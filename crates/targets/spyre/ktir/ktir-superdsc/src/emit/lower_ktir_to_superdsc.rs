@@ -3144,12 +3144,18 @@ pub fn lmlast(
 /// ⭐ ARITY IS THE PRECISION, and the fp8 half of main's body is already ported: three tensor inputs
 /// (activation, packed fp8 weight, the checkpoint's per-column `w_scale`) is W8A8 and goes to
 /// [`super::ktir_matmul_fp8`], which IS main's arity-3 branch unchanged.
+///
+/// ⛔ `b` IS THE FRAMING OF THE W REGION, AND IT IS NOT DEFAULTABLE — see the guards below. It comes
+/// from the producer's own `indexing_maps`
+/// ([`super::whole_function::matmul_b_orientation`]), because the extents cannot recover it when
+/// `k == n` and the two framings are DIFFERENT BUFFERS.
 pub fn matmul(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
+    b: super::whole_function::BOrient,
 ) -> Result<Vec<EmittedOp>, Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
     let [out] = outs[..] else {
@@ -3201,6 +3207,20 @@ pub fn matmul(
     //    operands (`set_df(Df::Fp8)`) carry SEN143_FP8 residency (½ f16) + drive the `matmulfp8` opFunc —
     //    no name suffix.
     if let [_, _, ws] = ins[..] {
+        // ⛔ THE PACKED fp8 KERNEL IS STAGED FROM THE TRANSPOSE-B BUFFER, so the plain framing has no
+        // meaning on this path and is refused rather than lowered. `matmul_fp8_descriptors` retiles the
+        // weight OUT-STICK-MAJOR (`[N/64, K/2, 2, 64]`, its `RetileDescriptor` — the layout
+        // `Corner::fp8_kernel_in`/`fp8_kernel_out` and `Fp8KernelKRows` are positional in), and every
+        // extent it reads is taken from the `[n, k]` region. Nothing on the plain side of this door has
+        // ever produced an arity-3 node — `KtirFunc::matmul_fp8` is the only builder that views a weight
+        // through `view_fp8` and it emits the transpose-B maps unconditionally — so this refusal is
+        // unreachable from every live producer and exists so that it stays that way.
+        if b == super::whole_function::BOrient::PlainB {
+            return err(format!(
+                "MatmulTile t{}: this is an fp8 W8A8 node (three inputs: activation, packed weight,                  per-column `w_scale`) whose `indexing_maps` state the PLAIN `[k, n]` B form. The fp8                  kernel's staged residency is built out-stick-major from the `[n, k]` weight, so the                  plain framing would size and corner the retile from the wrong two extents. Refused                  rather than lowered.",
+                out.tid
+            ));
+        }
         return Ok(super::ktir_matmul_fp8::matmul_fp8_descriptors(
             &super::ktir_matmul_fp8::Fp8Facts {
                 a_tid: a.tid,
@@ -3223,16 +3243,46 @@ pub fn matmul(
     // checked `w.region.rows.len != k` and `w.region.cols.len != n` against the SubtileIR region;
     // `KtirFunc::matmul` views the same buffer as its natural `[n, k]`, so the two checks swap sides
     // and nothing else about them changes.
-    if w.c_len != k {
+    //
+    // ⭐⭐⭐⭐⭐ AND THAT `[n, k]` IS THE **REGION'S** FRAMING, NOT THE DEVICE'S — which is the whole
+    // reason the orientation has to be threaded in here rather than assumed.
+    //
+    // `Stk::<KernelTag>::kernel(k, n_dev, ..)` below is emitted IDENTICALLY for both orientations, and
+    // it means exactly one thing: `StickLayout::kernel(k_in, n_out)`, i.e. `dev_off_stk`'s rank-2
+    // stick-blocked law with `dims[0] = in = K` as the ROW count and `out = N` as the sticked axis —
+    // element `(k, n)` at `(n/stk)·(K·stk) + k·stk + (n%stk)`. So the KERNEL slot IS a `[k, n]` DEVICE
+    // buffer, at every call site in this crate, and that is not a choice this emitter makes:
+    //
+    //   * `sdsc_abstract::vcache_write_offset` states it for the hardware-proven attention — "the V
+    //     cache … the VALUE bmm reads as a `[cap, hd]` KERNEL sticked on `hd` (`out`) … the kernel is
+    //     `[k=cap, n=hd]`" — and `attn.rs`'s value leg declares precisely that
+    //     (`Stk::kernel(v_stride, hd)`), contracting the V cache WHERE IT LIES with no relayout. That
+    //     op is `p @ V`, granite fp8 at 41 tok/s.
+    //   * `sdsc_abstract::kcache_kt_write_offset`'s twin says the score leg's kernel is `[hd, cap]` —
+    //     in-rows again — which is WHY the K cache is written ALREADY TRANSPOSED
+    //     (`restickify_kt_opspec_2d`): the relayout exists to MAKE a `[k, n]` buffer, never to consume
+    //     one.
+    //
+    // So a PLAIN-B `[k, n]` operand is already in the residency this slot reads and needs NO op; a
+    // TRANSPOSE-B `[n, k]` weight is the one whose bytes somebody must place in that order, which for a
+    // presented weight is the single host stage (`stage_2d(&StickLayout::kernel(k, n), ..)`) and costs
+    // nothing at inference. What differs between the two HERE is therefore only which of the region's
+    // two extents is K — and that is what these guards must not read wrong, because the extents alone
+    // cannot tell the framings apart at `k == n` (granite's `[4096, 4096]` output projection).
+    let (w_k, w_n, framing) = match b {
+        super::whole_function::BOrient::TransposeB => (w.c_len, w.r_len, "[n, k]"),
+        super::whole_function::BOrient::PlainB => (w.r_len, w.c_len, "[k, n]"),
+    };
+    if w_k != k {
         return err(format!(
-            "MatmulTile t{}: W cols {} != A cols (K) {k}",
-            out.tid, w.c_len
+            "MatmulTile t{}: W's K extent is {w_k} but A's cols (K) are {k}. This matmul's              `indexing_maps` state the {b:?} form, so its W region is framed `{framing}`              (`[{}, {}]` as handed over)",
+            out.tid, w.r_len, w.c_len
         ));
     }
-    if w.r_len != n {
+    if w_n != n {
         return err(format!(
-            "MatmulTile t{}: W rows {} != out cols (N) {n}",
-            out.tid, w.r_len
+            "MatmulTile t{}: W's N extent is {w_n} but out cols (N) are {n}. This matmul's              `indexing_maps` state the {b:?} form, so its W region is framed `{framing}`              (`[{}, {}]` as handed over)",
+            out.tid, w.r_len, w.c_len
         ));
     }
     if a.r_len != m {
@@ -3345,6 +3395,184 @@ pub fn matmul(
     })?;
     // Default path: one f16 matmul.
     Ok(vec![op])
+}
+
+/// ⛔⛔⛔ THE B FRAMING, BOTH WAYS, AT A SHAPE WHERE THE TWO ARE DISTINGUISHABLE — and the pair of
+/// controls that keeps each acceptance honest.
+///
+/// The shape is the decoder's own `tl.dot(p, v)`: `m = 64`, `k = 64`, `n = 128`. K ≠ N, so the region
+/// `[64, 128]` is a legal PLAIN B and an illegal TRANSPOSE B, and `[128, 64]` is the reverse — ONE
+/// variable (which extent is K) between every accept and its refusal.
+///
+/// ⭐ AND THE THIRD CLAIM IS THE LOAD-BEARING ONE: the two orientations emit the SAME DESCRIPTOR, byte
+/// for byte. The kernel slot's device order is `[in, out]` with `in` as the stick-block row count
+/// (`StickLayout::kernel`), so the orientation is a statement about the REGION the producer handed over,
+/// never about the device. That is why a `[k, n]` operand needs no relayout, and it is what a future
+/// change would break silently if this equality were not pinned.
+#[cfg(test)]
+mod matmul_b_framing_tests {
+    use super::*;
+    use crate::emit::whole_function::BOrient;
+
+    const M: u32 = 64;
+    const K: u32 = 64;
+    const N: u32 = 128;
+
+    /// A whole-buffer operand: the view IS the window.
+    fn reg(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
+        Region {
+            tid,
+            v_rows: rows,
+            v_cols: cols,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: cols,
+            r_cover: (0, rows),
+            is_out,
+            is_fp8: false,
+        }
+    }
+
+    /// `[A, W, out]` — the parameter list `matmul`'s `split_out` reads, with W framed by the caller.
+    fn lower(b: BOrient, w_rows: u32, w_cols: u32) -> Result<Vec<EmittedOp>, Error> {
+        let mut sid = 0i64;
+        let mut q = std::collections::HashSet::new();
+        let parms = vec![
+            reg(1, M, K, false),
+            reg(2, w_rows, w_cols, false),
+            reg(3, M, N, true),
+        ];
+        matmul("probe", &parms, &mut sid, None, &mut q, b)
+    }
+
+    /// The refusal message, or a panic naming what was emitted instead. `EmittedOp` is deliberately not
+    /// `Debug`, so `expect_err` cannot be used — and a test that reads a refusal must fail loudly when
+    /// there is none.
+    fn refusal(b: BOrient, w_rows: u32, w_cols: u32) -> String {
+        match lower(b, w_rows, w_cols) {
+            Ok(ops) => panic!(
+                "expected a refusal, but {} descriptor(s) were emitted for a {w_rows}x{w_cols} W                  region under {b:?}",
+                ops.len()
+            ),
+            Err(e) => e.message,
+        }
+    }
+
+    /// The one emitted descriptor, serialized — the only way to read a `TensorArg`'s declaration from a
+    /// test (its fields are private, and this is the same door `emit::tests` uses).
+    fn one_descriptor(b: BOrient, w_rows: u32, w_cols: u32) -> String {
+        let ops = lower(b, w_rows, w_cols).expect("this framing is the legal one");
+        assert_eq!(
+            ops.len(),
+            1,
+            "a plain f16 matmul is ONE descriptor — no relayout, no staging op"
+        );
+        let sdsc = ops[0].op.as_ref().expect("a matmul has a descriptor");
+        serde_json::to_string(sdsc).expect("SdscOp serializes")
+    }
+
+    /// ⭐ THE PLAIN FORM IS CONTRACTED WHERE IT LIES: a `[k, n]` region is accepted, ONE descriptor is
+    /// emitted (nothing transposes it), and the KERNEL is declared `[in, out]` with `in = k`.
+    #[test]
+    fn a_plain_b_k_by_n_region_is_contracted_in_place() {
+        let json = one_descriptor(BOrient::PlainB, K, N);
+        assert!(
+            json.contains("\"KERNEL\":{\"layoutDimOrder_\":[\"in\",\"out\"],\"stickDimOrder_\":[\"out\"]"),
+            "the kernel slot is in-rows/out-sticked; got {json}"
+        );
+        assert!(
+            json.contains("\"in_\":64") && json.contains("\"out_\":128"),
+            "the kernel's device extents are in=k=64, out=n=128; got {json}"
+        );
+    }
+
+    /// ⭐ THE TRANSPOSE FORM KEEPS ITS `[n, k]` REGION — the framing every presented weight arrives in.
+    #[test]
+    fn a_transpose_b_n_by_k_region_is_still_accepted() {
+        let _ = one_descriptor(BOrient::TransposeB, N, K);
+    }
+
+    /// ⭐⭐⭐ AND THE TWO EMIT THE **SAME DESCRIPTOR**. The orientation frames the REGION; the device
+    /// statement (`Stk::kernel(k, n_dev)` = `StickLayout::kernel(k_in, n_out)`) is identical, which is
+    /// exactly why the plain form needs no relayout. If a change ever makes these differ, the kernel
+    /// slot has acquired a second device order and every existing bundle's addressing is in question.
+    #[test]
+    fn both_orientations_emit_the_identical_device_declaration() {
+        assert_eq!(
+            one_descriptor(BOrient::PlainB, K, N),
+            one_descriptor(BOrient::TransposeB, N, K),
+            "the kernel slot's device order is not a function of the B orientation"
+        );
+    }
+
+    /// ⛔ CONTROL, ONE VARIABLE AWAY: the transpose framing under the PLAIN orientation. Without the
+    /// framing switch this is what the old guards accepted — and it is a different buffer.
+    #[test]
+    fn plain_b_refuses_the_transpose_framing() {
+        let m = refusal(BOrient::PlainB, N, K);
+        assert!(
+            m.contains("W's K extent is 128 but A's cols (K) are 64") && m.contains("PlainB"),
+            "the refusal must name the extent AND the framing it was read under: {m}"
+        );
+    }
+
+    /// ⛔ CONTROL, THE OTHER DIRECTION: the plain framing under the TRANSPOSE orientation — the case
+    /// `dot_to_linalg` records as "the weight reaches `matmul` as `[k, n]` and is refused".
+    #[test]
+    fn transpose_b_refuses_the_plain_framing() {
+        let m = refusal(BOrient::TransposeB, K, N);
+        assert!(
+            m.contains("W's K extent is 128 but A's cols (K) are 64") && m.contains("TransposeB"),
+            "the refusal must name the extent AND the framing it was read under: {m}"
+        );
+    }
+
+    /// ⛔⛔⛔ THE BLIND SPOT, PINNED: at `k == n` BOTH framings satisfy BOTH guards, so the extents
+    /// cannot recover the orientation and the descriptor that contracts the other way round is
+    /// well-formed. That is not a gap in these guards, it is WHY the orientation must be read from the
+    /// producer's `indexing_maps` (`whole_function::matmul_b_orientation`) rather than inferred here —
+    /// granite's `[4096, 4096]` output projection is exactly this shape. If this test ever starts
+    /// failing because one side refuses, an extent-based discriminator has been added and the maps are
+    /// no longer the only source — which is a fact worth knowing, not a regression.
+    #[test]
+    fn at_k_equals_n_neither_framing_can_be_told_from_the_extents() {
+        let mut sid = 0i64;
+        let mut q = std::collections::HashSet::new();
+        // A SQUARE op: m = k = n = 64, so the W region `[64, 64]` is both framings at once.
+        let parms = vec![
+            reg(1, 64, 64, false),
+            reg(2, 64, 64, false),
+            reg(3, 64, 64, true),
+        ];
+        for b in [BOrient::PlainB, BOrient::TransposeB] {
+            assert!(
+                matmul("probe", &parms, &mut sid, None, &mut q, b).is_ok(),
+                "a square weight walks through both framings — that IS the hole the maps close"
+            );
+        }
+    }
+
+    /// ⛔ THE fp8 ARM IS TRANSPOSE-B ONLY, and it sits BEFORE the framing guards, so it gets its own
+    /// refusal. The packed kernel's staged residency is built out-stick-major from the `[n, k]` weight;
+    /// the plain framing would size and corner that retile from the wrong two extents. Delete the
+    /// refusal and this lowers instead.
+    #[test]
+    fn an_fp8_node_refuses_the_plain_orientation_by_name() {
+        let mut sid = 0i64;
+        let mut q = std::collections::HashSet::new();
+        let mut w = reg(2, N, K, false);
+        w.is_fp8 = true;
+        let parms = vec![reg(1, M, K, false), w, reg(4, N, 1, false), reg(3, M, N, true)];
+        let e = match matmul("probe", &parms, &mut sid, None, &mut q, BOrient::PlainB) {
+            Ok(ops) => panic!("expected a refusal, {} descriptor(s) emitted", ops.len()),
+            Err(e) => e.message,
+        };
+        assert!(
+            e.contains("fp8 W8A8 node") && e.contains("PLAIN `[k, n]` B form"),
+            "the fp8 refusal must name the arity and the framing: {e}"
+        );
+    }
 }
 
 

@@ -96,43 +96,66 @@ pub struct SiluMulChain {
     pub consumed: [Ssa; 4],
 }
 
-/// PROVE a `linalg.matmul`'s weight is the TRANSPOSE-B one every assembler here assumes.
+/// WHICH WAY a `linalg.matmul` indexes its B operand — the orientation, READ FROM THE PROGRAM, because
+/// the two forms are DIFFERENT BUFFERS and the extents cannot tell them apart when `k == n`.
 ///
 /// # ⛔⛔⛔ THE HOLE THIS CLOSES IS A SILENT WRONG ANSWER, NOT A MISSING FEATURE
 ///
-/// Nothing in this crate reads `IndexingMaps` — `grep -rn IndexingMaps src/` is empty. The weight's
-/// orientation is instead inferred from its EXTENTS, by
-/// [`super::lower_ktir_to_superdsc::matmul`]'s two guards (`w.c_len != k`, `w.r_len != n`). Those
-/// guards cannot tell the two orientations apart WHEN `k == n`: a `[k, n]` weight then satisfies both
-/// and lowers to a descriptor that contracts the other way round. Granite's attention output
-/// projection is `4096 × 4096`, so that is a shape this backend really compiles.
+/// Nothing else in this crate reads `IndexingMaps`. The weight's framing was instead inferred from its
+/// EXTENTS, by [`super::lower_ktir_to_superdsc::matmul`]'s two guards, which cannot tell the two apart
+/// WHEN `k == n`: a `[k, n]` weight then satisfies both and lowers to a descriptor that contracts the
+/// other way round. Granite's attention output projection is `4096 × 4096`, so that is a shape this
+/// backend really compiles. This value is what those guards now frame themselves from.
 ///
-/// # WHAT THE CONTRACT IS, READ AT ITS DEFINITION
+/// # ⭐⭐⭐⭐⭐ AND THE KERNEL SLOT ITSELF IS `[k, n]` — THE PLAIN FORM NEEDS NO RELAYOUT
 ///
-/// scratchy's `KtirFunc::matmul` (`lower_subtile_tape_to_ktir.rs`) states it in its own doc: "W BINDS
-/// VERBATIM as its on-disk `[out, in]` = `[n, k]` buffer: the matmul reads it with transpose-B
-/// `indexing_maps` (B's map ends in the reduction dim, so the contraction reduces over k in place),
-/// so there is no transpose and no strided gather." That producer emits `[[0,2],[1,2],[0,1]]`
-/// unconditionally, which is why the assemblers can assume it and why nothing here checks.
+/// A first reading of this had the plain form as the exotic one, to be lowered by transposing B into
+/// the "assumed" orientation with `OpFunc::Transpose`. That was wrong twice over, and both halves were
+/// measured:
 ///
-/// So the maps are where the orientation LIVES, and a producer that puts the reduction dim last on
-/// B — `[[0,2],[2,1],[0,1]]`, MLIR's plain `linalg.matmul`, and what a `tt.dot` with no `.T` on the
-/// weight lowers to — is stating a DIFFERENT buffer. That is refused here, by name, with both ways
-/// out, rather than left to an extent guard that a square weight walks straight through.
-/// WHICH WAY a `linalg.matmul` indexes its B operand — the orientation, as a value, because a
-/// producer that states the plain form is stating a REAL, DIFFERENT buffer and one of the two can be
-/// lowered by transposing it rather than by refusing.
+/// * **The device slot is in-rows.** [`crate::sdsc_abstract::StickLayout::kernel`] is `[in(K),
+///   out(N)]` with `rows = k_in`, and `matmul` declares exactly that (`Stk::kernel(k, n_dev, ..)`) for
+///   BOTH forms. `vcache_write_offset`'s doc states the same thing for the hardware-proven attention —
+///   "the V cache … the VALUE bmm reads as a `[cap, hd]` KERNEL sticked on `hd` (`out`) … the kernel is
+///   `[k=cap, n=hd]`" — and `attn.rs`'s value leg contracts the V cache WHERE IT LIES, no relayout, at
+///   41 tok/s. `p @ V` IS this contraction. Its twin `kcache_kt_write_offset` is the other half of the
+///   argument: the score leg's kernel is `[hd, cap]`, in-rows again, which is why the K cache is
+///   written already-transposed rather than transposed on the way in.
+/// * **The relayout could not have computed it anyway.** MEASURED on both decoders: the transposing
+///   emission produced a `[128, 64]` intermediate and then declared the consuming kernel
+///   `layoutDimOrder_ ["in","out"]` with `in_ = 64, out_ = 128` over it (baked `sdsc_32` / `sdsc_33`)
+///   — a k-row/n-col reading of a buffer that physically had n rows. It moved the bytes AWAY from the
+///   slot's own address law. dxp then refused to schedule it on `SENARCH=MPW4` ("Implicit syncs not
+///   available for architectures prior to RCUDD1A"), which is the only reason the wrong answer was
+///   never baked.
+///
+/// So a `[k, n]` B is contracted in place, and the transposition a `[n, k]` B needs is spent OUTSIDE
+/// this crate: by the single host stage (`stage_2d(&StickLayout::kernel(k, n), ..)`) for a presented
+/// weight, or by the device's own already-transposed cache WRITE for a computed one.
+///
+/// # ⛔ WHAT THE FRONT END DOES WITH IT, SO THE TWO FORMS ARE NOT INTERCHANGEABLE HERE
+///
+/// `triton-ktir`'s `dot_to_linalg` REWIRES a `tt.dot`'s B past its `tt.trans` and states
+/// `[[0,2],[1,2],[0,1]]` — so a transpose-B node's region is the PRE-transpose buffer, `[n, k]`. A
+/// `tl.dot` with no `.T` keeps its operand and states no maps at all, which IS MLIR's plain default:
+/// region `[k, n]`. Both are honest statements about real buffers; what is not honest is reading one
+/// framing's extents as the other's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BOrient {
-    /// `[[d0,d2],[d1,d2],[d0,d1]]` — B's map ends in the reduction dim, so B is `[n, k]` and the
-    /// contraction reduces over k in place. Every assembler here assumes this; nothing to do.
+pub enum BOrient {
+    /// `[[d0,d2],[d1,d2],[d0,d1]]` — B's map ends in the reduction dim, so B's REGION is `[n, k]` and
+    /// the contraction reduces over k in place. scratchy's `KtirFunc::matmul` emits this
+    /// unconditionally for a presented weight ("W BINDS VERBATIM as its on-disk `[out, in]` = `[n, k]`
+    /// buffer … so there is no transpose and no strided gather"), and the host stage is where its bytes
+    /// are placed into the kernel slot's `[k, n]` device order.
     TransposeB,
-    /// `[[d0,d2],[d2,d1],[d0,d1]]`, or NO maps at all (MLIR's default for `linalg.matmul`) — B is
-    /// `[k, n]`. A different tensor, so it is transposed into the assumed orientation before use.
+    /// `[[d0,d2],[d2,d1],[d0,d1]]`, or NO maps at all (MLIR's default for `linalg.matmul`) — B's REGION
+    /// is `[k, n]`, which is the kernel slot's OWN device order. A computed operand (`tl.dot(p, v)`,
+    /// where `v` is this kernel's V projection) arrives this way and is contracted where it lies.
     PlainB,
 }
 
-fn matmul_b_orientation(
+/// PROVE which of the two forms a `linalg.matmul` states, from its own `indexing_maps`.
+pub fn matmul_b_orientation(
     f: &IRFunction<'static>,
     op: &ktir_core::ir::Operation<'static>,
 ) -> Result<BOrient, Error> {
@@ -1295,111 +1318,58 @@ pub fn lower_function(
             }
         }
 
-        // ⭐⭐⭐ A PLAIN-B CONTRACTION IS LOWERED BY TRANSPOSING B, NOT BY REFUSING IT.
+        // ⭐⭐⭐⭐⭐ A PLAIN-B CONTRACTION IS CONTRACTED WHERE IT LIES — NO RELAYOUT, NO ARCH FEATURE,
+        // AND NOTHING TO EMIT HERE AT ALL.
         //
-        // Every assembler here reads its second matmul operand as the KERNEL, physically `[n, k]` —
-        // scratchy's `KtirFunc::matmul` binds a weight verbatim in that orientation and emits the
-        // transpose-B maps unconditionally, which is why nothing downstream checks. A producer stating
-        // the plain form has a `[k, n]` buffer, a DIFFERENT tensor, and handing it to that assembler
-        // emits a well-formed descriptor computing the transposed contraction — invisible to every
-        // extent guard when k == n.
+        // THE KERNEL SLOT'S DEVICE ORDER IS `[in, out]` = `[k, n]`, WITH `in` AS THE STICK-BLOCK ROW
+        // COUNT. That is not this emitter's choice and it is the same for both orientations:
+        // `lower_ktir_to_superdsc::matmul` declares `Stk::<KernelTag>::kernel(k, n_dev, ..)`, i.e.
+        // `StickLayout::kernel(k_in, n_out)` — `dev_off_stk`'s rank-2 law with `dims[0] = k`, element
+        // `(k, n)` at `(n/stk)·(k·stk) + k·stk + (n%stk)`. A `[k, n]` operand is therefore ALREADY in
+        // the residency the slot reads, and `StickLayout::addr_eq` says so in the crate's own words:
+        // "`RowBlocked` vs `Kernel` is the identical stick-block formula", so the `[mb, out]` tile a
+        // producing matmul wrote IS a `[k, n]` kernel with `in = mb`.
         //
-        // ⭐ BUT IT IS NOT UNLOWERABLE, AND THE DEVICE HAS THE PRIMITIVE. `OpFunc::Transpose` is
-        // `interslicetranspose_fp16`, a real PT-unit op, and
-        // [`super::lower_ktir_to_superdsc::transpose`] is its door. So B is transposed into a minted
-        // intermediate and the matmul reads THAT, which is arithmetically the contraction the program
-        // states: `A[m,k] × (Bᵀ)[n,k] → [m,n]` is `A × B` for a `[k,n]` B.
+        // ⭐ THE DEVICE EVIDENCE IS THE SHIPPED ATTENTION, AND IT IS THIS EXACT CONTRACTION.
+        // `sdsc_abstract::vcache_write_offset`: "the V cache … the VALUE bmm reads as a `[cap, hd]`
+        // KERNEL sticked on `hd` (`out`) … the kernel is `[k=cap, n=hd]`", and `attn.rs`'s value leg
+        // declares `Stk::kernel(v_stride, hd)` — the V cache contracted in place, no relayout, granite
+        // fp8 at 41 tok/s. `p @ V` is `tl.dot(p, v)`. Its twin `kcache_kt_write_offset` completes the
+        // argument from the other side: the SCORE leg's kernel is `[hd, cap]`, in-rows again, which is
+        // why the K cache is written ALREADY TRANSPOSED (`restickify_kt_opspec_2d`) — the relayout
+        // exists to MAKE a `[k, n]` buffer, never to consume one.
         //
-        // ⭐ WHY THIS IS TAKEN HERE RATHER THAN PUSHED BACK ON THE PRODUCER. For a LOADED weight the
-        // better fix really is `.T` in the Triton source — the frontend folds it into the indexing maps
-        // and it costs no op. But `tl.dot(p, v)` in a decoder's attention contracts TWO COMPUTED
-        // VALUES: `p` is the softmax result and `v` is a projection, both produced on card. There is no
-        // host-side layout choice to make and no `.T` that is free, because the operand does not come
-        // from disk. One `interslicetranspose_fp16` plus one `[n, k]` buffer per such contraction is
-        // the cost, and it is a cost rather than a correctness problem.
+        // ⛔⛔⛔ WHAT USED TO BE HERE, AND WHY BOTH OF ITS CLAIMS WERE WRONG. This site transposed B
+        // into a minted `[n, k]` intermediate with `OpFunc::Transpose` and handed the matmul THAT. Two
+        // measurements killed it:
+        //   * IT COMPUTED THE WRONG THING. Baked on both decoders, `32_transpose_o41` wrote a
+        //     `[128, 64]` tile (`primaryDsInfo_` OUTPUT `stickDimOrder_ ["out","mb"]`, the 8×8
+        //     inter-slice block) and `33_matmul_o42` then declared its KERNEL `layoutDimOrder_
+        //     ["in","out"]` with `in_ = 64, out_ = 128` over it — a k-row/n-col reading of a buffer that
+        //     physically had n rows. The relayout moved the bytes AWAY from the slot's own address law;
+        //     the un-transposed `[64, 128]` value was already exactly what that descriptor reads.
+        //   * IT COULD NOT RUN. dxp refuses to schedule it on `SENARCH=MPW4` — "DtException: Implicit
+        //     syncs not available for architectures prior to RCUDD1A, ddcv1.cpp line 3416" — at 16
+        //     cores AND at 1 core, and identically when `OpFunc::Restickify` was substituted, so the
+        //     limit is the DATA-STAGE CHANGE a relayout makes and not either primitive. Across all six
+        //     gated fixtures the entire exercised op set is `add`/`batchmatmul`/`mean`/`mul`/`rsqrt`/
+        //     `silu`: no relayout primitive appears anywhere in the passing suite. That refusal is the
+        //     only reason the wrong answer above was never baked.
         //
-        // ⛔ THE STICK LAW IS THE TRANSPOSE DOOR'S, NOT RE-DERIVED HERE: it refuses by name unless both
-        // extents are whole 64-element sticks (`interslicetranspose_fp16` sticks its input on the column
-        // extent and its output on the 8×8 inter-slice block), so a shape it cannot do is named at the
-        // door that knows the law rather than guessed at here.
+        // So the orientation is not lowered by an op; it is a statement about the REGION's framing, and
+        // it is threaded into `matmul` (below) where the two extents are read. `assemble_transpose` and
+        // its `lower_ktir_to_superdsc::transpose` door are left exactly as they were — they serve
+        // `Program::Transpose`, a producer stating a `linalg.transpose` in its own right.
         //
-        // ⛔⛔⛔ MEASURED ARCHITECTURE LIMIT, AND IT IS WHY THIS PATH DOES NOT YET REACH A BINARY ON MPW4.
-        // The descriptor this emits is well-formed and dxp SCHEDULES it only on RCUDD1A or newer. On
-        // `SENARCH=MPW4` it is rejected:
-        //
-        //   sbf-ddc: DtException: Implicit syncs not available for architectures prior to RCUDD1A,
-        //   ddcv1.cpp line 3416   -> sbf-run-scheduler-on-sdsc: failed on program 'sdsc_32'
-        //
-        // MEASURED on both decoders, and the core division is NOT the variable: forcing the transpose
-        // onto ONE core reproduces it byte for byte, so this is `interslicetranspose_fp16` itself and not
-        // a cross-core sync. That also explains two facts already in the tree that otherwise look odd —
-        // `assemble_transpose` had ZERO callers, and the shipped attention transposes its Kᵀ with
-        // `OpFunc::Restickify` (`restickify_kt_opspec_2d`, which realizes the transpose through
-        // PER-OPERAND STICK AXES and `datastageBasedElemOff`) rather than with the transpose primitive.
-        //
-        // ⛔⛔⛔ AND THE RESTICKIFY IS NOT THE WAY OUT EITHER — MEASURED, so nobody repeats the probe.
-        // `OpFunc::Restickify` was substituted for the transpose at this exact site (same operand, same
-        // extents, `KtTileSlots`/`KtTileFeats` opened with a probe door) and dxp rejects it with the
-        // IDENTICAL DtException at the IDENTICAL program index. So the arch limit is not
-        // `interslicetranspose_fp16` specifically.
-        //
-        // What the two share is that their operands sit in DIFFERENT DATA STAGES — a relayout reads one
-        // stick order and writes another (`datastageBasedElemOff` is true ONLY for ReStickify, and the
-        // transpose carries its own `is_transpose_out` stick override), which is exactly the case that
-        // would need an implicit sync. Corroborating, and cheap to check: across ALL SIX gated fixtures
-        // the entire emitted op set is `add`, `batchmatmul`, `mean`, `mul`, `rsqrt`, `silu` — not one
-        // relayout primitive is exercised on MPW4 anywhere in the passing suite.
-        //
-        // SO A DEVICE RELAYOUT IS NOT AVAILABLE ON THIS ARCH, and the remaining ways out do not go
-        // through a second operand buffer at all:
-        //   * teach the KERNEL operand a SECOND WALK beside `Walk2::kernel_shared`, so a `[k, n]` buffer
-        //     is contracted where it lies — which is the option the original refusal named, and it needs
-        //     no relayout op and no arch feature. `matmul/**`.
-        //   * or have the producer hand `v` over already transposed, which for `tl.dot(p, v)` means the
-        //     FRONTEND choosing the projection's output layout (`v = h @ wvᵀ` could be emitted as
-        //     `vᵀ = wv @ hᵀ` only if `hᵀ` were free, which it is not) — so this one is not obviously
-        //     reachable and the kernel walk is the better bet.
-        // The algebra admits no reassociation that avoids it: `p @ (h @ wvᵀ)` and `(p @ h) @ wvᵀ` both
-        // leave a computed value in the kernel slot, and `aᵀ = vᵀ @ pᵀ` still needs `vᵀ`.
-        //
-        // dxp REJECTS this rather than mis-scheduling it, so the path fails closed meanwhile: exit 1 and
-        // no `init_binary.bin`, never a binary computing the transposed contraction.
-        if b_orient == Some(BOrient::PlainB) {
-            let b = per_op[1];
-            let Some(l) = layout else {
-                return err(format!(
-                    "{}: `{:?}` states the plain `[k, n]` B orientation, whose lowering transposes B \
-                     into an intermediate — and an intermediate needs a `BundleLayout` to hold its \
-                     buffer, which `layout: None` (the unit-test arm) cannot place",
-                    f.name, op.op_type
-                ));
-            };
-            let tid = next_tid;
-            next_tid += 1;
-            // `[k, n]` → `[n, k]`. The transpose door checks that this output view IS the input's
-            // swapped, so the two statements of the shape have to agree.
-            l.synth(crate::place::PlaceId::Act(tid), &[b.v_cols, b.v_rows]);
-            let bt = Region {
-                tid,
-                v_rows: b.v_cols,
-                v_cols: b.v_rows,
-                r_start: 0,
-                c_start: 0,
-                r_len: b.v_cols,
-                c_len: b.v_rows,
-                r_cover: (0, b.v_cols),
-                is_out: true,
-                is_fp8: false,
-            };
-            let mut t = super::lower_ktir_to_superdsc::transpose(
-                f.name,
-                &[b, bt],
-                sym_id_base,
-                Some(l),
-            )?;
-            out.append(&mut t);
-            per_op[1] = Region { is_out: false, ..bt };
-        }
+        // ⏭ ⛔ THE OTHER HALF OF THIS IS STILL A GAP, AND IT IS THE TRANSPOSE-B SIDE, NOT THIS ONE. A
+        // transpose-B B whose region is a COMPUTED value has no host stage to spend its transposition
+        // in: `dot_to_linalg` rewires B past the `tt.trans` and states the maps, nothing in this crate
+        // reads a tile's `CoordinateOrder` (`grep -rn CoordinateOrder src/` is empty), and the kernel
+        // slot reads `[k, n]` regardless — so `tl.dot(q, k.T)` on two in-register tiles contracts as
+        // `q @ k`. It is INVISIBLE to the guards below whenever the tile is square, which the decoder
+        // score matmuls (`[64, 64]`) are. The architecture's own answer is the shipped attention's:
+        // produce the operand already transposed at CACHE-WRITE time (`kcache_kt_write_offset`), which
+        // needs the relayout that this arch will not schedule. Named here rather than papered over.
 
         // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
         let stored = f.operations.iter().find(|s| {
@@ -1470,7 +1440,7 @@ pub fn lower_function(
             inter.insert(res, r);
             per_op.push(r);
             let name = f.name;
-            let mut emitted = emit_one(name, program, &per_op, sym_id_base, Some(layout))?;
+            let mut emitted = emit_one(name, program, &per_op, sym_id_base, Some(layout), b_orient)?;
             out.append(&mut emitted);
             lowered += 1;
             continue;
@@ -1497,7 +1467,7 @@ pub fn lower_function(
         o.is_out = true;
         per_op.push(o);
 
-        let mut emitted = emit_one(f.name, program, &per_op, sym_id_base, layout)?;
+        let mut emitted = emit_one(f.name, program, &per_op, sym_id_base, layout, b_orient)?;
         out.append(&mut emitted);
         lowered += 1;
     }
@@ -1519,6 +1489,10 @@ fn emit_one(
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
+    // The B orientation the WALK proved from this op's own `indexing_maps` — `Some` for exactly a
+    // `Node(Program::Matmul)`, which is the only arm that reads it. Threaded rather than re-derived
+    // because this fn has the regions, not the op.
+    b_orient: Option<BOrient>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
@@ -1556,7 +1530,18 @@ fn emit_one(
             // fresh set is correct for an fp16 program; an fp8 one needs it threaded across ops and
             // that is not yet done, so it is stated rather than silently per-op.
             let mut q = std::collections::HashSet::new();
-            super::lower_ktir_to_superdsc::matmul(name, per_op, sym_id_base, layout, &mut q)?
+            // ⛔ THE ORIENTATION IS PROVEN, NEVER DEFAULTED. `b_orient` is `Some` exactly when
+            // `program` is `Node(Program::Matmul)`, which is this arm — but a default here would be
+            // the silent wrong contraction at `k == n`, so the impossible case refuses by name.
+            let Some(b) = b_orient else {
+                return err(format!(
+                    "{name}: a `linalg.matmul` reached the matmul assembler with no proven B \
+                     orientation. The framing of its W region (`[n, k]` for transpose-B, `[k, n]` for \
+                     plain) is what the extent guards read, and at `k == n` neither framing can be \
+                     recovered from the extents, so it is refused rather than assumed"
+                ));
+            };
+            super::lower_ktir_to_superdsc::matmul(name, per_op, sym_id_base, layout, &mut q, b)?
         }
         Program::Elementwise(e) => {
             super::lower_ktir_to_superdsc::elementwise(name, e, per_op, sym_id_base, layout)?
