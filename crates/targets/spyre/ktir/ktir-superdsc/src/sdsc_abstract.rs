@@ -2368,12 +2368,17 @@ pub trait KindTag: sealed::Sealed + 'static {
 pub enum RowBlockedTag {}
 /// Matmul kernel / K-V cache.
 pub enum KernelTag {}
+/// ⭐ A matmul kernel declared the other way round: `[out, in]` stick-blocked on `in`, contraction on
+/// the sticked axis. A DISTINCT tag from [`KernelTag`] on purpose — the two address the same bytes at one
+/// stick, so only the type can stop one standing in for the other (see [`StickKind::KernelNt`]).
+pub enum KernelNtTag {}
 /// Per-row reduced scalar.
 pub enum RowScalarTag {}
 /// Head-major flat device tensor.
 pub enum FlatTag {}
 impl sealed::Sealed for RowBlockedTag {}
 impl sealed::Sealed for KernelTag {}
+impl sealed::Sealed for KernelNtTag {}
 impl sealed::Sealed for RowScalarTag {}
 impl sealed::Sealed for FlatTag {}
 impl KindTag for RowBlockedTag {
@@ -2384,6 +2389,11 @@ impl KindTag for RowBlockedTag {
 impl KindTag for KernelTag {
     fn kind() -> StickKind {
         StickKind::Kernel
+    }
+}
+impl KindTag for KernelNtTag {
+    fn kind() -> StickKind {
+        StickKind::KernelNt
     }
 }
 impl KindTag for RowScalarTag {
@@ -2471,6 +2481,25 @@ impl Stk<KernelTag> {
         Stk {
             name: name.into(),
             layout: StickLayout::kernel(k_in, n_out),
+            _p: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Stk<KernelNtTag> {
+    /// ⭐ A `KernelNt` handle `[out(N), in(K)]` stick-blocked on `in` — the score kernel read straight off
+    /// the NATURAL-K plane, with no re-transpose. Argument order is the DECLARED one, `(n_out, k_in)`,
+    /// mirroring [`StickLayout::kernel_nt`].
+    ///
+    /// ⛔ THE TAG IS THE GUARD, not the shape. A `Kernel` and a `KernelNt` of the same extents are the
+    /// SAME BYTES at one stick (`cols == lanes`, one stick group, the blocking degenerates) — proven in
+    /// `tests/kernel_nt_is_natural_k.rs` — so no address check can tell them apart, and the difference
+    /// that matters is which axis the matmul reduces. Distinct tags mean a builder that wants one cannot
+    /// silently be handed the other.
+    pub fn kernel_nt(n_out: usize, k_in: usize, name: impl Into<String>) -> Self {
+        Stk {
+            name: name.into(),
+            layout: StickLayout::kernel_nt(n_out, k_in),
             _p: std::marker::PhantomData,
         }
     }
