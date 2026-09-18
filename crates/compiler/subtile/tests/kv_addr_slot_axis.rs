@@ -88,8 +88,11 @@ fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
 fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
     for hd in [64usize, 128, 256] {
         let p = PagedKvPool::new(NKVH, hd);
-        let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
+            // EACH PLANE'S OWN footprint — the pool answers per plane now, because the three need not
+            // be the same size, and comparing a slot span against another plane's extent would be the
+            // exact confusion this signature removed.
+            let footprint = p.plane_block_elems(plane) as u32;
             let base = KvCoord::block(plane, kvh(0));
             let a_page_of_slots =
                 p.addr(base.at_slot(KvSlot::new(PagedKvPool::PAGE_SLOTS as u32))) - p.addr(base);
@@ -132,8 +135,8 @@ fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
 fn no_two_slots_of_a_plane_can_alias() {
     for hd in [64usize, 80, 128, 256] {
         let p = PagedKvPool::new(NKVH, hd);
-        let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
+            let footprint = p.plane_block_elems(plane) as u32;
             for h in [0u32, 5, 7] {
                 let base = KvCoord::block(plane, kvh(h));
                 let mut seen: std::collections::BTreeMap<u32, u32> = Default::default();

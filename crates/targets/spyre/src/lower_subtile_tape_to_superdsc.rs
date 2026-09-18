@@ -963,24 +963,22 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 scratchy_subtile::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
             let _ = cap;
             let seg = SegRole::Kv.segment();
-            let plane_bytes = pool.plane_stride() as u64 * 2;
-            // THE REQUEST STRIDE THIS PLACEMENT WAS SIZED FOR. `plane_stride` already carries the
-            // `ROWS` factor, so the pool grew ×ROWS per page here and nowhere else; publishing the
-            // stride from the same `pool` is what stops the runtime's shift from disagreeing with the
-            // addresses the ops baked.
             // ⛔ NO REQUEST STRIDE TO PUBLISH. A page holds slots, not requests, so there is no
             // "bytes between two requests' KV" for the runtime to shift by — a request is reached by its
             // PAGE, through the host's block table. Left at 0, which is what an unbatched bundle always
             // published and what `LaunchPages` reads as "no request dimension".
             let layer_base = seg_bytes[seg];
-            // Kᵀ at 0, V at `v_plane_base`, natural K at `knat_plane_base` — the offsets
-            // `PagedKvPool` bakes into the ops' plane-relative bases.
-            for (tid, plane_off) in [
-                // natural K, V, transposed K — the pre-paged cache's own order.
-                (k_id, pool.knat_plane_base() as u64 * 2),
-                (v_id, pool.v_plane_base() as u64 * 2),
-                (kct_resident_tid(k_id), pool.kt_plane_base() as u64 * 2),
-            ] {
+            // ⭐ EACH PLANE'S OFFSET AND ITS OWN SIZE, FROM ONE CALL. This read three bases and ONE shared
+            // `plane_stride()`, then reserved that one size for all three — correct only while the planes
+            // are equal, and silently the wrong footprint for two of them the moment any extent differs.
+            // `PlaneSlice` carries the pair, so there is nothing left to mismatch here.
+            let tid_of = |plane| match plane {
+                scratchy_subtile::sdsc_abstract::KvPlane::Knat => k_id,
+                scratchy_subtile::sdsc_abstract::KvPlane::V => v_id,
+                scratchy_subtile::sdsc_abstract::KvPlane::Kt => kct_resident_tid(k_id),
+            };
+            for slice in pool.planes() {
+                let tid = tid_of(slice.plane);
                 placements.insert(
                     tid,
                     TensorPlacement {
@@ -988,15 +986,15 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         role: SegRole::Kv,
                         segment: seg,
                         bank: 0,
-                        offset: layer_base + plane_off,
-                        size: plane_bytes,
+                        offset: layer_base + slice.base_bytes(),
+                        size: slice.size_bytes(),
                     },
                 );
             }
             // The per-layer stride the executor advances by MUST be exactly the three planes, with
             // no alignment padding creeping in between layers (hd and page_slots are 64-multiples,
             // so a plane is already 128-aligned — assert rather than trust).
-            let layer_stride_bytes = pool.layer_stride() as u64 * 2;
+            let layer_stride_bytes = pool.layer_stride_bytes();
             debug_assert_eq!(
                 align128(layer_base + layer_stride_bytes),
                 layer_base + layer_stride_bytes,
@@ -2136,7 +2134,7 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
                 }
             } else if e.kv_page_fold {
                 GroupKind::PageFold
-            } else if e.slab_stride_bytes > 0 {
+            } else if e.slab_stride_bytes.is_some() {
                 // Incremental Kᵀ restickify (kill-restickify Stage 2) → Slab (fusable, one
                 // `slab_stride_bytes`). A DISTINCT kind from Slot: its 8192-byte slab stride ≠ the
                 // cachewr's 128, so fusing them would trip the per-group uniform-stride assert.
@@ -2471,10 +2469,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         // anyone can construct: an op that declares a stride and leaves `kv_page_slots` at 0 yields
         // `None` here and simply is not a slab group, instead of reaching the runtime as an unbounded
         // block index. Zip rather than two ifs, so neither can be present without the other.
+        // The stride arrives NONZERO from the pool, so only the page has to be established here.
         let slab = matches!(kinds[r.start].kind, GroupKind::Slab)
             .then(|| {
                 Some(bundle::SlabShift::new(
-                    NonZeroU32::new(e.slab_stride_bytes)?,
+                    e.slab_stride_bytes?,
                     NonZeroU32::new(e.kv_page_slots)?,
                 ))
             })
@@ -2483,8 +2482,8 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             for t in r.clone() {
                 let o = &ops[owner[t]];
                 assert!(
-                    o.slab_stride_bytes == shift.stride_bytes().get(),
-                    "fused Slab group {gi}: op '{}' slab_stride {} != group stride {} — a fused Slab \
+                    o.slab_stride_bytes == Some(shift.stride_bytes()),
+                    "fused Slab group {gi}: op '{}' slab_stride {:?} != group stride {} — a fused Slab \
                      group's shim shift is uniform, so all restickifies must share one slab_stride \
                      (else a kv-head re-transposes the wrong slab)",
                     o.op_name,

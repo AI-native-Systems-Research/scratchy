@@ -97,6 +97,42 @@ impl KvWidth {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PlaneExtent(u32);
 
+/// ⭐ ONE PLANE'S SLICE OF A PAGE+LAYER: which plane, where it starts, and how many elements it owns —
+/// as ONE value, because a base and the footprint reserved for it must agree. See
+/// [`PagedKvPool::planes`], the only mint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlaneSlice {
+    pub plane: KvPlane,
+    base: ElemCount,
+    size: ElemCount,
+}
+
+impl PlaneSlice {
+    /// Element offset within a page+layer — an [`ElemCount`], so it cannot be spent as bytes without
+    /// naming the format that sizes them.
+    pub const fn base_elems(self) -> ElemCount {
+        self.base
+    }
+
+    /// Elements this plane owns — `nkvh` kv-head blocks of its OWN extent.
+    pub const fn size_elems(self) -> ElemCount {
+        self.size
+    }
+
+    /// ⭐ THE SAME TWO NUMBERS IN BYTES, through [`ElemCount::fp16_bytes`] — the existing door, whose own
+    /// doc is why there is no `* 2` here: "bytes are asked for by format, so an element count cannot be
+    /// spent as bytes without naming the format that sizes them". The pool's planes are fp16, the same
+    /// `DataFormat` [`POOL_STICK`] takes the stick width from.
+    pub const fn base_bytes(self) -> u64 {
+        self.base.fp16_bytes()
+    }
+
+    /// This plane's footprint in bytes — see [`base_bytes`](Self::base_bytes).
+    pub const fn size_bytes(self) -> u64 {
+        self.size.fp16_bytes()
+    }
+}
+
 impl PlaneExtent {
     /// The physical extent, for the stride arithmetic that is the only consumer.
     pub const fn get(self) -> u32 {
@@ -3879,6 +3915,30 @@ impl ElemCount {
     pub const fn fp16_bytes(self) -> u64 {
         self.0 * 2
     }
+
+    /// A KV plane's footprint: `nkvh` kv-head blocks of one plane's own extent. Its own door because a
+    /// plane's element count is the quantity the PLACEMENT reserves and the address law strides by, and
+    /// naming it here is what keeps those two from being two products.
+    pub const fn of_kv_plane(blocks: usize, block_elems: usize) -> ElemCount {
+        ElemCount((blocks * block_elems) as u64)
+    }
+
+    /// Nothing — the first plane's offset, and the seed a running offset accumulates from.
+    pub const NONE: ElemCount = ElemCount(0);
+
+    /// The raw count, for the `usize` strides the pool's existing callers take.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::ops::Add for ElemCount {
+    type Output = ElemCount;
+    /// Counts of the same thing add. This is how a plane's BASE is built — the sum of the planes before
+    /// it — so the offset and the sizes it is made of are the same currency throughout.
+    fn add(self, rhs: ElemCount) -> ElemCount {
+        ElemCount(self.0 + rhs.0)
+    }
 }
 
 /// THE COLUMN EXTENT ONE REDUCE/POINTWISE OP SWEEPS — a score-block width. Constructed only through
@@ -5176,7 +5236,10 @@ impl PagedKvPool {
         // slot span, so `PAGE_SLOTS` is a bound on what a `KvSlot` may BE, not a stride.
         // `plane_extent()`, not `PLANE_SLOTS`: this is the PHYSICAL stride, and the addressable count is a
         // different quantity with the same value. The type is what stops the substitution.
-        let (stk, pls) = (STK as u32, Self::plane_extent().get());
+        // `pls` is THIS PLANE's physical extent, not a pool-wide one — the feature-stick group stride
+        // below spans it, so a plane whose extent differs must get its own or stick 0's overrun reaches
+        // into stick 1.
+        let (stk, pls) = (STK as u32, self.plane_extent(c.plane).get());
         let hd = self.hd as u32;
         // ⚠️ PLANE-RELATIVE, deliberately. The emitter addresses each plane as its OWN NAMED TENSOR
         // (`kc`, `kct`, `vc`), so every offset a caller wants is WITHIN a plane — the plane base is
@@ -5186,7 +5249,9 @@ impl PagedKvPool {
         // here is what broke two of the pool's own doctests when I first tried to delegate to it.
         // 2. WHICH KV HEAD — and nothing else. There is no request term: a request is a set of SLOTS
         //    (reached through the host's page map), never a coordinate the device computes with.
-        let block = c.kvh.get() * self.plane_block_elems() as u32;
+        // ⭐ THE PLANE BEING ADDRESSED SUPPLIES ITS OWN BLOCK SIZE. Reading a single pool-wide extent here
+        // is what let the kv-head stride and the reserved footprint disagree once already.
+        let block = c.kvh.get() * self.plane_block_elems(c.plane) as u32;
         // 3. WHERE INSIDE THE BLOCK — the only place the planes differ.
         let (slot, feat) = (c.slot.get(), c.feat.get());
         let inside = match c.plane {
@@ -5268,19 +5333,37 @@ impl PagedKvPool {
         ChunkStart(KvSlot::new(want.get() - off + (page - padded.get())))
     }
 
-    /// ⭐ THE PHYSICAL EXTENT, TYPED — the only way the address law can obtain it, so the ADDRESSABLE count cannot
-    /// be substituted for it in a stride.
-    pub const fn plane_extent() -> PlaneExtent {
-        PlaneExtent(Self::PLANE_SLOTS as u32)
+    /// ⭐ THE PHYSICAL EXTENT OF ONE PLANE, TYPED, AND ASKED PER PLANE — the only way the address law can
+    /// obtain it, so the ADDRESSABLE count cannot be substituted for it in a stride.
+    ///
+    /// ⛔ IT TAKES THE PLANE BECAUSE THE THREE NEED NOT AGREE, and two of this pool's worst bugs were
+    /// exactly a slot extent read for the wrong thing. `plane_block_elems` once used `PAGE_SLOTS` where it
+    /// needed the physical extent, so "the stride between kv heads grew while the PLACEMENT reserved from
+    /// this function did not" and kv head 7 addressed past its footprint. And [`WRITE_SLACK`] widening
+    /// every plane at once broke hd=128 outright, because a feature-stick GROUP stride somewhere does not
+    /// follow it above one stick — a consumer never found.
+    ///
+    /// They are all [`PLANE_SLOTS`](Self::PLANE_SLOTS) TODAY, so this is inert. It exists so that
+    /// shrinking ONE of them is a change to this function and nothing else: natural K is only ever read by
+    /// the Kᵀ re-transpose, which now covers one stick-block per decode step, so it needs a fraction of
+    /// the slots the planes the attention actually sweeps do. ⚠️ That shrink is NOT yet takeable — prefill's
+    /// re-transpose still covers a whole page (`KtTileSlots::of_page`), and making it block-granular needs
+    /// prefill's chunk windows to be stick-block aligned, which is the chunker's business and not this
+    /// file's. Until then every plane must stay a full page.
+    pub const fn plane_extent(&self, plane: KvPlane) -> PlaneExtent {
+        match plane {
+            // The score and value legs sweep these, so their extent IS the addressable page (+ slack).
+            KvPlane::Kt | KvPlane::V => PlaneExtent(Self::PLANE_SLOTS as u32),
+            // ⛔ ALSO THE FULL PAGE, FOR NOW — see the note above. Named separately so the day it stops
+            // being the full page, no other arm moves with it.
+            KvPlane::Knat => PlaneExtent(Self::PLANE_SLOTS as u32),
+        }
     }
 
-    pub fn plane_block_elems(&self) -> usize {
-        // `PLANE_SLOTS`, NOT `PAGE_SLOTS`: this is the distance to the NEXT KV HEAD, so it is exactly the
-        // quantity a padded chunk write overruns. Sizing it by the addressable slot count is what put
-        // that overrun on top of the next head's keys.
-        // Physical, for the same reason: this is the distance to the NEXT KV HEAD, which is exactly what a padded
-        // chunk write overruns.
-        self.hd * Self::plane_extent().get() as usize
+    /// Elements in ONE KV HEAD's block of `plane` — the distance to the next kv head, which is exactly
+    /// what a padded chunk write overruns, so it is the PHYSICAL extent and never the addressable one.
+    pub const fn plane_block_elems(&self, plane: KvPlane) -> usize {
+        self.hd * self.plane_extent(plane).get() as usize
     }
 
     /// ⭐ THE BLOCK A `(kv head, request)` PAIR IS — for a caller addressing through a `Nest`'s
@@ -5344,16 +5427,35 @@ impl PagedKvPool {
     /// time ("the op addresses PAST its own tensor"), which is exactly the argument for deriving both
     /// from one function rather than two copies of one product.
     ///
-    /// The KV segment is three placements of `plane_stride` advanced by
+    /// The KV segment is the three [`planes`](Self::planes) advanced by
     /// [`layer_stride`](Self::layer_stride), and the runtime's page stride is derived from those same
     /// placement deltas — so this is the one number that sizes the pool.
-    pub fn plane_stride(&self) -> usize {
-        self.nkvh * self.plane_block_elems()
+    pub fn plane_stride(&self, plane: KvPlane) -> usize {
+        self.nkvh * self.plane_block_elems(plane)
     }
 
-    /// Elements in one page+layer: Kᵀ, then V, then natural K.
+    /// Elements in one page+layer — the three planes, SUMMED rather than `3 *` one of them, because they
+    /// need not be the same size.
     pub fn layer_stride(&self) -> usize {
-        3 * self.plane_stride()
+        self.layer_stride_elems().get() as usize
+    }
+
+    /// The same, as the [`ElemCount`] the planes are measured in.
+    pub fn layer_stride_elems(&self) -> ElemCount {
+        self.planes()
+            .iter()
+            .fold(ElemCount::NONE, |acc, p| acc + p.size_elems())
+    }
+
+    /// ⭐ BYTES PER (page, layer) — what the executor advances by and what the HOST sizes a page from,
+    /// through [`ElemCount::fp16_bytes`] rather than a `* 2` at each of those two call sites.
+    ///
+    /// ⛔ THE HOST USED TO SPELL THIS ITSELF as `3 * kv_dim * PLANE_SLOTS * 2`: the layout claim (`3 *`),
+    /// the width, the extent and the word length, all re-multiplied off-pool. It agrees only while the
+    /// three planes are equal, and a page sized too small makes the pool's pages OVERLAP — every request
+    /// reading a neighbour's keys, fluently, with nothing to catch it.
+    pub fn layer_stride_bytes(&self) -> u64 {
+        self.layer_stride_elems().fp16_bytes()
     }
 
     // ── PLANE ORDER inside a page+layer: natural K, then V, then transposed K. ──
@@ -5363,19 +5465,28 @@ impl PagedKvPool {
     // placement-sensitive. Having transposed-K first put all three planes at offsets the tuned
     // layout never used.
 
-    /// Element offset of the natural-K plane within a page+layer — FIRST, where `kc` was.
-    pub fn knat_plane_base(&self) -> usize {
-        0
-    }
-
-    /// Element offset of the V plane — SECOND, where `vc` was. Applied by the PLACEMENT, never an op.
-    pub fn v_plane_base(&self) -> usize {
-        self.plane_stride()
-    }
-
-    /// Element offset of the transposed-K plane — LAST, where `kct` was.
-    pub fn kt_plane_base(&self) -> usize {
-        2 * self.plane_stride()
+    /// ⭐⭐⭐⭐ EVERY PLANE'S BASE **WITH ITS OWN SIZE**, in layout order — the only way to obtain either,
+    /// so one plane's base can never be paired with another's footprint.
+    ///
+    /// ⛔ THIS REPLACES `knat_plane_base` / `v_plane_base` / `kt_plane_base` PLUS A SINGLE SHARED
+    /// `plane_stride()` AT THE CALL SITE. That worked only while the three planes were the same size: the
+    /// placement loop read three bases from here and ONE size, and reserved that size for each. The moment
+    /// any plane's extent differs, that pairing reserves the wrong footprint for two of them — and the
+    /// pool has already paid for exactly this shape once, when the kv-head stride grew and "the PLACEMENT
+    /// reserved from this function did not", so kv head 7 addressed past its own block. A base and a size
+    /// that must agree are one value, not two lookups.
+    ///
+    /// Order is natural K, V, transposed K — the pre-paged cache's own (`kc`, `vc`, `kct`). The order is
+    /// free (every op addresses its plane relatively) but it decides the byte offset each plane lands on,
+    /// and this path is measurably placement-sensitive.
+    pub fn planes(&self) -> [PlaneSlice; 3] {
+        let mut base = ElemCount::NONE;
+        [KvPlane::Knat, KvPlane::V, KvPlane::Kt].map(|plane| {
+            let size = ElemCount::of_kv_plane(self.nkvh, self.plane_block_elems(plane));
+            let slice = PlaneSlice { plane, base, size };
+            base = base + size;
+            slice
+        })
     }
 
     /// ⭐⭐⭐ THE ONE SEGMENT SHIFT THAT MOVES **BOTH** PLANES ONTO THE NEXT STICK-BLOCK, or `None`
@@ -5414,6 +5525,19 @@ impl PagedKvPool {
         };
         let knat = block_on(KvPlane::Knat);
         (knat == block_on(KvPlane::Kt)).then_some(knat)
+    }
+
+    /// The same shift the runtime actually applies — in BYTES, and as a [`NonZeroU32`], which is what
+    /// `bundle::SlabShift::new` requires.
+    ///
+    /// ⭐ NONZERO BY CONSTRUCTION, NOT BY A LATER CHECK. A stick-block of a plane is `hd * STK`
+    /// elements and both are nonzero, so the shift cannot be 0 — and carrying that in the type means the
+    /// group build does not have to re-establish it with a `NonZeroU32::new(..)?` whose `None` arm would
+    /// be unreachable and therefore untestable. Converted through [`ElemCount::fp16_bytes`], so this is
+    /// the only place the planes' format is spent.
+    pub fn slab_shift_bytes(&self, kvh: KvHead) -> Option<NonZeroU32> {
+        let elems = self.slab_shift_elems(kvh)?;
+        NonZeroU32::new(ElemCount::of_kv_plane(1, elems as usize).fp16_bytes() as u32)
     }
 
     #[allow(dead_code)]
@@ -5477,33 +5601,52 @@ impl PagedKvPool {
     ///         let head = QueryHead::all(NonZeroU32::new((nkvh * gqa) as u32).unwrap()).nth(qh).unwrap();
     ///         let kvh = KvHead::of_query(head, Gqa::new(gqa as u32));
     ///         let kt = p.addr(KvCoord::block(KvPlane::Kt, kvh));
-    ///         assert!(kt as usize + plane <= p.plane_stride());
+    ///         assert!(kt as usize + plane <= p.plane_stride(KvPlane::Kt));
     ///         let v = p.addr(KvCoord::block(KvPlane::V, kvh));
-    ///         assert!(v as usize + plane <= p.plane_stride());
+    ///         assert!(v as usize + plane <= p.plane_stride(KvPlane::V));
     ///     }
     ///     for kvh in 0..nkvh {
-    ///         assert!(p.kt_write_off(kvh, PagedKvPool::PAGE_SLOTS - 1, hd - 1) < p.plane_stride());
-    ///         assert!(p.v_write_off(kvh, PagedKvPool::PAGE_SLOTS - 1, hd - 1) < p.plane_stride());
+    ///         assert!(p.kt_write_off(kvh, PagedKvPool::PAGE_SLOTS - 1, hd - 1) < p.plane_stride(KvPlane::Kt));
+    ///         assert!(p.v_write_off(kvh, PagedKvPool::PAGE_SLOTS - 1, hd - 1) < p.plane_stride(KvPlane::V));
     ///     }
-    ///     // natural K, V, transposed K — the pre-paged cache's order, tiling the layer exactly.
-    ///     assert_eq!(p.knat_plane_base(), 0);
-    ///     assert_eq!(p.v_plane_base(), p.plane_stride());
-    ///     assert_eq!(p.kt_plane_base(), 2 * p.plane_stride());
-    ///     assert_eq!(p.kt_plane_base() + p.plane_stride(), p.layer_stride());
+    ///     // natural K, V, transposed K — the pre-paged cache's order, tiling the layer exactly. Each
+    ///     // plane's base comes WITH its own size, so this cannot be read as three bases and one stride.
+    ///     let [knat, v, kt] = p.planes();
+    ///     assert_eq!((knat.plane, knat.base), (KvPlane::Knat, 0));
+    ///     assert_eq!((v.plane, v.base), (KvPlane::V, knat.size));
+    ///     assert_eq!((kt.plane, kt.base), (KvPlane::Kt, knat.size + v.size));
+    ///     assert_eq!(kt.base + kt.size, p.layer_stride());
+    ///     assert!(p.planes_tile_the_layer());
     ///     // THE HEADS TILE THE PLANE EXACTLY. One head's block is its whole page — `hd * PAGE_SLOTS`
     ///     // — so head `k` ends precisely where head `k+1` begins and there is no request axis in
     ///     // between for a launch to step off the end of.
-    ///     assert_eq!(p.plane_block_elems(), p.hd() * PagedKvPool::PAGE_SLOTS);
-    ///     assert_eq!(nkvh * p.plane_block_elems(), p.plane_stride());
+    ///     for s in p.planes() {
+    ///         assert_eq!(p.plane_block_elems(s.plane), p.hd() * PagedKvPool::PAGE_SLOTS);
+    ///         assert_eq!(nkvh * p.plane_block_elems(s.plane), s.size);
+    ///     }
     /// }
     /// ```
+    /// ⭐ THE PLANES TILE THE LAYER EXACTLY — stated as "they abut and their sizes sum", which holds
+    /// whether or not they are the same size. It used to read `layer_stride == 3 * plane_stride`, which
+    /// is the same claim ONLY while all three agree, so it would have gone quietly false — as a `bool`,
+    /// with no reader able to say which plane moved — the moment one extent changed.
     pub fn planes_tile_the_layer(&self) -> bool {
-        self.layer_stride() == 3 * self.plane_stride()
-            && self.plane_stride() > 0
+        let planes = self.planes();
+        let abut = planes
+            .windows(2)
+            .all(|w| w[0].base_elems() + w[0].size_elems() == w[1].base_elems());
+        abut
+            && planes[0].base_elems() == ElemCount::NONE
+            && planes.iter().all(|p| p.size_elems() != ElemCount::NONE)
             // THE PLANE IS ITS HEADS AND NOTHING ELSE. Stated as an equation because the two sides are
             // written in different places (a nest's `.block()` count against a matmul's declared kernel
             // extent) and drifting apart would put one head's slots on top of the next head's.
-            && self.plane_stride() == self.nkvh * self.plane_block_elems()
+            && planes.iter().all(|p| {
+                p.size_elems() == ElemCount::of_kv_plane(self.nkvh, self.plane_block_elems(p.plane))
+            })
+            && planes
+                .last()
+                .is_some_and(|p| p.base_elems() + p.size_elems() == self.layer_stride_elems())
     }
 
     /// Head width this pool laid itself out for.

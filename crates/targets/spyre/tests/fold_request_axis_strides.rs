@@ -66,14 +66,18 @@ const NKVH: usize = 8;
 fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
     let pool = PagedKvPool::new(NKVH, HD);
     let pinned = HD * PagedKvPool::PAGE_SLOTS;
+    // ⭐ THE PLANE IS NAMED NOW, because the three need not be the same size. This axis is the one the
+    // fold's `y` step walks, which reads the Kᵀ plane — so that is the plane whose kv-head distance the
+    // pinned constant is being compared against, stated rather than left to whichever plane the pool
+    // happened to answer for.
     assert_eq!(
-        pool.plane_block_elems(),
+        pool.plane_block_elems(KvPlane::Kt),
         HD * PagedKvPool::PLANE_SLOTS,
         "the pool's kv-head distance is PHYSICAL slots, whatever PAGE_SLOTS says"
     );
     assert_eq!(
         pinned,
-        pool.plane_block_elems(),
+        pool.plane_block_elems(KvPlane::Kt),
         "`hd * PAGE_SLOTS` — the constant three request-axis attempts baked as the deleted \
          `PagedKvPool::request_stride` — is the KV-HEAD stride. A `y` step of one advances one kv \
          head. If this ever stops holding (WRITE_SLACK != 0) the constant becomes no axis at all, \
@@ -102,9 +106,9 @@ fn stepping_the_batch_axis_by_the_pinned_constant_walks_the_kv_head_axis() {
         - pool.addr(KvCoord::block(KvPlane::Kt, head0));
     assert_eq!(
         step as usize,
-        pool.plane_block_elems(),
-        "one unit of the kv-head axis IS `plane_block_elems` — the axis the pinned constant \
-         approximates. There is no other axis of that magnitude in the law."
+        pool.plane_block_elems(KvPlane::Kt),
+        "one unit of the kv-head axis IS `plane_block_elems` OF THE PLANE BEING STEPPED — the axis the \
+         pinned constant approximates. There is no other axis of that magnitude in the law."
     );
 }
 

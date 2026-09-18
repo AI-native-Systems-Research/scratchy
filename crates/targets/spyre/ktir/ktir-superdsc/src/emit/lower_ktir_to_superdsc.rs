@@ -2723,7 +2723,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         let head = kv_head_of(kvh, nkvh)?;
         let one_slot_per_op = per_request || mq == 1;
         let slab_shift = one_slot_per_op
-            .then(|| pool.slab_shift_elems(head))
+            .then(|| pool.slab_shift_bytes(head))
             .flatten();
         ops.push(assemble_restickify_kt_2d(
             &format!("attn_kctpost{kvh}{rq}_o{t}"),
@@ -2753,8 +2753,11 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // thing that tells the runtime which page that is.
         if let Some(o) = ops.last_mut() {
             o.kv_request = req;
-            if let Some(elems) = slab_shift {
-                o.slab_stride_bytes = elems * 2;
+            if slab_shift.is_some() {
+                // ⛔ NO `* 2` AND NO ZERO-MEANS-OFF HERE. The pool converted elements to bytes through
+                // `ElemCount::fp16_bytes` and hands back a `NonZeroU32`, so this site neither claims the
+                // planes are fp16 nor re-checks a value that cannot be zero.
+                o.slab_stride_bytes = slab_shift;
                 // ⛔ DECLARING THE PAGE IS NOT OPTIONAL HERE. `slab_delta` wraps the block index by
                 // THIS field, and an op that leaves it 0 keeps the unwrapped arithmetic — correct only
                 // inside a request's first page, and past slot 255 a block of no page at all. Opting

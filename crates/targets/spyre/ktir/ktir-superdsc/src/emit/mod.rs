@@ -1123,7 +1123,12 @@ pub struct EmittedOp {
     /// a zero stride (classified a Slab group, shift 0, so every step re-transposes block 0 and the
     /// prefix Kᵀ silently stops advancing). `bundle::KvShifts` already derives its own flag from its
     /// stride "so a stride and its flag cannot disagree"; this is that argument one layer up.
-    pub slab_stride_bytes: u32,
+    ///
+    /// ⭐ `Option<NonZeroU32>`, so "is this a slab op" and "by how much" are ONE question with one
+    /// answer, and the zero that used to mean "no" cannot also be written as a `Some`. It arrives this
+    /// way from `PagedKvPool::slab_shift_bytes`, which knows it is nonzero by construction, so nothing
+    /// downstream re-establishes it with a check whose failure arm is unreachable.
+    pub slab_stride_bytes: Option<std::num::NonZeroU32>,
     /// PAGE FOLD: folds ONE page of resident prefix into the running online-softmax state. Such ops
     /// are grouped APART from the body and re-launched once per page the context spans, each launch
     /// rebased to that page. The fold is an accumulation, so repeating it IS the loop — there is no
@@ -1221,7 +1226,7 @@ impl EmittedOp {
             time: 1,
             affine_strides: Vec::new(),
             slot_stride_bytes: 0,
-            slab_stride_bytes: 0,
+            slab_stride_bytes: None,
             slot_no_fuse: false,
             kv_page_fold: false,
             kv_batched_requests: false,
@@ -1331,7 +1336,7 @@ impl EmittedOp {
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
             kv_page_slots: 0,
             kv_request: 0,
-            slab_stride_bytes: 0,
+            slab_stride_bytes: None,
             slot_no_fuse: false,
             host_kv_write: false,
             kv_n_skip: 0,

@@ -1081,9 +1081,35 @@ impl SpyreWorker {
                     // tape was LOWERED at, so reading it from the wiring cannot
                     // disagree with the bundle and has no default to fire.
                     let layers = (wirings.decode.geometry.layers as usize).max(1);
-                    let plane_slots =
-                        scratchy_subtile::sdsc_abstract::PagedKvPool::PLANE_SLOTS as u64;
-                    let stride = (3 * kv_dim as u64 * plane_slots * 2 * layers as u64).max(1);
+                    // ⭐⭐⭐ ASK THE POOL, DO NOT RE-MULTIPLY ITS LAYOUT. This was
+                    // `3 * kv_dim * PLANE_SLOTS * 2 * layers` — the pool's own layer stride spelled a
+                    // second time, on the host, out of a layout claim (`3 *`), an extent and a word
+                    // length. It agrees only while the three planes are the same size, and a page sized
+                    // too small makes the pool's pages OVERLAP: every request reading a neighbour's keys,
+                    // fluently, with nothing to catch it. `layer_stride_bytes` sums the planes and does
+                    // its own element→byte conversion, so neither is restated here.
+                    //
+                    // ⛔ AND `nkvh` IS NOT `kv_dim / hd`. `KvWidth::of` is the door precisely because the
+                    // division-and-remultiply pattern — `(kv_dim / hd).max(1)` — is written up in its own
+                    // doc as the anti-pattern it replaces: the `.max(1)` turns "hd does not divide kv_dim"
+                    // into one head and a width that is the extent of nothing, quietly. `None` here is a
+                    // real load error, not a number to round.
+                    let hd = wirings.decode.geometry.head_dim;
+                    let kvw = scratchy_subtile::sdsc_abstract::KvWidth::of(kv_dim as u32, hd)
+                        .ok_or_else(|| {
+                            werr(format!(
+                                "this model's kv width {kv_dim} is not a whole number of {hd}-wide kv \
+                                 heads, so the KV pool has no layout — the bake and this host would \
+                                 disagree about where every page ends"
+                            ))
+                        })?;
+                    let stride = (scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+                        kvw.heads() as usize,
+                        hd as usize,
+                    )
+                    .layer_stride_bytes()
+                        * layers as u64)
+                        .max(1);
 
                     // THE DECLARED DEPTH, capped by what the prefix mask can address. `--max-model-len`
                     // when the CLI gave one, else the model's own limit — and `kv_max_addressable_tokens`
