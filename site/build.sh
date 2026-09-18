@@ -46,6 +46,10 @@ mkdir -p "$here/_site"
 cp "$here/index.html" "$here/styles.css" "$here/favicon.png" "$here/og-image.png" "$here/_site/"
 cp -R "$here/book" "$here/_site/book"
 
+# Generated straight from the DSL sources, so the architectures page cannot
+# drift from what the compiler actually reads.
+python3 "$here/build-archs.py" "$root" "$here/_site/architectures.html"
+
 # Every local href must resolve inside _site, or the copies drifted from the
 # sources and the deploy would ship dead links.
 broken=0
