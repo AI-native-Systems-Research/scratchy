@@ -121,7 +121,7 @@ pub fn try_assemble_matmul_seeded(
 ///
 /// A no-op wherever the layout reserves the padded weight (`held == n`), so the full-model path —
 /// including the granite lm_head, the one weight whose stick count needs the pad — is byte-identical.
-fn out_width_the_weight_holds(
+pub(super) fn out_width_the_weight_holds(
     layout: Option<&BundleLayout>,
     w_name: &str,
     m: u32,

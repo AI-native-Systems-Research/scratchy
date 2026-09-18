@@ -228,6 +228,14 @@ pub fn try_assemble_matmul_k_trips(
     }
     let stk = Fp16::ELEMS_PER_STICK;
     let k_t = plan.k_per_trip();
+    // ⛔ THE OCCUPANCY PAD IS ONLY REAL IF SOMETHING RESERVED IT — the SAME narrowing
+    // `try_assemble_matmul_seeded` applies, from the SAME function, at the FULL `k`. Sharing it is
+    // the point: a divergence here would mean the K-trip path emitted a padded width the single-node
+    // path had narrowed, and the only thing between that and a read past the weight is
+    // `resolve_seg_base`'s footprint guard — fail-closed, but a refusal where the other path bakes.
+    // `k` and not `k_t`: the width the weight HOLDS is a fact about the whole weight's placement, and
+    // one trip's depth is not that.
+    let n = super::assemble::out_width_the_weight_holds(layout, w.name(), m, n, k);
 
     // Every buffer this decomposition invents, declared at its FULL `[m, n]` footprint before any
     // op references it. Lazy allocation is a build error by design (`resolve_seg_base`).
@@ -386,6 +394,97 @@ mod tests {
             t(64).trips() > 1,
             "two rows per core does not, and that is the whole gap"
         );
+    }
+
+    /// The per-core START ADDRESSES of one op's dataspace `lds`, in bytes, deduplicated and sorted.
+    /// Read back out of the emitted descriptor — not re-derived — so this measures what bakes.
+    fn starts(op: &EmittedOp, lds: u32) -> Vec<i64> {
+        let mut out = std::collections::BTreeSet::new();
+        let sdsc = op.op.as_ref().expect("a matmul has a descriptor");
+        for dm in &sdsc.dscs_ {
+            for d in dm.values() {
+                for a in &d.scheduleTree_ {
+                    if a.ldsIdx_ == lds {
+                        for v in a.startAddressCoreCorelet_.data_.values() {
+                            out.insert(v.trim().parse::<i64>().expect("a concrete byte address"));
+                        }
+                    }
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// One K trip, emitted with and without the `kernel_phys_in` declaration, so the two can be
+    /// compared. Everything else is identical.
+    fn trip_kernel_starts(kernel_phys_in: Option<u32>) -> Vec<i64> {
+        let (m, n, k, k_t) = (64u32, 4096u32, 12800u32, 6400u32);
+        let form = proven();
+        let op = super::super::opspec::matmul_opspec_split::<Fp16, _>(
+            m,
+            n,
+            k_t,
+            1,
+            "a",
+            "w",
+            "o",
+            k_t * m,
+            k_t * Fp16::ELEMS_PER_STICK,
+            0,
+            <Fp16 as DataFormat>::DF,
+            None,
+            kernel_phys_in,
+            form,
+            None,
+            matmul_split_map_for(form),
+        )
+        .expect("one trip is placeable");
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let mut sym = 0i64;
+        let e = crate::emit::emit_sdsc_tiled("probe", &op, &folds, &mut sym, None)
+            .expect("the trip emits");
+        // lds1 is the KERNEL by the OpSpec's own arg order (input, kernel, output).
+        starts(&e, 1)
+    }
+
+    /// ⛔⛔⛔ THE DISCRIMINATING CONTROL FOR `kernel_phys_in`, and it is the one test that would
+    /// have caught the defect this declaration exists to prevent.
+    ///
+    /// The shared 2-D kernel walk is `[in, out]` stick `out`, and `dev_off_stk`'s rank-2 law puts the
+    /// `out` stick-GROUP stride at `dims[0] * stk` — i.e. at the weight's `in` DEPTH. A trip that
+    /// sweeps `k/T` and leaves `in` at the swept extent therefore strides every `out` core `T`× too
+    /// close and reads the previous trip's slab: correct for out-core 0 and wrong for all the rest,
+    /// which is fluent wrong output with no fault, invisible to a gate that executes no arithmetic.
+    ///
+    /// So the declaration is asserted to CHANGE the emitted addresses by exactly `T`, and the
+    /// undeclared form is measured beside it rather than described. Deleting `kernel_phys_in` fails
+    /// here, at `cargo test`, instead of on-card.
+    #[test]
+    fn the_kernel_device_extent_strides_out_cores_by_the_whole_weight_depth() {
+        let declared = trip_kernel_starts(Some(12800));
+        let undeclared = trip_kernel_starts(None);
+        assert_eq!(
+            declared.len(),
+            undeclared.len(),
+            "the same op on the same cores, so the same number of distinct starts"
+        );
+        assert!(declared.len() > 1, "the `out` split must be >1 for this to bite");
+        let d_step = declared[1] - declared[0];
+        let u_step = undeclared[1] - undeclared[0];
+        // 8 out-sticks per core × (12800 depth × 64 lanes × 2 B) = 13_107_200 B.
+        assert_eq!(
+            d_step, 13_107_200,
+            "the declared stride is the WHOLE weight depth"
+        );
+        assert_eq!(
+            u_step, 6_553_600,
+            "and the undeclared one is exactly half — the previous trip's slab"
+        );
+        assert_eq!(d_step, u_step * 2, "off by exactly the trip count T=2");
+        // Uniform, so it is an affine walk and not a scatter.
+        for w in declared.windows(2) {
+            assert_eq!(w[1] - w[0], d_step, "uniform: {declared:?}");
+        }
     }
 
     /// A one-trip plan must NOT reach the decomposing emitter — that path has to stay the ordinary
