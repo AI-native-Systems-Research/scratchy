@@ -20,7 +20,7 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --bg: #161616;
   --fg: #f4f4f4;
 
-  --sidebar-bg: #262626;
+  --sidebar-bg: #161616;
   --sidebar-fg: #c6c6c6;
   --sidebar-non-existant: #6f6f6f;
   --sidebar-active: #78a9ff;
@@ -32,7 +32,9 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --icons-hover: #f4f4f4;
 
   --links: #78a9ff;
+  --links-hover: #a6c8ff;
   --background-hover: rgba(141, 141, 141, 0.16);
+  --background-selected: rgba(141, 141, 141, 0.24);
   --focus: #ffffff;
 
   --inline-code-color: #ff7eb6;
@@ -65,7 +67,7 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --bg: #ffffff;
   --fg: #161616;
 
-  --sidebar-bg: #f4f4f4;
+  --sidebar-bg: #ffffff;
   --sidebar-fg: #525252;
   --sidebar-non-existant: #8d8d8d;
   --sidebar-active: #0f62fe;
@@ -77,7 +79,9 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --icons-hover: #161616;
 
   --links: #0f62fe;
+  --links-hover: #0043ce;
   --background-hover: rgba(141, 141, 141, 0.12);
+  --background-selected: rgba(141, 141, 141, 0.2);
   --focus: #0f62fe;
 
   --inline-code-color: #9f1853;
@@ -140,12 +144,48 @@ body,
 .content table td,
 .content table th { border-radius: 0; }
 
-/* Carbon's focus ring. */
-.content a:focus-visible,
-.sidebar a:focus-visible,
-#menu-bar a:focus-visible {
-  outline: 2px solid var(--links);
-  outline-offset: -2px;
+/* Carbon link — `link/_link.scss`. A link's focus ring is
+ * `focus-outline('border')`: 1px, no offset, and never the 2px inset ring that
+ * tiles and buttons take. Visited does not recolour; active returns to
+ * $link-primary and keeps the ring. */
+.content a,
+.sidebar a,
+.cds-breadcrumb a {
+  color: var(--links);
+  outline: none;
+  text-decoration: none;
+  transition: color 70ms cubic-bezier(0.2, 0, 0.38, 0.9);
+}
+
+@media (any-hover: hover) {
+  .content a:hover,
+  .content a:visited:hover,
+  .cds-breadcrumb a:hover {
+    color: var(--links-hover);
+    text-decoration: underline;
+  }
+  .content a:active:visited:hover { color: var(--links); }
+}
+
+.content a:visited,
+.cds-breadcrumb a:visited { color: var(--links); }
+
+.content a:focus,
+.content a:active,
+.sidebar a:focus,
+.cds-breadcrumb a:focus,
+.cds-breadcrumb a:active {
+  outline: 1px solid var(--focus);
+  text-decoration: underline;
+}
+.content a:active,
+.cds-breadcrumb a:active { color: var(--links); }
+
+@media screen and (prefers-contrast) {
+  .content a:focus,
+  .content a:active,
+  .sidebar a:focus,
+  .cds-breadcrumb a:focus { outline-style: dotted; }
 }
 
 /* ------------------------------------------------------------------ *
@@ -194,14 +234,14 @@ html.sidebar-visible #menu-bar {
 #menu-bar .brand {
   display: flex;
   align-items: center;
-  padding: 0 2rem 0 1rem;
+  padding: 0 3.2rem 0 1.6rem;
   border: 2px solid transparent;
   block-size: 100%;
   color: var(--fg);
   font-family: var(--mono-font);
   font-size: 1.4rem;
   font-weight: 600;
-  line-height: 1.25rem;
+  line-height: 2rem;
   letter-spacing: 0.1px;
   text-decoration: none;
 }
@@ -213,7 +253,7 @@ html.sidebar-visible #menu-bar {
   position: relative;
   display: flex;
   block-size: 100%;
-  padding-inline-start: 1rem;
+  padding-inline-start: 1.6rem;
 }
 #menu-bar .navlinks::before {
   content: "";
@@ -232,19 +272,26 @@ html.sidebar-visible #menu-bar {
   position: relative;
   display: flex;
   align-items: center;
-  padding: 0 1rem;
+  padding: 0 1.6rem;
   border: 2px solid transparent;
   block-size: 100%;
   color: var(--sidebar-fg);
   font-size: 1.4rem;
   font-weight: 400;
-  line-height: 1.125rem;
+  line-height: 1.8rem;
   letter-spacing: 0;
   text-decoration: none;
   transition: background-color 110ms, border-color 110ms, color 110ms;
 }
 #menu-bar .navlinks a:hover { background-color: var(--background-hover); color: var(--fg); }
 #menu-bar .navlinks a:focus { outline: none; border-color: var(--focus); }
+
+/* A nav item is a component, not a link — it never takes the link underline. */
+#menu-bar .navlinks a,
+#menu-bar .navlinks a:hover,
+#menu-bar .navlinks a:focus,
+#menu-bar .navlinks a:active,
+#menu-bar .brand:focus { text-decoration: none; }
 
 /* Kept in the DOM for book.js, which reads `.menu-title`. */
 #menu-bar .menu-title { display: none; }
@@ -272,7 +319,7 @@ html.sidebar-visible #menu-bar {
  * mdBook centres <main>. */
 .cds-breadcrumb {
   max-width: var(--content-max-width);
-  margin: 2rem auto 1rem;
+  margin: 3.2rem auto 1.6rem;
 }
 
 .breadcrumb-list {
@@ -286,8 +333,8 @@ html.sidebar-visible #menu-bar {
   letter-spacing: 0.16px;
 }
 
-.breadcrumb-item { position: relative; display: flex; align-items: center; margin-inline-end: 0.5rem; }
-.breadcrumb-item::after { content: "/"; color: var(--fg); margin-inline-start: 0.5rem; }
+.breadcrumb-item { position: relative; display: flex; align-items: center; margin-inline-end: 0.8rem; }
+.breadcrumb-item::after { content: "/"; color: var(--fg); margin-inline-start: 0.8rem; }
 .breadcrumb-item:last-child,
 .breadcrumb-item:last-child::after { margin-inline-end: 0; }
 .breadcrumb-item:last-child::after { content: ""; }
@@ -299,15 +346,71 @@ html.sidebar-visible #menu-bar {
 html[data-path^="blogs/"] .bc-blogs { display: flex; }
 html[data-path^="blogs/"] .bc-docs { display: none; }
 
-/* A blog post is not a chapter of the manual, so it arrives without the
- * manual's table of contents. */
-html[data-path^="blogs/"] #sidebar,
-html[data-path^="blogs/"] #sidebar-resize-handle,
-html[data-path^="blogs/"] #sidebar-toggle,
-html[data-path^="blogs/"] .nav-wrapper { display: none; }
-html[data-path^="blogs/"] #sidebar-toggle-anchor:checked ~ .page-wrapper {
-  margin-inline-start: 0;
-  transform: none;
+/* ------------------------------------------------------------------ *
+ * Carbon side nav — `ui-shell/side-nav/_side-nav.scss`
+ *
+ * A blog post and a doc chapter are the same artefact: a Markdown file
+ * listed in SUMMARY.md. They get the same navigation.
+ * ------------------------------------------------------------------ */
+
+:root { --sidebar-width: 256px; }   /* mini-units(32) */
+
+/* $background, not $layer — the shell's side nav shares the page surface,
+ * and sits under the header rather than beside it. */
+.sidebar {
+  inline-size: var(--sidebar-width);
+  max-inline-size: var(--sidebar-width);
+  block-size: calc(100% - var(--menu-bar-height));
+  background: var(--bg);
+  color: var(--sidebar-fg);
 }
 
-.sidebar .chapter li.chapter-item a.active { font-weight: 600; }
+.sidebar .sidebar-scrollbox { padding: 1.6rem 0; }
+
+/* side-nav__link: heading-compact-01, 32px minimum, 16px gutters. */
+.sidebar .chapter li.chapter-item a,
+.sidebar .chapter li.chapter-item div {
+  display: flex;
+  align-items: center;
+  padding: 0 1.6rem;
+  min-block-size: 3.2rem;
+  inline-size: 100%;
+  color: var(--sidebar-fg);
+  font-size: 1.4rem;
+  font-weight: 600;
+  line-height: 1.29;
+  letter-spacing: 0.16px;
+  text-decoration: none;
+  transition: color 110ms, background-color 110ms;
+}
+
+.sidebar .chapter li.chapter-item a:hover {
+  background-color: var(--background-hover);
+  color: var(--fg);
+  text-decoration: none;
+  outline: none;
+}
+
+/* side-nav__link--current */
+.sidebar .chapter li.chapter-item a.active {
+  background-color: var(--background-selected);
+  color: var(--fg);
+  font-weight: 600;
+}
+
+/* Nested entries drop to weight 400 and indent by mini-units(4). */
+.sidebar .chapter .section li.chapter-item a {
+  padding-inline-start: 3.2rem;
+  font-weight: 400;
+}
+
+/* Section headers ("Blogs") are labels, not destinations. */
+.sidebar .chapter li.part-title {
+  padding: 1.6rem 1.6rem 0.8rem;
+  margin: 0;
+  color: var(--searchresults-header-fg);
+  font-size: 1.2rem;
+  font-weight: 600;
+  letter-spacing: 0.32px;
+  text-transform: none;
+}

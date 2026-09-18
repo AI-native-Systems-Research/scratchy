@@ -35,7 +35,7 @@
   /* Carbon's button component tokens, verbatim. */
   --button-tertiary: #ffffff;
   --button-tertiary-hover: #f4f4f4;
-  --button-tertiary-text-hover: #161616;
+  --button-tertiary-active: #c6c6c6;
 
   /* Carbon spacing scale */
   --spacing-01: 0.125rem;
@@ -64,8 +64,9 @@
   --button-primary-active: #002d9c;
   --text-on-color: #ffffff;
 
-  /* $duration-fast-01/02 with motion(entrance, productive) */
-  --motion-productive: cubic-bezier(0, 0, 0.38, 0.9);
+  /* @carbon/motion, productive set */
+  --motion-standard: cubic-bezier(0.2, 0, 0.38, 0.9);
+  --motion-productive: cubic-bezier(0, 0, 0.38, 0.9);   /* entrance */
 }
 
 @media (prefers-color-scheme: light) {
@@ -92,7 +93,7 @@
 
     --button-tertiary: #0f62fe;
     --button-tertiary-hover: #0050e6;
-    --button-tertiary-text-hover: #ffffff;
+    --button-tertiary-active: #002d9c;
   }
 }
 
@@ -110,16 +111,48 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Carbon's focus ring: 2px, square, high contrast. */
-a:focus-visible,
-.btn:focus-visible,
-.dcard:focus-visible {
+/* Carbon link — `link/_link.scss`.
+ *
+ * Note the focus treatment: a link takes `focus-outline('border')`, which is a
+ * *1px* outline with no offset, not the 2px inset ring tiles and buttons use.
+ * Hover only applies where hover exists, visited does not recolour, and active
+ * returns to $link-primary while keeping the ring. Carbon keys all of this off
+ * `:focus` rather than `:focus-visible`, so this does too. */
+a {
+  color: var(--link-primary);
+  outline: none;
+  text-decoration: none;
+  transition: color 70ms var(--motion-standard);
+}
+
+@media (any-hover: hover) {
+  a:hover,
+  a:visited:hover { color: var(--link-primary-hover); text-decoration: underline; }
+  a:active:visited:hover { color: var(--link-primary); }
+}
+
+a:visited { color: var(--link-primary); }
+
+a:focus,
+a:active {
+  outline: 1px solid var(--focus);
+  text-decoration: underline;
+}
+a:active { color: var(--link-primary); }
+
+@media screen and (prefers-contrast) {
+  a:focus,
+  a:active { outline-style: dotted; }
+}
+
+/* Tiles take `focus-outline('outline')` instead — 2px, inset by 2px. */
+.dcard:focus,
+.tcard:focus,
+.ncard:focus {
   outline: 2px solid var(--focus);
   outline-offset: -2px;
 }
-
-a { color: var(--link-primary); text-decoration: none; }
-a:hover { color: var(--link-primary-hover); text-decoration: underline; }
+.dcard:focus { text-decoration: none; }
 
 code, pre { font-family: var(--mono); }
 
@@ -380,29 +413,66 @@ h1 .accent { color: var(--accent); }
     color 70ms var(--motion-productive);
 }
 
+/* `button-theme()` gives every variant a 1px border — $button-outline-width —
+ * and the shared focus ring is a double inset shadow: 1px of $focus at the
+ * edge, then $button-border-width (2px) of $background inside it. */
+.btn:focus {
+  outline: none;
+  border-color: var(--focus);
+  box-shadow:
+    inset 0 0 0 1px var(--focus),
+    inset 0 0 0 2px var(--background);
+}
+
+/* These anchors are components, not links: the Carbon link rules above would
+ * otherwise underline a button label or a nav item whenever it took focus. */
+.btn,
+.btn:focus,
+.btn:active,
+.brand,
+.brand:focus,
+.navlinks a,
+.navlinks a:focus,
+.navlinks a:active { text-decoration: none; }
+
+/* Primary: transparent border, $text-on-color throughout. */
 .btn.primary {
   background: var(--button-primary);
-  border-color: var(--button-primary);
+  border-color: transparent;
   color: var(--text-on-color);
 }
-.btn.primary:hover {
-  background: var(--button-primary-hover);
-  border-color: var(--button-primary-hover);
-  text-decoration: none;
+@media (any-hover: hover) {
+  .btn.primary:hover {
+    background: var(--button-primary-hover);
+    color: var(--text-on-color);
+    text-decoration: none;
+  }
 }
-.btn.primary:active { background: var(--button-primary-active); border-color: var(--button-primary-active); }
+.btn.primary:active { background: var(--button-primary-active); }
 
-/* Tertiary: the outline pairing Carbon specifies alongside a primary. */
+/* Tertiary: the outline pairing Carbon specifies alongside a primary. It
+ * fills on hover and inverts its text, fills solid on focus, and drops its
+ * border entirely when active. */
 .btn:not(.primary) {
   background: transparent;
   border-color: var(--button-tertiary);
   color: var(--button-tertiary);
 }
-.btn:not(.primary):hover {
-  background: var(--button-tertiary-hover);
-  border-color: var(--button-tertiary-hover);
-  color: var(--button-tertiary-text-hover);
-  text-decoration: none;
+@media (any-hover: hover) {
+  .btn:not(.primary):hover {
+    background: var(--button-tertiary-hover);
+    color: var(--text-inverse);
+    text-decoration: none;
+  }
+}
+.btn:not(.primary):focus {
+  background: var(--button-tertiary);
+  color: var(--text-inverse);
+}
+.btn:not(.primary):active {
+  border-color: transparent;
+  background: var(--button-tertiary-active);
+  color: var(--text-inverse);
 }
 
 /* ---------- sections ---------- */
