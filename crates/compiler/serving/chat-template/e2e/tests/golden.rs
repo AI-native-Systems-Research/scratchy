@@ -11,7 +11,8 @@ use minijinja::Environment;
 use scratchy_chat_template_e2e::smollm2_135m;
 use serde_json::json;
 
-const TEMPLATE: &str = include_str!("../../../../../models/arch/configs/llama/smollm2-135m.chat.jinja");
+const TEMPLATE: &str =
+    include_str!("../../../../../models/arch/configs/llama/smollm2-135m.chat.jinja");
 
 fn oracle() -> Environment<'static> {
     let mut env = Environment::new();
@@ -25,38 +26,68 @@ fn oracle() -> Environment<'static> {
 /// generation prompt on/off, empty content, unicode content.
 fn matrix() -> Vec<(&'static str, serde_json::Value)> {
     vec![
-        ("no system, 1 turn, agp", json!({
+        (
+            "no system, 1 turn, agp",
+            json!({
             "messages": [{"role": "user", "content": "Hi"}],
-            "add_generation_prompt": true })),
-        ("no system, agp off", json!({
+            "add_generation_prompt": true }),
+        ),
+        (
+            "no system, agp off",
+            json!({
             "messages": [{"role": "user", "content": "Hi"}],
-            "add_generation_prompt": false })),
-        ("with system", json!({
+            "add_generation_prompt": false }),
+        ),
+        (
+            "with system",
+            json!({
             "messages": [{"role": "system", "content": "Be terse"},
                          {"role": "user", "content": "Hi"}],
-            "add_generation_prompt": true })),
-        ("multi turn", json!({
+            "add_generation_prompt": true }),
+        ),
+        (
+            "multi turn",
+            json!({
             "messages": [{"role": "user", "content": "a"},
                          {"role": "assistant", "content": "b"},
                          {"role": "user", "content": "c"}],
-            "add_generation_prompt": true })),
-        ("empty content", json!({
+            "add_generation_prompt": true }),
+        ),
+        (
+            "empty content",
+            json!({
             "messages": [{"role": "user", "content": ""}],
-            "add_generation_prompt": true })),
-        ("unicode + newline", json!({
+            "add_generation_prompt": true }),
+        ),
+        (
+            "unicode + newline",
+            json!({
             "messages": [{"role": "user", "content": "héllo 🌍\nsecond"}],
-            "add_generation_prompt": true })),
-        ("empty message list", json!({
-            "messages": [], "add_generation_prompt": true })),
-        ("agp absent entirely", json!({
-            "messages": [{"role": "user", "content": "Hi"}] })),
-        ("content with quotes/tags", json!({
+            "add_generation_prompt": true }),
+        ),
+        (
+            "empty message list",
+            json!({
+            "messages": [], "add_generation_prompt": true }),
+        ),
+        (
+            "agp absent entirely",
+            json!({
+            "messages": [{"role": "user", "content": "Hi"}] }),
+        ),
+        (
+            "content with quotes/tags",
+            json!({
             "messages": [{"role": "user", "content": "say \"hi\" <b>&amp;</b> 'x'"}],
-            "add_generation_prompt": true })),
-        ("system not first", json!({
+            "add_generation_prompt": true }),
+        ),
+        (
+            "system not first",
+            json!({
             "messages": [{"role": "user", "content": "a"},
                          {"role": "system", "content": "late"}],
-            "add_generation_prompt": true })),
+            "add_generation_prompt": true }),
+        ),
     ]
 }
 
@@ -73,7 +104,9 @@ fn generated_matches_interpreter_byte_for_byte() {
         let ours = smollm2_135m::render(&ctx)
             .unwrap_or_else(|e| panic!("generated code failed on {name}: {e}"));
         if ours != theirs {
-            failures.push(format!("  {name}\n    generated: {ours:?}\n    oracle   : {theirs:?}"));
+            failures.push(format!(
+                "  {name}\n    generated: {ours:?}\n    oracle   : {theirs:?}"
+            ));
         }
     }
     assert!(
@@ -89,7 +122,11 @@ fn generated_matches_interpreter_byte_for_byte() {
 /// editor changes the rendered prompt, and therefore the tokenization.
 #[test]
 fn vendored_template_is_byte_exact() {
-    assert_eq!(TEMPLATE.len(), 368, "vendored SmolLM2 template changed size");
+    assert_eq!(
+        TEMPLATE.len(),
+        368,
+        "vendored SmolLM2 template changed size"
+    );
     assert!(
         !TEMPLATE.ends_with('\n'),
         "the upstream template has no trailing newline; something normalised it"
@@ -124,7 +161,10 @@ fn whitespace_config_is_not_optional() {
 fn drift_gate_accepts_only_the_exact_source() {
     let c = &smollm2_135m::COMPILED;
     assert!(c.matches(TEMPLATE), "must accept its own source");
-    assert_eq!(c.source, TEMPLATE, "embedded source must be the vendored bytes");
+    assert_eq!(
+        c.source, TEMPLATE,
+        "embedded source must be the vendored bytes"
+    );
 
     // Every one of these is a real way a template drifts in the wild, and every
     // one changes the rendered prompt.
@@ -145,5 +185,8 @@ fn drift_gate_accepts_only_the_exact_source() {
     // And the descriptor's fn pointer is the same renderer we tested above.
     let ctx = json!({ "messages": [{"role": "user", "content": "Hi"}],
                       "add_generation_prompt": true });
-    assert_eq!((c.render)(&ctx).unwrap(), smollm2_135m::render(&ctx).unwrap());
+    assert_eq!(
+        (c.render)(&ctx).unwrap(),
+        smollm2_135m::render(&ctx).unwrap()
+    );
 }

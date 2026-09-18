@@ -16,9 +16,9 @@
 
 use minijinja::Environment;
 use scratchy_chat_template_compiler::{
-    add, contains, eq, get_index, get_key, render_into, to_seq, truthy, Val,
+    Val, add, contains, eq, get_index, get_key, render_into, to_seq, truthy,
 };
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 /// An interpreter configured exactly like `crates/serving/api/src/chat_template.rs::build_env`.
 fn oracle() -> Environment<'static> {
@@ -83,7 +83,10 @@ fn display_parity() {
 fn booleans_render_python_style() {
     let mut s = String::new();
     render_into(&mut s, &Val::Ref(&json!(true)));
-    assert_eq!(s, "True", "if this is `true`, every boolean in every prompt is wrong");
+    assert_eq!(
+        s, "True",
+        "if this is `true`, every boolean in every prompt is wrong"
+    );
     assert_eq!(s, oracle_render("v", &json!(true)));
 }
 
@@ -103,16 +106,29 @@ fn undefined_renders_empty_and_does_not_error() {
 #[test]
 fn truthiness_parity() {
     let cases = [
-        json!(true), json!(false), json!(0), json!(1), json!(-1), json!(0.0),
-        json!(""), json!("x"), json!([]), json!([1]), json!({}), json!({"a": 1}),
+        json!(true),
+        json!(false),
+        json!(0),
+        json!(1),
+        json!(-1),
+        json!(0.0),
+        json!(""),
+        json!("x"),
+        json!([]),
+        json!([1]),
+        json!({}),
+        json!({"a": 1}),
         json!(null),
     ];
     let mut env = oracle();
-    env.add_template("t", "{% if v %}T{% else %}F{% endif %}").unwrap();
+    env.add_template("t", "{% if v %}T{% else %}F{% endif %}")
+        .unwrap();
     for c in &cases {
         let theirs = env
-            .get_template("t").unwrap()
-            .render(minijinja::context! { v => c.clone() }).unwrap();
+            .get_template("t")
+            .unwrap()
+            .render(minijinja::context! { v => c.clone() })
+            .unwrap();
         let ours = if truthy(&Val::Ref(c)) { "T" } else { "F" };
         assert_eq!(ours, theirs, "truthiness for {c:?}");
     }
@@ -133,19 +149,30 @@ fn contains_dispatch_parity() {
         (json!({"nope": 1}), "citations"),
     ];
     let mut env = oracle();
-    env.add_template("t", "{% if needle in v %}T{% else %}F{% endif %}").unwrap();
+    env.add_template("t", "{% if needle in v %}T{% else %}F{% endif %}")
+        .unwrap();
     for (hay, needle) in &cases {
-        let theirs = env.get_template("t").unwrap()
-            .render(minijinja::context! { v => hay.clone(), needle => needle }).unwrap();
+        let theirs = env
+            .get_template("t")
+            .unwrap()
+            .render(minijinja::context! { v => hay.clone(), needle => needle })
+            .unwrap();
         let n = json!(needle);
-        let ours = if contains(&Val::Ref(&n), &Val::Ref(hay)) { "T" } else { "F" };
+        let ours = if contains(&Val::Ref(&n), &Val::Ref(hay)) {
+            "T"
+        } else {
+            "F"
+        };
         assert_eq!(ours, theirs, "`{needle} in {hay:?}`");
     }
     // over undefined => false, not an error
     let n = json!("x");
     assert!(!contains(&Val::Ref(&n), &Val::Undefined));
-    let theirs = env.get_template("t").unwrap()
-        .render(minijinja::context! { needle => "x" }).unwrap();
+    let theirs = env
+        .get_template("t")
+        .unwrap()
+        .render(minijinja::context! { needle => "x" })
+        .unwrap();
     assert_eq!("F", theirs);
 }
 
@@ -160,8 +187,11 @@ fn add_parity_strings_numbers_sequences() {
         (json!([1, 2]), json!([3])),
     ];
     for (a, b) in &cases {
-        let theirs = env.get_template("t").unwrap()
-            .render(minijinja::context! { a => a.clone(), b => b.clone() }).unwrap();
+        let theirs = env
+            .get_template("t")
+            .unwrap()
+            .render(minijinja::context! { a => a.clone(), b => b.clone() })
+            .unwrap();
         let got = add(&Val::Ref(a), &Val::Ref(b)).expect("add should succeed");
         let mut ours = String::new();
         render_into(&mut ours, &got);
@@ -174,12 +204,17 @@ fn add_parity_strings_numbers_sequences() {
 fn add_errors_where_oracle_errors() {
     let mut env = oracle();
     env.add_template("t", "{{ a + b }}").unwrap();
-    let theirs = env.get_template("t").unwrap()
+    let theirs = env
+        .get_template("t")
+        .unwrap()
         .render(minijinja::context! { a => "x", b => 1 });
     let ours = add(&Val::Ref(&json!("x")), &Val::Ref(&json!(1)));
     assert_eq!(
-        theirs.is_err(), ours.is_err(),
-        "string + number: oracle err={:?}, ours err={:?}", theirs.is_err(), ours.is_err()
+        theirs.is_err(),
+        ours.is_err(),
+        "string + number: oracle err={:?}, ours err={:?}",
+        theirs.is_err(),
+        ours.is_err()
     );
 }
 
@@ -202,9 +237,13 @@ fn indexing_parity() {
 
     // and the interpreter agrees that a missing key renders empty
     let mut env = oracle();
-    env.add_template("t", "[{{ messages[0]['tool_calls'] }}]").unwrap();
-    let theirs = env.get_template("t").unwrap()
-        .render(minijinja::context! { messages => msgs.clone() }).unwrap();
+    env.add_template("t", "[{{ messages[0]['tool_calls'] }}]")
+        .unwrap();
+    let theirs = env
+        .get_template("t")
+        .unwrap()
+        .render(minijinja::context! { messages => msgs.clone() })
+        .unwrap();
     assert_eq!("[]", theirs);
 }
 
@@ -223,19 +262,22 @@ fn eq_bridges_str_and_json_string() {
 #[test]
 fn to_seq_parity() {
     let mut env = oracle();
-    env.add_template("t", "{% for x in v %}<{{ x }}>{% endfor %}").unwrap();
+    env.add_template("t", "{% for x in v %}<{{ x }}>{% endfor %}")
+        .unwrap();
 
     // Cases the interpreter renders successfully.
     let ok_cases = [
         json!([1, "a"]),
-        json!("abc"),          // => three iterations, one per char
+        json!("abc"),            // => three iterations, one per char
         json!({"b": 1, "a": 2}), // => keys, sorted
         json!([]),
         json!({}),
-        json!(null),           // => empty, no error
+        json!(null), // => empty, no error
     ];
     for v in &ok_cases {
-        let theirs = env.get_template("t").unwrap()
+        let theirs = env
+            .get_template("t")
+            .unwrap()
             .render(minijinja::context! { v => v.clone() })
             .unwrap_or_else(|e| panic!("oracle failed on {v:?}: {e}"));
         let items = to_seq(&Val::Ref(v)).unwrap_or_else(|e| panic!("ours failed on {v:?}: {e}"));
@@ -254,7 +296,9 @@ fn to_seq_parity() {
 
     // Cases the interpreter REJECTS — we must reject them too.
     for v in [json!(5), json!(true)] {
-        let theirs = env.get_template("t").unwrap()
+        let theirs = env
+            .get_template("t")
+            .unwrap()
             .render(minijinja::context! { v => v.clone() });
         let ours = to_seq(&Val::Ref(&v));
         assert!(theirs.is_err(), "oracle should reject iterating {v:?}");

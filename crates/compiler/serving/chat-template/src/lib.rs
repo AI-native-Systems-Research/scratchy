@@ -296,7 +296,11 @@ fn json_truthy(j: &Json) -> bool {
 pub fn get_key<'a>(v: &Val<'a>, key: &str) -> Val<'a> {
     match v {
         Val::Ref(Json::Object(o)) => o.get(key).map(Val::Ref).unwrap_or(Val::Undefined),
-        Val::Owned(Json::Object(o)) => o.get(key).cloned().map(Val::Owned).unwrap_or(Val::Undefined),
+        Val::Owned(Json::Object(o)) => o
+            .get(key)
+            .cloned()
+            .map(Val::Owned)
+            .unwrap_or(Val::Undefined),
         _ => Val::Undefined,
     }
 }
@@ -355,15 +359,13 @@ pub fn add<'a>(a: &Val<'_>, b: &Val<'_>) -> Result<Val<'a>, TemplateError> {
         return Ok(Val::Str(Cow::Owned(s)));
     }
     match (a.json(), b.json()) {
-        (Some(Json::Number(x)), Some(Json::Number(y))) => {
-            match (x.as_i64(), y.as_i64()) {
-                (Some(i), Some(j)) => Ok(Val::Owned(Json::from(i + j))),
-                _ => {
-                    let (x, y) = (x.as_f64().unwrap_or(0.0), y.as_f64().unwrap_or(0.0));
-                    Ok(Val::Owned(serde_json::json!(x + y)))
-                }
+        (Some(Json::Number(x)), Some(Json::Number(y))) => match (x.as_i64(), y.as_i64()) {
+            (Some(i), Some(j)) => Ok(Val::Owned(Json::from(i + j))),
+            _ => {
+                let (x, y) = (x.as_f64().unwrap_or(0.0), y.as_f64().unwrap_or(0.0));
+                Ok(Val::Owned(serde_json::json!(x + y)))
             }
-        }
+        },
         (Some(Json::Array(x)), Some(Json::Array(y))) => {
             let mut v = x.clone();
             v.extend(y.iter().cloned());

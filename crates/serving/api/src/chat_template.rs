@@ -316,7 +316,10 @@ impl ChatTemplate {
         // It is also the more natural shape: `messages`, `tools` and
         // `extra_kwargs` all arrive as `serde_json` already.
         let mut ctx_map = serde_json::Map::new();
-        ctx_map.insert("messages".into(), serde_json::Value::Array(messages.to_vec()));
+        ctx_map.insert(
+            "messages".into(),
+            serde_json::Value::Array(messages.to_vec()),
+        );
         ctx_map.insert(
             "add_generation_prompt".into(),
             serde_json::Value::Bool(add_generation_prompt),
@@ -353,9 +356,7 @@ impl ChatTemplate {
                     .get_template("chat")
                     .map_err(|e| ServeError::Internal(format!("failed to get template: {e}")))?;
                 tmpl.render(minijinja::Value::from_serialize(&ctx))
-                    .map_err(|e| {
-                        ServeError::Internal(format!("chat template render failed: {e}"))
-                    })
+                    .map_err(|e| ServeError::Internal(format!("chat template render failed: {e}")))
             }
         }
     }
@@ -917,18 +918,42 @@ mod tests {
     #[test]
     fn compiled_and_interpreted_agree_through_apply() {
         let matrix: Vec<Vec<TemplateMessage>> = vec![
-            vec![TemplateMessage { role: "user".into(), content: "Hi".into() }],
+            vec![TemplateMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            }],
             vec![
-                TemplateMessage { role: "system".into(), content: "Be terse".into() },
-                TemplateMessage { role: "user".into(), content: "Hi".into() },
+                TemplateMessage {
+                    role: "system".into(),
+                    content: "Be terse".into(),
+                },
+                TemplateMessage {
+                    role: "user".into(),
+                    content: "Hi".into(),
+                },
             ],
             vec![
-                TemplateMessage { role: "user".into(), content: "a".into() },
-                TemplateMessage { role: "assistant".into(), content: "b".into() },
-                TemplateMessage { role: "user".into(), content: "c".into() },
+                TemplateMessage {
+                    role: "user".into(),
+                    content: "a".into(),
+                },
+                TemplateMessage {
+                    role: "assistant".into(),
+                    content: "b".into(),
+                },
+                TemplateMessage {
+                    role: "user".into(),
+                    content: "c".into(),
+                },
             ],
-            vec![TemplateMessage { role: "user".into(), content: String::new() }],
-            vec![TemplateMessage { role: "user".into(), content: "héllo 🌍\nx".into() }],
+            vec![TemplateMessage {
+                role: "user".into(),
+                content: String::new(),
+            }],
+            vec![TemplateMessage {
+                role: "user".into(),
+                content: "héllo 🌍\nx".into(),
+            }],
             vec![],
         ];
 
@@ -939,9 +964,7 @@ mod tests {
             // Force the interpreter on the same source by constructing the
             // environment directly — `new()` would hand back the compiled path.
             let interpreted = ChatTemplate {
-                renderer: Renderer::Interpreted(Box::new(
-                    build_env(reg.compiled.source).unwrap(),
-                )),
+                renderer: Renderer::Interpreted(Box::new(build_env(reg.compiled.source).unwrap())),
                 bos_token: None,
                 eos_token: None,
                 template_str: reg.compiled.source.to_string(),
@@ -953,15 +976,21 @@ mod tests {
                     let b = interpreted.apply_simple(msgs, agp);
                     match (a, b) {
                         (Ok(a), Ok(b)) => assert_eq!(
-                            a, b,
+                            a,
+                            b,
                             "{}/{}: compiled and interpreted diverged (agp={agp}, {} msgs)",
-                            reg.arch, reg.stem, msgs.len()
+                            reg.arch,
+                            reg.stem,
+                            msgs.len()
                         ),
                         // "errors where the oracle errors" is part of the bar.
                         (Err(_), Err(_)) => {}
                         (a, b) => panic!(
                             "{}/{}: one path errored and the other did not: {:?} vs {:?}",
-                            reg.arch, reg.stem, a.is_err(), b.is_err()
+                            reg.arch,
+                            reg.stem,
+                            a.is_err(),
+                            b.is_err()
                         ),
                     }
                 }
@@ -972,14 +1001,19 @@ mod tests {
     /// A template this build did NOT compile must fall back, not render wrongly.
     #[test]
     fn unknown_template_falls_back_to_the_interpreter() {
-        let tpl = ChatTemplate::new(
-            "{% for m in messages %}<{{ m['role'] }}>{% endfor %}".to_string(),
-        )
-        .unwrap();
-        assert!(!tpl.is_compiled(), "an unvendored template must not claim a compiled renderer");
+        let tpl =
+            ChatTemplate::new("{% for m in messages %}<{{ m['role'] }}>{% endfor %}".to_string())
+                .unwrap();
+        assert!(
+            !tpl.is_compiled(),
+            "an unvendored template must not claim a compiled renderer"
+        );
         let out = tpl
             .apply_simple(
-                &[TemplateMessage { role: "user".into(), content: "x".into() }],
+                &[TemplateMessage {
+                    role: "user".into(),
+                    content: "x".into(),
+                }],
                 false,
             )
             .unwrap();

@@ -463,8 +463,7 @@ fn main() {
             .expect("arch name");
         chat_mods.push_str(&emit_chat_templates(configs_dir, &out_dir, arch));
     }
-    std::fs::write(out_dir.join("chat_templates.rs"), &chat_mods)
-        .expect("write chat_templates.rs");
+    std::fs::write(out_dir.join("chat_templates.rs"), &chat_mods).expect("write chat_templates.rs");
 
     // Shell-completion registry. Resolving it needs the network, so it happens
     // only under `hf-completions`; WRITING it is unconditional, because
