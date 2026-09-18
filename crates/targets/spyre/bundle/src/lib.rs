@@ -42,6 +42,7 @@ pub mod correction;
 pub use inventory;
 
 use std::borrow::Cow;
+use std::num::NonZeroU32;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  The two axes of the rung grid
@@ -286,8 +287,16 @@ pub struct KvShifts {
     /// seg2 shift per write slot, for a group that writes one token into the KV cache. `0` for a group
     /// that needs no slot shift.
     pub slot_stride_bytes: u32,
-    /// seg2 shift per 64-slot slab, for a group that restickifies Kᵀ. `0` when not a slab group.
-    pub slab_stride_bytes: u32,
+    /// The incremental Kᵀ restickify's shift, or `None` for a group that is not one.
+    ///
+    /// ⭐⭐⭐⭐⭐ THE STRIDE AND THE PAGE IT INDEXES INTO ARE ONE VALUE, and that is the whole reason this
+    /// is a [`SlabShift`] and not a `u32` beside [`Self::page_slots`]. A slab shift is a distance per
+    /// 64-slot BLOCK; a block index exists only inside a page. As two independent fields, "a stride with
+    /// no page" was a value you could write down — and the runtime that read it divided an absolute
+    /// history by 64 with nothing bounding the quotient, so from slot 256 on it shifted a whole page past
+    /// where the launch had been rebased. Below 257 tokens the two forms agree, which is why it shipped.
+    /// [`SlabShift::new`] takes both or neither, so that shape no longer exists to be checked for.
+    pub slab: Option<SlabShift>,
     /// The write-slot modulus AND the declaration that this bundle is PAGED — a runtime that does not
     /// know the key must refuse rather than apply an absolute-position shift and land past the page.
     /// `0` for an unpaged bundle.
@@ -312,9 +321,61 @@ impl KvShifts {
 
     /// Does this group restickify a Kᵀ slab? Derived, for the same reason.
     pub const fn slab_write(self) -> bool {
-        self.slab_stride_bytes > 0
+        self.slab.is_some()
     }
 }
+
+/// ⭐⭐⭐⭐⭐ THE INCREMENTAL Kᵀ RESTICKIFY'S SEGMENT SHIFT — a distance per 64-slot stick-block, TOGETHER
+/// WITH THE PAGE THAT BOUNDS THE BLOCK INDEX, because neither is meaningful without the other.
+///
+/// The op is baked at block 0 and the runtime moves it onto the live block. "Which block" is
+/// `position mod page / 64`, so the page is not context the caller may or may not supply — it is half
+/// the arithmetic. Carrying it here means [`shift_at`](Self::shift_at) is the only way to spend the
+/// stride, the wrap happens inside it, and there is no arrangement of these fields that skips it.
+///
+/// Both extents are [`NonZeroU32`], so a zero page (which would divide by zero) and a zero stride (a
+/// slab group whose every step re-transposes block 0) are not values either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlabShift {
+    stride_bytes: NonZeroU32,
+    page_slots: NonZeroU32,
+}
+
+impl SlabShift {
+    /// Both, or neither — there is no other constructor.
+    pub const fn new(stride_bytes: NonZeroU32, page_slots: NonZeroU32) -> SlabShift {
+        SlabShift {
+            stride_bytes,
+            page_slots,
+        }
+    }
+
+    /// Bytes to shift the KV segment so this op lands on the block holding `pos`.
+    ///
+    /// `pos` is a request's ABSOLUTE history and is wrapped into its page HERE — the one place it can
+    /// be, because this is the one place that holds both numbers. `rem_euclid` so a negative position
+    /// cannot produce a negative block.
+    pub const fn shift_at(self, pos: i64) -> u64 {
+        let page = self.page_slots.get() as i64;
+        let block = pos.rem_euclid(page) / SLAB_SLOTS;
+        (block as u64) * (self.stride_bytes.get() as u64)
+    }
+
+    /// The declared stride, for the group-uniformity comparison that is the only other reader.
+    pub const fn stride_bytes(self) -> NonZeroU32 {
+        self.stride_bytes
+    }
+
+    /// The page, for the ONE caller that has to take this value apart and put it back together: the
+    /// `#[forward]` codegen, which re-emits it through [`new`](Self::new) so the baked `static` cannot
+    /// hold a half of it either.
+    pub const fn page_slots(self) -> NonZeroU32 {
+        self.page_slots
+    }
+}
+
+/// Slots per stick-block — the fp16 stick, and the block's slot count.
+pub const SLAB_SLOTS: i64 = 64;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  A launch: the shifts and the program they apply to, as ONE value

@@ -1116,8 +1116,13 @@ pub struct EmittedOp {
     /// `(seq_pos/64)·slab_stride_bytes` so step `p` re-transposes slab `p/64` in place; prior slabs
     /// persist. Classified `GroupKind::Slab` — a DISTINCT kind from `Slot` (its `slab_stride_bytes`
     /// = STICK_BYTES·stick = 8192 ≠ the cachewr's `slot_stride_bytes` 128, so fusing would trip the Slot
-    /// uniform-stride assert). 0/`false` = the plain full-active_cap restickify. Default false/0.
-    pub slab_write: bool,
+    /// uniform-stride assert). `0` = the plain whole-page restickify.
+    ///
+    /// ⛔ NO `slab_write` FLAG BESIDE IT. There was one, and it made two arrangements expressible that
+    /// mean nothing: a stride with the flag clear (dead work baked into the bundle) and the flag set with
+    /// a zero stride (classified a Slab group, shift 0, so every step re-transposes block 0 and the
+    /// prefix Kᵀ silently stops advancing). `bundle::KvShifts` already derives its own flag from its
+    /// stride "so a stride and its flag cannot disagree"; this is that argument one layer up.
     pub slab_stride_bytes: u32,
     /// PAGE FOLD: folds ONE page of resident prefix into the running online-softmax state. Such ops
     /// are grouped APART from the body and re-launched once per page the context spans, each launch
@@ -1216,7 +1221,6 @@ impl EmittedOp {
             time: 1,
             affine_strides: Vec::new(),
             slot_stride_bytes: 0,
-            slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,
             kv_page_fold: false,
@@ -1253,7 +1257,6 @@ impl EmittedOp {
             kv_fold_rows: self.kv_fold_rows,
             kv_page_slots: self.kv_page_slots,
             kv_request: self.kv_request,
-            slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
             slot_no_fuse: self.slot_no_fuse,
             host_kv_write: self.host_kv_write,
@@ -1328,7 +1331,6 @@ impl EmittedOp {
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
             kv_page_slots: 0,
             kv_request: 0,
-            slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,
             host_kv_write: false,

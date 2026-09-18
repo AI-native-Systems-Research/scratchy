@@ -8854,20 +8854,32 @@ fn launch_tokens(
     } = g;
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::KvShifts {
         slot_stride_bytes,
-        slab_stride_bytes,
+        slab,
         page_slots,
         request,
         page_fold,
         batched_requests,
         fold_rows,
     } = kv;
-    let [slot, slab, slots, req] = [
-        *slot_stride_bytes,
-        *slab_stride_bytes,
-        *page_slots,
-        *request,
-    ]
-    .map(proc_macro2::Literal::u32_unsuffixed);
+    let [slot, slots, req] = [*slot_stride_bytes, *page_slots, *request]
+        .map(proc_macro2::Literal::u32_unsuffixed);
+    // ⭐ THE SLAB SHIFT IS RECONSTRUCTED THROUGH ITS CONSTRUCTOR, not field-by-field, so the baked
+    // `static` cannot hold a stride whose page went missing any more than the value it was read from
+    // could — `SlabShift`'s fields are private and `new` takes both. `NonZeroU32::new(..).unwrap()` is
+    // const-evaluable, and both numbers came from a `SlabShift`, so neither can be zero here.
+    let slab = match slab {
+        Some(s) => {
+            let stride = proc_macro2::Literal::u32_unsuffixed(s.stride_bytes().get());
+            let page = proc_macro2::Literal::u32_unsuffixed(s.page_slots().get());
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::SlabShift::new(
+                    match ::core::num::NonZeroU32::new(#stride) { Some(n) => n, None => unreachable!() },
+                    match ::core::num::NonZeroU32::new(#page) { Some(n) => n, None => unreachable!() },
+                ))
+            }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
     let fold_rows = match fold_rows {
         scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::WholeBatch => {
             quote! { ::scratchy_target_spyre::bundle_code::FoldRows::WholeBatch }
@@ -8895,7 +8907,7 @@ fn launch_tokens(
         ::scratchy_target_spyre::bundle_code::LaunchGroup {
             kv: ::scratchy_target_spyre::bundle_code::KvShifts {
                 slot_stride_bytes: #slot,
-                slab_stride_bytes: #slab,
+                slab: #slab,
                 page_slots: #slots,
                 request: #req,
                 page_fold: #page_fold,

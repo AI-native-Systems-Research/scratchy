@@ -284,8 +284,9 @@ impl Drop for Executor {
 impl OpProg {
     /// Pair one launch-index entry with the program it names.
     ///
-    /// `slot_write`/`slab_write` stay DERIVED from their strides ("> 0", as the C++ had them) so a
-    /// stride and its flag cannot disagree.
+    /// `slot_write` stays DERIVED from its stride ("> 0", as the C++ had it) so a stride and its flag
+    /// cannot disagree. The slab needs no flag at all: it is one `Option<SlabShift>` carrying both the
+    /// stride and the page its block index lives in.
     fn new(code: &'static bundle::LaunchGroup<'static>, fp: &'static str, index: usize) -> OpProg {
         let kv = &code.kv;
         OpProg {
@@ -299,8 +300,10 @@ impl OpProg {
                 slot_write: kv.slot_write(),
                 page_slots: kv.page_slots as u64,
                 slot_stride_bytes: kv.slot_stride_bytes as u64,
-                slab_write: kv.slab_write(),
-                slab_stride_bytes: kv.slab_stride_bytes as u64,
+                // ⭐ ONE FIELD, NOT THREE. The slab stride and the page its block index lives in are a
+                // single `SlabShift`, so there is no flag to derive and no stride to copy beside a page
+                // it might not match — see `bundle::SlabShift`.
+                slab: kv.slab,
                 batched_requests: kv.batched_requests,
             },
         }
@@ -1958,7 +1961,7 @@ impl Executor {
 
                 if d.repeat_probe
                     && !op.kv.page_fold
-                    && (op.kv.slot_write || op.kv.slab_write || op.kv.request > 0)
+                    && (op.kv.slot_write || op.kv.slab.is_some() || op.kv.request > 0)
                 {
                     // Both halves pay one drain, so the drain's host round trip cancels in the
                     // comparison and only the cold-vs-warm program difference is left.

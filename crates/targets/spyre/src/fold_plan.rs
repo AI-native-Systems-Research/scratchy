@@ -18,8 +18,9 @@ pub const SEG_KV: usize = 2;
 /// The prefix-validity mask's segment index. It rides in the activation segment precisely so a fold
 /// can shift it without disturbing the running softmax state or any other activation.
 pub const SEG_MASK: usize = 3;
-/// Slots per slab in the incremental Kᵀ restickify — the fp16 stick, and the slab's slot count.
-const SLAB_SLOTS: i64 = 64;
+// ⛔ NO `SLAB_SLOTS` HERE ANY MORE. The block width belongs beside the page that bounds the block index,
+// which is `scratchy_spyre_bundle::SLAB_SLOTS` and `SlabShift::shift_at`. A second copy in this file is
+// how the block arithmetic came to be written twice, once with the page and once without it.
 
 /// WHICH ROW OF THIS LAUNCH — a tensor row, not a request identity.
 ///
@@ -307,10 +308,11 @@ pub struct OpKv {
     pub page_slots: u64,
     /// Bytes between consecutive write slots.
     pub slot_stride_bytes: u64,
-    /// `slab_write`: the incremental Kᵀ restickify, which re-transposes the current slab.
-    pub slab_write: bool,
-    /// Bytes between consecutive slabs.
-    pub slab_stride_bytes: u64,
+    /// The incremental Kᵀ restickify's shift and the page that bounds its block index, as ONE value —
+    /// `None` for every op that is not one. See [`bundle::SlabShift`]: as a `slab_write` flag plus a
+    /// bare stride beside `page_slots`, three independently-filled fields described one fact, and the
+    /// combination that had a stride but no page made the block index an unbounded quotient.
+    pub slab: Option<scratchy_spyre_bundle::SlabShift>,
     /// THIS OP WAS BAKED WITH A REQUEST AXIS — its kernel steps one request per unit of that axis, so
     /// ONE launch computes every row of the batch and the fold no longer needs a pass per request.
     ///
@@ -944,19 +946,19 @@ pub fn nonfold_page_delta(op: &OpKv, s: &SessionKv, pos: SlotPos, caller_base: B
 /// The incremental Kᵀ restickify re-transposes the CURRENT slab, so its segment base moves by one
 /// slab's stride. Slab 0 is the baked base and does not shift.
 ///
-/// 🛑 TAKES THE LAUNCH POSITION, NOT THE OP'S. Every op of a batched launch therefore restickifies
-/// row 0's slab. Preserved verbatim: it is what the C++ does, and every other batched-decode defect
-/// found so far was invisible until a second request existed, so changing it here — untested, in the
-/// same commit as a port — is precisely how the last attempt at this file ended up garbling.
+/// 🛑 TAKES WHATEVER POSITION THE CALLER RESOLVED, and [`seg_deltas`] resolves the OP'S OWN — see
+/// `the_slab_shift_follows_the_requests_own_position`. It read the LAUNCH's for as long as the port
+/// was in progress (which is what the C++ does, and is invisible at one request), because every
+/// other batched-decode defect found so far was invisible until a second request existed, so
+/// changing it inside the port — untested — is how the last attempt at this file ended up garbling.
+/// ⭐ THERE IS NO ARITHMETIC HERE, AND THAT IS THE FIX. The page a block index lives in travels INSIDE
+/// [`bundle::SlabShift`], so wrapping the absolute position is not a step this function performs and
+/// therefore not a step it can omit. `None` is an op that is not an incremental restickify, which is the
+/// only case that contributes nothing — not a stride whose page went missing, because that value cannot
+/// be built.
 pub fn slab_delta(op: &OpKv, pos: SlotPos) -> Bytes {
-    if !op.slab_write {
-        return Bytes(0);
-    }
-    let slab = pos.get() / SLAB_SLOTS;
-    if slab <= 0 {
-        return Bytes(0);
-    }
-    Bytes((slab as u64).wrapping_mul(op.slab_stride_bytes))
+    op.slab
+        .map_or(Bytes(0), |shift| Bytes(shift.shift_at(pos.get())))
 }
 
 /// Everything the launch loop adds to the segment bases for one op on one pass, in the C++'s order.
@@ -1011,6 +1013,16 @@ mod tests {
     // a test appended into it a moment ago reported "0 passed; 19 filtered out" rather than failing. A test that
     // cannot run is worse than no test: it reads as coverage.
     use super::*;
+
+    /// A slab shift, for the fixtures. Both extents are required by the type, which is exactly what the
+    /// old `slab_write` + bare-stride pair let a fixture leave half-built.
+    fn slab_shift(stride: u32, page: u32) -> Option<scratchy_spyre_bundle::SlabShift> {
+        use std::num::NonZeroU32;
+        Some(scratchy_spyre_bundle::SlabShift::new(
+            NonZeroU32::new(stride).expect("a fixture states a real stride"),
+            NonZeroU32::new(page).expect("a fixture states a real page"),
+        ))
+    }
 
     /// A paged session with two requests holding distinct physical pages.
     fn sess() -> SessionKv {
@@ -1382,8 +1394,7 @@ mod tests {
                 ..Default::default()
             },
             OpKv {
-                slab_write: true,
-                slab_stride_bytes: 64,
+                slab: slab_shift(64, 256),
                 ..Default::default()
             },
             OpKv::default(),
@@ -1530,19 +1541,29 @@ mod tests {
     fn the_slab_shift_follows_the_requests_own_position() {
         let s = sess();
         let op = OpKv {
-            slab_write: true,
-            slab_stride_bytes: 8192,
+            slab: slab_shift(8192, 256),
             request: 1,
             ..Default::default()
         };
-        // Request 1 sits at 300 (slab 4); the launch is at 100 (slab 1). The shift must be request 1's.
+        // Request 1 sits at 300 — slot 44 of page 1, so block 0. The launch is at 100 — block 1. The
+        // shift must be request 1's, and the two DIFFER, which is what makes this a discriminator.
+        //
+        // ⭐ THESE NUMBERS MOVED, AND THAT IS THE FIX. This asserted `4 * stride` for position 300, which
+        // is block 4 of a page that has four blocks — the unbounded quotient. It stayed green because the
+        // fixture declared no page, a shape `SlabShift` no longer has a representation for.
         assert_eq!(
             op_slot_pos(&op, &s, SlotPos::of_launch(100)),
             SlotPos::of_launch(300)
         );
         assert_eq!(
             slab_delta(&op, op_slot_pos(&op, &s, SlotPos::of_launch(100))),
-            Bytes(4 * 8192)
+            Bytes(0),
+            "position 300 is slot 44 of page 1, so block 0 — NOT block 4"
+        );
+        assert_eq!(
+            slab_delta(&op, SlotPos::of_launch(100)),
+            Bytes(8192),
+            "the launch's own position is block 1, so the two really do disagree here"
         );
         assert_eq!(
             slab_delta(&op, SlotPos::of_launch(63)),
@@ -1564,8 +1585,57 @@ mod tests {
         assert_eq!(
             d.kv,
             slab_delta(&op, own) + nonfold_page_delta(&op, &s, own, Bytes(0)),
-            "the launch's slab would contribute 8192 here instead of {}",
-            4 * 8192
+            "the launch's block would contribute 8192 here instead of 0"
+        );
+    }
+
+    /// ⛔⛔⛔ THE SLAB SHIFT WRAPS AT THE PAGE, and this is pinned AT THE BOUNDARY rather than in the
+    /// middle — the middle of a page is where the unwrapped form is also right.
+    ///
+    /// A page is `PagedKvPool::PAGE_SLOTS` = 256 slots = four 64-slot slabs numbered 0..3, so a slab
+    /// index derived from an ABSOLUTE history is only an index while the history is inside its first
+    /// page. Position 300 is slot 44 of page 1 and therefore slab **0**; unwrapped it was `4 * stride`,
+    /// a slab of no page at all, one whole page past where [`nonfold_page_delta`] had already rebased
+    /// the launch.
+    ///
+    /// ⛔ THERE IS NO "UNPAGED SLAB OP" CASE BELOW, and its absence is the guard rather than an omission:
+    /// [`bundle::SlabShift`] takes the stride and the page together, so the shape this test used to have
+    /// to cover — a stride whose page was missing, which is what made the quotient unbounded — has no
+    /// representation. A fixture cannot build it, so no runtime check has to catch it.
+    #[test]
+    fn the_slab_shift_wraps_at_the_page() {
+        let paged = OpKv {
+            slab: slab_shift(8192, 256),
+            ..Default::default()
+        };
+        for (pos, slab, why) in [
+            (0i64, 0u64, "slot 0 of page 0 is the baked base"),
+            (63, 0, "still inside slab 0"),
+            (64, 1, "the first slab boundary"),
+            (255, 3, "the last slab of page 0"),
+            (256, 0, "slot 0 of page 1 — the wrap, and the whole point"),
+            (300, 0, "slot 44 of page 1: slab 0, where unwrapped gave slab 4"),
+            (511, 3, "the last slab of page 1"),
+            (512, 0, "slot 0 of page 2"),
+        ] {
+            assert_eq!(
+                slab_delta(&paged, SlotPos::of_launch(pos)),
+                Bytes(slab * 8192),
+                "pos {pos} must select slab {slab} ({why})"
+            );
+        }
+        // A page this wide has exactly four slabs, so no position may ever select a fourth index.
+        for pos in 0..1024i64 {
+            let d = slab_delta(&paged, SlotPos::of_launch(pos)).0;
+            assert!(
+                d < 4 * 8192,
+                "pos {pos} shifted by {d}, which is at or past the page's four slabs"
+            );
+        }
+        // An op that is not an incremental restickify contributes nothing — the ONLY `None` case left.
+        assert_eq!(
+            slab_delta(&OpKv::default(), SlotPos::of_launch(300)),
+            Bytes(0)
         );
     }
 

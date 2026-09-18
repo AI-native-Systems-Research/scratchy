@@ -73,6 +73,7 @@ pub use ktir_superdsc::ktir_node::ActiveCap;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR};
 use scratchy_subtile::superdsc_opspec::DataFormat;
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 // Re-export the hardware constants from the typed core so the whole emitter
 // shares ONE source of truth (the typed witnesses live in `superdsc_opspec`).
@@ -2135,7 +2136,7 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
                 }
             } else if e.kv_page_fold {
                 GroupKind::PageFold
-            } else if e.slab_write {
+            } else if e.slab_stride_bytes > 0 {
                 // Incremental Kᵀ restickify (kill-restickify Stage 2) → Slab (fusable, one
                 // `slab_stride_bytes`). A DISTINCT kind from Slot: its 8192-byte slab stride ≠ the
                 // cachewr's 128, so fusing them would trip the per-group uniform-stride assert.
@@ -2465,28 +2466,38 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         // SLAB-group stride (kill-restickify Stage 2): mirror the Slot guard — the shim shifts the fused
         // Slab group's seg2 base by `(slot_pos/64)·slab_stride` ONCE, so every op in the group MUST share
         // one slab_stride (else a kv-head restickifies the wrong slab). Non-Slab groups: 0.
-        let slab = if matches!(kinds[r.start].kind, GroupKind::Slab) {
-            let stride = e.slab_stride_bytes;
+        // ⭐ THE STRIDE BECOMES A SHIFT ONLY BY PRODUCING THE PAGE IT INDEXES INTO. `SlabShift::new`
+        // takes both as `NonZeroU32`, so this is where "a slab stride with no page" stops being a value
+        // anyone can construct: an op that declares a stride and leaves `kv_page_slots` at 0 yields
+        // `None` here and simply is not a slab group, instead of reaching the runtime as an unbounded
+        // block index. Zip rather than two ifs, so neither can be present without the other.
+        let slab = matches!(kinds[r.start].kind, GroupKind::Slab)
+            .then(|| {
+                Some(bundle::SlabShift::new(
+                    NonZeroU32::new(e.slab_stride_bytes)?,
+                    NonZeroU32::new(e.kv_page_slots)?,
+                ))
+            })
+            .flatten();
+        if let Some(shift) = slab {
             for t in r.clone() {
                 let o = &ops[owner[t]];
                 assert!(
-                    o.slab_stride_bytes == stride,
-                    "fused Slab group {gi}: op '{}' slab_stride {} != group stride {stride} — a fused \
-                     Slab group's shim shift is uniform, so all restickifies must share one slab_stride \
+                    o.slab_stride_bytes == shift.stride_bytes().get(),
+                    "fused Slab group {gi}: op '{}' slab_stride {} != group stride {} — a fused Slab \
+                     group's shim shift is uniform, so all restickifies must share one slab_stride \
                      (else a kv-head re-transposes the wrong slab)",
                     o.op_name,
-                    o.slab_stride_bytes
+                    o.slab_stride_bytes,
+                    shift.stride_bytes()
                 );
             }
-            stride
-        } else {
-            0
-        };
+        }
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold);
         let _ = gi; // launch order is the slice position now, not a field
         shifts.push(bundle::KvShifts {
             slot_stride_bytes: slot,
-            slab_stride_bytes: slab,
+            slab,
             // PAGED: `page_slots` is the write-slot modulus AND the declaration that this bundle is
             // paged — a runtime that does not know the key must refuse rather than apply an
             // absolute-position shift and land past the page.
