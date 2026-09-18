@@ -258,12 +258,23 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
 }
 
 #[test]
-fn fp8_untileable_matmul_is_err_not_substick() {
-    // A pathological fp8 matmul whose per-core tile does NOT fit LX even at a SINGLE 128-fp8 stick
-    // (N=128 ⇒ 1 stick, unsplittable; K=16384 ⇒ W[16384,128]·1B = 2 MiB > 1.68 MiB usable LX). The
-    // time-tile pass cannot slice below 128 without a sub-stick slab, so it MUST return a typed `Err`
-    // at emit (the build-time DtException-1535/1070 guard), NEVER silently emit a 64-wide fp8 tile.
-    let r = matmul_opspec_off::<Fp8>(
+fn fp8_lx_overflow_is_rescued_by_a_reduction_split_not_a_substick() {
+    // N=128 ⇒ ONE fp8 stick, unsplittable on the output axis; K=16384 ⇒ W[16384,128]·1B = 2 MiB against
+    // 1.68 MiB usable LX. The output-stick time-tile lever bottoms out here.
+    //
+    // ⛔ THIS TEST USED TO ASSERT `Err`, AND THAT ASSERTION WENT STALE. Its premise was the old
+    // `time_tile_for_lx` diagnosis — "does not fit even at one stick ⇒ needs K-time PSUM accumulation
+    // (Stage 2), which the frontend does not emit". That diagnosis was wrong: past one out-stick the
+    // per-core resident set is a function of the WORK DIVISION, not of the time-tiling, so the real lever
+    // is a reduction-axis CORE split. `WorkPlan::divide_and_time_tile_for_lx` landed that (it walks the
+    // reduction stick divisors on a refusal and re-runs the same splitter under `N/r` cores), and this
+    // shape is now RESCUED. `Ok` is the better answer and the test had it backwards — it was failing on
+    // main for exactly that reason.
+    //
+    // ⭐ SO THE PROPERTY IS "RESCUED BY SPLITTING `in`", NOT "Ok". Asserting mere success would pass just
+    // as well if the emitter had started shipping the sub-128 fp8 tile this file exists to forbid, so the
+    // split is what gets pinned — and the `in` split is exactly what the repair adds.
+    let op = matmul_opspec_off::<Fp8>(
         mm(1),
         nn(128),
         kk(16384),
@@ -275,10 +286,20 @@ fn fp8_untileable_matmul_is_err_not_substick() {
         0,
         0,
         0,
-    );
+    )
+    .expect("the reduction-split repair rescues a shape whose OUTPUT stick lever has bottomed out");
     assert!(
-        r.is_err(),
-        "an fp8 matmul that can't fit LX without a sub-128 slab must be Err, got Ok"
+        op.iter.split_of("in") > 1,
+        "the rescue IS the reduction split: expected `in` split > 1, got splits {:?}",
+        op.iter.splits()
+    );
+    // AND THE FLOOR THIS FILE GUARDS STILL HOLDS: whatever the division, no per-core output extent may
+    // drop below one whole 128-element fp8 stick.
+    assert_eq!(
+        op.iter.per_core_extent("out") % 128,
+        0,
+        "per-core `out` must stay a whole 128-fp8 stick; splits {:?}",
+        op.iter.splits()
     );
 }
 
