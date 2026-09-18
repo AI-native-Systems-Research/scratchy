@@ -56,7 +56,7 @@ were the easier cases.
 - Very small AoT binaries, e.g. 30Mi for Metal, 100Mi for Spyre, 250Mi for Cuda.
 - Very small docker images, e.g. 330Mi for Spyre.
 - Fast startup time, e.g. 300ms warm startup on Apple Silicon *independent of model size*; 12s for 8B on Spyre.
-- 25 architectures in 1,580 lines of DSL; Spyre support is ~129k lines and cost *zero* lines of model code.
+- 25 architectures in 1,580 lines of DSL; supporting Spyre took about as much Rust as supporting CUDA, and cost *zero* lines of model code.
 
 ## Getting Started
 

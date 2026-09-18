@@ -100,9 +100,9 @@ structurally incapable of providing this guarantee: it does not know the shapes
 until it is already running, on the card, where the only channel back to the
 developer is an integer.
 
-Spyre support is approximately 129,000 lines of Rust — twice the size of the
-CUDA backend — and it required zero changes to model code. The same 1,580 lines.
-The same 22-line LLaMA definition. An 8B model boots in 12 seconds from a
+Supporting silicon with no ecosystem behind it took about as much Rust as
+supporting CUDA, and it required zero changes to model code. The same 1,580
+lines. The same 22-line LLaMA definition. An 8B model boots in 12 seconds from a
 330 MiB image.
 
 ## A New Threshold for Novel Silicon
