@@ -1,27 +1,99 @@
+/* Carbon Design System tokens, hand-written.
+ *
+ * Colors are the published values of Carbon's `white` and `g100` themes
+ * (@carbon/themes), spacing is the $spacing-01..13 scale, and type is IBM Plex
+ * on the productive scale. No npm, no CDN components — the landing page and the
+ * mdBook theme (theme/scratchy.css) read the same tokens, so both faces of the
+ * site move together.
+ *
+ * Every color below is a published Carbon value. Nothing is hand-picked, and
+ * the syntax accents are drawn from Carbon's own Purple/Magenta/Teal/Green
+ * ramps rather than invented. Each pairing clears WCAG AA against the surface
+ * it sits on. */
+
 :root {
-  --bg: #0d1117;
-  --bg-soft: #131a24;
-  --panel: #161d29;
-  --line: #232c3b;
-  --fg: #d8e0ea;
-  --muted: #8b98ab;
-  --accent: #ff8a4c;
-  --accent-2: #63b3f5;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
-  --wide: 1080px;
+  /* g100 (dark) — the default face */
+  --background: #161616;
+  --background-hover: rgba(141, 141, 141, 0.16);
+  --layer-01: #262626;
+  --layer-02: #393939;
+  --layer-hover-01: #333333;
+  --layer-hover-02: #474747;
+  --border-subtle: #525252;
+  --border-strong: #6f6f6f;
+  --text-primary: #f4f4f4;
+  --text-secondary: #c6c6c6;
+  --text-helper: #a8a8a8;
+  --text-inverse: #161616;
+  --link-primary: #78a9ff;
+  --link-primary-hover: #a6c8ff;
+  --border-interactive: #4589ff;
+  --focus: #ffffff;
+
+  --accent: #78a9ff;          /* link-primary, Blue 40 — 7.68:1 on --background */
+
+  /* Carbon's button component tokens, verbatim. */
+  --button-tertiary: #ffffff;
+  --button-tertiary-hover: #f4f4f4;
+  --button-tertiary-active: #c6c6c6;
+
+  /* Carbon spacing scale */
+  --spacing-01: 0.125rem;
+  --spacing-02: 0.25rem;
+  --spacing-03: 0.5rem;
+  --spacing-04: 0.75rem;
+  --spacing-05: 1rem;
+  --spacing-06: 1.5rem;
+  --spacing-07: 2rem;
+  --spacing-08: 2.5rem;
+  --spacing-09: 3rem;
+  --spacing-10: 4rem;
+  --spacing-11: 5rem;
+  --spacing-12: 6rem;
+  --spacing-13: 10rem;
+
+  --sans: "IBM Plex Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* 16 columns at 66px — Carbon's 2x grid, held to a landing-page width */
+  --wide: 1056px;
+
+  /* Theme-invariant in Carbon: the same blue in white, g10, g90 and g100. */
+  --button-primary: #0f62fe;
+  --button-primary-hover: #0050e6;
+  --button-primary-active: #002d9c;
+  --text-on-color: #ffffff;
+
+  /* @carbon/motion, productive set */
+  --motion-standard: cubic-bezier(0.2, 0, 0.38, 0.9);
+  --motion-productive: cubic-bezier(0, 0, 0.38, 0.9);   /* entrance */
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #fbfcfd;
-    --bg-soft: #f2f5f8;
-    --panel: #ffffff;
-    --line: #dfe5ec;
-    --fg: #1a2330;
-    --muted: #5b6878;
-    --accent: #c2410c;
-    --accent-2: #1d63b5;
+    /* white theme */
+    --background: #ffffff;
+    --background-hover: rgba(141, 141, 141, 0.12);
+    --layer-01: #f4f4f4;
+    --layer-02: #ffffff;
+    --layer-hover-01: #e8e8e8;
+    --layer-hover-02: #e8e8e8;
+    --border-subtle: #c6c6c6;
+    --border-strong: #8d8d8d;
+    --text-primary: #161616;
+    --text-secondary: #525252;
+    --text-helper: #6f6f6f;
+    --text-inverse: #ffffff;
+    --link-primary: #0f62fe;
+    --link-primary-hover: #0043ce;
+    --border-interactive: #0f62fe;
+    --focus: #0f62fe;
+
+    --accent: #0f62fe;          /* interactive, Blue 60 — 5.00:1 on white */
+
+    --button-tertiary: #0f62fe;
+    --button-tertiary-hover: #0050e6;
+    --button-tertiary-active: #002d9c;
   }
 }
 
@@ -31,37 +103,73 @@ html { scroll-behavior: smooth; }
 
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--fg);
+  background: var(--background);
+  color: var(--text-primary);
   font-family: var(--sans);
-  font-size: 17.5px;
-  line-height: 1.7;
+  font-size: 1rem;      /* body-02 */
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
 
-a { color: var(--accent-2); text-decoration: none; }
-a:hover { text-decoration: underline; }
+/* Carbon link — `link/_link.scss`.
+ *
+ * Note the focus treatment: a link takes `focus-outline('border')`, which is a
+ * *1px* outline with no offset, not the 2px inset ring tiles and buttons use.
+ * Hover only applies where hover exists, visited does not recolour, and active
+ * returns to $link-primary while keeping the ring. Carbon keys all of this off
+ * `:focus` rather than `:focus-visible`, so this does too. */
+a {
+  color: var(--link-primary);
+  outline: none;
+  text-decoration: none;
+  transition: color 70ms var(--motion-standard);
+}
+
+@media (any-hover: hover) {
+  a:hover,
+  a:visited:hover { color: var(--link-primary-hover); text-decoration: underline; }
+  a:active:visited:hover { color: var(--link-primary); }
+}
+
+a:visited { color: var(--link-primary); }
+
+a:focus,
+a:active {
+  outline: 1px solid var(--focus);
+  text-decoration: underline;
+}
+a:active { color: var(--link-primary); }
+
+@media screen and (prefers-contrast) {
+  a:focus,
+  a:active { outline-style: dotted; }
+}
+
+/* Tiles take `focus-outline('outline')` instead — 2px, inset by 2px. */
+.dcard:focus,
+.tcard:focus,
+.ncard:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.dcard:focus { text-decoration: none; }
 
 code, pre { font-family: var(--mono); }
 
+/* Carbon code snippets are a $layer surface, not a bordered box. */
 code {
   font-size: 0.875em;
-  background: var(--bg-soft);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 0.1em 0.35em;
+  background: var(--layer-01);
+  padding: 0 var(--spacing-02);
 }
 
 pre {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-top: none;
-  border-radius: 0 0 8px 8px;
+  background: var(--layer-01);
   margin: 0;
-  padding: 1rem 1.15rem;
+  padding: var(--spacing-05) var(--spacing-06);
   overflow-x: auto;
-  font-size: 14px;
-  line-height: 1.6;
+  font-size: 0.875rem;  /* code-01 */
+  line-height: 1.43;
 }
 
 pre code {
@@ -73,253 +181,453 @@ pre code {
 
 .codehead {
   font-family: var(--mono);
-  font-size: 12.5px;
-  letter-spacing: 0.04em;
-  color: var(--muted);
-  background: var(--bg-soft);
-  border: 1px solid var(--line);
-  border-radius: 8px 8px 0 0;
-  padding: 0.5rem 1.15rem;
+  font-size: 0.75rem;   /* label-01 */
+  letter-spacing: 0.32px;
+  color: var(--text-helper);
+  background: var(--layer-01);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: var(--spacing-03) var(--spacing-06);
 }
 
-/* syntax accents */
-.c-at { color: var(--accent); }
-.c-kw { color: #c792ea; }
-.c-fn { color: var(--accent-2); }
-.c-n  { color: #f2b05e; }
-.c-s  { color: #86d99a; }
-.c-cm { color: var(--muted); font-style: italic; }
+/* syntax accents, from Carbon's color ramps */
+.c-at { color: #3ddbd9; }  /* Teal 30 */
+.c-kw { color: #be95ff; }  /* Purple 40 */
+.c-fn { color: #78a9ff; }  /* Blue 40 */
+.c-n  { color: #ff7eb6; }  /* Magenta 40 */
+.c-s  { color: #6fdc8c; }  /* Green 30 */
+.c-cm { color: var(--text-helper); font-style: italic; }
+
+@media (prefers-color-scheme: light) {
+  .c-at { color: #005d5d; }  /* Teal 70 */
+  .c-kw { color: #6929c4; }  /* Purple 70 */
+  .c-fn { color: #0043ce; }  /* Blue 70 */
+  .c-n  { color: #9f1853; }  /* Magenta 70 */
+  .c-s  { color: #0e6027; }  /* Green 70 */
+}
 
 /* ---------- hero ---------- */
 
+/* Flat, not gradient: Carbon surfaces are planes separated by a 1px rule. */
 .hero {
-  border-bottom: 1px solid var(--line);
-  background:
-    radial-gradient(900px 420px at 15% -10%, rgba(255, 138, 76, 0.13), transparent 70%),
-    radial-gradient(800px 420px at 85% 0%, rgba(99, 179, 245, 0.11), transparent 70%);
+  background: var(--layer-01);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
+/* Carbon UI shell header — `ui-shell/header/_header.scss`, followed exactly:
+ * fixed to the top of the viewport at `z('header')`, `mini-units(6)` tall,
+ * `$background`, one `$border-subtle` rule beneath, flush to both edges. The
+ * content below is offset by the same `mini-units(6)`, which is what Carbon's
+ * `.cds--header ~ .cds--content { margin-block-start: mini-units(6) }` does. */
 nav {
-  max-width: var(--wide);
-  margin: 0 auto;
-  padding: 1.1rem 1.5rem;
+  position: fixed;
+  z-index: 8000;              /* z('header') */
+  inset-block-start: 0;
+  inset-inline: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  block-size: 3rem;           /* mini-units(6) */
+  background: var(--background);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
+body { padding-block-start: 3rem; }
+
+/* header__name: body-compact-01 at 600, 0.1px tracking, a 16px lead-in and a
+ * 32px trailing gutter, over a transparent 2px border so focus can colour it
+ * without reflowing the bar. */
 .brand {
+  display: flex;
+  align-items: center;
+  block-size: 100%;
+  padding: 0 var(--spacing-07) 0 var(--spacing-05);
+  border: 2px solid transparent;
   font-family: var(--mono);
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  font-size: 1.05rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.25rem;
+  letter-spacing: 0.1px;
+  color: var(--text-primary);
 }
 .brand::before { content: "▚ "; color: var(--accent); }
 
-.navlinks { display: flex; gap: 1.5rem; font-size: 0.92rem; }
-.navlinks a { color: var(--muted); }
-.navlinks a:hover { color: var(--fg); text-decoration: none; }
+/* header__nav: sits immediately after the name, opened by a 1px × 24px
+ * `$border-subtle` divider at its inline start. */
+.navlinks {
+  position: relative;
+  display: flex;
+  block-size: 100%;
+  padding-inline-start: var(--spacing-05);
+}
+.navlinks::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-start: 0;
+  transform: translateY(-50%);
+  display: block;
+  inline-size: 1px;
+  block-size: 1.5rem;
+  background-color: var(--border-subtle);
+}
+
+/* header__menu-item: full-height, 16px gutters, hovers to $background-hover. */
+.navlinks a {
+  position: relative;
+  display: flex;
+  align-items: center;
+  block-size: 100%;
+  padding: 0 var(--spacing-05);
+  border: 2px solid transparent;
+  background-color: var(--background);
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  font-weight: 400;
+  line-height: 1.125rem;
+  letter-spacing: 0;
+  transition:
+    background-color 110ms var(--motion-productive),
+    border-color 110ms var(--motion-productive),
+    color 110ms var(--motion-productive);
+}
+.navlinks a:hover {
+  background-color: var(--background-hover);
+  color: var(--text-primary);
+  text-decoration: none;
+}
+.navlinks a:focus-visible { outline: none; border-color: var(--focus); }
+
+/* Selected state: $text-primary plus a 3px $border-interactive bar that
+ * overhangs the transparent border by 2px on each side. */
+.navlinks a[aria-current="page"] { color: var(--text-primary); }
+.navlinks a[aria-current="page"]::after {
+  content: "";
+  position: absolute;
+  inset-block-end: -2px;
+  inset-inline-start: -2px;
+  inline-size: calc(100% + 4px);
+  block-size: 3px;
+  background-color: var(--border-interactive);
+}
+
+/* header__global: the icon actions Carbon puts opposite the nav. */
+.header-global {
+  display: flex;
+  flex: 1 1 0%;
+  justify-content: flex-end;
+  block-size: 100%;
+}
 
 .hero-body {
   max-width: var(--wide);
   margin: 0 auto;
-  padding: 3.5rem 1.5rem 4rem;
+  padding: var(--spacing-10) var(--spacing-06) var(--spacing-11);
 }
 
+/* Carbon expressive headings are large and *light* — weight 300, no negative
+ * tracking. That restraint is most of what makes a page read as Carbon. */
 h1 {
-  font-size: clamp(2.2rem, 5.5vw, 3.6rem);
-  line-height: 1.1;
-  letter-spacing: -0.03em;
-  margin: 0 0 1.25rem;
-  font-weight: 700;
+  font-size: clamp(2.25rem, 5vw, 3.375rem);  /* heading-05 → heading-07 */
+  line-height: 1.19;
+  letter-spacing: 0;
+  font-weight: 300;
+  margin: 0 0 var(--spacing-06);
 }
 
 h1 .accent { color: var(--accent); }
 
 .lede {
-  max-width: 44rem;
-  font-size: 1.14rem;
-  color: var(--muted);
-  margin: 0 0 2.75rem;
+  max-width: 42rem;
+  font-size: 1.25rem;   /* fluid-paragraph-01 */
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--text-secondary);
+  margin: 0 0 var(--spacing-09);
 }
 
 .triple {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 1rem;
-  margin-bottom: 2.5rem;
+  gap: var(--spacing-05);
+  margin-bottom: var(--spacing-09);
 }
 
+/* Carbon tile: `$layer` background, **no border**, $spacing-05 padding, a 4rem
+ * minimum block size, body-compact-01 text, and a 2px inset focus outline. The
+ * border only exists under Carbon's `enable-tile-contrast` flag, so the layer
+ * contrast is what separates a tile from its surface.
+ *
+ * These sit inside the hero, which is already $layer-01, so they take
+ * $layer-02 — Carbon's layering model, where a tile steps up from whatever it
+ * rests on. The tiles in <main> rest on $background and take $layer-01. */
 .tcard {
   position: relative;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 1.25rem 1.25rem 1.1rem;
+  background: var(--layer-02);
+  padding: var(--spacing-05);
+  min-block-size: 4rem;
+  min-inline-size: 8rem;
+  font-size: 0.875rem;
+  line-height: 1.29;
+  letter-spacing: 0.16px;
+  outline: 2px solid transparent;
+  outline-offset: -2px;
 }
 
 .tnum {
   position: absolute;
-  top: 0.9rem;
-  right: 1rem;
+  top: var(--spacing-05);
+  right: var(--spacing-05);
   font-family: var(--mono);
-  font-size: 1.6rem;
-  font-weight: 700;
-  color: var(--line);
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--border-strong);
 }
 
-.tcard h3 { margin: 0 0 0.35rem; font-size: 1rem; letter-spacing: -0.01em; }
-.tcard p { margin: 0 0 0.7rem; color: var(--muted); font-size: 0.9rem; }
-.tcard a { font-size: 0.85rem; }
+.tcard h3 { margin: 0 0 var(--spacing-03); font-size: 0.875rem; font-weight: 600; line-height: 1.29; }
+.tcard p { margin: 0 0 var(--spacing-04); color: var(--text-secondary); }
 .tcard a code { background: none; border: none; padding: 0; }
 
-.cta { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+.cta { display: flex; gap: var(--spacing-02); flex-wrap: wrap; }
 
+/* Carbon button, size lg: 48px tall, no radius, and the label pushed to the
+ * start with a 15px lead-in against a 63px trailing gutter — `padding-inline:
+ * calc($spacing-05 - 1px) calc($spacing-05 * 3 + 16px - 1px)`. That asymmetry
+ * is the most recognisable thing about a Carbon button; it reserves the icon
+ * slot whether or not an icon is present. */
 .btn {
-  display: inline-block;
-  padding: 0.6rem 1.35rem;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  color: var(--fg);
-  font-weight: 600;
-  font-size: 0.95rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  text-align: start;
+  min-block-size: 3rem;
+  max-inline-size: 20rem;
+  padding: 0 calc(var(--spacing-05) * 3 + 1rem - 1px) 0 calc(var(--spacing-05) - 1px);
+  border: 1px solid transparent;
+  font-size: 0.875rem;
+  font-weight: 400;
+  line-height: 1.29;
+  letter-spacing: 0.16px;
+  transition:
+    background 70ms var(--motion-productive),
+    border-color 70ms var(--motion-productive),
+    color 70ms var(--motion-productive);
 }
-.btn:hover { text-decoration: none; border-color: var(--muted); }
+
+/* `button-theme()` gives every variant a 1px border — $button-outline-width —
+ * and the shared focus ring is a double inset shadow: 1px of $focus at the
+ * edge, then $button-border-width (2px) of $background inside it. */
+.btn:focus {
+  outline: none;
+  border-color: var(--focus);
+  box-shadow:
+    inset 0 0 0 1px var(--focus),
+    inset 0 0 0 2px var(--background);
+}
+
+/* These anchors are components, not links: the Carbon link rules above would
+ * otherwise underline a button label or a nav item whenever it took focus. */
+.btn,
+.btn:focus,
+.btn:active,
+.brand,
+.brand:focus,
+.navlinks a,
+.navlinks a:focus,
+.navlinks a:active { text-decoration: none; }
+
+/* Primary: transparent border, $text-on-color throughout. */
 .btn.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #1a1207;
+  background: var(--button-primary);
+  border-color: transparent;
+  color: var(--text-on-color);
 }
-.btn.primary:hover { filter: brightness(1.08); }
+@media (any-hover: hover) {
+  .btn.primary:hover {
+    background: var(--button-primary-hover);
+    color: var(--text-on-color);
+    text-decoration: none;
+  }
+}
+.btn.primary:active { background: var(--button-primary-active); }
+
+/* Tertiary: the outline pairing Carbon specifies alongside a primary. It
+ * fills on hover and inverts its text, fills solid on focus, and drops its
+ * border entirely when active. */
+.btn:not(.primary) {
+  background: transparent;
+  border-color: var(--button-tertiary);
+  color: var(--button-tertiary);
+}
+@media (any-hover: hover) {
+  .btn:not(.primary):hover {
+    background: var(--button-tertiary-hover);
+    color: var(--text-inverse);
+    text-decoration: none;
+  }
+}
+.btn:not(.primary):focus {
+  background: var(--button-tertiary);
+  color: var(--text-inverse);
+}
+.btn:not(.primary):active {
+  border-color: transparent;
+  background: var(--button-tertiary-active);
+  color: var(--text-inverse);
+}
 
 /* ---------- sections ---------- */
 
-main { max-width: var(--wide); margin: 0 auto; padding: 0 1.5rem; }
+main { max-width: var(--wide); margin: 0 auto; padding: 0 var(--spacing-06); }
 
-section { padding: 4rem 0; border-bottom: 1px solid var(--line); }
+section { padding: var(--spacing-11) 0; border-bottom: 1px solid var(--border-subtle); }
 section:last-child { border-bottom: none; }
 
 h2 {
-  font-size: 1.6rem;
-  letter-spacing: -0.02em;
-  margin: 0 0 0.6rem;
+  font-size: 1.75rem;   /* heading-04 */
+  line-height: 1.29;
+  letter-spacing: 0;
+  font-weight: 400;
+  margin: 0 0 var(--spacing-03);
 }
 
-.sub { color: var(--muted); max-width: 46rem; margin: 0 0 2rem; }
+.sub { color: var(--text-secondary); max-width: 42rem; margin: 0 0 var(--spacing-07); }
 
-.more { display: inline-block; margin-top: 1.25rem; font-weight: 600; font-size: 0.95rem; }
+.more { display: inline-block; margin-top: var(--spacing-06); font-size: 0.875rem; }
 
 /* numbers */
 
 .ngrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 1rem;
-  margin-top: 1.75rem;
+  gap: var(--spacing-05);
+  margin-top: var(--spacing-07);
 }
 
 .ncard {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 1.4rem 1.3rem;
+  background: var(--layer-01);
+  padding: var(--spacing-05);
+  min-block-size: 4rem;
+  outline: 2px solid transparent;
+  outline-offset: -2px;
 }
 
 .nval {
   font-family: var(--mono);
-  font-size: 2.4rem;
-  font-weight: 700;
+  font-size: 2.625rem;  /* heading-06 */
+  font-weight: 300;
   line-height: 1;
-  letter-spacing: -0.03em;
+  letter-spacing: 0;
   color: var(--accent);
 }
-.nunit { font-size: 1.15rem; margin-left: 0.1rem; }
+.nunit { font-size: 1.25rem; margin-left: var(--spacing-01); }
 
-.nlabel { margin-top: 0.6rem; font-weight: 600; font-size: 0.95rem; }
-.ncard p { margin: 0.3rem 0 0; color: var(--muted); font-size: 0.88rem; }
+.nlabel { margin-top: var(--spacing-04); font-weight: 600; font-size: 0.875rem; }
+.ncard p { margin: var(--spacing-02) 0 0; color: var(--text-secondary); font-size: 0.875rem; }
 
 /* idea */
 
 .idea {
   display: grid;
-  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
-  gap: 2.5rem;
+  grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr);
+  gap: var(--spacing-09);
   align-items: start;
 }
 
-.idea-text p { color: var(--muted); }
-.idea-text .punch { color: var(--fg); }
+.idea-text p { color: var(--text-secondary); }
+.idea-text .punch { color: var(--text-primary); }
+
+/* IBM Plex Mono is wider than the old system mono, so the forward-pass sample
+ * drops to code-01 and trims its gutters. Its longest line — the `rope_append`
+ * call at 76 columns — then clears the panel without a horizontal scrollbar. */
 .idea-code { min-width: 0; }
+.idea-code pre {
+  font-size: 0.75rem;
+  line-height: 1.34;
+  padding: var(--spacing-05);
+}
+.idea-code .codehead { padding: var(--spacing-03) var(--spacing-05); }
 
 /* spyre — a prose-only section, held to a readable measure */
 
-.spyre .idea-text { max-width: 46rem; }
+.spyre .idea-text { max-width: 42rem; }
 
 /* targets */
 
 .tgrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  gap: 1rem;
+  gap: var(--spacing-05);
 }
 
+/* A tile carrying the 3px $border-interactive bar Carbon uses to mark a
+ * selected one. */
 .tg {
-  background: var(--panel);
-  border: 1px solid var(--line);
+  background: var(--layer-01);
   border-left: 3px solid var(--accent);
-  border-radius: 8px;
-  padding: 1rem 1.1rem;
+  padding: var(--spacing-05);
+  min-block-size: 4rem;
+  font-size: 0.875rem;
+  line-height: 1.29;
+  letter-spacing: 0.16px;
 }
-.tg code { background: none; border: none; padding: 0; font-weight: 700; font-size: 0.95rem; }
-.tg span { display: block; margin-top: 0.3rem; color: var(--muted); font-size: 0.88rem; }
+.tg code { background: none; padding: 0; font-weight: 600; }
+.tg span { display: block; margin-top: var(--spacing-02); color: var(--text-secondary); }
 
 /* getting started */
 
-.conv { margin-top: 1.75rem; display: grid; gap: 0.75rem; }
-.conv > div { display: flex; gap: 1rem; flex-wrap: wrap; align-items: baseline; }
+.conv { margin-top: var(--spacing-07); display: grid; gap: var(--spacing-04); }
+.conv > div { display: flex; gap: var(--spacing-05); flex-wrap: wrap; align-items: baseline; }
 .conv > div > code { flex: none; }
-.conv span { color: var(--muted); font-size: 0.9rem; }
+.conv span { color: var(--text-secondary); font-size: 0.875rem; }
 
 /* docs */
 
 .dgrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 1rem;
-  margin-top: 1.75rem;
+  gap: var(--spacing-05);
+  margin-top: var(--spacing-07);
 }
 
+/* Carbon clickable tile: same tile, plus a pointer and a $layer-hover fill.
+ * The affordance is the background change, not a border. */
 .dcard {
   display: block;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 1.2rem 1.25rem;
+  background: var(--layer-01);
+  padding: var(--spacing-05);
+  min-block-size: 4rem;
   color: inherit;
+  cursor: pointer;
+  font-size: 0.875rem;
+  line-height: 1.29;
+  letter-spacing: 0.16px;
+  outline: 2px solid transparent;
+  outline-offset: -2px;
+  transition: background 150ms var(--motion-productive);
 }
-.dcard:hover { border-color: var(--accent); text-decoration: none; }
-.dcard h3 { margin: 0 0 0.3rem; font-size: 1rem; color: var(--accent-2); }
-.dcard p { margin: 0; color: var(--muted); font-size: 0.89rem; }
+.dcard:hover { background: var(--layer-hover-01); text-decoration: none; }
+.dcard h3 { margin: 0 0 var(--spacing-02); font-size: 0.875rem; font-weight: 600; line-height: 1.29; color: var(--link-primary); }
+.dcard p { margin: 0; color: var(--text-secondary); }
 
 /* footer */
 
 footer {
-  border-top: 1px solid var(--line);
-  padding: 2rem 1.5rem 3rem;
+  border-top: 1px solid var(--border-subtle);
+  padding: var(--spacing-08) var(--spacing-06) var(--spacing-10);
   text-align: center;
-  color: var(--muted);
-  font-size: 0.88rem;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
 }
 
 footer .credit {
-  max-width: 44rem;
-  margin: 1rem auto 0;
-  font-size: 0.82rem;
-  line-height: 1.6;
+  max-width: 42rem;
+  margin: var(--spacing-05) auto 0;
+  font-size: 0.75rem;
+  line-height: 1.34;
 }
 
 @media (max-width: 800px) {
-  .idea { grid-template-columns: 1fr; gap: 2rem; }
-  .hero-body { padding: 2.5rem 1.5rem 3rem; }
-  section { padding: 3rem 0; }
+  .idea { grid-template-columns: 1fr; gap: var(--spacing-07); }
+  .hero-body { padding: var(--spacing-08) var(--spacing-06) var(--spacing-09); }
+  section { padding: var(--spacing-09) 0; }
 }
