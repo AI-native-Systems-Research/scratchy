@@ -34,7 +34,7 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
+    EmittedOp, In, assemble_pointwise_broadcast_off, bmm_site,
     check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec,
     pointwise_chunk_out_offset, pw2, rb, rbo,
 };
@@ -2110,7 +2110,10 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     let cap = ops_in.cap;
     let stick = Fp16::ELEMS_PER_STICK; // 64
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+    // ⛔ NO `pool` HERE ANY MORE. Every pool address this body composed belonged to the resident-Kᵀ
+    // re-transpose, which is gone (its reader was the prefix score leg, which now streams its own Kᵀ per
+    // window into the `PrefixKt` scratch). The cache WRITE below addresses through its nests, not through
+    // `addr`, so nothing left in this function needs the pool.
     // ── PAGED-ATTENTION COMPUTE EXTENT, READ OFF THE PROGRAM ──
     //
     // ⭐⭐⭐ IT WAS `AttnAt::active_cap`, THE RUNG, RESOLVED HERE. The rung is a PRODUCER input: it
@@ -2512,6 +2515,8 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         &new_k_scaled,
         &new_v_rep,
         &kct,
+        // The natural-K plane, for the streamed prefix form (`SynthRole::PrefixKt`).
+        &kc,
         &vc,
         &pmask,
         &cmask,
@@ -2686,100 +2691,20 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     //
     // AND THE REQUEST IS THE ADDRESS, NOT A TAG — so the batch's re-transposes are ONE launch.
     //
-    // Flat product loop (not nested) so the body below keeps the indentation — and the shape — of the
-    // whole-page form it is otherwise unchanged from.
-    let kct_reqs = if per_request { mq } else { 1 };
-    for (req, kvh) in (0..kct_reqs).flat_map(|r| (0..nkvh).map(move |k| (r, k))) {
-        let rq = if per_request {
-            format!("_r{req}")
-        } else {
-            String::new()
-        };
-        // ⭐⭐⭐ ONE STICK-BLOCK WHEN THE OP APPENDS ONE SLOT, THE WHOLE PAGE OTHERWISE.
-        //
-        // A decode op covers exactly ONE new slot — `mq == 1` solo, or one op per request when the
-        // rows ARE requests — so exactly one of the page's `PAGE_SLOTS / STK` stick-blocks has a Kᵀ
-        // that this step invalidated. The others hold this same request's earlier keys, already
-        // transposed, and K is append-only within a page so nothing invalidates them. The op is baked
-        // at block 0 and the runtime shifts it onto the live one ([`slab_delta`]). A PREFILL chunk's op
-        // covers `mq` rows spanning up to a whole page, so it keeps the page-wide form.
-        //
-        // THE TEST IS THE OP'S ROW COUNT — the same quantity the cache writes above split `heads_on_y`
-        // on — not the model, not the bundle's name, and not a head dim.
-        //
-        // ⛔ AND THE POOL DECIDES WHETHER ONE SHIFT CAN EXPRESS IT AT ALL. `slab_delta` moves the op's
-        // KV-segment base by ONE number and this op reads natural K and writes Kᵀ through it, so the
-        // form exists only where a stick-block is the same distance in both planes.
-        // [`PagedKvPool::slab_shift_elems`] asks `addr` for both deltas and answers `None` when they
-        // disagree — every `hd > STK` — and this falls back to the page form. See that function for
-        // why the bound is an equation here and not `hd == 64`.
-        //
-        // 🛑 THE EARLIER ON-CARD ATTEMPT AT THIS REGRESSED DECODE, and the runtime defect that would
-        // explain it was fixed separately and FIRST: `slab_delta` never wrapped its slab index by the
-        // page, so past slot 255 it selected a block of no page at all. That wrap is now in place with
-        // a boundary test (`the_slab_shift_wraps_at_the_page`), which is the precondition this door
-        // needed — but the earlier measurement was taken without it, so the regression is UNEXPLAINED
-        // rather than refuted, and this form is gated on the card before it is believed.
-        let head = kv_head_of(kvh, nkvh)?;
-        let one_slot_per_op = per_request || mq == 1;
-        let slab_shift = pool.slab_shift_bytes(head);
-        // ⭐⭐⭐ HOW MANY STICK-BLOCKS THIS OP'S WINDOW CAN TOUCH — 1 for a decode step's single new slot,
-        // and for a PREFILL chunk the measured 2 (`subtile/tests/knat_needs_two_stick_blocks.rs`: the
-        // reachable chunk starts are page offsets 0, 96 and a stepped-back 160, in-block 0/32/32, and
-        // `32 + 96 = 128` is exactly two blocks — one slot more would be three, and both blocks are proven
-        // to stay inside the page). Blocks are emitted at BAKED offsets `j` from the window's own first
-        // block, and the runtime shifts all of them together by that block ([`slab_delta`]), so the count
-        // is a compile-time fact and the position is a runtime one.
-        let blocks = match slab_shift {
-            None => 0, // hd > STK: one shift cannot move both planes; keep the whole-page form.
-            Some(_) if one_slot_per_op => 1,
-            Some(_) => crate::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_BLOCKS,
-        };
-        for j in 0..blocks.max(1) {
-            let tile = if blocks == 0 {
-                crate::sdsc_abstract::KtTileSlots::of_page()
-            } else {
-                crate::sdsc_abstract::KtTileSlots::of_write_slab()
-            };
-            // Block `j` of the window: the same baked step on BOTH planes, which is exactly why one
-            // segment shift can move the pair (`slab_shift_elems` IS that equality). Asked in ELEMENTS
-            // here and in BYTES for the op field below — each from its own accessor, so neither call site
-            // converts between the two.
-            let step = crate::addr::DevOff::from_view_step(
-                j as u32 * pool.slab_shift_elems(head).unwrap_or(0),
-            );
-            ops.push(assemble_restickify_kt_2d(
-                &if blocks > 1 {
-                    format!("attn_kctpost{kvh}{rq}b{j}_o{t}")
-                } else {
-                    format!("attn_kctpost{kvh}{rq}_o{t}")
-                },
-                tile,
-                crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-                &kc,
-                crate::addr::DevOff::from_view_step(pool.addr(
-                    crate::sdsc_abstract::KvCoord::block(
-                        crate::sdsc_abstract::KvPlane::Knat,
-                        head,
-                    ),
-                )) + step,
-                &kct,
-                crate::addr::DevOff::from_view_step(pool.addr(
-                    crate::sdsc_abstract::KvCoord::block(crate::sdsc_abstract::KvPlane::Kt, head),
-                )) + step,
-                sym_id_base,
-                layout,
-            ));
-            if let Some(o) = ops.last_mut() {
-                o.kv_request = req;
-                if blocks > 0 {
-                    o.slab_stride_bytes = slab_shift;
-                    o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-                }
-            }
-        }
-    }
-
+    // ⭐⭐⭐⭐⭐ DELETED — THE RESIDENT Kᵀ HAS NO READER ANY MORE.
+    //
+    // The prefix score leg now transposes each window of its sweep into the one-block
+    // `SynthRole::PrefixKt` scratch as it goes (`assemble_attn`'s streamed form), which is what IBM's paged
+    // attention does with its single natural-K cache. The new-block leg has always used its own `new_kt`
+    // scratch. So nothing reads a resident Kᵀ plane, this whole stage had no consumer, and
+    // `PagedKvPool::planes` is two planes instead of three — a third of every KV page back, 1.5x the pages
+    // for the same budget.
+    //
+    // ⛔ WHAT WENT WITH IT, so the history is not lost with the code: this was the whole-page re-transpose,
+    // then the 4x-redundant-per-step finding, then one stick-block for decode and the measured two for
+    // prefill, and its `slab_delta` shift needed a page wrap that had gone missing from the tree twice.
+    // Every one of those is still live machinery — `slab_write`/`GroupKind::Slab`/`SlabShift` are what the
+    // CACHE WRITE uses — it is only the Kᵀ producer that is gone.
     Ok(ops)
 }
 

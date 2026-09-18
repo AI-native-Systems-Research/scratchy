@@ -8688,6 +8688,7 @@ fn synth_role_tokens(
         R::Rinv => quote! { #b::Rinv },
         R::Xn => quote! { #b::Xn },
         R::NewKt => quote! { #b::NewKt },
+        R::PrefixKt => quote! { #b::PrefixKt },
         R::Sc => quote! { #b::Sc },
         R::BMax => quote! { #b::BMax },
         R::NewM => quote! { #b::NewM },

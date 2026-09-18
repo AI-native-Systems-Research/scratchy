@@ -56,6 +56,17 @@ pub enum SynthRole {
     Xn,
     // ── flash-attention online-softmax state ──
     NewKt,
+    /// ⭐ THE PREFIX BLOCK'S Kᵀ, AS TRANSIENT SCRATCH — `[nkvh, hd, STK]`, one stick-block, rewritten by
+    /// every window of the sweep instead of read out of a resident third KV plane.
+    ///
+    /// This is what IBM's paged attention does: ONE natural-K cache
+    /// (`spyre-inference/.../paged_vector_add_target.py:64` is `[pages, slots, heads, hd]` sticked on `hd`,
+    /// same layout as its value cache) with the transpose materialised PER TILE as the KV axis streams. The
+    /// resident `kct` plane is a CACHE of that transpose — transpose a block once at write, read it for the
+    /// request's life — which costs ⅓ of every KV page and buys back re-transposing the whole prefix every
+    /// step. This role is the other side of that trade, so the two can be MEASURED against each other
+    /// instead of argued about.
+    PrefixKt,
     Sc,
     BMax,
     NewM,
@@ -107,6 +118,7 @@ impl fmt::Display for SynthRole {
             Self::Rinv => f.write_str("rinv"),
             Self::Xn => f.write_str("xn"),
             Self::NewKt => f.write_str("newkt"),
+            Self::PrefixKt => f.write_str("pfxkt"),
             Self::Sc => f.write_str("sc"),
             Self::BMax => f.write_str("bmax"),
             Self::NewM => f.write_str("newm"),

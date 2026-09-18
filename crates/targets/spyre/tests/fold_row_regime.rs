@@ -33,6 +33,8 @@ fn batch_decode_ops() -> Vec<ktir_superdsc::emit::EmittedOp> {
         "nks",
         "nvr",
         "kct",
+        // The natural-K plane, for the streamed prefix form's per-window transpose.
+        "kc",
         "vc",
         "pmask",
         "cmask",

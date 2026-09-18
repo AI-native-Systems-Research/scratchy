@@ -285,6 +285,9 @@ fn assemble_attn_threads_the_form_to_every_gform_op() {
             "nks",
             "nvr",
             "kct",
+            // The natural-K plane — the streamed prefix form transposes a window of it into the one-block
+            // `PrefixKt` scratch rather than reading the resident `kct`.
+            "kc",
             "vc",
             "pmask",
             "cmask",

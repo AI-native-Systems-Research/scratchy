@@ -1476,6 +1476,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     new_k_scaled: &str,
     new_v: &str,
     kct: &str,
+    // The NATURAL-K plane. The streamed prefix form transposes a window of it into the one-block
+    // `SynthRole::PrefixKt` scratch instead of reading the resident `kct` plane — see that role.
+    knat: &str,
     vc: &str,
     pmask: &str,
     cmask: &str,
@@ -2056,6 +2059,31 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // It broke multi-page coherence and it was chasing a cost that is not there: the mask's segment
     // is ~1.6 MB in the DECODE bundle (the ~150 MB figure is the PREFILL bundle, where mq=96 scales
     // every intermediate, and prefill runs once per request).
+    // ⭐⭐⭐⭐⭐ THE PREFIX BLOCK'S Kᵀ AS TRANSIENT SCRATCH — `[nkvh, hd, STK]`, ONE stick-block, rewritten
+    // by every window of the sweep. This is the other side of the resident-`kct` trade: IBM's paged
+    // attention keeps ONE natural-K cache and materialises the transpose PER TILE as the KV axis streams
+    // (`spyre-inference/.../paged_vector_add_target.py:64`), where we cache it in a third KV plane. Declared
+    // here so the two forms can be measured against each other rather than argued about; `SCRATCHY_PREFIX_KT_
+    // STREAM` is NOT a gate — the choice is made below at emit, per bundle, from the SWEEP WIDTH, which is
+    // the quantity the trade actually turns on.
+    let pfx_kt = crate::placement::syn(layout, out_id.synth(R::PrefixKt));
+    if let Some(l) = layout {
+        l.synth(
+            out_id.synth(R::PrefixKt),
+            &[nkvh, hd, crate::sdsc_abstract::POOL_STICK],
+        );
+    }
+    // ⛔ AND THE CHOICE IS THE SWEEP WIDTH, NOT A FLAG. Streaming re-transposes every window of the sweep,
+    // so it costs `nb` restickifies per step against the resident plane's ONE at write time — a win only
+    // while `nb == 1`, i.e. while a launch's sweep is a single stick-block. At `active_cap == POOL_STICK`
+    // the two forms do identical work and streaming needs no third plane; above it, streaming re-reads the
+    // whole prefix every step (at 576 tokens: 9 blocks x nkvh x 4096 elems x 40 layers ≈ 236 MB/step
+    // against a 24 ms budget) and the resident plane buys that back.
+    // MEASURING IT UNCONDITIONALLY FIRST. The width test below is what the arithmetic argues for, but that
+    // arithmetic has been wrong about this device repeatedly this session, so the wide-sweep cost gets
+    // measured on the card before it is believed:
+    //   let stream_prefix_kt = active_cap <= crate::sdsc_abstract::POOL_STICK;
+    let stream_prefix_kt = true;
     let fold_from = ops.len();
     // Windows ONE launch folds. `active_cap` is the sk_bucket rung as before, and the page equals the
     // pre-paged capacity, so this is bit-for-bit the baseline's fold; contexts past one page cost
@@ -2064,6 +2092,39 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // one-stick column budget — not the lane count it used to be spelled as.
     for w in SlotWindow::sweep(crate::sdsc_abstract::SlotCount::new(active_cap)) {
         let b = w.index();
+        // ⭐ STREAMED FORM: transpose THIS window's natural-K block into the one-block scratch, right before
+        // the score ops that read it. Ordered restickify→score per window inside one launch, so a single
+        // scratch block serves every window — which is what makes the resident Kᵀ plane unnecessary.
+        if stream_prefix_kt {
+            for kvh in 0..nkvh {
+                let head = crate::sdsc_abstract::KvHead::new(
+                    kvh,
+                    std::num::NonZeroU32::new(nkvh).expect("nkvh > 0"),
+                )
+                .expect("kv head in range");
+                ops.push(crate::emit::assemble_restickify_kt_2d(
+                    &format!("attn_pfxkt{kvh}b{b}_o{t}"),
+                    crate::sdsc_abstract::KtTileSlots::of_write_slab(),
+                    crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
+                    knat,
+                    // This window's slots of the NATURAL-K plane — the window carries its own first slot,
+                    // so no block stride is spelled here.
+                    crate::addr::DevOff::from_view_step(pool.addr(
+                        crate::sdsc_abstract::KvCoord::block(
+                            crate::sdsc_abstract::KvPlane::Knat,
+                            head,
+                        )
+                        .at_slot(w.first_slot()),
+                    )),
+                    &pfx_kt,
+                    // The scratch's own `[nkvh, hd, STK]` block for this kv head — no window term, because
+                    // the scratch holds exactly ONE window at a time. That is the whole point of it.
+                    crate::addr::DevOff::from_view_step(kvh * hd * crate::sdsc_abstract::POOL_STICK),
+                    sym_id_base,
+                    layout,
+                ));
+            }
+        }
         // PER-BLOCK OFFSETS, PRINTED (`SCRATCHY_SDSC_FOLD_TRACE`). Blocks 0-1 of a 4-block sweep are correct
         // and blocks 2-3 are not, and every candidate cause has been checked correct by reading — so the
         // next step is to make the blocks observable rather than to argue about them. The `[body-choice]`
@@ -2113,21 +2174,33 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // multi-block prompt is wrong from the first token). Matches the old proven flash decode
             // verbatim: `let k_blk = b * hd * stick;` (worktree superdsc-batch-perf). The V side below
             // is `b*stick*hd`, which is already correct and matches that same reference (`vblk`).
-            kct,
-            // ⭐⭐⭐⭐⭐ STILL `ContractionOnRows` FOR NOW — the flip to the natural-K plane is this one value
-            // plus pointing `kct` at `KvPlane::Knat`, and it is deliberately NOT taken in the same commit
-            // that builds the door. Everything it needs is in place and proven
-            // (`subtile/tests/kernel_nt_is_natural_k.rs`): `ContractionOnStick` here makes this leg read
-            // `[out,in]` stick `in`, which IS the natural-K plane the cache write already fills, and then the
-            // Kᵀ plane and the whole-page restickify both have no reader left.
+            // ⭐ THE SCRATCH WHEN STREAMING, THE RESIDENT PLANE OTHERWISE. In the streamed form the ops just
+            // above transposed THIS window into `pfx_kt`, so the kernel is that one block and the resident
+            // `kct` plane has no reader at all.
+            if stream_prefix_kt { &pfx_kt } else { kct },
             crate::sdsc_abstract::KernelOrient::ContractionOnRows,
-            crate::sdsc_abstract::PagedKvPool::KT_KERNEL_PITCH,
+            // The scratch's pitch is ONE stick-block — it holds a single window — where the resident plane's
+            // is a whole page. Getting this wrong reads the next kv head's block as this one's later slots.
+            if stream_prefix_kt {
+                crate::sdsc_abstract::SlotExtent::of_one_stick().kernel_row_pitch()
+            } else {
+                crate::sdsc_abstract::PagedKvPool::KT_KERNEL_PITCH
+            },
             // THE POOL COMPOSES THE REQUEST TERM, not this call site. `kt_block_base_of` is the same
             // `block_index(kvh) + r` the cache write bakes, so the fold's kernel and the write that
             // fills it cannot disagree about where request `r` lives — and no stride is spelled here.
             |h, sl| {
                 use crate::sdsc_abstract::{KvCoord, KvPlane};
                 let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
+                if stream_prefix_kt {
+                    // The scratch is `[nkvh, hd, STK]` and holds THIS window only, so there is no slot term
+                    // — the window is already spent, in the restickify that filled it. Just the kv head's
+                    // block and the contraction's feature slab.
+                    return crate::addr::DevOff::from_view_step(
+                        kvh.get() * hd * crate::sdsc_abstract::POOL_STICK
+                            + FeatIdx::of_slab(sl).get() * crate::sdsc_abstract::POOL_STICK,
+                    );
+                }
                 crate::addr::DevOff::from_view_step(
                     pool.addr(
                         KvCoord::block(KvPlane::Kt, kvh)

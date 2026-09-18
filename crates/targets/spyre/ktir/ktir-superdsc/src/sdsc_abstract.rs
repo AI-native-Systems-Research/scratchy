@@ -242,6 +242,14 @@ impl SlotExtent {
     pub const fn kernel_row_pitch(self) -> KtKernelPitch {
         KtKernelPitch(self.0)
     }
+
+    /// ⭐ ONE STICK-BLOCK — the STREAMED prefix form's scratch, which holds exactly one window of the sweep
+    /// at a time. A third door because it is a third quantity: not the new block's padded row count and not
+    /// a page's slots, but the single window a per-tile transpose materialises. `POOL_STICK` and not a bare
+    /// 64, for the reason that constant exists.
+    pub const fn of_one_stick() -> SlotExtent {
+        SlotExtent(POOL_STICK)
+    }
 }
 
 /// THE Kᵀ SCORE KERNEL'S DECLARED PHYSICAL COLUMN COUNT (`Stk::kernel`'s `n_out`) — the pitch that
@@ -5683,9 +5691,14 @@ impl PagedKvPool {
     /// Order is natural K, V, transposed K — the pre-paged cache's own (`kc`, `vc`, `kct`). The order is
     /// free (every op addresses its plane relatively) but it decides the byte offset each plane lands on,
     /// and this path is measurably placement-sensitive.
-    pub fn planes(&self) -> [PlaneSlice; 3] {
+    pub fn planes(&self) -> [PlaneSlice; 2] {
         let mut base = ElemCount::NONE;
-        [KvPlane::Knat, KvPlane::V, KvPlane::Kt].map(|plane| {
+        // ⭐⭐⭐⭐⭐ TWO PLANES. `KvPlane::Kt` IS GONE FROM THE POOL — the prefix score leg streams its Kᵀ
+        // per window into the one-block `SynthRole::PrefixKt` scratch (an INTERMEDIATE, not KV), which is
+        // what IBM's paged attention does with its single natural-K cache. With the streamed form nothing
+        // reads a resident Kᵀ, so the third of every page it occupied is back: a page is `2 * plane` now,
+        // i.e. 1.5x the pages for the same budget.
+        [KvPlane::Knat, KvPlane::V].map(|plane| {
             let size = ElemCount::of_kv_plane(self.nkvh, self.plane_block_elems(plane));
             let slice = PlaneSlice { plane, base, size };
             base = base + size;
@@ -5815,11 +5828,12 @@ impl PagedKvPool {
     ///     }
     ///     // natural K, V, transposed K — the pre-paged cache's order, tiling the layer exactly. Each
     ///     // plane's base comes WITH its own size, so this cannot be read as three bases and one stride.
-    ///     let [knat, v, kt] = p.planes();
+    ///     // TWO planes: `KvPlane::Kt` left the pool when the prefix score leg started streaming its Kᵀ
+    ///     // per window into the `PrefixKt` scratch, so nothing resident reads a transposed plane.
+    ///     let [knat, v] = p.planes();
     ///     assert_eq!((knat.plane, knat.base_elems()), (KvPlane::Knat, ElemCount::NONE));
     ///     assert_eq!((v.plane, v.base_elems()), (KvPlane::V, knat.size_elems()));
-    ///     assert_eq!((kt.plane, kt.base_elems()), (KvPlane::Kt, knat.size_elems() + v.size_elems()));
-    ///     assert_eq!(kt.base_elems() + kt.size_elems(), p.layer_stride_elems());
+    ///     assert_eq!(v.base_elems() + v.size_elems(), p.layer_stride_elems());
     ///     assert!(p.planes_tile_the_layer());
     ///     // THE HEADS TILE THE PLANE EXACTLY. One head's block is its whole page — `hd * PAGE_SLOTS`
     ///     // — so head `k` ends precisely where head `k+1` begins and there is no request axis in
