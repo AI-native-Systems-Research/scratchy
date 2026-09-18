@@ -187,6 +187,8 @@ pub fn assemble_matmul_split(
         <Fp16 as DataFormat>::DF,
         None,
         // The tower's shapes are not attention decode rows; they keep the proven walk pair.
+        // No K-trip: the tower drives whole contractions.
+        None,
         SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness()),
         // No head axis to state: the Kani tower's seam drives dense shapes, never a GQA group, so
         // there are no per-head placements and the stride check has nothing to compare.
