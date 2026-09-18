@@ -1,40 +1,46 @@
-# What Does "Reuse" Mean in the Age of AI?
+# What "Reuse" Means in the Age of AI
 
-Every generation of programmers has been told the same thing: don't write it,
-reuse it. What quietly changes, generation to generation, is how much of
-somebody else's decisions you have to carry along with the part you wanted.
+Every generation of programmers has inherited the same directive: don't write
+it, reuse it. What has shifted, generation to generation, is how much of
+someone else's architectural decisions must be carried along with the component
+you actually needed.
 
-It used to be all of them. A shared library arrived as a compiled `.so` and a
-header file — an opaque box whose insides your compiler couldn't see, let alone
-improve. Source-level languages like Python and JavaScript opened the box, but
-you still hauled the whole thing around; a `node_modules` directory is a
-monument to that. Bundlers were the first tools allowed to throw some of it
-away, though tree-shaking only deletes code nobody mentions by name. Then Rust
-and Go pushed specialization down into the semantics, and you get the fact that
-makes the era legible: a Go binary has no shared-library dependencies. Not
-because it's statically linked — because every capability arrived as *source*
-and left as machine code specialized for that one program.
+For decades, that cost was total. A shared library arrived as a compiled `.so`
+and a header file — an opaque artifact whose internals your compiler could
+neither inspect nor optimize. Source-level languages like Python and JavaScript
+opened the box, but the entire contents still had to be hauled along; a
+`node_modules` directory stands as a monument to that reality. Bundlers
+introduced selective elimination through tree-shaking, though only for code that
+went entirely unmentioned by name. Rust and Go pushed specialization further into
+the language semantics, yielding a telling characteristic of the modern era:
+a Go binary carries no shared-library dependencies — not because it is statically
+linked in the traditional sense, but because every capability arrived as source
+and left as machine code specialized for that single program.
 
-Fifty years of compiler engineering, and it all stops at a wall nobody thought
-to name. The code itself is sacred. A compiler may delete your dependency's
-unused parts and specialize its generic ones, but it may never restructure it.
-So the generality of the libraries you depend on is your generality too, whether
-or not you ever wanted it.
+Fifty years of compiler engineering, and it all meets the same wall. The code
+itself is treated as sacred. A compiler may delete unused portions of a
+dependency and specialize its generic abstractions, but it may never restructure
+them. The generality of the libraries a project depends on becomes the project's
+generality too, whether that generality was ever wanted or not.
 
-That's the wall AI knocks down — not by making compilers smarter, but by making
-faithful transcription cheap. When you can re-express someone's *algorithm*
-inside your own structure in an afternoon instead of over two quarters of pull
-requests, the thing you're reusing stops being the module. It's the idea. And
-once ideas are the unit, every project gets to be bespoke.
+That is the wall AI is knocking down — not by making compilers smarter, but by
+making faithful transcription cheap. When an algorithm can be re-expressed
+inside a team's own structure in an afternoon rather than across two quarters of
+pull requests, what is being reused is no longer the module. It is the idea. And
+once ideas become the unit of reuse, every project can be bespoke.
 
-## Scratchy
+## Introducing Scratchy
 
-[Scratchy](https://github.com/AI-native-Systems-Research/scratchy) is our
-existence proof: a compiler that takes a model architecture, a HuggingFace
-`config.json`, and a quantization preset, and emits an inference server that
-exists only for that triple.
+[Scratchy](https://github.com/AI-native-Systems-Research/scratchy) is the
+existence proof of this thesis: a compiler that takes a model architecture, a
+HuggingFace `config.json`, and a quantization preset, and emits an inference
+server that exists only for that specific combination.
 
-Here is the *entire* definition of LLaMA — the whole forward pass:
+In Scratchy, model architectures are expressed as simple, readable descriptions
+of the tensor operations, and Rust's procedural macro system does the rest —
+deriving weight wiring, kernel selection, buffer management, and dispatch
+tables entirely at compile time. The following is the complete definition of
+LLaMA — the entire forward pass:
 
 ```rust
 #[forward]
@@ -63,46 +69,56 @@ fn llama() {
 
 Twenty-two lines. No weight wiring, no kernel selection, no buffer management,
 no dispatch tables — Rust's procedural macros derive all of it at compile time.
-**25 architectures fit in 1,580 lines** this way. The payoff: a 30 MiB binary,
-and 300 ms warm startup *independent of model size*, because there's no graph to
-build at load time. The graph is a constant.
+Using this approach, 25 model architectures fit within 1,580 lines of total
+code. The result is a 30 MiB binary with a 300 ms warm startup time that is
+independent of model size, because there is no graph to construct at load time.
+The graph is a compile-time constant.
 
 The serving algorithms — paged KV cache, continuous batching, prefix caching —
-are [vLLM's](https://github.com/vllm-project/vllm), transcribed into Rust and
-credited by file and line at each site. Seventy citations to a repository that
-isn't in our build graph. That's what a dependency looks like when the unit of
-reuse is an idea.
+are drawn from [vLLM](https://github.com/vllm-project/vllm), transcribed into
+Rust and credited by file and line at each use site. Seventy citations to a
+repository that does not appear in the build graph. That is what a dependency
+looks like when the unit of reuse is an idea.
 
-## Why this matters for Spyre
+## Why This Matters for IBM Spyre
 
-Scratchy's first target isn't CUDA. It's the **IBM Spyre AIU** — and that's the
-real test, because exotic hardware is where the library era has nothing to
-offer.
+Scratchy's first production target is not CUDA. It is the IBM Spyre AIU — and
+that is where the design is put to its most meaningful test, because exotic
+hardware is precisely where the library era has nothing to offer.
 
-Each Spyre core has a 2 MiB scratchpad, of which 1,677,721 bytes are yours.
-Every tile of every operation must fit. Overflow it and you don't get an error
-message — you get `DtException 1535` on the card, minutes later, about a tile
-you can no longer inspect. The dominant cost of novel silicon isn't writing
-kernels; it's the feedback loop from a nameless on-card fault back to the line
-of math that caused it.
+Each Spyre core provides a 2 MiB scratchpad, of which 1,677,721 bytes are
+available to user workloads. Every tile of every operation must fit within that
+budget. Overflow it and the result is not a helpful error message — it is a
+`DtException 1535` on the card, surfacing minutes later, about a tile that can
+no longer be inspected. The dominant cost of novel silicon is not writing
+kernels; it is the feedback loop from a nameless on-card fault back to the line
+of arithmetic that caused it.
 
-Because scratchy knows every tile size at compile time, that fault becomes a
-`cargo build` error on your laptop. A general-purpose runtime structurally
-can't do this: it doesn't know the shapes until it's already running, on the
-card, where the only channel back to you is an integer.
+Because Scratchy knows every tile size at compile time, that fault becomes a
+`cargo build` error on a developer's laptop. A general-purpose runtime is
+structurally incapable of providing this guarantee: it does not know the shapes
+until it is already running, on the card, where the only channel back to the
+developer is an integer.
 
-Spyre support is ~129,000 lines of Rust, twice the size of our CUDA backend, and
-it cost **zero lines of model code**. Same 1,580 lines. Same 22-line LLaMA. An
-8B model boots in 12 seconds from a 330 MiB image.
+Spyre support is approximately 129,000 lines of Rust — twice the size of the
+CUDA backend — and it required zero changes to model code. The same 1,580 lines.
+The same 22-line LLaMA definition. An 8B model boots in 12 seconds from a
+330 MiB image.
 
-Which is the part worth tweeting. Reuse-by-code quietly puts a *population
-threshold* on what hardware is allowed to exist — "support" means a vendor
-maintaining a general backend inside someone else's general framework until the
-market justifies the headcount. Reuse-by-idea drops that threshold to one team
+## A New Threshold for Novel Silicon
+
+Reuse-by-code quietly imposes a population threshold on what hardware is
+permitted to exist. "Support" under that model means a vendor maintaining a
+general backend inside someone else's general framework until the market
+justifies the headcount. Reuse-by-idea drops that threshold to a single team
 with a compiler.
 
-The payoff isn't faster inference. It's that novel silicon becomes viable at a
-scale where it wasn't.
+The payoff is not faster inference on existing hardware. It is that novel
+silicon — hardware that would never clear the bar of a traditional software
+ecosystem — becomes viable at scales where it was not before. Scratchy is an
+early demonstration of what that shift makes possible, and a first look at what
+inference infrastructure might look like when ideas, not modules, are the unit
+of reuse.
 
 ---
 
