@@ -27,6 +27,7 @@
   --text-inverse: #161616;
   --link-primary: #78a9ff;
   --link-primary-hover: #a6c8ff;
+  --border-interactive: #4589ff;
   --focus: #ffffff;
 
   --accent: #78a9ff;          /* link-primary, Blue 40 — 7.68:1 on --background */
@@ -84,6 +85,7 @@
     --text-inverse: #ffffff;
     --link-primary: #0f62fe;
     --link-primary-hover: #0043ce;
+    --border-interactive: #0f62fe;
     --focus: #0f62fe;
 
     --accent: #0f62fe;          /* interactive, Blue 60 — 5.00:1 on white */
@@ -178,25 +180,34 @@ pre code {
   border-bottom: 1px solid var(--border-subtle);
 }
 
-/* Carbon UI shell header: `mini-units(6)` tall, `$background`, a single
- * `$border-subtle` rule beneath, and flush to the viewport edges — the shell
- * spans the window even though the content below it is measured. */
+/* Carbon UI shell header — `ui-shell/header/_header.scss`, followed exactly:
+ * fixed to the top of the viewport at `z('header')`, `mini-units(6)` tall,
+ * `$background`, one `$border-subtle` rule beneath, flush to both edges. The
+ * content below is offset by the same `mini-units(6)`, which is what Carbon's
+ * `.cds--header ~ .cds--content { margin-block-start: mini-units(6) }` does. */
 nav {
+  position: fixed;
+  z-index: 8000;              /* z('header') */
+  inset-block-start: 0;
+  inset-inline: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  block-size: 3rem;
+  block-size: 3rem;           /* mini-units(6) */
   background: var(--background);
   border-bottom: 1px solid var(--border-subtle);
 }
 
-/* header__name: body-compact-01 at 600, 0.1px tracking, 16px lead-in and a
- * 32px trailing gutter. */
+body { padding-block-start: 3rem; }
+
+/* header__name: body-compact-01 at 600, 0.1px tracking, a 16px lead-in and a
+ * 32px trailing gutter, over a transparent 2px border so focus can colour it
+ * without reflowing the bar. */
 .brand {
   display: flex;
   align-items: center;
   block-size: 100%;
   padding: 0 var(--spacing-07) 0 var(--spacing-05);
+  border: 2px solid transparent;
   font-family: var(--mono);
   font-size: 0.875rem;
   font-weight: 600;
@@ -206,15 +217,35 @@ nav {
 }
 .brand::before { content: "▚ "; color: var(--accent); }
 
-.navlinks { display: flex; block-size: 100%; }
+/* header__nav: sits immediately after the name, opened by a 1px × 24px
+ * `$border-subtle` divider at its inline start. */
+.navlinks {
+  position: relative;
+  display: flex;
+  block-size: 100%;
+  padding-inline-start: var(--spacing-05);
+}
+.navlinks::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-start: 0;
+  transform: translateY(-50%);
+  display: block;
+  inline-size: 1px;
+  block-size: 1.5rem;
+  background-color: var(--border-subtle);
+}
 
 /* header__menu-item: full-height, 16px gutters, hovers to $background-hover. */
 .navlinks a {
+  position: relative;
   display: flex;
   align-items: center;
   block-size: 100%;
   padding: 0 var(--spacing-05);
   border: 2px solid transparent;
+  background-color: var(--background);
   color: var(--text-secondary);
   font-size: 0.875rem;
   font-weight: 400;
@@ -222,6 +253,7 @@ nav {
   letter-spacing: 0;
   transition:
     background-color 110ms var(--motion-productive),
+    border-color 110ms var(--motion-productive),
     color 110ms var(--motion-productive);
 }
 .navlinks a:hover {
@@ -230,6 +262,27 @@ nav {
   text-decoration: none;
 }
 .navlinks a:focus-visible { outline: none; border-color: var(--focus); }
+
+/* Selected state: $text-primary plus a 3px $border-interactive bar that
+ * overhangs the transparent border by 2px on each side. */
+.navlinks a[aria-current="page"] { color: var(--text-primary); }
+.navlinks a[aria-current="page"]::after {
+  content: "";
+  position: absolute;
+  inset-block-end: -2px;
+  inset-inline-start: -2px;
+  inline-size: calc(100% + 4px);
+  block-size: 3px;
+  background-color: var(--border-interactive);
+}
+
+/* header__global: the icon actions Carbon puts opposite the nav. */
+.header-global {
+  display: flex;
+  flex: 1 1 0%;
+  justify-content: flex-end;
+  block-size: 100%;
+}
 
 .hero-body {
   max-width: var(--wide);

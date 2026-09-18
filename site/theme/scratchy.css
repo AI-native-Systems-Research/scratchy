@@ -32,6 +32,8 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --icons-hover: #f4f4f4;
 
   --links: #78a9ff;
+  --background-hover: rgba(141, 141, 141, 0.16);
+  --focus: #ffffff;
 
   --inline-code-color: #ff7eb6;
 
@@ -75,6 +77,8 @@ body { font-size: 1.6rem; line-height: 1.5; }
   --icons-hover: #161616;
 
   --links: #0f62fe;
+  --background-hover: rgba(141, 141, 141, 0.12);
+  --focus: #0f62fe;
 
   --inline-code-color: #9f1853;
 
@@ -144,27 +148,166 @@ body,
   outline-offset: -2px;
 }
 
-/* Menu bar: flat against the page, the way the landing nav is. */
+/* ------------------------------------------------------------------ *
+ * Carbon UI shell header
+ *
+ * theme/index.hbs rebuilds mdBook's menu bar as the shell header, so the
+ * book and the landing page carry one navigation instead of two. The
+ * metrics are `ui-shell/header/_header.scss`: fixed and flush to both
+ * viewport edges at z('header'), mini-units(6) tall, $background, one
+ * $border-subtle rule beneath.
+ *
+ * mdBook reserves the bar's height with #menu-bar-hover-placeholder and
+ * then cancels it with a negative margin on .page; taking the bar out of
+ * flow means that compensation has to go, or the chapter slides under it.
+ * ------------------------------------------------------------------ */
+
+:root { --menu-bar-height: 48px; }
+
 #menu-bar,
-#menu-bar.sticky {
-  background: var(--sidebar-bg);
-  border-bottom: 1px solid var(--table-border-color);
+#menu-bar.sticky,
+#menu-bar:hover,
+html.sidebar-visible #menu-bar {
+  position: fixed;
+  z-index: 8000;
+  inset-block-start: 0;
+  inset-inline: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  margin: 0;
+  block-size: var(--menu-bar-height);
+  background: var(--bg);
+  border-block-end: 1px solid var(--table-border-color);
   box-shadow: none;
 }
 
-.menu-title { font-weight: 600; letter-spacing: 0; }
+.page { margin-block-start: 0; }
 
-/* "▚ scratchy" home link, injected by theme/scratchy.js. */
-#scratchy-home {
-  color: var(--icons);
+/* Carbon's side nav sits *under* the header rather than beside it. */
+.sidebar { top: var(--menu-bar-height); }
+
+/* header__menu-trigger */
+#menu-bar .left-buttons { display: flex; align-items: center; margin: 0; }
+
+/* header__name */
+#menu-bar .brand {
+  display: flex;
+  align-items: center;
+  padding: 0 2rem 0 1rem;
+  border: 2px solid transparent;
+  block-size: 100%;
+  color: var(--fg);
   font-family: var(--mono-font);
-  font-weight: 600;
   font-size: 1.4rem;
+  font-weight: 600;
+  line-height: 1.25rem;
+  letter-spacing: 0.1px;
   text-decoration: none;
-  padding: 0 0.5rem;
-  line-height: var(--menu-bar-height);
 }
-#scratchy-home::before { content: "▚ "; color: var(--sidebar-active); }
-#scratchy-home:hover { color: var(--fg); }
+#menu-bar .brand::before { content: "▚ "; color: var(--sidebar-active); }
+#menu-bar .brand:focus { outline: none; border-color: var(--focus); }
+
+/* header__nav, opened by a 1px × 24px $border-subtle divider */
+#menu-bar .navlinks {
+  position: relative;
+  display: flex;
+  block-size: 100%;
+  padding-inline-start: 1rem;
+}
+#menu-bar .navlinks::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-start: 0;
+  transform: translateY(-50%);
+  display: block;
+  inline-size: 1px;
+  block-size: 24px;
+  background-color: var(--table-border-color);
+}
+
+/* header__menu-item */
+#menu-bar .navlinks a {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 0 1rem;
+  border: 2px solid transparent;
+  block-size: 100%;
+  color: var(--sidebar-fg);
+  font-size: 1.4rem;
+  font-weight: 400;
+  line-height: 1.125rem;
+  letter-spacing: 0;
+  text-decoration: none;
+  transition: background-color 110ms, border-color 110ms, color 110ms;
+}
+#menu-bar .navlinks a:hover { background-color: var(--background-hover); color: var(--fg); }
+#menu-bar .navlinks a:focus { outline: none; border-color: var(--focus); }
+
+/* Kept in the DOM for book.js, which reads `.menu-title`. */
+#menu-bar .menu-title { display: none; }
+
+/* header__global */
+#menu-bar .header-global {
+  display: flex;
+  flex: 1 1 0%;
+  align-items: center;
+  justify-content: flex-end;
+  block-size: 100%;
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Carbon breadcrumb — `breadcrumb/_breadcrumb.scss`
+ *
+ * body-compact-01, $spacing-03 either side of a '/' separator, no
+ * trailing slash, and the current page in $text-primary. The section
+ * segment ships in both forms so the hrefs stay right without script;
+ * `data-path` on <html> decides which one shows.
+ * ------------------------------------------------------------------ */
+
+/* Held to the chapter's measure so it lines up with the prose, the way
+ * mdBook centres <main>. */
+.cds-breadcrumb {
+  max-width: var(--content-max-width);
+  margin: 2rem auto 1rem;
+}
+
+.breadcrumb-list {
+  display: flex;
+  flex-wrap: wrap;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  font-size: 1.4rem;
+  line-height: 1.29;
+  letter-spacing: 0.16px;
+}
+
+.breadcrumb-item { position: relative; display: flex; align-items: center; margin-inline-end: 0.5rem; }
+.breadcrumb-item::after { content: "/"; color: var(--fg); margin-inline-start: 0.5rem; }
+.breadcrumb-item:last-child,
+.breadcrumb-item:last-child::after { margin-inline-end: 0; }
+.breadcrumb-item:last-child::after { content: ""; }
+.breadcrumb-item a { white-space: nowrap; }
+.breadcrumb-item--current span { color: var(--fg); cursor: auto; }
+
+/* Docs chapters get "Docs", blog posts get "Blogs". */
+.bc-blogs { display: none; }
+html[data-path^="blogs/"] .bc-blogs { display: flex; }
+html[data-path^="blogs/"] .bc-docs { display: none; }
+
+/* A blog post is not a chapter of the manual, so it arrives without the
+ * manual's table of contents. */
+html[data-path^="blogs/"] #sidebar,
+html[data-path^="blogs/"] #sidebar-resize-handle,
+html[data-path^="blogs/"] #sidebar-toggle,
+html[data-path^="blogs/"] .nav-wrapper { display: none; }
+html[data-path^="blogs/"] #sidebar-toggle-anchor:checked ~ .page-wrapper {
+  margin-inline-start: 0;
+  transform: none;
+}
 
 .sidebar .chapter li.chapter-item a.active { font-weight: 600; }

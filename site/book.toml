@@ -16,7 +16,6 @@ create-missing = false
 default-theme = "light"
 preferred-dark-theme = "navy"
 additional-css = ["theme/scratchy.css"]
-additional-js = ["theme/scratchy.js"]
 git-repository-url = "https://github.com/AI-native-Systems-Research/scratchy"
 site-url = "/scratchy/book/"
 
