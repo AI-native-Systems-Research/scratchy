@@ -368,6 +368,32 @@ impl Walk2<InAxis, OutAxis> {
     }
 }
 
+impl Walk2<OutAxis, InAxis> {
+    /// ⭐⭐⭐⭐⭐ THE SHARED 2-D KERNEL WALK DECLARED THE OTHER WAY ROUND — `[out, in]`, stick `in`, so the
+    /// CONTRACTION axis is the sticked one. The score matmul's kernel read straight off the NATURAL-K
+    /// plane, with no re-transpose and no second copy.
+    ///
+    /// The axis order lives in this TYPE, so this is not `kernel_shared` with its arguments swapped —
+    /// there are none. `stick()` is always the walk's LAST axis, which here is `in`, and the emitted
+    /// `LayoutInfo` copies `layoutDimOrder_`/`stickDimOrder_` straight off the walk. The device tile is
+    /// `[in/stick, out, stick]`, which at `hd == stick` is `slot·stick + feat` — the natural-K plane the
+    /// cache write already produces, pinned element-for-element against `PagedKvPool::addr` in
+    /// `subtile/tests/kernel_nt_is_natural_k.rs`.
+    ///
+    /// ⛔ WHY IT CAN EXIST, after a day of my concluding it could not: `dev_off` is ONE function whose
+    /// `stick_idx == 1` branch serves both orientations (the dims decide which), and this tree's own
+    /// `stride_map_disk_order` already reads GEMM weights in their on-disk orientation because "the
+    /// re-tile is ALREADY a strided gather … two swapped strides, not a data movement". The emitter
+    /// already declares two-dim sticks per operand (the fp8 kernel's `["in","out"]` / `[2,64]`). Nothing
+    /// was missing but a way to SAY it — and the resident Kᵀ plane, the whole-page restickify and a third
+    /// of the KV pool are what not saying it cost.
+    pub(crate) fn kernel_shared_nt() -> Self {
+        Walk2 {
+            _order: PhantomData,
+        }
+    }
+}
+
 impl Walk2<MbAxis, InAxis> {
     /// The plain 2-D matmul ACTIVATION walk `[mb, in]`, stick `in`. Rank-2 stick-on-last
     /// classifies stick-blocked (`RowBlocked`): rows interleave inside each stick group,

@@ -1012,23 +1012,56 @@ impl MatN {
 
 /// CONTRACTION EXTENT OF THIS MATMUL — the `in` (K) reduction stick extent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MatK(u32);
+pub struct MatK(u32, KernelOrient);
+
+/// ⭐⭐⭐⭐⭐ WHICH WAY ROUND THE KERNEL DECLARES ITSELF — the contraction on its ROW axis (`[in, out]`
+/// stick `out`, the resident Kᵀ plane) or on its STICKED axis (`[out, in]` stick `in`, the natural-K
+/// plane the cache write already produces).
+///
+/// It rides on [`MatK`] because `MatK` already IS the contraction, and because putting it here means the
+/// nine `matmul_opspec*` callers need no new argument: the one site that wants the other orientation asks
+/// for it where it already names the contraction width.
+///
+/// ⛔ NOT A SHAPE. The two orientations are the SAME BYTES at one stick (`cols == lanes`, one stick group,
+/// the blocking degenerates — pinned in `subtile/tests/kernel_nt_is_natural_k.rs`), so no extent and no
+/// address check distinguishes them. What differs is which axis reduces, and that is carried here, by
+/// `StickKind::KernelNt`, and by `Walk2<OutAxis, InAxis>` — never inferred.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KernelOrient {
+    /// `[in, out]` stick `out` — the contraction is the kernel's ROW axis. Every matmul in the tree.
+    ContractionOnRows,
+    /// `[out, in]` stick `in` — the contraction is the kernel's STICKED axis. The score leg reading
+    /// natural K, with no re-transpose.
+    ContractionOnStick,
+}
 
 impl MatK {
     /// One head's feature width `hd` — the score matmul contracts Q·Kᵀ over it.
     pub const fn of_head_dim(hd: u32) -> MatK {
-        MatK(hd)
+        MatK(hd, KernelOrient::ContractionOnRows)
+    }
+
+    /// ⭐ THE SAME CONTRACTION, against a kernel declared `[out, in]` stick `in` — i.e. the NATURAL-K
+    /// plane. Same width, same math; the only difference is which axis of the kernel the reduction runs
+    /// along, which is what lets the score leg skip the Kᵀ copy entirely.
+    pub const fn of_head_dim_nt(hd: u32) -> MatK {
+        MatK(hd, KernelOrient::ContractionOnStick)
+    }
+
+    /// Which way round this contraction's kernel is declared.
+    pub const fn orient(self) -> KernelOrient {
+        self.1
     }
     /// The score block's kv window — the value matmul contracts probabilities·V over it. Takes the
     /// block's own typed width, same reason as [`MatN::of_kv_window`].
     pub const fn of_kv_window(width: BlockCols) -> MatK {
-        MatK(width.get())
+        MatK(width.get(), KernelOrient::ContractionOnRows)
     }
     /// Exactly ONE stick of contraction — the identity-kernel slab copies, whose A-side read is
     /// deliberately one stick so the copy has no plane term of its own to get wrong. The width is
     /// the machine's lane count, named by the zero-sized [`Lanes`] witness.
     pub const fn one_stick(lanes: Lanes) -> MatK {
-        MatK(lanes.n())
+        MatK(lanes.n(), KernelOrient::ContractionOnRows)
     }
     /// ONE HEAD-DIM SLAB of contraction — the score leg's Q·Kᵀ split by slab so that its
     /// contraction is one stick at EVERY head dim, which is what
@@ -1038,11 +1071,11 @@ impl MatK {
     /// distinction [`BlockCols::of_head_slab`] already draws, and the reason this is not spelled
     /// `one_stick(Lanes)` at the call site.
     pub const fn of_head_slab(feats: SlabFeats) -> MatK {
-        MatK(feats.n())
+        MatK(feats.n(), KernelOrient::ContractionOnRows)
     }
     /// A projection's input features — K of `A[m,k]·W[k,n]` (or one K-split block of it).
     pub const fn of_in_features(k: u32) -> MatK {
-        MatK(k)
+        MatK(k, KernelOrient::ContractionOnRows)
     }
     pub const fn get(self) -> u32 {
         self.0

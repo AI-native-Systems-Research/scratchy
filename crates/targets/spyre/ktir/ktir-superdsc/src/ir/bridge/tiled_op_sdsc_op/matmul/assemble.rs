@@ -80,6 +80,8 @@ pub fn assemble_matmul_split(
         m,
         n,
         k,
+        // The tower drives raw extents and its kernels are ordinary `[in,out]` weights.
+        crate::sdsc_abstract::KernelOrient::ContractionOnRows,
         batch,
         a_name,
         w_name,

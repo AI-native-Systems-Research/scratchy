@@ -136,6 +136,8 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
         m.get(),
         n.get(),
         k.get(),
+        // The one quantity the extents cannot carry: which axis of the kernel reduces.
+        k.orient(),
         batch.get(),
         a_name,
         w_name,
@@ -162,6 +164,11 @@ pub fn matmul_opspec_split<DF: DataFormat, S>(
     m: u32,
     n: u32,
     k: u32,
+    // ⭐ WHICH WAY ROUND THE KERNEL DECLARES ITSELF. The extents give up their names at this seam, but the
+    // ORIENTATION cannot: `[in,out]` stick `out` and `[out,in]` stick `in` are the same extents and (at one
+    // stick) the same bytes, so there is nothing left in `m`/`n`/`k` to recover it from. It travels as its
+    // own value — see `sdsc_abstract::KernelOrient`.
+    k_orient: crate::sdsc_abstract::KernelOrient,
     batch: u32,
     a_name: &str,
     w_name: &str,
@@ -263,18 +270,39 @@ where
     //                                             across mb+y); a 3-D kernel makes dxp
     //                                             treat the weight as per-batch → garbage.
     // OUTPUT [mb,out,y] stick=out  scale[1,1,1] (reduction = OMIT `in`).
-    // KERNEL is always the bare 2-D shared weight [in,out] (broadcast across mb+batch).
-    let kernel_walk = Walk2::kernel_shared();
-    let kernel = TensorArg::<2>::new(
-        true,
-        w_name.to_string(),
-        Role::Kernel,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(kernel_walk.order()),
-        kernel_walk.order(),
-        kernel_walk.stick(),
-        Allocation::Hbm,
-    )
+    // KERNEL is the bare 2-D shared weight (broadcast across mb+batch) — in the ORIENTATION the
+    // contraction asks for. `[in,out]` stick `out` is every matmul in the tree; `[out,in]` stick `in` is
+    // the score leg reading the NATURAL-K plane, where the contraction is the sticked axis and no Kᵀ copy
+    // exists. The orientation rides on `MatK` because `MatK` IS the contraction — see
+    // `sdsc_abstract::KernelOrient` for why it is not a shape (the two are the same bytes at one stick).
+    let kernel = match k_orient {
+        crate::sdsc_abstract::KernelOrient::ContractionOnRows => {
+            let w = Walk2::kernel_shared();
+            TensorArg::<2>::new(
+                true,
+                w_name.to_string(),
+                Role::Kernel,
+                [Scale::Active, Scale::Active],
+                plan.iter_syms(w.order()),
+                w.order(),
+                w.stick(),
+                Allocation::Hbm,
+            )
+        }
+        crate::sdsc_abstract::KernelOrient::ContractionOnStick => {
+            let w = Walk2::kernel_shared_nt();
+            TensorArg::<2>::new(
+                true,
+                w_name.to_string(),
+                Role::Kernel,
+                [Scale::Active, Scale::Active],
+                plan.iter_syms(w.order()),
+                w.order(),
+                w.stick(),
+                Allocation::Hbm,
+            )
+        }
+    }
     .map_err(|e| e.0)?
     .with_offset(w_off);
 
