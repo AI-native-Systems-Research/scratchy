@@ -2,6 +2,26 @@
 //! query-row count `mq` (mq=1 decode, mq>1 prefill/chunked-prefill), no separate decode/prefill
 //! implementation. Ported from torch-spyre's `spyre__sdpa_overrideable` (`decompositions.py:527`):
 //!
+//! ⛔⛔⛔⭐⭐⭐⭐⭐ THE SCORE LEG CANNOT READ NATURAL K, AND THE REASON IS ONE LINE OF THE OP LIBRARY.
+//!
+//! The resident Kᵀ plane looks like pure waste: natural K is what the cache write produces, a third of
+//! every KV page is spent re-transposing it, and `dev_off` addresses BOTH orientations out of one
+//! function. The vocabulary to ask for the other one now exists and is proven element-for-element against
+//! `PagedKvPool::addr` (`StickKind::KernelNt` … `MatK::of_head_dim_nt`, and
+//! `subtile/tests/kernel_nt_is_natural_k.rs` at hd 64/128/256).
+//!
+//! ⛔ IT WAS TRIED ON THE CARD AND REFUSED: `KernelOrient::ContractionOnStick` on this leg, with its
+//! corner at `KvPlane::Knat`, gives
+//! `sbf-ddc: DtException: Could not find any suitable dimension mapping` (`ddl_conversion.cpp:2521`,
+//! granite-3.1-2b fp8, decode rungs 64 and 128). Because `deeptools/ddc/ddl_templates/bmm.ddl:22` says
+//! `%slice_layout_kernel = ddl.layout(%in,%out) {is_order_fixed=true}` — a bmm kernel's dim order is
+//! `(in, out)` and the op library declares it NON-PERMUTABLE, so there is no template to map onto.
+//!
+//! ⭐ DO NOT GENERALISE IT. `is_order_fixed=true` is on the bmm KERNEL; a transpose is NOT data movement
+//! on this device in general — `stride_map_disk_order` reads GEMM weights in their on-disk orientation as
+//! "two swapped strides, not a data movement". Read the relevant `.ddl` before concluding anything about
+//! another operand.
+//!
 //! ```python
 //! expansion = num_heads // num_kvheads
 //! if expansion != 1:
