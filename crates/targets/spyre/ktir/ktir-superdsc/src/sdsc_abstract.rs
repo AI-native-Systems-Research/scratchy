@@ -1052,6 +1052,14 @@ impl MatK {
     pub const fn orient(self) -> KernelOrient {
         self.1
     }
+
+    /// ⭐ RE-DECLARE THE ORIENTATION, keeping the width. For a shared emitter body whose two callers read
+    /// kernels of opposite orientation — attention's resident prefix leg (natural K) and its new-block leg
+    /// (a genuine Kᵀ scratch transposed from the activation) — so the body takes the orientation as a
+    /// parameter instead of every `MatK` door gaining a twin.
+    pub const fn with_orient(self, orient: KernelOrient) -> MatK {
+        MatK(self.0, orient)
+    }
     /// The score block's kv window — the value matmul contracts probabilities·V over it. Takes the
     /// block's own typed width, same reason as [`MatN::of_kv_window`].
     pub const fn of_kv_window(width: BlockCols) -> MatK {

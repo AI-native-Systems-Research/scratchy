@@ -616,6 +616,12 @@ fn assemble_attn_block(
     // one whose `y` stride uses the operand's declared pitch. See `of_score_leg`.
     score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
     kt_kernel: &str,
+    // ⭐ WHICH WAY ROUND `kt_kernel` IS DECLARED, because this body's two callers disagree: the RESIDENT
+    // prefix leg reads the natural-K plane (`[out,in]` stick `in` — contraction on the sticked axis, no
+    // transpose anywhere), while the NEW-BLOCK leg reads a genuine Kᵗ scratch that `assemble_restickify_kt_2d`
+    // transposed out of the activation (`[in,out]` stick `out`). The two are the SAME EXTENTS and, at one
+    // stick, the same BYTES, so nothing in the shapes distinguishes them — see `sdsc_abstract::KernelOrient`.
+    k_orient: crate::sdsc_abstract::KernelOrient,
     // The score kernel's declared physical column count. `KtKernelPitch` has exactly two doors — the
     // new block's slot extent and the pool page's slots — so a row count cannot reach this slot.
     kt_stride: crate::sdsc_abstract::KtKernelPitch,
@@ -875,7 +881,7 @@ fn assemble_attn_block(
                         &name,
                         MatM::single_row(),
                         MatN::of_kv_window(width),
-                        MatK::of_head_dim(hd),
+                        MatK::of_head_dim(hd).with_orient(k_orient),
                         // The score leg reads the TOKEN STREAM (heads on columns, `mq*hd` apart) and writes
                         // the HEAD-MAJOR score buffer (heads on rows, `mq*stick` apart). Two different laws,
                         // both stated, so the builder can refuse a walk that matches neither.
@@ -908,7 +914,7 @@ fn assemble_attn_block(
                         &name,
                         MatM::of_query_rows(mq),
                         MatN::of_kv_window(width),
-                        MatK::of_head_slab(FeatIdx::SLAB_FEATS),
+                        MatK::of_head_slab(FeatIdx::SLAB_FEATS).with_orient(k_orient),
                         MatY::of_gqa_group(
                             gqa,
                             nests.token_stream_by_slab(h0, s),
@@ -945,7 +951,7 @@ fn assemble_attn_block(
                 &format!("attn_{tag}sc_h{hi}_o{t}"),
                 MatM::of_query_rows(mq),
                 MatN::of_kv_window(width),
-                MatK::of_head_dim(hd),
+                MatK::of_head_dim(hd).with_orient(k_orient),
                 MatY::unbatched(),
                 bmm_form,
                 &rb(qs, mq_n, hd),
@@ -1884,6 +1890,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // slot is the kernel's physical pitch (the resident block's value here is `cap`), a SLOT question
                 // — the row count answered it only through the new-block identity `rows == slots`.
                 &new_kt,
+                // A GENUINE Kᵗ: `assemble_restickify_kt_2d` transposed it out of the activation into this
+                // scratch, so its contraction is the ROW axis, exactly as every other matmul's kernel is.
+                // Only the RESIDENT leg below reads an untransposed plane.
+                crate::sdsc_abstract::KernelOrient::ContractionOnRows,
                 mq_pad_t.slots().kernel_row_pitch(),
                 |h, sl| {
                     let hi = h.get();
@@ -2050,6 +2060,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // verbatim: `let k_blk = b * hd * stick;` (worktree superdsc-batch-perf). The V side below
             // is `b*stick*hd`, which is already correct and matches that same reference (`vblk`).
             kct,
+            // ⭐⭐⭐⭐⭐ STILL `ContractionOnRows` FOR NOW — the flip to the natural-K plane is this one value
+            // plus pointing `kct` at `KvPlane::Knat`, and it is deliberately NOT taken in the same commit
+            // that builds the door. Everything it needs is in place and proven
+            // (`subtile/tests/kernel_nt_is_natural_k.rs`): `ContractionOnStick` here makes this leg read
+            // `[out,in]` stick `in`, which IS the natural-K plane the cache write already fills, and then the
+            // Kᵀ plane and the whole-page restickify both have no reader left.
+            crate::sdsc_abstract::KernelOrient::ContractionOnRows,
             crate::sdsc_abstract::PagedKvPool::KT_KERNEL_PITCH,
             // THE POOL COMPOSES THE REQUEST TERM, not this call site. `kt_block_base_of` is the same
             // `block_index(kvh) + r` the cache write bakes, so the fold's kernel and the write that
