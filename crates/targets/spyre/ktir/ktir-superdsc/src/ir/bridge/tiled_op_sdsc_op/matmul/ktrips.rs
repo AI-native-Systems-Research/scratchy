@@ -147,6 +147,24 @@ pub fn plan_k_trips<DF: DataFormat>(
     ))
 }
 
+/// [`plan_k_trips`] for the DENSE fp16 PROJECTION door — the shapes
+/// [`super::assemble::try_assemble_matmul_seeded`] serves.
+///
+/// The untyped wrapper boundary, stated exactly as [`super::opspec::matmul_opspec`] states it: this
+/// door's callers are dense projections whose dims are unambiguous token rows and feature widths,
+/// never a batch of requests, so the proven walk pair (and with it the live splitter) belongs here
+/// rather than defaulted at a call site that has no witness to offer.
+pub fn plan_k_trips_dense(m: u32, n: u32, k: u32) -> Result<KTripPlan, String> {
+    plan_k_trips::<Fp16>(
+        m,
+        n,
+        k,
+        1,
+        <Fp16 as DataFormat>::DF,
+        SharedKernelBmmForm::batch_inner_proven(MatmulWrapperSite::witness()),
+    )
+}
+
 /// ⭐ THE K-TRIP EMISSION: `trips` matmul descriptors into per-trip partial buffers, then the adds
 /// that sum them into `o`.
 ///

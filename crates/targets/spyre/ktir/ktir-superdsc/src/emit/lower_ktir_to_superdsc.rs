@@ -3165,6 +3165,34 @@ pub fn matmul(
     // tabulating `REFUSED <stage> <message>` shows it as a blank row — which is exactly how
     // `swiglu_mlp_granite_flat`'s reduction split first surfaced. The `Result` form was added for this
     // and had no caller; this is that caller.
+    // ⭐⭐⭐ ONE NODE PER K TRIP, WHEN THE WHOLE CONTRACTION DOES NOT FIT LX — see
+    // `ir::bridge::tiled_op_sdsc_op::matmul::ktrips`. `plan_k_trips_dense` answers with the FIT
+    // ITSELF: it runs the SAME tiler this emission runs, T=1 first, and takes the first trip count
+    // whose plan does NOT split the reduction axis across cores. So `trips == 1` — every shape that
+    // bakes today — falls straight through to the single-node assembler below, byte-identically,
+    // because it measurably fits and not because a shape comparison spared it.
+    let trips = crate::ir::bridge::tiled_op_sdsc_op::matmul::ktrips::plan_k_trips_dense(m, n_dev, k).map_err(|message| Error {
+        message: format!("MatmulTile t{}: {message}", out.tid),
+    })?;
+    if trips.trips() > 1 {
+        return crate::ir::bridge::tiled_op_sdsc_op::matmul::ktrips::try_assemble_matmul_k_trips(
+            &op_name,
+            m,
+            n_dev,
+            k,
+            1,
+            &rb(&a.name(), m, k),
+            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, w.name()),
+            &rb(&out.name(), m, n_dev),
+            crate::place::PlaceId::Act(out.tid),
+            trips,
+            sym_id_base,
+            layout,
+        )
+        .map_err(|message| Error {
+            message: format!("MatmulTile t{}: {message}", out.tid),
+        });
+    }
     let op = try_assemble_matmul_seeded(
         &op_name,
         m,
