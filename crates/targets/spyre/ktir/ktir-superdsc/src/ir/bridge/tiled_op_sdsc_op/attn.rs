@@ -23,11 +23,22 @@
 //! layout — so it constrains the STICK decomposition, not the declared order. `bmm.ddl:25`'s global layout
 //! is `{}`, i.e. order NOT fixed, so `layoutDimOrder_` is permutable.
 //!
-//! ⇒ The `[out,in]` order was never the problem. `stickDimOrder_ = ["in"]` was: one stick dim cannot fill a
-//! two-dim slice layout. The shape that satisfies it is the TWO-DIM STICK `["in","out"]` — what 17 of 19
-//! vendor 2-D `[in,out]` fixtures carry, and what `emit/mod.rs`'s `is_fp8_kernel` branch already emits
-//! (`stickSize_ [2,64]`). ⚠️ UNTRIED: the `stickSize_` split has to land the right element count either
-//! side of `elemInSlice` (64 for fp16). That is the next experiment.
+//! ⇒ The `[out,in]` order was never the problem. **THE SLICE DIM WAS**, and `bmm.ddl` has TWO kernel slice
+//! layouts chosen by ELEMENT TYPE:
+//!
+//! ```text
+//! 22: %slice_layout_kernel       = ddl.layout(%in,%out) {is_order_fixed=true}   // int8 / fp8 / int4
+//! 23: %slice_layout_kernel_16bit = ddl.layout(%out)     {is_order_fixed=true}   // fp16
+//! ```
+//!
+//! `%kertensor_fp16` (line 41) takes the **one-dim** `(%out)`. So an **fp16** bmm kernel's slice
+//! decomposition must be exactly `["out"]` — the SCORE axis, i.e. slots. Kᵀ sticks on slots; natural K
+//! sticks on `hd` = `in`, so `{out} ∩ {in} = {}` and the mapping search fails. **At fp16 the resident Kᵀ
+//! plane is required**, and that is the real reason.
+//!
+//! ⭐⭐ THE LEVER, UNTRIED: line 22's two-dim `(%in,%out)` is what the NON-16-bit kernels take, which is why
+//! `emit/mod.rs`'s `is_fp8_kernel` branch (`["in","out"]` / `stickSize_ [2,64]`) bakes. An **fp8 KV cache**
+//! could therefore declare the natural-K orientation — killing this plane and halving KV bytes at once.
 //!
 //! ```python
 //! expansion = num_heads // num_kvheads
