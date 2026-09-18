@@ -3569,6 +3569,16 @@ impl Worker for CudaWorker {
                         .get("rope_scaling")
                         .map(scratchy_forward_compiler::hash_json_value)
                 },
+                // Suppressed for GGUF for the same reason as the two above: the
+                // metadata's rope base frequency routinely disagrees with the
+                // canonical `config.json`, so the variant's baked value stays
+                // authoritative rather than being second-guessed by a value we
+                // don't trust.
+                rope_theta: if suppress_hf_hints {
+                    None
+                } else {
+                    hf_config.rope_theta
+                },
             };
             // Runtime `max_model_len` — matches the serve-level
             // resolution (CLI `--max-model-len` ∨ HF

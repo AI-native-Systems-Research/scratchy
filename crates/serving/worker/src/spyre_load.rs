@@ -549,6 +549,7 @@ impl SpyreWorker {
                 .extra
                 .get("rope_scaling")
                 .map(scratchy_forward_compiler::hash_json_value),
+            rope_theta: hf_config.rope_theta,
         };
         let max_model_len = hf_config.max_position_embeddings.unwrap_or(4096);
 
