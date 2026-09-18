@@ -224,12 +224,6 @@ html.sidebar-visible #menu-bar {
 
 .page { margin-block-start: 0; }
 
-/* Carbon's side nav sits *under* the header rather than beside it. */
-.sidebar { top: var(--menu-bar-height); }
-
-/* header__menu-trigger */
-#menu-bar .left-buttons { display: flex; align-items: center; margin: 0; }
-
 /* header__name */
 #menu-bar .brand {
   display: flex;
@@ -347,70 +341,25 @@ html[data-path^="blogs/"] .bc-blogs { display: flex; }
 html[data-path^="blogs/"] .bc-docs { display: none; }
 
 /* ------------------------------------------------------------------ *
- * Carbon side nav — `ui-shell/side-nav/_side-nav.scss`
+ * No side nav
  *
- * A blog post and a doc chapter are the same artefact: a Markdown file
- * listed in SUMMARY.md. They get the same navigation.
+ * A blog post and a doc chapter are the same artefact, and neither
+ * carries mdBook's table of contents. Navigation is the shell header,
+ * the breadcrumb, and the chapter index on the book's front page.
+ *
+ * The elements stay in the DOM because book.js reaches for #sidebar,
+ * #sidebar-toggle and #sidebar-resize-handle on every page and throws
+ * without them.
  * ------------------------------------------------------------------ */
 
-:root { --sidebar-width: 256px; }   /* mini-units(32) */
+#sidebar,
+#sidebar-resize-handle,
+#sidebar-toggle,
+.nav-wrapper { display: none; }
 
-/* $background, not $layer — the shell's side nav shares the page surface,
- * and sits under the header rather than beside it. */
-.sidebar {
-  inline-size: var(--sidebar-width);
-  max-inline-size: var(--sidebar-width);
-  block-size: calc(100% - var(--menu-bar-height));
-  background: var(--bg);
-  color: var(--sidebar-fg);
-}
-
-.sidebar .sidebar-scrollbox { padding: 1.6rem 0; }
-
-/* side-nav__link: heading-compact-01, 32px minimum, 16px gutters. */
-.sidebar .chapter li.chapter-item a,
-.sidebar .chapter li.chapter-item div {
-  display: flex;
-  align-items: center;
-  padding: 0 1.6rem;
-  min-block-size: 3.2rem;
-  inline-size: 100%;
-  color: var(--sidebar-fg);
-  font-size: 1.4rem;
-  font-weight: 600;
-  line-height: 1.29;
-  letter-spacing: 0.16px;
-  text-decoration: none;
-  transition: color 110ms, background-color 110ms;
-}
-
-.sidebar .chapter li.chapter-item a:hover {
-  background-color: var(--background-hover);
-  color: var(--fg);
-  text-decoration: none;
-  outline: none;
-}
-
-/* side-nav__link--current */
-.sidebar .chapter li.chapter-item a.active {
-  background-color: var(--background-selected);
-  color: var(--fg);
-  font-weight: 600;
-}
-
-/* Nested entries drop to weight 400 and indent by mini-units(4). */
-.sidebar .chapter .section li.chapter-item a {
-  padding-inline-start: 3.2rem;
-  font-weight: 400;
-}
-
-/* Section headers ("Blogs") are labels, not destinations. */
-.sidebar .chapter li.part-title {
-  padding: 1.6rem 1.6rem 0.8rem;
-  margin: 0;
-  color: var(--searchresults-header-fg);
-  font-size: 1.2rem;
-  font-weight: 600;
-  letter-spacing: 0.32px;
-  text-transform: none;
+/* mdBook offsets the page by the rail's width whenever the toggle is
+ * checked, which it is by default. Nothing to make room for now. */
+#sidebar-toggle-anchor:checked ~ .page-wrapper {
+  margin-inline-start: 0;
+  transform: none;
 }
