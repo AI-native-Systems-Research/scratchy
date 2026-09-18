@@ -609,6 +609,113 @@ fn pointwise_extents_agree(
     Ok(())
 }
 
+/// [`elementwise`] where one operand is a VECTOR the output sprays — a per-row scalar `[m, 1]` along
+/// the stick axis, or a row vector `[1, n]` down the rows.
+///
+/// Split out rather than inlined because it uses a DIFFERENT assembler: `assemble_pointwise_broadcast_off`
+/// takes [`EwOperand`](crate::emit::EwOperand)s, each carrying its own `mb_broadcast`/`out_broadcast`, so
+/// the descriptor STATES which operands are sprayed. The seeded builder [`elementwise`] otherwise uses
+/// hands every operand the output's dims and has no way to say it.
+///
+/// ⛔ THE dxp SFP-SPLIT GEOMETRY IS REFUSED HERE BY NAME rather than left to the assembler's `panic!`.
+/// `assemble_pointwise_broadcast_off` aborts for a transcendental at multi-stick width with an
+/// out-broadcast input — the `map::at` dxp compile crash its guard records, OBSERVED on card. That guard
+/// is right, but a panic from this door exits 101 with no stage label, so a driver tabulating
+/// `REFUSED <stage> <message>` shows a blank row; `try_assemble_matmul_seeded` exists for exactly this
+/// reason and this is the same case. The condition is checked first so the refusal names the geometry.
+#[allow(clippy::too_many_arguments)]
+fn elementwise_broadcast(
+    name: &str,
+    kind: Elementwise,
+    op_func: &'static str,
+    arity: usize,
+    ins: &[Region],
+    out: &Region,
+    bcast: &[(bool, bool)],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let rows = node_rows(name, out)?;
+    let cols = out.c_len;
+    check_pointwise_cols(cols, "Elementwise", out.tid)?;
+    // A NON-SPRAYED OPERAND STILL HAS TO MATCH, and only the sprayed axis is exempt. Checking each
+    // operand against the output on the axes it does NOT broadcast keeps the extents-agree invariant
+    // intact for everything the broadcast does not explain — otherwise this arm would be a hole in it.
+    for (i, (x, &(mb, col))) in ins.iter().zip(bcast.iter()).enumerate() {
+        let rows_ok = mb || x.v_rows == out.v_rows;
+        let cols_ok = col || x.c_len == out.c_len;
+        if !rows_ok || !cols_ok {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` against an output t{} of \
+                 `[{}, {}]`, and the broadcast accounts for {}. Every axis an operand does NOT spray \
+                 must equal the output's, because this descriptor addresses it there; a mismatch on a \
+                 non-sprayed axis would run off the operand and take the wrong bytes silently.",
+                x.tid,
+                x.v_rows,
+                x.c_len,
+                out.tid,
+                out.v_rows,
+                out.c_len,
+                match (mb, col) {
+                    (true, true) => "both axes",
+                    (true, false) => "the ROW axis only",
+                    (false, true) => "the COLUMN axis only",
+                    (false, false) => "neither axis",
+                },
+            ));
+        }
+    }
+    if crate::emit::SFP_SPLIT_TRANSCENDENTALS.contains(&op_func)
+        && cols > Fp16::ELEMS_PER_STICK
+        && bcast.iter().any(|&(_, col)| col)
+    {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: `{op_func}` is an SFP transcendental at multi-stick width \
+             (cols={cols} > {}) with an OUT-BROADCAST (per-row scalar) input. That geometry CRASHES the \
+             dxp compile — `map::at` in ddc's per-core SFP split, OBSERVED on card 2026-06-27 for a \
+             full-width rsqrt over the rmsnorm mean. A transcendental on a reduced scalar must be ONE \
+             STICK wide and the broadcast belongs in the FOLLOWING multiply, which is not \
+             transcendental and is safe. Refused by name here rather than left to \
+             `assemble_pointwise_broadcast_off`'s panic, which exits with no stage label.",
+            Fp16::ELEMS_PER_STICK,
+        ));
+    }
+    // The handles, at each operand's OWN extent: a sprayed operand is the vector it really is, so its
+    // `Stk` states `[m, 1]` / `[1, n]` and the `In` builder says which way it sprays.
+    let handles: Vec<crate::sdsc_abstract::Stk<crate::sdsc_abstract::RowBlockedTag>> =
+        ins.iter().map(|x| rb(&x.name(), x.v_rows, x.c_len)).collect();
+    let ew: Vec<crate::emit::EwOperand<'_>> = handles
+        .iter()
+        .zip(bcast.iter())
+        .map(|(h, &(mb, col))| match (mb, col) {
+            // Both axes degenerate: ONE value for the whole output. `In::scalar` is that mode.
+            (true, true) => In::scalar(h).ew(),
+            (true, false) => In::mb(h).ew(),
+            (false, true) => In::col(h).ew(),
+            (false, false) => In::full(h).ew(),
+        })
+        .collect();
+    if ew.len() != arity {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: {} operand(s) for an arity-{arity} op",
+            ew.len()
+        ));
+    }
+    let o = rb(&out.name(), rows, cols);
+    let op_name = format!("{op_func}_o{}", out.tid);
+    Ok(vec![assemble_pointwise_broadcast_off(
+        &op_name,
+        op_func,
+        crate::sdsc_abstract::RowCount::of_token_rows(rows),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+        &ew,
+        &o,
+        crate::addr::DevOff::ZERO,
+        sym_id_base,
+        layout,
+    )])
+}
+
 /// main's `lower_elementwise_node` (main 8362-8432). Its door: the [`Elementwise`] kind is stated by
 /// the caller, the operand names are the parameters, and the row count is the node's ([`node_rows`] —
 /// the producer row-blocks a region wider than the LX holds, so the first window is not the node).
@@ -621,6 +728,34 @@ pub fn elementwise(
 ) -> Result<Vec<EmittedOp>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
     let (ins, out) = split_out(name, r, layout, arity)?;
+    // ⭐⭐⭐ A DEGENERATE OPERAND AXIS IS A BROADCAST, AND THE BROADCASTING BUILDER IS THE ONE THAT CAN
+    // SAY SO. [`pointwise_extents_agree`]'s own refusal names this exact remedy — "a row-broadcast
+    // `[1, n]` source or a per-row `[m, 1]` scalar is expressible only through the EwOperand builders
+    // (`pw2` + `In::col`), which mark the operand out-broadcast so the descriptor STATES the broadcast;
+    // this seeded whole-tensor path cannot express it". So this branches BEFORE that guard and reaches
+    // the other assembler; the guard is left exactly as it is, still refusing every genuinely
+    // mismatched extent on the seeded path it was written for. Nothing is relaxed.
+    //
+    // ⭐ THIS IS WHAT THE HARDWARE-PROVEN ATTENTION DOES, not an inference from the shape of the API.
+    // `ir/bridge/tiled_op_sdsc_op/attn.rs` computes this identical softmax and emits NO node for either
+    // broadcast: `attn_{tag}esub_o{t}` is `subtract` over
+    // `[In::full(&hm(sc)).ew(), In::col(&hm(run_m)).ew()]`, where `run_m` IS the reduce's `[rows, 1]`
+    // accumulator. The AIU has no broadcast primitive and needs none — a broadcast operand is an
+    // ADDRESSING MODE of the consuming op.
+    //
+    // The discriminator is the operand's own extent against the output's, which is the same one this
+    // file already uses to size a rank-1 intermediate ("a reduce writes `c_len == 1`, so anything
+    // reading a one-column tile is on the reduction's side of the program"). A caller reaching here
+    // through the whole-function door has additionally had that extent CROSS-CHECKED against the axis
+    // the program's own `expand_shape`/`linalg.broadcast` attributes state (see
+    // `whole_function::program_broadcast_chains`), so the two cannot drift apart.
+    let bcast: Vec<(bool, bool)> = ins
+        .iter()
+        .map(|x| (x.v_rows == 1 && out.v_rows > 1, x.c_len == 1 && out.c_len > 1))
+        .collect();
+    if bcast.iter().any(|&(mb, col)| mb || col) {
+        return elementwise_broadcast(name, kind, op_func, arity, &ins, &out, &bcast, sym_id_base, layout);
+    }
     pointwise_extents_agree(name, kind, &ins, &out)?;
     // ⛔ THIS COMMENT USED TO SAY `assemble_pointwise` EMITS THE SFP POLYNOMIAL TABLE "via
     // `constant_info(op_func)`". THERE IS NO SUCH FUNCTION. `constant_info` is a local in `emit_sdsc`
@@ -3722,35 +3857,102 @@ mod elementwise_tests {
 
     // ── (ii) REFUSAL + A CONTROL THAT STILL LOWERS ────────────────────────────────────────────
 
-    /// ⛔ THE SHAPE THAT MOTIVATED THE GUARD, AND IT IS LIVE. `LoweredOp::BiasAdd =>
-    /// SubOp::Elementwise(EwKind::Add)` (`crates/compiler/subtile/src/subtile_ir.rs`) whose bias is
-    /// rank-1 `[D]` (`crates/compiler/macros/src/shape.rs`, `sig_bias_add`), and `BiasAdd` is ABSENT
-    /// from that file's `elementwise` column-tiling list, so its operands are taken WHOLE — a
-    /// `[1, D]` region against a `[m, D]` output. The emitter gave it the output's dims and said
-    /// nothing.
+    /// ⭐ THE SHAPE THAT MOTIVATED THE GUARD, AND IT NOW LOWERS — AS A BROADCAST, WHICH IS WHAT IT IS.
+    /// `LoweredOp::BiasAdd => SubOp::Elementwise(EwKind::Add)` whose bias is rank-1 `[D]`: a `[1, D]`
+    /// region against a `[m, D]` output. This test used to pin a REFUSAL, and the refusal was right for
+    /// the SEEDED builder — which cannot say "broadcast" — but wrong as a statement about the device.
+    /// `In::mb` marks an operand mb-broadcast and `assemble_pointwise_broadcast_off` emits it, so the
+    /// door reaches that assembler instead. The refusal's own text named this remedy all along.
     #[test]
-    fn a_row_broadcast_operand_is_refused_by_name() {
+    fn a_row_broadcast_operand_now_lowers_through_the_broadcasting_builder() {
         let r = node(
             reg(5, 4, 128, false),
             reg(6, 1, 128, false),
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        // `EmittedOp` is not `Debug`, so `expect_err` is unavailable — bind the refusal directly.
+        let ops = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None)
+            .expect("a `[1, D]` bias under a `[m, D]` output is an mb-broadcast, which `In::mb` states");
+        assert_eq!(ops.len(), 1, "one pointwise op — the broadcast is an operand mode, not a node");
+        assert_eq!(ops[0].op_name, "add_o7");
+    }
+
+    /// ⛔⛔⛔ THE CONTROL THAT KEEPS THE GUARD A GUARD, and the one that makes the three tests above
+    /// mean something. A row extent that is NOT degenerate — `[2, 128]` under `[4, 128]` — is a real
+    /// mismatch with no broadcast reading, and `pointwise_extents_agree` must still refuse it by name.
+    /// If this ever lowers, the broadcast arm has stopped discriminating and has become a blanket
+    /// admission of any extent, which is the silent mis-addressing the guard exists to stop.
+    #[test]
+    fn a_non_degenerate_row_mismatch_is_still_refused_by_the_seeded_guard() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 2, 128, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
         let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None) else {
-            panic!("a [1,128] operand under a [4,128] output cannot be addressed here");
+            panic!("`[2, 128]` under `[4, 128]` is not a broadcast — 2 is not a degenerate axis");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
         assert!(
-            e.message.contains("`[1, 128]`") && e.message.contains("`[4, 128]`"),
-            "states BOTH extents: {}",
-            e.message
-        );
-        assert!(
             e.message.contains("device_dims"),
-            "states WHY — one device_dims for every operand: {}",
+            "still the seeded path's own refusal, which states WHY: {}",
             e.message
         );
+    }
+
+    /// ⛔ AND THE CONTROL FOR THE OTHER HALF: degenerate on the axis it sprays, WRONG on the axis it
+    /// does not. `[1, 64]` under `[4, 128]` is a legitimate mb-broadcast on rows and a plain mismatch on
+    /// columns, so the broadcast arm's own per-axis check must refuse it — a broadcast explains ONE
+    /// axis, never both by implication.
+    #[test]
+    fn a_broadcast_with_a_wrong_non_sprayed_axis_is_refused() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 1, 64, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None) else {
+            panic!("the column axis is not sprayed and 64 != 128, so this must refuse");
+        };
+        assert!(e.message.contains("t6"), "names the operand: {}", e.message);
+        assert!(
+            e.message.contains("the ROW axis only"),
+            "says WHICH axis the broadcast accounts for, so the reader sees the other one is the \
+             problem: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE dxp SFP-SPLIT GEOMETRY, REFUSED BY NAME RATHER THAN AS A PANIC. A transcendental at
+    /// multi-stick width with an out-broadcast (per-row scalar) input is the `map::at` dxp compile crash
+    /// observed on card. `assemble_pointwise_broadcast_off` panics for it; a panic from this door exits
+    /// 101 with no stage label, so the door names it first.
+    #[test]
+    fn a_transcendental_with_a_per_row_scalar_at_multi_stick_width_is_refused() {
+        let r = vec![reg(5, 4, 1, false), reg(7, 4, 128, true)];
+        let mut sym = 0i64;
+        let Err(e) = elementwise("rsqrt_s3", Elementwise::Rsqrt, &r, &mut sym, None) else {
+            panic!("an SFP transcendental with an out-broadcast input above one stick crashes dxp");
+        };
+        assert!(
+            e.message.contains("map::at") && e.message.contains("ONE STICK"),
+            "names the crash and the correct geometry: {}",
+            e.message
+        );
+    }
+
+    /// THE CONTROL FOR THAT ONE: the SAME broadcast at ONE STICK is the shipped geometry (the rmsnorm's
+    /// rsqrt over its mean) and must lower. Without this, the refusal above could be a blanket ban on
+    /// transcendentals with a reduced input.
+    #[test]
+    fn a_transcendental_with_a_per_row_scalar_at_one_stick_lowers() {
+        let r = vec![reg(5, 4, 1, false), reg(7, 4, 64, true)];
+        let mut sym = 0i64;
+        let ops = elementwise("rsqrt_s3", Elementwise::Rsqrt, &r, &mut sym, None)
+            .expect("one stick is the geometry a transcendental on a reduced scalar MUST have");
+        assert_eq!(ops.len(), 1);
     }
 
     /// THE CONTROL: identical extents on every operand, and it still lowers to exactly one op. If
@@ -3769,38 +3971,63 @@ mod elementwise_tests {
         assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
     }
 
-    /// NEGATIVE CONTROL: a DIFFERENT mismatch — the per-row `[m, 1]` scalar, which is the LayerNorm
-    /// mean-centering operand (`EwKind::Sub`'s own doc in `subtile_ir.rs`) — STILL refuses. Admitting
-    /// `Sub` to the op table did not admit its broadcast: the reference evaluator genuinely
-    /// broadcasts `bc == 1`, and this seeded path still cannot state it.
+    /// ⭐ THE PER-ROW `[m, 1]` SCALAR — THE DECODER'S SOFTMAX, AND IT NOW LOWERS. `qk - m[:, None]` is
+    /// exactly this shape, and so is the LayerNorm mean-centering operand (`EwKind::Sub`'s own doc in
+    /// `subtile_ir.rs`). `In::col` marks it out-broadcast and the hardware-proven attention emits the
+    /// identical descriptor: `attn_{tag}esub_o{t}` is `subtract` over
+    /// `[In::full(&hm(sc)).ew(), In::col(&hm(run_m)).ew()]`, at 31 tok/s on card. One stick wide here,
+    /// which is the decoder's own score width.
     #[test]
-    fn a_per_row_scalar_operand_is_still_refused() {
+    fn a_per_row_scalar_operand_now_lowers_as_the_softmax_subtract() {
         let r = node(
-            reg(5, 4, 128, false),
+            reg(5, 4, 64, false),
             reg(6, 4, 1, false),
-            reg(7, 4, 128, true),
+            reg(7, 4, 64, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise("sub_s3", Elementwise::Sub, &r, &mut sym, None) else {
-            panic!("a [4,1] per-row scalar is a broadcast this path cannot state");
+        let ops = elementwise("sub_s3", Elementwise::Sub, &r, &mut sym, None)
+            .expect("a `[m, 1]` per-row scalar is an out-broadcast, which `In::col` states");
+        assert_eq!(ops.len(), 1, "one pointwise op — no node for the broadcast");
+        assert_eq!(ops[0].op_name, "sub_o7");
+    }
+
+    /// ⛔⛔⛔ A UNARY IS GUARDED TOO, AND THIS IS THE FIXTURE THAT ACTUALLY TESTS IT.
+    ///
+    /// The test this replaces was named `a_unary_input_of_the_wrong_extent_is_refused` but its fixture
+    /// was `[1, 128]` under `[4, 128]` — a DEGENERATE row axis, which is a legitimate mb-broadcast and
+    /// the exact shape of an rmsnorm gain. So its name and its fixture disagreed: the intent was "the
+    /// guard covers unaries too", and the vehicle it picked was a shape that is not wrong at all. Under
+    /// the broadcast arm that fixture correctly lowers, which is why the old test failed.
+    ///
+    /// The intent is preserved here with a fixture that IS wrong: `[2, 128]` is neither the output's row
+    /// extent nor degenerate, so no broadcast reading exists and `pointwise_extents_agree` must still
+    /// refuse it — for a unary exactly as for a binary, since the builder hands every operand the
+    /// output's dims regardless of arity.
+    #[test]
+    fn a_unary_input_of_a_genuinely_wrong_extent_is_still_refused() {
+        let r = vec![reg(5, 2, 128, false), reg(7, 4, 128, true)];
+        let mut sym = 0i64;
+        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &mut sym, None) else {
+            panic!("`[2, 128]` under `[4, 128]` is not a broadcast — 2 is not a degenerate axis");
         };
-        assert!(e.message.contains("t6"), "names the operand: {}", e.message);
+        assert!(e.message.contains("t5"), "names the operand: {}", e.message);
         assert!(
-            e.message.contains("In::col"),
-            "points at the builder that CAN state it: {}",
+            e.message.contains("device_dims"),
+            "the seeded path's own refusal, which states WHY: {}",
             e.message
         );
     }
 
-    /// A UNARY's single input is guarded too — the builder hands it the output's dims just the same.
+    /// ⭐ AND THE ACCEPTING HALF OF THAT PAIR, one variable away: the SAME unary with the row extent
+    /// moved to 1 is a degenerate axis and lowers as an mb-broadcast. The operand mode is per-OPERAND,
+    /// not per-arity. Pairing the two is what shows the arm keys on degeneracy rather than on giving up.
     #[test]
-    fn a_unary_input_of_the_wrong_extent_is_refused() {
+    fn a_unary_input_that_is_a_row_vector_lowers_as_an_mb_broadcast() {
         let r = vec![reg(5, 1, 128, false), reg(7, 4, 128, true)];
         let mut sym = 0i64;
-        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &mut sym, None) else {
-            panic!("a unary's input extent must match its output too");
-        };
-        assert!(e.message.contains("t5"), "names the operand: {}", e.message);
+        let ops = elementwise("silu_s3", Elementwise::Silu, &r, &mut sym, None)
+            .expect("a `[1, 128]` unary input under a `[4, 128]` output is an mb-broadcast");
+        assert_eq!(ops.len(), 1, "one pointwise op — the broadcast is an operand mode");
     }
 
     /// ⭐ THE UNLOCK: a NON-broadcasting subtract — both operands at the output's extent — now

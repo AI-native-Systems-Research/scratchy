@@ -119,10 +119,23 @@ pub struct SiluMulChain {
 /// B — `[[0,2],[2,1],[0,1]]`, MLIR's plain `linalg.matmul`, and what a `tt.dot` with no `.T` on the
 /// weight lowers to — is stating a DIFFERENT buffer. That is refused here, by name, with both ways
 /// out, rather than left to an extent guard that a square weight walks straight through.
-fn matmul_weight_is_transpose_b(
+/// WHICH WAY a `linalg.matmul` indexes its B operand — the orientation, as a value, because a
+/// producer that states the plain form is stating a REAL, DIFFERENT buffer and one of the two can be
+/// lowered by transposing it rather than by refusing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BOrient {
+    /// `[[d0,d2],[d1,d2],[d0,d1]]` — B's map ends in the reduction dim, so B is `[n, k]` and the
+    /// contraction reduces over k in place. Every assembler here assumes this; nothing to do.
+    TransposeB,
+    /// `[[d0,d2],[d2,d1],[d0,d1]]`, or NO maps at all (MLIR's default for `linalg.matmul`) — B is
+    /// `[k, n]`. A different tensor, so it is transposed into the assumed orientation before use.
+    PlainB,
+}
+
+fn matmul_b_orientation(
     f: &IRFunction<'static>,
     op: &ktir_core::ir::Operation<'static>,
-) -> Result<(), Error> {
+) -> Result<BOrient, Error> {
     let maps = op.attributes.iter().find_map(|(k, v)| match (k, v) {
         (AttrKey::IndexingMaps, Attr::AffineMapList(m)) => Some(*m),
         _ => None,
@@ -139,28 +152,35 @@ fn matmul_weight_is_transpose_b(
             })
     });
     if is_transpose_b {
-        return Ok(());
+        return Ok(BOrient::TransposeB);
+    }
+    // `[[d0,d2],[d2,d1],[d0,d1]]` — MLIR's PLAIN `linalg.matmul`: B indexed `[k, n]`, its map ending in
+    // the NON-reduction dim. A `tt.dot` with no `.T` on its second operand lowers to this, and a
+    // producer that omits `indexing_maps` entirely is stating the same default.
+    let is_plain_b = maps.is_none_or(|m| {
+        m.len() == 3
+            && m.iter().zip([[0usize, 2], [2, 1], [0, 1]]).all(|(got, want)| {
+                got.exprs.len() == 2
+                    && got.exprs.iter().zip(want).all(|(e, d)| {
+                        matches!(e, ktir_core::affine::AffineExpr::Dim(i) if *i == d)
+                    })
+            })
+    });
+    if is_plain_b {
+        return Ok(BOrient::PlainB);
     }
     err(format!(
-        "{}: this `{:?}`'s weight is NOT the transpose-B one every assembler here assumes. \
-         {} The validated contract (scratchy's `KtirFunc::matmul`, at its own definition) is that W \
-         binds verbatim as its on-disk `[out, in]` = `[n, k]` buffer and the matmul reads it with \
-         `indexing_maps` `[[d0,d2],[d1,d2],[d0,d1]]`, so the contraction reduces over k in place. \
-         A weight whose map ends in the NON-reduction dim is a `[k, n]` buffer — a different \
-         tensor, not a different spelling — and `assemble_matmul_seeded` would emit a well-formed \
-         descriptor computing the transposed contraction. TWO WAYS OUT, both outside this door: \
-         transpose the weight before the matmul (in Triton, `w_desc.load(...).T`, which the \
-         frontend folds INTO the indexing maps and costs no op), or teach the KERNEL operand a \
-         second walk beside `Walk2::kernel_shared`. Refused rather than lowered, because the extent \
-         guards below cannot catch this at all when k == n — Granite's `[4096, 4096]` output \
-         projection is exactly that shape.",
-        f.name,
-        op.op_type,
-        match maps {
-            None => "It states NO `indexing_maps`, which for `linalg.matmul` is the plain \
-                     `[[d0,d2],[d2,d1],[d0,d1]]` form: B indexed `[k, n]`.",
-            Some(_) => "Its `indexing_maps` are not the transpose-B triple.",
-        }
+        "{}: this `{:?}`'s `indexing_maps` are NEITHER of the two contraction forms this door \
+         lowers. The assumed one is transpose-B, `[[d0,d2],[d1,d2],[d0,d1]]` — B's map ends in the \
+         reduction dim, so B is its on-disk `[out, in]` = `[n, k]` buffer and the contraction reduces \
+         over k in place; that is the contract scratchy's `KtirFunc::matmul` states at its own \
+         definition and emits unconditionally. The other is MLIR's plain \
+         `[[d0,d2],[d2,d1],[d0,d1]]` (B as `[k, n]`), which is lowered by TRANSPOSING B into the \
+         assumed orientation first. Anything else — a permuted A or C, a batch dim, a broadcast map — \
+         states an iteration order no assembler here walks, and the extent guards downstream cannot \
+         catch it at all when k == n (Granite's `[4096, 4096]` output projection is exactly that \
+         shape), so it is named rather than lowered.",
+        f.name, op.op_type,
     ))
 }
 
@@ -787,6 +807,185 @@ fn is_plumbing(op: OpKind) -> bool {
     )
 }
 
+/// WHICH AXIS a recognised rank-plumbing chain broadcasts along.
+///
+/// The two are not interchangeable and the device says which through a different `In` builder, so
+/// they are a variant rather than a `bool`: [`In::col`] marks the operand out-broadcast (a per-row
+/// scalar sprayed along the stick axis) and [`In::mb`] marks it mb-broadcast (a row vector sprayed
+/// down the rows). Emitting one for the other reads a `[m, 1]` operand as a `[1, n]` and takes the
+/// wrong bytes for every row after the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BcastAxis {
+    /// `[m, 1]` → `[m, n]`: a per-row scalar (a row reduction's result) sprayed along the columns.
+    /// The softmax's `m[:, None]` and `l[:, None]`.
+    Col,
+    /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
+    Mb,
+}
+
+/// ONE recognised broadcast: the value a consumer reads, resolved back to the rank-2 SOURCE the
+/// chain started from, plus the axis.
+#[derive(Clone, Copy)]
+struct Bcast {
+    src: Ssa,
+    axis: BcastAxis,
+}
+
+/// ⭐⭐⭐ A BROADCAST IS ADDRESSING, NOT A NODE — so its ops are PLUMBING and the CONSUMER carries it.
+///
+/// A KTIR producer spells `m[:, None]` as a three-op chain over a rank-1 value:
+///
+/// ```text
+/// %562 = LinalgReduce(..)                      -> tensor<64>
+/// %461 = TensorExpandShape(%562)  TargetShape=[64, 1]  Dimensions=1
+/// %761 = TensorCollapseShape(%461) TargetShape=[64]
+/// %762 = TensorEmpty()
+/// %462 = LinalgBroadcast(%761, %762) Dimensions=[1]    -> tensor<64x64>
+/// %463 = ArithSubf(%458, %462)
+/// ```
+///
+/// None of those four ops is a device op. The AIU has no broadcast primitive and needs none: a
+/// broadcast operand is an ADDRESSING MODE of the op that consumes it, which
+/// [`crate::emit::EwOperand`] states through `mb_broadcast`/`out_broadcast` and
+/// [`assemble_pointwise_broadcast_off`] emits. That is not an inference from the shape of the API —
+/// it is what the hardware-proven attention does: [`crate::ir::bridge::tiled_op_sdsc_op::attn`]
+/// computes this identical softmax (subtract a per-row max, exp, sum, divide by a per-row sum) and
+/// emits NO node for either broadcast; `attn_esub` reads `In::col(&hm(run_m))` and the reduce's
+/// `[rows, 1]` accumulator is the operand. So a `Program::Broadcast` variant would be inventing a
+/// node kind for something the device does as an operand mode, and the reason
+/// [`pointwise_extents_agree`](super::lower_ktir_to_superdsc) refuses a degenerate operand today is
+/// stated in its own refusal: the SEEDED whole-tensor builder cannot say "broadcast", and the
+/// `EwOperand` builders can.
+///
+/// This recogniser therefore returns, for each broadcast RESULT, the source value a consumer should
+/// read and the axis — and the `consumed` set of every value the chain minted, which no descriptor
+/// lowers. It is the same rank walk [`program_rmsnorm_chains`] already does for its `rsqrt` and its
+/// gain (through the same three op kinds, to depth 3); this generalises it to any consumer.
+///
+/// # ⛔ WHAT IS REFUSED RATHER THAN GUESSED
+///
+/// A `tensor.expand_shape` is only a broadcast when the dim it inserts is DEGENERATE — that is what
+/// makes the source a row or column vector rather than a reshaped tile. A general reshape (a
+/// `[64, 128]` → `[128, 64]` relayout, say) states no degenerate dim, moves real elements, and is a
+/// data movement the pointwise operand modes cannot express. Those are named, not treated as
+/// broadcasts. The `expand_shape`'s own `TargetShape` and the `linalg.broadcast`'s `Dimensions` state
+/// the axis INDEPENDENTLY, so they are cross-checked: a program where they disagree is not a
+/// broadcast this door understands.
+fn program_broadcast_chains(
+    f: &IRFunction<'static>,
+) -> Result<(std::collections::HashMap<Ssa, Bcast>, std::collections::HashSet<Ssa>), Error> {
+    let mut map: std::collections::HashMap<Ssa, Bcast> = std::collections::HashMap::new();
+    let mut consumed: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
+    let deep = f.ops_deep();
+    let def_of = |v: Ssa| deep.iter().copied().find(|o| o.result == Some(v));
+    for bc in deep.iter().copied().filter(|o| o.op_type == OpKind::LinalgBroadcast) {
+        let Some(res) = bc.result else { continue };
+        // The AXIS AS THE BROADCAST ITSELF STATES IT — `Dimensions` names the dim(s) being ADDED, so
+        // `[1]` sprays along the trailing (stick) axis and `[0]` down the rows. Exactly one dim, because
+        // a two-axis broadcast from a scalar is `In::scalar`, a different operand mode, and no producer
+        // in this door's programs states one; it is named rather than folded in silently.
+        let dims = bc.attributes.iter().find_map(|(k, v)| match (k, v) {
+            (AttrKey::Dimensions, Attr::IntList(d)) => Some(*d),
+            _ => None,
+        });
+        let Some(dims) = dims else {
+            return err(format!(
+                "{}: `linalg.broadcast` states no `Dimensions`, so which axis it sprays along is \
+                 unknown and the operand mode (`In::col` vs `In::mb`) cannot be chosen",
+                f.name
+            ));
+        };
+        let axis = match dims {
+            [1] => BcastAxis::Col,
+            [0] => BcastAxis::Mb,
+            _ => {
+                return err(format!(
+                    "{}: `linalg.broadcast` adds dims {dims:?}. This door expresses a broadcast as an \
+                     OPERAND MODE of the consuming pointwise op, and there are exactly two: `[1]` \
+                     (a per-row scalar along the stick axis, `In::col`) and `[0]` (a row vector down \
+                     the rows, `In::mb`). Anything else — a two-axis spray from a scalar, or a \
+                     non-leading/non-trailing axis — is a different mode or a real data movement, and \
+                     is named rather than emitted as one of these two",
+                    f.name
+                ));
+            }
+        };
+        // WALK BACK to the rank-2 value the chain started from, through the SAME three op kinds and the
+        // SAME depth `program_rmsnorm_chains` walks. The `tensor.empty` second operand is the
+        // broadcast's `outs` init and carries no data, so only operand 0 is followed.
+        let Some(mut cursor) = bc.operands.first().copied() else {
+            return err(format!("{}: `linalg.broadcast` has no source operand", f.name));
+        };
+        let mut chain = vec![res];
+        let mut saw_degenerate_expand = false;
+        for _ in 0..3 {
+            let Some(d) = def_of(cursor) else { break };
+            match d.op_type {
+                OpKind::TensorExpandShape => {
+                    // ⛔ THE DEGENERATE DIM IS WHAT MAKES THIS A BROADCAST. `TargetShape` states the
+                    // shape AFTER the insert; a `1` in it at the axis the broadcast sprays is a row or
+                    // column vector. Without one this is a relayout of real elements and no operand
+                    // mode expresses it.
+                    let target = d.attributes.iter().find_map(|(k, v)| match (k, v) {
+                        (AttrKey::TargetShape, Attr::IntList(t)) => Some(*t),
+                        _ => None,
+                    });
+                    let Some(target) = target else {
+                        return err(format!(
+                            "{}: `tensor.expand_shape` states no `TargetShape`, so whether it inserts \
+                             a DEGENERATE dim — the thing that makes it a broadcast rather than a \
+                             relayout — cannot be decided",
+                            f.name
+                        ));
+                    };
+                    let want = match axis {
+                        BcastAxis::Col => target.len().checked_sub(1),
+                        BcastAxis::Mb => Some(0),
+                    };
+                    // CROSS-CHECKED AGAINST THE BROADCAST'S OWN `Dimensions`: two independent
+                    // statements of the same axis, so a program where they disagree is refused instead
+                    // of one of them being believed.
+                    if want.map(|i| target.get(i).copied()) != Some(Some(1)) {
+                        return err(format!(
+                            "{}: `tensor.expand_shape` targets {target:?}, whose {} axis is not \
+                             degenerate, but the `linalg.broadcast` reading it sprays along {axis:?}. \
+                             A broadcast operand mode needs a `1` on the axis being sprayed — the \
+                             source must be a row or column vector. A general reshape moves real \
+                             elements and is a data movement no pointwise operand mode can express, so \
+                             it is named here rather than mis-addressed as a broadcast.",
+                            f.name,
+                            match axis {
+                                BcastAxis::Col => "trailing",
+                                BcastAxis::Mb => "leading",
+                            }
+                        ));
+                    }
+                    saw_degenerate_expand = true;
+                }
+                OpKind::TensorCollapseShape => {}
+                _ => break,
+            }
+            chain.push(cursor);
+            let Some(next) = d.operands.first().copied() else { break };
+            cursor = next;
+        }
+        if !saw_degenerate_expand {
+            return err(format!(
+                "{}: a `linalg.broadcast` sprays along {axis:?} but its source is not reached through \
+                 a `tensor.expand_shape` that inserts a DEGENERATE dim. That expand is the only thing \
+                 in the program that says the source IS a row or column vector, so without it the \
+                 operand's extent is unproven and addressing it as a broadcast would read past its end.",
+                f.name
+            ));
+        }
+        for v in chain {
+            consumed.insert(v);
+        }
+        map.insert(res, Bcast { src: cursor, axis });
+    }
+    Ok((map, consumed))
+}
+
 /// The [`Region`] one OPERAND names, by walking back from the value to the parameter it reads.
 ///
 /// `ktdp.load <- ktdp.construct_access_tile <- ktdp.construct_memory_view <- parameter`, and the
@@ -909,6 +1108,9 @@ pub fn lower_function(
     // device tid and a spurious slot moves every later constant's address. Recognising the chain makes
     // that multiply chain-interior, so the divisor never reaches the registry at all.
     let rmsnorms = program_rmsnorm_chains(f)?;
+    // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
+    // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
+    let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -921,6 +1123,8 @@ pub fn lower_function(
         if op.result.is_some_and(|r| {
             silus.iter().any(|c| c.consumed.contains(&r))
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
+                // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
+                || bcast_consumed.contains(&r)
         }) {
             continue;
         }
@@ -965,9 +1169,11 @@ pub fn lower_function(
         // [`matmul_weight_is_transpose_b`]: the extent guards downstream cannot distinguish the two
         // orientations when k == n, so a square weight would otherwise lower to a descriptor
         // contracting the other way round.
-        if matches!(program, Lowering::Node(Program::Matmul)) {
-            matmul_weight_is_transpose_b(f, op)?;
-        }
+        let b_orient = if matches!(program, Lowering::Node(Program::Matmul)) {
+            Some(matmul_b_orientation(f, op)?)
+        } else {
+            None
+        };
 
         // THIS OP'S INPUTS. `linalg.matmul`'s last operand is its `outs` accumulator init, not an
         // input, and the result is the output — so the inputs are the leading operands.
@@ -1008,6 +1214,18 @@ pub fn lower_function(
             (None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
+        // A BROADCAST OPERAND READS ITS SOURCE. The chain minted no buffer (it emitted no op), so the
+        // value the consumer names has no region of its own; the rank-2 source it sprays does. The AXIS
+        // the recogniser proved is then CHECKED against that region's shape below rather than trusted:
+        // two independent facts about the same operand, so a chain whose axis and extent disagree
+        // cannot address a full tile as a vector.
+        let bcast_axes: Vec<Option<BcastAxis>> =
+            in_values.iter().map(|v| bcasts.get(v).map(|b| b.axis)).collect();
+        let in_values: Vec<Ssa> = in_values
+            .iter()
+            .map(|v| bcasts.get(v).map_or(*v, |b| b.src))
+            .collect();
+
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
         for (i, v) in in_values.iter().enumerate() {
             match region_for_operand(k, *v)? {
@@ -1037,6 +1255,108 @@ pub fn lower_function(
                     }
                 },
             }
+        }
+
+        // ⛔⛔⛔ THE STATED AXIS AND THE RESOLVED EXTENT MUST AGREE, and this is the check that makes
+        // the broadcast safe rather than assumed. `program_broadcast_chains` proved the axis from the
+        // program's OWN attributes (the `expand_shape`'s degenerate dim, cross-checked against the
+        // `linalg.broadcast`'s `Dimensions`); the region says what the source operand actually IS. They
+        // are independent facts, and the emission depends on both: the consuming descriptor addresses a
+        // `Col` operand as one value per row and an `Mb` operand as one row of values. If a chain the
+        // program spelled as `[m, 1]` resolved to a full `[m, n]` tile, addressing it out-broadcast
+        // would read one column and spray it — a silent wrong answer with no shape error anywhere. The
+        // pointwise arm downstream selects its operand mode from THIS extent, so pinning the two
+        // together here is what stops the axis and the addressing from drifting apart.
+        for (i, axis) in bcast_axes.iter().enumerate() {
+            let Some(axis) = *axis else { continue };
+            let r = per_op[i];
+            let degenerate = match axis {
+                BcastAxis::Col => r.c_len == 1,
+                BcastAxis::Mb => r.v_rows == 1,
+            };
+            if !degenerate {
+                let what = match axis {
+                    BcastAxis::Col => "column",
+                    BcastAxis::Mb => "row",
+                };
+                return err(format!(
+                    "{}: `{:?}` input {i} is a recognised {axis:?} broadcast, but the source it \
+                     resolves to (t{}) is `[{}, {}]` — not degenerate on the axis being sprayed. The \
+                     program's `expand_shape`/`linalg.broadcast` say this operand is a {what} vector \
+                     and its extent says it is a full tile; the descriptor would address one {what} \
+                     and spray it over the whole output, silently. These are two independent \
+                     statements about the same operand and they disagree, so neither is believed.",
+                    f.name,
+                    op.op_type,
+                    r.tid,
+                    r.v_rows,
+                    r.c_len,
+                ));
+            }
+        }
+
+        // ⭐⭐⭐ A PLAIN-B CONTRACTION IS LOWERED BY TRANSPOSING B, NOT BY REFUSING IT.
+        //
+        // Every assembler here reads its second matmul operand as the KERNEL, physically `[n, k]` —
+        // scratchy's `KtirFunc::matmul` binds a weight verbatim in that orientation and emits the
+        // transpose-B maps unconditionally, which is why nothing downstream checks. A producer stating
+        // the plain form has a `[k, n]` buffer, a DIFFERENT tensor, and handing it to that assembler
+        // emits a well-formed descriptor computing the transposed contraction — invisible to every
+        // extent guard when k == n.
+        //
+        // ⭐ BUT IT IS NOT UNLOWERABLE, AND THE DEVICE HAS THE PRIMITIVE. `OpFunc::Transpose` is
+        // `interslicetranspose_fp16`, a real PT-unit op, and
+        // [`super::lower_ktir_to_superdsc::transpose`] is its door. So B is transposed into a minted
+        // intermediate and the matmul reads THAT, which is arithmetically the contraction the program
+        // states: `A[m,k] × (Bᵀ)[n,k] → [m,n]` is `A × B` for a `[k,n]` B.
+        //
+        // ⭐ WHY THIS IS TAKEN HERE RATHER THAN PUSHED BACK ON THE PRODUCER. For a LOADED weight the
+        // better fix really is `.T` in the Triton source — the frontend folds it into the indexing maps
+        // and it costs no op. But `tl.dot(p, v)` in a decoder's attention contracts TWO COMPUTED
+        // VALUES: `p` is the softmax result and `v` is a projection, both produced on card. There is no
+        // host-side layout choice to make and no `.T` that is free, because the operand does not come
+        // from disk. One `interslicetranspose_fp16` plus one `[n, k]` buffer per such contraction is
+        // the cost, and it is a cost rather than a correctness problem.
+        //
+        // ⛔ THE STICK LAW IS THE TRANSPOSE DOOR'S, NOT RE-DERIVED HERE: it refuses by name unless both
+        // extents are whole 64-element sticks (`interslicetranspose_fp16` sticks its input on the column
+        // extent and its output on the 8×8 inter-slice block), so a shape it cannot do is named at the
+        // door that knows the law rather than guessed at here.
+        if b_orient == Some(BOrient::PlainB) {
+            let b = per_op[1];
+            let Some(l) = layout else {
+                return err(format!(
+                    "{}: `{:?}` states the plain `[k, n]` B orientation, whose lowering transposes B \
+                     into an intermediate — and an intermediate needs a `BundleLayout` to hold its \
+                     buffer, which `layout: None` (the unit-test arm) cannot place",
+                    f.name, op.op_type
+                ));
+            };
+            let tid = next_tid;
+            next_tid += 1;
+            // `[k, n]` → `[n, k]`. The transpose door checks that this output view IS the input's
+            // swapped, so the two statements of the shape have to agree.
+            l.synth(crate::place::PlaceId::Act(tid), &[b.v_cols, b.v_rows]);
+            let bt = Region {
+                tid,
+                v_rows: b.v_cols,
+                v_cols: b.v_rows,
+                r_start: 0,
+                c_start: 0,
+                r_len: b.v_cols,
+                c_len: b.v_rows,
+                r_cover: (0, b.v_cols),
+                is_out: true,
+                is_fp8: false,
+            };
+            let mut t = super::lower_ktir_to_superdsc::transpose(
+                f.name,
+                &[b, bt],
+                sym_id_base,
+                Some(l),
+            )?;
+            out.append(&mut t);
+            per_op[1] = Region { is_out: false, ..bt };
         }
 
         // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
@@ -1218,6 +1538,232 @@ fn emit_one(
 /// `OpFunc::Silu` — a well-formed descriptor computing a different function — so they are the part
 /// that has to be tested deliberately. Each case below is one link of the chain broken, and the
 /// MATCHING chain is the control that keeps a broken builder from passing them all vacuously.
+/// THE BROADCAST RECOGNISER'S FAIL-CLOSED HALF, and every refusal has a control that isolates it.
+///
+/// ⭐⭐⭐ A TEST SET THAT ONLY ACCEPTS IS SATISFIED BY A PREDICATE THAT ACCEPTS EVERYTHING. This door
+/// turned three refusals into support, so each thing it still refuses gets a case that FAILS without
+/// that specific guard, and each accepting case is paired with the refusal one variable away from it:
+/// the axis (`Col` vs `Mb`) is moved alone, the degenerate dim is removed alone, and the two
+/// independent statements of the axis are made to disagree alone. Without that, "supports broadcasts"
+/// and "stopped checking" are the same suite.
+#[cfg(test)]
+mod broadcast_chain_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// WHAT THE PRODUCER ACTUALLY EMITS, from `KTIR_DUMP=1` on `decoder_block.py`:
+    ///
+    /// ```text
+    /// %461 = TensorExpandShape(%0)   TargetShape=[64, 1]  Dimensions=Int(1)
+    /// %761 = TensorCollapseShape(%461) TargetShape=[64]
+    /// %762 = TensorEmpty()
+    /// %462 = LinalgBroadcast(%761, %762) Dimensions=[1]
+    /// ```
+    ///
+    /// `target` is the expand's `TargetShape` and `bdims` the broadcast's `Dimensions`, so a case can
+    /// move either one alone. `bdims: None` drops the attribute entirely; `via_expand: false` wires the
+    /// broadcast straight to the source so the degenerate-expand requirement is what fires.
+    fn chain(
+        target: &'static [i64],
+        bdims: Option<&'static [i64]>,
+        via_expand: bool,
+    ) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (src, exp, col, emp, bc) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+        let mut ops = vec![];
+        if via_expand {
+            ops.push(
+                Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[src])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(target)),
+            );
+            ops.push(
+                Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[exp])
+                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[64])),
+            );
+        }
+        ops.push(Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]));
+        let source = if via_expand { col } else { src };
+        let mut b = Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[source, emp]);
+        if let Some(d) = bdims {
+            b = b.with_attr(a, AttrKey::Dimensions, Attr::IntList(d));
+        }
+        ops.push(b);
+        IRFunction {
+            name: "bcast_probe",
+            arguments: a.args(vec![(src, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    fn refusal(target: &'static [i64], bdims: Option<&'static [i64]>, via: bool) -> String {
+        program_broadcast_chains(&chain(target, bdims, via))
+            .err()
+            .map(|e| e.message)
+            .unwrap_or_else(|| panic!("expected a refusal for target={target:?} bdims={bdims:?}"))
+    }
+
+    /// ⭐ CONTROL (Col) — THE DECODER'S `m[:, None]`. `[64] → [64, 1] → [64, 64]`, the shape
+    /// `decoder_block.py`'s softmax states twice per layer. Without this the refusals below could all be
+    /// a broken walk rather than working guards.
+    #[test]
+    fn the_col_chain_is_recognised_and_resolves_to_its_source() {
+        let f = chain(&[64, 1], Some(&[1]), true);
+        let (map, consumed) = program_broadcast_chains(&f).expect("the softmax's own chain");
+        let b = map.get(&Ssa(4)).expect("the broadcast's result is what a consumer names");
+        assert_eq!(b.axis, BcastAxis::Col, "`Dimensions=[1]` sprays along the stick axis");
+        assert_eq!(b.src, Ssa(0), "the consumer must read the rank-2 SOURCE, not the chain");
+        for v in [Ssa(1), Ssa(2), Ssa(4)] {
+            assert!(consumed.contains(&v), "{v:?} is plumbing and must be lowered by nothing");
+        }
+    }
+
+    /// ⭐ CONTROL (Mb) — THE RMSNORM GAIN'S `n1[None, :]`, `TargetShape=[1, 128]` / `Dimensions=[0]`.
+    /// This is the case that makes `BcastAxis` a variant rather than a bool: BOTH axes really occur in
+    /// one decoder layer, so a bool would be a coin flip on real data.
+    #[test]
+    fn the_mb_chain_is_recognised_with_the_other_axis() {
+        let f = chain(&[1, 128], Some(&[0]), true);
+        let (map, _) = program_broadcast_chains(&f).expect("the rmsnorm gain's own chain");
+        assert_eq!(map[&Ssa(4)].axis, BcastAxis::Mb, "`Dimensions=[0]` sprays down the rows");
+    }
+
+    /// ⛔ THE CROSS-CHECK, AND IT IS THE ONE GUARD NO SINGLE ATTRIBUTE CAN PROVIDE. The expand says the
+    /// LEADING dim is degenerate (`[1, 128]`, a row vector) while the broadcast says it sprays along the
+    /// TRAILING axis (`Dimensions=[1]`, a per-row scalar). Each attribute is individually well-formed;
+    /// they describe different operands. Believing either one alone emits an operand mode for a vector
+    /// that lies the other way, so neither is believed.
+    #[test]
+    fn an_axis_the_two_attributes_disagree_about_is_refused() {
+        let m = refusal(&[1, 128], Some(&[1]), true);
+        assert!(
+            m.contains("whose trailing axis is not degenerate"),
+            "names WHICH axis is not degenerate — the expand's, not the broadcast's: {m}"
+        );
+        assert!(
+            m.contains("sprays along Col"),
+            "and names the axis the broadcast claimed, so the disagreement is legible: {m}"
+        );
+    }
+
+    /// ⛔ A NON-DEGENERATE EXPAND IS A RELAYOUT, NOT A BROADCAST — the guard the reshape case needs.
+    /// `[64, 128]` inserts nothing degenerate, so the source is a full tile; addressing it as a vector
+    /// would read one column and spray it, with no shape error anywhere.
+    #[test]
+    fn a_non_degenerate_expand_is_refused_as_a_relayout() {
+        let m = refusal(&[64, 128], Some(&[1]), true);
+        assert!(
+            m.contains("A general reshape moves real elements"),
+            "says WHY a general reshape is different in kind, not just that it was rejected: {m}"
+        );
+    }
+
+    /// ⛔ AN AXIS THAT IS NEITHER OF THE TWO OPERAND MODES. A two-axis spray from a scalar is
+    /// `In::scalar`, a third mode, and this door does not silently fold it into one of the two it emits.
+    #[test]
+    fn a_two_axis_broadcast_is_refused_by_name() {
+        let m = refusal(&[64, 1], Some(&[0, 1]), true);
+        assert!(m.contains("In::col") && m.contains("In::mb"), "names both modes it does emit: {m}");
+    }
+
+    /// ⛔ NO `Dimensions` AT ALL — then which axis it sprays is simply unknown, and picking one would be
+    /// choosing an operand mode for the producer.
+    #[test]
+    fn a_broadcast_with_no_dimensions_attribute_is_refused() {
+        let m = refusal(&[64, 1], None, true);
+        assert!(m.contains("no `Dimensions`"), "names the missing attribute: {m}");
+    }
+
+    /// ⛔ AND THE DEGENERATE EXPAND IS REQUIRED, NOT MERELY PREFERRED: with the broadcast wired straight
+    /// to its source there is nothing in the program saying the source is a vector, so its extent is
+    /// unproven. This is the case that fails if the walk ever accepts a chain it did not verify.
+    #[test]
+    fn a_broadcast_not_reached_through_a_degenerate_expand_is_refused() {
+        let m = refusal(&[64, 1], Some(&[1]), false);
+        assert!(
+            m.contains("DEGENERATE dim"),
+            "says what is missing and why it is load-bearing: {m}"
+        );
+    }
+}
+
+/// WHICH CONTRACTION FORM a `linalg.matmul` states, and the two this door lowers.
+#[cfg(test)]
+mod matmul_orientation_tests {
+    use super::*;
+    use ktir_core::affine::{AffineExpr, AffineMap};
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+
+    /// A `linalg.matmul` whose `indexing_maps` are the given dim triples, or NO maps when `None`.
+    fn mm(maps: Option<[[usize; 2]; 3]>) -> (&'static IRFunction<'static>, &'static Operation<'static>) {
+        let a: &'static Arena = Arena::global();
+        let mut op = Operation::new(a, Some(Ssa(9)), OpKind::LinalgMatmul, &[Ssa(0), Ssa(1), Ssa(2)]);
+        if let Some(m) = maps {
+            let list: Vec<AffineMap<'static>> = m
+                .iter()
+                .map(|pair| AffineMap {
+                    num_dims: 3,
+                    num_syms: 0,
+                    exprs: a.exprs(pair.iter().map(|d| AffineExpr::Dim(*d)).collect()),
+                })
+                .collect();
+            op = op.with_attr(a, AttrKey::IndexingMaps, Attr::AffineMapList(a.maps(list)));
+        }
+        let f = IRFunction {
+            name: "mm_probe",
+            arguments: a.args(vec![]),
+            operations: a.ops(vec![op.clone()]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        (Box::leak(Box::new(f)), Box::leak(Box::new(op)))
+    }
+
+    /// ⭐ THE ASSUMED FORM: B's map ends in the reduction dim `d2`, so B is `[n, k]` and the contraction
+    /// reduces over k in place. scratchy's `KtirFunc::matmul` emits this unconditionally, which is why
+    /// every assembler here may assume it.
+    #[test]
+    fn the_transpose_b_triple_is_recognised() {
+        let (f, op) = mm(Some([[0, 2], [1, 2], [0, 1]]));
+        assert_eq!(matmul_b_orientation(f, op).expect("the assumed form"), BOrient::TransposeB);
+    }
+
+    /// ⭐ MLIR'S PLAIN FORM, and the SAME answer for an op stating NO maps — which is what `tl.dot(p, v)`
+    /// with no `.T` lowers to, and the reason both decoders reached this door at all. It is a real `[k, n]`
+    /// buffer, so it is LOWERED by transposing B rather than refused.
+    #[test]
+    fn the_plain_triple_and_a_missing_attribute_are_both_plain_b() {
+        let (f, op) = mm(Some([[0, 2], [2, 1], [0, 1]]));
+        assert_eq!(matmul_b_orientation(f, op).expect("plain B"), BOrient::PlainB);
+        let (f2, op2) = mm(None);
+        assert_eq!(
+            matmul_b_orientation(f2, op2).expect("no maps IS the plain default"),
+            BOrient::PlainB,
+            "MLIR's default for `linalg.matmul` is the plain form; treating a missing attribute as the \
+             ASSUMED form would silently contract the other way round"
+        );
+    }
+
+    /// ⛔ THE CONTROL THAT KEEPS THE TWO ABOVE HONEST: a triple that is NEITHER form — here C permuted
+    /// to `[d1, d0]` — states an iteration order no assembler walks, and the extent guards downstream
+    /// cannot catch it when k == n. Without this case, `matmul_b_orientation` could return `PlainB` for
+    /// everything it does not recognise and every test above would still pass.
+    #[test]
+    fn a_triple_that_is_neither_form_is_refused_by_name() {
+        let (f, op) = mm(Some([[0, 2], [1, 2], [1, 0]]));
+        let e = matmul_b_orientation(f, op).err().expect("a permuted C is not either form");
+        assert!(
+            e.message.contains("NEITHER") && e.message.contains("k == n"),
+            "names that it is neither, and why an extent guard cannot catch it: {}",
+            e.message
+        );
+    }
+}
+
 #[cfg(test)]
 mod silu_chain_tests {
     use super::*;
