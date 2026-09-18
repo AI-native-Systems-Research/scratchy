@@ -43,7 +43,7 @@ rm -rf "$here/book" "$here/_site"
 mdbook build "$here"
 
 mkdir -p "$here/_site"
-cp "$here/index.html" "$here/styles.css" "$here/favicon.png" "$here/og-image.png" "$here/_site/"
+cp "$here/index.html" "$here/styles.css" "$here/favicon.png" "$here/_site/"
 cp -R "$here/book" "$here/_site/book"
 
 # Every local href must resolve inside _site, or the copies drifted from the
