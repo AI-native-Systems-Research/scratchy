@@ -5343,13 +5343,35 @@ impl PagedKvPool {
     /// every plane at once broke hd=128 outright, because a feature-stick GROUP stride somewhere does not
     /// follow it above one stick — a consumer never found.
     ///
-    /// They are all [`PLANE_SLOTS`](Self::PLANE_SLOTS) TODAY, so this is inert. It exists so that
-    /// shrinking ONE of them is a change to this function and nothing else: natural K is only ever read by
-    /// the Kᵀ re-transpose, which now covers one stick-block per decode step, so it needs a fraction of
-    /// the slots the planes the attention actually sweeps do. ⚠️ That shrink is NOT yet takeable — prefill's
-    /// re-transpose still covers a whole page (`KtTileSlots::of_page`), and making it block-granular needs
-    /// prefill's chunk windows to be stick-block aligned, which is the chunker's business and not this
-    /// file's. Until then every plane must stay a full page.
+    /// They are all [`PLANE_SLOTS`](Self::PLANE_SLOTS) TODAY, and the Knat arm is named separately so
+    /// that a future shrink is a change to this function and nothing else.
+    ///
+    /// ⛔⛔⛔ **BUT NATURAL K CANNOT BE SHRUNK WHILE THE RE-TRANSPOSE IS ONE OP, AND THIS IS A PROOF, NOT
+    /// A TODO.** It is tempting — natural K's only reader is the Kᵀ re-transpose, which covers ONE
+    /// stick-block per decode step and at most TWO per prefill chunk
+    /// (`tests/knat_needs_two_stick_blocks.rs` measures the two), so it looks like it needs a fraction of
+    /// the slots the planes the attention actually sweeps do. It does not, because of how it is MOVED:
+    ///
+    /// [`slab_delta`] shifts the op's KV-SEGMENT BASE by ONE number, and the op reads natural K and writes
+    /// Kᵀ *through that one base* — the same fact [`slab_shift_elems`](Self::slab_shift_elems) turns into
+    /// an equality test. Kᵀ block `b` sits at `b · hd · STK` in its plane. If natural K held only `K`
+    /// blocks, its block would be `(b mod K) · hd · STK`, and the difference between the two is
+    /// `(b − b mod K) · hd · STK` — a function of `b`. One shift cannot be two, so the pair stops moving
+    /// together and the transpose reads one block while writing another: a Kᵀ that is stale in the blocks
+    /// nothing re-derives, which reads back as fluent wrong output rather than a fault.
+    ///
+    /// So natural K must have as many blocks as Kᵀ, which is a whole page. The third plane is a
+    /// consequence of the one-shift runtime model, not of anyone's laziness.
+    ///
+    /// ⭐ THE ONE LEVER THAT WOULD LIFT IT: per-OPERAND segment deltas, so a restickify could shift its
+    /// input and its output by different amounts. That is a runtime and manifest change
+    /// (`fold_plan::seg_deltas` and `bundle::KvShifts` both carry one delta per group today), and it would
+    /// also retire `slab_shift_elems`' equality test, which exists only because the two must agree. Until
+    /// then: three full planes, and ~⅓ of the pool is a transpose source.
+    /// ⚠️ Two routes that look like they avoid this and do not: raising the prefill ceiling to a divisor of
+    /// the page (128 bakes, and MEASURED 11.67 s against 96's 11.07 s on the same prompts — a regression
+    /// that buys nothing), and wrapping natural K's write at a smaller modulus (its read still has to
+    /// alternate with `b`'s parity, which a baked offset cannot).
     pub const fn plane_extent(&self, plane: KvPlane) -> PlaneExtent {
         match plane {
             // The score and value legs sweep these, so their extent IS the addressable page (+ slack).
@@ -5612,17 +5634,17 @@ impl PagedKvPool {
     ///     // natural K, V, transposed K — the pre-paged cache's order, tiling the layer exactly. Each
     ///     // plane's base comes WITH its own size, so this cannot be read as three bases and one stride.
     ///     let [knat, v, kt] = p.planes();
-    ///     assert_eq!((knat.plane, knat.base), (KvPlane::Knat, 0));
-    ///     assert_eq!((v.plane, v.base), (KvPlane::V, knat.size));
-    ///     assert_eq!((kt.plane, kt.base), (KvPlane::Kt, knat.size + v.size));
-    ///     assert_eq!(kt.base + kt.size, p.layer_stride());
+    ///     assert_eq!((knat.plane, knat.base_elems()), (KvPlane::Knat, ElemCount::NONE));
+    ///     assert_eq!((v.plane, v.base_elems()), (KvPlane::V, knat.size_elems()));
+    ///     assert_eq!((kt.plane, kt.base_elems()), (KvPlane::Kt, knat.size_elems() + v.size_elems()));
+    ///     assert_eq!(kt.base_elems() + kt.size_elems(), p.layer_stride_elems());
     ///     assert!(p.planes_tile_the_layer());
     ///     // THE HEADS TILE THE PLANE EXACTLY. One head's block is its whole page — `hd * PAGE_SLOTS`
     ///     // — so head `k` ends precisely where head `k+1` begins and there is no request axis in
     ///     // between for a launch to step off the end of.
     ///     for s in p.planes() {
     ///         assert_eq!(p.plane_block_elems(s.plane), p.hd() * PagedKvPool::PAGE_SLOTS);
-    ///         assert_eq!(nkvh * p.plane_block_elems(s.plane), s.size);
+    ///         assert_eq!(ElemCount::of_kv_plane(nkvh, p.plane_block_elems(s.plane)), s.size_elems());
     ///     }
     /// }
     /// ```
