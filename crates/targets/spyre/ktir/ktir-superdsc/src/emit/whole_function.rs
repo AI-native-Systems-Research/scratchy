@@ -1322,6 +1322,28 @@ pub fn lower_function(
         // extents are whole 64-element sticks (`interslicetranspose_fp16` sticks its input on the column
         // extent and its output on the 8×8 inter-slice block), so a shape it cannot do is named at the
         // door that knows the law rather than guessed at here.
+        //
+        // ⛔⛔⛔ MEASURED ARCHITECTURE LIMIT, AND IT IS WHY THIS PATH DOES NOT YET REACH A BINARY ON MPW4.
+        // The descriptor this emits is well-formed and dxp SCHEDULES it only on RCUDD1A or newer. On
+        // `SENARCH=MPW4` it is rejected:
+        //
+        //   sbf-ddc: DtException: Implicit syncs not available for architectures prior to RCUDD1A,
+        //   ddcv1.cpp line 3416   -> sbf-run-scheduler-on-sdsc: failed on program 'sdsc_32'
+        //
+        // MEASURED on both decoders, and the core division is NOT the variable: forcing the transpose
+        // onto ONE core reproduces it byte for byte, so this is `interslicetranspose_fp16` itself and not
+        // a cross-core sync. That also explains two facts already in the tree that otherwise look odd —
+        // `assemble_transpose` had ZERO callers, and the shipped attention transposes its Kᵀ with
+        // `OpFunc::Restickify` (`restickify_kt_opspec_2d`, which realizes the transpose through
+        // PER-OPERAND STICK AXES and `datastageBasedElemOff`) rather than with the transpose primitive.
+        //
+        // So the arch-portable lowering for this operand is a RESTICKIFY, not a transpose, and that is
+        // the next step here: `[cap, hd]` -> `[hd, cap]` is exactly the shape relation `v` -> `vᵀ` needs.
+        // It is not taken in this change because the restickify's typed doors (`KtTileSlots`,
+        // `KtTileFeats`) are attention-shaped (`of_page`, `of_row_window`, `of_head_slab`,
+        // `of_head_dim`) and a general `[m, n]` operand needs a door of its own — an interface decision,
+        // not a widening. dxp REJECTS the transpose rather than mis-scheduling it, so this fails closed
+        // meanwhile.
         if b_orient == Some(BOrient::PlainB) {
             let b = per_op[1];
             let Some(l) = layout else {

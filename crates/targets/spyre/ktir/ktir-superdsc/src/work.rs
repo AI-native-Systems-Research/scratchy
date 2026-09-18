@@ -282,6 +282,124 @@ pub fn distribute_cores(dims: &[ItDim], max_cores: u32) -> BTreeMap<&'static str
     splits
 }
 
+/// THE CORE DIVISION FOR AN OP WHOSE OUTPUT STICK IS THE 8×8 INTER-SLICE BLOCK — the transpose.
+///
+/// # ⛔⛔⛔ WHY THIS IS NOT A CHANGE TO [`distribute_cores`]
+///
+/// [`distribute_cores`] splits `mb` FIRST AND TO THE HILT, and that order is not a preference: its own
+/// doc records the MEASURED failure that fixes (a flat row-major activation whose `out` dim was split
+/// while `mb` stayed whole put row `r` of out-core `c` at `(c+r)·eps` — scalarmul wrote only
+/// `mb+out/eps−1` of `mb·out/eps` stick-groups, `nz=3968`). Every reduce, pointwise and silu in the
+/// crate rides that division, so re-ordering it to serve the transpose would move the emission of every
+/// one of them. This is a SEPARATE function, passed only by [`crate::emit::transpose_opspec`], and
+/// `TileOp::tile` already takes the divider as a parameter — so nothing else's bytes can move.
+///
+/// # THE LAW, AS A PROPERTY RATHER THAN A FITTED FIXTURE
+///
+/// `emit_sdsc`'s `is_transpose_out` arm gives the output `stickSize_: [8, 8]` — its stick is the 8×8
+/// inter-slice block over (`out`, `mb`). A stick is the atomic unit a core moves, so a core whose slice
+/// ends part-way through a block shares an output stick with its neighbour and both write partial ones.
+/// The property that avoids it is therefore:
+///
+/// > **every split dim's PER-CORE EXTENT is a whole number of `BLOCK` elements, and the product of the
+/// > splits is at most the core count.**
+///
+/// Subject to that, cores used is MAXIMIZED. That is the whole rule; it is not read off any one
+/// fixture, and the guard in `transpose_opspec` re-checks the property on the plan this returns, so the
+/// two cannot drift.
+///
+/// ⭐ IT REPRODUCES THE GOLDEN AS A CONSEQUENCE, NOT AS A TARGET. `sdsc_interslicetranspose.json`
+/// (`mb_ 384`, `out_ 3072`, 32 cores) states `numWkSlicesPerDim_ {"out": 8, "mb": 4}` — per-core
+/// (mb 96, out 384), both whole multiples of 8, product 32. That pair satisfies the property above and
+/// is exactly the kind of solution this search finds. The fixture is one point and the property is what
+/// makes the emission safe; agreeing with the point is the check, not the definition.
+///
+/// ⛔ THE STICK AXIS SPLITS BY STICK COUNT, WHICH IS THE BINDING CONSTRAINT AND IS EASY TO MISREAD. A
+/// dim with `is_stick` is divided over whole DF-sticks, never elements — handing a core half a stick is
+/// dxp `L3DlOpsScheduler:1070`, the same law [`distribute_cores`] derives its `basis` from. So for a
+/// `[64, 128]` transpose the `out` axis has only TWO sticks and cannot split beyond 2 however many
+/// cores are free; the division is `{mb: 8, out: 2}` — 16 cores, per-core (mb 8, out 64), both whole
+/// blocks. Reasoning in elements suggests `out` could split by 4 for 32 cores, and that would be half a
+/// stick per core.
+///
+/// A shape with no admissible multi-core split lands on ONE core, which trivially holds the property
+/// (the whole tile is that core's slice). It is slow, not wrong, and the guard confirms it.
+pub fn distribute_cores_transpose_blocks(
+    dims: &[ItDim],
+    max_cores: u32,
+) -> BTreeMap<&'static str, u32> {
+    /// The `[8, 8]` output stick of `emit_sdsc`'s `is_transpose_out` arm.
+    const BLOCK: u32 = 8;
+    // Only the two real output axes are candidates. A reduction dim is never split, for
+    // `distribute_cores`' own reason (partial results colliding on one output address).
+    let mb = dims.iter().find(|d| d.name == "mb" && !d.is_reduction);
+    let out = dims.iter().find(|d| d.name == "out" && !d.is_reduction);
+    let (Some(mb), Some(out)) = (mb, out) else {
+        return BTreeMap::new();
+    };
+    // How many pieces each axis may be cut into AT ALL: a stick dim by whole DF-sticks, a free dim by
+    // elements. This is the constraint that caps `out` at its stick count.
+    let cap = |d: &ItDim| {
+        if d.is_stick {
+            d.size.div_ceil(d.df.elems_per_stick())
+        } else {
+            d.size
+        }
+    };
+    // A split is ADMISSIBLE when it divides the axis evenly, leaves a whole number of blocks on each
+    // core, and (on a stick axis) cuts a whole number of sticks.
+    let admissible = |d: &ItDim, split: u32| -> bool {
+        split >= 1
+            && split <= cap(d)
+            && cap(d).is_multiple_of(split)
+            && d.size.is_multiple_of(split)
+            && (d.size / split).is_multiple_of(BLOCK)
+    };
+    // MAXIMIZE cores used, and where several divisions tie, prefer the SQUAREST per-core tile.
+    //
+    // ⛔ THE TIE-BREAK IS A LOCALITY CHOICE, NOT A CORRECTNESS LAW, and saying which is which is the
+    // whole point. Correctness is the block property above: any division satisfying it gives every core
+    // whole output sticks, and that is what stops two cores writing partial ones. SEVERAL divisions
+    // satisfy it at the same core count — at the golden's own extents (mb 384, out 3072, 32 cores) both
+    // `{mb: 4, out: 8}` (the fixture's own pair, per-core 96×384) and `{mb: 2, out: 16}` (per-core
+    // 192×192) are admissible — so the fixture's particular numbers are ITS producer's choice among
+    // equals, not a law to be reverse-engineered. Claiming to have derived them would be fitting one
+    // point, which is exactly what `transpose_opspec`'s guard warns against. The squarest slice is
+    // preferred because this op moves 8×8 blocks and a squarer slice touches fewer distinct sticks per
+    // core; it is deterministic, and it is not load-bearing for correctness.
+    let mut best: Option<(u32, u32, u32)> = None; // (cores, mb_split, out_split)
+    for m in 1..=max_cores {
+        if !admissible(mb, m) {
+            continue;
+        }
+        for o in 1..=(max_cores / m) {
+            if !admissible(out, o) {
+                continue;
+            }
+            let (cores, skew) = (m * o, (mb.size / m).abs_diff(out.size / o));
+            let better = match best {
+                None => true,
+                Some((bc, bm, bo)) => {
+                    (cores, std::cmp::Reverse(skew))
+                        > (bc, std::cmp::Reverse((mb.size / bm).abs_diff(out.size / bo)))
+                }
+            };
+            if better {
+                best = Some((cores, m, o));
+            }
+        }
+    }
+    let best = best.unwrap_or((1, 1, 1));
+    let mut splits: BTreeMap<&'static str, u32> = BTreeMap::new();
+    if best.1 > 1 {
+        splits.insert(mb.name, best.1);
+    }
+    if best.2 > 1 {
+        splits.insert(out.name, best.2);
+    }
+    splits
+}
+
 /// Per-core slice index along each split dim, for `coreIdToWkSlice_`. Cores are
 /// numbered row-major over the split dims in `splits` insertion order: for
 /// `{out:2, mb:16}`, core c → out = c/16, mb = c%16 (matches the real fixture:

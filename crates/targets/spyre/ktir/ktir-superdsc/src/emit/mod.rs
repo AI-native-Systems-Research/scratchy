@@ -2693,12 +2693,24 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
         dims: dims.clone(),
         df: Df::Fp16,
     };
+    // ⭐ THE TRANSPOSE'S OWN DIVIDER, NOT `distribute_cores`. This op's output stick is the 8×8
+    // inter-slice block, so its per-core slice must be whole blocks on BOTH axes — a property
+    // `distribute_cores` cannot serve, because it splits `mb` first and to the hilt for a MEASURED
+    // reason of its own (see its doc: the flat row-major `(c+r)·eps` row-mixing, `nz=3968`) and every
+    // reduce/pointwise/silu in the crate rides that order. `TileOp::tile` takes the divider as a
+    // parameter, so pointing this ONE builder at
+    // [`distribute_cores_transpose_blocks`](crate::work::distribute_cores_transpose_blocks) leaves
+    // every other op's division — and bytes — untouched. The guard below re-checks the property on
+    // whatever plan comes back, so the divider and the seal cannot drift apart.
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
+        .tile(
+            MaxCores::<MAX_CORES>,
+            crate::work::distribute_cores_transpose_blocks,
+            "out",
+        )
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    // ⛔⛔⛔ THE PER-CORE SLICE MUST BE WHOLE 8×8 OUTPUT BLOCKS, AND THE VENDOR'S OWN FIXTURE SAYS THIS
-    // BUILDER'S DIVISION IS NOT.
+    // ⛔⛔⛔ THE PER-CORE SLICE MUST BE WHOLE 8×8 OUTPUT BLOCKS — RE-CHECKED ON THE PLAN, NOT ASSUMED.
     //
     // The OUTPUT's stick is the 8×8 inter-slice block over (`out`, `mb`) — `emit_sdsc`'s
     // `is_transpose_out` arm, `stickSize_: [8, 8]`. A stick is the atomic unit a core moves, so if a
@@ -2847,9 +2859,12 @@ mod transpose_tests {
     use ktir_core::irtype::IrType;
     use ktir_core::opkind::OpKind;
 
-    /// A shape this builder's core division actually lands on the 8×8 block: `mb` must be a multiple
-    /// of `8 · MAX_CORES` because `distribute_cores` splits `mb` alone (see the guard in
-    /// [`transpose_opspec`]). 256 is the smallest such row extent.
+    /// A row extent these tests share. It USED to be load-bearing: while the transpose rode
+    /// `distribute_cores` (which splits `mb` alone, to the hilt) only `mb` a multiple of `8 · MAX_CORES`
+    /// landed on the 8×8 block, and 256 was the smallest such extent. The transpose now has its own
+    /// block-aware divider ([`crate::work::distribute_cores_transpose_blocks`]), so any stick-aligned
+    /// extent lands on the block and 256 is merely a convenient one — kept so these descriptor
+    /// assertions stay byte-comparable with what they pinned before.
     const MB: u32 = 256;
 
     /// The `dscs_[0]` entry of an emitted op, by name.
@@ -2906,21 +2921,17 @@ mod transpose_tests {
         assert_eq!(c.attributes_.dataFormat_, "SEN169_FP16");
     }
 
-    /// The op's ITERATION SPACE is the fixture's, at the fixture's own extents: `out_ 3072`, `mb_ 384`,
-    /// `y_ 1`. This is the half of the fixture comparison that DOES agree — recorded because the other
-    /// half (the core division) does not, and a reader needs to know the divergence is the division and
-    /// not the shape. `N_` is read off a plan built for the fixture's extents; the guard below is what
-    /// stops that plan reaching a descriptor.
+    /// The op's ITERATION SPACE is the fixture's, at the fixture's own extents: `mb_ 384`, `out_ 3072`,
+    /// `y_ 1`. This used to be assertable only through the refusal message, because the fixture's own
+    /// shape could not reach a descriptor at all; with the block-aware divider it builds, so the
+    /// iteration space is now read off the real plan.
     #[test]
     fn the_iteration_space_matches_the_fixture_at_the_fixture_extents() {
-        let dims_only = transpose_opspec(384, 3072, "t1", "t2");
-        // It refuses (see the divergence test) — but the refusal message carries the extents it was
-        // built from, which is what this pins: the shape reached the divider intact.
-        let e = dims_only.expect_err("the fixture's own shape is refused by the division guard");
-        assert!(
-            e.contains("transpose [384, 3072]"),
-            "the extents are the fixture's `mb_ 384` / `out_ 3072`, got: {e}"
-        );
+        let spec = transpose_opspec(384, 3072, "t1", "t2")
+            .expect("the fixture's own shape divides on the block now");
+        assert_eq!(spec.iter.extent("mb"), 384, "the fixture's `mb_`");
+        assert_eq!(spec.iter.extent("out"), 3072, "the fixture's `out_`");
+        assert_eq!(spec.iter.extent("y"), 1, "the fixture's `y_`");
     }
 
     /// ⭐ EXHAUSTIVE: a transpose declares exactly TWO tensors, one per role, and in that order. The
@@ -2944,30 +2955,70 @@ mod transpose_tests {
         );
     }
 
-    /// ⛔⛔⛔ THE DIVERGENCE THE FIXTURE FOUND, PINNED AS A REFUSAL. At the golden's own shape
-    /// (`mb_ 384`, `out_ 3072`, 32 cores) the fixture splits BOTH axes — `{"out": 8, "mb": 4}`, per-core
-    /// (mb 96, out 384), both whole 8-blocks — while `distribute_cores` splits `mb` alone to 32, giving
-    /// per-core (mb 12, out 3072). 12 is not a multiple of 8, so two cores would sit inside one 8×8
-    /// output stick.
+    /// ⭐⭐⭐ THE DIVERGENCE THE FIXTURE FOUND, NOW CLOSED — AND THIS IS THE PLACE ITS OWN DOC ASKED
+    /// FOR THE NEW BEHAVIOUR TO BE RECORDED.
     ///
-    /// This asserts the REFUSAL, never our division as an expectation. When the division is fixed
-    /// against the fixture this test fails loudly and is the place to record the new behaviour — which
-    /// is the point of pinning it.
+    /// This test used to pin a REFUSAL: at the golden's shape (`mb_ 384`, `out_ 3072`, 32 cores)
+    /// `distribute_cores` split `mb` alone to 32, giving per-core (mb 12, out 3072), and 12 is not a
+    /// multiple of 8 — two cores inside one 8×8 output stick. Its doc said "when the division is fixed
+    /// against the fixture this test fails loudly and is the place to record the new behaviour". It did,
+    /// and this is that record.
+    ///
+    /// ⛔ WHAT IS ASSERTED IS THE PROPERTY AND THE CORE COUNT, NOT THE FIXTURE'S PARTICULAR PAIR.
+    /// Correctness is "every per-core extent is a whole 8-block"; SEVERAL divisions satisfy it at 32
+    /// cores, and the fixture's `{mb: 4, out: 8}` (per-core 96×384) is one of them, not the only one. So
+    /// this pins that we reach the fixture's CORE COUNT with the block property intact, and separately
+    /// that the fixture's own pair is admissible under that property. Asserting our particular pair
+    /// equals the fixture's would be fitting one point — the thing the guard's own text warns against.
     #[test]
-    fn the_fixtures_own_shape_is_refused_because_our_core_division_is_not_the_fixtures() {
-        let e = transpose_opspec(384, 3072, "t1", "t2")
-            .expect_err("per-core mb 12 is not a whole 8-row block");
-        assert!(
-            e.contains("(mb 12, out 3072)"),
-            "names the per-core extents this builder produces, got: {e}"
+    fn the_fixtures_own_shape_now_divides_on_the_block_and_uses_its_core_count() {
+        let spec = transpose_opspec(384, 3072, "t1", "t2")
+            .expect("the block-aware divider serves the golden's own shape");
+        for dim in ["mb", "out"] {
+            let per = spec.iter.per_core_extent(dim);
+            assert!(
+                per.is_multiple_of(8),
+                "per-core {dim} = {per} is not a whole 8-block of the output's [8, 8] stick"
+            );
+        }
+        assert_eq!(
+            spec.iter.cores_used().get(),
+            32,
+            "the fixture uses all 32 cores at this shape and so must we — a block-valid division that \
+             quietly dropped to 24 would pass the property and lose a quarter of the machine"
         );
+        // AND the fixture's own pair is admissible under the same property — checked directly, so the
+        // claim in the doc above is a measurement rather than an assertion.
         assert!(
-            e.contains(r#"{"out": 8, "mb": 4}"#),
-            "names the fixture's own division as the reference, got: {e}"
+            (384u32 / 4).is_multiple_of(8) && (3072u32 / 8).is_multiple_of(8),
+            "the fixture's own {{mb: 4, out: 8}} must satisfy the property this builder enforces"
         );
-        assert!(
-            e.contains("sdsc_interslicetranspose.json"),
-            "cites the fixture, got: {e}"
+    }
+
+    /// ⛔ AND THE SHAPE THAT ONCE FAILED, AS THE REGRESSION IT NOW IS: `[64, 128]` is the decoder's
+    /// `tl.dot(p, v)` transpose, and under `distribute_cores` it gave per-core (mb 2, out 128) and was
+    /// refused. It is the reason this divider exists.
+    ///
+    /// ⭐ NOTE THE STICK AXIS CAPS THE CORE COUNT AT 16, NOT 32, and reasoning in elements gets this
+    /// wrong. `out` is the stick dim, so it divides over whole 64-element sticks — `out = 128` is TWO
+    /// sticks and cannot split beyond 2 however many cores are free (half a stick per core is dxp
+    /// `L3DlOpsScheduler:1070`). With `mb` split 8 that is 16 cores, per-core (mb 8, out 64), both whole
+    /// blocks. An "obvious" `{mb: 8, out: 4}` for 32 cores would hand each core 32 columns — half a
+    /// stick.
+    #[test]
+    fn the_decoders_own_transpose_shape_divides_and_the_stick_axis_caps_the_cores() {
+        let spec =
+            transpose_opspec(64, 128, "t1", "t2").expect("the shape both decoders need");
+        assert_eq!(spec.iter.per_core_extent("mb"), 8, "8 rows = one whole block");
+        assert_eq!(
+            spec.iter.per_core_extent("out"),
+            64,
+            "64 columns = one whole 64-element stick, which is 8 whole blocks"
+        );
+        assert_eq!(
+            spec.iter.cores_used().get(),
+            16,
+            "16, not 32: the stick axis has only two sticks to give"
         );
     }
 
@@ -3198,21 +3249,68 @@ mod transpose_tests {
         );
     }
 
-    /// ⛔ AND THE DIVISION GUARD REACHES THE ENTRY POINT AS AN `Error`, NOT A PANIC. `assemble_transpose`
-    /// `panic!`s on a refused opspec, so a shape that passes the stick law but trips the core-division
-    /// guard would abort the build with a bare panic instead of a producer-reportable error. `mb = 64`
-    /// is exactly that shape: whole sticks on both axes, per-core mb 2.
+    /// ⭐⭐⭐ THE DECODER'S OWN TRANSPOSE LOWERS THROUGH THE ENTRY POINT — the regression this whole
+    /// divider exists for. `[64, 128]` → `[128, 64]` is `tl.dot(p, v)`'s B operand in
+    /// `decoder_block.py`, and it is the shape that used to trip the core-division guard with per-core
+    /// (mb 2, out 128).
+    ///
+    /// ⛔ THIS TEST REPLACES ONE THAT PINNED THAT REFUSAL AS "AN `Error`, NOT A PANIC", and the intent
+    /// behind it is preserved in a STRONGER form below rather than dropped. The concern was real:
+    /// `assemble_transpose` `panic!`s on a refused opspec, so a shape passing the entry point's stick law
+    /// but tripping the opspec's division guard would abort the build with a bare panic instead of a
+    /// producer-reportable error. The answer is no longer "the error is plumbed through" but "there is no
+    /// error left to plumb" — see the sweep in
+    /// [`no_shape_the_entry_point_accepts_can_make_the_opspec_refuse`].
     #[test]
-    fn a_stick_aligned_shape_whose_division_misses_the_block_is_an_error_not_a_panic() {
-        let e = refusal(&transpose_program((64, 128), (128, 64)));
-        assert!(
-            e.contains("(mb 2, out 128)"),
-            "the division guard's own message reaches the caller, got: {e}"
-        );
-        assert!(
-            e.contains("8x8 inter-slice block"),
-            "and names the block law, got: {e}"
-        );
+    fn the_decoders_transpose_shape_lowers_through_the_entry_point() {
+        let ops = lower_transpose(&transpose_program((64, 128), (128, 64)))
+            .expect("`[64, 128]` -> `[128, 64]` is the decoder's `tl.dot(p, v)` operand");
+        assert_eq!(ops.len(), 1, "one `interslicetranspose_fp16`, not a decomposition");
+    }
+
+    /// ⛔⛔⛔ THE SEAL IS UNREACHABLE BY CONSTRUCTION, AND THAT IS WHAT IS ASSERTED — not that it was
+    /// deleted, because it was not.
+    ///
+    /// `transpose_opspec`'s block guard still re-checks the property on every plan the divider returns;
+    /// it is the seal that would fire if the divider, the block size, or `TileOp::tile` ever changed
+    /// under it. What this pins is that no shape the ENTRY POINT accepts can trip it, so the `panic!`
+    /// inside `assemble_transpose` has nothing to fire on. Both halves matter: keeping the guard means a
+    /// divider regression is caught, and this sweep means a legal producer program can never meet it.
+    ///
+    /// The two guards compose because the entry point already demands both extents be whole 64-element
+    /// sticks, and 64 is itself a whole number of 8-blocks — so even the one-core fallback division
+    /// satisfies the block property. That is the reasoning; this is the measurement of it.
+    #[test]
+    fn no_shape_the_entry_point_accepts_can_make_the_opspec_refuse() {
+        let mut checked = 0u32;
+        for mb in (64..=1024u32).step_by(64) {
+            for out in (64..=1024u32).step_by(64) {
+                // The entry point accepts exactly the stick-aligned, view-swapped whole-buffer case.
+                if lower_transpose(&transpose_program(
+                    (mb as i64, out as i64),
+                    (out as i64, mb as i64),
+                ))
+                .is_err()
+                {
+                    continue;
+                }
+                checked += 1;
+                let spec = transpose_opspec(mb, out, "t1", "t2").unwrap_or_else(|e| {
+                    panic!(
+                        "[{mb}, {out}] passed the entry point but the opspec refused it: {e} — that                          reaches `assemble_transpose` as a bare `panic!`, which is the failure mode the                          test this replaced was written to prevent"
+                    )
+                });
+                for dim in ["mb", "out"] {
+                    let per = spec.iter.per_core_extent(dim);
+                    assert!(
+                        per.is_multiple_of(8),
+                        "[{mb}, {out}]: per-core {dim} = {per} is not a whole 8-block"
+                    );
+                }
+            }
+        }
+        assert_eq!(checked, 256, "the sweep must cover every stick-aligned shape in its range, or it \
+             proves nothing about the composition of the two guards");
     }
 
     // ── (iii) the byte-identity control ──────────────────────────────────────────────────────────
