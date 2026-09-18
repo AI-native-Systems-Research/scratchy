@@ -64,21 +64,51 @@ fn a_prefill_chunks_padded_window_spans_at_most_two_stick_blocks() {
     }
 }
 
-/// ⛔ AND THE TWO BLOCKS NEVER LEAVE THE PAGE, which is the other half: block `first + 1` must still be
-/// inside the plane, or the second op writes onto the NEXT kv head's keys — the exact `WRITE_SLACK`
-/// failure (` Rome. Q` became ` Romes,`).
+/// ⛔⛔⛔ EVERY BLOCK THE EMITTER BAKES STAYS INSIDE THE PAGE — asserted against
+/// [`PagedKvPool::PREFILL_CHUNK_BLOCKS`] ITSELF, not against a hand-written 2.
+///
+/// This is the assertion that would have caught a real bug and did not. `PREFILL_CHUNK_BLOCKS` was briefly
+/// `(SLOTS + STK - 1).div_ceil(STK)` — the ceiling applied twice — which is 3, and at the stepped-back
+/// start 160 the third block's index is `2 + 2 = 4` in a page of four blocks numbered 0..3: the op writes
+/// onto the NEXT KV HEAD's keys, which is the `WRITE_SLACK` corruption (correct first token, then fluent
+/// garbage past a chunk boundary). It reached the card; the short-chunk prompts did not expose it and only
+/// the descriptor dump did (`attn_kctpost0b2_o734`).
+///
+/// The previous version of this test checked `first + 1`, i.e. it hard-coded the two it was supposed to be
+/// guarding. Reading the count from the constant the emitter loops over is what makes it a guard.
 #[test]
-fn both_blocks_stay_inside_the_page() {
+fn every_baked_block_stays_inside_the_page() {
     let blocks_per_page = PagedKvPool::PAGE_SLOTS as u32 / STK;
+    let baked = PagedKvPool::PREFILL_CHUNK_BLOCKS as u32;
     for start in reachable_starts_in_a_page() {
         let first = start / STK;
         assert!(
-            first + 1 < blocks_per_page,
-            "a chunk at page offset {start} would have the re-transpose touch block {} of a page with \
-             {blocks_per_page} blocks",
-            first + 1
+            first + baked <= blocks_per_page,
+            "a chunk at page offset {start} has the re-transpose bake blocks {first}..{} of a page with \
+             only {blocks_per_page} — the overrun lands on the next kv head's keys",
+            first + baked - 1
         );
     }
+}
+
+/// And the baked count is exactly the span the windows need — neither short (a stale block) nor long (the
+/// overrun above).
+#[test]
+fn the_baked_block_count_matches_the_measured_span() {
+    let padded = PagedKvPool::PREFILL_CHUNK_SLOTS as u32;
+    let worst = reachable_starts_in_a_page()
+        .into_iter()
+        .map(|s| {
+            let first = s / STK;
+            (s + padded - 1) / STK - first + 1
+        })
+        .max()
+        .expect("at least one start");
+    assert_eq!(
+        PagedKvPool::PREFILL_CHUNK_BLOCKS as u32, worst,
+        "the emitter bakes {} block op(s) per kv head but the widest reachable window spans {worst}",
+        PagedKvPool::PREFILL_CHUNK_BLOCKS
+    );
 }
 
 /// The bound as the INEQUALITY it actually is, so a future ceiling change fails here with the reason

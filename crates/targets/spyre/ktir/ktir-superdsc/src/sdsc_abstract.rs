@@ -5233,6 +5233,29 @@ impl PagedKvPool {
     /// it; `codegen`'s `PREFILL_RUNGS` ceiling is asserted equal to it, so the two cannot drift.
     pub const PREFILL_CHUNK_SLOTS: usize = 96;
 
+    /// ⭐ STICK-BLOCKS ONE PREFILL CHUNK'S PADDED WINDOW CAN TOUCH — the BAKED op count of its Kᵀ
+    /// re-transpose, replacing a whole-page one.
+    ///
+    /// A chunk start is NOT block-aligned (96 does not divide 256, so the reachable starts are page
+    /// offsets 0, 96 and a stepped-back 160 — in-block 0, 32, 32), so a window straddles: `32 + 96 = 128`
+    /// slots, exactly TWO blocks. That inequality, and the fact that both blocks stay inside the page, is
+    /// MEASURED against the real [`chunk_room`](Self::chunk_room) /
+    /// [`chunk_write_start`](Self::chunk_write_start) laws in
+    /// `subtile/tests/knat_needs_two_stick_blocks.rs` rather than derived here.
+    ///
+    /// ⛔⛔⛔ IT IS `div_ceil` AND NOTHING MORE — I FIRST WROTE `(SLOTS + STK - 1).div_ceil(STK)`, WHICH IS
+    /// THE CEILING TWICE: `(96+63).div_ceil(64) = 3`. That emitted a THIRD block op, and at the
+    /// stepped-back start 160 its block index is `2 + 2 = 4` in a page that has four blocks numbered 0..3 —
+    /// the write lands on the NEXT KV HEAD's keys, which is the `WRITE_SLACK` corruption exactly (correct
+    /// first token, then fluent garbage past a chunk boundary). It reached the card and the short-chunk
+    /// prompts did not expose it; the DUMP did (`attn_kctpost0b2_o734`).
+    ///
+    /// Two is right because the worst reachable in-block offset is 32 and `32 + 96 = 128` = two blocks, and
+    /// `knat_needs_two_stick_blocks.rs` measures BOTH halves of that: the span, and that every emitted block
+    /// stays inside the page. A chunk width whose starts sat deeper into a block would break the span
+    /// assertion there — loudly, in a test, rather than as an address.
+    pub const PREFILL_CHUNK_BLOCKS: usize = Self::PREFILL_CHUNK_SLOTS.div_ceil(STK);
+
     /// ⭐ SLOTS A PADDED CHUNK WRITE MAY OVERRUN ITS PAGE BY — the physical slack every plane carries
     /// past its addressable [`PAGE_SLOTS`](Self::PAGE_SLOTS) so that overrun lands in DEAD SPACE instead
     /// of the next kv head's keys.

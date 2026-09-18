@@ -2722,47 +2722,60 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // rather than refuted, and this form is gated on the card before it is believed.
         let head = kv_head_of(kvh, nkvh)?;
         let one_slot_per_op = per_request || mq == 1;
-        let slab_shift = one_slot_per_op
-            .then(|| pool.slab_shift_bytes(head))
-            .flatten();
-        ops.push(assemble_restickify_kt_2d(
-            &format!("attn_kctpost{kvh}{rq}_o{t}"),
-            match slab_shift {
-                Some(_) => crate::sdsc_abstract::KtTileSlots::of_write_slab(),
-                None => crate::sdsc_abstract::KtTileSlots::of_page(),
-            },
-            crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-            &kc,
-            // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
-            // the same `(kv head)` block of the page the launch was shifted to. BOTH are baked at
-            // stick-block 0 of that block, which is what makes one shift able to move the pair.
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Knat,
-                head,
-            ))),
-            &kct,
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Kt,
-                head,
-            ))),
-            sym_id_base,
-            layout,
-        ));
-        // ⭐ TAGGED WITH ITS ROW, for the same reason the cache writes are: this op reads natural K and
-        // writes Kᵀ within ONE row's page, and with no request term left in the address the tag is the only
-        // thing that tells the runtime which page that is.
-        if let Some(o) = ops.last_mut() {
-            o.kv_request = req;
-            if slab_shift.is_some() {
-                // ⛔ NO `* 2` AND NO ZERO-MEANS-OFF HERE. The pool converted elements to bytes through
-                // `ElemCount::fp16_bytes` and hands back a `NonZeroU32`, so this site neither claims the
-                // planes are fp16 nor re-checks a value that cannot be zero.
-                o.slab_stride_bytes = slab_shift;
-                // ⛔ DECLARING THE PAGE IS NOT OPTIONAL HERE. `slab_delta` wraps the block index by
-                // THIS field, and an op that leaves it 0 keeps the unwrapped arithmetic — correct only
-                // inside a request's first page, and past slot 255 a block of no page at all. Opting
-                // into the incremental form and declaring the page are one act.
-                o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+        let slab_shift = pool.slab_shift_bytes(head);
+        // ⭐⭐⭐ HOW MANY STICK-BLOCKS THIS OP'S WINDOW CAN TOUCH — 1 for a decode step's single new slot,
+        // and for a PREFILL chunk the measured 2 (`subtile/tests/knat_needs_two_stick_blocks.rs`: the
+        // reachable chunk starts are page offsets 0, 96 and a stepped-back 160, in-block 0/32/32, and
+        // `32 + 96 = 128` is exactly two blocks — one slot more would be three, and both blocks are proven
+        // to stay inside the page). Blocks are emitted at BAKED offsets `j` from the window's own first
+        // block, and the runtime shifts all of them together by that block ([`slab_delta`]), so the count
+        // is a compile-time fact and the position is a runtime one.
+        let blocks = match slab_shift {
+            None => 0, // hd > STK: one shift cannot move both planes; keep the whole-page form.
+            Some(_) if one_slot_per_op => 1,
+            Some(_) => crate::sdsc_abstract::PagedKvPool::PREFILL_CHUNK_BLOCKS,
+        };
+        for j in 0..blocks.max(1) {
+            let tile = if blocks == 0 {
+                crate::sdsc_abstract::KtTileSlots::of_page()
+            } else {
+                crate::sdsc_abstract::KtTileSlots::of_write_slab()
+            };
+            // Block `j` of the window: the same baked step on BOTH planes, which is exactly why one
+            // segment shift can move the pair (`slab_shift_elems` IS that equality). Asked in ELEMENTS
+            // here and in BYTES for the op field below — each from its own accessor, so neither call site
+            // converts between the two.
+            let step = crate::addr::DevOff::from_view_step(
+                j as u32 * pool.slab_shift_elems(head).unwrap_or(0),
+            );
+            ops.push(assemble_restickify_kt_2d(
+                &if blocks > 1 {
+                    format!("attn_kctpost{kvh}{rq}b{j}_o{t}")
+                } else {
+                    format!("attn_kctpost{kvh}{rq}_o{t}")
+                },
+                tile,
+                crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
+                &kc,
+                crate::addr::DevOff::from_view_step(pool.addr(
+                    crate::sdsc_abstract::KvCoord::block(
+                        crate::sdsc_abstract::KvPlane::Knat,
+                        head,
+                    ),
+                )) + step,
+                &kct,
+                crate::addr::DevOff::from_view_step(pool.addr(
+                    crate::sdsc_abstract::KvCoord::block(crate::sdsc_abstract::KvPlane::Kt, head),
+                )) + step,
+                sym_id_base,
+                layout,
+            ));
+            if let Some(o) = ops.last_mut() {
+                o.kv_request = req;
+                if blocks > 0 {
+                    o.slab_stride_bytes = slab_shift;
+                    o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+                }
             }
         }
     }
