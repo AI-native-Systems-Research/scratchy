@@ -40,6 +40,22 @@
 //! `emit/mod.rs`'s `is_fp8_kernel` branch (`["in","out"]` / `stickSize_ [2,64]`) bakes. An **fp8 KV cache**
 //! could therefore declare the natural-K orientation — killing this plane and halving KV bytes at once.
 //!
+//! ⭐⭐⭐⭐⭐ AND WHAT IBM DOES, WHICH SETTLES WHY THIS PLANE EXISTS AT ALL. Their paged K cache is ONE
+//! tensor in NATURAL layout — `spyre-inference/experimental/attention_backend/paged_vector_add_target.py:64`
+//! is `[pages, slots, heads, hd]` sticked on `hd`, the same layout as its `value_cache`, with no transposed
+//! twin. They get away with it because their attention TILES the KV axis
+//! (`spyre_hint(tiles={"max_seqlen_kv": kv_block_size})`) and transposes EACH TILE as it streams, so their
+//! Kᵀ is transient per-tile scratch. They still pay a restickify for it (`dump_cost_model.py:454`).
+//!
+//! ⇒ **THIS PLANE IS A CACHE OF THE TRANSPOSE, not a transpose IBM avoids.** We transpose a stick-block once
+//! when it is written and read it for the rest of the request; they re-transpose every tile every step. With
+//! this fold sweeping the WHOLE prefix per step, their way costs ~118M elements/step at 576 tokens
+//! (9 blocks x 8 heads x 4096 x 40 layers) ≈ 236 MB against a 24 ms budget. The plane buys that back.
+//!
+//! ⛔ SO THE DEPENDENCY IS THE SWEEP, NOT THE LAYOUT: the third plane goes away when attention becomes
+//! tile-streaming (flash-style), and not before. Do not try to delete it while the fold reads the whole
+//! prefix per step.
+//!
 //! ```python
 //! expansion = num_heads // num_kvheads
 //! if expansion != 1:
