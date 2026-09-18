@@ -10,17 +10,24 @@
 //! `PagedKvPool::addr` (`StickKind::KernelNt` … `MatK::of_head_dim_nt`, and
 //! `subtile/tests/kernel_nt_is_natural_k.rs` at hd 64/128/256).
 //!
-//! ⛔ IT WAS TRIED ON THE CARD AND REFUSED: `KernelOrient::ContractionOnStick` on this leg, with its
-//! corner at `KvPlane::Knat`, gives
-//! `sbf-ddc: DtException: Could not find any suitable dimension mapping` (`ddl_conversion.cpp:2521`,
-//! granite-3.1-2b fp8, decode rungs 64 and 128). Because `deeptools/ddc/ddl_templates/bmm.ddl:22` says
-//! `%slice_layout_kernel = ddl.layout(%in,%out) {is_order_fixed=true}` — a bmm kernel's dim order is
-//! `(in, out)` and the op library declares it NON-PERMUTABLE, so there is no template to map onto.
+//! ⛔ A FIRST ATTEMPT WAS REFUSED ON CARD, AND THE REFUSAL WAS MISREAD.
+//! `KernelOrient::ContractionOnStick` here (dims `[out,in]`, stick `["in"]`) with its corner at
+//! `KvPlane::Knat` gives `sbf-ddc: DtException: Could not find any suitable dimension mapping`
+//! (`ddl_conversion.cpp:2521`, granite-3.1-2b fp8, decode rungs 64 and 128). `bmm.ddl:22` says
+//! `%slice_layout_kernel = ddl.layout(%in,%out) {is_order_fixed=true}`, which LOOKS like "a bmm kernel's
+//! dim order is non-permutable". It is not that.
 //!
-//! ⭐ DO NOT GENERALISE IT. `is_order_fixed=true` is on the bmm KERNEL; a transpose is NOT data movement
-//! on this device in general — `stride_map_disk_order` reads GEMM weights in their on-disk orientation as
-//! "two swapped strides, not a data movement". Read the relevant `.ddl` before concluding anything about
-//! another operand.
+//! ⭐⭐⭐ `ddl_conversion.cpp:2339-2356` builds THREE dim lists per dataspace and matches a different ddl
+//! layout against each: `globalDims` IS `layoutDimOrder_`, while `sliceDims`/`stickDims` are derived from
+//! `stickDimOrder_` against `elemInSlice = 128/wordLength/8`. The `is_order_fixed=true` one is the SLICE
+//! layout — so it constrains the STICK decomposition, not the declared order. `bmm.ddl:25`'s global layout
+//! is `{}`, i.e. order NOT fixed, so `layoutDimOrder_` is permutable.
+//!
+//! ⇒ The `[out,in]` order was never the problem. `stickDimOrder_ = ["in"]` was: one stick dim cannot fill a
+//! two-dim slice layout. The shape that satisfies it is the TWO-DIM STICK `["in","out"]` — what 17 of 19
+//! vendor 2-D `[in,out]` fixtures carry, and what `emit/mod.rs`'s `is_fp8_kernel` branch already emits
+//! (`stickSize_ [2,64]`). ⚠️ UNTRIED: the `stickSize_` split has to land the right element count either
+//! side of `elemInSlice` (64 for fp16). That is the next experiment.
 //!
 //! ```python
 //! expansion = num_heads // num_kvheads
