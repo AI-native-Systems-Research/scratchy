@@ -16,7 +16,7 @@
   <nav>
     <span class="brand">scratchy</span>
     <div class="navlinks">
-      <a href="book/why.html">Why</a>
+      <a href="book/blogs/REUSE.html">Blog</a>
       <a href="book/index.html">Docs</a>
       <a href="book/COMPILER.html">Compiler</a>
       <a href="https://github.com/AI-native-Systems-Research/scratchy">GitHub</a>
@@ -83,36 +83,19 @@
   </div>
 </section>
 
-<section class="why">
-  <h2>Why build it this way</h2>
-  <div class="why-body">
-    <p>
-      Every generation of programmers has been told the same thing: don't write
-      it, reuse it. What quietly changes is how much of somebody else's
-      decisions you have to carry along with the part you wanted. A shared
-      library arrived as an opaque <code>.so</code> your compiler couldn't see
-      into. Source-level languages opened the box but made you haul the whole
-      thing around. Bundlers were the first tools allowed to throw some of it
-      away. Rust and Go pushed specialization into the semantics — which is why
-      a Go binary has no shared-library dependencies, not because it is
-      statically linked, but because every capability arrived as source and left
-      as machine code specialized for one program.
-    </p>
-    <p>
-      And it all stops at a wall nobody thought to name. The code itself is
-      sacred: a compiler may delete a dependency's unused parts and specialize
-      its generic ones, but it may never restructure it. So the generality of
-      the libraries you depend on is your generality too, whether or not you
-      ever wanted it.
-    </p>
-    <p class="why-punch">
-      <strong>That is the wall AI knocks down</strong> — not by making compilers
-      smarter, but by making faithful transcription cheap. When you can
-      re-express someone's <em>algorithm</em> inside your own structure in an
-      afternoon instead of over two quarters of pull requests, the unit of reuse
-      stops being the module. It becomes the idea.
-    </p>
-    <a class="more" href="book/why.html">Read the argument in full →</a>
+<section class="blogs">
+  <h2>Blogs</h2>
+  <p class="sub">Longer-form writing on why the stack is shaped the way it is.</p>
+  <div class="dgrid">
+    <a class="dcard" href="book/blogs/REUSE.html">
+      <h3>What does &ldquo;reuse&rdquo; mean in the age of AI?</h3>
+      <p>
+        Shared libraries, source modules, bundlers, AoT-compiled crates — every
+        era let the toolchain specialize a little more, and every one of them
+        stopped at the same wall. What happens when the unit of reuse becomes an
+        idea, and what that bought us on IBM Spyre.
+      </p>
+    </a>
   </div>
 </section>
 
@@ -266,22 +249,6 @@ cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
     <a class="dcard" href="https://github.com/AI-native-Systems-Research/scratchy">
       <h3>Source</h3>
       <p>The repository, issues, and pull requests.</p>
-    </a>
-  </div>
-</section>
-
-<section class="blogs">
-  <h2>Blogs</h2>
-  <p class="sub">Longer-form writing on why the stack is shaped the way it is.</p>
-  <div class="dgrid">
-    <a class="dcard" href="book/blogs/REUSE.html">
-      <h3>What does &ldquo;reuse&rdquo; mean in the age of AI?</h3>
-      <p>
-        Shared libraries, source modules, bundlers, AoT-compiled crates — every
-        era let the toolchain specialize a little more, and every one of them
-        stopped at the same wall. What happens when the unit of reuse becomes an
-        idea, and what that bought us on IBM Spyre.
-      </p>
     </a>
   </div>
 </section>
