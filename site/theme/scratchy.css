@@ -1,103 +1,115 @@
-/* Dress mdBook in the landing page's palette and type.
+/* Dress mdBook in the landing page's Carbon palette and type.
  *
  * Only mdBook's own CSS custom properties are overridden, so its themes keep
- * working: `navy` is the dark face of the landing page, `light` the light one.
- * The palette values here are the same ones site/styles.css uses. */
+ * working: `navy` is Carbon's g100 theme, `light` is Carbon's white theme. The
+ * values here are the same published @carbon/themes tokens site/styles.css
+ * uses, so the book and the landing page never drift. */
+
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap");
 
 :root {
-  --mono-font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --scratchy-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --mono-font: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --scratchy-sans: "IBM Plex Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   --content-max-width: 820px;
 }
 
-/* mdBook's stock body is 1.6rem (16px, since html is 62.5%). Match the landing
- * page's 17.5px, and widen the measure to keep the line length readable. */
-body { font-size: 1.75rem; }
+/* mdBook's html is 62.5%, so 1rem is 10px. Carbon body-02 is 16px/1.5. */
+body { font-size: 1.6rem; line-height: 1.5; }
 
 .navy {
-  --bg: #0d1117;
-  --fg: #d8e0ea;
+  --bg: #161616;
+  --fg: #f4f4f4;
 
-  --sidebar-bg: #0a0e14;
-  --sidebar-fg: #a7b3c4;
-  --sidebar-non-existant: #5a6779;
-  --sidebar-active: #ff8a4c;
-  --sidebar-spacer: #232c3b;
+  --sidebar-bg: #161616;
+  --sidebar-fg: #c6c6c6;
+  --sidebar-non-existant: #6f6f6f;
+  --sidebar-active: #78a9ff;
+  --sidebar-spacer: #525252;
 
-  --scrollbar: #3a4658;
+  --scrollbar: #6f6f6f;
 
-  --icons: #6c7a8d;
-  --icons-hover: #d8e0ea;
+  --icons: #8d8d8d;
+  --icons-hover: #f4f4f4;
 
-  --links: #63b3f5;
+  --links: #78a9ff;
+  --links-hover: #a6c8ff;
+  --background-hover: rgba(141, 141, 141, 0.16);
+  --background-selected: rgba(141, 141, 141, 0.24);
+  --background-active: rgba(141, 141, 141, 0.4);
+  --focus: #ffffff;
 
-  --inline-code-color: #ff8a4c;
+  --inline-code-color: #ff7eb6;
 
-  --theme-popup-bg: #161d29;
-  --theme-popup-border: #232c3b;
-  --theme-hover: #1d2635;
+  --theme-popup-bg: #262626;
+  --theme-popup-border: #525252;
+  --theme-hover: #393939;
 
-  --quote-bg: #131a24;
-  --quote-border: #ff8a4c;
+  --quote-bg: #262626;
+  --quote-border: #78a9ff;
 
-  --table-border-color: #232c3b;
-  --table-header-bg: #1d2635;
-  --table-alternate-bg: #131a24;
+  --table-border-color: #525252;
+  --table-header-bg: #393939;
+  --table-alternate-bg: #262626;
 
-  --searchbar-border-color: #232c3b;
-  --searchbar-bg: #131a24;
-  --searchbar-fg: #d8e0ea;
-  --searchbar-shadow-color: #0a0e14;
-  --searchresults-header-fg: #8b98ab;
-  --searchresults-border-color: #232c3b;
-  --searchresults-li-bg: #131a24;
-  --search-mark-bg: #7a4a22;
+  --searchbar-border-color: #525252;
+  --searchbar-bg: #262626;
+  --searchbar-fg: #f4f4f4;
+  --searchbar-shadow-color: #161616;
+  --searchresults-header-fg: #a8a8a8;
+  --searchresults-border-color: #525252;
+  --searchresults-li-bg: #262626;
+  --search-mark-bg: #001d6c;
 
-  --footnote-highlight: #ff8a4c;
-  --overlay-bg: rgba(13, 17, 23, 0.55);
+  --footnote-highlight: #78a9ff;
+  --overlay-bg: rgba(22, 22, 22, 0.55);
 }
 
 .light {
-  --bg: #fbfcfd;
-  --fg: #1a2330;
+  --bg: #ffffff;
+  --fg: #161616;
 
-  --sidebar-bg: #f2f5f8;
-  --sidebar-fg: #2c3949;
-  --sidebar-non-existant: #a9b4c1;
-  --sidebar-active: #c2410c;
-  --sidebar-spacer: #dfe5ec;
+  --sidebar-bg: #ffffff;
+  --sidebar-fg: #525252;
+  --sidebar-non-existant: #8d8d8d;
+  --sidebar-active: #0f62fe;
+  --sidebar-spacer: #c6c6c6;
 
-  --scrollbar: #b4bfcb;
+  --scrollbar: #8d8d8d;
 
-  --icons: #8695a6;
-  --icons-hover: #1a2330;
+  --icons: #8d8d8d;
+  --icons-hover: #161616;
 
-  --links: #1d63b5;
+  --links: #0f62fe;
+  --links-hover: #0043ce;
+  --background-hover: rgba(141, 141, 141, 0.12);
+  --background-selected: rgba(141, 141, 141, 0.2);
+  --background-active: rgba(141, 141, 141, 0.5);
+  --focus: #0f62fe;
 
-  --inline-code-color: #a8360a;
+  --inline-code-color: #9f1853;
 
   --theme-popup-bg: #ffffff;
-  --theme-popup-border: #dfe5ec;
-  --theme-hover: #eef2f6;
+  --theme-popup-border: #c6c6c6;
+  --theme-hover: #e8e8e8;
 
-  --quote-bg: #f2f5f8;
-  --quote-border: #c2410c;
+  --quote-bg: #f4f4f4;
+  --quote-border: #0f62fe;
 
-  --table-border-color: #dfe5ec;
-  --table-header-bg: #eef2f6;
-  --table-alternate-bg: #f6f8fa;
+  --table-border-color: #c6c6c6;
+  --table-header-bg: #e0e0e0;
+  --table-alternate-bg: #f4f4f4;
 
-  --searchbar-border-color: #dfe5ec;
+  --searchbar-border-color: #c6c6c6;
   --searchbar-bg: #ffffff;
-  --searchbar-fg: #1a2330;
-  --searchbar-shadow-color: #dfe5ec;
-  --searchresults-header-fg: #5b6878;
-  --searchresults-border-color: #dfe5ec;
-  --searchresults-li-bg: #f6f8fa;
-  --search-mark-bg: #ffd9a8;
+  --searchbar-fg: #161616;
+  --searchbar-shadow-color: #c6c6c6;
+  --searchresults-header-fg: #6f6f6f;
+  --searchresults-border-color: #c6c6c6;
+  --searchresults-li-bg: #f4f4f4;
+  --search-mark-bg: #d0e2ff;
 
-  --footnote-highlight: #c2410c;
-  --overlay-bg: rgba(26, 35, 48, 0.35);
+  --footnote-highlight: #0f62fe;
+  --overlay-bg: rgba(22, 22, 22, 0.35);
 }
 
 html,
@@ -107,48 +119,307 @@ body,
   font-family: var(--scratchy-sans);
 }
 
+/* Carbon headings: no negative tracking, and light at display sizes. */
 .content h1,
 .content h2,
 .content h3,
 .content h4 {
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
+  font-weight: 400;
 }
 
-.content h1 { font-size: 1.9rem; }
-.content h2 { font-size: 1.45rem; }
+.content h1 { font-size: 2.8rem; line-height: 1.29; font-weight: 300; }
+.content h2 { font-size: 2rem; line-height: 1.4; }
+.content h3 { font-size: 1.6rem; font-weight: 600; }
 
-/* The landing page's panel treatment, for code blocks and tables. */
+/* Carbon surfaces are square planes separated by a 1px rule. */
 .content pre > .hljs {
   border: 1px solid var(--table-border-color);
-  border-radius: 8px;
+  border-radius: 0;
 }
 
 .content blockquote {
   border-inline-start-width: 3px;
-  border-radius: 0 6px 6px 0;
+  border-radius: 0;
 }
 
-/* Menu bar: flat against the page, the way the landing nav is. */
+.content table td,
+.content table th { border-radius: 0; }
+
+/* Carbon link — `link/_link.scss`. A link's focus ring is
+ * `focus-outline('border')`: 1px, no offset, and never the 2px inset ring that
+ * tiles and buttons take. Visited does not recolour; active returns to
+ * $link-primary and keeps the ring. */
+.content a,
+.sidebar a,
+.cds-breadcrumb a {
+  color: var(--links);
+  outline: none;
+  text-decoration: none;
+  transition: color 70ms cubic-bezier(0.2, 0, 0.38, 0.9);
+}
+
+@media (any-hover: hover) {
+  .content a:hover,
+  .content a:visited:hover,
+  .cds-breadcrumb a:hover {
+    color: var(--links-hover);
+    text-decoration: underline;
+  }
+  .content a:active:visited:hover { color: var(--links); }
+}
+
+.content a:visited,
+.cds-breadcrumb a:visited { color: var(--links); }
+
+.content a:focus,
+.content a:active,
+.sidebar a:focus,
+.cds-breadcrumb a:focus,
+.cds-breadcrumb a:active {
+  outline: 1px solid var(--focus);
+  text-decoration: underline;
+}
+.content a:active,
+.cds-breadcrumb a:active { color: var(--links); }
+
+@media screen and (prefers-contrast) {
+  .content a:focus,
+  .content a:active,
+  .sidebar a:focus,
+  .cds-breadcrumb a:focus { outline-style: dotted; }
+}
+
+/* ------------------------------------------------------------------ *
+ * Carbon UI shell header
+ *
+ * theme/index.hbs rebuilds mdBook's menu bar as the shell header, so the
+ * book and the landing page carry one navigation instead of two. The
+ * metrics are `ui-shell/header/_header.scss`: fixed and flush to both
+ * viewport edges at z('header'), mini-units(6) tall, $background, one
+ * $border-subtle rule beneath.
+ *
+ * mdBook reserves the bar's height with #menu-bar-hover-placeholder and
+ * then cancels it with a negative margin on .page; taking the bar out of
+ * flow means that compensation has to go, or the chapter slides under it.
+ * ------------------------------------------------------------------ */
+
+:root { --menu-bar-height: 48px; }
+
+/* mdBook does not set `box-sizing: border-box`, and the landing page's
+ * stylesheet does it globally. Without it, the 2px transparent border that
+ * header__name and header__menu-item carry for their focus state is *added*
+ * to `block-size: 100%`, so the nav items render 52px tall inside a 48px bar
+ * and their labels sit 2.5px below the landing page's. The bar itself gains
+ * its 1px bottom border the same way, making it 49px. */
 #menu-bar,
-#menu-bar.sticky {
-  background: var(--sidebar-bg);
-  border-bottom: 1px solid var(--table-border-color);
+#menu-bar *,
+.cds-breadcrumb,
+.cds-breadcrumb * { box-sizing: border-box; }
+
+#menu-bar,
+#menu-bar.sticky,
+#menu-bar:hover,
+html.sidebar-visible #menu-bar {
+  position: fixed;
+  z-index: 8000;
+  inset-block-start: 0;
+  inset-inline: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  margin: 0;
+  block-size: var(--menu-bar-height);
+  background: var(--bg);
+  border-block-end: 1px solid var(--table-border-color);
   box-shadow: none;
 }
 
-.menu-title { font-weight: 700; letter-spacing: -0.02em; }
+.page { margin-block-start: 0; }
 
-/* "▚ scratchy" home link, injected by theme/scratchy.js. */
-#scratchy-home {
-  color: var(--icons);
+/* header__name */
+#menu-bar .brand {
+  display: flex;
+  align-items: center;
+  padding: 0 3.2rem 0 1.6rem;
+  border: 2px solid transparent;
+  block-size: 100%;
+  color: var(--fg);
   font-family: var(--mono-font);
-  font-weight: 700;
-  font-size: 0.92rem;
+  font-size: 1.4rem;
+  font-weight: 600;
+  line-height: 2rem;
+  letter-spacing: 0.1px;
   text-decoration: none;
-  padding: 0 0.5rem;
-  line-height: var(--menu-bar-height);
 }
-#scratchy-home::before { content: "▚ "; color: var(--sidebar-active); }
-#scratchy-home:hover { color: var(--fg); }
+#menu-bar .brand::before { content: "▚ "; color: var(--sidebar-active); }
+#menu-bar .brand:focus { outline: none; border-color: var(--focus); }
 
-.sidebar .chapter li.chapter-item a.active { font-weight: 700; }
+/* header__nav, opened by a 1px × 24px $border-subtle divider */
+#menu-bar .navlinks {
+  position: relative;
+  display: flex;
+  block-size: 100%;
+  padding-inline-start: 1.6rem;
+}
+#menu-bar .navlinks::before {
+  content: "";
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-start: 0;
+  transform: translateY(-50%);
+  display: block;
+  inline-size: 1px;
+  block-size: 24px;
+  background-color: var(--table-border-color);
+}
+
+/* header__menu-item */
+#menu-bar .navlinks a {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 0 1.6rem;
+  border: 2px solid transparent;
+  block-size: 100%;
+  color: var(--sidebar-fg);
+  font-size: 1.4rem;
+  font-weight: 400;
+  line-height: 1.8rem;
+  letter-spacing: 0;
+  text-decoration: none;
+  transition: background-color 110ms, border-color 110ms, color 110ms;
+}
+#menu-bar .navlinks a:hover { background-color: var(--background-hover); color: var(--fg); }
+#menu-bar .navlinks a:focus { outline: none; border-color: var(--focus); }
+
+/* A nav item is a component, not a link — it never takes the link underline. */
+#menu-bar .navlinks a,
+#menu-bar .navlinks a:hover,
+#menu-bar .navlinks a:focus,
+#menu-bar .navlinks a:active,
+#menu-bar .brand:focus { text-decoration: none; }
+
+/* Kept in the DOM for book.js, which reads `.menu-title`. */
+#menu-bar .menu-title { display: none; }
+
+/* No theme picker: book.toml already tracks the reader's system preference
+ * (`default-theme` light, `preferred-dark-theme` navy), exactly as the landing
+ * page does through prefers-color-scheme. Offering six mdBook themes here
+ * would be a control the rest of the site does not have. Both elements stay in
+ * the DOM because book.js reads them on every page.
+ *
+ * Scoped through #menu-bar so this outweighs the header__action rule below,
+ * which is itself an id plus two classes. */
+#menu-bar #theme-toggle,
+#menu-bar #theme-list { display: none; }
+
+/* header__global. mdBook gives .left-buttons `margin: 0 5px` and
+ * .right-buttons `margin: 0 15px`; both have to go, or the brand starts 10px
+ * right of where it does on the landing page and the last icon never reaches
+ * the edge. */
+#menu-bar .left-buttons,
+#menu-bar .right-buttons { margin: 0; }
+
+#menu-bar .header-global {
+  display: flex;
+  flex: 1 1 0%;
+  align-items: center;
+  justify-content: flex-end;
+  block-size: 100%;
+  margin: 0;
+}
+
+/* header__action: mini-units(6) square, 1px transparent border, hovers to
+ * $background-hover and takes $focus on the border. */
+#menu-bar .header-global .icon-button,
+#menu-bar .header-global > a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: 4.8rem;
+  block-size: 4.8rem;
+  padding: 0;
+  border: 1px solid transparent;
+  line-height: 1;
+  transition: background-color 110ms, border-color 110ms;
+}
+#menu-bar .header-global .icon-button:hover,
+#menu-bar .header-global > a:hover { background-color: var(--background-hover); }
+#menu-bar .header-global .icon-button:focus,
+#menu-bar .header-global > a:focus { outline: none; border-color: var(--focus); }
+#menu-bar .header-global .icon-button:active,
+#menu-bar .header-global > a:active { background-color: var(--background-active); }
+
+/* mdBook centres its icons with `line-height: var(--menu-bar-height)`, which
+ * double-counts against the flex centring above. */
+#menu-bar .header-global i { line-height: 1; }
+
+/* ------------------------------------------------------------------ *
+ * Carbon breadcrumb — `breadcrumb/_breadcrumb.scss`
+ *
+ * body-compact-01, $spacing-03 either side of a '/' separator, no
+ * trailing slash, and the current page in $text-primary. The section
+ * segment ships in both forms so the hrefs stay right without script;
+ * `data-path` on <html> decides which one shows.
+ * ------------------------------------------------------------------ */
+
+/* Held to the chapter's measure so it lines up with the prose, the way
+ * mdBook centres <main>. */
+.cds-breadcrumb {
+  max-width: var(--content-max-width);
+  margin: 3.2rem auto 1.6rem;
+}
+
+.breadcrumb-list {
+  display: flex;
+  flex-wrap: wrap;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  font-size: 1.4rem;
+  line-height: 1.29;
+  letter-spacing: 0.16px;
+}
+
+.breadcrumb-item { position: relative; display: flex; align-items: center; margin-inline-end: 0.8rem; }
+.breadcrumb-item::after { content: "/"; color: var(--fg); margin-inline-start: 0.8rem; }
+.breadcrumb-item:last-child,
+.breadcrumb-item:last-child::after { margin-inline-end: 0; }
+.breadcrumb-item:last-child::after { content: ""; }
+.breadcrumb-item a { white-space: nowrap; }
+.breadcrumb-item--current span { color: var(--fg); cursor: auto; }
+
+/* Docs chapters get "Docs", blog posts get "Blogs". */
+.bc-blogs { display: none; }
+html[data-path^="blogs/"] .bc-blogs { display: flex; }
+html[data-path^="blogs/"] .bc-docs { display: none; }
+
+/* ------------------------------------------------------------------ *
+ * No side nav
+ *
+ * A blog post and a doc chapter are the same artefact, and neither
+ * carries mdBook's table of contents. Navigation is the shell header,
+ * the breadcrumb, and the chapter index on the book's front page.
+ *
+ * The elements stay in the DOM because book.js reaches for #sidebar,
+ * #sidebar-toggle and #sidebar-resize-handle on every page and throws
+ * without them.
+ * ------------------------------------------------------------------ */
+
+/* `.nav-wrapper` holds the mobile chapter arrows; `.nav-chapters` is the
+ * desktop pair, which mdBook fixes to the left and right viewport edges
+ * outside that wrapper. Both go — the previous-chapter chevron reads as a
+ * rail-collapse control sitting where the rail used to be. */
+#sidebar,
+#sidebar-resize-handle,
+#sidebar-toggle,
+.nav-wrapper,
+.nav-chapters { display: none; }
+
+/* mdBook offsets the page by the rail's width whenever the toggle is
+ * checked, which it is by default. Nothing to make room for now. */
+#sidebar-toggle-anchor:checked ~ .page-wrapper {
+  margin-inline-start: 0;
+  transform: none;
+}

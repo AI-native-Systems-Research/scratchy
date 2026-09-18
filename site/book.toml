@@ -15,8 +15,9 @@ create-missing = false
 # exactly as the landing page does.
 default-theme = "light"
 preferred-dark-theme = "navy"
+# Carbon's side nav labels entries, it does not number them.
+no-section-label = true
 additional-css = ["theme/scratchy.css"]
-additional-js = ["theme/scratchy.js"]
 git-repository-url = "https://github.com/AI-native-Systems-Research/scratchy"
 site-url = "/scratchy/book/"
 
