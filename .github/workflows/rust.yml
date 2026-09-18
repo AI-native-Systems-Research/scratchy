@@ -183,6 +183,47 @@ jobs:
       - name: KTIR optimizer tests
         run: cargo test -p ktir-optimizer
 
+      # LEAF-CRATE GUARD for the chat-template compiler. `scratchy-chat-template-compiler`
+      # is meant to be publishable on its own, which means no dependency on the rest of
+      # scratchy — and that property decays silently, so it is asserted rather than
+      # documented. Three checks:
+      #   1. no `scratchy-*` line in its manifest;
+      #   2. it builds OUTSIDE the workspace (`--manifest-path`), which is what a
+      #      published consumer does;
+      #   3. its source names neither `inventory` nor any scratchy type, so renaming it
+      #      for publication stays a one-line change. Emitting the registration is the
+      #      caller's job, deliberately.
+      - name: Chat-template compiler is a leaf crate
+        run: |
+          set -euo pipefail
+          C=crates/compiler/serving/chat-template
+          if grep -q '^scratchy-' $C/Cargo.toml; then
+            echo "::error::$C/Cargo.toml depends on a scratchy crate — leaf-ness lost"; exit 1
+          fi
+          cargo build --manifest-path $C/Cargo.toml --features compile
+          if grep -rn 'inventory\|Scratchy' $C/src/ | grep -vE ':\s*(//|///|//!)'; then
+            echo "::error::$C/src names inventory or a scratchy type — leaf-ness lost"; exit 1
+          fi
+
+      # The chat-template compiler's own suite: the runtime helpers checked
+      # DIFFERENTIALLY against minijinja (the interpreter is the oracle, so a wrong
+      # belief about Jinja cannot pass), plus the generated code compared byte-for-byte
+      # over a message matrix. Byte-identity is the bar because prompt drift is silent:
+      # a stray newline moved TinyLlama's `<` from token 529 to 29966 and produced
+      # nonsense with no error (see chat_template.rs).
+      - name: Chat-template compiler tests
+        run: cargo test -p scratchy-chat-template-compiler -p scratchy-chat-template-e2e
+
+      # The compiled path INTEGRATION: that the drift gate accepts a template's own
+      # source, that `apply()` agrees with the interpreter, and that byte-level drift
+      # (trailing newline, CRLF) is rejected rather than rendered wrongly.
+      # ⛔ NEEDS A MODEL IN SCOPE. With an empty registry these tests iterate nothing
+      # and pass vacuously, so they run under the same smollm2 scope as the steps
+      # below; the suite prints the registration count it asserted against.
+      - name: Chat-template compiled-path integration
+        run: cargo test -p scratchy-serving-api -p scratchy-models
+          --features metal,scratchy-models/smollm2-135m --lib chat_template -- --nocapture
+
       # Tool-call parser logic (Hermes / Llama / Kimi / Mistral / Jamba /
       # Granite / Gemma-4). Pure-logic unit tests with no GPU dependency —
       # don't need a real model at runtime, but scratchy-models has no

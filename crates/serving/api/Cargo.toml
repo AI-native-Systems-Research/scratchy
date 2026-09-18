@@ -21,9 +21,6 @@ serve = ["dep:axum", "dep:tower-http"]
 otel = ["scratchy-core-common/otel"]
 cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda", "scratchy-target-cuda/cuda"]
 nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
-# Test-only: see scratchy-serving-worker/test-model-smollm2. Enables one model so
-# `chat_template`'s compiled-path tests have a registration to assert against.
-test-compiled-chat = ["metal", "scratchy-serving-worker/test-model-smollm2"]
 metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
 spyre = ["scratchy-serving-worker/spyre"]
 # A card, and the emulator — siblings, forwarded to the worker's own tiers.

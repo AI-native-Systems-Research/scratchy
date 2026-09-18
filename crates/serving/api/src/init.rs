@@ -3567,7 +3567,36 @@ fn patch_additional_special_tokens(tok: &mut Tokenizer, model_dir: &Path) {
 /// names a readable file; otherwise treated as inline Jinja. This
 /// covers `--chat-template /path/to/tokenizer_config.json` as well
 /// as raw template strings.
+/// Resolve the chat template, and say once — at INFO — which renderer won.
+///
+/// ⛔ THE LOG LINE IS NOT DECORATION. Whether a request renders through generated
+/// Rust or through minijinja is invisible otherwise: both produce byte-identical
+/// output by design, so there is no symptom to observe. Diagnosing a suspected
+/// regression without this means rebuilding with `RUST_LOG=debug` and guessing.
+///
+/// It is a wrapper rather than a line at each `return` because
+/// `resolve_chat_template_inner` has several exit paths and there are six call
+/// sites (one per topology path in this file) — logging at either would
+/// duplicate it once per path, which is how the six copies of `max_model_len`
+/// resolution in this file happened.
 pub(crate) fn resolve_chat_template(
+    override_str: Option<&str>,
+    model_dir: &Path,
+) -> Option<ChatTemplate> {
+    let resolved = resolve_chat_template_inner(override_str, model_dir);
+    match &resolved {
+        Some(tpl) if tpl.is_compiled() => {
+            info!("Chat template: compiled renderer (Jinja is not interpreted per request)")
+        }
+        Some(_) => info!(
+            "Chat template: interpreted via minijinja (no compiled template matches these bytes)"
+        ),
+        None => {}
+    }
+    resolved
+}
+
+fn resolve_chat_template_inner(
     override_str: Option<&str>,
     model_dir: &Path,
 ) -> Option<ChatTemplate> {
