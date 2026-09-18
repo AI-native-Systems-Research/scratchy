@@ -1,334 +1,154 @@
 // SPDX-License-Identifier: Apache-2.0
-//! WHAT A REQUEST AXIS ON THE FOLD'S MATMULS ADDRESSES — read off the emitted per-core addresses
-//! rather than argued from the source.
+//! ⛔⛔⛔⛔⛔ WHY A REQUEST AXIS ON A **POOL** OPERAND IS NOT EXPRESSIBLE — the pool law has no request
+//! coordinate, so there is no stride for `y` to step, and the constant three attempts baked is not one.
 //!
-//! Collapsing the prefix fold from `pages × requests` launches to `pages` needs the score and value
+//! ## What this file used to assert, greenly, for five tests
+//! *"Collapsing the prefix fold from `pages × requests` launches to `pages` needs the score and value
 //! KERNELS to step one request per unit of the batch axis, i.e. a per-`y` step of exactly
-//! `PagedKvPool::request_stride` = `hd * PAGE_SLOTS`. Two readings of the stride rule agree on every
-//! op that ships today and differ here, so this settles it from the generated addresses: guessing
-//! wrong makes every request read a fraction of the way into request 0's page, which is fluent text
-//! built from another conversation's keys and nothing downstream that notices.
+//! `PagedKvPool::request_stride` = `hd * PAGE_SLOTS`."*
 //!
-//! ⛔ THE FOLD SWEEPS ONE 64-SLOT BLOCK AT A TIME (`width = stick`, `nb = active_cap/stick` blocks per
-//! launch), so each kernel's SWEPT extent is 64 while its physical block is the whole page. The
-//! `device_extent` override is what states the storage the op is a window into, and without it `y`
-//! steps a quarter of a page. That is the content of this file: which dim to declare, and that
-//! declaring it works.
+//! It measured that step off the emitted per-core addresses and found it exact — and it was exact,
+//! because the test **defined `req = HD * PAGE_SLOTS` itself** and then checked the emitter reproduced
+//! the number the `device_extent` override had just told it to use. A spot-check against its own
+//! parameters (`a-spot-check-against-its-own-parameters-verifies-nothing`). It never compared that
+//! number against the pool's own address law, which is the only oracle here.
+//!
+//! ## The pool law, quoted from `PagedKvPool::addr`'s own doc (`sdsc_abstract.rs:5169`)
+//! ```text
+//! 2. WHICH KV HEAD — and nothing else. There is no request term: a request is a set of SLOTS
+//!    (reached through the host's page map), never a coordinate the device computes with.
+//! ```
+//! `PagedKvPool::request_stride` **no longer exists**: `sdsc_abstract.rs:5197` records that the
+//! per-kv-head block distance *"replaced `block_index(kvh) = kvh * ROWS` and `request_stride`"*. So the
+//! baked step is not a request stride, and a `y` of 1 does not advance to request 1.
+//!
+//! ⛔ IT IS **EXACTLY** THE KV-HEAD STRIDE, AND A NEAR-MISS READING OF THAT IS REFUTED BELOW. The
+//! distance to the next kv head is `plane_block_elems() = hd * PLANE_SLOTS` — PHYSICAL slots — while
+//! `hd * PAGE_SLOTS` is the ADDRESSABLE count, so the natural guess is that the baked constant falls
+//! SHORT of kv head 1 by `hd * WRITE_SLACK`. It does not: `WRITE_SLACK` is 0 today, both quantities are
+//! 16384, and the first test here records that assertion failing. The step is not approximately the
+//! wrong axis, it is precisely the wrong one — see
+//! [`the_pinned_request_stride_is_exactly_the_kv_head_stride`].
+//!
+//! So a `y` of 1 advances one KV HEAD, and with `nkvh = 8` at a batch of 8 the batch axis is ALIASED
+//! ONTO the head axis: request `r` scored against kv head `r`'s keys. Which is exactly the reported
+//! symptom of all 3-4 attempts: fluent text assembled from another conversation's keys.
+//!
+//! ## ⭐ WHAT A REQUEST AXIS WOULD NEED, AND WHY THE POOL CANNOT BE IT
+//! A `y`-batched matmul steps a stride it DERIVES from a declared extent, so the operand must HAVE a
+//! uniform per-request pitch. The pool does not, and by its own law never will — the law's three axes
+//! are kv_head, slot and feat_slab, and a request is a SET OF SLOTS chosen by the host's page map, not
+//! a coordinate the device multiplies. So the collapse needs a DIFFERENT operand, one whose per-request
+//! pitch this compiler chooses; it is not reachable by picking a better constant for the pool, which is
+//! the move every attempt made. The three tests below fence off the constant so a fifth attempt cannot
+//! start from the same false evidence.
 
-use ktir_superdsc::emit;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_matmul_batched_off, assemble_matmul_off_phys_m,
-};
-use scratchy_subtile::sdsc_abstract::{
-    BlockCols, KernelTag, MatK, MatM, MatN, MatY, OperandPlacement, PagedKvPool, PerRequestRows,
-    QueryRowCount, RowBlockedTag, SlotWindow, StickLayout, Stk,
-};
+use ktir_superdsc::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
 
-const HD: u32 = 64;
-const MQ: u32 = 8; // requests = the batch axis
-const STICK: u32 = 64; // the fold's swept width: one 64-slot block
-const PAGE_SLOTS: u32 = PagedKvPool::PAGE_SLOTS as u32;
+const HD: usize = 64;
+const NKVH: usize = 8;
 
-fn act(n: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
-    Stk::<RowBlockedTag>::new(n, StickLayout::row_blocked(rows as usize, cols as usize)).unwrap()
-}
-fn ker(n: &str, rows: u32, cols: u32) -> Stk<KernelTag> {
-    Stk::<KernelTag>::new(n, StickLayout::kernel(rows as usize, cols as usize)).unwrap()
-}
-
-/// The per-core start addresses of operand `arg` (0=input, 1=kernel, 2=output), in ELEMENTS from the
-/// operand's own base, indexed by core.
-fn per_core_elems(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
-    let v = serde_json::to_value(&e.op).unwrap();
-    let data = &v["dscs_"][0][op_name]["scheduleTree_"][arg]["startAddressCoreCorelet_"]["data_"];
-    let mut rows: Vec<(u32, i64)> = data
-        .as_object()
-        .expect("per-core start addresses")
-        .iter()
-        .map(|(k, val)| {
-            let core: u32 = k
-                .trim_start_matches('[')
-                .split(',')
-                .next()
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            (core, val.as_str().unwrap().parse::<i64>().unwrap())
-        })
-        .collect();
-    rows.sort();
-    let base = rows[0].1;
-    rows.iter().map(|(_, a)| (a - base) / 2).collect()
-}
-
-/// THE DISTINCT OFFSETS, ascending — the addresses the batch axis reaches. Other dims may also be
-/// split across cores (the `out` split, when the op has one), so the distinct values are what
-/// identify the request steps rather than "every nth core".
-fn distinct_ascending(offs: &[i64], want: usize) -> Vec<i64> {
-    let mut v: Vec<i64> = offs.to_vec();
-    v.sort_unstable();
-    v.dedup();
-    assert!(
-        v.len() >= want,
-        "expected at least {want} distinct offsets, got {v:?}"
-    );
-    v
-}
-
-/// THE SCORE LEG: `qs · Kᵀ`, one op per query head, `y` = request. The kernel is `[hd, PAGE_SLOTS]`
-/// per request and the op sweeps a 64-slot window of it, so `out` is the dim to declare.
-#[test]
-fn the_score_kernel_steps_one_request_per_y() {
-    let mut s = 0i64;
-    let sc = assemble_matmul_batched_off(
-        "sc",
-        MatM::single_row(),
-        MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatK::of_head_dim(HD),
-        MatY::of_requests(MQ),
-        &act("t_qs", MQ, HD),
-        0,
-        &ker("t_kct", HD, PAGE_SLOTS),
-        0,
-        Some(("out", PAGE_SLOTS)),
-        &act("t_sc", MQ * 32, STICK),
-        0,
-        &mut s,
-        None,
-    );
-    let req = (HD * PAGE_SLOTS) as i64; // PagedKvPool::request_stride, in elements
-    let ys = distinct_ascending(&per_core_elems(&sc, "sc", 1), MQ as usize);
-    for (r, off) in ys.iter().take(MQ as usize).enumerate() {
-        assert_eq!(
-            *off,
-            r as i64 * req,
-            "request {r}'s Kᵀ block (offsets {ys:?})"
-        );
-    }
-}
-
-/// THE VALUE LEG: `probs · V`, one op per query head, `y` = request. V is `[PAGE_SLOTS, hd]` per
-/// request and the op sweeps 64 of its ROWS, so `in` is the dim to declare — the mirror of the score
-/// leg, and the reason the two overrides name different dims.
-#[test]
-fn the_value_kernel_steps_one_request_per_y() {
-    let mut s = 0i64;
-    let ov = assemble_matmul_batched_off(
-        "ov",
-        MatM::single_row(),
-        MatN::of_head_dim(HD),
-        MatK::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatY::of_requests(MQ),
-        &act("t_expb", MQ * 32, STICK),
-        0,
-        &ker("t_vc", PAGE_SLOTS, HD),
-        0,
-        Some(("in", PAGE_SLOTS)),
-        &act("t_ov", MQ * 32, HD),
-        0,
-        &mut s,
-        None,
-    );
-    let req = (HD * PAGE_SLOTS) as i64;
-    let ys = distinct_ascending(&per_core_elems(&ov, "ov", 1), MQ as usize);
-    for (r, off) in ys.iter().take(MQ as usize).enumerate() {
-        assert_eq!(
-            *off,
-            r as i64 * req,
-            "request {r}'s V block (offsets {ys:?})"
-        );
-    }
-}
-
-/// ⛔ AND WITHOUT THE DECLARATION IT IS WRONG, not merely different: `y` steps `in * 64`, a QUARTER of
-/// a page, so request 1 reads 64 slots into request 0's keys. Pinned so the override cannot be dropped
-/// as redundant — this is the failure the two readings of the stride rule differ by.
-#[test]
-fn an_undeclared_kernel_extent_steps_a_quarter_of_a_page() {
-    let mut s = 0i64;
-    let sc = assemble_matmul_batched_off(
-        "sc_bad",
-        MatM::single_row(),
-        MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatK::of_head_dim(HD),
-        MatY::of_requests(MQ),
-        &act("t_qs", MQ, HD),
-        0,
-        &ker("t_kct", HD, PAGE_SLOTS),
-        0,
-        None,
-        &act("t_sc", MQ * 32, STICK),
-        0,
-        &mut s,
-        None,
-    );
-    let req = (HD * PAGE_SLOTS) as i64;
-    let ys = distinct_ascending(&per_core_elems(&sc, "sc_bad", 1), 2);
-    assert_eq!(
-        ys[1],
-        (HD * STICK) as i64,
-        "undeclared: one swept window, not one page"
-    );
-    assert_eq!(ys[1] * 4, req, "…exactly a quarter of the request stride");
-}
-
-// ── THE PER-REQUEST GQA VALUE LEG (`assemble_matmul_off_phys_m`) — one op per kv-head group, `y` =
-//    the group's query heads, the request carried by each op's own base offset. The activation's
-//    `OperandPlacement` declares its base offset and its row packing in one law-minted value, so this
-//    pins both the per-core addresses and the declared walk, exactly as the request-axis tests above
-//    pin `kernel_device_extent`. ──
-
-const NQH: u32 = 32; // the per-request framing: one request's nqh rows are the contiguous ones
-const GQA: u32 = 4;
-
-/// The input operand's DECLARED on-card walk (`maxDimSizes_`): `[-1; rank]` = "reconstruct the
-/// stick-blocked walk from N_/layoutDimOrder_/stickSize_", pinned extents = "walk row-major over a
-/// buffer this many rows deep".
-fn max_dim_sizes(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<i64> {
-    let v = serde_json::to_value(&e.op).unwrap();
-    v["dscs_"][0][op_name]["scheduleTree_"][arg]["maxDimSizes_"]
-        .as_array()
-        .expect("declared walk")
-        .iter()
-        .map(|x| x.as_i64().unwrap())
-        .collect()
-}
-
-/// The operand's `layoutDimOrder_` — WHICH axis owns which stride is set by nothing but this order,
-/// so the walk pin above is only meaningful together with it.
-fn layout_dim_order(e: &emit::EmittedOp, op_name: &str, arg: usize) -> Vec<String> {
-    let v = serde_json::to_value(&e.op).unwrap();
-    v["dscs_"][0][op_name]["scheduleTree_"][arg]["layoutDimOrder_"]
-        .as_array()
-        .expect("declared order")
-        .iter()
-        .map(|x| x.as_str().unwrap().to_string())
-        .collect()
-}
-
-/// THE PER-REQUEST VALUE LEG's activation is `expb`, whose head pitch under the request-major row law
-/// is ONE ROW: the buffer is one stick wide and adjacent heads sit one row (`STICK` elements) apart, so
-/// the placement's pitch — the activation's rows per stick plane — is the law's own head pitch, 1.
+/// ⭐⭐⭐ THE PINNED CONSTANT **IS** THE KV-HEAD STRIDE, EXACTLY — so `y = r` addresses kv head `r`.
 ///
-/// The chunk's `mq` is the pitch of the OTHER activation (`qs`, the token-stream law). Declared here it
-/// would claim `expb` packs `mq` rows per plane — the per-core starts still land (the `mb` corner never
-/// moves at `mb = 1`), but the head (`y`) plane deepens to `mq` rows and every head past the first is
-/// walked `mq`x too far in. That pairing has no spelling: the pitch rides inside the placement the
-/// request-major law mints with the offset, so an offset from one law cannot carry another law's pitch.
-/// The law's pitch declares exactly the rows the op sweeps, so the DECLARED WALK is the head-outermost
-/// row-major sweep `[y, mb, in]` pinned at `[GQA, 1, 64]`: each head plane is the ONE row the law
-/// places, and `y` steps one stick per head — the same strides the per-core addresses below realize.
+/// ⛔ I FIRST WROTE THIS TEST ASSERTING THE CONSTANT WAS *SHORT* of the kv-head stride by
+/// `hd * WRITE_SLACK`, reasoning from the addressable-vs-physical split that really did put a padded
+/// chunk write on the next head's keys. **The assertion failed: both are 16384.** `WRITE_SLACK` is `0`
+/// today (`sdsc_abstract.rs:5031`, and `:90` says so outright), so `PLANE_SLOTS == PAGE_SLOTS` and the
+/// two readings coincide. The hypothesis is recorded as refuted because the near-miss story it tells is
+/// more forgiving than the truth: the step is not approximately the wrong axis, it is EXACTLY the
+/// wrong axis.
+///
+/// ⚠️ AND THE IDENTITY IS A COINCIDENCE WITH AN EXPIRY. `sdsc_abstract.rs:113` records that a non-zero
+/// `WRITE_SLACK` "arrived, and broke head_dim 128". Whenever it is non-zero again, `hd * PAGE_SLOTS`
+/// stops being any axis at all — so this test pins the equality rather than the constant, and fails
+/// loudly the day the two split.
 #[test]
-fn the_per_request_value_activation_steps_one_row_per_head() {
-    let mut s = 0i64;
-    let ov = assemble_matmul_off_phys_m(
-        "ov_req",
-        MatM::single_row(),
-        MatN::of_head_dim(HD),
-        MatK::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        // The batch axis carries BOTH operands' head strides now, so the builder can refuse a walk
-        // that strides `y` by neither. Under the request-major law adjacent heads are ONE ROW apart,
-        // and a row is one stick — which is exactly the `mb_dev * out` this walk derives.
-        MatY::of_gqa_group(
-            GQA,
-            OperandPlacement::of_request_major_rows(
-                0,
-                0,
-                PerRequestRows::of_one_request_heads(NQH),
-                BlockCols::of_slot_window(SlotWindow::SLOTS),
-            ),
-            OperandPlacement::of_request_major_rows(
-                0,
-                0,
-                PerRequestRows::of_one_request_heads(NQH),
-                BlockCols::of_head_dim(HD),
-            ),
-        ),
-        // The per-request fold leg exists only for a decode batch, so it carries the batch form —
-        // the head-outermost walk the pins below state.
-        SharedKernelBmmForm::of_attn_rows(true, QueryRowCount::of_mq(MQ)),
-        &act("t_expb", NQH, STICK),
-        // Request 0, head 0 of the request-major framing — offset 0 (the law's first row) and the
-        // law's one-row head pitch, minted together.
-        OperandPlacement::of_request_major_rows(
-            0,
-            0,
-            PerRequestRows::of_one_request_heads(NQH),
-            BlockCols::of_slot_window(SlotWindow::SLOTS),
-        ),
-        &ker("t_vc", PAGE_SLOTS, HD),
-        scratchy_subtile::addr::DevOff::ZERO,
-        &act("t_ov", NQH, HD),
-        scratchy_subtile::addr::DevOff::ZERO,
-        &mut s,
-        None,
+fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
+    let pool = PagedKvPool::new(NKVH, HD);
+    let pinned = HD * PagedKvPool::PAGE_SLOTS;
+    assert_eq!(
+        pool.plane_block_elems(),
+        HD * PagedKvPool::PLANE_SLOTS,
+        "the pool's kv-head distance is PHYSICAL slots, whatever PAGE_SLOTS says"
     );
     assert_eq!(
-        layout_dim_order(&ov, "ov_req", 0),
-        vec!["y", "mb", "in"],
-        "the value activation's walk is batch-OUTERMOST — `y` owns the head plane, `mb` the row"
+        pinned,
+        pool.plane_block_elems(),
+        "`hd * PAGE_SLOTS` — the constant three request-axis attempts baked as the deleted \
+         `PagedKvPool::request_stride` — is the KV-HEAD stride. A `y` step of one advances one kv \
+         head. If this ever stops holding (WRITE_SLACK != 0) the constant becomes no axis at all, \
+         which is worse, not better."
     );
     assert_eq!(
-        max_dim_sizes(&ov, "ov_req", 0),
-        vec![i64::from(GQA), 1, i64::from(STICK)],
-        "the value activation's declared walk pins the law's own extents: a one-row head plane \
-         per `y` step, never a plane deeper than the one row per head the law places"
+        PagedKvPool::WRITE_SLACK,
+        0,
+        "the equality above holds only while WRITE_SLACK is 0 — when it is not, `hd * PAGE_SLOTS` \
+         names nothing in the law and this file's second test is the one that still holds"
     );
-    let ys = distinct_ascending(&per_core_elems(&ov, "ov_req", 0), GQA as usize);
-    for (g, off) in ys.iter().take(GQA as usize).enumerate() {
-        assert_eq!(
-            *off,
-            (g as u32 * STICK) as i64,
-            "head {g}'s probability row (offsets {ys:?})"
-        );
-    }
-    // The OUTPUT side steps one head-major row per head too (`mb*out = hd` at mb=1) — the pair
-    // states the whole per-request relation, both sides one row per head.
-    let os = distinct_ascending(&per_core_elems(&ov, "ov_req", 2), GQA as usize);
-    for (g, off) in os.iter().take(GQA as usize).enumerate() {
-        assert_eq!(
-            *off,
-            (g as u32 * HD) as i64,
-            "head {g}'s output row (offsets {os:?})"
-        );
-    }
 }
 
-/// AND THE ACTIVATIONS LINE UP WITHOUT ANY DECLARATION, because a request is one ROW of a
-/// stick-blocked buffer and a row is one stick: `qs` steps `hd` per request within head `h`'s plane,
-/// `sc` steps 64. Both are `mb * <stick>` at `mb = 1`, so the truthful extents already produce them.
+/// ⭐⭐⭐ A STEP OF THE PINNED SIZE ADVANCES A **KV HEAD**, NOT A REQUEST — so `y = r` reads head `r`.
+///
+/// This is the mechanism behind "another conversation's keys": with `nkvh = 8` and a batch of 8, the
+/// batch axis sweeps exactly the kv-head axis, so request `r`'s score is computed against kv head
+/// `r`'s keys. Every row gets real, well-formed keys belonging to the wrong head of the wrong request.
 #[test]
-fn the_activations_step_one_row_per_request() {
-    let mut s = 0i64;
-    let sc = assemble_matmul_batched_off(
-        "sc_act",
-        MatM::single_row(),
-        MatN::of_kv_window(BlockCols::of_slot_window(SlotWindow::SLOTS)),
-        MatK::of_head_dim(HD),
-        MatY::of_requests(MQ),
-        &act("t_qs", MQ, HD),
-        0,
-        &ker("t_kct", HD, PAGE_SLOTS),
-        0,
-        Some(("out", PAGE_SLOTS)),
-        &act("t_sc", MQ * 32, STICK),
-        0,
-        &mut s,
-        None,
+fn stepping_the_batch_axis_by_the_pinned_constant_walks_the_kv_head_axis() {
+    let pool = PagedKvPool::new(NKVH, HD);
+    let nkvh_nz = std::num::NonZeroU32::new(NKVH as u32).expect("nkvh > 0");
+    let head0 = KvHead::new(0, nkvh_nz).expect("kv head 0");
+    let head1 = KvHead::new(1, nkvh_nz).expect("kv head 1");
+    let step = pool.addr(KvCoord::block(KvPlane::Kt, head1))
+        - pool.addr(KvCoord::block(KvPlane::Kt, head0));
+    assert_eq!(
+        step as usize,
+        pool.plane_block_elems(),
+        "one unit of the kv-head axis IS `plane_block_elems` — the axis the pinned constant \
+         approximates. There is no other axis of that magnitude in the law."
     );
-    let qs = distinct_ascending(&per_core_elems(&sc, "sc_act", 0), MQ as usize);
-    let out = distinct_ascending(&per_core_elems(&sc, "sc_act", 2), MQ as usize);
-    for r in 0..MQ as usize {
-        assert_eq!(
-            qs[r],
-            r as i64 * HD as i64,
-            "request {r}'s query row (offsets {qs:?})"
-        );
-        assert_eq!(
-            out[r],
-            r as i64 * STICK as i64,
-            "request {r}'s score row (offsets {out:?})"
+}
+
+/// ⛔⛔⛔ AND THERE IS NO REQUEST COORDINATE TO STEP: the SAME `KvCoord` is the same address, whichever
+/// request is being served.
+///
+/// The structural proof is that `KvCoord` has no request field — `block(plane, kvh).at_slot(..)
+/// .at_feat(..)` is the whole vocabulary — so this asserts the consequence: two requests reaching the
+/// same logical position produce ONE address. A request is separated by which SLOTS the host's page map
+/// gave it, and the device never computes with that.
+#[test]
+fn the_only_axis_the_pinned_constant_matches_is_the_kv_head_one() {
+    let pool = PagedKvPool::new(NKVH, HD);
+    let nkvh_nz = std::num::NonZeroU32::new(NKVH as u32).expect("nkvh > 0");
+    let kvh0 = KvHead::new(0, nkvh_nz).expect("kv head 0");
+    let base = pool.addr(KvCoord::block(KvPlane::Kt, kvh0));
+    // EVERY axis the coordinate vocabulary offers, as its own one-unit step. `KvCoord` has exactly
+    // these — `block(plane, kvh)`, `.at_slot()`, `.at_feat()` — and no request among them.
+    let kv_head = pool.addr(KvCoord::block(
+        KvPlane::Kt,
+        KvHead::new(1, nkvh_nz).expect("kv head 1"),
+    )) - base;
+    let slot = pool.addr(KvCoord::block(KvPlane::Kt, kvh0).at_slot(KvSlot::new(1))) - base;
+    let feat = pool.addr(KvCoord::block(KvPlane::Kt, kvh0).at_feat(FeatIdx::of_slab(1))) - base;
+    let pinned = (HD * PagedKvPool::PAGE_SLOTS) as u32;
+    // The KV-HEAD axis is the one it matches, and matching it is the defect: the batch axis was
+    // aliased onto the head axis, so request `r` scored against kv head `r`'s keys. With nkvh=8 and a
+    // batch of 8 the alias is total — every row reads real, well-formed keys from the wrong head.
+    assert_eq!(
+        kv_head, pinned,
+        "the kv-head axis is the axis the request axis was actually walking"
+    );
+    // ⛔ AND NEITHER OF THE OTHER TWO AXES IS A CANDIDATE, so there was never a third reading in which
+    // the constant meant something per-request. `slot` is where a request's separation actually lives —
+    // and it is the HOST's page map that says which slots, never a stride the device multiplies.
+    for (name, step) in [("slot", slot), ("feat_slab", feat)] {
+        assert_ne!(
+            step, pinned,
+            "the pool's `{name}` axis steps {step}, not the pinned {pinned}"
         );
     }
+    assert!(
+        slot > 0 && feat > 0 && slot != feat,
+        "the law's remaining axes must both be live and distinct (slot={slot}, feat={feat}), or this \
+         enumeration is not covering the vocabulary it claims to"
+    );
 }

@@ -581,11 +581,31 @@ pub fn page_base_bytes(s: &SessionKv, rp: RowPage) -> Bytes {
 /// whole win, and it is legal exactly when a launch can step from one request's page to the next by a
 /// single constant: `base(lp, r) == base(lp, 0) + r * stride`.
 ///
-/// THAT IS A PROPERTY OF THE POOL, NOT OF THE BATCH, so it is CHECKED here rather than declared. The
-/// pool gives every request the same pages and separates them INSIDE each page by
-/// `PagedKvPool::request_stride` — a bake constant, which is the half that matters, because a matmul
-/// steps its batch axis by an extent fixed when the bundle was compiled and cannot step a stride only
-/// knowable at launch. But holding still depends on which POOL ROWS are live: a request's row is its
+/// THAT IS A PROPERTY OF THE POOL, NOT OF THE BATCH, so it is CHECKED here rather than declared.
+///
+/// ⛔⛔⛔ THIS DOC USED TO SAY THE POOL *"separates them INSIDE each page by
+/// `PagedKvPool::request_stride` — a bake constant, which is the half that matters"*. **THAT CONSTANT
+/// DOES NOT EXIST.** `sdsc_abstract.rs:5197` records that the per-kv-head block distance *"replaced
+/// `block_index(kvh) = kvh * ROWS` and `request_stride`"*, and the pool's address law states the
+/// consequence outright at `:5169`: *"There is no request term: a request is a set of SLOTS (reached
+/// through the host's page map), never a coordinate the device computes with."*
+///
+/// So the affinity this type checks is a property of the HOST's `page_base_bytes` — a launch-time fact
+/// — and NOT of any stride a matmul could bake. `hd * PAGE_SLOTS`, the number three request-axis
+/// attempts baked believing it was `request_stride`, is MEASURED
+/// (`tests/fold_request_axis_strides.rs`) to be exactly the KV-HEAD stride: a `y` step of one advances
+/// one kv head, so request `r` scored against kv head `r`'s keys — real, well-formed, wrong.
+///
+/// ⛔ WHICH MEANS [`Affine`](LaunchPages::Affine) IS NECESSARY BUT NOT SUFFICIENT for a pool operand.
+/// It says the host CAN reach every row by one stride; it does not give the device an axis to step,
+/// because the law has none. A request axis needs an operand with a UNIFORM PER-REQUEST PITCH, and the
+/// pool is not one — so the collapse is not reachable by picking a better constant for the pool, which
+/// is the move every attempt made. It needs a different operand whose pitch this compiler chooses, and
+/// with it the removal of the absolute per-pass KV base [`fold_delta`] applies as a segment shift: a
+/// read that computes its own address off an already-shifted base composes two bases and lands inside
+/// neither — fluent garbage, no fault. That is one atomic change, and none of it is present today.
+///
+/// Holding still also depends on which POOL ROWS are live: a request's row is its
 /// identity for life, so four requests holding rows 0,1,3,7 have no single stride even though the pool
 /// is perfectly regular. Reading the answer off the installed state is what makes the irregular case
 /// cost correctness nothing: it falls back to [`Table`](LaunchPages::Table), which is exactly today's
