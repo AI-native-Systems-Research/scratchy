@@ -1720,6 +1720,26 @@ pub enum StickKind {
     RowBlocked,
     /// Matmul kernel / K-V cache: `[in, out]` stick-blocked on `out`; row-count `in`, m-independent.
     Kernel,
+    /// ⭐⭐⭐⭐⭐ THE SAME KERNEL, DECLARED `[out, in]` AND STICK-BLOCKED ON `in` — the contraction axis is
+    /// the STICKED one. This is a matmul kernel whose buffer is laid out the other way round, read
+    /// WITHOUT a copy.
+    ///
+    /// ⛔ WHY IT HAD TO EXIST. [`Kernel`](Self::Kernel) hard-codes "rows are K, cols are N, stick on N",
+    /// so the resident Kᵀ plane was the ONLY shape the score matmul could name — and natural K, which
+    /// the cache write produces directly, had to be re-transposed into it. Three planes per page, a
+    /// whole-page restickify, and a third of the KV pool spent on a transpose source. None of that is a
+    /// hardware limit: `dev_off` already addresses BOTH orientations (`[hd,cap]` stick 1 gives Kᵀ's
+    /// `(s/64)·(hd·64) + d·64 + s%64`; `[cap,hd]` stick 1 gives natural K's `s·64 + d`), and this file's
+    /// own `stride_map_disk_order` already reads GEMM weights in their on-disk orientation on the
+    /// strength of "two swapped strides, not a data movement". The vocabulary was the gap: four
+    /// `StickKind`s, none of them this one.
+    ///
+    /// ⛔ AND IT IS NOT `Kernel` WITH THE ARGS SWAPPED. `StickLayout::kernel(k_in, n_out)` puts the
+    /// contraction on `rows` BY CONSTRUCTION, so passing `(cap, hd)` does not transpose the read — it
+    /// tells the matmul to contract over SLOTS and emit `hd` columns. Same shapes, same checks, wrong
+    /// math. The kind is what carries which axis reduces, which is why this is a variant and not an
+    /// argument order.
+    KernelNt,
     /// Per-row reduced scalar (sum / max / recip): one value per row in lane 0 of its own stick.
     RowScalar,
     /// FLAT row-major `[rows, cols]` (stick NOT on the last re-tiled dim) — head-major tensors.
@@ -1829,6 +1849,50 @@ impl StickLayout {
             kind: StickKind::Kernel,
         }
     }
+
+    /// ⭐ A [`KernelNt`](StickKind::KernelNt) kernel: `[out(N), in(K)]` stick-blocked on `in`, i.e. the
+    /// contraction axis is the sticked one. Argument order is `(n_out, k_in)` — the DECLARED order —
+    /// deliberately the mirror of [`kernel`](Self::kernel)'s `(k_in, n_out)`, so a call site reads which
+    /// orientation it asked for instead of which number it happened to put first.
+    ///
+    /// The resident natural-K plane is exactly `kernel_nt(PAGE_SLOTS, hd)`: `dev_off` on
+    /// `[PAGE_SLOTS, hd]` stick 1 is `slot·64 + feat` at `hd == 64`, which is what the cache write
+    /// already produces — see [`StickKind::KernelNt`] for why this is a kind and not swapped arguments.
+    pub fn kernel_nt(n_out: usize, k_in: usize) -> Self {
+        Self::kernel_nt_df(n_out, k_in, Df::Fp16)
+    }
+
+    /// [`kernel_nt`](Self::kernel_nt) with an EXPLICIT device format.
+    pub fn kernel_nt_df(n_out: usize, k_in: usize, df: Df) -> Self {
+        StickLayout {
+            rows: n_out,
+            cols: k_in,
+            df,
+            kind: StickKind::KernelNt,
+        }
+    }
+
+    /// WHICH EXTENT REDUCES — the contraction length, from the KIND rather than from a position.
+    ///
+    /// ⛔ THIS IS THE WHOLE REASON `KernelNt` IS A VARIANT. Every site that wants "the K of this kernel"
+    /// used `rows` because `Kernel` is `[in, out]`; asking here instead means the two orientations can
+    /// share one matmul path without any of those sites guessing from a shape.
+    pub fn contraction_elems(&self) -> Option<usize> {
+        match self.kind {
+            StickKind::Kernel => Some(self.rows),
+            StickKind::KernelNt => Some(self.cols),
+            StickKind::RowBlocked | StickKind::RowScalar | StickKind::Flat => None,
+        }
+    }
+
+    /// WHICH EXTENT IS THE OUTPUT WIDTH — the twin of [`contraction_elems`](Self::contraction_elems).
+    pub fn output_elems(&self) -> Option<usize> {
+        match self.kind {
+            StickKind::Kernel => Some(self.cols),
+            StickKind::KernelNt => Some(self.rows),
+            StickKind::RowBlocked | StickKind::RowScalar | StickKind::Flat => None,
+        }
+    }
     /// A `RowScalar` per-row reduced value for `m` rows (one lane-0 value per row's stick). fp16.
     pub fn row_scalar(m: usize) -> Self {
         StickLayout {
@@ -1866,9 +1930,13 @@ impl StickLayout {
     /// STICK-blocked (its scalar sits at `r*lanes`, the `c==0` stick-block address), NOT row-major.
     pub fn addressing(&self) -> Addressing {
         match self.kind {
-            StickKind::RowBlocked | StickKind::Kernel | StickKind::RowScalar => {
-                Addressing::StickBlocked
-            }
+            // `KernelNt` is stick-blocked like `Kernel` — the difference is WHICH axis reduces, which is
+            // the kind's business and not the addressing's. Both take `dev_off`'s `stick_idx == 1` tiled
+            // branch; the dims they carry are what make one Kᵀ and the other natural K.
+            StickKind::RowBlocked
+            | StickKind::Kernel
+            | StickKind::KernelNt
+            | StickKind::RowScalar => Addressing::StickBlocked,
             StickKind::Flat => Addressing::RowMajor,
         }
     }
