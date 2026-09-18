@@ -228,10 +228,11 @@ impl KtKernelPitch {
 
 /// THE Kᵀ RESTICKIFY TILE'S SLOT EXTENT — how many slots one `assemble_restickify_kt_2d` tile
 /// re-sticks (the natural `[slots, feats]` rows in, the Kᵀ `[feats, slots]` columns out). Exactly
-/// two tiles exist and each is a door: one row window of the NEW block (whose rows ARE its slots —
-/// the [`MqPad`] identity) and a whole page of the resident pool. A feature width has no door, so
-/// the restickify's two extents — previously two adjacent bare `u32`s, both 64 on the sub-block
-/// form — cannot be handed over swapped.
+/// THREE tiles exist and each is a door: one row window of the NEW block (whose rows ARE its slots —
+/// the [`MqPad`] identity), a whole page of the resident pool, and the ONE stick-block a decode
+/// step's single new slot falls in. A feature width has no door, so the restickify's two extents —
+/// previously two adjacent bare `u32`s, both 64 on the sub-block form — cannot be handed over
+/// swapped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KtTileSlots(u32);
 
@@ -244,6 +245,23 @@ impl KtTileSlots {
     /// A whole page of the resident pool — the post-cache-write re-transpose spans every slot.
     pub const fn of_page() -> KtTileSlots {
         KtTileSlots(PagedKvPool::PAGE_SLOTS as u32)
+    }
+
+    /// ⭐ THE ONE STICK-BLOCK A DECODE STEP'S NEW SLOT FALLS IN — the incremental form, and the
+    /// reason [`EmittedOp::slab_write`](crate::emit::EmittedOp::slab_write) exists.
+    ///
+    /// A decode step appends exactly ONE slot, so exactly one of a page's
+    /// `PAGE_SLOTS / STK` stick-blocks has a Kᵀ that is now stale; the other blocks hold this same
+    /// request's earlier keys, already transposed, and K is append-only so nothing invalidates them.
+    /// The op is baked at block 0 and the runtime shifts it onto the live one — which is
+    /// [`slab_delta`], and is why it had to learn to wrap at the page before this door could be used.
+    ///
+    /// ⛔ IT IS NOT A CHEAPER WAY TO SPELL [`of_page`](Self::of_page) — it is only correct for a tile
+    /// whose new slots all land in ONE block. A prefill chunk's `mq_pad` rows span up to a whole
+    /// page, so that path keeps `of_page`, and the emitter picks between them on the ROW COUNT of the
+    /// op rather than on the model.
+    pub const fn of_write_slab() -> KtTileSlots {
+        KtTileSlots(STK as u32)
     }
 
     /// The slot-axis extent of the tile.
@@ -5358,6 +5376,44 @@ impl PagedKvPool {
     /// Element offset of the transposed-K plane — LAST, where `kct` was.
     pub fn kt_plane_base(&self) -> usize {
         2 * self.plane_stride()
+    }
+
+    /// ⭐⭐⭐ THE ONE SEGMENT SHIFT THAT MOVES **BOTH** PLANES ONTO THE NEXT STICK-BLOCK, or `None`
+    /// when no single shift can — the incremental Kᵀ restickify's whole precondition, as an EQUATION.
+    ///
+    /// [`slab_delta`] shifts an op's KV-SEGMENT BASE by one number, and the incremental restickify
+    /// reads natural K and writes Kᵀ *through that one base*. So it is expressible exactly when a
+    /// stick-block of slots is the same distance in both planes — which it is not in general, because
+    /// the two planes stick on opposite axes: Knat advances `STK` slots at `STK` elements each
+    /// (independent of the head dim), while Kᵀ advances one slot-stick group at `hd * STK`.
+    ///
+    /// ⛔ THIS IS WHY THE FORM IS HEAD-DIM-BOUNDED, AND WHY THAT BOUND IS NOT WRITTEN AS `hd == 64`.
+    /// The two agree only where `hd == STK`, so a head-dim test would be a *restatement* of this
+    /// arithmetic at a call site — the thing this file's one-address-law rule exists to prevent, and
+    /// the shape of the `hd > 64` bugs already recorded above (`v_block_base_first`, `WRITE_SLACK`).
+    /// Asking `addr` for both deltas and requiring them EQUAL means a future layout change that made
+    /// them agree at another head dim would enable this form automatically, and one that broke the
+    /// agreement at 64 would disable it — neither needing an edit here.
+    ///
+    /// Returned in ELEMENTS; the caller doubles it for fp16 bytes, as every other stride here does.
+    /// ```
+    /// use ktir_superdsc::sdsc_abstract::*;
+    /// use std::num::NonZeroU32;
+    /// let n = NonZeroU32::new(8).unwrap();
+    /// let h = KvHead::new(0, n).unwrap();
+    /// // hd == STK: one stick-block is 64 slots x 64 elements in BOTH planes.
+    /// assert_eq!(PagedKvPool::new(8, 64).slab_shift_elems(h), Some(64 * 64));
+    /// // hd > STK: Knat still advances 4096, Kt advances hd*64 — no single shift serves both.
+    /// assert_eq!(PagedKvPool::new(8, 128).slab_shift_elems(h), None);
+    /// assert_eq!(PagedKvPool::new(8, 256).slab_shift_elems(h), None);
+    /// ```
+    pub fn slab_shift_elems(&self, kvh: KvHead) -> Option<u32> {
+        let block_on = |plane: KvPlane| {
+            let base = KvCoord::block(plane, kvh);
+            self.addr(base.at_slot(KvSlot::new(STK as u32))) - self.addr(base)
+        };
+        let knat = block_on(KvPlane::Knat);
+        (knat == block_on(KvPlane::Kt)).then_some(knat)
     }
 
     #[allow(dead_code)]

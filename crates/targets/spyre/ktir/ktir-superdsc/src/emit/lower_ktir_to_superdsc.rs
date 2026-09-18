@@ -2695,25 +2695,55 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         } else {
             String::new()
         };
-        // WHOLE-PAGE re-transpose, structurally the proven full-`cap` form with the page (equal to
-        // that cap) substituted — NOT the slab-granular variant, whose on-card attempt regressed
-        // decode. Source and destination take the identical `layer + page` shift, which is why
-        // natural K lives in the page rather than a segment of its own.
+        // ⭐⭐⭐ ONE STICK-BLOCK WHEN THE OP APPENDS ONE SLOT, THE WHOLE PAGE OTHERWISE.
+        //
+        // A decode op covers exactly ONE new slot — `mq == 1` solo, or one op per request when the
+        // rows ARE requests — so exactly one of the page's `PAGE_SLOTS / STK` stick-blocks has a Kᵀ
+        // that this step invalidated. The others hold this same request's earlier keys, already
+        // transposed, and K is append-only within a page so nothing invalidates them. The op is baked
+        // at block 0 and the runtime shifts it onto the live one ([`slab_delta`]). A PREFILL chunk's op
+        // covers `mq` rows spanning up to a whole page, so it keeps the page-wide form.
+        //
+        // THE TEST IS THE OP'S ROW COUNT — the same quantity the cache writes above split `heads_on_y`
+        // on — not the model, not the bundle's name, and not a head dim.
+        //
+        // ⛔ AND THE POOL DECIDES WHETHER ONE SHIFT CAN EXPRESS IT AT ALL. `slab_delta` moves the op's
+        // KV-segment base by ONE number and this op reads natural K and writes Kᵀ through it, so the
+        // form exists only where a stick-block is the same distance in both planes.
+        // [`PagedKvPool::slab_shift_elems`] asks `addr` for both deltas and answers `None` when they
+        // disagree — every `hd > STK` — and this falls back to the page form. See that function for
+        // why the bound is an equation here and not `hd == 64`.
+        //
+        // 🛑 THE EARLIER ON-CARD ATTEMPT AT THIS REGRESSED DECODE, and the runtime defect that would
+        // explain it was fixed separately and FIRST: `slab_delta` never wrapped its slab index by the
+        // page, so past slot 255 it selected a block of no page at all. That wrap is now in place with
+        // a boundary test (`the_slab_shift_wraps_at_the_page`), which is the precondition this door
+        // needed — but the earlier measurement was taken without it, so the regression is UNEXPLAINED
+        // rather than refuted, and this form is gated on the card before it is believed.
+        let head = kv_head_of(kvh, nkvh)?;
+        let one_slot_per_op = per_request || mq == 1;
+        let slab_shift = one_slot_per_op
+            .then(|| pool.slab_shift_elems(head))
+            .flatten();
         ops.push(assemble_restickify_kt_2d(
             &format!("attn_kctpost{kvh}{rq}_o{t}"),
-            crate::sdsc_abstract::KtTileSlots::of_page(),
+            match slab_shift {
+                Some(_) => crate::sdsc_abstract::KtTileSlots::of_write_slab(),
+                None => crate::sdsc_abstract::KtTileSlots::of_page(),
+            },
             crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
             &kc,
             // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
-            // the same `(kv head)` block of the page the launch was shifted to.
+            // the same `(kv head)` block of the page the launch was shifted to. BOTH are baked at
+            // stick-block 0 of that block, which is what makes one shift able to move the pair.
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Knat,
-                kv_head_of(kvh, nkvh)?,
+                head,
             ))),
             &kct,
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Kt,
-                kv_head_of(kvh, nkvh)?,
+                head,
             ))),
             sym_id_base,
             layout,
@@ -2723,6 +2753,14 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // thing that tells the runtime which page that is.
         if let Some(o) = ops.last_mut() {
             o.kv_request = req;
+            if let Some(elems) = slab_shift {
+                o.slab_stride_bytes = elems * 2;
+                // ⛔ DECLARING THE PAGE IS NOT OPTIONAL HERE. `slab_delta` wraps the block index by
+                // THIS field, and an op that leaves it 0 keeps the unwrapped arithmetic — correct only
+                // inside a request's first page, and past slot 255 a block of no page at all. Opting
+                // into the incremental form and declaring the page are one act.
+                o.kv_page_slots = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+            }
         }
     }
 
