@@ -9,6 +9,10 @@
 //!     decomposition) opspec builders: `matmul_opspec`, `matmul_opspec_off`, `matmul_opspec_split`,
 //!     `matmul_opspec_batched`.
 //!   - [`assemble`] — the `assemble_matmul*` wrappers (opspec + `emit_sdsc_tiled`).
+//!   - [`ktrips`] — the ONE-NODE-PER-K-TRIP decomposition: a contraction whose per-core LX residency
+//!     does not fit even `out`-tiled to one stick becomes several whole matmuls over K-windows plus
+//!     explicit adds, instead of the reduction-CORE split that did not map for that shape. The only
+//!     DECOMPOSING member of this family, which is why it is its own file.
 //!   - [`walk`] — the NAMED walk axes (`MbAxis`/`YAxis`/`InAxis`/`OutAxis`), the sealed
 //!     [`walk::Walk2`]/[`walk::Walk3`] declared-walk constructors, each named for the stride
 //!     assignment its axis order encodes, and the sealed rung regimes ([`walk::RungRegime`])
@@ -16,6 +20,7 @@
 
 pub mod assemble;
 pub mod dims;
+pub mod ktrips;
 pub mod opspec;
 pub(crate) mod walk;
 
@@ -30,6 +35,7 @@ pub use opspec::{
     matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
     matmul_opspec_off_operands, matmul_opspec_off_operands_phys, matmul_opspec_split,
 };
+pub use ktrips::{KTripPlan, plan_k_trips, try_assemble_matmul_k_trips};
 pub use walk::SharedKernelBmmForm;
 
 pub use dims::set_split_mb_forbidden;

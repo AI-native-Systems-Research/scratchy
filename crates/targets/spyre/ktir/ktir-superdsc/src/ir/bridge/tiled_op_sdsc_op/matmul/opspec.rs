@@ -145,6 +145,8 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
         o_off,
         operand_df,
         phys_mb.map(PhysM::get),
+        // No K-trip: every typed door contracts the weight's whole reduction axis.
+        None,
         form,
         // The strides ride ON the batch axis, so they arrive here already paired with the `y` extent
         // they describe — there is no slot for a caller to fill one without the other.
@@ -179,6 +181,19 @@ pub fn matmul_opspec_split<DF: DataFormat, S>(
     // the work and `phys_mb` naming the tensor's own plane depth, or every head but the first is
     // addressed the wrong distance in.
     phys_mb: Option<u32>,
+    // ⭐ THE KERNEL'S TRUE PHYSICAL `in` EXTENT when this op contracts only PART of the weight's
+    // reduction axis — ONE K TRIP of a K-trip decomposition (see `super::ktrips`). `None` (every
+    // caller before that decomposition) means "the weight is exactly as deep as this op contracts".
+    //
+    // The shared 2-D kernel walk is `[in, out]` stick `out`, whose address law is
+    // `(n/stk)·(in·stk) + k·stk + (n%stk)` (`sdsc_abstract::dev_off_stk`, rank-2 stick-on-last), so
+    // the `out` stick-GROUP stride is `in·stk` — the FULL weight depth. A trip that sweeps `k/T` and
+    // leaves `in` at the swept extent therefore strides every `out` core `T`× too close and reads
+    // another trip's slab: correct for out-core 0 and wrong for all 31 others, which is a fluent
+    // wrong answer rather than a fault. `with_device_extent` is exactly the "iterate a window,
+    // address the allocation" declaration (`DeviceExtents::of_view`: a declared extent WINS), and
+    // `w_off = k0·stk` then places the trip inside that allocation.
+    kernel_phys_in: Option<u32>,
     // WHICH walk pair the batch>1 arm declares — see [`SharedKernelBmmForm`]. The live callers pick
     // the splitter from this same value (`matmul_split_map_for`); the Kani seam injects its own
     // splitter and states the proven form.
@@ -277,6 +292,23 @@ where
     )
     .map_err(|e| e.0)?
     .with_offset(w_off);
+    // The K-trip window (see `kernel_phys_in`). A phys SMALLER than the swept extent is not a
+    // window but a mis-declaration — the walk would describe less memory than the op reads — so it
+    // is refused here, the SAME rule `matmul_opspec_batched_off` enforces for its `y` override.
+    let kernel = match kernel_phys_in {
+        Some(phys) => {
+            let swept = plan.extent(InAxis::NAME);
+            if phys < swept {
+                return Err(format!(
+                    "matmul_opspec '{w_name}': kernel device_extent in={phys} is SMALLER than the \
+                     swept `in` {swept}. device_extent declares a window into a LARGER allocation \
+                     (phys >= iteration); a smaller value cannot be expressed this way."
+                ));
+            }
+            kernel.with_device_extent(InAxis::NAME, phys).map_err(|e| e.0)?
+        }
+        None => kernel,
+    };
 
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     // INPUT/OUTPUT rank tracks the op: a PLAIN 2-D matmul (batch==1) is [mb,in]/[mb,out] (opFuncName
