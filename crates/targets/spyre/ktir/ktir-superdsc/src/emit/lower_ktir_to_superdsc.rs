@@ -790,8 +790,10 @@ fn elementwise_broadcast(
     }
     // The handles, at each operand's OWN extent: a sprayed operand is the vector it really is, so its
     // `Stk` states `[m, 1]` / `[1, n]` and the `In` builder says which way it sprays.
-    let handles: Vec<crate::sdsc_abstract::Stk<crate::sdsc_abstract::RowBlockedTag>> =
-        ins.iter().map(|x| rb(&x.name(), x.v_rows, x.c_len)).collect();
+    let handles: Vec<crate::sdsc_abstract::Stk<crate::sdsc_abstract::RowBlockedTag>> = ins
+        .iter()
+        .map(|x| rb(&x.name(), x.v_rows, x.c_len))
+        .collect();
     let ew: Vec<crate::emit::EwOperand<'_>> = handles
         .iter()
         .zip(bcast.iter())
@@ -859,10 +861,25 @@ pub fn elementwise(
     // `whole_function::program_broadcast_chains`), so the two cannot drift apart.
     let bcast: Vec<(bool, bool)> = ins
         .iter()
-        .map(|x| (x.v_rows == 1 && out.v_rows > 1, x.c_len == 1 && out.c_len > 1))
+        .map(|x| {
+            (
+                x.v_rows == 1 && out.v_rows > 1,
+                x.c_len == 1 && out.c_len > 1,
+            )
+        })
         .collect();
     if bcast.iter().any(|&(mb, col)| mb || col) {
-        return elementwise_broadcast(name, kind, op_func, arity, &ins, &out, &bcast, sym_id_base, layout);
+        return elementwise_broadcast(
+            name,
+            kind,
+            op_func,
+            arity,
+            &ins,
+            &out,
+            &bcast,
+            sym_id_base,
+            layout,
+        );
     }
     pointwise_extents_agree(name, kind, &ins, &out)?;
     // ⛔ THIS COMMENT USED TO SAY `assemble_pointwise` EMITS THE SFP POLYNOMIAL TABLE "via
@@ -3556,9 +3573,11 @@ pub fn matmul(
     // whose plan does NOT split the reduction axis across cores. So `trips == 1` — every shape that
     // bakes today — falls straight through to the single-node assembler below, byte-identically,
     // because it measurably fits and not because a shape comparison spared it.
-    let trips = crate::ir::bridge::tiled_op_sdsc_op::matmul::ktrips::plan_k_trips_dense(m, n_dev, k).map_err(|message| Error {
-        message: format!("MatmulTile t{}: {message}", out.tid),
-    })?;
+    let trips =
+        crate::ir::bridge::tiled_op_sdsc_op::matmul::ktrips::plan_k_trips_dense(m, n_dev, k)
+            .map_err(|message| Error {
+                message: format!("MatmulTile t{}: {message}", out.tid),
+            })?;
     if trips.trips() > 1 {
         return crate::ir::bridge::tiled_op_sdsc_op::matmul::ktrips::try_assemble_matmul_k_trips(
             &op_name,
@@ -3678,7 +3697,9 @@ mod matmul_b_framing_tests {
     fn a_plain_b_k_by_n_region_is_contracted_in_place() {
         let json = one_descriptor(BOrient::PlainB, K, N);
         assert!(
-            json.contains("\"KERNEL\":{\"layoutDimOrder_\":[\"in\",\"out\"],\"stickDimOrder_\":[\"out\"]"),
+            json.contains(
+                "\"KERNEL\":{\"layoutDimOrder_\":[\"in\",\"out\"],\"stickDimOrder_\":[\"out\"]"
+            ),
             "the kernel slot is in-rows/out-sticked; got {json}"
         );
         assert!(
@@ -3763,7 +3784,12 @@ mod matmul_b_framing_tests {
         let mut q = std::collections::HashSet::new();
         let mut w = reg(2, N, K, false);
         w.is_fp8 = true;
-        let parms = vec![reg(1, M, K, false), w, reg(4, N, 1, false), reg(3, M, N, true)];
+        let parms = vec![
+            reg(1, M, K, false),
+            w,
+            reg(4, N, 1, false),
+            reg(3, M, N, true),
+        ];
         let e = match matmul("probe", &parms, &mut sid, None, &mut q, BOrient::PlainB) {
             Ok(ops) => panic!("expected a refusal, {} descriptor(s) emitted", ops.len()),
             Err(e) => e.message,
@@ -3774,7 +3800,6 @@ mod matmul_b_framing_tests {
         );
     }
 }
-
 
 /// A BARE ROW REDUCTION — `[rows, cols]` → `[rows, 1]`, one `sfp` op along the stick axis.
 ///
@@ -4354,9 +4379,14 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None)
-            .expect("a `[1, D]` bias under a `[m, D]` output is an mb-broadcast, which `In::mb` states");
-        assert_eq!(ops.len(), 1, "one pointwise op — the broadcast is an operand mode, not a node");
+        let ops = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None).expect(
+            "a `[1, D]` bias under a `[m, D]` output is an mb-broadcast, which `In::mb` states",
+        );
+        assert_eq!(
+            ops.len(),
+            1,
+            "one pointwise op — the broadcast is an operand mode, not a node"
+        );
         assert_eq!(ops[0].op_name, "add_o7");
     }
 
@@ -4510,7 +4540,11 @@ mod elementwise_tests {
         let mut sym = 0i64;
         let ops = elementwise("silu_s3", Elementwise::Silu, &r, &mut sym, None)
             .expect("a `[1, 128]` unary input under a `[4, 128]` output is an mb-broadcast");
-        assert_eq!(ops.len(), 1, "one pointwise op — the broadcast is an operand mode");
+        assert_eq!(
+            ops.len(),
+            1,
+            "one pointwise op — the broadcast is an operand mode"
+        );
     }
 
     /// ⭐ THE UNLOCK: a NON-broadcasting subtract — both operands at the output's extent — now

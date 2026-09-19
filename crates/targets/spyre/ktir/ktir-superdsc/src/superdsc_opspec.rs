@@ -2102,7 +2102,11 @@ impl OpSpec {
                 self.iter.split_of(d.name)
             )));
         }
-        if self.args.iter().any(|a| matches!(a.view().role, Role::KernelIdx)) {
+        if self
+            .args
+            .iter()
+            .any(|a| matches!(a.view().role, Role::KernelIdx))
+        {
             return Err(SuperDscError(format!(
                 "attach_indirect_index '{index_name}': this op already carries an index operand. \
                  `computeOp_.indirectAccessIndexLabeledDs` is a list, but no shipped input has more \

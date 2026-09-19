@@ -381,7 +381,10 @@ pub fn distribute_cores_transpose_blocks(
                 None => true,
                 Some((bc, bm, bo)) => {
                     (cores, std::cmp::Reverse(skew))
-                        > (bc, std::cmp::Reverse((mb.size / bm).abs_diff(out.size / bo)))
+                        > (
+                            bc,
+                            std::cmp::Reverse((mb.size / bm).abs_diff(out.size / bo)),
+                        )
                 }
             };
             if better {

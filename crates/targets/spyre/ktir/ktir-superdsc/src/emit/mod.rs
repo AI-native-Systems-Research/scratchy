@@ -261,26 +261,26 @@ fn per_core_addr(
     if matches!(view.role, Role::KernelIdx) {
         // fall through to the address fold with no stick witness
     } else {
-    match view.df {
-        Df::Fp8 | Df::SenInt8 => {
-            DeviceTileLayout::<Fp8>::new(layout, view.stick, &host_size)?;
-        }
-        Df::Fp32 => {
-            DeviceTileLayout::<Fp32>::new(layout, view.stick, &host_size)?;
-        }
-        Df::Fp16 | Df::Bf16 => {
-            DeviceTileLayout::<Fp16>::new(layout, view.stick, &host_size)?;
-        }
-        Df::Uint32 => {
-            return Err(SuperDscError(format!(
-                "a `Df::Uint32` operand reached the stick witness at role {:?}. SENUINT32 is the \
+        match view.df {
+            Df::Fp8 | Df::SenInt8 => {
+                DeviceTileLayout::<Fp8>::new(layout, view.stick, &host_size)?;
+            }
+            Df::Fp32 => {
+                DeviceTileLayout::<Fp32>::new(layout, view.stick, &host_size)?;
+            }
+            Df::Fp16 | Df::Bf16 => {
+                DeviceTileLayout::<Fp16>::new(layout, view.stick, &host_size)?;
+            }
+            Df::Uint32 => {
+                return Err(SuperDscError(format!(
+                    "a `Df::Uint32` operand reached the stick witness at role {:?}. SENUINT32 is the \
                  index format of a GATHER and nothing else, so it belongs to a `Role::KernelIdx` \
                  operand — which takes the arm above. A compute operand declaring it is a dtype \
                  mix-up, not a residency this emitter has.",
-                view.role
-            )));
+                    view.role
+                )));
+            }
         }
-    }
     }
 
     // The per-core start flows through [`view_stick_layout`] — the SAME classifier `emit_sdsc` declares to
@@ -3202,9 +3202,12 @@ mod transpose_tests {
     /// stick.
     #[test]
     fn the_decoders_own_transpose_shape_divides_and_the_stick_axis_caps_the_cores() {
-        let spec =
-            transpose_opspec(64, 128, "t1", "t2").expect("the shape both decoders need");
-        assert_eq!(spec.iter.per_core_extent("mb"), 8, "8 rows = one whole block");
+        let spec = transpose_opspec(64, 128, "t1", "t2").expect("the shape both decoders need");
+        assert_eq!(
+            spec.iter.per_core_extent("mb"),
+            8,
+            "8 rows = one whole block"
+        );
         assert_eq!(
             spec.iter.per_core_extent("out"),
             64,
@@ -3489,7 +3492,11 @@ mod transpose_tests {
     fn the_decoders_transpose_shape_lowers_through_the_entry_point() {
         let ops = lower_transpose(&transpose_program((64, 128), (128, 64)))
             .expect("`[64, 128]` -> `[128, 64]` is the decoder's `tl.dot(p, v)` operand");
-        assert_eq!(ops.len(), 1, "one `interslicetranspose_fp16`, not a decomposition");
+        assert_eq!(
+            ops.len(),
+            1,
+            "one `interslicetranspose_fp16`, not a decomposition"
+        );
     }
 
     /// ⛔⛔⛔ THE SEAL IS UNREACHABLE BY CONSTRUCTION, AND THAT IS WHAT IS ASSERTED — not that it was
@@ -3533,8 +3540,11 @@ mod transpose_tests {
                 }
             }
         }
-        assert_eq!(checked, 256, "the sweep must cover every stick-aligned shape in its range, or it \
-             proves nothing about the composition of the two guards");
+        assert_eq!(
+            checked, 256,
+            "the sweep must cover every stick-aligned shape in its range, or it \
+             proves nothing about the composition of the two guards"
+        );
     }
 
     // ── (iii) the byte-identity control ──────────────────────────────────────────────────────────
@@ -4493,9 +4503,27 @@ mod indirect_access_baseline {
         TileOp {
             kind: TileOpKind::PointwiseOrReduce { n_operands: 2 },
             dims: vec![
-                ItDim { name: "mb", size: rows, is_reduction: false, is_stick: false, df: Df::Fp16 },
-                ItDim { name: "out", size: cols, is_reduction: false, is_stick: true, df: Df::Fp16 },
-                ItDim { name: "y", size: 1, is_reduction: false, is_stick: false, df: Df::Fp16 },
+                ItDim {
+                    name: "mb",
+                    size: rows,
+                    is_reduction: false,
+                    is_stick: false,
+                    df: Df::Fp16,
+                },
+                ItDim {
+                    name: "out",
+                    size: cols,
+                    is_reduction: false,
+                    is_stick: true,
+                    df: Df::Fp16,
+                },
+                ItDim {
+                    name: "y",
+                    size: 1,
+                    is_reduction: false,
+                    is_stick: false,
+                    df: Df::Fp16,
+                },
             ],
             df: Df::Fp16,
         }
@@ -4735,13 +4763,23 @@ mod indirect_access_baseline {
             .iter()
             .find(|l| l.dsType_ == "KERNEL_IDX")
             .expect("a KERNEL_IDX labeledDs");
-        assert_eq!(idx.ldsIdx_, 1, "the index sits immediately after its gathered operand");
+        assert_eq!(
+            idx.ldsIdx_, 1,
+            "the index sits immediately after its gathered operand"
+        );
         assert_eq!(idx.wordLength, 4, "SENUINT32 is 4 bytes");
         assert_eq!(idx.dataFormat_, "SENUINT32");
-        assert_eq!(idx.scale_, vec![1], "every entry 1 — GatherIndexConversion.cpp:135");
+        assert_eq!(
+            idx.scale_,
+            vec![1],
+            "every entry 1 — GatherIndexConversion.cpp:135"
+        );
         // hbm ONLY: the shipped file gives its index vector no `lx` entry.
         let idx_mem = serde_json::to_string(&idx.memOrg_).expect("memOrg serializes");
-        assert_eq!(idx_mem, r#"{"hbm":{"isPresent":1}}"#, "index residency is HBM alone");
+        assert_eq!(
+            idx_mem, r#"{"hbm":{"isPresent":1}}"#,
+            "index residency is HBM alone"
+        );
 
         // (ii) its layout class, verbatim from the shipped file: ONE dim, sticked on it, at 32.
         let cls = dsc
@@ -4750,11 +4788,18 @@ mod indirect_access_baseline {
             .expect("a KERNEL_IDX layout class");
         assert_eq!(cls.layoutDimOrder_, vec!["mb"]);
         assert_eq!(cls.stickDimOrder_, vec!["mb"]);
-        assert_eq!(cls.stickSize_, vec![32], "NOT 64 — the index stick is 32 elements");
+        assert_eq!(
+            cls.stickSize_,
+            vec![32],
+            "NOT 64 — the index stick is 32 elements"
+        );
 
         // (iii) the index is named in `indirectAccessIndexLabeledDs` and in NEITHER other list.
         let c = &dsc.computeOp_[0];
-        assert_eq!(c.indirectAccessIndexLabeledDs, vec!["Tensor1-idx1".to_string()]);
+        assert_eq!(
+            c.indirectAccessIndexLabeledDs,
+            vec!["Tensor1-idx1".to_string()]
+        );
         assert!(
             !c.inputLabeledDs.contains(&"Tensor1-idx1".to_string()),
             "the index is not an input the op computes with"
@@ -4772,11 +4817,24 @@ mod indirect_access_baseline {
         let iv = node("allocate-Tensor1_hbm");
         let vv = node("allocate-Tensor0_hbm");
         assert_eq!(iv.indirectAllocType_, "index_tensor");
-        assert_eq!(iv.indexTensorType_, Some("index"), "RAW indices, pre-conversion");
-        assert_eq!(iv.relatedIndirectAccessAlloc_.as_deref(), Some("allocate-Tensor0_hbm"));
+        assert_eq!(
+            iv.indexTensorType_,
+            Some("index"),
+            "RAW indices, pre-conversion"
+        );
+        assert_eq!(
+            iv.relatedIndirectAccessAlloc_.as_deref(),
+            Some("allocate-Tensor0_hbm")
+        );
         assert_eq!(vv.indirectAllocType_, "value_tensor");
-        assert_eq!(vv.indexTensorType_, None, "only an index tensor carries one");
-        assert_eq!(vv.relatedIndirectAccessAlloc_.as_deref(), Some("allocate-Tensor1_hbm"));
+        assert_eq!(
+            vv.indexTensorType_, None,
+            "only an index tensor carries one"
+        );
+        assert_eq!(
+            vv.relatedIndirectAccessAlloc_.as_deref(),
+            Some("allocate-Tensor1_hbm")
+        );
 
         // (v) the VALUE tensor's walk pins the gathered axis to 1 and the index's reconstructs — the two
         // `maxDimSizes_` the shipped file carries, and the pin is what makes `skip_addr_sticks` one row.
@@ -4843,5 +4901,4 @@ mod indirect_access_baseline {
             e.0
         );
     }
-
 }

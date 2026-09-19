@@ -167,12 +167,14 @@ pub fn matmul_b_orientation(
     // d2), C row-major.
     let is_transpose_b = maps.is_some_and(|m| {
         m.len() == 3
-            && m.iter().zip([[0usize, 2], [1, 2], [0, 1]]).all(|(got, want)| {
-                got.exprs.len() == 2
-                    && got.exprs.iter().zip(want).all(|(e, d)| {
-                        matches!(e, ktir_core::affine::AffineExpr::Dim(i) if *i == d)
-                    })
-            })
+            && m.iter()
+                .zip([[0usize, 2], [1, 2], [0, 1]])
+                .all(|(got, want)| {
+                    got.exprs.len() == 2
+                        && got.exprs.iter().zip(want).all(
+                            |(e, d)| matches!(e, ktir_core::affine::AffineExpr::Dim(i) if *i == d),
+                        )
+                })
     });
     if is_transpose_b {
         return Ok(BOrient::TransposeB);
@@ -182,12 +184,14 @@ pub fn matmul_b_orientation(
     // producer that omits `indexing_maps` entirely is stating the same default.
     let is_plain_b = maps.is_none_or(|m| {
         m.len() == 3
-            && m.iter().zip([[0usize, 2], [2, 1], [0, 1]]).all(|(got, want)| {
-                got.exprs.len() == 2
-                    && got.exprs.iter().zip(want).all(|(e, d)| {
-                        matches!(e, ktir_core::affine::AffineExpr::Dim(i) if *i == d)
-                    })
-            })
+            && m.iter()
+                .zip([[0usize, 2], [2, 1], [0, 1]])
+                .all(|(got, want)| {
+                    got.exprs.len() == 2
+                        && got.exprs.iter().zip(want).all(
+                            |(e, d)| matches!(e, ktir_core::affine::AffineExpr::Dim(i) if *i == d),
+                        )
+                })
     });
     if is_plain_b {
         return Ok(BOrient::PlainB);
@@ -337,7 +341,11 @@ pub struct RmsNormChain {
 /// One chain per `math.rsqrt`. An empty `Vec` means the program states none.
 pub fn program_rmsnorm_chains(f: &IRFunction<'static>) -> Result<Vec<RmsNormChain>, Error> {
     let mut out = Vec::new();
-    for root in f.operations.iter().filter(|o| o.op_type == OpKind::MathRsqrt) {
+    for root in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::MathRsqrt)
+    {
         if let Some(c) = rmsnorm_chain_from(f, root)? {
             out.push(c);
         }
@@ -393,7 +401,9 @@ fn rmsnorm_chain_from(
         return Ok(None);
     };
     // `ms = <reduce> · INV_D`.
-    let Some(scale) = def_of(ms) else { return Ok(None) };
+    let Some(scale) = def_of(ms) else {
+        return Ok(None);
+    };
     if scale.op_type != OpKind::ArithMulf {
         return Ok(None);
     }
@@ -410,7 +420,9 @@ fn rmsnorm_chain_from(
     }) else {
         return Ok(None);
     };
-    let Some(red) = def_of(red_v) else { return Ok(None) };
+    let Some(red) = def_of(red_v) else {
+        return Ok(None);
+    };
     if red.op_type != OpKind::LinalgReduce {
         return Ok(None);
     }
@@ -472,7 +484,9 @@ fn rmsnorm_chain_from(
     // states none of them.
     let mut cursor = root_v;
     for _ in 0..3 {
-        let Some(next) = sole_reader(cursor) else { break };
+        let Some(next) = sole_reader(cursor) else {
+            break;
+        };
         if !matches!(
             next.op_type,
             OpKind::TensorExpandShape | OpKind::TensorCollapseShape | OpKind::LinalgBroadcast
@@ -499,11 +513,18 @@ fn rmsnorm_chain_from(
              reciprocal is a different function.",
             f.name,
             scale_mul.op_type,
-            if scale_mul.operands.contains(&x) { "reads" } else { "does NOT read" }
+            if scale_mul.operands.contains(&x) {
+                "reads"
+            } else {
+                "does NOT read"
+            }
         ));
     }
     let Some(scaled) = scale_mul.result else {
-        return err(format!("{}: the rmsnorm's normalising multiply has no result", f.name));
+        return err(format!(
+            "{}: the rmsnorm's normalising multiply has no result",
+            f.name
+        ));
     };
     consumed.push(scaled);
     // `· gamma` — the learned gain, itself reached through its own rank plumbing.
@@ -521,7 +542,10 @@ fn rmsnorm_chain_from(
         ));
     }
     let Some(gain_src) = gain_mul.operands.iter().copied().find(|&s| s != scaled) else {
-        return err(format!("{}: the rmsnorm's gain multiply squares its input", f.name));
+        return err(format!(
+            "{}: the rmsnorm's gain multiply squares its input",
+            f.name
+        ));
     };
     // Walk BACK through the gain's rank plumbing to the value a `Region` can be found for.
     let mut gamma = gain_src;
@@ -534,11 +558,16 @@ fn rmsnorm_chain_from(
             break;
         }
         consumed.push(gamma);
-        let Some(src) = d.operands.first().copied() else { break };
+        let Some(src) = d.operands.first().copied() else {
+            break;
+        };
         gamma = src;
     }
     let Some(out) = gain_mul.result else {
-        return err(format!("{}: the rmsnorm's gain multiply has no result", f.name));
+        return err(format!(
+            "{}: the rmsnorm's gain multiply has no result",
+            f.name
+        ));
     };
 
     // ⛔ THE DIVISOR IS `1/cols` FOR THIS TILE, CHECKED NUMERICALLY. `mean` is `sum/N`; a multiplier
@@ -594,7 +623,11 @@ fn rmsnorm_chain_from(
 /// `Elementwise` variant when the real answer is that a silu is mis-shaped.
 pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulChain>, Error> {
     let mut out = Vec::new();
-    for neg in f.operations.iter().filter(|o| o.op_type == OpKind::ArithNegf) {
+    for neg in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::ArithNegf)
+    {
         out.push(silu_mul_chain_from(f, neg)?);
     }
     Ok(out)
@@ -633,13 +666,16 @@ fn silu_mul_chain_from(
     // straight-line producer, where `ops_deep()` and `operations` are the same list.
     let deep = f.ops_deep();
     let readers = |v: Ssa| {
-        deep.iter().copied().filter(move |o: &&ktir_core::ir::Operation<'static>| {
-            o.operands.contains(&v)
-        })
+        deep.iter()
+            .copied()
+            .filter(move |o: &&ktir_core::ir::Operation<'static>| o.operands.contains(&v))
     };
 
     let (Some(gate), Some(neg_v)) = (neg.operands.first().copied(), neg.result) else {
-        return err(format!("{}: `arith.negf` with no operand or no result", f.name));
+        return err(format!(
+            "{}: `arith.negf` with no operand or no result",
+            f.name
+        ));
     };
 
     // ONE LINK OF THE CHAIN: the single op of kind `want` that reads `v`, or a refusal saying WHICH
@@ -649,7 +685,10 @@ fn silu_mul_chain_from(
     //
     // ⛔ MORE THAN ONE READER IS A REFUSAL, NOT A DETAIL. The fusion DESTROYS `v`, so a second reader
     // is a consumer of a value the device primitive never materialises.
-    let link = |v: Ssa, want: OpKind, what: &str| -> Result<&ktir_core::ir::Operation<'static>, Error> {
+    let link = |v: Ssa,
+                want: OpKind,
+                what: &str|
+     -> Result<&ktir_core::ir::Operation<'static>, Error> {
         let found: Vec<_> = readers(v).collect();
         match found.len() {
             0 => err(format!(
@@ -666,7 +705,11 @@ fn silu_mul_chain_from(
                  `OpFunc::Silu` never materialises the longhand's intermediates, so a second reader \
                  would be reading a value nothing writes. Exactly one reader, `{:?}`, is required.",
                 f.name,
-                found.iter().map(|o| format!("{:?}", o.op_type)).collect::<Vec<_>>().join(", "),
+                found
+                    .iter()
+                    .map(|o| format!("{:?}", o.op_type))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 want
             )),
         }
@@ -689,8 +732,10 @@ fn silu_mul_chain_from(
         .filter_map(|&s| splat_value(s))
         .next();
     match one {
-        Some(v) if v == 1.0 => {}
-        Some(v) => {
+        // Spelled as an inequality rather than `Some(v) if v == 1.0 => {}` plus a catch-all: a
+        // float LITERAL PATTERN is a lint of its own, and this way the refusal keeps `v` to name
+        // the constant the program actually states.
+        Some(v) if v != 1.0 => {
             return err(format!(
                 "{}: the silu longhand's `arith.addf` adds {v}, not 1.0. `sigmoid(x)` is \
                  `1/(1+e^-x)`, so any other constant is a DIFFERENT function and lowering it as \
@@ -698,6 +743,7 @@ fn silu_mul_chain_from(
                 f.name
             ));
         }
+        Some(_) => {}
         None => {
             return err(format!(
                 "{}: the silu longhand's `arith.addf` adds a value that is not a splatted \
@@ -820,7 +866,10 @@ enum Lowering {
 /// * BOTH are splats — a multiply of two compile-time constants. That is not a scalarmul (there is no
 ///   tensor to scale) and emitting one would invent an operand; it belongs to constant folding
 ///   upstream, so it falls through to be refused by name.
-pub fn splat_scale_of(f: &IRFunction<'static>, op: &ktir_core::ir::Operation<'static>) -> Option<(f32, Ssa)> {
+pub fn splat_scale_of(
+    f: &IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Option<(f32, Ssa)> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     // A splatted compile-time FLOAT. `arith.constant` → `tensor.splat` is the only spelling this
     // crate's producers use, and it is the one `program_scalarmul_scale` already reads.
@@ -972,12 +1021,22 @@ struct Bcast {
 /// broadcast this door understands.
 fn program_broadcast_chains(
     f: &IRFunction<'static>,
-) -> Result<(std::collections::HashMap<Ssa, Bcast>, std::collections::HashSet<Ssa>), Error> {
+) -> Result<
+    (
+        std::collections::HashMap<Ssa, Bcast>,
+        std::collections::HashSet<Ssa>,
+    ),
+    Error,
+> {
     let mut map: std::collections::HashMap<Ssa, Bcast> = std::collections::HashMap::new();
     let mut consumed: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
     let deep = f.ops_deep();
     let def_of = |v: Ssa| deep.iter().copied().find(|o| o.result == Some(v));
-    for bc in deep.iter().copied().filter(|o| o.op_type == OpKind::LinalgBroadcast) {
+    for bc in deep
+        .iter()
+        .copied()
+        .filter(|o| o.op_type == OpKind::LinalgBroadcast)
+    {
         let Some(res) = bc.result else { continue };
         // The AXIS AS THE BROADCAST ITSELF STATES IT — `Dimensions` names the dim(s) being ADDED, so
         // `[1]` sprays along the trailing (stick) axis and `[0]` down the rows. Exactly one dim, because
@@ -1013,7 +1072,10 @@ fn program_broadcast_chains(
         // SAME depth `program_rmsnorm_chains` walks. The `tensor.empty` second operand is the
         // broadcast's `outs` init and carries no data, so only operand 0 is followed.
         let Some(mut cursor) = bc.operands.first().copied() else {
-            return err(format!("{}: `linalg.broadcast` has no source operand", f.name));
+            return err(format!(
+                "{}: `linalg.broadcast` has no source operand",
+                f.name
+            ));
         };
         let mut chain = vec![res];
         let mut saw_degenerate_expand = false;
@@ -1065,7 +1127,9 @@ fn program_broadcast_chains(
                 _ => break,
             }
             chain.push(cursor);
-            let Some(next) = d.operands.first().copied() else { break };
+            let Some(next) = d.operands.first().copied() else {
+                break;
+            };
             cursor = next;
         }
         if !saw_degenerate_expand {
@@ -1110,11 +1174,13 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
     // this value reads and reuse that Region, rather than rebuilding one field by field and
     // risking a different answer from the same IR.
     let f = &k.func;
-    let load = f.operations.iter().find(|o| o.result == Some(v) && o.op_type == OpKind::KtdpLoad);
+    let load = f
+        .operations
+        .iter()
+        .find(|o| o.result == Some(v) && o.op_type == OpKind::KtdpLoad);
     let Some(load) = load else { return Ok(None) };
     let tile_v = load.operands.first().copied();
-    if f
-        .operations
+    if f.operations
         .iter()
         .any(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
     {
@@ -1192,7 +1258,12 @@ pub fn lower_function(
     // ⛔ THE TID MUST NOT COLLIDE WITH A PARAMETER'S. `act_name(tid)` is the operand name and the
     // key into `placements`/`ids`, so a reused tid would silently alias an intermediate onto a real
     // buffer. They are minted strictly above every bound tid.
-    let mut next_tid: u32 = k.bindings.iter().map(|b| b.get()).max().map_or(0, |m| m + 1);
+    let mut next_tid: u32 = k
+        .bindings
+        .iter()
+        .map(|b| b.get())
+        .max()
+        .map_or(0, |m| m + 1);
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
 
     // THE ONE FUSED CHAIN THIS DOOR READS, before the 1:1 walk rather than inside it. See
@@ -1318,8 +1389,10 @@ pub fn lower_function(
         // the recogniser proved is then CHECKED against that region's shape below rather than trusted:
         // two independent facts about the same operand, so a chain whose axis and extent disagree
         // cannot address a full tile as a vector.
-        let bcast_axes: Vec<Option<BcastAxis>> =
-            in_values.iter().map(|v| bcasts.get(v).map(|b| b.axis)).collect();
+        let bcast_axes: Vec<Option<BcastAxis>> = in_values
+            .iter()
+            .map(|v| bcasts.get(v).map(|b| b.axis))
+            .collect();
         let in_values: Vec<Ssa> = in_values
             .iter()
             .map(|v| bcasts.get(v).map_or(*v, |b| b.src))
@@ -1394,11 +1467,7 @@ pub fn lower_function(
                      and its extent says it is a full tile; the descriptor would address one {what} \
                      and spray it over the whole output, silently. These are two independent \
                      statements about the same operand and they disagree, so neither is believed.",
-                    f.name,
-                    op.op_type,
-                    r.tid,
-                    r.v_rows,
-                    r.c_len,
+                    f.name, op.op_type, r.tid, r.v_rows, r.c_len,
                 ));
             }
         }
@@ -1467,14 +1536,18 @@ pub fn lower_function(
         }
 
         // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
-        let stored = f.operations.iter().find(|s| {
-            s.op_type == OpKind::KtdpStore && s.operands.first().copied() == op.result
-        });
+        let stored = f
+            .operations
+            .iter()
+            .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == op.result);
         let Some(store) = stored else {
             // NOT STORED => AN INTERMEDIATE. Mint a buffer for it, declare it to the layout, and
             // record it so the consuming op finds it as an input.
             let Some(res) = op.result else {
-                return err(format!("{}: `{:?}` has no result to place", f.name, op.op_type));
+                return err(format!(
+                    "{}: `{:?}` has no result to place",
+                    f.name, op.op_type
+                ));
             };
             let dims = match op.result_type {
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
@@ -1535,7 +1608,8 @@ pub fn lower_function(
             inter.insert(res, r);
             per_op.push(r);
             let name = f.name;
-            let mut emitted = emit_one(name, program, &per_op, sym_id_base, Some(layout), b_orient)?;
+            let mut emitted =
+                emit_one(name, program, &per_op, sym_id_base, Some(layout), b_orient)?;
             out.append(&mut emitted);
             lowered += 1;
             continue;
@@ -1544,9 +1618,7 @@ pub fn lower_function(
         let out_view = f
             .operations
             .iter()
-            .find(|o| {
-                o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile
-            })
+            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile)
             .and_then(|t| t.operands.first().copied());
         let out_ptr = f
             .operations
@@ -1555,7 +1627,10 @@ pub fn lower_function(
             .and_then(|o| o.operands.first().copied());
         let out_idx = f.arguments.iter().position(|(a, _)| Some(*a) == out_ptr);
         let Some(out_idx) = out_idx else {
-            return err(format!("{}: `{:?}`'s store names no parameter", f.name, op.op_type));
+            return err(format!(
+                "{}: `{:?}`'s store names no parameter",
+                f.name, op.op_type
+            ));
         };
         let all = regions(k)?;
         let mut o = all[out_idx];
@@ -1611,7 +1686,12 @@ fn emit_one(
             // still closed. The per-`Program` door (`lower_ktir_to_superdsc::scalarmul`) is the one
             // that reads `gather_of` and carries it.
             return super::lower_ktir_to_superdsc::scalarmul_at(
-                name, scale, None, per_op, sym_id_base, layout,
+                name,
+                scale,
+                None,
+                per_op,
+                sym_id_base,
+                layout,
             );
         }
         // THE FUSED RMSNORM. `per_op` is `[x, gamma, out]`, which is `rmsnorm_at`'s own
@@ -1619,7 +1699,11 @@ fn emit_one(
         // `program_rmsnorm_eps` requires one root per FUNCTION and a decoder layer has two.
         Lowering::RmsNorm(eps) => {
             return super::lower_ktir_to_superdsc::rmsnorm_at(
-                name, eps, per_op, sym_id_base, layout,
+                name,
+                eps,
+                per_op,
+                sym_id_base,
+                layout,
             );
         }
         Lowering::Node(p) => p,
@@ -1653,7 +1737,7 @@ fn emit_one(
             return err(format!(
                 "{name}: `{other:?}` is not reachable from this door — it is a fused kind the \
                  producer states by calling its entry point directly"
-            ))
+            ));
         }
     })
 }
@@ -1702,12 +1786,18 @@ mod broadcast_chain_tests {
         let mut ops = vec![];
         if via_expand {
             ops.push(
-                Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[src])
-                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(target)),
+                Operation::new(a, Some(exp), OpKind::TensorExpandShape, &[src]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(target),
+                ),
             );
             ops.push(
-                Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[exp])
-                    .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[64])),
+                Operation::new(a, Some(col), OpKind::TensorCollapseShape, &[exp]).with_attr(
+                    a,
+                    AttrKey::TargetShape,
+                    Attr::IntList(&[64]),
+                ),
             );
         }
         ops.push(Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]));
@@ -1740,11 +1830,24 @@ mod broadcast_chain_tests {
     fn the_col_chain_is_recognised_and_resolves_to_its_source() {
         let f = chain(&[64, 1], Some(&[1]), true);
         let (map, consumed) = program_broadcast_chains(&f).expect("the softmax's own chain");
-        let b = map.get(&Ssa(4)).expect("the broadcast's result is what a consumer names");
-        assert_eq!(b.axis, BcastAxis::Col, "`Dimensions=[1]` sprays along the stick axis");
-        assert_eq!(b.src, Ssa(0), "the consumer must read the rank-2 SOURCE, not the chain");
+        let b = map
+            .get(&Ssa(4))
+            .expect("the broadcast's result is what a consumer names");
+        assert_eq!(
+            b.axis,
+            BcastAxis::Col,
+            "`Dimensions=[1]` sprays along the stick axis"
+        );
+        assert_eq!(
+            b.src,
+            Ssa(0),
+            "the consumer must read the rank-2 SOURCE, not the chain"
+        );
         for v in [Ssa(1), Ssa(2), Ssa(4)] {
-            assert!(consumed.contains(&v), "{v:?} is plumbing and must be lowered by nothing");
+            assert!(
+                consumed.contains(&v),
+                "{v:?} is plumbing and must be lowered by nothing"
+            );
         }
     }
 
@@ -1755,7 +1858,11 @@ mod broadcast_chain_tests {
     fn the_mb_chain_is_recognised_with_the_other_axis() {
         let f = chain(&[1, 128], Some(&[0]), true);
         let (map, _) = program_broadcast_chains(&f).expect("the rmsnorm gain's own chain");
-        assert_eq!(map[&Ssa(4)].axis, BcastAxis::Mb, "`Dimensions=[0]` sprays down the rows");
+        assert_eq!(
+            map[&Ssa(4)].axis,
+            BcastAxis::Mb,
+            "`Dimensions=[0]` sprays down the rows"
+        );
     }
 
     /// ⛔ THE CROSS-CHECK, AND IT IS THE ONE GUARD NO SINGLE ATTRIBUTE CAN PROVIDE. The expand says the
@@ -1793,7 +1900,10 @@ mod broadcast_chain_tests {
     #[test]
     fn a_two_axis_broadcast_is_refused_by_name() {
         let m = refusal(&[64, 1], Some(&[0, 1]), true);
-        assert!(m.contains("In::col") && m.contains("In::mb"), "names both modes it does emit: {m}");
+        assert!(
+            m.contains("In::col") && m.contains("In::mb"),
+            "names both modes it does emit: {m}"
+        );
     }
 
     /// ⛔ NO `Dimensions` AT ALL — then which axis it sprays is simply unknown, and picking one would be
@@ -1801,7 +1911,10 @@ mod broadcast_chain_tests {
     #[test]
     fn a_broadcast_with_no_dimensions_attribute_is_refused() {
         let m = refusal(&[64, 1], None, true);
-        assert!(m.contains("no `Dimensions`"), "names the missing attribute: {m}");
+        assert!(
+            m.contains("no `Dimensions`"),
+            "names the missing attribute: {m}"
+        );
     }
 
     /// ⛔ AND THE DEGENERATE EXPAND IS REQUIRED, NOT MERELY PREFERRED: with the broadcast wired straight
@@ -1826,9 +1939,16 @@ mod matmul_orientation_tests {
     use ktir_core::ir::Operation;
 
     /// A `linalg.matmul` whose `indexing_maps` are the given dim triples, or NO maps when `None`.
-    fn mm(maps: Option<[[usize; 2]; 3]>) -> (&'static IRFunction<'static>, &'static Operation<'static>) {
+    fn mm(
+        maps: Option<[[usize; 2]; 3]>,
+    ) -> (&'static IRFunction<'static>, &'static Operation<'static>) {
         let a: &'static Arena = Arena::global();
-        let mut op = Operation::new(a, Some(Ssa(9)), OpKind::LinalgMatmul, &[Ssa(0), Ssa(1), Ssa(2)]);
+        let mut op = Operation::new(
+            a,
+            Some(Ssa(9)),
+            OpKind::LinalgMatmul,
+            &[Ssa(0), Ssa(1), Ssa(2)],
+        );
         if let Some(m) = maps {
             let list: Vec<AffineMap<'static>> = m
                 .iter()
@@ -1843,7 +1963,7 @@ mod matmul_orientation_tests {
         let f = IRFunction {
             name: "mm_probe",
             arguments: a.args(vec![]),
-            operations: a.ops(vec![op.clone()]),
+            operations: a.ops(vec![op]),
             grid: (1, 1, 1),
             return_type: None,
         };
@@ -1857,7 +1977,10 @@ mod matmul_orientation_tests {
     #[test]
     fn the_transpose_b_triple_is_recognised() {
         let (f, op) = mm(Some([[0, 2], [1, 2], [0, 1]]));
-        assert_eq!(matmul_b_orientation(f, op).expect("the assumed form"), BOrient::TransposeB);
+        assert_eq!(
+            matmul_b_orientation(f, op).expect("the assumed form"),
+            BOrient::TransposeB
+        );
     }
 
     /// ⭐ MLIR'S PLAIN FORM, and the SAME answer for an op stating NO maps — which is what `tl.dot(p, v)`
@@ -1866,7 +1989,10 @@ mod matmul_orientation_tests {
     #[test]
     fn the_plain_triple_and_a_missing_attribute_are_both_plain_b() {
         let (f, op) = mm(Some([[0, 2], [2, 1], [0, 1]]));
-        assert_eq!(matmul_b_orientation(f, op).expect("plain B"), BOrient::PlainB);
+        assert_eq!(
+            matmul_b_orientation(f, op).expect("plain B"),
+            BOrient::PlainB
+        );
         let (f2, op2) = mm(None);
         assert_eq!(
             matmul_b_orientation(f2, op2).expect("no maps IS the plain default"),
@@ -1895,8 +2021,7 @@ mod matmul_orientation_tests {
     #[test]
     fn a_transpose_b_over_a_computed_value_is_refused_by_name() {
         let e = transposed_b_is_placeable("probe", BOrient::TransposeB, false)
-            .err()
-            .expect("an in-register value has no host stage and no cache write");
+            .expect_err("an in-register value has no host stage and no cache write");
         assert!(
             e.message.contains("COMPUTED value"),
             "names WHAT is wrong with the operand, not merely that it was rejected: {}",
@@ -1933,7 +2058,7 @@ mod matmul_orientation_tests {
     #[test]
     fn a_triple_that_is_neither_form_is_refused_by_name() {
         let (f, op) = mm(Some([[0, 2], [1, 2], [1, 0]]));
-        let e = matmul_b_orientation(f, op).err().expect("a permuted C is not either form");
+        let e = matmul_b_orientation(f, op).expect_err("a permuted C is not either form");
         assert!(
             e.message.contains("NEITHER") && e.message.contains("k == n"),
             "names that it is neither, and why an extent guard cannot catch it: {}",
@@ -2008,7 +2133,11 @@ mod silu_chain_tests {
         let c = cs[0];
         assert_eq!(c.gate, Ssa(0), "the gate is the value the negate consumed");
         assert_eq!(c.up, Ssa(1), "`up` is the multiply's other operand");
-        assert_eq!(c.mul, Ssa(8), "the terminal multiply's result is what the program produces");
+        assert_eq!(
+            c.mul,
+            Ssa(8),
+            "the terminal multiply's result is what the program produces"
+        );
         assert_eq!(
             c.consumed,
             [Ssa(4), Ssa(5), Ssa(6), Ssa(7)],
@@ -2080,12 +2209,19 @@ mod silu_chain_tests {
         let f = IRFunction {
             name: "no_silu",
             arguments: a.args(vec![(Ssa(0), IrType::Index)]),
-            operations: a.ops(vec![Operation::new(a, Some(Ssa(1)), OpKind::MathExp, &[Ssa(0)])]),
+            operations: a.ops(vec![Operation::new(
+                a,
+                Some(Ssa(1)),
+                OpKind::MathExp,
+                &[Ssa(0)],
+            )]),
             grid: (1, 1, 1),
             return_type: None,
         };
         assert!(
-            program_silu_mul_chains(&f).expect("no negate is not an error").is_empty(),
+            program_silu_mul_chains(&f)
+                .expect("no negate is not an error")
+                .is_empty(),
             "a function with no `arith.negf` states no silu longhand"
         );
     }

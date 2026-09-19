@@ -371,7 +371,9 @@ where
                      (phys >= iteration); a smaller value cannot be expressed this way."
                 ));
             }
-            kernel.with_device_extent(InAxis::NAME, phys).map_err(|e| e.0)?
+            kernel
+                .with_device_extent(InAxis::NAME, phys)
+                .map_err(|e| e.0)?
         }
         None => kernel,
     };
@@ -771,7 +773,12 @@ pub fn matmul_opspec_batched_off(
         .tile(MaxCores::<MAX_CORES>, matmul_split_map, OutAxis::NAME)
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    refuse_reduction_core_split(&plan, plan.extent(MbAxis::NAME), plan.extent(OutAxis::NAME), plan.extent(InAxis::NAME))?;
+    refuse_reduction_core_split(
+        &plan,
+        plan.extent(MbAxis::NAME),
+        plan.extent(OutAxis::NAME),
+        plan.extent(InAxis::NAME),
+    )?;
     // INPUT [y,mb,in] stick=in (batch-outermost; reduction = OMIT `in` from OUTPUT).
     let input_walk = Walk3::input_head_outermost();
     let input = TensorArg::<3>::new(

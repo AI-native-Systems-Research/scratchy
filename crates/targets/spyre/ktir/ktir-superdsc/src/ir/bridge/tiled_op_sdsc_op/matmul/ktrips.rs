@@ -35,16 +35,14 @@
 //! declared in `place.rs` under the comment "K-split / down-projection blocking (the only INDEXED
 //! roles)" and had NO producer in this tree. This is that producer.
 
-use super::dims::{matmul_split_map_for, matmul_dims};
+use super::dims::{matmul_dims, matmul_split_map_for};
 use super::walk::{InAxis, MatmulWrapperSite, OutAxis, SharedKernelBmmForm, WalkAxis};
 use crate::emit::{EmittedOp, In, pw2, rb};
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::place::{PlaceId, SynthRole as R};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, KernelTag, RowBlockedTag, RowCount, Stk};
-use crate::superdsc_opspec::{
-    DataFormat, Df, Fp16, MAX_CORES, MaxCores, SdscFoldSet, StickExtent,
-};
+use crate::superdsc_opspec::{DataFormat, Df, Fp16, MAX_CORES, MaxCores, SdscFoldSet, StickExtent};
 
 /// How ONE matmul's reduction axis is cut into trips: `trips` whole matmuls of `k_per_trip` each.
 ///
@@ -418,7 +416,7 @@ mod tests {
     /// One K trip, emitted with and without the `kernel_phys_in` declaration, so the two can be
     /// compared. Everything else is identical.
     fn trip_kernel_starts(kernel_phys_in: Option<u32>) -> Vec<i64> {
-        let (m, n, k, k_t) = (64u32, 4096u32, 12800u32, 6400u32);
+        let (m, n, k_t) = (64u32, 4096u32, 6400u32);
         let form = proven();
         let op = super::super::opspec::matmul_opspec_split::<Fp16, _>(
             m,
@@ -468,7 +466,10 @@ mod tests {
             undeclared.len(),
             "the same op on the same cores, so the same number of distinct starts"
         );
-        assert!(declared.len() > 1, "the `out` split must be >1 for this to bite");
+        assert!(
+            declared.len() > 1,
+            "the `out` split must be >1 for this to bite"
+        );
         let d_step = declared[1] - declared[0];
         let u_step = undeclared[1] - undeclared[0];
         // 8 out-sticks per core × (12800 depth × 64 lanes × 2 B) = 13_107_200 B.

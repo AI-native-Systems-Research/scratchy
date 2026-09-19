@@ -336,7 +336,11 @@ fn parse_dim_subscripts(
     };
     let syms: Vec<Option<i64>> = intermediate_vars
         .iter()
-        .map(|&v| ctx.get_value(v).ok().and_then(|x| scalar_i64(x, "dim_subs symbol").ok()))
+        .map(|&v| {
+            ctx.get_value(v)
+                .ok()
+                .and_then(|x| scalar_i64(x, "dim_subs symbol").ok())
+        })
         .collect();
 
     let mut subs = Vec::with_capacity(ndims);
@@ -384,17 +388,18 @@ fn parse_dim_subscripts(
                 // `idx_exprs.iter().zip(&iv.strides)` stops at the shorter, so a
                 // subscript list one short of the view's rank silently drops that
                 // axis's contribution and reads a well-formed WRONG element.
-                if let Some(iv) = index_views.get(view) {
-                    if !idx_exprs.is_empty() && idx_exprs.len() != iv.strides.len() {
-                        return Err(format!(
-                            "construct_indirect_access_tile: dim {d} is indirect through \
-                             index_view {view}, which is rank {}, but 'dim_subs' gives {} \
-                             subscript expression(s). They are dotted with the view's strides, \
-                             so a shorter list silently addresses the wrong element",
-                            iv.strides.len(),
-                            idx_exprs.len()
-                        ));
-                    }
+                if let Some(iv) = index_views.get(view)
+                    && !idx_exprs.is_empty()
+                    && idx_exprs.len() != iv.strides.len()
+                {
+                    return Err(format!(
+                        "construct_indirect_access_tile: dim {d} is indirect through \
+                         index_view {view}, which is rank {}, but 'dim_subs' gives {} \
+                         subscript expression(s). They are dotted with the view's strides, \
+                         so a shorter list silently addresses the wrong element",
+                        iv.strides.len(),
+                        idx_exprs.len()
+                    ));
                 }
                 DimSubscript::Indirect { view, idx_exprs }
             }
