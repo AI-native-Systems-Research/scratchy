@@ -21,7 +21,18 @@ use std::process::Command;
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(metal)");
     println!("cargo::rustc-check-cfg=cfg(metal_aot)");
-    let is_macos = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
+    // ⛔ THE METAL/NAX BACKEND IS SELECTED BY THE `metal` FEATURE ALONE, NOT BY THE TARGET.
+    // Reading `CARGO_CFG_TARGET_OS` here made the Apple-only `objc2` / `objc2-metal` /
+    // `objc2-foundation` crates non-optional for every macOS build, so a consumer with no
+    // crates.io access could not resolve this crate. Same concern as blas.rs's `accelerate`.
+    //
+    // ⚖️ NO ARITHMETIC CHANGES: `interpreter::execute_function_filtered` calls
+    // `execute_function_gpu` only under `cfg(metal)` and otherwise falls through to the comm
+    // scheduler, which is the documented and always-correct path.
+    //
+    // ⚖️ TO KEEP THE macOS DEFAULT EXACTLY AS IT WAS, default the `metal` feature on for
+    // `cfg(target_os = "macos")` in the workspace that owns this crate.
+    let is_macos = false;
     let feature_on = std::env::var("CARGO_FEATURE_METAL").is_ok();
     if is_macos || feature_on {
         println!("cargo::rustc-cfg=metal");

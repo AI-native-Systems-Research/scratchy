@@ -13,11 +13,13 @@
 //! run nested regions via `interpreter::execute_region`, and the cross-core
 //! comm seam lives in `comm` (only the top-level driver suspends).
 
-// Links the BLAS backend — Accelerate on macOS (default), or the feature-chosen
-// provider elsewhere. `blas-src` must be referenced once at the crate root for
-// its linker directives to take effect. See blas.rs.
+// Links the BLAS backend — Accelerate (`accelerate`), or the feature-chosen provider elsewhere.
+// `blas-src` must be referenced once at the crate root for its linker directives to take effect.
+//
+// ⛔ `target_os = "macos"` -> `feature = "accelerate"`, so building for a Mac does not by itself
+// acquire `cblas-sys`/`blas-src`. Full reason at the head of blas.rs.
 #[cfg(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"

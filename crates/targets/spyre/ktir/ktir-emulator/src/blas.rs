@@ -16,11 +16,26 @@
 //! BLAS is deterministic and — since NumPy's matmul is itself BLAS-backed —
 //! tends to *tighten* parity with the reference. Both paths take the same
 //! flat-`Vec<f32>` tile storage, so `linalg` matmul just calls `sgemm_rowmajor`.
+//!
+//! ⛔ THE BACKEND IS SELECTED BY A FEATURE, NOT BY THE TARGET. Every `cfg` list below reads
+//! `feature = "accelerate"` where it used to read `target_os = "macos"`, and so does `lib.rs`'s
+//! `extern crate blas_src`. A target-selected backend makes `cblas-sys` and `blas-src`
+//! NON-OPTIONAL on a Mac: the dependency is acquired by anyone who builds for that target,
+//! feature flags or not, so a consumer with no crates.io access cannot resolve this crate at all
+//! (`cargo --offline`). A feature is the same switch with an off position.
+//!
+//! ⚖️ NO ARITHMETIC CHANGES. The alternative to the `cblas_sgemm` path is `naive_sgemm`, which the
+//! doc above calls "the parity oracle for the BLAS path" — so the switch selects which code runs
+//! and not what it computes.
+//!
+//! ⚖️ TO KEEP THE macOS DEFAULT EXACTLY AS IT WAS, default `accelerate` on for
+//! `cfg(target_os = "macos")` in the workspace that owns this crate. That restores the old
+//! behaviour for every in-tree build while leaving a third-party consumer a way off it.
 
 /// `C(m×n) = A(m×k) · B(k×n)`, all row-major and contiguous. Naive loop —
 /// the cross-platform default (and the parity oracle for the BLAS path).
 #[cfg(not(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -32,7 +47,7 @@ pub fn sgemm_rowmajor(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec
 /// `C(m×n) = A(m×k) · B(k×n)` via the linked BLAS `cblas_sgemm` (Accelerate on
 /// macOS, or the selected provider — the cblas ABI is identical across them).
 #[cfg(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -86,7 +101,7 @@ pub fn naive_sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f3
 /// directly, with **no transpose of the weight data**. Routes to `cblas_sgemm`
 /// with `transB` (native, free) where available, else a naive loop.
 #[cfg(not(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -97,7 +112,7 @@ pub fn sgemm_rowmajor_bt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> 
 
 /// `C(m×n) = A(m×k) · B(n×k)ᵀ` via `cblas_sgemm` with `transB = CblasTrans`.
 #[cfg(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -161,7 +176,7 @@ pub fn naive_sgemm_bt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec
 /// `n`. Naive loop — the cross-platform default (and the parity oracle for the
 /// BLAS path).
 #[cfg(not(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -174,7 +189,7 @@ pub fn sgemv_rowmajor(k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
 /// form `Bᵀ·a` (length `n`) we ask cblas to transpose the m=k × n=n matrix:
 /// `cblas_sgemv(RowMajor, CblasTrans, k, n, 1, B, lda=n, a, 1, 0, y, 1)`.
 #[cfg(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -222,7 +237,7 @@ pub fn naive_sgemv(k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
 /// each output `y[j]` is the dot of `a` with `B`'s row `j` (both contiguous) —
 /// `aWᵀ` read directly, no weight transpose. Naive loop — portable default.
 #[cfg(not(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -235,7 +250,7 @@ pub fn sgemv_rowmajor_bt(k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
 /// `B·a` (length `n`) is the NON-transposed product of the m=n × n=k matrix:
 /// `cblas_sgemv(RowMajor, CblasNoTrans, n, k, 1, B, lda=k, a, 1, 0, y, 1)`.
 #[cfg(any(
-    target_os = "macos",
+    feature = "accelerate",
     feature = "openblas",
     feature = "mkl",
     feature = "blis"
@@ -327,7 +342,7 @@ mod tests {
 
     /// With a BLAS backend active, `cblas_sgemm` must agree with the naive oracle.
     #[cfg(any(
-        target_os = "macos",
+        feature = "accelerate",
         feature = "openblas",
         feature = "mkl",
         feature = "blis"
@@ -394,7 +409,7 @@ mod tests {
     /// With a BLAS backend active, `cblas_sgemv` (both forms) must agree with the
     /// naive GEMV oracle.
     #[cfg(any(
-        target_os = "macos",
+        feature = "accelerate",
         feature = "openblas",
         feature = "mkl",
         feature = "blis"

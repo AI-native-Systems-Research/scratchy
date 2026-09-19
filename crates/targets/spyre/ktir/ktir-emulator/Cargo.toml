@@ -31,6 +31,17 @@ targets = ["aarch64-apple-darwin"]
 default-target = "aarch64-apple-darwin"
 
 [features]
+# ⛔ `src/blas.rs` and `src/lib.rs` used to select the Accelerate `cblas_sgemm` backend on
+# `cfg(target_os = "macos")`, which made `cblas-sys` and `blas-src` NON-OPTIONAL for every macOS
+# build — so a consumer with no crates.io access could not resolve this crate at all. This feature
+# is that switch, moved off the target; the default build now resolves with no registry package.
+# ⚖️ Default it on for `cfg(target_os = "macos")` in the workspace to restore the old behaviour
+# exactly. Turning it on IS the old macOS behaviour, byte for byte.
+accelerate = [
+    "dep:cblas-sys",
+    "dep:blas-src",
+    "blas-src/accelerate",
+]
 blis = [
     "dep:cblas-sys",
     "dep:blas-src",
@@ -74,6 +85,10 @@ path = "examples/ktir_diff_run.rs"
 [[example]]
 name = "mtl4_smoke"
 path = "examples/mtl4_smoke.rs"
+# ⛔ This example `use`s `ktir_emulator::metal` unconditionally, and that module is `cfg(metal)`.
+# It used to build on macOS because build.rs set `cfg(metal)` from the TARGET; now that the
+# backend is feature-selected, say so here instead of letting the example fail to compile.
+required-features = ["metal"]
 
 [[test]]
 name = "bench_amx_vs_metal"
@@ -163,26 +178,3 @@ default-features = false
 
 [dev-dependencies]
 serde_json = "1"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-cblas-sys = "0.1"
-objc2 = "0.6"
-objc2-foundation = "0.3"
-
-[target.'cfg(target_os = "macos")'.dependencies.objc2-metal]
-version = "0.3"
-features = [
-    "MTL4ArgumentTable",
-    "MTL4CommandAllocator",
-    "MTL4CommandBuffer",
-    "MTL4CommandEncoder",
-    "MTL4CommandQueue",
-    "MTL4ComputeCommandEncoder",
-    "MTL4ComputePipeline",
-    "MTLAllocation",
-    "MTLResidencySet",
-]
-
-[target.'cfg(target_os = "macos")'.dependencies.blas-src]
-workspace = true
-features = ["accelerate"]
