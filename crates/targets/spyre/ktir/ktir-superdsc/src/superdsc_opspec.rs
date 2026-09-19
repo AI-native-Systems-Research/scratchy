@@ -167,6 +167,30 @@ impl DataFormat for Fp8 {
     const DF: Df = Df::Fp8;
 }
 
+/// SENUINT32 — the 4-byte unsigned index format of a GATHER's index vector, and the ONE format on
+/// this list that is not a compute dtype. **32 elems / 128-byte stick, 4 bytes/elem**, read verbatim
+/// off the shipped vendor input `dxp/test/test_gather_1core/sdsc_1.json`, whose KERNEL_IDX operand
+/// carries `wordLength` 4, `dataFormat_` SENUINT32 and `primaryDsInfo_.KERNEL_IDX.stickSize_` **[32]**
+/// — not the 64 every fp16 operand beside it uses.
+///
+/// ⛔ IT IS NOT `Fp32` WEARING ANOTHER NAME, even though the geometry coincides. dbo's
+/// `GatherIndexConversion.cpp:133` DT_CHECKs a 4-byte SENUINT32 index specifically, and the
+/// idx→address program it synthesises declares BOTH its own LDS entries SENUINT32; an IEEE_FP32
+/// spelling would be a different `dataFormat_` string on the wire for the same bytes.
+///
+/// ⛔ AND ITS STICK EXTENT IS NOT GUARDED. That same shipped file has `mb_ = 3` against `stickSize_`
+/// 32, so the multiple-of-stick assumption `DesignSpaceConfig::checkAssumption` enforces for a
+/// COMPUTE operand provably does not hold for a KERNEL_IDX one — see [`Role::KernelIdx`] and the
+/// `per_core_addr` arm that skips `DeviceTileLayout` for it.
+#[derive(Clone, Copy, Debug)]
+pub enum SenUint32 {}
+impl DataFormat for SenUint32 {
+    const ELEMS_PER_STICK: u32 = 32;
+    const NAME: &'static str = "SENUINT32";
+    const WORD_LENGTH: u32 = 4;
+    const DF: Df = Df::Uint32;
+}
+
 mod private {
     /// Seals [`DataFormat`](super::DataFormat) so only the formats defined in this
     /// module (`Fp16`, `Fp32`, `SenInt8`) can implement it. `Scale`/`OpFunc` are
@@ -176,6 +200,7 @@ mod private {
     impl SealedDf for super::Fp32 {}
     impl SealedDf for super::SenInt8 {}
     impl SealedDf for super::Fp8 {}
+    impl SealedDf for super::SenUint32 {}
 }
 
 /// **Value-level** mirror of the [`DataFormat`] sealed marker trait — the ONE dtype a dataspace
@@ -200,6 +225,10 @@ pub enum Df {
     /// bf16 dataspace today (the score path stays SEN169_FP16; bf16-output matmul is dxp-rejected). Kept
     /// representable for the `lower_attn_node` bf16-operand check.
     Bf16,
+    /// SENUINT32 — 4-byte / 32-stick. A GATHER's index vector ONLY (see [`SenUint32`]); never a
+    /// compute operand's dtype, so no `opFuncName` and no `attributes_.dataFormat_` is ever derived
+    /// from it.
+    Uint32,
 }
 
 impl Df {
@@ -211,6 +240,7 @@ impl Df {
             Df::Fp8 => <Fp8 as DataFormat>::ELEMS_PER_STICK,
             Df::SenInt8 => <SenInt8 as DataFormat>::ELEMS_PER_STICK,
             Df::Bf16 => <Fp16 as DataFormat>::ELEMS_PER_STICK, // BF16E shares fp16 geometry (2-byte / 64-stick)
+            Df::Uint32 => <SenUint32 as DataFormat>::ELEMS_PER_STICK,
         }
     }
     /// Bytes per element (`wordLength`) — from the type-level [`DataFormat`] impl.
@@ -221,6 +251,7 @@ impl Df {
             Df::Fp8 => <Fp8 as DataFormat>::WORD_LENGTH,
             Df::SenInt8 => <SenInt8 as DataFormat>::WORD_LENGTH,
             Df::Bf16 => <Fp16 as DataFormat>::WORD_LENGTH,
+            Df::Uint32 => <SenUint32 as DataFormat>::WORD_LENGTH,
         }
     }
     /// DeepTools `dataFormat_` string — from the type-level [`DataFormat`] impl (`Bf16` has no marker type).
@@ -231,6 +262,7 @@ impl Df {
             Df::Fp8 => <Fp8 as DataFormat>::NAME,
             Df::SenInt8 => <SenInt8 as DataFormat>::NAME,
             Df::Bf16 => "BF16E",
+            Df::Uint32 => <SenUint32 as DataFormat>::NAME,
         }
     }
 }
@@ -1067,6 +1099,16 @@ pub fn assert_df_stick_multiple(elems: u32, df: Df) -> Result<(), String> {
         Df::SenInt8 => StickExtent::<SenInt8>::new(elems).map(|_| ()),
         Df::Fp32 => StickExtent::<Fp32>::new(elems).map(|_| ()),
         Df::Fp16 | Df::Bf16 => StickExtent::<Fp16>::new(elems).map(|_| ()),
+        // ⛔ NOT `StickExtent::<SenUint32>` — the witness is deliberately ABSENT rather than widened.
+        // SENUINT32 is a GATHER's index format and the shipped `test_gather_1core/sdsc_1.json` declares
+        // `mb_ = 3` against its `stickSize_` of 32, so a multiple-of-stick assertion is FALSE of a real
+        // accepted input. An index vector is also never a work-division dim (it is rank-1 over the op's
+        // own `mb`, and `attach_indirect_index` forces a single-core plan), so nothing routes it here —
+        // reaching this arm means a compute dim was declared with the index dtype.
+        Df::Uint32 => Err(format!(
+            "a work-division dim declares `Df::Uint32` ({elems} elems). SENUINT32 is a gather's index \
+             format, never a compute dim's stick basis — see `SenUint32`."
+        )),
     }
 }
 
@@ -1145,6 +1187,21 @@ pub enum Role {
     Input,
     Kernel,
     Output,
+    /// A GATHER's INDEX VECTOR — `dsType_` KERNEL_IDX. NOT a compute operand: it carries no value the
+    /// op reads, only the row each gathered entry comes from, so `emit_sdsc` puts it in
+    /// `computeOp_.indirectAccessIndexLabeledDs` rather than `inputLabeledDs` and gives it
+    /// [`MemOrg::hbm_only`](crate::wire::MemOrg::hbm_only) — the shipped
+    /// `dxp/test/test_gather_1core/sdsc_1.json` gives its index vector NO `lx` entry, which
+    /// `MemOrg::hbm_only`'s own doc already states as the rule ("index tensors must reside in HBM —
+    /// no LX indirect addressing").
+    ///
+    /// ⭐ THE VALUE TENSOR IS THE OPERAND IMMEDIATELY BEFORE IT, and that adjacency is not a
+    /// convention this crate picked: dbo synthesises the `INT32IDXTOADDR` from the index lds and the
+    /// address it produces is consumed by the gathered operand, so an index appended LAST is defined
+    /// after its use — measured as `operand #1 does not dominate this use` from
+    /// `DSC2ToDataflowIR.cpp:51`. The shipped file places it at `ldsIdx_` 1, immediately after the
+    /// tensor it gathers. So the pairing needs no extra field: it IS the position.
+    KernelIdx,
 }
 impl Role {
     pub fn ds_type(self) -> &'static str {
@@ -1152,6 +1209,7 @@ impl Role {
             Role::Input => "INPUT",
             Role::Kernel => "KERNEL",
             Role::Output => "OUTPUT",
+            Role::KernelIdx => "KERNEL_IDX",
         }
     }
 }
@@ -1975,6 +2033,108 @@ impl OpSpec {
             op_func: first.op_func,
             second,
         };
+    }
+
+    /// ⭐⭐⭐ ATTACH A GATHER'S INDEX VECTOR to the operand at `gathered_arg_idx` — the ONE way an
+    /// indirect access enters this crate, and the mirror of [`Self::attach_fused_epilogue`]'s
+    /// insert-an-arg-after-the-fact shape.
+    ///
+    /// The index is a rank-1 `Role::KernelIdx` operand over the op's OWN `mb` axis, inserted
+    /// IMMEDIATELY AFTER the operand it indexes. Every field is forced rather than offered:
+    ///
+    /// * **rank 1, layout `["mb"]`, stick `"mb"`** — the shipped `test_gather_1core/sdsc_1.json`'s
+    ///   `primaryDsInfo_.KERNEL_IDX` verbatim (`layoutDimOrder_ ["mb"]`, `stickDimOrder_ ["mb"]`).
+    /// * **[`Df::Uint32`]** — which is what makes `wordLength` 4, `dataFormat_` SENUINT32 and
+    ///   `stickSize_` [32] fall out of the ONE dtype rather than being three hand-set fields.
+    /// * **the position** — `gathered_arg_idx + 1`. See [`Role::KernelIdx`] for the measurement that
+    ///   makes it load-bearing (`operand #1 does not dominate this use`, `DSC2ToDataflowIR.cpp:51`).
+    ///
+    /// ⛔ THE INDEX COUNT IS NOT A PARAMETER, AND THAT IS THE POINT. One index per gathered entry, and
+    /// the entries ARE the op's `mb` rows — so the count is `self.iter.extent("mb")`, the same number
+    /// the descriptor's `N_.mb_` states. A separate count would be a second statement of one fact, free
+    /// to disagree; the caller instead CHECKS its own reading against this one and refuses on a
+    /// mismatch (see `lower_ktir_to_superdsc::gather_of`).
+    ///
+    /// ⛔⛔⛔ AND IT REFUSES ANY SPLIT BUT THE GATHERED AXIS, BY NAME. dbo reads the gather base as
+    /// `min over cores of the value tensor's per-core start address` (`GatherIndexConversion.cpp`'s
+    /// `computeGatherMetadata`), so the per-core corner of the GATHERED operand is discarded: whatever
+    /// slice of an entry a core was given, it reads the entry from its start.
+    ///
+    /// Splitting the GATHERED axis (`mb`) is therefore the one division that survives it — a core owns
+    /// WHOLE entries, every row's base comes from the index rather than from a corner, and the core's own
+    /// index offset is carried through the conversion (`allocateAndModifyGather` preserves "the per-core
+    /// offset structure … by computing the delta from the original minimum address and applying it
+    /// uniformly"). Splitting any WITHIN-ENTRY axis silently gives every core entry-start data.
+    ///
+    /// `distribute_cores` splits `mb` first and spends only what is left on the other axes, so this is
+    /// the division it already produces whenever the row count reaches the core count. Where it does not
+    /// — a 1-row (decode) gather, whose cores must come from `out` — this is an `Err` naming the axis
+    /// rather than a descriptor whose cores all read column 0.
+    pub fn attach_indirect_index(
+        &mut self,
+        index_name: String,
+        gathered_arg_idx: usize,
+    ) -> Result<(), SuperDscError> {
+        if gathered_arg_idx >= self.args.len() {
+            return Err(SuperDscError(format!(
+                "attach_indirect_index '{index_name}': operand {gathered_arg_idx} does not exist \
+                 (this op has {} args) — the index is positioned relative to the tensor it gathers, \
+                 so there is no index without one",
+                self.args.len()
+            )));
+        }
+        if let Some(d) = self
+            .iter
+            .dims()
+            .iter()
+            .find(|d| d.name != "mb" && self.iter.split_of(d.name) > 1)
+        {
+            return Err(SuperDscError(format!(
+                "attach_indirect_index '{index_name}': this op's work division splits `{}` {} ways. \
+                 That is a WITHIN-ENTRY axis, and dbo takes the gather's base address as the MINIMUM of \
+                 the value tensor's per-core starts (`computeGatherMetadata`) — so each core's own \
+                 corner on the gathered tensor is discarded and every core reads its entries from the \
+                 entry START, not from its slice. Only the gathered axis (`mb`) may carry a split, where \
+                 a core owns whole entries and each row's base comes from the index. Both shipped vendor \
+                 fixtures are single-core (`test_gather_1core`, `test_scatter_1core`), which is the \
+                 degenerate case of that rule.",
+                d.name,
+                self.iter.split_of(d.name)
+            )));
+        }
+        if self.args.iter().any(|a| matches!(a.view().role, Role::KernelIdx)) {
+            return Err(SuperDscError(format!(
+                "attach_indirect_index '{index_name}': this op already carries an index operand. \
+                 `computeOp_.indirectAccessIndexLabeledDs` is a list, but no shipped input has more \
+                 than one entry and nothing states how a second index is paired with its operand — \
+                 the pairing here IS the adjacency, which two indices cannot both have."
+            )));
+        }
+        let at = gathered_arg_idx + 1;
+        let arg = TensorArg::<1>::new(
+            true,
+            index_name,
+            Role::KernelIdx,
+            [Scale::Active],
+            self.iter.iter_syms(["mb"]),
+            ["mb"],
+            "mb",
+            Allocation::Hbm,
+        )?
+        .with_df(Df::Uint32);
+        self.args.insert(at, AnyTensorArg::R1(arg));
+        Ok(())
+    }
+
+    /// The arg positions of this op's gather, as `(index, value)` — derived from the roles and the
+    /// adjacency [`Role::KernelIdx`] documents, never from a stored field, so the pairing the
+    /// descriptor emits is the pairing the operand list has.
+    pub fn indirect_index_pair(&self) -> Option<(usize, usize)> {
+        let i = self
+            .args
+            .iter()
+            .position(|a| matches!(a.view().role, Role::KernelIdx))?;
+        Some((i, i.checked_sub(1)?))
     }
 
     /// The name of THIS op's own batch axis, if it has one — `Some("y")` when `self.iter` carries

@@ -1605,8 +1605,13 @@ fn emit_one(
         // the per-`Program` door reaches through `scalarmul`, so the two cannot drift about what a
         // scalar multiply emits.
         Lowering::ScalarMul(scale) => {
+            // `None`: this door reaches a scalarmul through `region_for_operand`, which REFUSES an
+            // indirect access tile by name before any op is built (see its own doc) — so a gathering
+            // node never gets here, and passing the program's gather would be claiming a path that is
+            // still closed. The per-`Program` door (`lower_ktir_to_superdsc::scalarmul`) is the one
+            // that reads `gather_of` and carries it.
             return super::lower_ktir_to_superdsc::scalarmul_at(
-                name, scale, per_op, sym_id_base, layout,
+                name, scale, None, per_op, sym_id_base, layout,
             );
         }
         // THE FUSED RMSNORM. `per_op` is `[x, gamma, out]`, which is `rmsnorm_at`'s own

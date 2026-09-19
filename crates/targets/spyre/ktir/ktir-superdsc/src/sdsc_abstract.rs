@@ -1710,6 +1710,31 @@ enum Walk {
     /// A row-major (`Flat`/head-major, rows>1) start: the actual per-dim extents, pinned so the card walks
     /// row-major instead of being told to reconstruct a stick-block over a row-major buffer.
     RowMajor(Vec<i64>),
+    /// ⭐⭐⭐ A GATHER's VALUE TENSOR: dim `entry_dim` pinned to **1**, every other dim `-1`. This is the
+    /// third state a `Vec<i64>` allowed and the only MIXED one that is legal — and it is legal because
+    /// dxp reads it as a PAGE SIZE rather than as an extent.
+    ///
+    /// `dsc2::AllocateNode::getPageSize` (dsc2.cpp:4480) walks the VALUE tensor's `maxDimSizes_` and
+    /// turns every non-negative entry into that dim's page size, leaving `-1` dims unbounded.
+    /// `getBufferCapacityForNodePerDim` then clamps a paged VALUE dim to its page
+    /// (`dimSize = min(dimSize, dimPageSize)`), and `computeGatherMetadata` multiplies those clamped
+    /// per-dim capacities — each divided by its cumulative stick size — into `skip_addr_sticks`, the
+    /// stride the `idx32toaddr` program multiplies the index by. So pinning the GATHERED axis to 1 is
+    /// exactly the statement "one entry is one row of this tensor", and it is what makes
+    /// `base + idx·skip` land on entry `idx`. Leaving it `-1` instead makes one entry the op's WHOLE
+    /// `mb` tile — `mb`× too far for every index.
+    ///
+    /// ⭐ AND IT SETTLES THE RowBlocked-vs-Flat QUESTION FOR THIS OPERAND RATHER THAN DUCKING IT: with
+    /// the gathered axis paged to 1, the value tensor's effective device shape is `[1, feature]`, and
+    /// `rows == 1` is precisely where `StickLayout`'s two residencies are byte-identical (its own
+    /// `for_view_df` note: "rows==1 / single-stick are byte-identical to Flat either way"). One entry is
+    /// `feature` CONTIGUOUS elements under both readings, which is what a host-staged row-major table
+    /// (safetensors' own order) holds. The mb stride that would differ never enters the address: the
+    /// index supplies the row base.
+    ///
+    /// Serializes to `[1, -1]` / `[1, -1, -1]` — the shipped `test_gather_1core/sdsc_1.json`'s own
+    /// value-tensor walk, verbatim.
+    GatherEntry { rank: usize, entry_dim: usize },
 }
 
 impl serde::Serialize for DeviceWalk {
@@ -1724,6 +1749,13 @@ impl serde::Serialize for DeviceWalk {
                 seq.end()
             }
             Walk::RowMajor(ext) => ext.serialize(s),
+            Walk::GatherEntry { rank, entry_dim } => {
+                let mut seq = s.serialize_seq(Some(*rank))?;
+                for d in 0..*rank {
+                    seq.serialize_element(&if d == *entry_dim { 1i64 } else { -1i64 })?;
+                }
+                seq.end()
+            }
         }
     }
 }
@@ -2004,6 +2036,58 @@ impl StickLayout {
                 rank: extents.len(),
             }),
         }
+    }
+
+    /// [`device_walk`](Self::device_walk) FOR A GATHER'S INDEX VECTOR — every dim `-1`.
+    ///
+    /// ⭐ IT IS A NAMED EXCEPTION TO THE PIN LAW RATHER THAN A HOLE IN IT, and the exception is the
+    /// shipped vendor input's own: `test_gather_1core/sdsc_1.json` declares its index alloc
+    /// `maxDimSizes_ [-1]` against `mb_ = 3` — a `Flat` start with rows > 1, which `device_walk` would
+    /// otherwise pin. The pin exists because a row-major start told to reconstruct a stick-block gets
+    /// walked with the wrong strides; a RANK-1 tensor has no axes to reorder, so `off_view` is the
+    /// identity under both readings and there is nothing for the pin to protect. dxp also reads an INDEX
+    /// alloc's own `maxDimSizes_` only through `AllocateNode::getPageSize`, which for an
+    /// `index_tensor` follows `relatedIndirectAccessAlloc_` to the VALUE tensor and reads THAT one's —
+    /// so a pin here states an extent nothing consults while diverging from the one accepted example.
+    ///
+    /// `Err` above rank 1, because the argument above is exactly an argument about rank 1.
+    pub fn device_walk_index(
+        &self,
+        rank: usize,
+    ) -> Result<DeviceWalk, crate::superdsc_error::SuperDscError> {
+        if rank != 1 {
+            return Err(crate::superdsc_error::SuperDscError(format!(
+                "device_walk_index: a gather's index vector is rank 1 (`layoutDimOrder_ [\"mb\"]`, the \
+                 shipped `test_gather_1core` form); this one states {rank} dim(s), and the reason the \
+                 pin law is waived for it — one axis, nothing to reorder — does not hold above rank 1."
+            )));
+        }
+        Ok(DeviceWalk(Walk::Reconstruct { rank }))
+    }
+
+    /// [`device_walk`](Self::device_walk) FOR A GATHER'S VALUE TENSOR — dim `entry_dim` pinned to 1,
+    /// the rest reconstructed. See [`Walk::GatherEntry`] for why the mix is the one legal one and for
+    /// the dxp chain (`getPageSize` → `getBufferCapacityForNodePerDim` → `skip_addr_sticks`) that makes
+    /// the pin the definition of "one gathered entry".
+    ///
+    /// `Err` when `entry_dim` is not a dim of `extents`, so a pin that cannot name an axis is a build
+    /// failure rather than a walk of the wrong rank.
+    pub fn device_walk_gather_entry(
+        &self,
+        extents: &[i64],
+        entry_dim: usize,
+    ) -> Result<DeviceWalk, crate::superdsc_error::SuperDscError> {
+        if entry_dim >= extents.len() {
+            return Err(crate::superdsc_error::SuperDscError(format!(
+                "device_walk_gather_entry: entry dim {entry_dim} is past this view's {} dim(s) — \
+                 `maxDimSizes_` must have exactly one entry per `layoutDimOrder_` entry",
+                extents.len()
+            )));
+        }
+        Ok(DeviceWalk(Walk::GatherEntry {
+            rank: extents.len(),
+            entry_dim,
+        }))
     }
 
     /// The nest a PER-ROW reduction over the feature axis MUST walk: `FreeM` (rows) is CARRIED, the

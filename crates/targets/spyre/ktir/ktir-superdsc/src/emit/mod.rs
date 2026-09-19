@@ -154,6 +154,13 @@ pub(crate) fn view_stick_layout(
     crate::sdsc_abstract::StickLayout::for_view_df(&host_size_us, stick_idx, view.df)
 }
 
+/// `split_corner: false` gives every core the SAME base instead of its own WORK-SLICE CORNER.
+///
+/// The one caller that passes `false` is a GATHERED operand: the row a core reads comes from the index,
+/// not from a corner, and dbo reduces the value tensor's per-core starts to one `min` before deriving
+/// any address (`computeGatherMetadata`). Everything else passes `true` and is byte-identical to the
+/// former no-argument form.
+#[allow(clippy::too_many_arguments)]
 fn per_core_addr(
     seg_base: u64,
     view: &ArgView<'_>,
@@ -164,6 +171,7 @@ fn per_core_addr(
     wk_slice: &BTreeMap<String, BTreeMap<&'static str, crate::superdsc_opspec::SliceIndex>>,
     intra_base: u64,
     cores: u32,
+    split_corner: bool,
 ) -> Result<Vec<u64>, SuperDscError> {
     let cores = cores.max(1);
     // LX residency is core-local — every core shares the base (reference parity).
@@ -244,6 +252,15 @@ fn per_core_addr(
     let host_size: Vec<u64> = extents.dims().iter().map(|&e| e as u64).collect();
     // Stick guard at the OPERAND's device format: fp8/int8 = 128-elem stick (StickExtent<Fp8> rejects a
     // non-128-multiple at cargo build — the compile-time fp8 width guard), fp16/bf16 = 64, fp32 = 32.
+    // ⛔ A KERNEL_IDX OPERAND IS NOT STICK-GUARDED, AND THAT IS MEASURED RATHER THAN WAIVED. The
+    // shipped `test_gather_1core/sdsc_1.json` declares its index vector `mb_ = 3` against a
+    // `stickSize_` of 32 — so the multiple-of-stick assumption `DesignSpaceConfig::checkAssumption`
+    // enforces for a COMPUTE operand demonstrably does not hold for an index one, and applying
+    // `DeviceTileLayout` here would refuse the vendor's own accepted input. The guard is validation
+    // only (`_tile` is discarded); the address itself comes from `off_view` below either way.
+    if matches!(view.role, Role::KernelIdx) {
+        // fall through to the address fold with no stick witness
+    } else {
     match view.df {
         Df::Fp8 | Df::SenInt8 => {
             DeviceTileLayout::<Fp8>::new(layout, view.stick, &host_size)?;
@@ -254,6 +271,16 @@ fn per_core_addr(
         Df::Fp16 | Df::Bf16 => {
             DeviceTileLayout::<Fp16>::new(layout, view.stick, &host_size)?;
         }
+        Df::Uint32 => {
+            return Err(SuperDscError(format!(
+                "a `Df::Uint32` operand reached the stick witness at role {:?}. SENUINT32 is the \
+                 index format of a GATHER and nothing else, so it belongs to a `Role::KernelIdx` \
+                 operand — which takes the arm above. A compute operand declaring it is a dtype \
+                 mix-up, not a residency this emitter has.",
+                view.role
+            )));
+        }
+    }
     }
 
     // The per-core start flows through [`view_stick_layout`] — the SAME classifier `emit_sdsc` declares to
@@ -283,6 +310,9 @@ fn per_core_addr(
         // — a `SliceIndex` cannot be scaled by anything else.
         let mut corner = vec![0usize; layout.len()];
         for (li, &d) in layout.iter().enumerate() {
+            if !split_corner {
+                continue;
+            }
             if view.scale.get(li).map(|s| s.to_i64()).unwrap_or(1) <= 0 {
                 continue;
             }
@@ -664,6 +694,72 @@ pub fn assemble_pointwise_broadcast_hm(
         sym_id_base,
         layout,
     )
+}
+
+/// ⭐⭐⭐ A POINTWISE OP ONE OF WHOSE OPERANDS IS **GATHERED** — the indirect-access door.
+///
+/// Identical to [`assemble_pointwise_broadcast_off_from_tile`] except for the two things a gather
+/// changes, and both are forced rather than offered:
+///
+/// 1. **THE WORK DIVISION MAY SPLIT ONLY THE GATHERED AXIS**, which
+///    [`OpSpec::attach_indirect_index`] enforces. dbo takes the gather's base address as the MINIMUM of
+///    the value tensor's per-core starts (`computeGatherMetadata`), so a core that owns a COLUMN SLICE
+///    of an entry loses that slice — every core would read the entry from its start. A core that owns
+///    whole ENTRIES does not: the index supplies each row's base and the core's own index offset is
+///    preserved through the conversion (`allocateAndModifyGather` "computes the delta from the original
+///    minimum address and applying it uniformly"). `distribute_cores` splits `mb` FIRST and only spends
+///    what is left on the other axes, so the division a gather needs is the one it already makes
+///    whenever the row count reaches the core count — no budget knob, and the guard is what says so.
+/// 2. **THE INDEX OPERAND** is inserted immediately after `gathered_input` (an index into `inputs`),
+///    which is the adjacency `DSC2ToDataflowIR.cpp:51` requires — see [`Role::KernelIdx`].
+///
+/// `index_name` is the operand spelling of the id buffer, the same `crate::place::act_name` form every
+/// other operand here uses, so it resolves through the SAME `BundleLayout` the data operands do.
+///
+/// ⛔ FALLIBLE, unlike its non-gathering sibling. The sibling panics because it runs inside scratchy's
+/// `#[forward]` proc-macro where a panic IS the build error; this door is reached from a third-party
+/// KTIR producer's runtime driver, and every one of its refusals (`attach_indirect_index`'s core and
+/// arity guards, the value tensor's `mb`-axis requirement) is a statement about the PROGRAM rather than
+/// about this crate — so it returns them.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
+    op_name: &str,
+    tile_op: &crate::ir::island::tile_op::TileOp,
+    op_func: &'static str,
+    rows: u32,
+    cols: u32,
+    inputs: &[EwOperand<'_>],
+    gathered_input: usize,
+    index_name: &str,
+    o: &Stk<O>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, SuperDscError> {
+    if gathered_input >= inputs.len() {
+        return Err(SuperDscError(format!(
+            "{op_name}: input {gathered_input} is named as the gathered operand but this op has \
+             {} input(s)",
+            inputs.len()
+        )));
+    }
+    let head_major = O::kind() == StickKind::Flat;
+    let mut op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+        tile_op,
+        rows,
+        cols,
+        op_func_from_str(op_func),
+        inputs,
+        o.name(),
+        0,
+        head_major,
+    )
+    .map_err(SuperDscError)?;
+    // `inputs` are args `0..inputs.len()` and the output is last (`pointwise_broadcast_opspec_from_tile`
+    // pushes it after the loop), so an input's index IS its arg position — the same identity `emit_sdsc`
+    // relies on for `Tensor{i}-idx{i}`.
+    op.attach_indirect_index(index_name.to_string(), gathered_input)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
 }
 
 /// The per-chunk OUTPUT column offset (in elements) the emitter must apply for a
@@ -1814,6 +1910,11 @@ pub fn emit_sdsc(
     let mut primary: BTreeMap<&'static str, LayoutInfo> = BTreeMap::new();
     let mut input_refs: Vec<String> = Vec::new();
     let mut output_refs: Vec<String> = Vec::new();
+    // A GATHER's index operand: named in `computeOp_.indirectAccessIndexLabeledDs` and in NEITHER of
+    // the two lists above. `test_gather_1core/sdsc_1.json` is the whole citation — its `identity`
+    // reads `["Tensor0-idx0"]`, writes `["Tensor2-idx2"]` and lists `["Tensor1-idx1"]` here; the index
+    // is not an input the op computes with.
+    let mut indirect_refs: Vec<String> = Vec::new();
     for (i, v) in views.iter().enumerate() {
         labeled.push(LabeledDs {
             ldsIdx_: i as u32,
@@ -1832,7 +1933,13 @@ pub fn emit_sdsc(
             // finite ≈ 4.3e9, NOT 65504 (that is IEEE-fp16's 5-bit-exp max). Kani-proven
             // (`sen169_holds_attention_score_no_overflow`): a ~1e5 score is a NORMAL SEN169 value.
             dataFormat_: v.df.dataformat(),
-            memOrg_: if v.allocation.is_lx() {
+            // ⭐ A GATHER'S INDEX VECTOR IS HBM-ONLY, and that is the rule `MemOrg::hbm_only`'s own
+            // doc already states ("index tensors must reside in HBM — no LX indirect addressing").
+            // The shipped `test_gather_1core/sdsc_1.json` gives its KERNEL_IDX operand no `lx` entry;
+            // giving it one would claim an LX residency the indirect addressing cannot read through.
+            memOrg_: if matches!(v.role, Role::KernelIdx) {
+                MemOrg::hbm_only()
+            } else if v.allocation.is_lx() {
                 MemOrg::lx_only()
             } else {
                 MemOrg::hbm_lx()
@@ -1875,7 +1982,9 @@ pub fn emit_sdsc(
             continue;
         }
         let r = format!("Tensor{i}-idx{i}");
-        if i == out_idx {
+        if matches!(v.role, Role::KernelIdx) {
+            indirect_refs.push(r);
+        } else if i == out_idx {
             output_refs.push(r);
         } else {
             input_refs.push(r);
@@ -1895,6 +2004,29 @@ pub fn emit_sdsc(
     // ASSERT both below.
     let mut tree: Vec<AllocNode> = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // ⭐⭐⭐ THE GATHER'S ALLOC PAIR, AND IT IS THE HALF WITHOUT WHICH NOTHING GATHERS.
+    //
+    // `computeOp_.indirectAccessIndexLabeledDs` plus a KERNEL_IDX `labeledDs_` is NOT a gather on its
+    // own: dbo's `GatherIndexConversionPass::processSDSCForIndexTensors` selects an lds for conversion
+    // ONLY when its HBM `AllocateNode` carries `indirectAllocType_ == index_tensor` AND
+    // `indexTensorType_ == INDEX`. Without that pair the idx→address program is never synthesised, so
+    // `indexTensorType_` never becomes ADDRESS, `L3DlOpsScheduler`'s `isIndexLds()` stays false, and the
+    // op compiles as an ORDINARY read of the value tensor's BASE — a program that reports success and
+    // computes the wrong rows. (`GatherIndexConversion.md`, "Tensor Classification" and "the downstream
+    // scheduler asserts `indexTensorType_ == ADDRESS` … If the conversion has not run, it aborts".)
+    //
+    // The link is bidirectional and by ALLOC NAME, which is why both names are computed before either
+    // node is built: the index's `relatedIndirectAccessAlloc_` is what `computeGatherMetadata` follows
+    // to read the value tensor's base address, and the value's is what `AllocateNode::getPageSize`
+    // follows in the other direction.
+    let gather_pair: Option<(usize, usize)> = op.indirect_index_pair();
+    let alloc_name_of = |i: usize| -> String {
+        let comp = views
+            .get(i)
+            .map(|v| v.allocation.component())
+            .unwrap_or("hbm");
+        format!("allocate-Tensor{i}_{comp}")
+    };
     // Collision guard: collect every (output) byte address emitted; any duplicate
     // is two cores writing the same byte = silently-wrong → build `Err`.
     let mut out_addr_seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -1948,11 +2080,38 @@ pub fn emit_sdsc(
             }
             .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
-            if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
+            // A KERNEL_IDX operand is excluded for the SAME reason a KERNEL is: its layout is its own
+            // (rank-1, 32-elem sticks) and it is not the arrangement of any tensor a compute op reads,
+            // so declaring it would make a gather's index vector conflict with itself the moment two
+            // ops share one id buffer.
+            if active
+                && full
+                && !matches!(v.role, Role::Kernel | Role::KernelIdx)
+                && !v.allocation.is_lx()
+            {
                 l.declare_arrangement(v.name, view_stick_layout(v, &op.iter))?;
             }
         }
-        let per_core = per_core_addr(seg_base, v, &sl, &op.iter, &wk_slice, intra_base, cores)?;
+        // ⭐⭐⭐ A GATHERED OPERAND CARRIES NO PER-CORE CORNER, and that is what "gathered" MEANS.
+        //
+        // Every other operand's per-core start is its work-slice corner's device offset. A gathered one
+        // has no corner to take: the row each core reads comes from the INDEX, and dbo reduces the value
+        // tensor's per-core starts to a single `min` before it ever builds an address
+        // (`computeGatherMetadata`). So a per-core corner here is at best dead weight in the descriptor
+        // and at worst a number some other dxp reader believes — and the shipped
+        // `test_gather_1core/sdsc_1.json` carries exactly ONE address for its value tensor. Passing
+        // `false` for `split_corner` says the same thing this crate says everywhere else by scale: this
+        // operand does not range over the split axis on its own account.
+        let per_core = per_core_addr(
+            seg_base,
+            v,
+            &sl,
+            &op.iter,
+            &wk_slice,
+            intra_base,
+            cores,
+            !matches!(gather_pair, Some((_, val)) if val == i),
+        )?;
         // No two cores of an OUTPUT tensor may share a byte address (aliased write) — EXCEPT a K-split
         // matmul, where the `k` cores each contract a K-slice into a PARTIAL product that dxp
         // PSUM-accumulates into the SHARED output tile (torch-spyre's reduction-dim split). That case is
@@ -1977,6 +2136,49 @@ pub fn emit_sdsc(
             }
         }
         let addr = AddrFold::new(&per_core, folds);
+        // The walk's extents — unchanged, and still `Span::Swept` over THIS view.
+        let walk_extents: Vec<i64> = crate::sdsc_abstract::DeviceExtents::of_view(
+            &v.layout
+                .iter()
+                .map(|&d| op.iter.extent(d) as usize)
+                .collect::<Vec<_>>(),
+            &v.device_extent
+                .iter()
+                .map(|o| o.map(|p| p as usize))
+                .collect::<Vec<_>>(),
+            v.layout
+                .iter()
+                .position(|&d| d == v.stick)
+                .unwrap_or(usize::MAX),
+            &vec![true; v.layout.len()],
+            crate::sdsc_abstract::Span::Swept,
+        )
+        .dims()
+        .iter()
+        .map(|&e| e as i64)
+        .collect();
+        // ⭐ A GATHER'S VALUE TENSOR PINS ITS GATHERED AXIS TO 1 AND RECONSTRUCTS THE REST. dxp reads a
+        // value tensor's `maxDimSizes_` as a PAGE SIZE (`AllocateNode::getPageSize`, dsc2.cpp:4480), and
+        // `computeGatherMetadata` folds the paged per-dim capacities into `skip_addr_sticks` — the stride
+        // the `idx32toaddr` program multiplies each index by. Pinning the gathered axis to 1 is therefore
+        // the statement "one entry is one row"; leaving it `-1` makes one entry the op's whole `mb` tile,
+        // which is `mb`× too far for every index. See `Walk::GatherEntry`. The gathered axis is the op's
+        // own `mb` — the axis the index enumerates one entry per row of.
+        let walk = match gather_pair {
+            Some((idx, _)) if idx == i => sl.device_walk_index(walk_extents.len())?,
+            Some((_, val)) if val == i => {
+                let entry_dim = v.layout.iter().position(|&d| d == "mb").ok_or_else(|| {
+                    SuperDscError(format!(
+                        "op {op_name}: the gathered operand {i} ('{}') has no `mb` axis in its layout \
+                         {:?}, so there is no axis for the index to enumerate entries of. A gather's \
+                         value tensor is indexed along the op's row axis.",
+                        v.name, v.layout
+                    ))
+                })?;
+                sl.device_walk_gather_entry(&walk_extents, entry_dim)?
+            }
+            _ => sl.device_walk(&walk_extents),
+        };
         tree.push(AllocNode {
             nodeType_: "allocate",
             name_: name,
@@ -2016,32 +2218,25 @@ pub fn emit_sdsc(
             //
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
-            maxDimSizes_: sl.device_walk(
-                crate::sdsc_abstract::DeviceExtents::of_view(
-                    &v.layout
-                        .iter()
-                        .map(|&d| op.iter.extent(d) as usize)
-                        .collect::<Vec<_>>(),
-                    &v.device_extent
-                        .iter()
-                        .map(|o| o.map(|p| p as usize))
-                        .collect::<Vec<_>>(),
-                    v.layout
-                        .iter()
-                        .position(|&d| d == v.stick)
-                        .unwrap_or(usize::MAX),
-                    &vec![true; v.layout.len()],
-                    crate::sdsc_abstract::Span::Swept,
-                )
-                .dims()
-                .iter()
-                .map(|&e| e as i64)
-                .collect::<Vec<_>>()
-                .as_slice(),
-            ),
-            indirectAllocType_: "no_indirection",
-            relatedIndirectAccessAlloc_: None,
-            indexTensorType_: None,
+            maxDimSizes_: walk,
+            indirectAllocType_: match gather_pair {
+                Some((idx, _)) if idx == i => "index_tensor",
+                Some((_, val)) if val == i => "value_tensor",
+                _ => "no_indirection",
+            },
+            relatedIndirectAccessAlloc_: match gather_pair {
+                Some((idx, val)) if idx == i => Some(alloc_name_of(val)),
+                Some((idx, val)) if val == i => Some(alloc_name_of(idx)),
+                _ => None,
+            },
+            // "index", not "address": RAW INTEGER indices, which is the INITIAL state dbo's conversion
+            // pass looks for and then flips once it has written the address buffer. Emitting "address"
+            // would claim the conversion has already run and hand the hardware token ids as byte
+            // addresses.
+            indexTensorType_: match gather_pair {
+                Some((idx, _)) if idx == i => Some("index"),
+                _ => None,
+            },
             startAddressCoreCorelet_: addr,
             backGapCore_: None,
             coordinates_: coordinates,
@@ -2189,7 +2384,7 @@ pub fn emit_sdsc(
                 inputLabeledDs: input_refs,
                 interimLabeledDs: vec![],
                 outputLabeledDs: output_refs,
-                indirectAccessIndexLabeledDs: vec![],
+                indirectAccessIndexLabeledDs: indirect_refs,
             }];
             ops.extend(epilogue_compute_ops);
             ops
@@ -4263,16 +4458,20 @@ pub(crate) fn check_pointwise_cols(
 ///
 /// [`crate::wire`] declares the vendor's whole indirect-access field set — `indirectAllocType_`,
 /// `relatedIndirectAccessAlloc_`, `indexTensorType_` and `isStartAddrSymbolic_` on [`AllocNode`],
-/// `indirectAccessIndexLabeledDs` on [`ComputeOp`] — plus [`MemOrg::hbm_only`] beside them. Nothing
-/// in this crate sets any of them to an indirect value: [`emit_sdsc`] hardcodes every alloc node to
-/// `"no_indirection"` at its single construction site and leaves the other four `None`/empty, and
-/// `MemOrg::hbm_only` has ZERO call sites. The capability is DECLARED AND UNREACHABLE.
+/// `indirectAccessIndexLabeledDs` on [`ComputeOp`] — plus [`MemOrg::hbm_only`] beside them.
 ///
-/// Whatever eventually reaches it will rest on one claim: that switching it on changes NOTHING for
-/// the ops that do not use it — that every already-shipped bundle stays BYTE-IDENTICAL, not merely
-/// equivalent. That is a claim about a serializer, and a claim about a serializer is worth exactly
-/// one diff. There was no diff. These tests are it, so a later change is measured against a recorded
-/// baseline rather than against a reading of the emitter.
+/// ⭐ THE CAPABILITY IS NOW REACHABLE, AND THIS IS THE BASELINE IT WAS MEASURED AGAINST.
+/// [`assemble_pointwise_broadcast_gather`] is the one door that sets any of these to an indirect
+/// value, reached only by an op carrying a `Role::KernelIdx` operand; `MemOrg::hbm_only` has exactly
+/// that one call site. Every op WITHOUT such an operand still takes the `no_indirection` /
+/// `None` / empty arms at the same single construction sites.
+///
+/// That was the claim the door rested on: that switching it on changes NOTHING for the ops that do not
+/// use it — that every already-shipped bundle stays BYTE-IDENTICAL, not merely equivalent. That is a
+/// claim about a serializer, and a claim about a serializer is worth exactly one diff. These tests are
+/// it, so the change was measured against a recorded baseline rather than against a reading of the
+/// emitter — and they keep being it, because a regression here is a new key in every alloc node of
+/// every bundle.
 ///
 /// ⛔ TYPED-`None` AND SERIALIZED-ABSENT ARE TWO DIFFERENT CLAIMS, AND ONLY ONE OF THEM IS ABOUT THE
 /// BYTES. A bare `Option::None` serializes as `null`; it is `skip_serializing_if = "Option::is_none"`
@@ -4286,6 +4485,22 @@ mod indirect_access_baseline {
     use super::*;
     use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec;
 
+    /// The `TileOp` a two-operand fp16 pointwise over `[rows, cols]` declares — the same shape
+    /// `lower_ktir_to_superdsc::scalarmul_at` builds, restated here because that one is private.
+    fn gather_test_tile_op(rows: u32, cols: u32) -> crate::ir::island::tile_op::TileOp {
+        use crate::ir::island::tile_op::{TileOp, TileOpKind};
+        use crate::superdsc_opspec::{Df, ItDim};
+        TileOp {
+            kind: TileOpKind::PointwiseOrReduce { n_operands: 2 },
+            dims: vec![
+                ItDim { name: "mb", size: rows, is_reduction: false, is_stick: false, df: Df::Fp16 },
+                ItDim { name: "out", size: cols, is_reduction: false, is_stick: true, df: Df::Fp16 },
+                ItDim { name: "y", size: 1, is_reduction: false, is_stick: false, df: Df::Fp16 },
+            ],
+            df: Df::Fp16,
+        }
+    }
+
     /// Occurrences of `needle` in `hay`. Counting rather than `contains` is what makes an
     /// every-node claim non-vacuous: `contains` passes on one node out of three.
     fn count(hay: &str, needle: &str) -> usize {
@@ -4293,7 +4508,7 @@ mod indirect_access_baseline {
     }
 
     /// The op every assertion here is made about: an ordinary batched fp16 matmul over three
-    /// distinct operands. It declares no gather — as does every op this crate can build today.
+    /// distinct operands. It declares no gather — which is still every op but one.
     /// Same shape the emitter's other field-set tests use, so a divergence is about the fields
     /// under test and not about a differently-shaped op.
     fn non_gather_sdsc() -> (SdscOp, String) {
@@ -4478,4 +4693,155 @@ mod indirect_access_baseline {
             "MemOrg::hbm_only is not on this path"
         );
     }
+    /// ⭐⭐⭐ THE POSITIVE CONTROL: an op that DOES gather emits the whole field set, and every field is
+    /// asserted against the shipped `dxp/test/test_gather_1core/sdsc_1.json` rather than against this
+    /// emitter's own idea of a gather.
+    ///
+    /// Without this the baseline above would pass vacuously forever — "the fields are absent" is not
+    /// evidence about a gather, and the absence tests cannot fail for a door that was never opened.
+    #[test]
+    fn a_gathering_op_emits_the_shipped_gather_field_set() {
+        // 256 rows × 4096 columns — `embedding.py` at Granite width, the one fixture in tree whose
+        // KTIR carries a `ktdp.construct_indirect_access_tile`.
+        let rows = 256u32;
+        let cols = 4096u32;
+        let tile_op = gather_test_tile_op(rows, cols);
+        let x = rb("t1", rows, cols);
+        let sc = rbo("t_scale");
+        let out = rbo("t2");
+        let inputs = [In::full(&x).ew(), In::scalar(&sc).ew()];
+        let mut sym = 0i64;
+        let emitted = assemble_pointwise_broadcast_gather(
+            "scalarmul_o2",
+            &tile_op,
+            "multiply",
+            rows,
+            cols,
+            &inputs,
+            0,
+            "t0",
+            &out,
+            &mut sym,
+            None,
+        )
+        .expect("a gathered pointwise at the embedding's own extents lowers");
+        let sdsc = emitted.dsc().clone();
+        let json = serde_json::to_string(&sdsc).expect("SdscOp serializes");
+        let dsc = sdsc.dscs_[0].values().next().expect("one dsc");
+
+        // (i) the index is a KERNEL_IDX operand at ldsIdx 1 — immediately after the tensor it gathers.
+        let idx = dsc
+            .labeledDs_
+            .iter()
+            .find(|l| l.dsType_ == "KERNEL_IDX")
+            .expect("a KERNEL_IDX labeledDs");
+        assert_eq!(idx.ldsIdx_, 1, "the index sits immediately after its gathered operand");
+        assert_eq!(idx.wordLength, 4, "SENUINT32 is 4 bytes");
+        assert_eq!(idx.dataFormat_, "SENUINT32");
+        assert_eq!(idx.scale_, vec![1], "every entry 1 — GatherIndexConversion.cpp:135");
+        // hbm ONLY: the shipped file gives its index vector no `lx` entry.
+        let idx_mem = serde_json::to_string(&idx.memOrg_).expect("memOrg serializes");
+        assert_eq!(idx_mem, r#"{"hbm":{"isPresent":1}}"#, "index residency is HBM alone");
+
+        // (ii) its layout class, verbatim from the shipped file: ONE dim, sticked on it, at 32.
+        let cls = dsc
+            .primaryDsInfo_
+            .get("KERNEL_IDX")
+            .expect("a KERNEL_IDX layout class");
+        assert_eq!(cls.layoutDimOrder_, vec!["mb"]);
+        assert_eq!(cls.stickDimOrder_, vec!["mb"]);
+        assert_eq!(cls.stickSize_, vec![32], "NOT 64 — the index stick is 32 elements");
+
+        // (iii) the index is named in `indirectAccessIndexLabeledDs` and in NEITHER other list.
+        let c = &dsc.computeOp_[0];
+        assert_eq!(c.indirectAccessIndexLabeledDs, vec!["Tensor1-idx1".to_string()]);
+        assert!(
+            !c.inputLabeledDs.contains(&"Tensor1-idx1".to_string()),
+            "the index is not an input the op computes with"
+        );
+        assert!(!c.outputLabeledDs.contains(&"Tensor1-idx1".to_string()));
+
+        // (iv) the alloc PAIR, cross-linked both ways — the half without which dbo never converts the
+        // index and the op silently reads the value tensor's base.
+        let node = |n: &str| {
+            dsc.scheduleTree_
+                .iter()
+                .find(|a| a.name_ == n)
+                .unwrap_or_else(|| panic!("an alloc node named {n}"))
+        };
+        let iv = node("allocate-Tensor1_hbm");
+        let vv = node("allocate-Tensor0_hbm");
+        assert_eq!(iv.indirectAllocType_, "index_tensor");
+        assert_eq!(iv.indexTensorType_, Some("index"), "RAW indices, pre-conversion");
+        assert_eq!(iv.relatedIndirectAccessAlloc_.as_deref(), Some("allocate-Tensor0_hbm"));
+        assert_eq!(vv.indirectAllocType_, "value_tensor");
+        assert_eq!(vv.indexTensorType_, None, "only an index tensor carries one");
+        assert_eq!(vv.relatedIndirectAccessAlloc_.as_deref(), Some("allocate-Tensor1_hbm"));
+
+        // (v) the VALUE tensor's walk pins the gathered axis to 1 and the index's reconstructs — the two
+        // `maxDimSizes_` the shipped file carries, and the pin is what makes `skip_addr_sticks` one row.
+        assert!(
+            json.contains(r#""maxDimSizes_":[1,-1]"#),
+            "the value tensor's walk pins its gathered axis to 1: {json}"
+        );
+        assert!(
+            json.contains(r#""maxDimSizes_":[-1]"#),
+            "the index vector's walk reconstructs: {json}"
+        );
+
+        // (vi) EVERY core reads the value tensor from ONE address — a gathered operand has no corner.
+        let addrs: std::collections::BTreeSet<&String> =
+            vv.startAddressCoreCorelet_.data_.values().collect();
+        assert_eq!(
+            addrs.len(),
+            1,
+            "dbo reduces the value tensor's per-core starts to a `min`, so emitting more than one \
+             address is at best dead weight: {:?}",
+            vv.startAddressCoreCorelet_.data_
+        );
+        // ...while the INDEX keeps its per-core offsets, which the conversion carries through.
+        let iaddrs: std::collections::BTreeSet<&String> =
+            iv.startAddressCoreCorelet_.data_.values().collect();
+        assert!(
+            iaddrs.len() > 1,
+            "each core reads its own slice of the index vector: {:?}",
+            iv.startAddressCoreCorelet_.data_
+        );
+    }
+
+    /// ⛔ AND THE WITHIN-ENTRY SPLIT IS REFUSED BY NAME. A gather whose cores own COLUMN slices of an
+    /// entry reads every entry from its start, because `computeGatherMetadata` reduces the value
+    /// tensor's per-core starts to a `min`. One row is the shape that forces it: `distribute_cores`
+    /// cannot split `mb` at 1, so it spends the cores on `out`.
+    #[test]
+    fn a_within_entry_split_is_refused_rather_than_emitted() {
+        let (rows, cols) = (1u32, 4096u32);
+        let tile_op = gather_test_tile_op(rows, cols);
+        let x = rb("t1", rows, cols);
+        let sc = rbo("t_scale");
+        let out = rbo("t2");
+        let inputs = [In::full(&x).ew(), In::scalar(&sc).ew()];
+        let mut sym = 0i64;
+        let e = assemble_pointwise_broadcast_gather(
+            "scalarmul_o2",
+            &tile_op,
+            "multiply",
+            rows,
+            cols,
+            &inputs,
+            0,
+            "t0",
+            &out,
+            &mut sym,
+            None,
+        )
+        .err()
+        .expect("a one-row gather splits `out`, which is a within-entry axis");
+        assert!(
+            e.0.contains("WITHIN-ENTRY") && e.0.contains("out"),
+            "the refusal names the axis and why: {}",
+            e.0
+        );
+    }
+
 }
