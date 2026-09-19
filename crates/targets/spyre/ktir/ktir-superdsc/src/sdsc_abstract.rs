@@ -270,72 +270,77 @@ impl KtKernelPitch {
     }
 }
 
-/// THE Kᵀ RESTICKIFY TILE'S SLOT EXTENT — how many slots one `assemble_restickify_kt_2d` tile
-/// re-sticks (the natural `[slots, feats]` rows in, the Kᵀ `[feats, slots]` columns out). Exactly
-/// THREE tiles exist and each is a door: one row window of the NEW block (whose rows ARE its slots —
-/// the [`MqPad`] identity), a whole page of the resident pool, and the ONE stick-block a decode
-/// step's single new slot falls in. A feature width has no door, so the restickify's two extents —
-/// previously two adjacent bare `u32`s, both 64 on the sub-block form — cannot be handed over
-/// swapped.
+/// ⭐⭐⭐⭐⭐ THE Kᵀ RESTICKIFY'S TILE — ONE STICK ON **BOTH** AXES, AND NEITHER IS A FREE NUMBER.
+///
+/// One `assemble_restickify_kt_2d` re-sticks the natural `[slots, feats]` rows in and the Kᵀ
+/// `[feats, slots]` columns out. Both extents must be exactly one 64-element fp16 stick, and that is not
+/// a convention — it is the only shape the on-card ReStickify performs correctly.
+///
+/// ⛔⛔⛔ A MULTI-STICK Kᵀ RESTICKIFY IS THE KNOWN-BAD SHAPE, AND IT HAS NOW COST TWO SEPARATE BUGS:
+/// * on the SLOT axis: "the on-card ReStickify wrote the 2nd Kᵀ stick wrong, which is what garbled decode
+///   past 64 tokens, and the fix was to stop asking it to" — which is why the new-block leg sweeps row
+///   WINDOWS instead of one wide op;
+/// * on the FEATURE axis: the streamed prefix leg passed the whole head dim, so at `hd = 128` it asked for
+///   two feature sticks. granite-3.1-8b fp8 answered "France is a miswrite." repeatedly, DEGENERATE FROM
+///   THE FIRST TOKEN — and granite-3.1-2b (hd=64) was byte-identical either way, so the 2b card gate
+///   passed it straight through.
+///
+/// ⭐ SO THE FEATURE AXIS IS NOT A PARAMETER ANY MORE. It is [`POOL_STICK`], fixed, and the only choice
+/// left is WHICH slot window — the quantity that genuinely varies. The previous shape of this API was two
+/// adjacent extent arguments, both 64 at hd=64, either of which could be handed the wrong number or the
+/// other's; the whole-page/whole-head doors that made the bad shape spellable are DELETED along with the
+/// resident-Kᵀ re-transpose that was their only caller.
+///
+/// Both slot doors take a zero-sized witness ([`WindowRows`], or none at all for the write slab), so the
+/// extent cannot arrive as a literal either.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct KtTileSlots(u32);
+pub struct KtTile(u32);
 
-impl KtTileSlots {
-    /// One row window of new tokens — quantity (3): the window's rows are the new block's slots.
-    pub const fn of_row_window(rows: WindowRows) -> KtTileSlots {
-        KtTileSlots(rows.n())
+impl KtTile {
+    /// One row window of new tokens — quantity (3): the window's rows ARE the new block's slots
+    /// ([`MqPad`]'s identity).
+    pub const fn of_row_window(rows: WindowRows) -> KtTile {
+        KtTile(rows.n())
     }
 
-    /// A whole page of the resident pool — the post-cache-write re-transpose spans every slot.
-    pub const fn of_page() -> KtTileSlots {
-        KtTileSlots(PagedKvPool::PAGE_SLOTS as u32)
-    }
-
-    /// ⭐ THE ONE STICK-BLOCK A DECODE STEP'S NEW SLOT FALLS IN — the incremental form, and the
-    /// reason [`EmittedOp::slab_write`](crate::emit::EmittedOp::slab_write) exists.
-    ///
-    /// A decode step appends exactly ONE slot, so exactly one of a page's
-    /// `PAGE_SLOTS / STK` stick-blocks has a Kᵀ that is now stale; the other blocks hold this same
-    /// request's earlier keys, already transposed, and K is append-only so nothing invalidates them.
-    /// The op is baked at block 0 and the runtime shifts it onto the live one — which is
-    /// [`slab_delta`], and is why it had to learn to wrap at the page before this door could be used.
-    ///
-    /// ⛔ IT IS NOT A CHEAPER WAY TO SPELL [`of_page`](Self::of_page) — it is only correct for a tile
-    /// whose new slots all land in ONE block. A prefill chunk's `mq_pad` rows span up to a whole
-    /// page, so that path keeps `of_page`, and the emitter picks between them on the ROW COUNT of the
-    /// op rather than on the model.
-    pub const fn of_write_slab() -> KtTileSlots {
-        KtTileSlots(STK as u32)
+    /// ⭐ THE ONE STICK-BLOCK A SWEEP WINDOW COVERS — the streamed prefix form and the decode step's
+    /// single new slot alike. Both are one block; which block is a RUNTIME fact (the window's own first
+    /// slot, or `slab_delta`'s shift), never part of the tile.
+    pub const fn of_write_slab() -> KtTile {
+        KtTile(STK as u32)
     }
 
     /// The slot-axis extent of the tile.
-    pub const fn extent(self) -> u32 {
+    pub const fn slot_extent(self) -> u32 {
         self.0
+    }
+
+    /// The feature-axis extent — ONE STICK, always. Not a parameter: see the type's own doc for the two
+    /// bugs that were paid for the two extents being independently settable.
+    pub const fn feat_extent(self) -> u32 {
+        POOL_STICK
     }
 }
 
-/// THE Kᵀ RESTICKIFY TILE'S FEATURE EXTENT — the head-dim width one tile carries. Two doors: one
-/// head-dim slab (the sub-block form, quantity (4) of the four 64s) or the whole head dim (the
-/// whole-page re-transpose). A slot extent has no door here, mirroring [`KtTileSlots`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct KtTileFeats(u32);
-
-impl KtTileFeats {
-    /// One head-dim slab — quantity (4): the per-(row-window, slab) sub-block form.
-    pub const fn of_head_slab(feats: SlabFeats) -> KtTileFeats {
-        KtTileFeats(feats.n())
-    }
-
-    /// The whole head dim — the whole-page re-transpose spans it.
-    pub const fn of_head_dim(hd: u32) -> KtTileFeats {
-        KtTileFeats(hd)
-    }
-
-    /// The feature-axis extent of the tile.
-    pub const fn extent(self) -> u32 {
-        self.0
-    }
-}
+/// ⛔ THE INVARIANT, ASSERTED AT COMPILE TIME rather than trusted: every door [`KtTile`] has yields one
+/// whole stick on BOTH axes. `StickExtent` refuses a non-stick extent at emit, but that is a runtime
+/// `Err` inside a builder; this is the same claim where it cannot be reached.
+///
+/// ⛔⛔⛔ AND IT IS A FREE ITEM, NOT AN ASSOCIATED CONST. `const KtTile::_BOTH_AXES_ARE_ONE_STICK` was the
+/// first spelling of this and it was DEAD: an unused associated const is never evaluated, so the whole
+/// guard compiled clean with `feat_extent` deliberately returning `POOL_STICK * 2`. A free `const _: ()`
+/// is always evaluated. Verified by that same falsification passing through this form as an error.
+const _KT_TILE_IS_ONE_STICK_ON_BOTH_AXES: () = {
+    assert!(
+        KtTile::of_write_slab().slot_extent() == POOL_STICK
+            && KtTile::of_write_slab().feat_extent() == POOL_STICK
+            && KtTile::of_row_window(WindowRows).slot_extent() == POOL_STICK
+            && KtTile::of_row_window(WindowRows).feat_extent() == POOL_STICK,
+        "every KtTile door must yield exactly one stick on both axes — a multi-stick Kᵀ restickify \
+         writes its second stick wrong on card (garbled decode past 64 tokens on the slot axis; and at \
+         hd=128 on the feature axis it was degenerate from the first token)"
+    );
+};
 
 /// [`MqPad::cols`]'s answer: the COLUMN count of a score row against the new block — the width of the
 /// `[nqh·mq, mq_pad]` score/causal-mask buffers.
@@ -385,7 +390,7 @@ impl RowWindow {
     /// row is one score column against the new block, sized by the reduce's one-stick column budget,
     /// which is why the window is stick-tall in the first place) — spending it as columns goes
     /// through [`BlockCols::of_row_window`], spending it as rows through
-    /// [`KtTileSlots::of_row_window`], each of which demands this witness by type.
+    /// [`KtTile::of_row_window`], each of which demands this witness by type.
     pub const ROWS: WindowRows = WindowRows;
 
     /// Which window of the sweep — the sub-block's name, its Kᵀ slot-stick plane, its cmask block.

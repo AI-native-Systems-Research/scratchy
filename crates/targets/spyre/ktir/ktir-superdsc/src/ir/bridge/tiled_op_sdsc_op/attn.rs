@@ -121,8 +121,8 @@ use crate::emit::{
 };
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{
-    BlockCols, FeatIdx, FlatTag, KernelTag, KtTileFeats, KtTileSlots, Lanes, MaskRows, MatK, MatM,
-    MatN, MatY, PerRequestRows, RowCount, RowWindow, SlotWindow, Stk,
+    BlockCols, FeatIdx, FlatTag, KernelTag, KtTile, Lanes, MaskRows, MatK, MatM, MatN, MatY,
+    PerRequestRows, RowCount, RowWindow, SlotWindow, Stk,
 };
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{DataFormat, Df, Fp16};
@@ -1576,10 +1576,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     } else {
                         format!("attn_newkt{kvh}s{j}l{sl}_o{t}")
                     },
-                    // The tile is one ROW WINDOW of new tokens by one FEATURE SLAB — quantities (3) and (4),
-                    // not two lane counts: the window's rows are the tile's K rows, the slab its features.
-                    KtTileSlots::of_row_window(RowWindow::ROWS),
-                    KtTileFeats::of_head_slab(FeatIdx::SLAB_FEATS),
+                    // The tile is one ROW WINDOW of new tokens — quantity (3), not a lane count: the
+                    // window's rows ARE the tile's K rows. Its feature extent is not ours to pick; a Kᵀ
+                    // restickify is one stick wide by construction, hence the `nslab` loop around this.
+                    KtTile::of_row_window(RowWindow::ROWS),
                     new_k_scaled,
                     // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed
                     // `mq_pad` version that regressed decode). `new_k_scaled` inherits its kv-head stride from
@@ -2118,20 +2118,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         } else {
                             format!("attn_pfxkt{kvh}b{b}l{sl}_o{t}")
                         },
-                        crate::sdsc_abstract::KtTileSlots::of_write_slab(),
-                        // ONE STICK of features per op, through the same door the new-block leg uses.
-                        crate::sdsc_abstract::KtTileFeats::of_head_slab(FeatIdx::SLAB_FEATS),
+                        // ONE STICK-BLOCK of slots, and ONE STICK of features — the latter is not a
+                        // parameter at all, which is why `nslab` is a loop here rather than an extent.
+                        crate::sdsc_abstract::KtTile::of_write_slab(),
                         knat,
                         // This window's slots of the NATURAL-K plane, at this slab's features — both through
                         // the pool's own model, so no stride is spelled here.
-                        crate::addr::DevOff::from_view_step(pool.addr(
-                            crate::sdsc_abstract::KvCoord::block(
-                                crate::sdsc_abstract::KvPlane::Knat,
-                                head,
-                            )
-                            .at_slot(w.first_slot())
-                            .at_feat(FeatIdx::of_slab(sl)),
-                        )),
+                        crate::addr::DevOff::from_view_step(
+                            pool.addr(
+                                crate::sdsc_abstract::KvCoord::block(
+                                    crate::sdsc_abstract::KvPlane::Knat,
+                                    head,
+                                )
+                                .at_slot(w.first_slot())
+                                .at_feat(FeatIdx::of_slab(sl)),
+                            ),
+                        ),
                         &pfx_kt,
                         // The scratch's `[nkvh, hd, STK]` block for this kv head, at this slab's feature
                         // rows. No window term — the scratch holds exactly ONE window at a time, which is

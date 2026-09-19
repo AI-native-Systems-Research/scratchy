@@ -34,9 +34,9 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_pointwise_broadcast_off, bmm_site,
-    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec,
-    pointwise_chunk_out_offset, pw2, rb, rbo,
+    EmittedOp, In, assemble_pointwise_broadcast_off, bmm_site, check_pointwise_cols,
+    emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec, pointwise_chunk_out_offset,
+    pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_attn, assemble_matmul_off, assemble_matmul_seeded,

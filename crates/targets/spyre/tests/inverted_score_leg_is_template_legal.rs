@@ -17,8 +17,8 @@
 //! the downstream reorientation (the softmax's reduce axis, the score-block transpose the value leg needs)
 //! is built — because if the operands are not legal none of that work is worth starting.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::matmul_opspec_off;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::matmul_opspec_off;
 use ktir_superdsc::sdsc_abstract::{
     BlockCols, Lanes, MatK, MatM, MatN, MatY, PagedKvPool, QueryRowCount,
 };
@@ -28,7 +28,10 @@ const HD: u32 = 64;
 const MQ_PAD: u32 = 64;
 
 /// The declared `(layoutDimOrder_, stickDimOrder_)` of each primary dataspace in the emitted descriptor.
-fn primary_layouts(op: &ktir_superdsc::superdsc_opspec::OpSpec, name: &str) -> Vec<(String, Vec<String>)> {
+fn primary_layouts(
+    op: &ktir_superdsc::superdsc_opspec::OpSpec,
+    name: &str,
+) -> Vec<(String, Vec<String>)> {
     let folds = ktir_superdsc::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
     let emitted = ktir_superdsc::emit::emit_sdsc_tiled(name, op, &folds, &mut 0, None)
         .expect("the inverted leg must assemble");
@@ -39,7 +42,11 @@ fn primary_layouts(op: &ktir_superdsc::superdsc_opspec::OpSpec, name: &str) -> V
         if let Some(e) = info.get(key) {
             let stick = e["stickDimOrder_"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             out.push((key.to_string(), stick));
         }

@@ -3644,17 +3644,26 @@ fn restickify_kt_opspec_2d(
     })
 }
 
-/// Assemble ONE per-head Kᵀ restickify (natural `[slots,feats]` → slot-sticked `[feats,slots]`).
-/// See [`restickify_kt_opspec_2d`]. The tile's two extents arrive as
-/// [`KtTileSlots`](crate::sdsc_abstract::KtTileSlots)/[`KtTileFeats`](crate::sdsc_abstract::KtTileFeats) —
-/// each door names which quantity fills it, so the pair cannot be handed over swapped.
-/// `in_off`/`out_off` are the per-head element offsets into the natural cache (`head·cap·hd`) and
-/// the Kᵀ scratch (`head·hd·cap`).
+/// Assemble ONE per-(head, feature-slab) Kᵀ restickify (natural `[slots,feats]` → slot-sticked
+/// `[feats,slots]`). See [`restickify_kt_opspec_2d`].
+///
+/// ⭐ THE TILE IS ONE STICK ON BOTH AXES and the caller cannot say otherwise — [`KtTile`] has one
+/// door per slot window and NO feature door at all, because a multi-stick Kᵀ restickify is the
+/// known-bad shape on card (it garbled decode past 64 tokens on the slot axis, and at `hd = 128` it
+/// was degenerate from the first token on the feature axis). A caller covering `hd > 64` therefore
+/// emits `hd / 64` of these, one per feature slab, which is the only correct spelling.
+///
+/// `in_off`/`out_off` are the element offsets into the natural cache (`head·cap·hd + slab·64`) and
+/// the Kᵀ scratch (`head·hd·64 + slab·64`).
+///
+/// [`KtTile`]: crate::sdsc_abstract::KtTile
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_restickify_kt_2d(
     op_name: &str,
-    slots: crate::sdsc_abstract::KtTileSlots,
-    feats: crate::sdsc_abstract::KtTileFeats,
+    // ONE tile, one stick on BOTH axes by construction — see `KtTile`. This was two independently
+    // settable extents, which cost a garbled decode on the slot axis and a degenerate hd=128 on the
+    // feature axis.
+    tile: crate::sdsc_abstract::KtTile,
     in_name: &str,
     in_off: crate::addr::DevOff,
     o_name: &str,
@@ -3666,8 +3675,8 @@ pub fn assemble_restickify_kt_2d(
     let out_off = out_off.into_raw_elems();
 
     let op = restickify_kt_opspec_2d(
-        slots.extent(),
-        feats.extent(),
+        tile.slot_extent(),
+        tile.feat_extent(),
         in_name,
         o_name,
         in_off,

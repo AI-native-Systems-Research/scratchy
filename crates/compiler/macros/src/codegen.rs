@@ -8862,8 +8862,8 @@ fn launch_tokens(
         batched_requests,
         fold_rows,
     } = kv;
-    let [slot, slots, req] = [*slot_stride_bytes, *page_slots, *request]
-        .map(proc_macro2::Literal::u32_unsuffixed);
+    let [slot, slots, req] =
+        [*slot_stride_bytes, *page_slots, *request].map(proc_macro2::Literal::u32_unsuffixed);
     // ⭐ THE SLAB SHIFT IS RECONSTRUCTED THROUGH ITS CONSTRUCTOR, not field-by-field, so the baked
     // `static` cannot hold a stride whose page went missing any more than the value it was read from
     // could — `SlabShift`'s fields are private and `new` takes both. `NonZeroU32::new(..).unwrap()` is

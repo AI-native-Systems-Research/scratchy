@@ -29,7 +29,9 @@ fn reachable_starts_in_a_page() -> Vec<u32> {
     let mut starts = Vec::new();
     let mut want = 0u32;
     while want < page {
-        let placed = PagedKvPool::chunk_write_start(KvSlot::new(want), padded).slot().get();
+        let placed = PagedKvPool::chunk_write_start(KvSlot::new(want), padded)
+            .slot()
+            .get();
         starts.push(placed);
         // The chunk advances by the room its page has left, clipped to a whole chunk — the host's own law.
         let room = PagedKvPool::chunk_room(KvSlot::new(want)).get();
@@ -105,7 +107,8 @@ fn the_baked_block_count_matches_the_measured_span() {
         .max()
         .expect("at least one start");
     assert_eq!(
-        PagedKvPool::PREFILL_CHUNK_BLOCKS as u32, worst,
+        PagedKvPool::PREFILL_CHUNK_BLOCKS as u32,
+        worst,
         "the emitter bakes {} block op(s) per kv head but the widest reachable window spans {worst}",
         PagedKvPool::PREFILL_CHUNK_BLOCKS
     );

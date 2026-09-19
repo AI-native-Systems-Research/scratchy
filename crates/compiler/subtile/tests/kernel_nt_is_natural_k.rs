@@ -78,7 +78,11 @@ fn a_kernel_layout_addresses_the_transposed_plane() {
                         .at_slot(KvSlot::new(slot as u32))
                         .at_feat(FeatIdx::new(feat as u32)),
                 ) - block;
-                assert_eq!(kt.dev_off(feat, slot), want as usize, "hd={hd} Kᵀ ({slot},{feat})");
+                assert_eq!(
+                    kt.dev_off(feat, slot),
+                    want as usize,
+                    "hd={hd} Kᵀ ({slot},{feat})"
+                );
             }
         }
     }
@@ -93,8 +97,16 @@ fn the_kind_says_which_axis_reduces() {
     let kt = StickLayout::kernel(hd, cap);
     let nt = StickLayout::kernel_nt(cap, hd);
     assert_eq!(kt.contraction_elems(), Some(hd), "Kᵀ reduces over hd");
-    assert_eq!(nt.contraction_elems(), Some(hd), "natural K ALSO reduces over hd");
-    assert_eq!(kt.output_elems(), Some(cap), "and both emit cap score columns");
+    assert_eq!(
+        nt.contraction_elems(),
+        Some(hd),
+        "natural K ALSO reduces over hd"
+    );
+    assert_eq!(
+        kt.output_elems(),
+        Some(cap),
+        "and both emit cap score columns"
+    );
     assert_eq!(nt.output_elems(), Some(cap));
     assert_eq!(kt.kind, StickKind::Kernel);
     assert_eq!(nt.kind, StickKind::KernelNt);

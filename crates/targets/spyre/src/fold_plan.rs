@@ -1614,7 +1614,11 @@ mod tests {
             (64, 1, "the first slab boundary"),
             (255, 3, "the last slab of page 0"),
             (256, 0, "slot 0 of page 1 — the wrap, and the whole point"),
-            (300, 0, "slot 44 of page 1: slab 0, where unwrapped gave slab 4"),
+            (
+                300,
+                0,
+                "slot 44 of page 1: slab 0, where unwrapped gave slab 4",
+            ),
             (511, 3, "the last slab of page 1"),
             (512, 0, "slot 0 of page 2"),
         ] {
