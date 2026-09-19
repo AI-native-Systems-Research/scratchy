@@ -1,0 +1,73 @@
+/* Styles zero-md's rendered output. Injected per-page via a `<template
+ * data-append>` inside each `<zero-md>` (its only theming hook — the content
+ * renders into a shadow root, so an ordinary <link> can't reach it). Colors
+ * are all var(--cds-*): those custom properties inherit through the shadow
+ * boundary from <html>'s cds--g100/cds--white class, same as the rest of the
+ * site, so this file carries no hex of its own. */
+
+:host {
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.markdown-body {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 5rem;
+  color: var(--cds-text-primary);
+  background: transparent;
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+.markdown-body :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--cds-text-primary);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 2rem 0 0.75rem;
+}
+.markdown-body h1 { font-size: 2rem; margin-top: 0; }
+.markdown-body h2 { font-size: 1.5rem; border-bottom: 1px solid var(--cds-border-subtle-01); padding-bottom: 0.4rem; }
+.markdown-body h3 { font-size: 1.2rem; }
+
+.markdown-body p { margin: 0 0 1rem; }
+
+.markdown-body a { color: var(--cds-link-primary); text-decoration: none; }
+.markdown-body a:hover { text-decoration: underline; }
+
+.markdown-body code {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.875em;
+  background: var(--cds-layer-01);
+  border: 1px solid var(--cds-border-subtle-01);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+
+.markdown-body pre {
+  background: var(--cds-layer-01);
+  border: 1px solid var(--cds-border-subtle-01);
+  border-radius: 8px;
+  padding: 1rem 1.15rem;
+  overflow-x: auto;
+}
+.markdown-body pre code { background: none; border: none; padding: 0; }
+
+.markdown-body blockquote {
+  margin: 0 0 1rem;
+  padding: 0.25rem 0 0.25rem 1rem;
+  border-left: 3px solid var(--cds-link-primary);
+  color: var(--cds-text-secondary);
+}
+
+.markdown-body table { border-collapse: collapse; width: 100%; margin: 0 0 1.5rem; }
+.markdown-body th, .markdown-body td {
+  border: 1px solid var(--cds-border-subtle-01);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+.markdown-body th { background: var(--cds-layer-01); }
+
+.markdown-body hr { border: none; border-top: 1px solid var(--cds-border-subtle-01); margin: 2rem 0; }
+
+.markdown-body ul, .markdown-body ol { padding-left: 1.4rem; }
+.markdown-body li { margin: 0.25rem 0; }
