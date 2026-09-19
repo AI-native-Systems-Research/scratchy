@@ -33,6 +33,39 @@ pub enum AttrKey {
     DimKinds,
     /// `dim_map_0`
     DimMap0,
+    /// `dim_subs` — ONE `AffineMapList`, one map per OUTPUT DIMENSION of a
+    /// `ktdp.construct_indirect_access_tile`, carrying that dim's SUBSCRIPT
+    /// EXPRESSIONS.
+    ///
+    /// ⭐ WHY THIS KEY EXISTS. `parse_dim_subscripts` could build neither a
+    /// `direct_sub` dim nor an `indirect` dim with an explicit index expression,
+    /// because no key could carry the expression: it failed loudly on the first
+    /// and silently addressed the index view by the bare enumeration point on
+    /// the second. A gather whose index is an EXPRESSION — `table[ids[%off +
+    /// %d0], %d1]`, which is what any grid of more than one work item over one
+    /// index vector needs — was therefore inexpressible.
+    ///
+    /// ⛔ AND IT IS **ONE** KEY FOR EVERY DIM, NOT `dim_sub_0`, `dim_sub_1`, ...
+    /// [`AttrKey::DimMap0`] is the per-dim spelling and it is a dead end: only
+    /// `dim_map_0` is declared, so the SECOND `direct_expr` dim of any op is
+    /// unrepresentable and the handler refuses it by arity. A list indexed by
+    /// dimension has no such ceiling.
+    ///
+    /// # THE DOMAIN IS THE ENUMERATION POINT; CAPTURES ARE SYMBOLS
+    ///
+    /// Map `d` is evaluated at the intermediate-variable point, so `Dim(i)` is
+    /// enumeration variable `i` — NOT an operand, and NOT the captures-first
+    /// domain MLIR's own `per_dim_subscript_maps` uses. Outer SSA scalars enter
+    /// as `Sym(j)`, naming `intermediate_vars[j]`, whose value is read from the
+    /// value table when the op executes. That is exactly
+    /// [`crate::memref::SubExpr`]'s `(expr, syms)` split, and it is what lets an
+    /// `AffineExpr<'static>` — whose children are BORROWS and so cannot be built
+    /// while a handler runs — be read straight off the program.
+    ///
+    /// Result COUNT per map is the subscript arity of that dim: the index view's
+    /// RANK for an `indirect` dim (one expression per view axis, dotted with the
+    /// view's strides), and 1 for a `direct_sub` dim.
+    DimSubs,
     /// `dimensions`
     Dimensions,
     /// `dtype`

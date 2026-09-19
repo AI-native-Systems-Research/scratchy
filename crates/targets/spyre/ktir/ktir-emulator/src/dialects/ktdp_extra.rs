@@ -20,7 +20,7 @@ use crate::opkind::OpKind;
 use std::collections::HashMap;
 
 use super::{Dispatch, LatencyCategory};
-use crate::affine::AffineExpr;
+use crate::affine::{AffineExpr, AffineMap};
 use crate::attrkey::AttrKey;
 use crate::context::CoreContext;
 use crate::dtypes::DType;
@@ -175,9 +175,12 @@ fn construct_distributed_memory_view(
 /// - `shape`: `IntList` — output access-tile shape.
 /// - `variables_space_set`: `AffineSet` — domain of the intermediate vars.
 /// - `variables_space_order`: `AffineMap` (optional) — iteration order; normalized to `None` when identity, matching the Python parser.
-/// - `dim_kinds`: `StrList` — per-dim kind, one of `"direct"` / `"direct_expr"` / `"indirect"`.
-/// - `dim_data`: `IntList` — per-dim payload parallel to `dim_kinds`: variable index for `direct`, index-view index for `indirect`, ignored for `direct_expr`.
+/// - `dim_kinds`: `StrList` — per-dim kind, one of `"direct"` / `"direct_sub"` / `"direct_expr"` / `"indirect"`.
+/// - `dim_data`: `IntList` — per-dim payload parallel to `dim_kinds`: variable index for `direct`, index-view index for `indirect`, ignored for `direct_expr` / `direct_sub`.
 /// - `dim_map_N`: `AffineMap` for the Nth `direct_expr` dim, left-to-right.
+/// - `dim_subs`: `AffineMapList` — one map per output dim, carrying the SUBSCRIPT
+///   EXPRESSIONS of the `direct_sub` and `indirect` dims. Domain = the enumeration
+///   point, symbols = `intermediate_vars`. See [`AttrKey::DimSubs`].
 ///
 /// `op.operands[0]` is the primary memref; `op.operands[1..]` are the index
 /// views, in indirect-dim order. Mirrors the Python handler's construction of
@@ -230,7 +233,7 @@ fn construct_indirect_access_tile(
         _ => None,
     };
 
-    let dim_subscripts = parse_dim_subscripts(op, ctx, shape.len())?;
+    let dim_subscripts = parse_dim_subscripts(op, ctx, shape.len(), &index_views)?;
 
     let iat = IndirectAccessTile {
         parent_ref,
@@ -245,11 +248,20 @@ fn construct_indirect_access_tile(
 }
 
 /// Build the per-output-dim `DimSubscript` list from the `dim_kinds` /
-/// `dim_data` / `dim_sub_<d>` attributes. Mirrors the Python `dim_subscripts`
-/// resolution loop: subscript expressions in `dim_sub_<d>` are parsed against
-/// the `intermediate_vars` (iteration dims) with the remaining `%name` tokens
-/// resolved as outer SSA scalars from the value table — the Rust analogue of
-/// Python's `_resolve_node` folding `("ssa", "%name")` into `("const", v)`.
+/// `dim_data` / `dim_subs` attributes. Mirrors the Python `dim_subscripts`
+/// resolution loop: the subscript expression of dim `d` is `dim_subs[d]`, whose
+/// domain is the enumeration point and whose SYMBOLS are the `intermediate_vars`,
+/// resolved to their concrete values against the value table here — the Rust
+/// analogue of Python's `_resolve_node` folding `("ssa", "%name")` into
+/// `("const", v)`.
+///
+/// ⚖️ THE KEY IS `dim_subs` AND NOT `dim_sub_<d>`. This doc comment named
+/// `dim_sub_<d>` — the per-dim spelling the Python harness used — for as long as
+/// the two arms below could not be built at all, and `AttrKey` never declared
+/// such a key in any spelling. `dim_subs` is ONE list indexed by dimension,
+/// because a per-dim key family in a closed enum has the ceiling `dim_map_0`
+/// already demonstrates: only the first is declared, so the second dim of that
+/// kind is unrepresentable.
 ///
 /// A bare `direct` dim referencing an intermediate variable that is itself
 /// bound in the value table (an outer SSA scalar listed in
@@ -260,6 +272,7 @@ fn parse_dim_subscripts(
     op: &Operation<'static>,
     ctx: &CoreContext,
     ndims: usize,
+    index_views: &[MemRef],
 ) -> Result<Vec<DimSubscript>, String> {
     let kinds = match op.attr(AttrKey::DimKinds) {
         Some(Attr::StrList(v)) => *v,
@@ -298,6 +311,34 @@ fn parse_dim_subscripts(
         _ => &[],
     };
 
+    // The per-dim subscript maps, and the concrete value of every intermediate
+    // variable that IS an outer SSA scalar. `None` for one that is not bound in
+    // the value table (a pure iteration variable); referencing such a one as a
+    // symbol is refused by name in `sub_exprs`, never defaulted to 0 — a wrong
+    // address computes a well-formed wrong answer.
+    let dim_subs: Option<&[AffineMap<'static>]> = match op.attr(AttrKey::DimSubs) {
+        Some(Attr::AffineMapList(v)) => {
+            if v.len() != ndims {
+                return Err(format!(
+                    "construct_indirect_access_tile: dim_subs has {} map(s) but shape has \
+                     {ndims} dims",
+                    v.len()
+                ));
+            }
+            Some(v)
+        }
+        None => None,
+        Some(other) => {
+            return Err(format!(
+                "construct_indirect_access_tile: 'dim_subs' is {other:?}, expected AffineMapList"
+            ));
+        }
+    };
+    let syms: Vec<Option<i64>> = intermediate_vars
+        .iter()
+        .map(|&v| ctx.get_value(v).ok().and_then(|x| scalar_i64(x, "dim_subs symbol").ok()))
+        .collect();
+
     let mut subs = Vec::with_capacity(ndims);
     let mut expr_cursor = 0usize;
     for (d, kind) in kinds.iter().enumerate() {
@@ -321,28 +362,42 @@ fn parse_dim_subscripts(
                     None => DimSubscript::Direct { var_index },
                 }
             }
-            // ⭐ NO COUNTERPART UNDER THE TYPED IR. A `direct_sub` dim, and an
-            // `indirect` dim with explicit index expressions, carried their
-            // subscript as a TEXT attribute (`dim_sub_<d>`) that was parsed at
-            // execution time into an `AffineExpr` tree. `AttrKey` declares no
-            // per-dim subscript key, and an `AffineExpr<'static>`'s children are
-            // BORROWS — a tree cannot be built while a handler runs, only read from
-            // the program. Both need the subscript stated as an attribute the
-            // producer builds, so this fails loudly rather than computing a
-            // silently different address.
-            "direct_sub" => {
-                return Err(format!(
-                    "construct_indirect_access_tile: dim {d} is direct_sub, whose subscript has \
-                     no attribute to carry it — state it as an affine map on the op"
-                ));
-            }
-            "indirect" => DimSubscript::Indirect {
-                view: data[d] as usize,
-                // Empty = the identity-subscript path (address the view by the
-                // enumeration point itself); explicit index expressions have no
-                // attribute to carry them, as above.
-                idx_exprs: Vec::new(),
+            // ⭐ THE SUBSCRIPT IS READ FROM `dim_subs`, NOT REBUILT HERE. An
+            // `AffineExpr<'static>`'s children are BORROWS, so a tree cannot be
+            // constructed while a handler runs — only read off the program. So the
+            // PRODUCER states dim `d`'s subscript as `dim_subs[d]`, over the
+            // enumeration point with `intermediate_vars` as symbols, and this arm
+            // only resolves those symbols' values. A `direct_sub` dim with no
+            // `dim_subs` is still refused: its subscript is its whole meaning.
+            "direct_sub" => DimSubscript::DirectSub {
+                sub: one_sub_expr(dim_subs, &syms, d, "direct_sub")?,
             },
+            "indirect" => {
+                let view = data[d] as usize;
+                // One expression per INDEX-VIEW AXIS, dotted with that view's
+                // strides by `resolve_idx_reads`. Absent `dim_subs` keeps the
+                // legacy identity-subscript path — address the view by the
+                // enumeration point itself — which is what the structural
+                // `port_indirect_access` tests build.
+                let idx_exprs = sub_exprs(dim_subs, &syms, d)?;
+                // ⛔ THE ARITY IS CHECKED HERE BECAUSE `resolve_idx_reads` ZIPS.
+                // `idx_exprs.iter().zip(&iv.strides)` stops at the shorter, so a
+                // subscript list one short of the view's rank silently drops that
+                // axis's contribution and reads a well-formed WRONG element.
+                if let Some(iv) = index_views.get(view) {
+                    if !idx_exprs.is_empty() && idx_exprs.len() != iv.strides.len() {
+                        return Err(format!(
+                            "construct_indirect_access_tile: dim {d} is indirect through \
+                             index_view {view}, which is rank {}, but 'dim_subs' gives {} \
+                             subscript expression(s). They are dotted with the view's strides, \
+                             so a shorter list silently addresses the wrong element",
+                            iv.strides.len(),
+                            idx_exprs.len()
+                        ));
+                    }
+                }
+                DimSubscript::Indirect { view, idx_exprs }
+            }
             "direct_expr" => {
                 // Only the FIRST `direct_expr` dim is expressible: `AttrKey` declares
                 // `dim_map_0` and no successors.
@@ -375,6 +430,103 @@ fn parse_dim_subscripts(
         subs.push(sub);
     }
     Ok(subs)
+}
+
+/// Dim `d`'s subscript expressions as [`SubExpr`]s, or an empty vector when the op
+/// carries no `dim_subs` at all (the legacy identity-subscript path).
+///
+/// ⛔ A SYMBOL WITH NO RESOLVED VALUE IS A REFUSAL. `Sym(j)` names
+/// `intermediate_vars[j]`; if that value is not bound in the value table there is
+/// no address to compute, and substituting anything — 0 most temptingly — gathers
+/// a well-formed WRONG row. So every symbol a map references is checked here,
+/// before a single element is read.
+fn sub_exprs(
+    dim_subs: Option<&[AffineMap<'static>]>,
+    syms: &[Option<i64>],
+    d: usize,
+) -> Result<Vec<SubExpr>, String> {
+    let Some(maps) = dim_subs else {
+        return Ok(Vec::new());
+    };
+    let map = &maps[d];
+    let resolved = resolve_syms(map, syms, d)?;
+    Ok(map
+        .exprs
+        .iter()
+        .map(|e| SubExpr {
+            expr: *e,
+            syms: resolved.clone(),
+        })
+        .collect())
+}
+
+/// The single subscript expression of a one-subscript dim (`direct_sub`).
+fn one_sub_expr(
+    dim_subs: Option<&[AffineMap<'static>]>,
+    syms: &[Option<i64>],
+    d: usize,
+    kind: &str,
+) -> Result<SubExpr, String> {
+    let mut got = sub_exprs(dim_subs, syms, d)?;
+    if got.len() != 1 {
+        return Err(format!(
+            "construct_indirect_access_tile: dim {d} is {kind}, which is indexed by exactly ONE              subscript expression; 'dim_subs' supplies {}. State it as `dim_subs[{d}]` over the              enumeration point, with the captured scalars as symbols",
+            got.len()
+        ));
+    }
+    Ok(got.remove(0))
+}
+
+/// The symbol values one map needs, in `Sym` order, refusing an unresolved one.
+fn resolve_syms(
+    map: &AffineMap<'static>,
+    syms: &[Option<i64>],
+    d: usize,
+) -> Result<Vec<i64>, String> {
+    let mut highest: Option<usize> = None;
+    for e in map.exprs {
+        walk_syms(e, &mut |j| {
+            highest = Some(highest.map_or(j, |h: usize| h.max(j)));
+        });
+    }
+    let needed = highest.map_or(0, |h| h + 1);
+    if needed > syms.len() {
+        return Err(format!(
+            "construct_indirect_access_tile: dim {d}'s subscript references s{} but              'intermediate_vars' names only {} value(s)",
+            needed - 1,
+            syms.len()
+        ));
+    }
+    syms[..needed]
+        .iter()
+        .enumerate()
+        .map(|(j, v)| {
+            v.ok_or_else(|| {
+                format!(
+                    "construct_indirect_access_tile: dim {d}'s subscript references s{j} =                      intermediate_vars[{j}], which is not bound to a scalar in the value table.                      REFUSING rather than substituting a value: a wrong subscript gathers a                      well-formed wrong row"
+                )
+            })
+        })
+        .collect()
+}
+
+/// Call `f` with every `Sym` index in `e`.
+fn walk_syms(e: &AffineExpr<'static>, f: &mut impl FnMut(usize)) {
+    match e {
+        AffineExpr::Sym(j) => f(*j),
+        AffineExpr::Dim(_) | AffineExpr::Const(_) | AffineExpr::Ref(_) => {}
+        AffineExpr::Neg(a) => walk_syms(a, f),
+        AffineExpr::Add(a, b)
+        | AffineExpr::Sub(a, b)
+        | AffineExpr::Mul(a, b)
+        | AffineExpr::FloorDiv(a, b)
+        | AffineExpr::Mod(a, b)
+        | AffineExpr::Max(a, b)
+        | AffineExpr::Min(a, b) => {
+            walk_syms(a, f);
+            walk_syms(b, f);
+        }
+    }
 }
 
 // --- attribute helpers ---------------------------------------------------
