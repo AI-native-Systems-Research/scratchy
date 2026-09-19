@@ -2096,33 +2096,54 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // the score ops that read it. Ordered restickify→score per window inside one launch, so a single
         // scratch block serves every window — which is what makes the resident Kᵀ plane unnecessary.
         if stream_prefix_kt {
+            // ⛔⛔⛔ ONE RESTICKIFY PER (KV HEAD, FEATURE SLAB) — NOT per kv head. A MULTI-STICK Kᵀ
+            // restickify is the known-bad on-card shape this file already records: "the on-card ReStickify
+            // wrote the 2nd Kᵀ stick wrong, which is what garbled decode past 64 tokens, and the fix was to
+            // stop asking it to". Passing the whole head dim is exactly that ask at `hd > STK`, and it
+            // MEASURED as such: granite-3.1-8b fp8 (hd=128) answered "France is a miswrite." repeatedly,
+            // degenerate from the first token, while granite-3.1-2b (hd=64, nslab=1) was byte-identical
+            // because there the two forms are the same emission. The new-block leg above splits by slab for
+            // this reason; so does this one now.
+            let nslab = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, Df::Fp16).get();
             for kvh in 0..nkvh {
                 let head = crate::sdsc_abstract::KvHead::new(
                     kvh,
                     std::num::NonZeroU32::new(nkvh).expect("nkvh > 0"),
                 )
                 .expect("kv head in range");
-                ops.push(crate::emit::assemble_restickify_kt_2d(
-                    &format!("attn_pfxkt{kvh}b{b}_o{t}"),
-                    crate::sdsc_abstract::KtTileSlots::of_write_slab(),
-                    crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-                    knat,
-                    // This window's slots of the NATURAL-K plane — the window carries its own first slot,
-                    // so no block stride is spelled here.
-                    crate::addr::DevOff::from_view_step(pool.addr(
-                        crate::sdsc_abstract::KvCoord::block(
-                            crate::sdsc_abstract::KvPlane::Knat,
-                            head,
-                        )
-                        .at_slot(w.first_slot()),
-                    )),
-                    &pfx_kt,
-                    // The scratch's own `[nkvh, hd, STK]` block for this kv head — no window term, because
-                    // the scratch holds exactly ONE window at a time. That is the whole point of it.
-                    crate::addr::DevOff::from_view_step(kvh * hd * crate::sdsc_abstract::POOL_STICK),
-                    sym_id_base,
-                    layout,
-                ));
+                for sl in 0..nslab {
+                    ops.push(crate::emit::assemble_restickify_kt_2d(
+                        &if nslab == 1 {
+                            format!("attn_pfxkt{kvh}b{b}_o{t}")
+                        } else {
+                            format!("attn_pfxkt{kvh}b{b}l{sl}_o{t}")
+                        },
+                        crate::sdsc_abstract::KtTileSlots::of_write_slab(),
+                        // ONE STICK of features per op, through the same door the new-block leg uses.
+                        crate::sdsc_abstract::KtTileFeats::of_head_slab(FeatIdx::SLAB_FEATS),
+                        knat,
+                        // This window's slots of the NATURAL-K plane, at this slab's features — both through
+                        // the pool's own model, so no stride is spelled here.
+                        crate::addr::DevOff::from_view_step(pool.addr(
+                            crate::sdsc_abstract::KvCoord::block(
+                                crate::sdsc_abstract::KvPlane::Knat,
+                                head,
+                            )
+                            .at_slot(w.first_slot())
+                            .at_feat(FeatIdx::of_slab(sl)),
+                        )),
+                        &pfx_kt,
+                        // The scratch's `[nkvh, hd, STK]` block for this kv head, at this slab's feature
+                        // rows. No window term — the scratch holds exactly ONE window at a time, which is
+                        // the whole point of it.
+                        crate::addr::DevOff::from_view_step(
+                            kvh * hd * crate::sdsc_abstract::POOL_STICK
+                                + FeatIdx::of_slab(sl).get() * crate::sdsc_abstract::POOL_STICK,
+                        ),
+                        sym_id_base,
+                        layout,
+                    ));
+                }
             }
         }
         // PER-BLOCK OFFSETS, PRINTED (`SCRATCHY_SDSC_FOLD_TRACE`). Blocks 0-1 of a 4-block sweep are correct
