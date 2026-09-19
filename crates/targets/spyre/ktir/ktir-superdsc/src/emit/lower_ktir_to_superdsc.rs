@@ -3865,8 +3865,17 @@ mod reduce_tests {
         );
     }
 }
-/// A WHOLE-TENSOR 2-D TRANSPOSE — `[mb, out]` → `[out, mb]`, one `interslicetranspose_fp16` on the PT
-/// unit, via [`super::assemble_transpose`].
+/// A WHOLE-TENSOR 2-D TRANSPOSE — `[mb, out]` → `[out, mb]`, one masked-MACC relayout on the PT unit
+/// via [`super::try_assemble_restickify_transpose_2d`].
+///
+/// ⛔⛔⛔ IT IS NOT `interslicetranspose_fp16`, AND THE REASON IS MEASURED AT THE CALL BELOW. This door
+/// went in against [`super::assemble_transpose`] and the whole of the "8×8 inter-slice block" prose
+/// further down this comment was written for that assembler; it is kept because it is still true OF
+/// THAT ASSEMBLER, which still exists and still has its own tests. What changed is which of the two
+/// relayout primitives a KTIR `linalg.transpose` lowers to: the transpose door's output stick is
+/// two-dim and the DSC2→DataflowIR V3 translator refuses it, and its 8×8 block is not the residency a
+/// score matmul's KERNEL slot reads. See the call site, and
+/// [`super::try_assemble_restickify_transpose_2d`] for the full argument and its evidence.
 ///
 /// ⭐ THE ASSEMBLER WAS ALREADY WRITTEN; WHAT WAS MISSING WAS A DOOR. `OpFunc::Transpose` is a real
 /// device primitive (`superdsc_opspec.rs`, wire name `interslicetranspose_fp16`) and
@@ -3906,12 +3915,16 @@ mod reduce_tests {
 /// alternative, and the builder's OTHER refusal — the per-core 8×8 block division — arrives as an
 /// `Error` through [`super::try_assemble_transpose`]. The panicking form is never called from here.
 ///
-/// ⚠️ THE CORE DIVISION NARROWS THIS FURTHER THAN THE STICK LAW ALONE, AND THAT IS A DEFECT ELSEWHERE,
-/// NOT A LAW OF THE DEVICE. `distribute_cores` splits `mb` alone to all 32 cores, so today only a row
-/// extent that is a multiple of `8 · 32 = 256` gives each core whole 8-blocks — the vendor's own golden
-/// `sdsc_interslicetranspose.json` splits BOTH axes and its shape (`mb 384`) is therefore REFUSED here.
-/// See [`super::transpose_opspec`]'s guard: the fix is a core division measured against that fixture,
-/// which is out of scope of an entry point and must not be guessed from one fixture point.
+/// ⚠️ WHAT THE CORE DIVISION COSTS ON THE DOOR THIS NOW USES, MEASURED AND NOT FIXED. The restickify
+/// marks BOTH its axes `is_stick` — `out` is the INPUT's stick and `y` is the OUTPUT's — so
+/// `distribute_cores` divides each by STICK COUNT, and at the decoder's `[64, 64]` each axis has
+/// exactly ONE stick: `core_split(1, 32) == 1`, so the op lands on ONE core
+/// (`numWkSlicesPerDim_ {"out": 1, "y": 1}`, read out of the probe's own emission). That is CORRECT and
+/// not a fallback — splitting either axis at this extent hands a core a fraction of a 64-lane stick,
+/// which is dxp `L3DlOpsScheduler:1070` — and it is why the transpose door's 8 cores are not available
+/// here: that door declares `mb` `is_stick: false`, i.e. it splits the very axis this one must not.
+/// The cost is one core moving an 8 KiB tile, twice per decoder layer. It is SLOW, NOT WRONG, and
+/// making it faster is a division change with its own oracle, not a widening here.
 pub fn transpose(
     name: &str,
     r: &[Region],
@@ -3998,12 +4011,27 @@ pub fn transpose(
             a.tid, a.r_cover.0, a.r_cover.1,
         ));
     }
-    // ⛔ THE FALLIBLE FORM, because the builder makes a refusal this body cannot pre-check: the
-    // per-core division must land on the output's 8×8 block, and what the division IS depends on
-    // `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
-    // divider; calling the panicking `assemble_transpose` would abort the build with a bare panic
-    // where a producer needs an error against its own op. See `super::try_assemble_transpose`.
-    super::try_assemble_transpose(
+    // ⭐⭐⭐ THE RELAYOUT IS THE **STICK AXIS**, NOT THE 8×8 INTER-SLICE BLOCK. Both doors realize
+    // `[mb, cols]` → `[cols, mb]`; `super::try_assemble_restickify_transpose_2d` states the whole
+    // argument for preferring this one, and it has two independent halves:
+    //
+    //   * `interslicetranspose_fp16`'s output stick is TWO-dim (`["out","mb"]`/`[8,8]`), and DDC turns
+    //     any relayout's output stick order into a dynamic mask with one offset PER DIM of the parent
+    //     loop, which the DSC2→DataflowIR V3 translator accepts only at ONE
+    //     (`SNComputeLowering.cpp:74`). So the transpose door CANNOT BE TRANSLATED at the default
+    //     `RCUDD1A` arch, measured at four shapes; the restickify door's one-dim `y` stick is.
+    //   * AND the 8×8 block is not the residency the score matmul's KERNEL slot reads, so that pairing
+    //     was unsound even where it baked — see `emit/whole_function.rs`'s plain-B note, which records
+    //     exactly this mismatch measured on `32_transpose_o41`/`33_matmul_o42`. This door's rank-2
+    //     `["out","y"]`-sticked-on-`y` output IS `StickLayout::kernel`'s own `dev_off` formula.
+    //
+    // ⛔ STILL THE FALLIBLE FORM, and for a REFUSAL THAT MOVED rather than went away: this builder's
+    // are the stick law (restated above so this body can name the padding alternative) and the LX fit,
+    // which depends on `distribute_cores`' answer for the shape and so cannot be restated here without
+    // duplicating the divider. `super::try_assemble_transpose` keeps its signature, its own core-
+    // division guard and its tests for `OpFunc::Transpose`'s own sake; it is simply not what a KTIR
+    // `linalg.transpose` lowers to.
+    super::try_assemble_restickify_transpose_2d(
         &format!("transpose_o{}", out.tid),
         mb,
         cols,
