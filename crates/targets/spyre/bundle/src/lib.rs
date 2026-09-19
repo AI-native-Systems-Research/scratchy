@@ -350,8 +350,9 @@ pub struct LaunchProgram<'a> {
 /// path refusing when an index did not resolve. A bundle naming a program it does not carry was
 /// constructible, and the refusal was the proof it was constructible. There is no index to dangle now.
 ///
-/// `SCRATCHY_SUPERDSC_GROUP_SIZE=1` makes this one trip per program, which is the fault-isolation end of
-/// that knob — not a different mode.
+/// A group size of `1` makes this one trip per program, which is the fault-isolation end of that range —
+/// not a different mode. It is a compile-time constant (`GroupSize::PRODUCTION`), reached by a source
+/// edit; it was an env read until the two values were measured to give DIFFERENT OUTPUT at width 8.
 // NOT `Eq`: a group carries its PROGRAMS, and a program carries float constants.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchGroup<'a> {

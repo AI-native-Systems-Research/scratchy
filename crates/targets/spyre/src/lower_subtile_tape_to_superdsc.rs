@@ -116,12 +116,12 @@ pub use ktir_superdsc::work::{
 // do not move. Changing one is now a source edit that recompiles, which is what
 // makes it a constant rather than a configuration.
 //
-// 🛑 `SCRATCHY_SUPERDSC_GROUP_SIZE` IS DELIBERATELY NOT HERE. It is the one knob
-// the canonical env DOES set (2048), and the two authorities disagree: this file
-// says "2048 was too aggressive … 512 is the real ceiling, not 2048", while the
-// canonical pod env says "G=2048 = whole-body = ~14.6 tok/s … pod DEBUG scripts use
-// 512; DON'T — it tanks throughput". Picking either silently is a crash or a 2.2×
-// throughput regression, so it stays a read until someone settles it on a card.
+// ✅ `SCRATCHY_SUPERDSC_GROUP_SIZE` IS NOW HERE TOO — see [`GroupSize`]. It was held
+// back "until someone settles it on a card" because two authorities looked like they
+// disagreed on throughput; they did not. The "it tanks throughput" warning is about
+// 2048, while 128-vs-512 is the same speed in three independent measurements. What
+// the card DID settle is worse than a throughput question: the two values give
+// DIFFERENT OUTPUT at width 8, so the partition can never be ambient.
 
 // ⭐⭐⭐ THE WIRE LAYER LIVES IN `ktir_superdsc::wire` — `Dsc`, `SdscOp` and the whole
 // `#[derive(Serialize)]` family, the three fp8 nested-fold generators, and the HBM segment
@@ -2178,16 +2178,95 @@ pub fn group_spans_two_requests(trips: &[Trip], g: usize) -> bool {
     false
 }
 
-/// Medium-grain fusion group size (trips per concrete dxp bundle). `1` = the
-/// historical per-op path (each trip its own program). Env `SCRATCHY_SUPERDSC_GROUP_SIZE`.
-/// Hoisted OUT of the pure `group_ranges` (env reads unbound CBMC — see `plan_capped`).
+/// ⭐⭐⭐⭐⭐ TRIPS PER CONCRETE dxp BUNDLE, AS A COMPILE-TIME CONSTANT — and the reason it stopped
+/// being an env read is that **the knob moves CORRECTNESS, which no authority had measured.**
+///
+/// ⛔ WHAT THE ENV READ COST: three rounds of control experiments that never controlled anything.
+/// `SCRATCHY_SUPERDSC_GROUP_SIZE` was read by `std::env::var` at macro-expansion time and forwarded by
+/// NO `build.rs`, so changing it did not invalidate a single cargo unit. MEASURED: a build wrapper
+/// exporting 512 against a tree last built at the default finished in 5.20 s with the binary's md5 and
+/// mtime UNCHANGED — forcing the re-emit needs `cargo clean --release -p scratchy-models` (456 s), and
+/// `cargo clean -p` alone cleans the dev profile and does nothing. The pod's build wrappers export 512
+/// while a bare `cargo build` gets 128, so a "restored file-by-file to md5 equality, rebuilt" control
+/// compared a 128 bundle against 512 headline numbers and read the difference as nondeterminism.
+///
+/// ⭐ THE TWO VALUES ARE FREE IN SPEED AND NOT FREE IN OUTPUT. Three separate measurements agree that
+/// 128 and 512 cost the same: `spyre_exec.rs`'s 420-token probe (avg ITL 87.5 vs 87.5 ms, wall 45.5 vs
+/// 45.4 s), the 8b TTFT/ITL comparison below, and a w8 ladder (ITL med 62.8–63.1 vs 62.6–62.8 ms). But
+/// on granite-3.1-2b fp8 at width 8 against its own solo oracle, `solo_diff` is **8,8,8,8,8** at 128
+/// (N=5) and **7,6,7** at 512 (N=3) — and the SURVIVING row moves between identical trials. The 8b
+/// descriptor multiset is byte-identical across a 128 and a 512 bake (134 bundles, 94 distinct
+/// descriptor md5s, multisets equal), and `dxp_standalone` is bit-deterministic on a fixed partition
+/// (N=14 bakes across thread counts, `taskset` and `DT_PARALLEL_THREADS`, every output md5-identical).
+/// **So the partition into compile groups is the only variable, and it changes the answer.** A quantity
+/// like that cannot live in the environment of whoever happened to run the build.
+///
+/// The `2048` the canonical pod env sets is a THIRD value and the "it tanks throughput" warning attached
+/// to it is about 2048, not about 512 — conflating the two is what kept this a read.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct GroupSize(usize);
+
+impl GroupSize {
+    /// The largest partition the bake survives. `dxp_standalone` sizes its pool from
+    /// `hardware_concurrency()` (`dscglobal.h:56`), which reports the HOST's cores and ignores the
+    /// cgroup quota, and its thread count tracks the GROUP it is handed (MEASURED ~85 threads on a
+    /// 102-descriptor group against ~192 on a 300-descriptor one). Past the pod's ~3.1k–3.9k concurrent
+    /// thread ceiling, `COMPILE_WIDTH` children of a large group die with
+    /// `LLVM ERROR: pthread_create failed: Resource temporarily unavailable`. 2048 reaches it; 512 is
+    /// the largest value observed to bake.
+    const CEILING: usize = 512;
+
+    /// The ONE value the emission uses. 128 is what an unset variable produced, so this is a pure
+    /// constant-ification of a bare `cargo build` and of CI — no bundle fingerprint moves for them.
+    /// ⛔ It is NOT what the pod wrappers were exporting, so pod headline numbers taken at 512 do not
+    /// describe this build and must be re-measured, not carried over.
+    pub const PRODUCTION: Self = Self::new(128);
+
+    /// Const-evaluated, so an out-of-range group is `error[E0080]` at build time rather than a
+    /// part-way dxp death or a silently different partition.
+    const fn new(trips: usize) -> Self {
+        assert!(trips >= 1, "a launch group holds at least one trip");
+        assert!(
+            trips <= Self::CEILING,
+            "group size exceeds the measured dxp bake thread ceiling — the bake dies part-way with \
+             `pthread_create failed`, see GroupSize::CEILING"
+        );
+        Self(trips)
+    }
+
+    /// Trips in one group. `1` = the historical per-op path (each trip its own program), which is the
+    /// fault-isolation end of the range.
+    pub const fn trips(self) -> usize {
+        self.0
+    }
+}
+
+/// ⛔⭐ THIS LINE IS WHAT MAKES THE CEILING A LOCK, AND WITHOUT IT THERE IS NO LOCK AT ALL.
+/// `new`'s asserts alone do NOT fire for [`GroupSize::PRODUCTION`]: an associated const in an inherent
+/// impl is evaluated ON DEMAND, and a read from a runtime expression (`group_size()`) does not demand it
+/// — MEASURED, `Self::new(513)` passed `cargo check` clean and recompiled in 0.40 s with no diagnostic.
+/// A module-level `const _: ()` is a required-const context, so it forces the evaluation and turns an
+/// out-of-range group into `error[E0080]`. Mutation-checked in both directions: 513 is E0080 here, 128 is
+/// clean. Same defect class as [`an-unused-associated-const-is-not-a-static-assert`] — do not remove
+/// this in the belief that the `const fn` covers it.
+const _: () = {
+    assert!(GroupSize::PRODUCTION.trips() >= 1);
+    assert!(GroupSize::PRODUCTION.trips() <= GroupSize::CEILING);
+};
+
+/// Medium-grain fusion group size (trips per concrete dxp bundle) — [`GroupSize::PRODUCTION`].
+/// Stays a function so the pure `group_ranges` takes it as an argument and CBMC keeps its bound
+/// (see `plan_capped`); it no longer reads the environment.
 pub fn group_size() -> usize {
     // Decode is ~100% launch-count bound (measured ~3640 launches/tok @ ~41µs); fusing consecutive ops
     // into ≤g groups collapses that. 2048 was too aggressive — a fp8-dynamic granite prefill body fused
     // 512-trip groups fine but a dxp_standalone `vector::_M_range_check` crash surfaced once fusion pushed
-    // past that. `SCRATCHY_SUPERDSC_GROUP_SIZE=1` is the explicit DEBUG opt-out (per-op fault isolation).
-    // Read at EMIT time + forwarded by each arch build.rs (rerun-if-env-changed + rustc-env) so a change
-    // recompiles.
+    // past that. `GroupSize::new(1)` is the per-op fault-isolation end, reached by a source edit.
+    //
+    // ⛔ THE CLAIM THAT STOOD HERE — "forwarded by each arch build.rs (rerun-if-env-changed +
+    // rustc-env) so a change recompiles" — WAS FALSE. No build.rs mentioned the variable; nothing
+    // invalidated a cargo unit; the emitted bundle and the source went out of sync silently. See
+    // `GroupSize`.
     //
     // ⭐ DEFAULT = 128, DOWN FROM 512, AND THE REASON IS THE BAKE'S THREAD BUDGET — not runtime.
     // `dxp_standalone` sizes its pool from `hardware_concurrency()` (`dscglobal.h:56`), which reports the
@@ -2209,11 +2288,7 @@ pub fn group_size() -> usize {
     // ⭐ AND IT IS FREE AT RUNTIME. MEASURED on granite-3.1-8b fp8: neither TTFT nor ITL moves between
     // 512 and 128 — consistent with the recorded bs=1 result that a launch is essentially free, and with
     // the earlier 128-vs-512 comparison that found slow-mode ITL identical to within 0.1 ms.
-    std::env::var("SCRATCHY_SUPERDSC_GROUP_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&g| g >= 1)
-        .unwrap_or(128)
+    GroupSize::PRODUCTION.trips()
 }
 
 /// The FLAT (no-loop) `bundle.mlir` body for the all-time=1 case: one

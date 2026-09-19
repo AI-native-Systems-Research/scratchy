@@ -248,8 +248,8 @@ fn timers() -> std::sync::MutexGuard<'static, Timers> {
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
 /// ONE LAUNCH GROUP: a contiguous run of up to `group_size()` trips that dxp compiled into a single
-/// device program. `SCRATCHY_SUPERDSC_GROUP_SIZE=1` makes that one trip per program, which is the
-/// fault-isolation end of the same knob — not a different mode.
+/// device program. A group size of `1` makes that one trip per program, which is the fault-isolation end
+/// of the same range — not a different mode. See `GroupSize`: a compile-time constant, not an env read.
 ///
 /// Each is launched against the SHARED resident segments, so there is no ModuleStitcher (which
 /// orphaned the matmul in the fused bundle). A group that carries an address shift — a KV slot write,
