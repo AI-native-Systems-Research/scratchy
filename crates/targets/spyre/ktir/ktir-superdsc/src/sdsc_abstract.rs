@@ -5883,20 +5883,24 @@ pub fn page_gather_index_table(
     let rows = scratch.rows() as usize;
     let stride = pass_stride.get();
     let per_row = scratch.entries_per_row() as usize;
+    // ⭐ THE SAME CUT THE EMITTER'S OPS TAKE, from the same two ceilings — `PageScratch::entries_per_op`.
+    // Read off the scratch rather than recomputed, because "how many entries an op reads" and "how many
+    // entries the host writes into that op's stick" are the one number this table exists to keep single.
+    let (cut, ops) = (
+        scratch.entries_per_op() as usize,
+        scratch.ops_per_row() as usize,
+    );
     if block_tables.is_empty()
         || pages == 0
         || planes.get() <= 0
         || rows == 0
-        // ⛔ AND ONE REQUEST'S ENTRIES MUST FIT ITS OWN INDEX STICK. `PageScratch::of_pass` already
-        // refuses a wider plane, so this is the host's half of the same law: a `per_row` past the stick
-        // would write request `r+1`'s entries over request `r`'s and gather another request's page.
         || per_row == 0
-        || per_row > CopyDims::ENTRIES_PER_OP as usize
-        // ⛔ THE PASS BLOCK MUST HOLD THE STICK-STRIDED ENTRIES, NOT THE RAW ROW COUNT. Each request's
-        // entry sits at its own index stick (see the loop below), so a pass spans
-        // `mq * ENTRIES_PER_OP` words — 32× the row count. Checking `rows` alone would admit a pitch that
+        || cut == 0
+        // ⛔ THE PASS BLOCK MUST HOLD THE STICK-STRIDED ENTRIES, NOT THE RAW ROW COUNT. Each copy OP has
+        // its own index stick (see the loop below), so a pass spans `mq * ops_per_row * ENTRIES_PER_OP`
+        // words — 32× the row count at one op per request. Checking `rows` alone would admit a pitch that
         // puts request 1's stick inside pass 0's block and silently gather another pass's page.
-        || rows * CopyDims::ENTRIES_PER_OP as usize > stride
+        || scratch.index_sticks() as usize * CopyDims::ENTRIES_PER_OP as usize > stride
         || block_tables.len() < scratch.mq() as usize
     {
         return None;
@@ -5915,21 +5919,23 @@ pub fn page_gather_index_table(
             // keys is inert, while page 0 is a DIFFERENT row's keys and an unstaged mask byte reads VALID.
             let last = *table.last()?;
             let phys = *table.get(p).unwrap_or(&last);
-            // ⭐⭐⭐ ONE INDEX STICK PER REQUEST, `per_row` ENTRIES FROM COLUMN 0 — the vendor's own
-            // `[num_blocks, INT32_ELEMS_PER_STICK]` layout, and it is FORCED rather than copied.
-            // `PageScratch::copies` emits one op per request (an LX limit, measured on card), and
+            // ⭐⭐⭐ ONE INDEX STICK PER COPY **OP**, ITS OWN `cut` ENTRIES FROM COLUMN 0 — the vendor's
+            // own `[num_blocks, INT32_ELEMS_PER_STICK]` layout, and it is FORCED rather than copied.
             // `GatherCopy::index_base` must be a whole number of index sticks because dxp loads the IBR
-            // one stick at a time. So request `r`'s run has to start at stick `r`, column 0; the words
-            // past `per_row` in its stick are pad the op never reads.
+            // one stick at a time, so op `j` of request `r` has to start at stick `r*ops + j`, column 0;
+            // the words past its run in that stick are pad the op never reads.
             //
             // ⛔ AND ENTRY `i` IS THE `i`-th STICK BLOCK OF THE PLANE, IN PLANE ORDER — not a kv head
             // and not a window. The destination row is the plane itself and the copy fills it linearly,
             // so `i` is at once the source block and the destination sub-run; re-deriving it from
             // `(kvh, window)` is what let the emitter's block numbering and the host's disagree.
-            let base = p * stride + r as usize * CopyDims::ENTRIES_PER_OP as usize;
-            for i in 0..per_row {
-                *out.get_mut(base + i)? =
-                    GatherEntry::of_page_block(planes, phys, u32::try_from(i).ok()?)?;
+            for j in 0..ops {
+                let base = p * stride + (r as usize * ops + j) * CopyDims::ENTRIES_PER_OP as usize;
+                let first = j * cut;
+                for i in 0..(per_row - first).min(cut) {
+                    *out.get_mut(base + i)? =
+                        GatherEntry::of_page_block(planes, phys, u32::try_from(first + i).ok()?)?;
+                }
             }
         }
     }
@@ -6078,6 +6084,22 @@ const _: () = assert!(
      hd > 64. Re-derive the entry law before changing it."
 );
 
+// ⭐⭐⭐⭐⭐ THE EVEN-PIN CHECK, AS A BUILD-TIME PROPERTY — this is what `PagePlaneExtent::pin_is_even`
+// WAS, and it had no business being a runtime `if` in `PageScratch::of_pass`.
+//
+// SEN1P5+ does `DT_CHECK(skip_addr_sticks % 2 == 0)`, and the pin is `hd` sticks
+// (`PagePlaneExtent::skip_addr_sticks`). `PagePlaneExtent::of_pool` already refuses an `hd` that is not
+// a whole multiple of `POOL_STICK`, so the pin is even for EVERY constructible extent exactly while the
+// stick itself is even — one assertion over a constant, not a test per geometry. The old branch could
+// never fire (two independent reasons: POOL_STICK is 64, and `of_pool` divides by it), and its test sat
+// inside an `hd`-multiple-of-64 loop, so it asserted its own premise.
+const _: () = assert!(
+    POOL_STICK.is_multiple_of(2),
+    "PagePlaneExtent: the gather pins `hd` sticks and SEN1P5+ ABORTS on an odd `skip_addr_sticks`. An \
+     odd POOL_STICK would make hd == POOL_STICK an odd pin — a device abort, which is not something a \
+     door can refuse. Re-derive the pin before changing the stick."
+);
+
 impl PagePlaneExtent {
     /// The extent of one `(request, page)` plane, or `None` on a degenerate geometry or an `hd` that is
     /// not a whole number of sticks (a part-stick head dim has no stick-block entry at all).
@@ -6147,11 +6169,45 @@ impl PagePlaneExtent {
         self.entry_sub_rows()
     }
 
-    /// TRUE when the pin satisfies deeptools' even-stick check. The pin is `hd` sticks and `hd` is a
-    /// whole number of 64-element sticks by [`Self::of_pool`], so this is a witness rather than a filter
-    /// — but it is asked, because an abort is not a refusal.
-    pub const fn pin_is_even(self) -> bool {
-        self.skip_addr_sticks().is_multiple_of(2)
+    /// ⭐ ONE INDEX ENTRY IN **BYTES** — [`Self::entry_elems`] at the pool's own word length, which is
+    /// both the source bytes one entry reads and the destination bytes it writes. This is the quantity
+    /// the LX budget counts ([`Self::lx_entries_per_op`]); it is `hd`-PROPORTIONAL, unlike every other
+    /// number in this type, which is why the two op ceilings coincide at exactly one head dim.
+    pub const fn entry_bytes(self) -> u64 {
+        self.entry_elems()
+            * <crate::superdsc_opspec::Fp16 as crate::superdsc_opspec::DataFormat>::WORD_LENGTH
+                as u64
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE **LX** CEILING ON ONE COPY OP'S ENTRY COUNT — the second of the two INDEPENDENT
+    /// limits [`PageScratch::entries_per_op`] takes the minimum of, and the one that moves with `hd`.
+    ///
+    /// ⛔⛔⛔ AND IT IS A **PER-CORE** BUDGET, WHICH IS THE CORRECTION THIS FUNCTION EXISTS TO CARRY.
+    /// [`PagePlaneExtent::entry_elems`] records the bake refusal
+    /// (`L3DlOpsScheduler.cpp:1534`, gated on `isDoubleBuffering`) and reads it as "the op's WHOLE
+    /// footprint is measured, not its per-core share". The vendor source says otherwise, in the first
+    /// line of the function that produces the measured chunk (`getInitialChunkParams`, same file):
+    /// ```text
+    ///   // Initialize with the CoreD parameters.
+    ///   DataStructDims params = dsc.dataStageParam_.at(dataStageCoreIdx).ss_;
+    /// ```
+    /// The initial chunk starts from the **CORE** data stage — i.e. AFTER work division — with each
+    /// chunk dim at its minimum. So what must fit LX is `ceil(entries / cores)` entries of source plus
+    /// the same of destination, twice over for double buffering. The refusal that was measured is still
+    /// explained: a PLANE-sized pin leaves ONE entry, so `cores == 1` and the per-core share IS the
+    /// whole op.
+    ///
+    /// ⭐ WHICH IS WHY IT DOES NOT BIND AT ANY SHIPPED HEAD DIM, and that is a derived answer rather
+    /// than a hope. [`crate::superdsc_opspec::gather_copy_cores`]-equivalent division splits `mb` into
+    /// WHOLE entries, so at `entries <= MAX_CORES` every core owns exactly one and the resident is
+    /// `4 * entry_bytes`: 32 KB at hd=64, 64 KB at hd=128, 128 KB at hd=256, against
+    /// [`crate::superdsc_opspec::USABLE_LX_BYTES`] = 1.6 MB. It binds at hd >= 3277, where one entry's
+    /// own double-buffered pair leaves LX — and there this returns `0`, which [`PageScratch::of_pass`]
+    /// turns into a refusal the emitter raises as a BUILD failure rather than a silent ungathered bundle.
+    pub const fn lx_entries_per_op(self) -> u64 {
+        // Source chunk + destination chunk, each double buffered: four copies of one core's entries.
+        let per_core = crate::superdsc_opspec::USABLE_LX_BYTES / (4 * self.entry_bytes());
+        per_core * crate::superdsc_opspec::MAX_CORES as u64
     }
 
     /// Elements of ONE kv head's block inside the plane — `hd * PAGE_SLOTS`, the whole of one head's
@@ -6181,6 +6237,21 @@ impl PagePlaneExtent {
             return None;
         }
         Some(kvh as u64 * self.head_block_elems())
+    }
+
+    /// ⭐⭐⭐⭐⭐ FEATURE SLABS ONE 64-SLOT WINDOW SPANS — `hd / POOL_STICK`, the `nslab` of
+    /// `zz_the_two_planes_block_numbering_diverges_above_one_stick`, and the ONE quantity in this type
+    /// that moves with the head dim.
+    ///
+    /// Everything else here cancels `hd` ([`Self::blocks`] is 32 at nkvh=8 for every head dim), which is
+    /// what made "page granularity is head-dim independent" look like a proof. It is a proof about the
+    /// COPY — a page plane is contiguous at every stick-multiple head dim, and this file's tests derive
+    /// that from [`PagedKvPool::addr`] rather than assuming it. It is NOT a proof about the INDEX: in
+    /// `POOL_STICK * POOL_STICK` units Kᵗ numbers (window `b`, slab `s`) as `b * nslab + s` and V as
+    /// `s * blocks_per_page + b`, and those coincide for every coordinate **iff this is 1**. One table
+    /// serves both legs at one slab by that coincidence.
+    pub const fn slabs(self) -> u32 {
+        self.hd / POOL_STICK
     }
 }
 
@@ -6232,22 +6303,86 @@ impl PageScratch {
     /// instead of wrapping on the card.
     pub const ENTRIES_PER_PASS_MAX: u32 = 32;
 
-    /// THE ONE DOOR. `None` on a geometry the page gather cannot express — and note what is NOT a
-    /// refusal any more: **no head-dim ceiling.** `hd` must merely be a whole number of sticks.
+    /// THE ONE DOOR. `None` on a geometry the page gather cannot express.
+    ///
+    /// ⛔⛔⛔⛔⛔ **AND A REFUSAL HERE IS A BUILD FAILURE, NOT A FALLBACK.** The emitter door
+    /// (`lower_ktir_to_superdsc`'s `kv_block_index`) `expect`s this for every bundle whose rows ARE
+    /// requests, and `#[forward]` runs the emitter at macro expansion — so a geometry this cannot
+    /// express fails the compile with the quantity named. It used to be `.is_some()` feeding a
+    /// `zip`, which silently emitted the ungathered bundle: that is how an hd=128 build passed its
+    /// gate while gathering nothing.
+    ///
+    /// ⭐⭐⭐⭐⭐ **THE ONE-SLAB PRECONDITION IS GONE, AND THE CAUSE IT WAS STANDING IN FOR WAS NOT IN
+    /// THIS TYPE AT ALL.** What this door refused was `slabs() != 1`, on the card evidence that hd=128
+    /// gathered garbage from the first generated token at widths 2/4/8. Every argument it recorded for
+    /// why page granularity *is* expressible at two slabs was correct; the two defects were in the
+    /// FOLD'S OWN LEGS, both of them `nslab`-blind and both invisible at hd=64:
+    ///
+    /// * the gathered **value** leg declared `n = MatN::of_head_slab(SLAB_FEATS)` — one stick — with NO
+    ///   slab loop, so at hd=128 it wrote only feature slab 0 of `run_o` and the whole upper half of
+    ///   every head's attention output never received a prefix contribution at all;
+    /// * the gathered **score** leg declared `k = MatK::of_head_dim(hd)` under a `y`-batch, which at two
+    ///   sticks is exactly the shape `ScoreArm::choose` records as measured-twice incoherent inside dxp.
+    ///
+    /// Both now mirror the ungathered arms (`nslab` ops, partials accumulating, mask on slab 0 only), so
+    /// there is nothing left here for a head-dim gate to protect.
+    ///
+    /// ⭐⭐⭐⭐⭐ **AND hd=128 NOW RUNS EXACT ON CARD, WHICH IS WHAT LIFTED THE DOOR.** Pod
+    /// `nickm-7db9667cdd-z2jc6`, `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic`
+    /// (`hidden 4096, nqh 32, nkvh 8` ⇒ **hd = 128**), 420-token `c` probe, every width against its OWN
+    /// `--max-num-seqs 1` run of the identical file, `SCRATCHY_GATHER_DIAG=1` SET and confirmed nonzero:
+    /// ```text
+    ///   width 8   own_bad 0,0,0   degen 0,0,0   solo_diff 0,0,0   419 gather steps   ITL 142.9/142.9/143.9
+    ///   width 2   own_bad 0       degen 0       solo_diff 0      1676 gather steps   ITL 86.7
+    ///   solo (admit 1)  own_bad 0                                  0 gather steps    ITL 79.4
+    /// ```
+    /// `solo_diff 0` is the strong column: EVERY row's text is byte-identical to that row's own solo
+    /// output, at both widths, in every trial. `origin/main` on the identical probe and pod is
+    /// `own_bad 8,7,7` with `degen 4,5,3` at width 8.
+    ///
+    /// ⛔ FOR THE RECORD, THE MEASUREMENT THAT JUSTIFIED THE REFUSAL (same pod, same probe, same 419
+    /// gather steps, before the two fold legs were fixed): `own_ok 0/2`, `0/4`, `0/8`, every row wrong
+    /// from its first generated token. That is what a fold missing half of every output head looks like —
+    /// and it is why "the card refuses this geometry" was the wrong conclusion to draw from it.
+    ///
+    /// ⛔⛔⛔⛔⛔ WHAT THE OLD NOTE SAID, KEPT BECAUSE ITS ARGUMENTS ARE STILL THE DERIVATION. Page
+    /// granularity removed every *derivable* head-dim obstacle: a page plane is contiguous at hd=128 as
+    /// well as hd=64 (`zz_a_whole_page_plane_is_contiguous_at_every_head_dim` derives it from
+    /// [`PagedKvPool::addr`]), the entry count cancels `hd`, and the copy moves a plane byte for byte so
+    /// the two legs' block ORDER inside it cannot matter. Every one of those arguments is still true, and
+    /// the card still refuses the result. Pod `nickm-7db9667cdd-z2jc6`,
+    /// `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` (`hidden 4096, nqh 32, nkvh 8` ⇒ **hd = 128**),
+    /// `scr batch` over the 420-token `c` probe, each width against its OWN `--max-num-seqs 1` run of the
+    /// identical file, gather confirmed live in the bundle (419 `SCRATCHY_GATHER_DIAG` steps):
+    /// ```text
+    ///   width 2   own_ok 0/2   solo_diff 2   every row wrong from its FIRST generated token   (N=3)
+    ///   width 4   own_ok 0/4   solo_diff 4   same                                             (N=1)
+    ///   width 8   own_ok 0/8   solo_diff 8   same                                             (N=3)
+    /// ```
+    /// ⛔ AND THE CONTROL SEPARATES IT FROM THE 8b'S OWN PRE-EXISTING WIDTH-8 DEFECT: `origin/main`, no
+    /// gather in the bundle at all, on the identical probe and pod, is `own_ok 1/2` at width 2 (the one
+    /// bad row is the row its own SOLO degenerates on) and `own_ok 0-1/8` with 3-4 degenerate rows at
+    /// width 8. So width 8 is broken at hd=128 with or without a gather — but width 2 is NOT, and the
+    /// gather breaks it. Enabling this door at two slabs is a measured regression.
+    ///
+    /// ⛔ AND THE "BLOCK ORDER CANNOT MATTER" ARGUMENT IS THE ONE THAT SURVIVES INTACT. The two legs'
+    /// `POOL_STICK * POOL_STICK` numbering diverges above one slab (Kᵗ `b * nslab + s`, V
+    /// `s * blocks_per_page + b`) — but the entry unit is a STICK BLOCK of a plane that is copied byte
+    /// for byte, so one table still serves both legs at every head dim. That was never the defect.
     pub const fn of_pass(pool: PagedKvPool, mq: QueryRowCount) -> Option<PageScratch> {
         let Some(plane) = PagePlaneExtent::of_pool(pool) else {
             return None;
         };
         let mq = mq.get();
-        if mq == 0 || mq > Self::ENTRIES_PER_PASS_MAX || !plane.pin_is_even() {
+        if mq == 0 || mq > Self::ENTRIES_PER_PASS_MAX {
             return None;
         }
-        // ⛔ ONE REQUEST'S PLANE MUST FIT ONE INDEX STICK, because one op serves one request (LX, see
-        // `copies`) and dxp loads a gather's IBR in a SINGLE stick transfer, taking each core's read
-        // offset inside it modulo that stick. `blocks()` is `nkvh * PAGE_SLOTS / POOL_STICK` — 32 at
-        // nkvh=8, exactly the stick, for every head dim — so a pool with more kv heads gets NO gather
-        // here rather than a run whose cores past the wrap gather another core's pages.
-        if plane.blocks() > CopyDims::ENTRIES_PER_OP as u64 {
+        // ⛔ ONE ENTRY'S OWN DOUBLE-BUFFERED PAIR MUST FIT LX, which is the only geometry left that no
+        // cut can rescue: `copies` splits a request's run into as many ops as the two ceilings need, but
+        // an op naming ZERO entries is not an op. `lx_entries_per_op` is 0 only at hd >= 3277 — no model
+        // — and this is a refusal rather than a clamp because the emitter door turns it into a BUILD
+        // failure, so nobody can ship a bundle that quietly dropped the gather.
+        if plane.lx_entries_per_op() == 0 {
             return None;
         }
         let s = PageScratch { plane, mq };
@@ -6306,9 +6441,60 @@ impl PageScratch {
     }
 
     /// Index entries one request's row needs — the plane's stick blocks, and therefore also the entries
-    /// the host packs into request `r`'s index stick.
+    /// the host packs into request `r`'s index sticks.
     pub const fn entries_per_row(self) -> u64 {
         self.plane.blocks()
+    }
+
+    /// ⭐⭐⭐⭐⭐ ENTRIES **ONE COPY OP** MAY NAME — the MINIMUM of TWO INDEPENDENT CEILINGS, which are
+    /// both `32` at granite-3.1-2b and at no other geometry in the ladder.
+    ///
+    /// ⛔⛔⛔ THE TWO WERE ONE NUMBER, AND THE COINCIDENCE IS WHAT HID hd=128. `copies` capped a run at
+    /// [`CopyDims::ENTRIES_PER_OP`] alone, which is the **int32 IBR stick width** — how many index WORDS
+    /// dxp's one-stick IBR transfer holds. That is a property of the INDEX's dtype and of nothing else.
+    /// Beside it sits [`PagePlaneExtent::lx_entries_per_op`], the **LX chunk** ceiling — how many entries
+    /// of `hd * POOL_STICK` elements a core's double-buffered chunk can hold. The first is `hd`-free; the
+    /// second is inversely proportional to `hd`. They are equal at hd=64 and diverge everywhere else, and
+    /// a single `min` of two separately-derived named quantities is the only spelling under which that
+    /// can never again read as one fact.
+    ///
+    /// ⭐ WHICH CEILING BINDS, AT THE GEOMETRIES THAT EXIST: the IBR stick, always. The LX term is 800
+    /// entries at hd=128 and 400 at hd=256 (see its own derivation — the chunk is measured PER CORE, and
+    /// work division hands each core one entry), so it is asked and does not bind. Both are stated
+    /// because the previous conflation cost a round of card runs on the wrong hypothesis.
+    pub const fn entries_per_op(self) -> u32 {
+        let ibr_stick = CopyDims::ENTRIES_PER_OP as u64;
+        let lx_chunk = self.plane.lx_entries_per_op();
+        let cut = if ibr_stick < lx_chunk {
+            ibr_stick
+        } else {
+            lx_chunk
+        };
+        // Never wider than the run itself, so `ops_per_row` is 1 whenever one op suffices.
+        let per_row = self.entries_per_row();
+        if cut < per_row {
+            cut as u32
+        } else {
+            per_row as u32
+        }
+    }
+
+    /// ⭐⭐⭐ COPY OPS **ONE REQUEST'S** PLANE COSTS — `entries_per_row / entries_per_op`, rounded up.
+    ///
+    /// It is `1` for every model in the ladder (`blocks()` is `nkvh * PAGE_SLOTS / POOL_STICK` = 32 at
+    /// nkvh=8, exactly the IBR stick, at EVERY head dim), so the shipped emission does not move. It is
+    /// `2` at nkvh=16 and `4` at nkvh=32, which is what replaced the flat refusal `of_pass` used to make
+    /// there — a refusal being, at that door, a silently ungathered bundle.
+    pub const fn ops_per_row(self) -> u32 {
+        self.entries_per_row()
+            .div_ceil(self.entries_per_op() as u64) as u32
+    }
+
+    /// Index STICKS one pass stages — `mq * ops_per_row`, one per copy op. The host's table pitch and
+    /// the emitter's op count are this one number, so a table sized for fewer sticks than the ops read
+    /// cannot be built.
+    pub const fn index_sticks(self) -> u32 {
+        self.mq * self.ops_per_row()
     }
 
     /// The row a request owns, or `None` past the batch — the ONLY row law, with no window and no kv
@@ -6358,7 +6544,9 @@ impl PageScratch {
         [self.rows(), self.cols() as u32]
     }
 
-    /// ⭐⭐⭐⭐⭐ THE COPY OPS THIS PASS NEEDS — **ONE PER REQUEST**, and the reason is LX, not the IBR.
+    /// ⭐⭐⭐⭐⭐ THE COPY OPS THIS PASS NEEDS — **ONE PER (REQUEST, ENTRY CUT)**, where the cut is the
+    /// minimum of the IBR stick and the LX chunk ([`Self::entries_per_op`]). `ops_per_row` is 1 at every
+    /// geometry the ladder admits, so this is one op per request there.
     ///
     /// ⛔⛔⛔ MEASURED ON CARD, AND IT REFUTED MY OWN ARITHMETIC. One op per PLANE (`mq * sub_rows` =
     /// 16384 one-stick sub-rows = 2 MB at the shipped 2b geometry) is refused at bake:
@@ -6367,14 +6555,23 @@ impl PageScratch {
     ///   The initial chunk parameters must fit in LX for SuperDSC: 78_attn_gkt_o734_s0
     ///   L3DlOpsScheduler.cpp:1534
     /// ```
-    /// I had argued this was safe because [`crate::superdsc_opspec::USABLE_LX_BYTES`] is a PER-CORE
-    /// budget and 2 MB over 32 cores is 64 KB each. **dxp requires the INITIAL CHUNK to fit LX before
-    /// work division**, so the op's WHOLE footprint is what is measured, not its per-core share. A
-    /// per-core reading of a pre-division constraint is the mistake; do not re-derive it.
+    /// ⛔⛔⛔ AND THE READING OF THAT REFUSAL WRITTEN HERE WAS **WRONG**, which cost a round of card runs
+    /// on the wrong hypothesis. It said: "dxp requires the INITIAL CHUNK to fit LX before work division,
+    /// so the op's WHOLE footprint is what is measured, not its per-core share. A per-core reading of a
+    /// pre-division constraint is the mistake; do not re-derive it." The vendor source says the opposite,
+    /// in the first line of the function that produces the measured chunk (`getInitialChunkParams`, same
+    /// file): `DataStructDims params = dsc.dataStageParam_.at(dataStageCoreIdx).ss_;` — the **CoreD**
+    /// parameters, i.e. AFTER work division, with each chunk dim set to its minimum.
     ///
-    /// ⭐ ONE REQUEST PER OP IS `sub_rows` = 2048 SUB-ROWS = 256 KB, which is the SAME op size the
-    /// window-granular form shipped (32 rows × 4096 elements), so this is a cut back to a proven
-    /// footprint rather than a new shape.
+    /// ⭐ THE REFUSAL IS STILL EXPLAINED, BY THE PIN AND NOT BY THE FOOTPRINT: the pin is the op's unit of
+    /// work division, so a PLANE-sized pin leaves ONE entry, hence ONE CORE, and the per-core share then
+    /// IS the whole 2 MB. With the pin at one stick block the same footprint spreads over `blocks()`
+    /// cores. Consequence, and the reason this correction matters: the per-op ceiling is **not**
+    /// `2048 / hd` sub-rows, so hd=128's 512 KB op was never the hd=128 defect — see
+    /// [`PagePlaneExtent::lx_entries_per_op`] and `PageScratch::of_pass`.
+    ///
+    /// ⭐ ONE REQUEST PER OP IS `sub_rows` = 2048 SUB-ROWS = 256 KB at hd=64 and 512 KB at hd=128, both of
+    /// which spread over 32 cores at ONE stick block each — 16 KB and 32 KB per core, against a 1.6 MB LX.
     ///
     /// ⭐⭐⭐ AND THIS IS WHY IBM'S INDEX TABLE IS `[num_blocks, INT32_ELEMS_PER_STICK]` WITH THE VALUE AT
     /// COLUMN 0. [`GatherCopy::index_base`] must be a whole number of index STICKS, because dxp loads the
@@ -6384,27 +6581,40 @@ impl PageScratch {
     pub fn copies(self) -> impl Iterator<Item = GatherCopy> {
         let page = self.entry_page() as u32;
         let per_row = self.entries_per_row() as u32;
-        let mb = self.plane.sub_rows() as u32;
-        (0..self.mq).map(move |r| GatherCopy {
-            // Request `r`'s entries occupy stick `r` of the pass block, all `per_row` of them — the
-            // vendor's `[num_blocks, INT32_ELEMS_PER_STICK]` layout, one real run per gathered tile.
-            stick: r,
-            // ⛔ AND ITS DESTINATION IS THE `per_row * r`-th ENTRY, NOT THE `r`-th. This is the number
-            // the index base cannot supply: entries advance one STICK per op (32 words) while the
-            // destination advances one whole PAGE PLANE (`per_row` entries). Deriving the destination
-            // from the index base puts op `r`'s rows `per_row/1`× off.
-            dest_entry: r * per_row,
-            dims: CopyDims {
-                // ONE request's whole page plane, in one-stick sub-rows. `mb / page == per_row` ⇒ the
-                // index declares exactly `per_row` entries, which `of_pass` has already proved is one
-                // index stick.
-                mb,
-                // ⛔ ONE STICK, for the same reason as the window-granular form: a wider `out` classifies
-                // the operand STICK-MAJOR and scatters each gathered block, which scrambles what the
-                // matmul then reads.
-                out: POOL_STICK,
-                page: crate::superdsc_opspec::PageExtent::of_positions(page),
-            },
+        // ⭐ THE CUT, FROM BOTH CEILINGS AT ONCE — see [`Self::entries_per_op`]. At every shipped
+        // geometry `ops == 1` and `cut == per_row`, so the loop below emits exactly the one-op-per-request
+        // pass that runs on card today, stick for stick.
+        let (cut, ops) = (self.entries_per_op(), self.ops_per_row());
+        (0..self.mq).flat_map(move |r| {
+            (0..ops).map(move |j| {
+                let first = j * cut;
+                GatherCopy {
+                    // ⛔ ONE INDEX STICK PER **OP**, NOT PER REQUEST. Request `r`'s run occupies sticks
+                    // `[r*ops, (r+1)*ops)` — because dxp loads the IBR one stick at a time and takes each
+                    // core's read offset modulo it, so an op that names 16 entries must still FIND them at
+                    // a stick boundary. Packing two ops' entries into one stick would make op `j=1`'s base
+                    // `r*32 + 16` words, which is not a stick, and its 32-word load would straddle both
+                    // runs. `ops == 1` collapses this to `stick: r` — the shipped numbering.
+                    stick: r * ops + j,
+                    // ⛔ AND ITS DESTINATION IS THE `per_row * r + first`-th ENTRY, NOT THE STICK's. This
+                    // is the number the index base cannot supply: entries advance one whole STICK per op
+                    // (32 words) while the destination advances only the `cut` entries the op covers.
+                    // Deriving the destination from the index base puts op `r`'s rows `per_row`× off.
+                    dest_entry: r * per_row + first,
+                    dims: CopyDims {
+                        // THIS OP's RUN of the request's plane, in one-stick sub-rows — a whole cut, or
+                        // the short tail. In ENTRIES first and then multiplied into sub-rows, so
+                        // `page | mb` holds by construction and `mb / page` is the entry count the index
+                        // declares.
+                        mb: (per_row - first).min(cut) * page,
+                        // ⛔ ONE STICK, for the same reason as the window-granular form: a wider `out`
+                        // classifies the operand STICK-MAJOR and scatters each gathered block, which
+                        // scrambles what the matmul then reads.
+                        out: POOL_STICK,
+                        page: crate::superdsc_opspec::PageExtent::of_positions(page),
+                    },
+                }
+            })
         })
     }
 }

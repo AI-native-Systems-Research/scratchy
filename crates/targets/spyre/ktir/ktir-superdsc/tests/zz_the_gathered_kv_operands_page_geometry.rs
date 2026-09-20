@@ -24,7 +24,7 @@
 //! never asked for.
 
 use ktir_superdsc::emit as superdsc;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_attn, matmul_opspec};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::sdsc_abstract::{AttnGeometry, PagedKvPool, attn_bundle_rows};
 use ktir_superdsc::superdsc_opspec::{GatherIndex, KernelAxis, PageExtent, SdscFoldSet};
 

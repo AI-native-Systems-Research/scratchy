@@ -14,15 +14,22 @@
 //! own `--max-num-seqs 1` run of the identical file:
 //!
 //! ```text
-//! rung 2  rc=0  solo_diff=0  own_ok=2/2   ITL  88.2 ms (solo 79.5)  wall 48 s (solo 78 s)
-//! rung 4  rc=0  solo_diff=0  own_ok=4/4   ITL 117.3 ms (solo 79.4)  wall 60 s (solo 145 s)
-//! rung 8  rc=0  solo_diff=0  own_ok=8/8   ITL 173.4 ms (solo 79.3)  wall 86 s (solo 278 s)
+//! rung 2  rc=0  own_ok=1/2   solo_diff=1   degen=1   ITL  88-100 ms (solo 79.4)   N=3
+//! rung 8  rc=0  own_ok=0-1/8 solo_diff=8   degen=3-4 ITL 175-198 ms (solo 79.4)   N=3
 //! ```
 //!
-//! Clean at every rung, 3.66× aggregate at width 8 — and **not one of those tokens went through a
-//! gather.** A reader with those numbers and no test would record "the gather holds on the 8b". It
-//! does not exist there. `own_bad` is the misleading column and `solo_diff` the real one; the same
-//! trap one level up is that a clean batched result is not evidence the mechanism under test ran.
+//! ⛔⛔⛔ AND THE "CLEAN AT EVERY RUNG, 3.66×" THIS TABLE USED TO HOLD IS RETRACTED. That reading came
+//! from one trial per rung and from `own_bad` alone; re-measured at N=3 against each width's own
+//! `--max-num-seqs 1` oracle, `origin/main` on the 8b is ONE bad row of two at rung 2 (a different row
+//! each trial) and 7-8 bad of eight at rung 8, with 3-4 degenerate rows. So the 8b's batched decode is
+//! broken at width 8 **with no gather anywhere in the bundle** — a pre-existing defect, not this
+//! campaign's, and not something a gather could fix.
+//!
+//! ⭐ WHAT THE ORIGINAL POINT OF THIS FILE STILL IS, and it is now stronger: not one of those tokens
+//! went through a gather, at either reading of the numbers. A reader with a batched result and no test
+//! records "the gather holds on the 8b" when the mechanism is absent. `own_bad` is the misleading column
+//! and `solo_diff` the real one; and a clean batched result is never evidence that the mechanism under
+//! test ran.
 //!
 //! ## The boundary is `hd` and NOTHING ELSE, which is why the carry-over looks like it holds
 //! granite-3.1-8b has the SAME `nkvh = 8` and the same GQA as granite-3.1-2b, so every quantity the
@@ -61,7 +68,8 @@
 //!   emitter/host disagreement already recorded on [`GatherScratch::row_of`].
 
 use ktir_superdsc::sdsc_abstract::{
-    CopyDims, GatherScratch, POOL_STICK, PagedKvPool, QueryRowCount, SlotCount, SlotWindow,
+    CopyDims, GatherScratch, POOL_STICK, PageScratch, PagedKvPool, QueryRowCount, SlotCount,
+    SlotWindow,
 };
 
 /// granite-3.1-2b-instruct: `hidden 2048 / nqh 32` ⇒ hd == one stick. The ONE configuration every
@@ -106,6 +114,34 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
     // `nb` a fold pass can sweep. Widths are the baked decode rungs the 8b run reported ready.
     for cap in [64u32, 128, 256] {
         for mq in [1u32, 2, 4, 8, 16, 32] {
+            // ⛔⛔⛔⛔⛔ THE **LIVE** DOOR, ASKED IN THE SAME LOOP. `assemble_attn` stopped calling
+            // `GatherScratch::of_fold_pass` when the gather went page-granular; every assertion in this
+            // file below is about a door the shipped emitter no longer reads, which is how a green suite
+            // certified hd=128 for a whole round. `PageScratch::of_pass` IS the shipped door, and it
+            // refuses two slabs on CARD EVIDENCE (its own note carries the table and the `origin/main`
+            // control). A widening must move THIS assertion, not the dead one.
+            assert!(
+                PageScratch::of_pass(PagedKvPool::new(NKVH, HD_2B), QueryRowCount::of_mq(mq))
+                    .is_some(),
+                "hd={HD_2B} mq={mq}: the live page-granular door must admit one slab — every card \
+                 measurement of a correct gather comes from this geometry"
+            );
+            // ⭐⭐⭐⭐⭐ AND THE LIVE DOOR NOW ADMITS **TWO SLABS TOO**, WHICH IS THE ONE ASSERTION IN THIS
+            // FILE THAT HAS BEEN BOTH WAYS ROUND. It asserted `is_none()` on the card evidence that
+            // hd=128 gathered garbage from the first generated token — a green test pinning a door that
+            // did nothing at the only geometry anyone wanted it for. The two causes were found and they
+            // were NOT in the gather: the gathered VALUE leg wrote only feature slab 0 of `run_o` (no
+            // slab loop, so the upper half of every head's output had no prefix contribution at all),
+            // and the gathered SCORE leg contracted two sticks under a `y`-batch, the shape
+            // `ScoreArm::choose` records as measured-twice incoherent inside dxp. Both are `nslab` loops
+            // now, mirroring the ungathered arms.
+            assert!(
+                PageScratch::of_pass(PagedKvPool::new(NKVH, HD_8B), QueryRowCount::of_mq(mq))
+                    .is_some(),
+                "hd={HD_8B} mq={mq}: the live page-granular door must admit TWO slabs — a refusal here \
+                 is a bundle that silently emits the ungathered form, which is how an 8b build passed \
+                 its gate while gathering nothing. The head-dim obstacles were all in the FOLD's legs"
+            );
             let two_b = scratch_at(HD_2B, cap, mq);
             assert!(
                 two_b.is_some(),
@@ -142,7 +178,8 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
 fn the_bundle_level_door_is_the_per_pass_door_at_every_window_count() {
     for hd in [HD_2B, HD_8B, 96, 192, 256] {
         for mq in [1u32, 2, 4, 8, 16, 32] {
-            let admits = GatherScratch::admits(PagedKvPool::new(NKVH, hd), QueryRowCount::of_mq(mq));
+            let admits =
+                GatherScratch::admits(PagedKvPool::new(NKVH, hd), QueryRowCount::of_mq(mq));
             // ⛔ EVERY `active_cap` A LADDER RUNG CAN BE, not just the ceiling: the bundle-level
             // question is asked once and must be the answer for every body the bundle holds.
             for cap in [64u32, 128, 256] {

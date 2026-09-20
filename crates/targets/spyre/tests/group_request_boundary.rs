@@ -306,9 +306,13 @@ fn a_gathered_page_fold_run_is_never_chunked_by_the_group_size() {
 /// MEASURED 8b regression when it was not.
 ///
 /// The exemption above was applied to both folds with the justification that "the ungathered fold loses
-/// nothing by it: fewer groups is fewer launches". `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` is
-/// hd = 128, so `PageScratch::of_pass` refuses the gather and its fold is ungathered. On the 420-token
-/// `c` probe at width 8, each binary against its OWN `--max-num-seqs 1` run, N = 3:
+/// nothing by it: fewer groups is fewer launches". The measurements below were taken when
+/// `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` (hd = 128) had NO gather, because
+/// `PageScratch::of_pass` refused two slabs — a refusal since removed, so that model's fold is now
+/// GATHERED and takes the exemption. The rule is unchanged and so is its evidence: what these numbers
+/// pin is that the UNGATHERED fold (every prompt-chunk bundle, and any future ungathered decode) must
+/// keep the cap. On the 420-token `c` probe at width 8, each binary against its OWN `--max-num-seqs 1`
+/// run, N = 3:
 /// ```text
 ///   origin/main (cap applied)  own_bad 8,7,7  first divergence 87-118 chars in (term 14-19)
 ///   cap lifted for both folds  own_bad 8,8,8  first divergence 1-4 chars in (term 0): " 11111111…"

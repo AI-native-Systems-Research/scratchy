@@ -209,49 +209,87 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
 #[test]
 fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
     use ktir_superdsc::sdsc_abstract::{PageScratch, PagedKvPool, QueryRowCount};
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
-    for mq in [2u32, 8] {
-        let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
-            .expect("granite's geometry admits the page copy");
-        for cp in scratch.copies() {
-            let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
-                "Tensor0",
-                "Tensor2",
-                cp.dims().mb(),
-                ktir_superdsc::sdsc_abstract::POOL_STICK,
-                ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
-                    "BlockTable".to_string(),
-                    PageExtent::of_positions(
-                        u32::try_from(scratch.entry_page()).expect("a stick-sized pin"),
+    // ⭐⭐⭐⭐⭐ SWEPT OVER `nkvh` x `hd`, BECAUSE `skip_addr` IS `hd * POOL_STICK` AND THE PIN IS `hd`
+    // SUB-ROWS — two quantities that are BOTH `POOL_STICK` at hd=64 and neither of them at hd=128. This
+    // measurement was taken at the single point (nkvh=8, hd=64) where the pin, the stick and the IBR
+    // width all read 64/32, which is precisely how "the pin is one stick" and "the pin is `hd`" stayed
+    // indistinguishable. `nkvh` is swept too: at nkvh>8 a request's run exceeds one IBR stick, so the
+    // pass is several ops per request and EVERY one of them must still derive this same `skip_addr`.
+    for (nkvh, hd) in [
+        (8i64, 64i64),
+        (8, 128),
+        (8, 256),
+        (4, 128),
+        (16, 128),
+        (32, 64),
+    ] {
+        let pool = PagedKvPool::new(nkvh as usize, hd as usize);
+        for mq in [2u32, 8] {
+            let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
+                .expect("granite's geometry admits the page copy");
+            for cp in scratch.copies() {
+                let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                    "Tensor0",
+                    "Tensor2",
+                    cp.dims().mb(),
+                    ktir_superdsc::sdsc_abstract::POOL_STICK,
+                    ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
+                        "BlockTable".to_string(),
+                        PageExtent::of_positions(
+                            u32::try_from(scratch.entry_page()).expect("a stick-sized pin"),
+                        ),
+                        cp.index_base(),
                     ),
-                    cp.index_base(),
-                ),
-                ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
-            )
-            .expect("the page gather-copy op builds");
-            let value_idx = op.indirect.expect("a declared gather").value;
-            let cores = op.iter.cores_used().get();
-            let folds = SdscFoldSet::new(op.iter.cores_used());
-            let e = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
-            let j = serde_json::to_value(&e).unwrap();
-            let (dsc, node) = dsc_and_node(&j, "PageGather_0", value_idx);
-            let got = skip_addr_elems(dsc, node).expect("derivable");
-            assert_eq!(
-                got,
-                pool.stick_block_elems() as i64,
-                "mq={mq}: the SHIPPED copy's skip_addr must be ONE pool stick block ({} elems) — the \
-                 unit the host's entries are counted in. Got {got}, i.e. {}× off, which lands every \
-                 index step inside a different page with a clean bake.",
-                pool.stick_block_elems(),
-                got as f64 / pool.stick_block_elems() as f64,
-            );
-            assert!(
-                cores > 1,
-                "mq={mq}: the copy is planned onto {cores} core(s). A pinned axis holding ONE entry \
-                 admits no core split, and dxp then measures that one core's double-buffered chunk \
-                 against LX — which is the bake refusal 'The initial chunk parameters must fit in LX \
-                 for SuperDSC' (L3DlOpsScheduler.cpp:1534)."
-            );
+                    ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
+                )
+                .expect("the page gather-copy op builds");
+                let value_idx = op.indirect.expect("a declared gather").value;
+                let cores = op.iter.cores_used().get();
+                let folds = SdscFoldSet::new(op.iter.cores_used());
+                let e = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
+                let j = serde_json::to_value(&e).unwrap();
+                let (dsc, node) = dsc_and_node(&j, "PageGather_0", value_idx);
+                let got = skip_addr_elems(dsc, node).expect("derivable");
+                assert_eq!(
+                    got,
+                    pool.stick_block_elems() as i64,
+                    "nkvh={nkvh} hd={hd} mq={mq}: the SHIPPED copy's skip_addr must be ONE pool stick \
+                 block ({} elems) — the unit the host's entries are counted in. Got {got}, i.e. {}× \
+                 off, which lands every index step inside a different page with a clean bake.",
+                    pool.stick_block_elems(),
+                    got as f64 / pool.stick_block_elems() as f64,
+                );
+                // ⭐ AND IT IS `hd * POOL_STICK`, SPELLED AGAINST `hd` — the pin is `hd` sub-rows and the
+                // derived stride is `pin * out`, so at hd=128 both DOUBLE and neither is the stick.
+                assert_eq!(
+                    got,
+                    hd * ktir_superdsc::sdsc_abstract::POOL_STICK as i64,
+                    "nkvh={nkvh} hd={hd} mq={mq}: skip_addr is `hd * POOL_STICK`, a quantity that MOVES \
+                 with the head dim — it equals POOL_STICK² only at hd=64"
+                );
+                assert!(
+                    cores > 1,
+                    "nkvh={nkvh} hd={hd} mq={mq}: the copy is planned onto {cores} core(s). A pinned axis \
+                 holding ONE entry admits no core split, and dxp then measures that one core's \
+                 double-buffered chunk against LX — which is the bake refusal 'The initial chunk \
+                 parameters must fit in LX for SuperDSC' (L3DlOpsScheduler.cpp:1534)."
+                );
+                // ⭐ AND THE PER-CORE DOUBLE-BUFFERED CHUNK FITS LX, measured from the op's OWN planned core
+                // count rather than from the 2048-sub-row ceiling the LX refusal was once read as. Source +
+                // destination, twice over for double buffering.
+                let per_core_bytes = (cp.dims().mb() as u64 / cores as u64)
+                    * ktir_superdsc::sdsc_abstract::POOL_STICK as u64
+                    * 2
+                    * 4;
+                assert!(
+                    per_core_bytes <= ktir_superdsc::superdsc_opspec::USABLE_LX_BYTES,
+                    "nkvh={nkvh} hd={hd} mq={mq}: one core's double-buffered chunk is {per_core_bytes} B \
+                 over {} cores, against LX's {} B. `getInitialChunkParams` starts from the CORE data \
+                 stage, so this — not the op's whole footprint — is what dxp measures.",
+                    cores,
+                    ktir_superdsc::superdsc_opspec::USABLE_LX_BYTES,
+                );
+            }
         }
     }
 }
@@ -431,7 +469,8 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
         let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
         let got = skip_addr_elems(dsc, node).expect("derivable");
         assert_eq!(
-            got, want,
+            got,
+            want,
             "{plane} at hd=128 pinned {pin} sub-rows: dxp derives skip_addr = {got} elements where \
              the pool's own window stride is {want}. A step of {got} lands {:.2} of a window off — a \
              clean bake reading from inside another block.",

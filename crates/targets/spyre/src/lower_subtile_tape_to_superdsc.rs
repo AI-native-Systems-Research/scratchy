@@ -2089,10 +2089,13 @@ impl GroupKind {
     /// place that comment wanted. It also said "the ungathered fold loses nothing by it: fewer groups is
     /// fewer launches". That is the assumption granite-3.1-8b falsifies.
     ///
-    /// ⛔ MEASURED, `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` (hd = 128, so
-    /// [`PageScratch::of_pass`] refuses the gather — confirmed with `SCRATCHY_GATHER_DIAG=1` SET and 0
-    /// gather steps, against 421 at 2b — and the fold is UNGATHERED), 420-token `c` probe at width 8,
-    /// each binary scored against its OWN `--max-num-seqs 1` run, N = 3:
+    /// ⛔ MEASURED, `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` (hd = 128) **AT A TREE WHERE
+    /// [`PageScratch::of_pass`] STILL REFUSED TWO SLABS** — confirmed with `SCRATCHY_GATHER_DIAG=1` SET
+    /// and 0 gather steps, against 421 at 2b — so that model's fold was UNGATHERED and these three rows
+    /// are three partitions of the SAME ungathered fold. That refusal is gone and the 8b's fold is now
+    /// gathered (419 diag steps, `own_bad 0,0,0`, `solo_diff 0,0,0`, N=3), so the table below is evidence
+    /// about the UNGATHERED fold — which is what the rule is about. 420-token `c` probe at width 8, each
+    /// binary scored against its OWN `--max-num-seqs 1` run, N = 3:
     /// ```text
     ///   origin/main  (cap = g)     own_bad 8,7,7  degen 4,5,3  first divergence 87-118 chars (term 14-19)
     ///   cap lifted for BOTH folds  own_bad 8,8,8  degen 1,1,2  first divergence 1-4 chars (term 0):

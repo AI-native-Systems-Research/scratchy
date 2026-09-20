@@ -772,10 +772,14 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
     let per_leg = scratch.copies().count();
     assert_eq!(
         per_leg as u32,
-        scratch.mq(),
-        "a page-granular pass is ONE copy op per REQUEST — an op per PLANE is refused at bake, \
-         'The initial chunk parameters must fit in LX for SuperDSC' (L3DlOpsScheduler.cpp:1534), \
-         because the initial chunk is sized BEFORE work division so the op's whole 2 MB is measured"
+        scratch.mq() * scratch.ops_per_row(),
+        "a page-granular pass is one copy op per (REQUEST, index-stick cut) — `ops_per_row` is 1 at \
+         every geometry in the ladder, so this is one op per request there. An op per PLANE is refused \
+         at bake, 'The initial chunk parameters must fit in LX for SuperDSC' \
+         (L3DlOpsScheduler.cpp:1534): the pin is the op's unit of work division, so a plane-sized pin \
+         leaves ONE entry, hence ONE CORE, and `getInitialChunkParams` starts from the CORE data stage \
+         — the per-core share IS the whole op there. (It is NOT that the chunk is sized before work \
+         division; see `PagePlaneExtent::lx_entries_per_op` for the vendor line that settles it.)"
     );
     assert_eq!(
         gathered.len(),
