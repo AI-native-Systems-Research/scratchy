@@ -150,27 +150,45 @@ cds-header-name::part(prefix) { color: var(--accent); }
   padding: 3.5rem 1.5rem 4rem;
 }
 
+/* Type sizes are Carbon's own scale (--cds-heading-*, --cds-body-*,
+ * --cds-label-*), never hand-picked rem values. h1 uses Carbon's actual hero
+ * token, display-01 — @carbon/styles' precompiled CSS only exposes its flat
+ * base value (42px) as a custom property, not the responsive step table, so
+ * the breakpoints below are transcribed from @carbon/type's real source
+ * (display01 in lib/index.js: 42px up to md, 54px at lg/66rem, 60px at
+ * xlg/82rem, 76px at max/99rem — the same breakpoint widths as
+ * @carbon/layout's `breakpoints`). Carbon doesn't mandate a weight here —
+ * 300 is its "expressive" marketing convention, but other Carbon headings go
+ * up to 600/700 (e.g. heading-02) — this site keeps the bolder, tighter
+ * tracking on top of Carbon's real hero size scale. */
 h1 {
-  font-size: clamp(2.2rem, 5.5vw, 3.6rem);
+  font-size: 2.625rem;
+  font-weight: 700;
   line-height: 1.1;
   letter-spacing: -0.03em;
   margin: 0 0 1.25rem;
-  font-weight: 700;
 }
+
+@media (min-width: 66rem) { h1 { font-size: 3.375rem; } }
+@media (min-width: 82rem) { h1 { font-size: 3.75rem; } }
+@media (min-width: 99rem) { h1 { font-size: 4.75rem; line-height: 1.05; } }
 
 h1 .accent { color: var(--accent); }
 
 .lede {
   max-width: 44rem;
-  font-size: 1.14rem;
+  font-size: var(--cds-fluid-paragraph-01-font-size);
+  font-weight: var(--cds-fluid-paragraph-01-font-weight);
+  line-height: var(--cds-fluid-paragraph-01-line-height);
   color: var(--muted);
   margin: 0 0 2.75rem;
 }
 
+/* Carbon's real 16-column CSS Grid (--cds-css-grid/--cds-css-grid-column,
+ * from @carbon/styles), not a hand-rolled auto-fit track list. Column spans
+ * live on each child in the markup (cds--sm:col-span-4 etc.); .triple here
+ * is just the row gap and bottom margin layered on top. */
 .triple {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 1rem;
   margin-bottom: 2.5rem;
 }
 
@@ -188,9 +206,14 @@ h1 .accent { color: var(--accent); }
   color: var(--line);
 }
 
-.tcard h3 { margin: 0 0 0.35rem; font-size: 1rem; letter-spacing: -0.01em; }
-.tcard p { margin: 0 0 0.7rem; color: var(--muted); font-size: 0.9rem; }
-.tcard a { font-size: 0.85rem; }
+.tcard h3 {
+  margin: 0 0 0.35rem;
+  font-size: var(--cds-heading-01-font-size);
+  font-weight: var(--cds-heading-01-font-weight);
+  letter-spacing: var(--cds-heading-01-letter-spacing);
+}
+.tcard p { margin: 0 0 0.7rem; color: var(--muted); font-size: var(--cds-body-01-font-size); }
+.tcard a { font-size: var(--cds-label-01-font-size); }
 .tcard a code { background: none; border: none; padding: 0; }
 
 .cta { display: flex; gap: 0.75rem; flex-wrap: wrap; }
@@ -199,40 +222,48 @@ h1 .accent { color: var(--accent); }
 
 main { max-width: var(--wide); margin: 0 auto; padding: 0 1.5rem; }
 
+/* cds--css-grid sets its own centering/margin/padding, meant for a bare page
+ * grid — redundant and doubled-up when nested inside main's own padding. */
+main .cds--css-grid { max-inline-size: none; margin-inline: 0; padding-inline: 0; }
+
 section { padding: 4rem 0; border-bottom: 1px solid var(--line); }
 section:last-child { border-bottom: none; }
 
 h2 {
-  font-size: 1.6rem;
-  letter-spacing: -0.02em;
+  font-size: var(--cds-heading-04-font-size);
+  font-weight: var(--cds-heading-04-font-weight);
+  line-height: var(--cds-heading-04-line-height);
+  letter-spacing: var(--cds-heading-04-letter-spacing);
   margin: 0 0 0.6rem;
 }
 
-.sub { color: var(--muted); max-width: 46rem; margin: 0 0 2rem; }
+.sub { color: var(--muted); max-width: 46rem; font-size: var(--cds-body-01-font-size); margin: 0 0 2rem; }
 
-.more { display: inline-block; margin-top: 1.25rem; font-weight: 600; font-size: 0.95rem; }
+.more { display: inline-block; margin-top: 1.25rem; font-weight: 600; font-size: var(--cds-label-01-font-size); }
 
 /* numbers */
 
-.ngrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 1rem;
-  margin-top: 1.75rem;
-}
+.ngrid { margin-top: 1.75rem; }
 
+/* Same hero-scale treatment as h1 (see the note above it): display-02's real
+ * breakpoint table, transcribed from @carbon/type's source since the CDN
+ * bundle only exposes its flat 42px base as a custom property. */
 .nval {
   font-family: var(--mono);
-  font-size: 2.4rem;
-  font-weight: 700;
-  line-height: 1;
-  letter-spacing: -0.03em;
+  font-size: 2.625rem;
+  font-weight: 600;
+  line-height: 1.19;
+  letter-spacing: 0;
   color: var(--accent);
 }
-.nunit { font-size: 1.15rem; margin-left: 0.1rem; }
+@media (min-width: 66rem) { .nval { font-size: 3.375rem; } }
+@media (min-width: 82rem) { .nval { font-size: 3.75rem; line-height: 1.16; } }
+@media (min-width: 99rem) { .nval { font-size: 4.75rem; line-height: 1.13; } }
 
-.nlabel { margin-top: 0.6rem; font-weight: 600; font-size: 0.95rem; }
-.ncard p { margin: 0.3rem 0 0; color: var(--muted); font-size: 0.88rem; }
+.nunit { font-size: var(--cds-heading-03-font-size); margin-left: 0.1rem; }
+
+.nlabel { margin-top: 0.6rem; font-weight: 600; font-size: var(--cds-body-01-font-size); }
+.ncard p { margin: 0.3rem 0 0; color: var(--muted); font-size: var(--cds-label-01-font-size); }
 
 /* idea */
 
@@ -253,12 +284,6 @@ h2 {
 
 /* targets */
 
-.tgrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  gap: 1rem;
-}
-
 .tg {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -266,8 +291,8 @@ h2 {
   border-radius: 8px;
   padding: 1rem 1.1rem;
 }
-.tg code { background: none; border: none; padding: 0; font-weight: 700; font-size: 0.95rem; }
-.tg span { display: block; margin-top: 0.3rem; color: var(--muted); font-size: 0.88rem; }
+.tg code { background: none; border: none; padding: 0; font-weight: 700; font-size: var(--cds-body-02-font-size); }
+.tg span { display: block; margin-top: 0.3rem; color: var(--muted); font-size: var(--cds-label-01-font-size); }
 
 /* getting started */
 
@@ -278,15 +303,15 @@ h2 {
 
 /* docs */
 
-.dgrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 1rem;
-  margin-top: 1.75rem;
-}
+.dgrid { margin-top: 1.75rem; }
 
-.dcard h3 { margin: 0 0 0.3rem; font-size: 1rem; color: var(--accent-2); }
-.dcard p { margin: 0; color: var(--muted); font-size: 0.89rem; }
+.dcard h3 {
+  margin: 0 0 0.3rem;
+  font-size: var(--cds-heading-01-font-size);
+  font-weight: var(--cds-heading-01-font-weight);
+  color: var(--accent-2);
+}
+.dcard p { margin: 0; color: var(--muted); font-size: var(--cds-label-01-font-size); }
 
 /* footer */
 
