@@ -32,7 +32,7 @@ CHAPTERS = [
     ("Contributing", "CONTRIBUTING.md", "CONTRIBUTING"),
 ]
 BLOG_CHAPTERS = [
-    ("What does “reuse” mean in the age of AI?", "docs/blogs/REUSE.md", "blogs/REUSE"),
+    ("What “Reuse” Means in the Age of AI", "docs/blogs/REUSE.md", "blogs/REUSE"),
 ]
 ALL_CHAPTERS = CHAPTERS + BLOG_CHAPTERS
 
