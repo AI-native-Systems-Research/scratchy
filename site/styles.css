@@ -220,11 +220,19 @@ h1 .accent { color: var(--accent); }
 
 /* ---------- sections ---------- */
 
-main { max-width: var(--wide); margin: 0 auto; padding: 0 1.5rem; }
+/* `body > main` (direct child), not a bare `main` — docs pages also have a
+ * <main class="docs-content">, but it's nested one level deeper inside
+ * .docs-layout, not a direct child of <body>. An unscoped `main{}` here
+ * matched that one too, stacking an extra 1.5rem of padding and a max-width/
+ * auto-margin centering pass on top of .docs-layout's own padding: content
+ * squeezed into a narrow centered column, most visible on phones (that's
+ * also why it only showed up on hamburger/side-nav pages — that's the only
+ * place <main> ends up nested rather than a direct <body> child). */
+body > main { max-width: var(--wide); margin: 0 auto; padding: 0 1.5rem; }
 
 /* cds--css-grid sets its own centering/margin/padding, meant for a bare page
  * grid — redundant and doubled-up when nested inside main's own padding. */
-main .cds--css-grid { max-inline-size: none; margin-inline: 0; padding-inline: 0; }
+body > main .cds--css-grid { max-inline-size: none; margin-inline: 0; padding-inline: 0; }
 
 section { padding: 4rem 0; border-bottom: 1px solid var(--line); }
 section:last-child { border-bottom: none; }
