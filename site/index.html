@@ -35,8 +35,8 @@
 <cds-header aria-label="scratchy">
   <cds-header-name href="." prefix="▚">scratchy</cds-header-name>
   <cds-header-nav menu-bar-label="scratchy navigation">
-    <cds-header-nav-item href="book/index.html">Docs</cds-header-nav-item>
-    <cds-header-nav-item href="book/COMPILER.html">Compiler</cds-header-nav-item>
+    <cds-header-nav-item href="docs/index.html">Docs</cds-header-nav-item>
+    <cds-header-nav-item href="docs/COMPILER.html">Compiler</cds-header-nav-item>
     <cds-header-nav-item href="https://github.com/AI-native-Systems-Research/scratchy">GitHub</cds-header-nav-item>
   </cds-header-nav>
 </cds-header>
@@ -73,8 +73,8 @@
     </div>
 
     <div class="cta">
-      <cds-button kind="primary" href="book/BUILD.html">Build it</cds-button>
-      <cds-button kind="tertiary" href="book/COMPILER.html">How it works</cds-button>
+      <cds-button kind="primary" href="docs/BUILD.html">Build it</cds-button>
+      <cds-button kind="tertiary" href="docs/COMPILER.html">How it works</cds-button>
     </div>
   </div>
 </header>
@@ -85,7 +85,7 @@
   <h2>Blogs</h2>
   <p class="sub">Longer-form writing on why the stack is shaped the way it is.</p>
   <div class="dgrid cds--css-grid cds--css-grid--with-row-gap">
-    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/blogs/REUSE.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="docs/blogs/REUSE.html">
       <h3>What &ldquo;Reuse&rdquo; Means in the Age of AI</h3>
       <p>
         Shared libraries, source modules, bundlers, AoT-compiled crates — every
@@ -138,7 +138,7 @@
       arithmetic, and hands the optimizer enough constants to cut register
       pressure in the kernels that matter.
     </p>
-    <a class="more" href="book/COMPILER.html">Read the compiler deep dive →</a>
+    <a class="more" href="docs/COMPILER.html">Read the compiler deep dive →</a>
   </div>
 
   <div class="idea-code">
@@ -239,29 +239,29 @@ cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
     <div><code>quant/&lt;preset&gt;</code><span>Compiles that quantization <em>instead of</em> dense/bf16.</span></div>
     <div><code>-Fserve</code> <code>-Fbench</code><span>Beyond the default <code>scr chat</code> CLI.</span></div>
   </div>
-  <a class="more" href="book/BUILD.html">Full feature-scoping mechanics →</a>
+  <a class="more" href="docs/BUILD.html">Full feature-scoping mechanics →</a>
 </section>
 
 <section class="docs">
   <h2>Documentation</h2>
   <div class="dgrid cds--css-grid cds--css-grid--with-row-gap">
-    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/BUILD.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="docs/BUILD.html">
       <h3>Building</h3>
       <p>Feature scoping, model and quant selection, air-gapped builds.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/COMPILER.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="docs/COMPILER.html">
       <h3>The compiler</h3>
       <p>The whole-forward DSL, and what the proc macro actually emits.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/MODELS.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="docs/MODELS.html">
       <h3>Adding an architecture</h3>
       <p>The recipe for teaching scratchy a model it has never seen.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/spyre/KUBERNETES.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="docs/spyre/KUBERNETES.html">
       <h3>Spyre on OpenShift</h3>
       <p>Building and shipping an image for the AIU.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/CONTRIBUTING.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="docs/CONTRIBUTING.html">
       <h3>Contributing</h3>
       <p>PR workflow, CI gates, and the architecture invariants.</p>
     </cds-clickable-tile>

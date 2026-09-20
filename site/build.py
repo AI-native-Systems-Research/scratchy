@@ -2,11 +2,11 @@
 """Assemble the GitHub Pages site into site/_site:
 
     /            the hand-written landing page
-    /book/       docs/*.md + CONTRIBUTING.md, rendered client-side by zero-md
+    /docs/       docs/*.md + CONTRIBUTING.md, rendered client-side by zero-md
 
 The Markdown under docs/ stays the single source of truth. Each chapter is
 copied (with internal links rewritten to point at the built .html shells)
-into site/_site/book/, alongside a thin Carbon UI Shell page that renders it
+into site/_site/docs/, alongside a thin Carbon UI Shell page that renders it
 via <zero-md>. There is no server-side markdown-to-HTML step here — mdBook is
 gone; the browser renders the .md file at request time.
 
@@ -20,9 +20,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 SITE = HERE / "_site"
-BOOK = SITE / "book"
+DOCS_OUT = SITE / "docs"
 
-# (title, source path relative to repo root, dest slug under book/, without extension)
+# (title, source path relative to repo root, dest slug under docs/, without extension)
 CHAPTERS = [
     ("Introduction", "site/src/introduction.md", "index"),
     ("Building", "docs/BUILD.md", "BUILD"),
@@ -91,8 +91,8 @@ PAGE_TEMPLATE = """\
   <cds-header-menu-button button-label-active="Close menu" button-label-inactive="Open menu"></cds-header-menu-button>
   <cds-header-name href="{root}" prefix="▚">scratchy</cds-header-name>
   <cds-header-nav menu-bar-label="scratchy navigation">
-    <cds-header-nav-item href="{root}book/index.html">Docs</cds-header-nav-item>
-    <cds-header-nav-item href="{root}book/COMPILER.html">Compiler</cds-header-nav-item>
+    <cds-header-nav-item href="{root}docs/index.html">Docs</cds-header-nav-item>
+    <cds-header-nav-item href="{root}docs/COMPILER.html">Compiler</cds-header-nav-item>
     <cds-header-nav-item href="https://github.com/AI-native-Systems-Research/scratchy">GitHub</cds-header-nav-item>
   </cds-header-nav>
 </cds-header>
@@ -159,19 +159,19 @@ def nav_items(chapters, current_slug, root):
     for title, _src, slug in chapters:
         active = " active" if slug == current_slug else ""
         lines.append(
-            f'      <cds-side-nav-link href="{root}book/{slug}.html"{active}>{title}</cds-side-nav-link>'
+            f'      <cds-side-nav-link href="{root}docs/{slug}.html"{active}>{title}</cds-side-nav-link>'
         )
     return "\n".join(lines)
 
 
 def build_chapter(title, src_rel, slug):
     src = ROOT / src_rel
-    depth = slug.count("/") + 1  # book/<slug>.html is depth levels below site/_site/
+    depth = slug.count("/") + 1  # docs/<slug>.html is depth levels below site/_site/
     root = "../" * depth
 
     md_text = rewrite_links(src.read_text())
-    dest_md = BOOK / f"{slug}.md"
-    dest_html = BOOK / f"{slug}.html"
+    dest_md = DOCS_OUT / f"{slug}.md"
+    dest_html = DOCS_OUT / f"{slug}.html"
     dest_md.parent.mkdir(parents=True, exist_ok=True)
     dest_md.write_text(md_text)
 
@@ -190,10 +190,10 @@ def build_chapter(title, src_rel, slug):
 
 
 def check_markdown_links():
-    """Every relative markdown link must resolve to a file under book/."""
+    """Every relative markdown link must resolve to a file under docs/."""
     broken = False
     link_re = re.compile(r"\]\(([^)]+)\)")
-    for md in BOOK.rglob("*.md"):
+    for md in DOCS_OUT.rglob("*.md"):
         for m in link_re.finditer(md.read_text()):
             target = m.group(1)
             if target.startswith(("http://", "https://", "#", "mailto:")):
@@ -210,7 +210,7 @@ def check_markdown_links():
 
 def main():
     shutil.rmtree(SITE, ignore_errors=True)
-    BOOK.mkdir(parents=True)
+    DOCS_OUT.mkdir(parents=True)
 
     for asset in ("index.html", "styles.css", "favicon.png"):
         shutil.copy(HERE / asset, SITE / asset)
