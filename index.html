@@ -51,20 +51,20 @@
       <strong>Scratchy is what that looks like for inference.</strong>
     </p>
 
-    <div class="triple">
-      <cds-tile class="tcard">
+    <div class="triple cds--css-grid cds--css-grid--with-row-gap">
+      <cds-tile class="tcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5">
         <span class="tnum">1</span>
         <h3>A forward DSL</h3>
         <p>The entire forward pass of an architecture, written as the math.</p>
         <a href="https://github.com/AI-native-Systems-Research/scratchy/blob/main/crates/models/arch/dsl/gemma4-moe.rs.in#L58"><code>gemma4-moe</code></a>
       </cds-tile>
-      <cds-tile class="tcard">
+      <cds-tile class="tcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5">
         <span class="tnum">2</span>
         <h3>A model config</h3>
         <p>The stock <code>config.json</code> for one instance of that architecture.</p>
         <a href="https://github.com/AI-native-Systems-Research/scratchy/blob/main/crates/models/arch/configs/gemma4-moe/gemma-4-26b-a4b-it.json"><code>gemma-4-26b-a4b-it</code></a>
       </cds-tile>
-      <cds-tile class="tcard">
+      <cds-tile class="tcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5">
         <span class="tnum">3</span>
         <h3>A quantization</h3>
         <p>One preset, which <em>replaces</em> the dense emission rather than adding to it.</p>
@@ -84,8 +84,8 @@
 <section class="blogs">
   <h2>Blogs</h2>
   <p class="sub">Longer-form writing on why the stack is shaped the way it is.</p>
-  <div class="dgrid">
-    <cds-clickable-tile class="dcard" href="book/blogs/REUSE.html">
+  <div class="dgrid cds--css-grid cds--css-grid--with-row-gap">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/blogs/REUSE.html">
       <h3>What does &ldquo;reuse&rdquo; mean in the age of AI?</h3>
       <p>
         Shared libraries, source modules, bundlers, AoT-compiled crates — every
@@ -99,18 +99,18 @@
 
 <section class="numbers">
   <h2>Key numbers</h2>
-  <div class="ngrid">
-    <cds-tile class="ncard">
+  <div class="ngrid cds--css-grid cds--css-grid--with-row-gap">
+    <cds-tile class="ncard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5">
       <div class="nval">30<span class="nunit">Mi</span></div>
       <div class="nlabel">AoT binary, Metal</div>
       <p>100&#8239;Mi for Spyre, 250&#8239;Mi for CUDA.</p>
     </cds-tile>
-    <cds-tile class="ncard">
+    <cds-tile class="ncard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5">
       <div class="nval">330<span class="nunit">Mi</span></div>
       <div class="nlabel">Docker image, Spyre</div>
       <p>The runtime is the binary. There is no graph executor to ship.</p>
     </cds-tile>
-    <cds-tile class="ncard">
+    <cds-tile class="ncard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5">
       <div class="nval">300<span class="nunit">ms</span></div>
       <div class="nlabel">Warm start, Apple Silicon</div>
       <p><em>Independent of model size.</em> 12&#8239;s for 8B on Spyre.</p>
@@ -211,10 +211,10 @@
   <p class="sub">
     Pick one backend per build; they are mutually exclusive.
   </p>
-  <div class="tgrid">
-    <div class="tg"><code>-Fspyre</code><span>IBM Spyre AIU · requires the Spyre build toolkit</span></div>
-    <div class="tg"><code>-Fcuda</code><span>NVIDIA · requires the CUDA build toolkit</span></div>
-    <div class="tg"><code>-Fmetal</code><span>Apple Silicon · requires macOS</span></div>
+  <div class="cds--css-grid cds--css-grid--with-row-gap">
+    <div class="tg cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5"><code>-Fspyre</code><span>IBM Spyre AIU · requires the Spyre build toolkit</span></div>
+    <div class="tg cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5"><code>-Fcuda</code><span>NVIDIA · requires the CUDA build toolkit</span></div>
+    <div class="tg cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5"><code>-Fmetal</code><span>Apple Silicon · requires macOS</span></div>
   </div>
 </section>
 
@@ -244,28 +244,28 @@ cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
 
 <section class="docs">
   <h2>Documentation</h2>
-  <div class="dgrid">
-    <cds-clickable-tile class="dcard" href="book/BUILD.html">
+  <div class="dgrid cds--css-grid cds--css-grid--with-row-gap">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/BUILD.html">
       <h3>Building</h3>
       <p>Feature scoping, model and quant selection, air-gapped builds.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard" href="book/COMPILER.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/COMPILER.html">
       <h3>The compiler</h3>
       <p>The whole-forward DSL, and what the proc macro actually emits.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard" href="book/MODELS.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/MODELS.html">
       <h3>Adding an architecture</h3>
       <p>The recipe for teaching scratchy a model it has never seen.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard" href="book/spyre/KUBERNETES.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/spyre/KUBERNETES.html">
       <h3>Spyre on OpenShift</h3>
       <p>Building and shipping an image for the AIU.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard" href="book/CONTRIBUTING.html">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/CONTRIBUTING.html">
       <h3>Contributing</h3>
       <p>PR workflow, CI gates, and the architecture invariants.</p>
     </cds-clickable-tile>
-    <cds-clickable-tile class="dcard" href="https://github.com/AI-native-Systems-Research/scratchy">
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="https://github.com/AI-native-Systems-Research/scratchy">
       <h3>Source</h3>
       <p>The repository, issues, and pull requests.</p>
     </cds-clickable-tile>
