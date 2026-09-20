@@ -37,18 +37,26 @@ zero-md:not(:defined) {
 
 /* ---------- docs pages (site/build.py's Carbon UI Shell) ---------- */
 
-/* cds-side-nav positions itself fixed, 16rem wide, below the 3rem header. */
+/* cds-side-nav only becomes a persistent, always-visible rail at Carbon's own
+ * `lg` breakpoint (66rem — the exact value @carbon/styles uses to switch it
+ * out of mobile/overlay mode); below that it's collapsed behind the header's
+ * hamburger regardless of what this file says. .docs-layout must reserve
+ * space for it on the same breakpoint, or there's a window (e.g. 1000–1055px
+ * under a mismatched cutoff) where this file still reserves the margin but
+ * the rail isn't there to fill it — a wide empty gutter with squished
+ * content. Mobile-first here so that can't happen: no margin by default,
+ * added only once Carbon's own breakpoint says the rail is actually shown. */
 .docs-layout {
   display: flex;
   align-items: flex-start;
   gap: 2.5rem;
-  margin-left: 16rem;
   padding: 0 1.5rem;
 }
 
 .docs-content { flex: 1; min-width: 0; }
 
 .page-toc {
+  display: none;
   position: sticky;
   top: 4rem;
   width: 200px;
@@ -61,9 +69,9 @@ zero-md:not(:defined) {
 .page-toc a { color: var(--muted); }
 .page-toc a:hover { color: var(--fg); }
 
-@media (max-width: 1000px) {
-  .docs-layout { margin-left: 0; }
-  .page-toc { display: none; }
+@media (min-width: 66rem) {
+  .docs-layout { margin-left: 16rem; }
+  .page-toc { display: block; }
 }
 
 html { scroll-behavior: smooth; }
