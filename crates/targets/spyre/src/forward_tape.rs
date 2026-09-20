@@ -30,6 +30,20 @@ pub enum Staged {
     F32(std::borrow::Cow<'static, [f32]>),
     /// IEEE-f16 bytes, already in the device's format.
     F16(Vec<u8>),
+    /// ⭐ SIGNED 32-BIT INTEGERS — an index tensor, never a value tensor.
+    ///
+    /// ⛔ NOT A NARROWABLE NUMBER. Every other staged kernel output is a magnitude the device is
+    /// free to hold in f16; these are ADDRESSES-IN-WAITING, multiplied by `skip_addr` inside dxp's
+    /// synthesised `idx2addr`. f16 carries integers exactly only to 2048, and this pool's block
+    /// numbers run past that at 8 pages of one layer — so narrowing would not lose precision
+    /// visibly, it would silently gather a DIFFERENT ROW'S KEYS and read as fluent text.
+    /// ⭐ AND THEY ARE [`GatherEntry`]s, NOT `i32`s. The comment above already called them
+    /// "ADDRESSES-IN-WAITING"; the type now says so, so the only way to put one in this buffer is
+    /// [`GatherEntry::of_page_block`] and a hand-written block number does not compile.
+    ///
+    /// [`GatherEntry`]: scratchy_subtile::sdsc_abstract::GatherEntry
+    /// [`GatherEntry::of_page_block`]: scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block
+    I32(std::borrow::Cow<'static, [scratchy_subtile::sdsc_abstract::GatherEntry]>),
 }
 
 /// Where prefix validity comes from — the one genuinely two-regime input.
@@ -86,6 +100,18 @@ pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
     /// Stage the embedding and rotary tables stick-scattered. UNCONDITIONAL for the device, but
     /// [`stick_scatter`] is the identity at one row, so decode may pass either.
     pub stick_major: bool,
+    /// ⭐⭐⭐ THE GATHER'S INDEX TABLE — global 4096-element block numbers, row-major over
+    /// `[row, page]`, `Some` exactly when the bundle carries a [`ForwardKernel::KvBlockIndex`] step.
+    ///
+    /// ⛔ THESE ARE NOT PAGE NUMBERS AND NOT PHYSICAL ADDRESSES. dxp computes
+    /// `addr = idx * skip_addr + base` with `skip_addr` measured in ELEMENTS OF ONE ENTRY, which
+    /// for this pool is one 4096-element stick-group. A host page number would be off by
+    /// `page_stride/4096` — a factor of hundreds — and land inside a different layer.
+    ///
+    /// ⛔ NOT DERIVABLE HERE. Only the pool knows which physical page each row's logical page
+    /// occupies, and that mapping CHURNS as sequences are admitted and evicted. It is therefore an
+    /// INPUT, computed by the caller from the live block table, never recomputed from `positions`.
+    pub kv_blocks: Option<&'a [scratchy_subtile::sdsc_abstract::GatherEntry]>,
 }
 
 /// Run one host kernel and return the values it fills its operand with.
@@ -122,6 +148,23 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                 ),
             ),
         });
+    }
+    // ⭐⭐⭐ THE KV BLOCK INDEX, SERVED BEFORE THE f32 TAIL because it is not a float at all: the
+    // entries are int32 block numbers dxp multiplies by `skip_addr`. Routing them through the f32 arms
+    // would round every index through a float and, worse, hand the device the WRONG WIDTH — an index
+    // tensor read at 4 bytes but written as f32 pairs adjacent entries into one garbage address.
+    //
+    // ⛔ A GATHER STEP WITH NO TABLE IS A REFUSAL, NOT AN EMPTY BUFFER. An unstaged index reads as
+    // ZERO, and zero is a VALID block number — every row would gather block 0, i.e. row 0's keys for
+    // the whole batch. Fluent, wrong, and exactly the corruption this path exists to remove, so the
+    // absence is named here rather than filled in.
+    if let ForwardKernel::KvBlockIndex = step.kernel {
+        let blocks = inp.kv_blocks.ok_or_else(|| {
+            "KvBlockIndex step on a forward with no block table: an unstaged index tensor reads as \
+             ZERO, and block 0 is a VALID address — every row would gather row 0's keys"
+                .to_string()
+        })?;
+        return Ok(Staged::I32(std::borrow::Cow::Owned(blocks.to_vec())));
     }
     // ⭐ SERVED BEFORE THE OWNED TAIL, because a constant is not COMPUTED here — it is a table
     // the macro put in the binary, and the arms below all build their rows. Routing it through
@@ -184,6 +227,7 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
         ForwardKernel::CausalMask => causal_tiled(inp.causal, rows, inp.mq_pad, inp.num_q_heads),
         ForwardKernel::PrefixMask => unreachable!("served above, where its dtype is decided"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
+        ForwardKernel::KvBlockIndex => unreachable!("served above, where it stays an INTEGER"),
         ForwardKernel::Decode => {
             return Err("Decode is a device step, not a host call".to_string());
         }
@@ -293,6 +337,17 @@ pub enum ForwardKernel {
     PrefixMask,
     /// Causal validity for the new token's block.
     CausalMask,
+    /// ⭐⭐⭐ THE KV BLOCK INDEX — int32 entries a GATHERED KV read is addressed through.
+    ///
+    /// Present only when the bundle declares an indirect KV access. Today the block table is consulted
+    /// HOST-side to compute one page base per launch, which is why `SessionKv::fold_requests` says
+    /// *"ONE LAUNCHED OP HAS ONE PAGE BASE, so B requests cannot share a pass"*; staging it as a TENSOR
+    /// is what lets every row reach its own keys in one launch.
+    ///
+    /// ⛔ ENTRIES ARE GLOBAL 4096-ELEMENT BLOCK INDICES, NOT PAGE NUMBERS — dxp computes
+    /// `addr = idx * skip_addr + base_addr` and `skip_addr` is the score leg's own entry, measured at
+    /// 4096 elements. See [`KV_BLOCK_INDEX_TID`](crate::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID).
+    KvBlockIndex,
     /// Baked constant `i` (see [`crate::wiring::synthetic_constants`]).
     Const(usize),
     /// The device program itself.
@@ -328,6 +383,17 @@ pub struct ForwardShape {
     pub sin_srcs: &'static [(u32, u32)],
     /// `false` when the bundle placed no broadcast prefix mask, so nothing reads one.
     pub prefix_mask: bool,
+    /// ⭐⭐⭐ THIS BUNDLE READS KV THROUGH AN INDEX, so the tape has a [`ForwardKernel::KvBlockIndex`]
+    /// step and the launch must stage a table.
+    ///
+    /// ⛔ DERIVED FROM THE ARTIFACT, NEVER FROM A CALLER'S FLAG — `BakeFacts::gathers_kv`, which is
+    /// the presence of the `KV_BLOCK_INDEX_TID` placement, exactly as `uses_identity` and
+    /// `uses_ones_reduce` are. The two halves of a gather are the emitted descriptor and the staged
+    /// table, and they fail in OPPOSITE directions: a step with no descriptor binds a tensor nothing
+    /// reads (harmless, invisible), while a descriptor with no step gathers through an unstaged index
+    /// — which reads as ZERO, and block 0 is a VALID address, so every row would attend row 0's keys.
+    /// One artifact-derived question answers both.
+    pub kv_block_index: bool,
     pub n_consts: usize,
 }
 
@@ -362,6 +428,16 @@ impl ForwardShape {
             kernel: ForwardKernel::CausalMask,
             tensor: PlaceId::Act(sd::ATTN_CAUSAL_TID),
         });
+        // ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE — a step iff the bundle placed the tensor. See
+        // [`ForwardShape::kv_block_index`] for why the condition is the placement and not a caller's
+        // opinion, and [`kernel_values`] for why the missing-table case is a refusal rather than an
+        // empty buffer.
+        if self.kv_block_index {
+            v.push(ForwardStep {
+                kernel: ForwardKernel::KvBlockIndex,
+                tensor: PlaceId::Act(sd::KV_BLOCK_INDEX_TID),
+            });
+        }
         for i in 0..self.n_consts {
             // The const's own tid is resolved by the launcher from the same
             // list the kernel index addresses, so it is not repeated here.
@@ -457,7 +533,155 @@ mod tests {
             cos_srcs: &[(5, 64), (7, 64)],
             sin_srcs: &[(6, 64), (8, 64)],
             prefix_mask: true,
+            // The shipped non-gathering shape, so the ORDER assertion below stays the order every
+            // existing bundle plays. The gathering variant is asserted separately.
+            kv_block_index: false,
             n_consts: 3,
+        }
+    }
+
+    /// ⭐⭐⭐ A GATHERING BUNDLE'S TAPE HAS THE STEP, AND A NON-GATHERING ONE DOES NOT — the two halves
+    /// of the gather, checked against each other at the only place both are visible.
+    ///
+    /// ⛔ AND THE STEP NAMES THE RESERVED TID, not "some activation". The tape binds by identity, and a
+    /// step whose tensor no placement matches is skipped by the launcher's lookup with nothing said —
+    /// which for an index tensor means gathering through zeros, i.e. row 0's keys for the whole batch.
+    #[test]
+    fn the_kv_block_index_step_exists_exactly_when_the_bundle_gathers() {
+        let plain = shape();
+        assert!(
+            !plain
+                .steps()
+                .iter()
+                .any(|s| matches!(s.kernel, ForwardKernel::KvBlockIndex)),
+            "a bundle that placed no index tensor must bind none — otherwise every existing bundle \
+             would stage a table nothing reads, and the one artifact-derived question would have two \
+             answers"
+        );
+
+        let gathering = ForwardShape {
+            kv_block_index: true,
+            ..shape()
+        };
+        let steps = gathering.steps();
+        let idx: Vec<&ForwardStep> = steps
+            .iter()
+            .filter(|s| matches!(s.kernel, ForwardKernel::KvBlockIndex))
+            .collect();
+        assert_eq!(idx.len(), 1, "exactly one index table per forward");
+        assert_eq!(
+            idx[0].tensor,
+            PlaceId::Act(sd::KV_BLOCK_INDEX_TID),
+            "the step must name the RESERVED tid the emitter placed — a step naming anything else is \
+             a bind the launcher silently skips"
+        );
+        // ⛔ AND IT PRECEDES THE DEVICE STEP. Every bind must; an index bound after the launch is an
+        // index the launch did not have.
+        let device = steps
+            .iter()
+            .position(|s| matches!(s.kernel, ForwardKernel::Decode))
+            .expect("the tape reaches its device step");
+        let at = steps
+            .iter()
+            .position(|s| matches!(s.kernel, ForwardKernel::KvBlockIndex))
+            .expect("the index step is present");
+        assert!(at < device, "the index must be staged before the launch");
+        // The rest of the tape is unchanged — the gather ADDS a step, it does not reorder one.
+        let without: Vec<ForwardKernel> = steps
+            .iter()
+            .map(|s| s.kernel)
+            .filter(|k| !matches!(k, ForwardKernel::KvBlockIndex))
+            .collect();
+        assert_eq!(
+            without,
+            plain.steps().iter().map(|s| s.kernel).collect::<Vec<_>>(),
+            "declaring a gather must not move any other step"
+        );
+    }
+
+    /// ⛔⛔⛔ A GATHER STEP WITH NO TABLE IS A REFUSAL — asserted, because the alternative is the exact
+    /// silent corruption this whole path exists to remove.
+    ///
+    /// An unstaged index tensor reads as ZERO on the card, and block 0 is a VALID address (row 0's
+    /// first page). So a missing table does not fault, does not zero the output and does not move a
+    /// counter: every row of the batch attends row 0's keys and the model answers fluently and wrongly.
+    #[test]
+    fn a_gather_step_with_no_table_refuses_rather_than_reading_block_zero() {
+        let shape = ForwardShape {
+            kv_block_index: true,
+            ..shape()
+        };
+        let step = ForwardStep {
+            kernel: ForwardKernel::KvBlockIndex,
+            tensor: PlaceId::Act(sd::KV_BLOCK_INDEX_TID),
+        };
+        let err = match kernel_values(&step, &shape, &inputs_without_table()) {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a gather step with NO table produced a value — an unstaged index reads as zero, and \
+                 block 0 is a real address, so the whole batch would attend row 0's keys"
+            ),
+        };
+        assert!(
+            err.contains("block 0 is a VALID address"),
+            "the refusal must say WHY an empty buffer is not an option (got: {err})"
+        );
+
+        // And WITH a table the entries arrive as INTEGERS, not as a narrowed float. f16 carries
+        // integers exactly only to 2048, and this pool's block numbers pass that inside one layer.
+        //
+        // ⛔ THE ENTRIES ARE MINTED THROUGH THE REAL DOOR AND THE FACTOR COMES FROM A REAL POOL, so
+        // this checks the COMPOSITION rather than re-asserting literals it chose itself. `per_page`
+        // is `page_stride / stick_block` for an hd=64 pool over 40 layers — the shipped geometry —
+        // and page 17's block 0 is 65,280, past f16's exact-integer range by 30×.
+        let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(8, 64);
+        let per_page = scratchy_subtile::sdsc_abstract::gather_entries_per_page(
+            40 * pool.stick_block_bytes() * 96,
+            pool,
+        )
+        .expect("a page that is a whole number of stick blocks");
+        let mint = |phys: i64, block: u32| {
+            scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block(per_page, phys, block)
+                .expect("an in-range entry")
+        };
+        let blocks = [mint(0, 0), mint(1, 0), mint(2, 31), mint(17, 0)];
+        assert!(
+            blocks[3].as_i32() > 2048,
+            "the point of this test is a value f16 cannot hold exactly; per_page={} made only {}",
+            per_page.get(),
+            blocks[3].as_i32()
+        );
+        let mut inp = inputs_without_table();
+        inp.kv_blocks = Some(&blocks);
+        match kernel_values(&step, &shape, &inp).expect("a staged table") {
+            Staged::I32(v) => assert_eq!(
+                &v[..],
+                &blocks[..],
+                "the entries must reach the bind loop unmodified"
+            ),
+            Staged::F32(_) | Staged::F16(_) => {
+                panic!("an index table staged as a FLOAT — 65,280 is not representable in f16")
+            }
+        }
+    }
+
+    /// A `ForwardInputs` with everything the index step needs except the table.
+    fn inputs_without_table() -> ForwardInputs<'static, fn(usize) -> bool> {
+        ForwardInputs {
+            hidden: 64,
+            head_dim: 64,
+            num_q_heads: 1,
+            mq_pad: 64,
+            rope_theta: 10000.0,
+            embed_tokens: &[],
+            tokens: &[],
+            positions: &[],
+            causal: &[],
+            prefix: None,
+            consts: &[],
+            mask_neg: -1.0,
+            stick_major: false,
+            kv_blocks: None,
         }
     }
 
@@ -643,6 +867,7 @@ mod tests {
             consts: &[],
             mask_neg: -1.0,
             stick_major: false,
+            kv_blocks: None,
         };
         match kernel_values(&step, &sh, &inp).expect("broadcast staged") {
             Staged::F32(v) => {
@@ -650,6 +875,7 @@ mod tests {
                 assert_eq!(&v[..4], &[0.0, 0.0, 0.0, -1.0]);
             }
             Staged::F16(_) => panic!("a broadcast row is f32; the bind loop narrows it"),
+            Staged::I32(_) => panic!("a broadcast row is a MASK, not an index tensor"),
         }
         let _ = sa::POOL_STICK; // the Blocks variant's shape params come from here
     }

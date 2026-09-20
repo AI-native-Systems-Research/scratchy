@@ -65,6 +65,18 @@ pub(crate) fn run_prefill_batch(
         &scratchy_subtile::sdsc_abstract::LiveBatch,
         scratchy_subtile::sdsc_abstract::DeclaredFold,
     )>,
+    // ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE — global stick-block numbers, one per (launch row, logical page),
+    // built by the caller in the SAME loop that installs the page maps.
+    //
+    // ⛔ IT COMES FROM THE CALLER AND CANNOT BE RECOMPUTED HERE. Which physical page holds a row's
+    // logical page is the pool's live state, it CHURNS as sequences are admitted and evicted, and this
+    // function sees neither the pool nor the block tables. `ForwardInputs::kv_blocks` says the same
+    // thing at the other end of the hand-off.
+    //
+    // `None` for a launch that stages none — a prompt chunk, or a bundle that emitted no gather. The
+    // pairing is checked at `kernel_values`, against the BUNDLE's own placement rather than against
+    // this argument, so "table but no gather" is inert and "gather but no table" is a refusal.
+    kv_blocks: Option<&[scratchy_subtile::sdsc_abstract::GatherEntry]>,
     sh: &Shared<'_>,
     pf: &mut SuperDscSession,
     b: &BundleMeta,
@@ -78,6 +90,20 @@ pub(crate) fn run_prefill_batch(
     // The width the bundle being run was BAKED at — the launch binds exactly this many rows,
     // live or padding, and every extent below (embeddings, masks, `run_step`'s m) is sized by it.
     prefill_m: scratchy_subtile::sdsc_abstract::RungWidth,
+    // ⭐⭐⭐⭐⭐ WHETHER THE BUNDLE BEING RUN GATHERS — the SECOND fact `b` cannot answer, and it rides
+    // beside `prefill_m` because it has exactly `prefill_m`'s provenance: a decode batch rung is
+    // addressed by FINGERPRINT, so `b` is the single-request meta borrowed for its tensor IDS and
+    // describes neither this launch's row count nor its placements. The gather is emitted only by
+    // the collapsed `mq > 1` bodies, so `GathersKv::of(&b.facts)` answers `false` for every rung
+    // that places an index — which the card reports as `0xa35e RAS::PCI::BusFence`, a fence with no
+    // `vars` raised on senlib's own monitor thread, from two gather copies resolving
+    // `idx * skip_addr + base` over a tensor no step staged.
+    //
+    // ⛔ STILL A [`GathersKv`], SO IT STILL HAS ONE DOOR. A `bool` here would be precisely the
+    // "caller answers from a phase or a rung width" hazard that type exists to forbid; every caller
+    // mints this from an artifact — `BakeFacts` for a prompt chunk, the rung's own layout for a
+    // batched step.
+    gathers: scratchy_target_spyre::wiring::GathersKv,
     start: usize,
     want_logits: LogitsWanted<'_>,
 ) -> ExecutorResult<Option<Vec<f32>>> {
@@ -176,6 +202,9 @@ pub(crate) fn run_prefill_batch(
     // for one that is large enough to pay for the special case: the decode batch's prefix mask, which
     // is quadratic in the request count and 93% of everything bound. See the `pmask` branch below.
     let mut acts_f16: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)> = Vec::new();
+    // The gather's index table, raw LE int32 — bound through `bind_input_raw` so the shadow write
+    // copies it instead of re-encoding it as fp16.
+    let mut acts_i32: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)> = Vec::new();
     // Embeddings [mq, hidden] (row i = token i, pad rows replicate the last real token). The emit reads
     // the m>1 residual stream (including this host-staged embedding AND the causal cmask below) rank-2
     // STICK-MAJOR to match the always-stick-major matmul I/O, so stage the bytes stick-major: element
@@ -334,6 +363,14 @@ pub(crate) fn run_prefill_batch(
         scratchy_target_spyre::wiring::RowCapacity::of_baked_rung(prefill_m),
         launch_rows,
         prefix_src.is_some(),
+        // ⛔ THE BUNDLE'S OWN ANSWER — the `KV_BLOCK_INDEX_TID` placement, via [`GathersKv`]. Deriving
+        // it from `kv_blocks.is_some()` instead would make the caller's table the authority over the
+        // descriptor, so a forgotten table would silently emit no step and leave the gather reading
+        // block 0 for every row.
+        //
+        // ⛔ AND IT IS THE PARAMETER, NOT `b.facts`: on a batched rung `b` is the borrowed
+        // single-request meta, whose layout places no index — see `gathers` in the signature.
+        gathers,
         consts.len(),
     );
     let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
@@ -350,6 +387,11 @@ pub(crate) fn run_prefill_batch(
         consts: &consts,
         mask_neg,
         stick_major: stickmajor_emb,
+        // ⭐⭐⭐ THE GATHER'S TABLE, from the caller's own walk of the live page maps. `None` when this
+        // launch has none, which `kernel_values` turns into a REFUSAL if the bundle gathers — never
+        // into an empty buffer, because an unstaged index reads as block 0 and block 0 is a real
+        // address (row 0's first page), so every row would answer from row 0's keys.
+        kv_blocks,
     };
     let fsteps = shape.steps();
     let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
@@ -361,6 +403,7 @@ pub(crate) fn run_prefill_batch(
         staged: None,
         acts: Vec::with_capacity(fsteps.len()),
         acts_f16: Vec::new(),
+        acts_i32: Vec::new(),
         launched: false,
     };
     scratchy_subtile::host_tape::play(
@@ -371,6 +414,7 @@ pub(crate) fn run_prefill_batch(
     debug_assert!(launcher.launched, "the tape must reach its device step");
     acts.extend(launcher.acts);
     acts_f16.extend(launcher.acts_f16);
+    acts_i32.extend(launcher.acts_i32);
 
     // Prefix validity mask [cap]: 0 on valid resident prefix [0..start), mask_neg else -- SAME shared
     // formula decode uses (decode_prefix_col_valid), generalized with `start` (the resident prefix
@@ -422,18 +466,21 @@ pub(crate) fn run_prefill_batch(
     );
     let logits = match want_logits {
         LogitsWanted::LastRow => {
-            let l = pf.run_step_f16(mq, start, &acts, &acts_f16).map_err(|e| {
-                werr(format!(
-                    "superdsc prefill run_step (mq={mq}, start={start}): {e}"
-                ))
-            })?;
+            let l = pf
+                .run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, true)
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc prefill run_step (mq={mq}, start={start}): {e}"
+                    ))
+                })?
+                .unwrap_or_default();
             Some(l.get(..vocab).unwrap_or(&l).to_vec())
         }
         // The shim's own logits D2H converts ONE row from the placement's start (it was written for
         // the folded tail), so it cannot serve this case. Run with a null out-pointer and read the
         // whole `[rows, width]` result tensor back instead — the same single D2H, then de-interleave.
         LogitsWanted::PerRequest(geom) => {
-            pf.run_step_no_logits_f16(mq, start, &acts, &acts_f16)
+            pf.run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, false)
                 .map_err(|e| {
                     werr(format!(
                         "superdsc decode batch run_step (mq={mq}, start={start}): {e}"
@@ -499,7 +546,7 @@ pub(crate) fn run_prefill_batch(
             Some(gathered)
         }
         LogitsWanted::None => {
-            pf.run_step_no_logits_f16(mq, start, &acts, &acts_f16)
+            pf.run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, false)
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, start={start}): {e}"
@@ -591,6 +638,10 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
     pub(crate) acts: Vec<scratchy_target_spyre::wiring::Bind>,
     /// Binds already in the DEVICE's format — the batched prefix mask, and nothing else today.
     pub(crate) acts_f16: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>,
+    /// ⭐ RAW LE int32 binds — the gather's index table, and nothing else. Kept apart from
+    /// [`Self::acts_f16`] because the two need DIFFERENT shadow writes: an f16 bind is still
+    /// re-encoded (`ieee_to_sen_bytes`), an index must be copied verbatim.
+    pub(crate) acts_i32: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>,
     /// Set when the tape's device step runs; the caller reads the logits from there.
     pub(crate) launched: bool,
 }
@@ -637,6 +688,20 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
                 self.acts.push((tensor, v))
             }
             scratchy_target_spyre::forward_tape::Staged::F16(b) => self.acts_f16.push((tensor, b)),
+            // ⛔ ITS OWN LIST, AND ITS OWN BIND CALL. Routing int32 entries through `acts` would
+            // round every address through an f32 and then through `f32_to_f16_le`; routing them
+            // through `acts_f16` skips the narrowing but NOT `ieee_to_sen_bytes`, which re-encodes
+            // each 4-byte entry as two fp16 values. Both produce a valid, different block number —
+            // fluent output from another row's keys. See `Executor::bind_input_raw`.
+            scratchy_target_spyre::forward_tape::Staged::I32(v) => {
+                let mut bytes = Vec::with_capacity(v.len() * 4);
+                for e in v.iter() {
+                    // ⭐ THE ONE PLACE A `GatherEntry` BECOMES A NUMBER AGAIN — the wire encoder, which
+                    // is what `as_i32` exists for. Everything upstream of here carries the type.
+                    bytes.extend_from_slice(&e.as_i32().to_le_bytes());
+                }
+                self.acts_i32.push((tensor, bytes));
+            }
         }
         Ok(())
     }
@@ -967,6 +1032,12 @@ pub(crate) fn superdsc_forward_chunk(
                     // that statement — there are no per-request rows, so the chunk laws are the only
                     // ones reachable.
                     None,
+                    // ⛔ AND NO INDEX TABLE, for the same reason: a prompt chunk's rows share ONE
+                    // resident history, so there is nothing per-row for an index to distinguish, and
+                    // `compute_bundle_layout` places no index tensor for a bundle whose rows are not
+                    // requests. If one ever did, `kernel_values` refuses here rather than gathering
+                    // through an unstaged (zero, and therefore valid) index.
+                    None,
                     sh,
                     pf,
                     pmeta,
@@ -982,6 +1053,10 @@ pub(crate) fn superdsc_forward_chunk(
                                     .to_string(),
                             )
                         })?,
+                    // ⭐ THE PREFILL META'S OWN FACTS, which here IS the bundle being run — a prompt
+                    // chunk launches `pf` under `pmeta`, so unlike the batched rung the borrowed-meta
+                    // divergence does not arise and the artifact answer is the meta's.
+                    scratchy_target_spyre::wiring::GathersKv::of(&pmeta.facts),
                     chunk_start,
                     // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
                     // read however many rows this chunk ran at.
@@ -1185,6 +1260,10 @@ pub(crate) fn superdsc_forward_chunk(
         let shape = b.wiring.forward_shape(
             scratchy_target_spyre::wiring::StagedRows::ONE,
             prefix_src.is_some(),
+            // ⛔ THE BUNDLE'S OWN ANSWER, not "solo decode never gathers". A solo decode runs the
+            // SAME bundle a batched step does when the model bakes one decode graph, so asking the
+            // phase here instead of the artifact is how the two halves drift.
+            scratchy_target_spyre::wiring::GathersKv::of(&b.facts),
             consts.len(),
         );
         // fp16-safe attention "-inf": half the largest finite fp16 magnitude, negated —
@@ -1214,6 +1293,11 @@ pub(crate) fn superdsc_forward_chunk(
             // Proven to be the identity at one row, so this is decode's existing row-major
             // staging spelled as the general form.
             stick_major: true,
+            // ⛔ SOLO DECODE STAGES NO TABLE, and if the bundle gathers, `kernel_values` REFUSES
+            // rather than reading an unstaged index as block 0. That refusal is the correct outcome:
+            // this path resolves ONE page base per launch from `SessionKv`, so it has no per-row table
+            // to offer, and a bundle that gathers must be driven through the batched path.
+            kv_blocks: None,
         };
         let fsteps = shape.steps();
         let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
@@ -1225,6 +1309,7 @@ pub(crate) fn superdsc_forward_chunk(
             staged: None,
             acts: Vec::with_capacity(fsteps.len()),
             acts_f16: Vec::new(),
+            acts_i32: Vec::new(),
             launched: false,
         };
         scratchy_subtile::host_tape::play(

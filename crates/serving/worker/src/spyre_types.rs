@@ -170,11 +170,17 @@ pub(crate) struct DecodeRung {
     /// The row count this rung's bundle was BAKED at — every launch on it binds exactly this many
     /// rows, live or padding, and every mask/fold/logits extent below derives from it.
     pub(crate) seqs: scratchy_subtile::sdsc_abstract::RungWidth,
-    /// ⭐ THE COLUMNS ONE FOLD PASS OF **THIS RUNG'S BODY** SWEEPS (`active_cap`), plumbed from the
-    /// manifest. The mask-coverage guard below used `PAGE_SLOTS` because this was not available, which
-    /// made it the LOOSE bound: the fold covers `swept * pages`, not `PAGE_SLOTS * pages`, and a row
-    /// deeper than the covered window answers from its prompt and its newest token alone.
-    pub(crate) swept: scratchy_target_spyre::manifest::SweptCols,
+    // ⛔⛔⛔ WHAT WAS HERE AND WHY IT IS GONE: `swept` — "the columns one fold pass of THIS RUNG'S BODY
+    // sweeps (`active_cap`), plumbed from the manifest". It was the CEILING body's, and it could not be
+    // anything else: the manifest carries one `SweptCols` per BATCH WIDTH, while a rung's bundle holds a
+    // whole sk_bucket ladder of bodies (`nb ∈ {1, 2, 4}`) and which one a step runs is
+    // `select_body_paged`'s answer from the live context length.
+    //
+    // Two host decisions read it — the gather scratch's window count and the unswept-slot guard — and
+    // both were about the body, not the bundle. Both now come from
+    // `SuperDscSession::step_body(start).swept()`, which is the selector's own answer. The field is
+    // DELETED rather than left for "reporting", because a per-bundle number sitting next to a per-body
+    // question is how this defect happened three times.
     /// ⭐ THE BLOCKS THIS RUNG'S OWN PMASK BAKED ROOM FOR, read from its `bundle_layout.json`. `None` when
     /// the layout could not be read — the launch then keeps the pre-existing behaviour rather than
     /// refusing on a number it does not have. Compared against `MaskBlocks::of(grid)` at launch: the
@@ -188,6 +194,16 @@ pub(crate) struct DecodeRung {
     /// row-block distance. It used to be a worker-side `const` hand-mirroring the emitter's choice
     /// across two crates with no tie.
     pub(crate) fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
+    // ⛔⛔⛔ AND `gathers_kv` IS GONE FOR THE SAME REASON, ONE LEVEL FINER. It was this rung's own
+    // layout's `KV_BLOCK_INDEX_TID` placement — which fixed the defect it was introduced for (it had
+    // been `model.decode.last()`, the m=1 bucket, which places no index and answered `false` for every
+    // rung that does: `0xa35e RAS::PCI::BusFence` from two gather copies resolving
+    // `idx * skip_addr + base` over a tensor no step staged) and still answered about the BUNDLE. A
+    // placement is present if ANY body of the bundle gathers, and a bundle holds a ladder of them.
+    //
+    // It now comes from `step_body(start).gathers()`, which reads the SELECTED body's own launch groups
+    // (`bundle::KvShifts::gathered`). Same authority as `latch_paged_geometry`'s `page_slots`: a bake
+    // fact rides on the launch group it describes.
     pub(crate) sess: SuperDscSession,
     /// THIS rung's logits geometry. It is per-rung, not per-model: the lm-head tail runs unfolded at
     /// `m = seqs`, so the placement's row count — and therefore every gather address — differs

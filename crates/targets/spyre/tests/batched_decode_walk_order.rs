@@ -117,8 +117,11 @@ fn score_op(mq: u32, rows_are_requests: bool) -> emit::EmittedOp {
         // `mq*stick` apart), and the builder refuses if the declared walk strides by neither.
         MatY::of_gqa_group(
             GQA,
-            OperandPlacement::of_token_stream(QueryRowCount::of_mq(mq), NQH, HD, 0, 0),
+            // HEAD 0, REQUEST 0: this op sweeps a head's whole `mq` rows, so the request rides inside
+            // the block rather than being a coordinate it names.
+            OperandPlacement::of_token_stream(QueryRowCount::of_mq(mq), NQH, HD, 0, 0, 0),
             OperandPlacement::of_head_major_rows(
+                0,
                 0,
                 QueryRowCount::of_mq(mq),
                 MaskRows::new(
@@ -288,6 +291,7 @@ fn assemble_attn_threads_the_form_to_every_gform_op() {
             "vc",
             "pmask",
             "cmask",
+            None,
             scratchy_target_spyre::bundle_code::PlaceId::Act(7),
             rar,
             &mut sym,

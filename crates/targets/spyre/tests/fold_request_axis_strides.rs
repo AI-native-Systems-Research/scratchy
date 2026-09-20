@@ -13,12 +13,12 @@
 //! parameters (`a-spot-check-against-its-own-parameters-verifies-nothing`). It never compared that
 //! number against the pool's own address law, which is the only oracle here.
 //!
-//! ## The pool law, quoted from `PagedKvPool::addr`'s own doc (`sdsc_abstract.rs:5169`)
+//! ## The pool law, quoted from `PagedKvPool::addr`'s own doc (`sdsc_abstract.rs:5333`)
 //! ```text
 //! 2. WHICH KV HEAD — and nothing else. There is no request term: a request is a set of SLOTS
 //!    (reached through the host's page map), never a coordinate the device computes with.
 //! ```
-//! `PagedKvPool::request_stride` **no longer exists**: `sdsc_abstract.rs:5197` records that the
+//! `PagedKvPool::request_stride` **no longer exists**: `sdsc_abstract.rs:5361` records that the
 //! per-kv-head block distance *"replaced `block_index(kvh) = kvh * ROWS` and `request_stride`"*. So the
 //! baked step is not a request stride, and a `y` of 1 does not advance to request 1.
 //!
@@ -42,6 +42,19 @@
 //! pitch this compiler chooses; it is not reachable by picking a better constant for the pool, which is
 //! the move every attempt made. The three tests below fence off the constant so a fifth attempt cannot
 //! start from the same false evidence.
+//!
+//! ## ⭐ THE SHAPE THAT CAN CARRY A REQUEST AXIS
+//! A `y`-batched matmul steps a stride it DERIVES from a declared extent, so the operand must HAVE a
+//! uniform per-request pitch. The pool does not and by its own law will not. A **contiguous gather
+//! destination** does: `gather_copy_opspec` copies each row's page out of the pool through the index
+//! into a scratch whose pitch this compiler chooses, so the `y` step is the scratch's own declared
+//! pitch and the request→slots mapping stays where it is known — the host's page map, delivered as
+//! index entries. That is why the gather is not an optimisation of the collapse but its precondition.
+//!
+//! ⛔ WHICH ALSO MEANS THE TWO CANNOT LAND SEPARATELY. `fold_plan::fold_delta` returns
+//! `kv = page_base_bytes(s, rp)` — an ABSOLUTE per-pass KV base applied as a segment shift — while a
+//! gathered read computes `addr = idx * skip_addr + base` from that already-shifted base. Wiring the
+//! gather in without dropping the shift composes two bases and lands inside neither. One atomic change.
 
 use ktir_superdsc::sdsc_abstract::{FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, PagedKvPool};
 
@@ -53,7 +66,7 @@ const NKVH: usize = 8;
 /// ⛔ I FIRST WROTE THIS TEST ASSERTING THE CONSTANT WAS *SHORT* of the kv-head stride by
 /// `hd * WRITE_SLACK`, reasoning from the addressable-vs-physical split that really did put a padded
 /// chunk write on the next head's keys. **The assertion failed: both are 16384.** `WRITE_SLACK` is `0`
-/// today (`sdsc_abstract.rs:5031`, and `:90` says so outright), so `PLANE_SLOTS == PAGE_SLOTS` and the
+/// today (`sdsc_abstract.rs:5195`, and `:90` says so outright), so `PLANE_SLOTS == PAGE_SLOTS` and the
 /// two readings coincide. The hypothesis is recorded as refuted because the near-miss story it tells is
 /// more forgiving than the truth: the step is not approximately the wrong axis, it is EXACTLY the
 /// wrong axis.

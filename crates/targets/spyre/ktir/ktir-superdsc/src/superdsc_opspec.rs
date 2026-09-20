@@ -167,6 +167,40 @@ impl DataFormat for Fp8 {
     const DF: Df = Df::Fp8;
 }
 
+/// ⭐⭐⭐⭐⭐ SENUINT32 — THE **ONLY** FORMAT A GATHER'S INDEX TENSOR MAY CARRY. 32 elems / 128-byte
+/// stick, 4 bytes per entry.
+///
+/// ⛔ IT IS NOT THE VALUE OPERAND'S FORMAT, AND THAT MISTAKE WAS IN THIS FILE. `attach_gather_index`
+/// gave the index operand `self.args[value_idx].view().df` — fp16 — on the reasoning that "an index
+/// lives where the value does and is read at the same word length". The second half is false. Verified
+/// against the vendor's own fixtures, where the index and value LDS are independent:
+///
+/// ```text
+/// dxp/test/test_gather_1core/sdsc_1.json          index: KERNEL_IDX wordLength 4 SENUINT32
+///                                                value: OUTPUT     wordLength 2 SEN169_FP16
+/// dcg/.../test/sdsc_add_paged_l3lu.json           index: KERNEL_IDX wordLength 4 SENUINT32
+/// dcg/.../test/sdsc_identity_gather.json          index: KERNEL_IDX wordLength 4 SENUINT32
+/// primaryDsInfo_ KERNEL_IDX stickSize_ [32]  vs   OUTPUT stickSize_ [64]
+/// ```
+///
+/// NOT A SILENT DEFECT, WHICH IS THE ONE MERCY HERE: `L3DlOpsScheduler.cpp:5928` is
+/// `DT_CHECK(indexLds.wordLength == 4)` and `GatherIndexConversion.cpp:133` is
+/// `DT_CHECK(inputLds.dataFormat_ == DataFormats::SENUINT32)`, so a 2-byte index fails the BAKE. It
+/// would still have been a wrong emission shipped as "descriptor-verified" — the vendor-fixture test
+/// compared the alloc nodes, and the alloc node carries no dataFormat field at all (it lives on the
+/// `labeledDs_` entry joined by `ldsIdx_`), which is exactly why the diff was green.
+///
+/// The host side needs no change: `ConvertData_gather_idx` accepts `IEEE_INT32 -> SENUINT32` (and
+/// int64), and nothing else — so int32 host entries were right all along.
+#[derive(Clone, Copy, Debug)]
+pub enum SenUint32 {}
+impl DataFormat for SenUint32 {
+    const ELEMS_PER_STICK: u32 = 32;
+    const NAME: &'static str = "SENUINT32";
+    const WORD_LENGTH: u32 = 4;
+    const DF: Df = Df::SenUint32;
+}
+
 mod private {
     /// Seals [`DataFormat`](super::DataFormat) so only the formats defined in this
     /// module (`Fp16`, `Fp32`, `SenInt8`) can implement it. `Scale`/`OpFunc` are
@@ -176,6 +210,7 @@ mod private {
     impl SealedDf for super::Fp32 {}
     impl SealedDf for super::SenInt8 {}
     impl SealedDf for super::Fp8 {}
+    impl SealedDf for super::SenUint32 {}
 }
 
 /// **Value-level** mirror of the [`DataFormat`] sealed marker trait — the ONE dtype a dataspace
@@ -200,6 +235,9 @@ pub enum Df {
     /// bf16 dataspace today (the score path stays SEN169_FP16; bf16-output matmul is dxp-rejected). Kept
     /// representable for the `lower_attn_node` bf16-operand check.
     Bf16,
+    /// ⭐ SENUINT32 — 4-byte / 32-stick. A GATHER'S INDEX TENSOR AND NOTHING ELSE. See [`SenUint32`]
+    /// for why it cannot be the value operand's format.
+    SenUint32,
 }
 
 impl Df {
@@ -211,6 +249,7 @@ impl Df {
             Df::Fp8 => <Fp8 as DataFormat>::ELEMS_PER_STICK,
             Df::SenInt8 => <SenInt8 as DataFormat>::ELEMS_PER_STICK,
             Df::Bf16 => <Fp16 as DataFormat>::ELEMS_PER_STICK, // BF16E shares fp16 geometry (2-byte / 64-stick)
+            Df::SenUint32 => <SenUint32 as DataFormat>::ELEMS_PER_STICK,
         }
     }
     /// Bytes per element (`wordLength`) — from the type-level [`DataFormat`] impl.
@@ -221,6 +260,7 @@ impl Df {
             Df::Fp8 => <Fp8 as DataFormat>::WORD_LENGTH,
             Df::SenInt8 => <SenInt8 as DataFormat>::WORD_LENGTH,
             Df::Bf16 => <Fp16 as DataFormat>::WORD_LENGTH,
+            Df::SenUint32 => <SenUint32 as DataFormat>::WORD_LENGTH,
         }
     }
     /// DeepTools `dataFormat_` string — from the type-level [`DataFormat`] impl (`Bf16` has no marker type).
@@ -231,6 +271,7 @@ impl Df {
             Df::Fp8 => <Fp8 as DataFormat>::NAME,
             Df::SenInt8 => <SenInt8 as DataFormat>::NAME,
             Df::Bf16 => "BF16E",
+            Df::SenUint32 => <SenUint32 as DataFormat>::NAME,
         }
     }
 }
@@ -795,6 +836,51 @@ impl WorkPlan {
         names.map(|n| self.iter_sym(n))
     }
 
+    /// ⭐⭐⭐⭐⭐ THE **INDEX OPERAND'S** OWN ITERATION SPACE — this plan with every paged dim measured in
+    /// ENTRIES ([`PageExtent::entries_in`]) instead of positions, and UNSPLIT.
+    ///
+    /// ## Why it is a whole plan and not four divisions
+    /// The emitter reads a view's extents in FOUR places, each independently: the arrangement
+    /// classifier (`view_stick_layout`), the on-card walk (`maxDimSizes_`), the coordinate folds
+    /// (`build_coordinates` → `plan.extent / plan.split_of`) and the per-core START
+    /// (`per_core_addr` → `WorkPlan::corner_elems`, which is `slice_idx · per_core_extent`). Only the
+    /// first two go through [`crate::sdsc_abstract::DeviceExtents::of_view`], so a declared extent
+    /// (`TensorArg::with_device_extent`) reaches two of them and is DROPPED by the other two — which is
+    /// exactly how the index came to declare 2048 entries and a 256-byte per-core step. Handing the
+    /// index view a plan of its own makes all four read ONE number; there is no per-reader division to
+    /// forget.
+    ///
+    /// ## Why the paged dims come out UNSPLIT
+    /// dxp's own construction says so in words — `dsm/progCorrection.cpp:524`:
+    /// *"core work division : all cores operate on all sticks of arrayB, each scattering
+    /// `32/numCores` index out of 32 indicies"* — and its code gives `arrayB` (the index) **no
+    /// per-core HBM offset at all** (only `arrayA`, the value, gets one), setting
+    /// `arrayB_startIdx[core c] = num_index_per_core * c` instead. Both vendor fixtures agree: the
+    /// paged-attention one has 32 cores and only TWO distinct index addresses. Confirmed by baking
+    /// both declarations on the pod (`dxp_standalone`, `DBO_DEBUG=1`): unsplit gives ONE index address
+    /// for all 32 cores, and the per-core IBR word each core reads (`c`) is unchanged.
+    ///
+    /// `cores` is carried through untouched: the OP still uses every core it was divided over, and
+    /// `numWkSlicesPerDim_`/`coreIdToWkSlice_` are emitted from the op's own plan, never from this one.
+    ///
+    /// `None` when a pin names a dim this plan does not have, or does not divide it — the same refusal
+    /// [`PageExtent::entries_in`] documents, surfaced as the caller's build error.
+    pub fn of_index_entries(&self, pins: &[(&'static str, PageExtent)]) -> Option<WorkPlan> {
+        let mut dims = self.dims.clone();
+        let mut splits = self.splits.clone();
+        for &(name, pin) in pins {
+            let d = dims.iter_mut().find(|d| d.name == name)?;
+            d.size = pin.entries_in(d.size)?;
+            // The index is the WHOLE table on every core — see the note above.
+            splits.remove(name);
+        }
+        Some(WorkPlan {
+            dims,
+            splits,
+            cores: self.cores,
+        })
+    }
+
     /// Per-core extent of a named dim = `extent / split` (≥1). The work-division
     /// hands each core this much of `name`.
     pub fn per_core_extent(&self, name: &str) -> u32 {
@@ -1059,6 +1145,8 @@ pub fn assert_df_stick_multiple(elems: u32, df: Df) -> Result<(), String> {
         Df::SenInt8 => StickExtent::<SenInt8>::new(elems).map(|_| ()),
         Df::Fp32 => StickExtent::<Fp32>::new(elems).map(|_| ()),
         Df::Fp16 | Df::Bf16 => StickExtent::<Fp16>::new(elems).map(|_| ()),
+        // A gather's index table — 32 elems / 128-byte stick, the vendor's `KERNEL_IDX stickSize_ [32]`.
+        Df::SenUint32 => StickExtent::<SenUint32>::new(elems).map(|_| ()),
     }
 }
 
@@ -1137,6 +1225,27 @@ pub enum Role {
     Input,
     Kernel,
     Output,
+    /// ⭐⭐⭐⭐⭐ A GATHER'S INDEX TABLE — the vendor's `KERNEL_IDX`, and its OWN role for one reason:
+    /// `primaryDsInfo_` is keyed by `ds_type()`.
+    ///
+    /// ⛔ THIS WAS `Role::Input`, AND THAT SILENTLY DROPPED THE INDEX'S WHOLE LAYOUT. `emit_sdsc`
+    /// builds `primaryDsInfo_` with `primary.entry(role.ds_type()).or_insert_with(..)` — first writer
+    /// wins per role — and the op's real activation is operand 0 while the index is inserted just
+    /// before the output. So the index's `layoutDimOrder_ ["out"]` / `stickSize_ [32]` never reached
+    /// the JSON at all: dxp read the ACTIVATION's `["mb","in"]` / `[64]` for it. Different rank,
+    /// different stick, and (after the dtype fix) 4-byte entries described at 2 bytes.
+    ///
+    /// The vendor emits it as a separate role for exactly this reason — both fixtures carry
+    /// `primaryDsInfo_` with an `OUTPUT` entry at `stickSize_ [64]` AND a `KERNEL_IDX` entry at
+    /// `stickSize_ [32]`:
+    /// ```text
+    /// dxp/test/test_gather_1core/sdsc_1.json  KERNEL_IDX layoutDimOrder_ ["mb"]      stickSize_ [32]
+    /// dcg/.../sdsc_add_paged_l3lu.json        KERNEL_IDX layoutDimOrder_ ["x","y"]   stickSize_ [32]
+    /// ```
+    /// ⛔ NOT `Role::Kernel` EITHER: a kernel is a matmul weight, gets a `RetileDescriptor` and is
+    /// staged tiled; an index is host data bound per step. Sharing the name would put it through the
+    /// kernel-weight staging path.
+    Index,
 }
 impl Role {
     pub fn ds_type(self) -> &'static str {
@@ -1144,6 +1253,7 @@ impl Role {
             Role::Input => "INPUT",
             Role::Kernel => "KERNEL",
             Role::Output => "OUTPUT",
+            Role::Index => "KERNEL_IDX",
         }
     }
 }
@@ -1856,6 +1966,442 @@ impl EpilogueOpFunc {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Indirect (gathered) HBM access.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A GATHERED HBM read: operand [`Self::value`] is addressed through the int32 indices held in
+/// operand [`Self::index`], one entry per index.
+///
+/// ## Why this is ONE struct and not two operand flags
+/// dxp requires the two allocate nodes to CROSS-LINK — each names the other in
+/// `relatedIndirectAccessAlloc_` — and the compute op to name the index side in
+/// `indirectAccessIndexLabeledDs`. Three fields that must agree. Declared per-operand, a
+/// half-set pair is representable and lowers to a `map::at` with no message; declared once
+/// here, it is not.
+///
+/// ## The vendor shape this reproduces
+/// `dxp/test/test_gather_1core/sdsc_1.json`, the fixture that BAKES:
+/// ```text
+/// allocate-Tensor1_hbm  indirectAllocType_ index_tensor  indexTensorType_ index
+///                       relatedIndirectAccessAlloc_ allocate-Tensor2_hbm
+/// allocate-Tensor2_hbm  indirectAllocType_ value_tensor  isStartAddrSymbolic_ 1
+///                       relatedIndirectAccessAlloc_ allocate-Tensor1_hbm
+///                       maxDimSizes_ [1, -1, -1]
+/// computeOp_[0]         indirectAccessIndexLabeledDs ["Tensor1-idx1"]
+/// ```
+/// The whole address computation is affine — `ConvertData_gather_idx` does
+/// `addr = idx * skip_addr + base_addr`, with `skip_addr` documented *"in sticks: amt to skip
+/// per idx"*. Nothing in it means "page": an index step advances by whatever the declaration
+/// says, so the ENTRY is ours to choose.
+///
+/// ⛔ `skip_addr` is NOT free. It is derived from the value tensor's own per-dim capacities
+/// (`getBufferCapacityForNodePerDim`), where an unbounded dim contributes its datastage extent
+/// and the pinned dim is clamped to the page. So it equals the ENTRY'S OWN SIZE, which makes
+/// the gathered entries' HBM spacing a CONSTRAINT, not a parameter: they must be packed
+/// exactly `entry_size` apart. A declaration that disagrees with the real spacing produces
+/// wrong addresses that BAKE CLEAN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndirectAccess {
+    /// Operand position holding the indices (int32). Becomes the `index_tensor` node.
+    pub index: usize,
+    /// Operand position read THROUGH those indices. Becomes the `value_tensor` node.
+    pub value: usize,
+    /// The axis of `value` carrying the PAGE granularity, and how many of its positions one entry
+    /// covers. The emitter pins `maxDimSizes_` along it, which is what declares it paged:
+    /// `getPageSize` (`dsc2.cpp:4493-4526`) erases every negative entry, so the surviving pinned dims
+    /// ARE the paged dims.
+    pub entry_dim: KernelAxis,
+    /// HOW MANY positions along [`Self::entry_dim`] one index entry selects — the PAGE.
+    pub page: PageExtent,
+    /// ⭐⭐⭐ THE SECOND PAGED AXIS, PINNED TO 1 — one index entry PER POSITION along it.
+    ///
+    /// This is what makes a gather cover a whole batch in ONE launch: with only the page axis pinned,
+    /// an entry names a page but not a ROW, so each launch still serves one row and the launch count
+    /// keeps its batch factor. Pinning the batch axis as well puts both factors inside the index.
+    ///
+    /// `None` = pages only, which is a legal and smaller win (the vendor's own `test_gather_1core`
+    /// pins one dim), so it is not a defect — but it is not batch-invariant either, and the two must
+    /// not be confused.
+    ///
+    /// ⛔ NOT A "REQUEST" AXIS. This emitter is handed a batch of rows and executes it; a row is a
+    /// row, and `mb` is where they live. Nothing about a serving request is visible or needed here.
+    pub per_position: Option<KernelAxis>,
+}
+
+impl IndirectAccess {
+    /// The paged dims with their pins, in the order the VALUE's layout has them — which is exactly the
+    /// order the index tensor's own layout must be in (both vendor fixtures, see
+    /// `zz_the_index_tensors_shape_is_the_paged_dims.rs`).
+    ///
+    /// Returned as `(dim name, pin)` so the emitter and the index-operand builder read ONE list rather
+    /// than each re-deriving which dims are paged from two fields.
+    pub fn pins(&self) -> Vec<(&'static str, PageExtent)> {
+        let mut v = vec![(self.entry_dim.dim(), self.page)];
+        if let Some(pp) = self.per_position {
+            v.push((pp.dim(), PageExtent::single_position()));
+        }
+        v.sort_by_key(|(d, _)| KernelAxis::layout_rank(d));
+        v
+    }
+}
+
+/// ⭐⭐⭐ THE PAGE, IN POSITIONS OF THE PAGED AXIS — how much of `entry_dim` ONE index entry covers.
+///
+/// dxp clamps the paged axis's capacity to this and multiplies by the other axes' full per-core
+/// extents, so `skip_addr = page × (the rest)`. That makes this the ONE knob that sets the address
+/// stride, and the reason it is a type rather than a `u32`: the two useful values differ by 64× and
+/// both bake.
+///
+/// ## Measured, not assumed
+/// At the score leg's geometry (`in=64, out=256`), `zz_the_gathered_kv_operands_page_geometry.rs`
+/// records:
+/// ```text
+/// Slot pinned 1   -> skip_addr = 64      (one entry per KV column)
+/// Slot pinned 64  -> skip_addr = 4096    (one entry per POOL BLOCK)
+/// ```
+/// Both divide the pool's 4096-element block, so both can name a block base — but only the second
+/// makes an entry a plain BLOCK NUMBER. With the first, the entry is `64·block + column` and the index
+/// needs 64 entries per block, so a host that stages block numbers would address 64× short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageExtent(u32);
+
+impl PageExtent {
+    /// ⭐ ONE STICK of positions — for a Slot-paged KV read, one 64-slot Kᵗ block, i.e. exactly one
+    /// pool block. This is the door that makes an index entry a plain block number.
+    ///
+    /// Spelled from the format rather than from `sdsc_abstract::POOL_STICK` (which is this same
+    /// expression) because that module is layered ABOVE this one.
+    pub const fn of_one_stick() -> Self {
+        PageExtent(<Fp16 as DataFormat>::ELEMS_PER_STICK)
+    }
+
+    /// ONE POSITION — the vendor gather fixture's `[1, -1, -1]`. An entry is then a single position
+    /// along the axis, not a block.
+    pub const fn single_position() -> Self {
+        PageExtent(1)
+    }
+
+    /// ⭐ AN EXPLICIT NUMBER OF POSITIONS — the gather-copy op's page, which is `cols / POOL_STICK` sub-rows
+    /// of a block ([`crate::sdsc_abstract::GatherScratch::entry_page`]). Neither of the two named doors above
+    /// fits: the entry is neither one position nor one fp16 stick of them, it is one POOL BLOCK expressed in
+    /// the one-stick sub-rows a row-major destination forces. Kept a separate constructor so the two
+    /// geometry-named doors keep meaning exactly what they say.
+    pub const fn of_positions(n: u32) -> Self {
+        PageExtent(n)
+    }
+
+    /// The pin, as `maxDimSizes_` carries it.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// ⭐⭐⭐⭐⭐ HOW MANY INDEX ENTRIES A DIM OF `positions` NEEDS UNDER THIS PIN — **THE ONLY DIVISION
+    /// IN THE GATHER**, because dxp performs exactly this one and nothing else decides the entry count.
+    ///
+    /// `createIdx2AddrSdsc` (`dbo/src/Transforms/sdsc_bundle/GatherIndexConversion.cpp`) builds the
+    /// index→address conversion as a SINGLE-CORE SDSC whose `N_` is the gather op's `N_` **divided by
+    /// the value tensor's page size per dim** (`AllocateNode::getPageSize`, `dsc/dsc2.cpp:4493` — the
+    /// surviving non-negative `maxDimSizes_` entries), then rounded up to the index's stick:
+    /// ```text
+    /// for ([dim, size] : indexAlloc->getPageSize())  dsc.N_[dim] /= size;  // then ceil to stickSize
+    /// dsc.dataStageParam_[0].ss_ = dsc.N_;                                // ONE core
+    /// ```
+    /// MEASURED on the pod with `DBO_DEBUG=1`: the shipped `mb = 2048`, page `64` gather yields
+    /// `idx2addr_lds1_sdsc_0` with `N_ mb_ = 32`, and `allocateAndModifyGather`
+    /// (`dbo/src/Utils/sdsc_bundle/GatherBuffers.cpp`) allocates its converted-address output at
+    /// `getBufferCapacityForNode(indexAlloc)` = 32 entries = **128 bytes**, reading its input as ONE
+    /// CONTIGUOUS RUN starting at the MINIMUM of the index's per-core start addresses and writing one
+    /// contiguous run out. It then shifts every per-core index address by that single constant,
+    /// PRESERVING their spread.
+    ///
+    /// ⛔⛔⛔ SO THE INDEX'S DECLARED EXTENT IS NOT THE OP'S `mb`, AND DECLARING IT SO IS A WILD DMA.
+    /// The index operand used to take the op's own `mb` extent (2048) and the op's own 32-way `mb`
+    /// split, which put core `c`'s index start `64` ENTRIES (256 B) along — so cores 1..31 addressed
+    /// bytes 256..7936 of a 128-byte buffer that nothing ever wrote, and the card read raw index
+    /// bytes (or uninitialised HBM) as ABSOLUTE stick addresses. Entry `0` — the table's pad — becomes
+    /// address `0` that way, which is a PCIe bus-master abort, not a wrong answer.
+    ///
+    /// ⛔ AND THE ENTRY EACH CORE PICKS IS NOT AFFECTED BY THIS AT ALL, which is why the bug was
+    /// invisible: the DataflowIR shows core `c` indexing its IBR at word `c`
+    /// (`get_logical_memory_view %ibr, %c<c>`) **byte-identically before and after** — dxp derives that
+    /// from the op's own work-slice along the gather dim, not from the index allocation. The per-core
+    /// start address only decides which 32 words get loaded into the IBR in the first place.
+    ///
+    /// `None` when the pin is zero or does not divide, because a partial entry is an address.
+    pub const fn entries_in(self, positions: u32) -> Option<u32> {
+        if self.0 == 0 || !positions.is_multiple_of(self.0) {
+            None
+        } else {
+            Some(positions / self.0)
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ WHERE A GATHER OP'S INDEX OPERAND STARTS INSIDE THE INDEX TENSOR — **IN WHOLE INDEX
+/// STICKS**, because that is the unit dxp loads it in.
+///
+/// ⛔ A STICK COUNT AND NOT AN ENTRY COUNT, AND THAT IS THE WHOLE TYPE. The index tensor reaches the
+/// L3LU IBR as ONE transfer "in the granularity of one stick"
+/// (`L3DlOpsScheduler::fillTransferMulticastInfo`), so a base that is not a stick multiple hands the
+/// op 32 words straddling two different runs of entries — every core then converts the right index
+/// arithmetic over the wrong half of the table, with a clean bake. Spelled as sticks, that is not
+/// expressible; spelled as entries, `first_entry + 1` compiles.
+///
+/// `ZERO` is the whole-tensor case every non-split gather takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct EntryBase(u32);
+
+impl EntryBase {
+    /// The index tensor's own start — every gather whose index is not cut into runs.
+    pub const ZERO: EntryBase = EntryBase(0);
+
+    /// `sticks` whole index sticks in.
+    pub const fn of_sticks(sticks: u32) -> EntryBase {
+        EntryBase(sticks * <SenUint32 as DataFormat>::ELEMS_PER_STICK)
+    }
+
+    /// The base in ENTRIES — what the operand's `offset_elems` is, since an entry is one SENUINT32
+    /// word and `resolve_seg_base` multiplies by the arg's own `wordLength`.
+    pub const fn entries(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐⭐⭐ A GATHER, AS ONE ARGUMENT — the index operand's name plus the two facts that decide what an
+/// entry MEANS.
+///
+/// ⛔ ONE STRUCT, NOT A TUPLE, BECAUSE THE TWO FACTS ARE READ TOGETHER OR NOT AT ALL. `entry_dim`
+/// says which axis the entries enumerate and `page` says how much of it each covers; the address
+/// stride is a function of BOTH (`skip_addr = page × the other axes`). Supplied positionally, the
+/// pair reads as two independent knobs, and the combination that matters — Slot paged by one stick,
+/// so an entry is a plain pool block number — looks like a coincidence rather than the contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatherIndex {
+    /// The index operand's tensor name. It is APPENDED as a read-only operand and never listed as an
+    /// arithmetic input — see the emitter's `inputLabeledDs` note.
+    pub name: String,
+    /// The axis the entries enumerate.
+    pub entry_dim: KernelAxis,
+    /// How many positions along that axis one entry covers.
+    pub page: PageExtent,
+    /// The SECOND paged axis, pinned to 1 — see [`IndirectAccess::per_position`]. `None` pages the
+    /// entry axis only.
+    pub per_position: Option<KernelAxis>,
+    /// ⭐ WHERE THIS OP'S RUN OF ENTRIES STARTS inside the index tensor — see [`EntryBase`].
+    /// [`EntryBase::ZERO`] for every gather whose index is not cut into one-stick runs.
+    pub first_entry: EntryBase,
+}
+
+impl GatherIndex {
+    /// ⭐ THE PAGED-KV FORM: entries enumerate the KERNEL'S SLOTS, one stick each — so ONE entry is
+    /// ONE 4096-element pool block and the value staged is a plain global block number.
+    ///
+    /// This is the only combination the KV pool's own layout makes natural, which is why it has a
+    /// named door: every stride the pool defines is a multiple of one stick-block, so `idx * skip +
+    /// base` lands exactly on a block boundary for every integer `idx`.
+    pub fn of_pool_blocks(name: String) -> Self {
+        Self {
+            name,
+            entry_dim: KernelAxis::Slot,
+            page: PageExtent::of_one_stick(),
+            // ⛔ PAGES ONLY. Every row of the batch reads the same gathered block, so this collapses
+            // the PAGE relaunch and nothing else. Use [`Self::of_pool_blocks_per_row`] for the
+            // batch-invariant form; the two are separate doors precisely because they look identical
+            // in a descriptor diff and differ by the launch count.
+            per_position: None,
+            // The whole index tensor — this form is not cut into runs.
+            first_entry: EntryBase::ZERO,
+        }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE GATHER-COPY OP'S FORM — one entry PER `mb` ROW of the copy, which is one 64-slot pool
+    /// block for one (kv head, slot window, request).
+    ///
+    /// ⛔ THE ENTRY AXIS IS `mb` AND THERE IS NO SECOND PINNED AXIS, which is what makes the index a
+    /// single FLAT array. [`Self::of_pool_blocks`] and [`Self::of_pool_blocks_per_row`] both page the SLOT
+    /// axis, because they were written for the matmul KERNEL as the gathered operand — a shape deeptools
+    /// refuses (it cannot schedule a gather on an op that has a `KERNEL`; two bracketing card refusals,
+    /// and `emit_sdsc` now refuses it at build time). The copy op's dims are `[mb, out, y]` and it has no
+    /// `KERNEL`, so `out` stays whole and `mb` carries the entries.
+    ///
+    /// ⭐ AND THE `page` IS WHAT MAKES `skip_addr` ONE POOL BLOCK. `skip_addr` is
+    /// `page × the per-core extents of the unpinned dims`, and the copy declares ONE STICK of `out` (see
+    /// [`crate::sdsc_abstract::GatherScratch::sub_rows`] for why it must, and what a wider `out` scrambles),
+    /// so the entry spans `page × 64` elements. With `page = cols / POOL_STICK` that is exactly
+    /// [`crate::sdsc_abstract::GatherScratch::cols`] — the pool's own stick block — and an entry is a plain
+    /// global block number, which is what the host's table stages.
+    ///
+    /// ⛔ THE WORK DIVISION MUST NOT CUT AN ENTRY. `skip_addr` clamps the pinned axis to
+    /// `min(per_core_extent, page)`, so a core owning fewer than `page` positions of `mb` shrinks the entry:
+    /// at bs=2 an unrestricted split would give each of 32 cores 32 sub-rows against a 64-position page and
+    /// halve `skip_addr` — a clean bake whose every index step lands half a block short. `gather_copy_cores`
+    /// divides by whole entries for exactly this reason.
+    ///
+    /// ⭐ AND `first_entry` IS WHERE THIS OP'S RUN STARTS, because the pass is cut into one op per index
+    /// stick ([`crate::sdsc_abstract::GatherScratch::copies`]). It is an [`EntryBase`] — a STICK count —
+    /// so a run that starts mid-stick cannot be named here.
+    pub fn of_scratch_rows(name: String, page: PageExtent, first_entry: EntryBase) -> Self {
+        Self {
+            name,
+            entry_dim: KernelAxis::Batch,
+            page,
+            // ⛔ NO SECOND PAGED AXIS. `out` must stay UNPINNED: it is the factor `skip_addr` is made of,
+            // and pinning it too would collapse the entry to one position and make every index step move
+            // a single element.
+            per_position: None,
+            first_entry,
+        }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE BATCH-INVARIANT FORM: entries are a table over (KV block, BATCH ROW), so ONE launch
+    /// serves every row of the batch at its own KV base.
+    ///
+    /// Two paged axes, which is what IBM's paged attention declares (`[-1,-1,64,1]`): the slot axis
+    /// carries the page granularity, and `mb` is pinned to 1 so there is one entry per row.
+    ///
+    /// ⛔ THE VALUE OPERAND MUST ACTUALLY DECLARE `mb`. A matmul kernel is the BARE 2-D shared weight
+    /// `["in","out"]`, and the emitter refuses a paged axis the operand does not have — which is the
+    /// right failure, because a silently-dropped `mb` pin is this door's own promise unkept and reads
+    /// as a working gather.
+    pub fn of_pool_blocks_per_row(name: String) -> Self {
+        Self {
+            name,
+            entry_dim: KernelAxis::Slot,
+            page: PageExtent::of_one_stick(),
+            per_position: Some(KernelAxis::Batch),
+            // The whole index tensor — this form is not cut into runs.
+            first_entry: EntryBase::ZERO,
+        }
+    }
+}
+
+/// ⭐⭐⭐ THE AXIS AN INDEX STEPS ALONG, AS A CLOSED SET OF TWO — the matmul kernel's own dims.
+///
+/// ⛔ THIS REPLACES A FREE `&'static str`, AND THE DIFFERENCE IS A WHOLE FAILURE CLASS. A misspelled
+/// or foreign dim name resolved to nothing, and "nothing" is not a refusal the card can make: a value
+/// tensor whose `entry_dim` names a dim it does not have still emits a `value_tensor` node, still
+/// cross-links, and still BAKES — gathering with no page declared, which is wrong addresses from a
+/// clean build. The emitter had to carry a build-`Err` for that, and the assembler a `panic!`. Neither
+/// is needed now, because there is no third inhabitant to pass.
+///
+/// The two names are `Stk::kernel`'s own layout, which is `["in", "out"]` for every kernel operand
+/// this emitter builds — so [`position`](Self::position) is carried rather than searched for, and
+/// `zz_the_gathered_kv_operands_page_geometry.rs` asserts that layout off the real emission so the
+/// constant cannot drift silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelAxis {
+    /// `"in"` — the CONTRACTED axis (head dim). An index step advances a whole feature row.
+    Feature,
+    /// `"out"` — the kernel's output-column axis, which for a KV read is its SLOTS. This is the
+    /// paged axis of a paged attention: consecutive index entries name consecutive KV blocks.
+    Slot,
+    /// ⭐ `"mb"` — THE BATCH ROWS. Pinned to 1 this gives one index entry per row, which is what lets
+    /// one launch serve the whole batch.
+    ///
+    /// ⛔ A KERNEL OPERAND DOES NOT DECLARE THIS BY DEFAULT, and that is the whole gap. `matmul_opspec`
+    /// builds the kernel as the BARE 2-D shared weight `["in","out"]`, broadcast across the batch —
+    /// `matmul/opspec.rs` records that a 3-D kernel "makes dxp treat the weight as per-batch →
+    /// garbage". That warning is about an UNGATHERED kernel, where per-batch means a dxp-DERIVED
+    /// stride the KV pool does not have. Under `isStartAddrSymbolic_` the base comes from the index,
+    /// so per-batch is exactly right — and IBM's own gathered value tensor is rank-4 WITH `mb`. The
+    /// rank-3 kernel and the gather are correct only TOGETHER.
+    Batch,
+}
+
+impl KernelAxis {
+    /// The dim name, as `layoutDimOrder_` spells it.
+    pub const fn dim(self) -> &'static str {
+        match self {
+            Self::Feature => "in",
+            Self::Slot => "out",
+            Self::Batch => "mb",
+        }
+    }
+
+    /// This axis's position in a GATHERED kernel's layout — the sort key that puts a pin list into the
+    /// value's own layout order, which is the order the index tensor's layout must be in.
+    ///
+    /// A gathered kernel is declared `["in", "out", "mb"]`: the shared 2-D weight's own order with the
+    /// batch appended, so the ungathered `["in","out"]` prefix is unchanged and a bundle that declares
+    /// no gather emits exactly what it did.
+    pub const fn layout_rank(dim: &str) -> usize {
+        match dim.as_bytes() {
+            b"in" => 0,
+            b"out" => 1,
+            _ => 2,
+        }
+    }
+}
+// ⛔ THERE IS DELIBERATELY NO `position()`. A first draft carried one (`Feature => 0, Slot => 1`, the
+// kernel's own layout order) so the emitter could pin `maxDimSizes_` without a name lookup. It is
+// wrong for any value operand that is NOT a kernel: an ACTIVATION's layout is `["mb", "in"]`, so
+// `Feature => 0` pins "mb" — a different axis, a different `skip_addr`, and no complaint from
+// anything. `zz_skip_addr_computed_from_our_own_emission.rs` caught it immediately by pinning one dim
+// and excluding another. The emitter resolves [`KernelAxis::dim`] against the operand's OWN layout,
+// which is correct for every operand; the closed type is what makes that lookup succeed, not a
+// substitute for doing it.
+
+impl IndirectAccess {
+    /// The two operands must be DISTINCT — a tensor indexed by itself cross-links to itself,
+    /// which dxp reads as a cycle. Returns `None` rather than letting the emitter discover it.
+    pub fn of(
+        index: usize,
+        value: usize,
+        entry_dim: KernelAxis,
+        page: PageExtent,
+        // ⛔ The second paged axis must not be the SAME axis as the page one: two pins on one dim is
+        // one pin, and the one that survives decides `skip_addr`. Refused rather than silently merged.
+        per_position: Option<KernelAxis>,
+    ) -> Option<Self> {
+        (index != value && per_position != Some(entry_dim)).then_some(Self {
+            index,
+            value,
+            entry_dim,
+            page,
+            per_position,
+        })
+    }
+
+    /// This operand's role, if any. The emitter matches on this instead of comparing indices at
+    /// three separate sites.
+    pub fn role_of(&self, operand: usize) -> Option<IndirectRole> {
+        if operand == self.index {
+            Some(IndirectRole::Index {
+                value: self.value,
+                // ⭐ THE SAME LIST THE VALUE SIDE GETS, from the same call. The index's extents are the
+                // op's divided by these pins ([`WorkPlan::of_index_entries`]), so the divisor and the
+                // dims it is applied to cannot drift from the pins the value tensor declares.
+                pins: self.pins(),
+            })
+        } else if operand == self.value {
+            Some(IndirectRole::Value {
+                index: self.index,
+                pins: self.pins(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// One operand's side of an [`IndirectAccess`], carrying what that side needs to emit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndirectRole {
+    Index {
+        value: usize,
+        /// `(dim name, page)` for every paged dim — the SAME list the value side carries. The index's
+        /// own extents are the op's divided by these ([`WorkPlan::of_index_entries`]).
+        pins: Vec<(&'static str, PageExtent)>,
+    },
+    Value {
+        index: usize,
+        /// `(dim name, page)` for EVERY paged dim, in the value's own layout order — the same list the
+        /// index tensor's layout must be, so the emitter and the index builder read one thing.
+        pins: Vec<(&'static str, PageExtent)>,
+    },
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // OpSpec — the typed frontend op.
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -1884,6 +2430,13 @@ pub struct OpSpec {
     /// produced ONLY by [`WorkPlan::time_tile_for_lx`], so "doesn't fit LX" is a
     /// `cargo build` `Err`, never an on-card DtException 1535.
     pub time_tile: Option<TimeTile>,
+    /// This op reads one operand THROUGH another's indices — the hardware gather. `None` (every
+    /// op today) emits `indirectAllocType_: "no_indirection"` on every node and an empty
+    /// `indirectAccessIndexLabeledDs`, i.e. byte-identical to before this field existed.
+    ///
+    /// One `Option` for the whole op, never a flag per operand: see [`IndirectAccess`] for why a
+    /// half-declared pair must be unrepresentable.
+    pub indirect: Option<IndirectAccess>,
 }
 
 impl OpSpec {
@@ -1967,6 +2520,197 @@ impl OpSpec {
             op_func: first.op_func,
             second,
         };
+    }
+
+    /// ⭐⭐⭐ MAKE OPERAND `value_idx` A GATHERED READ: append an index operand and declare the pair.
+    ///
+    /// This is the whole frontend surface of the hardware gather. It exists as a METHOD, mirroring
+    /// [`Self::attach_fused_epilogue`], so no assembler signature has to grow an `Option` that every
+    /// caller then passes `None` to — and so the operand and the declaration are added TOGETHER. A
+    /// caller cannot push an index tensor and forget to declare it (an inert extra operand dxp reads
+    /// as a real input), nor declare a pair naming an operand that does not exist.
+    ///
+    /// ## What the index operand holds
+    /// int32, one entry per gathered read, in the units the value tensor's `entry_dim` steps. For
+    /// paged KV that is `phys(logical_page) * layers + layer`, which is one multiply and one add over
+    /// the block table the host already holds — see `fold_plan::page_base_bytes`, whose
+    /// `phys * page_stride_bytes` the gather reproduces exactly.
+    ///
+    /// ## Why the index is INSERTED BEFORE THE OUTPUT, not appended
+    /// ⛔ THIS WAS APPENDED, AND APPENDING IS A SILENT WRONG-DESTINATION BUG. `emit_sdsc` defines the
+    /// output as `views.len() - 1` — literally "the last arg" — so an appended index BECOMES the
+    /// output: the op stops writing its real destination and writes over the block table instead.
+    /// Caught by diffing the gathered and ungathered emissions of the shipped prefix score op
+    /// (`the_gather_does_not_displace_the_output`): the last node's walk went from `[4,8,64]` (the
+    /// score buffer) to `[-1,-1]`. The previous version of this note argued the opposite and was
+    /// simply wrong; an argument about an emitter is worth exactly one diff.
+    ///
+    /// Inserting at `out_idx` is also what the VENDOR does — `test_gather_1core/sdsc_1.json` orders its
+    /// three tensors `[input, index, output]`, index in the middle. And it composes with a fused
+    /// epilogue, whose operands insert at the same place for the same reason: each insertion slides the
+    /// output right, so the output stays last however many operands are added.
+    ///
+    /// `value_idx` is unaffected because it must be less than `out_idx` (that is the refusal below).
+    ///
+    /// Returns `None` — declaring nothing — if `value_idx` is out of range or names the output, since
+    /// gathering INTO an output is a write through an index, which is a scatter and a different op.
+    /// ⛔ IT TAKES THE WHOLE [`GatherIndex`], NOT ITS FIELDS. It took four of them side by side
+    /// (`index_name, entry_dim, page, per_position`) and both callers spread one `GatherIndex` across
+    /// them — so a field added to that type (`first_entry`, the run's base) was DROPPED at every call
+    /// site with nothing to say so, and a dropped base is every run of entries reading run 0's.
+    pub fn attach_gather_index(
+        &mut self,
+        gather: GatherIndex,
+        value_idx: usize,
+    ) -> Option<IndirectAccess> {
+        let GatherIndex {
+            name: index_name,
+            entry_dim,
+            page,
+            per_position,
+            first_entry,
+        } = gather;
+        let out_idx = self.args.len().saturating_sub(1);
+        if value_idx >= self.args.len() || value_idx == out_idx {
+            return None;
+        }
+        // ⭐⭐⭐ THE INDEX IS SHAPED BY THE PAGED DIMS, NOT BY THE VALUE.
+        //
+        // Both vendor fixtures give the index the value's PINNED dims only, in the value's own order —
+        // rank 1 for one pin, rank 2 for two (`zz_the_index_tensors_shape_is_the_paged_dims.rs` reads
+        // it off both). This CLONED the value operand, which handed dxp a table of a different shape
+        // from the one it walks: for the score leg, `["in","out"]` — 64x256 positions — where the rule
+        // says `["out"]`, a table of pages. Neither a fault nor a bake failure; a wrong address.
+        //
+        // The declaration is built FIRST so the pin list is the single source for both the walk (via
+        // `role_of`) and this layout: the index's dims cannot disagree with the dims that were pinned.
+        let ia = IndirectAccess::of(out_idx, value_idx, entry_dim, page, per_position)?;
+        let pins = ia.pins();
+        // ⛔⛔⛔ EVERY PAGED DIM MUST BE A DIM OF **THIS OP**, CHECKED BEFORE ANY SYMBOL IS MINTED.
+        //
+        // `iter_syms` ASSERTS on a name the plan does not carry — so asking for the matmul axis `in` on
+        // an op whose dims are `[mb, out, y]` PANICKED out of a function whose whole contract is to
+        // return `None`. The caller's `?` never ran, and a build panic naming `IterSym('in')` sends the
+        // reader to the work plan rather than to the declaration that is wrong. The closed `KernelAxis`
+        // type makes a MISSPELLED axis unrepresentable; it cannot make a well-spelled axis belong to
+        // every op, and those are different guarantees.
+        if pins
+            .iter()
+            .any(|&(d, _)| !self.iter.dims().iter().any(|k| k.name == d))
+        {
+            return None;
+        }
+        // ⛔⛔⛔ THE INDEX'S DTYPE IS **NOT** THE VALUE'S — see [`SenUint32`]. The value operand supplies
+        // only its RESIDENCY; the format is `SENUINT32` in every vendor fixture, and the two `DT_CHECK`s
+        // that read it (`L3DlOpsScheduler.cpp:5928`, `GatherIndexConversion.cpp:133`) fail the bake on
+        // anything else. Its SHAPE comes from the pins.
+        //
+        // This line was `self.args[value_idx].view().df`, with the note "an index lives where the value
+        // does and is read at the same word length". The residency half is right; the width half is not.
+        let df = <SenUint32 as DataFormat>::DF;
+        // ── THE INDEX'S STICK DIM: THE **INNERMOST** PAGED DIM, SUB-STICK ALLOWED ──
+        //
+        // ⛔ AND OUR `StickExtent` GUARD DOES NOT APPLY HERE, WHICH BOTH FIXTURES SETTLE OUTRIGHT:
+        // ```text
+        // test_gather_1core   index ["mb"]      N_ mb_ = 3     KERNEL_IDX stickDimOrder_ ["mb"] stickSize_ [32]
+        // sdsc_add_paged_l3lu index ["x","y"]   N_ y_  = 2     KERNEL_IDX stickDimOrder_ ["y"]  stickSize_ [32]
+        // ```
+        // Extents of THREE and TWO against a 32-entry stick. The vendor declares its index sub-stick,
+        // on its INNERMOST dim, in both files — so the guard is not describing a hardware requirement
+        // for an index, and this is the third instance of it being stronger than the fixtures
+        // (`our-stick-extent-guard-is-stronger-than-the-vendors-own-fixtures`).
+        //
+        // ⛔ AND KEEPING IT WAS NOT THE SAFE CHOICE, WHICH IS WHY THIS CHANGED. The previous rule —
+        // "the first paged dim whose extent is a whole multiple of 32" — did not merely refuse the
+        // vendor's shapes: on a two-pin declaration it silently picked the WRONG DIM. For an index
+        // `["out","mb"]` at a batch of 8 it took `out` (extent 256, a multiple of 32) where the vendor
+        // takes the innermost (`mb`), i.e. a different HBM layout for the very table the host stages.
+        // A refusal would have been honest; a different layout is an address. So the rule is now the
+        // vendor's own, and a sub-stick extent is accepted rather than steered around.
+        //
+        // ⭐⭐⭐ AND THE STICK DIM IS THE **ENTRY (GATHER) DIM**, WHICH THE C++ ASSERTS DIRECTLY.
+        // `dcg/dcg_fe/transfer_compute/transfer_compute.cpp:778-782` (`arrayB` is the index):
+        // ```cpp
+        // DT_CHECK(myOp->arrayA->dimToStickSize_.count(myOp->gatherScatterDim) == 0);
+        // DT_CHECK(myOp->arrayC->dimToStickSize_.count(myOp->gatherScatterDim) == 0);
+        // DT_CHECK(myOp->arrayB->dimToStickSize_.count(myOp->gatherScatterDim));
+        // DT_CHECK(myOp->arrayB->stickDimOrder_[0] ==
+        //          myOp->arrayB->layoutDimOrder_[0]);  // stick should be inner most
+        // ```
+        // Three requirements in four lines: the index MUST be stickified on the gather dim, the VALUE
+        // and OUTPUT must NOT be, and the index's stick dim must be `layoutDimOrder_[0]`. And
+        // `layoutDimOrder_` is **innermost-first** — stated on the field itself in three parallel
+        // structs (`perfdsc/perfLdsInfo.h:29`, `dsc/dataOpDsc.h:347`,
+        // `dsm/translators/sdscToPerfDsc/sdscHelper.cpp:47`: *"idx 0 means innermost"*) and confirmed by
+        // the stride arithmetic at `dsc/dsc2.cpp:2971-2979`, where entry `i`'s stride is the product of
+        // the entries BEFORE it.
+        //
+        // `pins()` is sorted by `KernelAxis::layout_rank`, which puts the entry axis ahead of the
+        // per-position one — so `first()` is both `layoutDimOrder_[0]` and the gather dim, satisfying
+        // all of it at once.
+        //
+        // ⛔ NOT `last()`. A previous line here took the last pin on the reasoning that "the innermost
+        // dim is the LAST of `pins()`" — the opposite of the convention the field's own comment states,
+        // and it would have declared `mb` as the stick of an `["out","mb"]` index while dxp asserts the
+        // gather dim. Same class of error as the stick-multiple guard it replaced: a plausible layout
+        // for the table the host stages, which is an address rather than a build failure.
+        let stick = pins.first().map(|&(d, _)| d)?;
+        let operand = match pins.len() {
+            1 => {
+                let layout = [pins[0].0];
+                AnyTensorArg::R1(
+                    TensorArg::<1>::new(
+                        true,
+                        index_name,
+                        // ⛔ `Role::Index`, NOT `Role::Input` — see [`Role::Index`]. Under `Input` the
+                        // index shares `primaryDsInfo_["INPUT"]` with the activation, which wins by
+                        // insertion order, so the index's own layout and stick size are never emitted.
+                        // Both defects are pinned by
+                        // `the_index_operand_carries_the_vendors_own_dtype_and_its_own_layout`,
+                        // fail-first-verified by reverting each one.
+                        Role::Index,
+                        [Scale::Active],
+                        self.iter.iter_syms(layout),
+                        layout,
+                        stick,
+                        Allocation::Hbm,
+                    )
+                    .ok()?
+                    .with_df(df)
+                    // ⭐ THIS OP'S RUN OF THE TABLE — see [`EntryBase`]. Zero for every uncut gather,
+                    // which is what `resolve_seg_base` already did with no offset at all.
+                    .with_offset(first_entry.entries()),
+                )
+            }
+            2 => {
+                let layout = [pins[0].0, pins[1].0];
+                AnyTensorArg::R2(
+                    TensorArg::<2>::new(
+                        true,
+                        index_name,
+                        // `Role::Index` — same reason as the rank-1 arm above.
+                        Role::Index,
+                        [Scale::Active; 2],
+                        self.iter.iter_syms(layout),
+                        layout,
+                        stick,
+                        Allocation::Hbm,
+                    )
+                    .ok()?
+                    .with_df(df)
+                    .with_offset(first_entry.entries()),
+                )
+            }
+            // ⛔ NOT A FALLBACK TO THE CLONE. A third paged dim is a shape neither fixture shows and
+            // this cannot invent; declaring nothing is the honest answer, and the caller's `?` turns it
+            // into the build error the gathered builder already reports.
+            _ => return None,
+        };
+        // BEFORE the output, so the output slides right and stays last — see the note above on the
+        // append that made the index the output.
+        self.args.insert(out_idx, operand);
+        self.indirect = Some(ia);
+        self.indirect
     }
 
     /// The name of THIS op's own batch axis, if it has one — `Some("y")` when `self.iter` carries

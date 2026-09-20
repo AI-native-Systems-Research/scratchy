@@ -1118,6 +1118,18 @@ fn read_compiled(stage: &Path, id: &GroupId) -> Result<CompiledGroup, String> {
     let program = correction::parse_spyrecode(&id.to_string(), &plan).map_err(|e| e.to_string())?;
     // An absent image is legitimate: dxp can compile a group to a job plan alone.
     let init_binary = std::fs::read(code.join("init_binary.bin")).unwrap_or_default();
+    // ⛔ THE FILE IS THE UPLOAD, so dxp's own statement of how many bytes it means to transfer has to
+    // match it. The launch sends `init_binary.len()` — a shorter declared transfer would mean part of
+    // the image is not dxp's to place, and a longer one that the file on disk is not all of it.
+    if let Some(t) = program.transfer_bytes
+        && t != init_binary.len() as u64
+    {
+        let _ = std::fs::remove_dir_all(stage);
+        return Err(format!(
+            "{id}: dxp declares an InitTransfer of {t} B but wrote a {} B init_binary.bin",
+            init_binary.len()
+        ));
+    }
     let _ = std::fs::remove_dir_all(stage);
     Ok(CompiledGroup {
         init_binary,

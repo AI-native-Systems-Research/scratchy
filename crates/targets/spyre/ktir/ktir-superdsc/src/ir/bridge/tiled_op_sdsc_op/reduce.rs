@@ -209,6 +209,7 @@ pub fn reduce_opspec_df(
         op_info,
         tiled_symbols,
         time_tile,
+        indirect: None,
     })
 }
 
@@ -502,6 +503,7 @@ pub fn reduce_opspec_off(
         op_info: OpInfo::ReduceScaling(scale_bits),
         tiled_symbols,
         time_tile,
+        indirect: None,
     })
 }
 

@@ -1960,10 +1960,13 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 .at(crate::addr::Idx::<crate::addr::Row>::n(p_in as u32 * stk))
                 .slab(s as u32)
                 .dev();
+            // REQUEST 0, and the op sweeps every row from there: RoPE's rotate covers the whole chunk,
+            // so the stream's row axis is swept work rather than a coordinate this site names.
             let a_place = crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
                 crate::sdsc_abstract::QueryRowCount::of_mq(mq),
                 heads,
                 hd,
+                0,
                 0,
                 p_in as u32,
                 Df::Fp16,
@@ -1972,6 +1975,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 crate::sdsc_abstract::QueryRowCount::of_mq(mq),
                 heads,
                 hd,
+                0,
                 0,
                 s as u32,
                 Df::Fp16,
@@ -2731,6 +2735,24 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         layout,
     ));
 
+    // ⭐ THE GATHER'S INDEX TENSOR, NAMED BY ITS RESERVED TID'S OWN SPELLING — `act_name` is what the
+    // placement, the bind and the descriptor all resolve through, so the tensor the descriptor gathers
+    // from is the tensor the worker fills. Under the SAME `rows_are_requests` that places it: a prompt
+    // chunk and a solo decode share one resident history across every row, so there is nothing per-row
+    // for an index to select and their emission stays byte-identical.
+    //
+    // ⛔⛔⛔ AND UNDER THE **GEOMETRY** TOO, WHICH IS THE OTHER HALF OF THE ONE RULE. `rows_are_requests`
+    // alone named a tensor that `assemble_attn` may then decline (`GatherScratch::of_fold_pass` refuses a
+    // head dim its flat copy cannot express) — so an 8b bundle reserved the index activation and carried a
+    // `KvBlockIndex` forward step for a gather that appears in no descriptor. Asking
+    // `GatherScratch::admits` HERE and at the placement (`lower_subtile_tape_to_superdsc`) makes the two
+    // halves ONE predicate; see that door for why the split was invisible at hd=64.
+    let kv_block_index: Option<String> = (rows_are_requests
+        && crate::sdsc_abstract::GatherScratch::admits(
+            crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize),
+            crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+        ))
+    .then(|| crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID));
     // ── (3) the unified score/softmax/output computation — ONE algorithm for any mq (see
     // ir::bridge::tiled_op_sdsc_op::attn's module doc for the torch-spyre correspondence). The head
     // geometry travels as the minted type, not as three integers this call could reorder, and the
@@ -2748,6 +2770,70 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         &vc,
         &pmask,
         &cmask,
+        // ⭐⭐⭐⭐⭐ THE GATHER, ON — the prefix score leg's Kᵗ operand takes its KV base from this index
+        // tensor instead of from the runtime's per-launch page shift.
+        //
+        // ⛔ GATED ON `rows_are_requests`, WHICH IS THE SAME CONDITION THE PLACEMENT USES. Both halves
+        // of a gather have to be decided once: `compute_bundle_layout` places `KV_BLOCK_INDEX_TID`
+        // under this predicate, `BakeFacts::gathers_kv` reads that placement, and the forward tape's
+        // `KvBlockIndex` step comes from that. A prompt chunk and a solo decode share ONE resident
+        // history across every row, so there is nothing per-row for an index to select and their
+        // emission stays byte-identical to before this existed.
+        //
+        // ⛔ AND THE NAME IS THE RESERVED TID'S OWN SPELLING, not a synthetic. `act_name` is what the
+        // placement, the bind and the descriptor all resolve through, so the tensor the descriptor
+        // gathers from is the tensor the worker fills. A name no placement matches is a bind the
+        // launcher SKIPS in silence, and a skipped index reads as zero — block 0, a real address — so
+        // every row of the batch would answer from row 0's keys.
+        //
+        // ══════════════════════════════════════════════════════════════════════════════════════════
+        // ⭐⭐⭐⭐⭐ ON — AND WHAT IT IS ATTACHED TO IS THE WHOLE STORY. A VENDOR CONSTRAINT MEASURED ON
+        // THE CARD THREE TIMES:
+        //
+        // **DEEPTOOLS CANNOT SCHEDULE A GATHER ON AN OP THAT HAS A `KERNEL` — i.e. ON A MATMUL.**
+        //
+        // The bake refuses, and the two refusals bracket the cause exactly (granite-3.1-2b fp8, pod
+        // `nickm-7db9667cdd-z2jc6`):
+        //   index memOrg_ = hbm+lx  ->  `sbf-ddc: DtException: Expect a valid allocate node.,
+        //                                L3DlOpsScheduler.cpp:2337`
+        //   index memOrg_ = hbm     ->  `sbf-ddc: DtException: Expect LX in labeledDs memOrg_.,
+        //                                L3DlOpsScheduler.cpp:2334`
+        // Both lines are in `calculateFlopPerByte`, which for EVERY HBM-pinned labeledDs demands an LX
+        // memOrg entry AND an allocated LX node. `allocAllMem` gives one to each STAGED operand and
+        // never to an index — an index is read into the IBR, not staged — so the two requirements
+        // cannot both be met and there is no third `memOrg_` to try.
+        //
+        // ⭐ IT ONLY RUNS FOR A REUSE OP, AND THAT IS THE WHOLE ANSWER.
+        // `L3DlOpsScheduler.cpp:1550` gates it on `isReuse`, and `hasDimensionReuse` (`:303-321`) is
+        // *"`primaryDsInfo_.size() > 1 && primaryDsInfo_.count(DsTypes::KERNEL)`"*. So:
+        //   our score op       primaryDsInfo_ {INPUT, KERNEL, OUTPUT, KERNEL_IDX}  -> reuse, EXPLORER RUNS
+        //   test_gather_1core  primaryDsInfo_ {OUTPUT, KERNEL_IDX}                 -> no KERNEL, skipped
+        //   sdsc_add_paged_l3lu primaryDsInfo_ {OUTPUT, KERNEL_IDX}                -> no KERNEL, skipped
+        // Neither vendor fixture gathers on a matmul. `test_gather_1core`'s op is `identity`; IBM's
+        // paged attention gathers on `AddZero` — an elementwise copy — and feeds the RESULT to its
+        // matmul. `a-gather-is-an-ordinary-compute-op-with-an-index-annotated-operand` says exactly
+        // that, and this is the constraint that forces it.
+        //
+        // ⭐ SO THE SHAPE THAT BAKES IS A SEPARATE GATHER OP, AND THAT IS WHAT `assemble_attn` NOW EMITS:
+        // two KERNEL-less `identity` copies that move the paged Kᵗ and V blocks through the index into
+        // CONTIGUOUS scratches, with the score and value matmuls reading those scratches per-request and
+        // carrying no gather at all. `emit_sdsc` still refuses a gather on a KERNEL-bearing op at build
+        // time (`asking_the_shipped_prefix_fold_for_a_gather_is_refused_naming_the_kernel` drives this
+        // very call path to prove the refusal reaches it), so the constraint is enforced rather than
+        // remembered.
+        //
+        // ⛔ `Some` IS THE COUPLING, NOT A SWITCH. Passing the NAME is what makes the emitter unable to
+        // gather unless a caller has a tensor to name — and the caller that names it is the same one that
+        // must place it (`compute_bundle_layout`, under this same `rows_are_requests`) and stage it
+        // (`BakeFacts::gathers_kv` → the forward tape's `KvBlockIndex` step). A name no placement matches
+        // is a bind the launcher SKIPS in silence, and a skipped index reads as entry 0 — a REAL address,
+        // page 0's first block, so every row of the batch would answer from one request's keys.
+        //
+        // ⛔ AND `assemble_attn` MAY STILL DECLINE IT. `GatherScratch::of_fold_pass` refuses a head dim
+        // above one stick, because a 64-slot window of the V plane is then `nslab` runs `PLANE_SLOTS*64`
+        // apart and a flat block copy would relayout it. That bundle emits exactly what it emits today
+        // rather than a copy that bakes and scrambles the value leg.
+        kv_block_index.as_deref(),
         attn_id,
         rows_are_requests,
         sym_id_base,

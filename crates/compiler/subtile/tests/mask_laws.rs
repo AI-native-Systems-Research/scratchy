@@ -9,9 +9,10 @@
 const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
 
 use scratchy_subtile::sdsc_abstract::{
-    BatchSlot, DeclaredFold, FoldPages, FoldWalker, HeadRequestRow, KvHistory, KvSlot, MaskBlocks,
-    MaskPassGrid, PrefixMaskShape, RungWidth, SlotCount, SlotRun, decode_batch_causal_col_valid,
-    decode_batch_prefix_mask_f16, decode_prefix_col_valid, prefill_causal_col_valid,
+    BatchSlot, DeclaredFold, FoldPages, FoldWalker, HeadRequestRow, KvHistory, KvSlot,
+    MaskBlockForm, MaskBlocks, MaskPassGrid, PrefixMaskShape, RungWidth, SlotCount, SlotRun,
+    decode_batch_causal_col_valid, decode_batch_prefix_mask_f16, decode_prefix_col_valid,
+    prefill_causal_col_valid,
 };
 
 /// THE RUNTIME SIDE OF A FOLD DECLARATION, as a test can hold it: it KEEPS what it was told, because the
@@ -126,7 +127,14 @@ fn grid<const COLS: u32>(cap: usize, rows: usize) -> MaskPassGrid {
     .expect("at least one page")
     // The grid's row axis is the RUNG width — these tests hand it the same row count the shape was
     // built with, one history per bound row.
-    .grid(RungWidth::of_baked_rows(rows.max(1) as u32).expect("at least one row"))
+    .grid(
+        RungWidth::of_baked_rows(rows.max(1) as u32).expect("at least one row"),
+        // ⛔ `PerRowPage` — every assertion in this file is about the UNCOLLAPSED fold's layout, where a
+        // pass reads ONE request's page and its block marks only that request's rows valid. The
+        // collapsed form's `PerPage` blocks are pinned separately; handing that form here would make
+        // these row-major block-index checks vacuous rather than failing.
+        MaskBlockForm::PerRowPage,
+    )
 }
 
 /// The grid AS THE STAGING CAN RECEIVE IT — declared to a walker, which is the only way to a
@@ -137,6 +145,89 @@ fn declared<const COLS: u32>(cap: usize, rows: usize) -> DeclaredFold {
     grid::<COLS>(cap, rows)
         .declare_to(&mut Walker::default())
         .expect("a test walker never refuses a declaration")
+}
+
+/// ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD'S MASK: ONE BLOCK PER **PAGE**, AND EVERY ROW'S OWN VALIDITY INSIDE IT.
+///
+/// ⛔ WHY THIS HAS TO BE ITS OWN LOCK. `MaskBlockForm` is read by THREE consumers — the block COUNT
+/// (`MaskBlocks::of`), the block INDEX the fill composes, and `fold_plan::reps` — and every pairwise
+/// agreement with the third one wrong is silent, because an additive mask byte the host never wrote reads
+/// as ZERO, which means VALID. Under `PerPage` a fold pass serves the WHOLE batch (the score kernel's `y`
+/// axis walks the requests over the gathered scratch), so row `h*mq + r` of pass `p` must find request
+/// `r`'s own validity in block `p` — not in block `r*pages + p`, which is where `PerRowPage` puts it and
+/// which under this form is some other page's block entirely.
+///
+/// So this asserts BOTH halves against histories that can tell them apart: the count is `pages` (not
+/// `pages * rows`), and for every (request, page) the valid columns in block `p` are exactly that
+/// request's own history — checked through `decode_prefix_col_valid`, the same law the broadcast path uses.
+#[test]
+fn the_collapsed_form_blocks_by_page_and_holds_every_rows_own_history() {
+    const COLS: u32 = 256;
+    let nqh = 4usize;
+    // RAGGED, and with a hole: three prompts of different depths then one shared decode step. A uniform
+    // batch cannot tell the two forms apart for the rows it happens to line up.
+    let hs = batch(&[300usize, 40, 570], 1);
+    let sh = shape::<COLS>(nqh, hs.len());
+    let deepest = hs.iter().map(|h| h.end().get()).max().unwrap_or(0) as usize;
+    let rung = RungWidth::of_baked_rows(hs.len() as u32).expect("at least one row");
+    let per_row_page = FoldPages::covering(
+        BatchSlot::solo(&KvHistory::contiguous(deepest)),
+        SlotCount::new(COLS),
+    )
+    .expect("at least one page")
+    .grid(rung, MaskBlockForm::PerRowPage);
+    let per_page = FoldPages::covering(
+        BatchSlot::solo(&KvHistory::contiguous(deepest)),
+        SlotCount::new(COLS),
+    )
+    .expect("at least one page")
+    .grid(rung, MaskBlockForm::PerPage);
+    let pages = per_page.pages().get();
+    assert!(pages > 1, "a single page cannot distinguish the two forms");
+
+    // ⭐ THE COUNT IS `mq`x SMALLER, which is the same factor as the launch saving — the mask's shape and
+    // the fold's pass count are one decision.
+    assert_eq!(MaskBlocks::of(per_page).get(), pages);
+    assert_eq!(
+        MaskBlocks::of(per_row_page).get(),
+        pages * hs.len() as u32,
+        "and the uncollapsed form still costs a block per (request, page)"
+    );
+    assert_eq!(
+        per_page.passes(),
+        pages,
+        "`passes` must agree with the block count — they are the same number by definition"
+    );
+
+    let declared = per_page
+        .declare_to(&mut Walker::default())
+        .expect("a test walker never refuses a declaration");
+    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, declared, &hs, f32::NEG_INFINITY);
+    let zero = half::f16::from_f32(0.0).to_le_bytes();
+    assert_eq!(
+        bytes.len(),
+        sh.elems(MaskBlocks::of(per_page)) * 2,
+        "the buffer is exactly the collapsed block count"
+    );
+    for (r, h) in hs.iter().enumerate() {
+        for p in 0..pages {
+            for head in 0..nqh as u32 {
+                let row = HeadRequestRow::of(head, r as u32, sh.mq()).get();
+                for c in 0..COLS {
+                    let slot = (p * COLS + c) as usize;
+                    let e = sh.elem(p, row, c);
+                    let got = bytes[e * 2..e * 2 + 2] == zero;
+                    assert_eq!(
+                        got,
+                        h.contains(slot),
+                        "block {p} row {row} (head {head}, request {r}) column {c} = slot {slot}: \
+                         a PerPage block must hold EVERY row's own history, so this cell is valid \
+                         exactly when request {r} holds that slot"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The batch shapes the mask has to survive: a list of prompt lengths, then `steps` decode tokens all
@@ -827,13 +918,13 @@ fn the_mask_is_blocked_by_the_passes_the_fold_was_declared_to_walk() {
     let per_page = SlotCount::new(COLS);
     let from_rows = FoldPages::covering(BatchSlot::of(rows.iter()), per_page)
         .expect("a row holds pages")
-        .grid(rung);
+        .grid(rung, MaskBlockForm::PerRowPage);
     let from_live = FoldPages::covering(
         BatchSlot::of(rows.iter().chain(std::iter::once(&prefilling))),
         per_page,
     )
     .expect("a row holds pages")
-    .grid(rung);
+    .grid(rung, MaskBlockForm::PerRowPage);
 
     // ⛔ THE TWO POPULATIONS, DISAGREEING. This is the whole content of the law: without it every
     // assertion below is trivially satisfied by either derivation.

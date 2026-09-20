@@ -146,6 +146,44 @@ use crate::worker::Worker;
 /// answer identical), which is a stronger claim than this comment could previously make; a detector whose
 /// predecessor was a literal `"(0"` match reported a fix that was not there, because the degenerate token
 /// differs per run.
+/// ⭐⭐⭐ STILL 8, AND THE WIDTH-8 COLUMN IS NOW MEASURED ON A PROBE THAT CROSSES A PAGE. The note above
+/// asked for the per-rung descriptor diff; it was done, and it found the gather's index: one op's index
+/// is ONE 128-byte stick while the pass declared `nkvh * nb * mq` entries, so above 32 the per-core IBR
+/// offset wrapped. Page granularity makes an entry a REQUEST, so no rung the ladder admits can overflow
+/// it.
+///
+/// MEASURED, `RedHatAI/granite-3.1-2b-instruct-FP8-dynamic` (hd=64, the geometry the gather runs on),
+/// 420-token generations that cross a page boundary, width 8 against its OWN `--max-num-seqs 1` run of
+/// the identical file, N=3:
+/// ```text
+///   this branch     own_ok 7/8   degen 0   1 row differs from solo   ITL 62.4-63.8 ms
+///   origin/main     own_ok 7/8   degen 0   0 rows differ            ITL 87.1-88.6 ms
+/// ```
+/// The 8th row is `c_05_seq1185`, whose OWN SOLO degenerates on both trees — the model fails that
+/// prompt, so it is excluded rather than counted. Six of the seven remaining rows are
+/// character-identical to solo through all 420 characters in every trial; the seventh diverges at
+/// in-page offset 178, NOT at a page boundary, and identically in all three trials.
+///
+/// ⛔ SO WIDTH 8 IS COHERENT, NOT BIT-EQUAL, AND THAT IS A DIFFERENT MECHANISM. A batched row is not
+/// expected to equal its bs=1 output token for token while `distribute_cores` divides the projections by
+/// ROW COUNT: at m=1 `q_proj` splits `out=32`, at m=8 `mb=8, out=4`. Measured with eight IDENTICAL
+/// prompts — same history, mask, write slot and hole as solo — the first batched step's top-2 logit gap
+/// still moves 8.156250 / 7.937500 / 7.812500 at m=1 / 2,4 / 8, deterministically per rung and
+/// identically across slots. `origin/main`, with no gather in the bundle at all, shows the same residual
+/// (1-2 rows at N=6). It is therefore not the gather, not the KV and not a race, and it is not closed by
+/// this change.
+///
+/// ⛔ AND 16 IS STILL NOT CLEAN, FOR A THIRD REASON. Measured with this cap temporarily at 32, on the
+/// SHORT probe (one sample per rung, which is why only the boundary and not the numbers is carried
+/// forward): rungs 2/4/8 matched solo, rung 16 put 8 of 16 rows wrong at ITL 71.1 ms and rung 32 put 24
+/// of 32 wrong at 297.2 ms. The crisp boundary is the PER-CORE ROW FOLD: `mq * GQA` is 32 row-slots at
+/// mq=8 — exactly the core count, one slot each — and 64 at mq=16, where each core must walk TWO
+/// (`zz_diff_the_rung_descriptors::doubling_the_rung_doubles_the_per_core_row_fold` measures the factor
+/// going 1 → 2 at precisely that width). That is the next thing to distrust, and it is a different
+/// mechanism from anything the gather touches.
+///
+/// ⭐ AND 16/32 ARE NOT EVEN A THROUGHPUT WIN, so the cap still forbids nothing worth having: 32 was
+/// 297 ms/step against rung 8's 47 ms for four times the rows — SLOWER in aggregate as well as wrong.
 #[cfg(feature = "spyre-hw")]
 const CORRECT_BATCH_WIDTH: usize = 8;
 
@@ -655,7 +693,6 @@ impl Worker for SpyreWorker {
                 let part = pool_partition(&sb)?;
                 let DecodeRung {
                     seqs,
-                    swept,
                     mask_cap,
                     fold_rows,
                     sess,
@@ -663,6 +700,24 @@ impl Worker for SpyreWorker {
                 } = &mut sb.decode_rungs[ri];
                 let seqs = *seqs;
                 let fold_rows = *fold_rows;
+                // ⛔⛔⛔ "DOES THIS BUNDLE GATHER" IS NOT ASKED HERE ANY MORE, AND THAT IS THE FIX.
+                // It was `let gathers_kv = *gathers_kv` off `DecodeRung` — which was already the
+                // SECOND home for this question (the first was `model.decode.last()`, the m=1 bucket,
+                // which places no index and answered `false` for every rung that does: `0xa35e
+                // RAS::PCI::BusFence` from two gather copies resolving `idx * skip_addr + base` over a
+                // tensor no step staged, a fence with no `vars` raised on senlib's own monitor thread).
+                //
+                // Both homes answered about a BUNDLE, and the question is about a BODY: a rung's bundle
+                // holds a whole sk_bucket ladder, and which body runs is the selector's answer from the
+                // live context length. So it is asked BELOW — once, of the session, after the page maps
+                // are installed (the selector reads `fold_requests` off them) and from the same write
+                // slot the launch is given. See `SuperDscSession::step_body`.
+                // The pool geometry the entry factor needs. `head_dim` decides the entry SIZE
+                // (`hd * 64` elements), so this is not interchangeable with any other pool value.
+                let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+                    model.kv_dim / model.head_dim,
+                    model.head_dim,
+                );
                 // WHICH RUNG IS ACTUALLY RUNNING, and how much of it is padding. A rung that failed
                 // to build at startup is logged and skipped, and the selection then lands on the next
                 // WIDER one — 8 live requests running the 16-row bundle is twice the rows for the
@@ -821,6 +876,15 @@ impl Worker for SpyreWorker {
                     requests.values().map(|r| &r.kv_hist),
                 );
                 let mut max_pages = 1usize;
+                // ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE, COLLECTED IN THE SAME WALK THAT INSTALLS THE PAGE
+                // MAPS — because it is the same data, and any second walk is a second chance to
+                // disagree about which page a row holds.
+                //
+                // ⛔ THE ROW ORDER IS THE SLOT ORDER, NOT THE REQUEST ORDER, for exactly the reason
+                // the `set_block_table` note below gives: slot `i` IS row `row0 + i` for the fold, and
+                // that includes the padding slots, whose map is live 0's. A table keyed by request
+                // would send every row past the first to another row's pages.
+                let mut page_maps: Vec<Vec<i64>> = Vec::with_capacity(width.count());
                 // ⛔ THE AFFINE-ROWS WITNESS WAS UNWRAPPED HERE, and the refusal it produced
                 // ("batched path reached without the affine-rows witness") had no way to fire — the rung was
                 // `Some` only when the witness was. It is all gone with the rows themselves.
@@ -888,7 +952,36 @@ impl Worker for SpyreWorker {
                     })?;
                     bind_launch_slot(sess, slot, write_slot, &map)?;
                     max_pages = max_pages.max(map.held().get() as usize);
+                    // The SAME `BlockTable` the launch just installed — `as_i64()` is the one untyping
+                    // in the path, and this reads it at the same call site rather than re-deriving the
+                    // map from `req.page_map` a second time.
+                    page_maps.push(map.as_i64());
                 }
+                // ⭐⭐⭐⭐⭐ **WHICH BODY THIS STEP WILL RUN**, and the two facts that are its alone. Asked
+                // of the session, from the write slot — and the launch below is handed that same slot as
+                // `start`, so the body staged for and the body launched are one body by construction.
+                //
+                // ⛔ IT IS ASKED HERE AND NOT EARLIER: the selector's fused/split decision turns on
+                // `fold_requests`, which the runtime INFERS from the page maps the loop above just
+                // installed. Asked before them it would answer for an unbatched step and hand back the
+                // fold-FUSED body, whose fold runs once — the (request 0, page 0) pass — leaving every
+                // other request attending no resident prefix.
+                //
+                // ⛔ AND THE TWO FACTS ARE PER-BODY, WHICH IS WHY THEY NO LONGER LIVE ON `DecodeRung`.
+                // `swept` was the manifest's — one number per BATCH WIDTH, i.e. the CEILING body's,
+                // while the launched body is whichever ladder rung the live context picked (`nb ∈
+                // {1,2,4}`); `gathers_kv` was the bundle's `KV_BLOCK_INDEX_TID` placement, which is
+                // present if ANY body of the bundle gathers. Three defects of this exact shape have now
+                // been fixed here, so the fields are DELETED and this is the only door.
+                let launch_pos = write_slot.get() as usize;
+                let step = sess.step_body(launch_pos).map_err(|e| {
+                    werr(format!(
+                        "decode batch: the session could not say which body this step runs: {e}"
+                    ))
+                })?;
+                let swept = step.swept();
+                let gathers_kv = step.gathers();
+                let bake_gathers_kv = gathers_kv.get();
                 // THE LIVE ROWS ONLY, built by the slot map's own walk — one token and one
                 // `BatchRow` per LIVE slot, in slot order, and nothing invented for the padding
                 // slots. `run_prefill_batch` widens this to the rung (`LaunchRows`), where a padding
@@ -956,7 +1049,20 @@ impl Worker for SpyreWorker {
                     ),
                 )
                 .ok_or_else(|| werr("decode batch: a row holds no pages".to_string()))?;
-                let fold_grid = fold_pages.grid(width);
+                // ⭐⭐⭐ AND WHAT ONE BLOCK DESCRIBES — a BAKE fact, from the same `gathers_kv` the index
+                // table below is built for. A gathered bundle's fold pass IS a page and serves every row
+                // (`MaskBlockForm::PerPage`), so the block count, the fill's block index and
+                // `fold_plan::reps` are one decision reaching all three. Staging the wrong form is silent
+                // both ways: `PerRowPage` against a collapsed fold leaves `mq-1` of every `mq` rows at −∞,
+                // and `PerPage` against an uncollapsed one gives every pass row 0's validity.
+                let fold_grid = fold_pages.grid(
+                    width,
+                    if bake_gathers_kv {
+                        scratchy_subtile::sdsc_abstract::MaskBlockForm::PerPage
+                    } else {
+                        scratchy_subtile::sdsc_abstract::MaskBlockForm::PerRowPage
+                    },
+                );
                 // ⛔⛔⛔ THE BUNDLE'S OWN PMASK MUST HOLD THIS GRID'S BLOCKS. `pmask = [nqh*mq, cap]`, so the
                 // rung baked room for `cap / COLS` blocks while this step needs `pages * width`. The
                 // capacity was already computed at load — for an `eprintln!` — and thrown away, so
@@ -1046,9 +1152,122 @@ impl Worker for SpyreWorker {
                         missed.get()
                     )));
                 }
-                let launch_pos = write_slot.get() as usize;
+                // ⭐⭐⭐⭐⭐ THE INDEX TABLE, BUILT ONLY IF THE BODY THIS STEP RUNS GATHERS — and the entry
+                // factor is the SESSION's, not a constant.
+                //
+                // ⛔ THE ENTRY IS NOT A PAGE NUMBER. dxp computes `addr = idx * skip_addr + base` with
+                // `skip_addr` one stick block (`hd * 64` elements — 4096 at hd=64, 8192 at hd=128), while
+                // a PAGE spans every layer. So the factor is `page_stride_bytes / stick_block_bytes`,
+                // read off this session's own `page_stride_bytes` — the very number
+                // `fold_plan::page_base_bytes` multiplies — which makes the two addressings an identity
+                // rather than two derivations to keep in step
+                // (`zz_the_gather_index_reproduces_the_host_page_address`).
+                //
+                // ⛔ AND A REFUSAL, NEVER A ZERO TABLE, when the factor does not exist: an entry of 0 is
+                // block 0, a REAL address (row 0's first page), so a fallback would give the whole batch
+                // row 0's keys — fluent and wrong, which is the corruption this path exists to remove.
+                let kv_blocks: Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>> =
+                    if bake_gathers_kv {
+                        let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
+                        werr(
+                            "decode batch: this bundle emits a GATHERED KV read, but a physical page \
+                             is not a whole number of index entries — no integer index can name a page \
+                             boundary, so every row would gather from inside the previous page"
+                                .to_string(),
+                        )
+                    })?;
+                        // ⭐⭐⭐ THE SCRATCH'S OWN SHAPE, from the SAME two extents the emitter sized it with:
+                        // the rung's width and the windows one pass sweeps (`swept / 64`, off the manifest's
+                        // `SweptCols`). A table built for a different `nb` or a different width would write
+                        // real block numbers into rows the copy does not read and leave the rows it does read
+                        // at zero — block 0, page 0's first block, a REAL address.
+                        let scratch = scratchy_subtile::sdsc_abstract::GatherScratch::of_fold_pass(
+                        pool,
+                        scratchy_subtile::sdsc_abstract::SlotWindow::count_in(
+                            scratchy_subtile::sdsc_abstract::SlotCount::new(swept.get()),
+                        ),
+                        scratchy_subtile::sdsc_abstract::QueryRowCount::of_mq(seqs.get()),
+                    )
+                    .ok_or_else(|| {
+                        werr(
+                            "decode batch: this bundle emits a GATHERED KV read, but its geometry \
+                             admits no flat block copy (a head dim above one stick makes a 64-slot V \
+                             window several strided runs). The bake and the host disagree about \
+                             whether this bundle gathers."
+                                .to_string(),
+                        )
+                    })?;
+                        // ⭐⭐⭐ THE PASS PITCH IS THE MASK'S BLOCK STRIDE, and it is the same `mask_shape` the
+                        // launch already declared to the session (`set_mask_stride`). The index is an
+                        // ACTIVATION, so it lives in the segment the fold shifts for the MASK — one shift, two
+                        // tensors, therefore one pitch. Re-deriving it here from a page count is exactly the
+                        // "same number, two derivations" defect the mask's own grid types exist to close.
+                        // ⭐ THE MASK'S OWN NUMBER, ASKED OF THE MASK. This was
+                        // `usize::try_from(mask_shape.rep_stride_bytes() / 4)` — the `/ 4` spelled at the
+                        // launch, i.e. the second derivation `PassStride` exists to remove.
+                        let pass_stride = mask_shape.pass_stride();
+                        let table = scratchy_subtile::sdsc_abstract::gather_index_table(
+                            scratch,
+                            &page_maps,
+                            max_pages,
+                            per_page,
+                            pass_stride,
+                        )
+                        .ok_or_else(|| {
+                            werr(format!(
+                                "decode batch: could not build the gather's index table from {} \
+                             installed page map(s) at {max_pages} page(s) — a launch row holds \
+                             fewer pages than the fold sweeps, an entry overflows int32, or the \
+                             pass block ({} entries) is smaller than one pass needs \
+                             ({} entries)",
+                                page_maps.len(),
+                                pass_stride.get(),
+                                scratch.rows(),
+                            ))
+                        })?;
+                        // ── GATHER DIAG (`SCRATCHY_GATHER_DIAG`) ── the index table is the one operand the
+                        // fence could name and does not: `RAS::PCI::BusFence` (0xa35e) carries NO `vars` in
+                        // `aiuras.json`, so the card states no address. Print the table's own extremes and the
+                        // pool they must land inside, as ONE string (a per-line `eprintln!` comes back shredded
+                        // mid-number), so an out-of-pool entry is a host-side fact before the launch.
+                        if std::env::var_os("SCRATCHY_GATHER_DIAG").is_some() {
+                            let (lo, hi) = table.iter().fold((i32::MAX, i32::MIN), |(l, h), e| {
+                                (l.min(e.as_i32()), h.max(e.as_i32()))
+                            });
+                            let max_phys = page_maps.iter().flatten().copied().max().unwrap_or(-1);
+                            // `per_page` IS `page_stride_bytes / stick_block_bytes`, so the stick block and
+                            // hence the byte reach the card will address are both recoverable here without a
+                            // new accessor: `hi * stick = hi * page_stride / per_page`.
+                            let stick = pool.stick_block_bytes() as i64;
+                            eprint!(
+                                "{}",
+                                format_args!(
+                                    "[gather] mq={} entries={} pass_stride={} max_pages={} \
+                                 per_page={} scratch_rows={} idx_lo={lo} idx_hi={hi} \
+                                 max_phys={max_phys} stick_bytes={stick} \
+                                 reach_bytes={} page_stride_bytes={} page_maps={} \
+                                 mask_rep_stride={} table_bytes={}\n",
+                                    seqs.get(),
+                                    table.len(),
+                                    pass_stride.get(),
+                                    max_pages,
+                                    per_page.get(),
+                                    scratch.rows(),
+                                    hi as i64 * stick,
+                                    per_page.get() * stick,
+                                    page_maps.len(),
+                                    mask_shape.rep_stride_bytes(),
+                                    table.len() * 4,
+                                )
+                            );
+                        }
+                        Some(table)
+                    } else {
+                        None
+                    };
                 let rows = run_prefill_batch(
                     Some((&rows_in, fold)),
+                    kv_blocks.as_deref(),
                     &sh,
                     sess,
                     // A batched rung sweeps the whole pool, so it runs on the widest decode
@@ -1056,6 +1275,9 @@ impl Worker for SpyreWorker {
                     model.decode.last().expect("at least one decode bucket"),
                     &toks,
                     seqs,
+                    // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
+                    // the meta above is borrowed for tensor ids and describes neither.
+                    gathers_kv,
                     launch_pos,
                     // Every row is a different request and every row is sampled — the tail runs
                     // unfolded, so the logits come back de-interleaved, one contiguous row each.

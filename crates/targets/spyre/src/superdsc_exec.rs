@@ -157,6 +157,18 @@ struct Diag {
     body_trace: bool,
     /// `SCRATCHY_SDSC_SEGADDR_DIAG`: one-shot dump of every segment's resolved runtime base.
     segaddr: bool,
+    /// `SCRATCHY_SDSC_PROG_VERIFY`: before every launch, D2H the program allocation and compare it
+    /// against the bytes the bake put there — printing ONLY when they differ.
+    ///
+    /// ⭐ IT ANSWERS A QUESTION THE FAULT PATH CANNOT. The unconditional readback on a failed launch
+    /// happens AFTER the hardware already faulted, on a stream the abend may have poisoned, so a
+    /// `rc != 0` there is ambiguous between "the image is fine" and "we could not look". Reading
+    /// before each launch is the same comparison on a healthy stream, and it dates the divergence:
+    /// a program that reads back wrong BEFORE it is ever launched was clobbered by the upload or by
+    /// an earlier launch, not by its own.
+    ///
+    /// A whole-image D2H plus a drain per launch is far too expensive to leave on, hence the knob.
+    prog_verify: bool,
     /// `SCRATCHY_SDSC_PHASE_TIME`: preamble-H2D / compute / logits-D2H split of a predict.
     phase_time: bool,
     /// `SCRATCHY_SDSC_PREP_TIME`: sub-phase timing of prepare.
@@ -164,6 +176,15 @@ struct Diag {
     /// `SCRATCHY_SDSC_OPTRACE`: after each on-card op, D2H every segment and print nonzero-count +
     /// max|.| — the op index where the signal collapses IS the divergence.
     optrace: bool,
+    /// `SCRATCHY_SDSC_LAUNCH_MARK`: one line BEFORE each submit naming the op and rep.
+    ///
+    /// ⭐ IT EXISTS FOR THE ONE FAULT NO OTHER PATH CAN ATTRIBUTE. `RAS::PCI::BusFence` (0xa35e) is
+    /// raised on senlib's OWN `PfMSIMonitor::PollingThread`, which `throw`s into a thread with no
+    /// handler — so the process `abort`s and EVERY host-side fault path (including `fault`'s
+    /// submit-refused dump above) never runs. The last line this printed is therefore the only
+    /// statement of which op the card was executing, and `aiuras.json` gives `BusFence` no `vars`,
+    /// so the fence itself names nothing at all.
+    launch_mark: bool,
     /// `SCRATCHY_SDSC_RESET_PROBE=N`: after the N-th forward, tear the runtime down and measure the
     /// RSS drop. BREAKS the session; a diagnostic to pick a fix, not a fix.
     reset_probe: Option<i64>,
@@ -182,9 +203,11 @@ impl Diag {
                 repeat_probe: on("SCRATCHY_SDSC_REPEAT_PROBE"),
                 body_trace: on("SCRATCHY_SDSC_BODY_TRACE"),
                 segaddr: on("SCRATCHY_SDSC_SEGADDR_DIAG"),
+                prog_verify: on("SCRATCHY_SDSC_PROG_VERIFY"),
                 phase_time: on("SCRATCHY_SDSC_PHASE_TIME"),
                 prep_time: on("SCRATCHY_SDSC_PREP_TIME"),
                 optrace: on("SCRATCHY_SDSC_OPTRACE"),
+                launch_mark: on("SCRATCHY_SDSC_LAUNCH_MARK"),
                 reset_probe: std::env::var("SCRATCHY_SDSC_RESET_PROBE")
                     .ok()
                     .and_then(|v| v.parse().ok()),
@@ -302,6 +325,9 @@ impl OpProg {
                 slab_write: kv.slab_write(),
                 slab_stride_bytes: kv.slab_stride_bytes as u64,
                 batched_requests: kv.batched_requests,
+                // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
+                // zero — a bake fact, carried on the group exactly like the axis itself.
+                gathered: kv.gathered,
             },
         }
     }
@@ -492,6 +518,21 @@ pub struct Executor {
     /// bound per predict are ACTIVATIONS (uploaded each step).
     bound: BTreeMap<bundle::PlaceId, Vec<u8>>,
     weight_ids: BTreeSet<bundle::PlaceId>,
+    /// ⭐⭐⭐⭐⭐ IDS WHOSE BYTES ARE **NOT** IEEE-fp16 — copied into the shadow verbatim instead of
+    /// going through [`sen_convert::ieee_to_sen_bytes`].
+    ///
+    /// ⛔ WITHOUT THIS, A GATHER'S INDEX TABLE IS DESTROYED BY THE BIND LOOP. Every staging path in
+    /// this file ends in `ieee_to_sen_bytes(src, dst)` — unconditionally, for weights at prepare and
+    /// for activations at every predict — because until now every bound tensor genuinely WAS a
+    /// magnitude the card holds in SEN169 fp16. The KV block index is int32 addresses-in-waiting
+    /// (`Staged::I32`): running them through an fp16 re-encoding reads each 4-byte entry as two fp16
+    /// values and rewrites both mantissas. Block 37 does not become "roughly 37"; it becomes a
+    /// different, valid, arbitrary block — fluent output from another request's keys, with no fault.
+    ///
+    /// ⛔ NOT A FLAG ON THE BIND CALL, A SET KEYED BY ID, because there are TWO convert loops
+    /// (`stage_weights`, `predict`) and a per-call flag would have to be remembered by both anyway.
+    /// One set, consulted by both, is the only arrangement in which they cannot disagree.
+    raw_ids: BTreeSet<bundle::PlaceId>,
 
     // ── KV / fold ──
     kv: KvGeometry,
@@ -509,6 +550,34 @@ pub struct Executor {
 // Driven single-threaded by the worker thread (the session moves between forwards, as the C++
 // session pointer did).
 unsafe impl Send for Executor {}
+
+/// ⭐⭐⭐⭐⭐ A RAW (device-format) PAYLOAD **AND THE PLACEMENT IT FITS**, as one value — the only thing
+/// [`Executor::bind_input_raw`] accepts, and the reason a raw bind can no longer overrun its tensor.
+///
+/// 🛑 **IT WAS TWO ARGUMENTS SIDE BY SIDE.** `bind_input_raw(id, bytes)` took a byte vector with no
+/// relation to the tensor it would be written into; the relation was re-established far away and at
+/// RUNTIME, by `refill_activations`'s over-bind `bail!` and by its `let Some(p) = places.get(nm) else
+/// { continue }`. Those two arms are different failures wearing one shape:
+///
+/// * **Too long.** The shadow write is `seg_host[seg][offset..][..src.len()]`, so a payload past its
+///   own placement overwrites the tensors the layout put after it. For the gather's index table the
+///   tensor after it is read as BLOCK NUMBERS, and a block number is a valid address — a clean bake,
+///   no fault, another page's keys.
+/// * **Not placed at all.** `continue` — the bind was SKIPPED, in silence. An index table nobody
+///   staged reads as entry 0 on every row, which is page 0's first block: a real address, so the whole
+///   batch answers fluently from row 0's history. `assemble_attn` states this exact hazard ("a name no
+///   placement matches is a bind the launcher skips in silence") and had nothing to enforce it with.
+///
+/// ⛔ THERE IS NO PUBLIC CONSTRUCTOR AND NO PUBLIC FIELD. [`Executor::place_raw`] is the only way to
+/// make one, it consults the session's own placement table, and it returns `None` for either case
+/// above — so neither is expressible at the bind, which is what makes the runtime checks redundant
+/// rather than merely duplicated. The placement is CONSUMED by the constructor rather than carried:
+/// a value that exists has already been measured against it, and keeping a second copy here would be
+/// the same "one quantity, two declarations" the type removes.
+pub struct RawBind {
+    id: bundle::PlaceId,
+    bytes: Vec<u8>,
+}
 
 impl Executor {
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -601,6 +670,7 @@ impl Executor {
             seg_borrowed: [false; NUM_SEGMENTS],
             bound: BTreeMap::new(),
             weight_ids: BTreeSet::new(),
+            raw_ids: BTreeSet::new(),
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
@@ -963,7 +1033,52 @@ impl Executor {
         if !self.prepared {
             self.weight_ids.insert(id);
         }
+        // A previously-raw id re-bound as fp16 must stop being raw, or the shadow would take an
+        // unconverted fp16 buffer. Cleared here rather than left to the caller.
+        self.raw_ids.remove(&id);
         self.bound.insert(id, bytes);
+    }
+
+    /// ⭐⭐⭐⭐⭐ MINT THE ONLY VALUE [`Self::bind_input_raw`] ACCEPTS — the payload measured against
+    /// the placement it will be written into, in one step, by the session that owns both.
+    ///
+    /// `None` on every shape a raw bind cannot have: a name this bundle never PLACED (a bind the
+    /// refill loop used to skip in silence — and a skipped index table reads as entry 0, which is a
+    /// REAL address: page 0's first block, i.e. the whole batch on row 0's keys), a payload LONGER
+    /// than its own placement (past it is the next tensor's bytes, and for the index table those
+    /// bytes are read as block numbers), or a byte count that is not a whole number of int32
+    /// entries (a partial trailing entry is a truncated address).
+    ///
+    /// ⛔ SHORT IS LEGITIMATE AND LONG IS NOT, which is why this is `>` and not `!=` — several
+    /// activations bind less than their placement on purpose (pmask reserves `[nqh*mq, cap]` and
+    /// binds one broadcast row; the index table's own pass block is the MASK's stride, of which one
+    /// pass fills the head).
+    pub fn place_raw(&self, id: bundle::PlaceId, bytes: Vec<u8>) -> Option<RawBind> {
+        let p = self.places.get(&id)?;
+        (bytes.len().is_multiple_of(4) && bytes.len() as u64 <= p.size)
+            .then_some(RawBind { id, bytes })
+    }
+
+    /// ⭐⭐⭐⭐⭐ Bind an ACTIVATION whose bytes are **ALREADY THE DEVICE'S** — copied into the shadow
+    /// verbatim, with no IEEE→SEN conversion. The gather's int32 index table, and nothing else today.
+    ///
+    /// ⛔ THIS IS NOT AN OPTIMISATION OF [`Self::bind_input`]. The f16 fast path
+    /// (`run_step_no_logits_f16`) also hands over device-format bytes, and it still routes them
+    /// through `bind_input` — which is sound only because `ieee_to_sen_bytes` is applied to them
+    /// too, so "already narrowed" means "already f16", not "already staged". An int32 tensor has no
+    /// fp16 encoding to survive that pass: see [`Self::raw_ids`] for what it does to a block number.
+    ///
+    /// ⛔⛔⛔ IT TAKES A [`RawBind`], NOT `(id, bytes)`, AND THAT IS THE WHOLE GUARD. The signature
+    /// used to be `(PlaceId, Vec<u8>)` — bytes with NO relation to the placement they land in — and
+    /// the relation was re-checked, far away and at runtime, by `refill_activations`'s over-bind
+    /// `bail!`. A length that exceeds its placement now has no value to arrive in: see
+    /// [`Self::place_raw`], the only constructor.
+    pub fn bind_input_raw(&mut self, b: RawBind) {
+        if !self.prepared {
+            self.weight_ids.insert(b.id);
+        }
+        self.raw_ids.insert(b.id);
+        self.bound.insert(b.id, b.bytes);
     }
 
     /// Declare, BEFORE prepare, that `seg` will be BORROWED from another session via
@@ -1077,6 +1192,18 @@ impl Executor {
         for (nm, src) in &self.bound {
             if !self.weight_ids.contains(nm) {
                 continue; // activation
+            }
+            // ⛔ A RAW BIND CANNOT BE A WEIGHT. This loop's every destination goes through
+            // `ieee_to_sen_bytes` or the retile walk, neither of which may touch int32 index entries
+            // (see [`Self::raw_ids`]) — and a raw id lands here only by having been bound BEFORE
+            // prepare, which `bind_input_raw` records as a weight like any other. Refuse rather than
+            // stage it through a converter that would rewrite every entry.
+            if self.raw_ids.contains(nm) {
+                bail!(
+                    "stage: '{nm}' was bound RAW but is a WEIGHT (bound before prepare) — raw bytes \
+                     are only honoured on the per-step activation path, and this loop would re-encode \
+                     them as fp16. Bind it after prepare."
+                );
             }
             let Some(p) = self.places.get(nm) else {
                 // ⛔ WAS `eprintln!` + `continue` — a weight the bake never placed was SKIPPED, so
@@ -1525,9 +1652,44 @@ impl Executor {
         let mut pinnable: Vec<Vec<u8>> = Vec::new();
         let r = (|| -> Result<()> {
             for op in &mut ops {
-                let addr = DevAddr::alloc(op.code.init_binary.len() as u64, MemKind::Program)
+                // ⛔⛔⛔ THE IMAGE IS NOT ALWAYS AT THE HEAD OF ITS ALLOCATION. dxp's
+                // `InitTransfer.dev_ptr` — which `parse_spyrecode` has REFUSED unless it equals
+                // `job_bin_ptr` — can name an address above `PROG_OFFSET_BASE`, reserving a prologue
+                // it does not fill. So `head` is that prologue, and it is the SAME number the launch
+                // passes as the bootstrap offset below: the device starts where the image starts
+                // because both come from `job_bin_ptr`, not because both happen to be zero.
+                //
+                // ⛔ IT WAS ZERO FOR EVERY PROGRAM THAT HAS EVER SHIPPED, which is why uploading at
+                // offset 0 worked until the batched-decode collapse produced the first group with a
+                // non-zero one — and then failed as `syndrome=0xc00 [PrepZeroFlitCnt, PrepSwVer]`,
+                // `job_count=0`, at exactly `PROG_OFFSET_BASE + head`: the device read the image's own
+                // flit `head/128` as its first job header. The image content was byte-identical to the
+                // bake (D2H'd and diffed, all 8 and all 20 programs of both faulting bundles); only
+                // its placement was wrong.
+                //
+                // ⭐ AND IT IS ONE VALUE, NOT A SUBTRACTION REPEATED AT THE LAUNCH. `prog_image` is the
+                // only place `job_bin_ptr` becomes an offset; the bootstrap the launch passes is
+                // `bootstrap()` of this same value, so the upload destination and the start address
+                // cannot be computed from different arithmetic (this site used `checked_sub` + a refusal
+                // while the launch used a bare `-`).
+                let img = op
+                    .code
+                    .prog_image(crate::sdk_abi::prog_offset_base())
                     .ok_or_else(|| {
-                        anyhow!("program alloc of {} B failed", op.code.init_binary.len())
+                        anyhow!(
+                            "program job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x}",
+                            op.code.job_bin_ptr,
+                            crate::sdk_abi::prog_offset_base()
+                        )
+                    })?;
+                let head = img.bootstrap();
+                let addr =
+                    DevAddr::alloc(img.alloc_bytes(), MemKind::Program).ok_or_else(|| {
+                        anyhow!(
+                            "program alloc of {} B ({head} B prologue + {} B image) failed",
+                            img.alloc_bytes(),
+                            img.image_bytes()
+                        )
                     })?;
                 // ⛔⛔⛔ DMA A PROGRAM OUT OF ANONYMOUS MEMORY, NEVER OUT OF THE EXECUTABLE.
                 //
@@ -1561,8 +1723,11 @@ impl Executor {
                 // ⛔ THE PROGRAM'S OWN BYTES, NOT THE REGION'S PADDED EXTENT. `DevAddr::alloc`
                 // rounds up, so `addr.total_size()` can exceed the binary — sending that many bytes
                 // reads past its end. The pad needs no content: nothing executes past the program.
+                let dst = addr
+                    .window(head, op.code.init_binary.len() as u64)
+                    .ok_or_else(|| anyhow!("program window at {head} B unaddressable"))?;
                 self.stream_ref()?
-                    .h2d(staged, &addr)
+                    .h2d(staged, &dst)
                     .map_err(|rc| anyhow!("program H2D rc={rc}"))?;
                 op.addr = Some(addr);
             }
@@ -1597,6 +1762,68 @@ impl Executor {
             ListSel::BodyFused => &mut self.body_fused,
             ListSel::Rung(i) => &mut self.body_rungs[i].1,
             ListSel::RungFused(i) => &mut self.body_rungs_fused[i].1,
+        }
+    }
+
+    /// The same list, read-only — for the per-body facts [`StepBody`] carries, which are read off the
+    /// body's own OPS.
+    fn list(&self, sel: ListSel) -> &Ops {
+        match sel {
+            ListSel::Prefix => &self.prefix_ops,
+            ListSel::Body => &self.body_ops,
+            ListSel::Suffix => &self.suffix_ops,
+            ListSel::BodyFused => &self.body_fused,
+            ListSel::Rung(i) => &self.body_rungs[i].1,
+            ListSel::RungFused(i) => &self.body_rungs_fused[i].1,
+        }
+    }
+
+    /// ⭐⭐⭐⭐⭐ **THE BODY THIS STEP WILL RUN**, and the only way anyone gets one.
+    ///
+    /// ⛔⛔⛔ IT TAKES THE WRITE SLOT AND NOTHING ELSE, WHICH IS THE WHOLE POINT. The selector's two
+    /// inputs are `valid_len` and `n_fold_pages`, and BOTH are functions of the slot this step writes —
+    /// so if a caller could pass them it could pass a pair the launch will not use, and then the host's
+    /// index table, the host's mask FORM and the launched descriptor would be about different bodies.
+    /// Derived here, from the one value the host also hands to `run_step` as `start`, there is no second
+    /// derivation to drift.
+    ///
+    /// ⛔ AND THIS IS THE THIRD TIME THE HOST ASKED A PER-BODY QUESTION OF THE WRONG BUNDLE.
+    /// `bake_gathers_kv` asked the m=1 decode bucket (`8f03f9974`), the gather scratch's window count
+    /// came off the CEILING body while an interior rung was launched (`49a99fd45`), and the swept extent
+    /// the unswept-slot guard used was the ceiling's too. All three had the same shape: a fact that
+    /// differs per BODY, read from something that is per BUNDLE. The fix is not a third careful call
+    /// site — it is that `DecodeRung` no longer HAS a `swept` or a `gathers_kv` field to read, and the
+    /// only value that answers either question is minted here, by the selector, from the selector's own
+    /// answer.
+    pub fn step_body(&mut self, seq_pos: SeqPos) -> Result<StepBody> {
+        let n_fold_pages = self.n_fold_pages(seq_pos);
+        // `valid_len = seq_pos + 1` — positions [0..seq_pos] are filled, including the token written to
+        // KV before attention. Spelled ONCE, here, for both readers of the selection.
+        let sel = self.select_body_paged(seq_pos.0 + 1, n_fold_pages)?;
+        Ok(StepBody {
+            sel,
+            swept: self.body_swept(sel),
+            // ⭐ THE BODY'S OWN OPS ANSWER IT, not a flag beside them and not the bundle's placement.
+            // Same discipline as `latch_paged_geometry` reading `page_slots` off the ops: a bake fact
+            // rides on the launch group that carries it (`bundle::KvShifts::gathered`), so a body that
+            // gathers cannot be driven as one that does not, or the reverse.
+            gathers: crate::wiring::GathersKv::of_launch_groups(
+                self.list(sel).iter().map(|o| o.kv.gathered),
+            ),
+        })
+    }
+
+    /// THIS body's swept extent — its own ladder rung's `active_cap`.
+    ///
+    /// The ladderless arms (`Body`/`BodyFused`: an UNROLLED bundle, which has no `rungs` and therefore
+    /// no ladder) sweep their whole baked capacity, and on the paged path that is one page — the number
+    /// the ops themselves carry. It is the value the host's guard used for every bundle before the
+    /// ladder's own extent was plumbed through, so a ladderless bundle behaves exactly as it did.
+    fn body_swept(&self, sel: ListSel) -> SweptCols {
+        match sel {
+            ListSel::Rung(i) => self.body_rungs[i].0,
+            ListSel::RungFused(i) => self.body_rungs_fused[i].0,
+            _ => SweptCols::new(self.kv.page_slots.0.max(0) as u32),
         }
     }
 
@@ -1924,14 +2151,6 @@ impl Executor {
                     })
                     .collect::<Result<_>>()?;
 
-                if d.segaddr
-                    && oi == 0
-                    && byte_off[SEG_WEIGHT.get()] == 0
-                    && byte_off[SEG_KV.get()] == 0
-                {
-                    self.dump_seg_addrs(&ta, op);
-                }
-
                 let prog = op
                     .addr
                     .as_ref()
@@ -1953,8 +2172,74 @@ impl Executor {
                 // transcendental while the matmul tolerates it. #2814: the 4th argument is the
                 // bootstrap OFFSET, not the full VA (flex bounds the seg7 translation to the
                 // program allocation's size).
-                let bootstrap = op.code.job_bin_ptr - crate::sdk_abi::prog_offset_base();
+                // ⛔ THE SAME VALUE `alloc_ops_at` UPLOADED AT, not a second subtraction. This line was
+                // `op.code.job_bin_ptr - prog_offset_base()` — bare, so an underflow wrapped here while
+                // the allocation path refused it, and the two could only agree by both being written
+                // correctly. `ProgImage` is now the one door: see `LaunchGroup::prog_image`.
+                let bootstrap = op
+                    .code
+                    .prog_image(crate::sdk_abi::prog_offset_base())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "op {oi}: job_bin_ptr {:#x} is below PROG_OFFSET_BASE {:#x} — it names no \
+                             bootstrap offset at all",
+                            op.code.job_bin_ptr,
+                            crate::sdk_abi::prog_offset_base()
+                        )
+                    })?
+                    .bootstrap();
                 let gt0 = Instant::now();
+                if d.launch_mark {
+                    // ⛔ ONE WRITE, and it must reach the fd BEFORE the submit: an abort from senlib's
+                    // monitor thread takes the process down with no unwinding, so a buffered line is a
+                    // line that never existed. Same single-`format!` discipline as `[progverify]`.
+                    let one = format!("[mark] op[{}] rep={rep} {}\n", op.index, op.label());
+                    eprint!("{one}");
+                }
+
+                if d.segaddr
+                    && oi == 0
+                    && byte_off[SEG_WEIGHT.get()] == 0
+                    && byte_off[SEG_KV.get()] == 0
+                {
+                    self.dump_seg_addrs(&ta, op, prog, bootstrap, &off);
+                }
+                // ⛔ EVERY FAULTING LAUNCH NAMES ITS OWN AIM. The one-shot dump above describes op[0]
+                // of whichever list launched FIRST, which is a different bundle from the one that
+                // faults — and that mis-attribution cost a session: `job_bin_ptr=0x1c00000000` was
+                // read off a prefill op and carried onto a decode fault whose bootstrap nobody had
+                // measured. A fault path is not a mode, so this has no knob.
+                let fault = |rc: i32| -> anyhow::Error {
+                    self.dump_launch_site("FAULT(submit-refused)", &ta, op, prog, bootstrap, &off);
+                    let sweep = self.prog_images_sweep("FAULT", ops);
+                    eprint!("{sweep}");
+                    launch_err(rc)
+                };
+                // ⭐ DATES THE DIVERGENCE. The fault path's readback runs after the abend, on a stream
+                // that may no longer answer; this one runs on a healthy stream immediately before the
+                // launch, so a program that already reads back wrong here was clobbered by its upload
+                // or by an EARLIER launch rather than by its own. Silent when the image matches —
+                // every launch printing "OK" would bury the one that does not.
+                if d.prog_verify {
+                    // ⭐ THE WHOLE LIST BEFORE ITS FIRST LAUNCH — on a HEALTHY stream, which the fault
+                    // path's sweep is not. Both of the load-time ways a program image can be wrong
+                    // (the H2D staged the wrong bytes; two program allocations overlap, so the second
+                    // upload lands in the first's flits) are already true here, before any op of this
+                    // list has run, so this dates them without depending on the abend leaving the
+                    // stream able to answer a D2H at all.
+                    if oi == 0 {
+                        let sweep = self.prog_images_sweep("PRE", ops);
+                        eprint!("{sweep}");
+                    }
+                    let r = self.prog_image_report(op, prog);
+                    if !r.starts_with("progimg: IDENTICAL") {
+                        // ⛔ ONE WRITE. A multi-argument `eprintln!` reaches the fd in pieces and the
+                        // CB-error lines are written from flex's completion THREAD, so a report built
+                        // by the formatter came back shredded mid-number.
+                        let one = format!("[progverify] op[{}] {} {r}\n", op.index, op.label());
+                        eprint!("{one}");
+                    }
+                }
 
                 if d.repeat_probe
                     && !op.kv.page_fold
@@ -1994,7 +2279,7 @@ impl Executor {
                     let st0 = Instant::now();
                     stream
                         .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(launch_err)?;
+                        .map_err(fault)?;
                     let st1 = Instant::now();
                     let mut t = timers();
                     t.submit_ms += (st1 - st0).as_secs_f64() * 1e3;
@@ -2006,7 +2291,7 @@ impl Executor {
                 } else {
                     stream
                         .compute(prog, &ta, "", bootstrap, &[], barrier)
-                        .map_err(launch_err)?;
+                        .map_err(fault)?;
                 }
 
                 // DEFAULT-OFF: skipping the per-group drain removes the ~868-ops/layer
@@ -2055,25 +2340,254 @@ impl Executor {
     /// ONE-SHOT SEGMENT-BASE DUMP: every segment's resolved runtime base (region, byte offset,
     /// chunk size) for the FIRST op of the FIRST layer — checkable by hand against
     /// bundle_layout.json's declared (segment, offset), instead of guessing from static JSON.
-    fn dump_seg_addrs(&self, ta: &[&DevAddr], op: &OpProg) {
+    fn dump_seg_addrs(
+        &self,
+        ta: &[&DevAddr],
+        op: &OpProg,
+        prog: &DevAddr,
+        bootstrap: u64,
+        off: &[u64; NUM_SEGMENTS],
+    ) {
         static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             return;
         }
+        self.dump_launch_site("op[0]", ta, op, prog, bootstrap, off);
+    }
+
+    /// ⭐⭐⭐ WHERE ONE LAUNCH WAS AIMED — every resolved segment base and, decisively, the PROGRAM
+    /// segment's own two numbers: the bootstrap offset the device starts executing at and the extent
+    /// of the allocation holding the binary.
+    ///
+    /// ⛔ THIS IS WHAT SEPARATES A PROGRAM FAULT FROM A DATA FAULT. A QGI/HMI address is a DMVA, and a
+    /// DMVA's top bits ARE the segment (`SEGMENT_SIZE_BITS = 34`, `PROG_SEGMENT = 7`), so an address in
+    /// `0x1c00000000..` is in the program segment by construction — but that is equally the shape of a
+    /// data operand whose base got resolved against segment 7, so the segment bits alone settle
+    /// nothing. The number that settles it is THIS LAUNCH'S BOOTSTRAP: if the faulting DMVA is
+    /// `PROG_OFFSET_BASE + bootstrap`, the device faulted on the very address the host told it to start
+    /// at, and no data operand is involved at all.
+    fn dump_launch_site(
+        &self,
+        who: &str,
+        ta: &[&DevAddr],
+        op: &OpProg,
+        prog: &DevAddr,
+        bootstrap: u64,
+        off: &[u64; NUM_SEGMENTS],
+    ) {
+        // ⛔ ONE WRITE, NOT TWELVE. `eprintln!` reaches the fd in several unlocked pieces and the
+        // tracing subscriber writes the CB-error lines from the completion THREAD, so a per-line dump
+        // came back shredded mid-number — unreadable exactly when it matters.
+        use std::fmt::Write as _;
+        let mut out = String::new();
         for (i, a) in ta.iter().enumerate() {
             match a.chunk0() {
-                Some(c) if a.is_single_chunk() => eprintln!(
-                    "[segaddr] seg{i} region={} offset={} size={}",
-                    c.region, c.offset, c.size
-                ),
-                _ => eprintln!("[segaddr] seg{i} MULTI-CHUNK"),
+                Some(c) if a.is_single_chunk() => {
+                    let _ = writeln!(
+                        out,
+                        "[segaddr] {who} seg{i} region={} offset={} size={} shift={}",
+                        c.region, c.offset, c.size, off[i]
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "[segaddr] {who} seg{i} MULTI-CHUNK shift={}", off[i]);
+                }
             }
         }
-        eprintln!(
-            "[segaddr] op[0] job_bin_ptr={:#x} PROG_OFFSET_BASE={:#x}",
+        let base = crate::sdk_abi::prog_offset_base();
+        match prog.chunk0() {
+            Some(c) => {
+                let _ = writeln!(
+                    out,
+                    "[segaddr] {who} seg7/PROG region={} offset={} size={} (binary {} B)",
+                    c.region,
+                    c.offset,
+                    c.size,
+                    op.code.init_binary.len()
+                );
+            }
+            None => {
+                let _ = writeln!(out, "[segaddr] {who} seg7/PROG no chunk");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "[segaddr] {who} op[{}] {} job_bin_ptr={:#x} PROG_OFFSET_BASE={base:#x} \
+             bootstrap={bootstrap:#x} ({bootstrap} B = flit {}) bootstrap_dmva={:#x} \
+             prog_extent={} B = {} flit(s)",
+            op.index,
+            op.label(),
             op.code.job_bin_ptr,
-            crate::sdk_abi::prog_offset_base()
+            // A flit IS a stick: 128 B (`sys-arch-spec/sysdef.cpp bytesPerStick`), the unit QGI and
+            // HMI report their addresses in.
+            bootstrap / u64::from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES),
+            base + bootstrap,
+            prog.total_size(),
+            prog.total_size() / u64::from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES),
         );
+        let _ = writeln!(out, "[segaddr] {who} {}", self.prog_image_report(op, prog));
+        eprint!("{out}");
+    }
+
+    /// ⭐⭐⭐ EVERY PROGRAM IN ONE LIST, READ BACK AND DIFFED — the reading that needs no attribution.
+    ///
+    /// ⛔ THE FAULTING OP IS NOT THE OP THAT REPORTS THE FAULT, and assuming otherwise is a live
+    /// hazard here. A compute launch returns `rc = 0` at submit and the hardware's verdict arrives
+    /// later on its own control block, so what a failed `compute` call actually means is "the stream
+    /// is in an error state from a PRIOR operation" — the log reads
+    /// `scheduler rejected submission: deferred error from a prior operation`. The op named by the
+    /// launch-site dump is therefore the first op to be REFUSED, which is some op after the one that
+    /// faulted. Sweeping the whole list sidesteps the question entirely: if any program's device copy
+    /// differs from its baked bytes, this finds it without having to know which one the hardware was
+    /// running.
+    fn prog_images_sweep(&self, who: &str, ops: &Ops) -> String {
+        use std::fmt::Write as _;
+        let mut same = 0usize;
+        let mut unread = 0usize;
+        let mut bad: Vec<usize> = Vec::new();
+        let mut detail = String::new();
+        for op in ops.iter() {
+            let Some(prog) = op.addr.as_ref() else {
+                continue;
+            };
+            let r = self.prog_image_report(op, prog);
+            if r.starts_with("progimg: IDENTICAL") {
+                same += 1;
+            } else if r.starts_with("progimg: DIFFERS") {
+                bad.push(op.index);
+                if bad.len() <= 4 {
+                    let i = op.index;
+                    let _ = writeln!(detail, "[progsweep] {who} op[{i}] {} {r}", op.label());
+                }
+            } else {
+                unread += 1;
+                if unread == 1 {
+                    let i = op.index;
+                    let _ = writeln!(detail, "[progsweep] {who} op[{i}] {} {r}", op.label());
+                }
+            }
+        }
+        format!(
+            "[progsweep] {who} {} op(s): {same} IDENTICAL, {} DIFFER {:?}, {unread} \
+             UNREADABLE\n{detail}",
+            ops.len(),
+            bad.len(),
+            bad,
+        )
+    }
+
+    /// ⭐⭐⭐ THE DEVICE'S OWN COPY OF ONE PROGRAM, READ BACK AND DIFFED AGAINST THE BAKED BYTES.
+    ///
+    /// ⛔ THIS IS THE DIRECT READ OF THE ONLY SURVIVING CLASS behind a `PrepZeroFlitCnt`+`PrepSwVer`
+    /// fault. Those two cases are the job-header parser refusing a header, and the baked header chain
+    /// has been walked in full — every program is well-formed under dip's own writer arithmetic, and
+    /// the flit the hardware names is ordinary payload, never a declared job boundary. Two statements
+    /// that cannot both be true, so one of them is not about the same bytes: the device is executing
+    /// an image that differs from the one the bake produced. Everything else about the launch (the
+    /// allocation's size, the H2D's length, `bootstrap`, the segment-7 translation) has been measured
+    /// and agrees, and none of those readings can see the CONTENT.
+    ///
+    /// The comparison is byte-for-byte over the binary's own length — never the allocation's
+    /// alignment-padded extent, which holds nothing and is not uploaded.
+    ///
+    /// ⚠️ WHAT AN "IDENTICAL" READING DOES *NOT* PROVE: that the device fetched these bytes. A D2H
+    /// resolves the host's `DevAddr` — region, offset, length — so it re-reads through the host's own
+    /// notion of where the program is. If the device fetched instructions through a DIFFERENT
+    /// translation for segment 7 than the one this address describes, the bytes here are the correct
+    /// ones and the fault is in the mapping, not the image. That is the shape "identical" leaves
+    /// standing, and it is worth naming because it is the only one left after this.
+    fn prog_image_report(&self, op: &OpProg, prog: &DevAddr) -> String {
+        use std::fmt::Write as _;
+        let baked: &[u8] = &op.code.init_binary;
+        let stick = usize::try_from(crate::lower_subtile_tape_to_superdsc::STICK_BYTES)
+            .expect("STICK_BYTES fits usize");
+        let Ok(stream) = self.stream_ref() else {
+            return "progimg: no stream — nothing to read back".to_string();
+        };
+        // ⛔ READ WHERE THE IMAGE WAS PUT, not where the allocation starts — `alloc_ops_at` places it
+        // at dxp's declared prologue, so a base-relative readback would diff the prologue against the
+        // image and call every such program corrupt.
+        let head = op
+            .code
+            .job_bin_ptr
+            .saturating_sub(crate::sdk_abi::prog_offset_base());
+        let Some(win) = prog.window(head, baked.len() as u64) else {
+            return "progimg: program window unaddressable".to_string();
+        };
+        let mut host = vec![0u8; baked.len()];
+        if let Err(rc) = stream.d2h(&mut host, &win) {
+            return format!("progimg: D2H rc={rc} — THE READBACK ITSELF FAILED, no verdict");
+        }
+        if let Err(rc) = stream.synchronize() {
+            return format!("progimg: D2H sync rc={rc} — THE READBACK ITSELF FAILED, no verdict");
+        }
+        // The header as dip writes it and `QGHeader` reads it (`dip/dip.cpp:77-91`, `senulator/qg.h`):
+        // `u8[0]` is `SW_VER`, bits 21:8 are the flit count EXCLUDING the header's own flit
+        // (`myflits = totalFlits_ - 1`), and bit 22 marks the last job of a program.
+        let hdr = |b: &[u8], f: usize| -> String {
+            match b.get(f * stick..f * stick + 4) {
+                None => "(short)".to_string(),
+                Some(w) => {
+                    let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                    format!(
+                        "{v:#010x} swver={:#04x} count={} term={}",
+                        v & 0xff,
+                        (v >> 8) & 0x3fff,
+                        (v >> 22) & 1
+                    )
+                }
+            }
+        };
+        let hex = |b: &[u8], f: usize| -> String {
+            let Some(s) = b.get(f * stick..f * stick + 32) else {
+                return "(short)".to_string();
+            };
+            let mut h = String::new();
+            for x in s {
+                let _ = write!(h, "{x:02x}");
+            }
+            h
+        };
+        let Some(first) = (0..baked.len()).find(|&i| host[i] != baked[i]) else {
+            return format!(
+                "progimg: IDENTICAL {} B — the device's copy of this program IS the baked image \
+                 (flit0 {})",
+                baked.len(),
+                hdr(baked, 0)
+            );
+        };
+        let ndiff = (0..baked.len()).filter(|&i| host[i] != baked[i]).count();
+        let nflits = baked.len() / stick;
+        let bad: Vec<usize> = (0..nflits)
+            .filter(|&f| {
+                (f * stick..(f + 1) * stick).any(|i| i < baked.len() && host[i] != baked[i])
+            })
+            .collect();
+        let ff = first / stick;
+        let mut out = format!(
+            "progimg: DIFFERS {} B of {} B, FIRST at byte {first} = flit {ff} + {} — \
+             {} of {nflits} flit(s) differ, first differing flits {:?}{}",
+            ndiff,
+            baked.len(),
+            first % stick,
+            bad.len(),
+            &bad[..bad.len().min(24)],
+            if bad.len() > 24 { " …" } else { "" },
+        );
+        let _ = write!(
+            out,
+            "\n[segaddr]   flit0  hdr baked={} | device={}\
+             \n[segaddr]   flit{ff} hdr baked={} | device={}\
+             \n[segaddr]   flit{ff} baked [0..32]={}\
+             \n[segaddr]   flit{ff} devic [0..32]={}",
+            hdr(baked, 0),
+            hdr(&host, 0),
+            hdr(baked, ff),
+            hdr(&host, ff),
+            hex(baked, ff),
+            hex(&host, ff),
+        );
+        out
     }
 
     /// ONE-PASS OPTRACE: after each on-card op, D2H the activation/intermediate/KV segments and
@@ -2359,7 +2873,14 @@ impl Executor {
                 continue;
             };
             let dst = &mut self.seg_host[seg.get()][p.offset as usize..][..src.len()];
-            sen_convert::ieee_to_sen_bytes(src, dst);
+            // ⛔ A RAW BIND IS COPIED, NOT RE-ENCODED. `ieee_to_sen_bytes` treats its source as fp16
+            // pairs; for the gather's int32 index table that rewrites every entry into a different
+            // valid block number. See [`Self::raw_ids`].
+            if self.raw_ids.contains(nm) {
+                dst.copy_from_slice(src);
+            } else {
+                sen_convert::ieee_to_sen_bytes(src, dst);
+            }
         }
         self.bound = bound;
 
@@ -2434,8 +2955,11 @@ impl Executor {
             // selector also picks the FOLD-FUSED twin when the context fits ONE page, which is the
             // baseline's group count (3 vs the split body's 5) — selecting the split body
             // regardless cost two extra launches per layer, ~1 ms/token, for a fold launched once.
+            // ⭐ THE SAME DOOR THE HOST ASKS THROUGH — [`Executor::step_body`], from the same write slot.
+            // Two call sites here and one on the host, all three taking `seq_pos` and nothing else, so
+            // the body the host staged for IS the body launched.
             let n_fold_pages = self.n_fold_pages(seq_pos);
-            let sel = self.select_body_paged(seq_pos.0 + 1, n_fold_pages)?;
+            let sel = self.step_body(seq_pos)?.sel;
             let base = self.page_base_for_write(seq_pos);
             // UNROLLED: one body over the whole model, and an unrolled bundle has no layer boundary
             // to bank on — its weights are one region by construction (`bank_weight_segment` refuses
@@ -2456,7 +2980,7 @@ impl Executor {
         // before attention). The same rung serves every layer this step; only the swept extents
         // differ, and the resident KV is shared.
         let n_fold_pages = self.n_fold_pages(seq_pos);
-        let sel = self.select_body_paged(seq_pos.0 + 1, n_fold_pages)?;
+        let sel = self.step_body(seq_pos)?.sel;
         let base = self.page_base_for_write(seq_pos);
         for v in 0..iters {
             let mut off = [0u64; NUM_SEGMENTS];
@@ -2939,6 +3463,13 @@ impl Executor {
     /// decode-BATCH bundle places `[nqh*mq, ...]` instead, and its staging is blocked by the DECLARED fold
     /// grid (`PrefixMaskShape` / `MaskBlocks`), not by this. `None` when the bundle placed no mask, or when
     /// the placement is not a whole number of pages — either way the caller must refuse rather than guess.
+    /// ⭐ BYTES PER PHYSICAL PAGE — `iters * kv_stride`, all layers of one page. THE number
+    /// `fold_plan::page_base_bytes` multiplies a block-table entry by, so it is also the number the
+    /// gather's index unit must divide. `0` for an unpaged bundle.
+    pub fn kv_page_stride_bytes(&self) -> u64 {
+        self.kv.page_stride_bytes
+    }
+
     pub fn pmask_slots(&self) -> Option<usize> {
         let nm = bundle::PlaceId::Act(crate::lower_subtile_tape_to_superdsc::ATTN_MASK_TID);
         let slots = (self.places.get(&nm)?.size / 2) as usize;
@@ -3035,6 +3566,43 @@ enum ListSel {
     BodyFused,
     Rung(usize),
     RungFused(usize),
+}
+
+/// ⭐⭐⭐⭐⭐ THE BODY ONE STEP RUNS, AND THE PER-BODY FACTS THE HOST MUST DECIDE FROM — as ONE value,
+/// minted only by [`Executor::step_body`].
+///
+/// ⛔ WHY THE FACTS TRAVEL WITH THE SELECTION AND NOT BESIDE IT. The host has to stage the gather's
+/// index table and choose the prefix mask's block FORM **before** the launch, and both answers belong
+/// to the body the launch will pick — not to the bundle, which holds several. Staging the wrong form is
+/// silent in both directions (`PerRowPage` against a collapsed fold leaves `mq-1` of every `mq` rows at
+/// −∞; `PerPage` against an uncollapsed one gives every pass row 0's validity), and staging no index for
+/// a body that gathers is `0xa35e RAS::PCI::BusFence` with no operand named. So the selection and the
+/// facts are one value: holding the facts means having asked the selector.
+///
+/// ⛔ `sel` IS PRIVATE. The host may not name a body — only ask which one, and read what it declares.
+#[derive(Clone, Copy, Debug)]
+pub struct StepBody {
+    sel: ListSel,
+    swept: SweptCols,
+    gathers: crate::wiring::GathersKv,
+}
+
+impl StepBody {
+    /// ⭐ THE COLUMNS ONE FOLD PASS OF **THIS** BODY SWEEPS — its own `active_cap`.
+    ///
+    /// Two host decisions derive from it and both used to take the CEILING rung's: the gather scratch's
+    /// window count (`nb`), and how far the fold's sweep reaches (`first_unswept_slot`). The ceiling is
+    /// the LOOSE bound for the guard — it passed at 1536 covered slots while a 128-column body really
+    /// covered 768 — and for the scratch it is a different NUMBER from the one the body reads.
+    pub const fn swept(self) -> SweptCols {
+        self.swept
+    }
+
+    /// ⭐ WHETHER **THIS** BODY READS ITS KV THROUGH A GATHERED SCRATCH — off the body's own launch
+    /// groups (`bundle::KvShifts::gathered`).
+    pub const fn gathers(self) -> crate::wiring::GathersKv {
+        self.gathers
+    }
 }
 
 /// This bundle's launches, in launch order.

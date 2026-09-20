@@ -178,11 +178,12 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 // numbers to bind anything at all. Re-exported so every path in the tree resolves unchanged.
 pub use ktir_superdsc::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
-    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, LAST_HIDDEN_TID, NEW_V_PROBE_TID,
-    ONES_REDUCE_TID, RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID,
-    RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID,
-    SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID,
-    SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, kct_resident_tid, scalarmul_scale_tid,
+    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
+    NEW_V_PROBE_TID, ONES_REDUCE_TID, RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT,
+    RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID,
+    ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID,
+    SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, kct_resident_tid, reserved_region,
+    scalarmul_scale_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -1089,8 +1090,24 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // page, so every other row must be masked off for it — the mask is `[pass][row][page]`
                 // and the runtime steps it by a whole `rows * page` block. A prompt keeps one
                 // broadcast row per page, which is all its rows can need.
+                // ⭐⭐⭐ AND A GATHERED BUNDLE BLOCKS THE MASK **PER PAGE**, SO IT NEEDS `MAX_PAGES_PER_ROW`
+                // BLOCKS AND NOT `MAX_FOLD_PASSES`. A gathered fold's pass IS a page and serves the whole
+                // batch (`MaskBlockForm::PerPage`), so the passes are bounded by the pages ONE ROW can hold
+                // — 16 — where an uncollapsed fold's are bounded by `pages × requests` over the shared pool
+                // (64). That is a 4x SMALLER reservation, and since the host stages only the live blocks it
+                // is also `mq`x less mask uploaded every step: at bs=8 and three pages, 3 blocks instead of
+                // 24.
+                //
+                // ⛔ WHICH FORM THIS BUNDLE USES IS THE SAME `rows_are_requests` CONDITION THE INDEX
+                // PLACEMENT AND `assemble_attn`'s gather are gated on — one predicate, three consumers.
+                // Getting it wrong is silent in the dangerous direction: `MAX_PAGES_PER_ROW` blocks against
+                // an uncollapsed fold is a fold reading mask bytes nobody staged, which read as ZERO and
+                // therefore VALID.
                 let (pm_rows, pm_blocks) = if rows_are_requests {
-                    (nqh * mq, MAX_FOLD_PASSES)
+                    (
+                        nqh * mq,
+                        scratchy_subtile::sdsc_abstract::PagedKvPool::MAX_PAGES_PER_ROW as u64,
+                    )
                 } else {
                     (1, MAX_PAGES_PER_REQUEST)
                 };
@@ -1127,6 +1144,164 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     },
                 );
                 seg_bytes[a] = align128(cmoff + cmbytes);
+                // ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX — the index tensor a GATHERED KV read is addressed through.
+                //
+                // A seg0 ACTIVATION, exactly like the two masks above and for the same reason: it is
+                // per-STEP host data (the block table changes as requests grow pages), and a seg1 weight
+                // is only H2D'd at PrepareModel, so a synthetic seg1 index would stay ZERO — which for
+                // an index tensor means every row gathering block 0, i.e. row 0's keys for everyone.
+                //
+                // ⭐⭐⭐ PLACED IFF THE BUNDLE GATHERS, WHICH IS WHAT MAKES THE PLACEMENT THE ANSWER.
+                // It used to be unconditional, and that cost the runtime its only artifact-derived way
+                // to ask the question: `BakeFacts::gathers_kv` is this placement's presence, exactly as
+                // `uses_identity` is `IDENTITY_TID`'s, and it decides whether the forward tape carries a
+                // `KvBlockIndex` step. Unconditional, every bundle claimed to gather, so every launch
+                // would have had to stage a table — including the prompt-chunk and solo-decode paths
+                // that emit no gather at all — and the one condition that must govern both halves would
+                // have had to be re-derived somewhere else.
+                //
+                // `rows_are_requests` is that condition, and it is the SAME parameter
+                // `lower_ktir_to_superdsc` passes `assemble_attn`'s `kv_block_index` from. A prompt chunk
+                // and a solo decode share ONE resident history across every row, so there is nothing for
+                // an index to distinguish and their emission stays byte-identical.
+                //
+                // ⛔⛔⛔⛔⛔ AND IT IS **STILL** `rows_are_requests` ALONE, AGAINST THE OBVIOUS FIX, BECAUSE
+                // THE 8b BATCHED PATH **READS THESE BYTES** — MEASURED, TWICE, ON THE CARD.
+                //
+                // The split is real and it is stated on [`GatherScratch::admits`]: `assemble_attn` may
+                // DECLINE the gather on the geometry (`of_fold_pass` refuses a head dim its flat copy
+                // cannot express) and this placement does not ask, so an hd=128 bundle reserves this
+                // activation, `BakeFacts::gathers_kv` answers `true` and the forward tape stages a table
+                // that NO descriptor gathers through — while `GathersKv::of_launch_groups`, the per-BODY
+                // door, answers `false` for the same bundle. Three doors, two answers. At hd=64
+                // `of_fold_pass` never refuses, which is why it was invisible.
+                //
+                // ⛔ NARROWING THIS WITH `GatherScratch::admits` — the one-line fix, which reserves only for
+                // the bundles that really gather — CANNOT BE VERIFIED TODAY, BECAUSE THE 8b BATCHED ORACLE
+                // DOES NOT HOLD. Measured on pod `nickm-7db9667cdd-z2jc6`, `scr batch` over the `c` probe
+                // (420-token generations, one distinct integer sequence per row), each rung against its OWN
+                // `--max-num-seqs 1` run of the identical file:
+                //
+                // | tree | rung 2 | rung 4 | rung 8 |
+                // |---|---|---|---|
+                // | this one, narrowed | `solo_diff=1` | `solo_diff=3` | `solo_diff=7`, 3 DEGEN |
+                // | this one, NOT narrowed (the code below) | `solo_diff=1` | `solo_diff=3` | `solo_diff=7` |
+                // | **`f080bb60a` REBUILT, md5-verified byte-equal** | `solo_diff=1` ×3 trials | — | — |
+                // | `f080bb60a` as recorded in its own commit message | `solo_diff=0` | `solo_diff=0` | `solo_diff=0` |
+                //
+                // ⭐ THE CONTROL IS THE WHOLE POINT. Narrowing this reservation moves every activation after
+                // it, so the first reading — "the hole was load-bearing padding and I removed it" — was
+                // entirely plausible and it is WRONG: the parent commit, restored file-by-file to md5
+                // equality and rebuilt on this same pod, is equally non-solo-exact. `rc=0`, no fault, ITL
+                // and wall unchanged across every variant (rung 8: 173.4 / 173.9 / 175.4 ms), and each bad
+                // row diverges from its own solo at a common prefix of 87-118 of 420 tokens. The SOLO
+                // oracles are byte-identical across all of it (`solo=EXACT` 8/8 against the baseline's own
+                // solo jsonl), so the oracle is not what moved either.
+                //
+                // ⛔ SO "granite-3.1-8b fp8 RUNS EVERY RUNG CLEAN AT 3.66x" IS NOT REPRODUCIBLE FROM THE
+                // COMMIT THAT RECORDS IT, and the 3.66x is a THROUGHPUT number whose correctness column was
+                // one sample. What differs between this morning's binary and the same source rebuilt is not
+                // in the source; the untested candidate is the BUNDLE BUILD (dxp's work division is
+                // thread-count sensitive and these builds are pinned to `taskset -c 0-19`), which would make
+                // the 8b's batched numerics a property of the compile rather than of the emission.
+                //
+                // ⛔⛔⛔ AND IT IS NOT AN hd=128 STORY: **granite-3.1-2b fp8 — the ONE geometry the gather
+                // actually runs on — is WORSE.** Same pod, same probe, same tree (whose 2b emission is
+                // byte-identical to `f080bb60a` by construction: at hd=64 `admits` is `true`, so the name
+                // gate reduces to `rows_are_requests` and this placement is untouched code), two trials per
+                // rung:
+                //
+                // | rung | solo | batched | `solo_diff` |
+                // |---|---|---|---|
+                // | 2 | ITL 27.8 ms | 33.9 / 33.7 ms | **2 of 2**, both trials |
+                // | 4 | ITL 27.7 ms | 39.3 / 40.5 ms | **4 of 4**, both trials |
+                // | 8 | ITL 28.1 ms | 63.5 / 62.4 ms | **8 of 8**, both trials |
+                //
+                // NOT ONE ROW matches its own solo at any width, and rung 4 finished 1385 and 1307 of the
+                // solo's 1680 tokens — rows terminating early, which is the collapse symptom, not noise. The
+                // pre-gather 2b record in `/work/bw/out.pre-gather` has the same probe at width 8 with
+                // `solo_diff=0`. So the gather's own 4.11x rests on a correctness column that does not hold
+                // today either, and the gather is ON in every one of those runs.
+                //
+                // ⛔ AND THAT IS WHY THIS STAYS AS IT IS. Not because the narrowing is wrong — it is right,
+                // and [`GatherScratch::admits`] states the rule — but because landing an address-moving
+                // change against an oracle that fails 1-of-2 rows on the unmodified parent would pin
+                // whatever it produced as "no regression". The order is: give the 8b batched path a STABLE
+                // oracle first (find why the same source rebuilt is not the same numerics), then narrow
+                // this, then measure. Until then only the emitter-side half of the one rule lands:
+                // `lower_ktir_to_superdsc` gates the tensor's NAME on `admits`, which is provably
+                // non-observable (`assemble_attn`'s `kv_block_index.zip(of_fold_pass(..))` is already `None`
+                // at hd=128 whichever way the name goes), so the coupling is stated where it costs no
+                // addresses and this placement keeps every byte it had.
+                if rows_are_requests {
+                    // ⛔⛔⛔ SIZE = THE ENTRIES THE **DESCRIPTOR DECLARES**, NOT THE ENTRIES THE HOST
+                    // MEANS TO FILL. This was `WIDEST_BATCH_RUNG * MAX_PAGES_PER_ROW` — 32 x 16 = 512
+                    // entries, "one per (launch row, logical page), the same shape as the host's
+                    // `block_tables`". MEASURED against the real emission
+                    // (`the_declared_index_holds_no_more_entries_than_the_bundle_reserves`), the
+                    // descriptor declares **2048**: the index's dims are the value's PAGED dims and its
+                    // extents come from the op's own iteration space, so along the slot axis it is the KV
+                    // WINDOW WIDTH (256) and not a page count — `["out","mb"] = [256, 8]`.
+                    //
+                    // 512 reserved against 2048 declared is 1536 entries read PAST the placement, and past
+                    // it is the next seg0 tensor's bytes read as block numbers. Block numbers are valid
+                    // addresses, so that bakes clean, faults nothing, and gathers from wherever those
+                    // bytes happen to point.
+                    //
+                    // So the bound is the descriptor's own worst case: the slot axis can declare at most a
+                    // whole page (`PAGE_SLOTS`, the pre-paged capacity every rung's `active_cap` is a
+                    // divisor of) and the batch axis at most the widest rung. Over-reserving is inert — the
+                    // tail is simply unread — while under-reserving is an address, so the asymmetry decides
+                    // which way to round. At `PAGE_SLOTS x WIDEST_BATCH_RUNG x 4 B` this is 32 KB of an
+                    // activation segment that is uploaded every step anyway.
+                    //
+                    // ⛔ ENTRIES ARE GLOBAL STICK-BLOCK INDICES, NOT PAGE NUMBERS. dxp computes
+                    // `addr = idx * skip_addr + base_addr`, and `skip_addr` is what the score leg's Kᵗ
+                    // operand emits as its entry: ONE STICK BLOCK, `hd * ELEMS_PER_STICK` elements —
+                    // MEASURED at 4096 at head_dim 64, and 8192 at head_dim 128. That unit works because
+                    // the whole pool is a uniform array of stick blocks (`plane_block_elems` is four of
+                    // them; `plane_stride` / `layer_stride` / `page_stride` all multiples), so one index
+                    // reaches any cell with no relayout. An entry written as a PAGE number is short by
+                    // `page_stride / stick_block` — hundreds — and lands inside a different layer:
+                    // `sdsc_abstract::gather_entries_per_page` is the factor, and it is NOT a constant.
+                    //
+                    // ⭐⭐⭐⭐⭐ THE SIZE IS **THE MASK'S OWN PASS GRID**, AND THAT PITCH IS FORCED BY THE LAUNCH
+                    // ABI, NOT CHOSEN.
+                    //
+                    // The gather now lives on the KERNEL-less copy op, whose gather dim is `mb` with no
+                    // second pinned axis — so the index is a FLAT rank-1 table of `nkvh * nb * mq` entries
+                    // per fold pass, and dxp's own formula reduces to `ceil_to_stick(mb)` with no per-row
+                    // stick to pad to. What sizes this placement is therefore not the entry layout but the
+                    // PASS layout: pass `p` needs its own entries, and the only per-pass shifts a launch has
+                    // are `kv`, `mask` and `intermediate` (`fold_plan::SegDeltas`). KV is resident and never
+                    // uploaded; the intermediate segment carries `qs` and the whole online-softmax state, so
+                    // shifting it would move every operand the pass reads. The index is an ACTIVATION —
+                    // `SegRole::Activation` IS `SEG_MASK` — so it rides the MASK's shift, and its per-pass
+                    // pitch must BE the mask's block stride.
+                    //
+                    // ⛔ SO THE TWO PLACEMENTS DERIVE THEIR PITCH FROM ONE NUMBER, `pmbytes / pm_blocks`,
+                    // computed just above for the mask itself. A pitch that disagrees puts pass `p`'s gather
+                    // on some other pass's entries — a clean bake reading real block numbers from the wrong
+                    // page. `gather_index_table` takes the SAME value as `pass_stride_entries`.
+                    //
+                    // ⛔ AND IT IS THE MASK'S BLOCK COUNT TOO, not `MAX_FOLD_PASSES`: a gathered fold's
+                    // passes are the pages ONE ROW holds. Over-reserving would be inert here, but agreeing
+                    // with the mask's own grid is what keeps the shift meaningful for both tensors.
+                    let bioff = seg_bytes[a];
+                    let bibytes = pmbytes;
+                    placements.insert(
+                        KV_BLOCK_INDEX_TID,
+                        TensorPlacement {
+                            tid: KV_BLOCK_INDEX_TID,
+                            bank: 0,
+                            role: SegRole::Activation,
+                            segment: a,
+                            offset: bioff,
+                            size: bibytes,
+                        },
+                    );
+                    seg_bytes[a] = align128(bioff + bibytes);
+                }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
                 // [mq_pad, nkvh·hd]. lower_attn_node copies layer-0 new_v here; the worker reads it to split
                 // the structural inf (matmul vs selector). Never reused ⇒ survives to post-prefill readback.
@@ -2497,6 +2672,10 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // ONE PASS PER PAGE INSTEAD OF PER (REQUEST, PAGE) — only when the fold's kernels actually
             // carry the request axis.
             batched_requests: fold_group && e.kv_batched_requests,
+            // ⭐ AND WHETHER THAT AXIS IS OVER A GATHERED SCRATCH — the other half of `fold_plan::collapsed`,
+            // and what sends the fold's KV shift to zero. Same `fold_group` gate as the axis: a non-fold
+            // group has no pass to gather for.
+            gathered: fold_group && e.kv_gathered,
             fold_rows: match e.kv_fold_rows {
                 scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest => {
                     bundle::FoldRows::PerRequest
@@ -3420,17 +3599,38 @@ mod tests {
     #[test]
     #[should_panic(expected = "reserved tid region overflow")]
     fn an_index_past_its_region_refuses_instead_of_aliasing_the_next_one() {
-        // scalarmul owns 100 slots; the 101st is past its floor.
-        let _ = scalarmul_scale_tid(RESERVED_REGIONS[1].slots as usize);
+        // The 101st scale is past scalarmul's floor. Asked BY NAME — see
+        // `the_declared_bases_are_the_regions_bases` for what a positional index cost here.
+        let _ = scalarmul_scale_tid(reserved_region("scalarmul_scale").slots as usize);
     }
 
-    /// The regions tile the space downward without gaps between the ones that abut, and every
-    /// declared base IS its region's base — the constants are derived from the table, so there is
-    /// no second copy to drift.
+    /// ⛔⛔⛔ EVERY DECLARED BASE IS ITS OWN **NAMED** REGION'S BASE — and this test previously
+    /// asserted the opposite, which is why the defect it now catches was invisible.
+    ///
+    /// It read `assert_eq!(KCT_RESIDENT_BASE, RESERVED_REGIONS[2].base)`. Both sides were the same
+    /// POSITION, so inserting the `kv_block_index` region at 2 moved the constant AND the expectation
+    /// together and the test stayed green — while `kct_resident_tid(0)` had begun answering
+    /// `KV_BLOCK_INDEX_TID`, i.e. layer 0's resident Kᵗ kernel and the gather's index table sharing one
+    /// placement. A test whose expectation is derived the same wrong way as the code cannot see the
+    /// code being wrong (`a-green-test-can-pin-a-port-divergence-as-correct`).
+    ///
+    /// The bake DID fail — `slots: 1` made `k_id >= 1` overflow — so nothing was silently shipped. That
+    /// was luck, not this test.
     #[test]
     fn the_declared_bases_are_the_regions_bases() {
-        assert_eq!(SCALARMUL_SCALE_BASE, RESERVED_REGIONS[1].base);
-        assert_eq!(KCT_RESIDENT_BASE, RESERVED_REGIONS[2].base);
+        assert_eq!(
+            SCALARMUL_SCALE_BASE,
+            reserved_region("scalarmul_scale").base
+        );
+        assert_eq!(KCT_RESIDENT_BASE, reserved_region("kct_resident").base);
+        // ⭐ AND THE TWO DOORS THAT SHARE A NEIGHBOURHOOD MUST NOT MEET. This is the assertion the
+        // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
+        // constant against its own definition.
+        assert_ne!(
+            kct_resident_tid(0),
+            KV_BLOCK_INDEX_TID,
+            "the resident Kᵗ kernel of layer 0 and the gather's index tensor are ONE tid"
+        );
         // Each region sits strictly below the one before it. They need NOT abut: the K-split
         // regions were removed and their span is deliberately left as a hole, because a reserved
         // id is a number that has been baked into artifacts and sliding one up to close a gap

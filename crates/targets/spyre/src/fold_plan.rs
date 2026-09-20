@@ -324,6 +324,19 @@ pub struct OpKv {
     /// which is a runtime property of the maps the host installed and so is checked, not declared —
     /// see [`LaunchPages`].
     pub batched_requests: bool,
+    /// ⭐⭐⭐ AND THAT AXIS WALKS A **GATHERED** SCRATCH — a contiguous destination the compiler placed,
+    /// filled by a KERNEL-less copy that resolved each row's page through an int32 index.
+    ///
+    /// This is what makes [`LaunchPages::Affine`] stop being a precondition. `Affine` proves the HOST can
+    /// reach every live row's page by ONE stride — a launch-time fact that hands the DEVICE no axis, and
+    /// one that is false for any real free-list allocation (rows holding pages 0,1,3,7 have no single
+    /// stride even though the pool is perfectly regular). A gathered fold puts each row's page in the
+    /// INDEX instead, so it collapses over ANY pool shape, which is the whole reason the gather exists.
+    ///
+    /// ⛔ AND THE KV SEGMENT SHIFT MUST GO TO ZERO WITH IT — see [`fold_delta`]. A gathered read computes
+    /// `addr = idx * skip_addr + base` from whatever base the launch installed, so a per-pass page shift
+    /// on top of an absolute entry composes two bases and lands inside neither: fluent, no fault.
+    pub gathered: bool,
 }
 
 /// The session state the arithmetic reads.
@@ -585,9 +598,9 @@ pub fn page_base_bytes(s: &SessionKv, rp: RowPage) -> Bytes {
 ///
 /// ⛔⛔⛔ THIS DOC USED TO SAY THE POOL *"separates them INSIDE each page by
 /// `PagedKvPool::request_stride` — a bake constant, which is the half that matters"*. **THAT CONSTANT
-/// DOES NOT EXIST.** `sdsc_abstract.rs:5197` records that the per-kv-head block distance *"replaced
+/// DOES NOT EXIST.** `sdsc_abstract.rs:5361` records that the per-kv-head block distance *"replaced
 /// `block_index(kvh) = kvh * ROWS` and `request_stride`"*, and the pool's address law states the
-/// consequence outright at `:5169`: *"There is no request term: a request is a set of SLOTS (reached
+/// consequence outright at `:5333`: *"There is no request term: a request is a set of SLOTS (reached
 /// through the host's page map), never a coordinate the device computes with."*
 ///
 /// So the affinity this type checks is a property of the HOST's `page_base_bytes` — a launch-time fact
@@ -600,10 +613,12 @@ pub fn page_base_bytes(s: &SessionKv, rp: RowPage) -> Bytes {
 /// It says the host CAN reach every row by one stride; it does not give the device an axis to step,
 /// because the law has none. A request axis needs an operand with a UNIFORM PER-REQUEST PITCH, and the
 /// pool is not one — so the collapse is not reachable by picking a better constant for the pool, which
-/// is the move every attempt made. It needs a different operand whose pitch this compiler chooses, and
-/// with it the removal of the absolute per-pass KV base [`fold_delta`] applies as a segment shift: a
-/// read that computes its own address off an already-shifted base composes two bases and lands inside
-/// neither — fluent garbage, no fault. That is one atomic change, and none of it is present today.
+/// is the move every attempt made. The operand that IS one is a CONTIGUOUS GATHER DESTINATION
+/// (`gather_copy_opspec`), whose pitch this compiler chooses. That is why the gather is the collapse's
+/// precondition rather than an optimisation of it — and why the two cannot land separately:
+/// [`fold_delta`] returns an absolute per-pass KV base as a segment shift, while a gathered read adds
+/// `idx * skip_addr` to that already-shifted base, so composing them lands inside neither — fluent
+/// garbage, no fault.
 ///
 /// Holding still also depends on which POOL ROWS are live: a request's row is its
 /// identity for life, so four requests holding rows 0,1,3,7 have no single stride even though the pool
@@ -615,6 +630,25 @@ pub fn page_base_bytes(s: &SessionKv, rp: RowPage) -> Bytes {
 /// page. Trusting the first difference is the bug this type exists to prevent — rows 0,1,3 agree on a
 /// stride of 1 for the first two rows and then diverge, so a launch built on the unverified stride
 /// reads row 2's KV for row 3 and returns fluent, wrong tokens.
+///
+/// ⛔⛔⛔ AND THE STRIDE THIS TYPE MEASURES IS **NOT BAKEABLE**, WHICH KILLS THE ROUTE THAT WOULD BAKE
+/// `MAX_PAGES_PER_ROW * layers * layer_stride` AND CHECK IT AGAINST WHAT IS MEASURED HERE. That plan —
+/// "keep reading the pool directly, no gather, ~200 lines, guarded by [`collapsed`]'s equality check" —
+/// rests on the host STRIPING the pool by the const `PagedKvPool::MAX_PAGES_PER_ROW` (16). **It does
+/// not.** `BlockTable::map_row` walks the row's LOGICAL pages and pushes `PhysPage(id)` for each id the
+/// engine's block manager handed out, in the order it handed them out, aliasing the fully-masked pages
+/// to one shared scratch page. So the stripe below is whatever the free list produced — measured 2 pages
+/// apart at bs=8 with one page per row (the scheduler grants "own pages + 1"), NOT 16 — and it changes
+/// with the allocation. A matmul steps its batch axis by an extent fixed when the bundle was COMPILED,
+/// so a stride that is 2 today and 3 tomorrow cannot be stepped at all, and a bundle baking 16 would
+/// simply never satisfy the equality check: the fold would silently never collapse and the only symptom
+/// would be that it is not faster. ⇒ There are exactly two ways to give the device a request axis:
+/// an operand whose per-request pitch THIS COMPILER chose (the gather's contiguous scratch), or a HOST
+/// that stripes the pool by that const so the measured stride equals the baked one by construction. The
+/// second is the smaller change and it also unlocks the cache write and the Kᵗ re-transpose — the other
+/// two per-request launches, which the gather does NOT reach — but it costs capacity (`rows * 16` pages
+/// must fit the pool, so 368 pages caps the ladder at 23 rows) and it re-introduces the per-request row
+/// scarcity that `ensure_pages`'s own note records as deliberately deleted. Neither is written.
 ///
 /// ⛔ AND THE PAGE MAPS ARE NO LONGER WHERE THE ROW LIVES. This used to read the stride out of
 /// `block_tables[1][0] - block_tables[0][0]`, which under the run-per-row pool was the row stride in
@@ -751,8 +785,24 @@ pub fn reps(op: &OpKv, s: &SessionKv, n_fold_pages: i64) -> i64 {
 /// answers have to come from the same predicate: `reps` collapsing while `fold_pass` still divides
 /// `rep` by the page count makes pass 1 of a 3-page context claim to be request 0's page 1 AND get
 /// only one third of the launches — a wrong history and a truncated sweep at once.
+/// ⭐⭐⭐ AND THE SECOND HALF IS "GATHERED **OR** AFFINE", NOT "AFFINE".
+///
+/// The precondition has always been *the device can reach every row's KV from one launch*. There are two
+/// ways to satisfy it and only one of them is a property of the pool:
+///   * [`OpKv::gathered`] — the fold's legs read a CONTIGUOUS scratch the compiler placed, filled by a
+///     copy that resolved each row's page through the host's index. Any pool shape works, because the
+///     irregularity was absorbed into the entries. This is the one the emitter can bake.
+///   * [`LaunchPages::Affine`] — the installed maps happen to admit a single stride, so a launch could in
+///     principle step it. Kept because a bundle that carries the axis WITHOUT the gather still needs that
+///     proof, and because it is genuinely false for the free-list allocations the gather exists for
+///     (measured: `BlockTable::map_row` pushes whatever ids the block manager handed out).
+///
+/// ⛔ REQUIRING BOTH WOULD SILENTLY DISABLE THE COLLAPSE, WHICH IS THE FAILURE MODE THIS CODEBASE HAS
+/// ALREADY PAID FOR ONCE: "the fold would silently never collapse and the only symptom would be that it is
+/// not faster". Requiring NEITHER is the wrong-history bug. So it is a disjunction of two witnesses, each
+/// of which independently establishes the same fact.
 pub fn collapsed(op: &OpKv, s: &SessionKv) -> bool {
-    op.batched_requests && matches!(LaunchPages::of(s), LaunchPages::Affine { .. })
+    op.batched_requests && (op.gathered || matches!(LaunchPages::of(s), LaunchPages::Affine { .. }))
 }
 
 /// ⭐⭐⭐⭐⭐ A PROOF THAT EVERY LIVE ROW HOLDS THE SAME NUMBER OF PAGES, carrying that number.
@@ -871,7 +921,22 @@ pub fn fold_delta(
         return (Bytes(0), Bytes(0), Bytes(0));
     };
     let req = rp.row();
-    let kv = page_base_bytes(s, rp);
+    // ⛔⛔⛔ A GATHERED FOLD TAKES **NO KV SHIFT**, AND THAT IS NOT AN OPTIMISATION.
+    //
+    // `page_base_bytes` is an ABSOLUTE per-pass KV base, applied as a segment shift. A gathered read is
+    // `addr = idx * skip_addr + base_addr`, and the entries the host stages are ABSOLUTE global stick-block
+    // numbers — they already carry the page. Applying the shift as well composes two bases and lands inside
+    // neither: a clean bake, no fault, another page's keys. That is exactly why the gather and this zero
+    // cannot land in separate commits.
+    //
+    // ⭐ AND THE PASS STILL HAS TO BE MINTED. `fold_pass` above is what proves this pass names a page its
+    // row holds; short-circuiting before it would let a sweep past the row's map through, and the mask
+    // shift below is derived from the same pass index.
+    let kv = if op.gathered {
+        Bytes(0)
+    } else {
+        page_base_bytes(s, rp)
+    };
     // One page of one row unless the worker declared otherwise — a per-request mask is `nqh * mq`
     // rows deep, and stepping it by one row's page would land inside the first row's data.
     let stride = if s.mask_rep_stride_bytes > 0 {
