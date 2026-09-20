@@ -44,16 +44,14 @@
 //! declared in `place.rs` under the comment "K-split / down-projection blocking (the only INDEXED
 //! roles)" and had NO producer in this tree. This is that producer.
 
-use super::dims::{matmul_split_map_for, matmul_dims};
+use super::dims::{matmul_dims, matmul_split_map_for};
 use super::walk::{InAxis, MatmulWrapperSite, OutAxis, SharedKernelBmmForm, WalkAxis};
 use crate::emit::{EmittedOp, In, pw2, rb};
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::place::{PlaceId, SynthRole as R};
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, KernelTag, RowBlockedTag, RowCount, Stk};
-use crate::superdsc_opspec::{
-    DataFormat, Df, Fp16, MAX_CORES, MaxCores, SdscFoldSet, StickExtent,
-};
+use crate::superdsc_opspec::{DataFormat, Df, Fp16, MAX_CORES, MaxCores, SdscFoldSet, StickExtent};
 
 /// How ONE matmul's reduction axis is cut into trips: `trips` whole matmuls of `k_per_trip` each.
 ///

@@ -31,11 +31,11 @@ pub use assemble::{
     assemble_matmul_off_with_epilogue, assemble_matmul_placed, assemble_matmul_seeded,
     assemble_matmul_split, try_assemble_matmul_seeded,
 };
+pub use ktrips::{KTripPlan, plan_k_trips, try_assemble_matmul_k_trips};
 pub use opspec::{
     matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
     matmul_opspec_off_operands, matmul_opspec_off_operands_phys, matmul_opspec_split,
 };
-pub use ktrips::{KTripPlan, plan_k_trips, try_assemble_matmul_k_trips};
 pub use walk::SharedKernelBmmForm;
 
 pub use dims::set_split_mb_forbidden;

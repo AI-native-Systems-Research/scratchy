@@ -3173,7 +3173,6 @@ pub fn matmul(
     Ok(vec![op])
 }
 
-
 /// A BARE ROW REDUCTION — `[rows, cols]` → `[rows, 1]`, one `sfp` op along the stick axis.
 ///
 /// ⭐ THE ASSEMBLER WAS ALREADY WRITTEN; WHAT WAS MISSING WAS A DOOR — the same story as

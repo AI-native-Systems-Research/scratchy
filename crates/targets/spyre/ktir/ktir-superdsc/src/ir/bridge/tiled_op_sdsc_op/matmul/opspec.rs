@@ -305,7 +305,9 @@ where
                      (phys >= iteration); a smaller value cannot be expressed this way."
                 ));
             }
-            kernel.with_device_extent(InAxis::NAME, phys).map_err(|e| e.0)?
+            kernel
+                .with_device_extent(InAxis::NAME, phys)
+                .map_err(|e| e.0)?
         }
         None => kernel,
     };
