@@ -256,3 +256,46 @@ fn partition_still_covers_exactly_with_mixed_requests() {
         assert!(!group_spans_two_requests(&trips, g));
     }
 }
+
+/// ⭐⭐⭐⭐⭐ A `PageFold` RUN IS **ONE GROUP AT ANY LENGTH** — the guard for a silent wrong-answer bug
+/// that shipped, not a tidiness check.
+///
+/// A group is the unit of the `reps` relaunch and the launch loop is group-major
+/// (`superdsc_exec::launch_ops_inner`: `for op { for rep { … } }`). So a fold cut into groups A and B
+/// runs A(pass 0..n) then B(pass 0..n) — and a GATHERED fold's passes communicate through a scratch they
+/// REWRITE, so every pass of B reads the page A left behind on its LAST pass. With a single pass that is
+/// invisible; it breaks at the first page crossing, at every batch width.
+///
+/// MEASURED on granite-3.1-2b fp8, 420-token probe: first divergence at absolute slot 256, offset 0 into
+/// page 1, identical at width 2 and width 8, and `SCRATCHY_SDSC_PEROP_SYNC=1` does not move it (the order
+/// is semantically wrong, not racy). `GroupSize`'s own doc records the same effect from the other side —
+/// `solo_diff` 8,8,8,8,8 at `g = 128` against 7,6,7 at `g = 512`, i.e. the partition changed the answer.
+/// A bigger `g` only moves which contexts are wrong; not cutting the run is the fix.
+#[test]
+fn a_page_fold_run_is_never_chunked_by_the_group_size() {
+    let fold = |r: u32| Trip::new(GroupKind::PageFold, TripRequest(r));
+    // Longer than every `g` tried, so a cap that still applied would show up as more than one group.
+    let trips: Vec<Trip> = (0..40).map(|_| fold(0)).collect();
+    for g in [1usize, 2, 3, 8, 128, 512] {
+        assert_eq!(
+            group_ranges(&trips, g),
+            vec![0..40],
+            "g={g}: a PageFold run must be ONE group — cutting it makes every pass of the second \
+             group read the gathered page the first group left at its LAST pass"
+        );
+        let (covered, ok) = group_ranges_cover_ok(&trips, g);
+        assert!(
+            ok && covered == trips.len(),
+            "g={g}: the scalar twin must accept the unchunked run too, or the Kani proof proves a \
+             walk the emitter does not take (covered={covered} ok={ok})"
+        );
+    }
+    // ⛔ AND THE REQUEST TEST STILL WINS. Exemption from the SIZE cap is not exemption from the rule
+    // that one launch resolves one request's page table.
+    let mixed = vec![fold(0), fold(0), fold(1), fold(1)];
+    assert_eq!(group_ranges(&mixed, 512), vec![0..2, 2..4]);
+    // ⛔ AND ONLY `PageFold` IS EXEMPT — a `Pure` run of the same length still chunks, which is what
+    // keeps the launch budget meaningful for the rest of the body.
+    let pures: Vec<Trip> = (0..40).map(|_| pure(0)).collect();
+    assert_eq!(group_ranges(&pures, 8).len(), 5);
+}

@@ -351,6 +351,7 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
             per_position: None,
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
+        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
     )
     .expect("the gather-copy op builds at the score leg's extents");
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -365,13 +366,14 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
         "Tensor0",
         "Tensor2",
         // The SAME width as the gathered control above, for the same reason — one index stick.
-        (HD as u32) * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+        HD * ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
         GatherIndex::of_scratch_rows(
             "Tensor3".to_string(),
-            PageExtent::of_positions(HD as u32),
+            PageExtent::of_positions(HD),
             ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         ),
+        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
     )
     .expect("the gather-copy op builds");
     // Drop the index operand and the declaration, leaving the bare two-operand identity.
@@ -402,7 +404,7 @@ fn the_gathered_kv_operand_capacity_divides_the_pool_block() {
     // INDEX's own capacity and report it as the address stride.
     let decl = GatherIndex::of_scratch_rows(
         "t_kv_block_index".to_string(),
-        PageExtent::of_positions(HD as u32),
+        PageExtent::of_positions(HD),
         ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
     );
     let op = gathered_score_shaped_op(decl.entry_dim, decl.page);
@@ -553,7 +555,7 @@ fn the_axis_and_page_together_decide_the_stride() {
     // factor divides a page by.
     let shipped = GatherIndex::of_scratch_rows(
         "T".to_string(),
-        PageExtent::of_positions(HD as u32),
+        PageExtent::of_positions(HD),
         ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
     );
     let cap = capacity_of(

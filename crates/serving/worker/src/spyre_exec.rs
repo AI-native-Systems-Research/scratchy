@@ -1171,29 +1171,31 @@ impl Worker for SpyreWorker {
                         let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
                         werr(
                             "decode batch: this bundle emits a GATHERED KV read, but a physical page \
-                             is not a whole number of index entries — no integer index can name a page \
+                             is not a whole number of STICK BLOCKS — no integer index can name a page \
                              boundary, so every row would gather from inside the previous page"
                                 .to_string(),
                         )
                     })?;
-                        // ⭐⭐⭐ THE SCRATCH'S OWN SHAPE, from the SAME two extents the emitter sized it with:
-                        // the rung's width and the windows one pass sweeps (`swept / 64`, off the manifest's
-                        // `SweptCols`). A table built for a different `nb` or a different width would write
-                        // real block numbers into rows the copy does not read and leave the rows it does read
-                        // at zero — block 0, page 0's first block, a REAL address.
-                        let scratch = scratchy_subtile::sdsc_abstract::GatherScratch::of_fold_pass(
+                        // ⭐⭐⭐ THE SCRATCH'S OWN SHAPE — and at page granularity it takes ONE extent, the
+                        // rung's width, because a row is a REQUEST.
+                        //
+                        // ⛔ THE WINDOW COUNT IS GONE FROM THIS CALL, WHICH IS THE POINT. It used to be
+                        // `SlotWindow::count_in(swept)` here and the EMITTER's own body rung there — two
+                        // different numbers by construction (the host reads the CEILING body's `swept`, the
+                        // emitter its interior rung), and a table built for a different `nb` wrote real block
+                        // numbers into rows the copy does not read while leaving the rows it does read at
+                        // zero: block 0, a REAL address. With `mq` alone both sides read the same rung.
+                        let scratch = scratchy_subtile::sdsc_abstract::PageScratch::of_pass(
                         pool,
-                        scratchy_subtile::sdsc_abstract::SlotWindow::count_in(
-                            scratchy_subtile::sdsc_abstract::SlotCount::new(swept.get()),
-                        ),
                         scratchy_subtile::sdsc_abstract::QueryRowCount::of_mq(seqs.get()),
                     )
                     .ok_or_else(|| {
                         werr(
                             "decode batch: this bundle emits a GATHERED KV read, but its geometry \
-                             admits no flat block copy (a head dim above one stick makes a 64-slot V \
-                             window several strided runs). The bake and the host disagree about \
-                             whether this bundle gathers."
+                             admits no page-granular copy — the head dim is not a whole number of \
+                             sticks, the rung is wider than one index stick, or the plane's footprint \
+                             does not fit the descriptor's u32 extents. The bake and the host disagree \
+                             about whether this bundle gathers."
                                 .to_string(),
                         )
                     })?;
@@ -1206,7 +1208,13 @@ impl Worker for SpyreWorker {
                         // `usize::try_from(mask_shape.rep_stride_bytes() / 4)` — the `/ 4` spelled at the
                         // launch, i.e. the second derivation `PassStride` exists to remove.
                         let pass_stride = mask_shape.pass_stride();
-                        let table = scratchy_subtile::sdsc_abstract::gather_index_table(
+                        // ⛔ THE PASS PITCH IS NOT THE SUSPECT IT LOOKED LIKE, AND THAT IS MEASURED.
+                        // Pinning every pass's entries to logical page 0 CHANGED the card's answer
+                        // (granite-3.1-2b fp8, width 8), so pass `p >= 1` demonstrably reads its OWN
+                        // index block: the index does ride the mask's per-pass segment shift, and the
+                        // page-crossing failure was never here. It was the launch GROUPING — see
+                        // `GroupKind::run_may_be_chunked`.
+                        let table = scratchy_subtile::sdsc_abstract::page_gather_index_table(
                             scratch,
                             &page_maps,
                             max_pages,
@@ -1235,20 +1243,25 @@ impl Worker for SpyreWorker {
                                 (l.min(e.as_i32()), h.max(e.as_i32()))
                             });
                             let max_phys = page_maps.iter().flatten().copied().max().unwrap_or(-1);
-                            // `per_page` IS `page_stride_bytes / stick_block_bytes`, so the stick block and
-                            // hence the byte reach the card will address are both recoverable here without a
-                            // new accessor: `hi * stick = hi * page_stride / per_page`.
+                            // ⛔ THE UNIT IS THE STICK BLOCK, AND IT IS THE POOL'S OWN NUMBER. `per_page`
+                            // is `page_stride_bytes / stick_block_bytes` and `skip_addr` is one stick
+                            // block, so `entry * stick_block_bytes` IS the byte the card computes —
+                            // converting with any other unit would mis-report the reach by `nkvh *
+                            // PAGE_SLOTS / POOL_STICK` (32× at the shipped 2b geometry). A diagnostic
+                            // that mis-reports an address is worse than none: this is the one print that
+                            // says whether an entry lands inside the pool.
                             let stick = pool.stick_block_bytes() as i64;
                             eprint!(
                                 "{}",
                                 format_args!(
-                                    "[gather] mq={} entries={} pass_stride={} max_pages={} \
+                                    "[gather] mq={} entries={} per_row={} pass_stride={} max_pages={} \
                                  per_page={} scratch_rows={} idx_lo={lo} idx_hi={hi} \
-                                 max_phys={max_phys} stick_bytes={stick} \
+                                 max_phys={max_phys} stick_block_bytes={stick} \
                                  reach_bytes={} page_stride_bytes={} page_maps={} \
                                  mask_rep_stride={} table_bytes={}\n",
                                     seqs.get(),
                                     table.len(),
+                                    scratch.entries_per_row(),
                                     pass_stride.get(),
                                     max_pages,
                                     per_page.get(),

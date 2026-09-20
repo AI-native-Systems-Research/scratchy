@@ -397,6 +397,11 @@ impl SuperDscSession {
         )
     }
 
+    // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE
+    // count for the pin that the card refuses (`PagePlaneExtent::entry_elems`); the page-granular gather
+    // pins one stick block like every other gather and reads the accessor above. Two accessors over one
+    // `kv_page_stride_bytes` is the "same number, two derivations" shape the identity exists to remove.
+
     /// ⭐⭐⭐⭐⭐ WHICH BODY THE NEXT LAUNCH AT `start` WILL RUN, and what it declares — see
     /// [`superdsc_exec::StepBody`]. The host asks this BEFORE it stages anything, because both the
     /// gather's index table and the prefix mask's block form are decisions about the selected body.

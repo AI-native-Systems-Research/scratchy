@@ -710,11 +710,21 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
                         .and_then(|w| w.as_array())
                         .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(0)).collect())
                         .unwrap_or_default();
+                    // ⭐ `-1` IS THE PINNED-DIM SENTINEL, NOT AN UNFILLED FIELD, and a page-granular index
+                    // declares exactly that: its `mb` is the paged axis and the op names ONE entry
+                    // (`mb == page`), so `getPageSize` (`dsc2.cpp:4493-4526`) erases the negative entry and
+                    // reads the dim as paged. A positive count is the multi-entry form, which is the one
+                    // that can exceed a stick — so the cap still applies to it and only to it.
+                    //
+                    // ⛔ THE >32 PROTECTION IS UNCHANGED FOR THE SHAPE IT WAS WRITTEN FOR. The IBR is
+                    // loaded one stick at a time and read `% bytesPerStick`, so a positive count above
+                    // `cap` WRAPS silently — the measured rung-8 corruption. What is new is that a
+                    // page-granular op cannot reach that shape at all: one entry per op.
                     assert!(
-                        !walk.is_empty() && walk.iter().all(|&e| e > 0 && e <= cap),
-                        "op '{name}' declares an index walk of {walk:?} and one gather op's index is \
-                         ONE {cap}-entry stick — cut the pass into one op per stick \
-                         (`GatherScratch::copies`)"
+                        !walk.is_empty() && walk.iter().all(|&e| e == -1 || (e > 0 && e <= cap)),
+                        "op '{name}' declares an index walk of {walk:?}; a gather op's index must be one \
+                         PINNED axis (-1) or a positive count within ONE {cap}-entry stick — cut the pass \
+                         into one op per entry (`PageScratch::copies`)"
                     );
                     // The KERNEL-less requirement, on the very op that carries it: `primaryDsInfo_`
                     // must hold no `KERNEL` role, which is what `hasDimensionReuse` counts.
@@ -750,20 +760,35 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
     // `[mb, out]` operand — it is a contiguous ONE-STICK RUN of rows, and the expected count is
     // therefore the scratch's own `copy_count`, derived here from the same geometry the emission used
     // rather than written down.
-    let scratch = ktir_superdsc::sdsc_abstract::GatherScratch::of_fold_pass(
+    // ⭐ PAGE GRANULARITY MAKES THE CUT UNNECESSARY, so the expected count is ONE OP PER PLANE. A row is
+    // now a REQUEST holding a whole page plane, so a pass names `mq` entries — and `mq` never exceeds one
+    // index stick at any rung the ladder admits, which is why the `rows / 32` split that used to produce
+    // 16 ops here is gone rather than merely satisfied. Still derived from the geometry, not written down.
+    let scratch = ktir_superdsc::sdsc_abstract::PageScratch::of_pass(
         ktir_superdsc::sdsc_abstract::PagedKvPool::new(NKVH as usize, HD as usize),
-        ktir_superdsc::sdsc_abstract::SlotWindow::count_in(
-            ktir_superdsc::sdsc_abstract::SlotCount::new(ACTIVE_CAP),
-        ),
         ktir_superdsc::sdsc_abstract::QueryRowCount::of_mq(8),
     )
-    .expect("this geometry admits the flat gather");
-    let per_leg = scratch.copy_count() as usize;
+    .expect("this geometry admits the page gather");
+    let per_leg = scratch.copies().count();
+    assert_eq!(
+        per_leg as u32,
+        scratch.mq(),
+        "a page-granular pass is ONE copy op per REQUEST — an op per PLANE is refused at bake, \
+         'The initial chunk parameters must fit in LX for SuperDSC' (L3DlOpsScheduler.cpp:1534), \
+         because the initial chunk is sized BEFORE work division so the op's whole 2 MB is measured"
+    );
     assert_eq!(
         gathered.len(),
         2 * per_leg,
-        "expected the Kᵗ and V copies at {per_leg} index stick(s) each ({} rows / {} per op), got \
-         {gathered:?}",
+        "expected {per_leg} Kᵗ copies and {per_leg} V copies, each naming ONE entry — got {gathered:?}",
+    );
+    // ⛔ AND THE ENTRY COUNT IS THE THING THAT USED TO WRAP. `rows()` is the live entry count per pass;
+    // above `CopyDims::ENTRIES_PER_OP` the IBR is read modulo one stick and the cores past the wrap use
+    // another core's page address (the measured rung-8 corruption). Asserted here so the property is
+    // pinned at the emission, not only at the type's own door.
+    assert!(
+        scratch.rows() <= ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+        "a pass names {} entries against a {}-entry index stick — this WRAPS silently on card",
         scratch.rows(),
         ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
     );
@@ -867,15 +892,24 @@ fn every_run_of_the_cut_pass_addresses_its_own_entries_and_rows() {
             }
         }
     }
-    // Kᵗ and V, four runs each.
+    // ⭐ ONE RUN PER REQUEST AT PAGE GRANULARITY — `mq` runs per leg, not the window-granular `rows/32`.
+    //
+    // ⛔ AND IT IS `mq`, NOT 1, BECAUSE THE CARD SAID SO. One op per PLANE (all `mq` requests in a single
+    // 2 MB copy) is what I emitted first, and dxp refuses it: "The initial chunk parameters must fit in LX
+    // for SuperDSC" (`L3DlOpsScheduler.cpp:1534`). LX is a per-core budget but the INITIAL CHUNK is sized
+    // before work division, so the op's whole footprint is measured. One request per op is 256 KB.
     let kt: Vec<_> = runs.iter().filter(|(n, ..)| n.contains("gkt")).collect();
     assert_eq!(
         kt.len(),
-        4,
-        "the rung-8 body is 128 rows = 4 runs per leg, got {runs:?}"
+        8,
+        "a page-granular rung-8 body is ONE run per REQUEST (mq=8), got {runs:?}"
     );
     // ⛔ THE BASES MUST BE STRICTLY INCREASING AND DISTINCT. Equal bases across runs IS the dropped-base
     // defect, and it is what a `startAddressCoreCorelet_` diff of two runs would otherwise hide.
+    //
+    // ⚠️ VACUOUS AT ONE RUN, AND KEPT DELIBERATELY: it is the guard for the multi-run case, which a wider
+    // rung or a smaller entry page would reintroduce. Deleting it would mean a future cut lands unguarded.
+    // The count assertion above is what carries the check today.
     for w in kt.windows(2) {
         let (a, b) = (w[0], w[1]);
         assert!(

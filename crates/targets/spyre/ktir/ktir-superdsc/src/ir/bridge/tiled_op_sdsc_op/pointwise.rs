@@ -59,6 +59,13 @@ pub fn gather_copy_opspec(
     rows: u32,
     cols: u32,
     gather: crate::superdsc_opspec::GatherIndex,
+    // ⭐⭐⭐⭐⭐ THE DESTINATION ENTRY THIS RUN STARTS AT — separate from `gather.first_entry`, and it has to
+    // be. See `GatherCopy::dest_entry`: the two were one number while a run's entries and its destination
+    // rows advanced together (the window-granular cut, where one index stick IS 32 scratch rows), and a
+    // page-granular op breaks that — it names ONE entry but must sit at a stick boundary, so entries
+    // advance 32 per op while rows advance 1. Both are minted from the same request index by `copies()`,
+    // so they cannot drift; they simply are not equal any more.
+    dest_entry: crate::superdsc_opspec::DestEntry,
 ) -> Result<OpSpec, String> {
     let cols_ext = crate::superdsc_opspec::StickExtent::<Fp16>::new(cols)?;
     if cols != Fp16::ELEMS_PER_STICK {
@@ -185,13 +192,18 @@ pub fn gather_copy_opspec(
         // token right then divergence, four runs wrong from the first token. The emission-side assertion
         // is `every_run_of_the_cut_pass_addresses_its_own_entries_and_rows`, which measures this exact
         // delta off the per-core start addresses rather than trusting the arithmetic.
+        // ⛔ `dest_entry`, NOT `gather.first_entry`. This read `gather.first_entry.entries()`, which is
+        // the INDEX's base in entries — equal to the destination's only while one index stick is 32
+        // consecutive destination rows. A page-granular op's index base is `32 * request` while its rows
+        // start at `request`, so reusing it lands every op's rows 32× too far out, past the scratch and
+        // into the next intermediate's bytes. Read as keys, clean bake, no fault.
         entry_elems
-            .checked_mul(gather.first_entry.entries())
+            .checked_mul(dest_entry.entries())
             .ok_or_else(|| {
                 format!(
                     "gather_copy_opspec('{src}' -> '{dst}'): the destination base for the run at entry \
                      {} overflows a 32-bit element offset at {entry_elems} elements per entry",
-                    gather.first_entry.entries()
+                    dest_entry.entries()
                 )
             })?,
     )?;
@@ -272,11 +284,14 @@ pub fn assemble_gather_copy(
         crate::superdsc_opspec::GatherIndex::of_scratch_rows(
             index.to_string(),
             d.page(),
-            // ⭐ THE RUN'S BASE, AND IT IS THE ONLY BASE PASSED ANYWHERE: `gather_copy_opspec` derives
-            // the DESTINATION's base from this one and the run's `cols`, so the entries this op reads
-            // and the rows it writes are the same run by construction.
+            // THE INDEX's base, in whole index STICKS — dxp loads the IBR one stick at a time.
             copy.index_base(),
         ),
+        // ⛔ AND THE DESTINATION's base SEPARATELY. It used to be derived from the index base above;
+        // see `GatherCopy::dest_entry` for the measurement that separated them (a page-granular op names
+        // one entry at stick `r` but writes run `r`, so the two advance at different rates). Both come
+        // from `copies()`, which mints them from one request index.
+        crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
     )
     .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());

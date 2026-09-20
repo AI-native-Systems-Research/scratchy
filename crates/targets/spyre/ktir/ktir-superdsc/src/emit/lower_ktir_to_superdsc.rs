@@ -2747,11 +2747,22 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // `KvBlockIndex` forward step for a gather that appears in no descriptor. Asking
     // `GatherScratch::admits` HERE and at the placement (`lower_subtile_tape_to_superdsc`) makes the two
     // halves ONE predicate; see that door for why the split was invisible at hd=64.
+    // ⭐⭐⭐ THE PAGE-GRANULAR DOOR, WHICH IS WHAT CLOSES THE THREE-DOOR SPLIT RECORDED BELOW. The
+    // window-granular `GatherScratch::admits` refused `hd > POOL_STICK`, so at hd=128 this gate and the
+    // `KV_BLOCK_INDEX_TID` placement (gated on `rows_are_requests` ALONE) gave DIFFERENT answers — a bundle
+    // that reserved an index nothing gathered through. `PageScratch::of_pass` admits every stick-multiple
+    // head dim, so both halves now answer the same thing for every geometry the pool admits.
+    //
+    // ⛔ AND THE DIRECTION OF THE OLD DIVERGENCE IS WHY THIS MUST MOVE WITH THE EMITTER, not after it. The
+    // emitter now gathers at hd=128; a placement that still refused there would leave the gather with NO
+    // staged table, and an unstaged index reads as entry 0 — page 0's first plane, a REAL address, so every
+    // row of the batch would answer from one request's keys with a clean bake and no fault.
     let kv_block_index: Option<String> = (rows_are_requests
-        && crate::sdsc_abstract::GatherScratch::admits(
+        && crate::sdsc_abstract::PageScratch::of_pass(
             crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize),
             crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-        ))
+        )
+        .is_some())
     .then(|| crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID));
     // ── (3) the unified score/softmax/output computation — ONE algorithm for any mq (see
     // ir::bridge::tiled_op_sdsc_op::attn's module doc for the torch-spyre correspondence). The head

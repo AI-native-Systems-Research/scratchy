@@ -66,6 +66,7 @@ fn gather_copy(decl: (KernelAxis, PageExtent)) -> ktir_superdsc::superdsc_opspec
             per_position: None,
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
+        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
     )
     .expect("the gather-copy op builds")
 }
@@ -295,6 +296,7 @@ fn the_declarations_own_refusals_survive_the_move() {
                 per_position: None,
                 first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
             },
+            ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
         )
         .is_err(),
         "an `in` axis is not a dim of the gather-copy op, and a silently-dropped pin is a gather with \

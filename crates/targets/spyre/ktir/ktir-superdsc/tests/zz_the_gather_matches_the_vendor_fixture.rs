@@ -83,6 +83,7 @@ fn gather_copy_declared() -> ktir_superdsc::superdsc_opspec::OpSpec {
         16,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
         vendor_index("Tensor1"),
+        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
     )
     .expect("the gather-copy op builds")
 }
@@ -103,6 +104,7 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
         16,
         ktir_superdsc::sdsc_abstract::POOL_STICK,
         vendor_index("Tensor1"),
+        ktir_superdsc::superdsc_opspec::DestEntry::ZERO,
     )
     .expect("the gather-copy op builds");
     // Drop the index operand and the declaration, leaving the bare two-operand identity.
@@ -505,16 +507,16 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
         let mut stack = vec![v];
         while let Some(node) = stack.pop() {
             if let Some(m) = node.as_object() {
-                if let Some(p) = m.get("primaryDsInfo_") {
-                    if p.get("KERNEL_IDX").is_some() {
-                        found += 1;
-                        assert!(
-                            !has_dimension_reuse(p),
-                            "{path}: a vendor gather op DOES have dimension reuse — the premise of \
-                             this test (that the vendor never gathers on a KERNEL-bearing op) is \
-                             wrong, and the card refusal needs another explanation"
-                        );
-                    }
+                if let Some(p) = m.get("primaryDsInfo_")
+                    && p.get("KERNEL_IDX").is_some()
+                {
+                    found += 1;
+                    assert!(
+                        !has_dimension_reuse(p),
+                        "{path}: a vendor gather op DOES have dimension reuse — the premise of this \
+                         test (that the vendor never gathers on a KERNEL-bearing op) is wrong, and \
+                         the card refusal needs another explanation"
+                    );
                 }
                 stack.extend(m.values().cloned());
             } else if let Some(a) = node.as_array() {

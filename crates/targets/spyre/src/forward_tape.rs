@@ -39,7 +39,12 @@ pub enum Staged {
     /// visibly, it would silently gather a DIFFERENT ROW'S KEYS and read as fluent text.
     /// ⭐ AND THEY ARE [`GatherEntry`]s, NOT `i32`s. The comment above already called them
     /// "ADDRESSES-IN-WAITING"; the type now says so, so the only way to put one in this buffer is
-    /// [`GatherEntry::of_page_block`] and a hand-written block number does not compile.
+    /// [`GatherEntry::of_page_block`] and a hand-written page number does not compile.
+    ///
+    /// ⛔ ONE ENTRY TYPE, BECAUSE THERE IS ONE PIN. A second type (`PageEntry`, counting whole page
+    /// PLANES) existed while the page-granular copy pinned a plane; that pin is refused on card
+    /// (`PagePlaneExtent::entry_elems`), so the unit is one STICK BLOCK for every gather and a second
+    /// type would only be a second derivation of the same factor.
     ///
     /// [`GatherEntry`]: scratchy_subtile::sdsc_abstract::GatherEntry
     /// [`GatherEntry::of_page_block`]: scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block
@@ -632,19 +637,30 @@ mod tests {
         //
         // ⛔ THE ENTRIES ARE MINTED THROUGH THE REAL DOOR AND THE FACTOR COMES FROM A REAL POOL, so
         // this checks the COMPOSITION rather than re-asserting literals it chose itself. `per_page`
-        // is `page_stride / stick_block` for an hd=64 pool over 40 layers — the shipped geometry —
-        // and page 17's block 0 is 65,280, past f16's exact-integer range by 30×.
+        // is `page_stride / PLANE bytes` for an hd=64 pool over 40 layers × 3 planes — the shipped
+        // geometry — so it is 120, and page 100's entry is 12,000: past f16's exact-integer range by ~6×.
+        //
+        // ⛔ THE PAGE NUMBER HAD TO GROW WITH THE GRANULARITY CHANGE, AND THAT IS THE POINT OF THE
+        // ASSERT BELOW. Page-granular entries count PLANES, not stick blocks, so the factor fell from
+        // 3,840 to 120 (`nkvh * PAGE_SLOTS / POOL_STICK` = 32× smaller). Page 17 then yields 2,040 — just
+        // UNDER f16's 2048 — so the old literal would have left this test passing while testing nothing.
+        // The assert is what caught it; do not lower it to match a factor.
+        //
+        // ⭐ AND THE FACTOR IS BACK AT THE STICK BLOCK, which only makes the entries LARGER — the pin the
+        // plane factor served is refused at bake (`PagePlaneExtent::entry_elems`). The assert below is
+        // what keeps this test honest across either factor: it checks the VALUE exceeds f16's exact
+        // range, not which factor produced it.
         let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(8, 64);
-        let per_page = scratchy_subtile::sdsc_abstract::gather_entries_per_page(
-            40 * pool.stick_block_bytes() * 96,
-            pool,
-        )
-        .expect("a page that is a whole number of stick blocks");
-        let mint = |phys: i64, block: u32| {
-            scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block(per_page, phys, block)
+        let plane = scratchy_subtile::sdsc_abstract::PagePlaneExtent::of_pool(pool)
+            .expect("a stick head dim");
+        let per_page =
+            scratchy_subtile::sdsc_abstract::gather_entries_per_page(40 * 3 * plane.bytes(), pool)
+                .expect("a page that is a whole number of stick blocks");
+        let mint = |phys: i64| {
+            scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block(per_page, phys, 0)
                 .expect("an in-range entry")
         };
-        let blocks = [mint(0, 0), mint(1, 0), mint(2, 31), mint(17, 0)];
+        let blocks = [mint(0), mint(1), mint(2), mint(100)];
         assert!(
             blocks[3].as_i32() > 2048,
             "the point of this test is a value f16 cannot hold exactly; per_page={} made only {}",

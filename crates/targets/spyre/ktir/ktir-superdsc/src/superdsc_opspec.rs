@@ -2167,6 +2167,39 @@ impl EntryBase {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ WHERE A GATHER RUN'S OUTPUT STARTS IN THE DESTINATION — **IN ENTRIES, AND DELIBERATELY NOT AN
+/// [`EntryBase`].**
+///
+/// ⛔⛔⛔ THESE TWO WERE ONE VALUE AND THE CARD FOUND IT. `gather_copy_opspec` derived the destination base
+/// from the INDEX base, which is exact only while a run's entries and its destination rows advance
+/// together — true of the window-granular cut, where one index stick IS 32 consecutive destination rows.
+/// A page-granular copy names ONE entry but must still start at a stick boundary (the IBR is loaded one
+/// stick at a time, see [`EntryBase`]), so its index base steps 32 per op while its destination steps 1.
+/// Reusing the index base there put every run's rows 32× too far out — past the scratch, into the next
+/// intermediate's bytes, read as page addresses with a clean bake.
+///
+/// ⛔ SO THE TYPES MUST DIFFER, NOT JUST THE VALUES. `EntryBase` is a STICK count that reports itself in
+/// entries; this is an ENTRY count with no stick constraint at all. One `of_sticks` where `of_entries`
+/// belongs is a 32× address error that compiles, which is precisely what separate types remove.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DestEntry(u32);
+
+impl DestEntry {
+    /// The destination's own start — every gather whose output is not cut into runs.
+    pub const ZERO: DestEntry = DestEntry(0);
+
+    /// `entries` whole entries in. NOT sticks: a destination run has no stick alignment requirement,
+    /// because nothing loads it through the IBR.
+    pub const fn of_entries(entries: u32) -> DestEntry {
+        DestEntry(entries)
+    }
+
+    /// The base in entries, which the caller multiplies by its own elements-per-entry.
+    pub const fn entries(self) -> u32 {
+        self.0
+    }
+}
+
 /// ⭐⭐⭐ A GATHER, AS ONE ARGUMENT — the index operand's name plus the two facts that decide what an
 /// entry MEANS.
 ///

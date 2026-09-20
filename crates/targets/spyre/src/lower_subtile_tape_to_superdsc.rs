@@ -2043,6 +2043,38 @@ impl GroupKind {
             _ => false,
         }
     }
+
+    /// ⭐⭐⭐⭐⭐ WHETHER A RUN OF THIS KIND MAY BE **CHUNKED BY THE GROUP SIZE** — false for
+    /// [`GroupKind::PageFold`], and that is a CORRECTNESS law, not a tuning choice.
+    ///
+    /// ⛔⛔⛔ A GROUP IS THE UNIT OF THE `reps` RELAUNCH, AND THE LOOP IS GROUP-MAJOR.
+    /// `superdsc_exec::launch_ops_inner` is `for op in ops { for rep in 0..reps(op) { … } }`, so a fold
+    /// cut into groups A then B runs **A(pass 0..n), then B(pass 0..n)** — never A(0),B(0),A(1),B(1).
+    /// Every op inside one pass therefore has to be inside one group.
+    ///
+    /// For an UNGATHERED fold the split is survivable by accident: each pass reads the pool through its
+    /// own KV segment shift, and the online softmax's running max/sum/output is accumulate-only, so
+    /// applying the (window, pass) contributions group-major gives the same answer. **For a GATHERED
+    /// fold it is wrong**, because the passes communicate through a buffer they REWRITE: group A's copy
+    /// leaves the gathered scratch holding page `n-1`, and every one of group B's passes then reads page
+    /// `n-1`. With one pass that is invisible — A writes page 0, B reads page 0 — which is exactly why
+    /// this survived every single-page test and broke at the first page crossing, at ANY batch width
+    /// (MEASURED on granite-3.1-2b fp8: first divergence at absolute slot 256, offset 0 into page 1, at
+    /// width 2 and width 8 alike; `SCRATCHY_SDSC_PEROP_SYNC=1` does not move it, because the order is
+    /// semantically wrong rather than racy).
+    ///
+    /// ⭐ AND [`GroupSize`]'s OWN DOC ALREADY RECORDED THE SYMPTOM WITHOUT NAMING IT: `solo_diff` is
+    /// 8,8,8,8,8 at `g = 128` and 7,6,7 at `g = 512`, "so the partition into compile groups is the only
+    /// variable, and it changes the answer". A partition that changes the answer is this: at 512 more of
+    /// the fold fits one group. The fix is not a bigger `g` — a bigger `g` only moves which contexts are
+    /// wrong — it is that this run is never cut.
+    ///
+    /// ⛔ ONE RULE FOR BOTH FOLDS, deliberately. Gating on "does this bundle gather" would put the
+    /// decision in a second place (the trip carries no gather bit, so it would have to be threaded), and
+    /// the ungathered fold loses nothing by it: fewer groups is fewer launches.
+    fn run_may_be_chunked(self) -> bool {
+        !matches!(self, GroupKind::PageFold)
+    }
 }
 
 impl Trip {
@@ -2093,7 +2125,16 @@ pub fn group_ranges(trips: &[Trip], g: usize) -> Vec<core::ops::Range<usize>> {
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
-        while end < n && cnt < g && trips[start].fusable_with(&trips[end]) {
+        // ⛔ THE CAP IS PER KIND — see [`GroupKind::run_may_be_chunked`]. A `PageFold` run is ONE group
+        // however long it is, because a group is the unit of the `reps` relaunch and the launch loop is
+        // group-major: cutting it makes every pass of the second group read the scratch the first group
+        // left at its LAST pass.
+        let cap = if trips[start].kind.run_may_be_chunked() {
+            g
+        } else {
+            usize::MAX
+        };
+        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
             end += 1;
             cnt += 1;
         }
@@ -2132,12 +2173,21 @@ pub fn group_ranges_cover_ok(trips: &[Trip], g: usize) -> (usize, bool) {
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
-        while end < n && cnt < g && trips[start].fusable_with(&trips[end]) {
+        // Byte-identical to `group_ranges`: the cap is per kind.
+        let cap = if trips[start].kind.run_may_be_chunked() {
+            g
+        } else {
+            usize::MAX
+        };
+        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
             end += 1;
             cnt += 1;
         }
         ok &= start == expect;
-        ok &= (end - start) <= g; // group ≤ g
+        // ⛔ THE SIZE INVARIANT IS NOW PER KIND TOO, and a `PageFold` run has NO size bound — it must be
+        // one group at any length (`GroupKind::run_may_be_chunked`). Keeping `<= g` here would make the
+        // proof contradict the walk it is the twin of.
+        ok &= (end - start) <= cap; // group ≤ its kind's cap
         ok &= end > start; // non-empty ⇒ the walk advances ⇒ terminates
         expect = end;
         i = end;

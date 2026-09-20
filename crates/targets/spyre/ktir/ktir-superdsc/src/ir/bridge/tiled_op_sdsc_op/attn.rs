@@ -359,9 +359,19 @@ impl BlockNests {
 /// [`crate::sdsc_abstract::GatherScratch::kernel_row_off`].
 #[derive(Clone, Copy)]
 struct GatheredFold {
-    scratch: crate::sdsc_abstract::GatherScratch,
-    /// WHICH 64-slot window of the pass these ops read — the same `SlotWindow` the block's own name and
-    /// mask slab come from, so the kernel row and the mask column block cannot describe different slots.
+    scratch: crate::sdsc_abstract::PageScratch,
+    /// The pool, because the gathered kernel base IS the pool's own address plus a request row — see
+    /// [`crate::sdsc_abstract::PageScratch::coord_off`]. Carrying it means this type composes no address
+    /// arithmetic of its own.
+    pool: crate::sdsc_abstract::PagedKvPool,
+    /// WHICH 64-slot window of the PAGE these ops read — the same `SlotWindow` the block's own name and
+    /// mask slab come from, so the kernel column block and the mask column block cannot describe
+    /// different slots.
+    ///
+    /// ⭐ THE WINDOW SURVIVES THE GRANULARITY CHANGE, AND ONLY THE GATHER'S GRANULARITY CHANGED. The
+    /// scratch now holds a whole PAGE per request, so the fold's tile stays a 64-slot window read OUT of
+    /// that page — exactly as the UNGATHERED legs already read one out of the pool. That is why the sweep,
+    /// the mask blocking and the online-softmax state are untouched by this change.
     window: SlotWindow,
 }
 
@@ -371,27 +381,46 @@ impl GatheredFold {
     fn requests(self) -> u32 {
         self.scratch.mq()
     }
-    /// The KERNEL BASE for (this window, kv head `kvh`, request `r`) — one scratch row, refused unless
-    /// the op's declared kernel is exactly that row. Both legs take it: the Kᵗ and V scratches carry the
-    /// same row order, which is why ONE index table fills both.
+    /// ⭐⭐⭐⭐⭐ THE KERNEL BASE for (this window, kv head `kvh`, request `r`) — **the POOL'S OWN ADDRESS
+    /// plus request `r`'s row**, with no arithmetic spelled here.
+    ///
+    /// ⛔ WHAT THIS REPLACES, AND WHY THE OLD FORM WAS THE BUG. It was `GatherScratch::kernel_row_off`,
+    /// which re-derived the window term against a scratch whose rows were 64-slot blocks — a SECOND
+    /// derivation of where a window lives, beside [`crate::sdsc_abstract::PagedKvPool::addr`]'s. At page
+    /// granularity the scratch row is a byte-for-byte copy of the page plane, so the base is the same
+    /// `KvCoord` the ungathered closures build, offset by `r * cols`. One law, both paths.
+    ///
+    /// `plane` is the operand's own plane: the score leg reads Kᵗ, the value leg V. Passing it means the
+    /// two legs cannot silently read one plane's arrangement at the other's offset.
     fn kernel_off(
         self,
         kvh: crate::sdsc_abstract::KvHead,
         r: u32,
-        k: MatK,
-        n: MatN,
+        plane: crate::sdsc_abstract::KvPlane,
     ) -> Result<crate::addr::DevOff, SuperDscError> {
-        self.scratch
-            .kernel_row_off(kvh.get(), self.window.index(), r, k, n)
+        let coord =
+            crate::sdsc_abstract::KvCoord::block(plane, kvh).at_slot(self.window.first_slot());
+        let off = self
+            .scratch
+            .coord_off(r, &self.pool, coord)
             .ok_or_else(|| {
                 SuperDscError(format!(
-                    "the collapsed fold's kernel for (kv head {}, window {}, request {r}) is not one \
-                     scratch row: the op declares in*out = {} where a row is {}. A kernel wider than a \
-                     row reads into the NEXT request's block — fluent, wrong, no fault.",
+                    "the collapsed fold's kernel for ({plane:?}, kv head {}, window {}, request {r}) is \
+                     outside the gathered scratch: the scratch holds {} request row(s) of {} element(s). \
+                     A base past a row reads into the NEXT request's page — fluent, wrong, no fault.",
                     kvh.get(),
                     self.window.index(),
-                    k.get() * n.get(),
+                    self.scratch.rows(),
                     self.scratch.cols(),
+                ))
+            })?;
+        u32::try_from(off)
+            .map(crate::addr::DevOff::from_view_step)
+            .map_err(|_| {
+                SuperDscError(format!(
+                    "the gathered kernel base for ({plane:?}, kv head {}, request {r}) is {off} \
+                     elements, which does not fit the descriptor's offset width",
+                    kvh.get(),
                 ))
             })
     }
@@ -940,7 +969,7 @@ fn assemble_attn_block(
                     // page. Shared across the group's `y`, as it ships — the group's four heads read the
                     // same kv head's Kᵗ.
                     &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
-                    gf.kernel_off(kvh, r, k, n)?,
+                    gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::Kt)?,
                     &rb(sc, rows_n, width_n),
                     rn.score_rows(h0, width).off(),
                     &mask_h,
@@ -1360,10 +1389,12 @@ fn assemble_attn_block(
                     bmm_form,
                     &rb(expb, rows_n, width_n),
                     rn.score_rows(h0, width),
-                    // ⭐ THE V SCRATCH AS THE KERNEL: `[64 slots, hd]`, so the declared row count is ONE
-                    // WINDOW where the pool's read declares a whole page (`PAGE_SLOTS`).
+                    // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS NOW THE PAGE — the scratch row
+                    // is a byte-for-byte copy of the V page plane, so `v_stride` is the pool's own
+                    // `PAGE_SLOTS` on both the gathered and ungathered paths. It used to be ONE WINDOW,
+                    // which is what made the gathered geometry differ from the pool's at all.
                     &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
-                    gf.kernel_off(kvh, r, k, n)?,
+                    gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V)?,
                     &rb(run_o, rows_n, hd),
                     rn.head_major(h0, 0),
                     fold_addend.as_ref().map(|a| (a, rn.head_major(h0, 0))),
@@ -2173,15 +2204,17 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // one combinator is what clippy's `manual_option_zip` asks for (`-D warnings` is the CI gate, and
     // `#[allow]` is not available). `of_fold_pass` is pure arithmetic over the pool's two extents, so
     // evaluating it for a caller with no index costs nothing and decides nothing.
-    let gather = kv_block_index.zip(crate::sdsc_abstract::GatherScratch::of_fold_pass(
-        pool,
-        // THE WINDOWS ONE PASS REALLY SWEEPS, from the same `count_in` the fold's own block loop
-        // takes its iteration from — so the scratch cannot be sized for a different `nb` than the
-        // number of blocks that read it. Sizing by `nkvh * mq` (dropping `nb`) is the recorded
-        // under-reservation whose overrun is the next tensor's bytes read as block numbers.
-        SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)),
-        width.mq(),
-    ));
+    // ⭐⭐⭐⭐⭐ PAGE GRANULARITY: THE WINDOW COUNT IS NOT AN ARGUMENT ANY MORE, AND THAT IS THE FIX.
+    //
+    // `of_fold_pass` took `SlotWindow::count_in(active_cap)` because a scratch ROW was a 64-slot window, so
+    // the row count carried `nb` — and the emitter's `nb` (its body's ladder rung) and the host's (the
+    // CEILING rung) are DIFFERENT NUMBERS, which is the recorded defect that made every kv head above the
+    // first read another head's page block. `PageScratch` holds ONE WHOLE PAGE PER REQUEST, so its extent
+    // is `mq` alone: a quantity both sides read off the same rung, with no window in it to disagree about.
+    //
+    // A head dim above one stick is no longer a refusal either — a whole page plane is contiguous at every
+    // stick-multiple `hd` (`zz_a_whole_page_plane_is_contiguous_at_every_head_dim`), so hd=128 gathers.
+    let gather = kv_block_index.zip(crate::sdsc_abstract::PageScratch::of_pass(pool, width.mq()));
     // The two scratches' spellings, and their FULL footprints declared up front — the same discipline as
     // every other synthetic here: a name that reaches its first access undeclared is a build panic, and a
     // shape declared smaller than the ops write aliases whatever the allocator handed out next.
@@ -2381,22 +2414,27 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // kernel PITCH, the per-head base OFFSET and the `y` step — are one decision per plane instead of four
     // at the call site. The scratch's pitch is ONE WINDOW on both planes (`[hd,64]` for Kᵗ, `[64,hd]` for
     // V), where the pool's are a whole page.
-    let (kt_src, kt_pitch) = match gather {
-        Some(_) => (
-            gkt.as_str(),
-            crate::sdsc_abstract::KtKernelPitch::of_gather_window(SlotWindow::SLOTS),
-        ),
-        None => (kct, crate::sdsc_abstract::PagedKvPool::KT_KERNEL_PITCH),
+    // ⭐⭐⭐⭐⭐ THE PITCHES ARE NOW THE POOL'S ON BOTH PATHS, AND ONLY THE TENSOR NAME DIFFERS.
+    //
+    // A page-granular scratch row is a byte-for-byte copy of the page plane, so the gathered operand's
+    // GEOMETRY IS the pool's — same declared pitch, same internal arrangement, and (via
+    // `PageScratch::coord_off`) the same address law offset by one request row. There is nothing left for
+    // a `Some` arm to declare differently.
+    //
+    // ⛔ WHAT THIS REPLACES WAS THE WHOLE BUG SURFACE. The gathered arms used to declare ONE WINDOW
+    // (`[hd,64]` for Kᵗ, `[64,hd]` for V) where the pool declares a whole page — a second geometry, whose
+    // window term was re-derived in `kernel_row_off` rather than taken from `PagedKvPool::addr`. Two
+    // geometries for one read is what let the emitter's `nb` and the host's disagree.
+    let kt_src = match gather {
+        Some(_) => gkt.as_str(),
+        None => kct,
     };
-    let (v_src, v_pitch) = match gather {
-        // The V scratch row is `[64 slots, hd]`, so its declared ROW count is the window's slots —
-        // reached through the window's own typed slot count, not spelled as 64.
-        Some(_) => (
-            gv.as_str(),
-            BlockCols::of_slot_window(SlotWindow::SLOTS).get(),
-        ),
-        None => (vc, crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32),
+    let kt_pitch = crate::sdsc_abstract::PagedKvPool::KT_KERNEL_PITCH;
+    let v_src = match gather {
+        Some(_) => gv.as_str(),
+        None => vc,
     };
+    let v_pitch = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
     // Windows ONE launch folds. `active_cap` is the sk_bucket rung as before, and the page equals the
     // pre-paged capacity, so this is bit-for-bit the baseline's fold; contexts past one page cost
     // additional LAUNCHES of this same group, never a wider sweep. The `active_cap / 64` lives in
@@ -2564,7 +2602,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // above the loop: the kernel base an op reads is the scratch row for (kv head, THIS window,
             // request), the same window whose mask slab and block name this call already carries. A value
             // hoisted out of the loop would give every window window 0's kernel rows.
-            gather.map(|(_, scratch)| GatheredFold { scratch, window: w }),
+            gather.map(|(_, scratch)| GatheredFold {
+                scratch,
+                pool,
+                window: w,
+            }),
             &bufs,
             sym_id_base,
             layout,

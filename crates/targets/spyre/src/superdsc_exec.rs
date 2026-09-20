@@ -2193,7 +2193,19 @@ impl Executor {
                     // ⛔ ONE WRITE, and it must reach the fd BEFORE the submit: an abort from senlib's
                     // monitor thread takes the process down with no unwinding, so a buffered line is a
                     // line that never existed. Same single-`format!` discipline as `[progverify]`.
-                    let one = format!("[mark] op[{}] rep={rep} {}\n", op.index, op.label());
+                    // ⭐ THE SEGMENT SHIFTS RIDE THE MARK. A gathered fold's index lives in seg3 and
+                    // moves ONLY by `delta.mask`, so "did the host shift pass p's index" is answered
+                    // by this line and nothing else — `[gather]` prints the TABLE, not the base.
+                    let one = format!(
+                        "[mark] op[{}] rep={rep} seg0+{} seg2+{} seg3+{} gathered={} pf={} {}\n",
+                        op.index,
+                        off[SEG_INTERMEDIATE.get()],
+                        off[SEG_KV.get()],
+                        off[SEG_MASK.get()],
+                        op.kv.gathered,
+                        op.kv.page_fold,
+                        op.label()
+                    );
                     eprint!("{one}");
                 }
 
