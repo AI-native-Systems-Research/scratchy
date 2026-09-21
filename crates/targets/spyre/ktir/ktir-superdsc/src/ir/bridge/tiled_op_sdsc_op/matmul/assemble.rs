@@ -44,15 +44,112 @@ pub fn assemble_matmul_seeded(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    try_assemble_matmul_seeded(op_name, m, n, k, batch, a, w, o, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
+}
+
+/// [`assemble_matmul_seeded`] AS A `Result` — the form a producer-facing entry point needs, exactly as
+/// [`crate::emit::try_assemble_transpose`] is that form for the transpose door.
+///
+/// ⛔ THE PANIC IS RIGHT FOR THE ASSEMBLERS AND WRONG FOR THE DOOR, and this matmul is now the second
+/// op to show why. Inside a `#[forward]` expansion a panic IS the build error, which is what
+/// `assemble_matmul`'s own doc means by "a panic here is a true internal-consistency bug, not
+/// reachable from model input" — true of the SUB-STICK witness it names. It is NOT true of the
+/// PLACEMENT-FOOTPRINT refusal `resolve_seg_base` raises, which is reachable from the caller's own
+/// buffer SIZING and was reached twice this session by a KTIR producer whose parameters are a Triton
+/// kernel's descriptors. Reported as a panic it exits 101 with no stage label, so a driver that
+/// tabulates its own `REFUSED <stage> <message>` lines shows a footprint mismatch as a BLANK ROW
+/// rather than as a failure — a reporting hole precisely where the report has to be trusted.
+///
+/// The panicking form keeps its signature and its panic for every existing caller, and now delegates
+/// here so there is ONE emission path rather than two that could drift.
+#[allow(clippy::too_many_arguments)]
+pub fn try_assemble_matmul_seeded(
+    op_name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    batch: u32,
+    a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    w: &Stk<crate::sdsc_abstract::KernelTag>,
+    o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    // ⛔ THE OCCUPANCY PAD IS ONLY REAL IF SOMETHING RESERVED IT — see
+    // [`out_width_the_weight_holds`]. A no-op for every caller whose layout reserves the padded
+    // weight; it drops the pad for a producer whose weight is the CALLER'S OWN tensor.
+    let n = out_width_the_weight_holds(layout, w.name(), m, n, k);
     // TYPED OPERANDS (compile-time addressing safety): a matmul's activation is RowBlocked, its weight
     // is a Kernel, its output is RowBlocked — a `cargo build` type error otherwise (you cannot hand a
     // `Flat`/`RowScalar` tensor here). The handles carry only the emitter NAME into `matmul_opspec`
     // (which owns df/shape), so the emit is byte-identical — the types are a pure addressing guard.
-    let op = matmul_opspec(m, n, k, batch, a.name(), w.name(), o.name())
-        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    let op = matmul_opspec(m, n, k, batch, a.name(), w.name(), o.name())?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"))
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
+}
+
+/// ⛔⛔⛔ THE `out` WIDTH THE LAYOUT ACTUALLY RESERVED FOR THIS MATMUL'S WEIGHT — because an
+/// OCCUPANCY PAD IS ONLY REAL IF SOMETHING MADE IT REAL.
+///
+/// `DeviceWidth::for_output` pads a FLOP-heavy matmul's `out` stick count so the gemm fills cores
+/// (`bump_sticks_to_splittable`), and the emitted kernel then MAC's over `[in, out_padded]`. Those
+/// invented columns are legal only because a SECOND party makes them exist: the worker zero-pads the
+/// staged weight by this same rule (`spyre_load`'s `n_dev`) and the bundle layout reserves the padded
+/// footprint for it, so the placement is as wide as the access.
+///
+/// A KTIR producer whose parameters are the CALLER'S OWN TENSORS has no staging pass. A Triton
+/// kernel's `desc_wg` is a `[D_FF, D_MODEL]` buffer the host hands over as-is, and the layout sizes
+/// its placement from exactly that view. The pad is then width nobody made, and the kernel reads past
+/// the weight — MEASURED as `resolve_seg_base`'s own refusal, at both blockings of the SwiGLU MLP:
+///
+/// ```text
+///   m=64  n=256   k=128   → n_dev 512    t1: 0B + 131072B    exceeds footprint 65536B    (seg1)
+///   m=64  n=12800 k=4096  → n_dev 14336  t1: 0B + 117440512B exceeds footprint 104857600B (seg1)
+/// ```
+///
+/// (Not a constant factor — 2× and 1.12× — because the two shapes take DIFFERENT arms of the bump:
+/// 4 sticks is rounded to the ≥8-core floor, 200 sticks takes the full-occupancy arm to 224.)
+///
+/// ⛔ AND IT ONLY EVER DROPS A PAD IT CAN PROVE IS THIS RULE'S OWN. `held` is the whole-stick width
+/// the reserved footprint holds; it is used ONLY when re-applying the padding rule to `held`
+/// reproduces the `n` we were handed. Any other shortfall is a REAL over-run — a wrong shape, a
+/// mis-sized placement — and `n` is returned UNCHANGED so the footprint guard still refuses it BY
+/// NAME instead of being quietly satisfied by a narrower emission. The util floor is re-checked at
+/// `held` for the same reason: the caller's guard #11 measured the PADDED width, so a `held` that
+/// would strand the gemm is left to that refusal rather than emitted below the floor.
+///
+/// A no-op wherever the layout reserves the padded weight (`held == n`), so the full-model path —
+/// including the granite lm_head, the one weight whose stick count needs the pad — is byte-identical.
+fn out_width_the_weight_holds(
+    layout: Option<&BundleLayout>,
+    w_name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+) -> u32 {
+    use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK};
+    let Some(l) = layout else { return n };
+    let Some(crate::place::PlaceId::Act(tid)) = l.id_of(w_name) else {
+        return n;
+    };
+    let Some(p) = l.placements.get(&tid) else {
+        return n;
+    };
+    // The weight buffer is the `out`-major `[n, k]` one this door's `KtirFunc::matmul` views (the
+    // transposed-weight `indexing_maps`), and a placement is sized by `synth_footprint_bytes`: the
+    // INNER axis stick-rounded, the outer multiplied. So one `out` row costs a stick-rounded `k`.
+    let row_bytes = k.next_multiple_of(FP16_ELEMS_PER_STICK) as u64 * 2; // fp16 kernel
+    if row_bytes == 0 {
+        return n;
+    }
+    let held = ((p.size / row_bytes) as u32 / FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK;
+    let floor_ok = CoreSplit::plan(m, held).ncores() >= 8;
+    if held < n && held > 0 && floor_ok && DeviceWidth::for_output(m, held, k).get() == n {
+        held
+    } else {
+        n
+    }
 }
 
 /// [`assemble_matmul_seeded`] with an INJECTABLE work-division `splitter` — the Kani-verified tower's
@@ -610,4 +707,116 @@ pub fn assemble_matmul_batched_off<O: crate::sdsc_abstract::KindTag>(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_matmul_batched_off {op_name}: {e}"))
+}
+
+/// THE CONTROL SET FOR [`out_width_the_weight_holds`], and the reason it is not vacuous.
+///
+/// ⛔⛔⛔ THE GUARD UNDER TEST EXISTS BECAUSE AN INVENTED WIDTH IS A SILENT WRONG ANSWER, so a
+/// test that only pins "it narrows" would be satisfied by a function that narrows ALWAYS — which is
+/// the opposite defect and just as silent. Three cases, and each moves exactly ONE thing:
+///
+/// | case | weight footprint | holds | verdict | what it pins |
+/// |---|---|---|---|---|
+/// | (a) | 65536 B | 256 cols | caps to **256** | the pad was fictional, so it is dropped |
+/// | (b) | 131072 B | 512 cols | keeps **512** | the pad was REAL, so nothing moves |
+/// | (c) | 16384 B | 64 cols | keeps **512** | the shortfall is NOT this rule's pad — left to the footprint guard |
+///
+/// (a)→(b) moves only the footprint and must flip the verdict, so the cap cannot be unconditional.
+/// (a)→(c) moves only the footprint again and must flip it BACK, so the cap cannot be "narrow to
+/// whatever is there": [`DeviceWidth::for_output`] at `(64, 64, 128)` is 64 — its MACs are under the
+/// `2^20` bump floor, so no pad is applied — which does not reproduce the 512 we were handed. That is
+/// a real over-run, and it must still reach `resolve_seg_base` and be refused BY NAME rather than
+/// quietly satisfied by a narrower descriptor computing fewer columns than the program states. Drop
+/// the reproduction check and (c) goes red while (a) and (b) stay green.
+///
+/// The shape is the MEASURED one: `m=64 n=256 k=128` is the small SwiGLU MLP blocking, whose
+/// `for_output` bumps 4 sticks to the 8-core floor (`n_dev 512`) and whose weight the caller supplies
+/// at its logical `[256, 128]` — the emission that asked for `0B + 131072B` of a 65536 B buffer.
+///
+/// ⚠️ WHAT (b) ACTUALLY DISCRIMINATES, MEASURED BY MUTATION RATHER THAN ASSUMED. (b) does NOT
+/// catch a cap that narrows unconditionally: at (b) the held width EQUALS `n`, so returning `held`
+/// and returning `n` are the same answer, and a mutant with `held < n` and the reproduction check
+/// both deleted leaves (b) green (it is (c) that goes red there). What (b) catches is a `held`
+/// computed WRONG — proven by mutating this function's hardcoded two-bytes-per-element to four,
+/// which turns (b) red. That is not a hypothetical mutation: it is precisely the latent fp8 hazard
+/// this function's own doc names, where a packed one-byte weight makes the same arithmetic compute
+/// a held width twice the truth. So (b) is the guard on the FOOTPRINT ARITHMETIC, and (c) is the
+/// guard on the narrowing CONDITION.
+#[cfg(test)]
+mod out_width_caps {
+    use super::*;
+    use crate::place::{PlaceId, act_name};
+    use crate::placement::{SegRole, TensorPlacement};
+
+    /// The measured small-MLP contraction: `[64, 128] · [128, 256]`, whose device `out` width is the
+    /// 8-stick occupancy floor rather than the logical 4 sticks.
+    const M: u32 = 64;
+    const K: u32 = 128;
+    const N_DEV: u32 = 512;
+
+    /// A layout in which `t1` — the weight — has exactly `size` bytes reserved. Only the two things
+    /// the guard reads are populated: the name→id map behind `id_of`, and the placement's `size`.
+    fn layout_holding(size: u64) -> BundleLayout {
+        let mut l = BundleLayout::default();
+        l.ids.borrow_mut().insert(act_name(1), PlaceId::Act(1));
+        l.placements.insert(
+            1,
+            TensorPlacement {
+                tid: 1,
+                role: SegRole::Weight,
+                segment: 1,
+                bank: 0,
+                offset: 0,
+                size,
+            },
+        );
+        l
+    }
+
+    /// The width the guard returns for a weight placement of `size` bytes.
+    fn width_for(size: u64) -> u32 {
+        let l = layout_holding(size);
+        out_width_the_weight_holds(Some(&l), &act_name(1), M, N_DEV, K)
+    }
+
+    /// ⛔ CASE (a) — THE MEASURED OVER-RUN. The weight is the caller's own `[256, 128]` tensor, so the
+    /// layout reserved `256 · 128 · 2 = 65536` B and nobody made the pad real. The emitted kernel must
+    /// MAC over the 256 columns that exist, not the 512 the occupancy rule invented.
+    #[test]
+    fn an_under_reserved_weight_caps_the_out_width_at_what_it_holds() {
+        assert_eq!(
+            width_for(256 * 128 * 2),
+            256,
+            "a weight whose placement holds 256 columns cannot be read at 512 — that is the \
+             measured `0B + 131072B exceeds footprint 65536B` refusal"
+        );
+    }
+
+    /// ⭐ CASE (b) — THE CONTROL THAT MAKES (a) NON-VACUOUS. The full-model path DOES reserve the
+    /// padded weight (the worker zero-pads the staged bytes by this same rule), so the cap must be a
+    /// no-op there. If this ever fails, the fix has started narrowing the shipping emission — which
+    /// the 8b fp16 emitted-bundle fingerprint would also catch, far later and far more expensively.
+    #[test]
+    fn a_fully_reserved_weight_keeps_the_padded_width() {
+        assert_eq!(
+            width_for(u64::from(N_DEV) * 128 * 2),
+            N_DEV,
+            "when the layout reserves the padded weight the pad is REAL and nothing may move"
+        );
+    }
+
+    /// ⛔ CASE (c) — A SHORTFALL THAT IS NOT THIS RULE'S PAD IS NOT QUIETLY SATISFIED. One stick of
+    /// weight under a 512-column access is a mis-sized placement or a wrong shape, not an occupancy
+    /// pad: re-padding 64 gives 64 (its MACs are below the `2^20` bump floor), which does not
+    /// reproduce 512. So `n` comes back UNCHANGED and the footprint guard still gets to refuse it by
+    /// name. A version of this function without the reproduction proof returns 64 here, and this test
+    /// is the only thing that notices.
+    #[test]
+    fn a_shortfall_that_is_not_this_rules_pad_is_left_to_the_footprint_guard() {
+        assert_eq!(
+            width_for(64 * 128 * 2),
+            N_DEV,
+            "64 does not re-pad to 512, so this is a real over-run and must NOT be narrowed away"
+        );
+    }
 }

@@ -813,6 +813,231 @@ pub fn rmsnorm(
     ))
 }
 
+/// THE POINTWISE DEVICE-WIDTH PAD, CAPPED AT THE WIDTH THE OUTPUT'S PLACEMENT ACTUALLY HOLDS.
+///
+/// # THE SECOND INSTANCE OF A NAMED CLASS, NOT A ONE-OFF
+///
+/// [`DeviceWidth::for_pointwise`] pads a ScalarMul's column count to a stick count the gemm can split
+/// across cores. That pad is width a SECOND PARTY has to make real: for the lm-head logits it IS real,
+/// because the producer matmul emitted the padded width and the bundle layout reserved the padded
+/// footprint. For an INTERMEDIATE that a producer mints at its logical 2-D shape, nobody reserved it —
+/// so the descriptor addresses past the buffer.
+///
+/// This is exactly the defect `2c5abe0a5` fixed for the matmul's `out` width
+/// ([`super::super::ir::bridge::tiled_op_sdsc_op::matmul::assemble`]'s `out_width_the_weight_holds`),
+/// and W1's invented-width audit PREDICTED this site before any config reached it: "`for_pointwise` …
+/// INVENTED, and WORSE than the matmul's: it is UNCONDITIONAL — no `macs >= 2^20` gate, so it pads
+/// every ScalarMul. NOT REACHABLE TODAY … Same fix shape (cap at the OUTPUT placement's whole-stick
+/// width) … the width is chosen at the read-only call site and I cannot construct a config that
+/// reaches it, so I did not change it."
+///
+/// ⚠️ THE CONFIG THAT MEASURED IT IS NOT IN THIS BRANCH, AND THAT IS STATED RATHER THAN ELIDED. The
+/// over-run was measured through the multi-op whole-function door, which is staged and lands with its
+/// first caller: `decoder_layer_one_flat`'s `qk · QK_SCALE` writes a `[64, 64]` intermediate,
+/// `for_pointwise` bumps 64 columns to 512 (eight sticks), and the emission asked for `0B + 65536B` of
+/// a buffer declared `8192B` — caught by `resolve_seg_base`'s footprint guard as "would alias the next
+/// intermediate". On the per-`Program` path this crate takes today the cap is a PROVEN NO-OP (see the
+/// reproduction rule below), which is the whole reason it is safe to land ahead of that door.
+///
+/// # WHY HERE AND NOT IN THE ASSEMBLER
+///
+/// W1 named `assemble_pointwise_broadcast_off_from_tile` because the call site was read-only to it.
+/// Both are ours now, and the width is CHOSEN here — it is baked into the `TileOp` two lines below, so
+/// capping at the point of choice keeps the `TileOp` and the assembler in agreement by construction
+/// rather than by two matching adjustments.
+///
+/// # ⛔ IT ONLY EVER DROPS A PAD IT CAN PROVE IS THIS RULE'S OWN
+///
+/// The same discipline that makes the matmul's version safe: the reserved width is re-padded and must
+/// REPRODUCE the width handed in. So a genuine over-run — an emission wider than the placement for any
+/// other reason — still reaches the footprint guard and is refused BY NAME, rather than quietly
+/// satisfied by a narrower descriptor that computes fewer columns than the program states. And it is a
+/// no-op wherever the layout does reserve the pad, which is the lm-head logits case the rule exists
+/// for.
+fn pointwise_width_the_output_holds(
+    layout: Option<&BundleLayout>,
+    names: &[&str],
+    rows: u32,
+    cols: u32,
+) -> u32 {
+    let Some(l) = layout else { return cols };
+    if rows == 0 {
+        return cols;
+    }
+    // ⭐ EVERY TENSOR THE OP ADDRESSES AT `cols`, NOT JUST THE OUTPUT. `cols` sizes the input view and
+    // the output view alike, so the pad is only real if BOTH hold it — and MEASURED, the one that did
+    // not was the INPUT: the guard fired on `synth 't32'` (the `qk` intermediate this op reads) while
+    // the output `t33` was a separate buffer. Taking the narrowest is what makes the check about the
+    // emission rather than about one operand of it.
+    //
+    // ⛔ AND IT READS THE SYNTH ALLOCATOR AS WELL AS `placements`. An INTERMEDIATE is declared through
+    // `BundleLayout::synth`, which records its footprint in `SynthAlloc::sizes` and NOT in
+    // `placements` — `resolve_seg_base`'s case 2, "the name is in the synth allocator's map". Reading
+    // only `placements` found nothing for exactly the tensors this cap exists for, so the cap silently
+    // did not fire; the first version of this function had that bug and a footprint guard caught it.
+    let held_of = |name: &str| -> Option<u32> {
+        let bytes = match l.id_of(name) {
+            Some(crate::place::PlaceId::Act(tid)) => l
+                .placements
+                .get(&tid)
+                .map(|p| p.size)
+                .or_else(|| l.synth.borrow().sizes.get(name).copied()),
+            _ => l.synth.borrow().sizes.get(name).copied(),
+        }?;
+        // A footprint is `synth_footprint_bytes`: the INNER (column) axis stick-rounded, the outer
+        // multiplied. So one row costs a stick-rounded column count, and the width the buffer holds is
+        // its size divided by the rows, in whole fp16 sticks.
+        let row_bytes = (bytes / rows as u64).max(1);
+        Some(((row_bytes / 2) as u32 / FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK)
+    };
+    let Some(held) = names.iter().filter_map(|n| held_of(n)).min() else {
+        return cols;
+    };
+    // THE PROOF: re-pad what the layout holds and require it to REPRODUCE the width we were about to
+    // emit. Only then is the excess demonstrably this rule's own pad; anything else is a genuine
+    // over-run and must still reach the footprint guard and be refused BY NAME, rather than be quietly
+    // satisfied by a narrower descriptor computing fewer columns than the program states.
+    if held > 0 && held < cols && DeviceWidth::for_pointwise(held).get() == cols {
+        held
+    } else {
+        cols
+    }
+}
+
+/// THE CONTROL SET FOR [`pointwise_width_the_output_holds`], the pointwise twin of
+/// `out_width_the_weight_holds`'s.
+///
+/// ⛔⛔⛔ SAME DISCIPLINE, SAME REASON: a test that only pins "it narrows" is satisfied by a
+/// function that narrows ALWAYS, which is the opposite silent wrong answer. Each case moves exactly
+/// one thing:
+///
+/// | case | `cols` asked | footprint | holds | verdict | what it pins |
+/// |---|---|---|---|---|---|
+/// | (a) | 512 | 8192 B | 64 | caps to **64** | the measured over-run: the pad was fictional |
+/// | (b) | 512 | 65536 B | 512 | keeps **512** | the pad was REAL — the lm-head logits case |
+/// | (c) | 1024 | 65536 B | 512 | keeps **1024** | 512 does not re-pad to 1024, so it is a real over-run |
+/// | (d) | 512 | out 65536 B / in 8192 B | 64 | caps to **64** | EVERY tensor the op addresses, not just the output |
+///
+/// (a)→(b) moves only the footprint and must flip the verdict. (c) is the case that pins the
+/// reproduction proof specifically: [`DeviceWidth::for_pointwise`] of 512 is 512, which does not
+/// reproduce the 1024 handed in, so the shortfall is a genuine over-run and must reach
+/// `resolve_seg_base` rather than be quietly satisfied. Note (c) has to be taken at a WIDER `cols`
+/// than (a) and (b): below 8 sticks every width re-pads to 512, so at `cols = 512` the reproduction
+/// check cannot be made to fail — which is a real asymmetry with the matmul's version and the reason
+/// this case looks different from `out_width_caps`' case (c).
+///
+/// ⭐ (d) IS THE BUG THIS FUNCTION ALREADY HAD ONCE, in two ways at once: the operand that did not
+/// hold the pad was the INPUT (`synth 't32'`, the `qk` intermediate the op READS) while the output was
+/// a separate, adequately sized buffer — so reading only the output finds nothing; and that input is
+/// declared through [`BundleLayout::synth`], which records its footprint in `SynthAlloc::sizes` and
+/// NOT in `placements` — so reading only `placements` also finds nothing. (d) fails if either the
+/// `.min()` over all names or the synth-allocator fallback is removed.
+///
+/// ⚠️ WHAT (b) ACTUALLY DISCRIMINATES, MEASURED BY MUTATION RATHER THAN ASSUMED — the same finding
+/// as `out_width_caps`'. (b) does NOT catch a cap that narrows unconditionally: at (b) the held width
+/// EQUALS `cols`, so both branches return the same answer, and deleting the narrowing condition
+/// leaves (b) green (it is (c) that goes red). What (b) catches is a `held` computed WRONG — proven by
+/// mutating the two-bytes-per-element divisor to four, which turns (b) red. So (b) guards the
+/// FOOTPRINT ARITHMETIC and (c) guards the narrowing CONDITION; neither substitutes for the other.
+#[cfg(test)]
+mod pointwise_width_caps {
+    use super::*;
+    use crate::place::{PlaceId, act_name};
+    use crate::placement::{SegRole, TensorPlacement};
+
+    /// The measured decoder intermediate: a `[64, 64]` score tile whose 64 columns `for_pointwise`
+    /// bumps to the 8-stick occupancy floor.
+    const ROWS: u32 = 64;
+
+    /// A layout with one PLACED tensor `t1` of `size` bytes — the ordinary activation case.
+    fn placed(size: u64) -> BundleLayout {
+        let mut l = BundleLayout::default();
+        l.ids.borrow_mut().insert(act_name(1), PlaceId::Act(1));
+        l.placements.insert(
+            1,
+            TensorPlacement {
+                tid: 1,
+                role: SegRole::Intermediate,
+                segment: 0,
+                bank: 0,
+                offset: 0,
+                size,
+            },
+        );
+        l
+    }
+
+    /// The width the guard returns for a single placed operand of `size` bytes at `cols`.
+    fn width_for(size: u64, cols: u32) -> u32 {
+        let l = placed(size);
+        pointwise_width_the_output_holds(Some(&l), &[&act_name(1)], ROWS, cols)
+    }
+
+    /// ⛔ CASE (a) — THE MEASURED OVER-RUN. `qk · QK_SCALE` writes a `[64, 64]` tile;
+    /// `for_pointwise` bumps 64 columns to 512, and the buffer is the 8192 B the logical shape needs.
+    /// The emission asked for `0B + 65536B` of it.
+    #[test]
+    fn an_under_reserved_intermediate_caps_the_pointwise_width() {
+        assert_eq!(
+            width_for(64 * 64 * 2, 512),
+            64,
+            "a `[64, 64]` tile holds 64 columns; emitting 512 is the measured \
+             `0B + 65536B exceeds footprint 8192B` refusal"
+        );
+    }
+
+    /// ⭐ CASE (b) — THE CONTROL THAT MAKES (a) NON-VACUOUS, and the case the rule exists FOR: the
+    /// padded lm-head logits, where the producer matmul emitted the padded width and the layout
+    /// reserved it. The cap must be a no-op.
+    #[test]
+    fn a_fully_reserved_tensor_keeps_the_padded_width() {
+        assert_eq!(
+            width_for(u64::from(ROWS) * 512 * 2, 512),
+            512,
+            "when the layout reserves the padded width the pad is REAL and nothing may move"
+        );
+    }
+
+    /// ⛔ CASE (c) — A SHORTFALL THAT IS NOT THIS RULE'S PAD IS LEFT TO THE FOOTPRINT GUARD.
+    /// `for_pointwise(512)` is 512, which does not reproduce the 1024 asked for, so this is a real
+    /// over-run: `cols` comes back unchanged and the refusal happens by name. Remove the reproduction
+    /// check and this returns 512 while (a) and (b) stay green.
+    #[test]
+    fn a_shortfall_that_is_not_this_rules_pad_is_left_to_the_footprint_guard() {
+        assert_eq!(
+            width_for(u64::from(ROWS) * 512 * 2, 1024),
+            1024,
+            "512 does not re-pad to 1024, so this is a real over-run and must NOT be narrowed away"
+        );
+    }
+
+    /// ⭐ CASE (d) — THE NARROWEST OPERAND WINS, AND THE SYNTH ALLOCATOR IS READ. The output `t1` is
+    /// adequately sized; the INPUT is a synthetic intermediate declared only in `SynthAlloc::sizes`
+    /// and holding one stick. `cols` sizes both views, so the pad is only real if BOTH hold it.
+    #[test]
+    fn the_narrowest_operand_wins_including_one_only_the_synth_allocator_knows() {
+        let l = placed(u64::from(ROWS) * 512 * 2);
+        let narrow = "t32_synth";
+        l.synth
+            .borrow_mut()
+            .sizes
+            .insert(narrow.to_string(), 64 * 64 * 2);
+        let out = act_name(1);
+        assert_eq!(
+            pointwise_width_the_output_holds(Some(&l), &[&out, narrow], ROWS, 512),
+            64,
+            "the INPUT is the operand that does not hold the pad, and it lives in the synth \
+             allocator rather than in `placements` — both halves of the bug this once had"
+        );
+        assert_eq!(
+            pointwise_width_the_output_holds(Some(&l), &[&out], ROWS, 512),
+            512,
+            "reading ONLY the output finds nothing wrong, which is why the minimum is taken over \
+             every tensor the op addresses"
+        );
+    }
+}
+
 /// main's `lower_scalarmul_node` (main 10376-10441): an on-device pointwise `mul` by the bound
 /// `[1,1]` scale const.
 ///
@@ -860,7 +1085,15 @@ pub fn scalarmul(
     // device width its producer matmul emitted (49664), not the logical 49159 (whose sub-stick 7 the dxp
     // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
     // for 64-aligned tensors (residual/embedding [.,4096]).
-    let cols = DeviceWidth::for_pointwise(out.c_len).get();
+    //
+    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — capped at the width the OUTPUT's placement
+    // actually holds. See [`pointwise_width_the_output_holds`].
+    let cols = pointwise_width_the_output_holds(
+        layout,
+        &[&out_name, &x],
+        rows,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    );
     let scale_name = crate::place::act_name(scalarmul_scale_tid(idx));
     let op_name = format!("scalarmul_o{}", out.tid);
     let x_h = rbo(&x);

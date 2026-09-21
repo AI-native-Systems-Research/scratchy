@@ -24,7 +24,7 @@ pub use assemble::{
     assemble_matmul_off, assemble_matmul_off_maybe_epilogue, assemble_matmul_off_phys_m,
     assemble_matmul_off_phys_m_maybe_epilogue, assemble_matmul_off_phys_m_with_epilogue,
     assemble_matmul_off_with_epilogue, assemble_matmul_placed, assemble_matmul_seeded,
-    assemble_matmul_split,
+    assemble_matmul_split, try_assemble_matmul_seeded,
 };
 pub use opspec::{
     matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
