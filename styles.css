@@ -29,12 +29,13 @@ cds-header-nav-item:not(:defined),
 cds-tile:not(:defined),
 cds-clickable-tile:not(:defined),
 cds-button:not(:defined),
+cds-header-global-action:not(:defined),
 cds-code-snippet:not(:defined),
 cds-side-nav:not(:defined),
+cds-side-nav-items:not(:defined),
+cds-side-nav-link:not(:defined),
 cds-select:not(:defined),
 cds-checkbox:not(:defined),
-cds-tag:not(:defined),
-cds-structured-list:not(:defined),
 zero-md:not(:defined) {
   visibility: hidden;
 }
@@ -148,10 +149,21 @@ cds-code-snippet {
  * exposed as ::part(prefix), not a CSS hack. */
 cds-header-name::part(prefix) { color: var(--accent); }
 
+/* The GitHub link is a cds-header-global-action with `href` and
+ * `tooltip-text` — it extends CDSButton directly (header defaults: ghost,
+ * lg, tooltip below), so it renders as a real <a>, sized/centered/tinted
+ * exactly like every other header action, no extra module or custom CSS.
+ * The `.cds--header__global` div is Carbon's own light-DOM slotting class
+ * for right-aligning header children. */
+
 .hero-body {
-  max-width: var(--wide);
   margin: 0 auto;
-  padding: 3.5rem 1.5rem 4rem;
+  padding-top: 3.5rem;
+}
+.hero .hero-body {
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
+    padding-bottom: 4rem;
 }
 
 /* Type sizes are Carbon's own scale (--cds-heading-*, --cds-body-*,
@@ -180,7 +192,7 @@ h1 {
 h1 .accent { color: var(--accent); }
 
 .lede {
-  max-width: 44rem;
+  max-width: var(--wide);
   font-size: var(--cds-fluid-paragraph-01-font-size);
   font-weight: var(--cds-fluid-paragraph-01-font-weight);
   line-height: var(--cds-fluid-paragraph-01-line-height);
@@ -232,7 +244,7 @@ h1 .accent { color: var(--accent); }
  * squeezed into a narrow centered column, most visible on phones (that's
  * also why it only showed up on hamburger/side-nav pages — that's the only
  * place <main> ends up nested rather than a direct <body> child). */
-body > main { max-width: var(--wide); margin: 0 auto; padding: 0 1.5rem; }
+body > main { margin: 0 auto; padding: 0 1.5rem; }
 
 /* cds--css-grid sets its own centering/margin/padding, meant for a bare page
  * grid — redundant and doubled-up when nested inside main's own padding. */
@@ -349,22 +361,21 @@ footer .credit {
 }
 
 /* architectures page ---------------------------------------------------------
- * Controls, panes and the ranking list are real Carbon Web Components; what
- * stays here is the diff view, which has no Carbon component. Colors come from
- * the aliases at the top of this file plus --cds-support-success/error for the
+ * The controls and panes are real Carbon Web Components; what stays here is
+ * the diff view, which has no Carbon component. Colors come from the aliases
+ * at the top of this file plus --cds-support-success/error for the
  * added/removed lines, the same pair Carbon uses for success and error status. */
 
+/* .archpage sits inside .docs-content (the shared docs-page container, see
+ * "docs pages" above) so it picks up the same left-margin reservation for
+ * the side-nav rail and the same horizontal gutter as every other page —
+ * it only adds the vertical rhythm specific to this page's own sections. */
 .archpage {
-  max-width: var(--wide);
-  margin: 0 auto;
-  padding: var(--cds-spacing-09) var(--cds-spacing-06) var(--cds-spacing-10);
+  padding: var(--cds-spacing-08) 0 var(--cds-spacing-10);
 }
 
-.archpage h1 {
-  margin: 0 0 var(--cds-spacing-05);
-  font-size: var(--cds-fluid-heading-04-font-size);
-  font-weight: 300;
-  line-height: 1.19;
+.archpage .sub {
+  max-width: 46rem;
 }
 
 .archpage h2 {
@@ -448,36 +459,6 @@ footer .credit {
 .r.add { background: color-mix(in srgb, var(--cds-support-success) 16%, transparent); box-shadow: inset 2px 0 0 var(--cds-support-success); }
 .r.del { background: color-mix(in srgb, var(--cds-support-error) 14%, transparent); box-shadow: inset 2px 0 0 var(--cds-support-error); }
 .r.fill { background: var(--cds-background-hover); }
-
-/* operations summary */
-
-.opsbox { margin: var(--cds-spacing-06) 0 0; display: grid; gap: var(--cds-spacing-03); }
-
-.opsrow {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--cds-spacing-03);
-  font-size: var(--cds-body-01-font-size);
-}
-
-.opslabel {
-  flex: 0 0 9rem;
-  font-family: var(--mono);
-  font-size: var(--cds-label-01-font-size);
-  letter-spacing: 0.32px;
-  color: var(--muted);
-}
-
-.opsrow .none { color: var(--muted); }
-
-/* ranking list */
-
-.archlist { margin-top: var(--cds-spacing-05); }
-.archlist cds-structured-list-cell { font-family: var(--mono); }
-.archlist .an { color: var(--accent); }
-.archlist .num { display: block; text-align: right; }
-.archlist cds-button { margin: calc(-1 * var(--cds-spacing-03)) 0; }
 
 @media (max-width: 900px) {
   .archgrid { grid-template-columns: 1fr; }

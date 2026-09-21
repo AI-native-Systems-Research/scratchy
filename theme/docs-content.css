@@ -10,13 +10,7 @@
 }
 
 .markdown-body {
-  max-width: 46rem;
-  margin: 0 auto;
   padding: 2.5rem 1.5rem 5rem;
-  color: var(--cds-text-primary);
-  background: transparent;
-  font-size: 1rem;
-  line-height: 1.6;
 }
 
 .markdown-body :is(h1, h2, h3, h4, h5, h6) {
