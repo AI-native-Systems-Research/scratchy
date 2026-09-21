@@ -708,3 +708,115 @@ pub fn assemble_matmul_batched_off<O: crate::sdsc_abstract::KindTag>(
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_matmul_batched_off {op_name}: {e}"))
 }
+
+/// THE CONTROL SET FOR [`out_width_the_weight_holds`], and the reason it is not vacuous.
+///
+/// ⛔⛔⛔ THE GUARD UNDER TEST EXISTS BECAUSE AN INVENTED WIDTH IS A SILENT WRONG ANSWER, so a
+/// test that only pins "it narrows" would be satisfied by a function that narrows ALWAYS — which is
+/// the opposite defect and just as silent. Three cases, and each moves exactly ONE thing:
+///
+/// | case | weight footprint | holds | verdict | what it pins |
+/// |---|---|---|---|---|
+/// | (a) | 65536 B | 256 cols | caps to **256** | the pad was fictional, so it is dropped |
+/// | (b) | 131072 B | 512 cols | keeps **512** | the pad was REAL, so nothing moves |
+/// | (c) | 16384 B | 64 cols | keeps **512** | the shortfall is NOT this rule's pad — left to the footprint guard |
+///
+/// (a)→(b) moves only the footprint and must flip the verdict, so the cap cannot be unconditional.
+/// (a)→(c) moves only the footprint again and must flip it BACK, so the cap cannot be "narrow to
+/// whatever is there": [`DeviceWidth::for_output`] at `(64, 64, 128)` is 64 — its MACs are under the
+/// `2^20` bump floor, so no pad is applied — which does not reproduce the 512 we were handed. That is
+/// a real over-run, and it must still reach `resolve_seg_base` and be refused BY NAME rather than
+/// quietly satisfied by a narrower descriptor computing fewer columns than the program states. Drop
+/// the reproduction check and (c) goes red while (a) and (b) stay green.
+///
+/// The shape is the MEASURED one: `m=64 n=256 k=128` is the small SwiGLU MLP blocking, whose
+/// `for_output` bumps 4 sticks to the 8-core floor (`n_dev 512`) and whose weight the caller supplies
+/// at its logical `[256, 128]` — the emission that asked for `0B + 131072B` of a 65536 B buffer.
+///
+/// ⚠️ WHAT (b) ACTUALLY DISCRIMINATES, MEASURED BY MUTATION RATHER THAN ASSUMED. (b) does NOT
+/// catch a cap that narrows unconditionally: at (b) the held width EQUALS `n`, so returning `held`
+/// and returning `n` are the same answer, and a mutant with `held < n` and the reproduction check
+/// both deleted leaves (b) green (it is (c) that goes red there). What (b) catches is a `held`
+/// computed WRONG — proven by mutating this function's hardcoded two-bytes-per-element to four,
+/// which turns (b) red. That is not a hypothetical mutation: it is precisely the latent fp8 hazard
+/// this function's own doc names, where a packed one-byte weight makes the same arithmetic compute
+/// a held width twice the truth. So (b) is the guard on the FOOTPRINT ARITHMETIC, and (c) is the
+/// guard on the narrowing CONDITION.
+#[cfg(test)]
+mod out_width_caps {
+    use super::*;
+    use crate::place::{PlaceId, act_name};
+    use crate::placement::{SegRole, TensorPlacement};
+
+    /// The measured small-MLP contraction: `[64, 128] · [128, 256]`, whose device `out` width is the
+    /// 8-stick occupancy floor rather than the logical 4 sticks.
+    const M: u32 = 64;
+    const K: u32 = 128;
+    const N_DEV: u32 = 512;
+
+    /// A layout in which `t1` — the weight — has exactly `size` bytes reserved. Only the two things
+    /// the guard reads are populated: the name→id map behind `id_of`, and the placement's `size`.
+    fn layout_holding(size: u64) -> BundleLayout {
+        let mut l = BundleLayout::default();
+        l.ids.borrow_mut().insert(act_name(1), PlaceId::Act(1));
+        l.placements.insert(
+            1,
+            TensorPlacement {
+                tid: 1,
+                role: SegRole::Weight,
+                segment: 1,
+                bank: 0,
+                offset: 0,
+                size,
+            },
+        );
+        l
+    }
+
+    /// The width the guard returns for a weight placement of `size` bytes.
+    fn width_for(size: u64) -> u32 {
+        let l = layout_holding(size);
+        out_width_the_weight_holds(Some(&l), &act_name(1), M, N_DEV, K)
+    }
+
+    /// ⛔ CASE (a) — THE MEASURED OVER-RUN. The weight is the caller's own `[256, 128]` tensor, so the
+    /// layout reserved `256 · 128 · 2 = 65536` B and nobody made the pad real. The emitted kernel must
+    /// MAC over the 256 columns that exist, not the 512 the occupancy rule invented.
+    #[test]
+    fn an_under_reserved_weight_caps_the_out_width_at_what_it_holds() {
+        assert_eq!(
+            width_for(256 * 128 * 2),
+            256,
+            "a weight whose placement holds 256 columns cannot be read at 512 — that is the \
+             measured `0B + 131072B exceeds footprint 65536B` refusal"
+        );
+    }
+
+    /// ⭐ CASE (b) — THE CONTROL THAT MAKES (a) NON-VACUOUS. The full-model path DOES reserve the
+    /// padded weight (the worker zero-pads the staged bytes by this same rule), so the cap must be a
+    /// no-op there. If this ever fails, the fix has started narrowing the shipping emission — which
+    /// the 8b fp16 emitted-bundle fingerprint would also catch, far later and far more expensively.
+    #[test]
+    fn a_fully_reserved_weight_keeps_the_padded_width() {
+        assert_eq!(
+            width_for(u64::from(N_DEV) * 128 * 2),
+            N_DEV,
+            "when the layout reserves the padded weight the pad is REAL and nothing may move"
+        );
+    }
+
+    /// ⛔ CASE (c) — A SHORTFALL THAT IS NOT THIS RULE'S PAD IS NOT QUIETLY SATISFIED. One stick of
+    /// weight under a 512-column access is a mis-sized placement or a wrong shape, not an occupancy
+    /// pad: re-padding 64 gives 64 (its MACs are below the `2^20` bump floor), which does not
+    /// reproduce 512. So `n` comes back UNCHANGED and the footprint guard still gets to refuse it by
+    /// name. A version of this function without the reproduction proof returns 64 here, and this test
+    /// is the only thing that notices.
+    #[test]
+    fn a_shortfall_that_is_not_this_rules_pad_is_left_to_the_footprint_guard() {
+        assert_eq!(
+            width_for(64 * 128 * 2),
+            N_DEV,
+            "64 does not re-pad to 512, so this is a real over-run and must NOT be narrowed away"
+        );
+    }
+}
