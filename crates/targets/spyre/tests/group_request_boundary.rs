@@ -150,7 +150,8 @@ fn no_kind_fuses_across_requests() {
     for kind in [
         GroupKind::Pure,
         GroupKind::Slab,
-        GroupKind::PageFold,
+        GroupKind::PageFold { gathered: true },
+        GroupKind::PageFold { gathered: false },
         GroupKind::SlotSolo,
     ] {
         let trips = vec![
@@ -238,7 +239,8 @@ fn partition_still_covers_exactly_with_mixed_requests() {
         Trip::new(GroupKind::HostKv { skip: 1 }, TripRequest(2)),
         pure(2),
         Trip::new(GroupKind::Slab, TripRequest(0)),
-        Trip::new(GroupKind::PageFold, TripRequest(0)),
+        Trip::new(GroupKind::PageFold { gathered: true }, TripRequest(0)),
+        Trip::new(GroupKind::PageFold { gathered: false }, TripRequest(0)),
     ];
     for g in 1..=8 {
         let (covered, ok) = group_ranges_cover_ok(&trips, g);
@@ -257,8 +259,8 @@ fn partition_still_covers_exactly_with_mixed_requests() {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ A `PageFold` RUN IS **ONE GROUP AT ANY LENGTH** — the guard for a silent wrong-answer bug
-/// that shipped, not a tidiness check.
+/// ⭐⭐⭐⭐⭐ A **GATHERED** `PageFold` RUN IS ONE GROUP AT ANY LENGTH — the guard for a silent
+/// wrong-answer bug that shipped, not a tidiness check.
 ///
 /// A group is the unit of the `reps` relaunch and the launch loop is group-major
 /// (`superdsc_exec::launch_ops_inner`: `for op { for rep { … } }`). So a fold cut into groups A and B
@@ -272,16 +274,16 @@ fn partition_still_covers_exactly_with_mixed_requests() {
 /// `solo_diff` 8,8,8,8,8 at `g = 128` against 7,6,7 at `g = 512`, i.e. the partition changed the answer.
 /// A bigger `g` only moves which contexts are wrong; not cutting the run is the fix.
 #[test]
-fn a_page_fold_run_is_never_chunked_by_the_group_size() {
-    let fold = |r: u32| Trip::new(GroupKind::PageFold, TripRequest(r));
+fn a_gathered_page_fold_run_is_never_chunked_by_the_group_size() {
+    let fold = |r: u32| Trip::new(GroupKind::PageFold { gathered: true }, TripRequest(r));
     // Longer than every `g` tried, so a cap that still applied would show up as more than one group.
     let trips: Vec<Trip> = (0..40).map(|_| fold(0)).collect();
     for g in [1usize, 2, 3, 8, 128, 512] {
         assert_eq!(
             group_ranges(&trips, g),
             vec![0..40],
-            "g={g}: a PageFold run must be ONE group — cutting it makes every pass of the second \
-             group read the gathered page the first group left at its LAST pass"
+            "g={g}: a gathered PageFold run must be ONE group — cutting it makes every pass of the \
+             second group read the gathered page the first group left at its LAST pass"
         );
         let (covered, ok) = group_ranges_cover_ok(&trips, g);
         assert!(
@@ -294,8 +296,54 @@ fn a_page_fold_run_is_never_chunked_by_the_group_size() {
     // that one launch resolves one request's page table.
     let mixed = vec![fold(0), fold(0), fold(1), fold(1)];
     assert_eq!(group_ranges(&mixed, 512), vec![0..2, 2..4]);
-    // ⛔ AND ONLY `PageFold` IS EXEMPT — a `Pure` run of the same length still chunks, which is what
-    // keeps the launch budget meaningful for the rest of the body.
+    // ⛔ AND ONLY THE GATHERED FOLD IS EXEMPT — a `Pure` run of the same length still chunks, which is
+    // what keeps the launch budget meaningful for the rest of the body.
     let pures: Vec<Trip> = (0..40).map(|_| pure(0)).collect();
     assert_eq!(group_ranges(&pures, 8).len(), 5);
+}
+
+/// ⭐⭐⭐⭐⭐ AND AN **UNGATHERED** `PageFold` RUN **IS** CHUNKED — the other half of the same law, and a
+/// MEASURED 8b regression when it was not.
+///
+/// The exemption above was applied to both folds with the justification that "the ungathered fold loses
+/// nothing by it: fewer groups is fewer launches". `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` is
+/// hd = 128, so `PageScratch::of_pass` refuses the gather and its fold is ungathered. On the 420-token
+/// `c` probe at width 8, each binary against its OWN `--max-num-seqs 1` run, N = 3:
+/// ```text
+///   origin/main (cap applied)  own_bad 8,7,7  first divergence 87-118 chars in (term 14-19)
+///   cap lifted for both folds  own_bad 8,8,8  first divergence 1-4 chars in (term 0): " 11111111…"
+///   this rule (gathered only)  own_bad 7,8,8  first divergence 87-118 chars in (term 14-19)
+/// ```
+/// Width 8 at hd=128 is broken in all three — that predates the fold work — but the lifted cap turns a
+/// prefix that is coherent for fifteen terms into garbage from the first token, and restoring the cap
+/// puts the per-row divergence offsets back on main's values row for row.
+///
+/// (Mutation check: make `run_may_be_chunked` ignore the payload again and this test drops to 1 group.)
+#[test]
+fn an_ungathered_page_fold_run_is_chunked_like_any_other() {
+    let fold = Trip::new(GroupKind::PageFold { gathered: false }, TripRequest(0));
+    let trips: Vec<Trip> = (0..40).map(|_| fold).collect();
+    assert_eq!(
+        group_ranges(&trips, 8),
+        vec![0..8, 8..16, 16..24, 24..32, 32..40],
+        "an UNGATHERED fold run must chunk at g — its passes rebase the KV segment instead of \
+         rewriting a shared scratch, so it never needed the exemption, and taking it is a measured \
+         granite-3.1-8b fp8 regression"
+    );
+    for g in [1usize, 2, 3, 8, 128, 512] {
+        let (covered, ok) = group_ranges_cover_ok(&trips, g);
+        assert!(
+            ok && covered == trips.len(),
+            "g={g}: the scalar twin must agree with the chunked walk too (covered={covered} ok={ok})"
+        );
+        assert!(!group_spans_two_requests(&trips, g));
+    }
+    // ⛔ AND THE TWO FOLDS DO NOT FUSE WITH EACH OTHER. A group takes its cap from its FIRST trip, so a
+    // mixed run would hand one half the other's cap — silently, and in the direction that loses the
+    // gathered fold's exemption.
+    let mixed = vec![
+        Trip::new(GroupKind::PageFold { gathered: true }, TripRequest(0)),
+        Trip::new(GroupKind::PageFold { gathered: false }, TripRequest(0)),
+    ];
+    assert_eq!(group_ranges(&mixed, 512), vec![0..1, 1..2]);
 }

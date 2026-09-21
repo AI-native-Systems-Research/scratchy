@@ -1987,7 +1987,12 @@ pub enum GroupKind {
     /// (they share a page base) but must never fuse with anything else — the shim re-launches this
     /// group per page, and a stray op swept in would re-run per page too, re-seeding the new-token
     /// block or re-adding the residual once per page.
-    PageFold,
+    ///
+    /// ⭐⭐⭐⭐⭐ `gathered` IS THE OP'S OWN [`EmittedOp::kv_gathered`], AND IT DECIDES THE SIZE CAP —
+    /// see [`GroupKind::run_may_be_chunked`]. It lives in the KIND because the chunking rule is a
+    /// property of the kind and must stay in ONE place; a gathered fold's passes communicate through a
+    /// scratch they rewrite, an ungathered fold's do not, and that is the whole difference.
+    PageFold { gathered: bool },
     /// `slab_write` DECODE incremental Kᵀ restickify (kill-restickify Stage 2, hd==64): re-transposes
     /// ONLY the current 64-slot slab; the shim shifts the group's seg2 base by
     /// `(slot_pos/64)·slab_stride_bytes` ONCE (each op baked at slab 0). Consecutive `Slab` trips FUSE
@@ -2036,7 +2041,11 @@ impl GroupKind {
         match (self, other) {
             (GroupKind::Pure, GroupKind::Pure) => true,
             (GroupKind::Slab, GroupKind::Slab) => true,
-            (GroupKind::PageFold, GroupKind::PageFold) => true,
+            // AND THE SAME GATHER STATE. They move together in today's emitter (one `gather` decision
+            // serves a whole attention block), so this arm is `true` in practice — but a group takes
+            // its SIZE CAP from its first trip's kind, so a run mixing the two would silently give one
+            // half the other's cap. Breaking at that boundary can only cost a launch.
+            (GroupKind::PageFold { gathered: a }, GroupKind::PageFold { gathered: b }) => a == b,
             (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
             // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
             // HostKv: the shim's `oi += skip` must land on this exact entry.
@@ -2045,7 +2054,7 @@ impl GroupKind {
     }
 
     /// ⭐⭐⭐⭐⭐ WHETHER A RUN OF THIS KIND MAY BE **CHUNKED BY THE GROUP SIZE** — false for
-    /// [`GroupKind::PageFold`], and that is a CORRECTNESS law, not a tuning choice.
+    /// `PageFold { gathered: true }` ALONE, and that is a CORRECTNESS law, not a tuning choice.
     ///
     /// ⛔⛔⛔ A GROUP IS THE UNIT OF THE `reps` RELAUNCH, AND THE LOOP IS GROUP-MAJOR.
     /// `superdsc_exec::launch_ops_inner` is `for op in ops { for rep in 0..reps(op) { … } }`, so a fold
@@ -2069,11 +2078,42 @@ impl GroupKind {
     /// the fold fits one group. The fix is not a bigger `g` — a bigger `g` only moves which contexts are
     /// wrong — it is that this run is never cut.
     ///
-    /// ⛔ ONE RULE FOR BOTH FOLDS, deliberately. Gating on "does this bundle gather" would put the
-    /// decision in a second place (the trip carries no gather bit, so it would have to be threaded), and
-    /// the ungathered fold loses nothing by it: fewer groups is fewer launches.
+    /// ⛔⛔⛔⛔⛔ AND IT IS THE **GATHERED** FOLD ONLY — "one rule for both folds" WAS SHIPPED AND IS A
+    /// MEASURED 8b REGRESSION.
+    ///
+    /// What stood here claimed two things, and both were false. It said gating on the gather "would put
+    /// the decision in a second place (the trip carries no gather bit, so it would have to be threaded)":
+    /// [`EmittedOp::kv_gathered`] already exists, `attn.rs` already sets it from the same `gather` the
+    /// fold's own [`GatheredFold`] is built from, and [`launch_index`] already reads it one function
+    /// away — so the bit was never absent, and carrying it in the KIND keeps the rule in exactly the one
+    /// place that comment wanted. It also said "the ungathered fold loses nothing by it: fewer groups is
+    /// fewer launches". That is the assumption granite-3.1-8b falsifies.
+    ///
+    /// ⛔ MEASURED, `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` (hd = 128, so
+    /// [`PageScratch::of_pass`] refuses the gather — confirmed with `SCRATCHY_GATHER_DIAG=1` SET and 0
+    /// gather steps, against 421 at 2b — and the fold is UNGATHERED), 420-token `c` probe at width 8,
+    /// each binary scored against its OWN `--max-num-seqs 1` run, N = 3:
+    /// ```text
+    ///   origin/main  (cap = g)     own_bad 8,7,7  degen 4,5,3  first divergence 87-118 chars (term 14-19)
+    ///   cap lifted for BOTH folds  own_bad 8,8,8  degen 1,1,2  first divergence 1-4 chars (term 0):
+    ///                                                          " 11111111…", " / / / / /…"
+    ///   THIS RULE (gathered only)  own_bad 7,8,8  degen 3,2,1  first divergence 87-118 chars (term 14-19)
+    /// ```
+    /// Every 8b width-8 cell is broken — that defect predates all of this and is not what changed — but
+    /// lifting the cap on the ungathered fold turns a prefix coherent for fifteen terms into garbage from
+    /// the first token, and restoring the cap restores main's per-row divergence offsets EXACTLY
+    /// (99/106/118/93/106/112/87 chars, row for row, on both trees).
+    ///
+    /// ⛔ WHY it damages the ungathered fold is NOT established, and this comment does not guess: the
+    /// only thing measured is that the partition is the variable. Which is the same shape as the bug the
+    /// exemption exists for, and the reason the exemption is now no wider than its evidence.
+    ///
+    /// ⭐ THE NECESSITY ARGUMENT ONLY EVER COVERED THE GATHERED FOLD. Its passes read a scratch the
+    /// gather REWRITES per pass, so group-major execution makes group B read the page group A left. An
+    /// ungathered pass rebases the KV segment instead and holds no state between groups — the online
+    /// softmax is accumulate-only — so it needs no exemption and is not given one.
     fn run_may_be_chunked(self) -> bool {
-        !matches!(self, GroupKind::PageFold)
+        !matches!(self, GroupKind::PageFold { gathered: true })
     }
 }
 
@@ -2125,10 +2165,11 @@ pub fn group_ranges(trips: &[Trip], g: usize) -> Vec<core::ops::Range<usize>> {
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
-        // ⛔ THE CAP IS PER KIND — see [`GroupKind::run_may_be_chunked`]. A `PageFold` run is ONE group
-        // however long it is, because a group is the unit of the `reps` relaunch and the launch loop is
-        // group-major: cutting it makes every pass of the second group read the scratch the first group
-        // left at its LAST pass.
+        // ⛔ THE CAP IS PER KIND — see [`GroupKind::run_may_be_chunked`]. A GATHERED `PageFold` run is ONE
+        // group however long it is, because a group is the unit of the `reps` relaunch and the launch loop
+        // is group-major: cutting it makes every pass of the second group read the scratch the first group
+        // left at its LAST pass. An UNGATHERED fold holds no such state, so it chunks like everything
+        // else — exempting it too is a measured 8b regression.
         let cap = if trips[start].kind.run_may_be_chunked() {
             g
         } else {
@@ -2184,9 +2225,9 @@ pub fn group_ranges_cover_ok(trips: &[Trip], g: usize) -> (usize, bool) {
             cnt += 1;
         }
         ok &= start == expect;
-        // ⛔ THE SIZE INVARIANT IS NOW PER KIND TOO, and a `PageFold` run has NO size bound — it must be
-        // one group at any length (`GroupKind::run_may_be_chunked`). Keeping `<= g` here would make the
-        // proof contradict the walk it is the twin of.
+        // ⛔ THE SIZE INVARIANT IS NOW PER KIND TOO, and a GATHERED `PageFold` run has NO size bound — it
+        // must be one group at any length (`GroupKind::run_may_be_chunked`). Keeping `<= g` here would make
+        // the proof contradict the walk it is the twin of.
         ok &= (end - start) <= cap; // group ≤ its kind's cap
         ok &= end > start; // non-empty ⇒ the walk advances ⇒ terminates
         expect = end;
@@ -2212,7 +2253,15 @@ pub fn group_spans_two_requests(trips: &[Trip], g: usize) -> bool {
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
-        while end < n && cnt < g && trips[start].fusable_with(&trips[end]) {
+        // THE SAME PER-KIND CAP AS THE WALK. It cannot change this predicate's answer — the run only
+        // extends while `fusable_with` holds, and that requires an equal request — but a third copy of
+        // the walk that drifts from the other two is how the cap came to be missing from one of them.
+        let cap = if trips[start].kind.run_may_be_chunked() {
+            g
+        } else {
+            usize::MAX
+        };
+        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
             end += 1;
             cnt += 1;
         }
@@ -2434,7 +2483,12 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
                     skip: e.kv_n_skip as usize,
                 }
             } else if e.kv_page_fold {
-                GroupKind::PageFold
+                // ⛔ THE GATHER STATE TRAVELS IN THE KIND, TAKEN FROM THE OP THAT DECLARED IT — the same
+                // field `launch_index` puts on the group's `KvShifts`, so the size cap and the runtime's
+                // `gathered` flag cannot come to disagree about which fold this is.
+                GroupKind::PageFold {
+                    gathered: e.kv_gathered,
+                }
             } else if e.slab_write {
                 // Incremental Kᵀ restickify (kill-restickify Stage 2) → Slab (fusable, one
                 // `slab_stride_bytes`). A DISTINCT kind from Slot: its 8192-byte slab stride ≠ the
@@ -2491,7 +2545,7 @@ fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usiz
     let (mut kinds, owner) = trip_kinds_and_owner(ops);
     if fold == FoldGrouping::Fused {
         for t in kinds.iter_mut() {
-            if matches!(t.kind, GroupKind::PageFold) {
+            if matches!(t.kind, GroupKind::PageFold { .. }) {
                 // Reclassified, but it KEEPS ITS REQUEST — so it still cannot fuse across requests.
                 t.kind = GroupKind::Pure;
             }
@@ -2782,7 +2836,7 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         } else {
             0
         };
-        let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold);
+        let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
         shifts.push(bundle::KvShifts {
             slot_stride_bytes: slot,
