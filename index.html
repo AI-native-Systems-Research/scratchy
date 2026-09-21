@@ -35,6 +35,7 @@
 <cds-header aria-label="scratchy">
   <cds-header-name href="." prefix="▚">scratchy</cds-header-name>
   <cds-header-nav menu-bar-label="scratchy navigation">
+    <cds-header-nav-item href="architectures.html">Models</cds-header-nav-item>
     <cds-header-nav-item href="book/index.html">Docs</cds-header-nav-item>
     <cds-header-nav-item href="book/COMPILER.html">Compiler</cds-header-nav-item>
     <cds-header-nav-item href="https://github.com/AI-native-Systems-Research/scratchy">GitHub</cds-header-nav-item>
@@ -162,6 +163,7 @@
         <span class="c-cm">// ...</span>
     }
 }</cds-code-snippet>
+    <a class="more" href="architectures.html">See all 25 architectures, side by side &rarr;</a>
   </div>
 </section>
 
@@ -252,6 +254,10 @@ cargo build -F metal,model/llama-3.2-3b,quant/mlx --release
     <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/COMPILER.html">
       <h3>The compiler</h3>
       <p>The whole-forward DSL, and what the proc macro actually emits.</p>
+    </cds-clickable-tile>
+    <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="architectures.html">
+      <h3>Model architectures</h3>
+      <p>All 25 supported models in the DSL, diffable two at a time.</p>
     </cds-clickable-tile>
     <cds-clickable-tile class="dcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5" href="book/MODELS.html">
       <h3>Adding an architecture</h3>

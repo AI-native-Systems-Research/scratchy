@@ -17,6 +17,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import build_archs
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 SITE = HERE / "_site"
@@ -87,15 +89,7 @@ PAGE_TEMPLATE = """\
 </head>
 <body>
 
-<cds-header aria-label="scratchy">
-  <cds-header-menu-button button-label-active="Close menu" button-label-inactive="Open menu"></cds-header-menu-button>
-  <cds-header-name href="{root}" prefix="▚">scratchy</cds-header-name>
-  <cds-header-nav menu-bar-label="scratchy navigation">
-    <cds-header-nav-item href="{root}book/index.html">Docs</cds-header-nav-item>
-    <cds-header-nav-item href="{root}book/COMPILER.html">Compiler</cds-header-nav-item>
-    <cds-header-nav-item href="https://github.com/AI-native-Systems-Research/scratchy">GitHub</cds-header-nav-item>
-  </cds-header-nav>
-</cds-header>
+{header}
 
 <cds-side-nav aria-label="Docs navigation" class="docs-side-nav">
   <cds-side-nav-items>
@@ -148,6 +142,35 @@ PAGE_TEMPLATE = """\
 """
 
 
+# The site chrome, defined once: the docs pages below and the architectures page
+# built by build_archs.py both render this, so the nav can never disagree with
+# itself. `active` is the href of the page being built, if it is in the nav.
+NAV = [
+    ("architectures.html", "Models"),
+    ("book/index.html", "Docs"),
+    ("book/COMPILER.html", "Compiler"),
+    ("https://github.com/AI-native-Systems-Research/scratchy", "GitHub"),
+]
+
+
+def header_html(root: str, active: str = "") -> str:
+    items = "\n".join(
+        '    <cds-header-nav-item href="{href}"{active}>{label}</cds-header-nav-item>'.format(
+            href=href if href.startswith("http") else root + href,
+            active=" active" if href == active else "",
+            label=label,
+        )
+        for href, label in NAV
+    )
+    return f"""<cds-header aria-label="scratchy">
+  <cds-header-menu-button button-label-active="Close menu" button-label-inactive="Open menu"></cds-header-menu-button>
+  <cds-header-name href="{root or '.'}" prefix="▚">scratchy</cds-header-name>
+  <cds-header-nav menu-bar-label="scratchy navigation">
+{items}
+  </cds-header-nav>
+</cds-header>"""
+
+
 def rewrite_links(text: str) -> str:
     for pattern, repl in LINK_REWRITES:
         text = re.sub(pattern, repl, text)
@@ -181,6 +204,7 @@ def build_chapter(title, src_rel, slug):
     page = PAGE_TEMPLATE.format(
         head=head,
         root=root,
+        header=header_html(root, active=f"book/{slug}.html"),
         nav_links=nav_links,
         nav_blog_links=nav_blog_links,
         md_src=f"{Path(slug).name}.md",
@@ -217,6 +241,8 @@ def main():
 
     for title, src_rel, slug in ALL_CHAPTERS:
         build_chapter(title, src_rel, slug)
+
+    build_archs.build(SITE / "architectures.html", header_html("", active="architectures.html"))
 
     if check_markdown_links():
         print("link check failed", file=sys.stderr)
