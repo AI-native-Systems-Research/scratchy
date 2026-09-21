@@ -31,6 +31,10 @@ cds-clickable-tile:not(:defined),
 cds-button:not(:defined),
 cds-code-snippet:not(:defined),
 cds-side-nav:not(:defined),
+cds-select:not(:defined),
+cds-checkbox:not(:defined),
+cds-tag:not(:defined),
+cds-structured-list:not(:defined),
 zero-md:not(:defined) {
   visibility: hidden;
 }
@@ -342,4 +346,141 @@ footer .credit {
   .idea { grid-template-columns: 1fr; gap: 2rem; }
   .hero-body { padding: 2.5rem 1.5rem 3rem; }
   section { padding: 3rem 0; }
+}
+
+/* architectures page ---------------------------------------------------------
+ * Controls, panes and the ranking list are real Carbon Web Components; what
+ * stays here is the diff view, which has no Carbon component. Colors come from
+ * the aliases at the top of this file plus --cds-support-success/error for the
+ * added/removed lines, the same pair Carbon uses for success and error status. */
+
+.archpage {
+  max-width: var(--wide);
+  margin: 0 auto;
+  padding: var(--cds-spacing-09) var(--cds-spacing-06) var(--cds-spacing-10);
+}
+
+.archpage h1 {
+  margin: 0 0 var(--cds-spacing-05);
+  font-size: var(--cds-fluid-heading-04-font-size);
+  font-weight: 300;
+  line-height: 1.19;
+}
+
+.archpage h2 {
+  margin: var(--cds-spacing-10) 0 var(--cds-spacing-03);
+  font-size: var(--cds-heading-03-font-size);
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+/* controls */
+
+.archbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--cds-spacing-05);
+  margin: var(--cds-spacing-07) 0 var(--cds-spacing-05);
+}
+
+.archbar cds-select { min-width: 16rem; }
+.archbar cds-button { margin-bottom: 1px; }        /* sit on the selects' baseline */
+.archbar cds-checkbox { padding-bottom: var(--cds-spacing-03); }
+
+.tally {
+  margin-left: auto;
+  padding-bottom: var(--cds-spacing-03);
+  font-family: var(--mono);
+  font-size: var(--cds-label-01-font-size);
+  letter-spacing: 0.32px;
+  color: var(--muted);
+}
+
+/* panes */
+
+.archgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--cds-spacing-05);
+  align-items: start;
+}
+
+.archpane { padding: 0; min-width: 0; overflow: hidden; }
+
+.archpane .codehead {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--cds-spacing-05);
+  border-bottom: 1px solid var(--line);
+}
+
+.archpane .cmeta { color: var(--muted); white-space: nowrap; }
+
+.archcode {
+  margin: 0;
+  padding: var(--cds-spacing-03) 0;
+  max-height: 32rem;
+  overflow: auto;
+  background: var(--bg-soft);
+  font-family: var(--mono);
+  font-size: var(--cds-code-01-font-size);
+  line-height: 1.5;
+}
+
+.archcode code { display: block; background: none; padding: 0; }
+
+/* One flex row per line, so a whole line can carry a diff background and the
+   two panes can be padded to stay aligned. */
+.r { display: flex; width: max-content; min-width: 100%; }
+
+.ln {
+  flex: 0 0 3rem;
+  padding-right: var(--cds-spacing-04);
+  text-align: right;
+  color: var(--muted);
+  opacity: 0.6;
+  user-select: none;
+}
+
+.lx { flex: 1 1 auto; white-space: pre; padding-right: var(--cds-spacing-05); }
+
+.r.add { background: color-mix(in srgb, var(--cds-support-success) 16%, transparent); box-shadow: inset 2px 0 0 var(--cds-support-success); }
+.r.del { background: color-mix(in srgb, var(--cds-support-error) 14%, transparent); box-shadow: inset 2px 0 0 var(--cds-support-error); }
+.r.fill { background: var(--cds-background-hover); }
+
+/* operations summary */
+
+.opsbox { margin: var(--cds-spacing-06) 0 0; display: grid; gap: var(--cds-spacing-03); }
+
+.opsrow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--cds-spacing-03);
+  font-size: var(--cds-body-01-font-size);
+}
+
+.opslabel {
+  flex: 0 0 9rem;
+  font-family: var(--mono);
+  font-size: var(--cds-label-01-font-size);
+  letter-spacing: 0.32px;
+  color: var(--muted);
+}
+
+.opsrow .none { color: var(--muted); }
+
+/* ranking list */
+
+.archlist { margin-top: var(--cds-spacing-05); }
+.archlist cds-structured-list-cell { font-family: var(--mono); }
+.archlist .an { color: var(--accent); }
+.archlist .num { display: block; text-align: right; }
+.archlist cds-button { margin: calc(-1 * var(--cds-spacing-03)) 0; }
+
+@media (max-width: 900px) {
+  .archgrid { grid-template-columns: 1fr; }
+  .archbar .tally { margin-left: 0; }
+  .archbar cds-select { min-width: 100%; }
 }
