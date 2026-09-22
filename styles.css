@@ -35,7 +35,7 @@ cds-side-nav:not(:defined),
 cds-side-nav-items:not(:defined),
 cds-side-nav-link:not(:defined),
 cds-select:not(:defined),
-cds-checkbox:not(:defined),
+diff-view-element:not(:defined),
 zero-md:not(:defined) {
   visibility: hidden;
 }
@@ -397,27 +397,10 @@ footer .credit {
 
 .archbar cds-select { min-width: 16rem; }
 .archbar cds-button { margin-bottom: 1px; }        /* sit on the selects' baseline */
-.archbar cds-checkbox { padding-bottom: var(--cds-spacing-03); }
-
-.tally {
-  margin-left: auto;
-  padding-bottom: var(--cds-spacing-03);
-  font-family: var(--mono);
-  font-size: var(--cds-label-01-font-size);
-  letter-spacing: 0.32px;
-  color: var(--muted);
-}
 
 /* panes */
 
-.archgrid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--cds-spacing-05);
-  align-items: start;
-}
-
-.archpane { padding: 0; min-width: 0; overflow: hidden; }
+.archpane { padding: 0; min-width: 0; overflow: hidden; margin: 0 0 var(--cds-spacing-05); }
 
 .archpane .codehead {
   display: flex;
@@ -428,6 +411,13 @@ footer .credit {
 
 .archpane .cmeta { color: var(--muted); white-space: nowrap; }
 
+/* Carbon's precompiled styles.min.css never actually defines --cds-code-01-*
+ * at :root (it's only defined, oddly, under an unrelated .cds--guidebanner
+ * rule) — every var() reference to it needs its own literal fallback, or it
+ * silently resolves to nothing. cds-code-snippet's own real compiled CSS
+ * does exactly this (`font-size: var(--cds-code-01-font-size, .75rem)`, etc.)
+ * — matched here, and again below for diff-view-element, so both code
+ * views render at the same real Carbon code-01 size instead of drifting. */
 .archcode {
   margin: 0;
   padding: var(--cds-spacing-03) 0;
@@ -435,33 +425,79 @@ footer .credit {
   overflow: auto;
   background: var(--bg-soft);
   font-family: var(--mono);
-  font-size: var(--cds-code-01-font-size);
-  line-height: 1.5;
+  font-size: var(--cds-code-01-font-size, 0.75rem);
+  line-height: var(--cds-code-01-line-height, 1.33333);
+  letter-spacing: var(--cds-code-01-letter-spacing, 0.32px);
 }
 
-.archcode code { display: block; background: none; padding: 0; }
-
-/* One flex row per line, so a whole line can carry a diff background and the
-   two panes can be padded to stay aligned. */
-.r { display: flex; width: max-content; min-width: 100%; }
-
-.ln {
-  flex: 0 0 3rem;
-  padding-right: var(--cds-spacing-04);
-  text-align: right;
-  color: var(--muted);
-  opacity: 0.6;
-  user-select: none;
+/* Undo every part of the global `code {}` prose-chip rule above (font-size,
+ * border, border-radius) that isn't already reset here — that rule is sized
+ * for an inline snippet inside a sentence, and left alone it compounds an
+ * extra 0.875em on top of .archcode's own already-correct code-01 size. */
+.archcode code {
+  display: block;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  font-size: inherit;
 }
 
-.lx { flex: 1 1 auto; white-space: pre; padding-right: var(--cds-spacing-05); }
+/* diff-view-element (https://konnorrogers.github.io/diff-view-element/) does
+ * its own diffing and PrismJS highlighting in shadow DOM. Every property set
+ * below is one of the component's own real, documented hooks — either a
+ * :host custom property it reads in default-theme.styles.js (--syntax-*,
+ * --mono-*, --hue-*), or a ::part() name it puts on specific shadow elements
+ * itself (table, line, character-diff--*) — never a shadow-piercing
+ * selector. --mono/--cds-code-01-font-size is the same font cds-code-snippet
+ * uses elsewhere in this file; --hue-2/3/4/6 are the exact colors .c-fn/
+ * .c-kw/.c-s/.c-n use for the hand-highlighted single-file pane, so the two
+ * views agree; everything else (backgrounds, borders, inserted/deleted) maps
+ * to the same --cds-* aliases the rest of the site uses, so it tracks
+ * light/dark mode like everything else instead of PrismJS's own fixed
+ * "One Light" palette. */
+diff-view-element {
+  --mono-1: var(--fg);
+  --mono-2: var(--muted);
+  --mono-3: var(--muted);
+  --hue-1: var(--accent);
+  --hue-2: var(--accent-2);
+  --hue-3: #c792ea;
+  --hue-4: #86d99a;
+  --hue-5: var(--accent);
+  --hue-6: #f2b05e;
+  --syntax-bg: var(--bg-soft);
+  --syntax-fg: var(--fg);
+  --syntax-gutter: var(--muted);
+  --syntax-guide: var(--line);
+  --syntax-selection-color: color-mix(in srgb, var(--accent) 25%, transparent);
+  --syntax-inserted-bg: color-mix(in srgb, var(--cds-support-success) 16%, transparent);
+  --syntax-deleted-bg: color-mix(in srgb, var(--cds-support-error) 14%, transparent);
+  display: block;
+  max-height: 32rem;
+  overflow: auto;
+}
 
-.r.add { background: color-mix(in srgb, var(--cds-support-success) 16%, transparent); box-shadow: inset 2px 0 0 var(--cds-support-success); }
-.r.del { background: color-mix(in srgb, var(--cds-support-error) 14%, transparent); box-shadow: inset 2px 0 0 var(--cds-support-error); }
-.r.fill { background: var(--cds-background-hover); }
+/* The shadow tree's own <pre>/<code> carry the browser's UA-default
+ * `font-family: monospace` — an explicit rule on those exact elements always
+ * beats an inherited value from outside the shadow boundary, no matter what
+ * the host's own font-family is set to. ::part(pre)/::part(code) target
+ * those elements directly (real part names the component renders, see
+ * basic-diff-view-element.js's render()), which is real author CSS and does
+ * win over that UA default. */
+diff-view-element::part(pre),
+diff-view-element::part(code) {
+  font-family: var(--mono);
+  font-size: var(--cds-code-01-font-size, 0.75rem);
+  line-height: var(--cds-code-01-line-height, 1.33333);
+  letter-spacing: var(--cds-code-01-letter-spacing, 0.32px);
+}
+
+diff-view-element::part(table) { border-color: var(--line); }
+diff-view-element::part(line) { border-color: var(--line); }
+diff-view-element::part(character-diff--inserted) { background: color-mix(in srgb, var(--cds-support-success) 32%, transparent); }
+diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb, var(--cds-support-error) 28%, transparent); }
 
 @media (max-width: 900px) {
-  .archgrid { grid-template-columns: 1fr; }
-  .archbar .tally { margin-left: 0; }
   .archbar cds-select { min-width: 100%; }
 }
