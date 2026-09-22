@@ -10,14 +10,63 @@ exists, not adding to it.
 ## Quickstart
 
 ```bash
-cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b   # or: cuda
+cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b
 ```
 
-`cuda` and `metal` are mutually exclusive. Add `serve` for the HTTP server
+`cuda` and `metal` are mutually exclusive. **On cuda this one-liner is not
+enough** — the kernels are a separate cargo invocation that has to run first;
+see [CUDA: build the kernels first](#cuda-build-the-kernels-first). Add
+`serve` for the HTTP server
 (`chat` — the in-process engine — is on by default), `multimodal` for the
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
 HuggingFace model ids is on by default (`hf-completions`); pass
 `--no-default-features` to build with no network access at all.
+
+## CUDA: build the kernels first
+
+A cuda build is **two cargo invocations, in this order**:
+
+```bash
+export SCRATCHY_GPU=h100 CUDA_ARCH=90 CUDA_COMPUTE_CAP=90   # see the table below
+
+# 1. nvcc kernels -> .a files in ~/.cache/cudaforge/scratchy-serving-cuda/
+#    No model or quant scope: nothing in forward expansion emits .cu, so the
+#    kernel set is scope-independent. Tens of minutes, several GB of RAM.
+cargo build --release -p scratchy-builder-cuda --features cuda
+
+# 2. the binary, which links those .a files
+cargo build --release -p scratchy-cli \
+    --features cuda,serve,bench,model/qwen2.5-14b,quant/fp8-dynamic-per-tensor
+```
+
+Step 1 cannot be folded into step 2. `scratchy-target-cuda`'s `build.rs` emits
+`rustc-link-lib=static=` for eleven archives that `scratchy-builder-cuda`'s
+`build.rs` produces, and rustc *bundles* static natives into an rlib — so those
+`.a` files must already exist when the rlib is built. There is no Cargo edge to
+order that: `scratchy-models` depends on `scratchy-target-cuda`, so an edge back
+from `target-cuda` to the builder would cycle. Skipping step 1 fails with
+`could not find native static library`, and it fails nondeterministically —
+whichever archive rustc reaches first.
+
+Three environment variables, none of them optional on a build host without a
+GPU:
+
+| var | read by | if unset |
+|---|---|---|
+| `SCRATCHY_GPU` | `#[forward]`, at expansion | probes `nvidia-smi`, else build error listing valid values |
+| `CUDA_ARCH` | kernel build + FA3 gating + the FA3 link | probes `nvidia-smi`, else **defaults to 89 and silently drops FlashAttention-3** |
+| `CUDA_COMPUTE_CAP` | `cudarc`'s build script | probes the local GPU |
+
+`CUDA_ARCH` is the one that bites: unset on a GPU-less builder it yields a
+binary that links and runs on Hopper with no FA3 decode path and no warning.
+Set it explicitly whenever you are not building on the target GPU.
+
+`git` must be on `PATH` at build time — `cudaforge` clones NVIDIA/cutlass at a
+pinned commit while compiling the scaled_mm kernels.
+
+`SCRATCHY_SKIP_CUDA_KERNELS=1` skips step 1's nvcc work for `cargo
+check`/`clippy` (this is what CI's cuda gate sets). Never set it for anything
+that links a binary.
 
 ## There is no default model or quant scope
 
