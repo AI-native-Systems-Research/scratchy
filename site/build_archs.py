@@ -44,6 +44,19 @@ def strip_comment(line):
     return line.split("//", 1)[0]
 
 
+# Some architectures wrap in a `mod <name> { fn forward() { ... } }` and
+# already call their entry point `forward`; the simpler ones (no `mod`
+# wrapper) still name it after themselves, `fn llama() {`. That's a purely
+# nominal difference, not a structural one — left alone it shows up as a
+# diff line (and inflates the ranking's "distance from baseline") on every
+# single comparison. Rewritten for display/diffing only; the compiler's
+# actual DSL files are untouched.
+def normalize_entry_fn(stem, lines):
+    ident = stem.replace("-", "_")
+    pattern = re.compile(rf"^(fn ){re.escape(ident)}(\(\))")
+    return [pattern.sub(r"\1forward\2", l, count=1) for l in lines]
+
+
 def norm(line):
     """Comparison key: whitespace-insensitive, comments ignored."""
     return " ".join(strip_comment(line).split())
@@ -67,25 +80,40 @@ def diff_count(a, b):
 # Carbon Web Components used below, one module per component family.
 # https://web-components.carbondesignsystem.com
 CDN = "https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest"
-MODULES = ["ui-shell", "button", "tile", "select", "checkbox"]
+MODULES = ["ui-shell", "button", "tile", "select"]
+
+# diff-view-element: a real, maintained diff web component (PrismJS-backed)
+# \u2014 https://konnorrogers.github.io/diff-view-element/. Pinned to the major
+# version, matching this file's @carbon/styles@1 pin.
+DIFF_VIEW_CDN = (
+    "https://cdn.jsdelivr.net/npm/diff-view-element@1"
+    "/cdn/exports/components/diff-view-element/diff-view-element-register.js"
+)
+# Rust isn't one of diff-view-element's built-in languages; this loads the
+# grammar into its own PrismJS instance on first use (see the JS below).
+PRISM_RUST_CDN = "https://cdn.jsdelivr.net/npm/prism-esm/components/prism-rust.js"
 
 
-def select(el_id, label, chosen, order, archs):
+def select(el_id, label, chosen, order, archs, placeholder=None):
     items = "\n".join(
         f'    <cds-select-item value="{n}"{" selected" if n == chosen else ""}>'
         f'{n} \u2014 {archs[n]["lines"]} lines</cds-select-item>'
         for n in order
     )
+    lead = ""
+    if placeholder is not None:
+        selected = " selected" if chosen == "" else ""
+        lead = f'    <cds-select-item value=""{selected}>{placeholder}</cds-select-item>\n'
     return (f'  <cds-select id="{el_id}" label-text="{label}" value="{chosen}">\n'
-            f'{items}\n  </cds-select>')
+            f'{lead}{items}\n  </cds-select>')
 
 
-def side_nav(order, chosen, compare):
+def side_nav(order, chosen):
     lines = []
     for n in order:
         active = " active" if n == chosen else ""
         lines.append(
-            f'    <cds-side-nav-link href="#{n}..{compare}" data-arch="{n}"{active}>'
+            f'    <cds-side-nav-link href="#{n}" data-arch="{n}"{active}>'
             f'{n}</cds-side-nav-link>'
         )
     return "\n".join(lines)
@@ -99,9 +127,9 @@ def page(header):
 
     archs = {}
     for f in files:
-        text = f.read_text()
-        lines = text.splitlines()
-        archs[f.name[: -len(".rs.in")]] = {
+        stem = f.name[: -len(".rs.in")]
+        lines = normalize_entry_fn(stem, f.read_text().splitlines())
+        archs[stem] = {
             "path": str(f.relative_to(ROOT)),
             "raw": lines,
             "html": [highlight(l) for l in lines],
@@ -115,7 +143,6 @@ def page(header):
 
     # Sorted by distance from the baseline: the ordering is the argument.
     order = sorted(archs, key=lambda n: (archs[n]["distance"], n))
-    compare = "granite" if "granite" in archs else next(n for n in order if n != base)
     total = sum(a["lines"] for a in archs.values())
 
     out = PAGE
@@ -123,11 +150,13 @@ def page(header):
         "{modules}": "\n".join(
             f'<script type="module" src="{CDN}/{m}.min.js"></script>' for m in MODULES
         ),
+        "{diff_view_cdn}": DIFF_VIEW_CDN,
         "{header}": header,
-        "{right}": select("right", "Compare", compare, order, archs),
-        "{nav}": side_nav(order, base, compare),
+        "{right}": select("right", "Diff against", "", order, archs, placeholder="— none —"),
+        "{nav}": side_nav(order, base),
         "{data}": json.dumps({"base": base, "order": order, "archs": archs,
-                              "left": base, "right": compare}, separators=(",", ":")),
+                              "left": base, "right": "", "prismRustUrl": PRISM_RUST_CDN},
+                             separators=(",", ":")),
         "{count}": str(len(archs)),
         "{total}": f"{total:,}",
         "{repo}": REPO,
@@ -163,6 +192,7 @@ PAGE = r"""<!doctype html>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@carbon/styles@1/css/styles.min.css">
 <link rel="stylesheet" href="styles.css">
 {modules}
+<script type="module" src="{diff_view_cdn}"></script>
 <script>
 (function () {
   var mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -191,25 +221,23 @@ PAGE = r"""<!doctype html>
   <h1>Scratchy model architectures</h1>
   <p class="lede">{count} architectures, {total} lines of DSL between them. Each one is
   the model's math, written once; the compiler turns it into the code for every
-  target. Pick a model from the list on the left as the baseline, then choose
-  what to diff it against below.</p>
+  target. Pick a model from the list on the left, then optionally diff it
+  against another below.</p>
 </div>
 
   <div class="archbar">
 {right}
-    <span id="tally" class="tally"></span>
   </div>
 
-  <div class="archgrid">
-    <cds-tile class="archpane">
-      <div class="codehead"><span id="lpath"></span><span id="lmeta" class="cmeta"></span></div>
-      <pre class="archcode"><code id="lcode"></code></pre>
-    </cds-tile>
-    <cds-tile class="archpane">
-      <div class="codehead"><span id="rpath"></span><span id="rmeta" class="cmeta"></span></div>
-      <pre class="archcode"><code id="rcode"></code></pre>
-    </cds-tile>
-  </div>
+  <cds-tile id="archpane" class="archpane">
+    <div class="codehead"><span id="path"></span><span id="meta" class="cmeta"></span></div>
+    <pre class="archcode"><code id="code"></code></pre>
+  </cds-tile>
+
+  <cds-tile id="diffpane" class="archpane" style="display: none">
+    <div class="codehead"><span id="diffhead"></span></div>
+    <diff-view-element id="diffview" language="rust" disable-line-numbers></diff-view-element>
+  </cds-tile>
 </main>
 </div>
 
@@ -218,77 +246,69 @@ PAGE = r"""<!doctype html>
 const DATA = JSON.parse(document.getElementById('archdata').textContent);
 const A = DATA.archs, ORDER = DATA.order;
 const $ = id => document.getElementById(id);
-const norm = s => s.replace(/\/\/.*$/, '').split(/\s+/).join(' ').trim();
 
-// The selects are rendered with their initial selection server-side, so the
-// page is correct before the component modules finish loading; L and R are the
-// authority afterwards.
-let L = DATA.left, R = DATA.right, FOLD = false;
+// The select is rendered with its initial (empty) selection server-side, so
+// the page is correct before the component modules finish loading; L and R
+// are the authority afterwards. R === '' means "no diff — just show L".
+let L = DATA.left, R = DATA.right;
 
-// Longest common subsequence over comment- and whitespace-insensitive lines,
-// so the panes stay aligned and only real edits light up.
-function align(a, b) {
-  const n = a.length, m = b.length;
-  const dp = Array.from({length: n + 1}, () => new Int32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--)
-      dp[i][j] = a[i] === b[j]
-        ? dp[i + 1][j + 1] + 1
-        : Math.max(dp[i + 1][j], dp[i][j + 1]);
-  const ops = [];
-  let i = 0, j = 0;
-  while (i < n && j < m) {
-    if (a[i] === b[j]) { ops.push(['=', i++, j++]); }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push(['-', i++, -1]); }
-    else { ops.push(['+', -1, j++]); }
-  }
-  while (i < n) ops.push(['-', i++, -1]);
-  while (j < m) ops.push(['+', -1, j++]);
-  return ops;
-}
-
-// One flex row per line so a whole line can carry a diff background, and so the
-// two panes stay aligned when one side has no counterpart.
-function row(arch, idx, cls) {
-  if (idx < 0) return '<span class="r fill"><span class="ln"></span><span class="lx">&nbsp;</span></span>';
-  return `<span class="r ${cls}"><span class="ln">${idx + 1}</span>` +
-         `<span class="lx">${A[arch].html[idx] || '&nbsp;'}</span></span>`;
+// diff-view-element ships without Rust highlighting; load the grammar into
+// its own PrismJS instance once, the first time a diff is actually shown —
+// not on page load, since most visits never open one. Must wait for the
+// element to actually be upgraded first: its register <script type=module>
+// loads asynchronously, so on a fresh page load (or a #left..right deep
+// link) this can run before `.highlighter`/`.requestUpdate` exist yet.
+let rustLoaded = false;
+async function ensureRustHighlighting() {
+  if (rustLoaded) return;
+  const [{ loader }] = await Promise.all([
+    import(DATA.prismRustUrl),
+    customElements.whenDefined('diff-view-element'),
+  ]);
+  if (rustLoaded) return;
+  rustLoaded = true;
+  loader($('diffview').highlighter);
+  $('diffview').requestUpdate();
 }
 
 function render() {
-  const ln = A[L].raw.map(norm), rn = A[R].raw.map(norm);
-  const ops = align(ln, rn);
-  let adds = 0, dels = 0, lout = '', rout = '';
-  for (const [t, i, j] of ops) {
-    // A blank or comment-only line is not an edit, whichever side it is on.
-    const real = t === '-' ? ln[i] !== '' : t === '+' ? rn[j] !== '' : false;
-    if (real) { if (t === '+') adds++; else dels++; }
-    if (FOLD && !real) continue;
-    lout += row(L, i, real && t === '-' ? 'del' : '');
-    rout += row(R, j, real && t === '+' ? 'add' : '');
+  // cds-tile's own shadow CSS sets `:host(cds-tile) { display: block }`
+  // unconditionally, which an author-origin rule always beats the UA-only
+  // `[hidden] { display: none }` default — so toggling `.hidden` on a
+  // cds-tile does nothing. Inline `style.display` outranks any stylesheet
+  // rule (short of !important), including that one.
+  const diffing = R !== '' && R !== L;
+  $('archpane').style.display = diffing ? 'none' : '';
+  $('diffpane').style.display = diffing ? '' : 'none';
+
+  if (!diffing) {
+    $('code').innerHTML = A[L].html.join('\n');
+    $('path').textContent = A[L].path;
+    $('meta').textContent = A[L].lines + ' lines';
+  } else {
+    const diffview = $('diffview');
+    diffview.oldValue = A[L].raw.join('\n');
+    diffview.newValue = A[R].raw.join('\n');
+    $('diffhead').textContent = `${A[L].path} → ${A[R].path}`;
+    ensureRustHighlighting();
   }
-  $('lcode').innerHTML = lout;
-  $('rcode').innerHTML = rout;
-  $('lpath').textContent = A[L].path;
-  $('rpath').textContent = A[R].path;
-  $('lmeta').textContent = A[L].lines + ' lines';
-  $('rmeta').textContent = A[R].lines + ' lines';
-  $('tally').textContent = L === R ? 'same file'
-    : (adds + dels) === 0 ? 'identical math'
-    : `+${adds} −${dels} lines`;
 
   for (const link of document.querySelectorAll('#model-nav cds-side-nav-link[data-arch]')) {
     link.toggleAttribute('active', link.dataset.arch === L);
-    link.href = '#' + link.dataset.arch + '..' + R;
   }
 
-  history.replaceState(null, '', '#' + L + '..' + R);
+  history.replaceState(null, '', diffing ? `#${L}..${R}` : `#${L}`);
 }
 
 function pick(side, name) {
-  if (!A[name]) return;
-  if (side === 'left') { L = name; }
-  else { R = name; $('right').value = name; }
+  if (side === 'left') {
+    if (!A[name]) return;
+    L = name;
+  } else {
+    if (name !== '' && !A[name]) return;
+    R = name;
+    $('right').value = name;
+  }
   render();
 }
 
@@ -301,13 +321,13 @@ for (const link of document.querySelectorAll('#model-nav cds-side-nav-link[data-
   });
 }
 
-// A #left..right fragment makes one specific comparison linkable, and stays
-// live afterward so the side-nav's own generated hrefs (and back/forward)
-// keep working.
+// A #left..right fragment makes one specific comparison linkable (and #left
+// alone links just that model), and stays live afterward so the side-nav's
+// own generated hrefs (and back/forward) keep working.
 function applyHash() {
-  const pair = decodeURIComponent(location.hash.slice(1)).split('..');
-  if (A[pair[0]]) pick('left', pair[0]);
-  if (A[pair[1]]) pick('right', pair[1]);
+  const [left, right] = decodeURIComponent(location.hash.slice(1)).split('..');
+  if (A[left]) pick('left', left);
+  pick('right', right && A[right] ? right : '');
   render();
 }
 window.addEventListener('hashchange', applyHash);
