@@ -201,6 +201,34 @@ pub fn lx_fusion_budget() -> usize {
         .unwrap_or(LX_FUSION_BUDGET_BYTES)
 }
 
+/// Per-core LX size in MB, as modelled: 2, matching `LXScratchpad::new(.., 2)` and
+/// [`LX_FUSION_BUDGET_BYTES`].
+pub const LX_CAPACITY_MB: i64 = 2;
+
+/// The per-core LX size to build a [`SpyreMemoryHierarchy`] with —
+/// [`LX_CAPACITY_MB`] unless overridden by `KTIR_LX_CAPACITY_MB`.
+///
+/// ⭐ WHY AN OVERRIDE, AND WHAT IT IS **NOT**. The same reason
+/// [`lx_fusion_budget`] has one, one step further down: a host with a different LX
+/// tunes it, and a test can SEPARATE TWO FAILURES THAT LOOK ALIKE. A program whose
+/// co-resident tiles exceed LX is refused by `track_lx_tile` before it computes
+/// anything, and that refusal reads exactly like a program that computes the wrong
+/// answer — both are "this configuration did not verify". Raising the capacity
+/// answers which: LX capacity is a RESIDENCY model and takes part in no
+/// arithmetic, so it can turn a refusal into a number but can never turn a WRONG
+/// number into a right one.
+///
+/// ⛔ IT DEFAULTS TO THE MODELLED 2 MB AND MUST STAY THERE. An unset variable is
+/// the device's own size, so every recorded LX refusal in this tree keeps its exact
+/// text; a caller that raises it owes the reader the reason at the call.
+pub fn lx_capacity_mb() -> i64 {
+    std::env::var("KTIR_LX_CAPACITY_MB")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(LX_CAPACITY_MB)
+}
+
 /// Per-core local scratchpad. Plain byte addressing, no stick concept.
 #[derive(Debug)]
 pub struct LXScratchpad {
@@ -259,7 +287,7 @@ pub struct SpyreMemoryHierarchy {
 impl SpyreMemoryHierarchy {
     pub fn new(num_cores: usize) -> Self {
         let lx = (0..num_cores)
-            .map(|c| Rc::new(UnsafeShared::new(LXScratchpad::new(c, 2))))
+            .map(|c| Rc::new(UnsafeShared::new(LXScratchpad::new(c, lx_capacity_mb()))))
             .collect();
         SpyreMemoryHierarchy {
             num_cores,

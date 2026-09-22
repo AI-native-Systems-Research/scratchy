@@ -680,6 +680,198 @@ pub fn assemble_pointwise_broadcast_hm(
     )
 }
 
+/// The operands and geometry of a GATHERED pointwise op — the parameter list of
+/// [`assemble_pointwise_broadcast_gather`], carried as a struct.
+///
+/// A struct rather than nine positional parameters because the sibling assemblers below predate that
+/// convention and each carries an `#[allow(clippy::too_many_arguments)]`; this follows
+/// [`lower_ktir_to_superdsc::rope_at`]'s `RopeAt` instead, which is the newer shape in this crate and
+/// adds no sixteenth `allow`.
+pub struct PointwiseGather<'a, O: KindTag> {
+    /// The descriptor's name.
+    pub op_name: &'a str,
+    /// The tile the KTIR program states. Its `dims` are the axis names the gather's pin is resolved
+    /// against, which is why the tile is passed rather than rebuilt from `rows`/`cols`.
+    pub tile_op: &'a crate::ir::island::tile_op::TileOp,
+    /// The `opFuncName` — a gather does NOT change it. `dxp/test/test_gather_1core/sdsc_1.json` is an
+    /// ordinary `identity` carrying one extra `labeledDs_` and one extra `computeOp_` field, so the
+    /// arithmetic this op names is whatever the program said.
+    pub op_func: &'static str,
+    pub rows: u32,
+    pub cols: u32,
+    /// The op's COMPUTE inputs, with the index buffer ALREADY EXCLUDED — that exclusion is
+    /// [`lower_ktir_to_superdsc::split_out_excluding`]'s, driven by the program.
+    pub inputs: &'a [EwOperand<'a>],
+    /// WHICH of `inputs` is read through the index. Must be the LAST input — see the refusal.
+    pub gathered_input: usize,
+    /// The index buffer's operand spelling — `crate::place::act_name(index_tid)`, the same form every
+    /// data operand here uses, so it resolves through the SAME [`BundleLayout`].
+    pub index_name: &'a str,
+    pub o: &'a Stk<O>,
+}
+
+/// ⭐⭐⭐ A POINTWISE OP ONE OF WHOSE INPUTS IS **GATHERED** — a row lookup `table[ids[row], :]`.
+///
+/// ## It is a CALLER of the gather, not a second gather
+/// Every field of the declaration comes from [`OpSpec::attach_gather_index`], which is already what
+/// [`crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec`] and
+/// [`crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec`] call. This is the third caller of that one
+/// door, so `Role::Index`, `Df::SenUint32`, the cross-linked alloc pair, `indirectAccessIndexLabeledDs`,
+/// the HBM-only `memOrg_` and the `maxDimSizes_` pin are all the emitter's existing behaviour reached
+/// from a new op shape — nothing about the marking is restated here.
+///
+/// ## ⭐ WHY A TABLE LOOKUP IS ONE PIN ON `mb` AND NOT THE PAGED-KV TWO
+/// [`GatherIndex::of_pool_blocks_per_row`] pins the slot axis for the page AND `mb` for the row, because
+/// a KV read has both a page coordinate and a request coordinate. A table lookup has only the row: one
+/// entry IS one row, so `entry_dim` is the op's own `mb` and `page` is
+/// [`PageExtent::single_position`]. dxp then derives `skip_addr = 1 x the per-core extents of the
+/// unpinned dims` = `cols`, i.e. one whole table row per index step, and the entries the host stages
+/// are plain row numbers. That pin is the vendor fixture's own shape —
+/// `zz_the_index_tensors_shape_is_the_paged_dims.rs` records `test_gather_1core` as
+/// `value maxDimSizes_ [1,-1,-1]` against `index layoutDimOrder_ ["mb"]`, and its op is an `identity`,
+/// not an attention.
+///
+/// ## ⛔ `cols` IS NOT LIMITED TO ONE STICK HERE, AND THAT IS NOT A WEAKENING OF `gather_copy_opspec`
+/// That builder refuses `cols != 64` because ITS destination must be CONTIGUOUS: a matmul kernel then
+/// reads the scratch per-batch at a stride dxp DERIVES, so a stick-major destination hands the score
+/// kernel another request's slots (its own "WHY THE DESTINATION BEING CONTIGUOUS IS THE POINT"). This
+/// op has no such consumer — its destination is an ordinary activation, written stick-major and read
+/// stick-major by the rest of the model, which is what every other pointwise here emits. An embedding
+/// row is `d_model` wide (4096 = 64 sticks) and must stay one row.
+///
+/// The half of that file's reasoning which DOES transfer is `skip_addr`, and it is enforced below.
+///
+/// ## ⛔ FALLIBLE, unlike its non-gathering siblings
+/// They panic because they run inside scratchy's `#[forward]` proc-macro, where a panic IS the build
+/// error. This door is reached from a third-party KTIR producer's driver, and every refusal below is a
+/// statement about the PROGRAM rather than about this crate — so it returns them.
+pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
+    g: PointwiseGather<'_, O>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, SuperDscError> {
+    let PointwiseGather {
+        op_name,
+        tile_op,
+        op_func,
+        rows,
+        cols,
+        inputs,
+        gathered_input,
+        index_name,
+        o,
+    } = g;
+    // ⛔ THE GATHERED INPUT MUST BE THE **LAST** ONE, because that is the only position at which the
+    // two placement laws coincide. `attach_gather_index` inserts the index at `out_idx` — immediately
+    // before the output, which is where the vendor puts it (`[input, index, output]`) and which keeps
+    // the output last however many operands are added. dbo separately needs the index to DOMINATE its
+    // use (`DSC2ToDataflowIR.cpp:51` reports `operand #1 does not dominate this use` otherwise), i.e.
+    // to sit next to the tensor it indexes. With the gathered input last, "before the output" and
+    // "after the value" are the same slot; with it earlier they are not, and this function cannot
+    // choose between them from what it is given. A program that gathers an earlier input is refused
+    // rather than emitted at whichever position happens to be reachable.
+    let last_input = inputs.len().checked_sub(1).ok_or_else(|| {
+        SuperDscError(format!(
+            "{op_name}: a gathered pointwise op has no inputs — there is no tensor for the index to \
+             select rows of"
+        ))
+    })?;
+    if gathered_input != last_input {
+        return Err(SuperDscError(format!(
+            "{op_name}: input {gathered_input} of {} is named as the gathered operand, but the index \
+             is inserted immediately before the OUTPUT (`attach_gather_index`, the vendor's \
+             `[input, index, output]` order) and dbo requires it to sit next to the tensor it indexes \
+             (`operand #1 does not dominate this use`, DSC2ToDataflowIR.cpp:51). Those are the same \
+             slot only for the LAST input. Reorder the op's inputs so the gathered one is last.",
+            inputs.len()
+        )));
+    }
+    // The OUTPUT kind drives the layout, exactly as in the sibling assemblers: a `Stk<FlatTag>` output
+    // is a head-major rank-3 op, a `Stk<RowBlockedTag>` output is the rank-2 stick-major token stream.
+    let head_major = O::kind() == StickKind::Flat;
+    let mut op = pointwise_broadcast_opspec_from_tile(
+        tile_op,
+        rows,
+        cols,
+        op_func_from_str(op_func),
+        inputs,
+        o.name(),
+        0,
+        head_major,
+    )
+    .map_err(SuperDscError)?;
+    // `inputs` are args `0..inputs.len()` and the output is pushed last, so an input's index IS its arg
+    // position — the same identity `emit_sdsc` relies on for `Tensor{i}-idx{i}`.
+    let ia = op
+        .attach_gather_index(
+            crate::superdsc_opspec::GatherIndex {
+                name: index_name.to_string(),
+                // ⭐ THE OP'S OWN ROW AXIS. One entry per row is what a table lookup IS.
+                entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                // ⭐ ONE POSITION — an entry is one row, so `skip_addr` is one row's `cols` elements.
+                page: crate::superdsc_opspec::PageExtent::single_position(),
+                // ⛔ NO SECOND PAGED AXIS. `out` is the factor `skip_addr` is made of; pinning it too
+                // would collapse an entry to a single element.
+                per_position: None,
+                // The whole index tensor. This op is not cut into one-stick runs — the entry count is
+                // the node's row count, checked against the index buffer's own view by the caller.
+                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+            },
+            gathered_input,
+        )
+        .ok_or_else(|| {
+            SuperDscError(format!(
+                "{op_name}: the gather declaration was refused for input {gathered_input}. Either the \
+                 op's work plan has no `mb` dim for the entries to enumerate, or `mb` does not divide \
+                 into whole entries. Both are properties of the tile the program states."
+            ))
+        })?;
+    // ⛔⛔⛔ ONLY THE ENTRY AXIS MAY CARRY A SPLIT, AND THIS IS THE HALF OF `gather_copy_opspec`'S
+    // REASONING THAT TRANSFERS TO ANY GATHER.
+    //
+    // dxp derives `skip_addr` as `page x the PER-CORE extents of the UNPINNED dims`
+    // (`getBufferCapacityForNodePerDim`, reproduced by `zz_skip_addr_computed_from_our_own_emission.rs`),
+    // so a split `out` DIVIDES the entry by the core count: at `cols = 4096` split 2 ways, `skip_addr`
+    // is 2048 against a host staging row numbers in units of 4096 — a clean bake whose every index step
+    // lands half a row short, i.e. fluent text assembled from two different rows. dbo also reduces the
+    // value tensor's per-core starts to a single `min` before deriving any address
+    // (`computeGatherMetadata`), so a core owning a COLUMN SLICE of an entry loses that slice and reads
+    // the entry from its start.
+    //
+    // ⭐ SPLITTING THE ENTRY AXIS IS THE ONE DIVISION THAT SURVIVES BOTH: a core owns whole entries,
+    // each row's base comes from the index, and the per-core index offset is carried through the
+    // conversion (`allocateAndModifyGather` preserves it "by computing the delta from the original
+    // minimum address and applying it uniformly"). `distribute_cores` splits `mb` first and spends only
+    // what is left on the other axes, so this is the division it already makes whenever the row count
+    // reaches the core count — and where it does not (a 1-row lookup, whose cores must come from `out`)
+    // this is an `Err` naming the axis rather than a descriptor whose cores all read column 0.
+    //
+    // ⛔ IT LIVES HERE RATHER THAN IN `attach_gather_index` DELIBERATELY. That door is shared with the
+    // KV paths, whose own divider (`gather_copy_cores`) already satisfies this by construction; adding a
+    // blanket refusal there would change a card-measured mechanism to restate what one of its callers
+    // already guarantees. Promoting it is a question for that door's two existing callers, not a thing
+    // to decide from here.
+    let entry_axis = ia.entry_dim.dim();
+    if let Some(d) = op
+        .iter
+        .dims()
+        .iter()
+        .find(|d| d.name != entry_axis && op.iter.split_of(d.name) > 1)
+    {
+        return Err(SuperDscError(format!(
+            "{op_name}: this op's work division splits `{}` {} ways, and only the entry axis \
+             (`{entry_axis}`) may carry a split. dxp derives `skip_addr` from the PER-CORE extents of \
+             the unpinned dims, so a split elsewhere shrinks what one index entry covers — every index \
+             step then lands a fraction of a row short, from a clean bake. Give the op enough rows for \
+             `distribute_cores` to spend its cores on `{entry_axis}` alone.",
+            d.name,
+            op.iter.split_of(d.name)
+        )));
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+}
+
 /// The per-chunk OUTPUT column offset (in elements) the emitter must apply for a
 /// COLUMN-BLOCK-SPLIT wide op. The tape splits wide ops (e.g. the granite MLP
 /// intermediate 12800 → the col-blocks `[0,8192)` + `[8192,12800)`) into multiple
