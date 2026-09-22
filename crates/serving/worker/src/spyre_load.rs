@@ -1189,6 +1189,13 @@ impl SpyreWorker {
                     .forward_shape(
                         scratchy_target_spyre::wiring::StagedRows::ONE,
                         true,
+                        // ⭐ AND THE GATHER'S ANSWER IS THIS BUNDLE'S OWN, from the layout being checked
+                        // — not `true` like the mask above. The mask's `true` asks for the WIDEST tensor
+                        // set because a launch may or may not stage a mask; a gather is not optional
+                        // that way. The index step exists iff this bake PLACED the index tensor, so
+                        // asking `true` here would report `KV_BLOCK_INDEX_TID` unplaced for every
+                        // non-gathering bundle and refuse to serve every model.
+                        scratchy_target_spyre::wiring::GathersKv::of_layout(&code.layout),
                         n_consts,
                     )
                     .unplaced(&code.layout);
@@ -1664,7 +1671,11 @@ impl SpyreWorker {
                 // is logged and SKIPPED — that batch runs on a narrower rung, in more than one
                 // forward, which is slower and never wrong.
                 let mut decode_ladder: Vec<DecodeRung> = Vec::new();
-                for (rung_n, rung_swept, sentinel) in g0.decode_rungs {
+                // ⛔ THE MANIFEST'S `SweptCols` IS DELIBERATELY NOT BOUND. It is the CEILING body's sweep —
+                // one number per BATCH WIDTH — and the two host decisions that used to read it are
+                // per-BODY (see `DecodeRung`). Binding it to `_` rather than to a name is the point: a
+                // named ceiling sitting in this loop is what got copied onto the rung three times.
+                for (rung_n, _ceiling_swept, sentinel) in g0.decode_rungs {
                     // ⛔ `RungSeqs::get`, so this reads a BATCH WIDTH and says so. The sibling ladder
                     // (`sk_bucket_rungs`) is keyed by the SWEEP EXTENT `active_cap`; selecting over it with
                     // `>= live` would bind a body baked for a 64-column sweep because four requests are
@@ -1823,9 +1834,11 @@ impl SpyreWorker {
                                 );
                                 decode_ladder.push(DecodeRung {
                                     seqs: rung_width,
-                                    swept: *rung_swept,
                                     mask_cap: rung_mask_cap,
                                     fold_rows,
+                                    // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
+                                    // per-BODY and this is per-bundle; see `DecodeRung`. The launch
+                                    // asks `sess.step_body(start)`, which is the selector itself.
                                     sess: rs,
                                     logits,
                                 });

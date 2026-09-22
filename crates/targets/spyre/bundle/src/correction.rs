@@ -19,7 +19,7 @@
 //! A malformed HCM is therefore a BUILD error naming the group, which is the only place a malformed
 //! compiler output can honestly be reported.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 
 /// Fold ID in the SuperDSC bundle (identifies which SDSC fold this symbol belongs to).
@@ -673,6 +673,74 @@ fn substitute_vars_in_dci(
 struct JobPlan {
     #[serde(rename = "JobExecPlan", default)]
     steps: Vec<JobStep>,
+    /// ⭐⭐⭐ WHERE THE IMAGE GOES AND HOW MUCH ROOM IT NEEDS — dxp's OTHER plan, and until now
+    /// unparsed.
+    ///
+    /// ⛔⛔⛔ THE PROGRAM IS NOT ALWAYS AT THE HEAD OF ITS ALLOCATION, and assuming it is cost this
+    /// campaign the whole batched-decode collapse. MEASURED over all 28 programs of both faulting
+    /// bundles (granite-3.1-2b fp8, batch widths 2 and 8): 26 declare
+    /// `Allocate{size: len} + InitTransfer{size: len, dev_ptr: PROG_OFFSET_BASE}`, and the one group
+    /// whose job count scales with the batch width declares
+    /// `Allocate{size: len + mq*128} + InitTransfer{size: len, dev_ptr: PROG_OFFSET_BASE + mq*128}`
+    /// — a prologue dxp reserves at the head of the allocation and does NOT fill. Its
+    /// `ComputeOnDevice.job_bin_ptr` is that same shifted address, which the launch has always
+    /// honoured as its bootstrap offset. Uploading at offset 0 while bootstrapping `mq*128` in made
+    /// the device read the image's own flit `mq` as its first job header: SW version `0x00` and a
+    /// zero flit count, reported as `syndrome=0xc00 [PrepZeroFlitCnt, PrepSwVer]` with
+    /// `job_count == 0` at exactly `PROG_OFFSET_BASE + mq*128`.
+    ///
+    /// Absent for every fixture written before this was read, hence `default` — an absent
+    /// preparation plan states nothing and constrains nothing.
+    #[serde(rename = "JobPreparationPlan", default)]
+    prep: Vec<PrepStep>,
+}
+
+/// One step of the preparation plan.
+#[derive(Deserialize)]
+struct PrepStep {
+    #[serde(default)]
+    command: PrepCommand,
+    #[serde(default)]
+    properties: serde_json::Value,
+}
+
+/// The preparation vocabulary, closed the same way [`JobCommand`] is and for the same reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
+enum PrepCommand {
+    /// Reserve this many bytes of program memory for the group.
+    Allocate,
+    /// Copy `init_bin_file`'s `size` bytes to `dev_ptr`.
+    InitTransfer,
+    /// Any step this port does not act on.
+    #[default]
+    Other,
+}
+
+impl From<String> for PrepCommand {
+    fn from(s: String) -> PrepCommand {
+        match s.as_str() {
+            "Allocate" => PrepCommand::Allocate,
+            "InitTransfer" => PrepCommand::InitTransfer,
+            _ => PrepCommand::Other,
+        }
+    }
+}
+
+/// `InitTransfer` properties: how many bytes of the image go, and to which device address.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct InitTransferCommand {
+    #[serde(default)]
+    size: DxpU64,
+    #[serde(default)]
+    dev_ptr: DxpU64,
+}
+
+/// `Allocate` properties: how much program memory the group needs, prologue included.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AllocateCommand {
+    #[serde(default)]
+    size: DxpU64,
 }
 
 /// One step of the plan: which command, and its properties.
@@ -754,9 +822,18 @@ impl<'de> Deserialize<'de> for DxpU64 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompiledProgram {
     /// `ComputeOnDevice.job_bin_ptr` — the device VA execution starts at.
+    ///
+    /// ⭐ IT IS ALSO THE IMAGE'S DESTINATION, and that is a build-time LAW here rather than a
+    /// coincidence: [`parse_spyrecode`] refuses any plan whose `InitTransfer.dev_ptr` names a
+    /// different address. So the one offset `job_bin_ptr - PROG_OFFSET_BASE` is where the upload goes,
+    /// where the device starts, and how much room the image needs above it — one quantity, used three
+    /// times, never recomputed from a second declaration.
     pub job_bin_ptr: u64,
     /// The finished correction flits, or empty when the program needs no correction step.
     pub correction: Vec<u8>,
+    /// `InitTransfer.size` when the plan states one — the bake checks it against the image file dxp
+    /// wrote, so a partial upload is a build failure instead of a program truncated on the card.
+    pub transfer_bytes: Option<u64>,
 }
 
 /// Parse one group's `spyrecode.json` and finish its program correction.
@@ -788,9 +865,50 @@ pub fn parse_spyrecode(label: &str, text: &str) -> Result<CompiledProgram> {
             JobCommand::Other => {}
         }
     }
+    // ⛔ THE PREPARATION PLAN IS CHECKED, NOT OBEYED SEPARATELY. Everything the launch needs about
+    // placement is already in `job_bin_ptr`; what the two steps below can do is DISAGREE with it, and
+    // a disagreement is a build failure naming the group rather than a device that starts executing
+    // somewhere the image is not.
+    let mut alloc_bytes: Option<u64> = None;
+    let mut transfer_bytes: Option<u64> = None;
+    for step in plan.prep {
+        match step.command {
+            PrepCommand::Allocate => {
+                let c: AllocateCommand = serde_json::from_value(step.properties)
+                    .map_err(|e| anyhow!("{label}: Allocate properties: {e}"))?;
+                alloc_bytes = Some(c.size.0);
+            }
+            PrepCommand::InitTransfer => {
+                let c: InitTransferCommand = serde_json::from_value(step.properties)
+                    .map_err(|e| anyhow!("{label}: InitTransfer properties: {e}"))?;
+                if c.dev_ptr.0 != job_bin_ptr {
+                    bail!(
+                        "{label}: dxp puts the image at {:#x} but starts execution at {job_bin_ptr:#x} \
+                         — the launch derives ONE offset from `job_bin_ptr` and uses it for both, so a \
+                         plan that separates them is not expressible. The device would read whatever \
+                         lies at the bootstrap as its first job header.",
+                        c.dev_ptr.0
+                    );
+                }
+                transfer_bytes = Some(c.size.0);
+            }
+            PrepCommand::Other => {}
+        }
+    }
+    // The allocation has to hold the prologue dxp reserves AND the image it then uploads. The launch
+    // sizes it from those two numbers directly; this only catches dxp asking for less than that.
+    if let (Some(a), Some(t)) = (alloc_bytes, transfer_bytes)
+        && a < t
+    {
+        bail!(
+            "{label}: dxp asks to allocate {a} B and then transfer {t} B into it — the image does not \
+             fit the allocation it declared"
+        );
+    }
     Ok(CompiledProgram {
         job_bin_ptr,
         correction,
+        transfer_bytes,
     })
 }
 
@@ -918,6 +1036,66 @@ mod tests {
         let e = parse_spyrecode("group_7", text).unwrap_err().to_string();
         assert!(e.contains("group_7"), "error must name the group: {e}");
         assert!(e.contains("no HCM"), "error must name what is missing: {e}");
+    }
+
+    /// ⭐ A PREPARATION PLAN MAY PLACE THE IMAGE ABOVE `PROG_OFFSET_BASE`, and then the bootstrap says
+    /// where: dxp reserves a prologue it does not fill and points `ComputeOnDevice` past it. The parse
+    /// keeps `job_bin_ptr` as that one address and reports the declared transfer length.
+    ///
+    /// Fail-first: dropping the `JobPreparationPlan` field leaves `transfer_bytes` `None`, so the
+    /// bake's image-length check goes silent.
+    #[test]
+    fn a_prologue_before_the_image_parses_and_the_bootstrap_names_it() {
+        let text = r#"{"JobExecPlan":[
+            {"command":"ComputeOnDevice","properties":{"job_bin_ptr":"120259084544"}}
+        ],"JobPreparationPlan":[
+            {"command":"Allocate","properties":{"size":"295168"}},
+            {"command":"InitTransfer","properties":{"init_bin_file":"init_binary.bin",
+                "size":"294912","dev_ptr":"120259084544"}}
+        ]}"#;
+        let p = parse_spyrecode("group_1", text).unwrap();
+        assert_eq!(p.job_bin_ptr, 120259084544);
+        assert_eq!(p.transfer_bytes, Some(294912));
+    }
+
+    /// ⛔ AND A PLAN THAT SEPARATES THE TWO IS A BUILD ERROR. The launch derives ONE offset from
+    /// `job_bin_ptr` and uses it as both the upload destination and the bootstrap, so a plan uploading
+    /// somewhere else is not expressible — and silently honouring only one of them is exactly the
+    /// defect this pair of fields was added to close: the device read the image's own flit `mq` as its
+    /// first job header and refused it with `PrepZeroFlitCnt`/`PrepSwVer`.
+    #[test]
+    fn an_image_placed_away_from_the_bootstrap_is_a_build_error() {
+        let text = r#"{"JobExecPlan":[
+            {"command":"ComputeOnDevice","properties":{"job_bin_ptr":"120259084544"}}
+        ],"JobPreparationPlan":[
+            {"command":"Allocate","properties":{"size":"295168"}},
+            {"command":"InitTransfer","properties":{"init_bin_file":"init_binary.bin",
+                "size":"294912","dev_ptr":"120259084288"}}
+        ]}"#;
+        let e = parse_spyrecode("group_1", text).unwrap_err().to_string();
+        assert!(e.contains("group_1"), "error must name the group: {e}");
+        assert!(
+            e.contains("0x1c00000000") && e.contains("0x1c00000100"),
+            "error must name both addresses: {e}"
+        );
+    }
+
+    /// An image larger than the allocation dxp asked for is a build error too — the two numbers come
+    /// from the same plan, so their disagreement is dxp's, not the card's.
+    #[test]
+    fn an_image_that_does_not_fit_its_allocation_is_a_build_error() {
+        let text = r#"{"JobExecPlan":[
+            {"command":"ComputeOnDevice","properties":{"job_bin_ptr":"64"}}
+        ],"JobPreparationPlan":[
+            {"command":"Allocate","properties":{"size":"128"}},
+            {"command":"InitTransfer","properties":{"size":"256","dev_ptr":"64"}}
+        ]}"#;
+        let e = parse_spyrecode("group_4", text).unwrap_err().to_string();
+        assert!(e.contains("group_4"), "error must name the group: {e}");
+        assert!(
+            e.contains("does not fit"),
+            "error must say what is wrong: {e}"
+        );
     }
 
     #[test]

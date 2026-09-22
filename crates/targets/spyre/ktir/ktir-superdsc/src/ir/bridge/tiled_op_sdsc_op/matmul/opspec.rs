@@ -153,6 +153,97 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
     )
 }
 
+/// THE KERNEL'S OPERAND POSITION in every matmul this module builds — `[a, w, o]`, so 1.
+///
+/// ⭐ NAMED HERE, IN THE MODULE THAT ORDERS THE OPERANDS, so nobody downstream re-derives it. The
+/// gathered assembler used to pass a literal `1` from two files away; a reordering of `[a, w, o]`
+/// would have made that literal point at the ACTIVATION, gathering the query stream through the KV
+/// page table — a clean bake and complete nonsense.
+const KERNEL_OPERAND: usize = 1;
+
+/// [`matmul_opspec_off_operands_phys`] WITH ITS KERNEL READ THROUGH AN INDEX — the hardware gather.
+///
+/// ⭐ THE GATHER IS ATTACHED BY THE BUILDER THAT ORDERED THE OPERANDS, which is what makes this
+/// total-by-construction rather than checked: `matmul_opspec_split` has just produced `[a, w, o]`, so
+/// [`KERNEL_OPERAND`] exists and is not the output, and [`KernelAxis`] is closed over the kernel's own
+/// two dims. The one remaining failure — a shortfall in the operand list — joins the `Result` the
+/// caller ALREADY unwraps, so the gathered path adds no second failure channel and no `panic!` of its
+/// own.
+///
+/// `None` builds byte-for-byte what the ungathered builder does.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_opspec_off_operands_phys_gathered<DF: DataFormat>(
+    m: MatM,
+    n: MatN,
+    k: MatK,
+    batch: MatY,
+    form: SharedKernelBmmForm,
+    a_name: &str,
+    w_name: &str,
+    o_name: &str,
+    a_off: u32,
+    w_off: u32,
+    o_off: u32,
+    operand_df: Df,
+    phys_mb: Option<PhysM>,
+    gather: Option<crate::superdsc_opspec::GatherIndex>,
+) -> Result<OpSpec, String> {
+    let mut op = matmul_opspec_off_operands_phys::<DF>(
+        m, n, k, batch, form, a_name, w_name, o_name, a_off, w_off, o_off, operand_df, phys_mb,
+    )?;
+    if let Some(g) = gather {
+        // ⭐⭐⭐⭐⭐ A BATCH-PAGED GATHER NEEDS THE KERNEL TO **DECLARE** `mb`, so re-declare it rank-3
+        // before the pins are resolved against its layout.
+        //
+        // `matmul_opspec_split` builds the kernel as the bare 2-D shared weight `["in","out"]` — right
+        // for every ungathered matmul, and the comment there records why: "a 3-D kernel makes dxp treat
+        // the weight as per-batch → garbage". That is a statement about a DIRECTLY ADDRESSED weight,
+        // whose per-batch base would be a stride dxp DERIVES from the declared extents — a stride the
+        // paged KV pool does not have, hence garbage. Under `isStartAddrSymbolic_` there is no derived
+        // base at all: every batch row's address comes from its own index entry. Per-batch is then
+        // exactly the semantics wanted, and IBM's own gathered value tensor is rank-4 WITH `mb`.
+        //
+        // ⛔ SO THE RANK-3 KERNEL IS SOUND ONLY *WITH* THE GATHER, and that pairing is why this lives
+        // here — inside the gathered builder, reachable only when a gather is being attached — rather
+        // than as a flag on the 2-D builder that something could set on its own.
+        if g.per_position == Some(crate::superdsc_opspec::KernelAxis::Batch) {
+            let stick = crate::superdsc_opspec::KernelAxis::Slot.dim();
+            let layout = [
+                crate::superdsc_opspec::KernelAxis::Feature.dim(),
+                stick,
+                crate::superdsc_opspec::KernelAxis::Batch.dim(),
+            ];
+            // ⭐ THE `["in","out"]` PREFIX IS PRESERVED, so the ungathered walk's dim order is the
+            // rank-3 walk's prefix and only the appended `mb` is new. A reordering here would move
+            // every stride on the operand, which is not what declaring one more axis should do.
+            let kernel = TensorArg::<3>::new(
+                true,
+                w_name.to_string(),
+                Role::Kernel,
+                [Scale::Active; 3],
+                op.iter.iter_syms(layout),
+                layout,
+                stick,
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(w_off)
+            .with_df(operand_df);
+            *op.args.get_mut(KERNEL_OPERAND).ok_or_else(|| {
+                format!("no operand at {KERNEL_OPERAND} to re-declare as the kernel")
+            })? = AnyTensorArg::R3(kernel);
+        }
+        op.attach_gather_index(g, KERNEL_OPERAND).ok_or_else(|| {
+            format!(
+                "the matmul has {} operand(s), so position {KERNEL_OPERAND} is not a kernel a \
+                     gather can read through",
+                op.args.len()
+            )
+        })?;
+    }
+    Ok(op)
+}
+
 /// [`matmul_opspec_off`] with an INJECTABLE work-division `splitter` — the SEAM the Kani-verified tower
 /// (`scratchy-sdsc`) drives: it passes a `CoreSplit`-derived splitter so the emitted SDSC uses the PROVEN
 /// 32-core partition (disjoint+covering, #50-free by proof), while this fn keeps owning the ABI OpSpec /
@@ -478,6 +569,7 @@ where
         op_info: OpInfo::None,
         tiled_symbols,
         time_tile,
+        indirect: None,
     })
 }
 
@@ -657,6 +749,14 @@ pub fn matmul_opspec_batched_off(
     o_off: u32,
     kernel_device_extent: Option<(&'static str, u32)>,
 ) -> Result<OpSpec, String> {
+    // ⛔⛔⛔ THIS FORM IS NOT FOR REQUESTS, AND THAT IS A CARD MEASUREMENT. A `RequestAxis` parameter here
+    // once carried the three `y` steps a request-batched fold leg would take, checked against the walk
+    // this function declares. The form it guarded — a per-batch 3-D `[y,in,out]` KERNEL, one distinct
+    // weight start per core — faulted at `job_bin_ptr + numCoresUsed_*128` at every rung, one flit past
+    // the program's per-core patch table, and rung 4's `{mb:1, y:4}` (the proven solo-decode split)
+    // faulted identically, so the kernel RANK is the fault and not the split. The collapsed fold now
+    // emits the shared-2-D-kernel form per request; see `attn.rs`'s collapsed-fold arm.
+    //
     // The floor of the typed run for the batched form: raw extents from here down.
     let (m, n, k, batch) = (m.get(), n.get(), k.get(), batch.get());
     let n_ext = StickExtent::<Fp16>::new(n)?;
@@ -750,5 +850,6 @@ pub fn matmul_opspec_batched_off(
         op_info: OpInfo::None,
         tiled_symbols,
         time_tile,
+        indirect: None,
     })
 }

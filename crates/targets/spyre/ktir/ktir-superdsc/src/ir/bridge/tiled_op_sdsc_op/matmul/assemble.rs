@@ -666,6 +666,97 @@ pub fn assemble_matmul_off_phys_m_with_epilogue<
     )
 }
 
+/// ⭐⭐⭐⭐⭐ [`assemble_matmul_off_phys_m_with_epilogue`] WITH ITS KERNEL READ THROUGH AN INDEX — the
+/// hardware gather, on the leg that reads KV.
+///
+/// This is what indirect addressing is FOR in attention: the score leg's Kᵗ operand stops being reached
+/// through a base this launch baked and becomes `addr = idx * skip_addr + base`, so every row reads its
+/// OWN keys from one launch instead of one launch per request. `SessionKv::fold_requests` names the cost
+/// that removes — *"ONE LAUNCHED OP HAS ONE PAGE BASE, so B requests cannot share a pass: the fold runs
+/// `pages x requests` times"*.
+///
+/// `gather` is `(index operand name, the kernel axis one index entry advances)`. Which OPERAND is the
+/// kernel is not this function's to say — `matmul_opspec_off_operands_phys_gathered` attaches the pair
+/// inside the builder that ordered `[a, w, o]`, so the position is answered where it is decided, and
+/// the axis is a closed [`crate::superdsc_opspec::KernelAxis`] rather than a dim name that could miss.
+/// Together those two make the declaration either right or unwritable: an index tensor with no
+/// declaration — which dxp reads as an ordinary arithmetic input — is not reachable from here.
+///
+/// ⛔ THE ONE THING THAT MAKES OR BREAKS IT IS `skip_addr`, AND WE DO NOT SUPPLY IT. dxp derives it from
+/// the value tensor's own per-dim capacities, so it equals ONE ENTRY'S SIZE, and the index steps whatever
+/// that is. Declare an entry smaller than the pool's real page stride and every index step lands a
+/// fraction of a page in — fluent text built from another request's keys, from a CLEAN BAKE, with every
+/// counter green. `zz_skip_addr_computed_from_our_own_emission.rs` recomputes dxp's own derivation off
+/// the emitted JSON for exactly this reason. ⛔ CHECK IT BEFORE BAKING; a card run cannot tell you.
+///
+/// `None` emits byte-for-byte what the ungathered assembler does — the indirect fields are absent from
+/// the descriptor when undeclared, which the gather-free test asserts rather than assumes.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
+    O: crate::sdsc_abstract::KindTag,
+    E: crate::sdsc_abstract::KindTag,
+>(
+    op_name: &str,
+    m: MatM,
+    n: MatN,
+    k: MatK,
+    batch: MatY,
+    form: SharedKernelBmmForm,
+    a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    a_place: OperandPlacement,
+    w: &Stk<crate::sdsc_abstract::KernelTag>,
+    w_off: crate::addr::DevOff,
+    o: &Stk<O>,
+    o_off: crate::addr::DevOff,
+    epi: &Stk<E>,
+    epi_off: crate::addr::DevOff,
+    epi_op_func: crate::superdsc_opspec::EpilogueOpFunc,
+    broadcast_dims: &[(&str, crate::superdsc_opspec::Scale)],
+    broadcast_batch: bool,
+    gather: Option<crate::superdsc_opspec::GatherIndex>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> crate::emit::EmittedOp {
+    // Same three offsets, from the same places, as the ungathered sibling — the activation's comes from
+    // its PLACEMENT, so this entry point cannot pair a law's pitch with a hand-added offset.
+    let (a_off_raw, w_off_raw, o_off_raw) = (
+        a_place.off().into_raw_elems(),
+        w_off.into_raw_elems(),
+        o_off.into_raw_elems(),
+    );
+    let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
+    // ONE failure channel: the gather is attached inside the builder, so a shortfall arrives as the
+    // same `Err` the ungathered path already reports, at the same `cargo build`.
+    let op = super::opspec::matmul_opspec_off_operands_phys_gathered::<Fp16>(
+        m,
+        n,
+        k,
+        batch,
+        form,
+        a_name,
+        w_name,
+        o_name,
+        a_off_raw,
+        w_off_raw,
+        o_off_raw,
+        <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
+        Some(a_place.head_pitch()),
+        gather,
+    )
+    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    assemble_from_opspec_with_epilogue(
+        op_name,
+        op,
+        epi,
+        epi_off,
+        epi_op_func,
+        broadcast_dims,
+        broadcast_batch,
+        sym_id_base,
+        layout,
+    )
+}
+
 /// [`assemble_matmul_off`] for the TRUE PER-BATCH (3-D-kernel) batchmatmul: ONE op covering
 /// `batch` kv-heads instead of `batch · gqa` per-head ops. See [`matmul_opspec_batched_off`] for
 /// the offset / `kernel_device_extent` contract.
@@ -820,3 +911,18 @@ mod out_width_caps {
         );
     }
 }
+
+// ⛔⛔⛔ WHAT WAS HERE, AND WHY IT IS GONE: `assemble_matmul_requests_off_maybe_epilogue` — the
+// per-batch-3-D-KERNEL bmm carrying a `RequestAxis`, built for the collapsed fold's two legs. Its form
+// is REFUTED ON CARD. A `[y,in,out]` kernel gives every core its own weight start, so with `mb` pinned
+// to 1 and a one-stick `out` the `y` split IS `numCoresUsed_`, and the launch faulted at
+// `job_bin_ptr + numCoresUsed_*128` — one flit past the program's per-core patch table — at rungs 2, 4
+// and 8 alike, syndrome `0xc00` / locator `0x2` / cases `[PrepZeroFlitCnt,PrepSwVer]` bit-identical with
+// only the index moving. Rung 4 closed it: `{mb:1, y:4}` is the on-hardware-proven solo-decode split, so
+// the split VALUE is exonerated and the kernel RANK is what the address is made of.
+//
+// The collapsed fold now emits one op per (request, kv head) through
+// `assemble_matmul_off_phys_m_with_epilogue` — the SHIPPED shared-2-D-kernel form, `y` on the GQA group —
+// and reaches request `r`'s block by a baked offset (`GatherScratch::kernel_row_off`). Nothing in
+// attention declares a 3-D kernel any more, which is asserted on the emitted descriptors by
+// `zz_the_declared_y_of_every_gathered_op`.

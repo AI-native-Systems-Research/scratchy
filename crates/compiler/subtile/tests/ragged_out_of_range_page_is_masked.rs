@@ -72,7 +72,7 @@ fn a_pass_past_a_rows_own_pages_has_no_valid_column() {
     // page from a row's own count up to that is out of range FOR THAT ROW, which is what this checks.
     let grid = FoldPages::covering(BatchSlot::of(hists.iter()), SlotCount::new(PER_PAGE))
         .expect("at least one page")
-        .grid(rung);
+        .grid(rung, MaskBlockForm::PerRowPage);
     let max_pages = grid.pages().get();
     let bytes = decode_batch_prefix_mask_f16::<PER_PAGE>(shape, declare(grid), &hists, -30000.0);
 
@@ -138,7 +138,7 @@ fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
     // `n_fold_pages` computes. Deriving it here rather than restating it is the whole point of the type.
     let grid = FoldPages::covering(at, SlotCount::new(PER_PAGE))
         .expect("at least one page")
-        .grid(rung);
+        .grid(rung, MaskBlockForm::PerRowPage);
     let max_pages = grid.pages().get();
     assert_eq!(
         max_pages as usize,

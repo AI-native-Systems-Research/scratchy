@@ -152,6 +152,7 @@ struct BlockBufs {
 /// The nests this block addresses through. Every extent an offset below is allowed to use comes from
 /// here, so a stride cannot be written at a call site — the caller names a coordinate and the nest
 /// supplies the arithmetic. `slabs` answers through the one `hd / lanes` law (`Shape::slabs_of`).
+#[derive(Clone, Copy)]
 struct BlockNests {
     /// The head count this stream is WIDE in — nqh for the query side, nkvh for the kv side. Kept
     /// explicitly rather than derived from `rows/mq`, because the two are independent quantities.
@@ -163,13 +164,15 @@ struct BlockNests {
     /// means — see [`BlockRows`]: the whole-batch `nqh*mq` and the per-request `nqh` are one value
     /// each, so a per-request extent cannot be paired with the whole-batch row law or vice versa.
     rows: BlockRows,
-    /// WHICH request this op set names, when the regime is per-request. Ignored otherwise.
+    /// WHICH request this op set names — the MINOR coordinate of both row laws
+    /// ([`crate::sdsc_abstract::HeadRequestRow`] / [`crate::sdsc_abstract::RequestHeadRow`]).
     ///
-    /// The prefix fold leaves it 0: its ops are emitted once and the RUNTIME rebases each pass onto
-    /// its own request's block, so naming a request at emit would double-count. The new-token block
-    /// is the opposite — it is not folded, nothing rebases it, so it is emitted once PER request and
-    /// each copy names its own here. Same row law, two ways of supplying the request term, which is
-    /// why it is a field and not a parameter of `head_row`.
+    /// An op that sweeps a head's whole `mq` rows leaves it 0 and the request rides inside its block:
+    /// the shipped prefix fold does that, and the RUNTIME rebases each pass onto its own request. An op
+    /// that computes ONE row names which — the new-token block (emitted once per request, since nothing
+    /// rebases it) and the COLLAPSED fold's per-request score/value legs, which reach it through
+    /// [`Self::at_request`]. Same row law for all three, which is why it is a field and not a parameter
+    /// of `head_row`.
     req: u32,
 }
 
@@ -245,14 +248,30 @@ impl BlockNests {
             }
             // THE ONE ROW LAW, shared with the mask that says which of these rows are valid. Restating
             // `h * self.mq` here is what let the two drift.
+            //
+            // ⭐ AND THE REQUEST IS THIS BLOCK'S OWN, exactly as the per-request branch above reads it —
+            // a hardcoded `0` here was right only while every op swept a head's whole `mq` rows. It is
+            // still 0 for every op that does; the collapsed fold's per-request legs re-base these nests
+            // onto their own request, which is what lets their kernel be a plain shared 2-D weight.
             BlockRows::WholeBatch(_) => {
-                crate::sdsc_abstract::HeadRequestRow::of(h, 0, self.mq.get()).get()
+                crate::sdsc_abstract::HeadRequestRow::of(h, self.req, self.mq.get()).get()
             }
         };
         Idx::<crate::addr::Row>::n(row)
     }
     fn slabs(&self) -> u32 {
         crate::addr::Shape::<0, 0, 0, 0>::slabs_of(self.hd, crate::superdsc_opspec::Df::Fp16).get()
+    }
+    /// ⭐⭐⭐⭐⭐ THESE NESTS RE-BASED ONTO **ONE REQUEST** — the collapsed fold's per-request legs, in one
+    /// coordinate change.
+    ///
+    /// Every buffer this block addresses is framed with the request as the row law's MINOR coordinate,
+    /// so "request `r`'s slice of the block" is not four offsets composed at a call site: it is the same
+    /// four laws asked for a different row. That is what makes a per-request OFFSET a substitute for a
+    /// per-request kernel DIM — the shape the card refused — and what keeps the emitter's rows the same
+    /// rows the mask's validity is staged into.
+    fn at_request(&self, r: u32) -> BlockNests {
+        BlockNests { req: r, ..*self }
     }
     /// Head-major `[nqh*mq, hd]` — the online-softmax buffers. Head `h`, slab `s`.
     /// The online-softmax buffers are rank-2 `[rows, hd]` with the heads stacked ON THE ROW AXIS, so
@@ -292,7 +311,9 @@ impl BlockNests {
                 )
             }
             BlockRows::WholeBatch(rows) => {
-                crate::sdsc_abstract::OperandPlacement::of_head_major_rows(h, self.mq, rows, width)
+                crate::sdsc_abstract::OperandPlacement::of_head_major_rows(
+                    h, self.req, self.mq, rows, width,
+                )
             }
         }
     }
@@ -301,7 +322,9 @@ impl BlockNests {
     /// plane pitch (`mq` rows) with the offset. Head `h`'s slab `s` is the COLUMN `h*hd + s*stick`,
     /// and the stick plane it lands in is the law's business, not the caller's.
     fn token_stream(&self, h: u32, s: u32) -> crate::sdsc_abstract::OperandPlacement {
-        crate::sdsc_abstract::OperandPlacement::of_token_stream(self.mq, self.heads, self.hd, h, s)
+        crate::sdsc_abstract::OperandPlacement::of_token_stream(
+            self.mq, self.heads, self.hd, h, self.req, s,
+        )
     }
     /// The same stream, for a walk that contracts ONE STICK per op — see
     /// [`OperandPlacement::of_token_stream_by_slab`]. The pitch differs; the offset and the head
@@ -312,9 +335,109 @@ impl BlockNests {
             self.heads,
             self.hd,
             h,
+            self.req,
             s,
             crate::superdsc_opspec::Df::Fp16,
         )
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD'S PER-REQUEST KERNEL PLACEMENT — the gathered scratch this block's ops
+/// read, and WHICH 64-slot window of it they are.
+///
+/// ⛔ ONE VALUE BECAUSE BOTH LEGS MOVE TOGETHER. `reps` is a property of the GROUP: the runtime launches
+/// the whole fold once per pass, so a pass serves the batch only if EVERY leg in it does. A score leg
+/// emitted per request beside a value leg emitted once computes every request's scores and then applies
+/// request 0's values to all of them — fluent, wrong, and it would look like a working collapse in the
+/// launch count. `Some` therefore means "this block's score AND value legs are per-request".
+///
+/// ⛔ AND IT CARRIES NO STRIDE, WHICH IS THE WHOLE FIX. It used to carry two `RequestAxis`es — the three
+/// `y` steps a per-batch-KERNEL matmul would take. That form is refuted on card (`numCoresUsed_` collapses
+/// onto the request count and the launch faults at `job_bin_ptr + cores*128`), so nothing strides across
+/// requests any more: each request gets its OWN op, whose three bases are the block's nests re-based by
+/// [`BlockNests::at_request`] and whose kernel base is
+/// [`crate::sdsc_abstract::GatherScratch::kernel_row_off`].
+#[derive(Clone, Copy)]
+struct GatheredFold {
+    scratch: crate::sdsc_abstract::PageScratch,
+    /// The pool, because the gathered kernel base IS the pool's own address plus a request row — see
+    /// [`crate::sdsc_abstract::PageScratch::coord_off`]. Carrying it means this type composes no address
+    /// arithmetic of its own.
+    pool: crate::sdsc_abstract::PagedKvPool,
+    /// WHICH 64-slot window of the PAGE these ops read — the same `SlotWindow` the block's own name and
+    /// mask slab come from, so the kernel column block and the mask column block cannot describe
+    /// different slots.
+    ///
+    /// ⭐ THE WINDOW SURVIVES THE GRANULARITY CHANGE, AND ONLY THE GATHER'S GRANULARITY CHANGED. The
+    /// scratch now holds a whole PAGE per request, so the fold's tile stays a 64-slot window read OUT of
+    /// that page — exactly as the UNGATHERED legs already read one out of the pool. That is why the sweep,
+    /// the mask blocking and the online-softmax state are untouched by this change.
+    window: SlotWindow,
+}
+
+impl GatheredFold {
+    /// Requests this pass serves — the scratch's own extent, which is also what the host's index table
+    /// was staged for.
+    fn requests(self) -> u32 {
+        self.scratch.mq()
+    }
+    /// ⭐⭐⭐⭐⭐ THE KERNEL BASE for (this window, kv head `kvh`, request `r`) — **the POOL'S OWN ADDRESS
+    /// plus request `r`'s row**, with no arithmetic spelled here.
+    ///
+    /// ⛔ WHAT THIS REPLACES, AND WHY THE OLD FORM WAS THE BUG. It was `GatherScratch::kernel_row_off`,
+    /// which re-derived the window term against a scratch whose rows were 64-slot blocks — a SECOND
+    /// derivation of where a window lives, beside [`crate::sdsc_abstract::PagedKvPool::addr`]'s. At page
+    /// granularity the scratch row is a byte-for-byte copy of the page plane, so the base is the same
+    /// `KvCoord` the ungathered closures build, offset by `r * cols`. One law, both paths.
+    ///
+    /// `plane` is the operand's own plane: the score leg reads Kᵗ, the value leg V. Passing it means the
+    /// two legs cannot silently read one plane's arrangement at the other's offset.
+    ///
+    /// ⭐⭐⭐⭐⭐ AND IT TAKES THE HEAD-DIM **SLAB**, WHICH IS THE WHOLE hd=128 FIX ON THIS SIDE. Both
+    /// gathered legs are one op per (kv head, request, SLAB) — the score leg because a `y`-batched
+    /// contraction must be ONE STICK, the value leg because a `y`-batched `out` must be one stick — and
+    /// the slab reaches the address the same way the ungathered closures send it: through
+    /// [`crate::sdsc_abstract::PagedKvPool::addr`]'s own `at_feat`. A slab added onto a finished offset
+    /// here would be a SECOND derivation of where a feature slab lives, which is the exact class of
+    /// defect `coord_off` exists to remove.
+    ///
+    /// ⛔ IT WAS HARDCODED TO SLAB 0 — not as an argument, as an ABSENCE: the two legs never mentioned a
+    /// slab, so at hd=128 the score leg contracted two sticks in one op and the value leg wrote only the
+    /// lower half of every output head. Both bake clean. See [`crate::sdsc_abstract::PageScratch::of_pass`].
+    fn kernel_off(
+        self,
+        kvh: crate::sdsc_abstract::KvHead,
+        r: u32,
+        plane: crate::sdsc_abstract::KvPlane,
+        slab: u32,
+    ) -> Result<crate::addr::DevOff, SuperDscError> {
+        let coord = crate::sdsc_abstract::KvCoord::block(plane, kvh)
+            .at_slot(self.window.first_slot())
+            .at_feat(FeatIdx::of_slab(slab));
+        let off = self
+            .scratch
+            .coord_off(r, &self.pool, coord)
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "the collapsed fold's kernel for ({plane:?}, kv head {}, window {}, slab {slab}, \
+                     request {r}) is outside the gathered scratch: the scratch holds {} request row(s) \
+                     of {} element(s). A base past a row reads into the NEXT request's page — fluent, \
+                     wrong, no fault.",
+                    kvh.get(),
+                    self.window.index(),
+                    self.scratch.rows(),
+                    self.scratch.cols(),
+                ))
+            })?;
+        u32::try_from(off)
+            .map(crate::addr::DevOff::from_view_step)
+            .map_err(|_| {
+                SuperDscError(format!(
+                    "the gathered kernel base for ({plane:?}, kv head {}, request {r}) is {off} \
+                     elements, which does not fit the descriptor's offset width",
+                    kvh.get(),
+                ))
+            })
     }
 }
 
@@ -651,15 +774,23 @@ fn assemble_attn_block(
     // WHICH request, when the row regime is per-request. 0 for the fold — the runtime rebases each
     // pass, so naming one here would count it twice. The new-token block passes its own `r`.
     req: u32,
-    // ONE PASS FOR THE WHOLE BATCH: give the score and value KERNELS a request axis, so row `h*mq+r`
-    // reads request `r`'s own page instead of request 0's. `Some(mq)` only for the prefix fold of a
-    // batched decode; `None` everywhere else, which emits exactly what shipped.
+    // ⭐⭐⭐⭐⭐ ONE PASS FOR THE WHOLE BATCH: give the score and value legs a REQUEST axis over the
+    // GATHERED SCRATCH, so row `h*mq+r` reads request `r`'s own page in the same launch. `Some` only for
+    // the prefix fold of a gathered batched decode; `None` everywhere else, which emits exactly what
+    // shipped.
     //
-    // This is what turns the fold's `pages × requests` launches into `pages` — 8 of the 12 a bs=8
-    // layer paid, at the ~93 µs a launch costs whatever it carries. The runtime half is gated on
-    // `OpKv::batched_requests`, and the mask's shape (one block per PAGE, every row valid on its own
-    // request's history) is the same decision seen from the host side. All three move together.
-    _request_axis: Option<u32>,
+    // This is what turns the fold's `pages × requests` launches into `pages`. The runtime half is gated
+    // on `OpKv::batched_requests`, and the mask's shape (`MaskBlockForm::PerPage` — one block per page,
+    // every row valid on its own request's history) is the same decision seen from the host side. All
+    // three move together, and the gather is the precondition for any of them: without it the axis walks
+    // an operand with no uniform per-request pitch, which is the fluent-garbage mechanism three earlier
+    // attempts hit.
+    //
+    // ⛔ THE VALUE CARRIES THE STRIDES, NOT A COUNT. It used to be `Option<u32>` — the request count —
+    // and the strides were left to be derived from whatever extents were in scope. `RequestAxis` carries
+    // each of the three `y` steps differenced out of the buffer that has it, and the builder refuses a
+    // walk that would step differently.
+    request_axis: Option<GatheredFold>,
     bufs: &BlockBufs,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -785,10 +916,143 @@ fn assemble_attn_block(
     } else {
         &[]
     };
+    // ⭐⭐⭐⭐⭐ THE COLLAPSED-FOLD ARM — **`mq` COPIES OF THE SHIPPED OP, ONE PER REQUEST, IN ONE PASS.**
+    //
+    // ⛔⛔⛔ THE `y = REQUEST` FORM IS REFUTED ON CARD AND MUST NOT COME BACK. Carrying the requests on
+    // `y` needs a per-batch 3-D `[y,in,out]` KERNEL — the one operand in the bundle whose per-core start
+    // count goes from ONE to `mq` — and with `mb` pinned to 1 and a one-stick `out` that `y` split IS
+    // `numCoresUsed_`. Every rung faulted at `job_bin_ptr + numCoresUsed_*128`, one flit past the
+    // program's per-core patch table (`init_binary.bin = 1920 + 128*cores`): rung 2 at +0x100, rung 4 at
+    // +0x200, rung 8 at +0x400, syndrome `0xc00` / locator `0x2` / cases `[PrepZeroFlitCnt,PrepSwVer]`
+    // bit-identical, only the index moving. Rung 4 is the discriminator that closed it: `{mb:1, y:4}` is
+    // `matmul/dims.rs`'s on-hardware-proven solo-decode split, so the `y`-split VALUE is exonerated and
+    // the 3-D kernel is what the address is made of.
+    //
+    // ⭐⭐⭐ AND THE GATHER IS WHAT MAKES THE DIM UNNECESSARY, which is the whole reason the scratch
+    // exists. The scratch destination is CONTIGUOUS and request-MINOR: the index already put request
+    // `r`'s KV block where `r` needs it, so `r`'s kernel is reached by a baked OFFSET — exactly as a GQA
+    // group's shared kv head is reached by `kt_off_fn`'s. So this arm emits the SHIPPED shape: `y` back on
+    // the GQA group with a bare 2-D `[in,out]` kernel (`MatY::of_gqa_group` +
+    // `assemble_matmul_off_phys_m_with_epilogue`), `mb` = ONE ROW, and the request supplied as a
+    // coordinate of all four laws (`BlockNests::at_request`). At `mq == 1` that is BYTE-FOR-BYTE the solo
+    // decode op that runs at 41 tok/s today; at `mq > 1` it is that op `mq` times, and `numCoresUsed_` is
+    // `{y:4, mb:1}` = 4 at EVERY rung.
+    //
+    // ⭐ THE OP COUNT IS THE TRADE, AND IT IS THE ONE TO WANT. `nkvh*mq` ops in ONE pass against the
+    // shipped `nkvh` ops in each of `mq` passes — the SAME op count, `mq`× fewer launches — and each op
+    // now computes ONE row where the shipped one computes `mq` and masks `mq-1` of them away. Measured:
+    // 1.42 µs per op against ~28 µs per fold pass.
+    //
+    // ⛔ AND THIS IS NOT THE PAIRING `attn.rs` FORBIDS. That one PACKS `(gqa, request)` onto a single `y`
+    // whose two components share one differenced step — garbage on the 8b at hd=128, 10/10 runs. Here `y`
+    // carries the group ALONE, exactly as it ships, and the request is not on an axis at all.
+    if let Some(gf) = request_axis {
+        // THE KV HEADS FROM THE SCRATCH ITSELF — the same count the index table was staged for, so the
+        // kernel row an op reads and the entry the host filled cannot come from two numbers.
+        let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
+            .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
+        let gqa = nqh / nkvh_nz.get();
+        // ⭐⭐⭐⭐⭐ THE CONTRACTION IS SPLIT BY SLAB — `nslab` ops of ONE STICK each, accumulating in `sc`.
+        //
+        // ⛔⛔⛔ IT WAS `MatK::of_head_dim(hd)` IN ONE OP, JUSTIFIED BY A COMMENT THAT SAID "the gather's
+        // own precondition is `hd <= POOL_STICK`, so there is exactly one slab and no partial sums to
+        // accumulate". The precondition was `PageScratch::of_pass`'s `slabs() != 1` refusal, so the prose
+        // was true only while the door was shut — and the whole point of the door coming off is that at
+        // hd=128 there ARE two slabs. An UNSPLIT `y`-batched contraction of two sticks is the shape
+        // `ScoreArm::choose` records as MEASURED-TWICE incoherent inside dxp ("degenerate output at a
+        // FASTER ITL, which is the tell: less work, done wrong"), and it is what the 8b's
+        // wrong-from-the-first-token runs were emitting.
+        //
+        // ⭐ AND `OneStickContraction::by_slab_split` IS THE WITNESS, which is why it takes no arguments:
+        // a slab IS one stick at every head dim, so the split satisfies the precondition by construction
+        // rather than by a head-dim test. The batched form's two stride relations hold because each
+        // operand declares its OWN pitch (`BatchStrides::{a_pitch,o_pitch}`).
+        //
+        // ⛔⛔⛔ AND THE KERNEL **VIEW** IS NOT WHAT WAS WRONG, WHICH IS WHY READING THE TEMPLATE WOULD
+        // NOT HAVE FOUND THIS. The fp16 score kernel's slice layout is ONE-DIM ON `%out`
+        // (`deeptools/share/ddc/ddl_templates/bmm.ddl:23`:
+        // `%slice_layout_kernel_16bit = ddl.layout(%out) {is_order_fixed=true}`), i.e. sticked on SLOTS,
+        // so `hd` is a non-stick reduction extent and a two-stick contraction is perfectly expressible in
+        // the view. It is nonetheless incoherent on the CARD under a `y`-batch — measured twice, and the
+        // template cannot say so. The lesson is the one this file keeps relearning: the declaration being
+        // legal is not the machine agreeing.
+        let (k, n) = (
+            MatK::of_head_slab(FeatIdx::SLAB_FEATS),
+            MatN::of_kv_window(width),
+        );
+        for r in 0..gf.requests() {
+            let rn = nests.at_request(r);
+            for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
+                let qh0 = kvh.group_first_query(crate::addr::Gqa::new(gqa));
+                let h0 = qh0.get();
+                // The mask under a collapsed pass is `MaskBlockForm::PerPage` and read PER ROW: this
+                // op's row block is the same `score_rows` slice `sc` itself writes, so the validity it
+                // adds is request `r`'s own. `mask_bcast` cannot be true here — a broadcast row would
+                // give every request row 0's validity — so there is no arm for it.
+                let row_mask_off = mask_off + rn.score_rows(h0, width).off();
+                for s in 0..nslab {
+                    // ⭐ THE MASK IS ADDED ON SLAB 0 ONLY — `sc = sum_s (Q_s . Kt_s) + mask`. Adding it
+                    // per slab adds it `nslab` times, which is INERT at hd=64 and wrong above it: the
+                    // same shape as every other defect this file records. Later slabs fuse `sc` itself
+                    // at this group's own offset, so the op computes `sc += Q_s . Kt_s` (the DDL epilogue
+                    // is SFP-resident with one store, so the read of the prior partial precedes it).
+                    let (epi_h, epi_off): (&Stk<FlatTag>, crate::addr::DevOff) = if s == 0 {
+                        (&mask_h, row_mask_off)
+                    } else {
+                        (&sc_h, rn.score_rows(h0, width).off())
+                    };
+                    // nslab == 1 keeps the op's NAME, so granite-3.1-2b's emission does not move.
+                    let name = if nslab == 1 {
+                        format!("attn_{tag}sc_g{}_r{r}_o{t}", kvh.get())
+                    } else {
+                        format!("attn_{tag}sc_g{}s{s}_r{r}_o{t}", kvh.get())
+                    };
+                    ops.push(assemble_matmul_off_phys_m_with_epilogue(
+                        // THE KV HEAD AND THE REQUEST AS SEPARATE NAME SEGMENTS, so the descriptor
+                        // projections that collapse `g{n}` / `r{n}` to one reported row keep working.
+                        &name,
+                        // ⛔ ONE ROW OF WORK. This op computes request `r`'s single score row for each
+                        // head of the group; declaring `mq` rows is what makes a pass compute `mq` rows
+                        // to keep one, which is the arithmetic the collapse is removing.
+                        MatM::single_row(),
+                        n,
+                        k,
+                        MatY::of_gqa_group(
+                            gqa,
+                            // ⛔ THE BY-SLAB STREAM PLACEMENT, NOT THE PLAIN ONE. A one-stick `in`
+                            // derives its head step as `pitch * in`, so the stream's own `mq` pitch
+                            // would stride 64 where the heads are `mq*hd` apart. Same law the
+                            // ungathered slab-split arm takes.
+                            rn.token_stream_by_slab(h0, s),
+                            rn.score_rows(h0, width),
+                        ),
+                        score_form,
+                        &rb(qs, mq_n, hd),
+                        rn.token_stream_by_slab(h0, s),
+                        // ⭐ THE GATHERED SCRATCH AS THE KERNEL, AT ITS FULL DECLARED `hd` ROWS with the
+                        // slab selected purely by OFFSET — the same discipline the ungathered arm uses.
+                        // Declaring `stick` rows instead would re-derive the stick-GROUP stride as
+                        // `stick*stk` where the tensor's is `hd*stk`.
+                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                        gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::Kt, s)?,
+                        &rb(sc, rows_n, width_n),
+                        rn.score_rows(h0, width).off(),
+                        epi_h,
+                        epi_off,
+                        crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                        &[],
+                        false,
+                        sym_id_base,
+                        layout,
+                    ));
+                }
+            }
+        }
+    }
     // TWO SEPARATE QUESTIONS, ASKED SEPARATELY: `b.score` is the LEGALITY witness (now unconditional —
     // the contraction is slab-split), and `ScoreArm::cheaper` is the COST choice on top of it. Folding
     // the cost into the witness would have made a hd=512 op-count REGRESSION look like a legality fact.
-    if let Some(nkvh_b) = batched
+    else if let Some(nkvh_b) = batched
         .and_then(|b| b.score.map(|_| b.nkvh))
         .filter(|&nkvh_b| ScoreArm::choose(nqh, nkvh_b, nslab) == ScoreArm::SlabSplitBatched)
     {
@@ -904,6 +1168,14 @@ fn assemble_attn_block(
                     // head step as `pitch * in`, so the stream's own `mq` pitch would stride 64 where
                     // the heads are `mq*hd` apart — the build-time refusal this arm first hit. The
                     // slab law mints the pitch that makes the derived step the head stride.
+                    //
+                    // ⭐⭐⭐ THIS IS THE ARM THE SHIPPED PREFIX SCORE LEG TAKES, so it is the arm the
+                    // gather has to be on. `per_req` is a hardcoded `false` (see its own note: the
+                    // row-batched experiment was written against a fold that had collapsed to one
+                    // pass), which means the `per_request` arm above is DEAD for the prefix block —
+                    // a gather placed only there would appear in no bundle at all, which is the
+                    // "a port with no caller is dead code" trap and was the plan of record until this
+                    // file's own descriptor test looked at the emitted JSON instead of the call site.
                     assemble_matmul_off_phys_m_with_epilogue(
                         &name,
                         MatM::of_query_rows(mq),
@@ -1142,8 +1414,91 @@ fn assemble_attn_block(
         // `request_stride` — "bytes between two requests' KV inside a page" — which no longer exists: a
         // page holds slots and a request is reached by its PAGE. There is nothing left to disagree.
     }
+    // ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD'S VALUE LEG — the score leg's mirror: `mq` copies of the SHIPPED
+    // per-kv-head op, one per request, `y` on the GQA group, the V scratch row reached by a baked OFFSET.
+    // See the score arm above for why the per-`y` kernel DIM is refuted and what the gather buys instead.
+    if let Some(gf) = request_axis {
+        let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
+            .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
+        let gqa = nqh / nkvh_nz.get();
+        // ⭐⭐⭐⭐⭐ ONE STICK OF `out` PER OP, SO ONE OP PER (KV HEAD, REQUEST, **SLAB**) — the same cut
+        // the ungathered batched arm below already makes, for the same reason.
+        //
+        // ⛔⛔⛔ THIS LEG HAD `n = MatN::of_head_slab(SLAB_FEATS)` — ONE STICK — AND **NO SLAB LOOP**,
+        // under a comment saying "ONE slab, because the gather's own precondition is `hd <= POOL_STICK`".
+        // At hd=64 one stick IS the whole head dim, so the absence was invisible. At hd=128 it means the
+        // gathered fold wrote only feature slab 0 of `run_o`: the upper 64 features of EVERY head's
+        // attention output received no prefix contribution at all, keeping only the new-token block's
+        // seed. Clean bake, no fault, every row wrong from its first generated token — which is exactly
+        // what `PageScratch::of_pass`'s refused hd=128 measurement recorded.
+        //
+        // ⛔ AND `out` MUST STAY ONE STICK, which is why the fix is a LOOP and not a wider `n`. A batched
+        // matmul reaches head `h` by striding `y` and derives that stride as `mb*out`; the accumulators
+        // are head-major `[rows, hd]` whose real pitch is `mq*stick`, so `out = hd` derives `mq*hd` and
+        // agrees only at one stick. The slab is selected by the output's own OFFSET
+        // (`of_head_major_accum(.., s)`) and the kernel's (`at_feat`), never by a fourth walk axis.
+        let (k, n) = (
+            MatK::of_kv_window(width),
+            MatN::of_head_slab(FeatIdx::SLAB_FEATS),
+        );
+        for r in 0..gf.requests() {
+            let rn = nests.at_request(r);
+            for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
+                let qh0 = kvh.group_first_query(crate::addr::Gqa::new(gqa));
+                let h0 = qh0.get();
+                for s in 0..nests.slabs() {
+                    // nslab == 1 keeps the op's NAME, so granite-3.1-2b's emission does not move.
+                    let name = if nests.slabs() == 1 {
+                        format!("attn_{tag}ov_g{}_r{r}_o{t}", kvh.get())
+                    } else {
+                        format!("attn_{tag}ov_g{}s{s}_r{r}_o{t}", kvh.get())
+                    };
+                    ops.push(assemble_matmul_off_phys_m_maybe_epilogue(
+                        &name,
+                        MatM::single_row(),
+                        n,
+                        k,
+                        // The same two laws the shipped batched value arm declares — a head-major
+                        // probability buffer read and a head-major accumulator written, both `mq*stick`
+                        // apart — asked at THIS request's row and THIS slab.
+                        MatY::of_gqa_group(
+                            gqa,
+                            rn.score_rows(h0, width),
+                            crate::sdsc_abstract::OperandPlacement::of_head_major_accum(
+                                rows.swept(),
+                                hd,
+                                mq,
+                                h0,
+                                r,
+                                s,
+                            ),
+                        ),
+                        bmm_form,
+                        &rb(expb, rows_n, width_n),
+                        rn.score_rows(h0, width),
+                        // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS NOW THE PAGE — the scratch
+                        // row is a byte-for-byte copy of the V page plane, so `v_stride` is the pool's own
+                        // `PAGE_SLOTS` on both the gathered and ungathered paths. It used to be ONE
+                        // WINDOW, which is what made the gathered geometry differ from the pool's at all.
+                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                        gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V, s)?,
+                        &rb(run_o, rows_n, hd),
+                        rn.head_major(h0, s),
+                        // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
+                        // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
+                        fold_addend.as_ref().map(|a| (a, rn.head_major(h0, s))),
+                        crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                        &[],
+                        false,
+                        sym_id_base,
+                        layout,
+                    ));
+                }
+            }
+        }
+    }
     // The value leg's mirror: plain 2-D, one per (request, query head), nothing declared.
-    if let Some(nkvh_b) = batched.and_then(|b| b.value.map(|_| b.nkvh)) {
+    else if let Some(nkvh_b) = batched.and_then(|b| b.value.map(|_| b.nkvh)) {
         let gqa = nqh / nkvh_b.max(1);
         let nkvh_nz = std::num::NonZeroU32::new(nkvh_b).ok_or_else(|| {
             SuperDscError("a batched value matmul needs at least one kv head".into())
@@ -1197,6 +1552,7 @@ fn assemble_attn_block(
                                 hd,
                                 mq,
                                 h0,
+                                nests.req,
                                 s,
                             ),
                         ),
@@ -1245,6 +1601,7 @@ fn assemble_attn_block(
                                 hd,
                                 mq,
                                 h0,
+                                nests.req,
                                 s,
                             ),
                         ),
@@ -1419,6 +1776,15 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     vc: &str,
     pmask: &str,
     cmask: &str,
+    // ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX TENSOR'S NAME — `Some` makes the PREFIX score leg's KV read a
+    // HARDWARE GATHER; `None` emits exactly what this bundle emitted before the gather existed.
+    //
+    // ⛔ THE `Option` IS THE COUPLING, NOT A SWITCH. A gathered read takes its base from this tensor's
+    // entries, so an emission that gathers without a host staging them addresses block 0 for every
+    // row — every request reading row 0's keys, fluent and wrong. Making the NAME the condition means
+    // the emitter cannot gather unless a caller has a tensor to name, which is the same caller that
+    // must fill it. There is no arrangement in which one is present and the other is not.
+    kv_block_index: Option<&str>,
     out_id: crate::place::PlaceId,
     // TRUE when these rows are separate requests. Only the prefix mask cares: a prompt's rows share
     // one resident history, requests each have their own.
@@ -1857,7 +2223,103 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     //
     // Until it is found, the fold takes the launch-per-request path — which is the ~51 ms bs=8 step that
     // WORKS, rather than a 2x that does not.
-    let fold_request_axis: Option<u32> = None;
+    //
+    // ── MEASURED ON THE CARD, 2026-09-17, granite-3.1-2b fp8, so the next attempt argues from numbers ──
+    //
+    // ⭐ THE COST MODEL. Launches and compute per DECODE STEP, `SCRATCHY_SDSC_SUBMIT_TIME`, this bundle:
+    //     bs   launches  barriered  compute   step    per-token
+    //      1        122        122   23.4 ms  24.1      24.1 ms
+    //      2        362        322   30.5 ms  31.3      15.7
+    //      4        602        482   40.3 ms  41.0      10.3
+    //      8       1082        802   51.0 ms  52.2       6.5
+    //     16       2040       1600   ~54  ms  55.0       3.44
+    //   Launches per layer are EXACTLY `3 + 3*requests` in the batch bundle (fits all four rungs), and
+    //   `pages` adds another `requests` per layer: 1082 → 1402 → 1722 at one, two and three resident
+    //   pages, i.e. `+320 = 8 requests × 40 layers` per page. So the `pages × requests` factor is real
+    //   and it is exactly what this gate turns off.
+    //
+    // ⛔ BUT THE FOLD IS ONE OF **THREE** PER-REQUEST LAUNCH FACTORS, NOT THE FACTOR. Of the 3 launches
+    //   per request per layer, one is this fold's extra rep and the other two are the KV CACHE WRITE and
+    //   the Kᵗ RE-TRANSPOSE (`lower_ktir_to_superdsc.rs`'s `per_request` loops, which tag `kv_request`
+    //   and so break the launch group at `Trip::fusable_with`). Collapsing the fold alone therefore
+    //   removes 1/3 of the per-request LAUNCHES; the other two need the same per-request page base and
+    //   are not touched by this axis.
+    //
+    // ⛔ AND A LAUNCH DOES **NOT** COST ~93 µs AT THE WIDTHS THAT MATTER — the sentence at the top of
+    //   this note is a bs≤4 number generalised. bs=8 → bs=16 adds 958 launches for +2.8 ms, i.e. ~2.9 µs
+    //   of marginal launch cost, because the host submits ahead (submit is 4-5 µs/launch and 5-11% of
+    //   compute) and the device pipelines. The honest marginal figures are ~28 µs per fold pass at
+    //   bs=8 — and most of that is the pass's WORK, since a pass computes `nqh*mq` rows to keep `nqh`.
+    //
+    // ⭐ SO WHAT THE COLLAPSE IS WORTH, from the per-page measurement (the fold is ~9.15 ms of a bs=8
+    //   step per resident page, launches and redundant rows together): 51.2 → ~43 ms at ONE page
+    //   (**1.19x**) and 69.5 → ~45 ms at THREE (**1.53x**), growing with pages and with requests. It is
+    //   a LONG-CONTEXT win, not a short-context one — at one page it is 19%, and `scr batch` at
+    //   bs=8/48 tokens never leaves one page. Measure the multi-page case or the win is invisible.
+    //
+    // ✅ AND THE OP-COUNT OBJECTION TO THE COLLAPSE IS DEAD, MEASURED. The collapsed fold emits one op
+    //   per (request, kv head) — `nkvh*mq` per pass against the shipped `nkvh` per pass — which is the
+    //   SAME op count over the step, since the shipped fold runs `mq` passes. Each op also computes ONE
+    //   row where the shipped one computes `mq` and masks `mq-1` away. The per-op price is measured:
+    //   forcing `ScoreArm::PerHead` emits 4x the ops (32 of `y=1` instead of 8 of `y=gqa`) at IDENTICAL
+    //   launch count (1082), trips and rows, and bs=8 compute went 51.0 → 63.3 ms — +12.3 ms over +8640
+    //   op executions = **1.42 µs per op**, against ~28 µs for a fold pass. Op count is ~20x cheaper
+    //   than a pass. (Corollary, unrelated but measured here: `ScoreArm::choose` picks correctly at
+    //   hd=64 — the batched arm really is faster on the card, 51.0 vs 63.3, so that cost model needs no
+    //   revisit.)
+    //
+    // ⛔⛔⛔ AND THE REQUEST DOES **NOT** GO ON `y`. That form — a per-batch 3-D `[y,in,out]` kernel, one
+    //   distinct weight start per core — is REFUTED ON CARD: it faulted at
+    //   `job_bin_ptr + numCoresUsed_*128` at rungs 2, 4 and 8 alike (syndrome/locator/case set
+    //   bit-identical, only the index moving), one flit past the program's per-core patch table, and rung
+    //   4's `{mb:1, y:4}` is the on-hardware-proven solo-decode split, so the `y`-split value is
+    //   exonerated and the KERNEL RANK is what the address is made of. What the gather bought is that the
+    //   dim is unnecessary: the scratch is contiguous and request-MINOR, so request `r`'s block is a baked
+    //   OFFSET (`GatherScratch::kernel_row_off`) exactly as a GQA group's kv head is, and `y` stays on the
+    //   group with the bare 2-D kernel that ships. See the collapsed-fold arm in `assemble_attn_block`.
+    // ⭐⭐⭐⭐⭐ THE COLLAPSE, ON — and every half of it comes from ONE `Option`.
+    //
+    // ⛔ THE COUPLING IS THE POINT, AND IT IS WHY THIS IS ONE EXPRESSION. Four things have to be true
+    // together or the fold reads another request's keys with a clean bake: (a) the caller has an index
+    // tensor it will STAGE (`kv_block_index` — a name no placement matches is a bind the launcher skips
+    // in silence, and a skipped index reads as entry 0, which is a REAL address), (b) the geometry admits
+    // a flat block copy (`GatherScratch::of_fold_pass`), (c) the score and value legs both take the
+    // request axis, and (d) the runtime drops the per-pass KV shift and blocks the mask per PAGE. (a) and
+    // (b) are decided here; (c) rides on this value into every fold block; (d) is the manifest flags set
+    // below, derived from this same value.
+    //
+    // `None` — a caller with no index, or a head dim above one stick — emits EXACTLY the bundle that
+    // shipped, byte for byte.
+    // ⭐ `zip`, not `and_then` + `map`: both halves are wanted TOGETHER or not at all, and stating it as
+    // one combinator is what clippy's `manual_option_zip` asks for (`-D warnings` is the CI gate, and
+    // `#[allow]` is not available). `of_fold_pass` is pure arithmetic over the pool's two extents, so
+    // evaluating it for a caller with no index costs nothing and decides nothing.
+    // ⭐⭐⭐⭐⭐ PAGE GRANULARITY: THE WINDOW COUNT IS NOT AN ARGUMENT ANY MORE, AND THAT IS THE FIX.
+    //
+    // `of_fold_pass` took `SlotWindow::count_in(active_cap)` because a scratch ROW was a 64-slot window, so
+    // the row count carried `nb` — and the emitter's `nb` (its body's ladder rung) and the host's (the
+    // CEILING rung) are DIFFERENT NUMBERS, which is the recorded defect that made every kv head above the
+    // first read another head's page block. `PageScratch` holds ONE WHOLE PAGE PER REQUEST, so its extent
+    // is `mq` alone: a quantity both sides read off the same rung, with no window in it to disagree about.
+    //
+    // A head dim above one stick is no longer a refusal either — a whole page plane is contiguous at every
+    // stick-multiple `hd` (`zz_a_whole_page_plane_is_contiguous_at_every_head_dim`), so hd=128 gathers.
+    let gather = kv_block_index.zip(crate::sdsc_abstract::PageScratch::of_pass(pool, width.mq()));
+    // The two scratches' spellings, and their FULL footprints declared up front — the same discipline as
+    // every other synthetic here: a name that reaches its first access undeclared is a build panic, and a
+    // shape declared smaller than the ops write aliases whatever the allocator handed out next.
+    let (gkt, gv) = (syn(R::GatherKt), syn(R::GatherV));
+    if let Some((_, scratch)) = gather
+        && let Some(l) = layout
+    {
+        for r in [R::GatherKt, R::GatherV] {
+            // ⛔ ONE VALUE, NOT A SLICE THE CALLER ASSEMBLES. `&[scratch.rows(), scratch.cols()]` is two
+            // same-typed numbers in a literal, so the wrong pair or the wrong order compiled and
+            // reserved the wrong footprint for a tensor whose overrun is the next intermediate's bytes
+            // read as block numbers. See `GatherScratch::footprint_dims`.
+            l.synth(out_id.synth(r), &scratch.footprint_dims());
+        }
+    }
     let _ = (rows_are_requests, batched.is_some());
     for r in 0..if per_req { mq } else { 1 } {
         for rw in mq_pad_t.row_windows() {
@@ -1993,6 +2455,76 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // is ~1.6 MB in the DECODE bundle (the ~150 MB figure is the PREFILL bundle, where mq=96 scales
     // every intermediate, and prefill runs once per request).
     let fold_from = ops.len();
+    // ⭐⭐⭐⭐⭐ THE GATHER ITSELF — TWO KERNEL-LESS COPIES, FIRST IN THE FOLD GROUP.
+    //
+    // ⛔ THEY MUST BE **IN** THE GROUP, WHICH IS WHY THEY SIT AFTER `fold_from`. `reps` is per-group: the
+    // runtime relaunches everything from here once per PAGE, and pass `p` needs pass `p`'s blocks in the
+    // scratch. A copy outside the group would run once and every pass but the first would score against
+    // page 0's keys — and since the mask is now blocked per page, nothing would mask that away.
+    //
+    // ⛔ AND ONE COPY PER **INDEX STICK** OF THE PASS, NOT PER WINDOW AND NOT ONE FOR THE WHOLE PASS.
+    // The per-head and per-window terms ride in the INDEX ENTRY (`GatherScratch::block_in_page`) rather
+    // than in a base offset, because an `EwOperand` carries one `col_offset` and there is nowhere for a
+    // second base to go — which is exactly why the entries are GLOBAL stick-block numbers. But one op
+    // for the whole pass declares `nkvh * nb * mq` entries, and dxp loads a gather's index ONE STICK at
+    // a time: above 32 entries the cores past the wrap read another core's page addresses, with a clean
+    // bake and no fault. `GatherScratch::copies` cuts the pass into contiguous one-stick RUNS of rows —
+    // the only cut a `[mb, out]` operand can name under a window-major row law — and each run carries
+    // its own index base and destination base as one value.
+    //
+    // ⛔ AND THE SOURCE OFFSET IS STILL ZERO FOR EVERY RUN, WHICH IS LOAD-BEARING.
+    // `addr = idx * skip_addr + base_addr` adds the index to the operand's OWN declared start, so the
+    // plane the copy reads is the one `kct`/`vc` name and the entry supplies EVERYTHING inside the page.
+    // A per-run source base would be added twice.
+    if let Some((idx, scratch)) = gather {
+        for (name, src, dst) in [
+            (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
+            (format!("attn_gv_o{t}"), vc, gv.as_str()),
+        ] {
+            // ⛔ THE STICK IS IN THE NAME AT EVERY WIDTH, including the single-stick case. Two ops that
+            // differ only in a baked offset and share a name are indistinguishable in every descriptor
+            // diff, every `[fold-block]` trace and every launch table — and the one-stick case is
+            // precisely the shape that is already proven on card, so it is the one whose identity must
+            // stay legible.
+            for cp in scratch.copies() {
+                ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                    &format!("{name}_s{}", cp.stick()),
+                    src,
+                    dst,
+                    cp,
+                    idx,
+                    sym_id_base,
+                    layout,
+                ));
+            }
+        }
+    }
+    // ⭐ WHERE THE FOLD'S KV COMES FROM: the gathered scratch when this bundle gathers, the paged pool
+    // otherwise. Named once here so the four things that must agree — the operand SPELLING, the declared
+    // kernel PITCH, the per-head base OFFSET and the `y` step — are one decision per plane instead of four
+    // at the call site. The scratch's pitch is ONE WINDOW on both planes (`[hd,64]` for Kᵗ, `[64,hd]` for
+    // V), where the pool's are a whole page.
+    // ⭐⭐⭐⭐⭐ THE PITCHES ARE NOW THE POOL'S ON BOTH PATHS, AND ONLY THE TENSOR NAME DIFFERS.
+    //
+    // A page-granular scratch row is a byte-for-byte copy of the page plane, so the gathered operand's
+    // GEOMETRY IS the pool's — same declared pitch, same internal arrangement, and (via
+    // `PageScratch::coord_off`) the same address law offset by one request row. There is nothing left for
+    // a `Some` arm to declare differently.
+    //
+    // ⛔ WHAT THIS REPLACES WAS THE WHOLE BUG SURFACE. The gathered arms used to declare ONE WINDOW
+    // (`[hd,64]` for Kᵗ, `[64,hd]` for V) where the pool declares a whole page — a second geometry, whose
+    // window term was re-derived in `kernel_row_off` rather than taken from `PagedKvPool::addr`. Two
+    // geometries for one read is what let the emitter's `nb` and the host's disagree.
+    let kt_src = match gather {
+        Some(_) => gkt.as_str(),
+        None => kct,
+    };
+    let kt_pitch = crate::sdsc_abstract::PagedKvPool::KT_KERNEL_PITCH;
+    let v_src = match gather {
+        Some(_) => gv.as_str(),
+        None => vc,
+    };
+    let v_pitch = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
     // Windows ONE launch folds. `active_cap` is the sk_bucket rung as before, and the page equals the
     // pre-paged capacity, so this is bit-for-bit the baseline's fold; contexts past one page cost
     // additional LAUNCHES of this same group, never a wider sweep. The `active_cap / 64` lives in
@@ -2049,11 +2581,16 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // multi-block prompt is wrong from the first token). Matches the old proven flash decode
             // verbatim: `let k_blk = b * hd * stick;` (worktree superdsc-batch-perf). The V side below
             // is `b*stick*hd`, which is already correct and matches that same reference (`vblk`).
-            kct,
-            crate::sdsc_abstract::PagedKvPool::KT_KERNEL_PITCH,
+            kt_src,
+            kt_pitch,
             // THE POOL COMPOSES THE REQUEST TERM, not this call site. `kt_block_base_of` is the same
             // `block_index(kvh) + r` the cache write bakes, so the fold's kernel and the write that
             // fills it cannot disagree about where request `r` lives — and no stride is spelled here.
+            //
+            // ⛔ AND THIS IS THE UNGATHERED READ ONLY. A gathered bundle's score and value legs take the
+            // collapsed per-request arm, whose kernel base is the SCRATCH's own row
+            // (`GatherScratch::kernel_row_off`, reached through `GatheredFold`) — a request coordinate this
+            // closure has no parameter for. A `gather` arm here would be a base no op reads.
             |h, sl| {
                 use crate::sdsc_abstract::{KvCoord, KvPlane};
                 let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
@@ -2062,8 +2599,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         KvCoord::block(KvPlane::Kt, kvh)
                             .at_slot(w.first_slot())
                             // The contraction's head-dim slab, through the pool's OWN model — the same
-                            // `at_feat` door the V plane below uses, so the two planes cannot disagree about
-                            // where a feature slab is.
+                            // `at_feat` door the V plane below uses, so the two planes cannot disagree
+                            // about where a feature slab is.
                             .at_feat(FeatIdx::of_slab(sl)),
                     ),
                 )
@@ -2072,7 +2609,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // pool's own model instead of being added to a finished address. The V operand's row count
             // is the PAGE, not `cap`, and it reaches the address only through that model — there is no
             // separate row-count argument to disagree with the kernel's declared `in` extent.
-            vc,
+            v_src,
             // ⭐ `PAGE_SLOTS`, NOT `hd` — the V plane's ROW axis is SLOTS, symmetric with `kt_stride` above.
             //
             // `Stk::kernel(k_in, n_out)` becomes `StickLayout { rows: k_in, cols: n_out }`, and a stick-blocked
@@ -2085,10 +2622,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // feature above 63 read the wrong slot. That is why this is verifiable ONLY on a real hd=128
             // model through `scr batch` — the emission at hd=64 must be byte-identical, and that is the
             // safety check for this edit.
-            crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
+            v_pitch,
             // NAMED, NOT COMPOSED: `w` is a slot window and `sl` a feature slab, so both are
             // COORDINATES. The hand-added `sl * PAGE_SLOTS * stick` was the V plane's own feature-stick
             // stride restated at the call site.
+            //
+            // ⛔ UNGATHERED ONLY, for the same reason as the Kᵗ closure above: a gathered bundle's value
+            // leg reads the V scratch through `GatheredFold::kernel_off`, which needs a request.
             |h, sl| {
                 use crate::sdsc_abstract::{KvCoord, KvPlane};
                 let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
@@ -2144,10 +2684,19 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             batched_prefix,
             bmm_form,
             0,
-            // ⭐ THE PREFIX FOLD TAKES THE REQUEST AXIS when the rows ARE requests. That is what makes
-            // one pass serve the whole batch, so the runtime can drop the `× requests` factor from
+            // ⭐ THE PREFIX FOLD GOES PER-REQUEST INSIDE ONE PASS when the bundle gathers. That is what
+            // makes one pass serve the whole batch, so the runtime can drop the `× requests` factor from
             // `reps` — see `fold_plan::reps`, gated on the `batched_requests` this sets below.
-            fold_request_axis,
+            //
+            // ⛔ THE **WINDOW** IS PART OF IT, and it is why this value is built here rather than once
+            // above the loop: the kernel base an op reads is the scratch row for (kv head, THIS window,
+            // request), the same window whose mask slab and block name this call already carries. A value
+            // hoisted out of the loop would give every window window 0's kernel rows.
+            gather.map(|(_, scratch)| GatheredFold {
+                scratch,
+                pool,
+                window: w,
+            }),
             &bufs,
             sym_id_base,
             layout,
@@ -2156,11 +2705,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
 
     for op in ops[fold_from..].iter_mut() {
         op.kv_page_fold = true;
-        // DECLARED, NOT INFERRED: the runtime cannot see what axes an op was baked with, and claiming
-        // a request axis the kernel does not have turns `pages × requests` passes into `pages` while
-        // every row but one reads the wrong history. It is only half the precondition — the other half
-        // is a pool layout that admits one stride, which `fold_plan::LaunchPages` checks at launch.
-        op.kv_batched_requests = fold_request_axis.is_some();
+        // DECLARED, NOT INFERRED: the runtime cannot see what rows an op was baked for, and claiming a
+        // whole-batch pass the kernels do not serve turns `pages × requests` passes into `pages` while
+        // every row but one reads the wrong history. It is the SAME `gather` the per-window
+        // `GatheredFold` above is built from, so the flag and the ops cannot disagree.
+        op.kv_batched_requests = gather.is_some();
+        // ⭐⭐⭐ AND THAT THE AXIS IS OVER A **GATHERED** OPERAND, which is what makes `LaunchPages::Affine`
+        // stop being a precondition. `Affine` says the HOST can reach every row's page by one stride — a
+        // launch-time fact that hands the device no axis, and false for any free-list allocation (rows at
+        // pages 0,1,3,7 have no single stride, which is precisely the case the gather exists for). A
+        // gathered fold resolves each row's page in the INDEX instead, so it collapses over any pool.
+        //
+        // ⛔ IT IS A SEPARATE FLAG AND NOT IMPLIED BY THE ONE ABOVE. They happen to move together in this
+        // emitter today, but `collapsed` reads `batched_requests && (gathered || Affine)`: the axis alone
+        // over an ungathered pool still needs the stride proof, and folding the two into one bool would
+        // discard that proof for a future bundle that has the axis without the gather.
+        op.kv_gathered = gather.is_some();
         // THE FOLD-ROW REGIME, declared from the value every fold block above was assembled with.
         // This is what the worker's intermediate-segment rebase stride derives from: whole-batch
         // passes sweep every shared-buffer row (stride 0, nothing to rebase), per-request passes

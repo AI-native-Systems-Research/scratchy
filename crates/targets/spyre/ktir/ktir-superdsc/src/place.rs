@@ -54,6 +54,19 @@ pub enum SynthRole {
     Meps,
     Rinv,
     Xn,
+    // ── the HARDWARE GATHER's contiguous destinations ──
+    //
+    // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
+    // whose rows have no uniform per-request pitch BY LAW (`PagedKvPool::addr` — "a request is a set of
+    // SLOTS, never a coordinate the device computes with"), so a `y = request` matmul over the pool
+    // cannot exist. A gathered COPY lands each (kv head, slot window, request) block at a pitch THIS
+    // compiler chose, and the score/value matmuls then read that at the stride dxp derives.
+    //
+    // ⛔ TWO ROLES, NOT ONE INDEXED ROLE: the Kᵗ plane and the V plane are read by different legs with
+    // different kernel shapes (`[hd, slots]` vs `[slots, hd]`) and are copied by two ops, so one shared
+    // buffer would have the value leg reading the score leg's blocks.
+    GatherKt,
+    GatherV,
     // ── flash-attention online-softmax state ──
     NewKt,
     Sc,
@@ -106,6 +119,8 @@ impl fmt::Display for SynthRole {
             Self::Meps => f.write_str("meps"),
             Self::Rinv => f.write_str("rinv"),
             Self::Xn => f.write_str("xn"),
+            Self::GatherKt => f.write_str("gkt"),
+            Self::GatherV => f.write_str("gv"),
             Self::NewKt => f.write_str("newkt"),
             Self::Sc => f.write_str("sc"),
             Self::BMax => f.write_str("bmax"),

@@ -269,8 +269,35 @@ impl TidRegion {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ RESERVED tensor id for the KV BLOCK INDEX — the index tensor a gathered KV read is
+/// addressed through, and the last piece the hardware gather needs.
+///
+/// Today the block table is HOST-SIDE state (`fold_plan`'s `block_tables: Vec<Vec<i64>>`), consulted
+/// per launch to compute ONE page base. `SessionKv::fold_requests` names what that costs: *"ONE LAUNCHED
+/// OP HAS ONE PAGE BASE, so B requests cannot share a pass: the fold runs `pages x requests` times"*.
+/// A gather replaces that scalar with a tensor, so every row reads its own keys in ONE launch — which is
+/// what batch-size-invariant attention means.
+///
+/// ## What the worker stages here, and why the arithmetic is already settled
+/// int32 GLOBAL 4096-ELEMENT BLOCK INDICES. `addr = idx * skip_addr + base` with `skip_addr = 4096`,
+/// which is what the score leg's Kᵗ operand already emits as its entry (MEASURED: per-core `in=64`,
+/// `out=64`). That works because the whole pool is a uniform array of 4096-element blocks — stick-groups
+/// at 0/4096/8192/12288, `plane_block_elems = 4*4096`, and `plane_stride`/`layer_stride`/`page_stride`
+/// all multiples of it — so one index reaches any cell with no relayout and no `device_extent` change.
+///
+/// It is the same affine map the host already computes: `fold_plan::page_base_bytes` is
+/// `phys * page_stride_bytes`, and dxp's `ConvertData_gather_idx` is `idx * skip_addr + base_addr`.
+///
+/// ## Why a NEW region rather than a 20th sentinel
+/// The sentinel region is FULL — `MAX-1 .. MAX-19` are all taken and `MAX-20` is
+/// `scalarmul_scale`'s base. Growing the sentinels would slide that region down, and this file warns
+/// exactly against it: *"every reserved id is a number that has been baked into artifacts, and moving
+/// one to tidy the map would silently repoint it"*. So this takes the top of the deliberately empty gap
+/// and declares its own region, which the compile-time disjointness proof then covers.
+pub const KV_BLOCK_INDEX_TID: u32 = u32::MAX - 120;
+
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 3] = [
+pub const RESERVED_REGIONS: [TidRegion; 4] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -282,7 +309,15 @@ pub const RESERVED_REGIONS: [TidRegion; 3] = [
         base: u32::MAX - 20,
         slots: 100,
     },
-    // ⛔ THE GAP FROM MAX-120 TO MAX-1_000_170 IS DELIBERATELY LEFT EMPTY. It held the K-split
+    // ⭐ THE KV BLOCK INDEX takes the TOP of the old K-split gap — see [`KV_BLOCK_INDEX_TID`] for why it
+    // is a new region instead of a 20th sentinel (the sentinel region is full, and sliding
+    // `scalarmul_scale` down would repoint ids already baked into artifacts).
+    TidRegion {
+        name: "kv_block_index",
+        base: KV_BLOCK_INDEX_TID,
+        slots: 1,
+    },
+    // ⛔ THE GAP FROM MAX-121 TO MAX-1_000_170 IS DELIBERATELY LEFT EMPTY. It held the K-split
     // block/zero/down_proj regions, which are gone with the K-split itself. `kct_resident` keeps
     // its ABSOLUTE base rather than sliding up into the hole: every reserved id is a number that
     // has been baked into artifacts, and moving one to tidy the map would silently repoint it.
@@ -296,6 +331,43 @@ pub const RESERVED_REGIONS: [TidRegion; 3] = [
     },
 ];
 
+/// ⛔⛔⛔ A REGION IS ADDRESSED BY ITS **NAME**, NEVER BY ITS ARRAY INDEX — and this function exists
+/// because indexing it by position has already cost exactly the bug the table was built to prevent.
+///
+/// `KCT_RESIDENT_BASE` and `kct_resident_tid` were spelled `RESERVED_REGIONS[2]`. Inserting the
+/// `kv_block_index` region AT position 2 (it belongs there — the table is ordered high tid → low)
+/// slid `kct_resident` to 3 and silently repointed both: `kct_resident_tid(0)` began answering
+/// `KV_BLOCK_INDEX_TID`, i.e. the resident Kᵗ kernel of layer 0 and the gather's index tensor became
+/// ONE tid with ONE placement. Only the region's `slots: 1` made it loud — `kct_resident_tid(k_id)`
+/// for any `k_id >= 1` overflowed a one-slot region and failed the bake. A wider new region would
+/// have aliased in silence, which is precisely "two tensors landing on one tid is not an error anyone
+/// sees" from this file's own header.
+///
+/// A name cannot be shifted by an insertion, and a name that is not in the table is a BUILD failure
+/// rather than a neighbouring region's base.
+pub const fn reserved_region(name: &str) -> TidRegion {
+    let want = name.as_bytes();
+    let mut i = 0;
+    while i < RESERVED_REGIONS.len() {
+        let have = RESERVED_REGIONS[i].name.as_bytes();
+        if have.len() == want.len() {
+            let mut k = 0;
+            let mut same = true;
+            while k < have.len() {
+                if have[k] != want[k] {
+                    same = false;
+                }
+                k += 1;
+            }
+            if same {
+                return RESERVED_REGIONS[i];
+            }
+        }
+        i += 1;
+    }
+    panic!("no reserved tid region by that name — a region was renamed or removed");
+}
+
 /// ⭐ THE PROOF, EVALUATED AT COMPILE TIME. Adding or resizing a region re-runs it; an overlap is
 /// a build error naming both regions, not a tensor that quietly answers to two names.
 #[allow(clippy::let_unit_value)]
@@ -304,13 +376,26 @@ const _: () = {
     // not const-evaluated, so a lock nothing mentions is a lock that never runs.
     let _ = SENTINELS_ARE_INSIDE_THEIR_REGION;
     let _ = RESERVED_REGIONS_ARE_DISJOINT;
+    let _ = EVERY_NAMED_REGION_RESOLVES;
+};
+
+/// ⭐⭐⭐ EVERY NAME THIS MODULE ADDRESSES A REGION BY, RESOLVED AT COMPILE TIME.
+///
+/// [`reserved_region`] panics on a name the table does not hold, and a `const fn` only panics when it
+/// is EVALUATED — so a rename would break the bake at whatever site first called it, or not at all if
+/// that site is behind a `cfg`. Naming them here makes the lookup run at every build.
+pub const EVERY_NAMED_REGION_RESOLVES: () = {
+    assert!(reserved_region("sentinels").base == u32::MAX - 1);
+    assert!(reserved_region("scalarmul_scale").slots > 0);
+    assert!(reserved_region("kv_block_index").base == KV_BLOCK_INDEX_TID);
+    assert!(reserved_region("kct_resident").slots > 0);
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
     // ⛔ THE ONE-OFF SENTINELS ARE DECLARED SEPARATELY (`ROPE_P_TID` .. `IDENTITY_TID`), so the
     // region table would happily describe a span they had already outgrown. Adding a 20th sentinel
     // now fails the build instead of silently taking `scalarmul_scale_tid(0)`'s slot.
-    let r = RESERVED_REGIONS[0];
+    let r = reserved_region("sentinels");
     assert!(r.base == u32::MAX - 1, "sentinels start at MAX-1");
     assert!(
         IDENTITY_TID >= r.floor(),
@@ -348,11 +433,11 @@ pub const RESERVED_REGIONS_ARE_DISJOINT: () = {
 /// below the other reserved ids (u32::MAX-1..-6) with room for many distinct scales.
 ///
 /// [`BundleLayout::scalarmul_scales`]: crate::placement::BundleLayout::scalarmul_scales
-pub const SCALARMUL_SCALE_BASE: u32 = RESERVED_REGIONS[1].base;
+pub const SCALARMUL_SCALE_BASE: u32 = reserved_region("scalarmul_scale").base;
 
 /// Reserved const TID for the `i`-th distinct ScalarMul scale.
 pub fn scalarmul_scale_tid(idx: usize) -> u32 {
-    RESERVED_REGIONS[1].at(idx as u32)
+    reserved_region("scalarmul_scale").at(idx as u32)
 }
 
 /// Base of the RESERVED tid block for the RESIDENT per-layer Kᵀ kernel `kct` (the "kill the O(active)
@@ -363,8 +448,54 @@ pub fn scalarmul_scale_tid(idx: usize) -> u32 {
 /// so the emitter (which has layer-0 `k_id`) and the layout/guard (which iterate every layer's `k_id`)
 /// compute the SAME kct tid with no layer-index handoff. A 1M gap below `DOWNPROJ_BLOCK_BASE` keeps it
 /// disjoint from the down_proj blocks (which descend only ~tens-of-K) AND from real source tids (~thousands).
-pub const KCT_RESIDENT_BASE: u32 = RESERVED_REGIONS[2].base;
+///
+/// ⛔ ADDRESSED BY NAME. This was `RESERVED_REGIONS[2]`, and inserting the one-slot `kv_block_index`
+/// region above it made `kct_resident_tid(0)` return `KV_BLOCK_INDEX_TID` — see [`reserved_region`].
+pub const KCT_RESIDENT_BASE: u32 = reserved_region("kct_resident").base;
 /// Reserved tid for the resident per-layer Kᵀ kernel of the K-cache source tid `k_id`.
 pub fn kct_resident_tid(k_id: u32) -> u32 {
-    RESERVED_REGIONS[2].at(k_id)
+    reserved_region("kct_resident").at(k_id)
+}
+
+/// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's
+/// index tensor must not be one tid.
+///
+/// `kct_resident_tid` / `KCT_RESIDENT_BASE` were `RESERVED_REGIONS[2]`, and the `kv_block_index` region
+/// was inserted at 2 (correctly — the table is ordered high tid → low). `kct_resident_tid(0)` then
+/// answered `KV_BLOCK_INDEX_TID`, and layer 0's resident Kᵗ kernel and the index table shared one
+/// placement. That is exactly this file's own stated failure — *"whichever is bound last wins and the
+/// other silently reads someone else's bytes"* — with the additional twist that the Kᵗ kernel is what
+/// the gather READS THROUGH the index.
+///
+/// It surfaced only because the new region has ONE slot, so every `k_id >= 1` overflowed and failed the
+/// bake. A region with room would have aliased in silence. This test does not depend on that luck.
+#[test]
+fn a_named_region_survives_an_insertion_above_it() {
+    assert_ne!(
+        kct_resident_tid(0),
+        KV_BLOCK_INDEX_TID,
+        "layer 0's resident Kᵗ kernel resolves to the gather's INDEX tid — the region lookup is \
+         positional again, so the tensor a gather reads through the index IS the index"
+    );
+    assert_eq!(
+        KCT_RESIDENT_BASE,
+        reserved_region("kct_resident").base,
+        "KCT_RESIDENT_BASE names a different region than kct_resident_tid does"
+    );
+    assert_eq!(
+        SCALARMUL_SCALE_BASE,
+        reserved_region("scalarmul_scale").base,
+        "SCALARMUL_SCALE_BASE names a different region than scalarmul_scale_tid does"
+    );
+    // Every region this module has a door for, resolved by name and asserted to hold the tid that
+    // door hands out — so a rename shows up here rather than as a neighbouring region's base.
+    assert!(
+        reserved_region("kct_resident").floor() <= kct_resident_tid(999),
+        "kct_resident_tid walked below its own region"
+    );
+    assert_eq!(
+        reserved_region("kv_block_index").at(0),
+        KV_BLOCK_INDEX_TID,
+        "the kv_block_index region's only slot is not KV_BLOCK_INDEX_TID"
+    );
 }

@@ -149,8 +149,11 @@ fn print_what_the_shipped_fold_score_op_addresses() {
         // really are: `qs` is the token stream (`mq*hd` apart) and `sc` is head-major (`mq*stick`).
         MatY::of_gqa_group(
             GQA,
-            OperandPlacement::of_token_stream(QueryRowCount::of_mq(MQ), NQH, HD, 0, 0),
+            // HEAD 0, REQUEST 0: the shipped fold op sweeps a head's whole `mq` rows, so the request
+            // rides inside the block rather than being a coordinate it names.
+            OperandPlacement::of_token_stream(QueryRowCount::of_mq(MQ), NQH, HD, 0, 0, 0),
             OperandPlacement::of_head_major_rows(
+                0,
                 0,
                 QueryRowCount::of_mq(MQ),
                 MaskRows::new(

@@ -98,6 +98,16 @@ pub struct BakeFacts {
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
+    /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
+    /// step and the launch must stage a block table.
+    ///
+    /// Same mechanism and the same reason as [`Self::uses_identity`]: the descriptor half and the
+    /// staging half of a feature must be decided by ONE artifact-derived question, because they fail
+    /// asymmetrically. A step this bundle has no gather for binds bytes nothing reads; a gather with no
+    /// step reads an unstaged index, and an unstaged index is ZERO — a VALID block — so every row
+    /// attends row 0's keys, fluently and wrongly.
+    pub gathers_kv: bool,
 }
 
 impl BakeFacts {
@@ -108,6 +118,7 @@ impl BakeFacts {
         ones_reduce_len: 0,
         uses_identity: false,
         scalarmul_scales: &[],
+        gathers_kv: false,
     };
 
     /// Read them off the generated layout.
@@ -118,6 +129,7 @@ impl BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
+            gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
@@ -255,9 +267,16 @@ impl Wiring {
         // bundle's capacity: see [`Self::baked_row_capacity`], which this is checked against.
         rows: StagedRows,
         owns_prefix: bool,
+        gathers: GathersKv,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        self.forward_shape_within(self.baked_row_capacity(), rows, owns_prefix, n_consts)
+        self.forward_shape_within(
+            self.baked_row_capacity(),
+            rows,
+            owns_prefix,
+            gathers,
+            n_consts,
+        )
     }
 
     /// [`Self::forward_shape`] with the capacity supplied by the CALLER rather than read off this
@@ -284,6 +303,9 @@ impl Wiring {
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
         rows: StagedRows,
         owns_prefix: bool,
+        // ⛔ A WITNESS, NOT A `bool` — mintable only from a [`BakeFacts`] read off the bundle's own
+        // layout. See [`GathersKv`].
+        gathers: GathersKv,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
@@ -299,8 +321,71 @@ impl Wiring {
             cos_srcs: self.cos_srcs,
             sin_srcs: self.sin_srcs,
             prefix_mask: owns_prefix,
+            kv_block_index: gathers.get(),
             n_consts,
         }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE PROOF THAT "THIS BUNDLE GATHERS" CAME FROM THE BUNDLE — a witness with exactly one
+/// door, [`BakeFacts`], which reads the `KV_BLOCK_INDEX_TID` placement off the generated layout.
+///
+/// ⛔ WHY NOT A `bool`. The two halves of a gather are the emitted descriptor and the staged index
+/// table, and their failure modes are not symmetric: a table nobody gathers through is inert, while a
+/// gather with no table reads an UNSTAGED index — which is zero, and block 0 is a real address, so
+/// every row of the batch attends row 0's keys. That is fluent, wrong output from a clean bake with no
+/// counter moved. A `bool` parameter is exactly the arrangement in which a caller can answer that
+/// question from something other than the artifact — a phase, a rung width, an `is_some()` on the
+/// wrong option — and one wrong answer in one direction is silent corruption.
+///
+/// So the only way to obtain one is to hold the bundle's own facts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GathersKv(bool);
+
+impl GathersKv {
+    /// The bundle's own answer.
+    pub fn of(facts: &BakeFacts) -> Self {
+        GathersKv(facts.gathers_kv)
+    }
+
+    /// The same answer straight off a LAYOUT, for callers that hold one but no [`BakeFacts`] — the
+    /// load-time placement check. It is the same lookup [`BakeFacts::of`] performs, spelled once here
+    /// rather than duplicated at the call site, and it takes a plain reference so a non-`'static`
+    /// layout can be asked.
+    pub fn of_layout(layout: &bundle::BundleLayout<'_>) -> Self {
+        GathersKv(
+            layout
+                .place_of_tid(crate::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID)
+                .is_some(),
+        )
+    }
+
+    /// ⭐⭐⭐ THE **PER-BODY** ANSWER, off the body's own LAUNCH GROUPS — each group's
+    /// `bundle::KvShifts::gathered`, which the emitter stamps on the fold group it built the gather into.
+    ///
+    /// ⛔ WHY A THIRD DOOR RATHER THAN REUSING THE LAYOUT ONE. [`Self::of_layout`] answers about a
+    /// BUNDLE: `KV_BLOCK_INDEX_TID` is placed if ANY body of it gathers. A decode bundle holds a whole
+    /// sk_bucket ladder of bodies plus their fold-fused twins, and which one a step runs is the
+    /// selector's answer from the live context length — so the bundle's placement cannot answer "does
+    /// the body I am about to launch gather", and answering it from the bundle is exactly the mistake
+    /// this file has now recorded three times (see `superdsc_exec::Executor::step_body`).
+    ///
+    /// The ops are the right authority for the same reason `latch_paged_geometry` reads `page_slots` off
+    /// them: a bake fact rides on the launch group it describes, so it cannot be true of a body that
+    /// does not carry it.
+    pub fn of_launch_groups(gathered: impl IntoIterator<Item = bool>) -> Self {
+        GathersKv(gathered.into_iter().any(|g| g))
+    }
+
+    /// ⭐ THE ONE CALLER-SIDE `false` THAT IS SOUND: a launch path with no SuperDSC layout to ask (the
+    /// KTIR emulator). It is spelled as its own named door rather than as `GathersKv(false)` so it
+    /// appears in a grep for who claims a bundle does not gather.
+    pub const fn no_layout_to_ask() -> Self {
+        GathersKv(false)
+    }
+
+    pub const fn get(self) -> bool {
+        self.0
     }
 }
 

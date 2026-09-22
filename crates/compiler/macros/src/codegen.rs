@@ -8687,6 +8687,8 @@ fn synth_role_tokens(
         R::Meps => quote! { #b::Meps },
         R::Rinv => quote! { #b::Rinv },
         R::Xn => quote! { #b::Xn },
+        R::GatherKt => quote! { #b::GatherKt },
+        R::GatherV => quote! { #b::GatherV },
         R::NewKt => quote! { #b::NewKt },
         R::Sc => quote! { #b::Sc },
         R::BMax => quote! { #b::BMax },
@@ -8859,6 +8861,7 @@ fn launch_tokens(
         request,
         page_fold,
         batched_requests,
+        gathered,
         fold_rows,
     } = kv;
     let [slot, slab, slots, req] = [
@@ -8900,6 +8903,7 @@ fn launch_tokens(
                 request: #req,
                 page_fold: #page_fold,
                 batched_requests: #batched_requests,
+                gathered: #gathered,
                 fold_rows: #fold_rows,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),

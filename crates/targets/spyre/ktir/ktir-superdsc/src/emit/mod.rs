@@ -28,9 +28,9 @@ use crate::placement::{BundleLayout, SegRole, align128};
 use crate::sdsc_abstract::{FlatTag, KindTag, RowBlockedTag, StickKind, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
-    Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32, ItDim,
-    MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet, StickExtent, TensorArg,
-    WorkPlan, assert_df_stick_multiple,
+    Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
+    IndirectRole, ItDim, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet,
+    StickExtent, TensorArg, WorkPlan, assert_df_stick_multiple,
 };
 use crate::wire::{
     AddrFold, AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs,
@@ -248,6 +248,25 @@ fn per_core_addr(
         Df::Fp16 | Df::Bf16 => {
             DeviceTileLayout::<Fp16>::new(layout, view.stick, &host_size)?;
         }
+        // ⛔⛔⛔ A GATHER'S INDEX TABLE IS **EXEMPT FROM THE STICK-MULTIPLE GUARD**, and both vendor
+        // fixtures settle that outright:
+        // ```text
+        // test_gather_1core   index ["mb"]     N_ mb_ = 3   KERNEL_IDX stickDimOrder_ ["mb"] stickSize_ [32]
+        // sdsc_add_paged_l3lu index ["x","y"]  N_ y_  = 2   KERNEL_IDX stickDimOrder_ ["y"]  stickSize_ [32]
+        // ```
+        // Extents of THREE and TWO against a 32-entry stick. An index is not a tiled compute operand —
+        // it is read into the IBR one 128-byte stick at a time (`senulator/memoryElement.cpp:810`) and
+        // never staged to LX, which is the same property that forces its HBM-only `memOrg_` and that
+        // makes `allocAllMem` skip it. `L3DlOpsScheduler:1040`, which the guard's own message cites,
+        // rejects sub-stick TILES; there is no tile here.
+        //
+        // ⛔ NOT A WEAKENING TO GET PAST A REFUSAL. The guard was already being SATISFIED by picking a
+        // different stick dim than the vendor picks (`out` rather than the innermost) — a different HBM
+        // layout for the table the host stages, which is an address rather than a build error. Removing
+        // it is what lets the stick dim be the vendor's own. `Df::SenUint32` occurs on index operands
+        // and nowhere else (`attach_gather_index` is its only producer), so this arm cannot exempt
+        // anything else.
+        Df::SenUint32 => {}
     }
 
     // The per-core start flows through [`view_stick_layout`] — the SAME classifier `emit_sdsc` declares to
@@ -581,6 +600,7 @@ fn sfp_rank1_opspec(
         op_info: OpInfo::None,
         tiled_symbols: vec![],
         time_tile: None,
+        indirect: None,
     })
 }
 
@@ -887,6 +907,7 @@ fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpe
         op_info: OpInfo::None,
         tiled_symbols: vec![],
         time_tile: None,
+        indirect: None,
     })
 }
 
@@ -1133,6 +1154,14 @@ pub struct EmittedOp {
     /// while the kernel still reads one request's K — every row but one attending the wrong history,
     /// fluently. See `fold_plan::reps`, which needs this AND a pool that admits a single stride.
     pub kv_batched_requests: bool,
+    /// ⭐⭐⭐ THIS OP'S BATCH AXIS WALKS A **GATHERED** SCRATCH, not the paged pool.
+    ///
+    /// Travels beside [`Self::kv_batched_requests`] because it answers the OTHER half of `collapsed`:
+    /// with the axis over a contiguous destination the compiler placed, each row's PAGE is resolved by
+    /// the index the host stages, so the pool needs no single stride and `LaunchPages::Affine` — which is
+    /// false for any free-list allocation — stops being a precondition. Without it a request axis still
+    /// needs that proof, so the runtime must be able to tell the two situations apart.
+    pub kv_gathered: bool,
     /// THE ROW REGIME this op's fold passes were baked under (meaningful with [`Self::kv_page_fold`]):
     /// whole-batch passes sweep every `nqh*mq` shared-buffer row and need NO per-pass rebase in the
     /// intermediate segment; per-request passes carry one request's `nqh` rows and do. Declared on the
@@ -1221,6 +1250,7 @@ impl EmittedOp {
             slot_no_fuse: false,
             kv_page_fold: false,
             kv_batched_requests: false,
+            kv_gathered: false,
             kv_fold_rows: Default::default(),
             kv_page_slots: 0,
             kv_request: 0,
@@ -1250,6 +1280,7 @@ impl EmittedOp {
             slot_stride_bytes: self.slot_stride_bytes,
             kv_page_fold: self.kv_page_fold,
             kv_batched_requests: self.kv_batched_requests,
+            kv_gathered: self.kv_gathered,
             kv_fold_rows: self.kv_fold_rows,
             kv_page_slots: self.kv_page_slots,
             kv_request: self.kv_request,
@@ -1325,6 +1356,7 @@ impl EmittedOp {
             slot_stride_bytes: 0,
             kv_page_fold: false,
             kv_batched_requests: false,
+            kv_gathered: false,
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
             kv_page_slots: 0,
             kv_request: 0,
@@ -1826,10 +1858,29 @@ pub fn emit_sdsc(
             // finite ≈ 4.3e9, NOT 65504 (that is IEEE-fp16's 5-bit-exp max). Kani-proven
             // (`sen169_holds_attention_score_no_overflow`): a ~1e5 score is a NORMAL SEN169 value.
             dataFormat_: v.df.dataformat(),
-            memOrg_: if v.allocation.is_lx() {
-                MemOrg::lx_only()
-            } else {
-                MemOrg::hbm_lx()
+            // ⛔⛔⛔⛔⛔ A GATHER'S INDEX IS **HBM-ONLY** — no LX residency — and the scheduler refuses
+            // the bake otherwise.
+            //
+            // MEASURED ON THE CARD POD with `hbm_lx()`:
+            //   `sbf-ddc: DtException: Expect a valid allocate node.,
+            //    L3DlOpsScheduler.cpp:2337`
+            // That line is in `calculateFlopPerByte`, which for EVERY HBM-pinned labeledDs does
+            // `lds.memOrg_.at(LX).allocateNode_` and `DT_CHECK_MSG(allocNode, ...)`. `allocAllMem` runs
+            // first and gives an LX chunk to each staged operand — but not to the index, because an
+            // index is not an arithmetic input (it is read into the IBR, never staged). So declaring an
+            // LX residency the allocator will not fill leaves a null node the estimator then
+            // dereferences.
+            //
+            // ⭐ AND THE VENDOR'S OWN INDEX IS EXACTLY THIS SHAPE:
+            //   test_gather_1core/sdsc_1.json  index  memOrg_ { "hbm": { "isPresent": 1 } }
+            //                                  value  memOrg_ { "hbm": ..., "lx": ... }
+            // `MemOrg::hbm_only()` has existed in `wire.rs` since the gather's first port with ZERO
+            // call sites and the doc comment "index tensors must reside in HBM — no LX indirect
+            // addressing". This is that call site.
+            memOrg_: match (v.allocation.is_lx(), &v.role) {
+                (true, _) => MemOrg::lx_only(),
+                (false, Role::Index) => MemOrg::hbm_only(),
+                (false, _) => MemOrg::hbm_lx(),
             },
         });
         // interslicetranspose_fp16: the OUTPUT role carries the TRANSPOSE — its
@@ -1868,6 +1919,23 @@ pub fn emit_sdsc(
         if epilogue_arg_idx.contains(&i) {
             continue;
         }
+        // ⛔⛔ THE INDEX OPERAND IS NOT AN ARITHMETIC INPUT, AND THE VENDOR FIXTURE IS EXPLICIT.
+        // `dxp/test/test_gather_1core/sdsc_1.json` has three tensors and lists them as
+        // `inputLabeledDs ["Tensor0-idx0"]`, `outputLabeledDs ["Tensor2-idx2"]`,
+        // `indirectAccessIndexLabeledDs ["Tensor1-idx1"]` — the index appears in exactly ONE list,
+        // and it is not the input list. It is read by the ADDRESSING, never by the arithmetic.
+        //
+        // Listing it as an input would hand dxp an op with one more operand than its DDL declares:
+        // a 2-input identity, a 3-input matmul. That is an arity the op function has no register for,
+        // and the failure is not a clean rejection — `attach_gather_index` shapes the index operand
+        // FROM the value operand (so its rank and stick law are legal), which is exactly what makes a
+        // spurious input plausible enough to lower.
+        if matches!(
+            op.indirect.and_then(|ia| ia.role_of(i)),
+            Some(IndirectRole::Index { .. })
+        ) {
+            continue;
+        }
         let r = format!("Tensor{i}-idx{i}");
         if i == out_idx {
             output_refs.push(r);
@@ -1879,6 +1947,51 @@ pub fn emit_sdsc(
     // reduce fixture: accum is inputLabeledDs[1] and the sole outputLabeledDs).
     if op.is_reduction && views.len() == 2 {
         input_refs.push(format!("Tensor{out_idx}-idx{out_idx}"));
+    }
+
+    // ⛔⛔⛔⛔⛔ A GATHER MAY NOT SIT ON AN OP THAT HAS A `KERNEL` — the card's own refusal, moved to
+    // the build.
+    //
+    // MEASURED ON THE CARD (pod nickm-7db9667cdd-z2jc6, granite-3.1-2b fp8), with the gather on the
+    // prefix score leg's Kᵗ operand. Two bakes, two refusals, bracketing the cause:
+    //   index memOrg_ = hbm + lx  ->  sbf-ddc: DtException: Expect a valid allocate node.
+    //                                 L3DlOpsScheduler.cpp:2337
+    //   index memOrg_ = hbm       ->  sbf-ddc: DtException: Expect LX in labeledDs memOrg_.
+    //                                 L3DlOpsScheduler.cpp:2334
+    // Both lines are in `calculateFlopPerByte`, which for EVERY HBM-pinned labeledDs requires an LX
+    // `memOrg_` entry (2334) AND a non-null LX allocate node (2337). `allocAllMem` gives an LX chunk
+    // to each STAGED operand and never to an index — an index is read into the IBR, not staged — so
+    // no `memOrg_` satisfies both, and there is no third value to try. DO NOT TRY ONE.
+    //
+    // ⭐ AND IT ONLY RUNS FOR A REUSE OP, WHICH IS WHY THE CONDITION IS EXACTLY "HAS A KERNEL".
+    // `L3DlOpsScheduler.cpp:1550` gates the whole arithmetic-intensity explorer on `isReuse`, and
+    // `hasDimensionReuse` (`:303-321`) is verbatim
+    // `primaryDsInfo_.size() > 1 && primaryDsInfo_.count(DsTypes::KERNEL)`. So:
+    //   our score matmul    primaryDsInfo_ {INPUT, KERNEL, OUTPUT, KERNEL_IDX}  reuse -> REFUSED
+    //   test_gather_1core   primaryDsInfo_ {OUTPUT, KERNEL_IDX}                 no KERNEL -> fine
+    //   sdsc_add_paged_l3lu primaryDsInfo_ {OUTPUT, KERNEL_IDX}                 no KERNEL -> fine
+    // NEITHER VENDOR FIXTURE GATHERS ON A MATMUL. `test_gather_1core`'s op is `identity` with BOTH
+    // its source and its destination typed `OUTPUT`; IBM's paged attention gathers on `AddZero` — an
+    // elementwise copy — and feeds the RESULT to its matmul.
+    //
+    // ⛔ A BUILD `Err`, NOT AN ASSERT AND NOT A COMMENT. The next attempt's instinct is another
+    // `memOrg_`, another dtype, another pin — the loop this emitter's gather tests describe. The
+    // predicate is three lines of C++ and it is decidable from what this function has already built,
+    // so it is decided here, once, with the shape that DOES work named in the message.
+    if op.indirect.is_some() && primary.len() > 1 && primary.contains_key("KERNEL") {
+        return Err(SuperDscError(format!(
+            "op '{op_name}': a GATHER is declared on an op whose primaryDsInfo_ carries a KERNEL \
+             ({:?}). deeptools cannot schedule that: `hasDimensionReuse` (L3DlOpsScheduler.cpp:303) \
+             is `primaryDsInfo_.size() > 1 && count(KERNEL)`, which turns on the \
+             arithmetic-intensity explorer (:1550), whose `calculateFlopPerByte` demands an LX \
+             allocate node for every HBM-pinned labeledDs (:2334/:2337) — and `allocAllMem` never \
+             gives one to an index, because an index is read into the IBR rather than staged. \
+             MEASURED as a bake refusal on the card at BOTH possible index memOrg_ values, so there \
+             is no declaration that fixes it. Gather on a KERNEL-LESS op instead: both vendor \
+             fixtures use an elementwise copy (`identity` / `AddZero`) whose operands are all typed \
+             OUTPUT, and feed its RESULT to the matmul.",
+            primary.keys().collect::<Vec<_>>()
+        )));
     }
 
     // ── scheduleTree_ : one AllocNode per distinct dataspace (deduped by name). ──
@@ -1898,11 +2011,80 @@ pub fn emit_sdsc(
         if !seen.insert(name.clone()) {
             continue;
         }
+        // This operand's side of a gathered access, if the op declares one. Derived from the op's
+        // single `Option`, never from a per-operand flag, so the index and value sides cannot
+        // disagree about which pair they belong to.
+        let indirect_role = op.indirect.as_ref().and_then(|ia| ia.role_of(i));
+        // ── THE PAGED DIMS ──
+        // ⛔ PINNING A DIM IS WHAT MAKES IT PAGED: `getPageSize` (`dsc2.cpp:4493-4526`) erases every
+        // negative entry of `maxDimSizes_`, so the pinned dims ARE the paged dims and each must
+        // satisfy `ss_(dim) % pageSize(dim) == 0` (`L3DlOpsScheduler:6655`).
+        //
+        // ⭐ PLURAL. This pinned exactly one dim, which caps a gather at collapsing the PAGE axis: an
+        // entry then names a page but not a batch ROW, so a launch still serves one row. IBM's paged
+        // attention pins TWO (`[-1,-1,64,1]`: a page granularity of 64 and a second axis at 1, one
+        // entry per position) and that is what puts both relaunch factors inside the index.
+        //
+        // ⭐ RESOLVED AGAINST THIS OPERAND'S OWN LAYOUT, never by a carried position. `KernelAxis` is
+        // a closed set, which is what makes these lookups succeed on the shipped path — but it is NOT
+        // a substitute for looking: an activation's layout is `["mb","in"]`, so a positional pin would
+        // land on a different axis entirely (see the note on `KernelAxis` for the draft that did
+        // exactly that).
+        //
+        // Resolved before the node is built because the failure is otherwise SILENT: a value tensor
+        // whose axis names a dim it does not have would still emit a `value_tensor` node, still
+        // cross-link, and still bake — gathering with no page declared, i.e. wrong addresses from a
+        // clean build.
+        let paged_dims: Vec<(usize, crate::superdsc_opspec::PageExtent)> = match &indirect_role {
+            Some(IndirectRole::Value { pins, .. }) => pins
+                .iter()
+                .map(|&(d, page)| {
+                    let at = v.layout.iter().position(|&x| x == d).ok_or_else(|| {
+                        SuperDscError(format!(
+                            "op {op_name}: operand {i} ('{}') is the gathered VALUE tensor, but the \
+                             declared paged axis '{d}' is not in its layout {:?}. An unresolvable \
+                             axis would emit a value_tensor with a MISSING page, which gathers wrong \
+                             addresses and still bakes. A gathered kernel must be declared with every \
+                             axis it pages — including `mb` when the batch is paged.",
+                            v.name, v.layout,
+                        ))
+                    })?;
+                    Ok((at, page))
+                })
+                .collect::<Result<Vec<_>, SuperDscError>>()?,
+            None | Some(IndirectRole::Index { .. }) => Vec::new(),
+        };
+        // ⭐⭐⭐⭐⭐ THE ITERATION SPACE **THIS OPERAND** IS MEASURED IN, resolved ONCE for every reader
+        // below. Every operand but one is measured in the op's own plan; the gather's INDEX is measured
+        // in ENTRIES ([`WorkPlan::of_index_entries`]), because dxp derives the entry count as the op's
+        // extent divided by the value tensor's page and converts exactly that many, contiguously.
+        //
+        // ⛔ ONE BINDING, NOT A DIVISION PER READER. The extents of a view are read FOUR times below —
+        // the arrangement classifier, the coordinate folds, the on-card walk and the per-core START —
+        // and only two of them go through `DeviceExtents::of_view`, so a declared extent reaches half of
+        // them. That is how the index came to declare the op's 2048 `mb` positions and step each core's
+        // start by 64 entries (256 B) into a 128-byte buffer: 31 of 32 cores read bytes nothing
+        // converted, as ABSOLUTE stick addresses. Substituting the plan once cannot be half-applied.
+        let iter = match &indirect_role {
+            Some(IndirectRole::Index { pins, .. }) => {
+                std::borrow::Cow::Owned(op.iter.of_index_entries(pins).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "op {op_name}: operand {i} ('{}') is the gather's INDEX, but its paged dims \
+                         {pins:?} do not divide this op's iteration extents into whole entries. dxp \
+                         converts exactly `extent / page` entries and no declaration changes that, so \
+                         a partial entry is an address rather than a shape.",
+                        v.name,
+                    ))
+                })?)
+            }
+            None | Some(IndirectRole::Value { .. }) => std::borrow::Cow::Borrowed(&op.iter),
+        };
+        let iter: &WorkPlan = &iter;
         // THE ONE device layout for this tensor view, computed ONCE and handed to BOTH the on-card WALK
         // (build_coordinates) and the per-core START (per_core_addr). Neither derives its own, so the walk
         // and start cannot address the tensor differently — a divergence is not representable (task #11).
-        let sl = view_stick_layout(v, &op.iter);
-        let coordinates = build_coordinates(v, &sl, &op.iter, fp8_matmul, op.is_reduction);
+        let sl = view_stick_layout(v, iter);
+        let coordinates = build_coordinates(v, &sl, iter, fp8_matmul, op.is_reduction);
         // SLICE read offset (intra-tensor): a sliced operand (RoPE's x[half:]) reads
         // from `seg_base + offset_elems·wordLength`. `per_core_addr` adds the per-core
         // work-slice offset on top of this intra-segment base.
@@ -1917,7 +2099,41 @@ pub fn emit_sdsc(
         // [nqh,1-stick] read across cap=256, or a per-head reduce accum), mis-sizing the synth
         // slot and false-firing the footprint guard. (`out_broadcast → out=RedStick`,
         // `mb_broadcast → mb=RedNonStick`, reduce accum's reduced dim = RedStick — see EwOperand.)
-        let arg_bytes = materialized_bytes(v, &op.iter);
+        let arg_bytes = materialized_bytes(v, iter);
+        // ⭐⭐⭐ A GATHERED VALUE OPERAND SPANS **ONE ENTRY**, NOT ITS DECLARED WALK — and the footprint
+        // guard has to measure the same thing dxp does or it refuses the shipped shape.
+        //
+        // `addr = idx * skip_addr + base_addr`: the walk's paged axis is CLAMPED to its pin
+        // (`getBufferCapacityForNodePerDim`), and the index supplies the rest of the address. So the copy
+        // op's gathered source declares `[mb = nkvh*nb*mq, out = hd*64]` while it only ever reads ONE
+        // `out`-row at a time out of the pool — 512 KB declared against a 256 KB resident Kᵗ plane at
+        // bs=8, which the guard below would call an overrun of a tensor the op never overruns.
+        //
+        // ⛔ AND THIS IS NOT A WEAKENING: where the entries POINT is checked where they are BUILT
+        // (`gather_index_table` refuses a page a row does not own, an entry that overflows int32, or more
+        // rows than a pass block holds). What stays checked here is what a gather cannot be told from the
+        // index — that ONE entry fits inside the tensor at all.
+        let arg_bytes = if paged_dims.is_empty() {
+            arg_bytes
+        } else {
+            let mut clamped = 1u64;
+            for (li, &d) in v.layout.iter().enumerate() {
+                let ext = match v.scale.get(li) {
+                    Some(Scale::Active) => iter.extent(d) as u64,
+                    _ if d == v.stick => v.df.elems_per_stick() as u64,
+                    _ => 1,
+                };
+                let pin = paged_dims
+                    .iter()
+                    .find(|&&(at, _)| at == li)
+                    .map(|&(_, p)| p.get() as u64);
+                clamped *= match pin {
+                    Some(p) => ext.min(p),
+                    None => ext,
+                };
+            }
+            clamped * v.df.word_length() as u64
+        };
         let (seg_base, intra_base) =
             resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df)?;
         // ── arrangement authority ── record THIS view's device layout for its tensor. If an earlier op
@@ -1943,10 +2159,10 @@ pub fn emit_sdsc(
             .or_else(|| l.synth.borrow().sizes.get(v.name).copied());
             let full = full_bytes.is_none_or(|fp| arg_bytes >= fp);
             if active && full && !matches!(v.role, Role::Kernel) && !v.allocation.is_lx() {
-                l.declare_arrangement(v.name, view_stick_layout(v, &op.iter))?;
+                l.declare_arrangement(v.name, view_stick_layout(v, iter))?;
             }
         }
-        let per_core = per_core_addr(seg_base, v, &sl, &op.iter, &wk_slice, intra_base, cores)?;
+        let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;
         // No two cores of an OUTPUT tensor may share a byte address (aliased write) — EXCEPT a K-split
         // matmul, where the `k` cores each contract a K-slice into a PARTIAL product that dxp
         // PSUM-accumulates into the SHARED output tile (torch-spyre's reduction-dim split). That case is
@@ -1977,7 +2193,35 @@ pub fn emit_sdsc(
             prev_: String::new(),
             ldsIdx_: i as u32,
             component_: comp,
-            isStartAddrSymbolic_: None,
+            // ⛔⛔⛔⛔⛔ A GATHERED VALUE TENSOR IS **NOT** SYMBOLIC — `Some(0)`, IBM's paged fixture's
+            // own value, and this was `Some(1)`.
+            //
+            // MEASURED ON THE CARD POD: with `Some(1)` and a concrete per-core address, dbo refuses the
+            // bake —
+            //   `dbo: DtException: Symbol operand does not exist: 34360262656,
+            //    VariableDefinition.cpp:303`
+            // — 34360262656 being the operand's real BYTE ADDRESS, read as a symbol id. `Some(1)` says
+            // "the start address in `startAddressCoreCorelet_.data_` is a symbol id, resolve it", and
+            // ours holds a concrete address (`AddrFold::new`, not `AddrFold::symbolic`). The two must
+            // agree, and the flag was set without the address ever changing.
+            //
+            // ⛔ AND THE FIX IS TO DROP THE FLAG, NOT TO MINT A SYMBOL, because the two vendor fixtures
+            // disagree and the PAGED one governs:
+            //   dxp/test/test_gather_1core/sdsc_1.json  value  isStartAddrSymbolic_ 1, data_ "-1"
+            //   dcg/.../test/sdsc_add_paged_l3lu.json   value  isStartAddrSymbolic_ 0, data_ "128000"
+            // The dxp file is a unit test OF THE SYMBOLIC PATH — its own `bundle.mlir` says so, and
+            // passes `%base_addr` with `symbol_ids=[-1]` to trigger it. IBM's paged attention, which is
+            // the case this emitter is reproducing, uses a CONCRETE base.
+            //
+            // ⭐ AND THAT SETTLES WHAT `base_addr` IS, which nothing else could: dxp's
+            // `addr = idx * skip_addr + base_addr` adds the index to the operand's OWN declared start,
+            // so the plane / kv-head / slot / feature terms the score leg bakes into its offset SURVIVE
+            // and the index supplies only the PAGE term. That is exactly the arithmetic
+            // `gather_entries_per_page` assumes.
+            isStartAddrSymbolic_: match &indirect_role {
+                Some(IndirectRole::Value { .. }) => Some(0),
+                None | Some(IndirectRole::Index { .. }) => None,
+            },
             // torch-spyre emits the HOST dim order verbatim (`[mb, in]`, mb-outermost) even for a
             // stick-major tensor — dxp applies `get_generic_stick_layout` INTERNALLY when it reconstructs
             // the stick-blocked `device_size` from `-1`, so the mb-outermost label + `-1` already yields the
@@ -2010,32 +2254,68 @@ pub fn emit_sdsc(
             //
             // `Span::Swept` with NO declaration reproduces `op.iter.extent(d)` exactly, and no
             // operand in any shipped bundle declares one — so every existing bundle is byte-identical.
-            maxDimSizes_: sl.device_walk(
-                crate::sdsc_abstract::DeviceExtents::of_view(
-                    &v.layout
-                        .iter()
-                        .map(|&d| op.iter.extent(d) as usize)
-                        .collect::<Vec<_>>(),
-                    &v.device_extent
-                        .iter()
-                        .map(|o| o.map(|p| p as usize))
-                        .collect::<Vec<_>>(),
-                    v.layout
-                        .iter()
-                        .position(|&d| d == v.stick)
-                        .unwrap_or(usize::MAX),
-                    &vec![true; v.layout.len()],
-                    crate::sdsc_abstract::Span::Swept,
+            maxDimSizes_: {
+                let walk = sl.device_walk(
+                    crate::sdsc_abstract::DeviceExtents::of_view(
+                        &v.layout
+                            .iter()
+                            .map(|&d| iter.extent(d) as usize)
+                            .collect::<Vec<_>>(),
+                        &v.device_extent
+                            .iter()
+                            .map(|o| o.map(|p| p as usize))
+                            .collect::<Vec<_>>(),
+                        v.layout
+                            .iter()
+                            .position(|&d| d == v.stick)
+                            .unwrap_or(usize::MAX),
+                        &vec![true; v.layout.len()],
+                        crate::sdsc_abstract::Span::Swept,
+                    )
+                    .dims()
+                    .iter()
+                    .map(|&e| e as i64)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                );
+                // Paged only on the gathered value side. Every pin was resolved against this operand's
+                // own layout above, so `paged_at` cannot be the thing that drops one.
+                if paged_dims.is_empty() {
+                    walk
+                } else {
+                    walk.clone().paged_at(&paged_dims).unwrap_or(walk)
+                }
+            },
+            // ── INDIRECT (GATHERED) HBM ACCESS ──
+            // Reproduces `dxp/test/test_gather_1core/sdsc_1.json`, the vendor fixture that BAKES:
+            // the two nodes CROSS-LINK (each names the other) and the compute op names the index
+            // side. Driven by ONE `Option` on the op, so a half-declared pair — which lowers to a
+            // message-less `map::at` inside dxp — is unrepresentable rather than caught late.
+            //
+            // `None` (every op today) yields exactly the previous three values, so this is
+            // byte-identical for every shipped bundle. A test asserts that rather than trusting it.
+            indirectAllocType_: match &indirect_role {
+                None => "no_indirection",
+                Some(IndirectRole::Index { .. }) => "index_tensor",
+                Some(IndirectRole::Value { .. }) => "value_tensor",
+            },
+            relatedIndirectAccessAlloc_: indirect_role.as_ref().map(|r| {
+                // The partner's node name, built by the SAME `format!` as `name` above so the
+                // cross-link cannot drift from the node it points at.
+                let partner = match r {
+                    IndirectRole::Index { value, .. } => value,
+                    IndirectRole::Value { index, .. } => index,
+                };
+                format!(
+                    "allocate-Tensor{partner}_{}",
+                    views[*partner].allocation.component()
                 )
-                .dims()
-                .iter()
-                .map(|&e| e as i64)
-                .collect::<Vec<_>>()
-                .as_slice(),
-            ),
-            indirectAllocType_: "no_indirection",
-            relatedIndirectAccessAlloc_: None,
-            indexTensorType_: None,
+            }),
+            // Only the INDEX side carries a tensor type; the vendor's value node omits it.
+            indexTensorType_: match &indirect_role {
+                Some(IndirectRole::Index { .. }) => Some("index"),
+                None | Some(IndirectRole::Value { .. }) => None,
+            },
             startAddressCoreCorelet_: addr,
             backGapCore_: None,
             coordinates_: coordinates,
@@ -2183,7 +2463,17 @@ pub fn emit_sdsc(
                 inputLabeledDs: input_refs,
                 interimLabeledDs: vec![],
                 outputLabeledDs: output_refs,
-                indirectAccessIndexLabeledDs: vec![],
+                // ── THE THIRD FIELD OF THE GATHER: the op names the INDEX side ──
+                // Same `Tensor{i}-idx{i}` spelling the labeled-DS refs above are built with, and the
+                // same operand position the two allocate nodes cross-link through, so all three
+                // references to the index operand come from one number. The vendor emits exactly
+                // `["Tensor1-idx1"]` here.
+                //
+                // Empty for every op that declares no gather, which is all of them today — so this
+                // is byte-identical for every shipped bundle.
+                indirectAccessIndexLabeledDs: op.indirect.map_or_else(Vec::new, |ia| {
+                    vec![format!("Tensor{}-idx{}", ia.index, ia.index)]
+                }),
             }];
             ops.extend(epilogue_compute_ops);
             ops
@@ -2548,6 +2838,7 @@ fn convert_opspec(
         op_info: OpInfo::None,
         tiled_symbols,
         time_tile,
+        indirect: None,
     })
 }
 
@@ -2764,6 +3055,7 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
         op_info: OpInfo::None,
         tiled_symbols,
         time_tile,
+        indirect: None,
     })
 }
 
@@ -3420,6 +3712,7 @@ fn restickify_opspec(
         op_info: OpInfo::None,
         tiled_symbols: vec![],
         time_tile: None,
+        indirect: None,
     })
 }
 
@@ -3518,6 +3811,7 @@ fn restickify_opspec_off(
         op_info: OpInfo::None,
         tiled_symbols: vec![],
         time_tile: None,
+        indirect: None,
     })
 }
 
@@ -3634,6 +3928,7 @@ fn restickify_kt_opspec_2d(
         op_info: OpInfo::None,
         tiled_symbols: vec![],
         time_tile: None,
+        indirect: None,
     })
 }
 
@@ -3745,6 +4040,7 @@ fn restickify_v_opspec_2d(
         op_info: OpInfo::None,
         tiled_symbols: vec![],
         time_tile: None,
+        indirect: None,
     })
 }
 

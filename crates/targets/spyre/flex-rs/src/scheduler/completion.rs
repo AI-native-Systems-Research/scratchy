@@ -275,11 +275,22 @@ fn qgi_detail(rb: ResponseBlockWire) -> String {
     }
     if qgi.is_qgi() {
         let cases: Vec<String> = qgi.qgi_error_cases().map(|c| format!("{c:?}")).collect();
+        // ⭐ `job_count` IS THE HARDWARE'S OWN STATEMENT OF HOW FAR THE QG CHAIN WALK GOT, and it was
+        // being decoded and thrown away. Every Prep case in the table is about parsing the job-header
+        // chain (`PrepZeroFlitCnt` = a header whose flit count read as zero, `PrepSwVer` = one whose
+        // SW version is not dip's `0xdd`), and a faulting ADDRESS alone cannot say whether the walk
+        // failed on the FIRST header or the Nth: the same address is reached by "started here" and by
+        // "walked here". `job_count == 0` means the device never validated a single job — which is a
+        // statement about the bytes AT the bootstrap, not about the chain — while any non-zero value
+        // means the walk consumed that many headers first and the defect is in the count the previous
+        // header declared. That distinction is the whole difference between suspecting the upload and
+        // suspecting the emission, and it costs one field.
         out.push_str(&format!(
-            " QGI addr={:#x} ({} flits) syndrome={:#x} cases=[{}]",
+            " QGI addr={:#x} ({} flits) syndrome={:#x} job_count={} cases=[{}]",
             qgi.qgi_address_bytes(),
             qgi.qgi_address_flits(),
             qgi.qgi_syndrome(),
+            qgi.job_count(),
             cases.join(","),
         ));
         if qgi.qgi_error_cases().any(|c| c.is_unmapped_address()) {

@@ -299,6 +299,12 @@ pub struct KvShifts {
     /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
     /// (request, page).
     pub batched_requests: bool,
+    /// ⭐ That axis walks a GATHERED scratch, so each row's PAGE came from the index the host stages
+    /// rather than from a segment shift. Two consequences the runtime must know: the pool needs no single
+    /// stride for the passes to collapse, and the fold's KV shift must be ZERO (an absolute entry plus a
+    /// per-pass page base composes two bases and lands inside neither). Meaningful only with
+    /// [`Self::batched_requests`].
+    pub gathered: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
 }
@@ -344,8 +350,9 @@ pub struct LaunchProgram<'a> {
 /// path refusing when an index did not resolve. A bundle naming a program it does not carry was
 /// constructible, and the refusal was the proof it was constructible. There is no index to dangle now.
 ///
-/// `SCRATCHY_SUPERDSC_GROUP_SIZE=1` makes this one trip per program, which is the fault-isolation end of
-/// that knob — not a different mode.
+/// A group size of `1` makes this one trip per program, which is the fault-isolation end of that range —
+/// not a different mode. It is a compile-time constant (`GroupSize::PRODUCTION`), reached by a source
+/// edit; it was an env read until the two values were measured to give DIFFERENT OUTPUT at width 8.
 // NOT `Eq`: a group carries its PROGRAMS, and a program carries float constants.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchGroup<'a> {
@@ -372,6 +379,62 @@ pub struct LaunchGroup<'a> {
     /// separately as `ComputeOnHost.size`; the bake checks the finished payload against it and refuses a
     /// mismatch, so only the payload needs to reach the binary.
     pub correction: Cow<'a, [u8]>,
+}
+
+impl LaunchGroup<'_> {
+    /// ⭐⭐⭐⭐⭐ WHERE THIS PROGRAM SITS INSIDE ITS OWN ALLOCATION AND HOW BIG THAT ALLOCATION IS — ONE
+    /// value, minted from [`Self::job_bin_ptr`] alone.
+    ///
+    /// 🛑 **IT WAS THE SAME SUBTRACTION, WRITTEN TWICE, WITH TWO DIFFERENT FAILURE BEHAVIOURS.** The
+    /// allocation path spelled `job_bin_ptr.checked_sub(prog_offset_base())` and refused an underflow;
+    /// the launch spelled `job_bin_ptr - prog_offset_base()` bare, two hundred lines away, which wraps
+    /// in release and panics in debug. Both are "the prologue dxp reserved", and the device starts
+    /// executing where the image was uploaded only because they agree.
+    ///
+    /// ⛔ THIS IS THE QUANTITY DXP DECLARES TWICE. `ComputeOnDevice.job_bin_ptr` and
+    /// `InitTransfer.dev_ptr` are the same device VA — `parse_spyrecode` refuses a plan where they
+    /// differ, because a plan that separates them is not expressible on this side: there is one
+    /// `job_bin_ptr`, and this is the one door it leaves through. Uploading at offset 0 while
+    /// bootstrapping `mq*128` in is what made the device read the image's own flit `mq` as its first job
+    /// header (`syndrome=0xc00 [PrepZeroFlitCnt, PrepSwVer]`, `job_count=0`), and it was expressible
+    /// only because the offset and the bootstrap were two derivations rather than one value.
+    ///
+    /// `None` when `job_bin_ptr` is below the program segment's base — an address that names no offset
+    /// at all, which used to be a refusal on one path and a wrap on the other.
+    pub fn prog_image(&self, prog_base: u64) -> Option<ProgImage> {
+        Some(ProgImage {
+            head: self.job_bin_ptr.checked_sub(prog_base)?,
+            image: self.init_binary.len() as u64,
+        })
+    }
+}
+
+/// ⭐⭐⭐ A PROGRAM'S PLACEMENT IN ITS PROGRAM-SEGMENT ALLOCATION: the prologue dxp reserves and does not
+/// fill, plus the image that follows it. See [`LaunchGroup::prog_image`], the only constructor.
+///
+/// The three numbers a launch needs — where to upload, where to start, how much to allocate — are all
+/// this one pair, so none of them can be computed from a different `job_bin_ptr` than the others.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProgImage {
+    head: u64,
+    image: u64,
+}
+
+impl ProgImage {
+    /// The bootstrap OFFSET the launch passes, which is ALSO the offset the image is uploaded at. One
+    /// accessor for both, because they are one number: flex bounds the seg7 translation to the
+    /// allocation's size, so the launch passes an offset and not the full VA.
+    pub const fn bootstrap(self) -> u64 {
+        self.head
+    }
+    /// Bytes the program allocation must hold: the unfilled prologue AND the image above it.
+    pub const fn alloc_bytes(self) -> u64 {
+        self.head + self.image
+    }
+    /// The image itself, for the diagnostics that report the two halves separately.
+    pub const fn image_bytes(self) -> u64 {
+        self.image
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════

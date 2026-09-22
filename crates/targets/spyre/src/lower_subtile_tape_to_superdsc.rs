@@ -116,12 +116,12 @@ pub use ktir_superdsc::work::{
 // do not move. Changing one is now a source edit that recompiles, which is what
 // makes it a constant rather than a configuration.
 //
-// 🛑 `SCRATCHY_SUPERDSC_GROUP_SIZE` IS DELIBERATELY NOT HERE. It is the one knob
-// the canonical env DOES set (2048), and the two authorities disagree: this file
-// says "2048 was too aggressive … 512 is the real ceiling, not 2048", while the
-// canonical pod env says "G=2048 = whole-body = ~14.6 tok/s … pod DEBUG scripts use
-// 512; DON'T — it tanks throughput". Picking either silently is a crash or a 2.2×
-// throughput regression, so it stays a read until someone settles it on a card.
+// ✅ `SCRATCHY_SUPERDSC_GROUP_SIZE` IS NOW HERE TOO — see [`GroupSize`]. It was held
+// back "until someone settles it on a card" because two authorities looked like they
+// disagreed on throughput; they did not. The "it tanks throughput" warning is about
+// 2048, while 128-vs-512 is the same speed in three independent measurements. What
+// the card DID settle is worse than a throughput question: the two values give
+// DIFFERENT OUTPUT at width 8, so the partition can never be ambient.
 
 // ⭐⭐⭐ THE WIRE LAYER LIVES IN `ktir_superdsc::wire` — `Dsc`, `SdscOp` and the whole
 // `#[derive(Serialize)]` family, the three fp8 nested-fold generators, and the HBM segment
@@ -178,11 +178,12 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 // numbers to bind anything at all. Re-exported so every path in the tree resolves unchanged.
 pub use ktir_superdsc::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
-    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, LAST_HIDDEN_TID, NEW_V_PROBE_TID,
-    ONES_REDUCE_TID, RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID,
-    RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID,
-    SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID,
-    SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, kct_resident_tid, scalarmul_scale_tid,
+    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
+    NEW_V_PROBE_TID, ONES_REDUCE_TID, RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT,
+    RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID,
+    ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID,
+    SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, kct_resident_tid, reserved_region,
+    scalarmul_scale_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -1089,8 +1090,24 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // page, so every other row must be masked off for it — the mask is `[pass][row][page]`
                 // and the runtime steps it by a whole `rows * page` block. A prompt keeps one
                 // broadcast row per page, which is all its rows can need.
+                // ⭐⭐⭐ AND A GATHERED BUNDLE BLOCKS THE MASK **PER PAGE**, SO IT NEEDS `MAX_PAGES_PER_ROW`
+                // BLOCKS AND NOT `MAX_FOLD_PASSES`. A gathered fold's pass IS a page and serves the whole
+                // batch (`MaskBlockForm::PerPage`), so the passes are bounded by the pages ONE ROW can hold
+                // — 16 — where an uncollapsed fold's are bounded by `pages × requests` over the shared pool
+                // (64). That is a 4x SMALLER reservation, and since the host stages only the live blocks it
+                // is also `mq`x less mask uploaded every step: at bs=8 and three pages, 3 blocks instead of
+                // 24.
+                //
+                // ⛔ WHICH FORM THIS BUNDLE USES IS THE SAME `rows_are_requests` CONDITION THE INDEX
+                // PLACEMENT AND `assemble_attn`'s gather are gated on — one predicate, three consumers.
+                // Getting it wrong is silent in the dangerous direction: `MAX_PAGES_PER_ROW` blocks against
+                // an uncollapsed fold is a fold reading mask bytes nobody staged, which read as ZERO and
+                // therefore VALID.
                 let (pm_rows, pm_blocks) = if rows_are_requests {
-                    (nqh * mq, MAX_FOLD_PASSES)
+                    (
+                        nqh * mq,
+                        scratchy_subtile::sdsc_abstract::PagedKvPool::MAX_PAGES_PER_ROW as u64,
+                    )
                 } else {
                     (1, MAX_PAGES_PER_REQUEST)
                 };
@@ -1127,6 +1144,164 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     },
                 );
                 seg_bytes[a] = align128(cmoff + cmbytes);
+                // ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX — the index tensor a GATHERED KV read is addressed through.
+                //
+                // A seg0 ACTIVATION, exactly like the two masks above and for the same reason: it is
+                // per-STEP host data (the block table changes as requests grow pages), and a seg1 weight
+                // is only H2D'd at PrepareModel, so a synthetic seg1 index would stay ZERO — which for
+                // an index tensor means every row gathering block 0, i.e. row 0's keys for everyone.
+                //
+                // ⭐⭐⭐ PLACED IFF THE BUNDLE GATHERS, WHICH IS WHAT MAKES THE PLACEMENT THE ANSWER.
+                // It used to be unconditional, and that cost the runtime its only artifact-derived way
+                // to ask the question: `BakeFacts::gathers_kv` is this placement's presence, exactly as
+                // `uses_identity` is `IDENTITY_TID`'s, and it decides whether the forward tape carries a
+                // `KvBlockIndex` step. Unconditional, every bundle claimed to gather, so every launch
+                // would have had to stage a table — including the prompt-chunk and solo-decode paths
+                // that emit no gather at all — and the one condition that must govern both halves would
+                // have had to be re-derived somewhere else.
+                //
+                // `rows_are_requests` is that condition, and it is the SAME parameter
+                // `lower_ktir_to_superdsc` passes `assemble_attn`'s `kv_block_index` from. A prompt chunk
+                // and a solo decode share ONE resident history across every row, so there is nothing for
+                // an index to distinguish and their emission stays byte-identical.
+                //
+                // ⛔⛔⛔⛔⛔ AND IT IS **STILL** `rows_are_requests` ALONE, AGAINST THE OBVIOUS FIX, BECAUSE
+                // THE 8b BATCHED PATH **READS THESE BYTES** — MEASURED, TWICE, ON THE CARD.
+                //
+                // The split is real and it is stated on [`GatherScratch::admits`]: `assemble_attn` may
+                // DECLINE the gather on the geometry (`of_fold_pass` refuses a head dim its flat copy
+                // cannot express) and this placement does not ask, so an hd=128 bundle reserves this
+                // activation, `BakeFacts::gathers_kv` answers `true` and the forward tape stages a table
+                // that NO descriptor gathers through — while `GathersKv::of_launch_groups`, the per-BODY
+                // door, answers `false` for the same bundle. Three doors, two answers. At hd=64
+                // `of_fold_pass` never refuses, which is why it was invisible.
+                //
+                // ⛔ NARROWING THIS WITH `GatherScratch::admits` — the one-line fix, which reserves only for
+                // the bundles that really gather — CANNOT BE VERIFIED TODAY, BECAUSE THE 8b BATCHED ORACLE
+                // DOES NOT HOLD. Measured on pod `nickm-7db9667cdd-z2jc6`, `scr batch` over the `c` probe
+                // (420-token generations, one distinct integer sequence per row), each rung against its OWN
+                // `--max-num-seqs 1` run of the identical file:
+                //
+                // | tree | rung 2 | rung 4 | rung 8 |
+                // |---|---|---|---|
+                // | this one, narrowed | `solo_diff=1` | `solo_diff=3` | `solo_diff=7`, 3 DEGEN |
+                // | this one, NOT narrowed (the code below) | `solo_diff=1` | `solo_diff=3` | `solo_diff=7` |
+                // | **`f080bb60a` REBUILT, md5-verified byte-equal** | `solo_diff=1` ×3 trials | — | — |
+                // | `f080bb60a` as recorded in its own commit message | `solo_diff=0` | `solo_diff=0` | `solo_diff=0` |
+                //
+                // ⭐ THE CONTROL IS THE WHOLE POINT. Narrowing this reservation moves every activation after
+                // it, so the first reading — "the hole was load-bearing padding and I removed it" — was
+                // entirely plausible and it is WRONG: the parent commit, restored file-by-file to md5
+                // equality and rebuilt on this same pod, is equally non-solo-exact. `rc=0`, no fault, ITL
+                // and wall unchanged across every variant (rung 8: 173.4 / 173.9 / 175.4 ms), and each bad
+                // row diverges from its own solo at a common prefix of 87-118 of 420 tokens. The SOLO
+                // oracles are byte-identical across all of it (`solo=EXACT` 8/8 against the baseline's own
+                // solo jsonl), so the oracle is not what moved either.
+                //
+                // ⛔ SO "granite-3.1-8b fp8 RUNS EVERY RUNG CLEAN AT 3.66x" IS NOT REPRODUCIBLE FROM THE
+                // COMMIT THAT RECORDS IT, and the 3.66x is a THROUGHPUT number whose correctness column was
+                // one sample. What differs between this morning's binary and the same source rebuilt is not
+                // in the source; the untested candidate is the BUNDLE BUILD (dxp's work division is
+                // thread-count sensitive and these builds are pinned to `taskset -c 0-19`), which would make
+                // the 8b's batched numerics a property of the compile rather than of the emission.
+                //
+                // ⛔⛔⛔ AND IT IS NOT AN hd=128 STORY: **granite-3.1-2b fp8 — the ONE geometry the gather
+                // actually runs on — is WORSE.** Same pod, same probe, same tree (whose 2b emission is
+                // byte-identical to `f080bb60a` by construction: at hd=64 `admits` is `true`, so the name
+                // gate reduces to `rows_are_requests` and this placement is untouched code), two trials per
+                // rung:
+                //
+                // | rung | solo | batched | `solo_diff` |
+                // |---|---|---|---|
+                // | 2 | ITL 27.8 ms | 33.9 / 33.7 ms | **2 of 2**, both trials |
+                // | 4 | ITL 27.7 ms | 39.3 / 40.5 ms | **4 of 4**, both trials |
+                // | 8 | ITL 28.1 ms | 63.5 / 62.4 ms | **8 of 8**, both trials |
+                //
+                // NOT ONE ROW matches its own solo at any width, and rung 4 finished 1385 and 1307 of the
+                // solo's 1680 tokens — rows terminating early, which is the collapse symptom, not noise. The
+                // pre-gather 2b record in `/work/bw/out.pre-gather` has the same probe at width 8 with
+                // `solo_diff=0`. So the gather's own 4.11x rests on a correctness column that does not hold
+                // today either, and the gather is ON in every one of those runs.
+                //
+                // ⛔ AND THAT IS WHY THIS STAYS AS IT IS. Not because the narrowing is wrong — it is right,
+                // and [`GatherScratch::admits`] states the rule — but because landing an address-moving
+                // change against an oracle that fails 1-of-2 rows on the unmodified parent would pin
+                // whatever it produced as "no regression". The order is: give the 8b batched path a STABLE
+                // oracle first (find why the same source rebuilt is not the same numerics), then narrow
+                // this, then measure. Until then only the emitter-side half of the one rule lands:
+                // `lower_ktir_to_superdsc` gates the tensor's NAME on `admits`, which is provably
+                // non-observable (`assemble_attn`'s `kv_block_index.zip(of_fold_pass(..))` is already `None`
+                // at hd=128 whichever way the name goes), so the coupling is stated where it costs no
+                // addresses and this placement keeps every byte it had.
+                if rows_are_requests {
+                    // ⛔⛔⛔ SIZE = THE ENTRIES THE **DESCRIPTOR DECLARES**, NOT THE ENTRIES THE HOST
+                    // MEANS TO FILL. This was `WIDEST_BATCH_RUNG * MAX_PAGES_PER_ROW` — 32 x 16 = 512
+                    // entries, "one per (launch row, logical page), the same shape as the host's
+                    // `block_tables`". MEASURED against the real emission
+                    // (`the_declared_index_holds_no_more_entries_than_the_bundle_reserves`), the
+                    // descriptor declares **2048**: the index's dims are the value's PAGED dims and its
+                    // extents come from the op's own iteration space, so along the slot axis it is the KV
+                    // WINDOW WIDTH (256) and not a page count — `["out","mb"] = [256, 8]`.
+                    //
+                    // 512 reserved against 2048 declared is 1536 entries read PAST the placement, and past
+                    // it is the next seg0 tensor's bytes read as block numbers. Block numbers are valid
+                    // addresses, so that bakes clean, faults nothing, and gathers from wherever those
+                    // bytes happen to point.
+                    //
+                    // So the bound is the descriptor's own worst case: the slot axis can declare at most a
+                    // whole page (`PAGE_SLOTS`, the pre-paged capacity every rung's `active_cap` is a
+                    // divisor of) and the batch axis at most the widest rung. Over-reserving is inert — the
+                    // tail is simply unread — while under-reserving is an address, so the asymmetry decides
+                    // which way to round. At `PAGE_SLOTS x WIDEST_BATCH_RUNG x 4 B` this is 32 KB of an
+                    // activation segment that is uploaded every step anyway.
+                    //
+                    // ⛔ ENTRIES ARE GLOBAL STICK-BLOCK INDICES, NOT PAGE NUMBERS. dxp computes
+                    // `addr = idx * skip_addr + base_addr`, and `skip_addr` is what the score leg's Kᵗ
+                    // operand emits as its entry: ONE STICK BLOCK, `hd * ELEMS_PER_STICK` elements —
+                    // MEASURED at 4096 at head_dim 64, and 8192 at head_dim 128. That unit works because
+                    // the whole pool is a uniform array of stick blocks (`plane_block_elems` is four of
+                    // them; `plane_stride` / `layer_stride` / `page_stride` all multiples), so one index
+                    // reaches any cell with no relayout. An entry written as a PAGE number is short by
+                    // `page_stride / stick_block` — hundreds — and lands inside a different layer:
+                    // `sdsc_abstract::gather_entries_per_page` is the factor, and it is NOT a constant.
+                    //
+                    // ⭐⭐⭐⭐⭐ THE SIZE IS **THE MASK'S OWN PASS GRID**, AND THAT PITCH IS FORCED BY THE LAUNCH
+                    // ABI, NOT CHOSEN.
+                    //
+                    // The gather now lives on the KERNEL-less copy op, whose gather dim is `mb` with no
+                    // second pinned axis — so the index is a FLAT rank-1 table of `nkvh * nb * mq` entries
+                    // per fold pass, and dxp's own formula reduces to `ceil_to_stick(mb)` with no per-row
+                    // stick to pad to. What sizes this placement is therefore not the entry layout but the
+                    // PASS layout: pass `p` needs its own entries, and the only per-pass shifts a launch has
+                    // are `kv`, `mask` and `intermediate` (`fold_plan::SegDeltas`). KV is resident and never
+                    // uploaded; the intermediate segment carries `qs` and the whole online-softmax state, so
+                    // shifting it would move every operand the pass reads. The index is an ACTIVATION —
+                    // `SegRole::Activation` IS `SEG_MASK` — so it rides the MASK's shift, and its per-pass
+                    // pitch must BE the mask's block stride.
+                    //
+                    // ⛔ SO THE TWO PLACEMENTS DERIVE THEIR PITCH FROM ONE NUMBER, `pmbytes / pm_blocks`,
+                    // computed just above for the mask itself. A pitch that disagrees puts pass `p`'s gather
+                    // on some other pass's entries — a clean bake reading real block numbers from the wrong
+                    // page. `gather_index_table` takes the SAME value as `pass_stride_entries`.
+                    //
+                    // ⛔ AND IT IS THE MASK'S BLOCK COUNT TOO, not `MAX_FOLD_PASSES`: a gathered fold's
+                    // passes are the pages ONE ROW holds. Over-reserving would be inert here, but agreeing
+                    // with the mask's own grid is what keeps the shift meaningful for both tensors.
+                    let bioff = seg_bytes[a];
+                    let bibytes = pmbytes;
+                    placements.insert(
+                        KV_BLOCK_INDEX_TID,
+                        TensorPlacement {
+                            tid: KV_BLOCK_INDEX_TID,
+                            bank: 0,
+                            role: SegRole::Activation,
+                            segment: a,
+                            offset: bioff,
+                            size: bibytes,
+                        },
+                    );
+                    seg_bytes[a] = align128(bioff + bibytes);
+                }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
                 // [mq_pad, nkvh·hd]. lower_attn_node copies layer-0 new_v here; the worker reads it to split
                 // the structural inf (matmul vs selector). Never reused ⇒ survives to post-prefill readback.
@@ -1812,7 +1987,12 @@ pub enum GroupKind {
     /// (they share a page base) but must never fuse with anything else — the shim re-launches this
     /// group per page, and a stray op swept in would re-run per page too, re-seeding the new-token
     /// block or re-adding the residual once per page.
-    PageFold,
+    ///
+    /// ⭐⭐⭐⭐⭐ `gathered` IS THE OP'S OWN [`EmittedOp::kv_gathered`], AND IT DECIDES THE SIZE CAP —
+    /// see [`GroupKind::run_may_be_chunked`]. It lives in the KIND because the chunking rule is a
+    /// property of the kind and must stay in ONE place; a gathered fold's passes communicate through a
+    /// scratch they rewrite, an ungathered fold's do not, and that is the whole difference.
+    PageFold { gathered: bool },
     /// `slab_write` DECODE incremental Kᵀ restickify (kill-restickify Stage 2, hd==64): re-transposes
     /// ONLY the current 64-slot slab; the shim shifts the group's seg2 base by
     /// `(slot_pos/64)·slab_stride_bytes` ONCE (each op baked at slab 0). Consecutive `Slab` trips FUSE
@@ -1861,12 +2041,82 @@ impl GroupKind {
         match (self, other) {
             (GroupKind::Pure, GroupKind::Pure) => true,
             (GroupKind::Slab, GroupKind::Slab) => true,
-            (GroupKind::PageFold, GroupKind::PageFold) => true,
+            // AND THE SAME GATHER STATE. They move together in today's emitter (one `gather` decision
+            // serves a whole attention block), so this arm is `true` in practice — but a group takes
+            // its SIZE CAP from its first trip's kind, so a run mixing the two would silently give one
+            // half the other's cap. Breaking at that boundary can only cost a launch.
+            (GroupKind::PageFold { gathered: a }, GroupKind::PageFold { gathered: b }) => a == b,
             (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
             // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
             // HostKv: the shim's `oi += skip` must land on this exact entry.
             _ => false,
         }
+    }
+
+    /// ⭐⭐⭐⭐⭐ WHETHER A RUN OF THIS KIND MAY BE **CHUNKED BY THE GROUP SIZE** — false for
+    /// `PageFold { gathered: true }` ALONE, and that is a CORRECTNESS law, not a tuning choice.
+    ///
+    /// ⛔⛔⛔ A GROUP IS THE UNIT OF THE `reps` RELAUNCH, AND THE LOOP IS GROUP-MAJOR.
+    /// `superdsc_exec::launch_ops_inner` is `for op in ops { for rep in 0..reps(op) { … } }`, so a fold
+    /// cut into groups A then B runs **A(pass 0..n), then B(pass 0..n)** — never A(0),B(0),A(1),B(1).
+    /// Every op inside one pass therefore has to be inside one group.
+    ///
+    /// For an UNGATHERED fold the split is survivable by accident: each pass reads the pool through its
+    /// own KV segment shift, and the online softmax's running max/sum/output is accumulate-only, so
+    /// applying the (window, pass) contributions group-major gives the same answer. **For a GATHERED
+    /// fold it is wrong**, because the passes communicate through a buffer they REWRITE: group A's copy
+    /// leaves the gathered scratch holding page `n-1`, and every one of group B's passes then reads page
+    /// `n-1`. With one pass that is invisible — A writes page 0, B reads page 0 — which is exactly why
+    /// this survived every single-page test and broke at the first page crossing, at ANY batch width
+    /// (MEASURED on granite-3.1-2b fp8: first divergence at absolute slot 256, offset 0 into page 1, at
+    /// width 2 and width 8 alike; `SCRATCHY_SDSC_PEROP_SYNC=1` does not move it, because the order is
+    /// semantically wrong rather than racy).
+    ///
+    /// ⭐ AND [`GroupSize`]'s OWN DOC ALREADY RECORDED THE SYMPTOM WITHOUT NAMING IT: `solo_diff` is
+    /// 8,8,8,8,8 at `g = 128` and 7,6,7 at `g = 512`, "so the partition into compile groups is the only
+    /// variable, and it changes the answer". A partition that changes the answer is this: at 512 more of
+    /// the fold fits one group. The fix is not a bigger `g` — a bigger `g` only moves which contexts are
+    /// wrong — it is that this run is never cut.
+    ///
+    /// ⛔⛔⛔⛔⛔ AND IT IS THE **GATHERED** FOLD ONLY — "one rule for both folds" WAS SHIPPED AND IS A
+    /// MEASURED 8b REGRESSION.
+    ///
+    /// What stood here claimed two things, and both were false. It said gating on the gather "would put
+    /// the decision in a second place (the trip carries no gather bit, so it would have to be threaded)":
+    /// [`EmittedOp::kv_gathered`] already exists, `attn.rs` already sets it from the same `gather` the
+    /// fold's own [`GatheredFold`] is built from, and [`launch_index`] already reads it one function
+    /// away — so the bit was never absent, and carrying it in the KIND keeps the rule in exactly the one
+    /// place that comment wanted. It also said "the ungathered fold loses nothing by it: fewer groups is
+    /// fewer launches". That is the assumption granite-3.1-8b falsifies.
+    ///
+    /// ⛔ MEASURED, `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic` (hd = 128) **AT A TREE WHERE
+    /// [`PageScratch::of_pass`] STILL REFUSED TWO SLABS** — confirmed with `SCRATCHY_GATHER_DIAG=1` SET
+    /// and 0 gather steps, against 421 at 2b — so that model's fold was UNGATHERED and these three rows
+    /// are three partitions of the SAME ungathered fold. That refusal is gone and the 8b's fold is now
+    /// gathered (419 diag steps, `own_bad 0,0,0`, `solo_diff 0,0,0`, N=3), so the table below is evidence
+    /// about the UNGATHERED fold — which is what the rule is about. 420-token `c` probe at width 8, each
+    /// binary scored against its OWN `--max-num-seqs 1` run, N = 3:
+    /// ```text
+    ///   origin/main  (cap = g)     own_bad 8,7,7  degen 4,5,3  first divergence 87-118 chars (term 14-19)
+    ///   cap lifted for BOTH folds  own_bad 8,8,8  degen 1,1,2  first divergence 1-4 chars (term 0):
+    ///                                                          " 11111111…", " / / / / /…"
+    ///   THIS RULE (gathered only)  own_bad 7,8,8  degen 3,2,1  first divergence 87-118 chars (term 14-19)
+    /// ```
+    /// Every 8b width-8 cell is broken — that defect predates all of this and is not what changed — but
+    /// lifting the cap on the ungathered fold turns a prefix coherent for fifteen terms into garbage from
+    /// the first token, and restoring the cap restores main's per-row divergence offsets EXACTLY
+    /// (99/106/118/93/106/112/87 chars, row for row, on both trees).
+    ///
+    /// ⛔ WHY it damages the ungathered fold is NOT established, and this comment does not guess: the
+    /// only thing measured is that the partition is the variable. Which is the same shape as the bug the
+    /// exemption exists for, and the reason the exemption is now no wider than its evidence.
+    ///
+    /// ⭐ THE NECESSITY ARGUMENT ONLY EVER COVERED THE GATHERED FOLD. Its passes read a scratch the
+    /// gather REWRITES per pass, so group-major execution makes group B read the page group A left. An
+    /// ungathered pass rebases the KV segment instead and holds no state between groups — the online
+    /// softmax is accumulate-only — so it needs no exemption and is not given one.
+    fn run_may_be_chunked(self) -> bool {
+        !matches!(self, GroupKind::PageFold { gathered: true })
     }
 }
 
@@ -1918,7 +2168,17 @@ pub fn group_ranges(trips: &[Trip], g: usize) -> Vec<core::ops::Range<usize>> {
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
-        while end < n && cnt < g && trips[start].fusable_with(&trips[end]) {
+        // ⛔ THE CAP IS PER KIND — see [`GroupKind::run_may_be_chunked`]. A GATHERED `PageFold` run is ONE
+        // group however long it is, because a group is the unit of the `reps` relaunch and the launch loop
+        // is group-major: cutting it makes every pass of the second group read the scratch the first group
+        // left at its LAST pass. An UNGATHERED fold holds no such state, so it chunks like everything
+        // else — exempting it too is a measured 8b regression.
+        let cap = if trips[start].kind.run_may_be_chunked() {
+            g
+        } else {
+            usize::MAX
+        };
+        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
             end += 1;
             cnt += 1;
         }
@@ -1957,12 +2217,21 @@ pub fn group_ranges_cover_ok(trips: &[Trip], g: usize) -> (usize, bool) {
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
-        while end < n && cnt < g && trips[start].fusable_with(&trips[end]) {
+        // Byte-identical to `group_ranges`: the cap is per kind.
+        let cap = if trips[start].kind.run_may_be_chunked() {
+            g
+        } else {
+            usize::MAX
+        };
+        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
             end += 1;
             cnt += 1;
         }
         ok &= start == expect;
-        ok &= (end - start) <= g; // group ≤ g
+        // ⛔ THE SIZE INVARIANT IS NOW PER KIND TOO, and a GATHERED `PageFold` run has NO size bound — it
+        // must be one group at any length (`GroupKind::run_may_be_chunked`). Keeping `<= g` here would make
+        // the proof contradict the walk it is the twin of.
+        ok &= (end - start) <= cap; // group ≤ its kind's cap
         ok &= end > start; // non-empty ⇒ the walk advances ⇒ terminates
         expect = end;
         i = end;
@@ -1987,7 +2256,15 @@ pub fn group_spans_two_requests(trips: &[Trip], g: usize) -> bool {
         let start = i;
         let mut end = start + 1;
         let mut cnt = 1usize;
-        while end < n && cnt < g && trips[start].fusable_with(&trips[end]) {
+        // THE SAME PER-KIND CAP AS THE WALK. It cannot change this predicate's answer — the run only
+        // extends while `fusable_with` holds, and that requires an equal request — but a third copy of
+        // the walk that drifts from the other two is how the cap came to be missing from one of them.
+        let cap = if trips[start].kind.run_may_be_chunked() {
+            g
+        } else {
+            usize::MAX
+        };
+        while end < n && cnt < cap && trips[start].fusable_with(&trips[end]) {
             end += 1;
             cnt += 1;
         }
@@ -2003,16 +2280,95 @@ pub fn group_spans_two_requests(trips: &[Trip], g: usize) -> bool {
     false
 }
 
-/// Medium-grain fusion group size (trips per concrete dxp bundle). `1` = the
-/// historical per-op path (each trip its own program). Env `SCRATCHY_SUPERDSC_GROUP_SIZE`.
-/// Hoisted OUT of the pure `group_ranges` (env reads unbound CBMC — see `plan_capped`).
+/// ⭐⭐⭐⭐⭐ TRIPS PER CONCRETE dxp BUNDLE, AS A COMPILE-TIME CONSTANT — and the reason it stopped
+/// being an env read is that **the knob moves CORRECTNESS, which no authority had measured.**
+///
+/// ⛔ WHAT THE ENV READ COST: three rounds of control experiments that never controlled anything.
+/// `SCRATCHY_SUPERDSC_GROUP_SIZE` was read by `std::env::var` at macro-expansion time and forwarded by
+/// NO `build.rs`, so changing it did not invalidate a single cargo unit. MEASURED: a build wrapper
+/// exporting 512 against a tree last built at the default finished in 5.20 s with the binary's md5 and
+/// mtime UNCHANGED — forcing the re-emit needs `cargo clean --release -p scratchy-models` (456 s), and
+/// `cargo clean -p` alone cleans the dev profile and does nothing. The pod's build wrappers export 512
+/// while a bare `cargo build` gets 128, so a "restored file-by-file to md5 equality, rebuilt" control
+/// compared a 128 bundle against 512 headline numbers and read the difference as nondeterminism.
+///
+/// ⭐ THE TWO VALUES ARE FREE IN SPEED AND NOT FREE IN OUTPUT. Three separate measurements agree that
+/// 128 and 512 cost the same: `spyre_exec.rs`'s 420-token probe (avg ITL 87.5 vs 87.5 ms, wall 45.5 vs
+/// 45.4 s), the 8b TTFT/ITL comparison below, and a w8 ladder (ITL med 62.8–63.1 vs 62.6–62.8 ms). But
+/// on granite-3.1-2b fp8 at width 8 against its own solo oracle, `solo_diff` is **8,8,8,8,8** at 128
+/// (N=5) and **7,6,7** at 512 (N=3) — and the SURVIVING row moves between identical trials. The 8b
+/// descriptor multiset is byte-identical across a 128 and a 512 bake (134 bundles, 94 distinct
+/// descriptor md5s, multisets equal), and `dxp_standalone` is bit-deterministic on a fixed partition
+/// (N=14 bakes across thread counts, `taskset` and `DT_PARALLEL_THREADS`, every output md5-identical).
+/// **So the partition into compile groups is the only variable, and it changes the answer.** A quantity
+/// like that cannot live in the environment of whoever happened to run the build.
+///
+/// The `2048` the canonical pod env sets is a THIRD value and the "it tanks throughput" warning attached
+/// to it is about 2048, not about 512 — conflating the two is what kept this a read.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct GroupSize(usize);
+
+impl GroupSize {
+    /// The largest partition the bake survives. `dxp_standalone` sizes its pool from
+    /// `hardware_concurrency()` (`dscglobal.h:56`), which reports the HOST's cores and ignores the
+    /// cgroup quota, and its thread count tracks the GROUP it is handed (MEASURED ~85 threads on a
+    /// 102-descriptor group against ~192 on a 300-descriptor one). Past the pod's ~3.1k–3.9k concurrent
+    /// thread ceiling, `COMPILE_WIDTH` children of a large group die with
+    /// `LLVM ERROR: pthread_create failed: Resource temporarily unavailable`. 2048 reaches it; 512 is
+    /// the largest value observed to bake.
+    const CEILING: usize = 512;
+
+    /// The ONE value the emission uses. 128 is what an unset variable produced, so this is a pure
+    /// constant-ification of a bare `cargo build` and of CI — no bundle fingerprint moves for them.
+    /// ⛔ It is NOT what the pod wrappers were exporting, so pod headline numbers taken at 512 do not
+    /// describe this build and must be re-measured, not carried over.
+    pub const PRODUCTION: Self = Self::new(128);
+
+    /// Const-evaluated, so an out-of-range group is `error[E0080]` at build time rather than a
+    /// part-way dxp death or a silently different partition.
+    const fn new(trips: usize) -> Self {
+        assert!(trips >= 1, "a launch group holds at least one trip");
+        assert!(
+            trips <= Self::CEILING,
+            "group size exceeds the measured dxp bake thread ceiling — the bake dies part-way with \
+             `pthread_create failed`, see GroupSize::CEILING"
+        );
+        Self(trips)
+    }
+
+    /// Trips in one group. `1` = the historical per-op path (each trip its own program), which is the
+    /// fault-isolation end of the range.
+    pub const fn trips(self) -> usize {
+        self.0
+    }
+}
+
+/// ⛔⭐ THIS LINE IS WHAT MAKES THE CEILING A LOCK, AND WITHOUT IT THERE IS NO LOCK AT ALL.
+/// `new`'s asserts alone do NOT fire for [`GroupSize::PRODUCTION`]: an associated const in an inherent
+/// impl is evaluated ON DEMAND, and a read from a runtime expression (`group_size()`) does not demand it
+/// — MEASURED, `Self::new(513)` passed `cargo check` clean and recompiled in 0.40 s with no diagnostic.
+/// A module-level `const _: ()` is a required-const context, so it forces the evaluation and turns an
+/// out-of-range group into `error[E0080]`. Mutation-checked in both directions: 513 is E0080 here, 128 is
+/// clean. Same defect class as [`an-unused-associated-const-is-not-a-static-assert`] — do not remove
+/// this in the belief that the `const fn` covers it.
+const _: () = {
+    assert!(GroupSize::PRODUCTION.trips() >= 1);
+    assert!(GroupSize::PRODUCTION.trips() <= GroupSize::CEILING);
+};
+
+/// Medium-grain fusion group size (trips per concrete dxp bundle) — [`GroupSize::PRODUCTION`].
+/// Stays a function so the pure `group_ranges` takes it as an argument and CBMC keeps its bound
+/// (see `plan_capped`); it no longer reads the environment.
 pub fn group_size() -> usize {
     // Decode is ~100% launch-count bound (measured ~3640 launches/tok @ ~41µs); fusing consecutive ops
     // into ≤g groups collapses that. 2048 was too aggressive — a fp8-dynamic granite prefill body fused
     // 512-trip groups fine but a dxp_standalone `vector::_M_range_check` crash surfaced once fusion pushed
-    // past that. `SCRATCHY_SUPERDSC_GROUP_SIZE=1` is the explicit DEBUG opt-out (per-op fault isolation).
-    // Read at EMIT time + forwarded by each arch build.rs (rerun-if-env-changed + rustc-env) so a change
-    // recompiles.
+    // past that. `GroupSize::new(1)` is the per-op fault-isolation end, reached by a source edit.
+    //
+    // ⛔ THE CLAIM THAT STOOD HERE — "forwarded by each arch build.rs (rerun-if-env-changed +
+    // rustc-env) so a change recompiles" — WAS FALSE. No build.rs mentioned the variable; nothing
+    // invalidated a cargo unit; the emitted bundle and the source went out of sync silently. See
+    // `GroupSize`.
     //
     // ⭐ DEFAULT = 128, DOWN FROM 512, AND THE REASON IS THE BAKE'S THREAD BUDGET — not runtime.
     // `dxp_standalone` sizes its pool from `hardware_concurrency()` (`dscglobal.h:56`), which reports the
@@ -2034,11 +2390,7 @@ pub fn group_size() -> usize {
     // ⭐ AND IT IS FREE AT RUNTIME. MEASURED on granite-3.1-8b fp8: neither TTFT nor ITL moves between
     // 512 and 128 — consistent with the recorded bs=1 result that a launch is essentially free, and with
     // the earlier 128-vs-512 comparison that found slow-mode ITL identical to within 0.1 ms.
-    std::env::var("SCRATCHY_SUPERDSC_GROUP_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&g| g >= 1)
-        .unwrap_or(128)
+    GroupSize::PRODUCTION.trips()
 }
 
 /// The FLAT (no-loop) `bundle.mlir` body for the all-time=1 case: one
@@ -2134,7 +2486,12 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
                     skip: e.kv_n_skip as usize,
                 }
             } else if e.kv_page_fold {
-                GroupKind::PageFold
+                // ⛔ THE GATHER STATE TRAVELS IN THE KIND, TAKEN FROM THE OP THAT DECLARED IT — the same
+                // field `launch_index` puts on the group's `KvShifts`, so the size cap and the runtime's
+                // `gathered` flag cannot come to disagree about which fold this is.
+                GroupKind::PageFold {
+                    gathered: e.kv_gathered,
+                }
             } else if e.slab_write {
                 // Incremental Kᵀ restickify (kill-restickify Stage 2) → Slab (fusable, one
                 // `slab_stride_bytes`). A DISTINCT kind from Slot: its 8192-byte slab stride ≠ the
@@ -2191,7 +2548,7 @@ fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usiz
     let (mut kinds, owner) = trip_kinds_and_owner(ops);
     if fold == FoldGrouping::Fused {
         for t in kinds.iter_mut() {
-            if matches!(t.kind, GroupKind::PageFold) {
+            if matches!(t.kind, GroupKind::PageFold { .. }) {
                 // Reclassified, but it KEEPS ITS REQUEST — so it still cannot fuse across requests.
                 t.kind = GroupKind::Pure;
             }
@@ -2482,7 +2839,7 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         } else {
             0
         };
-        let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold);
+        let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
         shifts.push(bundle::KvShifts {
             slot_stride_bytes: slot,
@@ -2497,6 +2854,10 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // ONE PASS PER PAGE INSTEAD OF PER (REQUEST, PAGE) — only when the fold's kernels actually
             // carry the request axis.
             batched_requests: fold_group && e.kv_batched_requests,
+            // ⭐ AND WHETHER THAT AXIS IS OVER A GATHERED SCRATCH — the other half of `fold_plan::collapsed`,
+            // and what sends the fold's KV shift to zero. Same `fold_group` gate as the axis: a non-fold
+            // group has no pass to gather for.
+            gathered: fold_group && e.kv_gathered,
             fold_rows: match e.kv_fold_rows {
                 scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest => {
                     bundle::FoldRows::PerRequest
@@ -3420,17 +3781,38 @@ mod tests {
     #[test]
     #[should_panic(expected = "reserved tid region overflow")]
     fn an_index_past_its_region_refuses_instead_of_aliasing_the_next_one() {
-        // scalarmul owns 100 slots; the 101st is past its floor.
-        let _ = scalarmul_scale_tid(RESERVED_REGIONS[1].slots as usize);
+        // The 101st scale is past scalarmul's floor. Asked BY NAME — see
+        // `the_declared_bases_are_the_regions_bases` for what a positional index cost here.
+        let _ = scalarmul_scale_tid(reserved_region("scalarmul_scale").slots as usize);
     }
 
-    /// The regions tile the space downward without gaps between the ones that abut, and every
-    /// declared base IS its region's base — the constants are derived from the table, so there is
-    /// no second copy to drift.
+    /// ⛔⛔⛔ EVERY DECLARED BASE IS ITS OWN **NAMED** REGION'S BASE — and this test previously
+    /// asserted the opposite, which is why the defect it now catches was invisible.
+    ///
+    /// It read `assert_eq!(KCT_RESIDENT_BASE, RESERVED_REGIONS[2].base)`. Both sides were the same
+    /// POSITION, so inserting the `kv_block_index` region at 2 moved the constant AND the expectation
+    /// together and the test stayed green — while `kct_resident_tid(0)` had begun answering
+    /// `KV_BLOCK_INDEX_TID`, i.e. layer 0's resident Kᵗ kernel and the gather's index table sharing one
+    /// placement. A test whose expectation is derived the same wrong way as the code cannot see the
+    /// code being wrong (`a-green-test-can-pin-a-port-divergence-as-correct`).
+    ///
+    /// The bake DID fail — `slots: 1` made `k_id >= 1` overflow — so nothing was silently shipped. That
+    /// was luck, not this test.
     #[test]
     fn the_declared_bases_are_the_regions_bases() {
-        assert_eq!(SCALARMUL_SCALE_BASE, RESERVED_REGIONS[1].base);
-        assert_eq!(KCT_RESIDENT_BASE, RESERVED_REGIONS[2].base);
+        assert_eq!(
+            SCALARMUL_SCALE_BASE,
+            reserved_region("scalarmul_scale").base
+        );
+        assert_eq!(KCT_RESIDENT_BASE, reserved_region("kct_resident").base);
+        // ⭐ AND THE TWO DOORS THAT SHARE A NEIGHBOURHOOD MUST NOT MEET. This is the assertion the
+        // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
+        // constant against its own definition.
+        assert_ne!(
+            kct_resident_tid(0),
+            KV_BLOCK_INDEX_TID,
+            "the resident Kᵗ kernel of layer 0 and the gather's index tensor are ONE tid"
+        );
         // Each region sits strictly below the one before it. They need NOT abut: the K-split
         // regions were removed and their span is deliberately left as a hole, because a reserved
         // id is a number that has been baked into artifacts and sliding one up to close a gap
