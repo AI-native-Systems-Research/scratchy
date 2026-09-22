@@ -148,7 +148,6 @@ PAGE_TEMPLATE = """\
 NAV = [
     ("architectures.html", "Models"),
     ("book/index.html", "Docs"),
-    ("book/COMPILER.html", "Compiler"),
 ]
 
 REPO_URL = "https://github.com/AI-native-Systems-Research/scratchy"
