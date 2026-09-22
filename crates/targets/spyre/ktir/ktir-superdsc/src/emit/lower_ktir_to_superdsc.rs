@@ -150,6 +150,114 @@ impl Region {
     }
 }
 
+/// ⭐⭐⭐ A GATHER THE PROGRAM STATES — the index parameter, the gathered parameter, and how many
+/// entries are taken.
+///
+/// `ktdp.construct_indirect_access_tile` is the ONE op that says "the row index is data": its first
+/// operand is the DATA view and its second the INDEX view, and each view's own first operand is the
+/// function parameter it reinterprets. So all three facts are read off the program; none is threaded in.
+#[derive(Clone, Copy, Debug)]
+pub struct Gather {
+    /// The parameter holding the index vector — `crate::place::act_name(index_tid)` is its operand name.
+    pub index_tid: u32,
+    /// The parameter being gathered FROM (the table).
+    pub value_tid: u32,
+    /// Entries the gather takes: the gathered tile's SLOW extent, one index per gathered row.
+    pub entries: u32,
+}
+
+/// [`Gather`] for this program, or `None` when it states no indirect access.
+///
+/// ⛔ MORE THAN ONE IS REFUSED BY NAME. `computeOp_.indirectAccessIndexLabeledDs` is a list, but no
+/// shipped vendor input has more than one entry and nothing states how a second index pairs with its
+/// operand — and the pairing this crate emits IS the operand adjacency ([`Role::KernelIdx`]), which two
+/// indices cannot both have. So a two-gather program is a refusal, not a guess.
+///
+/// ⛔ AND THE INDEX MAY NOT BE A VIEW OF THE TENSOR BEING GATHERED. An indirect tile whose indices come
+/// out of the buffer it indexes is a self-reference the alloc pair cannot express (one alloc node cannot
+/// be both `index_tensor` and `value_tensor`), and it is also certainly a producer bug.
+pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
+    let f = &k.func;
+    let tiles: Vec<&Operation<'_>> = f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .collect();
+    let tile = match tiles[..] {
+        [] => return Ok(None),
+        [one] => one,
+        _ => {
+            return err(format!(
+                "{}: {} `ktdp.construct_indirect_access_tile` op(s). One descriptor carries ONE index \
+                 operand, paired with the tensor it gathers by POSITION (the index sits immediately \
+                 after it, which is what `DSC2ToDataflowIR.cpp:51` requires), and two indices cannot \
+                 both be adjacent to their own operand. Split the program into one node per gather.",
+                f.name,
+                tiles.len()
+            ));
+        }
+    };
+    // Parameter of the view an operand of this tile reads: tile -> view -> parameter -> its binding.
+    let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
+        let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
+            message: format!(
+                "{}: the indirect access tile states no {what} operand — a gather needs both the \
+                 tensor it reads and the index vector that chooses the rows",
+                f.name
+            ),
+        })?;
+        let view = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the indirect access tile's {what} operand is not a \
+                     `ktdp.construct_memory_view`, so no parameter can be named for it",
+                    f.name
+                ),
+            })?;
+        let ptr = view.operands.first().copied();
+        let i = f
+            .arguments
+            .iter()
+            .position(|(a, _)| Some(*a) == ptr)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, so \
+                     the buffer it names has no binding and no placement",
+                    f.name
+                ),
+            })?;
+        k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+            message: format!("{}: parameter {i} has no bound buffer", f.name),
+        })
+    };
+    let value_tid = param_tid(0, "gathered")?;
+    let index_tid = param_tid(1, "index")?;
+    if value_tid == index_tid {
+        return err(format!(
+            "{}: the gather's index view and the tensor it gathers are the SAME parameter (t{value_tid}) \
+             — one HBM allocation cannot be both this gather's `index_tensor` and its `value_tensor`, \
+             which is the bidirectional `relatedIndirectAccessAlloc_` pair dbo follows in both \
+             directions.",
+            f.name
+        ));
+    }
+    let (entries, _) = shape_2d(tile).ok_or_else(|| Error {
+        message: format!(
+            "{}: the indirect access tile states no 2-D `shape`, so the number of gathered entries is \
+             unknown",
+            f.name
+        ),
+    })?;
+    Ok(Some(Gather {
+        index_tid,
+        value_tid,
+        entries,
+    }))
+}
+
 /// ⛔⛔⛔ THE GUARD FOR THE FACT THIS FILE USED TO DROP: an operand this emitter addresses at the
 /// BUFFER BASE may not carry a row corner.
 ///
@@ -1057,7 +1165,20 @@ pub fn scalarmul(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    let (ins, out) = split_out(name, r, layout, 1)?;
+    // ⭐ AND WHETHER THE TILE IT MULTIPLIES IS **GATHERED** is the program's statement, not the
+    // caller's. `Program::ScalarMul` is the kind of the one COMPUTE op; a Triton embedding is exactly
+    // that op over a row tile whose row INDEX is data (`embedding.py`'s
+    // `rows = table_desc.gather(ids, 0)` then `rows * EMB_SCALE`), so the gather is addressing that
+    // rides on this same node rather than a different node kind.
+    //
+    // `None` for every program that states no `ktdp.construct_indirect_access_tile`, and then `skip` is
+    // empty and [`split_out_excluding`] IS [`split_out`].
+    let gather = gather_of(k)?;
+    // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
+    // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
+    // than by relaxing the count. See [`split_out_excluding`].
+    let skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
+    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
     // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, like the epsilon and the attention scale. It was
     // `KtirNode::scalarmul_scale_idx`, a slot the producer resolved and hung on the node — so the
     // number the emulator multiplies by and the number the descriptor multiplies by were two facts
@@ -1103,6 +1224,107 @@ pub fn scalarmul(
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
     let mut tile_op = pointwise_tile_op(rows, cols, 2);
     tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
+    // ⭐⭐⭐ THE GATHERED FORM IS THE SAME OP WITH AN INDEX OPERAND ON THE TABLE — not a different
+    // `opFuncName`. The shipped `dxp/test/test_gather_1core/sdsc_1.json` is an ordinary `identity`
+    // carrying one extra `labeledDs_` and one extra `computeOp_` field, so nothing about the multiply
+    // changes; `assemble_pointwise_broadcast_gather` adds the index through the ONE door
+    // (`OpSpec::attach_gather_index`) every other gather in this crate goes through.
+    //
+    // ⛔ AND THE PROGRAM'S OWN ENTRY COUNT IS CHECKED AGAINST THE DESCRIPTOR'S ROW COUNT, because the
+    // two are the same fact stated twice: one index per gathered row. The index vector is described
+    // rank-1 over the op's `mb`, so a program whose indirect tile takes a different number of entries
+    // than the node has rows would be described with an index vector of the WRONG LENGTH — and the
+    // length is what the idx→address program iterates.
+    if let Some(g) = gather {
+        if g.value_tid != ins[0].tid {
+            return err(format!(
+                "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
+                 operand must sit immediately after the tensor it indexes, so a gather of a tensor this \
+                 op does not read has no position in the descriptor.",
+                g.value_tid, ins[0].tid,
+            ));
+        }
+        // ⛔⛔⛔ THE GATHER'S ENTRIES MUST **TILE** THE NODE, AND THE INDEX BUFFER MUST HOLD ONE INDEX
+        // PER NODE ROW. Two separate facts, and neither is the other.
+        //
+        // The program states ONE work item: `embedding.py` reads `start_m = tl.program_id(0)` and takes a
+        // `[BLOCK_M, D_MODEL]` tile, so its indirect access tile says BLOCK_M entries. [`node_rows`]
+        // meanwhile reports the OUTPUT VIEW's full row extent, because that is what the emitted
+        // descriptor spans — the same fold every other body here performs (a row-blocked program states
+        // `ceil(m/blk)` windows and one descriptor computes all of them). So the two numbers differ by
+        // exactly the grid, and requiring them EQUAL would refuse the fold rather than check it.
+        //
+        // What has to hold instead is that the work items TILE the node (`rows % entries == 0`), exactly
+        // as `node_rows` requires of the store windows — and, because the index operand is described
+        // rank-1 over the op's `mb`, that the INDEX BUFFER really holds `rows` indices. That second one
+        // is the load-bearing check: the descriptor makes the idx→address program iterate `mb`
+        // addresses, so an id buffer shorter than the node's rows would convert past its own end and
+        // gather from whatever follows it. It is read off the index parameter's OWN view, which is the
+        // only statement of that buffer's length anywhere in the program.
+        if g.entries == 0 || !rows.is_multiple_of(g.entries) {
+            return err(format!(
+                "{name}: the indirect access tile takes {} entries and the node writes {rows} row(s), \
+                 which {} does not divide. The emitted descriptor spans the whole node, so the work \
+                 items have to TILE it — the same obligation `node_rows` puts on the store windows.",
+                g.entries, g.entries,
+            ));
+        }
+        let idx_r = r.iter().find(|x| x.tid == g.index_tid).ok_or_else(|| Error {
+            message: format!(
+                "{name}: the program gathers through t{}, which is not one of this node's parameters — \
+                 an index buffer with no binding has no placement and no stated length",
+                g.index_tid
+            ),
+        })?;
+        let idx_len = (idx_r.v_rows as u64) * (idx_r.v_cols as u64);
+        if idx_len != rows as u64 {
+            return err(format!(
+                "{name}: the index buffer t{} states a `[{}, {}]` view — {idx_len} index(es) — while \
+                 this descriptor gathers {rows} row(s). The index operand is described rank-1 over the \
+                 op's `mb`, so dbo's idx→address program converts exactly {rows} entries: a shorter \
+                 buffer is read past its end and the surplus rows gather from whatever is placed next. \
+                 Emit one node per work item, or bind an index buffer covering the node.",
+                g.index_tid, idx_r.v_rows, idx_r.v_cols,
+            ));
+        }
+        // ⛔⛔⛔ THE TABLE GOES **LAST**, AND THE SWAP IS THE ONE THING THIS BRANCH DOES TO ITS OPERANDS.
+        //
+        // Two placement laws have to hold at once and they coincide at exactly one position. The index
+        // is inserted immediately BEFORE THE OUTPUT (`attach_gather_index`, which is the vendor's
+        // `[input, index, output]` order and what keeps the output last however many operands are
+        // added); dbo separately needs the index to sit NEXT TO the tensor it indexes, or the gathered
+        // operand's use precedes the idx→address program's definition and
+        // `DSC2ToDataflowIR.cpp:51` reports `operand #1 does not dominate this use`. Both hold only
+        // when the gathered tensor is the LAST input.
+        //
+        // The ungathered order above is `[table, scalar]`, which would emit `[table, scalar, idx, out]`
+        // — index at 2, table at 0, non-adjacent. Swapping to `[scalar, table]` emits
+        // `[scalar, table, idx, out]`: adjacent AND output-last.
+        //
+        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS `multiply`, which is commutative — the SAME two
+        // operands and the same `opFuncName`, in the other order. This is not a general licence: a
+        // non-commutative pointwise gathering a non-last operand has no such swap, which is why
+        // `assemble_pointwise_broadcast_gather` REFUSES that rather than reordering on the caller's
+        // behalf.
+        let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
+        return crate::emit::assemble_pointwise_broadcast_gather(
+            crate::emit::PointwiseGather {
+                op_name: &op_name,
+                tile_op: &tile_op,
+                op_func: "multiply",
+                rows,
+                cols,
+                inputs: &gathered_inputs,
+                gathered_input: 1,
+                index_name: &crate::place::act_name(g.index_tid),
+                o: &rbo(&out_name),
+            },
+            sym_id_base,
+            layout,
+        )
+        .map(|op| vec![op])
+        .map_err(Error::from);
+    }
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -3554,6 +3776,31 @@ pub fn split_out(
     layout: Option<&BundleLayout>,
     arity: usize,
 ) -> Result<(Vec<Region>, Region), Error> {
+    split_out_excluding(name, r, layout, arity, &[])
+}
+
+/// [`split_out`] WITH THE INDEX PARAMETERS LEFT OUT — the door a gathering program needs.
+///
+/// ⛔ IT IS NOT A LOOSENED ARITY. A gather's index vector is a parameter and a tensor, and the counting
+/// here treats every non-output parameter as one of the op's compute inputs — which is exact for every
+/// affinely-addressed program and WRONG for a gathering one by precisely one operand. Triton's
+/// `embedding_fwd` is the measured case: `desc_ids`, `desc_table`, `desc_o`, one `arith.mulf`, and so
+/// "2 tensor input(s) for an op that reads 1" — a true statement about the parameter list and a false
+/// one about the op. The index is an ADDRESSING operand (`computeOp_.indirectAccessIndexLabeledDs`,
+/// never `inputLabeledDs`), so it is excluded HERE and re-attached by
+/// [`OpSpec::attach_indirect_index`](crate::superdsc_opspec::OpSpec::attach_indirect_index) at the
+/// position the descriptor needs. The arity a body states is unchanged, which is the point: the count
+/// still has to be right.
+///
+/// `skip_tids` comes from [`gather_of`], i.e. from the program, never from a caller's assumption about
+/// which parameter is an index.
+pub fn split_out_excluding(
+    name: &str,
+    r: &[Region],
+    layout: Option<&BundleLayout>,
+    arity: usize,
+    skip_tids: &[u32],
+) -> Result<(Vec<Region>, Region), Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
     let [out] = outs[..] else {
         return err(format!(
@@ -3564,7 +3811,9 @@ pub fn split_out(
     let ins: Vec<Region> = r
         .iter()
         .copied()
-        .filter(|x| !x.is_out && scale_idx_of(layout, x.tid).is_none())
+        .filter(|x| {
+            !x.is_out && scale_idx_of(layout, x.tid).is_none() && !skip_tids.contains(&x.tid)
+        })
         .collect();
     if ins.len() != arity {
         return err(format!(
