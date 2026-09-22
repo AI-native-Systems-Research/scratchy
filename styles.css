@@ -248,7 +248,7 @@ body > main { margin: 0 auto; padding: 0 1.5rem; }
 
 /* cds--css-grid sets its own centering/margin/padding, meant for a bare page
  * grid — redundant and doubled-up when nested inside main's own padding. */
-body > main .cds--css-grid { max-inline-size: none; margin-inline: 0; padding-inline: 0; }
+body .cds--css-grid { max-inline-size: none; margin-inline: 0; padding-inline: 0; }
 
 section { padding: 4rem 0; border-bottom: 1px solid var(--line); }
 section:last-child { border-bottom: none; }
