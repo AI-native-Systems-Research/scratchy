@@ -7,12 +7,7 @@ description = "Compiles all CUDA kernels (.cu -> .a) for the scratchy inference 
 
 [features]
 default = []
-cuda = ["cudaforge", "scratchy-models/cuda"]
-
-[dependencies]
-# Dep on scratchy-models ensures forward!() runs first (generates .cu files)
-# before this crate's build.rs compiles them.
-scratchy-models = { path = "../../../models/arch" }
+cuda = ["cudaforge"]
 
 [build-dependencies]
 cudaforge = { version = "0.1.6", optional = true }
