@@ -6,6 +6,7 @@
 /crates/cli/tui/target/
 **/*.rs.bk
 /bench_results/
+.claude/worktrees/
 
 DRAFT_SPEC_DECODE_PLAN.md
 SPEC_DECODE_REFACTOR_PLAN.md
