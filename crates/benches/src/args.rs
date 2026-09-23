@@ -565,14 +565,43 @@ pub enum StartupScenario {
     Warm,
 }
 
-impl std::str::FromStr for StartupScenario {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "frozen" => Ok(Self::Frozen),
-            "cold" => Ok(Self::Cold),
-            "warm" => Ok(Self::Warm),
-            other => Err(format!("unknown scenario {other:?} (frozen|cold|warm)")),
+/// Which framework the child is, for the one thing that is framework-specific:
+/// classifying its stdout banner in CLI mode.
+///
+/// A closed set rather than a free string, because the failure mode of a typo is
+/// silent and wrong rather than loud: `--backend mlx_lm` would fall through to
+/// scratchy's rules, the `==========` separator mlx-lm prints would count as
+/// content, and the clock would stop on the banner — an impossibly fast TTFT
+/// with no error. The child *command* stays free-form (`--child-cmd`); only the
+/// banner grammar is enumerated, and adding a framework makes the compiler point
+/// at every match that needs an arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Backend {
+    /// `Using model: ...` plus ISO-8601 tracing lines.
+    Scratchy,
+    /// Output delimited by a rule of `=` characters.
+    MlxLm,
+    /// Server mode only — see `Backend::rejects_cli_mode`.
+    Vllm,
+}
+
+impl Backend {
+    /// Why this backend cannot be measured in CLI mode, if it cannot.
+    ///
+    /// vLLM has no self-contained one-shot generate to time: its CLI is a client
+    /// that needs a server already up, so timing it would measure a warm request
+    /// and label it a cold start. Refusing is the same call the harness this
+    /// replaced made for ollama — better no number than a number that looks like
+    /// a cold start and is not one. vLLM is measured in `--mode server`, where
+    /// `--backend` is not consulted at all.
+    pub fn rejects_cli_mode(self) -> Option<&'static str> {
+        match self {
+            Self::Vllm => Some(
+                "vLLM has no one-shot CLI generate to time — its CLI is a client for an \
+                 already-running server, so timing it would measure a warm request and call \
+                 it a cold start. Use `--mode server` (where --backend is not used).",
+            ),
+            Self::Scratchy | Self::MlxLm => None,
         }
     }
 }
@@ -603,28 +632,34 @@ pub enum EvictStrategy {
 pub struct StartupExecArgs {
     /// Measure exec -> first token across a process boundary instead of timing
     /// in-process engine construction.
-    #[arg(long)]
+    ///
+    /// `requires` rather than a runtime check: there is no such thing as this
+    /// mode without a child to launch, so clap refuses it up front.
+    #[arg(long, requires = "child_cmd")]
     pub exec: bool,
 
     /// The command to launch, as shell words — same convention as
-    /// `scr sweep --serve-cmd`. Any backend works without code changes:
+    /// `scr sweep --serve-cmd`. Any framework works without code changes:
     /// "scr serve MODEL --port 8731" or
     /// "python -m mlx_lm.server --model MODEL --port 8731".
-    #[arg(long)]
-    pub child_cmd: Option<String>,
+    ///
+    /// In CLI mode it must carry `{prompt}` (and usually `{output_len}`),
+    /// because each framework spells its prompt flag differently.
+    #[arg(long, value_parser = ChildCommand::parse)]
+    pub child_cmd: Option<ChildCommand>,
 
-    /// Names the stdout banner rules for CLI mode ("scratchy", "mlx-lm").
-    /// Free-form: an unknown value just uses the scratchy rules.
-    #[arg(long, default_value = "scratchy")]
-    pub backend: String,
+    /// Which framework the child is, for classifying its stdout banner in CLI
+    /// mode. Not consulted in server mode.
+    #[arg(long, value_enum, default_value_t = Backend::Scratchy)]
+    pub backend: Backend,
 
     /// How the first token is observed.
     #[arg(long, value_enum, default_value_t = StartupMode::Server)]
     pub mode: StartupMode,
 
-    /// Comma-separated rungs to run, in order: frozen,cold,warm.
-    #[arg(long, default_value = "cold,warm")]
-    pub scenarios: String,
+    /// Rungs to run, in order. Comma-separated: `--scenarios frozen,cold,warm`.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "cold,warm")]
+    pub scenarios: Vec<StartupScenario>,
 
     /// Repetitions per scenario (warm is always 1 — it is one resident server).
     #[arg(long, default_value_t = 3)]
@@ -682,12 +717,47 @@ pub struct StartupExecArgs {
     /// A second `--child-cmd` to run the blocking parity gate against before
     /// any timing. A broken dequant path can be fast, so timing a wrong
     /// computation is worse than not timing at all.
-    #[arg(long)]
-    pub parity_cmd: Option<String>,
+    #[arg(long, value_parser = ChildCommand::parse, requires = "parity_backend")]
+    pub parity_cmd: Option<ChildCommand>,
 
-    /// Banner rules for `--parity-cmd`'s backend.
-    #[arg(long, default_value = "mlx-lm")]
-    pub parity_backend: String,
+    /// Which framework `--parity-cmd` is, for its banner rules.
+    #[arg(long, value_enum, default_value_t = Backend::MlxLm)]
+    pub parity_backend: Backend,
+}
+
+/// A child command, already split into argv.
+///
+/// A newtype rather than a `String` so the shell-words split and the
+/// "not empty" invariant are established once, at argument-parse time, instead
+/// of being re-derived and re-checked wherever the command is used. The
+/// placeholder requirement stays a cross-field check because it depends on
+/// `--mode`, which clap cannot express — but `has_placeholder` keeps the
+/// question on the type.
+#[derive(Clone, Debug)]
+pub struct ChildCommand {
+    /// As typed, for provenance output.
+    pub raw: String,
+    /// Split on shell words: `{prompt}` survives as one argv element even when
+    /// the prompt contains spaces, because splitting happens before expansion.
+    pub argv: Vec<String>,
+}
+
+impl ChildCommand {
+    fn parse(s: &str) -> Result<Self, String> {
+        let argv = shell_words::split(s).map_err(|e| format!("not valid shell words: {e}"))?;
+        if argv.is_empty() {
+            return Err("command is empty".to_string());
+        }
+        Ok(Self {
+            raw: s.to_string(),
+            argv,
+        })
+    }
+
+    /// Whether the command says where the prompt goes. Required in CLI mode.
+    pub fn has_placeholder(&self) -> bool {
+        self.raw.contains("{prompt}")
+    }
 }
 
 /// `purge` is macOS-only and `posix_fadvise` does not exist there, so the

@@ -44,7 +44,7 @@ use anyhow::{Context, Result};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::args::{BenchStartupArgs, EvictStrategy, StartupMode, StartupScenario};
+use crate::args::{Backend, BenchStartupArgs, EvictStrategy, StartupMode, StartupScenario};
 
 // ---------------------------------------------------------------------------
 // Prompt construction
@@ -80,17 +80,19 @@ fn build_prompt(seed: u64, approx_tokens: usize) -> String {
 // In CLI mode the first content byte is the first token, but every CLI prints
 // a banner first. This decides "is this line still banner?" so the clock stops
 // on a token rather than a header.
-fn is_prelude(backend: &str, line: &str) -> bool {
+fn is_prelude(backend: Backend, line: &str) -> bool {
     let s = line.trim();
     if s.is_empty() {
         return true;
     }
     match backend {
         // mlx_lm.generate delimits its output with a rule of '=' characters.
-        "mlx-lm" => s.chars().all(|c| c == '='),
+        Backend::MlxLm => s.chars().all(|c| c == '='),
         // scratchy prints "Using model: ..." and, if RUST_LOG was not
-        // silenced, ISO-8601 tracing lines.
-        _ => {
+        // silenced, ISO-8601 tracing lines. Vllm shares the arm only for
+        // exhaustiveness — CLI mode rejects it before any child is spawned,
+        // because it has no one-shot generate to time.
+        Backend::Scratchy | Backend::Vllm => {
             s.starts_with("Using model:")
                 || (s.len() > 20
                     && s.as_bytes()[..4].iter().all(u8::is_ascii_digit)
@@ -359,7 +361,7 @@ pub(crate) struct Rep {
 /// a candidate and the candidate is committed once the line resolves as
 /// content. Stopping on the newline instead would overstate TTFT by a whole
 /// line of tokens.
-fn run_cli(argv: &[String], backend: &str) -> Result<Rep> {
+fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
     let t_zero = Instant::now();
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
@@ -869,8 +871,8 @@ const PARITY_PROMPTS: &[(&str, &str, usize)] = &[
     ("count", "Count from 1 to 10, separated by commas.", 40),
 ];
 
-fn normalize(s: &str, backend: &str) -> String {
-    let body = if backend == "mlx-lm" {
+fn normalize(s: &str, backend: Backend) -> String {
+    let body = if backend == Backend::MlxLm {
         s.split("==========").nth(1).unwrap_or(s)
     } else {
         s
@@ -884,7 +886,12 @@ fn normalize(s: &str, backend: &str) -> String {
         .join(" ")
 }
 
-fn parity_gate(a_cmd: &[String], a_backend: &str, b_cmd: &[String], b_backend: &str) -> Result<()> {
+fn parity_gate(
+    a_cmd: &[String],
+    a_backend: Backend,
+    b_cmd: &[String],
+    b_backend: Backend,
+) -> Result<()> {
     println!("=== parity gate: same model, greedy, high-confidence prompts ===");
     let mut failures = Vec::new();
     for (name, prompt, ntok) in PARITY_PROMPTS {
@@ -925,31 +932,47 @@ fn parity_gate(a_cmd: &[String], a_backend: &str, b_cmd: &[String], b_backend: &
 // ---------------------------------------------------------------------------
 pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     let ex = &args.exec_opts;
-    let child_cmd = ex
+    // clap's `requires` already guarantees --child-cmd is present with --exec,
+    // and ChildCommand's parser has split it and rejected an empty command.
+    let child = ex
         .child_cmd
-        .as_deref()
-        .context("--exec needs --child-cmd, e.g. --child-cmd \"scr serve MODEL --port 8731\"")?;
-    let argv = shell_words::split(child_cmd).context("--child-cmd is not valid shell words")?;
-    anyhow::ensure!(!argv.is_empty(), "--child-cmd is empty");
+        .as_ref()
+        .context("--exec needs --child-cmd (clap should have enforced this)")?;
+    let argv = child.argv.clone();
+
+    // Framework/mode combinations that cannot be measured are refused before a
+    // child is spawned, rather than producing a number that means something
+    // other than its label.
+    if ex.mode == StartupMode::Cli
+        && let Some(why) = ex.backend.rejects_cli_mode()
+    {
+        anyhow::bail!(
+            "--backend {:?} cannot be used with --mode cli. {why}",
+            ex.backend
+        );
+    }
 
     // CLI mode puts the prompt on the child's command line, so the caller has
     // to say where it goes — the flag differs per framework and this harness
     // deliberately knows nothing about any framework's flags.
     anyhow::ensure!(
-        ex.mode != StartupMode::Cli || child_cmd.contains("{prompt}"),
+        ex.mode != StartupMode::Cli || child.has_placeholder(),
         "--mode cli needs a {{prompt}} placeholder in --child-cmd, e.g.\n  \
          --child-cmd \"target/release/scr chat -m M --device metal -q {{prompt}} \
          --max-tokens {{output_len}}\""
     );
-    if let Some(ref p) = ex.parity_cmd {
+    if let Some(ref parity) = ex.parity_cmd {
         anyhow::ensure!(
-            p.contains("{prompt}"),
-            "--parity-cmd needs a {{prompt}} placeholder too (the gate runs both children in CLI mode)"
+            parity.has_placeholder() && child.has_placeholder(),
+            "the parity gate runs both children in CLI mode, so --parity-cmd and --child-cmd \
+             both need a {{prompt}} placeholder"
         );
-        anyhow::ensure!(
-            child_cmd.contains("{prompt}"),
-            "--parity-cmd requires --child-cmd to carry a {{prompt}} placeholder as well"
-        );
+        if let Some(why) = ex.parity_backend.rejects_cli_mode() {
+            anyhow::bail!(
+                "--parity-backend {:?} cannot run the gate. {why}",
+                ex.parity_backend
+            );
+        }
     }
 
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
@@ -966,30 +989,21 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     };
 
     if let Some(ref other) = ex.parity_cmd {
-        let other_argv = shell_words::split(other)?;
-        parity_gate(&argv, &ex.backend, &other_argv, &ex.parity_backend)?;
+        parity_gate(&argv, ex.backend, &other.argv, ex.parity_backend)?;
     }
 
     // Provenance: a number without its machine state is not a result.
     println!("model    : {model}");
-    println!("child    : {child_cmd}");
-    println!("backend  : {}  mode: {:?}", ex.backend, ex.mode);
-    println!("evict    : {:?}  scenarios: {}", ex.evict, ex.scenarios);
+    println!("child    : {}", child.raw);
+    println!("backend  : {:?}  mode: {:?}", ex.backend, ex.mode);
+    println!("evict    : {:?}  scenarios: {:?}", ex.evict, ex.scenarios);
     println!(
         "os       : {} / {}",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
 
-    let scenarios: Vec<StartupScenario> = ex
-        .scenarios
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse::<StartupScenario>()
-                .map_err(|e| anyhow::anyhow!(e))
-        })
-        .collect::<Result<_>>()?;
+    let scenarios = &ex.scenarios;
 
     // Fail before measuring, not after the first eviction attempt has already
     // destroyed the cache state a FROZEN rep needed.
@@ -1001,7 +1015,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     // Has any child been launched yet in this run? COLD and WARM both mean
     // "the caches are populated", which is only true once something has run.
     let mut launched = false;
-    for sc in scenarios {
+    for &sc in scenarios {
         let n = if sc == StartupScenario::Warm {
             1
         } else {
@@ -1034,7 +1048,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
                 let warmup_prompt = build_prompt(ex.seed, ex.input_len);
                 match ex.mode {
                     StartupMode::Cli => {
-                        run_cli(&expand(&argv, &warmup_prompt, ex.output_len), &ex.backend)?;
+                        run_cli(&expand(&argv, &warmup_prompt, ex.output_len), ex.backend)?;
                     }
                     StartupMode::Server => {
                         run_server(&ctx, &argv, &warmup_prompt, 0, ex.seed)?;
@@ -1049,7 +1063,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
             eprintln!("--- {sc:?}/{:?} rep {rep} ---", ex.mode);
 
             let mut r = match ex.mode {
-                StartupMode::Cli => run_cli(&expand(&argv, &prompt, ex.output_len), &ex.backend)?,
+                StartupMode::Cli => run_cli(&expand(&argv, &prompt, ex.output_len), ex.backend)?,
                 StartupMode::Server => run_server(
                     &ctx,
                     &argv,
@@ -1104,17 +1118,17 @@ mod tests {
 
     #[test]
     fn prelude_skips_banners_not_tokens() {
-        assert!(is_prelude("scratchy", "Using model: foo/bar"));
-        assert!(is_prelude("scratchy", "   "));
+        assert!(is_prelude(Backend::Scratchy, "Using model: foo/bar"));
+        assert!(is_prelude(Backend::Scratchy, "   "));
         assert!(is_prelude(
-            "scratchy",
+            Backend::Scratchy,
             "2026-09-23T12:00:00.000000Z  INFO thing happened"
         ));
-        assert!(!is_prelude("scratchy", "Speculative decoding is"));
-        assert!(is_prelude("mlx-lm", "=========="));
-        assert!(!is_prelude("mlx-lm", "The capital of France"));
+        assert!(!is_prelude(Backend::Scratchy, "Speculative decoding is"));
+        assert!(is_prelude(Backend::MlxLm, "=========="));
+        assert!(!is_prelude(Backend::MlxLm, "The capital of France"));
         // A short numeric-looking token must not be mistaken for a tracing line.
-        assert!(!is_prelude("scratchy", "42"));
+        assert!(!is_prelude(Backend::Scratchy, "42"));
     }
 
     #[test]
@@ -1160,19 +1174,30 @@ mod tests {
         assert_eq!(a.exec_opts.reps, 5);
         assert_eq!(a.exec_opts.mode, StartupMode::Server);
         assert_eq!(a.exec_opts.port, 8731);
-        let scenarios: Vec<StartupScenario> = a
-            .exec_opts
-            .scenarios
-            .split(',')
-            .map(|s| s.trim().parse().unwrap())
-            .collect();
+        // clap splits and validates the list; no hand-rolled parsing remains.
         assert_eq!(
-            scenarios,
+            a.exec_opts.scenarios,
             vec![
                 StartupScenario::Frozen,
                 StartupScenario::Cold,
                 StartupScenario::Warm
             ]
+        );
+        assert_eq!(a.exec_opts.backend, Backend::Scratchy);
+        assert_eq!(a.exec_opts.parity_backend, Backend::MlxLm);
+        // The default list is typed too, not a string to be re-split later.
+        let dflt = BenchStartupArgs::try_parse_from([
+            "startup",
+            "-m",
+            "org/model",
+            "--exec",
+            "--child-cmd",
+            "scr serve org/model",
+        ])
+        .unwrap();
+        assert_eq!(
+            dflt.exec_opts.scenarios,
+            vec![StartupScenario::Cold, StartupScenario::Warm]
         );
         // The in-process path must keep working untouched when --exec is absent.
         let plain = BenchStartupArgs::try_parse_from(["startup", "-m", "org/model"]).unwrap();
@@ -1199,11 +1224,83 @@ mod tests {
         assert_eq!(expand(&mlx, "hi", 8), vec!["python", "--prompt", "hi"]);
     }
 
+    /// Typos are rejected at argument-parse time, by the type.
+    ///
+    /// The point of enumerating these rather than taking strings: a misspelled
+    /// `--backend` used to be accepted and silently fall through to scratchy's
+    /// banner rules, so an mlx-lm run would stop its clock on the `==========`
+    /// separator and report an impossibly fast TTFT with no error at all.
     #[test]
-    fn scenario_parse_rejects_typos() {
-        assert!("frozen".parse::<StartupScenario>().is_ok());
-        assert!("COLD".parse::<StartupScenario>().is_ok());
-        assert!("lukewarm".parse::<StartupScenario>().is_err());
+    fn typos_are_rejected_by_the_types_not_discovered_at_runtime() {
+        use clap::Parser;
+        let bad = |extra: [&str; 2]| {
+            let mut argv = vec![
+                "startup",
+                "-m",
+                "org/model",
+                "--exec",
+                "--child-cmd",
+                "scr serve org/model",
+            ];
+            argv.extend_from_slice(&extra);
+            BenchStartupArgs::try_parse_from(argv)
+        };
+        assert!(bad(["--scenarios", "lukewarm"]).is_err(), "bad scenario");
+        assert!(bad(["--backend", "mlx_lm"]).is_err(), "underscore typo");
+        assert!(bad(["--backend", "nonesuch"]).is_err(), "unknown backend");
+        assert!(bad(["--evict", "drop_caches"]).is_err(), "unknown strategy");
+        // And the spellings that should work, do.
+        assert!(bad(["--backend", "mlx-lm"]).is_ok());
+        assert!(bad(["--scenarios", "frozen,cold,warm"]).is_ok());
+    }
+
+    /// `--exec` without a child is refused by clap, not by a runtime check.
+    #[test]
+    fn exec_requires_a_child_command() {
+        use clap::Parser;
+        assert!(
+            BenchStartupArgs::try_parse_from(["startup", "-m", "org/model", "--exec"]).is_err(),
+            "--exec alone should be rejected: there is no such thing as this mode without a child"
+        );
+    }
+
+    /// An unquotable command is rejected when parsed, not when spawned.
+    #[test]
+    fn child_command_is_validated_at_parse_time() {
+        use clap::Parser;
+        let unterminated = BenchStartupArgs::try_parse_from([
+            "startup",
+            "-m",
+            "org/model",
+            "--exec",
+            "--child-cmd",
+            "scr serve 'unterminated",
+        ]);
+        assert!(unterminated.is_err(), "unbalanced quote should not parse");
+
+        let ok = BenchStartupArgs::try_parse_from([
+            "startup",
+            "-m",
+            "org/model",
+            "--exec",
+            "--child-cmd",
+            "scr chat -q {prompt} --max-tokens {output_len}",
+        ])
+        .unwrap();
+        let child = ok.exec_opts.child_cmd.as_ref().unwrap();
+        assert!(child.has_placeholder());
+        // Split happens before expansion, so a multi-word prompt stays one argv
+        // element — the property that makes {prompt} safe.
+        assert_eq!(child.argv[0], "scr");
+        assert_eq!(child.argv.len(), 6);
+    }
+
+    /// vLLM in CLI mode is refused, because there is nothing there to time.
+    #[test]
+    fn vllm_has_no_cli_mode_to_measure() {
+        assert!(Backend::Vllm.rejects_cli_mode().is_some());
+        assert!(Backend::Scratchy.rejects_cli_mode().is_none());
+        assert!(Backend::MlxLm.rejects_cli_mode().is_none());
     }
 
     /// Banner-only output must yield NO measurement, not a fast one.
@@ -1221,7 +1318,7 @@ mod tests {
                 "-c".into(),
                 "echo 'Using model: fake'; echo".into(),
             ],
-            "scratchy",
+            Backend::Scratchy,
         )
         .expect("child runs");
         assert!(
@@ -1248,11 +1345,11 @@ mod tests {
                 // Touch ~64 MiB so this child's peak RSS is unmistakable.
                 "s=$(head -c 67108864 /dev/zero | tr '\\0' 'x'); echo ${#s}".into(),
             ],
-            "scratchy",
+            Backend::Scratchy,
         )
         .expect("big child runs");
-        let small =
-            run_cli(&["/bin/echo".into(), "hi".into()], "scratchy").expect("small child runs");
+        let small = run_cli(&["/bin/echo".into(), "hi".into()], Backend::Scratchy)
+            .expect("small child runs");
 
         assert!(
             big.peak_rss_mib > small.peak_rss_mib,
