@@ -98,22 +98,46 @@ fn is_prelude(backend: &str, line: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Child resource accounting
 // ---------------------------------------------------------------------------
-/// `ru_maxrss` and `ru_majflt` summed over reaped children.
+/// One child's own resource usage, as reported when it was reaped.
+pub(crate) struct ChildUsage {
+    /// Peak resident set of THAT child.
+    pub peak_rss_mib: f64,
+    /// Major (disk-backed) faults that child took. The evidence an eviction
+    /// actually happened.
+    pub major_faults: i64,
+    /// Whether it exited 0.
+    pub ok: bool,
+}
+
+/// Reap `child` with `wait4(2)` so the usage belongs to *that* child.
 ///
-/// `major_faults` is what proves an eviction actually happened, so this is
-/// load-bearing rather than diagnostic. Nothing else in the repo reads rusage,
-/// hence the one `unsafe` call; `getrusage` cannot fail for a valid `who`.
-fn children_rusage() -> (i64, i64) {
-    // SAFETY: `rusage` is a plain C struct we fully initialize by zeroing, and
-    // RUSAGE_CHILDREN is a valid `who`. getrusage only writes through the
-    // pointer and does not retain it.
-    unsafe {
-        let mut ru: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) != 0 {
-            return (0, 0);
-        }
-        (ru.ru_maxrss as i64, ru.ru_majflt as i64)
-    }
+/// `getrusage(RUSAGE_CHILDREN)` cannot do this, and the difference is not
+/// academic: its `ru_maxrss` is a high-water mark over every child the process
+/// has ever reaped, so a per-repetition delta silently breaks after the first
+/// rep — one earlier, larger child hides every later one. A Metal run reported
+/// a WARM server at 1 MiB for exactly that reason, because an earlier COLD rep
+/// had already pushed the mark to ~270 MiB. `wait4` returns the usage of the
+/// single child that exited, which is what the report claims to show, and it
+/// makes the fault count per-rep rather than a difference of running totals.
+///
+/// `std::process::Child`'s `Drop` does not reap on Unix, so reaping here does
+/// not collide with it — but nothing may call `Child::kill` afterwards, since
+/// the pid is free to be recycled. Kill first, then reap.
+fn wait4_child(child: &mut Child) -> Result<ChildUsage> {
+    let pid = child.id() as libc::pid_t;
+    let mut status: libc::c_int = 0;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `pid` is a live (possibly already-exited but unreaped) child of
+    // this process; `status` and `ru` are initialized locals that wait4 only
+    // writes through and does not retain.
+    let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+    anyhow::ensure!(rc == pid, "wait4({pid}) returned {rc}");
+    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    Ok(ChildUsage {
+        peak_rss_mib: rss_to_mib(ru.ru_maxrss as i64),
+        major_faults: ru.ru_majflt as i64,
+        ok,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +270,6 @@ pub(crate) struct Rep {
 /// content. Stopping on the newline instead would overstate TTFT by a whole
 /// line of tokens.
 fn run_cli(argv: &[String], backend: &str) -> Result<Rep> {
-    let (rss0, flt0) = children_rusage();
     let t_zero = Instant::now();
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
@@ -288,14 +311,16 @@ fn run_cli(argv: &[String], backend: &str) -> Result<Rep> {
         t_first = line_start;
     }
 
-    let st = child.wait()?;
-    let (rss1, flt1) = children_rusage();
-    anyhow::ensure!(st.success() || t_first.is_some(), "child failed: {st}");
+    let usage = wait4_child(&mut child)?;
+    anyhow::ensure!(
+        usage.ok || t_first.is_some(),
+        "child exited non-zero without emitting a token"
+    );
 
     Ok(Rep {
         ttft_exec_s: t_first.map(|t| t.duration_since(t_zero).as_secs_f64()),
-        peak_rss_mib: rss_delta_mib(rss0, rss1),
-        major_faults: flt1 - flt0,
+        peak_rss_mib: usage.peak_rss_mib,
+        major_faults: usage.major_faults,
         text,
         ..Default::default()
     })
@@ -342,7 +367,6 @@ fn run_server(
 ) -> Result<Rep> {
     let (agent, base_url, model) = (ctx.agent, ctx.base_url.as_str(), ctx.model);
     let output_len = ctx.output_len;
-    let (rss0, flt0) = children_rusage();
     let t_zero = Instant::now();
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
@@ -395,25 +419,19 @@ fn run_server(
         Ok(rep)
     })();
 
+    // Kill first, then reap: wait4 frees the pid, after which kill() could
+    // signal an unrelated recycled process.
     let _ = child.kill();
-    let _ = child.wait();
-    let (rss1, flt1) = children_rusage();
+    let usage = wait4_child(&mut child)?;
 
     let mut rep = result?;
-    rep.peak_rss_mib = rss_delta_mib(rss0, rss1);
-    rep.major_faults = flt1 - flt0;
+    rep.peak_rss_mib = usage.peak_rss_mib;
+    rep.major_faults = usage.major_faults;
     Ok(rep)
 }
 
-/// `ru_maxrss` is a high-water mark, not a counter, so a delta is only
-/// meaningful while it is rising; fall back to the absolute value.
-fn rss_delta_mib(before: i64, after: i64) -> f64 {
-    let raw = if after > before {
-        after - before
-    } else {
-        after
-    };
-    // Linux reports KiB, macOS bytes.
+/// `ru_maxrss` units differ by platform: Linux reports KiB, macOS bytes.
+fn rss_to_mib(raw: i64) -> f64 {
     if cfg!(target_os = "macos") {
         raw as f64 / 1_048_576.0
     } else {
@@ -840,6 +858,9 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
         .collect::<Result<_>>()?;
 
     let mut reps: Vec<Rep> = Vec::new();
+    // Has any child been launched yet in this run? COLD and WARM both mean
+    // "the caches are populated", which is only true once something has run.
+    let mut launched = false;
     for sc in scenarios {
         let n = if sc == StartupScenario::Warm {
             1
@@ -855,6 +876,33 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
                 }
                 evict(ex.evict, &ex.evict_path)?;
             }
+
+            // PRIME. A COLD rung means "you ran this before" — but the first
+            // launch in a fresh run has never touched the binary or the
+            // weights, so without this it silently measures FROZEN instead.
+            // Observed on Metal before this existed: COLD rep 0 took 7.935 s
+            // with ~31,570 major faults while rep 1 took 1.218 s with ~0, so
+            // the rung's own median averaged a frozen start with a cold one.
+            // One throwaway launch, discarded, and only when nothing has run
+            // yet: a FROZEN rep earlier in the list has already populated the
+            // caches, so priming after one would be wasted work.
+            if !launched && sc != StartupScenario::Frozen {
+                eprintln!(
+                    "--- priming ({sc:?} needs populated caches; this launch is discarded) ---"
+                );
+                let warmup_prompt = build_prompt(ex.seed, ex.input_len);
+                match ex.mode {
+                    StartupMode::Cli => {
+                        run_cli(&expand(&argv, &warmup_prompt, ex.output_len), &ex.backend)?;
+                    }
+                    StartupMode::Server => {
+                        run_server(&ctx, &argv, &warmup_prompt, 0, ex.seed)?;
+                    }
+                }
+                // `launched` is set below once the measured rep completes; no
+                // need to set it here, and doing so reads as dead.
+            }
+
             let seed = ex.seed + rep as u64 * 17;
             let prompt = build_prompt(seed, ex.input_len);
             eprintln!("--- {sc:?}/{:?} rep {rep} ---", ex.mode);
@@ -880,6 +928,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
                 eprintln!("    ttft_exec = {t:.3} s");
             }
             reps.push(r);
+            launched = true;
         }
     }
 
@@ -1004,6 +1053,48 @@ mod tests {
         assert!("lukewarm".parse::<StartupScenario>().is_err());
     }
 
+    /// A real child, reaped with wait4, must report ITS OWN usage.
+    ///
+    /// This is the regression guard for the bug a Metal run exposed: with
+    /// `getrusage(RUSAGE_CHILDREN)` the second child's "peak RSS" was the amount
+    /// by which it exceeded the first child's high-water mark, which reported a
+    /// live server at 1 MiB. Run a big child then a small one; the small one
+    /// must not inherit the big one's figure, and the fault count must not be a
+    /// difference of running totals.
+    #[test]
+    fn wait4_attributes_usage_to_the_child_that_exited() {
+        let big = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                // Touch ~64 MiB so this child's peak RSS is unmistakable.
+                "s=$(head -c 67108864 /dev/zero | tr '\\0' 'x'); echo ${#s}".into(),
+            ],
+            "scratchy",
+        )
+        .expect("big child runs");
+        let small =
+            run_cli(&["/bin/echo".into(), "hi".into()], "scratchy").expect("small child runs");
+
+        assert!(
+            big.peak_rss_mib > small.peak_rss_mib,
+            "the 64 MiB child ({:.1} MiB) should out-measure /bin/echo ({:.1} MiB); \
+             if these are equal or inverted, usage is being read from the process-wide \
+             high-water mark again",
+            big.peak_rss_mib,
+            small.peak_rss_mib
+        );
+        // The earlier, larger child must not leak into the later one.
+        assert!(
+            small.peak_rss_mib < 32.0,
+            "/bin/echo reported {:.1} MiB",
+            small.peak_rss_mib
+        );
+        // Per-child counters can be zero, never negative — a negative value is
+        // the signature of subtracting two running totals.
+        assert!(small.major_faults >= 0 && big.major_faults >= 0);
+    }
+
     #[test]
     fn rss_units_differ_by_platform() {
         // Linux getrusage reports KiB, macOS bytes.
@@ -1012,6 +1103,6 @@ mod tests {
         } else {
             1024.0
         };
-        assert_eq!(rss_delta_mib(0, 1_048_576), expect);
+        assert_eq!(rss_to_mib(1_048_576), expect);
     }
 }

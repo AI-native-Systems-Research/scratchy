@@ -55,6 +55,14 @@ benchmarks become unfalsifiable. So the ladder is explicit:
 - **WARM** — a server already up and serving. Isolates request latency from all
   startup cost.
 
+COLD and WARM say "you ran this before", so when nothing has run yet the harness
+performs **one throwaway priming launch** and discards it. Without that, the
+first repetition of a fresh run measures FROZEN while being labelled COLD — on a
+Metal run before priming existed, COLD rep 0 took 7.935 s with ~31,570 major
+faults and rep 1 took 1.218 s with ~0, and the rung's median averaged the two. A
+FROZEN repetition earlier in the list already populates the caches, so priming is
+skipped in that case.
+
 ### Eviction is platform-specific, and one obvious choice is wrong
 
 `--evict purge` (macOS) drops the whole unified buffer cache. It is symmetric: it
@@ -91,10 +99,15 @@ nothing is self-reported.
   `ttft_exec`.
 - **`tpot`** — per-token decode interval over N−1 intervals, matching
   `crates/benches/src/serve.rs`. `decode tok/s` is `1000/tpot`.
-- **`peak_rss`** / **`major_faults`** — child `ru_maxrss` / `ru_majflt`, same
-  call for every backend. `major_faults` is *evidence the eviction worked*: if
-  FROZEN does not fault far more than COLD, the cache control failed and the run
-  is void. The run asserts this and exits non-zero.
+- **`peak_rss`** / **`major_faults`** — the child's own `ru_maxrss` /
+  `ru_majflt`, read via `wait4(2)` when it is reaped, same call for every
+  backend. It has to be `wait4` rather than `getrusage(RUSAGE_CHILDREN)`: the
+  latter's `ru_maxrss` is a high-water mark over *every* child the process has
+  reaped, so per-repetition figures silently break after the first one — a Metal
+  run reported a live WARM server at 1 MiB because an earlier COLD repetition had
+  already pushed the mark to ~270 MiB. `major_faults` is *evidence the eviction
+  worked*: if FROZEN does not fault far more than COLD, the cache control failed
+  and the run is void. The run asserts this and exits non-zero.
 
 Cells are reported as `median (p10–p90) ×reps`, never a bare mean — a mean hid a
 bimodal ITL distribution in this repo for a week
