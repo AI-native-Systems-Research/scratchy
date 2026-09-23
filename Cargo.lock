@@ -3805,7 +3805,7 @@ dependencies = [
  "scratchy-target-spyre",
  "serde",
  "serde_json",
- "syn 2.0.119",
+ "syn 3.0.4",
  "tracing",
  "tracing-subscriber",
  "trybuild",
@@ -3854,7 +3854,7 @@ dependencies = [
  "scratchy-target-spyre",
  "scratchy-vision",
  "serde_json",
- "syn 2.0.119",
+ "syn 3.0.4",
  "ureq 3.4.2",
 ]
 
@@ -4106,7 +4106,7 @@ dependencies = [
  "scratchy-subtile",
  "scratchy-target-metal",
  "serde",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]

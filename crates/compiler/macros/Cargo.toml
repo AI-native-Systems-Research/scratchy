@@ -66,7 +66,7 @@ scratchy-subtile = { path = "../subtile" }
 # `scratchy-subtile` above already pulls it in on every backend, so this only lets the path be spelled
 # honestly instead of laundered through a re-export.
 ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "3", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 serde = { version = "1" }

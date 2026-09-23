@@ -29,7 +29,7 @@ scratchy-subtile = { path = "../../../compiler/subtile" }
 scratchy-target-metal = { path = ".." }
 scratchy-ir = { path = "../../../compiler/ir", features = ["metal"] }
 
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "3", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 serde = { version = "1", features = ["derive"] }
