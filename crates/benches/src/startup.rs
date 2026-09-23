@@ -82,6 +82,14 @@ const PERCENTAGES: &[f64] = &[10.0, 25.0, 50.0, 75.0, 90.0, 99.0];
 pub(crate) fn run_bench_startup(args: BenchStartupArgs) -> Result<()> {
     telemetry::init_tracing(&args.log_level);
 
+    // `--exec` is a different measurement, not a variant of this one: it times a
+    // child process to its first token rather than in-process construction. It
+    // shares only the model/args surface, so hand over before any of the
+    // in-process setup below runs.
+    if args.exec_opts.exec {
+        return crate::startup_exec::run(&args);
+    }
+
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
     eprintln!("vLLM Rust — startup benchmark");
     eprintln!("Model: {model}");

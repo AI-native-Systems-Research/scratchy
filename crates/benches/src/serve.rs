@@ -210,7 +210,7 @@ fn send_request(
 
 /// Compute percentile of a sorted slice using linear interpolation
 /// matching numpy.percentile(method='linear').
-fn percentile(sorted: &[f64], p: f64) -> f64 {
+pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }

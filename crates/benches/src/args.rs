@@ -540,6 +540,164 @@ pub struct BenchStartupArgs {
     /// Comma-separated list of batch sizes to capture as CUDA graphs.
     #[arg(long, default_value = "auto")]
     pub cuda_graph_sizes: String,
+
+    #[command(flatten)]
+    pub exec_opts: StartupExecArgs,
+}
+
+/// How the first token is observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum StartupMode {
+    /// One-shot CLI: the clock stops on the first content byte of stdout.
+    Cli,
+    /// HTTP server: the clock stops on the first streamed token.
+    Server,
+}
+
+/// Which rung of the cache ladder a repetition runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum StartupScenario {
+    /// Page cache evicted and derived on-disk caches removed.
+    Frozen,
+    /// Fresh process, caches warm — the honest everyday case.
+    Cold,
+    /// Process resident and past its first request.
+    Warm,
+}
+
+impl std::str::FromStr for StartupScenario {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "frozen" => Ok(Self::Frozen),
+            "cold" => Ok(Self::Cold),
+            "warm" => Ok(Self::Warm),
+            other => Err(format!("unknown scenario {other:?} (frozen|cold|warm)")),
+        }
+    }
+}
+
+/// How to evict the OS page cache for a FROZEN repetition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum EvictStrategy {
+    /// macOS `purge`: drops the whole unified buffer cache, symmetrically for
+    /// every framework under test.
+    Purge,
+    /// Linux `posix_fadvise(DONTNEED)` over `--evict-path`. Deliberately not
+    /// `drop_caches`, which is not namespaced and would evict a shared node's
+    /// entire page cache.
+    Fadvise,
+    /// Leave the page cache alone (FROZEN then collapses toward COLD).
+    None,
+}
+
+/// Exec-boundary mode for `scr bench startup`.
+///
+/// Without `--exec`, `bench startup` times `LLMBuilder::build()` in-process.
+/// With it, the clock starts before `fork`/`exec` and stops on the first token
+/// a *child* process emits — which is the only way to see process init, dynamic
+/// linking and first-touch page faults, and the only way to measure a framework
+/// that is not this binary.
+#[derive(Parser, Debug)]
+#[command(next_help_heading = "Exec-boundary mode (--exec)")]
+pub struct StartupExecArgs {
+    /// Measure exec -> first token across a process boundary instead of timing
+    /// in-process engine construction.
+    #[arg(long)]
+    pub exec: bool,
+
+    /// The command to launch, as shell words — same convention as
+    /// `scr sweep --serve-cmd`. Any backend works without code changes:
+    /// "scr serve MODEL --port 8731" or
+    /// "python -m mlx_lm.server --model MODEL --port 8731".
+    #[arg(long)]
+    pub child_cmd: Option<String>,
+
+    /// Names the stdout banner rules for CLI mode ("scratchy", "mlx-lm").
+    /// Free-form: an unknown value just uses the scratchy rules.
+    #[arg(long, default_value = "scratchy")]
+    pub backend: String,
+
+    /// How the first token is observed.
+    #[arg(long, value_enum, default_value_t = StartupMode::Server)]
+    pub mode: StartupMode,
+
+    /// Comma-separated rungs to run, in order: frozen,cold,warm.
+    #[arg(long, default_value = "cold,warm")]
+    pub scenarios: String,
+
+    /// Repetitions per scenario (warm is always 1 — it is one resident server).
+    #[arg(long, default_value_t = 3)]
+    pub reps: usize,
+
+    /// Page-cache eviction for FROZEN. Defaults to `purge` on macOS and
+    /// `fadvise` elsewhere.
+    #[arg(long, value_enum, default_value_t = default_evict())]
+    pub evict: EvictStrategy,
+
+    /// Files or directories to evict for FROZEN with `--evict fadvise` (the
+    /// weight shards and the binary). Directories recurse.
+    #[arg(long)]
+    pub evict_path: Vec<std::path::PathBuf>,
+
+    /// Directories to delete before a FROZEN repetition (derived caches such as
+    /// an aligned-weights sidecar or a `__pycache__`).
+    #[arg(long)]
+    pub remove_path: Vec<std::path::PathBuf>,
+
+    /// Port the child server listens on.
+    #[arg(long, default_value_t = 8731)]
+    pub port: u16,
+
+    /// Approximate prompt length in tokens.
+    #[arg(long, default_value_t = 64)]
+    pub input_len: usize,
+
+    /// Tokens to generate per request.
+    #[arg(long, default_value_t = 32)]
+    pub output_len: usize,
+
+    /// Base seed. Prompts are unique per seed so no prefix cache can serve a
+    /// repeat and collapse TTFT.
+    #[arg(long, default_value_t = 1000)]
+    pub seed: u64,
+
+    /// Requests to sample for the WARM rung, each with a unique prompt.
+    #[arg(long, default_value_t = 20)]
+    pub warm_requests: usize,
+
+    /// Seconds to wait after ready before sampling WARM, so lazy
+    /// post-ready initialization does not land inside the measurement.
+    #[arg(long, default_value_t = 8.0)]
+    pub settle_s: f64,
+
+    /// Readiness poll interval. This is the only quantization in `t_ready`.
+    #[arg(long, default_value_t = 20)]
+    pub poll_interval_ms: u64,
+
+    /// How long to wait for `/v1/models` to answer 200.
+    #[arg(long, default_value_t = 600)]
+    pub ready_timeout_s: u64,
+
+    /// A second `--child-cmd` to run the blocking parity gate against before
+    /// any timing. A broken dequant path can be fast, so timing a wrong
+    /// computation is worse than not timing at all.
+    #[arg(long)]
+    pub parity_cmd: Option<String>,
+
+    /// Banner rules for `--parity-cmd`'s backend.
+    #[arg(long, default_value = "mlx-lm")]
+    pub parity_backend: String,
+}
+
+/// `purge` is macOS-only and `posix_fadvise` does not exist there, so the
+/// right default is platform-dependent.
+fn default_evict() -> EvictStrategy {
+    if cfg!(target_os = "macos") {
+        EvictStrategy::Purge
+    } else {
+        EvictStrategy::Fadvise
+    }
 }
 
 impl BenchStartupArgs {

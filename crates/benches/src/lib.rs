@@ -24,6 +24,7 @@ mod ruler;
 mod serve;
 mod spans;
 mod startup;
+mod startup_exec;
 mod sweep;
 mod throughput;
 

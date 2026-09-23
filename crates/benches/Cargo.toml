@@ -31,6 +31,10 @@ rand = { workspace = true }
 # 0.5 is the line that pairs with rand 0.9; 0.4 would pin a second rand.
 rand_distr = "0.5"
 serde = { workspace = true }
+# `getrusage` for the child's peak RSS and major-fault count. major_faults is
+# what proves a FROZEN run's page-cache eviction took effect, so it gates
+# validity rather than being a diagnostic.
+libc = { workspace = true }
 shell-words = "1"
 csv = "1"
 dirs = { workspace = true }

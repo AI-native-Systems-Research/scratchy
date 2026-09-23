@@ -1,271 +1,206 @@
 # Benchmarking scratchy against other frameworks
 
 Methodology for the head-to-head comparisons, and the metric definitions they
-report. Until now this knowledge lived only in shell-script header comments;
-this file is the reference.
-
-The comparisons are split by what they measure, because they are different
-questions with different confounds:
+report.
 
 | harness | question | scenarios |
 |---|---|---|
 | [`scripts/bench_serve_compare.sh`](../scripts/bench_serve_compare.sh) | steady-state serving throughput and latency under load | input × output × concurrency sweep |
-| [`scripts/bench_startup_compare.sh`](../scripts/bench_startup_compare.sh) | how long from `exec` until the user sees a word | frozen / cold / warm cache ladder |
+| `scr bench startup --exec` | how long from `exec` until the user sees a word | frozen / cold / warm cache ladder |
+| `scr bench startup` (no `--exec`) | in-process engine construction cost | cold / warm iterations |
 
-Both currently target **mlx-lm** on Apple Silicon.
+## `--exec` vs plain `bench startup` — two different measurements
 
-### Not the same thing as `scr bench startup`
+`scr bench startup` without `--exec` mirrors
+[vLLM's `bench startup`](https://docs.vllm.ai/en/latest/cli/bench/startup/) down to
+`--num-iters-cold` / `--num-iters-warmup` / `--num-iters-warm`. The two modes are
+not interchangeable:
 
-`scr bench startup` (`crates/benches/src/startup.rs`, mirroring
-[vLLM's `bench startup`](https://docs.vllm.ai/en/latest/cli/bench/startup/), down
-to `--num-iters-cold` / `--num-iters-warmup` / `--num-iters-warm`) answers a
-different question, and the two numbers are not interchangeable:
-
-| | `scr bench startup` | `bench_startup_compare.sh` + `startup_probe.py` |
+| | plain `bench startup` | `bench startup --exec` |
 |---|---|---|
-| timed region | `LLMBuilder::build()`, in-process (`startup.rs:109-111`) | `exec` → first content byte of the first token |
+| timed region | `LLMBuilder::build()`, in-process (`crates/benches/src/startup.rs`) | `exec` → first content byte of the first token |
 | process | one process, N engine constructions | fresh `fork`/`exec` per measurement |
 | generates tokens | no — never sends a request, so **there is no TTFT to report** | yes; the clock stops on the first token byte |
-| what "cold" means | a fresh engine object. The HF cache is explicitly *not* wiped (`startup.rs:97-101`) and the page cache is untouched | the FROZEN/COLD rungs above: OS page cache and on-disk derived caches are controlled and the control is verified |
+| what "cold" means | a fresh engine object; the HF cache is explicitly *not* wiped and the page cache is untouched | the FROZEN/COLD rungs below, with the eviction *verified* |
 | sees `exec`, dyld, first-touch faults | no, by construction | yes — these dominate a real first launch |
-| other frameworks | no; it constructs scratchy's own `LLM` type | yes; one stopwatch drives every backend |
+| other frameworks | no; it constructs scratchy's own `LLM` | yes, via `--child-cmd` |
 
-So they are complementary rather than redundant. `scr bench startup` is the cheap,
-repeatable way to watch engine-init cost for regressions — it needs no sudo, no
-second framework, and gives percentiles over iterations in one process. The probe
-is what a *user-perceived* or *cross-framework* claim requires, because the costs
-it adds (exec, dynamic linking, page-cache state, prefill, the first sample) are
-exactly the ones an in-process loop cannot observe.
+They are complementary. Plain `bench startup` is the cheap, repeatable way to
+watch engine-init cost for regressions — no sudo, no second framework,
+percentiles over iterations in one process. `--exec` is what a *user-perceived*
+or *cross-framework* claim requires.
 
-**Do not put their numbers in the same table.** `bench startup` will always look
-faster, for the uninteresting reason that it is measuring less.
+**Do not put their numbers in the same table.** Plain `bench startup` will always
+look faster, for the uninteresting reason that it is measuring less.
 
 ---
 
-## 1. Startup: the cache ladder
+## 1. The cache ladder
 
-"Cold start" is not one thing — it is a stack of caches, each of which can be
-independently warm. Naming a single "cold" number without saying which of them
-were populated is how startup benchmarks become unfalsifiable. So the ladder is
-explicit:
+"Cold start" is not one thing — it is a stack of caches, each independently warm.
+Naming a single "cold" number without saying which were populated is how startup
+benchmarks become unfalsifiable. So the ladder is explicit:
 
 | surface | FROZEN | COLD | WARM |
 |---|---|---|---|
-| OS page cache (weights, binary, dylibs) | purged | warm | warm |
-| `~/.cache/scratchy/metal-aligned-weights` (if present; see caveat) | **removed** | present | present |
-| mlx-lm `__pycache__` | **removed** | present | present |
-| HF snapshot on disk | present | present | present |
+| OS page cache (weights, binary, dylibs) | evicted | warm | warm |
+| derived on-disk caches (`--remove-path`) | **removed** | present | present |
+| checkpoint on disk | present | present | present |
 | process | fresh `exec` | fresh `exec` | resident, ≥1 request served |
-| Metal pipelines / KV pool / warmup | rebuilt | rebuilt | done |
+| pipelines / KV pool / warmup | rebuilt | rebuilt | done |
 
 - **FROZEN** — first run ever on this machine, short of downloading weights.
-  Every page comes off SSD, and scratchy's aligned-weights sidecar is removed.
 - **COLD** — the honest everyday case: you ran it before, the machine has been
-  doing other things but not enough to evict 2 GiB, and you launch it again.
-- **WARM** — a server that is already up and has served traffic. Isolates
-  request latency from all startup cost.
+  busy but not enough to evict the weights, and you launch again.
+- **WARM** — a server already up and serving. Isolates request latency from all
+  startup cost.
 
-**Both FROZEN and COLD are always reported.** scratchy can keep a derived
-on-disk sidecar that MLX has no equivalent of; publishing only FROZEN would
-charge it a one-time cost on every launch, and publishing only COLD would hide
-that cost entirely.
+### Eviction is platform-specific, and one obvious choice is wrong
 
-> **Measured caveat, and it contradicts the obvious assumption.** For
-> `Llama-3.2-3B-Instruct-4bit` the sidecar is neither needed nor rebuilt.
-> scratchy writes it only from the realign-*copy* path
-> (`crates/targets/metal/src/metal_allocator.rs:1372`), and this checkpoint's
-> tensors already satisfy the bind alignment, so it loads 648/648 tensors
-> zero-copy directly from the HF mmap — with or without the sidecar. For this
-> model FROZEN→COLD is therefore a page-cache delta for *both* backends, and
-> the sidecar rung is inert (~0.17 s, inside the run-to-run spread).
->
-> The rung stays because it is *not* inert for checkpoints that do need
-> realignment: the code cites Qwen3.5-35B (18.99 GiB), where a warm relaunch
-> pays ~3.5 s of residency wiring instead of an ~8 s copy. **Re-check this per
-> model rather than assuming either way** — and note that once removed, the
-> sidecar will not come back for a zero-copy checkpoint, so COLD reps before
-> and after a FROZEN rep can take different load paths.
+`--evict purge` (macOS) drops the whole unified buffer cache. It is symmetric: it
+evicts CPython and a framework's dylibs exactly as it evicts the scratchy binary,
+which is what makes a cross-framework FROZEN fair.
 
-`sudo purge` is the only faithful page-cache drop on macOS; it is symmetric, in
-that it evicts CPython and the MLX dylibs exactly as it evicts the scratchy
-binary. Run with `--no-purge` and FROZEN collapses toward COLD.
+`--evict fadvise` (Linux) calls `posix_fadvise(POSIX_FADV_DONTNEED)` over
+`--evict-path`. It is deliberately **not** `drop_caches`: that file is not
+namespaced, so writing it from a container evicts the *host's* entire page cache
+and perturbs every other workload on a shared node. fadvise is unprivileged and
+surgical, and read-only mmap'd weight shards are exactly the clean-page case
+where `DONTNEED` is reliable. It needs `--evict-path`, and says so rather than
+silently evicting nothing.
+
+`--evict none` leaves the page cache alone; FROZEN then collapses toward COLD.
 
 ## 2. Metrics
 
-### Primary — one external stopwatch
-
-Every headline number is taken by [`scripts/startup_probe.py`](../scripts/startup_probe.py),
-which holds the clock itself and runs **the same code for both backends**. That
-single shared implementation is the core fairness guarantee: nothing is
-self-reported.
+One external stopwatch, held by the benchmark process, with **the same code for
+every backend**. That single shared implementation is the fairness guarantee:
+nothing is self-reported.
 
 - **`ttft_exec`** — seconds from `exec` to the first token byte. The headline.
   Spans process init, weight load, pipeline compile, KV allocation, warmup,
-  prefill and the first sample as one measured span, because that is what a
-  user experiences.
-- **`t_ready`** — `exec` until the server answers `GET /v1/models`. Splits
-  `ttft_exec` into "getting ready" and "doing the work". Poll granularity is
-  20 ms and is reported next to the number.
-- **`TTFT`** — time to first token measured from **request send** against an
-  already-running server. This is TTFT in the usual sense, and it is the
-  startup-independent half of `ttft_exec`: reported for every scenario, so
-  FROZEN, COLD and WARM are directly comparable on the same axis. In
-  frozen/cold it is the first request a fresh process ever serves, so it still
-  carries lazy pipeline compilation; in WARM it is steady state. p50 and p99
-  both reported.
-- **`tpot`** — per-token decode interval, over N−1 intervals, matching
+  prefill and the first sample as one measured span, because that is what a user
+  experiences.
+- **`t_ready`** — `exec` until `GET /v1/models` answers 200. Splits `ttft_exec`
+  into "getting ready" and "doing the work". Note this is an HTTP 200, not a TCP
+  accept: a listener can bind before the model is resident.
+  `--poll-interval-ms` (default 20) is the only quantization and is reported
+  alongside.
+- **`TTFT`** — first token measured from **request send** against a running
+  server: TTFT in the usual sense, and the startup-independent half of
+  `ttft_exec`.
+- **`tpot`** — per-token decode interval over N−1 intervals, matching
   `crates/benches/src/serve.rs`. `decode tok/s` is `1000/tpot`.
-- **`E2E*`** = `ttft_exec + (out_len − 1) · tpot` — the work-normalized total.
-  Required because mlx-lm ignores `ignore_eos` and stops early; a raw
-  wall-clock total would reward it for generating less.
+- **`peak_rss`** / **`major_faults`** — child `ru_maxrss` / `ru_majflt`, same
+  call for every backend. `major_faults` is *evidence the eviction worked*: if
+  FROZEN does not fault far more than COLD, the cache control failed and the run
+  is void. The run asserts this and exits non-zero.
 
-### Secondary — diagnostics
-
-- **`peak_rss`** — child `ru_maxrss`, same call both sides. On Apple Silicon
-  unified memory this includes GPU buffers.
-- **`major_faults`** — child `ru_majflt`. This is *evidence the purge worked*:
-  if FROZEN does not fault far more than COLD, the cache control failed and
-  the run is void. The summary asserts this and prints PASS/FAIL.
-
-### Why not the built-in numbers
-
-Neither framework's self-reported timings compose into `ttft_exec`:
-
-- `scr bench startup` rebuilds an `LLM` **in-process** and calls it "cold"; its
-  own comment (`crates/benches/src/startup.rs:97-101`) notes the HF cache is
-  never wiped, and it never sends a request, so it has no TTFT to report at all.
-  **Do not compare its output with `ttft_exec`** — see
-  [Not the same thing as `scr bench startup`](#not-the-same-thing-as-scr-bench-startup)
-  for the full side-by-side. It is the right tool for tracking engine-init
-  regressions; it is not a substitute for this harness, and this harness does not
-  replace it.
-- `scr chat --bench` reports `startup` and then a TTFT measured *from after
-  startup*, so the two never add up to user-perceived latency — and real work
-  lands after "startup" is declared done (a warmup generation, a background
-  integrity hash, lazy TurboQuant codebook selection).
-- `mlx_lm.generate --verbose` reports prompt/generation tok/s but never import
-  or load time.
+Cells are reported as `median (p10–p90) ×reps`, never a bare mean — a mean hid a
+bimodal ITL distribution in this repo for a week
+(`crates/cli/scr/src/commands/chat.rs`).
 
 ## 3. Fairness rules
 
-Rules 1–3 were learned the hard way by `bench_serve_compare.sh`; 4–8 are
-specific to startup.
-
-1. **Unique prompt per request.** A shared prompt lets scratchy's prefix cache
-   (or mlx-lm's prompt cache) serve the repeat, and TTFT collapses to ~0.
-   Prompts are seeded: identical across backends, unique per rep.
-2. **mlx-lm ignores `ignore_eos`.** Compare TTFT and TPOT directly; use `E2E*`
-   for totals. Generated tokens per request are always printed so
-   under-generation stays visible.
-3. **One model resident at a time.** Backends run serially; the probe refuses
-   to start against an already-serving port.
-4. **Same weights.** Both read the same `mlx-community` 4-bit checkpoint.
-   scratchy must be built with the preset matching the checkpoint's
-   `config.json` — for `Llama-3.2-3B-Instruct-4bit`
-   (`{"group_size": 64, "bits": 4}`) that is `quant/mlx-affine-b4-g64`.
-5. **Parity gate, blocking** ([`scripts/startup_parity.py`](../scripts/startup_parity.py)).
-   A broken dequant path can be *fast*, so timing a wrong computation is worse
-   than not timing at all. The gate enforces exact agreement on short
-   high-confidence prompts, and merely records drift on open-ended ones —
-   greedy argmax legitimately splits at near-ties between two different int4
-   kernel stacks, so gating on that would block on floating-point noise.
-   For real numerical fidelity work use the golden-reference tooling
-   (`scripts/generate_mlx_goldens.py`, `tools/vision_parity/`) instead.
-6. **ABBA interleaving.** Backend order reverses on odd reps so thermal drift
-   does not accrue to whichever backend always runs second. Thermal state and
-   power source are recorded, and throttling warns.
-7. **`HF_HUB_OFFLINE=1` for both.** Left online, mlx-lm makes a hub round trip
-   on every launch (`Fetching 6 files`) and network jitter lands inside the
-   measurement.
-8. **Median + p10/p90, never a bare mean**, with the rep count in every cell.
-   `crates/cli/scr/src/commands/chat.rs:90` records what a mean costs: it hid
-   a bimodal ITL distribution for a week.
-9. **Pin the sampling params explicitly.** Every request is greedy
-   (`temperature 0`) on both backends and from both clients. Leaving
-   temperature *unset* is the trap: `scr bench serve` then omits the field
-   entirely and each **server** applies its own default, so the two backends
-   get timed on different sampling paths. Measured on scratchy, which has
-   separate argmax and sampler kernels:
+1. **Unique prompt per request.** A shared prefix lets a prefix cache serve the
+   repeat and TTFT collapses. Prompts are seeded: identical across backends,
+   unique per rep. This is not hypothetical — a `bench serve` run against a
+   shared-prefix dataset reported a 98% prefix-cache hit rate, which inflated
+   throughput 1.84× and understated TTFT 11× before it was caught. Pass
+   `--no-prefix-caching` to the server under test as well.
+2. **Pin the sampling params.** Every request is greedy (`temperature 0`).
+   Leaving temperature *unset* is the trap: the field is omitted, each **server**
+   applies its own default, and the backends get timed on different sampling
+   paths. Measured on scratchy:
 
    | | TTFT p50 | TPOT p50 |
    |---|---|---|
-   | `--temperature 0` (argmax) | 44.3 ms | 12.96 ms |
-   | `--temperature 1.0` | 47.0 ms | 15.81 ms |
+   | `temperature 0` (argmax) | 44.3 ms | 12.96 ms |
+   | `temperature 1.0` | 47.0 ms | 15.81 ms |
    | unset (server default) | 71.2 ms | 15.81 ms |
 
    That spread is larger than most differences anyone would report, and it is
-   pure measurement artifact. Greedy also matches the parity gate, so what is
-   timed is what was verified.
+   pure measurement artifact. Greedy also matches what the parity gate verifies,
+   so what is timed is what was checked.
+3. **Parity gate, blocking** (`--parity-cmd`). A broken dequant path can be
+   *fast*, so timing a wrong computation is worse than not timing at all. The
+   gate enforces exact agreement on short high-confidence prompts and does not
+   gate on drift deep inside open-ended generations: greedy argmax legitimately
+   splits at near-ties between two kernel stacks. For real numerical fidelity
+   work use the golden-reference tooling (`scripts/generate_mlx_goldens.py`,
+   `tools/vision_parity/`) instead.
+4. **Same weights, matching preset.** scratchy must be built with the preset
+   matching the checkpoint's `config.json`.
+5. **One model resident at a time**, and `HF_HUB_OFFLINE=1` for both — left
+   online, some frameworks make a hub round trip per launch and network jitter
+   lands inside the measurement.
+6. **A settle delay before WARM** (`--settle-s`), so lazy post-ready
+   initialization does not land in the steady-state sample.
 
 ## 4. Known asymmetries — disclose, do not hide
 
 These favour one side or the other and must travel with any published number.
 
 - **scratchy compiles the model at build time.** `#[forward]` expands the whole
-  forward pass during `cargo build`, so work MLX does at runtime is already in
-  the binary. A real engineering advantage, and also why startup numbers
-  flatter scratchy versus a from-source comparison. The build cost is a
-  one-off; record it as a footnote rather than folding it into a scenario.
-- **scratchy's aligned-weights sidecar** has no MLX equivalent — hence the
-  FROZEN rung — but see the measured caveat above: it is inert for this
-  checkpoint, which loads zero-copy without it.
+  forward pass during `cargo build`, so work other engines do at runtime is
+  already in the binary. A real engineering advantage, and also why startup
+  numbers flatter scratchy. The build cost is a one-off; record it as a footnote
+  rather than folding it into a scenario.
+- **Derived on-disk caches have no cross-framework equivalent.** scratchy can
+  keep an aligned-weights sidecar; `--remove-path` puts it on the FROZEN rung so
+  it is neither charged per launch nor hidden. Measured caveat: for
+  `Llama-3.2-3B-Instruct-4bit` the sidecar is neither needed nor rebuilt —
+  scratchy writes it only from the realign-*copy* path
+  (`crates/targets/metal/src/metal_allocator.rs`) and that checkpoint loads
+  648/648 tensors zero-copy from the HF mmap. For that model FROZEN→COLD is a
+  page-cache delta only. It is *not* inert for checkpoints needing realignment
+  (the code cites Qwen3.5-35B at 18.99 GiB). **Re-check per model.**
 - **KV-cache dtype is not matched by default.** On metal scratchy enables
-  TurboQuant 3-bit KV compression while mlx-lm uses an uncompressed cache.
-  That is a *quality* difference as well as a perf one. Use
-  `--kv-cache-dtype fp16` for a like-for-like cache.
-- **A background integrity hash overlaps early decode.** On an aligned-cache
+  TurboQuant 3-bit KV compression while mlx-lm uses an uncompressed cache — a
+  *quality* difference as well as a perf one. Match it explicitly.
+- **A background integrity hash can overlap early decode.** On an aligned-cache
   *hit* scratchy content-hashes the cached blob on a background thread
-  (`crates/targets/metal/src/metal_allocator.rs:1002`) — observed between
-  0.39 s and 2.44 s for this model's ~1.7 GiB sidecar, competing with the
-  first requests. It does not occur when there is no sidecar, so it is present
-  in some COLD/WARM runs and absent in others: another reason WARM samples
-  begin only after a settle delay, and a reason to read `t_ready` and the
-  server log together rather than trusting a single rep.
+  (0.39–2.44 s observed for a ~1.7 GiB sidecar), competing with the first
+  requests. It does not happen when no sidecar exists, so it is present in some
+  runs and absent from others — hence `--settle-s`, and a reason to read
+  `t_ready` and the server log together rather than trusting one rep.
 - **Process shape differs.** scratchy is one static binary; mlx-lm is a CPython
-  interpreter plus imports. Under FROZEN both are evicted, which is the
-  real-world cost, but it is not a like-for-like measurement of model loading.
+  interpreter plus imports. FROZEN evicts both, which is the real-world cost, but
+  it is not a like-for-like measurement of model loading alone.
+- **Weight download is out of scope.** The checkpoint is on disk in all three
+  scenarios.
 
-## 5. Two clients, one server
+## 5. Running it
 
-WARM steady state is measured by **`scr bench serve`** — the repo's own load
-generator. It is base-URL driven and backend-agnostic, so the same binary
-drives scratchy and mlx-lm alike (this is exactly how `bench_serve_compare.sh`
-compares them), and the warm numbers come from the repo's existing TTFT/ITL
-logic and numpy-linear percentiles rather than a second implementation of the
-same statistics.
-
-It cannot serve FROZEN or COLD: those need the clock to start *before* `exec`,
-and `bench serve` can only measure from request send against a server that is
-already up. That is why `startup_probe.py` exists, and why it also issues its
-own warm requests — two independent clients against one server should agree,
-and the summary prints both. When they disagreed (scratchy 15.8 vs 12.9 ms
-TPOT) the cause was rule 9, not noise.
-
-## 6. Running it
+Any backend is named by `--child-cmd`, using the same shell-words convention as
+`scr sweep --serve-cmd`, so nothing here is scratchy-specific.
 
 ```bash
-# Build with serve + bench + the preset matching the checkpoint.
-cargo build --release -p scratchy-cli \
-  --features metal,serve,bench,model/llama-3.2-3b,quant/mlx-affine-b4-g64
+# scratchy, cold + warm, 3 reps each
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "scr serve $MODEL --device cuda:0 --port 8731 --no-prefix-caching" \
+    --scenarios cold,warm --reps 3 --output-json out/scratchy.json
 
-# mlx-lm in its own pinned venv; the version is recorded in the summary.
-uv venv /tmp/mlxbench --python 3.12
-uv pip install --python /tmp/mlxbench/bin/python mlx-lm
+# the same measurement against vLLM — no new code, just a different child
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "python -m vllm.entrypoints.openai.api_server --model $MODEL --port 8731 --no-enable-prefix-caching" \
+    --scenarios cold,warm --reps 3 --output-json out/vllm.json
 
-# Smoke first (no sudo, ~1 min), then the full ladder.
-scripts/bench_startup_compare.sh --mlx-python /tmp/mlxbench/bin/python \
-    --scenarios cold --modes server --reps 1 --no-long --no-purge
-scripts/bench_startup_compare.sh --mlx-python /tmp/mlxbench/bin/python
+# FROZEN on Linux: evict the weights and the binary, and prove it happened
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "scr serve $MODEL --device cuda:0 --port 8731" \
+    --scenarios frozen,cold --reps 3 \
+    --evict fadvise \
+    --evict-path "$HF_HOME/hub/models--org--name/snapshots" \
+    --evict-path target/release/scr
+
+# FROZEN on macOS, plus a blocking parity gate against mlx-lm
+sudo -v && scr bench startup --exec -m "$MODEL" --mode cli \
+    --child-cmd "target/release/scr chat -m $MODEL --device metal" \
+    --parity-cmd "python -m mlx_lm.generate --model $MODEL" \
+    --scenarios frozen,cold --evict purge
 ```
 
-FROZEN needs `sudo purge`; the script authorizes once up front and fails early
-if sudo is unavailable, rather than silently producing a fake frozen number.
-
-Results land in `bench_results/startup_compare/<timestamp>_<label>/`:
-per-rep JSON, backend logs, `run_meta.txt` (host, OS, git SHA, versions,
-thermal state), `parity/`, and `summary.md`. Re-summarize a finished directory
-without re-running it:
-
-```bash
-python3 scripts/startup_summary.py bench_results/startup_compare/<dir>
-```
+A run whose validity checks fail prints them and exits non-zero. That is
+intentional: a FROZEN rep that faulted no more than COLD did not measure a frozen
+start, and reporting it would be worse than reporting nothing.

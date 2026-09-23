@@ -3604,6 +3604,7 @@ dependencies = [
  "csv",
  "dirs 7.0.0",
  "indicatif",
+ "libc",
  "parquet",
  "rand",
  "rand_distr",
@@ -3626,7 +3627,6 @@ dependencies = [
  "cudaforge",
  "dirs 7.0.0",
  "minijinja",
- "scratchy-models",
 ]
 
 [[package]]
