@@ -1001,6 +1001,17 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
         std::fs::write(path, serde_json::to_string_pretty(&reps)?)?;
         eprintln!("results written to {path}");
     }
+    // A run that observed no first token measured nothing, and must not look
+    // like success to a script. The report above is already empty in that case,
+    // but an exit code of 0 would say otherwise — and the whole point of this
+    // harness is that a measurement which did not happen fails loudly.
+    anyhow::ensure!(
+        reps.iter().any(|r| r.ttft_exec_s.is_some()),
+        "no repetition observed a first token, so nothing was measured. Likely causes: \
+         the child never wrote generated text to stdout (CLI mode reads stdout only), \
+         every line it did write was classified as banner (see `--backend`), or the \
+         server answered /v1/models but returned no streamed content."
+    );
     anyhow::ensure!(
         failures.is_empty(),
         "validity checks failed; the run is void"
@@ -1114,6 +1125,31 @@ mod tests {
         assert!("frozen".parse::<StartupScenario>().is_ok());
         assert!("COLD".parse::<StartupScenario>().is_ok());
         assert!("lukewarm".parse::<StartupScenario>().is_err());
+    }
+
+    /// Banner-only output must yield NO measurement, not a fast one.
+    ///
+    /// This is the other half of the first-content-byte contract: a child that
+    /// prints only a prelude has not produced a token, so `ttft_exec` must stay
+    /// `None` and the caller must be able to tell. Verified against a real child
+    /// rather than a string, because the byte loop and the classifier have to
+    /// agree — and a run of only such reps exits non-zero (see `run`).
+    #[test]
+    fn banner_only_child_measures_nothing() {
+        let rep = run_cli(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo 'Using model: fake'; echo".into(),
+            ],
+            "scratchy",
+        )
+        .expect("child runs");
+        assert!(
+            rep.ttft_exec_s.is_none(),
+            "a banner-only child reported ttft_exec = {:?}; the clock stopped on the banner",
+            rep.ttft_exec_s
+        );
     }
 
     /// A real child, reaped with wait4, must report ITS OWN usage.
