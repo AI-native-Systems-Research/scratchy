@@ -1,0 +1,4 @@
+{
+  "_comment": "DeepSeek's `moe` DSL weight name maps to `mlp` on disk (HF safetensors store the MoE block under `model.layers.{l}.mlp`).",
+  "weight_leaf_renames": { "moe": "mlp" }
+}

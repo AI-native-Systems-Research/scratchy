@@ -644,14 +644,26 @@ pub fn compile_in_dir(
     // validation guarantees every model's bounds resolve the
     // manifest's formulas consistently, so any one model's bounds
     // suffice — we use the first (alphabetical) model.
+    // THE arch's declarations: `configs/<arch>/arch.json`. Facts about
+    // an arch that aren't derivable from a verbatim HF config.json live
+    // in that file, alongside the configs they describe — not in the
+    // DSL, which declares only the arch's MATH. Missing file → an arch
+    // that declares nothing (every fact derivable), which is the
+    // common case.
+    let spec = config::load_arch_json(models_dir).map_err(|e| {
+        syn::Error::new(
+            carrier.name_span,
+            format!("models_dir `{}`: {e}", models_dir.display()),
+        )
+    })?;
     let models = match mode.prelude {
         // `#[vision_forward]` configs are verbatim VL-wrapper HF
         // checkpoints; the vision loader derives the `vision_*`
         // bound set from the nested `vision_config` block via the
-        // carrier's declared `Params` schema instead of the
-        // decoder's flat top-level harvest.
-        classified::Prelude::Vision => config::load_dir_vision(models_dir, &carrier.spec),
-        _ => config::load_dir(models_dir, &carrier.spec),
+        // declared `Params` schema instead of the decoder's flat
+        // top-level harvest.
+        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec),
+        _ => config::load_dir(models_dir, &spec),
     }
     .map_err(|e| {
         syn::Error::new(

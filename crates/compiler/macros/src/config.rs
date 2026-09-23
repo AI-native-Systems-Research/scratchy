@@ -236,6 +236,15 @@ pub enum ConfigError {
         path: PathBuf,
         reason: String,
     },
+    /// A malformed `configs/<arch>/arch.json` — bad shape, bad enum
+    /// value, or an unknown key. Unknown keys are an ERROR rather than
+    /// a silent no-op: a typo'd declaration that quietly did nothing
+    /// would mis-emit the arch, which is exactly what the token
+    /// surface this file replaces was careful to prevent.
+    ArchJson {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -256,6 +265,9 @@ impl std::fmt::Display for ConfigError {
             Self::VisionDerivation { path, reason } => {
                 write!(f, "vision config {}: {reason}", path.display())
             }
+            Self::ArchJson { path, reason } => {
+                write!(f, "arch declaration {}: {reason}", path.display())
+            }
         }
     }
 }
@@ -271,6 +283,8 @@ impl std::error::Error for ConfigError {}
 /// Files skipped from the dense-base scan:
 /// - `weights.json` — per-arch shape manifest, loaded separately.
 /// - `quantizations.json` — preset declaration list.
+/// - `arch.json` — the arch's own declaration file (see
+///   [`load_arch_json`]), not a checkpoint.
 /// - `*.overrides.json` — per-(size, preset) drift overrides
 ///   applied during synthesis.
 ///
@@ -591,7 +605,10 @@ fn load_dir_mode(
         .iter()
         .filter(|p| {
             let name = p.file_name().and_then(|s| s.to_str());
-            !matches!(name, Some("weights.json") | Some("quantizations.json")) && !is_overrides(p)
+            !matches!(
+                name,
+                Some("weights.json") | Some("quantizations.json") | Some(ARCH_JSON)
+            ) && !is_overrides(p)
         })
         .cloned()
         .collect();
@@ -1503,6 +1520,278 @@ fn extract_vision_patch_embed_flatten(json: &serde_json::Value) -> Option<Vision
         leading_dim,
         channels_last,
     })
+}
+
+/// Load `configs/<arch>/arch.json` — THE arch's own declaration file.
+///
+/// This is the per-arch tier of the same JSON surface the
+/// per-checkpoint `<stem>.overrides.json` files already use, and it
+/// deliberately reuses their key names (`scale_dtype`,
+/// `decoder_safetensors_prefix`, `vision_safetensors_layout`,
+/// `vision_d_model_fingerprint`, `vision_patch_embed_flatten`, …) and
+/// their extractors, so there is ONE vocabulary for "facts about an
+/// arch that aren't derivable from a verbatim HF config.json" rather
+/// than two. Precedence is unchanged in spirit: HF `config.json`
+/// (per size) → `arch.json` (per arch) → `<stem>.overrides.json`
+/// (per checkpoint), each winning over the one before it.
+///
+/// A missing file is not an error: an arch whose every fact IS
+/// derivable from its config.json declares nothing, and its DSL file
+/// stays a bare `#[forward] fn`.
+pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, ConfigError> {
+    let path = dir.join(ARCH_JSON);
+    let mut spec = crate::arch_spec::DeclaredArchSpec::default();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(spec);
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|source| ConfigError::Json {
+            path: path.clone(),
+            source,
+        })?;
+
+    // Vision layout / fingerprint / patch-embed flatten: the SAME
+    // three extractors `resolve_arch_spec` runs over the per-checkpoint
+    // drift JSON, so the two tiers can never disagree about shape.
+    spec.safetensors = extract_vision_layout(&json);
+    spec.fingerprint = extract_vision_d_model_fingerprint(&json);
+    spec.patch_embed_flatten = extract_vision_patch_embed_flatten(&json);
+
+    // Scalars and strings. Enum-valued keys are validated here, at the
+    // single point they enter the compiler — the same check
+    // `resolve_arch_spec` applies to the drift tier.
+    let as_str = |k: &str| json.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    spec.pos_embed_key = as_str("vision_pos_embed_key");
+    spec.decoder_prefix = as_str("decoder_safetensors_prefix");
+    spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
+    spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
+
+    if let Some(s) = as_str("vision_rope_style") {
+        check_enum(
+            &path,
+            "vision_rope_style",
+            &s,
+            &["neox_hw", "interleaved_xy"],
+        )?;
+        spec.rope_style = Some(s);
+    }
+    if let Some(s) = as_str("vision_pos_emb_interp") {
+        check_enum(&path, "vision_pos_emb_interp", &s, &["bilinear", "bicubic"])?;
+        spec.pos_emb_interp = Some(s);
+    }
+    if let Some(s) = as_str("scale_dtype") {
+        check_enum(&path, "scale_dtype", &s, &["f16", "bf16"])?;
+        spec.scale_dtype = Some(s);
+    }
+
+    spec.bound_defaults = str_u64_pairs(&path, &json, "bound_defaults")?;
+    spec.scalar_defaults = str_f64_pairs(&path, &json, "scalar_defaults")?;
+    spec.config_aliases = str_str_pairs(&path, &json, "config_aliases")?;
+    spec.weight_leaf_renames = str_str_pairs(&path, &json, "weight_leaf_renames")?;
+    spec.params = parse_params_json(&path, &json)?;
+
+    // Typos must not silently no-op — the failure mode the token
+    // surface was careful about, kept here.
+    reject_unknown_keys(&path, &json)?;
+    Ok(spec)
+}
+
+/// Reserved (non-model) filename for the per-arch declaration file.
+pub(crate) const ARCH_JSON: &str = "arch.json";
+
+/// Every key `load_arch_json` understands. Anything else in an
+/// `arch.json` is a typo or a stale key, and is rejected.
+const ARCH_JSON_KEYS: &[&str] = &[
+    "vision_safetensors_layout",
+    "vision_d_model_fingerprint",
+    "vision_patch_embed_flatten",
+    "vision_pos_embed_key",
+    "vision_rope_style",
+    "vision_pos_emb_interp",
+    "vision_norm_eps",
+    "decoder_safetensors_prefix",
+    "scale_dtype",
+    "tie_default",
+    "bound_defaults",
+    "scalar_defaults",
+    "config_aliases",
+    "weight_leaf_renames",
+    "params",
+];
+
+fn reject_unknown_keys(path: &Path, json: &serde_json::Value) -> Result<(), ConfigError> {
+    let Some(obj) = json.as_object() else {
+        return Err(ConfigError::ArchJson {
+            path: path.to_path_buf(),
+            reason: "top level must be a JSON object".to_string(),
+        });
+    };
+    for k in obj.keys() {
+        // `_comment` is the established escape hatch in the existing
+        // `.overrides.json` files; keep it valid here too.
+        if k == "_comment" || ARCH_JSON_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        return Err(ConfigError::ArchJson {
+            path: path.to_path_buf(),
+            reason: format!("unknown key `{k}` (known: {})", ARCH_JSON_KEYS.join(", ")),
+        });
+    }
+    Ok(())
+}
+
+fn check_enum(path: &Path, key: &str, got: &str, allowed: &[&str]) -> Result<(), ConfigError> {
+    if allowed.contains(&got) {
+        return Ok(());
+    }
+    Err(ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason: format!("unknown {key} `{got}` ({})", allowed.join("|")),
+    })
+}
+
+/// `{"a": 1, "b": 2}` → sorted `[(a,1), (b,2)]`. Sorted so the emit is
+/// order-stable regardless of how the file was written.
+fn str_u64_pairs(
+    path: &Path,
+    json: &serde_json::Value,
+    key: &str,
+) -> Result<Vec<(String, u64)>, ConfigError> {
+    let Some(obj) = json.get(key) else {
+        return Ok(Vec::new());
+    };
+    let obj = obj.as_object().ok_or_else(|| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason: format!("`{key}` must be an object"),
+    })?;
+    let mut out: Vec<(String, u64)> = Vec::with_capacity(obj.len());
+    for (k, v) in obj {
+        let n = v.as_u64().ok_or_else(|| ConfigError::ArchJson {
+            path: path.to_path_buf(),
+            reason: format!("`{key}.{k}` must be a non-negative integer"),
+        })?;
+        out.push((k.clone(), n));
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn str_f64_pairs(
+    path: &Path,
+    json: &serde_json::Value,
+    key: &str,
+) -> Result<Vec<(String, f64)>, ConfigError> {
+    let Some(obj) = json.get(key) else {
+        return Ok(Vec::new());
+    };
+    let obj = obj.as_object().ok_or_else(|| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason: format!("`{key}` must be an object"),
+    })?;
+    let mut out: Vec<(String, f64)> = Vec::with_capacity(obj.len());
+    for (k, v) in obj {
+        let n = v.as_f64().ok_or_else(|| ConfigError::ArchJson {
+            path: path.to_path_buf(),
+            reason: format!("`{key}.{k}` must be a number"),
+        })?;
+        out.push((k.clone(), n));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn str_str_pairs(
+    path: &Path,
+    json: &serde_json::Value,
+    key: &str,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let Some(obj) = json.get(key) else {
+        return Ok(Vec::new());
+    };
+    let obj = obj.as_object().ok_or_else(|| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason: format!("`{key}` must be an object"),
+    })?;
+    let mut out: Vec<(String, String)> = Vec::with_capacity(obj.len());
+    for (k, v) in obj {
+        let s = v.as_str().ok_or_else(|| ConfigError::ArchJson {
+            path: path.to_path_buf(),
+            reason: format!("`{key}.{k}` must be a string"),
+        })?;
+        out.push((k.clone(), s.to_string()));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The `params` schema: an ORDERED array, because `expr` fields read
+/// bounds that earlier fields defined (`eval_params` walks in
+/// declaration order). A JSON object would not preserve that order,
+/// so this is a list of `{"name": …, <source>}` entries with exactly
+/// one source key each.
+fn parse_params_json(
+    path: &Path,
+    json: &serde_json::Value,
+) -> Result<Vec<crate::arch_spec::ParamField>, ConfigError> {
+    use crate::arch_spec::{ParamField, ParamSource};
+    let Some(v) = json.get("params") else {
+        return Ok(Vec::new());
+    };
+    let arr = v.as_array().ok_or_else(|| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason: "`params` must be an array (order matters: `expr` reads earlier fields)"
+            .to_string(),
+    })?;
+    let bad = |reason: String| ConfigError::ArchJson {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, f) in arr.iter().enumerate() {
+        let obj = f
+            .as_object()
+            .ok_or_else(|| bad(format!("`params[{i}]` must be an object")))?;
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| bad(format!("`params[{i}]` has no string `name`")))?
+            .to_string();
+        let source = match (obj.get("from"), obj.get("expr"), obj.get("value")) {
+            (Some(p), None, None) => {
+                let path_str = p
+                    .as_str()
+                    .ok_or_else(|| bad(format!("`params[{i}].from` must be a string")))?
+                    .to_string();
+                let default = match obj.get("default") {
+                    None => None,
+                    Some(d) => Some(
+                        d.as_u64()
+                            .ok_or_else(|| bad(format!("`params[{i}].default` must be an int")))?,
+                    ),
+                };
+                ParamSource::From {
+                    path: path_str,
+                    default,
+                }
+            }
+            (None, Some(e), None) => ParamSource::Expr(
+                e.as_str()
+                    .ok_or_else(|| bad(format!("`params[{i}].expr` must be a string")))?
+                    .to_string(),
+            ),
+            (None, None, Some(v)) => ParamSource::Value(
+                v.as_u64()
+                    .ok_or_else(|| bad(format!("`params[{i}].value` must be an int")))?,
+            ),
+            _ => {
+                return Err(bad(format!(
+                    "`params[{i}]` ({name}) needs EXACTLY one of `from` / `expr` / `value`"
+                )));
+            }
+        };
+        out.push(ParamField { name, source });
+    }
+    Ok(out)
 }
 
 /// Extract `mrope_section` as a fixed `[u32; 3]`, from a TOP-LEVEL

@@ -1,0 +1,7 @@
+{
+  "_comment": "ModernBERT spells its dual rotary bases `global_rope_theta` / `local_rope_theta`; the per-field readers (and the emitted `rotary` / `rotary_local` cache ctors) consume the gemma-convention `rope_theta` / `rope_local_base_freq` names. Alias, don't rename — the config stays verbatim and an explicit standard-name field still wins.",
+  "config_aliases": {
+    "rope_local_base_freq": "local_rope_theta",
+    "rope_theta": "global_rope_theta"
+  }
+}
