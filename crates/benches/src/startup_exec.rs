@@ -160,10 +160,21 @@ fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
     match strategy {
         EvictStrategy::None => Ok(()),
         EvictStrategy::Purge => {
-            let st = Command::new("purge")
+            // `purge` is root-only ("Unable to purge disk buffers: Operation not
+            // permitted" otherwise), so it goes through sudo — and through
+            // `-n`, so a missing credential fails immediately instead of
+            // blocking a benchmark on a password prompt. `preflight_evict`
+            // below checks for the credential before any measurement starts.
+            let st = Command::new("sudo")
+                .args(["-n", "purge"])
                 .status()
-                .context("`purge` failed to run (macOS only; needs sudo rights)")?;
-            anyhow::ensure!(st.success(), "`purge` exited with {st}");
+                .context("failed to run `sudo -n purge`")?;
+            anyhow::ensure!(
+                st.success(),
+                "`sudo -n purge` exited with {st}. purge needs root and macOS has no \
+                 unprivileged equivalent — run `sudo -v` first to cache the credential, \
+                 or pass `--evict none` (FROZEN then collapses toward COLD)"
+            );
             Ok(())
         }
         EvictStrategy::Fadvise => {
@@ -179,6 +190,52 @@ fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
             for p in paths {
                 fadvise_dontneed(p)
                     .with_context(|| format!("fadvise DONTNEED failed for {}", p.display()))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Check the eviction mechanism will work *before* anything is measured.
+///
+/// A FROZEN run that discovers its eviction is unusable has already thrown away
+/// the cache state it needed, so the failure has to come first. This mirrors the
+/// "authorizing once up front" step in the shell harness this replaces.
+fn preflight_evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
+    match strategy {
+        EvictStrategy::None => Ok(()),
+        EvictStrategy::Purge => {
+            let ok = Command::new("sudo")
+                .args(["-n", "true"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            anyhow::ensure!(
+                ok,
+                "FROZEN with `--evict purge` needs a cached sudo credential: `purge` requires \
+                 root and macOS has no unprivileged equivalent.\n  \
+                 Run `sudo -v`, then re-run this command.\n  \
+                 Or pass `--evict none` to skip eviction — FROZEN then collapses toward COLD \
+                 and the frozen-vs-cold validity checks will not mean anything."
+            );
+            Ok(())
+        }
+        EvictStrategy::Fadvise => {
+            anyhow::ensure!(
+                cfg!(target_os = "linux"),
+                "`--evict fadvise` needs Linux (macOS has no posix_fadvise); use `--evict purge`"
+            );
+            anyhow::ensure!(
+                !paths.is_empty(),
+                "`--evict fadvise` needs `--evict-path` (the weight shards and the binary)"
+            );
+            for p in paths {
+                anyhow::ensure!(
+                    p.exists(),
+                    "--evict-path {} does not exist; it would evict nothing and FROZEN \
+                     would silently be a COLD run",
+                    p.display()
+                );
             }
             Ok(())
         }
@@ -856,6 +913,12 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!(e))
         })
         .collect::<Result<_>>()?;
+
+    // Fail before measuring, not after the first eviction attempt has already
+    // destroyed the cache state a FROZEN rep needed.
+    if scenarios.contains(&StartupScenario::Frozen) {
+        preflight_evict(ex.evict, &ex.evict_path)?;
+    }
 
     let mut reps: Vec<Rep> = Vec::new();
     // Has any child been launched yet in this run? COLD and WARM both mean

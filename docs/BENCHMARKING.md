@@ -67,7 +67,11 @@ skipped in that case.
 
 `--evict purge` (macOS) drops the whole unified buffer cache. It is symmetric: it
 evicts CPython and a framework's dylibs exactly as it evicts the scratchy binary,
-which is what makes a cross-framework FROZEN fair.
+which is what makes a cross-framework FROZEN fair. **`purge` requires root**, so
+it runs as `sudo -n purge` — cache the credential with `sudo -v` before starting.
+The `-n` is deliberate: a benchmark must not block on a password prompt partway
+through, and a FROZEN run is checked for the credential up front rather than
+failing after it has already disturbed the cache state it needed.
 
 `--evict fadvise` (Linux) calls `posix_fadvise(POSIX_FADV_DONTNEED)` over
 `--evict-path`. It is deliberately **not** `drop_caches`: that file is not
@@ -207,10 +211,17 @@ scr bench startup --exec -m "$MODEL" \
     --evict-path "$HF_HOME/hub/models--org--name/snapshots" \
     --evict-path target/release/scr
 
-# FROZEN on macOS, plus a blocking parity gate against mlx-lm
-sudo -v && scr bench startup --exec -m "$MODEL" --mode cli \
-    --child-cmd "target/release/scr chat -m $MODEL --device metal" \
-    --parity-cmd "python -m mlx_lm.generate --model $MODEL" \
+# FROZEN on macOS: `sudo -v` first, or the up-front check refuses to start
+sudo -v
+scr bench startup --exec -m "$MODEL" \
+    --child-cmd "target/release/scr serve $MODEL --device metal --port 8731 --no-prefix-caching" \
+    --scenarios frozen,cold --reps 2 --evict purge
+
+# CLI mode needs {prompt}; add a blocking parity gate against mlx-lm
+sudo -v
+scr bench startup --exec -m "$MODEL" --mode cli \
+    --child-cmd "target/release/scr chat -m $MODEL --device metal -q {prompt} --max-tokens {output_len}" \
+    --parity-cmd "python -m mlx_lm.generate --model $MODEL --prompt {prompt} --max-tokens {output_len}" \
     --scenarios frozen,cold --evict purge
 ```
 
