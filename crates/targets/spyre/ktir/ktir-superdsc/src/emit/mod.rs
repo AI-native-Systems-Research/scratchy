@@ -3176,8 +3176,20 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
         dims: dims.clone(),
         df: Df::Fp16,
     };
+    // ⭐ THE TRANSPOSE'S OWN DIVIDER, NOT `distribute_cores` — and the guard below is what asked for
+    // it. This op's output stick is the 8x8 inter-slice block, so its per-core slice must be whole
+    // blocks on BOTH axes, which `distribute_cores` cannot serve: it splits `mb` first and to the
+    // hilt for a measured reason of its own (its doc: the flat row-major row-mixing), and every
+    // reduce/pointwise/silu in the crate rides that order. `TileOp::tile` takes the divider as a
+    // parameter, so pointing THIS ONE builder at the block-aware divider leaves every other op's
+    // division — and every other op's bytes — untouched. The guard stays exactly as it was and
+    // re-checks the property on whatever plan comes back, so divider and guard cannot drift apart.
     let tiled = tile_op
-        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
+        .tile(
+            MaxCores::<MAX_CORES>,
+            crate::work::distribute_cores_transpose_blocks,
+            "out",
+        )
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     // ⛔⛔⛔ THE PER-CORE SLICE MUST BE WHOLE 8×8 OUTPUT BLOCKS, AND THE VENDOR'S OWN FIXTURE SAYS THIS
@@ -3399,12 +3411,16 @@ mod transpose_tests {
     fn the_iteration_space_matches_the_fixture_at_the_fixture_extents() {
         let dims_only = transpose_opspec(384, 3072, "t1", "t2");
         // It refuses (see the divergence test) — but the refusal message carries the extents it was
-        // built from, which is what this pins: the shape reached the divider intact.
-        let e = dims_only.expect_err("the fixture's own shape is refused by the division guard");
-        assert!(
-            e.contains("transpose [384, 3072]"),
-            "the extents are the fixture's `mb_ 384` / `out_ 3072`, got: {e}"
-        );
+        // It now BUILDS (the division is the block-aware one), so the iteration space is asserted on
+        // the opspec itself rather than read out of a refusal message.
+        let spec = dims_only.expect("the fixture's own shape divides at the block now");
+        let mut sid = 0i64;
+        let op = assemble_transpose("tr", 384, 3072, "t1", "t2", &mut sid, None);
+        let d = dsc(&op, "tr");
+        assert_eq!(d.N_.mb_, 384, "the fixture's `mb_`");
+        assert_eq!(d.N_.out_, 3072, "the fixture's `out_`");
+        assert_eq!(d.N_.y_, 1, "the fixture's `y_`");
+        drop(spec);
     }
 
     /// ⭐ EXHAUSTIVE: a transpose declares exactly TWO tensors, one per role, and in that order. The
@@ -3434,25 +3450,37 @@ mod transpose_tests {
     /// per-core (mb 12, out 3072). 12 is not a multiple of 8, so two cores would sit inside one 8×8
     /// output stick.
     ///
-    /// This asserts the REFUSAL, never our division as an expectation. When the division is fixed
-    /// against the fixture this test fails loudly and is the place to record the new behaviour — which
-    /// is the point of pinning it.
+    /// ⭐ THE DIVERGENCE IS CLOSED, AND THIS IS THE RECORD ITS PREDECESSOR ASKED FOR — that test
+    /// asserted the REFUSAL and said in terms: "when the division is fixed against the fixture this
+    /// test fails loudly and is the place to record the new behaviour".
+    /// [`crate::work::distribute_cores_transpose_blocks`] is that fix, so the shape now lowers.
+    ///
+    /// ⛔ AND THE NEW DIVISION IS NOT THE FIXTURE'S OWN, WHICH IS STATED RATHER THAN GLOSSED. The
+    /// golden divides `{"out": 8, "mb": 4}` — per-core (mb 96, out 384). This divider answers
+    /// `{"mb": 2, "out": 16}` — per-core (mb 192, out 192). Both satisfy the property the guard checks
+    /// (whole 8-blocks on both axes, so no two cores sit inside one output stick) and they are NOT the
+    /// same division. One fixture point witnesses the property; it does not fix the law.
     #[test]
-    fn the_fixtures_own_shape_is_refused_because_our_core_division_is_not_the_fixtures() {
-        let e = transpose_opspec(384, 3072, "t1", "t2")
-            .expect_err("per-core mb 12 is not a whole 8-row block");
-        assert!(
-            e.contains("(mb 12, out 3072)"),
-            "names the per-core extents this builder produces, got: {e}"
-        );
-        assert!(
-            e.contains(r#"{"out": 8, "mb": 4}"#),
-            "names the fixture's own division as the reference, got: {e}"
-        );
-        assert!(
-            e.contains("sdsc_interslicetranspose.json"),
-            "cites the fixture, got: {e}"
-        );
+    fn the_fixtures_own_shape_now_divides_at_the_block() {
+        transpose_opspec(384, 3072, "t1", "t2")
+            .expect("the fixture's own shape divides at the block now");
+
+        let d = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        let dims = vec![d("mb", 384, false), d("out", 3072, true), d("y", 1, false)];
+        let p = WorkPlan::divide(
+            &dims,
+            MaxCores::<MAX_CORES>,
+            crate::work::distribute_cores_transpose_blocks,
+        )
+        .expect("the block divider places the fixture's shape");
+        assert_eq!(p.per_core_extent("mb"), 192, "splits: {:?}", p.splits());
+        assert_eq!(p.per_core_extent("out"), 192, "splits: {:?}", p.splits());
     }
 
     /// EVERY shape this builder ACCEPTS has whole-block per-core extents. This is the invariant, and it
@@ -3682,21 +3710,24 @@ mod transpose_tests {
         );
     }
 
-    /// ⛔ AND THE DIVISION GUARD REACHES THE ENTRY POINT AS AN `Error`, NOT A PANIC. `assemble_transpose`
-    /// `panic!`s on a refused opspec, so a shape that passes the stick law but trips the core-division
-    /// guard would abort the build with a bare panic instead of a producer-reportable error. `mb = 64`
-    /// is exactly that shape: whole sticks on both axes, per-core mb 2.
+    /// ⭐⭐⭐ EVERY STICK-LEGAL SHAPE NOW DIVIDES AT THE BLOCK, so the division guard is an INVARIANT
+    /// CHECK rather than a live refusal — and that is the property this test pins, at the very shape
+    /// its predecessor used to prove the opposite.
+    ///
+    /// `mb = 64, out = 128` was the "whole sticks on both axes, per-core mb 2" case: it passed the
+    /// stick law and tripped the block guard. With the block-aware divider it lowers.
+    ///
+    /// ⛔ WHY THE GUARD STAYS ANYWAY. The reasoning that makes it unreachable is a CONJUNCTION of two
+    /// separate laws — the stick law admits only multiples of the 64-element SEN169_FP16 stick, and 64
+    /// is a multiple of 8, so even a one-core division is block-whole. Either law moving on its own
+    /// (a narrower dtype's stick, an `is_stick` change, a divider that trades blocks for cores) breaks
+    /// the implication silently, and the guard is what would catch it. Measured, for the record: at
+    /// `(12, 64)` and `(8, 64)` the refusal now comes from the STICK law, not from the block guard.
     #[test]
-    fn a_stick_aligned_shape_whose_division_misses_the_block_is_an_error_not_a_panic() {
-        let e = refusal(&transpose_program((64, 128), (128, 64)));
-        assert!(
-            e.contains("(mb 2, out 128)"),
-            "the division guard's own message reaches the caller, got: {e}"
-        );
-        assert!(
-            e.contains("8x8 inter-slice block"),
-            "and names the block law, got: {e}"
-        );
+    fn a_stick_aligned_shape_whose_division_used_to_miss_the_block_now_lowers() {
+        let ops = lower_transpose(&transpose_program((64, 128), (128, 64)))
+            .expect("mb 64 / out 128 divides at the block now");
+        assert_eq!(ops.len(), 1, "one transpose descriptor");
     }
 
     // ── (iii) the byte-identity control ──────────────────────────────────────────────────────────
