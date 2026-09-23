@@ -619,7 +619,7 @@ scratchy-quantizations = { path = "../quantization" }
 # `syn` parses the DSL carrier (`dsl/<arch>.rs.in`). It is NOT used to render
 # the emit — `render_lines` walks the token stream directly, so the emitted file
 # never round-trips through an AST (see scratchy-forwards.rs for the numbers).
-syn = { version = "2", features = ["full", "parsing"] }
+syn = { version = "3", features = ["full", "parsing"] }
 proc-macro2 = "1"
 serde_json = { workspace = true }
 # Emit arches in parallel (scratchy-forwards.rs), nested with the pipeline's own
