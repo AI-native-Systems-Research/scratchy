@@ -44,7 +44,10 @@ use anyhow::{Context, Result};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::args::{Backend, BenchStartupArgs, EvictStrategy, StartupMode, StartupScenario};
+pub(crate) mod args;
+
+use crate::args::BenchStartupArgs;
+use args::{Backend, Evict, Mode, Scenario};
 
 // ---------------------------------------------------------------------------
 // Prompt construction
@@ -183,15 +186,15 @@ fn cached_kib() -> Option<i64> {
 ///   would perturb every other workload on a shared node. fadvise is
 ///   unprivileged and surgical, and read-only mmap'd weight shards are exactly
 ///   the clean-page case where DONTNEED is reliable.
-fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<Option<i64>> {
+fn evict(strategy: Evict, paths: &[PathBuf]) -> Result<Option<i64>> {
     let before = cached_kib();
     let evicted = |after: Option<i64>| match (before, after) {
         (Some(b), Some(a)) => Some(b - a),
         _ => None,
     };
     match strategy {
-        EvictStrategy::None => Ok(None),
-        EvictStrategy::Purge => {
+        Evict::None => Ok(None),
+        Evict::Purge => {
             // `purge` is root-only ("Unable to purge disk buffers: Operation not
             // permitted" otherwise), so it goes through sudo — and through
             // `-n`, so a missing credential fails immediately instead of
@@ -209,7 +212,7 @@ fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<Option<i64>> {
             );
             Ok(evicted(cached_kib()))
         }
-        EvictStrategy::Fadvise => {
+        Evict::Fadvise => {
             anyhow::ensure!(
                 cfg!(target_os = "linux"),
                 "--evict fadvise needs Linux (macOS has no posix_fadvise); use --evict purge"
@@ -233,10 +236,10 @@ fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<Option<i64>> {
 /// A FROZEN run that discovers its eviction is unusable has already thrown away
 /// the cache state it needed, so the failure has to come first. This mirrors the
 /// "authorizing once up front" step in the shell harness this replaces.
-fn preflight_evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
+fn preflight_evict(strategy: Evict, paths: &[PathBuf]) -> Result<()> {
     match strategy {
-        EvictStrategy::None => Ok(()),
-        EvictStrategy::Purge => {
+        Evict::None => Ok(()),
+        Evict::Purge => {
             let ok = Command::new("sudo")
                 .args(["-n", "true"])
                 .status()
@@ -252,7 +255,7 @@ fn preflight_evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
             );
             Ok(())
         }
-        EvictStrategy::Fadvise => {
+        Evict::Fadvise => {
             anyhow::ensure!(
                 cfg!(target_os = "linux"),
                 "`--evict fadvise` needs Linux (macOS has no posix_fadvise); use `--evict purge`"
@@ -943,7 +946,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     // Framework/mode combinations that cannot be measured are refused before a
     // child is spawned, rather than producing a number that means something
     // other than its label.
-    if ex.mode == StartupMode::Cli
+    if ex.mode == Mode::Cli
         && let Some(why) = ex.backend.rejects_cli_mode()
     {
         anyhow::bail!(
@@ -956,7 +959,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     // to say where it goes — the flag differs per framework and this harness
     // deliberately knows nothing about any framework's flags.
     anyhow::ensure!(
-        ex.mode != StartupMode::Cli || child.has_placeholder(),
+        ex.mode != Mode::Cli || child.has_placeholder(),
         "--mode cli needs a {{prompt}} placeholder in --child-cmd, e.g.\n  \
          --child-cmd \"target/release/scr chat -m M --device metal -q {{prompt}} \
          --max-tokens {{output_len}}\""
@@ -1007,7 +1010,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
 
     // Fail before measuring, not after the first eviction attempt has already
     // destroyed the cache state a FROZEN rep needed.
-    if scenarios.contains(&StartupScenario::Frozen) {
+    if scenarios.contains(&Scenario::Frozen) {
         preflight_evict(ex.evict, &ex.evict_path)?;
     }
 
@@ -1016,16 +1019,12 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     // "the caches are populated", which is only true once something has run.
     let mut launched = false;
     for &sc in scenarios {
-        let n = if sc == StartupScenario::Warm {
-            1
-        } else {
-            ex.reps
-        };
+        let n = if sc == Scenario::Warm { 1 } else { ex.reps };
         for rep in 0..n {
             // FROZEN: remove derived on-disk caches first, then evict the page
             // cache, so the removals above cannot repopulate it.
             let mut evicted_kib = None;
-            if sc == StartupScenario::Frozen {
+            if sc == Scenario::Frozen {
                 for p in &ex.remove_path {
                     let _ = std::fs::remove_dir_all(p);
                 }
@@ -1041,16 +1040,16 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
             // One throwaway launch, discarded, and only when nothing has run
             // yet: a FROZEN rep earlier in the list has already populated the
             // caches, so priming after one would be wasted work.
-            if !launched && sc != StartupScenario::Frozen {
+            if !launched && sc != Scenario::Frozen {
                 eprintln!(
                     "--- priming ({sc:?} needs populated caches; this launch is discarded) ---"
                 );
                 let warmup_prompt = build_prompt(ex.seed, ex.input_len);
                 match ex.mode {
-                    StartupMode::Cli => {
+                    Mode::Cli => {
                         run_cli(&expand(&argv, &warmup_prompt, ex.output_len), ex.backend)?;
                     }
-                    StartupMode::Server => {
+                    Mode::Server => {
                         run_server(&ctx, &argv, &warmup_prompt, 0, ex.seed)?;
                     }
                 }
@@ -1063,12 +1062,12 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
             eprintln!("--- {sc:?}/{:?} rep {rep} ---", ex.mode);
 
             let mut r = match ex.mode {
-                StartupMode::Cli => run_cli(&expand(&argv, &prompt, ex.output_len), ex.backend)?,
-                StartupMode::Server => run_server(
+                Mode::Cli => run_cli(&expand(&argv, &prompt, ex.output_len), ex.backend)?,
+                Mode::Server => run_server(
                     &ctx,
                     &argv,
                     &prompt,
-                    if sc == StartupScenario::Warm {
+                    if sc == Scenario::Warm {
                         ex.warm_requests
                     } else {
                         0
@@ -1172,16 +1171,12 @@ mod tests {
         .expect("exec flags should parse");
         assert!(a.exec_opts.exec);
         assert_eq!(a.exec_opts.reps, 5);
-        assert_eq!(a.exec_opts.mode, StartupMode::Server);
+        assert_eq!(a.exec_opts.mode, Mode::Server);
         assert_eq!(a.exec_opts.port, 8731);
         // clap splits and validates the list; no hand-rolled parsing remains.
         assert_eq!(
             a.exec_opts.scenarios,
-            vec![
-                StartupScenario::Frozen,
-                StartupScenario::Cold,
-                StartupScenario::Warm
-            ]
+            vec![Scenario::Frozen, Scenario::Cold, Scenario::Warm]
         );
         assert_eq!(a.exec_opts.backend, Backend::Scratchy);
         assert_eq!(a.exec_opts.parity_backend, Backend::MlxLm);
@@ -1197,7 +1192,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             dflt.exec_opts.scenarios,
-            vec![StartupScenario::Cold, StartupScenario::Warm]
+            vec![Scenario::Cold, Scenario::Warm]
         );
         // The in-process path must keep working untouched when --exec is absent.
         let plain = BenchStartupArgs::try_parse_from(["startup", "-m", "org/model"]).unwrap();
