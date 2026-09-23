@@ -6,6 +6,14 @@
 //! Measures total startup time (model loading + KV cache allocation) for both
 //! cold (no HF cache) and warm (cached weights) scenarios by repeatedly
 //! constructing an [`LLM`] instance.
+//!
+//! SCOPE, because it is easy to reach for the wrong one: what is timed here is
+//! `LLMBuilder::build()` *in-process* (see the `Instant::now()` below). No
+//! process is exec'd, no cache is wiped, and no request is ever sent — so this
+//! cannot produce a TTFT, and its "cold" is a fresh engine object rather than a
+//! cold machine. For "how long from `exec` until the user sees a word", and for
+//! any cross-framework comparison, use `scripts/startup_probe.py` instead; the
+//! two are not comparable. See `docs/BENCHMARKING.md`.
 
 use std::time::Instant;
 

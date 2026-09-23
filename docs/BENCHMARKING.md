@@ -14,6 +14,32 @@ questions with different confounds:
 
 Both currently target **mlx-lm** on Apple Silicon.
 
+### Not the same thing as `scr bench startup`
+
+`scr bench startup` (`crates/benches/src/startup.rs`, mirroring
+[vLLM's `bench startup`](https://docs.vllm.ai/en/latest/cli/bench/startup/), down
+to `--num-iters-cold` / `--num-iters-warmup` / `--num-iters-warm`) answers a
+different question, and the two numbers are not interchangeable:
+
+| | `scr bench startup` | `bench_startup_compare.sh` + `startup_probe.py` |
+|---|---|---|
+| timed region | `LLMBuilder::build()`, in-process (`startup.rs:109-111`) | `exec` → first content byte of the first token |
+| process | one process, N engine constructions | fresh `fork`/`exec` per measurement |
+| generates tokens | no — never sends a request, so **there is no TTFT to report** | yes; the clock stops on the first token byte |
+| what "cold" means | a fresh engine object. The HF cache is explicitly *not* wiped (`startup.rs:97-101`) and the page cache is untouched | the FROZEN/COLD rungs above: OS page cache and on-disk derived caches are controlled and the control is verified |
+| sees `exec`, dyld, first-touch faults | no, by construction | yes — these dominate a real first launch |
+| other frameworks | no; it constructs scratchy's own `LLM` type | yes; one stopwatch drives every backend |
+
+So they are complementary rather than redundant. `scr bench startup` is the cheap,
+repeatable way to watch engine-init cost for regressions — it needs no sudo, no
+second framework, and gives percentiles over iterations in one process. The probe
+is what a *user-perceived* or *cross-framework* claim requires, because the costs
+it adds (exec, dynamic linking, page-cache state, prefill, the first sample) are
+exactly the ones an in-process loop cannot observe.
+
+**Do not put their numbers in the same table.** `bench startup` will always look
+faster, for the uninteresting reason that it is measuring less.
+
 ---
 
 ## 1. Startup: the cache ladder
@@ -105,10 +131,14 @@ self-reported.
 
 Neither framework's self-reported timings compose into `ttft_exec`:
 
-- `scr bench startup` rebuilds an `LLM` **in-process** and calls it "cold";
-  its own comment (`crates/benches/src/startup.rs:80`) notes the HF cache is
-  never wiped. It cannot observe `exec`, dyld, or per-process Metal pipeline
-  compilation. **Do not compare its output with `ttft_exec`.**
+- `scr bench startup` rebuilds an `LLM` **in-process** and calls it "cold"; its
+  own comment (`crates/benches/src/startup.rs:97-101`) notes the HF cache is
+  never wiped, and it never sends a request, so it has no TTFT to report at all.
+  **Do not compare its output with `ttft_exec`** — see
+  [Not the same thing as `scr bench startup`](#not-the-same-thing-as-scr-bench-startup)
+  for the full side-by-side. It is the right tool for tracking engine-init
+  regressions; it is not a substitute for this harness, and this harness does not
+  replace it.
 - `scr chat --bench` reports `startup` and then a TTFT measured *from after
   startup*, so the two never add up to user-perceived latency — and real work
   lands after "startup" is declared done (a warmup generation, a background
