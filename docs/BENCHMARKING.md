@@ -109,9 +109,28 @@ nothing is self-reported.
   latter's `ru_maxrss` is a high-water mark over *every* child the process has
   reaped, so per-repetition figures silently break after the first one — a Metal
   run reported a live WARM server at 1 MiB because an earlier COLD repetition had
-  already pushed the mark to ~270 MiB. `major_faults` is *evidence the eviction
-  worked*: if FROZEN does not fault far more than COLD, the cache control failed
-  and the run is void. The run asserts this and exits non-zero.
+  already pushed the mark to ~270 MiB.
+- **`evicted`** — KiB that left the page cache when a FROZEN repetition's
+  eviction ran, from `/proc/meminfo` `Cached` sampled either side of it.
+
+### Proving the eviction happened
+
+A FROZEN number is worthless unless the eviction demonstrably took effect, so the
+run asserts it and exits non-zero on failure. **Where `evicted` is available it is
+the evidence, and `major_faults` is not gated on.** That ordering is deliberate:
+
+`ru_majflt` only counts faults on *memory-mapped* pages, and on Linux readahead
+plus fault-around will satisfy a sequential scan of a fully-evicted mmap'd file
+from within a single major fault. Measured on an H100 node: a `Cached` drop of
+511,560 kB for a 512,000 kB file — a 99.9% eviction — produced `majflt=1`, against
+`majflt=0` warm. Gating on `1 > 0` would be gating on noise, and tightening the
+threshold instead would reject correctly-evicted Linux runs.
+
+On macOS there is no `/proc/meminfo`, so the fault delta carries the argument —
+and there it is strong, because `purge` drops everything and a real loader's
+access pattern defeats readahead: 11,426 faults against 0 on a real checkpoint.
+`read()`-based children never produce major faults at all, whatever the cache
+state, so a FROZEN rung measured with `cat`/`dd`/`wc` is not measuring anything.
 
 Cells are reported as `median (p10–p90) ×reps`, never a bare mean — a mean hid a
 bimodal ITL distribution in this repo for a week

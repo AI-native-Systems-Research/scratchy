@@ -27,9 +27,13 @@
 //! | derived on-disk caches      | removed  | present | present           |
 //! | process                     | fresh    | fresh   | resident, ≥1 req  |
 //!
-//! FROZEN must fault far more than COLD or the eviction did not take effect and
-//! the run is void — `major_faults` is the evidence, and the validity check at
-//! the end of a run asserts it rather than leaving it to a reader.
+//! A FROZEN rung has to prove its eviction actually happened or the run is
+//! void, and the validity check at the end asserts that rather than leaving it
+//! to a reader. Where the eviction can measure its own effect (a drop in
+//! `/proc/meminfo` `Cached`) that is the evidence; `major_faults` is the
+//! fallback for platforms without it, because readahead makes the fault count a
+//! weak witness on Linux — a verified 500 MiB eviction was observed producing a
+//! single major fault.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -143,7 +147,28 @@ fn wait4_child(child: &mut Child) -> Result<ChildUsage> {
 // ---------------------------------------------------------------------------
 // Cache-state control
 // ---------------------------------------------------------------------------
-/// Evict the page cache so a FROZEN launch faults its weights back in.
+/// Page-cache bytes currently held, from `/proc/meminfo`. `None` off Linux.
+///
+/// Sampled either side of an eviction so the eviction can prove its own effect.
+/// That matters because the downstream proxy is unreliable: Linux readahead
+/// plus fault-around can satisfy a scan of a *fully evicted* mmap'd file with a
+/// single major fault (measured: `majflt=1` after a verified 500 MiB eviction,
+/// against `majflt=0` warm). Gating a run on that difference would be gating on
+/// noise, while a 511,560 kB drop in `Cached` for a 512,000 kB file is direct.
+fn cached_kib() -> Option<i64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|l| {
+        // "Cached:" only — "SwapCached:" does not start with it.
+        l.strip_prefix("Cached:")?
+            .split_whitespace()
+            .next()?
+            .parse::<i64>()
+            .ok()
+    })
+}
+
+/// Evict the page cache so a FROZEN launch faults its weights back in, and
+/// return how many KiB left the cache when that is measurable.
 ///
 /// Two strategies, because the honest mechanism differs by platform:
 ///
@@ -156,9 +181,14 @@ fn wait4_child(child: &mut Child) -> Result<ChildUsage> {
 ///   would perturb every other workload on a shared node. fadvise is
 ///   unprivileged and surgical, and read-only mmap'd weight shards are exactly
 ///   the clean-page case where DONTNEED is reliable.
-fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
+fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<Option<i64>> {
+    let before = cached_kib();
+    let evicted = |after: Option<i64>| match (before, after) {
+        (Some(b), Some(a)) => Some(b - a),
+        _ => None,
+    };
     match strategy {
-        EvictStrategy::None => Ok(()),
+        EvictStrategy::None => Ok(None),
         EvictStrategy::Purge => {
             // `purge` is root-only ("Unable to purge disk buffers: Operation not
             // permitted" otherwise), so it goes through sudo — and through
@@ -175,7 +205,7 @@ fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
                  unprivileged equivalent — run `sudo -v` first to cache the credential, \
                  or pass `--evict none` (FROZEN then collapses toward COLD)"
             );
-            Ok(())
+            Ok(evicted(cached_kib()))
         }
         EvictStrategy::Fadvise => {
             anyhow::ensure!(
@@ -191,7 +221,7 @@ fn evict(strategy: EvictStrategy, paths: &[PathBuf]) -> Result<()> {
                 fadvise_dontneed(p)
                     .with_context(|| format!("fadvise DONTNEED failed for {}", p.display()))?;
             }
-            Ok(())
+            Ok(evicted(cached_kib()))
         }
     }
 }
@@ -316,6 +346,9 @@ pub(crate) struct Rep {
     pub output_tokens: usize,
     pub peak_rss_mib: f64,
     pub major_faults: i64,
+    /// KiB that left the page cache when this repetition's eviction ran. `None`
+    /// when unmeasurable (no /proc/meminfo) or when nothing was evicted.
+    pub evicted_kib: Option<i64>,
     pub text: String,
 }
 
@@ -673,6 +706,8 @@ fn report(reps: &[Rep], poll_ms: u64) -> Vec<String> {
         "{:<9} {:<7} {:>16} {:>14}",
         "scenario", "mode", "peak_rss (MiB)", "major_faults"
     );
+    // `evicted` is the direct evidence column; see the validity note below for
+    // why it outranks major_faults where both exist.
     for sc in scenarios {
         for mode in ["cli", "server"] {
             let group: Vec<&Rep> = reps
@@ -686,12 +721,21 @@ fn report(reps: &[Rep], poll_ms: u64) -> Vec<String> {
             let mut flt: Vec<f64> = group.iter().map(|r| r.major_faults as f64).collect();
             rss.sort_by(f64::total_cmp);
             flt.sort_by(f64::total_cmp);
+            let mut ev: Vec<f64> = group
+                .iter()
+                .filter_map(|r| r.evicted_kib.map(|k| k as f64 / 1024.0))
+                .collect();
+            ev.sort_by(f64::total_cmp);
             println!(
-                "{:<9} {:<7} {:>16.0} {:>14.0}",
+                "{:<9} {:<7} {:>16.0} {:>14.0}   {}",
                 sc.to_uppercase(),
                 mode,
                 median(&rss).unwrap_or(0.0),
-                median(&flt).unwrap_or(0.0)
+                median(&flt).unwrap_or(0.0),
+                match median(&ev) {
+                    Some(v) => format!("evicted {v:.0} MiB"),
+                    None => String::new(),
+                }
             );
         }
     }
@@ -714,23 +758,56 @@ fn report(reps: &[Rep], poll_ms: u64) -> Vec<String> {
     for mode in ["cli", "server"] {
         let faults_f = |r: &Rep| Some(r.major_faults as f64);
         let ttft_f = |r: &Rep| r.ttft_exec_s;
-        if let (Some(ff), Some(fc)) = (
-            med_for("frozen", mode, &faults_f),
-            med_for("cold", mode, &faults_f),
-        ) {
-            any = true;
-            let ok = ff > fc;
-            println!(
-                "- {} — {mode}: FROZEN major faults {ff:.0} vs COLD {fc:.0} ({})",
-                if ok { "PASS" } else { "**FAIL**" },
-                if ok {
-                    "eviction took effect"
-                } else {
-                    "eviction did NOT take effect"
+        let evicted_f = |r: &Rep| r.evicted_kib.map(|k| k as f64);
+
+        // DID THE EVICTION HAPPEN? Prefer direct evidence over the downstream
+        // proxy. Where the eviction measured its own effect (a drop in
+        // /proc/meminfo Cached) that is proof the mechanism ran, and the fault
+        // count must NOT be allowed to void the run: Linux readahead plus
+        // fault-around can satisfy a scan of a fully evicted mmap'd file with a
+        // single major fault. Measured on an H100 node, a verified 500 MiB
+        // eviction produced majflt=1 against majflt=0 warm, so `1 > 0` passed
+        // this gate on what is indistinguishable from noise. Only where no
+        // direct measurement exists (macOS `purge`, no /proc/meminfo) does the
+        // fault delta carry the argument, and there it is strong: 11,426 vs 0.
+        match med_for("frozen", mode, &evicted_f) {
+            Some(kib) => {
+                any = true;
+                let ok = kib > 0.0;
+                println!(
+                    "- {} — {mode}: eviction dropped {:.0} MiB from the page cache ({})",
+                    if ok { "PASS" } else { "**FAIL**" },
+                    kib / 1024.0,
+                    if ok {
+                        "measured directly; major_faults not gated on, readahead makes it weak"
+                    } else {
+                        "nothing left the page cache"
+                    }
+                );
+                if !ok {
+                    failures.push(format!("{mode} page-cache control"));
                 }
-            );
-            if !ok {
-                failures.push(format!("{mode} page-cache control"));
+            }
+            None => {
+                if let (Some(ff), Some(fc)) = (
+                    med_for("frozen", mode, &faults_f),
+                    med_for("cold", mode, &faults_f),
+                ) {
+                    any = true;
+                    let ok = ff > fc;
+                    println!(
+                        "- {} — {mode}: FROZEN major faults {ff:.0} vs COLD {fc:.0} ({})",
+                        if ok { "PASS" } else { "**FAIL**" },
+                        if ok {
+                            "eviction took effect; no direct measurement on this platform"
+                        } else {
+                            "eviction did NOT take effect"
+                        }
+                    );
+                    if !ok {
+                        failures.push(format!("{mode} page-cache control"));
+                    }
+                }
             }
         }
         if let (Some(tf), Some(tc)) = (
@@ -933,11 +1010,12 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
         for rep in 0..n {
             // FROZEN: remove derived on-disk caches first, then evict the page
             // cache, so the removals above cannot repopulate it.
+            let mut evicted_kib = None;
             if sc == StartupScenario::Frozen {
                 for p in &ex.remove_path {
                     let _ = std::fs::remove_dir_all(p);
                 }
-                evict(ex.evict, &ex.evict_path)?;
+                evicted_kib = evict(ex.evict, &ex.evict_path)?;
             }
 
             // PRIME. A COLD rung means "you ran this before" — but the first
@@ -987,6 +1065,7 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
             r.scenario = format!("{sc:?}").to_lowercase();
             r.mode = format!("{:?}", ex.mode).to_lowercase();
             r.rep = rep;
+            r.evicted_kib = evicted_kib;
             if let Some(t) = r.ttft_exec_s {
                 eprintln!("    ttft_exec = {t:.3} s");
             }
