@@ -3448,12 +3448,38 @@ pub fn lmlast(
 /// ⭐ ARITY IS THE PRECISION, and the fp8 half of main's body is already ported: three tensor inputs
 /// (activation, packed fp8 weight, the checkpoint's per-column `w_scale`) is W8A8 and goes to
 /// [`super::ktir_matmul_fp8`], which IS main's arity-3 branch unchanged.
+/// ⭐ UNCHANGED FOR EVERY EXISTING CALLER, deliberately. `crates/targets/spyre`'s own
+/// `ktir_superdsc_door` calls this with five arguments, and its weights are transpose-B by
+/// construction (main's `[k, n]` SubtileIR region viewed as `[n, k]`) — which is exactly the reading
+/// the guard inside hardcoded before the orientation became a parameter. So this delegates at
+/// `TransposeB` and preserves today's behaviour byte-for-byte; only a producer that CAN prove the
+/// orientation is asked to.
 pub fn matmul(
     name: &str,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
+) -> Result<Vec<EmittedOp>, Error> {
+    matmul_oriented(
+        name,
+        r,
+        sym_id_base,
+        layout,
+        quantized,
+        super::whole_function::BOrient::TransposeB,
+    )
+}
+
+/// [`matmul`] with the weight orientation PROVEN by the caller instead of assumed — see
+/// [`super::whole_function::matmul_b_orientation`], which reads it off the op's own `indexing_maps`.
+pub fn matmul_oriented(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    quantized: &mut std::collections::HashSet<String>,
+    b: super::whole_function::BOrient,
 ) -> Result<Vec<EmittedOp>, Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
     let [out] = outs[..] else {
@@ -3527,16 +3553,27 @@ pub fn matmul(
     // checked `w.region.rows.len != k` and `w.region.cols.len != n` against the SubtileIR region;
     // `KtirFunc::matmul` views the same buffer as its natural `[n, k]`, so the two checks swap sides
     // and nothing else about them changes.
-    if w.c_len != k {
+    // ⛔ WHICH OF W'S TWO EXTENTS IS K IS A PROVEN FACT, NOT A CONVENTION. The check above reads the
+    // weight as `[n, k]` (transpose-B). A plain-B weight is `[k, n]`, and at `k == n` — granite's
+    // `[4096, 4096]` output projection — the extents alone cannot tell the two framings apart, so a
+    // hardcoded reading is a silent wrong contraction on one of them. `b` carries the orientation
+    // proved from the op's own `indexing_maps` by `whole_function::matmul_b_orientation`.
+    let (w_k, w_n, framing) = match b {
+        super::whole_function::BOrient::TransposeB => (w.c_len, w.r_len, "[n, k]"),
+        super::whole_function::BOrient::PlainB => (w.r_len, w.c_len, "[k, n]"),
+    };
+    if w_k != k {
         return err(format!(
-            "MatmulTile t{}: W cols {} != A cols (K) {k}",
-            out.tid, w.c_len
+            "MatmulTile t{}: W's K extent is {w_k} but A's cols (K) are {k} — W is {} x {} read as \
+             {framing}",
+            out.tid, w.r_len, w.c_len
         ));
     }
-    if w.r_len != n {
+    if w_n != n {
         return err(format!(
-            "MatmulTile t{}: W rows {} != out cols (N) {n}",
-            out.tid, w.r_len
+            "MatmulTile t{}: W's N extent is {w_n} but out cols (N) are {n} — W is {} x {} read as \
+             {framing}",
+            out.tid, w.r_len, w.c_len
         ));
     }
     if a.r_len != m {
@@ -4229,4 +4266,352 @@ mod proofs {
         let admitted = pointwise_extents_agree("p", Elementwise::Silu, &ins, &out).is_ok();
         assert_eq!(admitted, (arow, acol) == (orow, ocol));
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PER-OP ENTRY POINTS THE WHOLE-FUNCTION WALK DISPATCHES TO.
+//
+// Each is the `_at` form of an existing program: same lowering, but reading its own
+// constants off the op it is given rather than off a node that states one program for
+// the whole function. `reduce` is the bare `linalg.reduce` case, which had no door.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// [`rmsnorm`] with the epsilon SUPPLIED rather than read off the whole function.
+///
+/// ⭐ WHY THE SPLIT EXISTS — the same reason as [`scalarmul_at`]'s. [`program_rmsnorm_eps`] enforces
+/// ONE root `math.sqrt`/`math.rsqrt` in the function, which is exact for a function that IS one
+/// rmsnorm node and returns `None` for any whole kernel with two of them. `decoder_layer_fwd` has
+/// exactly two rmsnorms, so its epsilons can only be read PER CHAIN — which is what
+/// [`super::whole_function::program_rmsnorm_chains`] does, at the `arith.addf` each chain owns.
+///
+/// The body below is shared, so the two doors cannot drift about what an rmsnorm EMITS.
+pub fn rmsnorm_at(
+    name: &str,
+    eps: f32,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x, gamma and the output — the parameters `KtirFunc::rmsnorm` mints. Its constants are
+    // immediates, so none of them is a parameter.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
+    let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
+        message: format!(
+            "RmsNorm {name}: epsilon {eps}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor adds it as a bound `[1,1]` const, so \
+             the value the program uses must have a registry slot (registry desync)"
+        ),
+    })?;
+    check_pointwise_cols(out.c_len, "RmsNorm", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    // rms_norm_eps (config) flows via the scalarmul registry (compute_bundle_layout collected it) —
+    // the same reserved `[1,1]` const `subtile→superdsc` adds to the mean-of-squares.
+    let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
+    let x = tensors[0].name();
+    let gamma = tensors[1].name();
+    let t = out.tid;
+    Ok(assemble_rmsnorm(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        &gamma,
+        PlaceId::Act(t),
+        &eps_const,
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// [`scalarmul`] with the multiplier SUPPLIED rather than read off the whole function.
+///
+/// ⭐ WHY THE SPLIT EXISTS. [`program_scalarmul_scale`] reads EVERY `arith.mulf` in the function and
+/// requires them all to agree — exact for a function that IS one scalarmul node, which is what
+/// `KtirFunc` emits. A whole-kernel function is a different shape: one decoder layer holds 21
+/// `arith.mulf`, most with no splat at all and the splatted ones carrying FOUR different constants
+/// (`INV_D`, `QK_SCALE`, and `RM` twice). The whole-function reader necessarily returns `None` there,
+/// so a per-op caller must state the scale it PROVED for THAT op. The proving stays with the caller
+/// ([`super::whole_function::splat_scale_of`]), which is where the op is; this body's job is the
+/// descriptor.
+///
+/// Everything below is unchanged and shared, so the two doors cannot drift about what a scalarmul
+/// EMITS — only about where its number came from.
+pub fn scalarmul_at(
+    name: &str,
+    scale: f32,
+    // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
+    // answer, so the whole-function door and the per-`Program` door cannot disagree about whether a
+    // node gathers.
+    gather: Option<Gather>,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
+    // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
+    // than by relaxing the count. See [`split_out_excluding`].
+    let skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
+    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
+    let idx = scale_slot(layout, scale).ok_or_else(|| Error {
+        message: format!(
+            "ScalarMul {name}: multiplier {scale}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor multiplies by a bound `[1,1]` const, so \
+             the value the program uses must have a registry slot (registry desync)"
+        ),
+    })?;
+    let x = ins[0].name();
+    let out_name = out.name();
+    let rows = node_rows(name, &out)?;
+    // DEVICE width (the padding invariant): a ScalarMul on the padded logits `[.,49159]` must use the SAME
+    // device width its producer matmul emitted (49664), not the logical 49159 (whose sub-stick 7 the dxp
+    // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
+    // for 64-aligned tensors (residual/embedding [.,4096]).
+    //
+    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — capped at the width the OUTPUT's placement
+    // actually holds. See [`pointwise_width_the_output_holds`].
+    let cols = pointwise_width_the_output_holds(
+        layout,
+        &[&out_name, &x],
+        rows,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    );
+    let scale_name = crate::place::act_name(scalarmul_scale_tid(idx));
+    let op_name = format!("scalarmul_o{}", out.tid);
+    let x_h = rbo(&x);
+    let scale_h = rbo(&scale_name);
+    let inputs = [In::full(&x_h).ew(), In::scalar(&scale_h).ew()];
+    // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
+    // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
+    let mut tile_op = pointwise_tile_op(rows, cols, 2);
+    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
+    // ⭐⭐⭐ THE GATHERED FORM IS THE SAME OP WITH AN INDEX OPERAND ON ITS FIRST INPUT — not a different
+    // `opFuncName`. The shipped `dxp/test/test_gather_1core/sdsc_1.json` is an ordinary `identity`
+    // carrying one extra `labeledDs_` and one extra `computeOp_` field, so nothing about the multiply
+    // changes; `assemble_pointwise_broadcast_gather` adds the index and forces the single-core plan the
+    // gather's base-address rule requires.
+    //
+    // ⛔ AND THE PROGRAM'S OWN ENTRY COUNT IS CHECKED AGAINST THE DESCRIPTOR'S ROW COUNT, because the
+    // two are the same fact stated twice: one index per gathered row. The index vector is described
+    // rank-1 over the op's `mb`, so a program whose indirect tile takes a different number of entries
+    // than the node has rows would be described with an index vector of the WRONG LENGTH — and the
+    // length is what the idx→address program iterates.
+    if let Some(g) = gather {
+        if g.value_tid != ins[0].tid {
+            return err(format!(
+                "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
+                 operand must sit immediately after the tensor it indexes, so a gather of a tensor this \
+                 op does not read has no position in the descriptor.",
+                g.value_tid, ins[0].tid,
+            ));
+        }
+        // ⛔⛔⛔ THE GATHER'S ENTRIES MUST **TILE** THE NODE, AND THE INDEX BUFFER MUST HOLD ONE INDEX
+        // PER NODE ROW. Two separate facts, and neither is the other.
+        //
+        // The program states ONE work item: `embedding.py` reads `start_m = tl.program_id(0)` and takes a
+        // `[BLOCK_M, D_MODEL]` tile, so its indirect access tile says BLOCK_M entries. [`node_rows`]
+        // meanwhile reports the OUTPUT VIEW's full row extent, because that is what the emitted
+        // descriptor spans — the same fold every other body here performs (a row-blocked program states
+        // `ceil(m/blk)` windows and one descriptor computes all of them). So the two numbers differ by
+        // exactly the grid, and requiring them EQUAL would refuse the fold rather than check it.
+        //
+        // What has to hold instead is that the work items TILE the node (`rows % entries == 0`), exactly
+        // as `node_rows` requires of the store windows — and, because the index operand is described
+        // rank-1 over the op's `mb`, that the INDEX BUFFER really holds `rows` indices. That second one
+        // is the load-bearing check: the descriptor makes the idx→address program iterate `mb`
+        // addresses, so an id buffer shorter than the node's rows would convert past its own end and
+        // gather from whatever follows it. It is read off the index parameter's OWN view, which is the
+        // only statement of that buffer's length anywhere in the program.
+        if g.entries == 0 || !rows.is_multiple_of(g.entries) {
+            return err(format!(
+                "{name}: the indirect access tile takes {} entries and the node writes {rows} row(s), \
+                 which {} does not divide. The emitted descriptor spans the whole node, so the work \
+                 items have to TILE it — the same obligation `node_rows` puts on the store windows.",
+                g.entries, g.entries,
+            ));
+        }
+        let idx_r = r.iter().find(|x| x.tid == g.index_tid).ok_or_else(|| Error {
+            message: format!(
+                "{name}: the program gathers through t{}, which is not one of this node's parameters — \
+                 an index buffer with no binding has no placement and no stated length",
+                g.index_tid
+            ),
+        })?;
+        let idx_len = (idx_r.v_rows as u64) * (idx_r.v_cols as u64);
+        if idx_len != rows as u64 {
+            return err(format!(
+                "{name}: the index buffer t{} states a `[{}, {}]` view — {idx_len} index(es) — while \
+                 this descriptor gathers {rows} row(s). The index operand is described rank-1 over the \
+                 op's `mb`, so dbo's idx→address program converts exactly {rows} entries: a shorter \
+                 buffer is read past its end and the surplus rows gather from whatever is placed next. \
+                 Emit one node per work item, or bind an index buffer covering the node.",
+                g.index_tid, idx_r.v_rows, idx_r.v_cols,
+            ));
+        }
+        // ⭐ THE STRUCT FORM, which is how this door takes its arguments as of the merged gather
+        // (#92): eleven positional parameters became one named record, and the index's position is
+        // `gathered_input` rather than a bare index.
+        return crate::emit::assemble_pointwise_broadcast_gather(
+            crate::emit::PointwiseGather {
+                op_name: &op_name,
+                tile_op: &tile_op,
+                op_func: "multiply",
+                rows,
+                cols,
+                inputs: &inputs,
+                gathered_input: 0,
+                index_name: &crate::place::act_name(g.index_tid),
+                o: &rbo(&out_name),
+            },
+            sym_id_base,
+            layout,
+        )
+        .map(|op| vec![op])
+        .map_err(Error::from);
+    }
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &op_name,
+        &tile_op,
+        "multiply",
+        rows,
+        cols,
+        &inputs,
+        &rbo(&out_name),
+        0,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// A BARE ROW REDUCTION — `[rows, cols]` → `[rows, 1]`, one `sfp` op along the stick axis.
+///
+/// ⭐ THE ASSEMBLER WAS ALREADY WRITTEN; WHAT WAS MISSING WAS A DOOR — the same story as
+/// [`transpose`]. `assemble_reduce` / `assemble_reduce_seeded` have carried the `sum`/`max`/`mean`
+/// reduce since the SubtileIR path, and `assemble_rmsnorm` calls them, but only from INSIDE a fused
+/// kind. A producer whose program states a bare `linalg.reduce` — every Triton `tl.sum(x, 1)` or
+/// `tl.max(x, 1)` that is not part of a recognised rmsnorm — had no entry point at all.
+///
+/// # ⛔⛔⛔ A WIDE MULTI-ROW MAX IS REFUSED — THE SHARPEST SILENT WRONG ANSWER IN THIS FILE
+///
+/// Inside `rows > 1` **AND** a reduced extent past ONE STICK, an on-card reduce-MAX mis-combines the
+/// per-stick partial maxima and hands back the SEED. That LOWERS, BAKES, produces a well-formed
+/// descriptor and exits 0 under `dxp_standalone`, which executes no arithmetic — so nothing in the
+/// compile path can see it, and a softmax built on it computes `exp(x - 0)` for every row. It is
+/// refused BY NAME instead.
+///
+/// ## ⭐⭐⭐ IT IS THE CONJUNCTION, AND EACH SINGLE-AXIS READING HAS A SHIPPING COUNTER-EXAMPLE
+///
+/// Exactly ONE diagnostic ever measured this defect — `mxp = 0` over `[nqh, cap]` — and it moved the row
+/// count AND the width off their safe values TOGETHER, so on its own it cannot attribute the failure to
+/// either. Both single-axis readings were written down in this tree, and each is refuted by a different
+/// piece of hardware-proven emission:
+///
+/// * **"`rows > 1` is the defect"** — refuted by [`attn.rs`](crate::ir::bridge::tiled_op_sdsc_op::attn),
+///   which records a per-row split TRIED AND REVERTED (2026-07-28) after direct comparison against the
+///   old proven flash-decode's `attn_bmax{b}_o{t}`: that code reduces MAX at `rows = nqh` (> 1) with
+///   `width` one stick, on real hardware, at 31 tok/s. Its `assemble_attn_block` `width` parameter states
+///   the safe regime and names the two other 64s it must not be confused with — "one stick for every live
+///   caller; `mq_pad` and the head dim are the other 64s it must not silently become".
+/// * **"`cols` past one stick is the defect"** — refuted by [`ktir_matmul_fp8`](crate::emit::ktir_matmul_fp8)'s
+///   `fq_amax_op`, the fp8 activation-quantize amax on EVERY fp8 matmul of every layer: it reduces MAX
+///   over the FULL hidden width `k` (2048/4096 — many sticks). At decode `m == 1` and that is the same
+///   rank-3 flat emission this door produces, proven on card at 41 tok/s.
+///
+/// What the broken cell has that neither counter-example has is BOTH at once, and the conjunction is
+/// already named twice in the tree: `reduce.rs`'s `stickmajor` branch fires at exactly
+/// `rows > 1 && cols > 64`, and `ktir_matmul_fp8.rs` calls that regime "scrambled at rows>1 AND
+/// cols>64". Two readers each took half of it.
+///
+/// ## THE REMEDY IS TO TILE THE REDUCTION, NOT TO SPLIT ROWS
+///
+/// A genuinely wide max is tiled to one stick and combined — which is what `attention_flash.py` and
+/// `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a CORRECTNESS constraint. It is NOT split into one reduce
+/// per row: that is the experiment `attn.rs` reverted, measured on hardware as zero behavioural change,
+/// and it costs `rows` descriptors per softmax for nothing.
+///
+/// `Sum` combines correctly multi-row at any width, and `Max` is correct at `rows == 1` (any width) and
+/// at one stick (any row count) — the decoder's `[64, 64]` softmax is the latter, so it lowers.
+pub fn reduce(
+    name: &str,
+    kind: crate::ktir_node::ReduceKind,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ktir_node::ReduceKind;
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let data = ins[0];
+    // The REDUCED extent is the data's column span and the result is one column per row. Read the
+    // shape off the DATA rather than the output, so `rows` and `cols` cannot both come from the same
+    // region and agree vacuously.
+    let (rows, cols) = (data.r_len, data.c_len);
+    if rows == 0 || cols == 0 {
+        return err(format!(
+            "{name}: reducing t{} `[{rows}, {cols}]` — a reduce needs a non-empty tile",
+            data.tid
+        ));
+    }
+    // ⛔⛔⛔ THE MEASURED DEVICE DEFECT, FIRST, so no other complaint can mask it.
+    //
+    // THE STICK WIDTH COMES FROM THE DATA FORMAT, NOT FROM A LITERAL 64. This door emits through
+    // `assemble_reduce_seeded` → `reduce_opspec`, the fp16 wrapper, so the reduced axis is an
+    // fp16 `StickExtent` and `Df::Fp16` is the format to ask. Asking it through
+    // `Df::elems_per_stick` (which defers to the type-level `DataFormat::ELEMS_PER_STICK`, the single
+    // source of truth) is what makes fp32's 32 and fp8/int8's 128 come out right BY CONSTRUCTION if a
+    // non-fp16 reduce is ever routed here — a literal would be silently wrong for three of the five
+    // formats, and a comment saying "64 is fp16's stick" would not travel with the code.
+    let stick = Df::Fp16.elems_per_stick();
+    if matches!(kind, ReduceKind::Max) && rows > 1 && cols > stick {
+        return err(format!(
+            "{name}: a `max` reduce over t{}'s {cols} columns × {rows} rows is REFUSED, and not \
+             because it cannot be described. THE REFUSED CELL IS THE CONJUNCTION: `rows > 1` AND a \
+             reduced extent past ONE STICK ({stick} elements at fp16). Inside it the on-card \
+             reduce-MAX mis-combines the per-stick partial maxima and hands back THE SEED, so this \
+             would emit a well-formed descriptor, bake, exit 0 under `dxp_standalone` (which executes \
+             no arithmetic), and return that seed for all {rows} rows — a softmax built on it computes \
+             `exp(x - 0)`, silently.              DO NOT READ THIS AS EITHER AXIS ALONE; each single-axis reading has a shipping, \
+             hardware-proven counter-example. `rows > 1` is NOT the defect: \
+             `ir/bridge/tiled_op_sdsc_op/attn.rs`'s `attn_bmax` reduces MAX at `rows = nqh > 1` with \
+             `width` one stick at 31 tok/s on card, and that file records a per-row split TRIED AND \
+             REVERTED (2026-07-28) against exactly that comparison. A width past one stick is NOT the \
+             defect either: `emit/ktir_matmul_fp8.rs`'s `fq_amax_op` reduces MAX over the whole hidden \
+             width `k` (2048/4096, many sticks) on every fp8 matmul, and at decode (`m == 1`) that is \
+             this same rank-3 flat emission at 41 tok/s. Only BOTH AT ONCE is broken, which is why the \
+             one diagnostic that measured it (`mxp=0` over `[nqh,cap]`) could not tell the axes apart.              THE REMEDY: tile the reduction to ONE STICK and combine the partials — which is what \
+             `attention_flash.py` and `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a correctness \
+             constraint — or reduce with `sum`, which combines correctly multi-row at any width. It is \
+             NOT to split rows: that is the reverted experiment, measured on hardware as zero \
+             behavioural change, and it costs {rows} descriptors per softmax for nothing.",
+            data.tid
+        ));
+    }
+    // A `[rows, 1]` accumulator: the reduce writes one value per row.
+    if out.c_len != 1 {
+        return err(format!(
+            "{name}: the reduce's output t{} is `[{}, {}]`, but a row reduction along the stick axis \
+             writes ONE value per row — `[{rows}, 1]`. An output wider than one column would leave \
+             every column but the first holding whatever the buffer held.",
+            out.tid, out.r_len, out.c_len
+        ));
+    }
+    if out.r_len != rows {
+        return err(format!(
+            "{name}: the reduce reads {rows} row(s) of t{} and writes {} row(s) of t{} — a row \
+             reduction writes exactly one value per row it reads",
+            data.tid, out.r_len, out.tid
+        ));
+    }
+    let op_name = format!("{}_o{}", kind.op_func(), out.tid);
+    Ok(vec![
+        crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded(
+            &op_name,
+            kind.op_func(),
+            rows,
+            cols,
+            &rb(&data.name(), rows, cols),
+            &rb(&out.name(), rows, 1),
+            sym_id_base,
+            layout,
+        ),
+    ])
 }

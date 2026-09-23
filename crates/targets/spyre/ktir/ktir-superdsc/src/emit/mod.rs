@@ -47,6 +47,12 @@ pub mod ktir_matmul_fp8;
 /// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
 /// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
+/// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
+/// compute op to the per-kind entry point that already lowers it. A producer that hands over a
+/// whole kernel (a Triton-derived `IRFunction` holding an MLP's two projections and its silu, or a
+/// decoder layer's twelve `linalg.matmul`s) has no door otherwise: stating one `Program` for such a
+/// function is refused by arity, correctly, and there is nothing else to state.
+pub mod whole_function;
 
 /// REAL per-core HBM start addresses for one tensor's allocate node (task #50 —
 /// replaces the former same-base-for-all-cores stub). Each core `c` gets:
