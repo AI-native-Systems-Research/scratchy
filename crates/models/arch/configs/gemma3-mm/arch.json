@@ -1,0 +1,40 @@
+{
+  "_comment": "Gemma3-MM SigLIP vision tower. `params` field name = the bound name the DSL / weights.json reference; `from` paths index the VERBATIM HF `Gemma3ForConditionalGeneration` config.json (the configs here carry it byte-for-byte). SigLIP uses a learned absolute pos-embed and no rope at all -> `vision_rope_half_dim = 0`. Reproduces the old `VisionFamily::Gemma3` derivation (keys hidden_size/num_hidden_layers/num_attention_heads/num_channels; temporal/merge absent -> default 1; pool chain off image_size / mm_tokens_per_image; d_model = text_config.hidden_size). ORDER MATTERS: `expr` entries read bounds that earlier entries defined. SigLIP block norms read `vision_config.layer_norm_eps`, which is 1e-6 for every gemma3 checkpoint — the parse default (1e-6) already matches, so no `vision_norm_eps` is declared. `scale_dtype` governs ONLY the MM projector's `mm_soft_emb_norm` (rmsnorm(x, w+1.0) -> ScalarOffsetRmsNorm), which ships a BF16 gain in the mlx repacks; the `_s_<dtype>_` symbol must read it as bf16 (the f16 default mis-decodes -> garbled projection). The SigLIP block LayerNorms use the separate layer_norm_bias kernel (gain read as activation dtype), so this does not affect them. `vision_patch_embed_flatten.channels_last`: mlx_vlm-converted checkpoints store the SigLIP patch_embedding conv CHANNELS-LAST `[E, kh, kw, C]` (verified shape `[1152,14,14,3]`) while the pixel packing is channels-FIRST `(C, kh, kw)` (verified: scratchy pixels == mlx pixels at cos 1.0 in (c,kh,kw) order), so the weight is permuted to channels-first to match. HF-native Conv2d weights are already `[E,C,kh,kw]` and would need `false`; metal serves the mlx repacks. The fingerprint dim is 1 because the SigLIP->text projector matrix is `[vision_embed_dim, d_model]`.",
+  "scale_dtype": "bf16",
+  "vision_safetensors_layout": {
+    "default_root": "vision_tower.vision_model",
+    "layered_subpath": "encoder.layers",
+    "subtrees": { "mm": "multi_modal_projector" }
+  },
+  "vision_d_model_fingerprint": {
+    "key": "multi_modal_projector.mm_input_projection_weight",
+    "dim": 1
+  },
+  "vision_patch_embed_flatten": {
+    "key": "vision_tower.vision_model.embeddings.patch_embedding.weight",
+    "leading_dim": 0,
+    "channels_last": true
+  },
+  "params": [
+    { "name": "vision_embed_dim", "from": "vision_config.hidden_size" },
+    { "name": "vision_depth", "from": "vision_config.num_hidden_layers" },
+    { "name": "vision_num_heads", "from": "vision_config.num_attention_heads" },
+    { "name": "vision_in_chans", "from": "vision_config.num_channels" },
+    { "name": "vision_patch_size", "from": "vision_config.patch_size" },
+    { "name": "vision_temporal_patch_size", "from": "vision_config.temporal_patch_size", "default": 1 },
+    { "name": "vision_spatial_merge_size", "from": "vision_config.spatial_merge_size", "default": 1 },
+    { "name": "vision_head_dim", "expr": "vision_embed_dim / vision_num_heads" },
+    { "name": "vision_in_features", "expr": "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size" },
+    { "name": "vision_merge_factor", "expr": "vision_spatial_merge_size * vision_spatial_merge_size" },
+    { "name": "vision_merge_hidden", "expr": "vision_embed_dim * vision_spatial_merge_size * vision_spatial_merge_size" },
+    { "name": "vision_rope_half_dim", "value": 0 },
+    { "name": "vision_mlp_hidden", "from": "vision_config.intermediate_size" },
+    { "name": "vision_image_size", "from": "vision_config.image_size" },
+    { "name": "vision_patch_grid_side", "expr": "vision_image_size / vision_patch_size" },
+    { "name": "vision_num_positions", "expr": "vision_patch_grid_side * vision_patch_grid_side" },
+    { "name": "vision_pooled_tokens", "from": "mm_tokens_per_image" },
+    { "name": "vision_pool_factor", "expr": "vision_num_positions / vision_pooled_tokens" },
+    { "name": "vision_pool_kernel", "expr": "sqrt(vision_pool_factor)" },
+    { "name": "d_model", "from": "text_config.hidden_size" }
+  ]
+}

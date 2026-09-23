@@ -1,0 +1,34 @@
+{
+  "_comment": "Qwen3.5-VL vision tower. `params` field name = the bound name the DSL / weights.json reference; `from` paths index the VERBATIM HF `Qwen3_5ForConditionalGeneration` config.json (the configs here carry it byte-for-byte). Rotary tower: `rope_half_dim = head_dim / 2`. Reproduces the old `VisionFamily::Qwen3_5Vl` derivation (keys hidden_size/depth/num_heads/in_channels; temporal/merge default to 1 only when absent — both present here). ORDER MATTERS: `expr` entries read bounds that earlier entries defined. Qwen3.5 vision blocks hardcode 1e-6 in the modeling code (transformers / mlx-vlm); the old spec carried `norm_eps_key: None` -> 1e-6 default, which the parse default already supplies, so no `vision_norm_eps` is declared. The learned pos-embed table is interpolated host-side per forward (`fast_pos_embed_interpolate`, bilinear default — so no `vision_pos_emb_interp`). MLX-converted checkpoints ship the 5D conv weight channels-LAST; `try_load_mm` sniffs the actual layout at load, so `channels_last` only marks \"may need the permute\".",
+  "vision_safetensors_layout": {
+    "default_root": "vision_tower",
+    "layered_subpath": "blocks",
+    "subtrees": {}
+  },
+  "vision_d_model_fingerprint": {
+    "key": "vision_tower.merger.linear_fc2.weight",
+    "dim": 0
+  },
+  "vision_patch_embed_flatten": {
+    "key": "vision_tower.patch_embed.proj.weight",
+    "leading_dim": 0,
+    "channels_last": true
+  },
+  "vision_pos_embed_key": "vision_tower.pos_embed.weight",
+  "params": [
+    { "name": "vision_embed_dim", "from": "vision_config.hidden_size" },
+    { "name": "vision_depth", "from": "vision_config.depth" },
+    { "name": "vision_num_heads", "from": "vision_config.num_heads" },
+    { "name": "vision_in_chans", "from": "vision_config.in_channels" },
+    { "name": "vision_patch_size", "from": "vision_config.patch_size" },
+    { "name": "vision_temporal_patch_size", "from": "vision_config.temporal_patch_size", "default": 1 },
+    { "name": "vision_spatial_merge_size", "from": "vision_config.spatial_merge_size", "default": 1 },
+    { "name": "vision_head_dim", "expr": "vision_embed_dim / vision_num_heads" },
+    { "name": "vision_in_features", "expr": "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size" },
+    { "name": "vision_merge_factor", "expr": "vision_spatial_merge_size * vision_spatial_merge_size" },
+    { "name": "vision_merge_hidden", "expr": "vision_embed_dim * vision_spatial_merge_size * vision_spatial_merge_size" },
+    { "name": "vision_rope_half_dim", "expr": "vision_head_dim / 2" },
+    { "name": "vision_mlp_hidden", "from": "vision_config.intermediate_size" },
+    { "name": "d_model", "from": "vision_config.out_hidden_size" }
+  ]
+}

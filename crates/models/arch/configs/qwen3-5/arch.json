@@ -1,0 +1,6 @@
+{
+  "_comment": "Qwen3.5 checkpoints ship BF16 RMSNorm gains (Qwen3-family convention) — the metal gain-reader symbols must match. Qwen3.5 `*RMSNorm` stores zero-centered gains (`x * (1 + w)`); scratchy keeps the on-disk form and offsets in-kernel. All Qwen3.5 checkpoints are `Qwen3_5*ForConditionalGeneration` wrappers nesting the text decoder under `language_model.*`.",
+  "scale_dtype": "bf16",
+  "bound_defaults": { "rms_norm_zero_centered": 1 },
+  "decoder_safetensors_prefix": "language_model"
+}

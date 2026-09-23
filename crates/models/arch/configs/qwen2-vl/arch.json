@@ -1,0 +1,35 @@
+{
+  "_comment": "Qwen2-VL vision tower. `params` field name = the bound name the DSL / weights.json reference; `from` paths index the VERBATIM HF config.json's nested `vision_config` block (the configs here carry it byte-for-byte). Tower geometry uses the Qwen2-VL key spellings (`embed_dim` / `depth` / `num_heads` / `in_chans`); MLP width is a ratio (an integer in every shipped Qwen2-VL config), so `vision_mlp_hidden = embed * ratio`. ORDER MATTERS: `expr` entries read bounds that earlier entries defined. Qwen2-VL vision blocks hardcode 1e-6 in the modeling code (transformers / mlx-vlm) and the macro default is 1e-6 too — `vision_norm_eps` is stated here for the record, and the per-checkpoint flat override still wins.",
+  "vision_norm_eps": 1e-6,
+  "vision_safetensors_layout": {
+    "default_root": "visual",
+    "layered_subpath": "blocks",
+    "subtrees": {}
+  },
+  "vision_d_model_fingerprint": {
+    "key": "visual.merger.mlp.2.weight",
+    "dim": 0
+  },
+  "vision_patch_embed_flatten": {
+    "key": "visual.patch_embed.proj.weight",
+    "leading_dim": 0,
+    "channels_last": false
+  },
+  "params": [
+    { "name": "vision_embed_dim", "from": "vision_config.embed_dim" },
+    { "name": "vision_depth", "from": "vision_config.depth" },
+    { "name": "vision_num_heads", "from": "vision_config.num_heads" },
+    { "name": "vision_in_chans", "from": "vision_config.in_chans" },
+    { "name": "vision_patch_size", "from": "vision_config.patch_size" },
+    { "name": "vision_temporal_patch_size", "from": "vision_config.temporal_patch_size", "default": 1 },
+    { "name": "vision_spatial_merge_size", "from": "vision_config.spatial_merge_size", "default": 1 },
+    { "name": "vision_head_dim", "expr": "vision_embed_dim / vision_num_heads" },
+    { "name": "vision_in_features", "expr": "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size" },
+    { "name": "vision_merge_factor", "expr": "vision_spatial_merge_size * vision_spatial_merge_size" },
+    { "name": "vision_merge_hidden", "expr": "vision_embed_dim * vision_merge_factor" },
+    { "name": "vision_rope_half_dim", "expr": "vision_head_dim / 2" },
+    { "name": "vision_mlp_ratio", "from": "vision_config.mlp_ratio" },
+    { "name": "vision_mlp_hidden", "expr": "vision_embed_dim * vision_mlp_ratio" },
+    { "name": "d_model", "from": "vision_config.hidden_size" }
+  ]
+}

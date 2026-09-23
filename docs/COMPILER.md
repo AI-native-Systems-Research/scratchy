@@ -114,11 +114,15 @@ with projected patch embeddings spliced into the language token sequence and
 All arches share the one `scratchy-models` crate (`crates/models/arch/`):
 
 1. Write the math as one `#[forward(...)]` (or `#[vision_forward(...)]`) carrier
-   in `crates/models/arch/dsl/<arch>.rs.in`.
+   in `crates/models/arch/dsl/<arch>.rs.in`. The carrier is a bare
+   `fn <arch>()` and its body is the math — nothing else goes in this file.
 2. Drop the verbatim HuggingFace `config.json` for each model size into
    `crates/models/arch/configs/<arch>/`.
-3. Add a `weights.json` only for weight shapes dataflow can't infer, and an
-   optional `quantizations.json` to opt into presets.
+3. Add a `weights.json` only for weight shapes dataflow can't infer, an
+   optional `arch.json` for anything about the arch the configs don't already
+   say (safetensors layout, gain dtype, bound defaults, the vision `params`
+   schema — see [`MODELS.md`](MODELS.md)), and an optional
+   `quantizations.json` to opt into presets.
 4. Add the `arch-<name>` feature (and list it under `all-arches`) plus one
    `<stem> = ["arch-<name>"]` feature per config (no `model-` text prefix —
    `crates/cli/scr/Cargo.toml` reaches it as `model/<stem>` via the `model`

@@ -1,0 +1,23 @@
+{
+  "_comment": "Checkpoints ship BF16 RMSNorm gains / affine scales+biases. Text weights live under `language_model.model.*`. Long-context family (>=128k); size the KV block table for 32k. The global attention class shares its on-disk projection/norm leaves with the sliding class (same disk tensor, wider head). The MoE sandwich norms ship on disk with trailing `_1`/`_2` (`post_feedforward_layernorm_1`, etc) — a trailing `_<digit>` in a DSL leaf is read as a LAYER INDEX (`translate_digit_suffix`), so the DSL names them `_dense`/`_moe` and renames to the digit leaves here (same workaround as LocateAnything's `linear_1`/`linear_2`). mlx sets `scale = 1.0` for BOTH attention classes. Rope scalars are nested per attention class under `rope_parameters`; `top_k_experts` is gemma's name for the canonical `num_experts_per_tok`.",
+  "scale_dtype": "bf16",
+  "decoder_safetensors_prefix": "language_model",
+  "bound_defaults": { "max_blocks_per_seq": 2048 },
+  "scalar_defaults": { "attention_multiplier": 1.0 },
+  "weight_leaf_renames": {
+    "self_attn.k_norm_global": "self_attn.k_norm",
+    "self_attn.k_proj_global": "self_attn.k_proj",
+    "self_attn.o_proj_global": "self_attn.o_proj",
+    "self_attn.q_norm_global": "self_attn.q_norm",
+    "self_attn.q_proj_global": "self_attn.q_proj",
+    "post_feedforward_layernorm_dense": "post_feedforward_layernorm_1",
+    "post_feedforward_layernorm_moe": "post_feedforward_layernorm_2",
+    "pre_feedforward_layernorm_moe": "pre_feedforward_layernorm_2"
+  },
+  "config_aliases": {
+    "global_partial_rotary_factor": "rope_parameters.full_attention.partial_rotary_factor",
+    "rope_local_base_freq": "rope_parameters.sliding_attention.rope_theta",
+    "rope_theta": "rope_parameters.full_attention.rope_theta",
+    "num_experts_per_tok": "top_k_experts"
+  }
+}
