@@ -35,6 +35,7 @@ CHAPTERS = [
 ]
 BLOG_CHAPTERS = [
     ("What “Reuse” Means in the Age of AI", "docs/blogs/REUSE.md", "blogs/REUSE"),
+    ("Systems Must Evolve to be Compilers", "docs/blogs/EVOLVE.md", "blogs/EVOLVE"),
 ]
 ALL_CHAPTERS = CHAPTERS + BLOG_CHAPTERS
 
