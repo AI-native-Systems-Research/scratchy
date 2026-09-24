@@ -67,13 +67,19 @@ mod interpreter_codegen;
 #[cfg(feature = "metal")]
 mod opcode_shapes;
 mod parse;
-#[cfg(test)]
+// The Python costume: `ruff_python_parser` → the same `Ast` the Rust
+// costume produces. Not test-gated — `scratchy-forwards.rs` (the
+// scratchy-models build driver) compiles every `dsl/*.py` carrier
+// through it.
 mod parse_python;
 mod quantization;
 // Exposed so build scripts (`hf_registry_build.rs`) can parse a Hub
 // candidate's OWN `quantization_config` with the exact same logic that
 // decides what a checkpoint means at compile time — not a second,
 // drifting copy of "what counts as e.g. 4-bit affine".
+/// The Python costume's front end, exposed for the `scratchy-forwards`
+/// build driver in scratchy-models.
+pub use parse_python::{PythonCarrier, parse_python_file};
 pub use quantization::{ParseError, QuantMethod, QuantizationConfig};
 mod render;
 /// The build script's other half: `compile_in_dir` makes the tokens,
@@ -118,14 +124,16 @@ pub struct ForwardArgs {
     /// axis unused"). Declare this for models where attention
     /// dispatch wants to pick different kernels at different KV
     /// spans — e.g. FlashInfer decode wins on long sk, FA2 wins at
-    /// small prefill.
-    sk_buckets: Vec<u64>,
+    /// small prefill. `pub` since the `scratchy-forwards` build
+    /// driver sets it from the `.py` carrier's decorator metadata.
+    pub sk_buckets: Vec<u64>,
     /// Path to the per-arch CPU pixel-pack fn. Required for
     /// `#[vision_forward]`, ignored by `#[forward]`. The fn signature
     /// must match `fn(&VisionConfig, &[f32], u32, u32) -> (Vec<u16>,
     /// (u32, u32, u32))`. The macro-emitted `VisionArchWeights` impl
     /// forwards its `pixel_pack` associated fn to this path.
-    pixel_pack: Option<syn::Path>,
+    /// `pub` for the build driver, same reason as `sk_buckets`.
+    pub pixel_pack: Option<syn::Path>,
     /// Path to a `pub const PROCESSOR: scratchy_vision::MmMetadata` in
     /// the per-arch crate declaring CPU-side host preprocessing
     /// metadata (placeholder token id key, size policy, tokens-per-
@@ -133,7 +141,8 @@ pub struct ForwardArgs {
     /// ignored by `#[forward]`. Baked into every emitted
     /// `ScratchyMmRegistration` row. scratchy stays arch-agnostic — every
     /// arch-specific knob is data on the const, not a switch in scratchy.
-    processor: Option<syn::Path>,
+    /// `pub` for the build driver, same reason as `sk_buckets`.
+    pub processor: Option<syn::Path>,
     /// Span used for error reporting when a required arg is
     /// missing.
     pub span: Span,
@@ -598,11 +607,11 @@ pub fn compile_in_dir(
 /// The whole pipeline from an already-parsed [`ast::Ast`] — the
 /// convergence point where every carrier costume meets: the Rust DSL
 /// reaches it via [`parse::parse_block`], the Python costume via
-/// [`parse_python`] (which produces the SAME `Ast` types), and
-/// everything from classify down cannot tell which costume a file
-/// wore. `pub` in crate terms only — it exists for the costume-equivalence
-/// test and the emit_arch driver, not for macro users.
-fn compile_ast(
+/// [`parse_python::parse_python_file`] (which produces the SAME `Ast`
+/// types), and everything from classify down cannot tell which costume
+/// a file wore. `pub` for the `scratchy-forwards` build driver and the
+/// emission-equivalence test, not for macro users.
+pub fn compile_ast(
     args: &ForwardArgs,
     arch_name: &str,
     name_span: Span,

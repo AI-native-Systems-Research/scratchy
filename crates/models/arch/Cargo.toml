@@ -616,9 +616,11 @@ scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
 # `quant-<preset>` block above — quant scope moved off this crate so it can
 # get its own `quant` CLI alias, distinct from `model`).
 scratchy-quantizations = { path = "../quantization" }
-# `syn` parses the DSL carrier (`dsl/<arch>.rs.in`). It is NOT used to render
-# the emit — `render_lines` walks the token stream directly, so the emitted file
-# never round-trips through an AST (see scratchy-forwards.rs for the numbers).
+# `syn` is still used in `scratchy-forwards.rs` (ForwardArgs is a syn
+# parse target), and `proc-macro2` for the token re-rooting. The DSL
+# carrier itself is Python now — `parse_python_file` (ruff) reads it;
+# the emitted file never round-trips through an AST (see
+# scratchy-forwards.rs for the numbers).
 syn = { version = "3", features = ["full", "parsing"] }
 proc-macro2 = "1"
 serde_json = { workspace = true }
