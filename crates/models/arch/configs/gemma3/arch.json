@@ -1,0 +1,4 @@
+{
+  "_comment": "Gemma ties embed_tokens <-> lm_head (HF modeling default TRUE; checkpoints ship no lm_head.* on disk). An explicit config.json value wins. The CondGen (multimodal) checkpoints nest the decoder under `language_model.*` on disk — that prefix is per-config (the ForCausalLM repos don't), so it stays declared per <stem>.overrides.json.",
+  "tie_default": true
+}

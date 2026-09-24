@@ -1,0 +1,41 @@
+{
+  "_comment": "MoonViT (nvidia/LocateAnything-3B). `params` field name = the bound name the DSL / weights.json reference; `from` paths index the VERBATIM config.json (the configs here carry it byte-for-byte). The vision_config block has no channel / temporal keys (Conv2d RGB), so those are declared literally via `value`. Note `vision_config.merge_kernel_size.0` — a numeric path segment indexes a JSON array. ORDER MATTERS: `expr` entries read bounds that earlier entries defined. MoonViT block norms hardcode 1e-5 in the modeling code (mlx-vlm `locateanything/vision.py::LAYER_NORM_EPS`); the projector LayerNorm shares it. `vision_rope_style` is interleaved x/y adjacent-pair (GPT-J) rotation — validated vs the mlx golden (cosine 1.0, err 4.8e-7). The learned 64x64 pos-embed table uses torch-style bicubic (a = -0.75, align_corners = false) — golden cosine 0.999999. `vision_patch_embed_flatten.channels_last`: mlx-converted checkpoints ship the Conv2d weight channels-LAST `[E, kh, kw, C]`, so it is permuted channels-first before flattening to pair with the `(c, h, w)` patch packing. `weight_leaf_renames`: the projector's `linear_1`/`linear_2` disk leaves are unnameable in the DSL (a trailing `_<digit>` reads as a layer index), so `mm.proj_in`/`mm.proj_out` fold back here.",
+  "vision_norm_eps": 1e-5,
+  "vision_rope_style": "interleaved_xy",
+  "vision_pos_emb_interp": "bicubic",
+  "vision_pos_embed_key": "vision_tower.patch_embed.pos_emb.weight",
+  "vision_safetensors_layout": {
+    "default_root": "vision_tower",
+    "layered_subpath": "blocks",
+    "subtrees": { "mm": "multi_modal_projector" }
+  },
+  "vision_d_model_fingerprint": {
+    "key": "multi_modal_projector.linear_2.weight",
+    "dim": 0
+  },
+  "vision_patch_embed_flatten": {
+    "key": "vision_tower.patch_embed.proj.weight",
+    "leading_dim": 0,
+    "channels_last": true
+  },
+  "weight_leaf_renames": {
+    "mm.proj_in": "mm.linear_1",
+    "mm.proj_out": "mm.linear_2"
+  },
+  "params": [
+    { "name": "vision_embed_dim", "from": "vision_config.hidden_size" },
+    { "name": "vision_depth", "from": "vision_config.num_hidden_layers" },
+    { "name": "vision_num_heads", "from": "vision_config.num_attention_heads" },
+    { "name": "vision_in_chans", "value": 3 },
+    { "name": "vision_patch_size", "from": "vision_config.patch_size" },
+    { "name": "vision_temporal_patch_size", "value": 1 },
+    { "name": "vision_spatial_merge_size", "from": "vision_config.merge_kernel_size.0" },
+    { "name": "vision_head_dim", "expr": "vision_embed_dim / vision_num_heads" },
+    { "name": "vision_in_features", "expr": "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size" },
+    { "name": "vision_merge_factor", "expr": "vision_spatial_merge_size * vision_spatial_merge_size" },
+    { "name": "vision_merge_hidden", "expr": "vision_embed_dim * vision_merge_factor" },
+    { "name": "vision_rope_half_dim", "expr": "vision_head_dim / 2" },
+    { "name": "vision_mlp_hidden", "from": "vision_config.intermediate_size" },
+    { "name": "d_model", "from": "text_config.hidden_size" }
+  ]
+}

@@ -1,0 +1,5 @@
+{
+  "_comment": "Qwen3 checkpoints ship BF16 RMSNorm gains (Qwen3-family convention) — the metal gain-reader symbols must match. Qwen3 sparse-MoE routers renormalize the top-k weights; configs that omit `norm_topk_prob` default it TRUE (modeling code).",
+  "scale_dtype": "bf16",
+  "bound_defaults": { "norm_topk_prob": 1 }
+}

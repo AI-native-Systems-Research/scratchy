@@ -25,6 +25,8 @@ crates/models/arch/
     <size2>.json
     ...
     weights.json           # per-arch weight shape formulas (shared across sizes)
+    arch.json              # optional — per-arch declarations (everything about the
+                           #   arch that isn't derivable from a verbatim config.json)
     quantizations.json     # optional — preset names this arch supports
     <size>-<preset>.overrides.json  # optional — per-(size, preset) drift
 ```
@@ -53,6 +55,57 @@ crates/models/arch/
   `<size>.json` bounds belong here. For most Llama / Qwen2 / Granite
   entries, dataflow pins everything and `weights.json` is empty or
   absent.
+
+- **`arch.json`** (optional) — the arch's own declarations: everything
+  about it that is **not** derivable from a verbatim `config.json` plus
+  the DSL body, and that is the same across every size. The DSL file
+  declares the arch's *math* and nothing else, so these facts live here,
+  next to the checkpoints they describe.
+
+  Precedence, widest to narrowest — each wins field-by-field over the
+  one before it:
+
+  ```
+  <size>.json  →  arch.json  →  <size>-<preset>.overrides.json
+  (per size)      (per arch)    (per checkpoint)
+  ```
+
+  Keys reuse the same names the per-checkpoint overrides already use, so
+  there is one vocabulary for both tiers: `scale_dtype`,
+  `decoder_safetensors_prefix`, `tie_default`, `vision_norm_eps`,
+  `vision_rope_style`, `vision_pos_emb_interp`, `vision_pos_embed_key`,
+  `vision_safetensors_layout`, `vision_d_model_fingerprint`,
+  `vision_patch_embed_flatten`, plus the `{name: value}` maps
+  `bound_defaults`, `scalar_defaults`, `config_aliases`,
+  `weight_leaf_renames`. An unknown key is a build **error**, not a
+  silent no-op — a typo'd declaration would otherwise mis-emit the arch.
+
+  ```json
+  {
+    "scale_dtype": "bf16",
+    "bound_defaults": { "rms_norm_zero_centered": 1 },
+    "decoder_safetensors_prefix": "language_model"
+  }
+  ```
+
+  `params` (optional) is the bound schema vision towers need, where the
+  flat top-level harvest isn't enough — one entry per bound, each with
+  exactly one source: `from` (a dotted path into the verbatim config;
+  a numeric segment indexes an array, and `default` covers configs that
+  omit the key), `value` (a literal), or `expr` (arithmetic over bounds
+  declared *earlier*, with `*` `/` `+` `-`, parens, and `sqrt()`).
+
+  It is an **array, not an object**: `expr` entries read bounds that
+  earlier entries defined, and only a list preserves that order.
+
+  ```json
+  "params": [
+    { "name": "vision_embed_dim", "from": "vision_config.hidden_size" },
+    { "name": "vision_num_heads", "from": "vision_config.num_heads" },
+    { "name": "vision_head_dim",  "expr": "vision_embed_dim / vision_num_heads" },
+    { "name": "vision_rope_half_dim", "expr": "vision_head_dim / 2" }
+  ]
+  ```
 
 - **`quantizations.json`** (optional) — flat list of preset names
   this arch supports. Each preset cross-multiplies with every dense

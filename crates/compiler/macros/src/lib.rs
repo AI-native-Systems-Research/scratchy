@@ -443,23 +443,25 @@ pub const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048,
 /// `sk_buckets = []` for the legacy 1-D (sk-axis-unused) sweep.
 const DEFAULT_SK_BUCKETS: &[u64] = &[128, 512, 2048, 8192];
 
-/// The macro's carrier item: either the bare `fn` form (standard
-/// arches — flat verbatim-HF harvest, no declarations) or the `mod`
-/// form, whose items the macro CONSUMES as the arch's declaration
-/// surface (see [`arch_spec`]): exactly one `fn` (the DSL body), an
-/// optional `struct Params` (the typed bound schema), and recognized
-/// `const` items (safetensors layout, rope style, decoder prefix, …).
+/// The macro's carrier item: ONE `#[forward] fn <arch>()` whose body
+/// is the arch's math, and nothing else.
+///
+/// There is no second form. An arch's non-math facts — safetensors
+/// layout, rope style, decoder prefix, bound defaults, the `Params`
+/// bound schema — are DATA about the checkpoints, so they live with
+/// the checkpoints, in `configs/<arch>/arch.json` (read by
+/// [`config::load_arch_json`]). They used to be declared as `const`
+/// items inside a `mod` carrier, which meant the DSL file carried a
+/// config file written as fake Rust: the type ascriptions never
+/// resolved, and the macro string-matched const NAMES and scraped
+/// literals back out. The DSL declares math; the configs declare
+/// themselves.
 pub struct Carrier {
-    /// The DSL-bearing fn. In the `mod` form its name is
-    /// conventionally `forward`; the ARCH name comes from the mod.
+    /// The DSL-bearing fn; its ident names the arch.
     func: ItemFn,
-    /// Arch name: mod ident (mod form) or fn ident (bare form).
     arch_name: String,
     /// Span for error reporting anchored at the arch's name.
     name_span: Span,
-    /// The arch's parsed declarations. Default (empty) for the bare
-    /// `fn` form.
-    spec: arch_spec::DeclaredArchSpec,
 }
 
 pub fn parse_carrier(item: syn::Item) -> syn::Result<Carrier> {
@@ -471,64 +473,21 @@ pub fn parse_carrier(item: syn::Item) -> syn::Result<Carrier> {
                 func,
                 arch_name,
                 name_span,
-                spec: arch_spec::DeclaredArchSpec::default(),
             })
         }
-        syn::Item::Mod(m) => {
-            let arch_name = m.ident.to_string();
-            let name_span = m.ident.span();
-            let Some((_, items)) = m.content else {
-                return Err(syn::Error::new(
-                    name_span,
-                    "carrier mod must have an inline body",
-                ));
-            };
-            let mut spec = arch_spec::DeclaredArchSpec::default();
-            let mut func: Option<ItemFn> = None;
-            for it in items {
-                match it {
-                    syn::Item::Fn(f) => {
-                        if func.is_some() {
-                            return Err(syn::Error::new(
-                                f.sig.ident.span(),
-                                "carrier mod must contain exactly one fn (the DSL body)",
-                            ));
-                        }
-                        func = Some(f);
-                    }
-                    syn::Item::Struct(s) => {
-                        if s.ident != "Params" {
-                            return Err(syn::Error::new(
-                                s.ident.span(),
-                                "the only struct a carrier mod may declare is `Params`",
-                            ));
-                        }
-                        spec.parse_params_struct(&s)?;
-                    }
-                    syn::Item::Const(c) => spec.parse_const(&c)?,
-                    other => {
-                        return Err(syn::Error::new(
-                            name_span,
-                            format!(
-                                "carrier mod may only contain one fn, `struct Params`, \
-                                 and declaration consts — found {other:?}",
-                            ),
-                        ));
-                    }
-                }
-            }
-            let func = func
-                .ok_or_else(|| syn::Error::new(name_span, "carrier mod is missing the DSL fn"))?;
-            Ok(Carrier {
-                func,
-                arch_name,
-                name_span,
-                spec,
-            })
-        }
+        // A `mod` carrier is what the const-declaration surface used to
+        // require. Point at where those declarations go now rather than
+        // just rejecting the shape.
+        syn::Item::Mod(m) => Err(syn::Error::new(
+            m.ident.span(),
+            "#[forward] / #[vision_forward] expects a bare `fn <arch>()` carrier — \
+             the DSL declares only the arch's math. Move declarations \
+             (SAFETENSORS, SCALE_DTYPE, BOUND_DEFAULTS, `struct Params`, …) \
+             to configs/<arch>/arch.json",
+        )),
         other => Err(syn::Error::new(
             other.span(),
-            "#[forward] / #[vision_forward] expects a fn or a mod carrier",
+            "#[forward] / #[vision_forward] expects a bare `fn <arch>()` carrier",
         )),
     }
 }
@@ -644,14 +603,26 @@ pub fn compile_in_dir(
     // validation guarantees every model's bounds resolve the
     // manifest's formulas consistently, so any one model's bounds
     // suffice — we use the first (alphabetical) model.
+    // THE arch's declarations: `configs/<arch>/arch.json`. Facts about
+    // an arch that aren't derivable from a verbatim HF config.json live
+    // in that file, alongside the configs they describe — not in the
+    // DSL, which declares only the arch's MATH. Missing file → an arch
+    // that declares nothing (every fact derivable), which is the
+    // common case.
+    let spec = config::load_arch_json(models_dir).map_err(|e| {
+        syn::Error::new(
+            carrier.name_span,
+            format!("models_dir `{}`: {e}", models_dir.display()),
+        )
+    })?;
     let models = match mode.prelude {
         // `#[vision_forward]` configs are verbatim VL-wrapper HF
         // checkpoints; the vision loader derives the `vision_*`
         // bound set from the nested `vision_config` block via the
-        // carrier's declared `Params` schema instead of the
-        // decoder's flat top-level harvest.
-        classified::Prelude::Vision => config::load_dir_vision(models_dir, &carrier.spec),
-        _ => config::load_dir(models_dir, &carrier.spec),
+        // declared `Params` schema instead of the decoder's flat
+        // top-level harvest.
+        classified::Prelude::Vision => config::load_dir_vision(models_dir, &spec),
+        _ => config::load_dir(models_dir, &spec),
     }
     .map_err(|e| {
         syn::Error::new(

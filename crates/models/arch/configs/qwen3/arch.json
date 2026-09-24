@@ -1,0 +1,4 @@
+{
+  "_comment": "Qwen3 checkpoints ship BF16 RMSNorm gains (Qwen3-family convention) — the metal gain-reader symbols must match. Per-checkpoint repacks override via the same key in <stem>.overrides.json.",
+  "scale_dtype": "bf16"
+}

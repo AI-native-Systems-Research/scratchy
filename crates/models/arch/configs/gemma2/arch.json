@@ -1,0 +1,8 @@
+{
+  "_comment": "Gemma2 alternates sliding/global attention every other layer; the checkpoint configs omit the cadence field, so default the compressed `layer % pattern == remainder` form the DSL needs. Gemma also ties embed_tokens <-> lm_head (HF modeling default TRUE; checkpoints ship no lm_head.* on disk) — an explicit config.json value wins.",
+  "bound_defaults": {
+    "sliding_window_pattern": 2,
+    "sliding_window_global_remainder": 1
+  },
+  "tie_default": true
+}
