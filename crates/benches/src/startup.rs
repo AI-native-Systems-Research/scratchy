@@ -6,6 +6,14 @@
 //! Measures total startup time (model loading + KV cache allocation) for both
 //! cold (no HF cache) and warm (cached weights) scenarios by repeatedly
 //! constructing an [`LLM`] instance.
+//!
+//! SCOPE, because it is easy to reach for the wrong one: what is timed here is
+//! `LLMBuilder::build()` *in-process* (see the `Instant::now()` below). No
+//! process is exec'd, no cache is wiped, and no request is ever sent — so this
+//! cannot produce a TTFT, and its "cold" is a fresh engine object rather than a
+//! cold machine. For "how long from `exec` until the user sees a word", and for
+//! any cross-framework comparison, use `--exec` instead; the two are not
+//! comparable. See `docs/BENCHMARKING.md`.
 
 use std::time::Instant;
 
@@ -73,6 +81,14 @@ const PERCENTAGES: &[f64] = &[10.0, 25.0, 50.0, 75.0, 90.0, 99.0];
 
 pub(crate) fn run_bench_startup(args: BenchStartupArgs) -> Result<()> {
     telemetry::init_tracing(&args.log_level);
+
+    // `--exec` is a different measurement, not a variant of this one: it times a
+    // child process to its first token rather than in-process construction. It
+    // shares only the model/args surface, so hand over before any of the
+    // in-process setup below runs.
+    if args.exec_opts.exec {
+        return crate::startup_exec::run(&args);
+    }
 
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
     eprintln!("vLLM Rust — startup benchmark");

@@ -3632,6 +3632,7 @@ dependencies = [
  "csv",
  "dirs 7.0.0",
  "indicatif",
+ "libc",
  "parquet",
  "rand",
  "rand_distr",

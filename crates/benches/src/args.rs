@@ -540,6 +540,9 @@ pub struct BenchStartupArgs {
     /// Comma-separated list of batch sizes to capture as CUDA graphs.
     #[arg(long, default_value = "auto")]
     pub cuda_graph_sizes: String,
+
+    #[command(flatten)]
+    pub exec_opts: crate::startup_exec::args::ExecArgs,
 }
 
 impl BenchStartupArgs {
