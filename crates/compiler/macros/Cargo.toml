@@ -95,6 +95,8 @@ scratchy-target-spyre = { path = "../../targets/spyre", default-features = false
 # The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }
+ruff_python_ast = "0.0.14"
+ruff_python_parser = "0.0.14"
 
 [dev-dependencies]
 trybuild = "1"
