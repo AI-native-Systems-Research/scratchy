@@ -638,3 +638,6 @@ ureq = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3", features = ["MTLDevice"] }
+# bf16 logits readback in the qwen3 py-carrier parity test
+# (tests/qwen3_py_parity.rs).
+half = { workspace = true }
