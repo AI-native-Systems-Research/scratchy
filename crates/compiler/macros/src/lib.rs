@@ -67,6 +67,8 @@ mod interpreter_codegen;
 #[cfg(feature = "metal")]
 mod opcode_shapes;
 mod parse;
+#[cfg(test)]
+mod parse_python;
 mod quantization;
 // Exposed so build scripts (`hf_registry_build.rs`) can parse a Hub
 // candidate's OWN `quantization_config` with the exact same logic that
@@ -580,7 +582,35 @@ pub fn compile_in_dir(
     mode: CompileMode,
     models_dir: &std::path::Path,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let arch_name = carrier.arch_name.clone();
+    // ── Front end: parse + classify ───────────────────────────────
+    let ast = parse::parse_block(&carrier.func.block)
+        .map_err(|e| syn::Error::new(args.span, format!("parse: {e}")))?;
+    compile_ast(
+        args,
+        &carrier.arch_name,
+        carrier.name_span,
+        ast,
+        mode,
+        models_dir,
+    )
+}
+
+/// The whole pipeline from an already-parsed [`ast::Ast`] — the
+/// convergence point where every carrier costume meets: the Rust DSL
+/// reaches it via [`parse::parse_block`], the Python costume via
+/// [`parse_python`] (which produces the SAME `Ast` types), and
+/// everything from classify down cannot tell which costume a file
+/// wore. `pub` in crate terms only — it exists for the costume-equivalence
+/// test and the emit_arch driver, not for macro users.
+fn compile_ast(
+    args: &ForwardArgs,
+    arch_name: &str,
+    name_span: Span,
+    ast: ast::Ast,
+    mode: CompileMode,
+    models_dir: &std::path::Path,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let arch_name = arch_name.to_string();
 
     // `pixel_pack = path::to::fn` is OPTIONAL under VISION mode.
     // When unset, the trait's default `pixel_pack` (which delegates
@@ -590,9 +620,7 @@ pub fn compile_in_dir(
     // Override only for arches with different patch ordering
     // (SigLIP raster, etc.). Decoder mode ignores the arg if set.
 
-    // ── Front end: parse + classify ───────────────────────────────
-    let ast = parse::parse_block(&carrier.func.block)
-        .map_err(|e| syn::Error::new(args.span, format!("parse: {e}")))?;
+    // ── Front end: classify ────────────────────────────────────────
     let classified = classify::classify_with(&ast, mode.prelude)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
 
@@ -611,7 +639,7 @@ pub fn compile_in_dir(
     // common case.
     let spec = config::load_arch_json(models_dir).map_err(|e| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("models_dir `{}`: {e}", models_dir.display()),
         )
     })?;
@@ -626,7 +654,7 @@ pub fn compile_in_dir(
     }
     .map_err(|e| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("models_dir `{}`: {e}", models_dir.display()),
         )
     })?;
@@ -651,13 +679,13 @@ pub fn compile_in_dir(
             return Ok(quote! {});
         }
         return Err(syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("no *.json configs in {}", models_dir.display()),
         ));
     }
     let manifest = weights_manifest::load_or_empty(models_dir).map_err(|e| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("weights.json in {}: {e}", models_dir.display()),
         )
     })?;
@@ -722,7 +750,7 @@ pub fn compile_in_dir(
                  tensor literally uses an underscore (`{dotted}`), add a WEIGHT_LEAF_RENAMES \
                  entry in lib.rs mapping a non-digit DSL leaf to it. If the on-disk key really \
                  is a dotted nn.Sequential/submodule index, this is intended — ignore.",
-                arch = carrier.arch_name,
+                arch = arch_name,
             );
         }
     }
@@ -835,7 +863,7 @@ pub fn compile_in_dir(
                      downstream with an unrelated unclaimed-tile error. Declare each in \
                      {wjpath} — a marker/bundle family as \
                      `\"{first}\": [\"hidden_size\"]`, or the explicit leaf shape.",
-                    arch = carrier.arch_name,
+                    arch = arch_name,
                     names = unresolved.join(", "),
                     wjpath = models_dir.join("weights.json").display(),
                     first = first,
@@ -847,8 +875,8 @@ pub fn compile_in_dir(
     // Backend selection via feature flags (compile-time, not runtime)
     #[cfg(feature = "cuda")]
     let target_profile = {
-        let target_def = scratchy_target_cuda::targets::detect()
-            .map_err(|e| syn::Error::new(carrier.name_span, e))?;
+        let target_def =
+            scratchy_target_cuda::targets::detect().map_err(|e| syn::Error::new(name_span, e))?;
         target::from_profile_def(target_def)
     };
 
@@ -862,7 +890,7 @@ pub fn compile_in_dir(
     #[cfg(feature = "metal")]
     scratchy_target_metal::device::detect_metal_profile().ok_or_else(|| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
         )
     })?;
@@ -1801,7 +1829,7 @@ pub fn compile_in_dir(
     // empty-arms early-return — but the explicit skip here makes the
     // intent visible at the call site.
     let arch_dispatch_ts = if mode.emit_arch_dispatch {
-        let arch_ident = Ident::new(&arch_name, carrier.name_span);
+        let arch_ident = Ident::new(&arch_name, name_span);
         // Hybrid (Gated-DeltaNet) arches: the per-arch
         // `ScratchyWeights::gdn_runtime_config` override the worker reads
         // to size + allocate the GDN state pool. Empty for non-hybrid
@@ -1987,7 +2015,7 @@ pub fn compile_in_dir(
             &hf_arches,
             &arch_dispatch_arms,
             models_dir,
-            carrier.name_span,
+            name_span,
             gdn_runtime_config_tokens,
         )?
     } else {
