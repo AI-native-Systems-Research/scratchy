@@ -36,8 +36,10 @@
 //! single major fault.
 
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -147,6 +149,86 @@ fn wait4_child(child: &mut Child) -> Result<ChildUsage> {
         major_faults: ru.ru_majflt as i64,
         ok,
     })
+}
+
+/// The process group of the server child currently running, for the signal
+/// handler. Zero when there is none.
+static CHILD_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// Spawn a server child in a process group of its own.
+///
+/// The group is established at spawn because it is the only handle that reaches
+/// a child's *own* children, which `kill_group` needs and `Child` cannot give.
+fn spawn_child(argv: &[String]) -> Result<Child> {
+    install_group_killer();
+    let child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("failed to exec {}", argv[0]))?;
+    CHILD_GROUP.store(child.id() as i32, Ordering::SeqCst);
+    Ok(child)
+}
+
+/// Kill the child's whole process group, then reap the child itself.
+///
+/// A server is not necessarily one process. vLLM's API server spawns
+/// `VLLM::EngineCore` separately, so `Child::kill` — which signals exactly one
+/// pid — left the engine orphaned to init still holding 72444 MiB of device
+/// memory (measured: pid 39127, PPID 1, after a repetition that reported
+/// 95.164 s), and the next repetition had nothing left to allocate. scratchy
+/// never showed this, being a single process.
+///
+/// Kill before reap, as `wait4_child` explains: reaping frees the pid, and a
+/// freed pid may be recycled into an unrelated process group.
+fn kill_group(child: &mut Child) -> Result<ChildUsage> {
+    let pid = child.id() as libc::pid_t;
+    // A child that died during startup was already reaped by `wait_ready`'s
+    // `try_wait`, so its pid is free and `-pid` could name a stranger's group.
+    // std answers this from its cached status without touching the pid.
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        // SAFETY: `pid` is a live, unreaped child that `spawn_child` placed in
+        // a new group of its own, so `-pid` names that group and nothing else.
+        // The only failure is ESRCH, i.e. the tree is already gone.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+    // A child that moved itself out of the group would escape the signal above;
+    // this one cannot miss it, and is a no-op when the group kill worked.
+    let _ = child.kill();
+    CHILD_GROUP.store(0, Ordering::SeqCst);
+    wait4_child(child)
+}
+
+/// Make Ctrl-C tear the child's group down too.
+///
+/// `process_group(0)` takes the child *out* of this process's group, so the
+/// terminal's SIGINT no longer reaches it. Without this, interrupting a run
+/// would leave behind exactly the orphan holding the whole GPU that
+/// `kill_group` exists to prevent, with nobody left to clean it up.
+fn install_group_killer() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: `on_signal` only loads an atomic and calls `kill` and
+            // `_exit`, all async-signal-safe.
+            unsafe { libc::signal(sig, handler) };
+        }
+    });
+}
+
+extern "C" fn on_signal(sig: libc::c_int) {
+    let pgid = CHILD_GROUP.load(Ordering::SeqCst);
+    if pgid > 0 {
+        // SAFETY: async-signal-safe, and `CHILD_GROUP` is only non-zero while
+        // that group's leader is a live, unreaped child of ours.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    // SAFETY: `_exit` is async-signal-safe. 128 + signal is the conventional
+    // status for death by that signal.
+    unsafe { libc::_exit(128 + sig) };
 }
 
 // ---------------------------------------------------------------------------
@@ -463,12 +545,7 @@ fn run_server(
     let (agent, base_url, model) = (ctx.agent, ctx.base_url.as_str(), ctx.model);
     let output_len = ctx.output_len;
     let t_zero = Instant::now();
-    let mut child = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to exec {}", argv[0]))?;
+    let mut child = spawn_child(argv)?;
 
     // Always reap the child, even on the error paths below: `ru_maxrss` for
     // children is only accounted once the child has been waited on.
@@ -514,12 +591,17 @@ fn run_server(
         Ok(rep)
     })();
 
-    // Kill first, then reap: wait4 frees the pid, after which kill() could
-    // signal an unrelated recycled process.
-    let _ = child.kill();
-    let usage = wait4_child(&mut child)?;
+    let usage = kill_group(&mut child);
 
+    // Report the measurement error BEFORE the reap error. `wait_ready` uses
+    // `try_wait`, which reaps, so a child that dies during startup is already
+    // gone by the time we get here and `wait4` fails with ECHILD. `?`-ing the
+    // reap first therefore replaced the diagnosis with the symptom: a vLLM
+    // engine that died on a missing build tool reported only
+    // "wait4(27507) returned -1", and the "server exited before becoming ready
+    // (exit status: 1)" that had already been constructed was dropped.
     let mut rep = result?;
+    let usage = usage?;
     rep.peak_rss_mib = usage.peak_rss_mib;
     rep.major_faults = usage.major_faults;
     Ok(rep)
@@ -1320,6 +1402,93 @@ mod tests {
             rep.ttft_exec_s.is_none(),
             "a banner-only child reported ttft_exec = {:?}; the clock stopped on the banner",
             rep.ttft_exec_s
+        );
+    }
+
+    /// A server is not always one process: vLLM's API server spawns
+    /// `VLLM::EngineCore` separately, and killing only the direct child left
+    /// that engine holding the whole GPU. Liveness is checked here by watching
+    /// a file the grandchild appends to, not by signalling its pid — an orphan
+    /// stays signalable for as long as it is an unreaped zombie, and the CUDA
+    /// pod's init is `sleep`, which never reaps.
+    #[test]
+    fn teardown_kills_the_processes_the_child_itself_spawned() {
+        let f = std::env::temp_dir().join(format!("scr-group-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        let argv: Vec<String> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            // `exec` makes the grandchild the only writer, so the file can only
+            // keep growing if the teardown missed it. The loop is bounded
+            // because a grandchild that escapes has no parent left to stop it.
+            format!(
+                "(for _ in $(seq 100); do printf . >> {f}; sleep 0.05; done) & exec sleep 20",
+                f = f.display()
+            ),
+        ];
+        let mut child = spawn_child(&argv).expect("/bin/sh spawns");
+        let len = || std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+        for _ in 0..200 {
+            if len() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(len() > 0, "the grandchild never started writing");
+
+        let _ = kill_group(&mut child);
+        let at_teardown = len();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            len(),
+            at_teardown,
+            "the grandchild outlived the teardown and kept writing"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// A server that dies during startup must report WHY, not how it was reaped.
+    ///
+    /// `wait_ready` calls `try_wait`, which reaps the child, so the `wait4` in
+    /// `run_server`'s cleanup then fails with ECHILD. While that reap was
+    /// `?`-ed before the measurement error, every failed server start —
+    /// bad flag, missing dependency, OOM — surfaced as `wait4(<pid>) returned
+    /// -1` and the real diagnosis was discarded. Observed against vLLM, whose
+    /// engine core died on a missing build tool: the message named neither vLLM
+    /// nor an exit status, and the cause took a hand-run server to find.
+    #[test]
+    fn a_child_that_dies_before_ready_reports_why_not_how_it_was_reaped() {
+        let agent = crate::http::agent(false);
+        let ctx = Ctx {
+            agent: &agent,
+            // Nothing is listening here, and nothing will be: the child exits
+            // immediately, so readiness polling must notice the death rather
+            // than run out the timeout.
+            base_url: "http://127.0.0.1:1".into(),
+            model: "unused",
+            input_len: 8,
+            output_len: 4,
+            ready_timeout: Duration::from_secs(10),
+            poll: Duration::from_millis(20),
+            settle: Duration::from_millis(0),
+        };
+        let err = run_server(
+            &ctx,
+            &["/bin/sh".into(), "-c".into(), "exit 3".into()],
+            "hello",
+            0,
+            1,
+        )
+        .expect_err("a child that exits 3 cannot become ready");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("exited before becoming ready"),
+            "expected the startup diagnosis, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("wait4"),
+            "the reap error masked the real one again: {msg:?}"
         );
     }
 
