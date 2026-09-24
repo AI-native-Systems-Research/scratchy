@@ -1046,6 +1046,22 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
          --child-cmd \"target/release/scr chat -m M --device metal -q {{prompt}} \
          --max-tokens {{output_len}}\""
     );
+    // Server mode polls `--port` for readiness while the child listens on
+    // whatever its own command line says. A disagreement is not a small
+    // mistake: the harness waits out `--ready-timeout-s` (600 s by default)
+    // against a port nobody is listening on, once per repetition, and then
+    // reports it as the framework failing to start.
+    if ex.mode == Mode::Server
+        && let Some(child_port) = child.port()
+    {
+        anyhow::ensure!(
+            child_port == ex.port,
+            "--port {} but --child-cmd tells the child to listen on {child_port}. \
+             The harness polls --port for readiness, so these must agree — pass \
+             `--port {child_port}`.",
+            ex.port
+        );
+    }
     if let Some(ref parity) = ex.parity_cmd {
         anyhow::ensure!(
             parity.has_placeholder() && child.has_placeholder(),
@@ -1402,6 +1418,55 @@ mod tests {
             rep.ttft_exec_s.is_none(),
             "a banner-only child reported ttft_exec = {:?}; the clock stopped on the banner",
             rep.ttft_exec_s
+        );
+    }
+
+    /// The port the harness polls and the port the child binds must agree.
+    ///
+    /// Reading the child's own `--port` is the whole point: they are independent
+    /// flags, and a mismatch costs one `--ready-timeout-s` per repetition —
+    /// 600 s by default — polling a port nobody listens on, reported as the
+    /// framework failing to start. A child that names no port is left alone,
+    /// because the port may come from a config file or the environment.
+    #[test]
+    fn a_child_told_to_use_another_port_is_refused_not_polled() {
+        use clap::Parser;
+        // A child that cannot exist, so the agreeing case below cannot start a
+        // real server on whatever machine runs the tests.
+        let args = |cmd: &str, extra: &[&str]| {
+            let mut v = vec!["startup", "-m", "org/model", "--exec", "--child-cmd", cmd];
+            v.extend_from_slice(extra);
+            BenchStartupArgs::try_parse_from(v).expect("flags parse")
+        };
+        let port_of = |cmd: &str| {
+            args(cmd, &[])
+                .exec_opts
+                .child_cmd
+                .as_ref()
+                .expect("clap parsed the child command")
+                .port()
+        };
+        assert_eq!(port_of("vllm serve M --port 8821"), Some(8821));
+        assert_eq!(port_of("vllm serve M --port=8821"), Some(8821));
+        assert_eq!(port_of("scr serve M"), None);
+
+        let args = |extra: &[&str]| args("/nonexistent/vllm serve M --port 8821", extra);
+        let msg = run(&args(&[]))
+            .expect_err("the default port disagrees with the child's 8821")
+            .to_string();
+        assert!(
+            msg.contains("8821") && msg.contains("must agree"),
+            "the refusal must name the child's port: {msg:?}"
+        );
+
+        // Agreement gets past the guard. What fails afterwards is not this
+        // test's business, only that this refusal is gone.
+        let msg = run(&args(&["--port", "8821"]))
+            .expect_err("/nonexistent/vllm cannot be spawned")
+            .to_string();
+        assert!(
+            !msg.contains("must agree"),
+            "agreeing ports were refused: {msg:?}"
         );
     }
 
