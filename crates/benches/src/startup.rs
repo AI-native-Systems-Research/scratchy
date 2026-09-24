@@ -12,8 +12,8 @@
 //! process is exec'd, no cache is wiped, and no request is ever sent — so this
 //! cannot produce a TTFT, and its "cold" is a fresh engine object rather than a
 //! cold machine. For "how long from `exec` until the user sees a word", and for
-//! any cross-framework comparison, use `scripts/startup_probe.py` instead; the
-//! two are not comparable. See `docs/BENCHMARKING.md`.
+//! any cross-framework comparison, use `--exec` instead; the two are not
+//! comparable. See `docs/BENCHMARKING.md`.
 
 use std::time::Instant;
 
