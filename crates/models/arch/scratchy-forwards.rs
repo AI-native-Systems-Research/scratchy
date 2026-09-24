@@ -3,18 +3,19 @@
 //! redesign — the 25 per-arch `#[forward]` crates collapsed into one).
 //!
 //! For each arch whose `arch-<name>` feature is enabled, this reads that arch's
-//! DSL carrier from `dsl/<name>.rs.in` (the `#[forward]`/`#[vision_forward]`
-//! item, written exactly as it used to appear under the attribute macro), runs
-//! the shared pipeline (`scratchy_forward_compiler_macro::compile_in_dir`) over
-//! it against that arch's own `configs/<name>/`, and writes the emitted modules
-//! to `$OUT_DIR/<mod>.rs`, which `src/lib.rs` wraps in `pub mod <mod>` and
+//! DSL carrier from `dsl/<name>.py` (the `@forward`/`@vision_forward`-decorated
+//! `def` — the same math the `#[forward]` attribute used to annotate, now in
+//! torch-idiom Python), runs the shared pipeline
+//! (`scratchy_forward_compiler_macro::compile_ast`) over it against that arch's
+//! own `configs/<name>/`, and writes the emitted modules to
+//! `$OUT_DIR/<mod>.rs`, which `src/lib.rs` wraps in `pub mod <mod>` and
 //! `include!`s. The pipeline lib is a build-dependency; the backend feature
 //! (metal/cuda/…) is forwarded onto it so the emit matches what we then compile.
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
 use scratchy_forward_compiler_macro::{
-    CompileMode, DEFAULT_DECODER_WORKLOADS, ForwardArgs, compile_in_dir, parse_carrier,
-    render_tokens,
+    CompileMode, DEFAULT_DECODER_WORKLOADS, ForwardArgs, PythonCarrier, compile_ast,
+    parse_python_file, render_tokens,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -114,44 +115,27 @@ fn enabled_quants(
     enabled
 }
 
-/// Build `ForwardArgs` from the carrier's `#[forward(...)]`/`#[vision_forward(...)]`
-/// attribute tokens, filling the default decoder ladder when `workloads` is
-/// omitted (bare `#[forward]`). Vision carriers always pass `workloads`.
-fn args_from_attr(attr: &syn::Attribute) -> ForwardArgs {
-    let mut args: ForwardArgs = match &attr.meta {
-        syn::Meta::List(list) => syn::parse2(list.tokens.clone()).expect("parse #[forward] args"),
-        _ => syn::parse_str("").expect("empty #[forward] args"),
+/// Build `ForwardArgs` from the carrier's `@forward(...)` /
+/// `@vision_forward(...)` decorator metadata, filling the default
+/// decoder ladder when `workloads` is omitted (bare `@forward`).
+/// Vision carriers always pass `workloads`.
+fn args_from_carrier(carrier: &PythonCarrier) -> ForwardArgs {
+    let mut args: ForwardArgs = syn::parse_str("").expect("empty #[forward] args");
+    args.workloads = if carrier.workloads.is_empty() {
+        DEFAULT_DECODER_WORKLOADS.to_vec()
+    } else {
+        carrier.workloads.clone()
     };
-    if args.workloads.is_empty() {
-        args.workloads = DEFAULT_DECODER_WORKLOADS.to_vec();
+    if !carrier.sk_buckets.is_empty() {
+        args.sk_buckets = carrier.sk_buckets.clone();
+    }
+    if let Some(p) = &carrier.pixel_pack {
+        args.pixel_pack = Some(syn::parse_str(p).expect("pixel_pack path"));
+    }
+    if let Some(p) = &carrier.processor {
+        args.processor = Some(syn::parse_str(p).expect("processor path"));
     }
     args
-}
-
-/// `Some((mode, index))` if this item carries a `#[forward]`/`#[vision_forward]`
-/// attribute, identifying the carrier and its compile mode.
-fn carrier_attr(attrs: &[syn::Attribute]) -> Option<(CompileMode, usize)> {
-    attrs.iter().enumerate().find_map(|(i, a)| {
-        match a
-            .path()
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .as_deref()
-        {
-            Some("forward") => Some((CompileMode::DECODER, i)),
-            Some("vision_forward") => Some((CompileMode::VISION, i)),
-            _ => None,
-        }
-    })
-}
-
-fn item_attrs_mut(item: &mut syn::Item) -> Option<&mut Vec<syn::Attribute>> {
-    match item {
-        syn::Item::Fn(f) => Some(&mut f.attrs),
-        syn::Item::Mod(m) => Some(&mut m.attrs),
-        _ => None,
-    }
 }
 
 /// Write `$OUT_DIR/hf_registry.rs`, the shell-completion candidate list
@@ -183,7 +167,7 @@ fn write_hf_registry_file(out_dir: &Path, ids: &BTreeSet<String>) {
     }
 }
 
-/// Emit one arch: parse its DSL carrier (`dsl/<arch>.rs.in`), run the pipeline
+/// Emit one arch: parse its DSL carrier (`dsl/<arch>.py`), run the pipeline
 /// against its configs (`configs/<arch>/`), write `$OUT_DIR/<mod>.rs`. Called
 /// concurrently across arches — must not mutate global state (e.g. env). The
 /// quant scoping (SCRATCHY_QUANTS) is set once in `main` before the fan-out.
@@ -199,37 +183,24 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
 
     let dsl = std::fs::read_to_string(dsl_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", dsl_path.display()));
-    let file =
-        syn::parse_file(&dsl).unwrap_or_else(|e| panic!("parse {}: {e}", dsl_path.display()));
-
-    // Find the carrier item + its forward/vision_forward attribute; strip the
-    // attribute (parse_carrier expects the item without it, mirroring how an
-    // attribute macro receives its annotated item).
-    let mut carrier_item = None;
-    let mut mode = CompileMode::DECODER;
-    let mut args = None;
-    for mut item in file.items {
-        let found = item_attrs_mut(&mut item).and_then(|attrs| carrier_attr(attrs));
-        if let Some((m, i)) = found {
-            let attrs = item_attrs_mut(&mut item).unwrap();
-            let attr = attrs.remove(i);
-            mode = m;
-            args = Some(args_from_attr(&attr));
-            carrier_item = Some(item);
-            break;
-        }
-    }
-    let carrier_item = carrier_item.unwrap_or_else(|| {
-        panic!(
-            "{}: no #[forward]/#[vision_forward] carrier",
-            dsl_path.display()
-        )
-    });
-    let args = args.unwrap();
-
-    let carrier = parse_carrier(carrier_item).unwrap_or_else(|e| panic!("carrier: {e}"));
-    let tokens = compile_in_dir(&args, &carrier, mode, configs_dir)
-        .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
+    let carrier = parse_python_file(&dsl, proc_macro2::Span::call_site())
+        .unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
+    let mode = if carrier.vision {
+        CompileMode::VISION
+    } else {
+        CompileMode::DECODER
+    };
+    let args = args_from_carrier(&carrier);
+    let arch_name = carrier.arch_name.clone();
+    let tokens = compile_ast(
+        &args,
+        &arch_name,
+        proc_macro2::Span::call_site(),
+        carrier.ast,
+        mode,
+        configs_dir,
+    )
+    .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
 
@@ -291,7 +262,7 @@ fn main() {
     let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
     let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
 
-    // Each arch is a `dsl/<arch>.rs.in` DSL carrier paired with a
+    // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
     // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
     // a backend they support is on. Sorted for deterministic output.
     let dsl_dir = manifest.join("dsl");
@@ -303,7 +274,7 @@ fn main() {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".rs.in"))
+                .is_some_and(|n| n.ends_with(".py"))
         })
         .collect();
     dsl_files.sort();
@@ -316,7 +287,7 @@ fn main() {
             let arch = dsl_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".rs.in"))?
+                .and_then(|n| n.strip_suffix(".py"))?
                 .to_string();
             // Feature gate: `arch-<name>` → CARGO_FEATURE_ARCH_<ENVIFY(name)>.
             if std::env::var(format!("CARGO_FEATURE_ARCH_{}", envify(&arch))).is_err() {
