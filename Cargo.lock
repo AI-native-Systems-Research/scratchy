@@ -3662,6 +3662,23 @@ name = "scratchy-builder-spyre"
 version = "0.1.0"
 
 [[package]]
+name = "scratchy-chat-template-compiler"
+version = "0.1.0"
+dependencies = [
+ "minijinja",
+ "serde_json",
+]
+
+[[package]]
+name = "scratchy-chat-template-e2e"
+version = "0.1.0"
+dependencies = [
+ "minijinja",
+ "scratchy-chat-template-compiler",
+ "serde_json",
+]
+
+[[package]]
 name = "scratchy-cli"
 version = "0.1.0"
 dependencies = [
@@ -3775,6 +3792,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "scratchy-chat-template-compiler",
  "scratchy-ir",
  "scratchy-layers",
  "scratchy-subtile",
@@ -3843,6 +3861,7 @@ dependencies = [
  "objc2-metal",
  "proc-macro2",
  "rayon",
+ "scratchy-chat-template-compiler",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
@@ -3897,6 +3916,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
+ "scratchy-chat-template-compiler",
  "scratchy-core-common",
  "scratchy-core-config",
  "scratchy-core-model",

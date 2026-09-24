@@ -46,6 +46,8 @@ scratchy-core-model = { workspace = true }
 scratchy-quantizations = { workspace = true }
 scratchy-vision = { workspace = true, optional = true }
 scratchy-forward-compiler = { workspace = true }
+# Runtime half only: the CompiledTemplate contract. No minijinja via this edge.
+scratchy-chat-template-compiler = { workspace = true }
 # The cross-arch MM registry (`resolve_mm_metadata`) relocated below the
 # neutral `ScratchyWeights` trait into `scratchy-target-cuda`; multimodal.rs
 # resolves arch metadata through it. Optional + backend-gated like the rest.

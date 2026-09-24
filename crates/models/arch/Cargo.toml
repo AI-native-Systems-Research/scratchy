@@ -597,6 +597,9 @@ spyre = [
 hf-completions = ["dep:ureq"]
 [dependencies]
 scratchy-layers = { path = "../../layers" }
+# Runtime half only — the CompiledTemplate contract the emitted chat modules
+# name. minijinja rides the `compile` feature, which is build-side only.
+scratchy-chat-template-compiler = { workspace = true }
 scratchy-quantizations = { path = "../quantization" }
 scratchy-forward-compiler = { path = "../../compiler" }
 scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
@@ -610,6 +613,10 @@ anyhow = { workspace = true }
 # macro). The backend feature is forwarded onto this build-dep above.
 [build-dependencies]
 scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
+# ⛔ THE `compile` FEATURE IS BUILD-SIDE ONLY. The runtime half reaches this
+# crate through scratchy-forward-compiler (default features), so minijinja
+# never enters the serving binary via this edge.
+scratchy-chat-template-compiler = { workspace = true, features = ["compile"] }
 # Same crate as the regular dependency above, ALSO as a build-dependency:
 # scratchy-forwards.rs calls `scratchy_quantizations::enabled_presets()` to
 # read quant scope (see the `[features]` comment near the removed

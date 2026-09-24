@@ -1,0 +1,35 @@
+[package]
+name = "scratchy-chat-template-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compile a HuggingFace Jinja chat template into Rust source that renders it."
+
+# ⛔ LEAF CRATE. No `scratchy-*` dependency, ever — see the note in lib.rs.
+# CI asserts this; the crate must also build standalone via --manifest-path.
+
+[features]
+default = []
+# The build-time half: parse a template and emit Rust. Pulls minijinja's
+# parser. Never enabled by the serving crates.
+compile = ["dep:minijinja"]
+
+[dependencies]
+# The value model. NOT a scratchy dep, so leaf-ness holds. We deliberately reuse
+# serde_json::Value rather than inventing a value enum: the serving runtime
+# already hands minijinja serde_json values, so number kinds (u64/i64/f64) and
+# map key ordering (BTreeMap => sorted) match the interpreter for free. A
+# bespoke enum would have to re-derive both and would drift.
+serde_json = { workspace = true }
+
+# ⛔ PINNED EXACTLY, and only under `compile`. `unstable_machinery` is excluded
+# from minijinja's semver guarantees — its own docs say the module "does not
+# have a stable interface". A patch bump can break the AST walker, so bumps are
+# a deliberate, gated change.
+minijinja = { version = "=2.24.0", features = ["unstable_machinery"], optional = true }
+
+[dev-dependencies]
+# The ORACLE. Tests render the same template through the real interpreter and
+# require byte-identical output. Feature set must match the serving runtime's
+# (crates/serving/api/Cargo.toml) or the oracle validates a different language.
+minijinja = { version = "=2.24.0", features = ["builtins", "json", "loader", "unstable_machinery"] }
