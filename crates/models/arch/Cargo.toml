@@ -103,6 +103,7 @@ all-arches = [
 # module.
 # commandr (2 configs)
 "c4ai-command-r-v01" = ["arch-commandr"]
+"c4ai-command-r-v01-parity-tiny" = ["arch-commandr"]
 "command-r-1-layer" = ["arch-commandr"]
 
 # deepseek-v2 (1 configs)
@@ -120,10 +121,12 @@ all-arches = [
 
 # gemma2 (3 configs)
 "gemma2-27b" = ["arch-gemma2"]
+"gemma2-27b-parity-tiny" = ["arch-gemma2"]
 "gemma2-2b" = ["arch-gemma2"]
 "gemma2-9b" = ["arch-gemma2"]
 
 # gemma3 (4 configs)
+"gemma-3-12b-it-parity-tiny" = ["arch-gemma3"]
 "gemma-3-12b-it-text-only" = ["arch-gemma3"]
 "gemma-3-1b-it" = ["arch-gemma3"]
 "gemma-3-27b-it-text-only" = ["arch-gemma3"]
@@ -144,6 +147,7 @@ all-arches = [
 
 # granite (21 configs)
 "granite-3.0-2b-base" = ["arch-granite"]
+"granite-3.0-2b-base-parity-tiny" = ["arch-granite"]
 "granite-3.0-2b-instruct" = ["arch-granite"]
 "granite-3.0-8b-base" = ["arch-granite"]
 "granite-3.0-8b-instruct" = ["arch-granite"]
@@ -167,6 +171,7 @@ all-arches = [
 
 # llama (12 configs)
 "llama-2-13b" = ["arch-llama"]
+"llama-2-13b-parity-tiny" = ["arch-llama"]
 "llama-2-70b" = ["arch-llama"]
 "llama-2-7b" = ["arch-llama"]
 "llama-3-70b" = ["arch-llama"]
@@ -184,6 +189,7 @@ all-arches = [
 
 # mistral (3 configs)
 "mistral-7b-instruct-v0.3" = ["arch-mistral"]
+"mistral-7b-instruct-v0.3-parity-tiny" = ["arch-mistral"]
 "mistral-7b-v0.2" = ["arch-mistral"]
 "mistral-nemo-instruct-2407" = ["arch-mistral"]
 
@@ -197,6 +203,7 @@ all-arches = [
 
 # phi3 (10 configs)
 "phi-3-5-mini-instruct" = ["arch-phi3"]
+"phi-3-5-mini-instruct-parity-tiny" = ["arch-phi3"]
 "phi-3-medium-128k-instruct" = ["arch-phi3"]
 "phi-3-medium-4k-instruct" = ["arch-phi3"]
 "phi-3-mini-128k-instruct" = ["arch-phi3"]
@@ -250,6 +257,7 @@ all-arches = [
 
 # qwen3-5 (2 configs)
 "qwen3.5-0.8b" = ["arch-qwen3-5"]
+"qwen3.5-0.8b-parity-tiny" = ["arch-qwen3-5"]
 "qwen3.5-9b-text-only" = ["arch-qwen3-5"]
 
 # qwen3-5-moe (2 configs)
@@ -267,6 +275,7 @@ all-arches = [
 # i.e. `model/granite` is shorthand for "all granite models".
 "commandr" = [
     "c4ai-command-r-v01",
+    "c4ai-command-r-v01-parity-tiny",
     "command-r-1-layer",
 ]
 "deepseek-v2" = [
@@ -284,10 +293,12 @@ all-arches = [
 ]
 "gemma2" = [
     "gemma2-27b",
+    "gemma2-27b-parity-tiny",
     "gemma2-2b",
     "gemma2-9b",
 ]
 "gemma3" = [
+    "gemma-3-12b-it-parity-tiny",
     "gemma-3-12b-it-text-only",
     "gemma-3-1b-it",
     "gemma-3-27b-it-text-only",
@@ -308,6 +319,7 @@ all-arches = [
 ]
 "granite" = [
     "granite-3.0-2b-base",
+    "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",
     "granite-3.0-8b-base",
     "granite-3.0-8b-instruct",
@@ -331,6 +343,7 @@ all-arches = [
 ]
 "llama" = [
     "llama-2-13b",
+    "llama-2-13b-parity-tiny",
     "llama-2-70b",
     "llama-2-7b",
     "llama-3-70b",
@@ -348,6 +361,7 @@ all-arches = [
 ]
 "mistral" = [
     "mistral-7b-instruct-v0.3",
+    "mistral-7b-instruct-v0.3-parity-tiny",
     "mistral-7b-v0.2",
     "mistral-nemo-instruct-2407",
 ]
@@ -361,6 +375,7 @@ all-arches = [
 ]
 "phi3" = [
     "phi-3-5-mini-instruct",
+    "phi-3-5-mini-instruct-parity-tiny",
     "phi-3-medium-128k-instruct",
     "phi-3-medium-4k-instruct",
     "phi-3-mini-128k-instruct",
@@ -414,6 +429,7 @@ all-arches = [
 ]
 "qwen3-5" = [
     "qwen3.5-0.8b",
+    "qwen3.5-0.8b-parity-tiny",
     "qwen3.5-9b-text-only",
 ]
 "qwen3-5-moe" = [
@@ -431,6 +447,7 @@ all-arches = [
 # reached as `model/all` from scratchy-cli.
 all = [
     "c4ai-command-r-v01",
+    "c4ai-command-r-v01-parity-tiny",
     "command-r-1-layer",
     "deepseek-v2-lite",
     "deepseek-v3-academic-9b-fp8-block",
@@ -440,8 +457,10 @@ all = [
     "moonlight-16b-a3b-instruct-fp8-block",
     "moonlight-16b-a3b-instruct",
     "gemma2-27b",
+    "gemma2-27b-parity-tiny",
     "gemma2-2b",
     "gemma2-9b",
+    "gemma-3-12b-it-parity-tiny",
     "gemma-3-12b-it-text-only",
     "gemma-3-1b-it",
     "gemma-3-27b-it-text-only",
@@ -454,6 +473,7 @@ all = [
     "gemma-4-26b-a4b-it-optiq",
     "gemma-4-26b-a4b-it",
     "granite-3.0-2b-base",
+    "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",
     "granite-3.0-8b-base",
     "granite-3.0-8b-instruct",
@@ -475,7 +495,7 @@ all = [
     "granite-4.1-8b",
     "micro-g3.3-8b-instruct-1b",
     "llama-2-13b",
-    "llama-2-70b",
+    "llama-2-13b-parity-tiny",
     "llama-2-7b",
     "llama-3-70b",
     "llama-3-8b",
@@ -488,13 +508,14 @@ all = [
     "tinyllama-1.1b",
     "locateanything-3b",
     "mistral-7b-instruct-v0.3",
-    "mistral-7b-v0.2",
+    "mistral-7b-instruct-v0.3-parity-tiny",
     "mistral-nemo-instruct-2407",
     "mixtral-1-layer",
     "mixtral-8x7b-instruct-v0.1",
     "modernbert-base-1-layer",
     "modernbert-base",
     "phi-3-5-mini-instruct",
+    "phi-3-5-mini-instruct-parity-tiny",
     "phi-3-medium-128k-instruct",
     "phi-3-medium-4k-instruct",
     "phi-3-mini-128k-instruct",
@@ -536,6 +557,7 @@ all = [
     "qwen3-4b",
     "qwen3-8b",
     "qwen3.5-0.8b",
+    "qwen3.5-0.8b-parity-tiny",
     "qwen3.5-9b-text-only",
     "qwen3.5-35b-a3b-optiq",
     "qwen3.5-35b-a3b",

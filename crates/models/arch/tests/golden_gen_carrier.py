@@ -1492,6 +1492,24 @@ def main():
             else:
                 cfg["layer_types"] = [first, other]
                 cfg["sliding_window_pattern"] = 2
+        # `sliding_window_pattern` WITHOUT `layer_types` (gemma2/gemma3):
+        # the pattern indexes layer position mod pattern to pick the
+        # sliding vs global attention class. A 2-layer shrink under a
+        # pattern > 2 lands both layers on the SAME class — for gemma3
+        # (pattern 6, all-sliding) that erases the global-rope ops from
+        # one bucket but not the other, and the emitted Weights struct
+        # and its accessor disagree (no field `rotary`). Clamp the
+        # pattern to 2 so the shrink keeps exactly one layer of each
+        # class — the smallest geometry that still exercises both.
+        if not isinstance(cfg.get("layer_types"), list) \
+                and isinstance(cfg.get("sliding_window_pattern"), int) \
+                and cfg["sliding_window_pattern"] > 2:
+            cfg["sliding_window_pattern"] = 2
+        # LongRoPE per-channel factors (`rope_scaling.short_factor` /
+        # `long_factor`, phi3): one entry per rotary PAIR at full scale.
+        # After the shrink the pair count is smaller, so interpolate
+        # the table down to the new count — try_load's LongRope loader
+        # refuses a length mismatch (short=48, expected 16).
         # Identity preservation: a config field EQUAL to a product of
         # others at full scale (deepseek-v2's hidden_size == heads·
         # v_head_dim — its o_proj manifest formula reads [hidden_size,
@@ -1505,6 +1523,78 @@ def main():
             if target in full and all(f in full for f in factors) \
                     and full[target] == math.prod(full[f] for f in factors):
                 cfg[target] = math.prod(shrunk[f] for f in factors)
+        rs = cfg.get("rope_scaling")
+        if isinstance(rs, dict):
+            partial = json_path(cfg, "rope_parameters.partial_rotary_factor") \
+                or rs.get("partial_rotary_factor")
+            hd = shrunk.get("head_dim", 0)
+            rot_dim = round(partial * hd) if isinstance(partial, (int, float)) \
+                and abs(partial - 1.0) > 1e-9 else hd
+            pair = rot_dim // 2
+            for key in ("short_factor", "long_factor"):
+                tbl = rs.get(key)
+                if isinstance(tbl, list) and len(tbl) != pair:
+                    rs[key] = [
+                        tbl[min(len(tbl) - 1, round(i * (len(tbl) - 1) / max(pair - 1, 1)))]
+                        for i in range(pair)
+                    ]
+        # Text execution of a CondGen-wrapped config (gemma3: the oracle
+        # runs dsl/gemma3.py — @forward — over the mm wrapper's config):
+        # the compiled side derives its safetensors key prefix from the
+        # arch string + arch.json's decoder_safetensors_prefix. A
+        # ForConditionalGeneration string without a declared prefix makes
+        # the baked fingerprint expect `model.language_model.*` while the
+        # writer emits `model.*` — a silent fingerprint miss. Arch strings
+        # with a declared prefix (qwen3-5: "language_model") stay as-is;
+        # both sides nest consistently.
+        archs = cfg.get("architectures")
+        aj = json.loads((ARCH_DIR / arch / "arch.json").read_text()) \
+            if (ARCH_DIR / arch / "arch.json").exists() else {}
+        if isinstance(archs, list) and len(archs) == 1 \
+                and isinstance(archs[0], str) \
+                and archs[0].endswith("ForConditionalGeneration") \
+                and not aj.get("decoder_safetensors_prefix"):
+            cfg["architectures"] = [archs[0].replace(
+                "ForConditionalGeneration", "ForCausalLM")]
+        # Materialize the popped shrink-target keys into the config we
+        # WRITE — the ones that can also live nested in a `text_config`
+        # (head_dim, num_key_value_heads, num_global_key_value_heads).
+        # Without a top-level entry, scratchy's text_config hoist
+        # (or_insert — nested values win only when top level is absent)
+        # leaks the FULL-SCALE dims from a stale nested text_config
+        # (gemma3: num_key_value_heads 8, head_dim 256 under a shrunk
+        # 4×32 top level — NoHeadGrouping at compile time). ONLY the
+        # shrink targets, never the other derived bounds (attn_q_dim,
+        # q_gate_dim, sliding_window_global_remainder, …): config.rs
+        # never recomputes an explicit key, so pinning a derived bound
+        # changes downstream op classification (gemma3's m=2 tape lost
+        # its global-rope ops while the accessor kept `self.rotary`).
+        for k in REDERIVABLE:
+            if k in TINY_BOUNDS and k in shrunk:
+                cfg[k] = shrunk[k]
+        # mrope_section: bands cover the ROTARY half (rotary_dim/2), so
+        # a shrunk head_dim/partial factor needs the section rescaled to
+        # the new pair count — the macro's expansion guard (codegen.rs
+        # mrope_section_tokens) refuses a config whose section sums to
+        # anything else. Text decode is unaffected (all bands share the
+        # same 1D positions); only the written config must be consistent.
+        partial = cfg.get("partial_rotary_factor")
+        if not isinstance(partial, (int, float)):
+            partial = json_path(cfg, "rope_parameters.partial_rotary_factor")
+        hd = shrunk.get("head_dim", 0)
+        rot_dim = hd
+        if isinstance(partial, (int, float)) and abs(partial - 1.0) > 1e-9:
+            rot_dim = round(partial * hd)
+        pair = rot_dim // 2
+        for dotted in ("rope_parameters.mrope_section", "rope_scaling.mrope_section"):
+            sec = json_path(cfg, dotted)
+            if isinstance(sec, list) and len(sec) == 3 and sum(sec) != pair:
+                old = sum(sec)
+                new = [max(1, round(s * pair / old)) for s in sec]
+                # repair the sum on the largest band
+                i = new.index(max(new))
+                new[i] += pair - sum(new)
+                set_json_path(cfg, dotted, new)
     bounds = derive_bounds(cfg)
     # Vision arches: arch.json `params` table derives the vision_* / d_model
     # bounds (config.rs eval_params — additive over the flat harvest).
