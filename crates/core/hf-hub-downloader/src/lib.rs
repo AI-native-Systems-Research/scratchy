@@ -32,8 +32,11 @@ pub mod cache;
 mod error;
 mod fetch;
 mod limit;
+#[cfg(test)]
+mod local_hub;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use error::{Error, Result};
 
@@ -46,6 +49,15 @@ pub trait Progress: Send {
     /// Called once before any bytes move. `total` is 0 when the size is not
     /// known ahead of time, which is the case for small git-tracked files.
     fn init(&mut self, total: u64, filename: &str);
+    /// Called at most once, right after [`init`](Self::init) and before any
+    /// [`update`](Self::update), with the bytes a previous, interrupted run
+    /// already placed.
+    ///
+    /// Counted like an update by default. A UI that shows a transfer rate
+    /// overrides it, or gigabytes found on disk read as gigabytes a second.
+    fn resumed(&mut self, bytes: u64) {
+        self.update(bytes);
+    }
     /// Called with a byte delta, not a running total.
     fn update(&mut self, delta: u64);
     /// Called once after the file is verified and placed.
@@ -96,14 +108,15 @@ impl ClientBuilder {
         }
     }
 
-    /// How many concurrent ranges to split a large file into.
+    /// How many ranges of one large file may be in flight at once.
     ///
     /// Composes with whatever concurrency the caller runs *across* files, so
     /// the two multiply. That product is bounded by
-    /// [`max_concurrency`](Self::max_concurrency) rather than by this, which
+    /// [`max_concurrency`](Self::max_concurrency) rather than by this, and
+    /// those permits are shared round-robin between the files asking, which
     /// means a large value here is safe: it widens the single-file case
     /// without letting a sharded download open a connection per chunk per
-    /// shard.
+    /// shard, or letting one shard's ranges crowd out the others'.
     pub fn chunks(mut self, chunks: u64) -> Self {
         self.chunks = chunks.max(1);
         self
@@ -115,6 +128,8 @@ impl ClientBuilder {
     /// This is the knob that actually bounds load on the Hub. Eight shards
     /// at eight ranges each is sixty-four connections to one host; the Hub
     /// throttles that, and it loses to fewer, fatter streams regardless.
+    /// Files downloading at once split it evenly: eight shards get one
+    /// connection each, a single file gets all of them.
     pub fn max_concurrency(mut self, permits: usize) -> Self {
         self.max_concurrency = permits.max(1);
         self
@@ -159,12 +174,22 @@ impl ClientBuilder {
         // every header worth having is on the first hop and following would
         // discard them. Byte fetches must follow, because the git-tracked
         // path redirects within huggingface.co.
+        //
+        // Both keep one idle connection per permit. A large file is fetched
+        // as many short pieces from one CDN host, and ureq's default of three
+        // idle connections per host would close most of them between pieces
+        // and pay a fresh TLS handshake for the next.
+        let pooled = self.max_concurrency;
         let probing: ureq::Agent = ureq::Agent::config_builder()
             .max_redirects(0)
+            .max_idle_connections(pooled)
+            .max_idle_connections_per_host(pooled)
             .build()
             .into();
         let following: ureq::Agent = ureq::Agent::config_builder()
             .max_redirects(8)
+            .max_idle_connections(pooled)
+            .max_idle_connections_per_host(pooled)
             .build()
             .into();
         Client {
@@ -176,6 +201,7 @@ impl ClientBuilder {
             chunks: self.chunks,
             parallel_threshold: self.parallel_threshold,
             permits: limit::Semaphore::new(self.max_concurrency),
+            flows: AtomicU64::new(0),
             retries: self.retries,
         }
     }
@@ -191,6 +217,8 @@ pub struct Client {
     chunks: u64,
     parallel_threshold: u64,
     permits: limit::Semaphore,
+    /// Numbers each download's [`limit::Flow`].
+    flows: AtomicU64,
     retries: usize,
 }
 
@@ -299,6 +327,7 @@ impl Repo<'_> {
             // One budget per file, spanning its probe and all its ranges.
             budget: fetch::RetryBudget::new(self.client.retries),
             permits: &self.client.permits,
+            flow: limit::Flow(self.client.flows.fetch_add(1, Ordering::Relaxed)),
         };
 
         let meta = fetch::probe(
@@ -328,7 +357,18 @@ impl Repo<'_> {
         std::fs::create_dir_all(&blobs).map_err(|e| Error::io(&blobs, e))?;
         let partial = blobs.join(format!("{}.incomplete", meta.etag));
 
-        fetch::fetch(&opts, &meta, filename, &partial, progress)?;
+        // Pinned to the commit the first probe found, so a lapsed CDN URL is
+        // re-signed for these bytes and never swapped for a newer revision's.
+        let resolve = || {
+            fetch::probe(
+                &opts,
+                &self.client.endpoint,
+                &self.repo_id,
+                &meta.commit,
+                filename,
+            )
+        };
+        fetch::fetch(&opts, &meta, filename, &partial, progress, &resolve)?;
 
         if let Err(e) = fetch::verify(&partial, &meta, filename) {
             // Never leave content that failed verification where a later run

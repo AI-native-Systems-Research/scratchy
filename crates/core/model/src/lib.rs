@@ -5,6 +5,7 @@
 //! - **HfModelConfig** for parsing HuggingFace `config.json`
 //! - **SafeTensorsIndex** for sharded weight map lookups
 //! - **LoRA adapter config** parsing
+//! - **hub::download**, fetching a model from the HuggingFace Hub
 //!
 //! Quantization config parsing lives in the forward compiler
 //! (`scratchy-forward-compiler-macro`, `QuantMethod`) with runtime support in
@@ -15,6 +16,7 @@ pub mod attention_metadata;
 pub mod embedding;
 #[cfg(feature = "guided-decoding")]
 pub mod grammar;
+pub mod hub;
 pub mod lora;
 pub mod process_group;
 pub mod tensor;

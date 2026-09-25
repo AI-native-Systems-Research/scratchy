@@ -72,7 +72,8 @@ impl Progress for &Interrupting {
     }
 }
 
-/// Sum of the per-chunk counters in the resume sidecar next to the blob.
+/// Sum of the per-piece counters in the resume sidecar next to the blob,
+/// past its two-slot header (a magic number, then the piece size).
 fn resume_total(blobs: &Path) -> u64 {
     let log = std::fs::read_dir(blobs)
         .unwrap()
@@ -82,7 +83,7 @@ fn resume_total(blobs: &Path) -> u64 {
         .expect("no .resume sidecar — the interrupted run recorded nothing");
     let bytes = std::fs::read(log).unwrap();
     let (slots, _partial) = bytes.as_chunks::<8>();
-    slots.iter().copied().map(u64::from_le_bytes).sum()
+    slots.iter().skip(2).copied().map(u64::from_le_bytes).sum()
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -154,8 +155,8 @@ fn lfs_file_downloads_in_parallel_ranges_and_verifies() {
 /// Kill a download partway, then finish it: the second run must pick up the
 /// bytes the first one placed, not start over, and must still verify.
 ///
-/// This is the path worth distrusting. Resume arithmetic is per-chunk — each
-/// range restarts at `start + recorded`, and an off-by-one there produces a
+/// This is the path worth distrusting. Resume arithmetic is per-piece — each
+/// piece restarts at `start + recorded`, and an off-by-one there produces a
 /// file that is the right length, passes casually, and fails its hash.
 #[test]
 #[ignore = "requires network"]

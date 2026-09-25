@@ -17,6 +17,9 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 fs2 = { workspace = true }
+hf-hub-downloader = { workspace = true }
+indicatif = { workspace = true }
+tracing = { workspace = true }
 llguidance = { workspace = true, optional = true }
 toktrie = { workspace = true, optional = true }
 toktrie_hf_tokenizers = { workspace = true, optional = true }
