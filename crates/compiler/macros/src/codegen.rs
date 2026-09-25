@@ -11684,6 +11684,17 @@ pub fn emit_model(
     // `pub const KTIR_BUNDLE` for the per-model module; empty otherwise.
     let mut ktir_bundle_const = proc_macro2::TokenStream::new();
 
+    // Canonic­als the m2 front-end swap refused for want of a metal kernel
+    // (dense MoE today: `NoMetalRealization`). The bucket-table emission
+    // bakes these NO tape variants so `MetalWorkerPool::for_buckets`
+    // refuses at load (`BucketLower`) — the documented contract. Without
+    // this set the bake would lower the empty placeholder stream into
+    // VALID empty-command tapes, the forward would run a no-op dispatch,
+    // and the generated tail would die on `arena[terminal_slot]` with an
+    // inscrutable index-OOB.
+    #[cfg(feature = "metal")]
+    let mut metal_refused_buckets: HashSet<crate::assignment::WorkloadPoint> = HashSet::new();
+
     // PD-wavefront macro-emission (env-gated, diagnostic + the const builder).
     // HERE — not in the pre-emit drive — because the decode bucket's
     // `weight_slots` (the real weight-locator source) only exists post-lowering
@@ -12547,17 +12558,25 @@ pub fn emit_model(
                     Err(e) => {
                         // A refusal that means METAL HAS NO KERNEL is not a
                         // front-end gap: the runtime-lowering path refused
-                        // these too, at load, and the bake below already
-                        // bakes an empty variant list for them. Panicking
-                        // would make a dense-MoE preset abort the whole
-                        // build for an arch whose QUANTIZED presets lower
-                        // fine (mixtral).
+                        // these too, at load. Panicking would make a
+                        // dense-MoE preset abort the whole build for an arch
+                        // whose QUANTIZED presets lower fine (mixtral).
                         assert!(
                             !tape_pilot_arch || e.is_no_metal_realization(),
                             "[m2-flip] {} m={m}: the shared tape refused a DECLARED pilot \
                              ({e:?}) — with the solve off there is no fallback",
                             model.source_stem,
                         );
+                        // ⛔ THE REFUSAL MUST REACH THE POOL. The bake lowers
+                        // the placeholder stream into VALID empty-command
+                        // tapes unless this canonical is marked: the pool
+                        // then builds, the forward runs a no-op dispatch,
+                        // and the generated tail dies on
+                        // `arena[terminal_slot]` index-OOB. Marking the
+                        // canonical makes the bake emit `tapes: &[]` so
+                        // `MetalWorkerPool::for_buckets` refuses at load —
+                        // the documented contract.
+                        metal_refused_buckets.insert(*canonical);
                         eprintln!("[m2-eq] {} m={m} wavefront REFUSED: {e}", model.source_stem)
                     }
                 }
@@ -12882,6 +12901,23 @@ pub fn emit_model(
                         )
                     }
                 };
+            // A canonical the m2 front-end swap refused (dense MoE: no
+            // metal kernel) must reach the pool as a refusal too. Baking
+            // the placeholder stream would lower VALID empty-command
+            // tapes — the pool builds, the forward runs a no-op, and the
+            // generated tail panics on `arena[terminal_slot]` index-OOB.
+            // Empty variant list = the pool refuses at load (`BucketLower`)
+            // with the bucket named. Same contract as `Unlowerable` above.
+            let tapes_expr = if metal_refused_buckets.contains(&canonical) {
+                eprintln!(
+                    "[metal static tape] {}: bucket_m={m}: front-end REFUSED this canonical — \
+                     baking an empty variant list so the pool refuses at load",
+                    model.source_stem
+                );
+                quote! { &[] }
+            } else {
+                tapes_expr
+            };
             let ident = bucket_static_ident("METAL_TAPES_M", wp);
             metal_arena_bytes_statics.push(quote! {
                 #[cfg(feature = "metal")]

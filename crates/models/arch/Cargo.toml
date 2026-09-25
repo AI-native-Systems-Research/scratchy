@@ -108,6 +108,7 @@ all-arches = [
 
 # deepseek-v2 (1 configs)
 "deepseek-v2-lite" = ["arch-deepseek-v2"]
+"deepseek-v2-lite-parity-tiny" = ["arch-deepseek-v2"]
 
 # deepseek-v3 (4 configs)
 "deepseek-v3-academic-9b-fp8-block" = ["arch-deepseek-v3"]
@@ -195,6 +196,7 @@ all-arches = [
 
 # mixtral (2 configs)
 "mixtral-1-layer" = ["arch-mixtral"]
+"mixtral-1-layer-parity-tiny" = ["arch-mixtral"]
 "mixtral-8x7b-instruct-v0.1" = ["arch-mixtral"]
 
 # modernbert (2 configs)
@@ -240,6 +242,7 @@ all-arches = [
 
 # qwen2-moe (1 configs)
 "slimed-qwen-3" = ["arch-qwen2-moe"]
+"slimed-qwen-3-parity-tiny" = ["arch-qwen2-moe"]
 
 # qwen2-vl (4 configs)
 "qwen2-vl-2b-instruct" = ["arch-qwen2-vl"]
@@ -269,6 +272,7 @@ all-arches = [
 
 # qwen3-moe (2 configs)
 "qwen3-30b-a3b-instruct-2507" = ["arch-qwen3-moe"]
+"qwen3-30b-a3b-instruct-2507-parity-tiny" = ["arch-qwen3-moe"]
 "qwen3-moe-1-layer" = ["arch-qwen3-moe"]
 
 # `<arch>` (bare arch name) — every checked-in config for that one arch,
@@ -280,6 +284,7 @@ all-arches = [
 ]
 "deepseek-v2" = [
     "deepseek-v2-lite",
+    "deepseek-v2-lite-parity-tiny",
 ]
 "deepseek-v3" = [
     "deepseek-v3-academic-9b-fp8-block",
@@ -367,6 +372,7 @@ all-arches = [
 ]
 "mixtral" = [
     "mixtral-1-layer",
+    "mixtral-1-layer-parity-tiny",
     "mixtral-8x7b-instruct-v0.1",
 ]
 "modernbert" = [
@@ -412,6 +418,7 @@ all-arches = [
 ]
 "qwen2-moe" = [
     "slimed-qwen-3",
+    "slimed-qwen-3-parity-tiny",
 ]
 "qwen2-vl" = [
     "qwen2-vl-2b-instruct",
@@ -441,6 +448,7 @@ all-arches = [
 ]
 "qwen3-moe" = [
     "qwen3-30b-a3b-instruct-2507",
+    "qwen3-30b-a3b-instruct-2507-parity-tiny",
     "qwen3-moe-1-layer",
 ]
 # `all` — every checked-in config, every arch (CI's full-scope build);
@@ -450,6 +458,7 @@ all = [
     "c4ai-command-r-v01-parity-tiny",
     "command-r-1-layer",
     "deepseek-v2-lite",
+    "deepseek-v2-lite-parity-tiny",
     "deepseek-v3-academic-9b-fp8-block",
     "deepseek-v3-academic-9b",
     "deepseek-v3-tiny",
@@ -511,6 +520,7 @@ all = [
     "mistral-7b-instruct-v0.3-parity-tiny",
     "mistral-nemo-instruct-2407",
     "mixtral-1-layer",
+    "mixtral-1-layer-parity-tiny",
     "mixtral-8x7b-instruct-v0.1",
     "modernbert-base-1-layer",
     "modernbert-base",
@@ -546,6 +556,7 @@ all = [
     "qwen2.5-vl-72b-instruct",
     "qwen2.5-vl-7b-instruct",
     "slimed-qwen-3",
+    "slimed-qwen-3-parity-tiny",
     "qwen2-vl-2b-instruct",
     "qwen2-vl-2b-mlx",
     "qwen2-vl-72b-instruct",
@@ -563,6 +574,7 @@ all = [
     "qwen3.5-35b-a3b",
     "qwen3.5-9b",
     "qwen3-30b-a3b-instruct-2507",
+    "qwen3-30b-a3b-instruct-2507-parity-tiny",
     "qwen3-moe-1-layer",
 ]
 
