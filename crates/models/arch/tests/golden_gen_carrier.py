@@ -1225,6 +1225,204 @@ def avg_pool_2d(x):
     return pooled.reshape(l // f, e)
 
 
+def embed_keys_of(carrier_text):
+    """Manifest keys passed as `embed(input_ids, <key>)` — the Embedding
+    leaves (verbatim [vocab, hidden] on disk; also the tie source)."""
+    return {m.group(1) for m in re.finditer(
+        r"embed\(\s*input_ids\s*,\s*([A-Za-z_][A-Za-z_0-9.]*)\s*\)", carrier_text)}
+
+
+def is_tied(arch, cfg):
+    """config.rs tie resolution: explicit config flag, else the arch's
+    tie_default (gemma2/gemma3)."""
+    aj_path = ARCH_DIR / arch / "arch.json"
+    aj = json.loads(aj_path.read_text()) if aj_path.exists() else {}
+    return bool(cfg.get("tie_word_embeddings", aj.get("tie_default", False)))
+
+
+# ───────────────────────── synthetic checkpoint writer ─────────────────────────
+# Emits `model.safetensors` + `config.json` in HF layout from the SAME
+# tree tensors the oracle just executed, replicating codegen.rs
+# `safetensors_prefix` (digit-suffix translation, weight_leaf_renames,
+# layered `model.layers.{l}.{path}`, unlayered `model.{path}`, lm_head
+# top-level, decoder-prefix wrap/replace, packed-split row-wise fusion,
+# tie omission) — so the Rust gate loads byte-identical weights through
+# the macro-emitted `load`. One mechanism for every arch; per-arch
+# facts are the arch.json / weights.json declarations already read.
+
+
+def _ckpt_key(joined, index, dec_prefix):
+    """safetensors_prefix for a non-vision path: layered/unlayered/lm_head
+    + decoder_safetensors_prefix wrap/replace."""
+    if joined == "lm_head":
+        return "lm_head"
+    key = f"model.layers.{index}.{joined}" if index is not None else f"model.{joined}"
+    if dec_prefix is None:
+        return key
+    prefix = dec_prefix.rstrip(".")
+    if key == "lm_head":
+        return key
+    if key.startswith("model") and prefix.startswith("model"):
+        return f"{prefix}{key[len('model'):]}"
+    return f"{prefix}.{key}"
+
+
+def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier_text):
+    from safetensors.torch import save_file
+
+    aj = {}
+    aj_path = ARCH_DIR / arch / "arch.json"
+    if aj_path.exists():
+        aj = json.loads(aj_path.read_text())
+    dec_prefix = aj.get("decoder_safetensors_prefix")
+    renames = aj.get("weight_leaf_renames") or {}
+    packed = manifest.get("__packed_splits__") or {}
+    packed_targets = {t for targets in packed.values() for t in targets}
+    tie = bool(cfg.get("tie_word_embeddings", aj.get("tie_default", False)))
+
+    normalized = {}
+    for key, dims in manifest.items():
+        if key.startswith("__"):
+            continue
+        if isinstance(dims, dict):
+            dims = dims["shape"]
+        normalized[key] = dims
+
+    # Which keys are layered: the SAME `[...]`-ref census synth_trees
+    # applies (the DSL solver's signal — a manifest key is per-layer
+    # iff the carrier indexes it).
+    layered_refs = {m.group(1) for m in re.finditer(
+        r"([A-Za-z_][A-Za-z_0-9.]*)\[", carrier_text)}
+    bundle_args = bundle_call_args(carrier_text)
+    # The embed() call's weight argument — an Embedding ([vocab, hidden]
+    # on disk verbatim, NOT a transposed Linear), discovered from the
+    # carrier text exactly as the macro's embed matcher does.
+    embed_keys = embed_keys_of(carrier_text)
+
+    def resolve(key):
+        """Tree walk: `a.b.c` → trees.a.b.c (Layered distributes)."""
+        node = trees
+        for p in key.split("."):
+            node = getattr(node, p)
+        return node
+
+    def dsl_to_disk(key):
+        """digit-suffix translation + weight_leaf_renames (longest-suffix
+        match — codegen applies first hit; renames are ordered by
+        descending suffix length in arch.json authoring)."""
+        segs = [re.sub(r"_(\d+)$", r".\1", s) for s in key.split(".")]
+        joined = ".".join(segs)
+        for dsl_leaf, disk_leaf in renames.items():
+            if joined == dsl_leaf:
+                return disk_leaf
+            if (head := joined[: -len(dsl_leaf) - 1] if joined.endswith("." + dsl_leaf) else None) is not None:
+                return f"{head}.{disk_leaf}"
+        return joined
+
+    def disk_prefix(key, index):
+        return _ckpt_key(dsl_to_disk(key), index, dec_prefix)
+
+    # The GDN bundle: GatedDeltaNetLayer::load reads
+    # `{prefix}.conv1d.weight` (capital-A) `A_log` / `dt_bias` /
+    # `norm.weight` under the bundle's OWN disk prefix; the oracle leaf
+    # is lowercase `a_log`. in_proj/out_proj siblings are ordinary
+    # gemms under their own manifest keys.
+    def is_gdn_bundle(key):
+        return f"{key}[" in bundle_args and key.split(".")[-1] == "linear_attn"
+
+    out = {}
+
+    def put(key, tensor):
+        # bf16 on disk — the gate's GpuWeights runs set_target_dtype(BF16).
+        out[key] = tensor.detach().to(torch.bfloat16).contiguous()
+
+    def put_f32(key, tensor):
+        out[key] = tensor.detach().to(torch.float32).contiguous()
+
+    for key, dims in normalized.items():
+        if key in packed_targets:
+            continue  # written fused into its packed parent below
+        if key == "lm_head" and tie:
+            # tie_word_embeddings: NO lm_head on disk — the macro reuses
+            # embed_tokens (FieldLoad::LinearTiedToEmbedding).
+            continue
+        node = resolve(key)
+        is_layered = key in layered_refs
+        vals = list(node) if is_layered else [node]
+        if is_gdn_bundle(key):
+            for l, bundle in enumerate(vals):
+                pre = disk_prefix(key, l if is_layered else None)
+                put(f"{pre}.conv1d.weight", bundle.conv1d)
+                put_f32(f"{pre}.A_log", bundle.a_log)
+                put(f"{pre}.dt_bias", bundle.dt_bias)
+                put_f32(f"{pre}.norm.weight", bundle.norm)
+            continue
+        for l, t in enumerate(vals):
+            pre = disk_prefix(key, l if is_layered else None)
+            # `dotted.sibling` keys resolve to sub-Trees via `resolve`;
+            # a leaf whose parent chain hits a bundle marker merges into
+            # the bundle Tree (synth_trees moved it there) — ordinary
+            # attr walk handles both.
+            if isinstance(t, Tree):
+                continue  # non-GDN bundle markers are not gate phase-1
+            w = t
+            if hasattr(w, "bias") and isinstance(w.bias, torch.Tensor):
+                # `.bias` sibling (synth_trees attached it, or the
+                # manifest declared it via the dotted namespace).
+                put(f"{pre}.bias", w.bias)
+            if w.ndim == 2 and key not in embed_keys:
+                # gemm [K, N] → on-disk Linear [N, K]
+                put(f"{pre}.weight", w.T)
+            elif w.ndim == 3 and key.split(".")[-1] == "conv1d":
+                put(f"{pre}.weight", w)
+            else:
+                # Embedding [vocab, hidden] verbatim, norm gains [D],
+                # moe stacks
+                put(f"{pre}.weight", w)
+
+    # Packed splits: fuse each target group ROW-WISE into
+    # `{grandparent}.{parent}.weight` (weights.rs
+    # synthesize_packed_row_split_sizes carves them back out in
+    # listed order). Targets are written TRANSPOSED first, so the
+    # packed rows are output rows. The parent is NOT a manifest key
+    # (synth_trees never built it) — the fused tensor is assembled
+    # from its targets here.
+    for parent, targets in packed.items():
+        is_layered = any(t in layered_refs for t in targets)
+        l_indices = range(depth) if is_layered else [None]
+        for l in l_indices:
+            packed_rows = []
+            for t in targets:
+                w = resolve(t)
+                w = w[l] if t in layered_refs else w
+                packed_rows.append(w.T)
+            fused = torch.cat(packed_rows, dim=0)
+            pre = disk_prefix(parent, l)
+            put(f"{pre}.weight", fused)
+            # `.bias` siblings carve identically — fuse those too.
+            bias_rows = []
+            for t in targets:
+                w = resolve(t)
+                w = w[l] if t in layered_refs else w
+                if hasattr(w, "bias") and isinstance(w.bias, torch.Tensor):
+                    bias_rows.append(w.bias)
+            if bias_rows and len(bias_rows) == len(targets):
+                put(f"{pre}.bias", torch.cat(bias_rows, dim=0))
+
+    # tie_word_embeddings: NO lm_head on disk — the macro reuses
+    # embed_tokens (FieldLoad::LinearTiedToEmbedding). An untied
+    # lm_head was already written above as an ordinary gemm.
+
+    ckpt_dir = out_dir / "checkpoint"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    save_file(out, str(ckpt_dir / "model.safetensors"))
+    # config.json: the shrunk config VERBATIM — it is the config the
+    # tiny stem was checked in as, so the gate's fingerprint (embed
+    # shape, layer count, theta) matches the compiled variant.
+    (ckpt_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    return ckpt_dir
+
+
 def forward(fn):
     """`@forward` under torch is the identity — the decorator carries
     compile-time metadata only."""
@@ -1313,8 +1511,14 @@ def main():
     eval_params(arch, cfg, bounds)
     manifest = json.loads((ARCH_DIR / arch / "weights.json").read_text())
 
-    is_vision = "vision_config" in json.loads((ARCH_DIR / arch / f"{stem}.json").read_text()) or \
-                json_path(json.loads((ARCH_DIR / arch / f"{stem}.json").read_text()), "vision_config") is not None
+    # Vision classification is the CARRIER DECORATOR (parse_python.rs
+    # `PythonCarrier::vision`): `@vision_forward` → vision prelude,
+    # `@forward` → decoder. NOT config-based — qwen3-5 is a @forward
+    # text decoder whose configs nest a `vision_config` for the VL
+    # sibling, and the macro compiles those configs through the
+    # decoder path (text_config hoisted, vision_config ignored).
+    carrier = (DSL_DIR / f"{arch}.py").read_text()
+    is_vision = re.search(r"@vision_forward\s*(\(|\n)", carrier) is not None
 
     # ── STATE the shims read ──
     STATE["bounds"] = bounds
@@ -1374,8 +1578,18 @@ def main():
     n_blocks_needed = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
     STATE["block_table"] = [i for i in range(n_blocks_needed)]
 
-    carrier = (DSL_DIR / f"{arch}.py").read_text()
     trees = synth_trees(manifest, bounds, depth, carrier)
+    # tie_word_embeddings: HF ties lm_head to the embedding TABLE — the
+    # compiled side reuses the embed tensor (LinearTiedToEmbedding; the
+    # metal gemm computes x·W^T against the [vocab, hidden] table), so
+    # the oracle must consume the SAME tensor or the golden logits are
+    # computed against weights the tape never sees. The gemm shim takes
+    # [K, N], so the tied operand is the table transposed.
+    if is_tied(arch, cfg) and "lm_head" in manifest:
+        node = trees
+        for p in sorted(embed_keys_of(carrier))[0].split("."):
+            node = getattr(node, p)
+        trees.lm_head = node.T
 
     # ── ambient env the carrier body reads ──
     env = {k: v for k, v in globals().items() if not k.startswith("__")}
@@ -1454,6 +1668,10 @@ def main():
     }
     (out_dir / "harness.json").write_text(json.dumps(harness, indent=2))
     (out_dir / "goldens.json").write_text(json.dumps(manifest_out, indent=2))
+    if not is_vision:
+        ckpt = write_checkpoint(
+            out_dir, arch, cfg, manifest, bounds, trees, depth, carrier)
+        print(f"[{arch}/{stem}] checkpoint → {ckpt}")
     print(f"[{arch}/{stem}] logits {tuple(logits.shape)} → {out_dir}")
 
 

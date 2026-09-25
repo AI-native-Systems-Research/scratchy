@@ -241,6 +241,7 @@ all-arches = [
 "qwen2-vl-7b-instruct" = ["arch-qwen2-vl"]
 
 # qwen3 (5 configs)
+"qwen3-0.6b-parity-tiny" = ["arch-qwen3"]
 "qwen3-0.6b-bnb-4bit" = ["arch-qwen3"]
 "qwen3-0.6b" = ["arch-qwen3"]
 "qwen3-1.7b" = ["arch-qwen3"]
@@ -404,6 +405,7 @@ all-arches = [
     "qwen2-vl-7b-instruct",
 ]
 "qwen3" = [
+    "qwen3-0.6b-parity-tiny",
     "qwen3-0.6b-bnb-4bit",
     "qwen3-0.6b",
     "qwen3-1.7b",
@@ -527,6 +529,7 @@ all = [
     "qwen2-vl-2b-mlx",
     "qwen2-vl-72b-instruct",
     "qwen2-vl-7b-instruct",
+    "qwen3-0.6b-parity-tiny",
     "qwen3-0.6b-bnb-4bit",
     "qwen3-0.6b",
     "qwen3-1.7b",
@@ -637,3 +640,17 @@ objc2-metal = { version = "0.3", features = ["MTLDevice"] }
 # bf16 logits readback in the qwen3 py-carrier parity test
 # (tests/qwen3_py_parity.rs).
 half = { workspace = true }
+# harness.json / checkpoint config.json reads + ForwardCtxHandle /
+# ForwardDeviceHandle in the universal carrier parity gate
+# (tests/carrier_parity.rs).
+serde_json = { workspace = true }
+scratchy-tensors = { path = "../../tensors" }
+
+# The qwen3 py-parity test drives the real HF snapshot for the full
+# `qwen3-0.6b` stem directly (module path + goldens), so it only builds
+# when that stem is in scope. The universal gate (tests/carrier_parity.rs)
+# has no such requirement — it skips arches the build doesn't scope in.
+[[test]]
+name = "qwen3_py_parity"
+required-features = ["qwen3-0.6b"]
+
