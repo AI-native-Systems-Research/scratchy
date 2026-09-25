@@ -120,7 +120,7 @@ struct PagedBlockLoaderT {
   // `first_lb`. The thread's row lives in sub-page `row_page`; clamp to the
   // last allocated page so a partial tail tile never derefs an unallocated
   // block-table slot (those out-of-range rows are zeroed by load_safe).
-  METAL_FUNC const device T* resolve(int first_lb) const {
+  METAL_FUNC const device T* resolve(int first_lb) const thread {
     int lb = first_lb + int(row_page);
     if (lb >= num_pages) {
       lb = num_pages - 1;
@@ -149,7 +149,7 @@ struct PagedBlockLoaderT {
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
       ushort simd_lane_id [[thread_index_in_simdgroup]],
-      const device T* scratch_base_ = nullptr)
+      const device T* scratch_base_ = nullptr) thread
       : src_ld(src_ld_),
         tile_stride(BROWS * src_ld_),
         thread_idx(simd_group_id * 32 + simd_lane_id),
@@ -173,7 +173,7 @@ struct PagedBlockLoaderT {
   // ===== Methods copied verbatim from `BlockLoaderT` =====================
 
   /* Load from device memory into threadgroup memory — without bound checking */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       STEEL_PRAGMA_UNROLL
@@ -184,7 +184,7 @@ struct PagedBlockLoaderT {
   }
 
   /* Load from device memory into threadgroup memory — with bound checking */
-  METAL_FUNC void load_safe(short2 src_tile_dim) const {
+  METAL_FUNC void load_safe(short2 src_tile_dim) const thread {
     src_tile_dim = src_tile_dim - short2(bj, bi);
 
     if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
@@ -225,7 +225,7 @@ struct PagedBlockLoaderT {
   // ===== End verbatim copy ==============================================
 
   /* Iteration helper — advance to the next K-tile (kPagesPerTile pages). */
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     logical_block += kPagesPerTile;
     src = resolve(logical_block);
   }
@@ -234,7 +234,7 @@ struct PagedBlockLoaderT {
    * Used by the sliding-window kernel to skip K/V tiles entirely older than
    * the attention window. The kernel speaks in BK-tile units; the loader owns
    * the page-unit conversion so BK=BLOCK_SIZE (1 page/tile) is unchanged. */
-  METAL_FUNC void seek(int tile) {
+  METAL_FUNC void seek(int tile) thread {
     logical_block = tile * kPagesPerTile;
     src = resolve(logical_block);
   }
@@ -284,7 +284,7 @@ struct PagedKVBlockLoader {
       const device uint* block_table_row_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
       : cache_base(cache_base_),
         kv_blk_stride(kv_blk_stride_),
         kv_head_stride(kv_head_stride_),
@@ -297,7 +297,7 @@ struct PagedKVBlockLoader {
         dst(dst_ + bi * kDstStrRow + bj * kDstStrCol) {}
 
   /* Load this thread's slice of the current paged block. */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     // Spans: block_table bit 31 carries the rope-on-read unrotated flag;
     // mask it off for addressing. Identity for non-spans (the worker only
     // ever sets bit 31 when ROPE_ON_READ), so this is a free ALU op there.
@@ -316,7 +316,7 @@ struct PagedKVBlockLoader {
   /* Bounded variant: zero out positions past `src_tile_dim`.
    * For paged cache the bounds-checked path fires on the last
    * partial K block (kL_rem < BROWS). */
-  METAL_FUNC void load_safe(short2 src_tile_dim) const {
+  METAL_FUNC void load_safe(short2 src_tile_dim) const thread {
     src_tile_dim = src_tile_dim - short2(bj, bi);
 
     if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
@@ -361,7 +361,7 @@ struct PagedKVBlockLoader {
     }
   }
 
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     logical_block += 1;
   }
 };
