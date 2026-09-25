@@ -3704,7 +3704,7 @@ pub fn transpose(
 ) -> Result<Vec<EmittedOp>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let a = ins[0];
-    // The INPUT's view IS the op's `[mb, out]`: `assemble_transpose` iterates the input shape and the
+    // The INPUT's view IS the op's `[rows, cols]`: the builder iterates the input shape and the
     // output is its transpose. Read from the input so the two cannot be read from the same place and
     // agree vacuously.
     let (mb, cols) = (a.v_rows, a.v_cols);
@@ -3714,9 +3714,9 @@ pub fn transpose(
     if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
         return err(format!(
             "{name}: transposing t{} `[{mb}, {cols}]` into t{} `[{cols}, {mb}]` — BOTH extents must \
-             be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. An \
-             `interslicetranspose_fp16` sticks its input on the column extent and its output on the \
-             8x8 inter-slice block over (columns, rows), so each extent is a stick extent of one side; \
+             be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. This relayout \
+             sticks its INPUT on the column extent and its OUTPUT on the row extent — the two axes \
+             swap, which is the transposition — so each extent is a stick extent of one side; \
              a sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040), and the on-card \
              ReStickify that was asked for the per-step `[1, {stk}]` key anyway wrote the SECOND \
              transposed stick wrong and garbled decode past {stk} tokens. Pad the offending extent up \
@@ -3755,7 +3755,7 @@ pub fn transpose(
         if x.c_start != 0 || x.c_len != x.v_cols {
             return err(format!(
                 "{name}: the {role} t{} takes columns {}..{} of its `[{}, {}]` view — \
-                 `assemble_transpose` names a tensor and its two extents, with no column corner and \
+                 the relayout builder names a tensor and its two extents, with no column corner and \
                  no window, so it transposes the WHOLE buffer. Materialize the window first.",
                 x.tid,
                 x.c_start,
@@ -3782,12 +3782,26 @@ pub fn transpose(
             a.tid, a.r_cover.0, a.r_cover.1,
         ));
     }
+    // ⛔⛔⛔ THE RELAYOUT GOES OUT ON THE **RESTICKIFY** DOOR, NOT ON `OpFunc::Transpose`.
+    //
+    // `interslicetranspose_fp16` is the op named for this job and it CANNOT BE TRANSLATED at the
+    // default RCUDD1A arch, at any shape. Its output stick is the 8×8 inter-slice block over
+    // (`out`, `mb`) — TWO dims — and `Ddc::transformForInterSliceRestickify` turns a relayout's output
+    // stick into a dynamic mask over the innermost loop carrying `outputStickDimOrder[0]`, which for a
+    // 2-D tile is the FUSED `loop_dsX_dsY_out_mb`; `SNComputeLowering::constructDynamicMasking` accepts
+    // one loop carrying ONE dim (`SNComputeLowering.cpp:74`). Measured through `dxp_standalone`: every
+    // shape refuses there, including shapes whose core division splits both axes like the golden
+    // `sdsc_interslicetranspose.json` — which is what ruled the core division out as the cause.
+    // `OpFunc::Restickify` does the SAME transposition with a one-dim output stick and is accepted.
+    // See `super::restickify_transpose_opspec_2d`, which states the addressing argument in full, and
+    // `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors' output sticks.
+    //
     // ⛔ THE FALLIBLE FORM, because the builder makes a refusal this body cannot pre-check: the
-    // per-core division must land on the output's 8×8 block, and what the division IS depends on
-    // `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
-    // divider; calling the panicking `assemble_transpose` would abort the build with a bare panic
-    // where a producer needs an error against its own op. See `super::try_assemble_transpose`.
-    super::try_assemble_transpose(
+    // per-core tile must fit LX and this door cannot time-tile, and what the per-core tile IS depends
+    // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
+    // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
+    // error against its own op.
+    super::try_assemble_restickify_transpose_2d(
         &format!("transpose_o{}", out.tid),
         mb,
         cols,
