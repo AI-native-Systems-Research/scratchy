@@ -26,9 +26,15 @@ jobs:
   # `cudarc` (nvcc), so a GPU backend feature is required. We install only the
   # nvcc + cudart sub-packages via the network installer and cache them.
   #
-  # Compile + lint only: the hosted runner has no GPU, so kernel tests can't
-  # run. linux-arm64 is intentionally absent — GitHub's free ARM runners are
-  # public-repo only, and this repo is private.
+  # Compile + lint only where a GPU is required: the hosted runner has none, so
+  # kernel tests can't run here. What needs no GPU is tested — see the
+  # bench-harness steps at the end of the job.
+  #
+  # linux-arm64 is intentionally absent: nothing this job covers branches on
+  # architecture. The bench harness is the case in point — six `target_os` cfgs
+  # and zero `target_arch` ones, because the axis that divides it is Linux vs
+  # macOS, and both sides already have a job. CUDA has no aarch64 story in this
+  # build either, so a fifth job would re-run identical tests on identical code.
   # ---------------------------------------------------------------------------
   linux-cuda:
     name: linux-amd64 (cuda)
@@ -115,6 +121,36 @@ jobs:
           --exclude scratchy-target-metal
           --exclude scratchy-target-metal-compiler
           -- -D warnings
+
+      # The `--workspace` clippy above has no `--all-targets`: it builds
+      # lib+bins only, so every `#[cfg(test)]` block in the workspace is
+      # invisible to it and no job anywhere compiles them. These two steps close
+      # that for the one crate whose tests need no hardware at all.
+      #
+      # `--all-targets` can't simply be added to the workspace clippy: it would
+      # also build ktir-emulator's two known-broken examples (bench,
+      # ktir_diff_run) — the pre-existing MTL3->MTL4 gap documented at the KTIR
+      # steps in macos-metal, which is why those use `--lib --tests`. Hence a
+      # `-p`-scoped step instead.
+      #
+      # No backend feature, deliberately. scratchy-bench is `default = []` with
+      # `cuda`/`metal` as pure pass-throughs to scratchy-serving-api and no
+      # backend cfg of its own, so featureless drops only the tests behind the
+      # optional `datasets` feature (the parquet RAG subcommands). What remains
+      # is the whole executable coverage of the startup harness's process
+      # handling — process groups, kill(-pgid), wait4/ECHILD — which is
+      # kernel/libc semantics with no GPU in it, and it is also the exact
+      # command a contributor with neither CUDA nor Metal can run. CI runs that
+      # configuration, not a superset of it.
+      #
+      # No `--locked`: the featureless resolution differs from the committed
+      # Cargo.lock (cargo adds cblas-sys 0.1.4 alongside 0.3.0), and no other
+      # step here uses it either. That staleness is a separate fix.
+      - name: Clippy (bench test targets)
+        run: cargo clippy -p scratchy-bench --all-targets -- -D warnings
+
+      - name: Bench harness tests (no backend feature)
+        run: cargo test -p scratchy-bench
 
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.

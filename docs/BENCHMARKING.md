@@ -247,3 +247,43 @@ scr bench startup --exec -m "$MODEL" --mode cli \
 A run whose validity checks fail prints them and exits non-zero. That is
 intentional: a FROZEN rep that faulted no more than COLD did not measure a frozen
 start, and reporting it would be worse than reporting nothing.
+
+## 6. Reproducing without a GPU
+
+Everything above assumes real hardware, but the harness itself is process
+management, not inference: it spawns a child, waits for a port or a line of
+stdout, samples `getrusage`, and tears the process group down afterwards. None of
+that needs a backend, and the crate is built so that it doesn't — `default = []`,
+`cuda`/`metal` are pure pass-throughs to `scratchy-serving-api`, and there is no
+backend `cfg` in the crate. So the full test suite and the `scr` binary carrying
+`bench startup --exec` both build on any Linux or macOS box:
+
+```bash
+cargo test -p scratchy-bench          # the whole suite; no features, no GPU
+cargo build -p scratchy-cli --no-default-features --features bench
+./target/debug/scr bench startup --help   # renders the `--exec` section
+```
+
+Featureless drops only the tests behind the optional `datasets` feature (the
+parquet-backed `hotpotqa`/`multihop`/`msmarco` subcommands) — nothing that
+touches the startup harness, whose process handling those tests are the only
+executable coverage of. `linux-cuda` in `.github/workflows/rust.yml` runs these
+same commands, so reviewing the harness on a laptop runs the same gate CI does.
+Don't add `--locked`; the featureless resolution differs from the committed
+lockfile.
+
+**What this does not give you is a measurement.** Reviewing the harness's
+behaviour and publishing a number are different activities:
+
+- **A fake child measures nothing.** Per [Proving the eviction
+  happened](#proving-the-eviction-happened), a `read()`-based child never
+  produces major faults whatever the cache state — so a FROZEN rung driven by
+  `cat`/`dd`/`wc` is not measuring page-cache eviction, it is measuring `cat`.
+  Standing up a stub OpenAI server would validate the plumbing and nothing past
+  it.
+- **`--evict fadvise` is Linux-only** (`crates/benches/src/startup_exec/mod.rs`).
+  On macOS, FROZEN needs `--evict purge` and a live `sudo` ticket.
+- **Which rungs a GPU-less box may publish: none.** COLD and WARM still want a
+  real loader touching real weights, and FROZEN additionally wants the eviction
+  to have demonstrably taken effect. The reference figures stay the runs recorded
+  on real hardware — an H100 node for CUDA, an M5 Max for Metal.
