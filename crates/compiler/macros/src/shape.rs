@@ -2298,15 +2298,10 @@ impl InferCtx {
 mod tests {
     use super::*;
     use crate::classify::classify;
-    use crate::parse::parse_block;
+    use crate::parse_python::parse_body;
 
     fn classify_src(src: &str) -> Program {
-        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {src} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).expect("parse DSL");
+        let ast = parse_body(src).expect("parse DSL");
         classify(&ast).expect("classify")
     }
 
@@ -2386,19 +2381,18 @@ mod tests {
         // This is the acid test the plan promised: q_proj's shape
         // emerges as [hidden_size, num_attention_heads * head_dim].
         let p = classify_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                attn = attention(q, k, v, kv_cache[layer], block_table);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+                attn = attention(q, k, v, kv_cache[layer], block_table)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
         );
         let inf = infer(
             &p,
@@ -2462,18 +2456,17 @@ mod tests {
         // KV cache and no block table. The shape signature must accept
         // 3 args alongside the existing 5-arg decoder form.
         let p = classify_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                attn = attention(q, k, v);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                attn = attention(q, k, v)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
         );
         let inf = infer(
             &p,
@@ -2500,18 +2493,17 @@ mod tests {
         // Only 3 (encoder) and 5 (decoder) are valid; 4 must error so
         // typos like `attention(q, k, v, kv_cache)` don't slip through.
         let p = classify_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                attn = attention(q, k, v, kv_cache[layer]);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                attn = attention(q, k, v, kv_cache[layer])
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
         );
         let err = infer(
             &p,
@@ -2533,16 +2525,15 @@ mod tests {
         // MLP dims (intermediate_size) aren't pinned by any op
         // signature — they get anchored by the convention table.
         let p = classify_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-                gate = silu(gemm(normed, mlp.gate_proj[layer]));
-                up = gemm(normed, mlp.up_proj[layer]);
-                down = gemm(gate * up, mlp.down_proj[layer]);
-                hidden_states = add(down, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, post_attention_layernorm[layer])
+                gate = silu(gemm(normed, mlp.gate_proj[layer]))
+                up = gemm(normed, mlp.up_proj[layer])
+                down = gemm(gate * up, mlp.down_proj[layer])
+                hidden_states = add(down, hidden_states)
+            ",
         );
         let inf = infer(
             &p,
@@ -2752,15 +2743,8 @@ mod tests {
         //   parse → classify → shape::infer → Inferred.locals[out]
         // is the dims we wrote in the DSL.
         let p = {
-            let file: syn::File = syn::parse_str(
-                "fn _carrier() { y = reshape(input_layernorm, [num_tokens, hidden_size]); }",
-            )
-            .expect("syn parse");
-            let block = match &file.items[0] {
-                syn::Item::Fn(f) => &*f.block,
-                _ => unreachable!(),
-            };
-            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            let ast = parse_body("y = reshape(input_layernorm, [num_tokens, hidden_size])")
+                .expect("DSL parse");
             crate::classify::classify(&ast).expect("classify")
         };
 
@@ -2807,17 +2791,10 @@ mod tests {
         // vision_merge_factor)` — kept symbolic through shape::infer
         // (the codegen folds the divisor against `bounds` later).
         let p = {
-            let file: syn::File = syn::parse_str(
-                "fn _carrier() {\n\
-                 merged = reshape(pixels, [num_tokens / vision_merge_factor, vision_merge_hidden]);\n\
-                 }",
+            let ast = parse_body(
+                "merged = reshape(pixels, [num_tokens / vision_merge_factor, vision_merge_hidden])",
             )
-            .expect("syn parse");
-            let block = match &file.items[0] {
-                syn::Item::Fn(f) => &*f.block,
-                _ => unreachable!(),
-            };
-            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            .expect("DSL parse");
             crate::classify::classify_with(&ast, crate::classified::Prelude::Vision)
                 .expect("classify (vision prelude)")
         };
@@ -2870,19 +2847,14 @@ mod tests {
         // future edit that desyncs the two trips here, before it
         // reaches a `#[vision_forward]` expansion.
         let p = {
-            let file: syn::File = syn::parse_str(
-                "fn _carrier() {\n\
-                 pixels_out = pixels;\n\
-                 cos_out = cos;\n\
-                 sin_out = sin;\n\
-                 }",
+            let ast = parse_body(
+                "
+                pixels_out = pixels
+                cos_out = cos
+                sin_out = sin
+                ",
             )
-            .expect("syn parse");
-            let block = match &file.items[0] {
-                syn::Item::Fn(f) => &*f.block,
-                _ => unreachable!(),
-            };
-            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            .expect("DSL parse");
             crate::classify::classify_with(&ast, crate::classified::Prelude::Vision)
                 .expect("classify (vision prelude)")
         };

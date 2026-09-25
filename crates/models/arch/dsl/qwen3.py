@@ -1,11 +1,10 @@
 # The qwen3 forward, in torch-idiom Python. Parsed by scratchy
-# (ruff_python_parser -> the identical Ast the Rust costume produced),
-# never executed by the compiler. Executed under torch only by the CI
-# oracle, where the SAME text is the reference implementation and the
-# spec at once.
+# (compiler/macros/src/parse_python.rs), never executed by the
+# compiler. Executed under torch only by the CI oracle, where the SAME
+# text is the reference implementation and the spec at once.
 #
 # Dialect: the carrier is the `@forward`-decorated `def` (the
-# decorator carries the metadata the `#[forward]` attribute did).
+# decorator carries the compile metadata).
 # Statements are `name = expr`, `(a, b, c) = expr`, `for ivar in
 # range(<bound>)`, `if <layer predicate>:` (with `else:`). Expressions
 # are op calls, attribute chains (weight refs), `[layer]` indexing,

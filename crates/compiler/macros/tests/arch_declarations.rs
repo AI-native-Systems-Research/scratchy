@@ -133,20 +133,21 @@ fn params_entries_are_ordered_and_single_source() {
     });
 }
 
-/// The carrier is a bare `fn`. A `mod` carrier is the shape the deleted
-/// const surface required, so it must fail — and say where declarations go.
+/// The carrier declares math only. A declaration const next to the `def`
+/// is what the deleted const surface looked like, so it must fail — and say
+/// where declarations go.
 #[test]
-fn mod_carrier_is_rejected_with_a_pointer_to_arch_json() {
-    let item: syn::Item = syn::parse_quote! {
-        mod qwen3 {
-            const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
-            fn forward() {}
-        }
-    };
-    // `Carrier` is deliberately not Debug, so match rather than expect_err.
-    let msg = match scratchy_forward_compiler_macro::parse_carrier(item) {
-        Ok(_) => panic!("a mod carrier must be rejected"),
-        Err(e) => e.to_string(),
+fn declaration_beside_the_carrier_is_rejected_with_a_pointer_to_arch_json() {
+    let src = "SCALE_DTYPE = ScaleDtype.Bf16
+
+@forward
+def qwen3():
+    x = embed(input_ids, embed_tokens)
+";
+    // `PythonCarrier` is deliberately not Debug, so match rather than expect_err.
+    let msg = match scratchy_forward_compiler_macro::parse_python_file(src) {
+        Ok(_) => panic!("a declaration beside the carrier must be rejected"),
+        Err(e) => e,
     };
     assert!(
         msg.contains("arch.json"),
@@ -154,15 +155,20 @@ fn mod_carrier_is_rejected_with_a_pointer_to_arch_json() {
     );
 }
 
-/// The bare form is accepted and takes the arch name from the fn ident.
+/// The bare form is accepted and takes the arch name from the `def`.
 #[test]
-fn bare_fn_carrier_is_accepted() {
-    let item: syn::Item = syn::parse_quote! {
-        fn llama() {
-            hidden_states = embed(input_ids, embed_tokens);
-        }
-    };
-    scratchy_forward_compiler_macro::parse_carrier(item).expect("bare fn carrier is THE form");
+fn bare_def_carrier_is_accepted() {
+    let carrier = scratchy_forward_compiler_macro::parse_python_file(
+        "@forward
+def llama():
+    hidden_states = embed(input_ids, embed_tokens)
+",
+    );
+    assert_eq!(
+        carrier.map(|c| c.arch_name).as_deref(),
+        Ok("llama"),
+        "bare def carrier is THE form"
+    );
 }
 
 /// No DSL file may reintroduce a `mod` carrier or declaration consts —
@@ -173,15 +179,15 @@ fn no_dsl_file_declares_anything_but_math() {
     let mut seen = 0;
     for e in std::fs::read_dir(&dsl).expect("dsl/").flatten() {
         let p = e.path();
-        if !p.to_string_lossy().ends_with(".rs.in") {
+        if p.extension().is_none_or(|x| x != "py") {
             continue;
         }
+        // The carrier parser admits only imports + one decorated `def` at
+        // the top level, so a declaration const fails here.
         let text = std::fs::read_to_string(&p).unwrap();
-        let file = syn::parse_file(&text).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
-        for item in &file.items {
-            assert!(
-                matches!(item, syn::Item::Fn(_)),
-                "{}: DSL files contain exactly one `#[forward] fn` and nothing else — \
+        if let Err(e) = scratchy_forward_compiler_macro::parse_python_file(&text) {
+            panic!(
+                "{}: {e} — DSL files contain exactly one `@forward` def and nothing else; \
                  declarations belong in configs/<arch>/arch.json",
                 p.display()
             );

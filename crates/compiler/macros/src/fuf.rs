@@ -557,17 +557,12 @@ mod tests {
     use crate::cfg::build_cfg;
     use crate::classify::classify;
     use crate::config::{self, ModelParams};
-    use crate::parse::parse_block;
+    use crate::parse_python::parse_body;
     use crate::shape::{Dim, infer};
     use std::path::PathBuf;
 
     fn classify_src(src: &str) -> crate::classified::Program {
-        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {src} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).expect("parse DSL");
+        let ast = parse_body(src).expect("parse DSL");
         classify(&ast).expect("classify")
     }
 
@@ -605,12 +600,11 @@ mod tests {
     fn loop_body_unrolls_n_times() {
         let params = llama_3_2_1b_params(); // num_hidden_layers = 16
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                hidden_states = add(hidden_states, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                hidden_states = add(hidden_states, hidden_states)
+            ",
             &params,
         );
         // 1 embed + 16 adds = 17 tiles.
@@ -632,13 +626,12 @@ mod tests {
     fn weight_index_resolves_to_concrete_integer() {
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..3 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                hidden_states = add(normed, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(3):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                hidden_states = add(normed, hidden_states)
+            ",
             &params,
         );
         // Inside the loop body, each rmsnorm reads input_layernorm
@@ -665,15 +658,14 @@ mod tests {
         // layout, which isn't hidden_size directly).
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..2 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                oproj = gemm(q, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(2):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                oproj = gemm(q, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
             &params,
         );
         for node in &fuf.nodes {
@@ -709,19 +701,18 @@ mod tests {
     fn rope_append_tuple_maps_three_locals_to_same_tile() {
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..1 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                attn = attention(q, k, v, kv_cache[layer], block_table);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(1):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+                attn = attention(q, k, v, kv_cache[layer], block_table)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
             &params,
         );
 
@@ -763,16 +754,15 @@ mod tests {
         // for Expr::Mul (silent wrong-answer at codegen time).
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..1 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                gate = silu(gemm(normed, mlp.gate_proj[layer]));
-                up = gemm(normed, mlp.up_proj[layer]);
-                down = gemm(gate * up, mlp.down_proj[layer]);
-                hidden_states = add(down, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(1):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                gate = silu(gemm(normed, mlp.gate_proj[layer]))
+                up = gemm(normed, mlp.up_proj[layer])
+                down = gemm(gate * up, mlp.down_proj[layer])
+                hidden_states = add(down, hidden_states)
+            ",
             &params,
         );
         let n_mul = fuf.nodes.iter().filter(|n| n.op == OpKind::Mul).count();
@@ -791,23 +781,21 @@ mod tests {
         // which must point at the taken arm's tile per iteration.
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..4 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                if layer % 2 == 0 {
-                    attn = attention(q, k, v, kv_cache[layer], block_table);
-                } else {
-                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
-                }
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(4):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+                if layer % 2 == 0:
+                    attn = attention(q, k, v, kv_cache[layer], block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
             &params,
         );
 
@@ -865,23 +853,21 @@ mod tests {
         let mut params = llama_3_2_1b_params();
         params.bounds.insert("num_dense_layers".to_string(), 2);
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..5 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                if layer < num_dense_layers {
-                    attn = attention(q, k, v, kv_cache[layer], block_table);
-                } else {
-                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
-                }
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(5):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+                if layer < num_dense_layers:
+                    attn = attention(q, k, v, kv_cache[layer], block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
             &params,
         );
         let attn_family: Vec<OpKind> = fuf
@@ -914,23 +900,21 @@ mod tests {
         // attention-family ordering matches the membership pattern.
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..8 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                if [1, 3].contains(&layer) {
-                    attn = attention(q, k, v, kv_cache[layer], block_table);
-                } else {
-                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
-                }
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(8):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+                if layer in [1, 3]:
+                    attn = attention(q, k, v, kv_cache[layer], block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            ",
             &params,
         );
         let attn_family: Vec<OpKind> = fuf
@@ -962,26 +946,25 @@ mod tests {
         // Acid test: realistic Llama body at realistic N (16).
         let params = llama_3_2_1b_params();
         let fuf = unroll_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                attn = attention(q, k, v, kv_cache[layer], block_table);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+                attn = attention(q, k, v, kv_cache[layer], block_table)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
 
-                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-                up = gemm(normed2, mlp.up_proj[layer]);
-                down = gemm(up, mlp.down_proj[layer]);
-                hidden_states = add(down, hidden_states);
-            }
-            normed = rmsnorm(hidden_states, norm);
-            logits = gemm(normed, lm_head);
-            "#,
+                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer])
+                up = gemm(normed2, mlp.up_proj[layer])
+                down = gemm(up, mlp.down_proj[layer])
+                hidden_states = add(down, hidden_states)
+            normed = rmsnorm(hidden_states, norm)
+            logits = gemm(normed, lm_head)
+            ",
             &params,
         );
 

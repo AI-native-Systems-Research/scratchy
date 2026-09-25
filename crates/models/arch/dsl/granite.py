@@ -1,8 +1,7 @@
 # The granite forward, in torch-idiom Python. Parsed by scratchy
-# (ruff_python_parser -> the identical Ast the Rust costume produced),
-# never executed by the compiler. Executed under torch only by the CI
-# oracle, where the SAME text is the reference implementation and the
-# spec at once.
+# (compiler/macros/src/parse_python.rs), never executed by the
+# compiler. Executed under torch only by the CI oracle, where the SAME
+# text is the reference implementation and the spec at once.
 import torch
 import torch.nn.functional as F
 

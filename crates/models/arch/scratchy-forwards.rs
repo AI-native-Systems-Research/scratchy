@@ -6,17 +6,14 @@
 //! DSL carrier from `dsl/<name>.py` (the `@forward`/`@vision_forward`-decorated
 //! `def` — the same math the `#[forward]` attribute used to annotate, now in
 //! torch-idiom Python), runs the shared pipeline
-//! (`scratchy_forward_compiler_macro::compile_ast`) over it against that arch's
+//! (`scratchy_forward_compiler_macro::compile_carrier`) over it against that arch's
 //! own `configs/<name>/`, and writes the emitted modules to
 //! `$OUT_DIR/<mod>.rs`, which `src/lib.rs` wraps in `pub mod <mod>` and
 //! `include!`s. The pipeline lib is a build-dependency; the backend feature
 //! (metal/cuda/…) is forwarded onto it so the emit matches what we then compile.
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
-use scratchy_forward_compiler_macro::{
-    CompileMode, DEFAULT_DECODER_WORKLOADS, ForwardArgs, PythonCarrier, compile_ast,
-    parse_python_file, render_tokens,
-};
+use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -115,29 +112,6 @@ fn enabled_quants(
     enabled
 }
 
-/// Build `ForwardArgs` from the carrier's `@forward(...)` /
-/// `@vision_forward(...)` decorator metadata, filling the default
-/// decoder ladder when `workloads` is omitted (bare `@forward`).
-/// Vision carriers always pass `workloads`.
-fn args_from_carrier(carrier: &PythonCarrier) -> ForwardArgs {
-    let mut args: ForwardArgs = syn::parse_str("").expect("empty #[forward] args");
-    args.workloads = if carrier.workloads.is_empty() {
-        DEFAULT_DECODER_WORKLOADS.to_vec()
-    } else {
-        carrier.workloads.clone()
-    };
-    if !carrier.sk_buckets.is_empty() {
-        args.sk_buckets = carrier.sk_buckets.clone();
-    }
-    if let Some(p) = &carrier.pixel_pack {
-        args.pixel_pack = Some(syn::parse_str(p).expect("pixel_pack path"));
-    }
-    if let Some(p) = &carrier.processor {
-        args.processor = Some(syn::parse_str(p).expect("processor path"));
-    }
-    args
-}
-
 /// Write `$OUT_DIR/hf_registry.rs`, the shell-completion candidate list
 /// `src/lib.rs` includes and `compiled_hf_registry()` returns.
 ///
@@ -183,24 +157,10 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
 
     let dsl = std::fs::read_to_string(dsl_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", dsl_path.display()));
-    let carrier = parse_python_file(&dsl, proc_macro2::Span::call_site())
-        .unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let mode = if carrier.vision {
-        CompileMode::VISION
-    } else {
-        CompileMode::DECODER
-    };
-    let args = args_from_carrier(&carrier);
-    let arch_name = carrier.arch_name.clone();
-    let tokens = compile_ast(
-        &args,
-        &arch_name,
-        proc_macro2::Span::call_site(),
-        carrier.ast,
-        mode,
-        configs_dir,
-    )
-    .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
+    let carrier =
+        parse_python_file(&dsl).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
+    let tokens = compile_carrier(carrier, configs_dir)
+        .unwrap_or_else(|e| panic!("forward pipeline ({mod_name}): {e}"));
     // Re-root the emit under `pub mod <mod>` (see reroot_crate).
     let tokens = reroot_crate(tokens, mod_name);
 
@@ -330,7 +290,7 @@ fn main() {
         std::env::set_var("SCRATCHY_QUANTS", &quants);
     }
 
-    // Emit arches in parallel. compile_in_dir is itself rayon-parallel over
+    // Emit arches in parallel. compile_carrier is itself rayon-parallel over
     // models, so this is nested (arch × model) work-stealing across all cores —
     // recovering the cross-crate parallelism the per-arch crate split used to get
     // from cargo, in one process.

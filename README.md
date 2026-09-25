@@ -17,7 +17,7 @@ that as is possible. It takes as input a triple:
 
 - a [DSL](https://en.wikipedia.org/wiki/Domain-specific_language) for
   the entire forward of a model architecture;
-  e.g. [**gemma4-moe**](crates/models/arch/dsl/gemma4-moe.rs.in#L58)
+  e.g. [**gemma4-moe**](crates/models/arch/dsl/gemma4-moe.py)
 - the config.json for a given instance of that architecture;
   e.g. [**gemma4-moe-26b-a4b-it**](crates/models/arch/configs/gemma4-moe/gemma-4-26b-a4b-it.json)
 - the JSON config for a given quantization;
