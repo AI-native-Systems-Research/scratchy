@@ -22,6 +22,9 @@ pub use ktir_core as ktir;
 /// (`::scratchy_target_spyre::bundle_code::BundleCode { … }`), so its tokens depend on the target crate
 /// rather than on where the types happen to live.
 pub use scratchy_spyre_bundle as bundle_code;
+/// Run a bundle this binary did not bake — see the module docs.
+#[cfg(feature = "spyre-hw")]
+pub mod bundle_run;
 /// Where a launched op reads and writes KV: the shim launch loop's per-op, per-page offset
 /// arithmetic, lifted out of C++. No SDK dependency and no feature gate — it is arithmetic, so it
 /// builds and is tested on any host, including one with no Spyre toolchain.

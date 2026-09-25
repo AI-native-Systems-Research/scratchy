@@ -96,6 +96,13 @@ async fn run() -> anyhow::Result<()> {
         Commands::Chat(args) => commands::chat::run_chat(args).await,
         Commands::CollectEnv(args) => commands::collect_env::run_collect_env(args).await,
         Commands::Complete(args) => commands::chat::run_complete(args).await,
+        #[cfg(feature = "spyre-hw")]
+        Commands::Bundle(cmd) => {
+            use crate::args::BundleSubcommand;
+            match cmd.command {
+                BundleSubcommand::Run(args) => commands::bundle::run(args),
+            }
+        }
         Commands::Model(cmd) => {
             use crate::args::{CacheSubcommand, ModelSubcommand};
             match cmd.command {

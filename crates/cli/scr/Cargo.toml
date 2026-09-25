@@ -53,7 +53,14 @@ spyre = ["scratchy-serving-api/spyre", "scratchy-serving-worker/spyre"]
 # not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never
 # true, so a real-card build silently shipped WITHOUT the guard and rustc reported an
 # `unexpected cfg value`. The emulator does not imply it.
-spyre-hw = ["spyre", "scratchy-serving-api/spyre-hw", "scratchy-serving-worker/spyre-hw"]
+spyre-hw = [
+  "spyre",
+  "scratchy-serving-api/spyre-hw",
+  "scratchy-serving-worker/spyre-hw",
+  # `scr bundle run`: the executor and the bundle types, directly.
+  "dep:scratchy-target-spyre",
+  "scratchy-target-spyre/spyre-hw",
+]
 spyre-emu = ["scratchy-serving-api/spyre-emu", "scratchy-serving-worker/spyre-emu"]
 # Server-side modifiers: no-op without `serve` (`?/` only forwards when
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
@@ -109,6 +116,10 @@ path = "src/main.rs"
 
 [dependencies]
 scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
+# `scr bundle run` ONLY. Every other spyre path in this binary goes through the serving crates;
+# launching a bundle this binary did not bake needs the executor and the bundle types directly, and
+# those live in the target crate. Optional, and reachable only under `spyre-hw`.
+scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-serving-api = { workspace = true, optional = true }
