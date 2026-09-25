@@ -22,6 +22,8 @@ concurrency:
 
 jobs:
   build:
+    # Forks don't have Pages enabled, so configure-pages would fail there.
+    if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
