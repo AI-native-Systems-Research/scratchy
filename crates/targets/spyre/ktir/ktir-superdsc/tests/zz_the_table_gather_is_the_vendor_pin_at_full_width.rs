@@ -22,11 +22,18 @@
 //!   pointwise gather is legal for exactly the reason a gathered matmul is not.
 //! * The op has THREE data operands, not two, so the index's position is load-bearing in a way the
 //!   2-operand fixtures cannot show. See `the_gathered_operand_must_be_the_last_input`.
+//!
+//! ## AND AT `ROWS = 256` THE DOOR NOW EMITS **EIGHT LEGS**, ONE PER 32-ENTRY INDEX STICK
+//! One gather op's index is ONE `SenUint32` stick, so a 256-entry node is CUT. Every assertion below
+//! is a property of ONE leg's descriptor and is read off leg 0; the leg count is asserted as a
+//! function of [`CopyDims::ENTRIES_PER_OP`] rather than as a literal, so a change to that constant
+//! moves the expectation instead of breaking the file. `mod gather_cut` in `emit/mod.rs` owns the
+//! cut's OWN properties (the row window, the per-leg entry base, the residency `N_`).
 
 use ktir_superdsc::emit as superdsc;
 use ktir_superdsc::emit::{In, PointwiseGather, assemble_pointwise_broadcast_gather};
 use ktir_superdsc::ir::island::tile_op::{TileOp, TileOpKind};
-use ktir_superdsc::sdsc_abstract::{RowBlockedTag, StickLayout, Stk};
+use ktir_superdsc::sdsc_abstract::{CopyDims, RowBlockedTag, StickLayout, Stk};
 use ktir_superdsc::superdsc_opspec::{Df, ItDim};
 
 /// Granite's embedding geometry, read off the descriptor the pod bakes
@@ -64,16 +71,16 @@ fn h(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
     Stk::new(name, StickLayout::row_blocked(rows as usize, cols as usize)).expect("row-blocked")
 }
 
-/// The embedding op exactly as `scalarmul`'s gathered branch builds it: `[scalar, table]` with the
-/// TABLE LAST, `multiply`, a row-blocked output.
-fn emit(rows: u32, cols: u32) -> Result<serde_json::Value, String> {
+/// The embedding op exactly as `scalarmul_at`'s gathered branch builds it: `[scalar, table]` with the
+/// TABLE LAST, `multiply`, a row-blocked output. ONE LEG PER INDEX STICK.
+fn emit_legs(rows: u32, cols: u32) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
     let table = h("EmbTable", rows, cols);
     let scale = h("EmbScale", rows, cols);
     let out = h("EmbOut", rows, cols);
     let t = tile(rows, cols);
     let inputs = [In::scalar(&scale).ew(), In::full(&table).ew()];
     let mut sym = 0i64;
-    let e = assemble_pointwise_broadcast_gather(
+    assemble_pointwise_broadcast_gather(
         PointwiseGather {
             op_name: "scalarmul_o2",
             tile_op: &t,
@@ -88,17 +95,35 @@ fn emit(rows: u32, cols: u32) -> Result<serde_json::Value, String> {
         &mut sym,
         None,
     )
-    .map_err(|e| e.0)?;
+    .map_err(|e| e.0)
+}
+
+/// LEG 0's descriptor, with the LEG COUNT checked on the way past — so no assertion below can be
+/// reading a node the door silently stopped cutting.
+fn emit(rows: u32, cols: u32) -> Result<serde_json::Value, String> {
+    let legs = emit_legs(rows, cols)?;
+    let cap = CopyDims::ENTRIES_PER_OP;
+    assert_eq!(
+        legs.len() as u32,
+        rows.div_ceil(cap.min(rows)),
+        "a {rows}-entry gather is one op per {cap}-entry index stick"
+    );
     // `EmittedOp` carries the descriptor in `op`; a KTIR-only op would have `None` there, and this one
     // is not that, so an absent descriptor is a failure rather than something to tolerate.
-    let d =
-        e.op.as_ref()
-            .expect("a gathered pointwise has a descriptor");
+    let d = legs[0]
+        .op
+        .as_ref()
+        .expect("a gathered pointwise has a descriptor");
     Ok(serde_json::to_value(d).expect("serializes"))
 }
 
+/// The one `{name: dsc}` entry of a leg. Keyed by POSITION rather than by name: a cut leg is named
+/// `scalarmul_o2_g0` and an uncut op `scalarmul_o2`, and this file's claims are about neither
+/// spelling.
 fn body(j: &serde_json::Value) -> &serde_json::Value {
-    &j["dscs_"][0]["scalarmul_o2"]
+    let m = j["dscs_"][0].as_object().expect("one dsc per leg");
+    assert_eq!(m.len(), 1, "one op per descriptor");
+    m.values().next().expect("the leg's body")
 }
 
 fn alloc(j: &serde_json::Value, i: usize) -> &serde_json::Value {
@@ -281,12 +306,18 @@ fn a_split_outside_the_entry_axis_is_refused() {
 /// check: one build, one artifact, no second path that could drift from it.
 #[test]
 fn dump_the_descriptor_for_the_pod_bake() {
-    let j = emit(ROWS, COLS).expect("emits");
-    let wrapped = serde_json::json!({ "0_scalarmul_o2": j });
-    let p = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("embedding_gather_sdsc_0.json");
-    std::fs::write(&p, serde_json::to_string_pretty(&wrapped).expect("json"))
-        .unwrap_or_else(|e| panic!("writing {}: {e}", p.display()));
-    eprintln!("WROTE {}", p.display());
+    // EVERY LEG, because the bundle the pod runs is all eight of them — dumping only leg 0 would hand
+    // `dxp_standalone` a bundle that gathers 32 of the node's 256 rows.
+    for (k, leg) in emit_legs(ROWS, COLS).expect("emits").iter().enumerate() {
+        let d = leg.op.as_ref().expect("a descriptor");
+        let key = format!("{k}_{}", leg.op_name);
+        let wrapped = serde_json::json!({ key: serde_json::to_value(d).expect("json") });
+        let p = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("embedding_gather_sdsc_{k}.json"));
+        std::fs::write(&p, serde_json::to_string_pretty(&wrapped).expect("json"))
+            .unwrap_or_else(|e| panic!("writing {}: {e}", p.display()));
+        eprintln!("WROTE {}", p.display());
+    }
 }
 
 /// ⭐ AND THE UNGATHERED OP AT THE SAME GEOMETRY DECLARES **NO INDIRECTION ANYWHERE** — the control
