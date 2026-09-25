@@ -3826,6 +3826,7 @@ dependencies = [
  "scratchy-target-cuda",
  "scratchy-target-metal",
  "scratchy-target-spyre",
+ "scratchy-tensors",
  "scratchy-vision",
  "serde_json",
  "syn 3.0.6",
