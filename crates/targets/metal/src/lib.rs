@@ -167,7 +167,6 @@ pub mod tape;
 /// Apple Silicon target profiles and cost models.
 pub mod targets;
 pub mod turboquant;
-pub mod turboquant_window;
 
 // Atom-driven metal megakernel synthesis (atom IR + fuse passes + AoT
 // metallib compile). Consumed by the compiler's metal codegen and the

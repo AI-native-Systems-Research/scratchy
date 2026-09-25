@@ -11,147 +11,20 @@
 // crates/serving/worker/src/gpu_worker.rs (`slot |= 0x8000_0000`). Enforced by
 // crates/targets/metal/tests/kv_index_bit31_mask_test.rs.
 //
-//! TurboQuant fused Metal kernels — a faithful port of arozanov's
-//! `turboquant_mlx/metal.py` (FUSED_QUANTIZE_KERNEL + DEQUANT_FP16_KERNEL).
-//! One threadgroup per vector, `dim` threads (dim <= 512, power of two).
+//! TurboQuant paged-KV kernels bound by the tape's TurboQuant ops; the codebook
+//! math (norm, signs, WHT butterfly, nearest-centroid, bit packing) is a port of
+//! arozanov's `turboquant_mlx/metal.py`. `dim` threads per threadgroup (dim <=
+//! 512, power of two).
 //!
-//! `tq_fused_quantize`: raw fp32 vectors -> packed uint32 codes + f32 norms,
-//! in one dispatch (norm reduction + normalize + signs + WHT butterfly +
-//! nearest-centroid + pack). The raw butterfly output is already ~N(0,1), so
-//! it digitizes against the unscaled boundaries directly.
+//! `tq_compress_paged[_bf16]`: one threadgroup per (new KV slot, kv_head) —
+//! quantize the pool vector into packed uint32 codes + an f32 norm in the
+//! packed store, optionally writing the lossy dequant back into the pool.
 //!
-//! `tq_dequant_fp16`: packed codes + norms -> fp16 reconstruction. This is the
-//! dequant-to-buffer kernel `cache.py` calls (whole prefill, or one new token
-//! per decode step via the incremental buffer).
+//! `tq_dequant_blocktable[_bf16]`: one threadgroup per (block, kv_head, seq) —
+//! dequant the active context from the packed store into the fp16/bf16 scratch.
 
 #include <metal_stdlib>
 using namespace metal;
-
-kernel void tq_fused_quantize(
-    device const float* inp          [[buffer(0)]],   // [n_vecs, dim] f32
-    device const float* signs        [[buffer(1)]],   // [dim] +/-1
-    device const float* boundaries   [[buffer(2)]],   // [n_centroids-1]
-    device       uint*  packed_out   [[buffer(3)]],   // [n_vecs, packed_dim]
-    device       float* norms_out    [[buffer(4)]],   // [n_vecs]
-    constant uint& dim               [[buffer(5)]],
-    constant uint& bits              [[buffer(6)]],
-    constant uint& vals_per_word     [[buffer(7)]],
-    constant uint& packed_dim        [[buffer(8)]],
-    constant uint& n_centroids       [[buffer(9)]],
-    uint pos  [[threadgroup_position_in_grid]],
-    uint elem [[thread_position_in_threadgroup]])
-{
-    threadgroup float shared[512];
-    shared[elem] = inp[pos * dim + elem];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // L2 norm via parallel reduction.
-    threadgroup float norm_shared[512];
-    norm_shared[elem] = shared[elem] * shared[elem];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = dim / 2; stride > 0; stride >>= 1) {
-        if (elem < stride) {
-            norm_shared[elem] += norm_shared[elem + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float vec_norm = sqrt(norm_shared[0]);
-    float safe_norm = max(vec_norm, 1e-8f);
-
-    // Normalize, apply signs.
-    shared[elem] = shared[elem] / safe_norm;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    shared[elem] = shared[elem] * signs[elem];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // WHT butterfly (raw — no 1/sqrt(d); output is already ~N(0,1)).
-    uint h = 1;
-    while (h < dim) {
-        uint block = elem / (2 * h);
-        uint offset = elem % (2 * h);
-        if (offset < h) {
-            uint j = block * 2 * h + offset;
-            float a = shared[j];
-            float b = shared[j + h];
-            shared[j] = a + b;
-            shared[j + h] = a - b;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        h *= 2;
-    }
-    float scaled = shared[elem];
-
-    // Nearest centroid = number of boundaries exceeded.
-    uint idx = 0;
-    for (uint b = 0; b < n_centroids - 1; b++) {
-        if (scaled > boundaries[b]) {
-            idx++;
-        }
-    }
-
-    // Pack: the thread owning each word's slot 0 collects vals_per_word codes.
-    threadgroup uint idx_shared[512];
-    idx_shared[elem] = idx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint word_idx = elem / vals_per_word;
-    uint pos_in_word = elem % vals_per_word;
-    if (pos_in_word == 0 && word_idx < packed_dim) {
-        uint word = 0;
-        for (uint i = 0; i < vals_per_word && (word_idx * vals_per_word + i) < dim; i++) {
-            word |= (idx_shared[word_idx * vals_per_word + i] & ((1u << bits) - 1u)) << (i * bits);
-        }
-        packed_out[pos * packed_dim + word_idx] = word;
-    }
-    if (elem == 0) {
-        norms_out[pos] = vec_norm;
-    }
-}
-
-kernel void tq_dequant_fp16(
-    device const uint*  packed    [[buffer(0)]],   // [n_vecs, packed_dim]
-    device const float* norms     [[buffer(1)]],   // [n_vecs]
-    device const float* centroids [[buffer(2)]],   // [n_centroids]
-    device const float* signs     [[buffer(3)]],   // [dim]
-    device       half*  out       [[buffer(4)]],   // [n_vecs, dim] fp16
-    constant uint&  dim           [[buffer(5)]],
-    constant uint&  bits          [[buffer(6)]],
-    constant uint&  vals_per_word [[buffer(7)]],
-    constant uint&  packed_dim    [[buffer(8)]],
-    constant float& scale         [[buffer(9)]],   // 1/sqrt(dim)
-    uint pos  [[threadgroup_position_in_grid]],
-    uint elem [[thread_position_in_threadgroup]])
-{
-    uint bit_mask = (1u << bits) - 1u;
-    uint word_idx = elem / vals_per_word;
-    uint pos_in_word = elem % vals_per_word;
-    uint word = packed[pos * packed_dim + word_idx];
-    uint idx = (word >> (pos_in_word * bits)) & bit_mask;
-
-    float val = centroids[idx] * scale;
-
-    threadgroup float shared[512];
-    shared[elem] = val;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint h = 1;
-    while (h < dim) {
-        uint block = elem / (2 * h);
-        uint offset = elem % (2 * h);
-        if (offset < h) {
-            uint j = block * 2 * h + offset;
-            float a = shared[j];
-            float b = shared[j + h];
-            shared[j] = a + b;
-            shared[j + h] = a - b;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        h *= 2;
-    }
-
-    float result = shared[elem] * scale * signs[elem] * norms[pos];
-    out[pos * dim + elem] = (half)result;
-}
 
 // tq_compress_paged: the production wiring kernel. For each (new KV slot,
 // kv_head), read the fp16 vector IN PLACE from the paged pool (chunk-table
@@ -259,118 +132,6 @@ kernel void tq_compress_paged(
         h *= 2;
     }
     if (do_writeback != 0u) vec[elem] = (half)(shared[elem] * scale * signs[elem] * vec_norm);
-}
-
-// tq_dequant_paged: the dequant-on-READ primitive for the pool-capacity design.
-// For each (physical slot, kv_head), read the codes+norm from the packed store
-// (the canonical compressed cache) and dequant into a TARGET fp16 paged buffer
-// (chunk-table addressed) — the bounded read buffer attention will consume. The
-// inverse direction of tq_compress_paged's writeback: store -> fp16, no quantize.
-kernel void tq_dequant_paged(
-    device const uint64_t* chunk_table [[buffer(0)]],  // TARGET fp16 buffer chunk-addr table
-    device const uint*  slots        [[buffer(1)]],    // [n_slots] physical slots to dequant
-    device const float* signs        [[buffer(2)]],    // [dim]
-    device const float* centroids    [[buffer(3)]],    // [n_centroids]
-    device const uint*  packed_store [[buffer(4)]],    // canonical codes [max_slots, num_kv_heads, packed_dim]
-    device const float* norms_store  [[buffer(5)]],    // [max_slots, num_kv_heads]
-    constant uint&  dim              [[buffer(6)]],
-    constant uint&  bits             [[buffer(7)]],
-    constant uint&  vals_per_word    [[buffer(8)]],
-    constant uint&  packed_dim       [[buffer(9)]],
-    constant float& scale            [[buffer(10)]],   // 1/sqrt(dim)
-    constant uint&  num_kv_heads     [[buffer(11)]],
-    constant uint&  block_size       [[buffer(12)]],
-    constant uint&  blocks_per_chunk [[buffer(13)]],
-    device const uint*  dst_slots    [[buffer(14)]],   // [n_slots] TARGET (window) slots; = slots for identity
-    uint3 tg  [[threadgroup_position_in_grid]],         // x=slot index, y=kv_head
-    uint3 tid [[thread_position_in_threadgroup]])
-{
-    uint slot_i   = tg.x;
-    uint kv_head  = tg.y;
-    uint elem     = tid.x;
-    uint slot     = slots[slot_i];       // SOURCE: packed-store logical slot
-    uint dst_slot = dst_slots[slot_i];   // TARGET: window physical slot (chunk-addressed below)
-    uint block   = dst_slot / block_size;
-    uint tok     = dst_slot % block_size;
-    uint chunk   = (blocks_per_chunk == 0u) ? 0u : block / blocks_per_chunk;
-    uint bic     = (blocks_per_chunk == 0u) ? block : block % blocks_per_chunk;
-    uint kv_blk_stride  = num_kv_heads * block_size * dim;
-    uint kv_head_stride = block_size * dim;
-    device half* vec = (device half*)chunk_table[chunk]
-        + bic * kv_blk_stride + kv_head * kv_head_stride + tok * dim;
-
-    uint store_base = (slot * num_kv_heads + kv_head) * packed_dim;
-    uint bit_mask = (1u << bits) - 1u;
-    uint word_idx = elem / vals_per_word, pos_in_word = elem % vals_per_word;
-    uint word = packed_store[store_base + word_idx];
-    uint idx = (word >> (pos_in_word * bits)) & bit_mask;
-    float vec_norm = norms_store[slot * num_kv_heads + kv_head];
-
-    threadgroup float shared[512];
-    shared[elem] = centroids[idx] * scale;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint h = 1;
-    while (h < dim) {
-        uint blk = elem / (2 * h), off = elem % (2 * h);
-        if (off < h) { uint j = blk * 2 * h + off; float a = shared[j], b = shared[j + h]; shared[j] = a + b; shared[j + h] = a - b; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        h *= 2;
-    }
-    vec[elem] = (half)(shared[elem] * scale * signs[elem] * vec_norm);
-}
-
-// bf16 twin of tq_dequant_paged.
-kernel void tq_dequant_paged_bf16(
-    device const uint64_t* chunk_table [[buffer(0)]],  // TARGET fp16 buffer chunk-addr table
-    device const uint*  slots        [[buffer(1)]],    // [n_slots] physical slots to dequant
-    device const float* signs        [[buffer(2)]],    // [dim]
-    device const float* centroids    [[buffer(3)]],    // [n_centroids]
-    device const uint*  packed_store [[buffer(4)]],    // canonical codes [max_slots, num_kv_heads, packed_dim]
-    device const float* norms_store  [[buffer(5)]],    // [max_slots, num_kv_heads]
-    constant uint&  dim              [[buffer(6)]],
-    constant uint&  bits             [[buffer(7)]],
-    constant uint&  vals_per_word    [[buffer(8)]],
-    constant uint&  packed_dim       [[buffer(9)]],
-    constant float& scale            [[buffer(10)]],   // 1/sqrt(dim)
-    constant uint&  num_kv_heads     [[buffer(11)]],
-    constant uint&  block_size       [[buffer(12)]],
-    constant uint&  blocks_per_chunk [[buffer(13)]],
-    device const uint*  dst_slots    [[buffer(14)]],   // [n_slots] TARGET (window) slots; = slots for identity
-    uint3 tg  [[threadgroup_position_in_grid]],         // x=slot index, y=kv_head
-    uint3 tid [[thread_position_in_threadgroup]])
-{
-    uint slot_i   = tg.x;
-    uint kv_head  = tg.y;
-    uint elem     = tid.x;
-    uint slot     = slots[slot_i];       // SOURCE: packed-store logical slot
-    uint dst_slot = dst_slots[slot_i];   // TARGET: window physical slot (chunk-addressed below)
-    uint block   = dst_slot / block_size;
-    uint tok     = dst_slot % block_size;
-    uint chunk   = (blocks_per_chunk == 0u) ? 0u : block / blocks_per_chunk;
-    uint bic     = (blocks_per_chunk == 0u) ? block : block % blocks_per_chunk;
-    uint kv_blk_stride  = num_kv_heads * block_size * dim;
-    uint kv_head_stride = block_size * dim;
-    device bfloat* vec = (device bfloat*)chunk_table[chunk]
-        + bic * kv_blk_stride + kv_head * kv_head_stride + tok * dim;
-
-    uint store_base = (slot * num_kv_heads + kv_head) * packed_dim;
-    uint bit_mask = (1u << bits) - 1u;
-    uint word_idx = elem / vals_per_word, pos_in_word = elem % vals_per_word;
-    uint word = packed_store[store_base + word_idx];
-    uint idx = (word >> (pos_in_word * bits)) & bit_mask;
-    float vec_norm = norms_store[slot * num_kv_heads + kv_head];
-
-    threadgroup float shared[512];
-    shared[elem] = centroids[idx] * scale;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint h = 1;
-    while (h < dim) {
-        uint blk = elem / (2 * h), off = elem % (2 * h);
-        if (off < h) { uint j = blk * 2 * h + off; float a = shared[j], b = shared[j + h]; shared[j] = a + b; shared[j + h] = a - b; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        h *= 2;
-    }
-    vec[elem] = (bfloat)(shared[elem] * scale * signs[elem] * vec_norm);
 }
 
 // bf16 twin of tq_compress_paged (the pool is bf16 for Llama/Qwen).

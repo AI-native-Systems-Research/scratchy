@@ -157,18 +157,6 @@ pub struct MetalWorker {
     // ---------------------------------------------------------------
     config: WorkerCreateConfig,
     kv_cache: Option<KvCachePool>,
-    /// TurboQuant KV compression runtime — `Some` only when
-    /// `kv_cache_dtype == "turboquant"`. After each forward writes KV, the
-    /// worker calls `compress_layer` per layer over the new slots: quantizes
-    /// them into the per-layer packed store (~4.6x) and writes the dequant back
-    /// into the fp16 pool, so attention reads TurboQuant'd KV. OFF by default.
-    turboquant: Option<scratchy_target_metal::turboquant::TurboQuantRuntime>,
-    /// TurboQuant eviction-layer window map: logical KV block -> bounded fp16
-    /// window slot. `Some` alongside `turboquant`. Opt-in via SCRATCHY_TQ_WINDOW
-    /// — when set, the forward remaps block_table/slot_mapping logical->window,
-    /// dequant-fills evicted misses from the packed store, and the packed store
-    /// is the canonical full-capacity cache (the 4.6x). Off => the in-place path.
-    tq_window: Option<scratchy_target_metal::turboquant_window::WindowMap>,
     /// Gated-DeltaNet recurrent-state pool for hybrid arches (Qwen3.5 /
     /// Qwen3-Next). `Some(_)` only when the loaded model's
     /// `gdn_runtime_config()` is `Some` (built in `initialize_cache`).
@@ -611,8 +599,6 @@ impl MetalWorker {
         Self {
             config,
             kv_cache: None,
-            turboquant: None,
-            tq_window: None,
             gdn_state: None,
             gdn_slot_allocator: None,
             gdn_pending: None,
@@ -1724,110 +1710,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         #[cfg(feature = "guided-decoding")]
         let grammar_residency = device_buf.allocator.residency().clone();
 
-        // ── TurboQuant eviction-layer remap (opt-in: SCRATCHY_TQ_WINDOW) ──────
-        // The packed store is the canonical full-capacity cache; attention reads
-        // a BOUNDED fp16 window. Remap the logical block_table/slot_mapping to
-        // window slots, and dequant-fill evicted misses from packed before
-        // attention. A logical block written at offset 0 this forward is "fresh"
-        // (reuse-safe: a reallocated logical block is always written from 0), so
-        // it's assigned a window slot with NO dequant. Off => the in-place path
-        // below is byte-identical. Uniform geometry (gemma4 hybrid deferred).
-        let window_on = matches!(kv_pool, KvPoolHandle::TARGET)
-            && self.turboquant.is_some()
-            && self.tq_window.is_some()
-            && std::env::var_os("SCRATCHY_TQ_WINDOW").is_some();
-        let bs = self.config.block_size.max(1);
-        let num_reqs_rm = req.cu_seqlens_q.len().saturating_sub(1);
-        let (eff_block_table, eff_slot_mapping, window_misses): (
-            Vec<u32>,
-            Vec<u32>,
-            Vec<(u32, u32)>,
-        ) = if window_on {
-            let max_blocks = req
-                .block_table
-                .len()
-                .checked_div(num_reqs_rm)
-                .unwrap_or(req.block_table.len());
-            let bs32 = bs as u32;
-            let wm = self.tq_window.as_mut().unwrap();
-            let mut fresh = std::collections::HashSet::new();
-            for &s in req.slot_mapping {
-                if s % bs32 == 0 {
-                    fresh.insert(s / bs32);
-                }
-            }
-            let mut rbt = req.block_table.to_vec();
-            let mut misses: Vec<(u32, u32)> = Vec::new();
-            for sq in 0..num_reqs_rm {
-                let used = req.seqused_k.get(sq).copied().unwrap_or(0) as usize;
-                let valid = used.div_ceil(bs).min(max_blocks);
-                for i in 0..valid {
-                    let logical = req.block_table[sq * max_blocks + i];
-                    let wslot = if fresh.contains(&logical) {
-                        wm.assign_fresh(logical) as u32
-                    } else {
-                        let r = wm.resolve(logical);
-                        if r.miss {
-                            misses.push((logical, r.slot as u32));
-                        }
-                        r.slot as u32
-                    };
-                    rbt[sq * max_blocks + i] = wslot;
-                }
-            }
-            let mut rsm = req.slot_mapping.to_vec();
-            for (t, &ls) in req.slot_mapping.iter().enumerate() {
-                let lb = ls / bs32;
-                let off = ls % bs32;
-                let wb = wm.slot_of(lb).map(|x| x as u32).unwrap_or(lb);
-                rsm[t] = wb * bs32 + off;
-            }
-            (rbt, rsm, misses)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
-        if window_on
-            && !window_misses.is_empty()
-            && let Some(tq) = self.turboquant.as_ref()
-        {
-            let bs32 = bs as u32;
-            let mut src = Vec::with_capacity(window_misses.len() * bs);
-            let mut dst = Vec::with_capacity(window_misses.len() * bs);
-            for &(lblock, wblock) in &window_misses {
-                for tok in 0..bs32 {
-                    src.push(lblock * bs32 + tok);
-                    dst.push(wblock * bs32 + tok);
-                }
-            }
-            let src_buf = Self::alloc_shared_u32_buf(&mtl_device, &src);
-            let dst_buf = Self::alloc_shared_u32_buf(&mtl_device, &dst);
-            let n = src.len() as u32;
-            for layer in 0..tq.num_layers() {
-                let kb: Vec<&_> = kv_cache_ref
-                    .k_chunk_bufs(layer)
-                    .iter()
-                    .map(|m| m.buffer())
-                    .collect();
-                let vb: Vec<&_> = kv_cache_ref
-                    .v_chunk_bufs(layer)
-                    .iter()
-                    .map(|m| m.buffer())
-                    .collect();
-                tq.dequant_into_window(
-                    &mtl_device,
-                    layer,
-                    kv_cache_ref.k_chunk_table_mem(layer).buffer(),
-                    &kb,
-                    kv_cache_ref.v_chunk_table_mem(layer).buffer(),
-                    &vb,
-                    &src_buf,
-                    &dst_buf,
-                    n,
-                )
-                .map_err(|e| BackendError::Backend(format!("tq dequant_into_window: {e:?}")))?;
-            }
-        }
-
         let argmax_kernels = self
             .argmax_kernels
             .as_ref()
@@ -1836,28 +1718,10 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // ── 1. Upload host slices to fresh shared-storage MTLBuffers ─────
         let buf_input_ids = Self::alloc_shared_u32_buf(&mtl_device, req.input_ids);
         let buf_positions = Self::alloc_shared_u32_buf(&mtl_device, req.positions);
-        // window path binds the REMAPPED (window) slot_mapping/block_table for
-        // the forward; the logical slot_mapping is kept for the packed-store
-        // index in the post-forward compress.
-        let buf_slot_mapping = Self::alloc_shared_u32_buf(
-            &mtl_device,
-            if window_on {
-                &eff_slot_mapping
-            } else {
-                req.slot_mapping
-            },
-        );
-        let buf_logical_slot_mapping = Self::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
+        let buf_slot_mapping = Self::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
         let buf_cu_seqlens = Self::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
         let buf_seqused_k = Self::alloc_shared_u32_buf(&mtl_device, req.seqused_k);
-        let buf_block_table = Self::alloc_shared_u32_buf(
-            &mtl_device,
-            if window_on {
-                &eff_block_table
-            } else {
-                req.block_table
-            },
-        );
+        let buf_block_table = Self::alloc_shared_u32_buf(&mtl_device, req.block_table);
         // Stage the sample-row indices for the lm_head slice. The
         // closure inside macro-generated `forward` reads these via
         // `ctx.last_token_indices.as_raw()` and converts to a `&[u32]`
@@ -2362,50 +2226,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             )
         };
         let _ = logits; // argmax_out is what we read
-
-        // ── TurboQuant: compress this step's new KV slots in place ───────
-        // The forward above is blocking, so the new KV is written. For each
-        // layer, quantize the new slots into the packed store (~4.6x) and
-        // dequant back into the fp16 pool, so the NEXT step's attention reads
-        // TurboQuant'd KV. Target pool only; OFF unless kv_cache_dtype=turboquant.
-        if matches!(kv_pool, KvPoolHandle::TARGET)
-            && let Some(tq) = self.turboquant.as_ref()
-        {
-            let n_slots = req.num_tokens as u32;
-            // Batch ALL layers' K+V compress into ONE MTL4 command buffer
-            // (one commit, NO host wait) — the per-layer commit+wait was a
-            // ~2x decode hit (16 layers × K/V = 32 host syncs/step). The
-            // kernel reaches the pool via the chunk-table gpuAddress, so the
-            // chunk DATA buffers ride in as extra-resident (not bound) inside
-            // encode_compress_layer. slots = WINDOW slot (fp16 read),
-            // logical_slots = packed index; identical for the in-place path.
-            scratchy_target_metal::turboquant::run_compress_batch(&mtl_device, |batch| {
-                for layer in 0..tq.num_layers() {
-                    let kb: Vec<&_> = kv_cache_ref
-                        .k_chunk_bufs(layer)
-                        .iter()
-                        .map(|m| m.buffer())
-                        .collect();
-                    let vb: Vec<&_> = kv_cache_ref
-                        .v_chunk_bufs(layer)
-                        .iter()
-                        .map(|m| m.buffer())
-                        .collect();
-                    tq.encode_compress_layer(
-                        batch,
-                        layer,
-                        kv_cache_ref.k_chunk_table_mem(layer).buffer(),
-                        &kb,
-                        kv_cache_ref.v_chunk_table_mem(layer).buffer(),
-                        &vb,
-                        &buf_slot_mapping,
-                        &buf_logical_slot_mapping,
-                        n_slots,
-                    );
-                }
-            })
-            .map_err(|e| BackendError::Backend(format!("turboquant compress: {e:?}")))?;
-        }
 
         // ── 5. Read host-visible argmax buffer + return. ─────────────────
         let argmax_slice: &[u32] = unsafe {
@@ -3107,44 +2927,16 @@ impl Worker for MetalWorker {
             }
         };
 
-        // TurboQuant window (opt-in SCRATCHY_TQ_WINDOW): allocate the fp16 pool
-        // at the BOUNDED window size, not the full logical capacity — this is
-        // the resident-memory reduction. The packed store (built below) keeps
-        // the full `num_gpu_blocks` logical capacity (4.6x smaller bytes); the
-        // worker remaps logical->window every forward. capacity MUST be >= the
-        // max single-forward working set (else resolve_table self-evicts).
-        // Also require the supported geometry (power-of-2 head_dim <= 256) so an
-        // unsupported model with SCRATCHY_TQ_WINDOW set doesn't shrink the pool
-        // without the (skipped) window remap — see the tq_supported guard below.
-        let tq_window_on = self.config.kv_cache_dtype == "turboquant"
-            && std::env::var_os("SCRATCHY_TQ_WINDOW").is_some()
-            && (model.head_dim() as usize).is_power_of_two()
-            && (model.head_dim() as usize) <= 256;
-        let tq_window_blocks = std::env::var("SCRATCHY_TQ_WINDOW_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(num_gpu_blocks)
-            .clamp(1, num_gpu_blocks);
-        let pool_blocks = if tq_window_on {
-            tq_window_blocks
-        } else {
-            num_gpu_blocks
-        };
-        if tq_window_on {
-            info!(
-                "ScratchyWorker(metal): TurboQuant window — fp16 pool sized {pool_blocks} blocks (logical capacity {num_gpu_blocks}, packed-backed)"
-            );
-        }
         // Runtime per-sequence block-table capacity for this pool. Replaces the
         // compile-time `W::MAX_BLOCKS_PER_SEQ` (default 128 ≈ 2k tokens) so long
         // context isn't silently truncated. Stored on the pool; the host
         // block-table stride (execute_model), the kernel `MaxBlocksPerSeq`
         // function constant, and the rope-once scratch all read it back so the
-        // three agree. Capped at `pool_blocks` (the blocks actually allocated).
-        let pool_block_cap = self.kv_block_cap(pool_blocks);
+        // three agree. Capped at `num_gpu_blocks` (the blocks actually allocated).
+        let pool_block_cap = self.kv_block_cap(num_gpu_blocks);
         info!(
             "ScratchyWorker(metal): KV block-table capacity (max_blocks_per_seq) = {pool_block_cap} \
-             (max_model_len-derived, pool {pool_blocks} blocks × {} tokens/block)",
+             (max_model_len-derived, pool {num_gpu_blocks} blocks × {} tokens/block)",
             self.config.block_size,
         );
 
@@ -3300,7 +3092,7 @@ impl Worker for MetalWorker {
             let n_slots = num_tensors_for_pool * 2;
             KvCachePool::new_metal_chunked(
                 num_layers_for_pool,
-                pool_blocks,
+                num_gpu_blocks,
                 self.config.block_size,
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
@@ -3400,17 +3192,12 @@ impl Worker for MetalWorker {
         );
         self.kv_cache = Some(pool);
 
-        // TurboQuant KV compression — gated on `kv_cache_dtype == "turboquant"`,
-        // OFF by default (the fp16 pool above is unchanged). Build the runtime
-        // (kernels + codebook + per-layer packed store); the post-forward hook
-        // then compresses each step's new KV slots into the ~4.6x packed store
-        // and dequants them back into the fp16 pool so attention reads
-        // TurboQuant'd KV. (Uniform geometry; gemma4 per-layer hybrid is a
-        // follow-up — head_dim must be a power of two.)
+        // TurboQuant KV compression (`kv_cache_dtype == "turboquant"`) is owned by
+        // the per-layer tape ops, factory-provisioned via ForwardCtx::kv_turboquant.
         // TurboQuant supports only power-of-2 head_dim <= 256 (the Walsh-Hadamard
         // rotation needs a power-of-2 length; the kernel threadgroup caps at 256
         // threads). Models like phi3 (hd 96), deepseek_v3 (hd 56), kimi_k2 (hd
-        // 112) fall OUTSIDE that — for those we must NOT build the runtime (it
+        // 112) fall OUTSIDE that — for those we must NOT enable it (it
         // would panic in PolarQuantizer); fall back to plain fp16 + warn. This is
         // what makes turboquant safe to request/default on any model.
         let tq_hd = model.head_dim() as usize;
@@ -3421,10 +3208,6 @@ impl Worker for MetalWorker {
             );
         }
         if self.config.kv_cache_dtype == "turboquant" && tq_supported {
-            // The per-layer TurboQuant tape ops (factory-provisioned via
-            // ForwardCtx::kv_turboquant) now own compress + dequant. The old
-            // in-place TurboQuantRuntime + window map are superseded;
-            // `self.turboquant` stays None so every old hook below skips.
             info!(
                 "ScratchyWorker(metal): TurboQuant — per-layer tape ops active (factory-provisioned)"
             );

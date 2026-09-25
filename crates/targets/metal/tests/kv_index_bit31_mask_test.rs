@@ -69,12 +69,6 @@ fn is_masked(line: &str) -> bool {
     MASK_TOKENS.iter().any(|m| line.contains(m))
 }
 
-/// Host-generated window indices (TurboQuant `WindowMap`) are NOT worker-tagged
-/// and must NOT be masked (masking would corrupt them). They are annotated.
-fn is_host_window_index(line: &str) -> bool {
-    line.contains("SOURCE:") || line.contains("TARGET:") || line.contains("dst_slots[")
-}
-
 #[test]
 fn kv_kernels_strip_bit31_from_tagged_index_tables() {
     let mut violations: Vec<String> = Vec::new();
@@ -91,9 +85,6 @@ fn kv_kernels_strip_bit31_from_tagged_index_tables() {
             if trimmed.starts_with("//") || line.contains("[[buffer(") {
                 continue; // comment or buffer declaration, not an index use
             }
-            if is_host_window_index(line) {
-                continue; // deliberately-untagged host index
-            }
             let end = (i + MASK_WINDOW + 1).min(lines.len());
             if !lines[i..end].iter().any(|l| is_masked(l)) {
                 violations.push(format!("  {}:{}: {}", name, i + 1, line.trim()));
@@ -108,8 +99,7 @@ fn kv_kernels_strip_bit31_from_tagged_index_tables() {
          stripping bit 31 (`& 0x7FFFFFFFu`, like attention's ATTN_BT_MASK) within \
          {MASK_WINDOW} lines. Spans (rope-on-read) set bit 31 on these tables; an \
          unmasked read is OOB and silently corrupts the KV cache. Mask it before \
-         indexing — or, if this is a host-generated/untagged index, annotate it \
-         SOURCE:/TARGET:. See the contract at gpu_worker.rs (slot |= 0x8000_0000).\n\
+         indexing. See the contract at gpu_worker.rs (slot |= 0x8000_0000).\n\
          Offending:\n{}",
         violations.join("\n")
     );
