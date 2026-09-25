@@ -1165,20 +1165,6 @@ pub fn scalarmul(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    // ⭐ AND WHETHER THE TILE IT MULTIPLIES IS **GATHERED** is the program's statement, not the
-    // caller's. `Program::ScalarMul` is the kind of the one COMPUTE op; a Triton embedding is exactly
-    // that op over a row tile whose row INDEX is data (`embedding.py`'s
-    // `rows = table_desc.gather(ids, 0)` then `rows * EMB_SCALE`), so the gather is addressing that
-    // rides on this same node rather than a different node kind.
-    //
-    // `None` for every program that states no `ktdp.construct_indirect_access_tile`, and then `skip` is
-    // empty and [`split_out_excluding`] IS [`split_out`].
-    let gather = gather_of(k)?;
-    // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
-    // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
-    // than by relaxing the count. See [`split_out_excluding`].
-    let skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
-    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
     // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, like the epsilon and the attention scale. It was
     // `KtirNode::scalarmul_scale_idx`, a slot the producer resolved and hung on the node — so the
     // number the emulator multiplies by and the number the descriptor multiplies by were two facts
@@ -1192,151 +1178,14 @@ pub fn scalarmul(
              by the same value."
         ),
     })?;
-    let idx = scale_slot(layout, scale).ok_or_else(|| Error {
-        message: format!(
-            "ScalarMul {name}: multiplier {scale}, read off the program, is absent from \
-             `BundleLayout::scalarmul_scales` — the descriptor multiplies by a bound `[1,1]` const, so \
-             the value the program uses must have a registry slot (registry desync)"
-        ),
-    })?;
-    let x = ins[0].name();
-    let out_name = out.name();
-    let rows = node_rows(name, &out)?;
-    // DEVICE width (the padding invariant): a ScalarMul on the padded logits `[.,49159]` must use the SAME
-    // device width its producer matmul emitted (49664), not the logical 49159 (whose sub-stick 7 the dxp
-    // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
-    // for 64-aligned tensors (residual/embedding [.,4096]).
+    // ⭐ AND WHETHER THE TILE IT MULTIPLIES IS **GATHERED** is the program's statement, not the
+    // caller's. `Program::ScalarMul` is the kind of the one COMPUTE op; a Triton embedding is exactly
+    // that op over a row tile whose row INDEX is data (`embedding.py`'s
+    // `rows = table_desc.gather(ids, 0)` then `rows * EMB_SCALE`), so the gather is addressing that
+    // rides on this same node rather than a different node kind.
     //
-    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — capped at the width the OUTPUT's placement
-    // actually holds. See [`pointwise_width_the_output_holds`].
-    let cols = pointwise_width_the_output_holds(
-        layout,
-        &[&out_name, &x],
-        rows,
-        DeviceWidth::for_pointwise(out.c_len).get(),
-    );
-    let scale_name = crate::place::act_name(scalarmul_scale_tid(idx));
-    let op_name = format!("scalarmul_o{}", out.tid);
-    let x_h = rbo(&x);
-    let scale_h = rbo(&scale_name);
-    let inputs = [In::full(&x_h).ew(), In::scalar(&scale_h).ew()];
-    // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
-    // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
-    let mut tile_op = pointwise_tile_op(rows, cols, 2);
-    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
-    // ⭐⭐⭐ THE GATHERED FORM IS THE SAME OP WITH AN INDEX OPERAND ON THE TABLE — not a different
-    // `opFuncName`. The shipped `dxp/test/test_gather_1core/sdsc_1.json` is an ordinary `identity`
-    // carrying one extra `labeledDs_` and one extra `computeOp_` field, so nothing about the multiply
-    // changes; `assemble_pointwise_broadcast_gather` adds the index through the ONE door
-    // (`OpSpec::attach_gather_index`) every other gather in this crate goes through.
-    //
-    // ⛔ AND THE PROGRAM'S OWN ENTRY COUNT IS CHECKED AGAINST THE DESCRIPTOR'S ROW COUNT, because the
-    // two are the same fact stated twice: one index per gathered row. The index vector is described
-    // rank-1 over the op's `mb`, so a program whose indirect tile takes a different number of entries
-    // than the node has rows would be described with an index vector of the WRONG LENGTH — and the
-    // length is what the idx→address program iterates.
-    if let Some(g) = gather {
-        if g.value_tid != ins[0].tid {
-            return err(format!(
-                "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
-                 operand must sit immediately after the tensor it indexes, so a gather of a tensor this \
-                 op does not read has no position in the descriptor.",
-                g.value_tid, ins[0].tid,
-            ));
-        }
-        // ⛔⛔⛔ THE GATHER'S ENTRIES MUST **TILE** THE NODE, AND THE INDEX BUFFER MUST HOLD ONE INDEX
-        // PER NODE ROW. Two separate facts, and neither is the other.
-        //
-        // The program states ONE work item: `embedding.py` reads `start_m = tl.program_id(0)` and takes a
-        // `[BLOCK_M, D_MODEL]` tile, so its indirect access tile says BLOCK_M entries. [`node_rows`]
-        // meanwhile reports the OUTPUT VIEW's full row extent, because that is what the emitted
-        // descriptor spans — the same fold every other body here performs (a row-blocked program states
-        // `ceil(m/blk)` windows and one descriptor computes all of them). So the two numbers differ by
-        // exactly the grid, and requiring them EQUAL would refuse the fold rather than check it.
-        //
-        // What has to hold instead is that the work items TILE the node (`rows % entries == 0`), exactly
-        // as `node_rows` requires of the store windows — and, because the index operand is described
-        // rank-1 over the op's `mb`, that the INDEX BUFFER really holds `rows` indices. That second one
-        // is the load-bearing check: the descriptor makes the idx→address program iterate `mb`
-        // addresses, so an id buffer shorter than the node's rows would convert past its own end and
-        // gather from whatever follows it. It is read off the index parameter's OWN view, which is the
-        // only statement of that buffer's length anywhere in the program.
-        if g.entries == 0 || !rows.is_multiple_of(g.entries) {
-            return err(format!(
-                "{name}: the indirect access tile takes {} entries and the node writes {rows} row(s), \
-                 which {} does not divide. The emitted descriptor spans the whole node, so the work \
-                 items have to TILE it — the same obligation `node_rows` puts on the store windows.",
-                g.entries, g.entries,
-            ));
-        }
-        let idx_r = r.iter().find(|x| x.tid == g.index_tid).ok_or_else(|| Error {
-            message: format!(
-                "{name}: the program gathers through t{}, which is not one of this node's parameters — \
-                 an index buffer with no binding has no placement and no stated length",
-                g.index_tid
-            ),
-        })?;
-        let idx_len = (idx_r.v_rows as u64) * (idx_r.v_cols as u64);
-        if idx_len != rows as u64 {
-            return err(format!(
-                "{name}: the index buffer t{} states a `[{}, {}]` view — {idx_len} index(es) — while \
-                 this descriptor gathers {rows} row(s). The index operand is described rank-1 over the \
-                 op's `mb`, so dbo's idx→address program converts exactly {rows} entries: a shorter \
-                 buffer is read past its end and the surplus rows gather from whatever is placed next. \
-                 Emit one node per work item, or bind an index buffer covering the node.",
-                g.index_tid, idx_r.v_rows, idx_r.v_cols,
-            ));
-        }
-        // ⛔⛔⛔ THE TABLE GOES **LAST**, AND THE SWAP IS THE ONE THING THIS BRANCH DOES TO ITS OPERANDS.
-        //
-        // Two placement laws have to hold at once and they coincide at exactly one position. The index
-        // is inserted immediately BEFORE THE OUTPUT (`attach_gather_index`, which is the vendor's
-        // `[input, index, output]` order and what keeps the output last however many operands are
-        // added); dbo separately needs the index to sit NEXT TO the tensor it indexes, or the gathered
-        // operand's use precedes the idx→address program's definition and
-        // `DSC2ToDataflowIR.cpp:51` reports `operand #1 does not dominate this use`. Both hold only
-        // when the gathered tensor is the LAST input.
-        //
-        // The ungathered order above is `[table, scalar]`, which would emit `[table, scalar, idx, out]`
-        // — index at 2, table at 0, non-adjacent. Swapping to `[scalar, table]` emits
-        // `[scalar, table, idx, out]`: adjacent AND output-last.
-        //
-        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS `multiply`, which is commutative — the SAME two
-        // operands and the same `opFuncName`, in the other order. This is not a general licence: a
-        // non-commutative pointwise gathering a non-last operand has no such swap, which is why
-        // `assemble_pointwise_broadcast_gather` REFUSES that rather than reordering on the caller's
-        // behalf.
-        let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
-        return crate::emit::assemble_pointwise_broadcast_gather(
-            crate::emit::PointwiseGather {
-                op_name: &op_name,
-                tile_op: &tile_op,
-                op_func: "multiply",
-                rows,
-                cols,
-                inputs: &gathered_inputs,
-                gathered_input: 1,
-                index_name: &crate::place::act_name(g.index_tid),
-                o: &rbo(&out_name),
-            },
-            sym_id_base,
-            layout,
-        )
-        .map(|op| vec![op])
-        .map_err(Error::from);
-    }
-    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &op_name,
-        &tile_op,
-        "multiply",
-        rows,
-        cols,
-        &inputs,
-        &rbo(&out_name),
-        0,
-        sym_id_base,
-        layout,
-    )])
+    // `None` for every program that states no `ktdp.construct_indirect_access_tile`.
+    scalarmul_at(name, scale, gather_of(k)?, r, sym_id_base, layout)
 }
 
 /// A KV HEAD INDEX, TYPED, from a loop counter — the one place a bare `usize` becomes a [`KvHead`].
@@ -4335,8 +4184,10 @@ pub fn rmsnorm_at(
 /// ([`super::whole_function::splat_scale_of`]), which is where the op is; this body's job is the
 /// descriptor.
 ///
-/// Everything below is unchanged and shared, so the two doors cannot drift about what a scalarmul
-/// EMITS — only about where its number came from.
+/// ⭐ AND THIS IS THE ONLY BODY. [`scalarmul`] DELEGATES here, so the two doors cannot drift about
+/// what a scalarmul emits — only about where its number came from. It used to be a COPY with that
+/// same sentence on it, and the copy drifted in the one arm nothing could reach; see the operand-order
+/// note below for what that cost.
 pub fn scalarmul_at(
     name: &str,
     scale: f32,
@@ -4448,9 +4299,36 @@ pub fn scalarmul_at(
                 g.index_tid, idx_r.v_rows, idx_r.v_cols,
             ));
         }
-        // ⭐ THE STRUCT FORM, which is how this door takes its arguments as of the merged gather
-        // (#92): eleven positional parameters became one named record, and the index's position is
-        // `gathered_input` rather than a bare index.
+        // ⛔⛔⛔ THE TABLE GOES **LAST**, AND THE SWAP IS THE ONE THING THIS BRANCH DOES TO ITS OPERANDS.
+        //
+        // Two placement laws have to hold at once and they coincide at exactly one position. The index
+        // is inserted immediately BEFORE THE OUTPUT (`attach_gather_index`, which is the vendor's
+        // `[input, index, output]` order and what keeps the output last however many operands are
+        // added); dbo separately needs the index to sit NEXT TO the tensor it indexes, or the gathered
+        // operand's use precedes the idx→address program's definition and
+        // `DSC2ToDataflowIR.cpp:51` reports `operand #1 does not dominate this use`. Both hold only
+        // when the gathered tensor is the LAST input.
+        //
+        // The ungathered order above is `[table, scalar]`, which would emit `[table, scalar, idx, out]`
+        // — index at 2, table at 0, non-adjacent. Swapping to `[scalar, table]` emits
+        // `[scalar, table, idx, out]`: adjacent AND output-last.
+        //
+        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS `multiply`, which is commutative — the SAME two
+        // operands and the same `opFuncName`, in the other order. This is not a general licence: a
+        // non-commutative pointwise gathering a non-last operand has no such swap, which is why
+        // `assemble_pointwise_broadcast_gather` REFUSES that rather than reordering on the caller's
+        // behalf.
+        //
+        // ⛔⛔⛔ AND THIS ARM HELD `inputs` / `gathered_input: 0` UNTIL THE WHOLE-FUNCTION DOOR REACHED
+        // IT. `scalarmul_at`'s header said "everything below is unchanged and shared, so the two doors
+        // cannot drift about what a scalarmul EMITS" — but the body was COPIED, not shared, and the
+        // swap above was added to ONE copy. The other was unreachable (`region_for_operand` refused an
+        // indirect access tile before any op was built), so nothing ran it, and the first program that
+        // did got `assemble_pointwise_broadcast_gather`'s own refusal: "input 0 of 2 is named as the
+        // gathered operand ... those are the same slot only for the LAST input". MEASURED, the moment
+        // that refusal was lifted: `KTIR_WHOLE=1 bake_py embedding_granite`. `scalarmul` now DELEGATES
+        // here, so there is one body and the drift class is gone rather than repaired.
+        let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
         return crate::emit::assemble_pointwise_broadcast_gather(
             crate::emit::PointwiseGather {
                 op_name: &op_name,
@@ -4458,15 +4336,18 @@ pub fn scalarmul_at(
                 op_func: "multiply",
                 rows,
                 cols,
-                inputs: &inputs,
-                gathered_input: 0,
+                inputs: &gathered_inputs,
+                gathered_input: 1,
                 index_name: &crate::place::act_name(g.index_tid),
                 o: &rbo(&out_name),
             },
             sym_id_base,
             layout,
         )
-        .map(|op| vec![op])
+        // ⭐ MANY OPS, ONE PER INDEX STICK. The index reaches the IBR as ONE stick transfer, so a node
+        // with more entries than that is a leg per stick — each writing its own row window of the
+        // output in place. `assemble_pointwise_broadcast_gather` owns that cut, and the node's own
+        // 32-entry ceiling with it, so nothing here counts entries.
         .map_err(Error::from);
     }
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
