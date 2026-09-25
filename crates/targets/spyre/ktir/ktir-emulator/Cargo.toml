@@ -121,7 +121,7 @@ workspace = true
 optional = true
 
 [dependencies.cblas-sys]
-version = "0.1"
+version = "0.3"
 optional = true
 
 [dependencies.ktir-core]
