@@ -942,6 +942,7 @@ fn is_fused(id: KernelId) -> bool {
             | K::RopeAppendNormed
             | K::NormAddScalarMul
             | K::SynthGateUpSiluMul
+            | K::AttentionViaCacheTq
     )
 }
 
@@ -962,6 +963,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::RopeOnceSteel
         | K::RopeOnceGqaShared => KernelKind::Rope,
         K::AttentionViaCache
+        | K::AttentionViaCacheTq
         | K::AttentionPrefillSdpaPaged
         | K::AttnGatherKRope
         | K::AttnGatherVCopyT
@@ -1959,6 +1961,7 @@ pub(super) fn gate_matches(
         }
         Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens,
         Some(super::lowered::RuntimeGate::OnlyIfTurboquant) => turboquant,
+        Some(super::lowered::RuntimeGate::OnlyIfNotTurboquant) => !turboquant,
     }
 }
 

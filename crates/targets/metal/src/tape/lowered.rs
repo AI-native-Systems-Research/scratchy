@@ -437,15 +437,22 @@ pub enum KernelId {
     /// dst_rows @ 2, hidden inline @ 3)`.
     MmEmbedSplice,
     /// TurboQuant: dequant a layer's PACKED KV codes into the reused fp16
-    /// scratch (one layer at a time) right BEFORE that layer's attention.
-    /// Maps to `tq_dequant_paged[_bf16]` in `turboquant.metallib`. The packed
-    /// store (canonical, ~4.7x smaller) is the only persistent KV; the scratch
-    /// holds one layer's fp16 for the attention read, then is reused.
+    /// scratch (one layer at a time) right BEFORE that layer's KV writer, for
+    /// the prefill attention to read. Maps to `tq_dequant_blocktable[_bf16]`
+    /// in `turboquant.metallib`. The packed store (canonical, ~4.7x smaller)
+    /// is the only persistent KV; the scratch holds one layer's fp16 for the
+    /// attention read, then is reused.
     TqDequantToScratch,
     /// TurboQuant: quantize a layer's newly-written KV (in the fp16 scratch)
-    /// into the PACKED store right AFTER that layer's rope-append-cache write.
-    /// Maps to `tq_compress_paged[_bf16]` in `turboquant.metallib`.
+    /// into the PACKED store — after that layer's attention on uniform
+    /// arches, right after its KV writer on hybrid ones. Maps to
+    /// `tq_compress_paged[_bf16]` in `turboquant.metallib`.
     TqQuantizeToPacked,
+    /// TurboQuant decode attention: `AttentionViaCache` reading the packed
+    /// store directly in the codebook domain (function constant 13), so a
+    /// decode step never dequantizes the context. Same symbol as
+    /// `AttentionViaCache`.
+    AttentionViaCacheTq,
 }
 
 /// `MetalDtype` relocated to the cfg-free `scratchy-tensors` core so
@@ -554,6 +561,10 @@ pub enum RuntimeGate {
     /// but only fire when `kv_cache_dtype == turboquant` (the worker resolves
     /// the tq buffers + the KV scratch only then). No-op on every other run.
     OnlyIfTurboquant,
+    /// Run only when the KV cache is NOT TurboQuant-compressed: the plain
+    /// decode `AttentionViaCache` whose `AttentionViaCacheTq` twin replaces
+    /// it under TurboQuant.
+    OnlyIfNotTurboquant,
 }
 
 impl DispatchShape {

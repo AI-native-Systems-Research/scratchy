@@ -73,9 +73,9 @@ use crate::quantized::{
 use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
-    Binding, DispatchShape, GemmDims, IntoBaked, KernelId, LoweredCommand, LoweredMetalTape,
-    LoweringError, MetalDtype, RuntimeBindingKind, WeightBundleKind, WeightLocator, WeightTensor,
-    baked,
+    Binding, DispatchShape, GatedCommand, GemmDims, IntoBaked, KernelId, LoweredCommand,
+    LoweredMetalTape, LoweringError, MetalDtype, RuntimeBindingKind, WeightBundleKind,
+    WeightLocator, WeightTensor, baked,
 };
 
 /// Lower one bucket's `(backbone ++ lm_head)` instruction stream.
@@ -140,8 +140,8 @@ pub fn lower_pair(
     let mut commands = bb.commands.to_vec();
     let mut barrier_before = bb.barrier_before.to_vec();
     // Backbone commands (`bb.commands`) carry their own gate on each
-    // `GatedCommand`: `lower()` tagged the per-layer TurboQuant dequant/quantize
-    // commands `OnlyIfTurboquant`. There is no separate gate vec to
+    // `GatedCommand`: `inject_tq` tagged the per-layer TurboQuant commands
+    // (and the plain decode attention they replace). There is no separate gate vec to
     // re-initialize, so those gates cannot be dropped here — the lm_head
     // slice/fallback pushes below assign their own gate per command.
 
@@ -279,7 +279,7 @@ pub fn lower_pair(
         None
     };
 
-    use crate::tape::lowered::{GatedCommand, RuntimeGate};
+    use crate::tape::lowered::RuntimeGate;
     if let Some(info) = slice_info {
         // Non-spec path: index-driven gather → qmv-M=num_sample_rows
         // → index-driven scatter. Works for any num_seqs (single-seq
@@ -850,17 +850,46 @@ fn tq_quantize_command(
     }
 }
 
-/// TurboQuant: inject the per-layer dequant (before rope-append) + quantize
-/// (after attention) commands. No-op unless head_dim is a power of 2 ≤ 256
-/// (the only supported geometry). The commands are gated `OnlyIfTurboquant`
-/// (derived from their KernelId at tape assembly), so they're inert unless the
-/// worker provisions the tq buffers.
+/// TurboQuant decode: the `AttentionViaCacheTq` twin of a decode
+/// `AttentionViaCache` command — the same kernel, geometry and bindings plus
+/// `ATTN_TQ_BITS` and the packed-store bindings, so it reads every key but the
+/// one this step appended straight from the packed store.
+fn tq_attention_command(p: &MetalModelConsts, attn: &LoweredCommand, layer: u32) -> LoweredCommand {
+    let mut constants = attn.constants.to_vec();
+    constants.extend(Vec::from(
+        super::kernel_constants::AttentionViaCacheTqConstants {
+            bits: super::ids::TqCodeBits(crate::turboquant::tq_bits(p.tq_kv_bits)),
+        },
+    ));
+    let mut bindings = attn.bindings.to_vec();
+    bindings.extend(Vec::from(super::kernel_bindings::TqAttentionBindingSet {
+        kv_layer: super::ids::LayerId(layer),
+    }));
+    LoweredCommand {
+        kernel: KernelId::AttentionViaCacheTq,
+        constants: baked(constants),
+        bindings: baked(bindings),
+        ..*attn
+    }
+}
+
+/// TurboQuant: inject the per-layer dequant (before the KV writer) + quantize
+/// commands, gated `OnlyIfTurboquant` so they're inert unless the worker
+/// provisions the tq buffers. No-op unless head_dim is a power of 2 ≤ 512 (the
+/// only supported geometry).
+///
+/// A decode tape (`decode`: its attention is `AttentionViaCache`) runs no
+/// dequant at all: each TurboQuant layer's attention becomes the pair
+/// `[AttentionViaCache (OnlyIfNotTurboquant), AttentionViaCacheTq
+/// (OnlyIfTurboquant)]`, and the Tq twin reads the packed store directly.
 fn inject_tq(
     p: &MetalModelConsts,
+    instruction: &Instruction,
     cmds: Vec<LoweredCommand>,
-    _layer: u32,
+    decode: bool,
     bucket_m: u32,
-) -> Vec<LoweredCommand> {
+) -> Vec<GatedCommand> {
+    use crate::tape::lowered::RuntimeGate::{OnlyIfNotTurboquant, OnlyIfTurboquant};
     // Supported geometry = pow2 head_dim <= 512 (the kernels' widened threadgroup
     // arrays). Leave the tape byte-identical for anything else.
     // - UNIFORM arches (GLOBAL_HEAD_DIM == HEAD_DIM): quantize every layer at the
@@ -871,13 +900,15 @@ fn inject_tq(
     //   (RopeAppendNormed dispatches head_dim threads, so == GLOBAL_HEAD_DIM means
     //   a global layer). The attention kernel does NOT dispatch head_dim threads,
     //   so for hybrid we put BOTH dequant + quantize around the writer (one
-    //   reliable detection point). MUST agree with the factory, which provisions
-    //   GLOBAL-sized buffers for the global layers only.
+    //   reliable detection point); its global decode attention is the
+    //   `AttentionViaCache` instruction (sliding layers lower
+    //   `SlidingAttentionViaCache`). MUST agree with the factory, which
+    //   provisions GLOBAL-sized buffers for the global layers only.
     let hybrid = p.global_head_dim != p.head_dim;
     let base_ok = p.head_dim.is_power_of_two() && p.head_dim <= 512;
     let global_ok = p.global_head_dim.is_power_of_two() && p.global_head_dim <= 512;
     if !base_ok || (hybrid && !global_ok) {
-        return cmds;
+        return cmds.into_iter().map(GatedCommand::ungated).collect();
     }
     // The actual KV layer comes from the rope/attention command's own KvCacheK
     // binding — NOT the loop `iter` (0 for unrolled tapes like Llama).
@@ -895,6 +926,7 @@ fn inject_tq(
             _ => None,
         })
     }
+    let tq = |c| GatedCommand::gated(c, OnlyIfTurboquant);
     let mut out = Vec::with_capacity(cmds.len() + 4);
     for cmd in cmds {
         match cmd.kernel {
@@ -903,30 +935,33 @@ fn inject_tq(
             | KernelId::FusedQkvRopeCache
             | KernelId::FusedAffineQkvRopeCache => {
                 let layer = cmd_kv_layer(&cmd).unwrap_or(0);
-                if hybrid {
-                    let global = cmd.dispatch.threads_per_threadgroup.0 == p.global_head_dim;
-                    if global {
-                        out.push(tq_dequant_command(p, layer, false, bucket_m, true));
-                        out.push(tq_dequant_command(p, layer, true, bucket_m, true));
-                        out.push(cmd);
-                        out.push(tq_quantize_command(p, layer, false, bucket_m, true));
-                        out.push(tq_quantize_command(p, layer, true, bucket_m, true));
-                    } else {
-                        out.push(cmd);
-                    }
-                } else {
-                    out.push(tq_dequant_command(p, layer, false, bucket_m, false));
-                    out.push(tq_dequant_command(p, layer, true, bucket_m, false));
-                    out.push(cmd);
+                let global = hybrid && cmd.dispatch.threads_per_threadgroup.0 == p.global_head_dim;
+                if (!hybrid || global) && !decode {
+                    out.push(tq(tq_dequant_command(p, layer, false, bucket_m, global)));
+                    out.push(tq(tq_dequant_command(p, layer, true, bucket_m, global)));
+                }
+                out.push(GatedCommand::ungated(cmd));
+                if global {
+                    out.push(tq(tq_quantize_command(p, layer, false, bucket_m, true)));
+                    out.push(tq(tq_quantize_command(p, layer, true, bucket_m, true)));
                 }
             }
-            KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged if !hybrid => {
+            KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged
+                if !hybrid || matches!(instruction, Instruction::AttentionViaCache(..)) =>
+            {
                 let layer = cmd_kv_layer(&cmd).unwrap_or(0);
-                out.push(cmd);
-                out.push(tq_quantize_command(p, layer, false, bucket_m, false));
-                out.push(tq_quantize_command(p, layer, true, bucket_m, false));
+                if decode {
+                    out.push(GatedCommand::gated(cmd, OnlyIfNotTurboquant));
+                    out.push(tq(tq_attention_command(p, &cmd, layer)));
+                } else {
+                    out.push(GatedCommand::ungated(cmd));
+                }
+                if !hybrid {
+                    out.push(tq(tq_quantize_command(p, layer, false, bucket_m, false)));
+                    out.push(tq(tq_quantize_command(p, layer, true, bucket_m, false)));
+                }
             }
-            _ => out.push(cmd),
+            _ => out.push(GatedCommand::ungated(cmd)),
         }
     }
     out
@@ -965,7 +1000,7 @@ fn close_spans(
     open: &mut Vec<OpenSpan>,
     at: usize,
     loops: &mut Vec<super::lowered::TapeLoop>,
-    commands: &[crate::tape::lowered::LoweredCommand],
+    commands: &[GatedCommand],
     instructions: &[Instruction],
     p: &MetalModelConsts,
     cur_width: &mut crate::tape::lowered::ActivationWidth,
@@ -1029,8 +1064,16 @@ pub fn lower(
     block_cap: u32,
     profile: Option<&crate::targets::MetalTargetProfile>,
 ) -> Result<LoweredMetalTape, LoweringError> {
-    let mut commands = Vec::with_capacity(instructions.len());
+    let mut commands: Vec<GatedCommand> = Vec::with_capacity(instructions.len());
     let mut barrier_before: Vec<bool> = Vec::with_capacity(instructions.len());
+    // A decode tape (one query token per sequence) reads the TurboQuant packed
+    // store directly in its attention — see `inject_tq`.
+    let decode = instructions.iter().any(|i| {
+        matches!(
+            i,
+            Instruction::AttentionViaCache(..) | Instruction::SlidingAttentionViaCache(..)
+        )
+    });
     // The layer loop, if this tape has one. Set by the `Instruction::Loop` arm below,
     // which records the body instead of unrolling it.
     let mut loops: Vec<super::lowered::TapeLoop> = Vec::new();
@@ -1116,6 +1159,7 @@ pub fn lower(
             other => {
                 let cmds = inject_tq(
                     p,
+                    other,
                     lower_one(
                         p,
                         chunked,
@@ -1133,7 +1177,7 @@ pub fn lower(
                         cur_width,
                         m_divisor,
                     )?,
-                    0,
+                    decode,
                     bucket_m,
                 );
                 update_shape_state(p, other, &mut cur_width, &mut m_divisor);
@@ -1163,24 +1207,6 @@ pub fn lower(
     // so an inner loop ahead of its parent would be read as the parent.
     loops.sort_by_key(|l| (l.start, std::cmp::Reverse(l.period)));
     debug_assert_eq!(commands.len(), barrier_before.len());
-    // Per-command runtime gates, fused onto each command. The injected
-    // TurboQuant dequant/quantize commands are tagged `OnlyIfTurboquant` so they
-    // are skipped unless the KV cache is turboquant-compressed (the worker
-    // provisions the tq buffers); every other command is ungated. Fusing the
-    // gate onto each `GatedCommand` (vs a parallel `Vec`) is what makes the gate
-    // impossible to drop downstream.
-    let commands = commands
-        .into_iter()
-        .map(|c| match c.kernel {
-            KernelId::TqDequantToScratch | KernelId::TqQuantizeToPacked => {
-                crate::tape::lowered::GatedCommand::gated(
-                    c,
-                    crate::tape::lowered::RuntimeGate::OnlyIfTurboquant,
-                )
-            }
-            _ => crate::tape::lowered::GatedCommand::ungated(c),
-        })
-        .collect();
     Ok(LoweredMetalTape {
         bucket_m,
         num_arena_slots,
@@ -8999,63 +9025,184 @@ mod tests {
     // the empty impl suffices.
     impl scratchy_ir::WeightAccessors for TestParams {}
 
-    /// Each injected TurboQuant dequant/quantize command must carry the
-    /// `OnlyIfTurboquant` gate so it is skipped on a non-turboquant (fp16) KV
-    /// cache — otherwise the TQ kernels dispatch on fp16, read OOB from the
-    /// unbound packed/norms fallback bindings, and silently WEDGE the GPU. The
-    /// gate is fused onto each `GatedCommand`, so it can no longer be dropped by
-    /// a parallel-vec mishap (that is now a compile error); this test verifies
-    /// `inject_tq` assigns the gate VALUE correctly and `lower_pair` carries it.
-    /// Pure-CPU lowering check — never submits a Metal command buffer.
-    #[test]
-    fn lower_pair_keeps_turboquant_commands_gated() {
-        use crate::tape::lowered::RuntimeGate;
-        // One attention-via-cache op: inject_tq appends a `TqQuantizeToPacked`
-        // (uniform arch, hybrid=false) tagged `OnlyIfTurboquant`.
-        let backbone = vec![Instruction::AttentionViaCache(
-            /*q_slot=*/ 0, /*out_slot=*/ 1, /*layer=*/ 0, /*causal=*/ true,
-        )];
-        let lm_head: Vec<Instruction> = vec![];
-        let tape = lower_pair(
-            &tp(),
+    /// Lower one layer — the KV writer, then its attention — at `bucket_m`.
+    fn lower_tq_layer(attention: Instruction, bucket_m: u32) -> LoweredMetalTape {
+        let writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, /*layer=*/ 0, false, true);
+        lower_tq(&tp(), &[writer, attention], bucket_m)
+    }
+
+    fn lower_tq(p: &MetalModelConsts, backbone: &[Instruction], bucket_m: u32) -> LoweredMetalTape {
+        lower_pair(
+            p,
             /*chunked=*/ false,
-            &backbone,
-            &lm_head,
-            /*backbone_barriers=*/ &[false],
+            backbone,
+            &[],
+            /*backbone_barriers=*/ &vec![true; backbone.len()],
             /*lm_head_barriers=*/ &[],
-            /*bucket_m=*/ 1,
+            bucket_m,
             /*num_arena_slots=*/ 8,
             /*backbone_tape_index=*/ 0,
             /*lm_head_tape_index=*/ 1,
             /*block_cap=*/ 128,
             /*profile=*/ None,
         )
-        .expect("lower_pair");
+        .expect("lower_pair")
+    }
 
-        let is_tq = |k: &KernelId| {
-            matches!(
-                k,
-                KernelId::TqDequantToScratch | KernelId::TqQuantizeToPacked
-            )
-        };
-        let tq_count = tape
+    /// Each injected TurboQuant command must carry the `OnlyIfTurboquant` gate
+    /// so it is skipped on a non-turboquant (fp16) KV cache — otherwise the TQ
+    /// kernels dispatch on fp16, read OOB from the unbound packed/norms fallback
+    /// bindings, and silently WEDGE the GPU. The gate is fused onto each
+    /// `GatedCommand`, so it can no longer be dropped by a parallel-vec mishap
+    /// (that is now a compile error); these tests verify `inject_tq` assigns
+    /// the gate VALUE correctly and `lower_pair` carries it. Pure-CPU lowering
+    /// checks — never submit a Metal command buffer.
+    ///
+    /// Decode: no dequant pass; the plain attention runs only on fp16 KV and
+    /// its `AttentionViaCacheTq` twin — same geometry, plus the codebook width
+    /// and the packed-store bindings — only on TurboQuant KV.
+    #[test]
+    fn decode_turboquant_reads_packed_store_without_dequant() {
+        use crate::tape::lowered::RuntimeGate::{self, OnlyIfNotTurboquant, OnlyIfTurboquant};
+        let tape = lower_tq_layer(Instruction::AttentionViaCache(3, 6, 0, true), 1);
+        let steps: Vec<(KernelId, Option<RuntimeGate>)> = tape
             .commands
             .iter()
-            .filter(|c| is_tq(&c.command.kernel))
-            .count();
-        assert!(
-            tq_count > 0,
-            "inject_tq should emit TurboQuant commands for a uniform tape"
+            .map(|c| (c.command.kernel, c.gate))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (KernelId::RopeAppend, None),
+                (KernelId::AttentionViaCache, Some(OnlyIfNotTurboquant)),
+                (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquant)),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+            ]
         );
+        let (fp16, tq) = (&tape.commands[1].command, &tape.commands[2].command);
+        assert_eq!(
+            (fp16.library, fp16.function, fp16.dispatch),
+            (tq.library, tq.function, tq.dispatch)
+        );
+        let bits = crate::turboquant::tq_bits(tp().tq_kv_bits);
+        assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
+        assert_eq!(
+            tq.constants[fp16.constants.len()..],
+            [ConstantValue::uint(13, bits)]
+        );
+        assert_eq!(tq.bindings[..fp16.bindings.len()], *fp16.bindings);
+        let layer = crate::tape::ids::LayerId(0);
+        let tq_kinds: Vec<(u8, RuntimeBindingKind)> = tq.bindings[fp16.bindings.len()..]
+            .iter()
+            .map(|b| match b {
+                Binding::Runtime {
+                    kind,
+                    binding_index,
+                } => (*binding_index, *kind),
+                other => panic!("TurboQuant attention binding {other:?} is not a runtime buffer"),
+            })
+            .collect();
+        assert_eq!(
+            tq_kinds,
+            [
+                (7, RuntimeBindingKind::TqPackedK { layer }),
+                (8, RuntimeBindingKind::TqPackedV { layer }),
+                (9, RuntimeBindingKind::TqNormsK { layer }),
+                (10, RuntimeBindingKind::TqNormsV { layer }),
+                (11, RuntimeBindingKind::TqSigns),
+                (12, RuntimeBindingKind::TqCentroids),
+                (13, RuntimeBindingKind::SlotMapping { layer }),
+            ]
+        );
+    }
+
+    /// Hybrid arches (gemma-4) compress only the GLOBAL layers: in a decode
+    /// tape the global writer is followed by its quantize and the global
+    /// attention by its Tq twin, while the sliding layer stays plain fp16;
+    /// a prefill tape still dequantizes before the global writer only.
+    #[test]
+    fn hybrid_turboquant_compresses_global_layers_only() {
+        use crate::tape::lowered::RuntimeGate::{self, OnlyIfNotTurboquant, OnlyIfTurboquant};
+        let p = MetalModelConsts {
+            global_head_dim: 512,
+            num_global_kv_heads: 1,
+            global_block_size: 32,
+            global_rot_dim: 128,
+            sliding_window: 1024,
+            ..tp()
+        };
+        let global_writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, 0, false, true);
+        let sliding_writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, 1, false, false);
+        let steps = |tape: LoweredMetalTape| -> Vec<(KernelId, Option<RuntimeGate>)> {
+            tape.commands
+                .iter()
+                .map(|c| (c.command.kernel, c.gate))
+                .collect()
+        };
+        let decode = lower_tq(
+            &p,
+            &[
+                global_writer,
+                Instruction::AttentionViaCache(3, 6, 0, true),
+                sliding_writer,
+                Instruction::SlidingAttentionViaCache(3, 6, 1, true),
+            ],
+            1,
+        );
+        assert_eq!(
+            steps(decode),
+            [
+                (KernelId::RopeAppend, None),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+                (KernelId::AttentionViaCache, Some(OnlyIfNotTurboquant)),
+                (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquant)),
+                (KernelId::RopeAppend, None),
+                (KernelId::AttentionViaCache, None),
+            ]
+        );
+        let prefill = lower_tq(&p, &[global_writer, sliding_writer], 64);
+        assert_eq!(
+            steps(prefill),
+            [
+                (KernelId::TqDequantToScratch, Some(OnlyIfTurboquant)),
+                (KernelId::TqDequantToScratch, Some(OnlyIfTurboquant)),
+                (KernelId::RopeAppend, None),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+                (KernelId::RopeAppend, None),
+            ]
+        );
+    }
+
+    /// Prefill keeps the dequant pass (its attention reads the fp16 scratch),
+    /// gated like every TurboQuant command; nothing is gated off TurboQuant.
+    #[test]
+    fn prefill_turboquant_dequantizes_before_the_writer() {
+        use crate::tape::lowered::RuntimeGate::OnlyIfTurboquant;
+        let tape = lower_tq_layer(Instruction::AttentionPrefillPaged(3, 6, 0, false), 64);
+        let kernels: Vec<KernelId> = tape.commands.iter().map(|c| c.command.kernel).collect();
+        assert_eq!(
+            kernels[..3],
+            [
+                KernelId::TqDequantToScratch,
+                KernelId::TqDequantToScratch,
+                KernelId::RopeAppend
+            ]
+        );
+        assert!(!kernels.contains(&KernelId::AttentionViaCacheTq));
         for c in tape.commands {
-            if is_tq(&c.command.kernel) {
-                assert!(
-                    matches!(c.gate, Some(RuntimeGate::OnlyIfTurboquant)),
-                    "TurboQuant command {:?} must stay OnlyIfTurboquant-gated — \
-                     ungated it dispatches on fp16 and wedges the GPU",
-                    c.command.kernel,
-                );
-            }
+            let tq = matches!(
+                c.command.kernel,
+                KernelId::TqDequantToScratch | KernelId::TqQuantizeToPacked
+            );
+            assert_eq!(
+                c.gate,
+                tq.then_some(OnlyIfTurboquant),
+                "{:?} carries the wrong runtime gate",
+                c.command.kernel
+            );
         }
     }
 

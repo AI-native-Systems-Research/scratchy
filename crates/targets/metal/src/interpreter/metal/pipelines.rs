@@ -423,6 +423,7 @@ mod tests {
             | KernelId::AttnCausalSoftmax
             | KernelId::AttnGemmQk
             | KernelId::AttnGemmPv
+            | KernelId::AttentionViaCacheTq
             // BiasAdd specialized pipeline reads `num_cols` from
             // `function_constant(0)`. The test helper's
             // `(kernel, bucket_m)` API can't supply a per-call N;
@@ -583,6 +584,7 @@ mod tests {
             | KernelId::AttnCausalSoftmax
             | KernelId::AttnGemmQk
             | KernelId::AttnGemmPv
+            | KernelId::AttentionViaCacheTq
             | KernelId::BiasAdd => {
                 unreachable!(
                     "constants_for: Affine*/SiluMul/SplitKReduceSum/BiasAdd/Attn* not wired into \

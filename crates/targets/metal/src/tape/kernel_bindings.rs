@@ -215,6 +215,35 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
     }
 }
 
+/// `KernelId::AttentionViaCacheTq`: the bindings its `AttentionViaCache`
+/// twin's set gains — the layer's packed K/V codes + norms, the shared
+/// signs/codebook, and `slot_mapping` (slots 7..=13).
+pub struct TqAttentionBindingSet {
+    pub kv_layer: LayerId,
+}
+
+impl From<TqAttentionBindingSet> for Vec<Binding> {
+    fn from(s: TqAttentionBindingSet) -> Vec<Binding> {
+        let layer = s.kv_layer;
+        [
+            RuntimeBindingKind::TqPackedK { layer },
+            RuntimeBindingKind::TqPackedV { layer },
+            RuntimeBindingKind::TqNormsK { layer },
+            RuntimeBindingKind::TqNormsV { layer },
+            RuntimeBindingKind::TqSigns,
+            RuntimeBindingKind::TqCentroids,
+            RuntimeBindingKind::SlotMapping { layer },
+        ]
+        .into_iter()
+        .zip(7u8..)
+        .map(|(kind, binding_index)| Binding::Runtime {
+            kind,
+            binding_index,
+        })
+        .collect()
+    }
+}
+
 // ── RopeAppend ─────────────────────────────────────────────────────
 
 /// Bindings for `KernelId::RopeAppend`. Eight slots:
