@@ -420,8 +420,8 @@ struct BaseNAXFrag {
 
     // Create matmul output in register
     auto ct_c = gemm_op.template get_destination_cooperative_tensor<
-        decltype(ct_a),
-        decltype(ct_b),
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>,
         CType>();
 
     // Load A in to left operand registers
@@ -492,8 +492,8 @@ struct BaseNAXFrag {
 
     // Create matmul output in register
     auto ct_c = gemm_op.template get_destination_cooperative_tensor<
-        decltype(ct_a),
-        decltype(ct_b),
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>,
         CType>();
 
     // Load A in to left operand registers
@@ -570,23 +570,23 @@ struct NAXTile {
     }
   }
 
-  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j) {
+  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j) thread {
     return val_frags[i * kTileCols + j];
   }
 
   METAL_FUNC constexpr const thread frag_type& frag_at(
       const short i,
-      const short j) const {
+      const short j) const thread {
     return val_frags[i * kTileCols + j];
   }
 
   template <int i, int j>
-  METAL_FUNC constexpr thread frag_type& frag_at() {
+  METAL_FUNC constexpr thread frag_type& frag_at() thread {
     return val_frags[i * kTileCols + j];
   }
 
   template <int i, int j>
-  METAL_FUNC constexpr const thread frag_type& frag_at() const {
+  METAL_FUNC constexpr const thread frag_type& frag_at() const thread {
     return val_frags[i * kTileCols + j];
   }
 
@@ -611,7 +611,7 @@ struct NAXTile {
   }
 
   template <int i, int j, bool transpose>
-  METAL_FUNC constexpr thread frag_type& frag_at() {
+  METAL_FUNC constexpr thread frag_type& frag_at() thread {
     if constexpr (transpose) {
       return frag_at<j, i>();
     } else {
@@ -620,7 +620,7 @@ struct NAXTile {
   }
 
   template <int i, int j, bool transpose>
-  METAL_FUNC constexpr const thread frag_type& frag_at() const {
+  METAL_FUNC constexpr const thread frag_type& frag_at() const thread {
     if constexpr (transpose) {
       return frag_at<j, i>();
     } else {

@@ -54,7 +54,7 @@ struct integral_constant {
   static constexpr constant T value = v;
   using value_type = T;
   using type = integral_constant;
-  METAL_FUNC constexpr operator value_type() const noexcept { return value; }
+  METAL_FUNC constexpr operator value_type() const thread noexcept { return value; }
 };
 
 template <bool B>
@@ -67,11 +67,11 @@ using Int = integral_constant<int, val>;
 
 template <typename T, T tv, typename U, U uv>
 METAL_FUNC constexpr auto operator+(integral_constant<T,tv>, integral_constant<U,uv>) {
-  constexpr auto r = tv + uv; return integral_constant<decltype(r), r>{};
+  constexpr auto r = tv + uv; return integral_constant<metal::remove_addrspace_t<decltype(r)>, r>{};
 }
 template <typename T, T tv, typename U, U uv>
 METAL_FUNC constexpr auto operator*(integral_constant<T,tv>, integral_constant<U,uv>) {
-  constexpr auto r = tv * uv; return integral_constant<decltype(r), r>{};
+  constexpr auto r = tv * uv; return integral_constant<metal::remove_addrspace_t<decltype(r)>, r>{};
 }
 
 template <typename F>
@@ -498,8 +498,8 @@ struct BaseNAXFrag {
 
     // Create matmul output in register
     auto ct_c = gemm_op.template get_destination_cooperative_tensor<
-        decltype(ct_a),
-        decltype(ct_b),
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>,
         CType>();
 
     // Load A in to left operand registers
@@ -570,8 +570,8 @@ struct BaseNAXFrag {
 
     // Create matmul output in register
     auto ct_c = gemm_op.template get_destination_cooperative_tensor<
-        decltype(ct_a),
-        decltype(ct_b),
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>,
         CType>();
 
     // Load A in to left operand registers
@@ -641,36 +641,36 @@ struct NAXTile {
 
   METAL_FUNC NAXTile() thread {}
 
-  METAL_FUNC constexpr void clear() {
+  METAL_FUNC constexpr void clear() thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kNumFrags; ++i) {
       val_frags[i] = frag_type(0);
     }
   }
 
-  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j) {
+  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j) thread {
     return val_frags[i * kTileCols + j];
   }
 
   METAL_FUNC constexpr const thread frag_type& frag_at(
       const short i,
-      const short j) const {
+      const short j) const thread {
     return val_frags[i * kTileCols + j];
   }
 
   template <int i, int j>
-  METAL_FUNC constexpr thread frag_type& frag_at() {
+  METAL_FUNC constexpr thread frag_type& frag_at() thread {
     return val_frags[i * kTileCols + j];
   }
 
   template <int i, int j>
-  METAL_FUNC constexpr const thread frag_type& frag_at() const {
+  METAL_FUNC constexpr const thread frag_type& frag_at() const thread {
     return val_frags[i * kTileCols + j];
   }
 
   template <bool transpose>
   METAL_FUNC constexpr thread frag_type&
-  frag_at(const short i, const short j, metal::bool_constant<transpose>) {
+  frag_at(const short i, const short j, metal::bool_constant<transpose>) thread {
     if constexpr (transpose) {
       return frag_at(j, i);
     } else {
@@ -680,7 +680,7 @@ struct NAXTile {
 
   template <bool transpose>
   METAL_FUNC constexpr const thread frag_type&
-  frag_at(const short i, const short j, metal::bool_constant<transpose>) const {
+  frag_at(const short i, const short j, metal::bool_constant<transpose>) const thread {
     if constexpr (transpose) {
       return frag_at(j, i);
     } else {
@@ -689,7 +689,7 @@ struct NAXTile {
   }
 
   template <int i, int j, bool transpose>
-  METAL_FUNC constexpr thread frag_type& frag_at() {
+  METAL_FUNC constexpr thread frag_type& frag_at() thread {
     if constexpr (transpose) {
       return frag_at<j, i>();
     } else {
@@ -698,7 +698,7 @@ struct NAXTile {
   }
 
   template <int i, int j, bool transpose>
-  METAL_FUNC constexpr const thread frag_type& frag_at() const {
+  METAL_FUNC constexpr const thread frag_type& frag_at() const thread {
     if constexpr (transpose) {
       return frag_at<j, i>();
     } else {
@@ -706,16 +706,16 @@ struct NAXTile {
     }
   }
 
-  METAL_FUNC thread elem_type* elems() {
+  METAL_FUNC thread elem_type* elems() thread {
     return reinterpret_cast<thread elem_type*>(val_frags);
   }
 
-  METAL_FUNC const thread elem_type* elems() const {
+  METAL_FUNC const thread elem_type* elems() const thread {
     return reinterpret_cast<const thread elem_type*>(val_frags);
   }
 
   template <typename Op>
-  METAL_FUNC void row_reduce(thread metal::vec<T, kRowsPerThread>& vals) const {
+  METAL_FUNC void row_reduce(thread metal::vec<T, kRowsPerThread>& vals) const thread {
     auto vptr = (thread T*)(&vals);
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
@@ -728,7 +728,7 @@ struct NAXTile {
   }
 
   template <typename Op>
-  METAL_FUNC void row_bin_op(thread metal::vec<T, kRowsPerThread>& vals) {
+  METAL_FUNC void row_bin_op(thread metal::vec<T, kRowsPerThread>& vals) thread {
     auto vptr = (thread T*)(&vals);
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kTileRows; ++i) {
@@ -741,7 +741,7 @@ struct NAXTile {
   }
 
   template <typename U, int str_x, int str_y>
-  METAL_FUNC void load(const threadgroup U* src) {
+  METAL_FUNC void load(const threadgroup U* src) thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::load(
@@ -756,7 +756,7 @@ struct NAXTile {
   }
 
   template <typename U, int str_x, int str_y>
-  METAL_FUNC void store(threadgroup U* dst) const {
+  METAL_FUNC void store(threadgroup U* dst) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::store(
@@ -771,7 +771,7 @@ struct NAXTile {
   }
 
   template <typename U>
-  METAL_FUNC void load(const device U* src, const int ld) {
+  METAL_FUNC void load(const device U* src, const int ld) thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::load(
@@ -786,7 +786,7 @@ struct NAXTile {
   }
 
   template <typename U>
-  METAL_FUNC void store(device U* dst, const int ld) const {
+  METAL_FUNC void store(device U* dst, const int ld) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::store(
@@ -802,7 +802,7 @@ struct NAXTile {
 
   template <typename U>
   METAL_FUNC void
-  load_rows(const device U* src, const int ld, const short n_rows) {
+  load_rows(const device U* src, const int ld, const short n_rows) thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::load_rows(
@@ -819,7 +819,7 @@ struct NAXTile {
 
   template <typename U>
   METAL_FUNC void
-  load_safe(const device U* src, const int ld, const short2 src_tile_dims) {
+  load_safe(const device U* src, const int ld, const short2 src_tile_dims) thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::load_safe(
@@ -837,7 +837,7 @@ struct NAXTile {
 
   template <typename U>
   METAL_FUNC void store_rows(device U* dst, const int ld, const short n_rows)
-      const {
+      const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::store_rows(
@@ -854,7 +854,7 @@ struct NAXTile {
 
   template <typename U>
   METAL_FUNC void
-  store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const {
+  store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::store_safe(
@@ -875,7 +875,7 @@ struct NAXTile {
       device U* dst,
       const int ld,
       const short2 start,
-      const short2 stop) const {
+      const short2 stop) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
         NAXFrag_t::store_slice(
@@ -1043,7 +1043,7 @@ struct BlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
       : src_ld(src_ld_),
         tile_stride(reduction_dim ? BCOLS : BROWS * src_ld),
         thread_idx(simd_group_id * 32 + simd_lane_id),
@@ -1052,7 +1052,7 @@ struct BlockLoader {
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * src_ld + bj) {}
 
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < BROWS; i += TROWS) {
       *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
@@ -1060,7 +1060,7 @@ struct BlockLoader {
     }
   }
 
-  METAL_FUNC void load_safe(short2 src_tile_dim) const {
+  METAL_FUNC void load_safe(short2 src_tile_dim) const thread {
     src_tile_dim = src_tile_dim - short2(bj, bi);
     if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
       STEEL_PRAGMA_UNROLL
@@ -1095,7 +1095,7 @@ struct BlockLoader {
     }
   }
 
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     src += tile_stride;
   }
 };
@@ -1147,7 +1147,7 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id,
-      ushort simd_lane_id)
+      ushort simd_lane_id) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED * bytes_per_pack
@@ -1163,7 +1163,7 @@ struct QuantizedBlockLoader {
         scales(scales_ + bi * src_ld / group_size),
         biases(biases_ + bi * src_ld / group_size) {}
 
-  void load_unsafe() const {
+  void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
@@ -1176,7 +1176,7 @@ struct QuantizedBlockLoader {
     }
   }
 
-  void load_safe(short2 src_tile_dim) const {
+  void load_safe(short2 src_tile_dim) const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
@@ -1206,7 +1206,7 @@ struct QuantizedBlockLoader {
     }
   }
 
-  void next() {
+  void next() thread {
     src += tile_stride;
     if (reduction_dim == 1) {
       if (group_steps > 1) {
