@@ -275,6 +275,51 @@ impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::TqStageRotated` (`tq_stage_rotated_<dtype>`, attention.metal
+/// slots): the layer's KV geometry, the codebook width, and — for K under
+/// rope-on-read — the span re-rope geometry (slots 8/9/10).
+pub struct TqStageConstants {
+    pub head_dim: HeadDim,
+    pub num_kv_heads: NumKvHeads,
+    pub block_size: BlockSize,
+    pub max_blocks: MaxBlocksPerSeq,
+    pub blocks_per_chunk: BlocksPerChunk,
+    pub bits: TqCodeBits,
+    pub rot_dim: Option<RotDim>,
+    pub pair_off: Option<RopePairOff>,
+    pub rope_on_read: Option<u32>,
+}
+
+impl From<TqStageConstants> for Vec<ConstantValue> {
+    fn from(c: TqStageConstants) -> Self {
+        let mut v = vec![
+            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
+            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
+            ConstantValue::uint(ConstSlot(4), c.block_size.get()),
+            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
+        ];
+        push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
+        v.push(ConstantValue::uint(ConstSlot(13), c.bits.get()));
+        v
+    }
+}
+
+/// `KernelId::TqRotateRows` (`tq_{rotate,unrotate}_rows_<dtype>`).
+pub struct TqRotateRowsConstants {
+    pub head_dim: HeadDim,
+    pub num_q_heads: NumQHeads,
+}
+
+impl From<TqRotateRowsConstants> for Vec<ConstantValue> {
+    fn from(c: TqRotateRowsConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
+            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
+        ]
+    }
+}
+
 // ── AttentionPrefillSdpaPaged (sdpa + steel) ───────────────────────
 
 /// `KernelId::AttentionPrefillSdpaPaged` for both the

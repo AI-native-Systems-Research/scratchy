@@ -1368,7 +1368,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 /// STRIDE for this forward. The serving worker flattens the block table to
 /// `[num_reqs * max_blocks_eff]` (gpu_worker.rs), with
 /// `max_blocks_eff = max(W::MAX_BLOCKS_PER_SEQ, runtime_max_blocks)`, so the
-/// stride recovers as `len / num_seqs`. The `TqDequantToScratch` dispatch must
+/// stride recovers as `len / num_seqs`. The `TqStageRotated` dispatch must
 /// cover exactly this many blocks so the reused fp16 scratch is filled for the
 /// WHOLE active context (the kernel early-exits past `seqused_k`); the static
 /// `W::MAX_BLOCKS_PER_SEQ` truncated it at 2048 tokens for uniform arches.

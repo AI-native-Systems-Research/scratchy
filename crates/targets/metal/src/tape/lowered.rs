@@ -436,16 +436,21 @@ pub enum KernelId {
     /// `elementwise.metallib`. Bindings: `(embed @ 0 in/out, mm @ 1,
     /// dst_rows @ 2, hidden inline @ 3)`.
     MmEmbedSplice,
-    /// TurboQuant: dequant a layer's PACKED KV codes into the reused fp16
-    /// scratch (one layer at a time) right BEFORE that layer's KV writer, for
-    /// the prefill attention to read. Maps to `tq_dequant_blocktable[_bf16]`
-    /// in `turboquant.metallib`. The packed store (canonical, ~4.7x smaller)
-    /// is the only persistent KV; the scratch holds one layer's fp16 for the
-    /// attention read, then is reused.
-    TqDequantToScratch,
+    /// TurboQuant prefill: write a layer's K (or V) for the step's sequences
+    /// into the reused fp16 scratch in the codebook's ROTATED domain (R·k),
+    /// right before that layer's prefill attention — a table lookup per cached
+    /// key, a Walsh-Hadamard transform per new key. Maps to
+    /// `tq_stage_rotated_{f16,bf16}` in `attention.metallib`. The packed store
+    /// (canonical, ~4.7x smaller) is the only persistent KV; the scratch holds
+    /// one layer's image for the attention read, then is reused.
+    TqStageRotated,
+    /// TurboQuant prefill: rotate the attention's q rows into the codebook
+    /// domain (R·q) before it and its output rows back (Rᵀ·o) after it, in
+    /// place. Maps to `tq_{rotate,unrotate}_rows_{f16,bf16}` in
+    /// `attention.metallib`.
+    TqRotateRows,
     /// TurboQuant: quantize a layer's newly-written KV (in the fp16 scratch)
-    /// into the PACKED store — after that layer's attention on uniform
-    /// arches, right after its KV writer on hybrid ones. Maps to
+    /// into the PACKED store right after that layer's KV writer. Maps to
     /// `tq_compress_paged[_bf16]` in `turboquant.metallib`.
     TqQuantizeToPacked,
     /// TurboQuant decode attention: `AttentionViaCache` reading the packed
@@ -561,10 +566,16 @@ pub enum RuntimeGate {
     /// but only fire when `kv_cache_dtype == turboquant` (the worker resolves
     /// the tq buffers + the KV scratch only then). No-op on every other run.
     OnlyIfTurboquant,
-    /// Run only when the KV cache is NOT TurboQuant-compressed: the plain
-    /// decode `AttentionViaCache` whose `AttentionViaCacheTq` twin replaces
-    /// it under TurboQuant.
-    OnlyIfNotTurboquant,
+    /// Run only on a TurboQuant decode step — every sequence contributes
+    /// exactly one token (`num_tokens == num_seqs`) — the steps whose
+    /// attention is `AttentionViaCacheTq`, reading the packed store directly.
+    OnlyIfTurboquantDecode,
+    /// Run only on a TurboQuant step that is NOT a decode step: the
+    /// rotated-domain K/V staging and q/output rotation around its attention.
+    OnlyIfTurboquantNotDecode,
+    /// Run unless this is a TurboQuant decode step: the attention an
+    /// `AttentionViaCacheTq` twin replaces there.
+    UnlessTurboquantDecode,
 }
 
 impl DispatchShape {
@@ -1110,8 +1121,9 @@ pub enum RuntimeBindingKind {
     /// (`[0..vision_num_positions]` per image). Gemma3-MM.
     VisionPositionIds,
     /// TurboQuant per-layer PACKED key/value code store (canonical KV, ~4.7x
-    /// smaller than fp16). Source for `TqDequantToScratch`, dest for
-    /// `TqQuantizeToPacked`. Worker resolves to `tq_packed_k/v[layer]`.
+    /// smaller than fp16). Source for `TqStageRotated` and
+    /// `AttentionViaCacheTq`, dest for `TqQuantizeToPacked`. Worker resolves
+    /// to `tq_packed_k/v[layer]`.
     TqPackedK {
         layer: LayerId,
     },
