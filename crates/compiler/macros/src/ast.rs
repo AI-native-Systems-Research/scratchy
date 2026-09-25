@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Abstract syntax tree for the `#[forward]` DSL.
+//! Abstract syntax tree for the forward DSL (`dsl/<arch>.py`).
 //!
 //! The AST mirrors the source body verbatim — no classification,
 //! no shape inference, no substitution. It preserves the user's
@@ -8,7 +8,7 @@
 
 use syn::Ident;
 
-/// Top-level: the body of the `#[forward]` carrier fn.
+/// Top-level: the body of the `@forward` carrier `def`.
 #[derive(Clone, Debug)]
 pub struct Ast {
     pub statements: Vec<Stmt>,
@@ -17,18 +17,18 @@ pub struct Ast {
 /// A statement in the DSL body.
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    /// `name = expr;`
+    /// `name = expr`
     Assign { target: Ident, value: Expr },
-    /// `(a, b, c) = expr;` — tuple destructuring assignment.
+    /// `(a, b, c) = expr` — tuple destructuring assignment.
     AssignTuple { targets: Vec<Ident>, value: Expr },
-    /// `for ivar in 0..<bound> { body }` — symbolic trip count.
+    /// `for ivar in range(<bound>):` — symbolic trip count.
     For {
         ivar: Ident,
         start: BoundExpr,
         end: BoundExpr,
         body: Vec<Stmt>,
     },
-    /// `if <cond> { then_body } else { else_body }` — compile-time
+    /// `if <cond>:` … `else:` … — compile-time
     /// conditional. The condition must be one of a small closed set
     /// of predicates over a loop-induction variable (see
     /// [`BoolExpr`]). Evaluated at unroll time.
@@ -58,7 +58,7 @@ pub enum BoolExpr {
     },
     /// `ivar < bound`.
     Less { ivar: Ident, bound: BoundExpr },
-    /// `[lit, lit, ...].contains(&ivar)` — set-membership over a
+    /// `ivar in [lit, lit, ...]` — set-membership over a
     /// closed list of integer literals. Surface predicate for arches
     /// like Qwen2.5-VL whose `fullatt_block_indexes = [7, 15, 23, 31]`
     /// selects 4-of-32 transformer blocks for full attention; the

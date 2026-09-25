@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# A normal lib (not a proc-macro): the `#[forward]` pipeline
-# (`compile_in_dir`/`compile_common`/`parse_carrier`) is driven directly from
+# A normal lib (not a proc-macro): the forward pipeline
+# (`parse_python_file` + `compile_carrier`) is driven directly from
 # the consolidated `scratchy-models` build.rs — there is no attribute macro.
 [features]
 # No default backend. Consumer must opt into exactly one of `cuda`
@@ -95,8 +95,6 @@ scratchy-target-spyre = { path = "../../targets/spyre", default-features = false
 # The IR types the baked program is CONSTRUCTED from — this crate renders them as const tokens, so
 # it names the same types the lowering built. Dependency-free.
 ktir-core = { path = "../../targets/spyre/ktir/ktir-core", optional = true }
-ruff_python_ast = "0.0.14"
-ruff_python_parser = "0.0.14"
 
 [dev-dependencies]
 trybuild = "1"

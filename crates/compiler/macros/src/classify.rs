@@ -38,7 +38,7 @@ fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
 
 /// Classify the AST against the decoder prelude. Convenience entry
 /// point used by unit tests in adjacent modules; production code in
-/// `compile_common` calls [`classify_with`] with an explicit prelude.
+/// `compile_carrier` calls [`classify_with`] with an explicit prelude.
 #[allow(dead_code)]
 pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
     classify_with(ast, Prelude::Decoder)
@@ -581,37 +581,20 @@ fn attach_index(expr: Expr, index: LocalId) -> ClassifyResult<Expr> {
 mod tests {
     use super::*;
     use crate::classified::WeightId;
-    use crate::parse::parse_block;
+    use crate::parse_python::parse_body;
 
     fn classify_src(src: &str) -> Program {
-        let file: syn::File =
-            syn::parse_str(&format!("fn _carrier() {{ {src} }}")).expect("syntactic parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).expect("DSL parse");
+        let ast = parse_body(src).expect("DSL parse");
         classify_with(&ast, Prelude::Decoder).expect("classification")
     }
 
     fn classify_err(src: &str) -> syn::Error {
-        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {src} }}")).unwrap();
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).expect("DSL parse");
+        let ast = parse_body(src).expect("DSL parse");
         classify_with(&ast, Prelude::Decoder).expect_err("expected classification error")
     }
 
     fn classify_vision_src(src: &str) -> Program {
-        let file: syn::File =
-            syn::parse_str(&format!("fn _carrier() {{ {src} }}")).expect("syntactic parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).expect("DSL parse");
+        let ast = parse_body(src).expect("DSL parse");
         classify_with(&ast, Prelude::Vision).expect("classification")
     }
 
@@ -724,7 +707,10 @@ mod tests {
     #[test]
     fn for_loop_scopes_induction_var() {
         let p = classify_src(
-            "for layer in 0..num_hidden_layers { x = embed(kv_cache[layer], embed_tokens); }",
+            "
+            for layer in range(num_hidden_layers):
+                x = embed(kv_cache[layer], embed_tokens)
+            ",
         );
         match &p.statements[0] {
             Stmt::For { ivar, body, .. } => {
@@ -755,10 +741,11 @@ mod tests {
         // Two reads of the same dotted-path weight should produce
         // the same WeightId.
         let p = classify_src(
-            "for layer in 0..num_hidden_layers { \
-                q = gemm(q, self_attn.q_proj[layer]); \
-                q = gemm(q, self_attn.q_proj[layer]); \
-            }",
+            "
+            for layer in range(num_hidden_layers):
+                q = gemm(q, self_attn.q_proj[layer])
+                q = gemm(q, self_attn.q_proj[layer])
+            ",
         );
         match &p.statements[0] {
             Stmt::For { body, .. } => {
@@ -793,11 +780,14 @@ mod tests {
     #[test]
     fn if_merge_carry_is_emitted() {
         let p = classify_src(
-            "for layer in 0..4 { \
-                if layer % 2 == 0 { attn = attention(q, k, v, kv_cache, block_table); } \
-                else { attn = sliding_attention(q, k, v, kv_cache, block_table); } \
-                hidden_states = add(attn, attn); \
-            }",
+            "
+            for layer in range(4):
+                if layer % 2 == 0:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(attn, attn)
+            ",
         );
         match &p.statements[0] {
             Stmt::For { body, .. } => match &body[0] {
@@ -838,14 +828,14 @@ mod tests {
     #[test]
     fn if_in_literal_array_classifies_to_in_pred() {
         let p = classify_src(
-            "for layer in 0..32 { \
-                if [7, 15, 23, 31].contains(&layer) { \
-                    attn = attention(q, k, v, kv_cache, block_table); \
-                } else { \
-                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
-                } \
-                hidden_states = add(attn, attn); \
-            }",
+            "
+            for layer in range(32):
+                if layer in [7, 15, 23, 31]:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(attn, attn)
+            ",
         );
         match &p.statements[0] {
             Stmt::For { body, .. } => match &body[0] {
@@ -865,13 +855,13 @@ mod tests {
     #[test]
     fn if_in_with_unbound_ivar_is_rejected() {
         let err = classify_err(
-            "for layer in 0..32 { \
-                if [7, 15].contains(&ghost) { \
-                    attn = attention(q, k, v, kv_cache, block_table); \
-                } else { \
-                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
-                } \
-            }",
+            "
+            for layer in range(32):
+                if ghost in [7, 15]:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+            ",
         );
         let msg = err.to_string();
         assert!(
@@ -887,10 +877,13 @@ mod tests {
         // `then`, `b` only in `else`). Both are dead after the branch, so
         // this is allowed — only the intersection escapes (here empty).
         let p = classify_src(
-            "for layer in 0..4 { \
-                if layer % 2 == 0 { a = attention(q, k, v, kv_cache, block_table); } \
-                else { b = sliding_attention(q, k, v, kv_cache, block_table); } \
-            }",
+            "
+            for layer in range(4):
+                if layer % 2 == 0:
+                    a = attention(q, k, v, kv_cache, block_table)
+                else:
+                    b = sliding_attention(q, k, v, kv_cache, block_table)
+            ",
         );
         match &p.statements[0] {
             Stmt::For { body, .. } => match &body[0] {
@@ -913,12 +906,15 @@ mod tests {
         // arm — the dangerous silent-divergence case (a read after the `if`
         // would see the pre-`if` value when the `else` arm ran). Rejected.
         let err = classify_err(
-            "for layer in 0..4 { \
-                x = attention(q, k, v, kv_cache, block_table); \
-                if layer % 2 == 0 { x = sliding_attention(q, k, v, kv_cache, block_table); } \
-                else { y = attention(q, k, v, kv_cache, block_table); } \
-                hidden_states = add(x, x); \
-            }",
+            "
+            for layer in range(4):
+                x = attention(q, k, v, kv_cache, block_table)
+                if layer % 2 == 0:
+                    x = sliding_attention(q, k, v, kv_cache, block_table)
+                else:
+                    y = attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(x, x)
+            ",
         );
         let msg = err.to_string();
         assert!(
@@ -934,10 +930,13 @@ mod tests {
         // assignment, but inside a predicate it must resolve to a
         // loop local — so this is rejected.
         let err = classify_err(
-            "for layer in 0..4 { \
-                if ghost % 2 == 0 { x = attention(q, k, v, kv_cache, block_table); } \
-                else { x = sliding_attention(q, k, v, kv_cache, block_table); } \
-            }",
+            "
+            for layer in range(4):
+                if ghost % 2 == 0:
+                    x = attention(q, k, v, kv_cache, block_table)
+                else:
+                    x = sliding_attention(q, k, v, kv_cache, block_table)
+            ",
         );
         let msg = err.to_string();
         assert!(msg.contains("ghost"), "error names unbound ivar: {msg}");
@@ -946,27 +945,26 @@ mod tests {
     #[test]
     fn realistic_llama_body_classifies_fully() {
         let p = classify_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-                attn = attention(q, k, v, kv_cache[layer], block_table);
-                oproj = gemm(attn, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+                attn = attention(q, k, v, kv_cache[layer], block_table)
+                oproj = gemm(attn, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
 
-                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-                gate = silu(gemm(normed2, mlp.gate_proj[layer]));
-                up = gemm(normed2, mlp.up_proj[layer]);
-                down = gemm(gate * up, mlp.down_proj[layer]);
-                hidden_states = add(down, hidden_states);
-            }
-            normed = rmsnorm(hidden_states, norm);
-            logits = gemm(normed, lm_head);
-            "#,
+                normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer])
+                gate = silu(gemm(normed2, mlp.gate_proj[layer]))
+                up = gemm(normed2, mlp.up_proj[layer])
+                down = gemm(gate * up, mlp.down_proj[layer])
+                hidden_states = add(down, hidden_states)
+            normed = rmsnorm(hidden_states, norm)
+            logits = gemm(normed, lm_head)
+            ",
         );
 
         // Weights interned: input_layernorm, q_proj, k_proj, v_proj,

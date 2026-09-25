@@ -209,7 +209,7 @@ mod tests {
     use crate::config::{self, ModelParams};
     use crate::fuf::unroll;
     use crate::impl_lib::starter_library;
-    use crate::parse::parse_block;
+    use crate::parse_python::parse_body;
     use crate::shape::infer;
     use crate::solver::solve;
     use crate::target::TargetProfile;
@@ -230,12 +230,7 @@ mod tests {
     }
 
     fn solved_body(src: &str, params: &ModelParams) -> (Fuf, Assignment) {
-        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).unwrap();
+        let ast = parse_body(src).unwrap();
         let program = classify(&ast).unwrap();
         let inferred = infer(
             &program,
@@ -258,21 +253,20 @@ mod tests {
     // one subgraph, erasing the Q/K/V parallelism the wave-merging
     // tests below are inspecting. Dropping rope + attention lets the
     // three Gemms stay singleton and share a wave.
-    const ATTN_BODY: &str = r#"
-        hidden_states = embed(input_ids, embed_tokens);
-        for layer in 0..num_hidden_layers {
-            normed = rmsnorm(hidden_states, input_layernorm[layer]);
-            q = gemm(normed, self_attn.q_proj[layer]);
-            k = gemm(normed, self_attn.k_proj[layer]);
-            v = gemm(normed, self_attn.v_proj[layer]);
-            oproj = gemm(q, self_attn.o_proj[layer]);
-            hidden_states = add(oproj, hidden_states);
-        }
-        // Post-loop final norm so the last iteration's Add has a
-        // downstream RmsNorm consumer — otherwise the solver has no
-        // coverage for that Add (no standalone Add impl exists).
-        final_norm = rmsnorm(hidden_states, norm);
-    "#;
+    const ATTN_BODY: &str = "
+        hidden_states = embed(input_ids, embed_tokens)
+        for layer in range(num_hidden_layers):
+            normed = rmsnorm(hidden_states, input_layernorm[layer])
+            q = gemm(normed, self_attn.q_proj[layer])
+            k = gemm(normed, self_attn.k_proj[layer])
+            v = gemm(normed, self_attn.v_proj[layer])
+            oproj = gemm(q, self_attn.o_proj[layer])
+            hidden_states = add(oproj, hidden_states)
+        # Post-loop final norm so the last iteration's Add has a
+        # downstream RmsNorm consumer — otherwise the solver has no
+        # coverage for that Add (no standalone Add impl exists).
+        final_norm = rmsnorm(hidden_states, norm)
+    ";
 
     #[test]
     fn loop_is_shorter_than_one_wave_per_subgraph() {
@@ -305,18 +299,17 @@ mod tests {
     #[test]
     fn parallel_qkv_gemms_share_a_wave() {
         let (fuf, sfuf) = solved_body(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..1 {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                k = gemm(normed, self_attn.k_proj[layer]);
-                v = gemm(normed, self_attn.v_proj[layer]);
-                oproj = gemm(q, self_attn.o_proj[layer]);
-                hidden_states = add(oproj, hidden_states);
-            }
-            final_norm = rmsnorm(hidden_states, norm);
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(1):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                k = gemm(normed, self_attn.k_proj[layer])
+                v = gemm(normed, self_attn.v_proj[layer])
+                oproj = gemm(q, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            final_norm = rmsnorm(hidden_states, norm)
+            ",
             &llama_3_2_1b_params(),
         );
         let loop_ir = schedule(&fuf, &sfuf);
@@ -348,24 +341,18 @@ mod tests {
     #[test]
     fn workload_sweep_produces_one_loop_per_point() {
         let params = llama_3_2_1b_params();
-        let file: syn::File = syn::parse_str(
-            r#"fn _c() {
-                hidden_states = embed(input_ids, embed_tokens);
-                for layer in 0..num_hidden_layers {
-                    normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                    q = gemm(normed, self_attn.q_proj[layer]);
-                    oproj = gemm(q, self_attn.o_proj[layer]);
-                    hidden_states = add(oproj, hidden_states);
-                }
-                final_norm = rmsnorm(hidden_states, norm);
-            }"#,
+        let ast = parse_body(
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                oproj = gemm(q, self_attn.o_proj[layer])
+                hidden_states = add(oproj, hidden_states)
+            final_norm = rmsnorm(hidden_states, norm)
+            ",
         )
         .unwrap();
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).unwrap();
         let program = classify(&ast).unwrap();
         let inferred = infer(
             &program,

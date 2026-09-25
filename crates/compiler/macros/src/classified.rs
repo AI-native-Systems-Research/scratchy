@@ -641,7 +641,7 @@ pub struct Program {
     /// `visual.blocks.<L>.<x>`), reshape `nt` source, etc.
     pub prelude: Prelude,
     /// Decoder-side safetensors prefix to prepend to every text-decoder
-    /// safetensors key. Populated by `compile_common` from the arch's
+    /// safetensors key. Populated by `compile_carrier` from the arch's
     /// representative config (`decoder_safetensors_prefix` JSON field).
     /// `None` for text-only and Qwen-style VL arches; `Some("language_model")`
     /// for Gemma3-MM-style multimodal where HF nests the text decoder

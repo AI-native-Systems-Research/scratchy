@@ -7,34 +7,36 @@ then rely on a runtime graph executor to pick kernels. This project takes the
 opposite approach: **you write the math once, declaratively, and the compiler
 emits the whole forward pass ahead of time.**
 
-A model architecture is a single `#[forward(...)]` function whose body reads
-like the math itself. Here is the *entire* definition of LLaMA
-(`crates/models/arch/dsl/llama.rs.in`):
+A model architecture is a single `@forward`-decorated Python function whose
+body reads like the math itself. Here is the *entire* definition of LLaMA
+(`crates/models/arch/dsl/llama.py`):
 
-```rust
-#[forward]
-fn llama() {
-    hidden_states = embed(input_ids, embed_tokens);
-    for layer in 0..num_hidden_layers {
-        normed = rmsnorm(hidden_states, input_layernorm[layer]);
-        q = gemm(normed, self_attn.q_proj[layer]);
-        k = gemm(normed, self_attn.k_proj[layer]);
-        v = gemm(normed, self_attn.v_proj[layer]);
-        (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-        attn = attention(q, k, v, kv_cache[layer], block_table);
-        oproj = gemm(attn, self_attn.o_proj[layer]);
-        hidden_states = add(oproj, hidden_states);
+```python
+@forward
+def llama():
+    hidden_states = embed(input_ids, embed_tokens)
+    for layer in range(num_hidden_layers):
+        normed = rmsnorm(hidden_states, input_layernorm[layer])
+        q = gemm(normed, self_attn.q_proj[layer])
+        k = gemm(normed, self_attn.k_proj[layer])
+        v = gemm(normed, self_attn.v_proj[layer])
+        (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+        attn = attention(q, k, v, kv_cache[layer], block_table)
+        oproj = gemm(attn, self_attn.o_proj[layer])
+        hidden_states = add(oproj, hidden_states)
 
-        normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-        gate = silu(gemm(normed2, mlp.gate_proj[layer]));
-        up = gemm(normed2, mlp.up_proj[layer]);
-        down = gemm(gate * up, mlp.down_proj[layer]);
-        hidden_states = add(down, hidden_states);
-    }
-    normed = rmsnorm(hidden_states, norm);
-    logits = gemm(normed, lm_head);
-}
+        normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer])
+        gate = silu(gemm(normed2, mlp.gate_proj[layer]))
+        up = gemm(normed2, mlp.up_proj[layer])
+        down = gemm(gate * up, mlp.down_proj[layer])
+        hidden_states = add(down, hidden_states)
+    normed = rmsnorm(hidden_states, norm)
+    logits = gemm(normed, lm_head)
+    return logits
 ```
+
+The compiler parses this text (a strict subset of Python) and never runs it;
+the same file also runs under torch as a numeric reference.
 
 That's the whole architecture. No weight wiring, no kernel selection, no
 scratch-buffer management, no per-shape dispatch tables — the compiler derives
@@ -76,8 +78,8 @@ The compiler runs these passes at macro-expansion time:
 Instead of selecting kernels at runtime, the compiler precomputes optimal kernel
 sequences for discrete **buckets** of the workload space — token count `m` and
 KV-cache span `sk`. Both ladders default (the standard `sk` ladder is
-`[128, 512, 2048, 8192]`); an arch overrides either via `#[forward(workloads =
-[...], sk_buckets = [...])]` when its dispatch wants different breakpoints. Each canonical
+`[128, 512, 2048, 8192]`); an arch overrides either via `@forward(workloads=[...],
+sk_buckets=[...])` when its dispatch wants different breakpoints. Each canonical
 gets a static `FORWARD_TABLE` mapping `(m, sk)` ranges to an instruction
 sequence and its per-bucket scratch-tile layout. At load time, buckets are
 pruned to fit the target device's memory — small GPUs simply drop the
@@ -105,7 +107,7 @@ Metal-side affine 4-bit and NVFP4.
 
 ## Multimodal
 
-Vision-language models use a sibling `#[vision_forward]` macro for the encoder,
+Vision-language models use a sibling `@vision_forward` carrier for the encoder,
 with projected patch embeddings spliced into the language token sequence and
 2D/3D MRoPE position handling (Qwen2/2.5-VL).
 
@@ -113,9 +115,10 @@ with projected patch embeddings spliced into the language token sequence and
 
 All arches share the one `scratchy-models` crate (`crates/models/arch/`):
 
-1. Write the math as one `#[forward(...)]` (or `#[vision_forward(...)]`) carrier
-   in `crates/models/arch/dsl/<arch>.rs.in`. The carrier is a bare
-   `fn <arch>()` and its body is the math — nothing else goes in this file.
+1. Write the math as one `@forward` (or `@vision_forward(...)`) carrier
+   in `crates/models/arch/dsl/<arch>.py`. The carrier is a bare
+   `def <arch>():` and its body is the math — nothing but imports and that
+   `def` goes in this file.
 2. Drop the verbatim HuggingFace `config.json` for each model size into
    `crates/models/arch/configs/<arch>/`.
 3. Add a `weights.json` only for weight shapes dataflow can't infer, an

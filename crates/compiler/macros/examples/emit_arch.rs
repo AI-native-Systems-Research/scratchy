@@ -10,7 +10,7 @@
 //! is entirely target-neutral up to the final emit.
 //!
 //! This driver runs that same pipeline directly — the identical
-//! `parse_python_file` + `compile_ast` + `render_tokens` sequence
+//! `parse_python_file` + `compile_carrier` + `render_tokens` sequence
 //! `emit_arch()` uses — with no backend gate, and prints the rendered
 //! emit to stdout. Diffing its output across a refactor proves the
 //! change was semantics-preserving for arches the host cannot compile.
@@ -21,33 +21,8 @@
 //!
 //! Writes nothing; redirect stdout to capture. Stderr carries progress.
 
-use scratchy_forward_compiler_macro::{
-    CompileMode, DEFAULT_DECODER_WORKLOADS, ForwardArgs, compile_ast, parse_python_file,
-    render_tokens,
-};
+use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
 use std::path::PathBuf;
-
-/// Mirrors `scratchy-forwards.rs`'s `args_from_carrier`: the carrier's
-/// decorator metadata, defaulted to the standard decoder workload set when
-/// the DSL doesn't name its own.
-fn args_from_carrier(carrier: &scratchy_forward_compiler_macro::PythonCarrier) -> ForwardArgs {
-    let mut args: ForwardArgs = syn::parse_str("").expect("empty #[forward] args");
-    args.workloads = if carrier.workloads.is_empty() {
-        DEFAULT_DECODER_WORKLOADS.to_vec()
-    } else {
-        carrier.workloads.clone()
-    };
-    if !carrier.sk_buckets.is_empty() {
-        args.sk_buckets = carrier.sk_buckets.clone();
-    }
-    if let Some(p) = &carrier.pixel_pack {
-        args.pixel_pack = Some(syn::parse_str(p).expect("pixel_pack path"));
-    }
-    if let Some(p) = &carrier.processor {
-        args.processor = Some(syn::parse_str(p).expect("processor path"));
-    }
-    args
-}
 
 fn main() {
     let arch = std::env::args().nth(1).unwrap_or_else(|| {
@@ -74,24 +49,10 @@ fn main() {
 
     eprintln!("emit_arch: {arch}");
     let text = std::fs::read_to_string(&dsl_path).expect("read DSL");
-    let carrier = parse_python_file(&text, proc_macro2::Span::call_site())
-        .unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
-    let mode = if carrier.vision {
-        CompileMode::VISION
-    } else {
-        CompileMode::DECODER
-    };
-    let args = args_from_carrier(&carrier);
-    let arch_name = carrier.arch_name.clone();
-    let tokens = compile_ast(
-        &args,
-        &arch_name,
-        proc_macro2::Span::call_site(),
-        carrier.ast,
-        mode,
-        &configs_dir,
-    )
-    .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
+    let carrier =
+        parse_python_file(&text).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
+    let tokens = compile_carrier(carrier, &configs_dir)
+        .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
 
     let mut rendered = String::with_capacity(1 << 20);
     render_tokens(tokens, &mut rendered);

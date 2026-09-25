@@ -6,8 +6,8 @@ selection, the `-Fmodel/`/`-Fquant/` feature landscape, fast-iteration
 scoping), see [`BUILD.md`](BUILD.md) instead.
 
 Every architecture the `#[forward]` codegen compiles lives in ONE crate,
-`scratchy-models` (`crates/models/arch/`). Each arch is a `#[forward]` DSL
-carrier (`dsl/<arch>.rs.in`) paired with a `configs/<arch>/` dir, gated by a
+`scratchy-models` (`crates/models/arch/`). Each arch is a DSL
+carrier (`dsl/<arch>.py`) paired with a `configs/<arch>/` dir, gated by a
 per-arch cargo feature (`arch-llama`, `arch-qwen3`, ...), implied
 automatically by any of that arch's `<stem>` features. There are
 no per-arch crates — everything below lives under `crates/models/arch/`.
@@ -19,7 +19,7 @@ crates/models/arch/
   Cargo.toml               # arch-<name> + <stem> features (quant presets live on scratchy-quantizations instead); default = []
   scratchy-forwards.rs     # build script — runs the #[forward] pipeline per arch
   src/lib.rs               # #[cfg(feature="arch-<name>")] pub mod <arch>;  (includes OUT_DIR emit)
-  dsl/<arch>.rs.in         # one #[forward(...)] / #[vision_forward(...)] body — the math
+  dsl/<arch>.py            # one @forward / @vision_forward(...) def — the math
   configs/<arch>/
     <size1>.json           # per-model hyperparameters (HF config.json verbatim)
     <size2>.json
@@ -214,23 +214,30 @@ flagged for review.
 
 ### 4. Write the DSL body
 
-Add `crates/models/arch/dsl/<arch>.rs.in`:
+Add `crates/models/arch/dsl/<arch>.py`:
 
-```rust
-#[forward(
-    target = "../../../target_profiles/l4_sm89.json",
-    workloads = [1, 8, 64, 512, 4096],
-)]
-fn <arch>() {
-    // math of the forward pass, in bound-name shapes
-}
+```python
+import torch
+import torch.nn.functional as F
+
+
+@forward
+def <arch>():
+    # math of the forward pass, in bound-name shapes
+    ...
 ```
+
+`@forward` takes optional `workloads=[...]` / `sk_buckets=[...]` overrides of
+the default bucket ladders. The file is a strict subset of Python: the
+compiler parses it and never runs it, and anything outside the dialect
+(documented in `crates/compiler/macros/src/parse_python.rs`) is a build
+error with a `line:col`.
 
 The DSL body expresses the forward pass as pure math — `embed`,
 `rmsnorm`, `gemm`, `rope_append`, `attention`, `silu`, `add`, `mul`,
 etc. Every tensor is a local; weights are referenced by dotted path
 (e.g. `self_attn.q_proj[layer]`). Loop over `num_hidden_layers` using
-a bound name from config.json. See `dsl/llama.rs.in` as the canonical
+a bound name from config.json. See `dsl/llama.py` as the canonical
 reference.
 
 ### 5. Commit a correctness golden

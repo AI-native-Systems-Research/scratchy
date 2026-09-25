@@ -21,7 +21,7 @@ default = []
 
 # Per-arch gates. `arch-<name>` compiles that arch's `pub mod <name>` and tells
 # the build script to emit it. Vision arches also pull their shared text decoder + the
-# vision host crate. (The build script scans dsl/*.rs.in.)
+# vision host crate. (The build script scans dsl/*.py.)
 arch-commandr = []
 arch-deepseek-v2 = []
 arch-deepseek-v3 = []
@@ -616,12 +616,8 @@ scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
 # `quant-<preset>` block above — quant scope moved off this crate so it can
 # get its own `quant` CLI alias, distinct from `model`).
 scratchy-quantizations = { path = "../quantization" }
-# `syn` is still used in `scratchy-forwards.rs` (ForwardArgs is a syn
-# parse target), and `proc-macro2` for the token re-rooting. The DSL
-# carrier itself is Python now — `parse_python_file` (ruff) reads it;
-# the emitted file never round-trips through an AST (see
-# scratchy-forwards.rs for the numbers).
-syn = { version = "3", features = ["full", "parsing"] }
+# `proc-macro2` for the token re-rooting. The emitted file never
+# round-trips through an AST (see scratchy-forwards.rs for the numbers).
 proc-macro2 = "1"
 serde_json = { workspace = true }
 # Emit arches in parallel (scratchy-forwards.rs), nested with the pipeline's own
