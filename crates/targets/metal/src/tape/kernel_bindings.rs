@@ -244,6 +244,77 @@ impl From<TqAttentionBindingSet> for Vec<Binding> {
     }
 }
 
+/// `KernelId::TqStageRotated`: the layer's K (or V) scratch, the step's
+/// addressing, the layer's packed codes + norms, the codebook, and — for K
+/// under rope-on-read — the class-resolved cos_sin (slot 9).
+pub struct TqStageBindingSet {
+    pub kv_layer: LayerId,
+    pub is_v: bool,
+    /// `Some(is_global)` for K under rope-on-read.
+    pub rope_on_read: Option<bool>,
+}
+
+impl From<TqStageBindingSet> for Vec<Binding> {
+    fn from(s: TqStageBindingSet) -> Vec<Binding> {
+        let layer = s.kv_layer;
+        let (cache, packed, norms) = if s.is_v {
+            (
+                RuntimeBindingKind::KvCacheV { layer },
+                RuntimeBindingKind::TqPackedV { layer },
+                RuntimeBindingKind::TqNormsV { layer },
+            )
+        } else {
+            (
+                RuntimeBindingKind::KvCacheK { layer },
+                RuntimeBindingKind::TqPackedK { layer },
+                RuntimeBindingKind::TqNormsK { layer },
+            )
+        };
+        let mut v: Vec<Binding> = [
+            cache,
+            RuntimeBindingKind::BlockTable { layer },
+            RuntimeBindingKind::SeqUsedK,
+            RuntimeBindingKind::CuSeqlensQ,
+            RuntimeBindingKind::SlotMapping { layer },
+            packed,
+            norms,
+            RuntimeBindingKind::TqSigns,
+            RuntimeBindingKind::TqCentroids,
+        ]
+        .into_iter()
+        .zip(0u8..)
+        .map(|(kind, binding_index)| Binding::Runtime {
+            kind,
+            binding_index,
+        })
+        .collect();
+        if let Some(is_global) = s.rope_on_read {
+            push_rope_on_read_bindings(&mut v, layer, is_global, 9);
+        }
+        v
+    }
+}
+
+/// `KernelId::TqRotateRows`: the rows (in/out, arena) and the codebook signs.
+pub struct TqRotateRowsBindingSet {
+    pub rows: ArenaSlotIdx,
+}
+
+impl From<TqRotateRowsBindingSet> for Vec<Binding> {
+    fn from(s: TqRotateRowsBindingSet) -> Vec<Binding> {
+        vec![
+            Binding::ArenaSlot {
+                slot: s.rows.get(),
+                binding_index: 0,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::TqSigns,
+                binding_index: 1,
+            },
+        ]
+    }
+}
+
 // ── RopeAppend ─────────────────────────────────────────────────────
 
 /// Bindings for `KernelId::RopeAppend`. Eight slots:

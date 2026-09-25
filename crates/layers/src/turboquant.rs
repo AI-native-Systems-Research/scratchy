@@ -228,8 +228,8 @@ pub fn bytes_per_vec(dim: usize, bits: u32) -> usize {
 /// hand that buffer to ordinary attention. Per-token dequant is independent, so
 /// the incremental buffer is bit-identical to a full re-dequant; this struct is
 /// the host correctness reference for that mechanism before the paged-cache +
-/// worker wiring. (The production dequant is the Metal `tq_dequant_blocktable` kernel;
-/// this uses the host quantizer to validate the logic.)
+/// worker wiring. (Production metal attention reads the packed store itself,
+/// `attention.metal`; this uses the host quantizer to validate the logic.)
 pub struct TurboQuantKvStore {
     q: PolarQuantizer,
     pdim: usize,

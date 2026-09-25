@@ -244,9 +244,10 @@ inline void rope_on_read_k_pairs_inlane(
 // ── TurboQuant KV read (decode) ──────────────────────────────────────
 //
 //  13  ATTN_TQ_BITS  uint — codebook width (bits per code) of the TurboQuant
-//      packed KV store. Set only on the TurboQuant twin of the decode command;
-//      unset, the `is_function_constant_defined` guard folds the whole path
-//      away and buffers 7..13 are never accessed.
+//      packed KV store. Set on the TurboQuant twin of the decode command and
+//      on the prefill staging pass (`tq_stage_rotated`); unset, the
+//      `is_function_constant_defined` guard folds the decode path away and
+//      buffers 7..13 are never accessed.
 //
 // A TurboQuant vector is stored as codes `c` into an N(0,1) codebook plus its
 // L2 norm, and decodes as `x = norm · s² · D · H · c` (turboquant.metal: D =
@@ -309,6 +310,202 @@ inline void attn_rope_on_read(thread float* k_loc, uint qk_per_thread, uint simd
                                 cos_row, sin_row, half_dim, ATTN_PAIR_OFF);
     }
 }
+
+// ── TurboQuant prefill: the rotated-domain KV image ─────────────────────
+//
+// Prefill attention — every kernel family, unchanged — runs in the codebook's
+// rotated domain. R = s·H·D is orthonormal, so q·k = (R·q)·(R·k) and
+// Σ p·v = Rᵀ·Σ p·(R·v). `tq_stage_rotated` writes R·k (or R·v) for every key
+// of the step's sequences into the layer's cache scratch; `tq_rotate_rows`
+// turns q into R·q before the attention and its output back with Rᵀ after it.
+// A cached key needs no transform at all — R·x̃ = norm·s·centroid[code] — so the
+// pass is a table lookup over the context, and a Walsh-Hadamard transform only
+// over the step's new keys.
+//
+// Span blocks (block_table bit 31) are re-roped by the attention itself
+// (rope-on-read at key position i), so they are stored as rope₋ᵢ(R·ropeᵢ(k)):
+// the attention's own ropeᵢ turns that into R·ropeᵢ(k).
+
+// NeoX rope of this lane's contiguous slice (`simd_lid*qk + j`) to position
+// `i`, forward (`sign` 1) or inverse (-1). Pairs `(d, d + ATTN_PAIR_OFF)` for
+// `d < ATTN_ROT_DIM/2`, the partner slice fetched from lane
+// `simd_lid ± ATTN_PAIR_OFF/qk` (as `rope_on_read_k_slice`). Simdgroup-uniform.
+template <typename T>
+inline void tq_rope_slice(thread float* x, uint qk_per_thread, uint simd_lid, uint i,
+                          device const T* cos_sin, float sign) {
+    const uint half_dim = ATTN_ROT_DIM / 2u;
+    const uint pair_off = ATTN_PAIR_OFF;
+    device const T* cos_row = cos_sin + i * ATTN_ROT_DIM;
+    device const T* sin_row = cos_row + half_dim;
+    const uint base_d = simd_lid * qk_per_thread;
+    const bool first_side = base_d < half_dim;
+    const bool second_side = (base_d >= pair_off) && (base_d < pair_off + half_dim);
+    const uint src = first_side  ? simd_lid + pair_off / qk_per_thread
+                   : second_side ? simd_lid - pair_off / qk_per_thread
+                                 : simd_lid;
+    float pair[16];
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        pair[j] = simd_shuffle(x[j], src);
+    }
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        if (first_side) {
+            const uint d = base_d + j;
+            x[j] = x[j] * float(cos_row[d]) - pair[j] * sign * float(sin_row[d]);
+        } else if (second_side) {
+            const uint d = base_d + j - pair_off;
+            x[j] = x[j] * float(cos_row[d]) + pair[j] * sign * float(sin_row[d]);
+        }
+    }
+}
+
+// One (logical block, kv head, sequence) per 32-lane threadgroup; each lane
+// owns `qk` contiguous elements of every row. Grid (block-table width,
+// num_kv_heads, num_seqs), rows past `seq_used_k` skipped. Bindings:
+//   0 cache (the layer's K or V scratch, chunk table)  1 block_table
+//   2 seq_used_k  3 cu_seqlens_q  4 slot_mapping  5 packed codes  6 norms
+//   7 signs  8 centroids  9 cos_sin (K under ATTN_ROPE_ON_READ only)
+template <typename T>
+kernel void tq_stage_rotated(
+    device const uint64_t* cache        [[buffer(0)]],
+    device const uint*     block_table  [[buffer(1)]],
+    device const uint*     seq_used_k   [[buffer(2)]],
+    device const uint*     cu_seqlens_q [[buffer(3)]],
+    device const uint*     slot_mapping [[buffer(4)]],
+    device const uint*     packed       [[buffer(5)]],
+    device const float*    norms        [[buffer(6)]],
+    device const float*    signs        [[buffer(7)]],
+    device const float*    centroids    [[buffer(8)]],
+    device const T*        cos_sin      [[buffer(9)]],
+    uint3 tg       [[threadgroup_position_in_grid]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    const uint head_dim = ATTN_HEAD_DIM;
+    const uint num_kv = ATTN_NUM_KV_HEADS;
+    const uint block_size = ATTN_BLOCK_SIZE;
+    const uint qk_per_thread = head_dim / 32u;
+    const uint logical_block = tg.x;
+    const uint kv_head = tg.y;
+    const uint seq = tg.z;
+    const uint kv_len = seq_used_k[seq];
+    if (logical_block * block_size >= kv_len) {
+        return;
+    }
+    const uint q_start = cu_seqlens_q[seq];
+    const uint prefix_len = kv_len - (cu_seqlens_q[seq + 1] - q_start);
+    const uint bt_raw = block_table[seq * ATTN_MAX_BLOCKS_PER_SEQ + logical_block];
+    const uint physical_block = bt_raw & 0x7FFFFFFFu;
+    const bool span = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
+    const uint chunk = (ATTN_BLOCKS_PER_CHUNK == 0u) ? 0u : physical_block / ATTN_BLOCKS_PER_CHUNK;
+    const uint blk_in_chunk =
+        (ATTN_BLOCKS_PER_CHUNK == 0u) ? physical_block : physical_block % ATTN_BLOCKS_PER_CHUNK;
+    device T* block = (device T*)cache[chunk]
+        + (blk_in_chunk * num_kv + kv_head) * block_size * head_dim;
+    const uint vpw = 32u / ATTN_TQ;
+    const uint pdim = (head_dim + vpw - 1u) / vpw;
+    const uint e0 = simd_lid * qk_per_thread;
+    const float s = 1.0f / sqrt(float(head_dim));
+    for (uint t = 0; t < block_size; ++t) {
+        const uint i = logical_block * block_size + t;
+        if (i >= kv_len) {
+            break;
+        }
+        // The step's new keys come from the cache their writer just filled —
+        // unless the slot is the spans write-skip sentinel (a reused block:
+        // nothing was written, the key lives only in the packed store).
+        const bool cached =
+            i < prefix_len || slot_mapping[q_start + (i - prefix_len)] == 0xFFFFFFFFu;
+        device T* row = block + t * head_dim + e0;
+        float x[16];
+        if (cached) {
+            const uint store_row = (physical_block * block_size + t) * num_kv + kv_head;
+            const float n = norms[store_row] * s;
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                x[j] = centroids[tq_code(packed, store_row * pdim, e0 + j)] * n;
+            }
+            if (!span) {
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    row[j] = T(x[j]);
+                }
+                continue;
+            }
+            // x̃ = Rᵀ·x = s·D·H·x, to rope in the plain domain.
+            tq_wht(x, qk_per_thread, simd_lid);
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                x[j] *= s * signs[e0 + j];
+            }
+        } else {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                x[j] = float(row[j]);
+            }
+        }
+        if (span) {
+            tq_rope_slice<T>(x, qk_per_thread, simd_lid, i, cos_sin, 1.0f);
+        }
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            x[j] *= signs[e0 + j];
+        }
+        tq_wht(x, qk_per_thread, simd_lid);
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            x[j] *= s;
+        }
+        if (span) {
+            tq_rope_slice<T>(x, qk_per_thread, simd_lid, i, cos_sin, -1.0f);
+        }
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            row[j] = T(x[j]);
+        }
+    }
+}
+
+// Rotate each (token, q head) row of `rows` [tokens, num_q_heads, head_dim] in
+// place: R·x, or Rᵀ·x when INVERSE. Grid (tokens, num_q_heads), 32 lanes.
+template <typename T, bool INVERSE>
+kernel void tq_rotate_rows(
+    device T*           rows  [[buffer(0)]],
+    device const float* signs [[buffer(1)]],
+    uint2 tg       [[threadgroup_position_in_grid]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    const uint head_dim = ATTN_HEAD_DIM;
+    const uint qk_per_thread = head_dim / 32u;
+    const uint e0 = simd_lid * qk_per_thread;
+    device T* row = rows + (tg.x * ATTN_NUM_Q_HEADS + tg.y) * head_dim + e0;
+    const float s = 1.0f / sqrt(float(head_dim));
+    float x[16];
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        x[j] = float(row[j]) * (INVERSE ? 1.0f : signs[e0 + j]);
+    }
+    tq_wht(x, qk_per_thread, simd_lid);
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        row[j] = T(x[j] * s * (INVERSE ? signs[e0 + j] : 1.0f));
+    }
+}
+
+#define INSTANTIATE_TQ_PREFILL(tag, T)                                                   \
+    template [[host_name("tq_stage_rotated_" #tag)]] [[kernel]] void tq_stage_rotated<T>( \
+        device const uint64_t* cache [[buffer(0)]],                                     \
+        device const uint* block_table [[buffer(1)]],                                   \
+        device const uint* seq_used_k [[buffer(2)]],                                    \
+        device const uint* cu_seqlens_q [[buffer(3)]],                                  \
+        device const uint* slot_mapping [[buffer(4)]],                                  \
+        device const uint* packed [[buffer(5)]],                                        \
+        device const float* norms [[buffer(6)]],                                        \
+        device const float* signs [[buffer(7)]],                                        \
+        device const float* centroids [[buffer(8)]],                                    \
+        device const T* cos_sin [[buffer(9)]],                                          \
+        uint3 tg [[threadgroup_position_in_grid]],                                      \
+        uint simd_lid [[thread_index_in_simdgroup]]);                                   \
+    template [[host_name("tq_rotate_rows_" #tag)]] [[kernel]] void tq_rotate_rows<T, false>( \
+        device T* rows [[buffer(0)]], device const float* signs [[buffer(1)]],          \
+        uint2 tg [[threadgroup_position_in_grid]],                                      \
+        uint simd_lid [[thread_index_in_simdgroup]]);                                   \
+    template [[host_name("tq_unrotate_rows_" #tag)]] [[kernel]] void tq_rotate_rows<T, true>( \
+        device T* rows [[buffer(0)]], device const float* signs [[buffer(1)]],          \
+        uint2 tg [[threadgroup_position_in_grid]],                                      \
+        uint simd_lid [[thread_index_in_simdgroup]]);
+
+INSTANTIATE_TQ_PREFILL(f16, half)
+INSTANTIATE_TQ_PREFILL(bf16, bfloat)
 
 // ============================================================================
 // attention_via_cache_v2_{f16,bf16}_specialized — paged-cache decode attention

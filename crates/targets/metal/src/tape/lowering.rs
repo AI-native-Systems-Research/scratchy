@@ -586,148 +586,120 @@ fn sample_slice_command(
     }
 }
 
-/// TurboQuant: build the per-layer dequant command (packed[L] → fp16 scratch,
-/// block-table-driven, full context). `is_v` selects the V store/scratch. The
-/// grid (max_blocks, num_kv_heads, num_seqs) is overridden by the worker per
-/// forward (a tq dispatch special-case); the baked shape is a placeholder.
-fn tq_dequant_command(
+/// TurboQuant prefill: the per-layer staging command — the layer's K (or V)
+/// for every sequence of the step, written into the fp16 scratch in the
+/// codebook's rotated domain (`tq_stage_rotated`). `is_global` is the
+/// attention's layer class (its rope-on-read cos_sin for span blocks; V is
+/// never roped). The grid (block-table width, num_kv_heads, num_seqs) is
+/// overridden by the worker per forward; the baked shape is a placeholder.
+fn tq_stage_command(
     p: &MetalModelConsts,
     layer: u32,
     is_v: bool,
+    is_global: bool,
     bucket_m: u32,
-    global: bool,
+    block_cap: u32,
 ) -> LoweredCommand {
-    use crate::tape::lowered::{Binding, RuntimeBindingKind as RB};
-    // `global` selects gemma4's GLOBAL (full-context, head_dim 512) geometry vs
-    // the BASE/sliding geometry. On uniform arches GLOBAL_* == base, so global is
-    // always false and this is identical to before.
-    let (hd, nkv, bs) = if global {
-        (
-            p.global_head_dim,
-            p.num_global_kv_heads,
-            p.global_block_size,
-        )
+    let (ror_rd, ror_po, ror_on, ror_bind) = if is_v {
+        (None, None, None, None)
     } else {
-        (p.head_dim, p.num_kv_heads, p.block_size)
-    };
-    let bits = crate::turboquant::tq_bits(p.tq_kv_bits);
-    let vpw = 32 / bits;
-    let pdim = hd.div_ceil(vpw);
-    let scale = 1.0f32 / (hd as f32).sqrt();
-    let li = super::ids::LayerId(layer);
-    let (cache, packed, norms) = if is_v {
-        (
-            RB::KvCacheV { layer: li },
-            RB::TqPackedV { layer: li },
-            RB::TqNormsV { layer: li },
-        )
-    } else {
-        (
-            RB::KvCacheK { layer: li },
-            RB::TqPackedK { layer: li },
-            RB::TqNormsK { layer: li },
-        )
+        rope_on_read_params(p, is_global)
     };
     LoweredCommand {
-        kernel: KernelId::TqDequantToScratch,
-        library: "turboquant",
+        kernel: KernelId::TqStageRotated,
+        library: "attention",
         function: pick_specialized_symbol(
-            "tq_dequant_blocktable",
-            "tq_dequant_blocktable_bf16",
+            "tq_stage_rotated_f16",
+            "tq_stage_rotated_bf16",
             p.metal_dtype,
         ),
-        constants: baked(vec![]),
+        constants: super::kernel_constants::TqStageConstants {
+            head_dim: super::ids::HeadDim(p.global_head_dim),
+            num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
+            block_size: super::ids::BlockSize(p.global_block_size),
+            max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
+            blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
+            bits: super::ids::TqCodeBits(crate::turboquant::tq_bits(p.tq_kv_bits)),
+            rot_dim: ror_rd,
+            pair_off: ror_po,
+            rope_on_read: ror_on,
+        }
+        .into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (1, nkv, bucket_m),
-            threads_per_threadgroup: (hd, 1, 1),
+            threadgroups: (1, p.num_global_kv_heads, bucket_m),
+            threads_per_threadgroup: (32, 1, 1),
             m_scaling: None,
         },
-        bindings: baked(vec![
-            Binding::Runtime {
-                kind: cache,
-                binding_index: 0,
-            },
-            Binding::Runtime {
-                kind: RB::BlockTable { layer: li },
-                binding_index: 1,
-            },
-            Binding::Runtime {
-                kind: RB::SeqUsedK,
-                binding_index: 2,
-            },
-            Binding::Runtime {
-                kind: RB::TqSigns,
-                binding_index: 3,
-            },
-            Binding::Runtime {
-                kind: RB::TqCentroids,
-                binding_index: 4,
-            },
-            Binding::Runtime {
-                kind: packed,
-                binding_index: 5,
-            },
-            Binding::Runtime {
-                kind: norms,
-                binding_index: 6,
-            },
-            Binding::Inline {
-                binding_index: 7,
-                value: hd,
-            },
-            Binding::Inline {
-                binding_index: 8,
-                value: bits,
-            },
-            Binding::Inline {
-                binding_index: 9,
-                value: vpw,
-            },
-            Binding::Inline {
-                binding_index: 10,
-                value: pdim,
-            },
-            Binding::Inline {
-                binding_index: 11,
-                value: scale.to_bits(),
-            },
-            Binding::Inline {
-                binding_index: 12,
-                value: nkv,
-            },
-            Binding::Inline {
-                binding_index: 13,
-                value: bs,
-            },
-            Binding::Inline {
-                binding_index: 14,
-                value: crate::BLOCKS_PER_CHUNK,
-            },
-        ]),
+        bindings: super::kernel_bindings::TqStageBindingSet {
+            kv_layer: super::ids::LayerId(layer),
+            is_v,
+            rope_on_read: ror_bind,
+        }
+        .into_baked(),
+        gemm_dims: None,
+    }
+}
+
+/// TurboQuant prefill: rotate the attention's q rows into the codebook domain
+/// in place (`inverse` false, R·q), or its output rows back (`inverse`, Rᵀ·o).
+fn tq_rotate_command(
+    p: &MetalModelConsts,
+    rows: u32,
+    inverse: bool,
+    bucket_m: u32,
+) -> LoweredCommand {
+    let function = if inverse {
+        pick_specialized_symbol(
+            "tq_unrotate_rows_f16",
+            "tq_unrotate_rows_bf16",
+            p.metal_dtype,
+        )
+    } else {
+        pick_specialized_symbol("tq_rotate_rows_f16", "tq_rotate_rows_bf16", p.metal_dtype)
+    };
+    LoweredCommand {
+        kernel: KernelId::TqRotateRows,
+        library: "attention",
+        function,
+        constants: super::kernel_constants::TqRotateRowsConstants {
+            head_dim: super::ids::HeadDim(p.global_head_dim),
+            num_q_heads: super::ids::NumQHeads(p.num_q_heads),
+        }
+        .into_baked(),
+        dispatch: DispatchShape {
+            threadgroups: (bucket_m, p.num_q_heads, 1),
+            threads_per_threadgroup: (32, 1, 1),
+            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                seq_axis: None,
+                axis: crate::tape::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(bucket_m),
+            }),
+        },
+        bindings: super::kernel_bindings::TqRotateRowsBindingSet {
+            rows: super::ids::ArenaSlotIdx(rows),
+        }
+        .into_baked(),
         gemm_dims: None,
     }
 }
 
 /// TurboQuant: build the per-layer quantize command (new tokens in the fp16
-/// scratch → packed[L]). New-token count == num_tokens, so the grid scales like
-/// RopeAppend (m_scaling on X). `is_v` selects the V store/scratch.
+/// scratch → packed[L]), run right after the layer's KV writer. New-token
+/// count == num_tokens, so the grid scales like RopeAppend (m_scaling on X).
+/// `is_v` selects the V store/scratch. The TurboQuant layers are the GLOBAL
+/// class (every layer on uniform arches, where GLOBAL_* == base).
 fn tq_quantize_command(
     p: &MetalModelConsts,
     layer: u32,
     is_v: bool,
     bucket_m: u32,
-    global: bool,
 ) -> LoweredCommand {
     use crate::tape::lowered::{Binding, RuntimeBindingKind as RB};
-    let (hd, nkv, bs) = if global {
-        (
-            p.global_head_dim,
-            p.num_global_kv_heads,
-            p.global_block_size,
-        )
-    } else {
-        (p.head_dim, p.num_kv_heads, p.block_size)
-    };
+    let (hd, nkv, bs) = (
+        p.global_head_dim,
+        p.num_global_kv_heads,
+        p.global_block_size,
+    );
     let bits = crate::turboquant::tq_bits(p.tq_kv_bits);
     let vpw = 32 / bits;
     let pdim = hd.div_ceil(vpw);
@@ -834,16 +806,12 @@ fn tq_quantize_command(
                 kind: RB::SlotMapping { layer: li },
                 binding_index: 16,
             },
-            // do_writeback: uniform arches quantize AFTER attention, so the lossy
-            // in-place dequant must repopulate the pool for attention's reads (1).
-            // gemma4 GLOBAL layers quantize BEFORE attention (the only reliable
-            // global-detection point is the KV writer) — overwriting the scratch
-            // with the lossy reconstruction would make attention read cos≈0.65 K
-            // and produce garbage. Leave the raw rope K in the scratch (0); the
-            // packed store still gets the codes for future decode dequant.
+            // do_writeback 0: the quantize runs before attention, which reads
+            // the step's new keys raw (decode) or rotates them itself (prefill
+            // staging).
             Binding::Inline {
                 binding_index: 17,
-                value: if global { 0 } else { 1 },
+                value: 0,
             },
         ]),
         gemm_dims: None,
@@ -873,40 +841,62 @@ fn tq_attention_command(p: &MetalModelConsts, attn: &LoweredCommand, layer: u32)
     }
 }
 
-/// The decode-kernel form of a paged attention instruction: one query per
-/// sequence, the form that reads the TurboQuant packed store directly.
-fn via_cache_form(instruction: &Instruction) -> Option<Instruction> {
+/// A paged attention instruction: its q and output arena slots, and its
+/// decode-kernel form — one query per sequence, the form that reads the
+/// TurboQuant packed store directly.
+struct PagedAttention {
+    q: u32,
+    out: u32,
+    decode_form: Instruction,
+}
+
+fn paged_attention(instruction: &Instruction) -> Option<PagedAttention> {
     match *instruction {
         Instruction::AttentionPrefillPaged(q, out, layer, il)
-        | Instruction::AttentionViaCache(q, out, layer, il) => {
-            Some(Instruction::AttentionViaCache(q, out, layer, il))
-        }
+        | Instruction::AttentionViaCache(q, out, layer, il) => Some(PagedAttention {
+            q,
+            out,
+            decode_form: Instruction::AttentionViaCache(q, out, layer, il),
+        }),
         Instruction::SlidingAttentionPrefillPaged(q, out, layer, il)
-        | Instruction::SlidingAttentionViaCache(q, out, layer, il) => {
-            Some(Instruction::SlidingAttentionViaCache(q, out, layer, il))
-        }
+        | Instruction::SlidingAttentionViaCache(q, out, layer, il) => Some(PagedAttention {
+            q,
+            out,
+            decode_form: Instruction::SlidingAttentionViaCache(q, out, layer, il),
+        }),
         _ => None,
     }
 }
 
-/// TurboQuant: inject the per-layer dequant (before the KV writer) + quantize
-/// commands, gated on the TurboQuant runtime gates so they're inert unless the
-/// worker provisions the tq buffers. No-op unless head_dim is a power of 2 ≤
-/// 512 (the only supported geometry).
+/// A paged attention lowered for `inject_tq`: its slots and the lowered
+/// command of its decode-kernel form.
+struct TqAttention {
+    q: u32,
+    out: u32,
+    via_cache: LoweredCommand,
+}
+
+/// TurboQuant: inject the per-layer commands, gated on the TurboQuant runtime
+/// gates so they're inert unless the worker provisions the tq buffers. No-op
+/// unless head_dim is a power of 2 ≤ 512 (the only supported geometry).
 ///
-/// On a decode step — every sequence contributes one token, in any bucket — a
-/// TurboQuant layer's attention is the `AttentionViaCacheTq` twin of its
-/// decode-kernel form (`via_cache`), which reads the packed store directly:
-/// the instruction's own attention commands are gated `UnlessTurboquantDecode`
-/// and the dequant pass `OnlyIfTurboquantNotDecode`. A decode tape (`decode`:
-/// every step is a decode step) carries no dequant commands at all.
+/// - The KV writer is followed by the quantize of the step's new K/V.
+/// - On a decode step — every sequence contributes one token, in any bucket —
+///   the attention is the `AttentionViaCacheTq` twin of its decode-kernel
+///   form, reading the packed store directly (`OnlyIfTurboquantDecode`).
+/// - On any other step the instruction's own attention runs
+///   (`UnlessTurboquantDecode`) in the codebook's rotated domain: the K/V
+///   staging and q rotation before it and the output's rotation back after it
+///   are `OnlyIfTurboquantNotDecode`. A decode tape (`decode`) has no other
+///   steps and carries none of them.
 fn inject_tq(
     p: &MetalModelConsts,
     instruction: &Instruction,
     cmds: Vec<LoweredCommand>,
-    via_cache: Option<LoweredCommand>,
+    attention: Option<TqAttention>,
     decode: bool,
     bucket_m: u32,
+    block_cap: u32,
 ) -> Vec<GatedCommand> {
     use crate::tape::lowered::RuntimeGate::{
         OnlyIfTurboquant, OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode, UnlessTurboquantDecode,
@@ -948,52 +938,55 @@ fn inject_tq(
         })
     }
     let tq = |c| GatedCommand::gated(c, OnlyIfTurboquant);
+    let prefill = |c| GatedCommand::gated(c, OnlyIfTurboquantNotDecode);
     let global_attention = matches!(
         instruction,
         Instruction::AttentionPrefillPaged(..) | Instruction::AttentionViaCache(..)
     );
-    if let Some(via) = via_cache.filter(|_| !hybrid || global_attention) {
-        let layer = cmd_kv_layer(&via).unwrap_or(0);
-        let mut out: Vec<GatedCommand> = cmds
-            .into_iter()
-            .map(|c| GatedCommand::gated(c, UnlessTurboquantDecode))
-            .collect();
+    if let Some(a) = attention.filter(|_| !hybrid || global_attention) {
+        let layer = cmd_kv_layer(&a.via_cache).unwrap_or(0);
+        let mut out = Vec::with_capacity(cmds.len() + 5);
+        if !decode {
+            for is_v in [false, true] {
+                out.push(prefill(tq_stage_command(
+                    p,
+                    layer,
+                    is_v,
+                    global_attention,
+                    bucket_m,
+                    block_cap,
+                )));
+            }
+            out.push(prefill(tq_rotate_command(p, a.q, false, bucket_m)));
+        }
+        out.extend(
+            cmds.into_iter()
+                .map(|c| GatedCommand::gated(c, UnlessTurboquantDecode)),
+        );
+        if !decode {
+            out.push(prefill(tq_rotate_command(p, a.out, true, bucket_m)));
+        }
         out.push(GatedCommand::gated(
-            tq_attention_command(p, &via, layer),
+            tq_attention_command(p, &a.via_cache, layer),
             OnlyIfTurboquantDecode,
         ));
-        if !hybrid {
-            out.push(tq(tq_quantize_command(p, layer, false, bucket_m, false)));
-            out.push(tq(tq_quantize_command(p, layer, true, bucket_m, false)));
-        }
         return out;
     }
-    let mut out = Vec::with_capacity(cmds.len() + 4);
+    let mut out = Vec::with_capacity(cmds.len() + 2);
     for cmd in cmds {
-        match cmd.kernel {
+        let writer = matches!(
+            cmd.kernel,
             KernelId::RopeAppend
-            | KernelId::RopeAppendNormed
-            | KernelId::FusedQkvRopeCache
-            | KernelId::FusedAffineQkvRopeCache => {
-                let layer = cmd_kv_layer(&cmd).unwrap_or(0);
-                let global = hybrid && cmd.dispatch.threads_per_threadgroup.0 == p.global_head_dim;
-                if (!hybrid || global) && !decode {
-                    let dequant = |is_v| {
-                        GatedCommand::gated(
-                            tq_dequant_command(p, layer, is_v, bucket_m, global),
-                            OnlyIfTurboquantNotDecode,
-                        )
-                    };
-                    out.push(dequant(false));
-                    out.push(dequant(true));
-                }
-                out.push(GatedCommand::ungated(cmd));
-                if global {
-                    out.push(tq(tq_quantize_command(p, layer, false, bucket_m, true)));
-                    out.push(tq(tq_quantize_command(p, layer, true, bucket_m, true)));
-                }
-            }
-            _ => out.push(GatedCommand::ungated(cmd)),
+                | KernelId::RopeAppendNormed
+                | KernelId::FusedQkvRopeCache
+                | KernelId::FusedAffineQkvRopeCache
+        );
+        let tq_layer = !hybrid || cmd.dispatch.threads_per_threadgroup.0 == p.global_head_dim;
+        let layer = cmd_kv_layer(&cmd).unwrap_or(0);
+        out.push(GatedCommand::ungated(cmd));
+        if writer && tq_layer {
+            out.push(tq(tq_quantize_command(p, layer, false, bucket_m)));
+            out.push(tq(tq_quantize_command(p, layer, true, bucket_m)));
         }
     }
     out
@@ -1211,11 +1204,18 @@ pub fn lower(
                 let own = lower_at(other)?;
                 // The decode-kernel form of a paged attention: under TurboQuant,
                 // decode steps run its `AttentionViaCacheTq` twin (`inject_tq`).
-                let via_cache = match via_cache_form(other) {
-                    Some(form) => lower_at(&form)?.into_iter().next(),
+                let attention = match paged_attention(other) {
+                    Some(a) => lower_at(&a.decode_form)?
+                        .into_iter()
+                        .next()
+                        .map(|via_cache| TqAttention {
+                            q: a.q,
+                            out: a.out,
+                            via_cache,
+                        }),
                     None => None,
                 };
-                let cmds = inject_tq(p, other, own, via_cache, decode, bucket_m);
+                let cmds = inject_tq(p, other, own, attention, decode, bucket_m, block_cap);
                 update_shape_state(p, other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
@@ -9112,13 +9112,13 @@ mod tests {
             steps,
             [
                 (KernelId::RopeAppend, None),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
                 (KernelId::AttentionViaCache, Some(UnlessTurboquantDecode)),
                 (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
             ]
         );
-        let (fp16, tq) = (&tape.commands[1].command, &tape.commands[2].command);
+        let (fp16, tq) = (&tape.commands[3].command, &tape.commands[4].command);
         assert_eq!(
             (fp16.library, fp16.function, fp16.dispatch),
             (tq.library, tq.function, tq.dispatch)
@@ -9155,15 +9155,46 @@ mod tests {
         );
     }
 
+    use crate::tape::lowered::RuntimeGate;
+
+    /// The TurboQuant commands a multi-token tape wraps around one layer's
+    /// paged attention: stage K and V and rotate q before it, rotate its output
+    /// back after it (off decode steps), its decode twin (on decode steps).
+    fn tq_attention_steps(
+        prefill_attention: &[(KernelId, Option<RuntimeGate>)],
+    ) -> Vec<(KernelId, Option<RuntimeGate>)> {
+        use crate::tape::lowered::RuntimeGate::{
+            OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode, UnlessTurboquantDecode,
+        };
+        let mut steps = vec![
+            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
+            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
+            (KernelId::TqRotateRows, Some(OnlyIfTurboquantNotDecode)),
+        ];
+        steps.extend(
+            prefill_attention
+                .iter()
+                .map(|&(k, _)| (k, Some(UnlessTurboquantDecode))),
+        );
+        steps.push((KernelId::TqRotateRows, Some(OnlyIfTurboquantNotDecode)));
+        steps.push((KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)));
+        steps
+    }
+
+    fn gated_steps(tape: &LoweredMetalTape) -> Vec<(KernelId, Option<RuntimeGate>)> {
+        tape.commands
+            .iter()
+            .map(|c| (c.command.kernel, c.gate))
+            .collect()
+    }
+
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers: the global
-    /// writer is followed by its quantize and the global attention by its Tq
-    /// twin, while the sliding layer stays plain fp16. Only a tape that isn't
-    /// all decode steps dequantizes, before the global writer only.
+    /// writer is followed by its quantize and the global attention wrapped in
+    /// the TurboQuant commands, while the sliding layer stays plain fp16.
     #[test]
     fn hybrid_turboquant_compresses_global_layers_only() {
         use crate::tape::lowered::RuntimeGate::{
-            self, OnlyIfTurboquant, OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode,
-            UnlessTurboquantDecode,
+            OnlyIfTurboquant, OnlyIfTurboquantDecode, UnlessTurboquantDecode,
         };
         let p = MetalModelConsts {
             global_head_dim: 512,
@@ -9175,12 +9206,10 @@ mod tests {
         };
         let global_writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, 0, false, true);
         let sliding_writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, 1, false, false);
-        let steps = |tape: LoweredMetalTape| -> Vec<(KernelId, Option<RuntimeGate>)> {
-            tape.commands
-                .iter()
-                .map(|c| (c.command.kernel, c.gate))
-                .collect()
-        };
+        let quantize = [
+            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+        ];
         let decode = lower_tq(
             &p,
             &[
@@ -9191,112 +9220,95 @@ mod tests {
             ],
             1,
         );
-        assert_eq!(
-            steps(decode),
-            [
-                (KernelId::RopeAppend, None),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-                (KernelId::AttentionViaCache, Some(UnlessTurboquantDecode)),
-                (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)),
-                (KernelId::RopeAppend, None),
-                (KernelId::AttentionViaCache, None),
-            ]
-        );
-        let prefill = steps(lower_tq(
+        let mut want = vec![(KernelId::RopeAppend, None)];
+        want.extend(quantize);
+        want.extend([
+            (KernelId::AttentionViaCache, Some(UnlessTurboquantDecode)),
+            (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)),
+            (KernelId::RopeAppend, None),
+            (KernelId::AttentionViaCache, None),
+        ]);
+        assert_eq!(gated_steps(&decode), want);
+
+        let global_attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
+        let sliding_attention = Instruction::SlidingAttentionPrefillPaged(3, 6, 1, false);
+        let plain = |i: Instruction| gated_steps(&lower_tq(&p, &[i], 64));
+        let own = |i: Instruction| {
+            plain(i)
+                .into_iter()
+                .filter(|&(_, g)| g == Some(UnlessTurboquantDecode))
+                .collect::<Vec<_>>()
+        };
+        let prefill = lower_tq(
             &p,
             &[
                 global_writer,
-                Instruction::AttentionPrefillPaged(3, 6, 0, false),
+                global_attention,
                 sliding_writer,
-                Instruction::SlidingAttentionPrefillPaged(3, 6, 1, false),
+                sliding_attention,
             ],
             64,
-        ));
-        assert_eq!(
-            prefill[..5],
-            [
-                (
-                    KernelId::TqDequantToScratch,
-                    Some(OnlyIfTurboquantNotDecode)
-                ),
-                (
-                    KernelId::TqDequantToScratch,
-                    Some(OnlyIfTurboquantNotDecode)
-                ),
-                (KernelId::RopeAppend, None),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-            ]
         );
-        let twin = prefill
-            .iter()
-            .position(|&(k, _)| k == KernelId::AttentionViaCacheTq)
-            .expect("global attention has a Tq twin");
-        assert_eq!(prefill[twin].1, Some(OnlyIfTurboquantDecode));
-        assert!(
-            prefill[5..twin]
-                .iter()
-                .all(|&(_, g)| g == Some(UnlessTurboquantDecode)),
-            "global prefill attention must yield on decode steps: {:?}",
-            &prefill[5..twin]
-        );
-        assert_eq!(prefill[twin + 1], (KernelId::RopeAppend, None));
-        assert!(
-            prefill[twin + 2..].iter().all(|&(_, g)| g.is_none()),
-            "the sliding layer stays plain fp16: {:?}",
-            &prefill[twin + 2..]
-        );
+        let mut want = vec![(KernelId::RopeAppend, None)];
+        want.extend(quantize);
+        want.extend(tq_attention_steps(&own(global_attention)));
+        want.push((KernelId::RopeAppend, None));
+        want.extend(plain(sliding_attention));
+        assert_eq!(gated_steps(&prefill), want);
     }
 
-    /// A prefill tape keeps the dequant pass for steps that aren't decode
-    /// steps (their attention reads the fp16 scratch). On a decode step — one
-    /// token per sequence, e.g. a batch of decoding sequences — the prefill
-    /// attention yields to the `AttentionViaCacheTq` twin of its decode-kernel
-    /// form, and no dequant runs.
+    /// A multi-token tape runs its own attention off decode steps, in the
+    /// codebook's rotated domain: K/V staged and q rotated before it, the
+    /// output rotated back after it. On a decode step — one token per
+    /// sequence, e.g. a batch of decoding sequences — it yields to the
+    /// `AttentionViaCacheTq` twin of its decode-kernel form. There is no
+    /// dequant pass on any step.
     #[test]
-    fn prefill_turboquant_dequantizes_only_off_decode_steps() {
-        use crate::tape::lowered::RuntimeGate::{
-            self, OnlyIfTurboquant, OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode,
-            UnlessTurboquantDecode,
-        };
-        let tape = lower_tq_layer(Instruction::AttentionPrefillPaged(3, 6, 0, false), 64);
-        let steps: Vec<(KernelId, Option<RuntimeGate>)> = tape
+    fn prefill_turboquant_attends_in_the_rotated_domain() {
+        use crate::tape::lowered::RuntimeGate::{OnlyIfTurboquant, UnlessTurboquantDecode};
+        let attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
+        let tape = lower_tq_layer(attention, 64);
+        let mut want = vec![
+            (KernelId::RopeAppend, None),
+            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+        ];
+        let own: Vec<_> = gated_steps(&tape)
+            .into_iter()
+            .filter(|&(_, g)| g == Some(UnlessTurboquantDecode))
+            .collect();
+        assert!(!own.is_empty(), "the attention's own commands");
+        want.extend(tq_attention_steps(&own));
+        assert_eq!(gated_steps(&tape), want);
+
+        // q rotated in, the output rotated back: the attention's own slots.
+        let rotations: Vec<(&str, u32)> = tape
             .commands
             .iter()
-            .map(|c| (c.command.kernel, c.gate))
+            .filter(|c| c.command.kernel == KernelId::TqRotateRows)
+            .map(|c| match c.command.bindings[0] {
+                Binding::ArenaSlot { slot, .. } => (c.command.function, slot),
+                other => panic!("rotated rows bound as {other:?}"),
+            })
             .collect();
-        let n = steps.len();
         assert_eq!(
-            steps[..3],
-            [
-                (
-                    KernelId::TqDequantToScratch,
-                    Some(OnlyIfTurboquantNotDecode)
-                ),
-                (
-                    KernelId::TqDequantToScratch,
-                    Some(OnlyIfTurboquantNotDecode)
-                ),
-                (KernelId::RopeAppend, None),
-            ]
+            rotations,
+            [("tq_rotate_rows_bf16", 3), ("tq_unrotate_rows_bf16", 6)]
         );
-        assert_eq!(
-            steps[n - 3..],
-            [
-                (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-            ]
-        );
-        let attention = &steps[3..n - 3];
-        assert!(
-            !attention.is_empty()
-                && attention
+        // K then V staged, only K re-roping span blocks (cos_sin at slot 9).
+        let staged: Vec<bool> = tape
+            .commands
+            .iter()
+            .filter(|c| c.command.kernel == KernelId::TqStageRotated)
+            .map(|c| {
+                c.command
+                    .bindings
                     .iter()
-                    .all(|&(_, g)| g == Some(UnlessTurboquantDecode)),
-            "{attention:?}"
-        );
+                    .any(|b| matches!(b, Binding::Weight { .. }))
+            })
+            .collect();
+        assert_eq!(staged, [tp().rope_on_read, false]);
+
         let twin = |tape: &LoweredMetalTape| {
             tape.commands
                 .iter()

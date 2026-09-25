@@ -248,15 +248,15 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// attention was lowered.
     pub attn_unfused_scratch: Option<Buffer>,
     /// TurboQuant KV cache active for this worker (set from `runtime.tq` at
-    /// build). Gates the `OnlyIfTurboquant` per-layer dequant/quantize commands.
+    /// build). Gates the TurboQuant per-layer commands (`gate_matches`).
     pub turboquant: bool,
     /// Per-forward block-table ROW WIDTH (== the host's `max_blocks_eff`
-    /// stride) for the TurboQuant full-context dequant grid. Stashed from
+    /// stride) for the TurboQuant full-context staging grid. Stashed from
     /// `inputs.block_tables` before each forward (see the `write_runtime_inputs`
-    /// call sites in `pool.rs`). The `TqDequantToScratch` dispatch reads this
-    /// for `grid.x` so the dequant covers the WHOLE active context. Using the
+    /// call sites in `pool.rs`). The `TqStageRotated` dispatch reads this
+    /// for `grid.x` so the staging covers the WHOLE active context. Using the
     /// static `W::MAX_BLOCKS_PER_SEQ` instead (128 for uniform arches) truncated
-    /// the dequant at 128 blocks / 2048 tokens, leaving the reused fp16 scratch
+    /// it at 128 blocks / 2048 tokens, leaving the reused fp16 scratch
     /// tail holding the previous layer's KV → `!!!!` collapse past 2048 tokens.
     /// `0` until the first forward sets it (dispatch falls back to the const).
     pub tq_dequant_max_blocks: std::sync::atomic::AtomicU32,
@@ -834,42 +834,39 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     super::ids::NumTokens(num_tokens),
                     num_seqs,
                 );
-                // TurboQuant full-context dequant: the baked grid is a
+                // TurboQuant full-context staging: the baked grid is a
                 // placeholder; the kernel needs (max_blocks, num_kv_heads,
                 // num_seqs) — block-table-driven, with early-exit past
-                // seqused_k. max_blocks (grid.x) is read by the kernel from
-                // threadgroups_per_grid.x; grid.z = the live batch's num_seqs.
-                let tg_scaled =
-                    if matches!(step.kernel, super::lowered::KernelId::TqDequantToScratch) {
-                        // grid.x MUST equal the host block-table ROW STRIDE
-                        // (`max_blocks_eff`), which the kernel uses BOTH as the
-                        // block loop bound AND the `block_table[seq*stride + b]`
-                        // stride. The static `W::MAX_BLOCKS_PER_SEQ` (128 for
-                        // uniform arches like Llama) truncated the dequant at 128
-                        // blocks / 2048 tokens, so the reused fp16 scratch's tail
-                        // kept the PREVIOUS layer's KV → attention collapse to
-                        // `!!!!` past 2048 tokens. The per-forward runtime width is
-                        // stashed from `inputs.block_tables` (== the stride the host
-                        // padded the block_table to); fall back to the baked const
-                        // when unset (0). Floor at the const so we never shrink
-                        // below the host stride for short contexts.
-                        let runtime_mb = self
-                            .tq_dequant_max_blocks
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let baked =
-                            <W as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ;
-                        // Cover the whole active context: the runtime block-table
-                        // width (== the host's padded stride), floored at the baked
-                        // const so short contexts never shrink below it.
-                        let cover = runtime_mb.max(baked) as usize;
-                        MTLSize {
-                            width: cover,
-                            height: tg_scaled.height,
-                            depth: (num_seqs as usize).max(1),
-                        }
-                    } else {
-                        tg_scaled
-                    };
+                // seqused_k; grid.z = the live batch's num_seqs.
+                let tg_scaled = if matches!(step.kernel, super::lowered::KernelId::TqStageRotated) {
+                    // grid.x must cover the host block-table ROW WIDTH
+                    // (`max_blocks_eff`) — every block of the longest
+                    // sequence. The static `W::MAX_BLOCKS_PER_SEQ` (128 for
+                    // uniform arches like Llama) truncated the pass at 128
+                    // blocks / 2048 tokens, so the reused fp16 scratch's tail
+                    // kept the PREVIOUS layer's KV → attention collapse to
+                    // `!!!!` past 2048 tokens. The per-forward runtime width is
+                    // stashed from `inputs.block_tables` (== the stride the host
+                    // padded the block_table to); fall back to the baked const
+                    // when unset (0). Floor at the const so we never shrink
+                    // below the host stride for short contexts.
+                    let runtime_mb = self
+                        .tq_dequant_max_blocks
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let baked =
+                        <W as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ;
+                    // Cover the whole active context: the runtime block-table
+                    // width (== the host's padded stride), floored at the baked
+                    // const so short contexts never shrink below it.
+                    let cover = runtime_mb.max(baked) as usize;
+                    MTLSize {
+                        width: cover,
+                        height: tg_scaled.height,
+                        depth: (num_seqs as usize).max(1),
+                    }
+                } else {
+                    tg_scaled
+                };
                 // RopeOnce{Steel,Nax,GqaShared}: the pre-roped-K scratch is sized to
                 // MAX_BLOCKS_PER_SEQ logical blocks (lowering), and the steel/gqa
                 // attention reads the WHOLE sequence's roped K (computed prefix +
@@ -879,7 +876,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // tokens. Override grid.y to the live block-table width
                 // (`tq_dequant_max_blocks`, == kv_len/block_size), capped at the
                 // baked num_pages (the scratch's block capacity). Mirrors the
-                // TqDequantToScratch grid override above.
+                // TqStageRotated grid override above.
                 let tg_scaled = if matches!(
                     step.kernel,
                     super::lowered::KernelId::RopeOnceSteel
@@ -1020,7 +1017,8 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::Add
         | K::BiasAdd
         | K::Reshape
-        | K::TqDequantToScratch
+        | K::TqStageRotated
+        | K::TqRotateRows
         | K::TqQuantizeToPacked => KernelKind::Elementwise,
     }
 }
