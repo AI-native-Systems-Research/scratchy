@@ -732,6 +732,16 @@ fn llama_3b_two_sequences() {
     });
 }
 
+/// A decode step of eight sequences — the batched decode that runs in the
+/// multi-token buckets.
+#[test]
+fn llama_3b_eight_sequences() {
+    check(Case {
+        kv_lens: vec![900, 1, 257, 64, 1000, 33, 512, 2],
+        ..llama_3b("llama-3b eight seqs")
+    });
+}
+
 /// Llama-3.2-1B geometry on the contiguous lane layout, chunked addressing
 /// across two chunks.
 #[test]

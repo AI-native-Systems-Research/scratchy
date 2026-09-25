@@ -561,10 +561,16 @@ pub enum RuntimeGate {
     /// but only fire when `kv_cache_dtype == turboquant` (the worker resolves
     /// the tq buffers + the KV scratch only then). No-op on every other run.
     OnlyIfTurboquant,
-    /// Run only when the KV cache is NOT TurboQuant-compressed: the plain
-    /// decode `AttentionViaCache` whose `AttentionViaCacheTq` twin replaces
-    /// it under TurboQuant.
-    OnlyIfNotTurboquant,
+    /// Run only on a TurboQuant decode step — every sequence contributes
+    /// exactly one token (`num_tokens == num_seqs`) — the steps whose
+    /// attention is `AttentionViaCacheTq`, reading the packed store directly.
+    OnlyIfTurboquantDecode,
+    /// Run only on a TurboQuant step that is NOT a decode step: the per-layer
+    /// dequant pass the prefill attention kernels read.
+    OnlyIfTurboquantNotDecode,
+    /// Run unless this is a TurboQuant decode step: the attention an
+    /// `AttentionViaCacheTq` twin replaces there.
+    UnlessTurboquantDecode,
 }
 
 impl DispatchShape {

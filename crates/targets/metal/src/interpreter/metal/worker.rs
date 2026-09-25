@@ -1954,6 +1954,7 @@ pub(super) fn gate_matches(
     // unconditionally on multi-seq regressed c=4 TPOT by +5% on
     // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
     // win without hurting decode.
+    let turboquant_decode = turboquant && num_tokens == num_seqs;
     match gate {
         None => true,
         Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
@@ -1961,7 +1962,11 @@ pub(super) fn gate_matches(
         }
         Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens,
         Some(super::lowered::RuntimeGate::OnlyIfTurboquant) => turboquant,
-        Some(super::lowered::RuntimeGate::OnlyIfNotTurboquant) => !turboquant,
+        Some(super::lowered::RuntimeGate::OnlyIfTurboquantDecode) => turboquant_decode,
+        Some(super::lowered::RuntimeGate::OnlyIfTurboquantNotDecode) => {
+            turboquant && !turboquant_decode
+        }
+        Some(super::lowered::RuntimeGate::UnlessTurboquantDecode) => !turboquant_decode,
     }
 }
 
