@@ -241,13 +241,81 @@ inline void rope_on_read_k_pairs_inlane(
     }
 }
 
+// ── TurboQuant KV read (decode) ──────────────────────────────────────
+//
+//  13  ATTN_TQ_BITS  uint — codebook width (bits per code) of the TurboQuant
+//      packed KV store. Set only on the TurboQuant twin of the decode command;
+//      unset, the `is_function_constant_defined` guard folds the whole path
+//      away and buffers 7..13 are never accessed.
+//
+// A TurboQuant vector is stored as codes `c` into an N(0,1) codebook plus its
+// L2 norm, and decodes as `x = norm · s² · D · H · c` (turboquant.metal: D =
+// diag(signs), H the unnormalized Walsh-Hadamard transform, s² = 1/head_dim).
+// H is symmetric and D diagonal, so attention can stay in the codebook domain:
+//   q · x_t      = norm_t · (s² · H · D · q) · c_t       — rotate q once;
+//   Σ_t p_t x_t  = s² · D · H · (Σ_t p_t · norm_t · c_t)  — rotate the output once.
+// No key is ever decoded, so the per-layer full-context dequant pass is gone
+// for decode.
+constant uint ATTN_TQ_BITS [[function_constant(13)]];
+constant bool ATTN_TQ_DEF  = is_function_constant_defined(ATTN_TQ_BITS);
+constant uint ATTN_TQ      = ATTN_TQ_DEF ? ATTN_TQ_BITS : 0u;
+
+// Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
+// simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
+// ownership). Under both the contiguous and the co-resident layout the bits of
+// an element's index are a permutation of (the local index's bits, the lane's 5
+// bits), and H factors into one 2x2 butterfly per index bit — so a register
+// butterfly per local bit plus a `simd_shuffle_xor` butterfly per lane bit is
+// H·x for either layout. MUST be called simdgroup-uniformly.
+inline void tq_wht(thread float* x, uint qk_per_thread, uint simd_lid) {
+    for (uint h = 1; h < qk_per_thread; h <<= 1) {
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            if ((j & h) == 0u) {
+                const float a = x[j];
+                const float b = x[j | h];
+                x[j]     = a + b;
+                x[j | h] = a - b;
+            }
+        }
+    }
+    for (ushort m = 1; m < 32; m <<= 1) {
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            const float o = simd_shuffle_xor(x[j], m);
+            x[j] = (simd_lid & m) ? (o - x[j]) : (x[j] + o);
+        }
+    }
+}
+
+// Code of element `e` of the packed vector starting at word `row_word`:
+// `32 / bits` codes per u32, LSB first, none straddling a word (turboquant.metal).
+inline uint tq_code(device const uint* packed, uint row_word, uint e) {
+    const uint vpw = 32u / ATTN_TQ;
+    return (packed[row_word + e / vpw] >> ((e % vpw) * ATTN_TQ)) & ((1u << ATTN_TQ) - 1u);
+}
+
+// Spans rope-on-read: rotate this lane's K slice to key position `i`.
+template <typename T>
+inline void attn_rope_on_read(thread float* k_loc, uint qk_per_thread, uint simd_lid,
+                              uint i, device const T* cos_sin) {
+    const uint half_dim = ATTN_ROT_DIM / 2u;
+    device const T* cos_row = cos_sin + i * ATTN_ROT_DIM;
+    device const T* sin_row = cos_row + half_dim;
+    if (ATTN_PCR != 0u) {
+        // Co-resident: both pair members in-lane, no shuffle/staging.
+        rope_on_read_k_pairs_inlane<T>(k_loc, qk_per_thread, simd_lid,
+                                       cos_row, sin_row, half_dim);
+    } else {
+        rope_on_read_k_slice<T>(k_loc, qk_per_thread, simd_lid,
+                                cos_row, sin_row, half_dim, ATTN_PAIR_OFF);
+    }
+}
+
 // ============================================================================
-// attention_via_cache_v2_f16_specialized — paged-cache decode attention
+// attention_via_cache_v2_{f16,bf16}_specialized — paged-cache decode attention
 // ============================================================================
 //
 // Paged-cache adaptation of MLX's `sdpa_vector` (from
-// `mlx/backend/metal/kernels/sdpa_vector.h`). Key structural moves vs
-// the original v1 kernel above:
+// `mlx/backend/metal/kernels/sdpa_vector.h`):
 //
 //   1. Online softmax: max + sum_exp accumulated per-step in
 //      registers; output accumulator is rescaled when a new max is
@@ -259,35 +327,31 @@ inline void rope_on_read_k_pairs_inlane(
 //      so the work fans out across simdgroups without cross-simd
 //      reductions in the inner loop.
 //
-//   3. Each lane handles `qk_per_thread = HEAD_DIM / 32 = 2`
-//      elements of K and V. The dot product reduces inside one
-//      simdgroup via `simd_sum`.
+//   3. Each lane handles `qk_per_thread = HEAD_DIM / 32` elements of
+//      K and V. The dot product reduces inside one simdgroup via
+//      `simd_sum`.
 //
 // The combine step at the end (after the K loop) collects per-
 // simdgroup partials, reconciles their max+sum_exp via simd_max +
 // simd_sum on threadgroup-mem-staged values, then produces the
 // final output.
 //
-// Bindings (must match `interpreter::metal::lowering::lower_one`'s
-// `Instruction::AttentionViaCache` arm):
-//   buffer(0) = output      [batch, num_q_heads, head_dim]
-//   buffer(1) = q           [batch, num_q_heads, head_dim]
-//   buffer(2) = seq_used_k  [batch]
-//   buffer(3) = block_table [batch, MAX_BLOCKS_PER_SEQ]
-//   buffer(4) = k_cache     [num_blocks, num_kv_heads, BLOCK_SIZE, HEAD_DIM]
-//   buffer(5) = v_cache     [num_blocks, num_kv_heads, BLOCK_SIZE, HEAD_DIM]
-//
-// Function constants 0..5: same as v1 (HEAD_DIM, NUM_Q_HEADS,
-// NUM_KV_HEADS, ATTN_SCALE, BLOCK_SIZE, MAX_BLOCKS_PER_SEQ).
+// Bindings (must match `AttentionViaCacheBindingSet` /
+// `TqAttentionBindingSet` in tape/kernel_bindings.rs):
+//   buffer(0)  = output      [batch, num_q_heads, head_dim]
+//   buffer(1)  = q           [batch, num_q_heads, head_dim]
+//   buffer(2)  = seq_used_k  [batch]
+//   buffer(3)  = block_table [batch, MAX_BLOCKS_PER_SEQ]
+//   buffer(4)  = k_cache     chunk table → [num_blocks, num_kv_heads, BLOCK_SIZE, HEAD_DIM]
+//   buffer(5)  = v_cache     chunk table → same
+//   buffer(6)  = cos_sin     (ATTN_ROPE_ON_READ only)
+//   buffer(7..13) (ATTN_TQ only) = packed K codes, packed V codes, K norms,
+//                V norms ([slot, num_kv_heads, ...], by physical slot), signs
+//                [head_dim], centroids [2^bits], slot_mapping [batch].
 //
 // Dispatch: threadgroups (batch, num_q_heads, 1), threads (1024, 1, 1)
-// = 32 simdgroups × 32 lanes. The lowering pass picks this shape only
-// for the v2 symbol; v1 kept around as a fallback for now.
+// = 32 simdgroups × 32 lanes. HEAD_DIM must be a multiple of 32.
 //
-// Constraint: HEAD_DIM must equal 32 * qk_per_thread (i.e. evenly
-// divisible by 32). For TinyLlama HEAD_DIM=64 this means
-// qk_per_thread = 2.
-
 // max_total_threads_per_threadgroup(1024) = BN*BD (32*32) — REQUIRED. Without
 // it the metal compiler picks a per-GPU register budget optimized for speed;
 // at Gemma head_dim 256/512 the register pressure (q_reg[16]/o_reg[16]/k_loc[16]
@@ -299,21 +363,28 @@ inline void rope_on_read_k_pairs_inlane(
 // dispatchable (spilling registers on M1 if needed) or fail pipeline creation
 // loudly instead of corrupting silently. Must equal the dispatched
 // threads_per_threadgroup at lowering.rs (AttentionViaCache / Sliding).
-[[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2_f16_specialized(
-    device       half* output      [[buffer(0)]],   // [batch, num_q_heads, head_dim]
-    device const half* q           [[buffer(1)]],   // [batch, num_q_heads, head_dim]
-    device const uint* seq_used_k  [[buffer(2)]],   // [batch]
-    device const uint* block_table [[buffer(3)]],   // [batch, MAX_BLOCKS_PER_SEQ]
-    device const uint64_t* k_cache [[buffer(4)]],   // chunk-address table
-    device const uint64_t* v_cache [[buffer(5)]],   // chunk-address table
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2(
+    device       T* output         [[buffer(0)]],
+    device const T* q              [[buffer(1)]],
+    device const uint* seq_used_k  [[buffer(2)]],
+    device const uint* block_table [[buffer(3)]],
+    device const uint64_t* k_cache [[buffer(4)]],
+    device const uint64_t* v_cache [[buffer(5)]],
     // Rope-on-read (spans): cos/sin for the active layer class. The
     // per-block "stored unrotated → rotate on read" flag rides in
     // block_table bit 31 (free — the K-loop already loads block_table
     // for addressing), so there is NO separate flag buffer. Only
     // accessed when ATTN_ROPE_ON_READ; dead-eliminated otherwise.
-    device const half*     cos_sin               [[buffer(6)]],
+    device const T*     cos_sin      [[buffer(6)]],
+    device const uint*  tq_packed_k  [[buffer(7)]],
+    device const uint*  tq_packed_v  [[buffer(8)]],
+    device const float* tq_norms_k   [[buffer(9)]],
+    device const float* tq_norms_v   [[buffer(10)]],
+    device const float* tq_signs     [[buffer(11)]],
+    device const float* tq_centroids [[buffer(12)]],
+    device const uint*  slot_mapping [[buffer(13)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
-    uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
@@ -332,7 +403,6 @@ inline void rope_on_read_k_pairs_inlane(
     const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
     const float scale      = ATTN_SCALE_FC;
 
-    // qk_per_thread = HEAD_DIM / 32. For TinyLlama 64/32 = 2.
     const uint qk_per_thread = head_dim / uint(BD);
 
     const uint seq_idx     = tg_pos.x;            // batch index
@@ -345,10 +415,6 @@ inline void rope_on_read_k_pairs_inlane(
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
-
-    // Per-thread Q + accumulators (qk_per_thread should be a
-    // compile-time constant; runtime division of head_dim/BD makes
-    // this a runtime sized loop).
     thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim<=512;
     thread U o_reg[16];                 // Gemma4 global layers are 512)
 
@@ -357,10 +423,8 @@ inline void rope_on_read_k_pairs_inlane(
     threadgroup U tg_max[BN];
     threadgroup U tg_sum[BN];
 
-    // Q row pointer + scaled load. Each lane owns qk_per_thread
-    // contiguous elements at offset simd_lid * qk_per_thread.
-    device const half* q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       half* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
+    device const T*    q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
+    device       T*    o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
     device const uint* row_block_table = block_table + seq_idx * max_blocks;
 
     // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
@@ -371,20 +435,48 @@ inline void rope_on_read_k_pairs_inlane(
         o_reg[i] = 0;
     }
 
+    // TurboQuant: q rotated into the codebook domain, `s²·H·D·q`. The
+    // codebook domain is laid out contiguously — lane `l` owns elements
+    // `l*qk_per_thread + j` (`tq_e`) whatever the q/K layout, as H·D mixes
+    // every element anyway — so a lane's codes sit in adjacent packed words.
+    // Every simdgroup owns the same slices and rotates its own copy in
+    // registers. The codebook (<= 16 centroids) is staged once.
+    const uint tq_e = simd_lid * qk_per_thread;
+    thread U qt_reg[16];
+    threadgroup U tq_lut[16];
+    if (ATTN_TQ != 0u) {
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            qt_reg[j] = U(scale) * U(q_row[tq_e + j]) * tq_signs[tq_e + j];
+        }
+        tq_wht(qt_reg, qk_per_thread, simd_lid);
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            qt_reg[j] /= U(head_dim);
+        }
+        const uint tid = simd_gid * uint(BD) + simd_lid;
+        if (tid < (1u << ATTN_TQ)) {
+            tq_lut[tid] = tq_centroids[tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint tq_pdim = (ATTN_TQ == 0u) ? 0u : (head_dim + 32u / ATTN_TQ - 1u) / (32u / ATTN_TQ);
+
     // Initialize per-thread max with finite minimum (MLX uses
     // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
     // fast::exp doesn't handle -INFINITY safely so we avoid it.
     U max_score = -FLT_MAX;
     U sum_exp_score = 0;
 
-
+    // TurboQuant: the key this step appended (the query's own, at kv_len-1)
+    // is not in the packed store yet — uniform arches quantize after
+    // attention, hybrid ones only lossily before it — so it is read from the
+    // cache its writer just filled, exactly as the dequant path read it. A
+    // reused span block's slot is the write-skip sentinel: nothing was
+    // written, and that key lives only in the packed store.
+    const bool tail_in_cache = (ATTN_TQ == 0u) || (slot_mapping[seq_idx] != 0xFFFFFFFFu);
     // For each key, simdgroup `simd_gid` handles tokens at indices
     // simd_gid, simd_gid+BN, simd_gid+2*BN, ... The simdgroup that
     // overshoots `kv_len` skips its iteration and contributes 0.
     for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
-        // Sliding window: decode Q sits at absolute position kv_len-1;
-        // skip keys older than the window. Branch is simdgroup-uniform
-        // (i derives from simd_gid) and folds away when ATTN_WINDOW=0.
         // Sliding window: decode Q sits at absolute position kv_len-1;
         // skip keys older than the window. Branch is simdgroup-uniform
         // (i derives from simd_gid) and folds away when ATTN_WINDOW=0.
@@ -400,66 +492,93 @@ inline void rope_on_read_k_pairs_inlane(
         // across the simdgroup (same block per simdgroup-iteration).
         const bool do_rot = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
         const uint token_in_block = i - logical_block * block_size;
-        // Chunked KV: deref the chunk backing this physical block.
-        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
-        // compiler dead-eliminates the chunked branch — used by the
-        // single-buffer-per-layer mode where `k_cache[0]` holds the layer
-        // base address and physical_block is the full offset (no modulo,
-        // no per-block chunk_table load). When non-zero the path matches
-        // the reactive chunked KV pool.
-        uint chunk;
-        uint blk_in_chunk;
-        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
-            chunk = 0u;
-            blk_in_chunk = physical_block;
-        } else {
-            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
-            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
-        }
-        // Row base (no per-lane offset); element ownership via
-        // attn_elem_off — contiguous, or co-resident NeoX pairs.
-        device const half* k_ptr =
-            (device const half*)k_cache[chunk]
-            + blk_in_chunk   * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride;
-        device const half* v_ptr =
-            (device const half*)v_cache[chunk]
-            + blk_in_chunk   * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride;
+        // TurboQuant: every key but the tail comes from the packed store,
+        // indexed by physical slot (bit 31 stripped — spans or not).
+        const bool packed = (ATTN_TQ != 0u) && !(tail_in_cache && i + 1u == kv_len);
+        const uint tq_row =
+            ((bt_raw & 0x7FFFFFFFu) * block_size + token_in_block) * num_kv + kv_head_idx;
 
-        // Dot product q·k for this lane's slice; simd_sum reduces within
-        // the simdgroup. Span blocks (do_rot, simdgroup-uniform) are
-        // re-roped to this key's position (= `i`) in registers first;
-        // every other key dots directly from k_ptr — byte-identical to
-        // the rope-on-write hot path (the rope-on-read parity guarantee).
         U score = 0;
-        if (do_rot) {
-            U k_loc[16];
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                k_loc[j] = U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
-            }
-            const uint half_dim = ATTN_ROT_DIM / 2u;
-            device const half* cos_row = cos_sin + i * ATTN_ROT_DIM;
-            device const half* sin_row = cos_row + half_dim;
-            if (ATTN_PCR != 0u) {
-                // Co-resident: both pair members in-lane, no shuffle/staging.
-                rope_on_read_k_pairs_inlane<half>(k_loc, qk_per_thread, simd_lid,
-                                     cos_row, sin_row, half_dim);
+        U k_scale = 1;
+        device const T* v_ptr = nullptr;
+        if (packed) {
+            const uint k_word = tq_row * tq_pdim;
+            if (do_rot) {
+                // Span block: the codes hold UNROTATED K and RoPE does not
+                // commute with H·D, so decode this key the way the dequant
+                // pass did (rounded to T) and re-rope it in the plain domain.
+                U k_loc[16];
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    k_loc[j] = tq_lut[tq_code(tq_packed_k, k_word,
+                                              attn_elem_off(simd_lid, j, qk_per_thread, head_dim))];
+                }
+                tq_wht(k_loc, qk_per_thread, simd_lid);
+                const U k_norm = tq_norms_k[tq_row] / U(head_dim);
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    const uint e = attn_elem_off(simd_lid, j, qk_per_thread, head_dim);
+                    k_loc[j] = U(T(k_loc[j] * tq_signs[e] * k_norm));
+                }
+                attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    score += q_reg[j] * k_loc[j];
+                }
             } else {
-                rope_on_read_k_slice<half>(k_loc, qk_per_thread, simd_lid,
-                                     cos_row, sin_row, half_dim, ATTN_PAIR_OFF);
-            }
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                score += q_reg[j] * k_loc[j];
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    score += qt_reg[j] * tq_lut[tq_code(tq_packed_k, k_word, tq_e + j)];
+                }
+                k_scale = tq_norms_k[tq_row];
             }
         } else {
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                score += q_reg[j] * U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+            // Chunked KV: deref the chunk backing this physical block.
+            // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+            // compiler dead-eliminates the chunked branch — used by the
+            // single-buffer-per-layer mode where `k_cache[0]` holds the layer
+            // base address and physical_block is the full offset (no modulo,
+            // no per-block chunk_table load). When non-zero the path matches
+            // the reactive chunked KV pool.
+            uint chunk;
+            uint blk_in_chunk;
+            if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+                chunk = 0u;
+                blk_in_chunk = physical_block;
+            } else {
+                chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
+                blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+            }
+            // Row base (no per-lane offset); element ownership via
+            // attn_elem_off — contiguous, or co-resident NeoX pairs.
+            device const T* k_ptr =
+                (device const T*)k_cache[chunk]
+                + blk_in_chunk   * kv_blk_stride
+                + kv_head_idx    * kv_head_stride
+                + token_in_block * kv_tok_stride;
+            v_ptr =
+                (device const T*)v_cache[chunk]
+                + blk_in_chunk   * kv_blk_stride
+                + kv_head_idx    * kv_head_stride
+                + token_in_block * kv_tok_stride;
+
+            // Dot product q·k for this lane's slice. Span blocks (do_rot,
+            // simdgroup-uniform) are re-roped to this key's position (= `i`)
+            // in registers first; every other key dots directly from k_ptr —
+            // byte-identical to the rope-on-write hot path (the rope-on-read
+            // parity guarantee).
+            if (do_rot) {
+                U k_loc[16];
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    k_loc[j] = U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                }
+                attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    score += q_reg[j] * k_loc[j];
+                }
+            } else {
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    score += q_reg[j] * U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                }
             }
         }
-        score = simd_sum(score);
+        score = simd_sum(score) * k_scale;
 
         // Online softmax update. Match MLX `sdpa_vector`: fast::exp
         // for both factor + exp_score.
@@ -471,10 +590,29 @@ inline void rope_on_read_k_pairs_inlane(
         sum_exp_score = sum_exp_score * factor + exp_score;
 
         // Accumulate weighted V; rescale prior accumulator with factor.
-        // V element ownership matches K/Q (attn_elem_off).
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_reg[j] = o_reg[j] * factor
-                     + exp_score * U(v_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+        // V element ownership matches K/Q (attn_elem_off). Under TurboQuant
+        // the accumulator lives in the codebook domain.
+        if (packed) {
+            const uint v_word = tq_row * tq_pdim;
+            const U p_norm = exp_score * tq_norms_v[tq_row];
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_reg[j] = o_reg[j] * factor + p_norm * tq_lut[tq_code(tq_packed_v, v_word, tq_e + j)];
+            }
+        } else if (ATTN_TQ != 0u) {
+            // The tail's plain V into the codebook domain: s²·D·H·(H·D·v) = v.
+            U v_loc[16];
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                v_loc[j] = U(v_ptr[tq_e + j]) * tq_signs[tq_e + j];
+            }
+            tq_wht(v_loc, qk_per_thread, simd_lid);
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_reg[j] = o_reg[j] * factor + exp_score * v_loc[j];
+            }
+        } else {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_reg[j] = o_reg[j] * factor
+                         + exp_score * U(v_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+            }
         }
     }
 
@@ -514,210 +652,57 @@ inline void rope_on_read_k_pairs_inlane(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Lane 0 of each simdgroup writes its qk_per_thread output slice.
     // The combine transposes lane<->simdgroup, so simdgroup `simd_gid`
     // now owns the element set that lane `simd_gid` owned during the K
-    // loop — write via attn_elem_off(simd_gid, ...).
-    if (simd_lid == 0) {
+    // loop.
+    if (ATTN_TQ != 0u) {
+        // Codebook-domain output: gather it back into lane slices and
+        // rotate once, o = s²·D·H·a.
+        if (simd_lid == 0) {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                tg_outputs[simd_gid * qk_per_thread + j] = o_reg[j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_gid == 0) {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_reg[j] = tg_outputs[tq_e + j];
+            }
+            tq_wht(o_reg, qk_per_thread, simd_lid);
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_row[tq_e + j] = T(o_reg[j] * tq_signs[tq_e + j] / U(head_dim));
+            }
+        }
+    } else if (simd_lid == 0) {
+        // Lane 0 of each simdgroup writes its qk_per_thread output slice.
         for (uint j = 0; j < qk_per_thread; ++j) {
-            o_row[attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] = half(o_reg[j]);
+            o_row[attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] = T(o_reg[j]);
         }
     }
 }
 
-/// BF16 sibling of `attention_via_cache_v2_f16_specialized`. Same
-/// algorithm: paged-cache adaptation of MLX's `sdpa_vector` (online
-/// softmax + per-simdgroup K-axis split). Reads pre-rotated K from
-/// the cache (rope-on-write — `rope_append_bf16` rotates K and writes
-/// rotated K to the cache).
-///
-/// Constraint: HEAD_DIM must be a multiple of 32. Llama-3.2-1B
-/// (HEAD_DIM=64), Llama-3.2-3B (HEAD_DIM=128), and Qwen-class
-/// (HEAD_DIM=128) all satisfy.
-///
-/// max_total_threads_per_threadgroup(1024): see the f16 sibling — REQUIRED so
-/// the 1024-thread (32 simdgroup) launch is guaranteed dispatchable at Gemma
-/// head_dim 256/512 on M1 (else the pipeline cap drops to 640 and the driver
-/// under-launches → uninitialized softmax-combine slots → silent garbage).
-[[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2_bf16_specialized(
-    device       bfloat* output      [[buffer(0)]],   // [batch, num_q_heads, head_dim]
-    device const bfloat* q           [[buffer(1)]],   // [batch, num_q_heads, head_dim]
-    device const uint*   seq_used_k  [[buffer(2)]],   // [batch]
-    device const uint*   block_table [[buffer(3)]],   // [batch, MAX_BLOCKS_PER_SEQ]
-    device const uint64_t* k_cache   [[buffer(4)]],   // chunk-address table
-    device const uint64_t* v_cache   [[buffer(5)]],   // chunk-address table
-    // Rope-on-read (spans): see the f16 sibling. cos_sin is bf16 here;
-    // the unrotated flag rides in block_table bit 31 (no flag buffer).
-    device const bfloat*   cos_sin               [[buffer(6)]],
-    uint3  tg_pos    [[threadgroup_position_in_grid]],
-    uint3  tid       [[thread_position_in_threadgroup]],
-    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
-    uint   simd_lid  [[thread_index_in_simdgroup]])
-{
-    constexpr int BN = 32; // simdgroups per threadgroup
-    constexpr int BD = 32; // lanes per simdgroup
-    typedef float U;
-    const uint ATTN_BT_MASK = (ATTN_ROR != 0u) ? 0x7FFFFFFFu : 0xFFFFFFFFu;
+#define INSTANTIATE_ATTENTION_VIA_CACHE_V2(name, T)                                   \
+    template [[host_name(name)]] [[kernel]]                                            \
+    void attention_via_cache_v2<T>(                                                    \
+        device T* output [[buffer(0)]], device const T* q [[buffer(1)]],               \
+        device const uint* seq_used_k [[buffer(2)]],                                   \
+        device const uint* block_table [[buffer(3)]],                                  \
+        device const uint64_t* k_cache [[buffer(4)]],                                  \
+        device const uint64_t* v_cache [[buffer(5)]],                                  \
+        device const T* cos_sin [[buffer(6)]],                                         \
+        device const uint* tq_packed_k [[buffer(7)]],                                  \
+        device const uint* tq_packed_v [[buffer(8)]],                                  \
+        device const float* tq_norms_k [[buffer(9)]],                                  \
+        device const float* tq_norms_v [[buffer(10)]],                                 \
+        device const float* tq_signs [[buffer(11)]],                                   \
+        device const float* tq_centroids [[buffer(12)]],                               \
+        device const uint* slot_mapping [[buffer(13)]],                                \
+        uint3 tg_pos [[threadgroup_position_in_grid]],                                 \
+        uint simd_gid [[simdgroup_index_in_threadgroup]],                              \
+        uint simd_lid [[thread_index_in_simdgroup]]);
 
-    const uint head_dim    = ATTN_HEAD_DIM;
-    const uint num_q       = ATTN_NUM_Q_HEADS;
-    const uint num_kv      = ATTN_NUM_KV_HEADS;
-    const uint block_size  = ATTN_BLOCK_SIZE;
-    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
-    const float scale      = ATTN_SCALE_FC;
-
-    // Each lane handles `qk_per_thread` contiguous elements of head_dim.
-    const uint qk_per_thread = head_dim / uint(BD);
-
-    const uint seq_idx     = tg_pos.x;
-    const uint q_head_idx  = tg_pos.y;
-    const uint group_ratio = num_q / num_kv;
-    const uint kv_head_idx = q_head_idx / group_ratio;
-    const uint kv_len      = seq_used_k[seq_idx];
-
-    const uint kv_blk_stride  = num_kv * block_size * head_dim;
-    const uint kv_head_stride = block_size * head_dim;
-    const uint kv_tok_stride  = head_dim;
-
-    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim<=512)
-    thread U o_reg[16];
-
-    threadgroup U tg_outputs[BN * BD];
-    threadgroup U tg_max[BN];
-    threadgroup U tg_sum[BN];
-
-    device const bfloat* q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       bfloat* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
-    device const uint*   row_block_table = block_table + seq_idx * max_blocks;
-
-    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
-    // Element ownership follows attn_elem_off (contiguous, or co-resident
-    // NeoX pairs under ATTN_PAIR_CORESIDENT) — Q must match K's per-lane set.
-    for (uint i = 0; i < qk_per_thread; ++i) {
-        q_reg[i] = U(scale) * U(q_row[attn_elem_off(simd_lid, i, qk_per_thread, head_dim)]);
-        o_reg[i] = 0;
-    }
-
-    // Initialize per-thread max with finite minimum (MLX uses
-    // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
-    // fast::exp doesn't handle -INFINITY safely so we avoid it.
-    U max_score = -FLT_MAX;
-    U sum_exp_score = 0;
-
-
-    // Online softmax over K axis. Each simdgroup `simd_gid` covers
-    // tokens at indices simd_gid, simd_gid+BN, simd_gid+2*BN, ...
-    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
-        // Sliding window: see f16 sibling (decode Q at kv_len-1).
-        if (ATTN_WINDOW > 0 && (int(kv_len) - 1 - int(i)) >= ATTN_WINDOW) {
-            continue;
-        }
-        const uint logical_block = i / block_size;
-        const uint bt_raw = row_block_table[logical_block];
-        const uint physical_block = bt_raw & ATTN_BT_MASK;
-        const bool do_rot = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
-        const uint token_in_block = i - logical_block * block_size;
-        // Chunked KV: deref the chunk backing this physical block.
-        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
-        // compiler dead-eliminates the chunked branch — used by the
-        // single-buffer-per-layer mode where `k_cache[0]` holds the layer
-        // base address and physical_block is the full offset (no modulo,
-        // no per-block chunk_table load). When non-zero the path matches
-        // the reactive chunked KV pool.
-        uint chunk;
-        uint blk_in_chunk;
-        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
-            chunk = 0u;
-            blk_in_chunk = physical_block;
-        } else {
-            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
-            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
-        }
-        // Row base (no per-lane offset); ownership via attn_elem_off.
-        device const bfloat* k_ptr =
-            (device const bfloat*)k_cache[chunk]
-            + blk_in_chunk   * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride;
-        device const bfloat* v_ptr =
-            (device const bfloat*)v_cache[chunk]
-            + blk_in_chunk   * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride;
-
-        // q·k; span blocks (do_rot) re-roped to position `i` first, every
-        // other key dots directly from k_ptr. See the f16 sibling.
-        U score = 0;
-        if (do_rot) {
-            U k_loc[16];
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                k_loc[j] = U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
-            }
-            const uint half_dim = ATTN_ROT_DIM / 2u;
-            device const bfloat* cos_row = cos_sin + i * ATTN_ROT_DIM;
-            device const bfloat* sin_row = cos_row + half_dim;
-            if (ATTN_PCR != 0u) {
-                rope_on_read_k_pairs_inlane<bfloat>(k_loc, qk_per_thread, simd_lid,
-                                     cos_row, sin_row, half_dim);
-            } else {
-                rope_on_read_k_slice<bfloat>(k_loc, qk_per_thread, simd_lid,
-                                     cos_row, sin_row, half_dim, ATTN_PAIR_OFF);
-            }
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                score += q_reg[j] * k_loc[j];
-            }
-        } else {
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                score += q_reg[j] * U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
-            }
-        }
-        score = simd_sum(score);
-
-        U new_max = max(max_score, score);
-        // Match MLX `sdpa_vector`: fast::exp for both factor + exp_score.
-        U factor = metal::fast::exp(max_score - new_max);
-        U exp_score = metal::fast::exp(score - new_max);
-
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
-
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_reg[j] = o_reg[j] * factor
-                     + exp_score * U(v_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
-        }
-    }
-
-    // Combine per-simdgroup partials (online-softmax merge).
-    if (simd_lid == 0) {
-        tg_max[simd_gid] = max_score;
-        tg_sum[simd_gid] = sum_exp_score;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    U other_max = tg_max[simd_lid];
-    U global_max = simd_max(other_max);
-    U factor = metal::fast::exp(other_max - global_max);
-    U global_sum = simd_sum(tg_sum[simd_lid] * factor);
-
-    for (uint j = 0; j < qk_per_thread; ++j) {
-        tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
-        U combined = simd_sum(val);
-        if (global_sum != 0) {
-            combined = combined / global_sum;
-        }
-        o_reg[j] = combined;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (simd_lid == 0) {
-        // Combine transposed lane<->simdgroup; write via attn_elem_off(simd_gid).
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_row[attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] = bfloat(o_reg[j]);
-        }
-    }
-}
+INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_f16_specialized", half)
+INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bfloat)
 
 // ─────────────────────────────────────────────────────────────────────
 // attention_prefill_sdpa_v2_paged — paged-cache variant of the prefill

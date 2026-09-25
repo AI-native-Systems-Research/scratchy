@@ -258,6 +258,9 @@ u32_newtype!(
     /// Steel attention `[[function_constant(99)]]` debug-mode toggle.
     /// Bound to `0` for production; `>0` selects diagnostic paths.
     AttnDebugMode,
+    /// TurboQuant codebook width, bits per packed code
+    /// (`tq_bits(W::TQ_KV_BITS)`).
+    TqCodeBits,
 );
 
 i32_newtype!(

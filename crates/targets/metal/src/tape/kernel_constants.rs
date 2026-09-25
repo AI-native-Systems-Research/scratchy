@@ -21,7 +21,7 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
     IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
-    NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK,
+    NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TqCodeBits,
 };
 
 /// Append the spans rope-on-read function constants (slot 8 = rotary
@@ -259,6 +259,19 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             v.push(ConstantValue::uint(ConstSlot(12), pc));
         }
         v
+    }
+}
+
+/// `KernelId::AttentionViaCacheTq`: the constant its `AttentionViaCache`
+/// twin's set gains — `ATTN_TQ_BITS` (slot 13), which switches the kernel to
+/// reading the TurboQuant packed store.
+pub struct AttentionViaCacheTqConstants {
+    pub bits: TqCodeBits,
+}
+
+impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
+    fn from(c: AttentionViaCacheTqConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(13), c.bits.get())]
     }
 }
 
