@@ -156,10 +156,17 @@ mod imp {
             .to_string();
         let rope_theta = cfg["rope_theta"].as_f64();
         let rope_scaling = cfg.get("rope_scaling");
+        // Mirror `extract_rope_scaling` (config.rs): only llama3 / longrope
+        // / su / yarn / mrope types count as a scaling. Other types the
+        // manifest ignores ("linear" on gemma3) must read as None here or
+        // the baked fingerprint — which encoded the manifest's ignored
+        // value — rejects its own checkpoint.
+        let recognized = ["llama3", "longrope", "su", "yarn", "mrope"];
         let hf = HfFingerprint {
             rope_scaling_type: rope_scaling
                 .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
-                .and_then(|v| v.as_str()),
+                .and_then(|v| v.as_str())
+                .filter(|t| recognized.contains(t)),
             rope_scaling_hash: rope_scaling.map(hash_json_value),
             rope_theta,
         };
