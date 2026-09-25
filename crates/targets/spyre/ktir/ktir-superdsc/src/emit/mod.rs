@@ -30,7 +30,7 @@ use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
     IndirectRole, ItDim, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet,
-    StickExtent, TensorArg, WorkPlan, assert_df_stick_multiple,
+    StickExtent, TensorArg, USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
 };
 use crate::wire::{
     AddrFold, AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs,
@@ -3963,8 +3963,19 @@ mod transpose_tests {
     }
 
     /// THE CONTROL, and the proof that the entry point is not simply broken: the same transpose padded
-    /// to whole sticks lowers, and it lowers to exactly ONE descriptor named after its output buffer,
-    /// carrying the fixture's OUTPUT stick.
+    /// to whole sticks lowers, and it lowers to exactly ONE descriptor named after its output buffer.
+    ///
+    /// ⛔⛔⛔ IT IS A `ReStickifyOpHBM`, NOT AN `interslicetranspose_fp16`, AND THAT IS THE WHOLE POINT
+    /// OF THE REROUTE. `OpFunc::Transpose` sticks its output on the 8×8 inter-slice block over
+    /// (`out`, `mb`) — TWO dims — and the V3 translator accepts a dynamic mask over exactly ONE loop
+    /// carrying exactly ONE dim (`SNComputeLowering.cpp:68,74`), so it could not be lowered at the
+    /// default RCUDD1A arch at ANY shape. `OpFunc::Restickify` does the same transposition with a
+    /// one-dim output stick. See [`restickify_transpose_opspec_2d`], which states the addressing
+    /// argument, and `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors.
+    ///
+    /// The two roles' dim orders are asserted SWAPPED as well as the stick being one-dim: equal orders
+    /// would be a re-stick with no transposition, which carries the same one-dim stick and would pass
+    /// the stick assertion alone.
     #[test]
     fn the_entry_point_still_lowers_a_stick_aligned_transpose() {
         let ops = lower_transpose(&transpose_program((MB as i64, 128), (128, MB as i64)))
@@ -3977,8 +3988,23 @@ mod transpose_tests {
             "named after its output buffer"
         );
         let d = dsc(op, "transpose_o102");
-        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickSize_, vec![8, 8]);
-        assert_eq!(d.computeOp_[0].opFuncName, "interslicetranspose_fp16");
+        assert_eq!(
+            d.primaryDsInfo_["OUTPUT"].stickDimOrder_,
+            vec!["y"],
+            "the OUTPUT stick must be ONE dim — the only property the V3 translator's limit is a \
+             function of",
+        );
+        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickSize_, vec![64]);
+        assert_eq!(
+            (
+                d.primaryDsInfo_["INPUT"].layoutDimOrder_.clone(),
+                d.primaryDsInfo_["OUTPUT"].layoutDimOrder_.clone(),
+            ),
+            (vec!["y", "out"], vec!["out", "y"]),
+            "the two roles' dim orders must be SWAPPED — that swap IS the transposition, and equal \
+             orders would be a re-stick that copies",
+        );
+        assert_eq!(d.computeOp_[0].opFuncName, "ReStickifyOpHBM");
     }
 
     /// A column extent that is not a whole stick is refused at the entry point too, and the message
@@ -4005,21 +4031,46 @@ mod transpose_tests {
         );
     }
 
-    /// ⛔ AND THE DIVISION GUARD REACHES THE ENTRY POINT AS AN `Error`, NOT A PANIC. `assemble_transpose`
-    /// `panic!`s on a refused opspec, so a shape that passes the stick law but trips the core-division
-    /// guard would abort the build with a bare panic instead of a producer-reportable error. `mb = 64`
-    /// is exactly that shape: whole sticks on both axes, per-core mb 2.
+    /// ⛔ AND THE BUILDER'S OWN GUARD REACHES THE ENTRY POINT AS AN `Error`, NOT A PANIC. Every
+    /// `assemble_*` here `panic!`s on a refused opspec, so a shape that passes the stick law and then
+    /// trips a builder law would abort the build with a bare panic instead of a producer-reportable
+    /// error; the door calls the fallible form for exactly that reason.
+    ///
+    /// ⚖️ THE LAW BEING TRIPPED CHANGED WITH THE REROUTE, AND THAT IS WHY THIS SHAPE DID. It used to be
+    /// `transpose_opspec`'s 8×8 core-division guard, reached at `mb = 64` (per-core mb 2). The door now
+    /// emits a `ReStickifyOpHBM`, which has no block law — `[64, 128]` is one of the shapes the reroute
+    /// exists to make lower — so the remaining builder law is the LX budget: a restickify carries
+    /// `time_tile: None` (its output stick IS the whole `y` extent, so there is no stick dim left to
+    /// divide in time) and therefore cannot tile its way out of an over-budget tile. `[4096, 4096]` is
+    /// that shape: `distribute_cores` spends all 32 cores on `y`, leaving each one (y 128, out 4096) =
+    /// 2_097_152 B against the 1_677_721-B scratchpad.
     #[test]
-    fn a_stick_aligned_shape_whose_division_misses_the_block_is_an_error_not_a_panic() {
-        let e = refusal(&transpose_program((64, 128), (128, 64)));
+    fn a_stick_aligned_shape_whose_builder_law_fails_is_an_error_not_a_panic() {
+        let e = refusal(&transpose_program((4096, 4096), (4096, 4096)));
         assert!(
-            e.contains("(mb 2, out 128)"),
-            "the division guard's own message reaches the caller, got: {e}"
+            e.contains("(y 128, out 4096)"),
+            "the builder's own per-core tile reaches the caller, got: {e}"
         );
         assert!(
-            e.contains("8x8 inter-slice block"),
-            "and names the block law, got: {e}"
+            e.contains("1677721") && e.contains("time_tile"),
+            "and names the budget AND why this door cannot time-tile instead, got: {e}"
         );
+    }
+
+    /// ⭐ THE CONTROL FOR THE SHAPE THE REROUTE EXISTS FOR. `[64, 128]` used to be refused by the 8×8
+    /// core-division guard (per-core mb 2) and is exactly the class `decoder_layer_one_flat` needs; it
+    /// now emits, with the one-dim stick. Without this the test above would read as "big shapes are
+    /// refused" and would not record that the small one was UNBLOCKED.
+    #[test]
+    fn the_shape_the_block_division_used_to_refuse_now_lowers() {
+        let ops = lower_transpose(&transpose_program((64, 128), (128, 64)))
+            .expect("[64, 128] is the shape class the reroute unblocks");
+        let [op] = &ops[..] else {
+            panic!("a transpose is ONE descriptor, got {}", ops.len());
+        };
+        let d = dsc(op, "transpose_o102");
+        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickDimOrder_, vec!["y"]);
+        assert_eq!(d.computeOp_[0].opFuncName, "ReStickifyOpHBM");
     }
 
     // ── (iii) the byte-identity control ──────────────────────────────────────────────────────────
@@ -4486,6 +4537,87 @@ pub fn assemble_restickify_kt_2d(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"))
+}
+
+/// A STANDALONE `[rows, cols] → [cols, rows]` fp16 TRANSPOSE ON THE RESTICKIFY DOOR — the form
+/// [`lower_ktir_to_superdsc::transpose`] emits for a producer's `linalg.transpose`.
+///
+/// ⛔⛔⛔ WHY THIS DOOR AND NOT [`transpose_opspec`], WHICH IS NAMED FOR THE JOB. `OpFunc::Transpose`
+/// (`interslicetranspose_fp16`) sticks its OUTPUT on the 8×8 inter-slice block over (`out`, `mb`) —
+/// `emit_sdsc`'s `is_transpose_out` arm, `stickDimOrder_ ["out","mb"]`. A TWO-DIM output stick is what
+/// the V3 translator cannot lower: `Ddc::transformForInterSliceRestickify`
+/// (`ddc/ddc_transformation.cpp:2398`, unconditional from `Ddc::run_v1`) fires on any PT node whose
+/// input and output stick orders differ and writes one mask offset per dim of the innermost loop
+/// carrying `outputStickDimOrder[0]`, which for a 2-D (`mb`, `out`) tile is the FUSED
+/// `loop_dsX_dsY_out_mb` — two dims — while `SNComputeLowering::constructDynamicMasking` accepts
+/// exactly one loop carrying exactly one dim (`SNComputeLowering.cpp:68,74`). Measured through
+/// `dxp_standalone`: `OpFunc::Transpose` refuses at EVERY shape, including shapes whose core division
+/// splits both axes like the golden `sdsc_interslicetranspose.json`, which is what ruled the core
+/// division out as the cause. `OpFunc::Restickify` sticks its output on the single `y` axis, DDC lands
+/// on a one-dim loop, and the same masked-MACC path is accepted — exit 0.
+///
+/// ⭐ AND THE ADDRESSING IS THE LADDER'S OWN CONVENTION, which is why the substitution is sound and not
+/// merely translatable. [`restickify_kt_opspec_2d`] reads its input as `[y=rows, out=cols]` sticked on
+/// the LAST dim ⇒ `dev_off([rows,cols],1,·)` = `[cols/64, rows, 64]`, and writes `[out=cols, y=rows]`
+/// sticked on ITS last dim ⇒ `[rows/64, cols, 64]`. That stick-major form IS the fp16 device layout
+/// every operand on this path already carries, so both sides read and write bytes the rest of the
+/// bundle addresses identically — with the axes swapped, which is the transposition.
+///
+/// The extents are plain `u32` here rather than the paged-KV
+/// [`KtTileSlots`](crate::sdsc_abstract::KtTileSlots)/[`KtTileFeats`](crate::sdsc_abstract::KtTileFeats)
+/// newtypes [`assemble_restickify_kt_2d`] takes: this door serves an arbitrary producer-stated shape,
+/// which is exactly the thing those newtypes exist to forbid for the cache. Offsets are zero — a
+/// `linalg.transpose` names whole buffers (its caller refuses a window).
+fn restickify_transpose_opspec_2d(
+    rows: u32,
+    cols: u32,
+    in_name: &str,
+    o_name: &str,
+) -> Result<OpSpec, String> {
+    // The Kᵀ builder IS this descriptor: `cap`→`y` is the row axis, `hd`→`out` the column axis, and
+    // both stick laws are checked there. Sharing it means the two doors cannot drift apart.
+    let op = restickify_kt_opspec_2d(rows, cols, in_name, o_name, 0, 0)?;
+    // ⛔⛔⛔ AND IT MUST FAIL CLOSED ON LX, BECAUSE THIS DOOR CANNOT TIME-TILE ITS WAY OUT.
+    //
+    // `transpose_opspec` reached `TileOp::tile`, which splits the `out` stick dim in TIME when the
+    // per-core tile overflows the scratchpad. A restickify has no such axis to give: its output stick
+    // IS the whole `y` extent, so dividing `y` in time would split an output stick, and
+    // `restickify_kt_opspec_2d` therefore carries `time_tile: None`. So the reroute genuinely narrows
+    // what this door accepts, and the narrowing has to be a NAMED REFUSAL — otherwise a big transpose
+    // becomes a descriptor that addresses past LX and dies on-card as DtException 1535.
+    //
+    // The resident set is the 1 input + 1 output per-core tile, which for a relayout are the same
+    // extents on both sides (the swap is in the addressing, not the size).
+    let (per_y, per_out) = (op.iter.per_core_extent("y"), op.iter.per_core_extent("out"));
+    let resident = 2 * u64::from(per_y) * u64::from(per_out) * u64::from(Fp16::WORD_LENGTH);
+    if resident > USABLE_LX_BYTES {
+        return Err(format!(
+            "restickify transpose [{rows}, {cols}]: the per-core tile is (y {per_y}, out {per_out}) \
+             on {} cores, so the resident input+output set is {resident} B against the \
+             {USABLE_LX_BYTES}-B LX scratchpad. This door carries `time_tile: None` and cannot be \
+             time-tiled instead — a restickify's output stick IS the whole `y` extent, so there is no \
+             stick dim left to divide in time without splitting an output stick. Transpose a narrower \
+             column block and loop, which keeps each descriptor's resident set inside LX.",
+            op.iter.cores_used().get(),
+        ));
+    }
+    Ok(op)
+}
+
+/// [`restickify_transpose_opspec_2d`] assembled — the fallible form, because this is reached by a
+/// third-party KTIR producer that has its own op to blame (see [`try_assemble_transpose`]).
+pub fn try_assemble_restickify_transpose_2d(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    in_name: &str,
+    o_name: &str,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = restickify_transpose_opspec_2d(rows, cols, in_name, o_name)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
 
 /// PATH B (V side): a RANK-2 per-head restickify that RE-STICKS the natural V cache `[cap,hd]` (flat
