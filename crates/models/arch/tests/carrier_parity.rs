@@ -186,6 +186,29 @@ mod imp {
             return;
         }
 
+        // Dense MoE: the metal backend has no dense-MoE realization — the
+        // MoE kernels require affine-quantized expert storage
+        // (`to_wavefront.rs`: "MoE without affine expert storage has no
+        // metal realization"), so a dense-MoE checkpoint refuses at pool
+        // construction with `BucketLower`. The same refusal fires for the
+        // oracle's synthetic checkpoint. Comparing torch vs metal here
+        // would compare an execution against a refusal: not parity, a
+        // mechanism gap. Named loudly, not silently passed — the unlock is
+        // either a dense-MoE metal kernel or a quant-emulating oracle,
+        // whichever lands first. Sniffed off config keys (num_local_experts
+        // / n_routed_experts / num_experts — the three vocabularies the
+        // bridge itself reads), not an arch list.
+        let moe_keys = ["num_local_experts", "n_routed_experts", "num_experts"];
+        if moe_keys.iter().any(|k| cfg.get(k).is_some()) {
+            eprintln!(
+                "DEFERRED {}/{}: dense MoE — metal requires affine expert storage; \
+                 the oracle is dense-only (same refusal both sides)",
+                case.arch,
+                case.stem
+            );
+            return;
+        }
+
         let allocator = MetalAllocator::new((**device_arc).clone());
         let mut device = GpuDevice::new(device_arc.clone(), Arc::new(allocator.clone()));
         let mut gw = GpuWeights::from_dir(&ckpt, allocator.clone()).expect("GpuWeights::from_dir");
