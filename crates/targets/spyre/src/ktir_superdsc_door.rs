@@ -97,7 +97,19 @@ pub fn lower(
     // and a new kind fell through a `_` arm. `KtirNode::program` states it, so there is NO catch-all
     // here and a producer that gains a kind is an E0004 at this match.
     match k.program {
-        Program::Elementwise(ew) => elementwise(name, ew, &r, sym_id_base, layout),
+        // `&[]` IS THE DENSE PATH, AND IT IS ARGUMENT 4. The broadcast flag slice is per-operand and
+        // is stated by the whole-function walk from the region it read; a per-`Program` op has no
+        // region to state one, and an empty slice is the byte-identical no-broadcast emission this
+        // door always had. Measured: granite's baked descriptors are unchanged with this argument in
+        // place, 2b and 8b at fp16 and fp8, `diff -r` 0 lines.
+        //
+        // ⛔ THE POSITION MATTERS AND THE COMPILER ONLY HALF-NAMES IT. `&[]` infers its element type
+        // from whichever parameter it lands on, so writing it in slot 3 type-checks AS THE REGION LIST
+        // and pushes the error onto the NEXT argument — `expected &[Option<BcastAxis>], found
+        // &Vec<Region>` at `&r` — which reads as a problem with the regions rather than with where the
+        // empty slice went. Measured that way: `cargo check -p scratchy-target-spyre` rc 101, against
+        // rc 0 on main.
+        Program::Elementwise(ew) => elementwise(name, ew, &r, &[], sym_id_base, layout),
         Program::SiluMul => silumul(name, &r, sym_id_base, layout),
         Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
         Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),
