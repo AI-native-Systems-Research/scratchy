@@ -1285,14 +1285,6 @@ impl MetalWorker {
             .device
             .clone();
 
-        let residency = self
-            .gpu_device
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: no gpu_device".into()))?
-            .allocator
-            .residency()
-            .clone();
-
         // Assemble this step's sampler inputs (metal's `GpuSampleParams` layout)
         // and hand them to the metal sampler. The per-request seed inside comes
         // from the shared `scratchy_core_common::fnv_seed`, so it matches cuda;
@@ -1308,7 +1300,6 @@ impl MetalWorker {
         );
         Ok(scratchy_target_metal::sampling::PendingSampler::prepare(
             &device,
-            &residency,
             &params,
             jobs.len() as u32,
             vocab,
@@ -2057,6 +2048,16 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // `PendingSampler` moves into the closure; its output buffer is cloned
         // out first so it can be read back after the (single) host wait below.
         let pending_sampler = self.pending_sampler.take();
+        // The followup consumes the sampler while encoding, so these pins are
+        // what keep its buffers resident and alive until the host wait below.
+        let sampler_pins: Vec<PinnedBuffer> = pending_sampler
+            .iter()
+            .flat_map(|p| p.bound_buffers())
+            .map(|b| PinnedBuffer::pin(&residency, b))
+            .collect();
+        if !sampler_pins.is_empty() {
+            residency.commit();
+        }
         let sampler_readback = pending_sampler.as_ref().map(|p| p.output());
         #[cfg(feature = "sampler-telemetry")]
         let sampler_telem = pending_sampler.as_ref().and_then(|p| p.telemetry_output());
@@ -2195,6 +2196,8 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             )
         };
         let _ = logits; // argmax_out is what we read
+        // The command buffer has completed; the sampler's buffers can go.
+        drop(sampler_pins);
 
         // ── 5. Read host-visible argmax buffer + return. ─────────────────
         let argmax_slice: &[u32] = unsafe {
@@ -2491,9 +2494,18 @@ impl PinnedBuffer {
         bytes: usize,
     ) -> Self {
         let buffer = scratchy_target_metal::mtl4_dispatch::shared_zeroed(device, bytes);
-        residency.insert(&buffer);
+        Self::pin(residency, &buffer)
+    }
+
+    /// Pin an existing buffer (and hold a reference to it). Commit `residency`
+    /// before the command buffer that reads it is committed.
+    fn pin(
+        residency: &scratchy_target_metal::residency::MetalResidencySet,
+        buffer: &scratchy_target_metal::mtl4_dispatch::Buffer,
+    ) -> Self {
+        residency.insert(buffer);
         Self {
-            buffer,
+            buffer: buffer.clone(),
             residency: residency.clone(),
         }
     }

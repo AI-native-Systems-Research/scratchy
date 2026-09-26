@@ -406,16 +406,15 @@ pub fn gather_gpu_sample_params(
 #[cfg(feature = "sampler-telemetry")]
 const SAMPLER_TELEM_K: u32 = 8;
 
-/// One step's non-greedy sampler work: pinned-resident GPU buffers + argument
-/// tables, prepared BEFORE the forward so it can be encoded onto the forward's
+/// One step's non-greedy sampler work: GPU buffers + argument tables, prepared
+/// BEFORE the forward so it can be encoded onto the forward's
 /// OWN command buffer ([`encode_into`](Self::encode_into), from the argmax
 /// followup) — one commit, one host wait, no second command buffer. Read the
 /// sampled tokens after the wait via [`output`](Self::output).
 pub struct PendingSampler {
     njobs: u32,
     is_bf16: bool,
-    // Every buffer is bound by gpuAddress in `encode_into` and pinned resident,
-    // so all must outlive the forward CB — held here for exactly that.
+    // Every buffer is bound by gpuAddress in `encode_into`: see `bound_buffers`.
     scratch_f32: Buffer,
     out_buf: Buffer,
     row_idx_buf: Buffer,
@@ -457,14 +456,11 @@ unsafe impl Send for PendingSampler {}
 
 impl PendingSampler {
     /// Upload the neutral [`GpuSampleParams`](scratchy_core_common::GpuSampleParams)
-    /// into pinned-resident GPU buffers + build the argument tables. Address
-    /// binding is deferred to [`encode_into`](Self::encode_into) (which also binds
-    /// the forward's own logits). `residency` is the forward command buffer's
-    /// set — a freshly-allocated, gpuAddress-bound buffer is read as garbage if
-    /// it isn't pinned (mirrors the grammar-mask pinning).
+    /// into GPU buffers + build the argument tables. Address binding is deferred
+    /// to [`encode_into`](Self::encode_into) (which also binds the forward's own
+    /// logits).
     pub fn prepare(
         device: &Device,
-        residency: &crate::residency::MetalResidencySet,
         params: &scratchy_core_common::GpuSampleParams,
         njobs: u32,
         vocab: u32,
@@ -547,36 +543,6 @@ impl PendingSampler {
             None
         };
 
-        // Pin every gpuAddress-bound buffer resident for the forward CB.
-        for b in [
-            &scratch_f32,
-            &out_buf,
-            &row_idx_buf,
-            &temps_buf,
-            &top_ks_buf,
-            &top_ps_buf,
-            &min_ps_buf,
-            &uniforms_buf,
-            &reps_buf,
-            &freqs_buf,
-            &press_buf,
-            &out_ids_buf,
-            &prompt_ids_buf,
-            &consts_buf,
-        ] {
-            residency.insert(b);
-        }
-        #[cfg(feature = "sampler-telemetry")]
-        for b in [
-            &topk_probs_buf,
-            &topk_indices_buf,
-            &stats_buf,
-            &telem_consts_buf,
-        ] {
-            residency.insert(b);
-        }
-        residency.commit();
-
         Self {
             njobs,
             is_bf16,
@@ -610,6 +576,36 @@ impl PendingSampler {
             sample_at,
             penalties_at,
         }
+    }
+
+    /// Every buffer [`encode_into`](Self::encode_into) binds by GPU address. The
+    /// caller keeps them resident — and alive — until the forward's command
+    /// buffer completes.
+    pub fn bound_buffers(&self) -> impl Iterator<Item = &Buffer> {
+        let base = [
+            &self.scratch_f32,
+            &self.out_buf,
+            &self.row_idx_buf,
+            &self.temps_buf,
+            &self.top_ks_buf,
+            &self.top_ps_buf,
+            &self.min_ps_buf,
+            &self.uniforms_buf,
+            &self.reps_buf,
+            &self.freqs_buf,
+            &self.press_buf,
+            &self.out_ids_buf,
+            &self.prompt_ids_buf,
+            &self.consts_buf,
+        ];
+        #[cfg(feature = "sampler-telemetry")]
+        let base = base.into_iter().chain([
+            &self.topk_probs_buf,
+            &self.topk_indices_buf,
+            &self.stats_buf,
+            &self.telem_consts_buf,
+        ]);
+        base.into_iter()
     }
 
     /// Encode cast → [penalties] → sample onto the forward's OWN encoder (after
