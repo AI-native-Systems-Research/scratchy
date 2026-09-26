@@ -140,10 +140,12 @@ all-arches = [
 
 # gemma4 (2 configs)
 "gemma-4-12b-it" = ["arch-gemma4"]
+"gemma-4-12b-it-parity-tiny" = ["arch-gemma4"]
 "gemma-4-31b-it" = ["arch-gemma4"]
 
 # gemma4-moe (1 configs)
 "gemma-4-26b-a4b-it" = ["arch-gemma4-moe"]
+"gemma-4-26b-a4b-it-parity-tiny" = ["arch-gemma4-moe"]
 
 # granite (21 configs)
 "granite-3.0-2b-base" = ["arch-granite"]
@@ -200,6 +202,7 @@ all-arches = [
 
 # modernbert (2 configs)
 "modernbert-base-1-layer" = ["arch-modernbert"]
+"modernbert-base-1-layer-parity-tiny" = ["arch-modernbert"]
 "modernbert-base" = ["arch-modernbert"]
 
 # phi3 (10 configs)
@@ -221,6 +224,7 @@ all-arches = [
 "qwen2-1.5b" = ["arch-qwen2"]
 "qwen2-72b" = ["arch-qwen2"]
 "qwen2-7b" = ["arch-qwen2"]
+"qwen2-7b-parity-tiny" = ["arch-qwen2"]
 "qwen2-vl-2b-mlx-text-only" = ["arch-qwen2"]
 "qwen2-vl-2b" = ["arch-qwen2"]
 "qwen2.5-0.5b" = ["arch-qwen2"]
@@ -264,6 +268,7 @@ all-arches = [
 
 # qwen3-5-moe (1 configs)
 "qwen3.5-35b-a3b" = ["arch-qwen3-5-moe"]
+"qwen3.5-35b-a3b-parity-tiny" = ["arch-qwen3-5-moe"]
 
 # qwen3-5-vl (1 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
@@ -314,10 +319,12 @@ all-arches = [
 ]
 "gemma4" = [
     "gemma-4-12b-it",
+    "gemma-4-12b-it-parity-tiny",
     "gemma-4-31b-it",
 ]
 "gemma4-moe" = [
     "gemma-4-26b-a4b-it",
+    "gemma-4-26b-a4b-it-parity-tiny",
 ]
 "granite" = [
     "granite-3.0-2b-base",
@@ -374,6 +381,7 @@ all-arches = [
 ]
 "modernbert" = [
     "modernbert-base-1-layer",
+    "modernbert-base-1-layer-parity-tiny",
     "modernbert-base",
 ]
 "phi3" = [
@@ -406,6 +414,7 @@ all-arches = [
     "qwen2.5-7b",
     "qwen2.5-vl-3b-mlx-text-only",
     "qwen2.5-vl-3b",
+    "qwen2-7b-parity-tiny",
 ]
 "qwen2-5-vl" = [
     "qwen2.5-vl-3b-instruct",
@@ -438,6 +447,7 @@ all-arches = [
 ]
 "qwen3-5-moe" = [
     "qwen3.5-35b-a3b",
+    "qwen3.5-35b-a3b-parity-tiny",
 ]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
@@ -474,8 +484,10 @@ all = [
     "gemma-3-27b-it",
     "gemma-3-4b-it",
     "gemma-4-12b-it",
+    "gemma-4-12b-it-parity-tiny",
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
+    "gemma-4-26b-a4b-it-parity-tiny",
     "granite-3.0-2b-base",
     "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",
@@ -518,6 +530,7 @@ all = [
     "mixtral-1-layer-parity-tiny",
     "mixtral-8x7b-instruct-v0.1",
     "modernbert-base-1-layer",
+    "modernbert-base-1-layer-parity-tiny",
     "modernbert-base",
     "phi-3-5-mini-instruct",
     "phi-3-5-mini-instruct-parity-tiny",
@@ -546,6 +559,7 @@ all = [
     "qwen2.5-7b",
     "qwen2.5-vl-3b-mlx-text-only",
     "qwen2.5-vl-3b",
+    "qwen2-7b-parity-tiny",
     "qwen2.5-vl-3b-instruct",
     "qwen2.5-vl-3b-mlx",
     "qwen2.5-vl-72b-instruct",
@@ -566,6 +580,7 @@ all = [
     "qwen3.5-0.8b-parity-tiny",
     "qwen3.5-9b-text-only",
     "qwen3.5-35b-a3b",
+    "qwen3.5-35b-a3b-parity-tiny",
     "qwen3.5-9b",
     "qwen3-30b-a3b-instruct-2507",
     "qwen3-30b-a3b-instruct-2507-parity-tiny",
@@ -674,7 +689,9 @@ objc2-metal = { version = "0.3", features = ["MTLDevice"] }
 half = { workspace = true }
 # harness.json / checkpoint config.json reads + ForwardCtxHandle /
 # ForwardDeviceHandle in the universal carrier parity gate
-# (tests/carrier_parity.rs).
+# (tests/carrier_parity.rs). compute_hybrid_kv_layout (shared with the
+# worker) builds gemma4-style hybrid KV pools in the same gate.
+scratchy-core-config = { workspace = true }
 serde_json = { workspace = true }
 scratchy-tensors = { path = "../../tensors" }
 

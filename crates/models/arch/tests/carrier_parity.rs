@@ -229,25 +229,34 @@ mod imp {
         let layers = model.num_hidden_layers() as usize;
         let kv_heads = model.num_key_value_heads() as usize;
         let head_dim = model.head_dim() as usize;
-        let max_blocks = model.max_blocks_per_seq();
         let per_layer = model.per_layer_kv_token_elems();
-        if let Some(elems) = &per_layer {
-            // Hybrid geometry (gemma4-style mixed full+sliding layers):
-            // building the pool needs the per-layer is_sliding mask +
-            // page-unified block sizes + per-sliding-group tables — facts
-            // the trait doesn't carry yet. Deferred, NOT silently passed:
-            // named loudly so the deferral is visible in every run.
-            eprintln!(
-                "DEFERRED {}/{}: hybrid KV geometry ({:?} distinct \
-                 per-layer token elems) needs the sliding-group tables \
-                 this gate doesn't build yet",
-                case.arch,
-                case.stem,
-                elems.iter().collect::<std::collections::BTreeSet<_>>()
-            );
-            return;
-        }
-        let kv = unsafe {
+        // Hybrid KV (gemma4 SWA): the SAME shared layout the worker builds —
+        // `compute_hybrid_kv_layout` over per-layer page proxies
+        // (`per_layer_kv_token_elems`, head_size 1 — only the ratio drives
+        // grouping), then the pool with `layer_to_tensor` sharing and the
+        // group layout attached. Uniform models (`per_layer == None`) keep
+        // the one-tensor-per-layer pool, byte-identical to before.
+        let hybrid: Option<scratchy_core_config::HybridKvLayout> = per_layer.as_ref().and_then(|elems| {
+            let max_e = *elems.iter().max()?;
+            let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
+                .iter()
+                .map(|&e| scratchy_core_config::LayerKvGeometry {
+                    is_sliding: e == max_e,
+                    // Page proxy: head_size 1 keeps the per-class page RATIO.
+                    num_kv_heads: e,
+                    head_size: 1,
+                    head_size_v: None,
+                    sliding_window: if e == max_e { Some(1) } else { None },
+                })
+                .collect();
+            scratchy_core_config::compute_hybrid_kv_layout(
+                &geom,
+                BLOCK_SIZE,
+                usize::MAX / 2,
+                2, // bf16 elem bytes — only the (ignored) num_blocks read
+            )
+        });
+        let mut kv = unsafe {
             KvCachePool::new_metal_chunked(
                 layers,
                 NUM_BLOCKS,
@@ -255,8 +264,11 @@ mod imp {
                 kv_heads,
                 head_dim,
                 NUM_BLOCKS.max(1),
-                None, // uniform geometry (hybrid deferred above)
-                None, // one tensor per layer
+                // Page-unified elems on the hybrid path (uniform size, so
+                // the pool's default is correct); `None` on the uniform
+                // path too (no per-layer override there).
+                None,
+                hybrid.as_ref().map(|l| l.layer_to_tensor.clone()),
                 DType::BF16,
                 128,        // BLOCKS_PER_CHUNK (metal target const)
                 usize::MAX, // eager: one chunk covers our tokens
@@ -279,6 +291,9 @@ mod imp {
             )
             .expect("KvCachePool::new_metal_chunked")
         };
+        if let Some(layout) = hybrid.as_ref() {
+            kv.set_kv_group_layout(layout.num_groups(), layout.layer_to_group_u32());
+        }
         kv.fill_chunk_tables(|m| m.gpu_address());
 
         // GDN state pool (qwen3-5-style hybrid arches). One slot for our
@@ -346,8 +361,12 @@ mod imp {
         let su_buf = device.alloc_gpu_tensor_from_host(&[seqused_k.len()], DType::U32, unsafe {
             std::slice::from_raw_parts(seqused_k.as_ptr() as *const u8, seqused_k.len() * 4)
         });
+        // Row stride = NUM_BLOCKS: the pool is built with
+        // `max_blocks_per_seq = NUM_BLOCKS.max(1)`, and the macro bakes the
+        // kernel's MAX_BLOCKS_PER_SEQ from that same pool value — so host
+        // stride == kernel stride by construction (the worker's own rule).
         let bt_buf = device.alloc_gpu_tensor_from_host(
-            &[1, max_blocks],
+            &[1, NUM_BLOCKS],
             DType::U32,
             unsafe {
                 std::slice::from_raw_parts(
@@ -365,6 +384,45 @@ mod imp {
                 std::slice::from_raw_parts(lti.as_ptr() as *const u8, 4)
             });
 
+        // Sliding KV-cache groups (gemma4 SWA), the worker's encoding: group
+        // 0 (full) keeps the dumped slot_mapping/block_table (identity block
+        // ids; the page-unified full_block_size encoding of identity ids
+        // agrees with the oracle's base-BLOCK_SIZE identity slots — both are
+        // just abs_pos); each sliding group gets its OWN block-id range past
+        // the full group's (the groups SHARE the pool's physical tensors, so
+        // two groups writing the same block id would clobber each other),
+        // encoded with the base BLOCK_SIZE.
+        let mut sliding_sm_views: Vec<scratchy_tensors::TensorView> = Vec::new();
+        let mut sliding_bt_views: Vec<scratchy_tensors::TensorView> = Vec::new();
+        if let Some(layout) = hybrid.as_ref() {
+            let full_bs = layout.full_block_size().max(1);
+            let full_blocks = n.div_ceil(full_bs);
+            let slide_blocks = n.div_ceil(BLOCK_SIZE);
+            for s in 0..(layout.num_groups() - 1) {
+                // This group's block ids: [full_blocks + s*slide_blocks, …).
+                let base = full_blocks + s * slide_blocks;
+                // slot_mapping[t] = block_ids[abs/bs]*bs + abs%bs.
+                let sm: Vec<u32> = (0..n)
+                    .map(|t| ((base + t / BLOCK_SIZE) * BLOCK_SIZE + t % BLOCK_SIZE) as u32)
+                    .collect();
+                let sm_buf = device.alloc_gpu_tensor_from_host(&[n], DType::U32, unsafe {
+                    std::slice::from_raw_parts(sm.as_ptr() as *const u8, n * 4)
+                });
+                sliding_sm_views.push(unsafe { sm_buf.as_view() });
+                // block_table[logical_b] = physical id, same row stride as
+                // the full table (the kernel's MAX_BLOCKS_PER_SEQ).
+                let bt: Vec<u32> = (0..NUM_BLOCKS).map(|b| (base + b) as u32).collect();
+                let bt_buf = device.alloc_gpu_tensor_from_host(
+                    &[1, NUM_BLOCKS],
+                    DType::U32,
+                    unsafe {
+                        std::slice::from_raw_parts(bt.as_ptr() as *const u8, NUM_BLOCKS * 4)
+                    },
+                );
+                sliding_bt_views.push(unsafe { bt_buf.as_view() });
+            }
+        }
+
         let ctx = ForwardCtx {
             input_ids: unsafe { ids_buf.as_view() },
             positions: unsafe { pos_buf.as_view() },
@@ -373,8 +431,8 @@ mod imp {
             seqused_k: unsafe { su_buf.as_view() },
             span_ids: None,
             block_table: unsafe { bt_buf.as_view() },
-            sliding_slot_mappings: Vec::new(),
-            sliding_block_tables: Vec::new(),
+            sliding_slot_mappings: sliding_sm_views,
+            sliding_block_tables: sliding_bt_views,
             max_seqlen_q: n,
             max_seqlen_k: n,
             kv_cache: &kv,
