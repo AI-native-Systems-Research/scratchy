@@ -112,7 +112,7 @@ mod tests {
     use crate::config::{self, ModelParams};
     use crate::fuf::unroll;
     use crate::impl_lib::starter_library;
-    use crate::parse::parse_block;
+    use crate::parse_python::parse_body;
     use crate::schedule::schedule_workloads;
     use crate::shape::infer;
     use crate::solver::solve;
@@ -132,27 +132,26 @@ mod tests {
         from_profile_def(&scratchy_target_cuda::targets::L4_SM89)
     }
 
-    const LLAMA_BODY: &str = r#"
-        hidden_states = embed(input_ids, embed_tokens);
-        for layer in 0..num_hidden_layers {
-            normed = rmsnorm(hidden_states, input_layernorm[layer]);
-            q = gemm(normed, self_attn.q_proj[layer]);
-            k = gemm(normed, self_attn.k_proj[layer]);
-            v = gemm(normed, self_attn.v_proj[layer]);
-            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-            attn = attention(q, k, v, kv_cache[layer], block_table);
-            oproj = gemm(attn, self_attn.o_proj[layer]);
-            hidden_states = add(oproj, hidden_states);
+    const LLAMA_BODY: &str = "
+        hidden_states = embed(input_ids, embed_tokens)
+        for layer in range(num_hidden_layers):
+            normed = rmsnorm(hidden_states, input_layernorm[layer])
+            q = gemm(normed, self_attn.q_proj[layer])
+            k = gemm(normed, self_attn.k_proj[layer])
+            v = gemm(normed, self_attn.v_proj[layer])
+            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+            attn = attention(q, k, v, kv_cache[layer], block_table)
+            oproj = gemm(attn, self_attn.o_proj[layer])
+            hidden_states = add(oproj, hidden_states)
 
-            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-            gate = silu(gemm(normed2, mlp.gate_proj[layer]));
-            up = gemm(normed2, mlp.up_proj[layer]);
-            down = gemm(gate * up, mlp.down_proj[layer]);
-            hidden_states = add(down, hidden_states);
-        }
-        normed = rmsnorm(hidden_states, norm);
-        logits = gemm(normed, lm_head);
-    "#;
+            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer])
+            gate = silu(gemm(normed2, mlp.gate_proj[layer]))
+            up = gemm(normed2, mlp.up_proj[layer])
+            down = gemm(gate * up, mlp.down_proj[layer])
+            hidden_states = add(down, hidden_states)
+        normed = rmsnorm(hidden_states, norm)
+        logits = gemm(normed, lm_head)
+    ";
 
     #[test]
     fn loop_cost_equals_naive_sum_on_serial_chain() {
@@ -164,13 +163,7 @@ mod tests {
         // update the test to match) or the concurrency model's
         // factor-1 identity broke.
         let params = llama_params("llama-3.2-1b");
-        let file: syn::File =
-            syn::parse_str(&format!("fn _c() {{ {LLAMA_BODY} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).unwrap();
+        let ast = parse_body(LLAMA_BODY).unwrap();
         let program = classify(&ast).unwrap();
         let inferred = infer(
             &program,
@@ -212,13 +205,7 @@ mod tests {
     #[test]
     fn loop_cost_us_is_deterministic() {
         let params = llama_params("llama-3.2-1b");
-        let file: syn::File =
-            syn::parse_str(&format!("fn _c() {{ {LLAMA_BODY} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).unwrap();
+        let ast = parse_body(LLAMA_BODY).unwrap();
         let program = classify(&ast).unwrap();
         let inferred = infer(
             &program,
@@ -263,13 +250,7 @@ mod tests {
     #[test]
     fn refresh_predicted_us_overwrites_in_place() {
         let params = llama_params("llama-3.2-1b");
-        let file: syn::File =
-            syn::parse_str(&format!("fn _c() {{ {LLAMA_BODY} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).unwrap();
+        let ast = parse_body(LLAMA_BODY).unwrap();
         let program = classify(&ast).unwrap();
         let inferred = infer(
             &program,

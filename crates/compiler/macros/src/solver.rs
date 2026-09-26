@@ -818,7 +818,7 @@ mod tests {
         CostCtx, Handoff, Implementation, ImplementationLibrary, LaunchKind, Layout, MatchInfo,
         Resources, WorkloadConstraint, starter_library,
     };
-    use crate::parse::parse_block;
+    use crate::parse_python::parse_body;
     use crate::shape::infer;
     use crate::target::from_profile_def;
     use std::path::PathBuf;
@@ -837,12 +837,7 @@ mod tests {
     }
 
     fn build(src: &str, params: &ModelParams) -> (Fuf, Inferred) {
-        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).unwrap();
+        let ast = parse_body(src).unwrap();
         let program = classify(&ast).unwrap();
         let inferred = infer(
             &program,
@@ -860,27 +855,26 @@ mod tests {
     /// exercised by `FusedGateUpSiluMulImpl`; if you strip silu/mul
     /// from this body the solver falls back to all-singleton coverage
     /// and the fusion tests below go dead.
-    const LLAMA_BODY: &str = r#"
-        hidden_states = embed(input_ids, embed_tokens);
-        for layer in 0..num_hidden_layers {
-            normed = rmsnorm(hidden_states, input_layernorm[layer]);
-            q = gemm(normed, self_attn.q_proj[layer]);
-            k = gemm(normed, self_attn.k_proj[layer]);
-            v = gemm(normed, self_attn.v_proj[layer]);
-            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-            attn = attention(q, k, v, kv_cache[layer], block_table);
-            oproj = gemm(attn, self_attn.o_proj[layer]);
-            hidden_states = add(oproj, hidden_states);
+    const LLAMA_BODY: &str = "
+        hidden_states = embed(input_ids, embed_tokens)
+        for layer in range(num_hidden_layers):
+            normed = rmsnorm(hidden_states, input_layernorm[layer])
+            q = gemm(normed, self_attn.q_proj[layer])
+            k = gemm(normed, self_attn.k_proj[layer])
+            v = gemm(normed, self_attn.v_proj[layer])
+            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+            attn = attention(q, k, v, kv_cache[layer], block_table)
+            oproj = gemm(attn, self_attn.o_proj[layer])
+            hidden_states = add(oproj, hidden_states)
 
-            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-            gate = silu(gemm(normed2, mlp.gate_proj[layer]));
-            up = gemm(normed2, mlp.up_proj[layer]);
-            down = gemm(gate * up, mlp.down_proj[layer]);
-            hidden_states = add(down, hidden_states);
-        }
-        normed = rmsnorm(hidden_states, norm);
-        logits = gemm(normed, lm_head);
-    "#;
+            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer])
+            gate = silu(gemm(normed2, mlp.gate_proj[layer]))
+            up = gemm(normed2, mlp.up_proj[layer])
+            down = gemm(gate * up, mlp.down_proj[layer])
+            hidden_states = add(down, hidden_states)
+        normed = rmsnorm(hidden_states, norm)
+        logits = gemm(normed, lm_head)
+    ";
 
     const WORKLOAD_POINTS: [u64; 5] = [1, 8, 64, 512, 4096];
 
@@ -1288,13 +1282,7 @@ mod tests {
     }
 
     fn classify_program(src: &str) -> crate::classified::Program {
-        let file: syn::File =
-            syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse carrier");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = crate::parse::parse_block(block).unwrap();
+        let ast = parse_body(src).unwrap();
         crate::classify::classify(&ast).unwrap()
     }
 
@@ -1529,13 +1517,12 @@ mod tests {
 
         let params = llama_params("llama-3.2-1b");
         let (fuf, inferred) = build(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..2 {
-                hidden_states = add(hidden_states, hidden_states);
-                hidden_states = add(hidden_states, hidden_states);
-            }
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(2):
+                hidden_states = add(hidden_states, hidden_states)
+                hidden_states = add(hidden_states, hidden_states)
+            ",
             &params,
         );
         let target = l4_target();
@@ -1578,32 +1565,30 @@ mod tests {
     /// Exercises [`FusedGateUpGeluMulImpl`], both
     /// [`SlidingAttentionViaCacheImpl`] variants (decode + prefill),
     /// and [`TanhSoftCapImpl`] through the real solver.
-    const GEMMA_LIKE_BODY: &str = r#"
-        hidden_states = embed(input_ids, embed_tokens);
-        for layer in 0..num_hidden_layers {
-            normed = rmsnorm(hidden_states, input_layernorm[layer]);
-            q = gemm(normed, self_attn.q_proj[layer]);
-            k = gemm(normed, self_attn.k_proj[layer]);
-            v = gemm(normed, self_attn.v_proj[layer]);
-            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-            if layer % 2 == 0 {
-                attn = attention(q, k, v, kv_cache[layer], block_table);
-            } else {
-                attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
-            }
-            oproj = gemm(attn, self_attn.o_proj[layer]);
-            hidden_states = add(oproj, hidden_states);
+    const GEMMA_LIKE_BODY: &str = "
+        hidden_states = embed(input_ids, embed_tokens)
+        for layer in range(num_hidden_layers):
+            normed = rmsnorm(hidden_states, input_layernorm[layer])
+            q = gemm(normed, self_attn.q_proj[layer])
+            k = gemm(normed, self_attn.k_proj[layer])
+            v = gemm(normed, self_attn.v_proj[layer])
+            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer])
+            if layer % 2 == 0:
+                attn = attention(q, k, v, kv_cache[layer], block_table)
+            else:
+                attn = sliding_attention(q, k, v, kv_cache[layer], block_table)
+            oproj = gemm(attn, self_attn.o_proj[layer])
+            hidden_states = add(oproj, hidden_states)
 
-            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-            gate = gelu(gemm(normed2, mlp.gate_proj[layer]));
-            up = gemm(normed2, mlp.up_proj[layer]);
-            down = gemm(gate * up, mlp.down_proj[layer]);
-            hidden_states = add(down, hidden_states);
-        }
-        normed = rmsnorm(hidden_states, norm);
-        logits = gemm(normed, lm_head);
-        capped = tanh_softcap(logits);
-    "#;
+            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer])
+            gate = gelu(gemm(normed2, mlp.gate_proj[layer]))
+            up = gemm(normed2, mlp.up_proj[layer])
+            down = gemm(gate * up, mlp.down_proj[layer])
+            hidden_states = add(down, hidden_states)
+        normed = rmsnorm(hidden_states, norm)
+        logits = gemm(normed, lm_head)
+        capped = tanh_softcap(logits)
+    ";
 
     /// Llama-3.2-1B's numeric bounds + the Gemma-convention fields a
     /// body using `sliding_attention` / `tanh_softcap` requires. No

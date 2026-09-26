@@ -8,8 +8,8 @@
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::too_many_arguments)]
 //! Model architectures — ONE crate (the per-arch crates collapsed).
-//! `build.rs` drives the #[forward] pipeline per arch (from `<arch>/forward.rs.in`
-//! against `<arch>/configs`) into `$OUT_DIR/<mod>.rs`; each is wrapped in a
+//! `build.rs` drives the forward pipeline per arch (from `dsl/<arch>.py`
+//! against `configs/<arch>`) into `$OUT_DIR/<mod>.rs`; each is wrapped in a
 //! `pub mod <arch>` here. Runtime discovery is via the emitted
 //! `inventory::submit!` (see `scratchy_forward_compiler`), so a consumer just
 //! `extern crate scratchy_models as _;` to force-link the whole crate — no

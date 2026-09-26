@@ -618,6 +618,19 @@ inline float rope_norm_rms_256(
             local_sum += val * val;
         }
         scratch[d] = local_sum;
+        // The standalone 256-thread kernel writes shared_sum[tid] = 0
+        // for every tid >= n (its strided loop is empty), so its tree
+        // reduction sums exact zeros in the tail lanes. This kernel
+        // dispatches only HEAD_DIM threads, so on head_dim < 256 the
+        // lanes [n, 256) would otherwise hold uninitialized threadgroup
+        // memory through the whole reduction — garbage rms, NaN output.
+        // Zero them with the threads that exist (n == the threadgroup
+        // width at every call site), keeping the summed values — and
+        // therefore the f32 arithmetic — bit-identical to the
+        // standalone kernel's.
+        for (uint s = n + d; s < 256u; s += n) {
+            scratch[s] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = 128u; stride > 0u; stride >>= 1) {

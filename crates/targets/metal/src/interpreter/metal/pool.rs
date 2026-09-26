@@ -2469,6 +2469,43 @@ mod tests {
         assert_eq!(pool.available(), 1);
     }
 
+    /// A bucket spec with NO baked tape variants (what the macro emits
+    /// for a canonical the front end refused — dense MoE on metal) must
+    /// refuse pool construction with `BucketLower`, NOT build a pool
+    /// whose forward runs a no-op dispatch and whose tail then panics on
+    /// `arena[terminal_slot]` index-OOB. Pins the documented refusal
+    /// contract: "the POOL refuses at load".
+    #[test]
+    fn for_buckets_refuses_bucket_with_no_tape_variants() {
+        let specs = [MetalBucketSpec {
+            bucket_m: 1,
+            backbone_tape_index: 0,
+            lm_head_tape_index: 1,
+            num_arena_slots: 2,
+            terminal_slot: 1,
+            arena_bytes: TEST_ARENA_BYTES,
+            backbone: EMPTY_BACKBONE,
+            lm_head: EMPTY_LM_HEAD,
+            backbone_barriers: EMPTY_BARRIERS,
+            lm_head_barriers: EMPTY_BARRIERS,
+            tapes: &[],
+        }];
+        let Some(res) = build_via_for_buckets(&specs, 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        match res {
+            Err(PoolBuildError::BucketLower { bucket_m, .. }) => {
+                assert_eq!(bucket_m, 1, "refusal names the offending bucket");
+            }
+            Err(other) => panic!("expected BucketLower, got Err({other})"),
+            Ok(_) => panic!(
+                "expected BucketLower, got Ok(_) — a variant-less bucket built a pool; \
+                 its forward would no-op and its tail would panic on arena index-OOB"
+            ),
+        }
+    }
+
     /// Two empty buckets — verifies pick_bucket sees both
     /// `bucket_m`s and the constructor preserves spec order via
     /// `Arc<[…]>`.

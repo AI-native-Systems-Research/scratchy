@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Render an emitted token stream to the text rustc will read.
 //!
-//! The other half of the build-script contract (`compile_in_dir` produces
+//! The other half of the build-script contract (`compile_carrier` produces
 //! the tokens, this writes them). Nothing here is for a human: the emit is
 //! machine-read and 78 MB for a single llama stem. What rustc DOES care
 //! about is LINE STRUCTURE — `TokenStream::to_string()` yields one 77 MB

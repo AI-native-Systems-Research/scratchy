@@ -21,32 +21,37 @@ default = []
 
 # Per-arch gates. `arch-<name>` compiles that arch's `pub mod <name>` and tells
 # the build script to emit it. Vision arches also pull their shared text decoder + the
-# vision host crate. (The build script scans dsl/*.rs.in.)
+# vision host crate. (The build script scans dsl/*.py.)
 arch-commandr = []
 arch-deepseek-v2 = []
 arch-deepseek-v3 = []
 arch-deepseek-v3-flat = []
 arch-gemma2 = []
 arch-gemma3 = []
-arch-gemma3-mm = ["arch-gemma3", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-gemma3-mm = ["arch-gemma3", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-gemma4 = []
 arch-gemma4-moe = []
 arch-granite = []
 arch-llama = []
-arch-locateanything = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-locateanything = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-mistral = []
 arch-mixtral = []
 arch-modernbert = []
 arch-phi3 = []
 arch-qwen2 = []
-arch-qwen2-5-vl = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen2-5-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen2-moe = []
-arch-qwen2-vl = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen2-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen3 = []
 arch-qwen3-5 = []
 arch-qwen3-5-moe = []
-arch-qwen3-5-vl = ["arch-qwen3-5", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen3-5-vl = ["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen3-moe = []
+
+# Passthrough so the carrier-parity test can cfg-gate its vision arm on the
+# compiler's vision registry being compiled in (any arch-<X>-vl feature
+# enables it; nothing else does).
+vision = ["scratchy-forward-compiler/vision"]
 
 all-arches = [
     "arch-commandr",
@@ -103,10 +108,12 @@ all-arches = [
 # module.
 # commandr (2 configs)
 "c4ai-command-r-v01" = ["arch-commandr"]
+"c4ai-command-r-v01-parity-tiny" = ["arch-commandr"]
 "command-r-1-layer" = ["arch-commandr"]
 
 # deepseek-v2 (1 configs)
 "deepseek-v2-lite" = ["arch-deepseek-v2"]
+"deepseek-v2-lite-parity-tiny" = ["arch-deepseek-v2"]
 
 # deepseek-v3 (4 configs)
 "deepseek-v3-academic-9b-fp8-block" = ["arch-deepseek-v3"]
@@ -120,10 +127,12 @@ all-arches = [
 
 # gemma2 (3 configs)
 "gemma2-27b" = ["arch-gemma2"]
+"gemma2-27b-parity-tiny" = ["arch-gemma2"]
 "gemma2-2b" = ["arch-gemma2"]
 "gemma2-9b" = ["arch-gemma2"]
 
 # gemma3 (4 configs)
+"gemma-3-12b-it-parity-tiny" = ["arch-gemma3"]
 "gemma-3-12b-it-text-only" = ["arch-gemma3"]
 "gemma-3-1b-it" = ["arch-gemma3"]
 "gemma-3-27b-it-text-only" = ["arch-gemma3"]
@@ -133,17 +142,21 @@ all-arches = [
 "gemma-3-12b-it" = ["arch-gemma3-mm"]
 "gemma-3-27b-it" = ["arch-gemma3-mm"]
 "gemma-3-4b-it" = ["arch-gemma3-mm"]
+"gemma-3-4b-it-parity-tiny" = ["arch-gemma3-mm"]
 
 # gemma4 (2 configs)
 "gemma-4-12b-it" = ["arch-gemma4"]
+"gemma-4-12b-it-parity-tiny" = ["arch-gemma4"]
 "gemma-4-31b-it" = ["arch-gemma4"]
 
 # gemma4-moe (2 configs)
 "gemma-4-26b-a4b-it-optiq" = ["arch-gemma4-moe"]
 "gemma-4-26b-a4b-it" = ["arch-gemma4-moe"]
+"gemma-4-26b-a4b-it-parity-tiny" = ["arch-gemma4-moe"]
 
 # granite (21 configs)
 "granite-3.0-2b-base" = ["arch-granite"]
+"granite-3.0-2b-base-parity-tiny" = ["arch-granite"]
 "granite-3.0-2b-instruct" = ["arch-granite"]
 "granite-3.0-8b-base" = ["arch-granite"]
 "granite-3.0-8b-instruct" = ["arch-granite"]
@@ -167,6 +180,7 @@ all-arches = [
 
 # llama (12 configs)
 "llama-2-13b" = ["arch-llama"]
+"llama-2-13b-parity-tiny" = ["arch-llama"]
 "llama-2-70b" = ["arch-llama"]
 "llama-2-7b" = ["arch-llama"]
 "llama-3-70b" = ["arch-llama"]
@@ -181,22 +195,27 @@ all-arches = [
 
 # locateanything (1 configs)
 "locateanything-3b" = ["arch-locateanything"]
+"locateanything-3b-parity-tiny" = ["arch-locateanything"]
 
 # mistral (3 configs)
 "mistral-7b-instruct-v0.3" = ["arch-mistral"]
+"mistral-7b-instruct-v0.3-parity-tiny" = ["arch-mistral"]
 "mistral-7b-v0.2" = ["arch-mistral"]
 "mistral-nemo-instruct-2407" = ["arch-mistral"]
 
 # mixtral (2 configs)
 "mixtral-1-layer" = ["arch-mixtral"]
+"mixtral-1-layer-parity-tiny" = ["arch-mixtral"]
 "mixtral-8x7b-instruct-v0.1" = ["arch-mixtral"]
 
 # modernbert (2 configs)
 "modernbert-base-1-layer" = ["arch-modernbert"]
+"modernbert-base-1-layer-parity-tiny" = ["arch-modernbert"]
 "modernbert-base" = ["arch-modernbert"]
 
 # phi3 (10 configs)
 "phi-3-5-mini-instruct" = ["arch-phi3"]
+"phi-3-5-mini-instruct-parity-tiny" = ["arch-phi3"]
 "phi-3-medium-128k-instruct" = ["arch-phi3"]
 "phi-3-medium-4k-instruct" = ["arch-phi3"]
 "phi-3-mini-128k-instruct" = ["arch-phi3"]
@@ -213,6 +232,7 @@ all-arches = [
 "qwen2-1.5b" = ["arch-qwen2"]
 "qwen2-72b" = ["arch-qwen2"]
 "qwen2-7b" = ["arch-qwen2"]
+"qwen2-7b-parity-tiny" = ["arch-qwen2"]
 "qwen2-vl-2b-mlx-text-only" = ["arch-qwen2"]
 "qwen2-vl-2b" = ["arch-qwen2"]
 "qwen2.5-0.5b" = ["arch-qwen2"]
@@ -227,20 +247,24 @@ all-arches = [
 
 # qwen2-5-vl (4 configs)
 "qwen2.5-vl-3b-instruct" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-3b-instruct-parity-tiny" = ["arch-qwen2-5-vl"]
 "qwen2.5-vl-3b-mlx" = ["arch-qwen2-5-vl"]
 "qwen2.5-vl-72b-instruct" = ["arch-qwen2-5-vl"]
 "qwen2.5-vl-7b-instruct" = ["arch-qwen2-5-vl"]
 
 # qwen2-moe (1 configs)
 "slimed-qwen-3" = ["arch-qwen2-moe"]
+"slimed-qwen-3-parity-tiny" = ["arch-qwen2-moe"]
 
 # qwen2-vl (4 configs)
 "qwen2-vl-2b-instruct" = ["arch-qwen2-vl"]
+"qwen2-vl-2b-instruct-parity-tiny" = ["arch-qwen2-vl"]
 "qwen2-vl-2b-mlx" = ["arch-qwen2-vl"]
 "qwen2-vl-72b-instruct" = ["arch-qwen2-vl"]
 "qwen2-vl-7b-instruct" = ["arch-qwen2-vl"]
 
 # qwen3 (5 configs)
+"qwen3-0.6b-parity-tiny" = ["arch-qwen3"]
 "qwen3-0.6b-bnb-4bit" = ["arch-qwen3"]
 "qwen3-0.6b" = ["arch-qwen3"]
 "qwen3-1.7b" = ["arch-qwen3"]
@@ -249,27 +273,33 @@ all-arches = [
 
 # qwen3-5 (2 configs)
 "qwen3.5-0.8b" = ["arch-qwen3-5"]
+"qwen3.5-0.8b-parity-tiny" = ["arch-qwen3-5"]
 "qwen3.5-9b-text-only" = ["arch-qwen3-5"]
 
 # qwen3-5-moe (2 configs)
 "qwen3.5-35b-a3b-optiq" = ["arch-qwen3-5-moe"]
 "qwen3.5-35b-a3b" = ["arch-qwen3-5-moe"]
+"qwen3.5-35b-a3b-parity-tiny" = ["arch-qwen3-5-moe"]
 
 # qwen3-5-vl (1 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
+"qwen3.5-9b-parity-tiny" = ["arch-qwen3-5-vl"]
 
 # qwen3-moe (2 configs)
 "qwen3-30b-a3b-instruct-2507" = ["arch-qwen3-moe"]
+"qwen3-30b-a3b-instruct-2507-parity-tiny" = ["arch-qwen3-moe"]
 "qwen3-moe-1-layer" = ["arch-qwen3-moe"]
 
 # `<arch>` (bare arch name) — every checked-in config for that one arch,
 # i.e. `model/granite` is shorthand for "all granite models".
 "commandr" = [
     "c4ai-command-r-v01",
+    "c4ai-command-r-v01-parity-tiny",
     "command-r-1-layer",
 ]
 "deepseek-v2" = [
     "deepseek-v2-lite",
+    "deepseek-v2-lite-parity-tiny",
 ]
 "deepseek-v3" = [
     "deepseek-v3-academic-9b-fp8-block",
@@ -283,10 +313,12 @@ all-arches = [
 ]
 "gemma2" = [
     "gemma2-27b",
+    "gemma2-27b-parity-tiny",
     "gemma2-2b",
     "gemma2-9b",
 ]
 "gemma3" = [
+    "gemma-3-12b-it-parity-tiny",
     "gemma-3-12b-it-text-only",
     "gemma-3-1b-it",
     "gemma-3-27b-it-text-only",
@@ -296,17 +328,21 @@ all-arches = [
     "gemma-3-12b-it",
     "gemma-3-27b-it",
     "gemma-3-4b-it",
+    "gemma-3-4b-it-parity-tiny",
 ]
 "gemma4" = [
     "gemma-4-12b-it",
+    "gemma-4-12b-it-parity-tiny",
     "gemma-4-31b-it",
 ]
 "gemma4-moe" = [
     "gemma-4-26b-a4b-it-optiq",
     "gemma-4-26b-a4b-it",
+    "gemma-4-26b-a4b-it-parity-tiny",
 ]
 "granite" = [
     "granite-3.0-2b-base",
+    "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",
     "granite-3.0-8b-base",
     "granite-3.0-8b-instruct",
@@ -330,6 +366,7 @@ all-arches = [
 ]
 "llama" = [
     "llama-2-13b",
+    "llama-2-13b-parity-tiny",
     "llama-2-70b",
     "llama-2-7b",
     "llama-3-70b",
@@ -344,22 +381,27 @@ all-arches = [
 ]
 "locateanything" = [
     "locateanything-3b",
+    "locateanything-3b-parity-tiny",
 ]
 "mistral" = [
     "mistral-7b-instruct-v0.3",
+    "mistral-7b-instruct-v0.3-parity-tiny",
     "mistral-7b-v0.2",
     "mistral-nemo-instruct-2407",
 ]
 "mixtral" = [
     "mixtral-1-layer",
+    "mixtral-1-layer-parity-tiny",
     "mixtral-8x7b-instruct-v0.1",
 ]
 "modernbert" = [
     "modernbert-base-1-layer",
+    "modernbert-base-1-layer-parity-tiny",
     "modernbert-base",
 ]
 "phi3" = [
     "phi-3-5-mini-instruct",
+    "phi-3-5-mini-instruct-parity-tiny",
     "phi-3-medium-128k-instruct",
     "phi-3-medium-4k-instruct",
     "phi-3-mini-128k-instruct",
@@ -387,23 +429,28 @@ all-arches = [
     "qwen2.5-7b",
     "qwen2.5-vl-3b-mlx-text-only",
     "qwen2.5-vl-3b",
+    "qwen2-7b-parity-tiny",
 ]
 "qwen2-5-vl" = [
     "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-instruct-parity-tiny",
     "qwen2.5-vl-3b-mlx",
     "qwen2.5-vl-72b-instruct",
     "qwen2.5-vl-7b-instruct",
 ]
 "qwen2-moe" = [
     "slimed-qwen-3",
+    "slimed-qwen-3-parity-tiny",
 ]
 "qwen2-vl" = [
     "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-instruct-parity-tiny",
     "qwen2-vl-2b-mlx",
     "qwen2-vl-72b-instruct",
     "qwen2-vl-7b-instruct",
 ]
 "qwen3" = [
+    "qwen3-0.6b-parity-tiny",
     "qwen3-0.6b-bnb-4bit",
     "qwen3-0.6b",
     "qwen3-1.7b",
@@ -412,25 +459,31 @@ all-arches = [
 ]
 "qwen3-5" = [
     "qwen3.5-0.8b",
+    "qwen3.5-0.8b-parity-tiny",
     "qwen3.5-9b-text-only",
 ]
 "qwen3-5-moe" = [
     "qwen3.5-35b-a3b-optiq",
     "qwen3.5-35b-a3b",
+    "qwen3.5-35b-a3b-parity-tiny",
 ]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
+    "qwen3.5-9b-parity-tiny",
 ]
 "qwen3-moe" = [
     "qwen3-30b-a3b-instruct-2507",
+    "qwen3-30b-a3b-instruct-2507-parity-tiny",
     "qwen3-moe-1-layer",
 ]
 # `all` — every checked-in config, every arch (CI's full-scope build);
 # reached as `model/all` from scratchy-cli.
 all = [
     "c4ai-command-r-v01",
+    "c4ai-command-r-v01-parity-tiny",
     "command-r-1-layer",
     "deepseek-v2-lite",
+    "deepseek-v2-lite-parity-tiny",
     "deepseek-v3-academic-9b-fp8-block",
     "deepseek-v3-academic-9b",
     "deepseek-v3-tiny",
@@ -438,8 +491,10 @@ all = [
     "moonlight-16b-a3b-instruct-fp8-block",
     "moonlight-16b-a3b-instruct",
     "gemma2-27b",
+    "gemma2-27b-parity-tiny",
     "gemma2-2b",
     "gemma2-9b",
+    "gemma-3-12b-it-parity-tiny",
     "gemma-3-12b-it-text-only",
     "gemma-3-1b-it",
     "gemma-3-27b-it-text-only",
@@ -447,11 +502,15 @@ all = [
     "gemma-3-12b-it",
     "gemma-3-27b-it",
     "gemma-3-4b-it",
+    "gemma-3-4b-it-parity-tiny",
     "gemma-4-12b-it",
+    "gemma-4-12b-it-parity-tiny",
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it-optiq",
     "gemma-4-26b-a4b-it",
+    "gemma-4-26b-a4b-it-parity-tiny",
     "granite-3.0-2b-base",
+    "granite-3.0-2b-base-parity-tiny",
     "granite-3.0-2b-instruct",
     "granite-3.0-8b-base",
     "granite-3.0-8b-instruct",
@@ -473,7 +532,7 @@ all = [
     "granite-4.1-8b",
     "micro-g3.3-8b-instruct-1b",
     "llama-2-13b",
-    "llama-2-70b",
+    "llama-2-13b-parity-tiny",
     "llama-2-7b",
     "llama-3-70b",
     "llama-3-8b",
@@ -485,14 +544,18 @@ all = [
     "smollm2-360m",
     "tinyllama-1.1b",
     "locateanything-3b",
+    "locateanything-3b-parity-tiny",
     "mistral-7b-instruct-v0.3",
-    "mistral-7b-v0.2",
+    "mistral-7b-instruct-v0.3-parity-tiny",
     "mistral-nemo-instruct-2407",
     "mixtral-1-layer",
+    "mixtral-1-layer-parity-tiny",
     "mixtral-8x7b-instruct-v0.1",
     "modernbert-base-1-layer",
+    "modernbert-base-1-layer-parity-tiny",
     "modernbert-base",
     "phi-3-5-mini-instruct",
+    "phi-3-5-mini-instruct-parity-tiny",
     "phi-3-medium-128k-instruct",
     "phi-3-medium-4k-instruct",
     "phi-3-mini-128k-instruct",
@@ -518,26 +581,35 @@ all = [
     "qwen2.5-7b",
     "qwen2.5-vl-3b-mlx-text-only",
     "qwen2.5-vl-3b",
+    "qwen2-7b-parity-tiny",
     "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-instruct-parity-tiny",
     "qwen2.5-vl-3b-mlx",
     "qwen2.5-vl-72b-instruct",
     "qwen2.5-vl-7b-instruct",
     "slimed-qwen-3",
+    "slimed-qwen-3-parity-tiny",
     "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-instruct-parity-tiny",
     "qwen2-vl-2b-mlx",
     "qwen2-vl-72b-instruct",
     "qwen2-vl-7b-instruct",
+    "qwen3-0.6b-parity-tiny",
     "qwen3-0.6b-bnb-4bit",
     "qwen3-0.6b",
     "qwen3-1.7b",
     "qwen3-4b",
     "qwen3-8b",
     "qwen3.5-0.8b",
+    "qwen3.5-0.8b-parity-tiny",
     "qwen3.5-9b-text-only",
     "qwen3.5-35b-a3b-optiq",
     "qwen3.5-35b-a3b",
+    "qwen3.5-35b-a3b-parity-tiny",
     "qwen3.5-9b",
+    "qwen3.5-9b-parity-tiny",
     "qwen3-30b-a3b-instruct-2507",
+    "qwen3-30b-a3b-instruct-2507-parity-tiny",
     "qwen3-moe-1-layer",
 ]
 
@@ -616,10 +688,8 @@ scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
 # `quant-<preset>` block above — quant scope moved off this crate so it can
 # get its own `quant` CLI alias, distinct from `model`).
 scratchy-quantizations = { path = "../quantization" }
-# `syn` parses the DSL carrier (`dsl/<arch>.rs.in`). It is NOT used to render
-# the emit — `render_lines` walks the token stream directly, so the emitted file
-# never round-trips through an AST (see scratchy-forwards.rs for the numbers).
-syn = { version = "3", features = ["full", "parsing"] }
+# `proc-macro2` for the token re-rooting. The emitted file never
+# round-trips through an AST (see scratchy-forwards.rs for the numbers).
 proc-macro2 = "1"
 serde_json = { workspace = true }
 # Emit arches in parallel (scratchy-forwards.rs), nested with the pipeline's own
@@ -636,3 +706,22 @@ ureq = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3", features = ["MTLDevice"] }
+# bf16 logits readback in the qwen3 py-carrier parity test
+# (tests/qwen3_py_parity.rs).
+half = { workspace = true }
+# harness.json / checkpoint config.json reads + ForwardCtxHandle /
+# ForwardDeviceHandle in the universal carrier parity gate
+# (tests/carrier_parity.rs). compute_hybrid_kv_layout (shared with the
+# worker) builds gemma4-style hybrid KV pools in the same gate.
+scratchy-core-config = { workspace = true }
+serde_json = { workspace = true }
+scratchy-tensors = { path = "../../tensors" }
+
+# The qwen3 py-parity test drives the real HF snapshot for the full
+# `qwen3-0.6b` stem directly (module path + goldens), so it only builds
+# when that stem is in scope. The universal gate (tests/carrier_parity.rs)
+# has no such requirement — it skips arches the build doesn't scope in.
+[[test]]
+name = "qwen3_py_parity"
+required-features = ["qwen3-0.6b"]
+

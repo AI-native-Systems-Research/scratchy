@@ -3844,6 +3844,7 @@ dependencies = [
  "objc2-metal",
  "proc-macro2",
  "rayon",
+ "scratchy-core-config",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
@@ -3851,9 +3852,9 @@ dependencies = [
  "scratchy-target-cuda",
  "scratchy-target-metal",
  "scratchy-target-spyre",
+ "scratchy-tensors",
  "scratchy-vision",
  "serde_json",
- "syn 3.0.4",
  "ureq 3.4.2",
 ]
 
