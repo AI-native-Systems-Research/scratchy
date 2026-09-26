@@ -95,6 +95,9 @@ TINY_BOUNDS = {
     "n_shared_experts": 1,
     "linear_num_value_heads": 4,
     "linear_num_key_heads": 2,
+    # gemma3-mm hides the text side under text_config — the projector's
+    # d_model reads it, so it shrinks too.
+    "text_config.hidden_size": 64,
     "vision_config.hidden_size": 64,
     "vision_config.embed_dim": 64,
     "vision_config.intermediate_size": 128,
@@ -111,11 +114,16 @@ TINY_BOUNDS = {
     "vision_config.num_hidden_layers": 2,
     "vision_config.num_attention_heads": 4,
     "vision_config.mlp_ratio": 2,
-    "vision_config.window_size": 8,
+    # Qwen2.5-VL window attention: 56/merge2/patch14 = win_cells 2 — a
+    # REAL window tiling (not whole-grid) at the 16×16-patch grid this
+    # arch's goldens use (--num-tokens 256), so the window permutation
+    # is non-identity and the oracle transcribes the dispatch.
+    "vision_config.window_size": 56,
     # gemma3-mm's pool chain: mm_tokens_per_image (top-level) pairs
-    # with vision_num_positions — keep them equal so the pool factor
-    # stays 1 (kernel 1) after the shrink
-    "mm_tokens_per_image": 16,
+    # with vision_num_positions — 16 positions / 4 pooled tokens =
+    # pool factor 4 → kernel 2, the same >1 pooling class as the real
+    # config (4096/256 = 16 → kernel 4).
+    "mm_tokens_per_image": 4,
 }
 
 
@@ -1508,6 +1516,145 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
     return ckpt_dir
 
 
+def pos_embed_keys_of(carrier_text):
+    """Manifest keys passed as `pos_embed(position_ids, <key>)` —
+    learned lookup tables, verbatim [N, D] on disk (NOT transposed;
+    the macro's pos-embed matcher reads them like embeddings)."""
+    return {m.group(1) for m in re.finditer(
+        r"pos_embed\(\s*position_ids\s*,\s*([A-Za-z_][A-Za-z_0-9.]*)\s*\)", carrier_text)}
+
+
+def write_vision_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, carrier_text):
+    """Vision-tower counterpart of write_checkpoint: same manifest →
+    HF-layout safetensors, but through the VISION path rules
+    (codegen.rs safetensors_prefix's is_vision arm):
+      - layered keys → `<default_root>.<layered_subpath>.{l}.<leaf>`
+      - unlayered keys → `<default_root>.<leaf>`
+      - a first segment mapped in `subtrees` replaces the whole prefix
+        and is unindexed (e.g. `mm.*` → `multi_modal_projector.*`)
+      - digit-suffix translation + weight_leaf_renames, applied BEFORE
+        subtree resolution (same order as codegen)
+    The patch-embed conv weight ships RANK-2 `[E, in_features]` with
+    the k-axis in the pixel pack's (c, t, ph, pw) order — the
+    post-flatten form every `try_load_mm` sniff converges to (the
+    emitted flatten only fires at rank > 2). `raw_linear` manifest
+    kinds (gemma3-mm's matmul-natural `nn.Parameter`) and
+    `pos_embed()` lookup tables are written VERBATIM, no transpose.
+    """
+    from safetensors.torch import save_file
+
+    aj = json.loads((ARCH_DIR / arch / "arch.json").read_text())
+    layout = aj["vision_safetensors_layout"]
+    renames = aj.get("weight_leaf_renames") or {}
+    packed = manifest.get("__packed_splits__") or {}
+    packed_targets = {t for targets in packed.values() for t in targets}
+
+    normalized = {}
+    kinds = {}
+    for key, dims in manifest.items():
+        if key.startswith("__"):
+            continue
+        if isinstance(dims, dict):
+            kinds[key] = dims.get("kind")
+            dims = dims["shape"]
+        normalized[key] = dims
+
+    layered_refs = {m.group(1) for m in re.finditer(
+        r"([A-Za-z_][A-Za-z_0-9.]*)\[", carrier_text)}
+    embed_keys = embed_keys_of(carrier_text)
+    posembed_keys = pos_embed_keys_of(carrier_text)
+
+    def resolve(key):
+        node = trees
+        for p in key.split("."):
+            node = getattr(node, p)
+        return node
+
+    def dsl_to_disk(key):
+        segs = [re.sub(r"_(\d+)$", r".\1", s) for s in key.split(".")]
+        joined = ".".join(segs)
+        for dsl_leaf, disk_leaf in renames.items():
+            if joined == dsl_leaf:
+                return disk_leaf
+            if (head := joined[: -len(dsl_leaf) - 1] if joined.endswith("." + dsl_leaf) else None) is not None:
+                return f"{head}.{disk_leaf}"
+        return joined
+
+    def disk_prefix(key, index):
+        joined = dsl_to_disk(key)
+        segs = joined.split(".")
+        if segs[0] in layout.get("subtrees", {}):
+            rest = segs[1:]
+            disk = layout["subtrees"][segs[0]]
+            return disk if not rest else f"{disk}.{'.'.join(rest)}"
+        if index is not None:
+            return f"{layout['default_root']}.{layout['layered_subpath']}.{index}.{joined}"
+        return f"{layout['default_root']}.{joined}"
+
+    out = {}
+
+    def put(key, tensor):
+        out[key] = tensor.detach().to(torch.bfloat16).contiguous()
+
+    for key, dims in normalized.items():
+        if key in packed_targets:
+            continue
+        node = resolve(key)
+        is_layered = key in layered_refs
+        vals = list(node) if is_layered else [node]
+        for l, w in enumerate(vals):
+            pre = disk_prefix(key, l if is_layered else None)
+            if hasattr(w, "bias") and isinstance(w.bias, torch.Tensor):
+                put(f"{pre}.bias", w.bias)
+            if kinds.get(key) == "raw_linear":
+                # nn.Parameter: `load_raw` reads the disk key VERBATIM —
+                # no `.weight` suffix — matmul-natural, no transpose.
+                put(pre, w)
+            elif w.ndim == 2 and key not in embed_keys \
+                    and key not in posembed_keys:
+                put(f"{pre}.weight", w.T)
+            else:
+                put(f"{pre}.weight", w)
+
+    # Learned pos-embed table (arches declaring `vision_pos_embed_key`):
+    # not part of the manifest — the wrapper captures it host-side via
+    # `gw.tensor_to_f32(key)`. Written VERBATIM (bf16 on disk, exactly
+    # what `put` does) under the declared disk key.
+    pe_table = STATE.get("vision_pos_table")
+    if pe_table is not None:
+        key, table, _ng = pe_table
+        assert key not in out, f"pos-embed table {key} collides with a manifest entry"
+        out[key] = table.detach().to(torch.bfloat16).contiguous()
+
+    # Packed splits (attn.qkv / attn.wqkv): fuse target groups ROW-WISE
+    # into `{prefix}.{parent}.weight` + `.bias` — the loader's
+    # synthesize_packed_row_split_sizes carves them back out.
+    for parent, targets in packed.items():
+        is_layered = any(t in layered_refs for t in targets)
+        l_indices = range(len(list(resolve(targets[0])))) if is_layered else [None]
+        for l in l_indices:
+            packed_rows = []
+            for t in targets:
+                w = resolve(t)
+                w = w[l] if t in layered_refs else w
+                packed_rows.append(w.T)
+            put(f"{disk_prefix(parent, l)}.weight", torch.cat(packed_rows, dim=0))
+            bias_rows = []
+            for t in targets:
+                w = resolve(t)
+                w = w[l] if t in layered_refs else w
+                if hasattr(w, "bias") and isinstance(w.bias, torch.Tensor):
+                    bias_rows.append(w.bias)
+            if bias_rows and len(bias_rows) == len(targets):
+                put(f"{disk_prefix(parent, l)}.bias", torch.cat(bias_rows, dim=0))
+
+    ckpt_dir = out_dir / "checkpoint"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    save_file(out, str(ckpt_dir / "model.safetensors"))
+    (ckpt_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    return ckpt_dir
+
+
 def forward(fn):
     """`@forward` under torch is the identity — the decorator carries
     compile-time metadata only."""
@@ -1539,6 +1686,18 @@ def main():
 
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
+
+    # Vision classification is the CARRIER DECORATOR (parse_python.rs
+    # `PythonCarrier::vision`): `@vision_forward` → vision prelude,
+    # `@forward` → decoder. NOT config-based — qwen3-5 is a @forward
+    # text decoder whose configs nest a `vision_config` for the VL
+    # sibling, and the macro compiles those configs through the
+    # decoder path (text_config hoisted, vision_config ignored).
+    # Read BEFORE the shrink: the ForConditionalGeneration rewrite
+    # below must not fire for vision arches — the MM registry
+    # (`ScratchyMmRegistration`) claims the CondGen string verbatim.
+    carrier = (DSL_DIR / f"{arch}.py").read_text()
+    is_vision = re.search(r"@vision_forward\s*(\(|\n)", carrier) is not None
 
     cfg = load_config(arch, stem)
     if args.tiny:
@@ -1644,11 +1803,14 @@ def main():
         # the baked fingerprint expect `model.language_model.*` while the
         # writer emits `model.*` — a silent fingerprint miss. Arch strings
         # with a declared prefix (qwen3-5: "language_model") stay as-is;
-        # both sides nest consistently.
+        # both sides nest consistently. Vision arches (@vision_forward)
+        # keep the CondGen string — the MM registry claims it verbatim
+        # and the vision loader keys only off the tower's visual.* leaves.
         archs = cfg.get("architectures")
         aj = json.loads((ARCH_DIR / arch / "arch.json").read_text()) \
             if (ARCH_DIR / arch / "arch.json").exists() else {}
-        if isinstance(archs, list) and len(archs) == 1 \
+        if not is_vision \
+                and isinstance(archs, list) and len(archs) == 1 \
                 and isinstance(archs[0], str) \
                 and archs[0].endswith("ForConditionalGeneration") \
                 and not aj.get("decoder_safetensors_prefix"):
@@ -1712,19 +1874,18 @@ def main():
     eval_params(arch, cfg, bounds)
     manifest = json.loads((ARCH_DIR / arch / "weights.json").read_text())
 
-    # Vision classification is the CARRIER DECORATOR (parse_python.rs
-    # `PythonCarrier::vision`): `@vision_forward` → vision prelude,
-    # `@forward` → decoder. NOT config-based — qwen3-5 is a @forward
-    # text decoder whose configs nest a `vision_config` for the VL
-    # sibling, and the macro compiles those configs through the
-    # decoder path (text_config hoisted, vision_config ignored).
-    carrier = (DSL_DIR / f"{arch}.py").read_text()
-    is_vision = re.search(r"@vision_forward\s*(\(|\n)", carrier) is not None
-
     # ── STATE the shims read ──
     STATE["bounds"] = bounds
     STATE["cfg"] = cfg
+    STATE["arch"] = arch
     STATE["rms_eps"] = float(cfg.get("rms_norm_eps", cfg.get("layer_norm_eps", 1e-6)))
+    # Vision block-norm eps (config.rs: explicit flat key → arch-declared
+    # → 1e-6) — the emitted loader bakes it into every vision LayerNorm.
+    if is_vision:
+        aj_eps = json.loads((ARCH_DIR / arch / "arch.json").read_text()) \
+            .get("vision_norm_eps") if (ARCH_DIR / arch / "arch.json").exists() else None
+        STATE["rms_eps"] = float(
+            cfg.get("vision_norm_eps", aj_eps if aj_eps is not None else 1e-6))
     STATE["final_logit_softcapping"] = float(cfg.get("final_logit_softcapping", 0.0) or 30.0)
     # scalar() binding: config.rs extract_scalars — EVERY numeric config
     # field, by name, plus arch scalar_defaults (already merged into cfg).
@@ -1864,6 +2025,10 @@ def main():
 
     if is_vision:
         setup_vision_state(env, cfg, bounds, n, rng)
+        # The carrier reads num_tokens for the merger reshape — the
+        # PATCH count, which setup_vision_state just fixed (grid may
+        # differ from --num-tokens under a patch_grid_side bound).
+        n = env["num_tokens"]
 
     # ── EXECUTE THE CARRIER AS PYTHON ──
     exec(compile(carrier, f"{arch}.py", "exec"), env)
@@ -1893,6 +2058,10 @@ def main():
         dump("freqs", STATE["vision_freqs"])
         dump("cu_seqlens", np.asarray(STATE["vision_cu"], dtype=np.int64))
         dump("pixels", STATE["vision_pixels"])
+        # The RAW image (CHW f32) + geometry — the gate feeds this to the
+        # production `MultimodalForward::vision_forward`, whose own pixel
+        # pack / rope build must reproduce the tables above.
+        dump("image", STATE["vision_image"])
 
     # harness facts the Rust gate needs (no per-arch code on that side)
     harness = {
@@ -1904,9 +2073,28 @@ def main():
         "vision": is_vision,
         "rotary": {k: v["spec"] for k, v in rot_objs.items()},
     }
+    if is_vision:
+        v = {k[7:]: val for k, val in bounds.items() if k.startswith("vision_")}
+        merge = v.get("spatial_merge_size", 1)
+        gt, gh, gw = STATE["vision_grid"]
+        harness["vision_grid"] = {
+            "t": int(gt), "h": int(gh), "w": int(gw),
+            "patch_size": int(v.get("patch_size", 14)),
+            "spatial_merge_size": int(merge),
+            "temporal_patch_size": int(v.get("temporal_patch_size", 1)),
+            "in_chans": int(v.get("in_chans", 3)),
+            "pool_factor": int(v.get("pool_factor", 1)),
+            # output rows after merge (× pool) — the logits row count
+            "n_merged": int(gt * gh * gw // max(1, merge * merge)
+                            // max(1, v.get("pool_factor", 1))),
+        }
     (out_dir / "harness.json").write_text(json.dumps(harness, indent=2))
     (out_dir / "goldens.json").write_text(json.dumps(manifest_out, indent=2))
-    if not is_vision:
+    if is_vision:
+        ckpt = write_vision_checkpoint(
+            out_dir, arch, cfg, manifest, bounds, trees, carrier)
+        print(f"[{arch}/{stem}] vision checkpoint → {ckpt}")
+    else:
         ckpt = write_checkpoint(
             out_dir, arch, cfg, manifest, bounds, trees, depth, carrier)
         print(f"[{arch}/{stem}] checkpoint → {ckpt}")
@@ -1914,37 +2102,224 @@ def main():
 
 
 def setup_vision_state(env, cfg, bounds, n, rng):
-    """Vision ambient tensors: pixels (packed patches), per-token rope
-    freqs, cos/sin, cu_seqlens, pos_embeds. All identity/simple layouts
-    keyed off the vision bounds the arch.json params derive."""
+    """Vision ambient tensors, TRANSCRIBING the production
+    preprocessing (VisionWrapper::vision_forward + scratchy-vision):
+    a raw normalized CHW image → patches_from_normalized_chw's exact
+    (gh, gw, mh, mw, ci, ti, ph, pw) pack with the bf16 round-trip,
+    per-token 2D-rope freqs/cos/sin from build_rope_freqs_f32's
+    block-grouped (hpos, wpos) position logic, one cu_seqlens segment
+    per image. The gate runs the production path over the same raw
+    image (image.bin + grid facts in harness.json), so any divergence
+    between this transcription and the Rust builders IS the finding.
+
+    Geometry: the tower's own patch/merge size, one square grid that
+    yields num_tokens patch rows (`--num-tokens` must be a perfect
+    square; the grid side must be divisible by spatial_merge_size)."""
     v = {k[7:]: val for k, val in bounds.items() if k.startswith("vision_")}
-    in_features = v.get("in_features", v.get("embed_dim", 64) * 4)
+    in_chans = v.get("in_chans", 3)
+    patch = v.get("patch_size", 14)
+    temporal = v.get("temporal_patch_size", 1)
+    merge = v.get("spatial_merge_size", 1)
+    merge_factor = v.get("merge_factor", merge * merge)
     embed_dim = v.get("embed_dim", v.get("hidden_size", 64))
-    head_dim = v.get("head_dim", embed_dim // max(1, v.get("num_heads", 1)))
+    num_heads = v.get("num_heads", v.get("num_attention_heads", 1))
+    head_dim = v.get("head_dim", embed_dim // max(1, num_heads))
     STATE["vision_head_dim"] = head_dim
-    # pixels: [num_tokens, in_features] — one square image, grid side
-    # chosen so tokens = patch_grid^2 (fall back to n)
-    g = v.get("patch_grid_side", int(round(math.sqrt(n))))
-    n_tokens = g * g if v.get("patch_grid_side") else n
-    pixels = torch.from_numpy(rng.standard_normal((n_tokens, in_features)).astype(np.float32))
+
+    # Rope style: arch.json `vision_rope_style` ("interleaved_xy" for
+    # LocateAnything; NeoxHw default — vision_glue.rs rope_style_tokens).
+    aj = json.loads((ARCH_DIR / STATE["arch"] / "arch.json").read_text()) \
+        if (ARCH_DIR / STATE["arch"] / "arch.json").exists() else {}
+    interleaved = aj.get("vision_rope_style") == "interleaved_xy"
+    STATE["vision_interleaved"] = interleaved
+
+    in_features = v.get("in_features", in_chans * temporal * patch * patch)
+
+    # Grid: one square image, grid_side² patches == n. Gemma3-mm's
+    # SigLIP (merge 1) declares patch_grid_side; rotary towers merge
+    # S² patches per token row but the ENCODER runs pre-merge over all
+    # grid_side² patches — L here is the pre-merge patch count.
+    if v.get("patch_grid_side"):
+        g = v["patch_grid_side"]
+    else:
+        r = math.isqrt(n)
+        assert r * r == n, (
+            f"--num-tokens {n} is not a perfect square — the vision "
+            f"grid is square (grid_side² patches)")
+        g = r
+    n_tokens = g * g
+    # The S-divisibility asserts patches_from_normalized_chw enforces.
+    assert g % merge == 0, (
+        f"grid side {g} not divisible by spatial_merge_size {merge}")
+    height = width = g * patch
+
+    # ── raw image + production patch packing ──
+    image = torch.from_numpy(rng.standard_normal(
+        (in_chans, height, width)).astype(np.float32))
+    STATE["vision_image"] = image
+    STATE["vision_grid"] = (temporal, g, g)  # grid_thw (t, grid_h, grid_w)
+    p, s, t, c = patch, merge, temporal, in_chans
+    g_h, g_w = g // s, g // s
+    feat = c * t * p * p
+    patches = torch.zeros(n_tokens * feat)
+    img_flat = image.flatten()
+    out_idx = 0
+    for gh in range(g_h):
+        for gw in range(g_w):
+            for mh in range(s):
+                for mw in range(s):
+                    for ci in range(c):
+                        for _ti in range(t):
+                            img_h_base = gh * (s * p) + mh * p
+                            img_w_base = gw * (s * p) + mw * p
+                            for ph in range(p):
+                                img_h = img_h_base + ph
+                                row = ci * (height * width) + img_h * width + img_w_base
+                                for pw in range(p):
+                                    patches[out_idx] = img_flat[row + pw]
+                                    out_idx += 1
+    assert out_idx == n_tokens * feat
+    patches = patches.view(n_tokens, feat)
+    # bf16 round-trip (the wrapper uploads bf16 patches — the oracle
+    # must consume the SAME rounding the production path does).
+    pixels = patches.to(torch.bfloat16).to(torch.float32)
     STATE["vision_pixels"] = pixels
     env["pixels"] = pixels
     env["num_tokens"] = n_tokens
-    # rope: half = head_dim/2; freqs [L, half]; interleaved 2d rope uses
-    # per-token angle rows (h then w position) — identity: use pos*i freqs
+
+    # ── 2D rope tables (build_rope_freqs_f32 / build_rope_cos_sin_bf16) ──
+    # half = head_dim/2 angles per token; freq_axis = half/2; the
+    # first freq_axis angles rotate on the H position, the rest on W
+    # (NeoxHw; InterleavedXy alternates x=column, y=row per freq).
     half = head_dim // 2
-    inv = 1.0 / (10000.0 ** (torch.arange(0, half, dtype=torch.float64) * 2.0 / head_dim))
-    pos = torch.arange(n_tokens, dtype=torch.float64).unsqueeze(1)
-    freqs = (pos * inv.unsqueeze(0)).float()
+    freq_axis_dim = half // 2
+    inv_freq = [1.0 / (10000.0 ** ((2 * i) / half)) for i in range(freq_axis_dim)]
+    # hpos/wpos in the S²-block-grouped order the Rust builder uses.
+    frame_len = g * g
+    hpos = [0] * frame_len
+    wpos = [0] * frame_len
+    idx = 0
+    for hb in range(g // s):
+        for wb in range(g // s):
+            for sh in range(s):
+                for sw in range(s):
+                    hpos[idx] = hb * s + sh
+                    wpos[idx] = wb * s + sw
+                    idx += 1
+    freqs_rows = []
+    for token in range(frame_len):
+        hp, wp = float(hpos[token]), float(wpos[token])
+        row = []
+        for f in inv_freq:
+            if interleaved:
+                # InterleavedXy: x (column) then y, per freq.
+                row.append(wp * f)
+                row.append(hp * f)
+            else:
+                # NeoxHw: all H angles, then all W.
+                row.append(hp * f)
+        if not interleaved:
+            for f in inv_freq:
+                row.append(wp * f)
+        freqs_rows.append(row)
+    freqs = torch.tensor(freqs_rows, dtype=torch.float32)
     STATE["vision_freqs"] = freqs
-    # cos/sin full [L, head_dim] (concat halves — HF rot_pos_emb style)
-    emb = torch.cat([freqs, freqs], dim=-1)
-    STATE["vision_cos"] = emb.cos().to(torch.bfloat16)
-    STATE["vision_sin"] = emb.sin().to(torch.bfloat16)
+    # cos/sin: computed on the f32 angle, RESULT rounded to bf16
+    # (f32_to_bf16 in build_rope_cos_sin_bf16 — only the CUDA path
+    # reads these; the metal rope kernel reads the raw freqs).
+    STATE["vision_cos"] = freqs.cos().to(torch.bfloat16).to(torch.float32)
+    STATE["vision_sin"] = freqs.sin().to(torch.bfloat16).to(torch.float32)
     env["cos"] = STATE["vision_cos"]
     env["sin"] = STATE["vision_sin"]
     env["freqs"] = freqs
-    # cu_seqlens: one segment per image; one image here
+
+    # ── Learned pos-embed table (qwen3-5-vl / locateanything) —
+    # transcribes the wrapper's host-side interpolation
+    # (fast_pos_embed_interpolate bilinear / bicubic_...): the table
+    # is captured f32 from the checkpoint (bf16 on disk → f32 at
+    # read), interpolated to this grid in merge order, and uploaded
+    # bf16 as the `pos_embeds` extern. ng is a SMALLER grid than the
+    # real checkpoints' (48 / 64) so the interpolation genuinely
+    # resamples. ──
+    pe_key = aj.get("vision_pos_embed_key")
+    if pe_key is not None:
+        ng = 8
+        table = torch.from_numpy(
+            rng.standard_normal((ng * ng, embed_dim)).astype(np.float32)) * INIT_SCALE
+        # production reads the on-disk bf16 tensor back as f32
+        table = table.to(torch.bfloat16).to(torch.float32)
+        STATE["vision_pos_table"] = (pe_key, table, ng)
+
+        def lin(i, n):
+            return 0.0 if n <= 1 else i * (ng - 1) / (n - 1)
+
+        def bilinear_frame():
+            frame = []
+            for hb in range(g // s):
+                for wb in range(g // s):
+                    for sh in range(s):
+                        for sw in range(s):
+                            row, col = hb * s + sh, wb * s + sw
+                            hf, wf = lin(row, g), lin(col, g)
+                            h_floor, w_floor = int(hf), int(wf)
+                            h_ceil = min(h_floor + 1, ng - 1)
+                            w_ceil = min(w_floor + 1, ng - 1)
+                            dh, dw = hf - h_floor, wf - w_floor
+                            w00 = (1 - dh) * (1 - dw); w01 = (1 - dh) * dw
+                            w10 = dh * (1 - dw); w11 = dh * dw
+                            t00 = table[h_floor * ng + w_floor]
+                            t01 = table[h_floor * ng + w_ceil]
+                            t10 = table[h_ceil * ng + w_floor]
+                            t11 = table[h_ceil * ng + w_ceil]
+                            frame.append(w00 * t00 + w01 * t01 + w10 * t10 + w11 * t11)
+            return torch.stack(frame)  # [g*g, e] merge order
+
+        def bicubic_frame():
+            def cubic(t):
+                a = -0.75
+                t = abs(t)
+                if t <= 1.0:
+                    return (a + 2) * t**3 - (a + 3) * t**2 + 1
+                if t < 2.0:
+                    return a * (t**3 - 5 * t**2 + 8 * t - 4)
+                return 0.0
+
+            def src_window(dst, out_n):
+                src = (dst + 0.5) * ng / out_n - 0.5
+                start = max(math.floor(src - 2.0) + 1, 0)
+                end = min(max(math.floor(src + 2.0) + 1, 0), ng)
+                return src, start, end
+
+            frame = []
+            for hb in range(g // s):
+                for wb in range(g // s):
+                    for sh in range(s):
+                        for sw in range(s):
+                            row, col = hb * s + sh, wb * s + sw
+                            y, ys, ye = src_window(row, g)
+                            x, xs, xe = src_window(col, g)
+                            acc = torch.zeros(embed_dim)
+                            wsum = 0.0
+                            for yy in range(ys, ye):
+                                wy = cubic(yy - y)
+                                for xx in range(xs, xe):
+                                    wgt = wy * cubic(xx - x)
+                                    wsum += wgt
+                                    acc = acc + wgt * table[yy * ng + xx]
+                            frame.append(acc / wsum)
+            return torch.stack(frame)
+
+        if aj.get("vision_pos_emb_interp") == "bicubic":
+            frame = bicubic_frame()
+        else:
+            frame = bilinear_frame()
+        # tiled per temporal frame, then the bf16 upload round-trip
+        pos_embeds = torch.cat([frame] * temporal, dim=0)
+        pos_embeds = pos_embeds.to(torch.bfloat16).to(torch.float32)
+        env["pos_embeds"] = pos_embeds
+        assert pos_embeds.shape[0] == n_tokens
+
+    # ── cu_seqlens: one segment per image; one image here ──
     STATE["vision_cu"] = [0, n_tokens]
     env["cu_seqlens"] = STATE["vision_cu"]
     env["max_seqlen"] = n_tokens
@@ -1954,13 +2329,80 @@ def setup_vision_state(env, cfg, bounds, n, rng):
     env["max_seqlen_window"] = n_tokens
     # window permute indices operate on MERGED rows (num_tokens /
     # merge_factor), matching the carrier's reshape-before-gather
-    merge = v.get("merge_factor", v.get("spatial_merge_size", 1))
-    n_rows = n_tokens // merge
-    env["window_index"] = list(range(n_rows))
-    env["reverse_indices"] = list(range(n_rows))
+    env["window_index"] = list(range(n_tokens // merge_factor))
+    env["reverse_indices"] = list(range(n_tokens // merge_factor))
     env["position_ids"] = list(range(n_tokens))
-    # pos_embeds: [L, embed_dim] additive table
-    env["pos_embeds"] = torch.randn(n_tokens, embed_dim) * INIT_SCALE
+    # pos_embeds: [L, embed_dim] additive table — set by the learned
+    # pos-embed block above for arches declaring one; unused elsewhere
+    # (the env prelude's zeros default covers carriers that never read it).
+
+    # ── Qwen2.5-VL window dispatch — a transcription of
+    # build_qwen2_5_window_dispatch (scratchy-vision) + the S²
+    # block-grouped permutes the metal wrapper applies to the rope
+    # tables. Only arches carrying a vision_window_size bound (the
+    # codegen `windowed_attn_window_size` override) take this path;
+    # the natural-order tables above are the identity default. ──
+    ws = v.get("window_size")
+    if ws is not None:
+        win_cells = ws // s // patch
+        assert win_cells > 0, "window_size/S/patch_size must be > 0 (tiny bounds)"
+        llm_h, llm_w = g // s, g // s
+        assert temporal * llm_h * llm_w == n_tokens // (s * s), "grid/merge mismatch"
+        window_index = []
+        cu = [0]
+        cu_last = 0
+        max_cells = 0
+        # single image (gt frames): frame_base = ti*llm_h*llm_w
+        for ti in range(temporal):
+            frame_base = ti * llm_h * llm_w
+            pad_h = (win_cells - llm_h % win_cells) % win_cells
+            pad_w = (win_cells - llm_w % win_cells) % win_cells
+            nh = (llm_h + pad_h) // win_cells
+            nw = (llm_w + pad_w) // win_cells
+            for wh in range(nh):
+                for ww in range(nw):
+                    seg_cells = 0
+                    for ih in range(win_cells):
+                        for iw in range(win_cells):
+                            row = wh * win_cells + ih
+                            col = ww * win_cells + iw
+                            if row < llm_h and col < llm_w:
+                                window_index.append(frame_base + row * llm_w + col)
+                                seg_cells += 1
+                    cu_last += seg_cells * (s * s)
+                    cu.append(cu_last)
+                    max_cells = max(max_cells, seg_cells)
+        # dedup_consecutive
+        cu_win = [cu[0]] + [c for i, c in enumerate(cu[1:], 1) if c != cu[i - 1]]
+        # invert_permutation
+        reverse = [0] * len(window_index)
+        for i, p in enumerate(window_index):
+            reverse[p] = i
+        env["window_index"] = window_index
+        env["reverse_indices"] = reverse
+        env["cu_seqlens_window"] = cu_win
+        env["max_seqlen_window"] = max_cells * (s * s)
+
+        # S² block-grouped row permute of the rope tables (the metal
+        # wrapper's permute_rows_block_grouped_{bf16,f32}): permutation
+        # is over merged cells, each cell = s² consecutive rows moved
+        # as a unit, intra-cell order preserved.
+        def permute_block_grouped(table):
+            rows = table.shape[0]
+            inner = table.shape[1]
+            assert rows == n_tokens
+            out = torch.empty_like(table)
+            for i, cell in enumerate(window_index):
+                out[i * s * s:(i + 1) * s * s] = table[cell * s * s:(cell + 1) * s * s]
+            return out
+
+        freqs = permute_block_grouped(freqs)
+        STATE["vision_freqs"] = freqs
+        STATE["vision_cos"] = freqs.cos().to(torch.bfloat16).to(torch.float32)
+        STATE["vision_sin"] = freqs.sin().to(torch.bfloat16).to(torch.float32)
+        env["cos"] = STATE["vision_cos"]
+        env["sin"] = STATE["vision_sin"]
+        env["freqs"] = freqs
 
 
 if __name__ == "__main__":

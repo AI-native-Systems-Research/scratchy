@@ -89,12 +89,16 @@ mod imp {
         dir: PathBuf,
         arch: String,
         stem: String,
+        /// `harness.json`'s `vision_grid` object, present only for vision
+        /// goldens (`@vision_forward` carriers): grid t/h/w, patch/merge
+        /// sizes, n_merged. Its presence routes the case to the vision arm.
+        #[cfg_attr(not(feature = "vision"), allow(dead_code))]
+        vision_grid: Option<serde_json::Value>,
     }
 
     /// Every `goldens/<arch>-<stem>/` dir carrying a checkpoint — the
-    /// oracle only writes one for text (`@forward`) arches, so vision
-    /// goldens are skipped by construction, and a missing dir means
-    /// "regenerate", not "skip silently".
+    /// oracle writes one for every carrier (text AND vision), so a
+    /// missing dir means "regenerate", not "skip silently".
     fn discover() -> Vec<Case> {
         let mut out = Vec::new();
         let root = Path::new(GOLDENS);
@@ -122,6 +126,7 @@ mod imp {
             out.push(Case {
                 arch: harness["arch"].as_str().expect("harness arch").into(),
                 stem: harness["stem"].as_str().expect("harness stem").into(),
+                vision_grid: harness.get("vision_grid").cloned(),
                 dir,
             });
         }
@@ -131,6 +136,36 @@ mod imp {
 
     fn run_case(case: &Case, device_arc: &Arc<Device>) {
         let dir = &case.dir;
+        // ── weights: the oracle's synthetic checkpoint, through the
+        // worker's load path (fingerprint sniff included) ──
+        let ckpt = dir.join("checkpoint");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(ckpt.join("config.json")).unwrap())
+                .expect("checkpoint config.json parses");
+        let arch_hint = cfg["architectures"][0]
+            .as_str()
+            .expect("config architectures[0]")
+            .to_string();
+
+        // Vision carriers (`@vision_forward`) route to the vision arm: the
+        // oracle executed the tower standalone, so parity is the projected
+        // `[n_merged, d_model]` output vs the compiled `vision_forward` —
+        // the production MM entry point (`try_load_mm`), same dispatch the
+        // worker uses.
+        #[cfg(feature = "vision")]
+        if case.vision_grid.is_some() {
+            run_vision_case(case, &cfg, &arch_hint, device_arc);
+            return;
+        }
+        #[cfg(not(feature = "vision"))]
+        if case.vision_grid.is_some() {
+            panic!(
+                "{}/{}: vision golden but the compiler's vision registry is \
+                 not compiled in (enable an arch-<X>-vl feature)",
+                case.arch, case.stem
+            );
+        }
+
         let ids: Vec<u32> = load_bin_u32(&dir.join("input_ids.bin"));
         let pos: Vec<u32> = load_bin_u32(&dir.join("positions.bin"));
         let block_table: Vec<u32> = load_bin_u32(&dir.join("block_table.bin"));
@@ -143,17 +178,6 @@ mod imp {
         assert_eq!(block_table.len(), NUM_BLOCKS, "{}: block_table row len", case.stem);
         assert_eq!(golden.len() % n, 0, "{}: logits divisible by n", case.stem);
         let vocab = golden.len() / n;
-
-        // ── weights: the oracle's synthetic checkpoint, through the
-        // worker's load path (fingerprint sniff included) ──
-        let ckpt = dir.join("checkpoint");
-        let cfg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(ckpt.join("config.json")).unwrap())
-                .expect("checkpoint config.json parses");
-        let arch_hint = cfg["architectures"][0]
-            .as_str()
-            .expect("config architectures[0]")
-            .to_string();
         let rope_theta = cfg["rope_theta"].as_f64();
         let rope_scaling = cfg.get("rope_scaling");
         // Mirror `extract_rope_scaling` (config.rs): only llama3 / longrope
@@ -490,6 +514,136 @@ mod imp {
             cos > 0.99,
             "{}: cosine {cos} <= 0.99 — the compiled tape diverged from \
              the carrier-as-Python oracle (a real .py↔tape divergence)",
+            case.stem
+        );
+    }
+
+    /// Vision arm: the oracle executed the SAME `dsl/<arch>.py` text as a
+    /// standalone torch tower over the dumped raw image; parity is the
+    /// production `MultimodalForward::vision_forward` output (loaded via
+    /// `try_load_mm` — the worker's own MM dispatch, fingerprint sniff
+    /// included) against `logits.bin`'s `[n_merged, d_model]` rows, ALL of
+    /// them (every row is an independent projection — there is no last-row
+    /// convention on this side).
+    #[cfg(feature = "vision")]
+    fn run_vision_case(
+        case: &Case,
+        cfg: &serde_json::Value,
+        arch_hint: &str,
+        device_arc: &Arc<Device>,
+    ) {
+        use scratchy_forward_compiler::{try_load_mm, EmbedPatch, PixelInput};
+
+        let dir = &case.dir;
+        let golden = load_bin_f32(&dir.join("logits.bin"));
+        let image = load_bin_f32(&dir.join("image.bin"));
+        let vg = case.vision_grid.as_ref().expect("vision_grid (dispatched on)");
+        let num = |k: &str| vg[k].as_u64().expect("vision_grid {k}") as usize;
+        let patch = num("patch_size");
+        let merge = num("spatial_merge_size");
+        let gt = num("t");
+        let gh = num("h");
+        let gw = num("w");
+        let in_chans = num("in_chans");
+        let pool_factor = num("pool_factor");
+        let n_merged = num("n_merged");
+        let height = gh * patch;
+        let width = gw * patch;
+        assert_eq!(
+            image.len(),
+            in_chans * height * width,
+            "{}: image.bin size",
+            case.stem
+        );
+        // The oracle's own grid asserts, restated: the geometry the tower
+        // was shrunk to must tile exactly.
+        assert_eq!(gt * gh * gw % (merge * merge).max(1), 0);
+
+        let max_model_len = cfg["max_position_embeddings"].as_u64().unwrap_or(4096) as usize;
+        // No rope scaling on the vision side; the checkpoint's (text-side)
+        // value, if any, is what the emitted fingerprint baked.
+        let rope_scaling = cfg.get("rope_scaling");
+        let recognized = ["llama3", "longrope", "su", "yarn", "mrope"];
+        let hf = HfFingerprint {
+            rope_scaling_type: rope_scaling
+                .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
+                .and_then(|v| v.as_str())
+                .filter(|t| recognized.contains(t)),
+            rope_scaling_hash: rope_scaling.map(hash_json_value),
+            rope_theta: cfg["rope_theta"].as_f64(),
+        };
+
+        let allocator = MetalAllocator::new((**device_arc).clone());
+        let mut device = GpuDevice::new(device_arc.clone(), Arc::new(allocator.clone()));
+        let mut weights = GpuWeights::from_dir(dir.join("checkpoint"), allocator.clone())
+            .expect("GpuWeights::from_dir");
+        weights.set_target_dtype(DType::BF16);
+        let model = match try_load_mm(&mut weights, (), arch_hint, 1, 0, max_model_len, hf)
+            .expect("try_load_mm")
+        {
+            Some(m) => m,
+            None => {
+                // Same convention as the text arm: no compiled MM variant
+                // claims this arch string — the build's feature scope names
+                // other arches. The same goldens dir runs green in a build
+                // that scopes the arch in.
+                eprintln!(
+                    "skip {}/{}: {arch_hint} not compiled into this build",
+                    case.arch, case.stem
+                );
+                return;
+            }
+        };
+
+        // One still image; `vision_forward` runs the production pixel pack
+        // (patches_from_normalized_chw) itself — the gate feeds it the SAME
+        // raw CHW f32 the oracle packed from. The placeholder carries the
+        // merged token count (the worker's convention — `vision_forward`
+        // fills only the grid fields on return).
+        let pixels_in = [PixelInput {
+            pixels: &image,
+            height: height as u32,
+            width: width as u32,
+        }];
+        let placeholders = [EmbedPatch {
+            length: n_merged as u32,
+            ..EmbedPatch::default()
+        }];
+        let dev_h = scratchy_tensors::ForwardDeviceHandle::new(&mut device);
+        let (out, _patches) = unsafe { model.vision_forward(&pixels_in, &placeholders, dev_h) };
+
+        // readback: [n_merged, d_model] bf16, every row compared
+        let t = out.as_gpu_tensor();
+        let d_model = t.dim(1);
+        assert_eq!(t.dim(0), n_merged, "{}: vision output rows", case.stem);
+        assert_eq!(golden.len(), n_merged * d_model, "{}: golden size", case.stem);
+        assert_eq!(
+            n_merged,
+            gt * gh * gw / (merge * merge).max(1) / pool_factor.max(1),
+            "{}: n_merged vs grid",
+            case.stem
+        );
+        let raw = t.raw_ptr() as *const u16;
+        let got: Vec<f32> = (0..n_merged * d_model)
+            .map(|i| bf16::from_bits(unsafe { *raw.add(i) }).to_f32())
+            .collect();
+
+        let cos = cosine(&got, &golden);
+        let max_diff = got
+            .iter()
+            .zip(&golden)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        eprintln!("──────── {}/{} VISION CARRIER PARITY ────────", case.arch, case.stem);
+        eprintln!("  grid {gt}x{gh}x{gw} (patch {patch}, merge {merge}) → {n_merged} merged rows x {d_model}");
+        eprintln!("  cosine(vision_out)   = {cos:.6}");
+        eprintln!("  max_abs_diff         = {max_diff:.4}");
+
+        let nan = got.iter().filter(|x| x.is_nan() || x.is_infinite()).count();
+        assert_eq!(nan, 0, "{}: scratchy vision output contains NaN/Inf", case.stem);
+        assert!(
+            cos > 0.99,
+            "{}: cosine {cos} <= 0.99 — the compiled vision tape diverged \
+             from the carrier-as-Python oracle",
             case.stem
         );
     }
