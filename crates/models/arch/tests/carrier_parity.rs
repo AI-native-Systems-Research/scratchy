@@ -40,8 +40,8 @@ mod imp {
     use scratchy_models as _;
 
     use half::bf16;
-    use objc2_metal::{MTLDevice as _, MTLResourceOptions, MTLCreateSystemDefaultDevice};
-    use scratchy_forward_compiler::{hash_json_value, try_load, HfFingerprint};
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _, MTLResourceOptions};
+    use scratchy_forward_compiler::{HfFingerprint, hash_json_value, try_load};
     use scratchy_target_metal::device::Device;
     use scratchy_target_metal::kv_cache::KvCachePool;
     use scratchy_target_metal::{
@@ -118,11 +118,11 @@ mod imp {
             if !dir.join("harness.json").is_file() {
                 continue;
             }
-            let harness: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(dir.join("harness.json")).expect(
-                    "harness.json present (checked above) but unreadable",
-                ))
-                .expect("harness.json parses");
+            let harness: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("harness.json"))
+                    .expect("harness.json present (checked above) but unreadable"),
+            )
+            .expect("harness.json parses");
             out.push(Case {
                 arch: harness["arch"].as_str().expect("harness arch").into(),
                 stem: harness["stem"].as_str().expect("harness stem").into(),
@@ -175,7 +175,12 @@ mod imp {
         assert!(!ids.is_empty(), "{}: empty input_ids", case.stem);
         assert_eq!(pos.len(), n, "{}: positions len", case.stem);
         assert_eq!(slot_mapping.len(), n, "{}: slot_mapping len", case.stem);
-        assert_eq!(block_table.len(), NUM_BLOCKS, "{}: block_table row len", case.stem);
+        assert_eq!(
+            block_table.len(),
+            NUM_BLOCKS,
+            "{}: block_table row len",
+            case.stem
+        );
         assert_eq!(golden.len() % n, 0, "{}: logits divisible by n", case.stem);
         let vocab = golden.len() / n;
         let rope_theta = cfg["rope_theta"].as_f64();
@@ -204,8 +209,7 @@ mod imp {
         if cfg.get("quantization_config").is_some() {
             eprintln!(
                 "skip {}/{}: config carries quantization_config — the oracle is dense-only",
-                case.arch,
-                case.stem
+                case.arch, case.stem
             );
             return;
         }
@@ -227,8 +231,7 @@ mod imp {
             eprintln!(
                 "DEFERRED {}/{}: dense MoE — metal requires affine expert storage; \
                  the oracle is dense-only (same refusal both sides)",
-                case.arch,
-                case.stem
+                case.arch, case.stem
             );
             return;
         }
@@ -237,17 +240,21 @@ mod imp {
         let mut device = GpuDevice::new(device_arc.clone(), Arc::new(allocator.clone()));
         let mut gw = GpuWeights::from_dir(&ckpt, allocator.clone()).expect("GpuWeights::from_dir");
         gw.set_target_dtype(DType::BF16);
-        let model = match try_load(&mut gw, (), &arch_hint, 1, 0, max_model_len, hf).expect("try_load") {
-            Some(m) => m,
-            None => {
-                // No compiled variant claims this arch string — the build's
-                // feature scope names other arches. A skip, not a failure:
-                // the same goldens dir runs green in a build that scopes
-                // the arch in.
-                eprintln!("skip {}/{}: {arch_hint} not compiled into this build", case.arch, case.stem);
-                return;
-            }
-        };
+        let model =
+            match try_load(&mut gw, (), &arch_hint, 1, 0, max_model_len, hf).expect("try_load") {
+                Some(m) => m,
+                None => {
+                    // No compiled variant claims this arch string — the build's
+                    // feature scope names other arches. A skip, not a failure:
+                    // the same goldens dir runs green in a build that scopes
+                    // the arch in.
+                    eprintln!(
+                        "skip {}/{}: {arch_hint} not compiled into this build",
+                        case.arch, case.stem
+                    );
+                    return;
+                }
+            };
 
         // ── pools, sized from the loaded model (no per-arch constants) ──
         let layers = model.num_hidden_layers() as usize;
@@ -260,26 +267,27 @@ mod imp {
         // grouping), then the pool with `layer_to_tensor` sharing and the
         // group layout attached. Uniform models (`per_layer == None`) keep
         // the one-tensor-per-layer pool, byte-identical to before.
-        let hybrid: Option<scratchy_core_config::HybridKvLayout> = per_layer.as_ref().and_then(|elems| {
-            let max_e = *elems.iter().max()?;
-            let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
-                .iter()
-                .map(|&e| scratchy_core_config::LayerKvGeometry {
-                    is_sliding: e == max_e,
-                    // Page proxy: head_size 1 keeps the per-class page RATIO.
-                    num_kv_heads: e,
-                    head_size: 1,
-                    head_size_v: None,
-                    sliding_window: if e == max_e { Some(1) } else { None },
-                })
-                .collect();
-            scratchy_core_config::compute_hybrid_kv_layout(
-                &geom,
-                BLOCK_SIZE,
-                usize::MAX / 2,
-                2, // bf16 elem bytes — only the (ignored) num_blocks read
-            )
-        });
+        let hybrid: Option<scratchy_core_config::HybridKvLayout> =
+            per_layer.as_ref().and_then(|elems| {
+                let max_e = *elems.iter().max()?;
+                let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
+                    .iter()
+                    .map(|&e| scratchy_core_config::LayerKvGeometry {
+                        is_sliding: e == max_e,
+                        // Page proxy: head_size 1 keeps the per-class page RATIO.
+                        num_kv_heads: e,
+                        head_size: 1,
+                        head_size_v: None,
+                        sliding_window: if e == max_e { Some(1) } else { None },
+                    })
+                    .collect();
+                scratchy_core_config::compute_hybrid_kv_layout(
+                    &geom,
+                    BLOCK_SIZE,
+                    usize::MAX / 2,
+                    2, // bf16 elem bytes — only the (ignored) num_blocks read
+                )
+            });
         let mut kv = unsafe {
             KvCachePool::new_metal_chunked(
                 layers,
@@ -340,7 +348,10 @@ mod imp {
                     |bytes| {
                         // f32 conv/ssm state; MUST be StorageModeShared.
                         let buf = device_arc
-                            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+                            .newBufferWithLength_options(
+                                bytes,
+                                MTLResourceOptions::StorageModeShared,
+                            )
                             .expect("GDN state buffer alloc");
                         allocator.residency().insert(&buf);
                         Ok(MetalMem::from_buffer(buf))
@@ -351,16 +362,12 @@ mod imp {
             // slot 0 for our one sequence, fresh (state zero-init).
             let idx: [i32; 1] = [0];
             let fresh: [u32; 1] = [1];
-            let idx_buf = device.alloc_gpu_tensor_from_host(
-                &[1],
-                DType::I32,
-                unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4) },
-            );
-            let fresh_buf = device.alloc_gpu_tensor_from_host(
-                &[1],
-                DType::U32,
-                unsafe { std::slice::from_raw_parts(fresh.as_ptr() as *const u8, 4) },
-            );
+            let idx_buf = device.alloc_gpu_tensor_from_host(&[1], DType::I32, unsafe {
+                std::slice::from_raw_parts(idx.as_ptr() as *const u8, 4)
+            });
+            let fresh_buf = device.alloc_gpu_tensor_from_host(&[1], DType::U32, unsafe {
+                std::slice::from_raw_parts(fresh.as_ptr() as *const u8, 4)
+            });
             gdn_indices_view = Some(unsafe { idx_buf.as_view() });
             gdn_fresh_view = Some(unsafe { fresh_buf.as_view() });
         } else {
@@ -389,24 +396,16 @@ mod imp {
         // `max_blocks_per_seq = NUM_BLOCKS.max(1)`, and the macro bakes the
         // kernel's MAX_BLOCKS_PER_SEQ from that same pool value — so host
         // stride == kernel stride by construction (the worker's own rule).
-        let bt_buf = device.alloc_gpu_tensor_from_host(
-            &[1, NUM_BLOCKS],
-            DType::U32,
-            unsafe {
-                std::slice::from_raw_parts(
-                    block_table.as_ptr() as *const u8,
-                    NUM_BLOCKS * 4,
-                )
-            },
-        );
+        let bt_buf = device.alloc_gpu_tensor_from_host(&[1, NUM_BLOCKS], DType::U32, unsafe {
+            std::slice::from_raw_parts(block_table.as_ptr() as *const u8, NUM_BLOCKS * 4)
+        });
         // The worker ALWAYS passes per-sequence sample rows for prefill —
         // `None` means 0 and the lm_head slice trio's gather/scatter become
         // no-ops, leaving only stale arena at the last row.
         let lti: Vec<u32> = vec![n as u32 - 1];
-        let lti_buf =
-            device.alloc_gpu_tensor_from_host(&[1], DType::U32, unsafe {
-                std::slice::from_raw_parts(lti.as_ptr() as *const u8, 4)
-            });
+        let lti_buf = device.alloc_gpu_tensor_from_host(&[1], DType::U32, unsafe {
+            std::slice::from_raw_parts(lti.as_ptr() as *const u8, 4)
+        });
 
         // Sliding KV-cache groups (gemma4 SWA), the worker's encoding: group
         // 0 (full) keeps the dumped slot_mapping/block_table (identity block
@@ -436,13 +435,10 @@ mod imp {
                 // block_table[logical_b] = physical id, same row stride as
                 // the full table (the kernel's MAX_BLOCKS_PER_SEQ).
                 let bt: Vec<u32> = (0..NUM_BLOCKS).map(|b| (base + b) as u32).collect();
-                let bt_buf = device.alloc_gpu_tensor_from_host(
-                    &[1, NUM_BLOCKS],
-                    DType::U32,
-                    unsafe {
+                let bt_buf =
+                    device.alloc_gpu_tensor_from_host(&[1, NUM_BLOCKS], DType::U32, unsafe {
                         std::slice::from_raw_parts(bt.as_ptr() as *const u8, NUM_BLOCKS * 4)
-                    },
-                );
+                    });
                 sliding_bt_views.push(unsafe { bt_buf.as_view() });
             }
         }
@@ -503,7 +499,10 @@ mod imp {
             .iter()
             .zip(&gold_row)
             .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-        eprintln!("──────── {}/{} CARRIER PARITY ────────", case.arch, case.stem);
+        eprintln!(
+            "──────── {}/{} CARRIER PARITY ────────",
+            case.arch, case.stem
+        );
         eprintln!("  n_tokens = {n} (comparing the last-token logits row)");
         eprintln!("  cosine(logits[last]) = {cos:.6}");
         eprintln!("  max_abs_diff         = {max_diff:.4}");
@@ -532,12 +531,15 @@ mod imp {
         arch_hint: &str,
         device_arc: &Arc<Device>,
     ) {
-        use scratchy_forward_compiler::{try_load_mm, EmbedPatch, PixelInput};
+        use scratchy_forward_compiler::{EmbedPatch, PixelInput, try_load_mm};
 
         let dir = &case.dir;
         let golden = load_bin_f32(&dir.join("logits.bin"));
         let image = load_bin_f32(&dir.join("image.bin"));
-        let vg = case.vision_grid.as_ref().expect("vision_grid (dispatched on)");
+        let vg = case
+            .vision_grid
+            .as_ref()
+            .expect("vision_grid (dispatched on)");
         let num = |k: &str| vg[k].as_u64().expect("vision_grid {k}") as usize;
         let patch = num("patch_size");
         let merge = num("spatial_merge_size");
@@ -616,7 +618,12 @@ mod imp {
         let t = out.as_gpu_tensor();
         let d_model = t.dim(1);
         assert_eq!(t.dim(0), n_merged, "{}: vision output rows", case.stem);
-        assert_eq!(golden.len(), n_merged * d_model, "{}: golden size", case.stem);
+        assert_eq!(
+            golden.len(),
+            n_merged * d_model,
+            "{}: golden size",
+            case.stem
+        );
         assert_eq!(
             n_merged,
             gt * gh * gw / (merge * merge).max(1) / pool_factor.max(1),
@@ -633,13 +640,22 @@ mod imp {
             .iter()
             .zip(&golden)
             .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-        eprintln!("──────── {}/{} VISION CARRIER PARITY ────────", case.arch, case.stem);
-        eprintln!("  grid {gt}x{gh}x{gw} (patch {patch}, merge {merge}) → {n_merged} merged rows x {d_model}");
+        eprintln!(
+            "──────── {}/{} VISION CARRIER PARITY ────────",
+            case.arch, case.stem
+        );
+        eprintln!(
+            "  grid {gt}x{gh}x{gw} (patch {patch}, merge {merge}) → {n_merged} merged rows x {d_model}"
+        );
         eprintln!("  cosine(vision_out)   = {cos:.6}");
         eprintln!("  max_abs_diff         = {max_diff:.4}");
 
         let nan = got.iter().filter(|x| x.is_nan() || x.is_infinite()).count();
-        assert_eq!(nan, 0, "{}: scratchy vision output contains NaN/Inf", case.stem);
+        assert_eq!(
+            nan, 0,
+            "{}: scratchy vision output contains NaN/Inf",
+            case.stem
+        );
         assert!(
             cos > 0.99,
             "{}: cosine {cos} <= 0.99 — the compiled vision tape diverged \
