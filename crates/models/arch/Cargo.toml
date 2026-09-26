@@ -28,25 +28,30 @@ arch-deepseek-v3 = []
 arch-deepseek-v3-flat = []
 arch-gemma2 = []
 arch-gemma3 = []
-arch-gemma3-mm = ["arch-gemma3", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-gemma3-mm = ["arch-gemma3", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-gemma4 = []
 arch-gemma4-moe = []
 arch-granite = []
 arch-llama = []
-arch-locateanything = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-locateanything = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-mistral = []
 arch-mixtral = []
 arch-modernbert = []
 arch-phi3 = []
 arch-qwen2 = []
-arch-qwen2-5-vl = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen2-5-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen2-moe = []
-arch-qwen2-vl = ["arch-qwen2", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen2-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen3 = []
 arch-qwen3-5 = []
 arch-qwen3-5-moe = []
-arch-qwen3-5-vl = ["arch-qwen3-5", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
+arch-qwen3-5-vl = ["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen3-moe = []
+
+# Passthrough so the carrier-parity test can cfg-gate its vision arm on the
+# compiler's vision registry being compiled in (any arch-<X>-vl feature
+# enables it; nothing else does).
+vision = ["scratchy-forward-compiler/vision"]
 
 all-arches = [
     "arch-commandr",
@@ -137,6 +142,7 @@ all-arches = [
 "gemma-3-12b-it" = ["arch-gemma3-mm"]
 "gemma-3-27b-it" = ["arch-gemma3-mm"]
 "gemma-3-4b-it" = ["arch-gemma3-mm"]
+"gemma-3-4b-it-parity-tiny" = ["arch-gemma3-mm"]
 
 # gemma4 (2 configs)
 "gemma-4-12b-it" = ["arch-gemma4"]
@@ -188,6 +194,7 @@ all-arches = [
 
 # locateanything (1 configs)
 "locateanything-3b" = ["arch-locateanything"]
+"locateanything-3b-parity-tiny" = ["arch-locateanything"]
 
 # mistral (3 configs)
 "mistral-7b-instruct-v0.3" = ["arch-mistral"]
@@ -239,6 +246,7 @@ all-arches = [
 
 # qwen2-5-vl (4 configs)
 "qwen2.5-vl-3b-instruct" = ["arch-qwen2-5-vl"]
+"qwen2.5-vl-3b-instruct-parity-tiny" = ["arch-qwen2-5-vl"]
 "qwen2.5-vl-3b-mlx" = ["arch-qwen2-5-vl"]
 "qwen2.5-vl-72b-instruct" = ["arch-qwen2-5-vl"]
 "qwen2.5-vl-7b-instruct" = ["arch-qwen2-5-vl"]
@@ -249,6 +257,7 @@ all-arches = [
 
 # qwen2-vl (4 configs)
 "qwen2-vl-2b-instruct" = ["arch-qwen2-vl"]
+"qwen2-vl-2b-instruct-parity-tiny" = ["arch-qwen2-vl"]
 "qwen2-vl-2b-mlx" = ["arch-qwen2-vl"]
 "qwen2-vl-72b-instruct" = ["arch-qwen2-vl"]
 "qwen2-vl-7b-instruct" = ["arch-qwen2-vl"]
@@ -272,6 +281,7 @@ all-arches = [
 
 # qwen3-5-vl (1 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
+"qwen3.5-9b-parity-tiny" = ["arch-qwen3-5-vl"]
 
 # qwen3-moe (2 configs)
 "qwen3-30b-a3b-instruct-2507" = ["arch-qwen3-moe"]
@@ -316,6 +326,7 @@ all-arches = [
     "gemma-3-12b-it",
     "gemma-3-27b-it",
     "gemma-3-4b-it",
+    "gemma-3-4b-it-parity-tiny",
 ]
 "gemma4" = [
     "gemma-4-12b-it",
@@ -367,6 +378,7 @@ all-arches = [
 ]
 "locateanything" = [
     "locateanything-3b",
+    "locateanything-3b-parity-tiny",
 ]
 "mistral" = [
     "mistral-7b-instruct-v0.3",
@@ -418,6 +430,7 @@ all-arches = [
 ]
 "qwen2-5-vl" = [
     "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-instruct-parity-tiny",
     "qwen2.5-vl-3b-mlx",
     "qwen2.5-vl-72b-instruct",
     "qwen2.5-vl-7b-instruct",
@@ -428,6 +441,7 @@ all-arches = [
 ]
 "qwen2-vl" = [
     "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-instruct-parity-tiny",
     "qwen2-vl-2b-mlx",
     "qwen2-vl-72b-instruct",
     "qwen2-vl-7b-instruct",
@@ -451,6 +465,7 @@ all-arches = [
 ]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
+    "qwen3.5-9b-parity-tiny",
 ]
 "qwen3-moe" = [
     "qwen3-30b-a3b-instruct-2507",
@@ -483,6 +498,7 @@ all = [
     "gemma-3-12b-it",
     "gemma-3-27b-it",
     "gemma-3-4b-it",
+    "gemma-3-4b-it-parity-tiny",
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
     "gemma-4-31b-it",
@@ -523,6 +539,7 @@ all = [
     "smollm2-360m",
     "tinyllama-1.1b",
     "locateanything-3b",
+    "locateanything-3b-parity-tiny",
     "mistral-7b-instruct-v0.3",
     "mistral-7b-instruct-v0.3-parity-tiny",
     "mistral-nemo-instruct-2407",
@@ -561,12 +578,14 @@ all = [
     "qwen2.5-vl-3b",
     "qwen2-7b-parity-tiny",
     "qwen2.5-vl-3b-instruct",
+    "qwen2.5-vl-3b-instruct-parity-tiny",
     "qwen2.5-vl-3b-mlx",
     "qwen2.5-vl-72b-instruct",
     "qwen2.5-vl-7b-instruct",
     "slimed-qwen-3",
     "slimed-qwen-3-parity-tiny",
     "qwen2-vl-2b-instruct",
+    "qwen2-vl-2b-instruct-parity-tiny",
     "qwen2-vl-2b-mlx",
     "qwen2-vl-72b-instruct",
     "qwen2-vl-7b-instruct",
@@ -582,6 +601,7 @@ all = [
     "qwen3.5-35b-a3b",
     "qwen3.5-35b-a3b-parity-tiny",
     "qwen3.5-9b",
+    "qwen3.5-9b-parity-tiny",
     "qwen3-30b-a3b-instruct-2507",
     "qwen3-30b-a3b-instruct-2507-parity-tiny",
     "qwen3-moe-1-layer",
