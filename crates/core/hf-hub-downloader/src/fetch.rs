@@ -5,22 +5,31 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use rayon::prelude::*;
 // `sha1` and `sha2` both re-export the same `digest::Digest`, so one import
 // covers `Sha1` and `Sha256` alike.
 use sha2::Digest as _;
 
 use crate::Progress;
 use crate::error::{Error, Result};
-use crate::limit::Semaphore;
+use crate::limit::{Flow, Semaphore};
 
 /// Read buffer, and the granularity at which progress is reported.
 const BUF: usize = 256 * 1024;
 
-/// How often a chunk records its progress for resume. Small enough that a
+/// The most one ranged request asks for.
+///
+/// A range that spans a whole eighth of the file holds its permit until that
+/// eighth has landed, so whichever file claimed the permits first keeps them
+/// and the rest wait. Short pieces hand the permit back often enough for the
+/// round-robin in [`Semaphore`] to share it: that is what lets eight shards
+/// move together. Large enough that the extra request per piece — on a
+/// kept-alive connection, one round trip — is a rounding error.
+const PIECE: u64 = 32 * 1024 * 1024;
+
+/// How often a piece records its progress for resume. Small enough that a
 /// kill costs little, large enough that the sidecar write is noise.
 const RESUME_STRIDE: u64 = 8 * 1024 * 1024;
 
@@ -80,6 +89,8 @@ pub(crate) struct Opts<'a> {
     /// Retries left for this file, shared across its probe and every range.
     pub budget: RetryBudget,
     pub permits: &'a Semaphore,
+    /// This file's place in the round-robin for [`permits`](Self::permits).
+    pub flow: Flow,
 }
 
 /// What the Hub says about one file, gathered from a single redirect-less
@@ -180,8 +191,23 @@ fn classify(e: ureq::Error, url: &str, repo_id: &str, filename: &str, attempts: 
     }
 }
 
+/// Read one buffer of a response body.
+///
+/// A read that fails is the connection failing mid-transfer — a reset, a
+/// stall, a server that closed early — so it is transport, and retried from
+/// the last recorded offset. Only the write side is the disk. Reporting both
+/// as [`Error::Io`], which is not transient, made every reset fatal to the
+/// whole file.
+fn read_body(reader: &mut impl Read, buf: &mut [u8], url: &str, attempts: usize) -> Result<usize> {
+    reader.read(buf).map_err(|e| Error::Transport {
+        url: url.to_string(),
+        attempts,
+        source: Box::new(ureq::Error::Io(e)),
+    })
+}
+
 fn probe_once(opts: &Opts<'_>, url: &str, repo_id: &str, filename: &str) -> Result<FileMeta> {
-    let _permit = opts.permits.acquire();
+    let _permit = opts.permits.acquire(opts.flow);
 
     let mut req = opts.ranged.head(url);
     if let Some(token) = opts.token {
@@ -263,24 +289,131 @@ fn probe_once(opts: &Opts<'_>, url: &str, repo_id: &str, filename: &str) -> Resu
     }
 }
 
-/// Fetch `meta` into `dest`, in parallel ranges when the size is known and
-/// large enough, resuming whatever a previous run completed.
+/// Re-resolves a file: another probe of `/resolve/`, pinned to the commit the
+/// first one found, so the answer can only be a fresh signature for the same
+/// content.
+pub(crate) type Resolve<'a> = dyn Fn() -> Result<FileMeta> + Sync + 'a;
+
+/// Where a file's bytes currently come from.
+///
+/// The Hub's LFS redirect is presigned for an hour, and a download can
+/// outlive that: a large file on a slow link, or any shard sharing the
+/// connection budget with seven others. Pieces are requested for as long as
+/// the file is downloading, so once the URL lapses every one of them is
+/// refused. A 403 from a URL that has already served bytes is that expiry,
+/// and is answered by resolving the file again; a 403 from a URL that never
+/// served anything is a real refusal, and fails as it always did.
+struct Source<'a> {
+    signed: Mutex<Signed>,
+    resolve: &'a Resolve<'a>,
+    etag: &'a str,
+    filename: &'a str,
+}
+
+struct Signed {
+    url: String,
+    /// Bumped on every re-resolve, so a refused worker can tell a URL that
+    /// lapsed from one another worker has already replaced.
+    generation: u64,
+    served: bool,
+}
+
+/// The URL one request was made against.
+struct Lease {
+    url: String,
+    generation: u64,
+}
+
+impl<'a> Source<'a> {
+    fn new(meta: &'a FileMeta, filename: &'a str, resolve: &'a Resolve<'a>) -> Self {
+        Self {
+            signed: Mutex::new(Signed {
+                url: meta.url.clone(),
+                generation: 0,
+                served: false,
+            }),
+            resolve,
+            etag: &meta.etag,
+            filename,
+        }
+    }
+
+    /// Run `request` against the current URL, re-resolving it when it lapses.
+    fn fetch<T>(&self, mut request: impl FnMut(&Lease) -> Result<T>) -> Result<T> {
+        loop {
+            let lease = {
+                let signed = self.signed.lock().expect("source poisoned");
+                Lease {
+                    url: signed.url.clone(),
+                    generation: signed.generation,
+                }
+            };
+            match request(&lease) {
+                Err(Error::UnexpectedStatus { status: 403, .. }) if self.renew(&lease)? => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// The URL `lease` names has answered with bytes.
+    fn served(&self, lease: &Lease) {
+        let mut signed = self.signed.lock().expect("source poisoned");
+        if signed.generation == lease.generation {
+            signed.served = true;
+        }
+    }
+
+    /// Replace the URL that refused `lease`. `false` means the refusal was
+    /// real — that URL never served a byte — and must be returned as is.
+    fn renew(&self, lease: &Lease) -> Result<bool> {
+        {
+            let signed = self.signed.lock().expect("source poisoned");
+            if signed.generation != lease.generation {
+                return Ok(true);
+            }
+            if !signed.served {
+                return Ok(false);
+            }
+        }
+        // Not under the lock: resolving waits for a permit, and a worker
+        // holding one takes this lock to report that its URL served.
+        let fresh = (self.resolve)()?;
+        if fresh.etag != self.etag {
+            return Err(Error::HashMismatch {
+                filename: self.filename.to_string(),
+                expected: self.etag.to_string(),
+                actual: fresh.etag,
+            });
+        }
+        let mut signed = self.signed.lock().expect("source poisoned");
+        if signed.generation == lease.generation {
+            *signed = Signed {
+                url: fresh.url,
+                generation: lease.generation + 1,
+                served: false,
+            };
+        }
+        Ok(true)
+    }
+}
+
+/// Fetch `meta` into `dest`, in pieces when the size is known and large
+/// enough, resuming whatever a previous run completed.
 pub(crate) fn fetch(
     opts: &Opts<'_>,
     meta: &FileMeta,
     filename: &str,
     dest: &Path,
     progress: &mut dyn Progress,
+    resolve: &Resolve<'_>,
 ) -> Result<()> {
+    let source = Source::new(meta, filename, resolve);
+    progress.init(meta.size.unwrap_or(0), filename);
     match meta.size {
         Some(size) if size >= opts.parallel_threshold && opts.chunks > 1 => {
-            progress.init(size, filename);
-            fetch_ranges(opts, meta, filename, size, dest, progress)
+            fetch_pieces(opts, &source, meta, size, dest, progress)
         }
-        size => {
-            progress.init(size.unwrap_or(0), filename);
-            fetch_stream(opts, meta, filename, dest, progress)
-        }
+        _ => fetch_stream(opts, &source, meta, dest, progress),
     }
 }
 
@@ -288,68 +421,60 @@ pub(crate) fn fetch(
 /// splitting costs more in requests than it saves.
 fn fetch_stream(
     opts: &Opts<'_>,
+    source: &Source<'_>,
     meta: &FileMeta,
-    filename: &str,
     dest: &Path,
     progress: &mut dyn Progress,
 ) -> Result<()> {
+    let filename = source.filename;
     let sink = Mutex::new(progress);
     with_retry(&opts.budget, 0, 1, || {
-        let _permit = opts.permits.acquire();
+        source.fetch(|lease| {
+            let _permit = opts.permits.acquire(opts.flow);
 
-        let mut req = opts.following.get(&meta.url);
-        if let Some(token) = meta.send_token.then_some(opts.token).flatten() {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-        let res = req
-            .call()
-            .map_err(|e| classify(e, &meta.url, "", filename, opts.retries))?;
+            let mut req = opts.following.get(&lease.url);
+            if let Some(token) = meta.send_token.then_some(opts.token).flatten() {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
+            let res = req
+                .call()
+                .map_err(|e| classify(e, &lease.url, "", filename, opts.retries))?;
+            source.served(lease);
 
-        // Restart from zero: without a length there is nothing to resume
-        // against, and these files are small by construction.
-        let mut reader = res.into_body().into_reader();
-        let mut file = File::create(dest).map_err(|e| Error::io(dest, e))?;
-        let mut buf = vec![0u8; BUF];
-        loop {
-            let n = read_chunk(&mut reader, &mut buf, dest, opts, &meta.url)?;
-            if n == 0 {
-                break;
+            // Restart from zero: without a length there is nothing to resume
+            // against, and these files are small by construction.
+            let mut reader = res.into_body().into_reader();
+            let mut file = File::create(dest).map_err(|e| Error::io(dest, e))?;
+            let mut buf = vec![0u8; BUF];
+            loop {
+                let n = read_body(&mut reader, &mut buf, &lease.url, opts.retries)?;
+                if n == 0 {
+                    break;
+                }
+                std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| Error::io(dest, e))?;
+                let mut sink = sink.lock().expect("progress sink poisoned");
+                if sink.cancelled() {
+                    return Err(Error::Cancelled {
+                        filename: filename.to_string(),
+                    });
+                }
+                sink.update(n as u64);
             }
-            std::io::Write::write_all(&mut file, &buf[..n]).map_err(|e| Error::io(dest, e))?;
-            let mut sink = sink.lock().expect("progress sink poisoned");
-            if sink.cancelled() {
-                return Err(Error::Cancelled {
-                    filename: filename.to_string(),
-                });
-            }
-            sink.update(n as u64);
-        }
-        Ok(())
+            Ok(())
+        })
     })
 }
 
-/// Read one buffer, mapping a mid-body failure to a transient error so the
-/// retry layer can re-request rather than aborting the file.
-fn read_chunk(
-    reader: &mut impl Read,
-    buf: &mut [u8],
-    dest: &Path,
-    _opts: &Opts<'_>,
-    _url: &str,
-) -> Result<usize> {
-    reader.read(buf).map_err(|e| Error::io(dest, e))
-}
-
-/// Split into ranges and fetch them concurrently with positional writes.
+/// Split into pieces and fetch them concurrently with positional writes.
 ///
 /// Positional (`pwrite`) rather than seek-then-write under a lock: the lock
-/// would serialise every write and hand back the cost of chunking with none
+/// would serialise every write and hand back the cost of splitting with none
 /// of the benefit. The only shared mutable state is the progress sink and
 /// the resume log, neither of which touches the payload.
-fn fetch_ranges(
+fn fetch_pieces(
     opts: &Opts<'_>,
+    source: &Source<'_>,
     meta: &FileMeta,
-    filename: &str,
     size: u64,
     dest: &Path,
     progress: &mut dyn Progress,
@@ -363,117 +488,177 @@ fn fetch_ranges(
         .map_err(|e| Error::io(dest, e))?;
     file.set_len(size).map_err(|e| Error::io(dest, e))?;
 
-    let resume = ResumeLog::open(dest, opts.chunks as usize)?;
-    let span = size.div_ceil(opts.chunks);
-    let ranges: Vec<(usize, u64, u64)> = (0..opts.chunks)
-        .map(|i| (i as usize, i * span, ((i + 1) * span).min(size) - 1))
-        .filter(|(_, start, end)| start <= end)
-        .collect();
+    // Capped at `PIECE`, and small enough that a file just over the
+    // threshold still spreads across every range it is allowed.
+    let piece = PIECE.min(size.div_ceil(opts.chunks)).max(1);
+    let count = size.div_ceil(piece);
+    let resume = ResumeLog::open(dest, piece, count)?;
 
     // Bytes a previous run already placed. Reported up front so a resumed
     // download does not look like it restarted.
-    let done: u64 = (0..ranges.len()).map(|i| resume.get(i)).sum();
-    progress.update(done);
+    let done: u64 = (0..count).map(|idx| resume.get(idx)).sum();
+    if done > 0 {
+        progress.resumed(done);
+    }
 
-    let advanced = AtomicU64::new(0);
-    let sink = Mutex::new(progress);
+    let pieces = Pieces {
+        opts,
+        source,
+        send_token: meta.send_token,
+        file,
+        dest,
+        size,
+        piece,
+        count,
+        resume,
+        next: AtomicU64::new(0),
+        stop: AtomicBool::new(false),
+        unreported: AtomicU64::new(0),
+        sink: Mutex::new(progress),
+    };
 
-    let slots = ranges.len();
-    let outcome = ranges.par_iter().try_for_each(|&(idx, start, end)| {
-        with_retry(&opts.budget, idx, slots, || {
-            one_range(
-                opts, meta, filename, &file, dest, idx, start, end, &resume, &advanced, &sink,
-            )
+    let workers = opts.chunks.min(count) as usize;
+    std::thread::scope(|s| {
+        let running: Vec<_> = (0..workers)
+            .map(|slot| {
+                let pieces = &pieces;
+                s.spawn(move || pieces.work(slot, workers))
+            })
+            .collect();
+        running.into_iter().try_for_each(|worker| {
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         })
-    });
+    })?;
 
-    // Keep the log on failure or cancellation — it is what makes the next
-    // attempt resume instead of restart.
-    outcome?;
-    resume.discard();
+    // The `?` above keeps the log on failure or cancellation — it is what
+    // makes the next attempt resume instead of restart.
+    let rest = pieces.unreported.swap(0, Ordering::Relaxed);
+    if rest > 0 {
+        pieces
+            .sink
+            .lock()
+            .expect("progress sink poisoned")
+            .update(rest);
+    }
+    pieces.resume.discard();
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn one_range(
-    opts: &Opts<'_>,
-    meta: &FileMeta,
-    filename: &str,
-    file: &File,
-    dest: &Path,
-    idx: usize,
-    start: u64,
-    end: u64,
-    resume: &ResumeLog,
-    advanced: &AtomicU64,
-    sink: &Mutex<&mut dyn Progress>,
-) -> Result<()> {
-    // Re-read on every attempt: a retry must pick up from wherever the
-    // failed attempt actually got to, not from where this range began.
-    let already = resume.get(idx);
-    if already > end - start {
-        return Ok(());
-    }
-    let from = start + already;
+/// One file mid-fetch, shared by the workers claiming its pieces.
+struct Pieces<'a> {
+    opts: &'a Opts<'a>,
+    source: &'a Source<'a>,
+    send_token: bool,
+    file: File,
+    dest: &'a Path,
+    size: u64,
+    piece: u64,
+    count: u64,
+    resume: ResumeLog,
+    /// The next piece nobody has claimed.
+    next: AtomicU64,
+    /// Set by the first worker to fail, so the rest stop claiming pieces
+    /// for a download that is already lost.
+    stop: AtomicBool,
+    /// Bytes landed but not yet reported, batched to a report per [`BUF`].
+    unreported: AtomicU64,
+    sink: Mutex<&'a mut dyn Progress>,
+}
 
-    let _permit = opts.permits.acquire();
-
-    let mut req = opts
-        .ranged
-        .get(&meta.url)
-        .header("Range", format!("bytes={from}-{end}"));
-    if let Some(token) = meta.send_token.then_some(opts.token).flatten() {
-        req = req.header("Authorization", format!("Bearer {token}"));
-    }
-    let res = req
-        .call()
-        .map_err(|e| classify(e, &meta.url, "", filename, opts.retries))?;
-
-    // A server that ignored `Range` answers 200 and would stream the whole
-    // file into this chunk's slot, silently corrupting it. Refuse instead.
-    let status = res.status().as_u16();
-    if status != 206 {
-        return Err(Error::UnexpectedStatus {
-            url: meta.url.clone(),
-            status,
-        });
-    }
-
-    let mut reader = res.into_body().into_reader();
-    let mut buf = vec![0u8; BUF];
-    let mut at = from;
-    let mut since_log = 0u64;
-
-    loop {
-        let n = read_chunk(&mut reader, &mut buf, dest, opts, &meta.url)?;
-        if n == 0 {
-            break;
-        }
-        write_at(file, &buf[..n], at).map_err(|e| Error::io(dest, e))?;
-        at += n as u64;
-        since_log += n as u64;
-
-        // Payload first, then the counter: the log may lag reality, which
-        // costs a re-fetch, but it can never claim bytes that are not there.
-        if since_log >= RESUME_STRIDE {
-            resume.set(idx, at - start);
-            since_log = 0;
-        }
-
-        if advanced.fetch_add(n as u64, Ordering::Relaxed) + n as u64 >= BUF as u64 {
-            let carried = advanced.swap(0, Ordering::Relaxed);
-            let mut sink = sink.lock().expect("progress sink poisoned");
-            if sink.cancelled() {
-                resume.set(idx, at - start);
-                return Err(Error::Cancelled {
-                    filename: filename.to_string(),
-                });
+impl Pieces<'_> {
+    /// Claim and fetch pieces until none are left or one fails.
+    fn work(&self, slot: usize, workers: usize) -> Result<()> {
+        while !self.stop.load(Ordering::Relaxed) {
+            let idx = self.next.fetch_add(1, Ordering::Relaxed);
+            if idx >= self.count {
+                break;
             }
-            sink.update(carried);
+            let fetched = with_retry(&self.opts.budget, slot, workers, || {
+                self.source.fetch(|lease| self.fetch_piece(idx, lease))
+            });
+            if let Err(e) = fetched {
+                self.stop.store(true, Ordering::Relaxed);
+                return Err(e);
+            }
         }
+        Ok(())
     }
-    resume.set(idx, at - start);
-    Ok(())
+
+    fn fetch_piece(&self, idx: u64, lease: &Lease) -> Result<()> {
+        let filename = self.source.filename;
+        let start = idx * self.piece;
+        let end = (start + self.piece).min(self.size) - 1;
+        // Re-read on every attempt: a retry must pick up from wherever the
+        // failed attempt actually got to, not from where this piece began.
+        let already = self.resume.get(idx);
+        if already > end - start {
+            return Ok(());
+        }
+        let from = start + already;
+
+        let _permit = self.opts.permits.acquire(self.opts.flow);
+
+        let mut req = self
+            .opts
+            .ranged
+            .get(&lease.url)
+            .header("Range", format!("bytes={from}-{end}"));
+        if let Some(token) = self.send_token.then_some(self.opts.token).flatten() {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let res = req
+            .call()
+            .map_err(|e| classify(e, &lease.url, "", filename, self.opts.retries))?;
+
+        // A server that ignored `Range` answers 200 and would stream the whole
+        // file into this piece's slot, silently corrupting it. Refuse instead.
+        let status = res.status().as_u16();
+        if status != 206 {
+            return Err(Error::UnexpectedStatus {
+                url: lease.url.clone(),
+                status,
+            });
+        }
+        self.source.served(lease);
+
+        let mut reader = res.into_body().into_reader();
+        let mut buf = vec![0u8; BUF];
+        let mut at = from;
+        let mut since_log = 0u64;
+
+        loop {
+            let n = read_body(&mut reader, &mut buf, &lease.url, self.opts.retries)?;
+            if n == 0 {
+                break;
+            }
+            write_at(&self.file, &buf[..n], at).map_err(|e| Error::io(self.dest, e))?;
+            at += n as u64;
+            since_log += n as u64;
+
+            // Payload first, then the counter: the log may lag reality, which
+            // costs a re-fetch, but it can never claim bytes that are not there.
+            if since_log >= RESUME_STRIDE {
+                self.resume.set(idx, at - start);
+                since_log = 0;
+            }
+
+            if self.unreported.fetch_add(n as u64, Ordering::Relaxed) + n as u64 >= BUF as u64 {
+                let carried = self.unreported.swap(0, Ordering::Relaxed);
+                let mut sink = self.sink.lock().expect("progress sink poisoned");
+                if sink.cancelled() {
+                    self.resume.set(idx, at - start);
+                    return Err(Error::Cancelled {
+                        filename: filename.to_string(),
+                    });
+                }
+                sink.update(carried);
+            }
+        }
+        self.resume.set(idx, at - start);
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -492,21 +677,33 @@ fn write_at(file: &File, buf: &[u8], mut offset: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Per-chunk byte counts, so an interrupted download resumes instead of
+/// Per-piece byte counts, so an interrupted download resumes instead of
 /// restarting.
 ///
-/// A fixed array of `u64`s beside the target, one slot per chunk, updated in
+/// A fixed array of `u64`s beside the target, one slot per piece, updated in
 /// place. The alternative some implementations reach for — appending a second
 /// copy of every byte to a `.part` file — doubles both write bandwidth and
 /// peak disk to track a number that fits in eight bytes.
+///
+/// Laid out as `[MAGIC, piece, done_0, done_1, …]`. The piece size is recorded
+/// because a count means nothing apart from the bounds it counts into: a log
+/// written for other bounds — another `chunks` setting, or the one-range-per-
+/// chunk layout this crate used to write — would read as progress it is not,
+/// and "resume" into a file that fails its hash. A log whose header does not
+/// match is started over.
 pub(crate) struct ResumeLog {
     file: File,
     path: std::path::PathBuf,
-    slots: usize,
+    pieces: u64,
 }
 
+/// First slot of every log this layout writes.
+const MAGIC: u64 = u64::from_le_bytes(*b"hfdl-pc1");
+/// Slots before the first count: the magic, then the piece size.
+const HEADER: u64 = 2;
+
 impl ResumeLog {
-    pub(crate) fn open(dest: &Path, slots: usize) -> Result<Self> {
+    pub(crate) fn open(dest: &Path, piece: u64, pieces: u64) -> Result<Self> {
         let path = dest.with_extension("resume");
         let file = OpenOptions::new()
             .create(true)
@@ -515,25 +712,41 @@ impl ResumeLog {
             .truncate(false)
             .open(&path)
             .map_err(|e| Error::io(&path, e))?;
-        file.set_len((slots * 8) as u64)
-            .map_err(|e| Error::io(&path, e))?;
-        Ok(Self { file, path, slots })
-    }
+        let len = (HEADER + pieces) * 8;
+        let log = Self { file, path, pieces };
 
-    pub(crate) fn get(&self, idx: usize) -> u64 {
-        debug_assert!(idx < self.slots);
-        let mut buf = [0u8; 8];
-        match read_at(&self.file, &mut buf, (idx * 8) as u64) {
-            Ok(()) => u64::from_le_bytes(buf),
-            Err(_) => 0,
+        let fits = log.file.metadata().is_ok_and(|m| m.len() == len)
+            && log.slot(0) == Some(MAGIC)
+            && log.slot(1) == Some(piece);
+        if !fits {
+            let fresh = || {
+                log.file.set_len(0)?;
+                log.file.set_len(len)?;
+                write_at(&log.file, &MAGIC.to_le_bytes(), 0)?;
+                write_at(&log.file, &piece.to_le_bytes(), 8)
+            };
+            fresh().map_err(|e| Error::io(&log.path, e))?;
         }
+        Ok(log)
     }
 
-    pub(crate) fn set(&self, idx: usize, value: u64) {
-        debug_assert!(idx < self.slots);
+    fn slot(&self, slot: u64) -> Option<u64> {
+        let mut buf = [0u8; 8];
+        read_at(&self.file, &mut buf, slot * 8)
+            .ok()
+            .map(|()| u64::from_le_bytes(buf))
+    }
+
+    pub(crate) fn get(&self, idx: u64) -> u64 {
+        debug_assert!(idx < self.pieces);
+        self.slot(HEADER + idx).unwrap_or(0)
+    }
+
+    pub(crate) fn set(&self, idx: u64, value: u64) {
+        debug_assert!(idx < self.pieces);
         // Best effort: losing an update costs a re-fetch on the next run,
         // never correctness, so a failure here must not abort the download.
-        let _ = write_at(&self.file, &value.to_le_bytes(), (idx * 8) as u64);
+        let _ = write_at(&self.file, &value.to_le_bytes(), (HEADER + idx) * 8);
     }
 
     fn discard(&self) {

@@ -18,7 +18,6 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 sha2 = "0.11"
 sha1 = "0.11"
 hex = "0.4"
-rayon = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
