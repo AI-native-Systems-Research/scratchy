@@ -285,6 +285,11 @@ pub struct MetalWorker {
     /// order `execute_model` built. Written by `forward_argmax_blocking` after
     /// the (single) host wait, read + cleared by `execute_model`.
     fused_sampled: Option<Vec<u32>>,
+    /// The greedy argmax's output (one u32 per row) and its `[batch, vocab]`
+    /// constants, reused across forwards and grown only when a forward has
+    /// more rows.
+    argmax_out: Option<PinnedBuffer>,
+    argmax_consts: Option<PinnedBuffer>,
     /// Per-request grammar FSM state for constrained / guided decoding
     /// (`guided_grammar` / `response_format`). Keyed by req_id; created
     /// the first time a request with a grammar is scheduled and dropped
@@ -304,24 +309,14 @@ pub struct MetalWorker {
     /// `forward_argmax_blocking` to dispatch the mask before argmax.
     #[cfg(feature = "guided-decoding")]
     grammar_pending: Option<GrammarMaskHost>,
-    /// Persistent residency-pinned GPU buffers for the grammar mask, reused
-    /// across decode steps (memcpy per step). They MUST be pinned in the
-    /// residency set: a freshly-allocated, gpuAddress-bound bitset is evicted
-    /// under KV memory pressure (large-vocab models like Qwen at long context),
-    /// so the kernel would read garbage and the mask would silently fail. Grown
-    /// (realloc + re-pin + commit) only when a batch's bitset/row count exceeds
-    /// the current capacity; steady-state steps just memcpy into them.
+    /// The grammar mask's allow-bitsets, row map and constants, reused across
+    /// decode steps (memcpy per step) and grown only when a batch needs more.
     #[cfg(feature = "guided-decoding")]
-    grammar_buf_allow: Option<scratchy_target_metal::grammar_mask::Buffer>,
+    grammar_buf_allow: Option<PinnedBuffer>,
     #[cfg(feature = "guided-decoding")]
-    grammar_buf_rows: Option<scratchy_target_metal::grammar_mask::Buffer>,
+    grammar_buf_rows: Option<PinnedBuffer>,
     #[cfg(feature = "guided-decoding")]
-    grammar_buf_gconsts: Option<scratchy_target_metal::grammar_mask::Buffer>,
-    /// Capacities (in u32 words) of `grammar_buf_allow` / `grammar_buf_rows`.
-    #[cfg(feature = "guided-decoding")]
-    grammar_cap_allow: usize,
-    #[cfg(feature = "guided-decoding")]
-    grammar_cap_rows: usize,
+    grammar_buf_gconsts: Option<PinnedBuffer>,
     /// Phase 6 chain-advance kernel. One small kernel that bumps
     /// per-req `runtime.positions` / `slot_mapping` / `seqused_k` in
     /// place between K-step chain iters. Cached at load_model so the
@@ -639,6 +634,8 @@ impl MetalWorker {
             sampler_logits: None,
             pending_sampler: None,
             fused_sampled: None,
+            argmax_out: None,
+            argmax_consts: None,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -653,10 +650,6 @@ impl MetalWorker {
             grammar_buf_rows: None,
             #[cfg(feature = "guided-decoding")]
             grammar_buf_gconsts: None,
-            #[cfg(feature = "guided-decoding")]
-            grammar_cap_allow: 0,
-            #[cfg(feature = "guided-decoding")]
-            grammar_cap_rows: 0,
             chain_advance_kernel: None,
             draft_queue: None,
             target_kv_single_buffers: Vec::new(),
@@ -1417,24 +1410,19 @@ fn metal_chain_dispatch(
     };
 
     // ── 2. Allocate K argmax output buffers (host-visible) ──────
+    // Pinned for the duration of this call, like the constants below.
+    let residency = device_mut.allocator.residency().clone();
     let argmax_bytes = (req.num_tokens.max(1)) * 4;
-    let argmax_bufs: Vec<
-        ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>,
-    > = (0..k)
-        .map(|_| {
-            mtl_device
-                .newBufferWithLength_options(
-                    argmax_bytes,
-                    ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                )
-                .expect("argmax_buf alloc returned nil")
-        })
+    let pinned_argmax: Vec<PinnedBuffer> = (0..k)
+        .map(|_| PinnedBuffer::new(&mtl_device, &residency, argmax_bytes))
         .collect();
+    let argmax_bufs: Vec<scratchy_target_metal::mtl4_dispatch::Buffer> =
+        pinned_argmax.iter().map(|b| (**b).clone()).collect();
 
     // ── 3. Pack constants ───────────────────────────────────────
-    let consts_buf = mtl_device
-        .newBufferWithLength_options(16, ::objc2_metal::MTLResourceOptions::StorageModeShared)
-        .expect("consts_buf alloc returned nil");
+    let pinned_consts = PinnedBuffer::new(&mtl_device, &residency, 16);
+    residency.commit();
+    let consts_buf = (*pinned_consts).clone();
     let vocab_u32 = model_ref.vocab_size() as u32;
     unsafe {
         let p = consts_buf.contents().as_ptr() as *mut u32;
@@ -1705,10 +1693,9 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
         let mtl_device = device_buf.device.clone();
         // Owned handle to the shared residency set, cloned early (before the
-        // later `self.gpu_device.as_mut()` borrow) so the grammar-mask buffers
-        // can be pinned without extending `device_buf`'s borrow.
-        #[cfg(feature = "guided-decoding")]
-        let grammar_residency = device_buf.allocator.residency().clone();
+        // later `self.gpu_device.as_mut()` borrow) so the argmax and grammar-mask
+        // buffers can be pinned without extending `device_buf`'s borrow.
+        let residency = device_buf.allocator.residency().clone();
 
         let argmax_kernels = self
             .argmax_kernels
@@ -1951,16 +1938,17 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // one host wait. Pre-6a took the unfused path (separate dispatch
         // + commit + wait + readback) for 5.2a simplicity; this re-folds
         // it. Per call: 2 commit+waits → 1.
-        let argmax_bytes = (req.num_tokens.max(1)) * 4;
-        let argmax_out = mtl_device
-            .newBufferWithLength_options(
-                argmax_bytes,
-                ::objc2_metal::MTLResourceOptions::StorageModeShared,
-            )
-            .expect("argmax_out alloc returned nil");
-        let consts_buf = mtl_device
-            .newBufferWithLength_options(8, ::objc2_metal::MTLResourceOptions::StorageModeShared)
-            .expect("argmax consts alloc returned nil");
+        let grew = PinnedBuffer::reserve(
+            &mut self.argmax_out,
+            &mtl_device,
+            &residency,
+            req.num_tokens.max(1) * 4,
+        ) | PinnedBuffer::reserve(&mut self.argmax_consts, &mtl_device, &residency, 8);
+        if grew {
+            residency.commit();
+        }
+        let argmax_out = (**self.argmax_out.as_ref().expect("reserved above")).clone();
+        let consts_buf = (**self.argmax_consts.as_ref().expect("reserved above")).clone();
         let arg_table = {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
             let desc = MTL4ArgumentTableDescriptor::new();
@@ -1981,11 +1969,8 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             argmax_kernels;
         let argmax_kernels_addr = argmax_kernels_ptr as usize;
         // Stage this step's grammar mask (constrained / guided decoding) into
-        // the PERSISTENT residency-pinned buffers (grown + re-pinned only when a
-        // batch exceeds capacity). Pinning is mandatory: a per-step freshly
-        // allocated bitset gets evicted under KV pressure and the kernel reads
-        // garbage (see the `grammar_buf_*` field docs). The closure binds these
-        // by gpuAddress and runs the mask on the forward encoder before argmax.
+        // its pinned buffers. The closure binds these by gpuAddress and runs
+        // the mask on the forward encoder before argmax.
         #[cfg(feature = "guided-decoding")]
         let grammar_pending = self.grammar_pending.take();
         #[cfg(feature = "guided-decoding")]
@@ -1995,40 +1980,24 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             use ::objc2_metal::{MTLBuffer, MTLDevice};
             let kernels_addr =
                 kernels as *const scratchy_target_metal::grammar_mask::GrammarMaskKernels as usize;
-            let opts = ::objc2_metal::MTLResourceOptions::StorageModeShared;
-            let mut grew = false;
-            let need_allow = h.allow_bits.len().max(1);
-            if self.grammar_buf_allow.is_none() || self.grammar_cap_allow < need_allow {
-                let buf = mtl_device
-                    .newBufferWithLength_options(need_allow * 4, opts)
-                    .expect("grammar allow_bits buf");
-                grammar_residency.insert(&buf);
-                self.grammar_buf_allow = Some(buf);
-                self.grammar_cap_allow = need_allow;
-                grew = true;
-            }
-            let need_rows = h.rows.len().max(1);
-            if self.grammar_buf_rows.is_none() || self.grammar_cap_rows < need_rows {
-                let buf = mtl_device
-                    .newBufferWithLength_options(need_rows * 4, opts)
-                    .expect("grammar rows buf");
-                grammar_residency.insert(&buf);
-                self.grammar_buf_rows = Some(buf);
-                self.grammar_cap_rows = need_rows;
-                grew = true;
-            }
-            if self.grammar_buf_gconsts.is_none() {
-                let buf = mtl_device
-                    .newBufferWithLength_options(2 * 4, opts)
-                    .expect("grammar gconsts buf");
-                grammar_residency.insert(&buf);
-                self.grammar_buf_gconsts = Some(buf);
-                grew = true;
-            }
-            // Commit the residency set only when a buffer was (re)allocated;
-            // steady-state steps reuse the already-pinned buffers.
+            let grew = PinnedBuffer::reserve(
+                &mut self.grammar_buf_allow,
+                &mtl_device,
+                &residency,
+                h.allow_bits.len().max(1) * 4,
+            ) | PinnedBuffer::reserve(
+                &mut self.grammar_buf_rows,
+                &mtl_device,
+                &residency,
+                h.rows.len().max(1) * 4,
+            ) | PinnedBuffer::reserve(
+                &mut self.grammar_buf_gconsts,
+                &mtl_device,
+                &residency,
+                8,
+            );
             if grew {
-                grammar_residency.commit();
+                residency.commit();
             }
             let allow = self.grammar_buf_allow.as_ref().unwrap();
             let rows = self.grammar_buf_rows.as_ref().unwrap();
@@ -2060,9 +2029,9 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                     .expect("grammar_mask arg_table alloc returned nil")
             };
             Some(GrammarMaskGpu {
-                allow_bits: allow.clone(),
-                rows: rows.clone(),
-                gconsts: gconsts.clone(),
+                allow_bits: (**allow).clone(),
+                rows: (**rows).clone(),
+                gconsts: (**gconsts).clone(),
                 arg_table,
                 num_rows: h.rows.len() as u32,
                 kernels_addr,
@@ -2496,6 +2465,69 @@ impl Drop for ResidencyPanicGuard {
                 set.shutdown();
             }
         }
+    }
+}
+
+/// A shared-storage buffer held in a residency set for as long as it lives.
+/// MTL4 keeps resident only what a command buffer's residency sets hold, so
+/// every buffer the forward reaches by GPU address (bound into an argument
+/// table rather than through the arena) must be one of these: the GPU's writes
+/// to an unpinned fresh buffer can be silently lost — the greedy argmax read
+/// back all zeros (token `!`) for prompts whose last chunk ran ~2k tokens, and
+/// grammar bitsets read as garbage under KV pressure. Dropping it unpins it.
+#[cfg(feature = "metal")]
+struct PinnedBuffer {
+    buffer: scratchy_target_metal::mtl4_dispatch::Buffer,
+    residency: scratchy_target_metal::residency::MetalResidencySet,
+}
+
+#[cfg(feature = "metal")]
+impl PinnedBuffer {
+    /// A zeroed buffer of `bytes`, pinned. Commit `residency` before the
+    /// command buffer that reads it is committed.
+    fn new(
+        device: &scratchy_target_metal::mtl4_dispatch::Device,
+        residency: &scratchy_target_metal::residency::MetalResidencySet,
+        bytes: usize,
+    ) -> Self {
+        let buffer = scratchy_target_metal::mtl4_dispatch::shared_zeroed(device, bytes);
+        residency.insert(&buffer);
+        Self {
+            buffer,
+            residency: residency.clone(),
+        }
+    }
+
+    /// Grow `slot` to at least `bytes`, replacing (and unpinning) a smaller
+    /// buffer. Returns whether it allocated, i.e. whether `residency` needs a
+    /// commit.
+    fn reserve(
+        slot: &mut Option<Self>,
+        device: &scratchy_target_metal::mtl4_dispatch::Device,
+        residency: &scratchy_target_metal::residency::MetalResidencySet,
+        bytes: usize,
+    ) -> bool {
+        use ::objc2_metal::MTLBuffer;
+        if slot.as_ref().is_some_and(|p| p.buffer.length() >= bytes) {
+            return false;
+        }
+        *slot = Some(Self::new(device, residency, bytes));
+        true
+    }
+}
+
+#[cfg(feature = "metal")]
+impl std::ops::Deref for PinnedBuffer {
+    type Target = scratchy_target_metal::mtl4_dispatch::Buffer;
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        self.residency.remove(&self.buffer);
     }
 }
 
@@ -5014,6 +5046,8 @@ impl Worker for MetalWorker {
         self.kv_cache = None; // drops the file-backed store(s) → Drop msyncs their codes
         self.model = None;
         self.argmax_kernels = None;
+        self.argmax_out = None;
+        self.argmax_consts = None;
         #[cfg(feature = "guided-decoding")]
         {
             self.grammar_mask_kernels = None;
@@ -5021,8 +5055,6 @@ impl Worker for MetalWorker {
             self.grammar_buf_allow = None;
             self.grammar_buf_rows = None;
             self.grammar_buf_gconsts = None;
-            self.grammar_cap_allow = 0;
-            self.grammar_cap_rows = 0;
             self.grammar_states.clear();
             self.grammar_factory = None;
         }
