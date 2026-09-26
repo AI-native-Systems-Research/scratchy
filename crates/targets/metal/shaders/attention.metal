@@ -274,6 +274,14 @@ constant bool ATTN_TQ_KB = is_function_constant_defined(ATTN_TQ_K_BIAS);
 constant uint ATTN_TQ_V_BIAS [[function_constant(15)]];
 constant bool ATTN_TQ_VB = is_function_constant_defined(ATTN_TQ_V_BIAS);
 
+//  16  ATTN_TQ_HEADS — query heads per decode threadgroup under TurboQuant:
+//      consecutive heads of one KV head, so each key's codes are decoded once
+//      for all of them (decode is ALU-bound on that decode). Unset: 1.
+//      heads * head_dim / 32 <= 32.
+constant uint ATTN_TQ_HEADS_FC [[function_constant(16)]];
+constant uint ATTN_TQ_HEADS =
+    is_function_constant_defined(ATTN_TQ_HEADS_FC) ? ATTN_TQ_HEADS_FC : 1u;
+
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
 // ownership). Under both the contiguous and the co-resident layout the bits of
@@ -652,9 +660,13 @@ template <typename T>
     const float scale      = ATTN_SCALE_FC;
 
     const uint qk_per_thread = head_dim / uint(BD);
+    // Query heads this threadgroup serves (ATTN_TQ_HEADS): `heads`
+    // consecutive heads of one KV head; per-head state is indexed
+    // `[h * qk_per_thread + j]`.
+    const uint heads = (ATTN_TQ != 0u) ? ATTN_TQ_HEADS : 1u;
 
     const uint seq_idx     = tg_pos.x;            // batch index
-    const uint q_head_idx  = tg_pos.y;            // 0..NUM_Q_HEADS
+    const uint q_head_idx  = tg_pos.y * heads;    // first of `heads` query heads
     const uint group_ratio = num_q / num_kv;
     const uint kv_head_idx = q_head_idx / group_ratio;
     const uint kv_len      = seq_used_k[seq_idx];
@@ -663,13 +675,13 @@ template <typename T>
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
-    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim<=512;
-    thread U o_reg[16];                 // Gemma4 global layers are 512)
+    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim <= 512)
+    thread U o_reg[32];                 // [h * qk_per_thread + j], <= 32 (ATTN_TQ_HEADS)
 
     // Threadgroup scratch for per-simdgroup max + sum_exp combine.
     threadgroup U tg_outputs[BN * BD];
-    threadgroup U tg_max[BN];
-    threadgroup U tg_sum[BN];
+    threadgroup U tg_max[BN * 8];       // [head][simdgroup], heads <= 8
+    threadgroup U tg_sum[BN * 8];
 
     device const T*    q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
     device       T*    o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
@@ -678,10 +690,21 @@ template <typename T>
     // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
     // Element ownership follows attn_elem_off (contiguous, or co-resident
     // NeoX pairs under ATTN_PAIR_CORESIDENT) — Q must match K's per-lane set.
-    for (uint i = 0; i < qk_per_thread; ++i) {
-        q_reg[i] = U(scale) * U(q_row[attn_elem_off(simd_lid, i, qk_per_thread, head_dim)]);
+    // Under TurboQuant only the rare plain-domain keys (the tail, span blocks)
+    // use it, and they read it per head from q_row instead (`q_plain`).
+    if (ATTN_TQ == 0u) {
+        for (uint i = 0; i < qk_per_thread; ++i) {
+            q_reg[i] = U(scale) * U(q_row[attn_elem_off(simd_lid, i, qk_per_thread, head_dim)]);
+        }
+    }
+    for (uint i = 0; i < heads * qk_per_thread; ++i) {
         o_reg[i] = 0;
     }
+    auto q_plain = [&](uint h, uint j) -> U {
+        return ATTN_TQ == 0u
+            ? q_reg[j]
+            : U(scale) * U(q_row[h * head_dim + attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+    };
 
     // TurboQuant: q rotated into the codebook domain, `s²·H·D·q`. The
     // codebook domain is laid out contiguously — lane `l` owns elements
@@ -690,15 +713,18 @@ template <typename T>
     // Every simdgroup owns the same slices and rotates its own copy in
     // registers. The codebook (<= 16 centroids) is staged once.
     const uint tq_e = simd_lid * qk_per_thread;
-    thread U qt_reg[16];
+    thread U qt_reg[32];
     threadgroup U tq_lut[16];
     if (ATTN_TQ != 0u) {
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            qt_reg[j] = U(scale) * U(q_row[tq_e + j]) * tq_signs[tq_e + j];
-        }
-        tq_wht(qt_reg, qk_per_thread, simd_lid);
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            qt_reg[j] /= U(head_dim);
+        for (uint h = 0; h < heads; ++h) {
+            thread U* qt = qt_reg + h * qk_per_thread;
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                qt[j] = U(scale) * U(q_row[h * head_dim + tq_e + j]) * tq_signs[tq_e + j];
+            }
+            tq_wht(qt, qk_per_thread, simd_lid);
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                qt[j] /= U(head_dim);
+            }
         }
         const uint tid = simd_gid * uint(BD) + simd_lid;
         if (tid < (1u << ATTN_TQ)) {
@@ -715,37 +741,45 @@ template <typename T>
     device const T* kb = tq_k_bias + kv_head_idx * head_dim;
     device const T* vb = tq_v_bias + kv_head_idx * head_dim;
     const uint kb_np = (ATTN_ROT_DIM / 2u + 31u) / 32u;
-    thread U kb_a[8];                   // kb_np <= 8 (head_dim <= 512)
-    thread U kb_b[8];
-    U kb_c = 0;
+    thread U kb_a[16];                  // [h * kb_np + j]
+    thread U kb_b[16];
+    thread U kb_c[8];
     if (ATTN_TQ_KB) {
         const uint half_rot = ATTN_ROT_DIM / 2u;
-        for (uint j = 0; j < kb_np; ++j) {
-            const uint d = simd_lid * kb_np + j;
-            kb_a[j] = 0;
-            kb_b[j] = 0;
-            if (d < half_rot) {
-                const U q0 = U(scale) * U(q_row[d]);
-                const U q1 = U(scale) * U(q_row[d + ATTN_PAIR_OFF]);
-                const U b0 = U(kb[d]);
-                const U b1 = U(kb[d + ATTN_PAIR_OFF]);
-                kb_a[j] = q0 * b0 + q1 * b1;
-                kb_b[j] = q1 * b0 - q0 * b1;
+        for (uint h = 0; h < heads; ++h) {
+            device const T* qh = q_row + h * head_dim;
+            for (uint j = 0; j < kb_np; ++j) {
+                const uint d = simd_lid * kb_np + j;
+                kb_a[h * kb_np + j] = 0;
+                kb_b[h * kb_np + j] = 0;
+                if (d < half_rot) {
+                    const U q0 = U(scale) * U(qh[d]);
+                    const U q1 = U(scale) * U(qh[d + ATTN_PAIR_OFF]);
+                    const U b0 = U(kb[d]);
+                    const U b1 = U(kb[d + ATTN_PAIR_OFF]);
+                    kb_a[h * kb_np + j] = q0 * b0 + q1 * b1;
+                    kb_b[h * kb_np + j] = q1 * b0 - q0 * b1;
+                }
             }
-        }
-        for (uint e = simd_lid; e < head_dim; e += 32u) {
-            if (e >= half_rot && (e < ATTN_PAIR_OFF || e >= ATTN_PAIR_OFF + half_rot)) {
-                kb_c += U(scale) * U(q_row[e]) * U(kb[e]);
+            U c = 0;
+            for (uint e = simd_lid; e < head_dim; e += 32u) {
+                if (e >= half_rot && (e < ATTN_PAIR_OFF || e >= ATTN_PAIR_OFF + half_rot)) {
+                    c += U(scale) * U(qh[e]) * U(kb[e]);
+                }
             }
+            kb_c[h] = simd_sum(c);
         }
-        kb_c = simd_sum(kb_c);
     }
 
     // Initialize per-thread max with finite minimum (MLX uses
     // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
     // fast::exp doesn't handle -INFINITY safely so we avoid it.
-    U max_score = -FLT_MAX;
-    U sum_exp_score = 0;
+    U max_score[8];
+    U sum_exp_score[8];
+    for (uint h = 0; h < heads; ++h) {
+        max_score[h] = -FLT_MAX;
+        sum_exp_score[h] = 0;
+    }
 
     // TurboQuant: the key this step appended (the query's own, at kv_len-1)
     // is not in the packed store yet — uniform arches quantize after
@@ -779,10 +813,13 @@ template <typename T>
         const uint tq_row =
             ((bt_raw & 0x7FFFFFFFu) * block_size + token_in_block) * num_kv + kv_head_idx;
 
-        U score = 0;
+        U score[8];                     // this lane's share of each head's q·k
+        for (uint h = 0; h < heads; ++h) {
+            score[h] = 0;
+        }
         U k_scale = 1;
-        U k_off = 0;     // this lane's share of q·R_i·b (TurboQuant K bias)
-        U k_off_c = 0;   // its unrotated part, simdgroup-uniform
+        U k_off[8];                     // this lane's share of q·R_i·b (TurboQuant K bias)
+        const bool k_biased = ATTN_TQ_KB && packed && !do_rot;
         device const T* v_ptr = nullptr;
         if (packed) {
             const uint k_word = tq_row * tq_pdim;
@@ -804,24 +841,38 @@ template <typename T>
                     k_loc[j] = U(T(ATTN_TQ_KB ? x + U(kb[e]) : x));
                 }
                 attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
-                for (uint j = 0; j < qk_per_thread; ++j) {
-                    score += q_reg[j] * k_loc[j];
+                for (uint h = 0; h < heads; ++h) {
+                    for (uint j = 0; j < qk_per_thread; ++j) {
+                        score[h] += q_plain(h, j) * k_loc[j];
+                    }
                 }
             } else {
+                U k_code[16];
                 for (uint j = 0; j < qk_per_thread; ++j) {
-                    score += qt_reg[j] * tq_lut[tq_code(tq_packed_k, k_word, tq_e + j)];
+                    k_code[j] = tq_lut[tq_code(tq_packed_k, k_word, tq_e + j)];
+                }
+                for (uint h = 0; h < heads; ++h) {
+                    for (uint j = 0; j < qk_per_thread; ++j) {
+                        score[h] += qt_reg[h * qk_per_thread + j] * k_code[j];
+                    }
                 }
                 k_scale = tq_norms_k[tq_row];
-                if (ATTN_TQ_KB) {
+                if (k_biased) {
                     const uint d0 = simd_lid * kb_np;
                     device const T* cos_row = cos_sin + i * ATTN_ROT_DIM + d0;
                     device const T* sin_row = cos_row + ATTN_ROT_DIM / 2u;
+                    for (uint h = 0; h < heads; ++h) {
+                        k_off[h] = 0;
+                    }
                     for (uint j = 0; j < kb_np; ++j) {
                         if (d0 + j < ATTN_ROT_DIM / 2u) {
-                            k_off += kb_a[j] * U(cos_row[j]) + kb_b[j] * U(sin_row[j]);
+                            const U c = U(cos_row[j]);
+                            const U s = U(sin_row[j]);
+                            for (uint h = 0; h < heads; ++h) {
+                                k_off[h] += kb_a[h * kb_np + j] * c + kb_b[h * kb_np + j] * s;
+                            }
                         }
                     }
-                    k_off_c = kb_c;
                 }
             }
         } else {
@@ -859,98 +910,108 @@ template <typename T>
             // in registers first; every other key dots directly from k_ptr —
             // byte-identical to the rope-on-write hot path (the rope-on-read
             // parity guarantee).
+            U k_loc[16];
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                k_loc[j] = U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+            }
             if (do_rot) {
-                U k_loc[16];
-                for (uint j = 0; j < qk_per_thread; ++j) {
-                    k_loc[j] = U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
-                }
                 attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
+            }
+            for (uint h = 0; h < heads; ++h) {
                 for (uint j = 0; j < qk_per_thread; ++j) {
-                    score += q_reg[j] * k_loc[j];
-                }
-            } else {
-                for (uint j = 0; j < qk_per_thread; ++j) {
-                    score += q_reg[j] * U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                    score[h] += q_plain(h, j) * k_loc[j];
                 }
             }
         }
-        // k_scale is simdgroup-uniform, so a K bias's term joins the one
-        // reduction; without one this is exactly the plain score.
-        score = ATTN_TQ_KB ? simd_sum(score * k_scale + k_off) + k_off_c
-                           : simd_sum(score) * k_scale;
 
-        // Online softmax update. Match MLX `sdpa_vector`: fast::exp
-        // for both factor + exp_score.
-        U new_max = max(max_score, score);
-        U factor = metal::fast::exp(max_score - new_max);
-        U exp_score = metal::fast::exp(score - new_max);
-
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
+        // Online softmax update per head. Match MLX `sdpa_vector`:
+        // fast::exp for both factor + exp_score. k_scale is
+        // simdgroup-uniform, so a K bias's term joins the one reduction;
+        // without one this is exactly the plain score.
+        U factor[8];
+        U exp_score[8];
+        for (uint h = 0; h < heads; ++h) {
+            const U s = k_biased ? simd_sum(score[h] * k_scale + k_off[h]) + kb_c[h]
+                                 : simd_sum(score[h]) * k_scale;
+            const U new_max = max(max_score[h], s);
+            factor[h] = metal::fast::exp(max_score[h] - new_max);
+            exp_score[h] = metal::fast::exp(s - new_max);
+            max_score[h] = new_max;
+            sum_exp_score[h] = sum_exp_score[h] * factor[h] + exp_score[h];
+        }
 
         // Accumulate weighted V; rescale prior accumulator with factor.
         // V element ownership matches K/Q (attn_elem_off). Under TurboQuant
         // the accumulator lives in the codebook domain.
+        U v_loc[16];
         if (packed) {
             const uint v_word = tq_row * tq_pdim;
-            const U p_norm = exp_score * tq_norms_v[tq_row];
             for (uint j = 0; j < qk_per_thread; ++j) {
-                o_reg[j] = o_reg[j] * factor + p_norm * tq_lut[tq_code(tq_packed_v, v_word, tq_e + j)];
+                v_loc[j] = tq_lut[tq_code(tq_packed_v, v_word, tq_e + j)];
+            }
+            const U v_norm = tq_norms_v[tq_row];
+            for (uint h = 0; h < heads; ++h) {
+                exp_score[h] *= v_norm;
             }
         } else if (ATTN_TQ != 0u) {
             // The tail's plain V into the codebook domain: s²·D·H·(H·D·v) = v.
             // Centered like the packed codes; the bias returns at the output.
-            U v_loc[16];
             for (uint j = 0; j < qk_per_thread; ++j) {
                 const U v = U(v_ptr[tq_e + j]);
                 v_loc[j] = (ATTN_TQ_VB ? v - U(vb[tq_e + j]) : v) * tq_signs[tq_e + j];
             }
             tq_wht(v_loc, qk_per_thread, simd_lid);
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                o_reg[j] = o_reg[j] * factor + exp_score * v_loc[j];
-            }
         } else {
             for (uint j = 0; j < qk_per_thread; ++j) {
-                o_reg[j] = o_reg[j] * factor
-                         + exp_score * U(v_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                v_loc[j] = U(v_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+            }
+        }
+        for (uint h = 0; h < heads; ++h) {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_reg[h * qk_per_thread + j] =
+                    o_reg[h * qk_per_thread + j] * factor[h] + exp_score[h] * v_loc[j];
             }
         }
     }
 
     // ── Combine per-simdgroup partials ───────────────────────────
     //
-    // Each simdgroup's lane 0 publishes its max + sum_exp; all
+    // Each simdgroup's lane 0 publishes its max + sum_exp per head; all
     // simdgroups then read all values via lane id and reduce.
     if (simd_lid == 0) {
-        tg_max[simd_gid] = max_score;
-        tg_sum[simd_gid] = sum_exp_score;
+        for (uint h = 0; h < heads; ++h) {
+            tg_max[h * BN + simd_gid] = max_score[h];
+            tg_sum[h * BN + simd_gid] = sum_exp_score[h];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Each lane (within simdgroup_id 0..BN-1) reads tg_max[simd_lid]
-    // / tg_sum[simd_lid]; simd_max + simd_sum produce the global max
-    // and (factor-rescaled) global sum_exp.
-    U other_max = tg_max[simd_lid];
-    U global_max = simd_max(other_max);
-    U factor = metal::fast::exp(other_max - global_max);
-    U global_sum = simd_sum(tg_sum[simd_lid] * factor);
+    for (uint h = 0; h < heads; ++h) {
+        // Each lane (within simdgroup_id 0..BN-1) reads tg_max[simd_lid]
+        // / tg_sum[simd_lid]; simd_max + simd_sum produce the global max
+        // and (factor-rescaled) global sum_exp.
+        U other_max = tg_max[h * BN + simd_lid];
+        U global_max = simd_max(other_max);
+        U factor = metal::fast::exp(other_max - global_max);
+        U global_sum = simd_sum(tg_sum[h * BN + simd_lid] * factor);
 
-    // Combine output partials. Each simdgroup wrote o_reg[j] for
-    // its slice; we need to weight each simdgroup's contribution by
-    // its `factor` (the rescaling for the global max), then sum
-    // across simdgroups, then divide by global_sum.
-    for (uint j = 0; j < qk_per_thread; ++j) {
-        tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Each simdgroup reads its column from tg_outputs and sums
-        // across the BD partials, weighted by per-simdgroup factor.
-        U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
-        U combined = simd_sum(val);
-        if (global_sum != 0) {
-            combined = combined / global_sum;
+        // Combine output partials. Each simdgroup wrote o_reg[j] for
+        // its slice; we need to weight each simdgroup's contribution by
+        // its `factor` (the rescaling for the global max), then sum
+        // across simdgroups, then divide by global_sum.
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            tg_outputs[simd_lid * BD + simd_gid] = o_reg[h * qk_per_thread + j];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Each simdgroup reads its column from tg_outputs and sums
+            // across the BD partials, weighted by per-simdgroup factor.
+            U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
+            U combined = simd_sum(val);
+            if (global_sum != 0) {
+                combined = combined / global_sum;
+            }
+            o_reg[h * qk_per_thread + j] = combined;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        o_reg[j] = combined;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // The combine transposes lane<->simdgroup, so simdgroup `simd_gid`
@@ -958,21 +1019,25 @@ template <typename T>
     // loop.
     if (ATTN_TQ != 0u) {
         // Codebook-domain output: gather it back into lane slices and
-        // rotate once, o = s²·D·H·a.
+        // rotate once, o = s²·D·H·a — simdgroup `h` for head `h`.
         if (simd_lid == 0) {
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                tg_outputs[simd_gid * qk_per_thread + j] = o_reg[j];
+            for (uint h = 0; h < heads; ++h) {
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    tg_outputs[h * head_dim + simd_gid * qk_per_thread + j] =
+                        o_reg[h * qk_per_thread + j];
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_gid == 0) {
+        if (simd_gid < heads) {
+            U o_loc[16];
             for (uint j = 0; j < qk_per_thread; ++j) {
-                o_reg[j] = tg_outputs[tq_e + j];
+                o_loc[j] = tg_outputs[simd_gid * head_dim + tq_e + j];
             }
-            tq_wht(o_reg, qk_per_thread, simd_lid);
+            tq_wht(o_loc, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
-                const U o = o_reg[j] * tq_signs[tq_e + j] / U(head_dim);
-                o_row[tq_e + j] = T(ATTN_TQ_VB ? o + U(vb[tq_e + j]) : o);
+                const U o = o_loc[j] * tq_signs[tq_e + j] / U(head_dim);
+                o_row[simd_gid * head_dim + tq_e + j] = T(ATTN_TQ_VB ? o + U(vb[tq_e + j]) : o);
             }
         }
     } else if (simd_lid == 0) {
