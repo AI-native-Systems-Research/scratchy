@@ -3,7 +3,8 @@
 //! dequantized context — against a host f32 decode of the very same codes.
 //!
 //! - Decode (one query per sequence): `attention_via_cache_v2` with
-//!   `ATTN_TQ_BITS`, reading the packed store in the codebook domain.
+//!   `ATTN_TQ_BITS`, reading the packed store in the codebook domain, each
+//!   threadgroup serving the production `TqDecodeHeads` query heads.
 //! - Prefill (a chunk of queries per sequence): `tq_stage_rotated` stages K and
 //!   V in the codebook's rotated domain, `tq_rotate_rows` rotates q in and the
 //!   output back, and the production paged prefill attention runs unchanged
@@ -25,6 +26,7 @@ use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::ids::{HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -114,6 +116,9 @@ struct Case {
     /// few channels: K is cached as `signal + R_t·b_k` (unrotated `b_k` in a
     /// span block), V as `signal + b_v`.
     bias: Option<f32>,
+    /// Query heads per decode threadgroup (`ATTN_TQ_HEADS`); `check` runs
+    /// every count `TqDecodeHeads` can pick for the geometry.
+    decode_heads: u32,
 }
 
 /// Channels of each KV head that carry the large bias.
@@ -629,7 +634,8 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     let bits = ConstantValue::uint(13, c.bits);
     let (k_bias, v_bias) = (ConstantValue::uint(14, 1), ConstantValue::uint(15, 1));
     if decode {
-        let mut consts = f.attn_constants(&[bits]);
+        let heads = c.decode_heads;
+        let mut consts = f.attn_constants(&[bits, ConstantValue::uint(16, heads)]);
         if c.rope.is_some_and(|r| r.coresident) {
             consts.push(ConstantValue::uint(12, 1));
         }
@@ -666,7 +672,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             &[],
             &[],
             &resident,
-            tg(n_seqs, c.num_q_heads, 1),
+            tg(n_seqs, c.num_q_heads / heads as usize, 1),
             tg(1024, 1, 1),
         );
     } else {
@@ -824,7 +830,31 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     })
 }
 
+/// Every query-head count a decode threadgroup can serve for `c` (one run for
+/// a prefill case).
+fn head_counts(c: &Case) -> Vec<Case> {
+    if !c.seqs.iter().all(|&(_, new)| new == 1) {
+        return vec![c.clone()];
+    }
+    TqDecodeHeads::candidates(
+        HeadDim(c.head_dim as u32),
+        NumQHeads(c.num_q_heads as u32),
+        NumKvHeads(c.num_kv_heads as u32),
+    )
+    .map(|h| Case {
+        decode_heads: h.get(),
+        ..c.clone()
+    })
+    .collect()
+}
+
 fn check(c: Case) {
+    for c in head_counts(&c) {
+        check_one(c);
+    }
+}
+
+fn check_one(c: Case) {
     let Some(Outputs { got, ideal, .. }) = run_case(&c, true) else {
         return;
     };
@@ -848,8 +878,8 @@ fn check(c: Case) {
     };
     let tol = peak * c.dtype.ulp() * rounding;
     eprintln!(
-        "{}: peak {peak:.3}  max err {err:.2e}  (tol {tol:.2e})",
-        c.name
+        "{} ({} heads/threadgroup): peak {peak:.3}  max err {err:.2e}  (tol {tol:.2e})",
+        c.name, c.decode_heads
     );
     assert!(err <= tol, "{}: max error {err} > {tol}", c.name);
 }
@@ -877,6 +907,7 @@ fn llama_3b(name: &'static str) -> Case {
         span_blocks: vec![],
         first_new_write_skipped: false,
         bias: None,
+        decode_heads: 1,
     }
 }
 
@@ -1083,6 +1114,12 @@ fn qwen2_7b(name: &'static str) -> Case {
 /// not exercise the defect. Error is measured on the output's input-dependent
 /// part (the V bias is exact either way, so it would only inflate the scale).
 fn check_fidelity(c: Case, max_rel_err: f32, min_gain: f32) {
+    for c in head_counts(&c) {
+        check_fidelity_one(c, max_rel_err, min_gain);
+    }
+}
+
+fn check_fidelity_one(c: Case, max_rel_err: f32, min_gain: f32) {
     let Some(fixed) = run_case(&c, true) else {
         return;
     };

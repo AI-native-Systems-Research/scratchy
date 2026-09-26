@@ -22,6 +22,7 @@ use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
     IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
     NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TqCodeBits,
+    TqDecodeHeads,
 };
 
 /// Append the spans rope-on-read function constants (slot 8 = rotary
@@ -271,6 +272,7 @@ pub struct AttentionViaCacheTqConstants {
     pub bits: TqCodeBits,
     pub k_bias: bool,
     pub v_bias: bool,
+    pub heads: TqDecodeHeads,
 }
 
 impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
@@ -278,6 +280,7 @@ impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
         let mut v = vec![ConstantValue::uint(ConstSlot(13), c.bits.get())];
         v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
+        v.push(ConstantValue::uint(ConstSlot(16), c.heads.get()));
         v
     }
 }

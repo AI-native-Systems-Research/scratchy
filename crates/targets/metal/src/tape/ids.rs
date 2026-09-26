@@ -261,7 +261,46 @@ u32_newtype!(
     /// TurboQuant codebook width, bits per packed code
     /// (`tq_bits(W::TQ_KV_BITS)`).
     TqCodeBits,
+    /// Query heads one TurboQuant decode threadgroup covers
+    /// (`attention.metal` `ATTN_TQ_HEADS`, slot 16) — see [`TqDecodeHeads::for_group`].
+    TqDecodeHeads,
 );
+
+impl TqDecodeHeads {
+    /// Every head count the decode kernel serves for this geometry, ascending:
+    /// the divisors of the GQA group whose per-lane state fits
+    /// (`heads * head_dim / 32 <= 32`, at most 8 heads).
+    pub fn candidates(
+        head_dim: HeadDim,
+        num_q_heads: NumQHeads,
+        num_kv_heads: NumKvHeads,
+    ) -> impl Iterator<Item = Self> {
+        let group = num_q_heads.get() / num_kv_heads.get().max(1);
+        let lanes = head_dim.get() / 32;
+        (1..=group.min(8))
+            .filter(move |&h| group.is_multiple_of(h) && h * lanes <= 32)
+            .map(Self)
+    }
+
+    /// The most heads that still leave `4/5` of the GPU's cores a threadgroup
+    /// each (one per `heads` query heads). The threadgroup decodes each packed
+    /// key once for all of them, and TurboQuant decode is ALU-bound on that
+    /// decode — but too few threadgroups idle cores. Measured on a 10-core M5
+    /// (Llama-3.2-3B, Llama-3.1-8B, Qwen2.5-3B / -7B geometries at 8k): the
+    /// best count left 8 threadgroups in every case.
+    pub fn for_group(
+        head_dim: HeadDim,
+        num_q_heads: NumQHeads,
+        num_kv_heads: NumKvHeads,
+        gpu_cores: u32,
+    ) -> Self {
+        let min_threadgroups = gpu_cores * 4 / 5;
+        Self::candidates(head_dim, num_q_heads, num_kv_heads)
+            .filter(|h| num_q_heads.get() / h.get() >= min_threadgroups)
+            .last()
+            .unwrap_or(Self(1))
+    }
+}
 
 i32_newtype!(
     /// Sliding-window width in tokens (`W::SLIDING_WINDOW`) for the

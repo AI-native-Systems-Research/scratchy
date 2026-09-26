@@ -896,18 +896,22 @@ fn tq_quantize_command<const IS_K: bool>(
 /// operand's offset (a rotated K bias by the rope-on-read table and pairing).
 fn tq_attention_command(
     p: &MetalModelConsts,
-    attn: &LoweredCommand,
+    attention: &TqAttention,
     layer: u32,
     ops: TqOperands,
 ) -> LoweredCommand {
+    let (attn, heads) = (&attention.via_cache, attention.heads);
     let mut constants = attn.constants.to_vec();
     constants.extend(Vec::from(
         super::kernel_constants::AttentionViaCacheTqConstants {
             bits: super::ids::TqCodeBits(crate::turboquant::tq_bits(p.tq_kv_bits)),
             k_bias: ops.k.0.is_some(),
             v_bias: ops.v.0.is_some(),
+            heads,
         },
     ));
+    let mut dispatch = attn.dispatch;
+    dispatch.threadgroups.1 /= heads.get();
     let mut bindings = attn.bindings.to_vec();
     bindings.extend(Vec::from(super::kernel_bindings::TqAttentionBindingSet {
         kv_layer: super::ids::LayerId(layer),
@@ -918,6 +922,7 @@ fn tq_attention_command(
         kernel: KernelId::AttentionViaCacheTq,
         constants: baked(constants),
         bindings: baked(bindings),
+        dispatch,
         ..*attn
     }
 }
@@ -949,12 +954,14 @@ fn paged_attention(instruction: &Instruction) -> Option<PagedAttention> {
     }
 }
 
-/// A paged attention lowered for `inject_tq`: its slots and the lowered
-/// command of its decode-kernel form.
+/// A paged attention lowered for `inject_tq`: its slots, the lowered
+/// command of its decode-kernel form, and the query heads each of its
+/// TurboQuant decode threadgroups serves.
 struct TqAttention {
     q: u32,
     out: u32,
     via_cache: LoweredCommand,
+    heads: super::ids::TqDecodeHeads,
 }
 
 /// What `inject_tq` compresses at one instruction: the operands it writes to
@@ -1066,7 +1073,7 @@ fn inject_tq(
             out.push(prefill(tq_rotate_command(p, a.out, true, bucket_m)));
         }
         out.push(GatedCommand::gated(
-            tq_attention_command(p, &a.via_cache, layer, ops),
+            tq_attention_command(p, &a, layer, ops),
             OnlyIfTurboquantDecode,
         ));
         return Ok(out);
@@ -1386,6 +1393,14 @@ pub fn lower(
                             q: a.q,
                             out: a.out,
                             via_cache,
+                            heads: profile.map_or(super::ids::TqDecodeHeads(1), |t| {
+                                super::ids::TqDecodeHeads::for_group(
+                                    super::ids::HeadDim(p.global_head_dim),
+                                    super::ids::NumQHeads(p.num_q_heads),
+                                    super::ids::NumKvHeads(p.num_global_kv_heads),
+                                    t.gpu_cores,
+                                )
+                            }),
                         }),
                     None => None,
                 };
@@ -9329,7 +9344,7 @@ mod tests {
         assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
         assert_eq!(
             tq.constants[fp16.constants.len()..],
-            [ConstantValue::uint(13, bits)]
+            [ConstantValue::uint(13, bits), ConstantValue::uint(16, 1)]
         );
         assert_eq!(tq.bindings[..fp16.bindings.len()], *fp16.bindings);
         let layer = crate::tape::ids::LayerId(0);
@@ -9355,6 +9370,50 @@ mod tests {
                 (13, RuntimeBindingKind::SlotMapping { layer }),
             ]
         );
+    }
+
+    /// On a profiled target the TurboQuant decode twin serves several query
+    /// heads per threadgroup: the test geometry's GQA group of 8 (head_dim 64)
+    /// fits 8, and the 10-core M5 keeps >= 8 threadgroups at 4 — so a quarter
+    /// of the fp16 command's head axis, and `ATTN_TQ_HEADS` = 4.
+    #[test]
+    fn decode_turboquant_shares_each_key_decode_across_query_heads() {
+        let p = tp();
+        let backbone = [
+            tq_writer(0, true, LLAMA_KV),
+            Instruction::AttentionViaCache(3, 6, 0, true),
+        ];
+        let tape = lower_pair(
+            &p,
+            /*chunked=*/ false,
+            &backbone,
+            &[],
+            /*backbone_barriers=*/ &[true, true],
+            /*lm_head_barriers=*/ &[],
+            /*bucket_m=*/ 1,
+            /*num_arena_slots=*/ 8,
+            /*backbone_tape_index=*/ 0,
+            /*lm_head_tape_index=*/ 1,
+            /*block_cap=*/ 128,
+            Some(&crate::targets::M5_10CORE),
+        )
+        .expect("lower_pair");
+        let find = |k| {
+            tape.commands
+                .iter()
+                .find(|c| c.command.kernel == k)
+                .expect("command")
+                .command
+        };
+        let (fp16, tq) = (
+            find(KernelId::AttentionViaCache),
+            find(KernelId::AttentionViaCacheTq),
+        );
+        assert_eq!(p.num_q_heads / p.num_kv_heads, 8);
+        let (x, y, z) = fp16.dispatch.threadgroups;
+        assert_eq!(y, p.num_q_heads);
+        assert_eq!(tq.dispatch.threadgroups, (x, y / 4, z));
+        assert_eq!(tq.constants.last(), Some(&ConstantValue::uint(16, 4)));
     }
 
     use crate::tape::lowered::RuntimeGate;
@@ -9680,7 +9739,7 @@ mod tests {
                     let bias_consts: Vec<_> = c
                         .constants
                         .iter()
-                        .filter(|k| k.index >= 14)
+                        .filter(|k| matches!(k.index, 14 | 15))
                         .copied()
                         .collect();
                     Some((c.kernel, bound_from(c, from), bias_consts))
