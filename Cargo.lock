@@ -3679,6 +3679,7 @@ dependencies = [
  "scratchy-serving-api",
  "scratchy-serving-worker",
  "scratchy-target-cuda",
+ "scratchy-target-spyre",
  "serde",
  "serde_json",
  "tempfile",
@@ -4125,6 +4126,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

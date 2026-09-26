@@ -84,6 +84,32 @@ cc = "1"
 # uses, so a fixture cannot encode a relationship production can't.
 [dev-dependencies]
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
+# EXAMPLES ONLY. `bundle_run_dev` installs a subscriber so flex's completion thread has somewhere to
+# write its CB-error lines — the `hmi_syndrome` / `qgi_syndrome` / `job_count` that say why a launch was
+# rejected. Without one, a rejected launch is a bare `sync rc=-1`.
+tracing-subscriber = { workspace = true }
+
+# ⛔⛔⛔ DECLARED, BECAUSE `--all-targets` BUILDS AN EXAMPLE AND THE DEFAULT BUILD HAS NO
+# `bundle_run` TO BUILD IT AGAINST. `bundle_run_dev.rs` calls
+# `scratchy_target_spyre::bundle_run::run`, and `bundle_run` is `#[cfg(feature = "spyre-hw")]`
+# (lib.rs:27), so cargo's auto-discovered example is compiled at DEFAULT features and fails:
+#
+#   error[E0433]: cannot find `bundle_run` in `scratchy_target_spyre`
+#     --> crates/targets/spyre/examples/bundle_run_dev.rs:49:28
+#   note: found an item that was configured out ... gated behind the `spyre-hw` feature
+#
+# MEASURED per TARGET, because the whole command's rc cannot see this: `cargo clippy
+# -p scratchy-target-spyre --all-targets -- -D warnings` is rc 101 ON MAIN ALREADY, from 18
+# pre-existing lints in test targets NO CI JOB LINTS (`doc list item without indentation`,
+# `this assertion has a constant value`, `casting to the same type`, ...). What this block changes is
+# the EXAMPLE target: without it, `could not compile scratchy-target-spyre (example
+# "bundle_run_dev")`; with it, that target is skipped and no diagnostic names this example.
+# `required-features` is the declaration that makes the example's real dependency a fact cargo knows,
+# so `--all-targets` SKIPS it off-card instead of failing — the same shape of defect as an ungated
+# `pub mod`, one level out in the target graph where a per-crate `cargo check` never looks.
+[[example]]
+name = "bundle_run_dev"
+required-features = ["spyre-hw"]
 
 # The proof harnesses in this crate compile only under the model checker, so `cfg(kani)` is a real name a
 # normal build never defines. DECLARED rather than silenced: an undeclared cfg is how ~100 commits of "the
