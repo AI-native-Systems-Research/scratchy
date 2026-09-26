@@ -222,6 +222,26 @@ impl ChildCommand {
     pub fn has_placeholder(&self) -> bool {
         self.raw.contains("{prompt}")
     }
+
+    /// The port the child was told to listen on, when its own argv says.
+    ///
+    /// Asked so a disagreement with `--port` can be refused. It is only ever a
+    /// check, never adopted: a child that takes its port from a config file or
+    /// an environment variable has none on its command line, so inferring the
+    /// port from argv would silently do nothing in exactly the cases where the
+    /// caller most needs to be told.
+    pub fn port(&self) -> Option<u16> {
+        let mut rest = self.argv.iter();
+        while let Some(arg) = rest.next() {
+            if let Some(v) = arg.strip_prefix("--port=") {
+                return v.parse().ok();
+            }
+            if arg == "--port" {
+                return rest.next()?.parse().ok();
+            }
+        }
+        None
+    }
 }
 
 /// `purge` is macOS-only and `posix_fadvise` does not exist there, so the
