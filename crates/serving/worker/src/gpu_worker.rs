@@ -2562,25 +2562,6 @@ impl Worker for MetalWorker {
     fn prefill_bucket_max_m(&self) -> Option<u32> {
         // Set by `determine_available_memory` from the target-reactive bucket
         // selection; the engine clamps `max_num_batched_tokens` to it.
-        //
-        // TurboQuant: cap the prefill chunk at 2048. A chunked-prefill
-        // CONTINUATION chunk in the 4096 bucket has a residual collapse past
-        // ~8k tokens (3rd+ continuation, finite K/V — a downstream compute NaN);
-        // the 2048 bucket is clean (steel, verified to 31k). Capping here makes
-        // long-context TurboQuant correct BY DEFAULT (no --max-num-batched-tokens
-        // flag). `tq_on` mirrors `initialize_cache`'s auto-enable (power-of-2
-        // head_dim <= 256) so it holds before that runs too.
-        // TODO: root-cause the bucket-4096 continuation NaN to restore the 4096
-        // chunk's prefill throughput.
-        let tq_on = self.config.kv_cache_dtype == "turboquant"
-            || (self.config.kv_cache_dtype == "auto"
-                && self.model.as_ref().is_some_and(|m| {
-                    let hd = m.head_dim() as usize;
-                    hd.is_power_of_two() && hd <= 256
-                }));
-        if tq_on {
-            return self.metal_prefill_bucket_max_m.map(|v| v.min(2048));
-        }
         self.metal_prefill_bucket_max_m
     }
 
