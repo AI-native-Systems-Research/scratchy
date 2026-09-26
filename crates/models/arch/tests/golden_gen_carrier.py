@@ -76,6 +76,14 @@ TINY_BOUNDS = {
     "num_attention_heads": 4,
     "num_key_value_heads": 4,
     "num_global_key_value_heads": 1,
+    # gemma4's global-attention class: 2× the sliding head_dim, preserving
+    # the full-scale class relation (512 vs 256). Shrinking to head_dim
+    # itself would COLLAPSE the classes: codegen's rope guard then reads
+    # uniform geometry and demands GLOBAL_ROT_DIM == ROT_DIM, but the
+    # classes' rope widths still differ (global proportional 0.25×, sliding
+    # full). 64 also keeps the page relation real gemma4 has (global page
+    # 1×64 = 64 < sliding page 4×32 = 128 → the supported scale-up branch).
+    "global_head_dim": 64,
     # expert counts
     "num_local_experts": 8,
     "num_experts": 8,
@@ -652,8 +660,28 @@ def rmsnorm(x, w):
 
 
 def rmsnorm_unit(x):
-    var = x.pow(2).mean(-1, keepdim=True)
-    return x * torch.rsqrt(var + STATE["rms_eps"])
+    """Gemma4 `v_norm`: per-head unit RMSNorm (RMSNormNoScale(head_dim);
+    metal rope_append_normed norms V over head_dim inside each head, NOT
+    the flat kv_heads*head_dim row). The V row width uniquely identifies
+    the attention class (sliding kv_dim vs global kv_dim), so key off it;
+    anything that doesn't match a class geometry falls back to whole-row.
+    """
+    hd = None
+    for kvh_key, hd_key in (
+        ("num_key_value_heads", "head_dim"),
+        ("num_global_key_value_heads", "global_head_dim"),
+    ):
+        kvh = STATE["bounds"].get(kvh_key)
+        h = STATE["bounds"].get(hd_key)
+        if isinstance(kvh, int) and isinstance(h, int) and kvh * h == x.shape[-1]:
+            hd = h
+            break
+    if hd is None or hd == x.shape[-1]:
+        var = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(var + STATE["rms_eps"])
+    xv = x.view(*x.shape[:-1], -1, hd)
+    var = xv.pow(2).mean(-1, keepdim=True)
+    return (xv * torch.rsqrt(var + STATE["rms_eps"])).view(*x.shape)
 
 
 def mean(x):
@@ -743,8 +771,8 @@ def _paged_write(k, v, layer, kv_heads, head_dim):
     for t in range(k.shape[0]):
         slot = sm[t]
         blk, off = slot // BLOCK_SIZE, slot % BLOCK_SIZE
-        kcache[blk, :, off, :] = k[t].view(kv_heads, head_dim)
-        vcache[blk, :, off, :] = v[t].view(kv_heads, head_dim)
+        kcache[blk, :, off, :] = k[t].reshape(kv_heads, head_dim)
+        vcache[blk, :, off, :] = v[t].reshape(kv_heads, head_dim)
 
 
 def rope_append(q, k, v, positions, rotary, layer_cache):
@@ -1270,6 +1298,14 @@ def _ckpt_key(joined, index, dec_prefix):
 def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier_text):
     from safetensors.torch import save_file
 
+    # Dual-class layer split (gemma4): pattern/remainder decide which
+    # attention class layer l runs — write_checkpoint routes each layer's
+    # shared disk leaf through its OWN class's tree (see the
+    # class_shared arm below).
+    pattern = bounds.get("sliding_window_pattern", 0)
+    remainder = bounds.get(
+        "sliding_window_global_remainder", pattern - 1 if pattern else 0)
+
     aj = {}
     aj_path = ARCH_DIR / arch / "arch.json"
     if aj_path.exists():
@@ -1356,6 +1392,55 @@ def write_checkpoint(out_dir, arch, cfg, manifest, bounds, trees, depth, carrier
                 put_f32(f"{pre}.A_log", bundle.a_log)
                 put(f"{pre}.dt_bias", bundle.dt_bias)
                 put_f32(f"{pre}.norm.weight", bundle.norm)
+            continue
+        # Dual-class per-layer leaves (gemma4): `weight_leaf_renames` maps
+        # `q_proj_global` onto the SAME disk leaf as `q_proj`, but in a
+        # real checkpoint each layer's leaf carries that LAYER's class
+        # width. Writing both trees naively to the same disk key makes
+        # the later put() clobber the earlier — the compiled side then
+        # reads the wrong class's tensor while the oracle keeps its own
+        # tree. Route each layer's disk write through the tree of THAT
+        # layer's attention class: the renamed-to key's "base" name
+        # (rename stripped) walks the class branch.
+        class_shared = None
+        for dsl_leaf, disk_leaf in renames.items():
+            # The rename key is the GLOBAL-class name (e.g.
+            # `self_attn.q_proj_global` → `self_attn.q_proj`); the shared
+            # pair is (base key, f"{base}_global"). Either member of the
+            # pair enters this arm.
+            base_of_rename = (
+                dsl_leaf[:-len("_global")] if dsl_leaf.endswith("_global")
+                else dsl_leaf)
+            if key == dsl_leaf or key == base_of_rename:
+                class_shared = base_of_rename
+                break
+        if class_shared is not None:
+            base_name = class_shared
+            global_name = f"{base_name}_global"
+            base_tree = trees
+            for p in base_name.split("."):
+                base_tree = getattr(base_tree, p)
+            # The global-class tree may not exist in the manifest for
+            # this arch (renames can be non-class, e.g. LocateAnything
+            # `mm.proj_in`): fall back to whole-list base values.
+            try:
+                global_tree = trees
+                for p in global_name.split("."):
+                    global_tree = getattr(global_tree, p)
+            except AttributeError:
+                global_tree = base_tree
+            base_list = list(base_tree) if is_layered else [base_tree]
+            glob_list = list(global_tree) if is_layered else [global_tree]
+            for l in range(len(vals)):
+                is_class_l = (l % pattern == remainder) if pattern else False
+                w = (glob_list[l] if is_class_l else base_list[l])
+                pre = disk_prefix(key, l if is_layered else None)
+                if hasattr(w, "bias") and isinstance(w.bias, torch.Tensor):
+                    put(f"{pre}.bias", w.bias)
+                if w.ndim == 2 and key not in embed_keys:
+                    put(f"{pre}.weight", w.T)
+                else:
+                    put(f"{pre}.weight", w)
             continue
         for l, t in enumerate(vals):
             pre = disk_prefix(key, l if is_layered else None)
@@ -1474,8 +1559,21 @@ def main():
             # by popping... it can't: derive skips explicit keys. Instead
             # we recompute it from the truncated layer_types below.
         }
+        # `global_head_dim` is REDERIVABLE because uniform arches derive it
+        # = head_dim — but a DISTINCT explicit value (gemma4: 512 vs 256) IS
+        # the dual-class geometry. Popping it would let the derive collapse
+        # it onto the shrunk head_dim, fusing the two attention classes
+        # (codegen's rope guard then reads uniform geometry and refuses:
+        # GLOBAL_ROT_DIM != ROT_DIM). Capture it before the pop and keep it
+        # explicit so the TINY_BOUNDS shrink below can pin it at 2× head_dim,
+        # preserving the class relation; uniform arches (value == head_dim)
+        # still pop.
+        ghd_full, hd_full = cfg.get("global_head_dim"), cfg.get("head_dim")
         for k in REDERIVABLE:
             cfg.pop(k, None)
+        if isinstance(ghd_full, int) and isinstance(hd_full, int) \
+                and ghd_full != hd_full:
+            cfg["global_head_dim"] = ghd_full
         for k, v in TINY_BOUNDS.items():
             if (cur := json_path(cfg, k)) is not None and isinstance(cur, int):
                 set_json_path(cfg, k, v)
@@ -1572,6 +1670,19 @@ def main():
         for k in REDERIVABLE:
             if k in TINY_BOUNDS and k in shrunk:
                 cfg[k] = shrunk[k]
+        # gemma4's dual-class geometry: the global q/kv projection widths
+        # (`q_global_dim` / `k_global_dim`) are derived (config.rs) as
+        # num_attention_heads × global_head_dim / num_global_key_value_heads
+        # × global_head_dim. The shrink keeps global_head_dim at 2× head_dim
+        # (64 vs 32, the full-scale class relation), so the derived global
+        # q width (4×64) stays distinct from the sliding one (4×32). The
+        # global KV head count also collapses if left at num_attention_heads
+        # — shrink it to 1 (the real gemma4 relation: 1 global kv head vs 8
+        # sliding) so the class geometry stays distinct through the shrink.
+        if "global_head_dim" in cfg and isinstance(cfg.get("num_attention_heads"), int):
+            gkv = cfg.get("num_global_key_value_heads")
+            if isinstance(gkv, int) and gkv == cfg["num_attention_heads"]:
+                cfg["num_global_key_value_heads"] = 1
         # mrope_section: bands cover the ROTARY half (rotary_dim/2), so
         # a shrunk head_dim/partial factor needs the section rescaled to
         # the new pair count — the macro's expansion guard (codegen.rs
@@ -1625,23 +1736,41 @@ def main():
     kv_heads = bounds.get("num_key_value_heads", bounds.get("num_attention_heads", 1))
     head_dim = bounds.get("head_dim", 0)
 
-    # kv pools: per-layer (k, v) zeros [NUM_BLOCKS, kv_heads, BLOCK_SIZE, head_dim]
+    # kv pools: per-layer (k, v) zeros [NUM_BLOCKS, kv_heads, BLOCK_SIZE, head_dim].
+    # gemma4's global layers carry their own (kv heads, head_dim) — the
+    # per-layer class split (pattern/remainder) decides which geometry
+    # each layer's pool takes.
     STATE["kv_cache"] = []
-    for _ in range(depth):
+    g_kv = bounds.get("num_global_key_value_heads", kv_heads)
+    g_hd = bounds.get("global_head_dim", head_dim)
+    pattern = bounds.get("sliding_window_pattern", 0)
+    remainder = bounds.get("sliding_window_global_remainder", pattern - 1 if pattern else 0)
+    for l in range(depth):
+        is_global = pattern > 0 and l % pattern == remainder
+        l_kv, l_hd = (g_kv, g_hd) if is_global else (kv_heads, head_dim)
         STATE["kv_cache"].append((
-            torch.zeros(NUM_BLOCKS, kv_heads, BLOCK_SIZE, head_dim),
-            torch.zeros(NUM_BLOCKS, kv_heads, BLOCK_SIZE, head_dim),
+            torch.zeros(NUM_BLOCKS, l_kv, BLOCK_SIZE, l_hd),
+            torch.zeros(NUM_BLOCKS, l_kv, BLOCK_SIZE, l_hd),
         ))
     STATE["layer_of"] = {id(c): i for i, c in enumerate(STATE["kv_cache"])}
 
     rot_cfg = resolve_rotary_config(cfg, bounds)
     rot_objs = {}
     max_pos = bounds.get("max_position_embeddings", 64)
+    # Which layers run the GLOBAL class (the rotary/head geometry split
+    # gemma4's dual-class attention creates): the pattern/remainder the
+    # carrier itself branches on. The GLOBAL rotary object pairs with the
+    # GLOBAL kv head count; `rotary_local` (sliding class) with the base.
+    g_kv = bounds.get("num_global_key_value_heads", kv_heads)
     for name, spec in rot_cfg.items():
         tables = build_rotary(spec[0], spec[1], min(spec[2], max_pos), spec[3], spec[4])
+        is_global_rot = name == "rotary" and (
+            bounds.get("global_partial_rotary_factor") is not None
+            or bounds.get("global_head_dim", spec[0]) != spec[0]
+            or g_kv != kv_heads)
         rot_objs[name] = {"spec": spec, "tables": tables,
                           "q_heads": bounds.get("num_attention_heads", 1),
-                          "kv_heads": kv_heads}
+                          "kv_heads": g_kv if is_global_rot else kv_heads}
     if not rot_objs:  # vision or GDN-only arch — rotary unused
         rot_objs["rotary"] = {"spec": (head_dim, head_dim, 8, 10000.0, False),
                               "tables": build_rotary(head_dim or 8, head_dim or 8, 8, 10000.0),
@@ -1650,13 +1779,32 @@ def main():
 
     STATE["attn"] = {}
     for layer in range(depth):
-        STATE["attn"][layer] = {
-            "q_heads": bounds.get("num_attention_heads", 1),
-            "kv_heads": kv_heads,
-            "head_dim": head_dim,
-            "scale": attn_scale_for(cfg, bounds, head_dim),
-            "window": bounds.get("sliding_window", 0),
-        }
+        # gemma4's per-layer class split (mirrors `layer_types` /
+        # sliding_window_pattern): global layers run global_head_dim with
+        # num_global_key_value_heads; sliding layers the base geometry.
+        is_global = False
+        pattern = bounds.get("sliding_window_pattern", 0)
+        if pattern > 0:
+            remainder = bounds.get("sliding_window_global_remainder", pattern - 1)
+            is_global = layer % pattern == remainder
+        g_kv = bounds.get("num_global_key_value_heads", kv_heads)
+        g_hd = bounds.get("global_head_dim", head_dim)
+        if is_global and (g_kv != kv_heads or g_hd != head_dim):
+            STATE["attn"][layer] = {
+                "q_heads": bounds.get("num_attention_heads", 1),
+                "kv_heads": g_kv,
+                "head_dim": g_hd,
+                "scale": attn_scale_for(cfg, bounds, g_hd),
+                "window": bounds.get("sliding_window", 0),
+            }
+        else:
+            STATE["attn"][layer] = {
+                "q_heads": bounds.get("num_attention_heads", 1),
+                "kv_heads": kv_heads,
+                "head_dim": head_dim,
+                "scale": attn_scale_for(cfg, bounds, head_dim),
+                "window": bounds.get("sliding_window", 0),
+            }
     STATE["mla_theta"] = float(cfg.get("rope_theta", 10000.0))
     STATE["mla_scale"] = 1.0 / math.sqrt(bounds.get("qk_nope_head_dim", 1) + bounds.get("qk_rope_head_dim", 1)) \
         if "qk_nope_head_dim" in bounds else 0.0
