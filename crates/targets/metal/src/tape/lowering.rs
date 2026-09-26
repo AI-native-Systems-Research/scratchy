@@ -894,24 +894,24 @@ fn tq_quantize_command<const IS_K: bool>(
 /// `ATTN_TQ_BITS` and the packed-store bindings, so it reads every key but the
 /// one this step appended straight from the packed store, restoring each
 /// operand's offset (a rotated K bias by the rope-on-read table and pairing).
+/// One query head per threadgroup until [`serve_tq_decode_heads`] sets the
+/// device's count at load.
 fn tq_attention_command(
     p: &MetalModelConsts,
     attention: &TqAttention,
     layer: u32,
     ops: TqOperands,
 ) -> LoweredCommand {
-    let (attn, heads) = (&attention.via_cache, attention.heads);
+    let attn = &attention.via_cache;
     let mut constants = attn.constants.to_vec();
     constants.extend(Vec::from(
         super::kernel_constants::AttentionViaCacheTqConstants {
             bits: super::ids::TqCodeBits(crate::turboquant::tq_bits(p.tq_kv_bits)),
             k_bias: ops.k.0.is_some(),
             v_bias: ops.v.0.is_some(),
-            heads,
+            heads: super::ids::TqDecodeHeads(1),
         },
     ));
-    let mut dispatch = attn.dispatch;
-    dispatch.threadgroups.1 /= heads.get();
     let mut bindings = attn.bindings.to_vec();
     bindings.extend(Vec::from(super::kernel_bindings::TqAttentionBindingSet {
         kv_layer: super::ids::LayerId(layer),
@@ -922,9 +922,31 @@ fn tq_attention_command(
         kernel: KernelId::AttentionViaCacheTq,
         constants: baked(constants),
         bindings: baked(bindings),
-        dispatch,
         ..*attn
     }
+}
+
+/// Have a TurboQuant decode command serve `heads` query heads per
+/// threadgroup: the pool's pick for the device it loads on, since it turns on
+/// the GPU's core count and every tape is baked for a whole chip generation.
+/// Every other command is left as it is.
+pub(crate) fn serve_tq_decode_heads(
+    command: &mut LoweredCommand,
+    heads: super::ids::TqDecodeHeads,
+) {
+    if command.kernel != KernelId::AttentionViaCacheTq {
+        return;
+    }
+    let slot = super::kernel_constants::AttentionViaCacheTqConstants::HEADS;
+    let constants = command.constants.iter().map(|c| {
+        if c.index == slot.get() {
+            ConstantValue::uint(slot, heads.get())
+        } else {
+            *c
+        }
+    });
+    command.constants = baked(constants.collect());
+    command.dispatch.threadgroups.1 /= heads.get();
 }
 
 /// A paged attention instruction: its q and output arena slots, and its
@@ -954,14 +976,12 @@ fn paged_attention(instruction: &Instruction) -> Option<PagedAttention> {
     }
 }
 
-/// A paged attention lowered for `inject_tq`: its slots, the lowered
-/// command of its decode-kernel form, and the query heads each of its
-/// TurboQuant decode threadgroups serves.
+/// A paged attention lowered for `inject_tq`: its slots and the lowered
+/// command of its decode-kernel form.
 struct TqAttention {
     q: u32,
     out: u32,
     via_cache: LoweredCommand,
-    heads: super::ids::TqDecodeHeads,
 }
 
 /// What `inject_tq` compresses at one instruction: the operands it writes to
@@ -1393,14 +1413,6 @@ pub fn lower(
                             q: a.q,
                             out: a.out,
                             via_cache,
-                            heads: profile.map_or(super::ids::TqDecodeHeads(1), |t| {
-                                super::ids::TqDecodeHeads::for_group(
-                                    super::ids::HeadDim(p.global_head_dim),
-                                    super::ids::NumQHeads(p.num_q_heads),
-                                    super::ids::NumKvHeads(p.num_global_kv_heads),
-                                    t.gpu_cores,
-                                )
-                            }),
                         }),
                     None => None,
                 };
@@ -9372,33 +9384,36 @@ mod tests {
         );
     }
 
-    /// On a profiled target the TurboQuant decode twin serves several query
-    /// heads per threadgroup: the test geometry's GQA group of 8 (head_dim 64)
-    /// fits 8, and the 10-core M5 keeps >= 8 threadgroups at 4 — so a quarter
-    /// of the fp16 command's head axis, and `ATTN_TQ_HEADS` = 4.
+    /// The TurboQuant decode twin's query heads per threadgroup turn on the
+    /// device's GPU core count, which no baked class knows: every class's
+    /// profile lowers it at one head, and the pool serves the device's count
+    /// at load. The test geometry's GQA group of 8 (head_dim 64) fits 8 heads;
+    /// the most that leave 4/5 of the cores a threadgroup is 4 on an 8-core
+    /// M1, 2 on a 16-core M1 Pro, and 1 on a 32-core M1 Max.
     #[test]
-    fn decode_turboquant_shares_each_key_decode_across_query_heads() {
+    fn decode_turboquant_heads_follow_the_device_not_the_baked_class() {
+        use crate::tape::ids::{GpuCores, HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
         let p = tp();
         let backbone = [
             tq_writer(0, true, LLAMA_KV),
             Instruction::AttentionViaCache(3, 6, 0, true),
         ];
-        let tape = lower_pair(
-            &p,
-            /*chunked=*/ false,
-            &backbone,
-            &[],
-            /*backbone_barriers=*/ &[true, true],
-            /*lm_head_barriers=*/ &[],
-            /*bucket_m=*/ 1,
-            /*num_arena_slots=*/ 8,
-            /*backbone_tape_index=*/ 0,
-            /*lm_head_tape_index=*/ 1,
-            /*block_cap=*/ 128,
-            Some(&crate::targets::M5_10CORE),
-        )
-        .expect("lower_pair");
-        let find = |k| {
+        let find = |profile, k| {
+            let tape = lower_pair(
+                &p,
+                /*chunked=*/ false,
+                &backbone,
+                &[],
+                /*backbone_barriers=*/ &[true, true],
+                /*lm_head_barriers=*/ &[],
+                /*bucket_m=*/ 1,
+                /*num_arena_slots=*/ 8,
+                /*backbone_tape_index=*/ 0,
+                /*lm_head_tape_index=*/ 1,
+                /*block_cap=*/ 128,
+                Some(profile),
+            )
+            .expect("lower_pair");
             tape.commands
                 .iter()
                 .find(|c| c.command.kernel == k)
@@ -9406,14 +9421,41 @@ mod tests {
                 .command
         };
         let (fp16, tq) = (
-            find(KernelId::AttentionViaCache),
-            find(KernelId::AttentionViaCacheTq),
+            find(&crate::targets::M1_MAX, KernelId::AttentionViaCache),
+            find(&crate::targets::M1_MAX, KernelId::AttentionViaCacheTq),
         );
+        for class in [&crate::targets::M4_10CORE, &crate::targets::M5_10CORE] {
+            assert!(
+                find(class, KernelId::AttentionViaCacheTq) == tq,
+                "one tape per class"
+            );
+        }
         assert_eq!(p.num_q_heads / p.num_kv_heads, 8);
         let (x, y, z) = fp16.dispatch.threadgroups;
         assert_eq!(y, p.num_q_heads);
-        assert_eq!(tq.dispatch.threadgroups, (x, y / 4, z));
-        assert_eq!(tq.constants.last(), Some(&ConstantValue::uint(16, 4)));
+        assert_eq!(tq.dispatch.threadgroups, (x, y, z));
+        assert_eq!(tq.constants.last(), Some(&ConstantValue::uint(16, 1)));
+        for (cores, heads) in [(8, 4), (16, 2), (32, 1)] {
+            let served_heads = TqDecodeHeads::for_group(
+                HeadDim(p.global_head_dim),
+                NumQHeads(p.num_q_heads),
+                NumKvHeads(p.num_global_kv_heads),
+                GpuCores(cores),
+            );
+            assert_eq!(served_heads, TqDecodeHeads(heads), "{cores} cores");
+            let (mut served, mut other) = (tq, fp16);
+            serve_tq_decode_heads(&mut served, served_heads);
+            serve_tq_decode_heads(&mut other, served_heads);
+            assert_eq!(served.dispatch.threadgroups, (x, y / heads, z));
+            assert_eq!(
+                served.constants.last(),
+                Some(&ConstantValue::uint(16, heads))
+            );
+            assert!(
+                other == fp16,
+                "only the TurboQuant decode command is served"
+            );
+        }
     }
 
     use crate::tape::lowered::RuntimeGate;

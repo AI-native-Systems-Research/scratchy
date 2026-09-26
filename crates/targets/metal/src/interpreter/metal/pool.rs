@@ -137,6 +137,9 @@ pub enum PoolBuildError {
     /// needs at least one bucket; degenerate models that emit none
     /// would fail at `pick_bucket` time anyway, so we fail early.
     NoBuckets,
+    /// The device's IO-registry entry has no GPU core count
+    /// ([`crate::device::gpu_cores`]), which the TurboQuant decode tapes need.
+    UnknownGpuCores,
 }
 
 impl std::fmt::Display for PoolBuildError {
@@ -152,6 +155,10 @@ impl std::fmt::Display for PoolBuildError {
             ),
             Self::Worker(e) => write!(f, "MetalWorkerPool::for_buckets: {e}"),
             Self::NoBuckets => write!(f, "MetalWorkerPool::for_buckets: bucket_specs is empty"),
+            Self::UnknownGpuCores => write!(
+                f,
+                "MetalWorkerPool::for_buckets: the device's IO-registry entry has no gpu-core-count"
+            ),
         }
     }
 }
@@ -499,6 +506,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // scratch sizing are u32). Floor at 1 so a degenerate cap
         // (e.g. the empty-for-vision pool) never zero-sizes scratch.
         let block_cap_u32: u32 = block_cap.clamp(1, u32::MAX as usize) as u32;
+        use crate::tape::ids::{HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
+        let gpu_cores = crate::device::gpu_cores(&device).ok_or(PoolBuildError::UnknownGpuCores)?;
+        let tq_heads = TqDecodeHeads::for_group(
+            HeadDim(W::GLOBAL_HEAD_DIM),
+            NumQHeads(W::NUM_Q_HEADS),
+            NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
+            gpu_cores,
+        );
+        tracing::info!(
+            target: "scratchy-target-metal",
+            gpu_cores = gpu_cores.get(),
+            tq_decode_heads = tq_heads.get(),
+            "query heads per TurboQuant decode threadgroup"
+        );
         let mut tapes: Vec<LoweredMetalTape> = Vec::with_capacity(bucket_specs.len());
         for spec in bucket_specs {
             let variant = spec
@@ -511,7 +532,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                         "no baked tape variant for gen_class={gen_class:?} chunked={chunked}"
                     ),
                 })?;
-            tapes.push(variant.materialize(block_cap_u32));
+            tapes.push(variant.materialize(block_cap_u32, tq_heads));
         }
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
 
