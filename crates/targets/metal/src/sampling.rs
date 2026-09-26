@@ -24,6 +24,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
 
 use crate::mtl4_dispatch::{Buffer, Mtl4DispatchBatch};
+use crate::residency::{MetalResidencySet, Pinned};
 use crate::shader_cache::load_library_from_bytes;
 use crate::stream::MetalStreamError;
 
@@ -414,31 +415,32 @@ const SAMPLER_TELEM_K: u32 = 8;
 pub struct PendingSampler {
     njobs: u32,
     is_bf16: bool,
-    // Every buffer is bound by gpuAddress in `encode_into`: see `bound_buffers`.
-    scratch_f32: Buffer,
-    out_buf: Buffer,
-    row_idx_buf: Buffer,
-    temps_buf: Buffer,
-    top_ks_buf: Buffer,
-    top_ps_buf: Buffer,
-    min_ps_buf: Buffer,
-    uniforms_buf: Buffer,
-    reps_buf: Buffer,
-    freqs_buf: Buffer,
-    press_buf: Buffer,
-    out_ids_buf: Buffer,
-    prompt_ids_buf: Buffer,
-    consts_buf: Buffer,
+    // Every buffer is bound by gpuAddress in `encode_into`, so each is pinned
+    // for as long as this lives: keep it until the forward's host wait.
+    scratch_f32: Pinned,
+    out_buf: Pinned,
+    row_idx_buf: Pinned,
+    temps_buf: Pinned,
+    top_ks_buf: Pinned,
+    top_ps_buf: Pinned,
+    min_ps_buf: Pinned,
+    uniforms_buf: Pinned,
+    reps_buf: Pinned,
+    freqs_buf: Pinned,
+    press_buf: Pinned,
+    out_ids_buf: Pinned,
+    prompt_ids_buf: Pinned,
+    consts_buf: Pinned,
     // Sampler-telemetry spill (only compiled under `sampler-telemetry`): real
     // buffers when `telem_on`, else a reused dummy.
     #[cfg(feature = "sampler-telemetry")]
-    topk_probs_buf: Buffer,
+    topk_probs_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
-    topk_indices_buf: Buffer,
+    topk_indices_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
-    stats_buf: Buffer,
+    stats_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
-    telem_consts_buf: Buffer,
+    telem_consts_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
     telem_on: bool,
     #[cfg(feature = "sampler-telemetry")]
@@ -456,11 +458,12 @@ unsafe impl Send for PendingSampler {}
 
 impl PendingSampler {
     /// Upload the neutral [`GpuSampleParams`](scratchy_core_common::GpuSampleParams)
-    /// into GPU buffers + build the argument tables. Address binding is deferred
-    /// to [`encode_into`](Self::encode_into) (which also binds the forward's own
-    /// logits).
+    /// into GPU buffers pinned in `residency` (committed) + build the argument
+    /// tables. Address binding is deferred to [`encode_into`](Self::encode_into)
+    /// (which also binds the forward's own logits).
     pub fn prepare(
         device: &Device,
+        residency: &MetalResidencySet,
         params: &scratchy_core_common::GpuSampleParams,
         njobs: u32,
         vocab: u32,
@@ -468,31 +471,32 @@ impl PendingSampler {
     ) -> Self {
         use crate::mtl4_dispatch::{shared_slice, shared_zeroed};
         use objc2_metal::{MTL4ArgumentTableDescriptor, MTLDevice};
+        let pin = |buffer| residency.pin(buffer);
 
         let n = njobs as usize;
-        let row_idx_buf = shared_slice(device, &params.row_indices);
-        let temps_buf = shared_slice(device, &params.temperatures);
-        let top_ks_buf = shared_slice(device, &params.top_ks);
-        let top_ps_buf = shared_slice(device, &params.top_ps);
-        let min_ps_buf = shared_slice(device, &params.min_ps);
-        let uniforms_buf = shared_slice(device, &params.uniforms);
-        let reps_buf = shared_slice(device, &params.rep_penalties);
-        let freqs_buf = shared_slice(device, &params.freq_penalties);
-        let press_buf = shared_slice(device, &params.pres_penalties);
+        let row_idx_buf = pin(shared_slice(device, &params.row_indices));
+        let temps_buf = pin(shared_slice(device, &params.temperatures));
+        let top_ks_buf = pin(shared_slice(device, &params.top_ks));
+        let top_ps_buf = pin(shared_slice(device, &params.top_ps));
+        let min_ps_buf = pin(shared_slice(device, &params.min_ps));
+        let uniforms_buf = pin(shared_slice(device, &params.uniforms));
+        let reps_buf = pin(shared_slice(device, &params.rep_penalties));
+        let freqs_buf = pin(shared_slice(device, &params.freq_penalties));
+        let press_buf = pin(shared_slice(device, &params.pres_penalties));
         let (out_ids_buf, prompt_ids_buf) = if params.any_penalty {
             (
-                shared_slice(device, &params.output_token_ids),
-                shared_slice(device, &params.prompt_token_ids),
+                pin(shared_slice(device, &params.output_token_ids)),
+                pin(shared_slice(device, &params.prompt_token_ids)),
             )
         } else {
-            (shared_zeroed(device, 4), shared_zeroed(device, 4))
+            (pin(shared_zeroed(device, 4)), pin(shared_zeroed(device, 4)))
         };
-        let scratch_f32 = shared_zeroed(device, n * vocab as usize * 4);
-        let out_buf = shared_zeroed(device, n * 4);
-        let consts_buf = shared_slice(
+        let scratch_f32 = pin(shared_zeroed(device, n * vocab as usize * 4));
+        let out_buf = pin(shared_zeroed(device, n * 4));
+        let consts_buf = pin(shared_slice(
             device,
             &[vocab, params.max_output_len, params.max_prompt_len],
-        );
+        ));
 
         // Sampler telemetry: spill the sorted top-K + confidence/entropy only
         // when a consumer is watching (decided once here, honored at readback so
@@ -507,20 +511,21 @@ impl PendingSampler {
         let (topk_probs_buf, topk_indices_buf, stats_buf, telem_consts_buf) = if telem_on {
             let k = telem_k as usize;
             (
-                shared_zeroed(device, n * k * 4),
-                shared_zeroed(device, n * k * 4),
-                shared_zeroed(device, n * 2 * 4),
-                shared_slice(device, &[1u32, telem_k]),
+                pin(shared_zeroed(device, n * k * 4)),
+                pin(shared_zeroed(device, n * k * 4)),
+                pin(shared_zeroed(device, n * 2 * 4)),
+                pin(shared_slice(device, &[1u32, telem_k])),
             )
         } else {
             let dummy = shared_zeroed(device, 4);
             (
-                dummy.clone(),
-                dummy.clone(),
-                dummy,
-                shared_slice(device, &[0u32, 0u32]),
+                pin(dummy.clone()),
+                pin(dummy.clone()),
+                pin(dummy),
+                pin(shared_slice(device, &[0u32, 0u32])),
             )
         };
+        residency.commit();
 
         let mk_table = |count: usize| {
             let desc = MTL4ArgumentTableDescriptor::new();
@@ -576,36 +581,6 @@ impl PendingSampler {
             sample_at,
             penalties_at,
         }
-    }
-
-    /// Every buffer [`encode_into`](Self::encode_into) binds by GPU address. The
-    /// caller keeps them resident — and alive — until the forward's command
-    /// buffer completes.
-    pub fn bound_buffers(&self) -> impl Iterator<Item = &Buffer> {
-        let base = [
-            &self.scratch_f32,
-            &self.out_buf,
-            &self.row_idx_buf,
-            &self.temps_buf,
-            &self.top_ks_buf,
-            &self.top_ps_buf,
-            &self.min_ps_buf,
-            &self.uniforms_buf,
-            &self.reps_buf,
-            &self.freqs_buf,
-            &self.press_buf,
-            &self.out_ids_buf,
-            &self.prompt_ids_buf,
-            &self.consts_buf,
-        ];
-        #[cfg(feature = "sampler-telemetry")]
-        let base = base.into_iter().chain([
-            &self.topk_probs_buf,
-            &self.topk_indices_buf,
-            &self.stats_buf,
-            &self.telem_consts_buf,
-        ]);
-        base.into_iter()
     }
 
     /// Encode cast → [penalties] → sample onto the forward's OWN encoder (after

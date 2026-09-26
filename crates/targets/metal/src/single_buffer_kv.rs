@@ -34,6 +34,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
+use crate::residency::{MetalResidencySet, Pinned};
+
 pub type Result<T> = std::result::Result<T, String>;
 
 macro_rules! bail {
@@ -44,7 +46,7 @@ macro_rules! bail {
 /// `layer * 2 + kv_idx` (kv_idx = 0 for K, 1 for V) — matches the order
 /// `KvCachePool::new_metal_chunked` calls `alloc_chunk` in.
 pub struct SingleBufferKvLayer {
-    buf: Retained<ProtocolObject<dyn MTLBuffer>>,
+    buf: Pinned,
     chunk_bytes: usize,
     committed_chunks: usize,
     max_chunks: usize,
@@ -54,6 +56,7 @@ pub struct SingleBufferKvLayer {
 impl SingleBufferKvLayer {
     pub fn new(
         device: &ProtocolObject<dyn MTLDevice>,
+        residency: &MetalResidencySet,
         chunk_bytes: usize,
         max_chunks: usize,
     ) -> Result<Self> {
@@ -75,7 +78,7 @@ impl SingleBufferKvLayer {
             })?;
         let base_address = buf.gpuAddress();
         Ok(Self {
-            buf,
+            buf: residency.pin(buf),
             chunk_bytes,
             committed_chunks: 0,
             max_chunks,
@@ -123,8 +126,7 @@ impl SingleBufferKvLayer {
         chunk_idx * self.chunk_bytes
     }
 
-    /// Borrow the underlying MTLBuffer so the worker can insert it into the
-    /// `MTLResidencySet` exactly once for the buffer's lifetime.
+    /// Borrow the underlying MTLBuffer (pinned for this layer's lifetime).
     pub fn buffer(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
         &self.buf
     }

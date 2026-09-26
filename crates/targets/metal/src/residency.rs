@@ -16,6 +16,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
 use objc2::{class, msg_send, sel};
 use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLDevice};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -40,31 +41,41 @@ struct Inner {
     /// Whether `endResidency` has already been issued (via [`MetalResidencySet::shutdown`]).
     /// Guards against ending the residency request twice (request was made once).
     ended: bool,
+    /// Live [`Pinned`] count per member buffer (keyed by its address).
+    pins: HashMap<usize, usize>,
 }
 
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
+impl Inner {
+    /// Drop every allocation and end the residency request (an un-wired set,
+    /// never `requestResidency`'d, has none to end). Idempotent.
+    fn end(&mut self) {
+        if self.set_ptr.is_null() || self.ended {
+            return;
+        }
+        unsafe {
+            let _: () = msg_send![self.set_ptr, removeAllAllocations];
+            let _: () = msg_send![self.set_ptr, commit];
+            if self.requested {
+                let _: () = msg_send![self.set_ptr, endResidency];
+            }
+        }
+        self.ended = true;
+    }
+}
+
 impl Drop for Inner {
     fn drop(&mut self) {
+        // End residency BEFORE releasing the set, so the GPU driver reclaims
+        // the wired pages deterministically. A bare `release` can leave the
+        // residency request dangling if the set is retained anywhere (e.g.
+        // still attached to a command queue), stranding wired GPU memory
+        // after the process exits.
+        self.end();
         if !self.set_ptr.is_null() {
             unsafe {
-                // Undo the system-wired residency request and drop every pinned
-                // allocation BEFORE releasing the set, so the GPU driver reclaims
-                // the wired pages deterministically. A bare `release` can leave
-                // the residency request dangling if the set is retained anywhere
-                // (e.g. still attached to a command queue), stranding wired GPU
-                // memory after the process exits. Skip the end-pair if
-                // `shutdown()` already issued it. An un-wired set (never
-                // `requestResidency`'d) has no residency request to end —
-                // just drop its allocations before release.
-                if !self.ended {
-                    let _: () = msg_send![self.set_ptr, removeAllAllocations];
-                    let _: () = msg_send![self.set_ptr, commit];
-                    if self.requested {
-                        let _: () = msg_send![self.set_ptr, endResidency];
-                    }
-                }
                 let _: () = msg_send![self.set_ptr, release];
             }
         }
@@ -106,6 +117,7 @@ impl MetalResidencySet {
                 set_ptr,
                 requested: wire && !set_ptr.is_null(),
                 ended: false,
+                pins: HashMap::new(),
             })),
         }
     }
@@ -118,18 +130,7 @@ impl MetalResidencySet {
     /// work was in flight and orphans wired GPU memory (esp. on `kill -9`
     /// mid-decode, which can't reach this at all). Idempotent.
     pub fn shutdown(&self) {
-        let mut inner = self.inner.lock().expect("residency set mutex");
-        if inner.set_ptr.is_null() || inner.ended {
-            return;
-        }
-        unsafe {
-            let _: () = msg_send![inner.set_ptr, removeAllAllocations];
-            let _: () = msg_send![inner.set_ptr, commit];
-            if inner.requested {
-                let _: () = msg_send![inner.set_ptr, endResidency];
-            }
-        }
-        inner.ended = true;
+        self.inner.lock().expect("residency set mutex").end();
     }
 
     pub fn is_active(&self) -> bool {
@@ -137,30 +138,38 @@ impl MetalResidencySet {
         !inner.set_ptr.is_null()
     }
 
-    pub fn insert(&self, buffer: &Buffer) {
-        let inner = self.inner.lock().expect("residency set mutex");
-        if inner.set_ptr.is_null() {
-            return;
-        }
-        unsafe {
-            let buf_ptr: *mut AnyObject =
-                Retained::as_ptr(buffer) as *const AnyObject as *mut AnyObject;
-            let _: () = msg_send![inner.set_ptr, addAllocation: buf_ptr];
+    /// Hold `buffer` in this set until the returned [`Pinned`] drops. The only
+    /// way into a set, so no member can outlive its owner. Commit the set
+    /// before the command buffer that reads it is committed.
+    pub fn pin(&self, buffer: Buffer) -> Pinned {
+        self.update(&buffer, true);
+        Pinned {
+            buffer,
+            set: self.clone(),
         }
     }
 
-    /// Remove a previously-inserted allocation from the residency set
-    /// (reactive shrink). Pair with [`Self::commit`] to apply, then the
-    /// caller may free the buffer — its pages are no longer wired.
-    pub fn remove(&self, buffer: &Buffer) {
-        let inner = self.inner.lock().expect("residency set mutex");
-        if inner.set_ptr.is_null() {
+    /// Count one pin of `buffer` in or out; the set holds it while any are live.
+    fn update(&self, buffer: &Buffer, add: bool) {
+        let mut inner = self.inner.lock().expect("residency set mutex");
+        if inner.set_ptr.is_null() || inner.ended {
             return;
         }
-        unsafe {
-            let buf_ptr: *mut AnyObject =
-                Retained::as_ptr(buffer) as *const AnyObject as *mut AnyObject;
-            let _: () = msg_send![inner.set_ptr, removeAllocation: buf_ptr];
+        let buf_ptr: *mut AnyObject =
+            Retained::as_ptr(buffer) as *const AnyObject as *mut AnyObject;
+        let pins = inner.pins.entry(buf_ptr as usize).or_default();
+        *pins = if add { *pins + 1 } else { *pins - 1 };
+        match (add, *pins) {
+            (true, 1) => unsafe {
+                let _: () = msg_send![inner.set_ptr, addAllocation: buf_ptr];
+            },
+            (false, 0) => {
+                inner.pins.remove(&(buf_ptr as usize));
+                unsafe {
+                    let _: () = msg_send![inner.set_ptr, removeAllocation: buf_ptr];
+                }
+            }
+            _ => {}
         }
     }
 
@@ -190,6 +199,30 @@ impl MetalResidencySet {
             return;
         }
         let _: () = msg_send![cb_ptr, useResidencySet: inner.set_ptr];
+    }
+}
+
+/// A buffer held in a [`MetalResidencySet`] for exactly as long as this value
+/// lives: dropping it takes the buffer back out (applied at the set's next
+/// commit). MTL4 keeps resident only what a command buffer's sets hold, so a
+/// buffer the GPU reaches by address must be owned through one of these by
+/// something that outlives the command buffer.
+#[must_use = "dropping a Pinned unpins its buffer"]
+pub struct Pinned {
+    buffer: Buffer,
+    set: MetalResidencySet,
+}
+
+impl std::ops::Deref for Pinned {
+    type Target = Buffer;
+    fn deref(&self) -> &Buffer {
+        &self.buffer
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        self.set.update(&self.buffer, false);
     }
 }
 
@@ -248,18 +281,34 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_commit_roundtrip() {
+    fn dropping_a_pin_takes_the_buffer_out_of_the_set() {
         let Some(device_info) = crate::detect_device() else {
             eprintln!("skipping: no Metal device");
             return;
         };
         let device = device_info.device.clone();
         let set = MetalResidencySet::new(&device);
+        if !set.is_active() {
+            eprintln!("skipping: no MTLResidencySet on this OS");
+            return;
+        }
+        let members = || -> usize {
+            let inner = set.inner.lock().expect("residency set mutex");
+            unsafe { msg_send![inner.set_ptr, allocationCount] }
+        };
 
         let buf = device
             .newBufferWithLength_options(1024, MTLResourceOptions::StorageModeShared)
             .expect("newBufferWithLength");
-        set.insert(&buf);
+        let pinned = set.pin(buf.clone());
+        let pinned_again = set.pin(buf);
         set.commit();
+        assert_eq!(members(), 1);
+        drop(pinned);
+        set.commit();
+        assert_eq!(members(), 1, "the other pin still holds it");
+        drop(pinned_again);
+        set.commit();
+        assert_eq!(members(), 0);
     }
 }
