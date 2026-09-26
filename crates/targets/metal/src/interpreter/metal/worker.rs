@@ -980,6 +980,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineGatherQmmTNax
         | K::AffineQmmTSplitK
         | K::AffineQmmTNax
+        | K::AffineQmmSmallM
         | K::Nvfp4Qmv
         | K::Nvfp4QmmT
         | K::Nvfp4QmmTNax
@@ -1965,6 +1966,12 @@ pub(super) fn gate_matches(
             turboquant && !turboquant_decode
         }
         Some(super::lowered::RuntimeGate::UnlessTurboquantDecode) => !turboquant_decode,
+        Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
+            crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
+        }
+        Some(super::lowered::RuntimeGate::UnlessSmallMTokens) => {
+            !crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
+        }
     }
 }
 

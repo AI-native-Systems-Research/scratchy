@@ -66,9 +66,10 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
     if chunked { crate::BLOCKS_PER_CHUNK } else { 0 }
 }
 use crate::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
-    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
-    qmv_dispatch_shape, qmv_kernel_static_name, splitk_reduce_kernel_static_name,
+    DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
+    pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
+    qmm_t_kernel_static_name_with_compute, qmv_dispatch_shape, qmv_kernel_static_name,
+    small_m_kernel_static_name, splitk_reduce_kernel_static_name,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -992,6 +993,77 @@ fn inject_tq(
     out
 }
 
+/// On a NAX device, the small-M matrix-unit twin of an MLX-affine 4-bit
+/// `AffineQmm` in a bucket that can see a `SMALL_M_TOKENS` step: the twin runs
+/// on those steps (`OnlyIfSmallMTokens`) and the instruction's own GEMM on
+/// every other (`UnlessSmallMTokens`).
+fn route_small_m(
+    p: &MetalModelConsts,
+    instruction: &Instruction,
+    cmds: Vec<GatedCommand>,
+    bucket_m: u32,
+    tape_index: u32,
+    index: usize,
+    profile: Option<&crate::targets::MetalTargetProfile>,
+) -> Vec<GatedCommand> {
+    use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
+    let Instruction::AffineQmm(in_slot, out_slot, layer, n, k, group_size, 4, _) = *instruction
+    else {
+        return cmds;
+    };
+    let is_nax = profile.is_some_and(|t| crate::targets::is_nax_capable(t.generation));
+    let tile = match SmallMTile::for_bucket(bucket_m) {
+        Some(tile)
+            if is_nax
+                && matches!(group_size, 32 | 64 | 128)
+                && n.is_multiple_of(SMALL_M_TILE_COLS) =>
+        {
+            tile
+        }
+        _ => return cmds,
+    };
+    let small_m = LoweredCommand {
+        kernel: KernelId::AffineQmmSmallM,
+        library: "quantized_qmm_nax",
+        function: small_m_kernel_static_name(
+            dequant_dtype_for(p),
+            scale_dtype_for(p),
+            group_size,
+            tile,
+        ),
+        constants: super::kernel_constants::AffineQmmTConstants {
+            k: super::ids::KDimI32(k as i32),
+            n: super::ids::NDimI32(n as i32),
+            m: super::ids::MDimI32(bucket_m as i32),
+        }
+        .into_baked(),
+        dispatch: DispatchShape {
+            threadgroups: (n / SMALL_M_TILE_COLS, bucket_m.div_ceil(tile.rows()), 1),
+            threads_per_threadgroup: (32, 1, 1),
+            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                seq_axis: None,
+                axis: crate::tape::lowered::MScaleAxis::Y,
+                bucket_m: super::ids::BucketM(bucket_m),
+            }),
+        },
+        bindings: baked(affine_qmm_bindings(
+            in_slot,
+            out_slot,
+            super::ids::LayerId(layer),
+            WeightLocator {
+                bucket: tape_index,
+                op_idx: index as u32,
+                slot: 0,
+            },
+        )),
+        gemm_dims: None,
+    };
+    cmds.into_iter()
+        .map(|c| GatedCommand::gated(c.command, UnlessSmallMTokens))
+        .chain([GatedCommand::gated(small_m, OnlyIfSmallMTokens)])
+        .collect()
+}
+
 /// Lower one bucket's `Instruction` tape.
 ///
 /// `bucket_m` is the bucket point this tape is specialized for —
@@ -1215,7 +1287,15 @@ pub fn lower(
                         }),
                     None => None,
                 };
-                let cmds = inject_tq(p, other, own, attention, decode, bucket_m, block_cap);
+                let cmds = route_small_m(
+                    p,
+                    other,
+                    inject_tq(p, other, own, attention, decode, bucket_m, block_cap),
+                    bucket_m,
+                    tape_index,
+                    i,
+                    profile,
+                );
                 update_shape_state(p, other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
@@ -9255,6 +9335,77 @@ mod tests {
         want.push((KernelId::RopeAppend, None));
         want.extend(plain(sliding_attention));
         assert_eq!(gated_steps(&prefill), want);
+    }
+
+    /// On NAX, an MLX-affine 4-bit GEMM in a bucket that can see a 5–16-token
+    /// step gets its small-M twin — the 8-row tile in the 8-token bucket, the
+    /// 16-row one in the 64-token bucket — gated against the GEMM it replaces,
+    /// with the GEMM's own weights and slots. Batch 1, the prefill buckets,
+    /// 8-bit weights and non-NAX devices are left as they were.
+    #[test]
+    fn small_m_twin_serves_decode_batches_on_nax() {
+        use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
+        let gemm = |bits| Instruction::AffineQmm(0, 1, 0, 3072, 8192, 64, bits, 10);
+        let lower_at = |instruction, bucket_m, profile| {
+            lower_pair(
+                &tp(),
+                false,
+                &[instruction],
+                &[],
+                &[true],
+                &[],
+                bucket_m,
+                8,
+                0,
+                1,
+                128,
+                profile,
+            )
+            .expect("lower_pair")
+        };
+        let m5 = Some(&crate::targets::M5_10CORE);
+        for (bucket_m, own, tile) in [
+            (8, KernelId::AffineQmvFast, SmallMTile::Rows8),
+            (64, KernelId::AffineQmmTNax, SmallMTile::Rows16),
+        ] {
+            let tape = lower_at(gemm(4), bucket_m, m5);
+            let steps: Vec<_> = gated_steps(&tape);
+            assert_eq!(
+                steps,
+                [
+                    (own, Some(UnlessSmallMTokens)),
+                    (KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)),
+                ]
+            );
+            let (gemm_cmd, small) = (&tape.commands[0].command, &tape.commands[1].command);
+            let p = tp();
+            assert_eq!(
+                small.function,
+                small_m_kernel_static_name(dequant_dtype_for(&p), scale_dtype_for(&p), 64, tile)
+            );
+            assert_eq!(
+                small.dispatch.threadgroups,
+                (3072 / SMALL_M_TILE_COLS, bucket_m / tile.rows(), 1)
+            );
+            assert!(
+                small.bindings == gemm_cmd.bindings,
+                "same weights and slots"
+            );
+        }
+        for (instruction, bucket_m, profile) in [
+            (gemm(4), 1, m5),
+            (gemm(4), 512, m5),
+            (gemm(8), 8, m5),
+            (gemm(4), 8, Some(&crate::targets::M1_8CORE)),
+        ] {
+            let tape = lower_at(instruction, bucket_m, profile);
+            assert!(
+                tape.commands
+                    .iter()
+                    .all(|c| c.gate.is_none() && c.command.kernel != KernelId::AffineQmmSmallM),
+                "bucket {bucket_m}: no small-M twin"
+            );
+        }
     }
 
     /// A multi-token tape runs its own attention off decode steps, in the

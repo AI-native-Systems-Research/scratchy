@@ -216,6 +216,11 @@ pub enum KernelId {
     /// in `quantized_qmm_nax.metallib`. Only dispatched when
     /// `is_nax_capable(profile.generation)` and `K % 64 == 0`.
     AffineQmmTNax,
+    /// NAX decode-batch matmul: the 4-bit codes as the MPP `matmul2d`
+    /// operand, one threadgroup's rows covering the batch, so each weight is
+    /// read once per 8 or 16 rows. Maps to `affine_qmm_small_m_*` in
+    /// `quantized_qmm_nax.metallib`; runs on `SMALL_M_TOKENS` steps only.
+    AffineQmmSmallM,
     /// NVFP4 int4 decode matvec (generic). Maps to
     /// `nvfp4_qmv_<dtype>_s_<scale>_gs_16_b_4_batch_0` in the
     /// `quantized_qmv.metallib` (nvfp4 kernels share that library with
@@ -576,6 +581,12 @@ pub enum RuntimeGate {
     /// Run unless this is a TurboQuant decode step: the attention an
     /// `AttentionViaCacheTq` twin replaces there.
     UnlessTurboquantDecode,
+    /// Run only on a step whose token count is in
+    /// `quantized::SMALL_M_TOKENS`: the `AffineQmmSmallM` twin of a GEMM.
+    OnlyIfSmallMTokens,
+    /// Run unless the step's token count is in `quantized::SMALL_M_TOKENS`:
+    /// the GEMM an `AffineQmmSmallM` twin replaces there.
+    UnlessSmallMTokens,
 }
 
 impl DispatchShape {
