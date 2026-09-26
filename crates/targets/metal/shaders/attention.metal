@@ -710,16 +710,18 @@ template <typename T>
 
     // TurboQuant K bias: q·R_i·b = Σ_d (kb_a[d]·cos_{i,d} + kb_b[d]·sin_{i,d}) + kb_c
     // over the NeoX pairs (d, d + ATTN_PAIR_OFF), d < ATTN_ROT_DIM/2, plus the
-    // unrotated rest (kb_c). Per query; lane l owns pairs d ≡ l (mod 32).
+    // unrotated rest (kb_c). Per query; lane l owns the `kb_np` adjacent pairs
+    // from d = l·kb_np, so each key's cos/sin reads are contiguous per lane.
     device const T* kb = tq_k_bias + kv_head_idx * head_dim;
     device const T* vb = tq_v_bias + kv_head_idx * head_dim;
-    thread U kb_a[8];                   // (ATTN_ROT_DIM/2)/32 <= 8 (head_dim <= 512)
+    const uint kb_np = (ATTN_ROT_DIM / 2u + 31u) / 32u;
+    thread U kb_a[8];                   // kb_np <= 8 (head_dim <= 512)
     thread U kb_b[8];
     U kb_c = 0;
     if (ATTN_TQ_KB) {
         const uint half_rot = ATTN_ROT_DIM / 2u;
-        for (uint j = 0; j < 8u; ++j) {
-            const uint d = simd_lid + 32u * j;
+        for (uint j = 0; j < kb_np; ++j) {
+            const uint d = simd_lid * kb_np + j;
             kb_a[j] = 0;
             kb_b[j] = 0;
             if (d < half_rot) {
@@ -811,12 +813,12 @@ template <typename T>
                 }
                 k_scale = tq_norms_k[tq_row];
                 if (ATTN_TQ_KB) {
-                    device const T* cos_row = cos_sin + i * ATTN_ROT_DIM;
+                    const uint d0 = simd_lid * kb_np;
+                    device const T* cos_row = cos_sin + i * ATTN_ROT_DIM + d0;
                     device const T* sin_row = cos_row + ATTN_ROT_DIM / 2u;
-                    for (uint j = 0; j < 8u; ++j) {
-                        const uint d = simd_lid + 32u * j;
-                        if (d < ATTN_ROT_DIM / 2u) {
-                            k_off += kb_a[j] * U(cos_row[d]) + kb_b[j] * U(sin_row[d]);
+                    for (uint j = 0; j < kb_np; ++j) {
+                        if (d0 + j < ATTN_ROT_DIM / 2u) {
+                            k_off += kb_a[j] * U(cos_row[j]) + kb_b[j] * U(sin_row[j]);
                         }
                     }
                     k_off_c = kb_c;
@@ -872,10 +874,10 @@ template <typename T>
                 }
             }
         }
-        score = simd_sum(score) * k_scale;
-        if (ATTN_TQ_KB) {
-            score += simd_sum(k_off) + k_off_c;
-        }
+        // k_scale is simdgroup-uniform, so a K bias's term joins the one
+        // reduction; without one this is exactly the plain score.
+        score = ATTN_TQ_KB ? simd_sum(score * k_scale + k_off) + k_off_c
+                           : simd_sum(score) * k_scale;
 
         // Online softmax update. Match MLX `sdpa_vector`: fast::exp
         // for both factor + exp_score.
