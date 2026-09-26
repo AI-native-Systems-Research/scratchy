@@ -8093,6 +8093,10 @@ impl Implementation for RopeAppendRefImpl {
                 ("layer", syn::parse_quote!(u32)),
                 ("interleaved", syn::parse_quote!(bool)),
                 ("is_global", syn::parse_quote!(bool)),
+                (
+                    "kv_offsets",
+                    syn::parse_quote!(::scratchy_forward_compiler::KvOffsets),
+                ),
             ],
         )
     }
@@ -8156,7 +8160,79 @@ impl Implementation for RopeAppendRefImpl {
             layer,
             interleaved,
             is_global,
+            scratchy_forward_compiler::KvOffsets {
+                k: kv_offset_of(fuf, k_id),
+                v: kv_offset_of(fuf, v_id),
+            },
         )])
+    }
+}
+
+/// The additive offset the KV operand `tile` carries into the cache. No
+/// wildcard: an op kind that can feed a KV writer is classified here before
+/// it compiles.
+#[cfg(feature = "cuda")]
+fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset {
+    use scratchy_forward_compiler::{BiasStorage, KvOffset};
+    let node = fuf.get(tile);
+    let producer = || match node.inputs.first() {
+        Some(FufInput::Tile { id, .. }) => *id,
+        other => panic!("{:?}: input 0 must be a tile (got {other:?})", node.op),
+    };
+    match node.op {
+        OpKind::BiasAdd => match weight_storage_of(fuf.get(producer())) {
+            Some(StorageFormat::Affine { .. }) => KvOffset::LinearBias(BiasStorage::Affine),
+            Some(
+                StorageFormat::Dense
+                | StorageFormat::Awq { .. }
+                | StorageFormat::Gptq { .. }
+                | StorageFormat::Bnb4 { .. }
+                | StorageFormat::Fp8 { .. }
+                | StorageFormat::Ggml
+                | StorageFormat::Nvfp4 { .. },
+            ) => KvOffset::LinearBias(BiasStorage::Dense),
+            None => panic!("bias_add feeding a KV writer has no projection weight upstream"),
+        },
+        OpKind::Reshape => kv_offset_of(fuf, producer()),
+        OpKind::Gemm | OpKind::RmsNorm | OpKind::RmsNormUnit => KvOffset::Centered,
+        OpKind::Embed
+        | OpKind::RopeAppend
+        | OpKind::RopeAppendInterleaved
+        | OpKind::Attention
+        | OpKind::SlidingAttention
+        | OpKind::VarlenAttention
+        | OpKind::Silu
+        | OpKind::Gelu
+        | OpKind::QuickGelu
+        | OpKind::GeluErf
+        | OpKind::TanhSoftCap
+        | OpKind::ScalarWeightMul
+        | OpKind::Add
+        | OpKind::Sub
+        | OpKind::Mean
+        | OpKind::AllReduce
+        | OpKind::AllGather
+        | OpKind::MmEmbedSplice
+        | OpKind::Mul
+        | OpKind::VisionRope
+        | OpKind::MlaSplit
+        | OpKind::MlaAttention
+        | OpKind::Moe
+        | OpKind::GemmaMoe
+        | OpKind::GatedDeltaNet
+        | OpKind::GateSplit
+        | OpKind::GateApply
+        | OpKind::GateScale
+        | OpKind::LoadPixels
+        | OpKind::LoadPosEmbeds
+        | OpKind::EmbeddingGather
+        | OpKind::AvgPool2d
+        | OpKind::StripCls
+        | OpKind::PosEmbed => panic!(
+            "a KV operand produced by {:?} has no additive-offset rule — classify it in \
+             `kv_offset_of` before a KV writer consumes it",
+            node.op
+        ),
     }
 }
 

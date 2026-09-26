@@ -310,6 +310,10 @@ pub(crate) fn bridge_shape(name: &str) -> Option<OpcodeShape> {
                 ("layer", syn::parse_quote!(u32)),
                 ("interleaved", syn::parse_quote!(bool)),
                 ("is_global", syn::parse_quote!(bool)),
+                (
+                    "kv_offsets",
+                    syn::parse_quote!(::scratchy_forward_compiler::KvOffsets),
+                ),
             ],
         )),
         "RopeAppendNormed" => Some(OpcodeShape::new(

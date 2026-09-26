@@ -1597,6 +1597,20 @@ pub enum LoweringError {
         body_len: u32,
         remaining: usize,
     },
+    /// A TurboQuant codec command could not bind the additive offset of the
+    /// KV operand it compresses — quantizing without removing it would let the
+    /// offset's norm, not the signal's, set the codec's error.
+    TurboQuantOffsetUnbound { index: usize, missing: TqUnbound },
+}
+
+/// What a TurboQuant codec command at [`LoweringError::TurboQuantOffsetUnbound`]
+/// lacked.
+#[derive(Clone, Copy, Debug)]
+pub enum TqUnbound {
+    /// No KV writer precedes it, so its operands' offsets are unknown.
+    Writer,
+    /// A K bias, with no rotary table bound to rotate it to each key.
+    RotaryTable,
 }
 
 impl std::fmt::Display for LoweringError {
@@ -1620,6 +1634,11 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: malformed Loop({count}, {body_len}) at tape index {index} \
                  — body extends past tape end (only {remaining} instructions remain)"
+            ),
+            Self::TurboQuantOffsetUnbound { index, missing } => write!(
+                f,
+                "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
+                 operand's additive offset ({missing:?} missing)"
             ),
         }
     }

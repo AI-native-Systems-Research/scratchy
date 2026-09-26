@@ -261,3 +261,10 @@ pub struct WeightSlot {
     pub kind: WeightKind,
     pub base: String,
 }
+
+/// The `(tape_index, op_idx, slot)` accessor slot of weight `i` on an op's site: its ordinal
+/// among the site's weights of the same kind. The per-arch `WeightAccessors` are emitted by
+/// this rule, so a lowering that binds a site's weight computes the slot by it too.
+pub fn accessor_slot(site: &[WeightKind], i: usize) -> u32 {
+    site[..i].iter().filter(|k| **k == site[i]).count() as u32
+}

@@ -6224,20 +6224,19 @@ fn emit_weight_accessors_impl(
             let tape_index_lit = proc_macro2::Literal::u32_unsuffixed(tape_index);
             for (op_idx, slots) in weight_slots.iter().enumerate() {
                 let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
-                let mut counts: HashMap<&'static str, u32> = HashMap::new();
-                for slot in slots {
+                let kinds: Vec<WeightKind> = slots.iter().map(|s| s.kind.clone()).collect();
+                for (i, slot) in slots.iter().enumerate() {
                     let key = weight_kind_accessor_method(&slot.kind);
-                    let n = counts.entry(key).or_insert(0);
-                    let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
+                    let n = scratchy_subtile::handoff::accessor_slot(&kinds, i);
+                    let slot_lit = proc_macro2::Literal::u32_unsuffixed(n);
                     inventory.push((
                         tape_index,
                         role,
                         op_idx as u32,
-                        *n,
+                        n,
                         key,
                         slot.base.to_string(),
                     ));
-                    *n += 1;
                     // `WeightSlot::base` is a `String` (it crosses into the metal compiler
                     // crate, which must not pull `syn`); the identifier is minted HERE, at the
                     // one place that emits tokens for it.

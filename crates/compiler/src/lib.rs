@@ -44,7 +44,7 @@ pub use info::{
 // codegen time without any backend feature. Moved to the cfg-free
 // `scratchy-ir` crate; re-exported here so the macro path
 // `::scratchy_forward_compiler::Instruction` keeps resolving.
-pub use scratchy_ir::Instruction;
+pub use scratchy_ir::{BiasStorage, Instruction, KvOffset, KvOffsets};
 // Routed-expert per-projection bit packing for `MetalSharedFusedMoe`
 // (OptiQ mixed 4/8-bit). Re-exported so the macro codegen can pack and
 // the metal lowering can unpack via the same convention.

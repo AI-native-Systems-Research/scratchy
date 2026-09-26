@@ -27,6 +27,7 @@
 //   5  ATTN_MAX_BLOCKS_PER_SEQ uint
 
 #include <metal_stdlib>
+#include "turboquant_offset.h"
 using namespace metal;
 
 
@@ -261,6 +262,18 @@ constant uint ATTN_TQ_BITS [[function_constant(13)]];
 constant bool ATTN_TQ_DEF  = is_function_constant_defined(ATTN_TQ_BITS);
 constant uint ATTN_TQ      = ATTN_TQ_DEF ? ATTN_TQ_BITS : 0u;
 
+//  14  ATTN_TQ_K_BIAS / 15  ATTN_TQ_V_BIAS — set when the packed codes hold that
+//      operand MINUS its projection bias (turboquant_offset.h; the codec's
+//      error scales with the coded vector's norm). Decode (bias at buffers
+//      14 / 15): K's bias is rotated with the key, so each packed key's score
+//      gains q·R_i·b (needs the rope-on-read table and pairing); V's is added
+//      once to the output, since the softmax weights sum to 1. Prefill staging
+//      (bias at buffer 10) restores it into each cached key's rotated image.
+constant uint ATTN_TQ_K_BIAS [[function_constant(14)]];
+constant bool ATTN_TQ_KB = is_function_constant_defined(ATTN_TQ_K_BIAS);
+constant uint ATTN_TQ_V_BIAS [[function_constant(15)]];
+constant bool ATTN_TQ_VB = is_function_constant_defined(ATTN_TQ_V_BIAS);
+
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
 // ownership). Under both the contiguous and the co-resident layout the bits of
@@ -364,6 +377,7 @@ inline void tq_rope_slice(thread float* x, uint qk_per_thread, uint simd_lid, ui
 //   0 cache (the layer's K or V scratch, chunk table)  1 block_table
 //   2 seq_used_k  3 cu_seqlens_q  4 slot_mapping  5 packed codes  6 norms
 //   7 signs  8 centroids  9 cos_sin (K under ATTN_ROPE_ON_READ only)
+//   10 the projection bias (ATTN_TQ_K_BIAS on K / ATTN_TQ_V_BIAS on V only)
 template <typename T>
 kernel void tq_stage_rotated(
     device const uint64_t* cache        [[buffer(0)]],
@@ -376,6 +390,7 @@ kernel void tq_stage_rotated(
     device const float*    signs        [[buffer(7)]],
     device const float*    centroids    [[buffer(8)]],
     device const T*        cos_sin      [[buffer(9)]],
+    device const T*        bias         [[buffer(10)]],
     uint3 tg       [[threadgroup_position_in_grid]],
     uint  simd_lid [[thread_index_in_simdgroup]])
 {
@@ -404,6 +419,22 @@ kernel void tq_stage_rotated(
     const uint pdim = (head_dim + vpw - 1u) / vpw;
     const uint e0 = simd_lid * qk_per_thread;
     const float s = 1.0f / sqrt(float(head_dim));
+    // The codes hold the operand minus its projection bias (turboquant_offset.h);
+    // a cached key gets it back in the rotated domain. V's bias is one vector for
+    // every key, so its image R·b_v is taken once; K's is rotated to each key's
+    // position, so its image costs one transform per cached key.
+    const uint off_mode = ATTN_TQ_KB ? 2u : (ATTN_TQ_VB ? 1u : 0u);
+    device const T* b = bias + kv_head * head_dim;
+    float rb[16];
+    if (off_mode == 1u) {
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            rb[j] = float(b[e0 + j]) * signs[e0 + j];
+        }
+        tq_wht(rb, qk_per_thread, simd_lid);
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            rb[j] *= s;
+        }
+    }
     for (uint t = 0; t < block_size; ++t) {
         const uint i = logical_block * block_size + t;
         if (i >= kv_len) {
@@ -423,15 +454,30 @@ kernel void tq_stage_rotated(
                 x[j] = centroids[tq_code(packed, store_row * pdim, e0 + j)] * n;
             }
             if (!span) {
+                if (off_mode == 2u) {
+                    for (uint j = 0; j < qk_per_thread; ++j) {
+                        rb[j] = tq_offset<T>(2u, b, cos_sin, ATTN_ROT_DIM, ATTN_PAIR_OFF, i, false,
+                                             e0 + j) * signs[e0 + j];
+                    }
+                    tq_wht(rb, qk_per_thread, simd_lid);
+                    for (uint j = 0; j < qk_per_thread; ++j) {
+                        rb[j] *= s;
+                    }
+                }
                 for (uint j = 0; j < qk_per_thread; ++j) {
-                    row[j] = T(x[j]);
+                    row[j] = T(off_mode != 0u ? x[j] + rb[j] : x[j]);
                 }
                 continue;
             }
-            // x̃ = Rᵀ·x = s·D·H·x, to rope in the plain domain.
+            // x̃ = Rᵀ·x = s·D·H·x, to rope in the plain domain — where a span
+            // key, stored unrotated, gets its bias back unrotated.
             tq_wht(x, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
                 x[j] *= s * signs[e0 + j];
+                if (off_mode != 0u) {
+                    x[j] += tq_offset<T>(off_mode, b, cos_sin, ATTN_ROT_DIM, ATTN_PAIR_OFF, i,
+                                         true, e0 + j);
+                }
             }
         } else {
             for (uint j = 0; j < qk_per_thread; ++j) {
@@ -493,6 +539,7 @@ kernel void tq_rotate_rows(
         device const float* signs [[buffer(7)]],                                        \
         device const float* centroids [[buffer(8)]],                                    \
         device const T* cos_sin [[buffer(9)]],                                          \
+        device const T* bias [[buffer(10)]],                                            \
         uint3 tg [[threadgroup_position_in_grid]],                                      \
         uint simd_lid [[thread_index_in_simdgroup]]);                                   \
     template [[host_name("tq_rotate_rows_" #tag)]] [[kernel]] void tq_rotate_rows<T, false>( \
@@ -545,6 +592,8 @@ INSTANTIATE_TQ_PREFILL(bf16, bfloat)
 //   buffer(7..13) (ATTN_TQ only) = packed K codes, packed V codes, K norms,
 //                V norms ([slot, num_kv_heads, ...], by physical slot), signs
 //                [head_dim], centroids [2^bits], slot_mapping [batch].
+//   buffer(14/15) (ATTN_TQ_K_BIAS / ATTN_TQ_V_BIAS) = K / V projection bias
+//                [num_kv_heads * head_dim].
 //
 // Dispatch: threadgroups (batch, num_q_heads, 1), threads (1024, 1, 1)
 // = 32 simdgroups × 32 lanes. HEAD_DIM must be a multiple of 32.
@@ -581,6 +630,8 @@ template <typename T>
     device const float* tq_signs     [[buffer(11)]],
     device const float* tq_centroids [[buffer(12)]],
     device const uint*  slot_mapping [[buffer(13)]],
+    device const T*     tq_k_bias    [[buffer(14)]],
+    device const T*     tq_v_bias    [[buffer(15)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
@@ -657,6 +708,39 @@ template <typename T>
     }
     const uint tq_pdim = (ATTN_TQ == 0u) ? 0u : (head_dim + 32u / ATTN_TQ - 1u) / (32u / ATTN_TQ);
 
+    // TurboQuant K bias: q·R_i·b = Σ_d (kb_a[d]·cos_{i,d} + kb_b[d]·sin_{i,d}) + kb_c
+    // over the NeoX pairs (d, d + ATTN_PAIR_OFF), d < ATTN_ROT_DIM/2, plus the
+    // unrotated rest (kb_c). Per query; lane l owns the `kb_np` adjacent pairs
+    // from d = l·kb_np, so each key's cos/sin reads are contiguous per lane.
+    device const T* kb = tq_k_bias + kv_head_idx * head_dim;
+    device const T* vb = tq_v_bias + kv_head_idx * head_dim;
+    const uint kb_np = (ATTN_ROT_DIM / 2u + 31u) / 32u;
+    thread U kb_a[8];                   // kb_np <= 8 (head_dim <= 512)
+    thread U kb_b[8];
+    U kb_c = 0;
+    if (ATTN_TQ_KB) {
+        const uint half_rot = ATTN_ROT_DIM / 2u;
+        for (uint j = 0; j < kb_np; ++j) {
+            const uint d = simd_lid * kb_np + j;
+            kb_a[j] = 0;
+            kb_b[j] = 0;
+            if (d < half_rot) {
+                const U q0 = U(scale) * U(q_row[d]);
+                const U q1 = U(scale) * U(q_row[d + ATTN_PAIR_OFF]);
+                const U b0 = U(kb[d]);
+                const U b1 = U(kb[d + ATTN_PAIR_OFF]);
+                kb_a[j] = q0 * b0 + q1 * b1;
+                kb_b[j] = q1 * b0 - q0 * b1;
+            }
+        }
+        for (uint e = simd_lid; e < head_dim; e += 32u) {
+            if (e >= half_rot && (e < ATTN_PAIR_OFF || e >= ATTN_PAIR_OFF + half_rot)) {
+                kb_c += U(scale) * U(q_row[e]) * U(kb[e]);
+            }
+        }
+        kb_c = simd_sum(kb_c);
+    }
+
     // Initialize per-thread max with finite minimum (MLX uses
     // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
     // fast::exp doesn't handle -INFINITY safely so we avoid it.
@@ -697,13 +781,16 @@ template <typename T>
 
         U score = 0;
         U k_scale = 1;
+        U k_off = 0;     // this lane's share of q·R_i·b (TurboQuant K bias)
+        U k_off_c = 0;   // its unrotated part, simdgroup-uniform
         device const T* v_ptr = nullptr;
         if (packed) {
             const uint k_word = tq_row * tq_pdim;
             if (do_rot) {
                 // Span block: the codes hold UNROTATED K and RoPE does not
                 // commute with H·D, so decode this key the way the dequant
-                // pass did (rounded to T) and re-rope it in the plain domain.
+                // pass did (rounded to T, its unrotated bias restored) and
+                // re-rope it in the plain domain.
                 U k_loc[16];
                 for (uint j = 0; j < qk_per_thread; ++j) {
                     k_loc[j] = tq_lut[tq_code(tq_packed_k, k_word,
@@ -713,7 +800,8 @@ template <typename T>
                 const U k_norm = tq_norms_k[tq_row] / U(head_dim);
                 for (uint j = 0; j < qk_per_thread; ++j) {
                     const uint e = attn_elem_off(simd_lid, j, qk_per_thread, head_dim);
-                    k_loc[j] = U(T(k_loc[j] * tq_signs[e] * k_norm));
+                    const U x = k_loc[j] * tq_signs[e] * k_norm;
+                    k_loc[j] = U(T(ATTN_TQ_KB ? x + U(kb[e]) : x));
                 }
                 attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
                 for (uint j = 0; j < qk_per_thread; ++j) {
@@ -724,6 +812,17 @@ template <typename T>
                     score += qt_reg[j] * tq_lut[tq_code(tq_packed_k, k_word, tq_e + j)];
                 }
                 k_scale = tq_norms_k[tq_row];
+                if (ATTN_TQ_KB) {
+                    const uint d0 = simd_lid * kb_np;
+                    device const T* cos_row = cos_sin + i * ATTN_ROT_DIM + d0;
+                    device const T* sin_row = cos_row + ATTN_ROT_DIM / 2u;
+                    for (uint j = 0; j < kb_np; ++j) {
+                        if (d0 + j < ATTN_ROT_DIM / 2u) {
+                            k_off += kb_a[j] * U(cos_row[j]) + kb_b[j] * U(sin_row[j]);
+                        }
+                    }
+                    k_off_c = kb_c;
+                }
             }
         } else {
             // Chunked KV: deref the chunk backing this physical block.
@@ -775,7 +874,10 @@ template <typename T>
                 }
             }
         }
-        score = simd_sum(score) * k_scale;
+        // k_scale is simdgroup-uniform, so a K bias's term joins the one
+        // reduction; without one this is exactly the plain score.
+        score = ATTN_TQ_KB ? simd_sum(score * k_scale + k_off) + k_off_c
+                           : simd_sum(score) * k_scale;
 
         // Online softmax update. Match MLX `sdpa_vector`: fast::exp
         // for both factor + exp_score.
@@ -797,9 +899,11 @@ template <typename T>
             }
         } else if (ATTN_TQ != 0u) {
             // The tail's plain V into the codebook domain: s²·D·H·(H·D·v) = v.
+            // Centered like the packed codes; the bias returns at the output.
             U v_loc[16];
             for (uint j = 0; j < qk_per_thread; ++j) {
-                v_loc[j] = U(v_ptr[tq_e + j]) * tq_signs[tq_e + j];
+                const U v = U(v_ptr[tq_e + j]);
+                v_loc[j] = (ATTN_TQ_VB ? v - U(vb[tq_e + j]) : v) * tq_signs[tq_e + j];
             }
             tq_wht(v_loc, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
@@ -867,7 +971,8 @@ template <typename T>
             }
             tq_wht(o_reg, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
-                o_row[tq_e + j] = T(o_reg[j] * tq_signs[tq_e + j] / U(head_dim));
+                const U o = o_reg[j] * tq_signs[tq_e + j] / U(head_dim);
+                o_row[tq_e + j] = T(ATTN_TQ_VB ? o + U(vb[tq_e + j]) : o);
             }
         }
     } else if (simd_lid == 0) {
@@ -894,6 +999,8 @@ template <typename T>
         device const float* tq_signs [[buffer(11)]],                                   \
         device const float* tq_centroids [[buffer(12)]],                               \
         device const uint* slot_mapping [[buffer(13)]],                                \
+        device const T* tq_k_bias [[buffer(14)]],                                      \
+        device const T* tq_v_bias [[buffer(15)]],                                      \
         uint3 tg_pos [[threadgroup_position_in_grid]],                                 \
         uint simd_gid [[simdgroup_index_in_threadgroup]],                              \
         uint simd_lid [[thread_index_in_simdgroup]]);

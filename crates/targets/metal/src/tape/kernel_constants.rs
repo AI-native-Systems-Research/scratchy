@@ -262,16 +262,23 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
     }
 }
 
-/// `KernelId::AttentionViaCacheTq`: the constant its `AttentionViaCache`
+/// `KernelId::AttentionViaCacheTq`: the constants its `AttentionViaCache`
 /// twin's set gains — `ATTN_TQ_BITS` (slot 13), which switches the kernel to
-/// reading the TurboQuant packed store.
+/// reading the TurboQuant packed store, and `ATTN_TQ_K_BIAS` /
+/// `ATTN_TQ_V_BIAS` (slots 14 / 15), set when the codes hold that operand
+/// minus its projection bias (bound at buffers 14 / 15).
 pub struct AttentionViaCacheTqConstants {
     pub bits: TqCodeBits,
+    pub k_bias: bool,
+    pub v_bias: bool,
 }
 
 impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
     fn from(c: AttentionViaCacheTqConstants) -> Self {
-        vec![ConstantValue::uint(ConstSlot(13), c.bits.get())]
+        let mut v = vec![ConstantValue::uint(ConstSlot(13), c.bits.get())];
+        v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
+        v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
+        v
     }
 }
 
@@ -288,6 +295,10 @@ pub struct TqStageConstants {
     pub rot_dim: Option<RotDim>,
     pub pair_off: Option<RopePairOff>,
     pub rope_on_read: Option<u32>,
+    /// `ATTN_TQ_K_BIAS` / `ATTN_TQ_V_BIAS` (slots 14 / 15): the staged
+    /// operand's codes hold it minus its projection bias (bound at buffer 10).
+    pub k_bias: bool,
+    pub v_bias: bool,
 }
 
 impl From<TqStageConstants> for Vec<ConstantValue> {
@@ -301,6 +312,8 @@ impl From<TqStageConstants> for Vec<ConstantValue> {
         ];
         push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
         v.push(ConstantValue::uint(ConstSlot(13), c.bits.get()));
+        v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
+        v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
         v
     }
 }

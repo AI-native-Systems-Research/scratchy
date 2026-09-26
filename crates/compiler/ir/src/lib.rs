@@ -592,12 +592,14 @@ pub enum Instruction {
     #[cfg(fa3_built)]
     FlashAttention3Decode(u32, u32, u32, u32),
     /// `(q_slot, k_slot, v_slot, q_out, k_out, v_out, layer,
-    /// interleaved, is_global)`. `is_global` selects the attention
+    /// interleaved, is_global, kv_offsets)`. `is_global` selects the attention
     /// geometry class on hybrid sliding/global arches (Gemma4): the
     /// metal lowering reads `GLOBAL_HEAD_DIM/NUM_GLOBAL_KV_HEADS/
     /// GLOBAL_ROT_DIM` when true, the base consts when false.
     /// Identical on uniform models (GLOBAL_* default to base).
-    RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool, bool),
+    /// `kv_offsets`: the additive offset the K and V it writes carry — see
+    /// [`KvOffsets`].
+    RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool, bool, KvOffsets),
     MlaSplit(u32, u32, u32),
     MlaAttention(u32, u32, u32, u32, u32),
     /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). Args:
@@ -894,6 +896,40 @@ impl Clone for Instruction {
     fn clone(&self) -> Self {
         *self
     }
+}
+
+/// How a projection's learned bias is stored — which accessor reads it: a
+/// dense `LinearLayer`'s `.bias`, or an MLX-affine layer's `linear_bias`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BiasStorage {
+    Dense,
+    Affine,
+}
+
+/// The additive offset one KV operand carries when its writer caches it.
+///
+/// A per-vector-norm KV codec (TurboQuant) quantizes each cached vector
+/// relative to its own L2 norm, so its error scales with that norm. An operand
+/// that is `projection(x) + bias` has a norm the bias can dominate — Qwen2's
+/// `k_proj` bias is 7–137x the input-dependent part on its outlier layers — and
+/// the error then swamps the part that tells one key from another. The offset
+/// is known exactly, so the codec removes it before quantizing and restores it
+/// after; the writer declares it so the codec cannot miss it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvOffset {
+    /// A projection, or a norm of one: no additive offset.
+    Centered,
+    /// The producing projection's learned bias. K's is rotated with the key
+    /// (RoPE is linear), so at position `t` the offset is `R_t · b`.
+    LinearBias(BiasStorage),
+}
+
+/// [`KvOffset`] of the K and V operands of one KV writer. No default: whoever
+/// emits a writer classifies each operand by its producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KvOffsets {
+    pub k: KvOffset,
+    pub v: KvOffset,
 }
 
 /// Pack the three routed-expert projection bit-widths (gate / up / down)

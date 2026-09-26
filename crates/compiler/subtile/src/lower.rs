@@ -319,6 +319,125 @@ pub enum LoweredOp {
     },
 }
 
+/// The learned constant an op's output carries on top of the input-dependent
+/// part — what a per-vector-norm KV codec must remove from a cached K/V before
+/// quantizing, or the constant's norm sets its error instead of the signal's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdditiveOffset {
+    /// None: a projection, or a norm (which rescales per token, adding nothing).
+    Absent,
+    /// The op adds its bias source (operand 1) to operand 0.
+    Bias,
+    /// A view: operand 0's offset, unchanged.
+    OfOperand0,
+}
+
+impl LoweredOp {
+    /// This op's [`AdditiveOffset`], or `None` for an op a cached K/V is never
+    /// produced by. Exhaustive: a new op states its rule before it compiles.
+    pub fn additive_offset(&self) -> Option<AdditiveOffset> {
+        use LoweredOp as L;
+        match self {
+            L::Gemm { .. } | L::RmsNorm { .. } | L::RmsNormUnit { .. } => {
+                Some(AdditiveOffset::Absent)
+            }
+            L::BiasAdd => Some(AdditiveOffset::Bias),
+            L::Reshape { .. } => Some(AdditiveOffset::OfOperand0),
+            L::Silu
+            | L::Gelu
+            | L::TanhSoftCap
+            | L::ScalarWeightMul
+            | L::GateSplit { .. }
+            | L::GateApply
+            | L::GateScale
+            | L::LoadPixels { .. }
+            | L::EmbeddingGather { .. }
+            | L::LoadPosEmbeds { .. }
+            | L::VisionRope
+            | L::QuickGelu
+            | L::GeluErf
+            | L::VarlenAttention { .. }
+            | L::EncoderAttn { .. }
+            | L::GatedDeltaNet
+            | L::GemmaMoe { .. }
+            | L::Moe { .. }
+            | L::Mul
+            | L::ScalarMul { .. }
+            | L::SiluMul
+            | L::Add
+            | L::Mean
+            | L::Sub
+            | L::RopeRotate { .. }
+            | L::RopeAppend { .. }
+            | L::AttnDecode { .. } => None,
+        }
+    }
+}
+
+/// The projection — its op index and weight — whose bias the KV operand
+/// produced by `ops[op]` carries, or `None` if it carries none: views are
+/// followed back to the producer, which [`LoweredOp::additive_offset`] decides.
+/// `Err` names a producer with no rule, or a bias on something not a projection.
+pub fn kv_operand_bias(ops: &[OpDesc], op: usize) -> Result<Option<(usize, GemmWeight)>, String> {
+    let source = || match ops[op].inputs.first() {
+        Some(InputRef::Op(s)) => Ok(*s),
+        _ => Err(format!(
+            "op {op} ({:?}): operand 0 is not an op",
+            ops[op].op
+        )),
+    };
+    match ops[op].op.additive_offset() {
+        Some(AdditiveOffset::Absent) => Ok(None),
+        Some(AdditiveOffset::OfOperand0) => kv_operand_bias(ops, source()?),
+        Some(AdditiveOffset::Bias) => match ops[source()?].op {
+            LoweredOp::Gemm { weight, .. } => Ok(Some((source()?, weight))),
+            other => Err(format!("op {op}: a KV bias on {other:?}, not a projection")),
+        },
+        None => Err(format!(
+            "op {op} ({:?}) feeds a KV writer but has no additive-offset rule",
+            ops[op].op
+        )),
+    }
+}
+
+#[cfg(test)]
+mod additive_offset_tests {
+    use super::{AdditiveOffset, GemmWeight, LoweredOp};
+
+    /// Every producer a KV writer's operand has across the arches: Qwen2's
+    /// `bias_add(gemm)` carries the bias — marked `Absent`, TurboQuant codes
+    /// it and Qwen2 decodes garbage — while projections and the qk-norms
+    /// (Qwen3, Gemma) add nothing, and a per-head view carries its source's.
+    #[test]
+    fn kv_operand_producers_declare_their_offset() {
+        let gemm = LoweredOp::Gemm {
+            n: 512,
+            weight: GemmWeight::Dense,
+        };
+        assert_eq!(
+            LoweredOp::BiasAdd.additive_offset(),
+            Some(AdditiveOffset::Bias)
+        );
+        for centered in [
+            gemm,
+            LoweredOp::RmsNorm {
+                eps: 1e-6,
+                gain_offset: 0.0,
+            },
+            LoweredOp::RmsNormUnit { eps: 1e-6 },
+        ] {
+            assert_eq!(centered.additive_offset(), Some(AdditiveOffset::Absent));
+        }
+        let view = LoweredOp::Reshape {
+            rows_mult: 4,
+            rows_div: 1,
+            cols: 128,
+        };
+        assert_eq!(view.additive_offset(), Some(AdditiveOffset::OfOperand0));
+        assert_eq!(LoweredOp::Add.additive_offset(), None);
+    }
+}
+
 /// One op in the forward.
 #[derive(Clone, Debug)]
 pub struct OpDesc {
