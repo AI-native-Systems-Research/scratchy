@@ -48,6 +48,10 @@ use ktir_core::opkind::OpKind;
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gather_of, regions};
 use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+// The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
+// from it — so it lives beside that door and this recogniser names the same type rather than a
+// parallel one that would have to be mapped across the boundary.
+use super::lower_ktir_to_superdsc::BcastAxis;
 use crate::placement::BundleLayout;
 
 /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
@@ -955,22 +959,6 @@ fn is_plumbing(op: OpKind) -> bool {
     )
 }
 
-/// WHICH AXIS a recognised rank-plumbing chain broadcasts along.
-///
-/// The two are not interchangeable and the device says which through a different `In` builder, so
-/// they are a variant rather than a `bool`: [`In::col`] marks the operand out-broadcast (a per-row
-/// scalar sprayed along the stick axis) and [`In::mb`] marks it mb-broadcast (a row vector sprayed
-/// down the rows). Emitting one for the other reads a `[m, 1]` operand as a `[1, n]` and takes the
-/// wrong bytes for every row after the first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BcastAxis {
-    /// `[m, 1]` → `[m, n]`: a per-row scalar (a row reduction's result) sprayed along the columns.
-    /// The softmax's `m[:, None]` and `l[:, None]`.
-    Col,
-    /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
-    Mb,
-}
-
 /// ONE recognised broadcast: the value a consumer reads, resolved back to the rank-2 SOURCE the
 /// chain started from, plus the axis.
 #[derive(Clone, Copy)]
@@ -1715,8 +1703,11 @@ pub fn lower_function(
                 &per_op,
                 sym_id_base,
                 Some(layout),
-                b_orient,
-                op_gather,
+                WalkProof {
+                    b_orient,
+                    gather: op_gather,
+                    bcast: &bcast_axes,
+                },
             )?;
             out.append(&mut emitted);
             lowered += 1;
@@ -1751,8 +1742,11 @@ pub fn lower_function(
             &per_op,
             sym_id_base,
             layout,
-            b_orient,
-            op_gather,
+            WalkProof {
+                b_orient,
+                gather: op_gather,
+                bcast: &bcast_axes,
+            },
         )?;
         out.append(&mut emitted);
         lowered += 1;
@@ -1787,6 +1781,27 @@ pub fn lower_function(
     Ok(out)
 }
 
+/// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
+/// holds the REGIONS and not the ops — re-deriving any of these there would mean re-walking the
+/// chain without them. They ride together as one value because they are one op's row in the walk.
+///
+/// ⛔ DESTRUCTURED WITHOUT `..` at the head of [`emit_one`], so a fourth proof added here and not
+/// carried through is an E0027 at that line rather than a field nobody reads.
+struct WalkProof<'a> {
+    /// The B orientation the WALK proved from this op's own `indexing_maps` — `Some` for exactly a
+    /// `Node(Program::Matmul)`, which is the only arm that reads it.
+    b_orient: Option<BOrient>,
+    /// The gather THIS op reads, when the one the program states is over one of its inputs — the
+    /// walk's own join. `None` for every op of every program that states no
+    /// `ktdp.construct_indirect_access_tile`, which is every fixture but the embedding, and then the
+    /// arms below are byte-identical to what they were.
+    gather: Option<Gather>,
+    /// The per-input broadcast axes the WALK proved from this op's own rank-plumbing chain (see
+    /// [`program_broadcast_chains`]) — positional with `per_op`'s inputs, empty when no operand is
+    /// broadcast.
+    bcast: &'a [Option<BcastAxis>],
+}
+
 /// Hand ONE op's regions to the body its `Program` names.
 ///
 /// Every body here is unchanged and unaware it is being called per-op rather than per-function:
@@ -1798,16 +1813,13 @@ fn emit_one(
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    // The B orientation the WALK proved from this op's own `indexing_maps` — `Some` for exactly a
-    // `Node(Program::Matmul)`, which is the only arm that reads it. Threaded rather than re-derived
-    // because this fn has the regions, not the op.
-    b_orient: Option<BOrient>,
-    // The gather THIS op reads, when the one the program states is over one of its inputs — the walk's
-    // own join, threaded for the same reason as `b_orient`. `None` for every op of every program that
-    // states no `ktdp.construct_indirect_access_tile`, which is every fixture but the embedding, and
-    // then the arms below are byte-identical to what they were.
-    gather: Option<Gather>,
+    proof: WalkProof<'_>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
+    let WalkProof {
+        b_orient,
+        gather,
+        bcast,
+    } = proof;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
     // `split_out(.., 2)` reads.
@@ -1880,7 +1892,7 @@ fn emit_one(
             )?
         }
         Program::Elementwise(e) => {
-            super::lower_ktir_to_superdsc::elementwise(name, e, per_op, sym_id_base, layout)?
+            super::lower_ktir_to_superdsc::elementwise(name, e, per_op, bcast, sym_id_base, layout)?
         }
         Program::Transpose => {
             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?

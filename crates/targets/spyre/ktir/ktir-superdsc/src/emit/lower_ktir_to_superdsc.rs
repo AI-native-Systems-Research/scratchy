@@ -717,18 +717,53 @@ fn pointwise_extents_agree(
     Ok(())
 }
 
+/// WHICH AXIS a pointwise operand is broadcast along.
+///
+/// The two are not interchangeable and the device says which through a different [`In`] builder, so
+/// they are a variant rather than a `bool`: [`In::col`] marks the operand out-broadcast (a per-row
+/// scalar sprayed along the stick axis) and [`In::mb`] marks it mb-broadcast (a row vector sprayed
+/// down the rows). Emitting one for the other reads a `[m, 1]` operand as a `[1, n]` and takes the
+/// wrong bytes for every row after the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BcastAxis {
+    /// `[m, 1]` → `[m, n]`: a per-row scalar (a row reduction's result) sprayed along the columns.
+    /// The softmax's `m[:, None]` and `l[:, None]`.
+    Col,
+    /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
+    Mb,
+}
+
 /// main's `lower_elementwise_node` (main 8362-8432). Its door: the [`Elementwise`] kind is stated by
 /// the caller, the operand names are the parameters, and the row count is the node's ([`node_rows`] —
 /// the producer row-blocks a region wider than the LX holds, so the first window is not the node).
+///
+/// `bcast[i]` is the axis input `i` is broadcast along, `None` for a dense operand. The caller proves
+/// it from the program (see `whole_function::program_broadcast_chains`, which reads the
+/// `expand_shape`'s degenerate dim and cross-checks the `linalg.broadcast`'s `Dimensions`, then
+/// checks the axis against the resolved source's own extent). An empty slice means "no operand is
+/// broadcast", which is every existing caller.
 pub fn elementwise(
     name: &str,
     kind: Elementwise,
     r: &[Region],
+    bcast: &[Option<BcastAxis>],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
     let (ins, out) = split_out(name, r, layout, arity)?;
+    if !bcast.is_empty() && bcast.len() != ins.len() {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: {} broadcast flags for {} inputs — the flags are \
+             POSITIONAL (flag `i` selects input `i`'s operand mode), so a length mismatch would \
+             address some other operand as the vector",
+            bcast.len(),
+            ins.len(),
+        ));
+    }
+    if bcast.iter().any(Option::is_some) {
+        return elementwise_broadcast(name, kind, &ins, &out, bcast, sym_id_base, layout);
+    }
     pointwise_extents_agree(name, kind, &ins, &out)?;
     // ⛔ THIS COMMENT USED TO SAY `assemble_pointwise` EMITS THE SFP POLYNOMIAL TABLE "via
     // `constant_info(op_func)`". THERE IS NO SUCH FUNCTION. `constant_info` is a local in `emit_sdsc`
@@ -756,6 +791,123 @@ pub fn elementwise(
         layout,
     );
     Ok(vec![op])
+}
+
+/// ⭐⭐⭐ [`elementwise`] WITH A BROADCAST OPERAND — the arm [`pointwise_extents_agree`] names in its
+/// own refusal, now built.
+///
+/// A broadcast is an ADDRESSING MODE, not an op: the AIU has no broadcast primitive and needs none.
+/// [`EwOperand::scale`] turns [`In::col`] into `out = Scale::RedStick` (a one-stick `alpha_=0`
+/// broadcast READ) and [`In::mb`] into `mb = Scale::RedNonStick`, so the DESCRIPTOR states which axis
+/// is sprayed and the operand is read at its own extent instead of the output's. That is the whole
+/// difference from the seeded path, which computes `device_dims` once off the output tile and hands
+/// the same dims to every operand — which is why it has to refuse a degenerate one.
+///
+/// This is the same emission the hardware-proven bodies already use: `rmsnorm.rs` reads
+/// `In::col(&rinv)` for the per-row `1/rms` and `In::mb(&gamma)` for the `[1, cols]` gain, and
+/// `attn.rs`'s softmax reads `In::col(&hm(run_m))` for the per-row max. So the softmax a KTIR producer
+/// spells longhand lowers to the operand modes the fused body was already proving on card.
+///
+/// ⭐ THE OPERAND'S BUFFER IS ALREADY STICK-WIDE, which is what makes a `[m, 1]` region addressable
+/// as a per-row scalar. [`synth_footprint_bytes`](crate::placement::synth_footprint_bytes) rounds the
+/// INNER extent up to a whole stick, so the `[m, 1]` intermediate a row reduction writes reserves
+/// `m × 64` fp16 — byte-identical to the `rb(name, rows, 64)` handle `rmsnorm.rs` mints for `rinv`.
+/// The per-row value sits in lane 0 of each row and `Scale::RedStick` reads exactly that.
+///
+/// ⛔ THE EXTENTS ARE RE-CHECKED HERE, NOT TRUSTED. The caller proves the axis from the program's
+/// attributes; this door proves it from the operand's REGION. The two are independent, and the
+/// emission is only correct when both hold — a `Col` flag over an operand that is really `[m, n]`
+/// would read one lane and spray it over the whole output, silently.
+fn elementwise_broadcast(
+    name: &str,
+    kind: Elementwise,
+    ins: &[Region],
+    out: &Region,
+    bcast: &[Option<BcastAxis>],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // THE OP FUNC IS A FUNCTION OF THE KIND, so it is named here rather than passed. The caller holds
+    // it already, but [`elementwise_op_func`] is that one `match` and nothing else, so handing it over
+    // as well would buy a parameter and no fact — and the call already proved it Ok for this `kind`.
+    let (op_func, _) = elementwise_op_func(name, kind)?;
+    // ⛔ A UNARY'S ONLY INPUT CANNOT BE THE BROADCAST. `f(vector) -> tile` is not a pointwise op at
+    // all — it is a broadcast MATERIALIZATION with an `f` applied, and emitting it as one would put
+    // the whole output's worth of work on a descriptor whose only input is one lane per row. Nothing
+    // produces it, so it is named rather than given a meaning here.
+    if ins.len() < 2 {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: the only input of a unary op is marked broadcast, so the \
+             output would be a SPRAY of a vector rather than a function of a tile. A broadcast is an \
+             operand mode of an op that also reads a dense operand; a materialization is a different \
+             op and this door does not invent one"
+        ));
+    }
+    // EVERY OPERAND'S EXTENT AGAINST WHAT ITS FLAG CLAIMS — the dense ones at the output's extent
+    // (the law [`pointwise_extents_agree`] states), the broadcast ones degenerate on the sprayed axis
+    // and matching the output on the other. A `Col` operand must still have the output's ROW count:
+    // it supplies one value per row, so a different row count would run off its end exactly as a
+    // dense mismatch does.
+    for (i, x) in ins.iter().enumerate() {
+        let want = match bcast[i] {
+            None => (out.v_rows, out.c_len),
+            Some(BcastAxis::Col) => (out.v_rows, 1),
+            Some(BcastAxis::Mb) => (1, out.c_len),
+        };
+        if (x.v_rows, x.c_len) != want {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` but its operand mode \
+                 ({:?}) requires `[{}, {}]` against the `[{}, {}]` output t{}. A `Col` operand is one \
+                 value per row (`[rows, 1]`), an `Mb` operand one row of values (`[1, cols]`), and a \
+                 dense operand the whole tile; the descriptor addresses it as its mode says, so an \
+                 extent that disagrees reads bytes nobody wrote.",
+                x.tid, x.v_rows, x.c_len, bcast[i], want.0, want.1, out.v_rows, out.c_len, out.tid,
+            ));
+        }
+    }
+    let cols = out.c_len;
+    check_pointwise_cols(cols, "Elementwise", out.tid)?;
+    let rows = node_rows(name, out)?;
+    let op_name = format!("{op_func}_o{}", out.tid);
+    // The handles: `rb` is RowBlocked, which is what `head_major == false` means on the seeded path —
+    // the residual token stream, not the per-head attention layout. An INPUT handle's extents are
+    // annotation-only (`In::ew` keeps the name and the two broadcast flags), and the OUTPUT's are too
+    // (the builder reads `o.name()` and `O::kind()`), so the emission cannot depend on them; they are
+    // stated at the operand's own shape so a reader is not misled.
+    let out_h = rb(&out.name(), rows, cols);
+    let in_names: Vec<String> = ins.iter().map(Region::name).collect();
+    let in_handles: Vec<_> = in_names
+        .iter()
+        .zip(ins)
+        .map(|(n, x)| rb(n, x.v_rows, x.c_len))
+        .collect();
+    let ew: Vec<_> = in_handles
+        .iter()
+        .zip(bcast)
+        .map(|(h, b)| match b {
+            None => In::full(h).ew(),
+            Some(BcastAxis::Col) => In::col(h).ew(),
+            Some(BcastAxis::Mb) => In::mb(h).ew(),
+        })
+        .collect();
+    // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
+    // broadcast op is not silently exempt from it.
+    let tile_op = pointwise_tile_op(rows, cols, ins.len() as u32 + 1);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &op_name,
+        &tile_op,
+        op_func,
+        rows,
+        cols,
+        &ew,
+        &out_h,
+        // WHOLE-TENSOR, like the dense arm: this door's regions are un-windowed (its caller refuses a
+        // column corner), so there is no chunk offset to apply. A column-blocked broadcast op would
+        // need `crate::addr::col_of` here, as `silumul` does.
+        0,
+        sym_id_base,
+        layout,
+    )])
 }
 
 /// main's `lower_silumul_node` (main 8466-8604): `out = silu(gate) · up` DECOMPOSED into two
@@ -3774,7 +3926,7 @@ mod elementwise_tests {
         );
         let mut sym = 0i64;
         // `EmittedOp` is not `Debug`, so `expect_err` is unavailable — bind the refusal directly.
-        let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None) else {
+        let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None) else {
             panic!("a [1,128] operand under a [4,128] output cannot be addressed here");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -3801,7 +3953,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None)
+        let ops = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None)
             .expect("agreeing extents are the ordinary case");
         assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
     }
@@ -3818,7 +3970,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise("sub_s3", Elementwise::Sub, &r, &mut sym, None) else {
+        let Err(e) = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None) else {
             panic!("a [4,1] per-row scalar is a broadcast this path cannot state");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -3834,7 +3986,7 @@ mod elementwise_tests {
     fn a_unary_input_of_the_wrong_extent_is_refused() {
         let r = vec![reg(5, 1, 128, false), reg(7, 4, 128, true)];
         let mut sym = 0i64;
-        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &mut sym, None) else {
+        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &[], &mut sym, None) else {
             panic!("a unary's input extent must match its output too");
         };
         assert!(e.message.contains("t5"), "names the operand: {}", e.message);
@@ -3851,10 +4003,157 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("sub_s3", Elementwise::Sub, &r, &mut sym, None)
+        let ops = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None)
             .expect("a same-extent subtract is structurally an add");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "sub_o7");
+    }
+
+    // ── THE BROADCAST ARM, AND EVERY REFUSAL AROUND IT ────────────────────────────────────────
+    //
+    // ⭐⭐⭐ THE SOFTMAX IS WHY THIS ARM EXISTS. `decoder_layer_one_flat`'s `Elementwise(Sub)` takes the
+    // per-row max as a `[64, 1]` operand and its `Elementwise(RealDiv)` takes the per-row sum the same
+    // way; both were REFUSED by `pointwise_extents_agree`, correctly, because the seeded whole-tensor
+    // builder addresses every operand at the OUTPUT's extent. `In::col` states the broadcast instead,
+    // which is the builder that refusal has always named. MEASURED on card once this landed (with the
+    // transpose rerouted and the ScalarMul scales bound): `decoder_layer_one_flat` max|err| 0.0306 =
+    // 0.783 % of full scale over a 52-op chain, within_2pct_strict (floor 1e-3) 0.8937;
+    // `decoder_two_layers_flat` 0.0343 = 0.800 % FS over 104 ops, 0.8458 strict. The STRICT figure is
+    // quoted because it is the one that reproduces: the max errors reproduce exactly, a looser
+    // denominator did not.
+
+    /// ⭐ THE PER-ROW SCALAR NOW EMITS — one op, still named `sub_o7`, when the caller STATES the axis.
+    /// Its twin above (`a_per_row_scalar_operand_is_still_refused`) is the control: the SAME regions
+    /// with NO flag still refuse, so the flag is what admits it and not a loosened extent law.
+    #[test]
+    fn a_stated_col_broadcast_operand_emits_one_op() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 4, 1, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        )
+        .expect("a [m, 1] per-row scalar IS expressible once the axis is stated");
+        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+        assert_eq!(
+            ops[0].op_name, "sub_o7",
+            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
+             fingerprint, and the broadcast arm is the same op",
+        );
+    }
+
+    /// ⭐ AND THE ROW VECTOR TOO, through the OTHER builder. `Mb` is why [`BcastAxis`] is a variant
+    /// rather than a bool: an rmsnorm gain is `[1, n]` and reading it as `[m, 1]` would take one column
+    /// and spray it.
+    #[test]
+    fn a_stated_mb_broadcast_operand_emits_one_op() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 1, 128, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s3",
+            Elementwise::Mul,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
+        )
+        .expect("a [1, n] row vector is the mb-broadcast operand mode");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_name, "multiply_o7");
+    }
+
+    /// ⛔⛔⛔ THE AXIS AND THE EXTENT MUST AGREE, and this is the refusal that makes the flag a
+    /// STATEMENT rather than a licence. A `Col` flag over an operand that is really the whole tile
+    /// would address one lane per row and spray it over 128 columns — a silently wrong answer with no
+    /// shape error anywhere, which is exactly what the seeded path's own refusal exists to prevent.
+    #[test]
+    fn a_col_flag_over_a_full_tile_is_refused_by_name() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 4, 128, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!(
+                "a Col flag over a [4, 128] operand was ACCEPTED — the descriptor now reads one lane \
+                 per row and sprays it, and nothing downstream can tell"
+            );
+        };
+        assert!(e.message.contains("t6"), "names the operand: {}", e.message);
+        assert!(
+            e.message.contains("Col") && e.message.contains("[4, 1]"),
+            "states the mode AND the extent it requires: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND THE FLAGS ARE POSITIONAL, so a length that does not match the inputs is refused rather
+    /// than zip-truncated onto some other operand.
+    #[test]
+    fn a_flag_slice_of_the_wrong_length_is_refused() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 4, 1, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("one flag for two inputs must refuse — zip would silently flag input 0 instead")
+        };
+        assert!(
+            e.message.contains("POSITIONAL"),
+            "says why the length matters: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ A UNARY WHOSE ONLY INPUT IS THE BROADCAST is a materialization, not a pointwise op.
+    #[test]
+    fn a_unary_broadcast_input_is_refused_by_name() {
+        let r = vec![reg(5, 4, 1, false), reg(7, 4, 128, true)];
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "silu_s3",
+            Elementwise::Silu,
+            &r,
+            &[Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("f(vector) -> tile is a spray, not a pointwise op")
+        };
+        assert!(
+            e.message.contains("SPRAY") || e.message.contains("spray"),
+            "names what it would be: {}",
+            e.message
+        );
     }
 
     // ── (iii) EXHAUSTIVE DECLARED-SET ASSERTIONS ──────────────────────────────────────────────
