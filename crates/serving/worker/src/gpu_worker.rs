@@ -2507,7 +2507,7 @@ impl Drop for ResidencyPanicGuard {
 /// is not the constraint and the trade is a bad one. Sized to sit
 /// between the models measured on metal:
 ///
-///     qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> fp16 (garbage under TQ)
+///     qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> fp16
 ///     llama-3.2-1b   16 x 8 kv x 64  =  32 KiB/token   -> TurboQuant
 ///     granite-4.1-3b 40 x 8 kv x 64  =  80 KiB/token   -> TurboQuant
 ///     gemma-3-4b     34 x 4 kv x 256 = 544 KiB/token   -> TurboQuant
@@ -2864,15 +2864,11 @@ impl Worker for MetalWorker {
                 } else if kv_bytes_per_token < TQ_MIN_KV_BYTES_PER_TOKEN {
                     // TurboQuant buys KV CAPACITY. A model whose whole KV
                     // row is a few KB does not need the capacity and should
-                    // not pay the fidelity risk: `qwen2.5-0.5b` (24 layers
-                    // x 2 kv x 64 = 12 KiB/token) decodes garbage under
-                    // TurboQuant at the maximum 4 bits while fp16 KV is
-                    // clean, and every component — flat kernels, paged
-                    // kernels, codebook (outliers cost nothing), tape order,
-                    // dispatch grids — measures correct in isolation. The
-                    // cause is unidentified. Compressing 12 KiB/token was never
-                    // worth it, so the honest default is fp16 and the open
-                    // question is recorded rather than papered over.
+                    // not pay the (4-bit) fidelity cost: `qwen2.5-0.5b` is
+                    // 24 layers x 2 kv x 64 = 12 KiB/token. (Its old garbage
+                    // under TurboQuant was the codec coding its `k_proj` bias
+                    // — 137x the signal on layer 0 — as signal; the KV writer
+                    // now declares that offset and the codec removes it.)
                     tracing::info!(
                         "ScratchyWorker(metal): KV is {} KiB/token ({} layers x {nkv} kv x {hd}) — \
                          below the {} KiB TurboQuant threshold, using fp16 KV \

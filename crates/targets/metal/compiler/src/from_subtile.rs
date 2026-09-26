@@ -207,6 +207,37 @@ fn in_op(r: &InputRef) -> Option<usize> {
     }
 }
 
+/// The additive offset the KV operand produced by `op` carries into the
+/// cache of `layer`, and — for a bias — the producing projection's accessor,
+/// which the writer's weight site must hold (`op_abi::rope_append_bias_slots`).
+fn kv_offset_of(
+    lowered: &LoweredDecode,
+    facts: &StreamFacts<'_>,
+    op: usize,
+    layer: u32,
+) -> Result<(scratchy_ir::KvOffset, Option<WeightSlot>), String> {
+    use scratchy_ir::{BiasStorage, KvOffset};
+    let Some((gemm, weight)) = scratchy_subtile::lower::kv_operand_bias(&lowered.input.ops, op)?
+    else {
+        return Ok((KvOffset::Centered, None));
+    };
+    let e = weight_ext(lowered, gemm).ok_or("kv bias projection: no weight")?;
+    if layer_of_with_path(lowered, facts, e) != layer {
+        return Err(format!(
+            "op {op}: a KV bias from another layer's projection"
+        ));
+    }
+    let storage = match weight {
+        GemmWeight::Affine { .. } => BiasStorage::Affine,
+        GemmWeight::Dense | GemmWeight::Fp8Dynamic => BiasStorage::Dense,
+    };
+    let linear = WeightSlot {
+        kind: WeightKind::Linear,
+        base: base_of(lowered, facts, e)?,
+    };
+    Ok((KvOffset::LinearBias(storage), Some(linear)))
+}
+
 /// The bridge's output for one decode canonical: backbone + lm_head
 /// streams (UNCOMPRESSED — the caller runs the same
 /// `apply_loop_compression` the instruction-selection route runs) with
@@ -1266,6 +1297,9 @@ pub fn decode_instruction_stream(
                 let v = in_op(&od.inputs[3]).ok_or("rope in3 (v) not op")?;
                 let k_slot = slot_of(lowered, slots, k)?;
                 let v_slot = slot_of(lowered, slots, v)?;
+                let (k_off, k_linear) = kv_offset_of(lowered, facts, k, *layer)?;
+                let (v_off, v_linear) = kv_offset_of(lowered, facts, v, *layer)?;
+                let kv_offsets = scratchy_ir::KvOffsets { k: k_off, v: v_off };
                 backbone.push(I::RopeAppend(
                     q_slot,
                     k_slot,
@@ -1276,8 +1310,16 @@ pub fn decode_instruction_stream(
                     *layer,
                     *interleaved,
                     *is_global,
+                    kv_offsets,
                 ));
-                bb_ws.push(ws(WeightKind::CosSin, rope_rotary_ident(lowered, od)));
+                bb_ws.push(scratchy_target_metal::op_abi::rope_append_weight_site(
+                    WeightSlot {
+                        kind: WeightKind::CosSin,
+                        base: rope_rotary_ident(lowered, od),
+                    },
+                    k_linear,
+                    v_linear,
+                ));
                 bb_sigs.push(HazardSig {
                     group,
                     reads: vec![q_slot, k_slot, v_slot],

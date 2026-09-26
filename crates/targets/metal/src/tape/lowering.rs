@@ -75,7 +75,7 @@ use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
     Binding, DispatchShape, GatedCommand, GemmDims, IntoBaked, KernelId, LoweredCommand,
-    LoweredMetalTape, LoweringError, MetalDtype, RuntimeBindingKind, WeightBundleKind,
+    LoweredMetalTape, LoweringError, MetalDtype, RuntimeBindingKind, TqUnbound, WeightBundleKind,
     WeightLocator, WeightTensor, baked,
 };
 
@@ -587,25 +587,126 @@ fn sample_slice_command(
     }
 }
 
+/// A projection bias on the KV writer's weight site.
+#[derive(Clone, Copy)]
+struct TqBias {
+    which: WeightTensor,
+    layer: super::ids::LayerId,
+    at: WeightLocator,
+}
+
+impl TqBias {
+    fn binding(self, kind: WeightBundleKind, which: WeightTensor, slot: u32, index: u8) -> Binding {
+        Binding::Weight {
+            kind,
+            which,
+            layer: self.layer,
+            locator: WeightLocator { slot, ..self.at },
+            binding_index: index,
+        }
+    }
+
+    /// The bias itself, bound at `index`.
+    fn bias_binding(self, index: u8) -> Binding {
+        self.binding(
+            WeightBundleKind::LinearLayer,
+            self.which,
+            self.at.slot,
+            index,
+        )
+    }
+}
+
+/// One TurboQuant'd cache operand and its writer's projection bias, if any.
+/// `IS_K` fixes the store it lives in AND how that bias is restored: K's was
+/// rotated with the key by the writer's rotary table (the same site's
+/// `cos_sin_at` slot 0), V's is cached as-is.
+#[derive(Clone, Copy)]
+struct TqOperand<const IS_K: bool>(Option<TqBias>);
+
+/// The K and V a KV writer caches, as the TurboQuant codec must see them: it
+/// quantizes each vector relative to its own norm, so an additive offset it
+/// does not remove sets its error (`scratchy_ir::KvOffset`). Built only from the
+/// writer's declared `KvOffsets`; every codec command takes one.
+#[derive(Clone, Copy)]
+struct TqOperands {
+    k: TqOperand<true>,
+    v: TqOperand<false>,
+}
+
+impl TqOperands {
+    /// The operands of the KV writer `inst` at tape position `index`, or `None`
+    /// if `inst` writes no KV cache.
+    fn of_writer(inst: &Instruction, index: usize, tape_index: u32) -> Option<Self> {
+        use scratchy_ir::BiasStorage;
+        let [k, v] = match *inst {
+            Instruction::RopeAppend(.., layer, _, _, offsets) => {
+                crate::op_abi::rope_append_bias_slots(offsets).map(|b| {
+                    b.map(|(storage, slot)| TqBias {
+                        which: match storage {
+                            BiasStorage::Dense => WeightTensor::Bias,
+                            BiasStorage::Affine => WeightTensor::AffineLinearBias,
+                        },
+                        layer: super::ids::LayerId(layer),
+                        at: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot,
+                        },
+                    })
+                })
+            }
+            // Normed K/V (a norm adds nothing), and a fused projection whose
+            // lowering refuses a bias input.
+            Instruction::RopeAppendNormed(..) | Instruction::FusedQkvRopeCache(..) => [None, None],
+            _ => return None,
+        };
+        Some(Self {
+            k: TqOperand(k),
+            v: TqOperand(v),
+        })
+    }
+}
+
+/// `operands`, if a KV writer declared them and a K bias has the rotary table
+/// it rotates by.
+fn tq_operands(
+    p: &MetalModelConsts,
+    operands: Option<TqOperands>,
+) -> Result<TqOperands, TqUnbound> {
+    let ops = operands.ok_or(TqUnbound::Writer)?;
+    if ops.k.0.is_some() && !p.rope_on_read {
+        return Err(TqUnbound::RotaryTable);
+    }
+    Ok(ops)
+}
+
 /// TurboQuant prefill: the per-layer staging command — the layer's K (or V)
 /// for every sequence of the step, written into the fp16 scratch in the
-/// codebook's rotated domain (`tq_stage_rotated`). `is_global` is the
-/// attention's layer class (its rope-on-read cos_sin for span blocks; V is
-/// never roped). The grid (block-table width, num_kv_heads, num_seqs) is
-/// overridden by the worker per forward; the baked shape is a placeholder.
-fn tq_stage_command(
+/// codebook's rotated domain (`tq_stage_rotated`), its offset restored.
+/// `is_global` is the attention's layer class (its rope-on-read cos_sin for
+/// span blocks and a rotated K bias; V is never roped). The grid (block-table
+/// width, num_kv_heads, num_seqs) is overridden by the worker per forward; the
+/// baked shape is a placeholder.
+fn tq_stage_command<const IS_K: bool>(
     p: &MetalModelConsts,
     layer: u32,
-    is_v: bool,
+    operand: TqOperand<IS_K>,
     is_global: bool,
     bucket_m: u32,
     block_cap: u32,
 ) -> LoweredCommand {
-    let (ror_rd, ror_po, ror_on, ror_bind) = if is_v {
-        (None, None, None, None)
-    } else {
+    let (ror_rd, ror_po, ror_on, ror_bind) = if IS_K {
         rope_on_read_params(p, is_global)
+    } else {
+        (None, None, None, None)
     };
+    let mut bindings = Vec::from(super::kernel_bindings::TqStageBindingSet {
+        kv_layer: super::ids::LayerId(layer),
+        is_v: !IS_K,
+        rope_on_read: ror_bind,
+    });
+    bindings.extend(operand.0.map(|b| b.bias_binding(10)));
     LoweredCommand {
         kernel: KernelId::TqStageRotated,
         library: "attention",
@@ -624,6 +725,8 @@ fn tq_stage_command(
             rot_dim: ror_rd,
             pair_off: ror_po,
             rope_on_read: ror_on,
+            k_bias: IS_K && operand.0.is_some(),
+            v_bias: !IS_K && operand.0.is_some(),
         }
         .into_baked(),
         dispatch: DispatchShape {
@@ -631,12 +734,7 @@ fn tq_stage_command(
             threads_per_threadgroup: (32, 1, 1),
             m_scaling: None,
         },
-        bindings: super::kernel_bindings::TqStageBindingSet {
-            kv_layer: super::ids::LayerId(layer),
-            is_v,
-            rope_on_read: ror_bind,
-        }
-        .into_baked(),
+        bindings: baked(bindings),
         gemm_dims: None,
     }
 }
@@ -684,18 +782,42 @@ fn tq_rotate_command(
     }
 }
 
+/// `Binding::Runtime`s for `kinds`, bound from index `first`.
+fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) -> Vec<Binding> {
+    (first..)
+        .zip(kinds)
+        .map(|(binding_index, kind)| Binding::Runtime {
+            kind,
+            binding_index,
+        })
+        .collect()
+}
+
+/// `Binding::Inline`s for `values`, bound from index `first`.
+fn inline_at(first: u8, values: impl IntoIterator<Item = u32>) -> Vec<Binding> {
+    (first..)
+        .zip(values)
+        .map(|(binding_index, value)| Binding::Inline {
+            binding_index,
+            value,
+        })
+        .collect()
+}
+
 /// TurboQuant: build the per-layer quantize command (new tokens in the fp16
-/// scratch → packed[L]), run right after the layer's KV writer. New-token
-/// count == num_tokens, so the grid scales like RopeAppend (m_scaling on X).
-/// `is_v` selects the V store/scratch. The TurboQuant layers are the GLOBAL
-/// class (every layer on uniform arches, where GLOBAL_* == base).
-fn tq_quantize_command(
+/// scratch → packed[L]), run right after the layer's KV writer, removing the
+/// operand's offset first (bindings 18..=23: bias, rotary table, positions,
+/// then `offset_mode` — 0 none, 1 the bias, 2 the bias rotated to the key's
+/// position — `rot_dim`, `pair_off`). New-token count == num_tokens, so the grid
+/// scales like RopeAppend (m_scaling on X). The TurboQuant layers are the
+/// GLOBAL class (every layer on uniform arches, where GLOBAL_* == base).
+fn tq_quantize_command<const IS_K: bool>(
     p: &MetalModelConsts,
     layer: u32,
-    is_v: bool,
+    operand: TqOperand<IS_K>,
     bucket_m: u32,
 ) -> LoweredCommand {
-    use crate::tape::lowered::{Binding, RuntimeBindingKind as RB};
+    use RuntimeBindingKind as RB;
     let (hd, nkv, bs) = (
         p.global_head_dim,
         p.num_global_kv_heads,
@@ -703,23 +825,47 @@ fn tq_quantize_command(
     );
     let bits = crate::turboquant::tq_bits(p.tq_kv_bits);
     let vpw = 32 / bits;
-    let pdim = hd.div_ceil(vpw);
-    let n_cent = 1u32 << bits;
-    let scale = 1.0f32 / (hd as f32).sqrt();
+    let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
     let li = super::ids::LayerId(layer);
-    let (cache, packed, norms) = if is_v {
-        (
-            RB::KvCacheV { layer: li },
-            RB::TqPackedV { layer: li },
-            RB::TqNormsV { layer: li },
-        )
-    } else {
+    let (cache, packed, norms) = if IS_K {
         (
             RB::KvCacheK { layer: li },
             RB::TqPackedK { layer: li },
             RB::TqNormsK { layer: li },
         )
+    } else {
+        (
+            RB::KvCacheV { layer: li },
+            RB::TqPackedV { layer: li },
+            RB::TqNormsV { layer: li },
+        )
     };
+    let slots = RB::SlotMapping { layer: li };
+    let runtime = [cache, slots, RB::TqSigns, RB::TqBoundaries, RB::TqCentroids];
+    let mut bindings = runtime_at(0, runtime.into_iter().chain([packed, norms]));
+    let codec = [hd, bits, vpw, hd.div_ceil(vpw), 1 << bits, scale, nkv, bs];
+    bindings.extend(inline_at(
+        7,
+        codec.into_iter().chain([crate::BLOCKS_PER_CHUNK]),
+    ));
+    bindings.extend(runtime_at(16, [slots]));
+    // do_writeback 0: the quantize runs before attention, which reads the
+    // step's new keys raw (decode) or rotates them itself (prefill staging).
+    bindings.extend(inline_at(17, [0]));
+    if let Some(b) = operand.0 {
+        bindings.push(b.bias_binding(18));
+        if IS_K {
+            bindings.push(b.binding(WeightBundleKind::CosSin, WeightTensor::Weight, 0, 19));
+            bindings.extend(runtime_at(20, [RB::Positions]));
+        }
+    }
+    let (rot_dim, pair_off, ..) = rope_on_read_params(p, true);
+    let mode = operand.0.map_or(0, |_| 1 + u32::from(IS_K));
+    let pairing = [
+        rot_dim.map_or(0, |r| r.get()),
+        pair_off.map_or(0, |po| po.get()),
+    ];
+    bindings.extend(inline_at(21, [mode, pairing[0], pairing[1]]));
     LoweredCommand {
         kernel: KernelId::TqQuantizeToPacked,
         library: "turboquant",
@@ -738,83 +884,7 @@ fn tq_quantize_command(
                 bucket_m: super::ids::BucketM(bucket_m),
             }),
         },
-        bindings: baked(vec![
-            Binding::Runtime {
-                kind: cache,
-                binding_index: 0,
-            },
-            Binding::Runtime {
-                kind: RB::SlotMapping { layer: li },
-                binding_index: 1,
-            },
-            Binding::Runtime {
-                kind: RB::TqSigns,
-                binding_index: 2,
-            },
-            Binding::Runtime {
-                kind: RB::TqBoundaries,
-                binding_index: 3,
-            },
-            Binding::Runtime {
-                kind: RB::TqCentroids,
-                binding_index: 4,
-            },
-            Binding::Runtime {
-                kind: packed,
-                binding_index: 5,
-            },
-            Binding::Runtime {
-                kind: norms,
-                binding_index: 6,
-            },
-            Binding::Inline {
-                binding_index: 7,
-                value: hd,
-            },
-            Binding::Inline {
-                binding_index: 8,
-                value: bits,
-            },
-            Binding::Inline {
-                binding_index: 9,
-                value: vpw,
-            },
-            Binding::Inline {
-                binding_index: 10,
-                value: pdim,
-            },
-            Binding::Inline {
-                binding_index: 11,
-                value: n_cent,
-            },
-            Binding::Inline {
-                binding_index: 12,
-                value: scale.to_bits(),
-            },
-            Binding::Inline {
-                binding_index: 13,
-                value: nkv,
-            },
-            Binding::Inline {
-                binding_index: 14,
-                value: bs,
-            },
-            Binding::Inline {
-                binding_index: 15,
-                value: crate::BLOCKS_PER_CHUNK,
-            },
-            Binding::Runtime {
-                kind: RB::SlotMapping { layer: li },
-                binding_index: 16,
-            },
-            // do_writeback 0: the quantize runs before attention, which reads
-            // the step's new keys raw (decode) or rotates them itself (prefill
-            // staging).
-            Binding::Inline {
-                binding_index: 17,
-                value: 0,
-            },
-        ]),
+        bindings: baked(bindings),
         gemm_dims: None,
     }
 }
@@ -822,18 +892,28 @@ fn tq_quantize_command(
 /// TurboQuant decode: the `AttentionViaCacheTq` twin of a decode
 /// `AttentionViaCache` command — the same kernel, geometry and bindings plus
 /// `ATTN_TQ_BITS` and the packed-store bindings, so it reads every key but the
-/// one this step appended straight from the packed store.
-fn tq_attention_command(p: &MetalModelConsts, attn: &LoweredCommand, layer: u32) -> LoweredCommand {
+/// one this step appended straight from the packed store, restoring each
+/// operand's offset (a rotated K bias by the rope-on-read table and pairing).
+fn tq_attention_command(
+    p: &MetalModelConsts,
+    attn: &LoweredCommand,
+    layer: u32,
+    ops: TqOperands,
+) -> LoweredCommand {
     let mut constants = attn.constants.to_vec();
     constants.extend(Vec::from(
         super::kernel_constants::AttentionViaCacheTqConstants {
             bits: super::ids::TqCodeBits(crate::turboquant::tq_bits(p.tq_kv_bits)),
+            k_bias: ops.k.0.is_some(),
+            v_bias: ops.v.0.is_some(),
         },
     ));
     let mut bindings = attn.bindings.to_vec();
     bindings.extend(Vec::from(super::kernel_bindings::TqAttentionBindingSet {
         kv_layer: super::ids::LayerId(layer),
     }));
+    bindings.extend(ops.k.0.map(|b| b.bias_binding(14)));
+    bindings.extend(ops.v.0.map(|b| b.bias_binding(15)));
     LoweredCommand {
         kernel: KernelId::AttentionViaCacheTq,
         constants: baked(constants),
@@ -877,9 +957,19 @@ struct TqAttention {
     via_cache: LoweredCommand,
 }
 
+/// What `inject_tq` compresses at one instruction: the operands it writes to
+/// the KV cache, if it is a KV writer; the operands of the layer's writer (the
+/// latest one), which its attention reads; and that attention, if it is one.
+struct TqSite {
+    writes: Option<TqOperands>,
+    layer: Option<TqOperands>,
+    attention: Option<TqAttention>,
+}
+
 /// TurboQuant: inject the per-layer commands, gated on the TurboQuant runtime
 /// gates so they're inert unless the worker provisions the tq buffers. No-op
-/// unless head_dim is a power of 2 ≤ 512 (the only supported geometry).
+/// unless head_dim is a power of 2 ≤ 512 (the only supported geometry). Every
+/// codec command takes the operands of the KV writer it compresses (`site`).
 ///
 /// - The KV writer is followed by the quantize of the step's new K/V.
 /// - On a decode step — every sequence contributes one token, in any bucket —
@@ -894,11 +984,11 @@ fn inject_tq(
     p: &MetalModelConsts,
     instruction: &Instruction,
     cmds: Vec<LoweredCommand>,
-    attention: Option<TqAttention>,
+    site: TqSite,
     decode: bool,
     bucket_m: u32,
     block_cap: u32,
-) -> Vec<GatedCommand> {
+) -> Result<Vec<GatedCommand>, TqUnbound> {
     use crate::tape::lowered::RuntimeGate::{
         OnlyIfTurboquant, OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode, UnlessTurboquantDecode,
     };
@@ -920,7 +1010,7 @@ fn inject_tq(
     let base_ok = p.head_dim.is_power_of_two() && p.head_dim <= 512;
     let global_ok = p.global_head_dim.is_power_of_two() && p.global_head_dim <= 512;
     if !base_ok || (hybrid && !global_ok) {
-        return cmds.into_iter().map(GatedCommand::ungated).collect();
+        return Ok(cmds.into_iter().map(GatedCommand::ungated).collect());
     }
     // The actual KV layer comes from the rope/attention command's own KvCacheK
     // binding — NOT the loop `iter` (0 for unrolled tapes like Llama).
@@ -944,20 +1034,28 @@ fn inject_tq(
         instruction,
         Instruction::AttentionPrefillPaged(..) | Instruction::AttentionViaCache(..)
     );
-    if let Some(a) = attention.filter(|_| !hybrid || global_attention) {
+    if let Some(a) = site.attention.filter(|_| !hybrid || global_attention) {
+        let ops = tq_operands(p, site.layer)?;
         let layer = cmd_kv_layer(&a.via_cache).unwrap_or(0);
         let mut out = Vec::with_capacity(cmds.len() + 5);
         if !decode {
-            for is_v in [false, true] {
-                out.push(prefill(tq_stage_command(
-                    p,
-                    layer,
-                    is_v,
-                    global_attention,
-                    bucket_m,
-                    block_cap,
-                )));
-            }
+            let (k, v) = (ops.k, ops.v);
+            out.push(prefill(tq_stage_command(
+                p,
+                layer,
+                k,
+                global_attention,
+                bucket_m,
+                block_cap,
+            )));
+            out.push(prefill(tq_stage_command(
+                p,
+                layer,
+                v,
+                global_attention,
+                bucket_m,
+                block_cap,
+            )));
             out.push(prefill(tq_rotate_command(p, a.q, false, bucket_m)));
         }
         out.extend(
@@ -968,10 +1066,10 @@ fn inject_tq(
             out.push(prefill(tq_rotate_command(p, a.out, true, bucket_m)));
         }
         out.push(GatedCommand::gated(
-            tq_attention_command(p, &a.via_cache, layer),
+            tq_attention_command(p, &a.via_cache, layer, ops),
             OnlyIfTurboquantDecode,
         ));
-        return out;
+        return Ok(out);
     }
     let mut out = Vec::with_capacity(cmds.len() + 2);
     for cmd in cmds {
@@ -986,11 +1084,12 @@ fn inject_tq(
         let layer = cmd_kv_layer(&cmd).unwrap_or(0);
         out.push(GatedCommand::ungated(cmd));
         if writer && tq_layer {
-            out.push(tq(tq_quantize_command(p, layer, false, bucket_m)));
-            out.push(tq(tq_quantize_command(p, layer, true, bucket_m)));
+            let ops = tq_operands(p, site.writes)?;
+            out.push(tq(tq_quantize_command(p, layer, ops.k, bucket_m)));
+            out.push(tq(tq_quantize_command(p, layer, ops.v, bucket_m)));
         }
     }
-    out
+    Ok(out)
 }
 
 /// On a NAX device, the small-M matrix-unit twin of an MLX-affine 4-bit
@@ -1176,6 +1275,9 @@ pub fn lower(
     let mut loops: Vec<super::lowered::TapeLoop> = Vec::new();
     // Loop spans still open at the current walk position, innermost last.
     let mut open_spans: Vec<OpenSpan> = Vec::new();
+    // The latest KV writer's operands — what the TurboQuant commands of its
+    // layer compress (see `inject_tq`).
+    let mut tq_writer: Option<TqOperands> = None;
     let mut splitk_scratch_bytes: u32 = 0;
     let mut moe_scratch_bytes: u32 = 0;
     let mut roped_k_scratch_bytes: u32 = 0;
@@ -1287,15 +1389,17 @@ pub fn lower(
                         }),
                     None => None,
                 };
-                let cmds = route_small_m(
-                    p,
-                    other,
-                    inject_tq(p, other, own, attention, decode, bucket_m, block_cap),
-                    bucket_m,
-                    tape_index,
-                    i,
-                    profile,
-                );
+                let writes = TqOperands::of_writer(other, i, tape_index);
+                tq_writer = writes.or(tq_writer);
+                let site = TqSite {
+                    writes,
+                    layer: tq_writer,
+                    attention,
+                };
+                let tq = inject_tq(p, other, own, site, decode, bucket_m, block_cap).map_err(
+                    |missing| LoweringError::TurboQuantOffsetUnbound { index: i, missing },
+                )?;
+                let cmds = route_small_m(p, other, tq, bucket_m, tape_index, i, profile);
                 update_shape_state(p, other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
@@ -3027,6 +3131,7 @@ fn lower_one(
             layer,
             _interleaved,
             is_global,
+            _kv_offsets,
         ) => {
             // 2D dispatch: (M, num_heads) — one threadgroup per
             // (token, head) pair rotates the head's `head_dim` slice
@@ -9141,13 +9246,31 @@ mod tests {
     // the empty impl suffices.
     impl scratchy_ir::WeightAccessors for TestParams {}
 
+    /// A Llama layer's KV writer operands: bias-free projections.
+    const LLAMA_KV: scratchy_ir::KvOffsets = scratchy_ir::KvOffsets {
+        k: scratchy_ir::KvOffset::Centered,
+        v: scratchy_ir::KvOffset::Centered,
+    };
+
+    /// A layer's KV writer whose K and V carry `offsets`.
+    fn tq_writer(layer: u32, is_global: bool, offsets: scratchy_ir::KvOffsets) -> Instruction {
+        Instruction::RopeAppend(0, 1, 2, 3, 4, 5, layer, false, is_global, offsets)
+    }
+
     /// Lower one layer — the KV writer, then its attention — at `bucket_m`.
     fn lower_tq_layer(attention: Instruction, bucket_m: u32) -> LoweredMetalTape {
-        let writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, /*layer=*/ 0, false, true);
-        lower_tq(&tp(), &[writer, attention], bucket_m)
+        lower_tq(&tp(), &[tq_writer(0, true, LLAMA_KV), attention], bucket_m)
     }
 
     fn lower_tq(p: &MetalModelConsts, backbone: &[Instruction], bucket_m: u32) -> LoweredMetalTape {
+        try_lower_tq(p, backbone, bucket_m).expect("lower_pair")
+    }
+
+    fn try_lower_tq(
+        p: &MetalModelConsts,
+        backbone: &[Instruction],
+        bucket_m: u32,
+    ) -> Result<LoweredMetalTape, LoweringError> {
         lower_pair(
             p,
             /*chunked=*/ false,
@@ -9162,7 +9285,6 @@ mod tests {
             /*block_cap=*/ 128,
             /*profile=*/ None,
         )
-        .expect("lower_pair")
     }
 
     /// Each injected TurboQuant command must carry the `OnlyIfTurboquant` gate
@@ -9284,8 +9406,8 @@ mod tests {
             sliding_window: 1024,
             ..tp()
         };
-        let global_writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, 0, false, true);
-        let sliding_writer = Instruction::RopeAppend(0, 1, 2, 3, 4, 5, 1, false, false);
+        let global_writer = tq_writer(0, true, LLAMA_KV);
+        let sliding_writer = tq_writer(1, false, LLAMA_KV);
         let quantize = [
             (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
             (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
@@ -9313,8 +9435,10 @@ mod tests {
         let global_attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
         let sliding_attention = Instruction::SlidingAttentionPrefillPaged(3, 6, 1, false);
         let plain = |i: Instruction| gated_steps(&lower_tq(&p, &[i], 64));
+        // A TurboQuant'd attention compresses its layer's writer's operands, so
+        // its own commands are read off a tape that has the writer.
         let own = |i: Instruction| {
-            plain(i)
+            gated_steps(&lower_tq(&p, &[global_writer, i], 64))
                 .into_iter()
                 .filter(|&(_, g)| g == Some(UnlessTurboquantDecode))
                 .collect::<Vec<_>>()
@@ -9472,6 +9596,201 @@ mod tests {
             twin(&tape) == twin(&decode_form),
             "the twin is the decode kernel's form of the same attention"
         );
+    }
+
+    /// Every binding of `cmd` bound at `index` or later, in order.
+    fn bound_from(cmd: &LoweredCommand, index: u8) -> Vec<Binding> {
+        let at = |b: &Binding| match *b {
+            Binding::Runtime { binding_index, .. }
+            | Binding::Inline { binding_index, .. }
+            | Binding::Weight { binding_index, .. }
+            | Binding::ArenaSlot { binding_index, .. } => binding_index,
+            other => panic!("TurboQuant command binding {other:?}"),
+        };
+        cmd.bindings
+            .iter()
+            .filter(|b| at(b) >= index)
+            .copied()
+            .collect()
+    }
+
+    /// A Qwen2 writer's projection biases reach every codec command: the
+    /// quantize removes them (K's rotated by the writer's rotary table at each
+    /// token's position — mode 2 — V's as-is, mode 1), and the prefill staging
+    /// and decode twin restore them, all bound at the writer's weight site in
+    /// `op_abi::rope_append_bias_slots` order. The same layer with a centered
+    /// writer binds none of it and runs mode 0: the offset is the difference.
+    #[test]
+    fn turboquant_restores_a_biased_writers_offsets() {
+        use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
+        let p = MetalModelConsts {
+            rope_on_read: true,
+            ..tp()
+        };
+        let qwen2 = KvOffsets {
+            k: KvOffset::LinearBias(BiasStorage::Affine),
+            v: KvOffset::LinearBias(BiasStorage::Affine),
+        };
+        let layer = crate::tape::ids::LayerId(0);
+        let at = |slot| WeightLocator {
+            bucket: 0,
+            op_idx: 0,
+            slot,
+        };
+        let bias = |slot, binding_index| Binding::Weight {
+            kind: WeightBundleKind::LinearLayer,
+            which: WeightTensor::AffineLinearBias,
+            layer,
+            locator: at(slot),
+            binding_index,
+        };
+        let cos_sin = Binding::Weight {
+            kind: WeightBundleKind::CosSin,
+            which: WeightTensor::Weight,
+            layer,
+            locator: at(0),
+            binding_index: 19,
+        };
+        let positions = Binding::Runtime {
+            kind: RuntimeBindingKind::Positions,
+            binding_index: 20,
+        };
+        let mode = |mode| {
+            [(21, mode), (22, p.rot_dim), (23, p.rot_dim / 2)].map(|(binding_index, value)| {
+                Binding::Inline {
+                    binding_index,
+                    value,
+                }
+            })
+        };
+        let cat = |a: &[Binding], b: [Binding; 3]| [a, &b].concat();
+        // Each codec command's offset bindings and bias constants, in tape order.
+        let offsets = |offsets, attention, bucket_m| {
+            let tape = lower_tq(&p, &[tq_writer(0, true, offsets), attention], bucket_m);
+            tape.commands
+                .iter()
+                .filter_map(|c| {
+                    let c = &c.command;
+                    let from = match c.kernel {
+                        KernelId::TqQuantizeToPacked => 18,
+                        KernelId::TqStageRotated => 10,
+                        KernelId::AttentionViaCacheTq => 14,
+                        _ => return None,
+                    };
+                    let bias_consts: Vec<_> = c
+                        .constants
+                        .iter()
+                        .filter(|k| k.index >= 14)
+                        .copied()
+                        .collect();
+                    Some((c.kernel, bound_from(c, from), bias_consts))
+                })
+                .collect::<Vec<_>>()
+        };
+        let (q, stage, twin) = (
+            KernelId::TqQuantizeToPacked,
+            KernelId::TqStageRotated,
+            KernelId::AttentionViaCacheTq,
+        );
+        let (k_bias, v_bias) = (ConstantValue::uint(14, 1), ConstantValue::uint(15, 1));
+        let decode = Instruction::AttentionViaCache(3, 6, 0, true);
+        let prefill = Instruction::AttentionPrefillPaged(3, 6, 0, false);
+
+        let quantize = [
+            (q, cat(&[bias(0, 18), cos_sin, positions], mode(2)), vec![]),
+            (q, cat(&[bias(1, 18)], mode(1)), vec![]),
+        ];
+        let mut want = quantize.to_vec();
+        want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
+        assert_eq!(offsets(qwen2, decode, 1), want);
+
+        let mut want = quantize.to_vec();
+        want.push((stage, vec![bias(0, 10)], vec![k_bias]));
+        want.push((stage, vec![bias(1, 10)], vec![v_bias]));
+        want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
+        assert_eq!(offsets(qwen2, prefill, 64), want);
+
+        let centered = |kernel| (kernel, mode(0).to_vec(), vec![]);
+        let mut want = vec![centered(q), centered(q)];
+        want.extend([(stage, vec![], vec![]), (stage, vec![], vec![])]);
+        want.push((twin, vec![], vec![]));
+        assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
+    }
+
+    /// The quantize binds exactly the ABI `turboquant.metal` declares, in order
+    /// — written out here, independently of the builder, for a centered layer
+    /// (the offset tail is pinned above).
+    #[test]
+    fn turboquant_quantize_binds_the_kernel_abi() {
+        use RuntimeBindingKind as RB;
+        let p = tp();
+        let layer = crate::tape::ids::LayerId(0);
+        let rt = |binding_index, kind| Binding::Runtime {
+            kind,
+            binding_index,
+        };
+        let il = |binding_index, value| Binding::Inline {
+            binding_index,
+            value,
+        };
+        let bits = crate::turboquant::tq_bits(p.tq_kv_bits);
+        let (hd, vpw) = (p.head_dim, 32 / bits);
+        let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
+        let tape = lower_tq_layer(Instruction::AttentionViaCache(3, 6, 0, true), 1);
+        assert_eq!(
+            tape.commands[2].command.bindings, // the quantize of V
+            [
+                rt(0, RB::KvCacheV { layer }),
+                rt(1, RB::SlotMapping { layer }),
+                rt(2, RB::TqSigns),
+                rt(3, RB::TqBoundaries),
+                rt(4, RB::TqCentroids),
+                rt(5, RB::TqPackedV { layer }),
+                rt(6, RB::TqNormsV { layer }),
+                il(7, hd),
+                il(8, bits),
+                il(9, vpw),
+                il(10, hd.div_ceil(vpw)),
+                il(11, 1 << bits),
+                il(12, scale),
+                il(13, p.num_kv_heads),
+                il(14, p.block_size),
+                il(15, crate::BLOCKS_PER_CHUNK),
+                rt(16, RB::SlotMapping { layer }),
+                il(17, 0),
+                il(21, 0),
+                il(22, 0),
+                il(23, 0),
+            ]
+        );
+    }
+
+    /// A codec command with nothing to take its operands' offsets from does not
+    /// lower: an attention with no KV writer before it, or a K bias with no
+    /// rotary table bound to rotate it to each key.
+    #[test]
+    fn turboquant_without_its_writers_offsets_does_not_lower() {
+        use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
+        let decode = Instruction::AttentionViaCache(3, 6, 0, true);
+        assert!(matches!(
+            try_lower_tq(&tp(), &[decode], 1),
+            Err(LoweringError::TurboQuantOffsetUnbound {
+                index: 0,
+                missing: TqUnbound::Writer
+            })
+        ));
+        let k_biased = KvOffsets {
+            k: KvOffset::LinearBias(BiasStorage::Dense),
+            v: KvOffset::Centered,
+        };
+        assert!(!tp().rope_on_read);
+        assert!(matches!(
+            try_lower_tq(&tp(), &[tq_writer(0, true, k_biased), decode], 1),
+            Err(LoweringError::TurboQuantOffsetUnbound {
+                index: 0,
+                missing: TqUnbound::RotaryTable
+            })
+        ));
     }
 
     /// granite regression: the terminal `logits *= recip(logits_scaling)`

@@ -2011,6 +2011,7 @@ impl InstructionEval for Instruction {
                 layer,
                 interleaved,
                 is_global,
+                _kv_offsets,
             ) => unsafe {
                 // Gemma-4 CLASS-AWARE geometry: the GLOBAL (full-attention) class
                 // uses GLOBAL_HEAD_DIM / NUM_GLOBAL_KV_HEADS and PROPORTIONAL rope

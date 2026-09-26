@@ -110,7 +110,14 @@ struct Case {
     /// Each sequence's first new key sits in a reused span block: its slot is
     /// the write-skip sentinel and the key was quantized by an earlier request.
     first_new_write_skipped: bool,
+    /// Qwen2's K/V projection biases, `bias` times the signal's spread on a
+    /// few channels: K is cached as `signal + R_t·b_k` (unrotated `b_k` in a
+    /// span block), V as `signal + b_v`.
+    bias: Option<f32>,
 }
+
+/// Channels of each KV head that carry the large bias.
+const BIASED_CHANNELS: [usize; 4] = [3, 17, 70, 101];
 
 struct Lcg(u64);
 impl Lcg {
@@ -181,6 +188,9 @@ struct Fixture {
     q: Vec<f32>,
     cu_seqlens: Vec<u32>,
     cos_sin: Vec<u16>,
+    /// K / V projection biases `[kv_head][head_dim]` (zero without `c.bias`).
+    kb: Vec<f32>,
+    vb: Vec<f32>,
 }
 
 impl Fixture {
@@ -220,10 +230,23 @@ impl Fixture {
         let per_tok = c.num_kv_heads * c.head_dim;
         let mut vecs =
             |n: usize| -> Vec<f32> { (0..n).map(|_| c.dtype.round(rng.gauss())).collect() };
-        let k: Vec<Vec<f32>> = c.seqs.iter().map(|&(l, _)| vecs(l * per_tok)).collect();
-        let v: Vec<Vec<f32>> = c.seqs.iter().map(|&(l, _)| vecs(l * per_tok)).collect();
+        let mut k: Vec<Vec<f32>> = c.seqs.iter().map(|&(l, _)| vecs(l * per_tok)).collect();
+        let mut v: Vec<Vec<f32>> = c.seqs.iter().map(|&(l, _)| vecs(l * per_tok)).collect();
         let n_q: usize = c.seqs.iter().map(|&(_, n)| n).sum();
         let q = vecs(n_q * c.num_q_heads * c.head_dim);
+        let mut bias = |scale: f32| -> Vec<f32> {
+            let mut b = vecs(per_tok);
+            for h in 0..c.num_kv_heads {
+                for &d in BIASED_CHANNELS.iter().filter(|&&d| d < c.head_dim) {
+                    b[h * c.head_dim + d] = c.dtype.round(b[h * c.head_dim + d] * scale);
+                }
+            }
+            b
+        };
+        let (kb, vb) = match c.bias {
+            Some(scale) => (bias(scale), bias(scale)),
+            None => (vec![0.0; per_tok], vec![0.0; per_tok]),
+        };
         let cu_seqlens = std::iter::once(0)
             .chain(c.seqs.iter().scan(0u32, |acc, &(_, n)| {
                 *acc += n as u32;
@@ -250,17 +273,56 @@ impl Fixture {
                     .collect()
             }
         };
-        Self {
+        let mut f = Self {
             c: c.clone(),
             n_blocks,
             max_blocks,
             block_table,
             slot,
-            k,
-            v,
+            k: vec![],
+            v: vec![],
             q,
             cu_seqlens,
             cos_sin,
+            kb,
+            vb,
+        };
+        if c.bias.is_some() {
+            for (s, &(len, _)) in c.seqs.iter().enumerate() {
+                for t in 0..len {
+                    for h in 0..c.num_kv_heads {
+                        let row = (t * c.num_kv_heads + h) * c.head_dim;
+                        let (kb, vb) = (f.offset(s, t, h, false), f.offset(s, t, h, true));
+                        for d in 0..c.head_dim {
+                            k[s][row + d] = c.dtype.round(k[s][row + d] + kb[d]);
+                            v[s][row + d] = c.dtype.round(v[s][row + d] + vb[d]);
+                        }
+                    }
+                }
+            }
+        }
+        (f.k, f.v) = (k, v);
+        f
+    }
+
+    /// The bias key `t` of sequence `s` carries in KV head `h`: V's as-is, K's
+    /// rotated to `t` as the writer rotates the key — unrotated in a span
+    /// block, whose K is stored unrotated.
+    fn offset(&self, s: usize, t: usize, h: usize, is_v: bool) -> Vec<f32> {
+        let (c, hd) = (&self.c, self.c.head_dim);
+        let b = &(if is_v { &self.vb } else { &self.kb })[h * hd..][..hd];
+        match c.rope {
+            Some(r) if !is_v && !self.span(s, t) => {
+                let (half, cs) = (r.rot_dim / 2, &self.cos_sin[t * r.rot_dim..][..r.rot_dim]);
+                let mut o = b.to_vec();
+                for d in 0..half {
+                    let (cos, sin) = (c.dtype.value(cs[d]), c.dtype.value(cs[half + d]));
+                    o[d] = b[d] * cos - b[d + r.pair_off] * sin;
+                    o[d + r.pair_off] = b[d + r.pair_off] * cos + b[d] * sin;
+                }
+                o
+            }
+            _ => b.to_vec(),
         }
     }
 
@@ -414,9 +476,19 @@ fn ideal_attention(f: &Fixture, kv: impl Fn(usize, usize, usize, bool) -> Vec<f3
     out
 }
 
-/// The TurboQuant attention of case `c`, and the host f32 reference over the
-/// same packed codes.
-fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
+struct Outputs {
+    got: Vec<f32>,
+    /// Host f32 attention over the very codes the GPU wrote.
+    ideal: Vec<f32>,
+    /// f32 attention over the true (unquantized) K/V — the goal.
+    exact: Vec<f32>,
+}
+
+/// The TurboQuant attention of case `c`, the host f32 reference over the same
+/// packed codes, and exact attention. `restore`: remove each operand's bias
+/// before quantizing and restore it after (the fix); `false` codes the biased
+/// vectors themselves.
+fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     let Some(di) = detect_device() else {
         eprintln!("skipping {}: no Metal 4 GPU", c.name);
         return None;
@@ -472,19 +544,43 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
     let (packed_k, packed_v) = (shared(&device, &stale_codes), shared(&device, &stale_codes));
     let (norms_k, norms_v) = (shared(&device, &stale_norms), shared(&device, &stale_norms));
     let cached = |s: usize, t: usize| !f.written(s, t);
-    let quant_slots: Vec<u32> = (0..n_seqs)
+    // Each quantized key's slot — span bit set where its K is stored unrotated,
+    // as the worker's slot_mapping carries it — and position.
+    let (quant_slots, quant_pos): (Vec<u32>, Vec<u32>) = (0..n_seqs)
         .flat_map(|s| {
             (0..c.seqs[s].0)
                 .filter(move |&t| cached(s, t))
-                .map(move |t| f.slot[s][t] as u32)
+                .map(move |t| {
+                    let span = if f.span(s, t) { SPAN_BIT } else { 0 };
+                    (f.slot[s][t] as u32 | span, t as u32)
+                })
         })
-        .collect();
+        .unzip();
     let quant_slots_buf = shared(&device, &quant_slots);
+    let quant_pos = shared(&device, &quant_pos);
+    let dt_bits = |x: &[f32]| x.iter().map(|&e| c.dtype.bits(e)).collect::<Vec<_>>();
+    let (kb, vb) = (
+        shared(&device, &dt_bits(&f.kb)),
+        shared(&device, &dt_bits(&f.vb)),
+    );
+    let offset_on = restore && c.bias.is_some();
+    let (rot_dim, pair_off) = c
+        .rope
+        .map_or((0, 0), |r| (r.rot_dim as u32, r.pair_off as u32));
+    // `tq_offset` mode per operand: K's bias rotated (2), V's as-is (1).
+    let mode = |is_v: bool| match (offset_on, is_v) {
+        (false, _) => 0u32,
+        (true, false) => 2,
+        (true, true) => 1,
+    };
     let src_k = f.pool(&device, &f.k, 0, cached);
     let src_v = f.pool(&device, &f.v, 0, cached);
     let compress = pso("turboquant", c.dtype.compress().to_owned(), vec![]);
     let mut batch = Mtl4DispatchBatch::begin(&device)?;
-    for (src, packed, norms) in [(&src_k, &packed_k, &norms_k), (&src_v, &packed_v, &norms_v)] {
+    for (src, packed, norms, bias, is_v) in [
+        (&src_k, &packed_k, &norms_k, &kb, false),
+        (&src_v, &packed_v, &norms_v, &vb, true),
+    ] {
         batch.encode(
             &compress,
             &[
@@ -496,6 +592,9 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
                 (packed, 5),
                 (norms, 6),
                 (&quant_slots_buf, 16),
+                (bias, 18),
+                (&cos_sin, 19),
+                (&quant_pos, 20),
             ],
             &[
                 (hd as u32, 7),
@@ -507,6 +606,9 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
                 (bs as u32, 14),
                 (c.blocks_per_chunk as u32, 15),
                 (0, 17),
+                (mode(is_v), 21),
+                (rot_dim, 22),
+                (pair_off, 23),
             ],
             &[(quant.scale(), 12)],
             &[&src.data],
@@ -525,10 +627,33 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
     let mut batch = Mtl4DispatchBatch::begin(&device)?;
     let resident = [&scratch_k.data, &scratch_v.data];
     let bits = ConstantValue::uint(13, c.bits);
+    let (k_bias, v_bias) = (ConstantValue::uint(14, 1), ConstantValue::uint(15, 1));
     if decode {
         let mut consts = f.attn_constants(&[bits]);
         if c.rope.is_some_and(|r| r.coresident) {
             consts.push(ConstantValue::uint(12, 1));
+        }
+        if offset_on {
+            consts.extend([k_bias, v_bias]);
+        }
+        let mut binds = vec![
+            (&out, 0),
+            (&q, 1),
+            (&seq_used, 2),
+            (&block_table, 3),
+            (&scratch_k.table, 4),
+            (&scratch_v.table, 5),
+            (&cos_sin, 6),
+            (&packed_k, 7),
+            (&packed_v, 8),
+            (&norms_k, 9),
+            (&norms_v, 10),
+            (&signs, 11),
+            (&centroids, 12),
+            (&slot_mapping, 13),
+        ];
+        if offset_on {
+            binds.extend([(&kb, 14), (&vb, 15)]);
         }
         let attention = pso(
             "attention",
@@ -537,22 +662,7 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
         );
         batch.encode(
             &attention,
-            &[
-                (&out, 0),
-                (&q, 1),
-                (&seq_used, 2),
-                (&block_table, 3),
-                (&scratch_k.table, 4),
-                (&scratch_v.table, 5),
-                (&cos_sin, 6),
-                (&packed_k, 7),
-                (&packed_v, 8),
-                (&norms_k, 9),
-                (&norms_v, 10),
-                (&signs, 11),
-                (&centroids, 12),
-                (&slot_mapping, 13),
-            ],
+            &binds,
             &[],
             &[],
             &resident,
@@ -572,12 +682,15 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
                 v.extend(f.rope_constants());
             }
             v.push(bits);
+            if offset_on {
+                v.push(if rope { k_bias } else { v_bias });
+            }
             v
         };
         let stage_name = format!("tq_stage_rotated_{}", c.dtype.tag());
-        for (scratch, packed, norms, is_k) in [
-            (&scratch_k, &packed_k, &norms_k, true),
-            (&scratch_v, &packed_v, &norms_v, false),
+        for (scratch, packed, norms, bias, is_k) in [
+            (&scratch_k, &packed_k, &norms_k, &kb, true),
+            (&scratch_v, &packed_v, &norms_v, &vb, false),
         ] {
             let stage = pso("attention", stage_name.clone(), stage_consts(is_k));
             batch.encode(
@@ -593,6 +706,7 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
                     (&signs, 7),
                     (&centroids, 8),
                     (&cos_sin, 9),
+                    (bias, 10),
                 ],
                 &[],
                 &[],
@@ -678,16 +792,24 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
             norms[row],
         )
     };
+    let plain = |s: usize, t: usize, h: usize, is_v: bool| {
+        let of = if is_v { &f.v[s] } else { &f.k[s] };
+        of[(t * nkv + h) * hd..][..hd].to_vec()
+    };
     let ideal = ideal_attention(f, |s, t, h, is_v| {
         if f.written(s, t) {
-            let plain = if is_v { &f.v[s] } else { &f.k[s] };
-            return plain[(t * nkv + h) * hd..][..hd].to_vec();
+            return plain(s, t, h, is_v);
         }
-        let x = if is_v {
+        let mut x = if is_v {
             decode_row(&codes_v, &nv, f.slot[s][t], h)
         } else {
             decode_row(&codes_k, &nk, f.slot[s][t], h)
         };
+        if offset_on {
+            for (e, o) in x.iter_mut().zip(f.offset(s, t, h, is_v)) {
+                *e += o;
+            }
+        }
         // Span keys are decoded, rounded to the dtype, then re-roped.
         if !is_v && f.span(s, t) {
             x.iter().map(|&e| c.dtype.round(e)).collect()
@@ -695,11 +817,15 @@ fn run_case(c: &Case) -> Option<(Vec<f32>, Vec<f32>)> {
             x
         }
     });
-    Some((got, ideal))
+    Some(Outputs {
+        got,
+        ideal,
+        exact: ideal_attention(f, plain),
+    })
 }
 
 fn check(c: Case) {
-    let Some((got, ideal)) = run_case(&c) else {
+    let Some(Outputs { got, ideal, .. }) = run_case(&c, true) else {
         return;
     };
     assert!(
@@ -750,6 +876,7 @@ fn llama_3b(name: &'static str) -> Case {
         seqs: vec![(1000, 1)],
         span_blocks: vec![],
         first_new_write_skipped: false,
+        bias: None,
     }
 }
 
@@ -935,4 +1062,115 @@ fn prefill_gemma4_global_head_dim_512() {
         seqs: vec![(900, 20)],
         ..gemma4_global("prefill gemma4 global")
     });
+}
+
+// ── Qwen2: K/V projection biases ────────────────────────────────────────
+
+/// Qwen2.5-7B: bf16, 4-bit, GQA 7 — and Qwen2's K/V projection biases, 100x the
+/// signal on a few channels (its layer 0 measures 54x on the whole vector).
+fn qwen2_7b(name: &'static str) -> Case {
+    Case {
+        num_q_heads: 28,
+        num_kv_heads: 4,
+        bits: 4,
+        bias: Some(100.0),
+        ..llama_3b(name)
+    }
+}
+
+/// The goal, not just parity: attention over the codes must track attention
+/// over the true K/V — and coding the biased vectors must not, or the case does
+/// not exercise the defect. Error is measured on the output's input-dependent
+/// part (the V bias is exact either way, so it would only inflate the scale).
+fn check_fidelity(c: Case, max_rel_err: f32, min_gain: f32) {
+    let Some(fixed) = run_case(&c, true) else {
+        return;
+    };
+    let Some(defect) = run_case(&c, false) else {
+        return;
+    };
+    let vb = Fixture::new(&c).vb;
+    let group = c.num_q_heads / c.num_kv_heads;
+    let rel = |o: &Outputs| {
+        let (mut err, mut signal) = (0f64, 0f64);
+        for (i, (&got, &want)) in o.got.iter().zip(&o.exact).enumerate() {
+            let kv_head = (i / c.head_dim) % c.num_q_heads / group;
+            let bias = vb[kv_head * c.head_dim + i % c.head_dim];
+            err += ((got - want) as f64).powi(2);
+            signal += ((want - bias) as f64).powi(2);
+        }
+        (err / signal.max(1e-30)).sqrt() as f32
+    };
+    let (fixed, defect) = (rel(&fixed), rel(&defect));
+    eprintln!(
+        "{}: output error vs exact — bias restored {fixed:.4}, coded {defect:.4}",
+        c.name
+    );
+    assert!(
+        defect >= fixed * min_gain,
+        "{}: coding the biased vectors ({defect}) is not {min_gain}x worse than removing the \
+         bias ({fixed}) — the case does not exercise the defect",
+        c.name
+    );
+    assert!(
+        fixed <= max_rel_err,
+        "{}: attention over the bias-restored codes misses the exact output by {fixed} > \
+         {max_rel_err}",
+        c.name
+    );
+}
+
+#[test]
+fn decode_qwen2_7b_biased_kv() {
+    check(qwen2_7b("decode qwen2-7b biased"));
+}
+
+/// Span blocks hold K unrotated, so their bias is restored unrotated — and the
+/// step's own key in a reused span block comes from the packed store.
+#[test]
+fn decode_qwen2_7b_biased_kv_span_blocks() {
+    check(Case {
+        span_blocks: vec![0, 3, 4, 62],
+        first_new_write_skipped: true,
+        ..qwen2_7b("decode qwen2-7b biased spans")
+    });
+}
+
+#[test]
+fn prefill_qwen2_7b_biased_kv() {
+    check(Case {
+        seqs: vec![(700, 45), (60, 60)],
+        ..qwen2_7b("prefill qwen2-7b biased")
+    });
+}
+
+#[test]
+fn prefill_qwen2_7b_biased_kv_span_blocks() {
+    check(Case {
+        span_blocks: vec![0, 5, 40, 43],
+        first_new_write_skipped: true,
+        seqs: vec![(700, 45)],
+        ..qwen2_7b("prefill qwen2-7b biased spans")
+    });
+}
+
+/// Measured: 0.140 relative error with the bias restored, 2.69 coding the
+/// biased vectors (19x) — the garbage Qwen2 decoded under TurboQuant.
+#[test]
+fn decode_qwen2_7b_biased_kv_tracks_exact_attention() {
+    check_fidelity(qwen2_7b("decode qwen2-7b biased fidelity"), 0.2, 10.0);
+}
+
+/// Measured: 0.139 with the bias restored in the staged rotated image, 1.97
+/// coding the biased vectors (14x).
+#[test]
+fn prefill_qwen2_7b_biased_kv_tracks_exact_attention() {
+    check_fidelity(
+        Case {
+            seqs: vec![(700, 45)],
+            ..qwen2_7b("prefill qwen2-7b biased fidelity")
+        },
+        0.2,
+        10.0,
+    );
 }

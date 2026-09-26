@@ -259,8 +259,9 @@ mod tests {
     }
 
     /// `tq_compress_paged` over token slots `slots[..n_slots]`, bound as the
-    /// kernel declares (0..=17): `slots` doubles as `logical_slots` (in place)
-    /// and `do_writeback = 1`, so `kv.data` ends up holding the lossy dequant.
+    /// kernel declares (0..=23, no offset): `slots` doubles as `logical_slots`
+    /// (in place) and `do_writeback = 1`, so `kv.data` ends up holding the
+    /// lossy dequant.
     fn compress(device: &Device, kv: PagedKv, slots: &Buffer, n_slots: usize) {
         let pso = pipeline(device, "tq_compress_paged");
         let cb = kv.cb;
@@ -288,6 +289,9 @@ mod tests {
                     (kv.block_size as u32, 14),
                     (kv.bpc as u32, 15),
                     (1, 17),
+                    (0, 21),
+                    (0, 22),
+                    (0, 23),
                 ],
                 &[(cb.q.scale(), 12)],
                 &[kv.data],

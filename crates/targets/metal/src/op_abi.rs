@@ -19,8 +19,46 @@
 //! its norm to the raw projection, and `ScalarMul` aliases only when
 //! its scale is exactly 1.0 — a value predicate, not an opcode fact.
 
-use scratchy_ir::Instruction;
+use scratchy_ir::{BiasStorage, Instruction, KvOffset, KvOffsets};
+use scratchy_subtile::handoff::{WeightKind, accessor_slot};
 use scratchy_subtile::lower::LoweredOp;
+
+// ── The KV writer's weight site ─────────────────────────────────────
+//
+// Two declarations, adjacent: how the bridge LAYS OUT a `RopeAppend`'s
+// weight site, and where the TurboQuant lowering FINDS the biases on it.
+// Slot 0 is the rotary table; an operand carrying a projection bias
+// ([`KvOffset::LinearBias`]) puts that projection's `LinearLayer` on the
+// same site, K's first.
+
+/// A `RopeAppend`'s weight site: `cos_sin`, then each biased operand's
+/// projection — `Some` exactly where that operand's offset is `LinearBias`.
+pub fn rope_append_weight_site<W>(cos_sin: W, k_bias: Option<W>, v_bias: Option<W>) -> Vec<W> {
+    std::iter::once(cos_sin)
+        .chain(k_bias)
+        .chain(v_bias)
+        .collect()
+}
+
+/// Where [`rope_append_weight_site`] put the K and V bias projections — their
+/// accessor slots, by the rule the per-arch `WeightAccessors` are emitted with
+/// ([`accessor_slot`]) — with the storage each bias is read from.
+pub fn rope_append_bias_slots(o: KvOffsets) -> [Option<(BiasStorage, u32)>; 2] {
+    let storage = |x: KvOffset| match x {
+        KvOffset::LinearBias(s) => Some(s),
+        KvOffset::Centered => None,
+    };
+    let (k, v) = (storage(o.k), storage(o.v));
+    let linear = |s: Option<BiasStorage>| s.map(|_| WeightKind::Linear);
+    let site = rope_append_weight_site(WeightKind::CosSin, linear(k), linear(v));
+    // The site is `[cos_sin, K?, V?]`: K sits right after the rotary table, V after K.
+    let k_at = 1;
+    let v_at = 1 + usize::from(k.is_some());
+    [
+        k.map(|s| (s, accessor_slot(&site, k_at))),
+        v.map(|s| (s, accessor_slot(&site, v_at))),
+    ]
+}
 
 /// The operand index this op's metal kernel writes OVER, if any.
 ///

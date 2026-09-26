@@ -425,7 +425,7 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let g = lit_bool(g);
             quote! { FlashInferAttentionPrefill(#a, #b, #c, #d, #e, #f, #g) }
         }
-        I::RopeAppend(a, b, c, d, e, f, g, h, i) => {
+        I::RopeAppend(a, b, c, d, e, f, g, h, i, j) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
@@ -435,7 +435,8 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let g = lit_u32(g);
             let h = lit_bool(h);
             let i = lit_bool(i);
-            quote! { RopeAppend(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+            let j = kv_offsets_tokens(j);
+            quote! { RopeAppend(#a, #b, #c, #d, #e, #f, #g, #h, #i, #j) }
         }
         I::RopeAppendNormed(a, b, c, d, e, f, g, h, i) => {
             let a = lit_u32(a);
@@ -899,6 +900,24 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
     }
 }
 
+/// A [`KvOffsets`](scratchy_forward_compiler::KvOffsets) as a const expression.
+fn kv_offsets_tokens(o: scratchy_forward_compiler::KvOffsets) -> TokenStream {
+    use scratchy_forward_compiler::{BiasStorage, KvOffset};
+    let one = |x: KvOffset| match x {
+        KvOffset::Centered => quote! { ::scratchy_forward_compiler::KvOffset::Centered },
+        KvOffset::LinearBias(BiasStorage::Dense) => quote! {
+            ::scratchy_forward_compiler::KvOffset::LinearBias(
+                ::scratchy_forward_compiler::BiasStorage::Dense)
+        },
+        KvOffset::LinearBias(BiasStorage::Affine) => quote! {
+            ::scratchy_forward_compiler::KvOffset::LinearBias(
+                ::scratchy_forward_compiler::BiasStorage::Affine)
+        },
+    };
+    let (k, v) = (one(o.k), one(o.v));
+    quote! { ::scratchy_forward_compiler::KvOffsets { k: #k, v: #v } }
+}
+
 /// Variant ident as it appears on the Rust enum and in
 /// `OpcodeShape::name`. Used by the loop-detection pass to look up
 /// per-variant iter-index field positions.
@@ -1348,7 +1367,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             6 => u(g),
             _ => None,
         },
-        I::RopeAppend(a, b, c, d, e, f, g, _, _) => match idx {
+        I::RopeAppend(a, b, c, d, e, f, g, _, _, _) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -2107,14 +2126,14 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             6 => I::RopeAppendNormed(a, b, c, d, e, f, n, h, i),
             _ => panic!("RopeAppendNormed: bad idx {idx}"),
         },
-        I::RopeAppend(a, b, c, d, e, f, g, h, i) => match idx {
-            0 => I::RopeAppend(n, b, c, d, e, f, g, h, i),
-            1 => I::RopeAppend(a, n, c, d, e, f, g, h, i),
-            2 => I::RopeAppend(a, b, n, d, e, f, g, h, i),
-            3 => I::RopeAppend(a, b, c, n, e, f, g, h, i),
-            4 => I::RopeAppend(a, b, c, d, n, f, g, h, i),
-            5 => I::RopeAppend(a, b, c, d, e, n, g, h, i),
-            6 => I::RopeAppend(a, b, c, d, e, f, n, h, i),
+        I::RopeAppend(a, b, c, d, e, f, g, h, i, j) => match idx {
+            0 => I::RopeAppend(n, b, c, d, e, f, g, h, i, j),
+            1 => I::RopeAppend(a, n, c, d, e, f, g, h, i, j),
+            2 => I::RopeAppend(a, b, n, d, e, f, g, h, i, j),
+            3 => I::RopeAppend(a, b, c, n, e, f, g, h, i, j),
+            4 => I::RopeAppend(a, b, c, d, n, f, g, h, i, j),
+            5 => I::RopeAppend(a, b, c, d, e, n, g, h, i, j),
+            6 => I::RopeAppend(a, b, c, d, e, f, n, h, i, j),
             _ => panic!("RopeAppend: bad idx {idx}"),
         },
         I::MlaSplit(a, b, c) => match idx {

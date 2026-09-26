@@ -62,6 +62,8 @@ pub enum NormalizedField {
     /// Boolean flag — `interleaved`, `biased`,
     /// `use_logits_soft_cap`, …
     ConstBool(bool),
+    /// The additive offset a KV writer's K and V carry.
+    KvOffsets(crate::KvOffsets),
     /// Fixed-length integer array, truncated to its valid prefix
     /// (`Reshape::dims_lit[..ndim]`).
     ConstU32Array(Vec<u32>),
@@ -640,6 +642,7 @@ impl InstructionInfo for Instruction {
                 layer,
                 interleaved,
                 is_global,
+                kv_offsets,
             ) => (
                 "RopeAppend",
                 vec![
@@ -653,6 +656,7 @@ impl InstructionInfo for Instruction {
                     F::RopeCosSin,
                     F::ConstBool(interleaved),
                     F::ConstBool(is_global),
+                    F::KvOffsets(kv_offsets),
                 ],
             ),
             Instruction::MlaSplit(in_slot, kv_latent_slot, k_pe_slot) => (
