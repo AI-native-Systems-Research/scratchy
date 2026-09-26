@@ -24,6 +24,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
 
 use crate::mtl4_dispatch::{Buffer, Mtl4DispatchBatch};
+use crate::residency::{MetalResidencySet, Pinned};
 use crate::shader_cache::load_library_from_bytes;
 use crate::stream::MetalStreamError;
 
@@ -406,40 +407,40 @@ pub fn gather_gpu_sample_params(
 #[cfg(feature = "sampler-telemetry")]
 const SAMPLER_TELEM_K: u32 = 8;
 
-/// One step's non-greedy sampler work: pinned-resident GPU buffers + argument
-/// tables, prepared BEFORE the forward so it can be encoded onto the forward's
+/// One step's non-greedy sampler work: GPU buffers + argument tables, prepared
+/// BEFORE the forward so it can be encoded onto the forward's
 /// OWN command buffer ([`encode_into`](Self::encode_into), from the argmax
 /// followup) — one commit, one host wait, no second command buffer. Read the
 /// sampled tokens after the wait via [`output`](Self::output).
 pub struct PendingSampler {
     njobs: u32,
     is_bf16: bool,
-    // Every buffer is bound by gpuAddress in `encode_into` and pinned resident,
-    // so all must outlive the forward CB — held here for exactly that.
-    scratch_f32: Buffer,
-    out_buf: Buffer,
-    row_idx_buf: Buffer,
-    temps_buf: Buffer,
-    top_ks_buf: Buffer,
-    top_ps_buf: Buffer,
-    min_ps_buf: Buffer,
-    uniforms_buf: Buffer,
-    reps_buf: Buffer,
-    freqs_buf: Buffer,
-    press_buf: Buffer,
-    out_ids_buf: Buffer,
-    prompt_ids_buf: Buffer,
-    consts_buf: Buffer,
+    // Every buffer is bound by gpuAddress in `encode_into`, so each is pinned
+    // for as long as this lives: keep it until the forward's host wait.
+    scratch_f32: Pinned,
+    out_buf: Pinned,
+    row_idx_buf: Pinned,
+    temps_buf: Pinned,
+    top_ks_buf: Pinned,
+    top_ps_buf: Pinned,
+    min_ps_buf: Pinned,
+    uniforms_buf: Pinned,
+    reps_buf: Pinned,
+    freqs_buf: Pinned,
+    press_buf: Pinned,
+    out_ids_buf: Pinned,
+    prompt_ids_buf: Pinned,
+    consts_buf: Pinned,
     // Sampler-telemetry spill (only compiled under `sampler-telemetry`): real
     // buffers when `telem_on`, else a reused dummy.
     #[cfg(feature = "sampler-telemetry")]
-    topk_probs_buf: Buffer,
+    topk_probs_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
-    topk_indices_buf: Buffer,
+    topk_indices_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
-    stats_buf: Buffer,
+    stats_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
-    telem_consts_buf: Buffer,
+    telem_consts_buf: Pinned,
     #[cfg(feature = "sampler-telemetry")]
     telem_on: bool,
     #[cfg(feature = "sampler-telemetry")]
@@ -457,14 +458,12 @@ unsafe impl Send for PendingSampler {}
 
 impl PendingSampler {
     /// Upload the neutral [`GpuSampleParams`](scratchy_core_common::GpuSampleParams)
-    /// into pinned-resident GPU buffers + build the argument tables. Address
-    /// binding is deferred to [`encode_into`](Self::encode_into) (which also binds
-    /// the forward's own logits). `residency` is the forward command buffer's
-    /// set — a freshly-allocated, gpuAddress-bound buffer is read as garbage if
-    /// it isn't pinned (mirrors the grammar-mask pinning).
+    /// into GPU buffers pinned in `residency` (committed) + build the argument
+    /// tables. Address binding is deferred to [`encode_into`](Self::encode_into)
+    /// (which also binds the forward's own logits).
     pub fn prepare(
         device: &Device,
-        residency: &crate::residency::MetalResidencySet,
+        residency: &MetalResidencySet,
         params: &scratchy_core_common::GpuSampleParams,
         njobs: u32,
         vocab: u32,
@@ -472,31 +471,32 @@ impl PendingSampler {
     ) -> Self {
         use crate::mtl4_dispatch::{shared_slice, shared_zeroed};
         use objc2_metal::{MTL4ArgumentTableDescriptor, MTLDevice};
+        let pin = |buffer| residency.pin(buffer);
 
         let n = njobs as usize;
-        let row_idx_buf = shared_slice(device, &params.row_indices);
-        let temps_buf = shared_slice(device, &params.temperatures);
-        let top_ks_buf = shared_slice(device, &params.top_ks);
-        let top_ps_buf = shared_slice(device, &params.top_ps);
-        let min_ps_buf = shared_slice(device, &params.min_ps);
-        let uniforms_buf = shared_slice(device, &params.uniforms);
-        let reps_buf = shared_slice(device, &params.rep_penalties);
-        let freqs_buf = shared_slice(device, &params.freq_penalties);
-        let press_buf = shared_slice(device, &params.pres_penalties);
+        let row_idx_buf = pin(shared_slice(device, &params.row_indices));
+        let temps_buf = pin(shared_slice(device, &params.temperatures));
+        let top_ks_buf = pin(shared_slice(device, &params.top_ks));
+        let top_ps_buf = pin(shared_slice(device, &params.top_ps));
+        let min_ps_buf = pin(shared_slice(device, &params.min_ps));
+        let uniforms_buf = pin(shared_slice(device, &params.uniforms));
+        let reps_buf = pin(shared_slice(device, &params.rep_penalties));
+        let freqs_buf = pin(shared_slice(device, &params.freq_penalties));
+        let press_buf = pin(shared_slice(device, &params.pres_penalties));
         let (out_ids_buf, prompt_ids_buf) = if params.any_penalty {
             (
-                shared_slice(device, &params.output_token_ids),
-                shared_slice(device, &params.prompt_token_ids),
+                pin(shared_slice(device, &params.output_token_ids)),
+                pin(shared_slice(device, &params.prompt_token_ids)),
             )
         } else {
-            (shared_zeroed(device, 4), shared_zeroed(device, 4))
+            (pin(shared_zeroed(device, 4)), pin(shared_zeroed(device, 4)))
         };
-        let scratch_f32 = shared_zeroed(device, n * vocab as usize * 4);
-        let out_buf = shared_zeroed(device, n * 4);
-        let consts_buf = shared_slice(
+        let scratch_f32 = pin(shared_zeroed(device, n * vocab as usize * 4));
+        let out_buf = pin(shared_zeroed(device, n * 4));
+        let consts_buf = pin(shared_slice(
             device,
             &[vocab, params.max_output_len, params.max_prompt_len],
-        );
+        ));
 
         // Sampler telemetry: spill the sorted top-K + confidence/entropy only
         // when a consumer is watching (decided once here, honored at readback so
@@ -511,20 +511,21 @@ impl PendingSampler {
         let (topk_probs_buf, topk_indices_buf, stats_buf, telem_consts_buf) = if telem_on {
             let k = telem_k as usize;
             (
-                shared_zeroed(device, n * k * 4),
-                shared_zeroed(device, n * k * 4),
-                shared_zeroed(device, n * 2 * 4),
-                shared_slice(device, &[1u32, telem_k]),
+                pin(shared_zeroed(device, n * k * 4)),
+                pin(shared_zeroed(device, n * k * 4)),
+                pin(shared_zeroed(device, n * 2 * 4)),
+                pin(shared_slice(device, &[1u32, telem_k])),
             )
         } else {
             let dummy = shared_zeroed(device, 4);
             (
-                dummy.clone(),
-                dummy.clone(),
-                dummy,
-                shared_slice(device, &[0u32, 0u32]),
+                pin(dummy.clone()),
+                pin(dummy.clone()),
+                pin(dummy),
+                pin(shared_slice(device, &[0u32, 0u32])),
             )
         };
+        residency.commit();
 
         let mk_table = |count: usize| {
             let desc = MTL4ArgumentTableDescriptor::new();
@@ -546,36 +547,6 @@ impl PendingSampler {
         } else {
             None
         };
-
-        // Pin every gpuAddress-bound buffer resident for the forward CB.
-        for b in [
-            &scratch_f32,
-            &out_buf,
-            &row_idx_buf,
-            &temps_buf,
-            &top_ks_buf,
-            &top_ps_buf,
-            &min_ps_buf,
-            &uniforms_buf,
-            &reps_buf,
-            &freqs_buf,
-            &press_buf,
-            &out_ids_buf,
-            &prompt_ids_buf,
-            &consts_buf,
-        ] {
-            residency.insert(b);
-        }
-        #[cfg(feature = "sampler-telemetry")]
-        for b in [
-            &topk_probs_buf,
-            &topk_indices_buf,
-            &stats_buf,
-            &telem_consts_buf,
-        ] {
-            residency.insert(b);
-        }
-        residency.commit();
 
         Self {
             njobs,

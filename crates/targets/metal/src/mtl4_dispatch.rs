@@ -19,7 +19,7 @@ use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSharedEvent, MTLSize,
 };
 
-use crate::residency::MetalResidencySet;
+use crate::residency::{MetalResidencySet, Pinned};
 use crate::stream::MetalStreamError;
 
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -129,9 +129,7 @@ pub fn dispatch_threadgroups(
     // tracking), so every address-bound buffer must be in a committed
     // set attached to the command buffer.
     let res = crate::residency::MetalResidencySet::new(device);
-    for b in buffers {
-        res.insert(b);
-    }
+    let _pins: Vec<Pinned> = buffers.iter().map(|&b| res.pin(b.clone())).collect();
     res.commit();
 
     let desc = MTL4ArgumentTableDescriptor::new();
@@ -231,12 +229,14 @@ pub struct Mtl4DispatchBatch {
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     enc: Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>,
-    /// `setBytes`-replacement scalar buffers, kept alive until completion.
-    scalars: Vec<Buffer>,
+    /// Every buffer the batch binds or makes resident (bound, dereferenced,
+    /// `setBytes`-replacement scalars, the gap filler), pinned until completion.
+    pins: Vec<Pinned>,
     /// Per-dispatch argument tables, kept alive until completion.
     tables: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
-    /// Throwaway zeroed buffer bound at any unused argument-table gap index.
-    zero: Buffer,
+    /// Address of the throwaway zeroed buffer bound at any unused argument-table
+    /// gap index (the buffer itself is `pins[0]`).
+    zero: u64,
 }
 
 impl Mtl4DispatchBatch {
@@ -249,8 +249,7 @@ impl Mtl4DispatchBatch {
             .newCommandAllocator()
             .expect("MTL4 command allocator");
         let event = device.newSharedEvent().expect("shared event");
-        let zero = shared_zeroed(device, 16);
-        res.insert(&zero);
+        let zero = res.pin(shared_zeroed(device, 16));
         let cb = device.newCommandBuffer().expect("mtl4 command buffer");
         cb.beginCommandBufferWithAllocator(&alloc4);
         let enc = cb.computeCommandEncoder().expect("mtl4 encoder");
@@ -262,9 +261,9 @@ impl Mtl4DispatchBatch {
             event,
             cb,
             enc,
-            scalars: Vec::new(),
+            zero: zero.gpuAddress(),
+            pins: vec![zero],
             tables: Vec::new(),
-            zero,
         })
     }
 
@@ -292,25 +291,23 @@ impl Mtl4DispatchBatch {
         let mut binds: Vec<(u64, usize)> =
             Vec::with_capacity(buffer_bindings.len() + u32_scalars.len() + f32_scalars.len());
         for &(b, i) in buffer_bindings {
-            self.res.insert(b);
+            self.pins.push(self.res.pin(b.clone()));
             binds.push((b.gpuAddress(), i));
         }
         for &b in extra_resident {
-            self.res.insert(b);
+            self.pins.push(self.res.pin(b.clone()));
         }
         for &(v, i) in u32_scalars {
-            let sb = shared_u32(&self.device, v);
-            self.res.insert(&sb);
+            let sb = self.res.pin(shared_u32(&self.device, v));
             binds.push((sb.gpuAddress(), i));
-            self.scalars.push(sb);
+            self.pins.push(sb);
         }
         for &(v, i) in f32_scalars {
-            let sb = shared_f32(&self.device, v);
-            self.res.insert(&sb);
+            let sb = self.res.pin(shared_f32(&self.device, v));
             binds.push((sb.gpuAddress(), i));
-            self.scalars.push(sb);
+            self.pins.push(sb);
         }
-        let table = build_arg_table(&self.device, &binds, self.zero.gpuAddress());
+        let table = build_arg_table(&self.device, &binds, self.zero);
         self.enc.setComputePipelineState(pso);
         self.enc.setArgumentTable(Some(&table));
         assert_within_pipeline_cap(pso, threads_per_threadgroup);
@@ -371,31 +368,30 @@ impl Mtl4DispatchBatch {
                     "MTL4 dispatch batch timed out".into(),
                 ));
             }
-            // `self` drops here → residency set + scalar buffers + tables freed
+            // `self` drops here → residency set + pinned buffers + tables freed
             // AFTER the GPU has drained. Safe.
             Ok(())
         } else {
             use block2::RcBlock;
             use objc2_metal::{MTL4CommitFeedback, MTL4CommitOptions};
             // No host wait: the GPU still references the residency set, the
-            // address-bound scalar buffers, and the argument tables. MTL4 does
+            // pinned buffers, and the argument tables. MTL4 does
             // NOT implicitly retain any of them, so move them into a commit-
             // feedback handler that fires on completion — its captured handles
             // (Arc/Retained clones) keep everything alive until the GPU is done.
             let opts = MTL4CommitOptions::new();
             let res = self.res.clone();
-            let scalars = std::mem::take(&mut self.scalars);
+            let pins = std::mem::take(&mut self.pins);
             let tables = std::mem::take(&mut self.tables);
             let alloc4 = self.alloc4.clone();
             let queue4 = self.queue4.clone();
             let cb_keep = self.cb.clone();
-            let zero = self.zero.clone();
             let block = RcBlock::new(
                 move |_fb: std::ptr::NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
                     // Touch every captured handle so the closure owns them; the
                     // handler runs once on GPU completion, then Metal releases
                     // the block and these handles drop.
-                    let _ = (&res, &scalars, &tables, &alloc4, &queue4, &cb_keep, &zero);
+                    let _ = (&res, &pins, &tables, &alloc4, &queue4, &cb_keep);
                 },
             );
             unsafe {

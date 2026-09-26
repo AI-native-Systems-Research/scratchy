@@ -5,12 +5,17 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLBuffer;
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+
+use crate::residency::{Device, MetalResidencySet, Pinned};
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 
 pub struct MetalMem {
     buffer: Buffer,
+    /// Held by a [`Self::new_pinned`] allocation; a sub-range's parent buffer
+    /// is pinned by its owner.
+    _pin: Option<Pinned>,
     base: *mut u8,
     size: usize,
     /// Byte offset into `buffer`'s gpuAddress range. 0 for ordinary per-chunk
@@ -28,28 +33,24 @@ unsafe impl Send for MetalMem {}
 unsafe impl Sync for MetalMem {}
 
 impl MetalMem {
-    pub fn from_buffer(buffer: Buffer) -> Self {
-        // GUARD: this wrapper derives CPU pointers from `contents()` — only
-        // valid for CPU-accessible storage. A StorageModePrivate buffer here
-        // silently yields a garbage base on macOS 26.5.1+ (large allocations
-        // return an unmapped pointer). Fail at construction instead.
-        use objc2_metal::MTLResource as _;
-        let mode = buffer.storageMode();
-        assert!(
-            mode == objc2_metal::MTLStorageMode::Shared,
-            "MetalMem::from_buffer requires StorageModeShared (CPU-accessible) \
-             storage; got {mode:?}. Private/Memoryless buffers have no valid \
-             contents() pointer — use a GPU-only wrapper or allocate Shared.",
-        );
+    /// A fresh `bytes`-long buffer pinned in `residency` for this value's
+    /// lifetime. Always `StorageModeShared`: this wrapper derives CPU pointers
+    /// from `contents()`, and a Private buffer yields a garbage base on macOS
+    /// 26.5.1+ (large allocations return an unmapped pointer).
+    pub fn new_pinned(device: &Device, residency: &MetalResidencySet, bytes: usize) -> Self {
+        let buffer = device
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .expect("MetalMem: newBufferWithLength_options returned nil");
         let base = buffer.contents().as_ptr() as *mut u8;
         let size = buffer.length();
         assert!(
             !base.is_null() || size == 0,
-            "MetalMem::from_buffer: contents() returned NULL for a {size}-byte \
+            "MetalMem::new_pinned: contents() returned NULL for a {size}-byte \
              Shared buffer",
         );
         Self {
-            buffer,
+            buffer: buffer.clone(),
+            _pin: Some(residency.pin(buffer)),
             base,
             size,
             metal_offset: 0,
@@ -66,6 +67,7 @@ impl MetalMem {
         let base = std::ptr::null_mut();
         Self {
             buffer,
+            _pin: None,
             base,
             size,
             metal_offset: offset,
