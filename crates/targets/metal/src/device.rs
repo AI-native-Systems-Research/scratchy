@@ -3,12 +3,16 @@
 
 //! Metal device detection and management.
 
+use crate::tape::ids::GpuCores;
 use crate::targets::MetalTargetProfile;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_core_foundation::{CFNumber, CFRetained, CFString, CFType};
 use objc2_metal::{
     MTL4CompilerDescriptor, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
 };
+use std::ffi::c_void;
+use std::ptr::NonNull;
 
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
@@ -106,6 +110,41 @@ pub fn detect_device() -> Option<MetalDevice> {
     Some(MetalDevice::new(device, profile))
 }
 
+/// The GPU cores of `device`: the `gpu-core-count` property of its IO-registry
+/// entry. Metal has no API for it and the chip's name does not determine it
+/// (an M1 Max has 24 or 32 cores, an M3 Max 30 or 40), so no
+/// [`MetalTargetProfile`] carries it. `None` if the entry lacks it.
+pub fn gpu_cores(device: &ProtocolObject<dyn MTLDevice>) -> Option<GpuCores> {
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IORegistryEntryIDMatching(entry_id: u64) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+        fn IORegistryEntryCreateCFProperty(
+            entry: u32,
+            key: &CFString,
+            allocator: *const c_void,
+            options: u32,
+        ) -> Option<NonNull<CFType>>;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+    let key = CFString::from_static_str("gpu-core-count");
+    // SAFETY: `IOServiceGetMatchingService` consumes the matching dictionary
+    // and returns a service we own (0 if none), released once read; the
+    // property comes back retained, and `CFRetained` releases it.
+    let property = unsafe {
+        let service =
+            IOServiceGetMatchingService(0, IORegistryEntryIDMatching(device.registryID()));
+        if service == 0 {
+            return None;
+        }
+        let property = IORegistryEntryCreateCFProperty(service, &key, std::ptr::null(), 0);
+        IOObjectRelease(service);
+        CFRetained::from_raw(property?)
+    };
+    let cores = property.downcast_ref::<CFNumber>()?.as_i32()?;
+    u32::try_from(cores).ok().filter(|&n| n > 0).map(GpuCores)
+}
+
 /// Whether the default Metal device can create an `MTL4Compiler` (a real
 /// Metal-4 GPU is present). Equivalent to `detect_device().is_some()` without
 /// building the profile; kept for call sites that only need the boolean.
@@ -127,7 +166,9 @@ mod tests {
         if let Some(device) = detect_device() {
             println!("Detected device: {}", device.device.name());
             println!("Profile: {:?}", device.profile.generation);
-            assert!(device.profile.gpu_cores > 0);
+            let cores = gpu_cores(&device.device);
+            println!("GPU cores: {cores:?}");
+            assert!(cores.is_some_and(|n| n.get() > 0));
         }
     }
 }

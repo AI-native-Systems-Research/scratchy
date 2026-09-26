@@ -4075,6 +4075,7 @@ dependencies = [
  "libc",
  "memmap2",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
  "objc2-metal",
  "rand",
