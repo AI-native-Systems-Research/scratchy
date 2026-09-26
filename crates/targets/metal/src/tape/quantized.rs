@@ -493,9 +493,11 @@ pub fn qmm_t_kernel_static_name(
 /// Step token counts the small-M matrix-unit GEMM (`affine_qmm_small_m_*`)
 /// serves on NAX devices. Below, `qmv_fast`'s per-row weight re-reads cost
 /// no more than the matrix unit's padding; above, a second M tile re-reads
-/// the weights and NAX `qmm_t`'s 64-row tile wins. Base M5, Llama-3.2-3B
-/// shapes: ~2× `qmv_fast` at 6–8 tokens, ~1.4–1.6× NAX `qmm_t` at 16, and
-/// behind `qmm_t` at 32.
+/// the weights and NAX `qmm_t`'s 64-row tile wins (a 32-row tile loses
+/// too). Base M5, Llama-3.2-3B, weights streamed from memory: ~1.35×
+/// `qmv_fast` at 6 tokens and ~1.9× at 8; at 9–16 level with NAX `qmm_t` on
+/// the wide gate/up/down shapes, and ~15–20% lower decode TPOT at 16
+/// concurrent sequences end to end than routing them to `qmm_t`.
 pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 5..=16;
 
 /// Output columns per small-M threadgroup (one simdgroup).
