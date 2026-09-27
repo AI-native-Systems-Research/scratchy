@@ -173,8 +173,8 @@ pub fn lower_pair(
     //   * `bucket_m > 1` — decode/batched-decode buckets need every
     //     row of logits intact.
     //   * `lm_head` is exactly one `Instruction::AffineQmm` (the
-    //     common case across Llama / Qwen / Mistral). Tied
-    //     embeddings and multi-step lm_heads fall through.
+    //     common case across Llama / Qwen / Mistral, tied embeddings
+    //     included). Multi-step lm_heads fall through.
     //   * It lowered to exactly one `LoweredCommand` — i.e. Standard
     //     or Nax qmm_t, not SplitK (whose split partials and reduce
     //     would need their own row handling). At num_tokens=1024 the
@@ -285,12 +285,12 @@ pub fn lower_pair(
         // Non-spec path: index-driven gather → qmv-M=num_sample_rows
         // → index-driven scatter. Works for any num_seqs (single-seq
         // prefill / multi-seq prefill / decode) because the gather
-        // kernel reads the per-seq sample row from `last_token_indices`
+        // kernel finds each sequence's last row from `cu_seqlens_q`
         // and the qmv runs at M = num_sample_rows (worker overrides
         // TG.X via seq_axis). Scatter writes back so the worker's
         // downstream argmax reads from the original sample positions.
         commands.push(GatedCommand::gated(
-            gather_last_token_command(p, info.in_slot, info.k, bucket_m),
+            gather_last_token_command(p, info.in_slot, info.k),
             RuntimeGate::OnlyIfNoSpec,
         ));
         barrier_before.push(true);
@@ -318,7 +318,6 @@ pub fn lower_pair(
                 p,
                 info.softcap_out_slot.unwrap_or(info.out_slot),
                 info.n,
-                bucket_m,
             ),
             RuntimeGate::OnlyIfNoSpec,
         ));
@@ -500,34 +499,30 @@ fn lm_head_softcap_command(
     }
 }
 
-fn gather_last_token_command(
+pub(crate) fn gather_last_token_command(
     p: &MetalModelConsts,
     slot: u32,
     hidden_size: u32,
-    bucket_m: u32,
 ) -> LoweredCommand {
     sample_slice_command(
         p,
         slot,
         hidden_size,
-        bucket_m,
         KernelId::GatherLastToken,
         "gather_last_token_f16_specialized",
         "gather_last_token_bf16_specialized",
     )
 }
 
-fn scatter_first_to_last_row_command(
+pub(crate) fn scatter_first_to_last_row_command(
     p: &MetalModelConsts,
     slot: u32,
     vocab_size: u32,
-    bucket_m: u32,
 ) -> LoweredCommand {
     sample_slice_command(
         p,
         slot,
         vocab_size,
-        bucket_m,
         KernelId::ScatterFirstToLastRow,
         "scatter_first_to_last_row_f16_specialized",
         "scatter_first_to_last_row_bf16_specialized",
@@ -538,15 +533,12 @@ fn sample_slice_command(
     p: &MetalModelConsts,
     slot: u32,
     row_stride: u32,
-    bucket_m: u32,
     kernel: KernelId,
     f16_symbol: &'static str,
     bf16_symbol: &'static str,
 ) -> LoweredCommand {
-    // 2D dispatch: tg.x covers the row-stride dim (one thread per
-    // element), tg.y covers the sample-row dim (one TG row per seq).
-    // The Y dim is baked to bucket_m worst-case; threads with
-    // `tid.y >= num_seqs` early-out so the actual work is N rows.
+    // One thread per column, walking the sequences in order: the rows
+    // move in place, so one thread per row would race (see the shader).
     const THREADS_PER_TG: u32 = 256;
     LoweredCommand {
         kernel,
@@ -557,17 +549,9 @@ fn sample_slice_command(
         }
         .into_baked(),
         dispatch: DispatchShape {
-            threadgroups: (row_stride.div_ceil(THREADS_PER_TG), bucket_m, 1),
+            threadgroups: (row_stride.div_ceil(THREADS_PER_TG), 1, 1),
             threads_per_threadgroup: (THREADS_PER_TG, 1, 1),
-            // seq_axis=Y SETS tg.y = num_seqs at dispatch — only N TGs
-            // along the sample-row dim instead of the bucket_m baseline.
-            // axis here is a no-op (bucket_m=1 → X*num_tokens/1, but X
-            // is the row-stride dim which doesn't scale with M).
-            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                axis: crate::tape::lowered::MScaleAxis::X,
-                bucket_m: super::ids::BucketM(1),
-                seq_axis: Some(crate::tape::lowered::MScaleAxis::Y),
-            }),
+            m_scaling: None,
         },
         bindings: baked(vec![
             Binding::ArenaSlot {
