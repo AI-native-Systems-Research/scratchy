@@ -3904,13 +3904,6 @@ impl Worker for MetalWorker {
         // stride keeps the host write self-consistent (the kernel would still
         // read its baked stride; this never under-runs the host buffer).
         let max_blocks_eff = kernel_block_table_stride.max(runtime_max_blocks).max(1);
-        // ⚠️ MEASURED 2026-08-11, SO THE COMMENT ABOVE IS NOT THE WHOLE STORY: forcing this stride to the
-        // kernel's own baked value (128) and to 2048 both left the 12-request repro at 1/12 — the same
-        // score as the pool value (8192). The host/kernel stride disagreement is REAL (slot 5 is baked from
-        // `W::MAX_BLOCKS_PER_SEQ` at pipelines.rs:489, not from the pool as the comment above claims) but it
-        // is NOT what corrupts a prefill that shares a step with a decode. Do not re-chase it from the
-        // comment alone. (That corruption was the rope-once K scratch serving batch row 0's keys to every
-        // sequence; see `route_by_sequence_count` in the metal lowering.)
         let mut block_table_u32: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
         if runtime_max_blocks > 0 {
             for (i, blocks) in attn.block_ids.iter().enumerate() {

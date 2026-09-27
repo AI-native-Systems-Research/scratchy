@@ -2766,7 +2766,7 @@ mod tests {
             kernel: KernelId::RmsNorm,
             library: rmsnorm_pre.library,
             function: rmsnorm_pre.function,
-            constants: rmsnorm_pre.constants.clone(),
+            constants: rmsnorm_pre.constants,
             dispatch: rmsnorm_pre.dispatch,
             bindings: rmsnorm_pre
                 .bindings
