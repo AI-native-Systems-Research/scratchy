@@ -808,9 +808,9 @@ impl<M: PoolMemory> KvCachePool<M> {
 
     /// Reactive shrink (2c): drop all chunks past the first `keep`,
     /// returning the freed K+V chunk buffers (all layers) so the caller
-    /// can `residency.remove` + `commit` them BEFORE they're dropped
-    /// (freed). The chunk-address table entries for the dropped chunks
-    /// become stale but are never read — a later `grow_to_cover`
+    /// decides when they're dropped (freed). The chunk-address table
+    /// entries for the dropped chunks become stale but are never read — a
+    /// later `grow_to_cover`
     /// re-allocates from the shrunk length and overwrites them. Only
     /// safe to call when no live block falls in a dropped chunk (e.g.
     /// the batch is fully idle); the caller owns that invariant.
@@ -832,7 +832,7 @@ impl<M: PoolMemory> KvCachePool<M> {
 
     /// Grow the pool until `block_id` is backed by an allocated chunk.
     /// Allocates each missing chunk's K+V buffers for every layer (via
-    /// `alloc_chunk`, which must residency-insert) and writes their
+    /// `alloc_chunk`, which must return resident memory) and writes their
     /// `gpuAddress` (via `gpu_addr`) into the per-layer chunk tables.
     /// Returns the number of chunks newly allocated (0 = already
     /// covered); the caller must `residency.commit()` once if > 0 before

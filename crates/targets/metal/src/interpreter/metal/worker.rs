@@ -220,6 +220,8 @@ impl std::error::Error for WorkerError {}
 /// references threaded through `new`.
 pub struct MetalWorker<W: CanonicalParams> {
     pub arena: Vec<Buffer>,
+    /// Residency pins for every buffer the baked dispatches reach by address.
+    _pins: Vec<crate::residency::Pinned>,
     pub bucket_bakings: Vec<BucketBaking>,
     /// Shared SplitK scratch buffer. `Some` when any bucket tape
     /// requested a non-zero `splitk_scratch_bytes` (i.e. at least one
@@ -327,6 +329,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             });
         }
 
+        // Every buffer the baked dispatches reach by address, pinned for as
+        // long as this worker lives.
+        let mut pins: Vec<crate::residency::Pinned> = Vec::new();
+        let mut pin = |b: &Buffer| pins.extend(residency.map(|r| r.pin(b.clone())));
+
         let arena: Vec<Buffer> = arena_layout
             .iter()
             .map(|&size| {
@@ -340,115 +347,44 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         MTLResourceOptions::StorageModeShared,
                     )
                     .expect("newBufferWithLength_options returned nil");
-                if let Some(r) = residency {
-                    r.insert(&buf);
-                }
+                pin(&buf);
                 buf
             })
             .collect();
 
-        // Shared SplitK scratch buffer sized to the max across all
-        // bucket tapes — one buffer suffices because successive
-        // `affine_qmm_t_splitk` / `splitk_reduce_sum` pairs run
-        // serially inside a single encoder. Allocated only when at
-        // least one tape requested non-zero scratch; bakings that
-        // don't reference `Binding::Scratch` pay nothing.
-        let max_splitk_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.splitk_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let splitk_scratch: Option<Buffer> = if max_splitk_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_splitk_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (splitk scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
+        // A Private scratch buffer (the host never reads scratch back) sized to
+        // the max across bucket tapes and pinned, since dispatches bind it by
+        // baked address; `None` when no tape needs it.
+        let mut scratch = |bytes: fn(&LoweredMetalTape) -> u32, what: &str| {
+            let max = bucket_tapes.iter().map(bytes).max().unwrap_or(0);
+            (max > 0).then(|| {
+                let buf = device
+                    .newBufferWithLength_options(
+                        max as usize,
+                        MTLResourceOptions::StorageModePrivate,
+                    )
+                    .unwrap_or_else(|| panic!("newBufferWithLength_options returned nil ({what})"));
+                pin(&buf);
+                buf
+            })
         };
-
-        // Shared MoE scratch buffer for `Binding::MoeScratch`. Sized
-        // to the max per-bucket `moe_scratch_bytes` because MoE blocks
-        // within one bucket execute serially through the dispatch; cross-
-        // bucket reuse is fine because only one bucket runs per
-        // forward. Private storage — host never reads these
-        // intermediates back.
-        let max_moe_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.moe_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let moe_scratch: Option<Buffer> = if max_moe_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_moe_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (moe scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
-        };
-
-        // Shared roped-K scratch buffer for `Binding::RopedKScratch`
-        // (spans rope-on-read, rope-once-to-scratch — NAX matrix-accel AND the
-        // simdgroup steel prefill). Sized to the max `roped_k_scratch_bytes`
-        // across buckets — one buffer suffices because the RopeOnce{Nax,Steel}
-        // command and its following attention run serially per layer through
-        // the dispatch, and the scratch is overwritten each layer (the cache, not
-        // the scratch, is the persistent artifact).
-        // Private storage — host never reads it back. Bound by dispatch-baked
-        // address, so it MUST be made resident (lazy-pager hazard).
-        let max_roped_k_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.roped_k_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let roped_k_scratch: Option<Buffer> = if max_roped_k_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_roped_k_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (roped-K scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
-        };
-
-        // Shared hd512-unfused-attention scratch (q_head/Kdense/Vdense_T/scores/
-        // out_head packed at baked offsets). One buffer, overwritten per layer.
-        let max_attn_unfused_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.attn_unfused_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let attn_unfused_scratch: Option<Buffer> = if max_attn_unfused_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_attn_unfused_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (attn-unfused scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
-        };
+        // SplitK: one buffer suffices because successive `affine_qmm_t_splitk`
+        // / `splitk_reduce_sum` pairs run serially inside a single encoder.
+        let splitk_scratch = scratch(|t| t.splitk_scratch_bytes, "splitk scratch");
+        // `Binding::MoeScratch`: MoE blocks within one bucket execute serially
+        // through the dispatch; cross-bucket reuse is fine because only one
+        // bucket runs per forward.
+        let moe_scratch = scratch(|t| t.moe_scratch_bytes, "moe scratch");
+        // `Binding::RopedKScratch` (spans rope-on-read, rope-once-to-scratch —
+        // NAX matrix-accel AND the simdgroup steel prefill): the
+        // RopeOnce{Nax,Steel} command and its following attention run serially
+        // per layer through the dispatch, and the scratch is overwritten each
+        // layer (the cache, not the scratch, is the persistent artifact).
+        let roped_k_scratch = scratch(|t| t.roped_k_scratch_bytes, "roped-K scratch");
+        // hd512-unfused attention (q_head/Kdense/Vdense_T/scores/out_head
+        // packed at baked offsets). One buffer, overwritten per layer.
+        let attn_unfused_scratch =
+            scratch(|t| t.attn_unfused_scratch_bytes, "attn-unfused scratch");
 
         // Runtime metadata buffers (`input_ids`, `positions`,
         // `slot_mapping`, `cu_seqlens_q`, `seq_used_k`, `block_table`)
@@ -468,7 +404,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // Compile-time residency guard: destructure RuntimeBindings with
             // NO `..` rest so adding a new runtime buffer fails THIS build
             // until its residency is explicitly decided — either pinned here
-            // (`r.insert(field)`) or bound to `field: _` with a reason. A new
+            // (`pin(field)`) or bound to `field: _` with a reason. A new
             // dispatch-bound buffer that is silently left un-pinned reads stale
             // zero pages → token salad.
             let RuntimeBindings {
@@ -513,27 +449,27 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // (dispatch-bound by baked gpuAddress, same lazy-pager hazard).
                 tq,
             } = runtime;
-            r.insert(input_ids);
-            r.insert(positions);
-            r.insert(cu_seqlens_q);
-            r.insert(seq_used_k);
+            pin(input_ids);
+            pin(positions);
+            pin(cu_seqlens_q);
+            pin(seq_used_k);
             // Span labels: bound by dispatch-baked address on rope-on-read
             // arches (slot 8 of the prefill attention), so pin like seq_used_k.
-            r.insert(span_ids);
+            pin(span_ids);
             // Per-KV-cache-group slot_mappings + block tables (vLLM hybrid
             // layout). One group on uniform models; full + N sliding on gemma4
             // SWA. Each is bound by dispatch-baked gpuAddress (same lazy-pager
             // hazard as the inputs), so EVERY group buffer must be pinned.
             for b in slot_mappings {
-                r.insert(b);
+                pin(b);
             }
             for b in block_tables {
-                r.insert(b);
+                pin(b);
             }
             // Spans rope-on-read per-layer flag mirrors (placeholders on
             // non-spans arches; bound by baked gpuAddress when active).
             for b in block_unrotated_flags {
-                r.insert(b);
+                pin(b);
             }
             // Gated-DeltaNet per-forward index buffers (hybrid arches:
             // Qwen3.5 / Qwen3-Next). Same contract as the inputs above —
@@ -547,8 +483,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // answer). The factory allocates these unconditionally (a
             // 16 KiB Shared buffer even for non-hybrid arches), so the
             // insert is a harmless pin when no GDN command binds them.
-            r.insert(gdn_state_indices);
-            r.insert(gdn_is_fresh);
+            pin(gdn_state_indices);
+            pin(gdn_is_fresh);
             // Vision per-forward externs (vision towers: Qwen3.5-VL ViT).
             // Same baked-gpuAddress / lazy-pager hazard as the GDN
             // buffers above — the `vision_rope_2d` / `vision_varlen_attn`
@@ -557,42 +493,42 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // zero pages (garbage rope angles / all-token-0 pixels). The
             // factory allocates 16-byte placeholders on non-vision arches,
             // so the pin is harmless when no vision command binds them.
-            r.insert(vision_rope_freqs);
-            r.insert(pixels);
-            r.insert(vision_pos_embeds);
-            r.insert(mm_embeds);
-            r.insert(mm_dst_rows);
-            r.insert(mrope_cos_sin);
-            r.insert(vision_cu_seqlens_full);
-            r.insert(vision_cu_seqlens_window);
-            r.insert(vision_window_index);
-            r.insert(vision_reverse_indices);
-            r.insert(vision_position_ids);
+            pin(vision_rope_freqs);
+            pin(pixels);
+            pin(vision_pos_embeds);
+            pin(mm_embeds);
+            pin(mm_dst_rows);
+            pin(mrope_cos_sin);
+            pin(vision_cu_seqlens_full);
+            pin(vision_cu_seqlens_window);
+            pin(vision_window_index);
+            pin(vision_reverse_indices);
+            pin(vision_position_ids);
             // TurboQuant: the packed code stores + norms + codebook are read by
             // the dequant/quantize dispatch commands via baked gpuAddress, so pin them
             // (same lazy-pager hazard). `None` on non-turboquant runs → no-op.
             if let Some(t) = tq {
                 for b in &t.packed_k {
-                    r.insert(b);
+                    pin(b);
                 }
                 for b in &t.packed_v {
-                    r.insert(b);
+                    pin(b);
                 }
                 for b in &t.norms_k {
-                    r.insert(b);
+                    pin(b);
                 }
                 for b in &t.norms_v {
-                    r.insert(b);
+                    pin(b);
                 }
-                r.insert(&t.signs);
-                r.insert(&t.boundaries);
-                r.insert(&t.centroids);
+                pin(&t.signs);
+                pin(&t.boundaries);
+                pin(&t.centroids);
                 // The fp16 scratch (table + backing data) is bound at every
                 // layer's kv_cache slot + dereffed via the table's gpuAddress.
-                r.insert(&t.scratch_k_table);
-                r.insert(&t.scratch_v_table);
-                r.insert(&t.scratch_k_data);
-                r.insert(&t.scratch_v_data);
+                pin(&t.scratch_k_table);
+                pin(&t.scratch_v_table);
+                pin(&t.scratch_k_data);
+                pin(&t.scratch_v_data);
             }
             r.commit();
         }
@@ -617,18 +553,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // residency set so the dispatch exec dispatch sees its
             // residency entry (the dispatch never `setBuffer`s these
             // explicitly — bindings are pre-recorded in the dispatch).
-            if let (Some(r), Some(b)) = (residency, baking.moe_inline_buf.as_ref()) {
-                r.insert(b);
+            if let Some(b) = baking.moe_inline_buf.as_ref() {
+                pin(b);
             }
             bucket_bakings.push(baking);
         }
-        if let (Some(r), Some(b)) = (residency, moe_scratch.as_ref()) {
-            r.insert(b);
+        if let Some(r) = residency {
             r.commit();
         }
 
         Ok(Self {
             arena,
+            _pins: pins,
             bucket_bakings,
             splitk_scratch,
             moe_scratch,

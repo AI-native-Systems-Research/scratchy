@@ -10,6 +10,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
+use crate::residency::Pinned;
 use scratchy_tensors::DeviceAllocator;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -28,7 +29,7 @@ unsafe impl Send for BufKeepAlive {}
 const DEFAULT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
 struct MetalArena {
-    buffer: Buffer,
+    buffer: Pinned,
     base: *mut u8,
     capacity: usize,
     used: usize,
@@ -327,7 +328,7 @@ struct MmapRegion {
     /// `.contents()` pointer is what the loader threads `pread`
     /// into. All `alloc_and_copy_host{,_aligned}` zero-copy returns
     /// and `buffer_for` lookups resolve into this buffer.
-    aligned_buffer: Buffer,
+    aligned_buffer: Pinned,
     aligned_base: *mut u8,
     aligned_capacity: usize,
     /// Per-tensor records, sorted by `src_offset` for binary-search
@@ -905,7 +906,7 @@ impl MetalAllocator {
         // (the wired set is also committed per-forward in the pool; a
         // double-commit when the two alias is harmless). Weight loading is
         // one-time at startup, before any forward's command buffer exists.
-        self.weights_residency.insert(&buffer);
+        let buffer = self.weights_residency.pin(buffer);
         self.weights_residency.commit();
 
         let tensors: Vec<MmapTensor> = packed
@@ -1338,7 +1339,7 @@ impl MetalAllocator {
         // Weight buffer (aligned copy path). Weights set → pageable by
         // default (WeightResidency::Unwired). Commit so a distinct un-wired
         // set registers the add (see the cache-hit path above).
-        self.weights_residency.insert(&dst_buffer);
+        let dst_buffer = self.weights_residency.pin(dst_buffer);
         self.weights_residency.commit();
 
         let cache_path = if cache_enabled {
@@ -1538,7 +1539,7 @@ impl MetalAllocator {
                 capacity
             );
         }
-        residency.insert(&buffer);
+        let buffer = residency.pin(buffer);
         if let Some(cb) = hook.lock().expect("arena hook mutex").as_ref() {
             (cb)(&buffer);
         }

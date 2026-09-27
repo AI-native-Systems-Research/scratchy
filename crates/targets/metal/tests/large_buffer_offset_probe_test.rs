@@ -63,9 +63,7 @@ where
         return false;
     };
     let res = MetalResidencySet::new(device);
-    for &b in residency {
-        res.insert(b);
-    }
+    let _pins: Vec<_> = residency.iter().map(|&b| res.pin(b.clone())).collect();
     res.commit();
 
     let alloc4 = device
@@ -525,8 +523,7 @@ fn shared_buffer_mtl4_gpuaddress_read_at_large_offsets() {
     // Residency: MTL4 requires explicit residency for address-bound
     // buffers — mirror production (residency set attached to the CB).
     let res = scratchy_target_metal::residency::MetalResidencySet::new(device);
-    res.insert(&big);
-    res.insert(&dst);
+    let _pins = [res.pin(big.clone()), res.pin(dst.clone())];
     res.commit();
 
     let mut failures = Vec::new();
@@ -636,13 +633,13 @@ fn shared_buffer_mtl4_read_under_residency_pressure() {
             eprintln!("skipping: shard {i} alloc failed");
             return;
         };
-        res.insert(&b);
-        shards.push(b);
+        shards.push(res.pin(b));
     }
-    let dst = device
-        .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
-        .expect("dst");
-    res.insert(&dst);
+    let dst = res.pin(
+        device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .expect("dst"),
+    );
     res.commit();
 
     const MSL: &str = r#"
@@ -927,9 +924,7 @@ fn nocopy_residency_wiring_at_scale() {
     // Residency set insert + commit.
     let res = scratchy_target_metal::residency::MetalResidencySet::new(device);
     let t_ins = std::time::Instant::now();
-    for (b, _) in &bufs {
-        res.insert(b);
-    }
+    let _pins: Vec<_> = bufs.iter().map(|(b, _)| res.pin(b.clone())).collect();
     eprintln!("insert: {:?}", t_ins.elapsed());
     let t_commit = std::time::Instant::now();
     res.commit();
@@ -955,10 +950,11 @@ fn nocopy_residency_wiring_at_scale() {
     let pso = device
         .newComputePipelineStateWithFunction_error(&func)
         .expect("pso");
-    let dst = device
-        .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
-        .expect("dst");
-    res.insert(&dst);
+    let dst = res.pin(
+        device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .expect("dst"),
+    );
     res.commit();
 
     let alloc4 = device.newCommandAllocator().expect("alloc4");
