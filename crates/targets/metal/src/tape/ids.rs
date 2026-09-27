@@ -134,6 +134,21 @@ impl BucketM {
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct NumTokens(pub u32);
 
+/// The smallest sequence count a bucket serves on the decode path.
+///
+/// `MetalWorkerPool::pick_bucket` maps every live `num_seqs > 1` to a
+/// multi-row bucket, so a multi-row bucket's floor is derived from the
+/// ladder (the previous rung plus one), not from the bucket's `bucket_m` —
+/// the bucket can be asked to decode far fewer sequences than it has rows.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct MinBatch(pub u32);
+
+impl MinBatch {
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
 impl From<u32> for NumTokens {
     fn from(v: u32) -> Self {
         Self(v)
@@ -292,15 +307,22 @@ impl TqDecodeHeads {
     /// decode — but too few threadgroups idle cores. Measured on a 10-core M5
     /// (Llama-3.2-3B, Llama-3.1-8B, Qwen2.5-3B / -7B geometries at 8k): the
     /// best count left 8 threadgroups in every case.
+    ///
+    /// `min_batch` is the smallest sequence count the bucket this tape serves
+    /// can decode: threadgroups also scale one per sequence, so a bucket that
+    /// only ever decodes one sequence at a time gets no extra occupancy from
+    /// packing heads — its `min_batch` must be able to fund the same 4/5-of-
+    /// cores floor on its own.
     pub fn for_group(
         head_dim: HeadDim,
         num_q_heads: NumQHeads,
         num_kv_heads: NumKvHeads,
         gpu_cores: GpuCores,
+        min_batch: MinBatch,
     ) -> Self {
         let min_threadgroups = gpu_cores.get() * 4 / 5;
         Self::candidates(head_dim, num_q_heads, num_kv_heads)
-            .filter(|h| num_q_heads.get() / h.get() >= min_threadgroups)
+            .filter(|h| num_q_heads.get() / h.get() * min_batch.get() >= min_threadgroups)
             .last()
             .unwrap_or(Self(1))
     }

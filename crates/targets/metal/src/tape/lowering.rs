@@ -9390,9 +9390,15 @@ mod tests {
     /// at load. The test geometry's GQA group of 8 (head_dim 64) fits 8 heads;
     /// the most that leave 4/5 of the cores a threadgroup is 4 on an 8-core
     /// M1, 2 on a 16-core M1 Pro, and 1 on a 32-core M1 Max.
+    ///
+    /// The pick also turns on the bucket's decode-batch floor: a bucket that
+    /// only ever decodes one sequence can't fund extra threadgroups, but a
+    /// bucket serving 9+ sequences multiplies the per-head-group count by the
+    /// batch — the 32-core M1 Max serves 3 heads per threadgroup there (24/8
+    /// threadgroups × 9 sequences ≥ 25).
     #[test]
     fn decode_turboquant_heads_follow_the_device_not_the_baked_class() {
-        use crate::tape::ids::{GpuCores, HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
+        use crate::tape::ids::{GpuCores, HeadDim, MinBatch, NumKvHeads, NumQHeads, TqDecodeHeads};
         let p = tp();
         let backbone = [
             tq_writer(0, true, LLAMA_KV),
@@ -9441,6 +9447,7 @@ mod tests {
                 NumQHeads(p.num_q_heads),
                 NumKvHeads(p.num_global_kv_heads),
                 GpuCores(cores),
+                MinBatch(1),
             );
             assert_eq!(served_heads, TqDecodeHeads(heads), "{cores} cores");
             let (mut served, mut other) = (tq, fp16);
@@ -9454,6 +9461,35 @@ mod tests {
             assert!(
                 other == fp16,
                 "only the TurboQuant decode command is served"
+            );
+        }
+        // The batch dimension: 2 is the smallest batch any multi-row
+        // bucket decodes (`pick_bucket` rounds 2..7 up to the
+        // SAFE_MULTI_ROW_BUCKET_M rung, skipping the smaller rungs on
+        // the ladder), and 9 is the smallest batch the post-8 rung of
+        // the default ladder serves. On a 32-core M1 Max the
+        // single-sequence pick is 1 (32 threadgroups ≥ 25); with 2
+        // sequences the geometry can afford 2 (16 × 2 = 32 ≥ 25), with
+        // 9 it can afford 8 (4 × 9 = 36 ≥ 25). On a 10-core M5 the
+        // single-sequence pick is 4 (8 × 1 = 8 ≥ 8; 8 heads would be
+        // 4 groups < 8), while 2 and 9 sequences both afford 8 — the
+        // pick only ever rises with batch, never falls.
+        for (cores, single, pair, batched) in [(32u32, 1u32, 2u32, 8u32), (10, 4, 8, 8)] {
+            let pick = |batch: u32| {
+                TqDecodeHeads::for_group(
+                    HeadDim(p.global_head_dim),
+                    NumQHeads(p.num_q_heads),
+                    NumKvHeads(p.num_global_kv_heads),
+                    GpuCores(cores),
+                    MinBatch(batch),
+                )
+            };
+            assert_eq!(pick(1), TqDecodeHeads(single), "{cores} cores, 1 seq");
+            assert_eq!(pick(2), TqDecodeHeads(pair), "{cores} cores, 2 seqs");
+            assert_eq!(pick(9), TqDecodeHeads(batched), "{cores} cores, 9 seqs");
+            assert!(
+                pick(2).get() >= pick(1).get() && pick(9).get() >= pick(2).get(),
+                "{cores} cores: batch lowered the pick"
             );
         }
     }

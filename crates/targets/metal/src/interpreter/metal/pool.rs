@@ -36,6 +36,11 @@ use super::worker::{ArenaLayout, MetalWorker, WorkerError};
 use crate::MetalAllocator;
 use scratchy_ir::{CanonicalParams, Instruction};
 
+/// The smallest multi-row bucket `pick_bucket` will ever route a batch to:
+/// every `num_seqs > 1` is rounded up to at least this many rows, skipping
+/// any smaller rungs the ladder may contain.
+const SAFE_MULTI_ROW_BUCKET_M: u32 = 8;
+
 /// One bucket's compile-time data, ready to be lowered + handed to a
 /// [`MetalWorkerPool`].
 ///
@@ -506,20 +511,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // scratch sizing are u32). Floor at 1 so a degenerate cap
         // (e.g. the empty-for-vision pool) never zero-sizes scratch.
         let block_cap_u32: u32 = block_cap.clamp(1, u32::MAX as usize) as u32;
-        use crate::tape::ids::{HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
+        use crate::tape::ids::{HeadDim, MinBatch, NumKvHeads, NumQHeads, TqDecodeHeads};
         let gpu_cores = crate::device::gpu_cores(&device).ok_or(PoolBuildError::UnknownGpuCores)?;
-        let tq_heads = TqDecodeHeads::for_group(
-            HeadDim(W::GLOBAL_HEAD_DIM),
-            NumQHeads(W::NUM_Q_HEADS),
-            NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
-            gpu_cores,
-        );
-        tracing::info!(
-            target: "scratchy-target-metal",
-            gpu_cores = gpu_cores.get(),
-            tq_decode_heads = tq_heads.get(),
-            "query heads per TurboQuant decode threadgroup"
-        );
+        let mut last_multi_row_rung: u32 = SAFE_MULTI_ROW_BUCKET_M;
         let mut tapes: Vec<LoweredMetalTape> = Vec::with_capacity(bucket_specs.len());
         for spec in bucket_specs {
             let variant = spec
@@ -532,6 +526,37 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                         "no baked tape variant for gen_class={gen_class:?} chunked={chunked}"
                     ),
                 })?;
+            // The bucket's decode-batch floor: `pick_bucket` routes
+            // `num_seqs == 1` to the 1-row bucket and every larger batch to
+            // a rung of at least `SAFE_MULTI_ROW_BUCKET_M` rows — the
+            // smallest multi-row rung can therefore be asked to decode as
+            // few as 2 sequences even when smaller rungs exist on the
+            // ladder (they are dead: never selected). Every larger rung's
+            // floor is one past the previous *selectable* rung.
+            // `bucket_specs` arrive in the macro's ascending order.
+            let min_batch = if spec.bucket_m <= SAFE_MULTI_ROW_BUCKET_M {
+                MinBatch(if spec.bucket_m == 1 { 1 } else { 2 })
+            } else {
+                MinBatch(last_multi_row_rung.saturating_add(1))
+            };
+            if spec.bucket_m > SAFE_MULTI_ROW_BUCKET_M {
+                last_multi_row_rung = spec.bucket_m;
+            }
+            let tq_heads = TqDecodeHeads::for_group(
+                HeadDim(W::GLOBAL_HEAD_DIM),
+                NumQHeads(W::NUM_Q_HEADS),
+                NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
+                gpu_cores,
+                min_batch,
+            );
+            tracing::info!(
+                target: "scratchy-target-metal",
+                bucket_m = spec.bucket_m,
+                min_batch = min_batch.get(),
+                gpu_cores = gpu_cores.get(),
+                tq_decode_heads = tq_heads.get(),
+                "query heads per TurboQuant decode threadgroup"
+            );
             tapes.push(variant.materialize(block_cap_u32, tq_heads));
         }
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
@@ -670,7 +695,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// up to the safe-floor bucket (typically 8), at the cost of
     /// padded compute for small batches.
     pub fn pick_bucket(&self, num_tokens: u32) -> Result<usize, ForwardError> {
-        const SAFE_MULTI_ROW_BUCKET_M: u32 = 8;
         if num_tokens == 0 {
             return Err(ForwardError::ZeroTokens);
         }
