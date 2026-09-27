@@ -706,7 +706,7 @@ fn tq_stage_command<const IS_K: bool>(
             block_size: super::ids::BlockSize(p.global_block_size),
             max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
-            bits: super::ids::TqCodeBits(crate::turboquant::tq_bits(p.tq_kv_bits)),
+            bits: super::ids::TqCodeBits(p.tq_kv_bits),
             rot_dim: ror_rd,
             pair_off: ror_po,
             rope_on_read: ror_on,
@@ -809,7 +809,7 @@ fn tq_quantize_command<const IS_K: bool>(
         p.num_global_kv_heads,
         p.global_block_size,
     );
-    let bits = crate::turboquant::tq_bits(p.tq_kv_bits);
+    let bits = p.tq_kv_bits;
     let vpw = 32 / bits;
     let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
     let li = super::ids::LayerId(layer);
@@ -892,7 +892,7 @@ fn tq_attention_command(
     let mut constants = attn.constants.to_vec();
     constants.extend(Vec::from(
         super::kernel_constants::AttentionViaCacheTqConstants {
-            bits: super::ids::TqCodeBits(crate::turboquant::tq_bits(p.tq_kv_bits)),
+            bits: super::ids::TqCodeBits(p.tq_kv_bits),
             k_bias: ops.k.0.is_some(),
             v_bias: ops.v.0.is_some(),
             heads: super::ids::TqDecodeHeads(1),
@@ -9431,7 +9431,7 @@ mod tests {
             (fp16.library, fp16.function, fp16.dispatch),
             (tq.library, tq.function, tq.dispatch)
         );
-        let bits = crate::turboquant::tq_bits(tp().tq_kv_bits);
+        let bits = tp().tq_kv_bits;
         assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
         assert_eq!(
             tq.constants[fp16.constants.len()..],
@@ -10096,7 +10096,7 @@ mod tests {
             binding_index,
             value,
         };
-        let bits = crate::turboquant::tq_bits(p.tq_kv_bits);
+        let bits = p.tq_kv_bits;
         let (hd, vpw) = (p.head_dim, 32 / bits);
         let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
         let tape = lower_tq_layer(Instruction::AttentionViaCache(3, 6, 0, true), 1);

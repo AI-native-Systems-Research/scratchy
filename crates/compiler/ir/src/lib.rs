@@ -989,8 +989,8 @@ pub trait CanonicalParams: WeightAccessors {
     /// survives outlier-heavy KV (Qwen-class massive activations); arches
     /// validated coherent at 3-bit override this for ~4.7x compression
     /// (Llama family). The metal RuntimeFactory and the lowering pass both
-    /// read it (env `SCRATCHY_TQ_BITS` overrides for experimentation), so the
-    /// codebook and the baked kernel constants always agree for a given arch.
+    /// read it, so the codebook and the baked kernel constants always agree
+    /// for a given arch.
     const TQ_KV_BITS: u32 = 4;
     /// Vision-tower attention head count. Vision encoders run plain
     /// MHA (`num_kv_heads == num_heads`); only one head dim is needed.

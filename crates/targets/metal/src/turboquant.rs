@@ -10,10 +10,6 @@ use objc2_metal::MTLDevice;
 
 use crate::argmax::{Buffer, Device};
 
-/// TurboQuant codebook bit-width. 3 by default (arozanov's setting, ~4.7x); a
-/// higher value trades compression for fidelity — needed for arches with
-pub use crate::tape::quantized::tq_bits;
-
 /// Build the TurboQuant provisioning for one worker at the GLOBAL (full-context)
 /// geometry. `num_blocks` is the shared KV pool capacity (the packed store is the
 /// canonical cache of that size); the scratch is ONE layer's fp16 (num_blocks

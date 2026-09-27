@@ -258,8 +258,7 @@ u32_newtype!(
     /// Steel attention `[[function_constant(99)]]` debug-mode toggle.
     /// Bound to `0` for production; `>0` selects diagnostic paths.
     AttnDebugMode,
-    /// TurboQuant codebook width, bits per packed code
-    /// (`tq_bits(W::TQ_KV_BITS)`).
+    /// TurboQuant codebook width, bits per packed code (`W::TQ_KV_BITS`).
     TqCodeBits,
     /// Query heads one TurboQuant decode threadgroup covers
     /// (`attention.metal` `ATTN_TQ_HEADS`, slot 16) — see [`TqDecodeHeads::for_group`].
