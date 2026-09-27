@@ -190,6 +190,11 @@ pub mod paged_kv_layout;
 /// `[[function_constant]]` on the hand-written kernels.
 pub const BLOCKS_PER_CHUNK: u32 = 128;
 
+/// Bit 31 of a `slot_mapping` or `block_table` entry: the block stores K
+/// unrotated (a span block), and attention re-ropes it on read. Kernels strip
+/// it (`& 0x7FFFFFFFu`, `ATTN_BT_MASK`) before indexing.
+pub const UNROTATED_BLOCK_BIT: u32 = 0x8000_0000;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};

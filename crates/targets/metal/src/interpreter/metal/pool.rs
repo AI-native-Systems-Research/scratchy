@@ -1423,7 +1423,7 @@ fn step_has_unrotated_blocks(inputs: &ForwardInputs<'_>, block_size: u32) -> boo
         });
         row[..used.min(row.len())]
             .iter()
-            .any(|b| b & 0x8000_0000 != 0)
+            .any(|b| b & crate::UNROTATED_BLOCK_BIT != 0)
     })
 }
 
@@ -2204,7 +2204,7 @@ mod tests {
     /// its row) does not count, and neither does another group's table.
     #[test]
     fn a_step_has_unrotated_blocks_only_among_the_blocks_it_uses() {
-        let flagged = |b: u32| b | 0x8000_0000;
+        let flagged = |b: u32| b | crate::UNROTATED_BLOCK_BIT;
         let cu = [0u32, 1, 2];
         let used = [32u32, 17];
         let has = |table: &[u32]| {
