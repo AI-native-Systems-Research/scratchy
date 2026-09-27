@@ -359,6 +359,13 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// Only such a step runs the one-command decode and the pipelined prefill
     /// scan (`RuntimeGate::OnlyIfPlainGdn`).
     pub gdn_plain: std::sync::atomic::AtomicBool,
+    /// Per-dispatch GPU timestamp heap (`SCRATCHY_METAL_KERNEL_TIME`).
+    /// `None` unless the env var is set at worker build — the probe is
+    /// opt-in and costs nothing otherwise. One timestamp is written
+    /// after EVERY dispatched kernel; the pool resolves and prints the
+    /// per-kernel deltas after the forward's host wait (see
+    /// `print_kernel_tape`).
+    pub kernel_time_heap: Option<super::mtl4::KernelTimeHeap>,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -811,6 +818,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
+            kernel_time_heap: if std::env::var_os("SCRATCHY_METAL_KERNEL_TIME").is_some() {
+                Some(super::mtl4::KernelTimeHeap::new(&device))
+            } else {
+                None
+            },
             _marker: std::marker::PhantomData,
         })
     }
@@ -1103,6 +1115,14 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 };
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
+                // SCRATCHY_METAL_KERNEL_TIME: one GPU timestamp per
+                // dispatched kernel (relaxed granularity — the probe
+                // must not perturb what it measures). Index pairs with
+                // the tape position; the pool prints deltas after the
+                // host wait.
+                if let Some(heap) = &self.kernel_time_heap {
+                    heap.write_timestamp(enc, step.kernel, tg_scaled);
+                }
                 #[cfg(feature = "forward-telemetry")]
                 if tape_enabled {
                     tape.push(TapeEntry {
