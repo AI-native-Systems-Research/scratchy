@@ -587,6 +587,25 @@ pub enum RuntimeGate {
     /// Run unless the step's token count is in `quantized::SMALL_M_TOKENS`:
     /// the GEMM an `AffineQmmSmallM` twin replaces there.
     UnlessSmallMTokens,
+    /// Run only on a step with one sequence: the prefill attention that reads
+    /// K from the rope-once scratch, which holds one sequence's keys.
+    OnlyIfOneSequence,
+    /// Run only on a step with several sequences: the attention twin that
+    /// reads each sequence's K through its own block-table row.
+    UnlessOneSequence,
+    /// Run only when every gate in the list matches.
+    All(&'static [RuntimeGate]),
+}
+
+impl RuntimeGate {
+    /// `gate` narrowed by `and`: a command that already carries a gate keeps
+    /// it, and must now also match `and`.
+    pub fn and(gate: Option<RuntimeGate>, and: RuntimeGate) -> RuntimeGate {
+        match gate {
+            None => and,
+            Some(g) => RuntimeGate::All(baked(vec![g, and])),
+        }
+    }
 }
 
 impl DispatchShape {

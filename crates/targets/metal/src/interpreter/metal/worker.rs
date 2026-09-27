@@ -1972,6 +1972,11 @@ pub(super) fn gate_matches(
         Some(super::lowered::RuntimeGate::UnlessSmallMTokens) => {
             !crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
         }
+        Some(super::lowered::RuntimeGate::OnlyIfOneSequence) => num_seqs == 1,
+        Some(super::lowered::RuntimeGate::UnlessOneSequence) => num_seqs > 1,
+        Some(super::lowered::RuntimeGate::All(gates)) => gates
+            .iter()
+            .all(|g| gate_matches(Some(*g), num_tokens, num_seqs, has_spec_tokens, turboquant)),
     }
 }
 
@@ -2049,6 +2054,33 @@ mod tests {
     use scratchy_layers::{Linear, LinearLayer, RmsNorm};
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::Arc;
+
+    /// The sequence gates follow the step's sequence count, not its token
+    /// count, and `All` needs every gate: under TurboQuant a decode step runs
+    /// neither the scratch attention nor its per-row twin.
+    #[test]
+    fn sequence_gates_follow_the_steps_sequence_count() {
+        use super::super::lowered::RuntimeGate::{
+            All, OnlyIfOneSequence, UnlessOneSequence, UnlessTurboquantDecode,
+        };
+        for (tokens, seqs, one) in [(512, 1, true), (512, 2, false), (16, 16, false)] {
+            assert_eq!(
+                gate_matches(Some(OnlyIfOneSequence), tokens, seqs, false, false),
+                one
+            );
+            assert_eq!(
+                gate_matches(Some(UnlessOneSequence), tokens, seqs, false, false),
+                !one
+            );
+        }
+        let one = All(&[UnlessTurboquantDecode, OnlyIfOneSequence]);
+        assert!(gate_matches(Some(one), 512, 1, false, true));
+        assert!(!gate_matches(Some(one), 512, 2, false, true));
+        assert!(
+            !gate_matches(Some(one), 1, 1, false, true),
+            "a TurboQuant decode step"
+        );
+    }
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
     /// instances the `WeightAccessors` impl below returns. Plays the

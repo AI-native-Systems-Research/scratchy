@@ -282,6 +282,14 @@ constant uint ATTN_TQ_HEADS_FC [[function_constant(16)]];
 constant uint ATTN_TQ_HEADS =
     is_function_constant_defined(ATTN_TQ_HEADS_FC) ? ATTN_TQ_HEADS_FC : 1u;
 
+//  17  ATTN_TQ_STAGE_PASS — the rows one `tq_stage_rotated` dispatch stages:
+//      1 = the step's new rows (read from the cache their writer just filled),
+//      2 = the cached rows (decoded from the packed store). The lowering runs
+//      pass 1 then pass 2: a row that is new for one sequence can be a
+//      prefix-cache hit for another in the same step, and both rewrite it in
+//      place, so the two writes must be ordered, not concurrent.
+constant uint ATTN_TQ_STAGE_PASS [[function_constant(17)]];
+
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
 // ownership). Under both the contiguous and the co-resident layout the bits of
@@ -453,6 +461,9 @@ kernel void tq_stage_rotated(
         // nothing was written, the key lives only in the packed store).
         const bool cached =
             i < prefix_len || slot_mapping[q_start + (i - prefix_len)] == 0xFFFFFFFFu;
+        if (cached != (ATTN_TQ_STAGE_PASS == 2u)) {
+            continue;
+        }
         device T* row = block + t * head_dim + e0;
         float x[16];
         if (cached) {
@@ -1636,28 +1647,10 @@ inline void rope_once_gqa_shared_body(
     uint2 gid)
 {
     const uint logical_block = gid.y;
-    // ⛔⛔⛔⭐⭐⭐⭐⭐ THIS HARD-CODED 0 IS THE BATCHED-DECODE / BATCHED-PREFILL CORRUPTION.
-    // MEASURED 2026-08-11 on metal (13s repro, granite-3.3-8b-4bit):
-    //   * 12 short distinct prompts, no prefix-cache hits: 1 of 12 correct. The ONLY correct one is the
-    //     request whose prefill had a step to ITSELF.
-    //   * same 4 prompts with --max-num-seqs 1: 4 of 4. Solo: 4 of 4.
-    // WHY: rope-once re-ropes K out of the paged cache into a dense `k_scratch` that the steel/NAX paged
-    // prefill attention then reads INSTEAD of the cache. With `seq_idx = 0` it reads
-    // `block_table + 0 * MAX_BLOCKS_PER_SEQ` and `seq_used_k[0]`, and the scratch has NO batch dimension —
-    // so ONE K image, built entirely from batch row 0's history, is served to EVERY row of the batch.
-    // Row 0 is therefore always right (a decode sharing the step IS row 0) and every seq_idx > 0 attends
-    // row 0's keys, which reads as fluent, confidently wrong output.
-    // ⛔ NOT spans-gated: `ROPE_ON_READ` derives from `fuf_uses_rotary` (macros/src/lib.rs:1841), i.e. it is
-    // on for EVERY rope model including granite — `SPANS_OFF=1` changes nothing (measured, identical 1/12).
-    // ⛔ THE OBVIOUS FIX DOES NOT FIT IN MEMORY. Adding a batch dimension means
-    // `num_pages(block_cap=8192) * NUM_KV_HEADS * BLOCK_SIZE * HEAD_DIM * 2B` ≈ 268 MB PER SEQUENCE
-    // (lowering.rs ~4272 sizes exactly one sequence). x max_num_seqs is not an option.
-    // ⏭ THE FIX IS TO STOP STAGING: for a multi-sequence step, read the paged cache per row (each request
-    // through its OWN block_table row) rather than through this scratch — which is what vLLM does (K is
-    // stored already-roped and `block_table.py:186` commits all `num_reqs` rows; there is no staging buffer
-    // at all). The comment below was true when written — the caller really was single-sequence — and it
-    // outlived that fact, which is why this survived every host-side audit.
-    const uint seq_idx       = 0; // single-sequence prefill ONLY — see above; WRONG for num_reqs > 1
+    // The scratch has no batch dimension: this stages batch row 0 only, and the
+    // tape runs it only on single-sequence steps (`RuntimeGate::OnlyIfOneSequence`);
+    // a step with several sequences runs the attention's per-row twin instead.
+    const uint seq_idx       = 0;
 
     const uint head_dim    = ATTN_HEAD_DIM;
     const uint num_kv      = ATTN_NUM_KV_HEADS;

@@ -207,7 +207,9 @@ void rope_once_nax_kernel(
     const device T*    cos_sin      [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]]) {
   const uint logical_block = gid.y;
-  const uint seq_idx = 0; // single-sequence prefill (rope-once is per-request)
+  // Batch row 0 only: the tape runs this on single-sequence steps (see
+  // attention.metal's rope_once_gqa_shared).
+  const uint seq_idx = 0;
 
   const uint kv_len = seq_used_k[seq_idx];
   const uint num_pages = (kv_len + uint(BLOCK_SIZE_) - 1u) / uint(BLOCK_SIZE_);

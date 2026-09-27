@@ -531,6 +531,22 @@ impl MetalWorker {
     }
 }
 
+/// Keep only the first write to each KV slot in a step. Two sequences can be
+/// handed the same block for tokens they both compute (a full prefix-cache hit
+/// backs off one block but keeps the hit block), so they write identical K/V to
+/// the same slots. A second write races with the first (TurboQuant's prefill
+/// staging re-rotates the row in place), so later writers get the write-skip
+/// sentinel and read the first writer's keys like any cached row.
+fn keep_first_slot_writes(slots: &mut [u32]) {
+    let mut written = std::collections::HashSet::with_capacity(slots.len());
+    for slot in slots.iter_mut().filter(|s| **s != u32::MAX) {
+        // Bit 31 flags an unrotated (span) block; the slot is the low bits.
+        if !written.insert(*slot & 0x7FFF_FFFF) {
+            *slot = u32::MAX;
+        }
+    }
+}
+
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size × 2 bytes.
 /// bf16 and f16 are both 2 bytes/elt under metal; int4 KV is unsupported.
 #[cfg(feature = "metal")]
@@ -3898,6 +3914,7 @@ impl Worker for MetalWorker {
                 slot_mapping_u32.push(slot);
             }
         }
+        keep_first_slot_writes(&mut slot_mapping_u32);
 
         // block_table padded to [num_reqs, max_blocks_per_seq] u32.
         //
@@ -3938,7 +3955,8 @@ impl Worker for MetalWorker {
         // score as the pool value (8192). The host/kernel stride disagreement is REAL (slot 5 is baked from
         // `W::MAX_BLOCKS_PER_SEQ` at pipelines.rs:489, not from the pool as the comment above claims) but it
         // is NOT what corrupts a prefill that shares a step with a decode. Do not re-chase it from the
-        // comment alone.
+        // comment alone. (That corruption was the rope-once K scratch serving batch row 0's keys to every
+        // sequence; see `route_by_sequence_count` in the metal lowering.)
         let mut block_table_u32: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
         if runtime_max_blocks > 0 {
             for (i, blocks) in attn.block_ids.iter().enumerate() {
@@ -4020,6 +4038,7 @@ impl Worker for MetalWorker {
                     }
                 }
             }
+            keep_first_slot_writes(&mut sm);
             let mut bt: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
             for (i, blocks) in sliding.iter().enumerate() {
                 // Clamp to the kernel's baked MAX_BLOCKS_PER_SEQ row stride: a
@@ -5116,3 +5135,20 @@ impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
 
 #[cfg(feature = "metal")]
 inventory::submit!(&MetalWorkerFactory as &dyn crate::worker_factory::WorkerFactory);
+
+#[cfg(test)]
+mod tests {
+    use super::keep_first_slot_writes;
+
+    /// A slot two sequences write in one step keeps its first writer; the later
+    /// write becomes the skip sentinel. Padding stays padding, and a span
+    /// (bit-31) write of the same slot counts as the same slot.
+    #[test]
+    fn a_slot_written_twice_in_a_step_keeps_its_first_writer() {
+        let span = |s: u32| s | 0x8000_0000;
+        let mut slots = vec![64, 65, u32::MAX, 64, 65, 66, u32::MAX, span(66), 67];
+        keep_first_slot_writes(&mut slots);
+        let skip = u32::MAX;
+        assert_eq!(slots, [64, 65, skip, skip, skip, 66, skip, skip, 67]);
+    }
+}

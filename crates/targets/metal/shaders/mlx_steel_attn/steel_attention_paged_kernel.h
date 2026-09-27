@@ -152,10 +152,9 @@ void rope_once_steel_kernel(
     const device T*    cos_sin      [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]]) {
   const uint logical_block = gid.y;
-  // ⛔⛔⛔ SEE attention.metal's rope_once FOR THE FULL FINDING: this 0 serves batch row 0's K image to
-  // EVERY row of the batch, and is the measured cause of 1-of-12 on a 12-request metal batch. Correct only
-  // while the caller is single-sequence, which it no longer is.
-  const uint seq_idx = 0; // single-sequence prefill ONLY — WRONG for num_reqs > 1
+  // Batch row 0 only: the tape runs this on single-sequence steps (see
+  // attention.metal's rope_once_gqa_shared).
+  const uint seq_idx = 0;
 
   const uint kv_len = seq_used_k[seq_idx];
   const uint num_pages = (kv_len + uint(BLOCK_SIZE_) - 1u) / uint(BLOCK_SIZE_);

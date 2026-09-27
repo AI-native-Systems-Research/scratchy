@@ -695,6 +695,7 @@ fn tq_stage_command<const IS_K: bool>(
     is_global: bool,
     bucket_m: u32,
     block_cap: u32,
+    pass: super::kernel_constants::TqStagePass,
 ) -> LoweredCommand {
     let (ror_rd, ror_po, ror_on, ror_bind) = if IS_K {
         rope_on_read_params(p, is_global)
@@ -727,6 +728,7 @@ fn tq_stage_command<const IS_K: bool>(
             rope_on_read: ror_on,
             k_bias: IS_K && operand.0.is_some(),
             v_bias: !IS_K && operand.0.is_some(),
+            pass,
         }
         .into_baked(),
         dispatch: DispatchShape {
@@ -1067,22 +1069,28 @@ fn inject_tq(
         let mut out = Vec::with_capacity(cmds.len() + 5);
         if !decode {
             let (k, v) = (ops.k, ops.v);
-            out.push(prefill(tq_stage_command(
-                p,
-                layer,
-                k,
-                global_attention,
-                bucket_m,
-                block_cap,
-            )));
-            out.push(prefill(tq_stage_command(
-                p,
-                layer,
-                v,
-                global_attention,
-                bucket_m,
-                block_cap,
-            )));
+            // New rows first, cached rows after (`TqStagePass`).
+            use super::kernel_constants::TqStagePass;
+            for pass in [TqStagePass::New, TqStagePass::Cached] {
+                out.push(prefill(tq_stage_command(
+                    p,
+                    layer,
+                    k,
+                    global_attention,
+                    bucket_m,
+                    block_cap,
+                    pass,
+                )));
+                out.push(prefill(tq_stage_command(
+                    p,
+                    layer,
+                    v,
+                    global_attention,
+                    bucket_m,
+                    block_cap,
+                    pass,
+                )));
+            }
             out.push(prefill(tq_rotate_command(p, a.q, false, bucket_m)));
         }
         out.extend(
@@ -1117,6 +1125,39 @@ fn inject_tq(
         }
     }
     Ok(out)
+}
+
+/// A paged prefill attention that reads K from the rope-once scratch runs only
+/// on single-sequence steps: the scratch holds one sequence's keys, staged
+/// from batch row 0. Its per-row twin (the attention arms emit it after the
+/// rope-once pair) runs on every other step. Every other command is left as
+/// it is.
+fn route_by_sequence_count(cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
+    use crate::tape::lowered::RuntimeGate::{self, OnlyIfOneSequence, UnlessOneSequence};
+    let reads_scratch = |c: &LoweredCommand| {
+        matches!(
+            c.kernel,
+            KernelId::RopeOnceNax | KernelId::RopeOnceSteel | KernelId::RopeOnceGqaShared
+        ) || c
+            .bindings
+            .iter()
+            .any(|b| matches!(b, Binding::RopedKScratch { .. }))
+    };
+    if !cmds.iter().any(|c| reads_scratch(&c.command)) {
+        return cmds;
+    }
+    cmds.into_iter()
+        .map(|c| {
+            let only = if reads_scratch(&c.command) {
+                OnlyIfOneSequence
+            } else if c.command.kernel == KernelId::AttentionPrefillSdpaPaged {
+                UnlessOneSequence
+            } else {
+                return c;
+            };
+            GatedCommand::gated(c.command, RuntimeGate::and(c.gate, only))
+        })
+        .collect()
 }
 
 /// On a NAX device, the small-M matrix-unit twin of an MLX-affine 4-bit
@@ -1427,6 +1468,7 @@ pub fn lower(
                     |missing| LoweringError::TurboQuantOffsetUnbound { index: i, missing },
                 )?;
                 let cmds = route_small_m(p, other, tq, bucket_m, tape_index, i, profile);
+                let cmds = route_by_sequence_count(cmds);
                 update_shape_state(p, other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
@@ -1597,6 +1639,49 @@ fn rope_on_read_params(
         Some(1),
         Some(is_global),
     )
+}
+
+/// The sdpa-paged prefill attention: one threadgroup per (q head, query
+/// token). Each query token finds its sequence in `cu_seqlens_q` and reads K
+/// through that sequence's own block-table row, so it is right for any number
+/// of sequences; it leaves grid Z alone (see `MScaling::seq_axis`).
+fn sdpa_paged_command(
+    p: &MetalModelConsts,
+    constants: super::kernel_constants::AttentionPrefillPagedConstants,
+    bindings: super::kernel_bindings::AttentionPrefillPagedBindingSet,
+    bucket_m: u32,
+) -> LoweredCommand {
+    use crate::tape::kernel_identity::{AttentionSdpaPagedBf16, AttentionSdpaPagedF16};
+    let dispatch = DispatchShape {
+        threadgroups: (p.num_q_heads, bucket_m, 1),
+        threads_per_threadgroup: (1024, 1, 1),
+        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+            seq_axis: None,
+            axis: crate::tape::lowered::MScaleAxis::Y,
+            bucket_m: super::ids::BucketM(bucket_m),
+        }),
+    };
+    match p.metal_dtype {
+        crate::tape::lowered::MetalDtype::Bf16 => {
+            LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(constants, bindings, dispatch)
+        }
+        _ => LoweredCommand::for_kernel::<AttentionSdpaPagedF16>(constants, bindings, dispatch),
+    }
+}
+
+/// The steel/NAX paged prefill attention's grid: one threadgroup per
+/// (BQ-block of queries, q head), and one Z-layer per sequence
+/// (`tid.z = seq_idx`) so a BQ-block never straddles a sequence boundary.
+fn steel_paged_dispatch(p: &MetalModelConsts, bucket_m: u32, bq: u32) -> DispatchShape {
+    DispatchShape {
+        threadgroups: (bucket_m.div_ceil(bq), p.num_q_heads, 1),
+        threads_per_threadgroup: (128, 1, 1),
+        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+            seq_axis: Some(crate::interpreter::metal::lowered::MScaleAxis::Z),
+            axis: crate::tape::lowered::MScaleAxis::X,
+            bucket_m: super::ids::BucketM(bucket_m),
+        }),
+    }
 }
 
 /// Co-resident NeoX-pair lane layout for the decode rope-on-read path
@@ -4387,10 +4472,8 @@ fn lower_one(
             // one source. Bug class #8 — drift between the three
             // independent `&'static str` fields — can't recur.
             use crate::steel_paged::{nax_paged_symbol, steel_paged_symbol};
-            use crate::tape::kernel_identity::{AttentionSdpaPagedBf16, AttentionSdpaPagedF16};
             // Spans rope-on-read (GLOBAL class). All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, true);
-            let n_q_heads = p.num_q_heads;
             const BQ_STEEL: u32 = 32;
             // NAX kernel tiles queries in BQ=64 blocks (4 warps × 16-row
             // NAX Q-frags), vs the simdgroup steel kernel's BQ=32.
@@ -4467,20 +4550,6 @@ fn lower_one(
             // set) with no per-tile smem rotation. The gqa_shared twin of
             // nax_spans/steel_spans below.
             let gqa_shared_spans = use_gqa_shared && p.rope_on_read;
-            let (tg_shape, threads_per_tg, m_scale_axis) = if use_steel {
-                let nq_blocks = bucket_m.div_ceil(bq_steel);
-                (
-                    (nq_blocks, n_q_heads, 1),
-                    (128u32, 1u32, 1u32),
-                    crate::tape::lowered::MScaleAxis::X,
-                )
-            } else {
-                (
-                    (n_q_heads, bucket_m, 1),
-                    (1024u32, 1u32, 1u32),
-                    crate::tape::lowered::MScaleAxis::Y,
-                )
-            };
             let constants = super::kernel_constants::AttentionPrefillPagedConstants {
                 // Paged prefill attends the whole cached sequence on a
                 // continuation chunk → FullSeqUsed. Resolved once here; the
@@ -4532,60 +4601,42 @@ fn lower_one(
             // scratch at slot 7 (no per-tile rotation, no cos_sin in the
             // attention). The remaining sdpa-paged path keeps the in-kernel
             // cos_sin path.
-            // ⛔⛔⛔⭐⭐⭐⭐⭐ THE SCRATCH PATH IS WRONG FOR num_reqs > 1, AND THIS IS WHERE THE FIX GOES.
-            // `RopeOnce{Nax,Steel,GqaShared}` hard-codes `seq_idx = 0` (attention.metal:1263 and the two
-            // mlx_steel_attn paged headers) and the scratch has NO batch dimension, so it stages ONE K
-            // image from batch row 0 and serves it to every row. MEASURED on metal 2026-08-11: 12 short
-            // distinct prompts score 1/12, and the only correct one is the request that prefilled ALONE;
-            // the same file with `--max-num-seqs 1` scores 4/4.
             //
-            // ⭐ THE CORRECT PATH ALREADY EXISTS AND IS THE `else` OF THIS VERY FLAG: the sdpa-paged
-            // kernel with the in-kernel cos_sin path reads `block_table + seq_idx * max_blocks`, i.e. each
-            // request's OWN row (attention.metal ~854). So the fix is to route a multi-sequence step to
-            // that path instead of building a batch-aware scratch — adding a batch dimension is
-            // ~268 MB PER SEQUENCE at this config (see the sizing below, `num_pages = block_cap`).
-            //
-            // ⛔ WHAT MAKES IT MORE THAN A ONE-LINER: `use_nax`/`use_steel` are decided HERE, at lowering
-            // time, and a command's kernel + bindings are fixed once lowered — while "how many sequences
-            // are in this step" is a RUNTIME fact (a mixed step's `m` is total tokens, indistinguishable
-            // from a single long prefill's `m`). So this needs either runtime kernel selection (two
-            // lowered variants chosen per step) or a scratch packed per sequence with runtime offsets.
-            // That is a real design decision with a single-sequence perf cost, not a guess to make blind.
+            // The scratch holds ONE sequence's keys (it has no batch
+            // dimension: at `num_pages = block_cap` one sequence is already
+            // ~268 MB), so the rope-once pair runs only on single-sequence
+            // steps (`OnlyIfOneSequence`). A step with several sequences runs
+            // a per-row twin instead (`UnlessOneSequence`): the same attention
+            // reading K from the cache through each sequence's own block-table
+            // row and re-roping flagged (bit-31) blocks in-kernel — sdpa-paged
+            // for steel/NAX, gqa_shared without the scratch for gqa_shared.
+            // `route_by_sequence_count` attaches the gates.
             let nax_spans = use_nax && p.rope_on_read;
             let steel_spans = use_steel && !use_nax && p.rope_on_read;
             // NAX, simdgroup steel, and gqa_shared all read pre-roped K from the
             // shared `Binding::RopedKScratch` at slot 7 (the rope-once-to-scratch
             // pattern); they share the scratch-source binding flag.
             let roped_k_scratch = nax_spans || steel_spans || gqa_shared_spans;
-            let bindings = super::kernel_bindings::AttentionPrefillPagedBindingSet {
-                output: super::ids::ArenaSlotIdx(*out_slot),
-                q: super::ids::ArenaSlotIdx(*q_slot),
-                kv_layer: super::ids::LayerId(*layer + layer_offset),
-                // Steel/NAX/gqa_shared read pre-roped K from the scratch, so
-                // they do NOT bind cos_sin at slot 7 (the rope is done by
-                // RopeOnce{Nax,Steel,GqaShared}). The sdpa-paged path keeps the
-                // in-kernel cos_sin path.
-                rope_on_read: if roped_k_scratch { None } else { ror_bind },
-                nax_roped_k_scratch: roped_k_scratch,
+            // The attention's bindings with K from the rope-once scratch, or
+            // (`scratch == false`) from the cache with the in-kernel cos_sin
+            // rope.
+            let bindings_for =
+                |scratch: bool| super::kernel_bindings::AttentionPrefillPagedBindingSet {
+                    output: super::ids::ArenaSlotIdx(*out_slot),
+                    q: super::ids::ArenaSlotIdx(*q_slot),
+                    kv_layer: super::ids::LayerId(*layer + layer_offset),
+                    rope_on_read: if scratch { None } else { ror_bind },
+                    nax_roped_k_scratch: scratch,
+                };
+            let bindings = bindings_for(roped_k_scratch);
+            // The per-row twin's constants: no steel debug slot, no scratch.
+            let per_row_constants = super::kernel_constants::AttentionPrefillPagedConstants {
+                debug_mode: None,
+                k_scratch: None,
+                ..constants
             };
-            let dispatch = DispatchShape {
-                threadgroups: tg_shape,
-                threads_per_threadgroup: threads_per_tg,
-                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                    // Steel tiles queries in BQ-blocks that must not
-                    // straddle a sequence boundary, so its grid needs one
-                    // Z-layer per sequence (`tid.z = seq_idx`). SDPA is
-                    // per-query-token and self-attributes, so it leaves Z
-                    // alone. See MScaling::seq_axis.
-                    seq_axis: if use_steel {
-                        Some(crate::interpreter::metal::lowered::MScaleAxis::Z)
-                    } else {
-                        None
-                    },
-                    axis: m_scale_axis,
-                    bucket_m: super::ids::BucketM(bucket_m),
-                }),
-            };
+            let sdpa_paged =
+                |constants, bindings| sdpa_paged_command(p, constants, bindings, bucket_m);
             // GQA-cooperative fallback: when steel can't take the shape (head_dim
             // 512 has no steel instantiation — TG memory) AND the GQA ratio is
             // high, the per-(q_head, query) sdpa_vector kernel re-streams
@@ -4625,14 +4676,15 @@ fn lower_one(
                     library,
                     function,
                     constants: constants.into_baked(),
-                    dispatch,
+                    dispatch: steel_paged_dispatch(p, bucket_m, bq_steel),
                     bindings: bindings.into_baked(),
                     gemm_dims: None,
                 };
                 if roped_k_scratch {
-                    // Two commands: (1) RopeOnce{Nax,Steel} ropes the cache's K
+                    // Three commands: (1) RopeOnce{Nax,Steel} ropes the cache's K
                     // into the shared scratch (sized per-layer below); (2) the
-                    // steel/NAX attention reads pre-roped K from the scratch.
+                    // steel/NAX attention reads pre-roped K from the scratch;
+                    // (3) its sdpa-paged twin for steps with several sequences.
                     // Pick the rope-once kernel matching the selected attention
                     // kernel: NAX (hd128 only) → `rope_once_nax`; simdgroup steel
                     // (hd 64/96/128/256, incl. SmolLM hd64) → `rope_once_steel`.
@@ -4702,41 +4754,48 @@ fn lower_one(
                         .into_baked(),
                         gemm_dims: None,
                     };
-                    return Ok(vec![rope_cmd, attn_cmd]);
+                    let per_row = sdpa_paged(per_row_constants, bindings_for(false));
+                    return Ok(vec![rope_cmd, attn_cmd, per_row]);
                 }
                 attn_cmd
             } else if use_gqa_shared {
-                let attn_cmd = LoweredCommand {
-                    kernel: KernelId::AttentionPrefillSdpaPaged,
-                    library: "attention",
-                    function: pick_specialized_symbol(
-                        "attention_prefill_sdpa_gqa_shared_f16_specialized",
-                        "attention_prefill_sdpa_gqa_shared_bf16_specialized",
-                        p.metal_dtype,
-                    ),
-                    constants: constants.into_baked(),
-                    dispatch: DispatchShape {
-                        // One TG per (kv_head, query); `32 × gqa`
-                        // threads = one simdgroup per q-head (gqa <=
-                        // 32 keeps this within the 1024-thread cap).
-                        threadgroups: (p.num_global_kv_heads, bucket_m, 1),
-                        threads_per_threadgroup: (32 * gqa, 1, 1),
-                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                            seq_axis: None,
-                            axis: crate::tape::lowered::MScaleAxis::Y,
-                            bucket_m: super::ids::BucketM(bucket_m),
-                        }),
-                    },
-                    bindings: bindings.into_baked(),
-                    gemm_dims: None,
+                let gqa_shared = |constants: super::kernel_constants::AttentionPrefillPagedConstants,
+                                  bindings: super::kernel_bindings::AttentionPrefillPagedBindingSet| {
+                    LoweredCommand {
+                        kernel: KernelId::AttentionPrefillSdpaPaged,
+                        library: "attention",
+                        function: pick_specialized_symbol(
+                            "attention_prefill_sdpa_gqa_shared_f16_specialized",
+                            "attention_prefill_sdpa_gqa_shared_bf16_specialized",
+                            p.metal_dtype,
+                        ),
+                        constants: constants.into_baked(),
+                        dispatch: DispatchShape {
+                            // One TG per (kv_head, query); `32 × gqa`
+                            // threads = one simdgroup per q-head (gqa <=
+                            // 32 keeps this within the 1024-thread cap).
+                            threadgroups: (p.num_global_kv_heads, bucket_m, 1),
+                            threads_per_threadgroup: (32 * gqa, 1, 1),
+                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                seq_axis: None,
+                                axis: crate::tape::lowered::MScaleAxis::Y,
+                                bucket_m: super::ids::BucketM(bucket_m),
+                            }),
+                        },
+                        bindings: bindings.into_baked(),
+                        gemm_dims: None,
+                    }
                 };
+                let attn_cmd = gqa_shared(constants, bindings);
                 if gqa_shared_spans {
-                    // Two commands: (1) RopeOnceGqaShared ropes the cache's K
+                    // Three commands: (1) RopeOnceGqaShared ropes the cache's K
                     // into the shared scratch (dense, logical-block indexed);
                     // (2) the gqa_shared attention reads pre-roped K from the
                     // scratch (slot 7, ATTN_K_SCRATCH set) with no per-tile smem
-                    // rotation. head_dim 512 (gemma4 global) has no steel/NAX
-                    // instantiation, so this is the path launch-claude takes.
+                    // rotation; (3) its twin without the scratch, re-roping K
+                    // in smem, for steps with several sequences. head_dim 512
+                    // (gemma4 global) has no steel/NAX instantiation, so this is
+                    // the path launch-claude takes.
                     let rope_sym = crate::steel_paged::rope_once_gqa_shared_symbol(steel_dtype_tag)
                         .expect("rope_once_gqa_shared_symbol is Some for f16/bf16");
                     // f16 and bf16 are both 2 B/elem.
@@ -4781,20 +4840,12 @@ fn lower_one(
                         .into_baked(),
                         gemm_dims: None,
                     };
-                    return Ok(vec![rope_cmd, attn_cmd]);
+                    let per_row = gqa_shared(per_row_constants, bindings_for(false));
+                    return Ok(vec![rope_cmd, attn_cmd, per_row]);
                 }
                 attn_cmd
             } else {
-                match p.metal_dtype {
-                    crate::tape::lowered::MetalDtype::Bf16 => {
-                        LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(
-                            constants, bindings, dispatch,
-                        )
-                    }
-                    _ => LoweredCommand::for_kernel::<AttentionSdpaPagedF16>(
-                        constants, bindings, dispatch,
-                    ),
-                }
+                sdpa_paged(constants, bindings)
             }
         }
 
@@ -4869,10 +4920,8 @@ fn lower_one(
                 "SlidingAttentionPrefillPaged lowered with SLIDING_WINDOW <= 0"
             );
             use crate::steel_paged::steel_paged_symbol;
-            use crate::tape::kernel_identity::{AttentionSdpaPagedBf16, AttentionSdpaPagedF16};
             // Spans rope-on-read (SLIDING class). All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, false);
-            let n_q_heads = p.num_q_heads;
             const BQ_STEEL: u32 = 32;
             let steel_dtype_tag: &str = match p.metal_dtype {
                 crate::tape::lowered::MetalDtype::Bf16 => "bf16",
@@ -4891,20 +4940,6 @@ fn lower_one(
             // scratch (slot 7) with no in-kernel rotation. Mirrors the
             // `steel_spans` path in the global AttentionPrefillPaged arm.
             let steel_spans = use_steel && p.rope_on_read;
-            let (tg_shape, threads_per_tg, m_scale_axis) = if use_steel {
-                let nq_blocks = bucket_m.div_ceil(BQ_STEEL);
-                (
-                    (nq_blocks, n_q_heads, 1),
-                    (128u32, 1u32, 1u32),
-                    crate::tape::lowered::MScaleAxis::X,
-                )
-            } else {
-                (
-                    (n_q_heads, bucket_m, 1),
-                    (1024u32, 1u32, 1u32),
-                    crate::tape::lowered::MScaleAxis::Y,
-                )
-            };
             let constants = super::kernel_constants::AttentionPrefillPagedConstants {
                 // Paged prefill attends the whole cached sequence on a
                 // continuation chunk → FullSeqUsed. Resolved once here; the
@@ -4946,35 +4981,19 @@ fn lower_one(
                 // its own constant so span isolation holds on all 30 layers.
                 self_only: if steel_spans { Some(1) } else { None },
             };
-            let bindings = super::kernel_bindings::AttentionPrefillPagedBindingSet {
-                output: super::ids::ArenaSlotIdx(*out_slot),
-                q: super::ids::ArenaSlotIdx(*q_slot),
-                kv_layer: super::ids::LayerId(*layer + layer_offset),
-                // Steel spans reads pre-roped K from the scratch (slot 7), so
-                // it does NOT bind cos_sin there; the non-spans path keeps the
-                // in-kernel cos_sin binding.
-                rope_on_read: if steel_spans { None } else { ror_bind },
-                // Sliding prefill uses the simdgroup steel kernel (hd256),
-                // never NAX (hd128 only). Spans → reads pre-roped K from the
-                // shared scratch at slot 7 (RopeOnceSteel below).
-                nax_roped_k_scratch: steel_spans,
-            };
-            let dispatch = DispatchShape {
-                threadgroups: tg_shape,
-                threads_per_threadgroup: threads_per_tg,
-                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                    // Steel: one grid-Z layer per sequence so a BQ
-                    // tile never straddles a sequence boundary (see
-                    // the AttentionPrefillPaged arm).
-                    seq_axis: if use_steel {
-                        Some(crate::interpreter::metal::lowered::MScaleAxis::Z)
-                    } else {
-                        None
-                    },
-                    axis: m_scale_axis,
-                    bucket_m: super::ids::BucketM(bucket_m),
-                }),
-            };
+            // Steel spans reads pre-roped K from the scratch (slot 7), so it
+            // does NOT bind cos_sin there; the non-spans path keeps the
+            // in-kernel cos_sin binding. Sliding prefill uses the simdgroup
+            // steel kernel (hd256), never NAX (hd128 only).
+            let bindings_for =
+                |scratch: bool| super::kernel_bindings::AttentionPrefillPagedBindingSet {
+                    output: super::ids::ArenaSlotIdx(*out_slot),
+                    q: super::ids::ArenaSlotIdx(*q_slot),
+                    kv_layer: super::ids::LayerId(*layer + layer_offset),
+                    rope_on_read: if scratch { None } else { ror_bind },
+                    nax_roped_k_scratch: scratch,
+                };
+            let bindings = bindings_for(steel_spans);
             if use_steel {
                 let function = steel_symbol.expect("steel_symbol is Some when use_steel is true");
                 let attn_cmd = LoweredCommand {
@@ -4982,18 +5001,20 @@ fn lower_one(
                     library: "attention_steel_paged",
                     function,
                     constants: constants.into_baked(),
-                    dispatch,
+                    dispatch: steel_paged_dispatch(p, bucket_m, BQ_STEEL),
                     bindings: bindings.into_baked(),
                     gemm_dims: None,
                 };
                 if steel_spans {
-                    // Two commands: (1) RopeOnceSteel ropes the cache's K into
+                    // Three commands: (1) RopeOnceSteel ropes the cache's K into
                     // the shared scratch using SLIDING geometry (HEAD_DIM 256,
                     // NUM_KV_HEADS, BLOCK_SIZE) + the SLIDING-class cos_sin
                     // (is_global: false — gemma4 uses a different rope theta for
                     // local vs global layers); (2) the steel attention reads
-                    // pre-roped K from the scratch (slot 7). Mirrors the
-                    // global AttentionPrefillPaged steel_spans path.
+                    // pre-roped K from the scratch (slot 7); (3) its sdpa-paged
+                    // twin, for steps with several sequences — the scratch holds
+                    // one sequence's keys. Mirrors the global
+                    // AttentionPrefillPaged steel_spans path.
                     let rope_sym =
                         crate::steel_paged::rope_once_steel_symbol(steel_dtype_tag, p.head_dim)
                             .expect(
@@ -5036,20 +5057,22 @@ fn lower_one(
                         .into_baked(),
                         gemm_dims: None,
                     };
-                    return Ok(vec![rope_cmd, attn_cmd]);
+                    // The sdpa path's constants: in-kernel rope, no steel
+                    // debug slot, no self-only gate.
+                    let per_row_constants =
+                        super::kernel_constants::AttentionPrefillPagedConstants {
+                            debug_mode: None,
+                            rope_on_read: ror_on,
+                            self_only: None,
+                            ..constants
+                        };
+                    let per_row =
+                        sdpa_paged_command(p, per_row_constants, bindings_for(false), bucket_m);
+                    return Ok(vec![rope_cmd, attn_cmd, per_row]);
                 }
                 attn_cmd
             } else {
-                match p.metal_dtype {
-                    crate::tape::lowered::MetalDtype::Bf16 => {
-                        LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(
-                            constants, bindings, dispatch,
-                        )
-                    }
-                    _ => LoweredCommand::for_kernel::<AttentionSdpaPagedF16>(
-                        constants, bindings, dispatch,
-                    ),
-                }
+                sdpa_paged_command(p, constants, bindings, bucket_m)
             }
         }
 
@@ -9469,7 +9492,10 @@ mod tests {
         use crate::tape::lowered::RuntimeGate::{
             OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode, UnlessTurboquantDecode,
         };
+        // K and V staged twice: the new rows, then the cached ones.
         let mut steps = vec![
+            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
+            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
             (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
             (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
             (KernelId::TqRotateRows, Some(OnlyIfTurboquantNotDecode)),
@@ -9671,19 +9697,37 @@ mod tests {
             rotations,
             [("tq_rotate_rows_bf16", 3), ("tq_unrotate_rows_bf16", 6)]
         );
-        // K then V staged, only K re-roping span blocks (cos_sin at slot 9).
-        let staged: Vec<bool> = tape
+        // K then V staged, only K re-roping span blocks (cos_sin at slot 9),
+        // the step's new rows (pass 1, slot 17) before the cached ones (pass 2).
+        let staged: Vec<(bool, Option<u32>)> = tape
             .commands
             .iter()
             .filter(|c| c.command.kernel == KernelId::TqStageRotated)
             .map(|c| {
-                c.command
+                let reropes = c
+                    .command
                     .bindings
                     .iter()
-                    .any(|b| matches!(b, Binding::Weight { .. }))
+                    .any(|b| matches!(b, Binding::Weight { .. }));
+                let pass = c
+                    .command
+                    .constants
+                    .iter()
+                    .find(|k| k.index == 17)
+                    .map(|k| k.bits);
+                (reropes, pass)
             })
             .collect();
-        assert_eq!(staged, [tp().rope_on_read, false]);
+        let ror = tp().rope_on_read;
+        assert_eq!(
+            staged,
+            [
+                (ror, Some(1)),
+                (false, Some(1)),
+                (ror, Some(2)),
+                (false, Some(2))
+            ]
+        );
 
         let twin = |tape: &LoweredMetalTape| {
             tape.commands
@@ -9697,6 +9741,65 @@ mod tests {
             twin(&tape) == twin(&decode_form),
             "the twin is the decode kernel's form of the same attention"
         );
+    }
+
+    /// The rope-once scratch holds one sequence's keys, so a prefill attention
+    /// that reads it runs only on single-sequence steps; a step with several
+    /// sequences runs its per-row twin, the sdpa-paged kernel reading K through
+    /// each sequence's own block-table row and roping it in-kernel (cos_sin).
+    /// Both keep their TurboQuant gate. Checked for the full and sliding arms.
+    #[test]
+    fn prefill_attention_reads_the_rope_once_scratch_only_for_one_sequence() {
+        use crate::tape::lowered::RuntimeGate::{
+            OnlyIfOneSequence, UnlessOneSequence, UnlessTurboquantDecode,
+        };
+        let p = MetalModelConsts {
+            rope_on_read: true,
+            sliding_window: 512,
+            ..tp()
+        };
+        let one = RuntimeGate::All(&[UnlessTurboquantDecode, OnlyIfOneSequence]);
+        let many = RuntimeGate::All(&[UnlessTurboquantDecode, UnlessOneSequence]);
+        for attention in [
+            Instruction::AttentionPrefillPaged(3, 6, 0, false),
+            Instruction::SlidingAttentionPrefillPaged(3, 6, 0, false),
+        ] {
+            let tape = lower_tq(&p, &[tq_writer(0, true, LLAMA_KV), attention], 64);
+            let own: Vec<&GatedCommand> = tape
+                .commands
+                .iter()
+                .filter(|c| c.gate == Some(one) || c.gate == Some(many))
+                .collect();
+            assert_eq!(
+                own.iter()
+                    .map(|c| (c.command.kernel, c.gate))
+                    .collect::<Vec<_>>(),
+                [
+                    (KernelId::RopeOnceSteel, Some(one)),
+                    (KernelId::AttentionPrefillSdpaPaged, Some(one)),
+                    (KernelId::AttentionPrefillSdpaPaged, Some(many)),
+                ],
+                "{attention:?}"
+            );
+            let binds =
+                |c: &GatedCommand, f: fn(&Binding) -> bool| c.command.bindings.iter().any(f);
+            let scratch = |b: &Binding| matches!(b, Binding::RopedKScratch { .. });
+            let cos_sin = |b: &Binding| {
+                matches!(
+                    b,
+                    Binding::Weight {
+                        kind: WeightBundleKind::RopeOnReadCosSin { .. },
+                        ..
+                    }
+                )
+            };
+            assert!(binds(own[1], scratch) && !binds(own[1], cos_sin));
+            assert!(!binds(own[2], scratch) && binds(own[2], cos_sin));
+            assert_eq!(
+                own[2].command.function,
+                "attention_prefill_sdpa_v2_paged_bf16_specialized"
+            );
+        }
     }
 
     /// Every binding of `cmd` bound at `index` or later, in order.
@@ -9806,14 +9909,16 @@ mod tests {
         assert_eq!(offsets(qwen2, decode, 1), want);
 
         let mut want = quantize.to_vec();
-        want.push((stage, vec![bias(0, 10)], vec![k_bias]));
-        want.push((stage, vec![bias(1, 10)], vec![v_bias]));
+        for _pass in 0..2 {
+            want.push((stage, vec![bias(0, 10)], vec![k_bias]));
+            want.push((stage, vec![bias(1, 10)], vec![v_bias]));
+        }
         want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
         assert_eq!(offsets(qwen2, prefill, 64), want);
 
         let centered = |kernel| (kernel, mode(0).to_vec(), vec![]);
         let mut want = vec![centered(q), centered(q)];
-        want.extend([(stage, vec![], vec![]), (stage, vec![], vec![])]);
+        want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));
         want.push((twin, vec![], vec![]));
         assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
     }
