@@ -590,20 +590,32 @@ pub enum RuntimeGate {
     /// Run only on a step with one sequence: the prefill attention that reads
     /// K from the rope-once scratch, which holds one sequence's keys.
     OnlyIfOneSequence,
-    /// Run only on a step with several sequences: the attention twin that
-    /// reads each sequence's K through its own block-table row.
+    /// Run only on a step with several sequences: the attention twins that
+    /// read each sequence's K through its own block-table row.
     UnlessOneSequence,
+    /// Run only on a step whose block tables hold an unrotated (bit-31, span)
+    /// block: the per-row attention twin that re-ropes K as it reads it.
+    OnlyIfUnrotatedBlocks,
+    /// Run unless the step's block tables hold an unrotated block: the
+    /// per-row attention twin that reads the cache's already-roped K as is.
+    UnlessUnrotatedBlocks,
     /// Run only when every gate in the list matches.
     All(&'static [RuntimeGate]),
 }
 
 impl RuntimeGate {
     /// `gate` narrowed by `and`: a command that already carries a gate keeps
-    /// it, and must now also match `and`.
-    pub fn and(gate: Option<RuntimeGate>, and: RuntimeGate) -> RuntimeGate {
-        match gate {
-            None => and,
-            Some(g) => RuntimeGate::All(baked(vec![g, and])),
+    /// it, and must now also match every gate in `and`.
+    pub fn and(gate: Option<RuntimeGate>, and: &[RuntimeGate]) -> RuntimeGate {
+        let mut all: Vec<RuntimeGate> = match gate {
+            None => Vec::new(),
+            Some(RuntimeGate::All(gs)) => gs.to_vec(),
+            Some(g) => vec![g],
+        };
+        all.extend_from_slice(and);
+        match all.as_slice() {
+            [only] => *only,
+            _ => RuntimeGate::All(baked(all)),
         }
     }
 }

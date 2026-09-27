@@ -1128,32 +1128,46 @@ fn inject_tq(
 }
 
 /// A paged prefill attention that reads K from the rope-once scratch runs only
-/// on single-sequence steps: the scratch holds one sequence's keys, staged
-/// from batch row 0. Its per-row twin (the attention arms emit it after the
-/// rope-once pair) runs on every other step. Every other command is left as
-/// it is.
+/// on single-sequence steps: the scratch holds one sequence's keys, staged from
+/// batch row 0. The attention arms emit two per-row twins after the rope-once
+/// pair, for steps with several sequences: one reading the cache's roped K as
+/// is, and one (binding cos_sin) re-roping unrotated span blocks as it reads,
+/// which only a step holding such a block needs. Every other command is left
+/// as it is.
 fn route_by_sequence_count(cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
-    use crate::tape::lowered::RuntimeGate::{self, OnlyIfOneSequence, UnlessOneSequence};
+    use crate::tape::lowered::RuntimeGate::{
+        self, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence, UnlessUnrotatedBlocks,
+    };
+    let binds = |c: &LoweredCommand, f: fn(&Binding) -> bool| c.bindings.iter().any(f);
+    let scratch = |b: &Binding| matches!(b, Binding::RopedKScratch { .. });
+    let cos_sin = |b: &Binding| {
+        matches!(
+            b,
+            Binding::Weight {
+                kind: WeightBundleKind::RopeOnReadCosSin { .. },
+                ..
+            }
+        )
+    };
     let reads_scratch = |c: &LoweredCommand| {
         matches!(
             c.kernel,
             KernelId::RopeOnceNax | KernelId::RopeOnceSteel | KernelId::RopeOnceGqaShared
-        ) || c
-            .bindings
-            .iter()
-            .any(|b| matches!(b, Binding::RopedKScratch { .. }))
+        ) || binds(c, scratch)
     };
     if !cmds.iter().any(|c| reads_scratch(&c.command)) {
         return cmds;
     }
     cmds.into_iter()
         .map(|c| {
-            let only = if reads_scratch(&c.command) {
-                OnlyIfOneSequence
-            } else if c.command.kernel == KernelId::AttentionPrefillSdpaPaged {
-                UnlessOneSequence
-            } else {
+            let only: &[RuntimeGate] = if reads_scratch(&c.command) {
+                &[OnlyIfOneSequence]
+            } else if c.command.kernel != KernelId::AttentionPrefillSdpaPaged {
                 return c;
+            } else if binds(&c.command, cos_sin) {
+                &[UnlessOneSequence, OnlyIfUnrotatedBlocks]
+            } else {
+                &[UnlessOneSequence, UnlessUnrotatedBlocks]
             };
             GatedCommand::gated(c.command, RuntimeGate::and(c.gate, only))
         })
@@ -4617,20 +4631,29 @@ fn lower_one(
             // shared `Binding::RopedKScratch` at slot 7 (the rope-once-to-scratch
             // pattern); they share the scratch-source binding flag.
             let roped_k_scratch = nax_spans || steel_spans || gqa_shared_spans;
-            // The attention's bindings with K from the rope-once scratch, or
-            // (`scratch == false`) from the cache with the in-kernel cos_sin
-            // rope.
-            let bindings_for =
-                |scratch: bool| super::kernel_bindings::AttentionPrefillPagedBindingSet {
+            // The attention's bindings: K from the rope-once scratch, or from
+            // the cache, with cos_sin to re-rope unrotated span blocks when
+            // `reropes`.
+            let bindings_for = |scratch: bool, reropes: bool| {
+                super::kernel_bindings::AttentionPrefillPagedBindingSet {
                     output: super::ids::ArenaSlotIdx(*out_slot),
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
-                    rope_on_read: if scratch { None } else { ror_bind },
+                    rope_on_read: if reropes { ror_bind } else { None },
                     nax_roped_k_scratch: scratch,
-                };
-            let bindings = bindings_for(roped_k_scratch);
-            // The per-row twin's constants: no steel debug slot, no scratch.
-            let per_row_constants = super::kernel_constants::AttentionPrefillPagedConstants {
+                }
+            };
+            let bindings = bindings_for(roped_k_scratch, !roped_k_scratch);
+            // The per-row twins' constants, neither reading the scratch: the
+            // plain twin reads the cache's roped K as is (rope-on-read off);
+            // the re-roping twin is sdpa-paged or gqa_shared (no steel debug
+            // slot), re-roping span blocks in-kernel.
+            let plain_constants = super::kernel_constants::AttentionPrefillPagedConstants {
+                rope_on_read: None,
+                k_scratch: None,
+                ..constants
+            };
+            let reroping_constants = super::kernel_constants::AttentionPrefillPagedConstants {
                 debug_mode: None,
                 k_scratch: None,
                 ..constants
@@ -4754,8 +4777,13 @@ fn lower_one(
                         .into_baked(),
                         gemm_dims: None,
                     };
-                    let per_row = sdpa_paged(per_row_constants, bindings_for(false));
-                    return Ok(vec![rope_cmd, attn_cmd, per_row]);
+                    let plain = LoweredCommand {
+                        constants: plain_constants.into_baked(),
+                        bindings: bindings_for(false, false).into_baked(),
+                        ..attn_cmd
+                    };
+                    let reroping = sdpa_paged(reroping_constants, bindings_for(false, true));
+                    return Ok(vec![rope_cmd, attn_cmd, plain, reroping]);
                 }
                 attn_cmd
             } else if use_gqa_shared {
@@ -4840,8 +4868,9 @@ fn lower_one(
                         .into_baked(),
                         gemm_dims: None,
                     };
-                    let per_row = gqa_shared(per_row_constants, bindings_for(false));
-                    return Ok(vec![rope_cmd, attn_cmd, per_row]);
+                    let plain = gqa_shared(plain_constants, bindings_for(false, false));
+                    let reroping = gqa_shared(reroping_constants, bindings_for(false, true));
+                    return Ok(vec![rope_cmd, attn_cmd, plain, reroping]);
                 }
                 attn_cmd
             } else {
@@ -4985,15 +5014,16 @@ fn lower_one(
             // does NOT bind cos_sin there; the non-spans path keeps the
             // in-kernel cos_sin binding. Sliding prefill uses the simdgroup
             // steel kernel (hd256), never NAX (hd128 only).
-            let bindings_for =
-                |scratch: bool| super::kernel_bindings::AttentionPrefillPagedBindingSet {
+            let bindings_for = |scratch: bool, reropes: bool| {
+                super::kernel_bindings::AttentionPrefillPagedBindingSet {
                     output: super::ids::ArenaSlotIdx(*out_slot),
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
-                    rope_on_read: if scratch { None } else { ror_bind },
+                    rope_on_read: if reropes { ror_bind } else { None },
                     nax_roped_k_scratch: scratch,
-                };
-            let bindings = bindings_for(steel_spans);
+                }
+            };
+            let bindings = bindings_for(steel_spans, !steel_spans);
             if use_steel {
                 let function = steel_symbol.expect("steel_symbol is Some when use_steel is true");
                 let attn_cmd = LoweredCommand {
@@ -5057,18 +5087,33 @@ fn lower_one(
                         .into_baked(),
                         gemm_dims: None,
                     };
-                    // The sdpa path's constants: in-kernel rope, no steel
-                    // debug slot, no self-only gate.
-                    let per_row_constants =
+                    // The plain twin reads the cache's roped K as is (no span
+                    // gate); the re-roping twin is sdpa-paged (in-kernel rope, no
+                    // steel debug slot).
+                    let plain = LoweredCommand {
+                        constants: super::kernel_constants::AttentionPrefillPagedConstants {
+                            rope_on_read: None,
+                            self_only: None,
+                            ..constants
+                        }
+                        .into_baked(),
+                        bindings: bindings_for(false, false).into_baked(),
+                        ..attn_cmd
+                    };
+                    let reroping_constants =
                         super::kernel_constants::AttentionPrefillPagedConstants {
                             debug_mode: None,
                             rope_on_read: ror_on,
                             self_only: None,
                             ..constants
                         };
-                    let per_row =
-                        sdpa_paged_command(p, per_row_constants, bindings_for(false), bucket_m);
-                    return Ok(vec![rope_cmd, attn_cmd, per_row]);
+                    let reroping = sdpa_paged_command(
+                        p,
+                        reroping_constants,
+                        bindings_for(false, true),
+                        bucket_m,
+                    );
+                    return Ok(vec![rope_cmd, attn_cmd, plain, reroping]);
                 }
                 attn_cmd
             } else {
@@ -9744,14 +9789,17 @@ mod tests {
     }
 
     /// The rope-once scratch holds one sequence's keys, so a prefill attention
-    /// that reads it runs only on single-sequence steps; a step with several
-    /// sequences runs its per-row twin, the sdpa-paged kernel reading K through
-    /// each sequence's own block-table row and roping it in-kernel (cos_sin).
-    /// Both keep their TurboQuant gate. Checked for the full and sliding arms.
+    /// that reads it runs only on single-sequence steps. A step with several
+    /// sequences runs a per-row twin reading K through each sequence's own
+    /// block-table row: the same kernel reading the cache's roped K as is, or,
+    /// when the step holds an unrotated span block, the sdpa-paged kernel
+    /// re-roping it (cos_sin). All keep their TurboQuant gate. Checked for the
+    /// full and sliding arms.
     #[test]
     fn prefill_attention_reads_the_rope_once_scratch_only_for_one_sequence() {
         use crate::tape::lowered::RuntimeGate::{
-            OnlyIfOneSequence, UnlessOneSequence, UnlessTurboquantDecode,
+            OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence, UnlessTurboquantDecode,
+            UnlessUnrotatedBlocks,
         };
         let p = MetalModelConsts {
             rope_on_read: true,
@@ -9759,7 +9807,16 @@ mod tests {
             ..tp()
         };
         let one = RuntimeGate::All(&[UnlessTurboquantDecode, OnlyIfOneSequence]);
-        let many = RuntimeGate::All(&[UnlessTurboquantDecode, UnlessOneSequence]);
+        let plain = RuntimeGate::All(&[
+            UnlessTurboquantDecode,
+            UnlessOneSequence,
+            UnlessUnrotatedBlocks,
+        ]);
+        let reroping = RuntimeGate::All(&[
+            UnlessTurboquantDecode,
+            UnlessOneSequence,
+            OnlyIfUnrotatedBlocks,
+        ]);
         for attention in [
             Instruction::AttentionPrefillPaged(3, 6, 0, false),
             Instruction::SlidingAttentionPrefillPaged(3, 6, 0, false),
@@ -9768,7 +9825,7 @@ mod tests {
             let own: Vec<&GatedCommand> = tape
                 .commands
                 .iter()
-                .filter(|c| c.gate == Some(one) || c.gate == Some(many))
+                .filter(|c| [one, plain, reroping].iter().any(|g| c.gate == Some(*g)))
                 .collect();
             assert_eq!(
                 own.iter()
@@ -9777,7 +9834,8 @@ mod tests {
                 [
                     (KernelId::RopeOnceSteel, Some(one)),
                     (KernelId::AttentionPrefillSdpaPaged, Some(one)),
-                    (KernelId::AttentionPrefillSdpaPaged, Some(many)),
+                    (KernelId::AttentionPrefillSdpaPaged, Some(plain)),
+                    (KernelId::AttentionPrefillSdpaPaged, Some(reroping)),
                 ],
                 "{attention:?}"
             );
@@ -9794,9 +9852,14 @@ mod tests {
                 )
             };
             assert!(binds(own[1], scratch) && !binds(own[1], cos_sin));
-            assert!(!binds(own[2], scratch) && binds(own[2], cos_sin));
+            assert!(!binds(own[2], scratch) && !binds(own[2], cos_sin));
+            assert!(!binds(own[3], scratch) && binds(own[3], cos_sin));
             assert_eq!(
-                own[2].command.function,
+                own[2].command.function, own[1].command.function,
+                "the plain twin is the scratch attention's own kernel"
+            );
+            assert_eq!(
+                own[3].command.function,
                 "attention_prefill_sdpa_v2_paged_bf16_specialized"
             );
         }
