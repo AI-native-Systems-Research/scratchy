@@ -492,16 +492,22 @@ pub fn qmm_t_kernel_static_name(
 
 /// Step token counts the small-M matrix-unit GEMM (`affine_qmm_small_m_*`)
 /// serves on NAX devices. Below, `qmv_fast`'s per-row weight re-reads cost
-/// no more than the matrix unit's padding; above, a second M tile re-reads
-/// the weights and NAX `qmm_t`'s 64-row tile wins (a 32-row tile loses
-/// too). Base M5, Llama-3.2-3B, weights streamed from memory: ~1.35×
-/// `qmv_fast` at 6 tokens and ~1.9× at 8; at 9–16 level with NAX `qmm_t` on
-/// the wide gate/up/down shapes, and ~15–20% lower decode TPOT at 16
-/// concurrent sequences end to end than routing them to `qmm_t`.
-pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 5..=16;
+/// no more than the matrix unit's padding (base M5, Granite-3.3-2B: 333 vs
+/// 346 µs of GEMM per layer at 3 tokens, 393 vs 343 at 4); above, a second
+/// M tile re-reads the weights and NAX `qmm_t`'s 64-row tile wins (a 32-row
+/// tile loses too).
+pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 4..=16;
 
-/// Output columns per small-M threadgroup (one simdgroup).
+/// Output columns per small-M threadgroup.
 pub const SMALL_M_TILE_COLS: u32 = 16;
+
+/// Simdgroups per small-M threadgroup, each summing its own share of the
+/// K groups: one simdgroup per 16 columns left too few loads in flight
+/// (Granite-3.3-2B's 512-wide k/v at 8 tokens: 23 µs vs 7 µs for
+/// `qmv_fast` at 1). Base M5, Granite-3.3-2B decode TPOT at 4 / 8 / 16
+/// sequences, ms: 1 → 21.5 / 24.5 / 34.2, 2 → 19.4 / 21.2 / 26.2,
+/// 4 → 17.4 / 19.4 / 25.5, 8 → 17.4 / 19.3 / 26.4.
+pub const SMALL_M_SIMDGROUPS: u32 = 4;
 
 /// Rows per small-M threadgroup: the whole batch in the buckets up to 8
 /// tokens, 16 in the larger ones.
@@ -531,7 +537,7 @@ impl SmallMTile {
     }
 }
 
-/// `affine_qmm_small_m_<act>_s_<scale>_gs_<gs>_b_4_tm_<rows>_tn_16_nsg_1`
+/// `affine_qmm_small_m_<act>_s_<scale>_gs_<gs>_b_4_tm_<rows>_tn_16_nsg_4`
 /// (`quantized_qmm_nax.metal`).
 pub fn small_m_kernel_static_name(
     dtype: DequantDtype,
@@ -552,7 +558,7 @@ pub fn small_m_kernel_static_name(
         .or_insert_with(|| {
             Box::leak(
                 format!(
-                    "affine_qmm_small_m_{}_s_{}_gs_{group_size}_b_4_tm_{}_tn_{SMALL_M_TILE_COLS}_nsg_1",
+                    "affine_qmm_small_m_{}_s_{}_gs_{group_size}_b_4_tm_{}_tn_{SMALL_M_TILE_COLS}_nsg_{SMALL_M_SIMDGROUPS}",
                     dtype.symbol_infix(),
                     scale_dtype.symbol_infix(),
                     tile.rows(),

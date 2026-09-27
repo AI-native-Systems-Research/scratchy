@@ -869,11 +869,13 @@ METAL_FUNC void gemm_t_nax_impl(
 //
 // The group sums `xs` of the tile's rows are staged in threadgroup memory
 // SMALL_M_XS_GROUPS groups at a time — a small footprint, so it doesn't cap
-// how many threadgroups a core holds. Buffers as
+// how many threadgroups a core holds. The NSG simdgroups split K: each runs
+// its own matmul over every NSG-th group, and their partial tiles are summed
+// through threadgroup memory. Buffers as
 // `affine_qmm_t_nax`: w[0], scales[1], biases[2], x[3], y[4]; K/N/M from
 // function constants 0/1/2. N % TN == 0 (static N slices skip bounds
-// checks — the lowering checks it); M rows are bounds-checked
-// (`dynamic_extent`). Grid: (N/TN, ceil(M/TM)), 32·NSG threads.
+// checks — the lowering checks it); M rows are bounds-checked. Grid:
+// (N/TN, ceil(M/TM)), 32·NSG threads.
 // ─────────────────────────────────────────────────────────────────
 
 MLX_MTL_CONST int SMALL_M_XS_GROUPS = 32;
@@ -886,7 +888,8 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
     const device T*        x      [[buffer(3)]],
     device T*              y      [[buffer(4)]],
     uint2 tgid [[threadgroup_position_in_grid]],
-    uint  tid  [[thread_index_in_threadgroup]])
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sg   [[simdgroup_index_in_threadgroup]])
 {
     using namespace mpp::tensor_ops;
     using Ext = dextents<int32_t, 2>;
@@ -899,15 +902,13 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
     using XB = tensor<device uint4b_format, Ext, tensor_inline>;
     XA A((device T*)x, Ext(K, M));
     XB B((typename XB::data_handle_type)w, Ext(K, N));
-    tensor<device T, Ext, tensor_inline> C(y, Ext(N, M));
     constexpr auto desc =
         matmul2d_descriptor(TM, TN, G, false, true, false, matmul2d_descriptor::mode::multiply);
-    matmul2d<desc, execution_simdgroups<NSG>> op;
+    matmul2d<desc, execution_simdgroups<1>> op;
     auto sA0 = A.template slice<G, dynamic_extent>(0, row0);
     auto sB0 = B.template slice<G, TN>(0, col0);
     auto part = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), float>();
     auto acc = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), float>();
-    auto out = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), T>();
     _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
         if (acc.is_valid_element(i)) acc[i] = 0.0f;
     }
@@ -925,7 +926,7 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
             xs[m * SMALL_M_XS_GROUPS + gg] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int gg = 0; gg < chunk; ++gg) {
+        for (int gg = int(sg); gg < chunk; gg += NSG) {
             const int g = g0 + gg;
             auto sA = A.template slice<G, dynamic_extent>(g * G, row0);
             auto sB = B.template slice<G, TN>(g * G, col0);
@@ -943,11 +944,22 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
             }
         }
     }
+    threadgroup float red[NSG * TM * TN];
     _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
-        if (acc.is_valid_element(i)) out[i] = T(acc[i]);
+        if (acc.is_valid_element(i)) {
+            const auto idx = acc.get_multidimensional_index(i);
+            red[(int(sg) * TM + idx[1]) * TN + idx[0]] = acc[i];
+        }
     }
-    auto mC = C.template slice<TN, dynamic_extent>(col0, row0);
-    out.store(mC);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = int(tid); e < rows * TN; e += NSG * 32) {
+        const int m = e / TN, n = e % TN;
+        float sum = 0.0f;
+        for (int j = 0; j < NSG; ++j) {
+            sum += red[(j * TM + m) * TN + n];
+        }
+        y[(row0 + m) * N + col0 + n] = T(sum);
+    }
 }
 
 #define INST_QMM_SMALL_M(act_tag, act_type, scale_tag, scale_type, gs, tm, tn, nsg)          \
@@ -961,14 +973,15 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
         const device act_type*   x      [[buffer(3)]],                                    \
         device act_type*         y      [[buffer(4)]],                                    \
         uint2 tgid [[threadgroup_position_in_grid]],                                      \
-        uint  tid  [[thread_index_in_threadgroup]]);
+        uint  tid  [[thread_index_in_threadgroup]],                                       \
+        uint  sg   [[simdgroup_index_in_threadgroup]]);
 
-// 16 columns, one simdgroup: the best (or tied) tile at 5–16 rows on the
-// Llama-3.2-3B gate/up and down shapes, over 32/1 and 64/2 — the narrow
-// tile keeps enough threadgroups in flight on narrow layers.
+// 16 columns, 4 simdgroups (`quantized::SMALL_M_SIMDGROUPS`): the 16-column
+// tile keeps enough threadgroups in flight on narrow layers, and splitting K
+// four ways keeps enough loads in flight in each.
 #define INST_QMM_SMALL_M_TILES(act_tag, act_type, scale_tag, scale_type, gs)             \
-    INST_QMM_SMALL_M(act_tag, act_type, scale_tag, scale_type, gs, 8, 16, 1)             \
-    INST_QMM_SMALL_M(act_tag, act_type, scale_tag, scale_type, gs, 16, 16, 1)
+    INST_QMM_SMALL_M(act_tag, act_type, scale_tag, scale_type, gs, 8, 16, 4)             \
+    INST_QMM_SMALL_M(act_tag, act_type, scale_tag, scale_type, gs, 16, 16, 4)
 
 #define INST_QMM_SMALL_M_GS(act_tag, act_type, scale_tag, scale_type)                    \
     INST_QMM_SMALL_M_TILES(act_tag, act_type, scale_tag, scale_type, 32)                 \

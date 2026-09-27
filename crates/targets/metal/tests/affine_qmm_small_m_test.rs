@@ -180,7 +180,7 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
             depth: 1,
         },
         MTLSize {
-            width: 32,
+            width: 32 * scratchy_target_metal::quantized::SMALL_M_SIMDGROUPS as usize,
             height: 1,
             depth: 1,
         },
@@ -236,7 +236,7 @@ fn small_m_eight_row_tile_across_dtypes_and_group_sizes() {
             (Dtype::F16, Dtype::Bf16),
         ] {
             for group_size in [32, 64, 128] {
-                for m in [5, 8] {
+                for m in [4, 8] {
                     run(
                         device,
                         cache,
@@ -258,11 +258,12 @@ fn small_m_eight_row_tile_across_dtypes_and_group_sizes() {
 }
 
 /// The 16-row tile in the 64-token bucket: a partial tile and a full one
-/// (the routed range), and two tiles.
+/// (the routed range), and two tiles. K = 896 (Qwen2.5-0.5B's hidden size)
+/// is 14 groups of 64, which the tile's simdgroups split unevenly.
 #[test]
 fn small_m_sixteen_row_tile() {
     with_nax(|device, cache| {
-        for m in [9, 13, 16, 32] {
+        for (m, k) in [(9, 3072), (13, 3072), (16, 3072), (32, 3072), (13, 896)] {
             run(
                 device,
                 cache,
@@ -273,7 +274,7 @@ fn small_m_sixteen_row_tile() {
                     m,
                     bucket_m: 64,
                     n: 512,
-                    k: 3072,
+                    k,
                     tile: SmallMTile::Rows16,
                 },
             );
