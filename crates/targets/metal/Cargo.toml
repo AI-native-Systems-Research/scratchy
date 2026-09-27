@@ -61,6 +61,8 @@ objc2-metal = { version = "0.3", features = [
     "MTL4ComputePipeline",
 ] }
 objc2-foundation = "0.3"
+# `device::gpu_cores` reads the GPU core count from the IO registry.
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFNumber", "CFString"] }
 dispatch2 = "0.3"
 half = "2.3"
 serde = { version = "1.0", features = ["derive"] }

@@ -264,6 +264,10 @@ u32_newtype!(
     /// Query heads one TurboQuant decode threadgroup covers
     /// (`attention.metal` `ATTN_TQ_HEADS`, slot 16) — see [`TqDecodeHeads::for_group`].
     TqDecodeHeads,
+    /// The GPU cores of the device a tape runs on, read at load
+    /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
+    /// one chip name ships with several core counts (an M1 Max has 24 or 32).
+    GpuCores,
 );
 
 impl TqDecodeHeads {
@@ -292,9 +296,9 @@ impl TqDecodeHeads {
         head_dim: HeadDim,
         num_q_heads: NumQHeads,
         num_kv_heads: NumKvHeads,
-        gpu_cores: u32,
+        gpu_cores: GpuCores,
     ) -> Self {
-        let min_threadgroups = gpu_cores * 4 / 5;
+        let min_threadgroups = gpu_cores.get() * 4 / 5;
         Self::candidates(head_dim, num_q_heads, num_kv_heads)
             .filter(|h| num_q_heads.get() / h.get() >= min_threadgroups)
             .last()

@@ -275,12 +275,20 @@ pub struct AttentionViaCacheTqConstants {
     pub heads: TqDecodeHeads,
 }
 
+impl AttentionViaCacheTqConstants {
+    /// `ATTN_TQ_HEADS`, the slot of [`Self::heads`].
+    pub const HEADS: ConstSlot = ConstSlot(16);
+}
+
 impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
     fn from(c: AttentionViaCacheTqConstants) -> Self {
         let mut v = vec![ConstantValue::uint(ConstSlot(13), c.bits.get())];
         v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
-        v.push(ConstantValue::uint(ConstSlot(16), c.heads.get()));
+        v.push(ConstantValue::uint(
+            AttentionViaCacheTqConstants::HEADS,
+            c.heads.get(),
+        ));
         v
     }
 }

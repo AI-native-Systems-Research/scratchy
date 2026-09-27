@@ -28,9 +28,6 @@ pub struct MetalTargetProfile {
     /// Architecture generation (M1/M2/M3/M4)
     pub generation: AppleSiliconGen,
 
-    /// Number of GPU cores
-    pub gpu_cores: u32,
-
     /// Peak TFLOPS for FP16 operations
     pub peak_tflops_fp16: f64,
 
@@ -50,7 +47,6 @@ pub struct MetalTargetProfile {
 /// M1 device profile (base model, 8 GPU cores)
 pub const M1_8CORE: MetalTargetProfile = MetalTargetProfile {
     generation: AppleSiliconGen::M1,
-    gpu_cores: 8,
     peak_tflops_fp16: 2.6,
     memory_bandwidth_gbps: 68.25,
     unified_memory_gb: 16,
@@ -61,7 +57,6 @@ pub const M1_8CORE: MetalTargetProfile = MetalTargetProfile {
 /// M1 Max device profile (32 GPU cores)
 pub const M1_MAX: MetalTargetProfile = MetalTargetProfile {
     generation: AppleSiliconGen::M1,
-    gpu_cores: 32,
     peak_tflops_fp16: 10.4,
     memory_bandwidth_gbps: 400.0,
     unified_memory_gb: 64,
@@ -72,7 +67,6 @@ pub const M1_MAX: MetalTargetProfile = MetalTargetProfile {
 /// M2 device profile (10 GPU cores)
 pub const M2_10CORE: MetalTargetProfile = MetalTargetProfile {
     generation: AppleSiliconGen::M2,
-    gpu_cores: 10,
     peak_tflops_fp16: 3.6,
     memory_bandwidth_gbps: 100.0,
     unified_memory_gb: 24,
@@ -83,7 +77,6 @@ pub const M2_10CORE: MetalTargetProfile = MetalTargetProfile {
 /// M3 device profile (base model, 10 GPU cores)
 pub const M3_10CORE: MetalTargetProfile = MetalTargetProfile {
     generation: AppleSiliconGen::M3,
-    gpu_cores: 10,
     peak_tflops_fp16: 4.0,
     memory_bandwidth_gbps: 100.0,
     unified_memory_gb: 24,
@@ -94,7 +87,6 @@ pub const M3_10CORE: MetalTargetProfile = MetalTargetProfile {
 /// M4 device profile (10 GPU cores)
 pub const M4_10CORE: MetalTargetProfile = MetalTargetProfile {
     generation: AppleSiliconGen::M4,
-    gpu_cores: 10,
     peak_tflops_fp16: 4.5,
     memory_bandwidth_gbps: 120.0,
     unified_memory_gb: 24,
@@ -111,7 +103,6 @@ pub const M4_10CORE: MetalTargetProfile = MetalTargetProfile {
 /// correctness.
 pub const M5_10CORE: MetalTargetProfile = MetalTargetProfile {
     generation: AppleSiliconGen::M5,
-    gpu_cores: 10,
     peak_tflops_fp16: 5.0,
     memory_bandwidth_gbps: 150.0,
     unified_memory_gb: 24,
@@ -172,8 +163,6 @@ mod tests {
     #[allow(clippy::assertions_on_constants)] // deliberate const sanity checks on the profile tables
     fn test_profile_constants() {
         assert_eq!(M1_8CORE.generation, AppleSiliconGen::M1);
-        assert_eq!(M1_8CORE.gpu_cores, 8);
-        assert_eq!(M2_10CORE.gpu_cores, 10);
         assert!(M3_10CORE.peak_tflops_fp16 > M2_10CORE.peak_tflops_fp16);
     }
 }

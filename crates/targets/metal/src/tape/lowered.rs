@@ -1734,7 +1734,8 @@ pub struct ScratchPatch {
 /// expansion for a `(generation class, chunked addressing)` pair, with
 /// block-capacity dependence expressed as patches. The pool picks the
 /// matching variant at load and [`Self::materialize`]s it with the
-/// runtime capacity — selection and substitution only, no analysis.
+/// runtime capacity and the device's TurboQuant decode heads — selection
+/// and substitution only, no analysis.
 #[derive(Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ClassedTape {
     pub gen_class: GenClass,
@@ -1759,62 +1760,68 @@ fn patched(floor: u32, base: i64, num: i64, den: u32, round_up: bool, cap: u32) 
 }
 
 impl ClassedTape {
-    /// Substitute the runtime block-table capacity into the baked tape.
-    /// The ONE permitted load-time `baked` site: commands
-    /// whose constants carry a capacity patch are copied once per model
-    /// load; everything else stays the macro-emitted static.
-    pub fn materialize(&self, cap: u32) -> LoweredMetalTape {
+    /// Substitute the runtime block-table capacity, and the query heads
+    /// each TurboQuant decode threadgroup serves on this device
+    /// ([`crate::tape::lowering::serve_tq_decode_heads`]), into the baked
+    /// tape. The ONE permitted load-time `baked` site: the commands are
+    /// copied once per model load.
+    pub fn materialize(
+        &self,
+        cap: u32,
+        tq_heads: crate::tape::ids::TqDecodeHeads,
+    ) -> LoweredMetalTape {
         let mut tape = self.tape;
-        if !self.const_patches.is_empty() {
-            let mut commands: Vec<GatedCommand> = self.tape.commands.to_vec();
-            for p in self.const_patches {
-                let cmd = &mut commands[p.cmd_idx as usize];
-                let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
-                match p.target {
-                    PatchTarget::Constant(i) => {
-                        let mut consts = cmd.command.constants.to_vec();
-                        consts[i as usize].bits = v;
-                        cmd.command.constants = baked(consts);
-                    }
-                    PatchTarget::Threadgroups(ax) => {
-                        let tg = &mut cmd.command.dispatch.threadgroups;
-                        match ax {
-                            0 => tg.0 = v,
-                            1 => tg.1 = v,
-                            _ => tg.2 = v,
-                        }
-                    }
-                    PatchTarget::ThreadsPerThreadgroup(ax) => {
-                        let t = &mut cmd.command.dispatch.threads_per_threadgroup;
-                        match ax {
-                            0 => t.0 = v,
-                            1 => t.1 = v,
-                            _ => t.2 = v,
-                        }
-                    }
-                    PatchTarget::MScalingBucketM => {
-                        let ms = cmd
-                            .command
-                            .dispatch
-                            .m_scaling
-                            .as_mut()
-                            .expect("MScalingBucketM patch on a command without m_scaling");
-                        ms.bucket_m = crate::tape::ids::BucketM(v);
-                    }
-                    PatchTarget::AttnScratchOffset(bi) => {
-                        let mut binds = cmd.command.bindings.to_vec();
-                        match &mut binds[bi as usize] {
-                            Binding::AttnUnfusedScratch { offset, .. } => *offset = v,
-                            other => {
-                                panic!("AttnScratchOffset patch on non-scratch binding {other:?}")
-                            }
-                        }
-                        cmd.command.bindings = baked(binds);
+        let mut commands: Vec<GatedCommand> = self.tape.commands.to_vec();
+        for p in self.const_patches {
+            let cmd = &mut commands[p.cmd_idx as usize];
+            let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
+            match p.target {
+                PatchTarget::Constant(i) => {
+                    let mut consts = cmd.command.constants.to_vec();
+                    consts[i as usize].bits = v;
+                    cmd.command.constants = baked(consts);
+                }
+                PatchTarget::Threadgroups(ax) => {
+                    let tg = &mut cmd.command.dispatch.threadgroups;
+                    match ax {
+                        0 => tg.0 = v,
+                        1 => tg.1 = v,
+                        _ => tg.2 = v,
                     }
                 }
+                PatchTarget::ThreadsPerThreadgroup(ax) => {
+                    let t = &mut cmd.command.dispatch.threads_per_threadgroup;
+                    match ax {
+                        0 => t.0 = v,
+                        1 => t.1 = v,
+                        _ => t.2 = v,
+                    }
+                }
+                PatchTarget::MScalingBucketM => {
+                    let ms = cmd
+                        .command
+                        .dispatch
+                        .m_scaling
+                        .as_mut()
+                        .expect("MScalingBucketM patch on a command without m_scaling");
+                    ms.bucket_m = crate::tape::ids::BucketM(v);
+                }
+                PatchTarget::AttnScratchOffset(bi) => {
+                    let mut binds = cmd.command.bindings.to_vec();
+                    match &mut binds[bi as usize] {
+                        Binding::AttnUnfusedScratch { offset, .. } => *offset = v,
+                        other => {
+                            panic!("AttnScratchOffset patch on non-scratch binding {other:?}")
+                        }
+                    }
+                    cmd.command.bindings = baked(binds);
+                }
             }
-            tape.commands = baked(commands);
         }
+        for cmd in &mut commands {
+            crate::tape::lowering::serve_tq_decode_heads(&mut cmd.command, tq_heads);
+        }
+        tape.commands = baked(commands);
         for p in self.scratch_patches {
             let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
             match p.field {
