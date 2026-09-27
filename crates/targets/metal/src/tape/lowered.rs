@@ -465,6 +465,105 @@ pub enum KernelId {
     AttentionViaCacheTq,
 }
 
+/// Which sequences of a step a command computes correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeqScope {
+    /// Every sequence: the kernel works token by token, or finds each
+    /// sequence's rows through `cu_seqlens_q` and its own block-table row.
+    AllRows,
+    /// Batch row 0 only: the kernel, or a scratch it binds, holds one
+    /// sequence's state (`seq_used[0]`, `cu_seqlens_q[1] - cu_seqlens_q[0]`,
+    /// or keys staged from row 0). The lowering runs such a command on
+    /// single-sequence steps only, beside a per-row twin for the rest.
+    RowZero,
+}
+
+impl KernelId {
+    /// No wildcard arm: a new kernel must say whether it reads every sequence.
+    pub const fn seq_scope(self) -> SeqScope {
+        match self {
+            Self::RopeOnceNax
+            | Self::RopeOnceSteel
+            | Self::RopeOnceGqaShared
+            | Self::AttnGatherKRope
+            | Self::AttnGatherVCopyT
+            | Self::AttnCausalSoftmax
+            | Self::AttnGemmQk
+            | Self::AttnGemmPv => SeqScope::RowZero,
+            Self::Embed
+            | Self::RmsNorm
+            | Self::RmsNormUnit
+            | Self::ScalarWeightMul
+            | Self::NormAddScalarMul
+            | Self::RopeAppendNormed
+            | Self::FusedAddRmsNorm
+            | Self::Gemm
+            | Self::FusedGateUpSiluMul
+            | Self::RopeAppend
+            | Self::FusedQkvRopeCache
+            | Self::FusedAffineQkvRopeCache
+            | Self::AttentionViaCache
+            | Self::AttentionPrefillSdpaPaged
+            | Self::AttnQConvert
+            | Self::AttnOConvert
+            | Self::ScalarMul
+            | Self::TanhSoftCap
+            | Self::Add
+            | Self::BiasAdd
+            | Self::Reshape
+            | Self::AffineQmvQuad
+            | Self::AffineQmvFast
+            | Self::AffineQmv
+            | Self::AffineQmmT
+            | Self::AffineGatherQmmT
+            | Self::AffineGatherQmmTNax
+            | Self::AffineQmmTSplitK
+            | Self::AffineQmmTNax
+            | Self::AffineQmmSmallM
+            | Self::Nvfp4Qmv
+            | Self::Nvfp4QmmT
+            | Self::Nvfp4QmmTNax
+            | Self::SiluMul
+            | Self::GeluMul
+            | Self::GateApply
+            | Self::GateScale
+            | Self::GateSplit
+            | Self::GatedDeltaNet
+            | Self::SplitKReduceSum
+            | Self::AffineEmbed
+            | Self::SynthPreAttn
+            | Self::SynthMlpPreDown
+            | Self::SynthGateUpSiluMul
+            | Self::GatherLastToken
+            | Self::ScatterFirstToLastRow
+            | Self::Softmax
+            | Self::ArgPartitionTopK
+            | Self::TakeAlongAxis
+            | Self::SliceTrailingColsU32
+            | Self::AffineGatherQmvFast
+            | Self::AffineGatherQmv
+            | Self::MoeWeightedSum
+            | Self::MoeGroupOffsets
+            | Self::MoeGroupInit
+            | Self::MoeGroupScatter
+            | Self::MoeGroupGather
+            | Self::MoePerExpertScale
+            | Self::VisionLayerNorm
+            | Self::VisionRope
+            | Self::VisionVarlenAttn
+            | Self::EmbeddingGather
+            | Self::AvgPool2d
+            | Self::VisionGelu
+            | Self::VisionLoadPixels
+            | Self::MmEmbedSplice
+            | Self::TqStageRotated
+            | Self::TqRotateRows
+            | Self::TqQuantizeToPacked
+            | Self::AttentionViaCacheTq => SeqScope::AllRows,
+        }
+    }
+}
+
 /// `MetalDtype` relocated to the cfg-free `scratchy-tensors` core so
 /// the `scratchy-ir` `CanonicalParams::METAL_DTYPE` const can name
 /// it. Re-exported here so `crate::tape::MetalDtype` (the
@@ -1258,6 +1357,19 @@ impl LoweredCommand {
             gemm_dims: None,
         }
     }
+
+    /// Row zero if its kernel or any buffer it binds is.
+    pub fn seq_scope(&self) -> SeqScope {
+        match self
+            .bindings
+            .iter()
+            .map(|b| b.seq_scope())
+            .find(|s| *s == SeqScope::RowZero)
+        {
+            Some(row_zero) => row_zero,
+            None => self.kernel.seq_scope(),
+        }
+    }
 }
 
 /// A lowered command fused with its runtime gate.
@@ -1435,6 +1547,20 @@ impl Binding {
             | Self::AttnUnfusedScratch { .. }
             | Self::Inline { .. }
             | Self::MoeScratch { .. } => self,
+        }
+    }
+
+    /// The rope-once and unfused-attention scratches hold one sequence's keys.
+    pub const fn seq_scope(self) -> SeqScope {
+        match self {
+            Self::RopedKScratch { .. } | Self::AttnUnfusedScratch { .. } => SeqScope::RowZero,
+            Self::ArenaSlot { .. }
+            | Self::Source { .. }
+            | Self::Weight { .. }
+            | Self::Runtime { .. }
+            | Self::Scratch { .. }
+            | Self::Inline { .. }
+            | Self::MoeScratch { .. } => SeqScope::AllRows,
         }
     }
 }
@@ -1632,6 +1758,10 @@ pub enum LoweringError {
     /// KV operand it compresses — quantizing without removing it would let the
     /// offset's norm, not the signal's, set the codec's error.
     TurboQuantOffsetUnbound { index: usize, missing: TqUnbound },
+    /// A command computes batch row 0 only ([`SeqScope::RowZero`]) and its
+    /// instruction has no per-row twin re-roping span blocks, so some step with
+    /// several sequences would run no attention, or row 0's for every sequence.
+    RowZeroWithoutPerRowTwin { index: usize, kernel: KernelId },
 }
 
 /// What a TurboQuant codec command at [`LoweringError::TurboQuantOffsetUnbound`]
@@ -1670,6 +1800,12 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
                  operand's additive offset ({missing:?} missing)"
+            ),
+            Self::RowZeroWithoutPerRowTwin { index, kernel } => write!(
+                f,
+                "lowering: `{kernel:?}` at tape index {index} computes sequence 0 only, and \
+                 the instruction has no per-row twin re-roping span blocks for steps with \
+                 several sequences"
             ),
         }
     }

@@ -1127,51 +1127,61 @@ fn inject_tq(
     Ok(out)
 }
 
-/// A paged prefill attention that reads K from the rope-once scratch runs only
-/// on single-sequence steps: the scratch holds one sequence's keys, staged from
-/// batch row 0. The attention arms emit two per-row twins after the rope-once
-/// pair, for steps with several sequences: one reading the cache's roped K as
-/// is, and one (binding cos_sin) re-roping unrotated span blocks as it reads,
-/// which only a step holding such a block needs. Every other command is left
-/// as it is.
-fn route_by_sequence_count(cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
+/// A command that computes batch row 0 only ([`SeqScope::RowZero`]: the
+/// rope-once pair, whose scratch holds one sequence's keys, and the hd512
+/// unfused attention) runs on single-sequence steps only. The instruction's
+/// per-row paged attentions serve steps with several sequences: one reading
+/// the cache's roped K as is takes the steps without unrotated span blocks,
+/// and one binding cos_sin, re-roping those blocks as it reads, takes the rest
+/// (or every such step, when it is alone). An instruction with a row-zero
+/// command and no re-roping per-row twin is refused. Every other command is
+/// left as it is.
+fn route_by_sequence_count(
+    index: usize,
+    cmds: Vec<GatedCommand>,
+) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{
         self, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence, UnlessUnrotatedBlocks,
     };
-    let binds = |c: &LoweredCommand, f: fn(&Binding) -> bool| c.bindings.iter().any(f);
-    let scratch = |b: &Binding| matches!(b, Binding::RopedKScratch { .. });
-    let cos_sin = |b: &Binding| {
-        matches!(
-            b,
-            Binding::Weight {
-                kind: WeightBundleKind::RopeOnReadCosSin { .. },
-                ..
-            }
-        )
+    use crate::tape::lowered::SeqScope::{AllRows, RowZero};
+    let Some(row_zero) = cmds.iter().find(|c| c.command.seq_scope() == RowZero) else {
+        return Ok(cmds);
     };
-    let reads_scratch = |c: &LoweredCommand| {
-        matches!(
-            c.kernel,
-            KernelId::RopeOnceNax | KernelId::RopeOnceSteel | KernelId::RopeOnceGqaShared
-        ) || binds(c, scratch)
+    let per_row = |c: &LoweredCommand| {
+        c.kernel == KernelId::AttentionPrefillSdpaPaged && c.seq_scope() == AllRows
     };
-    if !cmds.iter().any(|c| reads_scratch(&c.command)) {
-        return cmds;
+    let reropes = |c: &LoweredCommand| {
+        c.bindings.iter().any(|b| {
+            matches!(
+                b,
+                Binding::Weight {
+                    kind: WeightBundleKind::RopeOnReadCosSin { .. },
+                    ..
+                }
+            )
+        })
+    };
+    let twins = || cmds.iter().map(|c| &c.command).filter(|c| per_row(c));
+    if !twins().any(reropes) {
+        return Err(LoweringError::RowZeroWithoutPerRowTwin {
+            index,
+            kernel: row_zero.command.kernel,
+        });
     }
-    cmds.into_iter()
+    let plain = twins().any(|c| !reropes(c));
+    Ok(cmds
+        .into_iter()
         .map(|c| {
-            let only: &[RuntimeGate] = if reads_scratch(&c.command) {
-                &[OnlyIfOneSequence]
-            } else if c.command.kernel != KernelId::AttentionPrefillSdpaPaged {
-                return c;
-            } else if binds(&c.command, cos_sin) {
-                &[UnlessOneSequence, OnlyIfUnrotatedBlocks]
-            } else {
-                &[UnlessOneSequence, UnlessUnrotatedBlocks]
+            let only: &[RuntimeGate] = match c.command.seq_scope() {
+                RowZero => &[OnlyIfOneSequence],
+                AllRows if !per_row(&c.command) => return c,
+                AllRows if !reropes(&c.command) => &[UnlessOneSequence, UnlessUnrotatedBlocks],
+                AllRows if plain => &[UnlessOneSequence, OnlyIfUnrotatedBlocks],
+                AllRows => &[UnlessOneSequence],
             };
             GatedCommand::gated(c.command, RuntimeGate::and(c.gate, only))
         })
-        .collect()
+        .collect())
 }
 
 /// On a NAX device, the small-M matrix-unit twin of an MLX-affine 4-bit
@@ -1482,7 +1492,7 @@ pub fn lower(
                     |missing| LoweringError::TurboQuantOffsetUnbound { index: i, missing },
                 )?;
                 let cmds = route_small_m(p, other, tq, bucket_m, tape_index, i, profile);
-                let cmds = route_by_sequence_count(cmds);
+                let cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(p, other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
@@ -4199,8 +4209,13 @@ fn lower_one(
                  lq!=kv_len handling and re-validating gemma-4-12b at >2048 tokens. \
                  Bisect: 2f6bc04d good, be0079d3 broken."
             );
+            // The unfused kernels read sequence 0 only (`seq_used[0]`,
+            // `cu_seqlens_q[1] - cu_seqlens_q[0]`): they serve single-sequence
+            // steps, and the paged attention below the rest.
             #[allow(clippy::overly_complex_bool_expr)]
-            if HD512_UNFUSED_CONTINUATION_OK && p.global_head_dim > 256 && p.rope_on_read {
+            let hd512_unfused =
+                HD512_UNFUSED_CONTINUATION_OK && p.global_head_dim > 256 && p.rope_on_read;
+            let unfused = if hd512_unfused {
                 use crate::specialized_pipeline_cache::ConstantValue as CV;
                 let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
                 let (rd, po, _on, _bind) = rope_on_read_params(p, true);
@@ -4464,8 +4479,10 @@ fn lower_one(
                     ]),
                     gemm_dims: None,
                 });
-                return Ok(cmds);
-            }
+                Some(cmds)
+            } else {
+                None
+            };
             // Steel-attention paged kernel — MLX FA-2 algorithm with
             // simdgroup_matrix MMAs (BQ=32, BK=16, BD=128, WM=4). Wins
             // big over the sdpa_vector port for prefill, but at small
@@ -4563,7 +4580,10 @@ fn lower_one(
             // and the attention reads pre-roped K (slot 7 = scratch, ATTN_K_SCRATCH
             // set) with no per-tile smem rotation. The gqa_shared twin of
             // nax_spans/steel_spans below.
-            let gqa_shared_spans = use_gqa_shared && p.rope_on_read;
+            // No rope-once pair where the unfused attention serves
+            // single-sequence steps.
+            let rope_once = p.rope_on_read && unfused.is_none();
+            let gqa_shared_spans = use_gqa_shared && rope_once;
             let constants = super::kernel_constants::AttentionPrefillPagedConstants {
                 // Paged prefill attends the whole cached sequence on a
                 // continuation chunk → FullSeqUsed. Resolved once here; the
@@ -4625,8 +4645,8 @@ fn lower_one(
             // row and re-roping flagged (bit-31) blocks in-kernel — sdpa-paged
             // for steel/NAX, gqa_shared without the scratch for gqa_shared.
             // `route_by_sequence_count` attaches the gates.
-            let nax_spans = use_nax && p.rope_on_read;
-            let steel_spans = use_steel && !use_nax && p.rope_on_read;
+            let nax_spans = use_nax && rope_once;
+            let steel_spans = use_steel && !use_nax && rope_once;
             // NAX, simdgroup steel, and gqa_shared all read pre-roped K from the
             // shared `Binding::RopedKScratch` at slot 7 (the rope-once-to-scratch
             // pattern); they share the scratch-source binding flag.
@@ -4670,7 +4690,7 @@ fn lower_one(
             // T=2930. Gated to gqa >= 8 so low-GQA arches keep the proven
             // sdpa_vector path. (`gqa` / `use_gqa_shared` / `gqa_shared_spans`
             // were computed above so `constants.k_scratch` could be set.)
-            if use_steel {
+            let attention = if use_steel {
                 // Symbol came from the codegen'd table above
                 // (`steel_symbol.is_some()` is the gate). Build the
                 // command directly instead of going through
@@ -4875,6 +4895,13 @@ fn lower_one(
                 attn_cmd
             } else {
                 sdpa_paged(constants, bindings)
+            };
+            match unfused {
+                Some(mut cmds) => {
+                    cmds.push(attention);
+                    return Ok(cmds);
+                }
+                None => attention,
             }
         }
 
@@ -9863,6 +9890,89 @@ mod tests {
                 "attention_prefill_sdpa_v2_paged_bf16_specialized"
             );
         }
+    }
+
+    /// Gemma-4's hd512 global prefill runs the unfused attention, whose kernels
+    /// read sequence 0 only, on single-sequence steps, and on the rest a paged
+    /// attention re-roping span blocks as it reads: gqa_shared at a GQA ratio it
+    /// takes, sdpa-paged otherwise. Neither needs a rope-once pair or scratch.
+    #[test]
+    fn hd512_unfused_prefill_runs_only_for_one_sequence() {
+        use crate::tape::lowered::RuntimeGate::{
+            OnlyIfOneSequence, UnlessOneSequence, UnlessTurboquantDecode,
+        };
+        use crate::tape::lowered::SeqScope;
+        let one = RuntimeGate::All(&[UnlessTurboquantDecode, OnlyIfOneSequence]);
+        let rest = RuntimeGate::All(&[UnlessTurboquantDecode, UnlessOneSequence]);
+        for (kv_heads, per_row) in [
+            (2, "attention_prefill_sdpa_gqa_shared_bf16_specialized"),
+            (16, "attention_prefill_sdpa_v2_paged_bf16_specialized"),
+        ] {
+            let p = MetalModelConsts {
+                rope_on_read: true,
+                global_head_dim: 512,
+                num_global_kv_heads: kv_heads,
+                global_block_size: 32,
+                global_rot_dim: 128,
+                ..tp()
+            };
+            let attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
+            let tape = lower_tq(&p, &[tq_writer(0, true, LLAMA_KV), attention], 64);
+            let gated = |g: RuntimeGate| {
+                tape.commands
+                    .iter()
+                    .filter(move |c| c.gate == Some(g))
+                    .map(|c| c.command)
+            };
+            assert!(gated(one).any(|c| c.kernel == KernelId::AttnGatherKRope));
+            assert!(gated(one).all(|c| c.seq_scope() == SeqScope::RowZero));
+            assert_eq!(
+                gated(rest).map(|c| c.function).collect::<Vec<_>>(),
+                [per_row],
+                "{kv_heads} kv heads"
+            );
+            assert_eq!(tape.roped_k_scratch_bytes, 0);
+        }
+    }
+
+    /// A command computing batch row 0 only, in an instruction without a per-row
+    /// twin that re-ropes span blocks, is refused: some step with several
+    /// sequences would run no attention, or row 0's for every sequence.
+    #[test]
+    fn a_row_zero_command_without_a_reroping_per_row_twin_is_refused() {
+        use crate::tape::lowered::SeqScope;
+        let p = MetalModelConsts {
+            rope_on_read: true,
+            ..tp()
+        };
+        let attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
+        let tape = lower_tq(&p, &[tq_writer(0, true, LLAMA_KV), attention], 64);
+        let cmds: Vec<GatedCommand> = tape
+            .commands
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.command.kernel,
+                    KernelId::RopeOnceSteel | KernelId::AttentionPrefillSdpaPaged
+                )
+            })
+            .map(|c| GatedCommand::ungated(c.command))
+            .collect();
+        let [rope_once, scratch, plain, reroping] = cmds[..] else {
+            panic!("{} commands", cmds.len());
+        };
+        assert_eq!(rope_once.command.seq_scope(), SeqScope::RowZero);
+        assert_eq!(scratch.command.seq_scope(), SeqScope::RowZero);
+        for without_reroping in [vec![rope_once, scratch], vec![rope_once, scratch, plain]] {
+            assert!(matches!(
+                route_by_sequence_count(7, without_reroping),
+                Err(LoweringError::RowZeroWithoutPerRowTwin {
+                    index: 7,
+                    kernel: KernelId::RopeOnceSteel
+                })
+            ));
+        }
+        assert!(route_by_sequence_count(7, vec![rope_once, scratch, reroping]).is_ok());
     }
 
     /// Every binding of `cmd` bound at `index` or later, in order.
