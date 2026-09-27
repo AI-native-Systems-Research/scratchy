@@ -1145,7 +1145,7 @@ fn route_small_m(
         .into_baked(),
         dispatch: DispatchShape {
             threadgroups: (n / SMALL_M_TILE_COLS, bucket_m.div_ceil(tile.rows()), 1),
-            threads_per_threadgroup: (32, 1, 1),
+            threads_per_threadgroup: (32 * crate::quantized::SMALL_M_SIMDGROUPS, 1, 1),
             m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                 seq_axis: None,
                 axis: crate::tape::lowered::MScaleAxis::Y,
@@ -9520,7 +9520,7 @@ mod tests {
         assert_eq!(gated_steps(&prefill), want);
     }
 
-    /// On NAX, an MLX-affine 4-bit GEMM in a bucket that can see a 5–16-token
+    /// On NAX, an MLX-affine 4-bit GEMM in a bucket that can see a 4–16-token
     /// step gets its small-M twin — the 8-row tile in the 8-token bucket, the
     /// 16-row one in the 64-token bucket — gated against the GEMM it replaces,
     /// with the GEMM's own weights and slots. Batch 1, the prefill buckets,
