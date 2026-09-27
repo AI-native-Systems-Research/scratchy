@@ -262,6 +262,11 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// tail holding the previous layer's KV → `!!!!` collapse past 2048 tokens.
     /// `0` until the first forward sets it (dispatch falls back to the const).
     pub tq_dequant_max_blocks: std::sync::atomic::AtomicU32,
+    /// Whether some sequence of the step about to run has an unrotated
+    /// (bit-31, span) block in its block table, set with
+    /// `tq_dequant_max_blocks`. Only a prefill attention that re-ropes K can
+    /// read such a block (`RuntimeGate::OnlyIfUnrotatedBlocks`).
+    pub unrotated_blocks: std::sync::atomic::AtomicBool,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -572,6 +577,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             attn_unfused_scratch,
             turboquant: runtime.tq.is_some(),
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
+            unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             _marker: std::marker::PhantomData,
         })
     }
@@ -695,6 +701,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
         } else {
             Vec::new()
         };
+        let facts = StepFacts {
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            turboquant: self.turboquant,
+            unrotated_blocks: self
+                .unrotated_blocks
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -726,13 +741,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         need_barrier = false;
                     }
                 }
-                if !gate_matches(
-                    *gate,
-                    num_tokens,
-                    num_seqs,
-                    has_spec_tokens,
-                    self.turboquant,
-                ) {
+                if !gate_matches(*gate, facts) {
                     // Skipped: the lm_head slice's gather/qmv/scatter
                     // (gated single-seq) doesn't fire for batched
                     // batches; the M=bucket_m fallback (gated
@@ -1874,13 +1883,14 @@ fn resolve_bindings<W: CanonicalParams>(
 /// full-`M=bucket_m` lm_head fallback is gated this way so the
 /// slice's per-seq-incorrect logits get overwritten with a
 /// correct multi-row GEMM result.
-pub(super) fn gate_matches(
-    gate: Option<super::lowered::RuntimeGate>,
-    num_tokens: u32,
-    num_seqs: u32,
-    has_spec_tokens: bool,
-    turboquant: bool,
-) -> bool {
+pub(super) fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
+    let StepFacts {
+        num_tokens,
+        num_seqs,
+        has_spec_tokens,
+        turboquant,
+        unrotated_blocks,
+    } = step;
     // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
     // tokens to drop (prefill / chunked-prefill / mixed batches);
     // steady-state decode has `num_tokens == num_seqs` and slicing
@@ -1908,7 +1918,25 @@ pub(super) fn gate_matches(
         Some(super::lowered::RuntimeGate::UnlessSmallMTokens) => {
             !crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
         }
+        Some(super::lowered::RuntimeGate::OnlyIfOneSequence) => num_seqs == 1,
+        Some(super::lowered::RuntimeGate::UnlessOneSequence) => num_seqs > 1,
+        Some(super::lowered::RuntimeGate::OnlyIfUnrotatedBlocks) => unrotated_blocks,
+        Some(super::lowered::RuntimeGate::UnlessUnrotatedBlocks) => !unrotated_blocks,
+        Some(super::lowered::RuntimeGate::All(gates)) => {
+            gates.iter().all(|g| gate_matches(Some(*g), step))
+        }
     }
+}
+
+/// What a runtime gate can ask about the step being encoded.
+#[derive(Clone, Copy)]
+pub(super) struct StepFacts {
+    pub num_tokens: u32,
+    pub num_seqs: u32,
+    pub has_spec_tokens: bool,
+    pub turboquant: bool,
+    /// Some sequence's block table has an unrotated (bit-31, span) block.
+    pub unrotated_blocks: bool,
 }
 
 fn scale_tg_for_num_tokens(
@@ -1985,6 +2013,47 @@ mod tests {
     use scratchy_layers::{Linear, LinearLayer, RmsNorm};
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::Arc;
+
+    /// The sequence gates follow the step's sequence count, not its token
+    /// count; the span-block gates follow the step's block tables; and `All`
+    /// needs every gate: under TurboQuant a decode step runs none of the
+    /// prefill attention's variants.
+    #[test]
+    fn sequence_and_span_block_gates_follow_the_step() {
+        use super::super::lowered::RuntimeGate::{
+            All, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence,
+            UnlessTurboquantDecode, UnlessUnrotatedBlocks,
+        };
+        let step = |num_tokens, num_seqs, turboquant, unrotated_blocks| StepFacts {
+            num_tokens,
+            num_seqs,
+            has_spec_tokens: false,
+            turboquant,
+            unrotated_blocks,
+        };
+        for (tokens, seqs, one) in [(512, 1, true), (512, 2, false), (16, 16, false)] {
+            let s = step(tokens, seqs, false, false);
+            assert_eq!(gate_matches(Some(OnlyIfOneSequence), s), one);
+            assert_eq!(gate_matches(Some(UnlessOneSequence), s), !one);
+        }
+        for unrotated in [false, true] {
+            let s = step(512, 2, false, unrotated);
+            assert_eq!(gate_matches(Some(OnlyIfUnrotatedBlocks), s), unrotated);
+            assert_eq!(gate_matches(Some(UnlessUnrotatedBlocks), s), !unrotated);
+        }
+        let plain = All(&[
+            UnlessTurboquantDecode,
+            UnlessOneSequence,
+            UnlessUnrotatedBlocks,
+        ]);
+        assert!(gate_matches(Some(plain), step(512, 2, true, false)));
+        assert!(!gate_matches(Some(plain), step(512, 2, true, true)));
+        assert!(!gate_matches(Some(plain), step(512, 1, true, false)));
+        assert!(
+            !gate_matches(Some(plain), step(2, 2, true, false)),
+            "a TurboQuant decode step"
+        );
+    }
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
     /// instances the `WeightAccessors` impl below returns. Plays the

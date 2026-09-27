@@ -526,6 +526,56 @@ impl MetalWorker {
     }
 }
 
+/// One step's per-token KV write targets, in the kernels' `slot_mapping`
+/// encoding: the slot, with [`UNROTATED_BLOCK_BIT`] for a span block, or
+/// `u32::MAX` to write nothing. A slot has at most one writer per step. Two
+/// sequences can be handed the same block for tokens they both compute (a full
+/// prefix-cache hit backs off one block but keeps the hit block), and a second
+/// write races with the first (TurboQuant's prefill staging re-rotates the row
+/// in place), so a later writer skips and reads the first writer's keys like
+/// any cached row.
+///
+/// [`UNROTATED_BLOCK_BIT`]: scratchy_target_metal::UNROTATED_BLOCK_BIT
+#[cfg(feature = "metal")]
+struct StepSlotMapping {
+    slots: Vec<u32>,
+    written: std::collections::HashSet<u32>,
+}
+
+#[cfg(feature = "metal")]
+impl StepSlotMapping {
+    const SKIP: u32 = u32::MAX;
+
+    fn with_capacity(tokens: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(tokens),
+            written: std::collections::HashSet::with_capacity(tokens),
+        }
+    }
+
+    /// The next token writes its K/V to `slot`, K unrotated if `unrotated`.
+    fn write(&mut self, slot: usize, unrotated: bool) {
+        let bit = scratchy_target_metal::UNROTATED_BLOCK_BIT;
+        let slot = u32::try_from(slot)
+            .ok()
+            .filter(|s| s & bit == 0)
+            .expect("KV slot below the unrotated-block bit");
+        if !self.written.insert(slot) {
+            return self.skip();
+        }
+        self.slots.push(if unrotated { slot | bit } else { slot });
+    }
+
+    /// The next token writes no K/V.
+    fn skip(&mut self) {
+        self.slots.push(Self::SKIP);
+    }
+
+    fn into_slots(self) -> Vec<u32> {
+        self.slots
+    }
+}
+
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size × 2 bytes.
 /// bf16 and f16 are both 2 bytes/elt under metal; int4 KV is unsupported.
 #[cfg(feature = "metal")]
@@ -3761,7 +3811,7 @@ impl Worker for MetalWorker {
         // slot_mapping[t] = block_ids[abs_pos / bs] * bs + (abs_pos % bs)
         // u32 under metal — the macro-emitted forward reads this as
         // `&[u32]`. Rope kernel checks `slot_mapping[i] != u32::MAX`.
-        let mut slot_mapping_u32: Vec<u32> = Vec::with_capacity(num_tokens);
+        let mut slot_mapping = StepSlotMapping::with_capacity(num_tokens);
         // Spans (rope-on-read): only set bit 31 when the loaded model's
         // kernels mask it (W::ROPE_ON_READ). False for non-spans models →
         // `ann` stays None → byte-identical slot_mapping.
@@ -3786,7 +3836,7 @@ impl Worker for MetalWorker {
                 let block_idx = abs_pos / full_block_size;
                 let offset = abs_pos % full_block_size;
                 if block_idx >= block_ids.len() {
-                    slot_mapping_u32.push(u32::MAX);
+                    slot_mapping.skip();
                     continue;
                 }
                 // Phase 2: a reused cache-hit block already holds valid
@@ -3794,10 +3844,10 @@ impl Worker for MetalWorker {
                 // skip rewriting its KV (u32::MAX = the kernels' write-skip
                 // sentinel). Attention still READS it via block_table (bit 31).
                 if reused.is_some_and(|r| r.contains(&block_idx)) {
-                    slot_mapping_u32.push(u32::MAX);
+                    slot_mapping.skip();
                     continue;
                 }
-                let mut slot = (block_ids[block_idx] * full_block_size + offset) as u32;
+                let slot = block_ids[block_idx] * full_block_size + offset;
                 // ⚠️ SPANS BIT-31 CONTRACT (authoritative definition).
                 // Bit 31 of a slot_mapping / block_table entry = "this block is
                 // stored UNROTATED" (rope_append skips K-rotation; attention
@@ -3811,15 +3861,14 @@ impl Worker for MetalWorker {
                 // fused_qkv_rope_cache, fused_affine_qkv_rope_cache,
                 // turboquant.metal. Enforced by
                 // crates/targets/metal/tests/kv_index_bit31_mask_test.rs.
-                if ann.is_some_and(|a| {
+                let unrotated = ann.is_some_and(|a| {
                     a.get(&block_idx)
                         .is_some_and(scratchy_core_common::BlockKind::is_relocatable)
-                }) {
-                    slot |= 0x8000_0000;
-                }
-                slot_mapping_u32.push(slot);
+                });
+                slot_mapping.write(slot, unrotated);
             }
         }
+        let slot_mapping_u32 = slot_mapping.into_slots();
 
         // block_table padded to [num_reqs, max_blocks_per_seq] u32.
         //
@@ -3860,7 +3909,8 @@ impl Worker for MetalWorker {
         // score as the pool value (8192). The host/kernel stride disagreement is REAL (slot 5 is baked from
         // `W::MAX_BLOCKS_PER_SEQ` at pipelines.rs:489, not from the pool as the comment above claims) but it
         // is NOT what corrupts a prefill that shares a step with a decode. Do not re-chase it from the
-        // comment alone.
+        // comment alone. (That corruption was the rope-once K scratch serving batch row 0's keys to every
+        // sequence; see `route_by_sequence_count` in the metal lowering.)
         let mut block_table_u32: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
         if runtime_max_blocks > 0 {
             for (i, blocks) in attn.block_ids.iter().enumerate() {
@@ -3877,7 +3927,7 @@ impl Worker for MetalWorker {
                         a.get(&j)
                             .is_some_and(scratchy_core_common::BlockKind::is_relocatable)
                     }) {
-                        entry |= 0x8000_0000;
+                        entry |= scratchy_target_metal::UNROTATED_BLOCK_BIT;
                     }
                     block_table_u32[i * max_blocks_eff + j] = entry;
                 }
@@ -3924,7 +3974,7 @@ impl Worker for MetalWorker {
         let mut sliding_block_tables_u32: Vec<Vec<u32>> =
             Vec::with_capacity(attn.sliding_groups.len());
         for sliding in &attn.sliding_groups {
-            let mut sm: Vec<u32> = Vec::with_capacity(num_tokens);
+            let mut sm = StepSlotMapping::with_capacity(num_tokens);
             // `i` indexes tokens_before / q_lens / sliding in lockstep.
             #[allow(clippy::needless_range_loop)]
             for i in 0..num_reqs {
@@ -3936,9 +3986,9 @@ impl Worker for MetalWorker {
                     let block_idx = abs_pos / block_size;
                     let offset = abs_pos % block_size;
                     if block_idx < block_ids.len() {
-                        sm.push((block_ids[block_idx] * block_size + offset) as u32);
+                        sm.write(block_ids[block_idx] * block_size + offset, false);
                     } else {
-                        sm.push(u32::MAX);
+                        sm.skip();
                     }
                 }
             }
@@ -3953,7 +4003,7 @@ impl Worker for MetalWorker {
                     bt[i * max_blocks_eff + j] = bid as u32;
                 }
             }
-            sliding_slot_mappings_u32.push(sm);
+            sliding_slot_mappings_u32.push(sm.into_slots());
             sliding_block_tables_u32.push(bt);
         }
         // Borrowed views for the per-group ForwardArgmaxRequest fields.
@@ -4510,18 +4560,17 @@ impl Worker for MetalWorker {
                                 + spec9_k_thread + 1;
                             let block_idx = chain_pos / spec9_block_size_thread;
                             let offset = chain_pos % spec9_block_size_thread;
-                            let slot = if block_idx
-                                < spec9_block_ids_thread.len()
-                            {
-                                spec9_block_ids_thread[block_idx]
-                                    * spec9_block_size_thread as u32
-                                    + offset as u32
-                            } else {
-                                u32::MAX
-                            };
+                            let mut spec_slot = StepSlotMapping::with_capacity(1);
+                            match spec9_block_ids_thread.get(block_idx) {
+                                Some(&block) => spec_slot.write(
+                                    block as usize * spec9_block_size_thread + offset,
+                                    false,
+                                ),
+                                None => spec_slot.skip(),
+                            }
                             let spec_input_ids: Vec<u32> = vec![spec_seeds[0]];
                             let spec_positions: Vec<u32> = vec![chain_pos as u32];
-                            let spec_slot: Vec<u32> = vec![slot];
+                            let spec_slot: Vec<u32> = spec_slot.into_slots();
                             let spec_cu: Vec<u32> = vec![0, 1];
                             let spec_su: Vec<u32> = vec![(chain_pos + 1) as u32];
                             let spec_req =
@@ -5038,3 +5087,32 @@ impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
 
 #[cfg(feature = "metal")]
 inventory::submit!(&MetalWorkerFactory as &dyn crate::worker_factory::WorkerFactory);
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use super::StepSlotMapping;
+
+    /// A slot two sequences write in one step keeps its first writer; the later
+    /// write becomes the skip sentinel. A span (unrotated) write of the same
+    /// slot counts as the same slot.
+    #[test]
+    fn a_slot_written_twice_in_a_step_keeps_its_first_writer() {
+        let mut step = StepSlotMapping::with_capacity(9);
+        for (slot, unrotated) in [(64, false), (65, false)] {
+            step.write(slot, unrotated);
+        }
+        step.skip();
+        for (slot, unrotated) in [(64, false), (65, false), (66, true)] {
+            step.write(slot, unrotated);
+        }
+        step.skip();
+        for (slot, unrotated) in [(66, false), (67, false)] {
+            step.write(slot, unrotated);
+        }
+        let (skip, span) = (u32::MAX, scratchy_target_metal::UNROTATED_BLOCK_BIT);
+        assert_eq!(
+            step.into_slots(),
+            [64, 65, skip, skip, skip, 66 | span, skip, skip, 67]
+        );
+    }
+}

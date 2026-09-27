@@ -310,6 +310,19 @@ pub struct TqStageConstants {
     /// operand's codes hold it minus its projection bias (bound at buffer 10).
     pub k_bias: bool,
     pub v_bias: bool,
+    /// `ATTN_TQ_STAGE_PASS` (slot 17): which rows this dispatch stages.
+    pub pass: TqStagePass,
+}
+
+/// The rows one `tq_stage_rotated` dispatch stages. A step stages its new rows,
+/// then its cached ones: a row new for one sequence can be a prefix-cache hit
+/// for another in the same step, and both rewrite it in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TqStagePass {
+    /// The step's new rows, read from the cache their writer just filled.
+    New = 1,
+    /// Cached rows, decoded from the packed store.
+    Cached = 2,
 }
 
 impl From<TqStageConstants> for Vec<ConstantValue> {
@@ -325,6 +338,7 @@ impl From<TqStageConstants> for Vec<ConstantValue> {
         v.push(ConstantValue::uint(ConstSlot(13), c.bits.get()));
         v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
+        v.push(ConstantValue::uint(ConstSlot(17), c.pass as u32));
         v
     }
 }

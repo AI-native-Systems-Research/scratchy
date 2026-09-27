@@ -16,6 +16,9 @@
 //! own (written) keys — so reading anything but the packed store and those keys
 //! poisons the output.
 //!
+//! Also (fp16 KV): each paged prefill attention a step with several sequences
+//! runs, against f32 attention of every sequence alone.
+//!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
 use half::{bf16, f16};
@@ -26,7 +29,10 @@ use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::steel_paged::{nax_paged_symbol, steel_paged_symbol};
 use scratchy_target_metal::tape::ids::{HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
+use scratchy_target_metal::tape::kernel_constants::TqStagePass;
+use scratchy_target_metal::targets::is_nax_capable;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -694,32 +700,38 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             v
         };
         let stage_name = format!("tq_stage_rotated_{}", c.dtype.tag());
-        for (scratch, packed, norms, bias, is_k) in [
-            (&scratch_k, &packed_k, &norms_k, &kb, true),
-            (&scratch_v, &packed_v, &norms_v, &vb, false),
-        ] {
-            let stage = pso("attention", stage_name.clone(), stage_consts(is_k));
-            batch.encode(
-                &stage,
-                &[
-                    (&scratch.table, 0),
-                    (&block_table, 1),
-                    (&seq_used, 2),
-                    (&cu_seqlens, 3),
-                    (&slot_mapping, 4),
-                    (packed, 5),
-                    (norms, 6),
-                    (&signs, 7),
-                    (&centroids, 8),
-                    (&cos_sin, 9),
-                    (bias, 10),
-                ],
-                &[],
-                &[],
-                &resident,
-                tg(f.max_blocks, nkv, n_seqs),
-                tg(32, 1, 1),
-            );
+        // New rows, then cached rows, as the tape stages them.
+        for pass in [TqStagePass::New, TqStagePass::Cached] {
+            for (scratch, packed, norms, bias, is_k) in [
+                (&scratch_k, &packed_k, &norms_k, &kb, true),
+                (&scratch_v, &packed_v, &norms_v, &vb, false),
+            ] {
+                let mut consts = stage_consts(is_k);
+                consts.push(ConstantValue::uint(17, pass as u32));
+                let stage = pso("attention", stage_name.clone(), consts);
+                batch.encode(
+                    &stage,
+                    &[
+                        (&scratch.table, 0),
+                        (&block_table, 1),
+                        (&seq_used, 2),
+                        (&cu_seqlens, 3),
+                        (&slot_mapping, 4),
+                        (packed, 5),
+                        (norms, 6),
+                        (&signs, 7),
+                        (&centroids, 8),
+                        (&cos_sin, 9),
+                        (bias, 10),
+                    ],
+                    &[],
+                    &[],
+                    &resident,
+                    tg(f.max_blocks, nkv, n_seqs),
+                    tg(32, 1, 1),
+                );
+            }
+            batch.barrier();
         }
         let rotate_consts = vec![
             ConstantValue::uint(0, hd as u32),
@@ -1209,5 +1221,216 @@ fn prefill_qwen2_7b_biased_kv_tracks_exact_attention() {
         },
         0.2,
         10.0,
+    );
+}
+
+// ── fp16 KV: the attentions of a step with several sequences ───────────
+
+/// A paged prefill attention that reads each sequence's K/V through its own
+/// block-table row: what a step with several sequences runs.
+#[derive(Clone, Copy)]
+enum PerRow {
+    /// sdpa-paged, re-roping span blocks as it reads.
+    Sdpa,
+    /// gqa_shared without the rope-once scratch, re-roping span blocks.
+    GqaShared,
+    /// The simdgroup steel kernel, reading the cache's roped K as is.
+    Steel,
+    /// The NAX (M5+) steel kernel, likewise.
+    Nax,
+}
+
+/// `kernel` over every sequence of `c` in one step, from an fp16 cache holding
+/// every key (NaN elsewhere), against f32 attention of each sequence alone.
+/// The sequences' keys differ, so a kernel serving sequence 0's keys to all
+/// would fail every other sequence's rows — shown first on the host.
+fn check_per_row(c: Case, kernel: PerRow) {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping {}: no Metal 4 GPU", c.name);
+        return;
+    };
+    if matches!(kernel, PerRow::Nax) && !is_nax_capable(di.profile.generation) {
+        eprintln!("skipping {}: no NAX", c.name);
+        return;
+    }
+    let device = di.device.clone();
+    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let f = &Fixture::new(&c);
+    let (hd, nq, nkv) = (c.head_dim, c.num_q_heads, c.num_kv_heads);
+    let n_q = *f.cu_seqlens.last().unwrap() as usize;
+    let q_rows =
+        |s: usize| f.cu_seqlens[s] as usize * nq * hd..f.cu_seqlens[s + 1] as usize * nq * hd;
+    let max_err = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let plain = |s: usize, t: usize, h: usize, is_v: bool| {
+        let of = if is_v { &f.v[s] } else { &f.k[s] };
+        of[(t * nkv + h) * hd..][..hd].to_vec()
+    };
+    let ideal = ideal_attention(f, plain);
+    let peak = ideal.iter().fold(0f32, |m, x| m.max(x.abs()));
+    // Rounded q, K and V, and the output.
+    let tol = peak * c.dtype.ulp() * 3.0;
+    // Sequence 0 is the longest, so its keys cover every other query position.
+    let row_zero = ideal_attention(f, |_, t, h, is_v| plain(0, t, h, is_v));
+    for s in 1..c.seqs.len() {
+        let rows = q_rows(s);
+        let err = max_err(&row_zero[rows.clone()], &ideal[rows]);
+        eprintln!(
+            "{} sequence {s} read as sequence 0: max err {err:.2e}",
+            c.name
+        );
+        assert!(err > tol, "{}: sequence {s} reads like sequence 0", c.name);
+    }
+
+    let tag = c.dtype.tag();
+    let q_blocks = |bq: usize| tg(n_q.div_ceil(bq), nq, c.seqs.len());
+    let steel_debug = ConstantValue::uint(99, 0);
+    let (library, function, extra, grid, threads) = match kernel {
+        PerRow::Sdpa => (
+            "attention",
+            format!("attention_prefill_sdpa_v2_paged_{tag}_specialized"),
+            None,
+            tg(nq, n_q, 1),
+            tg(1024, 1, 1),
+        ),
+        PerRow::GqaShared => (
+            "attention",
+            format!("attention_prefill_sdpa_gqa_shared_{tag}_specialized"),
+            None,
+            tg(nkv, n_q, 1),
+            tg(32 * (nq / nkv), 1, 1),
+        ),
+        PerRow::Steel => (
+            "attention_steel_paged",
+            steel_paged_symbol(tag, hd as u32)
+                .expect("steel instance")
+                .to_owned(),
+            Some(steel_debug),
+            q_blocks(32),
+            tg(128, 1, 1),
+        ),
+        PerRow::Nax => (
+            "attention_steel_nax_paged",
+            nax_paged_symbol(tag, hd as u32)
+                .expect("NAX instance")
+                .to_owned(),
+            Some(steel_debug),
+            q_blocks(64),
+            tg(128, 1, 1),
+        ),
+    };
+    let function: &'static str = Box::leak(function.into_boxed_str());
+    let pso = cache
+        .get_or_build(&PipelineKey::new(
+            library,
+            function,
+            f.attn_constants(extra.as_slice()),
+        ))
+        .expect("pipeline");
+
+    let nan = c.dtype.bits(f32::NAN);
+    let k = f.pool(&device, &f.k, nan, |_, _| true);
+    let v = f.pool(&device, &f.v, nan, |_, _| true);
+    let seq_used: Vec<u32> = c.seqs.iter().map(|&(l, _)| l as u32).collect();
+    let q: Vec<u16> = f.q.iter().map(|&x| c.dtype.bits(x)).collect();
+    let (seq_used, q) = (shared(&device, &seq_used), shared(&device, &q));
+    let cu_seqlens = shared(&device, &f.cu_seqlens);
+    let block_table = shared(&device, &f.block_table);
+    let cos_sin = shared(&device, &f.cos_sin);
+    let span_ids = shared(&device, &vec![0u32; f.n_blocks * c.block_size]);
+    let out = shared(&device, &vec![0u16; n_q * nq * hd]);
+    let mut batch = Mtl4DispatchBatch::begin(&device).expect("MTL4 queue");
+    batch.encode(
+        &pso,
+        &[
+            (&out, 0),
+            (&q, 1),
+            (&cu_seqlens, 2),
+            (&seq_used, 3),
+            (&block_table, 4),
+            (&k.table, 5),
+            (&v.table, 6),
+            (&cos_sin, 7),
+            (&span_ids, 8),
+        ],
+        &[],
+        &[],
+        &[&k.data, &v.data],
+        grid,
+        threads,
+    );
+    batch.commit(true).expect("attention");
+    let got: Vec<f32> = read::<u16>(&out, n_q * nq * hd)
+        .into_iter()
+        .map(|b| c.dtype.value(b))
+        .collect();
+    for s in 0..c.seqs.len() {
+        let rows = q_rows(s);
+        let err = max_err(&got[rows.clone()], &ideal[rows]);
+        eprintln!("{} sequence {s}: max err {err:.2e} (tol {tol:.2e})", c.name);
+        assert!(
+            err <= tol,
+            "{}: sequence {s} max error {err} > {tol}",
+            c.name
+        );
+    }
+}
+
+/// Llama-3.2-3B, production chunking: a continuing chunk, a decoding
+/// sequence, and a fresh prompt in one step, the longest first.
+fn per_row_llama(name: &'static str) -> Case {
+    Case {
+        blocks_per_chunk: 128,
+        seqs: vec![(700, 45), (300, 1), (60, 60)],
+        ..llama_3b(name)
+    }
+}
+
+#[test]
+fn per_row_sdpa_paged_rerope_span_blocks() {
+    check_per_row(
+        Case {
+            span_blocks: vec![0, 5, 40],
+            ..per_row_llama("per-row sdpa-paged")
+        },
+        PerRow::Sdpa,
+    );
+}
+
+#[test]
+fn per_row_gqa_shared_rerope_span_blocks() {
+    check_per_row(
+        Case {
+            blocks_per_chunk: 128,
+            seqs: vec![(900, 20), (300, 1), (130, 70)],
+            ..gemma4_global("per-row gqa_shared gemma4 global")
+        },
+        PerRow::GqaShared,
+    );
+}
+
+#[test]
+fn per_row_steel_reads_roped_keys() {
+    check_per_row(
+        Case {
+            rope: None,
+            ..per_row_llama("per-row steel")
+        },
+        PerRow::Steel,
+    );
+}
+
+#[test]
+fn per_row_nax_reads_roped_keys() {
+    check_per_row(
+        Case {
+            rope: None,
+            ..per_row_llama("per-row nax")
+        },
+        PerRow::Nax,
     );
 }
