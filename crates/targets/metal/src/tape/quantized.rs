@@ -1250,14 +1250,3 @@ mod tests {
         assert_eq!(get_qmv_batch_limit(8192, 8192, AppleSiliconGen::M1), 6);
     }
 }
-
-/// outlier-heavy KV (e.g. Qwen's massive activations) where 3-bit degrades. Read
-/// once at worker init from `SCRATCHY_TQ_BITS`; the lowering bakes the SAME value
-/// into the kernel constants, so they always agree within a run.
-pub fn tq_bits(arch_default: u32) -> u32 {
-    std::env::var("SCRATCHY_TQ_BITS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&b| (2..=8).contains(&b))
-        .unwrap_or(arch_default)
-}

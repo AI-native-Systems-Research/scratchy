@@ -13406,9 +13406,7 @@ pub fn emit_model(
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS as usize,
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM as usize,
                                 ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
-                                ::scratchy_target_metal::turboquant::tq_bits(
-                                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::TQ_KV_BITS,
-                                ),
+                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::TQ_KV_BITS,
                                 42,
                             ))
                         } else {
@@ -13999,9 +13997,7 @@ pub fn emit_model(
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS as usize,
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM as usize,
                                 ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
-                                ::scratchy_target_metal::turboquant::tq_bits(
-                                    <Weights as ::scratchy_forward_compiler::CanonicalParams>::TQ_KV_BITS,
-                                ),
+                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::TQ_KV_BITS,
                                 42,
                             ))
                         } else {

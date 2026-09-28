@@ -1963,7 +1963,7 @@ mod tests {
         // in DIFFERENT arena buffers so the weight pool can be un-wired
         // without dragging the scratch pool with it.
         let scratch = alloc.alloc_uninit(64).expect("scratch alloc");
-        let w = vec![0x9u8; 64];
+        let w = [0x9u8; 64];
         let weight = unsafe {
             alloc
                 .alloc_and_copy_host(w.as_ptr(), w.len())

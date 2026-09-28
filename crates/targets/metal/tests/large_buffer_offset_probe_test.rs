@@ -103,7 +103,7 @@ fn shared_buffer_above_4_gib_offset_round_trip() {
     };
     let device = &mdev.device;
 
-    let max_len = device.maxBufferLength() as usize;
+    let max_len = device.maxBufferLength();
     eprintln!(
         "device.maxBufferLength = {} bytes ({:.2} GiB)",
         max_len,
@@ -482,7 +482,7 @@ fn shared_buffer_mtl4_gpuaddress_read_at_large_offsets() {
     };
 
     let big_len: usize = 5 * GIB + 256 * 1024 * 1024;
-    if (device.maxBufferLength() as usize) < big_len {
+    if device.maxBufferLength() < big_len {
         eprintln!("skipping: maxBufferLength too small");
         return;
     }

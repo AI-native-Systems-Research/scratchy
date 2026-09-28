@@ -742,10 +742,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     }
                 }
                 if !gate_matches(*gate, facts) {
-                    // Skipped: the lm_head slice's gather/qmv/scatter
-                    // (gated single-seq) doesn't fire for batched
-                    // batches; the M=bucket_m fallback (gated
-                    // multi-seq) doesn't fire for single-seq prefill.
+                    // Skipped: e.g. the lm_head slice's gather/qmv/scatter
+                    // (`OnlyIfNoSpec`) on a spec-decode verify step, or
+                    // its M=bucket_m fallback (`OnlyIfSpec`) on any other.
                     // Either way the timestamp slot, barrier, and
                     // dispatch are skipped together so the kernel
                     // doesn't run with stale per-dispatch state.
@@ -2055,6 +2054,91 @@ mod tests {
         );
     }
 
+    /// The lm_head sample slice, as the tape builds and dispatches it: the
+    /// gather moves each sequence's last row to row `i`, the scatter moves
+    /// row `i` back, both in place. In a mixed step, decodes and short chunks
+    /// put some sequences' last rows inside `0..num_seqs`, the rows the
+    /// others are moved to; every sequence must still get its own row.
+    #[test]
+    fn sample_slice_moves_each_sequences_own_row() {
+        let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device.device.clone();
+        let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
+            .expect("compile standard shaders");
+        let p = crate::tape::model_consts::MetalModelConsts {
+            metal_dtype: MetalDtype::F16,
+            ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
+        };
+        // Decodes, then short prefix-hit chunks, then long chunks.
+        let q_lens: Vec<u32> = [vec![1; 24], vec![2; 16], vec![3; 8], vec![40; 4]].concat();
+        let cu: Vec<u32> = std::iter::once(0)
+            .chain(q_lens.iter().scan(0, |end, n| {
+                *end += n;
+                Some(*end)
+            }))
+            .collect();
+        let (num_seqs, num_tokens) = (q_lens.len(), *cu.last().unwrap() as usize);
+        let last = |i: usize| cu[i + 1] as usize - 1;
+        let width = 1024u32;
+        let bucket_m = 512;
+        for gather in [true, false] {
+            let cmd = if gather {
+                crate::tape::lowering::gather_last_token_command(&p, 0, width)
+            } else {
+                crate::tape::lowering::scatter_first_to_last_row_command(&p, 0, width)
+            };
+            let pso = cache
+                .get_or_build(&crate::specialized_pipeline_cache::PipelineKey::new(
+                    cmd.library,
+                    cmd.function,
+                    cmd.constants.to_vec(),
+                ))
+                .expect("pipeline");
+            let (grid, threads) = mtl_size_pair(&cmd);
+            let grid = scale_tg_for_num_tokens(
+                grid,
+                cmd.dispatch.m_scaling,
+                super::super::ids::NumTokens(num_tokens as u32),
+                num_seqs as u32,
+            );
+            // Every element of row `r` holds `r`.
+            let rows: Vec<u16> = (0..bucket_m as usize)
+                .flat_map(|r| {
+                    std::iter::repeat_n(half::f16::from_f32(r as f32).to_bits(), width as usize)
+                })
+                .collect();
+            let buf = crate::mtl4_dispatch::shared_slice(&device, &rows);
+            let cu_buf = crate::mtl4_dispatch::shared_slice(&device, &cu);
+            let n_buf = crate::mtl4_dispatch::shared_u32(&device, num_seqs as u32);
+            assert!(crate::mtl4_dispatch::dispatch_threadgroups(
+                &device,
+                &pso,
+                &[&buf, &cu_buf, &n_buf],
+                grid,
+                threads,
+            ));
+            let got: Vec<u16> = crate::mtl4_dispatch::read_slice(&buf, rows.len());
+            let row = |r: usize| &got[r * width as usize..][..width as usize];
+            for (i, q_len) in q_lens.iter().enumerate() {
+                // Gather: row i holds sequence i's last row. Scatter: that
+                // last row holds row i, sequence i's logits.
+                let (at, want) = if gather { (i, last(i)) } else { (last(i), i) };
+                let want = half::f16::from_f32(want as f32).to_bits();
+                let wrong = row(at).iter().filter(|&&x| x != want).count();
+                assert_eq!(
+                    wrong,
+                    0,
+                    "{}: sequence {i} ({} tokens): {wrong} of {width} elements of row {at} are another row's",
+                    if gather { "gather" } else { "scatter" },
+                    q_len
+                );
+            }
+        }
+    }
+
     /// Test fixture: holds `CanonicalParams` constants AND the layer
     /// instances the `WeightAccessors` impl below returns. Plays the
     /// role of the per-canonical `Weights` struct the macro will emit.
@@ -2682,7 +2766,7 @@ mod tests {
             kernel: KernelId::RmsNorm,
             library: rmsnorm_pre.library,
             function: rmsnorm_pre.function,
-            constants: rmsnorm_pre.constants.clone(),
+            constants: rmsnorm_pre.constants,
             dispatch: rmsnorm_pre.dispatch,
             bindings: rmsnorm_pre
                 .bindings
