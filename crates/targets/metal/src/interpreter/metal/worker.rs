@@ -25,17 +25,22 @@ use crate::interpreter::metal::__re::{
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 
+use super::ids::LayerId;
 use super::lowered::{
-    Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightBundleKind, WeightTensor,
+    Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightTensor,
 };
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
+use crate::tape::ids::SourceIx;
+use crate::tape::lowered::ModelSources;
 #[cfg(feature = "forward-telemetry")]
 use scratchy_core_common::forward_telemetry::{
     ForwardRecord, ForwardTelemetry, KernelKind, TapeEntry,
 };
 use scratchy_ir::CanonicalParams;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 /// Byte size of arena slot `i`. The macro's `colored_slot_map()`
 /// computes this from the FUF's per-slot shape × dtype × max bucket;
@@ -146,14 +151,19 @@ pub enum WorkerError {
         command_index: usize,
         reason: &'static str,
     },
-    /// Resolving a `Binding::Weight` via the WtFn thunk + allocator
-    /// failed. Either the layer struct didn't carry the requested
-    /// tensor (e.g. bias absent on a no-bias linear) or the tensor's
-    /// raw pointer didn't fall inside any of the allocator's arenas.
+    /// A per-bucket scratch or inline buffer a binding needs was not provisioned.
     WeightLookupFailed { reason: &'static str },
     /// A command's MLX-affine codes operand could not be bound stored the
     /// way its kernel reads them.
     AffineCodes(crate::metal_allocator::AffineCodesBindError),
+    /// A model source a tape binds did not resolve at load.
+    SourceUnresolved {
+        ix: SourceIx,
+        source: &'static str,
+        which: WeightTensor,
+        layer: LayerId,
+        why: SourceMiss,
+    },
     /// A command referenced `Binding::Scratch` but the worker has no
     /// SplitK scratch buffer allocated. Indicates a lowering /
     /// `LoweredMetalTape::splitk_scratch_bytes` accounting bug —
@@ -204,6 +214,18 @@ impl std::fmt::Display for WorkerError {
             Self::WeightLookupFailed { reason } => {
                 write!(f, "MetalWorker: weight lookup: {reason}")
             }
+            Self::SourceUnresolved {
+                ix,
+                source,
+                which,
+                layer,
+                why,
+            } => write!(
+                f,
+                "MetalWorker: model source #{} `{source}` {which:?} at layer {}: {why:?}",
+                ix.get(),
+                layer.get()
+            ),
             Self::ScratchBufferMissing {
                 bucket_index,
                 command_index,
@@ -218,6 +240,20 @@ impl std::fmt::Display for WorkerError {
 }
 
 impl std::error::Error for WorkerError {}
+
+/// Why a [`WorkerError::SourceUnresolved`] source did not resolve.
+#[derive(Debug)]
+pub enum SourceMiss {
+    /// The model's generated resolver has no such family.
+    NoFamily,
+    /// The family's bundle holds no such tensor (a `which` of another kind, an absent optional
+    /// bias or shared expert, a Dense MoE on metal).
+    NoTensor,
+    /// The tensor lives in no arena of the pool's allocator.
+    NotResident,
+    /// A bake met a binding its pool did not resolve.
+    NotResolved,
+}
 
 /// One per concurrent forward. Owns its arena + per-bucket bakings;
 /// borrows the model meta + runtime bindings + pipeline cache via
@@ -287,8 +323,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         arena_layout: &ArenaLayout,
         bucket_tapes: &[LoweredMetalTape],
         pipelines: &SpecializedPipelines,
-        weights: &W,
-        allocator: &MetalAllocator,
+        sources: &ResolvedSources,
         runtime: &RuntimeBindings,
     ) -> Result<Self, WorkerError> {
         Self::new_with_residency(
@@ -296,8 +331,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             arena_layout,
             bucket_tapes,
             pipelines,
-            weights,
-            allocator,
+            sources,
             runtime,
             None,
         )
@@ -314,8 +348,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         arena_layout: &ArenaLayout,
         bucket_tapes: &[LoweredMetalTape],
         pipelines: &SpecializedPipelines,
-        weights: &W,
-        allocator: &MetalAllocator,
+        sources: &ResolvedSources,
         runtime: &RuntimeBindings,
         residency: Option<&crate::residency::MetalResidencySet>,
     ) -> Result<Self, WorkerError> {
@@ -541,7 +574,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
 
         let mut bucket_bakings = Vec::with_capacity(bucket_tapes.len());
         for (bucket_idx, tape) in bucket_tapes.iter().enumerate() {
-            let baking = bake_bucket(
+            let baking = bake_bucket::<W>(
                 bucket_idx,
                 tape,
                 &arena,
@@ -550,8 +583,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 roped_k_scratch.as_ref(),
                 attn_unfused_scratch.as_ref(),
                 pipelines,
-                weights,
-                allocator,
+                sources,
                 runtime,
                 device.clone(),
             )?;
@@ -985,8 +1017,7 @@ fn bake_bucket<W: CanonicalParams>(
     roped_k_scratch: Option<&Buffer>,
     attn_unfused_scratch: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
-    weights: &W,
-    allocator: &MetalAllocator,
+    sources: &ResolvedSources,
     runtime: &RuntimeBindings,
     device: Arc<Device>,
 ) -> Result<BucketBaking, WorkerError> {
@@ -1067,8 +1098,7 @@ fn bake_bucket<W: CanonicalParams>(
                 moe_scratch,
                 moe_inline_buf.as_ref(),
                 &mut inline_cursor,
-                weights,
-                allocator,
+                sources,
                 runtime,
             )?;
             // f16 → `gemm_f16_specialized` (simdgroup_half8x8), bf16 →
@@ -1174,8 +1204,7 @@ fn bake_bucket<W: CanonicalParams>(
             attn_unfused_scratch,
             moe_inline_buf.as_ref(),
             &mut inline_cursor,
-            weights,
-            allocator,
+            sources,
             runtime,
         )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
@@ -1260,7 +1289,7 @@ fn bake_bucket<W: CanonicalParams>(
 /// weight thunk. Anything else is a contract violation surfaced as
 /// [`WorkerError::GemmBindingsMalformed`].
 #[allow(clippy::too_many_arguments)]
-fn resolve_gemm_buffers<W: CanonicalParams>(
+fn resolve_gemm_buffers(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand,
@@ -1268,8 +1297,7 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
     moe_scratch: Option<&Buffer>,
     moe_inline_buf: Option<&Buffer>,
     inline_cursor: &mut u32,
-    weights: &W,
-    allocator: &MetalAllocator,
+    sources: &ResolvedSources,
     runtime: &RuntimeBindings,
 ) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
     // KernelId::Gemm never references the SplitK scratch buffer
@@ -1289,8 +1317,7 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
         /*attn_unfused_scratch=*/ None,
         moe_inline_buf,
         inline_cursor,
-        weights,
-        allocator,
+        sources,
         runtime,
     )?;
     if bound.len() != 3 {
@@ -1324,424 +1351,73 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
     ))
 }
 
-/// Resolve a `Binding::Weight` against the loaded model `weights`
-/// and the allocator that owns the underlying `MTLBuffer` arenas.
-///
-/// Calls into the per-arch [`scratchy_ir::WeightAccessors`] impl (emitted by
-/// `scratchy-forward-compiler-macro::codegen::emit_weight_accessors_impl`) using
-/// the binding's `(bucket, op_idx, slot, layer)` locator to recover the
-/// `&Layer` struct (`&RmsNorm`, `&LinearLayer`, `&Embedding`), pulls
-/// out the raw GpuTensor pointer matching `which`, and asks the
-/// allocator which buffer + offset that pointer belongs to.
-///
-/// Same shape CUDA's interpreter uses: `WeightAccessors` → layer
-/// struct → `GpuTensor`. The Metal-side delta is just the final
-/// pointer → `(&Buffer, offset)` reverse lookup against the arena
-/// allocator.
-fn resolve_weight<W: scratchy_ir::CanonicalParams + scratchy_ir::WeightAccessors>(
-    weights: &W,
-    allocator: &MetalAllocator,
-    kind: &WeightBundleKind,
-    layer: u32,
-    which: WeightTensor,
-    locator: super::lowered::WeightLocator,
-    codes: crate::tape::kernel_constants::AffineCodes,
-) -> Result<(Buffer, u64), WorkerError> {
-    let bucket = locator.bucket;
-    let op_idx = locator.op_idx;
-    let slot = locator.slot;
-    let tensor = match kind {
-        WeightBundleKind::RmsNorm => weights.rms_norm_at(bucket, op_idx, slot, layer).weight,
-        WeightBundleKind::Embedding => weights.embedding_at(bucket, op_idx, slot, layer).weight,
-        WeightBundleKind::LinearLayer => {
-            let l = weights.linear_at(bucket, op_idx, slot, layer);
-            match (which, l) {
-                // Dense path
-                (WeightTensor::Weight, scratchy_layers::LinearLayer::Dense(_)) => l.dense_weight(),
-                (WeightTensor::Bias, scratchy_layers::LinearLayer::Dense(_)) => {
-                    l.dense_bias().ok_or(WorkerError::WeightLookupFailed {
-                        reason: "LinearLayer bias requested but not present",
-                    })?
-                }
-                // MLX-affine path: distinct accessors per tensor role.
-                (WeightTensor::Weight, scratchy_layers::LinearLayer::AffineQuant(_)) => {
-                    l.affine_weight()
-                }
-                (WeightTensor::AffineScales, scratchy_layers::LinearLayer::AffineQuant(_)) => {
-                    l.affine_scales()
-                }
-                (WeightTensor::AffineBiases, scratchy_layers::LinearLayer::AffineQuant(_)) => {
-                    l.affine_biases()
-                }
-                (WeightTensor::AffineLinearBias, scratchy_layers::LinearLayer::AffineQuant(_)) => l
-                    .affine_linear_bias()
-                    .ok_or(WorkerError::WeightLookupFailed {
-                        reason: "AffineQuant linear_bias requested but not present",
-                    })?,
-                // NVFP4 path: packed weight via the shared `Weight` role,
-                // folded per-group scales via `Nvfp4Scales`. No biases.
-                (WeightTensor::Weight, scratchy_layers::LinearLayer::Nvfp4(_)) => l.nvfp4_weight(),
-                (WeightTensor::Nvfp4Scales, scratchy_layers::LinearLayer::Nvfp4(_)) => {
-                    l.nvfp4_scales()
-                }
-                // Mismatch: affine/nvfp4 WeightTensor on a Dense layer (or
-                // vice versa), or any quant arm we don't expect to reach
-                // the Metal worker.
-                (WeightTensor::AffineScales, _)
-                | (WeightTensor::AffineBiases, _)
-                | (WeightTensor::AffineLinearBias, _)
-                | (WeightTensor::Nvfp4Scales, _) => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "AffineScales/AffineBiases/AffineLinearBias/Nvfp4Scales requested \
-                                 but LinearLayer is not the matching quant variant",
-                    });
-                }
-                (WeightTensor::Weight | WeightTensor::Bias, _) => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "LinearLayer arm not reachable on the Metal worker — \
-                                 macro should only emit Dense or AffineQuant on metal",
-                    });
-                }
-                // `Moe*` WeightTensor variants are only valid against
-                // `WeightBundleKind::{FusedMoe, SharedFusedMoe}`. The
-                // lowering pass should never pair a Moe tensor with a
-                // LinearLayer bundle — surface as a config bug rather
-                // than a panic.
-                (
-                    WeightTensor::MoeRouterGate
-                    | WeightTensor::MoeExpertGateW
-                    | WeightTensor::MoeExpertGateS
-                    | WeightTensor::MoeExpertGateB
-                    | WeightTensor::MoeExpertUpW
-                    | WeightTensor::MoeExpertUpS
-                    | WeightTensor::MoeExpertUpB
-                    | WeightTensor::MoeExpertDownW
-                    | WeightTensor::MoeExpertDownS
-                    | WeightTensor::MoeExpertDownB
-                    | WeightTensor::MoeSharedGateUpW
-                    | WeightTensor::MoeSharedGateUpS
-                    | WeightTensor::MoeSharedGateUpB
-                    | WeightTensor::MoeSharedDownW
-                    | WeightTensor::MoeSharedDownS
-                    | WeightTensor::MoeSharedDownB
-                    | WeightTensor::MoeSharedExpertGate
-                    | WeightTensor::GemmaRouterGate
-                    | WeightTensor::GemmaPerExpertScale
-                    | WeightTensor::GemmaRouterScale
-                    | WeightTensor::GdnConv1d
-                    | WeightTensor::GdnALog
-                    | WeightTensor::GdnDtBias
-                    | WeightTensor::GdnNorm,
-                    _,
-                ) => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "Moe*/Gemma*/Gdn* WeightTensor variant requested against LinearLayer \
-                                 bundle — expected FusedMoe / SharedFusedMoe / GemmaRouter / \
-                                 GemmaSwitchGlu / GatedDeltaNet bundle",
-                    });
+/// Every model tensor a pool's tapes bind, resolved ONCE at load: `(source, tensor, layer)` →
+/// the buffer and offset holding it. Workers bake from this table; nothing resolves per
+/// dispatch record, and a worker never touches the weights.
+pub struct ResolvedSources(HashMap<(SourceIx, WeightTensor, LayerId), (Buffer, u64)>);
+
+impl ResolvedSources {
+    /// Resolve every [`Binding::Source`] of `tapes` (loops played out) through the model's
+    /// generated [`ModelSources`] impl, each distinct `(ix, which, layer)` once.
+    pub fn resolve<W: ModelSources>(
+        weights: &W,
+        allocator: &MetalAllocator,
+        tapes: &[LoweredMetalTape],
+    ) -> Result<Self, WorkerError> {
+        let mut table = HashMap::new();
+        for c in tapes.iter().flat_map(LoweredMetalTape::commands_expanded) {
+            for b in c.command.bindings {
+                let &Binding::Source {
+                    ix, which, layer, ..
+                } = b
+                else {
+                    continue;
+                };
+                let miss = |why| WorkerError::SourceUnresolved {
+                    ix,
+                    source: W::SOURCES.get(ix.get() as usize).copied().unwrap_or("?"),
+                    which,
+                    layer,
+                    why,
+                };
+                let bundle = weights
+                    .source(ix, layer)
+                    .ok_or(miss(SourceMiss::NoFamily))?;
+                // MLX-affine packed codes bind stored the way each reading command's kernel
+                // reads them — every reader, so two that disagree refuse the load.
+                if bundle.is_affine_codes(which) {
+                    let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
+                    let codes =
+                        crate::tape::kernel_constants::AffineCodes::of_constants(c.command.constants);
+                    let at = allocator
+                        .bind_affine_codes(tensor.raw_ptr(), tensor.size_bytes(), codes)
+                        .map_err(WorkerError::AffineCodes)?;
+                    table.entry((ix, which, layer)).or_insert(at);
+                } else if let Entry::Vacant(v) = table.entry((ix, which, layer)) {
+                    let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
+                    let at = allocator.buffer_for(tensor.raw_ptr());
+                    v.insert(at.ok_or(miss(SourceMiss::NotResident))?);
                 }
             }
         }
-        WeightBundleKind::GatedDeltaNet => {
-            let l = weights.gated_delta_net_at(bucket, op_idx, slot, layer);
-            match which {
-                WeightTensor::GdnConv1d => l.conv1d,
-                WeightTensor::GdnALog => l.a_log,
-                WeightTensor::GdnDtBias => l.dt_bias,
-                WeightTensor::GdnNorm => l.norm,
-                _ => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "non-Gdn* WeightTensor requested against GatedDeltaNet bundle",
-                    });
-                }
-            }
-        }
-        WeightBundleKind::LayerNorm => {
-            // Torch-style LayerNorm-with-bias bundle (vision towers).
-            // `which == Weight` → the gain, `which == Bias` → the
-            // (mandatory) bias. The `vision_layernorm` kernel binds both
-            // (buffer 2 = weight, buffer 3 = bias), so the lowering arm
-            // emits one `Weight{Weight}` + one `Weight{Bias}` against the
-            // same locator. An absent bias is a loader/DSL mismatch —
-            // surface it rather than dropping the bias term.
-            let l = weights.layer_norm_at(bucket, op_idx, slot, layer);
-            match which {
-                WeightTensor::Weight => l.weight,
-                WeightTensor::Bias => l.bias.ok_or(WorkerError::WeightLookupFailed {
-                    reason: "LayerNorm bundle has no .bias — vision LayerNorm \
-                             requires both .weight and .bias",
-                })?,
-                _ => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "non-Weight/Bias WeightTensor requested against LayerNorm bundle",
-                    });
-                }
-            }
-        }
-        WeightBundleKind::CosSin => weights.cos_sin_at(bucket, op_idx, slot, layer),
-        // Spans rope-on-read: cos/sin resolved by layer CLASS (the
-        // binding's bucket/op_idx/slot locator is unused). Returns a
-        // GpuTensor (the rotary/rotary_local cos_sin cache); the common
-        // arena-lookup below maps it to (buffer, offset) like CosSin.
-        WeightBundleKind::RopeOnReadCosSin { is_global } => {
-            weights.rope_on_read_cos_sin(*is_global, layer)
-        }
-        // MLX-affine int4 quantized embedding (P6). The lowering's
-        // `AffineEmbed` arm always uses `layer = 0` (embed_tokens is
-        // not a layered weight) and the kernel expects three buffer
-        // bindings: packed weight, scales, biases.
-        WeightBundleKind::AffineQuantEmbedding => {
-            let e = weights.affine_quant_embedding_at(bucket, op_idx, slot, layer);
-            match which {
-                WeightTensor::GdnConv1d
-                | WeightTensor::GdnALog
-                | WeightTensor::GdnDtBias
-                | WeightTensor::GdnNorm => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "Gdn* WeightTensor requested against AffineQuantEmbedding bundle",
-                    });
-                }
-                WeightTensor::Weight => e.weight,
-                WeightTensor::AffineScales => e.scales,
-                WeightTensor::AffineBiases => e.affine_biases,
-                WeightTensor::Bias | WeightTensor::AffineLinearBias | WeightTensor::Nvfp4Scales => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "AffineQuantEmbedding carries only (weight, scales, biases) \
-                                 — no linear-layer bias, and NVFP4 embeddings stay dense",
-                    });
-                }
-                WeightTensor::MoeRouterGate
-                | WeightTensor::MoeExpertGateW
-                | WeightTensor::MoeExpertGateS
-                | WeightTensor::MoeExpertGateB
-                | WeightTensor::MoeExpertUpW
-                | WeightTensor::MoeExpertUpS
-                | WeightTensor::MoeExpertUpB
-                | WeightTensor::MoeExpertDownW
-                | WeightTensor::MoeExpertDownS
-                | WeightTensor::MoeExpertDownB
-                | WeightTensor::MoeSharedGateUpW
-                | WeightTensor::MoeSharedGateUpS
-                | WeightTensor::MoeSharedGateUpB
-                | WeightTensor::MoeSharedDownW
-                | WeightTensor::MoeSharedDownS
-                | WeightTensor::MoeSharedDownB
-                | WeightTensor::MoeSharedExpertGate
-                | WeightTensor::GemmaRouterGate
-                | WeightTensor::GemmaPerExpertScale
-                | WeightTensor::GemmaRouterScale => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "Moe*/Gemma* WeightTensor variant against AffineQuantEmbedding \
-                                 bundle — expected FusedMoe / SharedFusedMoe / GemmaRouter / \
-                                 GemmaSwitchGlu bundle",
-                    });
-                }
-            }
-        }
-        // ── FusedMoe / SharedFusedMoe ──────────────────────────────
-        //
-        // §2: dispatch into the AffineFusedMoELayer /
-        // AffineSharedFusedMoELayer struct fields. The Metal worker
-        // can only resolve the `Affine` variant — the Dense variant
-        // is cuda-only and never reaches this code path (the
-        // MetalFusedMoeImpl only claims `OpKind::Moe` tiles whose
-        // source weight has `StorageFormat::Affine`, and the macro
-        // emits `load_affine` accordingly).
-        WeightBundleKind::FusedMoe => {
-            let layer_struct = weights.fused_moe_at(bucket, op_idx, slot, layer);
-            let affine = match layer_struct {
-                scratchy_layers::layers_moe::FusedMoELayer::Affine(a) => a.as_ref(),
-                scratchy_layers::layers_moe::FusedMoELayer::Dense(_) => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "FusedMoe bundle on Metal worker resolved to Dense variant — \
-                                 the macro should emit FusedMoELayer::load_affine for Metal MoE; \
-                                 reaching the Dense arm means a Dense BF16 checkpoint loaded \
-                                 through the Metal MoE path",
-                    });
-                }
-            };
-            match which {
-                WeightTensor::MoeRouterGate => affine.router_gate,
-                WeightTensor::MoeExpertGateW => affine.expert_gate_w,
-                WeightTensor::MoeExpertGateS => affine.expert_gate_scales,
-                WeightTensor::MoeExpertGateB => affine.expert_gate_biases,
-                WeightTensor::MoeExpertUpW => affine.expert_up_w,
-                WeightTensor::MoeExpertUpS => affine.expert_up_scales,
-                WeightTensor::MoeExpertUpB => affine.expert_up_biases,
-                WeightTensor::MoeExpertDownW => affine.expert_down_w,
-                WeightTensor::MoeExpertDownS => affine.expert_down_scales,
-                WeightTensor::MoeExpertDownB => affine.expert_down_biases,
-                // FusedMoe (Mixtral-style, no shared expert) cannot
-                // legitimately request Shared* tensors. The macro
-                // would only emit those bindings against
-                // SharedFusedMoe — surface as a lowering bug.
-                WeightTensor::MoeSharedGateUpW
-                | WeightTensor::MoeSharedGateUpS
-                | WeightTensor::MoeSharedGateUpB
-                | WeightTensor::MoeSharedDownW
-                | WeightTensor::MoeSharedDownS
-                | WeightTensor::MoeSharedDownB
-                | WeightTensor::MoeSharedExpertGate => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "MoeShared* WeightTensor requested against FusedMoe bundle — \
-                                 use SharedFusedMoe bundle for shared-expert tensors",
-                    });
-                }
-                WeightTensor::Weight
-                | WeightTensor::Bias
-                | WeightTensor::AffineScales
-                | WeightTensor::AffineBiases
-                | WeightTensor::AffineLinearBias
-                | WeightTensor::Nvfp4Scales
-                | WeightTensor::GemmaRouterGate
-                | WeightTensor::GemmaPerExpertScale
-                | WeightTensor::GemmaRouterScale
-                | WeightTensor::GdnConv1d
-                | WeightTensor::GdnALog
-                | WeightTensor::GdnDtBias
-                | WeightTensor::GdnNorm => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "non-Moe WeightTensor variant requested against FusedMoe bundle",
-                    });
-                }
-            }
-        }
-        WeightBundleKind::SharedFusedMoe => {
-            let layer_struct = weights.shared_fused_moe_at(bucket, op_idx, slot, layer);
-            let shared = match layer_struct {
-                scratchy_layers::layers_moe::SharedFusedMoELayer::Affine(a) => a.as_ref(),
-                scratchy_layers::layers_moe::SharedFusedMoELayer::Dense(_) => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "SharedFusedMoe bundle on Metal worker resolved to Dense variant",
-                    });
-                }
-            };
-            let routed = &shared.routed;
-            // Lowering only emits shared-* bindings when the layer's
-            // `shared_intermediate_size > 0`. None at runtime → the
-            // loader was built with shared_inter=0 but the macro
-            // baked a shared-expert tail into the Instruction
-            // payload anyway → lowering / loader split bug.
-            let shared_or_err = |opt: Option<scratchy_tensors::tensor::GpuTensor>| {
-                opt.ok_or(WorkerError::WeightLookupFailed {
-                    reason: "SharedFusedMoe shared-expert tensor binding fired but \
-                                 layer was loaded with shared_intermediate_size=0",
-                })
-            };
-            match which {
-                WeightTensor::MoeRouterGate => routed.router_gate,
-                WeightTensor::MoeExpertGateW => routed.expert_gate_w,
-                WeightTensor::MoeExpertGateS => routed.expert_gate_scales,
-                WeightTensor::MoeExpertGateB => routed.expert_gate_biases,
-                WeightTensor::MoeExpertUpW => routed.expert_up_w,
-                WeightTensor::MoeExpertUpS => routed.expert_up_scales,
-                WeightTensor::MoeExpertUpB => routed.expert_up_biases,
-                WeightTensor::MoeExpertDownW => routed.expert_down_w,
-                WeightTensor::MoeExpertDownS => routed.expert_down_scales,
-                WeightTensor::MoeExpertDownB => routed.expert_down_biases,
-                WeightTensor::MoeSharedGateUpW => shared_or_err(shared.shared_gate_up_w)?,
-                WeightTensor::MoeSharedGateUpS => shared_or_err(shared.shared_gate_up_scales)?,
-                WeightTensor::MoeSharedGateUpB => shared_or_err(shared.shared_gate_up_biases)?,
-                WeightTensor::MoeSharedDownW => shared_or_err(shared.shared_down_w)?,
-                WeightTensor::MoeSharedDownS => shared_or_err(shared.shared_down_scales)?,
-                WeightTensor::MoeSharedDownB => shared_or_err(shared.shared_down_biases)?,
-                WeightTensor::MoeSharedExpertGate => shared_or_err(shared.shared_expert_gate)?,
-                WeightTensor::Weight
-                | WeightTensor::Bias
-                | WeightTensor::AffineScales
-                | WeightTensor::AffineBiases
-                | WeightTensor::AffineLinearBias
-                | WeightTensor::Nvfp4Scales
-                | WeightTensor::GemmaRouterGate
-                | WeightTensor::GemmaPerExpertScale
-                | WeightTensor::GemmaRouterScale
-                | WeightTensor::GdnConv1d
-                | WeightTensor::GdnALog
-                | WeightTensor::GdnDtBias
-                | WeightTensor::GdnNorm => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "non-Moe WeightTensor variant requested against SharedFusedMoe \
-                                 bundle",
-                    });
-                }
-            }
-        }
-        // ── Gemma-4 router bundle (GemmaMoe op) ─────────────────────
-        //
-        // Resolves the dequant'd dense router gate, the per-expert score
-        // scale, and the RMSNorm gain off the GemmaRouterLayer struct.
-        WeightBundleKind::GemmaRouter => {
-            let r = weights.gemma_router_at(bucket, op_idx, slot, layer);
-            match which {
-                WeightTensor::GemmaRouterGate => r.gate,
-                WeightTensor::GemmaPerExpertScale => r.per_expert_scale,
-                WeightTensor::GemmaRouterScale => r.scale,
-                _ => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "non-GemmaRouter* WeightTensor requested against GemmaRouter bundle",
-                    });
-                }
-            }
-        }
-        // ── Gemma-4 SwitchGLU experts bundle (GemmaMoe op) ──────────
-        //
-        // Reuses the MoeExpert* WeightTensor variants (same expert-major
-        // affine layout) against the router-less SwitchGluExpertsLayer.
-        WeightBundleKind::GemmaSwitchGlu => {
-            let e = weights.gemma_switch_glu_at(bucket, op_idx, slot, layer);
-            match which {
-                WeightTensor::MoeExpertGateW => e.expert_gate_w,
-                WeightTensor::MoeExpertGateS => e.expert_gate_scales,
-                WeightTensor::MoeExpertGateB => e.expert_gate_biases,
-                WeightTensor::MoeExpertUpW => e.expert_up_w,
-                WeightTensor::MoeExpertUpS => e.expert_up_scales,
-                WeightTensor::MoeExpertUpB => e.expert_up_biases,
-                WeightTensor::MoeExpertDownW => e.expert_down_w,
-                WeightTensor::MoeExpertDownS => e.expert_down_scales,
-                WeightTensor::MoeExpertDownB => e.expert_down_biases,
-                _ => {
-                    return Err(WorkerError::WeightLookupFailed {
-                        reason: "non-MoeExpert* WeightTensor requested against GemmaSwitchGlu \
-                                 bundle (the router lives in the separate GemmaRouter bundle)",
-                    });
-                }
-            }
-        }
-    };
-    // The MLX-affine packed codes bind stored the way this command's kernel
-    // reads them.
-    let codes_operand = match kind {
-        WeightBundleKind::LinearLayer => {
-            matches!(which, WeightTensor::Weight)
-                && matches!(
-                    weights.linear_at(bucket, op_idx, slot, layer),
-                    scratchy_layers::LinearLayer::AffineQuant(_)
-                )
-        }
-        WeightBundleKind::AffineQuantEmbedding => matches!(which, WeightTensor::Weight),
-        WeightBundleKind::FusedMoe
-        | WeightBundleKind::SharedFusedMoe
-        | WeightBundleKind::GemmaSwitchGlu => matches!(
-            which,
-            WeightTensor::MoeExpertGateW
-                | WeightTensor::MoeExpertUpW
-                | WeightTensor::MoeExpertDownW
-                | WeightTensor::MoeSharedGateUpW
-                | WeightTensor::MoeSharedDownW
-        ),
-        _ => false,
-    };
-    if codes_operand {
-        return allocator
-            .bind_affine_codes(tensor.raw_ptr(), tensor.size_bytes(), codes)
-            .map_err(WorkerError::AffineCodes);
+        Ok(Self(table))
     }
-    allocator
-        .buffer_for(tensor.raw_ptr())
-        .ok_or(WorkerError::WeightLookupFailed {
-            reason: "weight pointer not in any MetalAllocator arena \
-                     — was it loaded through this allocator?",
+
+    fn get(
+        &self,
+        ix: SourceIx,
+        which: WeightTensor,
+        layer: LayerId,
+    ) -> Result<(Buffer, u64), WorkerError> {
+        let hit = self.0.get(&(ix, which, layer)).cloned();
+        hit.ok_or(WorkerError::SourceUnresolved {
+            ix,
+            source: "?",
+            which,
+            layer,
+            why: SourceMiss::NotResolved,
         })
+    }
 }
 
 /// Resolve every binding on `cmd` to (buffer, offset, binding-index).
@@ -1750,7 +1426,7 @@ fn resolve_weight<W: scratchy_ir::CanonicalParams + scratchy_ir::WeightAccessors
 /// don't have to thread the [`MetalAllocator`]'s arenas-`Mutex` lock
 /// guard through to the encoder.
 #[allow(clippy::too_many_arguments)]
-fn resolve_bindings<W: CanonicalParams>(
+fn resolve_bindings(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand,
@@ -1761,22 +1437,20 @@ fn resolve_bindings<W: CanonicalParams>(
     attn_unfused_scratch: Option<&Buffer>,
     moe_inline_buf: Option<&Buffer>,
     inline_cursor: &mut u32,
-    weights: &W,
-    allocator: &MetalAllocator,
+    sources: &ResolvedSources,
     runtime: &RuntimeBindings,
 ) -> Result<Vec<(Buffer, u64, u64)>, WorkerError> {
     let mut out: Vec<(Buffer, u64, u64)> = Vec::with_capacity(cmd.bindings.len());
     for binding in cmd.bindings {
         let (buf, off, idx) = match binding {
-            // Static-tape sources resolve through the tape's generated
-            // resolver before this legacy per-dispatch path runs; a
-            // Source binding reaching HERE means a static tape was fed
-            // to the legacy resolver — a wiring bug, refused loudly.
-            Binding::Source { .. } => {
-                return Err(WorkerError::WeightLookupFailed {
-                    reason: "Binding::Source reached the legacy binding resolver \
-                             (static tapes resolve sources at load, not per dispatch)",
-                });
+            Binding::Source {
+                ix,
+                which,
+                layer,
+                binding_index,
+            } => {
+                let (b, off) = sources.get(*ix, *which, *layer)?;
+                (b, off, *binding_index as u64)
             }
             Binding::ArenaSlot {
                 slot,
@@ -1792,46 +1466,6 @@ fn resolve_bindings<W: CanonicalParams>(
                     });
                 }
                 (arena[s].clone(), 0u64, *binding_index as u64)
-            }
-            Binding::Weight {
-                kind,
-                which,
-                layer,
-                locator,
-                binding_index,
-            } => {
-                // MRoPE text decoders (Qwen3.5-VL) override the static
-                // cos/sin RotaryCache with a per-forward, per-token
-                // band-split table built host-side (option (b)). The
-                // table lives in `runtime.mrope_cos_sin` and the rope
-                // kernel reads it with identity positions (`positions[t]
-                // = t`), so redirect the baked `WeightBundleKind::CosSin`
-                // pointer to that runtime buffer. Compile-time gated on
-                // `W::MROPE_SECTION` — folds away (zero cost, no behavior
-                // change) on every 1D-rope arch. Covers all cos/sin
-                // consumers at once (`RopeAppend`, `FusedQkvRopeCache`,
-                // the affine-fused QKV-rope path) since they all bind
-                // `CosSin` here.
-                if W::MROPE_SECTION.is_some() && matches!(kind, WeightBundleKind::CosSin) {
-                    (
-                        runtime
-                            .buffer_for(super::lowered::RuntimeBindingKind::MropeCosSin)
-                            .clone(),
-                        0u64,
-                        *binding_index as u64,
-                    )
-                } else {
-                    let (b, off) = resolve_weight(
-                        weights,
-                        allocator,
-                        kind,
-                        layer.get(),
-                        *which,
-                        *locator,
-                        crate::tape::kernel_constants::AffineCodes::of_constants(cmd.constants),
-                    )?;
-                    (b, off, *binding_index as u64)
-                }
             }
             Binding::Runtime {
                 kind,
@@ -2040,8 +1674,7 @@ fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
 mod tests {
     use super::*;
     use crate::interpreter::metal::lowered::{
-        Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, WeightBundleKind,
-        WeightLocator, WeightTensor,
+        Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, SourceRef, WeightTensor,
     };
     use crate::specialized_pipeline_cache::{ConstantValue, SpecializedPipelineCache};
     use scratchy_ir::CanonicalParams;
@@ -2128,9 +1761,17 @@ mod tests {
         let bucket_m = 512;
         for gather in [true, false] {
             let cmd = if gather {
-                crate::tape::lowering::gather_last_token_command(&p, 0, width)
+                crate::tape::lowering::gather_last_token_command(
+                    &p,
+                    crate::tape::ids::ArenaSlotIdx(0),
+                    width,
+                )
             } else {
-                crate::tape::lowering::scatter_first_to_last_row_command(&p, 0, width)
+                crate::tape::lowering::scatter_first_to_last_row_command(
+                    &p,
+                    crate::tape::ids::ArenaSlotIdx(0),
+                    width,
+                )
             };
             let pso = cache
                 .get_or_build(&crate::specialized_pipeline_cache::PipelineKey::new(
@@ -2182,8 +1823,8 @@ mod tests {
     }
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
-    /// instances the `WeightAccessors` impl below returns. Plays the
-    /// role of the per-canonical `Weights` struct the macro will emit.
+    /// instances its `ModelSources` impl below returns. Plays the
+    /// role of the per-canonical `Weights` struct the macro emits.
     struct TestWeights {
         rmsnorm_layer: RmsNorm,
         linear_layer: LinearLayer,
@@ -2212,24 +1853,30 @@ mod tests {
         const METAL_DTYPE: MetalDtype = MetalDtype::F16;
     }
 
-    // Weight resolution now flows through `WeightAccessors` (the WtFn
-    // thunk seam is gone). The synthetic tapes below bind `RmsNorm` and
-    // `LinearLayer` weight bundles, so this probe overrides exactly
-    // those two accessors to return its held layer instances; every
-    // other accessor keeps the trait's `unreachable!` default.
-    impl scratchy_ir::WeightAccessors for TestWeights {
-        fn rms_norm_at(&self, _bucket: u32, _op_idx: u32, _slot: u32, _layer: u32) -> &RmsNorm {
-            &self.rmsnorm_layer
-        }
-        fn linear_at(&self, _bucket: u32, _op_idx: u32, _slot: u32, _layer: u32) -> &LinearLayer {
-            &self.linear_layer
+    // `WeightAccessors` is a supertrait of `CanonicalParams` (every method defaults). The
+    // synthetic tapes below bind two model sources: the RmsNorm (0) and the LinearLayer (1).
+    impl scratchy_ir::WeightAccessors for TestWeights {}
+    const RMSNORM: SourceIx = SourceIx(0);
+    const LINEAR: SourceIx = SourceIx(1);
+    impl ModelSources for TestWeights {
+        const SOURCES: &'static [&'static str] = &["rmsnorm", "linear"];
+        fn source(&self, ix: SourceIx, _layer: LayerId) -> Option<SourceRef<'_>> {
+            match ix {
+                RMSNORM => Some(SourceRef::RmsNorm(&self.rmsnorm_layer)),
+                LINEAR => Some(SourceRef::Linear(&self.linear_layer)),
+                _ => None,
+            }
         }
     }
 
+    /// `tapes`' model sources, resolved as the pool resolves them.
+    fn sources(w: &TestWeights, a: &MetalAllocator, tapes: &[LoweredMetalTape]) -> ResolvedSources {
+        ResolvedSources::resolve(w, a, tapes).expect("sources resolve")
+    }
+
     /// Build a `TestWeights` + the `MetalAllocator` that owns its
-    /// MTLBuffer arenas. The allocator is also used by the pool to
-    /// resolve `Binding::Weight` lookups; tests that build a worker
-    /// directly thread the same allocator into `MetalWorker::new`.
+    /// MTLBuffer arenas. The allocator maps each resolved source's
+    /// tensor back to its `(MTLBuffer, offset)`.
     ///
     /// Allocations are zero-filled — sufficient for verifying the
     /// recording flow. Numerical correctness lives in `pipelines.rs`'s
@@ -2347,15 +1994,10 @@ mod tests {
                     slot: 1,
                     binding_index: 1,
                 },
-                Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm,
+                Binding::Source {
+                    ix: RMSNORM,
                     which: WeightTensor::Weight,
-                    layer: crate::interpreter::metal::ids::LayerId(0),
-                    locator: WeightLocator {
-                        bucket: 0,
-                        op_idx: 0,
-                        slot: 0,
-                    },
+                    layer: LayerId(0),
                     binding_index: 2,
                 },
             ]),
@@ -2384,15 +2026,10 @@ mod tests {
                     slot: 1,
                     binding_index: 1,
                 },
-                Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm,
+                Binding::Source {
+                    ix: RMSNORM,
                     which: WeightTensor::Weight,
-                    layer: crate::interpreter::metal::ids::LayerId(0),
-                    locator: WeightLocator {
-                        bucket: 0,
-                        op_idx: 0,
-                        slot: 0,
-                    },
+                    layer: LayerId(0),
                     binding_index: 2,
                 },
             ]),
@@ -2461,8 +2098,7 @@ mod tests {
             &arena_layout,
             &tapes,
             &pipelines,
-            &weights,
-            &allocator,
+            &sources(&weights, &allocator, &tapes),
             &runtime,
         )
         .expect("worker builds");
@@ -2519,8 +2155,7 @@ mod tests {
             &bad_layout,
             &tapes,
             &pipelines,
-            &weights,
-            &allocator,
+            &sources(&weights, &allocator, &tapes),
             &runtime,
         )
         .err()
@@ -2628,8 +2263,7 @@ mod tests {
             &vec![1024, 1024],
             &[tape],
             &pipelines,
-            &weights,
-            &allocator,
+            &sources(&weights, &allocator, &[tape]),
             &runtime,
         )
         .expect("worker bakes attention command");
@@ -2670,15 +2304,10 @@ mod tests {
                     slot: 1,
                     binding_index: 1,
                 },
-                Binding::Weight {
-                    kind: WeightBundleKind::LinearLayer,
+                Binding::Source {
+                    ix: LINEAR,
                     which: WeightTensor::Weight,
-                    layer: crate::interpreter::metal::ids::LayerId(0),
-                    locator: WeightLocator {
-                        bucket: 0,
-                        op_idx: 0,
-                        slot: 0,
-                    },
+                    layer: LayerId(0),
                     binding_index: 2,
                 },
             ]),
@@ -2727,8 +2356,7 @@ mod tests {
             &vec![64 * 1024, 64 * 1024],
             &[tape],
             &pipelines,
-            &weights,
-            &allocator,
+            &sources(&weights, &allocator, &[tape]),
             &runtime,
         )
         .expect("worker bakes GEMM command");
@@ -2790,15 +2418,10 @@ mod tests {
                     slot: 1,
                     binding_index: 1,
                 },
-                Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm,
+                Binding::Source {
+                    ix: RMSNORM,
                     which: WeightTensor::Weight,
-                    layer: crate::interpreter::metal::ids::LayerId(0),
-                    locator: WeightLocator {
-                        bucket: 0,
-                        op_idx: 0,
-                        slot: 0,
-                    },
+                    layer: LayerId(0),
                     binding_index: 2,
                 },
             ]),
@@ -2821,20 +2444,18 @@ mod tests {
                         slot: *slot,
                         binding_index: *binding_index,
                     },
-                    Binding::Weight {
-                        kind,
+                    Binding::Source {
+                        ix,
                         which,
                         layer,
-                        locator,
                         binding_index,
-                    } => Binding::Weight {
-                        kind: *kind,
+                    } => Binding::Source {
+                        ix: *ix,
                         which: *which,
                         layer: *layer,
-                        locator: *locator,
                         binding_index: *binding_index,
                     },
-                    _ => unreachable!("rmsnorm_pre uses only ArenaSlot + RmsNorm Weight"),
+                    _ => unreachable!("rmsnorm_pre uses only ArenaSlot + the RmsNorm source"),
                 })
                 .collect::<Vec<_>>()
                 .into_baked(),
@@ -2863,8 +2484,7 @@ mod tests {
             &vec![64 * 1024, 64 * 1024],
             &[tape],
             &pipelines,
-            &weights,
-            &allocator,
+            &sources(&weights, &allocator, &[tape]),
             &runtime,
         )
         .expect("worker bakes mixed tape");

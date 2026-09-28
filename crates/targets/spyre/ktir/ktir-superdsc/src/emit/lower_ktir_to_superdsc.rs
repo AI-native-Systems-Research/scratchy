@@ -4188,10 +4188,10 @@ mod elementwise_tests {
 
     // ── (ii) REFUSAL + A CONTROL THAT STILL LOWERS ────────────────────────────────────────────
 
-    /// ⛔ THE SHAPE THAT MOTIVATED THE GUARD, AND IT IS LIVE. `LoweredOp::BiasAdd =>
-    /// SubOp::Elementwise(EwKind::Add)` (`crates/compiler/subtile/src/subtile_ir.rs`) whose bias is
-    /// rank-1 `[D]` (`crates/compiler/macros/src/shape.rs`, `sig_bias_add`), and `BiasAdd` is ABSENT
-    /// from that file's `elementwise` column-tiling list, so its operands are taken WHOLE — a
+    /// ⛔ THE SHAPE THAT MOTIVATED THE GUARD, AND IT IS LIVE. `SubOp::Elementwise(EwKind::BiasAdd)`
+    /// lowers to this `add`, and its bias is rank-1 `[D]` (`crates/compiler/macros/src/shape.rs`,
+    /// `sig_bias_add`); `BiasAdd` is ABSENT from `lower_region`'s `elementwise` column-tiling list
+    /// (`crates/compiler/subtile/src/subtile_ir.rs`), so its operands are taken WHOLE — a
     /// `[1, D]` region against a `[m, D]` output. The emitter gave it the output's dims and said
     /// nothing.
     #[test]

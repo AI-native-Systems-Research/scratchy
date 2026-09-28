@@ -15,8 +15,13 @@
 //! validation computes with — not the correctness *oracle* (that is
 //! scratchy-target-metal non-mega at temp=0).
 
+// First, so the pattern it generates (`expansion_ops!`) is in textual scope for every module.
+#[macro_use]
+pub mod ops;
 pub mod fixtures;
 pub mod lower;
+/// The dataflow facts one persistent kernel needs to play a tape: waits, units, coherence.
+pub mod megakernel_plan;
 /// SubtileIR → KTIR (IBM Spyre target). The macro calls it under `-Fspyre`.
 /// ALSO needed by `-Fsuperdsc`: `emit_bundle` builds the source/dim manifest via
 /// `lower_graph_to_ktir`, which the sdsc bundle embeds — so gate on either.
@@ -28,8 +33,6 @@ pub mod lower;
 /// generated from `crates/models/arch/*/configs/*.json`. Always compiled: the tape carries a
 /// [`ktir_superdsc::head_counts::ModelAttnGeometry`] on every attention node, whatever the target.
 pub mod model_geometry;
-pub mod ops;
-pub mod subops;
 pub mod subtile_ir;
 // SDSC opspec — addressing/op LAW, not emission: `sdsc_abstract` and the shared geometry types
 // depend on it, so it stayed substrate while the lowering that consumes it moved to the spyre
@@ -63,8 +66,19 @@ pub use ktir_superdsc::{addr, sdsc_abstract, superdsc_error, superdsc_opspec};
 /// The compiler -> target handoff types (`TileId`, `SlotMap`, `SourceBinding`,
 /// `LoweredDecode`, `WeightKind`). Shared so a target's own compiler can name them.
 pub mod handoff;
+/// A target's KV codec steps, inserted around its coded KV writers and attentions.
+pub mod kv_codec;
+/// A target's sampled rows, inserted around the result matmul of a multi-row canonical.
+pub mod sample_rows;
 
 pub mod subtile_tape;
+/// Arena colours for the tape's slots, under a target's declared alias facts.
+pub mod tape_colouring;
+/// Which tape steps a target computes inside another step's fused command, under its declared
+/// fusion patterns.
+pub mod tape_folding;
+/// The unrolled tape read as steps over the source ops they compute.
+pub mod tape_steps;
 
 /// THE HOST TAPE — the program as data: the ordered host-side sequence of
 /// kernel launches, transfers and CPU steps that a compiled bundle's kernels

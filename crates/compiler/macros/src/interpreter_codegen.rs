@@ -1037,6 +1037,10 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
     }
 }
 
+#[cfg(any(
+    not(any(feature = "metal", feature = "spyre")),
+    all(test, feature = "spyre")
+))]
 /// Extract the field at position `idx` as a `u64` for loop-detection
 /// purposes (which only ever needs to compare scalar layer-style
 /// fields). Returns `None` for fields that aren't a single scalar
@@ -1801,6 +1805,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
     }
 }
 
+#[cfg(not(any(feature = "metal", feature = "spyre")))]
 /// Replace the field at position `idx` (interpreted as u32) with
 /// `new_val`. Used by `apply_loop_compression` to set per-row
 /// baselines for the iter-index field. Panics if `idx` is invalid
@@ -2990,14 +2995,6 @@ pub struct LoweredBucket {
     /// `(bucket, op_idx, slot)` against this parallel array to emit
     /// match arms — `op_idx` is the index into `instances`.
     pub weight_slots: Vec<Vec<WeightSlot>>,
-    /// Total size of the runtime tile table for this bucket.
-    /// Tape-path only: the ISel stream carries its slot table elsewhere.
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    pub num_slots: u32,
-    /// Slot index whose `Owned` entry is the bucket fn's return
-    /// value. Tape-path only, same reason as `num_slots`.
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    pub final_slot: u32,
     /// One `barrier_before` flag per entry in `instances`. `true`
     /// means a concurrency-aware backend (today: metal MTL4
     /// encoder) must serialize the dispatched instance against
@@ -3050,6 +3047,7 @@ impl ArchOpcodes {
         out
     }
 
+    #[cfg(not(any(feature = "metal", feature = "spyre")))]
     /// Iterate (variant_name, shape). Used by
     /// `apply_loop_compression` to build the per-variant layer-field
     /// position map.
@@ -3284,9 +3282,7 @@ pub fn apply_loop_compression(
             // bodies. `start` says WHERE the run was cut, and the shared re-roll deliberately
             // rotates that cut to the layer boundary with the fewest carried slots (see
             // `reroll_subtile_tape`'s phase rotation), so it legitimately differs from a search
-            // that just maximises span. Taking the shared phase is the POINT; that the rewrite
-            // preserves semantics at that phase is proven by `verify_loop_compression`, which
-            // replays the compressed stream against the original.
+            // that just maximises span. Taking the shared phase is the POINT.
             let shape = |r: &Option<(usize, usize, u32)>| r.map(|(_, p, i)| (p, i));
             assert!(
                 shape(&shared) == shape(&local),
@@ -3510,13 +3506,6 @@ pub(crate) fn repack_moe_expert_bits(
 /// Impl's `fan_out`, interleaves `Free` instances at drop-pass
 /// scheduling points, and registers each Impl's `OpcodeShape` into
 /// `arch_opcodes` for shape-checking + iter-index discovery.
-///
-/// `final_tile` is the `(TileId, output_slot)` whose slot index will
-/// be exposed as `LoweredBucket.final_slot`. The full forward passes
-/// `(fuf.last(), 0)`; the backbone-only forward passes the input of
-/// the skipped terminal subgraph. The drop pass is told to protect
-/// this slot via the caller's `protected` set, since the per-bucket
-/// fn `take_owned`s it as the return value.
 #[allow(clippy::too_many_arguments)]
 pub fn lower_bucket(
     fuf: &Fuf,
@@ -3535,13 +3524,8 @@ pub fn lower_bucket(
     // in the signature so calls stay symmetric with `colored_slot_map`.
     _protected: &HashSet<(TileId, u8)>,
     arch_opcodes: &mut ArchOpcodes,
-    // Feeds `final_slot`, which is tape-path only — see the field's gate.
-    _final_tile: (TileId, u8),
     slots: &SlotMap,
 ) -> LoweredBucket {
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    let num_slots = slots.total();
-
     // Aliases: every Impl's output_alias declares which of its
     // outputs borrow from an upstream owner.
     let mut alias_to_owner: HashMap<(TileId, u8), (TileId, u8)> = HashMap::new();
@@ -3877,17 +3861,11 @@ pub fn lower_bucket(
     }
 
     debug_assert_eq!(barriers.len(), instances.len());
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    let final_slot = slots.of(_final_tile.0, _final_tile.1);
 
     LoweredBucket {
         barriers,
         instances,
         weight_slots,
-        #[cfg(any(feature = "metal", feature = "spyre"))]
-        num_slots,
-        #[cfg(any(feature = "metal", feature = "spyre"))]
-        final_slot,
     }
 }
 
@@ -4835,8 +4813,6 @@ mod tests {
             ],
             barriers: vec![false; 3],
             weight_slots: vec![Vec::new(); 3],
-            num_slots: 1,
-            final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
         assert_eq!(lb.instances.len(), 2, "Loop + 1 body row");
@@ -4890,8 +4866,6 @@ mod tests {
             ],
             barriers: vec![false; 6],
             weight_slots: vec![Vec::new(); 6],
-            num_slots: 1,
-            final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
         assert_eq!(lb.instances.len(), 3, "Loop + 2 body rows");
@@ -4929,127 +4903,9 @@ mod tests {
             instances: original.clone(),
             barriers: vec![false; original.len()],
             weight_slots: vec![Vec::new(); original.len()],
-            num_slots: 1,
-            final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
         assert_eq!(lb.instances.len(), 1);
         assert_eq!(instruction_variant_name(&lb.instances[0]), "Free");
     }
-}
-
-// The metal/spyre roll proof: the rolled emission must expand to the un-rolled one.
-#[cfg(any(feature = "metal", feature = "spyre"))]
-/// Expand a loop-compressed instruction stream back to its full
-/// form and byte-compare against the pre-compression original —
-/// the compression's own correctness oracle, run at expansion
-/// (`layer = baseline + iteration`, mirroring the interpreter's
-/// `__layer + layer` arm computation). Returns the first mismatch.
-pub fn verify_loop_compression(
-    original: &[Instruction],
-    compressed: &[Instruction],
-    arch_opcodes: &ArchOpcodes,
-    iter_index_field_name: &str,
-) -> Result<(), String> {
-    let mut iter_idx: std::collections::HashMap<String, usize> = Default::default();
-    for (name, shape) in arch_opcodes.iter() {
-        for (i, (fname, _ty)) in shape.fields.iter().enumerate() {
-            if fname == iter_index_field_name {
-                iter_idx.insert(name.clone(), i);
-                break;
-            }
-        }
-    }
-    // ⛔ RECURSIVE, BECAUSE LOOPS NEST. gemma-4 rolls an outer six-layer cell (`SSSSSG`) with an
-    // inner loop over the five sliding layers, so the layer an inner row lands on is the SUM of
-    // every enclosing loop's `iteration * stride`. A flat walk would expand the outer body once
-    // and re-prove the inner loop against itself.
-    fn expand_into(
-        rows: &[Instruction],
-        base: u32,
-        iter_idx: &std::collections::HashMap<String, usize>,
-        out: &mut Vec<Instruction>,
-    ) {
-        let mut k = 0usize;
-        while k < rows.len() {
-            let inst = rows[k];
-            if let Instruction::Loop(iters, period, layer_stride) = inst {
-                let body = &rows[k + 1..k + 1 + period as usize];
-                for it in 0..iters {
-                    expand_into(body, base + it * layer_stride, iter_idx, out);
-                }
-                k += 1 + period as usize;
-            } else {
-                let name = instruction_variant_name(&inst);
-                out.push(match iter_idx.get(name) {
-                    Some(&fi) => {
-                        let at = instruction_field_at(&inst, fi).unwrap_or(0) as u32;
-                        instruction_with_field_set(inst, fi, at + base)
-                    }
-                    None => inst,
-                });
-                k += 1;
-            }
-        }
-    }
-    let mut expanded: Vec<Instruction> = Vec::new();
-    expand_into(compressed, 0, &iter_idx, &mut expanded);
-    if expanded.len() != original.len() {
-        return Err(format!(
-            "expanded len {} != original {}",
-            expanded.len(),
-            original.len()
-        ));
-    }
-    for (i, (a, b)) in original.iter().zip(expanded.iter()).enumerate() {
-        if format!("{a:?}") != format!("{b:?}") {
-            return Err(format!("row {i}: original={a:?} expanded={b:?}"));
-        }
-    }
-    Ok(())
-}
-
-// The metal/spyre roll proof: the rolled emission must expand to the un-rolled one.
-#[cfg(any(feature = "metal", feature = "spyre"))]
-/// Same oracle for the barrier stream: expand the compressed flags
-/// (Loop row = `false`, body slice replicated per iteration) and
-/// compare against the pre-compression flags.
-pub fn verify_loop_compression_barriers(
-    original: &[bool],
-    compressed_instances: &[Instruction],
-    compressed_barriers: &[bool],
-) -> Result<(), String> {
-    // ⛔ RECURSIVE, LIKE THE INSTRUCTION ORACLE. A nested body's rows would otherwise be copied
-    // verbatim per outer iteration WITHOUT expanding the inner loop, so the flag stream comes out
-    // short — measured on gemma-4 as `barrier expanded len 375 != original 662`.
-    fn expand_into(rows: &[Instruction], flags: &[bool], base: usize, out: &mut Vec<bool>) {
-        let mut k = 0usize;
-        while k < rows.len() {
-            if let Instruction::Loop(iters, period, _) = rows[k] {
-                let body = k + 1..k + 1 + period as usize;
-                for _ in 0..iters {
-                    expand_into(&rows[body.clone()], flags, base + body.start, out);
-                }
-                k = body.end;
-            } else {
-                out.push(flags[base + k]);
-                k += 1;
-            }
-        }
-    }
-    let mut expanded: Vec<bool> = Vec::new();
-    expand_into(compressed_instances, compressed_barriers, 0, &mut expanded);
-    if expanded.len() != original.len() {
-        return Err(format!(
-            "barrier expanded len {} != original {}",
-            expanded.len(),
-            original.len()
-        ));
-    }
-    for (i, (a, b)) in original.iter().zip(expanded.iter()).enumerate() {
-        if a != b {
-            return Err(format!("barrier row {i}: original={a} expanded={b}"));
-        }
-    }
-    Ok(())
 }

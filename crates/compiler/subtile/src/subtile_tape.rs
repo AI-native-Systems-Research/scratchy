@@ -1291,6 +1291,13 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
                 written[pid as usize] = Some(ptoken);
             }
         }
+        // ⭐ AN EFFECT FREES AT ITS STEP. A node nothing reads that is not the result (a KV
+        // codec's staging writes a runtime buffer, not a value) holds its slot while it computes
+        // only; left to the sweep below, its slot would outlive every layer body and trail the tape.
+        if consumer_remaining[nid as usize] == 0 && node.output.tensor != graph.result {
+            let effect = written[nid as usize].take().expect("written above");
+            builder.free_slot(effect);
+        }
     }
 
     // Free any leaf slots (no successors) that remain — typically the
@@ -1321,11 +1328,7 @@ enum KeyDepth {
 /// (every `SlotId` and the `SubtileId` node), so two structurally-
 /// identical per-layer copies hash the same. Mirrors `detect_repeating_run`
 /// in the interpreter codegen, applied to the SubtileTape `Instr` stream.
-fn reroll_fingerprint<F: crate::subtile_ir::RopeForm>(
-    instr: &Instr,
-    graph: &crate::subtile_ir::SubtileIR<F>,
-    depth: KeyDepth,
-) -> u64 {
+fn reroll_fingerprint(instr: &Instr, classes: &[u64]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -1337,11 +1340,7 @@ fn reroll_fingerprint<F: crate::subtile_ir::RopeForm>(
             // ⭐ WHAT THE NODE DOES, not merely how many operands it takes. Without this a
             // Gemm and an RmsNorm hash alike — and so do a sliding-window layer and a global
             // one, which is how gemma-3 re-rolled 26 layers onto one body.
-            let op = &graph.nodes[node.index()].op;
-            match depth {
-                KeyDepth::Class => op.reroll_class_key(&mut h),
-                KeyDepth::Shape => op.reroll_shape_key(&mut h),
-            }
+            classes[node.index()].hash(&mut h);
             // Structural shape of the inputs (kinds + arity), ids masked.
             inputs.len().hash(&mut h);
             for ci in inputs.iter() {
@@ -1403,9 +1402,10 @@ pub fn class_fingerprints<F: crate::subtile_ir::RopeForm>(
     tape: &SubtileTape,
     graph: &crate::subtile_ir::SubtileIR<F>,
 ) -> Vec<u64> {
+    let classes = node_classes(graph, KeyDepth::Class);
     tape.instrs
         .iter()
-        .map(|i| reroll_fingerprint(i, graph, KeyDepth::Class))
+        .map(|i| reroll_fingerprint(i, &classes))
         .collect()
 }
 
@@ -1414,9 +1414,10 @@ pub fn shape_fingerprints<F: crate::subtile_ir::RopeForm>(
     tape: &SubtileTape,
     graph: &crate::subtile_ir::SubtileIR<F>,
 ) -> Vec<u64> {
+    let classes = node_classes(graph, KeyDepth::Shape);
     tape.instrs
         .iter()
-        .map(|i| reroll_fingerprint(i, graph, KeyDepth::Shape))
+        .map(|i| reroll_fingerprint(i, &classes))
         .collect()
 }
 
@@ -1616,6 +1617,41 @@ pub fn layer_class_plan<F: crate::subtile_ir::RopeForm>(
     }
     out.push(RollPlan::Steps(end..shape.len()));
     Some(out)
+}
+
+/// Every node's re-roll class at `depth`: its op's ([`crate::subtile_ir::SubOp::reroll_class_key`]
+/// or [`crate::subtile_ir::SubOp::reroll_shape_key`]).
+///
+/// ⭐ A CONSTRUCT'S EXPANSION IS ONE PROGRAM. A step of an expanded construct (a MoE block,
+/// `expansion_ops!`) also carries the classes of the construct's steps it reads, so the block's
+/// class reaches its last step: a weighted sum over 8-bit experts is not its 4-bit twin, and a
+/// run boundary falls after a differing block, never inside it.
+fn node_classes<F: crate::subtile_ir::RopeForm>(
+    graph: &crate::subtile_ir::SubtileIR<F>,
+    depth: KeyDepth,
+) -> Vec<u64> {
+    use crate::subtile_ir::SubOp;
+    use std::collections::hash_map::{DefaultHasher, HashMap};
+    use std::hash::{Hash, Hasher};
+    let mut classes: Vec<u64> = Vec::with_capacity(graph.nodes.len());
+    let mut step_of: HashMap<crate::subtile_ir::TensorId, usize> = HashMap::new();
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let mut h = DefaultHasher::new();
+        match depth {
+            KeyDepth::Class => node.op.reroll_class_key(&mut h),
+            KeyDepth::Shape => node.op.reroll_shape_key(&mut h),
+        }
+        if matches!(node.op, expansion_ops!()) {
+            for input in &node.inputs {
+                if let Some(&p) = step_of.get(&input.tensor) {
+                    classes[p].hash(&mut h);
+                }
+            }
+            step_of.insert(node.output.tensor, i);
+        }
+        classes.push(h.finish());
+    }
+    classes
 }
 
 pub fn find_layer_loop<F: crate::subtile_ir::RopeForm>(
@@ -2919,5 +2955,72 @@ pub(crate) mod tests {
     /// so the numeric module shares ONE source of truth for the fixture.
     pub(crate) fn per_layer_weight_chain_graph() -> SubtileIR<NeoX> {
         per_layer_weight_chain()
+    }
+
+    /// Two MoE blocks whose experts differ only in width: the steps after the projection (the
+    /// weighted sum) carry the difference, so a run boundary cannot fall inside the block; the
+    /// router steps ahead of it do not.
+    #[test]
+    fn an_expanded_block_carries_its_class_to_its_last_step() {
+        use crate::lower::{ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc};
+        use crate::subtile_ir::{
+            ExpertBundle, ExpertProj, NumExperts, RouterBundle, SharedExpertBound, SourceShape,
+            TopK, lower_region,
+        };
+        use InputRef::{Ext, Op};
+        let nz = |n| std::num::NonZeroU32::new(n).unwrap();
+        let (experts, k) = (NumExperts::new(nz(4)), TopK::new(nz(2)));
+        let (router, bundle) = (RouterBundle::Fused, ExpertBundle::Fused);
+        let op = |op, inputs| OpDesc { op, m: 1, inputs };
+        let weight = GemmWeight::Dense;
+        let mut ops = vec![];
+        for bits in [8, 4] {
+            // Each block reads a projection, as a layer's MoE reads its norm.
+            let input = ops.len().checked_sub(1).map_or(Ext(0), Op);
+            ops.push(op(SubOp::MatmulTile { n: 64, weight }, vec![input, Ext(1)]));
+            let x = ops.len() - 1;
+            let quant = ExpertQuant::declared(64, bits);
+            let proj = ExpertProj::Gate;
+            let shared = SharedExpertBound(None);
+            ops.extend([
+                op(SubOp::RouterLogits { experts, router }, vec![Op(x), Ext(2)]),
+                op(SubOp::RouteArgsort, vec![Op(x + 1)]),
+                op(SubOp::RouteTopK { k }, vec![Op(x + 2)]),
+                op(SubOp::RouteGatherScores, vec![Op(x + 1), Op(x + 3)]),
+                op(
+                    SubOp::ExpertSort { experts, k, bundle },
+                    vec![Op(x), Op(x + 3)],
+                ),
+                op(
+                    SubOp::ExpertMatmul {
+                        proj,
+                        n: 64,
+                        k,
+                        quant,
+                        bundle,
+                    },
+                    vec![Op(x + 5), Op(x + 5), Ext(2)],
+                ),
+                op(
+                    SubOp::ExpertCombine { hidden: 64, shared },
+                    vec![Op(x + 6), Op(x + 4)],
+                ),
+            ]);
+        }
+        let input = LoweringInput {
+            sources: [(1, 64), (64, 64), (1, 1)]
+                .map(|(rows, cols)| SourceShape { rows, cols })
+                .to_vec(),
+            result: ops.len() - 1,
+            ops,
+        };
+        let classes = node_classes(
+            &lower_region(&input, std::num::NonZeroU32::MAX),
+            KeyDepth::Class,
+        );
+        let (first, second) = (&classes[1..8], &classes[9..16]);
+        assert_eq!(first[..5], second[..5], "the routers are the same program");
+        assert_ne!(first[5], second[5], "the projections differ in width");
+        assert_ne!(first[6], second[6], "so do the weighted sums over them");
     }
 }

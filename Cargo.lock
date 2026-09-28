@@ -3674,10 +3674,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "hf-hub-downloader",
  "objc2-metal",
  "proc-macro2",
  "rayon",
  "scratchy-core-config",
+ "scratchy-core-model",
  "scratchy-forward-compiler",
  "scratchy-forward-compiler-macro",
  "scratchy-layers",
@@ -3688,6 +3690,8 @@ dependencies = [
  "scratchy-tensors",
  "scratchy-vision",
  "serde_json",
+ "sha2 0.11.0",
+ "tokenizers 0.23.2",
  "ureq 3.4.2",
 ]
 

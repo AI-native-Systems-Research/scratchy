@@ -1,253 +1,232 @@
-//! THE op registry — the single declaration site for the tape vocabulary.
+//! THE op registry — the single declaration site for the facts of THE op vocabulary,
+//! [`crate::subtile_ir::SubOp`].
 //!
-//! Every fact a consumer needs about a [`crate::lower::LoweredOp`] beyond
-//! its prose docs — its fields, operand arity, and output-width rule — is
-//! declared ONCE here as an X-macro row. Consumers (the enum lock guard,
-//! `op_out_cols`, the emitter in the `#[forward]` macro crate, per-target
-//! support tables, refusal lists) each invoke [`for_each_lowered_op!`]
-//! with their own callback and generate their site from the same rows.
+//! Every fact a consumer needs about an op beyond its prose docs — its kind, its name, its
+//! operand arity and its output-width rule — is declared ONCE here as an X-macro row, for the op
+//! as the front end states it and as a lowered node performs it alike (the two are one enum, at
+//! two [`crate::subtile_ir::OpStage`]s). Consumers (the IR validator, `lower_region`'s output
+//! widths, the fixtures, per-target fusion tables keyed on [`SubOpKind`], refusal messages) each
+//! invoke [`crate::for_each_subop!`] with their own callback and generate their site from the
+//! same rows.
 //!
-//! Adding an op = adding ONE row here (plus the enum variant with its
-//! prose docs, which the lock guard below forces to stay in sync — a
-//! missing or drifted variant is a compile error at the guard match, not
-//! a silently-unhandled case nine files away). This exists because the
-//! previous attempt at the metal/spyre unification wrote each of these
-//! facts by hand at every site: one op touched nine files, and every slot
-//! bug of that branch traced to one site disagreeing with another.
+//! Adding an op = adding its variant (with its prose docs) and ONE row here. Every generated
+//! match is exhaustive over the enum, so a variant without a row is a compile error at the
+//! generated site, not a silently-unhandled case nine files away. This exists because a previous
+//! attempt at the metal/spyre unification wrote each of these facts by hand at every site: one op
+//! touched nine files, and every slot bug of that branch traced to one site disagreeing with
+//! another.
 //!
-//! Row grammar:
-//! `Name { fields } , arity = (|n| <bool over n>), cols = <class>;`
-//! - `arity` is a closure-form predicate over the operand count (the
-//!   binder is declared IN the row so macro hygiene ties it to the body).
+//! Row grammar: `Kind [<pattern>] arity = (|n| <bool over n>), cols = <class>;`
+//! - `Kind` names the op in [`SubOpKind`] and in [`crate::subtile_ir::SubOp::name`]; for a
+//!   variant with fields it is the variant's own name.
+//! - The pattern is a real match pattern, so an elementwise kind (`Elementwise(EwKind::Silu)`) is
+//!   a row in its own right rather than a special case the consumer has to unpack.
+//! - `arity` is a closure-form predicate over the operand count (the binder is declared IN the
+//!   row so macro hygiene ties it to the body).
 //! - `cols` is one of (bracketed so it stays one macro token tree):
 //!   - `[in0]` — shape-preserving: output width = `inputs[0]` width;
 //!   - `[in1]` — output width = `inputs[1]` width (GDN's z operand);
+//!   - `[one]` — one column per row (a row reduction);
 //!   - `[field f]` — output width is the op's own field `f`;
-//!   - `[expr |op| ...]` — computed from the op's fields.
+//!   - `[nz f]` — the op's own non-zero count field `f` (`.get()`);
+//!   - `[pairs in0 k]` / `[pairs f k]` — `(token, expert)` pair rows laid out `[m, k·w]`, `w` the
+//!     width of operand 0 or of the op's field `f`, `k` the op's top-k field;
+//!   - `[q_width g]` — the query width of the op's head geometry field `g`.
+//!
+//! Rows after `@expansion` are the ops one construct expands to (an arch-level MoE block, or the KV
+//! codec or sampled rows a target's facts insert); they also generate `expansion_ops!()`, the
+//! pattern a target without them refuses by.
 
-/// X-macro over every [`crate::lower::LoweredOp`]. Callbacks receive the
-/// full row list and pick what they need.
+/// X-macro over every op of [`crate::subtile_ir::SubOp`]. Callbacks receive the full row list.
 #[macro_export]
-macro_rules! for_each_lowered_op {
+macro_rules! for_each_subop {
     ($cb:ident) => {
         $cb! {
-            Gemm { n: u32, weight: GemmWeight },
-                arity = (|n| n == 2 || n == 3),
-                cols = [field n];
-            RmsNorm { eps: f32, gain_offset: f32 },
-                arity = (|n| n == 2),
-                cols = [in0];
-            Silu {},
-                arity = (|n| n == 1),
-                cols = [in0];
-            Gelu {},
-                arity = (|n| n == 1),
-                cols = [in0];
-            TanhSoftCap {},
-                arity = (|n| n == 1),
-                cols = [in0];
-            RmsNormUnit { eps: f32 },
-                arity = (|n| n == 1),
-                cols = [in0];
-            ScalarWeightMul {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            Moe { qwen_shared: bool, num_experts: u32, top_k: u32, moe_inter: u32, shared_inter: u32, norm_topk: bool, group_size: u32, bits: u32 },
-                arity = (|n| n == 2),
-                cols = [in0];
-            GemmaMoe { num_experts: u32, top_k: u32, moe_inter: u32, group_size: u32, bits: u32 },
-                arity = (|n| n == 4),
-                cols = [in0];
-            LoadPixels { in_features: u32 },
-                arity = (|n| n == 0),
-                cols = [field in_features];
-            LoadPosEmbeds { width: u32 },
-                arity = (|n| n == 0),
-                cols = [field width];
-            EmbeddingGather { indices_kind: u8 },
-                arity = (|n| n == 1),
-                cols = [in0];
-            VisionRope {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            QuickGelu {},
-                arity = (|n| n == 1),
-                cols = [in0];
-            GeluErf {},
-                arity = (|n| n == 1),
-                cols = [in0];
-            VarlenAttention { cu_kind: u8 },
-                arity = (|n| n == 3),
-                cols = [in0];
-            EncoderAttn { geom: ModelAttnGeometry, scale: f32 },
-                arity = (|n| n == 3),
-                cols = [expr |op| op_encoder_q_width(op)];
-            GatedDeltaNet {},
-                arity = (|n| n == 5),
-                cols = [in1];
-            GateSplit { half_cols: u32 },
-                arity = (|n| n == 1),
-                cols = [field half_cols];
-            GateApply {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            GateScale {},
-                arity = (|n| n == 3),
-                cols = [in0];
-            Mul {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            ScalarMul { scale: f32 },
-                arity = (|n| n == 1),
-                cols = [in0];
-            SiluMul {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            Add {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            Mean {},
-                arity = (|n| n == 1),
-                cols = [expr |_op| 1u32];
-            Sub {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            BiasAdd {},
-                arity = (|n| n == 2),
-                cols = [in0];
-            Reshape { rows_mult: u32, rows_div: u32, cols: u32 },
-                arity = (|n| n == 1),
-                cols = [field cols];
-            RopeRotate { head_dim: HeadDim },
-                arity = (|n| n == 3),
-                cols = [in0];
-            RopeAppend { head_dim: HeadDim, layer: u32, is_global: bool, interleaved: bool },
-                arity = (|n| n == 4),
-                cols = [in0];
-            AttnDecode { geom: ModelAttnGeometry, scale: f32, valid_len: u32, sliding: bool },
-                arity = (|n| n >= 3),
-                cols = [expr |op| op_geom_q_width(op)];
+            // 2 = [act, W] fp16 / affine; 3 = [act, W, w_scale] fp8 W8A8.
+            MatmulTile [SubOp::MatmulTile { .. }] arity = (|n| n == 2 || n == 3), cols = [field n];
+            SumReduce [SubOp::SumReduce { .. }] arity = (|n| n >= 1), cols = [in0];
+            Reshape [SubOp::Reshape { .. }] arity = (|n| n == 1), cols = [field cols];
+            Silu [SubOp::Elementwise(EwKind::Silu)] arity = (|n| n == 1), cols = [in0];
+            Gelu [SubOp::Elementwise(EwKind::Gelu)] arity = (|n| n == 1), cols = [in0];
+            QuickGelu [SubOp::Elementwise(EwKind::QuickGelu)] arity = (|n| n == 1), cols = [in0];
+            GeluErf [SubOp::Elementwise(EwKind::GeluErf)] arity = (|n| n == 1), cols = [in0];
+            Mul [SubOp::Elementwise(EwKind::Mul)] arity = (|n| n == 2), cols = [in0];
+            Add [SubOp::Elementwise(EwKind::Add)] arity = (|n| n == 2), cols = [in0];
+            Sub [SubOp::Elementwise(EwKind::Sub)] arity = (|n| n == 2), cols = [in0];
+            BiasAdd [SubOp::Elementwise(EwKind::BiasAdd)] arity = (|n| n == 2), cols = [in0];
+            ScalarMul [SubOp::ScalarMul { .. }] arity = (|n| n == 1), cols = [in0];
+            SiluMul [SubOp::SiluMul] arity = (|n| n == 2), cols = [in0];
+            RmsNorm [SubOp::RmsNorm { .. }] arity = (|n| n == 2), cols = [in0];
+            RmsNormReduce [SubOp::RmsNormReduce { .. }] arity = (|n| n == 1), cols = [one];
+            RmsNormApply [SubOp::RmsNormApply { .. }] arity = (|n| n == 3), cols = [in0];
+            RopeRotate [SubOp::RopeRotate { .. }] arity = (|n| n == 3), cols = [in0];
+            // E.12: RopeAppend takes [K, cos, sin, V, K_cache, V_cache]
+            // — the caches are per-layer PrefixK / PrefixV sources used
+            // as TMA-store destinations for the new decode token's K/V.
+            RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0];
+            // `[Q, (K_seg, V_seg)...]`.
+            AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| n >= 3 && n % 2 == 1),
+                cols = [q_width geom];
+            TanhSoftCap [SubOp::TanhSoftCap] arity = (|n| n == 1), cols = [in0];
+            RmsNormUnit [SubOp::RmsNormUnit { .. }] arity = (|n| n == 1), cols = [in0];
+            ScalarWeightMul [SubOp::ScalarWeightMul] arity = (|n| n == 2), cols = [in0];
+            GateSplit [SubOp::GateSplit { .. }] arity = (|n| n == 1), cols = [field half_cols];
+            GateApply [SubOp::GateApply] arity = (|n| n == 2), cols = [in0];
+            GateScale [SubOp::GateScale] arity = (|n| n == 3), cols = [in0];
+            // Host-staged: the buffer is delivered by the runtime, not by an operand.
+            LoadPixels [SubOp::LoadPixels { .. }] arity = (|n| n == 0), cols = [field in_features];
+            LoadPosEmbeds [SubOp::LoadPosEmbeds { .. }] arity = (|n| n == 0), cols = [field width];
+            // The index table is a runtime input, not an operand — hence ONE.
+            EmbeddingGather [SubOp::EmbeddingGather { .. }] arity = (|n| n == 1), cols = [in0];
+            VisionRope [SubOp::VisionRope] arity = (|n| n == 2), cols = [in0];
+            VarlenAttention [SubOp::VarlenAttention { .. }] arity = (|n| n == 3), cols = [in0];
+            EncoderAttn [SubOp::EncoderAttn { .. }] arity = (|n| n == 3), cols = [q_width geom];
+            GatedDeltaNet [SubOp::GatedDeltaNet] arity = (|n| n == 5), cols = [in1];
+            Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one];
+            // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
+            // also generating `expansion_ops!()`, the pattern a target without them refuses by.
+            @expansion
+            KvEncode [SubOp::KvEncode { .. }] arity = (|n| n == 2 || n == 3), cols = [one];
+            KvStage [SubOp::KvStage { .. }] arity = (|n| n == 1), cols = [one];
+            RotateRows [SubOp::RotateRows { .. }] arity = (|n| n == 1), cols = [in0];
+            AttnPackedKv [SubOp::AttnPackedKv] arity = (|n| n == 4), cols = [in1];
+            RouterNorm [SubOp::RouterNorm { .. }] arity = (|n| n == 2), cols = [in0];
+            RouterLogits [SubOp::RouterLogits { .. }] arity = (|n| n == 2), cols = [nz experts];
+            RouteSoftmax [SubOp::RouteSoftmax] arity = (|n| n == 1), cols = [in0];
+            RouteArgsort [SubOp::RouteArgsort] arity = (|n| n == 1), cols = [in0];
+            RouteTopK [SubOp::RouteTopK { .. }] arity = (|n| n == 1), cols = [nz k];
+            RouteGatherScores [SubOp::RouteGatherScores] arity = (|n| n == 2), cols = [in1];
+            RouteScale [SubOp::RouteScale { .. }] arity = (|n| n == 1), cols = [in0];
+            RouteRenorm [SubOp::RouteRenorm] arity = (|n| n == 1), cols = [in0];
+            RouteExpertScale [SubOp::RouteExpertScale { .. }] arity = (|n| n == 3), cols = [in0];
+            ExpertSort [SubOp::ExpertSort { .. }] arity = (|n| n == 2), cols = [pairs in0 k];
+            ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = (|n| n == 3), cols = [pairs n k];
+            ExpertGatedAct [SubOp::ExpertGatedAct { .. }] arity = (|n| n == 2), cols = [in0];
+            ExpertUnsort [SubOp::ExpertUnsort] arity = (|n| n == 2), cols = [in0];
+            ExpertCombine [SubOp::ExpertCombine { .. }] arity = (|n| n == 2), cols = [field hidden];
+            SampleRowsGather [SubOp::SampleRowsGather] arity = (|n| n == 1), cols = [in0];
+            SampleRowsScatter [SubOp::SampleRowsScatter] arity = (|n| n == 1), cols = [in0];
+            // `[rows, over, weight]`, or `[.., weight, w_scale]` for an fp8 matmul.
+            AllRowsMatmul [SubOp::AllRowsMatmul] arity = (|n| n == 3 || n == 4), cols = [in1];
         }
     };
 }
-
-/// `cols = expr(...)` helper for [`AttnDecode`]: the registry row can't
-/// name `geom` positionally, so the expression routes through this fn.
-pub(crate) fn op_encoder_q_width(op: &crate::lower::LoweredOp) -> u32 {
-    match op {
-        crate::lower::LoweredOp::EncoderAttn { geom, .. } => geom.q_width(),
-        _ => unreachable!("registry routes only EncoderAttn here"),
-    }
-}
-
-pub(crate) fn op_geom_q_width(op: &crate::lower::LoweredOp) -> u32 {
-    match op {
-        crate::lower::LoweredOp::AttnDecode { geom, .. } => geom.q_width(),
-        _ => unreachable!("op_geom_q_width called on a non-AttnDecode row"),
-    }
-}
-
-// ── Lock guard ──────────────────────────────────────────────────────
-// A match generated from the registry, over the hand-written enum, with
-// every declared field bound by name. If the enum gains a variant the
-// registry lacks: non-exhaustive match → compile error HERE. If the
-// registry names a field the enum lacks (or drops one): pattern error
-// HERE. The prose docs stay on the enum; the facts stay here; the
-// compiler holds them together.
-macro_rules! __lock_registry_to_enum {
-    ($( $name:ident { $($f:ident : $t:ty),* $(,)? },
-         arity = (|$an:ident| $arity:expr),
-         cols = $cols:tt; )*) => {
-        #[allow(unused_variables, dead_code)]
-        pub(crate) fn __registry_lock(op: &crate::lower::LoweredOp) {
-            use crate::lower::LoweredOp;
-            match op {
-                $( LoweredOp::$name { $($f),* } => {} )*
-            }
-        }
-    };
-}
-for_each_lowered_op!(__lock_registry_to_enum);
-
-// ── Derived: operand-arity check ────────────────────────────────────
-macro_rules! __derive_arity {
-    ($( $name:ident { $($f:ident : $t:ty),* $(,)? },
-         arity = (|$an:ident| $arity:expr),
-         cols = $cols:tt; )*) => {
-        /// Whether `n` operands is legal for `op` — derived from the
-        /// registry, used by the IR validator.
-        pub fn lowered_op_arity_ok(op: &crate::lower::LoweredOp, n_operands: usize) -> bool {
-            use crate::lower::LoweredOp;
-            match op {
-                $( LoweredOp::$name { .. } => {
-                    let $an = n_operands;
-                    $arity
-                } )*
-            }
-        }
-    };
-}
-for_each_lowered_op!(__derive_arity);
 
 // ── Derived: output width ───────────────────────────────────────────
-macro_rules! __derive_out_cols_arm {
-    (@arm $op:ident, $w:ident, $name:ident, [in0]) => {
+// The arm's pattern and body come from one row's `cols` class; a field-reading class binds the
+// row's own field name in the pattern, so no arm needs a nested match.
+macro_rules! __out_cols_pat {
+    ($kind:ident, $pat:pat, [field $f:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $f, .. }
+    };
+    ($kind:ident, $pat:pat, [q_width $g:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $g, .. }
+    };
+    ($kind:ident, $pat:pat, [nz $f:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $f, .. }
+    };
+    ($kind:ident, $pat:pat, [pairs in0 $k:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $k, .. }
+    };
+    ($kind:ident, $pat:pat, [pairs $f:ident $k:ident]) => {
+        $crate::subtile_ir::SubOp::$kind { $f, $k, .. }
+    };
+    ($kind:ident, $pat:pat, $cols:tt) => {
+        $pat
+    };
+}
+macro_rules! __out_cols_body {
+    ($w:ident, [in0]) => {
         $w(0)
     };
-    (@arm $op:ident, $w:ident, $name:ident, [in1]) => {
+    ($w:ident, [in1]) => {
         $w(1)
     };
-    (@arm $op:ident, $w:ident, $name:ident, [field $f:ident]) => {
-        match $op {
-            crate::lower::LoweredOp::$name { $f, .. } => *$f,
-            _ => unreachable!(),
-        }
+    ($w:ident, [one]) => {
+        1u32
     };
-    (@arm $op:ident, $w:ident, $name:ident, [expr |$p:ident| $e:expr]) => {{
-        let $p = $op;
-        $e
-    }};
-}
-macro_rules! __derive_out_cols {
-    ($( $name:ident { $($f:ident : $t:ty),* $(,)? },
-         arity = (|$an:ident| $arity:expr),
-         cols = $cols:tt; )*) => {
-        /// Output column count of `op` — derived from the registry.
-        ///
-        /// `operand_cols(k)` yields the width of operand `k`; a row
-        /// declaring `[in0]`/`[in1]` calls it, the other classes never
-        /// do. Taking a LOOKUP rather than just `in0_cols` is what lets
-        /// this serve every consumer: the fixtures path used to keep a
-        /// hand-written copy of this match purely because GDN's width
-        /// comes from operand 1, and that copy is the kind of second
-        /// site the registry exists to prevent.
-        pub fn lowered_op_out_cols(
-            op: &crate::lower::LoweredOp,
-            operand_cols: impl Fn(usize) -> u32,
-        ) -> u32 {
-            use crate::lower::LoweredOp;
-            match op {
-                $( LoweredOp::$name { .. } =>
-                    __derive_out_cols_arm!(@arm op, operand_cols, $name, $cols), )*
-            }
-        }
+    ($w:ident, [field $f:ident]) => {
+        *$f
+    };
+    ($w:ident, [q_width $g:ident]) => {
+        $g.q_width()
+    };
+    ($w:ident, [nz $f:ident]) => {
+        $f.get()
+    };
+    ($w:ident, [pairs in0 $k:ident]) => {
+        $w(0) * $k.get()
+    };
+    ($w:ident, [pairs $f:ident $k:ident]) => {
+        *$f * $k.get()
     };
 }
-for_each_lowered_op!(__derive_out_cols);
 
-// ── Derived: stable name strings (histograms, audit notes, refusals) ─
-macro_rules! __derive_names {
-    ($( $name:ident { $($f:ident : $t:ty),* $(,)? },
-         arity = (|$an:ident| $arity:expr),
-         cols = $cols:tt; )*) => {
-        /// The op's registry name — derived; for dumps and refusal
-        /// messages, so no consumer hand-writes a parallel string table.
-        pub fn lowered_op_name(op: &crate::lower::LoweredOp) -> &'static str {
-            use crate::lower::LoweredOp;
-            match op {
-                $( LoweredOp::$name { .. } => stringify!($name), )*
+macro_rules! __derive_registry {
+    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt; )*
+     @expansion $( $ek:ident [$ep:pat] arity = (|$ean:ident| $ea:expr), cols = $ec:tt; )*) => {
+        __derive_registry! {
+            $( $kind [$pat] arity = (|$an| $arity), cols = $cols; )*
+            $( $ek [$ep] arity = (|$ean| $ea), cols = $ec; )*
+        }
+
+        /// Every op an arch-level construct expands to, as ONE match pattern (use it with
+        /// `SubOp` in scope): the arm a target that realizes none of them refuses them by.
+        #[macro_export]
+        macro_rules! expansion_ops {
+            () => {
+                $( $ep )|*
+            };
+        }
+    };
+    ($( $kind:ident [$pat:pat] arity = (|$an:ident| $arity:expr), cols = $cols:tt; )*) => {
+        /// An op without its fields: how a declared target table names an op. Derived from the
+        /// registry, so no table keeps a parallel list.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum SubOpKind {
+            $( $kind, )*
+        }
+
+        impl<F: $crate::subtile_ir::RopeForm, S: $crate::subtile_ir::OpStage>
+            $crate::subtile_ir::SubOp<F, S>
+        {
+            /// The op's kind.
+            pub fn kind(&self) -> SubOpKind {
+                use $crate::subtile_ir::{EwKind, SubOp};
+                match self {
+                    $( $pat => SubOpKind::$kind, )*
+                }
+            }
+
+            /// The op's registry name — for dumps and refusal messages, so no consumer
+            /// hand-writes a parallel string table.
+            pub fn name(&self) -> &'static str {
+                use $crate::subtile_ir::{EwKind, SubOp};
+                match self {
+                    $( $pat => stringify!($kind), )*
+                }
+            }
+
+            /// Whether `n_operands` is legal for the op — used by the IR validator.
+            pub fn arity_ok(&self, n_operands: usize) -> bool {
+                use $crate::subtile_ir::{EwKind, SubOp};
+                match self {
+                    $( $pat => { let $an = n_operands; $arity } )*
+                }
+            }
+
+            /// The op's output column count. `operand_cols(k)` yields the width of operand
+            /// `k`; a row declaring `[in0]`/`[in1]` calls it, the other classes never do.
+            /// Taking a LOOKUP rather than just `in0_cols` is what lets this serve every
+            /// consumer: GDN's width comes from operand 1.
+            pub fn out_cols(&self, operand_cols: impl Fn(usize) -> u32) -> u32 {
+                use $crate::subtile_ir::{EwKind, SubOp};
+                match self {
+                    $( __out_cols_pat!($kind, $pat, $cols) =>
+                        __out_cols_body!(operand_cols, $cols), )*
+                }
             }
         }
     };
 }
-for_each_lowered_op!(__derive_names);
+for_each_subop!(__derive_registry);

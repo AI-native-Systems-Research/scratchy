@@ -46,11 +46,12 @@ pub fn wave_levels(input: &LoweringInput) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower::{LoweredOp, OpDesc};
+    use crate::lower::OpDesc;
+    use crate::subtile_ir::{EwKind, SubOp};
 
     fn op(inputs: Vec<InputRef>) -> OpDesc {
         OpDesc {
-            op: LoweredOp::Add,
+            op: SubOp::Elementwise(EwKind::Add),
             m: 1,
             inputs,
         }

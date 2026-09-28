@@ -30,7 +30,8 @@
 use crate::classified::{Program, UnrollIndex, WeightId};
 use crate::to_wavefront::{LoweredDecode, SourceBinding};
 use crate::weight_vocab::{WeightAccessor, WeightKind};
-use scratchy_subtile::lower::{GemmWeight, InputRef, LoweredOp};
+use scratchy_subtile::lower::{GemmWeight, InputRef};
+use scratchy_subtile::subtile_ir::{EwKind, SubOp};
 
 /// The weight-binding external of op `op_idx`, if it binds one.
 ///
@@ -54,7 +55,7 @@ pub(crate) enum MlpPacking {
 /// How the embedding table is stored.
 ///
 /// ⛔ THIS IS NOT VISIBLE FROM THE TAPE. The gather `embed_tokens[id]` is a host lookup before
-/// the first op, so it binds to no `LoweredOp` — its storage lives in the FUF node. Getting it
+/// the first op, so it binds to no tape op — its storage lives in the FUF node. Getting it
 /// wrong does not mis-name anything; it emits a `load` body that calls `load_affine_dequant` on
 /// a dense `Embedding`, which does not compile. That is the good case.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,7 +135,7 @@ pub(crate) fn gate_up_pair(
         InputRef::Ext(_) => None,
     };
     let ops = &lowered.input.ops;
-    if !matches!(ops[mul_op].op, LoweredOp::Mul) {
+    if !matches!(ops[mul_op].op, SubOp::Elementwise(EwKind::Mul)) {
         return None;
     }
     let si = in_op(&ops[mul_op].inputs[0])?;
@@ -153,7 +154,7 @@ fn reads_centered(lowered: &LoweredDecode, op_idx: usize) -> bool {
     let centered = matches!(
         lowered.input.ops[op_idx].inputs.first(),
         Some(InputRef::Op(src))
-            if matches!(lowered.input.ops[*src].op, LoweredOp::Sub)
+            if matches!(lowered.input.ops[*src].op, SubOp::Elementwise(EwKind::Sub))
     );
     // ⛔ CENTERING ALONE IS NOT ENOUGH. modernbert has a norm that reads a centered activation
     // and is nonetheless declared `RmsNorm` — judging on the `Sub` alone flipped it the other
@@ -161,31 +162,18 @@ fn reads_centered(lowered: &LoweredDecode, op_idx: usize) -> bool {
     // RmsNorm is scale only. So the bias consumer is the half that actually separates them.
     centered
         && lowered.input.ops.iter().any(|d| {
-            matches!(d.op, LoweredOp::BiasAdd)
+            matches!(d.op, SubOp::Elementwise(EwKind::BiasAdd))
                 && d.inputs
                     .iter()
                     .any(|r| matches!(r, InputRef::Op(j) if *j == op_idx))
         })
 }
 
-/// WHICH of an op's weight bundles this is — 0-based, in operand order.
-///
-/// ⛔ NOT A BARE `usize`, BECAUSE THE OTHER `usize` IS RIGHT THERE. The emission loop holds both
-/// this ordinal and `ext`, an index into `lowered.bindings`. They are different spaces and both
-/// erase to a machine word, so `kind_of(op, ext)` typechecks and silently asks for the kind of a
-/// bundle the op does not have — landing on bundle 0's answer whenever `ext` happens to be 0.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct BundleIdx(pub usize);
-
 /// EVERY weight-carrying source an op binds, in operand order.
 ///
-/// ⛔ AN OP CAN BIND MORE THAN ONE BUNDLE, and taking only the first is a silent wrong answer.
-/// `GemmaMoe`'s operands are `[router_in, expert_in, router_bundle, experts_bundle]` — two
-/// bundles of DIFFERENT kinds. Resolving just the first gave the router's accessor the experts'
-/// kind and never declared the experts' accessor at all, which is
-///     expected `&GemmaRouterLayer`, found `&SwitchGluExpertsLayer`
-///     no method named `experts_switch_glu`
-/// on gemma-4-26b-a4b. Ops that bind one weight are the common case, not the only one.
+/// ⛔ AN OP CAN BIND MORE THAN ONE (an fp8 matmul binds its weight and its scale), and taking
+/// only the first is a silent wrong answer. Ops that bind one weight are the common case, not the
+/// only one.
 fn weight_exts(lowered: &LoweredDecode, op_idx: usize) -> Vec<usize> {
     lowered.input.ops[op_idx]
         .inputs
@@ -220,14 +208,10 @@ fn weight_of(lowered: &LoweredDecode, ext: usize) -> Option<(WeightId, Option<Un
 /// ⛔ RETURNS `Err` RATHER THAN A DEFAULT for an op this walk has not been
 /// taught. A silent "assume Linear" would emit a `Weights` field of the wrong
 /// type and fail far away at load, so a new weight-binding opcode is a build
-/// error here — the same discipline `metal_alias_operand`'s exhaustive match
+/// error here — the same discipline `metal_colour_rule`'s exhaustive match
 /// uses.
-fn kind_of(
-    lowered: &LoweredDecode,
-    op_idx: usize,
-    bundle: BundleIdx,
-) -> Result<WeightKind, String> {
-    use LoweredOp as L;
+fn kind_of(lowered: &LoweredDecode, op_idx: usize) -> Result<WeightKind, String> {
+    use SubOp as L;
     let op = &lowered.input.ops[op_idx].op;
     Ok(match op {
         // ⭐ A LAYERNORM IS A SHAPE, NOT AN OPCODE. The DSL declares a `LayerNorm` field, but by
@@ -237,19 +221,7 @@ fn kind_of(
         // qwen2-vl and locateanything. The centering `Sub` on its input is what distinguishes
         // the two, so the kind is read from the op's NEIGHBOURHOOD, not the op alone.
         L::RmsNorm { .. } if reads_centered(lowered, op_idx) => WeightKind::LayerNorm,
-        // Two bundles, two kinds, in operand order: the router first, then the SwitchGLU
-        // experts. Keyed on `bundle` because the OP alone cannot distinguish them.
-        L::GemmaMoe { .. } => match bundle.0 {
-            0 => WeightKind::GemmaRouter,
-            1 => WeightKind::GemmaSwitchGlu,
-            n => {
-                return Err(format!(
-                    "weight_bindings: GemmaMoe binds bundle {n}, but it has exactly two \
-                     (router, experts)"
-                ));
-            }
-        },
-        L::Gemm { weight, .. } => match weight {
+        L::MatmulTile { weight, .. } => match weight {
             GemmWeight::Dense => WeightKind::Linear,
             GemmWeight::Fp8Dynamic => WeightKind::Fp8,
             // The quantized-linear kinds are named by the PRESET, which the
@@ -259,13 +231,11 @@ fn kind_of(
         L::RmsNorm { .. } | L::RmsNormUnit { .. } => WeightKind::RmsNorm,
         L::EmbeddingGather { .. } => WeightKind::Embedding,
         L::GatedDeltaNet => WeightKind::GatedDeltaNet,
-        L::Moe { qwen_shared, .. } => {
-            if *qwen_shared {
-                WeightKind::SharedFusedMoe
-            } else {
-                WeightKind::FusedMoe
-            }
-        }
+        // A MoE block's steps bind their router's or their experts' bundle — the bundle table.
+        L::RouterNorm { router, .. }
+        | L::RouterLogits { router, .. }
+        | L::RouteExpertScale { router } => router.weight_kind(),
+        L::ExpertMatmul { bundle, .. } => bundle.weight_kind(),
         L::RopeRotate { .. } | L::RopeAppend { .. } => WeightKind::CosSin,
         // A standalone (unfused) per-layer scalar parameter — granite's
         // `layer_scalar` class — reads through the norm accessor. Unlike
@@ -347,7 +317,7 @@ pub(crate) fn emit_weight_bindings(
         .input
         .ops
         .iter()
-        .filter(|od| matches!(od.op, LoweredOp::Gemm { .. }))
+        .filter(|od| matches!(od.op, SubOp::MatmulTile { .. }))
         .filter_map(|od| match od.inputs.get(1) {
             Some(InputRef::Ext(e)) => Some(*e),
             _ => None,
@@ -529,25 +499,25 @@ pub(crate) fn from_tape(
         // `BiasAdd`'s own weight operand mints no field of its own — the bias
         // rides on its upstream gemm's accessor (`AffineQuantLinear`/`Linear`
         // both carry an optional bias loaded off the SAME prefix), matching
-        // metal's own `from_subtile.rs` `LoweredOp::BiasAdd` arm, which derives
+        // metal's own `steps_from_tape.rs` `BiasAdd` arm, which derives
         // base/kind from the upstream gemm and never reads this op's weight
         // input. Minting a second, independent accessor here for the same
         // on-disk tensor produced a spurious `<gemm>.bias`-named field that
         // tried to load it a second time under a `RmsNorm` kind — panicking at
         // load with `weight not found: ...bias.weight` on any arch whose
         // gemm+bias pair reaches this walk (e.g. qwen2's q/k/v_proj bias).
-        if matches!(lowered.input.ops[op_idx].op, LoweredOp::BiasAdd) {
+        if matches!(
+            lowered.input.ops[op_idx].op,
+            SubOp::Elementwise(EwKind::BiasAdd)
+        ) {
             continue;
         }
-        // ⭐ ONE ACCESSOR PER BUNDLE, NOT PER OP. Most ops bind a single weight, but
-        // `GemmaMoe` binds two of different kinds; walking only the first is what dropped
-        // gemma-4-26b-a4b's `experts_switch_glu` accessor and mis-typed its router.
-        let exts = weight_exts(lowered, op_idx);
-        for (bundle, ext) in exts.iter().copied().enumerate() {
+        // ⭐ ONE ACCESSOR PER BOUND WEIGHT, NOT PER OP.
+        for ext in weight_exts(lowered, op_idx) {
             let Some((id, index)) = weight_of(lowered, ext) else {
                 continue;
             };
-            let kind = kind_of(lowered, op_idx, BundleIdx(bundle))?;
+            let kind = kind_of(lowered, op_idx)?;
             // A packed pair is ONE field named for both halves, whose sources are both weights in
             // the order the name spells them — which is how the load body recovers them.
             if let Some(&up_op) = packed_partner.get(&op_idx) {
@@ -588,7 +558,7 @@ pub(crate) fn from_tape(
     // ⛔ NOT A TAPE OP, SO THE WALK ABOVE CANNOT SEE IT. The tape begins at
     // the ALREADY-EMBEDDED hidden row: the gather `embed_tokens[input_id]` is
     // a cheap host lookup the runtime performs before the first op, so the
-    // embedding binds to no `LoweredOp` and appears in no `SourceBinding`.
+    // embedding binds to no tape op and appears in no `SourceBinding`.
     // It is nonetheless a weight the model must load — and the one a tied
     // `lm_head` redirects to — so it is resolved the same way the bridge
     // resolves its own `embed_base`: by name against the program's weight
@@ -648,7 +618,7 @@ mod tests {
 
     fn gemm(w_ext: usize) -> OpDesc {
         OpDesc {
-            op: LoweredOp::Gemm {
+            op: SubOp::MatmulTile {
                 n: 8,
                 weight: GemmWeight::Dense,
             },
@@ -659,9 +629,9 @@ mod tests {
 
     fn norm(w_ext: usize) -> OpDesc {
         OpDesc {
-            op: LoweredOp::RmsNorm {
+            op: SubOp::RmsNorm {
                 eps: 1e-5,
-                gain_offset: 0.0,
+                gain: scratchy_subtile::subtile_ir::GainConvention::Scale,
             },
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(w_ext)],
@@ -671,7 +641,7 @@ mod tests {
     /// `silu(x)` over op `src` — the middle of a gate/up MLP tail.
     fn silu(src: usize) -> OpDesc {
         OpDesc {
-            op: LoweredOp::Silu,
+            op: SubOp::Elementwise(EwKind::Silu),
             m: 1,
             inputs: vec![InputRef::Op(src)],
         }
@@ -680,7 +650,7 @@ mod tests {
     /// `a * b` over two ops — the `Mul` that closes the tail.
     fn mul(a: usize, b: usize) -> OpDesc {
         OpDesc {
-            op: LoweredOp::Mul,
+            op: SubOp::Elementwise(EwKind::Mul),
             m: 1,
             inputs: vec![InputRef::Op(a), InputRef::Op(b)],
         }
@@ -779,6 +749,7 @@ mod tests {
             bindings,
             op_tiles: vec![None; n_ops],
             norm_gain_add_tiles: Default::default(),
+            op_expansion: vec![None; n_ops],
         }
     }
 
@@ -916,7 +887,7 @@ mod tests {
                     // `Mul` binds no weight in any real tape; pointing one at a
                     // weight external is the stand-in for a NEW opcode nobody
                     // has taught this walk yet.
-                    op: LoweredOp::Mul,
+                    op: SubOp::Elementwise(EwKind::Mul),
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 }],

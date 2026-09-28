@@ -149,7 +149,7 @@ fn sub_rows(tr: &TensorRegion, off: u32, h: u32) -> TensorRegion {
 fn ew_kind_program(kind: EwKind) -> ktir_superdsc::ktir_node::Elementwise {
     use ktir_superdsc::ktir_node::Elementwise as E;
     match kind {
-        EwKind::Add => E::Add,
+        EwKind::Add | EwKind::BiasAdd => E::Add,
         EwKind::Mul => E::Mul,
         EwKind::Sub => E::Sub,
         EwKind::Silu => E::Silu,
@@ -161,7 +161,7 @@ fn ew_kind_program(kind: EwKind) -> ktir_superdsc::ktir_node::Elementwise {
 
 fn ew_kind_stem(kind: EwKind) -> &'static str {
     match kind {
-        EwKind::Add => "add",
+        EwKind::Add | EwKind::BiasAdd => "add",
         EwKind::Mul => "mul",
         EwKind::Sub => "sub",
         EwKind::Silu => "silu",
@@ -193,11 +193,11 @@ fn lower_elementwise_node_rows<F: RopeForm>(
         };
         // Each operand carries its OWN region offset, so the block is relative to that operand.
         let y = match kind {
-            EwKind::Add | EwKind::Mul | EwKind::Sub => {
+            EwKind::Add | EwKind::Mul | EwKind::Sub | EwKind::BiasAdd => {
                 let a = st.load_region(&sub_rows(&node.inputs[0], off, h));
                 let b = st.load_region(&sub_rows(&node.inputs[1], off, h));
                 let op = match kind {
-                    EwKind::Add => OpKind::ArithAddf,
+                    EwKind::Add | EwKind::BiasAdd => OpKind::ArithAddf,
                     EwKind::Mul => OpKind::ArithMulf,
                     _ => OpKind::ArithSubf,
                 };
@@ -269,7 +269,7 @@ fn lower_elementwise_node<F: RopeForm>(
     }
     let dims = vec![i64::from(rows), i64::from(cols)];
     let y = match kind {
-        EwKind::Add => {
+        EwKind::Add | EwKind::BiasAdd => {
             let a = st.load_region(&node.inputs[0]);
             let b = st.load_region(&node.inputs[1]);
             st.binop(OpKind::ArithAddf, a, b, dims)
@@ -1038,12 +1038,11 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::VarlenAttention { .. }
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
-        | SubOp::GemmaMoe { .. }
-        | SubOp::Moe { .. }
+        | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ⛔ THE ONE PLACE THAT MUST IMPLEMENT IT, so the refusal lives here
         // and names the required lowering rather than the op.
-        SubOp::Reshape => Unhandled(
+        SubOp::Reshape { .. } => Unhandled(
             "SubOp::Reshape reached the SuperDSC lowering. It must become a RESTICKIFY \
                  (a real re-laying copy), NOT a placement alias: `dev_off_stk` places (i,j) \
                  at (j/stk)*(a*stk)+i*stk+(j%stk) where `a` is the ROW COUNT, so two views \
@@ -1080,7 +1079,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // A port would therefore be main's text written to satisfy a rule, with no model able to
         // exercise it. A future arch that DOES emit one gets this loud bake error, which names where
         // the body comes from — not a second path to SuperDSC.
-        SubOp::SumReduce => Unhandled(format!(
+        SubOp::SumReduce { .. } => Unhandled(format!(
             "SubOp::SumReduce t{} has no KTIR lowering. Nothing in this repository constructs the \
              node, so no body here has ever run; the port source is `ibm/main`'s \
              `lower_sumreduce_node` (main 8432-8466), a variadic pointwise `add` over \

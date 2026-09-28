@@ -4043,6 +4043,7 @@ mod tests {
         let nodes = vec![SubtileNode {
             id: SubtileId::from_index(0),
             op: SubOp::MatmulTile {
+                n: 16,
                 weight: GemmWeight::Dense,
             },
             inputs: vec![whole(0, &tensors), whole(1, &tensors)],
@@ -4365,6 +4366,7 @@ mod tests {
             let node = SubtileNode {
                 id: SubtileId::from_index(0),
                 op: SubOp::MatmulTile {
+                    n: vocab,
                     weight: GemmWeight::Dense,
                 },
                 inputs: vec![whole(0, &tensors), whole(1, &tensors)],
@@ -4482,6 +4484,7 @@ mod tests {
             SubtileNode {
                 id: SubtileId::from_index(0),
                 op: SubOp::MatmulTile {
+                    n,
                     weight: GemmWeight::Fp8Dynamic,
                 },
                 inputs: vec![whole(0, &tensors), whole(1, &tensors), whole(2, &tensors)],
@@ -4490,6 +4493,7 @@ mod tests {
             SubtileNode {
                 id: SubtileId::from_index(1),
                 op: SubOp::MatmulTile {
+                    n,
                     weight: GemmWeight::Fp8Dynamic,
                 },
                 // SAME activation t0, DIFFERENT weight/scale/out → the quantize of t0 must be reused.

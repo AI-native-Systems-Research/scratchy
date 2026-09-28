@@ -717,6 +717,12 @@ half = { workspace = true }
 scratchy-core-config = { workspace = true }
 serde_json = { workspace = true }
 scratchy-tensors = { path = "../../tensors" }
+# tests/metal_o2_logits.rs (the runtime logits oracle): local Hub-cache lookup, the tokenizer,
+# and the row hash (config parse and the hybrid KV layout: scratchy-core-config above).
+hf-hub-downloader = { workspace = true }
+scratchy-core-model = { workspace = true }
+sha2 = "0.11"
+tokenizers = { workspace = true }
 
 # The qwen3 py-parity test drives the real HF snapshot for the full
 # `qwen3-0.6b` stem directly (module path + goldens), so it only builds
