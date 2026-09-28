@@ -665,21 +665,14 @@ pub enum RuntimeGate {
     /// `M=bucket_m` lm_head fallback that populates every row of
     /// logits for greedy rejection sampling at spec-decode verify.
     OnlyIfSpec,
-    /// Run only when the KV cache is TurboQuant-compressed. The per-layer
-    /// dequant/quantize commands are emitted unconditionally by the lowering
-    /// but only fire when `kv_cache_dtype == turboquant` (the worker resolves
-    /// the tq buffers + the KV scratch only then). No-op on every other run.
-    OnlyIfTurboquant,
-    /// Run only on a TurboQuant decode step — every sequence contributes
-    /// exactly one token (`num_tokens == num_seqs`) — the steps whose
-    /// attention is `AttentionViaCacheTq`, reading the packed store directly.
-    OnlyIfTurboquantDecode,
-    /// Run only on a TurboQuant step that is NOT a decode step: the
-    /// rotated-domain K/V staging and q/output rotation around its attention.
-    OnlyIfTurboquantNotDecode,
-    /// Run unless this is a TurboQuant decode step: the attention an
-    /// `AttentionViaCacheTq` twin replaces there.
-    UnlessTurboquantDecode,
+    /// Run only on a decode step — every sequence contributes exactly one
+    /// token (`num_tokens == num_seqs`): a TurboQuant model's
+    /// `AttentionViaCacheTq`, reading the packed store directly.
+    OnlyIfDecodeStep,
+    /// Run unless this is a decode step: the attention an
+    /// `AttentionViaCacheTq` twin replaces there, and the rotated-domain K/V
+    /// staging and q/output rotation around it.
+    UnlessDecodeStep,
     /// Run only on a step whose token count is in
     /// `quantized::SMALL_M_TOKENS`: the `AffineQmmSmallM` twin of a GEMM.
     OnlyIfSmallMTokens,
@@ -1762,6 +1755,10 @@ pub enum LoweringError {
     /// instruction has no per-row twin re-roping span blocks, so some step with
     /// several sequences would run no attention, or row 0's for every sequence.
     RowZeroWithoutPerRowTwin { index: usize, kernel: KernelId },
+    /// The model's KV codec is TurboQuant, but its backbone binds the KV cache
+    /// without compressing any of it: the factory would provision packed stores
+    /// nothing writes, and the worker would stop growing a pool the tape reads.
+    TurboQuantCompressesNothing,
 }
 
 /// What a TurboQuant codec command at [`LoweringError::TurboQuantOffsetUnbound`]
@@ -1806,6 +1803,10 @@ impl std::fmt::Display for LoweringError {
                 "lowering: `{kernel:?}` at tape index {index} computes sequence 0 only, and \
                  the instruction has no per-row twin re-roping span blocks for steps with \
                  several sequences"
+            ),
+            Self::TurboQuantCompressesNothing => f.write_str(
+                "lowering: the model's KV codec is TurboQuant, but no KV writer in its \
+                 backbone is one the codec compresses",
             ),
         }
     }

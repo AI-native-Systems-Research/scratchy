@@ -571,6 +571,10 @@ nccl = [
 ]
 # A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
 spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
+# TurboQuant KV compression for every metal model whose geometry the codec
+# takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
+# other backends. Off here like every other scope; `scratchy-cli` defaults it on.
+turboquant = ["scratchy-forward-compiler-macro/turboquant"]
 spyre = [
     "scratchy-forward-compiler-macro/spyre",
     "scratchy-forward-compiler/spyre",

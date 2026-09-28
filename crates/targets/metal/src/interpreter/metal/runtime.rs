@@ -82,7 +82,8 @@ pub struct RuntimeBindings {
     /// forward; on every other arch it is a one-element placeholder that
     /// is never bound (so non-spans pays nothing).
     pub block_unrotated_flags: Vec<Buffer>,
-    /// TurboQuant runtime buffers — `Some` only when kv_cache_dtype=turboquant.
+    /// TurboQuant runtime buffers — `Some` exactly when the model's
+    /// `KV_CODEC` is TurboQuant, the only models whose tapes bind them.
     /// The packed code stores are the canonical KV (~4.7x smaller); the per-layer
     /// dequant fills the (reused) `kv_cache_k/v` scratch before each attention.
     pub tq: Option<TqRuntimeBuffers>,
@@ -175,6 +176,15 @@ impl RuntimeBindings {
             .unwrap_or(0)
     }
 
+    /// The TurboQuant buffers a `Tq*` binding resolves to. Only a TurboQuant
+    /// model's tape binds them, and its factory always provisions them, so a
+    /// miss is a model-meta bug like an out-of-range `KvCache*` layer.
+    fn tq(&self) -> &TqRuntimeBuffers {
+        self.tq
+            .as_ref()
+            .expect("a TurboQuant binding in the tape of a model whose KV codec is dense")
+    }
+
     /// Resolve a [`RuntimeBindingKind`] to the buffer the worker
     /// should bake into the dispatch. Panics if a `KvCache*` layer index
     /// exceeds the held `Vec` length — that's a model-meta bug, not a
@@ -193,46 +203,13 @@ impl RuntimeBindings {
             RuntimeBindingKind::BlockUnrotatedFlags { layer } => {
                 &self.block_unrotated_flags[layer.get() as usize]
             }
-            // The tq commands are injected into EVERY tape (gated
-            // OnlyIfTurboquant) but the bake resolves all bindings regardless of
-            // the gate. When tq is absent (fp16/bf16 cache), fall back to a
-            // present buffer — the gated command never dispatches, so the bound
-            // buffer is inert. (Never panic here: it breaks the non-tq path.)
-            RuntimeBindingKind::TqPackedK { layer } => self
-                .tq
-                .as_ref()
-                .and_then(|t| t.packed_k.get(layer.get() as usize))
-                .unwrap_or(&self.input_ids),
-            RuntimeBindingKind::TqPackedV { layer } => self
-                .tq
-                .as_ref()
-                .and_then(|t| t.packed_v.get(layer.get() as usize))
-                .unwrap_or(&self.input_ids),
-            RuntimeBindingKind::TqNormsK { layer } => self
-                .tq
-                .as_ref()
-                .and_then(|t| t.norms_k.get(layer.get() as usize))
-                .unwrap_or(&self.input_ids),
-            RuntimeBindingKind::TqNormsV { layer } => self
-                .tq
-                .as_ref()
-                .and_then(|t| t.norms_v.get(layer.get() as usize))
-                .unwrap_or(&self.input_ids),
-            RuntimeBindingKind::TqSigns => self
-                .tq
-                .as_ref()
-                .map(|t| &t.signs)
-                .unwrap_or(&self.input_ids),
-            RuntimeBindingKind::TqBoundaries => self
-                .tq
-                .as_ref()
-                .map(|t| &t.boundaries)
-                .unwrap_or(&self.input_ids),
-            RuntimeBindingKind::TqCentroids => self
-                .tq
-                .as_ref()
-                .map(|t| &t.centroids)
-                .unwrap_or(&self.input_ids),
+            RuntimeBindingKind::TqPackedK { layer } => &self.tq().packed_k[layer.get() as usize],
+            RuntimeBindingKind::TqPackedV { layer } => &self.tq().packed_v[layer.get() as usize],
+            RuntimeBindingKind::TqNormsK { layer } => &self.tq().norms_k[layer.get() as usize],
+            RuntimeBindingKind::TqNormsV { layer } => &self.tq().norms_v[layer.get() as usize],
+            RuntimeBindingKind::TqSigns => &self.tq().signs,
+            RuntimeBindingKind::TqBoundaries => &self.tq().boundaries,
+            RuntimeBindingKind::TqCentroids => &self.tq().centroids,
             RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
             RuntimeBindingKind::NumSeqsU32 => &self.num_sample_rows_u32,
             RuntimeBindingKind::SampleIndices => &self.sample_indices,

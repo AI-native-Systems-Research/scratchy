@@ -179,8 +179,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy + test.
+      # `turboquant` is on in every default `scr` build but not in
+      # scratchy-models' own (empty) default, so name it: every model then
+      # expands with the KV codec users get, and the lowering's check that a
+      # TurboQuant model's tape compresses its KV runs across the whole catalog.
       - name: Clippy
-        run: cargo clippy -p scratchy-models --features metal,all -- -D warnings
+        run: cargo clippy -p scratchy-models --features metal,all,turboquant -- -D warnings
 
       # `all` is model stems only, so the step above never turns
       # `hf-completions` on and its build-script path (the huggingface.co query

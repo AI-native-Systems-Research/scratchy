@@ -221,6 +221,50 @@ pub fn bytes_per_vec(dim: usize, bits: u32) -> usize {
     packed_dim(dim, bits) * 4 + 4
 }
 
+/// A TurboQuant code width, in bits per rotated element. Only the widths
+/// [`vals_per_word`] has a packing for exist: `TqBits::new(5)` in a const is a
+/// compile error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TqBits(u32);
+
+impl TqBits {
+    pub const fn new(bits: u32) -> Self {
+        let _ = vals_per_word(bits);
+        Self(bits)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// How a model's KV cache is stored. Fixed per model when it is built: the
+/// `turboquant` feature gives every model whose geometry the codec supports
+/// [`KvCodec::TurboQuant`], and nothing chooses between them at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvCodec {
+    /// Uncompressed, in the model's own dtype.
+    Dense,
+    /// One packed code per rotated element and one f32 norm per head vector
+    /// ([`bytes_per_vec`]).
+    TurboQuant(TqBits),
+}
+
+impl KvCodec {
+    pub const fn is_turboquant(self) -> bool {
+        matches!(self, Self::TurboQuant(_))
+    }
+}
+
+impl std::fmt::Display for KvCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense => f.write_str("dense"),
+            Self::TurboQuant(bits) => write!(f, "TurboQuant {}-bit", bits.get()),
+        }
+    }
+}
+
 /// Single-stream TurboQuant KV store — the mechanism of arozanov's
 /// `cache.py::TurboQuantKVCache.update_and_fetch` (standard K+V path): store
 /// bit-packed codes + f32 norms; on read, fill an fp32 dequant buffer (full on

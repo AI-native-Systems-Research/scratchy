@@ -7128,12 +7128,71 @@ pub fn fuf_uses_rotary(fuf: &Fuf) -> bool {
     })
 }
 
+/// The model reads or writes a paged KV cache (encoders and vision towers
+/// don't).
+pub fn fuf_uses_kv_cache(fuf: &Fuf) -> bool {
+    fuf.nodes.iter().any(|n| {
+        n.inputs.iter().any(|i| {
+            matches!(
+                i,
+                crate::fuf::FufInput::Extern {
+                    kind: crate::classified::ExternKind::KvCache,
+                    ..
+                }
+            )
+        })
+    })
+}
+
+/// The model's KV codec. TurboQuant under the `turboquant` feature, on metal
+/// only, wherever `codec_for` takes its geometry; dense everywhere else. A
+/// model the feature would compress but can't is named in the build output.
+fn kv_codec_for(
+    model: &ModelParams,
+    head_dim: u32,
+    global_head_dim: u32,
+    uses_kv_cache: bool,
+    bits: scratchy_forward_compiler::TqBits,
+) -> scratchy_forward_compiler::KvCodec {
+    #[cfg(all(feature = "turboquant", feature = "metal"))]
+    {
+        use scratchy_target_metal::turboquant::{DenseReason, KvGeometry, codec_for};
+        let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
+        let geometry = KvGeometry {
+            num_layers: bound("num_hidden_layers"),
+            num_kv_heads: bound("num_key_value_heads"),
+            head_dim,
+            global_head_dim,
+            latent: bound("kv_lora_rank") > 0,
+            has_kv_cache: uses_kv_cache,
+        };
+        match codec_for(geometry, bits) {
+            Ok(bits) => scratchy_forward_compiler::KvCodec::TurboQuant(bits),
+            Err(reason) => {
+                if reason != DenseReason::NoKvCache {
+                    println!(
+                        "cargo:warning=turboquant: {} keeps a dense KV cache: {reason}",
+                        model.source_stem
+                    );
+                }
+                scratchy_forward_compiler::KvCodec::Dense
+            }
+        }
+    }
+    #[cfg(not(all(feature = "turboquant", feature = "metal")))]
+    {
+        let _ = (model, head_dim, global_head_dim, uses_kv_cache, bits);
+        scratchy_forward_compiler::KvCodec::Dense
+    }
+}
+
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
     has_bias_add: bool,
     has_gelu_mlp: bool,
     uses_rotary: bool,
+    uses_kv_cache: bool,
     // Filled with the SAME values the impl's consts are emitted from —
     // one derivation, two consumers (the impl tokens and the macro-side
     // tape bake). Built in this fn so drift is impossible.
@@ -7620,19 +7679,29 @@ fn emit_canonical_params_impl(
 
     // TurboQuant KV bit-width policy (Metal). 3-bit (~4.7x) is validated
     // coherent for the Llama family; outlier-heavy KV (Qwen-class massive
-    // activations) degrades at 3-bit and needs 4-bit — the conservative trait
-    // default. Promote arches to 3 here as the validation sweep confirms them.
-    // Hybrid/SWA + non-pow2 head_dim fall back to fp16 at the factory
-    // regardless of this value, so this only chooses 3 vs 4 for the arches
-    // turboquant actually runs on.
-    let tq_kv_bits_v: u32 = {
+    // activations) degrades at 3-bit and needs 4-bit. Promote arches to 3 here
+    // as the validation sweep confirms them.
+    let tq_bits = {
         let rides_3bit = model
             .architectures
             .iter()
             .any(|a| a.starts_with("Llama") || a.contains("TinyLlama"));
-        if rides_3bit { 3 } else { 4 }
+        scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
     };
-    let tq_kv_bits_lit = proc_macro2::Literal::u32_unsuffixed(tq_kv_bits_v);
+    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, uses_kv_cache, tq_bits);
+    let kv_codec_tokens = match kv_codec {
+        scratchy_forward_compiler::KvCodec::Dense => {
+            quote! { ::scratchy_forward_compiler::KvCodec::Dense }
+        }
+        scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(bits.get());
+            quote! {
+                ::scratchy_forward_compiler::KvCodec::TurboQuant(
+                    ::scratchy_forward_compiler::TqBits::new(#bits_lit),
+                )
+            }
+        }
+    };
 
     #[cfg(feature = "metal")]
     {
@@ -7671,7 +7740,7 @@ fn emit_canonical_params_impl(
                 .get("max_blocks_per_seq")
                 .map(|&v| v as u32)
                 .unwrap_or(128),
-            tq_kv_bits: tq_kv_bits_v,
+            kv_codec,
             vision_num_heads,
             vision_head_dim,
             vision_q_size,
@@ -7709,7 +7778,7 @@ fn emit_canonical_params_impl(
             const ATTN_SCALE: f32 = #attn_scale_lit;
             const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
             const SLIDING_WINDOW: i32 = #sliding_window_lit;
-            const TQ_KV_BITS: u32 = #tq_kv_bits_lit;
+            const KV_CODEC: ::scratchy_forward_compiler::KvCodec = #kv_codec_tokens;
             const KV_LORA_RANK: usize = #kv_lora_rank_lit;
             const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
             const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
@@ -11563,6 +11632,7 @@ pub fn emit_model(
         has_bias_add,
         program_has_gelu(program),
         fuf_uses_rotary(fuf),
+        fuf_uses_kv_cache(fuf),
         #[cfg(feature = "metal")]
         &mut resolved_metal_consts,
     );
@@ -13327,22 +13397,15 @@ pub fn emit_model(
                         }
                     };
                 // TurboQuant: captured (Copy) so the 'static factory closure can
-                // provision the packed stores + scratch per worker when enabled.
-                // UNIFORM arches (num_kv_groups == 1): every layer is "global",
-                // compressed at the base geometry. HYBRID/SWA arches (gemma4:
-                // num_kv_groups > 1) compress ONLY the GLOBAL (full-context, group
-                // 0) layers at the GLOBAL geometry — IF that geometry is a power
-                // of two and <= 512 (the widened kernels' supported range); the
-                // sliding layers stay fp16. `is_global[L]` = (group_of(L) == 0):
-                // group 0 is always the full-context group (see
-                // `compute_hybrid_kv_layout`); uniform → all-zero map → all-true.
-                let __tq_global_ok =
-                    (<Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM)
-                        .is_power_of_two()
-                        && <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM
-                            <= 512;
-                let __tq_on = ctx.kv_turboquant
-                    && (ctx.kv_cache.num_kv_groups() == 1 || __tq_global_ok);
+                // provision the packed stores + scratch per worker for a model
+                // whose `KV_CODEC` is TurboQuant. UNIFORM arches (num_kv_groups
+                // == 1): every layer is "global", compressed at the base
+                // geometry. HYBRID/SWA arches (gemma4: num_kv_groups > 1)
+                // compress ONLY the GLOBAL (full-context, group 0) layers at the
+                // GLOBAL geometry; the sliding layers stay fp16.
+                // `is_global[L]` = (group_of(L) == 0): group 0 is always the
+                // full-context group (see `compute_hybrid_kv_layout`); uniform →
+                // all-zero map → all-true.
                 let __tq_nb = ctx.kv_cache.num_blocks;
                 let __tq_is_global: ::std::vec::Vec<bool> = ctx
                     .kv_cache
@@ -13368,15 +13431,9 @@ pub fn emit_model(
                         // GLOBAL_* == base, so this is identical to the base-geometry
                         // call (every layer global). gemma4 provisions GLOBAL-sized
                         // packed/norms/scratch (head_dim 512, NUM_GLOBAL_KV_HEADS,
-                        // GLOBAL_BLOCK_SIZE) for the group-0 layers only. The gate
-                        // requires the GLOBAL head_dim power-of-two and <= 512.
-                        let __tq_prov = if __tq_on
-                            && (<Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM)
-                                .is_power_of_two()
-                            && <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM
-                                <= 512
-                        {
-                            Some(::scratchy_target_metal::turboquant::build_tq_provision(
+                        // GLOBAL_BLOCK_SIZE) for the group-0 layers only.
+                        let __tq_prov = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC {
+                            ::scratchy_forward_compiler::KvCodec::TurboQuant(bits) => Some(::scratchy_target_metal::turboquant::build_tq_provision(
                                 dev,
                                 &__tq_is_global,
                                 __tq_nb,
@@ -13384,11 +13441,10 @@ pub fn emit_model(
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS as usize,
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM as usize,
                                 ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
-                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::TQ_KV_BITS,
+                                bits,
                                 42,
-                            ))
-                        } else {
-                            None
+                            )),
+                            ::scratchy_forward_compiler::KvCodec::Dense => None,
                         };
                         ::scratchy_target_metal::interpreter::metal::RuntimeBindings {
                             input_ids: alloc(max_m * 4),
@@ -14499,6 +14555,7 @@ mod tests {
             false,
             false,
             false,
+            true,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14536,6 +14593,7 @@ mod tests {
             false,
             false,
             false,
+            true,
             #[cfg(feature = "metal")]
             &mut None,
         )
@@ -14585,6 +14643,7 @@ mod tests {
             false,
             false,
             false,
+            true,
             #[cfg(feature = "metal")]
             &mut None,
         )

@@ -58,7 +58,7 @@ pub use scratchy_ir::{pack_moe_expert_bits, unpack_moe_expert_bits};
 // re-exports are unconditional and the macro path
 // `::scratchy_forward_compiler::CanonicalParams` keeps resolving.
 pub use backend_compat::{BackendCompat, Cuda, Metal, Wgpu};
-pub use scratchy_ir::{CanonicalParams, WeightAccessors};
+pub use scratchy_ir::{CanonicalParams, KvCodec, TqBits, WeightAccessors};
 // The cuda runtime entry points (`run` / `run_backbone` / `InstructionEval` /
 // `InterpreterCtx`), tile-table helpers (`view` / `tile_ref` / `take_owned`),
 // piecewise capture, vision-arch wrappers (`VisionWrapper` /

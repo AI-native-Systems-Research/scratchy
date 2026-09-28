@@ -232,9 +232,10 @@ impl LLMBuilder {
     }
 
     /// Set the KV cache dtype ("auto", "fp16", "turboquant", "fp8_e4m3").
-    /// "auto" upgrades to TurboQuant on metal for supported arches; pass
-    /// "fp16" to force a lossless KV cache (required for relocatable spans /
-    /// rope-on-read transparency).
+    /// On metal the codec is fixed when the model is built (the `turboquant`
+    /// feature): "auto" takes it, "fp16" / "turboquant" assert it and the
+    /// engine refuses to start on a mismatch — assert "fp16" where a lossless
+    /// KV cache is required (relocatable spans / rope-on-read transparency).
     pub fn kv_cache_dtype(mut self, dtype: impl Into<String>) -> Self {
         self.config.kv_cache_dtype = dtype.into();
         self

@@ -89,6 +89,9 @@ Note the convention for selecting models and quants:
   build can actually run (`scr completions zsh --install`). **On by default**;
   it resolves that list against huggingface.co at build time, so an air-gapped
   build wants `--no-default-features`. See [`docs/BUILD.md`](docs/BUILD.md).
+- `turboquant` — TurboQuant KV-cache compression on metal, for every model
+  whose geometry takes it (the build names the ones that stay dense). **On by
+  default**, and fixed at build time: `--kv-cache-dtype` can only assert it.
 
 ### Deep Dives
 

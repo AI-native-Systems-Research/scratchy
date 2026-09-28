@@ -70,7 +70,7 @@ cargo build --release -p scratchy-cli --features metal,model/llama-3.2-3b
 compiler crate via its own edge to scratchy-target-metal — and `--workspace`
 builds every member as a root regardless of `--features`, so excluding only
 one of the two still drags `objc2` onto Linux); the **macOS** job
-runs `cargo clippy -p scratchy-models --features metal,all -- -D warnings`
+runs `cargo clippy -p scratchy-models --features metal,all,turboquant -- -D warnings`
 + kernel tests. It sets `SCRATCHY_GPU=h100`, `CUDA_COMPUTE_CAP=90`,
 `SCRATCHY_SKIP_CUDA_KERNELS=1` (so `scratchy-builder-cuda`'s build script doesn't
 need a GPU/nvcc). Both `all` runs are the full-scope case —
