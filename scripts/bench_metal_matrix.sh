@@ -5,63 +5,39 @@
 #     scripts/bench_metal_matrix.sh --models llama-3.2-3b
 #     scripts/bench_metal_matrix.sh --scenarios cold,warm   # no sudo needed
 #
-# It is a RUNNER, not a measurement tool. Every number comes from a `scr bench`
-# subcommand; this script only decides what to run, in what order, and merges the
-# results into one file. Two consequences worth knowing:
+# A RUNNER, not a measurement tool: every number comes from a `scr bench`
+# subcommand, except BUILD TIME and BINARY SIZE per model. scratchy compiles one
+# model into the binary, so size is a per-model fact and the build is the cost
+# of doing that work ahead of time; every startup number excludes it.
 #
-#   * It never starts or stops a server. `scr bench startup --exec` spawns and
-#     reaps its own children, so this script cannot leak one.
-#   * It adds exactly one measurement of its own: BUILD TIME and BINARY SIZE per model. scratchy
-#     compiles one model into the binary, so size is a per-model fact, and the
-#     build is the cost side of doing that work ahead of time. Every startup
-#     number below excludes it, which is precisely why it has to be reported.
+#   build seconds, binary MiB          cargo build, stat
+#   ttft_exec: frozen / cold / warm    scr bench startup --exec (cache ladder)
+#   peak RSS, major faults             scr bench startup --exec (per child, wait4)
+#   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
+#   concurrency curve                  scr bench serve (input 512, output 128)
+#   input x output grid (heat maps)    scr bench serve (conc 8)
 #
-# WHAT YOU GET, AND WHICH COMMAND PRODUCES IT
+# Rung definitions and fairness rules: docs/BENCHMARKING.md.
 #
-#   build seconds, binary MiB          this script (`cargo build`, `stat`)
-#   ttft_exec: frozen / cold / warm    scr bench startup --exec
-#   t_ready, ttft_from_send, tpot      scr bench startup --exec
-#   peak RSS, major faults             scr bench startup --exec  (per child, wait4)
-#   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve
-#   scaling curves (conc/in/out)       scr bench serve   (one axis at a time)
+# Needs: `sudo -v` first for the frozen rung (macOS `purge`), or pass
+# --scenarios cold,warm. Weights download on first use unless --offline.
 #
-# The cache ladder, the eviction proof, the priming launch, per-child resource
-# attribution and the validity gates all live in `--exec`. See
-# docs/BENCHMARKING.md for what each rung means.
+# Scaling (--no-scaling skips it; --scale-axes picks from conc,input,output,grid):
+# one seed per (model, axis, rung) — unique so the prefix cache cannot serve a
+# later cell, shared across engines so all see the same prompts. Concurrency is
+# offered (--max-concurrency), not the effective decode batch.
 #
-# REQUIREMENTS
-#   * `--scenarios frozen,...` needs `sudo` (macOS `purge`). Run `sudo -v` first,
-#     or pass `--scenarios cold,warm` and leave the frozen cells blank.
-#   * Weights are downloaded on first use unless you pass --offline.
+# Comparison engines, each on when installed (--no-mlx / --no-ollama):
+#   mlx-lm  python with `import mlx_lm` ($VIRTUAL_ENV, python3, or --mlx-python)
+#   ollama  its own `ollama serve` on --port (a desktop one on 11434 is left
+#           alone); pulls on first use. GGUF Q4_K_M weights, ignores ignore_eos,
+#           RSS misses the runner grandchild; restarted per axis with
+#           OLLAMA_NUM_PARALLEL / OLLAMA_CONTEXT_LENGTH sized for that axis.
+# No parity gate: it needs CLI mode and this ladder runs in server mode.
 #
-# SCALING STAGE (on by default; --no-scaling skips it)
-#
-#   One axis at a time from a base cell (input 512, output 128, conc 8),
-#   never a full factorial: the marginal curve per axis is the deliverable.
-#
-#     concurrency: 1, 2, 4, 8, 16, 32   (input/output pinned at the base cell)
-#     input len:   128, 512, 2048, 8192 (conc/output pinned)
-#     output len:  16, 64, 256, 1024    (conc/input pinned)
-#
-#   Metrics per rung: output tok/s, median TTFT, median TPOT, request
-#   throughput. TPOT-vs-concurrency is the batched-decode health check —
-#   a good batched decoder keeps it ~flat.
-#
-#   Load-bearing rules inherited from scripts/bench_serve_compare.sh:
-#     * UNIQUE SEED PER CELL — the same seed means identical random prompts,
-#       so the prefix cache serves later cells and TTFT collapses to ~0.
-#       Seeds are shared across backends (same prompts ⇒ fair comparison)
-#       but unique across cells. The base seed is fixed (not ${RANDOM}) so a
-#       rerun of the script reproduces the same prompts.
-#     * One resident server per model for the whole scaling stage; cells run
-#       back-to-back against it, warmups before the timed requests.
-#     * `--max-concurrency N` is OFFERED concurrency; the scheduler decides
-#       the effective decode batch. Curves are against offered concurrency
-#       until `bench serve` records the effective batch too (disclosed in
-#       docs/BENCHMARKING.md).
-#     * mlx-lm, when the comparison column is on, runs the same sweep with
-#       the same per-cell seeds. Compare TTFT/TPOT directly; E2E only
-#       work-normalized (mlx-lm under-generates without ignore_eos).
+# --serve-args "..." passes extra flags to `scr serve` (recorded in the JSON).
+# --cell-timeout-s bounds each scaling cell; a timed-out cell skips the rest of
+# that server's cells, since a hung server would hang them all.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -76,18 +52,22 @@ MODELS_DEFAULT=(
   "gemma-4-26b-a4b-it=mlx-community/gemma-4-26b-a4b-it-4bit:mlx-affine-b4-g64"            # 15.4 GB
   "gemma-4-31b-it=mlx-community/gemma-4-31b-it-4bit:mlx-affine-b4-g64"                    # 18.4 GB
   "qwen3.5-35b-a3b=mlx-community/Qwen3.5-35B-A3B-4bit:mlx-affine-b4-g64"                  # 20.4 GB
-  # Frontier-ish: Moonlight is a DeepSeek-V3-architecture MoE (16B total, ~3B
-  # active), so it exercises the MLA + MoE path at a size a 36 GB machine can
-  # host. Listed twice on purpose — same model, two quantizations — which is the
-  # only quantization axis in this matrix, since the gemma4 and qwen3.5 families
-  # declare mlx-affine-b4-g64 and nothing else.
   "moonlight-16b-a3b-instruct=mlx-community/Moonlight-16B-A3B-Instruct-4-bit:mlx-affine-b4-g64"        #  9.0 GB
   "moonlight-16b-a3b-instruct-fp8-block=starpit/moonlight-16b-a3b-instruct-fp8-block:fp8-block-128x128" # 16.7 GB
-  # DeepSeek-V2-Lite has no public 4-bit MLX build, so it would be bf16 at
-  # 31.4 GB and exhaust a 36 GB machine once the KV cache is allocated. The
-  # DeepSeek-V2 arch is instead reachable via
-  # mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx (8.8 GB) if wanted.
 )
+
+# ollama library tag per stem; no tag, no ollama column.
+ollama_tag() {
+    case "$1" in
+        granite-3.3-2b-instruct) echo "granite3.3:2b" ;;
+        llama-3.2-3b)            echo "llama3.2:3b" ;;
+        granite-3.3-8b-instruct) echo "granite3.3:8b" ;;
+        qwen2.5-7b)              echo "qwen2.5:7b" ;;
+        gemma-4-26b-a4b-it)      echo "gemma4:26b" ;;
+        gemma-4-31b-it)          echo "gemma4:31b" ;;
+        qwen3.5-35b-a3b)         echo "qwen3.5:35b-a3b" ;;
+    esac
+}
 
 MODELS=()
 SCENARIOS="frozen,cold,warm"
@@ -101,86 +81,91 @@ OFFLINE=0
 SKIP_BUILD=0
 OUT_DIR=""
 KV_CACHE_DTYPE=""
-# `--exec` picks purge on macOS and fadvise on Linux by itself
-EVICT=""
+EVICT=""                 # --exec picks purge on macOS by itself
 EVICT_PATH=()
 SETTLE_S=""
-# `--exec` defaults to 600 s, too tight for a ~20 GB checkpoint on this class of
-# machine: gemma-4-31b-it (18.4 GB) timed out at 600 s.
-READY_TIMEOUT_S="1800"
+# --exec's 600 s default timed out gemma-4-31b-it (18.4 GB) on this class of machine.
+READY_TIMEOUT_S=1800
+CELL_TIMEOUT_S=3600
+SERVE_ARGS=""
 SEED=""
-# Setting --mlx-python turns on the comparison column: the same ladder is run a
-# second time with --backend mlx-lm.
 MLX_PYTHON=""
-# Scaling stage (see the header): base cell + one-axis-at-a-time rungs.
+MLX_AUTO=1
+OLLAMA_AUTO=1
 SCALING=1
+SCALE_AXES="conc,grid"
 SCALE_CONC="1,2,4,8,16,32"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
+SCALE_GRID_INPUT="128,512,2048,8192"
+SCALE_GRID_OUTPUT="16,64,256,1024"
 SCALE_BASE_INPUT=512
 SCALE_BASE_OUTPUT=128
 SCALE_BASE_CONC=8
-# Prompts per scaling cell: enough for the median to be honest at the highest
-# concurrency without making an 8192-input rung take all day. Default scales
-# with nothing — tune per machine if a rung is too noisy.
 SCALE_NUM_PROMPTS=24
 SCALE_WARMUPS=4
-# Fixed base for per-cell seeds so reruns see the same prompts.
 SCALE_SEED_BASE=20260927
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --models)         IFS=',' read -r -a MODELS <<<"$2"; shift 2 ;;
-        --scenarios)      SCENARIOS="$2"; shift 2 ;;
-        --reps)           REPS="$2"; shift 2 ;;
-        --port)           PORT="$2"; shift 2 ;;
-        --num-prompts)    NUM_PROMPTS="$2"; shift 2 ;;
-        --input-len)      INPUT_LEN="$2"; shift 2 ;;
-        --output-len)     OUTPUT_LEN="$2"; shift 2 ;;
-        --warm-requests)  WARM_REQUESTS="$2"; shift 2 ;;
-        --kv-cache-dtype) KV_CACHE_DTYPE="$2"; shift 2 ;;
-        --evict)          EVICT="$2"; shift 2 ;;
-        --evict-path)     EVICT_PATH+=("$2"); shift 2 ;;
-        --settle-s)       SETTLE_S="$2"; shift 2 ;;
-        --ready-timeout-s) READY_TIMEOUT_S="$2"; shift 2 ;;
-        --seed)           SEED="$2"; shift 2 ;;
-        --mlx-python)     MLX_PYTHON="$2"; shift 2 ;;
-        --scaling)        SCALING=1; shift ;;
-        --no-scaling)     SCALING=0; shift ;;
-        --scale-conc)     SCALE_CONC="$2"; shift 2 ;;
-        --scale-input)    SCALE_INPUT="$2"; shift 2 ;;
-        --scale-output)   SCALE_OUTPUT="$2"; shift 2 ;;
+        --models)            IFS=',' read -r -a MODELS <<<"$2"; shift 2 ;;
+        --scenarios)         SCENARIOS="$2"; shift 2 ;;
+        --reps)              REPS="$2"; shift 2 ;;
+        --port)              PORT="$2"; shift 2 ;;
+        --num-prompts)       NUM_PROMPTS="$2"; shift 2 ;;
+        --input-len)         INPUT_LEN="$2"; shift 2 ;;
+        --output-len)        OUTPUT_LEN="$2"; shift 2 ;;
+        --warm-requests)     WARM_REQUESTS="$2"; shift 2 ;;
+        --kv-cache-dtype)    KV_CACHE_DTYPE="$2"; shift 2 ;;
+        --evict)             EVICT="$2"; shift 2 ;;
+        --evict-path)        EVICT_PATH+=("$2"); shift 2 ;;
+        --settle-s)          SETTLE_S="$2"; shift 2 ;;
+        --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
+        --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
+        --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
+        --seed)              SEED="$2"; shift 2 ;;
+        --mlx-python)        MLX_PYTHON="$2"; shift 2 ;;
+        --no-mlx)            MLX_AUTO=0; MLX_PYTHON=""; shift ;;
+        --no-ollama)         OLLAMA_AUTO=0; shift ;;
+        --scaling)           SCALING=1; shift ;;
+        --no-scaling)        SCALING=0; shift ;;
+        --scale-axes)        SCALE_AXES="$2"; shift 2 ;;
+        --scale-conc)        SCALE_CONC="$2"; shift 2 ;;
+        --scale-input)       SCALE_INPUT="$2"; shift 2 ;;
+        --scale-output)      SCALE_OUTPUT="$2"; shift 2 ;;
+        --scale-grid-input)  SCALE_GRID_INPUT="$2"; shift 2 ;;
+        --scale-grid-output) SCALE_GRID_OUTPUT="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
-        --scale-warmups)  SCALE_WARMUPS="$2"; shift 2 ;;
-        --offline)        OFFLINE=1; shift ;;
-        --skip-build)     SKIP_BUILD=1; shift ;;
-        --out-dir)        OUT_DIR="$2"; shift 2 ;;
-        -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *)                echo "unknown arg: $1" >&2; exit 2 ;;
+        --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
+        --offline)           OFFLINE=1; shift ;;
+        --skip-build)        SKIP_BUILD=1; shift ;;
+        --out-dir)           OUT_DIR="$2"; shift 2 ;;
+        -h|--help)           awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; exit 0 ;;
+        *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 [[ ${#MODELS[@]} -eq 0 ]] && MODELS=("${MODELS_DEFAULT[@]}")
 (( OFFLINE )) && export HF_HUB_OFFLINE=1
+
+if (( MLX_AUTO )) && [[ -z "${MLX_PYTHON}" ]]; then
+    for py in ${VIRTUAL_ENV:+"${VIRTUAL_ENV}/bin/python"} python3; do
+        if "${py}" -c 'import mlx_lm' 2>/dev/null; then MLX_PYTHON="$(command -v "${py}")"; break; fi
+    done
+fi
+OLLAMA_BIN=""
+(( OLLAMA_AUTO )) && OLLAMA_BIN="$(command -v ollama || true)"
 
 BIN="${ROOT}/target/release/scr"
 chip="$(sysctl -n machdep.cpu.brand_string)"
 slug="$(echo "${chip}" | tr '[:upper:] ' '[:lower:]-' | sed 's/[^a-z0-9-]//g')"
 : "${OUT_DIR:="${ROOT}/bench_results/metal_matrix"}"
 RAW="${OUT_DIR}/${slug}"
-mkdir -p "${RAW}"
 JSON="${OUT_DIR}/${slug}.json"
+mkdir -p "${RAW}"
 
-# ---- preflight: fail now, with a fix, rather than three models in ------------
 die() { echo "error: $*" >&2; exit 1; }
-
 command -v cargo >/dev/null || die "cargo not on PATH"
-[[ "$(uname -s)" == "Darwin" ]] || die "this runner is the metal side of #3; use the cuda/spyre runner elsewhere"
-
-# `--exec` is what measures the cache ladder.
-EXEC_OK=0
-if [[ -x "${BIN}" ]] && "${BIN}" bench startup --help 2>/dev/null | grep -q -- '--exec'; then
-    EXEC_OK=1
-fi
+[[ "$(uname -s)" == "Darwin" ]] || die "this runner is for Apple Silicon; use the cuda/spyre runner elsewhere"
 if [[ ",${SCENARIOS}," == *",frozen,"* ]]; then
     sudo -n true 2>/dev/null || die "frozen needs sudo for \`purge\`: run \`sudo -v\` first, or pass --scenarios cold,warm"
 fi
@@ -188,15 +173,20 @@ fi
 echo "machine : ${chip}"
 echo "models  : ${#MODELS[@]}"
 echo "rungs   : ${SCENARIOS}"
+echo "mlx-lm  : ${MLX_PYTHON:-skipped (pip install mlx-lm, or pass --mlx-python)}"
+echo "ollama  : ${OLLAMA_BIN:-skipped (brew install ollama)}"
+(( SCALING )) && echo "scaling : ${SCALE_AXES}"
 echo "output  : ${JSON}"
-(( EXEC_OK )) || cat <<EOF
-
-EOF
 
 # ---- machine block ----------------------------------------------------------
-python3 - "${JSON}" "${chip}" "${SCENARIOS}" "${EXEC_OK}" <<'PY'
-import json, subprocess, sys, time
-out, chip, scenarios, exec_ok = sys.argv[1:5]
+export SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
+       SCALE_GRID_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS \
+       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S
+python3 - "${JSON}" "${chip}" <<'PY'
+import json, os, subprocess, sys, time
+out, chip = sys.argv[1:3]
+e = os.environ
+ints = lambda k: [int(x) for x in e[k].split(",") if x]
 sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout.strip()
 sysctl = lambda k: sh("sysctl", "-n", k)
 batt = sh("pmset", "-g", "batt")
@@ -204,11 +194,9 @@ json.dump({
   "schema": 2, "issue": 91, "epic": 3,
   "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
   "generator": "scripts/bench_metal_matrix.sh",
-  "measured_by": {
-    "footprint": "this runner (cargo build, stat)",
-    "cache_ladder": "scr bench startup --exec" if exec_ok == "1" else "UNAVAILABLE",
-    "warm_serving": "scr bench serve",
-  },
+  "measured_by": {"footprint": "this runner (cargo build, stat)",
+                  "cache_ladder": "scr bench startup --exec",
+                  "warm_serving": "scr bench serve", "scaling": "scr bench serve"},
   "machine": {
     "hw_model": sysctl("hw.model"), "chip": chip,
     "cores_total": int(sysctl("hw.ncpu") or 0),
@@ -222,59 +210,104 @@ json.dump({
   "repo": {"sha": sh("git", "rev-parse", "HEAD"),
            "branch": sh("git", "rev-parse", "--abbrev-ref", "HEAD"),
            "dirty": bool(sh("git", "status", "--porcelain"))},
-  "config": {"scenarios": scenarios.split(",")},
+  "config": {"scenarios": e["SCENARIOS"].split(","),
+             "kv_cache_dtype": e["KV_CACHE_DTYPE"] or "default (TurboQuant)",
+             "scratchy_serve_args": e["SERVE_ARGS"] or None,
+             "cell_timeout_s": int(e["CELL_TIMEOUT_S"]),
+             "scaling": None if e["SCALING"] != "1" else {
+                 "axes": e["SCALE_AXES"].split(","), "conc": ints("SCALE_CONC"),
+                 "input": ints("SCALE_INPUT"), "output": ints("SCALE_OUTPUT"),
+                 "grid_input": ints("SCALE_GRID_INPUT"), "grid_output": ints("SCALE_GRID_OUTPUT"),
+                 "base": {"input": int(e["SCALE_BASE_INPUT"]), "output": int(e["SCALE_BASE_OUTPUT"]),
+                          "conc": int(e["SCALE_BASE_CONC"])},
+                 "num_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
+                 "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
+             "comparison": {"mlx_lm": bool(e["MLX_PYTHON"]), "ollama": bool(e["OLLAMA_BIN"])}},
   "methodology": "docs/BENCHMARKING.md — rung definitions, fairness rules and disclosed asymmetries live there, not here",
   "models": [],
 }, open(out, "w"), indent=2)
 PY
 
-# ---- scaling helpers ---------------------------------------------------------
-# One `scr bench serve` per (axis, rung) against the ALREADY-RUNNING server on
-# ${PORT}. Output: one JSON per cell at "${out_prefix}.${axis}-${rung}.json",
-# merged into the machine JSON later. `stem` (model), `id` and the SCALE_*
-# config are from the enclosing scope. Seeds are deterministic per
-# (stem, axis, rung) so a rerun sees the same prompts AND no two cells share
-# prompts (which would let the prefix cache serve a later cell from an earlier
-# one and collapse its TTFT).
-run_scale_cells() { # out_prefix
-    local out_prefix="$1"
-    local seed
-    cell_seed() { # axis rung
-        # Distinct per (model, axis, rung); stable across reruns and identical
-        # for scratchy and mlx-lm (same prompts for both engines).
-        local h=0 ch
-        local s="${stem}:$1"
-        for (( i=0; i<${#s}; i++ )); do
-            ch="${s:i:1}"
-            h=$(( (h * 31 + $(printf '%d' "'${ch}")) % 1000000000 ))
-        done
-        echo $(( (h + $2 * 7919) % 2000000000 ))
-    }
-    run_cell() { # axis rung input output conc
-        local axis="$1" rung="$2" in="$3" out="$4" conc="$5"
-        seed="$(cell_seed "${axis}" "${rung}")"
-        echo "    ${axis}=${rung} (in ${in}, out ${out}, conc ${conc}, seed ${seed})"
-        "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${id}" \
-            --num-prompts "${SCALE_NUM_PROMPTS}" --input-len "${in}" --output-len "${out}" \
-            --max-concurrency "${conc}" --temperature 0 --seed "${seed}" \
-            --num-warmups "${SCALE_WARMUPS}" \
-            --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
-            --output-json "${out_prefix}.${axis}-${rung}.json" --disable-tqdm 2>&1 | tail -2 | sed 's/^/        /' \
-            || echo "        cell failed" >&2
-    }
-    local -a concs inputs outputs
-    IFS=',' read -r -a concs  <<<"${SCALE_CONC}"
-    IFS=',' read -r -a inputs <<<"${SCALE_INPUT}"
-    IFS=',' read -r -a outputs <<<"${SCALE_OUTPUT}"
-    for c in "${concs[@]}"; do
-        run_cell conc  "${c}" "${SCALE_BASE_INPUT}"  "${SCALE_BASE_OUTPUT}" "${c}"
+# ---- servers ----------------------------------------------------------------
+# One server at a time on ${PORT}; the exit trap stops it on failure or Ctrl-C.
+srv=""
+serve_up() { # log ready_path cmd...
+    local log="$1" path="$2"; shift 2
+    "$@" >>"${log}" 2>&1 &
+    srv=$!
+    local deadline=$(( $(date +%s) + READY_TIMEOUT_S ))
+    while (( $(date +%s) < deadline )); do
+        curl -fsS -m 2 "http://127.0.0.1:${PORT}${path}" >/dev/null 2>&1 && return 0
+        kill -0 "${srv}" 2>/dev/null || return 1
+        sleep 1
     done
-    for l in "${inputs[@]}"; do
-        run_cell input "${l}" "${l}" "${SCALE_BASE_OUTPUT}" "${SCALE_BASE_CONC}"
-    done
-    for l in "${outputs[@]}"; do
-        run_cell output "${l}" "${SCALE_BASE_INPUT}" "${l}" "${SCALE_BASE_CONC}"
-    done
+    return 1
+}
+serve_down() {
+    [[ -n "${srv}" ]] || return 0
+    # stderr off for the whole block: bash's "Terminated" job notice is not a failure.
+    {
+        kill -TERM "${srv}" || true
+        for _ in $(seq 1 30); do kill -0 "${srv}" || break; sleep 1; done
+        kill -KILL "${srv}" || true
+        wait "${srv}" || true
+    } 2>/dev/null
+    srv=""
+}
+trap serve_down EXIT
+ollama_env() { echo env OLLAMA_HOST="127.0.0.1:${PORT}" OLLAMA_KEEP_ALIVE=-1 OLLAMA_MAX_LOADED_MODELS=1 "$@"; }
+ollama_up() { serve_up "${RAW}/serve-ollama-${stem}.log" /api/version $(ollama_env "$@") "${OLLAMA_BIN}" serve; }
+
+max_of() { local m=0 x; IFS=',' read -r -a _xs <<<"$1"; for x in "${_xs[@]}"; do (( x > m )) && m=${x}; done; echo "${m}"; }
+
+# ---- scaling ----------------------------------------------------------------
+# One `scr bench serve` per cell against the running server, written to
+# "<prefix>.<axis>-<rung>.json". cell_model / cell_tok override the model name
+# sent and the tokenizer that sizes prompts (ollama serves a tag).
+run_cell() { # prefix axis rung input output conc
+    (( cells_hung )) && return 0
+    local out_json="$1.$2-$3.json" seed rc=0
+    seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3" | cksum | cut -d' ' -f1)
+    echo "    $2=$3 (in $4, out $5, conc $6, seed ${seed})"
+    # perl's alarm survives exec: SIGALRM ends the client after CELL_TIMEOUT_S.
+    # The client's own output goes to the pipe; stderr off hides bash's job notice.
+    { perl -e 'alarm shift; exec @ARGV' "${CELL_TIMEOUT_S}" \
+        "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
+        ${cell_tok:+--tokenizer "${cell_tok}"} \
+        --num-prompts "${SCALE_NUM_PROMPTS}" --input-len "$4" --output-len "$5" \
+        --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${SCALE_WARMUPS}" \
+        --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
+        --output-json "${out_json}" --disable-tqdm 2>&1 | tail -1 | sed 's/^/        /'; } 2>/dev/null || rc=$?
+    if (( rc == 142 )); then
+        cells_hung=1
+        echo "        timed out after ${CELL_TIMEOUT_S}s; skipping this server's remaining cells" >&2
+    elif (( rc )); then
+        echo "        cell failed" >&2
+    fi
+}
+run_scale_cells() { # prefix [axes]
+    local prefix="$1" axes=",${2:-${SCALE_AXES}}," x o
+    cells_hung=0
+    local -a xs os
+    if [[ "${axes}" == *",conc,"* ]]; then
+        IFS=',' read -r -a xs <<<"${SCALE_CONC}"
+        for x in "${xs[@]}"; do run_cell "${prefix}" conc "${x}" "${SCALE_BASE_INPUT}" "${SCALE_BASE_OUTPUT}" "${x}"; done
+    fi
+    if [[ "${axes}" == *",input,"* ]]; then
+        IFS=',' read -r -a xs <<<"${SCALE_INPUT}"
+        for x in "${xs[@]}"; do run_cell "${prefix}" input "${x}" "${x}" "${SCALE_BASE_OUTPUT}" "${SCALE_BASE_CONC}"; done
+    fi
+    if [[ "${axes}" == *",output,"* ]]; then
+        IFS=',' read -r -a xs <<<"${SCALE_OUTPUT}"
+        for x in "${xs[@]}"; do run_cell "${prefix}" output "${x}" "${SCALE_BASE_INPUT}" "${x}" "${SCALE_BASE_CONC}"; done
+    fi
+    if [[ "${axes}" == *",grid,"* ]]; then
+        IFS=',' read -r -a xs <<<"${SCALE_GRID_INPUT}"
+        IFS=',' read -r -a os <<<"${SCALE_GRID_OUTPUT}"
+        for x in "${xs[@]}"; do for o in "${os[@]}"; do
+            run_cell "${prefix}" grid "${x}x${o}" "${x}" "${o}" "${SCALE_BASE_CONC}"
+        done; done
+    fi
 }
 
 # ---- per model --------------------------------------------------------------
@@ -283,10 +316,8 @@ for entry in "${MODELS[@]}"; do
     id="${rest%%:*}"; quant="${rest#*:}"; [[ "${quant}" == "${rest}" ]] && quant=""
     echo; echo "################ ${stem} ################"
 
-    feats="metal,serve,bench,model/${stem}"
-    [[ -n "${quant}" ]] && feats="${feats},quant/${quant}"
+    feats="metal,serve,bench,model/${stem}${quant:+,quant/${quant}}"
     build_secs=""; bytes=""; built=1
-
     if (( ! SKIP_BUILD )); then
         echo "--- build -F ${feats}"
         t0=$(date +%s)
@@ -300,184 +331,174 @@ for entry in "${MODELS[@]}"; do
             tail -3 "${RAW}/build-${stem}.log" | sed 's/^/    /' >&2
         fi
     fi
-
-    # Each model needs its own binary: the next build overwrites this one.
+    # The next build overwrites ${BIN}, so each model keeps its own copy.
     model_bin="${RAW}/scr-${stem}"
     (( built )) && cp "${BIN}" "${model_bin}"
 
-    exec_json="${RAW}/exec-${stem}.json"
-    exec_mlx_json="${RAW}/exec-mlx-${stem}.json"
-    serve_json="${RAW}/serve-${stem}.json"
-    scale_prefix="${RAW}/scale-${stem}"
-    scale_mlx_prefix="${RAW}/scale-mlx-${stem}"
-    rm -f "${exec_json}" "${exec_mlx_json}" "${serve_json}" "${scale_prefix}".* "${scale_mlx_prefix}".*
+    rm -f "${RAW}"/{exec,exec-mlx,exec-ollama,serve}-"${stem}".json "${RAW}"/scale{,-mlx,-ollama}-"${stem}".*.json
+    cell_model=""; cell_tok=""; oquant=""
+    otag=""; [[ -n "${OLLAMA_BIN}" ]] && otag="$(ollama_tag "${stem}")"
 
-    if (( built && EXEC_OK )); then
-        serve_cmd="${model_bin} serve ${id} --port ${PORT}"
-        [[ -n "${KV_CACHE_DTYPE}" ]] && serve_cmd="${serve_cmd} --kv-cache-dtype ${KV_CACHE_DTYPE}"
-        mlx_cmd=""
-        [[ -n "${MLX_PYTHON}" ]] && mlx_cmd="${MLX_PYTHON} -m mlx_lm.server --model ${id} --port ${PORT}"
-
-        # Flags shared by every --exec invocation for this model.
-        common=(--model "${id}" --exec
-                --mode server
-                --scenarios "${SCENARIOS}"
-                --reps "${REPS}"
-                --port "${PORT}"
-                --input-len "${INPUT_LEN}"
-                --output-len "${OUTPUT_LEN}"
-                --warm-requests "${WARM_REQUESTS}"
-                --remove-path "${HOME}/.cache/scratchy/metal-aligned-weights")
-        [[ -n "${EVICT}" ]]    && common+=(--evict "${EVICT}")
-        [[ -n "${SETTLE_S}" ]] && common+=(--settle-s "${SETTLE_S}")
-        [[ -n "${READY_TIMEOUT_S}" ]] && common+=(--ready-timeout-s "${READY_TIMEOUT_S}")
-        [[ -n "${SEED}" ]]     && common+=(--seed "${SEED}")
-        for ep in "${EVICT_PATH[@]:-}"; do [[ -n "${ep}" ]] && common+=(--evict-path "${ep}"); done
-
-        echo "--- scr bench startup --exec, backend scratchy (${SCENARIOS})"
-        # --remove-path clears the derived aligned-weights sidecar, which a FROZEN
-        # rung must not find warm. --exec spawns and reaps its own children.
-        parity=()
-        if [[ -n "${mlx_cmd}" ]]; then
-            # Blocking: a broken dequant path can be fast and wrong, so the two
-            # engines must agree on the same greedy prompts before either is timed.
-            parity=(--parity-cmd "${mlx_cmd}" --parity-backend mlx-lm)
-        fi
-        "${BIN}" bench startup "${common[@]}" \
-            --child-cmd "${serve_cmd}" \
-            --backend scratchy \
-            ${parity[@]+"${parity[@]}"} \
-            --output-json "${exec_json}" \
-            2>&1 | tail -8 | sed 's/^/    /' \
-            || echo "    --exec returned non-zero (validity gate, or a real failure); see above" >&2
-
-        if [[ -n "${mlx_cmd}" ]]; then
-            echo "--- scr bench startup --exec, backend mlx-lm (comparison column)"
-            "${BIN}" bench startup "${common[@]}" \
-                --child-cmd "${mlx_cmd}" \
-                --backend mlx-lm \
-                --output-json "${exec_mlx_json}" \
-                2>&1 | tail -6 | sed 's/^/    /' \
-                || echo "    mlx-lm --exec returned non-zero; see above" >&2
-        fi
+    # The comparison engines only need a working `scr` client, not this model's build.
+    if ! { [[ -x "${BIN}" ]] && "${BIN}" bench startup --help 2>/dev/null | grep -q -- '--exec'; }; then
+        echo "    no scr with \`bench startup --exec\` — nothing to measure with" >&2
+        continue
     fi
+    ladder=(--exec --mode server --scenarios "${SCENARIOS}" --reps "${REPS}" --port "${PORT}"
+            --input-len "${INPUT_LEN}" --output-len "${OUTPUT_LEN}" --warm-requests "${WARM_REQUESTS}"
+            --ready-timeout-s "${READY_TIMEOUT_S}"
+            --remove-path "${HOME}/.cache/scratchy/metal-aligned-weights")
+    [[ -n "${EVICT}" ]]    && ladder+=(--evict "${EVICT}")
+    [[ -n "${SETTLE_S}" ]] && ladder+=(--settle-s "${SETTLE_S}")
+    [[ -n "${SEED}" ]]     && ladder+=(--seed "${SEED}")
+    for ep in ${EVICT_PATH[@]+"${EVICT_PATH[@]}"}; do ladder+=(--evict-path "${ep}"); done
+    run_ladder() { # label model child-cmd backend out_json [extra...]
+        echo "--- scr bench startup --exec, $1 (${SCENARIOS})"
+        local label="$1" model="$2" cmd="$3" backend="$4" out="$5"; shift 5
+        "${BIN}" bench startup --model "${model}" "${ladder[@]}" "$@" --child-cmd "${cmd}" \
+            --backend "${backend}" --output-json "${out}" 2>&1 \
+            | awk '/^ *scenario +mode/{n=0} {l[n++]=$0} END{for(i=(n>6&&!h?n-6:0);i<n;i++)print l[i]} /^ *scenario +mode/{h=1}' \
+            | sed 's/^/    /' \
+            || echo "    ${label} --exec returned non-zero (validity gate, or a real failure); see above" >&2
+    }
 
+    # ---- scratchy
     if (( built )); then
+        run_ladder scratchy "${id}" \
+            "${model_bin} serve ${id} --port ${PORT}${KV_CACHE_DTYPE:+ --kv-cache-dtype ${KV_CACHE_DTYPE}}${SERVE_ARGS:+ ${SERVE_ARGS}}" \
+            scratchy "${RAW}/exec-${stem}.json"
         echo "--- scr bench serve (warm steady state, greedy, conc 1)"
-        # One resident server for this stage only; --exec owns the ladder above.
-        "${model_bin}" serve "${id}" --port "${PORT}" >"${RAW}/serve-${stem}.log" 2>&1 &
-        sp=$!
-        ready=0
-        deadline=$(( $(date +%s) + 1800 ))
-        while (( $(date +%s) < deadline )); do
-            curl -fsS -m 2 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1 && { ready=1; break; }
-            kill -0 "${sp}" 2>/dev/null || break
-            sleep 1
-        done
-        if (( ready )); then
+        if serve_up "${RAW}/serve-${stem}.log" /v1/models "${model_bin}" serve "${id}" --port "${PORT}" \
+                ${KV_CACHE_DTYPE:+--kv-cache-dtype "${KV_CACHE_DTYPE}"} ${SERVE_ARGS}; then
             "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${id}" \
                 --num-prompts "${NUM_PROMPTS}" --input-len "${INPUT_LEN}" --output-len "${OUTPUT_LEN}" \
                 --max-concurrency 1 --temperature 0 --seed "${RANDOM}${RANDOM}" \
                 --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
-                --output-json "${serve_json}" --disable-tqdm 2>&1 | tail -4 | sed 's/^/    /' \
+                --output-json "${RAW}/serve-${stem}.json" --disable-tqdm 2>&1 | tail -4 | sed 's/^/    /' \
                 || echo "    bench serve failed" >&2
+            if (( SCALING )); then
+                echo "--- scaling sweep, scratchy"
+                run_scale_cells "${RAW}/scale-${stem}"
+            fi
         else
             echo "    server never became ready — ${RAW}/serve-${stem}.log" >&2
         fi
-
-        # ---- scaling stage: same server, one axis at a time ------------------
-        # Base cell (SCALE_BASE_INPUT x SCALE_BASE_OUTPUT @ SCALE_BASE_CONC),
-        # then one rung list per axis with the others pinned. Seeds are
-        # deterministic per (stem, axis, rung) — see the header notes.
-        if (( ready && SCALING )); then
-            echo "--- scaling sweep (base ${SCALE_BASE_INPUT}x${SCALE_BASE_OUTPUT} @conc ${SCALE_BASE_CONC})"
-            run_scale_cells "${scale_prefix}"
-        fi
-        # Kill the whole job, not just the pid, so nothing survives this loop.
-        kill -INT "${sp}" 2>/dev/null || true
-        for _ in $(seq 1 30); do kill -0 "${sp}" 2>/dev/null || break; sleep 1; done
-        kill -KILL "${sp}" 2>/dev/null || true
-        wait "${sp}" 2>/dev/null || true
-        pkill -f "${model_bin} serve" 2>/dev/null || true
+        serve_down
     fi
 
-    # ---- scaling stage, mlx-lm comparison column ----------------------------
-    # Same rungs, same per-cell seeds (fair: identical prompts), one resident
-    # mlx-lm server. TTFT/TPOT compare directly; E2E only work-normalized.
-    if (( built && SCALING )) && [[ -n "${MLX_PYTHON}" ]]; then
-        echo "--- scaling sweep, mlx-lm (same rungs, same seeds)"
-        "${MLX_PYTHON}" -m mlx_lm.server --model "${id}" --port "${PORT}" \
-            >"${RAW}/serve-mlx-${stem}.log" 2>&1 &
-        mp=$!
-        ready=0
-        deadline=$(( $(date +%s) + 1800 ))
-        while (( $(date +%s) < deadline )); do
-            curl -fsS -m 2 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1 && { ready=1; break; }
-            kill -0 "${mp}" 2>/dev/null || break
-            sleep 1
-        done
-        if (( ready )); then
-            run_scale_cells "${scale_mlx_prefix}"
+    # ---- mlx-lm
+    if [[ -n "${MLX_PYTHON}" ]]; then
+        run_ladder mlx-lm "${id}" "${MLX_PYTHON} -m mlx_lm.server --model ${id} --port ${PORT}" \
+            mlx-lm "${RAW}/exec-mlx-${stem}.json"
+        if (( SCALING )); then
+            echo "--- scaling sweep, mlx-lm"
+            if serve_up "${RAW}/serve-mlx-${stem}.log" /v1/models \
+                    "${MLX_PYTHON}" -m mlx_lm.server --model "${id}" --port "${PORT}"; then
+                run_scale_cells "${RAW}/scale-mlx-${stem}"
+            else
+                echo "    mlx-lm server never became ready — ${RAW}/serve-mlx-${stem}.log" >&2
+            fi
+            serve_down
+        fi
+    fi
+
+    # ---- ollama
+    if [[ -n "${otag}" ]]; then
+        echo "--- ollama ${otag}"
+        show() { curl -fsS -m 10 "http://127.0.0.1:${PORT}/api/show" -d "{\"model\":\"${otag}\"}"; }
+        have=0
+        if ollama_up; then
+            if show >/dev/null 2>&1; then
+                have=1
+            elif (( ! OFFLINE )); then
+                echo "    pulling ${otag} (first use)"
+                OLLAMA_HOST="127.0.0.1:${PORT}" "${OLLAMA_BIN}" pull "${otag}" \
+                    >>"${RAW}/serve-ollama-${stem}.log" 2>&1 && have=1
+            fi
+            (( have )) && oquant="$(show 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["details"]["quantization_level"])' || true)"
+        fi
+        serve_down
+        if (( ! have )); then
+            echo "    ${otag} not available (offline, or the pull failed) — skipped" >&2
         else
-            echo "    mlx-lm server never became ready — ${RAW}/serve-mlx-${stem}.log" >&2
+            oevict=()
+            [[ ",${SCENARIOS}," == *",frozen,"* ]] && oevict=(--evict-path "${HOME}/.ollama/models/blobs")
+            run_ladder ollama "${otag}" "$(ollama_env) ${OLLAMA_BIN} serve" vllm \
+                "${RAW}/exec-ollama-${stem}.json" ${oevict[@]+"${oevict[@]}"}
+            if (( SCALING )); then
+                # ollama reserves NUM_PARALLEL x CONTEXT_LENGTH of KV up front, so
+                # each axis gets a server sized for just that axis.
+                cell_model="${otag}"; cell_tok="${id}"
+                IFS=',' read -r -a axes <<<"${SCALE_AXES}"
+                for ax in "${axes[@]}"; do
+                    par=${SCALE_BASE_CONC}
+                    case "${ax}" in
+                        conc)   par=$(max_of "${SCALE_CONC}"); ctx=$(( SCALE_BASE_INPUT + SCALE_BASE_OUTPUT )) ;;
+                        input)  ctx=$(( $(max_of "${SCALE_INPUT}") + SCALE_BASE_OUTPUT )) ;;
+                        output) ctx=$(( SCALE_BASE_INPUT + $(max_of "${SCALE_OUTPUT}") )) ;;
+                        grid)   ctx=$(( $(max_of "${SCALE_GRID_INPUT}") + $(max_of "${SCALE_GRID_OUTPUT}") )) ;;
+                        *)      continue ;;
+                    esac
+                    ctx=$(( ctx + 256 ))   # tokenizer slack
+                    echo "--- scaling sweep, ollama ${ax} (num_parallel ${par}, context ${ctx})"
+                    if ollama_up OLLAMA_NUM_PARALLEL="${par}" OLLAMA_CONTEXT_LENGTH="${ctx}"; then
+                        run_scale_cells "${RAW}/scale-ollama-${stem}" "${ax}"
+                    else
+                        echo "    ollama serve did not start — ${RAW}/serve-ollama-${stem}.log" >&2
+                    fi
+                    serve_down
+                done
+                cell_model=""; cell_tok=""
+            fi
         fi
-        kill -INT "${mp}" 2>/dev/null || true
-        for _ in $(seq 1 30); do kill -0 "${mp}" 2>/dev/null || break; sleep 1; done
-        kill -KILL "${mp}" 2>/dev/null || true
-        wait "${mp}" 2>/dev/null || true
-        pkill -f "mlx_lm.server --model ${id}" 2>/dev/null || true
     fi
 
-    python3 - "${JSON}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
-              "${build_secs}" "${bytes}" "${exec_json}" "${serve_json}" "${exec_mlx_json}" \
-              "${scale_prefix}" "${scale_mlx_prefix}" <<'PY'
+    python3 - "${JSON}" "${RAW}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
+              "${build_secs}" "${bytes}" "${otag}" "${oquant}" <<'PY'
 import glob, json, os, re, sys
-js, stem, mid, quant, feats, built, secs, size, exec_json, serve_json, exec_mlx_json, scale_prefix, scale_mlx_prefix = sys.argv[1:15]
-def num(x):
-    for cast in (int, float):
-        try: return cast(x)
-        except Exception: pass
-    return None
-def load(p):
-    return json.load(open(p)) if p and os.path.exists(p) else None
-def scaling(prefix):
-    # <prefix>.<axis>-<rung>.json -> [{axis, rung, metrics...}]
-    if not prefix or not os.path.isdir(os.path.dirname(prefix)):
-        return None
+js, raw, stem, mid, quant, feats, built, secs, size, otag, oquant = sys.argv[1:12]
+KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms", "median_itl_ms",
+        "p99_itl_ms", "median_e2el_ms", "output_throughput", "request_throughput",
+        "completed", "total_output_tokens", "duration"]
+CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?\.json$")
+def load(name):
+    p = os.path.join(raw, name)
+    return json.load(open(p)) if os.path.exists(p) else None
+def metrics(j):
+    return {k: j[k] for k in KEEP if k in j} if j else None
+def scaling(engine):
     cells = []
-    pat = re.compile(r"\.(conc|input|output)-(\d+)\.json$")
-    for p in sorted(glob.glob(prefix + ".*.json")):
-        m = pat.search(p)
-        if not m:
+    for p in sorted(glob.glob(os.path.join(raw, f"scale{engine}-{stem}.*.json"))):
+        m = CELL.search(p)
+        if not m or not (j := load(os.path.basename(p))):
             continue
-        sj = load(p)
-        if not sj:
-            continue
-        keep = ["median_ttft_ms","p99_ttft_ms","median_tpot_ms","p99_tpot_ms","median_itl_ms",
-                "p99_itl_ms","median_e2el_ms","output_throughput","request_throughput",
-                "completed","total_output_tokens","duration"]
-        cells.append({"axis": m.group(1), "rung": int(m.group(2)),
-                      **{k: sj[k] for k in keep if k in sj}})
+        axis, a, b = m.groups()
+        where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b)}
+                 if axis == "grid" else {"rung": int(a)})
+        cells.append({"axis": axis, **where, **metrics(j)})
     return cells or None
 d = json.load(open(js))
-warm = None
-sj = load(serve_json)
-if sj:
-    keep = ["median_ttft_ms","p99_ttft_ms","median_tpot_ms","p99_tpot_ms","median_itl_ms",
-            "p99_itl_ms","median_e2el_ms","output_throughput","request_throughput",
-            "completed","total_output_tokens","duration"]
-    warm = {k: sj[k] for k in keep if k in sj}
 d["models"].append({
     "stem": stem, "model_id": mid, "quant": quant or None, "features": feats,
     "built": built == "1",
-    "footprint": {"build_seconds": num(secs), "binary_bytes": num(size),
+    "footprint": {"build_seconds": int(secs) if secs else None,
+                  "binary_bytes": int(size) if size else None,
                   "container_image_bytes": None,
                   "note": "no container image: Metal is not available in Linux containers"},
-    "cache_ladder": load(exec_json),
-    "cache_ladder_mlx_lm": load(exec_mlx_json),
-    "warm_serving": warm,
-    "scaling": scaling(scale_prefix),
-    "scaling_mlx_lm": scaling(scale_mlx_prefix),
+    "cache_ladder": load(f"exec-{stem}.json"),
+    "cache_ladder_mlx_lm": load(f"exec-mlx-{stem}.json"),
+    "warm_serving": metrics(load(f"serve-{stem}.json")),
+    "scaling": scaling(""),
+    "scaling_mlx_lm": scaling("-mlx"),
+    "ollama": None if not otag else {
+        "tag": otag, "quantization": oquant or None,
+        "disclosed": ["GGUF weights, not the MLX checkpoint: no parity gate",
+                      "ignores ignore_eos, so it can under-generate",
+                      "peak RSS is `ollama serve` only; the runner grandchild is not counted",
+                      "scaling server sized per axis: OLLAMA_NUM_PARALLEL = axis top concurrency, "
+                      "OLLAMA_CONTEXT_LENGTH = longest input+output (+256)"]},
+    "cache_ladder_ollama": load(f"exec-ollama-{stem}.json"),
+    "scaling_ollama": scaling("-ollama"),
 })
 json.dump(d, open(js, "w"), indent=2)
 PY
@@ -498,6 +519,8 @@ def med(reps, scenario, field):
     return statistics.median(vals) if vals else None
 def fmt(v, nd=0):
     return "-" if v is None else f"{v:.{nd}f}"
+def cells(e, key, axis):
+    return [c for c in (e.get(key) or []) if c["axis"] == axis]
 for e in d["models"]:
     f, ladder, w = e["footprint"], e.get("cache_ladder"), e.get("warm_serving") or {}
     mib = round(f["binary_bytes"] / 1048576) if f["binary_bytes"] else None
@@ -509,24 +532,35 @@ for e in d["models"]:
         print("    BUILD FAILED — see the build log in this machine's raw/ directory")
     elif ladder is None:
         print("    cache ladder unavailable")
-    sc = e.get("scaling") or []
-    conc = sorted((c for c in sc if c["axis"] == "conc"), key=lambda c: c["rung"])
+    conc = sorted(cells(e, "scaling", "conc"), key=lambda c: c["rung"])
     if conc:
-        # Scaling headline: throughput at the top concurrency rung, and the
-        # TPOT ratio top/base — the per-request cost of being batched (a good
-        # batched decoder keeps it ~1.0).
+        # TPOT at the top rung vs conc<=2: the per-request cost of batching (~1.0 is good).
         top = conc[-1]
         base_tp = next((c["median_tpot_ms"] for c in conc if c["rung"] <= 2), None)
-        ratio = (top["median_tpot_ms"] / base_tp) if (top.get("median_tpot_ms") and base_tp) else None
         line = f"    scaling: conc {top['rung']} -> {fmt(top.get('output_throughput'), 1)} tok/s"
-        if ratio:
-            line += f" · TPOT x{ratio:.2f} vs conc<=2"
+        if top.get("median_tpot_ms") and base_tp:
+            line += f" · TPOT x{top['median_tpot_ms'] / base_tp:.2f} vs conc<=2"
         print(line)
-        mln = e.get("scaling_mlx_lm") or []
-        mtop = [c for c in mln if c["axis"] == "conc" and c["rung"] == top["rung"]]
-        if mtop and mtop[0].get("output_throughput"):
-            print(f"    scaling mlx-lm: conc {top['rung']} -> {fmt(mtop[0]['output_throughput'], 1)} tok/s")
-print(f"\nfrozen/cold are ttft_exec seconds (exec -> first token); TTFT/TPOT are warm ms.")
+        for name, key in (("mlx-lm", "scaling_mlx_lm"), ("ollama", "scaling_ollama")):
+            t = [c for c in cells(e, key, "conc") if c["rung"] == top["rung"]]
+            if t and t[0].get("output_throughput"):
+                print(f"    scaling {name}: conc {top['rung']} -> {fmt(t[0]['output_throughput'], 1)} tok/s")
+    # Text heat maps: scratchy / engine output tok/s per grid cell (>1.00 = scratchy faster).
+    grid = {(c["input_len"], c["output_len"]): c for c in cells(e, "scaling", "grid")}
+    ins = sorted({k[0] for k in grid}); outs = sorted({k[1] for k in grid})
+    for name, key in (("mlx-lm", "scaling_mlx_lm"), ("ollama", "scaling_ollama")):
+        them = {(c["input_len"], c["output_len"]): c for c in cells(e, key, "grid")}
+        if not (grid and them):
+            continue
+        print(f"    grid, scratchy / {name} output tok/s (rows input, cols output):")
+        print("      " + "in/out".rjust(8) + "".join(f"{o:>8}" for o in outs))
+        for i in ins:
+            row = ""
+            for o in outs:
+                a = grid.get((i, o), {}).get("output_throughput")
+                b = them.get((i, o), {}).get("output_throughput")
+                row += f"{a / b:>8.2f}" if (a and b) else f"{'-':>8}"
+            print("      " + f"{i:>8}" + row)
+print("\nfrozen/cold are ttft_exec seconds (exec -> first token); TTFT/TPOT are warm ms.")
 print(f"json -> {sys.argv[1]}")
-print("paste this file into issue #91; fill the table in #95 from it")
 PY
