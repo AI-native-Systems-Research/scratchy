@@ -23,6 +23,7 @@
 #   t_ready, ttft_from_send, tpot      scr bench startup --exec
 #   peak RSS, major faults             scr bench startup --exec  (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve
+#   scaling curves (conc/in/out)       scr bench serve   (one axis at a time)
 #
 # The cache ladder, the eviction proof, the priming launch, per-child resource
 # attribution and the validity gates all live in `--exec`. See
@@ -32,6 +33,35 @@
 #   * `--scenarios frozen,...` needs `sudo` (macOS `purge`). Run `sudo -v` first,
 #     or pass `--scenarios cold,warm` and leave the frozen cells blank.
 #   * Weights are downloaded on first use unless you pass --offline.
+#
+# SCALING STAGE (on by default; --no-scaling skips it)
+#
+#   One axis at a time from a base cell (input 512, output 128, conc 8),
+#   never a full factorial: the marginal curve per axis is the deliverable.
+#
+#     concurrency: 1, 2, 4, 8, 16, 32   (input/output pinned at the base cell)
+#     input len:   128, 512, 2048, 8192 (conc/output pinned)
+#     output len:  16, 64, 256, 1024    (conc/input pinned)
+#
+#   Metrics per rung: output tok/s, median TTFT, median TPOT, request
+#   throughput. TPOT-vs-concurrency is the batched-decode health check —
+#   a good batched decoder keeps it ~flat.
+#
+#   Load-bearing rules inherited from scripts/bench_serve_compare.sh:
+#     * UNIQUE SEED PER CELL — the same seed means identical random prompts,
+#       so the prefix cache serves later cells and TTFT collapses to ~0.
+#       Seeds are shared across backends (same prompts ⇒ fair comparison)
+#       but unique across cells. The base seed is fixed (not ${RANDOM}) so a
+#       rerun of the script reproduces the same prompts.
+#     * One resident server per model for the whole scaling stage; cells run
+#       back-to-back against it, warmups before the timed requests.
+#     * `--max-concurrency N` is OFFERED concurrency; the scheduler decides
+#       the effective decode batch. Curves are against offered concurrency
+#       until `bench serve` records the effective batch too (disclosed in
+#       docs/BENCHMARKING.md).
+#     * mlx-lm, when the comparison column is on, runs the same sweep with
+#       the same per-cell seeds. Compare TTFT/TPOT directly; E2E only
+#       work-normalized (mlx-lm under-generates without ignore_eos).
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -82,6 +112,21 @@ SEED=""
 # Setting --mlx-python turns on the comparison column: the same ladder is run a
 # second time with --backend mlx-lm.
 MLX_PYTHON=""
+# Scaling stage (see the header): base cell + one-axis-at-a-time rungs.
+SCALING=1
+SCALE_CONC="1,2,4,8,16,32"
+SCALE_INPUT="128,512,2048,8192"
+SCALE_OUTPUT="16,64,256,1024"
+SCALE_BASE_INPUT=512
+SCALE_BASE_OUTPUT=128
+SCALE_BASE_CONC=8
+# Prompts per scaling cell: enough for the median to be honest at the highest
+# concurrency without making an 8192-input rung take all day. Default scales
+# with nothing — tune per machine if a rung is too noisy.
+SCALE_NUM_PROMPTS=24
+SCALE_WARMUPS=4
+# Fixed base for per-cell seeds so reruns see the same prompts.
+SCALE_SEED_BASE=20260927
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -100,6 +145,13 @@ while [[ $# -gt 0 ]]; do
         --ready-timeout-s) READY_TIMEOUT_S="$2"; shift 2 ;;
         --seed)           SEED="$2"; shift 2 ;;
         --mlx-python)     MLX_PYTHON="$2"; shift 2 ;;
+        --scaling)        SCALING=1; shift ;;
+        --no-scaling)     SCALING=0; shift ;;
+        --scale-conc)     SCALE_CONC="$2"; shift 2 ;;
+        --scale-input)    SCALE_INPUT="$2"; shift 2 ;;
+        --scale-output)   SCALE_OUTPUT="$2"; shift 2 ;;
+        --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
+        --scale-warmups)  SCALE_WARMUPS="$2"; shift 2 ;;
         --offline)        OFFLINE=1; shift ;;
         --skip-build)     SKIP_BUILD=1; shift ;;
         --out-dir)        OUT_DIR="$2"; shift 2 ;;
@@ -176,6 +228,55 @@ json.dump({
 }, open(out, "w"), indent=2)
 PY
 
+# ---- scaling helpers ---------------------------------------------------------
+# One `scr bench serve` per (axis, rung) against the ALREADY-RUNNING server on
+# ${PORT}. Output: one JSON per cell at "${out_prefix}.${axis}-${rung}.json",
+# merged into the machine JSON later. `stem` (model), `id` and the SCALE_*
+# config are from the enclosing scope. Seeds are deterministic per
+# (stem, axis, rung) so a rerun sees the same prompts AND no two cells share
+# prompts (which would let the prefix cache serve a later cell from an earlier
+# one and collapse its TTFT).
+run_scale_cells() { # out_prefix
+    local out_prefix="$1"
+    local seed
+    cell_seed() { # axis rung
+        # Distinct per (model, axis, rung); stable across reruns and identical
+        # for scratchy and mlx-lm (same prompts for both engines).
+        local h=0 ch
+        local s="${stem}:$1"
+        for (( i=0; i<${#s}; i++ )); do
+            ch="${s:i:1}"
+            h=$(( (h * 31 + $(printf '%d' "'${ch}")) % 1000000000 ))
+        done
+        echo $(( (h + $2 * 7919) % 2000000000 ))
+    }
+    run_cell() { # axis rung input output conc
+        local axis="$1" rung="$2" in="$3" out="$4" conc="$5"
+        seed="$(cell_seed "${axis}" "${rung}")"
+        echo "    ${axis}=${rung} (in ${in}, out ${out}, conc ${conc}, seed ${seed})"
+        "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${id}" \
+            --num-prompts "${SCALE_NUM_PROMPTS}" --input-len "${in}" --output-len "${out}" \
+            --max-concurrency "${conc}" --temperature 0 --seed "${seed}" \
+            --num-warmups "${SCALE_WARMUPS}" \
+            --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
+            --output-json "${out_prefix}.${axis}-${rung}.json" --disable-tqdm 2>&1 | tail -2 | sed 's/^/        /' \
+            || echo "        cell failed" >&2
+    }
+    local -a concs inputs outputs
+    IFS=',' read -r -a concs  <<<"${SCALE_CONC}"
+    IFS=',' read -r -a inputs <<<"${SCALE_INPUT}"
+    IFS=',' read -r -a outputs <<<"${SCALE_OUTPUT}"
+    for c in "${concs[@]}"; do
+        run_cell conc  "${c}" "${SCALE_BASE_INPUT}"  "${SCALE_BASE_OUTPUT}" "${c}"
+    done
+    for l in "${inputs[@]}"; do
+        run_cell input "${l}" "${l}" "${SCALE_BASE_OUTPUT}" "${SCALE_BASE_CONC}"
+    done
+    for l in "${outputs[@]}"; do
+        run_cell output "${l}" "${SCALE_BASE_INPUT}" "${l}" "${SCALE_BASE_CONC}"
+    done
+}
+
 # ---- per model --------------------------------------------------------------
 for entry in "${MODELS[@]}"; do
     stem="${entry%%=*}"; rest="${entry#*=}"
@@ -207,7 +308,9 @@ for entry in "${MODELS[@]}"; do
     exec_json="${RAW}/exec-${stem}.json"
     exec_mlx_json="${RAW}/exec-mlx-${stem}.json"
     serve_json="${RAW}/serve-${stem}.json"
-    rm -f "${exec_json}" "${exec_mlx_json}" "${serve_json}"
+    scale_prefix="${RAW}/scale-${stem}"
+    scale_mlx_prefix="${RAW}/scale-mlx-${stem}"
+    rm -f "${exec_json}" "${exec_mlx_json}" "${serve_json}" "${scale_prefix}".* "${scale_mlx_prefix}".*
 
     if (( built && EXEC_OK )); then
         serve_cmd="${model_bin} serve ${id} --port ${PORT}"
@@ -281,6 +384,15 @@ for entry in "${MODELS[@]}"; do
         else
             echo "    server never became ready — ${RAW}/serve-${stem}.log" >&2
         fi
+
+        # ---- scaling stage: same server, one axis at a time ------------------
+        # Base cell (SCALE_BASE_INPUT x SCALE_BASE_OUTPUT @ SCALE_BASE_CONC),
+        # then one rung list per axis with the others pinned. Seeds are
+        # deterministic per (stem, axis, rung) — see the header notes.
+        if (( ready && SCALING )); then
+            echo "--- scaling sweep (base ${SCALE_BASE_INPUT}x${SCALE_BASE_OUTPUT} @conc ${SCALE_BASE_CONC})"
+            run_scale_cells "${scale_prefix}"
+        fi
         # Kill the whole job, not just the pid, so nothing survives this loop.
         kill -INT "${sp}" 2>/dev/null || true
         for _ in $(seq 1 30); do kill -0 "${sp}" 2>/dev/null || break; sleep 1; done
@@ -289,10 +401,38 @@ for entry in "${MODELS[@]}"; do
         pkill -f "${model_bin} serve" 2>/dev/null || true
     fi
 
+    # ---- scaling stage, mlx-lm comparison column ----------------------------
+    # Same rungs, same per-cell seeds (fair: identical prompts), one resident
+    # mlx-lm server. TTFT/TPOT compare directly; E2E only work-normalized.
+    if (( built && SCALING )) && [[ -n "${MLX_PYTHON}" ]]; then
+        echo "--- scaling sweep, mlx-lm (same rungs, same seeds)"
+        "${MLX_PYTHON}" -m mlx_lm.server --model "${id}" --port "${PORT}" \
+            >"${RAW}/serve-mlx-${stem}.log" 2>&1 &
+        mp=$!
+        ready=0
+        deadline=$(( $(date +%s) + 1800 ))
+        while (( $(date +%s) < deadline )); do
+            curl -fsS -m 2 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1 && { ready=1; break; }
+            kill -0 "${mp}" 2>/dev/null || break
+            sleep 1
+        done
+        if (( ready )); then
+            run_scale_cells "${scale_mlx_prefix}"
+        else
+            echo "    mlx-lm server never became ready — ${RAW}/serve-mlx-${stem}.log" >&2
+        fi
+        kill -INT "${mp}" 2>/dev/null || true
+        for _ in $(seq 1 30); do kill -0 "${mp}" 2>/dev/null || break; sleep 1; done
+        kill -KILL "${mp}" 2>/dev/null || true
+        wait "${mp}" 2>/dev/null || true
+        pkill -f "mlx_lm.server --model ${id}" 2>/dev/null || true
+    fi
+
     python3 - "${JSON}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
-              "${build_secs}" "${bytes}" "${exec_json}" "${serve_json}" "${exec_mlx_json}" <<'PY'
-import json, os, sys
-js, stem, mid, quant, feats, built, secs, size, exec_json, serve_json, exec_mlx_json = sys.argv[1:12]
+              "${build_secs}" "${bytes}" "${exec_json}" "${serve_json}" "${exec_mlx_json}" \
+              "${scale_prefix}" "${scale_mlx_prefix}" <<'PY'
+import glob, json, os, re, sys
+js, stem, mid, quant, feats, built, secs, size, exec_json, serve_json, exec_mlx_json, scale_prefix, scale_mlx_prefix = sys.argv[1:15]
 def num(x):
     for cast in (int, float):
         try: return cast(x)
@@ -300,6 +440,25 @@ def num(x):
     return None
 def load(p):
     return json.load(open(p)) if p and os.path.exists(p) else None
+def scaling(prefix):
+    # <prefix>.<axis>-<rung>.json -> [{axis, rung, metrics...}]
+    if not prefix or not os.path.isdir(os.path.dirname(prefix)):
+        return None
+    cells = []
+    pat = re.compile(r"\.(conc|input|output)-(\d+)\.json$")
+    for p in sorted(glob.glob(prefix + ".*.json")):
+        m = pat.search(p)
+        if not m:
+            continue
+        sj = load(p)
+        if not sj:
+            continue
+        keep = ["median_ttft_ms","p99_ttft_ms","median_tpot_ms","p99_tpot_ms","median_itl_ms",
+                "p99_itl_ms","median_e2el_ms","output_throughput","request_throughput",
+                "completed","total_output_tokens","duration"]
+        cells.append({"axis": m.group(1), "rung": int(m.group(2)),
+                      **{k: sj[k] for k in keep if k in sj}})
+    return cells or None
 d = json.load(open(js))
 warm = None
 sj = load(serve_json)
@@ -317,6 +476,8 @@ d["models"].append({
     "cache_ladder": load(exec_json),
     "cache_ladder_mlx_lm": load(exec_mlx_json),
     "warm_serving": warm,
+    "scaling": scaling(scale_prefix),
+    "scaling_mlx_lm": scaling(scale_mlx_prefix),
 })
 json.dump(d, open(js, "w"), indent=2)
 PY
@@ -348,6 +509,23 @@ for e in d["models"]:
         print("    BUILD FAILED — see the build log in this machine's raw/ directory")
     elif ladder is None:
         print("    cache ladder unavailable")
+    sc = e.get("scaling") or []
+    conc = sorted((c for c in sc if c["axis"] == "conc"), key=lambda c: c["rung"])
+    if conc:
+        # Scaling headline: throughput at the top concurrency rung, and the
+        # TPOT ratio top/base — the per-request cost of being batched (a good
+        # batched decoder keeps it ~1.0).
+        top = conc[-1]
+        base_tp = next((c["median_tpot_ms"] for c in conc if c["rung"] <= 2), None)
+        ratio = (top["median_tpot_ms"] / base_tp) if (top.get("median_tpot_ms") and base_tp) else None
+        line = f"    scaling: conc {top['rung']} -> {fmt(top.get('output_throughput'), 1)} tok/s"
+        if ratio:
+            line += f" · TPOT x{ratio:.2f} vs conc<=2"
+        print(line)
+        mln = e.get("scaling_mlx_lm") or []
+        mtop = [c for c in mln if c["axis"] == "conc" and c["rung"] == top["rung"]]
+        if mtop and mtop[0].get("output_throughput"):
+            print(f"    scaling mlx-lm: conc {top['rung']} -> {fmt(mtop[0]['output_throughput'], 1)} tok/s")
 print(f"\nfrozen/cold are ttft_exec seconds (exec -> first token); TTFT/TPOT are warm ms.")
 print(f"json -> {sys.argv[1]}")
 print("paste this file into issue #91; fill the table in #95 from it")
