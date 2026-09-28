@@ -615,6 +615,14 @@ fn init_cache(
         effective_max_model_len,
         worker.supports_hybrid_swa_kv(),
     );
+    // A worker whose uniform pool is not dense rows (a metal model built with
+    // TurboQuant: packed codes) states what one block costs; the budget buys
+    // that many of them instead.
+    if swa_hybrid_kv.is_none()
+        && let Some(bytes_per_block) = worker.kv_block_bytes(block_size)
+    {
+        num_gpu_blocks = blocks_within(kv_cache_bytes, bytes_per_block);
+    }
     // Fixed-size resident KV pool cap (spyre/sendnn PAGED CB): the on-card pool is
     // exactly `nblk` blocks, so the scheduler's block allocator must not exceed it
     // (else it hands out a block id past the pool → silent KV corruption). The
@@ -3758,8 +3766,15 @@ fn compute_num_blocks(
         dtype_elem_bytes
     };
     let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * elem_bytes;
-    let bytes_per_block = block_size * num_layers * bytes_per_token_per_layer;
+    blocks_within(
+        available_bytes,
+        block_size * num_layers * bytes_per_token_per_layer,
+    )
+}
 
+/// How many blocks of `bytes_per_block` a uniform KV pool fits in
+/// `available_bytes` — at least 16.
+fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
     if bytes_per_block == 0 {
         return 1024; // Fallback.
     }

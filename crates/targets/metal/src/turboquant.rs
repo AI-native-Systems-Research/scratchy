@@ -7,7 +7,7 @@
 //! (`attention.metal`).
 
 use objc2_metal::MTLDevice;
-use scratchy_layers::turboquant::TqBits;
+use scratchy_layers::turboquant::{KvCodec, TqBits, bytes_per_vec};
 
 use crate::argmax::{Buffer, Device};
 
@@ -105,11 +105,41 @@ pub fn codec_for(geometry: KvGeometry, bits: TqBits) -> Result<TqBits, DenseReas
     {
         return Err(DenseReason::HeadDim(hd));
     }
-    let bytes_per_token = num_layers * num_kv_heads * head_dim as usize * 2 * 2;
+    let bytes_per_token = kv_bytes_per_token(
+        KvCodec::Dense,
+        num_layers,
+        num_kv_heads,
+        head_dim as usize,
+        2,
+    );
     if bytes_per_token < MIN_KV_BYTES_PER_TOKEN {
         return Err(DenseReason::SmallKv { bytes_per_token });
     }
     Ok(bits)
+}
+
+/// The width of the fp16 scratch attention stages TurboQuant K/V into.
+const SCRATCH_ELEM_BYTES: usize = 2;
+
+/// Bytes one token's K and V cost in a KV pool of `num_layers` layers of
+/// `num_kv_heads × head_dim` stored as `codec`: dense, every layer's
+/// `dense_elem_bytes`-wide row; TurboQuant, every layer's packed codes and
+/// norms ([`bytes_per_vec`]) plus the one-layer fp16 scratch — what
+/// [`build_tq_provision`] allocates per token.
+pub fn kv_bytes_per_token(
+    codec: KvCodec,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    dense_elem_bytes: usize,
+) -> usize {
+    match codec {
+        KvCodec::Dense => num_layers * 2 * num_kv_heads * head_dim * dense_elem_bytes,
+        KvCodec::TurboQuant(bits) => {
+            num_layers * 2 * num_kv_heads * bytes_per_vec(head_dim, bits.get())
+                + 2 * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES
+        }
+    }
 }
 
 /// Build the TurboQuant provisioning for one worker at the GLOBAL (full-context)
@@ -223,9 +253,9 @@ pub fn build_tq_provision(
     // case — a dedicated scratch, not a pool-shared tensor). Contiguous data +
     // a chunk-table of gpuAddresses at chunk offsets (the kernels deref it).
     let per_block_elems = block_size * num_kv_heads * head_dim;
-    let scratch_bytes = num_blocks * per_block_elems * 2;
+    let scratch_bytes = num_blocks * per_block_elems * SCRATCH_ELEM_BYTES;
     let n_chunks = num_blocks.div_ceil(blocks_per_chunk.max(1));
-    let chunk_bytes = blocks_per_chunk * per_block_elems * 2;
+    let chunk_bytes = blocks_per_chunk * per_block_elems * SCRATCH_ELEM_BYTES;
     let build_scratch = || {
         let data = alloc(scratch_bytes);
         // Zero the scratch so blocks the rope DOESN'T write read back as 0
@@ -441,6 +471,53 @@ mod tests {
     /// clean, and the host-side codebook is FINE at 64 (mean cosine 0.9849 /
     /// 0.9958, better than at 128). So the untested combination is the suspect,
     /// and this sweep is what makes it a test rather than an argument.
+    /// The KV budget sizes a TurboQuant pool with `kv_bytes_per_token`; the
+    /// buffers `build_tq_provision` sizes per token — every layer's packed
+    /// codes and norms, and the K and V scratch — must add up to exactly that,
+    /// or the pool the engine counts is not the pool the GPU holds.
+    #[test]
+    fn provision_allocates_kv_bytes_per_token() {
+        let Some(device) = crate::detect_device().map(|d| d.device) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let (num_layers, num_blocks, block_size, num_kv_heads, head_dim) = (3, 8, 16, 2, 64);
+        for bits in [TqBits::new(3), TqBits::new(4)] {
+            let tq = build_tq_provision(
+                &device,
+                &vec![true; num_layers],
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+                4,
+                bits,
+                42,
+            );
+            let len = |b: &Buffer| b.length();
+            let per_token: usize = [&tq.packed_k, &tq.packed_v, &tq.norms_k, &tq.norms_v]
+                .into_iter()
+                .flatten()
+                .map(len)
+                .sum::<usize>()
+                + len(&tq.scratch_k_data)
+                + len(&tq.scratch_v_data);
+            assert_eq!(
+                per_token,
+                num_blocks
+                    * block_size
+                    * kv_bytes_per_token(
+                        KvCodec::TurboQuant(bits),
+                        num_layers,
+                        num_kv_heads,
+                        head_dim,
+                        2
+                    ),
+                "{bits:?}"
+            );
+        }
+    }
+
     #[test]
     fn gpu_compress_paged_in_place() {
         let Some(device) = crate::detect_device().map(|d| d.device) else {

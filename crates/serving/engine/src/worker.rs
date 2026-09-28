@@ -127,6 +127,16 @@ pub trait Worker: Send {
         None
     }
 
+    /// Bytes one block of `block_size` tokens costs in this worker's uniform KV
+    /// pool, when that is not the dense row the engine derives from the HF
+    /// config (`layers × 2 × kv_heads × head_dim × dtype`): a metal model built
+    /// with TurboQuant stores packed codes. The engine sizes `num_gpu_blocks`
+    /// from the memory budget by this instead. `None` = the dense row. Valid
+    /// after `load_model`.
+    fn kv_block_bytes(&self, _block_size: usize) -> Option<usize> {
+        None
+    }
+
     /// HARD CAP on the scheduler's `max_num_seqs`, if the backend can only DECODE a bounded number of
     /// sequences in one batched step.
     ///

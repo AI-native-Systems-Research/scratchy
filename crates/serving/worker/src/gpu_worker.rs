@@ -591,12 +591,65 @@ fn kv_per_block_bytes(
             .sum::<usize>()
             .saturating_mul(elt_bytes);
     }
-    (model.num_hidden_layers() as usize)
-        .saturating_mul(2)
-        .saturating_mul(model.num_key_value_heads() as usize)
-        .saturating_mul(model.head_dim() as usize)
-        .saturating_mul(block_size)
-        .saturating_mul(elt_bytes)
+    block_size.saturating_mul(pool_bytes_per_token(
+        model,
+        scratchy_forward_compiler::KvCodec::Dense,
+        elt_bytes,
+    ))
+}
+
+/// `kv_bytes_per_token` at `model`'s pool geometry: every layer, its KV heads
+/// and head_dim, `dense_elem_bytes` wide when `codec` is dense.
+#[cfg(feature = "metal")]
+fn pool_bytes_per_token(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    codec: scratchy_forward_compiler::KvCodec,
+    dense_elem_bytes: usize,
+) -> usize {
+    scratchy_target_metal::turboquant::kv_bytes_per_token(
+        codec,
+        model.num_hidden_layers() as usize,
+        model.num_key_value_heads() as usize,
+        model.head_dim() as usize,
+        dense_elem_bytes,
+    )
+}
+
+/// A uniform model built with TurboQuant: its KV lives in packed codes and the
+/// fp16 pool is a one-chunk seed (`initialize_cache`). A hybrid model's
+/// TurboQuant global layers share a pool sized to its context, not the budget.
+#[cfg(feature = "metal")]
+fn uniform_turboquant(model: &dyn scratchy_forward_compiler::ScratchyWeights) -> bool {
+    model.kv_codec().is_turboquant() && model.per_layer_kv_token_elems().is_none()
+}
+
+/// Bytes one block of the TARGET pool costs: a uniform TurboQuant model's
+/// codes, norms and scratch, every other model's dense rows.
+#[cfg(feature = "metal")]
+fn target_block_bytes(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+) -> usize {
+    if uniform_turboquant(model) {
+        block_size.saturating_mul(pool_bytes_per_token(model, model.kv_codec(), 2))
+    } else {
+        kv_per_block_bytes(model, block_size)
+    }
+}
+
+/// Bytes one block of the DRAFT pool costs: it is allocated dense in full
+/// (`initialize_draft_cache_metal`), and a TurboQuant draft's codec buffers
+/// come on top of it.
+#[cfg(feature = "metal")]
+fn draft_block_bytes(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+) -> usize {
+    let codec = match model.kv_codec() {
+        scratchy_forward_compiler::KvCodec::Dense => 0,
+        codec => block_size.saturating_mul(pool_bytes_per_token(model, codec, 2)),
+    };
+    kv_per_block_bytes(model, block_size).saturating_add(codec)
 }
 
 // `compute_available_kv_bytes`, `PrefillBucketSelection`, and
@@ -2543,6 +2596,14 @@ impl Worker for MetalWorker {
         Some(model.max_blocks_per_seq() * self.config.block_size)
     }
 
+    fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
+        // A uniform TurboQuant model's blocks are packed codes, not the dense
+        // rows the engine would derive — the same cost the draft split in
+        // `determine_available_memory` divides by.
+        let model = self.model.as_deref()?;
+        uniform_turboquant(model).then(|| target_block_bytes(model, block_size))
+    }
+
     fn load_model(&mut self) -> ExecutorResult<()> {
         let _t_total = std::time::Instant::now();
         let t_resolve = std::time::Instant::now();
@@ -3331,18 +3392,30 @@ impl Worker for MetalWorker {
         // the bucket selector just split.
         let available =
             compute_available_kv_bytes(total, weights_and_overhead, peak_activation_estimate, 1.0);
+        // A uniform TurboQuant pool still reserves one fp16 chunk per layer
+        // (`initialize_cache`), whatever its block count.
+        let tq_seed = self
+            .model
+            .as_deref()
+            .filter(|m| uniform_turboquant(*m))
+            .map_or(0, |m| {
+                scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
+                    * kv_per_block_bytes(m, self.config.block_size)
+            });
+        let available = available.saturating_sub(tq_seed);
         // Per-pair split: when a draft model is loaded, every target KV
         // block has a 1:1 mirror in the draft pool, so the engine should
         // think it has only `target / (target + draft)` of the budget.
-        // After the engine divides by `target_per_block_bytes` to land on
-        // num_gpu_blocks, the same count of draft blocks fits inside the
-        // remaining `draft / (target + draft)` slice.
+        // After the engine divides by the target's per-block bytes
+        // (`kv_block_bytes`, or its dense row) to land on num_gpu_blocks,
+        // the same count of draft blocks fits inside the remaining
+        // `draft / (target + draft)` slice.
         let (available_reported, draft_reservation) = if let Some(draft) = self.draft_model.as_ref()
         {
             let target = self.model.as_ref().expect("model loaded before draft");
             let bs = self.config.block_size;
-            let t_pb = kv_per_block_bytes(target.as_ref(), bs);
-            let d_pb = kv_per_block_bytes(draft.as_ref(), bs);
+            let t_pb = target_block_bytes(target.as_ref(), bs);
+            let d_pb = draft_block_bytes(draft.as_ref(), bs);
             let denom = t_pb.saturating_add(d_pb).max(1);
             // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
             let scaled = (available as u128 * t_pb as u128 / denom as u128) as usize;
@@ -3352,12 +3425,13 @@ impl Worker for MetalWorker {
         };
         info!(
             "ScratchyWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
-             arena_peak={:.1} MiB (pair={:.1} MiB), kv_budget={:.1} GiB \
+             arena_peak={:.1} MiB (pair={:.1} MiB), tq_seed={:.1} MiB, kv_budget={:.1} GiB \
              (target_share={:.1} GiB, draft_reserve={:.1} GiB)",
             total as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
             arena_peak as f64 / 1_048_576.0,
             arena_peak_pair as f64 / 1_048_576.0,
+            tq_seed as f64 / 1_048_576.0,
             available as f64 / 1_073_741_824.0,
             available_reported as f64 / 1_073_741_824.0,
             draft_reservation as f64 / 1_073_741_824.0,
