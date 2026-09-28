@@ -1027,7 +1027,7 @@ fn inject_tq(
         return Ok(cmds.into_iter().map(GatedCommand::ungated).collect());
     };
     // The codec is only TurboQuant where the geometry is one the kernels take
-    // (`crate::turboquant::codec_for`).
+    // (`scratchy_layers::turboquant::codec_for`).
     // - UNIFORM arches (GLOBAL_HEAD_DIM == HEAD_DIM): quantize every layer at the
     //   base geometry, dequant-before-rope + quantize-after-attention (as before).
     // - HYBRID/SWA arches (gemma4: GLOBAL 512 != base 256): quantize ONLY the

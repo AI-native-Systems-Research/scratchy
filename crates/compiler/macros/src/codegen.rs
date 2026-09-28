@@ -7156,7 +7156,7 @@ fn kv_codec_for(
 ) -> scratchy_forward_compiler::KvCodec {
     #[cfg(all(feature = "turboquant", feature = "metal"))]
     {
-        use scratchy_target_metal::turboquant::{DenseReason, KvGeometry, codec_for};
+        use scratchy_ir::{DenseReason, KvGeometry, codec_for};
         let bound = |k: &str| *model.bounds.get(k).unwrap_or(&0) as usize;
         let geometry = KvGeometry {
             num_layers: bound("num_hidden_layers"),

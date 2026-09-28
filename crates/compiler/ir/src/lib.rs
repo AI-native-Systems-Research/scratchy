@@ -23,7 +23,7 @@ use scratchy_tensors::tensor::MAX_DIMS;
 // `SCALE_DTYPE` consts. They relocated to the cfg-free
 // `scratchy-tensors` core so this cfg-free crate can name them without a
 // backend feature.
-pub use scratchy_layers::turboquant::{KvCodec, TqBits};
+pub use scratchy_layers::turboquant::{DenseReason, KvCodec, KvGeometry, TqBits, codec_for};
 use scratchy_tensors::{MetalDtype, ScaleDtype};
 // The `GpuTensor`, `AffineQuantEmbedding` (in `scratchy-quantizations`), and
 // `scratchy_layers` layer structs are referenced exclusively through

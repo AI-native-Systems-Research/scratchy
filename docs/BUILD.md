@@ -179,7 +179,7 @@ warning: scratchy-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache:
 A model stays dense when it has no KV cache, when its KV cache is an MLA
 latent, when a head_dim is not a power of two no wider than 512, or when its
 fp16 KV row is under 24 KiB/token — too small for the capacity to be worth the
-fidelity. The rule is `scratchy_target_metal::turboquant::codec_for`. The
+fidelity. The rule is `scratchy_layers::turboquant::codec_for`. The
 server logs the loaded model's codec at start (`KV cache codec: TurboQuant
 3-bit (built in)`).
 
