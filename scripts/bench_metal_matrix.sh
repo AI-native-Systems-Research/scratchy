@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Metal benchmark matrix — one Mac in, one JSON out.
 #
-#     scripts/bench_metal_matrix.sh                 # every model, every rung
-#     scripts/bench_metal_matrix.sh --models llama-3.2-3b
+#     scripts/bench_metal_matrix.sh                 # the three default models
+#     scripts/bench_metal_matrix.sh --models llama-3.2-3b,qwen2.5-7b   # any from MODELS_ALL
+#     scripts/bench_metal_matrix.sh --models all
 #     scripts/bench_metal_matrix.sh --scenarios cold,warm   # no sudo needed
 #
 # A RUNNER, not a measurement tool: every number comes from a `scr bench`
@@ -11,7 +12,9 @@
 # of doing that work ahead of time; every startup number excludes it.
 #
 #   build seconds, binary MiB          cargo build, stat
-#   ttft_exec: frozen / cold / warm    scr bench startup --exec (cache ladder)
+#   startup (launch -> ready): frozen / cold, then the first request on its own
+#                                      scr bench startup --exec (cache ladder)
+#   warm: send -> first token, median over unique prompts to a resident server
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
 #   concurrency curve                  scr bench serve (input 512, output 128)
@@ -35,7 +38,9 @@
 #           OLLAMA_NUM_PARALLEL / OLLAMA_CONTEXT_LENGTH sized for that axis.
 # No parity gate: it needs CLI mode and this ladder runs in server mode.
 #
-# --serve-args "..." passes extra flags to `scr serve` (recorded in the JSON).
+# --serve-args "..." replaces the extra `scr serve` flags (recorded in the JSON).
+# The default caps batches at 2048 tokens: at 4096 the scheduler can build a
+# 4097-token batch, the Metal worker panics (NoBucketFits) and the server hangs.
 # --cell-timeout-s bounds each scaling cell; a timed-out cell skips the rest of
 # that server's cells, since a hung server would hang them all.
 set -euo pipefail
@@ -44,17 +49,17 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 ROOT="$(cd -- "${HERE}/.." &>/dev/null && pwd)"
 
 # Every id verified against the HuggingFace API with its download size
-MODELS_DEFAULT=(
+MODELS_ALL=(
   "granite-3.3-2b-instruct=mlx-community/granite-3.3-2b-instruct-4bit:mlx-affine-b4-g64"  #  1.4 GB
   "llama-3.2-3b=mlx-community/Llama-3.2-3B-Instruct-4bit:mlx-affine-b4-g64"               #  1.8 GB
   "granite-3.3-8b-instruct=mlx-community/granite-3.3-8b-instruct-4bit:mlx-affine-b4-g64"  #  4.6 GB
-  "qwen2.5-7b=mlx-community/Qwen2.5-7B-Instruct-4bit:mlx-affine-b4-g64"                   #  4.3 GB
+  "qwen2.5-7b=mlx-community/Qwen2.5-7B-Instruct-4bit:mlx-affine-b4-g64-qembed"            #  4.3 GB
   "gemma-4-26b-a4b-it=mlx-community/gemma-4-26b-a4b-it-4bit:mlx-affine-b4-g64"            # 15.4 GB
   "gemma-4-31b-it=mlx-community/gemma-4-31b-it-4bit:mlx-affine-b4-g64"                    # 18.4 GB
   "qwen3.5-35b-a3b=mlx-community/Qwen3.5-35B-A3B-4bit:mlx-affine-b4-g64"                  # 20.4 GB
-  "moonlight-16b-a3b-instruct=mlx-community/Moonlight-16B-A3B-Instruct-4-bit:mlx-affine-b4-g64"        #  9.0 GB
-  "moonlight-16b-a3b-instruct-fp8-block=starpit/moonlight-16b-a3b-instruct-fp8-block:fp8-block-128x128" # 16.7 GB
 )
+# Small dense, mid dense, large MoE: one of each kind keeps a run overnight.
+MODELS_DEFAULT="granite-3.3-2b-instruct,qwen2.5-7b,gemma-4-26b-a4b-it"
 
 # ollama library tag per stem; no tag, no ollama column.
 ollama_tag() {
@@ -72,6 +77,10 @@ ollama_tag() {
 MODELS=()
 SCENARIOS="frozen,cold,warm"
 REPS=3
+# Discarded launches before cold, so it measures a settled cache: scratchy's
+# Metal aligned-weights cache takes about three launches to settle. The harness
+# does one on its own; more come from a throwaway cold call, so 2 rounds up to 3.
+PRIME=3
 PORT=8751
 NUM_PROMPTS=20
 INPUT_LEN=64
@@ -87,23 +96,23 @@ SETTLE_S=""
 # --exec's 600 s default timed out gemma-4-31b-it (18.4 GB) on this class of machine.
 READY_TIMEOUT_S=1800
 CELL_TIMEOUT_S=3600
-SERVE_ARGS=""
+SERVE_ARGS="--max-num-batched-tokens 2048"
 SEED=""
 MLX_PYTHON=""
 MLX_AUTO=1
 OLLAMA_AUTO=1
 SCALING=1
 SCALE_AXES="conc,grid"
-SCALE_CONC="1,2,4,8,16,32"
+SCALE_CONC="1,4,16"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
-SCALE_GRID_INPUT="128,512,2048,8192"
-SCALE_GRID_OUTPUT="16,64,256,1024"
+SCALE_GRID_INPUT="128,1024,4096"
+SCALE_GRID_OUTPUT="16,128,512"
 SCALE_BASE_INPUT=512
 SCALE_BASE_OUTPUT=128
 SCALE_BASE_CONC=8
-SCALE_NUM_PROMPTS=24
-SCALE_WARMUPS=4
+SCALE_NUM_PROMPTS=12
+SCALE_WARMUPS=2
 SCALE_SEED_BASE=20260927
 
 while [[ $# -gt 0 ]]; do
@@ -111,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --models)            IFS=',' read -r -a MODELS <<<"$2"; shift 2 ;;
         --scenarios)         SCENARIOS="$2"; shift 2 ;;
         --reps)              REPS="$2"; shift 2 ;;
+        --prime)             PRIME="$2"; shift 2 ;;
         --port)              PORT="$2"; shift 2 ;;
         --num-prompts)       NUM_PROMPTS="$2"; shift 2 ;;
         --input-len)         INPUT_LEN="$2"; shift 2 ;;
@@ -144,7 +154,16 @@ while [[ $# -gt 0 ]]; do
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
-[[ ${#MODELS[@]} -eq 0 ]] && MODELS=("${MODELS_DEFAULT[@]}")
+[[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
+[[ "${MODELS[*]}" == "all" ]] && MODELS=("${MODELS_ALL[@]}")
+# A bare stem resolves against MODELS_ALL; a full stem=id[:quant] is used as is.
+for i in "${!MODELS[@]}"; do
+    [[ "${MODELS[i]}" == *=* ]] && continue
+    hit=""
+    for e in "${MODELS_ALL[@]}"; do [[ "${e%%=*}" == "${MODELS[i]}" ]] && hit="${e}"; done
+    [[ -n "${hit}" ]] || { echo "unknown model: ${MODELS[i]} (see MODELS_ALL)" >&2; exit 2; }
+    MODELS[i]="${hit}"
+done
 (( OFFLINE )) && export HF_HUB_OFFLINE=1
 
 if (( MLX_AUTO )) && [[ -z "${MLX_PYTHON}" ]]; then
@@ -264,25 +283,35 @@ max_of() { local m=0 x; IFS=',' read -r -a _xs <<<"$1"; for x in "${_xs[@]}"; do
 # One `scr bench serve` per cell against the running server, written to
 # "<prefix>.<axis>-<rung>.json". cell_model / cell_tok override the model name
 # sent and the tokenizer that sizes prompts (ollama serves a tag).
+numbers() { # bench-serve json -> one human line
+    python3 - "$1" <<'PY' 2>/dev/null || echo "no result"
+import json, sys
+j = json.load(open(sys.argv[1]))
+print(f"{j['output_throughput']:7.1f} tok/s · TTFT p50 {j['median_ttft_ms']:6.0f} ms"
+      f" · TPOT p50 {j['median_tpot_ms']:5.1f} ms · {j['completed']} ok")
+PY
+}
 run_cell() { # prefix axis rung input output conc
     (( cells_hung )) && return 0
     local out_json="$1.$2-$3.json" seed rc=0
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3" | cksum | cut -d' ' -f1)
-    echo "    $2=$3 (in $4, out $5, conc $6, seed ${seed})"
+    printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3" "$4" "$5" "$6"
     # perl's alarm survives exec: SIGALRM ends the client after CELL_TIMEOUT_S.
-    # The client's own output goes to the pipe; stderr off hides bash's job notice.
+    # The client's output goes to a log; stderr off hides bash's job notice.
     { perl -e 'alarm shift; exec @ARGV' "${CELL_TIMEOUT_S}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
         ${cell_tok:+--tokenizer "${cell_tok}"} \
         --num-prompts "${SCALE_NUM_PROMPTS}" --input-len "$4" --output-len "$5" \
         --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${SCALE_WARMUPS}" \
         --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
-        --output-json "${out_json}" --disable-tqdm 2>&1 | tail -1 | sed 's/^/        /'; } 2>/dev/null || rc=$?
+        --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
     if (( rc == 142 )); then
         cells_hung=1
-        echo "        timed out after ${CELL_TIMEOUT_S}s; skipping this server's remaining cells" >&2
+        echo "timed out after ${CELL_TIMEOUT_S}s; skipping this server's remaining cells"
     elif (( rc )); then
-        echo "        cell failed" >&2
+        echo "failed (see ${RAW}/cells-${stem}.log)"
+    else
+        numbers "${out_json}"
     fi
 }
 run_scale_cells() { # prefix [axes]
@@ -308,6 +337,78 @@ run_scale_cells() { # prefix [axes]
             run_cell "${prefix}" grid "${x}x${o}" "${x}" "${o}" "${SCALE_BASE_CONC}"
         done; done
     fi
+}
+
+# ---- summary: one model's rows, or everything ----------------------------
+summary() { # [stem]
+python3 - "${JSON}" "${1:-}" <<'PY'
+import json, statistics, sys
+d, only = json.load(open(sys.argv[1])), sys.argv[2]
+m = d["machine"]
+if not only:
+    print(f"{m['chip']} · {m['cores_total']} cores ({m['cores_performance']}P+{m['cores_efficiency']}E) "
+          f"· {m['memory_gb']} GB · macOS {m['macos']}")
+print(f"{'model':26}{'build':>7}{'MiB':>6}{'frozen':>9}{'cold':>8}{'1st req':>9}{'warm':>8}"
+      f"{'TTFT':>8}{'TPOT':>8}{'tok/s':>8}")
+def med(reps, scenario, field):
+    vals = [r[field] for r in (reps or []) if r.get("scenario") == scenario and r.get(field) is not None]
+    return statistics.median(vals) if vals else None
+def ms(s):
+    return None if s is None else s * 1000
+def fmt(v, nd=0):
+    return "-" if v is None else f"{v:.{nd}f}"
+def cells(e, key, axis):
+    return [c for c in (e.get(key) or []) if c["axis"] == axis]
+for e in [x for x in d["models"] if x["stem"] == only or not only]:
+    f, ladder, w = e["footprint"], e.get("cache_ladder"), e.get("warm_serving") or {}
+    mib = round(f["binary_bytes"] / 1048576) if f["binary_bytes"] else None
+    print(f"{e['stem']:26}{fmt(f['build_seconds']):>7}{fmt(mib):>6}"
+          f"{fmt(med(ladder,'frozen','t_ready_s'), 2):>9}{fmt(med(ladder,'cold','t_ready_s'), 2):>8}"
+          f"{fmt(med(ladder,'cold','ttft_from_send_s'), 2):>9}"
+          f"{fmt(ms(med(ladder,'warm','ttft_from_send_s'))):>8}"
+          f"{fmt(w.get('median_ttft_ms')):>8}{fmt(w.get('median_tpot_ms'), 1):>8}"
+          f"{fmt(w.get('output_throughput'), 1):>8}")
+    if not e["built"]:
+        print("    BUILD FAILED — see the build log in this machine's raw/ directory")
+    elif ladder is None and not w and not e.get("scaling"):
+        print("    NO SCRATCHY NUMBERS — the server never served; see the exec and serve logs in raw/")
+    elif ladder is None:
+        print("    cache ladder unavailable")
+    conc = sorted(cells(e, "scaling", "conc"), key=lambda c: c["rung"])
+    if conc:
+        # TPOT at the top rung vs conc<=2: the per-request cost of batching (~1.0 is good).
+        top = conc[-1]
+        base_tp = next((c["median_tpot_ms"] for c in conc if c["rung"] <= 2), None)
+        line = f"    scaling: conc {top['rung']} -> {fmt(top.get('output_throughput'), 1)} tok/s"
+        if top.get("median_tpot_ms") and base_tp:
+            line += f" · TPOT x{top['median_tpot_ms'] / base_tp:.2f} vs conc<=2"
+        print(line)
+        for name, key in (("mlx-lm", "scaling_mlx_lm"), ("ollama", "scaling_ollama")):
+            t = [c for c in cells(e, key, "conc") if c["rung"] == top["rung"]]
+            if t and t[0].get("output_throughput"):
+                print(f"    scaling {name}: conc {top['rung']} -> {fmt(t[0]['output_throughput'], 1)} tok/s")
+    # Text heat maps: scratchy / engine output tok/s per grid cell (>1.00 = scratchy faster).
+    grid = {(c["input_len"], c["output_len"]): c for c in cells(e, "scaling", "grid")}
+    ins = sorted({k[0] for k in grid}); outs = sorted({k[1] for k in grid})
+    for name, key in (("mlx-lm", "scaling_mlx_lm"), ("ollama", "scaling_ollama")):
+        them = {(c["input_len"], c["output_len"]): c for c in cells(e, key, "grid")}
+        if not (grid and them):
+            continue
+        print(f"    grid, scratchy / {name} output tok/s (rows input, cols output):")
+        print("      " + "in/out".rjust(8) + "".join(f"{o:>8}" for o in outs))
+        for i in ins:
+            row = ""
+            for o in outs:
+                a = grid.get((i, o), {}).get("output_throughput")
+                b = them.get((i, o), {}).get("output_throughput")
+                row += f"{a / b:>8.2f}" if (a and b) else f"{'-':>8}"
+            print("      " + f"{i:>8}" + row)
+if not only:
+    print("\nfrozen/cold: startup s, launch -> ready (no request). 1st req: s, the cold launch's first"
+          "\nrequest, send -> first token. warm: ms, send -> first token, median over unique prompts to a"
+          "\nresident server. TTFT/TPOT ms and tok/s: `scr bench serve`, conc 1.")
+    print(f"json -> {sys.argv[1]}")
+PY
 }
 
 # ---- per model --------------------------------------------------------------
@@ -344,7 +445,7 @@ for entry in "${MODELS[@]}"; do
         echo "    no scr with \`bench startup --exec\` — nothing to measure with" >&2
         continue
     fi
-    ladder=(--exec --mode server --scenarios "${SCENARIOS}" --reps "${REPS}" --port "${PORT}"
+    ladder=(--exec --mode server --port "${PORT}"
             --input-len "${INPUT_LEN}" --output-len "${OUTPUT_LEN}" --warm-requests "${WARM_REQUESTS}"
             --ready-timeout-s "${READY_TIMEOUT_S}"
             --remove-path "${HOME}/.cache/scratchy/metal-aligned-weights")
@@ -352,14 +453,49 @@ for entry in "${MODELS[@]}"; do
     [[ -n "${SETTLE_S}" ]] && ladder+=(--settle-s "${SETTLE_S}")
     [[ -n "${SEED}" ]]     && ladder+=(--seed "${SEED}")
     for ep in ${EVICT_PATH[@]+"${EVICT_PATH[@]}"}; do ladder+=(--evict-path "${ep}"); done
+    # FROZEN deletes the caches COLD needs settled, and the harness primes only
+    # once and never after FROZEN, so the ladder runs as up to three calls:
+    # FROZEN alone, a throwaway COLD call to settle the caches, then the rest.
+    # The kept calls' runs are joined into one file.
     run_ladder() { # label model child-cmd backend out_json [extra...]
         echo "--- scr bench startup --exec, $1 (${SCENARIOS})"
         local label="$1" model="$2" cmd="$3" backend="$4" out="$5"; shift 5
-        "${BIN}" bench startup --model "${model}" "${ladder[@]}" "$@" --child-cmd "${cmd}" \
-            --backend "${backend}" --output-json "${out}" 2>&1 \
-            | awk '/^ *scenario +mode/{n=0} {l[n++]=$0} END{for(i=(n>6&&!h?n-6:0);i<n;i++)print l[i]} /^ *scenario +mode/{h=1}' \
-            | sed 's/^/    /' \
-            || echo "    ${label} --exec returned non-zero (validity gate, or a real failure); see above" >&2
+        local frozen="" rest="" sc parts=()
+        for sc in ${SCENARIOS//,/ }; do
+            if [[ "${sc}" == frozen ]]; then frozen=frozen; else rest+="${rest:+,}${sc}"; fi
+        done
+        rm -f "${out}" "${out%.json}".{frozen,rest,prime}.json
+        startup() { # scenarios reps out_json [extra...]
+            local scs="$1" reps="$2" o="$3"; shift 3
+            "${BIN}" bench startup --model "${model}" "${ladder[@]}" --scenarios "${scs}" --reps "${reps}" "$@" \
+                --child-cmd "${cmd}" --backend "${backend}" --output-json "${o}"
+        }
+        show_report() {
+            awk '/^ *scenario +mode/{n=0} {l[n++]=$0} END{for(i=(n>6&&!h?n-6:0);i<n;i++)print l[i]} /^ *scenario +mode/{h=1}' \
+                | sed 's/^/    /'
+        }
+        if [[ -n "${frozen}" ]]; then
+            startup frozen "${REPS}" "${out%.json}.frozen.json" "$@" 2>&1 | show_report \
+                || echo "    ${label} --exec frozen returned non-zero (validity gate, or a real failure); see above" >&2
+            parts+=("${out%.json}.frozen.json")
+        fi
+        if [[ -n "${rest}" ]]; then
+            if (( PRIME > 1 )); then
+                echo "    priming: $(( PRIME > 2 ? PRIME : 3 )) discarded launches"
+                startup cold $(( PRIME > 2 ? PRIME - 2 : 1 )) "${out%.json}.prime.json" "$@" \
+                    >>"${RAW}/prime-${label}.log" 2>&1 \
+                    || echo "    ${label} priming returned non-zero; see ${RAW}/prime-${label}.log" >&2
+            fi
+            startup "${rest}" "${REPS}" "${out%.json}.rest.json" "$@" 2>&1 | show_report \
+                || echo "    ${label} --exec returned non-zero (validity gate, or a real failure); see above" >&2
+            parts+=("${out%.json}.rest.json")
+        fi
+        python3 - "${out}" ${parts[@]+"${parts[@]}"} <<'PY'
+import json, os, sys
+runs = [r for p in sys.argv[2:] if os.path.exists(p) for r in json.load(open(p))]
+if runs:
+    json.dump(runs, open(sys.argv[1], "w"), indent=2)
+PY
     }
 
     # ---- scratchy
@@ -374,8 +510,9 @@ for entry in "${MODELS[@]}"; do
                 --num-prompts "${NUM_PROMPTS}" --input-len "${INPUT_LEN}" --output-len "${OUTPUT_LEN}" \
                 --max-concurrency 1 --temperature 0 --seed "${RANDOM}${RANDOM}" \
                 --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
-                --output-json "${RAW}/serve-${stem}.json" --disable-tqdm 2>&1 | tail -4 | sed 's/^/    /' \
-                || echo "    bench serve failed" >&2
+                --output-json "${RAW}/serve-${stem}.json" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1 \
+                && { printf '    '; numbers "${RAW}/serve-${stem}.json"; } \
+                || echo "    bench serve failed (see ${RAW}/cells-${stem}.log)" >&2
             if (( SCALING )); then
                 echo "--- scaling sweep, scratchy"
                 run_scale_cells "${RAW}/scale-${stem}"
@@ -503,64 +640,21 @@ d["models"].append({
 json.dump(d, open(js, "w"), indent=2)
 PY
     echo "    recorded"
+    summary "${stem}"
 done
 
-# ---- summary ----------------------------------------------------------------
 echo; echo "================================================================"
+summary
+
+# A model scratchy never served must fail the run, not sit in the table as a
+# row of dashes: a preset that matches no checkpoint looks exactly like that.
 python3 - "${JSON}" <<'PY'
-import json, statistics, sys
+import json, sys
 d = json.load(open(sys.argv[1]))
-m = d["machine"]
-print(f"{m['chip']} · {m['cores_total']} cores ({m['cores_performance']}P+{m['cores_efficiency']}E) "
-      f"· {m['memory_gb']} GB · macOS {m['macos']}")
-print(f"{'model':26}{'build':>7}{'MiB':>6}{'frozen':>9}{'cold':>8}{'TTFT':>8}{'TPOT':>8}{'tok/s':>8}")
-def med(reps, scenario, field):
-    vals = [r[field] for r in (reps or []) if r.get("scenario") == scenario and r.get(field) is not None]
-    return statistics.median(vals) if vals else None
-def fmt(v, nd=0):
-    return "-" if v is None else f"{v:.{nd}f}"
-def cells(e, key, axis):
-    return [c for c in (e.get(key) or []) if c["axis"] == axis]
-for e in d["models"]:
-    f, ladder, w = e["footprint"], e.get("cache_ladder"), e.get("warm_serving") or {}
-    mib = round(f["binary_bytes"] / 1048576) if f["binary_bytes"] else None
-    print(f"{e['stem']:26}{fmt(f['build_seconds']):>7}{fmt(mib):>6}"
-          f"{fmt(med(ladder,'frozen','ttft_exec_s'), 2):>9}{fmt(med(ladder,'cold','ttft_exec_s'), 2):>8}"
-          f"{fmt(w.get('median_ttft_ms')):>8}{fmt(w.get('median_tpot_ms'), 1):>8}"
-          f"{fmt(w.get('output_throughput'), 1):>8}")
-    if not e["built"]:
-        print("    BUILD FAILED — see the build log in this machine's raw/ directory")
-    elif ladder is None:
-        print("    cache ladder unavailable")
-    conc = sorted(cells(e, "scaling", "conc"), key=lambda c: c["rung"])
-    if conc:
-        # TPOT at the top rung vs conc<=2: the per-request cost of batching (~1.0 is good).
-        top = conc[-1]
-        base_tp = next((c["median_tpot_ms"] for c in conc if c["rung"] <= 2), None)
-        line = f"    scaling: conc {top['rung']} -> {fmt(top.get('output_throughput'), 1)} tok/s"
-        if top.get("median_tpot_ms") and base_tp:
-            line += f" · TPOT x{top['median_tpot_ms'] / base_tp:.2f} vs conc<=2"
-        print(line)
-        for name, key in (("mlx-lm", "scaling_mlx_lm"), ("ollama", "scaling_ollama")):
-            t = [c for c in cells(e, key, "conc") if c["rung"] == top["rung"]]
-            if t and t[0].get("output_throughput"):
-                print(f"    scaling {name}: conc {top['rung']} -> {fmt(t[0]['output_throughput'], 1)} tok/s")
-    # Text heat maps: scratchy / engine output tok/s per grid cell (>1.00 = scratchy faster).
-    grid = {(c["input_len"], c["output_len"]): c for c in cells(e, "scaling", "grid")}
-    ins = sorted({k[0] for k in grid}); outs = sorted({k[1] for k in grid})
-    for name, key in (("mlx-lm", "scaling_mlx_lm"), ("ollama", "scaling_ollama")):
-        them = {(c["input_len"], c["output_len"]): c for c in cells(e, key, "grid")}
-        if not (grid and them):
-            continue
-        print(f"    grid, scratchy / {name} output tok/s (rows input, cols output):")
-        print("      " + "in/out".rjust(8) + "".join(f"{o:>8}" for o in outs))
-        for i in ins:
-            row = ""
-            for o in outs:
-                a = grid.get((i, o), {}).get("output_throughput")
-                b = them.get((i, o), {}).get("output_throughput")
-                row += f"{a / b:>8.2f}" if (a and b) else f"{'-':>8}"
-            print("      " + f"{i:>8}" + row)
-print("\nfrozen/cold are ttft_exec seconds (exec -> first token); TTFT/TPOT are warm ms.")
-print(f"json -> {sys.argv[1]}")
+bad = [e["stem"] for e in d["models"] if not e["built"]
+       or (not e.get("cache_ladder") and not e.get("warm_serving") and not e.get("scaling"))]
+if bad:
+    print(f"\nFAILED: scratchy produced no numbers for {', '.join(bad)} (results still in the json)",
+          file=sys.stderr)
+    sys.exit(1)
 PY
