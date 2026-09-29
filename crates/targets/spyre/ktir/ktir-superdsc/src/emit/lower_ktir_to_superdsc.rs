@@ -39,7 +39,7 @@ use super::{
     pointwise_chunk_out_offset, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul_off, assemble_matmul_seeded,
+    assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
@@ -54,6 +54,7 @@ use crate::reserved_tids::{
     kct_resident_tid, scalarmul_scale_tid,
 };
 use crate::sdsc_abstract::{KernelTag, Stk};
+use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
 use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK};
 use ktir_core::attrkey::AttrKey;
@@ -504,7 +505,7 @@ fn store_views(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
 
 /// Every `arith.constant` index in the func, by the SSA it defines — an access tile's corner is one
 /// of these, and a corner is what carries a column-chunked node's `region.cols.start`.
-fn index_constants(f: &IRFunction<'static>) -> std::collections::HashMap<Ssa, i64> {
+pub(crate) fn index_constants(f: &IRFunction<'static>) -> std::collections::HashMap<Ssa, i64> {
     let mut m = std::collections::HashMap::new();
     for op in f.operations.iter() {
         if op.op_type != OpKind::ArithConstant {
@@ -518,12 +519,34 @@ fn index_constants(f: &IRFunction<'static>) -> std::collections::HashMap<Ssa, i6
             m.insert(r, v);
         }
     }
+    // A Triton front end wraps its tile corners in `arith.index_cast` (an i64 constant narrowed
+    // to the index width), so a cast of a constant is a constant too and is recorded under the
+    // CAST's result. Chains resolve iteratively; a cast of anything non-constant stays absent.
+    loop {
+        let mut grew = false;
+        for op in f.operations.iter() {
+            if op.op_type != OpKind::ArithIndexCast {
+                continue;
+            }
+            let Some(r) = op.result else { continue };
+            let Some(src) = op.operands.first() else { continue };
+            if !m.contains_key(&r) {
+                if let Some(v) = m.get(&src) {
+                    m.insert(r, *v);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
     m
 }
 
 /// An op's `[.., rows, cols]` from its own `shape` attribute or result type — the same reading
 /// `logical_2d` did, kept because a 1-D shape is a ROW (our per-channel vectors are `[hidden]`).
-fn shape_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
+pub(crate) fn shape_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
     let dims = op
         .attributes
         .iter()
@@ -3508,8 +3531,30 @@ pub fn matmul_oriented(
     // the mq>1 lm-head tail used to arrive here with `r_start = mq-1`. It now arrives with the row
     // ALREADY MATERIALIZED (`lmlast`), so this refusal is the seal on that, for every arch.
     base_addressed(name, &a, "activation (A)")?;
-    base_addressed(name, &w, "weight (W)")?;
+    // ⛔ THE WEIGHT'S AND OUTPUT'S CORNERS ARE CARRIED, NOT DROPPED — the windowing arm below
+    // states each as an `offset_elems` on the operand's own address law, so a corner this emitter
+    // cannot carry is the one the LAW cannot address, and each is refused by name below (with the
+    // corner computation, where the orientation has said which axis is which):
+    //   * W's OUT corner (the kernel steps out in whole sticks — `(n/stk)·(k_phys·stk) + …`) must
+    //     be stick-aligned; its IN corner steps `k·stk` and needs no alignment.
+    //   * OUT: a row corner is refused exactly as A's (the output group stride derives from the
+    //     swept `m`, which IS the tensor's rows); a column corner must be a whole stick.
+    //   * A: a column corner must be a whole stick (its row corner is refused outright above).
     base_addressed(name, &out, "output")?;
+    let rcol = |r: &Region, role: &str| -> Result<(), Error> {
+        if r.c_start != 0 && !r.c_start.is_multiple_of(FP16_ELEMS_PER_STICK) {
+            return err(format!(
+                "{name}: {role} t{} states column corner {} of its `[{}, {}]` view, which is not \
+                 a whole {FP16_ELEMS_PER_STICK}-column stick — the stick-blocked address law steps \
+                 whole sticks (`(c/64)·(rows·64) + …`), so a sub-stick column corner has no \
+                 address. Pad the blocking so every window corner is stick-aligned.",
+                r.tid, r.c_start, r.v_rows, r.v_cols,
+            ));
+        }
+        Ok(())
+    };
+    rcol(&a, "activation (A)")?;
+    rcol(&out, "output")?;
     // ⭐ THE PRECISION IS THE WEIGHT VIEW'S ELEMENT TYPE, and arity agrees with it by construction:
     // `KtirFunc::matmul_fp8` is the only builder that views a weight through `view_fp8`, and it is
     // the only one that binds a third input (the checkpoint's per-column `w_scale`). Disagreement
@@ -3634,18 +3679,125 @@ pub fn matmul_oriented(
         ));
     }
     let op_name = format!("matmul_o{}", out.tid);
-    let op = assemble_matmul_seeded(
-        &op_name,
-        m,
-        n_dev,
-        k,
-        1,
-        &rb(&a.name(), m, k),
-        &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, w.name()),
-        &rb(&out.name(), m, n_dev),
-        sym_id_base,
-        layout,
-    );
+    // ⭐⭐⭐⭐⭐ THE WINDOWED EMISSION — every operand's corner and the kernel's physical `in`
+    // extent, stated to the one assembler that can carry them.
+    //
+    // A Triton kernel's K/N-tiled matmul sweeps a WINDOW of each parameter: `[m, k_blk]` of an
+    // `[m, k_full]` activation, `[k_blk, n_blk]` of the weight, `[m, n_blk]` of the output — the
+    // regions this door is handed carry each load's OWN tile (whole_function::region_for_operand),
+    // and this arm turns each corner into the operand's `offset_elems` exactly the way the
+    // GQA-group bmm does. MEASURED on the unblocked SwiGLU small twin: without this arm every
+    // matmul of every trip read the parameter's FIRST tile, and the card output matched
+    // `2·[silu(2·x₀Wg)·(2·x₀Wu)]Wd` to corr 0.999996 — the ×2s being the duplicated no-offset
+    // trips summed by the accumulator `arith.addf`s.
+    //
+    // ⛔ AND THE OFFSETS ALONE ARE NOT THE FIX: the kernel's stick-group stride is derived from the
+    // TILE's k (this op's swept `k`), but a windowed weight lives in an allocation whose `in`
+    // extent is the TENSOR's own. Reading column-block `k_blk` of a `[k_full, n]` weight with the
+    // tile's stride lands every stick group after the first `k_blk`-invented rows away — the same
+    // corr 0.983 ceiling the offsets-alone run hit. `w_in_phys` (the tensor's own in-extent) is
+    // declared through `TensorArg::device_extent` — the torch-spyre `arg.device_size` law the
+    // batched attention already relies on for the same reason.
+    //
+    // ⛔ THE ACTIVATION AND OUTPUT GROUP STRIDES ARE ALREADY RIGHT: both are RowBlocked sticked on
+    // their column axis (a group stride is `rows · stick`), and `m` is not tiled by this door
+    // (`base_addressed` above still refuses A's row corner), so the swept `m` IS the tensor's row
+    // count and the handle extents the opspec derives are the tensor's own.
+    //
+    // A FULL-TENSOR program — every region the whole window of its view, corners 0, `k` the
+    // tensor's whole extent — emits exactly the offsets-zero, no-device-extent form, which is
+    // byte-identical to `assemble_matmul_seeded` (`matmul_opspec_off` at zero offsets IS
+    // `matmul_opspec`; `set_device_extent` at `w_in_phys == k` states what the stride derivation
+    // already concluded).
+    //
+    // The corners, per orientation (the kernel's coords are `[in=k, out=n]`, so which of W's two
+    // view axes is k_start and which is n_start is decided by the PROVEN `b`, not by convention —
+    // at `k == n` the extents cannot tell the two framings apart):
+    //   * A (RowBlocked `[rows, cols]`):      `rc_of(a.v_rows, a.v_cols, a.r_start, a.c_start)`
+    //   * W (Kernel `[in, out]`):             `rc_of(k_full, n_full, k_start, n_start)`
+    //   * O (RowBlocked `[rows, cols]`):      `col_of(m, out_full_cols, out.c_start)`
+    // with `out_full_cols = out.v_cols`.
+    let a_off = crate::addr::rc_of(a.v_rows, a.v_cols, a.r_start, a.c_start, Df::Fp16);
+    let (k_start, n_start, k_full, n_full) = match b {
+        super::whole_function::BOrient::TransposeB => {
+            // W's view is `[n, k]`: the ROW axis is out (n), the COLUMN axis is in (k).
+            (w.c_start, w.r_start, w.v_cols, w.v_rows)
+        }
+        super::whole_function::BOrient::PlainB => {
+            // W's view is `[k, n]`: the ROW axis is in (k), the COLUMN axis is out (n).
+            (w.r_start, w.c_start, w.v_rows, w.v_cols)
+        }
+    };
+    // ⛔ THE KERNEL'S OUT CORNER STEPS WHOLE STICKS (`(n/stk)·(k_phys·stk) + k·stk + (n%stk)`), so
+    // a sub-stick `n_start` has no address on that law — refused by name rather than emitted as a
+    // mis-strided read. (The IN corner steps `k·stk` and needs no alignment.)
+    if n_start != 0 && !n_start.is_multiple_of(FP16_ELEMS_PER_STICK) {
+        return err(format!(
+            "{name}: weight (W) t{} states out-corner {} ({} framing), which is not a whole \
+             {FP16_ELEMS_PER_STICK}-column stick — the kernel's stick-group stride steps whole \
+             sticks, so a sub-stick out corner has no address. Pad the blocking so every window \
+             corner is stick-aligned.",
+            w.tid, n_start, framing,
+        ));
+    }
+    let w_off = crate::addr::rc_of(k_full, n_full, k_start, n_start, Df::Fp16);
+    let o_off = crate::addr::col_of(m, out.v_cols, out.c_start, Df::Fp16);
+    // ⛔⛔⛔ A WHOLE-TENSOR PROGRAM KEEPS THE BASE EMISSION, BYTE-IDENTICAL. Nine fixtures are
+    // verified on-card through `assemble_matmul_seeded`, and that call is also the one that
+    // applies `out_width_the_weight_holds` — the pad-drop a KTIR producer's UNPADDED caller-owned
+    // weight needs (MEASURED as `resolve_seg_base`'s footprint refusal at both SwiGLU blockings).
+    // `assemble_matmul_windowed` states offsets and a device extent instead, which is a different
+    // (correct) contract for a WINDOWED program and an unneeded risk for a whole-tensor one: a
+    // window that is its view entire, corners 0, is exactly the program the base form was built
+    // for. Anything else — any corner, any partial window — is the tiled case this arm exists for.
+    let whole = |r: &Region| {
+        r.r_start == 0 && r.c_start == 0 && r.r_len == r.v_rows && r.c_len == r.v_cols
+    };
+    let op = if whole(&a) && whole(&w) && whole(&out) {
+        assemble_matmul_seeded(
+            &op_name,
+            m,
+            n_dev,
+            k,
+            1,
+            &rb(&a.name(), m, k),
+            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, w.name()),
+            &rb(&out.name(), m, n_dev),
+            sym_id_base,
+            layout,
+        )
+    } else {
+        // ⛔ A PARTIAL WINDOW MAY NOT TAKE THE UTIL-FLOOR PAD. `n_dev > n` invents output columns
+        // the program never stated; on a whole-tensor program their write lands in the placement's
+        // own pad (the footprint guard's business), but on a WINDOWED program it lands in the
+        // NEIGHBOUR WINDOW's columns — silent corruption of a trip this program never names. The
+        // weight's pad columns are read through the same neighbour. Refused by name; the blocking
+        // must keep every window's stick count splittable on its own.
+        if n_dev > n {
+            return err(format!(
+                "MatmulTile t{}: the output window is partial (n={n} of {}) and the util floor \
+                 would pad the device width to {n_dev} — the padded columns would write into the \
+                 neighbouring window's output and read its weight columns. Pad the blocking so \
+                 each window's stick count is splittable to ≥8 on its own.",
+                out.tid, out.v_cols,
+            ));
+        }
+        assemble_matmul_windowed(
+            &op_name,
+            MatM::of_token_rows(m),
+            MatN::of_out_features(n_dev),
+            MatK::of_in_features(k),
+            &rb(&a.name(), m, k),
+            a_off,
+            &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, w.name()),
+            w_off,
+            k_full,
+            &rb(&out.name(), m, n_dev),
+            o_off,
+            sym_id_base,
+            layout,
+        )
+    };
     // Default path: one f16 matmul.
     Ok(vec![op])
 }

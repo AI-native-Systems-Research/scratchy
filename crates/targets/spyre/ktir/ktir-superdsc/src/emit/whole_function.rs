@@ -1200,7 +1200,58 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
         .iter()
         .find(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructAccessTile);
     let Some(tile) = tile else { return Ok(None) };
-    region_of_view_operand(k, tile, 0)
+    let Some(mut r) = region_of_view_operand(k, tile, 0)? else {
+        return Ok(None);
+    };
+    // ⭐⭐⭐⭐⭐ THE WINDOW IS THE LOAD'S OWN TILE, NOT THE PARAMETER'S FIRST.
+    //
+    // `regions()` keeps the FIRST access tile over each parameter's view — a sound description of a
+    // straight-line program that reads each buffer one way, and SILENTLY WRONG the moment a producer
+    // states several tiles over one view. MEASURED on the unblocked (`unroll_constant_trip_loops`)
+    // SwiGLU MLP, small twin (16/128/256, BLOCK_N=128, BLOCK_K=64): every gate/up matmul of every
+    // k-trip and every n-trip read the SAME window (the weight's trip-0 `[128, 64]` tile at the
+    // buffer base), and the card output matched `2·[silu(2·x₀Wg)·(2·x₀Wu)]Wd` to corr 0.999996 — the
+    // ×2s being the duplicated no-offset trips summed by the accumulator `arith.addf`s, and the Wd
+    // in it the window-0 read through TILE-extent strides (the kernel's stick-group stride derives
+    // from the tile's k, not the tensor's — see `matmul_oriented`'s windowing arm).
+    //
+    // So the tile in hand — THIS load's own `ktdp.construct_access_tile`, whose corner constants the
+    // cast-resolving `index_constants` already sees — states the window, and it is copied onto the
+    // parameter's Region here. The tile's corner operands (1 = row, 2 = column) and its `Shape` are
+    // read by exactly the code `regions()` reads them with (`shape_2d` and `consts.get`), so the two
+    // walks cannot disagree about one tile. A tile whose corners are NOT constants names a window
+    // no descriptor can carry, and is refused by name rather than silently falling back to the
+    // parameter's first tile — the same discipline as `regions()`'s in-loop guard.
+    if tile.operands.len() == 3 {
+        let consts = super::lower_ktir_to_superdsc::index_constants(&k.func);
+        let Some(shape) = super::lower_ktir_to_superdsc::shape_2d(tile) else {
+            return err(format!(
+                "{}: the access tile feeding this load states no 2-D `shape`, so its window is \
+                 unknown",
+                f.name
+            ));
+        };
+        let (rs, cs) = match (
+            tile.operands.get(1).and_then(|s| consts.get(s).copied()),
+            tile.operands.get(2).and_then(|s| consts.get(s).copied()),
+        ) {
+            (Some(rs), Some(cs)) => (rs as u32, cs as u32),
+            _ => {
+                return err(format!(
+                    "{}: the access tile feeding this load states a window whose corner is not a \
+                     constant (`ktdp.construct_access_tile` operands 1/2), so the descriptor cannot \
+                     carry the offset. A loop-carried or computed corner needs hoisting or unrolling \
+                     before the whole-function door can address it.",
+                    f.name
+                ));
+            }
+        };
+        r.r_start = rs;
+        r.c_start = cs;
+        r.r_len = shape.0;
+        r.c_len = shape.1;
+    }
+    Ok(Some(r))
 }
 
 /// The [`Region`] of the parameter that operand `slot` of a TILE op reinterprets — the tail both the

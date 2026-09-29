@@ -1719,6 +1719,29 @@ impl AnyTensorArg {
         }
     }
 
+    /// Rank-erased [`TensorArg::with_device_extent`] setter — declares one `layout` dim's TRUE
+    /// physical extent on an arg a builder already assembled. For the windowed dense matmul
+    /// (`assemble_matmul_windowed`), whose kernel is a K/N-tiled slice of the caller's own weight
+    /// buffer: the swept `in` extent is the tile's k while the allocation's is the tensor's, and the
+    /// stick-group stride must come from the allocation. PANICS if `dim` is not in the arg's layout,
+    /// same discipline as [`Self::set_scale_for_dim`].
+    pub fn set_device_extent(&mut self, dim: &'static str, phys_extent: u32) {
+        fn set<const D: usize>(t: &mut TensorArg<D>, dim: &'static str, phys_extent: u32) {
+            let idx = t
+                .layout
+                .iter()
+                .position(|&d| d == dim)
+                .unwrap_or_else(|| panic!("set_device_extent: '{dim}' not in {:?}", t.layout));
+            t.device_extent[idx] = Some(phys_extent);
+        }
+        match self {
+            AnyTensorArg::R1(t) => set(t, dim, phys_extent),
+            AnyTensorArg::R2(t) => set(t, dim, phys_extent),
+            AnyTensorArg::R3(t) => set(t, dim, phys_extent),
+            AnyTensorArg::R4(t) => set(t, dim, phys_extent),
+        }
+    }
+
     /// Rank-erased ROLE setter. The epilogue's extra operand is tagged [`Role::Output`] to match
     /// `bmm.ddl`'s own convention (bias/bnA/bnB/resadd share the OUTPUT dsType/layout bucket, not
     /// INPUT) — confirmed against the golden `sdsc_bmm_lxopt.json` fixture, whose bias arg carries
