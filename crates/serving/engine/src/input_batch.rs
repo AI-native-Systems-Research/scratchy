@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use scratchy_core_model::AttentionMetadata;
+use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 
 // ---------------------------------------------------------------------------
 // The per-slot conservation law
@@ -18,17 +19,17 @@ use scratchy_core_model::AttentionMetadata;
 
 /// EVERY PER-SLOT VEC, NAMED ONCE — and this list is the only place a slot field may be introduced.
 ///
-/// ⛔⛔⛔ WHY THIS IS A MACRO AND NOT NINE HAND-WRITTEN LINES ×3. `InputBatch` stores a slot as one
-/// element in each of nine parallel `Vec`s, so "slot `i` exists" is really the claim *all nine have a
+/// ⛔⛔⛔ WHY THIS IS A MACRO AND NOT SIX HAND-WRITTEN LINES ×3. `InputBatch` stores a slot as one
+/// element in each of six parallel `Vec`s, so "slot `i` exists" is really the claim *all six have a
 /// length greater than `i`, describing the same request*. Nothing in the type system said so: the push,
-/// the swap and the pop were three hand-maintained lists of the same nine names, and adding a tenth
+/// the swap and the pop were three hand-maintained lists of the same names, and adding another
 /// field meant editing all three correctly or getting a store where one field is off by one slot — i.e.
 /// one request reading another's block table, silently, with no length ever disagreeing about anything
 /// the compiler can see.
 ///
 /// That is the CONSERVATION-LAW family of defect, the one a newtype cannot catch because every field
 /// here is a *different* quantity and each is already correctly typed. The law is not about any one
-/// field's type; it is that the nine move TOGETHER.
+/// field's type; it is that they move TOGETHER.
 ///
 /// So this list generates all three motions, plus a [`NewSlot`] whose struct literal the compiler
 /// refuses to accept until every field has a value. Adding a per-slot field is now: add one line here,
@@ -82,36 +83,39 @@ macro_rules! per_slot_fields {
 per_slot_fields! {
     /// Request id — the slot's identity, and what `req_id_to_slot` maps to its index.
     req_ids: String,
-    /// Most recently appended token id (the decode input).
-    last_token_ids: u32,
-    /// Current sequence position (prompt_len + num_generated - 1).
-    positions: u32,
-    /// Number of this request's tokens already written to the KV block pool.
+    /// How many of this request's tokens are in the KV block pool. Every step
+    /// [`InputBatch::prepare_inputs`] builds sets it to the scheduler's `num_computed_tokens`, and
+    /// [`InputBatch::commit_step`] advances it past the step — what the cuda graph fast path and spyre
+    /// read in between.
     tokens_in_pool: usize,
     /// Block table (full/global KV-cache group block ids), REPLACED wholesale each step.
     block_tables: Vec<usize>,
     /// Per-SLIDING-GROUP block tables (gemma4 SWA); empty on non-SWA requests.
     sliding_groups: Vec<Vec<usize>>,
-    /// Whether this slot is still in prefill.
-    is_prefill: bool,
-    /// The prompt tokens a prefill slot feeds this step (a CHUNK, not the history).
-    prefill_tokens: Option<Vec<u32>>,
     /// This request's PROMPT, whole. `prompt_len` is derived from it and never stored.
     prompt: Vec<u32>,
     /// Everything sampled since, in order. `prompt ++ generated` is the token history.
     generated: Vec<u32>,
-    /// Position offset for prefill (the scheduler's num_computed_tokens).
-    prefill_pos_offset: u32,
 }
 
 // ---------------------------------------------------------------------------
 // InputBatch
 // ---------------------------------------------------------------------------
 
-/// Persistent batch state that survives across engine steps.
+/// Persistent per-request state that survives across engine steps, and the builder of each step's
+/// flat model inputs.
 ///
-/// Requests occupy dense slots (0..num_active). Finished requests are
-/// swap-removed with the last slot to keep the array compact without gaps.
+/// Requests occupy dense slots (0..num_active). Finished requests are swap-removed with the last slot
+/// to keep the array compact without gaps.
+///
+/// ⛔⛔ A SLOT IS NOT A SCHEDULED REQUEST. The scheduler leaves running requests out of a step — when
+/// the token budget runs out, when async scheduling knows an in-flight step will finish one at
+/// `max_tokens`, when it preempts one — and every such request keeps its slot (its history is needed
+/// again). So WHAT a step runs is never read off the slots: [`Self::prepare_inputs`] walks the
+/// [`SchedulerOutput`] and takes each request's chunk from its history at the scheduler's
+/// `num_computed_tokens`, for exactly its `num_scheduled_tokens`. The step's token count is the
+/// scheduler's `total_num_scheduled_tokens` by construction, and that is bounded by the budget the
+/// engine sized to the largest resident bucket.
 pub struct InputBatch {
     // --- Slot management ---
     /// req_id → slot index.
@@ -120,50 +124,26 @@ pub struct InputBatch {
     req_ids: Vec<String>,
 
     // --- Per-slot persistent state (indexed by slot) ---
-    /// Most recently appended token ID (decode input).
-    last_token_ids: Vec<u32>,
-    /// Current sequence position (prompt_len + num_generated - 1).
-    positions: Vec<u32>,
-    /// Number of tokens already written to KV block pool.
+    /// Tokens of each request already written to the KV block pool.
     tokens_in_pool: Vec<usize>,
     /// Block table per request (full/global KV-cache group block IDs).
     block_tables: Vec<Vec<usize>>,
-    /// Sliding KV-cache group block table per request (gemma4 SWA): the
-    /// per-request ring. `None` per slot on non-SWA models.
     /// Per-request, per-SLIDING-GROUP block tables (vLLM group-shared layout):
     /// `sliding_groups[req][sliding_group]`. Empty inner vec on non-SWA reqs.
     sliding_groups: Vec<Vec<Vec<usize>>>,
-    /// Whether this slot is in its first step (prefill).
-    is_prefill: Vec<bool>,
-    // ⛔⛔⛔ THE TOKEN STORE LIVES HERE NOW — see `prompt` and `generated` below.
-    //
-    // Every backend used to keep its own beside this struct: metal holds `token_buffers:
-    // HashMap<String, Vec<u32>>` (the prompt) AND `prompt_lengths: HashMap<String, usize>`, where the
-    // second is assigned `token_buffers[id].len()` at its ONLY insert — two stores of one quantity.
-    // spyre held `ReqState::tokens` + `ReqState::prompt_len`, the same pair renamed. So this struct knew
-    // a request's blocks and positions but not its TOKENS, which is the next thing every caller wants,
-    // and each backend answered it privately.
-    //
-    // ⭐ spyre is migrated (it reads `token_at`/`prompt_len` and appends with `push_generated`). metal
-    // and cuda are NOT: `add_request(prompt_token_ids, ..)` is passed a CHUNK by both (`tokens_to_use`),
-    // not the prompt, so their `prompt` stays empty until someone changes that contract — which cannot
-    // be compiled for cuda on the machine this was written on (no nvcc). `set_prompt` is how a backend
-    // opts in, and `prompt_len` answers 0 for one that has not.
-    /// Full prompt tokens for prefill slots (consumed after first prepare_inputs).
-    prefill_tokens: Vec<Option<Vec<u32>>>,
     /// THE PROMPT, whole, per slot. Every length about it is derived from this — there is no
-    /// `prompt_len` vec, because a stored length is a second store of one quantity and that is exactly
-    /// what metal's `prompt_lengths` map is.
+    /// `prompt_len` vec, because a stored length is a second store of one quantity.
     prompt: Vec<Vec<u32>>,
-    /// Everything sampled since, in order, per slot. `prompt ++ generated` IS the token history, and
-    /// `token_at` is the one place the boundary arithmetic lives.
+    /// Everything sampled since, in order, per slot. `prompt ++ generated` IS the token history — what
+    /// every step reads its chunk from, and the samplers their seed position (and metal its penalty
+    /// histories) — and [`Self::token_at`] is the one place the boundary arithmetic lives.
     generated: Vec<Vec<u32>>,
-    /// Position offset for prefill (num_computed_tokens from scheduler).
-    prefill_pos_offset: Vec<u32>,
 
     // --- Reusable per-step buffers (cleared + refilled each step) ---
     flat_token_ids: Vec<u32>,
     flat_positions: Vec<u32>,
+    /// `(slot, num_computed_tokens, num_scheduled_tokens)` of this step's requests, in slot order.
+    step_rows: Vec<(usize, usize, usize)>,
 
     // --- Reusable output buffers (swapped out in prepare_inputs, swapped back via reclaim) ---
     req_inputs_buf: Vec<ReqSlice>,
@@ -188,18 +168,14 @@ impl InputBatch {
         Self {
             req_id_to_slot: HashMap::new(),
             req_ids: Vec::new(),
-            last_token_ids: Vec::new(),
-            positions: Vec::new(),
             tokens_in_pool: Vec::new(),
             block_tables: Vec::new(),
             sliding_groups: Vec::new(),
-            is_prefill: Vec::new(),
-            prefill_tokens: Vec::new(),
             prompt: Vec::new(),
             generated: Vec::new(),
-            prefill_pos_offset: Vec::new(),
             flat_token_ids: Vec::new(),
             flat_positions: Vec::new(),
+            step_rows: Vec::new(),
             req_inputs_buf: Vec::new(),
             query_start_loc_buf: Vec::new(),
             q_lens_buf: Vec::new(),
@@ -216,57 +192,74 @@ impl InputBatch {
         self.req_ids.len()
     }
 
-    /// Add a new request (single KV-cache group; non-SWA models).
+    /// Apply one step's request lifecycle from the scheduler: drop the finished, admit the new (with
+    /// their WHOLE prompt), and replace the block tables of the cached. Ported from Python
+    /// `GPUModelRunner._update_states`.
+    ///
+    /// Preempted requests are NOT dropped: the scheduler resumes one by scheduling it again from its
+    /// `num_computed_tokens` (0, or its prefix-cache hit) with its complete block tables, and its chunk
+    /// is read from the history kept here. Until then it is simply not scheduled, so not run.
+    pub fn update_states(&mut self, sched: &SchedulerOutput) {
+        self.remove_finished(&sched.finished_req_ids);
+        for new_req in &sched.scheduled_new_reqs {
+            // Group 0 = full (global layers); groups 1.. = the sliding groups (gemma4 SWA).
+            let (full, sliding) = new_req
+                .block_ids
+                .split_first()
+                .map_or((Vec::new(), Vec::new()), |(f, s)| (f.clone(), s.to_vec()));
+            self.add_request_hybrid(
+                new_req.req_id.clone(),
+                new_req.prompt_token_ids.as_deref().unwrap_or(&[]),
+                full,
+                sliding,
+                new_req.num_computed_tokens,
+            );
+        }
+        let cached = &sched.scheduled_cached_reqs;
+        for (req_id, groups) in cached.req_ids.iter().zip(&cached.new_block_ids) {
+            if let Some((full, sliding)) = groups.as_deref().and_then(<[_]>::split_first) {
+                self.update_blocks_hybrid(req_id, full.clone(), sliding.to_vec());
+            }
+        }
+    }
+
+    /// Add a new request (single KV-cache group; non-SWA models). `prompt` is the WHOLE prompt.
     pub fn add_request(
         &mut self,
         req_id: String,
-        prompt_token_ids: &[u32],
+        prompt: &[u32],
         block_ids: Vec<usize>,
         num_computed_tokens: u32,
     ) {
-        self.add_request_hybrid(
-            req_id,
-            prompt_token_ids,
-            block_ids,
-            Vec::new(),
-            num_computed_tokens,
-        );
+        self.add_request_hybrid(req_id, prompt, block_ids, Vec::new(), num_computed_tokens);
     }
 
     /// Add a new request with its SLIDING KV-cache group block tables (gemma4
     /// SWA): `sliding_groups[s]` is sliding group `s`'s blocks for this request.
-    /// Empty is identical to [`Self::add_request`].
+    /// Empty is identical to [`Self::add_request`]. `prompt` is the WHOLE prompt; a request already
+    /// holding a slot under this id is replaced, never duplicated.
     pub fn add_request_hybrid(
         &mut self,
         req_id: String,
-        prompt_token_ids: &[u32],
+        prompt: &[u32],
         block_ids: Vec<usize>,
         sliding_groups: Vec<Vec<usize>>,
         num_computed_tokens: u32,
     ) {
+        self.remove_request(&req_id);
         let slot = self.req_ids.len();
         self.req_id_to_slot.insert(req_id.clone(), slot);
-        // ⛔ ONE LITERAL, NINE FIELDS, NO ORDER TO GET WRONG. Nothing here pushes to an individual vec:
+        // ⛔ ONE LITERAL, EVERY FIELD, NO ORDER TO GET WRONG. Nothing here pushes to an individual vec:
         // `push_slot` is generated from `per_slot_fields!`, so a field added to that list stops this
         // literal from compiling until it is given a value.
         self.push_slot(NewSlot {
             req_ids: req_id,
-            // The last prompt token, used if this transitions to decode with no set_last_token call.
-            last_token_ids: prompt_token_ids.last().copied().unwrap_or(0),
-            // Set properly during prepare_inputs for prefill.
-            positions: 0,
             // When prefix caching supplies computed tokens, their KV is already in the pool.
             tokens_in_pool: num_computed_tokens as usize,
             block_tables: block_ids,
             sliding_groups,
-            is_prefill: true,
-            prefill_tokens: Some(prompt_token_ids.to_vec()),
-            // ⛔ EMPTY, NOT `prompt_token_ids`: what arrives here is the CHUNK to feed this step, and a
-            // chunk is not a prompt — on a chunked prefill it is a prefix of one, on a prefix-cache hit a
-            // suffix. A backend that knows the whole prompt says so with `set_prompt`.
-            prompt: Vec::new(),
+            prompt: prompt.to_vec(),
             generated: Vec::new(),
-            prefill_pos_offset: num_computed_tokens,
         });
     }
 
@@ -289,14 +282,7 @@ impl InputBatch {
 
     /// Remove all finished requests.
     pub fn remove_finished(&mut self, finished_req_ids: &std::collections::HashSet<String>) {
-        // Collect slots to remove (iterate in reverse so swap-remove is safe).
-        let mut to_remove: Vec<String> = Vec::new();
         for req_id in finished_req_ids {
-            if self.req_id_to_slot.contains_key(req_id) {
-                to_remove.push(req_id.clone());
-            }
-        }
-        for req_id in &to_remove {
             self.remove_request(req_id);
         }
     }
@@ -333,9 +319,7 @@ impl InputBatch {
     }
 
     /// Get the stored SLIDING KV-cache group block tables for a request
-    /// (gemma4 SWA). Empty on uniform models. Used by the chunked-prefill
-    /// continuation path to preserve the sliding tables across a
-    /// remove + re-add (`add_request_hybrid`).
+    /// (gemma4 SWA). Empty on uniform models.
     pub fn sliding_groups(&self, req_id: &str) -> Option<&[Vec<usize>]> {
         self.req_id_to_slot
             .get(req_id)
@@ -377,6 +361,17 @@ impl InputBatch {
         (&self.req_ids, &self.block_tables, &self.tokens_in_pool)
     }
 
+    /// Whether this step is EVERY slot decoding exactly one token — the only step a replay over all
+    /// slots ([`Self::fast_path_info`]) runs exactly. A slot the scheduler left out, a chunk, or a
+    /// speculative verify makes it false.
+    pub fn schedules_one_token_per_slot(&self, sched: &SchedulerOutput) -> bool {
+        sched.num_scheduled_tokens.len() == self.req_ids.len()
+            && self
+                .req_ids
+                .iter()
+                .all(|id| sched.num_scheduled_tokens.get(id) == Some(&1))
+    }
+
     /// Token counts for the super-fast graph path's `PendingCommit`.
     ///
     /// The super-fast path is always a pure decode batch (all q_len=1), so each
@@ -387,21 +382,49 @@ impl InputBatch {
         vec![1; self.req_ids.len()]
     }
 
-    /// Prepare model inputs for the current step.
+    /// Build this step's flat model inputs FROM THE SCHEDULE. Ported from Python
+    /// `GPUModelRunner._prepare_inputs`.
     ///
-    /// Returns `(req_inputs, attn_meta, batch_block_ids, batch_tokens_before)`
-    /// where `req_inputs` contains per-request token_ids, positions, and spec
-    /// decode info.
+    /// Every request the scheduler scheduled — and only those — is packed, in slot order. Its chunk is
+    /// its history `prompt ++ generated` from the scheduler's `num_computed_tokens`, for its
+    /// `num_scheduled_tokens` minus its draft tokens, followed by the drafts; positions run from
+    /// `num_computed_tokens`. Prefill, chunked-prefill continuation, decode, speculative verify and a
+    /// resume after preemption are all this one slice — there is no per-slot mode to fall out of step
+    /// with the scheduler.
     ///
-    /// `spec_decode_tokens` maps req_id → draft tokens for speculative decode.
-    pub fn prepare_inputs(
-        &mut self,
-        spec_decode_tokens: &HashMap<String, Vec<u32>>,
-    ) -> PreparedInputs {
+    /// # Panics
+    /// If a scheduled request holds no slot, or its history is shorter than the chunk the scheduler
+    /// scheduled — either means this batch lost track of a request the scheduler still runs.
+    pub fn prepare_inputs(&mut self, sched: &SchedulerOutput) -> PreparedInputs {
         self.flat_token_ids.clear();
         self.flat_positions.clear();
 
-        let num_reqs = self.req_ids.len();
+        let cached = &sched.scheduled_cached_reqs;
+        let scheduled = sched
+            .scheduled_new_reqs
+            .iter()
+            .map(|r| (&r.req_id, r.num_computed_tokens))
+            .chain(
+                cached
+                    .req_ids
+                    .iter()
+                    .zip(cached.num_computed_tokens.iter().copied()),
+            );
+        let mut rows = std::mem::take(&mut self.step_rows);
+        rows.clear();
+        for (req_id, num_computed) in scheduled {
+            let slot = *self
+                .req_id_to_slot
+                .get(req_id)
+                .unwrap_or_else(|| panic!("scheduled request {req_id} holds no InputBatch slot"));
+            rows.push((
+                slot,
+                num_computed as usize,
+                sched.num_scheduled_tokens[req_id],
+            ));
+        }
+        rows.sort_unstable_by_key(|&(slot, _, _)| slot);
+        let num_reqs = rows.len();
 
         // Reuse pre-allocated buffers (retain capacity across steps).
         let mut req_inputs = std::mem::take(&mut self.req_inputs_buf);
@@ -423,111 +446,61 @@ impl InputBatch {
 
         let mut offset = 0usize;
 
-        for slot in 0..num_reqs {
+        for &(slot, num_computed, num_scheduled) in &rows {
             let req_id = &self.req_ids[slot];
-            let tb = self.tokens_in_pool[slot];
+            let drafts = sched
+                .scheduled_spec_decode_tokens
+                .get(req_id)
+                .map_or(&[][..], Vec::as_slice);
+            let num_real = num_scheduled - drafts.len();
+            let (prompt, generated) = (&self.prompt[slot], &self.generated[slot]);
+            let end = num_computed + num_real;
+            let token_start = self.flat_token_ids.len();
+            // `prompt ++ generated` over `num_computed..end`, split at the prompt boundary. An index
+            // past the history panics: that chunk was never this batch's to run.
+            let in_prompt = num_computed.min(prompt.len())..end.min(prompt.len());
+            let in_generated =
+                num_computed.max(prompt.len()) - prompt.len()..end.max(prompt.len()) - prompt.len();
+            self.flat_token_ids.extend_from_slice(&prompt[in_prompt]);
+            self.flat_token_ids
+                .extend_from_slice(&generated[in_generated]);
+            self.flat_token_ids.extend_from_slice(drafts);
+            self.flat_positions
+                .extend(num_computed as u32..(num_computed + num_scheduled) as u32);
 
-            if self.is_prefill[slot] {
-                // Prefill: emit the full prompt tokens.
-                let prompt_tokens = self.prefill_tokens[slot]
-                    .as_ref()
-                    .expect("prefill slot must have prompt tokens");
-                let pos_offset = self.prefill_pos_offset[slot];
-                let num_tokens = prompt_tokens.len();
-
-                let token_start = self.flat_token_ids.len();
-                self.flat_token_ids.extend_from_slice(prompt_tokens);
-                for i in 0..num_tokens as u32 {
-                    self.flat_positions.push(pos_offset + i);
-                }
-
-                query_start_loc.push(offset);
-                q_lens.push(num_tokens);
-                seq_lens.push(tb + num_tokens);
-                batch_block_ids.push(self.block_tables[slot].clone());
-                batch_tokens_before.push(tb);
-                is_prefill_vec.push(true);
-                batch_req_ids.push(req_id.clone());
-
-                req_inputs.push(ReqSlice {
-                    req_id: req_id.clone(),
-                    token_start,
-                    token_count: num_tokens,
-                    spec_token_ids: Vec::new(),
-                });
-
-                offset += num_tokens;
-            } else {
-                // Decode: emit last_token_id + optional spec decode tokens.
-                let spec_tokens = spec_decode_tokens.get(req_id).cloned().unwrap_or_default();
-                let position = self.positions[slot];
-
-                let token_start = self.flat_token_ids.len();
-
-                if spec_tokens.is_empty() {
-                    // Normal single-token decode.
-                    self.flat_token_ids.push(self.last_token_ids[slot]);
-                    self.flat_positions.push(position);
-
-                    query_start_loc.push(offset);
-                    q_lens.push(1);
-                    seq_lens.push(tb + 1);
-                    batch_block_ids.push(self.block_tables[slot].clone());
-                    batch_tokens_before.push(tb);
-                    is_prefill_vec.push(false);
-                    batch_req_ids.push(req_id.clone());
-
-                    req_inputs.push(ReqSlice {
-                        req_id: req_id.clone(),
-                        token_start,
-                        token_count: 1,
-                        spec_token_ids: Vec::new(),
-                    });
-
-                    offset += 1;
-                } else {
-                    // Speculative decode: [last_token, draft_0, ..., draft_K-1].
-                    let total = 1 + spec_tokens.len();
-                    self.flat_token_ids.push(self.last_token_ids[slot]);
-                    self.flat_positions.push(position);
-                    for (j, &draft_tok) in spec_tokens.iter().enumerate() {
-                        self.flat_token_ids.push(draft_tok);
-                        self.flat_positions.push(position + 1 + j as u32);
-                    }
-
-                    query_start_loc.push(offset);
-                    q_lens.push(total);
-                    seq_lens.push(tb + total);
-                    batch_block_ids.push(self.block_tables[slot].clone());
-                    batch_tokens_before.push(tb);
-                    is_prefill_vec.push(false);
-                    batch_req_ids.push(req_id.clone());
-
-                    req_inputs.push(ReqSlice {
-                        req_id: req_id.clone(),
-                        token_start,
-                        token_count: total,
-                        spec_token_ids: spec_tokens,
-                    });
-
-                    offset += total;
-                }
-            }
+            query_start_loc.push(offset);
+            q_lens.push(num_scheduled);
+            seq_lens.push(num_computed + num_scheduled);
+            batch_block_ids.push(self.block_tables[slot].clone());
+            batch_tokens_before.push(num_computed);
+            is_prefill_vec.push(num_computed < prompt.len());
+            batch_req_ids.push(req_id.clone());
+            req_inputs.push(ReqSlice {
+                req_id: req_id.clone(),
+                token_start,
+                token_count: num_scheduled,
+                spec_token_ids: drafts.to_vec(),
+                // A chunk that stops short of the end of the history (a prefill chunk, or a resume
+                // re-prefilling what it had generated) samples nothing — Python's discard mask.
+                emits_token: end >= prompt.len() + generated.len(),
+            });
+            self.tokens_in_pool[slot] = num_computed;
+            offset += num_scheduled;
         }
         query_start_loc.push(offset);
 
         // Sliding KV-cache GROUPS (gemma4 SWA): transpose the per-request,
-        // per-group tables to [sliding_group][req][block] in the same slot
+        // per-group tables to [sliding_group][req][block] in the same row
         // order as `batch_block_ids`. Empty on non-SWA models.
-        let num_sliding_groups = self.sliding_groups[..num_reqs]
+        let num_sliding_groups = rows
             .iter()
-            .map(|g| g.len())
+            .map(|&(slot, _, _)| self.sliding_groups[slot].len())
             .max()
             .unwrap_or(0);
         let sliding_groups: Vec<Vec<Vec<usize>>> = (0..num_sliding_groups)
             .map(|g| {
-                (0..num_reqs)
-                    .map(|slot| {
+                rows.iter()
+                    .map(|&(slot, _, _)| {
                         self.sliding_groups[slot]
                             .get(g)
                             .cloned()
@@ -536,6 +509,7 @@ impl InputBatch {
                     .collect::<Vec<Vec<usize>>>()
             })
             .collect();
+        self.step_rows = rows;
 
         let attn_meta = AttentionMetadata::new(
             num_reqs,
@@ -558,10 +532,11 @@ impl InputBatch {
         }
     }
 
-    /// Commit step results after sampling.
+    /// Commit step results after sampling: advance the pool cursor past the step's KV and append the
+    /// emitted tokens to the history.
     ///
-    /// For each request: updates positions, tokens_in_pool, clears prefill,
-    /// and stores the last sampled token.
+    /// `sampled_tokens` is what the step emitted for this request — empty for a chunk that emits
+    /// nothing ([`ReqSlice::emits_token`]).
     pub fn commit_step(
         &mut self,
         req_id: &str,
@@ -572,11 +547,7 @@ impl InputBatch {
         let Some(&slot) = self.req_id_to_slot.get(req_id) else {
             return;
         };
-
-        let tb = self.tokens_in_pool[slot];
-
-        // Update tokens_in_pool.
-        let new_tokens_in_cache = if was_spec_decode {
+        self.tokens_in_pool[slot] += if was_spec_decode {
             // Spec decode: only accepted tokens get cached (input tokens up to
             // the first rejection). `sampled_tokens.len()` == num_accepted + 1
             // which also equals the number of input tokens correctly in cache
@@ -585,36 +556,7 @@ impl InputBatch {
         } else {
             input_token_count
         };
-        self.tokens_in_pool[slot] = tb + new_tokens_in_cache;
-
-        // Update position for the next decode step.
-        // The next input token (last sampled) sits at position = tokens_in_pool.
-        // For normal decode: tokens_in_pool + 1 - 1 = tokens_in_pool. ✓
-        // For spec decode: tokens_in_pool (accepted tokens are already counted). ✓
-        self.positions[slot] = self.tokens_in_pool[slot] as u32;
-
-        // Store the last sampled token for the next decode step.
-        if let Some(&last) = sampled_tokens.last() {
-            self.last_token_ids[slot] = last;
-        }
-
-        // Clear prefill state.
-        if self.is_prefill[slot] {
-            self.is_prefill[slot] = false;
-            self.prefill_tokens[slot] = None;
-        }
-    }
-
-    /// STATE THIS REQUEST'S PROMPT, whole and once, at admission.
-    ///
-    /// Separate from `add_request` because that one is handed the CHUNK to feed this step, which is a
-    /// different quantity. Everything about the prompt is then derived from this one value — in
-    /// particular [`Self::prompt_len`], so a length cannot disagree with the tokens it counts.
-    pub fn set_prompt(&mut self, req_id: &str, prompt: &[u32]) {
-        if let Some(&slot) = self.req_id_to_slot.get(req_id) {
-            self.prompt[slot].clear();
-            self.prompt[slot].extend_from_slice(prompt);
-        }
+        self.generated[slot].extend_from_slice(sampled_tokens);
     }
 
     /// Where this request's prompt ends — the position sampling starts at. DERIVED, never stored.
@@ -628,6 +570,16 @@ impl InputBatch {
     pub fn token_count(&self, req_id: &str) -> usize {
         self.req_id_to_slot.get(req_id).map_or(0, |&slot| {
             self.prompt[slot].len() + self.generated[slot].len()
+        })
+    }
+
+    /// This request's history as `(prompt, generated)` — empty for a request this batch does not hold.
+    pub fn history(&self, req_id: &str) -> (&[u32], &[u32]) {
+        self.req_id_to_slot.get(req_id).map_or((&[], &[]), |&slot| {
+            (
+                self.prompt[slot].as_slice(),
+                self.generated[slot].as_slice(),
+            )
         })
     }
 
@@ -645,47 +597,11 @@ impl InputBatch {
         }
     }
 
-    /// Append a sampled token AND make it the next decode input — one call, because it is one event.
-    ///
-    /// ⛔ `set_last_token` alone moves the decode input without extending the history. That is coherent
-    /// only while nothing reads the history, which is the arrangement that let two backends keep private
-    /// token stores in the first place.
+    /// Append one sampled token to the history — for a backend that samples outside
+    /// [`Self::commit_step`].
     pub fn push_generated(&mut self, req_id: &str, token_id: u32) {
         if let Some(&slot) = self.req_id_to_slot.get(req_id) {
             self.generated[slot].push(token_id);
-            self.last_token_ids[slot] = token_id;
-        }
-    }
-
-    /// Set the last token for a request (after sampling).
-    pub fn set_last_token(&mut self, req_id: &str, token_id: u32) {
-        if let Some(&slot) = self.req_id_to_slot.get(req_id) {
-            self.last_token_ids[slot] = token_id;
-        }
-    }
-
-    /// Re-enter prefill mode for a request that has more prompt/sequence
-    /// tokens to process (chunked prefill continuation).
-    ///
-    /// Called when a running request still has prompt beyond `tokens_in_pool` — i.e. it is mid-prefill
-    /// and the scheduler has allocated blocks for the next chunk. `tokens` is the slice to process this
-    /// step; `pos_offset` is `num_computed_tokens` (= tokens already in the KV cache = current
-    /// `tokens_in_pool`).
-    ///
-    /// Matches Python InputBatch behaviour: prompt token ids are stored persistently and sliced each
-    /// step via `num_computed_tokens`.
-    pub fn set_prefill_continuation(&mut self, req_id: &str, tokens: Vec<u32>, pos_offset: u32) {
-        if let Some(&slot) = self.req_id_to_slot.get(req_id) {
-            self.is_prefill[slot] = true;
-            self.prefill_tokens[slot] = Some(tokens);
-            self.prefill_pos_offset[slot] = pos_offset;
-            // Sync the pool cursor to the scheduler's. Normally a no-op
-            // (commit_step already advanced it chunk by chunk), but a spans
-            // credit advances the scheduler's cursor WITHOUT an executed step —
-            // the credited span's KV is reused, not recomputed — and seq_lens /
-            // tokens_before / slot mapping all derive from this counter, so it
-            // must follow the jump.
-            self.tokens_in_pool[slot] = pos_offset as usize;
         }
     }
 
@@ -734,10 +650,13 @@ pub struct ReqSlice {
     pub req_id: String,
     /// Start index in flat_token_ids / flat_positions.
     pub token_start: usize,
-    /// Number of tokens for this request.
+    /// Number of tokens for this request — its `num_scheduled_tokens`.
     pub token_count: usize,
     /// Speculative decode draft tokens (empty for normal decode/prefill).
     pub spec_token_ids: Vec<u32>,
+    /// Whether this step samples a token for the request: its chunk reaches the end of its history.
+    /// False for a chunk of a longer prefill (or of a resume's re-prefill), whose sample is discarded.
+    pub emits_token: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -746,9 +665,124 @@ pub struct ReqSlice {
 
 #[cfg(test)]
 mod tests {
+    use scratchy_serving_scheduler::scheduler::output::NewRequestData;
+
     use crate::spec_decode::greedy_rejection_sample;
 
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // What the scheduler sends
+    // -----------------------------------------------------------------------
+
+    /// The `SchedulerOutput` of a step that runs `rows` — `(req_id, num_computed_tokens,
+    /// num_scheduled_tokens)` — as requests the scheduler has scheduled before.
+    fn step(rows: &[(&str, u32, usize)]) -> SchedulerOutput {
+        let mut s = SchedulerOutput::make_empty();
+        for &(id, num_computed, num_scheduled) in rows {
+            let c = &mut s.scheduled_cached_reqs;
+            c.req_ids.push(id.into());
+            c.new_block_ids.push(None);
+            c.num_computed_tokens.push(num_computed);
+            c.num_output_tokens.push(0);
+            s.num_scheduled_tokens.insert(id.into(), num_scheduled);
+            s.total_num_scheduled_tokens += num_scheduled;
+        }
+        s
+    }
+
+    /// `s` admitting `req_id` for the first time, scheduling `num_scheduled` of its `prompt` from
+    /// `num_computed` (its prefix-cache hit).
+    fn admitting(
+        mut s: SchedulerOutput,
+        req_id: &str,
+        prompt: &[u32],
+        blocks: Vec<usize>,
+        num_computed: u32,
+        num_scheduled: usize,
+    ) -> SchedulerOutput {
+        s.scheduled_new_reqs.push(NewRequestData::new(
+            req_id.into(),
+            Some(prompt.to_vec()),
+            vec![blocks],
+            num_computed,
+            None,
+            None,
+            None,
+        ));
+        s.num_scheduled_tokens.insert(req_id.into(), num_scheduled);
+        s.total_num_scheduled_tokens += num_scheduled;
+        s
+    }
+
+    /// `s` carrying `drafts` as `req_id`'s speculative tokens (counted in its `num_scheduled_tokens`).
+    fn drafted(mut s: SchedulerOutput, req_id: &str, drafts: &[u32]) -> SchedulerOutput {
+        s.scheduled_spec_decode_tokens
+            .insert(req_id.into(), drafts.to_vec());
+        s
+    }
+
+    /// `s` resuming `req_id` (scheduled in `s`) onto its complete new block table.
+    fn resumed(mut s: SchedulerOutput, req_id: &str, blocks: Vec<usize>) -> SchedulerOutput {
+        let c = &mut s.scheduled_cached_reqs;
+        let i = c.req_ids.iter().position(|r| r == req_id).unwrap();
+        c.resumed_req_ids.insert(req_id.into());
+        c.new_block_ids[i] = Some(vec![blocks]);
+        s
+    }
+
+    /// `s` preempting `ids`.
+    fn preempting(mut s: SchedulerOutput, ids: &[&str]) -> SchedulerOutput {
+        s.preempted_req_ids = Some(ids.iter().map(|&id| id.into()).collect());
+        s
+    }
+
+    /// `s` finishing `ids`.
+    fn finishing(mut s: SchedulerOutput, ids: &[&str]) -> SchedulerOutput {
+        s.finished_req_ids = ids.iter().map(|&id| id.into()).collect();
+        s
+    }
+
+    /// The row `req_id` was packed at.
+    fn row(p: &PreparedInputs, req_id: &str) -> usize {
+        p.attn_meta
+            .req_ids
+            .iter()
+            .position(|r| r == req_id)
+            .unwrap()
+    }
+
+    /// Run one step the way a worker does: lifecycle, build, commit what each row emitted
+    /// (`sampled(req_id)`), reclaim. Returns what was packed as `(req_id, tokens, positions)`.
+    fn run(
+        b: &mut InputBatch,
+        s: &SchedulerOutput,
+        sampled: impl Fn(&str) -> Vec<u32>,
+    ) -> Vec<(String, Vec<u32>, Vec<u32>)> {
+        b.update_states(s);
+        let p = b.prepare_inputs(s);
+        let mut packed = Vec::new();
+        for r in &p.req_inputs {
+            let span = r.token_start..r.token_start + r.token_count;
+            packed.push((
+                r.req_id.clone(),
+                p.flat_token_ids[span.clone()].to_vec(),
+                p.flat_positions[span].to_vec(),
+            ));
+            let out = if r.emits_token {
+                sampled(&r.req_id)
+            } else {
+                Vec::new()
+            };
+            b.commit_step(&r.req_id, &out, r.token_count, !r.spec_token_ids.is_empty());
+        }
+        b.reclaim_buffers(p);
+        packed
+    }
+
+    // -----------------------------------------------------------------------
+    // Slot mechanics
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_add_and_remove_request() {
@@ -799,134 +833,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_inputs_prefill() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
-
-        let spec = HashMap::new();
-        let prepared = batch.prepare_inputs(&spec);
-
-        assert_eq!(prepared.flat_token_ids, &[10, 20, 30]);
-        assert_eq!(prepared.flat_positions, &[0, 1, 2]);
-        assert_eq!(prepared.req_inputs.len(), 1);
-        assert_eq!(prepared.req_inputs[0].token_count, 3);
-        assert!(prepared.attn_meta.is_prefill[0]);
-        assert_eq!(prepared.attn_meta.num_reqs, 1);
-        assert_eq!(prepared.attn_meta.total_tokens, 3);
-    }
-
-    #[test]
-    fn test_prepare_inputs_prefill_with_offset() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0], 5);
-
-        let spec = HashMap::new();
-        let prepared = batch.prepare_inputs(&spec);
-
-        assert_eq!(prepared.flat_token_ids, &[10, 20, 30]);
-        assert_eq!(prepared.flat_positions, &[5, 6, 7]);
-    }
-
-    #[test]
-    fn test_prefill_to_decode_transition() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
-
-        // First step: prefill.
-        let spec = HashMap::new();
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.req_inputs[0].token_count, 3);
-        assert!(prepared.attn_meta.is_prefill[0]);
-
-        // Commit: 3 prompt tokens cached, sampled token 99.
-        batch.commit_step("r1", &[99], 3, false);
-
-        // Second step: should be decode.
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.flat_token_ids, &[99]);
-        assert_eq!(prepared.req_inputs[0].token_count, 1);
-        assert!(!prepared.attn_meta.is_prefill[0]);
-        assert_eq!(prepared.attn_meta.tokens_before[0], 3);
-    }
-
-    #[test]
-    fn test_decode_multiple_steps() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20], vec![0], 0);
-
-        let spec = HashMap::new();
-
-        // Prefill.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[30], 2, false);
-
-        // Decode step 1.
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.flat_token_ids, &[30]);
-        assert_eq!(prepared.flat_positions, &[2]); // position 2 = after tokens 0,1 in pool + sampled
-        batch.commit_step("r1", &[40], 1, false);
-
-        // Decode step 2.
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.flat_token_ids, &[40]);
-        assert_eq!(prepared.flat_positions, &[3]);
-    }
-
-    #[test]
-    fn test_mixed_prefill_and_decode() {
-        let mut batch = InputBatch::new();
-        // r1 already past prefill.
-        batch.add_request("r1".into(), &[10, 20], vec![0], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[30], 2, false);
-
-        // Add r2 as new prefill while r1 is decoding.
-        batch.add_request("r2".into(), &[50, 60, 70], vec![1, 2], 0);
-
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.attn_meta.num_reqs, 2);
-        // r1 is decode (1 token), r2 is prefill (3 tokens).
-        assert_eq!(prepared.attn_meta.total_tokens, 4);
-
-        // Find r1 and r2 in the results.
-        let r1_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r1")
-            .unwrap();
-        let r2_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r2")
-            .unwrap();
-
-        assert_eq!(prepared.req_inputs[r1_idx].token_count, 1);
-        assert_eq!(prepared.req_inputs[r2_idx].token_count, 3);
-        assert!(!prepared.attn_meta.is_prefill[r1_idx]);
-        assert!(prepared.attn_meta.is_prefill[r2_idx]);
-    }
-
-    #[test]
-    fn test_spec_decode_tokens() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10], vec![0], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[20], 1, false);
-
-        // Decode with spec tokens.
-        let mut spec = HashMap::new();
-        spec.insert("r1".to_string(), vec![30, 40]);
-
-        let prepared = batch.prepare_inputs(&spec);
-        // Should have 3 tokens: [last_token=20, draft_30, draft_40].
-        assert_eq!(prepared.req_inputs[0].token_count, 3);
-        assert_eq!(prepared.req_inputs[0].spec_token_ids, vec![30, 40]);
-        assert_eq!(prepared.flat_token_ids, &[20, 30, 40]);
-    }
-
-    #[test]
     fn test_update_blocks() {
         let mut batch = InputBatch::new();
         batch.add_request("r1".into(), &[10], vec![0], 0);
@@ -952,87 +858,425 @@ mod tests {
         assert!(batch.contains("r2"));
     }
 
+    /// Removing the LAST active request leaves an empty batch.
     #[test]
-    fn test_tokens_in_pool_tracking() {
+    fn test_remove_last_request_leaves_empty_batch() {
         let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0], 0);
-
-        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
-
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[40], 3, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
-
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[50], 1, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+        batch.add_request("r1".into(), &[1, 2], vec![0], 0);
+        batch.remove_request("r1");
+        assert_eq!(batch.num_active(), 0);
+        assert!(!batch.contains("r1"));
     }
 
+    /// Removing the FIRST of N requests triggers swap-remove; all surviving
+    /// requests must remain slot-consistent and individually removable.
     #[test]
-    fn test_spec_decode_commit() {
+    fn test_remove_first_of_many_slot_consistency() {
         let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10], vec![0], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[20], 1, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 1);
-
-        // Spec decode: 3 tokens input, 2 accepted.
-        batch.commit_step("r1", &[30, 40], 3, true);
-        // tokens_in_pool should increase by sampled.len() (2), not input count (3).
-        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+        for i in 0u32..5 {
+            batch.add_request(format!("r{i}"), &[i], vec![i as usize], 0);
+        }
+        // Remove r0 (slot 0); r4 should swap into slot 0.
+        batch.remove_request("r0");
+        assert_eq!(batch.num_active(), 4);
+        for i in 1u32..5 {
+            let id = format!("r{i}");
+            assert!(batch.contains(&id));
+            assert_eq!(batch.block_table(&id), Some(&[i as usize][..]));
+        }
+        for i in 1u32..5 {
+            batch.remove_request(&format!("r{i}"));
+        }
+        assert_eq!(batch.num_active(), 0);
     }
 
+    /// Removing a middle request: slot indices of all other requests must
+    /// remain valid (no off-by-one errors from the swap-remove).
     #[test]
-    fn test_spec_decode_multi_token_commit() {
+    fn test_remove_middle_request_slot_consistency() {
+        let mut batch = InputBatch::new();
+        batch.add_request("a".into(), &[1], vec![10], 0);
+        batch.add_request("b".into(), &[2], vec![20], 0);
+        batch.add_request("c".into(), &[3], vec![30], 0);
+        batch.add_request("d".into(), &[4], vec![40], 0);
+
+        // Remove "b" (slot 1). "d" (last slot = 3) should fill slot 1.
+        batch.remove_request("b");
+        assert_eq!(batch.num_active(), 3);
+        assert!(!batch.contains("b"));
+        assert_eq!(batch.block_table("a"), Some(&[10][..]));
+        assert_eq!(batch.block_table("c"), Some(&[30][..]));
+        assert_eq!(batch.block_table("d"), Some(&[40][..]));
+    }
+
+    /// commit_step must be a no-op for a removed request. This guards against stale slot reuse when
+    /// another request gets the same slot index via swap-remove.
+    #[test]
+    fn test_commit_step_noop_for_removed_request() {
         let mut batch = InputBatch::new();
         batch.add_request("r1".into(), &[10, 20, 30], vec![0], 0);
-        let spec = HashMap::new();
+        batch.add_request("r2".into(), &[40, 50], vec![1], 0);
+        run(&mut batch, &step(&[("r1", 0, 3), ("r2", 0, 2)]), |_| {
+            vec![9]
+        });
 
-        // Prefill.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[40], 3, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+        batch.remove_request("r1");
 
-        // Decode step: normal.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[50], 1, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+        let tip_before = batch.tokens_in_pool_for("r2");
+        batch.commit_step("r1", &[0], 99, false); // r1 no longer in batch
+        assert_eq!(
+            batch.tokens_in_pool_for("r2"),
+            tip_before,
+            "stale commit_step must not corrupt surviving requests"
+        );
+        assert_eq!(batch.token_count("r2"), 3, "nor their history");
+    }
 
-        // Spec decode: 4 input tokens [50, d0, d1, d2], all 3 accepted + bonus.
-        // sampled = [d0, d1, d2, bonus] = 4 tokens.
-        batch.commit_step("r1", &[60, 70, 80, 90], 4, true);
-        // tokens_in_pool += 4 (the 4 input tokens are all correctly cached).
+    /// A request admitted under an id that already holds a slot REPLACES that slot: no duplicate
+    /// slot, no stale history, blocks or pool cursor.
+    #[test]
+    fn test_readmitted_req_id_replaces_its_slot() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[1, 2, 3], vec![0, 1], 0);
+        run(&mut batch, &step(&[("r1", 0, 3)]), |_| vec![99]);
+        for n in 3..8 {
+            run(&mut batch, &step(&[("r1", n, 1)]), |_| vec![0]);
+        }
         assert_eq!(batch.tokens_in_pool_for("r1"), 8);
 
-        // Next decode should use the last sampled token (90) at position 8.
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.flat_token_ids, &[90]);
-        assert_eq!(prepared.flat_positions, &[8]);
+        batch.add_request("r1".into(), &[10, 20], vec![5], 0);
+        assert_eq!(batch.num_active(), 1, "one slot per id");
+        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
+        assert_eq!(batch.block_table("r1"), Some(&[5][..]));
+        assert_eq!(batch.history("r1"), (&[10u32, 20][..], &[][..]));
+    }
+
+    // -----------------------------------------------------------------------
+    // The step is the schedule
+    // -----------------------------------------------------------------------
+
+    /// THE #146 OVERFLOW. A running request the scheduler left out of a full-budget step (the async
+    /// max-tokens skip, the budget running out, a preemption) is NOT packed: the step carries exactly
+    /// `total_num_scheduled_tokens`, so it can never grow past the budget — the 4096 → 4097
+    /// `NoBucketFits` panic.
+    #[test]
+    fn a_request_the_scheduler_left_out_is_not_packed() {
+        let mut batch = InputBatch::new();
+        batch.add_request("stale".into(), &[1, 2], vec![0], 0);
+        run(&mut batch, &step(&[("stale", 0, 2)]), |_| vec![7]);
+        let big: Vec<u32> = (100..104).collect();
+        let s = admitting(SchedulerOutput::make_empty(), "big", &big, vec![1], 0, 4);
+
+        batch.update_states(&s);
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.attn_meta.total_tokens, s.total_num_scheduled_tokens);
+        assert_eq!(p.attn_meta.req_ids, vec!["big".to_string()]);
+        assert_eq!(p.flat_token_ids, big);
+        assert_eq!(p.attn_meta.query_start_loc, vec![0, 4]);
+        batch.reclaim_buffers(p);
+
+        // The skipped request is untouched: when it is scheduled again it decodes its last token.
+        assert_eq!(batch.tokens_in_pool_for("stale"), 2);
+        let packed = run(&mut batch, &step(&[("stale", 2, 1)]), |_| vec![8]);
+        assert_eq!(packed, vec![("stale".into(), vec![7], vec![2])]);
+    }
+
+    /// Every step packs exactly what was scheduled, whatever mix of prefill, chunk and decode — and
+    /// the slots it leaves out contribute nothing.
+    #[test]
+    fn the_packed_token_count_is_the_scheduled_token_count() {
+        let mut batch = InputBatch::new();
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            batch.add_request((*id).into(), &[1; 10], vec![i], 0);
+        }
+        let schedules = [
+            step(&[("a", 0, 10), ("b", 0, 4), ("c", 0, 10)]),
+            step(&[("a", 10, 1), ("b", 4, 6), ("d", 0, 3)]),
+            step(&[("b", 10, 1), ("d", 3, 7)]),
+            step(&[("a", 11, 1), ("c", 10, 1)]),
+        ];
+        for s in &schedules {
+            batch.update_states(s);
+            let p = batch.prepare_inputs(s);
+            assert_eq!(p.attn_meta.total_tokens, s.total_num_scheduled_tokens);
+            assert_eq!(p.flat_token_ids.len(), s.total_num_scheduled_tokens);
+            assert_eq!(p.attn_meta.num_reqs, s.num_scheduled_tokens.len());
+            for r in &p.req_inputs {
+                assert_eq!(r.token_count, s.num_scheduled_tokens[&r.req_id]);
+            }
+            for r in 0..p.attn_meta.num_reqs {
+                let (id, q) = (&p.attn_meta.req_ids[r], p.attn_meta.q_lens[r]);
+                let out = if p.req_inputs[r].emits_token {
+                    vec![5]
+                } else {
+                    vec![]
+                };
+                batch.commit_step(id, &out, q, false);
+            }
+            batch.reclaim_buffers(p);
+        }
+    }
+
+    /// Rows come out in SLOT order, whatever order the scheduler listed them in — the order a replay
+    /// over every slot (the cuda graph fast path) assumes.
+    #[test]
+    fn rows_are_in_slot_order() {
+        let mut batch = InputBatch::new();
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            batch.add_request((*id).into(), &[1, 2], vec![i], 0);
+        }
+        let p = batch.prepare_inputs(&step(&[("c", 0, 2), ("a", 0, 2), ("b", 0, 2)]));
+        assert_eq!(p.attn_meta.req_ids, vec!["a", "b", "c"]);
+    }
+
+    /// A scheduled request with no slot is a lost request, not an empty row.
+    #[test]
+    #[should_panic(expected = "holds no InputBatch slot")]
+    fn a_scheduled_request_without_a_slot_panics() {
+        let mut batch = InputBatch::new();
+        let _ = batch.prepare_inputs(&step(&[("ghost", 0, 1)]));
+    }
+
+    /// A chunk the history does not hold was never this batch's to run.
+    #[test]
+    #[should_panic]
+    fn a_chunk_past_the_history_panics() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], vec![0], 0);
+        let _ = batch.prepare_inputs(&step(&[("r1", 7, 10)]));
+    }
+
+    /// `update_states` is the lifecycle: finished requests go, new ones come in with their whole
+    /// prompt, cached ones get their block tables replaced — and a preempted one keeps its slot.
+    #[test]
+    fn update_states_admits_drops_replaces_blocks_and_keeps_the_preempted() {
+        let mut batch = InputBatch::new();
+        batch.add_request("done".into(), &[1], vec![0], 0);
+        batch.add_request("running".into(), &[2, 3], vec![1], 0);
+        batch.push_generated("running", 9);
+        batch.add_request("preempted".into(), &[4], vec![2], 0);
+
+        let mut s = step(&[("running", 2, 1)]);
+        s.scheduled_cached_reqs.new_block_ids[0] = Some(vec![vec![1, 7]]);
+        let s = preempting(
+            finishing(admitting(s, "new", &[5, 6, 7], vec![3], 1, 2), &["done"]),
+            &["preempted"],
+        );
+        batch.update_states(&s);
+
+        assert!(!batch.contains("done"));
+        assert!(
+            batch.contains("preempted"),
+            "a preempted request keeps its history"
+        );
+        assert_eq!(batch.block_table("running"), Some(&[1, 7][..]));
+        assert_eq!(batch.history("new"), (&[5u32, 6, 7][..], &[][..]));
+        assert_eq!(batch.tokens_in_pool_for("new"), 1);
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.attn_meta.req_ids, vec!["running", "new"]);
+        assert_eq!(
+            p.flat_token_ids,
+            &[9, 6, 7],
+            "the new request's chunk skips its cached prefix"
+        );
+    }
+
+    /// Only a step of every slot decoding one token is a step a replay over all slots runs exactly.
+    #[test]
+    fn schedules_one_token_per_slot_only_when_every_slot_decodes_one() {
+        let mut batch = InputBatch::new();
+        batch.add_request("a".into(), &[1, 2], vec![0], 0);
+        batch.add_request("b".into(), &[1, 2], vec![1], 0);
+        assert!(batch.schedules_one_token_per_slot(&step(&[("a", 2, 1), ("b", 2, 1)])));
+        assert!(
+            !batch.schedules_one_token_per_slot(&step(&[("a", 2, 1)])),
+            "a slot left out"
+        );
+        assert!(
+            !batch.schedules_one_token_per_slot(&step(&[("a", 2, 1), ("b", 0, 2)])),
+            "a chunk"
+        );
+        assert!(
+            !batch.schedules_one_token_per_slot(&step(&[("a", 2, 1), ("b", 2, 1), ("c", 0, 1)])),
+            "a request with no slot"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Prefill, chunked prefill, decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prepare_inputs_prefill() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
+
+        let prepared = batch.prepare_inputs(&step(&[("r1", 0, 3)]));
+
+        assert_eq!(prepared.flat_token_ids, &[10, 20, 30]);
+        assert_eq!(prepared.flat_positions, &[0, 1, 2]);
+        assert_eq!(prepared.req_inputs.len(), 1);
+        assert_eq!(prepared.req_inputs[0].token_count, 3);
+        assert!(prepared.req_inputs[0].emits_token);
+        assert!(prepared.attn_meta.is_prefill[0]);
+        assert_eq!(prepared.attn_meta.num_reqs, 1);
+        assert_eq!(prepared.attn_meta.total_tokens, 3);
+    }
+
+    /// A prefix-cache hit: the chunk is the prompt's suffix past the scheduler's `num_computed`, at
+    /// its own positions — and the prompt is still the whole prompt.
+    #[test]
+    fn test_prepare_inputs_prefill_with_offset() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[1, 2, 3, 4, 5, 10, 20, 30], vec![0], 5);
+
+        let prepared = batch.prepare_inputs(&step(&[("r1", 5, 3)]));
+
+        assert_eq!(prepared.flat_token_ids, &[10, 20, 30]);
+        assert_eq!(prepared.flat_positions, &[5, 6, 7]);
+        assert_eq!(prepared.attn_meta.tokens_before[0], 5);
+        assert_eq!(batch.prompt_len("r1"), 8);
     }
 
     #[test]
-    fn test_spec_decode_partial_accept_commit() {
+    fn test_prefill_to_decode_transition() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
+
+        let prepared = batch.prepare_inputs(&step(&[("r1", 0, 3)]));
+        assert_eq!(prepared.req_inputs[0].token_count, 3);
+        assert!(prepared.attn_meta.is_prefill[0]);
+        batch.reclaim_buffers(prepared);
+        batch.commit_step("r1", &[99], 3, false);
+
+        let prepared = batch.prepare_inputs(&step(&[("r1", 3, 1)]));
+        assert_eq!(prepared.flat_token_ids, &[99]);
+        assert_eq!(prepared.req_inputs[0].token_count, 1);
+        assert!(!prepared.attn_meta.is_prefill[0]);
+        assert_eq!(prepared.attn_meta.tokens_before[0], 3);
+    }
+
+    #[test]
+    fn test_decode_multiple_steps() {
         let mut batch = InputBatch::new();
         batch.add_request("r1".into(), &[10, 20], vec![0], 0);
-        let spec = HashMap::new();
 
-        // Prefill.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[30], 2, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 2);
+        run(&mut batch, &step(&[("r1", 0, 2)]), |_| vec![30]);
+        let packed = run(&mut batch, &step(&[("r1", 2, 1)]), |_| vec![40]);
+        assert_eq!(packed, vec![("r1".into(), vec![30], vec![2])]);
+        let packed = run(&mut batch, &step(&[("r1", 3, 1)]), |_| vec![50]);
+        assert_eq!(packed, vec![("r1".into(), vec![40], vec![3])]);
+        assert_eq!(
+            batch.history("r1"),
+            (&[10u32, 20][..], &[30u32, 40, 50][..])
+        );
+    }
 
-        // Spec decode: 4 input tokens [30, d0, d1, d2], only 1 accepted.
-        // sampled = [d0, recovered] = 2 tokens.
-        batch.commit_step("r1", &[40, 50], 4, true);
-        // tokens_in_pool += 2 (30 and d0 are correctly cached).
-        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+    #[test]
+    fn test_mixed_prefill_and_decode() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20], vec![0], 0);
+        run(&mut batch, &step(&[("r1", 0, 2)]), |_| vec![30]);
 
-        // Next decode should use the last sampled token (50) at position 4.
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.flat_token_ids, &[50]);
-        assert_eq!(prepared.flat_positions, &[4]);
+        let s = admitting(step(&[("r1", 2, 1)]), "r2", &[50, 60, 70], vec![1, 2], 0, 3);
+        batch.update_states(&s);
+        let prepared = batch.prepare_inputs(&s);
+        assert_eq!(prepared.attn_meta.num_reqs, 2);
+        assert_eq!(prepared.attn_meta.total_tokens, 4);
+
+        let (r1, r2) = (row(&prepared, "r1"), row(&prepared, "r2"));
+        assert_eq!(prepared.req_inputs[r1].token_count, 1);
+        assert_eq!(prepared.req_inputs[r2].token_count, 3);
+        assert!(!prepared.attn_meta.is_prefill[r1]);
+        assert!(prepared.attn_meta.is_prefill[r2]);
+    }
+
+    /// A prompt longer than one step's budget runs as chunks, each read from the prompt at the
+    /// scheduler's `num_computed`; only the chunk that reaches the end of the prompt emits a token.
+    #[test]
+    fn test_chunked_prefill_continuation() {
+        let mut batch = InputBatch::new();
+        let prompt: Vec<u32> = (0..10).collect();
+        batch.add_request("r1".into(), &prompt, vec![0, 1, 2], 0);
+
+        let p1 = batch.prepare_inputs(&step(&[("r1", 0, 5)]));
+        assert_eq!(p1.flat_token_ids, &[0, 1, 2, 3, 4]);
+        assert!(p1.attn_meta.is_prefill[0]);
+        assert!(
+            !p1.req_inputs[0].emits_token,
+            "a mid-prompt chunk samples nothing"
+        );
+        batch.reclaim_buffers(p1);
+        batch.commit_step("r1", &[], 5, false);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 5);
+        assert_eq!(batch.token_count("r1"), 10, "nothing was appended");
+
+        let p2 = batch.prepare_inputs(&step(&[("r1", 5, 5)]));
+        assert_eq!(p2.flat_token_ids, &[5, 6, 7, 8, 9]);
+        assert_eq!(p2.flat_positions, &[5, 6, 7, 8, 9]);
+        assert!(p2.attn_meta.is_prefill[0]);
+        assert!(
+            p2.req_inputs[0].emits_token,
+            "the final chunk samples the first token"
+        );
+        assert_eq!(p2.attn_meta.seq_lens[0], 10);
+        batch.reclaim_buffers(p2);
+        batch.commit_step("r1", &[90], 5, false);
+
+        let pd = batch.prepare_inputs(&step(&[("r1", 10, 1)]));
+        assert!(!pd.attn_meta.is_prefill[0]);
+        assert_eq!(pd.flat_token_ids, &[90]);
+        assert_eq!(pd.attn_meta.q_lens[0], 1);
+        assert_eq!(pd.attn_meta.seq_lens[0], 11);
+    }
+
+    /// Two chunks of 32 read `prompt[0..32]` then `prompt[32..64]`.
+    #[test]
+    fn test_chunked_prefill_second_chunk_slice() {
+        let mut batch = InputBatch::new();
+        let prompt: Vec<u32> = (0..64).collect();
+        batch.add_request("r1".into(), &prompt, vec![0, 1, 2, 3], 0);
+        let packed = run(&mut batch, &step(&[("r1", 0, 32)]), |_| vec![]);
+        assert_eq!(packed[0].1, (0..32).collect::<Vec<u32>>());
+        let packed = run(&mut batch, &step(&[("r1", 32, 32)]), |_| vec![64]);
+        assert_eq!(packed[0].1, (32..64).collect::<Vec<u32>>());
+        assert_eq!(packed[0].2, (32..64).collect::<Vec<u32>>());
+    }
+
+    /// seq_lens stays within the scheduler's block allocation across chunks.
+    #[test]
+    fn test_chunked_prefill_slot_mapping_invariant() {
+        let block_size = 4usize;
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[0, 1, 2, 3, 4, 5, 6, 7], vec![0], 0);
+        run(&mut batch, &step(&[("r1", 0, 4)]), |_| vec![]);
+
+        let mut s = step(&[("r1", 4, 4)]);
+        s.scheduled_cached_reqs.new_block_ids[0] = Some(vec![vec![0, 1]]);
+        batch.update_states(&s);
+        let p2 = batch.prepare_inputs(&s);
+        assert_eq!(p2.attn_meta.seq_lens[0], 8);
+        assert!(
+            p2.attn_meta.seq_lens[0] <= p2.attn_meta.block_ids[0].len() * block_size,
+            "seq_lens must not exceed block capacity"
+        );
+    }
+
+    #[test]
+    fn test_seq_lens_formula_for_prefill() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[1, 2, 3, 4, 5], vec![0, 1], 0);
+        let p = batch.prepare_inputs(&step(&[("r1", 0, 5)]));
+        assert_eq!(p.attn_meta.seq_lens[0], 5, "seq_lens = 0 + 5 = 5");
+        batch.reclaim_buffers(p);
+
+        batch.add_request("r2".into(), &[7, 8, 10, 20, 30], vec![2, 3], 2);
+        let p2 = batch.prepare_inputs(&step(&[("r2", 2, 3)]));
+        assert_eq!(
+            p2.attn_meta.seq_lens[row(&p2, "r2")],
+            5,
+            "2 (cached) + 3 (tokens)"
+        );
     }
 
     #[test]
@@ -1041,8 +1285,7 @@ mod tests {
         batch.add_request("r1".into(), &[10, 20], vec![0], 0);
         batch.add_request("r2".into(), &[30, 40, 50], vec![1], 0);
 
-        let spec = HashMap::new();
-        let prepared = batch.prepare_inputs(&spec);
+        let prepared = batch.prepare_inputs(&step(&[("r1", 0, 2), ("r2", 0, 3)]));
         let meta = &prepared.attn_meta;
 
         assert_eq!(meta.query_start_loc.len(), meta.num_reqs + 1);
@@ -1055,9 +1298,143 @@ mod tests {
         }
     }
 
-    // Rejection-sample unit tests live with their owning module:
-    //   `scratchy-serving-engine/src/spec_decode/verify.rs`. Local copies removed
-    //   in phase 5.5 along with the `pub use` shim.
+    /// `seq_lens[i]` = `tokens_before[i]` + `q_lens[i]` in a mixed decode / fresh / cached batch.
+    #[test]
+    fn test_seq_lens_equals_tokens_before_plus_q_lens() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[1, 2], vec![0], 0);
+        run(&mut batch, &step(&[("r1", 0, 2)]), |_| vec![99]);
+        batch.add_request("r2".into(), &[10, 20, 30], vec![1, 2], 0);
+        batch.add_request("r3".into(), &[1, 2, 3, 4, 40, 50], vec![3, 4], 4);
+
+        let prepared = batch.prepare_inputs(&step(&[("r1", 2, 1), ("r2", 0, 3), ("r3", 4, 2)]));
+        let meta = &prepared.attn_meta;
+        for i in 0..meta.num_reqs {
+            assert_eq!(
+                meta.seq_lens[i],
+                meta.tokens_before[i] + meta.q_lens[i],
+                "req {i}: seq_lens must equal tokens_before + q_lens"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tokens_in_pool_tracking() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0], 0);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
+
+        run(&mut batch, &step(&[("r1", 0, 3)]), |_| vec![40]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+        run(&mut batch, &step(&[("r1", 3, 1)]), |_| vec![50]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+    }
+
+    /// The scheduler's `num_computed_tokens` is the pool cursor of every step it schedules — e.g. a
+    /// spans credit advances it WITHOUT an executed step, and the step follows the jump.
+    #[test]
+    fn the_scheduler_sets_the_pool_cursor_of_every_scheduled_step() {
+        let mut batch = InputBatch::new();
+        let prompt: Vec<u32> = (0..12).collect();
+        batch.add_request("r1".into(), &prompt, vec![0, 1, 2], 0);
+        run(&mut batch, &step(&[("r1", 0, 4)]), |_| vec![]);
+        // Tokens 4..8 are credited (reused KV); the scheduler resumes the prefill at 8.
+        let p = batch.prepare_inputs(&step(&[("r1", 8, 4)]));
+        assert_eq!(p.flat_token_ids, &[8, 9, 10, 11]);
+        assert_eq!(p.attn_meta.tokens_before[0], 8);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 8);
+    }
+
+    /// Sliding-group tables follow the packed rows, not the raw slot order.
+    #[test]
+    fn sliding_groups_follow_the_packed_rows() {
+        let mut batch = InputBatch::new();
+        batch.add_request_hybrid("a".into(), &[1], vec![0], vec![vec![100]], 0);
+        batch.add_request_hybrid("b".into(), &[2], vec![1], vec![vec![200]], 0);
+
+        let prepared = batch.prepare_inputs(&step(&[("b", 0, 1)]));
+        assert_eq!(prepared.attn_meta.req_ids, vec!["b".to_string()]);
+        assert_eq!(prepared.attn_meta.sliding_groups, vec![vec![vec![200]]]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Speculative decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spec_decode_tokens() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10], vec![0], 0);
+        run(&mut batch, &step(&[("r1", 0, 1)]), |_| vec![20]);
+
+        let prepared = batch.prepare_inputs(&drafted(step(&[("r1", 1, 3)]), "r1", &[30, 40]));
+        // [last_token=20, draft_30, draft_40].
+        assert_eq!(prepared.req_inputs[0].token_count, 3);
+        assert_eq!(prepared.req_inputs[0].spec_token_ids, vec![30, 40]);
+        assert_eq!(prepared.flat_token_ids, &[20, 30, 40]);
+        assert_eq!(prepared.flat_positions, &[1, 2, 3]);
+        assert!(prepared.req_inputs[0].emits_token);
+    }
+
+    #[test]
+    fn test_spec_decode_commit() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10], vec![0], 0);
+        run(&mut batch, &step(&[("r1", 0, 1)]), |_| vec![20]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 1);
+
+        // Spec decode: 3 tokens input, 2 accepted.
+        batch.commit_step("r1", &[30, 40], 3, true);
+        // tokens_in_pool increases by sampled.len() (2), not input count (3).
+        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+        assert_eq!(batch.history("r1").1, &[20, 30, 40]);
+    }
+
+    #[test]
+    fn test_spec_decode_multi_token_commit() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0], 0);
+
+        run(&mut batch, &step(&[("r1", 0, 3)]), |_| vec![40]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+        run(&mut batch, &step(&[("r1", 3, 1)]), |_| vec![50]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+
+        // Spec decode: 4 input tokens [50, d0, d1, d2], all 3 accepted + bonus.
+        let packed = run(
+            &mut batch,
+            &drafted(step(&[("r1", 4, 4)]), "r1", &[60, 70, 80]),
+            |_| vec![60, 70, 80, 90],
+        );
+        assert_eq!(packed[0].1, vec![50, 60, 70, 80]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 8);
+
+        // Nothing rejected: the scheduler resumes at 8, on the bonus token.
+        let packed = run(&mut batch, &step(&[("r1", 8, 1)]), |_| vec![91]);
+        assert_eq!(packed, vec![("r1".into(), vec![90], vec![8])]);
+    }
+
+    #[test]
+    fn test_spec_decode_partial_accept_commit() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20], vec![0], 0);
+
+        run(&mut batch, &step(&[("r1", 0, 2)]), |_| vec![30]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 2);
+
+        // Spec decode: 4 input tokens [30, d0, d1, d2], only d0 accepted + recovered 50.
+        run(
+            &mut batch,
+            &drafted(step(&[("r1", 2, 4)]), "r1", &[40, 41, 42]),
+            |_| vec![40, 50],
+        );
+        // 30 and d0 are correctly cached.
+        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+
+        // The scheduler rewound its cursor by the 2 rejected drafts: 2 + 4 - 2 = 4.
+        let packed = run(&mut batch, &step(&[("r1", 4, 1)]), |_| vec![60]);
+        assert_eq!(packed, vec![("r1".into(), vec![50], vec![4])]);
+    }
 
     /// Regression test for the super-fast graph path deferred commit bug.
     ///
@@ -1076,11 +1453,9 @@ mod tests {
     fn test_fast_path_token_counts_linear_growth() {
         let mut batch = InputBatch::new();
         batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
-        let spec = HashMap::new();
 
         // Step 1: prefill.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[40], 3, false);
+        run(&mut batch, &step(&[("r1", 0, 3)]), |_| vec![40]);
         assert_eq!(batch.tokens_in_pool_for("r1"), 3);
 
         // Step 2: first graph decode (normal path). Deferred, token_count=1.
@@ -1089,7 +1464,6 @@ mod tests {
         // Steps 3..20: super-fast path loop.
         for step in 3..=20 {
             // Capture token_counts BEFORE resolving the previous pending commit.
-            // This is the line that was buggy: old code did tokens_in_pool.to_vec().
             let new_pending_tc = batch.fast_path_token_counts();
             assert_eq!(
                 new_pending_tc,
@@ -1116,6 +1490,10 @@ mod tests {
         // After 18 super-fast steps, tokens_in_pool should be 3 + 18 = 21.
         assert_eq!(batch.tokens_in_pool_for("r1"), 21);
     }
+
+    // Rejection-sample unit tests live with their owning module:
+    //   `scratchy-serving-engine/src/spec_decode/verify.rs`. Local copies removed
+    //   in phase 5.5 along with the `pub use` shim.
 
     #[test]
     fn test_rejection_output_length_invariants() {
@@ -1259,468 +1637,232 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pipeline parallelism: set_last_token overrides commit_step's dummy token
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_set_last_token_overrides_commit_step() {
-        // Simulates PP non-last stage: commit_step with dummy 0, then
-        // set_last_token with the real sampled token from the scheduler.
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
-
-        // Simulate prefill → decode transition.
-        let no_spec = std::collections::HashMap::new();
-        let prepared = batch.prepare_inputs(&no_spec);
-        assert_eq!(prepared.flat_token_ids, vec![10, 20, 30]);
-        batch.commit_step("r1", &[99], 3, false); // normal commit with real token
-
-        // Verify decode uses token 99.
-        let prepared2 = batch.prepare_inputs(&no_spec);
-        assert_eq!(prepared2.flat_token_ids, vec![99]);
-        batch.reclaim_buffers(prepared2);
-
-        // Now simulate PP non-last stage: commit with dummy 0.
-        batch.commit_step("r1", &[0], 1, false);
-
-        // Without fix: next decode would use token 0.
-        // With fix: set_last_token overrides it.
-        batch.set_last_token("r1", 42);
-
-        let prepared3 = batch.prepare_inputs(&no_spec);
-        assert_eq!(
-            prepared3.flat_token_ids,
-            vec![42],
-            "set_last_token must override the dummy 0 from commit_step"
-        );
-        batch.reclaim_buffers(prepared3);
-    }
-
-    #[test]
-    fn test_set_last_token_multiple_requests() {
-        // Multiple requests in PP mode, each getting different real tokens.
-        let mut batch = InputBatch::new();
-        let no_spec = std::collections::HashMap::new();
-        batch.add_request("r1".into(), &[10, 20], vec![0, 1], 0);
-        batch.add_request("r2".into(), &[30, 40], vec![2, 3], 0);
-
-        let _ = batch.prepare_inputs(&no_spec);
-        batch.commit_step("r1", &[100], 2, false);
-        batch.commit_step("r2", &[200], 2, false);
-
-        // Decode step: commit with dummy 0 (PP non-last stage).
-        let p2 = batch.prepare_inputs(&no_spec);
-        batch.reclaim_buffers(p2);
-        batch.commit_step("r1", &[0], 1, false);
-        batch.commit_step("r2", &[0], 1, false);
-
-        // Override with real tokens.
-        batch.set_last_token("r1", 101);
-        batch.set_last_token("r2", 201);
-
-        let prepared = batch.prepare_inputs(&no_spec);
-        // Both requests should use their real tokens.
-        assert!(
-            prepared.flat_token_ids.contains(&101),
-            "r1 should embed token 101, got {:?}",
-            prepared.flat_token_ids
-        );
-        assert!(
-            prepared.flat_token_ids.contains(&201),
-            "r2 should embed token 201, got {:?}",
-            prepared.flat_token_ids
-        );
-        batch.reclaim_buffers(prepared);
-    }
-
-    #[test]
-    fn test_set_last_token_nonexistent_request_is_noop() {
-        let mut batch = InputBatch::new();
-        // Should not panic.
-        batch.set_last_token("nonexistent", 42);
-    }
-
-    // -----------------------------------------------------------------------
-    // Preemption / resumption tests
+    // Preemption / resumption
     //
-    // These tests directly model the invariants that the worker must maintain
-    // during KV cache preemption and resumption.  The root bug was:
-    //   add_request(req_id, all_tokens, blocks_for_scheduled_chunk)
-    // where len(all_tokens) > blocks_for_scheduled_chunk * block_size, causing
-    // seq_lens > available_blocks → slot_mapping = -1 → CUDA fault.
+    // A preempted request keeps its slot and its history and is simply not scheduled. The scheduler
+    // resumes it by scheduling it again from its `num_computed_tokens` (0, or a prefix-cache hit)
+    // with its complete new block tables; its chunk is then read from `prompt ++ generated` like any
+    // other. The root bug this family of tests grew from was a resume that packed MORE tokens than the
+    // scheduler allocated blocks for — seq_lens > blocks → slot_mapping = -1 → a GPU fault — which a
+    // step built from `num_scheduled_tokens` cannot express.
     // -----------------------------------------------------------------------
 
-    /// Helper: simulate the invariant the worker must uphold when re-adding a
-    /// resumed request.  Returns true if block coverage is sufficient.
-    fn blocks_cover_tokens(tokens: &[u32], block_ids: &[usize], block_size: usize) -> bool {
-        if tokens.is_empty() {
-            return true;
+    /// Helper: whether `block_ids` cover `num_tokens` at `block_size`.
+    fn blocks_cover(num_tokens: usize, block_ids: &[usize], block_size: usize) -> bool {
+        block_ids.len() >= num_tokens.div_ceil(block_size)
+    }
+
+    /// A request that ran, then was preempted: prefill of `prompt` then `decodes` decode steps, each
+    /// sampling `100 + i`.
+    fn ran_then_preempted(b: &mut InputBatch, id: &str, prompt: &[u32], decodes: u32) {
+        b.add_request(id.into(), prompt, vec![0, 1], 0);
+        let n = prompt.len() as u32;
+        run(b, &step(&[(id, 0, prompt.len())]), |_| vec![100]);
+        for i in 0..decodes {
+            run(b, &step(&[(id, n + i, 1)]), move |_| vec![101 + i]);
         }
-        let needed = tokens.len().div_ceil(block_size);
-        block_ids.len() >= needed
+        b.update_states(&preempting(step(&[]), &[id]));
     }
 
-    /// After preemption, remove_request leaves the batch without the request.
+    /// Preemption keeps the slot and its history, and the request does not run while preempted.
     #[test]
-    fn test_preemption_removes_from_batch() {
+    fn test_preempted_request_keeps_its_slot_and_does_not_run() {
         let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
         batch.add_request("r2".into(), &[40, 50], vec![2], 0);
-        assert_eq!(batch.num_active(), 2);
-
-        // Preempt r1.
-        batch.remove_request("r1");
-        assert_eq!(batch.num_active(), 1);
-        assert!(!batch.contains("r1"));
-        assert!(batch.contains("r2"));
-    }
-
-    /// A preempted request that is re-added as prefill must have is_prefill=true
-    /// and tokens_in_pool initialized from num_computed.
-    #[test]
-    fn test_resumed_request_is_prefill() {
-        let mut batch = InputBatch::new();
-        // r1 runs a full prefill+decode cycle.
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 3, false);
-        // r1 is now in decode mode, tokens_in_pool=3.
-        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
-
-        // Simulate preemption: remove.
-        batch.remove_request("r1");
-        assert!(!batch.contains("r1"));
-
-        // Simulate resumption: re-add as fresh prefill.
-        // Block coverage: 3 tokens need 2 blocks at block_size=2.
-        batch.add_request("r1".into(), &[10, 20, 30], vec![5, 6], 0);
+        ran_then_preempted(&mut batch, "r1", &[10, 20, 30], 1);
         assert!(batch.contains("r1"));
-        assert_eq!(batch.tokens_in_pool_for("r1"), 0); // reset to 0
+        assert_eq!(batch.history("r1").1, &[100, 101]);
 
-        // prepare_inputs should treat r1 as prefill.
-        let prepared = batch.prepare_inputs(&spec);
-        let r1_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r1")
-            .unwrap();
-        assert!(
-            prepared.attn_meta.is_prefill[r1_idx],
-            "resumed request must be scheduled as prefill"
-        );
-        assert_eq!(prepared.req_inputs[r1_idx].token_count, 3);
+        let p = batch.prepare_inputs(&step(&[("r2", 0, 2)]));
+        assert_eq!(p.attn_meta.req_ids, vec!["r2"]);
+        assert_eq!(p.attn_meta.total_tokens, 2);
     }
 
-    /// Resumption must not call commit_step on behalf of the preempted/resumed
-    /// slot — the slot should be clean (no phantom tokens_in_pool growth).
+    /// A resume re-prefills the WHOLE history — prompt and everything it had generated — from the
+    /// scheduler's cursor, onto the blocks it ships, as a prefill.
+    #[test]
+    fn test_resumed_request_re_prefills_its_history() {
+        let mut batch = InputBatch::new();
+        ran_then_preempted(&mut batch, "r1", &[10, 20, 30], 1);
+
+        let s = resumed(step(&[("r1", 0, 5)]), "r1", vec![5, 6]);
+        batch.update_states(&s);
+        assert_eq!(batch.block_table("r1"), Some(&[5, 6][..]));
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.flat_token_ids, &[10, 20, 30, 100, 101]);
+        assert_eq!(p.flat_positions, &[0, 1, 2, 3, 4]);
+        assert!(p.attn_meta.is_prefill[0]);
+        assert_eq!(p.attn_meta.tokens_before[0], 0);
+        assert!(
+            p.req_inputs[0].emits_token,
+            "the resume caught up: it samples the next token"
+        );
+    }
+
+    /// A resumed request's pool cursor is the scheduler's (0 from scratch), not what it had before.
     #[test]
     fn test_resumed_tokens_in_pool_is_zero_from_scratch() {
         let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30, 40, 50], vec![0, 1, 2], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 5, false);
-        // Decode step 1.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[100], 1, false);
-        // Decode step 2.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[101], 1, false);
+        ran_then_preempted(&mut batch, "r1", &[10, 20, 30, 40, 50], 2);
         assert_eq!(batch.tokens_in_pool_for("r1"), 7);
 
-        // Preempt.
-        batch.remove_request("r1");
-
-        // Resume from scratch (all KV evicted, num_computed=0).
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
+        let s = resumed(step(&[("r1", 0, 3)]), "r1", vec![0, 1]);
+        batch.update_states(&s);
+        let p = batch.prepare_inputs(&s);
         assert_eq!(
             batch.tokens_in_pool_for("r1"),
             0,
             "resumed-from-scratch must have tokens_in_pool=0"
         );
+        batch.reclaim_buffers(p);
+        batch.commit_step("r1", &[], 3, false);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 3, "0 + 3, not 7 + 3");
     }
 
-    /// Resume with partial prefix cache: num_computed > 0 means KV for the
-    /// first num_computed tokens is still valid.
+    /// Resume with a partial prefix cache: the KV of the first `num_computed` tokens is still valid.
     #[test]
     fn test_resumed_with_partial_prefix_cache() {
         let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30, 40], vec![0, 1], 2);
-        // tokens_in_pool = 2 (from prefix cache)
-        assert_eq!(batch.tokens_in_pool_for("r1"), 2);
+        ran_then_preempted(&mut batch, "r1", &[10, 20, 30, 40], 1);
 
-        let spec = HashMap::new();
-        let prepared = batch.prepare_inputs(&spec);
-        // Positions start at 2 (prefix cache provides tokens 0,1).
-        assert_eq!(prepared.flat_positions, &[2, 3, 4, 5]);
+        let s = resumed(step(&[("r1", 2, 4)]), "r1", vec![0, 1]);
+        batch.update_states(&s);
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.flat_token_ids, &[30, 40, 100, 101]);
+        assert_eq!(p.flat_positions, &[2, 3, 4, 5]);
+        assert_eq!(p.attn_meta.tokens_before[0], 2);
     }
 
-    /// Key invariant: blocks must cover ALL tokens passed to add_request.
-    /// block_size=16, 48 tokens need 3 blocks; providing 2 blocks is unsafe.
+    /// The resumed chunk is exactly what the scheduler scheduled — never the whole history — so the
+    /// blocks it allocated for that chunk cover it.
     #[test]
-    fn test_block_coverage_invariant() {
+    fn test_resumed_chunk_is_the_scheduled_chunk() {
         let block_size = 16;
-        // 32 tokens, 2 blocks → exactly covered.
-        let tokens_32: Vec<u32> = (0u32..32).collect();
-        let blocks_2 = vec![0, 1];
-        assert!(
-            blocks_cover_tokens(&tokens_32, &blocks_2, block_size),
-            "32 tokens with 2 blocks of size 16 should be covered"
-        );
-
-        // 33 tokens, 2 blocks → NOT covered (needs 3).
-        let tokens_33: Vec<u32> = (0u32..33).collect();
-        assert!(
-            !blocks_cover_tokens(&tokens_33, &blocks_2, block_size),
-            "33 tokens with 2 blocks of size 16 must NOT be covered"
-        );
-
-        // 33 tokens, 3 blocks → covered.
-        let blocks_3 = vec![0, 1, 2];
-        assert!(
-            blocks_cover_tokens(&tokens_33, &blocks_3, block_size),
-            "33 tokens with 3 blocks of size 16 should be covered"
-        );
-    }
-
-    /// Simulate the exact worker bug: full token_buffers passed to
-    /// add_request but blocks only cover a scheduled chunk.
-    ///
-    /// This tests the invariant that was VIOLATED before the fix:
-    ///   token_buffers = prompt(10) + output(20) = 30 tokens
-    ///   num_scheduled = 16 tokens (chunked prefill)
-    ///   new_block_ids covers 16 tokens = 1 block of size 16
-    ///
-    /// With the bug: add_request(30 tokens, 1 block) → seq_lens=30, blocks=1
-    ///   → slot_mapping=-1 for tokens 17..30 → CUDA fault
-    ///
-    /// With the fix: add_request(16 tokens, 1 block) → seq_lens=16, blocks=1 ✓
-    #[test]
-    fn test_resumed_token_truncation_to_scheduled_chunk() {
-        let block_size = 16;
-        // Simulate a request with 30 tokens total (10 prompt + 20 outputs generated
-        // before preemption).
-        let full_token_buffer: Vec<u32> = (0u32..30).collect();
-        let num_computed: u32 = 0; // all KV evicted
-        let num_scheduled: usize = 16; // only first 16 tokens scheduled this step
-        let new_block_ids = vec![0usize]; // 1 block covers 16 tokens
-
-        // THE FIX: truncate to the scheduled chunk.
-        let start = num_computed as usize;
-        let end = (start + num_scheduled).min(full_token_buffer.len());
-        let tokens_to_add = &full_token_buffer[start..end];
-
-        assert_eq!(tokens_to_add.len(), 16);
-        assert!(
-            blocks_cover_tokens(tokens_to_add, &new_block_ids, block_size),
-            "truncated tokens must be covered by allocated blocks"
-        );
-
         let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), tokens_to_add, new_block_ids, num_computed);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
-        assert_eq!(batch.block_table("r1"), Some(&[0usize][..]));
+        // 10 prompt tokens + 20 generated before preemption = a 30-token history.
+        batch.add_request("r1".into(), &(0..10).collect::<Vec<u32>>(), vec![0], 0);
+        for t in 10..30 {
+            batch.push_generated("r1", t);
+        }
+        let s = resumed(step(&[("r1", 0, 16)]), "r1", vec![0]);
+        batch.update_states(&s);
+        let p = batch.prepare_inputs(&s);
 
-        let spec = HashMap::new();
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.req_inputs[0].token_count, 16);
-        assert_eq!(prepared.attn_meta.seq_lens[0], 16); // tb(0) + tokens(16)
-    }
-
-    /// Without truncation (BUG scenario): add_request with more tokens than
-    /// blocks can hold — the seq_lens would exceed block capacity.
-    #[test]
-    fn test_full_token_buffer_exceeds_block_coverage() {
-        let block_size = 16;
-        let full_tokens: Vec<u32> = (0u32..30).collect();
-        let one_block = vec![0usize]; // covers only 16 tokens
-
-        // This is what the BUGGY code would do:
+        assert_eq!(p.req_inputs[0].token_count, 16);
+        assert_eq!(p.flat_token_ids, (0..16).collect::<Vec<u32>>());
+        assert_eq!(p.attn_meta.seq_lens[0], 16);
+        assert!(blocks_cover(
+            p.attn_meta.seq_lens[0],
+            &p.attn_meta.block_ids[0],
+            block_size
+        ));
         assert!(
-            !blocks_cover_tokens(&full_tokens, &one_block, block_size),
-            "BUG scenario: 30 tokens exceeds 1 block of 16 — would cause slot_mapping=-1"
+            !p.req_inputs[0].emits_token,
+            "a resume chunk short of the history samples nothing"
         );
     }
 
-    /// Chunked prefill resumption: first chunk is scheduled, second comes later.
-    /// Each chunk must be independently covered by its block allocation.
+    /// A resume that takes two chunks: the second starts where the first stopped, and only it emits.
     #[test]
     fn test_chunked_resumption_two_steps() {
         let block_size = 16;
-        // Full sequence: 40 tokens.
-        let full_buf: Vec<u32> = (0u32..40).collect();
-        let num_computed = 0u32;
-
-        // Step 1: schedule first 16 tokens, allocate 1 block.
-        let num_sched_1 = 16usize;
-        let blocks_1 = vec![0usize];
-        let chunk1 = &full_buf[num_computed as usize..num_computed as usize + num_sched_1];
-        assert!(blocks_cover_tokens(chunk1, &blocks_1, block_size));
-
         let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), chunk1, blocks_1, num_computed);
-        let spec = HashMap::new();
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(prepared.req_inputs[0].token_count, 16);
-        batch.commit_step("r1", &[999], 16, false);
-        // tokens_in_pool = 16 after first chunk.
+        batch.add_request("r1".into(), &(0..40).collect::<Vec<u32>>(), vec![0], 0);
+
+        let s1 = resumed(step(&[("r1", 0, 16)]), "r1", vec![0]);
+        let packed = run(&mut batch, &s1, |_| vec![999]);
+        assert_eq!(packed[0].1, (0..16).collect::<Vec<u32>>());
         assert_eq!(batch.tokens_in_pool_for("r1"), 16);
+        assert_eq!(
+            batch.token_count("r1"),
+            40,
+            "the first chunk emitted nothing"
+        );
 
-        // Step 2: resume / continue with next 24 tokens (positions 16..40).
-        // Scheduler re-adds with num_computed=16, new_block_ids for 24 more tokens (2 blocks).
-        let num_computed_2 = 16u32;
-        let num_sched_2 = 24usize;
-        let blocks_2 = vec![0usize, 1, 2]; // full 3-block set covering 48 positions (16..48)
-
-        // Truncate to the scheduled chunk.
-        let start = num_computed_2 as usize;
-        let end = (start + num_sched_2).min(full_buf.len());
-        let chunk2 = &full_buf[start..end];
-        assert_eq!(chunk2.len(), 24);
-        assert!(blocks_cover_tokens(chunk2, &blocks_2, block_size));
-
-        // Re-add as prefill for the second chunk.
-        batch.remove_request("r1");
-        batch.add_request("r1".into(), chunk2, blocks_2, num_computed_2);
-        let prepared2 = batch.prepare_inputs(&spec);
-        assert_eq!(prepared2.req_inputs[0].token_count, 24);
-        assert_eq!(prepared2.attn_meta.seq_lens[0], 16 + 24); // tb + tokens
+        let mut s2 = step(&[("r1", 16, 24)]);
+        s2.scheduled_cached_reqs.new_block_ids[0] = Some(vec![vec![0, 1, 2]]);
+        batch.update_states(&s2);
+        let p2 = batch.prepare_inputs(&s2);
+        assert_eq!(p2.flat_token_ids, (16..40).collect::<Vec<u32>>());
+        assert_eq!(p2.attn_meta.seq_lens[0], 16 + 24);
+        assert!(blocks_cover(40, &p2.attn_meta.block_ids[0], block_size));
+        assert!(p2.req_inputs[0].emits_token);
     }
 
-    /// Preempted and resumed in the same batch step: the preemption removes
-    /// the old slot and the resumption re-adds a fresh one; no phantom state.
+    /// A 1024-token history resumed as a 128-token chunk onto 8 blocks of 16.
+    #[test]
+    fn test_resumed_chunk_matches_block_capacity() {
+        let block_size = 16usize;
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &(0..1024).collect::<Vec<u32>>(), vec![0], 0);
+        let s = resumed(step(&[("r1", 0, 128)]), "r1", (0..8).collect());
+        batch.update_states(&s);
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.flat_token_ids.len(), 128);
+        assert_eq!(p.attn_meta.block_ids[0].len() * block_size, 128);
+        assert!(blocks_cover(
+            p.attn_meta.seq_lens[0],
+            &p.attn_meta.block_ids[0],
+            block_size
+        ));
+    }
+
+    /// Preempted and resumed in the same scheduler step.
     #[test]
     fn test_same_step_preemption_and_resumption() {
         let mut batch = InputBatch::new();
-        // r1 has been running for a while.
         batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 3, false);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[100], 1, false);
+        run(&mut batch, &step(&[("r1", 0, 3)]), |_| vec![99]);
+        run(&mut batch, &step(&[("r1", 3, 1)]), |_| vec![100]);
         assert_eq!(batch.tokens_in_pool_for("r1"), 4);
 
-        // Same step: preempt r1 (remove stale slot), then immediately resume.
-        batch.remove_request("r1"); // preempt
-        assert!(!batch.contains("r1"));
-
-        // Resume as prefill from scratch with fresh blocks.
-        batch.add_request("r1".into(), &[10, 20], vec![5, 6], 0); // only 2-token chunk scheduled
-        assert!(batch.contains("r1"));
-        assert_eq!(
-            batch.tokens_in_pool_for("r1"),
-            0,
-            "same-step resume must start with tokens_in_pool=0"
-        );
-
-        // prepare_inputs must treat r1 as prefill.
-        let prepared = batch.prepare_inputs(&spec);
-        let r1_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r1")
-            .unwrap();
-        assert!(prepared.attn_meta.is_prefill[r1_idx]);
-        assert_eq!(prepared.req_inputs[r1_idx].token_count, 2);
+        let s = preempting(resumed(step(&[("r1", 0, 2)]), "r1", vec![5, 6]), &["r1"]);
+        batch.update_states(&s);
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.flat_token_ids, &[10, 20]);
+        assert!(p.attn_meta.is_prefill[0]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
+        assert_eq!(batch.block_table("r1"), Some(&[5, 6][..]));
     }
 
-    /// Multiple preemptions: request preempted, resumed, preempted again,
-    /// resumed again. Invariants must hold throughout.
+    /// Preempted, resumed, preempted again, resumed again — the history carries through each cycle.
     #[test]
     fn test_multiple_preemption_cycles() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // First run.
         batch.add_request("r1".into(), &[1, 2, 3, 4], vec![0, 1], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[10], 4, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+        run(&mut batch, &step(&[("r1", 0, 4)]), |_| vec![10]);
+        batch.update_states(&preempting(step(&[]), &["r1"]));
 
-        // First preemption.
-        batch.remove_request("r1");
-
-        // First resumption: full re-prefill (only first 4 tokens scheduled).
-        batch.add_request("r1".into(), &[1, 2, 3, 4], vec![2, 3], 0);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[11], 4, false);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[12], 1, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 5);
-
-        // Second preemption.
-        batch.remove_request("r1");
-        assert!(!batch.contains("r1"));
-
-        // Second resumption: partial prefix cache, num_computed=4.
-        batch.add_request("r1".into(), &[1], vec![4, 5], 4); // 1 new token at pos 4
-        assert_eq!(
-            batch.tokens_in_pool_for("r1"),
-            4,
-            "partial cache: tokens_in_pool initialized to num_computed"
+        // First resumption: a full re-prefill of prompt ++ [10].
+        let packed = run(
+            &mut batch,
+            &resumed(step(&[("r1", 0, 5)]), "r1", vec![2, 3]),
+            |_| vec![11],
         );
+        assert_eq!(packed[0].1, vec![1, 2, 3, 4, 10]);
+        run(&mut batch, &step(&[("r1", 5, 1)]), |_| vec![12]);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 6);
+        batch.update_states(&preempting(step(&[]), &["r1"]));
 
-        let prepared = batch.prepare_inputs(&spec);
-        let r1_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r1")
-            .unwrap();
-        assert!(prepared.attn_meta.is_prefill[r1_idx]);
-        // seq_lens = tb(4) + tokens(1) = 5
-        assert_eq!(prepared.attn_meta.seq_lens[r1_idx], 5);
-        // Position of the single token = 4 (prefix cache offset).
-        assert_eq!(prepared.flat_positions, &[4]);
+        // Second resumption: partial prefix cache, num_computed=6, one token left.
+        let s = resumed(step(&[("r1", 6, 1)]), "r1", vec![4, 5]);
+        batch.update_states(&s);
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.flat_token_ids, &[12]);
+        assert_eq!(p.flat_positions, &[6]);
+        assert_eq!(p.attn_meta.seq_lens[0], 7);
     }
 
-    /// commit_step must be a no-op for a removed (preempted) request.
-    /// This guards against stale slot reuse when another request gets the
-    /// same slot index via swap-remove.
-    #[test]
-    fn test_commit_step_noop_for_removed_request() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0], 0);
-        batch.add_request("r2".into(), &[40, 50], vec![1], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 3, false);
-        batch.commit_step("r2", &[100], 2, false);
-
-        // Preempt r1.
-        batch.remove_request("r1");
-
-        // A stale commit_step for r1 should be a no-op (not corrupt r2).
-        let tip_before = batch.tokens_in_pool_for("r2");
-        batch.commit_step("r1", &[0], 99, false); // r1 no longer in batch
-        let tip_after = batch.tokens_in_pool_for("r2");
-        assert_eq!(
-            tip_before, tip_after,
-            "stale commit_step must not corrupt surviving requests"
-        );
-    }
-
-    /// Verify that block_tables are correctly initialized for a resumed request,
-    /// i.e., update_blocks followed by remove+add_request leaves the right table.
+    /// The block table a resume ships replaces whatever the request held before.
     #[test]
     fn test_resumed_block_table_overwrite() {
         let mut batch = InputBatch::new();
         batch.add_request("r1".into(), &[10, 20], vec![0, 1], 0);
-        let spec = HashMap::new();
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 2, false);
-
-        // Simulate a block extension (normal decode operation).
+        run(&mut batch, &step(&[("r1", 0, 2)]), |_| vec![99]);
         batch.update_blocks("r1", vec![0, 1, 2, 3]);
-        assert_eq!(batch.block_table("r1"), Some(&[0, 1, 2, 3][..]));
+        batch.update_states(&preempting(step(&[]), &["r1"]));
 
-        // Preempt.
-        batch.remove_request("r1");
-
-        // Resume with entirely new blocks.
-        batch.add_request("r1".into(), &[10, 20], vec![7, 8], 0);
+        batch.update_states(&resumed(step(&[("r1", 0, 3)]), "r1", vec![7, 8]));
         assert_eq!(
             batch.block_table("r1"),
             Some(&[7, 8][..]),
@@ -1728,791 +1870,242 @@ mod tests {
         );
     }
 
-    /// Seq_lens computed during prepare_inputs equals tokens_in_pool + num_tokens.
-    /// For prefill: seq_lens = num_computed + prompt_len.
-    /// This must hold for both fresh prefill and resumed prefill.
-    #[test]
-    fn test_seq_lens_formula_for_prefill() {
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // Fresh prefill: no prefix cache.
-        batch.add_request("r1".into(), &[1, 2, 3, 4, 5], vec![0, 1], 0);
-        let p = batch.prepare_inputs(&spec);
-        assert_eq!(p.attn_meta.seq_lens[0], 5, "seq_lens = 0 + 5 = 5");
-
-        // Resumed prefill: 2 tokens already cached.
-        batch.add_request("r2".into(), &[10, 20, 30], vec![2, 3], 2);
-        let p2 = batch.prepare_inputs(&spec);
-        let r2_idx = p2.req_inputs.iter().position(|r| r.req_id == "r2").unwrap();
-        assert_eq!(
-            p2.attn_meta.seq_lens[r2_idx], 5,
-            "seq_lens = 2 (cached) + 3 (tokens) = 5"
-        );
-    }
-
-    /// After resumption with num_computed=0, commit_step correctly advances
-    /// tokens_in_pool for subsequent decode steps.
+    /// After a resume, decode continues from the history's end.
     #[test]
     fn test_resumed_then_normal_decode_progression() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
+        ran_then_preempted(&mut batch, "r1", &[10, 20, 30], 0);
 
-        // Resumed as full prefill (no prefix cache, 4-token chunk, 1 block of size 4).
-        batch.add_request("r1".into(), &[10, 20, 30, 40], vec![0], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 4, false);
+        run(
+            &mut batch,
+            &resumed(step(&[("r1", 0, 4)]), "r1", vec![0]),
+            |_| vec![200],
+        );
         assert_eq!(batch.tokens_in_pool_for("r1"), 4);
-
-        // Decode step 1.
-        let p1 = batch.prepare_inputs(&spec);
-        assert!(!p1.attn_meta.is_prefill[0]);
-        assert_eq!(p1.flat_token_ids, &[99]);
-        assert_eq!(p1.flat_positions, &[4]);
-        batch.commit_step("r1", &[100], 1, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 5);
-
-        // Decode step 2.
-        let p2 = batch.prepare_inputs(&spec);
-        assert_eq!(p2.flat_token_ids, &[100]);
-        assert_eq!(p2.flat_positions, &[5]);
+        let packed = run(&mut batch, &step(&[("r1", 4, 1)]), |_| vec![201]);
+        assert_eq!(packed, vec![("r1".into(), vec![200], vec![4])]);
+        let packed = run(&mut batch, &step(&[("r1", 5, 1)]), |_| vec![202]);
+        assert_eq!(packed, vec![("r1".into(), vec![201], vec![5])]);
     }
 
-    // -----------------------------------------------------------------------
-    // Extended preemption/resumption coverage
-    // Every nuance of the worker preemption fix is covered below.
-    // -----------------------------------------------------------------------
-
-    /// Removing the LAST active request leaves an empty batch.
-    #[test]
-    fn test_preempt_last_request_leaves_empty_batch() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[1, 2], vec![0], 0);
-        batch.remove_request("r1");
-        assert_eq!(batch.num_active(), 0);
-        assert!(!batch.contains("r1"));
-    }
-
-    /// Removing the FIRST of N requests triggers swap-remove; all surviving
-    /// requests must remain slot-consistent and individually removable.
-    #[test]
-    fn test_preempt_first_of_many_slot_consistency() {
-        let mut batch = InputBatch::new();
-        for i in 0u32..5 {
-            batch.add_request(format!("r{i}"), &[i], vec![i as usize], 0);
-        }
-        // Preempt r0 (slot 0); r4 should swap into slot 0.
-        batch.remove_request("r0");
-        assert_eq!(batch.num_active(), 4);
-        // Every surviving request must still be findable and removable.
-        for i in 1u32..5 {
-            let id = format!("r{i}");
-            assert!(batch.contains(&id));
-            assert_eq!(batch.block_table(&id), Some(&[i as usize][..]));
-        }
-        // Remove them all one by one to verify no corruption.
-        for i in 1u32..5 {
-            batch.remove_request(&format!("r{i}"));
-        }
-        assert_eq!(batch.num_active(), 0);
-    }
-
-    /// Preempting a middle request: slot indices of all other requests must
-    /// remain valid (no off-by-one errors from the swap-remove).
-    #[test]
-    fn test_preempt_middle_request_slot_consistency() {
-        let mut batch = InputBatch::new();
-        batch.add_request("a".into(), &[1], vec![10], 0);
-        batch.add_request("b".into(), &[2], vec![20], 0);
-        batch.add_request("c".into(), &[3], vec![30], 0);
-        batch.add_request("d".into(), &[4], vec![40], 0);
-
-        // Preempt "b" (slot 1). "d" (last slot = 3) should fill slot 1.
-        batch.remove_request("b");
-        assert_eq!(batch.num_active(), 3);
-        assert!(!batch.contains("b"));
-        assert_eq!(batch.block_table("a"), Some(&[10][..]));
-        assert_eq!(batch.block_table("c"), Some(&[30][..]));
-        assert_eq!(batch.block_table("d"), Some(&[40][..]));
-    }
-
-    /// Re-using the same req_id after preemption must not inherit any stale
-    /// state from the previous slot (e.g., old block tables or tokens_in_pool).
-    #[test]
-    fn test_reused_req_id_no_stale_state() {
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // First run: r1 runs for a while.
-        batch.add_request("r1".into(), &[1, 2, 3], vec![0, 1], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 3, false);
-        for _ in 0..5 {
-            let _ = batch.prepare_inputs(&spec);
-            batch.commit_step("r1", &[0], 1, false);
-        }
-        assert_eq!(batch.tokens_in_pool_for("r1"), 8);
-        assert_eq!(batch.block_table("r1").unwrap().len(), 2); // blocks 0,1
-
-        // Preempt.
-        batch.remove_request("r1");
-
-        // Resume with completely different blocks and fewer tokens.
-        batch.add_request("r1".into(), &[10, 20], vec![5], 0);
-        // Must have fresh state, not the old 8 tokens in pool.
-        assert_eq!(
-            batch.tokens_in_pool_for("r1"),
-            0,
-            "reused req_id must have tokens_in_pool=0"
-        );
-        assert_eq!(
-            batch.block_table("r1"),
-            Some(&[5][..]),
-            "reused req_id must use the new block table"
-        );
-    }
-
-    /// Preemption of a request that was NEVER prefilled (just added then
-    /// immediately preempted before the first prepare_inputs) must be safe.
-    #[test]
-    fn test_preempt_before_first_prefill() {
-        let mut batch = InputBatch::new();
-        batch.add_request("r1".into(), &[1, 2, 3], vec![0], 0);
-        batch.add_request("r2".into(), &[4, 5], vec![1], 0);
-
-        // Immediately preempt r1 without calling prepare_inputs.
-        batch.remove_request("r1");
-        assert_eq!(batch.num_active(), 1);
-        assert!(batch.contains("r2"));
-    }
-
-    /// Block coverage: boundary at exactly one block full.
-    #[test]
-    fn test_block_coverage_exact_boundary() {
-        let block_size = 16;
-        let tokens: Vec<u32> = (0..16).collect();
-        let blocks = vec![0usize];
-        assert!(
-            blocks_cover_tokens(&tokens, &blocks, block_size),
-            "16 tokens, 1 block of 16: exactly covered"
-        );
-    }
-
-    /// Block coverage: one token over the boundary requires an extra block.
-    #[test]
-    fn test_block_coverage_one_over_boundary() {
-        let block_size = 16;
-        let tokens: Vec<u32> = (0..17).collect();
-        let one_block = vec![0usize];
-        let two_blocks = vec![0usize, 1];
-
-        assert!(
-            !blocks_cover_tokens(&tokens, &one_block, block_size),
-            "17 tokens with 1 block should NOT be covered"
-        );
-        assert!(
-            blocks_cover_tokens(&tokens, &two_blocks, block_size),
-            "17 tokens with 2 blocks should be covered"
-        );
-    }
-
-    /// block_size=1 edge case: each token needs its own block.
-    #[test]
-    fn test_block_coverage_block_size_one() {
-        let block_size = 1;
-        let tokens: Vec<u32> = (0..5).collect();
-        let five_blocks: Vec<usize> = (0..5).collect();
-        let four_blocks: Vec<usize> = (0..4).collect();
-
-        assert!(blocks_cover_tokens(&tokens, &five_blocks, block_size));
-        assert!(!blocks_cover_tokens(&tokens, &four_blocks, block_size));
-    }
-
-    /// Empty token slice: always covered regardless of block count.
-    #[test]
-    fn test_block_coverage_empty_tokens() {
-        let block_size = 16;
-        let empty: Vec<u32> = vec![];
-        let no_blocks: Vec<usize> = vec![];
-        assert!(
-            blocks_cover_tokens(&empty, &no_blocks, block_size),
-            "empty token slice with no blocks should be covered"
-        );
-    }
-
-    /// The resumed chunk's slice must correctly start at num_computed.
-    /// If prefix cache provides 8 tokens, the chunk starts at index 8.
-    #[test]
-    fn test_chunk_slice_starts_at_num_computed() {
-        let full_buf: Vec<u32> = (100..120).collect(); // 20 tokens
-        let num_computed = 8u32;
-        let num_scheduled = 6usize;
-
-        let start = num_computed as usize;
-        let end = (start + num_scheduled).min(full_buf.len());
-        let chunk = &full_buf[start..end];
-
-        assert_eq!(chunk.len(), 6);
-        // Tokens 108..114 (0-indexed into 100..120 → values 108..114).
-        assert_eq!(chunk[0], 108);
-        assert_eq!(chunk[5], 113);
-    }
-
-    /// When num_computed + num_scheduled > len(full_buf), the chunk must be
-    /// clamped to the end of the buffer (no out-of-bounds panic).
-    #[test]
-    fn test_chunk_clamp_at_buffer_end() {
-        let full_buf: Vec<u32> = (0..10).collect();
-        let num_computed = 7u32;
-        let num_scheduled = 10usize; // would go to index 17 without clamping
-
-        let start = num_computed as usize;
-        let end = (start + num_scheduled).min(full_buf.len());
-        let chunk = &full_buf[start..end];
-
-        assert_eq!(chunk.len(), 3); // only 3 tokens remain (indices 7, 8, 9)
-        assert_eq!(chunk, &[7u32, 8, 9]);
-    }
-
-    /// Resumption chunk size must exactly match block capacity.
-    /// This is the key invariant that prevents slot_mapping=-1.
-    #[test]
-    fn test_resumed_chunk_matches_block_capacity() {
-        // Simulate a long request preempted after 1024 tokens.
-        // Scheduler re-schedules with 128-token chunk, allocates 8 blocks of 16.
-        let block_size = 16usize;
-        let full_buf: Vec<u32> = (0..1024).collect();
-        let num_computed = 0u32;
-        let num_scheduled = 128usize;
-        let new_block_ids: Vec<usize> = (0..8).collect(); // 8 blocks × 16 = 128 capacity
-
-        let start = num_computed as usize;
-        let end = (start + num_scheduled).min(full_buf.len());
-        let chunk = &full_buf[start..end];
-
-        assert_eq!(chunk.len(), 128);
-        assert_eq!(new_block_ids.len() * block_size, 128);
-        assert!(blocks_cover_tokens(chunk, &new_block_ids, block_size));
-    }
-
-    /// Simulate a realistic 3-request mixed batch:
-    ///   r1 = normal decode (never preempted)
-    ///   r2 = preempted last step, resumed this step as prefill
-    ///   r3 = brand new request
-    ///
-    /// All three must coexist correctly in prepare_inputs.
+    /// A decode, a resume and a brand-new request in one step.
     #[test]
     fn test_mixed_batch_with_preempted_and_new() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // r1: running decode.
         batch.add_request("r1".into(), &[10, 20], vec![0], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 2, false);
-        // r1 is now decode.
-
-        // r2: was running, preempted, re-admitted this step.
+        run(&mut batch, &step(&[("r1", 0, 2)]), |_| vec![99]);
         batch.add_request("r2".into(), &[30, 40, 50], vec![1, 2], 0);
-        let _ = batch.prepare_inputs(&spec); // r2 is prefill
-        batch.commit_step("r2", &[100], 3, false);
-        // r2 is now decode.
-        batch.remove_request("r2"); // preempted
+        run(&mut batch, &step(&[("r2", 0, 3)]), |_| vec![100]);
+        batch.update_states(&preempting(step(&[]), &["r2"]));
 
-        // r3: brand new.
-        batch.add_request("r3".into(), &[60, 70], vec![3], 0);
-
-        // r2 resumed as prefill (only 2 tokens scheduled, 1 block).
-        batch.add_request("r2".into(), &[30, 40], vec![4], 0);
-
-        assert_eq!(batch.num_active(), 3); // r1 (decode), r2 (prefill), r3 (prefill)
-
-        let prepared = batch.prepare_inputs(&spec);
+        let s = admitting(
+            resumed(step(&[("r1", 2, 1), ("r2", 0, 2)]), "r2", vec![4]),
+            "r3",
+            &[60, 70],
+            vec![3],
+            0,
+            2,
+        );
+        batch.update_states(&s);
+        assert_eq!(batch.num_active(), 3);
+        let prepared = batch.prepare_inputs(&s);
         assert_eq!(prepared.attn_meta.num_reqs, 3);
 
-        let r1_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r1")
-            .unwrap();
-        let r2_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r2")
-            .unwrap();
-        let r3_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r3")
-            .unwrap();
-
-        assert!(!prepared.attn_meta.is_prefill[r1_idx], "r1 must be decode");
-        assert!(prepared.attn_meta.is_prefill[r2_idx], "r2 must be prefill");
-        assert!(prepared.attn_meta.is_prefill[r3_idx], "r3 must be prefill");
-
-        assert_eq!(prepared.req_inputs[r1_idx].token_count, 1);
-        assert_eq!(prepared.req_inputs[r2_idx].token_count, 2);
-        assert_eq!(prepared.req_inputs[r3_idx].token_count, 2);
-
-        // r1 decode: seq_lens = tokens_in_pool(2) + 1 = 3.
-        assert_eq!(prepared.attn_meta.seq_lens[r1_idx], 3);
-        // r2 prefill (fresh): seq_lens = 0 + 2 = 2.
-        assert_eq!(prepared.attn_meta.seq_lens[r2_idx], 2);
-        // r3 prefill (fresh): seq_lens = 0 + 2 = 2.
-        assert_eq!(prepared.attn_meta.seq_lens[r3_idx], 2);
-    }
-
-    /// update_blocks for a resumed request must happen BEFORE remove+add_request,
-    /// and the final block table must come from add_request, not update_blocks.
-    ///
-    /// This tests that the worker pattern:
-    ///   1. update_blocks(req_id, new_block_ids)  ← from cached-reqs loop
-    ///   2. remove_request(req_id)               ← preemption fixup
-    ///   3. add_request(req_id, tokens, new_block_ids, num_computed) ← resumption
-    ///
-    /// leaves the correct final state.
-    #[test]
-    fn test_update_blocks_then_readd_final_state() {
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        batch.add_request("r1".into(), &[1, 2, 3], vec![0, 1], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 3, false);
-        // r1 is decode, block_table = [0, 1].
-
-        // Step 1: update_blocks with new allocation (as if scheduler gave new blocks).
-        batch.update_blocks("r1", vec![10, 11, 12]);
-        assert_eq!(batch.block_table("r1"), Some(&[10, 11, 12][..]));
-
-        // Step 2: preempt.
-        batch.remove_request("r1");
-
-        // Step 3: re-add with final resumption blocks.
-        batch.add_request("r1".into(), &[1, 2], vec![20, 21], 0);
-
-        // Final state: add_request blocks win.
-        assert_eq!(
-            batch.block_table("r1"),
-            Some(&[20, 21][..]),
-            "final block table must be from add_request, not the intermediate update_blocks"
+        let (r1, r2, r3) = (
+            row(&prepared, "r1"),
+            row(&prepared, "r2"),
+            row(&prepared, "r3"),
         );
-        assert_eq!(
-            batch.tokens_in_pool_for("r1"),
-            0,
-            "re-added request must have tokens_in_pool=0"
+        assert!(!prepared.attn_meta.is_prefill[r1], "r1 must be decode");
+        assert!(prepared.attn_meta.is_prefill[r2], "r2 must be prefill");
+        assert!(prepared.attn_meta.is_prefill[r3], "r3 must be prefill");
+        assert_eq!(prepared.req_inputs[r1].token_count, 1);
+        assert_eq!(prepared.req_inputs[r2].token_count, 2);
+        assert_eq!(prepared.req_inputs[r3].token_count, 2);
+        assert_eq!(prepared.attn_meta.seq_lens[r1], 3);
+        assert_eq!(prepared.attn_meta.seq_lens[r2], 2);
+        assert_eq!(prepared.attn_meta.seq_lens[r3], 2);
+        assert!(
+            !prepared.req_inputs[r2].emits_token,
+            "r2 resumed 2 of its 4 tokens"
         );
     }
 
-    /// commit_step called for a resumed (prefill) slot must update tokens_in_pool
-    /// to exactly num_computed + input_token_count (no residual from previous decode).
-    #[test]
-    fn test_commit_after_resumption_correct_tokens_in_pool() {
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // Long initial run.
-        batch.add_request("r1".into(), &[1, 2, 3, 4, 5, 6, 7, 8], vec![0, 1, 2, 3], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 8, false);
-        for _ in 0..10 {
-            let _ = batch.prepare_inputs(&spec);
-            batch.commit_step("r1", &[0], 1, false);
-        }
-        assert_eq!(batch.tokens_in_pool_for("r1"), 18); // 8 + 10
-
-        // Preempt, then resume with 4-token chunk.
-        batch.remove_request("r1");
-        batch.add_request("r1".into(), &[1, 2, 3, 4], vec![0, 1], 0);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
-
-        // Commit the prefill step.
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[88], 4, false);
-        assert_eq!(
-            batch.tokens_in_pool_for("r1"),
-            4,
-            "after prefill commit: tokens_in_pool = 0 + 4 = 4 (not 18+4)"
-        );
-    }
-
-    /// Verify positions emitted during resumed prefill.
-    /// With num_computed=0: positions are 0,1,2,...,N-1.
-    /// With num_computed=K: positions are K, K+1, ..., K+N-1.
+    /// Positions of a resumed prefill start at the scheduler's cursor.
     #[test]
     fn test_resumed_prefill_positions() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // Fresh resumption (no prefix cache).
-        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
-        let p = batch.prepare_inputs(&spec);
+        batch.add_request("r1".into(), &[10, 20, 30, 40, 50, 60, 70], vec![0, 1], 0);
+        let p = batch.prepare_inputs(&resumed(step(&[("r1", 0, 3)]), "r1", vec![0, 1]));
         assert_eq!(p.flat_positions, &[0, 1, 2]);
         batch.reclaim_buffers(p);
 
-        // Resumption with prefix cache (4 tokens pre-computed).
-        batch.remove_request("r1");
-        batch.add_request("r1".into(), &[40, 50, 60], vec![0, 1], 4);
-        let p2 = batch.prepare_inputs(&spec);
+        let p2 = batch.prepare_inputs(&resumed(step(&[("r1", 4, 3)]), "r1", vec![0, 1]));
         assert_eq!(
             p2.flat_positions,
             &[4, 5, 6],
             "resumed with num_computed=4: positions must be 4,5,6"
         );
+        assert_eq!(p2.flat_token_ids, &[50, 60, 70]);
     }
 
-    /// query_start_loc invariants must hold in a batch containing a resumed
-    /// (multi-token prefill) request alongside a normal decode request.
+    /// query_start_loc invariants with a resumed multi-token prefill beside a decode.
     #[test]
     fn test_query_start_loc_with_resumed_prefill() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // r1 in decode.
         batch.add_request("r1".into(), &[1, 2], vec![0], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 2, false);
-
-        // r2 resumed as 5-token prefill.
+        run(&mut batch, &step(&[("r1", 0, 2)]), |_| vec![99]);
         batch.add_request("r2".into(), &[10, 20, 30, 40, 50], vec![1, 2, 3], 0);
 
-        let prepared = batch.prepare_inputs(&spec);
+        let prepared = batch.prepare_inputs(&resumed(
+            step(&[("r1", 2, 1), ("r2", 0, 5)]),
+            "r2",
+            vec![1, 2, 3],
+        ));
         let meta = &prepared.attn_meta;
-
-        // query_start_loc must have num_reqs + 1 entries.
         assert_eq!(meta.query_start_loc.len(), meta.num_reqs + 1);
-        // Last entry = total_tokens.
         assert_eq!(*meta.query_start_loc.last().unwrap(), meta.total_tokens);
-        // Each span matches q_lens.
         for i in 0..meta.num_reqs {
             assert_eq!(
                 meta.query_start_loc[i + 1] - meta.query_start_loc[i],
                 meta.q_lens[i]
             );
         }
-        // Total = 1 (decode r1) + 5 (prefill r2) = 6.
         assert_eq!(meta.total_tokens, 6);
     }
 
-    /// Preempting ALL requests simultaneously leaves an empty, consistent batch.
+    /// Every request preempted at once: nothing runs; every one resumes as a prefill.
     #[test]
     fn test_preempt_all_requests_simultaneously() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
+        let ids: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
+        for (i, id) in ids.iter().enumerate() {
+            batch.add_request(id.clone(), &[i as u32, i as u32 + 1], vec![i], 0);
+        }
+        let all: Vec<(&str, u32, usize)> = ids.iter().map(|id| (id.as_str(), 0, 2)).collect();
+        run(&mut batch, &step(&all), |_| vec![100]);
 
-        for i in 0u32..6 {
-            batch.add_request(format!("r{i}"), &[i, i + 1], vec![i as usize], 0);
-        }
-        let _ = batch.prepare_inputs(&spec);
-        for i in 0u32..6 {
-            batch.commit_step(&format!("r{i}"), &[100 + i], 2, false);
-        }
-
-        // Preempt all.
-        for i in 0u32..6 {
-            batch.remove_request(&format!("r{i}"));
-        }
-        assert_eq!(batch.num_active(), 0);
-
-        // Re-admit all as fresh prefills.
-        for i in 0u32..6 {
-            batch.add_request(
-                format!("r{i}"),
-                &[i, i + 1],
-                vec![10 + i as usize, 20 + i as usize],
-                0,
-            );
-        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let s = preempting(step(&[]), &refs);
+        batch.update_states(&s);
         assert_eq!(batch.num_active(), 6);
+        let p = batch.prepare_inputs(&s);
+        assert_eq!(p.attn_meta.num_reqs, 0);
+        assert_eq!(p.attn_meta.total_tokens, 0);
+        batch.reclaim_buffers(p);
 
-        let prepared = batch.prepare_inputs(&spec);
-        // All 6 requests must be prefill.
-        assert!(
-            prepared.attn_meta.is_prefill.iter().all(|&p| p),
-            "all re-added requests must be prefill"
-        );
+        let resume: Vec<(&str, u32, usize)> = ids.iter().map(|id| (id.as_str(), 0, 3)).collect();
+        let mut s = step(&resume);
+        for (i, id) in ids.iter().enumerate() {
+            s = resumed(s, id, vec![10 + i, 20 + i]);
+        }
+        batch.update_states(&s);
+        let prepared = batch.prepare_inputs(&s);
+        assert!(prepared.attn_meta.is_prefill.iter().all(|&p| p));
+        assert!(prepared.req_inputs.iter().all(|r| r.emits_token));
+        assert_eq!(prepared.attn_meta.total_tokens, 18);
     }
 
-    /// Stress: 10 preemption+resumption cycles on the same request. After each
-    /// cycle, tokens_in_pool and block_table must reflect the fresh state only.
+    /// 10 preempt/resume cycles: each resume re-prefills the grown history onto fresh blocks.
     #[test]
     fn test_many_preemption_cycles_stress() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
         let prompt: Vec<u32> = (1..=8).collect();
+        batch.add_request("r1".into(), &prompt, vec![0, 1], 0);
+        run(&mut batch, &step(&[("r1", 0, 8)]), |_| vec![99]);
 
         for cycle in 0u32..10 {
+            batch.update_states(&preempting(step(&[]), &["r1"]));
+            let history = batch.token_count("r1");
             let blocks: Vec<usize> = vec![cycle as usize * 2, cycle as usize * 2 + 1];
-            batch.add_request("r1".into(), &prompt, blocks.clone(), 0);
-            assert_eq!(
-                batch.tokens_in_pool_for("r1"),
-                0,
-                "cycle {cycle}: tokens_in_pool must be 0 on fresh add"
-            );
-            assert_eq!(
-                batch.block_table("r1").unwrap(),
-                blocks.as_slice(),
-                "cycle {cycle}: block table must match fresh allocation"
-            );
-
-            // Prefill + decode.
-            let _ = batch.prepare_inputs(&spec);
-            batch.commit_step("r1", &[99 + cycle], 8, false);
-            let _ = batch.prepare_inputs(&spec);
-            batch.commit_step("r1", &[100 + cycle], 1, false);
-            assert_eq!(batch.tokens_in_pool_for("r1"), 9);
-
-            // Preempt.
-            batch.remove_request("r1");
+            let s = resumed(step(&[("r1", 0, history)]), "r1", blocks.clone());
+            batch.update_states(&s);
+            assert_eq!(batch.block_table("r1").unwrap(), blocks.as_slice());
+            let p = batch.prepare_inputs(&s);
+            assert_eq!(batch.tokens_in_pool_for("r1"), 0, "cycle {cycle}");
+            assert_eq!(p.flat_token_ids.len(), history, "cycle {cycle}");
+            assert_eq!(p.flat_token_ids[..8], prompt[..], "cycle {cycle}");
+            assert!(p.req_inputs[0].emits_token);
+            batch.reclaim_buffers(p);
+            batch.commit_step("r1", &[200 + cycle], history, false);
+            assert_eq!(batch.tokens_in_pool_for("r1"), history);
         }
-        assert_eq!(batch.num_active(), 0);
+        assert_eq!(batch.token_count("r1"), 8 + 1 + 10);
     }
 
-    /// The resumption chunk for a request that was mid-second-prefill chunk
-    /// (num_computed > 0) must use the right slice: buf[num_computed..num_computed+num_scheduled].
-    #[test]
-    fn test_chunked_prefill_second_chunk_slice() {
-        // Full buffer: prompt tokens [0..64].
-        let full_buf: Vec<u32> = (0..64).collect();
-
-        // First chunk: tokens 0..32, num_computed=0, num_scheduled=32.
-        let chunk1 = &full_buf[0..32];
-        assert_eq!(chunk1.len(), 32);
-
-        // Second chunk: tokens 32..64, num_computed=32, num_scheduled=32.
-        let num_computed_2 = 32u32;
-        let num_scheduled_2 = 32usize;
-        let start = num_computed_2 as usize;
-        let end = (start + num_scheduled_2).min(full_buf.len());
-        let chunk2 = &full_buf[start..end];
-
-        assert_eq!(chunk2.len(), 32);
-        assert_eq!(chunk2[0], 32, "second chunk must start at token index 32");
-        assert_eq!(chunk2[31], 63, "second chunk must end at token index 63");
-
-        // Verify block coverage for the second chunk (2 blocks of size 16 = 32).
-        let block_size = 16;
-        let blocks: Vec<usize> = (2..4).collect(); // blocks 2 and 3 for second chunk
-        assert!(blocks_cover_tokens(chunk2, &blocks, block_size));
-    }
-
-    /// `tokens_before` in attn_meta must equal `tokens_in_pool` for all slots.
-    /// For a resumed prefill with num_computed=0, tokens_before must be 0.
-    /// For a resumed prefill with num_computed=K, tokens_before must be K.
+    /// A resumed prefill's tokens_before is the scheduler's cursor: 0 from scratch, K with a hit.
     #[test]
     fn test_tokens_before_for_resumed_prefill() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // r1: resumed from scratch.
         batch.add_request("r1".into(), &[1, 2, 3], vec![0, 1], 0);
-        // r2: resumed with partial prefix cache (6 tokens precomputed).
-        batch.add_request("r2".into(), &[4, 5, 6, 7], vec![2, 3, 4], 6);
-
-        let prepared = batch.prepare_inputs(&spec);
-        let r1_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r1")
-            .unwrap();
-        let r2_idx = prepared
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r2")
-            .unwrap();
-
-        assert_eq!(
-            prepared.attn_meta.tokens_before[r1_idx], 0,
-            "r1 resumed from scratch: tokens_before must be 0"
+        batch.add_request(
+            "r2".into(),
+            &(0..10).collect::<Vec<u32>>(),
+            vec![2, 3, 4],
+            0,
         );
-        assert_eq!(
-            prepared.attn_meta.tokens_before[r2_idx], 6,
-            "r2 with prefix cache: tokens_before must be 6"
+
+        let s = resumed(
+            resumed(step(&[("r1", 0, 3), ("r2", 6, 4)]), "r1", vec![0, 1]),
+            "r2",
+            vec![2, 3, 4],
         );
+        let prepared = batch.prepare_inputs(&s);
+        assert_eq!(prepared.attn_meta.tokens_before[row(&prepared, "r1")], 0);
+        assert_eq!(prepared.attn_meta.tokens_before[row(&prepared, "r2")], 6);
     }
 
-    /// `seq_lens[i]` = `tokens_before[i]` + `q_lens[i]` for all requests.
-    /// This must hold for mixed batches with preempted/resumed/new/decode requests.
-    #[test]
-    fn test_seq_lens_equals_tokens_before_plus_q_lens() {
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // r1: decode (2 tokens in pool).
-        batch.add_request("r1".into(), &[1, 2], vec![0], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 2, false);
-
-        // r2: resumed prefill, no prefix cache.
-        batch.add_request("r2".into(), &[10, 20, 30], vec![1, 2], 0);
-
-        // r3: resumed prefill, 4 tokens cached.
-        batch.add_request("r3".into(), &[40, 50], vec![3, 4], 4);
-
-        let prepared = batch.prepare_inputs(&spec);
-        let meta = &prepared.attn_meta;
-        for i in 0..meta.num_reqs {
-            assert_eq!(
-                meta.seq_lens[i],
-                meta.tokens_before[i] + meta.q_lens[i],
-                "req {i}: seq_lens must equal tokens_before + q_lens"
-            );
-        }
-    }
-
-    /// After preempting a request that had a PENDING spec-decode commit
-    /// (was_spec_decode=true), removing it must not affect other requests.
+    /// Preempting a request with speculative-decode history leaves the others untouched.
     #[test]
     fn test_preempt_request_with_spec_decode_history() {
         let mut batch = InputBatch::new();
-        let spec_map = HashMap::new();
-
-        // r1 and r2 both run.
         batch.add_request("r1".into(), &[1, 2], vec![0], 0);
         batch.add_request("r2".into(), &[3, 4], vec![1], 0);
-        let _ = batch.prepare_inputs(&spec_map);
-        batch.commit_step("r1", &[10], 2, false);
-        batch.commit_step("r2", &[20], 2, false);
-
-        // r1 runs speculative decode: 2 drafts accepted + 1 bonus = 3 tokens.
-        let _ = batch.prepare_inputs(&spec_map);
-        batch.commit_step("r1", &[11, 12, 13], 3, true);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 5); // 2 + 3
-
-        // r2 normal decode.
-        let _ = batch.prepare_inputs(&spec_map);
-        batch.commit_step("r2", &[21], 1, false);
+        run(&mut batch, &step(&[("r1", 0, 2), ("r2", 0, 2)]), |id| {
+            vec![if id == "r1" { 10 } else { 20 }]
+        });
+        run(
+            &mut batch,
+            &drafted(step(&[("r1", 2, 3)]), "r1", &[11, 12]),
+            |_| vec![11, 12, 13],
+        );
+        assert_eq!(batch.tokens_in_pool_for("r1"), 5);
+        run(&mut batch, &step(&[("r2", 2, 1)]), |_| vec![21]);
         assert_eq!(batch.tokens_in_pool_for("r2"), 3);
 
-        // Preempt r1 (the one with spec-decode history).
-        batch.remove_request("r1");
-        assert!(!batch.contains("r1"));
-        assert_eq!(batch.num_active(), 1);
-
-        // r2 must be unaffected.
+        batch.update_states(&preempting(step(&[]), &["r1"]));
         assert_eq!(batch.tokens_in_pool_for("r2"), 3);
-        let prepared = batch.prepare_inputs(&spec_map);
-        assert_eq!(prepared.req_inputs[0].req_id, "r2");
+        let prepared = batch.prepare_inputs(&step(&[("r2", 3, 1)]));
+        assert_eq!(prepared.attn_meta.req_ids, vec!["r2"]);
+        assert_eq!(prepared.flat_token_ids, &[21]);
         assert!(!prepared.attn_meta.is_prefill[0]);
     }
 
-    /// Verify that after N decode steps, preemption + resumption with a
-    /// single-token chunk correctly computes seq_lens as 0 + 1 = 1.
+    /// A resume as a single-token chunk: seq_lens = 0 + 1.
     #[test]
     fn test_resumed_single_token_chunk() {
         let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // r1: long sequence, 100 decode steps.
-        batch.add_request("r1".into(), &[1, 2, 3, 4, 5], vec![0, 1, 2], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 5, false);
-        for i in 0..100 {
-            let _ = batch.prepare_inputs(&spec);
-            batch.commit_step("r1", &[100 + i], 1, false);
-        }
+        ran_then_preempted(&mut batch, "r1", &[1, 2, 3, 4, 5], 100);
         assert_eq!(batch.tokens_in_pool_for("r1"), 105);
 
-        // Preempt, resume with single-token chunk (extreme chunked prefill).
-        batch.remove_request("r1");
-        batch.add_request("r1".into(), &[1], vec![0], 0); // 1 token, 1 block
-        assert_eq!(batch.tokens_in_pool_for("r1"), 0);
-
-        let prepared = batch.prepare_inputs(&spec);
-        assert_eq!(
-            prepared.attn_meta.seq_lens[0], 1,
-            "single-token resumed prefill: seq_lens must be 1"
-        );
-        assert!(prepared.attn_meta.is_prefill[0]);
+        let p = batch.prepare_inputs(&resumed(step(&[("r1", 0, 1)]), "r1", vec![0]));
+        assert_eq!(p.attn_meta.seq_lens[0], 1);
+        assert_eq!(p.flat_token_ids, &[1]);
+        assert!(p.attn_meta.is_prefill[0]);
+        assert!(!p.req_inputs[0].emits_token);
     }
 
-    // -----------------------------------------------------------------------
-    // set_prefill_continuation — running multi-chunk prefill
-    // -----------------------------------------------------------------------
-
-    /// Verify that set_prefill_continuation re-arms a decode slot for prefill.
-    /// Simulates a running request whose prompt spans two scheduler chunks.
+    /// Block coverage: boundary at exactly one block full, one over, block_size 1, empty.
     #[test]
-    fn test_set_prefill_continuation_basic() {
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // Chunk 1: tokens 0..5 of a 10-token prompt.
-        batch.add_request("r1".into(), &[0, 1, 2, 3, 4], vec![0], 0);
-        let p1 = batch.prepare_inputs(&spec);
-        assert_eq!(p1.req_inputs[0].token_count, 5);
-        assert!(p1.attn_meta.is_prefill[0]);
-        batch.commit_step("r1", &[99], 5, false);
-        assert_eq!(batch.tokens_in_pool_for("r1"), 5);
-
-        // After commit, slot is in decode mode.
-        let p_dec = batch.prepare_inputs(&spec);
-        assert!(!p_dec.attn_meta.is_prefill[0]);
-        assert_eq!(p_dec.attn_meta.q_lens[0], 1); // decode: 1 token
-
-        // Scheduler sends chunk 2: tokens 5..10.
-        batch.set_prefill_continuation("r1", vec![5, 6, 7, 8, 9], 5);
-
-        // Now prepare_inputs must emit the full 5-token chunk as prefill.
-        let p2 = batch.prepare_inputs(&spec);
-        assert!(
-            p2.attn_meta.is_prefill[0],
-            "must be prefill after continuation"
-        );
-        assert_eq!(p2.req_inputs[0].token_count, 5);
-        assert_eq!(p2.attn_meta.seq_lens[0], 5 + 5); // tokens_in_pool + chunk
-        // Positions: 5, 6, 7, 8, 9.
-        assert_eq!(p2.attn_meta.query_start_loc[0], 0);
-    }
-
-    /// Verify tokens_in_pool, positions, and seq_lens after two-chunk prefill
-    /// followed by a decode step.
-    #[test]
-    fn test_set_prefill_continuation_then_decode() {
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // Chunk 1: tokens 0..4.
-        batch.add_request("r1".into(), &[10, 20, 30, 40], vec![0], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[50], 4, false); // tokens_in_pool = 4
-
-        // Chunk 2: tokens 4..8.
-        batch.set_prefill_continuation("r1", vec![50, 60, 70, 80], 4);
-        let p2 = batch.prepare_inputs(&spec);
-        assert_eq!(p2.req_inputs[0].token_count, 4);
-        assert_eq!(p2.attn_meta.seq_lens[0], 8);
-        batch.commit_step("r1", &[90], 4, false); // tokens_in_pool = 8
-
-        // Now in decode mode — emit one token at position 8.
-        let pd = batch.prepare_inputs(&spec);
-        assert!(!pd.attn_meta.is_prefill[0]);
-        assert_eq!(pd.attn_meta.q_lens[0], 1);
-        assert_eq!(pd.attn_meta.seq_lens[0], 9); // tokens_in_pool + 1
-    }
-
-    /// Verify slot_mapping validity invariant: seq_lens ≤ blocks * block_size.
-    #[test]
-    fn test_set_prefill_continuation_slot_mapping_invariant() {
-        let block_size = 4usize;
-        let mut batch = InputBatch::new();
-        let spec = HashMap::new();
-
-        // 2 blocks, 8 token capacity.  Chunk 1: tokens 0..4 (1 block).
-        batch.add_request("r1".into(), &[0, 1, 2, 3], vec![0], 0);
-        let _ = batch.prepare_inputs(&spec);
-        batch.commit_step("r1", &[99], 4, false);
-
-        // Chunk 2: tokens 4..8 (block 1 appended).
-        batch.update_blocks("r1", vec![0, 1]);
-        batch.set_prefill_continuation("r1", vec![4, 5, 6, 7], 4);
-        let p2 = batch.prepare_inputs(&spec);
-        // seq_lens = 4 + 4 = 8.  Blocks cover 8 tokens.  No -1 slot.
-        assert_eq!(p2.attn_meta.seq_lens[0], 8);
-        assert!(
-            p2.attn_meta.seq_lens[0] <= p2.attn_meta.block_ids[0].len() * block_size,
-            "seq_lens must not exceed block capacity"
-        );
+    fn test_block_coverage_boundaries() {
+        assert!(blocks_cover(32, &[0, 1], 16));
+        assert!(!blocks_cover(33, &[0, 1], 16));
+        assert!(blocks_cover(33, &[0, 1, 2], 16));
+        assert!(blocks_cover(16, &[0], 16));
+        assert!(!blocks_cover(17, &[0], 16));
+        assert!(blocks_cover(5, &[0, 1, 2, 3, 4], 1));
+        assert!(!blocks_cover(5, &[0, 1, 2, 3], 1));
+        assert!(blocks_cover(0, &[], 16));
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -2522,7 +2115,7 @@ mod tests {
     /// EVERY PER-SLOT VEC HOLDS THE SAME NUMBER OF SLOTS, through any sequence of adds and removes.
     ///
     /// This is the law `per_slot_fields!` exists to make unbreakable: a slot is one element in each of
-    /// eleven parallel vecs, so "slot `i` describes request `i`" is only true while all eleven have the
+    /// six parallel vecs, so "slot `i` describes request `i`" is only true while all six have the
     /// same length. With push/swap/pop generated from one field list an inequality is no longer
     /// expressible through the API — this is what notices if someone hand-edits one vec anyway.
     #[test]
@@ -2541,10 +2134,12 @@ mod tests {
             b.add_request(format!("r{i}"), &[i as u32], vec![i], 0);
         }
         check(&b, 5, "after 5 adds");
+        b.add_request("r2".into(), &[9], vec![9], 0); // re-admission replaces, never duplicates
+        check(&b, 5, "after re-admitting an id");
         b.remove_request("r0"); // swap-remove from the FRONT: exercises the swap, not just the pop
         check(&b, 4, "after removing the first slot");
-        b.remove_request("r4"); // the request that was swapped into slot 0
-        check(&b, 3, "after removing the swapped-in request");
+        b.remove_request("r4");
+        check(&b, 3, "after removing another");
         b.remove_request("nonexistent"); // must not resize anything
         check(&b, 3, "after removing a request that was never added");
         for id in ["r1", "r2", "r3"] {
@@ -2554,18 +2149,15 @@ mod tests {
     }
 
     /// `prompt ++ generated` is ONE sequence and `token_at` is the only place that knows the boundary.
-    /// Every earlier defect on the spyre path was a slot and a token sharing an integer; this is the
-    /// same shape one level up, so the arithmetic lives in exactly one function.
     #[test]
     fn token_at_reads_across_the_prompt_generated_boundary() {
         let mut b = InputBatch::new();
-        b.add_request("r".into(), &[], vec![0], 0);
-        b.set_prompt("r", &[10, 11, 12]);
+        b.add_request("r".into(), &[10, 11, 12], vec![0], 0);
         assert_eq!(b.prompt_len("r"), 3);
         assert_eq!(b.token_count("r"), 3);
 
         b.push_generated("r", 90);
-        b.push_generated("r", 91);
+        b.commit_step("r", &[91], 1, false);
         assert_eq!(b.token_count("r"), 5, "generation extends the sequence");
         assert_eq!(
             b.prompt_len("r"),
@@ -2579,20 +2171,36 @@ mod tests {
             vec![Some(10), Some(11), Some(12), Some(90), Some(91), None],
             "positions 0..5 read straight through the boundary; 5 does not exist"
         );
+        assert_eq!(b.history("r"), (&[10u32, 11, 12][..], &[90u32, 91][..]));
     }
 
-    /// A prompt stated twice REPLACES; it does not append. Admission happens once, but a store whose
-    /// setter appends would turn a retry into a doubled prompt — the same hazard `update_blocks`
-    /// documents for block tables.
+    /// A step reads its chunk through the same boundary: a chunk straddling it takes the prompt's
+    /// tail and the generated head.
     #[test]
-    fn set_prompt_replaces() {
+    fn a_chunk_reads_across_the_prompt_generated_boundary() {
         let mut b = InputBatch::new();
-        b.add_request("r".into(), &[], vec![0], 0);
-        b.set_prompt("r", &[1, 2, 3]);
-        b.set_prompt("r", &[7, 8]);
-        assert_eq!(b.prompt_len("r"), 2);
-        assert_eq!(b.token_at("r", 0), Some(7));
-        assert_eq!(b.token_at("r", 2), None);
+        b.add_request("r".into(), &[10, 11, 12], vec![0], 0);
+        b.push_generated("r", 90);
+        b.push_generated("r", 91);
+        let p = b.prepare_inputs(&step(&[("r", 1, 3)]));
+        assert_eq!(p.flat_token_ids, &[11, 12, 90]);
+        assert!(
+            !p.req_inputs[0].emits_token,
+            "91 is still ahead of the chunk"
+        );
+    }
+
+    /// An emitted token is appended to the history; a chunk that emits nothing appends nothing.
+    #[test]
+    fn commit_step_appends_exactly_what_was_emitted() {
+        let mut b = InputBatch::new();
+        b.add_request("r".into(), &[1, 2, 3, 4], vec![0], 0);
+        b.commit_step("r", &[], 2, false);
+        assert_eq!(b.token_count("r"), 4);
+        b.commit_step("r", &[7], 2, false);
+        assert_eq!(b.history("r").1, &[7]);
+        b.commit_step("r", &[8, 9], 3, true);
+        assert_eq!(b.history("r").1, &[7, 8, 9]);
     }
 
     /// The tokens follow their request through a swap-remove — the reason they belong in the struct that
@@ -2600,12 +2208,9 @@ mod tests {
     #[test]
     fn the_tokens_follow_their_request_through_a_swap_remove() {
         let mut b = InputBatch::new();
-        for (i, id) in ["a", "victim", "z"].iter().enumerate() {
-            b.add_request((*id).into(), &[], vec![i], 0);
-        }
-        b.set_prompt("a", &[10, 11]);
-        b.set_prompt("victim", &[90]);
-        b.set_prompt("z", &[70, 71, 72]);
+        b.add_request("a".into(), &[10, 11], vec![0], 0);
+        b.add_request("victim".into(), &[90], vec![1], 0);
+        b.add_request("z".into(), &[70, 71, 72], vec![2], 0);
         b.push_generated("z", 73);
 
         b.remove_request("victim"); // "z" (last slot) is swapped into slot 1
@@ -2630,24 +2235,10 @@ mod tests {
         assert_eq!(b.token_at("ghost", 0), None);
         assert_eq!(b.token_count("ghost"), 0);
         assert_eq!(b.prompt_len("ghost"), 0);
-        b.set_prompt("ghost", &[1, 2, 3]);
+        assert_eq!(b.history("ghost"), (&[][..], &[][..]));
         b.push_generated("ghost", 4);
+        b.commit_step("ghost", &[5], 1, false);
         assert_eq!(b.num_active(), 0);
         assert_eq!(b.token_count("ghost"), 0);
-    }
-
-    /// metal and cuda have NOT opted in: they never call `set_prompt`, so the store answers 0 rather
-    /// than something derived from the chunk `add_request` was handed. A wrong number here would be a
-    /// prompt boundary, i.e. "when does sampling start".
-    #[test]
-    fn a_backend_that_has_not_opted_in_gets_zero_not_the_chunk() {
-        let mut b = InputBatch::new();
-        // What cuda/metal pass: the tokens to feed THIS STEP.
-        b.add_request("r".into(), &[5, 6, 7], vec![0], 0);
-        assert_eq!(b.prompt_len("r"), 0, "a chunk is not a prompt");
-        assert_eq!(b.token_count("r"), 0);
-        // And their step building is unaffected — the chunk still reaches the model.
-        let p = b.prepare_inputs(&HashMap::new());
-        assert_eq!(p.req_inputs[0].token_count, 3);
     }
 }
