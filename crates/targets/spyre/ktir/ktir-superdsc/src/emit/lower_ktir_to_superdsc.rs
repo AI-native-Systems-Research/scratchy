@@ -529,12 +529,14 @@ pub(crate) fn index_constants(f: &IRFunction<'static>) -> std::collections::Hash
                 continue;
             }
             let Some(r) = op.result else { continue };
-            let Some(src) = op.operands.first() else { continue };
-            if !m.contains_key(&r) {
-                if let Some(v) = m.get(&src) {
-                    m.insert(r, *v);
-                    grew = true;
-                }
+            let Some(src) = op.operands.first() else {
+                continue;
+            };
+            if !m.contains_key(&r)
+                && let Some(v) = m.get(src)
+            {
+                m.insert(r, *v);
+                grew = true;
             }
         }
         if !grew {
@@ -3750,9 +3752,8 @@ pub fn matmul_oriented(
     // (correct) contract for a WINDOWED program and an unneeded risk for a whole-tensor one: a
     // window that is its view entire, corners 0, is exactly the program the base form was built
     // for. Anything else — any corner, any partial window — is the tiled case this arm exists for.
-    let whole = |r: &Region| {
-        r.r_start == 0 && r.c_start == 0 && r.r_len == r.v_rows && r.c_len == r.v_cols
-    };
+    let whole =
+        |r: &Region| r.r_start == 0 && r.c_start == 0 && r.r_len == r.v_rows && r.c_len == r.v_cols;
     let op = if whole(&a) && whole(&w) && whole(&out) {
         assemble_matmul_seeded(
             &op_name,
