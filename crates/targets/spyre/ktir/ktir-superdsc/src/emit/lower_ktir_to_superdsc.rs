@@ -3774,13 +3774,22 @@ pub fn matmul_oriented(
         // weight's pad columns are read through the same neighbour. Refused by name; the blocking
         // must keep every window's stick count splittable on its own.
         if n_dev > n {
-            return err(format!(
-                "MatmulTile t{}: the output window is partial (n={n} of {}) and the util floor \
-                 would pad the device width to {n_dev} — the padded columns would write into the \
-                 neighbouring window's output and read its weight columns. Pad the blocking so \
-                 each window's stick count is splittable to ≥8 on its own.",
-                out.tid, out.v_cols,
-            ));
+            // ⭐ BUT A WINDOW THAT SPANS THE OUTPUT'S WHOLE COLUMN WIDTH AT CORNER 0 MAY TAKE THE
+            // PAD. The pad columns land in the row-partial window's OWN placement rows — the same
+            // contract the base emission's pad has always carried (the footprint guard's business),
+            // not a neighbour's. The prefill lm-head tail is exactly this: the output view is
+            // `[rung_rows, vocab]` and the matmul's window is `[1, vocab]` (the tail extraction
+            // materializes the last row), full-width, corner 0.
+            let cols_entire = |r: &Region| r.c_start == 0 && r.c_len == r.v_cols;
+            if !cols_entire(&out) {
+                return err(format!(
+                    "MatmulTile t{}: the output window is partial (n={n} of {}) and the util floor \
+                     would pad the device width to {n_dev} — the padded columns would write into the \
+                     neighbouring window's output and read its weight columns. Pad the blocking so \
+                     each window's stick count is splittable to ≥8 on its own.",
+                    out.tid, out.v_cols,
+                ));
+            }
         }
         assemble_matmul_windowed(
             &op_name,
