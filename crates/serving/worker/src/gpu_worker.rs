@@ -197,9 +197,6 @@ pub struct MetalWorker {
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
     is_shutdown: bool,
-    token_buffers: HashMap<String, Vec<u32>>,
-    /// Per-request prompt length (for discard_request_mask on intermediate prefill chunks).
-    prompt_lengths: HashMap<String, usize>,
     /// Per-request block annotations for span-aware RoPE.
     annotation_buffers: HashMap<String, scratchy_core_common::BlockAnnotations>,
     /// Spans Phase 2: per-request logical block indices that are reused cache
@@ -657,8 +654,6 @@ impl MetalWorker {
             model_dtype: GpuDType::F16,
             resolved_architecture: None,
             is_shutdown: false,
-            token_buffers: HashMap::new(),
-            prompt_lengths: HashMap::new(),
             annotation_buffers: HashMap::new(),
             reused_block_buffers: HashMap::new(),
             mm_data_buffers: HashMap::new(),
@@ -1335,8 +1330,7 @@ impl MetalWorker {
             req_ids,
             &self.sampling_params_map,
             &mut self.seeded_rngs,
-            &self.prompt_lengths,
-            &self.token_buffers,
+            |id| self.input_batch.history(id),
             vocab,
         );
         Ok(scratchy_target_metal::sampling::PendingSampler::prepare(
@@ -3538,8 +3532,6 @@ impl Worker for MetalWorker {
 
         // ── 1. Lifecycle: drop finished requests ──────────────────
         for req_id in &scheduler_output.finished_req_ids {
-            self.token_buffers.remove(req_id);
-            self.prompt_lengths.remove(req_id);
             self.annotation_buffers.remove(req_id);
             self.reused_block_buffers.remove(req_id);
             self.mm_data_buffers.remove(req_id);
@@ -3555,10 +3547,19 @@ impl Worker for MetalWorker {
                 alloc.release(gdn_slot_key(req_id));
             }
         }
-        self.input_batch
-            .remove_finished(&scheduler_output.finished_req_ids);
+        // A preempted request resumes by recomputing from the scheduler's cursor, so its recurrent
+        // state must restart from zero like a new request's.
+        if let (Some(alloc), Some(preempted)) = (
+            self.gdn_slot_allocator.as_mut(),
+            &scheduler_output.preempted_req_ids,
+        ) {
+            for req_id in preempted {
+                alloc.release(gdn_slot_key(req_id));
+            }
+        }
+        self.input_batch.update_states(scheduler_output);
 
-        // ── 2. Lifecycle: add newly scheduled requests ────────────
+        // ── 2. Lifecycle: the per-request state beside the batch ──
         for new_req in &scheduler_output.scheduled_new_reqs {
             let num_tokens = scheduler_output
                 .num_scheduled_tokens
@@ -3568,15 +3569,6 @@ impl Worker for MetalWorker {
             if num_tokens == 0 {
                 continue;
             }
-            let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
-            let start = new_req.num_computed_tokens as usize;
-            let end = (start + num_tokens).min(prompt_ids.len());
-            let tokens_to_use = &prompt_ids[start..end];
-
-            self.token_buffers
-                .insert(new_req.req_id.clone(), prompt_ids.to_vec());
-            self.prompt_lengths
-                .insert(new_req.req_id.clone(), prompt_ids.len());
             if let Some(ref params) = new_req.sampling_params {
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
@@ -3649,94 +3641,9 @@ impl Worker for MetalWorker {
                         .insert(new_req.req_id.clone(), reused.iter().copied().collect());
                 }
             }
-            // Group 0 = full (global layers); groups 1.. = the sliding groups
-            // (gemma4 SWA), present only for hybrid models (vLLM group-shared).
-            let block_ids = new_req.block_ids.first().cloned().unwrap_or_default();
-            let sliding_groups: Vec<Vec<usize>> =
-                new_req.block_ids.iter().skip(1).cloned().collect();
-            self.input_batch.add_request_hybrid(
-                new_req.req_id.clone(),
-                tokens_to_use,
-                block_ids,
-                sliding_groups,
-                new_req.num_computed_tokens,
-            );
         }
 
-        // ── 3. Lifecycle: refresh cached requests' block tables ───
-        for (i, req_id) in scheduler_output
-            .scheduled_cached_reqs
-            .req_ids
-            .iter()
-            .enumerate()
-        {
-            if let Some(Some(new_blocks)) =
-                scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
-                && let Some(group0) = new_blocks.first()
-            {
-                let sliding: Vec<Vec<usize>> = new_blocks.iter().skip(1).cloned().collect();
-                self.input_batch
-                    .update_blocks_hybrid(req_id, group0.clone(), sliding);
-            }
-        }
-        let cached = &scheduler_output.scheduled_cached_reqs;
-        if !cached.new_token_ids.is_empty() {
-            for (i, req_id) in cached.req_ids.iter().enumerate() {
-                if let Some(tokens) = cached.new_token_ids.get(i)
-                    && let Some(&last_token) = tokens.last()
-                {
-                    self.input_batch.set_last_token(req_id, last_token);
-                }
-            }
-        }
-
-        // ── 3b. Re-arm chunked-prefill continuations as prefill ───
-        // A cached (running) request that still has un-prefilled prompt
-        // tokens must run THIS step as a PREFILL chunk, not a decode. The
-        // previous chunk's commit_step cleared is_prefill, so without this
-        // re-arm prepare_inputs would emit a single decode token (q_len=1)
-        // and DROP the rest of the prompt — including the user's question —
-        // producing garbage / a prompt echo on every prompt longer than
-        // max_num_batched_tokens (the chunked-prefill threshold). Unlike the
-        // CUDA worker (execute_model_inner), the metal path previously had no
-        // re-arm at all, so all chunked prefill was silently broken.
-        //
-        // The request is still mid-prefill iff `num_computed < prompt_len`
-        // (matches Python vLLM, where a request is "in prefill" while
-        // num_computed_tokens < num_prompt_tokens). This INCLUDES the final
-        // chunk (num_computed + num_scheduled == prompt_len). The block table
-        // (step 3 above) and tokens_in_pool (prior commit_step) are already
-        // up to date, so set_prefill_continuation — flip is_prefill + set this
-        // chunk's tokens + pos_offset — is sufficient.
-        for (i, req_id) in cached.req_ids.iter().enumerate() {
-            if cached.resumed_req_ids.contains(req_id) {
-                continue;
-            }
-            let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
-            let num_computed = cached.num_computed_tokens.get(i).copied().unwrap_or(0) as usize;
-            if num_computed >= prompt_len {
-                continue; // prefill complete → normal decode, leave as-is
-            }
-            let num_scheduled = scheduler_output
-                .num_scheduled_tokens
-                .get(req_id)
-                .copied()
-                .unwrap_or(0);
-            if num_scheduled == 0 {
-                continue;
-            }
-            let tokens = match self.token_buffers.get(req_id) {
-                Some(buf) => {
-                    let start = num_computed;
-                    let end = (start + num_scheduled).min(buf.len());
-                    buf[start..end].to_vec()
-                }
-                None => continue,
-            };
-            self.input_batch
-                .set_prefill_continuation(req_id, tokens, num_computed as u32);
-        }
-
+        #[cfg(feature = "metal")]
         if self.input_batch.num_active() == 0 {
             // Reactive KV (2c): batch fully idle → no live blocks. Defer the
             // shrink until the GPU has been idle for `KV_SHRINK_IDLE_AFTER`.
@@ -3745,32 +3652,27 @@ impl Worker for MetalWorker {
             // re-faults them on first GPU touch — a multi-second stall on a
             // long prefill. Deferring keeps back-to-back requests fast while
             // still releasing memory once genuinely idle.
-            #[cfg(feature = "metal")]
-            {
-                let now = std::time::Instant::now();
-                let idle_since = *self.kv_idle_since.get_or_insert(now);
-                if now.duration_since(idle_since) >= KV_SHRINK_IDLE_AFTER {
-                    self.shrink_metal_kv_idle();
-                }
+            let now = std::time::Instant::now();
+            let idle_since = *self.kv_idle_since.get_or_insert(now);
+            if now.duration_since(idle_since) >= KV_SHRINK_IDLE_AFTER {
+                self.shrink_metal_kv_idle();
             }
+        } else {
+            // A batch is active again — cancel any pending idle-shrink timer.
+            self.kv_idle_since = None;
+        }
+        // Nothing scheduled — an idle batch, or every live request skipped, preempted or finished
+        // this step: nothing runs.
+        if scheduler_output.total_num_scheduled_tokens == 0 {
             return Ok(ModelRunnerOutput::empty());
         }
 
-        // A batch is active again — cancel any pending idle-shrink timer.
-        #[cfg(feature = "metal")]
-        {
-            self.kv_idle_since = None;
-        }
-
         // ── 4. Prepare flat batch inputs ─────────────────────────
-        // Phase 4.6: forward the scheduler's spec drafts into
-        // `prepare_inputs` so verify batches get the
-        // `[last_token, draft_0..K-1]` flat shape per req. For non-spec
-        // batches `scheduled_spec_decode_tokens` is empty → existing
-        // q_len=1 path is unchanged.
-        let mut prepared = self
-            .input_batch
-            .prepare_inputs(&scheduler_output.scheduled_spec_decode_tokens);
+        // Built from the schedule: exactly the scheduled requests, each its
+        // scheduled chunk (a verify row is `[last_token, draft_0..K-1]`), so
+        // `num_tokens` IS `total_num_scheduled_tokens` — within the budget the
+        // engine sized to the largest resident bucket.
+        let mut prepared = self.input_batch.prepare_inputs(scheduler_output);
         let attn = &prepared.attn_meta;
         let num_tokens = attn.total_tokens;
         let num_reqs = attn.num_reqs;
@@ -4040,9 +3942,7 @@ impl Worker for MetalWorker {
                     let mut allow_bits: Vec<u32> = Vec::new();
                     for (i, req_id) in req_ids_in_order.iter().enumerate() {
                         // Still-prefilling chunk → no token sampled this step.
-                        let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
-                        let seq_len_after = attn.seq_lens.get(i).copied().unwrap_or(usize::MAX);
-                        if seq_len_after < prompt_len {
+                        if !prepared.req_inputs[i].emits_token {
                             continue;
                         }
                         // Speculative verify batch → unsupported with grammar.
@@ -4231,9 +4131,7 @@ impl Worker for MetalWorker {
             if !req_slice.spec_token_ids.is_empty() {
                 continue; // spec-verify rows use greedy rejection, not the sampler
             }
-            let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
-            let seq_len_after = attn.seq_lens.get(i).copied().unwrap_or(usize::MAX);
-            if seq_len_after < prompt_len {
+            if !req_slice.emits_token {
                 continue; // still-prefilling chunk emits no token
             }
             let greedy = self
@@ -4751,13 +4649,13 @@ impl Worker for MetalWorker {
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let req_slice = &prepared.req_inputs[i];
             req_id_to_index.insert(req_id.clone(), i);
-            // Chunked-prefill intermediate chunk: the prefill does NOT
-            // complete this step (the request still has prompt tokens past
-            // this chunk, i.e. `seq_len < prompt_len`). Such a chunk writes
-            // its K/V into the cache but must NOT emit a sampled token —
-            // only the FINAL chunk (where seq_len == prompt_len) or a decode
-            // step produces output. This matches Python vLLM, which excludes
-            // still-prefilling requests from the logits/sample set.
+            // Intermediate chunk: the chunk stops short of the end of the
+            // request's history (a prefill chunk, or a resume re-prefilling
+            // what it had generated — `emits_token` false). Such a chunk
+            // writes its K/V into the cache but must NOT emit a sampled token
+            // — only a chunk that reaches the end of the history produces
+            // output. This matches Python vLLM, which excludes still-
+            // prefilling requests from the logits/sample set.
             //
             // Without this gate every non-final chunk emits one spurious
             // token: the greedy argmax at the chunk's last prompt position
@@ -4767,11 +4665,8 @@ impl Worker for MetalWorker {
             // — the "doubled first token" / prompt-echo symptom of chunked
             // prefill. `commit_step` still advances `tokens_in_pool` by the
             // chunk's `q_len` (it keys on `input_token_count`, not the token
-            // slice), so an empty emit leaves prefill bookkeeping correct and
-            // the next step's re-arm continues the prefill.
-            let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
-            let seq_len_after = attn.seq_lens.get(i).copied().unwrap_or(usize::MAX);
-            if seq_len_after < prompt_len {
+            // slice), so an empty emit leaves prefill bookkeeping correct.
+            if !req_slice.emits_token {
                 sampled_token_ids.push(Vec::new());
                 was_spec_decode.push(false);
                 continue;
@@ -4887,22 +4782,14 @@ impl Worker for MetalWorker {
             };
 
         // ── 7. Commit per-request state ─────────────────────────
+        // Appends this step's emitted tokens to the history the next step's
+        // chunk and the on-GPU sampler's penalties read; appending AFTER
+        // sampling means a step's penalty is based on tokens generated
+        // strictly before it (standard vLLM behavior).
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let q_len = q_lens[i];
             self.input_batch
                 .commit_step(req_id, &sampled_token_ids[i], q_len, was_spec_decode[i]);
-            // Append this step's emitted tokens to the per-request token
-            // history (`token_buffers` = prompt ++ generated). The repetition /
-            // frequency / presence penalties in the on-GPU sampler read this
-            // history; appending AFTER sampling means a step's penalty is based
-            // on tokens generated strictly before it (standard vLLM behavior).
-            // Prefill-continuation reads (`token_buffers[..prompt_len]`) are
-            // unaffected — the appended tokens live past `prompt_len`.
-            if !sampled_token_ids[i].is_empty()
-                && let Some(buf) = self.token_buffers.get_mut(req_id)
-            {
-                buf.extend_from_slice(&sampled_token_ids[i]);
-            }
         }
 
         Ok(ModelRunnerOutput {

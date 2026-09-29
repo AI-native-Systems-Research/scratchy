@@ -414,19 +414,14 @@ impl Worker for SpyreWorker {
             // the same ids ("In the common single-group case, all groups share the same block IDs"), so
             // group 0 is the list. A hybrid model would need a group per attention class, which this
             // backend does not bake.
+            // ⭐ AND THE TOKENS THEMSELVES, in the same store as the block table. `ReqState` used to hold
+            // `tokens` + `prompt_len`; the length is now derived from this one value.
             input_batch.add_request(
                 nr.req_id.clone(),
-                // ⛔ NO CHUNK. This argument is "the tokens to feed this step" and it drives
-                // `prepare_inputs`, which is the cuda/metal step builder — this worker builds its own
-                // chunks from the prompt below, so handing it one here would populate a field nothing on
-                // this path reads. The PROMPT goes in through `set_prompt`, which is a different thing.
-                &[],
+                &prompt,
                 nr.block_ids.first().cloned().unwrap_or_default(),
                 nr.num_computed_tokens,
             );
-            // ⭐ AND THE TOKENS THEMSELVES, in the same store as the block table. `ReqState` used to hold
-            // `tokens` + `prompt_len`; the length is now derived from this one value.
-            input_batch.set_prompt(&nr.req_id, &prompt);
             // Only the paged (card) install below reads it.
             #[cfg(feature = "spyre-hw")]
             let host_now: Vec<usize> = input_batch

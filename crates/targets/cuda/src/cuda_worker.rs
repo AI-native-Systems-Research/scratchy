@@ -1533,9 +1533,9 @@ pub struct CudaWorker {
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
     is_shutdown: bool,
+    /// Per-request `prompt ++ generated` as ONE buffer, for the logits processors, which take the
+    /// history in that shape. A second copy of `InputBatch`'s history, appended at the same commits.
     token_buffers: HashMap<String, Vec<u32>>,
-    /// Per-request prompt length (for discard_request_mask on intermediate prefill chunks).
-    prompt_lengths: HashMap<String, usize>,
     /// Per-request block annotations for span-aware RoPE.
     annotation_buffers: HashMap<String, scratchy_core_common::BlockAnnotations>,
     /// Per-request multimodal data (images), only populated for requests
@@ -1759,7 +1759,6 @@ impl CudaWorker {
             uses_ggml: false,
             host_staging: None,
             token_buffers: HashMap::new(),
-            prompt_lengths: HashMap::new(),
             annotation_buffers: HashMap::new(),
             mm_data_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
@@ -2492,7 +2491,6 @@ impl CudaWorker {
         host_staging: &Option<HostStaging>,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
-        prompt_lengths: &HashMap<String, usize>,
         logits: GpuTensor,
         prepared: PreparedInputs,
         device: &mut GpuDevice,
@@ -2580,7 +2578,6 @@ impl CudaWorker {
                     0,
                     input_batch,
                     token_buffers,
-                    prompt_lengths,
                 );
             }
 
@@ -2601,11 +2598,7 @@ impl CudaWorker {
                 for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
                     let params = sampling_params_map.get(&req_slice.req_id);
                     let t = params.map_or(1.0f32, |p| p.temperature.max(1e-7) as f32);
-                    let plen = prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
-                    let position = token_buffers
-                        .get(&req_slice.req_id)
-                        .map(|b| b.len().saturating_sub(plen))
-                        .unwrap_or(0) as u32;
+                    let position = input_batch.history(&req_slice.req_id).1.len() as u32;
                     let seed = gen_seed(&req_slice.req_id, position);
                     unsafe {
                         *temps_ptr.add(i) = t;
@@ -2657,11 +2650,7 @@ impl CudaWorker {
                             p.min_p as f32,
                         )
                     });
-                    let plen = prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
-                    let position = token_buffers
-                        .get(&req_slice.req_id)
-                        .map(|b| b.len().saturating_sub(plen))
-                        .unwrap_or(0) as u32;
+                    let position = input_batch.history(&req_slice.req_id).1.len() as u32;
                     let random = scratchy_core_common::seed_to_uniform(gen_seed(
                         &req_slice.req_id,
                         position,
@@ -2720,7 +2709,6 @@ impl CudaWorker {
                 0,
                 input_batch,
                 token_buffers,
-                prompt_lengths,
             );
         }
 
@@ -2828,11 +2816,7 @@ impl CudaWorker {
                         p.min_p as f32,
                     )
                 });
-                let plen = prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
-                let position = token_buffers
-                    .get(&req_slice.req_id)
-                    .map(|b| b.len().saturating_sub(plen))
-                    .unwrap_or(0) as u32;
+                let position = input_batch.history(&req_slice.req_id).1.len() as u32;
                 let random =
                     scratchy_core_common::seed_to_uniform(gen_seed(&req_slice.req_id, position));
                 unsafe {
@@ -2982,18 +2966,9 @@ impl CudaWorker {
         let host_ids =
             Self::d2h_token_ids_sync(host_staging.as_ref(), 0, &token_ids_gpu, num_reqs, device)?;
 
-        // Build discard mask for intermediate prefill chunks.
-        let mut discard = vec![false; num_reqs];
-        for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-            if req_slice.token_count > 1 {
-                let prompt_len = prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
-                let tokens_in_pool = input_batch.tokens_in_pool_for(&req_slice.req_id);
-                let seq_len_after = tokens_in_pool + req_slice.token_count;
-                if seq_len_after < prompt_len {
-                    discard[req_idx] = true;
-                }
-            }
-        }
+        // Discard mask: a chunk short of the end of its history (an intermediate prefill chunk)
+        // emits nothing. Matches Python's discard_request_mask.
+        let discard: Vec<bool> = prepared.req_inputs.iter().map(|r| !r.emits_token).collect();
 
         for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
             let tok = host_ids[req_idx];
@@ -3006,9 +2981,10 @@ impl CudaWorker {
                 g.advance(tok);
             }
 
+            let emitted: &[u32] = if discard[req_idx] { &[] } else { &[tok] };
             input_batch.commit_step(
                 &req_slice.req_id,
-                &[tok],
+                emitted,
                 req_slice.token_count,
                 !req_slice.spec_token_ids.is_empty(),
             );
@@ -3133,7 +3109,12 @@ impl CudaWorker {
                 target_ids,
                 &req_slice.spec_token_ids,
             );
-            let accepted_tokens = rejection.accepted_tokens;
+            // A chunk short of the end of its history emits nothing (discard mask).
+            let accepted_tokens = if req_slice.emits_token {
+                rejection.accepted_tokens
+            } else {
+                Vec::new()
+            };
 
             // 4. Commit step with accepted tokens.
             input_batch.commit_step(
@@ -3190,7 +3171,6 @@ impl CudaWorker {
         buf_idx: usize,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
-        prompt_lengths: &HashMap<String, usize>,
     ) -> ExecutorResult<ModelRunnerOutput> {
         let host_ids = Self::d2h_token_ids_sync(
             host_staging.as_ref(),
@@ -3199,27 +3179,16 @@ impl CudaWorker {
             num_reqs,
             device,
         )?;
-        // Build discard mask: intermediate prefill chunks (seq_len after
-        // this step < prompt_len) should not have their sampled tokens
-        // appended to token_buffers. Matches Python's discard_request_mask.
-        let mut discard = vec![false; num_reqs];
-        for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-            if req_slice.token_count > 1 {
-                // This is a prefill request. Check if it finishes the prompt.
-                let prompt_len = prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
-                let tokens_in_pool = input_batch.tokens_in_pool_for(&req_slice.req_id);
-                let seq_len_after = tokens_in_pool + req_slice.token_count;
-                if seq_len_after < prompt_len {
-                    discard[req_idx] = true;
-                }
-            }
-        }
+        // Discard mask: a chunk short of the end of its history (an intermediate prefill chunk)
+        // emits nothing. Matches Python's discard_request_mask.
+        let discard: Vec<bool> = prepared.req_inputs.iter().map(|r| !r.emits_token).collect();
 
         for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
             let tok = host_ids[req_idx];
+            let emitted: &[u32] = if discard[req_idx] { &[] } else { &[tok] };
             input_batch.commit_step(
                 &req_slice.req_id,
-                &[tok],
+                emitted,
                 req_slice.token_count,
                 !req_slice.spec_token_ids.is_empty(),
             );
@@ -4921,7 +4890,6 @@ impl Worker for CudaWorker {
 
         // Clear per-request state.
         self.token_buffers.clear();
-        self.prompt_lengths.clear();
         self.annotation_buffers.clear();
         self.sampling_params_map.clear();
         self.input_batch = InputBatch::new();
@@ -5141,7 +5109,6 @@ impl CudaWorker {
         }
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
-            self.prompt_lengths.remove(req_id);
             self.annotation_buffers.remove(req_id);
             self.mm_data_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
@@ -5157,8 +5124,17 @@ impl CudaWorker {
                 alloc.release(gdn_slot_key(req_id));
             }
         }
-        self.input_batch
-            .remove_finished(&scheduler_output.finished_req_ids);
+        // A preempted request resumes by recomputing from the scheduler's cursor, so its recurrent
+        // state must restart from zero like a new request's.
+        if let (Some(alloc), Some(preempted)) = (
+            self.gdn_slot_allocator.as_mut(),
+            &scheduler_output.preempted_req_ids,
+        ) {
+            for req_id in preempted {
+                alloc.release(gdn_slot_key(req_id));
+            }
+        }
+        self.input_batch.update_states(scheduler_output);
 
         // Ensure grammar vocabulary is built if any new request needs it.
         #[cfg(feature = "guided-decoding")]
@@ -5186,22 +5162,18 @@ impl CudaWorker {
 
             let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
             let start = new_req.num_computed_tokens as usize;
-            let end = (start + num_tokens).min(prompt_ids.len());
-            let tokens_to_use = &prompt_ids[start..end];
 
             tracing::info!(
                 req_id = %new_req.req_id,
                 prompt_len = prompt_ids.len(),
                 cached = start,
-                new = tokens_to_use.len(),
+                new = num_tokens,
                 hit_rate = format_args!("{:.0}%", if prompt_ids.is_empty() { 0.0 } else { start as f64 / prompt_ids.len() as f64 * 100.0 }),
                 "KV cache hit",
             );
 
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
-            self.prompt_lengths
-                .insert(new_req.req_id.clone(), prompt_ids.len());
             if let Some(ref ann) = new_req.block_annotations {
                 self.annotation_buffers
                     .insert(new_req.req_id.clone(), ann.clone());
@@ -5240,87 +5212,23 @@ impl CudaWorker {
                     }
                 }
             }
-
-            // Group 0 = full/global; groups 1.. = sliding groups (gemma4 SWA),
-            // present only for hybrid models. Mirror the metal split so the
-            // grouped decode reads each layer's own group table.
-            let block_ids = new_req.block_ids.first().cloned().unwrap_or_default();
-            let sliding_groups: Vec<Vec<usize>> =
-                new_req.block_ids.iter().skip(1).cloned().collect();
-            self.input_batch.add_request_hybrid(
-                new_req.req_id.clone(),
-                tokens_to_use,
-                block_ids,
-                sliding_groups,
-                new_req.num_computed_tokens,
-            );
         }
 
-        // Update cached requests' block tables. Track if any changed.
-        let mut blocks_changed = !scheduler_output.scheduled_new_reqs.is_empty();
-        for (i, req_id) in scheduler_output
-            .scheduled_cached_reqs
-            .req_ids
-            .iter()
-            .enumerate()
-        {
-            if let Some(Some(new_blocks)) =
-                scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
-                && let Some(group0) = new_blocks.first()
-            {
-                if !group0.is_empty() {
-                    blocks_changed = true;
-                }
-                // Sliding groups (gemma4 SWA) ship each step too — carry them so
-                // decode reads the sliding layers' own group tables (empty on
-                // uniform models → update_blocks_hybrid leaves them untouched).
-                let sliding_new: Vec<Vec<usize>> = new_blocks.iter().skip(1).cloned().collect();
-                self.input_batch
-                    .update_blocks_hybrid(req_id, group0.clone(), sliding_new);
-            }
-        }
-
-        // ---------------------------------------------------------------
-        // PP token fixup: when the scheduler provides new_token_ids (PP sync
-        // scheduling), overwrite last_token_ids in the input batch so that
-        // non-last PP stages embed the correct token instead of the dummy 0
-        // committed in the previous step.
-        // Matches Python: gpu_model_runner.py _update_states lines 1143-1150.
-        // ---------------------------------------------------------------
-        let cached = &scheduler_output.scheduled_cached_reqs;
-        if !cached.new_token_ids.is_empty() {
-            for (i, req_id) in cached.req_ids.iter().enumerate() {
-                if let Some(tokens) = cached.new_token_ids.get(i)
-                    && let Some(&last_token) = tokens.last()
-                {
-                    self.input_batch.set_last_token(req_id, last_token);
-                }
-            }
-        }
-
-        // ---------------------------------------------------------------
-        // Chunked prefill re-arm: detect cached requests that need
-        // more than 1 token (prefill continuation). Must happen before
-        // the super fast graph path, which would otherwise replay a
-        // decode graph instead of running the prefill eagerly.
-        // ---------------------------------------------------------------
-        let has_chunked_prefill =
-            scheduler_output
+        // Whether any block table changed this step (new requests, or a cached one that got blocks).
+        let blocks_changed = !scheduler_output.scheduled_new_reqs.is_empty()
+            || scheduler_output
                 .scheduled_cached_reqs
-                .req_ids
+                .new_block_ids
                 .iter()
-                .any(|req_id| {
-                    let is_resumed = scheduler_output
-                        .scheduled_cached_reqs
-                        .resumed_req_ids
-                        .contains(req_id);
-                    let num_scheduled = scheduler_output
-                        .num_scheduled_tokens
-                        .get(req_id)
-                        .copied()
-                        .unwrap_or(0);
-                    is_resumed || num_scheduled > 1
-                });
+                .flatten()
+                .any(|groups| groups.first().is_some_and(|group0| !group0.is_empty()));
+
+        // The super fast graph path replays a one-token decode over EVERY slot. Only a step that is
+        // exactly that — no slot left out, no chunk, no verify — may take it; anything else runs the
+        // regular path, built from the schedule.
+        let one_token_per_slot = self
+            .input_batch
+            .schedules_one_token_per_slot(scheduler_output);
 
         // ---------------------------------------------------------------
         // Super fast path: skip prepare_inputs entirely when the graph
@@ -5336,7 +5244,7 @@ impl CudaWorker {
         // bucket changed across steps (e.g. seq grew past 512), the captured
         // graph differs and we must fall through to the regular path so the
         // FlashInfer plan slot for the new bucket gets seeded.
-        let fast_sk_bucket: Option<u32> = if self.graph_metadata_valid && !has_chunked_prefill {
+        let fast_sk_bucket: Option<u32> = if self.graph_metadata_valid && one_token_per_slot {
             self.graph_runner.as_ref().and_then(|r| {
                 let (_, _, tokens_in_pool) = self.input_batch.fast_path_info();
                 let max_k = tokens_in_pool
@@ -5350,7 +5258,7 @@ impl CudaWorker {
         } else {
             None
         };
-        let fast_graph_bs = if self.graph_metadata_valid && !has_chunked_prefill {
+        let fast_graph_bs = if self.graph_metadata_valid && one_token_per_slot {
             fast_sk_bucket.and_then(|sk| {
                 self.graph_runner
                     .as_ref()
@@ -5478,7 +5386,7 @@ impl CudaWorker {
         }
 
         // Resolve any deferred D2H commit from the previous step before
-        // prepare_inputs (which reads positions, tokens_in_pool, last_token_ids).
+        // prepare_inputs (which reads the token history).
         if let Some(pending) = self.pending_commit.take() {
             if let Some(ref dev) = self.device {
                 dev.sync_d2h().map_err(|e| {
@@ -5502,152 +5410,14 @@ impl CudaWorker {
             }
         }
 
-        // ---------------------------------------------------------------
-        // Preemption/resumption fixup — done AFTER pending_commit resolution
-        // so that token_buffers has the final token from the previous step
-        // before we rebuild the prefill sequence.
-        //
-        // Preempted requests: remove from InputBatch to stop zombie GPU writes
-        // into blocks that have been freed and reallocated.  We keep
-        // token_buffers / sampling_params_map / seeded_rngs so the request
-        // can be cleanly re-admitted.
-        //
-        // Resumed requests: re-add to InputBatch as a fresh prefill using the
-        // complete token sequence (prompt + all output tokens generated so
-        // far).  The pending_commit above has already appended the very last
-        // token to token_buffers, so the sequence is complete.
-        //
-        // Matches Python gpu_model_runner._update_states: unscheduled requests
-        // are removed, resumed requests are re-added via add_request.
-        // ---------------------------------------------------------------
-        if let Some(preempted) = &scheduler_output.preempted_req_ids {
-            for req_id in preempted {
-                self.input_batch.remove_request(req_id);
-            }
-        }
-        for (i, req_id) in scheduler_output
-            .scheduled_cached_reqs
-            .req_ids
-            .iter()
-            .enumerate()
-        {
-            let is_resumed = scheduler_output
-                .scheduled_cached_reqs
-                .resumed_req_ids
-                .contains(req_id);
-            // Chunked prefill continuation: a cached (running) request that
-            // still has un-prefilled prompt tokens. We must re-arm the
-            // InputBatch slot as prefill (remove + add_request) so
-            // prepare_inputs emits this chunk's prompt tokens (q_len = chunk
-            // size) instead of a single decode token.
-            //
-            // The request is still mid-prefill iff `num_computed < prompt_len`
-            // (matches Python vLLM, where a request is "in prefill" while
-            // num_computed_tokens < num_prompt_tokens). This INCLUDES the
-            // final chunk, where num_computed + num_scheduled == prompt_len.
-            //
-            // (Earlier this gated on `num_computed + num_scheduled < prompt_len`
-            // (strict), which dropped the FINAL chunk of every chunked prefill:
-            // its prompt tokens — including the user's actual question — were
-            // never processed, and the slot ran as a 1-token decode of the
-            // discarded mid-prefill sample. So every prompt longer than
-            // max_num_batched_tokens produced garbage / a prompt echo. A normal
-            // decode has num_computed >= prompt_len and is still excluded.)
-            let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
-            let num_computed_here = scheduler_output
-                .scheduled_cached_reqs
-                .num_computed_tokens
-                .get(i)
-                .copied()
-                .unwrap_or(0) as usize;
-            let is_chunked_prefill_continuation = !is_resumed && num_computed_here < prompt_len;
-            if !is_resumed && !is_chunked_prefill_continuation {
-                continue;
-            }
-            // Re-add the resumed/chunked-prefill request as a fresh prefill.
-            let new_block_ids: Vec<usize> = scheduler_output
-                .scheduled_cached_reqs
-                .new_block_ids
-                .get(i)
-                .and_then(|opt| opt.as_ref())
-                .and_then(|groups| groups.first())
-                .cloned()
-                .unwrap_or_default();
-            let num_computed = scheduler_output
-                .scheduled_cached_reqs
-                .num_computed_tokens
-                .get(i)
-                .copied()
-                .unwrap_or(0);
-            // Truncate to the scheduled chunk: scheduler allocated blocks for
-            // exactly `num_scheduled_tokens` tokens starting from `num_computed`.
-            // Passing the full token_buffers (prompt + all outputs) would give
-            // seq_lens > available blocks → slot_mapping = -1 → GPU fault.
-            // This mirrors the new-request chunked-prefill logic (lines ~4906-4908).
-            let num_scheduled = scheduler_output
-                .num_scheduled_tokens
-                .get(req_id)
-                .copied()
-                .unwrap_or(0);
-            let tokens: Vec<u32> = self
-                .token_buffers
-                .get(req_id)
-                .map(|buf| {
-                    let start = num_computed as usize;
-                    let end = (start + num_scheduled).min(buf.len());
-                    buf[start..end].to_vec()
-                })
-                .unwrap_or_default();
-            // For both resumed and chunked prefill, the scheduler's
-            // allocate_slots returns ALL block IDs (not a delta).
-            // For chunked prefill, update_blocks already set the full
-            // block table on the input_batch slot — grab it before remove.
-            let all_block_ids = if is_chunked_prefill_continuation {
-                // update_blocks (line ~6359) already set the full block table
-                self.input_batch
-                    .block_table(req_id)
-                    .map(|b| b.to_vec())
-                    .unwrap_or(new_block_ids)
-            } else {
-                new_block_ids
-            };
-            // Sliding KV groups (gemma4 SWA) must survive the remove + re-add,
-            // else the continuation/resume chunk drops to group 0 and sliding
-            // layers read the full group's blocks → garbage. Chunked
-            // continuation: the stored tables (set by update_blocks_hybrid).
-            // Resumed: the scheduler ships the full per-group set this step.
-            let all_sliding: Vec<Vec<usize>> = if is_chunked_prefill_continuation {
-                self.input_batch
-                    .sliding_groups(req_id)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_default()
-            } else {
-                scheduler_output
-                    .scheduled_cached_reqs
-                    .new_block_ids
-                    .get(i)
-                    .and_then(|opt| opt.as_ref())
-                    .map(|groups| groups.iter().skip(1).cloned().collect())
-                    .unwrap_or_default()
-            };
-            // Remove the old (zombie) slot first, then re-add as prefill.
-            self.input_batch.remove_request(req_id);
-            self.input_batch.add_request_hybrid(
-                req_id.clone(),
-                &tokens,
-                all_block_ids,
-                all_sliding,
-                num_computed,
-            );
-        }
-
-        // Prepare flat inputs from InputBatch.
-        let prepared = self
-            .input_batch
-            .prepare_inputs(&scheduler_output.scheduled_spec_decode_tokens);
+        // Prepare flat inputs from the schedule: exactly the scheduled requests, each its chunk.
+        let prepared = self.input_batch.prepare_inputs(scheduler_output);
         if prepared.flat_token_ids.is_empty() {
             return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
         }
+        // Graph metadata describes the rows it was built from: only a step that packs EVERY slot
+        // leaves metadata the next step's all-slot replay (the super fast path) may reuse.
+        let packs_every_slot = prepared.attn_meta.num_reqs == self.input_batch.num_active();
 
         let total_tokens = prepared.flat_token_ids.len();
         // PP plumbing was removed alongside the hand-written CUDA model
@@ -5760,7 +5530,13 @@ impl CudaWorker {
         };
         let num_reqs = prepared.req_inputs.len();
 
-        // Build batch_req_ids for this step (used by processor updates after forward).
+        // Build batch_req_ids for this step (used by processor updates after forward). The rows are
+        // the SCHEDULED requests, which change whenever the scheduler leaves one out — no request
+        // need arrive or leave — and the processors' per-row state is rebuilt on any change.
+        self.batch_changed |= !self
+            .batch_req_ids
+            .iter()
+            .eq(prepared.req_inputs.iter().map(|r| &r.req_id));
         self.batch_req_ids.clear();
         self.batch_req_ids
             .extend(prepared.req_inputs.iter().map(|r| r.req_id.clone()));
@@ -5842,9 +5618,14 @@ impl CudaWorker {
 
         let vocab_size = model.vocab_size();
 
-        // Check if this is a pure decode batch (all q_len=1) and we have a graph.
+        // Check if this is a pure decode batch (all q_len=1, every row sampling) and we have a
+        // graph. A one-token chunk short of its history samples nothing, which the graph path
+        // (it returns a token per row) cannot express.
         // We allow padding to the nearest captured graph size (e.g. BS=3 → graph BS=4).
-        let is_decode = prepared.attn_meta.q_lens.iter().all(|&q| q == 1);
+        let is_decode = prepared
+            .req_inputs
+            .iter()
+            .all(|r| r.token_count == 1 && r.emits_token);
         // MM-bearing reqs MUST take the eager path: the decode CUDA graph was
         // captured with 1D position tensors (single rope-kernel invocation
         // per layer); replaying it for an MM-bearing req would feed 1D
@@ -5924,7 +5705,10 @@ impl CudaWorker {
         // This avoids running the entire batch through the slow eager path when
         // most requests are decode (q_len=1) but a few are prefill chunks.
         // ---------------------------------------------------------------------------
-        let has_decode = prepared.attn_meta.q_lens.contains(&1);
+        // A mixed batch has both a one-token row and a multi-token chunk (an all-one-token step
+        // that is not `is_decode` runs eager).
+        let q_lens = &prepared.attn_meta.q_lens;
+        let has_decode = q_lens.contains(&1) && q_lens.iter().any(|&q| q > 1);
         let any_spec_in_batch = prepared
             .req_inputs
             .iter()
@@ -6254,7 +6038,6 @@ impl CudaWorker {
                 &self.host_staging,
                 &mut self.input_batch,
                 &mut self.token_buffers,
-                &self.prompt_lengths,
                 logits,
                 prepared,
                 device,
@@ -6463,8 +6246,8 @@ impl CudaWorker {
             };
 
             // Record that graph buffers now have valid metadata for next step.
-            self.last_graph_batch_size = Some((graph_bs, sk_bucket));
-            self.graph_metadata_valid = true;
+            self.last_graph_batch_size = packs_every_slot.then_some((graph_bs, sk_bucket));
+            self.graph_metadata_valid = packs_every_slot;
 
             // Deferred D2H: enqueue async copy on transfer stream, return
             // immediately without blocking on the GPU. The token IDs are
@@ -6526,7 +6309,6 @@ impl CudaWorker {
                 0,
                 &mut self.input_batch,
                 &mut self.token_buffers,
-                &self.prompt_lengths,
             );
         }
 
@@ -6709,8 +6491,8 @@ impl CudaWorker {
             };
 
             // Track metadata validity for next step (works for non-greedy too).
-            self.last_graph_batch_size = Some((graph_bs, sk_bucket));
-            self.graph_metadata_valid = true;
+            self.last_graph_batch_size = packs_every_slot.then_some((graph_bs, sk_bucket));
+            self.graph_metadata_valid = packs_every_slot;
 
             // Slice logits to only the real requests (discard padded rows).
             let logits = if graph_bs > num_reqs {
@@ -7211,7 +6993,6 @@ impl CudaWorker {
             &self.host_staging,
             &mut self.input_batch,
             &mut self.token_buffers,
-            &self.prompt_lengths,
             logits,
             prepared,
             device,

@@ -289,14 +289,12 @@ pub fn encode_sampler_stage_into_mtl4(
 /// [`GpuSampleParams`]: scratchy_core_common::GpuSampleParams
 /// [`fnv_seed`]: scratchy_core_common::fnv_seed
 /// [`seed_to_uniform`]: scratchy_core_common::seed_to_uniform
-#[allow(clippy::too_many_arguments)]
-pub fn gather_gpu_sample_params(
+pub fn gather_gpu_sample_params<'h>(
     jobs: &[(usize, u32)],
     req_ids: &[String],
     sampling_params_map: &std::collections::HashMap<String, scratchy_core_common::SamplingParams>,
     seeded_rngs: &mut std::collections::HashMap<String, rand::rngs::StdRng>,
-    prompt_lengths: &std::collections::HashMap<String, usize>,
-    token_buffers: &std::collections::HashMap<String, Vec<u32>>,
+    history: impl Fn(&str) -> (&'h [u32], &'h [u32]),
     vocab: u32,
 ) -> scratchy_core_common::GpuSampleParams {
     use rand::Rng;
@@ -347,11 +345,7 @@ pub fn gather_gpu_sample_params(
         } else {
             // Generated-token count = the request's decode position; advances
             // each step so the seed varies. Shared with cuda_worker.
-            let plen = prompt_lengths.get(req_id).copied().unwrap_or(0);
-            let position = token_buffers
-                .get(req_id)
-                .map(|b| b.len().saturating_sub(plen))
-                .unwrap_or(0) as u32;
+            let position = history(req_id).1.len() as u32;
             scratchy_core_common::fnv_seed(req_id, position)
         };
         params
@@ -359,27 +353,17 @@ pub fn gather_gpu_sample_params(
             .push(scratchy_core_common::seed_to_uniform(seed));
     }
 
-    // Penalty token histories (only when a row uses penalties). `token_buffers`
-    // = prompt ++ generated, split at `prompt_len`; both arrays are row-major
-    // `njobs * max_*` padded with `vocab`.
+    // Penalty token histories (only when a row uses penalties): the request's
+    // prompt and generated tokens; both arrays are row-major `njobs * max_*`
+    // padded with `vocab`.
     if params.any_penalty {
         let mut outs: Vec<Vec<i32>> = Vec::with_capacity(njobs);
         let mut prompts: Vec<Vec<i32>> = Vec::with_capacity(njobs);
         for &(i, _) in jobs {
             let req_id = &req_ids[i];
-            let plen = prompt_lengths.get(req_id).copied().unwrap_or(0);
-            let (p_ids, o_ids): (Vec<i32>, Vec<i32>) = match token_buffers.get(req_id) {
-                Some(b) => {
-                    let cut = plen.min(b.len());
-                    (
-                        b[..cut].iter().map(|&t| t as i32).collect(),
-                        b[cut..].iter().map(|&t| t as i32).collect(),
-                    )
-                }
-                None => (Vec::new(), Vec::new()),
-            };
-            prompts.push(p_ids);
-            outs.push(o_ids);
+            let (prompt, generated) = history(req_id);
+            prompts.push(prompt.iter().map(|&t| t as i32).collect());
+            outs.push(generated.iter().map(|&t| t as i32).collect());
         }
         let max_out = outs.iter().map(Vec::len).max().unwrap_or(0);
         let max_prompt = prompts.iter().map(Vec::len).max().unwrap_or(0);
