@@ -318,6 +318,42 @@ fn node_rows(name: &str, out: &Region) -> Result<u32, Error> {
     Ok(out.v_rows)
 }
 
+/// ⭐⭐⭐ THE ROW BASIS AN ELEMENTWISE OP SWEEPS — the matmul windowing arm's law, stated once for the
+/// pointwise arms.
+///
+/// [`node_rows`] folds a ROW-BLOCKED program: its store windows tile `0..v_rows` and one descriptor
+/// spans all of them, which is the only shape a whole-view sweep can serve. A GRID program states the
+/// opposite — ONE window, at a corner this program instance owns — and its inputs are INTERMEDIATES
+/// at the window's own height (an unrolled flash block's `p·V` is `[64, 128]` against a `[1024, 128]`
+/// output view). Sweeping the view there would read 960 rows nobody wrote and write 960 rows nobody
+/// stores; sweeping the WINDOW is exactly what `matmul_oriented` already does (`m = out.r_len`).
+///
+/// The corner itself is still [`base_addressed`]'s business — `split_out` refuses a nonzero row
+/// corner on every operand, so a windowed op here is always at row 0 of its view (the grid's block 0
+/// or an unrolled trip whose corner the fold pass carried away). A program whose window sits at a
+/// nonzero row is the 16-tile grid-corner case, and it is refused by that guard rather than here.
+fn pointwise_rows(name: &str, out: &Region) -> Result<u32, Error> {
+    if out.r_cover == (0, out.v_rows) {
+        node_rows(name, out)
+    } else {
+        // The window basis is only honest if the op's rows ARE the window's: the caller's extent
+        // checks compare every operand against this number, and `r_len` is the window one tile
+        // states. A cover that is neither the whole view nor a single window (two disjoint
+        // windows, say) is a program shape this basis does not describe, and is refused by name
+        // rather than folded.
+        if out.r_cover.1 - out.r_cover.0 != out.r_len {
+            return err(format!(
+                "{name}: the output t{}'s store windows cover rows {}..{} in blocks of {} row(s) — \
+                 neither a row-blocked program one descriptor can fold (windows tiling the view) nor \
+                 a grid program's single window. The pointwise arms sweep one rectangle; this \
+                 program states several disjoint ones.",
+                out.tid, out.r_cover.0, out.r_cover.1, out.r_len,
+            ));
+        }
+        Ok(out.r_len)
+    }
+}
+
 /// This program's parameters as [`Region`]s, in parameter order.
 ///
 /// ⭐ THE PAIRING IS A ZIP, NOT A SEARCH. A func's `arguments` are `%0..%{n-1}` in first-use order
@@ -789,6 +825,12 @@ pub fn elementwise(
     if bcast.iter().any(Option::is_some) {
         return elementwise_broadcast(name, kind, &ins, &out, bcast, sym_id_base, layout);
     }
+    // ⭐⭐⭐ THE PER-ROW CHAIN TAKES THE ONE-STICK ARM — see [`elementwise_per_row`]. A `[rows, 1]`
+    // output is the running-max/alpha/denominator chain of an online softmax, which the
+    // hardware-proven attention body lowers at one stick wide (value in lane 0), not one column.
+    if out.c_len == 1 {
+        return elementwise_per_row(name, kind, &ins, &out, sym_id_base, layout);
+    }
     pointwise_extents_agree(name, kind, &ins, &out)?;
     // ⛔ THIS COMMENT USED TO SAY `assemble_pointwise` EMITS THE SFP POLYNOMIAL TABLE "via
     // `constant_info(op_func)`". THERE IS NO SUCH FUNCTION. `constant_info` is a local in `emit_sdsc`
@@ -805,7 +847,65 @@ pub fn elementwise(
     let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
     let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
     let op_name = format!("{op_func}_o{}", out.tid);
-    let tile_op = pointwise_tile_op(node_rows(name, &out)?, cols, arity as u32 + 1);
+    let tile_op = pointwise_tile_op(pointwise_rows(name, &out)?, cols, arity as u32 + 1);
+    let op = assemble_pointwise_seeded_from_tile(
+        &op_name,
+        &tile_op,
+        op_func,
+        &in_refs,
+        &out.name(),
+        sym_id_base,
+        layout,
+    );
+    Ok(vec![op])
+}
+
+/// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
+/// online softmax.
+///
+/// The seeded path above refuses `cols=1` because `assemble_pointwise` emits no `coordinateMasking_`
+/// and a one-column output is not a whole stick. But the hardware-proven attention body HAS this
+/// class and lowers it at ONE STICK WIDE, not one column: `attn.rs`'s `newm`/`corrsubt`/`corr`/
+/// `lcorr`/`ladd` all state `BlockCols::of_one_stick(Lanes::FP16)`, the value rides in LANE 0 and
+/// lanes 1..63 are never read (every consumer reads the buffer through `In::col`, the one-stick
+/// broadcast mode, or a reduce accumulator that keeps the same lane-0 law). That is proven emission
+/// on card, not a new shape being invented here.
+///
+/// The footprint already agrees: `synth_footprint_bytes` rounds a `[rows, 1]` intermediate's inner
+/// extent up to a whole stick, so the reserved buffer is `rows × 64` fp16 — exactly what an op at
+/// `cols = 64` spans. Emitting one column would UNDERWRITE the buffer, not preserve it.
+///
+/// ⛔ ONLY THE DENSE PER-ROW CHAIN TAKES THIS ARM. A broadcast operand still needs the operand-mode
+/// path below (`elementwise_broadcast`), because a spray is an addressing mode, not a width. And
+/// `rows` comes from [`node_rows`], the same source the dense path reads, so a windowed program is
+/// spanned rather than re-blocked.
+fn elementwise_per_row(
+    name: &str,
+    kind: Elementwise,
+    ins: &[Region],
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (op_func, arity) = elementwise_op_func(name, kind)?;
+    // EVERY operand must be the same per-row shape — this is the dense path's law ([`pointwise_extents_agree`])
+    // restated for the one-stick emission: the op computes lane 0 of every row of every operand.
+    for (i, x) in ins.iter().enumerate() {
+        if (x.v_rows, x.c_len) != (out.v_rows, out.c_len) {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` but the output t{} is \
+                 `[{}, {}]` — a per-row op computes LANE 0 of matching rows, so a mismatched operand \
+                 is the same out-of-end read the dense path refuses",
+                x.tid, x.v_rows, x.c_len, out.tid, out.v_rows, out.c_len,
+            ));
+        }
+    }
+    let cols = FP16_ELEMS_PER_STICK;
+    let rows = pointwise_rows(name, out)?;
+    let op_name = format!("{op_func}_o{}", out.tid);
+    let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+    let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
+    let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
     let op = assemble_pointwise_seeded_from_tile(
         &op_name,
         &tile_op,
@@ -873,10 +973,18 @@ fn elementwise_broadcast(
     // and matching the output on the other. A `Col` operand must still have the output's ROW count:
     // it supplies one value per row, so a different row count would run off its end exactly as a
     // dense mismatch does.
+    //
+    // ⭐ THE ROW BASIS IS THE WINDOW'S when the store windows do not tile the view ([`pointwise_rows`])
+    // — the epilogue `out / l[:, None]` of an unrolled flash block writes a `[64, 128]` window of a
+    // `[1024, 128]` parameter view, and the dense operand beside the broadcast one is the `[64, 128]`
+    // intermediate this block computed. The view is the row-blocked basis; the window is the grid
+    // one; comparing a window's inputs against a view's extent is the mismatch that reads rows
+    // nobody wrote.
+    let rows = pointwise_rows(name, out)?;
     for (i, x) in ins.iter().enumerate() {
         let want = match bcast[i] {
-            None => (out.v_rows, out.c_len),
-            Some(BcastAxis::Col) => (out.v_rows, 1),
+            None => (rows, out.c_len),
+            Some(BcastAxis::Col) => (rows, 1),
             Some(BcastAxis::Mb) => (1, out.c_len),
         };
         if (x.v_rows, x.c_len) != want {
@@ -890,9 +998,16 @@ fn elementwise_broadcast(
             ));
         }
     }
-    let cols = out.c_len;
+    // ⭐ A `[rows, 1]` OUTPUT IS THE PER-ROW CHAIN at one stick, the same law the dense arm routes
+    // through [`elementwise_per_row`]: the value rides in lane 0 of a one-stick output, which is the
+    // width `attn.rs`'s own `lcorr`/`ladd` emissions state. A broadcast OPERAND of a per-row op is
+    // still an operand mode (a spray is addressing, not width), so only the width is folded here.
+    let cols = if out.c_len == 1 {
+        FP16_ELEMS_PER_STICK
+    } else {
+        out.c_len
+    };
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
-    let rows = node_rows(name, out)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // The handles: `rb` is RowBlocked, which is what `head_major == false` means on the seeded path —
     // the residual token stream, not the per-head attention layout. An INPUT handle's extents are
