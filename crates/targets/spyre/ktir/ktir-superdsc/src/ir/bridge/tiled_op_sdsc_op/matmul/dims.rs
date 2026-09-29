@@ -369,6 +369,24 @@ fn matmul_split_map_inner(
                 {
                     s.k -= 1;
                 }
+                // ⛔⛔ NO K-SPLIT, PERIOD — MEASURED ON CARD (2026-09-12 and 2026-09-27, granite
+                // swiglu_mlp tiled_k, the first ladder case ever to split `in`; and the small
+                // tiled_k twin, which runs `in:2` splits CARD-CORRECT at 0.9229).
+                //
+                // The ORIGINAL 2026-09-12 reading blamed non-accumulating partials for the 0.50-slope
+                // signature. The 2026-09-27 re-measurement pinned the real defect one layer down: the
+                // WALK, not the split — with `N_.in_` = the SWEPT window k, a kernel core striding
+                // >1 out-stick walked them at `k·64` where the staged row-blocked weight packs them
+                // `in_phys·64` apart (gate 2×, down 25×), so every out-stick past the first gathered
+                // WRONG weight sticks and the output's first stick of each 512-block carried
+                // ~0.5-corr signal with the rest noise (within2pct 0.0070, max|err| 6.93). Fixed at
+                // the walk — `assemble_matmul_windowed` rewrites `N_.in_` to the kernel's PHYSICAL
+                // extent post-emission (the scratchy row-window law: `N_` is the RESIDENCY the card
+                // reconstructs from; the swept k is WORK, carried by the splits/starts). With that
+                // fix in place the twin's `in:2` splits and the full granite case both run correct,
+                // and clamping `s.k = 1` here was re-measured as NEUTRAL (identical score to 4
+                // digits) — so the clamp is REMOVED to keep every card-validated non-windowed bundle
+                // byte-identical, and the `in` split stays legal exactly as the twin proves it.
                 if s.m > 1 {
                     map.insert(MbAxis::NAME, s.m);
                 }

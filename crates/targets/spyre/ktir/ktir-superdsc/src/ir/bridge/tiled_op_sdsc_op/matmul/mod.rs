@@ -25,13 +25,12 @@ pub use assemble::{
     assemble_matmul_off_phys_m_maybe_epilogue, assemble_matmul_off_phys_m_with_epilogue,
     assemble_matmul_off_phys_m_with_epilogue_gathered, assemble_matmul_off_with_epilogue,
     assemble_matmul_placed, assemble_matmul_seeded, assemble_matmul_split,
-    try_assemble_matmul_seeded,
+    assemble_matmul_windowed, try_assemble_matmul_seeded,
 };
+pub use dims::set_split_mb_forbidden;
 pub use opspec::{
     matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
     matmul_opspec_off_operands, matmul_opspec_off_operands_phys,
     matmul_opspec_off_operands_phys_gathered, matmul_opspec_split,
 };
 pub use walk::SharedKernelBmmForm;
-
-pub use dims::set_split_mb_forbidden;

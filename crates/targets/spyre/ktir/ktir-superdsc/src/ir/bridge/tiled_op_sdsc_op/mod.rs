@@ -36,9 +36,9 @@ pub use attn::assemble_attn;
 pub use matmul::{
     SharedKernelBmmForm, assemble_matmul, assemble_matmul_batched_off,
     assemble_matmul_batched_seeded, assemble_matmul_off, assemble_matmul_off_phys_m,
-    assemble_matmul_placed, assemble_matmul_seeded, assemble_matmul_split, matmul_opspec,
-    matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
-    matmul_opspec_off_operands, matmul_opspec_split, try_assemble_matmul_seeded,
+    assemble_matmul_placed, assemble_matmul_seeded, assemble_matmul_split,
+    assemble_matmul_windowed, matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off,
+    matmul_opspec_off, matmul_opspec_off_operands, matmul_opspec_split, try_assemble_matmul_seeded,
 };
 pub use pointwise::{
     assemble_gather_copy, assemble_pointwise_broadcast_off_from_tile,

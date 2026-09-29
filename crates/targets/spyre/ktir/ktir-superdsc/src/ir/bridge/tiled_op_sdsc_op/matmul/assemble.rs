@@ -261,6 +261,123 @@ pub fn assemble_matmul_off<O: crate::sdsc_abstract::KindTag>(
     assemble_from_opspec(op_name, op, sym_id_base, layout)
 }
 
+/// [`assemble_matmul_off`] for a WINDOW of each operand — a Triton kernel's K/N-tiled matmul, where
+/// one trip sweeps `[m, k_blk]` of an `[m, k_full]` activation, `[k_blk, n_blk]` of a
+/// `[k_full, n_full]` (or transposed `[n_full, k_full]`) weight, and `[m, n_blk]` of an
+/// `[m, n_full]` output. Three facts the base forms cannot state:
+///
+/// 1. **Offsets.** Each operand's window corner becomes its `offset_elems` — the same slice
+///    mechanism the GQA-group bmm uses (`matmul_opspec_off`), so an unblocked program at zero
+///    offsets emits byte-identically to `assemble_matmul_seeded`.
+/// 2. **The KERNEL's physical `in` extent.** The kernel's stick-group stride is derived from the
+///    TILE's k (this op's iteration extent), but a windowed weight lives in an allocation whose
+///    `in` extent is the tensor's own. Reading column-block `k_blk` of a `[k_full, n]` weight with
+///    the tile's stride lands every stick group after the first `k_blk/k_stick`-invented rows
+///    away — MEASURED as corr 0.983 on the unblocked SwiGLU small twin (the offsets alone reached
+///    0.983 and the stride was the residual). `kernel_in_phys` declares the tensor's own `in`
+///    extent through [`TensorArg::with_device_extent`], the torch-spyre `arg.device_size` law the
+///    batched attention already relies on for the same reason (a swept window of a larger
+///    allocation must still be ADDRESSED by the allocation's stride).
+/// 3. **`n` vs `n_dev`.** The util-floor padding and the `DeviceWidth` rule are applied by the
+///    CALLER exactly as for the base form; this takes the final `n` it is handed.
+///
+/// ⛔ THE ACTIVATION AND OUTPUT GROUP STRIDES ARE ALREADY RIGHT. Both are RowBlocked sticked on
+/// their column axis, so a group stride is `rows · stick` — and `m` is not tiled by this door
+/// (`r_start` is refused upstream by `base_addressed`), so the swept `m` IS the tensor's row count
+/// and the handle extents the opspec derives are the tensor's own. Only the kernel's `in` axis —
+/// the one this tiling splits — needs the declaration.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_matmul_windowed(
+    op_name: &str,
+    m: MatM,
+    n: MatN,
+    k: MatK,
+    a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    a_off: crate::addr::DevOff,
+    w: &Stk<crate::sdsc_abstract::KernelTag>,
+    w_off: crate::addr::DevOff,
+    w_in_phys: u32,
+    o: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    o_off: crate::addr::DevOff,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
+    let mut op = matmul_opspec_off::<Fp16>(
+        m,
+        n,
+        k,
+        MatY::of_batch(1),
+        SharedKernelBmmForm::batch_inner_proven(super::walk::MatmulWrapperSite::witness()),
+        a_name,
+        w_name,
+        o_name,
+        a_off.into_raw_elems(),
+        w_off.into_raw_elems(),
+        o_off.into_raw_elems(),
+    )
+    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    // ⛔ THE KERNEL'S OWN `in` EXTENT, and a phys SMALLER than the swept k is a mis-declaration
+    // (the same rule `matmul_opspec_batched_off` states): a window never covers more than its
+    // allocation. Refused here rather than emitting a descriptor whose declared span exceeds the
+    // footprint the placement reserved.
+    if w_in_phys < k.get() {
+        panic!(
+            "assemble_matmul {op_name}: kernel `in` physical extent {w_in_phys} is SMALLER than \
+             the swept k {} — a window cannot cover more than its allocation",
+            k.get()
+        );
+    }
+    if let Some(kernel) = op.args.iter_mut().find(|arg| arg.view().name == w_name) {
+        use super::walk::WalkAxis as _;
+        kernel.set_device_extent(super::walk::InAxis::NAME, w_in_phys);
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    let mut emitted = crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    // ⭐⭐⭐⭐⭐ `N_.in_` CARRIES THE **KERNEL WEIGHT'S PHYSICAL `in` EXTENT**, NOT THE SWEPT `k`
+    // — THE ONE NUMBER THE WINDOW CHANGES ABOUT THE WIRE, AND THE CARD DECIDED IT.
+    //
+    // `maxDimSizes_ = -1` on a stick-blocked operand means "reconstruct the `device_size` from
+    // `N_`/`layoutDimOrder_`/`stickSize_`", and the extent that reconstruction reads for the
+    // out-stick GROUP stride is `N_`'s `in_`. A kernel weight is row-blocked at its PHYSICAL
+    // `[in_phys, out]` — the staged retile (`RetileDescriptor`'s `[out/64, in_phys, 64]`) packs
+    // consecutive out-sticks of one row `in_phys·64` elements apart — so a window sweeping `k`
+    // of `in_phys` leaves the card striding out-sticks by `k·64` instead: gate `2×` wrong
+    // (k=2048 of 4096), down `25×` (k=512 of 12800). Granite tiled_k is the first bake with
+    // >1 out-stick per kernel core (gate 2, down 8), so it is the first to exercise the stride:
+    // the output's first stick of each 512-col block carried ~0.5-corr signal, the rest noise,
+    // max|err| 6.93 against a 0.8055 flat ceiling. MEASURED ON CARD (pod nickm-7db9667cdd-fg7xv).
+    //
+    // Pinning `maxDimSizes_` instead is ON THE RECORD as inert: scratchy's gather row-window
+    // measured `[256,-1]` and `[256,4096]` BOTH giving 0.017013 with the wrong `N_`, while
+    // rewriting ONLY `N_` (the tensor's row count, not the leg's) made all eight blocks exact —
+    // the residency extent dxp reconstructs from is `N_`, full stop.
+    //
+    // ⛔ ONLY `N_`, AND THAT IS NOT AN OVERSIGHT. `numWkSlicesPerDim_`, `coreIdToWkSlice_`,
+    // `dataStageParam_.ss_`/`el_` and the per-core start addresses keep the SWEPT `k` — they are
+    // the op's WORK (per-core starts verified correct on card: gate cores stride exactly
+    // 1,048,576 B = 2 sticks × 4096 rows × 128 B). Rewriting the plan instead would divide the
+    // work by the physical extent, which is a different op.
+    //
+    // THE ACTIVATION AGREES. A `[mb, k]` window of the `[mb, in_phys]` activation walks ITS
+    // stick groups at `mb·lanes` (keyed on `N_.mb_`, untouched), and the contraction dim is
+    // shared: the activation's physical in extent EQUALS `w_in_phys` (A[64,4096]·W[4096,12800]
+    // gate, A[64,12800]·W[12800,4096] down) — so the tiled descriptor says exactly what the
+    // PASSING flat granite descriptor says (`N_.in_ = 4096/12800`, its kernels never wrong).
+    // FLAT AND `k == in_phys` ARE BYTE-IDENTICAL: `w_in_phys == k` skips the rewrite.
+    if w_in_phys != k.get()
+        && let Some(dsc) = emitted.op.as_mut()
+    {
+        for dsc_map in dsc.dscs_.iter_mut() {
+            for d in dsc_map.values_mut() {
+                d.N_.in_ = w_in_phys as i64;
+            }
+        }
+    }
+    emitted
+}
+
 /// [`assemble_matmul_off`] for an op that sweeps only PART of the activation's rows: `m` is what it
 /// COMPUTES; the activation's base offset and its head pitch (how many rows the tensor is actually
 /// packed with per stick plane) arrive TOGETHER as one [`OperandPlacement`], and stride derivation
