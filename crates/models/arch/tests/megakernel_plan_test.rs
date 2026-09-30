@@ -58,10 +58,12 @@ fn check_class(name: &str, classed: &ClassedTape) {
         mk.metallib.starts_with(b"MTLB"),
         "{name}: the library is compiled at build time"
     );
-    // The work split is the launch's: every lane a function of the GPU's cores (`MK_P`).
+    // The work split is the launch's participants': the threadgroups that checked in, each by
+    // its ticket, never by its position in the grid.
     assert!(
-        !source_has(mk.source, "mk_tg == ") || source_has(mk.source, "% MK_P;"),
-        "{name}: a pinned lane not taken modulo the launch's threadgroups"
+        source_has(mk.source, "if (!mk_check_in(")
+            && !source_has(mk.source, "threadgroup_position_in_grid"),
+        "{name}: work placed by grid position, not by the participants that checked in"
     );
     // Each baked step is spelled once — alone, or in a co-issued group's one call.
     for s in mk.steps {

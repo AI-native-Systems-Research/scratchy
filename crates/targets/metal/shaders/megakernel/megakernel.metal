@@ -94,42 +94,69 @@
 #undef MK_LIB
 
 #ifndef MK_ENUMERATE
-// The persistent threadgroups one launch runs — the GPU's cores, known at load. Every generated
-// work split reads it: item `i` of a spread step at phase cursor `c` runs on threadgroup
-// `(c + i) mod MK_P`, a pinned unit of lane `l` on threadgroup `l mod MK_P`.
+// The threadgroups one launch asks for — the GPU's cores, known at load. Those that start in
+// time to check in (`mk_check_in`) run the token: the generated work split reads their count
+// `mk_p`, item `i` of a spread step at phase cursor `c` running on participant `(c + i) mod mk_p`,
+// a pinned unit of lane `l` on participant `l`.
 constant uint MK_P [[function_constant(4096)]];
-// Polls one grid-barrier wait may spend before it records a stall and gives up. Apple10 offers
-// no forward-progress primitive (`atomic_wait*`, `critical_section` and `yield_simdgroup` fail
-// pipeline creation), so a wait spins — boundedly.
+// Polls one grid-barrier wait may spend before it records a stall and gives up. The participants
+// are all running, so a wait lasts as long as the slowest of them takes to arrive; there is no
+// forward-progress primitive to wait on instead (Apple10: `atomic_wait*`, `critical_section` and
+// `yield_simdgroup` fail pipeline creation), so a wait spins — boundedly.
 constant uint MK_SPIN_LIMIT [[function_constant(4097)]];
+// Polls the first threadgroups to check in wait for the others before the launch goes ahead
+// without them. The GPU starts a launch's threadgroups together, unless other work holds some of
+// its cores; then one can start 100+ ms late (an M1 Max, measured), and the token runs without it.
+constant uint MK_CHECKIN_POLLS [[function_constant(4098)]];
 
-// The launch's synchronization block, the stall word alone on its 128-byte line; one 128-byte line
-// per persistent threadgroup follows it (`mk_arrived`). Mirrors `MkSyncBlock`
-// (interpreter/metal/megakernel.rs).
+// The launch's synchronization block: the stall word, then the check-in's ticket counter and its
+// close word, alone on a 128-byte line; one 128-byte line per participant follows it
+// (`mk_arrived`). The host zeroes everything after the stall word before every launch. Mirrors
+// `MkSyncBlock` (interpreter/metal/megakernel.rs).
 struct MkSync {
   atomic_uint stall[4]; // [0] = 1 + the barrier site that gave up (0 = healthy), [1] = arrivals
-                        // it saw, [2] = the barriers the launch had passed, [3] = the P it
-                        // waited for
-  uint line[28];
+                        // it saw, [2] = the barriers the launch had passed, [3] = the
+                        // participants it waited for
+  atomic_uint checkin;  // tickets taken this launch
+  atomic_uint closed;   // 0 while the check-in is open, then 1 + the participants
+  uint line[26];
 };
 
-// The grid barriers threadgroup `tg` has arrived at, ever (wraps): its own line after the block.
-METAL_FUNC device atomic_uint* mk_arrived(device MkSync* sync, uint tg) {
-  return (device atomic_uint*)((device uchar*)(sync + 1) + tg * 128u);
+// The grid barriers participant `idx` has arrived at this launch: its own line after the block.
+METAL_FUNC device atomic_uint* mk_arrived(device MkSync* sync, uint idx) {
+  return (device atomic_uint*)((device uchar*)(sync + 1) + idx * 128u);
 }
 
-// Stall word first, then this threadgroup's arrivals, which every thread keeps (`gen`): thread 0
-// at kernel entry. `ok` holds [0] the verdict, [1] the arrivals. A launch after a stall (the host
-// turns the stall word into a typed error and resets the block) waits at no barrier.
-METAL_FUNC void mk_enter(device MkSync* sync, uint tg, uint t, thread uint& gen,
-                         threadgroup uint* ok) {
+// THE CHECK-IN, before any work: thread 0 takes a ticket and waits (at most `MK_CHECKIN_POLLS`)
+// for every threadgroup of the launch to take one; then the first to see the wait over closes
+// the check-in at the tickets taken so far — the participants. Returns false for a threadgroup
+// whose ticket came after the close: it exits having touched nothing. `ok` holds [0] the verdict
+// the barriers read (a launch after an unreported stall waits at none), [1] the ticket, [2] the
+// participants — written by thread 0 alone and read by every thread after a threadgroup barrier,
+// so every thread of a threadgroup takes the same path out of it.
+METAL_FUNC bool mk_check_in(device MkSync* sync, uint t, threadgroup uint* ok, thread uint& idx,
+                            thread uint& p) {
   if (t == 0) {
+    const uint ticket = atomic_fetch_add_explicit(&sync->checkin, 1u, memory_order_relaxed);
+    uint closed = atomic_load_explicit(&sync->closed, memory_order_relaxed);
+    for (uint polls = 0; closed == 0u; ++polls) {
+      const uint taken = atomic_load_explicit(&sync->checkin, memory_order_relaxed);
+      if (taken >= MK_P || polls >= MK_CHECKIN_POLLS) {
+        uint open = 0u;
+        atomic_compare_exchange_weak_explicit(&sync->closed, &open, 1u + min(taken, MK_P),
+                                              memory_order_relaxed, memory_order_relaxed);
+      }
+      closed = atomic_load_explicit(&sync->closed, memory_order_relaxed);
+    }
     const bool healthy = atomic_load_explicit(&sync->stall[0], memory_order_relaxed) == 0u;
-    ok[1] = atomic_load_explicit(mk_arrived(sync, tg), memory_order_relaxed);
     ok[0] = healthy ? 1u : 0u;
+    ok[1] = ticket;
+    ok[2] = closed - 1u;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  gen = ok[1];
+  idx = ok[1];
+  p = ok[2];
+  return idx < p;
 }
 
 // The grid barrier's fences: release before a threadgroup publishes its arrival, acquire after
@@ -145,27 +172,26 @@ METAL_FUNC void mk_enter(device MkSync* sync, uint tg, uint t, thread uint& gen,
 #define MK_FENCE_ACQUIRE memory_order_seq_cst
 #endif
 
-// A GRID BARRIER: every threadgroup's device writes before it are visible to every threadgroup
-// after it. Release; thread 0 publishes this threadgroup's arrival on its own line; threads
-// 0..P-1 each spin (bounded) until one threadgroup's line shows the same barrier; acquire. No
-// read-modify-write and no second hop: the last arrival's store IS what the others wait for.
-// `site` numbers the barrier in the kernel text; `gen0` is the arrivals at entry, so
-// `gen - gen0` counts the barriers passed — the first is also the co-residency check-in (a
-// threadgroup the GPU never scheduled alongside the others shows as a stall there). Once a wait
-// gave up (`ok[0]` = 0) no later barrier waits and the launch runs to its end, the host reporting
-// the stall: the kernel never exits early. An exit on a verdict read from threadgroup memory puts
-// every later barrier under control flow the compiler cannot prove uniform — so compiled, a
-// threadgroup of the Gemma-4 kernel hung at a layer loop's exit.
-METAL_FUNC void mk_grid_sync(device MkSync* sync, uint tg, uint t, thread uint& gen, uint gen0,
+// A GRID BARRIER among the launch's `p` participants: every participant's device writes before
+// it are visible to every participant after it. Release; thread 0 publishes this participant's
+// arrival on its own line; threads 0..p-1 each spin (bounded) until one participant's line shows
+// the same barrier; acquire. No read-modify-write and no second hop: the last arrival's store IS
+// what the others wait for. `site` numbers the barrier in the kernel text; `gen` counts the
+// barriers passed this launch. Once a wait gave up (`ok[0]` = 0) no later barrier waits and the
+// launch runs to its end, the host reporting the stall: the kernel never exits mid-way. An exit
+// on a verdict read from threadgroup memory while other threads may still write it puts every
+// later barrier under control flow that is not uniform — so compiled, a threadgroup of the
+// Gemma-4 kernel hung at a layer loop's exit.
+METAL_FUNC void mk_grid_sync(device MkSync* sync, uint idx, uint p, uint t, thread uint& gen,
                              threadgroup uint* ok, uint site) {
   const uint mine = gen + 1u;
   atomic_thread_fence(mem_flags::mem_device, MK_FENCE_RELEASE, thread_scope_device);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (t == 0) atomic_store_explicit(mk_arrived(sync, tg), mine, memory_order_relaxed);
-  if (t < MK_P && ok[0] != 0u) {
+  if (t == 0) atomic_store_explicit(mk_arrived(sync, idx), mine, memory_order_relaxed);
+  if (t < p && ok[0] != 0u) {
     device atomic_uint* line = mk_arrived(sync, t);
     for (uint spins = 0;; ++spins) {
-      if (int(atomic_load_explicit(line, memory_order_relaxed) - mine) >= 0) break;
+      if (atomic_load_explicit(line, memory_order_relaxed) >= mine) break;
       const bool check = (spins & 1023u) == 1023u;
       if (check && atomic_load_explicit(&sync->stall[0], memory_order_relaxed) != 0u) {
         ok[0] = 0u;
@@ -176,13 +202,12 @@ METAL_FUNC void mk_grid_sync(device MkSync* sync, uint tg, uint t, thread uint& 
         if (atomic_compare_exchange_weak_explicit(&sync->stall[0], &expected, 1u + site,
                                                   memory_order_relaxed, memory_order_relaxed)) {
           uint seen = 0u;
-          for (uint l = 0; l < MK_P; ++l) {
-            const uint at = atomic_load_explicit(mk_arrived(sync, l), memory_order_relaxed);
-            seen += int(at - mine) >= 0 ? 1u : 0u;
+          for (uint l = 0; l < p; ++l) {
+            seen += atomic_load_explicit(mk_arrived(sync, l), memory_order_relaxed) >= mine;
           }
           atomic_store_explicit(&sync->stall[1], seen, memory_order_relaxed);
-          atomic_store_explicit(&sync->stall[2], mine - 1u - gen0, memory_order_relaxed);
-          atomic_store_explicit(&sync->stall[3], MK_P, memory_order_relaxed);
+          atomic_store_explicit(&sync->stall[2], mine - 1u, memory_order_relaxed);
+          atomic_store_explicit(&sync->stall[3], p, memory_order_relaxed);
         }
         ok[0] = 0u;
         break;
@@ -194,8 +219,8 @@ METAL_FUNC void mk_grid_sync(device MkSync* sync, uint tg, uint t, thread uint& 
   gen = mine;
 }
 
-// The first work item of a spread step on threadgroup `tg`, the phase cursor at `c`.
-METAL_FUNC uint mk_first(uint tg, uint c) { return (tg + MK_P - c % MK_P) % MK_P; }
+// The first work item of a spread step on participant `idx` of `p`, the phase cursor at `c`.
+METAL_FUNC uint mk_first(uint idx, uint p, uint c) { return (idx + p - c % p) % p; }
 
 // The work items of a grid the load sizes (`vpi` virtual threadgroups per item).
 METAL_FUNC uint mk_items(uint3 grid, uint vpi) { return (grid.x * grid.y * grid.z + vpi - 1u) / vpi; }

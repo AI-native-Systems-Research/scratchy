@@ -836,8 +836,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if trace {
             eprintln!(
                 "[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4] {took} \
-                 megakernel_runs={}",
+                 megakernel_runs={} participants={}",
                 worker.megakernel_runs_played(),
+                match worker.megakernel_runs_played() {
+                    0 => "-".to_string(),
+                    _ => worker
+                        .megakernel_participants(bucket_idx)
+                        .map_or("-".to_string(), |p| p.to_string()),
+                },
             );
         }
         Ok(())

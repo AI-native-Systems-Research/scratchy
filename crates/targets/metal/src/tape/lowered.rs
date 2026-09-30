@@ -2297,11 +2297,12 @@ pub const MK_SIMD_WIDTH: u32 = 32;
 /// Threadgroup memory the steps of one persistent threadgroup may use: the 32 KiB a threadgroup
 /// has, less the 16 bytes the generated kernel keeps for its barrier flag.
 pub const MK_TG_MEMORY: u32 = 32 * 1024 - 16;
-/// The function constants of every generated kernel (`megakernel.metal`): the persistent
-/// threadgroups `MK_P` and the grid-barrier spin bound `MK_SPIN_LIMIT`; the load constants
-/// ([`MkLoadConstant`]) follow from `MK_FC_LOAD`.
+/// The function constants of every generated kernel (`megakernel.metal`): the threadgroups a
+/// launch asks for `MK_P`, the grid-barrier spin bound `MK_SPIN_LIMIT` and the check-in's wait
+/// `MK_CHECKIN_POLLS`; the load constants ([`MkLoadConstant`]) follow from `MK_FC_LOAD`.
 pub const MK_FC_P: ConstSlot = ConstSlot(4096);
 pub const MK_FC_SPIN_LIMIT: ConstSlot = ConstSlot(4097);
+pub const MK_FC_CHECKIN_POLLS: ConstSlot = ConstSlot(4098);
 pub const MK_FC_LOAD: ConstSlot = ConstSlot(4200);
 
 /// How a step packs into items of at most [`MK_THREADS`] threads (its adapter's `item_threads`).
@@ -2416,11 +2417,8 @@ pub enum MegakernelError {
     LoadConstant { symbol: &'static str },
     /// The generated library failed to compile at load.
     Compile(String),
-    /// Not every persistent threadgroup of the launch checked in at its first grid barrier (site
-    /// `site`): the GPU did not run all `of` of them at once (`arrived` had).
-    CoResidency { site: u32, arrived: u32, of: u32 },
     /// The launch's `ordinal`-th grid barrier (site `site` of the kernel text) gave up waiting
-    /// (`arrived` of `of`).
+    /// (`arrived` of its `of` participants).
     Stall {
         site: u32,
         ordinal: u32,
@@ -2494,11 +2492,6 @@ impl std::fmt::Display for MegakernelError {
                 "megakernel: a load constant of `{symbol}` is not on its materialized command"
             ),
             Self::Compile(e) => write!(f, "megakernel: the generated library: {e}"),
-            Self::CoResidency { site, arrived, of } => write!(
-                f,
-                "megakernel: only {arrived} of {of} persistent threadgroups checked in at the \
-                 first grid barrier (site {site}): not co-resident"
-            ),
             Self::Stall {
                 site,
                 ordinal,
@@ -2506,8 +2499,8 @@ impl std::fmt::Display for MegakernelError {
                 of,
             } => write!(
                 f,
-                "megakernel: grid barrier {ordinal} (site {site}) gave up ({arrived} of {of} \
-                 threadgroups arrived)"
+                "megakernel: grid barrier {ordinal} (site {site}) gave up ({arrived} of its {of} \
+                 participants arrived)"
             ),
         }
     }

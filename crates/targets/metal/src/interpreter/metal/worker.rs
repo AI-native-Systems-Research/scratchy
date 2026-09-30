@@ -605,6 +605,13 @@ impl<W: CanonicalParams> MetalWorker<W> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// After a forward of `bucket` completed: how many threadgroups ran its megakernel launch
+    /// (checked in), if it had one.
+    pub fn megakernel_participants(&self, bucket: usize) -> Option<u32> {
+        let mk = self.bucket_bakings.get(bucket)?.megakernel.as_ref()?;
+        Some(mk.participants())
+    }
+
     /// After a forward's command buffer completed: the first bounded wait any megakernel run
     /// gave up on, as a typed error (every stall word is cleared).
     pub fn take_megakernel_stall(&self) -> Result<(), MegakernelError> {

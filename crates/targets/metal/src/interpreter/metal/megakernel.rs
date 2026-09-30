@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
+use ::objc2_foundation::NSRange;
 use ::objc2_metal::{
     MTL4ArgumentTable, MTL4CommandEncoder as _, MTL4ComputeCommandEncoder, MTL4VisibilityOptions,
     MTLComputePipelineState as _, MTLStages,
@@ -26,26 +27,40 @@ use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::worker::WorkerError;
 use crate::tape::constants::ConstantValue;
 use crate::tape::lowered::{
-    GatedCommand, MK_FC_P, MK_FC_SPIN_LIMIT, MK_THREADS, MegakernelError, MegakernelTape,
-    MkLoadSource,
+    GatedCommand, MK_FC_CHECKIN_POLLS, MK_FC_P, MK_FC_SPIN_LIMIT, MK_THREADS, MegakernelError,
+    MegakernelTape, MkLoadSource,
 };
 
 /// The adapters' bodies: `shaders/megakernel/megakernel.metal` with its local includes inlined
 /// (build.rs). A tape's generated kernel completes it; the bake compiles the two together.
 pub const MK_BODIES: &str = include_str!(concat!(env!("OUT_DIR"), "/mk_bodies.metal"));
 
-/// Polls one grid-barrier wait may spend before it records a stall and gives up.
-const MK_SPIN_LIMIT: u32 = 1 << 20;
+/// Polls one grid-barrier wait may spend before it records a stall and gives up: about a second
+/// at the ~67 ns a poll took on an M1 Max. Every participant is running, so this bounds a wait for
+/// one the system holds up, not one that never started.
+const MK_SPIN_LIMIT: u32 = 1 << 24;
 
-/// The launch synchronization block: the stall word alone on its 128-byte line, then one 128-byte
-/// line per persistent threadgroup (the grid barriers it has arrived at). Mirrors `MkSync` in
-/// `shaders/megakernel/megakernel.metal`.
+/// Polls the first threadgroups to check in wait for the rest of the launch before it goes ahead
+/// without them: tens of microseconds. On an M1 Max every threadgroup normally checked in within
+/// 0 polls of the first; one held up by other work on the GPU came 1.6–2.3 million polls
+/// (120–155 ms) later.
+const MK_CHECKIN_POLLS: u32 = 1 << 10;
+
+/// The launch synchronization block: the stall word, the check-in's ticket counter and close word
+/// on one 128-byte line, then one 128-byte line per participant (the grid barriers it has arrived
+/// at this launch). Mirrors `MkSync` in `shaders/megakernel/megakernel.metal`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MkSyncBlock {
     stall: [u32; 4],
-    line: [u32; 28],
+    checkin: u32,
+    closed: u32,
+    line: [u32; 26],
 }
+
+/// Where the block's per-launch state starts: everything after the stall word, which the host
+/// reads (and resets) after the forward.
+const MK_SYNC_LAUNCH_STATE: usize = std::mem::offset_of!(MkSyncBlock, checkin);
 
 /// Bytes of the synchronization block of a launch of `threadgroups`.
 fn sync_bytes(threadgroups: usize) -> usize {
@@ -116,6 +131,7 @@ impl MegakernelBaking {
         let mut constants = vec![
             ConstantValue::uint(MK_FC_P, threadgroups as u32),
             ConstantValue::uint(MK_FC_SPIN_LIMIT, MK_SPIN_LIMIT),
+            ConstantValue::uint(MK_FC_CHECKIN_POLLS, MK_CHECKIN_POLLS),
         ];
         for l in tape.load_constants {
             let at = baked_of.iter().position(|&b| b == l.baked as usize);
@@ -242,13 +258,20 @@ impl MegakernelBaking {
         self.commands.clone()
     }
 
-    /// Encode the launch: a barrier, then the kernel over `MK_P` threadgroups. The caller fences
-    /// the next dispatch.
+    /// Encode the launch: its synchronization state zeroed (the check-in and every participant's
+    /// barrier count start afresh), a barrier, then the kernel over `MK_P` threadgroups. The
+    /// caller fences the next dispatch.
     pub fn encode(&self, enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>) {
+        let state = NSRange {
+            location: MK_SYNC_LAUNCH_STATE,
+            length: sync_bytes(self.threadgroups) - MK_SYNC_LAUNCH_STATE,
+        };
+        // SAFETY: the range lies inside the live, resident synchronization buffer.
+        unsafe { enc.fillBuffer_range_value(&self.sync, state, 0) };
         enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch | MTLStages::Blit,
             MTLStages::Dispatch,
-            MTLStages::Dispatch,
-            MTL4VisibilityOptions::None,
+            MTL4VisibilityOptions::Device,
         );
         enc.setArgumentTable(Some(&self.table));
         enc.setComputePipelineState(&self.pipeline);
@@ -261,6 +284,15 @@ impl MegakernelBaking {
             one(self.threadgroups),
             one(MK_THREADS as usize),
         );
+    }
+
+    /// After a forward's command buffer completed: the threadgroups that checked in to its launch
+    /// (0 if it played none since the last reset).
+    pub fn participants(&self) -> u32 {
+        // SAFETY: a shared `MkSyncBlock` the GPU no longer touches (the forward completed).
+        let block =
+            unsafe { std::ptr::read_volatile(self.sync.contents().as_ptr().cast::<MkSyncBlock>()) };
+        block.closed.saturating_sub(1)
     }
 
     /// After a forward's command buffer completed: a grid barrier that gave up, as a typed error
@@ -277,11 +309,6 @@ impl MegakernelBaking {
         };
         match block.stall {
             [0, ..] => Ok(()),
-            [site, arrived, 0, of] => Err(MegakernelError::CoResidency {
-                site: site - 1,
-                arrived,
-                of,
-            }),
             [site, arrived, ordinal, of] => Err(MegakernelError::Stall {
                 site: site - 1,
                 ordinal,

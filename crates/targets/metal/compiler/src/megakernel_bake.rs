@@ -390,41 +390,48 @@ fn pack_phases(
 }
 
 impl PhaseShape {
-    /// The split of every phase of shape `s`, as program-scope constants of the launch's `MK_P`
-    /// (the pipeline's specialization folds each). The phase keeps the fewest rounds its items
-    /// allow — at their adapters' widths, or across the whole threadgroup for a phase of few
-    /// rounds ([`MK_ROUND_BOUND_PHASE`]) — a slot of the last round left to each free pinned unit;
-    /// the slots those rounds hold beyond the items go to the steps in proportion to their virtual
-    /// threadgroups, each step's items then even (`MK_S{s}_K{i}` virtual threadgroups per item,
-    /// `MK_S{s}_N{i}` items, starting at cursor `MK_S{s}_C{i}`); pinned group `g` plays on the lane
-    /// after the phase's last spread item (`MK_S{s}_L{g}`), the least loaded.
+    /// The split of every phase of shape `s` among the launch's `mk_p` participants — the
+    /// threadgroups that checked in — as functions of `mk_p` the phase inlines. The phase keeps the
+    /// fewest rounds its items allow — at their adapters' widths, or across the whole threadgroup
+    /// for a phase of few rounds ([`MK_ROUND_BOUND_PHASE`]) — a slot of the last round left to each
+    /// free pinned unit; the slots those rounds hold beyond the items go to the steps in proportion
+    /// to their virtual threadgroups, each step's items then even (`MK_S{s}_K{i}` virtual
+    /// threadgroups per item, `MK_S{s}_N{i}` items, starting at cursor `MK_S{s}_C{i}`); pinned group
+    /// `g` plays on the participant after the phase's last spread item (`MK_S{s}_L{g}`), the least
+    /// loaded.
     fn msl(&self, s: usize, out: &mut String) {
-        let p = |name: &str| format!("MK_S{s}_{name}");
+        let p = |name: &str| format!("MK_S{s}_{name}(mk_p)");
+        let mut def = |ty: &str, name: &str, expr: &str| {
+            let _ = writeln!(
+                out,
+                "METAL_FUNC {ty} MK_S{s}_{name}(uint mk_p) {{ return {expr}; }}"
+            );
+        };
         let (min, max) = (
             |a: &str, b: &str| format!("({a} < {b} ? {a} : {b})"),
             |a: &str, b: &str| format!("({a} > {b} ? {a} : {b})"),
         );
         let declared: u32 = self.spread.iter().map(|x| x.declared).sum();
-        let _ = writeln!(
-            out,
-            "constant bool {} = ({declared}u + MK_P - 1u) / MK_P <= {MK_ROUND_BOUND_PHASE}u;",
-            p("RB")
+        def(
+            "bool",
+            "RB",
+            &format!("({declared}u + mk_p - 1u) / mk_p <= {MK_ROUND_BOUND_PHASE}u"),
         );
         let mut n0 = Vec::with_capacity(self.spread.len());
         for (i, x) in self.spread.iter().enumerate() {
-            let _ = writeln!(out, "constant uint {} = {};", p(&format!("V{i}")), x.vtgs);
+            def("uint", &format!("V{i}"), &x.vtgs);
             match x.fit {
                 Some((widest, whole)) => {
-                    let _ = writeln!(
-                        out,
-                        "constant uint {} = {} ? {whole}u : {widest}u;\n\
-                         constant uint {} = ({} + {} - 1u) / {};",
-                        p(&format!("KA{i}")),
-                        p("RB"),
-                        p(&format!("NA{i}")),
-                        p(&format!("V{i}")),
-                        p(&format!("KA{i}")),
-                        p(&format!("KA{i}")),
+                    def(
+                        "uint",
+                        &format!("KA{i}"),
+                        &format!("{} ? {whole}u : {widest}u", p("RB")),
+                    );
+                    let (v, ka) = (p(&format!("V{i}")), p(&format!("KA{i}")));
+                    def(
+                        "uint",
+                        &format!("NA{i}"),
+                        &format!("({v} + {ka} - 1u) / {ka}"),
                     );
                     n0.push(p(&format!("NA{i}")));
                 }
@@ -439,30 +446,22 @@ impl PhaseShape {
             .filter(|&i| self.spread[i].fit.is_some())
             .map(|i| p(&format!("V{i}")))
             .collect();
-        let _ = writeln!(
-            out,
-            "constant uint {} = {};\nconstant uint {} = {};\n\
-             constant uint {} = ({} + {} + MK_P - 1u) / MK_P;\nconstant uint {} = {};\n\
-             constant uint {} = {};",
-            p("NT"),
-            sum(&n0),
-            p("RES"),
-            min(&format!("{}u", self.free), "MK_P - 1u"),
-            p("R"),
-            p("NT"),
-            p("RES"),
-            p("SLOTS"),
-            max(&format!("{} * MK_P - {}", p("R"), p("RES")), &p("NT")),
-            p("VF"),
-            sum(&fit_v),
+        def("uint", "NT", &sum(&n0));
+        def("uint", "RES", &min(&format!("{}u", self.free), "mk_p - 1u"));
+        def(
+            "uint",
+            "R",
+            &format!("({} + {} + mk_p - 1u) / mk_p", p("NT"), p("RES")),
         );
-        let _ = writeln!(out, "constant uint {} = 0u;", p("C0"));
+        def(
+            "uint",
+            "SLOTS",
+            &max(&format!("{} * mk_p - {}", p("R"), p("RES")), &p("NT")),
+        );
+        def("uint", "VF", &sum(&fit_v));
+        def("uint", "C0", "0u");
         for (i, x) in self.spread.iter().enumerate() {
-            let (v, k, n) = (
-                p(&format!("V{i}")),
-                p(&format!("K{i}")),
-                p(&format!("N{i}")),
-            );
+            let (v, k) = (p(&format!("V{i}")), p(&format!("K{i}")));
             match x.fit {
                 Some(_) => {
                     let share = format!(
@@ -472,31 +471,27 @@ impl PhaseShape {
                         p("NT"),
                         p("VF")
                     );
-                    let _ = writeln!(
-                        out,
-                        "constant uint {k} = ({v} + {} - 1u) / {};\n\
-                         constant uint {n} = ({v} + {k} - 1u) / {k};",
-                        min(&v, &share),
-                        min(&v, &share),
+                    let items = min(&v, &share);
+                    def(
+                        "uint",
+                        &format!("K{i}"),
+                        &format!("({v} + {items} - 1u) / {items}"),
                     );
+                    def("uint", &format!("N{i}"), &format!("({v} + {k} - 1u) / {k}"));
                 }
-                None => {
-                    let _ = writeln!(out, "constant uint {n} = {}u;", x.declared);
-                }
+                None => def("uint", &format!("N{i}"), &format!("{}u", x.declared)),
             }
-            let _ = writeln!(
-                out,
-                "constant uint {} = {} + {n};",
-                p(&format!("C{}", i + 1)),
-                p(&format!("C{i}")),
+            def(
+                "uint",
+                &format!("C{}", i + 1),
+                &format!("{} + {}", p(&format!("C{i}")), p(&format!("N{i}"))),
             );
         }
         for g in 0..self.groups {
-            let _ = writeln!(
-                out,
-                "constant uint {} = ({} + {g}u) % MK_P;",
-                p(&format!("L{g}")),
-                p(&format!("C{}", self.spread.len())),
+            def(
+                "uint",
+                &format!("L{g}"),
+                &format!("({} + {g}u) % mk_p", p(&format!("C{}", self.spread.len()))),
             );
         }
     }
@@ -1188,12 +1183,11 @@ impl<'a> Gen<'a> {
             s,
             "[[kernel, max_total_threads_per_threadgroup(1024)]] void mk_forward(\n    \
              constant ulong* mk_a [[buffer(0)]],\n    device MkSync* mk_sync [[buffer(1)]],\n    \
-             uint mk_tg [[threadgroup_position_in_grid]],\n    \
              uint mk_t [[thread_index_in_threadgroup]]) {{\n  \
              threadgroup uchar mk_tgm[{tg_memory}] __attribute__((aligned(16)));\n  \
-             threadgroup uint mk_ok[2];\n  uint mk_gen = 0u;\n  \
-             mk_enter(mk_sync, mk_tg, mk_t, mk_gen, mk_ok);\n  \
-             const uint mk_gen0 = mk_gen;\n{body}}}\n"
+             threadgroup uint mk_ok[3];\n  uint mk_idx, mk_p;\n  \
+             if (!mk_check_in(mk_sync, mk_t, mk_ok, mk_idx, mk_p)) return;\n  \
+             uint mk_gen = 0u;\n{body}}}\n"
         );
         let library = String::leak(format!("megakernel_{:016x}", fnv1a(s.as_bytes())));
         let mut steps = Vec::new();
@@ -1294,9 +1288,9 @@ impl<'a> Gen<'a> {
                 let s = self.step_decl(a, inst.as_deref(), PerItem::Split { shape, ord })?;
                 let _ = writeln!(
                     out,
-                    "{ind}{{ // {}\n{ind}  {}\n{ind}  for (uint it = mk_first(mk_tg, MK_S{shape}_C{ord}); \
-                     it < {}; it += MK_P) {{\n{ind}    {}(s, mk_lane(s, it, mk_t), mk_tgm);{}\n\
-                     {ind}  }}\n{ind}}}",
+                    "{ind}{{ // {}\n{ind}  {}\n{ind}  for (uint it = mk_first(mk_idx, mk_p, \
+                     MK_S{shape}_C{ord}(mk_p)); it < {}; it += mk_p) {{\n{ind}    {}(s, \
+                     mk_lane(s, it, mk_t), mk_tgm);{}\n{ind}  }}\n{ind}}}",
                     s.what,
                     s.decl,
                     s.items,
@@ -1313,9 +1307,9 @@ impl<'a> Gen<'a> {
             Place::Pinned { .. } | Place::Everywhere => {
                 let _ = match placement {
                     Place::Pinned { shape, group } => {
-                        writeln!(out, "{ind}if (mk_tg == MK_S{shape}_L{group}) {{")
+                        writeln!(out, "{ind}if (mk_idx == MK_S{shape}_L{group}(mk_p)) {{")
                     }
-                    _ => writeln!(out, "{ind}{{ // on every threadgroup"),
+                    _ => writeln!(out, "{ind}{{ // on every participant"),
                 };
                 let mut last_tg = 0;
                 let members: Vec<usize> = members.collect();
@@ -1524,9 +1518,10 @@ impl<'a> Gen<'a> {
                 format!("{}u", g.vtgs_per_item),
                 format!("mk_items(s.grid, {}u)", g.vtgs_per_item),
             ),
-            (false, Some((shape, ord))) => {
-                (format!("MK_S{shape}_K{ord}"), format!("MK_S{shape}_N{ord}"))
-            }
+            (false, Some((shape, ord))) => (
+                format!("MK_S{shape}_K{ord}(mk_p)"),
+                format!("MK_S{shape}_N{ord}(mk_p)"),
+            ),
             (false, None) if heads.is_some() => (
                 format!("{}u", g.vtgs_per_item),
                 format!("mk_items(s.grid, {}u)", g.vtgs_per_item),
@@ -1602,7 +1597,7 @@ impl Emit {
     /// the counters of a loop the kernel starts in.
     fn barrier(&mut self, ind: &str, out: &mut String) {
         let site = self.sites;
-        let call = format!("mk_grid_sync(mk_sync, mk_tg, mk_t, mk_gen, mk_gen0, mk_ok, {site}u);");
+        let call = format!("mk_grid_sync(mk_sync, mk_idx, mk_p, mk_t, mk_gen, mk_ok, {site}u);");
         match &self.prior {
             Prior::Nothing => return,
             Prior::Always => {
@@ -1763,14 +1758,28 @@ mod tests {
 
     /// Evaluates the generated program-scope constants at one `MK_P`: the arithmetic the
     /// pipeline's specialization folds (unsigned `+ - * / %`, comparisons, `?:`).
+    /// Evaluates the generated program-scope constants and split functions with `p` threadgroups
+    /// launched and all `p` checked in (`MK_P` = `mk_p` = `p`): the arithmetic the kernel runs
+    /// (unsigned `+ - * / %`, comparisons, `?:`), each function of `mk_p` a name.
     fn eval_constants(text: &str, p: u32) -> HashMap<String, u64> {
-        let mut env = HashMap::from([("MK_P".to_string(), u64::from(p))]);
+        let mut env = HashMap::from([
+            ("MK_P".to_string(), u64::from(p)),
+            ("mk_p".to_string(), u64::from(p)),
+        ]);
         for line in text.lines() {
-            let Some(rest) = line.trim().strip_prefix("constant ") else {
+            let line = line.trim();
+            let (name, expr) = if let Some(rest) = line.strip_prefix("constant ") {
+                let (_, rest) = rest.split_once(' ').expect("a typed constant");
+                rest.split_once(" = ").expect("an initialized constant")
+            } else if let Some(rest) = line.strip_prefix("METAL_FUNC ") {
+                let (_, rest) = rest.split_once(' ').expect("a typed function");
+                let (name, rest) = rest
+                    .split_once("(uint mk_p) { return ")
+                    .expect("a split function");
+                (name, rest.trim_end_matches(" }"))
+            } else {
                 continue;
             };
-            let (_, rest) = rest.split_once(' ').expect("a typed constant");
-            let (name, expr) = rest.split_once(" = ").expect("an initialized constant");
             let v = eval(expr.trim_end_matches(';'), &env);
             env.insert(name.to_string(), v);
         }
@@ -1884,6 +1893,11 @@ mod tests {
             assert_eq!(t[*at], ")");
             *at += 1;
             return v;
+        }
+        if t.get(*at).is_some_and(|y| y == "(") {
+            // A split function, called with the participants.
+            assert_eq!(t[*at + 1..*at + 3], ["mk_p", ")"], "{x}(mk_p)");
+            *at += 3;
         }
         match x.strip_suffix('u').and_then(|n| n.parse().ok()) {
             Some(n) => n,
