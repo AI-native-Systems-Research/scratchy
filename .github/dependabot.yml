@@ -7,6 +7,13 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # parquet's arrow reader returns arrow's types: bumped apart, the
+      # dataset benches hand one arrow's record batches to another's writer.
+      arrow:
+        patterns:
+          - "arrow"
+          - "parquet"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

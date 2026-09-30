@@ -124,8 +124,8 @@ jobs:
 
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is
-      # invisible to it and no job anywhere compiles them. These two steps close
-      # that for the one crate whose tests need no hardware at all.
+      # invisible to it and no job anywhere compiles them. These three steps
+      # close that for the one crate whose tests need no hardware at all.
       #
       # `--all-targets` can't simply be added to the workspace clippy: it would
       # also build ktir-emulator's two known-broken examples (bench,
@@ -135,13 +135,20 @@ jobs:
       #
       # No backend feature, deliberately. scratchy-bench is `default = []` with
       # `cuda`/`metal` as pure pass-throughs to scratchy-serving-api and no
-      # backend cfg of its own, so featureless drops only the tests behind the
-      # optional `datasets` feature (the parquet RAG subcommands). What remains
-      # is the whole executable coverage of the startup harness's process
-      # handling — process groups, kill(-pgid), wait4/ECHILD — which is
-      # kernel/libc semantics with no GPU in it, and it is also the exact
-      # command a contributor with neither CUDA nor Metal can run. CI runs that
-      # configuration, not a superset of it.
+      # backend cfg of its own, so the one feature that changes what compiles
+      # is `datasets` (the parquet RAG subcommands), and neither side of it
+      # needs a GPU. Each side has code only it compiles: featureless, the arm
+      # that answers those subcommands with a rebuild hint; `datasets`, the
+      # arrow/parquet readers. Nothing else enables `datasets`, so a lint of
+      # one side is blind to the other — and the readers are exactly what an
+      # arrow or parquet bump can break (they hand parquet's record batches to
+      # arrow's JSON writer, which only type-checks when both resolve to the
+      # same arrow). Hence a lint of each. The tests run under `datasets`: no
+      # test is featureless-only, so
+      # that is a superset, adding the parquet-to-query tests to the whole
+      # executable coverage of the startup harness's process handling —
+      # process groups, kill(-pgid), wait4/ECHILD — which is kernel/libc
+      # semantics with no GPU in it.
       #
       # No `--locked`: the featureless resolution differs from the committed
       # Cargo.lock (cargo adds cblas-sys 0.1.4 alongside 0.3.0), and no other
@@ -149,8 +156,11 @@ jobs:
       - name: Clippy (bench test targets)
         run: cargo clippy -p scratchy-bench --all-targets -- -D warnings
 
+      - name: Clippy (bench test targets, parquet datasets)
+        run: cargo clippy -p scratchy-bench --all-targets --features datasets -- -D warnings
+
       - name: Bench harness tests (no backend feature)
-        run: cargo test -p scratchy-bench
+        run: cargo test -p scratchy-bench --features datasets
 
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.

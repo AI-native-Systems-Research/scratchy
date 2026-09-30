@@ -71,7 +71,7 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         let bytes = crate::http::get_bytes(&agent, url)?;
         std::fs::write(&parquet_path, &bytes)?;
 
-        let records = parquet_to_json_records(&parquet_path)?;
+        let records = crate::parquet_records::parquet_to_json_records(&parquet_path)?;
 
         eprintln!("Caching {} records as JSON...", records.len());
         let json_str = serde_json::to_string(&records)?;
@@ -79,7 +79,11 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         records
     };
 
-    // Build queries and corpus stats.
+    Ok(build_dataset(&raw, num_queries))
+}
+
+/// Build queries and corpus stats from the dataset's JSON rows.
+fn build_dataset(raw: &[serde_json::Value], num_queries: usize) -> Dataset {
     let mut queries: Vec<Query> = Vec::new();
     let mut unique_titles: HashSet<String> = HashSet::new();
     let mut corpus_texts: Vec<String> = Vec::new();
@@ -132,35 +136,11 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         });
     }
 
-    Ok(Dataset {
+    Dataset {
         queries,
         corpus_size: unique_titles.len(),
         corpus_texts,
-    })
-}
-
-/// Read a parquet file and return rows as JSON values.
-fn parquet_to_json_records(parquet_path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
-    use arrow::json::writer::{JsonArray, Writer};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    eprintln!("Reading parquet...");
-    let file = std::fs::File::open(parquet_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-
-    let batches: Vec<_> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-    let batch_refs: Vec<&_> = batches.iter().collect();
-
-    let mut buf = Vec::new();
-    let mut writer = Writer::<_, JsonArray>::new(&mut buf);
-    writer.write_batches(&batch_refs)?;
-    writer.finish()?;
-    drop(writer);
-
-    let records: Vec<serde_json::Value> = serde_json::from_slice(&buf)?;
-    eprintln!("Read {} records.", records.len());
-    Ok(records)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +581,10 @@ pub(crate) fn run_bench_hotpotqa(args: BenchHotpotqaArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use serde_json::json;
+
+    use crate::parquet_records::fixture::through_parquet;
 
     #[test]
     fn evaluate_exact_substring() {
@@ -648,5 +632,83 @@ mod tests {
     #[test]
     fn normalize_tokens_basic() {
         assert_eq!(normalize_tokens("hello, world!"), vec!["hello", "world"]);
+    }
+
+    /// HotpotQA's first validation row (context cut to two paragraphs), under
+    /// the schema of the file `scr bench hotpotqa` downloads: `context` is a
+    /// struct of per-paragraph lists, and sentences after the first keep
+    /// their leading space.
+    #[test]
+    fn parquet_row_becomes_query() {
+        let list = |item| DataType::List(Arc::new(Field::new("element", item, true)));
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("question", DataType::Utf8, true),
+            Field::new("answer", DataType::Utf8, true),
+            Field::new("type", DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+            Field::new(
+                "supporting_facts",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("title", list(DataType::Utf8), true),
+                    Field::new("sent_id", list(DataType::Int32), true),
+                ])),
+                true,
+            ),
+            Field::new(
+                "context",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("title", list(DataType::Utf8), true),
+                    Field::new("sentences", list(list(DataType::Utf8)), true),
+                ])),
+                true,
+            ),
+        ]);
+        let raw = through_parquet(
+            schema,
+            &[json!({
+                "id": "5a8b57f25542995d1e6f1371",
+                "question": "Were Scott Derrickson and Ed Wood of the same nationality?",
+                "answer": "yes",
+                "type": "comparison",
+                "level": "hard",
+                "supporting_facts": {"title": ["Scott Derrickson", "Ed Wood"], "sent_id": [0, 0]},
+                "context": {
+                    "title": ["Ed Wood (film)", "Scott Derrickson"],
+                    "sentences": [
+                        ["Ed Wood is a 1994 American biographical period comedy-drama film."],
+                        [
+                            "Scott Derrickson (born July 16, 1966) is an American director.",
+                            " He lives in Los Angeles, California.",
+                        ],
+                    ],
+                },
+            })],
+        );
+
+        let dataset = build_dataset(&raw, 10);
+
+        assert_eq!(dataset.queries.len(), 1);
+        let query = &dataset.queries[0];
+        assert_eq!(
+            query.question,
+            "Were Scott Derrickson and Ed Wood of the same nationality?"
+        );
+        assert_eq!(query.answer, "yes");
+        assert_eq!(query.question_type, "comparison");
+        assert_eq!(
+            query.documents,
+            [
+                (
+                    "Ed Wood (film)".to_string(),
+                    "Ed Wood is a 1994 American biographical period comedy-drama film.".to_string(),
+                ),
+                (
+                    "Scott Derrickson".to_string(),
+                    "Scott Derrickson (born July 16, 1966) is an American director.  He lives in Los Angeles, California.".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(dataset.corpus_size, 2);
     }
 }

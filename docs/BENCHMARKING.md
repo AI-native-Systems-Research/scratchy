@@ -255,16 +255,19 @@ backend `cfg` in the crate. So the full test suite and the `scr` binary carrying
 `bench startup --exec` both build on any Linux or macOS box:
 
 ```bash
-cargo test -p scratchy-bench          # the whole suite; no features, no GPU
+cargo test -p scratchy-bench --features datasets   # the whole suite; no GPU
 cargo build -p scratchy-cli --no-default-features --features bench
 ./target/debug/scr bench startup --help   # renders the `--exec` section
 ```
 
-Featureless drops only the tests behind the optional `datasets` feature (the
-parquet-backed `hotpotqa`/`multihop`/`msmarco` subcommands) — nothing that
-touches the startup harness, whose process handling those tests are the only
-executable coverage of. `linux-cuda` in `.github/workflows/rust.yml` runs these
-same commands, so reviewing the harness on a laptop runs the same gate CI does.
+`datasets` is the optional feature behind the parquet-backed
+`hotpotqa`/`multihop`/`msmarco` subcommands, and it needs no GPU either.
+Featureless (`cargo test -p scratchy-bench`) drops only the tests of their
+parquet readers — nothing that touches the startup harness, whose process
+handling these tests are the only executable coverage of. `linux-cuda` in
+`.github/workflows/rust.yml` runs the same test command and lints the crate
+both with and without `datasets`, so reviewing the harness on a laptop runs the
+same gate CI does.
 Don't add `--locked`; the featureless resolution differs from the committed
 lockfile.
 
