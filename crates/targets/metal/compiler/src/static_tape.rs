@@ -478,6 +478,8 @@ pub fn bake_bucket_tapes(
     // linear scan over `PartialEq` beats stringifying every body.
     type Body = (LoweredMetalTape, Vec<CapPatch>, Vec<ScratchPatch>);
     let mut seen: Vec<Body> = Vec::new();
+    let mut mk_seen: Vec<(LoweredMetalTape, Vec<u32>)> = Vec::new();
+    let mut mk_statics: Vec<TokenStream> = Vec::new();
     let uniq = format!("M{}", input.bucket_m);
     for class in classes {
         let profile = profile_for(class);
@@ -489,19 +491,34 @@ pub fn bake_bucket_tapes(
             let body = diff_probes(l0.tape, &ta, &tb, &tc).map_err(BakeDefect)?;
             let class_toks = crate::const_tokens::const_tokens(&class)
                 .map_err(|e| BakeDefect(format!("serialize class: {e}")))?;
-            // THE DECODE MEGAKERNEL: the bucket-1 tape of the M5 direct-addressing variant.
-            let megakernel = match (class, chunked, input.bucket_m) {
-                (GenClass::M5, false, 1) => {
+            // THE DECODE MEGAKERNEL of every class's bucket-1 direct-addressing tape: one static
+            // per distinct (tape, rows) — classes lowering alike share it.
+            let megakernel = match (chunked, input.bucket_m) {
+                (false, 1) => {
                     let (tape, const_patches, _) = &body;
-                    let mk = crate::megakernel_bake::bake_megakernel(
-                        tape,
-                        const_patches,
-                        &l0.row_commands,
-                        input.steps,
-                    )?;
-                    let toks = crate::const_tokens::const_tokens(&mk.as_slice())
-                        .map_err(|e| BakeDefect(format!("serialize megakernel: {e}")))?;
-                    quote! { megakernel: #toks, }
+                    let key = (*tape, l0.row_commands.clone());
+                    let ix = match mk_seen.iter().position(|k| *k == key) {
+                        Some(ix) => ix,
+                        None => {
+                            let mk = crate::megakernel_bake::bake_megakernel(
+                                tape,
+                                const_patches,
+                                &l0.row_commands,
+                                input.steps,
+                            )?;
+                            let toks = crate::const_tokens::const_tokens(&mk.as_slice())
+                                .map_err(|e| BakeDefect(format!("serialize megakernel: {e}")))?;
+                            let ident =
+                                quote::format_ident!("__MEGAKERNEL_{uniq}_{}", mk_seen.len());
+                            mk_statics.push(quote! {
+                                const #ident: &[__tl::MegakernelTape] = #toks;
+                            });
+                            mk_seen.push(key);
+                            mk_seen.len() - 1
+                        }
+                    };
+                    let ident = quote::format_ident!("__MEGAKERNEL_{uniq}_{ix}");
+                    quote! { megakernel: #ident, }
                 }
                 _ => TokenStream::new(),
             };
@@ -563,6 +580,7 @@ pub fn bake_bucket_tapes(
         {
             #aliases
             #(#body_statics)*
+            #(#mk_statics)*
             &[ #(#entries)* ]
         }
     })

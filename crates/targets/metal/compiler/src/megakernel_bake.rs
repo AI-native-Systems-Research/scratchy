@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! THE DECODE MEGAKERNEL, COMPILED — per bucket-1 tape, per KV mode, at expansion.
+//! THE DECODE MEGAKERNEL, COMPILED — per bucket-1 tape, at expansion.
 //!
 //! The WHOLE decode forward becomes ONE kernel. Every command the planned context
 //! ([`GateCtx::decode_one`]) admits is fed to the SHARED plan ([`plan`]) with the dataflow of the
@@ -25,11 +25,11 @@ use std::fmt::Write as _;
 use std::num::NonZeroU32;
 
 use scratchy_subtile::megakernel_plan::{
-    Items, Lane, MegakernelPlan, Placement, Schedule, StepFlow, UnitIx, plan, schedule,
+    Items, MegakernelPlan, Placement, Schedule, StepFlow, UnitIx, plan, schedule,
 };
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantType, ConstantValue};
 use scratchy_target_metal::tape::ids::{
-    ArenaSlotIdx, GpuCores, HeadDim, LayerId, NumKvHeads, NumQHeads, NumTokens, TqDecodeHeads,
+    ArenaSlotIdx, HeadDim, LayerId, NumKvHeads, NumQHeads, NumTokens, TqDecodeHeads,
 };
 use scratchy_target_metal::tape::kernel_constants::{
     AttentionViaCacheConstants, AttentionViaCacheTqConstants,
@@ -43,10 +43,6 @@ use scratchy_target_metal::tape::lowered::{
 use scratchy_target_metal::tape::step::{MetalLoc, MetalStep, MetalStepTape, RowAccess, StepRow};
 
 use crate::static_tape::BakeDefect;
-
-/// The persistent threadgroups the schedule balances for: the base M5's GPU cores. A launch runs
-/// `MK_P` = the device's cores (a function constant at load); any `P` runs the schedule.
-const MK_LANES: u32 = 10;
 
 /// An elementwise step ([`MkAdapter::tail`]: a residual add, a scalar scale) of at most this many
 /// items may be played whole by the threadgroup that ran what it waits on, instead of spreading
@@ -209,12 +205,13 @@ impl KvAliasing {
     }
 }
 
-/// A decode attention (fp16 KV) plays the query heads of one KV head per virtual threadgroup in the
-/// megakernel — as many as the device's pick for TurboQuant decode at the persistent threadgroups
-/// ([`TqDecodeHeads::for_group`]) — so its 1024-thread items fill them in one round instead of
-/// spilling into a second (Gemma-4 sliding: 16 one-head items on 10). The body computes each head
-/// exactly as it does one head per threadgroup.
-fn attention_heads(cmd: &LoweredCommand) -> Option<TqDecodeHeads> {
+/// A decode attention's (fp16 KV) query heads per virtual threadgroup, as the device's pick for
+/// TurboQuant decode makes it ([`TqDecodeHeads::for_group`]) at the launch's persistent
+/// threadgroups — the GPU's cores, `MK_P`, known at load — so its items fill them instead of
+/// spilling into another round. The rule's candidates, most heads first: `(q / h, h)`, `h` taken
+/// when `q / h ≥ ⌊4·MK_P / 5⌋`, else one head. `None`: not a decode attention, or one head on
+/// every GPU. The body computes each head exactly as it does one head per threadgroup.
+fn heads_rule(cmd: &LoweredCommand) -> Option<Vec<(u32, u32)>> {
     if cmd.kernel != KernelId::AttentionViaCache {
         return None;
     }
@@ -223,30 +220,38 @@ fn attention_heads(cmd: &LoweredCommand) -> Option<TqDecodeHeads> {
         c.map(|v| v.bits)
     };
     use AttentionViaCacheConstants as A;
-    let heads = TqDecodeHeads::for_group(
+    let q = at(A::NUM_Q_HEADS)?;
+    let candidates = TqDecodeHeads::candidates(
         HeadDim(at(A::HEAD_DIM)?),
-        NumQHeads(at(A::NUM_Q_HEADS)?),
+        NumQHeads(q),
         NumKvHeads(at(A::NUM_KV_HEADS)?),
-        GpuCores(MK_LANES),
     );
-    (heads.get() > 1).then_some(heads)
+    let mut rule: Vec<(u32, u32)> = candidates
+        .map(|h| (q / h.get(), h.get()))
+        .filter(|&(_, h)| h > 1)
+        .collect();
+    rule.reverse();
+    (!rule.is_empty()).then_some(rule)
 }
 
-/// A command as the megakernel plays it: its constants and grid, a decode attention's heads
-/// grouped per virtual threadgroup ([`attention_heads`]).
+/// [`heads_rule`] as MSL: a function of `MK_P` the pipeline's specialization folds.
+fn heads_msl(rule: &[(u32, u32)]) -> String {
+    rule.iter().rev().fold("1u".into(), |e, (threadgroups, h)| {
+        format!("({threadgroups}u >= MK_P * 4u / 5u ? {h}u : {e})")
+    })
+}
+
+/// A command as the megakernel plays it: its constants and grid, one head per virtual threadgroup
+/// (a decode attention's grouping, [`heads_rule`], is spelled in `MK_P` where the step is).
 fn played(cmd: &LoweredCommand) -> (Vec<ConstantValue>, (u32, u32, u32)) {
-    let mut constants = cmd.constants.to_vec();
-    let mut grid = cmd.dispatch.threadgroups_at(NumTokens(1), 1);
-    if let Some(h) = attention_heads(cmd) {
-        let slot = AttentionViaCacheTqConstants::HEADS;
-        constants.push(ConstantValue::uint(slot, h.get()));
-        grid.1 /= h.get();
-    }
-    (constants, grid)
+    (
+        cmd.constants.to_vec(),
+        cmd.dispatch.threadgroups_at(NumTokens(1), 1),
+    )
 }
 
-/// A step's geometry: its adapter's widest packing — what the plan and schedule see — or, packed
-/// by [`pack_phases`], items of `vtgs_per_item` virtual threadgroups.
+/// A step's geometry: its adapter's widest packing — what the plan and schedule see — or items of
+/// `vtgs_per_item` virtual threadgroups.
 fn step_geometry(
     cmd: &LoweredCommand,
     adapter: &MkAdapter,
@@ -262,99 +267,70 @@ fn step_geometry(
     }
 }
 
-/// A spread step's size as [`pack_phases`] divides it: its virtual threadgroups, and its widest
-/// item's at its adapter's width and across the whole persistent threadgroup.
-#[derive(Clone, Copy)]
-struct Packable {
-    vtgs: u32,
-    widest: u32,
-    whole: u32,
+/// A spread step as its phase's packing reads it: its virtual threadgroups (MSL: a literal, or
+/// with its decode attention's heads grouped, [`heads_rule`]), its declared items (the plan's),
+/// and — `fit`: `None` for a grid the load sizes, played at its widest — its items' virtual
+/// threadgroups at its adapter's width and across the whole persistent threadgroup.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct SpreadIn {
+    vtgs: String,
+    declared: u32,
+    fit: Option<(u32, u32)>,
+}
+
+/// One phase's work split, as every phase of its shape spells it: its spread steps in order, its
+/// pinned units that wait on nothing in the phase (`free`: each keeps a slot of the last round),
+/// and its pinned lane groups (a unit and the in-phase units it waits on share a lane).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct PhaseShape {
+    spread: Vec<SpreadIn>,
+    free: u32,
+    groups: u32,
+}
+
+/// Where a unit runs, as the kernel spells it: spread step `ord` of phase shape `shape`, the
+/// lane of pinned group `group` of it, or on every threadgroup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    Spread { shape: usize, ord: usize },
+    Pinned { shape: usize, group: u32 },
+    Everywhere,
 }
 
 /// A phase whose items, at their adapters' widths, fill at most this many rounds is bound by its
 /// rounds, not by its streams: its items widen up to the whole persistent threadgroup, so every
-/// lane plays one even share. Qwen3-0.6B's 128-tile down and output projections play 10 items of
-/// 13 tiles, not 32 of 4 with two lanes playing four: -0.12 ms/token on the base M5 (widening
-/// phases of up to 8 rounds measured the same).
+/// lane plays one even share (Qwen3-0.6B's 128-tile down and output projections: -0.12 ms/token on
+/// a base M5; phases of up to 8 rounds measured the same there).
 const MK_ROUND_BOUND_PHASE: u32 = 4;
 
-/// Packs each phase's spread steps over the [`MK_LANES`] persistent threadgroups. The phase keeps
-/// the fewest rounds its widest items allow (every lane plays its items one after another) — at
-/// their adapters' widths, or across the whole threadgroup for a phase of few rounds
-/// ([`MK_ROUND_BOUND_PHASE`]) — a slot of the last round left to each pinned unit the phase places
-/// freely; within those rounds' slots the widest items are narrowed, widest first, while the slots
-/// hold them, so every lane plays an even share of the phase: a 256-tile gemm plays 20 items of 13
-/// tiles, not 12 of 22 with two lanes doubled; a TurboQuant K and V compress of 8 heads each play
-/// 4 + 4 items of 2 heads in ONE round, not 8 + 8 items of 1 in two. A grid the load sizes keeps
-/// its widest packing. The cursors are recounted, and the phase's pinned units placed again on
-/// the lanes the repacked items leave least loaded (a unit following another in its phase stays
-/// with it): Qwen2.5-0.5B's K and V projections take the two lanes Q's items leave free. Returns
-/// each step's items' virtual threadgroups.
+/// Places each phase's units ([`Place`]) and collects the phase shapes they spell. The split
+/// itself is the shape's [`PhaseShape::msl`]: a function of the launch's `MK_P`.
 fn pack_phases(
-    sched: &mut Schedule,
+    sched: &Schedule,
     plan: &MegakernelPlan<MkLoc>,
-    packable: &[Option<Packable>],
-) -> Vec<Option<u32>> {
-    let mut per_item = vec![None; packable.len()];
+    spread_in: &[SpreadIn],
+) -> (Vec<Place>, Vec<PhaseShape>) {
+    let mut places = vec![Place::Everywhere; plan.units.len()];
+    let mut shapes: Vec<PhaseShape> = Vec::new();
     for phase in &sched.phases {
         let units: Vec<usize> = phase.clone().map(|u| u as usize).collect();
         let in_phase = |w: &UnitIx| phase.contains(&w.0);
+        let first = |u: usize| plan.units[u].steps.start as usize;
         let spread: Vec<usize> = units
             .iter()
             .copied()
             .filter(|&u| matches!(sched.placements[u], Placement::Spread { .. }))
             .collect();
-        let free = units
-            .iter()
-            .filter(|&&u| matches!(sched.placements[u], Placement::Pinned(_)))
-            .filter(|&&u| !plan.units[u].waits.iter().any(in_phase))
-            .count() as u32;
-        let first = |u: usize| plan.units[u].steps.start as usize;
-        let at = |i: usize| packable[first(spread[i])];
-        let declared: u32 = spread.iter().map(|&u| plan.units[u].items.0.get()).sum();
-        let round_bound = declared.div_ceil(MK_LANES) <= MK_ROUND_BOUND_PHASE;
-        let mut k: Vec<Option<u32>> = (0..spread.len())
-            .map(|i| at(i).map(|p| if round_bound { p.whole } else { p.widest }))
-            .collect();
-        let mut items: Vec<u32> = (0..spread.len())
-            .map(|i| match (at(i), k[i]) {
-                (Some(p), Some(k)) => p.vtgs.div_ceil(k),
-                _ => plan.units[spread[i]].items.0.get(),
-            })
-            .collect();
-        let reserved = free.min(MK_LANES - 1);
-        let rounds = (items.iter().sum::<u32>() + reserved).div_ceil(MK_LANES);
-        let slots = (rounds * MK_LANES - reserved).max(items.iter().sum());
-        loop {
-            let widest = (0..spread.len())
-                .filter_map(|i| k[i].filter(|&k| k > 1).map(|k| (k, i)))
-                .max_by_key(|&(k, i)| (k, at(i).map(|p| p.vtgs)));
-            let Some((ki, i)) = widest else { break };
-            let vtgs = at(i).map_or(0, |p| p.vtgs);
-            let narrower = vtgs.div_ceil(ki - 1);
-            if items.iter().sum::<u32>() - items[i] + narrower > slots {
-                break;
-            }
-            k[i] = Some(ki - 1);
-            items[i] = narrower;
-        }
-        let mut load = [0u32; MK_LANES as usize];
-        let mut cursor = 0u32;
-        for (i, &u) in spread.iter().enumerate() {
-            sched.placements[u] = Placement::Spread { cursor };
-            for (l, w) in (0u32..).zip(load.iter_mut()) {
-                let first = (l + MK_LANES - cursor % MK_LANES) % MK_LANES;
-                *w += items[i].saturating_sub(first).div_ceil(MK_LANES);
-            }
-            cursor += items[i];
-            per_item[first(u)] = k[i];
-        }
-        // The pinned units in lane groups: a unit and the in-phase units it waits on share a lane.
         let pinned: Vec<usize> = units
             .iter()
             .copied()
             .filter(|&u| matches!(sched.placements[u], Placement::Pinned(_)))
             .collect();
+        let free = pinned
+            .iter()
+            .filter(|&&u| !plan.units[u].waits.iter().any(in_phase))
+            .count() as u32;
+        // The pinned units in lane groups: a unit and the in-phase units it waits on share a lane.
         let mut group: Vec<usize> = (0..pinned.len()).collect();
         let root = |g: &[usize], mut i: usize| {
             while g[i] != i {
@@ -370,22 +346,156 @@ fn pack_phases(
                 }
             }
         }
-        let mut lanes: Vec<Option<Lane>> = vec![None; pinned.len()];
+        let mut ordinal: Vec<Option<u32>> = vec![None; pinned.len()];
+        let mut groups = 0u32;
+        let group_of: Vec<u32> = (0..pinned.len())
+            .map(|i| {
+                let r = root(&group, i);
+                *ordinal[r].get_or_insert_with(|| {
+                    groups += 1;
+                    groups - 1
+                })
+            })
+            .collect();
+        let shape = PhaseShape {
+            spread: spread
+                .iter()
+                .map(|&u| spread_in[first(u)].clone())
+                .collect(),
+            free,
+            groups,
+        };
+        let shape = match shapes.iter().position(|s| *s == shape) {
+            Some(s) => s,
+            None => {
+                shapes.push(shape);
+                shapes.len() - 1
+            }
+        };
+        for (ord, &u) in spread.iter().enumerate() {
+            places[u] = Place::Spread { shape, ord };
+        }
         for (i, &u) in pinned.iter().enumerate() {
-            let g = root(&group, i);
-            let lane = *lanes[g].get_or_insert_with(|| {
-                let least = (0..MK_LANES).min_by_key(|&l| load[l as usize]);
-                Lane(least.expect("at least one lane"))
-            });
-            let unit = &plan.units[u];
-            load[lane.0 as usize] += match unit.items == Items::ONE {
-                true => unit.steps.end - unit.steps.start,
-                false => unit.items.0.get(),
+            places[u] = Place::Pinned {
+                shape,
+                group: group_of[i],
             };
-            sched.placements[u] = Placement::Pinned(lane);
         }
     }
-    per_item
+    (places, shapes)
+}
+
+impl PhaseShape {
+    /// The split of every phase of shape `s`, as program-scope constants of the launch's `MK_P`
+    /// (the pipeline's specialization folds each). The phase keeps the fewest rounds its items
+    /// allow — at their adapters' widths, or across the whole threadgroup for a phase of few
+    /// rounds ([`MK_ROUND_BOUND_PHASE`]) — a slot of the last round left to each free pinned unit;
+    /// the slots those rounds hold beyond the items go to the steps in proportion to their virtual
+    /// threadgroups, each step's items then even (`MK_S{s}_K{i}` virtual threadgroups per item,
+    /// `MK_S{s}_N{i}` items, starting at cursor `MK_S{s}_C{i}`); pinned group `g` plays on the lane
+    /// after the phase's last spread item (`MK_S{s}_L{g}`), the least loaded.
+    fn msl(&self, s: usize, out: &mut String) {
+        let p = |name: &str| format!("MK_S{s}_{name}");
+        let (min, max) = (
+            |a: &str, b: &str| format!("({a} < {b} ? {a} : {b})"),
+            |a: &str, b: &str| format!("({a} > {b} ? {a} : {b})"),
+        );
+        let declared: u32 = self.spread.iter().map(|x| x.declared).sum();
+        let _ = writeln!(
+            out,
+            "constant bool {} = ({declared}u + MK_P - 1u) / MK_P <= {MK_ROUND_BOUND_PHASE}u;",
+            p("RB")
+        );
+        let mut n0 = Vec::with_capacity(self.spread.len());
+        for (i, x) in self.spread.iter().enumerate() {
+            let _ = writeln!(out, "constant uint {} = {};", p(&format!("V{i}")), x.vtgs);
+            match x.fit {
+                Some((widest, whole)) => {
+                    let _ = writeln!(
+                        out,
+                        "constant uint {} = {} ? {whole}u : {widest}u;\n\
+                         constant uint {} = ({} + {} - 1u) / {};",
+                        p(&format!("KA{i}")),
+                        p("RB"),
+                        p(&format!("NA{i}")),
+                        p(&format!("V{i}")),
+                        p(&format!("KA{i}")),
+                        p(&format!("KA{i}")),
+                    );
+                    n0.push(p(&format!("NA{i}")));
+                }
+                None => n0.push(format!("{}u", x.declared)),
+            }
+        }
+        let sum = |v: &[String]| match v {
+            [] => "0u".to_string(),
+            _ => v.join(" + "),
+        };
+        let fit_v: Vec<String> = (0..self.spread.len())
+            .filter(|&i| self.spread[i].fit.is_some())
+            .map(|i| p(&format!("V{i}")))
+            .collect();
+        let _ = writeln!(
+            out,
+            "constant uint {} = {};\nconstant uint {} = {};\n\
+             constant uint {} = ({} + {} + MK_P - 1u) / MK_P;\nconstant uint {} = {};\n\
+             constant uint {} = {};",
+            p("NT"),
+            sum(&n0),
+            p("RES"),
+            min(&format!("{}u", self.free), "MK_P - 1u"),
+            p("R"),
+            p("NT"),
+            p("RES"),
+            p("SLOTS"),
+            max(&format!("{} * MK_P - {}", p("R"), p("RES")), &p("NT")),
+            p("VF"),
+            sum(&fit_v),
+        );
+        let _ = writeln!(out, "constant uint {} = 0u;", p("C0"));
+        for (i, x) in self.spread.iter().enumerate() {
+            let (v, k, n) = (
+                p(&format!("V{i}")),
+                p(&format!("K{i}")),
+                p(&format!("N{i}")),
+            );
+            match x.fit {
+                Some(_) => {
+                    let share = format!(
+                        "{} + ({} - {}) * {v} / {}",
+                        p(&format!("NA{i}")),
+                        p("SLOTS"),
+                        p("NT"),
+                        p("VF")
+                    );
+                    let _ = writeln!(
+                        out,
+                        "constant uint {k} = ({v} + {} - 1u) / {};\n\
+                         constant uint {n} = ({v} + {k} - 1u) / {k};",
+                        min(&v, &share),
+                        min(&v, &share),
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "constant uint {n} = {}u;", x.declared);
+                }
+            }
+            let _ = writeln!(
+                out,
+                "constant uint {} = {} + {n};",
+                p(&format!("C{}", i + 1)),
+                p(&format!("C{i}")),
+            );
+        }
+        for g in 0..self.groups {
+            let _ = writeln!(
+                out,
+                "constant uint {} = ({} + {g}u) % MK_P;",
+                p(&format!("L{g}")),
+                p(&format!("C{}", self.spread.len())),
+            );
+        }
+    }
 }
 
 fn defect(what: &str, e: MegakernelError) -> BakeDefect {
@@ -596,8 +706,10 @@ struct Planned {
     admitted: Vec<usize>,
     plan: MegakernelPlan<MkLoc>,
     sched: Schedule,
-    /// Per admitted step: its items' virtual threadgroups ([`pack_phases`]; `None` = widest).
-    per_item: Vec<Option<u32>>,
+    /// Per unit: where it runs ([`pack_phases`]).
+    places: Vec<Place>,
+    /// The phase shapes the places name.
+    shapes: Vec<PhaseShape>,
     /// Per admitted step: what it reads and writes, as the plan ordered it.
     flows: Vec<StepFlow<MkLoc>>,
 }
@@ -706,13 +818,14 @@ pub fn bake_megakernel(
     if !stops.is_empty() {
         let stops: Vec<String> = stops.iter().map(ToString::to_string).collect();
         return Err(BakeDefect(format!(
-            "the bucket-1 decode tape is not playable inside one kernel: {}",
+            "the bucket-1 decode tape is not playable inside one \
+             kernel: {}",
             stops.join("; ")
         )));
     }
     let kv = KvAliasing::of(&commands, &admitted);
     let mut flows = Vec::with_capacity(admitted.len());
-    let mut packable: Vec<Option<Packable>> = Vec::with_capacity(admitted.len());
+    let mut spread_in: Vec<SpreadIn> = Vec::with_capacity(admitted.len());
     let mut pending = false;
     let mut next = admitted.iter().peekable();
     for (e, &(_, brk)) in walk.iter().enumerate() {
@@ -733,15 +846,26 @@ pub fn bake_megakernel(
         let g = geometry(None)?;
         let (_, grid) = played(cmd);
         let whole = geometry(Some(MK_THREADS / g.vtg_stride))?;
-        packable.push((!load_sized).then_some(Packable {
-            vtgs: grid.0 * grid.1 * grid.2,
-            widest: g.vtgs_per_item,
-            whole: whole.vtgs_per_item,
-        }));
         let items = match load_sized {
             true => Items(g.items.0.max(NonZeroU32::MIN.saturating_add(1))),
             false => g.items,
         };
+        // The plan sees one head per virtual threadgroup: the most items the step can have.
+        let vtgs = match heads_rule(cmd) {
+            Some(rule) => format!(
+                "({}u * ({}u / {}) * {}u)",
+                grid.0,
+                grid.1,
+                heads_msl(&rule),
+                grid.2
+            ),
+            None => format!("{}u", grid.0 * grid.1 * grid.2),
+        };
+        spread_in.push(SpreadIn {
+            vtgs,
+            declared: items.0.get(),
+            fit: (!load_sized).then_some((g.vtgs_per_item, whole.vtgs_per_item)),
+        });
         let row = access[row_of[origin.baked]];
         let at = |l: &MetalLoc| kv.row(l.advanced(origin.layers));
         let reads: Vec<MetalLoc> = row.reads.iter().flat_map(at).collect();
@@ -774,13 +898,16 @@ pub fn bake_megakernel(
         };
         return Err(defect("the codec's shared scratch", e));
     }
-    let mut sched = schedule(&plan, &flows, MK_LANES);
-    let per_item = pack_phases(&mut sched, &plan, &packable);
+    // The phase structure assumes no core count: every pinned unit is placed as if on a lane
+    // of its own. The split within each phase is a function of the launch's `MK_P`.
+    let sched = schedule(&plan, &flows, plan.units.len() as u32);
+    let (places, shapes) = pack_phases(&sched, &plan, &spread_in);
     let planned = Planned {
         admitted,
         plan,
         sched,
-        per_item,
+        places,
+        shapes,
         flows,
     };
     let generator = Gen::new(tape, patches, &commands, &origins, &planned, &kv)?;
@@ -801,17 +928,15 @@ pub fn bake_megakernel(
 /// How a step runs, as the generated code spells it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct StepKey {
-    /// The step opens its unit, which runs so.
-    unit: Option<Placement>,
+    /// The step opens its unit, which runs there.
+    unit: Option<Place>,
     /// The step opens a phase: a grid barrier stands before it (unless nothing ran before).
     phase: bool,
     /// A pinned unit whose waits include a unit of its own phase (on its lane).
     follows: bool,
-    /// Its items' virtual threadgroups ([`pack_phases`]).
-    per_item: Option<u32>,
 }
 
-/// The kernel generator of one KV mode.
+/// The kernel generator of the decode tape.
 struct Gen<'a> {
     commands: &'a [GatedCommand],
     planned: &'a Planned,
@@ -845,7 +970,7 @@ impl<'a> Gen<'a> {
             admitted,
             plan,
             sched,
-            per_item,
+            places,
             ..
         } = planned;
         let n = tape.commands.len();
@@ -867,10 +992,9 @@ impl<'a> Gen<'a> {
                     .iter()
                     .any(|w| phase_of(w.0 as usize) == phase_of(u));
             key.push(StepKey {
-                unit: opens.then_some(sched.placements[u]),
+                unit: opens.then_some(places[u]),
                 phase: opens && phase_start.contains(&(u as u32)),
                 follows,
-                per_item: per_item[a],
             });
         }
         let baked: Vec<usize> = admitted.iter().map(|&e| origins[e].baked).collect();
@@ -964,7 +1088,20 @@ impl<'a> Gen<'a> {
         let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
         let mut body = String::new();
         let (constants, _) = played(cmd);
+        let heads = heads_rule(cmd).map(|rule| heads_msl(&rule));
         for c in adapter.constants {
+            if let Some(h) = heads
+                .as_ref()
+                .filter(|_| c.slot == AttentionViaCacheTqConstants::HEADS)
+            {
+                let _ = writeln!(
+                    body,
+                    "  static METAL_FUNC uint {}() {{ return {h}; }}\n  \
+                     static METAL_FUNC bool has_{}() {{ return true; }}",
+                    c.name, c.name,
+                );
+                continue;
+            }
             let given = constants.iter().find(|v| v.index == c.slot.get());
             if let Some(v) = given.filter(|v| v.ty != c.ty) {
                 let e = MegakernelError::ConstantType {
@@ -999,10 +1136,17 @@ impl<'a> Gen<'a> {
         Ok(format!("MkC{n}"))
     }
 
-    fn geometry(&self, a: usize) -> Result<MkGeometry, BakeDefect> {
+    /// Admitted step `a`'s geometry at its adapter's width, or (`whole`) across the whole
+    /// persistent threadgroup — the widest items a phase's split may give it.
+    fn geometry(&self, a: usize, whole: bool) -> Result<MkGeometry, BakeDefect> {
         let cmd = self.command(a);
         let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
-        step_geometry(cmd, adapter, self.planned.per_item[a]).map_err(|e| defect(cmd.function, e))
+        let at = |k| step_geometry(cmd, adapter, k).map_err(|e| defect(cmd.function, e));
+        let widest = at(None)?;
+        match whole {
+            true => at(Some(MK_THREADS / widest.vtg_stride)),
+            false => Ok(widest),
+        }
     }
 
     /// The whole kernel: the tape's nodes in order, loops rolled.
@@ -1016,7 +1160,7 @@ impl<'a> Gen<'a> {
         self.emit(tree, &mut at, &mut body)?;
         let mut tg_memory = self.coissue_tg.max(16);
         for a in 0..self.baked.len() {
-            tg_memory = tg_memory.max(self.geometry(a)?.tg_memory);
+            tg_memory = tg_memory.max(self.geometry(a, true)?.tg_memory);
         }
         let tg_memory = tg_memory.next_multiple_of(16);
         let mut s = String::from(
@@ -1029,6 +1173,9 @@ impl<'a> Gen<'a> {
                 msl_type(*ty),
                 l.index.get()
             );
+        }
+        for (n, shape) in self.planned.shapes.iter().enumerate() {
+            shape.msl(n, &mut s);
         }
         for (n, p) in self.policies.iter().enumerate() {
             let _ = write!(s, "struct MkC{n} {{\n{p}}};\n");
@@ -1122,7 +1269,7 @@ impl<'a> Gen<'a> {
     fn unit(
         &mut self,
         a: usize,
-        placement: Placement,
+        placement: Place,
         loops: &[(String, u32)],
         ind: &str,
         out: &mut String,
@@ -1137,11 +1284,11 @@ impl<'a> Gen<'a> {
             })
         });
         match placement {
-            Placement::Spread { cursor } => {
-                let s = self.step_decl(a, inst.as_deref(), None)?;
+            Place::Spread { shape, ord } => {
+                let s = self.step_decl(a, inst.as_deref(), PerItem::Split { shape, ord })?;
                 let _ = writeln!(
                     out,
-                    "{ind}{{ // {}\n{ind}  {}\n{ind}  for (uint it = mk_first(mk_tg, {cursor}u); \
+                    "{ind}{{ // {}\n{ind}  {}\n{ind}  for (uint it = mk_first(mk_tg, MK_S{shape}_C{ord}); \
                      it < {}; it += MK_P) {{\n{ind}    {}(s, mk_lane(s, it, mk_t), mk_tgm);{}\n\
                      {ind}  }}\n{ind}}}",
                     s.what,
@@ -1157,10 +1304,10 @@ impl<'a> Gen<'a> {
             }
             // One lane plays a pinned unit; a copied one runs on every lane, each lane reading
             // its own copy's writes after it.
-            Placement::Pinned(_) | Placement::Everywhere => {
+            Place::Pinned { .. } | Place::Everywhere => {
                 let _ = match placement {
-                    Placement::Pinned(lane) => {
-                        writeln!(out, "{ind}if (mk_tg == {}u % MK_P) {{", lane.0)
+                    Place::Pinned { shape, group } => {
+                        writeln!(out, "{ind}if (mk_tg == MK_S{shape}_L{group}) {{")
                     }
                     _ => writeln!(out, "{ind}{{ // on every threadgroup"),
                 };
@@ -1182,7 +1329,7 @@ impl<'a> Gen<'a> {
                         last_tg = self.coissue(&group, inst.as_deref(), ind, out)?;
                         continue;
                     }
-                    let s = self.step_decl(m, inst.as_deref(), None)?;
+                    let s = self.step_decl(m, inst.as_deref(), PerItem::Widest)?;
                     if s.items == "1u" {
                         let _ = writeln!(
                             out,
@@ -1210,7 +1357,7 @@ impl<'a> Gen<'a> {
                     );
                     last_tg = 0;
                 }
-                if placement == Placement::Everywhere {
+                if placement == Place::Everywhere {
                     let _ = writeln!(
                         out,
                         "{ind}  threadgroup_barrier(mem_flags::mem_device | \
@@ -1237,10 +1384,14 @@ impl<'a> Gen<'a> {
     /// (Gemma-3-1B: -0.22 ms/token on the base M5).
     fn coissued(&self, rest: &[usize]) -> Vec<usize> {
         let first = self.command(rest[0]);
+        // A grid the launch's `MK_P` sizes plays alone.
+        if heads_rule(first).is_some() {
+            return vec![rest[0]];
+        }
         let (constants, grid) = played(first);
         let tpg = first.dispatch.threads_per_threadgroup;
         let vtgs = grid.0 * grid.1 * grid.2;
-        let Ok(g) = self.geometry(rest[0]) else {
+        let Ok(g) = self.geometry(rest[0], false) else {
             return vec![rest[0]];
         };
         let adapter = MkAdapter::of(first.library, first.function).expect("playable");
@@ -1287,7 +1438,7 @@ impl<'a> Gen<'a> {
         let vtgs = grid.0 * grid.1 * grid.2;
         let mut texts = Vec::with_capacity(group.len());
         for &m in group {
-            texts.push(self.step_decl(m, inst, Some(vtgs))?);
+            texts.push(self.step_decl(m, inst, PerItem::Coissued(vtgs))?);
         }
         let s0 = &texts[0];
         let width = vtgs * s0.stride;
@@ -1318,19 +1469,21 @@ impl<'a> Gen<'a> {
     }
 
     /// Admitted step `a` as the kernel spells it, in the iteration `inst` (`None`: outside every
-    /// loop), its items of `vtgs_per_item` virtual threadgroups (`None`: as packed).
+    /// loop), its items as `per_item` says.
     fn step_decl(
         &mut self,
         a: usize,
         inst: Option<&str>,
-        vtgs_per_item: Option<u32>,
+        per_item: PerItem,
     ) -> Result<StepText, BakeDefect> {
         let b = self.baked[a];
         let cmd = self.command(a);
         let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
-        let g = match vtgs_per_item {
-            Some(k) => step_geometry(cmd, adapter, Some(k)).map_err(|e| defect(cmd.function, e))?,
-            None => self.geometry(a)?,
+        let g = match per_item {
+            PerItem::Coissued(k) => {
+                step_geometry(cmd, adapter, Some(k)).map_err(|e| defect(cmd.function, e))?
+            }
+            PerItem::Widest | PerItem::Split { .. } => self.geometry(a, false)?,
         };
         let (table_at, row_len) = self.rows[b].expect("a played command has rows");
         let row = match inst {
@@ -1348,15 +1501,40 @@ impl<'a> Gen<'a> {
             axis(MScaleAxis::Z, grid.2),
         );
         let load_sized = [&gx, &gy, &gz].iter().any(|v| v.starts_with("MK_LOAD_"));
-        let items = match load_sized {
-            true => format!("mk_items(s.grid, {}u)", g.vtgs_per_item),
-            false => format!("{}u", g.items.0.get()),
+        // A decode attention's heads grouped per virtual threadgroup, in `MK_P`.
+        let heads = heads_rule(cmd).map(|rule| heads_msl(&rule));
+        let gy = match &heads {
+            Some(h) => format!("({gy} / {h})"),
+            None => gy,
+        };
+        let split = match per_item {
+            PerItem::Split { shape, ord } => self.planned.shapes[shape].spread[ord]
+                .fit
+                .map(|_| (shape, ord)),
+            PerItem::Widest | PerItem::Coissued(_) => None,
+        };
+        let (k, items) = match (load_sized, split) {
+            (true, _) => (
+                format!("{}u", g.vtgs_per_item),
+                format!("mk_items(s.grid, {}u)", g.vtgs_per_item),
+            ),
+            (false, Some((shape, ord))) => {
+                (format!("MK_S{shape}_K{ord}"), format!("MK_S{shape}_N{ord}"))
+            }
+            (false, None) if heads.is_some() => (
+                format!("{}u", g.vtgs_per_item),
+                format!("mk_items(s.grid, {}u)", g.vtgs_per_item),
+            ),
+            (false, None) => (
+                format!("{}u", g.vtgs_per_item),
+                format!("{}u", g.items.0.get()),
+            ),
         };
         let t = cmd.dispatch.threads_per_threadgroup;
         let decl = format!(
-            "const MkStep s = {{{row}, uint3({gx}, {gy}, {gz}), uint3({}u, {}u, {}u), {}u, {}u, \
+            "const MkStep s = {{{row}, uint3({gx}, {gy}, {gz}), uint3({}u, {}u, {}u), {k}, {}u, \
              {}u}};",
-            t.0, t.1, t.2, g.vtgs_per_item, g.vtg_stride, adapter.tg_bytes.0
+            t.0, t.1, t.2, g.vtg_stride, adapter.tg_bytes.0
         );
         // What the plan shares must be read and written device-coherently.
         for x in cmd.bindings {
@@ -1382,6 +1560,17 @@ impl<'a> Gen<'a> {
             stride: g.vtg_stride,
         })
     }
+}
+
+/// How many virtual threadgroups a step's items play, as its spelling says.
+#[derive(Clone, Copy)]
+enum PerItem {
+    /// Its adapter's width (a pinned unit's member).
+    Widest,
+    /// A co-issued member's whole grid in one item.
+    Coissued(u32),
+    /// Spread step `ord` of phase shape `shape`: the shape's split, in `MK_P`.
+    Split { shape: usize, ord: usize },
 }
 
 /// One step's spelling.
@@ -1475,4 +1664,262 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scratchy_target_metal::tape::ids::GpuCores;
+    use std::collections::HashMap;
+
+    /// Evaluates the generated program-scope constants at one `MK_P`: the arithmetic the
+    /// pipeline's specialization folds (unsigned `+ - * / %`, comparisons, `?:`).
+    fn eval_constants(text: &str, p: u32) -> HashMap<String, u64> {
+        let mut env = HashMap::from([("MK_P".to_string(), u64::from(p))]);
+        for line in text.lines() {
+            let Some(rest) = line.trim().strip_prefix("constant ") else {
+                continue;
+            };
+            let (_, rest) = rest.split_once(' ').expect("a typed constant");
+            let (name, expr) = rest.split_once(" = ").expect("an initialized constant");
+            let v = eval(expr.trim_end_matches(';'), &env);
+            env.insert(name.to_string(), v);
+        }
+        env
+    }
+
+    fn tokens(expr: &str) -> Vec<String> {
+        let chars: Vec<char> = expr.chars().collect();
+        let mut out = Vec::new();
+        let mut word = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c.is_ascii_alphanumeric() || c == '_' {
+                word.push(c);
+                i += 1;
+                continue;
+            }
+            if !word.is_empty() {
+                out.push(std::mem::take(&mut word));
+            }
+            if (c == '<' || c == '>') && chars.get(i + 1) == Some(&'=') {
+                out.push(format!("{c}="));
+                i += 2;
+                continue;
+            }
+            if !c.is_whitespace() {
+                out.push(c.to_string());
+            }
+            i += 1;
+        }
+        if !word.is_empty() {
+            out.push(word);
+        }
+        out
+    }
+
+    fn eval(expr: &str, env: &HashMap<String, u64>) -> u64 {
+        let t = tokens(expr);
+        let mut at = 0;
+        let v = ternary(&t, &mut at, env);
+        assert_eq!(at, t.len(), "trailing tokens in {expr}");
+        v
+    }
+
+    fn ternary(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
+        let c = compare(t, at, env);
+        if t.get(*at).is_some_and(|x| x == "?") {
+            *at += 1;
+            let a = ternary(t, at, env);
+            assert_eq!(t[*at], ":");
+            *at += 1;
+            let b = ternary(t, at, env);
+            return if c != 0 { a } else { b };
+        }
+        c
+    }
+
+    fn compare(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
+        let a = additive(t, at, env);
+        let op = t.get(*at).cloned().unwrap_or_default();
+        if !["<", ">", "<=", ">="].contains(&op.as_str()) {
+            return a;
+        }
+        *at += 1;
+        let b = additive(t, at, env);
+        u64::from(match op.as_str() {
+            "<" => a < b,
+            ">" => a > b,
+            "<=" => a <= b,
+            _ => a >= b,
+        })
+    }
+
+    fn additive(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
+        let mut v = multiplicative(t, at, env);
+        while let Some(op) = t.get(*at).filter(|x| *x == "+" || *x == "-").cloned() {
+            *at += 1;
+            let b = multiplicative(t, at, env);
+            v = match op.as_str() {
+                "+" => v + b,
+                _ => v.checked_sub(b).expect("no unsigned underflow"),
+            };
+        }
+        v
+    }
+
+    fn multiplicative(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
+        let mut v = primary(t, at, env);
+        while let Some(op) = t
+            .get(*at)
+            .filter(|x| ["*", "/", "%"].contains(&x.as_str()))
+            .cloned()
+        {
+            *at += 1;
+            let b = primary(t, at, env);
+            v = match op.as_str() {
+                "*" => v * b,
+                "/" => v / b,
+                _ => v % b,
+            };
+        }
+        v
+    }
+
+    fn primary(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
+        let x = t[*at].clone();
+        *at += 1;
+        if x == "(" {
+            let v = ternary(t, at, env);
+            assert_eq!(t[*at], ")");
+            *at += 1;
+            return v;
+        }
+        match x.strip_suffix('u').and_then(|n| n.parse().ok()) {
+            Some(n) => n,
+            None => *env.get(&x).unwrap_or_else(|| panic!("unbound {x}")),
+        }
+    }
+
+    /// The megakernel's heads grouping, spelled in `MK_P`, is the device's pick for TurboQuant
+    /// decode ([`TqDecodeHeads::for_group`]) at every core count.
+    #[test]
+    fn heads_are_the_devices_pick_at_every_core_count() {
+        let geometries = [
+            (64, 32, 8),
+            (128, 24, 8),
+            (128, 32, 8),
+            (256, 16, 8),
+            (512, 16, 2),
+            (128, 28, 4),
+            (64, 9, 3),
+        ];
+        for (hd, q, kv) in geometries {
+            let geometry = (HeadDim(hd), NumQHeads(q), NumKvHeads(kv));
+            let mut rule: Vec<(u32, u32)> =
+                TqDecodeHeads::candidates(geometry.0, geometry.1, geometry.2)
+                    .map(|h| (q / h.get(), h.get()))
+                    .filter(|&(_, h)| h > 1)
+                    .collect();
+            rule.reverse();
+            let text = format!("constant uint H = {};", heads_msl(&rule));
+            for p in 1..=128 {
+                let pick =
+                    TqDecodeHeads::for_group(geometry.0, geometry.1, geometry.2, GpuCores(p));
+                assert_eq!(
+                    eval_constants(&text, p)["H"],
+                    u64::from(pick.get()),
+                    "hd {hd}, {q} q / {kv} kv heads, {p} cores"
+                );
+            }
+        }
+    }
+
+    /// Every phase split is valid and even at every core count: each item plays at least one
+    /// virtual threadgroup and no more than the whole threadgroup holds, a step's items cover its
+    /// grid with none empty, the cursors follow the items, no lane plays more rounds than the
+    /// split's, and every pinned lane is a threadgroup of the launch.
+    #[test]
+    fn a_phase_splits_evenly_at_every_core_count() {
+        let fit = |vtgs: u32, widest: u32, whole: u32| SpreadIn {
+            vtgs: format!("{vtgs}u"),
+            declared: vtgs.div_ceil(widest),
+            fit: Some((widest, whole)),
+        };
+        let shapes = [
+            PhaseShape {
+                spread: vec![fit(256, 1, 16)],
+                free: 0,
+                groups: 0,
+            },
+            PhaseShape {
+                spread: vec![fit(128, 4, 32), fit(8, 1, 4)],
+                free: 2,
+                groups: 2,
+            },
+            PhaseShape {
+                spread: vec![fit(3, 1, 1)],
+                free: 1,
+                groups: 1,
+            },
+            PhaseShape {
+                spread: vec![fit(4096, 8, 32), fit(4096, 8, 32), fit(17, 2, 8)],
+                free: 0,
+                groups: 3,
+            },
+            PhaseShape {
+                spread: vec![
+                    fit(640, 16, 16),
+                    SpreadIn {
+                        vtgs: "12u".into(),
+                        declared: 6,
+                        fit: None,
+                    },
+                ],
+                free: 5,
+                groups: 5,
+            },
+        ];
+        for (s, shape) in shapes.iter().enumerate() {
+            let mut text = String::new();
+            shape.msl(s, &mut text);
+            for p in 1..=128u32 {
+                let env = eval_constants(&text, p);
+                let get = |n: String| env[&format!("MK_S{s}_{n}")];
+                let mut total = 0;
+                for (i, x) in shape.spread.iter().enumerate() {
+                    assert_eq!(
+                        get(format!("C{i}")),
+                        total,
+                        "shape {s}, {p} cores: cursor {i}"
+                    );
+                    let n = get(format!("N{i}"));
+                    total += n;
+                    if let Some((_, whole)) = x.fit {
+                        let (v, k) = (get(format!("V{i}")), get(format!("K{i}")));
+                        assert!(
+                            (1..=u64::from(whole)).contains(&k),
+                            "shape {s}, {p} cores: step {i} plays {k} per item"
+                        );
+                        assert!(
+                            n * k >= v && (n - 1) * k < v,
+                            "shape {s}, {p} cores: step {i}'s {n} items of {k} and its grid of {v}"
+                        );
+                    }
+                }
+                let rounds = get("R".into());
+                assert!(
+                    total.div_ceil(u64::from(p)) <= rounds,
+                    "shape {s}, {p} cores: {total} items over {rounds} rounds"
+                );
+                for g in 0..shape.groups {
+                    assert!(
+                        get(format!("L{g}")) < u64::from(p),
+                        "shape {s}, {p} cores: lane of group {g}"
+                    );
+                }
+            }
+        }
+    }
 }

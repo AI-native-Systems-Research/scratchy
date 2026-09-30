@@ -9,18 +9,30 @@
 #![cfg(feature = "metal")]
 
 use scratchy_target_metal::interpreter::metal::MetalBucketSpec;
-use scratchy_target_metal::tape::lowered::{GateCtx, GenClass};
+use scratchy_target_metal::tape::lowered::{ClassedTape, GateCtx, GenClass};
 
 fn check(name: &str, buckets: &[MetalBucketSpec]) {
     let decode = buckets
         .iter()
         .find(|b| b.bucket_m == 1)
         .expect("a decode bucket");
-    let classed = decode
+    let classes: Vec<GenClass> = decode
         .tapes
         .iter()
-        .find(|t| t.gen_class == GenClass::M5 && !t.chunked)
-        .expect("an M5 variant");
+        .filter(|t| !t.chunked)
+        .map(|t| t.gen_class)
+        .collect();
+    assert_eq!(
+        classes,
+        [GenClass::M1, GenClass::Mid, GenClass::M5],
+        "{name}: every GPU generation's decode tape"
+    );
+    for classed in decode.tapes.iter().filter(|t| !t.chunked) {
+        check_class(&format!("{name} {:?}", classed.gen_class), classed);
+    }
+}
+
+fn check_class(name: &str, classed: &ClassedTape) {
     let commands = classed.tape.commands_expanded();
     let origins = classed.tape.expanded_origins();
     let [mk] = classed.megakernel else {
@@ -41,6 +53,11 @@ fn check(name: &str, buckets: &[MetalBucketSpec]) {
     assert!(
         source_has(mk.source, &format!("void {}(", mk.kernel)),
         "{name}: the kernel is in the source"
+    );
+    // The work split is the launch's: every lane a function of the GPU's cores (`MK_P`).
+    assert!(
+        !source_has(mk.source, "mk_tg == ") || source_has(mk.source, "% MK_P;"),
+        "{name}: a pinned lane not taken modulo the launch's threadgroups"
     );
     // Each baked step is spelled once — alone, or in a co-issued group's one call.
     for s in mk.steps {
