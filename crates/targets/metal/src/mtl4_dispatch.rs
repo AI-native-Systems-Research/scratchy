@@ -20,7 +20,6 @@ use objc2_metal::{
 };
 
 use crate::residency::{MetalResidencySet, Pinned};
-use crate::stream::MetalStreamError;
 
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -29,9 +28,11 @@ pub type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 /// Block until `event` reaches `value`: the GPU is done with every command buffer committed
 /// before the signal, however long that takes. Returning earlier hands back buffers a kernel is
 /// still using — the caller frees, reuses or unpins them under it, and a process that then exits
-/// leaves the kernel running on the GPU. A command buffer the system ends (a GPU fault, its
-/// watchdog) still reaches the signal, its error arriving through the commit feedback; each minute
-/// the wait goes on is reported.
+/// leaves the kernel running on the GPU. So a kernel that never ends holds this wait, and the
+/// thread, until the system ends its command buffer or the process is killed; each minute the wait
+/// goes on is reported. (A command buffer that failed with an out-of-memory error has been seen to
+/// reach its signal, with the error in the commit feedback — see the pool's `submit`; one ended by
+/// the GPU watchdog has not been observed here.)
 pub fn wait_drained(event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
     let started = std::time::Instant::now();
     while !event.waitUntilSignaledValue_timeoutMS(value, 60_000) {
@@ -349,11 +350,11 @@ impl Mtl4DispatchBatch {
 
     /// End encoding, commit the residency set, end + submit the command buffer.
     /// `wait == true` signals a shared event and blocks until the GPU drains
-    /// (sync path: returns `Err` on timeout). `wait == false` submits fire-and-
+    /// ([`wait_drained`]: however long that takes). `wait == false` submits fire-and-
     /// forget — queue ordering guarantees a later dispatch on the same device
     /// sees the result — and keeps the batch's resources alive via a commit-
     /// feedback handler that drops them only after GPU completion.
-    pub fn commit(mut self, wait: bool) -> Result<(), MetalStreamError> {
+    pub fn commit(mut self, wait: bool) {
         self.enc.endEncoding();
         // Commit the now-populated residency set, THEN attach it to the CB
         // (between begin and endCommandBuffer) so the driver wires every bound +
@@ -379,7 +380,6 @@ impl Mtl4DispatchBatch {
             wait_drained(&self.event, 1);
             // `self` drops here → residency set + pinned buffers + tables freed
             // AFTER the GPU has drained. Safe.
-            Ok(())
         } else {
             use block2::RcBlock;
             use objc2_metal::{MTL4CommitFeedback, MTL4CommitOptions};
@@ -416,7 +416,6 @@ impl Mtl4DispatchBatch {
             }
             // Drop our `block` handle: Metal retained it in `addFeedbackHandler`
             // and releases it after firing, dropping the captured resources.
-            Ok(())
         }
     }
 }

@@ -16,9 +16,22 @@ use clap::Parser;
 
 use crate::args::{Cli, Commands};
 
+/// Whether a termination signal ended the run through its normal teardown (`Interrupted`).
+fn interrupted(_r: &anyhow::Result<()>) -> bool {
+    #[cfg(feature = "chat")]
+    return _r
+        .as_ref()
+        .is_err_and(|e| e.is::<scratchy_serving_api::llm::Interrupted>());
+    #[cfg(not(feature = "chat"))]
+    false
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let r = run().await;
+    // A run a termination signal ended exits as the signal's default action would have
+    // (128 + SIGINT), not as a failure.
+    let failed = if interrupted(&r) { 130 } else { 1 };
     // ⛔⛔⛔ SENLIB SEGFAULTS IN ITS OWN `atexit` HANDLER, SO THIS PROCESS DOES NOT RUN ONE.
     //
     // MEASURED 2026-08-14 under `MALLOC_PERTURB_=165` (which fills freed memory, turning a use-after-free
@@ -60,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("Error: {e:?}");
-                1
+                failed
             }
         };
         let _ = std::io::stdout().flush();
@@ -68,6 +81,11 @@ async fn main() -> anyhow::Result<()> {
         // SAFETY: `_exit` is async-signal-safe and takes no locks. Everything this process still owns is
         // memory and file descriptors, both reclaimed by the kernel.
         unsafe { libc::_exit(code) };
+    }
+    #[cfg(not(feature = "spyre-hw"))]
+    if interrupted(&r) {
+        eprintln!("interrupted");
+        std::process::exit(failed);
     }
     #[cfg(not(feature = "spyre-hw"))]
     r

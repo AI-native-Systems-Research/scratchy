@@ -157,7 +157,8 @@ enum Input {
 
 #[cfg(feature = "chat")]
 fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
-    use scratchy_serving_api::llm::{ChatMessage, LLM, termination_signal};
+    use scratchy_serving_api::llm::{ChatMessage, Interrupted, LLM};
+    use scratchy_serving_api::signal::termination_signal;
 
     // `init_tracing` honors `RUST_LOG` when set; "info" is just the default level so the
     // startup milestones (session ready, ladder built, KV pool sized, ...) still print without
@@ -268,6 +269,10 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         }
 
         for (i, message) in prompts.iter().enumerate() {
+            // A signal between turns, when no generation was running to stop.
+            if input.try_recv().is_ok() {
+                return Err(Interrupted.into());
+            }
             conversation.push(ChatMessage::user(message));
 
             let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
@@ -327,7 +332,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
             Ok(Input::End) | Err(_) => break,
             Ok(Input::Interrupt) => {
                 println!();
-                break;
+                return Err(Interrupted.into());
             }
         };
         if input.is_empty() {

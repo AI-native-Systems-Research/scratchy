@@ -39,5 +39,6 @@ pub mod reasoning_parser;
 pub mod responses;
 #[cfg(feature = "serve")]
 pub mod server;
+pub mod signal;
 pub mod spans;
 pub mod tool_parser;

@@ -243,7 +243,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 /// Note: `kill -9` (SIGKILL) is uncatchable and bypasses this entirely — the
 /// only mitigation there is to not `kill -9` a busy server.
 async fn shutdown_signal() {
-    crate::llm::termination_signal().await;
+    crate::signal::termination_signal().await;
     info!("Termination signal received — shutting down gracefully (releasing GPU residency)");
 }
 

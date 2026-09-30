@@ -886,9 +886,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// its compute encoder, the pool's residency sets declared on it; if it
     /// fails, its error returns with the command buffer ended and nothing
     /// committed. Otherwise the command buffer is committed and this returns
-    /// once the GPU is done with it ([`wait_drained`]) — completed, or ended
-    /// by the system, whose error the commit feedback reports — so nothing it
-    /// reads is still in use when the caller gets control back.
+    /// once the GPU is done with it ([`wait_drained`]) — completed, or failed
+    /// with the error the commit feedback reports — so nothing it reads is
+    /// still in use when the caller gets control back.
     ///
     /// [`wait_drained`]: crate::mtl4_dispatch::wait_drained
     fn submit<R>(

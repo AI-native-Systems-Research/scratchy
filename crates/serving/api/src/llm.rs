@@ -422,31 +422,6 @@ impl std::fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
-/// Resolves on the process's first SIGINT or SIGTERM after the call.
-pub async fn termination_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
-}
-
 impl LLM {
     /// Create an LLM with default settings for the given model.
     ///
@@ -516,23 +491,33 @@ impl LLM {
         Interrupter(Arc::clone(&self.interrupt))
     }
 
-    /// Abort `request_id` and step the engine until nothing it scheduled is still in flight, so the
-    /// device is idle when the generation returns [`Interrupted`].
-    fn stop(&mut self, request_id: &str) -> Result<RequestOutput> {
-        self.client
-            .abort_requests(&[request_id.to_owned()])
-            .map_err(|e| anyhow::anyhow!("abort_requests failed: {e}"))?;
+    /// Whether [`Interrupter::interrupt`] was called since the generation started (a running
+    /// generation asks between steps).
+    fn interrupted(&self) -> bool {
+        self.interrupt.load(Ordering::Acquire)
+    }
+
+    /// A generation starts: an interrupt from before it (nothing was running) does not stop it.
+    fn start_generation(&self) {
+        self.interrupt.store(false, Ordering::Release);
+    }
+
+    /// Stop an interrupted generation: abort its requests and step the engine until they are
+    /// retired, then the [`Interrupted`] error it returns. Without the background pipeline a step
+    /// has finished on the GPU when it returns; with it (`max_num_seqs > 1`) up to two are queued,
+    /// and these steps are what finishes them.
+    fn stop(&mut self, request_ids: &[String]) -> anyhow::Error {
+        if let Err(e) = self.client.abort_requests(request_ids) {
+            return anyhow::anyhow!("abort_requests failed: {e}");
+        }
         while self.client.has_unfinished_requests() {
-            match self
-                .client
-                .get_output()
-                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?
-            {
-                StepOutcome::Progressed { .. } => {}
-                StepOutcome::Stalled | StepOutcome::Idle => break,
+            match self.client.get_output() {
+                Ok(StepOutcome::Progressed { .. }) => {}
+                Ok(StepOutcome::Stalled | StepOutcome::Idle) => break,
+                Err(e) => return anyhow::anyhow!("engine step failed: {e}"),
             }
         }
-        Err(Interrupted.into())
+        Interrupted.into()
     }
 
     /// The model name / HuggingFace ID.
@@ -789,6 +774,7 @@ impl LLM {
         let base_id = format!("llm-{}", uuid::Uuid::new_v4());
 
         // Submit all requests to the engine.
+        self.start_generation();
         let mut request_ids: Vec<String> = Vec::with_capacity(total);
         for (p_idx, prompt_ids) in prompt_token_ids.iter().enumerate() {
             for n_idx in 0..n {
@@ -866,6 +852,9 @@ impl LLM {
         let mut itl_count: Vec<u32> = vec![0; total];
 
         while self.client.has_unfinished_requests() {
+            if self.interrupted() {
+                return Err(self.stop(&request_ids));
+            }
             let outcome = self
                 .client
                 .get_output()
@@ -1082,6 +1071,7 @@ impl LLM {
         }
 
         let request_id = format!("llm-chat-{}", uuid::Uuid::new_v4());
+        self.start_generation();
         let _t_submit = std::time::Instant::now();
         self.client
             .add_request(EngineCoreRequest {
@@ -1128,8 +1118,8 @@ impl LLM {
         let mut steps = 0usize;
         let mut _d_step0 = std::time::Duration::ZERO;
         while self.client.has_unfinished_requests() {
-            if self.interrupt.swap(false, Ordering::AcqRel) {
-                return self.stop(&request_id);
+            if self.interrupted() {
+                return Err(self.stop(std::slice::from_ref(&request_id)));
             }
             let _t_step_i = std::time::Instant::now();
             let outcome = self
