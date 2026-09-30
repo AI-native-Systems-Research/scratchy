@@ -38,9 +38,9 @@
 #           OLLAMA_NUM_PARALLEL / OLLAMA_CONTEXT_LENGTH sized for that axis.
 # No parity gate: it needs CLI mode and this ladder runs in server mode.
 #
-# --serve-args "..." replaces the extra `scr serve` flags (recorded in the JSON).
-# The default caps batches at 2048 tokens: at 4096 the scheduler can build a
-# 4097-token batch, the Metal worker panics (NoBucketFits) and the server hangs.
+# --serve-args "..." adds extra `scr serve` flags (recorded in the JSON). None
+# by default: `scr serve` sizes --max-num-batched-tokens to the largest resident
+# prefill bucket, the same as any user gets.
 # --cell-timeout-s bounds each scaling cell; a timed-out cell skips the rest of
 # that server's cells, since a hung server would hang them all.
 set -euo pipefail
@@ -96,7 +96,7 @@ SETTLE_S=""
 # --exec's 600 s default timed out gemma-4-31b-it (18.4 GB) on this class of machine.
 READY_TIMEOUT_S=1800
 CELL_TIMEOUT_S=3600
-SERVE_ARGS="--max-num-batched-tokens 2048"
+SERVE_ARGS=""
 SEED=""
 MLX_PYTHON=""
 MLX_AUTO=1
