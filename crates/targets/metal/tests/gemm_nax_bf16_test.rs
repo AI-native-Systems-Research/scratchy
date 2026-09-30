@@ -100,8 +100,11 @@ fn gemm_nax_bf16_correct_and_fast() {
         return;
     };
     let dev = &device.device;
-    let lib = load_library_from_bytes(dev, scratchy_target_metal::embedded_metallib!("quantized_qmm_nax"))
-        .expect("load NAX lib");
+    let lib = load_library_from_bytes(
+        dev,
+        scratchy_target_metal::embedded_metallib!("quantized_qmm_nax"),
+    )
+    .expect("load NAX lib");
 
     // ---- Correctness: M=128, N=96 (unaligned), K=128 vs CPU A@B^T ----
     {
