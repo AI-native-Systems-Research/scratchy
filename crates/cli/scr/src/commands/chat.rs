@@ -269,10 +269,6 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         }
 
         for (i, message) in prompts.iter().enumerate() {
-            // A signal between turns, when no generation was running to stop.
-            if input.try_recv().is_ok() {
-                return Err(Interrupted.into());
-            }
             conversation.push(ChatMessage::user(message));
 
             let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
@@ -306,6 +302,10 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
             }
 
             conversation.push(ChatMessage::assistant(&output.outputs[0].text));
+            // A signal after the turn's last step: the turn finished, the run ends here.
+            if input.try_recv().is_ok() {
+                return Err(Interrupted.into());
+            }
         }
         return Ok(());
     }

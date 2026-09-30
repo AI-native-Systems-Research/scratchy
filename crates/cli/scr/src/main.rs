@@ -17,12 +17,15 @@ use clap::Parser;
 use crate::args::{Cli, Commands};
 
 /// Whether a termination signal ended the run through its normal teardown (`Interrupted`).
-fn interrupted(_r: &anyhow::Result<()>) -> bool {
-    #[cfg(feature = "chat")]
-    return _r
-        .as_ref()
-        .is_err_and(|e| e.is::<scratchy_serving_api::llm::Interrupted>());
-    #[cfg(not(feature = "chat"))]
+#[cfg(feature = "chat")]
+fn interrupted(r: &anyhow::Result<()>) -> bool {
+    r.as_ref()
+        .is_err_and(|e| e.is::<scratchy_serving_api::llm::Interrupted>())
+}
+
+/// Without the in-process engine, nothing ends a run on a signal but the signal itself.
+#[cfg(not(feature = "chat"))]
+fn interrupted(_: &anyhow::Result<()>) -> bool {
     false
 }
 

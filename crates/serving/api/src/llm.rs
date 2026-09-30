@@ -396,17 +396,28 @@ pub struct LLM {
     interrupt: Arc<AtomicBool>,
 }
 
-/// Stops an [`LLM`]'s running generation from another thread: after the step in flight, the
-/// generation aborts its request, steps the engine until nothing of it is in flight, and returns
-/// [`Interrupted`]. What a termination signal does to an in-process generation, so the process
-/// exits through its normal teardown — the device idle, its residency released — instead of dying
-/// with GPU work in flight.
+/// Stops an [`LLM`]'s generation from another thread: the one running, or — when none is — the
+/// next to start. After the step in flight, the generation aborts its request, steps the engine
+/// until nothing of it is queued, and returns [`Interrupted`]. What a termination signal does to
+/// an in-process generation, so the process exits through its normal teardown — the device idle,
+/// its residency released — instead of dying with GPU work in flight.
 #[derive(Clone)]
 pub struct Interrupter(Arc<AtomicBool>);
 
 impl Interrupter {
     pub fn interrupt(&self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+/// A generation's hold on its [`LLM`]'s interrupt: taken when the generation starts, it clears
+/// the interrupt when the generation returns, however it returns. Cleared then rather than at the
+/// start, an interrupt that lands while the generation prepares its requests still stops it.
+struct Generation(Arc<AtomicBool>);
+
+impl Drop for Generation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -491,15 +502,15 @@ impl LLM {
         Interrupter(Arc::clone(&self.interrupt))
     }
 
-    /// Whether [`Interrupter::interrupt`] was called since the generation started (a running
+    /// Whether [`Interrupter::interrupt`] was called since the last generation returned (a running
     /// generation asks between steps).
     fn interrupted(&self) -> bool {
         self.interrupt.load(Ordering::Acquire)
     }
 
-    /// A generation starts: an interrupt from before it (nothing was running) does not stop it.
-    fn start_generation(&self) {
-        self.interrupt.store(false, Ordering::Release);
+    /// A generation starts; see [`Generation`].
+    fn generation(&self) -> Generation {
+        Generation(Arc::clone(&self.interrupt))
     }
 
     /// Stop an interrupted generation: abort its requests and step the engine until they are
@@ -747,6 +758,7 @@ impl LLM {
         seal: bool,
         volatile: bool,
     ) -> Result<Vec<RequestOutput>> {
+        let _generation = self.generation();
         let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
         params
             .validate()
@@ -774,7 +786,6 @@ impl LLM {
         let base_id = format!("llm-{}", uuid::Uuid::new_v4());
 
         // Submit all requests to the engine.
-        self.start_generation();
         let mut request_ids: Vec<String> = Vec::with_capacity(total);
         for (p_idx, prompt_ids) in prompt_token_ids.iter().enumerate() {
             for n_idx in 0..n {
@@ -1025,6 +1036,7 @@ impl LLM {
         params: Option<SamplingParams>,
         mut on_token: impl FnMut(&str),
     ) -> Result<RequestOutput> {
+        let _generation = self.generation();
         let tpl = self
             .chat_template
             .as_ref()
@@ -1071,7 +1083,6 @@ impl LLM {
         }
 
         let request_id = format!("llm-chat-{}", uuid::Uuid::new_v4());
-        self.start_generation();
         let _t_submit = std::time::Instant::now();
         self.client
             .add_request(EngineCoreRequest {
