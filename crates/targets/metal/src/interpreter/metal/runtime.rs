@@ -229,7 +229,6 @@ impl RuntimeBindings {
             RuntimeBindingKind::VisionCuSeqlensWindow => &self.vision_cu_seqlens_window,
             RuntimeBindingKind::VisionWindowIndex => &self.vision_window_index,
             RuntimeBindingKind::VisionReverseIndices => &self.vision_reverse_indices,
-            RuntimeBindingKind::VisionPositionIds => &self.vision_position_ids,
         }
     }
 }

@@ -143,6 +143,8 @@ pub struct ForwardInputs<'a> {
     /// reads it in place of the static cos/sin cache, with identity
     /// positions). `None` for 1D-rope arches.
     pub mrope_cos_sin: Option<&'a [u8]>,
+    /// How the baked tape is played (`GpuDevice::metal_tape_play`).
+    pub play: super::lowered::TapePlay,
 }
 
 /// Build the per-token MRoPE cos/sin override table for the text decoder
@@ -256,6 +258,8 @@ pub enum ForwardError {
     /// A caller-supplied followup hook (e.g. argmax encode + wait
     /// chained on the forward CB's shared event) failed.
     Followup(String),
+    /// A megakernel run of the forward gave up a bounded wait.
+    Megakernel(super::lowered::MegakernelError),
 }
 
 impl std::fmt::Display for ForwardError {
@@ -287,6 +291,7 @@ impl std::fmt::Display for ForwardError {
             Self::Followup(msg) => {
                 write!(f, "MetalWorkerPool::forward: followup hook failed: {msg}")
             }
+            Self::Megakernel(e) => write!(f, "MetalWorkerPool::forward: {e}"),
         }
     }
 }

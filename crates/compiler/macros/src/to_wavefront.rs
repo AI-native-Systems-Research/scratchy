@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! PD-wavefront task **T2b** — the macro→wavefront bridge.
 //!
-//! Translate a *solved* decode FUF (`Fuf` + solver [`Assignment`]) into a
+//! Translate a decode FUF into a
 //! [`scratchy_subtile::lower::LoweringInput`] and hand it to
 //! [`scratchy_subtile::lower::lower`], so a real Llama-3.2-1B forward
 //! flows through the host-validated subtile pipeline (DAG eval + tape
@@ -45,7 +45,6 @@ use scratchy_subtile::subtile_ir::{
     RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, TopK,
 };
 
-use crate::assignment::Assignment;
 use crate::classified::{ExternKind, OpKind, UnrollIndex};
 use crate::codegen::weight_kind_accessor_method;
 use crate::config::ModelParams;
@@ -189,7 +188,6 @@ pub use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 #[derive(Debug, Clone)]
 pub struct BridgeStats {
     pub fuf_tiles: usize,
-    pub subgraphs: usize,
     pub sources: usize,
     pub ops: usize,
     /// `(op kind name, count)`, sorted by name.
@@ -548,17 +546,12 @@ impl PrefixCapacity {
 
 /// Translate a solved decode FUF into a wavefront `LoweringInput`.
 ///
-/// `asn` is the `num_tokens = 1` (decode) [`Assignment`]; `bounds` is the
-/// per-model integer bounds the solver used (tp-sharded if tp>1).
+/// `bounds` is the per-model integer bounds (tp-sharded if tp>1).
 /// `prefix_len` ([`PrefixCapacity`]) models the KV-cache prefix rows for the
 /// attention `Source` segments (structural only — the real length binds at run
 /// time); the decode and prefill bundles of one model MUST share it.
 pub fn lower_decode_to_wavefront(
     fuf: &Fuf,
-    // `None` = tape-authoritative mode (M2b step 3): the walk needs no
-    // solver assignment — `Some` adds the coverage sanity check the
-    // instruction-selection era provided for free.
-    asn: Option<&Assignment>,
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
     model: &ModelParams,
@@ -583,8 +576,7 @@ pub fn lower_decode_to_wavefront(
     };
     let mut b = bounds.clone();
     // num_tokens (= query rows m): 1 = decode, >1 = batched prefill. The op row
-    // dim threads through OpDesc.m / the EmbeddedHidden + cos_sin sources — NOT
-    // the solver Assignment (which only tiles N/K, num_tokens-independent) — so
+    // dim threads through OpDesc.m / the EmbeddedHidden + cos_sin sources, so
     // overriding the bound + m here yields a valid m-row graph.
     let m = num_tokens.max(1);
     b.insert("num_tokens".into(), m as u64);
@@ -730,16 +722,6 @@ pub fn lower_decode_to_wavefront(
     for tile_id in topo {
         let node = fuf.get(tile_id);
         let tile = node.id;
-        // Every tile must be claimed by the solve — otherwise codegen
-        // would have errored. A coverage gap here is a real bug, so
-        // surface it rather than lower a tile the solver rejected.
-        if asn.is_some_and(|a| a.subgraph_of(tile).is_none()) {
-            return Err(BridgeError::MalformedOp {
-                tile,
-                op: node.op,
-                detail: "tile not covered by the assignment",
-            });
-        }
 
         match node.op {
             // Embed is a host-side row gather, not a megakernel op: the
@@ -1683,7 +1665,7 @@ pub struct ResolutionReport {
 }
 
 /// Compute dump stats for a lowered forward (the drive logs these).
-pub fn stats(fuf: &Fuf, asn: &Assignment, lowered: &LoweredDecode) -> BridgeStats {
+pub fn stats(fuf: &Fuf, lowered: &LoweredDecode) -> BridgeStats {
     let input = &lowered.input;
     let mut hist: HashMap<&'static str, usize> = HashMap::new();
     for od in &input.ops {
@@ -1711,7 +1693,6 @@ pub fn stats(fuf: &Fuf, asn: &Assignment, lowered: &LoweredDecode) -> BridgeStat
         .count();
     BridgeStats {
         fuf_tiles: fuf.len(),
-        subgraphs: asn.num_subgraphs(),
         sources: input.sources.len(),
         ops: input.ops.len(),
         op_histogram,

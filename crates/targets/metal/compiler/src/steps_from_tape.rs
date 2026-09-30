@@ -34,8 +34,8 @@ use scratchy_target_metal::op_abi::{
 use scratchy_target_metal::tape::lowered::RuntimeGate;
 use scratchy_target_metal::tape::step::{
     self as st, AffineBits as Bits, AffineGroupSize as Gs, ArenaSlotIdx as Slot, HiddenSize as W,
-    IntermediateSize as Inter, LayerId, MetalStep, MoeRegion, MoeRows, MoeStep,
-    RowsPerToken as Rows, StepRow,
+    IntermediateSize as Inter, LayerId, MetalLoc, MetalStep, MoeRegion, MoeRows, MoeStep,
+    RowAccess, RowsPerToken as Rows, StepRow,
 };
 
 use crate::canonical::MetalStepFacts;
@@ -1519,6 +1519,63 @@ impl Assembled {
         let lm = all.split_off(self.sigs.len());
         (all, lm)
     }
+
+    /// Each row's dataflow for the megakernel plan, backbone and lm_head: the hazard signature
+    /// the barrier walk fences on, named. The rows one construct expanded to carry the UNION of
+    /// their accesses — [`hazard_flags`] fences them as one, and a member may bind what another
+    /// member only views (an elided step's operand).
+    pub fn access(&self) -> (Vec<RowAccess>, Vec<RowAccess>) {
+        (row_access(&self.sigs), row_access(&self.lm_sigs))
+    }
+}
+
+/// [`Assembled::access`] of one half, grouped exactly as [`hazard_flags`] groups it.
+fn row_access(sigs: &[HazardSig]) -> Vec<RowAccess> {
+    let mut out = Vec::with_capacity(sigs.len());
+    let mut i = 0;
+    while i < sigs.len() {
+        if sigs[i].metadata {
+            out.push(RowAccess::default());
+            i += 1;
+            continue;
+        }
+        let g = sigs[i].group;
+        let rest = sigs[i + 1..].iter();
+        let end = i + 1 + rest.take_while(|s| g.is_some() && s.group == g).count();
+        let mut union = RowAccess::default();
+        for s in &sigs[i..end] {
+            let mut add = |l: MetalLoc, write: bool| {
+                let list = if write {
+                    &mut union.writes
+                } else {
+                    &mut union.reads
+                };
+                if !list.contains(&l) {
+                    list.push(l);
+                }
+            };
+            s.reads.iter().for_each(|x| add(MetalLoc::Arena(*x), false));
+            s.writes.iter().for_each(|x| add(MetalLoc::Arena(*x), true));
+            s.kv_r.into_iter().for_each(|l| add(MetalLoc::Kv(l), false));
+            s.kv_w.into_iter().for_each(|l| add(MetalLoc::Kv(l), true));
+            for (access, loc) in [
+                (s.op_scratch, MetalLoc::OpScratch),
+                (s.codec_staging, MetalLoc::CodecStaging),
+            ] {
+                match access {
+                    Access::Untouched => {}
+                    Access::Read => add(loc, false),
+                    Access::Write => {
+                        add(loc, false);
+                        add(loc, true);
+                    }
+                }
+            }
+        }
+        out.extend(std::iter::repeat_n(union, end - i));
+        i = end;
+    }
+    out
 }
 
 /// Lay the records out along `items`: head rows first, each step's record at its position, a

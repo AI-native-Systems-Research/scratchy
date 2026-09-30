@@ -147,12 +147,15 @@ fn main() {
     // the metallibs, so emitting nothing here lets Linux/cuda builds
     // compile this crate without needing `xcrun`.
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "macos" {
+        write_mk_adapters_rs(&out_dir, &[]);
+        std::fs::write(out_dir.join("mk_bodies.metal"), "").expect("write mk_bodies.metal");
         return;
     }
 
     require_min_macos_sdk();
 
     let shader_dir = manifest_dir.join("shaders");
+    build_megakernel(&shader_dir, &out_dir);
 
     let mut entries: Vec<_> = std::fs::read_dir(&shader_dir)
         .unwrap_or_else(|e| panic!("read shaders/ failed: {e}"))
@@ -235,6 +238,218 @@ fn compile_shader(shader: &Path, out_dir: &Path, shader_dir: &Path) {
     if !status.success() {
         panic!("`xcrun metallib` failed for {}", shader.display());
     }
+}
+
+// ── The decode megakernel ────────────────────────────────────────────────────────────────────
+//
+// `shaders/megakernel/megakernel.metal` includes the normalized shaders in bodies-only mode.
+// Their instantiation lines are the ONLY list of what a megakernel may call: preprocessed with
+// `-DMK_ENUMERATE`, each `MK_ADAPTER` prints a marker, and the markers become `mk_adapters.rs`
+// (read by the bake, which generates each tape's kernels). The same TU with its local includes
+// inlined is `mk_bodies.metal`: the self-contained text the worker compiles a tape's generated
+// kernels against at load.
+
+/// One `MK_ADAPTER` marker.
+struct MkMarker {
+    library: String,
+    function: String,
+    tg_bytes: u32,
+    coherent: u32,
+    item_threads: u32,
+    writes: u32,
+    /// An elementwise (`MK_TAIL`) adapter.
+    tail: bool,
+    /// `(item threads, row constant slot, below)` of an `MK_STREAM_ROWS` adapter.
+    short_rows: Option<(u32, u32, u32)>,
+    /// `(MSL type, name, index)` of the dispatch kernel's function constants.
+    constants: Vec<(String, String, u32)>,
+    /// The adapter call, `MK_C` standing for the step's constant policy.
+    call: String,
+}
+
+fn build_megakernel(shader_dir: &Path, out_dir: &Path) {
+    let tu = shader_dir.join("megakernel").join("megakernel.metal");
+    let out = Command::new("xcrun")
+        .args([
+            "-sdk",
+            "macosx",
+            "metal",
+            "-E",
+            "-P",
+            "-DMK_ENUMERATE",
+            "-I",
+        ])
+        .arg(shader_dir)
+        .arg(&tu)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn `xcrun metal -E` failed: {e}"));
+    if !out.status.success() {
+        panic!(
+            "megakernel enumeration failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let markers = parse_mk_markers(&String::from_utf8_lossy(&out.stdout));
+    write_mk_adapters_rs(out_dir, &markers);
+    let mut bodies = String::new();
+    inline_local_includes(&tu, shader_dir, &mut Vec::new(), &mut bodies);
+    std::fs::write(out_dir.join("mk_bodies.metal"), bodies).expect("write mk_bodies.metal");
+}
+
+/// `file` with every `#include "…"` replaced by the included text (resolved next to the includer,
+/// then in `shaders/`), each local file inlined once — the headers are `#pragma once`, whose line
+/// is dropped (it would warn in a main file). System includes stay for the runtime compiler.
+fn inline_local_includes(
+    file: &Path,
+    shader_dir: &Path,
+    seen: &mut Vec<PathBuf>,
+    out: &mut String,
+) {
+    let text =
+        std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+    seen.push(file.to_path_buf());
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("#pragma once") {
+            continue;
+        }
+        let Some(name) = t
+            .strip_prefix("#include \"")
+            .and_then(|r| r.split('"').next())
+        else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let near = file.parent().expect("a shader has a directory").join(name);
+        let path = if near.exists() {
+            near
+        } else {
+            shader_dir.join(name)
+        };
+        let path = path
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("{}: #include \"{name}\": {e}", file.display()));
+        if !seen.contains(&path) {
+            inline_local_includes(&path, shader_dir, seen, out);
+        }
+    }
+}
+
+fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
+    let mut markers = Vec::new();
+    for chunk in text.split("@@MK ").skip(1) {
+        let body = chunk
+            .split("@@END")
+            .next()
+            .expect("an MK_ADAPTER marker without @@END");
+        let (head, rest) = body.split_once("@@C").expect("marker without @@C");
+        let (consts, call) = rest.split_once("@@CALL").expect("marker without @@CALL");
+        let head: Vec<&str> = head.split_whitespace().collect();
+        let [
+            library,
+            function,
+            tg_bytes,
+            coherent,
+            item_threads,
+            writes,
+            tail,
+            short,
+            row,
+            below,
+        ] = head[..]
+        else {
+            panic!("malformed MK_ADAPTER marker head: {head:?}");
+        };
+        let int = |s: &str| {
+            match s.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16),
+                None => s.parse(),
+            }
+            .unwrap_or_else(|e| panic!("MK_ADAPTER {function}: `{s}`: {e}"))
+        };
+        let constants = consts
+            .split(';')
+            .map(|c| c.split_whitespace().collect::<Vec<_>>())
+            .filter(|c| !c.is_empty())
+            .map(|c| match c[..] {
+                [ty, name, index] => (ty.to_string(), name.to_string(), int(index)),
+                _ => panic!("MK_ADAPTER {function}: malformed constant {c:?}"),
+            })
+            .collect();
+        let call = call.split_whitespace().collect::<Vec<_>>().join(" ");
+        let call = call
+            .strip_prefix('(')
+            .and_then(|c| c.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("MK_ADAPTER {function}: call `{call}` is not parenthesized"));
+        markers.push(MkMarker {
+            library: library.to_string(),
+            function: function.to_string(),
+            tg_bytes: int(tg_bytes),
+            coherent: int(coherent),
+            item_threads: int(item_threads),
+            writes: int(writes),
+            tail: int(tail) != 0,
+            short_rows: (int(short) != 0).then(|| (int(short), int(row), int(below))),
+            constants,
+            call: call.to_string(),
+        });
+    }
+    assert!(
+        !markers.is_empty(),
+        "the megakernel TU enumerated no adapters"
+    );
+    markers
+}
+
+/// The Rust mirror: `MK_ADAPTERS`, included by `tape/lowered.rs`.
+fn write_mk_adapters_rs(out_dir: &Path, markers: &[MkMarker]) {
+    let mut s = String::from(
+        "// SPDX-License-Identifier: Apache-2.0\n\
+         // Auto-generated by `scratchy-target-metal/build.rs` from the shaders' MK_ADAPTER lines.\n\n\
+         /// Every kernel a megakernel may call, as its adapter.\n\
+         pub const MK_ADAPTERS: &[MkAdapter] = &[\n",
+    );
+    for m in markers {
+        let constants: Vec<String> = m
+            .constants
+            .iter()
+            .map(|(ty, name, i)| {
+                let ty = match ty.as_str() {
+                    "uint" => "UInt",
+                    "int" => "Int",
+                    "float" => "Float",
+                    "bool" => "Bool",
+                    other => panic!(
+                        "{}: constant type `{other}` has no ConstantType",
+                        m.function
+                    ),
+                };
+                format!(
+                    "MkConst {{ slot: ConstSlot({i}), ty: ConstantType::{ty}, name: {name:?} }}"
+                )
+            })
+            .collect();
+        s += &format!(
+            "    MkAdapter {{ library: {:?}, function: {:?}, tg_bytes: VtgBytes({}), \
+             coherent: BindingMask({:#x}), item_threads: {}, writes: BindingMask({:#x}), \
+             tail: {}, short_rows: {}, constants: &[{}], call: {:?} }},\n",
+            m.library,
+            m.function,
+            m.tg_bytes,
+            m.coherent,
+            m.item_threads,
+            m.writes,
+            m.tail,
+            m.short_rows.map_or("None".to_string(), |(threads, row, below)| format!(
+                "Some(ShortRows {{ item_threads: {threads}, row: ConstSlot({row}), below: {below} }})"
+            )),
+            constants.join(", "),
+            m.call,
+        );
+    }
+    s += "];\n";
+    std::fs::write(out_dir.join("mk_adapters.rs"), s).expect("write mk_adapters.rs");
 }
 
 /// Emit the `INST_STEEL_PAGED(tag, type, bd)` lines that

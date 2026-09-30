@@ -168,14 +168,6 @@ pub mod tape;
 pub mod targets;
 pub mod turboquant;
 
-// Atom-driven metal megakernel synthesis (atom IR + fuse passes + AoT
-// metallib compile). Consumed by the compiler's metal codegen and the
-// metal cost-sweep.
-pub mod aot;
-pub mod atom;
-pub mod atom_lib;
-pub mod fuse_pass;
-
 // Metal interpreter (lowering pass + worker pool) relocated out of the
 // compiler — a `cfg(feature = "metal")` there was a cfg-elimination
 // violation. cpu_golden + paged_kv_layout are its pure-CPU test oracles
@@ -186,8 +178,8 @@ pub mod paged_kv_layout;
 
 /// Number of paged-KV-cache blocks backed by one physical chunk buffer
 /// in the metal reactive (chunked) KV pool. SINGLE SOURCE OF TRUTH for
-/// the chunk granularity, baked into synth MSL and set as a
-/// `[[function_constant]]` on the hand-written kernels.
+/// the chunk granularity, set as a `[[function_constant]]` on the
+/// kernels.
 pub const BLOCKS_PER_CHUNK: u32 = 128;
 
 /// Bit 31 of a `slot_mapping` or `block_table` entry: the block stores K

@@ -14,8 +14,8 @@
 //! pass (CUDA's runtime `Loop` interpreter has no analogue on Metal —
 //! the per-bucket dispatch is fully baked).
 
-use crate::tape::constants::ConstantValue;
-use crate::tape::ids::{BucketM, LayerId, SourceIx};
+use crate::tape::constants::{ConstSlot, ConstantType, ConstantValue};
+use crate::tape::ids::{BucketM, LayerId, NumTokens, SourceIx};
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
 ///
@@ -60,23 +60,6 @@ pub enum KernelId {
     /// paged KV cache at the per-request slot. Output: rotated Q
     /// only (K/V are sunk into cache).
     RopeAppend,
-    /// Fused QKV matmul + NeoX-style RoPE + paged KV-cache write in
-    /// one kernel. Replaces the four-dispatch
-    /// `Q_proj + K_proj + V_proj + RopeAppend` chain on the dense
-    /// (BF16 / F16) path. Affine-int4 / prefill variants land
-    /// separately. Maps to
-    /// `fused_qkv_rope_cache_<dtype>_specialized` in
-    /// `fused_qkv_rope_cache.metallib`.
-    FusedQkvRopeCache,
-    /// Affine-int4 sibling of [`KernelId::FusedQkvRopeCache`]. Reads
-    /// packed `u32` weights + per-group F16 scales/biases (mlx-community
-    /// 4bit layout) for Q/K/V concatenated along the output axis, fuses
-    /// the dequant→matmul→RoPE→paged-cache-write chain in a single
-    /// launch. Maps to
-    /// `fused_affine_qkv_rope_cache_<dtype>_s_<scale_dtype>_b_4_specialized`
-    /// in `fused_affine_qkv_rope_cache.metallib`. Group size rides on
-    /// function constant 7.
-    FusedAffineQkvRopeCache,
     /// Decode-bucket attention reading from the paged KV cache.
     /// Single-query-token-per-sequence path.
     AttentionViaCache,
@@ -153,11 +136,8 @@ pub enum KernelId {
     /// Elementwise residual add: `lhs += rhs`. Output is the lhs slot
     /// rebound (in-place semantics).
     Add,
-    /// Per-row bias broadcast add: `out[m, n] = in[m, n] + bias[n]`.
-    /// Singleton claim used by `MetalBiasAddImpl` for Qwen2/Qwen2.5
-    /// (and any other) QKV biases that the synth megakernel doesn't
-    /// absorb at the current bucket M (e.g. M ≥ 2 prefill where the
-    /// solver's cost CSV picks unfused). Maps to
+    /// Per-row bias broadcast add: `out[m, n] = in[m, n] + bias[n]`
+    /// (Qwen2/Qwen2.5 QKV biases). Maps to
     /// `bias_add_{f16,bf16}_specialized` in `elementwise.metallib`;
     /// `num_cols` rides on `function_constant(0)`.
     BiasAdd,
@@ -238,18 +218,14 @@ pub enum KernelId {
     /// `quantized_qmv.metallib` (nvfp4 kernels share that library with
     /// the affine `qmv` ones). Same structure as `AffineQmv`; the only
     /// difference is the E2M1-LUT weight decode (no per-group bias).
-    Nvfp4Qmv,
     /// NVFP4 int4 prefill matmul (transpose=true, standard tile). Maps
     /// to `nvfp4_qmm_t_<dtype>_s_<scale>_gs_16_b_4_alN_<bool>_batch_0`
     /// in `quantized_qmm.metallib`. Mirrors `AffineQmmT`.
-    Nvfp4QmmT,
     /// NVFP4 int4 prefill matmul on NAX (Apple9 / M4+) — 64×64 MPP
     /// matmul2d tile. Maps to
     /// `nvfp4_qmm_t_nax_<dtype>_s_<scale>_gs_16_b_4_alN_<bool>_batch_0`
     /// in `quantized_qmm_nax.metallib`. Dispatched (in place of
-    /// `Nvfp4QmmT`) when `is_nax_capable(profile.generation)` and
     /// `K % 64 == 0`. Mirrors `AffineQmmTNax`.
-    Nvfp4QmmTNax,
     /// Fused `silu(gate) * up` for the decomposed q-MLP path. The
     /// macro emits this after a pair of `AffineQmm` GEMMs when the
     /// gate/up Linears are MLX-affine quantized (plan P12 branch
@@ -286,24 +262,6 @@ pub enum KernelId {
     /// `nn.QuantizedEmbedding.__call__`
     /// (`python/mlx/nn/layers/quantized.py:144`).
     AffineEmbed,
-    /// Compiler-synthesized pre-attention megakernel. Symbol resolves
-    /// against a per-arch source-compiled library registered at worker
-    /// init via `SpecializedPipelineCache::register_source_library`.
-    /// Kernel body is generated at macro-expansion time by
-    /// `scratchy-forward-compiler-macro::fuse_pass`.
-    SynthPreAttn,
-    /// Compiler-synthesized MLP pre-down megakernel. Symbol resolves
-    /// against a per-arch source-compiled library registered at worker
-    /// init via `SpecializedPipelineCache::register_source_library`.
-    /// Kernel body is generated at macro-expansion time by
-    /// `scratchy-forward-compiler-macro::fuse_pass::synthesize_mlp_pre_down_chunk`.
-    /// Fuses `FusedAddRmsNorm + gate AffineQmv + up AffineQmv + SiluMul`
-    /// into one dispatch; the standalone `AffineQmm` down_proj
-    /// instruction follows immediately and consumes the device-buffer
-    /// `silu_mul` output.
-    SynthMlpPreDown,
-    /// Fused gate+up GEMM + SiluMul large-M prefill kernel.
-    SynthGateUpSiluMul,
     /// Slice the last-token row of a `[num_tokens, hidden]` activation
     /// to row 0 of the same buffer, in place. Inserted by the lowering
     /// pass before the lm_head GEMM so the GEMM runs at M=1 instead of
@@ -441,9 +399,6 @@ pub enum KernelId {
     /// Row gather by a runtime u32 index buffer (`embedding_gather.metal`)
     /// — Qwen2.5-VL window permutation / inverse.
     EmbeddingGather,
-    /// 2-D non-overlapping average pool (`avg_pool_2d.metal`) — the
-    /// Gemma3-MM SigLIP→text projector's k×k spatial collapse.
-    AvgPool2d,
     /// Standalone tanh-approx GELU (Qwen3.5-VL ViT MLP / merger MLP).
     /// Maps to `gelu_tanh_{f16,bf16}` in `activation.metallib`. Bindings:
     /// `(out @ 0, in @ 1, n inline @ 2)`.
@@ -517,8 +472,6 @@ impl KernelId {
             | Self::Gemm
             | Self::FusedGateUpSiluMul
             | Self::RopeAppend
-            | Self::FusedQkvRopeCache
-            | Self::FusedAffineQkvRopeCache
             | Self::AttentionViaCache
             | Self::AttentionPrefillSdpaPaged
             | Self::AttnQConvert
@@ -541,9 +494,6 @@ impl KernelId {
             | Self::AffineQmmW4a8
             | Self::AffineGatherW4a8Quant
             | Self::AffineGatherQmmW4a8
-            | Self::Nvfp4Qmv
-            | Self::Nvfp4QmmT
-            | Self::Nvfp4QmmTNax
             | Self::SiluMul
             | Self::GeluMul
             | Self::GateApply
@@ -552,9 +502,6 @@ impl KernelId {
             | Self::GatedDeltaNet
             | Self::SplitKReduceSum
             | Self::AffineEmbed
-            | Self::SynthPreAttn
-            | Self::SynthMlpPreDown
-            | Self::SynthGateUpSiluMul
             | Self::GatherLastToken
             | Self::ScatterFirstToLastRow
             | Self::Softmax
@@ -574,7 +521,6 @@ impl KernelId {
             | Self::VisionRope
             | Self::VisionVarlenAttn
             | Self::EmbeddingGather
-            | Self::AvgPool2d
             | Self::VisionGelu
             | Self::VisionLoadPixels
             | Self::MmEmbedSplice
@@ -734,6 +680,76 @@ impl RuntimeGate {
     }
 }
 
+/// The live facts a [`RuntimeGate`] reads, for one forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateCtx {
+    pub num_tokens: u32,
+    pub num_seqs: u32,
+    pub has_spec_tokens: bool,
+    /// Some sequence's block table has an unrotated (bit-31, span) block.
+    pub unrotated_blocks: bool,
+}
+
+impl GateCtx {
+    /// One sequence decoding one token, no speculative tokens: the contexts a bucket-1
+    /// [`MegakernelTape`] is planned under, where every gate is a constant — the bake checks
+    /// each of its gates reads the same whether or not the sequence holds an unrotated block.
+    pub const fn decode_one(unrotated_blocks: bool) -> Self {
+        Self {
+            num_tokens: 1,
+            num_seqs: 1,
+            has_spec_tokens: false,
+            unrotated_blocks,
+        }
+    }
+}
+
+impl RuntimeGate {
+    /// Whether a command under this gate runs in `ctx` — ONE predicate: the worker asks it per
+    /// dispatch, the megakernel bake per planned context.
+    pub fn admits(self, ctx: GateCtx) -> bool {
+        // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
+        // tokens to drop (prefill / chunked-prefill / mixed batches);
+        // steady-state decode has `num_tokens == num_seqs` and slicing
+        // would just add 2 kernel launches with no GEMM-work savings
+        // (qmv at M=num_seqs == qmm at M=num_seqs). Verified: gating
+        // unconditionally on multi-seq regressed c=4 TPOT by +5% on
+        // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
+        // win without hurting decode.
+        let GateCtx {
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            unrotated_blocks,
+        } = ctx;
+        let decode_step = num_tokens == num_seqs;
+        match self {
+            Self::OnlyIfNoSpec => !has_spec_tokens && num_tokens > num_seqs,
+            Self::OnlyIfSpec => has_spec_tokens,
+            Self::OnlyIfDecodeStep => decode_step,
+            Self::UnlessDecodeStep => !decode_step,
+            Self::OnlyIfSmallMTokens => crate::quantized::SMALL_M_TOKENS.contains(&num_tokens),
+            Self::UnlessSmallMTokens => !crate::quantized::SMALL_M_TOKENS.contains(&num_tokens),
+            Self::OnlyIfOneSequence => num_seqs == 1,
+            Self::UnlessOneSequence => num_seqs > 1,
+            Self::OnlyIfUnrotatedBlocks => unrotated_blocks,
+            Self::UnlessUnrotatedBlocks => !unrotated_blocks,
+            Self::All(gates) => gates.iter().all(|g| g.admits(ctx)),
+        }
+    }
+}
+
+/// How the worker plays a baked tape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TapePlay {
+    /// One MTL4 dispatch per command.
+    Dispatch,
+    /// Every megakernel run the tape carries as one persistent kernel; the commands outside the
+    /// runs are dispatched as [`Self::Dispatch`] dispatches them.
+    #[default]
+    Megakernel,
+}
+
 impl DispatchShape {
     /// 1D dispatch helper: `total_threads` rounded up by
     /// `threads_per_group`.
@@ -773,6 +789,58 @@ impl DispatchShape {
             bucket_m,
         });
         d
+    }
+
+    /// The grid dispatched for a forward of `num_tokens` tokens in `num_seqs` sequences.
+    pub fn threadgroups_at(&self, num_tokens: NumTokens, num_seqs: u32) -> (u32, u32, u32) {
+        let (x, y, z) = self.threadgroups;
+        let Some(s) = self.m_scaling else {
+            return self.threadgroups;
+        };
+        let [x, y, z] = s.scale([x, y, z].map(u64::from), num_tokens, num_seqs);
+        let narrow = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        (narrow(x), narrow(y), narrow(z))
+    }
+}
+
+impl MScaling {
+    /// `grid` (threadgroups per axis) rescaled for a forward of `num_tokens` tokens in
+    /// `num_seqs` sequences: `axis` becomes `ceil(baseline · n / bucket_m)` with `n` clamped to
+    /// `[1, bucket_m]` (never above the baked grid), and `seq_axis`, when set, becomes the live
+    /// `num_seqs`.
+    pub fn scale(self, mut grid: [u64; 3], num_tokens: NumTokens, num_seqs: u32) -> [u64; 3] {
+        let bm = self.bucket_m.get().max(1) as u64;
+        let n = (num_tokens.get().max(1) as u64).min(bm);
+        let slot = &mut grid[self.axis.index()];
+        *slot = slot.saturating_mul(n).div_ceil(bm);
+        // `seq_axis`: SET (not scale) the chosen axis to the live num_seqs. The steel paged
+        // prefill kernel needs one grid-Z layer per sequence (`tid.z = seq_idx`) so a BQ-block
+        // tile never straddles a sequence boundary; over-dispatched (seq, q-block) pairs
+        // early-out in the kernel.
+        if let Some(seq_ax) = self.seq_axis {
+            grid[seq_ax.index()] = num_seqs.max(1) as u64;
+        }
+        grid
+    }
+}
+
+impl MScaleAxis {
+    /// The axis of `(x, y, z)` index `i`.
+    pub const fn of_index(i: u8) -> Option<Self> {
+        match i {
+            0 => Some(Self::X),
+            1 => Some(Self::Y),
+            2 => Some(Self::Z),
+            _ => None,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
     }
 }
 
@@ -998,7 +1066,6 @@ impl SourceRef<'_> {
             (Self::Linear(l @ L::AffineQuant(_)), T::AffineBiases) => Some(l.affine_biases()),
             (Self::Linear(l @ L::AffineQuant(_)), T::AffineLinearBias) => l.affine_linear_bias(),
             (Self::Linear(l @ L::Nvfp4(_)), T::Weight) => Some(l.nvfp4_weight()),
-            (Self::Linear(l @ L::Nvfp4(_)), T::Nvfp4Scales) => Some(l.nvfp4_scales()),
             (Self::GatedDeltaNet(g), T::GdnConv1d) => Some(g.conv1d),
             (Self::GatedDeltaNet(g), T::GdnALog) => Some(g.a_log),
             (Self::GatedDeltaNet(g), T::GdnDtBias) => Some(g.dt_bias),
@@ -1070,13 +1137,6 @@ pub enum WeightTensor {
     /// Worker reports `MissingBias` if the layer's `linear_bias` is
     /// `None`. Only valid against `LinearLayer::AffineQuant`.
     AffineLinearBias,
-    /// Per-group folded scales on an NVFP4 LinearLayer
-    /// (`Nvfp4Linear.scales`, `[N, K/group_size]` F16 —
-    /// `e4m3_to_f32(weight_scale) / weight_global_scale`). Only valid
-    /// against `LinearLayer::Nvfp4`. NVFP4 has no per-group bias, so
-    /// there is no `Nvfp4Biases` counterpart; the packed weight is
-    /// fetched via the shared `WeightTensor::Weight`.
-    Nvfp4Scales,
     // ── MoE bundle tensors ──────────────────────────────────────────
     //
     // Valid only against the `SourceRef::{FusedMoe, SharedFusedMoe}` bundles (the expert slabs
@@ -1289,9 +1349,6 @@ pub enum RuntimeBindingKind {
     /// u32 inverse permutation read by `EmbeddingGather(kind = 1)`
     /// (window-grouped → natural order at the merger output).
     VisionReverseIndices,
-    /// u32 SigLIP positional-embedding indices read by `PosEmbed`
-    /// (`[0..vision_num_positions]` per image). Gemma3-MM.
-    VisionPositionIds,
     /// TurboQuant per-layer PACKED key/value code store (canonical KV, ~4.7x
     /// smaller than fp16). Source for `TqStageRotated` and
     /// `AttentionViaCacheTq`, dest for `TqQuantizeToPacked`. Worker resolves
@@ -1337,29 +1394,19 @@ pub struct LoweredCommand {
     pub kernel: KernelId,
     /// Compiled-metallib name the kernel symbol lives in (matches the
     /// `&'static str` keys [`SpecializedPipelineCache::with_standard_shaders`]
-    /// registers). Empty for `KernelId::Gemm` (no entry; routed
-    /// out-of-band).
+    /// registers).
     ///
     /// [`SpecializedPipelineCache::with_standard_shaders`]: crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders
     pub library: &'static str,
-    /// MSL `kernel void` symbol the pipeline binds. Empty for
-    /// `KernelId::Gemm`.
+    /// MSL `kernel void` symbol the pipeline binds.
     pub function: &'static str,
     /// `[[function_constant(N)]]` bag the pipeline specializes on.
     /// Pre-baked at lowering time from `W::*` + bucket_m so the worker
-    /// never reaches back into `CanonicalParams`. Empty Vec is valid
-    /// (e.g. `Add`, `ScalarMul`); empty constants AND empty function
-    /// name signals "this is the opaque GEMM path."
+    /// never reaches back into `CanonicalParams`. Empty is valid
+    /// (e.g. `Add`, `ScalarMul`).
     pub constants: &'static [ConstantValue],
     pub dispatch: DispatchShape,
     pub bindings: &'static [Binding],
-    /// Dense-GEMM dimensions when `kernel == KernelId::Gemm`; `None`
-    /// for every other kernel. The worker reads `(m, n, k)` from
-    /// here when encoding the MPS dispatch (5.C.5 routing).
-    /// Carried on the lowered command rather than baked into
-    /// `DispatchShape` because MPS does not consume threadgroup
-    /// counts — the dimensions are the actual API parameters.
-    pub gemm_dims: Option<GemmDims>,
 }
 
 impl LoweredCommand {
@@ -1371,7 +1418,7 @@ impl LoweredCommand {
     ///
     /// Use this for kernels whose symbol name is a single `&'static
     /// str` — attention, etc. Kernels whose symbol is composed at
-    /// lowering time (qmv / qmm_t / synth_*) keep the struct-literal
+    /// lowering time (qmv / qmm_t) keep the struct-literal
     /// `LoweredCommand { kernel, library, function, ... }` form.
     pub fn for_kernel<K: crate::tape::kernel_identity::MetalKernel>(
         constants: K::Constants,
@@ -1385,7 +1432,6 @@ impl LoweredCommand {
             constants: baked(constants.into()),
             dispatch,
             bindings: baked(bindings.into()),
-            gemm_dims: None,
         }
     }
 
@@ -1456,12 +1502,10 @@ impl From<LoweredCommand> for GatedCommand {
     }
 }
 
-/// Dense-GEMM dimensions for `KernelId::Gemm`.
-///
-/// `out = in @ weight^T` for the canonical row-major Linear layer:
-/// `in: [m, k]`, `weight: [n, k]`, `out: [m, n]`. Future quantized
-/// or transposed variants get sibling structs once they land.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+/// A dense GEMM's shape: `out = in @ weight^T` for the canonical row-major Linear layer —
+/// `in: [m, k]`, `weight: [n, k]`, `out: [m, n]`. The lowering bakes it into the command's
+/// function constants and grid (`lowering::gemm_command`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmDims {
     /// Rows of the activation / output (= bucket_m).
     pub m: u32,
@@ -1539,7 +1583,6 @@ impl RuntimeBindingKind {
             | Self::VisionCuSeqlensWindow
             | Self::VisionWindowIndex
             | Self::VisionReverseIndices
-            | Self::VisionPositionIds
             | Self::TqSigns
             | Self::TqBoundaries
             | Self::TqCentroids => self,
@@ -1548,6 +1591,20 @@ impl RuntimeBindingKind {
 }
 
 impl Binding {
+    /// The argument-table index this binding fills.
+    pub fn binding_index(&self) -> u8 {
+        match *self {
+            Self::ArenaSlot { binding_index, .. }
+            | Self::Source { binding_index, .. }
+            | Self::Runtime { binding_index, .. }
+            | Self::Scratch { binding_index }
+            | Self::RopedKScratch { binding_index }
+            | Self::AttnUnfusedScratch { binding_index, .. }
+            | Self::Inline { binding_index, .. }
+            | Self::MoeScratch { binding_index, .. } => binding_index,
+        }
+    }
+
     /// Advance every layer this binding names by `by` loop iterations.
     pub fn bump_layer(self, by: u32) -> Self {
         match self {
@@ -1621,6 +1678,14 @@ pub struct TapeLoop {
     pub layer_stride: u32,
 }
 
+/// An expanded command's origin: its position in the baked `commands` and how many layers its
+/// enclosing loops advance it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandOrigin {
+    pub baked: usize,
+    pub layers: u32,
+}
+
 impl LoweredMetalTape {
     /// The tape's commands with the layer loop played out: prologue, then the body once per
     /// iteration with every `LayerId` advanced, then the tail.
@@ -1634,11 +1699,22 @@ impl LoweredMetalTape {
     /// in exactly one pattern (`LayerId(literal + layer_offset)`); a weight's source family
     /// does not vary.
     pub fn commands_expanded(&self) -> Vec<GatedCommand> {
-        let mut out = Vec::with_capacity(self.commands.len());
         let cmds = self.commands;
-        Self::walk(self.loops, 0..cmds.len(), 0, &mut |pos, off| {
-            out.push(cmds[pos].with_layer_bumped(off))
-        });
+        let origins = self.expanded_origins().into_iter();
+        origins
+            .map(|o| cmds[o.baked].with_layer_bumped(o.layers))
+            .collect()
+    }
+
+    /// Where each command of [`Self::commands_expanded`] comes from — the same walk.
+    pub fn expanded_origins(&self) -> Vec<CommandOrigin> {
+        let mut out = Vec::with_capacity(self.commands.len());
+        Self::walk(
+            self.loops,
+            0..self.commands.len(),
+            0,
+            &mut |baked, layers| out.push(CommandOrigin { baked, layers }),
+        );
         out
     }
 
@@ -1885,7 +1961,7 @@ impl GenClass {
 }
 
 /// Which scalar of a command a [`CapPatch`] rewrites at load.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum PatchTarget {
     /// `constants[i].bits`.
     Constant(u32),
@@ -1957,6 +2033,9 @@ pub struct ClassedTape {
     pub tape: LoweredMetalTape,
     pub const_patches: &'static [CapPatch],
     pub scratch_patches: &'static [ScratchPatch],
+    /// The decode megakernel, one per KV mode — baked for the bucket-1, M5, direct-addressing
+    /// variant only; empty everywhere else.
+    pub megakernel: &'static [MegakernelTape],
 }
 
 fn patched(floor: u32, base: i64, num: i64, den: u32, round_up: bool, cap: u32) -> u32 {
@@ -2043,5 +2122,456 @@ impl ClassedTape {
             }
         }
         tape
+    }
+}
+
+// ── The decode megakernel (compiled per bucket-1 tape at expansion, launched by the worker) ────
+
+/// A span of [`LoweredMetalTape::commands_expanded`]: `[start, end)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CommandSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The decode megakernel of one bucket-1 tape, planned under [`GateCtx::decode_one`]: the WHOLE
+/// decode forward as ONE generated kernel — every command the gates admit, as straight-line
+/// adapter calls with every constant a literal, the tape's layer loops kept rolled — launched once
+/// per forward in place of `commands`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct MegakernelTape {
+    /// Names the library `source` compiles to (a content hash): workers of one load share it.
+    pub library: &'static str,
+    /// The generated kernel; the worker appends it to the adapters' bodies at load.
+    pub source: &'static str,
+    /// Its `[[kernel]]` host name.
+    pub kernel: &'static str,
+    /// The expanded commands the launch replaces (the admitted ones run inside it).
+    pub commands: CommandSpan,
+    /// Every baked command the kernel plays, in tape order.
+    pub steps: &'static [MkKernelStep],
+    /// Addresses (`u64`) the kernel's address table holds.
+    pub table_len: u32,
+    /// Grid barriers one launch crosses, loops played out.
+    pub grid_barriers: u32,
+    /// The kernel's function constants the load supplies.
+    pub load_constants: &'static [MkLoadConstant],
+}
+
+/// A baked command the kernel plays: `baked` indexes [`LoweredMetalTape::commands`]; its `k`-th
+/// expanded instance (loop iteration) reads binding `i`'s address at table entry
+/// `table_at + k · row_len + i`. Named, so the load checks it plays what the bake saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkKernelStep {
+    pub baked: u32,
+    pub function: &'static str,
+    pub table_at: u32,
+    pub row_len: u32,
+}
+
+/// A scalar the load decides — the KV capacity's patches, the device's TurboQuant decode heads —
+/// read from the materialized command at `baked` into function constant `index` of the kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkLoadConstant {
+    pub index: ConstSlot,
+    pub baked: u32,
+    pub source: MkLoadSource,
+}
+
+/// Where a [`MkLoadConstant`] is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum MkLoadSource {
+    /// The command's function constant at this slot.
+    Constant(ConstSlot),
+    /// The command's threadgroups along this axis.
+    Threadgroups(MScaleAxis),
+}
+
+impl LoweredCommand {
+    /// What `materialize` sets from the device, beyond the capacity patches: the TurboQuant
+    /// decode heads ([`crate::tape::lowering::serve_tq_decode_heads`]) — a constant and the grid's
+    /// y axis.
+    pub fn device_served(&self) -> &'static [MkLoadSource] {
+        const HEADS: &[MkLoadSource] = &[
+            MkLoadSource::Constant(
+                crate::tape::kernel_constants::AttentionViaCacheTqConstants::HEADS,
+            ),
+            MkLoadSource::Threadgroups(MScaleAxis::Y),
+        ];
+        if self.kernel == KernelId::AttentionViaCacheTq {
+            HEADS
+        } else {
+            &[]
+        }
+    }
+}
+
+/// Threadgroup memory one virtual threadgroup of an adapter owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VtgBytes(pub u32);
+
+/// Binding indices, one bit each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindingMask(pub u32);
+
+impl BindingMask {
+    pub fn contains(self, binding_index: u8) -> bool {
+        binding_index < 32 && self.0 & (1 << binding_index) != 0
+    }
+}
+
+/// A function constant of a dispatch kernel, as its adapter's policy names it.
+#[derive(Clone, Copy, Debug)]
+pub struct MkConst {
+    pub slot: ConstSlot,
+    pub ty: ConstantType,
+    /// The policy's accessor (`C::name()`).
+    pub name: &'static str,
+}
+
+/// A kernel a megakernel can call: one `MK_ADAPTER` line of a normalized shader, enumerated by
+/// build.rs from the shader's own instantiation macros (`MK_ADAPTERS`, generated).
+#[derive(Clone, Copy, Debug)]
+pub struct MkAdapter {
+    /// The dispatch kernel's library and host name — what a command names.
+    pub library: &'static str,
+    pub function: &'static str,
+    pub tg_bytes: VtgBytes,
+    /// Bindings the adapter reads or writes device-coherently.
+    pub coherent: BindingMask,
+    /// Threads one item plays at most: [`MK_THREADS`], or fewer for a streaming body that streams
+    /// its weights faster with fewer live threads per core (`MK_STREAM` in the shader, measured).
+    pub item_threads: u32,
+    /// Bindings the adapter may write (every one, unless its `MK_STREAM` line says which).
+    pub writes: BindingMask,
+    /// An elementwise adapter (`MK_TAIL`): a step of a few of its items may be played whole by one
+    /// threadgroup.
+    pub tail: bool,
+    /// A streaming body whose fastest width depends on its row length (`MK_STREAM_ROWS`).
+    pub short_rows: Option<ShortRows>,
+    /// The dispatch kernel's function constants.
+    pub constants: &'static [MkConst],
+    /// The adapter, `MK_C` standing for the step's constant policy.
+    pub call: &'static str,
+}
+
+/// The width a streaming body plays SHORT rows at: a step whose constant at `row` is below `below`
+/// plays items of up to `item_threads` (few passes per row: more rows in flight hide each row's
+/// latency).
+#[derive(Clone, Copy, Debug)]
+pub struct ShortRows {
+    pub item_threads: u32,
+    pub row: ConstSlot,
+    pub below: u32,
+}
+
+include!(concat!(env!("OUT_DIR"), "/mk_adapters.rs"));
+
+impl MkAdapter {
+    /// Threads one item of a step with `constants` plays at most: [`Self::item_threads`], or the
+    /// [`ShortRows`] width for a short-row step.
+    pub fn item_threads_for(&self, constants: &[ConstantValue]) -> u32 {
+        let short = self.short_rows.filter(|r| {
+            constants
+                .iter()
+                .any(|c| c.index == r.row.get() && c.bits < r.below)
+        });
+        short.map_or(self.item_threads, |r| r.item_threads)
+    }
+
+    /// The adapter of the kernel a command names, if a megakernel can call it.
+    pub fn of(library: &str, function: &str) -> Option<&'static MkAdapter> {
+        MK_ADAPTERS
+            .iter()
+            .find(|a| (a.library, a.function) == (library, function))
+    }
+}
+
+/// Threads of one persistent (physical) threadgroup of the megakernel.
+pub const MK_THREADS: u32 = 1024;
+/// Virtual threadgroups start on simdgroup boundaries.
+pub const MK_SIMD_WIDTH: u32 = 32;
+/// Threadgroup memory the steps of one persistent threadgroup may use: the 32 KiB a threadgroup
+/// has, less the 16 bytes the generated kernel keeps for its barrier flag.
+pub const MK_TG_MEMORY: u32 = 32 * 1024 - 16;
+/// The function constants of every generated kernel (`megakernel.metal`): the persistent
+/// threadgroups `MK_P` and the grid-barrier spin bound `MK_SPIN_LIMIT`; the load constants
+/// ([`MkLoadConstant`]) follow from `MK_FC_LOAD`.
+pub const MK_FC_P: ConstSlot = ConstSlot(4096);
+pub const MK_FC_SPIN_LIMIT: ConstSlot = ConstSlot(4097);
+pub const MK_FC_LOAD: ConstSlot = ConstSlot(4200);
+
+/// How a step packs into items of at most [`MK_THREADS`] threads (its adapter's `item_threads`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MkGeometry {
+    /// Threads per virtual threadgroup, rounded up to a simdgroup.
+    pub vtg_stride: u32,
+    /// Virtual threadgroups one item plays.
+    pub vtgs_per_item: u32,
+    /// Items of the step.
+    pub items: scratchy_subtile::megakernel_plan::Items,
+    /// Threadgroup memory one item needs: a region per virtual threadgroup, plus the sink the
+    /// lanes past the last one share.
+    pub tg_memory: u32,
+}
+
+/// The geometry of a step dispatched as `grid` threadgroups of `tpg` threads, each owning
+/// `tg_bytes` of threadgroup memory, played in items of at most `item_threads` threads (at least
+/// one virtual threadgroup).
+pub fn mk_geometry(
+    grid: (u32, u32, u32),
+    tpg: (u32, u32, u32),
+    tg_bytes: VtgBytes,
+    item_threads: u32,
+) -> Result<MkGeometry, MegakernelError> {
+    let threads = tpg.0 * tpg.1 * tpg.2;
+    if threads == 0 || threads > MK_THREADS {
+        return Err(MegakernelError::ThreadCap {
+            needed: threads,
+            cap: MK_THREADS,
+        });
+    }
+    let vtg_stride = threads.next_multiple_of(MK_SIMD_WIDTH);
+    let regions = |k: u32| {
+        if k * vtg_stride < MK_THREADS {
+            k + 1
+        } else {
+            k
+        }
+    };
+    let fits = |k: &u32| regions(*k) * tg_bytes.0 <= MK_TG_MEMORY;
+    let live = item_threads.clamp(vtg_stride, MK_THREADS);
+    let k = (1..=live / vtg_stride).rev().find(fits);
+    let k = k.ok_or(MegakernelError::ThreadgroupMemory {
+        needed: 2 * tg_bytes.0,
+        budget: MK_TG_MEMORY,
+    })?;
+    let vtgs = u64::from(grid.0) * u64::from(grid.1) * u64::from(grid.2);
+    let items = u32::try_from(vtgs.div_ceil(u64::from(k))).ok();
+    let items = items.and_then(std::num::NonZeroU32::new);
+    let items = items.ok_or(MegakernelError::EmptyGrid)?;
+    Ok(MkGeometry {
+        vtg_stride,
+        vtgs_per_item: k,
+        items: scratchy_subtile::megakernel_plan::Items(items),
+        tg_memory: regions(k) * tg_bytes.0,
+    })
+}
+
+/// Why the megakernel cannot bake, load or finish — never a silent fallback: a bucket-1 decode
+/// tape the megakernel cannot play fails the build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MegakernelError {
+    /// A decode command whose kernel has no megakernel adapter (`MK_ADAPTER` line).
+    NoAdapter {
+        library: &'static str,
+        function: &'static str,
+    },
+    /// A decode command whose kernel is classed as never running in a bucket-1 decode forward.
+    NotAtDecode {
+        kernel: KernelId,
+        function: &'static str,
+        class: &'static str,
+    },
+    /// A command whose gate at a one-token decode reads whether the sequence holds an unrotated
+    /// span block: the kernel plays the same either way, so no gate there may.
+    SpanDependentGate { function: &'static str },
+    /// A decode command's load patch the kernel cannot take as a function constant.
+    LoadPatch {
+        symbol: &'static str,
+        target: PatchTarget,
+    },
+    /// A location the plan shares between threadgroups is bound by an adapter that does not
+    /// access it device-coherently.
+    IncoherentShared { symbol: &'static str, binding: u8 },
+    /// A command binds a location its step row's dataflow does not state.
+    UnstatedLocation { symbol: &'static str, binding: u8 },
+    /// Two commands touch the KV codec's shared scratch with neither ordered after the other.
+    UnorderedScratch {
+        first: &'static str,
+        second: &'static str,
+    },
+    /// A step's threadgroup, or the persistent threadgroup the pipeline can launch.
+    ThreadCap { needed: u32, cap: u32 },
+    /// Threadgroup memory beyond what a persistent threadgroup has.
+    ThreadgroupMemory { needed: u32, budget: u32 },
+    /// A command's constant disagrees in type with the adapter's declared constant.
+    ConstantType {
+        symbol: &'static str,
+        index: u16,
+        declared: ConstantType,
+        given: ConstantType,
+    },
+    /// A step dispatches no threadgroup.
+    EmptyGrid,
+    /// A command the kernel plays is not the kernel the bake generated the step for.
+    AdapterMismatch {
+        expected: &'static str,
+        found: &'static str,
+    },
+    /// A load constant's source is not on its materialized command.
+    LoadConstant { symbol: &'static str },
+    /// The generated library failed to compile at load.
+    Compile(String),
+    /// Not every persistent threadgroup of the launch checked in at its first grid barrier (site
+    /// `site`): the GPU did not run all `of` of them at once (`arrived` had).
+    CoResidency { site: u32, arrived: u32, of: u32 },
+    /// The launch's `ordinal`-th grid barrier (site `site` of the kernel text) gave up waiting
+    /// (`arrived` of `of`).
+    Stall {
+        site: u32,
+        ordinal: u32,
+        arrived: u32,
+        of: u32,
+    },
+}
+
+impl std::fmt::Display for MegakernelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAdapter { library, function } => write!(
+                f,
+                "megakernel: `{library}::{function}` has no megakernel adapter (MK_ADAPTER)"
+            ),
+            Self::NotAtDecode {
+                kernel,
+                function,
+                class,
+            } => write!(
+                f,
+                "megakernel: `{function}` ({kernel:?}) runs in the bucket-1 decode forward, but \
+                 its kernel is classed {class}"
+            ),
+            Self::SpanDependentGate { function } => write!(
+                f,
+                "megakernel: `{function}`'s gate at a one-token decode depends on whether the \
+                 sequence holds an unrotated span block"
+            ),
+            Self::LoadPatch { symbol, target } => write!(
+                f,
+                "megakernel: `{symbol}`: load patch {target:?} is not a function constant"
+            ),
+            Self::IncoherentShared { symbol, binding } => write!(
+                f,
+                "megakernel: `{symbol}` binds a location threadgroups share at {binding}, which \
+                 its adapter does not access device-coherently"
+            ),
+            Self::UnstatedLocation { symbol, binding } => write!(
+                f,
+                "megakernel: `{symbol}` binds a location at {binding} its step row does not state"
+            ),
+            Self::UnorderedScratch { first, second } => write!(
+                f,
+                "megakernel: `{first}` and `{second}` touch the KV codec's shared scratch unordered"
+            ),
+            Self::ThreadCap { needed, cap } => {
+                write!(f, "megakernel: {needed} threads per threadgroup, cap {cap}")
+            }
+            Self::ThreadgroupMemory { needed, budget } => write!(
+                f,
+                "megakernel: {needed} bytes of threadgroup memory, budget {budget}"
+            ),
+            Self::ConstantType {
+                symbol,
+                index,
+                declared,
+                given,
+            } => write!(
+                f,
+                "megakernel: `{symbol}` constant {index} is {given:?}, its adapter declares \
+                 {declared:?}"
+            ),
+            Self::EmptyGrid => write!(f, "megakernel: a step dispatches no threadgroup"),
+            Self::AdapterMismatch { expected, found } => write!(
+                f,
+                "megakernel: a kernel step generated for `{expected}` would play `{found}`"
+            ),
+            Self::LoadConstant { symbol } => write!(
+                f,
+                "megakernel: a load constant of `{symbol}` is not on its materialized command"
+            ),
+            Self::Compile(e) => write!(f, "megakernel: the generated library: {e}"),
+            Self::CoResidency { site, arrived, of } => write!(
+                f,
+                "megakernel: only {arrived} of {of} persistent threadgroups checked in at the \
+                 first grid barrier (site {site}): not co-resident"
+            ),
+            Self::Stall {
+                site,
+                ordinal,
+                arrived,
+                of,
+            } => write!(
+                f,
+                "megakernel: grid barrier {ordinal} (site {site}) gave up ({arrived} of {of} \
+                 threadgroups arrived)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MegakernelError {}
+
+#[cfg(test)]
+mod megakernel_tests {
+    use super::*;
+
+    fn g(grid: (u32, u32, u32), tpg: (u32, u32, u32), bytes: u32) -> (u32, u32, u32, u32) {
+        streamed(grid, tpg, bytes, MK_THREADS)
+    }
+
+    fn streamed(
+        grid: (u32, u32, u32),
+        tpg: (u32, u32, u32),
+        bytes: u32,
+        item_threads: u32,
+    ) -> (u32, u32, u32, u32) {
+        let g = mk_geometry(grid, tpg, VtgBytes(bytes), item_threads).expect("fits");
+        (g.vtg_stride, g.vtgs_per_item, g.items.0.get(), g.tg_memory)
+    }
+
+    /// A qmv step: 64-thread threadgroups, sixteen to an item, no threadgroup memory.
+    #[test]
+    fn small_threadgroups_pack_on_simdgroup_boundaries_into_one_item() {
+        assert_eq!(g((1, 384, 1), (32, 2, 1), 0), (64, 16, 24, 0));
+        // 96 threads: ten virtual threadgroups, the 64 lanes over share a sink region.
+        assert_eq!(g((25, 1, 1), (96, 1, 1), 1024), (96, 10, 3, 11 * 1024));
+    }
+
+    /// A streaming body's items play at most its measured width, never less than one virtual
+    /// threadgroup.
+    #[test]
+    fn a_streaming_step_packs_to_its_item_width() {
+        assert_eq!(streamed((1, 384, 1), (32, 2, 1), 0, 256), (64, 4, 96, 0));
+        assert_eq!(streamed((1, 384, 1), (32, 2, 1), 0, 512), (64, 8, 48, 0));
+        assert_eq!(streamed((4, 1, 1), (512, 1, 1), 0, 256), (512, 1, 4, 0));
+    }
+
+    /// A norm owns its `shared_sum[1024]` per virtual threadgroup; a budget that cannot hold
+    /// every region packs fewer threadgroups per item and keeps the sink.
+    #[test]
+    fn threadgroup_memory_bounds_the_virtual_threadgroups_of_an_item() {
+        assert_eq!(g((1, 1, 1), (256, 1, 1), 4096), (256, 4, 1, 4 * 4096));
+        assert_eq!(g((8, 1, 1), (128, 1, 1), 6144), (128, 4, 2, 5 * 6144));
+        let too_big = mk_geometry((1, 1, 1), (1024, 1, 1), VtgBytes(40 * 1024), MK_THREADS);
+        assert!(matches!(
+            too_big,
+            Err(MegakernelError::ThreadgroupMemory { .. })
+        ));
+        let wide = mk_geometry((1, 1, 1), (1025, 1, 1), VtgBytes(0), MK_THREADS);
+        assert!(matches!(wide, Err(MegakernelError::ThreadCap { .. })));
+        let empty = mk_geometry((0, 1, 1), (64, 1, 1), VtgBytes(0), MK_THREADS);
+        assert_eq!(empty, Err(MegakernelError::EmptyGrid));
+    }
+
+    /// At a one-token decode of one sequence every gate but the span one is a constant.
+    #[test]
+    fn a_one_token_decode_admits_by_the_gate_alone() {
+        use RuntimeGate as G;
+        for ctx in [false, true].map(GateCtx::decode_one) {
+            assert!(G::OnlyIfDecodeStep.admits(ctx) && !G::UnlessDecodeStep.admits(ctx));
+            assert!(!G::OnlyIfNoSpec.admits(ctx) && !G::OnlyIfSpec.admits(ctx));
+            assert!(G::OnlyIfOneSequence.admits(ctx) && !G::UnlessOneSequence.admits(ctx));
+        }
     }
 }

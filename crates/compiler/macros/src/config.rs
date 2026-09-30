@@ -2149,8 +2149,8 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
     }
     // All-MoE decoders (Qwen3.5-MoE) have no dense MLP, so their HF
     // configs omit `intermediate_size` — but the bound is a universal
-    // DISPATCH_FIELDS constant and the MLP-fusion seams
-    // (SynthGateUpSiluMul, FusedGateUpSiluMul) size their SwiGLU from
+    // DISPATCH_FIELDS constant and the MLP-fusion seam
+    // (FusedGateUpSiluMul) sizes its SwiGLU from
     // it. For such configs the model's only non-routed SwiGLU is the
     // shared expert, so derive its width (0 when there is no shared
     // expert either). Dense / hybrid models ship `intermediate_size`

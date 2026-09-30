@@ -31,36 +31,35 @@
 // Dispatch: grid (ceil(head_v/tg), HV, num_seqs); thread = (value-dim, head, seq).
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
-constant uint  GDN_SCAN_NUM_K_HEADS [[function_constant(0)]];
-constant uint  GDN_SCAN_NUM_V_HEADS [[function_constant(1)]];
-constant uint  GDN_SCAN_HEAD_K      [[function_constant(2)]];
-constant uint  GDN_SCAN_HEAD_V      [[function_constant(3)]];
-constant float GDN_SCAN_SCALE       [[function_constant(4)]];
+#define GDN_SCAN_CONSTS(X)                                                                \
+  X(uint, num_k_heads, GDN_SCAN_NUM_K_HEADS, 0) X(uint, num_v_heads, GDN_SCAN_NUM_V_HEADS, 1) \
+  X(uint, head_k, GDN_SCAN_HEAD_K, 2) X(uint, head_v, GDN_SCAN_HEAD_V, 3)                  \
+  X(float, scale, GDN_SCAN_SCALE, 4)
+#ifndef MK_BODIES_ONLY
+GDN_SCAN_CONSTS(MK_FC_DECLARE)
+struct GdnScanFc {
+  GDN_SCAN_CONSTS(MK_FC_ACCESSOR)
+};
+#endif
 
 // Matches CUDA `MAX_HEAD_K_DIM` (gdn_recurrent_kernels.cu): register state row.
 constant constexpr uint GDN_SCAN_KMAX = 128;
 
-template <typename T>
-[[kernel]] void gdn_scan_varlen(
-    device       float* o             [[buffer(0)]],
-    const device T*     conv_out      [[buffer(1)]],
-    const device float* g             [[buffer(2)]],
-    const device float* beta          [[buffer(3)]],
-    device       float* ssm_state     [[buffer(4)]],
-    const device int*   cu_seqlens    [[buffer(5)]],
-    const device int*   state_indices [[buffer(6)]],
-    const device uint*  is_fresh      [[buffer(7)]],
-    uint3 tgid [[threadgroup_position_in_grid]],
-    uint3 tpig [[thread_position_in_grid]])
+// Body shared by the dispatch kernels and the megakernel adapter: the thread at `tgid` / `tpig`.
+template <typename T, typename C, typename OP, typename CP, typename FP>
+METAL_FUNC void gdn_scan_varlen_body(
+    OP o, CP conv_out, FP g, FP beta, device float* ssm_state, const device int* cu_seqlens,
+    const device int* state_indices, const device uint* is_fresh, uint3 tgid, uint3 tpig)
 {
-  uint H = GDN_SCAN_NUM_K_HEADS;
-  uint HV = GDN_SCAN_NUM_V_HEADS;
-  uint K = GDN_SCAN_HEAD_K;
-  uint Vd = GDN_SCAN_HEAD_V;
-  float scale = GDN_SCAN_SCALE;
+  uint H = C::num_k_heads();
+  uint HV = C::num_v_heads();
+  uint K = C::head_k();
+  uint Vd = C::head_v();
+  float scale = C::scale();
 
   uint key_dim = H * K;
   uint value_dim = HV * Vd;
@@ -96,8 +95,8 @@ template <typename T>
   for (int i_t = 0; i_t < seq_len; i_t++) {
     uint t = uint(bos + i_t);
     // q from key-head i_h; k from key-head i_h (offset key_dim); v from value-head i_hv.
-    const device T* q_ptr = conv_out + t * conv_dim + i_h * K;
-    const device T* k_ptr = conv_out + t * conv_dim + key_dim + i_h * K;
+    CP q_ptr = conv_out + t * conv_dim + i_h * K;
+    CP k_ptr = conv_out + t * conv_dim + key_dim + i_h * K;
 
     float q_sq = 0.0f, k_sq = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
@@ -136,6 +135,36 @@ template <typename T>
   }
 }
 
+// Megakernel adapter: o (0), conv_out (1), g (2) and beta (3) device-coherent; the layer's
+// recurrent state is touched by this step alone, one thread per (value-dim, head, sequence).
+template <typename T, typename C>
+MK_FUNC void mk_gdn_scan_varlen(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  gdn_scan_varlen_body<T, C>((mk_ptr<float>)s.addr[0], (mk_cptr<T>)s.addr[1],
+                             (mk_cptr<float>)s.addr[2], (mk_cptr<float>)s.addr[3],
+                             (device float*)s.addr[4], (const device int*)s.addr[5],
+                             (const device int*)s.addr[6], (const device uint*)s.addr[7],
+                             l.tg_pos, mk_thread_in_grid(l));
+}
+
+#ifndef MK_BODIES_ONLY
+template <typename T>
+[[kernel]] void gdn_scan_varlen(
+    device       float* o             [[buffer(0)]],
+    const device T*     conv_out      [[buffer(1)]],
+    const device float* g             [[buffer(2)]],
+    const device float* beta          [[buffer(3)]],
+    device       float* ssm_state     [[buffer(4)]],
+    const device int*   cu_seqlens    [[buffer(5)]],
+    const device int*   state_indices [[buffer(6)]],
+    const device uint*  is_fresh      [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tpig [[thread_position_in_grid]])
+{
+  gdn_scan_varlen_body<T, GdnScanFc>(o, conv_out, g, beta, ssm_state, cu_seqlens, state_indices,
+                                     is_fresh, tgid, tpig);
+}
+
 #define INST_GDN_SCAN_VARLEN(dtype_tag, mtl_type)                            \
   template [[host_name("gdn_scan_varlen_" #dtype_tag)]] [[kernel]] void      \
   gdn_scan_varlen<mtl_type>(                                                 \
@@ -149,6 +178,11 @@ template <typename T>
       const device uint*     is_fresh      [[buffer(7)]],                    \
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint3 tpig [[thread_position_in_grid]]);
+#else
+#define INST_GDN_SCAN_VARLEN(dtype_tag, mtl_type)                                        \
+  MK_ADAPTER(gdn_scan_varlen_##dtype_tag, 0, 0xf, (mk_gdn_scan_varlen<mtl_type, MK_C>),  \
+             GDN_SCAN_CONSTS)
+#endif
 
 INST_GDN_SCAN_VARLEN(f16,  half)
 INST_GDN_SCAN_VARLEN(bf16, bfloat)

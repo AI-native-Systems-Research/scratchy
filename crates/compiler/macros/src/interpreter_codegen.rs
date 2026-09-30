@@ -25,21 +25,25 @@
 //! does not match KVM tp_throughput opcode numbering, does not
 //! emit `Noop` padding. Those are megakernel concerns.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-
 use proc_macro2::TokenStream;
 use quote::quote;
 
 use scratchy_forward_compiler::Instruction;
 
-use crate::assignment::{Assignment, SubgraphId};
-use crate::classified::{ExternKind, Program, UnrollIndex};
-use crate::config::ModelParams;
-use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, MatchInfo};
-use crate::schedule::Loop;
-use crate::shape::Shape;
-use crate::weight_vocab::{OpcodeShape, SlotMap, WeightSlot};
+use crate::weight_vocab::WeightSlot;
+// Instruction selection's lowering (cuda only).
+#[cfg(feature = "cuda")]
+use {
+    crate::assignment::{Assignment, SubgraphId},
+    crate::classified::{ExternKind, Program, UnrollIndex},
+    crate::config::ModelParams,
+    crate::fuf::{Fuf, FufInput, TileId},
+    crate::impl_lib::{ImplementationLibrary, MatchInfo},
+    crate::schedule::Loop,
+    crate::shape::Shape,
+    crate::weight_vocab::{OpcodeShape, SlotMap},
+    std::collections::{BTreeMap, HashMap, HashSet},
+};
 
 // ── Instruction helpers ──────────────────────────────────────────
 //
@@ -850,26 +854,6 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let h = lit_u32(h);
             quote! { Nvfp4Qmm(#a, #b, #c, #d, #e, #f, #g, #h) }
         }
-        I::SynthPreAttn(a, b, c, d, e, f, g, h, i) => {
-            let a = lit_u32(a);
-            let b = lit_u32(b);
-            let c = lit_u32(c);
-            let d = lit_u32(d);
-            let e = lit_u32(e);
-            let f = lit_u32(f);
-            let g = lit_u32(g);
-            quote! { SynthPreAttn(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
-        }
-        I::SynthMlpPreDown(a, b, c, d, e, f, g, h) => {
-            let a = lit_u32(a);
-            let b = lit_u32(b);
-            let c = lit_u32(c);
-            let d = lit_u32(d);
-            let e = lit_u32(e);
-            let f = lit_u32(f);
-            let g = lit_u32(g);
-            quote! { SynthMlpPreDown(#a, #b, #c, #d, #e, #f, #g, #h) }
-        }
         I::SiluMul(a, b, c, w) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -882,14 +866,6 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let b = lit_u32(b);
             let c = lit_u32(c);
             quote! { GeluMul(#a, #b, #c) }
-        }
-        I::SynthGateUpSiluMul(a, b, c, d, e, f) => {
-            let a = lit_u32(a);
-            let b = lit_u32(b);
-            let c = lit_u32(c);
-            let d = lit_u32(d);
-            let e = lit_u32(e);
-            quote! { SynthGateUpSiluMul(#a, #b, #c, #d, #e, #f) }
         }
         I::AffineEmbed(a, b, c) => {
             let a = lit_u32(a);
@@ -921,6 +897,7 @@ fn kv_offsets_tokens(o: scratchy_forward_compiler::KvOffsets) -> TokenStream {
 /// Variant ident as it appears on the Rust enum and in
 /// `OpcodeShape::name`. Used by the loop-detection pass to look up
 /// per-variant iter-index field positions.
+#[cfg(feature = "cuda")]
 pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
     use scratchy_forward_compiler::Instruction as I;
     match inst {
@@ -1028,19 +1005,13 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::AttentionPrefillPaged(..) => "AttentionPrefillPaged",
         I::AffineQmm(..) => "AffineQmm",
         I::Nvfp4Qmm(..) => "Nvfp4Qmm",
-        I::SynthPreAttn(..) => "SynthPreAttn",
-        I::SynthMlpPreDown(..) => "SynthMlpPreDown",
         I::SiluMul(..) => "SiluMul",
         I::GeluMul(..) => "GeluMul",
-        I::SynthGateUpSiluMul(..) => "SynthGateUpSiluMul",
         I::AffineEmbed(..) => "AffineEmbed",
     }
 }
 
-#[cfg(any(
-    not(any(feature = "metal", feature = "spyre")),
-    all(test, feature = "spyre")
-))]
+#[cfg(feature = "cuda")]
 /// Extract the field at position `idx` as a `u64` for loop-detection
 /// purposes (which only ever needs to compare scalar layer-style
 /// fields). Returns `None` for fields that aren't a single scalar
@@ -1756,26 +1727,6 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             7 => u(h),
             _ => None,
         },
-        I::SynthPreAttn(a, b, c, d, e, f, g, _h, _i) => match idx {
-            0 => u(a),
-            1 => u(b),
-            2 => u(c),
-            3 => u(d),
-            4 => u(e),
-            5 => u(f),
-            6 => u(g),
-            _ => None,
-        },
-        I::SynthMlpPreDown(a, b, c, d, e, f, g, _h) => match idx {
-            0 => u(a),
-            1 => u(b),
-            2 => u(c),
-            3 => u(d),
-            4 => u(e),
-            5 => u(f),
-            6 => u(g),
-            _ => None,
-        },
         I::SiluMul(a, b, c, _w) => match idx {
             0 => u(a),
             1 => u(b),
@@ -1788,14 +1739,6 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             2 => u(c),
             _ => None,
         },
-        I::SynthGateUpSiluMul(a, b, c, d, e, _f) => match idx {
-            0 => u(a),
-            1 => u(b),
-            2 => u(c),
-            3 => u(d),
-            4 => u(e),
-            _ => None,
-        },
         I::AffineEmbed(a, b, c) => match idx {
             0 => u(a),
             1 => u(b),
@@ -1805,7 +1748,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
     }
 }
 
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+#[cfg(feature = "cuda")]
 /// Replace the field at position `idx` (interpreted as u32) with
 /// `new_val`. Used by `apply_loop_compression` to set per-row
 /// baselines for the iter-index field. Panics if `idx` is invalid
@@ -2533,26 +2476,6 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             7 => I::Nvfp4Qmm(a, b, c, d, e, f, g, n),
             _ => panic!("Nvfp4Qmm: bad idx {idx}"),
         },
-        I::SynthPreAttn(a, b, c, d, e, f, g, h, i) => match idx {
-            0 => I::SynthPreAttn(n, b, c, d, e, f, g, h, i),
-            1 => I::SynthPreAttn(a, n, c, d, e, f, g, h, i),
-            2 => I::SynthPreAttn(a, b, n, d, e, f, g, h, i),
-            3 => I::SynthPreAttn(a, b, c, n, e, f, g, h, i),
-            4 => I::SynthPreAttn(a, b, c, d, n, f, g, h, i),
-            5 => I::SynthPreAttn(a, b, c, d, e, n, g, h, i),
-            6 => I::SynthPreAttn(a, b, c, d, e, f, n, h, i),
-            _ => panic!("SynthPreAttn: bad idx {idx}"),
-        },
-        I::SynthMlpPreDown(a, b, c, d, e, f, g, h) => match idx {
-            0 => I::SynthMlpPreDown(n, b, c, d, e, f, g, h),
-            1 => I::SynthMlpPreDown(a, n, c, d, e, f, g, h),
-            2 => I::SynthMlpPreDown(a, b, n, d, e, f, g, h),
-            3 => I::SynthMlpPreDown(a, b, c, n, e, f, g, h),
-            4 => I::SynthMlpPreDown(a, b, c, d, n, f, g, h),
-            5 => I::SynthMlpPreDown(a, b, c, d, e, n, g, h),
-            6 => I::SynthMlpPreDown(a, b, c, d, e, f, n, h),
-            _ => panic!("SynthMlpPreDown: bad idx {idx}"),
-        },
         I::SiluMul(a, b, c, w) => match idx {
             0 => I::SiluMul(n, b, c, w),
             1 => I::SiluMul(a, n, c, w),
@@ -2564,14 +2487,6 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             1 => I::GeluMul(a, n, c),
             2 => I::GeluMul(a, b, n),
             _ => panic!("GeluMul: bad idx {idx}"),
-        },
-        I::SynthGateUpSiluMul(a, b, c, d, e, f) => match idx {
-            0 => I::SynthGateUpSiluMul(n, b, c, d, e, f),
-            1 => I::SynthGateUpSiluMul(a, n, c, d, e, f),
-            2 => I::SynthGateUpSiluMul(a, b, n, d, e, f),
-            3 => I::SynthGateUpSiluMul(a, b, c, n, e, f),
-            4 => I::SynthGateUpSiluMul(a, b, c, d, n, f),
-            _ => panic!("SynthGateUpSiluMul: bad idx {idx}"),
         },
         I::AffineEmbed(a, b, c) => match idx {
             0 => I::AffineEmbed(n, b, c),
@@ -2587,7 +2502,7 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+#[cfg(feature = "cuda")]
 /// One slot per (tile, output_slot). Used when no liveness
 /// information is available; the colored variant
 /// [`colored_slot_map`] is what `lower_bucket` actually picks for
@@ -2648,6 +2563,7 @@ pub fn build_slot_map(fuf: &Fuf) -> SlotMap {
 ///    backbone-output slot for `forward_backbone`) never have their
 ///    color reused — they must stay alive past the slice's end so
 ///    the per-bucket fn can `take_owned` them.
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn colored_slot_map(
     fuf: &Fuf,
@@ -2760,8 +2676,8 @@ pub fn colored_slot_map(
     // COMPLETES (its last per-tile position), not just until the
     // reading tile's position. Charging the reading tile's position
     // lets the linear scan free the input early and an in-place output
-    // of the SAME subgraph (e.g. SynthMlpPreDown / SynthPreAttn residual
-    // `Add`) reuse its slot — a cross-threadgroup RAW/WAR race that only
+    // of the SAME subgraph (e.g. a fused residual `Add`) reuse its
+    // slot — a cross-threadgroup RAW/WAR race that only
     // manifests on hardware that doesn't run the tiles in position order
     // (M5 / gen-17). Single-tile subgraphs are unaffected (subgraph-last
     // == the tile's own position). Genuinely-safe element-wise in-place
@@ -3010,6 +2926,7 @@ pub struct LoweredBucket {
 ///
 /// Bodies for each variant live in `scratchy_forward_compiler::Instruction::eval`;
 /// nothing per-arch needs the body here.
+#[cfg(feature = "cuda")]
 #[derive(Default)]
 pub struct ArchOpcodes {
     /// Variant ident → shape. First insert wins; later inserts of
@@ -3018,6 +2935,7 @@ pub struct ArchOpcodes {
     by_name: BTreeMap<String, OpcodeShape>,
 }
 
+#[cfg(feature = "cuda")]
 impl ArchOpcodes {
     pub fn new() -> Self {
         Self::default()
@@ -3034,20 +2952,7 @@ impl ArchOpcodes {
         self.by_name.insert(key, shape);
     }
 
-    /// Snapshot of registered variant shapes keyed by variant ident
-    /// string. Includes the universal `Alias` / `Free` / `Loop`
-    /// variants. Consumed by [`emit_bucket_static_slice`] to
-    /// type-check positional field values against the registered
-    /// shape per bucket.
-    pub fn shapes_by_name(&self) -> BTreeMap<String, OpcodeShape> {
-        let mut out: BTreeMap<String, OpcodeShape> = self.by_name.clone();
-        out.insert("Alias".to_string(), alias_variant_shape());
-        out.insert("Free".to_string(), free_variant_shape());
-        out.insert("Loop".to_string(), loop_variant_shape());
-        out
-    }
-
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
+    #[cfg(feature = "cuda")]
     /// Iterate (variant_name, shape). Used by
     /// `apply_loop_compression` to build the per-variant layer-field
     /// position map.
@@ -3059,7 +2964,7 @@ impl ArchOpcodes {
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+#[cfg(feature = "cuda")]
 /// Find the largest contiguous run of instances that can be
 /// described as N copies of a P-instruction body, optionally
 /// allowing a per-variant ITERATION-INDEX field to step linearly
@@ -3168,7 +3073,7 @@ fn detect_repeating_run(
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+#[cfg(feature = "cuda")]
 /// Two blocks of pre-hashed (fingerprint, iter_index_value) pairs
 /// match iff the fingerprints are equal pairwise AND the
 /// iter-index values, when present, satisfy `cand = base +
@@ -3197,7 +3102,7 @@ fn blocks_match(
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+#[cfg(feature = "cuda")]
 /// Apply loop compression to `lowered.instances` in place. When
 /// [`detect_repeating_run`] finds a contiguous run, replace it
 /// with one `Op::Loop` row plus a single iteration's body. The
@@ -3224,41 +3129,10 @@ fn blocks_match(
 /// name as a parameter so the same code works for any future
 /// loop construct (e.g., per-head, per-block) that adds a
 /// different convention.
-/// Where the layer loop comes from.
-///
-/// ⛔ THESE ARE NOT INTERCHANGEABLE, WHICH IS WHY THEY ARE NAMED. `Shared` means this stream was
-/// lowered from the `SubtileTape`, so the loop is the ONE answer `find_layer_loop` gave, mapped
-/// through the emitter's step->instruction spans. `LocalSearch` means the stream has no tape
-/// correspondence (the instruction-selection path), so the only available answer is a search of
-/// the stream itself. An `Option` here would have let a tape-lowered stream silently fall back
-/// to the second search — the exact duplication being removed.
-pub enum LoopSource {
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    Shared(Option<(usize, usize, u32)>),
-    LocalSearch,
-}
-
-// ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
-// tape; this searches the ISel stream for one because that stream has no tape. Gated so
-// metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
-/// `LoopSource::Shared` carries `(start, period, iters)` in `lowered.instances` positions, from
-/// [`scratchy_subtile::subtile_tape::find_layer_loop`] — the ONE search, run on the shared
-/// `SubtileTape` before any target lowered.
-///
-/// ⛔ THE LOCAL SEARCH IS A CROSS-CHECK, NOT AN ALTERNATIVE. `detect_repeating_run` still runs,
-/// and a disagreement with the shared answer is a build failure naming the model. Two searches
-/// over two representations is exactly the duplication being removed; keeping one as an
-/// assertion is how the removal is PROVEN rather than asserted.
 pub fn apply_loop_compression(
     arch_opcodes: &ArchOpcodes,
     lowered: &mut LoweredBucket,
     iter_index_field_name: &str,
-    loop_source: LoopSource,
-    // Read only by the tape-path `Shared` arm below; the ISel `LocalSearch`
-    // arm has no use for it. Underscored like `_protected` in `lower_bucket`
-    // so the signature stays symmetric across targets.
-    _what: &str,
 ) {
     use std::collections::HashMap;
 
@@ -3272,30 +3146,7 @@ pub fn apply_loop_compression(
         }
     }
 
-    let local = detect_repeating_run(&lowered.instances, &iter_idx);
-    let chosen = match loop_source {
-        #[cfg(any(feature = "metal", feature = "spyre"))]
-        LoopSource::Shared(shared) => {
-            // ⛔ THE STRUCTURE MUST AGREE; THE PHASE NEED NOT, AND THAT IS NOT A FUDGE.
-            // `period` and `iters` say WHAT the repeating body is — a disagreement there means
-            // the step->instruction span map is wrong and the two targets would run different
-            // bodies. `start` says WHERE the run was cut, and the shared re-roll deliberately
-            // rotates that cut to the layer boundary with the fewest carried slots (see
-            // `reroll_subtile_tape`'s phase rotation), so it legitimately differs from a search
-            // that just maximises span. Taking the shared phase is the POINT.
-            let shape = |r: &Option<(usize, usize, u32)>| r.map(|(_, p, i)| (p, i));
-            assert!(
-                shape(&shared) == shape(&local),
-                "[one-reroll] {_what}: the shared tape's layer loop {shared:?} and the \
-                 instruction-stream search {local:?} describe DIFFERENT bodies (period, iters). \
-                 They are the same repeating run in the same units, so this means the \
-                 step->instruction span map is wrong."
-            );
-            shared
-        }
-        LoopSource::LocalSearch => local,
-    };
-    let Some((start, period, iters)) = chosen else {
+    let Some((start, period, iters)) = detect_repeating_run(&lowered.instances, &iter_idx) else {
         return;
     };
 
@@ -3349,14 +3200,9 @@ pub fn apply_loop_compression(
 /// alias for `::scratchy_forward_compiler::Instruction`. Each row is
 /// `<Variant>(v0, v1, …)` — tuple-style construction matching the
 /// variant declaration order in `Instruction`. The variant + field
-/// arity comes directly from the typed `Instruction` value, so the
-/// `OpcodeShape` arity check is no longer load-bearing here; we keep
-/// `shapes_by_name` in the signature for caller-side
-/// shape-registration plumbing but the per-row body trusts the
-/// constructor.
+/// arity comes directly from the typed `Instruction` value.
 pub fn emit_bucket_static_slice(
     static_ident: &syn::Ident,
-    _shapes_by_name: &BTreeMap<String, OpcodeShape>,
     instances: &[Instruction],
 ) -> TokenStream {
     let elements = instances.iter().map(instruction_to_tokens);
@@ -3367,6 +3213,7 @@ pub fn emit_bucket_static_slice(
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+#[cfg(feature = "cuda")]
 fn assert_shapes_agree(a: &OpcodeShape, b: &OpcodeShape) {
     assert_eq!(
         a.name, b.name,
@@ -3397,55 +3244,16 @@ fn assert_shapes_agree(a: &OpcodeShape, b: &OpcodeShape) {
     }
 }
 
-/// The universal `Free` variant codegen always emits. Not Impl-
-/// driven; emitted at the drop-pass-determined scheduling points
-/// to clear a tile slot.
-pub fn free_variant_shape() -> OpcodeShape {
-    OpcodeShape::new("Free", vec![("slot", syn::parse_quote!(u32))])
-}
-
-/// The universal `Alias` variant codegen emits at the start of
-/// every per-bucket slice — one row per zero-copy `View` aliasing
-/// pair the lowering surfaced via `output_alias`. The interpreter's
-/// arm sets `__tiles[dst] = Some(view(src))`, the same setup the
-/// per-bucket fn used to do as a separate prelude. Folding aliases
-/// into the slice means there's no per-fn prelude duplication
-/// between forward and forward_backbone.
-pub fn alias_variant_shape() -> OpcodeShape {
-    OpcodeShape::new(
-        "Alias",
-        vec![
-            ("dst", syn::parse_quote!(u32)),
-            ("src", syn::parse_quote!(u32)),
-        ],
-    )
-}
-
 /// Construct an `Alias(dst, src)` instance for the alias prelude.
+#[cfg(feature = "cuda")]
 pub fn alias_instance(dst: u32, src: u32) -> Instruction {
     Instruction::Alias(dst, src)
-}
-
-/// The universal `Loop` variant the layer-template detection
-/// emits when a subsequence of the slice repeats N times. The
-/// interpreter sees `Op::Loop(count, body_len)` and runs the
-/// next `body_len` ops `count` times, threading the iteration
-/// index through as `__layer`. Compresses a 40-layer transformer
-/// body from 40·body rows to body+1 rows.
-pub fn loop_variant_shape() -> OpcodeShape {
-    OpcodeShape::new(
-        "Loop",
-        vec![
-            ("count", syn::parse_quote!(u32)),
-            ("body_len", syn::parse_quote!(u32)),
-        ],
-    )
 }
 
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+#[cfg(feature = "cuda")]
 /// Construct a `Loop(count, body_len, layer_stride)` instance the layer-template
 /// detection prepends in front of a repeating sub-sequence of the
 /// slice.
@@ -3466,6 +3274,7 @@ pub fn loop_instance(count: u32, body_len: u32) -> Instruction {
 /// per-variant `model` is in scope and resolves each projection's true
 /// on-disk width from the per-module map. No-op for non-affine / uniform
 /// checkpoints (all three resolve to the same width).
+#[cfg(feature = "cuda")]
 pub(crate) fn repack_moe_expert_bits(
     emits: Vec<Instruction>,
     program: &Program,
@@ -3506,6 +3315,7 @@ pub(crate) fn repack_moe_expert_bits(
 /// Impl's `fan_out`, interleaves `Free` instances at drop-pass
 /// scheduling points, and registers each Impl's `OpcodeShape` into
 /// `arch_opcodes` for shape-checking + iter-index discovery.
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn lower_bucket(
     fuf: &Fuf,
@@ -3619,10 +3429,6 @@ pub fn lower_bucket(
             };
             let emits = match imp.fan_out(&m, fuf, program, bounds, slots) {
                 Some(e) => e,
-                // A claim-only impl (its real lowering happens elsewhere, e.g. the
-                // KTIR bundle) declares it emits no host `Instruction`; skip it
-                // here. Any other `None` is an unmigrated-Impl bug (panic below).
-                None if !imp.emits_host_instruction() => continue,
                 None => panic!(
                     "Impl `{name}` (id {id}) has no fan_out — unmigrated to host \
                      interpreter IR. Override `opcode_shape` + `fan_out` on \
@@ -3876,6 +3682,7 @@ pub fn lower_bucket(
 /// and a Rust type that selects the `WeightKind` variant. The
 /// `_<layer>` suffix is stripped — the per-arch impl receives `layer`
 /// as a runtime arg.
+#[cfg(feature = "cuda")]
 pub fn weight_accessors_to_slots(
     accessors: &[crate::weight_vocab::WeightAccessor],
 ) -> Vec<WeightSlot> {
@@ -3977,6 +3784,7 @@ pub fn weight_accessors_to_slots(
 /// resolved against the upstream Linear's `AffineLinearBias` field),
 /// runtime-only attention reads, etc. Variants that explicitly
 /// declare a typed weight accessor return ≥1.
+#[cfg(feature = "cuda")]
 pub fn instruction_weight_count(inst: &Instruction) -> usize {
     use Instruction as I;
     match inst {
@@ -4031,8 +3839,6 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         I::MetalBiasAdd(..) => 1,
         // Single typed embedding.
         I::Embed(..) => 1,
-        #[cfg(feature = "metal")]
-        I::AffineEmbed(..) => 1,
         // Single RmsNorm.
         I::RmsNorm(..) | I::FusedAddRmsNorm(..) => 1,
         // ScalarWeightMul consumes its layer_scalar[layer] accessor
@@ -4045,14 +3851,6 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         // sub-slots 0/1). CosSin is auto-injected by the rotary
         // check, not counted here (mirrors FusedQkvQkNormRopeCache).
         I::RopeAppendNormed(..) => 2,
-        // Megakernels — same accessor inventory as their unfused
-        // chains (RmsNorm + 3 LinearLayer / RmsNorm + 2 LinearLayer /
-        // 2 LinearLayer). CosSin is auto-injected on top by the
-        // rotary check, not counted here.
-        I::SynthPreAttn(..) => 4,
-        I::SynthMlpPreDown(..) => 3,
-        #[cfg(feature = "metal")]
-        I::SynthGateUpSiluMul(..) => 2,
         // Fused QKV+RoPE family (cuda). The dense + cutlass + quant
         // (marlin / bnb4 / ggml / fp8) variants all run a SINGLE
         // packed `[q | k | v]` GEMM through one accessor — the loader
@@ -4126,6 +3924,7 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
     use Instruction as I;
     matches!(
@@ -4149,12 +3948,6 @@ pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
             | I::Fp8FusedQkvRopeCache(..)
             | I::Fp8FusedQkvRopePrefill(..)
             | I::MlaAttention(..)
-            // Metal compiler-synth megakernel: fuses RMSNorm + QKV
-            // GEMMs + RoPE + paged KV-write into one dispatch; the
-            // RoPE step inside reads the per-arch rotary cos/sin
-            // cache, so the macro must inject a `CosSin` slot for
-            // this op.
-            | I::SynthPreAttn(..)
     )
 }
 
@@ -4163,6 +3956,7 @@ pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
 /// if any claimed tile carries an `ExternKind::RotaryLocal` input,
 /// the claim's rope op pulls from `wm.rotary_local`; else from
 /// `wm.rotary`. Both fields are emitted by `codegen.rs` per arch.
+#[cfg(feature = "cuda")]
 pub fn rotary_base_for_claim(fuf: &Fuf, claimed: &[TileId]) -> syn::Ident {
     let uses_local = claimed.iter().any(|&tid| {
         fuf.get(tid).inputs.iter().any(|i| {
@@ -4179,6 +3973,7 @@ pub fn rotary_base_for_claim(fuf: &Fuf, claimed: &[TileId]) -> syn::Ident {
     syn::Ident::new(name, proc_macro2::Span::call_site())
 }
 
+#[cfg(feature = "cuda")]
 pub fn collect_boundary_inputs(fuf: &Fuf, claimed: &[TileId]) -> Vec<TileId> {
     let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
     let mut seen: HashSet<TileId> = HashSet::new();
@@ -4198,12 +3993,11 @@ pub fn collect_boundary_inputs(fuf: &Fuf, claimed: &[TileId]) -> Vec<TileId> {
 
 // ── Tests ────────────────────────────────────────────────────────
 
-#[cfg(all(test, any(feature = "cuda", feature = "spyre")))]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use crate::fuf::FufNode;
     use crate::shape::Dim;
-    use quote::format_ident;
 
     /// Slot allocation packs (tile, output_slot) pairs in
     /// topological order. Test pins the order so emitted

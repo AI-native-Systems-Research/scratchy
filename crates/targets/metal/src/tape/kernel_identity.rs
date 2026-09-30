@@ -31,8 +31,6 @@
 //!   - FusedGateUpSiluMul (decode vs prefill branch)
 //!   - GatherLastToken / ScatterFirstToLastRow (same)
 //!   - RopeAppend (dtype-only — left for follow-up)
-//!   - FusedQkvRopeCache (dtype-only — left for follow-up)
-//!   - Synth* (compiler-emitted symbol — never static)
 
 use crate::tape::constants::ConstantValue;
 

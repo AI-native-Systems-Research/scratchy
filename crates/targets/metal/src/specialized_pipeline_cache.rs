@@ -65,6 +65,8 @@ impl PipelineKey {
 pub struct SpecializedPipelineCache {
     device: Device,
     libraries: HashMap<&'static str, Library>,
+    /// Libraries compiled at load from generated MSL (the decode megakernels), by name.
+    compiled: Mutex<HashMap<&'static str, Library>>,
     pipelines: Mutex<HashMap<PipelineKey, ComputePipelineState>>,
     /// Lazy-built MTL4 compiler. Pipelines built through this compiler
     /// run correctly when dispatched (`dispatchThreadgroups`) on an
@@ -89,35 +91,10 @@ impl SpecializedPipelineCache {
         Ok(Self {
             device,
             libraries,
+            compiled: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
             compiler: OnceLock::new(),
         })
-    }
-
-    /// Register a synthesized kernel library from precompiled metallib
-    /// bytes. The macro AOT-compiles synthesized `.metal` sources at
-    /// proc-macro expansion time (shells out to `xcrun metal -c` +
-    /// `xcrun metallib`) and embeds the resulting bytes as
-    /// `&'static [u8]`. Same `newLibraryWithData` path used by all
-    /// hand-written shaders — NOT the runtime MSL→AIR compile path
-    /// (`newLibraryWithSource`), which produces different binaries
-    /// across Apple GPU generations and was the source of a real M1
-    /// runtime failure.
-    ///
-    /// Used by the compiler-driven megakernel synthesis pass
-    /// (`scratchy-forward-compiler-macro/src/fuse_pass.rs`).
-    pub fn register_metallib_library(
-        &mut self,
-        name: &'static str,
-        bytes: &'static [u8],
-    ) -> Result<(), MetalStreamError> {
-        let lib = load_library_from_bytes(&self.device, bytes).map_err(|e| {
-            MetalStreamError::ShaderCompilationFailed(format!(
-                "load synthesized metallib `{name}`: {e}"
-            ))
-        })?;
-        self.libraries.insert(name, lib);
-        Ok(())
     }
 
     #[cfg(test)]
@@ -142,6 +119,7 @@ impl SpecializedPipelineCache {
         Ok(Self {
             device,
             libraries,
+            compiled: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
             compiler: OnceLock::new(),
         })
@@ -290,6 +268,35 @@ impl SpecializedPipelineCache {
         )
     }
 
+    /// Compile the library `name` from generated MSL (`source`, built only when needed) as
+    /// `xcrun metal` compiles every shader — fast math (the default), Metal 4.1 (the offline
+    /// default; the runtime's is older) — unless it is already compiled; how long this call's
+    /// compile took (`None`: it was).
+    pub fn compile_library(
+        &self,
+        name: &'static str,
+        source: impl FnOnce() -> String,
+    ) -> Result<Option<std::time::Duration>, MetalStreamError> {
+        let mut compiled = self.compiled.lock().unwrap();
+        if compiled.contains_key(name) {
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let opts = objc2_metal::MTLCompileOptions::new();
+        // `MTLLanguageVersion4_1` = (4 << 16) | 1; objc2-metal does not name it yet.
+        opts.setLanguageVersion(objc2_metal::MTLLanguageVersion((4 << 16) | 1));
+        let lib = self
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(&source()), Some(&opts))
+            .map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "compile library `{name}`: {e:?}"
+                ))
+            })?;
+        compiled.insert(name, lib);
+        Ok(Some(started.elapsed()))
+    }
+
     pub fn len(&self) -> usize {
         self.pipelines.lock().unwrap().len()
     }
@@ -309,12 +316,17 @@ impl SpecializedPipelineCache {
             }
         }
 
-        let library = self.libraries.get(key.library_name).ok_or_else(|| {
-            MetalStreamError::ShaderCompilationFailed(format!(
-                "no library `{}` in SpecializedPipelineCache (call `new` with this library)",
-                key.library_name
-            ))
-        })?;
+        let compiled = self.compiled.lock().unwrap().get(key.library_name).cloned();
+        let library = self
+            .libraries
+            .get(key.library_name)
+            .or(compiled.as_ref())
+            .ok_or_else(|| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "no library `{}` in SpecializedPipelineCache (call `new` with this library)",
+                    key.library_name
+                ))
+            })?;
 
         let constants = MTLFunctionConstantValues::new();
         for c in &key.constants {

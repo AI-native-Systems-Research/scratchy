@@ -3,6 +3,7 @@
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
+#include "megakernel/mk_common.h"
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -46,9 +47,9 @@ using namespace metal;
 // output tile.
 // ---------------------------------------------------------------------------
 
-constant uint GEMM_M [[function_constant(0)]];
-constant uint GEMM_N [[function_constant(1)]];
-constant uint GEMM_K [[function_constant(2)]];
+#define GEMM_CONSTS(X) X(uint, m, GEMM_M, 0) X(uint, n, GEMM_N, 1) X(uint, k, GEMM_K, 2)
+#ifndef MK_BODIES_ONLY
+GEMM_CONSTS(MK_FC_DECLARE)
 
 // Block-diagonal span attention for the hd512 unfused QKᵀ: granularity of the
 // per-position span-label buffer (== metal KV block size). The bound only fires
@@ -57,6 +58,7 @@ constant uint GEMM_K [[function_constant(2)]];
 constant uint QK_SPAN_BLOCK_RAW [[function_constant(3)]];
 constant uint QK_SPAN_BLOCK =
     is_function_constant_defined(QK_SPAN_BLOCK_RAW) ? QK_SPAN_BLOCK_RAW : 0u;
+#endif // MK_BODIES_ONLY
 
 // Shared C = A @ B^T body (A:[M,K], B:[N,K], C:[M,N]) with M/N/K passed
 // explicitly. The dense kernel passes the baked GEMM_M/N/K; the hd512 unfused
@@ -65,90 +67,112 @@ constant uint QK_SPAN_BLOCK =
 // early-return. This is the pre-M5 (non-NAX) counterpart of gemm_nax_bf16_qk/pv
 // and uses the identical [M,N,K] convention, so its output matches bit-for-bit
 // modulo accumulation order.
+//
+// ONE body text for bf16 and f16 (`T`, `MAT_T` the simdgroup matrix type); the megakernel
+// (`mk_gemm`) plays its tile, B loads and store with its own A staging — the same values into the
+// same MMA in the same order. The weight (B) row stride `w_ld` == K for dense/QKᵀ, but
+// for PV the V^T dense buffer is strided by static max_kv while the contraction K = kv_len — they
+// MUST be decoupled. Weight is [N, K]: C = A @ W^T loads B with transpose=true.
+// The A tile through `a_pad` (a partial tile).
+#define GEMM_T_STAGE_A(T)                                                                   \
+    for (uint t = tid; t < TILE * TILE; t += 32u) {                                         \
+        uint r = t / TILE;                                                                  \
+        uint c = t % TILE;                                                                  \
+        uint mr = m_base + r;                                                               \
+        uint kc = k_base + c;                                                               \
+        a_pad[r * TILE + c] = (mr < M && kc < K) ? input[mr * K + kc] : T(0);               \
+    }                                                                                       \
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+// The tile this simdgroup owns; the rest of the body reads `m_base` / `n_base` / `m_full` /
+// `n_full`.
+#define GEMM_T_TILE                                                                         \
+    constexpr uint TILE = 8u;                                                               \
+    const uint m_base = tgid.y * TILE;                                                      \
+    const uint n_base = tgid.x * TILE;                                                      \
+    if (m_base >= M || n_base >= N) return;                                                 \
+                                                                                            \
+    const bool m_full = (m_base + TILE <= M);                                               \
+    const bool n_full = (n_base + TILE <= N);
+
+// The B tile at `k_base` (the weight rows [n_base, n_base + TILE), transposed).
+#define GEMM_T_LOAD_B(T)                                                                    \
+    if (n_full && k_full) {                                                                 \
+        simdgroup_load(B, weight + n_base * w_ld + k_base, w_ld, ulong2(0, 0), true);       \
+    } else {                                                                                \
+        for (uint t = tid; t < TILE * TILE; t += 32u) {                                     \
+            uint r = t / TILE;                                                              \
+            uint c = t % TILE;                                                              \
+            uint nr = n_base + r;                                                           \
+            uint kc = k_base + c;                                                           \
+            b_pad[r * TILE + c] = (nr < N && kc < K) ? weight[nr * w_ld + kc] : T(0);       \
+        }                                                                                   \
+        simdgroup_barrier(mem_flags::mem_threadgroup);                                      \
+        simdgroup_load(B, b_pad, TILE, ulong2(0, 0), true);                                 \
+    }
+
+// The accumulated tile out, through `c_scratch`.
+#define GEMM_T_STORE(T)                                                                     \
+    simdgroup_store(acc, c_scratch, TILE);                                                  \
+    simdgroup_barrier(mem_flags::mem_threadgroup);                                          \
+                                                                                            \
+    if (m_full && n_full) {                                                                 \
+        for (uint t = tid; t < TILE * TILE; t += 32u) {                                     \
+            uint r = t / TILE;                                                              \
+            uint c = t % TILE;                                                              \
+            output[(m_base + r) * N + (n_base + c)] = T(c_scratch[r * TILE + c]);           \
+        }                                                                                   \
+    } else {                                                                                \
+        for (uint t = tid; t < TILE * TILE; t += 32u) {                                     \
+            uint r = t / TILE;                                                              \
+            uint c = t % TILE;                                                              \
+            uint mr = m_base + r;                                                           \
+            uint nc = n_base + c;                                                           \
+            if (mr < M && nc < N) {                                                         \
+                output[mr * N + nc] = T(c_scratch[r * TILE + c]);                           \
+            }                                                                               \
+        }                                                                                   \
+    }
+
+#define GEMM_T_BODY(T, MAT_T)                                                               \
+    GEMM_T_TILE                                                                             \
+                                                                                            \
+    simdgroup_float8x8 acc = simdgroup_float8x8(0.0f);                                      \
+                                                                                            \
+    for (uint k_base = 0u; k_base < K; k_base += TILE) {                                    \
+        const bool k_full = (k_base + TILE <= K);                                           \
+                                                                                            \
+        MAT_T A;                                                                            \
+        MAT_T B;                                                                            \
+                                                                                            \
+        if (m_full && k_full) {                                                             \
+            simdgroup_load(A, input + m_base * K + k_base, K);                              \
+        } else {                                                                            \
+            GEMM_T_STAGE_A(T)                                                               \
+            simdgroup_load(A, a_pad, TILE);                                                 \
+        }                                                                                   \
+                                                                                            \
+        GEMM_T_LOAD_B(T)                                                                    \
+        simdgroup_multiply_accumulate(acc, A, B, acc);                                      \
+    }                                                                                       \
+                                                                                            \
+    GEMM_T_STORE(T)
+
 inline void gemm_t_bf16_body(
     device bfloat*       output,
     device const bfloat* input,
     device const bfloat* weight,
     uint M, uint N, uint K,
-    uint w_ld,           // weight (B) ROW stride; == K for dense/QKᵀ, but for PV
-                         // the V^T dense buffer is strided by static max_kv while
-                         // the contraction K = kv_len — they MUST be decoupled.
+    uint w_ld,
     threadgroup bfloat*  a_pad,
     threadgroup bfloat*  b_pad,
     threadgroup float*   c_scratch,
     uint3 tgid, uint tid)
 {
-    constexpr uint TILE = 8u;
-    const uint m_base = tgid.y * TILE;
-    const uint n_base = tgid.x * TILE;
-    if (m_base >= M || n_base >= N) return;
-
-    const bool m_full = (m_base + TILE <= M);
-    const bool n_full = (n_base + TILE <= N);
-
-    simdgroup_float8x8 acc = simdgroup_float8x8(0.0f);
-
-    for (uint k_base = 0u; k_base < K; k_base += TILE) {
-        const bool k_full = (k_base + TILE <= K);
-
-        simdgroup_bfloat8x8 A;
-        simdgroup_bfloat8x8 B;
-
-        if (m_full && k_full) {
-            simdgroup_load(A, input + m_base * K + k_base, K);
-        } else {
-            for (uint t = tid; t < TILE * TILE; t += 32u) {
-                uint r = t / TILE;
-                uint c = t % TILE;
-                uint mr = m_base + r;
-                uint kc = k_base + c;
-                a_pad[r * TILE + c] = (mr < M && kc < K) ? input[mr * K + kc] : bfloat(0);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            simdgroup_load(A, a_pad, TILE);
-        }
-
-        // weight is [N, K] with ROW stride w_ld; compute C = A @ W^T → load B
-        // with transpose=true. Row stride is w_ld (not K) so PV can read the
-        // max_kv-strided V^T while contracting only kv_len columns.
-        if (n_full && k_full) {
-            simdgroup_load(B, weight + n_base * w_ld + k_base, w_ld, ulong2(0, 0), true);
-        } else {
-            for (uint t = tid; t < TILE * TILE; t += 32u) {
-                uint r = t / TILE;
-                uint c = t % TILE;
-                uint nr = n_base + r;
-                uint kc = k_base + c;
-                b_pad[r * TILE + c] = (nr < N && kc < K) ? weight[nr * w_ld + kc] : bfloat(0);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            simdgroup_load(B, b_pad, TILE, ulong2(0, 0), true);
-        }
-        simdgroup_multiply_accumulate(acc, A, B, acc);
-    }
-
-    simdgroup_store(acc, c_scratch, TILE);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (m_full && n_full) {
-        for (uint t = tid; t < TILE * TILE; t += 32u) {
-            uint r = t / TILE;
-            uint c = t % TILE;
-            output[(m_base + r) * N + (n_base + c)] = bfloat(c_scratch[r * TILE + c]);
-        }
-    } else {
-        for (uint t = tid; t < TILE * TILE; t += 32u) {
-            uint r = t / TILE;
-            uint c = t % TILE;
-            uint mr = m_base + r;
-            uint nc = n_base + c;
-            if (mr < M && nc < N) {
-                output[mr * N + nc] = bfloat(c_scratch[r * TILE + c]);
-            }
-        }
-    }
+    GEMM_T_BODY(bfloat, simdgroup_bfloat8x8)
 }
 
+#ifndef MK_BODIES_ONLY
 kernel void gemm_bf16_specialized(
     device       bfloat* output [[buffer(0)]],
     device const bfloat* input  [[buffer(1)]],
@@ -164,6 +188,7 @@ kernel void gemm_bf16_specialized(
     gemm_t_bf16_body(output, input, weight, GEMM_M, GEMM_N, GEMM_K, GEMM_K,
                      a_pad, b_pad, c_scratch, tgid, tid3.x);
 }
+#endif // MK_BODIES_ONLY
 
 // f16 counterpart of `gemm_t_bf16_body` — identical tiling and dispatch
 // convention, with `half` inputs and `simdgroup_half8x8` MMA (float
@@ -182,74 +207,62 @@ inline void gemm_t_f16_body(
     threadgroup float* c_scratch,
     uint3 tgid, uint tid)
 {
-    constexpr uint TILE = 8u;
-    const uint m_base = tgid.y * TILE;
-    const uint n_base = tgid.x * TILE;
-    if (m_base >= M || n_base >= N) return;
-
-    const bool m_full = (m_base + TILE <= M);
-    const bool n_full = (n_base + TILE <= N);
-
-    simdgroup_float8x8 acc = simdgroup_float8x8(0.0f);
-
-    for (uint k_base = 0u; k_base < K; k_base += TILE) {
-        const bool k_full = (k_base + TILE <= K);
-
-        simdgroup_half8x8 A;
-        simdgroup_half8x8 B;
-
-        if (m_full && k_full) {
-            simdgroup_load(A, input + m_base * K + k_base, K);
-        } else {
-            for (uint t = tid; t < TILE * TILE; t += 32u) {
-                uint r = t / TILE;
-                uint c = t % TILE;
-                uint mr = m_base + r;
-                uint kc = k_base + c;
-                a_pad[r * TILE + c] = (mr < M && kc < K) ? input[mr * K + kc] : half(0);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            simdgroup_load(A, a_pad, TILE);
-        }
-
-        if (n_full && k_full) {
-            simdgroup_load(B, weight + n_base * w_ld + k_base, w_ld, ulong2(0, 0), true);
-        } else {
-            for (uint t = tid; t < TILE * TILE; t += 32u) {
-                uint r = t / TILE;
-                uint c = t % TILE;
-                uint nr = n_base + r;
-                uint kc = k_base + c;
-                b_pad[r * TILE + c] = (nr < N && kc < K) ? weight[nr * w_ld + kc] : half(0);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            simdgroup_load(B, b_pad, TILE, ulong2(0, 0), true);
-        }
-        simdgroup_multiply_accumulate(acc, A, B, acc);
-    }
-
-    simdgroup_store(acc, c_scratch, TILE);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (m_full && n_full) {
-        for (uint t = tid; t < TILE * TILE; t += 32u) {
-            uint r = t / TILE;
-            uint c = t % TILE;
-            output[(m_base + r) * N + (n_base + c)] = half(c_scratch[r * TILE + c]);
-        }
-    } else {
-        for (uint t = tid; t < TILE * TILE; t += 32u) {
-            uint r = t / TILE;
-            uint c = t % TILE;
-            uint mr = m_base + r;
-            uint nc = n_base + c;
-            if (mr < M && nc < N) {
-                output[mr * N + nc] = half(c_scratch[r * TILE + c]);
-            }
-        }
-    }
+    GEMM_T_BODY(half, simdgroup_half8x8)
 }
 
+// Megakernel adapter: one 8×8 output tile per virtual threadgroup (one simdgroup), output (0) /
+// input (1) coherent. The dispatch kernel's A tiles, B tiles and multiply-accumulate order, but
+// the A tiles of MK_GEMM_KB consecutive K steps staged at once (one simdgroup barrier per
+// MK_GEMM_KB steps instead of per step) and their weight (B) tiles loaded before the first of their
+// multiply-accumulates, so the loads overlap — at M = 1 (the MoE router logits) the body is a
+// serial chain of K / 8 steps, each otherwise waiting on its load.
+// Its a_rows / b_pad / c_scratch (MK_GEMM_KB·128 + 128 + 256 bytes) in its region.
+#define MK_GEMM_KB 8u
+template <typename T, typename MAT_T, typename C>
+MK_FUNC void mk_gemm(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+    if (!l.live) return;
+    constexpr uint STAGED = 8u * MK_GEMM_KB; // A columns staged at once
+    threadgroup uchar* region = mk_region(s, l, tg);
+    threadgroup T* a_rows = (threadgroup T*)region; // [8, STAGED]
+    threadgroup T* b_pad = (threadgroup T*)(region + MK_GEMM_KB * 128u);
+    threadgroup float* c_scratch = (threadgroup float*)(region + MK_GEMM_KB * 128u + 128u);
+    mk_ptr<T> output = (mk_ptr<T>)s.addr[0];
+    mk_cptr<T> input = (mk_cptr<T>)s.addr[1];
+    device const T* weight = (device const T*)s.addr[2];
+    const uint M = C::m(), N = C::n(), K = C::k(), w_ld = C::k();
+    const uint3 tgid = l.tg_pos;
+    const uint tid = l.tid3.x;
+    GEMM_T_TILE
+
+    simdgroup_float8x8 acc = simdgroup_float8x8(0.0f);
+    for (uint k0 = 0u; k0 < K; k0 += STAGED) {
+        for (uint t = tid; t < TILE * STAGED; t += 32u) {
+            const uint r = t / STAGED;
+            const uint c = t % STAGED;
+            const uint mr = m_base + r;
+            const uint kc = k0 + c;
+            a_rows[r * STAGED + c] = (mr < M && kc < K) ? input[mr * K + kc] : T(0);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // Every B tile of the batch loaded before the first multiply-accumulate.
+        MAT_T bs[MK_GEMM_KB];
+        for (uint j = 0u; j < MK_GEMM_KB && k0 + j * TILE < K; ++j) {
+            const uint k_base = k0 + j * TILE;
+            const bool k_full = (k_base + TILE <= K);
+            thread MAT_T& B = bs[j];
+            GEMM_T_LOAD_B(T)
+        }
+        for (uint j = 0u; j < MK_GEMM_KB && k0 + j * TILE < K; ++j) {
+            MAT_T A;
+            simdgroup_load(A, a_rows + j * TILE, STAGED);
+            simdgroup_multiply_accumulate(acc, A, bs[j], acc);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    GEMM_T_STORE(T)
+}
+
+#ifndef MK_BODIES_ONLY
 kernel void gemm_f16_specialized(
     device       half* output [[buffer(0)]],
     device const half* input  [[buffer(1)]],
@@ -265,7 +278,13 @@ kernel void gemm_f16_specialized(
     gemm_t_f16_body(output, input, weight, GEMM_M, GEMM_N, GEMM_K, GEMM_K,
                     a_pad, b_pad, c_scratch, tgid, tid3.x);
 }
+#else
+MK_ADAPTER(gemm_bf16_specialized, 1408, 0x3, (mk_gemm<bfloat, simdgroup_bfloat8x8, MK_C>),
+           GEMM_CONSTS)
+MK_ADAPTER(gemm_f16_specialized, 1408, 0x3, (mk_gemm<half, simdgroup_half8x8, MK_C>), GEMM_CONSTS)
+#endif
 
+#ifndef MK_BODIES_ONLY
 // ── Blocked simdgroup GEMM for the hd512 unfused attention (pre-M5) ──────────
 // C = A[M,K] @ B[N,K]^T. 32×32 output tile, 4 simdgroups (WM=WN=2), BK=16,
 // register-cached 8×8 frags, shared A/B — a single-output adaptation of the MoE
@@ -440,3 +459,4 @@ kernel void gemm_bf16_pv(
     gemm_t_bf16_blocked(output, input, weight, GEMM_M, GEMM_N, seq_used[0], GEMM_K,
                         As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
 }
+#endif // MK_BODIES_ONLY

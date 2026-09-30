@@ -22,10 +22,59 @@
 // the negative tail.
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
-constant uint SILU_MUL_N [[function_constant(0)]];
+#define SILU_MUL_CONSTS(X) X(uint, n, SILU_MUL_N, 0)
+#ifndef MK_BODIES_ONLY
+SILU_MUL_CONSTS(MK_FC_DECLARE)
+#endif
+
+// Bodies shared by the dispatch kernels and the megakernel adapters: element `gid`.
+template <typename T, typename OP, typename IP>
+METAL_FUNC void silu_mul_body(OP out, IP gate, IP up, uint gid) {
+  // SiLU(x) = x / (1 + exp(-x)) — kept in float so the denormalized
+  // tail of the half/bfloat exp() stays representable.
+  float g = float(gate[gid]);
+  float u = float(up[gid]);
+  float silu_g = g / (1.0f + exp(-g));
+  out[gid] = static_cast<T>(silu_g * u);
+}
+
+template <typename T, typename OP, typename IP>
+METAL_FUNC void gelu_mul_body(OP out, IP gate, IP up, uint gid) {
+  float g = float(gate[gid]);
+  float u = float(up[gid]);
+  const float sqrt_2_over_pi = 0.7978845608f;
+  const float coeff = 0.044715f;
+  // Clamp the tanh argument: Metal's fast-math tanh computes
+  // (exp(2x)-1)/(exp(2x)+1), which is inf/inf = NaN once 2x
+  // overflows exp (|x| ≳ 44 — i.e. ANY gate ≥ ~10.06; Gemma4 layer-0
+  // gates reach 57.5). tanh(15) rounds to exactly 1.0f, so the clamp
+  // is bit-exact vs a saturating tanh. Same fix as activation.metal.
+  float inner = clamp(
+      sqrt_2_over_pi * (g + coeff * g * g * g), -15.0f, 15.0f);
+  float gelu_g = 0.5f * g * (1.0f + tanh(inner));
+  out[gid] = static_cast<T>(gelu_g * u);
+}
+
+// Megakernel adapters: one thread per element as the 1-D dispatch lays them out; out (0), gate
+// (1) and up (2) device-coherent.
+template <typename T, typename C>
+MK_FUNC void mk_silu_mul(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  const uint gid = l.tg_pos.x * l.tpg.x + l.tid3.x;
+  if (!l.live || gid >= C::n()) return;
+  silu_mul_body<T>((mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1], (mk_cptr<T>)s.addr[2], gid);
+}
+template <typename T, typename C>
+MK_FUNC void mk_gelu_mul(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  const uint gid = l.tg_pos.x * l.tpg.x + l.tid3.x;
+  if (!l.live || gid >= C::n()) return;
+  gelu_mul_body<T>((mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1], (mk_cptr<T>)s.addr[2], gid);
+}
+
+#ifndef MK_BODIES_ONLY
 
 template <typename T>
 [[kernel]] void silu_mul(
@@ -37,12 +86,7 @@ template <typename T>
   if (gid >= SILU_MUL_N) {
     return;
   }
-  // SiLU(x) = x / (1 + exp(-x)) — kept in float so the denormalized
-  // tail of the half/bfloat exp() stays representable.
-  float g = float(gate[gid]);
-  float u = float(up[gid]);
-  float silu_g = g / (1.0f + exp(-g));
-  out[gid] = static_cast<T>(silu_g * u);
+  silu_mul_body<T>(out, gate, up, gid);
 }
 
 #define INST_SILU_MUL(dtype_tag, mtl_type)                                \
@@ -52,9 +96,15 @@ template <typename T>
       const device mtl_type* gate [[buffer(1)]],                          \
       const device mtl_type* up   [[buffer(2)]],                          \
       uint gid [[thread_position_in_grid]]);
+#else
+#define INST_SILU_MUL(dtype_tag, mtl_type) \
+  MK_TAIL(silu_mul_##dtype_tag, 0x7, (mk_silu_mul<mtl_type, MK_C>), SILU_MUL_CONSTS)
+#endif
 
 INST_SILU_MUL(f16,  half)
 INST_SILU_MUL(bf16, bfloat)
+
+#ifndef MK_BODIES_ONLY
 
 // GELU (tanh approximation) sibling for the decomposed GeGLU q-MLP
 // path (Gemma2/3/4: `gelu_pytorch_tanh(gate) * up`). Same three
@@ -73,19 +123,7 @@ template <typename T>
   if (gid >= SILU_MUL_N) {
     return;
   }
-  float g = float(gate[gid]);
-  float u = float(up[gid]);
-  const float sqrt_2_over_pi = 0.7978845608f;
-  const float coeff = 0.044715f;
-  // Clamp the tanh argument: Metal's fast-math tanh computes
-  // (exp(2x)-1)/(exp(2x)+1), which is inf/inf = NaN once 2x
-  // overflows exp (|x| ≳ 44 — i.e. ANY gate ≥ ~10.06; Gemma4 layer-0
-  // gates reach 57.5). tanh(15) rounds to exactly 1.0f, so the clamp
-  // is bit-exact vs a saturating tanh. Same fix as activation.metal.
-  float inner = clamp(
-      sqrt_2_over_pi * (g + coeff * g * g * g), -15.0f, 15.0f);
-  float gelu_g = 0.5f * g * (1.0f + tanh(inner));
-  out[gid] = static_cast<T>(gelu_g * u);
+  gelu_mul_body<T>(out, gate, up, gid);
 }
 
 #define INST_GELU_MUL(dtype_tag, mtl_type)                                \
@@ -95,6 +133,10 @@ template <typename T>
       const device mtl_type* gate [[buffer(1)]],                          \
       const device mtl_type* up   [[buffer(2)]],                          \
       uint gid [[thread_position_in_grid]]);
+#else
+#define INST_GELU_MUL(dtype_tag, mtl_type) \
+  MK_TAIL(gelu_mul_##dtype_tag, 0x7, (mk_gelu_mul<mtl_type, MK_C>), SILU_MUL_CONSTS)
+#endif
 
 INST_GELU_MUL(f16,  half)
 INST_GELU_MUL(bf16, bfloat)

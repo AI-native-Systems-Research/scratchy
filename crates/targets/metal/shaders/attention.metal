@@ -27,17 +27,38 @@
 //   5  ATTN_MAX_BLOCKS_PER_SEQ uint
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 #include "turboquant_offset.h"
 using namespace metal;
 
-
-
-constant uint  ATTN_HEAD_DIM           [[function_constant(0)]];
-constant uint  ATTN_NUM_Q_HEADS        [[function_constant(1)]];
-constant uint  ATTN_NUM_KV_HEADS       [[function_constant(2)]];
-constant float ATTN_SCALE_FC           [[function_constant(3)]];
-constant uint  ATTN_BLOCK_SIZE         [[function_constant(4)]];
-constant uint  ATTN_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
+// Every function constant of this file, ONE list, in segments: each segment is declared where
+// the kernels always declared it (the program-scope initializer follows declaration order;
+// indices 6..16 are documented there). The decode kernel's body reads them through a policy
+// `C`: `AttnFc` (these declarations) in the dispatch kernels, `AttnMk` (a megakernel step's
+// generated constant policy) in the megakernel.
+#define ATTN_CONSTS_SHAPE(X)                                                                    \
+  X(uint, head_dim, ATTN_HEAD_DIM, 0) X(uint, num_q, ATTN_NUM_Q_HEADS, 1)                       \
+  X(uint, num_kv, ATTN_NUM_KV_HEADS, 2) X(float, scale, ATTN_SCALE_FC, 3)                       \
+  X(uint, block_size, ATTN_BLOCK_SIZE, 4) X(uint, max_blocks, ATTN_MAX_BLOCKS_PER_SEQ, 5)
+#define ATTN_CONSTS_CHUNK(X) X(uint, blocks_per_chunk, ATTN_BLOCKS_PER_CHUNK, 6)
+#define ATTN_CONSTS_WINDOW(X) X(int, window, ATTN_WINDOW, 7)
+#define ATTN_CONSTS_ROR(X)                                                                      \
+  X(uint, rot_dim, ATTN_ROT_DIM, 8) X(uint, pair_off, ATTN_PAIR_OFF, 9)                         \
+  X(uint, ror_fc, ATTN_ROPE_ON_READ, 10)
+#define ATTN_CONSTS_KSCR(X) X(uint, k_scratch_fc, ATTN_K_SCRATCH, 11)
+#define ATTN_CONSTS_PCR(X) X(uint, pcr_fc, ATTN_PAIR_CORESIDENT, 12)
+#define ATTN_CONSTS_TQ(X) X(uint, tq_bits, ATTN_TQ_BITS, 13)
+#define ATTN_CONSTS_TQ_KB(X) X(uint, tq_k_bias, ATTN_TQ_K_BIAS, 14)
+#define ATTN_CONSTS_TQ_VB(X) X(uint, tq_v_bias, ATTN_TQ_V_BIAS, 15)
+#define ATTN_CONSTS_TQ_HEADS(X) X(uint, tq_heads_fc, ATTN_TQ_HEADS_FC, 16)
+#define ATTN_CONSTS(X)                                                                          \
+  ATTN_CONSTS_SHAPE(X) ATTN_CONSTS_CHUNK(X) ATTN_CONSTS_WINDOW(X) ATTN_CONSTS_ROR(X)            \
+  ATTN_CONSTS_KSCR(X) ATTN_CONSTS_PCR(X) ATTN_CONSTS_TQ(X) ATTN_CONSTS_TQ_KB(X)                 \
+  ATTN_CONSTS_TQ_VB(X) ATTN_CONSTS_TQ_HEADS(X)
+#ifndef MK_BODIES_ONLY
+ATTN_CONSTS_SHAPE(MK_FC_DECLARE)
+#endif// Defined once its derived constants are (below); helpers default to it.
+struct AttnFc;
 // Reactive (chunked) KV pool: the `k_cache`/`v_cache` bindings are
 // per-layer chunk-address TABLES (device uint64 gpuAddresses), not the
 // cache buffers. A resolved physical block id derefs
@@ -46,7 +67,9 @@ constant uint  ATTN_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
 // scratchy-target-metal's `BLOCKS_PER_CHUNK`. (`attention_via_cache_v2_*`
 // reads constant slot 6 via `AttentionViaCacheConstants`;
 // `attention_prefill_sdpa_v2_paged_*` via `AttentionPrefillPagedConstants`.)
-constant uint  ATTN_BLOCKS_PER_CHUNK   [[function_constant(6)]];
+#ifndef MK_BODIES_ONLY
+ATTN_CONSTS_CHUNK(MK_FC_DECLARE)
+#endif
 
 // Sliding-window attention (Gemma2/3/4 alternating layers). A query at
 // absolute position `q` attends to keys `k` with `0 <= q - k < window`
@@ -54,7 +77,9 @@ constant uint  ATTN_BLOCKS_PER_CHUNK   [[function_constant(6)]];
 // `linds < rinds + window_size` and HF's `(q-k) >= window` masking).
 // `0` disables the window entirely; the compiler folds the checks away
 // for non-sliding pipelines (full-attention models pass 0).
-constant int   ATTN_WINDOW             [[function_constant(7)]];
+#ifndef MK_BODIES_ONLY
+ATTN_CONSTS_WINDOW(MK_FC_DECLARE)
+#endif
 
 // Cap on `seq_used_k[seq]` the shared-logits buffer can hold.
 // Each token uses 4 bytes; this cap × 4 == threadgroup memory bytes
@@ -83,9 +108,8 @@ constant int   ATTN_WINDOW             [[function_constant(7)]];
 //                                  rope, head_dim/2 for proportional rope
 //                                  (MUST match rope_append's ROPE_PAIR_OFF)
 //  10  ATTN_ROPE_ON_READ  uint  — 0/1 master switch
-constant uint ATTN_ROT_DIM      [[function_constant(8)]];
-constant uint ATTN_PAIR_OFF     [[function_constant(9)]];
-constant uint ATTN_ROPE_ON_READ [[function_constant(10)]];
+#ifndef MK_BODIES_ONLY
+ATTN_CONSTS_ROR(MK_FC_DECLARE)
 constant bool ATTN_ROR_DEFINED  = is_function_constant_defined(ATTN_ROPE_ON_READ);
 constant uint ATTN_ROR          = ATTN_ROR_DEFINED ? ATTN_ROPE_ON_READ : 0u;
 
@@ -104,7 +128,7 @@ constant uint ATTN_ROR          = ATTN_ROR_DEFINED ? ATTN_ROPE_ON_READ : 0u;
 //      the kernel keeps the in-kernel cos_sin rotation (or, with ROR also
 //      unset, the byte-identical non-spans cache read). The rope-once kernel
 //      itself reads ATTN_ROT_DIM / ATTN_PAIR_OFF / the per-block bit-31 flag.
-constant uint ATTN_K_SCRATCH        [[function_constant(11)]];
+ATTN_CONSTS_KSCR(MK_FC_DECLARE)
 constant bool ATTN_K_SCRATCH_DEF    = is_function_constant_defined(ATTN_K_SCRATCH);
 constant uint ATTN_KSCR             = ATTN_K_SCRATCH_DEF ? ATTN_K_SCRATCH : 0u;
 
@@ -121,17 +145,19 @@ constant uint ATTN_KSCR             = ATTN_K_SCRATCH_DEF ? ATTN_K_SCRATCH : 0u;
 //      addressing helpers below fold to the plain contiguous slice when
 //      this is 0 (every non-spans dispatch + the A/B-off case), keeping
 //      that path byte-identical.
-constant uint ATTN_PAIR_CORESIDENT     [[function_constant(12)]];
+ATTN_CONSTS_PCR(MK_FC_DECLARE)
 constant bool ATTN_PAIR_CORESIDENT_DEF = is_function_constant_defined(ATTN_PAIR_CORESIDENT);
 constant uint ATTN_PCR                 = ATTN_PAIR_CORESIDENT_DEF ? ATTN_PAIR_CORESIDENT : 0u;
+#endif // MK_BODIES_ONLY
 
 // Per-lane element offset (within a key's head_dim row) for local index
 // `j` in [0, qk_per_thread). Contiguous layout: `simd_lid*qk + j`.
 // Co-resident layout: the lane owns `np = qk/2` first-side elements then
 // their `+half_dim` pairs, so element `j` is in-lane paired with element
 // `j ± np`. half_dim = head_dim/2 (full NeoX, the only case PCR is set).
+template <typename C = AttnFc>
 inline uint attn_elem_off(uint simd_lid, uint j, uint qk_per_thread, uint head_dim) {
-    if (ATTN_PCR != 0u) {
+    if (C::pcr() != 0u) {
         const uint np    = qk_per_thread / 2u;
         const uint base  = simd_lid * np;
         const uint halfd = head_dim / 2u;
@@ -258,7 +284,8 @@ inline void rope_on_read_k_pairs_inlane(
 //   Σ_t p_t x_t  = s² · D · H · (Σ_t p_t · norm_t · c_t)  — rotate the output once.
 // No key is ever decoded, so the per-layer full-context dequant pass is gone
 // for decode.
-constant uint ATTN_TQ_BITS [[function_constant(13)]];
+#ifndef MK_BODIES_ONLY
+ATTN_CONSTS_TQ(MK_FC_DECLARE)
 constant bool ATTN_TQ_DEF  = is_function_constant_defined(ATTN_TQ_BITS);
 constant uint ATTN_TQ      = ATTN_TQ_DEF ? ATTN_TQ_BITS : 0u;
 
@@ -269,18 +296,48 @@ constant uint ATTN_TQ      = ATTN_TQ_DEF ? ATTN_TQ_BITS : 0u;
 //      gains q·R_i·b (needs the rope-on-read table and pairing); V's is added
 //      once to the output, since the softmax weights sum to 1. Prefill staging
 //      (bias at buffer 10) restores it into each cached key's rotated image.
-constant uint ATTN_TQ_K_BIAS [[function_constant(14)]];
+ATTN_CONSTS_TQ_KB(MK_FC_DECLARE)
 constant bool ATTN_TQ_KB = is_function_constant_defined(ATTN_TQ_K_BIAS);
-constant uint ATTN_TQ_V_BIAS [[function_constant(15)]];
+ATTN_CONSTS_TQ_VB(MK_FC_DECLARE)
 constant bool ATTN_TQ_VB = is_function_constant_defined(ATTN_TQ_V_BIAS);
 
 //  16  ATTN_TQ_HEADS — query heads per decode threadgroup under TurboQuant:
 //      consecutive heads of one KV head, so each key's codes are decoded once
-//      for all of them (decode is ALU-bound on that decode). Unset: 1.
+//      for all of them (decode is ALU-bound on that decode); the decode
+//      megakernel also groups an fp16-KV decode's heads so. Unset: 1.
 //      heads * head_dim / 32 <= 32.
-constant uint ATTN_TQ_HEADS_FC [[function_constant(16)]];
+ATTN_CONSTS_TQ_HEADS(MK_FC_DECLARE)
 constant uint ATTN_TQ_HEADS =
     is_function_constant_defined(ATTN_TQ_HEADS_FC) ? ATTN_TQ_HEADS_FC : 1u;
+#endif // MK_BODIES_ONLY
+
+#ifndef MK_BODIES_ONLY
+// The dispatch kernels' constants, as the decode body reads them: the list, and the values the
+// kernels derive from it (an unset optional constant reads its default).
+struct AttnFc {
+    ATTN_CONSTS(MK_FC_ACCESSOR)
+    static METAL_FUNC uint ror() { return ATTN_ROR; }
+    static METAL_FUNC uint pcr() { return ATTN_PCR; }
+    static METAL_FUNC uint tq() { return ATTN_TQ; }
+    static METAL_FUNC bool tq_kb() { return ATTN_TQ_KB; }
+    static METAL_FUNC bool tq_vb() { return ATTN_TQ_VB; }
+    static METAL_FUNC uint tq_heads() { return ATTN_TQ_HEADS; }
+};
+#endif
+// The megakernel adapter's region: the kernel's four threadgroup arrays (floats), then q.
+#define ATTN_MK_TG_FLOATS (1024 + 256 + 256 + 16)
+// A megakernel step's constants: its generated policy spells an unset constant as 0 — already the
+// derived value except the heads (default 1) and the bias switches (`has_…`: set or not).
+template <typename G>
+struct AttnMk {
+    ATTN_CONSTS(MK_FC_FORWARD)
+    static METAL_FUNC uint ror() { return G::ror_fc(); }
+    static METAL_FUNC uint pcr() { return G::pcr_fc(); }
+    static METAL_FUNC uint tq() { return G::tq_bits(); }
+    static METAL_FUNC bool tq_kb() { return G::has_tq_k_bias(); }
+    static METAL_FUNC bool tq_vb() { return G::has_tq_v_bias(); }
+    static METAL_FUNC uint tq_heads() { return G::has_tq_heads_fc() ? G::tq_heads_fc() : 1u; }
+};
 
 //  17  ATTN_TQ_STAGE_PASS — the rows one `tq_stage_rotated` dispatch stages:
 //      1 = the step's new rows (read from the cache their writer just filled),
@@ -318,28 +375,30 @@ inline void tq_wht(thread float* x, uint qk_per_thread, uint simd_lid) {
 
 // Code of element `e` of the packed vector starting at word `row_word`:
 // `32 / bits` codes per u32, LSB first, none straddling a word (turboquant.metal).
-inline uint tq_code(device const uint* packed, uint row_word, uint e) {
-    const uint vpw = 32u / ATTN_TQ;
-    return (packed[row_word + e / vpw] >> ((e % vpw) * ATTN_TQ)) & ((1u << ATTN_TQ) - 1u);
+template <typename C = AttnFc, typename PP = device const uint*>
+inline uint tq_code(PP packed, uint row_word, uint e) {
+    const uint vpw = 32u / C::tq();
+    return (packed[row_word + e / vpw] >> ((e % vpw) * C::tq())) & ((1u << C::tq()) - 1u);
 }
 
 // Spans rope-on-read: rotate this lane's K slice to key position `i`.
-template <typename T>
+template <typename T, typename C = AttnFc>
 inline void attn_rope_on_read(thread float* k_loc, uint qk_per_thread, uint simd_lid,
                               uint i, device const T* cos_sin) {
-    const uint half_dim = ATTN_ROT_DIM / 2u;
-    device const T* cos_row = cos_sin + i * ATTN_ROT_DIM;
+    const uint half_dim = C::rot_dim() / 2u;
+    device const T* cos_row = cos_sin + i * C::rot_dim();
     device const T* sin_row = cos_row + half_dim;
-    if (ATTN_PCR != 0u) {
+    if (C::pcr() != 0u) {
         // Co-resident: both pair members in-lane, no shuffle/staging.
         rope_on_read_k_pairs_inlane<T>(k_loc, qk_per_thread, simd_lid,
                                        cos_row, sin_row, half_dim);
     } else {
         rope_on_read_k_slice<T>(k_loc, qk_per_thread, simd_lid,
-                                cos_row, sin_row, half_dim, ATTN_PAIR_OFF);
+                                cos_row, sin_row, half_dim, C::pair_off());
     }
 }
 
+#ifndef MK_BODIES_ONLY
 // ── TurboQuant prefill: the rotated-domain KV image ─────────────────────
 //
 // Prefill attention — every kernel family, unchanged — runs in the codebook's
@@ -572,6 +631,7 @@ kernel void tq_rotate_rows(
 
 INSTANTIATE_TQ_PREFILL(f16, half)
 INSTANTIATE_TQ_PREFILL(bf16, bfloat)
+#endif // MK_BODIES_ONLY
 
 // ============================================================================
 // attention_via_cache_v2_{f16,bf16}_specialized — paged-cache decode attention
@@ -628,53 +688,67 @@ INSTANTIATE_TQ_PREFILL(bf16, bfloat)
 // dispatchable (spilling registers on M1 if needed) or fail pipeline creation
 // loudly instead of corrupting silently. Must equal the dispatched
 // threads_per_threadgroup at lowering.rs (AttentionViaCache / Sliding).
-template <typename T>
-[[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2(
-    device       T* output         [[buffer(0)]],
-    device const T* q              [[buffer(1)]],
-    device const uint* seq_used_k  [[buffer(2)]],
-    device const uint* block_table [[buffer(3)]],
-    device const uint64_t* k_cache [[buffer(4)]],
-    device const uint64_t* v_cache [[buffer(5)]],
-    // Rope-on-read (spans): cos/sin for the active layer class. The
-    // per-block "stored unrotated → rotate on read" flag rides in
-    // block_table bit 31 (free — the K-loop already loads block_table
-    // for addressing), so there is NO separate flag buffer. Only
-    // accessed when ATTN_ROPE_ON_READ; dead-eliminated otherwise.
-    device const T*     cos_sin      [[buffer(6)]],
-    device const uint*  tq_packed_k  [[buffer(7)]],
-    device const uint*  tq_packed_v  [[buffer(8)]],
-    device const float* tq_norms_k   [[buffer(9)]],
-    device const float* tq_norms_v   [[buffer(10)]],
-    device const float* tq_signs     [[buffer(11)]],
-    device const float* tq_centroids [[buffer(12)]],
-    device const uint*  slot_mapping [[buffer(13)]],
-    device const T*     tq_k_bias    [[buffer(14)]],
-    device const T*     tq_v_bias    [[buffer(15)]],
-    uint3  tg_pos    [[threadgroup_position_in_grid]],
-    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
-    uint   simd_lid  [[thread_index_in_simdgroup]])
+// Body shared by the dispatch kernels and the megakernel adapter (one virtual threadgroup of
+// 1024 threads — the dispatch's own — so no lane is ever dead and the control flow is the
+// kernel's). `C`: the constant policy (`AttnFc` / `AttnMk`); `OP` / `QP`: output / q; `KP`: the
+// KV pages' pointer type (the chunk tables hand out addresses); `PP` / `NP`: the TurboQuant packed
+// codes / norms — device-coherent in the megakernel, where other units wrote them.
+template <typename T, typename C, typename OP, typename QP, typename KP, typename PP, typename NP>
+METAL_FUNC void attention_via_cache_v2_body(
+    OP output,
+    QP q,
+    device const uint* seq_used_k,
+    device const uint* block_table,
+    device const uint64_t* k_cache,
+    device const uint64_t* v_cache,
+    device const T*     cos_sin,
+    PP                  tq_packed_k,
+    PP                  tq_packed_v,
+    NP                  tq_norms_k,
+    NP                  tq_norms_v,
+    device const float* tq_signs,
+    device const float* tq_centroids,
+    device const uint*  slot_mapping,
+    device const T*     tq_k_bias,
+    device const T*     tq_v_bias,
+    uint3  tg_pos,
+    uint   simd_gid,
+    uint   simd_lid,
+    threadgroup float* tg_outputs,  // [BN * BD]
+    threadgroup float* tg_max,      // [BN * 8]: [head][simdgroup], heads <= 8
+    threadgroup float* tg_sum,      // [BN * 8]
+    threadgroup float* tq_lut)      // [16]
 {
+    // Source order, not the compiler's: fast math lets the GPU compiler re-associate these sums,
+    // and HOW it does depends on the size of the function it compiles — this body inside the
+    // whole-forward megakernel re-associated differently than in its own dispatch kernel
+    // (Gemma-4 sliding attention, one bf16 ulp at one element, then diverging tokens). With
+    // re-association off both compile the same sums in the same order. Contraction likewise:
+    // fast math may fuse any multiply into any later add, and which it fuses differed between the
+    // two (Llama-3.2 fp16 KV, from the first decode step); `contract(on)` fuses only a multiply-add
+    // the source writes as one expression, the same in both.
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(on)
     constexpr int BN = 32; // simdgroups per threadgroup
     constexpr int BD = 32; // lanes per simdgroup
     typedef float U;
     // Spans: block_table entries carry the unrotated flag in bit 31 when
-    // ATTN_ROR; mask it off for the physical block id. Compile-const
+    // C::ror(); mask it off for the physical block id. Compile-const
     // false (non-spans) → no mask, byte-identical.
-    const uint ATTN_BT_MASK = (ATTN_ROR != 0u) ? 0x7FFFFFFFu : 0xFFFFFFFFu;
+    const uint ATTN_BT_MASK = (C::ror() != 0u) ? 0x7FFFFFFFu : 0xFFFFFFFFu;
 
-    const uint head_dim    = ATTN_HEAD_DIM;
-    const uint num_q       = ATTN_NUM_Q_HEADS;
-    const uint num_kv      = ATTN_NUM_KV_HEADS;
-    const uint block_size  = ATTN_BLOCK_SIZE;
-    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
-    const float scale      = ATTN_SCALE_FC;
+    const uint head_dim    = C::head_dim();
+    const uint num_q       = C::num_q();
+    const uint num_kv      = C::num_kv();
+    const uint block_size  = C::block_size();
+    const uint max_blocks  = C::max_blocks();
+    const float scale      = C::scale();
 
     const uint qk_per_thread = head_dim / uint(BD);
-    // Query heads this threadgroup serves (ATTN_TQ_HEADS): `heads`
+    // Query heads this threadgroup serves (C::tq_heads()): `heads`
     // consecutive heads of one KV head; per-head state is indexed
     // `[h * qk_per_thread + j]`.
-    const uint heads = (ATTN_TQ != 0u) ? ATTN_TQ_HEADS : 1u;
+    const uint heads = C::tq_heads();
 
     const uint seq_idx     = tg_pos.x;            // batch index
     const uint q_head_idx  = tg_pos.y * heads;    // first of `heads` query heads
@@ -686,16 +760,12 @@ template <typename T>
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
-    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim <= 512)
-    thread U o_reg[32];                 // [h * qk_per_thread + j], <= 32 (ATTN_TQ_HEADS)
+    thread U q_reg[32];                 // [h * qk_per_thread + j], <= 32 (C::tq_heads())
+    thread U o_reg[32];                 // [h * qk_per_thread + j], <= 32 (C::tq_heads())
 
-    // Threadgroup scratch for per-simdgroup max + sum_exp combine.
-    threadgroup U tg_outputs[BN * BD];
-    threadgroup U tg_max[BN * 8];       // [head][simdgroup], heads <= 8
-    threadgroup U tg_sum[BN * 8];
 
-    device const T*    q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       T*    o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
+    auto               q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
+    auto               o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
     device const uint* row_block_table = block_table + seq_idx * max_blocks;
 
     // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
@@ -703,18 +773,21 @@ template <typename T>
     // NeoX pairs under ATTN_PAIR_CORESIDENT) — Q must match K's per-lane set.
     // Under TurboQuant only the rare plain-domain keys (the tail, span blocks)
     // use it, and they read it per head from q_row instead (`q_plain`).
-    if (ATTN_TQ == 0u) {
-        for (uint i = 0; i < qk_per_thread; ++i) {
-            q_reg[i] = U(scale) * U(q_row[attn_elem_off(simd_lid, i, qk_per_thread, head_dim)]);
+    if (C::tq() == 0u) {
+        for (uint h = 0; h < heads; ++h) {
+            for (uint i = 0; i < qk_per_thread; ++i) {
+                q_reg[h * qk_per_thread + i] = U(scale) * U(q_row[h * head_dim
+                    + attn_elem_off<C>(simd_lid, i, qk_per_thread, head_dim)]);
+            }
         }
     }
     for (uint i = 0; i < heads * qk_per_thread; ++i) {
         o_reg[i] = 0;
     }
     auto q_plain = [&](uint h, uint j) -> U {
-        return ATTN_TQ == 0u
-            ? q_reg[j]
-            : U(scale) * U(q_row[h * head_dim + attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+        return C::tq() == 0u
+            ? q_reg[h * qk_per_thread + j]
+            : U(scale) * U(q_row[h * head_dim + attn_elem_off<C>(simd_lid, j, qk_per_thread, head_dim)]);
     };
 
     // TurboQuant: q rotated into the codebook domain, `s²·H·D·q`. The
@@ -725,8 +798,7 @@ template <typename T>
     // registers. The codebook (<= 16 centroids) is staged once.
     const uint tq_e = simd_lid * qk_per_thread;
     thread U qt_reg[32];
-    threadgroup U tq_lut[16];
-    if (ATTN_TQ != 0u) {
+    if (C::tq() != 0u) {
         for (uint h = 0; h < heads; ++h) {
             thread U* qt = qt_reg + h * qk_per_thread;
             for (uint j = 0; j < qk_per_thread; ++j) {
@@ -738,43 +810,43 @@ template <typename T>
             }
         }
         const uint tid = simd_gid * uint(BD) + simd_lid;
-        if (tid < (1u << ATTN_TQ)) {
+        if (tid < (1u << C::tq())) {
             tq_lut[tid] = tq_centroids[tid];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const uint tq_pdim = (ATTN_TQ == 0u) ? 0u : (head_dim + 32u / ATTN_TQ - 1u) / (32u / ATTN_TQ);
+    const uint tq_pdim = (C::tq() == 0u) ? 0u : (head_dim + 32u / C::tq() - 1u) / (32u / C::tq());
 
     // TurboQuant K bias: q·R_i·b = Σ_d (kb_a[d]·cos_{i,d} + kb_b[d]·sin_{i,d}) + kb_c
-    // over the NeoX pairs (d, d + ATTN_PAIR_OFF), d < ATTN_ROT_DIM/2, plus the
+    // over the NeoX pairs (d, d + C::pair_off()), d < C::rot_dim()/2, plus the
     // unrotated rest (kb_c). Per query; lane l owns the `kb_np` adjacent pairs
     // from d = l·kb_np, so each key's cos/sin reads are contiguous per lane.
     device const T* kb = tq_k_bias + kv_head_idx * head_dim;
     device const T* vb = tq_v_bias + kv_head_idx * head_dim;
-    const uint kb_np = (ATTN_ROT_DIM / 2u + 31u) / 32u;
+    const uint kb_np = (C::rot_dim() / 2u + 31u) / 32u;
     thread U kb_a[16];                  // [h * kb_np + j]
     thread U kb_b[16];
     thread U kb_c[8];
-    if (ATTN_TQ_KB) {
-        const uint half_rot = ATTN_ROT_DIM / 2u;
+    if (C::tq_kb()) {
+        const uint half_rot = C::rot_dim() / 2u;
         for (uint h = 0; h < heads; ++h) {
-            device const T* qh = q_row + h * head_dim;
+            auto qh = q_row + h * head_dim;
             for (uint j = 0; j < kb_np; ++j) {
                 const uint d = simd_lid * kb_np + j;
                 kb_a[h * kb_np + j] = 0;
                 kb_b[h * kb_np + j] = 0;
                 if (d < half_rot) {
                     const U q0 = U(scale) * U(qh[d]);
-                    const U q1 = U(scale) * U(qh[d + ATTN_PAIR_OFF]);
+                    const U q1 = U(scale) * U(qh[d + C::pair_off()]);
                     const U b0 = U(kb[d]);
-                    const U b1 = U(kb[d + ATTN_PAIR_OFF]);
+                    const U b1 = U(kb[d + C::pair_off()]);
                     kb_a[h * kb_np + j] = q0 * b0 + q1 * b1;
                     kb_b[h * kb_np + j] = q1 * b0 - q0 * b1;
                 }
             }
             U c = 0;
             for (uint e = simd_lid; e < head_dim; e += 32u) {
-                if (e >= half_rot && (e < ATTN_PAIR_OFF || e >= ATTN_PAIR_OFF + half_rot)) {
+                if (e >= half_rot && (e < C::pair_off() || e >= C::pair_off() + half_rot)) {
                     c += U(scale) * U(qh[e]) * U(kb[e]);
                 }
             }
@@ -798,15 +870,15 @@ template <typename T>
     // cache its writer just filled, exactly as the dequant path read it. A
     // reused span block's slot is the write-skip sentinel: nothing was
     // written, and that key lives only in the packed store.
-    const bool tail_in_cache = (ATTN_TQ == 0u) || (slot_mapping[seq_idx] != 0xFFFFFFFFu);
+    const bool tail_in_cache = (C::tq() == 0u) || (slot_mapping[seq_idx] != 0xFFFFFFFFu);
     // For each key, simdgroup `simd_gid` handles tokens at indices
     // simd_gid, simd_gid+BN, simd_gid+2*BN, ... The simdgroup that
     // overshoots `kv_len` skips its iteration and contributes 0.
     for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
         // Sliding window: decode Q sits at absolute position kv_len-1;
         // skip keys older than the window. Branch is simdgroup-uniform
-        // (i derives from simd_gid) and folds away when ATTN_WINDOW=0.
-        if (ATTN_WINDOW > 0 && (int(kv_len) - 1 - int(i)) >= ATTN_WINDOW) {
+        // (i derives from simd_gid) and folds away when C::window()=0.
+        if (C::window() > 0 && (int(kv_len) - 1 - int(i)) >= C::window()) {
             continue;
         }
         // Resolve paged cache pointer for token i in this simdgroup.
@@ -816,11 +888,11 @@ template <typename T>
         // Spans: bit 31 = this block's K is stored unrotated → rotate on
         // read. Free — bt_raw is loaded for addressing anyway. Uniform
         // across the simdgroup (same block per simdgroup-iteration).
-        const bool do_rot = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
+        const bool do_rot = (C::ror() != 0u) && ((bt_raw & 0x80000000u) != 0u);
         const uint token_in_block = i - logical_block * block_size;
         // TurboQuant: every key but the tail comes from the packed store,
         // indexed by physical slot (bit 31 stripped — spans or not).
-        const bool packed = (ATTN_TQ != 0u) && !(tail_in_cache && i + 1u == kv_len);
+        const bool packed = (C::tq() != 0u) && !(tail_in_cache && i + 1u == kv_len);
         const uint tq_row =
             ((bt_raw & 0x7FFFFFFFu) * block_size + token_in_block) * num_kv + kv_head_idx;
 
@@ -830,8 +902,8 @@ template <typename T>
         }
         U k_scale = 1;
         U k_off[8];                     // this lane's share of q·R_i·b (TurboQuant K bias)
-        const bool k_biased = ATTN_TQ_KB && packed && !do_rot;
-        device const T* v_ptr = nullptr;
+        const bool k_biased = C::tq_kb() && packed && !do_rot;
+        KP v_ptr = nullptr;
         if (packed) {
             const uint k_word = tq_row * tq_pdim;
             if (do_rot) {
@@ -841,17 +913,17 @@ template <typename T>
                 // re-rope it in the plain domain.
                 U k_loc[16];
                 for (uint j = 0; j < qk_per_thread; ++j) {
-                    k_loc[j] = tq_lut[tq_code(tq_packed_k, k_word,
-                                              attn_elem_off(simd_lid, j, qk_per_thread, head_dim))];
+                    k_loc[j] = tq_lut[tq_code<C>(tq_packed_k, k_word,
+                                              attn_elem_off<C>(simd_lid, j, qk_per_thread, head_dim))];
                 }
                 tq_wht(k_loc, qk_per_thread, simd_lid);
                 const U k_norm = tq_norms_k[tq_row] / U(head_dim);
                 for (uint j = 0; j < qk_per_thread; ++j) {
-                    const uint e = attn_elem_off(simd_lid, j, qk_per_thread, head_dim);
+                    const uint e = attn_elem_off<C>(simd_lid, j, qk_per_thread, head_dim);
                     const U x = k_loc[j] * tq_signs[e] * k_norm;
-                    k_loc[j] = U(T(ATTN_TQ_KB ? x + U(kb[e]) : x));
+                    k_loc[j] = U(T(C::tq_kb() ? x + U(kb[e]) : x));
                 }
-                attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
+                attn_rope_on_read<T, C>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
                 for (uint h = 0; h < heads; ++h) {
                     for (uint j = 0; j < qk_per_thread; ++j) {
                         score[h] += q_plain(h, j) * k_loc[j];
@@ -860,7 +932,7 @@ template <typename T>
             } else {
                 U k_code[16];
                 for (uint j = 0; j < qk_per_thread; ++j) {
-                    k_code[j] = tq_lut[tq_code(tq_packed_k, k_word, tq_e + j)];
+                    k_code[j] = tq_lut[tq_code<C>(tq_packed_k, k_word, tq_e + j)];
                 }
                 for (uint h = 0; h < heads; ++h) {
                     for (uint j = 0; j < qk_per_thread; ++j) {
@@ -870,13 +942,13 @@ template <typename T>
                 k_scale = tq_norms_k[tq_row];
                 if (k_biased) {
                     const uint d0 = simd_lid * kb_np;
-                    device const T* cos_row = cos_sin + i * ATTN_ROT_DIM + d0;
-                    device const T* sin_row = cos_row + ATTN_ROT_DIM / 2u;
+                    device const T* cos_row = cos_sin + i * C::rot_dim() + d0;
+                    device const T* sin_row = cos_row + C::rot_dim() / 2u;
                     for (uint h = 0; h < heads; ++h) {
                         k_off[h] = 0;
                     }
                     for (uint j = 0; j < kb_np; ++j) {
-                        if (d0 + j < ATTN_ROT_DIM / 2u) {
+                        if (d0 + j < C::rot_dim() / 2u) {
                             const U c = U(cos_row[j]);
                             const U s = U(sin_row[j]);
                             for (uint h = 0; h < heads; ++h) {
@@ -888,7 +960,7 @@ template <typename T>
             }
         } else {
             // Chunked KV: deref the chunk backing this physical block.
-            // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+            // C::blocks_per_chunk() is a function constant. When set to 0 the
             // compiler dead-eliminates the chunked branch — used by the
             // single-buffer-per-layer mode where `k_cache[0]` holds the layer
             // base address and physical_block is the full offset (no modulo,
@@ -896,22 +968,22 @@ template <typename T>
             // the reactive chunked KV pool.
             uint chunk;
             uint blk_in_chunk;
-            if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+            if (C::blocks_per_chunk() == 0u) {
                 chunk = 0u;
                 blk_in_chunk = physical_block;
             } else {
-                chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
-                blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+                chunk = physical_block / C::blocks_per_chunk();
+                blk_in_chunk = physical_block % C::blocks_per_chunk();
             }
             // Row base (no per-lane offset); element ownership via
             // attn_elem_off — contiguous, or co-resident NeoX pairs.
-            device const T* k_ptr =
-                (device const T*)k_cache[chunk]
+            KP k_ptr =
+                (KP)k_cache[chunk]
                 + blk_in_chunk   * kv_blk_stride
                 + kv_head_idx    * kv_head_stride
                 + token_in_block * kv_tok_stride;
             v_ptr =
-                (device const T*)v_cache[chunk]
+                (KP)v_cache[chunk]
                 + blk_in_chunk   * kv_blk_stride
                 + kv_head_idx    * kv_head_stride
                 + token_in_block * kv_tok_stride;
@@ -923,10 +995,10 @@ template <typename T>
             // parity guarantee).
             U k_loc[16];
             for (uint j = 0; j < qk_per_thread; ++j) {
-                k_loc[j] = U(k_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                k_loc[j] = U(k_ptr[attn_elem_off<C>(simd_lid, j, qk_per_thread, head_dim)]);
             }
             if (do_rot) {
-                attn_rope_on_read<T>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
+                attn_rope_on_read<T, C>(k_loc, qk_per_thread, simd_lid, i, cos_sin);
             }
             for (uint h = 0; h < heads; ++h) {
                 for (uint j = 0; j < qk_per_thread; ++j) {
@@ -958,23 +1030,23 @@ template <typename T>
         if (packed) {
             const uint v_word = tq_row * tq_pdim;
             for (uint j = 0; j < qk_per_thread; ++j) {
-                v_loc[j] = tq_lut[tq_code(tq_packed_v, v_word, tq_e + j)];
+                v_loc[j] = tq_lut[tq_code<C>(tq_packed_v, v_word, tq_e + j)];
             }
             const U v_norm = tq_norms_v[tq_row];
             for (uint h = 0; h < heads; ++h) {
                 exp_score[h] *= v_norm;
             }
-        } else if (ATTN_TQ != 0u) {
+        } else if (C::tq() != 0u) {
             // The tail's plain V into the codebook domain: s²·D·H·(H·D·v) = v.
             // Centered like the packed codes; the bias returns at the output.
             for (uint j = 0; j < qk_per_thread; ++j) {
                 const U v = U(v_ptr[tq_e + j]);
-                v_loc[j] = (ATTN_TQ_VB ? v - U(vb[tq_e + j]) : v) * tq_signs[tq_e + j];
+                v_loc[j] = (C::tq_vb() ? v - U(vb[tq_e + j]) : v) * tq_signs[tq_e + j];
             }
             tq_wht(v_loc, qk_per_thread, simd_lid);
         } else {
             for (uint j = 0; j < qk_per_thread; ++j) {
-                v_loc[j] = U(v_ptr[attn_elem_off(simd_lid, j, qk_per_thread, head_dim)]);
+                v_loc[j] = U(v_ptr[attn_elem_off<C>(simd_lid, j, qk_per_thread, head_dim)]);
             }
         }
         for (uint h = 0; h < heads; ++h) {
@@ -1028,7 +1100,7 @@ template <typename T>
     // The combine transposes lane<->simdgroup, so simdgroup `simd_gid`
     // now owns the element set that lane `simd_gid` owned during the K
     // loop.
-    if (ATTN_TQ != 0u) {
+    if (C::tq() != 0u) {
         // Codebook-domain output: gather it back into lane slices and
         // rotate once, o = s²·D·H·a — simdgroup `h` for head `h`.
         if (simd_lid == 0) {
@@ -1048,19 +1120,95 @@ template <typename T>
             tq_wht(o_loc, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
                 const U o = o_loc[j] * tq_signs[tq_e + j] / U(head_dim);
-                o_row[simd_gid * head_dim + tq_e + j] = T(ATTN_TQ_VB ? o + U(vb[tq_e + j]) : o);
+                o_row[simd_gid * head_dim + tq_e + j] = T(C::tq_vb() ? o + U(vb[tq_e + j]) : o);
             }
         }
     } else if (simd_lid == 0) {
-        // Lane 0 of each simdgroup writes its qk_per_thread output slice.
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_row[attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] = T(o_reg[j]);
+        // Lane 0 of each simdgroup writes its qk_per_thread output slice of each head.
+        for (uint h = 0; h < heads; ++h) {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_row[h * head_dim + attn_elem_off<C>(simd_gid, j, qk_per_thread, head_dim)] =
+                    T(o_reg[h * qk_per_thread + j]);
+            }
         }
     }
 }
 
-#define INSTANTIATE_ATTENTION_VIA_CACHE_V2(name, T)                                   \
-    template [[host_name(name)]] [[kernel]]                                            \
+// Megakernel adapter: output (0), the KV pages (via 4 / 5) and the TurboQuant stores (7-10)
+// device-coherent; tg_outputs / tg_max / tg_sum / tq_lut in the region. q (1) — written by another
+// unit — is copied (device-coherently, once) into the region and the body reads the copy: the
+// body's q loads must stay ordinary loads, which the compiler hoists and CSEs exactly as in the
+// dispatch kernel. (Read through coherent-load intrinsics, which it cannot move, the loop-invariant
+// `scale · q` is re-associated with the key — different bits whenever the scale is no power of 2.)
+template <typename T, typename C>
+MK_FUNC void mk_attention_via_cache_v2(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+    threadgroup float* region = (threadgroup float*)mk_region(s, l, tg);
+    // The rows the body reads: `heads` query heads from `q_head_idx` of sequence `seq_idx`.
+    const uint heads = C::tq_heads();
+    const uint row = (l.tg_pos.x * C::num_q() + l.tg_pos.y * heads) * C::head_dim();
+    threadgroup T* q_copy = (threadgroup T*)(region + ATTN_MK_TG_FLOATS);
+    mk_cptr<T> q = (mk_cptr<T>)s.addr[1] + row;
+    for (uint i = l.tid; i < heads * C::head_dim(); i += l.tpg.x) {
+        q_copy[i] = q[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    attention_via_cache_v2_body<T, C, mk_ptr<T>, threadgroup const T*, mk_cptr<T>, mk_cptr<uint>,
+                                mk_cptr<float>>(
+        (mk_ptr<T>)s.addr[0], (threadgroup const T*)q_copy - row, (device const uint*)s.addr[2],
+        (device const uint*)s.addr[3], (device const uint64_t*)s.addr[4],
+        (device const uint64_t*)s.addr[5], (device const T*)s.addr[6],
+        (mk_cptr<uint>)s.addr[7], (mk_cptr<uint>)s.addr[8], (mk_cptr<float>)s.addr[9],
+        (mk_cptr<float>)s.addr[10], (device const float*)s.addr[11],
+        (device const float*)s.addr[12], (device const uint*)s.addr[13],
+        (device const T*)s.addr[14], (device const T*)s.addr[15], l.tg_pos, l.simd_gid, l.simd_lid,
+        region, region + 1024, region + 1024 + 256, region + 1024 + 512);
+}
+
+#ifndef MK_BODIES_ONLY
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2(
+    device       T* output         [[buffer(0)]],
+    device const T* q              [[buffer(1)]],
+    device const uint* seq_used_k  [[buffer(2)]],
+    device const uint* block_table [[buffer(3)]],
+    device const uint64_t* k_cache [[buffer(4)]],
+    device const uint64_t* v_cache [[buffer(5)]],
+    // Rope-on-read (spans): cos/sin for the active layer class. The
+    // per-block "stored unrotated → rotate on read" flag rides in
+    // block_table bit 31 (free — the K-loop already loads block_table
+    // for addressing), so there is NO separate flag buffer. Only
+    // accessed when ATTN_ROPE_ON_READ; dead-eliminated otherwise.
+    device const T*     cos_sin      [[buffer(6)]],
+    device const uint*  tq_packed_k  [[buffer(7)]],
+    device const uint*  tq_packed_v  [[buffer(8)]],
+    device const float* tq_norms_k   [[buffer(9)]],
+    device const float* tq_norms_v   [[buffer(10)]],
+    device const float* tq_signs     [[buffer(11)]],
+    device const float* tq_centroids [[buffer(12)]],
+    device const uint*  slot_mapping [[buffer(13)]],
+    device const T*     tq_k_bias    [[buffer(14)]],
+    device const T*     tq_v_bias    [[buffer(15)]],
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 32; // simdgroups per threadgroup
+    constexpr int BD = 32; // lanes per simdgroup
+    typedef float U;
+    // Threadgroup scratch for per-simdgroup max + sum_exp combine.
+    threadgroup U tg_outputs[BN * BD];
+    threadgroup U tg_max[BN * 8];       // [head][simdgroup], heads <= 8
+    threadgroup U tg_sum[BN * 8];
+    threadgroup U tq_lut[16];
+    attention_via_cache_v2_body<T, AttnFc, device T*, device const T*, device const T*,
+                                device const uint*, device const float*>(
+        output, q, seq_used_k, block_table, k_cache, v_cache, cos_sin, tq_packed_k, tq_packed_v,
+        tq_norms_k, tq_norms_v, tq_signs, tq_centroids, slot_mapping, tq_k_bias, tq_v_bias, tg_pos,
+        simd_gid, simd_lid, tg_outputs, tg_max, tg_sum, tq_lut);
+}
+
+#define INSTANTIATE_ATTENTION_VIA_CACHE_V2(tag, T)                                    \
+    template [[host_name("attention_via_cache_v2_" #tag "_specialized")]] [[kernel]]   \
     void attention_via_cache_v2<T>(                                                    \
         device T* output [[buffer(0)]], device const T* q [[buffer(1)]],               \
         device const uint* seq_used_k [[buffer(2)]],                                   \
@@ -1080,9 +1228,18 @@ template <typename T>
         uint3 tg_pos [[threadgroup_position_in_grid]],                                 \
         uint simd_gid [[simdgroup_index_in_threadgroup]],                              \
         uint simd_lid [[thread_index_in_simdgroup]]);
+#else
+// tg_outputs[1024] + tg_max[256] + tg_sum[256] + tq_lut[16] float, then the q copy (at most
+// 1024 elements: heads · head_dim / 32 <= 32).
+#define INSTANTIATE_ATTENTION_VIA_CACHE_V2(tag, T)                                             \
+    MK_ADAPTER(attention_via_cache_v2_##tag##_specialized, 8256, 0x7b3,                         \
+               (mk_attention_via_cache_v2<T, AttnMk<MK_C>>), ATTN_CONSTS)
+#endif
 
-INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_f16_specialized", half)
-INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bfloat)
+INSTANTIATE_ATTENTION_VIA_CACHE_V2(f16, half)
+INSTANTIATE_ATTENTION_VIA_CACHE_V2(bf16, bfloat)
+
+#ifndef MK_BODIES_ONLY
 
 // ─────────────────────────────────────────────────────────────────────
 // attention_prefill_sdpa_v2_paged — paged-cache variant of the prefill
@@ -2306,3 +2463,4 @@ kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
         o_ptr[j] = bfloat(o_reg[j] * inv);
     }
 }
+#endif // MK_BODIES_ONLY

@@ -1287,63 +1287,6 @@ impl InstructionInfo for Instruction {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::SynthPreAttn(
-                residual_slot,
-                delta_slot,
-                out_slot,
-                residual_out_slot,
-                layer,
-                _group_size,
-                _bits,
-                _symbol,
-                _has_linear_bias,
-            ) => (
-                "SynthPreAttn",
-                vec![
-                    F::Slot(residual_slot),
-                    F::Slot(delta_slot),
-                    F::Slot(out_slot),
-                    F::Slot(residual_out_slot),
-                    F::Layer(layer),
-                    F::LayerKind("LinearLayer"),
-                ],
-            ),
-            Instruction::SynthMlpPreDown(
-                residual_slot,
-                delta_slot,
-                out_slot,
-                residual_out_slot,
-                layer,
-                _group_size,
-                _bits,
-                _symbol,
-            ) => (
-                "SynthMlpPreDown",
-                vec![
-                    F::Slot(residual_slot),
-                    F::Slot(delta_slot),
-                    F::Slot(out_slot),
-                    F::Slot(residual_out_slot),
-                    F::Layer(layer),
-                    F::LayerKind("LinearLayer"),
-                ],
-            ),
-            Instruction::SynthGateUpSiluMul(
-                x_norm_slot,
-                out_slot,
-                layer,
-                _group_size,
-                _bits,
-                _symbol,
-            ) => (
-                "SynthGateUpSiluMul",
-                vec![
-                    F::Slot(x_norm_slot),
-                    F::Slot(out_slot),
-                    F::Layer(layer),
-                    F::LayerKind("LinearLayer"),
-                ],
-            ),
             Instruction::SiluMul(gate_slot, up_slot, out_slot, width) => (
                 "SiluMul",
                 vec![

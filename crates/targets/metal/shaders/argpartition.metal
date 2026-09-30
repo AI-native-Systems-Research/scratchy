@@ -31,6 +31,7 @@
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
@@ -276,24 +277,34 @@ struct KernelMergeSort {
 
   MLX_MTL_CONST short N_PER_BLOCK = BLOCK_THREADS * N_PER_THREAD;
 
+  // Shared by the dispatch kernel and the megakernel adapter. `MK`: the barrier-uniform form —
+  // a lane outside a real virtual threadgroup (`!live`) sorts padding and stores nothing, but
+  // runs every barrier. The kernel names its own pointer / scalar-reference types.
+  template <bool MK = false, typename IP, typename OP, typename CI>
   static METAL_FUNC void block_sort_impl(
-      const device T* inp,
-      device U* out,
-      const constant int& size_sorted_axis,
-      const constant int& in_stride_sorted_axis,
-      const constant int& out_stride_sorted_axis,
-      const constant int& in_stride_segment_axis,
-      const constant int& out_stride_segment_axis,
+      IP inp,
+      OP out,
+      CI size_sorted_axis,
+      CI in_stride_sorted_axis,
+      CI out_stride_sorted_axis,
+      CI in_stride_segment_axis,
+      CI out_stride_segment_axis,
       threadgroup ValT* tgp_vals,
       threadgroup IdxT* tgp_idxs,
       uint3 tid,
-      uint3 lid) {
+      uint3 lid,
+      bool live = true) {
     inp += tid.y * in_stride_segment_axis;
     out += tid.y * out_stride_segment_axis;
 
     for (short i = lid.x; i < N_PER_BLOCK; i += BLOCK_THREADS) {
-      tgp_vals[i] = i < size_sorted_axis ? inp[i * in_stride_sorted_axis]
-                                         : ValT(CompareOp::init);
+      if constexpr (MK) {
+        tgp_vals[i] = live && i < size_sorted_axis ? inp[i * in_stride_sorted_axis]
+                                                   : ValT(CompareOp::init);
+      } else {
+        tgp_vals[i] = i < size_sorted_axis ? inp[i * in_stride_sorted_axis]
+                                           : ValT(CompareOp::init);
+      }
       if (ARG_SORT) {
         tgp_idxs[i] = i;
       }
@@ -303,6 +314,11 @@ struct KernelMergeSort {
     block_merge_sort_t::sort(tgp_vals, tgp_idxs, size_sorted_axis, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    if constexpr (MK) {
+      if (!live) {
+        return;
+      }
+    }
     for (int i = lid.x; i < size_sorted_axis; i += BLOCK_THREADS) {
       if (ARG_SORT) {
         out[i * out_stride_sorted_axis] = tgp_idxs[i];
@@ -313,6 +329,25 @@ struct KernelMergeSort {
   }
 };
 
+// Megakernel adapter of the contiguous arg-sort: inp (0) / out (1) coherent, the five sizes the
+// inline scalars by reference; `BYTES` (the instantiation line's declared threadgroup bytes) is
+// checked against the kernel's own arrays.
+template <typename T, short BLOCK_THREADS, short N_PER_THREAD, uint BYTES>
+MK_FUNC void mk_arg_block_sort(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+  using sort_kernel = KernelMergeSort<T, uint, true, BLOCK_THREADS, N_PER_THREAD>;
+  using ValT = typename sort_kernel::ValT;
+  using IdxT = typename sort_kernel::IdxT;
+  constexpr uint vals = sort_kernel::N_PER_BLOCK * sizeof(ValT);
+  static_assert(BYTES == vals + sort_kernel::N_PER_BLOCK * sizeof(IdxT), "declared tg bytes");
+  threadgroup uchar* region = mk_region(s, l, tg);
+  sort_kernel::template block_sort_impl<true, mk_cptr<T>, mk_ptr<uint>, const device int&>(
+      (mk_cptr<T>)s.addr[0], (mk_ptr<uint>)s.addr[1], *(const device int*)s.addr[2],
+      *(const device int*)s.addr[3], *(const device int*)s.addr[4],
+      *(const device int*)s.addr[5], *(const device int*)s.addr[6],
+      (threadgroup ValT*)region, (threadgroup IdxT*)(region + vals), l.tg_pos, l.tid3, l.live);
+}
+
+#ifndef MK_BODIES_ONLY
 template <
     typename T,
     typename U,
@@ -338,7 +373,8 @@ block_sort(
   threadgroup ValT tgp_vals[sort_kernel::N_PER_BLOCK];
   if (ARG_SORT) {
     threadgroup IdxT tgp_idxs[sort_kernel::N_PER_BLOCK];
-    sort_kernel::block_sort_impl(
+    sort_kernel::template block_sort_impl<false, const device T*, device U*,
+                                          const constant int&>(
         inp,
         out,
         size_sorted_axis,
@@ -351,7 +387,8 @@ block_sort(
         tid,
         lid);
   } else {
-    sort_kernel::block_sort_impl(
+    sort_kernel::template block_sort_impl<false, const device T*, device U*,
+                                          const constant int&>(
         inp,
         out,
         size_sorted_axis,
@@ -379,7 +416,9 @@ block_sort(
 // upcasting load → float, sort as float, store back as bf16 — done
 // by an outer wrapper layer in the lowering arm.
 
-#define INSTANTIATE_ARG_SORT(itname, itype, bn, tn)                    \
+// `bytes`: the megakernel's threadgroup memory per virtual threadgroup — the kernel's sort arrays,
+// bn·tn·(sizeof(itype) + sizeof(uint)).
+#define INSTANTIATE_ARG_SORT(itname, itype, bn, tn, bytes)             \
   template [[host_name("c_arg_block_sort_" #itname "_uint32_bn" #bn    \
                        "_tn" #tn)]] [[kernel]] void                    \
   block_sort<itype, uint, true, bn, tn>(                               \
@@ -392,14 +431,19 @@ block_sort(
       const constant int& out_stride_segment_axis [[buffer(6)]],       \
       uint3 tid [[threadgroup_position_in_grid]],                      \
       uint3 lid [[thread_position_in_threadgroup]]);
+#else
+#define INSTANTIATE_ARG_SORT(itname, itype, bn, tn, bytes)                                      \
+  MK_ADAPTER(c_arg_block_sort_##itname##_uint32_bn##bn##_tn##tn, bytes, 0x3,                 \
+             (mk_arg_block_sort<itype, bn, tn, bytes>), MK_NO_CONSTS)
+#endif
 
-INSTANTIATE_ARG_SORT(float32, float, 32, 4)
-INSTANTIATE_ARG_SORT(float16, half, 32, 4)
-INSTANTIATE_ARG_SORT(bfloat16, bfloat, 32, 4)
-INSTANTIATE_ARG_SORT(uint32, uint, 32, 4)
-INSTANTIATE_ARG_SORT(float32, float, 64, 4)
-INSTANTIATE_ARG_SORT(uint32, uint, 64, 4)
+INSTANTIATE_ARG_SORT(float32, float, 32, 4, 1024)
+INSTANTIATE_ARG_SORT(float16, half, 32, 4, 768)
+INSTANTIATE_ARG_SORT(bfloat16, bfloat, 32, 4, 768)
+INSTANTIATE_ARG_SORT(uint32, uint, 32, 4, 1024)
+INSTANTIATE_ARG_SORT(float32, float, 64, 4, 2048)
+INSTANTIATE_ARG_SORT(uint32, uint, 64, 4, 2048)
 // bn=64 tn=4 ⇒ N_PER_BLOCK=256: Qwen3.5-MoE router (E=256). The bn=32
 // variants above cap at 128 experts.
-INSTANTIATE_ARG_SORT(float16, half, 64, 4)
-INSTANTIATE_ARG_SORT(bfloat16, bfloat, 64, 4)
+INSTANTIATE_ARG_SORT(float16, half, 64, 4, 1536)
+INSTANTIATE_ARG_SORT(bfloat16, bfloat, 64, 4, 1536)

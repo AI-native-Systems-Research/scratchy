@@ -65,7 +65,7 @@ pub struct ForwardCtx<'a> {
     /// sequence's first (fresh) forward. `None` for non-hybrid arches.
     pub gdn_is_fresh: Option<TensorView<'a>>,
     /// `true` when at least one req in this forward carries `spec_token_ids`
-    /// (= a spec-decode verify batch). Threaded through to `gate_matches` so
+    /// (= a spec-decode verify batch). Threaded through to `RuntimeGate::admits` so
     /// the lm_head slice trio (gated `OnlyIfSingleSeqNoSpec`) skips and the
     /// full `M=bucket_m` lm_head fallback (gated `OnlyIfMultiSeqOrSpec`) fires.
     /// Caller sets `false` for prefill / decode / lockstep / draft chain.

@@ -119,7 +119,7 @@ fn run_lower(
     cap: u32,
     profile: &MetalTargetProfile,
     chunked: bool,
-) -> Result<LoweredMetalTape, BakeDefect> {
+) -> Result<tl::Lowered, BakeDefect> {
     let at = tl::BakePoint {
         chunked,
         bucket_m: input.bucket_m,
@@ -482,13 +482,29 @@ pub fn bake_bucket_tapes(
     for class in classes {
         let profile = profile_for(class);
         for chunked in [false, true] {
-            let t0 = run_lower(mc, input, CAP_ZERO, &profile, chunked)?;
-            let ta = run_lower(mc, input, CAP_A, &profile, chunked)?;
-            let tb = run_lower(mc, input, CAP_B, &profile, chunked)?;
-            let tc = run_lower(mc, input, CAP_CHECK, &profile, chunked)?;
-            let body = diff_probes(t0, &ta, &tb, &tc).map_err(BakeDefect)?;
+            let l0 = run_lower(mc, input, CAP_ZERO, &profile, chunked)?;
+            let ta = run_lower(mc, input, CAP_A, &profile, chunked)?.tape;
+            let tb = run_lower(mc, input, CAP_B, &profile, chunked)?.tape;
+            let tc = run_lower(mc, input, CAP_CHECK, &profile, chunked)?.tape;
+            let body = diff_probes(l0.tape, &ta, &tb, &tc).map_err(BakeDefect)?;
             let class_toks = crate::const_tokens::const_tokens(&class)
                 .map_err(|e| BakeDefect(format!("serialize class: {e}")))?;
+            // THE DECODE MEGAKERNEL: the bucket-1 tape of the M5 direct-addressing variant.
+            let megakernel = match (class, chunked, input.bucket_m) {
+                (GenClass::M5, false, 1) => {
+                    let (tape, const_patches, _) = &body;
+                    let mk = crate::megakernel_bake::bake_megakernel(
+                        tape,
+                        const_patches,
+                        &l0.row_commands,
+                        input.steps,
+                    )?;
+                    let toks = crate::const_tokens::const_tokens(&mk.as_slice())
+                        .map_err(|e| BakeDefect(format!("serialize megakernel: {e}")))?;
+                    quote! { megakernel: #toks, }
+                }
+                _ => TokenStream::new(),
+            };
             let body_ix = match seen.iter().position(|b| *b == body) {
                 Some(ix) => ix,
                 None => {
@@ -520,6 +536,7 @@ pub fn bake_bucket_tapes(
                                 tape: #tape_toks,
                                 const_patches: #cp_toks,
                                 scratch_patches: #sp_toks,
+                                megakernel: &[],
                             };
                     });
                     seen.push(body);
@@ -531,6 +548,7 @@ pub fn bake_bucket_tapes(
                 __tl::ClassedTape {
                     gen_class: #class_toks,
                     chunked: #chunked,
+                    #megakernel
                     ..#ident
                 },
             });

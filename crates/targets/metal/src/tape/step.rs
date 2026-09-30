@@ -460,14 +460,53 @@ impl RotaryTables {
     }
 }
 
-/// One bucket's step tape: the backbone and the lm_head halves, each with one barrier flag and
-/// one weight site per row. The default is the empty tape a refused canonical bakes.
+/// Memory a row can touch that another row of the same forward also touches — the barrier walk's
+/// hazard locations, named. Weights, runtime inputs and inline scalars are absent: no row writes
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MetalLoc {
+    Arena(Slot),
+    /// A layer's paged KV cache.
+    Kv(LayerId),
+    /// The MoE / GDN op scratch, ONE location.
+    OpScratch,
+    /// The KV codec's staging buffer, ONE location.
+    CodecStaging,
+    /// With the KV codec on: the ONE fp16 scratch every coded layer's cache half resolves to.
+    TqScratch,
+    /// With the KV codec on: a coded layer's own packed codes and norms.
+    TqStore(LayerId),
+}
+
+impl MetalLoc {
+    /// This location as it is in loop iteration `by` of a rolled body: a KV layer advances.
+    pub fn advanced(self, by: u32) -> Self {
+        match self {
+            Self::Kv(l) => Self::Kv(l.advance(by)),
+            Self::TqStore(l) => Self::TqStore(l.advance(by)),
+            Self::Arena(_) | Self::OpScratch | Self::CodecStaging | Self::TqScratch => self,
+        }
+    }
+}
+
+/// A row's dataflow: what its commands read and write. An in-place operand is in both lists; the
+/// rows one construct expanded to carry the construct's union (they fence as one).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowAccess {
+    pub reads: Vec<MetalLoc>,
+    pub writes: Vec<MetalLoc>,
+}
+
+/// One bucket's step tape: the backbone and the lm_head halves, each with one barrier flag, one
+/// weight site and one dataflow per row. The default is the empty tape a refused canonical bakes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MetalStepTape {
     pub backbone: Vec<StepRow>,
     pub backbone_barriers: Vec<bool>,
     pub backbone_sources: Vec<Vec<RowSource>>,
+    pub backbone_access: Vec<RowAccess>,
     pub lm_head: Vec<StepRow>,
     pub lm_head_barriers: Vec<bool>,
     pub lm_head_sources: Vec<Vec<RowSource>>,
+    pub lm_head_access: Vec<RowAccess>,
 }

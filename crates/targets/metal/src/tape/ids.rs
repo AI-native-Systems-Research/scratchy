@@ -241,7 +241,7 @@ u32_newtype!(
     /// The KV cache bindings are per-layer chunk-address tables (device
     /// uint64 gpuAddresses); a physical block id `pb` derefs
     /// `table[pb / BLOCKS_PER_CHUNK]` and addresses `pb % BLOCKS_PER_CHUNK`
-    /// within that chunk. Same value baked into the `SynthPreAttn` MSL.
+    /// within that chunk.
     BlocksPerChunk,
     /// Block-table fanout per sequence (`W::MAX_BLOCKS_PER_SEQ`).
     MaxBlocksPerSeq,

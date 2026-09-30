@@ -35,30 +35,31 @@
 // Dispatch: grid (num_seqs, ceil(conv_dim/tg), 1); one thread per (seq, channel).
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
-constant uint GDN_CONV_DIM    [[function_constant(0)]];
-constant uint GDN_CONV_KERNEL [[function_constant(1)]];
+#define GDN_CONV_CONSTS(X) X(uint, conv_dim, GDN_CONV_DIM, 0) X(uint, kernel_size, GDN_CONV_KERNEL, 1)
+#ifndef MK_BODIES_ONLY
+GDN_CONV_CONSTS(MK_FC_DECLARE)
+struct GdnConvFc {
+  GDN_CONV_CONSTS(MK_FC_ACCESSOR)
+};
+#endif
 
 // Upper bound for the register window/weights (kernel-1 and kernel). GDN conv
 // kernels are tiny (Qwen3.5 uses 4); 8 is a safe compile-time ceiling.
 constant constexpr uint GDN_CONV_KMAX = 8;
 
-template <typename T>
-[[kernel]] void gdn_conv1d_varlen(
-    device       float* conv_out      [[buffer(0)]],
-    const device T*     x             [[buffer(1)]],
-    const device T*     w             [[buffer(2)]],
-    device       float* conv_state    [[buffer(3)]],
-    const device int*   cu_seqlens    [[buffer(4)]],
-    const device int*   state_indices [[buffer(5)]],
-    const device uint*  is_fresh      [[buffer(6)]],
-    uint3 tgid [[threadgroup_position_in_grid]],
-    uint3 tpig [[thread_position_in_grid]])
+// Body shared by the dispatch kernels and the megakernel adapter: the thread at `tgid` / `tpig`.
+template <typename T, typename C, typename OP, typename XP>
+METAL_FUNC void gdn_conv1d_varlen_body(
+    OP conv_out, XP x, const device T* w, device float* conv_state,
+    const device int* cu_seqlens, const device int* state_indices, const device uint* is_fresh,
+    uint3 tgid, uint3 tpig)
 {
-  uint conv_dim = GDN_CONV_DIM;
-  uint kernel_size = GDN_CONV_KERNEL;
+  uint conv_dim = C::conv_dim();
+  uint kernel_size = C::kernel_size();
   uint state_len = kernel_size - 1;
 
   uint seq = tgid.x;
@@ -111,6 +112,35 @@ template <typename T>
   }
 }
 
+// Megakernel adapter: conv_out (0) and x (1) device-coherent; the layer's conv state is touched by
+// this step alone, one thread per (sequence, channel). Compiled alone: inlined into the megakernel,
+// the four-tap sum's products fuse into its adds differently than in the dispatch kernel.
+template <typename T, typename C>
+MK_FUNC_ALONE void mk_gdn_conv1d_varlen(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  gdn_conv1d_varlen_body<T, C>((mk_ptr<float>)s.addr[0], (mk_cptr<T>)s.addr[1],
+                               (const device T*)s.addr[2], (device float*)s.addr[3],
+                               (const device int*)s.addr[4], (const device int*)s.addr[5],
+                               (const device uint*)s.addr[6], l.tg_pos, mk_thread_in_grid(l));
+}
+
+#ifndef MK_BODIES_ONLY
+template <typename T>
+[[kernel]] void gdn_conv1d_varlen(
+    device       float* conv_out      [[buffer(0)]],
+    const device T*     x             [[buffer(1)]],
+    const device T*     w             [[buffer(2)]],
+    device       float* conv_state    [[buffer(3)]],
+    const device int*   cu_seqlens    [[buffer(4)]],
+    const device int*   state_indices [[buffer(5)]],
+    const device uint*  is_fresh      [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tpig [[thread_position_in_grid]])
+{
+  gdn_conv1d_varlen_body<T, GdnConvFc>(conv_out, x, w, conv_state, cu_seqlens, state_indices,
+                                       is_fresh, tgid, tpig);
+}
+
 #define INST_GDN_CONV1D_VARLEN(dtype_tag, mtl_type)                          \
   template [[host_name("gdn_conv1d_varlen_" #dtype_tag)]] [[kernel]] void    \
   gdn_conv1d_varlen<mtl_type>(                                               \
@@ -123,6 +153,11 @@ template <typename T>
       const device uint*     is_fresh      [[buffer(6)]],                    \
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint3 tpig [[thread_position_in_grid]]);
+#else
+#define INST_GDN_CONV1D_VARLEN(dtype_tag, mtl_type)                                       \
+  MK_ADAPTER(gdn_conv1d_varlen_##dtype_tag, 0, 0x3, (mk_gdn_conv1d_varlen<mtl_type, MK_C>), \
+             GDN_CONV_CONSTS)
+#endif
 
 INST_GDN_CONV1D_VARLEN(f16,  half)
 INST_GDN_CONV1D_VARLEN(bf16, bfloat)

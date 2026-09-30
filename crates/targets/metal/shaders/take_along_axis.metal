@@ -18,9 +18,35 @@
 // One thread per (n, k). Dispatch (top_k, N, 1).
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
+// Body shared by the dispatch kernel and the megakernel adapter (every operand coherent there;
+// the sizes are the inline scalars, by reference).
+template <typename SP, typename IP, typename OP, typename CI>
+METAL_FUNC void take_along_axis_body(SP src, IP indices, OP out, CI src_axis_size,
+                                     CI idx_axis_size, uint2 gid, uint2 grid) {
+  uint k = gid.x;
+  uint n = gid.y;
+  if (k >= grid.x || n >= grid.y) return;
+  uint idx = indices[n * uint(idx_axis_size) + k];
+  // No negative-index normalization: argpartition outputs u32 in
+  // [0, src_axis_size). MLX's `is_signed_v<IdxT>` branch is dead
+  // for our uint indices.
+  out[n * uint(idx_axis_size) + k] = src[n * uint(src_axis_size) + idx];
+}
+
+template <typename T>
+MK_FUNC void mk_take_along_axis(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  take_along_axis_body<mk_cptr<T>, mk_cptr<uint>, mk_ptr<T>, const device int&>(
+      (mk_cptr<T>)s.addr[0], (mk_cptr<uint>)s.addr[1], (mk_ptr<T>)s.addr[2],
+      *(const device int*)s.addr[3], *(const device int*)s.addr[4], mk_thread_in_grid(l).xy,
+      mk_threads_per_grid(s).xy);
+}
+
+#ifndef MK_BODIES_ONLY
 template <typename T>
 [[kernel]] void take_along_axis_2d_contig(
     const device T*    src        [[buffer(0)]],
@@ -30,14 +56,8 @@ template <typename T>
     const constant int& idx_axis_size [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 grid [[threads_per_grid]]) {
-  uint k = gid.x;
-  uint n = gid.y;
-  if (k >= grid.x || n >= grid.y) return;
-  uint idx = indices[n * uint(idx_axis_size) + k];
-  // No negative-index normalization: argpartition outputs u32 in
-  // [0, src_axis_size). MLX's `is_signed_v<IdxT>` branch is dead
-  // for our uint indices.
-  out[n * uint(idx_axis_size) + k] = src[n * uint(src_axis_size) + idx];
+  take_along_axis_body<const device T*, const device uint*, device T*, const constant int&>(
+      src, indices, out, src_axis_size, idx_axis_size, gid, grid);
 }
 
 #define INSTANTIATE_TAKE(tag, type)                                     \
@@ -50,6 +70,11 @@ template <typename T>
       const constant int& idx_axis_size [[buffer(4)]],                  \
       uint2 gid [[thread_position_in_grid]],                            \
       uint2 grid [[threads_per_grid]]);
+#else
+#define INSTANTIATE_TAKE(tag, type)                                                  \
+  MK_TAIL(take_along_axis_2d_contig_##tag, 0x7, (mk_take_along_axis<type>), \
+             MK_NO_CONSTS)
+#endif
 
 INSTANTIATE_TAKE(float32, float)
 INSTANTIATE_TAKE(float16, half)

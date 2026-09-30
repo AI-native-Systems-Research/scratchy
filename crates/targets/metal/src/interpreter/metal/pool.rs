@@ -28,7 +28,7 @@ use objc2_metal::{
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
 use super::forward::{ForwardError, ForwardInputs};
-use super::lowered::{LoweredMetalTape, ModelSources};
+use super::lowered::{LoweredMetalTape, MegakernelTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::RuntimeBindings;
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
@@ -262,6 +262,8 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape]>,
+    /// Each bucket's baked megakernel tapes (one per KV mode; empty for most buckets).
+    bucket_megakernels: Arc<[&'static [MegakernelTape]]>,
     /// Every model tensor the tapes bind, resolved once in [`Self::new`].
     sources: ResolvedSources,
     arena_layout: Arc<ArenaLayout>,
@@ -366,6 +368,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         allocator: Arc<MetalAllocator>,
         pipelines: Arc<SpecializedPipelines>,
         bucket_tapes: Arc<[LoweredMetalTape]>,
+        bucket_megakernels: Arc<[&'static [MegakernelTape]]>,
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
@@ -395,6 +398,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
+            bucket_megakernels,
             sources,
             arena_layout: Arc::new(arena_layout),
             runtime_factory,
@@ -473,12 +477,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 
         // Worker arena is sized for the largest activation across every
         // bucket, AND for the largest colored slot count across buckets.
-        // Slot counts can differ per bucket: a bucket whose solver picked
-        // a fusion that needs extra scratch — e.g. the synth pre-attn /
-        // mlp-pre-down kernels, which write the updated residual to a
-        // distinct `residual_out` slot instead of in place to avoid a
-        // cross-threadgroup race — carries more colored slots than a
-        // bucket that didn't. A bucket's tape only ever references slots
+        // Slot counts can differ per bucket: each bucket's tape is coloured
+        // on its own. A bucket's tape only ever references slots
         // in `0..its own num_arena_slots`, so an arena sized to the max
         // serves every bucket; smaller buckets simply leave the tail
         // slots resident and idle. `arena_bytes` is elementwise-maxed
@@ -497,16 +497,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
 
-        let mut cache = SpecializedPipelineCache::with_standard_shaders((*device).clone())
+        let cache = SpecializedPipelineCache::with_standard_shaders((*device).clone())
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
-        // Compiler-driven synthesis: each Metal arch exposes its macro-generated synthesized
-        // kernel metallibs via `W::synthesized_kernel_metallibs()`,
-        // loaded via `newLibraryWithData`.
-        for (name, bytes) in W::synthesized_kernel_metallibs() {
-            cache.register_metallib_library(name, bytes).map_err(|e| {
-                PoolBuildError::PipelineCacheBuild(format!("synthesized kernel `{name}`: {e:?}"))
-            })?;
-        }
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache)));
 
         // Select each bucket's macro-baked tape variant: generation
@@ -539,6 +531,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             "query heads per TurboQuant decode threadgroup"
         );
         let mut tapes: Vec<LoweredMetalTape> = Vec::with_capacity(bucket_specs.len());
+        let mut megakernels = Vec::with_capacity(bucket_specs.len());
         for spec in bucket_specs {
             let variant = spec
                 .tapes
@@ -551,6 +544,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     ),
                 })?;
             tapes.push(variant.materialize(block_cap_u32, tq_heads));
+            megakernels.push(variant.megakernel);
         }
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
 
@@ -560,6 +554,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
+            Arc::from(megakernels),
             arena_layout,
             runtime_factory,
             max_workers,
@@ -819,47 +814,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ) -> Result<(), ForwardError>,
     {
         self.ensure_mtl4();
-        // gemma3-mm SigLIP vision tower: the projector tail
-        // (`AvgPool2d -> soft_emb_norm -> mm_input_projection`) hits an
-        // in-command-buffer write→read coherence failure at the
-        // 4096-patch scale — the projector gemm reads the soft-emb-norm
-        // output as all-zero (→ silent all-zero vision embeds → garbled
-        // text) unless a CB boundary (commit + host-wait) separates the
-        // writer from the reader. No in-CB barrier fixes it (None,
-        // Device, or forced-on-every-dispatch all fail); only the CB
-        // boundary does. So run the WHOLE vision bucket as serialized
-        // single-dispatch segments (each its own CB + host-wait), the
-        // proven-correct execution from the dump replay. This is a
-        // once-per-image prefill path (vision towers have no argmax
-        // tail), so the per-segment host-wait overhead (~0.5 ms ×
-        // dispatches) is immaterial against the multi-second tower.
-        // The AvgPool2d-tape auto-trigger runs the segment at K=1.
-        let needs_serialized = worker.bucket_has_avg_pool_2d(bucket_idx);
-        if needs_serialized {
-            assert!(
-                tail.is_none(),
-                "serialized chunked forward does not support a tail hook \
-                 (vision towers have no argmax tail)",
-            );
-            let k = 1;
-            let total = worker.count_dispatches(bucket_idx);
-            let mut start = 0usize;
-            while start < total {
-                let end = (start + k).min(total);
-                self.run_dump_segment(
-                    worker,
-                    bucket_idx,
-                    num_tokens,
-                    num_seqs,
-                    has_spec_tokens,
-                    start..end,
-                )?;
-                start = end;
-            }
-            return Ok(());
-        }
         let trace = std::env::var_os("SCRATCHY_METAL_TRACE").is_some();
-        let ((), took) = self.submit(|enc| {
+        let ((), took) = self.submit(worker, |enc| {
             worker
                 .run_bucket_mtl4(
                     bucket_idx,
@@ -878,7 +834,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             Ok(())
         })?;
         if trace {
-            eprintln!("[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4] {took}");
+            eprintln!(
+                "[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4] {took} \
+                 megakernel_runs={}",
+                worker.megakernel_runs_played(),
+            );
         }
         Ok(())
     }
@@ -888,12 +848,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// fails, its error returns with the command buffer ended and nothing
     /// committed. Otherwise the command buffer is committed and this returns
     /// once the GPU is done with it ([`wait_drained`]) — completed, or failed
-    /// with the error the commit feedback reports — so nothing it reads is
+    /// with the error the commit feedback reports, or with the first bounded
+    /// wait a megakernel run of `worker` gave up on — so nothing it reads is
     /// still in use when the caller gets control back.
     ///
     /// [`wait_drained`]: crate::mtl4_dispatch::wait_drained
     fn submit<R>(
         &self,
+        worker: &MetalWorker<W>,
         encode: impl FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         ) -> Result<R, ForwardError>,
@@ -978,6 +940,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 mtl4.allocator.reset();
             }
         }
+        worker
+            .take_megakernel_stall()
+            .map_err(ForwardError::Megakernel)?;
         let t_waited = t_pre.elapsed();
         Ok((
             encoded,
@@ -987,33 +952,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 wait: t_waited - t_committed,
             },
         ))
-    }
-
-    /// One activation-dump replay segment: encode flat dispatch
-    /// indices `range` of the bucket's baked tape on a fresh MTL4 CB,
-    /// commit, and host-wait.
-    fn run_dump_segment(
-        &self,
-        worker: &MetalWorker<W>,
-        bucket_idx: usize,
-        num_tokens: usize,
-        num_seqs: u32,
-        has_spec_tokens: bool,
-        range: std::ops::Range<usize>,
-    ) -> Result<(), ForwardError> {
-        self.submit(|enc| {
-            worker
-                .run_bucket_mtl4_range(
-                    bucket_idx,
-                    num_tokens as u32,
-                    num_seqs,
-                    has_spec_tokens,
-                    enc,
-                    range,
-                )
-                .map_err(ForwardError::Worker)
-        })?;
-        Ok(())
     }
 
     /// Phase 6 chain-driver primitive. Opens ONE MTL4 command buffer
@@ -1068,7 +1006,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         begin_step(&guard, inputs)?;
 
         // Caller's body encodes the entire chain onto the encoder.
-        let (body_result, took) = self.submit(|enc| body(&guard.worker, &guard.runtime, enc))?;
+        let (body_result, took) = self.submit(&guard.worker, |enc| {
+            body(&guard.worker, &guard.runtime, enc)
+        })?;
         if trace {
             eprintln!("[chain encoder mtl4] {took}");
         }
@@ -1238,6 +1178,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             self.device.clone(),
             &self.arena_layout,
             &self.bucket_tapes,
+            &self.bucket_megakernels,
             &self.pipelines,
             &self.sources,
             &runtime,
@@ -1281,6 +1222,7 @@ fn begin_step<W: CanonicalParams>(
         step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
         Relaxed,
     );
+    worker.worker.set_tape_play(inputs.play);
     Ok(())
 }
 
@@ -1720,7 +1662,6 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
         };
         LoweredMetalTape {
             bucket_m,
@@ -1761,6 +1702,7 @@ mod tests {
             allocator,
             pipelines,
             tapes,
+            Arc::from(Vec::new()),
             arena_layout,
             runtime_factory,
             max,
@@ -1999,6 +1941,7 @@ mod tests {
             allocator,
             pipelines,
             tapes,
+            Arc::from(Vec::new()),
             arena_layout,
             runtime_factory,
             max_workers,
@@ -2101,6 +2044,7 @@ mod tests {
                 mm_embeds: None,
                 mm_dst_rows: None,
                 mrope_cos_sin: None,
+                play: super::super::lowered::TapePlay::Dispatch,
             };
             step_has_unrotated_blocks(&inputs, 16)
         };
@@ -2141,6 +2085,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            play: super::super::lowered::TapePlay::Dispatch,
         };
         // Closure runs *while* the worker is checked out — assertion
         // is that we got it (not on numerical correctness; that's
@@ -2188,6 +2133,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            play: super::super::lowered::TapePlay::Dispatch,
         };
         let err = pool
             .forward(&inputs, |_, _| ())
@@ -2228,6 +2174,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            play: super::super::lowered::TapePlay::Dispatch,
         };
         match pool.forward(&inputs, |_, _| ()) {
             Err(ForwardError::NoBucketFits {
@@ -2278,6 +2225,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            play: super::super::lowered::TapePlay::Dispatch,
         };
         let err = pool
             .forward(&inputs, |_, _| ())
@@ -2339,6 +2287,7 @@ mod tests {
                     tape,
                     const_patches: &[],
                     scratch_patches: &[],
+                    megakernel: &[],
                 });
             }
         }

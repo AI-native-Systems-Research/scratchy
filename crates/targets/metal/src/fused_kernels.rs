@@ -20,6 +20,15 @@ pub struct FusedAddRmsNorm {
     pub pipeline_f16_vec4: ComputePipelineState,
 }
 
+/// A normalized shader's text for the runtime compiler, which has no include path: the megakernel
+/// header it includes is inlined (as `shader_cache` inlines `metal_nax.h`).
+pub fn runtime_source(shader: &str) -> String {
+    shader.replace(
+        "#include \"megakernel/mk_common.h\"",
+        include_str!("../shaders/megakernel/mk_common.h"),
+    )
+}
+
 fn compile_library(device: &Device, source: &str) -> Result<Library, MetalStreamError> {
     let opts = objc2_metal::MTLCompileOptions::new();
     let ns_source = NSString::from_str(source);
@@ -44,10 +53,8 @@ fn compile_pipeline(
 
 impl FusedAddRmsNorm {
     pub fn new(device: Arc<MetalDevice>) -> Result<Self, MetalStreamError> {
-        let library = compile_library(
-            &device.device,
-            include_str!("../shaders/fused_add_rmsnorm.metal"),
-        )?;
+        let source = runtime_source(include_str!("../shaders/fused_add_rmsnorm.metal"));
+        let library = compile_library(&device.device, &source)?;
         let pipeline_f16_vec4 =
             compile_pipeline(&device.device, &library, "fused_add_rmsnorm_f16_vec4")?;
 
@@ -63,10 +70,8 @@ pub struct FusedGateUpSiluMul {
 
 impl FusedGateUpSiluMul {
     pub fn new(device: Arc<MetalDevice>) -> Result<Self, MetalStreamError> {
-        let library = compile_library(
-            &device.device,
-            include_str!("../shaders/fused_gate_up_silu_mul.metal"),
-        )?;
+        let source = runtime_source(include_str!("../shaders/fused_gate_up_silu_mul.metal"));
+        let library = compile_library(&device.device, &source)?;
 
         Ok(Self {
             pipeline_f16_vec4: compile_pipeline(

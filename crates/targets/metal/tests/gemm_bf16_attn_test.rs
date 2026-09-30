@@ -59,7 +59,9 @@ fn run_and_check(qk: bool) {
         return;
     };
     let dev = &device.device;
-    let src = include_str!("../shaders/gemm.metal");
+    let src = &scratchy_target_metal::fused_kernels::runtime_source(include_str!(
+        "../shaders/gemm.metal"
+    ));
     let opts = objc2_metal::MTLCompileOptions::new();
     let lib = dev
         .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))

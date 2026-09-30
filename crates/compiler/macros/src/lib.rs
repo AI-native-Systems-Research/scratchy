@@ -37,11 +37,10 @@ use proc_macro2::Span;
 use quote::quote;
 use syn::Ident;
 
+#[cfg(feature = "cuda")]
 mod alias_rules;
 mod arch_spec;
 mod ast;
-#[cfg(feature = "metal")]
-use scratchy_target_metal::atom;
 mod cfg;
 mod classified;
 mod classify;
@@ -53,13 +52,12 @@ mod config;
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
 pub use config::{total_models_emitted, unmatched_build_filter_tags};
-#[cfg(feature = "metal")]
-use scratchy_target_metal::fuse_pass;
 mod assignment;
 #[cfg(feature = "cuda")]
 mod cost;
 mod emit;
 mod fuf;
+#[cfg(feature = "cuda")]
 mod impl_lib;
 mod interpreter_codegen;
 // The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
@@ -77,10 +75,12 @@ mod render;
 /// The build script's other half: `compile_carrier` makes the tokens,
 /// `render_tokens` turns them into the text rustc reads.
 pub use render::render_tokens;
+#[cfg(feature = "cuda")]
 mod schedule;
 mod shape;
 #[cfg(feature = "cuda")]
 mod solver;
+#[cfg(feature = "cuda")]
 mod target;
 mod to_wavefront;
 mod tp_lowering;
@@ -417,6 +417,125 @@ impl CompileMode {
     };
 }
 
+/// One (model, tp) variant, solved: what `#[forward]` emits a module from. On cuda, instruction
+/// selection's products ride along; a tape-scheduled target (metal, spyre) lowers from the shared
+/// tape at emission and has none.
+pub(crate) struct SolvedModel<'a> {
+    pub(crate) model: &'a config::ModelParams,
+    /// Shapes inferred from THIS model's bounds — never the
+    /// arch-level `models[0]` inference (see the unroll site).
+    pub(crate) inferred: shape::Inferred,
+    /// The classified body THIS model was lowered against, with
+    /// its own reshape recovery applied. Emission must read the
+    /// same program the FUF was built from.
+    pub(crate) prog: classified::Program,
+    pub(crate) fuf: fuf::Fuf,
+    pub(crate) sfufs: crate::assignment::WorkloadAssignments,
+    /// Instruction selection's wave schedule per workload point, over `sfufs`.
+    #[cfg(feature = "cuda")]
+    pub(crate) loops: schedule::WorkloadLoops,
+    /// The implementation library `sfufs` indexes.
+    #[cfg(feature = "cuda")]
+    pub(crate) library: &'a impl_lib::ImplementationLibrary,
+    pub(crate) stub_items: proc_macro2::TokenStream,
+    /// Tensor-parallel world size this model was solved at. The
+    /// (variant × tp) fanout constructs one SolvedModel per
+    /// (model, tp_world_size) pair. At `tp_world_size = 1` (every
+    /// emission when `CARGO_FEATURE_NCCL` is unset) sharding is
+    /// identity. Threaded into `dedup_signature` so the
+    /// canonical-equivalence-class hash keeps each tp on its own
+    /// canonical, and into the `tp_lowering::insert_all_reduces`
+    /// call so the FUF receives a row-parallel AllReduce only
+    /// when it should.
+    pub(crate) tp_world_size: u8,
+    /// Per-(model, tp) Rust-ident form of the emitted module. At
+    /// tp=1 this is `model.name` verbatim (preserves the
+    /// `scratchy_models::<arch>::<model>::Weights` path callers
+    /// already use); at tp>1 it gets a `_tp{N}` suffix.
+    pub(crate) mod_name: String,
+    /// Per-(model, tp) HF-form stem used as the alphabetical
+    /// canonical-selection key inside `compute_canonical_variants`.
+    /// At tp=1 = `model.source_stem`; at tp>1 it's
+    /// `format!("{}_tp{}", model.source_stem, tp_world_size)` so
+    /// every member of a tp-N equivalence class shares the suffix
+    /// and within-class ordering is preserved.
+    pub(crate) canon_stem: String,
+}
+
+impl HasSolvedSig for SolvedModel<'_> {
+    fn dedup_signature(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        // Bounds get baked as integer literals in the emitted
+        // forward body (`ctx.bound("hidden_size")` expands to the
+        // concrete number at macro expansion). Variants with
+        // differing bounds produce different literal output.
+        for (k, v) in &self.model.bounds {
+            parts.push(format!("b:{k}={v}"));
+        }
+        // Scalars get baked as float literals (attention_scale_for,
+        // softcap). Same reasoning.
+        for (k, v) in &self.model.scalars {
+            parts.push(format!("s:{k}={v}"));
+        }
+        // `tie_word_embeddings` routes lm_head through
+        // `FieldLoad::LinearTiedToEmbedding` (no safetensors
+        // read) vs `FieldLoad::LinearDense` — two different
+        // bodies, so variants with different tie settings
+        // can't share a compiled `load_with`.
+        parts.push(format!("t:{}", self.model.tie_word_embeddings));
+        // `rope_scaling` (short/long_factor, type, orig_max) is
+        // baked into `RotaryCache::new_*` as literal arguments in
+        // `load_with`. Two variants with identical bounds +
+        // scalars but different `rope_scaling` (Phi-4-mini-instruct
+        // vs Phi-4-mini-reasoning: all-1.0 short_factor vs the
+        // non-trivial vector) MUST NOT share a canonical — the
+        // shim would bake the canonical's rotary for both.
+        parts.push(format!("r:{}", self.model.rope_scaling_hash.unwrap_or(0)));
+        // Resolved per-arch declaration (+ per-checkpoint drift):
+        // safetensors layout, decoder prefix, scale dtype, rope
+        // style, … all bake into the emitted loader / glue
+        // (`vision_tower.*` vs `visual.*` paths, `_s_bf16_`
+        // symbol arms). Two variants with identical bounds but
+        // drifted specs (qwen2-vl-2b-instruct vs the
+        // mlx_vlm-repacked qwen2-vl-2b-mlx) MUST NOT share a
+        // canonical — folding them emits conflicting
+        // `VisionArchWeights` impls (E0119) or, worse, one
+        // variant silently loading the other's paths.
+        parts.push(format!("a:{:?}", self.model.arch));
+        parts.push(dedup_quant_sig(
+            self.model.quantization.as_ref().map(|qc| &qc.method),
+        ));
+        // Tensor-parallel canonicalization axis. The
+        // SolvedModel.tp_world_size field is the per-(model, tp)
+        // discriminator; until task #7's outer-loop fanout lands
+        // every SolvedModel has `tp_world_size = 1`, so every
+        // dedup string still ends in `tp:1`. When the fanout
+        // turns on, two SolvedModels of the same model at tp=1
+        // vs tp=2 hash to different signatures and pick separate
+        // canonicals — pinned by `tp_world_sizes_pick_separate_
+        // canonicals`.
+        parts.push(dedup_tp_sig(self.tp_world_size));
+        // SFUF per (num_tokens, sk_bucket) point: which Impl runs
+        // at each subgraph. Identical SFUFs → each impl's
+        // `emit_call` produces identical output at identical
+        // positions in the body.
+        let mut wps: Vec<_> = self.sfufs.per_workload.iter().collect();
+        wps.sort_by_key(|(wp, _)| (wp.num_tokens, wp.sk_bucket));
+        for (wp, sf) in wps {
+            let mut impls: Vec<(u32, u32)> = sf.impls.iter().map(|(sg, i)| (sg.0, i.0)).collect();
+            impls.sort();
+            parts.push(format!("w:{}-{}-{:?}", wp.num_tokens, wp.sk_bucket, impls));
+        }
+        parts.join("|")
+    }
+    fn source_stem(&self) -> &str {
+        &self.canon_stem
+    }
+    fn model_name(&self) -> &str {
+        &self.mod_name
+    }
+}
+
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
 /// its arch's `configs/<arch>/` directory — in vision mode for a
 /// `@vision_forward` carrier, decoder mode for `@forward`.
@@ -716,31 +835,12 @@ pub fn compile_carrier(
         )
     })?;
 
-    // Spyre/KTIR is a host backend with no GPU cost model. The solver only
-    // needs a profile to cover the FUF with spyre's own claim impls, which the
-    // KTIR emitter then lowers — so the profile is honestly `Backend::Spyre`
-    // (no Cuda masquerade), carries no GPU hardware spec, and uses the universal
-    // cost table (analytic fallback). The op set is driven by spyre's registered
-    // impls, not by the backend discriminant.
-    // Spyre is tape-scheduled too, so nothing consumes a cost profile there;
-    // the binding is kept (and unused) so the shape stays visible next to the
-    // cuda and metal arms.
-    #[cfg(feature = "spyre")]
-    let _target_profile = target::TargetProfile {
-        name: "spyre".to_string(),
-        source_path: std::path::PathBuf::new(),
-        backend: target::Backend::Spyre,
-        peak_tflops_fp16: 100.0,
-        memory_bandwidth_gbps: 1000.0,
-        backend_spec: target::BackendSpec::Spyre,
-        cost_table: target::CostTable::universal(),
-    };
-
     #[cfg(not(any(feature = "cuda", feature = "metal", feature = "spyre")))]
     compile_error!(
         "scratchy-forward-compiler-macro requires a backend feature: 'cuda', 'metal', or 'spyre'"
     );
 
+    #[cfg(feature = "cuda")]
     let library = impl_lib::starter_library();
 
     // Stable rebuild-on-JSON-change: emit `const _: &str =
@@ -794,118 +894,6 @@ pub fn compile_carrier(
     // they all resolve to the same `Marlin*Impl` family and the
     // quant knobs (`desc_act`, `sym`, etc.) only change the
     // per-variant `load`, never the forward.
-    struct SolvedModel<'a> {
-        model: &'a config::ModelParams,
-        /// Shapes inferred from THIS model's bounds — never the
-        /// arch-level `models[0]` inference (see the unroll site).
-        inferred: shape::Inferred,
-        /// The classified body THIS model was lowered against, with
-        /// its own reshape recovery applied. Emission must read the
-        /// same program the FUF was built from.
-        prog: classified::Program,
-        fuf: fuf::Fuf,
-        sfufs: crate::assignment::WorkloadAssignments,
-        loops: schedule::WorkloadLoops,
-        stub_items: proc_macro2::TokenStream,
-        /// Tensor-parallel world size this model was solved at. The
-        /// (variant × tp) fanout constructs one SolvedModel per
-        /// (model, tp_world_size) pair. At `tp_world_size = 1` (every
-        /// emission when `CARGO_FEATURE_NCCL` is unset) sharding is
-        /// identity. Threaded into `dedup_signature` so the
-        /// canonical-equivalence-class hash keeps each tp on its own
-        /// canonical, and into the `tp_lowering::insert_all_reduces`
-        /// call so the FUF receives a row-parallel AllReduce only
-        /// when it should.
-        tp_world_size: u8,
-        /// Per-(model, tp) Rust-ident form of the emitted module. At
-        /// tp=1 this is `model.name` verbatim (preserves the
-        /// `scratchy_models::<arch>::<model>::Weights` path callers
-        /// already use); at tp>1 it gets a `_tp{N}` suffix.
-        mod_name: String,
-        /// Per-(model, tp) HF-form stem used as the alphabetical
-        /// canonical-selection key inside `compute_canonical_variants`.
-        /// At tp=1 = `model.source_stem`; at tp>1 it's
-        /// `format!("{}_tp{}", model.source_stem, tp_world_size)` so
-        /// every member of a tp-N equivalence class shares the suffix
-        /// and within-class ordering is preserved.
-        canon_stem: String,
-    }
-
-    impl HasSolvedSig for SolvedModel<'_> {
-        fn dedup_signature(&self) -> String {
-            let mut parts: Vec<String> = Vec::new();
-            // Bounds get baked as integer literals in the emitted
-            // forward body (`ctx.bound("hidden_size")` expands to the
-            // concrete number at macro expansion). Variants with
-            // differing bounds produce different literal output.
-            for (k, v) in &self.model.bounds {
-                parts.push(format!("b:{k}={v}"));
-            }
-            // Scalars get baked as float literals (attention_scale_for,
-            // softcap). Same reasoning.
-            for (k, v) in &self.model.scalars {
-                parts.push(format!("s:{k}={v}"));
-            }
-            // `tie_word_embeddings` routes lm_head through
-            // `FieldLoad::LinearTiedToEmbedding` (no safetensors
-            // read) vs `FieldLoad::LinearDense` — two different
-            // bodies, so variants with different tie settings
-            // can't share a compiled `load_with`.
-            parts.push(format!("t:{}", self.model.tie_word_embeddings));
-            // `rope_scaling` (short/long_factor, type, orig_max) is
-            // baked into `RotaryCache::new_*` as literal arguments in
-            // `load_with`. Two variants with identical bounds +
-            // scalars but different `rope_scaling` (Phi-4-mini-instruct
-            // vs Phi-4-mini-reasoning: all-1.0 short_factor vs the
-            // non-trivial vector) MUST NOT share a canonical — the
-            // shim would bake the canonical's rotary for both.
-            parts.push(format!("r:{}", self.model.rope_scaling_hash.unwrap_or(0)));
-            // Resolved per-arch declaration (+ per-checkpoint drift):
-            // safetensors layout, decoder prefix, scale dtype, rope
-            // style, … all bake into the emitted loader / glue
-            // (`vision_tower.*` vs `visual.*` paths, `_s_bf16_`
-            // symbol arms). Two variants with identical bounds but
-            // drifted specs (qwen2-vl-2b-instruct vs the
-            // mlx_vlm-repacked qwen2-vl-2b-mlx) MUST NOT share a
-            // canonical — folding them emits conflicting
-            // `VisionArchWeights` impls (E0119) or, worse, one
-            // variant silently loading the other's paths.
-            parts.push(format!("a:{:?}", self.model.arch));
-            parts.push(dedup_quant_sig(
-                self.model.quantization.as_ref().map(|qc| &qc.method),
-            ));
-            // Tensor-parallel canonicalization axis. The
-            // SolvedModel.tp_world_size field is the per-(model, tp)
-            // discriminator; until task #7's outer-loop fanout lands
-            // every SolvedModel has `tp_world_size = 1`, so every
-            // dedup string still ends in `tp:1`. When the fanout
-            // turns on, two SolvedModels of the same model at tp=1
-            // vs tp=2 hash to different signatures and pick separate
-            // canonicals — pinned by `tp_world_sizes_pick_separate_
-            // canonicals`.
-            parts.push(dedup_tp_sig(self.tp_world_size));
-            // SFUF per (num_tokens, sk_bucket) point: which Impl runs
-            // at each subgraph. Identical SFUFs → each impl's
-            // `emit_call` produces identical output at identical
-            // positions in the body.
-            let mut wps: Vec<_> = self.sfufs.per_workload.iter().collect();
-            wps.sort_by_key(|(wp, _)| (wp.num_tokens, wp.sk_bucket));
-            for (wp, sf) in wps {
-                let mut impls: Vec<(u32, u32)> =
-                    sf.impls.iter().map(|(sg, i)| (sg.0, i.0)).collect();
-                impls.sort();
-                parts.push(format!("w:{}-{}-{:?}", wp.num_tokens, wp.sk_bucket, impls));
-            }
-            parts.join("|")
-        }
-        fn source_stem(&self) -> &str {
-            &self.canon_stem
-        }
-        fn model_name(&self) -> &str {
-            &self.mod_name
-        }
-    }
-
     // Compile-time tp set. The per-arch
     // crate's `nccl` cargo feature transitively enables
     // `scratchy-forward-compiler-macro/nccl`, recompiling THIS proc-macro with
@@ -1101,10 +1089,7 @@ pub fn compile_carrier(
             // an empty `Assignment` per point stands in; nothing on
             // the pilot path reads their contents.
             #[cfg(any(feature = "metal", feature = "spyre"))]
-            let tape_pilot = true;
-            #[cfg(not(any(feature = "metal", feature = "spyre")))]
-            let tape_pilot = false;
-            let sfufs = if tape_pilot {
+            let sfufs = {
                 let sk_eff: Vec<u64> = if args.sk_buckets.is_empty() {
                     vec![0]
                 } else {
@@ -1118,47 +1103,31 @@ pub fn compile_carrier(
                                 num_tokens: *m,
                                 sk_bucket: *sk,
                             },
-                            crate::assignment::Assignment {
-                                cover: Default::default(),
-                                impls: Default::default(),
-                                predicted_us: 0.0,
-                            },
+                            crate::assignment::Assignment::default(),
                         );
                     }
                 }
                 crate::assignment::WorkloadAssignments { per_workload }
-            } else {
-                #[cfg(feature = "cuda")]
-                {
-                    solver::solve_with_arch_filter(
-                        &model_fuf,
-                        &library,
-                        &target_profile,
-                        Some((&model_prog, model)),
-                        &model_inferred,
-                        &solve_bounds,
-                        &args.workloads,
-                        &args.sk_buckets,
-                        tp_world_size,
-                    )
-                    .map_err(|e| {
-                        syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem))
-                    })?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    // Unreachable on metal and spyre: `tape_pilot` above is
-                    // unconditionally true there, so this arm never runs — which
-                    // is what lets the solver be absent from the build entirely.
-                    unreachable!("metal builds are always tape-scheduled")
-                }
             };
-            // Only `cost::refresh_predicted_us` mutates this, and it is not
-            // compiled on a metal-only build.
+            // Only `cost::refresh_predicted_us` mutates this.
             #[cfg(feature = "cuda")]
-            let mut sfufs = sfufs;
+            let mut sfufs = solver::solve_with_arch_filter(
+                &model_fuf,
+                &library,
+                &target_profile,
+                Some((&model_prog, model)),
+                &model_inferred,
+                &solve_bounds,
+                &args.workloads,
+                &args.sk_buckets,
+                tp_world_size,
+            )
+            .map_err(|e| {
+                syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem))
+            })?;
             let d_solve = t_solve.elapsed();
 
+            #[cfg(feature = "cuda")]
             let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
             #[cfg(feature = "cuda")]
             cost::refresh_predicted_us(
@@ -1176,317 +1145,25 @@ pub fn compile_carrier(
             // loop compression, which happens inside `emit_model`, not in
             // this pre-emit solve drive.
 
-            let max_waves = loops
-                .per_workload
-                .values()
-                .map(|l| l.num_waves())
-                .max()
-                .unwrap_or(0);
-            // Kernel-class summary lifted from HEAD (`9189c3147`).
-            // Classification must be TOTAL: any impl name that doesn't
-            // map to a known class fails the build, prompting us to
-            // add the kernel to the explicit table.
-            //
-            // Three semantic axes:
-            //   - attention backend: fa2 / fi / mla
-            //   - GEMM backend (pure or fused-with-GEMM): cublas /
-            //     cutlass / marlin. fp8 folds into cutlass (uses
-            //     `cutlass_scaled_mm_with_bias`); bnb4 folds into
-            //     cublas (dequant + cuBLAS matmul).
-            //   - non-gemm: kernels that are neither attention nor
-            //     GEMM-bearing — element-wise, reshapes, residual
-            //     adds, standalone norms. Surfaced because their
-            //     existence is usually a "why didn't we fuse this?"
-            //     signal.
-            const CLASS_LABELS: [&str; 8] = [
-                "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm",
-            ];
-            // Names that are non-gemm despite a `fused_` prefix
-            // (norm-side fusions with no matmul).
-            const NON_GEMM_NAMES: &[&str] = &[
-                "embed_ref",
-                "rmsnorm_ref",
-                "add_ref",
-                "reshape_ref",
-                "rope_append_ref",
-                "silu_ref",
-                "elem_mul_ref",
-                "scalar_mul_inplace",
-                "scalar_offset_rms_norm",
-                "tanh_softcap_inplace",
-                // Gemma4 singletons: unit-gain rmsnorm (v_norm) and
-                // the per-layer [1]-weight multiply (layer_scalar).
-                "rmsnorm_unit",
-                "scalar_weight_mul",
-                // Gemma4 post-FFN tail fusion (rmsnorm+add+scalar_mul
-                // in one kernel — norm-side, no matmul).
-                "metal_norm_add_scalar_mul_f16",
-                "metal_norm_add_scalar_mul_bf16",
-                // Gemma4 pre-attn tail fusion (q/k norms + v unit-norm
-                // inside the rope dispatch — norm-side, no matmul).
-                "metal_rope_append_normed_f16",
-                "metal_rope_append_normed_bf16",
-                "softcap",
-                "nosoftcap",
-                "deepseek_moe_ref",
-                "deepseek_moe_fp8_block",
-                "deepseek_moe_ggml",
-                "fused_moe_ref",
-                "shared_fused_moe_ref",
-                "cuda_gemma_moe",
-                // Qwen3.5 hybrid ops — host-callback dispatch wrappers whose
-                // internals (conv1d / recurrent scan / deinterleave / sigmoid
-                // gate) carry no matmul; the projections are separate DSL
-                // gemms. Same accounting class as the `*_ref` MoE siblings.
-                "gated_delta_net_ref",
-                "gate_split_ref",
-                "gate_apply_ref",
-                "gate_scale_ref",
-                // Metal MoE Impls. Same "host-callback dispatch
-                // wrapper, internal compute steps already classified
-                // (Gemm via metal_gemm_, gather_qmv via
-                // metal_affine_qmm_)" shape as the cuda *_ref
-                // siblings — bucket them under non-gemm for
-                // accounting.
-                #[cfg(feature = "metal")]
-                "metal_fused_moe",
-                #[cfg(feature = "metal")]
-                "metal_shared_fused_moe",
-                #[cfg(feature = "metal")]
-                "metal_gemma_moe",
-                "fused_add_rms_norm",
-                "fused_add_rms_norm_with_offset",
-                "mean_sub_rms_norm",
-                "mean_sub_rms_norm_bias_add",
-                // Vision-side unary elementwise ops (G.4). Shape-
-                // preserving, no matmul — same class as the text-side
-                // `scalar_mul_inplace` / `tanh_softcap_inplace` lines.
-                "quick_gelu_inplace",
-                "gelu_erf_inplace",
-                "gelu_tanh_inplace",
-                // Metal kernels (Phase 5.F: the proc-macro now runs
-                // under `--features metal`, so the classifier sees
-                // these names alongside the CUDA ones). Hand-rolled
-                // norm / elementwise / fused-MLP / RoPE — same shape
-                // class as the CUDA `*_ref` siblings, just emitting
-                // MSL instead of CUDA. `metal_attention_*` and
-                // `metal_gemm_*` get their own prefix arms below
-                // (fa2 / cutlass-equivalent). Gated on `metal` so the
-                // CUDA build doesn't carry dead names in its classifier.
-                #[cfg(feature = "metal")]
-                "metal_add_f16",
-                #[cfg(feature = "metal")]
-                "metal_add_bf16",
-                #[cfg(feature = "metal")]
-                "metal_embed_f16",
-                #[cfg(feature = "metal")]
-                "metal_embed_bf16",
-                #[cfg(feature = "metal")]
-                "metal_affine_embed_f16",
-                #[cfg(feature = "metal")]
-                "metal_affine_embed_bf16",
-                #[cfg(feature = "metal")]
-                "metal_reshape",
-                #[cfg(feature = "metal")]
-                "metal_bias_add_f16",
-                #[cfg(feature = "metal")]
-                "metal_bias_add_bf16",
-                #[cfg(feature = "metal")]
-                "metal_rmsnorm_f16",
-                #[cfg(feature = "metal")]
-                "metal_rmsnorm_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fused_add_rmsnorm_f16",
-                #[cfg(feature = "metal")]
-                "metal_fused_add_rmsnorm_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_silu_mul_f16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_silu_mul_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_gelu_mul_f16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_gelu_mul_bf16",
-                #[cfg(feature = "metal")]
-                "metal_rope_append_f16",
-                #[cfg(feature = "metal")]
-                "metal_rope_append_bf16",
-                // CommandR and other models use the interleaved rope
-                // variant; same shape class as the regular rope_append.
-                #[cfg(feature = "metal")]
-                "metal_rope_append_interleaved_f16",
-                #[cfg(feature = "metal")]
-                "metal_rope_append_interleaved_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fatrelu_f16",
-                // Metal counterparts of the CUDA `scalar_mul_inplace`
-                // and `tanh_softcap_inplace` non-gemm in-place
-                // mutators. Same kernel class — bandwidth-bound
-                // elementwise unary.
-                #[cfg(feature = "metal")]
-                "metal_scalar_mul_f16",
-                #[cfg(feature = "metal")]
-                "metal_scalar_mul_bf16",
-                #[cfg(feature = "metal")]
-                "metal_tanh_softcap_f16",
-                #[cfg(feature = "metal")]
-                "metal_tanh_softcap_bf16",
-                // Vision-prelude pixels materialization (G.5.e.1).
-                // Synthesized by `vision_lowering::materialize_pixels`;
-                // emits a single D2D copy that wraps `ctx.fwd.pixels`
-                // into a tile-table OwnedTensor. Not a compute kernel.
-                "load_pixels",
-                // Qwen3.5-VL pos_embeds materialization (sibling of
-                // load_pixels) — wraps `ctx.fwd.pos_embeds` into a tile.
-                "load_pos_embeds",
-                // Vision-side varlen attention + vision rope.
-                // Shape-preserving non-gemm primitives.
-                "varlen_attention",
-                "vision_rope",
-                // Row-permutation gather (G.6.4). Used by Qwen2.5-VL's
-                // window-attention dispatch — same class as the other
-                // memory-bound vision primitives.
-                "embedding_gather",
-                // 2-D average pool over the patch grid (G.7(b)). Used
-                // by Gemma3-MM's SigLIP→text projector to reduce the
-                // 64×64 patch grid down to 16×16 = 256 tokens. Memory-
-                // bound with one thread per output cell; non-gemm.
-                "avg_pool_2d",
-                // Vision learned positional embedding lookup (G.7(c.1)).
-                // Reuses the decoder's `embedding_gather_masked` kernel;
-                // same memory-bound class as `embed_ref`.
-                "pos_embed_ref",
-            ];
-            let mut classes_used = [false; 8];
-            let mut unknown_names: std::collections::BTreeSet<&'static str> =
-                std::collections::BTreeSet::new();
-            for assignment in sfufs.per_workload.values() {
-                for impl_id in assignment.impls.values() {
-                    let name = library.get(*impl_id).name();
-                    // Most kernel-name prefixes here are CUDA-specific
-                    // (flashinfer/mla/cutlass/marlin/fp8/bnb4/ggml/cublas-via-fused_/
-                    // NCCL collectives + the multimodal D2D splice).
-                    // Gating each behind `cfg!(feature = "cuda")` keeps
-                    // the metal-only build's classifier from carrying
-                    // dead arms and prevents a hypothetical
-                    // metal-emitted impl that happens to start with
-                    // `cutlass` etc. from being silently mis-classed.
-                    let bucket = if cfg!(feature = "cuda") && name.starts_with("flashinfer") {
-                        Some(1) // fi
-                    } else if cfg!(feature = "cuda") && name.starts_with("flash_attention_3") {
-                        // FA3 paged decode (Hopper-native, sm_90+).
-                        // Same class as FlashInfer for the cost-model
-                        // mix line — both are persistent-scheduler
-                        // attention kernels and exclude each other in
-                        // the per-cell solver pick.
-                        Some(1) // fi
-                    } else if name.starts_with("mla_") {
-                        // MLA singletons (`mla_split_ref`, `mla_attention_ref`)
-                        // and `DeepSeekMoeRefImpl`-family are registered under
-                        // both backends — runtime support diverges, but the
-                        // classifier just buckets by name for the build-time
-                        // mix line.
-                        Some(2) // mla
-                    } else if name.starts_with("attention_")
-                        || name.starts_with("sliding_attention_")
-                        || name.starts_with("fa2_")
-                        || name == "encoder_attention"
-                        || (cfg!(feature = "metal") && name.starts_with("metal_attention_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_sliding_attention_"))
-                    {
-                        Some(0) // fa2
-                    } else if cfg!(feature = "cuda") && name.starts_with("marlin") {
-                        Some(5) // marlin
-                    } else if cfg!(feature = "cuda") && name.starts_with("fp8") {
-                        Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
-                    } else if cfg!(feature = "cuda")
-                        && (name.starts_with("bnb4") || name.starts_with("ggml"))
-                    {
-                        // cublas: bnb4 dequant + cuBLAS matmul; ggml
-                        // dequant_mul_mat_vec at decode + cuBLAS at prefill.
-                        Some(3)
-                    } else if (cfg!(feature = "cuda") && name.starts_with("cutlass"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_affine_qmm_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_nvfp4_qmm_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_synth_"))
-                    {
-                        // Metal GEMM is currently routed through MPS
-                        // matmul2d (see scratchy-target-metal::gemm);
-                        // metal int4 GEMM routes through the
-                        // qmv/qmm_t kernels (see scratchy-target-metal::
-                        // quantized). Both treated as cutlass-equivalent
-                        // for class accounting — same "specialized
-                        // matmul tile" shape from the cost-model's
-                        // perspective.
-                        Some(4) // cutlass
-                    } else if NON_GEMM_NAMES.contains(&name) {
-                        Some(6) // non-gemm
-                    } else if name.starts_with("ktir_") {
-                        // `ktir_*` claim impls are host-callback placeholders that
-                        // let the solver cover each op; the real kernel is the
-                        // embedded KTIR bundle, so there is no host GEMM/attention
-                        // kernel to account for in this build-time mix line. (No
-                        // cuda/metal impl uses this prefix, so the arm is inert
-                        // under those backends — no need to name a target.)
-                        Some(6) // non-gemm
-                    } else if cfg!(feature = "cuda")
-                        && (name == "all_reduce" || name == "all_gather")
-                    {
-                        // Tensor-parallel collectives inserted by
-                        // `tp_lowering` at tp>1 (AllReduce after
-                        // row-parallel gemms + vocab-parallel embed;
-                        // AllGather after lm_head). Maps to NCCL —
-                        // semantically distinct from compute kernels.
-                        Some(7) // comm
-                    } else if (cfg!(feature = "cuda") || cfg!(feature = "metal"))
-                        && name == "mm_embed_splice"
-                    {
-                        // Multimodal post-Embed D2D splice inserted by
-                        // `tp_lowering::insert_mm_splices`. Not a
-                        // compute kernel — runs a sequence of
-                        // memcpy_dtod_async calls per image placeholder.
-                        // Bucketed alongside the comm kernels since
-                        // they share the "not a GEMM / not a normal
-                        // per-token kernel" shape.
-                        Some(7) // comm
-                    } else if name.starts_with("fused_") || name == "gemm_ref" {
-                        // `fused_gemm_bias` (qwen2 K/V) and the gemma
-                        // fusion families (`fused_add_rms_norm`,
-                        // `fused_add_rms_norm_with_offset`,
-                        // `scalar_offset_rms_norm`) live in both backends
-                        // now. cuda routes through cuBLAS gemm_bias; metal
-                        // routes through its own GEMM path. Same
-                        // build-time class for accounting.
-                        Some(3) // cublas / cublas-equivalent
-                    } else {
-                        None
-                    };
-                    match bucket {
-                        Some(b) => classes_used[b] = true,
-                        None => {
-                            unknown_names.insert(name);
-                        }
-                    }
-                }
-            }
-            if !unknown_names.is_empty() {
-                return Err(syn::Error::new(
-                    args.span,
-                    format!(
-                        "[{}] kernel-class summary: no class assigned for impl name(s): {}. \
-                         Add a class (or extend an existing prefix) in lib.rs.",
-                        model.source_stem,
-                        unknown_names.iter().copied().collect::<Vec<_>>().join(", "),
-                    ),
-                ));
-            }
-            let kernel_mix: String = classes_used
-                .iter()
-                .zip(CLASS_LABELS.iter())
-                .filter(|(seen, _)| **seen)
-                .map(|(_, label)| format!(" {label}"))
-                .collect();
+            // Instruction selection's wave count and kernel-class mix, for the build log; a
+            // tape-scheduled target selects no kernel here and has neither.
+            #[cfg(feature = "cuda")]
+            let (max_waves, kernel_mix) = {
+                let waves = loops.per_workload.values().map(|l| l.num_waves()).max();
+                let mix = kernel_class_mix(&sfufs, &library).map_err(|names| {
+                    syn::Error::new(
+                        args.span,
+                        format!(
+                            "[{}] kernel-class summary: no class assigned for impl name(s): {names}. \
+                             Add a class (or extend an existing prefix) in lib.rs.",
+                            model.source_stem,
+                        ),
+                    )
+                })?;
+                (waves.unwrap_or(0), mix)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (max_waves, kernel_mix) = (0, String::new());
             // Per-M scoring: gated on SCRATCHY_DEBUG so the default
             // build log stays terse (one line per (variant, tp)).
             let per_m_part: String = if scratchy_debug() {
@@ -1523,7 +1200,7 @@ pub fn compile_carrier(
                 waves = max_waves,
             );
 
-            let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
+            let stub_items = emit_model_stub_items(&model_fuf);
 
             solved.push(SolvedModel {
                 model,
@@ -1531,7 +1208,10 @@ pub fn compile_carrier(
                 prog: model_prog,
                 fuf: model_fuf,
                 sfufs,
+                #[cfg(feature = "cuda")]
                 loops,
+                #[cfg(feature = "cuda")]
+                library: &library,
                 stub_items,
                 tp_world_size,
                 mod_name,
@@ -1565,16 +1245,9 @@ pub fn compile_carrier(
         };
 
         let codegen_items = codegen::emit_model(
-            &sm.prog,
-            sm.model,
-            &sm.fuf,
-            &sm.sfufs,
-            &sm.loops,
-            &library,
+            sm,
             &manifest,
-            &sm.inferred,
             canonical_override.as_ref(),
-            sm.tp_world_size,
             mode.emit_arch_dispatch,
         );
         let stub_items = &sm.stub_items;
@@ -2900,11 +2573,186 @@ fn pascal_case(ident: &Ident) -> Ident {
 /// they really cared about (prefill cost ≫ decode cost) lives in
 /// `solver::tests` now, calling `solve()` directly. ~9k lines off
 /// cargo expand workspace-wide.
-fn emit_model_stub_items(
-    fuf: &fuf::Fuf,
-    _sfufs: &crate::assignment::WorkloadAssignments,
-    _loops: &schedule::WorkloadLoops,
-) -> proc_macro2::TokenStream {
+/// Instruction selection's kernel-class mix for the build log (the classes of every impl the solve
+/// picked, as ` <label>` words), or the impl names no class claims.
+///
+/// Kernel-class summary lifted from HEAD (`9189c3147`).
+/// Classification must be TOTAL: any impl name that doesn't
+/// map to a known class fails the build, prompting us to
+/// add the kernel to the explicit table.
+///
+/// Three semantic axes:
+///   - attention backend: fa2 / fi / mla
+///   - GEMM backend (pure or fused-with-GEMM): cublas /
+///     cutlass / marlin. fp8 folds into cutlass (uses
+///     `cutlass_scaled_mm_with_bias`); bnb4 folds into
+///     cublas (dequant + cuBLAS matmul).
+///   - non-gemm: kernels that are neither attention nor
+///     GEMM-bearing — element-wise, reshapes, residual
+///     adds, standalone norms. Surfaced because their
+///     existence is usually a "why didn't we fuse this?"
+///     signal.
+#[cfg(feature = "cuda")]
+fn kernel_class_mix(
+    sfufs: &assignment::WorkloadAssignments,
+    library: &impl_lib::ImplementationLibrary,
+) -> Result<String, String> {
+    const CLASS_LABELS: [&str; 8] = [
+        "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm",
+    ];
+    // Names that are non-gemm despite a `fused_` prefix
+    // (norm-side fusions with no matmul).
+    const NON_GEMM_NAMES: &[&str] = &[
+        "embed_ref",
+        "rmsnorm_ref",
+        "add_ref",
+        "reshape_ref",
+        "rope_append_ref",
+        "scalar_mul_inplace",
+        "scalar_offset_rms_norm",
+        "tanh_softcap_inplace",
+        // Gemma4 singletons: unit-gain rmsnorm (v_norm) and
+        // the per-layer [1]-weight multiply (layer_scalar).
+        "rmsnorm_unit",
+        "scalar_weight_mul",
+        "softcap",
+        "nosoftcap",
+        "deepseek_moe_ref",
+        "deepseek_moe_fp8_block",
+        "deepseek_moe_ggml",
+        "fused_moe_ref",
+        "shared_fused_moe_ref",
+        "cuda_gemma_moe",
+        // Qwen3.5 hybrid ops — host-callback dispatch wrappers whose
+        // internals (conv1d / recurrent scan / deinterleave / sigmoid
+        // gate) carry no matmul; the projections are separate DSL
+        // gemms. Same accounting class as the `*_ref` MoE siblings.
+        "gated_delta_net_ref",
+        "gate_split_ref",
+        "gate_apply_ref",
+        "gate_scale_ref",
+        "fused_add_rms_norm",
+        "fused_add_rms_norm_with_offset",
+        "mean_sub_rms_norm",
+        "mean_sub_rms_norm_bias_add",
+        // Vision-side unary elementwise ops (G.4). Shape-
+        // preserving, no matmul — same class as the text-side
+        // `scalar_mul_inplace` / `tanh_softcap_inplace` lines.
+        "quick_gelu_inplace",
+        "gelu_erf_inplace",
+        "gelu_tanh_inplace",
+        // Vision-prelude pixels materialization (G.5.e.1).
+        // Synthesized by `vision_lowering::materialize_pixels`;
+        // emits a single D2D copy that wraps `ctx.fwd.pixels`
+        // into a tile-table OwnedTensor. Not a compute kernel.
+        "load_pixels",
+        // Qwen3.5-VL pos_embeds materialization (sibling of
+        // load_pixels) — wraps `ctx.fwd.pos_embeds` into a tile.
+        "load_pos_embeds",
+        // Vision-side varlen attention + vision rope.
+        // Shape-preserving non-gemm primitives.
+        "varlen_attention",
+        "vision_rope",
+        // Row-permutation gather (G.6.4). Used by Qwen2.5-VL's
+        // window-attention dispatch — same class as the other
+        // memory-bound vision primitives.
+        "embedding_gather",
+        // 2-D average pool over the patch grid (G.7(b)). Used
+        // by Gemma3-MM's SigLIP→text projector to reduce the
+        // 64×64 patch grid down to 16×16 = 256 tokens. Memory-
+        // bound with one thread per output cell; non-gemm.
+        "avg_pool_2d",
+        // Vision learned positional embedding lookup (G.7(c.1)).
+        // Reuses the decoder's `embedding_gather_masked` kernel;
+        // same memory-bound class as `embed_ref`.
+        "pos_embed_ref",
+    ];
+    let mut classes_used = [false; 8];
+    let mut unknown_names: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+    for assignment in sfufs.per_workload.values() {
+        for impl_id in assignment.impls.values() {
+            let name = library.get(*impl_id).name();
+            let bucket = if name.starts_with("flashinfer") {
+                Some(1) // fi
+            } else if name.starts_with("flash_attention_3") {
+                // FA3 paged decode (Hopper-native, sm_90+).
+                // Same class as FlashInfer for the cost-model
+                // mix line — both are persistent-scheduler
+                // attention kernels and exclude each other in
+                // the per-cell solver pick.
+                Some(1) // fi
+            } else if name.starts_with("mla_") {
+                // MLA singletons (`mla_split_ref`, `mla_attention_ref`)
+                // and `DeepSeekMoeRefImpl`-family are registered under
+                // both backends — runtime support diverges, but the
+                // classifier just buckets by name for the build-time
+                // mix line.
+                Some(2) // mla
+            } else if name.starts_with("attention_")
+                || name.starts_with("sliding_attention_")
+                || name.starts_with("fa2_")
+                || name == "encoder_attention"
+            {
+                Some(0) // fa2
+            } else if name.starts_with("marlin") {
+                Some(5) // marlin
+            } else if name.starts_with("fp8") {
+                Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
+            } else if name.starts_with("bnb4") || name.starts_with("ggml") {
+                // cublas: bnb4 dequant + cuBLAS matmul; ggml
+                // dequant_mul_mat_vec at decode + cuBLAS at prefill.
+                Some(3)
+            } else if name.starts_with("cutlass") {
+                Some(4) // cutlass
+            } else if NON_GEMM_NAMES.contains(&name) {
+                Some(6) // non-gemm
+            } else if name == "all_reduce" || name == "all_gather" {
+                // Tensor-parallel collectives inserted by
+                // `tp_lowering` at tp>1 (AllReduce after
+                // row-parallel gemms + vocab-parallel embed;
+                // AllGather after lm_head). Maps to NCCL —
+                // semantically distinct from compute kernels.
+                Some(7) // comm
+            } else if name == "mm_embed_splice" {
+                // Multimodal post-Embed D2D splice inserted by
+                // `tp_lowering::insert_mm_splices`. Not a
+                // compute kernel — runs a sequence of
+                // memcpy_dtod_async calls per image placeholder.
+                // Bucketed alongside the comm kernels since
+                // they share the "not a GEMM / not a normal
+                // per-token kernel" shape.
+                Some(7) // comm
+            } else if name.starts_with("fused_") || name == "gemm_ref" {
+                // `fused_gemm_bias` (qwen2 K/V) and the gemma
+                // fusion families (`fused_add_rms_norm`,
+                // `fused_add_rms_norm_with_offset`,
+                // `scalar_offset_rms_norm`) route through cuBLAS
+                // gemm_bias. Same build-time class for accounting.
+                Some(3) // cublas / cublas-equivalent
+            } else {
+                None
+            };
+            match bucket {
+                Some(b) => classes_used[b] = true,
+                None => {
+                    unknown_names.insert(name);
+                }
+            }
+        }
+    }
+    if !unknown_names.is_empty() {
+        return Err(unknown_names.into_iter().collect::<Vec<_>>().join(", "));
+    }
+    Ok(classes_used
+        .iter()
+        .zip(CLASS_LABELS.iter())
+        .filter(|(seen, _)| **seen)
+        .map(|(_, label)| format!(" {label}"))
+        .collect())
+}
+
+fn emit_model_stub_items(fuf: &fuf::Fuf) -> proc_macro2::TokenStream {
     let num_tiles = fuf.len();
     quote! {
         pub const NUM_TILES: usize = #num_tiles;

@@ -16,6 +16,7 @@ pub mod lowering;
 pub mod pipelines;
 
 pub mod forward;
+pub mod megakernel;
 pub mod mtl4;
 pub mod pool;
 pub mod runtime;
@@ -31,15 +32,15 @@ pub use ids::{
     PhysicalBlockIdx, QTokenIdx, SeqIdx, SlotInBlock,
 };
 pub use lowered::{
-    Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
-    ModelSources, RuntimeBindingKind, SourceRef, WeightTensor,
+    Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
+    MegakernelError, MetalDtype, ModelSources, RuntimeBindingKind, SourceRef, TapePlay,
+    WeightTensor,
 };
 pub use pipelines::{PipelineLookupError, SpecializedPipelines};
 
 /// Reactive (chunked) KV pool granularity — re-exported single source
 /// of truth so the worker (chunk-pool sizing) and the lowering
-/// (chunk-table `[[function_constant]]`) share the exact value the
-/// macro-generated `SynthPreAttn` bakes. See
+/// (chunk-table `[[function_constant]]`) share the exact value. See
 /// [`crate::BLOCKS_PER_CHUNK`].
 pub use crate::BLOCKS_PER_CHUNK;
 pub use forward::{ForwardError, ForwardInputs, build_mrope_cos_sin_override};
@@ -48,8 +49,7 @@ pub use pool::{
 };
 pub use runtime::RuntimeBindings;
 pub use worker::{
-    ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker, ResolvedSources, SourceMiss,
-    WorkerError,
+    ArenaLayout, BucketBaking, BucketStep, MetalWorker, ResolvedSources, SourceMiss, WorkerError,
 };
 
 // Centralized type aliases for the objc2-metal `Retained` wrapper

@@ -48,10 +48,10 @@ pub(crate) fn alias_preamble() -> TokenStream {
 fn module_of(ty: &str) -> Result<TokenStream, Error> {
     let m = match ty {
         "KernelId" | "Binding" | "DispatchShape" | "MScaling" | "MScaleAxis" | "RuntimeGate"
-        | "LoweredCommand" | "GatedCommand" | "GemmDims" | "WeightTensor"
-        | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
-        | "CapPatch" | "ScratchPatch" | "ScratchField" | "GenClass" | "PatchTarget"
-        | "TapeLoop" => {
+        | "LoweredCommand" | "GatedCommand" | "WeightTensor" | "RuntimeBindingKind"
+        | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape" | "CapPatch" | "ScratchPatch"
+        | "ScratchField" | "GenClass" | "PatchTarget" | "TapeLoop" | "MegakernelTape"
+        | "MkKernelStep" | "MkLoadConstant" | "MkLoadSource" | "CommandSpan" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {
@@ -377,7 +377,6 @@ mod tests {
                         binding_index: 1,
                     },
                 ]),
-                gemm_dims: None,
             },
             gate: Some(RuntimeGate::OnlyIfDecodeStep),
         }

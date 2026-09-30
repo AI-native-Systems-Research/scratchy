@@ -5,7 +5,7 @@
 //! These describe WHICH workload point (num_tokens, sk_bucket) a result
 //! belongs to; they say nothing about how that result was produced. The
 //! tape-scheduled path builds them directly with empty payloads (see
-//! `lib.rs`'s `tape_pilot` branch) and never runs the solver, so codegen's
+//! `lib.rs`) and never runs the solver, so codegen's
 //! dependence on these types is not a dependence on instruction selection.
 //!
 //! They lived in `solver` because the solver was their only producer. Keeping
@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+#[cfg(feature = "cuda")]
 use crate::fuf::TileId;
 
 /// Stable identifier for one [`Implementation`] in the
@@ -32,6 +33,7 @@ pub struct SubgraphId(pub u32);
 #[derive(Clone, Debug, Default)]
 pub struct Assignment {
     /// Tile → which subgraph claims it.
+    #[cfg(feature = "cuda")]
     pub cover: HashMap<TileId, SubgraphId>,
     /// Subgraph → which Impl realizes it.
     pub impls: HashMap<SubgraphId, ImplId>,
@@ -49,18 +51,22 @@ impl Assignment {
         self.cover.len() == num_tiles
     }
 
+    #[cfg(feature = "cuda")]
     pub fn subgraph_of(&self, tile: TileId) -> Option<SubgraphId> {
         self.cover.get(&tile).copied()
     }
 
+    #[cfg(feature = "cuda")]
     pub fn impl_of(&self, sg: SubgraphId) -> Option<ImplId> {
         self.impls.get(&sg).copied()
     }
 
+    #[cfg(feature = "cuda")]
     pub fn subgraphs(&self) -> impl Iterator<Item = SubgraphId> + '_ {
         self.impls.keys().copied()
     }
 
+    #[cfg(feature = "cuda")]
     pub fn tiles_in_subgraph(&self, sg: SubgraphId) -> Vec<TileId> {
         let mut v: Vec<TileId> = self
             .cover
@@ -71,6 +77,7 @@ impl Assignment {
         v
     }
 
+    #[cfg(feature = "cuda")]
     pub fn num_subgraphs(&self) -> usize {
         self.impls.len()
     }
@@ -122,6 +129,8 @@ impl WorkloadAssignments {
     /// Lookup by num_tokens only, picking the first matching
     /// sk_bucket in sorted order. Convenience for 1-D callers and
     /// invariants that care only about coverage, not sk dispatch.
+    // Used by the solver's tests only.
+    #[cfg(all(test, feature = "cuda"))]
     pub fn get_nt(&self, num_tokens: u64) -> Option<&Assignment> {
         self.per_workload
             .iter()

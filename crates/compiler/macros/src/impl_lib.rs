@@ -20,7 +20,6 @@ use std::fmt;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-#[cfg(feature = "cuda")]
 use scratchy_forward_compiler::Instruction;
 
 use crate::assignment::ImplId;
@@ -31,7 +30,6 @@ use crate::emit::weight_field_name;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::{Dim, Shape};
-#[cfg(feature = "cuda")]
 use crate::target::Backend;
 use crate::target::TargetProfile;
 #[cfg(test)]
@@ -84,10 +82,7 @@ pub struct CostCtx<'a> {
     /// Expected number of `forward` calls per model load. Used to
     /// amortize startup cost (e.g. CPU pack memcpy) against
     /// per-call runtime. Solver objective: `startup + N × per_call`.
-    ///
-    /// Backend defaults assume different workload mixes — metal
-    /// targets interactive chat (one prefill + tens of decodes ≈ 64);
-    /// cuda targets batched serving (tens of thousands).
+    /// The default assumes batched serving (tens of thousands).
     pub expected_calls_per_load: u64,
 }
 
@@ -123,16 +118,10 @@ impl CostCtx<'_> {
     }
 
     /// Default `expected_calls_per_load` for the given backend
-    /// (metal=64 for interactive chat, cuda=10000 for batched
-    /// serving).
+    /// (cuda=10000 for batched serving).
     pub fn default_expected_calls_per_load(backend: crate::target::Backend) -> u64 {
         match backend {
-            crate::target::Backend::Metal => 64,
             crate::target::Backend::Cuda => 10_000,
-            // Spyre runs per-token decode (many calls per load), like cuda; the
-            // exact value is moot since spyre uses the universal (analytic) cost
-            // table, but keep it on the decode-heavy scale.
-            crate::target::Backend::Spyre => 10_000,
         }
     }
 }
@@ -498,7 +487,7 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     }
 
     /// Guard G4: solve-time precondition for a PICKED (impl, tile)
-    /// claim. Mirrors any shape assert the impl's metal/cuda lowering
+    /// claim. Mirrors any shape assert the impl's lowering
     /// makes (e.g. `assert!(intermediate % HEAD_DIM == 0)`) so a
     /// violation is a compile-time macro error, not a worker-thread
     /// runtime panic. Default `Ok(())` — only impls whose lowering
@@ -521,10 +510,8 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// Override on impls that introduce extra load work, typically
     /// **packed weight accessors**: `required_weights` returns one
     /// accessor with multiple `source_weights`, the loader CPU-
-    /// memcpys each component into a packed buffer. On metal that
-    /// memcpy is fully synchronous and shows up as a measurable
-    /// chunk of "init engine" time; cuda overlaps it with stream
-    /// DMA so the cost is effectively 0 there.
+    /// memcpys each component into a packed buffer. cuda overlaps
+    /// that memcpy with stream DMA, so its cost is effectively 0.
     ///
     /// The solver's objective is
     /// `startup_us + ctx.expected_calls_per_load × cost_us`, so a
@@ -533,20 +520,6 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// unpacked alternative.
     fn startup_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
         0.0
-    }
-
-    /// Return an `Atom` view of this Impl's claim, or `None` if it
-    /// can't participate in compiler-driven megakernel synthesis
-    /// (must stay as a standalone kernel call). Default `None` —
-    /// existing Impls aren't fuseable until they opt in.
-    ///
-    /// The fuse pass (`fuse_pass.rs`) walks the solver's claim
-    /// assignments, calls `as_atom` on each Impl, and groups
-    /// adjacent atoms whose dispatch shape and data-flow are
-    /// compatible into one synthesized kernel.
-    #[cfg(feature = "metal")]
-    fn as_atom(&self, _m: &MatchInfo, _fuf: &Fuf) -> Option<Box<dyn crate::atom::Atom>> {
-        None
     }
 
     /// Per-CTA resource demand of this implementation.
@@ -642,11 +615,10 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     ///
     /// The FUF dependency graph doesn't model the KV cache as a
     /// tile-output edge (it's a runtime-ambient resource, like
-    /// `input_ids`), so backends that need to schedule explicit
-    /// ordering around it (e.g. metal MTL4 encoder barriers) ask
-    /// each impl's declared rule. CUDA backends with implicit stream
-    /// ordering can ignore the answer; they get the same correctness
-    /// for free from the stream.
+    /// `input_ids`), so a lowering that schedules explicit ordering
+    /// around it (the per-instance barrier flags) asks each impl's
+    /// declared rule. Implicit stream ordering gets the same
+    /// correctness for free.
     ///
     /// Default: no KV cache interaction.
     fn kv_rule(&self) -> crate::alias_rules::KvRule {
@@ -679,10 +651,7 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// beyond the primary `opcode_shape()`. Default empty.
     ///
     /// Used by storage-polymorphic Impls that fan out to different
-    /// opcode mixes depending on weight format. `MetalFusedGateUp-
-    /// SiluMulImpl` is the motivating example: Dense → single
-    /// `FusedGateUpSiluMul`; MLX-affine → decomposed
-    /// `(AffineQmm, AffineQmm, SiluMul)`. The codegen registration
+    /// opcode mixes depending on weight format. The codegen registration
     /// loop calls `opcode_shape()` AND `extra_opcode_shapes()` and
     /// registers all of them so the per-bucket static-slice
     /// validator can typecheck every variant fan_out emits.
@@ -708,18 +677,6 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         _slots: &SlotMap,
     ) -> Option<Vec<scratchy_forward_compiler::Instruction>> {
         None
-    }
-
-    /// Whether this Impl contributes a host-interpreter `Instruction` to the
-    /// per-bucket slice. Default `true`: a migrated Impl emits one, so a `None`
-    /// from [`fan_out`](Self::fan_out) is an unmigrated-Impl bug the codegen
-    /// panics on. An Impl whose real lowering happens elsewhere (claim-only
-    /// impls that exist purely to let the solver cover a tile, with the actual
-    /// kernel produced by a downstream lowering such as KTIR) overrides this to
-    /// `false` — the codegen then skips it instead of treating its `None`
-    /// fan_out as a bug. This is a property of the Impl, not of any target.
-    fn emits_host_instruction(&self) -> bool {
-        true
     }
 }
 
@@ -1098,10 +1055,8 @@ fn cost_attention(m: &MatchInfo, ctx: &CostCtx) -> f64 {
 /// overrides each reference an Impl-specific kernel symbol +
 /// weight type that a shared macro can't express generically.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct EmbedRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for EmbedRefImpl {
     fn name(&self) -> &'static str {
         "embed_ref"
@@ -1112,8 +1067,7 @@ impl Implementation for EmbedRefImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::Embed)?;
         // Dense-kernel gate: a quantized embed table is claimed by the
-        // backend's quant-specific impl (e.g. metal's `MetalAffineEmbedImpl`),
-        // not this dense reference.
+        // backend's quant-specific impl, not this dense reference.
         if let Some(s) = weight_storage_of(fuf.get(seed))
             && !matches!(s, StorageFormat::Dense)
         {
@@ -1182,16 +1136,13 @@ impl Implementation for EmbedRefImpl {
 /// each at any layer — rides on the `weight_fn` fn-pointer +
 /// `layer` u32 fields.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct RmsNormRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for RmsNormRefImpl {
     fn name(&self) -> &'static str {
         "rmsnorm_ref"
     }
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        // CUDA-only implementation - Metal targets use MetalRmsNormImpl
         profile.backend == crate::target::Backend::Cuda
     }
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
@@ -1278,11 +1229,9 @@ impl Implementation for RmsNormRefImpl {
         let acc_name = acc.name.to_string();
         let (_base, layer) = split_base_layer(&acc_name);
         let layer = layer.map_or(0, |v| v.0) as u32;
-        // `hidden_size` — the reduction width the metal kernel reads
-        // as `RMSNORM_HIDDEN_SIZE`. Cuda eval ignores this field
-        // (reads tile shape directly). On metal we need the actual
-        // last-dim size baked because the kernel uses a
-        // function-constant loop bound.
+        // `hidden_size` — the reduction width, baked into the
+        // instruction. Cuda eval ignores this field (reads tile shape
+        // directly).
         //
         // Detection rule (name-based, matches the DSL conventions
         // across arches): the per-head q_norm /
@@ -1369,10 +1318,8 @@ impl Implementation for RmsNormRefImpl {
 /// / `k_proj` / `v_proj` / `o_proj` / `lm_head` / …) — same
 /// `weight_fn` + `layer` pattern as RmsNorm.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GemmRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GemmRefImpl {
     fn name(&self) -> &'static str {
         "gemm_ref"
@@ -1383,7 +1330,7 @@ impl Implementation for GemmRefImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
         // Dense-kernel gate: a quantized weight is claimed by the backend's
-        // quant-specific GEMM impl (Marlin / metal QMM), not this dense
+        // quant-specific GEMM impl (Marlin, …), not this dense
         // reference.
         if let Some(s) = weight_storage_of(fuf.get(seed))
             && !matches!(s, StorageFormat::Dense)
@@ -1492,10 +1439,8 @@ impl Implementation for GemmRefImpl {
 // every consumer of the reshaped view is done.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct ReshapeRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for ReshapeRefImpl {
     fn name(&self) -> &'static str {
         "reshape_ref"
@@ -1727,758 +1672,441 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
 /// multi-tile fusions the `scratchy-target-cuda` shape requires.
 /// Replaced / augmented by calibrated target-specific impls as
 /// they're ported.
-/// Spyre/KTIR neutral reference impl for a standalone `OpKind::Silu` (the SwiGLU
-/// activation; the KTIR emitter re-fuses Silu+Mul into SiluMul downstream).
-/// Host-callback, no codegen — it just claims the tile so the solver completes
-/// under -Fspyre, where the cuda/metal fused gate-up impls aren't present.
-#[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
-pub struct SiluRefImpl;
-
-#[cfg(feature = "cuda")]
-impl Implementation for SiluRefImpl {
-    fn name(&self) -> &'static str {
-        "silu_ref"
-    }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
-    }
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        if node.op != OpKind::Silu {
-            return None;
-        }
-        let inp = match node.inputs.first() {
-            Some(FufInput::Tile { id, .. }) => *id,
-            _ => return None,
-        };
-        Some(MatchInfo {
-            claimed_tiles: vec![seed],
-            boundary_inputs: vec![inp],
-            boundary_outputs: vec![seed],
-        })
-    }
-    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        let m = ctx.num_tokens() as f64;
-        let ime = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
-        let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 2.0 * m * ime * BYTES_PER_ELEM;
-        if bw_gb > 0.0 {
-            (bytes / (bw_gb * 1e9)) * 1e6
-        } else {
-            0.0
-        }
-    }
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources::ZERO
-    }
-    fn launch_kind(&self) -> LaunchKind {
-        LaunchKind::HostCallback
-    }
-    fn supported_input_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn supported_output_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
-    }
-    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
-    }
-}
-
-/// Spyre/KTIR neutral reference impl for a two-tile `OpKind::Mul` (the SwiGLU
-/// `silu(gate) * up`). Distinct from `ScalarMulImpl` (Tile × Scalar).
-/// Host-callback, no codegen — claims the tile so the solver completes.
-#[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
-pub struct ElemMulRefImpl;
-
-#[cfg(feature = "cuda")]
-impl Implementation for ElemMulRefImpl {
-    fn name(&self) -> &'static str {
-        "elem_mul_ref"
-    }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
-    }
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        if node.op != OpKind::Mul || node.inputs.len() != 2 {
-            return None;
-        }
-        let a = match &node.inputs[0] {
-            FufInput::Tile { id, .. } => *id,
-            _ => return None,
-        };
-        let b = match &node.inputs[1] {
-            FufInput::Tile { id, .. } => *id,
-            _ => return None,
-        };
-        Some(MatchInfo {
-            claimed_tiles: vec![seed],
-            boundary_inputs: vec![a, b],
-            boundary_outputs: vec![seed],
-        })
-    }
-    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        let m = ctx.num_tokens() as f64;
-        let ime = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
-        let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 3.0 * m * ime * BYTES_PER_ELEM;
-        if bw_gb > 0.0 {
-            (bytes / (bw_gb * 1e9)) * 1e6
-        } else {
-            0.0
-        }
-    }
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources::ZERO
-    }
-    fn launch_kind(&self) -> LaunchKind {
-        LaunchKind::HostCallback
-    }
-    fn supported_input_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn supported_output_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
-    }
-    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
-    }
-}
-
-// ── Spyre / KTIR claim impls ────────────────────────────────────────────────
-//
-// Spyre lowers the solved FUF to an embedded KTIR bundle (`dump_wavefront_mega`
-// → `lower_decode_to_wavefront` → `lower_graph_to_ktir`) that the host worker
-// runs; that lowering reads the FUF op graph + claim structure, never a host
-// `Instruction` or a cuBLAS kernel, and the worker loads + dequantizes weights
-// host-side by their on-disk keys. So spyre OWNS this set of pure CLAIM impls —
-// the way metal owns its `Metal*Impl`s — instead of borrowing cuda's kernel
-// impls (`CublasGemmImpl` & co.). Each one just lets the solver cover an op's
-// tile; it emits no host `Instruction` (`fan_out` defaults to `None`,
-// `emits_host_instruction` is `false`) and is storage-agnostic. No matcher here
-// tests the target by name.
-#[derive(Debug)]
-#[cfg(feature = "cuda")]
-pub struct KtirClaimImpl {
-    name: &'static str,
-    op: OpKind,
-    /// Attention claims require the 5-arg decoder form (a `KvCache` extern);
-    /// false for every other op.
-    require_kv_cache: bool,
-    workload: WorkloadConstraint,
-}
-
-#[cfg(feature = "cuda")]
-impl KtirClaimImpl {
-    const fn new(
-        name: &'static str,
-        op: OpKind,
-        require_kv_cache: bool,
-        workload: WorkloadConstraint,
-    ) -> Self {
-        Self {
-            name,
-            op,
-            require_kv_cache,
-            workload,
-        }
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Implementation for KtirClaimImpl {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
-    }
-    fn workload_constraint(&self) -> WorkloadConstraint {
-        self.workload
-    }
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        if self.require_kv_cache && !attention_has_kv_cache_extern(fuf, seed) {
-            return None;
-        }
-        single_tile_match(fuf, seed, self.op)
-    }
-    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
-        // Spyre registers exactly one claim impl per op, so this impl is always
-        // the sole candidate at its seed — the value only has to be finite and
-        // does not affect which impl is picked or the emitted KTIR bundle (the
-        // bundle is derived from the FUF + claim, not from cost).
-        1.0
-    }
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources::ZERO
-    }
-    fn launch_kind(&self) -> LaunchKind {
-        LaunchKind::HostCallback
-    }
-    fn supported_input_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn supported_output_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
-    }
-    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
-    }
-    fn emits_host_instruction(&self) -> bool {
-        false
-    }
-}
-
-/// Populate `lib` with spyre's own claim impls — one per backbone op the KTIR
-/// decode/prefill bundles cover. Mirrors the cuda / metal per-feature blocks:
-/// the target owns its impl set.
-#[cfg(feature = "cuda")]
-pub fn populate_spyre(lib: &mut ImplementationLibrary) {
-    let any = WorkloadConstraint::Any;
-    let decode = WorkloadConstraint::NumTokensRange { min: 1, max: 1 };
-    let prefill = WorkloadConstraint::NumTokensRange {
-        min: 2,
-        max: u32::MAX,
-    };
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_embed",
-        OpKind::Embed,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_rmsnorm",
-        OpKind::RmsNorm,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_gemm",
-        OpKind::Gemm,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_add",
-        OpKind::Add,
-        false,
-        any,
-    )));
-    // Both rope flavors (the singleton cuda impl gates on `is_rope_append_op`).
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_rope_append",
-        OpKind::RopeAppend,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_rope_append_interleaved",
-        OpKind::RopeAppendInterleaved,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_reshape",
-        OpKind::Reshape,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_pos_embed",
-        OpKind::PosEmbed,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_attention",
-        OpKind::Attention,
-        true,
-        decode,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_attention_prefill",
-        OpKind::Attention,
-        true,
-        prefill,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_silu",
-        OpKind::Silu,
-        false,
-        any,
-    )));
-    lib.push(Box::new(KtirClaimImpl::new(
-        "ktir_mul",
-        OpKind::Mul,
-        false,
-        any,
-    )));
-}
-
 pub fn starter_library() -> ImplementationLibrary {
-    // ISel (this library, `solver`, `cost`) is cuda-only: metal and spyre are
-    // tape-scheduled (`tape_pilot` in lib.rs is unconditionally true there,
-    // and the non-cuda solve arm is `unreachable!`), so nothing ever reads
-    // this library on those targets. The binding stays immutable there.
-    #[cfg(feature = "cuda")]
     let mut lib = ImplementationLibrary::new();
-    #[cfg(not(feature = "cuda"))]
-    let lib = ImplementationLibrary::new();
-    #[cfg(feature = "cuda")]
+    // Gemma4's singletons: unit-gain rmsnorm (`v_norm`) and the per-layer
+    // [1]-weight multiply (`layer_scalar`).
+    lib.push(Box::new(RmsNormUnitImpl));
+    lib.push(Box::new(ScalarWeightMulImpl));
+    lib.push(Box::new(EmbedRefImpl));
+    lib.push(Box::new(RmsNormRefImpl));
     {
-        // Target-agnostic singletons needed on BOTH backends (Gemma4 is
-        // metal-first): unit-gain rmsnorm (`v_norm`) and the per-layer
-        // [1]-weight multiply (`layer_scalar`).
-        lib.push(Box::new(RmsNormUnitImpl));
-        lib.push(Box::new(ScalarWeightMulImpl));
-        lib.push(Box::new(EmbedRefImpl));
-        lib.push(Box::new(RmsNormRefImpl));
-        {
-            // CohereLayerNorm-flavored norm: claims `(Mean, Sub, RmsNorm)`
-            // and emits `cohere_layer_norm`. The DSL stays pure math
-            // (`mu = mean(x); centered = sub(x, mu); rmsnorm(centered, w)`);
-            // this Impl does the structural fusion back to one kernel call.
-            lib.push(Box::new(MeanSubRmsNormImpl));
-            // Torch-style LayerNorm with bias: claims the 4-tile pattern
-            // `(Mean, Sub, RmsNorm, BiasAdd)` and emits `layer_norm_bias`.
-            // Solver's claim-size-DESC sort lets this absorb the bias at
-            // sites where the trio's RmsNorm output flows into a `bias_add`
-            // (e.g. ModernBERT, Qwen2-VL vision blocks). Sites without a
-            // `bias_add` consumer fall through to the trio.
-            lib.push(Box::new(MeanSubRmsNormBiasAddImpl));
-            // The full cuBLAS-routing Impl set (singleton + fused peers):
-            //   - GemmRefImpl                 — singleton Gemm via cuBLAS
-            //   - FusedCublasGemmAddImpl      — (Gemm, Add) via cuBLAS
-            //   - FusedGemmBiasImpl           — (Gemm, BiasAdd) via cuBLAS
-            //   - FusedGateUpSiluMulImpl      — packed SwiGLU via cuBLAS
-            //   - FusedGateUpGeluMulImpl      — packed GELU-MLP via cuBLAS
-            //   - FusedQkvRopeCacheImpl       — packed QKV+rope (M=1) via cuBLAS
-            //   - FusedQkvRopePrefillImpl     — packed QKV+rope (M≥2) via cuBLAS
-            //
-            // Every one of these Impls has a `CutlassFused…` peer registered
-            // unconditionally below.
-            let cublas_enabled = std::env::var_os("SCRATCHY_DISABLE_CUBLAS_GEMM").is_none();
-            lib.push(Box::new(GemmRefImpl));
-            lib.push(Box::new(FusedCublasGemmAddImpl));
-            lib.push(Box::new(AttentionViaCacheImpl));
-            // Reshape is a metadata-only view op synthesized by shape
-            // inference to bridge axis-factor mismatches (e.g. per-head QK-
-            // norm in Qwen3/Gemma3). Zero-cost, zero-launch; the emitted
-            // code is a single `TensorView::reshape(&[..])` call.
-            lib.push(Box::new(ReshapeRefImpl));
-            // Multi-tile fusions. The solver's claim-size-DESC sort picks
-            // these over singleton coverage when both apply; the singletons
-            // stay as fallbacks for tile positions the fusion doesn't match
-            // (e.g. the first layer's input_layernorm, whose upstream is
-            // `embed` not `Add`, stays a singleton RmsNorm claim).
-            //
-            // `(Gemm, BiasAdd)` pairs not absorbed by a larger fusion (e.g.
-            // a lone affine-transform gemm that's not a QKV-pre-rope or
-            // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
-            //
-            // **NOT gated on the cuBLAS env var.** `CutlassFusedGemmBiasImpl`
-            // below has no `cutlass_gemm_bias` CSV rows for qwen2's K/V
-            // projection shapes (N=128, K=896 for Qwen2.5-0.5B and the rest
-            // of the qwen2 fleet). At cuBLAS-OFF the singleton-fallback chain
-            // (CutlassGemv + RopeAppendRefImpl + AttentionPrefill) produces a
-            // different K/V tensor layout than the fused path expects —
-            // verified failure on qwen2-0.5b: position 3 mismatch
-            // ("英文字" engine vs " is" golden). Until Lever A2 ships
-            // (cutlass_gemm_bias CSV sweep across qwen2 packed-QKV shapes),
-            // this Impl stays registered to keep qwen2 correctness-green.
-            lib.push(Box::new(FusedGemmBiasImpl));
-            // CUTLASS bias-add peer to FusedGemmBiasImpl — plain
-            // `cutlass::gemm::device::Gemm` with `LinearCombination` epilogue
-            // and bias passed as the C operand at ldc=0 (row broadcast). One
-            // Impl per CUTLASS_TILE_ZOO entry, gated per-tile on calibrated
-            // CSV row presence; the DP picks the best tile per workload.
-            for tile in CUTLASS_TILE_ZOO {
-                lib.push(Box::new(CutlassFusedGemmBiasImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-            }
-            // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpSiluMul
-            // below is the cuBLAS-OFF peer.
-            if cublas_enabled {
-                lib.push(Box::new(FusedGateUpSiluMulImpl));
-            }
-            // CUTLASS EVT peer to FusedGateUpSiluMulImpl — same claim, different
-            // kernel shape. Solver's DP picks whichever has lower calibrated
-            // cost per bucket; `target_compatible` gates on CSV row presence.
-            // Parameterized over CUTLASS_TILE_ZOO so the up-projection GEMM
-            // tile is DP-pickable rather than hardcoded — the previous
-            // hardcoded `cutlass_128x128_s3` lost to small-M tiles after the
-            // tile_m=16 splitK additions, breaking SiLU MLP fusions.
-            for tile in CUTLASS_TILE_ZOO {
-                lib.push(Box::new(CutlassFusedGateUpSiluMulImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-            }
-            // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpGeluMul
-            // below is the cuBLAS-OFF peer.
-            if cublas_enabled {
-                lib.push(Box::new(FusedGateUpGeluMulImpl));
-            }
-            // CUTLASS peer to FusedGateUpGeluMulImpl. Mirrors the cuBLAS path
-            // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
-            // BW-bound `gelu_and_mul_fused` — picking the GEMM tile per (M,
-            // 2I, K) bucket. One Impl per CUTLASS_TILE_ZOO entry.
-            for tile in CUTLASS_TILE_ZOO {
-                lib.push(Box::new(CutlassFusedGateUpGeluMulImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-            }
-            lib.push(Box::new(FusedAddRmsNormImpl));
-            // Norm→Gemm fusion family: captures the lm_head + body Norm→Gemm
-            // patterns the analyzer's fusion-gap report flagged as the
-            // dominant cuBLAS surface. Three claim shapes — (RmsNorm, Gemm)
-            // 2-tile, (LayerNorm, Gemm) 2-tile, (Add, RmsNorm, Gemm) 3-tile.
-            // Tile-zoo-pickable; one Impl per CUTLASS_TILE_ZOO entry per
-            // shape. matches() rejects multi-consumer norms so FusedQkvRope*
-            // / FusedGateUp* keep claiming the body QKV / gate-up patterns.
-            for tile in CUTLASS_TILE_ZOO {
-                lib.push(Box::new(CutlassFusedRmsNormGemmImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-                // CohereLayerNorm-flavored peer: claims `(Mean, Sub, RmsNorm,
-                // Gemm)` and emits `cohere_layer_norm + cutlass_gemm`. Cost
-                // calibration shared with the `CutlassFusedRmsNormGemm` row.
-                lib.push(Box::new(CutlassFusedMeanSubRmsNormGemmImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-                lib.push(Box::new(CutlassFusedAddRmsNormGemmImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-            }
-            // Singleton fallback for residual `Add`s whose downstream is not
-            // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
-            // adds before any LayerNorm. Emits `add_inplace`.
-            lib.push(Box::new(AddRefImpl));
-            // Tensor-parallel all-reduce-sum: the only matcher for
-            // `OpKind::AllReduce` nodes the lowering pass inserts after every
-            // row-parallel gemm at tp>1.
-            lib.push(Box::new(AllReduceImpl));
-            // Tensor-parallel all-gather along the last dim: the only matcher
-            // for `OpKind::AllGather` nodes the lowering pass inserts after
-            // the lm_head Gemm at tp>1.
-            lib.push(Box::new(AllGatherImpl));
-            // Multimodal embed splice — the only matcher for
-            // `OpKind::MmEmbedSplice` nodes the lowering pass
-            // (`tp_lowering::insert_mm_splices`) inserts after every Embed.
-            // At tp>1 sits after the AllReduce that `insert_all_reduces`
-            // chained onto the Embed, so the D2D-overwrite runs on reduced
-            // embeddings (not pre-reduce partials). At tp=1 sits directly
-            // on the Embed output — equivalent to the pre-refactor inline
-            // splice that lived inside `Instruction::Embed::eval`.
-            lib.push(Box::new(MmEmbedSpliceImpl));
-            // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
-            // + RmsNorm. Claimed by the DP in preference to the 2-tile
-            // FusedAddRmsNorm + standalone ScalarOffset because it's a
-            // larger claim.
-            lib.push(Box::new(FusedAddRmsNormWithOffsetImpl));
-            // Gemma-style `rmsnorm(x, w + scalar)` for the standalone case
-            // (no upstream residual-Add): scalar rides as the rms_norm
-            // kernel's `weight_offset` param.
-            lib.push(Box::new(ScalarOffsetRmsNormImpl));
-            // Tile × scalar in-place multiply (e.g. Gemma embed scale).
-            // Only claims Mul tiles whose inputs are (Tile, Scalar); the
-            // tensor×tensor SwiGLU / GELU fusions claim the disjoint
-            // (Tile, Tile) pattern.
-            lib.push(Box::new(ScalarMulImpl));
-            // Decode / prefill QKV+rope variants — the solver picks via
-            // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
-            //
-            // **NOT gated on the cuBLAS env var.** `CutlassFusedQkvRope*Impl`
-            // peers reject biased claims (Lever A2). At cuBLAS-OFF, qwen2's
-            // biased QKV pattern would have NO fused impl available; the
-            // singleton-fallback chain (RopeAppendRefImpl + CutlassFusedGemmBias
-            // + AttentionPrefillContiguous) emits K/V at `[T, heads*head_dim]`
-            // while the downstream Attention impl expects `[T, heads, head_dim]`
-            // (the fused-path layout) — verified correctness failure on
-            // qwen2-0.5b. Keeping these registered preserves correctness; the
-            // DP still picks `CutlassFusedQkvRope*` for non-biased patterns
-            // when its calibrated cost wins.
-            lib.push(Box::new(FusedQkvRopeCacheImpl));
-            lib.push(Box::new(FusedQkvRopePrefillImpl));
-            // CUTLASS peers — packed CUTLASS GEMM at (M, q+2*kv, hidden)
-            // followed by the same fused_qkv_rope_cache / fused_qkv_rope
-            // post-pass. One Impl per CUTLASS_TILE_ZOO entry per variant;
-            // target_compatible gates each on calibrated CSV row presence.
-            // matches() rejects biased claims (qwen2 keeps cuBLAS until the
-            // bias-zoo CSV is shape-swept).
-            for tile in CUTLASS_TILE_ZOO {
-                lib.push(Box::new(CutlassFusedQkvRopeCacheImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-                lib.push(Box::new(CutlassFusedQkvRopePrefillImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-            }
-            // FusedQkvQkNormRopeCacheImpl (three-gemm + fused qk_norm_rope +
-            // cache) is staged in this crate but intentionally NOT registered.
-            // The 3-gemm emit_call produces incorrect numerics on Qwen3/Gemma3
-            // (attention output diverges from golden at prompt 0 position 0).
-            // Root cause is unresolved: possibly Q/K/V ordering, reshape
-            // layout, or the interaction between the per-arch rotary cache
-            // and the kernel's expected layout. Until the correctness issue
-            // is tracked down, Qwen3/Gemma3 go through singletons
-            // (GemmRef + ReshapeRef + RmsNormRef + RopeAppendRef) which IS
-            // correctness-green.
-            //
-            // The singleton path is correctness-equivalent to what Qwen3 shipped
-            // with originally; the fused impl is a perf optimization that
-            // stays scoped to a future session with a proper numerics bringup.
-            //
-            // Singleton fallback claims standalone RopeAppend tiles. Emits
-            // `rotary_embedding_inplace` + `reshape_and_cache`.
-            lib.push(Box::new(RopeAppendRefImpl));
-            // Matching attention pair — decode reads from cache, prefill
-            // reads the contiguous K/V produced by the prefill QKV impl.
-            lib.push(Box::new(AttentionPrefillContiguousImpl));
-            // Encoder/bidirectional attention — claims the 3-arg
-            // `attention(q, k, v)` form (no kv_cache). All other attention
-            // Impls reject 3-arg via `attention_has_kv_cache_extern`, so this
-            // is the sole path for encoder models like ModernBERT.
-            lib.push(Box::new(EncoderAttentionImpl));
-            // Sliding-window variants of the attention pair. Claim
-            // `OpKind::SlidingAttention` so the DSL author opts into window
-            // masking per-tile (e.g. alternating layers via `if` in the DSL
-            // body). `window_size_left` reads from `sliding_window` config.
-            lib.push(Box::new(SlidingAttentionViaCacheImpl));
-            lib.push(Box::new(SlidingAttentionPrefillContiguousImpl));
-            // Standalone TanhSoftCap — reads `final_logit_softcapping` from
-            // config. The DSL body emits `tanh_softcap(...)` only for
-            // architectures that cap logits.
-            lib.push(Box::new(TanhSoftCapImpl));
-            // Cutlass standalone GEMM tile zoo — one Impl per tile variant
-            // in `target_profiles/cost_*.csv`. `target_compatible` gates each
-            // by "does this target have a calibrated cost row for this
-            // variant?", so targets without CSV data silently fall back to
-            // `GemmRefImpl` (cuBLAS). Matching is rejected for Gemms whose
-            // output flows into a fusion (RopeAppend / Silu / Mul) so the
-            // solver can never pick cutlass for a QKV or gate/up gemm that
-            // would otherwise break its fusion chain.
-            for tile in CUTLASS_TILE_ZOO {
-                lib.push(Box::new(CutlassGemmImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-            }
-            // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
-            // on residual. 2-tile claim over `(Gemm, Add)`; DP picks over
-            // FusedAddRmsNormImpl per layer-residual chain by cost.
-            for tile in CUTLASS_TILE_ZOO {
-                lib.push(Box::new(CutlassGemmAddImpl {
-                    tile_m: tile.0,
-                    tile_n: tile.1,
-                    stages: tile.2,
-                }));
-            }
-            // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
-            // Closes the small-N/large-K tall-skinny shape class where the
-            // standard tile zoo leaves cuBLAS winning. target_compatible
-            // gates on CSV row presence, so uncalibrated targets skip
-            // these variants silently.
-            for &(tm, tn, st, sk) in CUTLASS_SPLITK_ZOO {
-                lib.push(Box::new(CutlassGemmSplitKImpl {
-                    tile_m: tm,
-                    tile_n: tn,
-                    stages: st,
-                    split_k: sk,
-                }));
-            }
+        // CohereLayerNorm-flavored norm: claims `(Mean, Sub, RmsNorm)`
+        // and emits `cohere_layer_norm`. The DSL stays pure math
+        // (`mu = mean(x); centered = sub(x, mu); rmsnorm(centered, w)`);
+        // this Impl does the structural fusion back to one kernel call.
+        lib.push(Box::new(MeanSubRmsNormImpl));
+        // Torch-style LayerNorm with bias: claims the 4-tile pattern
+        // `(Mean, Sub, RmsNorm, BiasAdd)` and emits `layer_norm_bias`.
+        // Solver's claim-size-DESC sort lets this absorb the bias at
+        // sites where the trio's RmsNorm output flows into a `bias_add`
+        // (e.g. ModernBERT, Qwen2-VL vision blocks). Sites without a
+        // `bias_add` consumer fall through to the trio.
+        lib.push(Box::new(MeanSubRmsNormBiasAddImpl));
+        // The full cuBLAS-routing Impl set (singleton + fused peers):
+        //   - GemmRefImpl                 — singleton Gemm via cuBLAS
+        //   - FusedCublasGemmAddImpl      — (Gemm, Add) via cuBLAS
+        //   - FusedGemmBiasImpl           — (Gemm, BiasAdd) via cuBLAS
+        //   - FusedGateUpSiluMulImpl      — packed SwiGLU via cuBLAS
+        //   - FusedGateUpGeluMulImpl      — packed GELU-MLP via cuBLAS
+        //   - FusedQkvRopeCacheImpl       — packed QKV+rope (M=1) via cuBLAS
+        //   - FusedQkvRopePrefillImpl     — packed QKV+rope (M≥2) via cuBLAS
+        //
+        // Every one of these Impls has a `CutlassFused…` peer registered
+        // unconditionally below.
+        let cublas_enabled = std::env::var_os("SCRATCHY_DISABLE_CUBLAS_GEMM").is_none();
+        lib.push(Box::new(GemmRefImpl));
+        lib.push(Box::new(FusedCublasGemmAddImpl));
+        lib.push(Box::new(AttentionViaCacheImpl));
+        // Reshape is a metadata-only view op synthesized by shape
+        // inference to bridge axis-factor mismatches (e.g. per-head QK-
+        // norm in Qwen3/Gemma3). Zero-cost, zero-launch; the emitted
+        // code is a single `TensorView::reshape(&[..])` call.
+        lib.push(Box::new(ReshapeRefImpl));
+        // Multi-tile fusions. The solver's claim-size-DESC sort picks
+        // these over singleton coverage when both apply; the singletons
+        // stay as fallbacks for tile positions the fusion doesn't match
+        // (e.g. the first layer's input_layernorm, whose upstream is
+        // `embed` not `Add`, stays a singleton RmsNorm claim).
+        //
+        // `(Gemm, BiasAdd)` pairs not absorbed by a larger fusion (e.g.
+        // a lone affine-transform gemm that's not a QKV-pre-rope or
+        // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
+        //
+        // **NOT gated on the cuBLAS env var.** `CutlassFusedGemmBiasImpl`
+        // below has no `cutlass_gemm_bias` CSV rows for qwen2's K/V
+        // projection shapes (N=128, K=896 for Qwen2.5-0.5B and the rest
+        // of the qwen2 fleet). At cuBLAS-OFF the singleton-fallback chain
+        // (CutlassGemv + RopeAppendRefImpl + AttentionPrefill) produces a
+        // different K/V tensor layout than the fused path expects —
+        // verified failure on qwen2-0.5b: position 3 mismatch
+        // ("英文字" engine vs " is" golden). Until Lever A2 ships
+        // (cutlass_gemm_bias CSV sweep across qwen2 packed-QKV shapes),
+        // this Impl stays registered to keep qwen2 correctness-green.
+        lib.push(Box::new(FusedGemmBiasImpl));
+        // CUTLASS bias-add peer to FusedGemmBiasImpl — plain
+        // `cutlass::gemm::device::Gemm` with `LinearCombination` epilogue
+        // and bias passed as the C operand at ldc=0 (row broadcast). One
+        // Impl per CUTLASS_TILE_ZOO entry, gated per-tile on calibrated
+        // CSV row presence; the DP picks the best tile per workload.
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedGemmBiasImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpSiluMul
+        // below is the cuBLAS-OFF peer.
+        if cublas_enabled {
+            lib.push(Box::new(FusedGateUpSiluMulImpl));
+        }
+        // CUTLASS EVT peer to FusedGateUpSiluMulImpl — same claim, different
+        // kernel shape. Solver's DP picks whichever has lower calibrated
+        // cost per bucket; `target_compatible` gates on CSV row presence.
+        // Parameterized over CUTLASS_TILE_ZOO so the up-projection GEMM
+        // tile is DP-pickable rather than hardcoded — the previous
+        // hardcoded `cutlass_128x128_s3` lost to small-M tiles after the
+        // tile_m=16 splitK additions, breaking SiLU MLP fusions.
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedGateUpSiluMulImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpGeluMul
+        // below is the cuBLAS-OFF peer.
+        if cublas_enabled {
+            lib.push(Box::new(FusedGateUpGeluMulImpl));
+        }
+        // CUTLASS peer to FusedGateUpGeluMulImpl. Mirrors the cuBLAS path
+        // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
+        // BW-bound `gelu_and_mul_fused` — picking the GEMM tile per (M,
+        // 2I, K) bucket. One Impl per CUTLASS_TILE_ZOO entry.
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedGateUpGeluMulImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        lib.push(Box::new(FusedAddRmsNormImpl));
+        // Norm→Gemm fusion family: captures the lm_head + body Norm→Gemm
+        // patterns the analyzer's fusion-gap report flagged as the
+        // dominant cuBLAS surface. Three claim shapes — (RmsNorm, Gemm)
+        // 2-tile, (LayerNorm, Gemm) 2-tile, (Add, RmsNorm, Gemm) 3-tile.
+        // Tile-zoo-pickable; one Impl per CUTLASS_TILE_ZOO entry per
+        // shape. matches() rejects multi-consumer norms so FusedQkvRope*
+        // / FusedGateUp* keep claiming the body QKV / gate-up patterns.
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedRmsNormGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+            // CohereLayerNorm-flavored peer: claims `(Mean, Sub, RmsNorm,
+            // Gemm)` and emits `cohere_layer_norm + cutlass_gemm`. Cost
+            // calibration shared with the `CutlassFusedRmsNormGemm` row.
+            lib.push(Box::new(CutlassFusedMeanSubRmsNormGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+            lib.push(Box::new(CutlassFusedAddRmsNormGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // Singleton fallback for residual `Add`s whose downstream is not
+        // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
+        // adds before any LayerNorm. Emits `add_inplace`.
+        lib.push(Box::new(AddRefImpl));
+        // Tensor-parallel all-reduce-sum: the only matcher for
+        // `OpKind::AllReduce` nodes the lowering pass inserts after every
+        // row-parallel gemm at tp>1.
+        lib.push(Box::new(AllReduceImpl));
+        // Tensor-parallel all-gather along the last dim: the only matcher
+        // for `OpKind::AllGather` nodes the lowering pass inserts after
+        // the lm_head Gemm at tp>1.
+        lib.push(Box::new(AllGatherImpl));
+        // Multimodal embed splice — the only matcher for
+        // `OpKind::MmEmbedSplice` nodes the lowering pass
+        // (`tp_lowering::insert_mm_splices`) inserts after every Embed.
+        // At tp>1 sits after the AllReduce that `insert_all_reduces`
+        // chained onto the Embed, so the D2D-overwrite runs on reduced
+        // embeddings (not pre-reduce partials). At tp=1 sits directly
+        // on the Embed output — equivalent to the pre-refactor inline
+        // splice that lived inside `Instruction::Embed::eval`.
+        lib.push(Box::new(MmEmbedSpliceImpl));
+        // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
+        // + RmsNorm. Claimed by the DP in preference to the 2-tile
+        // FusedAddRmsNorm + standalone ScalarOffset because it's a
+        // larger claim.
+        lib.push(Box::new(FusedAddRmsNormWithOffsetImpl));
+        // Gemma-style `rmsnorm(x, w + scalar)` for the standalone case
+        // (no upstream residual-Add): scalar rides as the rms_norm
+        // kernel's `weight_offset` param.
+        lib.push(Box::new(ScalarOffsetRmsNormImpl));
+        // Tile × scalar in-place multiply (e.g. Gemma embed scale).
+        // Only claims Mul tiles whose inputs are (Tile, Scalar); the
+        // tensor×tensor SwiGLU / GELU fusions claim the disjoint
+        // (Tile, Tile) pattern.
+        lib.push(Box::new(ScalarMulImpl));
+        // Decode / prefill QKV+rope variants — the solver picks via
+        // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
+        //
+        // **NOT gated on the cuBLAS env var.** `CutlassFusedQkvRope*Impl`
+        // peers reject biased claims (Lever A2). At cuBLAS-OFF, qwen2's
+        // biased QKV pattern would have NO fused impl available; the
+        // singleton-fallback chain (RopeAppendRefImpl + CutlassFusedGemmBias
+        // + AttentionPrefillContiguous) emits K/V at `[T, heads*head_dim]`
+        // while the downstream Attention impl expects `[T, heads, head_dim]`
+        // (the fused-path layout) — verified correctness failure on
+        // qwen2-0.5b. Keeping these registered preserves correctness; the
+        // DP still picks `CutlassFusedQkvRope*` for non-biased patterns
+        // when its calibrated cost wins.
+        lib.push(Box::new(FusedQkvRopeCacheImpl));
+        lib.push(Box::new(FusedQkvRopePrefillImpl));
+        // CUTLASS peers — packed CUTLASS GEMM at (M, q+2*kv, hidden)
+        // followed by the same fused_qkv_rope_cache / fused_qkv_rope
+        // post-pass. One Impl per CUTLASS_TILE_ZOO entry per variant;
+        // target_compatible gates each on calibrated CSV row presence.
+        // matches() rejects biased claims (qwen2 keeps cuBLAS until the
+        // bias-zoo CSV is shape-swept).
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedQkvRopeCacheImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+            lib.push(Box::new(CutlassFusedQkvRopePrefillImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // FusedQkvQkNormRopeCacheImpl (three-gemm + fused qk_norm_rope +
+        // cache) is staged in this crate but intentionally NOT registered.
+        // The 3-gemm emit_call produces incorrect numerics on Qwen3/Gemma3
+        // (attention output diverges from golden at prompt 0 position 0).
+        // Root cause is unresolved: possibly Q/K/V ordering, reshape
+        // layout, or the interaction between the per-arch rotary cache
+        // and the kernel's expected layout. Until the correctness issue
+        // is tracked down, Qwen3/Gemma3 go through singletons
+        // (GemmRef + ReshapeRef + RmsNormRef + RopeAppendRef) which IS
+        // correctness-green.
+        //
+        // The singleton path is correctness-equivalent to what Qwen3 shipped
+        // with originally; the fused impl is a perf optimization that
+        // stays scoped to a future session with a proper numerics bringup.
+        //
+        // Singleton fallback claims standalone RopeAppend tiles. Emits
+        // `rotary_embedding_inplace` + `reshape_and_cache`.
+        lib.push(Box::new(RopeAppendRefImpl));
+        // Matching attention pair — decode reads from cache, prefill
+        // reads the contiguous K/V produced by the prefill QKV impl.
+        lib.push(Box::new(AttentionPrefillContiguousImpl));
+        // Encoder/bidirectional attention — claims the 3-arg
+        // `attention(q, k, v)` form (no kv_cache). All other attention
+        // Impls reject 3-arg via `attention_has_kv_cache_extern`, so this
+        // is the sole path for encoder models like ModernBERT.
+        lib.push(Box::new(EncoderAttentionImpl));
+        // Sliding-window variants of the attention pair. Claim
+        // `OpKind::SlidingAttention` so the DSL author opts into window
+        // masking per-tile (e.g. alternating layers via `if` in the DSL
+        // body). `window_size_left` reads from `sliding_window` config.
+        lib.push(Box::new(SlidingAttentionViaCacheImpl));
+        lib.push(Box::new(SlidingAttentionPrefillContiguousImpl));
+        // Standalone TanhSoftCap — reads `final_logit_softcapping` from
+        // config. The DSL body emits `tanh_softcap(...)` only for
+        // architectures that cap logits.
+        lib.push(Box::new(TanhSoftCapImpl));
+        // Cutlass standalone GEMM tile zoo — one Impl per tile variant
+        // in `target_profiles/cost_*.csv`. `target_compatible` gates each
+        // by "does this target have a calibrated cost row for this
+        // variant?", so targets without CSV data silently fall back to
+        // `GemmRefImpl` (cuBLAS). Matching is rejected for Gemms whose
+        // output flows into a fusion (RopeAppend / Silu / Mul) so the
+        // solver can never pick cutlass for a QKV or gate/up gemm that
+        // would otherwise break its fusion chain.
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
+        // on residual. 2-tile claim over `(Gemm, Add)`; DP picks over
+        // FusedAddRmsNormImpl per layer-residual chain by cost.
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassGemmAddImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
+        // Closes the small-N/large-K tall-skinny shape class where the
+        // standard tile zoo leaves cuBLAS winning. target_compatible
+        // gates on CSV row presence, so uncalibrated targets skip
+        // these variants silently.
+        for &(tm, tn, st, sk) in CUTLASS_SPLITK_ZOO {
+            lib.push(Box::new(CutlassGemmSplitKImpl {
+                tile_m: tm,
+                tile_n: tn,
+                stages: st,
+                split_k: sk,
+            }));
+        }
 
-            lib.push(Box::new(CutlassGemvImpl));
+        lib.push(Box::new(CutlassGemvImpl));
 
-            // ── Marlin (AWQ / GPTQ) impls ───────────────────────────────
-            //
-            // Active only on models whose `quantization_config` resolves at
-            // least one weight to a Marlin-consumable storage format
-            // (`StorageFormat::Awq { .. }` or `StorageFormat::Gptq { .. }`).
-            // Each matcher gates on quant storage, so they're no-ops on
-            // dense models — the dense fused impls claim the same patterns
-            // for `Dense` weights. Registered after the Cutlass zoo so they
-            // land with the rest of the matmul kernels.
-            lib.push(Box::new(MarlinGemmImpl));
-            lib.push(Box::new(MarlinFusedGateUpSiluMulImpl));
-            lib.push(Box::new(MarlinFusedGateUpGeluMulImpl));
-            lib.push(Box::new(MarlinFusedQkvRopeCacheImpl));
-            lib.push(Box::new(MarlinFusedQkvRopePrefillImpl));
+        // ── Marlin (AWQ / GPTQ) impls ───────────────────────────────
+        //
+        // Active only on models whose `quantization_config` resolves at
+        // least one weight to a Marlin-consumable storage format
+        // (`StorageFormat::Awq { .. }` or `StorageFormat::Gptq { .. }`).
+        // Each matcher gates on quant storage, so they're no-ops on
+        // dense models — the dense fused impls claim the same patterns
+        // for `Dense` weights. Registered after the Cutlass zoo so they
+        // land with the rest of the matmul kernels.
+        lib.push(Box::new(MarlinGemmImpl));
+        lib.push(Box::new(MarlinFusedGateUpSiluMulImpl));
+        lib.push(Box::new(MarlinFusedGateUpGeluMulImpl));
+        lib.push(Box::new(MarlinFusedQkvRopeCacheImpl));
+        lib.push(Box::new(MarlinFusedQkvRopePrefillImpl));
 
-            // ── BitsAndBytes 4-bit (NF4 / FP4) impls ────────────────────
-            // Gated per-matches on `StorageFormat::Bnb4 { .. }`; stay
-            // dormant on dense / Marlin-consumable models.
-            lib.push(Box::new(Bnb4GemmImpl));
-            lib.push(Box::new(Bnb4FusedGateUpSiluMulImpl));
-            lib.push(Box::new(Bnb4FusedGateUpGeluMulImpl));
-            lib.push(Box::new(Bnb4FusedQkvRopeCacheImpl));
-            lib.push(Box::new(Bnb4FusedQkvRopePrefillImpl));
+        // ── BitsAndBytes 4-bit (NF4 / FP4) impls ────────────────────
+        // Gated per-matches on `StorageFormat::Bnb4 { .. }`; stay
+        // dormant on dense / Marlin-consumable models.
+        lib.push(Box::new(Bnb4GemmImpl));
+        lib.push(Box::new(Bnb4FusedGateUpSiluMulImpl));
+        lib.push(Box::new(Bnb4FusedGateUpGeluMulImpl));
+        lib.push(Box::new(Bnb4FusedQkvRopeCacheImpl));
+        lib.push(Box::new(Bnb4FusedQkvRopePrefillImpl));
 
-            // ── GGML/GGUF impls ─────────────────────────────────────────
-            // Gated per-matches on `StorageFormat::Ggml`; stay dormant on
-            // dense / Marlin / BNB4 / FP8 models. Singleton + fused
-            // gate/up SwiGLU/SwiGELU; fused QKV+rope is still a follow-up
-            // (RopeAppendRefImpl claims the rope tile when storage is Ggml,
-            // matching the deferral gate in `rope_append_has_fused_qkv_upstream`).
-            lib.push(Box::new(GgmlGemmImpl));
-            lib.push(Box::new(GgmlFusedGateUpSiluMulImpl));
-            lib.push(Box::new(GgmlFusedGateUpGeluMulImpl));
-            lib.push(Box::new(GgmlFusedQkvRopeCacheImpl));
-            lib.push(Box::new(GgmlFusedQkvRopePrefillImpl));
+        // ── GGML/GGUF impls ─────────────────────────────────────────
+        // Gated per-matches on `StorageFormat::Ggml`; stay dormant on
+        // dense / Marlin / BNB4 / FP8 models. Singleton + fused
+        // gate/up SwiGLU/SwiGELU; fused QKV+rope is still a follow-up
+        // (RopeAppendRefImpl claims the rope tile when storage is Ggml,
+        // matching the deferral gate in `rope_append_has_fused_qkv_upstream`).
+        lib.push(Box::new(GgmlGemmImpl));
+        lib.push(Box::new(GgmlFusedGateUpSiluMulImpl));
+        lib.push(Box::new(GgmlFusedGateUpGeluMulImpl));
+        lib.push(Box::new(GgmlFusedQkvRopeCacheImpl));
+        lib.push(Box::new(GgmlFusedQkvRopePrefillImpl));
 
-            // ── FP8 (E4M3) impls ────────────────────────────────────────
-            // Gated per-matches on `StorageFormat::Fp8 { .. }`; stay dormant
-            // on dense / Marlin / BNB4 models. Singleton only today; fused
-            // QKV / gate-up peers are perf follow-ups.
-            lib.push(Box::new(Fp8GemmImpl));
-            lib.push(Box::new(Fp8FusedGemmBiasImpl));
-            lib.push(Box::new(Fp8FusedGateUpSiluMulImpl));
-            lib.push(Box::new(Fp8FusedGateUpGeluMulImpl));
-            lib.push(Box::new(Fp8FusedQkvRopeCacheImpl));
-            lib.push(Box::new(Fp8FusedQkvRopePrefillImpl));
+        // ── FP8 (E4M3) impls ────────────────────────────────────────
+        // Gated per-matches on `StorageFormat::Fp8 { .. }`; stay dormant
+        // on dense / Marlin / BNB4 models. Singleton only today; fused
+        // QKV / gate-up peers are perf follow-ups.
+        lib.push(Box::new(Fp8GemmImpl));
+        lib.push(Box::new(Fp8FusedGemmBiasImpl));
+        lib.push(Box::new(Fp8FusedGateUpSiluMulImpl));
+        lib.push(Box::new(Fp8FusedGateUpGeluMulImpl));
+        lib.push(Box::new(Fp8FusedQkvRopeCacheImpl));
+        lib.push(Box::new(Fp8FusedQkvRopePrefillImpl));
 
-            // ── DeepSeek MLA + MoE ops ───────────────────────────────────
-            // MLA split (kv_a → kv_latent + k_pe), full MLA attention
-            // sequence, and DeepSeekV2MoE (routed + shared expert).
-            lib.push(Box::new(MlaSplitRefImpl));
-            lib.push(Box::new(MlaAttentionImpl));
-            lib.push(Box::new(GatedDeltaNetImpl));
-            lib.push(Box::new(GateSplitImpl));
-            lib.push(Box::new(GateApplyImpl));
-            lib.push(Box::new(GateScaleImpl));
-            lib.push(Box::new(DeepSeekMoeRefImpl));
-            lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
-            lib.push(Box::new(DeepSeekGgmlMoeImpl));
-            lib.push(Box::new(FusedMoeRefImpl));
-            lib.push(Box::new(SharedFusedMoeRefImpl));
-            lib.push(Box::new(CudaGemmaMoeImpl));
+        // ── DeepSeek MLA + MoE ops ───────────────────────────────────
+        // MLA split (kv_a → kv_latent + k_pe), full MLA attention
+        // sequence, and DeepSeekV2MoE (routed + shared expert).
+        lib.push(Box::new(MlaSplitRefImpl));
+        lib.push(Box::new(MlaAttentionImpl));
+        lib.push(Box::new(GatedDeltaNetImpl));
+        lib.push(Box::new(GateSplitImpl));
+        lib.push(Box::new(GateApplyImpl));
+        lib.push(Box::new(GateScaleImpl));
+        lib.push(Box::new(DeepSeekMoeRefImpl));
+        lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
+        lib.push(Box::new(DeepSeekGgmlMoeImpl));
+        lib.push(Box::new(FusedMoeRefImpl));
+        lib.push(Box::new(SharedFusedMoeRefImpl));
+        lib.push(Box::new(CudaGemmaMoeImpl));
 
-            // ── Vision-tower ops (Phase G.4) ─────────────────────────────
-            // One Impl per vision OpKind from G.2. Pairs with the
-            // `OpKind::from_name` arms added in G.4 so `varlen_attention(...)`
-            // / `vision_rope(...)` / `quick_gelu(...)` / `gelu_erf(...)` parse
-            // ⟺ codegen stays total. Unreachable until `#[vision_forward]`
-            // bodies land in G.5+.
-            lib.push(Box::new(VarlenAttentionImpl));
-            lib.push(Box::new(VisionRopeImpl));
-            lib.push(Box::new(QuickGeluImpl));
-            lib.push(Box::new(GeluErfImpl));
-            // GELU-tanh singleton (Phase G.7(c)). Mirrors `QuickGeluImpl` /
-            // `GeluErfImpl`; claims a standalone `gelu(x)` tile. SigLIP /
-            // Gemma3-MM use tanh-form GELU in their MLP. The
-            // `FusedGateUpGeluMul*` family still claims `(gemm, gemm, gelu, mul)`
-            // SwiGLU-style chains (Gemma2/3 text decoder); the singleton only
-            // fires when no Mul follows.
-            lib.push(Box::new(GeluImpl));
-            // Vision learned positional embedding (Phase G.7(c.1)). Mirror of
-            // `EmbedRefImpl` — same kernel (`embedding_gather_masked`), but
-            // anchored on `vision_num_positions` / `vision_embed_dim` and
-            // reading `ctx.fwd.vision_position_ids` instead of
-            // `ctx.fwd.input_ids`. Used by SigLIP / Gemma3-MM and any future
-            // tower with a learned positional table.
-            lib.push(Box::new(PosEmbedRefImpl));
-            // Pixels materialization (Phase G.5.e.1). Synthesized by
-            // `vision_lowering::materialize_pixels` after `fuf::unroll`
-            // under `Prelude::Vision`; the Impl runs only when that pass
-            // produced a tile. Decoder bodies never see this OpKind.
-            lib.push(Box::new(LoadPixelsImpl));
-            // Qwen3.5-VL pos_embeds materialization (sibling of LoadPixels).
-            lib.push(Box::new(LoadPosEmbedsImpl));
-            // Row-permutation gather (Phase G.6.4). Claims any DSL call to
-            // `embedding_gather(x, indices)`. The `indices` arg is one of
-            // `vision_window_index` / `vision_reverse_indices` (both vision-
-            // prelude externs); the Impl bakes which one the caller used into
-            // the emitted `Instruction::EmbeddingGather`'s discriminant so
-            // eval reads the correct `ForwardCtx` field.
-            lib.push(Box::new(EmbeddingGatherImpl));
-            // 2-D non-overlapping average pool (Phase G.7(b)). Claims any
-            // `avg_pool_2d(x)` call; reduces the leading dim by the bake-time
-            // `vision_pool_factor`. Used by Gemma3-MM's SigLIP→text projector.
-            lib.push(Box::new(AvgPool2dImpl));
+        // ── Vision-tower ops (Phase G.4) ─────────────────────────────
+        // One Impl per vision OpKind from G.2. Pairs with the
+        // `OpKind::from_name` arms added in G.4 so `varlen_attention(...)`
+        // / `vision_rope(...)` / `quick_gelu(...)` / `gelu_erf(...)` parse
+        // ⟺ codegen stays total. Unreachable until `#[vision_forward]`
+        // bodies land in G.5+.
+        lib.push(Box::new(VarlenAttentionImpl));
+        lib.push(Box::new(VisionRopeImpl));
+        lib.push(Box::new(QuickGeluImpl));
+        lib.push(Box::new(GeluErfImpl));
+        // GELU-tanh singleton (Phase G.7(c)). Mirrors `QuickGeluImpl` /
+        // `GeluErfImpl`; claims a standalone `gelu(x)` tile. SigLIP /
+        // Gemma3-MM use tanh-form GELU in their MLP. The
+        // `FusedGateUpGeluMul*` family still claims `(gemm, gemm, gelu, mul)`
+        // SwiGLU-style chains (Gemma2/3 text decoder); the singleton only
+        // fires when no Mul follows.
+        lib.push(Box::new(GeluImpl));
+        // Vision learned positional embedding (Phase G.7(c.1)). Mirror of
+        // `EmbedRefImpl` — same kernel (`embedding_gather_masked`), but
+        // anchored on `vision_num_positions` / `vision_embed_dim` and
+        // reading `ctx.fwd.vision_position_ids` instead of
+        // `ctx.fwd.input_ids`. Used by SigLIP / Gemma3-MM and any future
+        // tower with a learned positional table.
+        lib.push(Box::new(PosEmbedRefImpl));
+        // Pixels materialization (Phase G.5.e.1). Synthesized by
+        // `vision_lowering::materialize_pixels` after `fuf::unroll`
+        // under `Prelude::Vision`; the Impl runs only when that pass
+        // produced a tile. Decoder bodies never see this OpKind.
+        lib.push(Box::new(LoadPixelsImpl));
+        // Qwen3.5-VL pos_embeds materialization (sibling of LoadPixels).
+        lib.push(Box::new(LoadPosEmbedsImpl));
+        // Row-permutation gather (Phase G.6.4). Claims any DSL call to
+        // `embedding_gather(x, indices)`. The `indices` arg is one of
+        // `vision_window_index` / `vision_reverse_indices` (both vision-
+        // prelude externs); the Impl bakes which one the caller used into
+        // the emitted `Instruction::EmbeddingGather`'s discriminant so
+        // eval reads the correct `ForwardCtx` field.
+        lib.push(Box::new(EmbeddingGatherImpl));
+        // 2-D non-overlapping average pool (Phase G.7(b)). Claims any
+        // `avg_pool_2d(x)` call; reduces the leading dim by the bake-time
+        // `vision_pool_factor`. Used by Gemma3-MM's SigLIP→text projector.
+        lib.push(Box::new(AvgPool2dImpl));
 
-            // FlashInfer paged attention. Gated sm_89+ in each Impl's
-            // `target_compatible`; sm_80/sm_86 fall back to FA2 (untested
-            // with this shim).
-            //
-            // Apples-to-apples vs Python vLLM (`--attention-backend
-            // FLASHINFER`, CUDA graphs both sides, BF16, vllm 0.19.1):
-            //   H100  BS=1 in=8192   3B 0.265s vs 0.334s py  (-21%)
-            //                         7B 0.405s vs 0.583s py  (-30%)
-            //                        14B 0.777s vs 1.147s py  (-32%)
-            //   L40S  BS=1 in=8192   3B 0.651s vs 0.935s py  (-30%)
-            //                         7B 1.336s vs 1.956s py  (-32%)
-            //                        14B 2.647s vs 3.939s py  (-33%)
-            // Batched (BS=8/32) is -5..-13% across both arches.
-            //
-            // H100 TP=2 verified (Qwen2.5-7B 0.348s, Qwen2.5-14B 0.625s
-            // at BS=1 in=8192, faster than TP=1) including the
-            // num_kv_heads=1-per-rank shape (Qwen2.5-3B at TP=2).
-            //
-            // The sm_89 enable depends on the multi-slot plan cache in
-            // `scratchy_target_cuda::flashinfer::FlashInferPlanCache`. The
-            // cost solver alternates between (head_dim,
-            // use_logits_soft_cap) impls across decode shapes; with the
-            // older single-slot cache, switching cfg mid-session
-            // `cudaFree`d the previous plan's int_ws_d/float_ws_d, which
-            // captured CUDA graphs still referenced through params_1 /
-            // params_2 baked into kernel args at capture — replay then
-            // surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS`. Holding one
-            // persistent slot per cfg fixes that.
-            for &head_dim in &[64u32, 128, 256] {
-                for &use_softcap in &[false, true] {
-                    lib.push(Box::new(FlashInferAttentionDecodeImpl {
-                        head_dim,
-                        use_logits_soft_cap: use_softcap,
-                    }));
-                    lib.push(Box::new(FlashInferAttentionPrefillImpl {
-                        head_dim,
-                        use_logits_soft_cap: use_softcap,
-                    }));
-                }
+        // FlashInfer paged attention. Gated sm_89+ in each Impl's
+        // `target_compatible`; sm_80/sm_86 fall back to FA2 (untested
+        // with this shim).
+        //
+        // Apples-to-apples vs Python vLLM (`--attention-backend
+        // FLASHINFER`, CUDA graphs both sides, BF16, vllm 0.19.1):
+        //   H100  BS=1 in=8192   3B 0.265s vs 0.334s py  (-21%)
+        //                         7B 0.405s vs 0.583s py  (-30%)
+        //                        14B 0.777s vs 1.147s py  (-32%)
+        //   L40S  BS=1 in=8192   3B 0.651s vs 0.935s py  (-30%)
+        //                         7B 1.336s vs 1.956s py  (-32%)
+        //                        14B 2.647s vs 3.939s py  (-33%)
+        // Batched (BS=8/32) is -5..-13% across both arches.
+        //
+        // H100 TP=2 verified (Qwen2.5-7B 0.348s, Qwen2.5-14B 0.625s
+        // at BS=1 in=8192, faster than TP=1) including the
+        // num_kv_heads=1-per-rank shape (Qwen2.5-3B at TP=2).
+        //
+        // The sm_89 enable depends on the multi-slot plan cache in
+        // `scratchy_target_cuda::flashinfer::FlashInferPlanCache`. The
+        // cost solver alternates between (head_dim,
+        // use_logits_soft_cap) impls across decode shapes; with the
+        // older single-slot cache, switching cfg mid-session
+        // `cudaFree`d the previous plan's int_ws_d/float_ws_d, which
+        // captured CUDA graphs still referenced through params_1 /
+        // params_2 baked into kernel args at capture — replay then
+        // surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS`. Holding one
+        // persistent slot per cfg fixes that.
+        for &head_dim in &[64u32, 128, 256] {
+            for &use_softcap in &[false, true] {
+                lib.push(Box::new(FlashInferAttentionDecodeImpl {
+                    head_dim,
+                    use_logits_soft_cap: use_softcap,
+                }));
+                lib.push(Box::new(FlashInferAttentionPrefillImpl {
+                    head_dim,
+                    use_logits_soft_cap: use_softcap,
+                }));
             }
-            // FA3 Hopper-native decode (sm_90+, hdim128, no softcap). Solver
-            // weighs it against `FlashInferAttentionDecodeImpl` per cell;
-            // when the cost CSV doesn't have an `fa3_*` row, target_compatible
-            // returns false and FI wins by default (zero-config fallback).
-            #[cfg(fa3_built)]
-            lib.push(Box::new(FlashAttention3DecodeImpl { head_dim: 128 }));
-        } // end #[cfg(feature = "cuda")] CUDA-impls block
-    }
+        }
+        // FA3 Hopper-native decode (sm_90+, hdim128, no softcap). Solver
+        // weighs it against `FlashInferAttentionDecodeImpl` per cell;
+        // when the cost CSV doesn't have an `fa3_*` row, target_compatible
+        // returns false and FI wins by default (zero-config fallback).
+        #[cfg(fa3_built)]
+        lib.push(Box::new(FlashAttention3DecodeImpl { head_dim: 128 }));
+    } // end #[cfg(feature = "cuda")] CUDA-impls block
     lib
 }
 
@@ -2502,22 +2130,15 @@ pub fn starter_library() -> ImplementationLibrary {
 // safetensors path, so most callers get this for free.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedGemmBiasImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedGemmBiasImpl {
     fn name(&self) -> &'static str {
         "fused_gemm_bias"
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        // cuBLAS `gemm_bias` epilog — CUDA only. The Metal interpreter
-        // (Phase 5.A) has no `FusedGemmBias` lowering arm, so on Metal the
-        // `(Gemm, BiasAdd)` chain must stay split (Gemm + `MetalBiasAdd`,
-        // both of which `lower_one` handles). Without this gate the cost
-        // solver picks the fused variant at M=1 and pool-init panics. Spyre
-        // doesn't register this impl at all, but gate it to cuda honestly.
+        // cuBLAS `gemm_bias` epilog — CUDA only.
         profile.backend == crate::target::Backend::Cuda
     }
 
@@ -2718,14 +2339,12 @@ impl Implementation for FusedGemmBiasImpl {
 // (workload M, weight N, K) bucket.
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedGemmBiasImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedGemmBiasImpl {
     fn csv_name(&self) -> &'static str {
         self.static_name()
@@ -2758,7 +2377,6 @@ impl CutlassFusedGemmBiasImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedGemmBiasImpl {
     fn name(&self) -> &'static str {
         self.static_name()
@@ -2925,7 +2543,6 @@ impl Implementation for CutlassFusedGemmBiasImpl {
 // wants. No intermediate D2D copies; no cross-impl contract.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedGateUpSiluMulImpl;
 
 /// The `WeightId` + concrete index read by the first weight-typed
@@ -2994,7 +2611,6 @@ pub fn fused_accessor_name(
     syn::Ident::new(&joined, proc_macro2::Span::call_site())
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedGateUpSiluMulImpl {
     fn name(&self) -> &'static str {
         "fused_gate_up_silu_mul"
@@ -3262,14 +2878,12 @@ pub(crate) fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> boo
 // memory relative to the cuBLAS-packed peer.
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedGateUpSiluMulImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedGateUpSiluMulImpl {
     /// CSV name for the up-projection GEMM tile.
     fn up_csv_name(&self) -> &'static str {
@@ -3299,7 +2913,6 @@ impl CutlassFusedGateUpSiluMulImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedGateUpSiluMulImpl {
     fn name(&self) -> &'static str {
         self.up_csv_name()
@@ -3489,14 +3102,12 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
 // `cutlass_<tile>(M, 2I, K) < cublas(M, 2I, K)`.
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedGateUpGeluMulImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedGateUpGeluMulImpl {
     fn csv_name(&self) -> &'static str {
         // Reuses the standalone CutlassGemm tile names — the GEMM
@@ -3527,7 +3138,6 @@ impl CutlassFusedGateUpGeluMulImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedGateUpGeluMulImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
@@ -3733,10 +3343,8 @@ fn rotary_cos_sin_tokens(fuf: &Fuf, claimed: &[TileId]) -> TokenStream {
 // Gemm cannot simultaneously feed a Silu and a Gelu.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedGateUpGeluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedGateUpGeluMulImpl {
     fn name(&self) -> &'static str {
         "fused_gate_up_gelu_mul"
@@ -3984,7 +3592,6 @@ pub struct ScalarMulImpl;
 
 impl ScalarMulImpl {}
 
-#[cfg(feature = "cuda")]
 impl Implementation for ScalarMulImpl {
     fn name(&self) -> &'static str {
         "scalar_mul_inplace"
@@ -4151,10 +3758,8 @@ impl Implementation for ScalarMulImpl {
 // field exists or the tile shouldn't be in the FUF.)
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct TanhSoftCapImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for TanhSoftCapImpl {
     fn name(&self) -> &'static str {
         "tanh_softcap_inplace"
@@ -4273,10 +3878,8 @@ impl Implementation for TanhSoftCapImpl {
 /// (base head_dim × kv heads) or `attention` (global head_dim × global
 /// kv heads, Gemma4: 512×1).
 #[derive(Debug)]
-#[cfg(feature = "cuda")]
 pub struct RmsNormUnitImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for RmsNormUnitImpl {
     fn name(&self) -> &'static str {
         "rmsnorm_unit"
@@ -4403,10 +4006,8 @@ impl Implementation for RmsNormUnitImpl {
 /// applied to the hidden state at the end of every decoder layer).
 /// DSL `scalar_weight_mul(x, layer_scalar[layer])`.
 #[derive(Debug)]
-#[cfg(feature = "cuda")]
 pub struct ScalarWeightMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for ScalarWeightMulImpl {
     fn name(&self) -> &'static str {
         "scalar_weight_mul"
@@ -4538,10 +4139,8 @@ impl Implementation for ScalarWeightMulImpl {
 // the new contribution, slot 1 is the residual.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct AddRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for AddRefImpl {
     fn name(&self) -> &'static str {
         "add_ref"
@@ -4698,10 +4297,8 @@ impl Implementation for AddRefImpl {
 // returns `None` → `UnclaimedTile` library gap.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedAddRmsNormImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedAddRmsNormImpl {
     fn name(&self) -> &'static str {
         "fused_add_rms_norm"
@@ -4835,11 +4432,6 @@ impl Implementation for FusedAddRmsNormImpl {
         )
     }
 
-    #[cfg(feature = "metal")]
-    fn as_atom(&self, _m: &MatchInfo, _fuf: &Fuf) -> Option<Box<dyn crate::atom::Atom>> {
-        Some(Box::new(crate::atom_lib::AddRmsNormAtom::default()))
-    }
-
     fn fan_out(
         &self,
         m: &MatchInfo,
@@ -4917,10 +4509,8 @@ impl Implementation for FusedAddRmsNormImpl {
 // Silu/Mul precedent uses.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MeanSubRmsNormImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MeanSubRmsNormImpl {
     fn name(&self) -> &'static str {
         "mean_sub_rms_norm"
@@ -5109,10 +4699,8 @@ impl Implementation for MeanSubRmsNormImpl {
 // Used by encoder models like ModernBERT.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MeanSubRmsNormBiasAddImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MeanSubRmsNormBiasAddImpl {
     fn name(&self) -> &'static str {
         "mean_sub_rms_norm_bias_add"
@@ -5329,14 +4917,12 @@ impl Implementation for MeanSubRmsNormBiasAddImpl {
 // FusedQkvRope* still claims them.
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedRmsNormGemmImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedRmsNormGemmImpl {
     fn csv_name(&self) -> &'static str {
         match (self.tile_m, self.tile_n, self.stages) {
@@ -5438,7 +5024,6 @@ fn cutlass_tile_supports_shape(_m: u32, n: u32, k: u32) -> bool {
     n.is_multiple_of(8) && k.is_multiple_of(8)
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedRmsNormGemmImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
@@ -5645,14 +5230,12 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
 // `CutlassFusedRmsNormGemm` CSV row.
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedMeanSubRmsNormGemmImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedMeanSubRmsNormGemmImpl {
     fn csv_name(&self) -> &'static str {
         // Share calibration with the LayerNorm-Gemm flavor — the
@@ -5669,7 +5252,6 @@ impl CutlassFusedMeanSubRmsNormGemmImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedMeanSubRmsNormGemmImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
@@ -5888,14 +5470,12 @@ impl Implementation for CutlassFusedMeanSubRmsNormGemmImpl {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedAddRmsNormGemmImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedAddRmsNormGemmImpl {
     fn csv_name(&self) -> &'static str {
         CutlassFusedRmsNormGemmImpl {
@@ -5907,7 +5487,6 @@ impl CutlassFusedAddRmsNormGemmImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedAddRmsNormGemmImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
@@ -6160,10 +5739,8 @@ impl Implementation for CutlassFusedAddRmsNormGemmImpl {
 // claim possible — the DP reports UnclaimedTile.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedAddRmsNormWithOffsetImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedAddRmsNormWithOffsetImpl {
     fn name(&self) -> &'static str {
         "fused_add_rms_norm_with_offset"
@@ -6440,10 +6017,8 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
 // [`FusedAddRmsNormImpl`], which rejects Adds with non-Tile inputs.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct ScalarOffsetRmsNormImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for ScalarOffsetRmsNormImpl {
     fn name(&self) -> &'static str {
         "scalar_offset_rms_norm"
@@ -6644,7 +6219,7 @@ impl Implementation for ScalarOffsetRmsNormImpl {
         let acc_name = acc.name.to_string();
         let (_base, layer) = split_base_layer(&acc_name);
         let layer = layer.map_or(0, |v| v.0) as u32;
-        // `hidden_size` / `m_multiplier` for the metal kernel's baked
+        // `hidden_size` / `m_multiplier` for the instruction's baked
         // reduction width + row count — same name-based detection as
         // `RmsNormRefImpl::fan_out`. Per-head q/k norms reduce `head_dim`
         // over `num_q/kv_heads` rows-per-token; every other norm reduces
@@ -6707,7 +6282,6 @@ impl Implementation for ScalarOffsetRmsNormImpl {
 // other two are swallowed by the same claim.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedQkvRopeCacheImpl;
 
 /// Read the layer index captured by the DSL's `kv_cache[layer]`
@@ -6825,7 +6399,6 @@ fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     true
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "fused_qkv_rope_cache"
@@ -7193,7 +6766,6 @@ impl Implementation for FusedQkvRopeCacheImpl {
 // same claim.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedQkvQkNormRopeCacheImpl;
 
 /// Walk from a Gemm tile through the optional `Add → Reshape →
@@ -7375,7 +6947,6 @@ fn find_gemm_root_of_norm_chain(fuf: &Fuf, endpoint: TileId) -> Option<TileId> {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedQkvQkNormRopeCacheImpl {
     fn name(&self) -> &'static str {
         "fused_qkv_qk_norm_rope_cache"
@@ -7801,10 +7372,8 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
 // `kv_cache[layer]` argument), same as for RopeAppend.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct AttentionViaCacheImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for AttentionViaCacheImpl {
     fn name(&self) -> &'static str {
         "attention_via_cache"
@@ -7965,10 +7534,8 @@ impl Implementation for AttentionViaCacheImpl {
 // count.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct RopeAppendRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for RopeAppendRefImpl {
     fn name(&self) -> &'static str {
         "rope_append_ref"
@@ -8171,7 +7738,6 @@ impl Implementation for RopeAppendRefImpl {
 /// The additive offset the KV operand `tile` carries into the cache. No
 /// wildcard: an op kind that can feed a KV writer is classified here before
 /// it compiles.
-#[cfg(feature = "cuda")]
 fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset {
     use scratchy_forward_compiler::{BiasStorage, KvOffset};
     let node = fuf.get(tile);
@@ -8252,10 +7818,8 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
 // bucket. Decode goes through `FusedQkvRopeCacheImpl`.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedQkvRopePrefillImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedQkvRopePrefillImpl {
     fn name(&self) -> &'static str {
         "fused_qkv_rope_prefill"
@@ -8468,14 +8032,12 @@ fn fused_qkv_claim_is_biased(fuf: &Fuf, info: &MatchInfo) -> bool {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedQkvRopeCacheImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedQkvRopeCacheImpl {
     fn csv_name(&self) -> &'static str {
         // Reuses the standalone CutlassGemm tile names — the GEMM
@@ -8507,7 +8069,6 @@ impl CutlassFusedQkvRopeCacheImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
@@ -8715,14 +8276,12 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
 }
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassFusedQkvRopePrefillImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassFusedQkvRopePrefillImpl {
     fn csv_name(&self) -> &'static str {
         CutlassFusedQkvRopeCacheImpl {
@@ -8734,7 +8293,6 @@ impl CutlassFusedQkvRopePrefillImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassFusedQkvRopePrefillImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
@@ -8925,10 +8483,8 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
 // `WorkloadConstraint::NumTokensRange { min: 2, max: u32::MAX }`.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct AttentionPrefillContiguousImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for AttentionPrefillContiguousImpl {
     fn name(&self) -> &'static str {
         "attention_prefill_contiguous"
@@ -9080,10 +8636,8 @@ impl Implementation for AttentionPrefillContiguousImpl {
 // variants land separately as they need a window-size constant.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct EncoderAttentionImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for EncoderAttentionImpl {
     fn name(&self) -> &'static str {
         "encoder_attention"
@@ -9205,10 +8759,8 @@ impl Implementation for EncoderAttentionImpl {
 // [`SlidingAttentionPrefillContiguousImpl`].
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct SlidingAttentionViaCacheImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for SlidingAttentionViaCacheImpl {
     fn name(&self) -> &'static str {
         "sliding_attention_via_cache"
@@ -9329,10 +8881,8 @@ impl Implementation for SlidingAttentionViaCacheImpl {
 // and calls `flash_attn_contiguous` with the config-driven window.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct SlidingAttentionPrefillContiguousImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for SlidingAttentionPrefillContiguousImpl {
     fn name(&self) -> &'static str {
         "sliding_attention_prefill_contiguous"
@@ -9517,14 +9067,12 @@ const CUTLASS_TILE_ZOO: &[(u32, u32, u32)] = &[
 ];
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassGemmImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassGemmImpl {
     /// Same string as `static_name`, returned as `&'static str` so the
     /// hot `target_compatible` path doesn't allocate. The CSV column
@@ -9571,7 +9119,6 @@ fn gemm_mnk(ctx: &CostCtx, node: &crate::fuf::FufNode) -> Option<(u32, u32, u32)
     Some((m, n, k))
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassGemmImpl {
     fn name(&self) -> &'static str {
         self.static_name()
@@ -9753,7 +9300,6 @@ const CUTLASS_SPLITK_ZOO: &[(u32, u32, u32, u32)] = &[
 ];
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassGemmSplitKImpl {
     pub tile_m: u32,
     pub tile_n: u32,
@@ -9761,7 +9307,6 @@ pub struct CutlassGemmSplitKImpl {
     pub split_k: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassGemmSplitKImpl {
     fn csv_name(&self) -> &'static str {
         self.static_name()
@@ -9792,7 +9337,6 @@ impl CutlassGemmSplitKImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassGemmSplitKImpl {
     fn name(&self) -> &'static str {
         self.static_name()
@@ -9938,14 +9482,12 @@ impl Implementation for CutlassGemmSplitKImpl {
 // the same way `CutlassGemmImpl` does.
 
 #[derive(Debug, Clone)]
-#[cfg(feature = "cuda")]
 pub struct CutlassGemmAddImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-#[cfg(feature = "cuda")]
 impl CutlassGemmAddImpl {
     fn csv_name(&self) -> &'static str {
         // Dedicated `_add` CSV row measured at beta=1.0 — captures
@@ -9983,7 +9525,6 @@ impl CutlassGemmAddImpl {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassGemmAddImpl {
     fn name(&self) -> &'static str {
         self.impl_name()
@@ -10196,10 +9737,8 @@ impl Implementation for CutlassGemmAddImpl {
 // can already win these buckets via cost).
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedCublasGemmAddImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedCublasGemmAddImpl {
     fn name(&self) -> &'static str {
         "fused_cublas_gemm_add"
@@ -10397,10 +9936,8 @@ impl Implementation for FusedCublasGemmAddImpl {
 /// M=1 SIMT GEMV specialisation — the decode path's lm_head /
 /// o_proj / down_proj.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct CutlassGemvImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for CutlassGemvImpl {
     fn name(&self) -> &'static str {
         "cutlass_gemv"
@@ -10710,10 +10247,8 @@ fn marlin_fused_gate_up_would_match(fuf: &Fuf, seed: TileId) -> bool {
 
 /// Singleton Marlin GEMM — the AWQ counterpart of `GemmRefImpl`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MarlinGemmImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MarlinGemmImpl {
     fn name(&self) -> &'static str {
         "marlin_gemm"
@@ -10856,10 +10391,8 @@ impl Implementation for MarlinGemmImpl {
 /// `FusedGateUpSiluMulImpl`. AWQ metadata concats along dim N, so
 /// the fused accessor is a single `MarlinLinear` (not two).
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MarlinFusedGateUpSiluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MarlinFusedGateUpSiluMulImpl {
     fn name(&self) -> &'static str {
         "marlin_fused_gate_up_silu_mul"
@@ -11038,10 +10571,8 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
 /// `gelu_and_mul_fused` — exactly what the dense GELU path does,
 /// but reading from a MarlinLinear instead of a dense LinearLayer.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MarlinFusedGateUpGeluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MarlinFusedGateUpGeluMulImpl {
     fn name(&self) -> &'static str {
         "marlin_fused_gate_up_gelu_mul"
@@ -11212,10 +10743,8 @@ impl Implementation for MarlinFusedGateUpGeluMulImpl {
 /// Marlin fused QKV + RoPE + cache-write (decode) — the AWQ
 /// counterpart of `FusedQkvRopeCacheImpl`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MarlinFusedQkvRopeCacheImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MarlinFusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "marlin_fused_qkv_rope_cache"
@@ -11462,10 +10991,8 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
 /// Marlin fused QKV + RoPE (prefill, contiguous K/V) — the AWQ
 /// counterpart of `FusedQkvRopePrefillImpl`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MarlinFusedQkvRopePrefillImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MarlinFusedQkvRopePrefillImpl {
     fn name(&self) -> &'static str {
         "marlin_fused_qkv_rope_prefill"
@@ -11631,10 +11158,8 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
 
 /// Singleton Bnb4 GEMM — BNB4 counterpart of `MarlinGemmImpl`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Bnb4GemmImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Bnb4GemmImpl {
     fn name(&self) -> &'static str {
         "bnb4_gemm"
@@ -11771,10 +11296,8 @@ impl Implementation for Bnb4GemmImpl {
 /// `ggml_dequantize_to_tensor + cuBLAS` kernel based on the runtime
 /// `GgmlDType` carried on the loaded `GgmlStorage`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GgmlGemmImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GgmlGemmImpl {
     fn name(&self) -> &'static str {
         "ggml_gemm"
@@ -11899,10 +11422,8 @@ impl Implementation for GgmlGemmImpl {
 /// calls the polymorphic `LinearLayer::forward` to dequant+gemm
 /// into a `[tokens, 2*intermediate]` tensor, then `silu_and_mul_fused`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GgmlFusedGateUpSiluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GgmlFusedGateUpSiluMulImpl {
     fn name(&self) -> &'static str {
         "ggml_fused_gate_up_silu_mul"
@@ -12068,10 +11589,8 @@ impl Implementation for GgmlFusedGateUpSiluMulImpl {
 /// Gemma uses Gelu — having both ready avoids a second round-trip
 /// when wiring more arches.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GgmlFusedGateUpGeluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GgmlFusedGateUpGeluMulImpl {
     fn name(&self) -> &'static str {
         "ggml_fused_gate_up_gelu_mul"
@@ -12245,10 +11764,8 @@ impl Implementation for GgmlFusedGateUpGeluMulImpl {
 /// — without it, the standalone `BiasAdd` tile has no claimer and
 /// the solver fails.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GgmlFusedQkvRopeCacheImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GgmlFusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "ggml_fused_qkv_rope_cache"
@@ -12477,10 +11994,8 @@ impl Implementation for GgmlFusedQkvRopeCacheImpl {
 
 /// Fused QKV+RoPE (prefill, contiguous K/V) for GGUF.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GgmlFusedQkvRopePrefillImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GgmlFusedQkvRopePrefillImpl {
     fn name(&self) -> &'static str {
         "ggml_fused_qkv_rope_prefill"
@@ -12645,10 +12160,8 @@ impl Implementation for GgmlFusedQkvRopePrefillImpl {
 
 /// Singleton FP8 GEMM — FP8 counterpart of `Bnb4GemmImpl`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Fp8GemmImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Fp8GemmImpl {
     fn name(&self) -> &'static str {
         "fp8_gemm"
@@ -12763,10 +12276,8 @@ impl Implementation for Fp8GemmImpl {
 /// same as `Fp8GemmImpl`'s — the BiasAdd tile is absorbed into the
 /// accessor rather than a separate kernel launch.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Fp8FusedGemmBiasImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Fp8FusedGemmBiasImpl {
     fn name(&self) -> &'static str {
         "fp8_fused_gemm_bias"
@@ -12936,10 +12447,8 @@ impl Implementation for Fp8FusedGemmBiasImpl {
 /// emits one `Fp8Linear::forward` on the fused weight followed by
 /// `silu_and_mul_fused`. FP8 counterpart of `Bnb4FusedGateUpSiluMulImpl`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Fp8FusedGateUpSiluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Fp8FusedGateUpSiluMulImpl {
     fn name(&self) -> &'static str {
         "fp8_fused_gate_up_silu_mul"
@@ -13112,10 +12621,8 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
 /// one `Bnb4bitLinear::forward` on the fused weight followed by
 /// `silu_and_mul_fused`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Bnb4FusedGateUpSiluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Bnb4FusedGateUpSiluMulImpl {
     fn name(&self) -> &'static str {
         "bnb4_fused_gate_up_silu_mul"
@@ -13280,10 +12787,8 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
 
 /// Fused gate/up + GELU for BNB4 — Gemma2-style MLP.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Bnb4FusedGateUpGeluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Bnb4FusedGateUpGeluMulImpl {
     fn name(&self) -> &'static str {
         "bnb4_fused_gate_up_gelu_mul"
@@ -13449,10 +12954,8 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
 /// Fused gate/up + GELU for FP8 — Gemma2/Gemma3/Granite-style MLP.
 /// FP8 counterpart of `Bnb4FusedGateUpGeluMulImpl`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Fp8FusedGateUpGeluMulImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Fp8FusedGateUpGeluMulImpl {
     fn name(&self) -> &'static str {
         "fp8_fused_gate_up_gelu_mul"
@@ -13633,10 +13136,8 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
 /// weight_scales are per-channel `[N, 1]`, and drifting when they
 /// collapse to per-tensor scalars.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Fp8FusedQkvRopeCacheImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Fp8FusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "fp8_fused_qkv_rope_cache"
@@ -13870,10 +13371,8 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
 
 /// Fused QKV + RoPE (prefill, contiguous K/V) for FP8.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Fp8FusedQkvRopePrefillImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Fp8FusedQkvRopePrefillImpl {
     fn name(&self) -> &'static str {
         "fp8_fused_qkv_rope_prefill"
@@ -14020,10 +13519,8 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
 /// Fused QKV + RoPE (decode, M=1) for BNB4. Mirrors
 /// `MarlinFusedQkvRopeCacheImpl` but emits the BNB4 matmul path.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Bnb4FusedQkvRopeCacheImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Bnb4FusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "bnb4_fused_qkv_rope_cache"
@@ -14252,10 +13749,8 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
 
 /// Fused QKV + RoPE (prefill, contiguous K/V) for BNB4.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct Bnb4FusedQkvRopePrefillImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for Bnb4FusedQkvRopePrefillImpl {
     fn name(&self) -> &'static str {
         "bnb4_fused_qkv_rope_prefill"
@@ -14464,13 +13959,11 @@ fn fi_cost_us(head_dim: u32, use_logits_soft_cap: bool, ctx: &CostCtx) -> f64 {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg(feature = "cuda")]
 pub struct FlashInferAttentionDecodeImpl {
     pub head_dim: u32,
     pub use_logits_soft_cap: bool,
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for FlashInferAttentionDecodeImpl {
     fn name(&self) -> &'static str {
         // Variant-level identification happens through the CSV row
@@ -14501,10 +13994,8 @@ impl Implementation for FlashInferAttentionDecodeImpl {
         // sm_89+ (Ada/Hopper). Older arches (sm_80 A100, sm_86 RTX30,
         // sm_75 T4) fall back to FA2 via the `target_compatible
         // == false` branch — they're untested with this shim.
-        let compute_cap = match &profile.backend_spec {
-            crate::target::BackendSpec::Cuda(s) => s.compute_capability,
-            _ => return false,
-        };
+        let crate::target::BackendSpec::Cuda(spec) = &profile.backend_spec;
+        let compute_cap = spec.compute_capability;
         if compute_cap < 89 {
             return false;
         }
@@ -14671,23 +14162,19 @@ fn fa3_cost_us(head_dim: u32, ctx: &CostCtx) -> f64 {
 
 #[cfg(fa3_built)]
 #[derive(Debug, Clone, Copy)]
-#[cfg(feature = "cuda")]
 pub struct FlashAttention3DecodeImpl {
     pub head_dim: u32,
 }
 
 #[cfg(fa3_built)]
-#[cfg(feature = "cuda")]
 impl Implementation for FlashAttention3DecodeImpl {
     fn name(&self) -> &'static str {
         "flash_attention_3_decode"
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        let compute_cap = match &profile.backend_spec {
-            crate::target::BackendSpec::Cuda(s) => s.compute_capability,
-            _ => return false,
-        };
+        let crate::target::BackendSpec::Cuda(spec) = &profile.backend_spec;
+        let compute_cap = spec.compute_capability;
         // FA3 is sm_90a-only. The vendored library is built with
         // `-arch=sm_90a` (see `build_flash_attention_3` in
         // `scratchy-builder-cuda/build.rs`); calling on older arches
@@ -14809,13 +14296,11 @@ impl Implementation for FlashAttention3DecodeImpl {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[cfg(feature = "cuda")]
 pub struct FlashInferAttentionPrefillImpl {
     pub head_dim: u32,
     pub use_logits_soft_cap: bool,
 }
 
-#[cfg(feature = "cuda")]
 impl Implementation for FlashInferAttentionPrefillImpl {
     fn name(&self) -> &'static str {
         "flashinfer_attention_prefill"
@@ -14831,10 +14316,8 @@ impl Implementation for FlashInferAttentionPrefillImpl {
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
         // sm_89+ — see FlashInferAttentionDecodeImpl::target_compatible.
-        let compute_cap = match &profile.backend_spec {
-            crate::target::BackendSpec::Cuda(s) => s.compute_capability,
-            _ => return false,
-        };
+        let crate::target::BackendSpec::Cuda(spec) = &profile.backend_spec;
+        let compute_cap = spec.compute_capability;
         if compute_cap < 89 {
             return false;
         }
@@ -14966,10 +14449,8 @@ impl Implementation for FlashInferAttentionPrefillImpl {
 // Both outputs are OwnedTensors — no aliasing with upstream.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MlaSplitRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MlaSplitRefImpl {
     fn name(&self) -> &'static str {
         "mla_split_ref"
@@ -15089,10 +14570,8 @@ impl Implementation for MlaSplitRefImpl {
 // Output: [T, num_heads * v_head_dim]
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MlaAttentionImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MlaAttentionImpl {
     fn name(&self) -> &'static str {
         "mla_attention_ref"
@@ -15211,10 +14690,8 @@ impl Implementation for MlaAttentionImpl {
 // Emits a direct call to `DeepSeekV2MoELayer::forward`.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct DeepSeekMoeRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for DeepSeekMoeRefImpl {
     fn name(&self) -> &'static str {
         "deepseek_moe_ref"
@@ -15369,10 +14846,8 @@ impl Implementation for DeepSeekMoeRefImpl {
 //   weight → GatedDeltaNetLayer. Layer index derived from the weight name.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GatedDeltaNetImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GatedDeltaNetImpl {
     fn name(&self) -> &'static str {
         "gated_delta_net_ref"
@@ -15499,10 +14974,8 @@ impl Implementation for GatedDeltaNetImpl {
 // outputs (both freshly allocated by the eval). Backend-agnostic host-callback.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GateSplitImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GateSplitImpl {
     fn name(&self) -> &'static str {
         "gate_split_ref"
@@ -15578,10 +15051,8 @@ impl Implementation for GateSplitImpl {
 // `out = attn * sigmoid(gate)`. Shape-preserving 2-input elementwise.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GateApplyImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GateApplyImpl {
     fn name(&self) -> &'static str {
         "gate_apply_ref"
@@ -15662,10 +15133,8 @@ impl Implementation for GateApplyImpl {
 // across the hidden axis. 3-input elementwise-with-broadcast.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GateScaleImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GateScaleImpl {
     fn name(&self) -> &'static str {
         "gate_scale_ref"
@@ -15755,10 +15224,8 @@ impl Implementation for GateScaleImpl {
 // differ).
 //
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct DeepSeekFp8BlockMoeImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for DeepSeekFp8BlockMoeImpl {
     fn name(&self) -> &'static str {
         "deepseek_moe_fp8_block"
@@ -15886,10 +15353,8 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
 // the host-interpreter Op variant is `DeepSeekMoeGgml`.
 //
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct DeepSeekGgmlMoeImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for DeepSeekGgmlMoeImpl {
     fn name(&self) -> &'static str {
         "deepseek_moe_ggml"
@@ -16022,22 +15487,16 @@ impl Implementation for DeepSeekGgmlMoeImpl {
 // (or any other identifier mapped to a `FusedMoELayer` accessor by
 // the per-arch weights manifest.)
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct FusedMoeRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for FusedMoeRefImpl {
     fn name(&self) -> &'static str {
         "fused_moe_ref"
     }
 
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        // Emits `Instruction::FusedMoe` (CUDA-only at runtime), but
-        // partitioned away from Metal by storage gate in `matches`:
-        // Affine-stored experts route to `MetalFusedMoeImpl` (which
-        // emits `Instruction::MetalFusedMoe`). Dense-stored MoE on
-        // Metal is structurally unclaimed today; it would need a
-        // dense-per-expert Metal kernel that hasn't been ported.
+        // Emits `Instruction::FusedMoe`; Affine-stored experts are
+        // refused by the storage gate in `matches`.
         true
     }
 
@@ -16055,10 +15514,8 @@ impl Implementation for FusedMoeRefImpl {
         if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
             return None;
         }
-        // Affine-stored MoE routes to `MetalFusedMoeImpl` (Metal-only
-        // SwitchGLU decomposition). This Impl is Dense-only at
-        // runtime — the cuda `FusedMoELayer::load` (layers_moe.rs:160)
-        // reads dense BF16 stacked tensors.
+        // Dense-only at runtime — the cuda `FusedMoELayer::load`
+        // (layers_moe.rs:160) reads dense BF16 stacked tensors.
         let node = fuf.get(seed);
         if matches!(weight_storage_of(node), Some(StorageFormat::Affine { .. })) {
             return None;
@@ -16180,18 +15637,16 @@ impl Implementation for FusedMoeRefImpl {
 // (or whichever identifier the per-arch weights manifest maps to a
 // `SharedFusedMoELayer` accessor.)
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct SharedFusedMoeRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for SharedFusedMoeRefImpl {
     fn name(&self) -> &'static str {
         "shared_fused_moe_ref"
     }
 
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        // Partitioned from Metal via Affine-storage gate in `matches`;
-        // see `FusedMoeRefImpl::target_compatible` for the rationale.
+        // Affine storage is refused in `matches`; see
+        // `FusedMoeRefImpl::target_compatible`.
         true
     }
 
@@ -16215,8 +15670,7 @@ impl Implementation for SharedFusedMoeRefImpl {
         if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
             return None;
         }
-        // Affine-stored MoE → `MetalSharedFusedMoeImpl`. cuda's
-        // `SharedFusedMoELayer::load` (layers_moe.rs:429) is Dense-only.
+        // cuda's `SharedFusedMoELayer::load` (layers_moe.rs:429) is Dense-only.
         let node = fuf.get(seed);
         if matches!(weight_storage_of(node), Some(StorageFormat::Affine { .. })) {
             return None;
@@ -16331,11 +15785,8 @@ impl Implementation for SharedFusedMoeRefImpl {
 //
 // `OpKind::GemmaMoe` is gemma-only with TWO activation inputs (router_in =
 // post-attention residual, expert_in = ff2-normed) and TWO weight bundles
-// (`router[layer]`, `experts.switch_glu[layer]`). `MetalGemmaMoeImpl`
-// (`crate::metal::moe`) claims it on Metal; `CudaGemmaMoeImpl` below claims it
-// on CUDA. Both reuse `Instruction::GemmaMoe` and these three helpers (moved
-// here from `metal/moe.rs` so the cfg(metal)-gated module and the neutral CUDA
-// Impl can share them).
+// (`router[layer]`, `experts.switch_glu[layer]`). `CudaGemmaMoeImpl` below
+// claims it through these three helpers.
 
 /// Match a single `OpKind::GemmaMoe` tile.
 pub(crate) fn gemma_moe_single_tile_match(fuf: &Fuf, seed: TileId) -> Option<MatchInfo> {
@@ -16413,12 +15864,10 @@ pub(crate) fn gemma_expert_gs_bits(node: &FufNode, program: &Program) -> Option<
     None
 }
 
-/// Emit the fat `Instruction::GemmaMoe` for a claimed `gemma_moe` tile. Shared
-/// by the Metal and CUDA Impls — both read router_in (input 0), expert_in
-/// (input 1), the out slot, the layer (from the router accessor suffix), and
-/// the MoE shape from `bounds`. The CUDA eval reads the slots + layer and
-/// resolves the rest from the runtime layer structs; the trailing shape fields
-/// are filled for the Metal lowering and are harmless on CUDA.
+/// Emit the fat `Instruction::GemmaMoe` for a claimed `gemma_moe` tile: router_in
+/// (input 0), expert_in (input 1), the out slot, the layer (from the router
+/// accessor suffix), and the MoE shape from `bounds`. The CUDA eval reads the
+/// slots + layer and resolves the rest from the runtime layer structs.
 pub(crate) fn gemma_moe_fan_out(
     m: &MatchInfo,
     fuf: &Fuf,
@@ -16477,16 +15926,11 @@ pub(crate) fn gemma_moe_fan_out(
     )])
 }
 
-/// CUDA solver-side singleton for the Gemma-4 fused MoE (`gemma_moe` op).
-/// Near-clone of `MetalGemmaMoeImpl`; `target_compatible` flips to CUDA and the
-/// emitted instruction is the SAME `Instruction::GemmaMoe`. Registered
-/// unconditionally (like the other `*MoeRefImpl`s); on a Metal build its
-/// `target_compatible` filters it out so `MetalGemmaMoeImpl` claims the op.
+/// CUDA solver-side singleton for the Gemma-4 fused MoE (`gemma_moe` op),
+/// emitting `Instruction::GemmaMoe`.
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct CudaGemmaMoeImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for CudaGemmaMoeImpl {
     fn name(&self) -> &'static str {
         "cuda_gemma_moe"
@@ -16584,7 +16028,7 @@ impl Implementation for CudaGemmaMoeImpl {
 // cuda-gated), so under `spyre` the cfg ADMITTED it and it failed to compile —
 // taking every other test in this crate down with it. A predicate that is WRONG
 // rather than absent, so the crate's whole suite was unrunnable off cuda.
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -18284,10 +17728,8 @@ mod tests {
 // from picking it on uncalibrated targets.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct AllReduceImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for AllReduceImpl {
     fn name(&self) -> &'static str {
         "all_reduce"
@@ -18427,10 +17869,8 @@ impl Implementation for AllReduceImpl {
 // Impl never matches and is free in the solver.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct AllGatherImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for AllGatherImpl {
     fn name(&self) -> &'static str {
         "all_gather"
@@ -18569,10 +18009,8 @@ impl Implementation for AllGatherImpl {
 // the cost is one taken-branch check per forward pass.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct MmEmbedSpliceImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for MmEmbedSpliceImpl {
     fn name(&self) -> &'static str {
         "mm_embed_splice"
@@ -18692,10 +18130,8 @@ impl Implementation for MmEmbedSpliceImpl {
 // OpKind + Impl.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct LoadPixelsImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for LoadPixelsImpl {
     fn name(&self) -> &'static str {
         "load_pixels"
@@ -18780,10 +18216,8 @@ impl Implementation for LoadPixelsImpl {
 // single `Instruction::LoadPosEmbeds { out_slot }` row.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct LoadPosEmbedsImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for LoadPosEmbedsImpl {
     fn name(&self) -> &'static str {
         "load_pos_embeds"
@@ -18854,10 +18288,8 @@ impl Implementation for LoadPosEmbedsImpl {
 }
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct VarlenAttentionImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for VarlenAttentionImpl {
     fn name(&self) -> &'static str {
         "varlen_attention"
@@ -19034,10 +18466,8 @@ impl Implementation for VarlenAttentionImpl {
 // as q / k.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct VisionRopeImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for VisionRopeImpl {
     fn name(&self) -> &'static str {
         "vision_rope"
@@ -19154,10 +18584,8 @@ impl Implementation for VisionRopeImpl {
 // from `in_slot` to `out_slot`.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct QuickGeluImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for QuickGeluImpl {
     fn name(&self) -> &'static str {
         "quick_gelu_inplace"
@@ -19254,10 +18682,8 @@ impl Implementation for QuickGeluImpl {
 // for one or the other; mismatching is silently wrong.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GeluErfImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GeluErfImpl {
     fn name(&self) -> &'static str {
         "gelu_erf_inplace"
@@ -19355,10 +18781,8 @@ impl Implementation for GeluErfImpl {
 // SwiGLU chains; this singleton only fires when no Mul follows.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct GeluImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for GeluImpl {
     fn name(&self) -> &'static str {
         "gelu_tanh_inplace"
@@ -19460,10 +18884,8 @@ impl Implementation for GeluImpl {
 // hard-codes `vocab_size` / `hidden_size` (decoder-only bounds).
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct PosEmbedRefImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for PosEmbedRefImpl {
     fn name(&self) -> &'static str {
         "pos_embed_ref"
@@ -19554,10 +18976,8 @@ impl Implementation for PosEmbedRefImpl {
 // tile is reused / freed by the standard drop pass).
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct EmbeddingGatherImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for EmbeddingGatherImpl {
     fn name(&self) -> &'static str {
         "embedding_gather"
@@ -19678,10 +19098,8 @@ impl Implementation for EmbeddingGatherImpl {
 // drop pass.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct AvgPool2dImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for AvgPool2dImpl {
     fn name(&self) -> &'static str {
         "avg_pool_2d"
@@ -19773,10 +19191,8 @@ impl Implementation for AvgPool2dImpl {
 // reused). `consumes_input_tiles` stays empty.
 
 #[derive(Debug, Default)]
-#[cfg(feature = "cuda")]
 pub struct StripClsImpl;
 
-#[cfg(feature = "cuda")]
 impl Implementation for StripClsImpl {
     fn name(&self) -> &'static str {
         "strip_cls"

@@ -488,7 +488,7 @@ pub enum OpKind {
     AvgPool2d,
     /// CLIP-class CLS-token strip: `strip_cls(x) -> [L-1, e]`. Removes
     /// the leading CLS row that LLaVA-1.5's CLIP encoder produces.
-    /// Claimed by [`crate::impl_lib::StripClsImpl`].
+    /// Claimed on cuda by instruction selection's `StripClsImpl`.
     StripCls,
     /// Vision-tower learned positional embedding lookup:
     /// `pos_embed(position_ids, weight) -> [num_tokens, vision_embed_dim]`.

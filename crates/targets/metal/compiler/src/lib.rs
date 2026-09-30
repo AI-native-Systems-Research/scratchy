@@ -15,6 +15,8 @@
 pub mod canonical;
 /// Generic `const`-constructor emission for the metal tape types.
 pub mod const_tokens;
+/// The decode megakernel of a bucket-1 tape, baked.
+pub mod megakernel_bake;
 /// The `const`-emitting bake: step tape -> per-bucket static tapes.
 pub mod static_tape;
 /// Metal's step records, built from the shared tape.

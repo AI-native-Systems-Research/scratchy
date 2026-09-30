@@ -3,25 +3,24 @@
 //!
 //! These types and helpers describe WHERE a weight lives and WHICH slot a
 //! value occupies. They are consumed by `to_wavefront` (the shared front
-//! end) and `metal_from_subtile` (metal's bridge) — the code that REPLACED
-//! instruction selection — as well as by codegen and the selection library
-//! itself.
-//!
-//! They lived in `impl_lib` for historical reasons: that module grew up as
-//! the instruction-selection library and accumulated this vocabulary along
-//! the way. Keeping them there means a build that performs no instruction
-//! selection still has to compile all of it, which is why `impl_lib` cannot
-//! simply be feature-gated off the metal path, even though instruction
-//! selection itself never runs under metal or spyre.
+//! end), codegen and `weight_bindings` on every target, and by the
+//! instruction-selection library (cuda only), whose helpers here are gated
+//! with it.
 
 use std::collections::BTreeMap;
 
 use proc_macro2::TokenStream;
 
-use crate::classified::{ExternKind, OpKind, UnrollIndex, WeightId};
-use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+use crate::classified::{UnrollIndex, WeightId};
+use crate::fuf::{Fuf, FufInput, FufNode};
 use crate::quantization::StorageFormat;
 use crate::shape::{Dim, Shape};
+// Instruction selection's helpers (cuda only).
+#[cfg(feature = "cuda")]
+use {
+    crate::classified::{ExternKind, OpKind},
+    crate::fuf::TileId,
+};
 
 /// Evaluate a `Dim` to a concrete integer using `bounds`. Free
 /// function so non-`CostCtx` callers (e.g. `fan_out`, which only has
@@ -78,11 +77,12 @@ pub struct WeightAccessor {
 /// Walk `claimed` tiles' inputs for the first
 /// `FufInput::Extern { kind: ExternKind::KvCache, index: Some(layer) }`
 /// and return the layer index as a u32. KV-touching Impls
-/// (`RopeAppend`, fused QKV+cache, `SynthPreAttn`,
-/// `AttentionViaCache`, paged prefill attention) declare a
+/// (`RopeAppend`, fused QKV+cache, `AttentionViaCache`, paged
+/// prefill attention) declare a
 /// [`crate::alias_rules::KvRule`] via [`Implementation::kv_rule`] —
 /// the same extern is already on the tile's input list, the Impl
 /// just declares which direction (write vs read) the layer flows.
+#[cfg(feature = "cuda")]
 pub fn kv_cache_extern_layer(claimed_tiles: &[TileId], fuf: &Fuf) -> Option<u32> {
     for &t in claimed_tiles {
         for input in &fuf.get(t).inputs {
@@ -117,6 +117,7 @@ pub fn kv_cache_extern_layer(claimed_tiles: &[TileId], fuf: &Fuf) -> Option<u32>
 /// Every Impl-driven variant is named here, by exactly one Impl.
 /// Two Impls declaring the same variant ident must agree on field
 /// shape — codegen panics on mismatch.
+#[cfg(feature = "cuda")]
 #[derive(Clone, Debug)]
 pub struct OpcodeShape {
     /// PascalCase ident the per-arch enum uses for this variant.
@@ -125,6 +126,7 @@ pub struct OpcodeShape {
     /// `name: type` inside the variant's struct-style payload.
     pub fields: Vec<(syn::Ident, syn::Type)>,
 }
+#[cfg(feature = "cuda")]
 impl OpcodeShape {
     /// Build from a variant name and a list of (field_ident, type)
     /// pairs. Used inside Impls' `opcode_shape()` overrides.
@@ -201,6 +203,7 @@ pub(crate) fn weight_storage_of(node: &FufNode) -> Option<&StorageFormat> {
 /// Return the `(TileId, slot)` of a node's first `FufInput::Tile`
 /// input. For Gemm this identifies the activation (the weight input
 /// is a `FufInput::Weight`).
+#[cfg(feature = "cuda")]
 pub(crate) fn first_tile_input(node: &crate::fuf::FufNode) -> Option<(TileId, u8)> {
     node.inputs.iter().find_map(|i| match i {
         FufInput::Tile { id, slot } => Some((*id, *slot)),
@@ -211,6 +214,7 @@ pub(crate) fn first_tile_input(node: &crate::fuf::FufNode) -> Option<(TileId, u8
 /// or the Cohere-style `RopeAppendInterleaved`. Used by the QKV+rope
 /// fusion matchers and the singleton fallback so a single impl claims
 /// both flavors and dispatches to the right kernel at emit time.
+#[cfg(feature = "cuda")]
 pub(crate) fn is_rope_append_op(op: OpKind) -> bool {
     matches!(op, OpKind::RopeAppend | OpKind::RopeAppendInterleaved)
 }
@@ -246,13 +250,13 @@ pub(crate) fn gemm_nk_from_fuf(
 }
 
 // ── ScalarMul tile helpers ───────────────────────────────────────
-// Vocabulary, not selection: `alias_rules` calls these on the tape path to
-// decide whether a scalar multiply is an identity pass-through. They lived on
-// `ScalarMulImpl` only because that impl was their first caller.
+// `alias_rules` calls these to decide whether a scalar multiply is an
+// identity pass-through.
 /// Extract the FUF's scalar literal from a single-tile claim.
 /// Returns `f32::NAN` for malformed claims (matcher invariants
 /// guarantee one Scalar input, so this only fires if the matcher
 /// is bypassed).
+#[cfg(feature = "cuda")]
 pub(crate) fn scalar_mul_scale_of(claimed_tiles: &[TileId], fuf: &Fuf) -> f32 {
     let tile = match claimed_tiles.first() {
         Some(&t) => t,
@@ -267,11 +271,13 @@ pub(crate) fn scalar_mul_scale_of(claimed_tiles: &[TileId], fuf: &Fuf) -> f32 {
 }
 /// Whether the matched `x * scale` is mathematically `x` and
 /// therefore reducible to an alias of the source tile.
+#[cfg(feature = "cuda")]
 pub(crate) fn scalar_mul_is_unity_passthrough(claimed_tiles: &[TileId], fuf: &Fuf) -> bool {
     scalar_mul_scale_of(claimed_tiles, fuf) == 1.0
 }
 /// `(src_tile, src_slot)` of the Tile input. Helpers shared by
 /// `output_alias` / `consumes_input_tiles` / `fan_out`.
+#[cfg(feature = "cuda")]
 pub(crate) fn scalar_mul_tile_input(claimed_tiles: &[TileId], fuf: &Fuf) -> (TileId, u8) {
     let tile = claimed_tiles[0];
     let node = fuf.get(tile);

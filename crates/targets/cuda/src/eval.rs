@@ -370,9 +370,6 @@ impl InstructionEval for Instruction {
         match *self {
             // Metal-only fused lowerings — constructed only by the metal
             // interpreter, dispatched via the ICB tape, never the cuda eval.
-            Instruction::SynthGateUpSiluMul(..) => {
-                unreachable!("SynthGateUpSiluMul is metal-only; cuda never constructs it")
-            }
             Instruction::AffineEmbed(..) => {
                 unreachable!("AffineEmbed is metal-only; cuda never constructs it")
             }
@@ -3141,18 +3138,6 @@ impl InstructionEval for Instruction {
                     "Instruction::Nvfp4Qmm is metal-only — the macro must \
                      not emit it on the cuda forward (NVFP4 weights stay \
                      in StorageFormat::Dense on cuda by the FUF downgrade)"
-                );
-            }
-            Instruction::SynthPreAttn(..) => {
-                unreachable!(
-                    "Instruction::SynthPreAttn is metal-only — emitted by the \
-                     compiler-driven megakernel synthesis pass on the metal forward only"
-                );
-            }
-            Instruction::SynthMlpPreDown(..) => {
-                unreachable!(
-                    "Instruction::SynthMlpPreDown is metal-only — emitted by the \
-                     compiler-driven megakernel synthesis pass on the metal forward only"
                 );
             }
             Instruction::SiluMul(..) => {

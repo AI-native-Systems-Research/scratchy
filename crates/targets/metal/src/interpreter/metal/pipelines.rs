@@ -103,73 +103,38 @@ impl SpecializedPipelines {
     /// this layer is a thin pass-through to
     /// [`SpecializedPipelineCache::get_or_build`].
     ///
-    /// Returns [`PipelineLookupError::OpaqueKernel`] for
-    /// `KernelId::Gemm`: that kernel is opaque to this picker — both
-    /// dtypes have their own dims-keyed builders
-    /// ([`Self::pipeline_for_gemm_f16`] / [`Self::pipeline_for_gemm_bf16`]).
-    /// The worker special-cases GEMM upfront and never reaches this
-    /// method for those commands; the explicit error guards against
-    /// a future caller that forgets.
-    ///
     /// [`SpecializedPipelineCache::get_or_build`]: crate::specialized_pipeline_cache::SpecializedPipelineCache::get_or_build
     pub fn pipeline_for_command<W: CanonicalParams>(
         &self,
         cmd: &LoweredCommand,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
-        if matches!(cmd.kernel, KernelId::Gemm) {
-            return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
-        }
         let key = PipelineKey::new(cmd.library, cmd.function, cmd.constants.to_vec());
         self.cache
             .get_or_build(&key)
             .map_err(PipelineLookupError::Build)
     }
 
-    /// Bf16 GEMM pipeline keyed on the dynamic `(M, N, K)` triple.
-    /// MPS' `MPSMatrixMultiplication` doesn't accept
-    /// `MPSDataTypeBFloat16`, so the bf16 path uses the custom
-    /// `gemm_bf16_specialized` kernel (uses `simdgroup_bfloat8x8`
-    /// MMA tiles, native on M3+). Shape goes through function
-    /// constants 0 / 1 / 2 = M / N / K.
-    ///
-    /// Caller supplies the dims directly (the lowering pass has them
-    /// on `LoweredCommand.gemm_dims`); they don't sit on
-    /// `CanonicalParams` since each GEMM step has its own shape.
-    pub fn pipeline_for_gemm_bf16(
+    /// Compile the generated megakernel library `name` from `source` unless a load already did;
+    /// how long this call's compile took (`None`: already compiled).
+    pub fn megakernel_library(
         &self,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> Result<ComputePipelineState, PipelineLookupError> {
-        let constants = vec![
-            ConstantValue::uint(0, m),
-            ConstantValue::uint(1, n),
-            ConstantValue::uint(2, k),
-        ];
-        let key = PipelineKey::new("gemm", "gemm_bf16_specialized", constants);
+        name: &'static str,
+        source: impl FnOnce() -> String,
+    ) -> Result<Option<std::time::Duration>, PipelineLookupError> {
         self.cache
-            .get_or_build(&key)
+            .compile_library(name, source)
             .map_err(PipelineLookupError::Build)
     }
 
-    /// f16 GEMM pipeline keyed on the dynamic `(M, N, K)` triple — the
-    /// `gemm_f16_specialized` kernel (`simdgroup_half8x8` MMA). Mirrors
-    /// [`Self::pipeline_for_gemm_bf16`] so f16 dense GEMM dispatches as a
-    /// normal MTL4 compute step instead of going through MPS' classic
-    /// `MPSMatrixMultiplication`. Shape via function constants
-    /// 0 / 1 / 2 = M / N / K.
-    pub fn pipeline_for_gemm_f16(
+    /// A kernel of the megakernel library `library`, specialized with `constants` and memoized
+    /// like every other pipeline: workers share it.
+    pub fn megakernel(
         &self,
-        m: u32,
-        n: u32,
-        k: u32,
+        library: &'static str,
+        function: &'static str,
+        constants: Vec<ConstantValue>,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
-        let constants = vec![
-            ConstantValue::uint(0, m),
-            ConstantValue::uint(1, n),
-            ConstantValue::uint(2, k),
-        ];
-        let key = PipelineKey::new("gemm", "gemm_f16_specialized", constants);
+        let key = PipelineKey::new(library, function, constants);
         self.cache
             .get_or_build(&key)
             .map_err(PipelineLookupError::Build)
@@ -184,8 +149,8 @@ impl SpecializedPipelines {
 
 #[derive(Debug)]
 pub enum PipelineLookupError {
-    /// `KernelId::Gemm` is intentionally opaque (dims-keyed builders).
-    /// Callers must route it through the GEMM wrapper, not this cache.
+    /// A kernel whose constants are per-command shapes (`KernelId::Gemm`'s M / N / K): a
+    /// `KernelId`-keyed picker cannot name its pipeline; its lowered command does.
     OpaqueKernel(KernelId),
     /// `KernelId::Reshape` is metadata-only. Callers should drop it
     /// before reaching this layer; the lowering pass already does so.
@@ -206,7 +171,7 @@ impl std::fmt::Display for PipelineLookupError {
         match self {
             Self::OpaqueKernel(k) => write!(
                 f,
-                "specialized pipeline lookup: {k:?} is opaque (route through MPS GEMM wrapper)"
+                "specialized pipeline lookup: {k:?}'s constants are per-command shapes"
             ),
             Self::MetadataOnly(k) => write!(
                 f,
@@ -291,14 +256,6 @@ mod tests {
             (KernelId::TqQuantizeToPacked, MetalDtype::Bf16) => {
                 ("turboquant", "tq_compress_paged_bf16")
             }
-            (KernelId::FusedQkvRopeCache, MetalDtype::F16) => (
-                "fused_qkv_rope_cache",
-                "fused_qkv_rope_cache_f16_specialized",
-            ),
-            (KernelId::FusedQkvRopeCache, MetalDtype::Bf16) => (
-                "fused_qkv_rope_cache",
-                "fused_qkv_rope_cache_bf16_specialized",
-            ),
             (KernelId::AttentionViaCache, MetalDtype::F16) => {
                 ("attention", "attention_via_cache_v2_f16_specialized")
             }
@@ -365,9 +322,6 @@ mod tests {
                 | KernelId::AffineQmmW4a8
                 | KernelId::AffineGatherW4a8Quant
                 | KernelId::AffineGatherQmmW4a8
-                | KernelId::Nvfp4Qmv
-                | KernelId::Nvfp4QmmT
-                | KernelId::Nvfp4QmmTNax
                 | KernelId::AffineEmbed
                 | KernelId::SiluMul
                 | KernelId::GeluMul
@@ -376,10 +330,6 @@ mod tests {
                 | KernelId::GateScale
                 | KernelId::GatedDeltaNet
                 | KernelId::SplitKReduceSum
-                | KernelId::FusedAffineQkvRopeCache
-                | KernelId::SynthPreAttn
-            | KernelId::SynthMlpPreDown
-            | KernelId::SynthGateUpSiluMul
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
@@ -409,7 +359,6 @@ mod tests {
             | KernelId::VisionRope
             | KernelId::VisionVarlenAttn
             | KernelId::EmbeddingGather
-            | KernelId::AvgPool2d
             | KernelId::VisionGelu
             | KernelId::VisionLoadPixels
             | KernelId::MmEmbedSplice
@@ -495,15 +444,6 @@ mod tests {
                 ConstantValue::uint(5, crate::BLOCKS_PER_CHUNK),
                 ConstantValue::uint(6, W::ROT_DIM / 2),
             ],
-            KernelId::FusedQkvRopeCache => vec![
-                ConstantValue::uint(0, W::Q_SIZE as u32),
-                ConstantValue::uint(1, W::NUM_Q_HEADS),
-                ConstantValue::uint(2, W::NUM_KV_HEADS),
-                ConstantValue::uint(3, W::HEAD_DIM),
-                ConstantValue::uint(4, W::ROT_DIM),
-                ConstantValue::uint(5, W::BLOCK_SIZE),
-                ConstantValue::uint(6, bucket_m),
-            ],
             KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged => vec![
                 ConstantValue::uint(0, W::HEAD_DIM),
                 ConstantValue::uint(1, W::NUM_Q_HEADS),
@@ -534,9 +474,6 @@ mod tests {
             | KernelId::AffineQmmW4a8
             | KernelId::AffineGatherW4a8Quant
             | KernelId::AffineGatherQmmW4a8
-            | KernelId::Nvfp4Qmv
-            | KernelId::Nvfp4QmmT
-            | KernelId::Nvfp4QmmTNax
             | KernelId::AffineEmbed
             | KernelId::SiluMul
             | KernelId::GeluMul
@@ -548,10 +485,6 @@ mod tests {
             | KernelId::RopeOnceNax
             | KernelId::RopeOnceSteel
             | KernelId::RopeOnceGqaShared
-            | KernelId::FusedAffineQkvRopeCache
-            | KernelId::SynthPreAttn
-            | KernelId::SynthMlpPreDown
-            | KernelId::SynthGateUpSiluMul
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
@@ -581,7 +514,6 @@ mod tests {
             | KernelId::VisionRope
             | KernelId::VisionVarlenAttn
             | KernelId::EmbeddingGather
-            | KernelId::AvgPool2d
             | KernelId::VisionGelu
             | KernelId::VisionLoadPixels
             | KernelId::MmEmbedSplice

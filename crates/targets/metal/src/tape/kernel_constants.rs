@@ -20,7 +20,7 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
-    IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
+    IntermediateSize, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
     NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TqCodeBits,
     TqDecodeHeads,
 };
@@ -170,44 +170,6 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
     }
 }
 
-// ── FusedQkvRopeCache (dense BF16/F16) ─────────────────────────────
-
-/// `KernelId::FusedQkvRopeCache`
-/// (`fused_qkv_rope_cache_<dtype>_specialized`).
-pub struct FusedQkvRopeCacheConstants {
-    pub q_size: QSize,
-    pub num_q_heads: NumQHeads,
-    pub num_kv_heads: NumKvHeads,
-    pub head_dim: HeadDim,
-    pub rot_dim: RotDim,
-    pub block_size: BlockSize,
-    pub bucket_m: BucketM,
-    pub blocks_per_chunk: BlocksPerChunk,
-    /// Spans rope-on-read: `Some(1)` sets FQRC_ROPE_ON_READ (slot 8) so the
-    /// fused kernel stores K unrotated for slot_mapping-bit-31 blocks. `None`
-    /// omits the const → default-off (byte-identical non-spans).
-    pub rope_on_read: Option<u32>,
-}
-
-impl From<FusedQkvRopeCacheConstants> for Vec<ConstantValue> {
-    fn from(c: FusedQkvRopeCacheConstants) -> Self {
-        let mut v = vec![
-            ConstantValue::uint(ConstSlot(0), c.q_size.get()),
-            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
-            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
-            ConstantValue::uint(ConstSlot(3), c.head_dim.get()),
-            ConstantValue::uint(ConstSlot(4), c.rot_dim.get()),
-            ConstantValue::uint(ConstSlot(5), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(6), c.bucket_m.get()),
-            ConstantValue::uint(ConstSlot(7), c.blocks_per_chunk.get()),
-        ];
-        if let Some(ror) = c.rope_on_read {
-            v.push(ConstantValue::uint(ConstSlot(8), ror));
-        }
-        v
-    }
-}
-
 // ── AttentionViaCache (decode) ─────────────────────────────────────
 
 /// `KernelId::AttentionViaCache`
@@ -243,12 +205,22 @@ pub struct AttentionViaCacheConstants {
     pub pair_coresident: Option<u32>,
 }
 
+impl AttentionViaCacheConstants {
+    /// `ATTN_HEAD_DIM`, `ATTN_NUM_Q_HEADS`, `ATTN_NUM_KV_HEADS`: the slots of the shape.
+    pub const HEAD_DIM: ConstSlot = ConstSlot(0);
+    pub const NUM_Q_HEADS: ConstSlot = ConstSlot(1);
+    pub const NUM_KV_HEADS: ConstSlot = ConstSlot(2);
+}
+
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
     fn from(c: AttentionViaCacheConstants) -> Self {
         let mut v = vec![
-            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
-            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
-            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
+            ConstantValue::uint(AttentionViaCacheConstants::HEAD_DIM, c.head_dim.get()),
+            ConstantValue::uint(AttentionViaCacheConstants::NUM_Q_HEADS, c.num_q_heads.get()),
+            ConstantValue::uint(
+                AttentionViaCacheConstants::NUM_KV_HEADS,
+                c.num_kv_heads.get(),
+            ),
             ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
@@ -739,30 +711,3 @@ impl From<FusedGateUpSiluMulPrefillConstants> for Vec<ConstantValue> {
         ]
     }
 }
-
-// ── Synth-* (compiler-emitted megakernels) ────────────────────────
-
-/// `KernelId::SynthPreAttn` / `KernelId::SynthMlpPreDown` /
-/// `KernelId::SynthGateUpSiluMul` — the macro-emitted megakernels.
-///
-/// All three bake every dim into MSL `constant constexpr` literals at
-/// synth time. Only the per-bucket `M` stays a function constant
-/// (slot 0).
-pub struct SynthMegakernelConstants {
-    pub bucket_m: BucketM,
-}
-
-impl From<SynthMegakernelConstants> for Vec<ConstantValue> {
-    fn from(c: SynthMegakernelConstants) -> Self {
-        vec![ConstantValue::uint(ConstSlot(0), c.bucket_m.get())]
-    }
-}
-
-// Keep `KDim` / `NDim` re-exported even though the int32 siblings
-// (`KDimI32`/`NDimI32`) cover the qmv/qmm_t shaders today. SplitK
-// reduce and the synth-* family need the unsigned form.
-#[allow(dead_code)]
-const _: fn() = || {
-    let _ = std::marker::PhantomData::<KDim>;
-    let _ = std::marker::PhantomData::<NDim>;
-};

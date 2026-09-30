@@ -1932,6 +1932,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 queue: draft_q,
                 allocator: main_dev.allocator.clone(),
                 metal_bucket_max_m: main_dev.metal_bucket_max_m,
+                metal_tape_play: main_dev.metal_tape_play,
             })
         } else {
             None
@@ -2454,6 +2455,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 queue: draft_q,
                 allocator: main_dev.allocator.clone(),
                 metal_bucket_max_m: main_dev.metal_bucket_max_m,
+                metal_tape_play: main_dev.metal_tape_play,
             })
         } else {
             None
@@ -4305,6 +4307,7 @@ impl Worker for MetalWorker {
                             // Draft chain shadow device: draft is a small
                             // non-GDN model; keep all its buckets (no prune).
                             metal_bucket_max_m: None,
+                            metal_tape_play: Default::default(),
                         };
                         // Upload host slices into fresh shared
                         // MTLBuffers (thread-local, dropped at thread

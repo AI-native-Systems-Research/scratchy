@@ -12,8 +12,9 @@ use half::{bf16, f16};
 use objc2_metal::MTLSize;
 use scratchy_target_metal::cpu_golden;
 use scratchy_target_metal::device::detect_device;
-use scratchy_target_metal::interpreter::metal::SpecializedPipelines;
-use scratchy_target_metal::specialized_pipeline_cache::SpecializedPipelineCache;
+use scratchy_target_metal::specialized_pipeline_cache::{PipelineKey, SpecializedPipelineCache};
+use scratchy_target_metal::tape::lowered::{GemmDims, MetalDtype};
+use scratchy_target_metal::tape::lowering::gemm_command;
 
 const SHAPES: &[(usize, usize, usize)] = &[
     (64, 2048, 2048),  // TinyLlama Q/K/V/O K-side
@@ -31,31 +32,35 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (1, 8192, 2048),   // Llama-3.2-1B gate/up decode
 ];
 
-fn gemm_grid(m: usize, n: usize) -> (MTLSize, MTLSize) {
-    // Dispatch: (ceil(N/8), ceil(M/8), 1) threadgroups, one simdgroup
-    // (32 threads) each — matches the worker's bf16/f16 GEMM bake.
-    (
-        MTLSize {
-            width: (n as u64).div_ceil(8) as usize,
-            height: (m as u64).div_ceil(8) as usize,
-            depth: 1,
-        },
-        MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
-    )
+/// The pipeline and grid of the GEMM command the lowering emits for `(dtype, m, n, k)` — the
+/// production identity (library, symbol, M/N/K constants, grid), nothing re-derived here.
+fn gemm_dispatch(
+    cache: &SpecializedPipelineCache,
+    dtype: MetalDtype,
+    (m, n, k): (usize, usize, usize),
+) -> (objc2::rc::Retained<common::Pipeline>, MTLSize, MTLSize) {
+    let dims = GemmDims {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+    };
+    let cmd = gemm_command(dtype, dims, Vec::new());
+    let key = PipelineKey::new(cmd.library, cmd.function, cmd.constants.to_vec());
+    let pso = cache.get_or_build(&key).expect("gemm pipeline");
+    let size = |(width, height, depth): (u32, u32, u32)| MTLSize {
+        width: width as usize,
+        height: height as usize,
+        depth: depth as usize,
+    };
+    let d = cmd.dispatch;
+    (pso, size(d.threadgroups), size(d.threads_per_threadgroup))
 }
 
-fn make_pipelines() -> Option<(common::Device, SpecializedPipelines)> {
+fn make_pipelines() -> Option<(common::Device, SpecializedPipelineCache)> {
     let device = detect_device()?.device;
     let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
         .expect("compile standard shaders");
-    Some((
-        device,
-        SpecializedPipelines::new(std::sync::Arc::new(cache)),
-    ))
+    Some((device, cache))
 }
 
 #[test]
@@ -78,10 +83,7 @@ fn gemm_bf16_matches_cpu_golden() {
         let w_buf = common::shared_slice(&device, &weight);
         let out_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<bf16>());
 
-        let pso = pl
-            .pipeline_for_gemm_bf16(m as u32, n as u32, k as u32)
-            .expect("gemm_bf16 pipeline");
-        let (grid, threads) = gemm_grid(m, n);
+        let (pso, grid, threads) = gemm_dispatch(&pl, MetalDtype::Bf16, (m, n, k));
         if !common::dispatch_threadgroups(
             &device,
             &pso,
@@ -136,10 +138,7 @@ fn gemm_f16_matches_cpu_golden() {
         let w_buf = common::shared_slice(&device, &weight);
         let out_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<f16>());
 
-        let pso = pl
-            .pipeline_for_gemm_f16(m as u32, n as u32, k as u32)
-            .expect("gemm_f16 pipeline");
-        let (grid, threads) = gemm_grid(m, n);
+        let (pso, grid, threads) = gemm_dispatch(&pl, MetalDtype::F16, (m, n, k));
         if !common::dispatch_threadgroups(
             &device,
             &pso,

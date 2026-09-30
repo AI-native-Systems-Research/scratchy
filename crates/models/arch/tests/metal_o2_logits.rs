@@ -4,7 +4,8 @@
 //! For one cached checkpoint per case, this loads the model through the same public entry points
 //! the metal worker uses (`GpuWeights::from_dir` → `scratchy_forward_compiler::try_load`), builds
 //! the KV pool the way `MetalWorker::initialize_cache` does (uniform, or vLLM's group-shared hybrid
-//! layout; TurboQuant by the same auto rule; a Gated-DeltaNet state pool when the arch has one),
+//! layout; a Gated-DeltaNet state pool when the arch has one; TurboQuant where the build compiled
+//! the model's KV codec as it — `--features turboquant`),
 //! then runs ONE sequence at a time — a prefill over each fixed prompt, then greedy decode — and
 //! prints, per step, the greedy token and a SHA-256 of the full logits row the step produced (the
 //! terminal arena slot). Decoders hash the sampled row; encoders hash every row.
@@ -32,8 +33,7 @@ use scratchy_core_config::{LayerKvGeometry, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{HfFingerprint, ScratchyWeights, hash_json_value, try_load};
 use scratchy_target_metal::gdn_state::GdnStatePool;
-use scratchy_target_metal::interpreter::metal::__re::{MTLDevice as _, MTLResourceOptions};
-use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype};
+use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, TapePlay};
 use scratchy_target_metal::kv_cache::KvCachePool;
 use scratchy_target_metal::single_buffer_kv::SingleBufferKvLayer;
 use scratchy_target_metal::weights::GpuWeights;
@@ -44,18 +44,36 @@ use scratchy_target_metal::{
 use sha2::{Digest, Sha256};
 
 /// How the baked tapes are played for one step. The tape itself is fixed at expansion; this picks
-/// the realization. P0 has the one the product runs; the megakernel phase adds its own and runs
-/// both over the same prompts, requiring identical bytes.
+/// the realization (`GpuDevice::metal_tape_play`, read by the forward). A decoder case runs both
+/// over the same prompts, and the gate requires identical bytes.
 #[derive(Clone, Copy, Debug)]
 enum ExecPath {
-    /// One MTL4 dispatch per tape command (`ScratchyWeights::forward_with_metal_followup`).
+    /// One MTL4 dispatch per tape command.
     Dispatch,
+    /// The decode megakernel runs the bucket-1 tape carries, every other command dispatched.
+    Megakernel,
 }
 
 impl ExecPath {
     fn name(self) -> &'static str {
         match self {
             Self::Dispatch => "dispatch",
+            Self::Megakernel => "megakernel",
+        }
+    }
+
+    fn play(self) -> TapePlay {
+        match self {
+            Self::Dispatch => TapePlay::Dispatch,
+            Self::Megakernel => TapePlay::Megakernel,
+        }
+    }
+
+    /// Every path a case of `rows` runs: an encoder has no decode step to play differently.
+    fn all_for(rows: Rows) -> &'static [ExecPath] {
+        match rows {
+            Rows::Sampled => &[Self::Dispatch, Self::Megakernel],
+            Rows::All => &[Self::Dispatch],
         }
     }
 }
@@ -118,9 +136,6 @@ const NUM_BLOCKS: usize = BLOCKS_PER_CHUNK as usize;
 /// Largest prefill bucket kept in the pool's ladder — the largest a prompt above needs.
 const BUCKET_CAP: u32 = 64;
 
-/// `MetalWorker::initialize_cache`'s TurboQuant auto threshold (KV bytes per token, fp16 K+V).
-const TQ_MIN_KV_BYTES_PER_TOKEN: usize = 24 * 1024;
-
 /// Snapshot directory of `repo` in the local Hub cache.
 fn snapshot_dir(repo: &str) -> PathBuf {
     let root = hf_hub_downloader::cache::default_root();
@@ -137,7 +152,6 @@ struct Loaded {
     /// Backing buffers of `kv`'s chunks; must outlive the pool.
     _kv_layers: Vec<SingleBufferKvLayer>,
     gdn: Option<GdnStatePool<PoolMem>>,
-    turboquant: bool,
     /// Group 0 (full attention) block size — page-unified on hybrid layouts.
     full_block_size: usize,
     /// KV-cache groups (1 = uniform; 1 + sliding groups on vLLM's hybrid layout).
@@ -194,10 +208,6 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let head_dim = model.head_dim() as usize;
     let kv_heads = model.num_key_value_heads() as usize;
     let layers = model.num_hidden_layers() as usize;
-    let kv_bytes_per_token = layers * kv_heads * head_dim * 2 * 2;
-    let turboquant = head_dim.is_power_of_two()
-        && head_dim <= 256
-        && kv_bytes_per_token >= TQ_MIN_KV_BYTES_PER_TOKEN;
 
     let cache_dtype = match model.metal_dtype() {
         MetalDtype::Bf16 => DType::BF16,
@@ -235,9 +245,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 (None, Some(v)) => blocks_per_chunk * v[slot / 2] * elem_bytes,
                 _ => chunk_bytes,
             };
-            let layer = SingleBufferKvLayer::new(&device, bytes, 1).expect("SingleBufferKvLayer");
-            residency.insert(layer.buffer());
-            layer
+            SingleBufferKvLayer::new(&device, &residency, bytes, 1).expect("SingleBufferKvLayer")
         })
         .collect();
     let block_cap = max_model_len.div_ceil(BLOCK_SIZE).clamp(1, NUM_BLOCKS);
@@ -275,13 +283,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                     bytes,
                 ))
             },
-            |bytes| {
-                let buffer = device
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                    .expect("chunk table alloc");
-                residency.insert(&buffer);
-                Ok(MetalMem::from_buffer(buffer))
-            },
+            |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
         )
     }
     .expect("KvCachePool::new_metal_chunked");
@@ -302,13 +304,7 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 cfg.num_v_heads as usize,
                 cfg.head_v_dim as usize,
                 cfg.head_k_dim as usize,
-                |bytes| {
-                    let buffer = device
-                        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                        .expect("GDN state alloc");
-                    residency.insert(&buffer);
-                    Ok(MetalMem::from_buffer(buffer))
-                },
+                |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
             )
         }
         .expect("GdnStatePool::new")
@@ -324,7 +320,6 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
         kv,
         _kv_layers: kv_layers,
         gdn,
-        turboquant,
         full_block_size,
         tokenizer,
     }
@@ -449,18 +444,16 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
             .map(|_| view(&s.gdn_indices, &[1], DType::I32)),
         gdn_is_fresh: l.gdn.as_ref().map(|_| view(&s.gdn_fresh, &[1], u32t)),
         has_spec_tokens: false,
-        kv_turboquant: l.turboquant,
         last_token_indices: Some(view(&s.last_token_indices, &[1], u32t)),
     };
-    let out = match path {
-        ExecPath::Dispatch => unsafe {
-            l.model.forward_with_metal_followup(
-                ForwardCtxHandle::new(&ctx),
-                ForwardDeviceHandle::new(&mut l.gpu),
-                n as u64,
-                None,
-            )
-        },
+    l.gpu.metal_tape_play = path.play();
+    let out = unsafe {
+        l.model.forward_with_metal_followup(
+            ForwardCtxHandle::new(&ctx),
+            ForwardDeviceHandle::new(&mut l.gpu),
+            n as u64,
+            None,
+        )
     };
     let t = out.as_gpu_tensor();
     let shape = t.shape().to_vec();
@@ -544,7 +537,7 @@ fn run_case(case: Case, paths: &[ExecPath]) {
         case.repo,
         l.model.arch_name(),
         l.model.vocab_size(),
-        if l.turboquant { "turboquant" } else { "fp16" },
+        l.model.kv_codec(),
         l.num_groups,
         l.full_block_size,
         l.gdn.is_some(),
@@ -619,7 +612,7 @@ macro_rules! o2_cases {
                     prompts: o2_cases!(@or PROMPTS $(, $prompts)?),
                     bucket_cap: o2_cases!(@or BUCKET_CAP $(, $cap)?),
                 },
-                &[ExecPath::Dispatch],
+                ExecPath::all_for(Rows::$rows),
             );
         }
     )*};

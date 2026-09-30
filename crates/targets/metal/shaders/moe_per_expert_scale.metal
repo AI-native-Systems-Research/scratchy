@@ -21,11 +21,39 @@
 // multiply matches the host reference's single rounding.
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
-constant uint MPES_N [[function_constant(0)]];
+#define MPES_CONSTS(X) X(uint, n, MPES_N, 0)
+#ifndef MK_BODIES_ONLY
+MPES_CONSTS(MK_FC_DECLARE)
+struct MpesFc {
+  MPES_CONSTS(MK_FC_ACCESSOR)
+};
+#endif
 
+// Body shared by the dispatch kernel and the megakernel adapter (scores / indices coherent there).
+template <typename T, typename C, typename SP, typename IP>
+METAL_FUNC void moe_per_expert_scale_body(SP topk_scores, IP topk_inds,
+                                          const device T* per_expert_scale, uint gid) {
+  if (gid >= C::n()) {
+    return;
+  }
+  uint expert = topk_inds[gid];
+  float s = float(per_expert_scale[expert]);
+  float w = float(topk_scores[gid]);
+  topk_scores[gid] = static_cast<T>(w * s);
+}
+
+template <typename T, typename C>
+MK_FUNC void mk_moe_per_expert_scale(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  moe_per_expert_scale_body<T, C>((mk_ptr<T>)s.addr[0], (mk_cptr<uint>)s.addr[1],
+                                  (const device T*)s.addr[2], mk_thread_in_grid(l).x);
+}
+
+#ifndef MK_BODIES_ONLY
 template <typename T>
 [[kernel]] void moe_per_expert_scale(
     device       T*        topk_scores      [[buffer(0)]],
@@ -33,13 +61,7 @@ template <typename T>
     const device T*        per_expert_scale [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= MPES_N) {
-    return;
-  }
-  uint expert = topk_inds[gid];
-  float s = float(per_expert_scale[expert]);
-  float w = float(topk_scores[gid]);
-  topk_scores[gid] = static_cast<T>(w * s);
+  moe_per_expert_scale_body<T, MpesFc>(topk_scores, topk_inds, per_expert_scale, gid);
 }
 
 #define INST_MPES(dtype_tag, mtl_type)                                    \
@@ -49,6 +71,11 @@ template <typename T>
       const device uint*     topk_inds        [[buffer(1)]],             \
       const device mtl_type* per_expert_scale [[buffer(2)]],             \
       uint gid [[thread_position_in_grid]]);
+#else
+#define INST_MPES(dtype_tag, mtl_type)                                                       \
+  MK_TAIL(moe_per_expert_scale_##dtype_tag, 0x3,                                    \
+             (mk_moe_per_expert_scale<mtl_type, MK_C>), MPES_CONSTS)
+#endif
 
 INST_MPES(float16,  half)
 INST_MPES(bfloat16, bfloat)

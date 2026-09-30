@@ -18,8 +18,10 @@
 // 1D dispatches still work — set `grid_dim.y == 1`, `index.y == 0`.
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 using namespace metal;
 
+#ifndef MK_BODIES_ONLY
 // `T_act` is the activation / output dtype (f16 or bf16). `T_scale` is the
 // scales/biases storage dtype on disk (always f16 in every sampled
 // mlx-community 4bit checkpoint — see `INT4_PARITY_PROBES.md` §7
@@ -72,6 +74,7 @@ DEFINE_AFFINE_DEQUANTIZE_B4(f16,  half,   f16, half, 128)
 DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half,  32)
 DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half,  64)
 DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half, 128)
+#endif // MK_BODIES_ONLY
 
 // ============================================================================
 // affine_embed_b4_kernel — gather + dequantize in one pass.
@@ -110,21 +113,26 @@ DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half, 128)
 // checkpoint (`INT4_PARITY_PROBES.md` §2). Add other widths if a model
 // surfaces.
 
-constant uint AFFINE_EMBED_HIDDEN_SIZE [[function_constant(0)]];
 // 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8`, matrix-unit
 // tapes); XOR-ing each loaded byte restores them. Unset: as written.
-constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
+#define AFFINE_EMBED_CONSTS(X)                                                                 \
+  X(uint, hidden, AFFINE_EMBED_HIDDEN_SIZE, 0) X(bool, offset8, AFFINE_CODES_OFFSET8, 5)
+#ifndef MK_BODIES_ONLY
+AFFINE_EMBED_CONSTS(MK_FC_DECLARE)
 constant uint AFFINE_CODES_XOR =
     is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x88u : 0u;
+#endif
 
-template <typename T_act, typename T_scale, const int group_size>
+// `OP`: the output pointer type — device-coherent when the megakernel plays it.
+template <typename T_act, typename T_scale, const int group_size, typename OP = device T_act*>
 inline void affine_embed_b4_kernel(
     const device uint8_t* w,
     const device T_scale* scales,
     const device T_scale* biases,
     const device uint* indices,
-    device T_act* out,
+    OP out,
     uint hidden_size,
+    uint codes_xor,
     uint2 index) {
     constexpr int pack_factor = 2;
     // The dispatch rounds threadgroups.x up by threads_per_threadgroup.x;
@@ -145,12 +153,13 @@ inline void affine_embed_b4_kernel(
     // In-register T_scale → T_act cast (`INT4_PARITY_PROBES.md` §7).
     T_act scale = static_cast<T_act>(scales[gindex]);
     T_act bias  = static_cast<T_act>(biases[gindex]);
-    uint val = w[w_offset] ^ AFFINE_CODES_XOR;
+    uint val = w[w_offset] ^ codes_xor;
 
     out[out_offset + 0] = scale * T_act(val & 0x0f)        + bias;
     out[out_offset + 1] = scale * T_act((val >> 4) & 0x0f) + bias;
 }
 
+#ifndef MK_BODIES_ONLY
 #define DEFINE_AFFINE_EMBED_B4(act_tag, act_type, scale_tag, scale_type, gs)             \
     kernel void affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_4(                  \
         const device uint8_t* w           [[buffer(0)]],                                 \
@@ -160,8 +169,14 @@ inline void affine_embed_b4_kernel(
         device act_type* out              [[buffer(4)]],                                 \
         uint2 index    [[thread_position_in_grid]]) {                                    \
         affine_embed_b4_kernel<act_type, scale_type, gs>(                                \
-            w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);           \
+            w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, AFFINE_CODES_XOR, \
+            index);                                                                      \
     }
+#else
+#define DEFINE_AFFINE_EMBED_B4(act_tag, act_type, scale_tag, scale_type, gs)                  \
+    MK_ADAPTER(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_4, 0, 0x10,              \
+               (mk_affine_embed<act_type, scale_type, gs, 4, MK_C>), AFFINE_EMBED_CONSTS)
+#endif
 
 DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,    32)
 DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,    64)
@@ -176,13 +191,13 @@ DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,   128)
 // code (pack_factor=1), so each thread reads one byte and writes ONE
 // output element (vs the b4 kernel's 2 nibbles → 2 elements). Same MLX
 // affine dequant `y = scale * code + bias`.
-template <typename T_act, typename T_scale, const int group_size>
+template <typename T_act, typename T_scale, const int group_size, typename OP = device T_act*>
 inline void affine_embed_b8_kernel(
     const device uint8_t* w,
     const device T_scale* scales,
     const device T_scale* biases,
     const device uint* indices,
-    device T_act* out,
+    OP out,
     uint hidden_size,
     uint2 index) {
     if (index.x >= hidden_size) return;
@@ -201,6 +216,28 @@ inline void affine_embed_b8_kernel(
     out[out_offset] = scale * T_act(val) + bias;
 }
 
+// Megakernel adapters: the gather-dequant of one dispatch thread, the output (4) coherent.
+template <typename T_act, typename T_scale, int gs, int bits, typename C>
+MK_FUNC void mk_affine_embed(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+    if (!l.live) return;
+    const device uint8_t* w = (const device uint8_t*)s.addr[0];
+    const device T_scale* scales = (const device T_scale*)s.addr[1];
+    const device T_scale* biases = (const device T_scale*)s.addr[2];
+    const device uint* indices = (const device uint*)s.addr[3];
+    const uint2 index = mk_thread_in_grid(l).xy;
+    if constexpr (bits == 4) {
+        // The step's codes: stored offset-8 (XOR 0x88 per byte) or as written.
+        const uint codes_xor = C::has_offset8() && C::offset8() ? 0x88u : 0u;
+        affine_embed_b4_kernel<T_act, T_scale, gs>(w, scales, biases, indices,
+                                                   (mk_ptr<T_act>)s.addr[4], C::hidden(),
+                                                   codes_xor, index);
+    } else {
+        affine_embed_b8_kernel<T_act, T_scale, gs>(w, scales, biases, indices,
+                                                   (mk_ptr<T_act>)s.addr[4], C::hidden(), index);
+    }
+}
+
+#ifndef MK_BODIES_ONLY
 #define DEFINE_AFFINE_EMBED_B8(act_tag, act_type, scale_tag, scale_type, gs)             \
     kernel void affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_8(                  \
         const device uint8_t* w           [[buffer(0)]],                                 \
@@ -212,6 +249,11 @@ inline void affine_embed_b8_kernel(
         affine_embed_b8_kernel<act_type, scale_type, gs>(                                \
             w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);           \
     }
+#else
+#define DEFINE_AFFINE_EMBED_B8(act_tag, act_type, scale_tag, scale_type, gs)                  \
+    MK_ADAPTER(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_8, 0, 0x10,              \
+               (mk_affine_embed<act_type, scale_type, gs, 8, MK_C>), AFFINE_EMBED_CONSTS)
+#endif
 
 DEFINE_AFFINE_EMBED_B8(f16,  half,   f16, half,    32)
 DEFINE_AFFINE_EMBED_B8(f16,  half,   f16, half,    64)

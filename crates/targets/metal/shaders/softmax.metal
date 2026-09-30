@@ -28,13 +28,14 @@
 #include <metal_common>
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
 #define MLX_N_READS 4
 
 template <typename T>
-struct Limits {
+struct SoftmaxLimits {
   static constant constexpr const T min = numeric_limits<T>::lowest();
   static constant constexpr const T finite_min = numeric_limits<T>::lowest();
 };
@@ -46,6 +47,104 @@ inline T softmax_exp(T x) {
   return fast::exp(x);
 }
 
+// Body shared by the dispatch kernels and the megakernel adapter, as TEXT over the kernel's own
+// names (a function body would reorder the kernel's first loads — its AIR would differ). `DEAD`:
+// this lane plays no real virtual threadgroup — the megakernel's barrier-uniform form loads and
+// stores nothing for it but runs every barrier; the kernel passes `false`.
+#define SOFTMAX_SINGLE_ROW_BODY(DEAD)                                                   \
+  AccT ld[N_READS];                                                                     \
+                                                                                        \
+  in += gid * size_t(axis_size) + lid * N_READS;                                        \
+  if (DEAD) {                                                                           \
+    for (int i = 0; i < N_READS; i++) {                                                 \
+      ld[i] = SoftmaxLimits<AccT>::min;                                                 \
+    }                                                                                   \
+  } else if (lid * N_READS + N_READS <= axis_size) {                                    \
+    for (int i = 0; i < N_READS; i++) {                                                 \
+      ld[i] = AccT(in[i]);                                                              \
+    }                                                                                   \
+  } else {                                                                              \
+    for (int i = 0; i < N_READS; i++) {                                                 \
+      ld[i] = ((lid * N_READS + i) < axis_size) ? AccT(in[i])                           \
+                                                : SoftmaxLimits<AccT>::min;             \
+    }                                                                                   \
+  }                                                                                     \
+  if (simd_group_id == 0) {                                                             \
+    local_max[simd_lane_id] = SoftmaxLimits<AccT>::min;                                 \
+    local_normalizer[simd_lane_id] = 0;                                                 \
+  }                                                                                     \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+                                                                                        \
+  AccT maxval = SoftmaxLimits<AccT>::finite_min;                                        \
+  for (int i = 0; i < N_READS; i++) {                                                   \
+    maxval = (maxval < ld[i]) ? ld[i] : maxval;                                         \
+  }                                                                                     \
+  maxval = simd_max(maxval);                                                            \
+  if (simd_lane_id == 0) {                                                              \
+    local_max[simd_group_id] = maxval;                                                  \
+  }                                                                                     \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+  if (simd_group_id == 0) {                                                             \
+    maxval = simd_max(local_max[simd_lane_id]);                                         \
+    if (simd_lane_id == 0) {                                                            \
+      local_max[0] = maxval;                                                            \
+    }                                                                                   \
+  }                                                                                     \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+  maxval = local_max[0];                                                                \
+                                                                                        \
+  AccT normalizer = 0;                                                                  \
+  for (int i = 0; i < N_READS; i++) {                                                   \
+    AccT exp_x = softmax_exp(ld[i] - maxval);                                           \
+    ld[i] = exp_x;                                                                      \
+    normalizer += exp_x;                                                                \
+  }                                                                                     \
+  normalizer = simd_sum(normalizer);                                                    \
+  if (simd_lane_id == 0) {                                                              \
+    local_normalizer[simd_group_id] = normalizer;                                       \
+  }                                                                                     \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+  if (simd_group_id == 0) {                                                             \
+    normalizer = simd_sum(local_normalizer[simd_lane_id]);                              \
+    if (simd_lane_id == 0) {                                                            \
+      local_normalizer[0] = normalizer;                                                 \
+    }                                                                                   \
+  }                                                                                     \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+  normalizer = 1 / local_normalizer[0];                                                 \
+                                                                                        \
+  out += gid * size_t(axis_size) + lid * N_READS;                                       \
+  if (DEAD) {                                                                           \
+  } else if (lid * N_READS + N_READS <= axis_size) {                                    \
+    for (int i = 0; i < N_READS; i++) {                                                 \
+      out[i] = T(ld[i] * normalizer);                                                   \
+    }                                                                                   \
+  } else {                                                                              \
+    for (int i = 0; i < N_READS; i++) {                                                 \
+      if ((lid * N_READS + i) < axis_size) {                                            \
+        out[i] = T(ld[i] * normalizer);                                                 \
+      }                                                                                 \
+    }                                                                                   \
+  }
+
+// Megakernel adapter: in (0) / out (1) coherent, `axis_size` the inline scalar by reference; the
+// two 32-entry reductions of one virtual threadgroup in its region.
+template <typename T, typename AccT>
+MK_FUNC void mk_softmax(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+  constexpr int N_READS = MLX_N_READS;
+  mk_cptr<T> in = (mk_cptr<T>)s.addr[0];
+  mk_ptr<T> out = (mk_ptr<T>)s.addr[1];
+  const device int& axis_size = *(const device int*)s.addr[2];
+  const uint gid = l.tg_pos.x;
+  const int lid = l.tid;
+  const uint simd_lane_id = l.simd_lid;
+  const uint simd_group_id = l.simd_gid;
+  threadgroup AccT* local_max = (threadgroup AccT*)mk_region(s, l, tg);
+  threadgroup AccT* local_normalizer = local_max + 32;
+  SOFTMAX_SINGLE_ROW_BODY(!l.live)
+}
+
+#ifndef MK_BODIES_ONLY
 template <typename T, typename AccT = T, int N_READS = MLX_N_READS>
 [[kernel]] void softmax_single_row(
     const device T* in,
@@ -62,75 +161,7 @@ template <typename T, typename AccT = T, int N_READS = MLX_N_READS>
   threadgroup AccT local_max[SIMD_SIZE];
   threadgroup AccT local_normalizer[SIMD_SIZE];
 
-  AccT ld[N_READS];
-
-  in += gid * size_t(axis_size) + lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      ld[i] = AccT(in[i]);
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      ld[i] = ((lid * N_READS + i) < axis_size) ? AccT(in[i])
-                                                : Limits<AccT>::min;
-    }
-  }
-  if (simd_group_id == 0) {
-    local_max[simd_lane_id] = Limits<AccT>::min;
-    local_normalizer[simd_lane_id] = 0;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  AccT maxval = Limits<AccT>::finite_min;
-  for (int i = 0; i < N_READS; i++) {
-    maxval = (maxval < ld[i]) ? ld[i] : maxval;
-  }
-  maxval = simd_max(maxval);
-  if (simd_lane_id == 0) {
-    local_max[simd_group_id] = maxval;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group_id == 0) {
-    maxval = simd_max(local_max[simd_lane_id]);
-    if (simd_lane_id == 0) {
-      local_max[0] = maxval;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  maxval = local_max[0];
-
-  AccT normalizer = 0;
-  for (int i = 0; i < N_READS; i++) {
-    AccT exp_x = softmax_exp(ld[i] - maxval);
-    ld[i] = exp_x;
-    normalizer += exp_x;
-  }
-  normalizer = simd_sum(normalizer);
-  if (simd_lane_id == 0) {
-    local_normalizer[simd_group_id] = normalizer;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group_id == 0) {
-    normalizer = simd_sum(local_normalizer[simd_lane_id]);
-    if (simd_lane_id == 0) {
-      local_normalizer[0] = normalizer;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  normalizer = 1 / local_normalizer[0];
-
-  out += gid * size_t(axis_size) + lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      out[i] = T(ld[i] * normalizer);
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        out[i] = T(ld[i] * normalizer);
-      }
-    }
-  }
+  SOFTMAX_SINGLE_ROW_BODY(false)
 }
 
 #define INSTANTIATE_PRECISE(tag, type)                          \
@@ -154,6 +185,12 @@ template <typename T, typename AccT = T, int N_READS = MLX_N_READS>
       uint _lid [[thread_position_in_threadgroup]],             \
       uint simd_lane_id [[thread_index_in_simdgroup]],          \
       uint simd_group_id [[simdgroup_index_in_threadgroup]]);
+#else
+// One virtual threadgroup owns `local_max[32]` + `local_normalizer[32]` of float.
+#define INSTANTIATE_PRECISE(tag, type) \
+  MK_ADAPTER(block_softmax_precise_##tag, 256, 0x3, (mk_softmax<type, float>), MK_NO_CONSTS)
+#define INSTANTIATE_NONPRECISE(tag, type)
+#endif
 
 // Precise variants use AccT=float so all simd reductions land on
 // float; non-precise variants stay in the input dtype. MSL's native
@@ -183,6 +220,65 @@ INSTANTIATE_NONPRECISE(float16, half)
 // Symbol naming follows the softmax precedent.
 // ─────────────────────────────────────────────────────────────────
 
+// Body shared by the dispatch kernels and the megakernel adapter, as TEXT over the kernel's own
+// names (as `SOFTMAX_SINGLE_ROW_BODY`). `DEAD`: this lane plays no real virtual threadgroup — it
+// loads and stores nothing but runs every barrier; the kernel passes `false`.
+#define TOPK_RENORM_BODY(DEAD)                                                          \
+  AccT ld[N_READS];                                                                     \
+  in  += gid * size_t(axis_size) + lid * N_READS;                                       \
+  out += gid * size_t(axis_size) + lid * N_READS;                                       \
+  if (DEAD) {                                                                           \
+    for (int i = 0; i < N_READS; i++) ld[i] = AccT(0);                                  \
+  } else if (lid * N_READS + N_READS <= axis_size) {                                    \
+    for (int i = 0; i < N_READS; i++) ld[i] = AccT(in[i]);                              \
+  } else {                                                                              \
+    for (int i = 0; i < N_READS; i++) {                                                 \
+      ld[i] = ((lid * N_READS + i) < axis_size) ? AccT(in[i]) : AccT(0);                \
+    }                                                                                   \
+  }                                                                                     \
+                                                                                        \
+  if (simd_group_id == 0) local_sum[simd_lane_id] = 0;                                  \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+                                                                                        \
+  AccT s = 0;                                                                           \
+  for (int i = 0; i < N_READS; i++) s += ld[i];                                         \
+  s = simd_sum(s);                                                                      \
+  if (simd_lane_id == 0) local_sum[simd_group_id] = s;                                  \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+  if (simd_group_id == 0) {                                                             \
+    s = simd_sum(local_sum[simd_lane_id]);                                              \
+    if (simd_lane_id == 0) local_sum[0] = s;                                            \
+  }                                                                                     \
+  threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+  AccT total = local_sum[0];                                                            \
+  AccT inv = (total > AccT(0)) ? (AccT(1) / total) : AccT(0);                           \
+                                                                                        \
+  if (DEAD) {                                                                           \
+  } else if (lid * N_READS + N_READS <= axis_size) {                                    \
+    for (int i = 0; i < N_READS; i++) out[i] = T(ld[i] * inv);                          \
+  } else {                                                                              \
+    for (int i = 0; i < N_READS; i++) {                                                 \
+      if (lid * N_READS + i < axis_size) out[i] = T(ld[i] * inv);                       \
+    }                                                                                   \
+  }
+
+// Megakernel adapter: in (0) / out (1) coherent, `axis_size` the inline scalar by reference; the
+// 32-entry reduction of one virtual threadgroup in its region.
+template <typename T, typename AccT>
+MK_FUNC void mk_topk_renorm(thread const MkStep& st, MkLane l, threadgroup uchar* tg) {
+  constexpr int N_READS = MLX_N_READS;
+  mk_cptr<T> in = (mk_cptr<T>)st.addr[0];
+  mk_ptr<T> out = (mk_ptr<T>)st.addr[1];
+  const device int& axis_size = *(const device int*)st.addr[2];
+  const uint gid = l.tg_pos.x;
+  const int lid = l.tid;
+  const uint simd_lane_id = l.simd_lid;
+  const uint simd_group_id = l.simd_gid;
+  threadgroup AccT* local_sum = (threadgroup AccT*)mk_region(st, l, tg);
+  TOPK_RENORM_BODY(!l.live)
+}
+
+#ifndef MK_BODIES_ONLY
 template <typename T, typename AccT = float, int N_READS = MLX_N_READS>
 [[kernel]] void topk_renorm_single_row(
     const device T* in,
@@ -196,40 +292,7 @@ template <typename T, typename AccT = float, int N_READS = MLX_N_READS>
   constexpr int SIMD_SIZE = 32;
   threadgroup AccT local_sum[SIMD_SIZE];
 
-  AccT ld[N_READS];
-  in  += gid * size_t(axis_size) + lid * N_READS;
-  out += gid * size_t(axis_size) + lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) ld[i] = AccT(in[i]);
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      ld[i] = ((lid * N_READS + i) < axis_size) ? AccT(in[i]) : AccT(0);
-    }
-  }
-
-  if (simd_group_id == 0) local_sum[simd_lane_id] = 0;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  AccT s = 0;
-  for (int i = 0; i < N_READS; i++) s += ld[i];
-  s = simd_sum(s);
-  if (simd_lane_id == 0) local_sum[simd_group_id] = s;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group_id == 0) {
-    s = simd_sum(local_sum[simd_lane_id]);
-    if (simd_lane_id == 0) local_sum[0] = s;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  AccT total = local_sum[0];
-  AccT inv = (total > AccT(0)) ? (AccT(1) / total) : AccT(0);
-
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) out[i] = T(ld[i] * inv);
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if (lid * N_READS + i < axis_size) out[i] = T(ld[i] * inv);
-    }
-  }
+  TOPK_RENORM_BODY(false)
 }
 
 #define INSTANTIATE_TOPK_RENORM(tag, type)                          \
@@ -242,6 +305,11 @@ template <typename T, typename AccT = float, int N_READS = MLX_N_READS>
       uint _lid [[thread_position_in_threadgroup]],                 \
       uint simd_lane_id [[thread_index_in_simdgroup]],              \
       uint simd_group_id [[simdgroup_index_in_threadgroup]]);
+#else
+// One virtual threadgroup owns `local_sum[32]` of float.
+#define INSTANTIATE_TOPK_RENORM(tag, type) \
+  MK_ADAPTER(topk_renorm_##tag, 128, 0x3, (mk_topk_renorm<type, float>), MK_NO_CONSTS)
+#endif
 
 INSTANTIATE_TOPK_RENORM(float16, half)
 INSTANTIATE_TOPK_RENORM(bfloat16, bfloat)

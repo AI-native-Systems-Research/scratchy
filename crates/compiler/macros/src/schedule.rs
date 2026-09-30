@@ -196,12 +196,7 @@ pub fn find_intra_wave_dep_violation(
     None
 }
 
-// ⛔ CUDA ONLY, AND THE GATE USED TO SAY OTHERWISE. This module names
-// `scratchy_target_cuda` and `crate::solver` (instruction selection, itself
-// cuda-gated), so under `spyre` the cfg ADMITTED it and it failed to compile —
-// taking every other test in this crate down with it. A predicate that is WRONG
-// rather than absent, so the crate's whole suite was unrunnable off cuda.
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cfg::build_cfg;

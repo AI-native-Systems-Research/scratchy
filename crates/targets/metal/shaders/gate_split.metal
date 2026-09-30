@@ -19,25 +19,25 @@
 // the matching gate elem from the interleaved source row.
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
-constant uint GATE_SPLIT_N         [[function_constant(0)]];
-constant uint GATE_SPLIT_HEAD_DIM  [[function_constant(1)]];
-constant uint GATE_SPLIT_NUM_HEADS [[function_constant(2)]];
+#define GATE_SPLIT_CONSTS(X)                                                              \
+  X(uint, n, GATE_SPLIT_N, 0) X(uint, head_dim, GATE_SPLIT_HEAD_DIM, 1)                   \
+  X(uint, num_heads, GATE_SPLIT_NUM_HEADS, 2)
+#ifndef MK_BODIES_ONLY
+GATE_SPLIT_CONSTS(MK_FC_DECLARE)
+struct GateSplitFc {
+  GATE_SPLIT_CONSTS(MK_FC_ACCESSOR)
+};
+#endif
 
-template <typename T>
-[[kernel]] void gate_split(
-    device       T* q_out    [[buffer(0)]],
-    device       T* gate_out [[buffer(1)]],
-    const device T* qg       [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-  if (gid >= GATE_SPLIT_N) {
-    return;
-  }
-  uint hd   = GATE_SPLIT_HEAD_DIM;
-  uint cols = GATE_SPLIT_NUM_HEADS * hd;   // per-output row width
+// Body shared by the dispatch kernels and the megakernel adapter: element `gid` (< n).
+template <typename C, typename QP, typename GP, typename SP>
+METAL_FUNC void gate_split_body(QP q_out, GP gate_out, SP qg, uint gid) {
+  uint hd   = C::head_dim();
+  uint cols = C::num_heads() * hd;   // per-output row width
   uint row  = gid / cols;
   uint rem  = gid % cols;
   uint head = rem / hd;
@@ -48,6 +48,28 @@ template <typename T>
   gate_out[gid] = qg[base + hd];
 }
 
+// Megakernel adapter: q_out (0), gate_out (1) and qg (2) device-coherent.
+template <typename T, typename C>
+MK_FUNC void mk_gate_split(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  const uint gid = mk_thread_in_grid(l).x;
+  if (!l.live || gid >= C::n()) return;
+  gate_split_body<C>((mk_ptr<T>)s.addr[0], (mk_ptr<T>)s.addr[1], (mk_cptr<T>)s.addr[2], gid);
+}
+
+#ifndef MK_BODIES_ONLY
+template <typename T>
+[[kernel]] void gate_split(
+    device       T* q_out    [[buffer(0)]],
+    device       T* gate_out [[buffer(1)]],
+    const device T* qg       [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= GATE_SPLIT_N) {
+    return;
+  }
+  gate_split_body<GateSplitFc>(q_out, gate_out, qg, gid);
+}
+
 #define INST_GATE_SPLIT(dtype_tag, mtl_type)                              \
   template [[host_name("gate_split_" #dtype_tag)]] [[kernel]] void        \
   gate_split<mtl_type>(                                                   \
@@ -55,6 +77,10 @@ template <typename T>
       device       mtl_type* gate_out [[buffer(1)]],                      \
       const device mtl_type* qg       [[buffer(2)]],                      \
       uint gid [[thread_position_in_grid]]);
+#else
+#define INST_GATE_SPLIT(dtype_tag, mtl_type) \
+  MK_TAIL(gate_split_##dtype_tag, 0x7, (mk_gate_split<mtl_type, MK_C>), GATE_SPLIT_CONSTS)
+#endif
 
 INST_GATE_SPLIT(f16,  half)
 INST_GATE_SPLIT(bf16, bfloat)

@@ -4,6 +4,7 @@
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
+#include "megakernel/mk_common.h"
 using namespace metal;
 
 // MLX's pragma helpers from `mlx/backend/metal/kernels/utils.h`.
@@ -11,6 +12,7 @@ using namespace metal;
 #define MLX_MTL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
 #endif
 
+#ifndef MK_BODIES_ONLY
 /// Fused Gate-Up-SiLU-Mul kernel for SwiGLU activation
 ///
 /// Pattern: silu(gate_proj(x)) * up_proj(x)
@@ -172,6 +174,8 @@ kernel void fused_gate_up_silu_mul_concat_f16_vec4(
     }
 }
 
+#endif // MK_BODIES_ONLY
+
 /// GELU variant for Gemma2/3 models
 /// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
 inline float gelu_approx(float x) {
@@ -185,6 +189,7 @@ inline float gelu_approx(float x) {
     return 0.5f * x * (1.0f + tanh(inner));
 }
 
+#ifndef MK_BODIES_ONLY
 /// Fused Gate-Up-GELU-Mul for Gemma models
 kernel void fused_gate_up_gelu_mul_f16(
     device const half* gate_out [[buffer(0)]],
@@ -204,6 +209,7 @@ kernel void fused_gate_up_gelu_mul_f16(
         output[gid * N + i] = half(gelu_approx(gate) * up);
     }
 }
+#endif // MK_BODIES_ONLY
 
 // Note: Metal does not have erf() function, so exact GELU is not available
 // Use approximate GELU instead (gelu_approx above)
@@ -250,24 +256,31 @@ kernel void fused_gate_up_gelu_mul_f16(
 // instead of writing both rows separately) and the function-constant
 // shape arguments instead of MLX's runtime constants.
 
-constant uint FUSED_MLP_DECODE_M [[function_constant(3)]];
-constant uint FUSED_MLP_DECODE_N [[function_constant(4)]];
-constant uint FUSED_MLP_DECODE_K [[function_constant(5)]];
-// GELU (Gemma GeGLU) vs SiLU (SwiGLU) activation selector. Default
+// GELU (Gemma GeGLU) vs SiLU (SwiGLU) activation selector (slot 9). Default
 // false (SiLU) so existing FusedGateUpSiluMul stays bit-identical.
-constant bool FUSED_MLP_DECODE_IS_GELU [[function_constant(9)]];
+#define FUSED_MLP_DECODE_CONSTS(X)                                                        \
+  X(uint, m, FUSED_MLP_DECODE_M, 3) X(uint, n, FUSED_MLP_DECODE_N, 4)                     \
+  X(uint, k, FUSED_MLP_DECODE_K, 5) X(bool, is_gelu, FUSED_MLP_DECODE_IS_GELU, 9)
+#ifndef MK_BODIES_ONLY
+FUSED_MLP_DECODE_CONSTS(MK_FC_DECLARE)
+struct FusedMlpDecodeFc {
+    FUSED_MLP_DECODE_CONSTS(MK_FC_ACCESSOR)
+};
+#endif
 
-kernel void fused_gate_up_silu_mul_decode_f16_specialized(
-    device       half* output  [[buffer(0)]],   // [1, N]
-    device const half* input   [[buffer(1)]],   // [1, K]
-    device const half* weight  [[buffer(2)]],   // [2*N, K] packed [gate; up]
-    uint3 tid     [[threadgroup_position_in_grid]],
-    uint3 lid     [[thread_position_in_threadgroup]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]])
+// Body shared by the dispatch kernels and the megakernel adapter, after the caller's `M == 1`
+// check. `MK` = played inside the megakernel: a thread past the rows (`live` false) skips the
+// work instead of returning, so every thread of the persistent threadgroup reaches the
+// reduction's barrier. The caller declares the per-thread state — the zeroed TM accumulators
+// `gate_result` / `up_result` and the TN staging buffers — and `tgp_gate` / `tgp_up`, the
+// reduction's `BN * (blockM + TM)` floats each.
+template <typename T, typename C, bool MK, typename OP, typename IP>
+METAL_FUNC void fused_mlp_decode_body(
+    OP output, IP input, device const T* weight, uint3 tid, uint simd_gid, uint simd_lid,
+    bool live, uint N, uint K, thread float* gate_result, thread float* up_result,
+    thread T* in_buf, thread T* gate_buf, thread T* up_buf, threadgroup float* tgp_gate,
+    threadgroup float* tgp_up)
 {
-    if (FUSED_MLP_DECODE_M != 1u) return;
-
     // Compile-time params chosen from MLX's `instantiate_gemv_blocks`
     // standard non-edge case: `instantiate_gemv(name, itype, 1, 8, 1, 32, 4, 4)`.
     constexpr int BM = 1;
@@ -281,16 +294,7 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
     constexpr int blockM   = threadsM * TM;  // 4
     constexpr int blockN   = threadsN * TN;  // 1024
 
-    const uint N = FUSED_MLP_DECODE_N;
-    const uint K = FUSED_MLP_DECODE_K;
     const uint matrix_ld = K;
-
-    // Per-thread accumulators (TM outputs per thread).
-    thread float gate_result[TM] = {0};
-    thread float up_result  [TM] = {0};
-    thread half  in_buf [TN];
-    thread half  gate_buf[TN];
-    thread half  up_buf  [TN];
 
     const int thrM = SN != 32 ? int(simd_lid) / SN : 0;
     const int thrN = SN != 32 ? int(simd_lid) % SN : int(simd_lid);
@@ -304,7 +308,10 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
 
     // Block position: which output rows this threadgroup is computing.
     int out_row = int(tid.x) * blockM + bm;
-    if (out_row >= int(N)) return;
+    if constexpr (!MK) {
+        if (out_row >= int(N)) return;
+    }
+    const bool active = !MK || (live && out_row < int(N));
 
     // Adjust the tail simdgroup so the last threadgroup's writes stay
     // in bounds (matches MLX's edge handling).
@@ -312,8 +319,8 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
     out_row = out_row + TM <= N_int ? out_row : N_int - TM;
 
     // Pointer pair: gate row out_row, up row N + out_row.
-    device const half* gate_mat = weight + uint(out_row) * matrix_ld;
-    device const half* up_mat   = weight + (N + uint(out_row)) * matrix_ld;
+    device const T* gate_mat = weight + uint(out_row) * matrix_ld;
+    device const T* up_mat   = weight + (N + uint(out_row)) * matrix_ld;
 
     // Loop over K in blocks of blockN = 1024.
     const int K_int = int(K);
@@ -321,77 +328,76 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
     const int last_iter = blockN * n_iter;
     const int leftover = K_int - last_iter;
 
-    for (int i = 0; i < n_iter; ++i) {
-        // Load TN input elements for this thread's K-slice.
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-            in_buf[tn] = input[bn + tn];
+    if (active) {
+        for (int i = 0; i < n_iter; ++i) {
+            // Load TN input elements for this thread's K-slice.
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                in_buf[tn] = input[bn + tn];
+            }
+
+            int mat_offset = 0;
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                // Load TN gate-weight + TN up-weight elements for row tm.
+                MLX_MTL_PRAGMA_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    gate_buf[tn] = gate_mat[mat_offset + bn + tn];
+                    up_buf[tn]   = up_mat  [mat_offset + bn + tn];
+                }
+                // Accumulate.
+                MLX_MTL_PRAGMA_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
+                    up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+                }
+                mat_offset += int(matrix_ld);
+            }
+
+            bn += blockN;
         }
 
-        int mat_offset = 0;
+        if (leftover > 0) {
+            // Bounds-checked tail — copy MLX's load_safe pattern inline.
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                in_buf[tn] = (bn + tn < K_int) ? input[bn + tn] : T(0);
+            }
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                MLX_MTL_PRAGMA_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    gate_buf[tn] = (bn + tn < K_int)
+                        ? gate_mat[tm * int(matrix_ld) + bn + tn]
+                        : T(0);
+                    up_buf[tn] = (bn + tn < K_int)
+                        ? up_mat  [tm * int(matrix_ld) + bn + tn]
+                        : T(0);
+                }
+                MLX_MTL_PRAGMA_UNROLL
+                for (int tn = 0; tn < TN; tn++) {
+                    gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
+                    up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+                }
+            }
+        }
+
+        // Simdgroup reduction (32-lane shuffle-down).
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
-            // Load TN gate-weight + TN up-weight elements for row tm.
             MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_buf[tn] = gate_mat[mat_offset + bn + tn];
-                up_buf[tn]   = up_mat  [mat_offset + bn + tn];
+            for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                gate_result[tm] += simd_shuffle_down(gate_result[tm], sn);
+                up_result[tm]   += simd_shuffle_down(up_result[tm], sn);
             }
-            // Accumulate.
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
-                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
-            }
-            mat_offset += int(matrix_ld);
-        }
-
-        bn += blockN;
-    }
-
-    if (leftover > 0) {
-        // Bounds-checked tail — copy MLX's load_safe pattern inline.
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-            in_buf[tn] = (bn + tn < K_int) ? input[bn + tn] : half(0);
-        }
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tm = 0; tm < TM; tm++) {
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_buf[tn] = (bn + tn < K_int)
-                    ? gate_mat[tm * int(matrix_ld) + bn + tn]
-                    : half(0);
-                up_buf[tn] = (bn + tn < K_int)
-                    ? up_mat  [tm * int(matrix_ld) + bn + tn]
-                    : half(0);
-            }
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
-                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
-            }
-        }
-    }
-
-    // Simdgroup reduction (32-lane shuffle-down).
-    MLX_MTL_PRAGMA_UNROLL
-    for (int tm = 0; tm < TM; tm++) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
-            gate_result[tm] += simd_shuffle_down(gate_result[tm], sn);
-            up_result[tm]   += simd_shuffle_down(up_result[tm], sn);
         }
     }
 
     // Threadgroup reduction across BN=8 simdgroups (only sgN=0 will
     // hold the final partials and write outputs).
-    threadgroup float tgp_gate[BN * (blockM + TM)];
-    threadgroup float tgp_up  [BN * (blockM + TM)];
-
     threadgroup float* gate_results = tgp_gate + sgN * (blockM + TM) + bm;
     threadgroup float* up_results   = tgp_up   + sgN * (blockM + TM) + bm;
-    if (thrN == 0) {
+    if (active && thrN == 0) {
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
             gate_results[tm] = gate_result[tm];
@@ -400,7 +406,7 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (sgN == 0 && thrN == 0) {
+    if (active && sgN == 0 && thrN == 0) {
         MLX_MTL_PRAGMA_UNROLL
         for (int sgn = 1; sgn < BN; sgn++) {
             MLX_MTL_PRAGMA_UNROLL
@@ -415,167 +421,68 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
         for (int tm = 0; tm < TM; tm++) {
             const float g = gate_result[tm];
             const float u = up_result[tm];
-            const float act = FUSED_MLP_DECODE_IS_GELU
+            const float act = C::is_gelu()
                 ? gelu_approx(g)
                 : g / (1.0f + exp(-g));
-            output[out_row + tm] = half(act * u);
+            output[out_row + tm] = T(act * u);
         }
     }
 }
 
-/// BF16 specialized variant of the M=1 decode fused MLP. Direct
-/// translation of `..._decode_f16_specialized` with `bfloat` device
-/// pointers and `bfloat` thread-local buffers; accumulators stay
-/// f32 (matching the f16 variant's accumulation semantics).
-kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
-    device       bfloat* output  [[buffer(0)]],
-    device const bfloat* input   [[buffer(1)]],
-    device const bfloat* weight  [[buffer(2)]],
-    uint3 tid     [[threadgroup_position_in_grid]],
-    uint3 lid     [[thread_position_in_threadgroup]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]])
-{
-    if (FUSED_MLP_DECODE_M != 1u) return;
-
-    constexpr int BM = 1;
-    constexpr int BN = 8;
-    constexpr int SM = 1;
-    constexpr int SN = 32;
-    constexpr int TM = 4;
-    constexpr int TN = 4;
-    constexpr int threadsM = BM * SM;
-    constexpr int threadsN = BN * SN;
-    constexpr int blockM   = threadsM * TM;
-    constexpr int blockN   = threadsN * TN;
-
-    const uint N = FUSED_MLP_DECODE_N;
-    const uint K = FUSED_MLP_DECODE_K;
-    const uint matrix_ld = K;
-
-    thread float gate_result[TM] = {0};
-    thread float up_result  [TM] = {0};
-    thread bfloat in_buf [TN];
-    thread bfloat gate_buf[TN];
-    thread bfloat up_buf  [TN];
-
-    const int thrM = SN != 32 ? int(simd_lid) / SN : 0;
-    const int thrN = SN != 32 ? int(simd_lid) % SN : int(simd_lid);
-
-    const int sgN = BN != 1 ? int(simd_gid) % BN : 0;
-    const int simdM = BN != 1 ? SM * (int(simd_gid) / BN) : SM * int(simd_gid);
-    const int simdN = BN != 1 ? SN * (int(simd_gid) % BN) : 0;
-
-    int bm = (simdM + thrM) * TM;
-    int bn = (simdN + thrN) * TN;
-
-    int out_row = int(tid.x) * blockM + bm;
-    if (out_row >= int(N)) return;
-
-    const int N_int = int(N);
-    out_row = out_row + TM <= N_int ? out_row : N_int - TM;
-
-    device const bfloat* gate_mat = weight + uint(out_row) * matrix_ld;
-    device const bfloat* up_mat   = weight + (N + uint(out_row)) * matrix_ld;
-
-    const int K_int = int(K);
-    const int n_iter = K_int / blockN;
-    const int last_iter = blockN * n_iter;
-    const int leftover = K_int - last_iter;
-
-    for (int i = 0; i < n_iter; ++i) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-            in_buf[tn] = input[bn + tn];
-        }
-
-        int mat_offset = 0;
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tm = 0; tm < TM; tm++) {
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_buf[tn] = gate_mat[mat_offset + bn + tn];
-                up_buf[tn]   = up_mat  [mat_offset + bn + tn];
-            }
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
-                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
-            }
-            mat_offset += int(matrix_ld);
-        }
-
-        bn += blockN;
-    }
-
-    if (leftover > 0) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tn = 0; tn < TN; tn++) {
-            in_buf[tn] = (bn + tn < K_int) ? input[bn + tn] : bfloat(0);
-        }
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tm = 0; tm < TM; tm++) {
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_buf[tn] = (bn + tn < K_int)
-                    ? gate_mat[tm * int(matrix_ld) + bn + tn]
-                    : bfloat(0);
-                up_buf[tn] = (bn + tn < K_int)
-                    ? up_mat  [tm * int(matrix_ld) + bn + tn]
-                    : bfloat(0);
-            }
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tn = 0; tn < TN; tn++) {
-                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
-                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
-            }
-        }
-    }
-
-    MLX_MTL_PRAGMA_UNROLL
-    for (int tm = 0; tm < TM; tm++) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
-            gate_result[tm] += simd_shuffle_down(gate_result[tm], sn);
-            up_result[tm]   += simd_shuffle_down(up_result[tm], sn);
-        }
-    }
-
-    threadgroup float tgp_gate[BN * (blockM + TM)];
-    threadgroup float tgp_up  [BN * (blockM + TM)];
-
-    threadgroup float* gate_results = tgp_gate + sgN * (blockM + TM) + bm;
-    threadgroup float* up_results   = tgp_up   + sgN * (blockM + TM) + bm;
-    if (thrN == 0) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tm = 0; tm < TM; tm++) {
-            gate_results[tm] = gate_result[tm];
-            up_results[tm]   = up_result[tm];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (sgN == 0 && thrN == 0) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int sgn = 1; sgn < BN; sgn++) {
-            MLX_MTL_PRAGMA_UNROLL
-            for (int tm = 0; tm < TM; tm++) {
-                gate_result[tm] += tgp_gate[sgn * (blockM + TM) + bm + tm];
-                up_result[tm]   += tgp_up  [sgn * (blockM + TM) + bm + tm];
-            }
-        }
-
-        MLX_MTL_PRAGMA_UNROLL
-        for (int tm = 0; tm < TM; tm++) {
-            const float g = gate_result[tm];
-            const float u = up_result[tm];
-            const float act = FUSED_MLP_DECODE_IS_GELU
-                ? gelu_approx(g)
-                : g / (1.0f + exp(-g));
-            output[out_row + tm] = bfloat(act * u);
-        }
-    }
+// Megakernel adapter: one virtual threadgroup of 256 threads per dispatch threadgroup; output (0)
+// and input (1) device-coherent; the two reductions (2 × 64 floats) in its region.
+template <typename T, typename C>
+MK_FUNC void mk_fused_mlp_decode(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+    thread float gate_result[4] = {0};
+    thread float up_result  [4] = {0};
+    thread T in_buf[4], gate_buf[4], up_buf[4];
+    threadgroup float* gate = (threadgroup float*)mk_region(s, l, tg);
+    fused_mlp_decode_body<T, C, true>((mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1],
+                                      (device const T*)s.addr[2], l.tg_pos, l.simd_gid,
+                                      l.simd_lid, l.live && C::m() == 1u, C::n(), C::k(),
+                                      gate_result, up_result, in_buf, gate_buf, up_buf, gate,
+                                      gate + 64);
 }
+
+#ifndef MK_BODIES_ONLY
+#define INST_FUSED_MLP_DECODE(tag, T)                                                     \
+  kernel void fused_gate_up_silu_mul_decode_##tag##_specialized(                         \
+      device       T* output  [[buffer(0)]],                                              \
+      device const T* input   [[buffer(1)]],                                              \
+      device const T* weight  [[buffer(2)]],                                              \
+      uint3 tid     [[threadgroup_position_in_grid]],                                     \
+      uint3 lid     [[thread_position_in_threadgroup]],                                   \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                                  \
+      uint  simd_lid [[thread_index_in_simdgroup]])                                       \
+  {                                                                                       \
+    if (FUSED_MLP_DECODE_M != 1u) return;                                                 \
+    const uint N = FUSED_MLP_DECODE_N;                                                    \
+    const uint K = FUSED_MLP_DECODE_K;                                                    \
+    /* Per-thread accumulators (TM = 4 outputs per thread), TN = 4 staging values. */     \
+    thread float gate_result[4] = {0};                                                    \
+    thread float up_result  [4] = {0};                                                    \
+    thread T in_buf [4];                                                                  \
+    thread T gate_buf[4];                                                                 \
+    thread T up_buf  [4];                                                                 \
+    threadgroup float tgp_gate[8 * (4 + 4)];                                              \
+    threadgroup float tgp_up  [8 * (4 + 4)];                                              \
+    fused_mlp_decode_body<T, FusedMlpDecodeFc, false>(output, input, weight, tid,         \
+                                                      simd_gid, simd_lid, true, N, K,     \
+                                                      gate_result, up_result, in_buf,     \
+                                                      gate_buf, up_buf, tgp_gate, tgp_up); \
+  }
+#else
+#define INST_FUSED_MLP_DECODE(tag, T)                                                     \
+  MK_ADAPTER(fused_gate_up_silu_mul_decode_##tag##_specialized, 512, 0x3,                 \
+             (mk_fused_mlp_decode<T, MK_C>), FUSED_MLP_DECODE_CONSTS)
+#endif
+
+// f16 and the BF16 translation (`bfloat` device pointers and thread-local buffers; accumulators
+// stay f32, matching the f16 variant's accumulation semantics).
+INST_FUSED_MLP_DECODE(f16, half)
+INST_FUSED_MLP_DECODE(bf16, bfloat)
+
+#ifndef MK_BODIES_ONLY
 
 // ============================================================================
 // fused_gate_up_silu_mul_gemm_steel_{f16,bf16}_specialized
@@ -1003,4 +910,4 @@ kernel void fused_gate_up_silu_mul_gemm_steel_bf16_specialized(
         }
     }
 }
-
+#endif // MK_BODIES_ONLY

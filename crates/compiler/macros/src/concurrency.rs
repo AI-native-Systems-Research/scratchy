@@ -124,7 +124,7 @@ impl<'p> ConcurrencyModel<'p> {
     }
 }
 
-#[cfg(all(test, any(feature = "cuda", feature = "spyre")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::classified::OpKind;

@@ -11,7 +11,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-#[cfg(feature = "cuda")]
 use scratchy_target_cuda::targets::ProfileDef;
 
 /// Empirical GPU cost table: `(kernel_name, M, N, K) -> cost_us`.
@@ -30,26 +29,11 @@ use scratchy_target_cuda::targets::ProfileDef;
 pub struct CostTable {
     entries: HashMap<(String, u32, u32, u32), f64>,
     kernel_set: HashSet<String>,
-    /// When true, [`has_kernel`](Self::has_kernel) returns true for ANY name —
-    /// so a backend with no empirical cost CSV (spyre/KTIR) passes every impl's
-    /// `target_compatible` gate; cost falls back to the analytic formula.
-    universal: bool,
 }
 
 impl CostTable {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// A cost table that claims every kernel (`has_kernel` always true) with no
-    /// cost entries — analytic cost fallback. The spyre/KTIR target uses this:
-    /// it has no GPU cost sweep, and the solver only needs *a* valid impl per op
-    /// to produce the standard decode SubtileIR the KTIR emitter lowers.
-    pub fn universal() -> Self {
-        Self {
-            universal: true,
-            ..Self::default()
-        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -79,7 +63,7 @@ impl CostTable {
     /// `target_compatible` to gate impls without scanning the cost
     /// table per call.
     pub fn has_kernel(&self, kernel: &str) -> bool {
-        self.universal || self.kernel_set.contains(kernel)
+        self.kernel_set.contains(kernel)
     }
 
     /// Every distinct kernel name observed in the CSV. Useful for
@@ -96,11 +80,6 @@ impl CostTable {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Cuda,
-    Metal,
-    /// IBM Spyre / KTIR host emulator — a host-orchestrated backend with no GPU
-    /// cost model. The solver only needs a profile to cover the FUF with
-    /// spyre's own claim impls, which the KTIR emitter then lowers.
-    Spyre,
 }
 
 /// CUDA-specific hardware characteristics.
@@ -114,20 +93,8 @@ pub struct CudaSpec {
     pub shared_memory_per_sm_kb: u32,
 }
 
-/// Metal-specific hardware characteristics.
-#[derive(Clone, Debug)]
-pub struct MetalSpec {
-    /// Apple Silicon generation (M1, M2, M3, M4).
-    pub generation: String,
-    /// Number of GPU cores.
-    pub gpu_cores: u32,
-    /// Threadgroup memory per threadgroup, kilobytes.
-    pub threadgroup_memory_kb: u32,
-}
-
 /// Hardware characteristics a cost model uses to estimate kernel
-/// timing. All units are explicit. Backend-agnostic to support
-/// both CUDA and Metal targets.
+/// timing. All units are explicit.
 #[derive(Clone, Debug)]
 pub struct TargetProfile {
     pub name: String,
@@ -151,9 +118,6 @@ pub struct TargetProfile {
 #[derive(Clone, Debug)]
 pub enum BackendSpec {
     Cuda(CudaSpec),
-    Metal(MetalSpec),
-    /// Spyre/KTIR host backend — no GPU hardware spec (analytic cost only).
-    Spyre,
 }
 
 impl TargetProfile {
@@ -169,7 +133,6 @@ impl TargetProfile {
 /// const, parsing the embedded CSV bytes into a `CostTable`. The
 /// proc-macro calls this once per `#[forward]` invocation after
 /// resolving the active GPU (`scratchy_target_cuda::targets::detect()`).
-#[cfg(feature = "cuda")]
 pub fn from_profile_def(def: &ProfileDef) -> TargetProfile {
     TargetProfile {
         name: def.name.to_string(),
@@ -223,12 +186,7 @@ pub fn parse_cost_csv(csv: &str) -> CostTable {
     table
 }
 
-// ⛔ CUDA ONLY, AND THE GATE USED TO SAY OTHERWISE. This module names
-// `scratchy_target_cuda` and `crate::solver` (instruction selection, itself
-// cuda-gated), so under `spyre` the cfg ADMITTED it and it failed to compile —
-// taking every other test in this crate down with it. A predicate that is WRONG
-// rather than absent, so the crate's whole suite was unrunnable off cuda.
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use scratchy_target_cuda::targets::{H100_SM90, L4_SM89};
@@ -237,20 +195,18 @@ mod tests {
     fn from_profile_def_carries_spec_fields() {
         let l4 = from_profile_def(&L4_SM89);
         assert_eq!(l4.backend, Backend::Cuda);
-        if let BackendSpec::Cuda(spec) = &l4.backend_spec {
+        {
+            let BackendSpec::Cuda(spec) = &l4.backend_spec;
             assert_eq!(spec.compute_capability, 89);
             assert_eq!(spec.num_sms, 58);
-        } else {
-            panic!("Expected CUDA backend spec");
         }
         assert!(l4.peak_tflops_fp16 > 100.0);
 
         let h100 = from_profile_def(&H100_SM90);
         assert_eq!(h100.backend, Backend::Cuda);
-        if let BackendSpec::Cuda(spec) = &h100.backend_spec {
+        {
+            let BackendSpec::Cuda(spec) = &h100.backend_spec;
             assert_eq!(spec.compute_capability, 90);
-        } else {
-            panic!("Expected CUDA backend spec");
         }
         assert!(h100.peak_tflops_fp16 > l4.peak_tflops_fp16);
     }

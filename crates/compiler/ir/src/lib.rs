@@ -396,15 +396,11 @@ pub enum Instruction {
     /// the codegen prelude); no `out_slot` payload.
     FusedCublasGemmAdd(u32, u32, u32, u32, u32),
     FusedGemmBias(u32, u32, u32),
-    /// Metal-only per-row bias broadcast add. Emitted by
-    /// `MetalBiasAddImpl` when the synth-pre-attn megakernel doesn't
-    /// claim the biased QKV chain (today: M ≥ 2 prefill, where the
-    /// cost CSV picks unfused).
+    /// Metal-only per-row bias broadcast add.
     /// CUDA's analogue is `FusedGemmBias`, which folds the bias into
     /// cuBLAS's gemm_bias epilog. On Metal the singleton path
     /// dispatches a separate `KernelId::BiasAdd` after the AffineQmm
-    /// / Gemm; once the synth path absorbs biases the solver will
-    /// prefer that over this singleton on decode workloads.
+    /// / Gemm.
     ///
     /// Fields: `(in_slot, out_slot, layer, n, is_affine)`. Bias is
     /// resolved through the tape-level `WeightAccessors::linear_at`
@@ -739,75 +735,6 @@ pub enum Instruction {
     ///
     /// CUDA eval is `unreachable!` — emit only on the metal forward.
     Nvfp4Qmm(u32, u32, u32, u32, u32, u32, u32, u32),
-    /// Compiler-synthesized pre-attention chunk megakernel. Metal-only.
-    /// Combines (Add → RmsNorm → 3×AffineQmv → RoPE → paged KV-cache
-    /// write) into one dispatch. The kernel itself is generated at
-    /// macro-expansion time by
-    /// `scratchy-forward-compiler-macro/src/fuse_pass.rs` stitching MK primitive
-    /// calls; the symbol name carried here resolves at runtime against
-    /// a per-arch source-compiled library registered into the
-    /// `SpecializedPipelineCache` at worker-pool init.
-    ///
-    /// Tuple fields: `(residual_slot, delta_slot, q_out_slot, layer,
-    /// group_size, bits, kernel_symbol, has_linear_bias)`. Q/K/V
-    /// LinearLayer accessors and the RmsNorm/CosSin pair resolve
-    /// through `WeightAccessors::{linear_at, rms_norm_at, cos_sin_at}`
-    /// at slots 0..3 of the same `(bucket, op_idx)` — avoiding the
-    /// load-time packed-concat infrastructure that Phase 0's revert
-    /// dropped.
-    ///
-    /// CUDA eval is `unreachable!`.
-    SynthPreAttn(
-        u32, // 0: residual_in_slot
-        u32, // 1: delta_slot
-        u32, // 2: q_out_slot
-        /// 3: `residual_out_slot` — distinct arena slot for the updated
-        /// residual (`residual_in + delta`). NOT written in place: the
-        /// kernel is tiled across threadgroups and reads the whole
-        /// `residual_in` for the rmsnorm sum, so an in-place write would
-        /// race cross-threadgroup. The coloring keeps it distinct from
-        /// `residual_in_slot`; downstream reads this. For the layer-0
-        /// `_init` variant (no residual add) the `fan_out` sets it equal
-        /// to `residual_in_slot` and the kernel leaves it untouched.
-        u32,
-        u32,          // 4: layer
-        u32,          // 5: group_size
-        u32,          // 6: bits
-        &'static str, // 7: kernel_symbol
-        /// 8: `has_linear_bias`. When `true`, the lowering arm appends 3
-        /// extra `Binding::Weight { which: AffineLinearBias, .. }`
-        /// entries for Q/K/V at buffers 18/19/20 and picks the
-        /// `_bias` synth kernel symbol (set by `fan_out`). Qwen2/2.5
-        /// quantized chains land here; Llama stays `false`.
-        bool,
-    ),
-    /// Compiler-synthesized MLP pre-down chunk megakernel. Metal-only.
-    /// Combines (FusedAddRmsNorm → AffineQmv gate → AffineQmv up →
-    /// SiluMul) into one dispatch, leaving the down-projection as a
-    /// standalone `AffineQmm` consumer of the synthesized output. The
-    /// kernel itself is generated at macro-expansion time by
-    /// `scratchy-forward-compiler-macro::fuse_pass::synthesize_mlp_pre_down_chunk`;
-    /// the symbol name carried here resolves at runtime against a
-    /// per-arch source-compiled library registered into the
-    /// `SpecializedPipelineCache` at worker-pool init.
-    ///
-    /// Tuple fields: `(residual_in_slot, delta_slot, silu_mul_out_slot,
-    /// residual_out_slot, layer, group_size, bits, kernel_symbol)`.
-    /// Gate/up `LinearLayer`s and the RmsNorm resolve through
-    /// `WeightAccessors::{linear_at, rms_norm_at}` at slots 0/1/2 of the
-    /// same `(bucket, op_idx)`. The standalone `AffineQmm` for down_proj
-    /// follows directly in the instruction stream as before.
-    ///
-    /// `residual_out_slot` is the distinct arena slot the fusion writes
-    /// the updated residual (`residual_in + delta`) into — NOT in place,
-    /// because the kernel is tiled across threadgroups and reads the
-    /// whole `residual_in` for the rmsnorm sum (an in-place write would
-    /// race cross-threadgroup). The coloring assigns it a slot distinct
-    /// from `residual_in_slot` (fused-subgraph inputs stay live to the
-    /// subgraph's end); downstream reads `residual_out_slot`.
-    ///
-    /// CUDA eval is `unreachable!`.
-    SynthMlpPreDown(u32, u32, u32, u32, u32, u32, u32, &'static str),
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
     /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
@@ -832,13 +759,6 @@ pub enum Instruction {
     /// `(gate_slot, up_slot, out_slot)`, same `[M, intermediate_size]`
     /// shapes. Metal-only.
     GeluMul(u32, u32, u32),
-    /// Fused gate+up GEMM + SiluMul for large-M prefill (M ≥ 8).
-    /// Metal-only; emitted by `MetalSynthGateUpSiluMulImpl`.
-    /// Fields: `(x_norm_slot, out_slot, layer, group_size, bits,
-    /// kernel_symbol)`. Gate/up LinearLayer accessors resolve through
-    /// `WeightAccessors::linear_at` at slots 0/1 of the same
-    /// `(bucket, op_idx)`.
-    SynthGateUpSiluMul(u32, u32, u32, u32, u32, &'static str),
     /// MLX-affine int4 quantized embedding lookup (Metal-only).
     /// Replaces `Instruction::Embed` when `model.embed_tokens` ships
     /// as a quantized triple `(weight=U32, scales, biases)` — i.e.
@@ -993,21 +913,6 @@ pub trait CanonicalParams: WeightAccessors {
     /// Set by `#[vision_forward]` from the vision config.
     const VISION_NUM_HEADS: u32 = 0;
 
-    /// Metal-only: list of compiler-synthesized kernel sources (per
-    /// `scratchy-forward-compiler-macro::fuse_pass`). Each entry is
-    /// `(symbol_name, precompiled .metallib bytes)`. The proc-macro
-    /// AOT-compiles synthesized MSL via `xcrun metal -c` +
-    /// `xcrun metallib` at macro-expansion time and embeds the
-    /// resulting bytes as `&'static [u8]`. The MetalWorkerPool
-    /// registers each via
-    /// `SpecializedPipelineCache::register_metallib_library`
-    /// (`newLibraryWithData`) — same path used by every hand-written
-    /// shader, NOT `newLibraryWithSource`. Default empty — the macro
-    /// overrides this per Metal arch with the actual synthesized
-    /// metallibs from the FUF analysis.
-    fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
-        &[]
-    }
     /// Vision-tower attention head dimension. Same defaults / set-by
     /// rule as [`Self::VISION_NUM_HEADS`].
     const VISION_HEAD_DIM: u32 = 0;

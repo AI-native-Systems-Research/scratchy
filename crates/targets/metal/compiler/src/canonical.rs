@@ -289,12 +289,15 @@ pub fn lower_canonical(
         let (flags, _) = b.flags();
         proof(&b, &flags).map(|()| (b, flags))
     };
+    // The megakernel plan's feed: each row's dataflow, from the layout that is kept.
+    let (rolled_access, lm_head_access) = rolled.access();
     let mut cut = match proof(&rolled, &rolled_flags) {
         Ok(()) => Some((
             RollOutcome::Rolled { peel: 0 },
             rolled.rows,
             rolled_flags,
             rolled.sites,
+            rolled_access,
         )),
         Err(e) => {
             why.push(format!("peel=0: {e}"));
@@ -309,7 +312,8 @@ pub fn lower_canonical(
     if let Some(items) = &tp.layer_rolled {
         match candidate(items) {
             Ok((b, flags)) if cut.as_ref().is_none_or(|c| b.rows.len() < c.1.len()) => {
-                cut = Some((RollOutcome::LayerClasses, b.rows, flags, b.sites));
+                let (access, _) = b.access();
+                cut = Some((RollOutcome::LayerClasses, b.rows, flags, b.sites, access));
             }
             Ok(_) => {}
             Err(e) => why.push(format!("layer-class: {e}")),
@@ -324,7 +328,8 @@ pub fn lower_canonical(
             };
             match candidate(&items) {
                 Ok((b, flags)) => {
-                    cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, b.sites));
+                    let (access, _) = b.access();
+                    cut = Some((RollOutcome::Rolled { peel }, b.rows, flags, b.sites, access));
                     break;
                 }
                 Err(e) => why.push(format!("peel={peel}: {e}")),
@@ -332,12 +337,14 @@ pub fn lower_canonical(
         }
     }
     let from = unrolled.rows.len();
-    let (roll, backbone, backbone_barriers, backbone_sites) = cut.unwrap_or((
-        RollOutcome::Unrolled,
-        unrolled.rows,
-        unrolled_flags,
-        unrolled.sites,
-    ));
+    let (roll, backbone, backbone_barriers, backbone_sites, backbone_access) = match cut {
+        Some(kept) => kept,
+        None => {
+            let (access, _) = unrolled.access();
+            let (rows, sites) = (unrolled.rows, unrolled.sites);
+            (RollOutcome::Unrolled, rows, unrolled_flags, sites, access)
+        }
+    };
     match roll {
         RollOutcome::Unrolled => eprintln!(
             "[m2-roll] {stem} m={m}: NO cut rolls — emitting the un-rolled tape. {}",
@@ -360,9 +367,11 @@ pub fn lower_canonical(
             backbone,
             backbone_barriers,
             backbone_sources: backbone_sites.iter().map(|s| sources.row(s)).collect(),
+            backbone_access,
             lm_head: rolled.lm_rows,
             lm_head_barriers,
             lm_head_sources: rolled.lm_sites.iter().map(|s| sources.row(s)).collect(),
+            lm_head_access,
         },
         colours: colour_count,
         result,

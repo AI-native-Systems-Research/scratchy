@@ -9,11 +9,9 @@
 //!
 //! The execution plan partitions the bucket's command stream into
 //! [`BucketStep`]s: contiguous runs of commands sharing a pipeline
-//! become a single `BucketStep::Dispatch`; dense GEMM (f16 and bf16)
-//! bakes to a `gemm_{f16,bf16}_specialized` Dispatch step like every
-//! other kernel. MTL4 execution reads the pre-baked `mtl4_steps` from
-//! each baking; a bucket is ineligible only if a kernel exceeds the
-//! 31-entry argument-table bind cap.
+//! become a single `BucketStep::Dispatch`. MTL4 execution reads the
+//! pre-baked `mtl4_steps` from each baking; a bucket is ineligible only
+//! if a kernel exceeds the 31-entry argument-table bind cap.
 
 #[cfg(test)]
 use crate::interpreter::metal::lowered::IntoBaked;
@@ -27,7 +25,8 @@ use ::objc2::runtime::ProtocolObject;
 
 use super::ids::LayerId;
 use super::lowered::{
-    Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightTensor,
+    Binding, GateCtx, LoweredCommand, LoweredMetalTape, MegakernelError, MegakernelTape, TapePlay,
+    WeightTensor,
 };
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
@@ -50,8 +49,6 @@ pub type ArenaLayout = Vec<u64>;
 /// One unit of execution in a bucket's plan.
 ///
 /// `Dispatch` is a contiguous run of commands sharing a single pipeline.
-/// Dense GEMM (f16 and bf16) is a `Dispatch` step like every other
-/// kernel — `gemm_{f16,bf16}_specialized`, no MPS.
 pub enum BucketStep {
     Dispatch {
         /// Kernel id of every dispatch in this step. Coalescing
@@ -88,17 +85,6 @@ pub enum BucketStep {
     },
 }
 
-/// A `(buffer, offset)` pair for a resolved dense-GEMM operand. The
-/// arena/weight buffers themselves outlive the worker (the arena
-/// lives on the worker; weight buffers live on the model meta which
-/// the pool keeps alive), so a non-owning `Buffer` clone is
-/// equivalent to an `Arc` clone — `metal::Buffer` is itself a
-/// reference-counted handle.
-pub struct BoundBuffer {
-    pub buffer: Buffer,
-    pub offset: u64,
-}
-
 /// One bucket's baked artifacts: the execution plan and MTL4 steps.
 pub struct BucketBaking {
     pub bucket_m: u32,
@@ -117,6 +103,8 @@ pub struct BucketBaking {
     /// top_k stamps. dispatch-bound commands access this via
     /// `setBuffer_offset_atIndex` like any other device buffer.
     pub moe_inline_buf: Option<Buffer>,
+    /// The bucket's decode megakernel in this worker's KV mode, when its tape carries one.
+    pub megakernel: Option<super::megakernel::MegakernelBaking>,
 }
 
 #[derive(Debug)]
@@ -134,22 +122,6 @@ pub enum WorkerError {
         command_index: usize,
         slot: u32,
         arena_len: usize,
-    },
-    /// `KernelId::Gemm` reached the bake step but its
-    /// `LoweredCommand::gemm_dims` was `None`. Indicates a lowering
-    /// bug — the lowering pass owns populating those for `Gemm`
-    /// commands.
-    MissingGemmDims {
-        bucket_index: usize,
-        command_index: usize,
-    },
-    /// `KernelId::Gemm` had unexpected bindings. The worker expects
-    /// (output, input, weight) at indices 0/1/2 — anything else
-    /// is a lowering / model-meta contract violation.
-    GemmBindingsMalformed {
-        bucket_index: usize,
-        command_index: usize,
-        reason: &'static str,
     },
     /// A per-bucket scratch or inline buffer a binding needs was not provisioned.
     WeightLookupFailed { reason: &'static str },
@@ -173,6 +145,8 @@ pub enum WorkerError {
         bucket_index: usize,
         command_index: usize,
     },
+    /// The bucket's megakernel could not load.
+    Megakernel(MegakernelError),
 }
 
 impl std::fmt::Display for WorkerError {
@@ -192,23 +166,6 @@ impl std::fmt::Display for WorkerError {
                 f,
                 "MetalWorker: bucket {bucket_index} command {command_index} \
                  references arena slot {slot} but arena has only {arena_len} slots"
-            ),
-            Self::MissingGemmDims {
-                bucket_index,
-                command_index,
-            } => write!(
-                f,
-                "MetalWorker: bucket {bucket_index} command {command_index}: \
-                 KernelId::Gemm has no gemm_dims (lowering bug)"
-            ),
-            Self::GemmBindingsMalformed {
-                bucket_index,
-                command_index,
-                reason,
-            } => write!(
-                f,
-                "MetalWorker: bucket {bucket_index} command {command_index}: \
-                 GEMM bindings malformed ({reason})"
             ),
             Self::AffineCodes(e) => write!(f, "MetalWorker: {e}"),
             Self::WeightLookupFailed { reason } => {
@@ -235,6 +192,7 @@ impl std::fmt::Display for WorkerError {
                  Binding::Scratch with no splitk scratch buffer allocated \
                  (lowering / tape accounting bug)"
             ),
+            Self::Megakernel(e) => write!(f, "MetalWorker: {e}"),
         }
     }
 }
@@ -304,6 +262,11 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// `tq_dequant_max_blocks`. Only a prefill attention that re-ropes K can
     /// read such a block (`RuntimeGate::OnlyIfUnrotatedBlocks`).
     pub unrotated_blocks: std::sync::atomic::AtomicBool,
+    /// How the next forward plays its tape ([`TapePlay`]); stashed from the forward's inputs
+    /// like `tq_dequant_max_blocks`. `true` = [`TapePlay::Megakernel`].
+    plays_megakernel: std::sync::atomic::AtomicBool,
+    /// Megakernel runs the last forward played (the trace reads it).
+    megakernel_runs: std::sync::atomic::AtomicU32,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -330,6 +293,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             device,
             arena_layout,
             bucket_tapes,
+            &[],
             pipelines,
             sources,
             runtime,
@@ -342,11 +306,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// pool to pin every per-worker arena into the wired set so cmdbuf
     /// dispatches don't race against Apple's lazy paging on
     /// Llama-3.2-class working sets.
+    ///
+    /// `megakernels[i]` is bucket `i`'s baked megakernel tapes (one per KV mode, usually none);
+    /// the worker plays the one of its own KV mode.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_residency(
         device: Arc<Device>,
         arena_layout: &ArenaLayout,
         bucket_tapes: &[LoweredMetalTape],
+        megakernels: &[&'static [MegakernelTape]],
         pipelines: &SpecializedPipelines,
         sources: &ResolvedSources,
         runtime: &RuntimeBindings,
@@ -574,9 +542,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
 
         let mut bucket_bakings = Vec::with_capacity(bucket_tapes.len());
         for (bucket_idx, tape) in bucket_tapes.iter().enumerate() {
+            let megakernel = megakernels.get(bucket_idx).and_then(|m| m.first());
             let baking = bake_bucket::<W>(
                 bucket_idx,
                 tape,
+                megakernel,
                 &arena,
                 splitk_scratch.as_ref(),
                 moe_scratch.as_ref(),
@@ -593,6 +563,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // explicitly — bindings are pre-recorded in the dispatch).
             if let Some(b) = baking.moe_inline_buf.as_ref() {
                 pin(b);
+            }
+            // The megakernel's addresses and sync words are bound by address too.
+            if let Some(m) = baking.megakernel.as_ref() {
+                m.buffers().into_iter().for_each(&mut pin);
             }
             bucket_bakings.push(baking);
         }
@@ -612,41 +586,34 @@ impl<W: CanonicalParams> MetalWorker<W> {
             attn_unfused_scratch,
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
+            plays_megakernel: std::sync::atomic::AtomicBool::new(false),
+            megakernel_runs: std::sync::atomic::AtomicU32::new(0),
             _marker: std::marker::PhantomData,
         })
     }
 
-    /// Count total dispatches across all MTL4 steps in this bucket.
-    pub fn count_dispatches(&self, bucket: usize) -> usize {
-        self.bucket_bakings
-            .get(bucket)
-            .and_then(|b| b.mtl4_steps.as_ref())
-            .map(|steps| steps.iter().map(|s| s.dispatches.len()).sum())
-            .unwrap_or(0)
+    /// How the next forward plays its tape — stashed from the forward's inputs.
+    pub fn set_tape_play(&self, play: TapePlay) {
+        let mk = play == TapePlay::Megakernel;
+        self.plays_megakernel
+            .store(mk, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// True if this bucket's tape contains an `AvgPool2d` dispatch — the
-    /// gemma3-mm SigLIP projector's spatial pool. That op (and the
-    /// `soft_emb_norm -> mm_input_projection` tail after it) hits an
-    /// in-command-buffer write→read coherence failure at the 4096-patch
-    /// scale: the projector gemm reads the soft-emb-norm output as
-    /// all-zero (silent all-zero vision embeds → garbled text) UNLESS a
-    /// command-buffer boundary (commit + host-wait) separates the
-    /// writer from the reader. In-CB `Dispatch→Dispatch` barriers — even
-    /// `visibility=Device`, even forced on every dispatch — do NOT fix
-    /// it; only the CB boundary does. The pool serializes such buckets
-    /// via [`run_dump_segment`]-style chunked commits. Cheap to scan
-    /// (handful of steps) and the result gates a once-per-image path.
-    pub fn bucket_has_avg_pool_2d(&self, bucket: usize) -> bool {
-        self.bucket_bakings
-            .get(bucket)
-            .and_then(|b| b.mtl4_steps.as_ref())
-            .map(|steps| {
-                steps
-                    .iter()
-                    .any(|s| matches!(s.kernel, super::lowered::KernelId::AvgPool2d))
-            })
-            .unwrap_or(false)
+    /// Megakernel runs the last encoded forward played.
+    pub fn megakernel_runs_played(&self) -> u32 {
+        self.megakernel_runs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// After a forward's command buffer completed: the first bounded wait any megakernel run
+    /// gave up on, as a typed error (every stall word is cleared).
+    pub fn take_megakernel_stall(&self) -> Result<(), MegakernelError> {
+        let stalls = self
+            .bucket_bakings
+            .iter()
+            .filter_map(|b| b.megakernel.as_ref());
+        let words: Vec<_> = stalls.map(|m| m.take_stall()).collect();
+        words.into_iter().collect()
     }
 
     /// Phase A.3 MTL4 execution path. Encodes the
@@ -664,43 +631,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
         has_spec_tokens: bool,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, has_spec_tokens, enc, None)
-    }
-
-    /// Activation-dump replay segment: encode only the flat dispatch
-    /// indices in `range` (counting every dispatch slot in step order,
-    /// including runtime-gate-skipped ones, so indices stay aligned
-    /// with the lowered command order / the [`DumpCmd`] sidecar).
-    /// Used by the pool's `run_dump_pass` to re-run the tape in
-    /// segments with a host wait + arena readback between them.
-    pub fn run_bucket_mtl4_range(
-        &self,
-        bucket: usize,
-        num_tokens: u32,
-        num_seqs: u32,
-        has_spec_tokens: bool,
-        enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-        range: std::ops::Range<usize>,
-    ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(
-            bucket,
-            num_tokens,
-            num_seqs,
-            has_spec_tokens,
-            enc,
-            Some(range),
-        )
-    }
-
-    fn run_bucket_mtl4_inner(
-        &self,
-        bucket: usize,
-        num_tokens: u32,
-        num_seqs: u32,
-        has_spec_tokens: bool,
-        enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-        range: Option<std::ops::Range<usize>>,
-    ) -> Result<(), WorkerError> {
         use ::objc2_metal::{
             MTL4CommandEncoder, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
         };
@@ -715,27 +645,23 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // MTL4 compute encoders do NOT auto-serialize successive
         // dispatches the way MTL3's default-Serial encoder does;
         // the per-sub-dispatch `barrier_before` flag was computed
-        // at macro time by `scratchy-forward-compiler-macro::interpreter_codegen
-        // ::lower_bucket` from the FUF dataflow + `Implementation::
-        // kv_layer_io`. Runtime does zero analysis — just emits a
+        // at macro time from the tape's dataflow (the metal compiler's
+        // hazard walk). Runtime does zero analysis — just emits a
         // `Dispatch→Dispatch` barrier wherever the flag fires.
         // Flat dispatch index across all steps. Counts EVERY dispatch
-        // slot (including range-filtered and gate-skipped ones) so it
-        // stays aligned with the lowered command order — the contract
-        // the `DumpCmd` sidecar / `run_bucket_mtl4_range` rely on.
+        // slot (including gate-skipped ones) so it stays aligned with
+        // the expanded command order the megakernel's span names.
         let mut flat_idx: usize = 0;
         // Opt-in kernel tape (forward-local; published once at encode end).
-        // Only the full forward is captured — dump-replay ranges are skipped so
-        // the tape always reflects a complete dispatch sequence.
         #[cfg(feature = "forward-telemetry")]
-        let tape_enabled = range.is_none() && ForwardTelemetry::global().is_enabled();
+        let tape_enabled = ForwardTelemetry::global().is_enabled();
         #[cfg(feature = "forward-telemetry")]
         let mut tape: Vec<TapeEntry> = if tape_enabled {
             Vec::with_capacity(mtl4_steps.iter().map(|s| s.dispatches.len()).sum())
         } else {
             Vec::new()
         };
-        let facts = StepFacts {
+        let ctx = GateCtx {
             num_tokens,
             num_seqs,
             has_spec_tokens,
@@ -743,6 +669,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
         };
+        // THE MEGAKERNEL plays only in the context it was planned under (bucket-1 decode of one
+        // sequence, this worker's KV mode — its gates are constants there). Its ONE launch
+        // replaces the forward's span of flat dispatch indices; a dispatch after it re-sets its
+        // pipeline and fences.
+        let plays = self
+            .plays_megakernel
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let megakernel = baking
+            .megakernel
+            .as_ref()
+            .filter(|_| plays && ctx == GateCtx::decode_one(ctx.unrotated_blocks));
+        let (mut runs_played, mut refence, mut repipeline) = (0u32, false, false);
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -755,26 +693,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
             {
                 let this_idx = flat_idx;
                 flat_idx += 1;
-                // The compiler's own hazard-analysis verdict for the tape,
-                // captured before runtime overrides (force/range) mutate it.
-                #[cfg(feature = "forward-telemetry")]
-                let compiler_barrier = *need_barrier;
-                // In range mode: skip dispatches outside the segment,
-                // and suppress the barrier on the segment's FIRST
-                // dispatch — its predecessor ran in a previous command
-                // buffer (commit + host wait = stronger ordering), and
-                // a leading barrier on an empty encoder is something
-                // the production path never emits.
-                let mut need_barrier = *need_barrier;
-                if let Some(r) = &range {
-                    if !r.contains(&this_idx) {
+                if let Some(mk) = megakernel {
+                    let span = mk.commands();
+                    if span.contains(&this_idx) {
+                        if this_idx == span.start {
+                            mk.encode(enc);
+                            (runs_played, refence, repipeline) = (runs_played + 1, true, true);
+                        }
                         continue;
                     }
-                    if this_idx == r.start {
-                        need_barrier = false;
-                    }
                 }
-                if !gate_matches(*gate, facts) {
+                // The compiler's own hazard-analysis verdict for the tape,
+                // captured before the megakernel's re-fence overrides it.
+                #[cfg(feature = "forward-telemetry")]
+                let compiler_barrier = *need_barrier;
+                let mut need_barrier = *need_barrier;
+                if !gate.is_none_or(|g| g.admits(ctx)) {
                     // Skipped: e.g. the lm_head slice's gather/qmv/scatter
                     // (`OnlyIfNoSpec`) on a spec-decode verify step, or
                     // its M=bucket_m fallback (`OnlyIfSpec`) on any other.
@@ -782,6 +716,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // dispatch are skipped together so the kernel
                     // doesn't run with stale per-dispatch state.
                     continue;
+                }
+                if std::mem::take(&mut repipeline) {
+                    enc.setComputePipelineState(&step.pipeline);
+                }
+                if std::mem::take(&mut refence) {
+                    need_barrier = true;
                 }
                 if need_barrier {
                     // Default to `None` visibility — measured -30 ms
@@ -890,6 +830,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 }
             }
         }
+        self.megakernel_runs
+            .store(runs_played, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "forward-telemetry")]
         if tape_enabled {
             ForwardTelemetry::global().publish(ForwardRecord {
@@ -905,17 +847,14 @@ impl<W: CanonicalParams> MetalWorker<W> {
 /// Whether the compiler folded several ops into this single dispatch — the
 /// `Fused*` kernels plus the multi-op rope/norm variants.
 #[cfg(feature = "forward-telemetry")]
-fn is_fused(id: KernelId) -> bool {
-    use KernelId as K;
+fn is_fused(id: super::lowered::KernelId) -> bool {
+    use super::lowered::KernelId as K;
     matches!(
         id,
         K::FusedAddRmsNorm
             | K::FusedGateUpSiluMul
-            | K::FusedQkvRopeCache
-            | K::FusedAffineQkvRopeCache
             | K::RopeAppendNormed
             | K::NormAddScalarMul
-            | K::SynthGateUpSiluMul
             | K::AttentionViaCacheTq
     )
 }
@@ -924,15 +863,13 @@ fn is_fused(id: KernelId) -> bool {
 /// the live dispatch tape by. Exhaustive on purpose: a new `KernelId` variant
 /// forces a classification decision here rather than silently defaulting.
 #[cfg(feature = "forward-telemetry")]
-fn kernel_kind(id: KernelId) -> KernelKind {
-    use KernelId as K;
+fn kernel_kind(id: super::lowered::KernelId) -> KernelKind {
+    use super::lowered::KernelId as K;
     match id {
         K::Embed | K::AffineEmbed | K::EmbeddingGather | K::MmEmbedSplice => KernelKind::Embed,
         K::RmsNorm | K::RmsNormUnit | K::FusedAddRmsNorm | K::NormAddScalarMul => KernelKind::Norm,
         K::RopeAppendNormed
         | K::RopeAppend
-        | K::FusedQkvRopeCache
-        | K::FusedAffineQkvRopeCache
         | K::RopeOnceNax
         | K::RopeOnceSteel
         | K::RopeOnceGqaShared => KernelKind::Rope,
@@ -945,8 +882,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AttnOConvert
         | K::AttnCausalSoftmax
         | K::AttnGemmQk
-        | K::AttnGemmPv
-        | K::SynthPreAttn => KernelKind::Attention,
+        | K::AttnGemmPv => KernelKind::Attention,
         K::GatedDeltaNet => KernelKind::GatedDeltaNet,
         K::Gemm
         | K::AffineQmvQuad
@@ -962,9 +898,6 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineQmmW4a8
         | K::AffineGatherW4a8Quant
         | K::AffineGatherQmmW4a8
-        | K::Nvfp4Qmv
-        | K::Nvfp4QmmT
-        | K::Nvfp4QmmTNax
         | K::AffineGatherQmvFast
         | K::AffineGatherQmv
         | K::SplitKReduceSum => KernelKind::Gemm,
@@ -980,18 +913,13 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::GateSplit
         | K::ArgPartitionTopK
         | K::TakeAlongAxis => KernelKind::Moe,
-        K::FusedGateUpSiluMul
-        | K::SiluMul
-        | K::GeluMul
-        | K::SynthGateUpSiluMul
-        | K::SynthMlpPreDown => KernelKind::Mlp,
+        K::FusedGateUpSiluMul | K::SiluMul | K::GeluMul => KernelKind::Mlp,
         K::GatherLastToken | K::ScatterFirstToLastRow | K::Softmax | K::SliceTrailingColsU32 => {
             KernelKind::Sample
         }
         K::VisionLayerNorm
         | K::VisionRope
         | K::VisionVarlenAttn
-        | K::AvgPool2d
         | K::VisionGelu
         | K::VisionLoadPixels => KernelKind::Vision,
         K::ScalarWeightMul
@@ -1011,6 +939,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
 fn bake_bucket<W: CanonicalParams>(
     bucket_index: usize,
     tape: &LoweredMetalTape,
+    megakernel: Option<&MegakernelTape>,
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
     moe_scratch: Option<&Buffer>,
@@ -1082,108 +1011,11 @@ fn bake_bucket<W: CanonicalParams>(
     let mut inline_cursor: u32 = 0;
 
     let mut steps: Vec<BucketStep> = Vec::new();
+    // Every command's resolved bindings, when the megakernel's step records need their addresses.
+    let mut bound_by_command: Vec<Vec<super::megakernel::BoundBinding>> = Vec::new();
 
     for (cmd_idx, gated) in expanded_commands.iter().enumerate() {
         let cmd = &gated.command;
-        if matches!(cmd.kernel, KernelId::Gemm) {
-            let dims = cmd.gemm_dims.ok_or(WorkerError::MissingGemmDims {
-                bucket_index,
-                command_index: cmd_idx,
-            })?;
-            let (a, b, c) = resolve_gemm_buffers(
-                bucket_index,
-                cmd_idx,
-                cmd,
-                arena,
-                moe_scratch,
-                moe_inline_buf.as_ref(),
-                &mut inline_cursor,
-                sources,
-                runtime,
-            )?;
-            // f16 → `gemm_f16_specialized` (simdgroup_half8x8), bf16 →
-            // `gemm_bf16_specialized` (simdgroup_bfloat8x8). Both are
-            // custom MMA kernels routed through the same per-step
-            // dispatch plumbing as every other compute kernel — no MPS,
-            // no classic command buffer. (MPS rejects BFloat16, and we
-            // drive f16 the same way so the backend has one MTL4 GEMM
-            // path.)
-            match W::METAL_DTYPE {
-                MetalDtype::F16 | MetalDtype::Bf16 => {
-                    let pipeline = match W::METAL_DTYPE {
-                        MetalDtype::F16 => pipelines.pipeline_for_gemm_f16(dims.m, dims.n, dims.k),
-                        _ => pipelines.pipeline_for_gemm_bf16(dims.m, dims.n, dims.k),
-                    }
-                    .map_err(WorkerError::PipelineLookup)?;
-                    // gemm_{f16,bf16}_specialized binding contract:
-                    //   buffer(0) = output, buffer(1) = input, buffer(2) = weight
-                    let bindings_for_cmd: Vec<(Buffer, u64, u64)> = vec![
-                        (c.buffer.clone(), c.offset, 0u64),
-                        (a.buffer.clone(), a.offset, 1u64),
-                        (b.buffer.clone(), b.offset, 2u64),
-                    ];
-                    // Dispatch: (ceil(N/8), ceil(M/8), 1) threadgroups,
-                    // 32 threads (one simdgroup) per threadgroup.
-                    let dispatch_for_cmd = (
-                        MTLSize {
-                            width: (dims.n as u64).div_ceil(8) as usize,
-                            height: (dims.m as u64).div_ceil(8) as usize,
-                            depth: 1_usize,
-                        },
-                        MTLSize {
-                            width: 32_usize,
-                            height: 1_usize,
-                            depth: 1_usize,
-                        },
-                    );
-                    let cmd_barrier = expanded_barriers.get(cmd_idx).copied().unwrap_or(true);
-                    // Dense GEMM: M is the height axis but the bake here
-                    // is for a dense linear that always dispatches at the
-                    // actual M (no bucket_m baking), so leave m_scaling
-                    // as None.
-                    match steps.last_mut() {
-                        Some(BucketStep::Dispatch {
-                            pipeline: prev,
-                            direct_bindings,
-                            direct_dispatch,
-                            direct_m_scaling,
-                            barrier_before,
-                            runtime_gate,
-                            ..
-                        }) if same_pipeline(prev, &pipeline) => {
-                            direct_bindings.push(bindings_for_cmd);
-                            direct_dispatch.push(dispatch_for_cmd);
-                            direct_m_scaling.push(None);
-                            barrier_before.push(cmd_barrier);
-                            // Gemm path is never gated (no slice); push None
-                            // to keep the Vec aligned with `direct_dispatch`.
-                            runtime_gate.push(None);
-                        }
-                        _ => {
-                            steps.push(BucketStep::Dispatch {
-                                kernel: KernelId::Gemm,
-                                pipeline,
-                                direct_bindings: vec![bindings_for_cmd],
-                                direct_dispatch: vec![dispatch_for_cmd],
-                                direct_m_scaling: vec![None],
-                                barrier_before: vec![cmd_barrier],
-                                runtime_gate: vec![None],
-                            });
-                        }
-                    }
-                }
-                MetalDtype::Int4 => {
-                    return Err(WorkerError::PipelineLookup(
-                        super::pipelines::PipelineLookupError::DtypeNotYetWired(
-                            KernelId::Gemm,
-                            MetalDtype::Int4,
-                        ),
-                    ));
-                }
-            }
-            continue;
-        }
-
         // The lowering pass baked `library` / `function` / `constants`
         // into the command directly — every per-layer scalar (eps,
         // attn_scale, paging strides) and the `W::METAL_DTYPE`-driven
@@ -1211,15 +1043,16 @@ fn bake_bucket<W: CanonicalParams>(
             bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
         let (tg, tpt) = mtl_size_pair(cmd);
 
-        // Coalesce with the previous step iff (a) it's an dispatch step
-        // (a Gemm step forces an encoder boundary) and (b) its
-        // pipeline shares the underlying ObjC pointer (specialized
-        // pipelines are refcounted — same key returns same handle
-        // from the cache).
+        // Coalesce with the previous step iff its pipeline shares the
+        // underlying ObjC pointer (specialized pipelines are refcounted —
+        // same key returns same handle from the cache).
         let bindings_for_cmd: Vec<(Buffer, u64, u64)> = bound_refs
             .iter()
             .map(|(b, off, idx)| ((*b).clone(), *off, *idx))
             .collect();
+        if megakernel.is_some() {
+            bound_by_command.push(bindings_for_cmd.clone());
+        }
         let dispatch_for_cmd = (
             MTLSize {
                 width: (tg.width),
@@ -1275,80 +1108,46 @@ fn bake_bucket<W: CanonicalParams>(
     }
 
     let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &device);
+    let megakernel = match megakernel {
+        Some(mk) => {
+            use super::megakernel::MegakernelBaking;
+            let baked_of: Vec<usize> = tape.expanded_origins().iter().map(|o| o.baked).collect();
+            let (baking, load) = MegakernelBaking::bake(
+                mk,
+                &expanded_commands,
+                &baked_of,
+                &bound_by_command,
+                pipelines,
+                &device,
+            )?;
+            if std::env::var_os("SCRATCHY_METAL_TRACE").is_some() {
+                eprintln!(
+                    "[megakernel] bucket_m={} ONE launch plays {} of {} commands; \
+                     grid barriers per forward={}; library {} ({} bytes MSL) compiled in {:?}; \
+                     pipeline built in {:?}; maxTotalThreadsPerThreadgroup={}; persistent \
+                     threadgroups P={}",
+                    tape.bucket_m,
+                    load.steps,
+                    expanded_commands.len(),
+                    load.grid_barriers,
+                    mk.library,
+                    load.source_bytes,
+                    load.compiled,
+                    load.pipeline_built,
+                    load.max_threads,
+                    load.threadgroups,
+                );
+            }
+            Some(baking)
+        }
+        None => None,
+    };
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         mtl4_steps,
         moe_inline_buf,
+        megakernel,
     })
-}
-
-/// Resolve `(out, in, weight)` buffers for a `KernelId::Gemm` command.
-///
-/// The lowering pass guarantees the binding order: index 0 → output
-/// arena slot, index 1 → input arena slot, index 2 → LinearLayer
-/// weight thunk. Anything else is a contract violation surfaced as
-/// [`WorkerError::GemmBindingsMalformed`].
-#[allow(clippy::too_many_arguments)]
-fn resolve_gemm_buffers(
-    bucket_index: usize,
-    command_index: usize,
-    cmd: &LoweredCommand,
-    arena: &[Buffer],
-    moe_scratch: Option<&Buffer>,
-    moe_inline_buf: Option<&Buffer>,
-    inline_cursor: &mut u32,
-    sources: &ResolvedSources,
-    runtime: &RuntimeBindings,
-) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
-    // KernelId::Gemm never references the SplitK scratch buffer
-    // (dense GEMM has its own per-step dispatch path), so pass None.
-    // MoE plumbing IS passed through: the §3b lowering emits the MoE
-    // router-projection step as `Instruction::Gemm` with a
-    // `Binding::MoeScratch` output, so the resolve has to be able to
-    // unwrap MoE scratch refs the same as the dispatch path.
-    let bound = resolve_bindings(
-        bucket_index,
-        command_index,
-        cmd,
-        arena,
-        /*splitk_scratch=*/ None,
-        moe_scratch,
-        /*roped_k_scratch=*/ None,
-        /*attn_unfused_scratch=*/ None,
-        moe_inline_buf,
-        inline_cursor,
-        sources,
-        runtime,
-    )?;
-    if bound.len() != 3 {
-        return Err(WorkerError::GemmBindingsMalformed {
-            bucket_index,
-            command_index,
-            reason: "expected exactly 3 bindings (out, in, weight)",
-        });
-    }
-    // Bindings are produced in the order the lowering pass listed
-    // them; their `binding_index` field carries the encoder slot but
-    // we only care about positional ordering. The lowering pass uses
-    // 0 = out, 1 = in, 2 = weight.
-    let mut iter = bound.into_iter();
-    let out = iter.next().expect("bound[0]");
-    let inp = iter.next().expect("bound[1]");
-    let wt = iter.next().expect("bound[2]");
-    Ok((
-        BoundBuffer {
-            buffer: inp.0,
-            offset: inp.1,
-        },
-        BoundBuffer {
-            buffer: wt.0,
-            offset: wt.1,
-        },
-        BoundBuffer {
-            buffer: out.0,
-            offset: out.1,
-        },
-    ))
 }
 
 /// Every model tensor a pool's tapes bind, resolved ONCE at load: `(source, tensor, layer)` →
@@ -1387,8 +1186,9 @@ impl ResolvedSources {
                 // reads them — every reader, so two that disagree refuse the load.
                 if bundle.is_affine_codes(which) {
                     let tensor = bundle.tensor(which).ok_or(miss(SourceMiss::NoTensor))?;
-                    let codes =
-                        crate::tape::kernel_constants::AffineCodes::of_constants(c.command.constants);
+                    let codes = crate::tape::kernel_constants::AffineCodes::of_constants(
+                        c.command.constants,
+                    );
                     let at = allocator
                         .bind_affine_codes(tensor.raw_ptr(), tensor.size_bytes(), codes)
                         .map_err(WorkerError::AffineCodes)?;
@@ -1542,74 +1342,8 @@ fn resolve_bindings(
 /// `num_tokens.div_ceil(tile)`, clamped so we never grow above the
 /// baked value (guards against `num_tokens > bucket_m`, which the
 /// bucket picker already rules out but defense-in-depth).
-/// Evaluate a per-dispatch [`RuntimeGate`] against the live
-/// `num_seqs` of this forward (= `cu_seqlens_q.len() - 1`).
-/// Returns `true` when the dispatch should fire, `false` when it
-/// should be skipped. `gate == None` (the common case) always
-/// fires.
-///
-/// `OnlyIfSingleSeq` fires when there's exactly one sequence in
-/// the bucket — either pure single-seq prefill or a one-token
-/// decode forward. The lm_head slice's gather/qmv/scatter trio is
-/// gated this way.
-///
-/// `OnlyIfMultiSeq` fires when the bucket holds multiple
-/// sequences (batched decode, mixed prefill+decode). The
-/// full-`M=bucket_m` lm_head fallback is gated this way so the
-/// slice's per-seq-incorrect logits get overwritten with a
-/// correct multi-row GEMM result.
-pub(super) fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
-    let StepFacts {
-        num_tokens,
-        num_seqs,
-        has_spec_tokens,
-        unrotated_blocks,
-    } = step;
-    // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
-    // tokens to drop (prefill / chunked-prefill / mixed batches);
-    // steady-state decode has `num_tokens == num_seqs` and slicing
-    // would just add 2 kernel launches with no GEMM-work savings
-    // (qmv at M=num_seqs == qmm at M=num_seqs). Verified: gating
-    // unconditionally on multi-seq regressed c=4 TPOT by +5% on
-    // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
-    // win without hurting decode.
-    let decode_step = num_tokens == num_seqs;
-    match gate {
-        None => true,
-        Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
-            !has_spec_tokens && num_tokens > num_seqs
-        }
-        Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens,
-        Some(super::lowered::RuntimeGate::OnlyIfDecodeStep) => decode_step,
-        Some(super::lowered::RuntimeGate::UnlessDecodeStep) => !decode_step,
-        Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
-            crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
-        }
-        Some(super::lowered::RuntimeGate::UnlessSmallMTokens) => {
-            !crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
-        }
-        Some(super::lowered::RuntimeGate::OnlyIfOneSequence) => num_seqs == 1,
-        Some(super::lowered::RuntimeGate::UnlessOneSequence) => num_seqs > 1,
-        Some(super::lowered::RuntimeGate::OnlyIfUnrotatedBlocks) => unrotated_blocks,
-        Some(super::lowered::RuntimeGate::UnlessUnrotatedBlocks) => !unrotated_blocks,
-        Some(super::lowered::RuntimeGate::All(gates)) => {
-            gates.iter().all(|g| gate_matches(Some(*g), step))
-        }
-    }
-}
-
-/// What a runtime gate can ask about the step being encoded.
-#[derive(Clone, Copy)]
-pub(super) struct StepFacts {
-    pub num_tokens: u32,
-    pub num_seqs: u32,
-    pub has_spec_tokens: bool,
-    /// Some sequence's block table has an unrotated (bit-31, span) block.
-    pub unrotated_blocks: bool,
-}
-
 fn scale_tg_for_num_tokens(
-    mut tg: MTLSize,
+    tg: MTLSize,
     scaling: Option<super::lowered::MScaling>,
     num_tokens: super::ids::NumTokens,
     num_seqs: u32,
@@ -1617,33 +1351,13 @@ fn scale_tg_for_num_tokens(
     let Some(s) = scaling else {
         return tg;
     };
-    let bm = s.bucket_m.get().max(1) as u64;
-    let n = (num_tokens.get().max(1) as u64).min(bm);
-    let slot = match s.axis {
-        super::lowered::MScaleAxis::X => &mut tg.width,
-        super::lowered::MScaleAxis::Y => &mut tg.height,
-        super::lowered::MScaleAxis::Z => &mut tg.depth,
-    };
-    // new = ceil(baseline * n / bucket_m). Clamped above to the
-    // baseline so accidental num_tokens > bucket_m can't grow the
-    // grid past what was baked.
-    let baseline = *slot as u64;
-    let scaled = baseline.saturating_mul(n).div_ceil(bm);
-    *slot = scaled as usize;
-    // `seq_axis`: SET (not scale) the chosen axis to the live num_seqs.
-    // The steel paged prefill kernel needs one grid-Z layer per sequence
-    // (`tid.z = seq_idx`) so a BQ-block tile never straddles a sequence
-    // boundary; over-dispatched (seq, q-block) pairs early-out in the
-    // kernel. See `MScaling::seq_axis`.
-    if let Some(seq_ax) = s.seq_axis {
-        let seq_slot = match seq_ax {
-            super::lowered::MScaleAxis::X => &mut tg.width,
-            super::lowered::MScaleAxis::Y => &mut tg.height,
-            super::lowered::MScaleAxis::Z => &mut tg.depth,
-        };
-        *seq_slot = num_seqs.max(1) as usize;
+    let grid = [tg.width, tg.height, tg.depth].map(|v| v as u64);
+    let [width, height, depth] = s.scale(grid, num_tokens, num_seqs).map(|v| v as usize);
+    MTLSize {
+        width,
+        height,
+        depth,
     }
-    tg
 }
 
 fn mtl_size_pair(cmd: &LoweredCommand) -> (MTLSize, MTLSize) {
@@ -1674,7 +1388,8 @@ fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
 mod tests {
     use super::*;
     use crate::interpreter::metal::lowered::{
-        Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, SourceRef, WeightTensor,
+        Binding, DispatchShape, KernelId, LoweredCommand, MetalDtype, RuntimeBindingKind,
+        SourceRef, WeightTensor,
     };
     use crate::specialized_pipeline_cache::{ConstantValue, SpecializedPipelineCache};
     use scratchy_ir::CanonicalParams;
@@ -1693,7 +1408,7 @@ mod tests {
             All, OnlyIfDecodeStep, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep,
             UnlessOneSequence, UnlessUnrotatedBlocks,
         };
-        let step = |num_tokens, num_seqs, unrotated_blocks| StepFacts {
+        let step = |num_tokens, num_seqs, unrotated_blocks| GateCtx {
             num_tokens,
             num_seqs,
             has_spec_tokens: false,
@@ -1706,27 +1421,24 @@ mod tests {
             (18, 16, false),
         ] {
             let s = step(tokens, seqs, false);
-            assert_eq!(gate_matches(Some(OnlyIfDecodeStep), s), decode);
-            assert_eq!(gate_matches(Some(UnlessDecodeStep), s), !decode);
+            assert_eq!(OnlyIfDecodeStep.admits(s), decode);
+            assert_eq!(UnlessDecodeStep.admits(s), !decode);
         }
         for (tokens, seqs, one) in [(512, 1, true), (512, 2, false), (16, 16, false)] {
             let s = step(tokens, seqs, false);
-            assert_eq!(gate_matches(Some(OnlyIfOneSequence), s), one);
-            assert_eq!(gate_matches(Some(UnlessOneSequence), s), !one);
+            assert_eq!(OnlyIfOneSequence.admits(s), one);
+            assert_eq!(UnlessOneSequence.admits(s), !one);
         }
         for unrotated in [false, true] {
             let s = step(512, 2, unrotated);
-            assert_eq!(gate_matches(Some(OnlyIfUnrotatedBlocks), s), unrotated);
-            assert_eq!(gate_matches(Some(UnlessUnrotatedBlocks), s), !unrotated);
+            assert_eq!(OnlyIfUnrotatedBlocks.admits(s), unrotated);
+            assert_eq!(UnlessUnrotatedBlocks.admits(s), !unrotated);
         }
         let plain = All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
-        assert!(gate_matches(Some(plain), step(512, 2, false)));
-        assert!(!gate_matches(Some(plain), step(512, 2, true)));
-        assert!(!gate_matches(Some(plain), step(512, 1, false)));
-        assert!(
-            !gate_matches(Some(plain), step(2, 2, false)),
-            "a decode step"
-        );
+        assert!(plain.admits(step(512, 2, false)));
+        assert!(!plain.admits(step(512, 2, true)));
+        assert!(!plain.admits(step(512, 1, false)));
+        assert!(!plain.admits(step(2, 2, false)), "a decode step");
     }
 
     /// The lm_head sample slice, as the tape builds and dispatches it: the
@@ -2001,7 +1713,6 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
         };
         let fused_add_rmsnorm = LoweredCommand {
             kernel: KernelId::FusedAddRmsNorm,
@@ -2033,7 +1744,6 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
         };
         // Two RmsNorm commands then two FusedAddRmsNorm commands —
         // exercises both kernels and the coalescer's same-pipeline
@@ -2243,7 +1953,6 @@ mod tests {
                     binding_index: 5,
                 },
             ]),
-            gemm_dims: None,
         };
         let tape = LoweredMetalTape {
             bucket_m: 1,
@@ -2283,19 +1992,10 @@ mod tests {
     /// Bindings match the lowering pass: arena slots `(0, 1)` for
     /// (out, in) and a `LinearLayer` weight binding.
     fn build_gemm_command(bucket_m: u32, n: u32, k: u32) -> LoweredCommand {
-        LoweredCommand {
-            kernel: KernelId::Gemm,
-            // GEMM is opaque to the unified pipeline picker — see the
-            // matching note in `lowering.rs` for the production GEMM arm.
-            library: "",
-            function: "",
-            constants: &[],
-            dispatch: DispatchShape {
-                threadgroups: (bucket_m.div_ceil(16), n.div_ceil(16), 1),
-                threads_per_threadgroup: (16, 16, 1),
-                m_scaling: None,
-            },
-            bindings: crate::interpreter::metal::lowered::baked(vec![
+        crate::tape::lowering::gemm_command(
+            <TestWeights as CanonicalParams>::METAL_DTYPE,
+            crate::interpreter::metal::lowered::GemmDims { m: bucket_m, n, k },
+            vec![
                 Binding::ArenaSlot {
                     slot: 0,
                     binding_index: 0,
@@ -2310,9 +2010,8 @@ mod tests {
                     layer: LayerId(0),
                     binding_index: 2,
                 },
-            ]),
-            gemm_dims: Some(crate::interpreter::metal::lowered::GemmDims { m: bucket_m, n, k }),
-        }
+            ],
+        )
     }
 
     /// A tape carrying one `KernelId::Gemm` command bakes to an MTL4
@@ -2370,10 +2069,9 @@ mod tests {
         );
     }
 
-    /// Phase 5.C.5: an dispatch→Gemm→dispatch tape. The Gemm forces an encoder
-    /// boundary, so the post-Gemm RmsNorm cannot coalesce with the
-    /// pre-Gemm RmsNorm even though both share the same specialized
-    /// pipeline.
+    /// Phase 5.C.5: an dispatch→Gemm→dispatch tape. The Gemm's pipeline differs, so the
+    /// post-Gemm RmsNorm cannot coalesce with the pre-Gemm RmsNorm even though both share the
+    /// same specialized pipeline.
     //
     // The three-segment structure (and the non-coalescing) is an internal
     // `bake_bucket` detail, not public on `BucketBaking`; the observable
@@ -2425,7 +2123,6 @@ mod tests {
                     binding_index: 2,
                 },
             ]),
-            gemm_dims: None,
         };
         let rmsnorm_post = LoweredCommand {
             kernel: KernelId::RmsNorm,
@@ -2459,7 +2156,6 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .into_baked(),
-            gemm_dims: None,
         };
 
         let tape = LoweredMetalTape {

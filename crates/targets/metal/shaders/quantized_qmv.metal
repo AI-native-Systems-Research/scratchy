@@ -28,6 +28,7 @@
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
@@ -48,14 +49,27 @@ MLX_MTL_CONST int QUAD_SIZE = 4;
 // the constant bag.
 // ─────────────────────────────────────────────────────────────────
 
-constant int IN_VEC_SIZE  [[function_constant(0)]];
-constant int OUT_VEC_SIZE [[function_constant(1)]];
 // 5: the 4-bit codes are stored XOR 0x88 (signed q - 8; `AffineCodes::Offset8`,
 // set on matrix-unit tapes, where the W4A8 prefill GEMM reads them as int4).
 // XOR-ing each loaded word restores the unsigned codes. Unset: as written.
-constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
+#define QMV_CONSTS(X)                                                                         \
+  X(int, k, IN_VEC_SIZE, 0) X(int, n, OUT_VEC_SIZE, 1) X(bool, offset8, AFFINE_CODES_OFFSET8, 5)
+#ifndef MK_BODIES_ONLY
+QMV_CONSTS(MK_FC_DECLARE)
 constant uint16_t AFFINE_CODES_XOR =
     is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x8888 : 0;
+// The dispatch kernels' constants, as the gather body reads them.
+struct QmvFc {
+  QMV_CONSTS(MK_FC_ACCESSOR)
+  static METAL_FUNC bool has_offset8() { return is_function_constant_defined(AFFINE_CODES_OFFSET8); }
+};
+#endif
+// The XOR that restores a constant policy's 4-bit codes: 0x8888 per 16-bit word when they are
+// stored offset-8, else 0. A generated megakernel policy spells an unset constant as unset.
+template <typename C>
+METAL_FUNC uint16_t qmv_codes_xor() {
+  return C::has_offset8() && C::offset8() ? 0x8888 : 0;
+}
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26
@@ -102,8 +116,8 @@ inline float nvfp4_decode(uint code) {
 // load_vector / load_vector_safe — quantized.h:28-189
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T, typename U, int values_per_thread, int bits>
-inline U load_vector(const device T* x, thread U* x_thread) {
+template <typename T, typename U, int values_per_thread, int bits, typename XP = const device T*>
+inline U load_vector(XP x, thread U* x_thread) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -181,8 +195,8 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   return sum;
 }
 
-template <typename T, typename U, int values_per_thread, int bits>
-inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
+template <typename T, typename U, int values_per_thread, int bits, typename XP = const device T*>
+inline U load_vector_safe(XP x, thread U* x_thread, int N) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -275,7 +289,8 @@ inline U qdot(
     const thread U* x_thread,
     U scale,
     U bias,
-    U sum) {
+    U sum,
+    uint16_t codes_xor) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -316,7 +331,7 @@ inline U qdot(
   else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
-      const uint16_t wi = ws[i] ^ AFFINE_CODES_XOR;
+      const uint16_t wi = ws[i] ^ codes_xor;
       accum +=
           (x_thread[4 * i] * (wi & 0x000f) +
            x_thread[4 * i + 1] * (wi & 0x00f0) +
@@ -378,7 +393,8 @@ inline U qdot_safe(
     U scale,
     U bias,
     U sum,
-    int N) {
+    int N,
+    uint16_t codes_xor) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -419,7 +435,7 @@ inline U qdot_safe(
   else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (N / 4); i++) {
-      const uint16_t wi = ws[i] ^ AFFINE_CODES_XOR;
+      const uint16_t wi = ws[i] ^ codes_xor;
       accum +=
           (x_thread[4 * i] * (wi & 0x000f) +
            x_thread[4 * i + 1] * (wi & 0x00f0) +
@@ -558,18 +574,20 @@ METAL_FUNC void adjust_matrix_offsets(
 // qmv_quad_impl — quantized.h:692-747
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, int D>
+template <typename T_act, typename T_scale, int group_size, int bits, int D,
+          typename XP = const device T_act*, typename YP = device T_act*>
 METAL_FUNC void qmv_quad_impl(
     const device uint32_t* w,
     const device T_scale* scales,
     const device T_scale* biases,
-    const device T_act* x,
-    device T_act* y,
+    XP x,
+    YP y,
     // K / N now baked as function constants on the kernel side
     // (IN_VEC_SIZE / OUT_VEC_SIZE) and forwarded by-value here so
     // the impl body matches the MLX C++ source line-for-line.
     int in_vec_size,
     int out_vec_size,
+    uint16_t codes_xor,
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
     uint quad_lid [[thread_index_in_quadgroup]]) {
@@ -607,7 +625,7 @@ METAL_FUNC void qmv_quad_impl(
     U s = sl[0];
     U b = bl[0];
     if (row * quads_per_simd + out_row < out_vec_size) {
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum, codes_xor);
     }
   }
 
@@ -623,15 +641,17 @@ METAL_FUNC void qmv_quad_impl(
 // qmv_fast_impl — quantized.h:749-814
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits>
+template <typename T_act, typename T_scale, int group_size, int bits,
+          typename XP = const device T_act*, typename YP = device T_act*>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device T_scale* scales,
     const device T_scale* biases,
-    const device T_act* x,
-    device T_act* y,
+    XP x,
+    YP y,
     int in_vec_size,
     int out_vec_size,
+    uint16_t codes_xor,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -673,7 +693,7 @@ METAL_FUNC void qmv_fast_impl(
 
       U s = sl[0];
       U b = bl[0];
-      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum, codes_xor);
     }
 
     ws += block_size * bytes_per_pack / pack_factor;
@@ -694,15 +714,17 @@ METAL_FUNC void qmv_fast_impl(
 // qmv_impl — quantized.h:816-975
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits>
+template <typename T_act, typename T_scale, int group_size, int bits,
+          typename XP = const device T_act*, typename YP = device T_act*>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
     const device T_scale* scales,
     const device T_scale* biases,
-    const device T_act* x,
-    device T_act* y,
+    XP x,
+    YP y,
     int in_vec_size,
     int out_vec_size,
+    uint16_t codes_xor,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -758,7 +780,7 @@ METAL_FUNC void qmv_impl(
         U s = sl[0];
         U b = bl[0];
         result[row] +=
-            qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+            qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum, codes_xor);
       }
 
       ws += block_size * bytes_per_pack / pack_factor;
@@ -784,7 +806,7 @@ METAL_FUNC void qmv_impl(
         U s = sl[0];
         U b = bl[0];
         result[row] += qdot_safe<U, values_per_thread, bits>(
-            wl, x_thread, s, b, sum, remaining);
+            wl, x_thread, s, b, sum, remaining, codes_xor);
       }
     }
 
@@ -819,7 +841,7 @@ METAL_FUNC void qmv_impl(
         U s = sl[0];
         U b = bl[0];
         result[row] +=
-            qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+            qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum, codes_xor);
       }
 
       ws += block_size * bytes_per_pack / pack_factor;
@@ -843,7 +865,7 @@ METAL_FUNC void qmv_impl(
         U s = sl[0];
         U b = bl[0];
         result[row] += qdot_safe<U, values_per_thread, bits>(
-            wl, x_thread, s, b, sum, remaining);
+            wl, x_thread, s, b, sum, remaining, codes_xor);
       }
     }
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -855,6 +877,35 @@ METAL_FUNC void qmv_impl(
   }
 }
 
+// Megakernel adapters: K / N from the step's constant policy, x (3) / y (4) device-coherent, one
+// simdgroup pair per virtual threadgroup exactly as the (32, 2, 1) dispatch lays them out (the quad
+// form: its quadgroups are the virtual threadgroup's aligned lane quads).
+template <typename T_act, typename T_scale, int gs, int bits, int D, typename C>
+MK_FUNC void mk_affine_qmv_quad(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  qmv_quad_impl<T_act, T_scale, gs, bits, D>(
+      (const device uint32_t*)s.addr[0], (const device T_scale*)s.addr[1],
+      (const device T_scale*)s.addr[2], (mk_cptr<T_act>)s.addr[3], (mk_ptr<T_act>)s.addr[4],
+      C::k(), C::n(), qmv_codes_xor<C>(), l.tg_pos, l.tid / QUAD_SIZE, l.tid % QUAD_SIZE);
+}
+template <typename T_act, typename T_scale, int gs, int bits, typename C>
+MK_FUNC void mk_affine_qmv_fast(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  qmv_fast_impl<T_act, T_scale, gs, bits>(
+      (const device uint32_t*)s.addr[0], (const device T_scale*)s.addr[1],
+      (const device T_scale*)s.addr[2], (mk_cptr<T_act>)s.addr[3], (mk_ptr<T_act>)s.addr[4],
+      C::k(), C::n(), qmv_codes_xor<C>(), l.tg_pos, l.simd_gid, l.simd_lid);
+}
+template <typename T_act, typename T_scale, int gs, int bits, typename C>
+MK_FUNC void mk_affine_qmv(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  qmv_impl<T_act, T_scale, gs, bits>(
+      (const device uint32_t*)s.addr[0], (const device T_scale*)s.addr[1],
+      (const device T_scale*)s.addr[2], (mk_cptr<T_act>)s.addr[3], (mk_ptr<T_act>)s.addr[4],
+      C::k(), C::n(), qmv_codes_xor<C>(), l.tg_pos, l.simd_gid, l.simd_lid);
+}
+
+#ifndef MK_BODIES_ONLY
 // ─────────────────────────────────────────────────────────────────
 // affine_qmv_quad — quantized.h:1443-1493
 // ─────────────────────────────────────────────────────────────────
@@ -908,6 +959,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
       y,
       IN_VEC_SIZE,
       OUT_VEC_SIZE,
+      AFFINE_CODES_XOR,
       tid,
       quad_gid,
       quad_lid);
@@ -964,6 +1016,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
       y,
       IN_VEC_SIZE,
       OUT_VEC_SIZE,
+      AFFINE_CODES_XOR,
       tid,
       simd_gid,
       simd_lid);
@@ -1020,6 +1073,7 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
       y,
       IN_VEC_SIZE,
       OUT_VEC_SIZE,
+      AFFINE_CODES_XOR,
       tid,
       simd_gid,
       simd_lid);
@@ -1051,6 +1105,23 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 1) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,1)
+#else
+// Megakernel mode: each instantiation line names the decode (batch_0) adapters. Item widths
+// measured on the base M5 (10 persistent threadgroups, weights streamed from DRAM): qmv_fast
+// K 3072 / 8192 streams 135 GB/s at 256 threads per item, 128 at 512, 123 at 1024 (dispatch 130);
+// qmv K 2816: 106 at 256, 130 at 512, 123 at 1024 (dispatch 127); K 4864 / 6912: 123 / 126 at 512,
+// 110 / 118 at 1024. SHORT rows (K below 2048, a few 256-value passes per row) want every thread:
+// K 896 / 1152 stream 88 / 93 GB/s at 512, 113 / 112 at 1024 (dispatch 101 / 107).
+#define INST_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs)                            \
+  MK_STREAM(affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, 256, 0x18, 0x10, \
+            (mk_affine_qmv_fast<act_type, scale_type, gs, 4, MK_C>), QMV_CONSTS)              \
+  MK_STREAM_ROWS(affine_qmv_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, 512, 1024, 0, 2048, \
+                 0x18, 0x10, (mk_affine_qmv<act_type, scale_type, gs, 4, MK_C>), QMV_CONSTS)  \
+  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_d_64_batch_0, 1024, 0x18, \
+            0x10, (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 64, MK_C>), QMV_CONSTS)  \
+  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_d_128_batch_0, 1024, 0x18, \
+            0x10, (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 128, MK_C>), QMV_CONSTS)
+#endif
 
 // Coverage: T_scale=half always (every sampled mlx-community 4bit ships
 // F16 scales — `INT4_PARITY_PROBES.md:73,287`). T_act per `torch_dtype`.
@@ -1077,14 +1148,28 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 // until now. bf16/bf16 = the Gemma4 production combo; f16/f16 kept
 // for unit tests. batch_0 only (the decode/prefill paths never use
 // the batched variants for the MLP).
+#ifndef MK_BODIES_ONLY
 #define INST_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs)                       \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
   INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 64, 0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 128,0)
+#else
+#define INST_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs)                         \
+  MK_ADAPTER(affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_batch_0, 0, 0x18,   \
+             (mk_affine_qmv_fast<act_type, scale_type, gs, 8, MK_C>), QMV_CONSTS)             \
+  MK_ADAPTER(affine_qmv_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_batch_0, 0, 0x18,        \
+             (mk_affine_qmv<act_type, scale_type, gs, 8, MK_C>), QMV_CONSTS)                  \
+  MK_ADAPTER(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_d_64_batch_0, 0, 0x18, \
+             (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 64, MK_C>), QMV_CONSTS)         \
+  MK_ADAPTER(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_d_128_batch_0, 0, 0x18, \
+             (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 128, MK_C>), QMV_CONSTS)
+#endif
 
 INST_QMV_ALL_B8(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
+
+#ifndef MK_BODIES_ONLY
 
 // ─────────────────────────────────────────────────────────────────
 // nvfp4 CLEAN decode-matvec — FAITHFUL PORT of MLX `fp_qmv_impl`
@@ -1295,6 +1380,7 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 // group_size is always 16 for NVFP4; T_scale always half (folded F16).
 INST_NVFP4_QMV(f16, half, f16, half, 16)
 INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
+#endif // MK_BODIES_ONLY
 
 // ─────────────────────────────────────────────────────────────────
 // affine_gather_qmv_{fast,} — quantized.h:1899-2021 (MoE rhs gather)
@@ -1327,6 +1413,54 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 //
 // ─────────────────────────────────────────────────────────────────
 
+// Body shared by both dispatch kernels and their megakernel adapters, as TEXT: a function body
+// here reorders the kernel's first loads (its AIR would differ), so the kernels and the adapter
+// expand the same statements over their own `w, scales, biases, x, rhs_indices, y, top_k, tid,
+// simd_gid, simd_lid`. `IMPL` is the matvec, `C` the constant policy (K / N).
+#define AFFINE_GATHER_QMV_BODY(IMPL, C)                                                 \
+  /* `tid.z` flattens the (token, top_k_slot) axis. tid.x is fixed                    \
+     to 0 — the M-axis broadcast is folded into z. */                                   \
+  uint nk = tid.z;                                                                      \
+  uint token_n = nk / uint(top_k);                                                      \
+  uint expert_idx = rhs_indices[nk];                                                    \
+  /* Per-expert weight slab strides: w is packed int4 with                             \
+     `in_vec/8 * out_vec` uint32 per expert; scales/biases hold                         \
+     `in_vec/gs * out_vec` per expert. */                                               \
+  size_t expert_stride_w = size_t(C::k() / (32 / bits)) * size_t(C::n());               \
+  size_t expert_stride_sb = size_t(C::k() / group_size) * size_t(C::n());               \
+  const device uint32_t* w_e = w + expert_idx * expert_stride_w;                        \
+  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;                  \
+  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;                  \
+  auto x_e = x + size_t(token_n) * size_t(C::k());                                      \
+  auto y_e = y + size_t(nk) * size_t(C::n());                                           \
+  uint3 inner_tid = uint3(0, tid.y, 0);                                                 \
+  IMPL<T_act, T_scale, group_size, bits>(                                               \
+      w_e, s_e, b_e, x_e, y_e, C::k(), C::n(), qmv_codes_xor<C>(),                      \
+      inner_tid, simd_gid, simd_lid);
+
+// Megakernel adapters: x (3), rhs_indices (4) and y (5) device-coherent (tape-written); `top_k`
+// the inline scalar by reference.
+template <typename T_act, typename T_scale, int group_size, int bits, bool fast, typename C>
+MK_FUNC void mk_affine_gather_qmv(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  const device uint32_t* w = (const device uint32_t*)s.addr[0];
+  const device T_scale* scales = (const device T_scale*)s.addr[1];
+  const device T_scale* biases = (const device T_scale*)s.addr[2];
+  mk_cptr<T_act> x = (mk_cptr<T_act>)s.addr[3];
+  mk_cptr<uint32_t> rhs_indices = (mk_cptr<uint32_t>)s.addr[4];
+  mk_ptr<T_act> y = (mk_ptr<T_act>)s.addr[5];
+  const device int& top_k = *(const device int*)s.addr[6];
+  const uint3 tid = l.tg_pos;
+  const uint simd_gid = l.simd_gid;
+  const uint simd_lid = l.simd_lid;
+  if constexpr (fast) {
+    AFFINE_GATHER_QMV_BODY(qmv_fast_impl, C)
+  } else {
+    AFFINE_GATHER_QMV_BODY(qmv_impl, C)
+  }
+}
+
+#ifndef MK_BODIES_ONLY
 template <typename T_act, typename T_scale, int group_size, int bits>
 [[kernel]] void affine_gather_qmv_fast(
     const device uint32_t* w           [[buffer(0)]],
@@ -1339,27 +1473,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
-  // `tid.z` flattens the (token, top_k_slot) axis. tid.x is fixed
-  // to 0 — the M-axis broadcast is folded into z.
-  uint nk = tid.z;
-  uint token_n = nk / uint(top_k);
-  uint expert_idx = rhs_indices[nk];
-
-  // Per-expert weight slab strides: w is packed int4 with
-  // `in_vec/8 * out_vec` uint32 per expert; scales/biases hold
-  // `in_vec/gs * out_vec` per expert.
-  size_t expert_stride_w = size_t(IN_VEC_SIZE / (32 / bits)) * size_t(OUT_VEC_SIZE);
-  size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
-  const device uint32_t* w_e = w + expert_idx * expert_stride_w;
-  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
-  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;
-  const device T_act*    x_e = x + size_t(token_n) * size_t(IN_VEC_SIZE);
-  device T_act*          y_e = y + size_t(nk) * size_t(OUT_VEC_SIZE);
-
-  uint3 inner_tid = uint3(0, tid.y, 0);
-  qmv_fast_impl<T_act, T_scale, group_size, bits>(
-      w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
-      inner_tid, simd_gid, simd_lid);
+  AFFINE_GATHER_QMV_BODY(qmv_fast_impl, QmvFc)
 }
 
 template <typename T_act, typename T_scale, int group_size, int bits>
@@ -1374,22 +1488,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
-  uint nk = tid.z;
-  uint token_n = nk / uint(top_k);
-  uint expert_idx = rhs_indices[nk];
-
-  size_t expert_stride_w = size_t(IN_VEC_SIZE / (32 / bits)) * size_t(OUT_VEC_SIZE);
-  size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
-  const device uint32_t* w_e = w + expert_idx * expert_stride_w;
-  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
-  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;
-  const device T_act*    x_e = x + size_t(token_n) * size_t(IN_VEC_SIZE);
-  device T_act*          y_e = y + size_t(nk) * size_t(OUT_VEC_SIZE);
-
-  uint3 inner_tid = uint3(0, tid.y, 0);
-  qmv_impl<T_act, T_scale, group_size, bits>(
-      w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
-      inner_tid, simd_gid, simd_lid);
+  AFFINE_GATHER_QMV_BODY(qmv_impl, QmvFc)
 }
 
 #define INST_GATHER_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits)               \
@@ -1397,6 +1496,19 @@ template <typename T_act, typename T_scale, int group_size, int bits>
       #name "_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_" #bits)]]                              \
   [[kernel]] decltype(name<act_type, scale_type, gs, bits>)                                      \
       name<act_type, scale_type, gs, bits>;
+#else
+// Megakernel mode: each instantiation line names its adapter (`fast` from the kernel's name), its
+// item width that of its matvec body (INST_QMV_ALL).
+#define MK_GATHER_FAST_affine_gather_qmv_fast true
+#define MK_GATHER_FAST_affine_gather_qmv false
+#define MK_GATHER_ITEM_affine_gather_qmv_fast 256
+#define MK_GATHER_ITEM_affine_gather_qmv 512
+#define INST_GATHER_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits)                 \
+  MK_STREAM(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits, MK_GATHER_ITEM_##name, 0x38, \
+            0x20,                                                                                \
+            (mk_affine_gather_qmv<act_type, scale_type, gs, bits, MK_GATHER_FAST_##name, MK_C>), \
+            QMV_CONSTS)
+#endif
 
 #define INST_GATHER_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs) \
   INST_GATHER_QMV(affine_gather_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4) \

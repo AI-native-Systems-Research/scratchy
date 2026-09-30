@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 using namespace metal;
 
+#ifndef MK_BODIES_ONLY
 // ============================================================================
 // Embed: Embedding lookup operation
 // out[i, :] = table[indices[i], :]
@@ -50,8 +52,30 @@ kernel void embed_bf16(
 /// `scratchy-target-metal::interpreter::metal::pipelines::constants_for(Embed)`:
 ///   0 = M (bucket_m, = num_tokens for this bucket)
 ///   1 = HIDDEN_SIZE (= W::Q_SIZE)
-constant uint EMBED_M           [[function_constant(0)]];
-constant uint EMBED_HIDDEN_SIZE [[function_constant(1)]];
+#endif // MK_BODIES_ONLY
+#define EMBED_CONSTS(X) X(uint, m, EMBED_M, 0) X(uint, hidden, EMBED_HIDDEN_SIZE, 1)
+
+// Megakernel adapter: the rows the dispatch threads of one virtual threadgroup gather (token
+// `tg_pos.x * tpg.x + t` for thread `t`), each row copied by all of its threads — a copy, so the
+// split writes the same bytes. The output (0) is device-coherent.
+template <typename T, typename C>
+MK_FUNC void mk_embed(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  if (!l.live) return;
+  mk_ptr<T> out = (mk_ptr<T>)s.addr[0];
+  const device T* table = (const device T*)s.addr[1];
+  const device uint* indices = (const device uint*)s.addr[2];
+  const uint first = l.tg_pos.x * l.tpg.x;
+  const uint last = min(first + l.tpg.x, C::m());
+  for (uint tok = first; tok < last; ++tok) {
+    const uint idx = indices[tok];
+    for (uint i = l.tid; i < C::hidden(); i += l.tpg.x) {
+      out[tok * C::hidden() + i] = table[idx * C::hidden() + i];
+    }
+  }
+}
+
+#ifndef MK_BODIES_ONLY
+EMBED_CONSTS(MK_FC_DECLARE)
 
 kernel void embed_f16_specialized(
     device       half* out     [[buffer(0)]],   // [num_tokens, hidden_size]
@@ -88,3 +112,7 @@ kernel void embed_bf16_specialized(
         dst[i] = src[i];
     }
 }
+#else
+MK_TAIL(embed_f16_specialized, 0x1, (mk_embed<half, MK_C>), EMBED_CONSTS)
+MK_TAIL(embed_bf16_specialized, 0x1, (mk_embed<bfloat, MK_C>), EMBED_CONSTS)
+#endif // MK_BODIES_ONLY

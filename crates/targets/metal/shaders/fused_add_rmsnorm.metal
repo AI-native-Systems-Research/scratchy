@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 using namespace metal;
 
 /// Fused Add + RMSNorm kernel: y = rmsnorm(x + residual, weight, eps)
@@ -18,6 +19,7 @@ using namespace metal;
 /// Outputs:
 /// - output: normalized result [M, N]
 /// - residual_out: (x + residual) for next layer's residual [M, N]
+#ifndef MK_BODIES_ONLY
 kernel void fused_add_rmsnorm_f16(
     device const half* input [[buffer(0)]],
     device const half* residual [[buffer(1)]],
@@ -126,15 +128,72 @@ kernel void fused_add_rmsnorm_bf16(
     }
 }
 
+#endif // MK_BODIES_ONLY
+
 /// Phase 5.B.3 specialized variant: layer-independent params baked
 /// in via `[[function_constant(N)]]`. Index assignments must match
 /// `scratchy-target-metal::interpreter::metal::pipelines`:
 ///   0 = M (uint), 1 = N/HIDDEN_SIZE (uint), 2 = EPS (float).
-constant uint  FUSED_ARN_M             [[function_constant(0)]];
-constant uint  FUSED_ARN_HIDDEN_SIZE   [[function_constant(1)]];
-constant float FUSED_ARN_EPS           [[function_constant(2)]];
-// Zero-centered (Gemma / Qwen3.5) RMSNorm: effective gain = weight + offset.
-constant float FUSED_ARN_WEIGHT_OFFSET [[function_constant(3)]];
+// FUSED_ARN_WEIGHT_OFFSET: zero-centered (Gemma / Qwen3.5) RMSNorm: effective gain = weight + offset.
+#define FUSED_ARN_CONSTS(X)                                                                  \
+  X(uint, m, FUSED_ARN_M, 0) X(uint, n, FUSED_ARN_HIDDEN_SIZE, 1) X(float, eps, FUSED_ARN_EPS, 2) \
+  X(float, off, FUSED_ARN_WEIGHT_OFFSET, 3)
+#ifndef MK_BODIES_ONLY
+FUSED_ARN_CONSTS(MK_FC_DECLARE)
+// The dispatch kernels' constants, as the bodies read them.
+struct FusedArnFc {
+  FUSED_ARN_CONSTS(MK_FC_ACCESSOR)
+};
+#endif // MK_BODIES_ONLY
+
+// Body shared by the dispatch kernel and the megakernel adapter (see `rmsnorm_body`): `residual`
+// and `delta` are both read and written in place.
+template <typename T_act, typename T_scale, typename C, typename RP, typename DP>
+METAL_FUNC void fused_add_rmsnorm_body(RP residual, DP delta, const device T_scale* weight,
+                                       uint gid, uint tid, uint tg_size, bool live,
+                                       threadgroup float* shared_sum) {
+    // Pass 1: residual += delta in place, accumulate sum-of-squares.
+    float local_sum = 0.0f;
+    if (live) {
+        for (uint i = tid; i < C::n(); i += tg_size) {
+            float r = float(residual[gid * C::n() + i]);
+            float d = float(delta[gid * C::n() + i]);
+            float s = r + d;
+            residual[gid * C::n() + i] = T_act(s);
+            local_sum += s * s;
+        }
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(C::n()) + C::eps());
+
+    // Pass 2: write `rmsnorm(residual, weight)` back into `delta`.
+    if (live) {
+        for (uint i = tid; i < C::n(); i += tg_size) {
+            float s = float(residual[gid * C::n() + i]);
+            float w = float(weight[i]) + C::off();
+            delta[gid * C::n() + i] = T_act((s / rms) * w);
+        }
+    }
+}
+
+// Megakernel adapter: residual (0) and delta (1) device-coherent.
+template <typename T_act, typename T_scale, typename C>
+MK_FUNC void mk_fused_add_rmsnorm(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+    fused_add_rmsnorm_body<T_act, T_scale, C>((mk_ptr<T_act>)s.addr[0], (mk_ptr<T_act>)s.addr[1],
+                                              (const device T_scale*)s.addr[2], l.tg_pos.x, l.tid,
+                                              l.tpg.x, l.live && l.tg_pos.x < C::m(),
+                                              (threadgroup float*)mk_region(s, l, tg));
+}
+#ifndef MK_BODIES_ONLY
 
 /// Specialized fused add+rmsnorm matching the CUDA `fused_add_rms_norm_inplace`
 /// semantics (`scratchy-target-cuda::kernels::fused_add_rms_norm_inplace`):
@@ -166,34 +225,8 @@ template <typename T_act, typename T_scale>
     if (gid >= FUSED_ARN_M) return;
 
     threadgroup float shared_sum[1024];
-
-    // Pass 1: residual += delta in place, accumulate sum-of-squares.
-    float local_sum = 0.0f;
-    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
-        float r = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float s = r + d;
-        residual[gid * FUSED_ARN_HIDDEN_SIZE + i] = T_act(s);
-        local_sum += s * s;
-    }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = sqrt(shared_sum[0] / float(FUSED_ARN_HIDDEN_SIZE) + FUSED_ARN_EPS);
-
-    // Pass 2: write `rmsnorm(residual, weight)` back into `delta`.
-    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
-        float s = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float w = float(weight[i]) + FUSED_ARN_WEIGHT_OFFSET;
-        delta[gid * FUSED_ARN_HIDDEN_SIZE + i] = T_act((s / rms) * w);
-    }
+    fused_add_rmsnorm_body<T_act, T_scale, FusedArnFc>(residual, delta, weight, gid, tid, tg_size,
+                                                       true, shared_sum);
 }
 
 #define INST_FUSED_ARN(act_tag, act_type, scale_tag, scale_type)              \
@@ -201,6 +234,13 @@ template <typename T_act, typename T_scale>
                        "_specialized")]]                                      \
   [[kernel]] decltype(fused_add_rmsnorm_specialized_impl<act_type, scale_type>) \
       fused_add_rmsnorm_specialized_impl<act_type, scale_type>;
+#else
+// Megakernel mode: the same instantiation lines name the adapters (the dispatch kernel's
+// `shared_sum[1024]` per virtual threadgroup).
+#define INST_FUSED_ARN(act_tag, act_type, scale_tag, scale_type)                          \
+  MK_ADAPTER(fused_add_rmsnorm_##act_tag##_s_##scale_tag##_specialized, 4096, 0x3,     \
+             (mk_fused_add_rmsnorm<act_type, scale_type, MK_C>), FUSED_ARN_CONSTS)
+#endif
 
 // Coverage: T_scale tracks on-disk gain dtype. Llama-3.x ships F16
 // gains; Qwen3 family ships BF16. See INST_RMSNORM in `rmsnorm.metal`.
@@ -208,6 +248,8 @@ INST_FUSED_ARN(f16,  half,   f16,  half)
 INST_FUSED_ARN(bf16, bfloat, f16,  half)
 INST_FUSED_ARN(bf16, bfloat, bf16, bfloat)
 INST_FUSED_ARN(f16,  half,   bf16, bfloat)
+
+#ifndef MK_BODIES_ONLY
 
 /// Optimized variant with vectorized loads (half4) for better memory bandwidth
 /// Requires N to be multiple of 4
@@ -288,6 +330,62 @@ kernel void fused_add_rmsnorm_f16_vec4(
 ///
 /// Dispatch: `(M, 1, 1)` threadgroups × `tg_size` threads, cooperative
 /// reduction over `HIDDEN_SIZE`.
+#endif // MK_BODIES_ONLY
+
+// Body shared by the dispatch kernels and the megakernel adapter (see `rmsnorm_body`).
+template <typename T_act, typename T_scale, typename C, typename DP, typename RP, typename OP>
+METAL_FUNC void norm_add_scalar_mul_body(DP delta, RP residual, OP out,
+                                         const device T_scale* gains,
+                                         const device T_scale* layer_scalar, uint gid, uint tid,
+                                         uint tg_size, bool live, threadgroup float* shared_sum) {
+    // Pass 1: sum-of-squares over delta (the norm input).
+    float local_sum = 0.0f;
+    if (live) {
+        for (uint i = tid; i < C::n(); i += tg_size) {
+            float d = float(delta[gid * C::n() + i]);
+            local_sum += d * d;
+        }
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(C::n()) + C::eps());
+    float s = float(layer_scalar[0]);
+
+    // Pass 2: out = (normed + residual) * layer_scalar. Round to T_act
+    // at EVERY op boundary the unfused chain rounds at (RmsNorm store,
+    // Add store, ScalarWeightMul store) — keeps the fused kernel
+    // BIT-IDENTICAL to the rmsnorm/add/scalar_weight_mul sequence, so
+    // verbatim greedy parity is preserved by construction.
+    if (live) {
+        for (uint i = tid; i < C::n(); i += tg_size) {
+            float d = float(delta[gid * C::n() + i]);
+            float r = float(residual[gid * C::n() + i]);
+            float w = float(gains[i]) + C::off();
+            T_act normed = T_act((d / rms) * w);
+            T_act summed = T_act(float(normed) + r);
+            out[gid * C::n() + i] = T_act(float(summed) * s);
+        }
+    }
+}
+
+// Megakernel adapter: delta (0), residual (1) and out (2) device-coherent.
+template <typename T_act, typename T_scale, typename C>
+MK_FUNC void mk_norm_add_scalar_mul(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+    norm_add_scalar_mul_body<T_act, T_scale, C>(
+        (mk_cptr<T_act>)s.addr[0], (mk_cptr<T_act>)s.addr[1], (mk_ptr<T_act>)s.addr[2],
+        (const device T_scale*)s.addr[3], (const device T_scale*)s.addr[4], l.tg_pos.x, l.tid,
+        l.tpg.x, l.live && l.tg_pos.x < C::m(), (threadgroup float*)mk_region(s, l, tg));
+}
+
+#ifndef MK_BODIES_ONLY
 template <typename T_act, typename T_scale>
 [[kernel]] void norm_add_scalar_mul_impl(
     device const T_act*   delta        [[buffer(0)]],
@@ -302,39 +400,9 @@ template <typename T_act, typename T_scale>
     if (gid >= FUSED_ARN_M) return;
 
     threadgroup float shared_sum[1024];
-
-    // Pass 1: sum-of-squares over delta (the norm input).
-    float local_sum = 0.0f;
-    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
-        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        local_sum += d * d;
-    }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = sqrt(shared_sum[0] / float(FUSED_ARN_HIDDEN_SIZE) + FUSED_ARN_EPS);
-    float s = float(layer_scalar[0]);
-
-    // Pass 2: out = (normed + residual) * layer_scalar. Round to T_act
-    // at EVERY op boundary the unfused chain rounds at (RmsNorm store,
-    // Add store, ScalarWeightMul store) — keeps the fused kernel
-    // BIT-IDENTICAL to the rmsnorm/add/scalar_weight_mul sequence, so
-    // verbatim greedy parity is preserved by construction.
-    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
-        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float r = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float w = float(gains[i]) + FUSED_ARN_WEIGHT_OFFSET;
-        T_act normed = T_act((d / rms) * w);
-        T_act summed = T_act(float(normed) + r);
-        out[gid * FUSED_ARN_HIDDEN_SIZE + i] = T_act(float(summed) * s);
-    }
+    norm_add_scalar_mul_body<T_act, T_scale, FusedArnFc>(delta, residual, out, gains,
+                                                         layer_scalar, gid, tid, tg_size, true,
+                                                         shared_sum);
 }
 
 #define INST_NORM_ADD_SCALAR_MUL(act_tag, act_type, scale_tag, scale_type)    \
@@ -342,6 +410,11 @@ template <typename T_act, typename T_scale>
                        "_specialized")]]                                      \
   [[kernel]] decltype(norm_add_scalar_mul_impl<act_type, scale_type>)        \
       norm_add_scalar_mul_impl<act_type, scale_type>;
+#else
+#define INST_NORM_ADD_SCALAR_MUL(act_tag, act_type, scale_tag, scale_type)                \
+  MK_ADAPTER(norm_add_scalar_mul_##act_tag##_s_##scale_tag##_specialized, 4096, 0x7,     \
+             (mk_norm_add_scalar_mul<act_type, scale_type, MK_C>), FUSED_ARN_CONSTS)
+#endif
 
 INST_NORM_ADD_SCALAR_MUL(f16,  half,   f16,  half)
 INST_NORM_ADD_SCALAR_MUL(bf16, bfloat, f16,  half)

@@ -22,25 +22,26 @@
 //! The caller's entire integration is two calls: `Weights::load(...)`
 //! at startup and `forward(...)` per step.
 //!
-//! Emission-per-subgraph is delegated to
-//! [`crate::impl_lib::Implementation::emit_call`]: codegen walks
-//! the LOOP's waves and asks each subgraph's bound impl to emit
-//! its own tokens. New kernels / new ops extend the library, not
-//! this file.
+//! On cuda, emission-per-subgraph is delegated to instruction
+//! selection's `Implementation::emit_call`: codegen walks the LOOP's
+//! waves and asks each subgraph's bound impl to emit its own tokens.
+//! New kernels / new ops extend the library, not this file. A
+//! tape-scheduled target (metal, spyre) lowers the shared tape instead.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
 
-use crate::assignment::WorkloadAssignments;
-use crate::classified::{Expr, OpKind, Program, Stmt, UnrollIndex, WeightId};
+use crate::classified::{OpKind, Program, UnrollIndex, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
+#[cfg(feature = "cuda")]
 use crate::impl_lib::ImplementationLibrary;
-use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
-use crate::schedule::WorkloadLoops;
+use crate::interpreter_codegen::emit_bucket_static_slice;
+#[cfg(feature = "cuda")]
+use crate::interpreter_codegen::{ArchOpcodes, lower_bucket};
 use crate::weight_vocab::{SlotMap, WeightAccessor, WeightSlot};
 
 // ── Weights struct + loader emission ─────────────────────────────
@@ -1718,8 +1719,6 @@ pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
 /// GDN gated RMSNorm uses its own kernel and is unaffected. Distinct
 /// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
 /// un-bakes a converter's pre-applied constant). Default 0.0.
-// `pub(crate)`: also consulted by `MetalRopeAppendNormedImpl::applies_to`
-// (the synth norm prologue is only bit-correct for offset-0 models).
 pub(crate) fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
     // Read the parsed `bounds` table (booleans land there as 0/1, and
     // `apply_arch_semantic_defaults` inserts the flag for the
@@ -1763,10 +1762,11 @@ fn tie_word_embeddings(model: &ModelParams) -> bool {
 /// Aggregate every unique WeightAccessor across every workload
 /// tape_index's SFUF. Errors on name collisions with conflicting
 /// `rust_type`s.
+#[cfg(feature = "cuda")]
 fn collect_accessors(
     program: &Program,
     fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
+    sfufs: &crate::assignment::WorkloadAssignments,
     lib: &ImplementationLibrary,
     _model_for_trace: &ModelParams,
 ) -> Result<Vec<WeightAccessor>, TokenStream> {
@@ -2604,53 +2604,15 @@ pub(crate) enum WeightsEmitMode<'a> {
 fn emit_weights_struct(
     program: &Program,
     fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
-    // M2b: when the arch is tape-scheduled, the accessor set comes
-    // from the SHARED TAPE. Both sets are still computed and the
-    // emitted field/type/source signature asserted equal — the
-    // transition gate; the tape's is what gets emitted.
-    tape_accessors: Option<&[WeightAccessor]>,
-    lib: &ImplementationLibrary,
+    // The model's accessor set: instruction selection's on cuda ([`collect_accessors`]), the
+    // SHARED TAPE's on a tape-scheduled target.
+    accessors: Vec<WeightAccessor>,
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
     tp_world_size: u8,
     emit_fingerprint: bool,
 ) -> TokenStream {
-    let isel_accessors = match collect_accessors(program, fuf, sfufs, lib, model) {
-        Ok(a) => a,
-        Err(err) => return err,
-    };
-    let accessors = match tape_accessors {
-        Some(tape) => {
-            let sig = |accs: &[WeightAccessor]| {
-                group_accessors_by_base(accs)
-                    .iter()
-                    .map(|g| {
-                        (
-                            g.base.clone(),
-                            g.rust_type.to_string().replace(' ', ""),
-                            g.entries.len(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                sig(tape),
-                if isel_accessors.is_empty() {
-                    sig(tape)
-                } else {
-                    sig(&isel_accessors)
-                },
-                "model `{}`: tape accessor set emits a DIFFERENT Weights struct than \
-                 instruction selection",
-                model.source_stem,
-            );
-            tape.to_vec()
-        }
-        None => isel_accessors,
-    };
-
     // Storage-format guard: a given accessor's `rust_type` must be
     // compatible with every one of its source weights' storage
     // formats. The allowed pairs today:
@@ -6644,10 +6606,10 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
 ///
 /// - [`BackboneLayout::Decoder`] — the FUF ends in `gemm(<tile>,
 ///   lm_head)` (or that gemm followed by an `AllGather` at tp>1).
-///   The backbone is everything except the terminal subgraph; the
-///   `(TileId, u8)` it carries is the lm_head Gemm's hidden-state
-///   input — the slot `forward_backbone` returns and the slot the
-///   lm_head slice reads.
+///   The backbone is everything except the terminal subgraph; its
+///   output is the lm_head Gemm's hidden-state input
+///   ([`lm_head_input`]) — the slot `forward_backbone` returns and the
+///   slot the lm_head slice reads.
 /// - [`BackboneLayout::Encoder`] — the FUF's terminal is NOT
 ///   `gemm(_, lm_head)`. Covers text-side encoders (ModernBERT)
 ///   AND every `#[vision_forward]` body (Qwen2-VL / Qwen2.5-VL /
@@ -6657,17 +6619,26 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
 ///   directly.
 #[derive(Clone, Copy, Debug)]
 enum BackboneLayout {
-    Decoder { backbone_out: (TileId, u8) },
+    Decoder,
     Encoder,
 }
 
-/// Classify the FUF's terminal as decoder vs encoder. A decoder
-/// terminal is `gemm(<tile>, <lm_head_weight>)`, optionally followed
-/// by an `AllGather` (inserted by tp>1 lowering on the vocab-parallel
-/// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadPixels` /
+/// Classify the FUF's terminal as decoder vs encoder: a decoder is a FUF with an
+/// [`lm_head_input`].
+fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
+    match lm_head_input(fuf, program) {
+        Some(_) => BackboneLayout::Decoder,
+        None => BackboneLayout::Encoder,
+    }
+}
+
+/// A decoder's backbone output: the hidden-state input of its terminal
+/// `gemm(<tile>, <lm_head_weight>)`, optionally followed by an `AllGather`
+/// (inserted by tp>1 lowering on the vocab-parallel lm_head Gemm). `None`
+/// for an encoder. Walks past trailing `MmEmbedSplice` / `LoadPixels` /
 /// `LoadPosEmbeds` nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
-fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
+fn lm_head_input(fuf: &Fuf, program: &Program) -> Option<(TileId, u8)> {
     const LM_HEAD_PREFIX: &str = "lm_head";
 
     let last_node = last_non_splice_node(fuf).expect("FUF must be non-empty to emit a forward fn");
@@ -6712,7 +6683,7 @@ fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
         // AllGather has exactly one tile input by construction.
         match last_node.inputs.first() {
             Some(FufInput::Tile { id, .. }) => fuf.get(*id),
-            _ => return BackboneLayout::Encoder,
+            _ => return None,
         }
     } else {
         last_node
@@ -6720,7 +6691,7 @@ fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
 
     // Decoder shape: `gemm(<tile>, <lm_head weight>)`.
     if lm_head_node.op != crate::classified::OpKind::Gemm {
-        return BackboneLayout::Encoder;
+        return None;
     }
     let weight_is_lm_head = matches!(
         lm_head_node.inputs.get(1),
@@ -6733,13 +6704,11 @@ fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
                 == Some(LM_HEAD_PREFIX)
     );
     if !weight_is_lm_head {
-        return BackboneLayout::Encoder;
+        return None;
     }
     match lm_head_node.inputs.first() {
-        Some(FufInput::Tile { id, slot }) => BackboneLayout::Decoder {
-            backbone_out: (*id, *slot),
-        },
-        _ => BackboneLayout::Encoder,
+        Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+        _ => None,
     }
 }
 
@@ -6775,296 +6744,6 @@ fn bounds_for_wp(
         }
     }
     bounds
-}
-
-/// Emit the full per-model module body: Weights struct + loader,
-/// one forward fn per workload tape_index, and a dispatching wrapper.
-///
-/// When `canonical_override` is `Some(ident)`, this variant is a
-/// shim for that canonical sibling — emit `pub type Weights =
-/// super::<ident>::Weights;` instead of a fresh struct, emit the
-/// variant-specific `load` + `fingerprint_matches` bodies
-/// (loaders differ per quant preset, fingerprints differ per
-/// tensor-suffix gate), and `pub use` the canonical's forward +
-/// forward_backbone + per-tape_index forward_m_<N> fns. rustc doesn't
-/// re-monomorphize `pub use` re-exports, so the canonical fn body
-/// is optimized ONCE regardless of how many variants share it.
-#[cfg(feature = "metal")]
-fn emit_synthesized_kernel_sources_override(
-    model: &ModelParams,
-    tp_world_size: u8,
-    has_linear_bias: bool,
-    mlp_uses_gelu: bool,
-) -> TokenStream {
-    use crate::quantization::QuantMethod;
-    let (bits, group_size, mlp_bits) = match model.quantization.as_ref().map(|q| &q.method) {
-        Some(QuantMethod::Affine {
-            bits,
-            group_size,
-            bits_overrides,
-            ..
-        }) => {
-            // MLP projection width: the preset's bits_overrides carry
-            // per-suffix widths (Gemma4: mlp.{gate,up,down}_proj → 8).
-            let mlp_bits = bits_overrides
-                .iter()
-                .find(|(path, _)| path.contains("mlp."))
-                .map(|(_, b)| *b)
-                .unwrap_or(*bits);
-            (*bits, *group_size, mlp_bits)
-        }
-        _ => return quote! {},
-    };
-    if bits != 4 {
-        return quote! {};
-    }
-    let mlp_act = if mlp_uses_gelu {
-        ::scratchy_target_metal::atom_lib::MlpAct::Gelu
-    } else {
-        ::scratchy_target_metal::atom_lib::MlpAct::Silu
-    };
-    // bf16 activation is the default for every modern Llama / Qwen /
-    // Mistral / Gemma metal arch (per CanonicalParams::METAL_DTYPE).
-    // Future: thread W::METAL_DTYPE through and emit per-dtype variants.
-    let t_act = "bfloat";
-    // T_scale tracks on-disk scale convention. Mirrors the SCALE_DTYPE
-    // override in `emit_canonical_params_impl`: Qwen3 family ships BF16
-    // scales+biases, everything else ships F16. Synth kernel symbol
-    // must match the corresponding `MetalSynth*Impl` instantiation
-    // registered in `starter_library` (otherwise the solver's pick and
-    // the runtime pipeline cache disagree on the library key).
-    // Whole Qwen3 family (Qwen3 / Qwen3Moe / Qwen3.5 / Qwen3.6 /
-    // Qwen3-Next, dense + MoE + the VL-wrapped `Qwen3_5ForConditional
-    // Generation` text decoders) ships BF16 scales+biases. Match by
-    // family prefix so new members are covered automatically.
-    let is_bf16_scale = model.arch.scale_dtype.as_deref() == Some("bf16");
-    let t_scale = if is_bf16_scale { "bfloat" } else { "half" };
-
-    // Model dims baked as MSL `constant constexpr` literals at synth
-    // time. Same TP-sharding rules as `emit_canonical_params_impl`:
-    // num_q / num_kv / intermediate split per-rank; hidden stays
-    // replicated (residual stream is post-allreduce).
-    let tp = tp_world_size as u32;
-    let tp_us = tp_world_size as usize;
-    let hidden = *model.bounds.get("hidden_size").unwrap_or(&0) as u32;
-    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
-    let num_q = (*model.bounds.get("num_attention_heads").unwrap_or(&0) as u32) / tp;
-    let num_kv = (*model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32) / tp;
-    let intermediate = (*model.bounds.get("intermediate_size").unwrap_or(&0) as u32) / tp;
-    let partial = model
-        .scalars
-        .get("partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9);
-    let rot_dim = match partial {
-        Some(f) => (f * head_dim as f64).round() as u32,
-        None => head_dim,
-    };
-    let eps = rms_norm_eps(model);
-    let _ = tp_us;
-
-    // Sanity-gate: if any required dim is zero, skip emission (the
-    // model isn't a standard transformer-decoder we can synthesize for).
-    if hidden == 0 || head_dim == 0 || num_q == 0 || num_kv == 0 || intermediate == 0 {
-        return quote! {};
-    }
-
-    let consts = crate::fuse_pass::ChunkConstants {
-        // Baked as `constant constexpr` literals in the emitted MSL.
-        // M is the only remaining function constant (varies per
-        // tape_index; can't be baked).
-        hidden,
-        num_q_heads: num_q,
-        num_kv_heads: num_kv,
-        head_dim,
-        rot_dim,
-        block_size: 16, // scratchy_forward_compiler::CanonicalParams::BLOCK_SIZE default
-        intermediate,
-        m: 0,
-        group_size,
-        rms_norm_eps: eps,
-        // Pre-attn synth gains 3 extra `__{q,k,v}_linear_bias` buffer
-        // params + a bias epilogue inside each per-band AffineQmvAtom
-        // when this is `true`. Threaded down from
-        // `program_has_bias_add` so Qwen2/Qwen2.5 (DSL emits
-        // `bias_add` on QKV) gets the biased variant; Llama (no DSL
-        // bias_add) keeps the existing one. MLP / gate-up synths
-        // ignore this — Qwen2 MLP has no biases.
-        has_linear_bias,
-    };
-    let pre_attn = crate::fuse_pass::synthesize_pre_attn_chunk(
-        crate::fuse_pass::SynthesisBackend::Metal,
-        t_act,
-        t_scale,
-        &consts,
-    );
-    let pre_attn_init = crate::fuse_pass::synthesize_pre_attn_init_chunk(
-        crate::fuse_pass::SynthesisBackend::Metal,
-        t_act,
-        t_scale,
-        &consts,
-    );
-    // MLP pre-down synth: bake BOTH the 4-bit and 8-bit kernels.
-    //
-    // The solver picks a `MetalSynthMlpPreDown` impl by the shared
-    // expert's *actual* per-module quant width (`synth_mlp_pre_down.rs`
-    // registers a b4 and a b8 variant, each `matches()`-gated on the
-    // weight's bits). A mixed-width OptiQ checkpoint therefore dispatches
-    // b4 on some layers and b8 on others, but `mlp_bits` — derived from a
-    // `bits_overrides` suffix match — only knows one width, so it would
-    // register a single library and leave the other width's pipeline
-    // lookup unresolved (→ silent garble). Emit both; a uniform model
-    // simply never looks up the unused one.
-    let _ = mlp_bits;
-    let mlp_pre_down_variants: ::std::vec::Vec<_> = [4u32, 8u32]
-        .into_iter()
-        .map(|b| {
-            crate::fuse_pass::synthesize_mlp_pre_down_chunk(
-                crate::fuse_pass::SynthesisBackend::Metal,
-                t_act,
-                t_scale,
-                &consts,
-                mlp_act,
-                b,
-            )
-        })
-        .collect();
-    // AOT-compile each synth source to a `.metallib` blob at macro
-    // expansion time. Same `xcrun metal -c` + `xcrun metallib`
-    // pipeline used by `scratchy-target-metal/build.rs` for every
-    // hand-written shader. Runtime loads via `newLibraryWithData`
-    // (NOT `newLibraryWithSource`) so the resulting Metal binaries
-    // are identical to the AOT-compiled shaders — same compiler
-    // path, same behavior across Apple GPU generations.
-    let gate_up = ::scratchy_target_metal::fuse_pass::synthesize_gate_up_silu_mul_large_chunk(
-        ::scratchy_target_metal::fuse_pass::SynthesisBackend::Metal,
-        t_act,
-        t_scale,
-        &consts,
-    );
-    let gu_bytes =
-        ::scratchy_target_metal::aot::aot_compile_metallib(&gate_up.symbol, &gate_up.source);
-
-    let pa_bytes =
-        ::scratchy_target_metal::aot::aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
-    let pi_bytes = ::scratchy_target_metal::aot::aot_compile_metallib(
-        &pre_attn_init.symbol,
-        &pre_attn_init.source,
-    );
-    // Dedup by symbol so a model whose b4 and b8 chunks collide (they
-    // don't today — the width is baked into the symbol) never registers
-    // the same key twice.
-    let mut seen_md: ::std::collections::HashSet<String> = ::std::collections::HashSet::new();
-    let md_symbol_lits: ::std::vec::Vec<syn::LitStr> = ::std::vec::Vec::new();
-    let md_bytes_lits: ::std::vec::Vec<syn::LitByteStr> = ::std::vec::Vec::new();
-    let (md_symbol_lits, md_bytes_lits) = mlp_pre_down_variants.iter().fold(
-        (md_symbol_lits, md_bytes_lits),
-        |(mut syms, mut blobs), chunk| {
-            if seen_md.insert(chunk.symbol.clone()) {
-                let bytes = ::scratchy_target_metal::aot::aot_compile_metallib(
-                    &chunk.symbol,
-                    &chunk.source,
-                );
-                syms.push(syn::LitStr::new(
-                    &chunk.symbol,
-                    proc_macro2::Span::call_site(),
-                ));
-                blobs.push(syn::LitByteStr::new(&bytes, proc_macro2::Span::call_site()));
-            }
-            (syms, blobs)
-        },
-    );
-    // One named const per md variant (byte-string literals aren't
-    // `'static`-promotable inside the returned array; a `const` binding is).
-    let md_idents: ::std::vec::Vec<proc_macro2::Ident> = (0..md_bytes_lits.len())
-        .map(|i| quote::format_ident!("__SYNTH_MLP_PRE_DOWN_LIB_{}", i))
-        .collect();
-
-    let gu_symbol_lit = syn::LitStr::new(&gate_up.symbol, proc_macro2::Span::call_site());
-    let gu_bytes_lit = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
-
-    let pa_symbol_lit = syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
-    let pi_symbol_lit = syn::LitStr::new(&pre_attn_init.symbol, proc_macro2::Span::call_site());
-
-    let pa_bytes_lit = syn::LitByteStr::new(&pa_bytes, proc_macro2::Span::call_site());
-    let pi_bytes_lit = syn::LitByteStr::new(&pi_bytes, proc_macro2::Span::call_site());
-
-    quote! {
-        fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
-            const __SYNTH_PRE_ATTN_LIB: &[u8] = #pa_bytes_lit;
-            const __SYNTH_PRE_ATTN_INIT_LIB: &[u8] = #pi_bytes_lit;
-            const __SYNTH_GATE_UP_SILU_MUL_LIB: &[u8] = #gu_bytes_lit;
-            #( const #md_idents: &[u8] = #md_bytes_lits; )*
-            &[
-                (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
-                (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_LIB),
-                (#gu_symbol_lit, __SYNTH_GATE_UP_SILU_MUL_LIB),
-                #( (#md_symbol_lits, #md_idents) ),*
-            ]
-        }
-    }
-}
-
-/// Walk the classified DSL `Program` looking for any
-/// `Expr::Call { op: OpKind::BiasAdd, .. }`. Returns `true` on the
-/// first hit. Drives the biased variant of the synth pre-attn
-/// megakernel — Qwen2/Qwen2.5 DSL emits `bias_add` on QKV, Llama
-/// does not.
-/// True when the DSL's MLP uses a tanh-GELU gate (`gelu(gemm(...)) *
-/// up`) — Gemma-family GeGLU. Drives the gelu variant of the synth MLP
-/// megakernel (`synth_mlp_pre_down_gelu_*`).
-pub fn program_has_gelu(program: &Program) -> bool {
-    fn scan_stmt(stmt: &Stmt) -> bool {
-        match stmt {
-            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => scan_expr(value),
-            Stmt::For { body, .. } => body.iter().any(scan_stmt),
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => then_body.iter().any(scan_stmt) || else_body.iter().any(scan_stmt),
-        }
-    }
-    fn scan_expr(expr: &Expr) -> bool {
-        match expr {
-            Expr::Call { op, args } => matches!(op, OpKind::Gelu) || args.iter().any(scan_expr),
-            Expr::Mul { lhs, rhs } => scan_expr(lhs) || scan_expr(rhs),
-            Expr::Local(_)
-            | Expr::Extern { .. }
-            | Expr::Weight { .. }
-            | Expr::ScalarLit(_)
-            | Expr::SqrtBound(_)
-            | Expr::ConfigScalar { .. } => false,
-        }
-    }
-    program.statements.iter().any(scan_stmt)
-}
-
-pub fn program_has_bias_add(program: &Program) -> bool {
-    fn scan_stmt(stmt: &Stmt) -> bool {
-        match stmt {
-            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => scan_expr(value),
-            Stmt::For { body, .. } => body.iter().any(scan_stmt),
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => then_body.iter().any(scan_stmt) || else_body.iter().any(scan_stmt),
-        }
-    }
-    fn scan_expr(expr: &Expr) -> bool {
-        match expr {
-            Expr::Call { op, args } => matches!(op, OpKind::BiasAdd) || args.iter().any(scan_expr),
-            Expr::Mul { lhs, rhs } => scan_expr(lhs) || scan_expr(rhs),
-            Expr::Local(_)
-            | Expr::Extern { .. }
-            | Expr::Weight { .. }
-            | Expr::ScalarLit(_)
-            | Expr::SqrtBound(_)
-            | Expr::ConfigScalar { .. } => false,
-        }
-    }
-    program.statements.iter().any(scan_stmt)
 }
 
 /// Whether this model uses rotary position embeddings — any `Rotary` extern
@@ -7147,8 +6826,6 @@ fn kv_codec_for(
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
-    has_bias_add: bool,
-    has_gelu_mlp: bool,
     uses_rotary: bool,
     uses_kv_cache: bool,
     // Filled with the SAME values the impl's consts are emitted from —
@@ -7576,26 +7253,6 @@ fn emit_canonical_params_impl(
         None => quote! {},
     };
 
-    // Synthesized-kernel sources override (Metal-only, affine-int4
-    // gated). Empty for cuda models and any model that doesn't ship
-    // an MLX-affine int4 quantization config; default `&[]` from the
-    // CanonicalParams trait kicks in there.
-    //
-    // `has_bias_add` is threaded through so Qwen2/Qwen2.5 (whose DSL
-    // emits `bias_add` on QKV) gets the biased synth kernel variants
-    // — `synth_pre_attn{,_init}_<dtype>_<scale>_gs<N>_bias` — and the
-    // lowering arm's `kernel_symbol` matches the registered library.
-    // Mismatch surfaces at worker init as
-    // `PipelineLookup(no library …_bias in SpecializedPipelineCache)`.
-    #[cfg(feature = "metal")]
-    let synth_sources_override =
-        emit_synthesized_kernel_sources_override(model, tp_world_size, has_bias_add, has_gelu_mlp);
-    #[cfg(not(feature = "metal"))]
-    let synth_sources_override = {
-        let _ = (tp_world_size, has_bias_add, has_gelu_mlp);
-        TokenStream::new()
-    };
-
     // SCALE_DTYPE override — only matters under `--features metal`.
     // mlx-community 4bit convention (probed across cached HF snapshots):
     // Llama-3.x / Qwen2.5 / SmolLM ship F16 scales+biases+norm gains,
@@ -7606,8 +7263,7 @@ fn emit_canonical_params_impl(
     // baked into `model.architectures`.
     // Declared per arch (`const SCALE_DTYPE` on the carrier mod;
     // per-checkpoint repacks override via the `scale_dtype` JSON
-    // drift key). Must stay in sync with the synth-kernel
-    // `t_scale` gate above (same declared value).
+    // drift key).
     let scale_dtype_is_bf16 = {
         let is_bf16_scale = model.arch.scale_dtype.as_deref() == Some("bf16");
         // NVFP4 (NVIDIA ModelOpt) checkpoints ship BF16 RMSNorm gains
@@ -7706,8 +7362,6 @@ fn emit_canonical_params_impl(
             vision_in_features,
             vision_rope_interleaved,
             vision_attn_scale,
-            vision_patch_grid_side,
-            vision_pool_kernel,
             gdn_num_k_heads,
             gdn_num_v_heads,
             gdn_head_k_dim,
@@ -7771,7 +7425,6 @@ fn emit_canonical_params_impl(
             const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
             #mrope_section_tokens
-            #synth_sources_override
             #scale_dtype_override
         }
     }
@@ -9042,7 +8695,6 @@ fn dump_wavefront_mega(
     program: &Program,
     model: &ModelParams,
     fuf: &Fuf,
-    decode_asn: &crate::assignment::Assignment,
     inferred: &crate::shape::Inferred,
     decode_bounds: &BTreeMap<String, u64>,
     backbone_slots: &[Vec<WeightSlot>],
@@ -9094,22 +8746,6 @@ fn dump_wavefront_mega(
     // Primary bundle row count: 1 = decode (default), >1 = the mq golden-gate
     // knob. The worker's batched-prefill bundle is emitted separately below
     // (default m = prefix_len; `KTIR_PREFILL_LEN` overrides).
-    // Tape-scheduled targets skip instruction selection, so there is no solve
-    // to cross-check the bridge against.
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    let tape_pilot_arch_wf = true;
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let tape_pilot_arch_wf = false;
-    // The bridge takes the assignment ONLY to cross-check that the solve
-    // covered every tile (to_wavefront.rs, the `subgraph_of` guard); it reads
-    // nothing else from it. A tape-scheduled build never solves, so there is
-    // no coverage to check and passing `None` skips a check that would
-    // otherwise fail against a deliberately-empty assignment.
-    let decode_asn_check = if tape_pilot_arch_wf {
-        None
-    } else {
-        Some(decode_asn)
-    };
     let primary_m: u32 = std::env::var("KTIR_M")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -9117,7 +8753,6 @@ fn dump_wavefront_mega(
         .unwrap_or(1);
     let lowered = match crate::to_wavefront::lower_decode_to_wavefront(
         fuf,
-        decode_asn_check,
         inferred,
         decode_bounds,
         model,
@@ -9165,17 +8800,11 @@ fn dump_wavefront_mega(
             panic!("[wavefront] {stem}: superdsc decode NOT LOWERED — {e}");
         }
     };
-    let st = to_wavefront::stats(fuf, decode_asn, &lowered);
+    let st = to_wavefront::stats(fuf, &lowered);
     eprintln!(
-        "[wavefront] {stem}: {} fuf tiles, {} subgraphs → {} sources ({} weights, \
+        "[wavefront] {stem}: {} fuf tiles → {} sources ({} weights, \
          {} prefix-kv), {} ops; ops {:?}",
-        st.fuf_tiles,
-        st.subgraphs,
-        st.sources,
-        st.weight_sources,
-        st.prefix_sources,
-        st.ops,
-        st.op_histogram,
+        st.fuf_tiles, st.sources, st.weight_sources, st.prefix_sources, st.ops, st.op_histogram,
     );
 
     let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
@@ -10070,7 +9699,6 @@ fn dump_wavefront_mega(
             for cap in caps {
                 let lwd = match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
-                    decode_asn_check,
                     inferred,
                     decode_bounds,
                     model,
@@ -10133,7 +9761,6 @@ fn dump_wavefront_mega(
             for seqs in scratchy_subtile::sdsc_abstract::PagedKvPool::BATCH_RUNGS {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
-                    decode_asn_check,
                     inferred,
                     decode_bounds,
                     model,
@@ -10424,7 +10051,6 @@ fn dump_wavefront_mega(
         for pl in prefill_rung_widths {
             let lowered = to_wavefront::lower_decode_to_wavefront(
                 fuf,
-                decode_asn_check,
                 inferred,
                 decode_bounds,
                 model,
@@ -10510,7 +10136,6 @@ fn dump_wavefront_mega(
         {
             match crate::to_wavefront::lower_decode_to_wavefront(
                 fuf,
-                decode_asn_check,
                 inferred,
                 decode_bounds,
                 model,
@@ -10579,7 +10204,6 @@ fn dump_wavefront_mega(
         let (_cb_decode_graph, mut cb_decode_groups): (String, GroupGraphs) =
             match crate::to_wavefront::lower_decode_to_wavefront(
                 fuf,
-                decode_asn_check,
                 inferred,
                 decode_bounds,
                 model,
@@ -11015,23 +10639,28 @@ fn dump_wavefront_mega(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Emit the full per-model module body: Weights struct + loader,
+/// one forward fn per workload tape_index, and a dispatching wrapper.
+///
+/// When `canonical_override` is `Some(ident)`, this variant is a
+/// shim for that canonical sibling — emit `pub type Weights =
+/// super::<ident>::Weights;` instead of a fresh struct, emit the
+/// variant-specific `load` + `fingerprint_matches` bodies
+/// (loaders differ per quant preset, fingerprints differ per
+/// tensor-suffix gate), and `pub use` the canonical's forward +
+/// forward_backbone + per-tape_index forward_m_<N> fns. rustc doesn't
+/// re-monomorphize `pub use` re-exports, so the canonical fn body
+/// is optimized ONCE regardless of how many variants share it.
 pub fn emit_model(
-    program: &Program,
-    model: &ModelParams,
-    fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
-    loops: &WorkloadLoops,
-    lib: &ImplementationLibrary,
+    sm: &crate::SolvedModel<'_>,
     manifest: &crate::weights_manifest::WeightsManifest,
-    // Shape inference for this arch — threaded only so the PD-wavefront
-    // macro-emission (`dump_wavefront_mega`) can resolve weight shapes;
-    // unused on the normal codegen path.
-    inferred: &crate::shape::Inferred,
     canonical_override: Option<&Ident>,
-    tp_world_size: u8,
     emit_fingerprint: bool,
 ) -> TokenStream {
+    let (program, model, fuf, sfufs) = (&sm.prog, sm.model, &sm.fuf, &sm.sfufs);
+    // Shape inference for this model — read by the tape lowerings (metal's front end, the spyre
+    // bundle) to resolve weight shapes.
+    let (inferred, tp_world_size) = (&sm.inferred, sm.tp_world_size);
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
     // (which already covers text-side encoders like ModernBERT)
@@ -11045,28 +10674,15 @@ pub fn emit_model(
     // TODO: Add target_profile parameter and dispatch based on backend
 
     if let Some(canonical) = canonical_override {
-        return emit_shim_model(
-            program,
-            fuf,
-            sfufs,
-            lib,
-            model,
-            manifest,
-            canonical,
-            tp_world_size,
-            emit_fingerprint,
-        );
+        return emit_shim_model(sm, manifest, canonical, emit_fingerprint);
     }
-    // The struct emitter, callable twice: once with instruction
-    // selection's accessors and — for a tape-scheduled arch, after
-    // the front-end swap has produced them — once with the tape's.
-    let emit_struct = |tape_accs: Option<&[WeightAccessor]>| {
+    // The struct emitter, over one accessor set — metal calls it twice: before the front-end
+    // swap (no accessor), and with the tape's once the swap has produced them.
+    let emit_struct = |accessors: Vec<WeightAccessor>| {
         emit_weights_struct(
             program,
             fuf,
-            sfufs,
-            tape_accs,
-            lib,
+            accessors,
             model,
             manifest,
             WeightsEmitMode::Canonical,
@@ -11077,7 +10693,7 @@ pub fn emit_model(
     #[cfg(feature = "metal")]
     let mut tape_accessors_for_struct: Option<Vec<WeightAccessor>> = None;
     #[cfg(feature = "metal")]
-    let mut weights = emit_struct(None);
+    let mut weights = emit_struct(Vec::new());
     // THE MODEL'S WEIGHT BINDING, from the tape both backends lower.
     //
     // Instruction selection (cuda's solver) and metal's instruction-stream
@@ -11106,7 +10722,6 @@ pub fn emit_model(
                 // spyre), exactly as the bucket-folding lowering below.
                 crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
-                    None,
                     inferred,
                     &bounds,
                     model,
@@ -11148,7 +10763,8 @@ pub fn emit_model(
             model.source_stem,
             tw.as_ref().map(|t| t.accessors.len()).unwrap_or(0),
         );
-        let struct_tokens = emit_struct(tw.as_ref().map(|t| t.accessors.as_slice()));
+        let struct_tokens =
+            emit_struct(tw.as_ref().map(|t| t.accessors.clone()).unwrap_or_default());
         // The id → FIELD binding, emitted INTO THE SAME MODULE as the struct so
         // its arms can name `w.self_attn_q_proj[3]` directly. This is what the
         // worker's `"{disk}.weight"` lookup is replaced by; only generated code
@@ -11179,8 +10795,11 @@ pub fn emit_model(
         };
         quote! { #struct_tokens #bindings }
     };
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let weights = emit_struct(None);
+    #[cfg(feature = "cuda")]
+    let weights = match collect_accessors(program, fuf, sfufs, sm.library, model) {
+        Ok(accessors) => emit_struct(accessors),
+        Err(err) => err,
+    };
 
     // Group workload points by SFUF signature (sorted subgraph → impl).
     // Buckets with identical impl picks produce byte-identical fn
@@ -11191,11 +10810,6 @@ pub fn emit_model(
     // fn-pointer to) is preserved. Dedup runs over `(num_tokens,
     // sk_bucket)` 2-D points so models with `sk_buckets` declared get
     // the same compile-time win.
-    // Metal and spyre both lower from the shared tape; cuda is the instruction-selection path.
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    let tape_pilot_arch = true;
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let tape_pilot_arch = false;
     let bucket_points: Vec<crate::assignment::WorkloadPoint> =
         sfufs.per_workload.keys().copied().collect();
     let mut sfuf_to_canonical: HashMap<Vec<(u32, u32)>, crate::assignment::WorkloadPoint> =
@@ -11216,14 +10830,13 @@ pub fn emit_model(
     // gate has held across the fleet, the tape folding replaces the
     // solve as the bucket authority and the per-arch solve dies.
     #[cfg(feature = "metal")]
-    if tape_pilot_arch {
+    {
         let mut tape_to_canonical: HashMap<String, crate::assignment::WorkloadPoint> =
             HashMap::new();
         for (bi, wp) in bucket_points.iter().enumerate() {
             let bounds = bounds_for_wp(model, *wp, tp_world_size);
             let fp = match crate::to_wavefront::lower_decode_to_wavefront(
                 fuf,
-                None,
                 inferred,
                 &bounds,
                 model,
@@ -11276,7 +10889,6 @@ pub fn emit_model(
     // forward_backbone share the backbone slice; forward additionally
     // runs LM_HEAD; forward_backbone DtoD-copies the backbone-output
     // slot. No more pair of near-identical full slices per tape_index.
-    let mut arch_opcodes = ArchOpcodes::new();
     let mut canonical_lowered: BTreeMap<
         crate::assignment::WorkloadPoint,
         (
@@ -11292,23 +10904,6 @@ pub fn emit_model(
             crate::weight_vocab::SlotMap,
         ),
     > = BTreeMap::new();
-    // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
-    // AllGather (tp>1), not one of the post-Embed `MmEmbedSplice` nodes
-    // that `tp_lowering::insert_mm_splices` appends. Those sit at fuf-
-    // array-tail but semantically belong near the Embed; walking past
-    // them with `last_non_splice_node` recovers the real terminal.
-    let last_node_id = last_non_splice_node(fuf)
-        .expect("non-empty FUF expected")
-        .id;
-    let layout = backbone_layout(fuf, program);
-    // For encoder layouts (text-side encoders like ModernBERT AND
-    // every `#[vision_forward]` body) the FUF's terminal IS the
-    // backbone output; decoder layouts carry the lm_head Gemm's
-    // hidden-state input as the backbone output.
-    let backbone_out = match layout {
-        BackboneLayout::Decoder { backbone_out } => backbone_out,
-        BackboneLayout::Encoder => (last_node_id, 0),
-    };
     // M2b step 3: a tape-scheduled pilot arch never runs the metal
     // instruction-selection lowering — no colored_slot_map, no
     // lower_bucket, no fan_out. The canonical tuple starts as an
@@ -11316,122 +10911,134 @@ pub fn emit_model(
     // field from the shared tape (a pilot whose swap then refuses
     // panics loudly there — an empty stream cannot ship silently
     // because the bucket table still reads these fields).
+    #[cfg(any(feature = "metal", feature = "spyre"))]
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
             continue;
         }
-        if tape_pilot_arch {
-            canonical_lowered.insert(
-                *wp,
-                (
-                    CanonicalLowered {
-                        backbone: crate::interpreter_codegen::LoweredBucket {
-                            instances: Vec::new(),
-                            weight_slots: Vec::new(),
-                            barriers: Vec::new(),
-                        },
-                        lm_head: crate::interpreter_codegen::LoweredBucket {
-                            instances: Vec::new(),
-                            weight_slots: Vec::new(),
-                            barriers: Vec::new(),
-                        },
-                    },
-                    0,
-                    0,
-                    0,
-                    crate::weight_vocab::SlotMap::new(),
-                ),
-            );
-            continue;
-        }
-        let sfuf = &sfufs.per_workload[wp];
-        let loop_ir = loops
-            .per_workload
-            .get(wp)
-            .expect("schedule populated every key");
-        let bounds = bounds_for_wp(model, *wp, tp_world_size);
-        // Decoder mode skips the terminal subgraph in the backbone
-        // lowering and emits it as a separate LM_HEAD slice. Encoder
-        // mode lowers the entire pipeline as the backbone (no split).
-        let skip_subgraph = match layout {
-            BackboneLayout::Decoder { .. } => Some(
-                sfuf.subgraph_of(last_node_id)
-                    .expect("terminal tile must be in a subgraph"),
-            ),
-            BackboneLayout::Encoder => None,
-        };
-
-        // Protect the backbone output (`take_owned` reads it). For
-        // decoder we additionally protect the terminal slot so the
-        // backbone's drop pass leaves it free for lm_head to write.
-        let mut protected_bb: HashSet<(TileId, u8)> = HashSet::new();
-        protected_bb.insert(backbone_out);
-        if matches!(layout, BackboneLayout::Decoder { .. }) {
-            protected_bb.insert((last_node_id, 0));
-        }
-
-        // Per-tape_index colored slot map. Computed once and shared
-        // between backbone lowering and the lm_head fan_out so they
-        // agree on slot indices.
-        let slots = crate::interpreter_codegen::colored_slot_map(
-            fuf,
-            sfuf,
-            loop_ir,
-            lib,
-            None,
-            &protected_bb,
-        );
-        let backbone_slot = slots.of(backbone_out.0, backbone_out.1);
-        // In encoder mode `take_owned` of the backbone-output slot is
-        // also the terminal — the same slot index plays both roles.
-        let terminal_slot = match layout {
-            BackboneLayout::Decoder { .. } => slots.of(last_node_id, 0),
-            BackboneLayout::Encoder => backbone_slot,
-        };
-        let num_slots = slots.total();
-
-        // Decoder: skip the terminal subgraph so it emits as a
-        // separate lm_head slice. Encoder (text encoders OR vision
-        // bodies): pass `None` so the whole FUF lowers as backbone.
-        let lowered_bb = lower_bucket(
-            fuf,
-            sfuf,
-            loop_ir,
-            program,
-            model,
-            lib,
-            &bounds,
-            skip_subgraph,
-            &protected_bb,
-            &mut arch_opcodes,
-            &slots,
-        );
-
-        // LM_HEAD — only emitted in decoder mode. One row, computed
-        // by directly invoking the terminal subgraph's `fan_out`
-        // against the same slot map. Encoder mode (text encoders OR
-        // vision bodies) emits an empty slice — the whole pipeline
-        // already ran in the backbone.
-        let lowered_lm = match layout {
-            BackboneLayout::Decoder { .. } => {
-                let terminal_sg =
-                    skip_subgraph.expect("decoder layout always has a terminal subgraph");
-                let term_imp_id = sfuf
-                    .impl_of(terminal_sg)
-                    .expect("terminal subgraph has an Impl assignment");
-                let term_imp = lib.get(term_imp_id);
-                if !term_imp.emits_host_instruction() {
-                    // Claim-only terminal (e.g. spyre's `ktir_gemm` lm_head):
-                    // its real lowering is the embedded bundle, not a host
-                    // `Instruction`. The host-interpreter lm_head slice is not
-                    // emitted for such a target, so produce an empty bucket
-                    // (mirrors `lower_bucket`'s skip of claim-only impls).
-                    crate::interpreter_codegen::LoweredBucket {
+        canonical_lowered.insert(
+            *wp,
+            (
+                CanonicalLowered {
+                    backbone: crate::interpreter_codegen::LoweredBucket {
                         instances: Vec::new(),
-                        barriers: Vec::new(),
                         weight_slots: Vec::new(),
-                    }
-                } else {
+                        barriers: Vec::new(),
+                    },
+                    lm_head: crate::interpreter_codegen::LoweredBucket {
+                        instances: Vec::new(),
+                        weight_slots: Vec::new(),
+                        barriers: Vec::new(),
+                    },
+                },
+                0,
+                0,
+                0,
+                crate::weight_vocab::SlotMap::new(),
+            ),
+        );
+    }
+    let layout = backbone_layout(fuf, program);
+    // Instruction selection's lowering, per canonical: the colored slot map, the backbone
+    // stream, and the lm_head terminal's own fan-out.
+    #[cfg(feature = "cuda")]
+    {
+        let (lib, loops) = (sm.library, &sm.loops);
+        let mut arch_opcodes = ArchOpcodes::new();
+        // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
+        // AllGather (tp>1), not one of the post-Embed `MmEmbedSplice` nodes
+        // that `tp_lowering::insert_mm_splices` appends. Those sit at fuf-
+        // array-tail but semantically belong near the Embed; walking past
+        // them with `last_non_splice_node` recovers the real terminal.
+        let last_node_id = last_non_splice_node(fuf)
+            .expect("non-empty FUF expected")
+            .id;
+        // For encoder layouts (text-side encoders like ModernBERT AND
+        // every `#[vision_forward]` body) the FUF's terminal IS the
+        // backbone output; decoder layouts carry the lm_head Gemm's
+        // hidden-state input as the backbone output.
+        let backbone_out = lm_head_input(fuf, program).unwrap_or((last_node_id, 0));
+        for (i, wp) in bucket_points.iter().enumerate() {
+            if bucket_canonical[i] != *wp {
+                continue;
+            }
+            let sfuf = &sfufs.per_workload[wp];
+            let loop_ir = loops
+                .per_workload
+                .get(wp)
+                .expect("schedule populated every key");
+            let bounds = bounds_for_wp(model, *wp, tp_world_size);
+            // Decoder mode skips the terminal subgraph in the backbone
+            // lowering and emits it as a separate LM_HEAD slice. Encoder
+            // mode lowers the entire pipeline as the backbone (no split).
+            let skip_subgraph = match layout {
+                BackboneLayout::Decoder => Some(
+                    sfuf.subgraph_of(last_node_id)
+                        .expect("terminal tile must be in a subgraph"),
+                ),
+                BackboneLayout::Encoder => None,
+            };
+
+            // Protect the backbone output (`take_owned` reads it). For
+            // decoder we additionally protect the terminal slot so the
+            // backbone's drop pass leaves it free for lm_head to write.
+            let mut protected_bb: std::collections::HashSet<(TileId, u8)> =
+                std::collections::HashSet::new();
+            protected_bb.insert(backbone_out);
+            if matches!(layout, BackboneLayout::Decoder) {
+                protected_bb.insert((last_node_id, 0));
+            }
+
+            // Per-tape_index colored slot map. Computed once and shared
+            // between backbone lowering and the lm_head fan_out so they
+            // agree on slot indices.
+            let slots = crate::interpreter_codegen::colored_slot_map(
+                fuf,
+                sfuf,
+                loop_ir,
+                lib,
+                None,
+                &protected_bb,
+            );
+            let backbone_slot = slots.of(backbone_out.0, backbone_out.1);
+            // In encoder mode `take_owned` of the backbone-output slot is
+            // also the terminal — the same slot index plays both roles.
+            let terminal_slot = match layout {
+                BackboneLayout::Decoder => slots.of(last_node_id, 0),
+                BackboneLayout::Encoder => backbone_slot,
+            };
+            let num_slots = slots.total();
+
+            // Decoder: skip the terminal subgraph so it emits as a
+            // separate lm_head slice. Encoder (text encoders OR vision
+            // bodies): pass `None` so the whole FUF lowers as backbone.
+            let lowered_bb = lower_bucket(
+                fuf,
+                sfuf,
+                loop_ir,
+                program,
+                model,
+                lib,
+                &bounds,
+                skip_subgraph,
+                &protected_bb,
+                &mut arch_opcodes,
+                &slots,
+            );
+
+            // LM_HEAD — only emitted in decoder mode. One row, computed
+            // by directly invoking the terminal subgraph's `fan_out`
+            // against the same slot map. Encoder mode (text encoders OR
+            // vision bodies) emits an empty slice — the whole pipeline
+            // already ran in the backbone.
+            let lowered_lm = match layout {
+                BackboneLayout::Decoder => {
+                    let terminal_sg =
+                        skip_subgraph.expect("decoder layout always has a terminal subgraph");
+                    let term_imp_id = sfuf
+                        .impl_of(terminal_sg)
+                        .expect("terminal subgraph has an Impl assignment");
+                    let term_imp = lib.get(term_imp_id);
                     let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
                     let term_match = crate::impl_lib::MatchInfo {
                         claimed_tiles: term_claimed.clone(),
@@ -11473,95 +11080,56 @@ pub fn emit_model(
                         weight_slots: term_weight_slots,
                     }
                 }
-            }
-            BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
-                instances: Vec::new(),
-                barriers: Vec::new(),
-                weight_slots: Vec::new(),
-            },
-        };
-
-        canonical_lowered.insert(
-            *wp,
-            (
-                CanonicalLowered {
-                    backbone: lowered_bb,
-                    lm_head: lowered_lm,
+                BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
+                    instances: Vec::new(),
+                    barriers: Vec::new(),
+                    weight_slots: Vec::new(),
                 },
-                num_slots,
-                backbone_slot,
-                terminal_slot,
-                slots,
-            ),
-        );
-    }
+            };
 
-    // Layer-template detection: collapse the contiguous repeating
-    // sub-sequence of the slice (the per-layer transformer body)
-    // into one `Instruction::Loop(N, body_len)` row + one
-    // iteration's body. Fused boundary effects (e.g., FusedAddRmsNorm
-    // absorbing layer L's final add into layer L+1's first norm)
-    // leave layer 0 / the last layer structurally distinct, so the
-    // detection picks the largest CONTIGUOUS run that genuinely
-    // repeats — middle layers — and keeps the boundary residues as
-    // straight-line code in prelude/suffix.
-    // Pre-attention chain synthesis (compiler-driven). Detect the
-    // contiguous `(FusedAddRmsNorm, AffineQmm × 3, RopeAppend)` chain
-    // that spans the K→K+1 layer boundary in the unrolled per-claim
-    // op list and replace each match with one `SynthPreAttn` op
-    // backed by the synthesized MSL kernel emitted via
-    // `emit_synthesized_kernel_sources_override`. Must run BEFORE
-    // `apply_loop_compression` — once the loop body collapses we
-    // can't see the boundary chain anymore.
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let synth_t_act: Option<&'static str> = {
-        use crate::quantization::QuantMethod;
-        match model.quantization.as_ref().map(|q| &q.method) {
-            Some(QuantMethod::Affine { bits: 4, .. }) => Some("bfloat"),
-            _ => None,
+            canonical_lowered.insert(
+                *wp,
+                (
+                    CanonicalLowered {
+                        backbone: lowered_bb,
+                        lm_head: lowered_lm,
+                    },
+                    num_slots,
+                    backbone_slot,
+                    terminal_slot,
+                    slots,
+                ),
+            );
         }
-    };
-    // Skip the synth fusion at bucket_m >= 2: the synth's
-    // `(M, num_heads_total)` threadgroup grid makes its AddRmsNorm
-    // phase redundantly process the residual+delta read once per
-    // (token, head) — work that scales as M*num_heads instead of M.
-    // At M=1 the redundancy is cheap relative to the saved qmv
-    // dispatch overhead and the synth wins. At M>=2 the redundant
-    // device reads dominate; the unfused chain (one norm dispatch
-    // per token + per-head qmv) is strictly cheaper.
-    //
-    // TODO: replace this hardcoded threshold with a solver-driven
-    // pick — `SynthPreAttnImpl::cost_us` vs `(FusedAddRmsNorm + 3
-    // AffineQmm)::cost_us` from the swept CSV.
-    // ⛔ CUDA ONLY. This searches the instruction-SELECTION stream for a repeating run, because
-    // that stream has no tape to read the loop off. A tape-scheduled target HAS one — the shared
-    // re-roll already found it — and its rolled stream replaces `cl` further down, so running
-    // this under metal/spyre re-derived a fact that was then thrown away. Two searches over two
-    // representations, free to disagree, is the arrangement this line of work exists to remove.
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    for (wp, (cl, _, _, _, _)) in canonical_lowered.iter_mut() {
-        let _ = synth_t_act;
-        let _ = wp;
-        crate::interpreter_codegen::apply_loop_compression(
-            &arch_opcodes,
-            &mut cl.backbone,
-            "layer",
-            crate::interpreter_codegen::LoopSource::LocalSearch,
-            &model.source_stem,
-        );
-        crate::interpreter_codegen::apply_loop_compression(
-            &arch_opcodes,
-            &mut cl.lm_head,
-            "layer",
-            crate::interpreter_codegen::LoopSource::LocalSearch,
-            &model.source_stem,
-        );
+
+        // Layer-template detection: collapse the contiguous repeating
+        // sub-sequence of the slice (the per-layer transformer body)
+        // into one `Instruction::Loop(N, body_len)` row + one
+        // iteration's body. Fused boundary effects (e.g., FusedAddRmsNorm
+        // absorbing layer L's final add into layer L+1's first norm)
+        // leave layer 0 / the last layer structurally distinct, so the
+        // detection picks the largest CONTIGUOUS run that genuinely
+        // repeats — middle layers — and keeps the boundary residues as
+        // straight-line code in prelude/suffix.
+        // This searches the instruction-SELECTION stream for a repeating run, because that stream
+        // has no tape to read the loop off; a tape-scheduled target's shared re-roll already found it.
+        for (cl, _, _, _, _) in canonical_lowered.values_mut() {
+            crate::interpreter_codegen::apply_loop_compression(
+                &arch_opcodes,
+                &mut cl.backbone,
+                "layer",
+            );
+            crate::interpreter_codegen::apply_loop_compression(
+                &arch_opcodes,
+                &mut cl.lm_head,
+                "layer",
+            );
+        }
     }
 
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row short instead of
     // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
-    let has_bias_add = program_has_bias_add(program);
     #[cfg(feature = "metal")]
     let mut resolved_metal_consts: Option<
         scratchy_target_metal::tape::model_consts::MetalModelConsts,
@@ -11569,8 +11137,6 @@ pub fn emit_model(
     let canonical_params_impl = emit_canonical_params_impl(
         model,
         tp_world_size,
-        has_bias_add,
-        program_has_gelu(program),
         fuf_uses_rotary(fuf),
         fuf_uses_kv_cache(fuf),
         #[cfg(feature = "metal")]
@@ -11592,7 +11158,6 @@ pub fn emit_model(
         type __I = ::scratchy_forward_compiler::Instruction;
         use ::scratchy_forward_compiler::Instruction::*;
     };
-    let shapes_by_name = arch_opcodes.shapes_by_name();
 
     // Static slices: BACKBONE_M_<wp> + LM_HEAD_M_<wp> per CANONICAL
     // tape_index only. Non-canonical buckets share their canonical
@@ -11607,12 +11172,10 @@ pub fn emit_model(
         let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
         static_slices.push(emit_bucket_static_slice(
             &backbone_static_ident,
-            &shapes_by_name,
             &lowered.backbone.instances,
         ));
         static_slices.push(emit_bucket_static_slice(
             &lm_head_static_ident,
-            &shapes_by_name,
             &lowered.lm_head.instances,
         ));
         // Metal MTL4 barrier flags, computed at FUF/SlotMap level
@@ -11747,7 +11310,7 @@ pub fn emit_model(
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, None, inferred, &bounds, model, prefix, m as u32,
+            fuf, inferred, &bounds, model, prefix, m as u32,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
@@ -11869,46 +11432,36 @@ pub fn emit_model(
         }
     };
     // M2b: for a tape-scheduled arch the Weights struct is emitted
-    // from the TAPE's accessor set (asserted to produce the same
-    // struct as instruction selection's inside `emit_weights_struct`).
-    // Re-emitted HERE because the tape accessors only exist after the
-    // front-end swap has lowered the canonical.
+    // from the TAPE's accessor set. Re-emitted HERE because the tape
+    // accessors only exist after the front-end swap has lowered the
+    // canonical.
     #[cfg(feature = "metal")]
-    if let Some(tape_accs) = tape_accessors_for_struct.as_ref() {
-        weights = emit_struct(Some(tape_accs));
+    if let Some(tape_accs) = tape_accessors_for_struct {
+        weights = emit_struct(tape_accs);
     }
 
     if cfg!(feature = "spyre") {
-        match sfufs.get_nt(1) {
-            Some(decode_asn) => {
-                // The canonical the decode (num_tokens=1) point folded into,
-                // and its `2*ci` backbone bucket id.
-                let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
-                match decode_wp {
-                    Some(decode_wp) => {
-                        let idx = bucket_points.iter().position(|w| *w == decode_wp).unwrap();
-                        let canonical = bucket_canonical[idx];
-                        let bb_bucket_id = canonical_to_bucket_id[&canonical];
-                        let (cl, ..) = &canonical_lowered[&canonical];
-                        let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
-                        dump_wavefront_mega(
-                            program,
-                            model,
-                            fuf,
-                            decode_asn,
-                            inferred,
-                            &decode_bounds,
-                            &cl.backbone.weight_slots,
-                            &cl.lm_head.weight_slots,
-                            bb_bucket_id,
-                            &mut ktir_bundle_const,
-                        );
-                    }
-                    None => eprintln!(
-                        "[wavefront] {}: no decode (num_tokens=1) workload point",
-                        model.source_stem
-                    ),
-                }
+        // The canonical the decode (num_tokens=1) point folded into,
+        // and its `2*ci` backbone bucket id.
+        let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
+        match decode_wp {
+            Some(decode_wp) => {
+                let idx = bucket_points.iter().position(|w| *w == decode_wp).unwrap();
+                let canonical = bucket_canonical[idx];
+                let bb_bucket_id = canonical_to_bucket_id[&canonical];
+                let (cl, ..) = &canonical_lowered[&canonical];
+                let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
+                dump_wavefront_mega(
+                    program,
+                    model,
+                    fuf,
+                    inferred,
+                    &decode_bounds,
+                    &cl.backbone.weight_slots,
+                    &cl.lm_head.weight_slots,
+                    bb_bucket_id,
+                    &mut ktir_bundle_const,
+                );
             }
             None => eprintln!(
                 "[wavefront] {}: no decode (num_tokens=1) workload point",
@@ -12258,7 +11811,7 @@ pub fn emit_model(
     // 0. Cuda builds skip the constant entirely.
     let vocab_size_lit = {
         let width = match layout {
-            BackboneLayout::Decoder { .. } => model.bounds.get("vocab_size").copied().unwrap_or(0),
+            BackboneLayout::Decoder => model.bounds.get("vocab_size").copied().unwrap_or(0),
             BackboneLayout::Encoder => model.bounds.get("hidden_size").copied().unwrap_or(0),
         };
         proc_macro2::Literal::u64_unsuffixed(width)
@@ -12324,6 +11877,12 @@ pub fn emit_model(
     // vs broadcast `[n]` positions are disambiguated at runtime by
     // `ctx.positions` numel (the worker uploads `[3, n]` only when image
     // tokens are present).
+    // How the forward plays the baked tape (`GpuDevice::metal_tape_play`) — a metal fact, emitted
+    // only by a metal expansion like the tape statics it selects between.
+    #[cfg(feature = "metal")]
+    let metal_play = quote! { play: device.metal_tape_play, };
+    #[cfg(not(feature = "metal"))]
+    let metal_play = proc_macro2::TokenStream::new();
     let mrope_runtime_block: proc_macro2::TokenStream = match model.mrope_section {
         Some([t, h, w]) => {
             let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
@@ -13049,6 +12608,7 @@ pub fn emit_model(
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
+                #metal_play
             };
 
             // ── Run forward + copy logits out ─────────────────────
@@ -13368,6 +12928,7 @@ pub fn emit_model(
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
+                #metal_play
             };
 
             // Pre-pick the bucket from iter-0 num_tokens. The chain
@@ -13456,7 +13017,7 @@ pub fn emit_model(
     // backbone slot. Both shapes are dispatched via the same
     // `FORWARD_TABLE` row.
     let forward_backbone_fn = match layout {
-        BackboneLayout::Decoder { .. } => quote! {
+        BackboneLayout::Decoder => quote! {
             /// Backbone-only dispatch (no lm_head). Returns a fresh
             /// OwnedTensor (memcpy of the backbone tile).
             #[cfg(feature = "cuda")]
@@ -13624,30 +13185,33 @@ fn _unused(_: OpKind) {}
 ///   re-emit. rustc doesn't re-monomorphize `pub use` paths, so
 ///   the canonical's release-optimized forward is called directly
 ///   through this module without additional LLVM work.
-#[allow(clippy::too_many_arguments)]
 fn emit_shim_model(
-    program: &Program,
-    fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
-    lib: &ImplementationLibrary,
-    model: &ModelParams,
+    sm: &crate::SolvedModel<'_>,
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical: &Ident,
-    tp_world_size: u8,
     emit_fingerprint: bool,
 ) -> TokenStream {
-    let weights = emit_weights_struct(
-        program,
-        fuf,
-        sfufs,
-        None,
-        lib,
-        model,
-        manifest,
-        WeightsEmitMode::Shim { canonical },
-        tp_world_size,
-        emit_fingerprint,
-    );
+    let (program, model, fuf) = (&sm.prog, sm.model, &sm.fuf);
+    let tp_world_size = sm.tp_world_size;
+    #[cfg(feature = "cuda")]
+    let accessors = collect_accessors(program, fuf, &sm.sfufs, sm.library, model);
+    // A tape-scheduled shim declares no accessor of its own: its tape is the canonical's.
+    #[cfg(not(feature = "cuda"))]
+    let accessors = Ok(Vec::new());
+    let shim = WeightsEmitMode::Shim { canonical };
+    let weights = match accessors {
+        Ok(a) => emit_weights_struct(
+            program,
+            fuf,
+            a,
+            model,
+            manifest,
+            shim,
+            tp_world_size,
+            emit_fingerprint,
+        ),
+        Err(err) => err,
+    };
 
     // Per-tape_index fn surfaces are gone — dispatch lives on the
     // canonical's `FORWARD_TABLE` + `find_bucket`. Re-export the
@@ -13655,7 +13219,6 @@ fn emit_shim_model(
     // canonical's `METAL_BUCKETS` static + `metal_pool()` constructor
     // — variant-specific differences (quant format, fingerprint) are
     // load-time only; static tape_index plans are byte-identical.
-    let _ = sfufs;
     quote! {
         #weights
 
@@ -13742,8 +13305,6 @@ mod tests {
             &m,
             1,
             false,
-            false,
-            false,
             true,
             #[cfg(feature = "metal")]
             &mut None,
@@ -13779,8 +13340,6 @@ mod tests {
         let ts = emit_canonical_params_impl(
             &m,
             2,
-            false,
-            false,
             false,
             true,
             #[cfg(feature = "metal")]
@@ -13829,8 +13388,6 @@ mod tests {
         let ts = emit_canonical_params_impl(
             &m,
             8,
-            false,
-            false,
             false,
             true,
             #[cfg(feature = "metal")]
@@ -14652,13 +14209,11 @@ mod fingerprint_tests {
             ],
         };
         match backbone_layout(&fuf, &program) {
-            BackboneLayout::Decoder { backbone_out } => {
-                assert_eq!(
-                    backbone_out,
-                    (TileId(0), 0),
-                    "decoder backbone-out must be the lm_head Gemm's first tile input",
-                );
-            }
+            BackboneLayout::Decoder => assert_eq!(
+                lm_head_input(&fuf, &program),
+                Some((TileId(0), 0)),
+                "decoder backbone-out must be the lm_head Gemm's first tile input",
+            ),
             BackboneLayout::Encoder => panic!("expected Decoder layout, got Encoder"),
         }
     }
@@ -14735,9 +14290,9 @@ mod fingerprint_tests {
             }
             let fuf = Fuf { nodes };
             match backbone_layout(&fuf, &program) {
-                BackboneLayout::Decoder { backbone_out } => assert_eq!(
-                    backbone_out,
-                    (TileId(0), 0),
+                BackboneLayout::Decoder => assert_eq!(
+                    lm_head_input(&fuf, &program),
+                    Some((TileId(0), 0)),
                     "{name}: backbone-out must be the lm_head Gemm's tile input",
                 ),
                 BackboneLayout::Encoder => {
@@ -14841,7 +14396,9 @@ mod fingerprint_tests {
             ],
         };
         match backbone_layout(&fuf, &program) {
-            BackboneLayout::Decoder { backbone_out } => assert_eq!(backbone_out, (TileId(0), 0)),
+            BackboneLayout::Decoder => {
+                assert_eq!(lm_head_input(&fuf, &program), Some((TileId(0), 0)))
+            }
             BackboneLayout::Encoder => panic!("expected Decoder past AllGather"),
         }
     }

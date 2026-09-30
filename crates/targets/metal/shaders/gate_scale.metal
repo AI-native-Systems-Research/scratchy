@@ -19,12 +19,39 @@
 // Sigmoid kept in float so the half/bfloat exp() tail stays representable.
 
 #include <metal_stdlib>
+#include "megakernel/mk_common.h"
 
 using namespace metal;
 
-constant uint GATE_SCALE_N [[function_constant(0)]];
-constant uint GATE_SCALE_COLS [[function_constant(1)]];
+#define GATE_SCALE_CONSTS(X) X(uint, n, GATE_SCALE_N, 0) X(uint, cols, GATE_SCALE_COLS, 1)
+#ifndef MK_BODIES_ONLY
+GATE_SCALE_CONSTS(MK_FC_DECLARE)
+struct GateScaleFc {
+  GATE_SCALE_CONSTS(MK_FC_ACCESSOR)
+};
+#endif
 
+// Body shared by the dispatch kernels and the megakernel adapter: element `gid` (< n).
+template <typename T, typename C, typename OP, typename IP>
+METAL_FUNC void gate_scale_body(OP out, IP routed, IP shared_y, IP g, uint gid) {
+  uint row = gid / C::cols();
+  float r = float(routed[gid]);
+  float s = float(shared_y[gid]);
+  float gv = float(g[row]);
+  float sig_g = 1.0f / (1.0f + exp(-gv));
+  out[gid] = static_cast<T>(r + s * sig_g);
+}
+
+// Megakernel adapter: out (0), routed (1), shared_y (2) and g (3) device-coherent.
+template <typename T, typename C>
+MK_FUNC void mk_gate_scale(thread const MkStep& s, MkLane l, threadgroup uchar*) {
+  const uint gid = mk_thread_in_grid(l).x;
+  if (!l.live || gid >= C::n()) return;
+  gate_scale_body<T, C>((mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1], (mk_cptr<T>)s.addr[2],
+                        (mk_cptr<T>)s.addr[3], gid);
+}
+
+#ifndef MK_BODIES_ONLY
 template <typename T>
 [[kernel]] void gate_scale(
     device       T* out      [[buffer(0)]],
@@ -36,12 +63,7 @@ template <typename T>
   if (gid >= GATE_SCALE_N) {
     return;
   }
-  uint row = gid / GATE_SCALE_COLS;
-  float r = float(routed[gid]);
-  float s = float(shared_y[gid]);
-  float gv = float(g[row]);
-  float sig_g = 1.0f / (1.0f + exp(-gv));
-  out[gid] = static_cast<T>(r + s * sig_g);
+  gate_scale_body<T, GateScaleFc>(out, routed, shared_y, g, gid);
 }
 
 #define INST_GATE_SCALE(dtype_tag, mtl_type)                              \
@@ -52,6 +74,10 @@ template <typename T>
       const device mtl_type* shared_y [[buffer(2)]],                      \
       const device mtl_type* g        [[buffer(3)]],                      \
       uint gid [[thread_position_in_grid]]);
+#else
+#define INST_GATE_SCALE(dtype_tag, mtl_type) \
+  MK_TAIL(gate_scale_##dtype_tag, 0xf, (mk_gate_scale<mtl_type, MK_C>), GATE_SCALE_CONSTS)
+#endif
 
 INST_GATE_SCALE(f16,  half)
 INST_GATE_SCALE(bf16, bfloat)
