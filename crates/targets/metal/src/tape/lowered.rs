@@ -228,6 +228,13 @@ pub enum KernelId {
     /// activations x the offset-8 4-bit codes.
     /// `affine_qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<tn>_nsg_<nsg>`.
     AffineQmmW4a8,
+    /// The MoE grouped W4A8 pre-pass over the padded rows (sentinel rows
+    /// skipped). `affine_gather_w4a8_quant_<dtype>`.
+    AffineGatherW4a8Quant,
+    /// The MoE grouped expert GEMM on the int8 lane: each 32-row tile's
+    /// expert slab x its int8 rows.
+    /// `affine_gather_qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<tn>_nsg_<nsg>`.
+    AffineGatherQmmW4a8,
     /// NVFP4 int4 decode matvec (generic). Maps to
     /// `nvfp4_qmv_<dtype>_s_<scale>_gs_16_b_4_batch_0` in the
     /// `quantized_qmv.metallib` (nvfp4 kernels share that library with
@@ -399,6 +406,11 @@ pub enum KernelId {
     /// x @ 2, fill @ 3, pos @ 4, indices_pad @ 5, x_pad @ 6)`. Symbol
     /// `moe_group_scatter_{float16,bfloat16}`.
     MoeGroupScatter,
+    /// `MoeGroupScatter` for the W4A8 grouped GEMM: scatters the tokens'
+    /// int8 rows + per-64-chunk scales (quantized once, before the scatter)
+    /// into the padded layout. Also `MG_MPAD_MAX` (2). Symbol
+    /// `moe_group_scatter_q8`.
+    MoeGroupScatterQ8,
     /// MoE grouped-GEMM prefill: un-scatter the padded down output back
     /// to token order — `out[i,:] = src[pos[i],:]`. Function constant
     /// `MG_W` (5). Bindings `(src @ 0, pos @ 1, out @ 2)`. Symbol
@@ -529,6 +541,8 @@ impl KernelId {
             | Self::AffineQmmSmallM
             | Self::AffineW4a8Quant
             | Self::AffineQmmW4a8
+            | Self::AffineGatherW4a8Quant
+            | Self::AffineGatherQmmW4a8
             | Self::Nvfp4Qmv
             | Self::Nvfp4QmmT
             | Self::Nvfp4QmmTNax
@@ -555,6 +569,7 @@ impl KernelId {
             | Self::MoeGroupOffsets
             | Self::MoeGroupInit
             | Self::MoeGroupScatter
+            | Self::MoeGroupScatterQ8
             | Self::MoeGroupGather
             | Self::MoePerExpertScale
             | Self::VisionLayerNorm

@@ -160,6 +160,51 @@ INST_MG_SCATTER(float16, half)
 INST_MG_SCATTER(bfloat16, bfloat)
 INST_MG_SCATTER(float32, float)
 
+// ── moe_group_scatter_q8 ───────────────────────────────────────────
+// `moe_group_scatter` for the W4A8 grouped GEMM: places each pair's
+// token row already quantized (`affine_w4a8_quant` layout: int8 xq[rows][K]
+// then float2 qa[rows][K/64]) at its padded slot, so the tokens are
+// quantized once, not once per expert copy. x holds the bucket's
+// MG_M / MG_TOP_K token rows; x_pad holds MG_MPAD_MAX padded rows.
+kernel void moe_group_scatter_q8(
+    const device uint* topk_inds [[buffer(0)]],
+    const device uint* offset    [[buffer(1)]],
+    const device uchar* x        [[buffer(2)]],
+    device atomic_uint* fill     [[buffer(3)]],
+    device uint*       pos       [[buffer(4)]],
+    device uint*       indices_pad [[buffer(5)]],
+    device uchar*      x_pad     [[buffer(6)]],
+    uint2 tid  [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tgsz [[threads_per_threadgroup]]) {
+  const uint i = tgid.y;
+  if (i >= uint(MG_M)) return;
+  threadgroup uint p_shared;
+  if (tid.x == 0) {
+    uint e = topk_inds[i];
+    uint p = (e < uint(MG_NUM_EXPERTS))
+        ? offset[e] + atomic_fetch_add_explicit(&fill[e], 1u, memory_order_relaxed)
+        : 0u;
+    pos[i] = p;
+    indices_pad[p] = e;
+    p_shared = p;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint p = p_shared;
+  const uint token = i / uint(MG_TOP_K);
+  const uint K = uint(MG_K), KC = K / 64, rows = uint(MG_M) / uint(MG_TOP_K);
+  const device uint4* src = (const device uint4*)(x + size_t(token) * K);
+  device uint4* dst = (device uint4*)(x_pad + size_t(p) * K);
+  for (uint d = tid.x; d < K / 16; d += tgsz.x) {
+    dst[d] = src[d];
+  }
+  const device float2* qa = (const device float2*)(x + size_t(rows) * K) + size_t(token) * KC;
+  device float2* qa_pad = (device float2*)(x_pad + size_t(uint(MG_MPAD_MAX)) * K) + size_t(p) * KC;
+  for (uint c = tid.x; c < KC; c += tgsz.x) {
+    qa_pad[c] = qa[c];
+  }
+}
+
 // ── moe_group_gather (un-scatter) ──────────────────────────────────
 // Restores token order after the grouped GEMM:
 //   out[i, :] = src[pos[i], :]   for i in [0, MG_M)

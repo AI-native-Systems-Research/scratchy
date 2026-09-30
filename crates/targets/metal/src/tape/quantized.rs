@@ -613,16 +613,37 @@ pub fn w4a8_scratch_bytes(m: u32, k: u32) -> u32 {
     m * k + m * (k / 64) * 8
 }
 
-/// `affine_w4a8_quant_<dtype>`.
-pub fn w4a8_quant_static_name(dtype: DequantDtype) -> &'static str {
-    match dtype {
-        DequantDtype::F16 => "affine_w4a8_quant_f16",
-        DequantDtype::Bf16 => "affine_w4a8_quant_bf16",
+/// Which rows a W4A8 pair runs over: a GEMM's own `M` rows, or the MoE
+/// grouped layout's padded rows (each 32-row tile one expert's, sentinel
+/// rows and tiles skipped — the `affine_gather_*` kernels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum W4a8Rows {
+    Dense,
+    Grouped,
+}
+
+impl W4a8Rows {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Dense => "affine_",
+            Self::Grouped => "affine_gather_",
+        }
     }
 }
 
-/// `affine_qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<cols>_nsg_<simdgroups>`.
+/// `affine_[gather_]w4a8_quant_<dtype>`.
+pub fn w4a8_quant_static_name(rows: W4a8Rows, dtype: DequantDtype) -> &'static str {
+    match (rows, dtype) {
+        (W4a8Rows::Dense, DequantDtype::F16) => "affine_w4a8_quant_f16",
+        (W4a8Rows::Dense, DequantDtype::Bf16) => "affine_w4a8_quant_bf16",
+        (W4a8Rows::Grouped, DequantDtype::F16) => "affine_gather_w4a8_quant_f16",
+        (W4a8Rows::Grouped, DequantDtype::Bf16) => "affine_gather_w4a8_quant_bf16",
+    }
+}
+
+/// `affine_[gather_]qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<cols>_nsg_<simdgroups>`.
 pub fn qmm_w4a8_static_name(
+    rows: W4a8Rows,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
     group_size: u32,
@@ -630,18 +651,19 @@ pub fn qmm_w4a8_static_name(
 ) -> &'static str {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (DequantDtype, ScaleDtype, u32, W4a8Tile);
+    type Key = (W4a8Rows, DequantDtype, ScaleDtype, u32, W4a8Tile);
     static CACHE: OnceLock<Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
     let mut guard = CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("qmm_w4a8_static_name cache poisoned");
     guard
-        .entry((dtype, scale_dtype, group_size, tile))
+        .entry((rows, dtype, scale_dtype, group_size, tile))
         .or_insert_with(|| {
             Box::leak(
                 format!(
-                    "affine_qmm_w4a8_{}_s_{}_gs_{group_size}_tn_{}_nsg_{}",
+                    "{}qmm_w4a8_{}_s_{}_gs_{group_size}_tn_{}_nsg_{}",
+                    rows.prefix(),
                     dtype.symbol_infix(),
                     scale_dtype.symbol_infix(),
                     tile.cols(),

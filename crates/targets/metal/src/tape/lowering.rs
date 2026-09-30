@@ -67,10 +67,10 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 }
 use crate::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS,
-    W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
-    qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name, qmv_dispatch_shape,
-    qmv_kernel_static_name, small_m_kernel_static_name, splitk_reduce_kernel_static_name,
-    w4a8_quant_static_name, w4a8_scratch_bytes,
+    W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape,
+    qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name,
+    qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
+    splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -2553,7 +2553,7 @@ fn lower_one(
                     let quant = LoweredCommand {
                         kernel: KernelId::AffineW4a8Quant,
                         library: "quantized_qmm_nax",
-                        function: w4a8_quant_static_name(dtype),
+                        function: w4a8_quant_static_name(W4a8Rows::Dense, dtype),
                         constants: constants(),
                         dispatch: DispatchShape {
                             threadgroups: ((k_v / 64).div_ceil(16), bucket_m, 1),
@@ -2593,7 +2593,13 @@ fn lower_one(
                     let gemm = LoweredCommand {
                         kernel: KernelId::AffineQmmW4a8,
                         library: "quantized_qmm_nax",
-                        function: qmm_w4a8_static_name(dtype, scale_dtype, gs, tile),
+                        function: qmm_w4a8_static_name(
+                            W4a8Rows::Dense,
+                            dtype,
+                            scale_dtype,
+                            gs,
+                            tile,
+                        ),
                         constants: constants(),
                         dispatch: DispatchShape {
                             threadgroups: (n_v / tile.cols(), bucket_m / W4A8_TILE_ROWS, 1),
@@ -9021,21 +9027,89 @@ fn lower_gemma_moe(
                 },
             ],
         ));
+        // The grouped expert GEMMs run W4A8 on the matrix unit's int8 lane
+        // when the experts' codes are stored offset-8 and the shapes fit its
+        // tiles: every expert's run starts on a 64-row boundary, so each
+        // 32-row tile is one expert's.
+        let codes = p.codes.for_bits(p.bits);
+        let w4a8 = p.is_nax
+            && codes == super::kernel_constants::AffineCodes::Offset8
+            && matches!(p.group_size, 64 | 128)
+            && p.hidden.is_multiple_of(64)
+            && p.moe_inter.is_multiple_of(64)
+            && W4a8Tile::for_n(p.hidden).is_some()
+            && W4a8Tile::for_n(p.moe_inter).is_some()
+            && mpad_max.is_multiple_of(W4A8_TILE_ROWS);
+        // W4A8: the bucket's token rows are quantized once, into the
+        // `down_out` region (unused until G8), and scattered as int8 rows +
+        // scales into `x_pad` — not once per expert copy.
+        if w4a8 {
+            cmds.push(make_moe_command(
+                KernelId::AffineW4a8Quant,
+                "quantized_qmm_nax",
+                w4a8_quant_static_name(W4a8Rows::Dense, dtype),
+                vec![
+                    ConstantValue::int(0, p.hidden as i32),
+                    ConstantValue::int(2, p.bucket_m as i32),
+                ],
+                DispatchShape {
+                    threadgroups: ((p.hidden / 64).div_ceil(16), p.bucket_m, 1),
+                    threads_per_threadgroup: (128, 1, 1),
+                    m_scaling: Some(MScaling {
+                        seq_axis: None,
+                        axis: MScaleAxis::Y,
+                        bucket_m: bm,
+                    }),
+                },
+                vec![
+                    Binding::ArenaSlot {
+                        slot: p.expert_in_slot,
+                        binding_index: 0,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 1,
+                        byte_offset: layout.down_out,
+                    },
+                ],
+            ));
+        }
         // G3: scatter each real (token,expert) row to its padded slot
         //     (m-scaled over actual pairs).
+        let (scatter_kernel, scatter_symbol, scatter_src, scatter_threads) = if w4a8 {
+            (
+                KernelId::MoeGroupScatterQ8,
+                "moe_group_scatter_q8",
+                Binding::MoeScratch {
+                    binding_index: 2,
+                    byte_offset: layout.down_out,
+                },
+                (p.hidden / 16).min(256),
+            )
+        } else {
+            (
+                KernelId::MoeGroupScatter,
+                moe_group_scatter_symbol(elem_dtype),
+                Binding::ArenaSlot {
+                    slot: p.expert_in_slot,
+                    binding_index: 2,
+                },
+                p.hidden.min(256),
+            )
+        };
         cmds.push(make_moe_command(
-            KernelId::MoeGroupScatter,
+            scatter_kernel,
             "moe_group",
-            moe_group_scatter_symbol(elem_dtype),
+            scatter_symbol,
             vec![
                 ConstantValue::int(0, m_pairs as i32),
                 ConstantValue::int(1, p.num_experts as i32),
+                ConstantValue::int(2, mpad_max as i32),
                 ConstantValue::int(3, p.top_k as i32),
                 ConstantValue::int(4, p.hidden as i32),
             ],
             DispatchShape {
                 threadgroups: (1, m_pairs, 1),
-                threads_per_threadgroup: (p.hidden.min(256), 1, 1),
+                threads_per_threadgroup: (scatter_threads, 1, 1),
                 m_scaling: Some(MScaling {
                     seq_axis: None,
                     axis: MScaleAxis::Y,
@@ -9051,10 +9125,7 @@ fn lower_gemma_moe(
                     binding_index: 1,
                     byte_offset: layout.grp_offset,
                 },
-                Binding::ArenaSlot {
-                    slot: p.expert_in_slot,
-                    binding_index: 2,
-                },
+                scatter_src,
                 Binding::MoeScratch {
                     binding_index: 3,
                     byte_offset: layout.grp_fill,
@@ -9075,6 +9146,62 @@ fn lower_gemma_moe(
         ));
         // Grouped GEMM helper: y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad).
         let gemm = |which_w, which_s, which_b, x_byte: u32, y_byte: u32, n_out: u32, k_in: u32| {
+            if let (true, Some(tile)) = (w4a8, W4a8Tile::for_n(n_out)) {
+                return make_moe_command(
+                    KernelId::AffineGatherQmmW4a8,
+                    "quantized_qmm_nax",
+                    qmm_w4a8_static_name(W4a8Rows::Grouped, dtype, scale_dtype, p.group_size, tile),
+                    [
+                        ConstantValue::int(0, k_in as i32),
+                        ConstantValue::int(1, n_out as i32),
+                        ConstantValue::int(2, mpad_max as i32),
+                        ConstantValue::int(4, p.num_experts as i32),
+                    ]
+                    .into_iter()
+                    .chain(codes.constant())
+                    .collect(),
+                    DispatchShape {
+                        threadgroups: (n_out / tile.cols(), mpad_max / W4A8_TILE_ROWS, 1),
+                        threads_per_threadgroup: (32 * tile.simdgroups(), 1, 1),
+                        m_scaling: None,
+                    },
+                    vec![
+                        Binding::Weight {
+                            kind: experts_kind,
+                            which: which_w,
+                            layer: layer_id,
+                            locator: locator0,
+                            binding_index: 0,
+                        },
+                        Binding::Weight {
+                            kind: experts_kind,
+                            which: which_s,
+                            layer: layer_id,
+                            locator: locator0,
+                            binding_index: 1,
+                        },
+                        Binding::Weight {
+                            kind: experts_kind,
+                            which: which_b,
+                            layer: layer_id,
+                            locator: locator0,
+                            binding_index: 2,
+                        },
+                        Binding::MoeScratch {
+                            binding_index: 3,
+                            byte_offset: x_byte,
+                        },
+                        Binding::MoeScratch {
+                            binding_index: 4,
+                            byte_offset: y_byte,
+                        },
+                        Binding::MoeScratch {
+                            binding_index: 5,
+                            byte_offset: layout.grp_indices_pad,
+                        },
+                    ],
+                );
+            }
             // NAX (M5 matrix accelerator) is ~5-10x faster per call than
             // the steel grouped GEMM; use it when available + N%64==0 +
             // gs in {64,128} (BM=64 tile). The host padded to BM=64, so a
@@ -9206,12 +9333,48 @@ fn lower_gemma_moe(
                 ],
             ));
         }
-        // G7: down (act = gate_pad → down_pad).
+        // G7: down (act = gate_pad → down_pad). W4A8 quantizes the act into
+        // `x_pad` first (gate/up are done with it; sentinel rows skipped).
+        if w4a8 {
+            cmds.push(make_moe_command(
+                KernelId::AffineGatherW4a8Quant,
+                "quantized_qmm_nax",
+                w4a8_quant_static_name(W4a8Rows::Grouped, dtype),
+                vec![
+                    ConstantValue::int(0, p.moe_inter as i32),
+                    ConstantValue::int(2, mpad_max as i32),
+                    ConstantValue::int(4, p.num_experts as i32),
+                ],
+                DispatchShape {
+                    threadgroups: ((p.moe_inter / 64).div_ceil(16), mpad_max, 1),
+                    threads_per_threadgroup: (128, 1, 1),
+                    m_scaling: None,
+                },
+                vec![
+                    Binding::MoeScratch {
+                        binding_index: 0,
+                        byte_offset: layout.grp_gate_pad,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 1,
+                        byte_offset: layout.grp_x_pad,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 2,
+                        byte_offset: layout.grp_indices_pad,
+                    },
+                ],
+            ));
+        }
         cmds.push(gemm(
             WeightTensor::MoeExpertDownW,
             WeightTensor::MoeExpertDownS,
             WeightTensor::MoeExpertDownB,
-            layout.grp_gate_pad,
+            if w4a8 {
+                layout.grp_x_pad
+            } else {
+                layout.grp_gate_pad
+            },
             layout.grp_down_pad,
             p.hidden,
             p.moe_inter,
@@ -9937,6 +10100,7 @@ mod tests {
         assert_eq!(
             qmm.function,
             qmm_w4a8_static_name(
+                W4a8Rows::Dense,
                 dequant_dtype_for(&p),
                 scale_dtype_for(&p),
                 64,

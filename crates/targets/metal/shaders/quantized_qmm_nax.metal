@@ -1025,18 +1025,24 @@ INST_QMM_SMALL_M_GS(bf16, bfloat, bf16, bfloat)
 // guarantees K % 64 == 0, N % TN == 0 and M (the bucket) % 32 == 0 —
 // the tensor slices are static and unchecked. Grids: quant
 // (ceil(K/64 / 16), M), 128 threads; GEMM (N/TN, M/32), 32·NSG threads.
+//
+// The `affine_gather_*` pair is the MoE grouped expert GEMM: M is the
+// padded row bound, indices[5] (quant: [2]) holds each padded row's expert
+// (QMM_NUM_EXPERTS = sentinel), every expert's run starts on a 64-row
+// boundary, so each 32-row tile reads one expert's weight slab. Sentinel
+// rows are not quantized and sentinel tiles do not run.
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T>
-[[kernel]] void affine_w4a8_quant(
-    const device T* x [[buffer(0)]], device uchar* scratch [[buffer(1)]],
-    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
-    uint lid [[thread_index_in_simdgroup]]) {
+template <typename T, bool gather>
+METAL_FUNC void w4a8_quant_impl(
+    const device T* x, device uchar* scratch, const device uint32_t* indices,
+    uint2 tgid, uint sgid, uint lid) {
     const int K = QMM_K, M = QMM_M, KC = K / 64;
     // One lane octet (8 lanes x 8 elements) per 64-chunk, 16 per threadgroup.
     const int c = (int(tgid.x) * 4 + int(sgid)) * 4 + int(lid / 8);
     const int m = int(tgid.y);
     if (c >= KC) return;
+    if (gather && indices[m] >= uint(QMM_NUM_EXPERTS)) return;
     const int l8 = int(lid % 8);
     const device vec<T, 4>* p = (const device vec<T, 4>*)(x + int64_t(m) * K + c * 64 + l8 * 8);
     const float4 v0 = float4(p[0]), v1 = float4(p[1]);
@@ -1058,11 +1064,27 @@ template <typename T>
     }
 }
 
+template <typename T>
+[[kernel]] void affine_w4a8_quant(
+    const device T* x [[buffer(0)]], device uchar* scratch [[buffer(1)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_index_in_simdgroup]]) {
+    w4a8_quant_impl<T, false>(x, scratch, nullptr, tgid, sgid, lid);
+}
+
+template <typename T>
+[[kernel]] void affine_gather_w4a8_quant(
+    const device T* x [[buffer(0)]], device uchar* scratch [[buffer(1)]],
+    const device uint32_t* indices [[buffer(2)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_index_in_simdgroup]]) {
+    w4a8_quant_impl<T, true>(x, scratch, indices, tgid, sgid, lid);
+}
+
 template <typename T, typename S, int G, int TN, int NSG>
-[[kernel]] void affine_qmm_w4a8(
-    const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
-    const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
-    device T* y [[buffer(4)]], uint2 tgid [[threadgroup_position_in_grid]]) {
+METAL_FUNC void qmm_w4a8_impl(
+    const device uchar* w, const device S* scales, const device S* biases,
+    const device uchar* scratch, device T* y, uint2 tgid) {
     using namespace mpp::tensor_ops;
     using Ext = dextents<int32_t, 2>;
     constexpr int TM = 32;
@@ -1108,17 +1130,50 @@ template <typename T, typename S, int G, int TN, int NSG>
     out.store(mC);
 }
 
+template <typename T, typename S, int G, int TN, int NSG>
+[[kernel]] void affine_qmm_w4a8(
+    const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
+    const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
+    device T* y [[buffer(4)]], uint2 tgid [[threadgroup_position_in_grid]]) {
+    qmm_w4a8_impl<T, S, G, TN, NSG>(w, scales, biases, scratch, y, tgid);
+}
+
+template <typename T, typename S, int G, int TN, int NSG>
+[[kernel]] void affine_gather_qmm_w4a8(
+    const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
+    const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
+    device T* y [[buffer(4)]], const device uint32_t* indices [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint expert = indices[tgid.y * 32];
+    if (expert >= uint(QMM_NUM_EXPERTS)) return;  // sentinel tile
+    const size_t K = size_t(QMM_K), N = size_t(QMM_N);
+    qmm_w4a8_impl<T, S, G, TN, NSG>(
+        w + size_t(expert) * N * K / 2, scales + size_t(expert) * N * (K / G),
+        biases + size_t(expert) * N * (K / G), scratch, y, tgid);
+}
+
 template [[host_name("affine_w4a8_quant_bf16")]] [[kernel]] void affine_w4a8_quant<bfloat>(
     const device bfloat*, device uchar*, uint2, uint, uint);
 template [[host_name("affine_w4a8_quant_f16")]] [[kernel]] void affine_w4a8_quant<half>(
     const device half*, device uchar*, uint2, uint, uint);
+template [[host_name("affine_gather_w4a8_quant_bf16")]] [[kernel]] void
+affine_gather_w4a8_quant<bfloat>(const device bfloat*, device uchar*, const device uint32_t*,
+                                 uint2, uint, uint);
+template [[host_name("affine_gather_w4a8_quant_f16")]] [[kernel]] void
+affine_gather_w4a8_quant<half>(const device half*, device uchar*, const device uint32_t*,
+                               uint2, uint, uint);
 
 #define INST_QMM_W4A8(act_tag, act_type, scale_tag, scale_type, gs, tn, nsg)                   \
     template [[host_name("affine_qmm_w4a8_" #act_tag "_s_" #scale_tag "_gs_" #gs "_tn_" #tn     \
                          "_nsg_" #nsg)]] [[kernel]] void                                       \
     affine_qmm_w4a8<act_type, scale_type, gs, tn, nsg>(                                         \
         const device uchar*, const device scale_type*, const device scale_type*,               \
-        const device uchar*, device act_type*, uint2);
+        const device uchar*, device act_type*, uint2);                                         \
+    template [[host_name("affine_gather_qmm_w4a8_" #act_tag "_s_" #scale_tag "_gs_" #gs        \
+                         "_tn_" #tn "_nsg_" #nsg)]] [[kernel]] void                            \
+    affine_gather_qmm_w4a8<act_type, scale_type, gs, tn, nsg>(                                  \
+        const device uchar*, const device scale_type*, const device scale_type*,               \
+        const device uchar*, device act_type*, const device uint32_t*, uint2);
 
 // 128 columns x 4 simdgroups where N allows it; 64 x 2 otherwise.
 #define INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, gs)                      \

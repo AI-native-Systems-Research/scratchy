@@ -15,7 +15,7 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::quantized::{
-    DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS, W4a8Tile,
+    DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS, W4a8Rows, W4a8Tile,
     qmm_w4a8_static_name, small_m_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
@@ -231,7 +231,7 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
                 &vec![0u8; w4a8_scratch_bytes(g.bucket_m as u32, k as u32) as usize],
             );
             batch.encode(
-                &pipeline(w4a8_quant_static_name(g.act.act())),
+                &pipeline(w4a8_quant_static_name(W4a8Rows::Dense, g.act.act())),
                 &[(&x_buf, 0), (&scratch, 1)],
                 &[],
                 &[],
@@ -240,7 +240,13 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
                 size(128, 1),
             );
             batch.barrier();
-            let name = qmm_w4a8_static_name(g.act.act(), g.scale.scale(), gs as u32, tile);
+            let name = qmm_w4a8_static_name(
+                W4a8Rows::Dense,
+                g.act.act(),
+                g.scale.scale(),
+                gs as u32,
+                tile,
+            );
             batch.encode(
                 &pipeline(name),
                 &[

@@ -811,11 +811,12 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
 }
 
 /// Codes stored offset-8 (XOR 0x88, as an M5 target stores 4-bit codes)
-/// read under `AFFINE_CODES_OFFSET8` give bit-identical output to the codes
-/// as written, on every qmm_t kernel: Standard, SplitK and (on NAX
-/// hardware) NAX.
+/// read under `AFFINE_CODES_OFFSET8` (signed nibbles, the 8 folded into the
+/// bias) match the CPU reference of the codes as written within the same
+/// noise floor as every other qmm_t test, on Standard, SplitK and (on NAX
+/// hardware) NAX — and the same flipped codes read as written do not.
 #[test]
-fn affine_qmm_t_b4_offset8_codes_match_as_written() {
+fn affine_qmm_t_b4_offset8_codes_match_cpu_reference() {
     let Some(dev) = detect_device() else {
         eprintln!("skipping: no Metal 4 GPU");
         return;
@@ -829,22 +830,36 @@ fn affine_qmm_t_b4_offset8_codes_match_as_written() {
         kernels.push(QmmTKernel::Nax);
     }
     let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7, n, k, m, gs as usize);
+    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, gs as usize);
     let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
     for kernel in kernels {
         let run = |packed: &[u8], codes| {
             run_qmm_t_bf16_codes(packed, &scales, &biases, &x, (m, n, k, gs), kernel, codes)
                 .expect("MTL4 queue")
         };
-        let as_written = run(&packed, AffineCodes::AsWritten);
-        assert_ne!(
-            run(&offset8, AffineCodes::AsWritten),
-            as_written,
-            "{kernel:?}"
+        // SplitK sums bf16 partials host-side: the looser budget its own
+        // parity test uses.
+        let slack = if matches!(kernel, QmmTKernel::SplitK { .. }) {
+            2.0
+        } else {
+            1.0
+        };
+        let (idx, mv, ev, err, allowed) =
+            worst_abs_error_vs_noise_floor(&run(&offset8, AffineCodes::Offset8), &expected, k, 0.5);
+        assert!(
+            err <= allowed * slack,
+            "{kernel:?} offset-8: abs_err={err:.5} at {idx} (allowed {:.5}; metal={mv}, cpu={ev})",
+            allowed * slack
         );
-        assert_eq!(
-            run(&offset8, AffineCodes::Offset8),
-            as_written,
-            "{kernel:?}"
+        let (_, _, _, wrong, allowed) = worst_abs_error_vs_noise_floor(
+            &run(&offset8, AffineCodes::AsWritten),
+            &expected,
+            k,
+            0.5,
+        );
+        assert!(
+            wrong > allowed * slack,
+            "{kernel:?}: flipped codes read as written must be wrong"
         );
     }
 }

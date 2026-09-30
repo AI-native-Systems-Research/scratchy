@@ -34,9 +34,11 @@ inline constexpr short get_bytes_per_pack() {
   return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
 }
 
-// `offset8` (4-bit only): the codes are stored XOR 0x88
-// (`AffineCodes::Offset8`); each byte is XOR-ed back before use. A template
-// parameter, not a runtime value, so the as-written loop is the upstream one.
+// `offset8` (4-bit only): the codes are stored XOR 0x88 (`AffineCodes::
+// Offset8`), i.e. each nibble is the signed q - 8. Read signed and fold the 8
+// into the bias: 16·(q - 8) is the byte's high nibble as int8, and its low
+// nibble shifted up; s/16 of that plus (b + 8s) is s·q + b, exactly. A
+// template parameter, so the as-written loop is the upstream one.
 template <typename U, int N, int bits, bool offset8 = false>
 inline void
 dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
@@ -78,10 +80,10 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   else if (bits == 4) {
     U s[2] = {scale, scale / static_cast<U>(16.0f)};
     if (offset8) {
+      const U bias8 = bias + static_cast<U>(8.0f) * scale;
       for (int i = 0; i < (N / 2); i++) {
-        const uint8_t wi = w[i] ^ 0x88;
-        w_local[2 * i] = s[0] * (wi & 0x0f) + bias;
-        w_local[2 * i + 1] = s[1] * (wi & 0xf0) + bias;
+        w_local[2 * i] = s[1] * static_cast<int8_t>(w[i] << 4) + bias8;
+        w_local[2 * i + 1] = s[1] * static_cast<int8_t>(w[i] & 0xf0) + bias8;
       }
     } else {
       for (int i = 0; i < (N / 2); i++) {

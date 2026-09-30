@@ -933,6 +933,8 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineQmmSmallM
         | K::AffineW4a8Quant
         | K::AffineQmmW4a8
+        | K::AffineGatherW4a8Quant
+        | K::AffineGatherQmmW4a8
         | K::Nvfp4Qmv
         | K::Nvfp4QmmT
         | K::Nvfp4QmmTNax
@@ -943,6 +945,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::MoeGroupOffsets
         | K::MoeGroupInit
         | K::MoeGroupScatter
+        | K::MoeGroupScatterQ8
         | K::MoeGroupGather
         | K::MoePerExpertScale
         | K::GateApply
