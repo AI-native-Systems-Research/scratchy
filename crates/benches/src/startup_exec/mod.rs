@@ -962,8 +962,11 @@ fn normalize(s: &str, backend: Backend) -> String {
     } else {
         s
     };
+    // Same line classifier the TTFT clock uses: scratchy's tracing goes to
+    // stdout, and without this every scratchy answer carries its INFO lines
+    // and the gate fails on outputs that agree exactly.
     body.lines()
-        .filter(|l| !l.starts_with("Using model:"))
+        .filter(|l| !is_prelude(backend, l))
         .collect::<Vec<_>>()
         .join(" ")
         .split_whitespace()
@@ -1296,6 +1299,23 @@ mod tests {
         let plain = BenchStartupArgs::try_parse_from(["startup", "-m", "org/model"]).unwrap();
         assert!(!plain.exec_opts.exec);
         assert_eq!(plain.num_iters_cold, 3);
+    }
+
+    #[test]
+    fn normalize_strips_scratchy_tracing_so_parity_compares_answers() {
+        let scr = "2026-09-28T20:37:08.687348Z INFO Using cached model: /x\n\
+                   Using model: org/m\n\
+                   2026-09-28T20:37:11.104104Z INFO TurboQuant KV: auto-selected\n\
+                   1, 2, 3, 4, 5, 6, 7, 8, 9, 10.\n";
+        let mlx = "==========\n1, 2, 3, 4, 5, 6, 7, 8, 9, 10.\n==========\nPrompt: 9 tokens\n";
+        assert_eq!(
+            normalize(scr, Backend::Scratchy),
+            normalize(mlx, Backend::MlxLm)
+        );
+        assert_eq!(
+            normalize(scr, Backend::Scratchy),
+            "1, 2, 3, 4, 5, 6, 7, 8, 9, 10."
+        );
     }
 
     #[test]
