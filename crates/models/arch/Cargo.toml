@@ -138,8 +138,7 @@ all-arches = [
 "gemma-4-12b-it" = ["arch-gemma4"]
 "gemma-4-31b-it" = ["arch-gemma4"]
 
-# gemma4-moe (2 configs)
-"gemma-4-26b-a4b-it-optiq" = ["arch-gemma4-moe"]
+# gemma4-moe (1 configs)
 "gemma-4-26b-a4b-it" = ["arch-gemma4-moe"]
 
 # granite (21 configs)
@@ -251,8 +250,7 @@ all-arches = [
 "qwen3.5-0.8b" = ["arch-qwen3-5"]
 "qwen3.5-9b-text-only" = ["arch-qwen3-5"]
 
-# qwen3-5-moe (2 configs)
-"qwen3.5-35b-a3b-optiq" = ["arch-qwen3-5-moe"]
+# qwen3-5-moe (1 configs)
 "qwen3.5-35b-a3b" = ["arch-qwen3-5-moe"]
 
 # qwen3-5-vl (1 configs)
@@ -302,7 +300,6 @@ all-arches = [
     "gemma-4-31b-it",
 ]
 "gemma4-moe" = [
-    "gemma-4-26b-a4b-it-optiq",
     "gemma-4-26b-a4b-it",
 ]
 "granite" = [
@@ -415,7 +412,6 @@ all-arches = [
     "qwen3.5-9b-text-only",
 ]
 "qwen3-5-moe" = [
-    "qwen3.5-35b-a3b-optiq",
     "qwen3.5-35b-a3b",
 ]
 "qwen3-5-vl" = [
@@ -449,7 +445,6 @@ all = [
     "gemma-3-4b-it",
     "gemma-4-12b-it",
     "gemma-4-31b-it",
-    "gemma-4-26b-a4b-it-optiq",
     "gemma-4-26b-a4b-it",
     "granite-3.0-2b-base",
     "granite-3.0-2b-instruct",
@@ -534,7 +529,6 @@ all = [
     "qwen3-8b",
     "qwen3.5-0.8b",
     "qwen3.5-9b-text-only",
-    "qwen3.5-35b-a3b-optiq",
     "qwen3.5-35b-a3b",
     "qwen3.5-9b",
     "qwen3-30b-a3b-instruct-2507",
