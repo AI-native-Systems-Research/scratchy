@@ -194,12 +194,6 @@ These favour one side or the other and must travel with any published number.
 - **KV-cache dtype is not matched by default.** On metal scratchy enables
   TurboQuant 3-bit KV compression while mlx-lm uses an uncompressed cache — a
   *quality* difference as well as a perf one. Match it explicitly.
-- **A background integrity hash can overlap early decode.** On an aligned-cache
-  *hit* scratchy content-hashes the cached blob on a background thread
-  (0.39–2.44 s observed for a ~1.7 GiB sidecar), competing with the first
-  requests. It does not happen when no sidecar exists, so it is present in some
-  runs and absent from others — hence `--settle-s`, and a reason to read
-  `t_ready` and the server log together rather than trusting one rep.
 - **Process shape differs.** scratchy is one static binary; mlx-lm is a CPython
   interpreter plus imports. FROZEN evicts both, which is the real-world cost, but
   it is not a like-for-like measurement of model loading alone.
