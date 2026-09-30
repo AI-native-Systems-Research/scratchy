@@ -65,40 +65,44 @@ fn every_persistent_threadgroup_runs_at_once() {
     let pipeline = device
         .newComputePipelineStateWithFunction_error(&func)
         .expect("pipeline");
+    // One threadgroup per core — what the megakernel needs — then two: whether a core holds two
+    // of these (so the first count alone cannot show that every core was free).
     let mut short = Vec::new();
-    for round in 0..ROUNDS {
-        let count = shared_slice(&device, &[0u32]);
-        let waited = shared_slice(&device, &vec![0u32; p as usize]);
-        let order = shared_slice(&device, &vec![0u32; p as usize]);
-        let params = shared_slice(&device, &[p, LIMIT]);
-        let started = std::time::Instant::now();
-        assert!(dispatch_threadgroups(
-            &device,
-            &pipeline,
-            &[&count, &waited, &order, &params],
-            MTLSize {
-                width: p as usize,
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: 1024,
-                height: 1,
-                depth: 1,
-            },
-        ));
-        let elapsed = started.elapsed();
-        let arrived = read_slice::<u32>(&count, 1)[0];
-        let waited = read_slice::<u32>(&waited, p as usize);
-        let order = read_slice::<u32>(&order, p as usize);
-        let first = order.iter().position(|&o| o == 0).unwrap_or(0);
-        println!(
-            "round {round}: {arrived} of {p} threadgroups checked in; the first waited {} polls \
-             for the last (limit {LIMIT}); launch took {elapsed:?}",
-            waited[first],
-        );
-        if arrived < p {
-            short.push((round, arrived));
+    for (n, per_core) in [(p, "one"), (2 * p, "two")] {
+        for round in 0..ROUNDS {
+            let count = shared_slice(&device, &[0u32]);
+            let waited = shared_slice(&device, &vec![0u32; n as usize]);
+            let order = shared_slice(&device, &vec![0u32; n as usize]);
+            let params = shared_slice(&device, &[n, LIMIT]);
+            let started = std::time::Instant::now();
+            assert!(dispatch_threadgroups(
+                &device,
+                &pipeline,
+                &[&count, &waited, &order, &params],
+                MTLSize {
+                    width: n as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            ));
+            let elapsed = started.elapsed();
+            let arrived = read_slice::<u32>(&count, 1)[0];
+            let waited = read_slice::<u32>(&waited, n as usize);
+            let order = read_slice::<u32>(&order, n as usize);
+            let first = order.iter().position(|&o| o == 0).unwrap_or(0);
+            println!(
+                "{per_core} per core, round {round}: {arrived} of {n} threadgroups checked in; the \
+                 first waited {} polls for the last (limit {LIMIT}); launch took {elapsed:?}",
+                waited[first],
+            );
+            if n == p && arrived < p {
+                short.push((round, arrived));
+            }
         }
     }
     assert!(

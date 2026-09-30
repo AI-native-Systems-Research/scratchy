@@ -1668,17 +1668,37 @@ fn replace_word(text: &str, word: &str, by: &str) -> String {
 /// Compiles `mk`'s library at build time into `dir` as every shader is compiled — the build
 /// machine's `xcrun metal` with [`MSL_TO_AIR`] then [`AIR_TO_METALLIB`], its toolchain's language
 /// standard — so its bodies compile exactly as their dispatch kernels; returns the metallib's
-/// path for the emission to include. Named by the library's content hash, and written through a
-/// file of this process's own, so builds expanding models in parallel never read a half-written
-/// one.
+/// path for the emission to include. Named by a hash of everything the compile reads — the
+/// toolchain's version, the flags, the adapters' bodies and the generated kernel — so a change to
+/// any of them compiles afresh; written through files of this compile's own, so models expanding
+/// in parallel never read a half-written one.
 pub fn compile_metallib(mk: &MegakernelTape, dir: &Path) -> Result<PathBuf, BakeDefect> {
     let fail = |what: String| BakeDefect(format!("megakernel `{}`: {what}", mk.library));
     std::fs::create_dir_all(dir).map_err(|e| fail(format!("create {}: {e}", dir.display())))?;
-    let metallib = dir.join(format!("{}.metallib", mk.library));
+    let inputs = format!(
+        "{}\n{}\n{}\n{MK_BODIES}\n{}",
+        toolchain()?,
+        MSL_TO_AIR.join(" "),
+        AIR_TO_METALLIB.join(" "),
+        mk.source
+    );
+    let metallib = dir.join(format!(
+        "{}-{:016x}.metallib",
+        mk.library,
+        fnv1a(inputs.as_bytes())
+    ));
     if metallib.exists() {
         return Ok(metallib);
     }
-    let own = |ext: &str| dir.join(format!("{}.{}.{ext}", mk.library, std::process::id()));
+    static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let compile = COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let own = |ext: &str| {
+        dir.join(format!(
+            "{}.{}.{compile}.{ext}",
+            mk.library,
+            std::process::id()
+        ))
+    };
     let (source, air, lib) = (own("metal"), own("air"), own("metallib"));
     std::fs::write(&source, format!("{MK_BODIES}\n{}", mk.source))
         .map_err(|e| fail(format!("write {}: {e}", source.display())))?;
@@ -1708,6 +1728,24 @@ pub fn compile_metallib(mk: &MegakernelTape, dir: &Path) -> Result<PathBuf, Bake
         std::fs::remove_file(f).map_err(|e| fail(format!("remove {}: {e}", f.display())))?;
     }
     Ok(metallib)
+}
+
+/// The build machine's Metal toolchain, as `xcrun metal --version` names it (asked once).
+fn toolchain() -> Result<&'static str, BakeDefect> {
+    static VERSION: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    let version = VERSION.get_or_init(|| {
+        let out = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal", "--version"])
+            .output()
+            .map_err(|e| format!("spawn xcrun: {e}"))?;
+        match out.status.success() {
+            true => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+            false => Err(String::from_utf8_lossy(&out.stderr).into_owned()),
+        }
+    });
+    version
+        .as_deref()
+        .map_err(|e| BakeDefect(format!("megakernel: the Metal toolchain's version: {e}")))
 }
 
 /// FNV-1a, 64-bit: a deterministic content name (the bake must be reproducible).
