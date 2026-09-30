@@ -38,26 +38,6 @@ struct MetalArena {
 unsafe impl Send for MetalArena {}
 unsafe impl Sync for MetalArena {}
 
-/// Fast non-cryptographic content hash over a byte region —
-/// u64-chunked FNV-1a variant (~RAM-bandwidth in release). Integrity
-/// bit for the aligned sidecar: computed during the build write,
-/// re-verified in the background after every cache-hit launch.
-fn content_hash64(base: *const u8, len: usize) -> u64 {
-    const PRIME: u64 = 0x0000_0100_0000_01B3;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let words = len / 8;
-    // SAFETY: caller guarantees `base..base+len` readable.
-    let w = unsafe { std::slice::from_raw_parts(base as *const u64, words) };
-    for &x in w {
-        h = (h ^ x).wrapping_mul(PRIME);
-    }
-    let tail = unsafe { std::slice::from_raw_parts(base.add(words * 8), len - words * 8) };
-    for &b in tail {
-        h = (h ^ b as u64).wrapping_mul(PRIME);
-    }
-    h
-}
-
 /// Latch flipped by the executor once model load + warmup complete.
 /// Background sidecar writers wait on it so the one-time cache build
 /// never contends with the load itself (observed: writers racing the
@@ -188,8 +168,6 @@ struct AlignedCacheMeta {
     /// model it came from — including local-path loads that can't be
     /// reverse-mapped from the HF cache. Not part of the validity check.
     src_path: String,
-    /// `content_hash64` of the aligned blob, filled by the builder.
-    content_hash: std::cell::Cell<u64>,
 }
 
 impl AlignedCacheMeta {
@@ -204,24 +182,18 @@ impl AlignedCacheMeta {
         // backslashes, unicode); the rest are numbers.
         let src_path = serde_json::to_string(&self.src_path).unwrap_or_else(|_| "\"\"".to_string());
         format!(
-            "{{\"layout_version\":{},\"src_size\":{},\"src_mtime_ns\":{},\"aligned_capacity\":{},\"content_hash\":{},\"src_path\":{}}}",
+            "{{\"layout_version\":{},\"src_size\":{},\"src_mtime_ns\":{},\"aligned_capacity\":{},\"src_path\":{}}}",
             ALIGNED_CACHE_LAYOUT_VERSION,
             self.src_size,
             self.src_mtime_ns,
             self.aligned_capacity,
-            self.content_hash.get(),
             src_path,
         )
     }
-    /// The expected blob hash from the on-disk meta (None for metas
-    /// written before the integrity bit existed — treated as invalid
-    /// by `is_valid_on_disk`).
-    fn disk_content_hash(&self) -> Option<u64> {
-        let j: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(self.meta_json_path()).ok()?).ok()?;
-        j.get("content_hash").and_then(|v| v.as_u64())
-    }
-    /// True iff bin + meta exist and match this source + layout.
+    /// True iff bin + meta exist and match this source + layout. The
+    /// meta is the commit record: the builder renames it into place only
+    /// after the blob is fully written, synced, and renamed, so a meta
+    /// that exists and matches names a complete blob.
     fn is_valid_on_disk(&self) -> bool {
         let Ok(meta_str) = std::fs::read_to_string(self.meta_json_path()) else {
             return false;
@@ -234,8 +206,7 @@ impl AlignedCacheMeta {
             && j.get("src_size").and_then(|v| v.as_u64()) == Some(self.src_size)
             && j.get("src_mtime_ns").and_then(|v| v.as_u128_lossy()) == Some(self.src_mtime_ns)
             && j.get("aligned_capacity").and_then(|v| v.as_u64())
-                == Some(self.aligned_capacity as u64)
-            && j.get("content_hash").and_then(|v| v.as_u64()).is_some();
+                == Some(self.aligned_capacity as u64);
         ok && std::fs::metadata(&self.bin)
             .map(|m| m.len() as usize == self.aligned_capacity)
             .unwrap_or(false)
@@ -773,7 +744,6 @@ impl MetalAllocator {
                 aligned_capacity,
                 &packed,
                 mmap,
-                m.disk_content_hash(),
             ) {
                 Ok(()) => {
                     tracing::info!(
@@ -788,8 +758,8 @@ impl MetalAllocator {
                         "aligned-cache: rejected {} ({e}); deleting and falling back to copy",
                         cf.display()
                     );
-                    // Self-heal: a cache that fails to map or fails the
-                    // integrity check must not be retried forever.
+                    // Self-heal: a cache that fails to map must not be
+                    // retried forever.
                     if let Some(m) = meta.as_ref() {
                         let _ = std::fs::remove_file(m.meta_json_path());
                     }
@@ -843,7 +813,6 @@ impl MetalAllocator {
             aligned_capacity,
             bin,
             src_path: path.to_string_lossy().into_owned(),
-            content_hash: std::cell::Cell::new(0),
         })
     }
 
@@ -860,7 +829,6 @@ impl MetalAllocator {
         aligned_capacity: usize,
         packed: &[(usize, usize, usize)],
         mmap: Arc<memmap2::Mmap>,
-        expected_hash: Option<u64>,
     ) -> std::result::Result<(), (anyhow::Error, Arc<memmap2::Mmap>)> {
         let file = match std::fs::File::open(cache_bin) {
             Ok(f) => f,
@@ -919,93 +887,6 @@ impl MetalAllocator {
                 ready: Arc::new(TensorReady::new(0)),
             })
             .collect();
-
-        // ALWAYS-ON integrity bit: spot-check the head window (4 KiB)
-        // of every tensor against the SOURCE bytes before serving from
-        // the sidecar (~8 MiB of scattered source reads). Catches torn
-        // writes, truncation surviving the size check, and
-        // wrong-file/bit-rot with high probability; mismatch is
-        // self-healing — the caller falls back to the copy path and
-        // deletes the bad cache.
-        {
-            let src_base = base as usize;
-            let dst_base = cache_mmap.as_ptr() as usize;
-            for (i, t) in tensors.iter().enumerate() {
-                let w = t.len.min(4096);
-                if w == 0 {
-                    continue;
-                }
-                let a = unsafe {
-                    std::slice::from_raw_parts((src_base + t.src_offset) as *const u8, w)
-                };
-                let b = unsafe {
-                    std::slice::from_raw_parts((dst_base + t.dst_offset) as *const u8, w)
-                };
-                if a != b {
-                    return Err((
-                        anyhow::anyhow!(
-                            "sidecar integrity check failed at tensor #{i} \
-                             (src_off={}, dst_off={}) — torn or stale cache",
-                            t.src_offset,
-                            t.dst_offset
-                        ),
-                        mmap,
-                    ));
-                }
-            }
-        }
-
-        // Integrity bit (full coverage): the head-window spot-check
-        // above misses corruption away from tensor heads (proven by a
-        // byte-flip test at +2.5 GB). Verify the FULL blob against the
-        // build-time content hash in the BACKGROUND — zero startup
-        // cost; runs after the load-complete latch so it never
-        // contends with launch. On mismatch the process ABORTS loudly
-        // (it is already serving from these pages — continuing means
-        // silently corrupt weights, this week's nightmare class) and
-        // deletes the cache so relaunch self-heals via the copy path.
-        if let Some(expected) = expected_hash {
-            // Hold an Arc clone of the sidecar mmap for the lifetime of
-            // this detached hash. It outlives the caller's teardown on a
-            // short-lived run (e.g. `scr chat -q …` finishes inference,
-            // prints, and unwinds while the latch has already fired).
-            // Capturing only a raw `usize` let `_cache_mmap` (the sole
-            // owner) drop and munmap mid-hash during teardown — the hash
-            // loop then read unmapped pages → EXC_BAD_ACCESS, a ~50%
-            // teardown segfault. The Arc defers the munmap until the hash
-            // returns; it never blocks exit. (regression: c54955a3)
-            let hash_mmap = Arc::clone(&cache_mmap);
-            let hash_len = aligned_capacity;
-            let bin = cache_bin.to_path_buf();
-            let meta_json = bin.with_extension("meta.json");
-            std::thread::spawn(move || {
-                let t_wait = std::time::Instant::now();
-                while !WEIGHTS_LOAD_COMPLETE.load(std::sync::atomic::Ordering::Acquire)
-                    && t_wait.elapsed() < std::time::Duration::from_secs(180)
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-                let t0 = std::time::Instant::now();
-                let got = content_hash64(hash_mmap.as_ptr(), hash_len);
-                if got != expected {
-                    let _ = std::fs::remove_file(&meta_json);
-                    let _ = std::fs::remove_file(&bin);
-                    eprintln!(
-                        "FATAL: aligned-cache integrity verification FAILED for {} \
-                         (content_hash {got:#x} != recorded {expected:#x}). The cache has \
-                         been deleted; relaunch will rebuild it from the checkpoint. \
-                         Aborting rather than serve corrupt weights.",
-                        bin.display()
-                    );
-                    std::process::abort();
-                }
-                tracing::info!(
-                    "aligned-cache: background integrity verify OK for {} in {:?}",
-                    bin.display(),
-                    t0.elapsed()
-                );
-            });
-        }
 
         let aligned_base = cache_mmap.as_ptr() as *mut u8;
         self.mmaps
@@ -1160,17 +1041,13 @@ impl MetalAllocator {
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
-            // Integrity bit: hash the blob we just wrote (from the
-            // in-memory buffer — RAM-bandwidth, no re-read) and stamp
-            // it into the meta. Verified in the background after every
-            // cache-hit launch.
-            meta.content_hash
-                .set(content_hash64(aligned_base as *const u8, len));
             if let Err(e) = std::fs::rename(&tmp, &cache_bin) {
                 tracing::warn!("aligned-cache: rename failed: {e}");
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
+            // Commit: the blob is complete, synced, and renamed into
+            // place; renaming the meta in marks the cache done.
             let meta_tmp = meta
                 .meta_json_path()
                 .with_extension(format!("json.tmp.{}", std::process::id()));
@@ -1813,12 +1690,10 @@ mod tests {
             aligned_capacity: 789,
             bin: std::path::PathBuf::from("/tmp/x.bin"),
             src_path: "/weird/pa\"th/model.safetensors".to_string(),
-            content_hash: std::cell::Cell::new(0xdead),
         };
         let json = meta.to_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("to_json emits valid JSON");
         assert_eq!(v["src_path"], "/weird/pa\"th/model.safetensors");
-        assert_eq!(v["content_hash"], 0xdead_u64);
         assert_eq!(v["layout_version"], ALIGNED_CACHE_LAYOUT_VERSION);
     }
 
