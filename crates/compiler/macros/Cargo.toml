@@ -47,6 +47,12 @@ spyre-hw = ["spyre", "scratchy-target-spyre/spyre-hw"]
 # without nccl still get the fast tp=1-only macro and consumers with
 # it get the full fanout — no cross-talk.
 nccl = ["scratchy-forward-compiler/nccl"]
+# TurboQuant KV compression, fixed per model at build time. Read only under
+# `metal`, the one backend with the codec's kernels: every model whose geometry
+# the codec takes (`scratchy_layers::turboquant::codec_for`) is emitted
+# with `KV_CODEC = TurboQuant`, the rest stay dense and are named in the build
+# output. Nothing selects it at runtime. `scratchy-cli` turns it on by default.
+turboquant = []
 
 [dependencies]
 tracing = { workspace = true }

@@ -191,9 +191,11 @@ These favour one side or the other and must travel with any published number.
   648/648 tensors zero-copy from the HF mmap. For that model FROZEN→COLD is a
   page-cache delta only. It is *not* inert for checkpoints needing realignment
   (the code cites Qwen3.5-35B at 18.99 GiB). **Re-check per model.**
-- **KV-cache dtype is not matched by default.** On metal scratchy enables
-  TurboQuant 3-bit KV compression while mlx-lm uses an uncompressed cache — a
-  *quality* difference as well as a perf one. Match it explicitly.
+- **KV-cache dtype is not matched by default.** A default metal build stores
+  KV as TurboQuant codes (3-bit for the Llama family, 4-bit otherwise; the
+  `turboquant` feature) while mlx-lm uses an uncompressed cache — a *quality*
+  difference as well as a perf one. It is fixed at build time, so match it with
+  a build without the feature, not a runtime flag.
 - **Process shape differs.** scratchy is one static binary; mlx-lm is a CPython
   interpreter plus imports. FROZEN evicts both, which is the real-world cost, but
   it is not a like-for-like measurement of model loading alone.

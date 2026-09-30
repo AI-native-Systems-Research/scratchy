@@ -70,10 +70,6 @@ pub struct ForwardCtx<'a> {
     /// full `M=bucket_m` lm_head fallback (gated `OnlyIfMultiSeqOrSpec`) fires.
     /// Caller sets `false` for prefill / decode / lockstep / draft chain.
     pub has_spec_tokens: bool,
-    /// TurboQuant KV compression on (kv_cache_dtype == "turboquant"). When set
-    /// (and head_dim is a supported power-of-2 ≤256), the metal RuntimeFactory
-    /// provisions the packed stores + scratch and the per-layer tape ops fire.
-    pub kv_turboquant: bool,
     /// Multimodal embed splice. `mm_embeds` carries the projected
     /// vision-encoder output `[total_mm_tokens, hidden]`; `embed_patches`
     /// names the destination ranges in the input-id sequence. Empty

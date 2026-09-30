@@ -249,9 +249,6 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// sized to `max(attn_unfused_scratch_bytes)`. `None` when no hd512-unfused
     /// attention was lowered.
     pub attn_unfused_scratch: Option<Buffer>,
-    /// TurboQuant KV cache active for this worker (set from `runtime.tq` at
-    /// build). Gates the TurboQuant per-layer commands (`gate_matches`).
-    pub turboquant: bool,
     /// Per-forward block-table ROW WIDTH (== the host's `max_blocks_eff`
     /// stride) for the TurboQuant full-context staging grid. Stashed from
     /// `inputs.block_tables` before each forward (see the `write_runtime_inputs`
@@ -511,7 +508,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             pin(vision_position_ids);
             // TurboQuant: the packed code stores + norms + codebook are read by
             // the dequant/quantize dispatch commands via baked gpuAddress, so pin them
-            // (same lazy-pager hazard). `None` on non-turboquant runs → no-op.
+            // (same lazy-pager hazard). `None` for a dense model → no-op.
             if let Some(t) = tq {
                 for b in &t.packed_k {
                     pin(b);
@@ -575,7 +572,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
             moe_scratch,
             roped_k_scratch,
             attn_unfused_scratch,
-            turboquant: runtime.tq.is_some(),
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             _marker: std::marker::PhantomData,
@@ -705,7 +701,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
             num_tokens,
             num_seqs,
             has_spec_tokens,
-            turboquant: self.turboquant,
             unrotated_blocks: self
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1887,7 +1882,6 @@ pub(super) fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: Step
         num_tokens,
         num_seqs,
         has_spec_tokens,
-        turboquant,
         unrotated_blocks,
     } = step;
     // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
@@ -1898,19 +1892,15 @@ pub(super) fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: Step
     // unconditionally on multi-seq regressed c=4 TPOT by +5% on
     // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
     // win without hurting decode.
-    let turboquant_decode = turboquant && num_tokens == num_seqs;
+    let decode_step = num_tokens == num_seqs;
     match gate {
         None => true,
         Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
             !has_spec_tokens && num_tokens > num_seqs
         }
         Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens,
-        Some(super::lowered::RuntimeGate::OnlyIfTurboquant) => turboquant,
-        Some(super::lowered::RuntimeGate::OnlyIfTurboquantDecode) => turboquant_decode,
-        Some(super::lowered::RuntimeGate::OnlyIfTurboquantNotDecode) => {
-            turboquant && !turboquant_decode
-        }
-        Some(super::lowered::RuntimeGate::UnlessTurboquantDecode) => !turboquant_decode,
+        Some(super::lowered::RuntimeGate::OnlyIfDecodeStep) => decode_step,
+        Some(super::lowered::RuntimeGate::UnlessDecodeStep) => !decode_step,
         Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
             crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
         }
@@ -1933,7 +1923,6 @@ pub(super) struct StepFacts {
     pub num_tokens: u32,
     pub num_seqs: u32,
     pub has_spec_tokens: bool,
-    pub turboquant: bool,
     /// Some sequence's block table has an unrotated (bit-31, span) block.
     pub unrotated_blocks: bool,
 }
@@ -2013,44 +2002,50 @@ mod tests {
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::Arc;
 
-    /// The sequence gates follow the step's sequence count, not its token
-    /// count; the span-block gates follow the step's block tables; and `All`
-    /// needs every gate: under TurboQuant a decode step runs none of the
-    /// prefill attention's variants.
+    /// The decode-step gates follow whether every sequence contributes one
+    /// token; the sequence gates follow the step's sequence count, not its
+    /// token count; the span-block gates follow the step's block tables; and
+    /// `All` needs every gate: a decode step runs none of a TurboQuant prefill
+    /// attention's variants.
     #[test]
-    fn sequence_and_span_block_gates_follow_the_step() {
+    fn step_gates_follow_the_step() {
         use super::super::lowered::RuntimeGate::{
-            All, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence,
-            UnlessTurboquantDecode, UnlessUnrotatedBlocks,
+            All, OnlyIfDecodeStep, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep,
+            UnlessOneSequence, UnlessUnrotatedBlocks,
         };
-        let step = |num_tokens, num_seqs, turboquant, unrotated_blocks| StepFacts {
+        let step = |num_tokens, num_seqs, unrotated_blocks| StepFacts {
             num_tokens,
             num_seqs,
             has_spec_tokens: false,
-            turboquant,
             unrotated_blocks,
         };
+        for (tokens, seqs, decode) in [
+            (1, 1, true),
+            (16, 16, true),
+            (512, 1, false),
+            (18, 16, false),
+        ] {
+            let s = step(tokens, seqs, false);
+            assert_eq!(gate_matches(Some(OnlyIfDecodeStep), s), decode);
+            assert_eq!(gate_matches(Some(UnlessDecodeStep), s), !decode);
+        }
         for (tokens, seqs, one) in [(512, 1, true), (512, 2, false), (16, 16, false)] {
-            let s = step(tokens, seqs, false, false);
+            let s = step(tokens, seqs, false);
             assert_eq!(gate_matches(Some(OnlyIfOneSequence), s), one);
             assert_eq!(gate_matches(Some(UnlessOneSequence), s), !one);
         }
         for unrotated in [false, true] {
-            let s = step(512, 2, false, unrotated);
+            let s = step(512, 2, unrotated);
             assert_eq!(gate_matches(Some(OnlyIfUnrotatedBlocks), s), unrotated);
             assert_eq!(gate_matches(Some(UnlessUnrotatedBlocks), s), !unrotated);
         }
-        let plain = All(&[
-            UnlessTurboquantDecode,
-            UnlessOneSequence,
-            UnlessUnrotatedBlocks,
-        ]);
-        assert!(gate_matches(Some(plain), step(512, 2, true, false)));
-        assert!(!gate_matches(Some(plain), step(512, 2, true, true)));
-        assert!(!gate_matches(Some(plain), step(512, 1, true, false)));
+        let plain = All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
+        assert!(gate_matches(Some(plain), step(512, 2, false)));
+        assert!(!gate_matches(Some(plain), step(512, 2, true)));
+        assert!(!gate_matches(Some(plain), step(512, 1, false)));
         assert!(
-            !gate_matches(Some(plain), step(2, 2, true, false)),
-            "a TurboQuant decode step"
+            !gate_matches(Some(plain), step(2, 2, false)),
+            "a decode step"
         );
     }
 

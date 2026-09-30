@@ -7,6 +7,8 @@
 //! (`attention.metal`).
 
 use objc2_metal::MTLDevice;
+pub use scratchy_layers::turboquant::kv_bytes_per_token;
+use scratchy_layers::turboquant::{SCRATCH_ELEM_BYTES, TqBits};
 
 use crate::argmax::{Buffer, Device};
 
@@ -34,16 +36,17 @@ pub fn build_tq_provision(
     num_kv_heads: usize,
     head_dim: usize,
     blocks_per_chunk: usize,
-    bits: u32,
+    bits: TqBits,
     seed: u64,
 ) -> crate::interpreter::metal::runtime::TqRuntimeBuffers {
     use objc2_metal::{MTLBuffer, MTLResourceOptions};
     use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
+    let bits = bits.get();
     let num_layers = is_global.len();
     let n_global = is_global.iter().filter(|&&g| g).count();
     let pdim = packed_dim(head_dim, bits);
     tracing::info!(
-        "TurboQuant KV: auto-selected {bits}-bit codebook (head_dim={head_dim}, \
+        "TurboQuant KV: {bits}-bit codebook (head_dim={head_dim}, \
          num_kv_heads={num_kv_heads}, block_size={block_size}, packed_dim={pdim}, \
          {num_blocks} blocks, {n_global}/{num_layers} global layers compressed)"
     );
@@ -120,9 +123,9 @@ pub fn build_tq_provision(
     // case — a dedicated scratch, not a pool-shared tensor). Contiguous data +
     // a chunk-table of gpuAddresses at chunk offsets (the kernels deref it).
     let per_block_elems = block_size * num_kv_heads * head_dim;
-    let scratch_bytes = num_blocks * per_block_elems * 2;
+    let scratch_bytes = num_blocks * per_block_elems * SCRATCH_ELEM_BYTES;
     let n_chunks = num_blocks.div_ceil(blocks_per_chunk.max(1));
-    let chunk_bytes = blocks_per_chunk * per_block_elems * 2;
+    let chunk_bytes = blocks_per_chunk * per_block_elems * SCRATCH_ELEM_BYTES;
     let build_scratch = || {
         let data = alloc(scratch_bytes);
         // Zero the scratch so blocks the rope DOESN'T write read back as 0
@@ -167,7 +170,9 @@ mod tests {
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice};
     use objc2_foundation::NSString;
     use objc2_metal::{MTLBuffer, MTLLibrary, MTLSize};
-    use scratchy_layers::turboquant::{PolarQuantizer, pack_indices, packed_dim, vals_per_word};
+    use scratchy_layers::turboquant::{
+        KvCodec, PolarQuantizer, pack_indices, packed_dim, vals_per_word,
+    };
 
     /// The embedded `turboquant.metallib`'s pipeline for kernel `name`.
     fn pipeline(device: &Device, name: &str) -> ComputePipelineState {
@@ -330,6 +335,53 @@ mod tests {
         let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
         let norm = |v: &[f32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
         (dot / (norm(a) * norm(b)).max(1e-12)) as f32
+    }
+
+    /// The KV budget sizes a TurboQuant pool with `kv_bytes_per_token`; the
+    /// buffers `build_tq_provision` sizes per token — every layer's packed
+    /// codes and norms, and the K and V scratch — must add up to exactly that,
+    /// or the pool the engine counts is not the pool the GPU holds.
+    #[test]
+    fn provision_allocates_kv_bytes_per_token() {
+        let Some(device) = crate::detect_device().map(|d| d.device) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        let (num_layers, num_blocks, block_size, num_kv_heads, head_dim) = (3, 8, 16, 2, 64);
+        for bits in [TqBits::new(3), TqBits::new(4)] {
+            let tq = build_tq_provision(
+                &device,
+                &vec![true; num_layers],
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+                4,
+                bits,
+                42,
+            );
+            let len = |b: &Buffer| b.length();
+            let allocated: usize = [&tq.packed_k, &tq.packed_v, &tq.norms_k, &tq.norms_v]
+                .into_iter()
+                .flatten()
+                .map(len)
+                .sum::<usize>()
+                + len(&tq.scratch_k_data)
+                + len(&tq.scratch_v_data);
+            assert_eq!(
+                allocated,
+                num_blocks
+                    * block_size
+                    * kv_bytes_per_token(
+                        KvCodec::TurboQuant(bits),
+                        num_layers,
+                        num_kv_heads,
+                        head_dim,
+                        2
+                    ),
+                "{bits:?}"
+            );
+        }
     }
 
     /// `tq_compress_paged` in place at every (head_dim, bits) the metal path

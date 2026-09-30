@@ -2137,6 +2137,21 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant `ScratchyWeights::kv_codec()` arms: each reads its own
+    // module's `CanonicalParams::KV_CODEC`, so the dispatcher keeps no second
+    // record of it.
+    let kv_codec_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => <#model_ident::Weights as
+                    ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC,
+            }
+        })
+        .collect();
+
     // Per-variant spyre arms for `ScratchyWeights::ktir_bundle()`: each variant
     // returns its module's embedded `KTIR_BUNDLE` const as a neutral `&dyn Any`
     // (the worker downcasts it). Emitted inside the `#[cfg(feature = "spyre")]`
@@ -2804,6 +2819,11 @@ fn emit_arch_dispatcher(
             fn num_key_value_heads(&self) -> u64 { self.num_key_value_heads() }
             fn head_dim(&self) -> u64 { self.head_dim() }
             fn vocab_size(&self) -> u64 { self.vocab_size() }
+            fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
+                match self {
+                    #(#kv_codec_arms)*
+                }
+            }
 
             #gdn_runtime_config_tokens
 

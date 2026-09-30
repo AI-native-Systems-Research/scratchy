@@ -573,14 +573,19 @@ impl StepSlotMapping {
     }
 }
 
-/// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size × 2 bytes.
-/// bf16 and f16 are both 2 bytes/elt under metal; int4 KV is unsupported.
+/// Bytes per element of a metal KV pool's dense rows: bf16 and f16 are both 2;
+/// int4 KV is unsupported.
+#[cfg(feature = "metal")]
+const METAL_KV_ELEM_BYTES: usize = 2;
+
+/// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
+/// × [`METAL_KV_ELEM_BYTES`].
 #[cfg(feature = "metal")]
 fn kv_per_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
 ) -> usize {
-    let elt_bytes: usize = 2;
+    let elt_bytes = METAL_KV_ELEM_BYTES;
     // Hybrid-attention-geometry arches (Gemma4) size each layer by its
     // own kv_heads*head_dim; uniform arches use the single product.
     // Mis-summing here mis-sizes the scheduler's KV budget.
@@ -591,12 +596,104 @@ fn kv_per_block_bytes(
             .sum::<usize>()
             .saturating_mul(elt_bytes);
     }
-    (model.num_hidden_layers() as usize)
-        .saturating_mul(2)
-        .saturating_mul(model.num_key_value_heads() as usize)
-        .saturating_mul(model.head_dim() as usize)
-        .saturating_mul(block_size)
-        .saturating_mul(elt_bytes)
+    block_size.saturating_mul(pool_bytes_per_token(
+        model,
+        scratchy_forward_compiler::KvCodec::Dense,
+        elt_bytes,
+    ))
+}
+
+/// `kv_bytes_per_token` at `model`'s pool geometry: every layer, its KV heads
+/// and head_dim, `dense_elem_bytes` wide when `codec` is dense.
+#[cfg(feature = "metal")]
+fn pool_bytes_per_token(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    codec: scratchy_forward_compiler::KvCodec,
+    dense_elem_bytes: usize,
+) -> usize {
+    scratchy_target_metal::turboquant::kv_bytes_per_token(
+        codec,
+        model.num_hidden_layers() as usize,
+        model.num_key_value_heads() as usize,
+        model.head_dim() as usize,
+        dense_elem_bytes,
+    )
+}
+
+/// vLLM group-shared hybrid KV layout (gemma4): infer the per-layer sliding
+/// mask from `per_layer_kv_token_elems` (the bigger-page class is the sliding
+/// class) and compute the grouping. This is `Some` only for the
+/// page-differentiated case — the SAME trigger the scheduler's `hybrid_kv` uses
+/// in `init`, so the two never disagree on group count. `None` → one physical
+/// tensor per layer (the uniform pool).
+#[cfg(feature = "metal")]
+fn hybrid_kv_layout(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+    elem_bytes: usize,
+) -> Option<scratchy_core_config::HybridKvLayout> {
+    let elems = model.per_layer_kv_token_elems()?;
+    let max_e = *elems.iter().max()?;
+    let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
+        .iter()
+        .map(|&e| scratchy_core_config::LayerKvGeometry {
+            is_sliding: e == max_e,
+            // Page proxy: head_size 1 keeps the per-class page RATIO
+            // (only the ratio drives grouping + block_size scaling).
+            num_kv_heads: e,
+            head_size: 1,
+            head_size_v: None,
+            sliding_window: if e == max_e { Some(1) } else { None },
+        })
+        .collect();
+    // `available` is irrelevant here — the pool sizes from the passed
+    // `num_gpu_blocks`; callers only read the grouping fields.
+    scratchy_core_config::compute_hybrid_kv_layout(&geom, block_size, usize::MAX / 2, elem_bytes)
+}
+
+/// A uniform model built with TurboQuant: its KV lives in packed codes and the
+/// fp16 pool is a one-chunk seed (`initialize_cache`). A hybrid model's
+/// TurboQuant global layers share a pool sized to its context, not the budget.
+#[cfg(feature = "metal")]
+fn uniform_turboquant(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+) -> bool {
+    model.kv_codec().is_turboquant()
+        && hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_none()
+}
+
+/// Bytes one block of the TARGET pool costs: a uniform TurboQuant model's
+/// codes, norms and scratch, every other model's dense rows.
+#[cfg(feature = "metal")]
+fn target_block_bytes(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+) -> usize {
+    if uniform_turboquant(model, block_size) {
+        block_size.saturating_mul(pool_bytes_per_token(
+            model,
+            model.kv_codec(),
+            METAL_KV_ELEM_BYTES,
+        ))
+    } else {
+        kv_per_block_bytes(model, block_size)
+    }
+}
+
+/// Bytes one block of the DRAFT pool costs: it is allocated dense in full
+/// (`initialize_draft_cache_metal`), and a TurboQuant draft's codec buffers
+/// come on top of it.
+#[cfg(feature = "metal")]
+fn draft_block_bytes(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+) -> usize {
+    let codec = match model.kv_codec() {
+        scratchy_forward_compiler::KvCodec::Dense => 0,
+        codec => block_size.saturating_mul(pool_bytes_per_token(model, codec, METAL_KV_ELEM_BYTES)),
+    };
+    kv_per_block_bytes(model, block_size).saturating_add(codec)
 }
 
 // `compute_available_kv_bytes`, `PrefillBucketSelection`, and
@@ -1022,7 +1119,12 @@ impl MetalWorker {
         // skip growth there; hybrid SWA must grow its fp16 sliding tensors. Gate
         // on `kv_is_hybrid` (the same discriminator `max_chunks` uses) — NOT
         // `kv_full_block_size`, which is nonzero on uniform too.
-        if self.config.kv_cache_dtype == "turboquant" && !self.kv_is_hybrid {
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|m| m.kv_codec().is_turboquant())
+            && !self.kv_is_hybrid
+        {
             return;
         }
         let Some(device) = self.gpu_device.as_ref() else {
@@ -1526,10 +1628,6 @@ fn metal_chain_dispatch(
         gdn_state_indices: None,
         gdn_is_fresh: None,
         has_spec_tokens: false,
-        // metal_chain_dispatch (free fn): tq is provisioned at worker spawn via
-        // the main forward_argmax_blocking path; the shared worker runtime
-        // already carries it, so this flag is inert here.
-        kv_turboquant: false,
         last_token_indices: None,
     };
 
@@ -1959,7 +2057,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             gdn_state_indices: view_gdn_indices,
             gdn_is_fresh: view_gdn_is_fresh,
             has_spec_tokens: req.has_spec_tokens,
-            kv_turboquant: self.config.kv_cache_dtype == "turboquant",
             last_token_indices: view_last_token_indices,
         };
 
@@ -2516,24 +2613,6 @@ fn reserve_pinned(
 }
 
 #[cfg(feature = "metal")]
-/// Minimum fp16 KV footprint (bytes per token, all layers, K+V) for
-/// TurboQuant to be worth enabling by default.
-///
-/// TurboQuant trades fidelity for KV CAPACITY. Below this, the capacity
-/// is not the constraint and the trade is a bad one. Sized to sit
-/// between the models measured on metal:
-///
-///     qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> fp16
-///     llama-3.2-1b   16 x 8 kv x 64  =  32 KiB/token   -> TurboQuant
-///     granite-4.1-3b 40 x 8 kv x 64  =  80 KiB/token   -> TurboQuant
-///     gemma-3-4b     34 x 4 kv x 256 = 544 KiB/token   -> TurboQuant
-///
-/// A model between 12 and 32 KiB/token is untested either way; the
-/// threshold is set at 24 KiB so the two measured points stay on the
-/// sides they were measured on, and is a POLICY knob, not a law.
-const TQ_MIN_KV_BYTES_PER_TOKEN: usize = 24 * 1024;
-
-#[cfg(feature = "metal")]
 impl Worker for MetalWorker {
     fn init_device(&mut self) -> ExecutorResult<()> {
         let device = scratchy_target_metal::detect_device()
@@ -2559,6 +2638,14 @@ impl Worker for MetalWorker {
         let model = self.model.as_ref()?;
         model.per_layer_kv_token_elems()?;
         Some(model.max_blocks_per_seq() * self.config.block_size)
+    }
+
+    fn kv_block_bytes(&self, block_size: usize) -> Option<usize> {
+        // A uniform TurboQuant model's blocks are packed codes, not the dense
+        // rows the engine would derive — the same cost the draft split in
+        // `determine_available_memory` divides by.
+        let model = self.model.as_deref()?;
+        uniform_turboquant(model, block_size).then(|| target_block_bytes(model, block_size))
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {
@@ -2836,54 +2923,6 @@ impl Worker for MetalWorker {
         num_gpu_blocks: usize,
         _num_cpu_blocks: usize,
     ) -> ExecutorResult<()> {
-        // TurboQuant ON BY DEFAULT (metal): the default `kv_cache_dtype` is
-        // "auto". Resolve it to "turboquant" for arches TurboQuant supports
-        // (power-of-2 head_dim <= 256; gemma4's 512 global group is handled by
-        // the factory's GLOBAL gate). Unsupported arches (phi3 hd 96,
-        // deepseek 56, ...) keep fp16. An explicit `--kv-cache-dtype` is honored
-        // verbatim (only the literal "auto" default is upgraded here).
-        if self.config.kv_cache_dtype == "auto" {
-            let geom = self.model.as_ref().map(|m| {
-                (
-                    m.head_dim() as usize,
-                    m.num_key_value_heads() as usize,
-                    m.num_hidden_layers() as usize,
-                )
-            });
-            if let Some((hd, nkv, layers)) = geom {
-                // KV bytes per token, fp16, K and V across every layer —
-                // the quantity TurboQuant exists to shrink.
-                let kv_bytes_per_token = layers * nkv * hd * 2 /* K+V */ * 2 /* fp16 */;
-                if !(hd.is_power_of_two() && hd <= 256) {
-                    tracing::info!(
-                        "ScratchyWorker(metal): head_dim {hd} unsupported by TurboQuant (needs power-of-2 <= 256) — using fp16 KV"
-                    );
-                } else if kv_bytes_per_token < TQ_MIN_KV_BYTES_PER_TOKEN {
-                    // TurboQuant buys KV CAPACITY. A model whose whole KV
-                    // row is a few KB does not need the capacity and should
-                    // not pay the (4-bit) fidelity cost: `qwen2.5-0.5b` is
-                    // 24 layers x 2 kv x 64 = 12 KiB/token. (Its old garbage
-                    // under TurboQuant was the codec coding its `k_proj` bias
-                    // — 137x the signal on layer 0 — as signal; the KV writer
-                    // now declares that offset and the codec removes it.)
-                    tracing::info!(
-                        "ScratchyWorker(metal): KV is {} KiB/token ({} layers x {nkv} kv x {hd}) — \
-                         below the {} KiB TurboQuant threshold, using fp16 KV \
-                         (compression buys little here; pass --kv-cache-dtype turboquant to force)",
-                        kv_bytes_per_token / 1024,
-                        layers,
-                        TQ_MIN_KV_BYTES_PER_TOKEN / 1024
-                    );
-                } else {
-                    self.config.kv_cache_dtype = "turboquant".to_string();
-                    tracing::info!(
-                        "ScratchyWorker(metal): TurboQuant KV ON by default (head_dim {hd}, \
-                         {} KiB/token); pass --kv-cache-dtype fp16 to disable",
-                        kv_bytes_per_token / 1024
-                    );
-                }
-            }
-        }
         let model = self
             .model
             .as_ref()
@@ -2898,6 +2937,23 @@ impl Worker for MetalWorker {
                 "FP8 KV cache not supported on metal — use F16".into(),
             ));
         }
+        // The KV codec was fixed when the model was built (`KV_CODEC`, from the
+        // `turboquant` feature and the model's geometry). A `--kv-cache-dtype`
+        // naming one asserts it rather than choosing it.
+        let kv_codec = model.kv_codec();
+        match (self.config.kv_cache_dtype.as_str(), kv_codec) {
+            ("auto", _)
+            | ("fp16", scratchy_forward_compiler::KvCodec::Dense)
+            | ("turboquant", scratchy_forward_compiler::KvCodec::TurboQuant(_)) => {}
+            (asked, built) => {
+                return Err(ExecutorError::WorkerInit(format!(
+                    "--kv-cache-dtype {asked}: this binary stores the model's KV cache as \
+                     {built}, fixed when it was built by the `turboquant` feature and the \
+                     model's geometry"
+                )));
+            }
+        }
+        info!("ScratchyWorker(metal): KV cache codec: {kv_codec} (built in)");
 
         // Metal KV cache is f16; the per-canonical `forward` reads block
         // pointers via `KvCachePool::k_layer_mem` / `v_layer_mem` (added
@@ -2974,36 +3030,7 @@ impl Worker for MetalWorker {
         let elem_bytes = cache_dtype.size_bytes();
         let chunk_bytes_logical = blocks_per_chunk * per_block_elems * elem_bytes;
 
-        // vLLM group-shared hybrid KV layout (gemma4): infer the per-layer
-        // sliding mask from `per_layer_kv_token_elems` (the bigger-page class
-        // is the sliding class) and compute the grouping. This is `Some` only
-        // for the page-differentiated case — the SAME trigger the scheduler's
-        // `hybrid_kv` uses in `init`, so the two never disagree on group count.
-        // `None` → one physical tensor per layer (the uniform pool).
-        let hybrid_layout: Option<scratchy_core_config::HybridKvLayout> =
-            model.per_layer_kv_token_elems().and_then(|elems| {
-                let max_e = *elems.iter().max()?;
-                let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
-                    .iter()
-                    .map(|&e| scratchy_core_config::LayerKvGeometry {
-                        is_sliding: e == max_e,
-                        // Page proxy: head_size 1 keeps the per-class page RATIO
-                        // (only the ratio drives grouping + block_size scaling).
-                        num_kv_heads: e,
-                        head_size: 1,
-                        head_size_v: None,
-                        sliding_window: if e == max_e { Some(1) } else { None },
-                    })
-                    .collect();
-                // `available` is irrelevant here — the pool sizes from the
-                // passed `num_gpu_blocks`; we only read the grouping fields.
-                scratchy_core_config::compute_hybrid_kv_layout(
-                    &geom,
-                    self.config.block_size,
-                    usize::MAX / 2,
-                    elem_bytes,
-                )
-            });
+        let hybrid_layout = hybrid_kv_layout(model.as_ref(), self.config.block_size, elem_bytes);
         // One physical tensor per group POSITION (gemma4: group_size=5) on the
         // hybrid path; one per layer otherwise.
         let num_tensors_for_pool = hybrid_layout
@@ -3049,12 +3076,11 @@ impl Worker for MetalWorker {
             // path needs the full capacity; VA is lazily paged (Apple pager), so
             // the untouched global tensors cost no physical memory — the SWA win
             // (global packed + sliding fp16-windowed) is preserved.
-            let max_chunks =
-                if self.config.kv_cache_dtype == "turboquant" && hybrid_layout.is_none() {
-                    1
-                } else {
-                    num_chunks_total
-                };
+            let max_chunks = if kv_codec.is_turboquant() && hybrid_layout.is_none() {
+                1
+            } else {
+                num_chunks_total
+            };
             let layer = scratchy_target_metal::single_buffer_kv::SingleBufferKvLayer::new(
                 &mtl_device,
                 &residency,
@@ -3175,27 +3201,6 @@ impl Worker for MetalWorker {
             self.config.block_size,
         );
         self.kv_cache = Some(pool);
-
-        // TurboQuant KV compression (`kv_cache_dtype == "turboquant"`) is owned by
-        // the per-layer tape ops, factory-provisioned via ForwardCtx::kv_turboquant.
-        // TurboQuant supports only power-of-2 head_dim <= 256 (the Walsh-Hadamard
-        // rotation needs a power-of-2 length; the kernel threadgroup caps at 256
-        // threads). Models like phi3 (hd 96), deepseek_v3 (hd 56), kimi_k2 (hd
-        // 112) fall OUTSIDE that — for those we must NOT enable it (it
-        // would panic in PolarQuantizer); fall back to plain fp16 + warn. This is
-        // what makes turboquant safe to request/default on any model.
-        let tq_hd = model.head_dim() as usize;
-        let tq_supported = tq_hd.is_power_of_two() && tq_hd <= 256;
-        if self.config.kv_cache_dtype == "turboquant" && !tq_supported {
-            tracing::warn!(
-                "ScratchyWorker(metal): TurboQuant unsupported for head_dim {tq_hd} (needs power-of-2 <= 256) — falling back to fp16 KV cache"
-            );
-        }
-        if self.config.kv_cache_dtype == "turboquant" && tq_supported {
-            info!(
-                "ScratchyWorker(metal): TurboQuant — per-layer tape ops active (factory-provisioned)"
-            );
-        }
 
         // Gated-DeltaNet (Qwen3.5 / Qwen3-Next) recurrent-state pool —
         // the non-paged sibling of the KV cache. Only hybrid arches
@@ -3402,18 +3407,30 @@ impl Worker for MetalWorker {
         // the bucket selector just split.
         let available =
             compute_available_kv_bytes(total, weights_and_overhead, peak_activation_estimate, 1.0);
+        // A uniform TurboQuant pool still reserves one fp16 chunk per layer
+        // (`initialize_cache`), whatever its block count.
+        let tq_seed = self
+            .model
+            .as_deref()
+            .filter(|m| uniform_turboquant(*m, self.config.block_size))
+            .map_or(0, |m| {
+                scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
+                    * kv_per_block_bytes(m, self.config.block_size)
+            });
+        let available = available.saturating_sub(tq_seed);
         // Per-pair split: when a draft model is loaded, every target KV
         // block has a 1:1 mirror in the draft pool, so the engine should
         // think it has only `target / (target + draft)` of the budget.
-        // After the engine divides by `target_per_block_bytes` to land on
-        // num_gpu_blocks, the same count of draft blocks fits inside the
-        // remaining `draft / (target + draft)` slice.
+        // After the engine divides by the target's per-block bytes
+        // (`kv_block_bytes`, or its dense row) to land on num_gpu_blocks,
+        // the same count of draft blocks fits inside the remaining
+        // `draft / (target + draft)` slice.
         let (available_reported, draft_reservation) = if let Some(draft) = self.draft_model.as_ref()
         {
             let target = self.model.as_ref().expect("model loaded before draft");
             let bs = self.config.block_size;
-            let t_pb = kv_per_block_bytes(target.as_ref(), bs);
-            let d_pb = kv_per_block_bytes(draft.as_ref(), bs);
+            let t_pb = target_block_bytes(target.as_ref(), bs);
+            let d_pb = draft_block_bytes(draft.as_ref(), bs);
             let denom = t_pb.saturating_add(d_pb).max(1);
             // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
             let scaled = (available as u128 * t_pb as u128 / denom as u128) as usize;
@@ -3423,12 +3440,13 @@ impl Worker for MetalWorker {
         };
         info!(
             "ScratchyWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
-             arena_peak={:.1} MiB (pair={:.1} MiB), kv_budget={:.1} GiB \
+             arena_peak={:.1} MiB (pair={:.1} MiB), tq_seed={:.1} MiB, kv_budget={:.1} GiB \
              (target_share={:.1} GiB, draft_reserve={:.1} GiB)",
             total as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
             arena_peak as f64 / 1_048_576.0,
             arena_peak_pair as f64 / 1_048_576.0,
+            tq_seed as f64 / 1_048_576.0,
             available as f64 / 1_073_741_824.0,
             available_reported as f64 / 1_073_741_824.0,
             draft_reservation as f64 / 1_073_741_824.0,
@@ -4364,7 +4382,6 @@ impl Worker for MetalWorker {
                             gdn_state_indices: None,
                             gdn_is_fresh: None,
                             has_spec_tokens: false,
-        kv_turboquant: false, // secondary path; tq provisioned via the main forward
                             last_token_indices: None,
                         };
                         let logits = unsafe {

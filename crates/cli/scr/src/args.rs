@@ -518,7 +518,9 @@ pub struct ServeArgs {
     pub cublas_autotune: bool,
 
     /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3" (FP8).
-    /// FP8 halves KV cache memory, doubling capacity.
+    /// FP8 halves KV cache memory, doubling capacity. On metal the KV codec is
+    /// fixed when the binary is built (the `turboquant` feature): "auto" takes
+    /// it, and "fp16" / "turboquant" assert it — a mismatch refuses to start.
     #[arg(long, default_value = "auto")]
     pub kv_cache_dtype: String,
 

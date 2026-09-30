@@ -376,7 +376,7 @@ mod tests {
                 ]),
                 gemm_dims: None,
             },
-            gate: Some(RuntimeGate::OnlyIfTurboquant),
+            gate: Some(RuntimeGate::OnlyIfDecodeStep),
         }
     }
 
@@ -393,7 +393,7 @@ mod tests {
             "Binding :: ArenaSlot { slot : 2u32 , binding_index : 0u8 }",
             "Binding :: Source { ix : 7u32 , binding_index : 1u8 }",
             "index : 3u16",
-            "RuntimeGate :: OnlyIfTurboquant",
+            "RuntimeGate :: OnlyIfDecodeStep",
             "\"metal_embed_f16\"",
         ] {
             assert!(s.contains(needle), "missing `{needle}` in:\n{s}");

@@ -247,12 +247,14 @@ async fn test_qwen2_vl_bug1_prefill_graph_skips_encoder() {
 /// through `crates/targets/metal/shaders/turboquant.metal` /
 /// `crates/layers/src/turboquant.rs`), NOT in the KV routing.
 ///
-/// This test exists to make the fix un-gameable. It forces
-/// `--kv-cache-dtype turboquant` **explicitly**, so the only way to turn it
-/// green is to make TurboQuant reconstruct image KV accurately.
+/// This test exists to make the fix un-gameable. It asserts
+/// `--kv-cache-dtype turboquant` **explicitly** — the server refuses to start
+/// unless the binary was built with the `turboquant` feature and this model's
+/// KV codec is TurboQuant — so the only way to turn it green is to make
+/// TurboQuant reconstruct image KV accurately.
 ///
 /// 🛑 DO NOT "fix" a failure here by:
-///   - routing multimodal models to fp16 (`gpu_worker.rs` `kv_cache_dtype` /
+///   - making multimodal models dense (`turboquant::codec_for`, the
 ///     `self.mm.is_some()` gate / `prefill_bucket_max_m`),
 ///   - skipping/fp16-ing image-token KV positions,
 ///   - or relaxing this test's model/flags.
@@ -291,7 +293,7 @@ async fn test_qwen2_vl_turboquant_image_forced_on() {
     assert_mentions_any(
         text,
         &["red", "circle", "round"],
-        "TurboQuant image KV (forced --kv-cache-dtype turboquant)",
+        "TurboQuant image KV (asserted --kv-cache-dtype turboquant)",
     );
 }
 

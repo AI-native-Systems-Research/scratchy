@@ -20,7 +20,9 @@ see [CUDA: build the kernels first](#cuda-build-the-kernels-first). Add
 (`chat` — the in-process engine — is on by default), `multimodal` for the
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
 HuggingFace model ids is on by default (`hf-completions`); pass
-`--no-default-features` to build with no network access at all.
+`--no-default-features` to build with no network access at all. TurboQuant KV
+compression on metal is on by default too, and fixed at build time — see
+[`turboquant`](#turboquant--kv-cache-compression-fixed-at-build-time).
 
 ## CUDA: build the kernels first
 
@@ -158,6 +160,37 @@ model never ends up with zero compiled variants.
   dense on every build using that backend).
 
 No `quant/*` feature named at all = every selected model compiles dense only.
+
+## `turboquant` — KV cache compression, fixed at build time
+
+On metal, a model's KV cache is either dense (the model's own dtype) or
+TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
+decides which: nothing chooses at runtime. The `turboquant` feature is **on by
+default** in `scratchy-cli` and does nothing on cuda or spyre.
+
+With it on, every selected model whose geometry the codec takes is emitted with
+`KV_CODEC = TurboQuant`; the rest stay dense and the build names each one and
+why:
+
+```
+warning: scratchy-models@0.1.0: turboquant: qwen2.5-0.5b keeps a dense KV cache: its KV row is 12 KiB/token, below the 24 KiB TurboQuant threshold
+```
+
+A model stays dense when it has no KV cache, when its KV cache is an MLA
+latent, when a head_dim is not a power of two no wider than 512, or when its
+fp16 KV row is under 24 KiB/token — too small for the capacity to be worth the
+fidelity. The rule is `scratchy_layers::turboquant::codec_for`. The
+server logs the loaded model's codec at start (`KV cache codec: TurboQuant
+3-bit (built in)`).
+
+`--kv-cache-dtype` on metal takes the codec by default (`auto`) and can only
+*assert* it: `fp16` or `turboquant` refuses to start if the binary stores the
+model's KV cache the other way. For a dense-KV metal binary, drop the feature:
+
+```bash
+cargo build -p scratchy-cli --no-default-features \
+    --features chat,hf-completions,metal,model/llama-3.2-1b
+```
 
 ## `hf-completions` — shell tab completion over real model ids
 

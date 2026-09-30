@@ -33,17 +33,19 @@ fn greedy_params(max_tokens: u32) -> SamplingParams {
 /// memory, which OOMs the Metal command buffer when another process already
 /// holds most of the GPU).
 fn build_llm(model: &str) -> scratchy_serving_api::llm::LLM {
-    // Force fp16 KV: these tests assert the *fp16 rope-on-read* transparency
-    // invariant (annotated == normal, bit-for-bit). TurboQuant is on by default
-    // on metal and stores lossy KV codes, which makes the rope-on-read reuse
-    // path diverge from rotate-on-write by quant noise — failing the assert by
-    // construction. Spans-under-TurboQuant is covered separately by the bench
-    // reuse/coherence checks, not this bit-identity gate.
-    // Default fp16 KV: the bit-identity coherence tests need a lossless cache.
-    // The PERF bench (which does not assert bit-identity) overrides via
-    // SPANS_KV_DTYPE=auto to run the production TurboQuant path (what real
-    // `serve`/`launch claude` use), so gemma's hd512 global KV is compressed
-    // instead of ballooning fp16 and OOMing at long context on 32GB.
+    // Assert fp16 KV: these tests check the *fp16 rope-on-read* transparency
+    // invariant (annotated == normal, bit-for-bit). TurboQuant stores lossy KV
+    // codes, which makes the rope-on-read reuse path diverge from
+    // rotate-on-write by quant noise — failing the assert by construction. The
+    // KV codec is fixed at build time, so the engine refuses to start if this
+    // build stores the model's KV as TurboQuant: run these against a build
+    // without the `turboquant` feature. Spans-under-TurboQuant is covered
+    // separately by the bench reuse/coherence checks, not this bit-identity gate.
+    // The PERF bench (which does not assert bit-identity) sets
+    // SPANS_KV_DTYPE=auto to accept whatever codec the build has — TurboQuant
+    // in a default build, what real `serve`/`launch claude` use, so gemma's
+    // hd512 global KV is compressed instead of ballooning fp16 and OOMing at
+    // long context on 32GB.
     let kv_dtype = std::env::var("SPANS_KV_DTYPE")
         .ok()
         .unwrap_or_else(|| "fp16".into());

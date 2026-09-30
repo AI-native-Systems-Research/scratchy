@@ -30,7 +30,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::tape::model_consts::MetalModelConsts;
-use scratchy_ir::Instruction;
+use scratchy_ir::{Instruction, KvCodec, TqBits};
 
 /// Set by the worker when a draft model is loaded. The
 /// `attention_via_cache_v2_*` kernel's BPC=0 fast path has an unresolved
@@ -138,6 +138,26 @@ pub fn lower_pair(
         block_cap,
         profile,
     )?;
+    let binds_kv_cache = |c: &GatedCommand| {
+        c.command.bindings.iter().any(|b| {
+            matches!(
+                b,
+                Binding::Runtime {
+                    kind: RuntimeBindingKind::KvCacheK { .. } | RuntimeBindingKind::KvCacheV { .. },
+                    ..
+                }
+            )
+        })
+    };
+    if p.kv_codec.is_turboquant()
+        && bb.commands.iter().any(binds_kv_cache)
+        && !bb
+            .commands
+            .iter()
+            .any(|c| c.command.kernel == KernelId::TqQuantizeToPacked)
+    {
+        return Err(LoweringError::TurboQuantCompressesNothing);
+    }
     let mut commands = bb.commands.to_vec();
     let mut barrier_before = bb.barrier_before.to_vec();
     // Backbone commands (`bb.commands`) carry their own gate on each
@@ -680,6 +700,7 @@ fn tq_stage_command<const IS_K: bool>(
     bucket_m: u32,
     block_cap: u32,
     pass: super::kernel_constants::TqStagePass,
+    bits: TqBits,
 ) -> LoweredCommand {
     let (ror_rd, ror_po, ror_on, ror_bind) = if IS_K {
         rope_on_read_params(p, is_global)
@@ -706,7 +727,7 @@ fn tq_stage_command<const IS_K: bool>(
             block_size: super::ids::BlockSize(p.global_block_size),
             max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
-            bits: super::ids::TqCodeBits(p.tq_kv_bits),
+            bits: super::ids::TqCodeBits(bits.get()),
             rot_dim: ror_rd,
             pair_off: ror_po,
             rope_on_read: ror_on,
@@ -802,6 +823,7 @@ fn tq_quantize_command<const IS_K: bool>(
     layer: u32,
     operand: TqOperand<IS_K>,
     bucket_m: u32,
+    bits: TqBits,
 ) -> LoweredCommand {
     use RuntimeBindingKind as RB;
     let (hd, nkv, bs) = (
@@ -809,7 +831,7 @@ fn tq_quantize_command<const IS_K: bool>(
         p.num_global_kv_heads,
         p.global_block_size,
     );
-    let bits = p.tq_kv_bits;
+    let bits = bits.get();
     let vpw = 32 / bits;
     let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
     let li = super::ids::LayerId(layer);
@@ -883,16 +905,16 @@ fn tq_quantize_command<const IS_K: bool>(
 /// One query head per threadgroup until [`serve_tq_decode_heads`] sets the
 /// device's count at load.
 fn tq_attention_command(
-    p: &MetalModelConsts,
     attention: &TqAttention,
     layer: u32,
     ops: TqOperands,
+    bits: TqBits,
 ) -> LoweredCommand {
     let attn = &attention.via_cache;
     let mut constants = attn.constants.to_vec();
     constants.extend(Vec::from(
         super::kernel_constants::AttentionViaCacheTqConstants {
-            bits: super::ids::TqCodeBits(p.tq_kv_bits),
+            bits: super::ids::TqCodeBits(bits.get()),
             k_bias: ops.k.0.is_some(),
             v_bias: ops.v.0.is_some(),
             heads: super::ids::TqDecodeHeads(1),
@@ -979,20 +1001,18 @@ struct TqSite {
     attention: Option<TqAttention>,
 }
 
-/// TurboQuant: inject the per-layer commands, gated on the TurboQuant runtime
-/// gates so they're inert unless the worker provisions the tq buffers. No-op
-/// unless head_dim is a power of 2 ≤ 512 (the only supported geometry). Every
+/// TurboQuant: inject the per-layer commands of a model whose KV codec
+/// (`p.kv_codec`) is TurboQuant; a dense model's tape is left as it is. Every
 /// codec command takes the operands of the KV writer it compresses (`site`).
 ///
 /// - The KV writer is followed by the quantize of the step's new K/V.
 /// - On a decode step — every sequence contributes one token, in any bucket —
 ///   the attention is the `AttentionViaCacheTq` twin of its decode-kernel
-///   form, reading the packed store directly (`OnlyIfTurboquantDecode`).
+///   form, reading the packed store directly (`OnlyIfDecodeStep`).
 /// - On any other step the instruction's own attention runs
-///   (`UnlessTurboquantDecode`) in the codebook's rotated domain: the K/V
-///   staging and q rotation before it and the output's rotation back after it
-///   are `OnlyIfTurboquantNotDecode`. A decode tape (`decode`) has no other
-///   steps and carries none of them.
+///   (`UnlessDecodeStep`) in the codebook's rotated domain, and so do the K/V
+///   staging and q rotation before it and the output's rotation back after
+///   it. A decode tape (`decode`) has no other steps and carries none of them.
 fn inject_tq(
     p: &MetalModelConsts,
     instruction: &Instruction,
@@ -1002,11 +1022,12 @@ fn inject_tq(
     bucket_m: u32,
     block_cap: u32,
 ) -> Result<Vec<GatedCommand>, TqUnbound> {
-    use crate::tape::lowered::RuntimeGate::{
-        OnlyIfTurboquant, OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode, UnlessTurboquantDecode,
+    use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
+    let KvCodec::TurboQuant(bits) = p.kv_codec else {
+        return Ok(cmds.into_iter().map(GatedCommand::ungated).collect());
     };
-    // Supported geometry = pow2 head_dim <= 512 (the kernels' widened threadgroup
-    // arrays). Leave the tape byte-identical for anything else.
+    // The codec is only TurboQuant where the geometry is one the kernels take
+    // (`scratchy_layers::turboquant::codec_for`).
     // - UNIFORM arches (GLOBAL_HEAD_DIM == HEAD_DIM): quantize every layer at the
     //   base geometry, dequant-before-rope + quantize-after-attention (as before).
     // - HYBRID/SWA arches (gemma4: GLOBAL 512 != base 256): quantize ONLY the
@@ -1020,11 +1041,6 @@ fn inject_tq(
     //   layers lower the `Sliding*` ones). MUST agree with the factory, which
     //   provisions GLOBAL-sized buffers for the global layers only.
     let hybrid = p.global_head_dim != p.head_dim;
-    let base_ok = p.head_dim.is_power_of_two() && p.head_dim <= 512;
-    let global_ok = p.global_head_dim.is_power_of_two() && p.global_head_dim <= 512;
-    if !base_ok || (hybrid && !global_ok) {
-        return Ok(cmds.into_iter().map(GatedCommand::ungated).collect());
-    }
     // The actual KV layer comes from the rope/attention command's own KvCacheK
     // binding — NOT the loop `iter` (0 for unrolled tapes like Llama).
     use crate::tape::lowered::{Binding, RuntimeBindingKind as RB};
@@ -1041,8 +1057,7 @@ fn inject_tq(
             _ => None,
         })
     }
-    let tq = |c| GatedCommand::gated(c, OnlyIfTurboquant);
-    let prefill = |c| GatedCommand::gated(c, OnlyIfTurboquantNotDecode);
+    let prefill = |c| GatedCommand::gated(c, UnlessDecodeStep);
     let global_attention = matches!(
         instruction,
         Instruction::AttentionPrefillPaged(..) | Instruction::AttentionViaCache(..)
@@ -1064,6 +1079,7 @@ fn inject_tq(
                     bucket_m,
                     block_cap,
                     pass,
+                    bits,
                 )));
                 out.push(prefill(tq_stage_command(
                     p,
@@ -1073,20 +1089,18 @@ fn inject_tq(
                     bucket_m,
                     block_cap,
                     pass,
+                    bits,
                 )));
             }
             out.push(prefill(tq_rotate_command(p, a.q, false, bucket_m)));
         }
-        out.extend(
-            cmds.into_iter()
-                .map(|c| GatedCommand::gated(c, UnlessTurboquantDecode)),
-        );
+        out.extend(cmds.into_iter().map(prefill));
         if !decode {
             out.push(prefill(tq_rotate_command(p, a.out, true, bucket_m)));
         }
         out.push(GatedCommand::gated(
-            tq_attention_command(p, &a, layer, ops),
-            OnlyIfTurboquantDecode,
+            tq_attention_command(&a, layer, ops, bits),
+            OnlyIfDecodeStep,
         ));
         return Ok(out);
     }
@@ -1104,8 +1118,12 @@ fn inject_tq(
         out.push(GatedCommand::ungated(cmd));
         if writer && tq_layer {
             let ops = tq_operands(p, site.writes)?;
-            out.push(tq(tq_quantize_command(p, layer, ops.k, bucket_m)));
-            out.push(tq(tq_quantize_command(p, layer, ops.v, bucket_m)));
+            out.push(GatedCommand::ungated(tq_quantize_command(
+                p, layer, ops.k, bucket_m, bits,
+            )));
+            out.push(GatedCommand::ungated(tq_quantize_command(
+                p, layer, ops.v, bucket_m, bits,
+            )));
         }
     }
     Ok(out)
@@ -1454,7 +1472,8 @@ pub fn lower(
                 let own = lower_at(other)?;
                 // The decode-kernel form of a paged attention: under TurboQuant,
                 // decode steps run its `AttentionViaCacheTq` twin (`inject_tq`).
-                let attention = match paged_attention(other) {
+                let attention = match paged_attention(other).filter(|_| p.kv_codec.is_turboquant())
+                {
                     Some(a) => lower_at(&a.decode_form)?
                         .into_iter()
                         .next()
@@ -9316,6 +9335,17 @@ mod tests {
     fn tp() -> MetalModelConsts {
         MetalModelConsts::from_canonical::<TestParams>()
     }
+
+    /// The code width the TurboQuant fixture is built at.
+    const TQ_BITS: TqBits = TqBits::new(4);
+
+    /// `tp()` built with the `turboquant` feature: its KV codec is TurboQuant.
+    fn tq_consts() -> MetalModelConsts {
+        MetalModelConsts {
+            kv_codec: KvCodec::TurboQuant(TQ_BITS),
+            ..tp()
+        }
+    }
     use scratchy_ir::Instruction;
 
     /// Minimal `CanonicalParams` impl for lowering-shape tests. No
@@ -9365,7 +9395,11 @@ mod tests {
 
     /// Lower one layer — the KV writer, then its attention — at `bucket_m`.
     fn lower_tq_layer(attention: Instruction, bucket_m: u32) -> LoweredMetalTape {
-        lower_tq(&tp(), &[tq_writer(0, true, LLAMA_KV), attention], bucket_m)
+        lower_tq(
+            &tq_consts(),
+            &[tq_writer(0, true, LLAMA_KV), attention],
+            bucket_m,
+        )
     }
 
     fn lower_tq(p: &MetalModelConsts, backbone: &[Instruction], bucket_m: u32) -> LoweredMetalTape {
@@ -9393,23 +9427,66 @@ mod tests {
         )
     }
 
-    /// Each injected TurboQuant command must carry the `OnlyIfTurboquant` gate
-    /// so it is skipped on a non-turboquant (fp16) KV cache — otherwise the TQ
-    /// kernels dispatch on fp16, read OOB from the unbound packed/norms fallback
-    /// bindings, and silently WEDGE the GPU. The gate is fused onto each
-    /// `GatedCommand`, so it can no longer be dropped by a parallel-vec mishap
-    /// (that is now a compile error); these tests verify `inject_tq` assigns
-    /// the gate VALUE correctly and `lower_pair` carries it. Pure-CPU lowering
-    /// checks — never submit a Metal command buffer.
-    ///
-    /// Decode: no dequant pass; the plain attention runs only off TurboQuant
-    /// and its `AttentionViaCacheTq` twin — same geometry, plus the codebook
-    /// width and the packed-store bindings — only on TurboQuant KV.
+    /// A dense model's tape carries no TurboQuant command and gates nothing on
+    /// the step shape: the codec is in the tape only when the model was built
+    /// with it. Pure-CPU lowering checks — never submit a Metal command buffer.
+    #[test]
+    fn dense_codec_lowers_no_turboquant_commands() {
+        assert_eq!(tp().kv_codec, KvCodec::Dense);
+        for (attention, bucket_m) in [
+            (Instruction::AttentionViaCache(3, 6, 0, true), 1),
+            (Instruction::AttentionPrefillPaged(3, 6, 0, false), 64),
+        ] {
+            let tape = lower_tq(&tp(), &[tq_writer(0, true, LLAMA_KV), attention], bucket_m);
+            assert!(
+                tape.commands.iter().all(|c| !matches!(
+                    c.command.kernel,
+                    KernelId::TqQuantizeToPacked
+                        | KernelId::TqStageRotated
+                        | KernelId::TqRotateRows
+                        | KernelId::AttentionViaCacheTq
+                )),
+                "{attention:?}"
+            );
+            assert!(tape.commands.iter().all(|c| !matches!(
+                c.gate,
+                Some(RuntimeGate::OnlyIfDecodeStep | RuntimeGate::UnlessDecodeStep)
+            )));
+        }
+    }
+
+    /// A TurboQuant model whose backbone binds the KV cache but compresses
+    /// none of it does not lower: a hybrid model's sliding layers alone stay
+    /// fp16, so nothing would write the packed stores its factory provisions.
+    #[test]
+    fn turboquant_that_compresses_nothing_does_not_lower() {
+        let p = MetalModelConsts {
+            global_head_dim: 512,
+            num_global_kv_heads: 1,
+            global_block_size: 32,
+            global_rot_dim: 128,
+            sliding_window: 1024,
+            ..tq_consts()
+        };
+        assert!(matches!(
+            try_lower_tq(
+                &p,
+                &[
+                    tq_writer(1, false, LLAMA_KV),
+                    Instruction::SlidingAttentionViaCache(3, 6, 1, true),
+                ],
+                1,
+            ),
+            Err(LoweringError::TurboQuantCompressesNothing)
+        ));
+    }
+
+    /// Decode: no dequant pass; the plain attention runs off decode steps and
+    /// its `AttentionViaCacheTq` twin — same geometry, plus the codebook width
+    /// and the packed-store bindings — on them. The quantize runs every step.
     #[test]
     fn decode_turboquant_reads_packed_store_without_dequant() {
-        use crate::tape::lowered::RuntimeGate::{
-            self, OnlyIfTurboquant, OnlyIfTurboquantDecode, UnlessTurboquantDecode,
-        };
+        use crate::tape::lowered::RuntimeGate::{self, OnlyIfDecodeStep, UnlessDecodeStep};
         let tape = lower_tq_layer(Instruction::AttentionViaCache(3, 6, 0, true), 1);
         let steps: Vec<(KernelId, Option<RuntimeGate>)> = tape
             .commands
@@ -9420,10 +9497,10 @@ mod tests {
             steps,
             [
                 (KernelId::RopeAppend, None),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-                (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-                (KernelId::AttentionViaCache, Some(UnlessTurboquantDecode)),
-                (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)),
+                (KernelId::TqQuantizeToPacked, None),
+                (KernelId::TqQuantizeToPacked, None),
+                (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
+                (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
             ]
         );
         let (fp16, tq) = (&tape.commands[3].command, &tape.commands[4].command);
@@ -9431,7 +9508,7 @@ mod tests {
             (fp16.library, fp16.function, fp16.dispatch),
             (tq.library, tq.function, tq.dispatch)
         );
-        let bits = tp().tq_kv_bits;
+        let bits = TQ_BITS.get();
         assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
         assert_eq!(
             tq.constants[fp16.constants.len()..],
@@ -9472,7 +9549,7 @@ mod tests {
     #[test]
     fn decode_turboquant_heads_follow_the_device_not_the_baked_class() {
         use crate::tape::ids::{GpuCores, HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
-        let p = tp();
+        let p = tq_consts();
         let backbone = [
             tq_writer(0, true, LLAMA_KV),
             Instruction::AttentionViaCache(3, 6, 0, true),
@@ -9545,25 +9622,35 @@ mod tests {
     fn tq_attention_steps(
         prefill_attention: &[(KernelId, Option<RuntimeGate>)],
     ) -> Vec<(KernelId, Option<RuntimeGate>)> {
-        use crate::tape::lowered::RuntimeGate::{
-            OnlyIfTurboquantDecode, OnlyIfTurboquantNotDecode, UnlessTurboquantDecode,
-        };
+        use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
         // K and V staged twice: the new rows, then the cached ones.
         let mut steps = vec![
-            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
-            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
-            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
-            (KernelId::TqStageRotated, Some(OnlyIfTurboquantNotDecode)),
-            (KernelId::TqRotateRows, Some(OnlyIfTurboquantNotDecode)),
+            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
+            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
+            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
+            (KernelId::TqStageRotated, Some(UnlessDecodeStep)),
+            (KernelId::TqRotateRows, Some(UnlessDecodeStep)),
         ];
         steps.extend(
             prefill_attention
                 .iter()
-                .map(|&(k, _)| (k, Some(UnlessTurboquantDecode))),
+                .map(|&(k, _)| (k, Some(UnlessDecodeStep))),
         );
-        steps.push((KernelId::TqRotateRows, Some(OnlyIfTurboquantNotDecode)));
-        steps.push((KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)));
+        steps.push((KernelId::TqRotateRows, Some(UnlessDecodeStep)));
+        steps.push((KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)));
         steps
+    }
+
+    /// The attention's own commands in `tape`: off decode steps, and not one
+    /// of the codec's staging or rotation commands around it.
+    fn own_attention_steps(tape: &LoweredMetalTape) -> Vec<(KernelId, Option<RuntimeGate>)> {
+        gated_steps(tape)
+            .into_iter()
+            .filter(|&(k, g)| {
+                g == Some(RuntimeGate::UnlessDecodeStep)
+                    && !matches!(k, KernelId::TqStageRotated | KernelId::TqRotateRows)
+            })
+            .collect()
     }
 
     fn gated_steps(tape: &LoweredMetalTape) -> Vec<(KernelId, Option<RuntimeGate>)> {
@@ -9578,22 +9665,20 @@ mod tests {
     /// the TurboQuant commands, while the sliding layer stays plain fp16.
     #[test]
     fn hybrid_turboquant_compresses_global_layers_only() {
-        use crate::tape::lowered::RuntimeGate::{
-            OnlyIfTurboquant, OnlyIfTurboquantDecode, UnlessTurboquantDecode,
-        };
+        use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
         let p = MetalModelConsts {
             global_head_dim: 512,
             num_global_kv_heads: 1,
             global_block_size: 32,
             global_rot_dim: 128,
             sliding_window: 1024,
-            ..tp()
+            ..tq_consts()
         };
         let global_writer = tq_writer(0, true, LLAMA_KV);
         let sliding_writer = tq_writer(1, false, LLAMA_KV);
         let quantize = [
-            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+            (KernelId::TqQuantizeToPacked, None),
+            (KernelId::TqQuantizeToPacked, None),
         ];
         let decode = lower_tq(
             &p,
@@ -9608,8 +9693,8 @@ mod tests {
         let mut want = vec![(KernelId::RopeAppend, None)];
         want.extend(quantize);
         want.extend([
-            (KernelId::AttentionViaCache, Some(UnlessTurboquantDecode)),
-            (KernelId::AttentionViaCacheTq, Some(OnlyIfTurboquantDecode)),
+            (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
+            (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
             (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, None),
         ]);
@@ -9617,15 +9702,16 @@ mod tests {
 
         let global_attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
         let sliding_attention = Instruction::SlidingAttentionPrefillPaged(3, 6, 1, false);
-        let plain = |i: Instruction| gated_steps(&lower_tq(&p, &[i], 64));
+        // A sliding layer lowers as it would in a dense model; alone in a tape
+        // it compresses nothing, which a TurboQuant model's tape may not do.
+        let dense = MetalModelConsts {
+            kv_codec: KvCodec::Dense,
+            ..p
+        };
+        let plain = |i: Instruction| gated_steps(&lower_tq(&dense, &[i], 64));
         // A TurboQuant'd attention compresses its layer's writer's operands, so
         // its own commands are read off a tape that has the writer.
-        let own = |i: Instruction| {
-            gated_steps(&lower_tq(&p, &[global_writer, i], 64))
-                .into_iter()
-                .filter(|&(_, g)| g == Some(UnlessTurboquantDecode))
-                .collect::<Vec<_>>()
-        };
+        let own = |i: Instruction| own_attention_steps(&lower_tq(&p, &[global_writer, i], 64));
         let prefill = lower_tq(
             &p,
             &[
@@ -9723,18 +9809,14 @@ mod tests {
     /// dequant pass on any step.
     #[test]
     fn prefill_turboquant_attends_in_the_rotated_domain() {
-        use crate::tape::lowered::RuntimeGate::{OnlyIfTurboquant, UnlessTurboquantDecode};
         let attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
         let tape = lower_tq_layer(attention, 64);
         let mut want = vec![
             (KernelId::RopeAppend, None),
-            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
-            (KernelId::TqQuantizeToPacked, Some(OnlyIfTurboquant)),
+            (KernelId::TqQuantizeToPacked, None),
+            (KernelId::TqQuantizeToPacked, None),
         ];
-        let own: Vec<_> = gated_steps(&tape)
-            .into_iter()
-            .filter(|&(_, g)| g == Some(UnlessTurboquantDecode))
-            .collect();
+        let own = own_attention_steps(&tape);
         assert!(!own.is_empty(), "the attention's own commands");
         want.extend(tq_attention_steps(&own));
         assert_eq!(gated_steps(&tape), want);
@@ -9804,75 +9886,73 @@ mod tests {
     /// sequences runs a per-row twin reading K through each sequence's own
     /// block-table row: the same kernel reading the cache's roped K as is, or,
     /// when the step holds an unrotated span block, the sdpa-paged kernel
-    /// re-roping it (cos_sin). All keep their TurboQuant gate. Checked for the
-    /// full and sliding arms.
+    /// re-roping it (cos_sin). Under TurboQuant all keep their decode-step
+    /// gate. Checked for the full and sliding arms, dense and TurboQuant.
     #[test]
     fn prefill_attention_reads_the_rope_once_scratch_only_for_one_sequence() {
         use crate::tape::lowered::RuntimeGate::{
-            OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence, UnlessTurboquantDecode,
+            OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessDecodeStep, UnlessOneSequence,
             UnlessUnrotatedBlocks,
         };
-        let p = MetalModelConsts {
-            rope_on_read: true,
-            sliding_window: 512,
-            ..tp()
-        };
-        let one = RuntimeGate::All(&[UnlessTurboquantDecode, OnlyIfOneSequence]);
-        let plain = RuntimeGate::All(&[
-            UnlessTurboquantDecode,
-            UnlessOneSequence,
-            UnlessUnrotatedBlocks,
-        ]);
-        let reroping = RuntimeGate::All(&[
-            UnlessTurboquantDecode,
-            UnlessOneSequence,
-            OnlyIfUnrotatedBlocks,
-        ]);
-        for attention in [
-            Instruction::AttentionPrefillPaged(3, 6, 0, false),
-            Instruction::SlidingAttentionPrefillPaged(3, 6, 0, false),
+        for (codec, step_gate) in [
+            (KvCodec::Dense, None),
+            (KvCodec::TurboQuant(TQ_BITS), Some(UnlessDecodeStep)),
         ] {
-            let tape = lower_tq(&p, &[tq_writer(0, true, LLAMA_KV), attention], 64);
-            let own: Vec<&GatedCommand> = tape
-                .commands
-                .iter()
-                .filter(|c| [one, plain, reroping].iter().any(|g| c.gate == Some(*g)))
-                .collect();
-            assert_eq!(
-                own.iter()
-                    .map(|c| (c.command.kernel, c.gate))
-                    .collect::<Vec<_>>(),
-                [
-                    (KernelId::RopeOnceSteel, Some(one)),
-                    (KernelId::AttentionPrefillSdpaPaged, Some(one)),
-                    (KernelId::AttentionPrefillSdpaPaged, Some(plain)),
-                    (KernelId::AttentionPrefillSdpaPaged, Some(reroping)),
-                ],
-                "{attention:?}"
-            );
-            let binds =
-                |c: &GatedCommand, f: fn(&Binding) -> bool| c.command.bindings.iter().any(f);
-            let scratch = |b: &Binding| matches!(b, Binding::RopedKScratch { .. });
-            let cos_sin = |b: &Binding| {
-                matches!(
-                    b,
-                    Binding::Weight {
-                        kind: WeightBundleKind::RopeOnReadCosSin { .. },
-                        ..
-                    }
-                )
+            let p = MetalModelConsts {
+                rope_on_read: true,
+                sliding_window: 512,
+                kv_codec: codec,
+                ..tp()
             };
-            assert!(binds(own[1], scratch) && !binds(own[1], cos_sin));
-            assert!(!binds(own[2], scratch) && !binds(own[2], cos_sin));
-            assert!(!binds(own[3], scratch) && binds(own[3], cos_sin));
-            assert_eq!(
-                own[2].command.function, own[1].command.function,
-                "the plain twin is the scratch attention's own kernel"
-            );
-            assert_eq!(
-                own[3].command.function,
-                "attention_prefill_sdpa_v2_paged_bf16_specialized"
-            );
+            let one = RuntimeGate::and(step_gate, &[OnlyIfOneSequence]);
+            let plain = RuntimeGate::and(step_gate, &[UnlessOneSequence, UnlessUnrotatedBlocks]);
+            let reroping = RuntimeGate::and(step_gate, &[UnlessOneSequence, OnlyIfUnrotatedBlocks]);
+            for attention in [
+                Instruction::AttentionPrefillPaged(3, 6, 0, false),
+                Instruction::SlidingAttentionPrefillPaged(3, 6, 0, false),
+            ] {
+                let tape = lower_tq(&p, &[tq_writer(0, true, LLAMA_KV), attention], 64);
+                let own: Vec<&GatedCommand> = tape
+                    .commands
+                    .iter()
+                    .filter(|c| [one, plain, reroping].iter().any(|g| c.gate == Some(*g)))
+                    .collect();
+                assert_eq!(
+                    own.iter()
+                        .map(|c| (c.command.kernel, c.gate))
+                        .collect::<Vec<_>>(),
+                    [
+                        (KernelId::RopeOnceSteel, Some(one)),
+                        (KernelId::AttentionPrefillSdpaPaged, Some(one)),
+                        (KernelId::AttentionPrefillSdpaPaged, Some(plain)),
+                        (KernelId::AttentionPrefillSdpaPaged, Some(reroping)),
+                    ],
+                    "{codec}: {attention:?}"
+                );
+                let binds =
+                    |c: &GatedCommand, f: fn(&Binding) -> bool| c.command.bindings.iter().any(f);
+                let scratch = |b: &Binding| matches!(b, Binding::RopedKScratch { .. });
+                let cos_sin = |b: &Binding| {
+                    matches!(
+                        b,
+                        Binding::Weight {
+                            kind: WeightBundleKind::RopeOnReadCosSin { .. },
+                            ..
+                        }
+                    )
+                };
+                assert!(binds(own[1], scratch) && !binds(own[1], cos_sin));
+                assert!(!binds(own[2], scratch) && !binds(own[2], cos_sin));
+                assert!(!binds(own[3], scratch) && binds(own[3], cos_sin));
+                assert_eq!(
+                    own[2].command.function, own[1].command.function,
+                    "the plain twin is the scratch attention's own kernel"
+                );
+                assert_eq!(
+                    own[3].command.function,
+                    "attention_prefill_sdpa_v2_paged_bf16_specialized"
+                );
+            }
         }
     }
 
@@ -9883,21 +9963,30 @@ mod tests {
     #[test]
     fn hd512_unfused_prefill_runs_only_for_one_sequence() {
         use crate::tape::lowered::RuntimeGate::{
-            OnlyIfOneSequence, UnlessOneSequence, UnlessTurboquantDecode,
+            OnlyIfOneSequence, UnlessDecodeStep, UnlessOneSequence,
         };
         use crate::tape::lowered::SeqScope;
-        let one = RuntimeGate::All(&[UnlessTurboquantDecode, OnlyIfOneSequence]);
-        let rest = RuntimeGate::All(&[UnlessTurboquantDecode, UnlessOneSequence]);
-        for (kv_heads, per_row) in [
-            (2, "attention_prefill_sdpa_gqa_shared_bf16_specialized"),
-            (16, "attention_prefill_sdpa_v2_paged_bf16_specialized"),
-        ] {
+        for ((codec, step_gate), (kv_heads, per_row)) in [
+            (KvCodec::Dense, None),
+            (KvCodec::TurboQuant(TQ_BITS), Some(UnlessDecodeStep)),
+        ]
+        .into_iter()
+        .flat_map(|c| {
+            [
+                (2, "attention_prefill_sdpa_gqa_shared_bf16_specialized"),
+                (16, "attention_prefill_sdpa_v2_paged_bf16_specialized"),
+            ]
+            .map(|h| (c, h))
+        }) {
+            let one = RuntimeGate::and(step_gate, &[OnlyIfOneSequence]);
+            let rest = RuntimeGate::and(step_gate, &[UnlessOneSequence]);
             let p = MetalModelConsts {
                 rope_on_read: true,
                 global_head_dim: 512,
                 num_global_kv_heads: kv_heads,
                 global_block_size: 32,
                 global_rot_dim: 128,
+                kv_codec: codec,
                 ..tp()
             };
             let attention = Instruction::AttentionPrefillPaged(3, 6, 0, false);
@@ -9913,7 +10002,7 @@ mod tests {
             assert_eq!(
                 gated(rest).map(|c| c.function).collect::<Vec<_>>(),
                 [per_row],
-                "{kv_heads} kv heads"
+                "{codec}: {kv_heads} kv heads"
             );
             assert_eq!(tape.roped_k_scratch_bytes, 0);
         }
@@ -9986,7 +10075,7 @@ mod tests {
         use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
         let p = MetalModelConsts {
             rope_on_read: true,
-            ..tp()
+            ..tq_consts()
         };
         let qwen2 = KvOffsets {
             k: KvOffset::LinearBias(BiasStorage::Affine),
@@ -10086,7 +10175,7 @@ mod tests {
     #[test]
     fn turboquant_quantize_binds_the_kernel_abi() {
         use RuntimeBindingKind as RB;
-        let p = tp();
+        let p = tq_consts();
         let layer = crate::tape::ids::LayerId(0);
         let rt = |binding_index, kind| Binding::Runtime {
             kind,
@@ -10096,7 +10185,7 @@ mod tests {
             binding_index,
             value,
         };
-        let bits = p.tq_kv_bits;
+        let bits = TQ_BITS.get();
         let (hd, vpw) = (p.head_dim, 32 / bits);
         let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
         let tape = lower_tq_layer(Instruction::AttentionViaCache(3, 6, 0, true), 1);
@@ -10136,7 +10225,7 @@ mod tests {
         use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
         let decode = Instruction::AttentionViaCache(3, 6, 0, true);
         assert!(matches!(
-            try_lower_tq(&tp(), &[decode], 1),
+            try_lower_tq(&tq_consts(), &[decode], 1),
             Err(LoweringError::TurboQuantOffsetUnbound {
                 index: 0,
                 missing: TqUnbound::Writer
@@ -10146,9 +10235,9 @@ mod tests {
             k: KvOffset::LinearBias(BiasStorage::Dense),
             v: KvOffset::Centered,
         };
-        assert!(!tp().rope_on_read);
+        assert!(!tq_consts().rope_on_read);
         assert!(matches!(
-            try_lower_tq(&tp(), &[tq_writer(0, true, k_biased), decode], 1),
+            try_lower_tq(&tq_consts(), &[tq_writer(0, true, k_biased), decode], 1),
             Err(LoweringError::TurboQuantOffsetUnbound {
                 index: 0,
                 missing: TqUnbound::RotaryTable

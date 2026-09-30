@@ -221,6 +221,181 @@ pub fn bytes_per_vec(dim: usize, bits: u32) -> usize {
     packed_dim(dim, bits) * 4 + 4
 }
 
+/// A TurboQuant code width, in bits per rotated element. Only the widths
+/// [`vals_per_word`] has a packing for exist: `TqBits::new(5)` in a const is a
+/// compile error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TqBits(u32);
+
+impl TqBits {
+    pub const fn new(bits: u32) -> Self {
+        let _ = vals_per_word(bits);
+        Self(bits)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// How a model's KV cache is stored. Fixed per model when it is built: the
+/// `turboquant` feature gives every model whose geometry the codec supports
+/// [`KvCodec::TurboQuant`], and nothing chooses between them at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvCodec {
+    /// Uncompressed, in the model's own dtype.
+    Dense,
+    /// One packed code per rotated element and one f32 norm per head vector
+    /// ([`bytes_per_vec`]).
+    TurboQuant(TqBits),
+}
+
+impl KvCodec {
+    pub const fn is_turboquant(self) -> bool {
+        matches!(self, Self::TurboQuant(_))
+    }
+}
+
+impl std::fmt::Display for KvCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense => f.write_str("dense"),
+            Self::TurboQuant(bits) => write!(f, "TurboQuant {}-bit", bits.get()),
+        }
+    }
+}
+
+/// Minimum fp16 KV footprint (bytes per token, all layers, K+V) for a model
+/// to be built with TurboQuant.
+///
+/// TurboQuant trades fidelity for KV CAPACITY. Below this, the capacity
+/// is not the constraint and the trade is a bad one. Sized to sit
+/// between the models measured on metal:
+///
+///     qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> dense
+///     llama-3.2-1b   16 x 8 kv x 64  =  32 KiB/token   -> TurboQuant
+///     granite-4.1-3b 40 x 8 kv x 64  =  80 KiB/token   -> TurboQuant
+///     gemma-3-4b     34 x 4 kv x 256 = 544 KiB/token   -> TurboQuant
+///
+/// A model between 12 and 32 KiB/token is untested either way; the
+/// threshold is set at 24 KiB so the two measured points stay on the
+/// sides they were measured on, and is a POLICY knob, not a law.
+pub const MIN_KV_BYTES_PER_TOKEN: usize = 24 * 1024;
+
+/// The widest head the codec's metal kernels take: their threadgroup arrays
+/// hold one element per thread of a head.
+pub const MAX_HEAD_DIM: u32 = 512;
+
+/// The attention geometry a model's KV codec is decided from.
+#[derive(Clone, Copy, Debug)]
+pub struct KvGeometry {
+    pub num_layers: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: u32,
+    /// The full-context layers' head_dim; `head_dim` on a uniform model.
+    pub global_head_dim: u32,
+    /// The KV row is a compressed latent (MLA), not per-head K and V.
+    pub latent: bool,
+    /// The model has a KV cache at all (encoders and vision towers don't).
+    pub has_kv_cache: bool,
+}
+
+/// Why a model keeps a dense KV cache in a `turboquant` build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseReason {
+    NoKvCache,
+    /// The codec rotates head vectors; an MLA latent is not one.
+    LatentKv,
+    /// The rotation is a Walsh-Hadamard transform, over a power-of-two
+    /// length no wider than [`MAX_HEAD_DIM`].
+    HeadDim(u32),
+    /// Below [`MIN_KV_BYTES_PER_TOKEN`].
+    SmallKv {
+        bytes_per_token: usize,
+    },
+}
+
+impl std::fmt::Display for DenseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoKvCache => f.write_str("it has no KV cache"),
+            Self::LatentKv => f.write_str("its KV cache is an MLA latent, not per-head K and V"),
+            Self::HeadDim(hd) => write!(
+                f,
+                "head_dim {hd} is not a power of two no wider than {MAX_HEAD_DIM}"
+            ),
+            Self::SmallKv { bytes_per_token } => write!(
+                f,
+                "its KV row is {} KiB/token, below the {} KiB TurboQuant threshold",
+                bytes_per_token / 1024,
+                MIN_KV_BYTES_PER_TOKEN / 1024
+            ),
+        }
+    }
+}
+
+/// `bits`-bit TurboQuant for a model of `geometry`, or why it stays dense.
+/// The one rule: the lowering injects the codec, the factory provisions it and
+/// the worker sizes its pool from the `KV_CODEC` this decides.
+pub fn codec_for(geometry: KvGeometry, bits: TqBits) -> Result<TqBits, DenseReason> {
+    let KvGeometry {
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        global_head_dim,
+        latent,
+        has_kv_cache,
+    } = geometry;
+    let supported = |hd: u32| hd.is_power_of_two() && hd <= MAX_HEAD_DIM;
+    if !has_kv_cache {
+        return Err(DenseReason::NoKvCache);
+    }
+    if latent {
+        return Err(DenseReason::LatentKv);
+    }
+    if let Some(hd) = [head_dim, global_head_dim]
+        .into_iter()
+        .find(|&hd| !supported(hd))
+    {
+        return Err(DenseReason::HeadDim(hd));
+    }
+    let bytes_per_token = kv_bytes_per_token(
+        KvCodec::Dense,
+        num_layers,
+        num_kv_heads,
+        head_dim as usize,
+        2,
+    );
+    if bytes_per_token < MIN_KV_BYTES_PER_TOKEN {
+        return Err(DenseReason::SmallKv { bytes_per_token });
+    }
+    Ok(bits)
+}
+
+/// The width of the fp16 scratch attention stages TurboQuant K/V into.
+pub const SCRATCH_ELEM_BYTES: usize = 2;
+
+/// Bytes one token's K and V cost in a KV pool of `num_layers` layers of
+/// `num_kv_heads × head_dim` stored as `codec`: dense, every layer's
+/// `dense_elem_bytes`-wide row; TurboQuant, every layer's packed codes and
+/// norms ([`bytes_per_vec`]) plus the one-layer fp16 scratch — what the metal
+/// target's `build_tq_provision` allocates per token.
+pub fn kv_bytes_per_token(
+    codec: KvCodec,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    dense_elem_bytes: usize,
+) -> usize {
+    match codec {
+        KvCodec::Dense => num_layers * 2 * num_kv_heads * head_dim * dense_elem_bytes,
+        KvCodec::TurboQuant(bits) => {
+            num_layers * 2 * num_kv_heads * bytes_per_vec(head_dim, bits.get())
+                + 2 * num_kv_heads * head_dim * SCRATCH_ELEM_BYTES
+        }
+    }
+}
+
 /// Single-stream TurboQuant KV store — the mechanism of arozanov's
 /// `cache.py::TurboQuantKVCache.update_and_fetch` (standard K+V path): store
 /// bit-packed codes + f32 norms; on read, fill an fp32 dequant buffer (full on

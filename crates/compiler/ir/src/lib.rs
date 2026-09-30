@@ -23,6 +23,7 @@ use scratchy_tensors::tensor::MAX_DIMS;
 // `SCALE_DTYPE` consts. They relocated to the cfg-free
 // `scratchy-tensors` core so this cfg-free crate can name them without a
 // backend feature.
+pub use scratchy_layers::turboquant::{DenseReason, KvCodec, KvGeometry, TqBits, codec_for};
 use scratchy_tensors::{MetalDtype, ScaleDtype};
 // The `GpuTensor`, `AffineQuantEmbedding` (in `scratchy-quantizations`), and
 // `scratchy_layers` layer structs are referenced exclusively through
@@ -985,13 +986,11 @@ pub trait CanonicalParams: WeightAccessors {
     /// existing arches need no override; Qwen2-VL sets it via the
     /// proc-macro emit path. Plan: `~/.claude/plans/distributed-mapping-map.md`.
     const MROPE_SECTION: Option<[u32; 3]> = None;
-    /// TurboQuant KV-cache codebook bit-width. Conservative default that
-    /// survives outlier-heavy KV (Qwen-class massive activations); arches
-    /// validated coherent at 3-bit override this for ~4.7x compression
-    /// (Llama family). The metal RuntimeFactory and the lowering pass both
-    /// read it, so the codebook and the baked kernel constants always agree
-    /// for a given arch.
-    const TQ_KV_BITS: u32 = 4;
+    /// How this model's KV cache is stored, fixed when it is built. The metal
+    /// lowering injects the TurboQuant commands, the RuntimeFactory provisions
+    /// the packed stores, and the worker sizes and grows the KV pool, all from
+    /// this one value — so the tape, its buffers and the pool always agree.
+    const KV_CODEC: KvCodec = KvCodec::Dense;
     /// Vision-tower attention head count. Vision encoders run plain
     /// MHA (`num_kv_heads == num_heads`); only one head dim is needed.
     /// Default 0 for text-only arches that never produce
