@@ -361,6 +361,8 @@ mod tests {
                 | KernelId::AffineQmmTSplitK
                 | KernelId::AffineQmmTNax
                 | KernelId::AffineQmmSmallM
+                | KernelId::AffineW4a8Quant
+                | KernelId::AffineQmmW4a8
                 | KernelId::Nvfp4Qmv
                 | KernelId::Nvfp4QmmT
                 | KernelId::Nvfp4QmmTNax
@@ -525,6 +527,8 @@ mod tests {
             | KernelId::AffineQmmTSplitK
             | KernelId::AffineQmmTNax
             | KernelId::AffineQmmSmallM
+            | KernelId::AffineW4a8Quant
+            | KernelId::AffineQmmW4a8
             | KernelId::Nvfp4Qmv
             | KernelId::Nvfp4QmmT
             | KernelId::Nvfp4QmmTNax

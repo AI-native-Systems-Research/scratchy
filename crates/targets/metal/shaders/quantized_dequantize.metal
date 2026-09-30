@@ -111,6 +111,11 @@ DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half, 128)
 // surfaces.
 
 constant uint AFFINE_EMBED_HIDDEN_SIZE [[function_constant(0)]];
+// 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8`, matrix-unit
+// tapes); XOR-ing each loaded byte restores them. Unset: as written.
+constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
+constant uint AFFINE_CODES_XOR =
+    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x88u : 0u;
 
 template <typename T_act, typename T_scale, const int group_size>
 inline void affine_embed_b4_kernel(
@@ -140,7 +145,7 @@ inline void affine_embed_b4_kernel(
     // In-register T_scale → T_act cast (`INT4_PARITY_PROBES.md` §7).
     T_act scale = static_cast<T_act>(scales[gindex]);
     T_act bias  = static_cast<T_act>(biases[gindex]);
-    uint val = w[w_offset];
+    uint val = w[w_offset] ^ AFFINE_CODES_XOR;
 
     out[out_offset + 0] = scale * T_act(val & 0x0f)        + bias;
     out[out_offset + 1] = scale * T_act((val >> 4) & 0x0f) + bias;

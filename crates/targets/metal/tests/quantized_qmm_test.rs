@@ -30,6 +30,7 @@ use scratchy_target_metal::quantized::{
 };
 use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
+use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 
 mod common;
 
@@ -53,6 +54,7 @@ fn build_qmm_t_pipeline(
     bits: u32,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
+    codes: AffineCodes,
 ) -> scratchy_target_metal::shader_cache::ComputePipelineState {
     let aligned_n = match kernel {
         QmmTKernel::Nax => n.is_multiple_of(64),
@@ -70,6 +72,7 @@ fn build_qmm_t_pipeline(
     {
         constants.push(ConstantValue::int(3, k_partition_size as i32));
     }
+    constants.extend(codes.constant());
     cache
         .get_pipeline_specialized(&kernel_name, &constants)
         .expect("qmm_t pipeline")
@@ -163,6 +166,26 @@ fn run_qmm_t_bf16(
     group_size: u32,
     expected_kernel: QmmTKernel,
 ) -> Option<Vec<half::bf16>> {
+    run_qmm_t_bf16_codes(
+        packed,
+        scales,
+        biases,
+        x,
+        (m, n, k, group_size),
+        expected_kernel,
+        AffineCodes::AsWritten,
+    )
+}
+
+fn run_qmm_t_bf16_codes(
+    packed: &[u8],
+    scales: &[half::f16],
+    biases: &[half::f16],
+    x: &[half::bf16],
+    (m, n, k, group_size): (usize, usize, usize, u32),
+    expected_kernel: QmmTKernel,
+    codes: AffineCodes,
+) -> Option<Vec<half::bf16>> {
     let device = detect_device()?.device;
     let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
 
@@ -202,6 +225,7 @@ fn run_qmm_t_bf16(
         4,
         DequantDtype::Bf16,
         ScaleDtype::F16,
+        codes,
     );
     let (tg, tpg) = qmm_t_dispatch_shape(expected_kernel, m as u32, n as u32, 1 /* B */);
     let threadgroups = objc2_metal::MTLSize {
@@ -702,6 +726,7 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
         4,
         DequantDtype::Bf16,
         ScaleDtype::F16,
+        AffineCodes::AsWritten,
     );
     let (tg, tpg) = qmm_t_dispatch_shape(QmmTKernel::Nax, m as u32, n as u32, 1);
     let threadgroups = objc2_metal::MTLSize {
@@ -783,4 +808,43 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
         "qmm_t NAX gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
          (allowed {allowed:.5}; metal={mv}, cpu={ev})"
     );
+}
+
+/// Codes stored offset-8 (XOR 0x88, as an M5 target stores 4-bit codes)
+/// read under `AFFINE_CODES_OFFSET8` give bit-identical output to the codes
+/// as written, on every qmm_t kernel: Standard, SplitK and (on NAX
+/// hardware) NAX.
+#[test]
+fn affine_qmm_t_b4_offset8_codes_match_as_written() {
+    let Some(dev) = detect_device() else {
+        eprintln!("skipping: no Metal 4 GPU");
+        return;
+    };
+    let (m, n, k, gs) = (64, 64, 2048, 64);
+    let mut kernels = vec![
+        QmmTKernel::Standard,
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, gs, false),
+    ];
+    if scratchy_target_metal::targets::is_nax_capable(dev.profile.generation) {
+        kernels.push(QmmTKernel::Nax);
+    }
+    let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7, n, k, m, gs as usize);
+    let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
+    for kernel in kernels {
+        let run = |packed: &[u8], codes| {
+            run_qmm_t_bf16_codes(packed, &scales, &biases, &x, (m, n, k, gs), kernel, codes)
+                .expect("MTL4 queue")
+        };
+        let as_written = run(&packed, AffineCodes::AsWritten);
+        assert_ne!(
+            run(&offset8, AffineCodes::AsWritten),
+            as_written,
+            "{kernel:?}"
+        );
+        assert_eq!(
+            run(&offset8, AffineCodes::Offset8),
+            as_written,
+            "{kernel:?}"
+        );
+    }
 }

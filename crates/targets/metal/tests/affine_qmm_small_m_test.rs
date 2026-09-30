@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `affine_qmm_small_m_*` (NAX): the decode-batch MLX-affine 4-bit GEMM that
-//! feeds the matrix unit the packed 4-bit codes directly — against a host f32
-//! reference of `y = x · (s·q + b)ᵀ`, launched as the tape launches it (M
-//! baked at the bucket, the grid scaled to the live rows), for every
-//! activation / scale dtype and group size the lowering routes to it.
+//! The NAX MLX-affine 4-bit GEMMs that feed the matrix unit the offset-8
+//! codes directly — `affine_qmm_small_m_*` (decode batches) and the
+//! `affine_w4a8_quant_*` + `affine_qmm_w4a8_*` pair (int8 activations) —
+//! against a host f32 reference of `y = x · (s·q + b)ᵀ`, launched as the
+//! tape launches them (M baked at the bucket, the grid scaled to the live
+//! rows), for every activation / scale dtype and group size the lowering
+//! routes to them.
 //!
 //! GPU tests (NAX hardware only; skipped elsewhere) — run with
 //! `--test-threads=1` (standing rule).
@@ -13,7 +15,8 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::quantized::{
-    DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, small_m_kernel_static_name,
+    DequantDtype, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS, W4a8Tile,
+    qmm_w4a8_static_name, small_m_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -101,20 +104,43 @@ struct Gemm {
     bucket_m: usize,
     n: usize,
     k: usize,
-    tile: SmallMTile,
+    kernel: Kernel,
+}
+
+#[derive(Clone, Copy)]
+enum Kernel {
+    SmallM(SmallMTile),
+    W4a8(W4a8Tile),
+}
+
+/// The activation the W4A8 pre-pass hands the GEMM: each (row, 64-chunk)
+/// rounded to int8 at its own scale `amax / 127`, as the kernel computes it.
+fn int8_chunks(x: &[f32]) -> Vec<f32> {
+    x.chunks(64)
+        .flat_map(|c| {
+            let amax = c.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let (inv, a) = if amax > 0.0 {
+                (127.0 / amax, amax / 127.0)
+            } else {
+                (0.0, 0.0)
+            };
+            c.iter().map(move |v| (v * inv).round_ties_even() * a)
+        })
+        .collect()
 }
 
 fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
     let (m, n, k, gs) = (g.m, g.n, g.k, g.group_size);
     let mut rng = Rng(0x5eed ^ (m * 7919 + n * 31 + k) as u64);
-    // MLX affine: 8 codes per u32, the low nibble first.
+    // MLX affine: 8 codes per u32, the low nibble first, stored offset-8
+    // (q XOR 8, the signed q - 8) as the matrix unit reads them.
     let codes: Vec<u8> = (0..n * k).map(|_| (rng.next() & 0xf) as u8).collect();
     let packed: Vec<u32> = codes
         .chunks(8)
         .map(|c| {
             c.iter()
                 .enumerate()
-                .fold(0u32, |w, (i, &q)| w | (q as u32) << (4 * i))
+                .fold(0u32, |w, (i, &q)| w | ((q ^ 8) as u32) << (4 * i))
         })
         .collect();
     let groups = n * k / gs;
@@ -130,6 +156,11 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
         round(g.act, &x),
     );
 
+    let x_used: Vec<f32> = x_h.iter().map(|&b| g.act.value(b)).collect();
+    let x_used = match g.kernel {
+        Kernel::SmallM(_) => x_used,
+        Kernel::W4a8(_) => int8_chunks(&x_used),
+    };
     let kg = k / gs;
     let mut want = vec![0f32; m * n];
     for r in 0..m {
@@ -139,21 +170,27 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
                 let grp = c * kg + kk / gs;
                 let w = g.scale.value(scales_h[grp]) * codes[c * k + kk] as f32
                     + g.scale.value(biases_h[grp]);
-                acc += (g.act.value(x_h[r * k + kk]) * w) as f64;
+                acc += (x_used[r * k + kk] * w) as f64;
             }
             want[r * n + c] = acc as f32;
         }
     }
 
-    let name = small_m_kernel_static_name(g.act.act(), g.scale.scale(), gs as u32, g.tile);
     let consts = vec![
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),
         ConstantValue::int(2, g.bucket_m as i32),
     ];
-    let pipeline = cache
-        .get_or_build(&PipelineKey::new("quantized_qmm_nax", name, consts))
-        .expect("small-M pipeline");
+    let pipeline = |name: &'static str| {
+        cache
+            .get_or_build(&PipelineKey::new("quantized_qmm_nax", name, consts.clone()))
+            .expect("pipeline")
+    };
+    let size = |width: usize, height: usize| MTLSize {
+        width,
+        height,
+        depth: 1,
+    };
     let (w_buf, s_buf, b_buf, x_buf) = (
         shared(device, &packed),
         shared(device, &scales_h),
@@ -162,29 +199,69 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
     );
     let y_buf = shared(device, &vec![0u16; g.bucket_m * n]);
     let mut batch = Mtl4DispatchBatch::begin(device).expect("mtl4");
-    batch.encode(
-        &pipeline,
-        &[
-            (&w_buf, 0),
-            (&s_buf, 1),
-            (&b_buf, 2),
-            (&x_buf, 3),
-            (&y_buf, 4),
-        ],
-        &[],
-        &[],
-        &[],
-        MTLSize {
-            width: n / SMALL_M_TILE_COLS as usize,
-            height: m.div_ceil(g.tile.rows() as usize),
-            depth: 1,
-        },
-        MTLSize {
-            width: 32 * scratchy_target_metal::quantized::SMALL_M_SIMDGROUPS as usize,
-            height: 1,
-            depth: 1,
-        },
-    );
+    let name = match g.kernel {
+        Kernel::SmallM(tile) => {
+            let name = small_m_kernel_static_name(g.act.act(), g.scale.scale(), gs as u32, tile);
+            batch.encode(
+                &pipeline(name),
+                &[
+                    (&w_buf, 0),
+                    (&s_buf, 1),
+                    (&b_buf, 2),
+                    (&x_buf, 3),
+                    (&y_buf, 4),
+                ],
+                &[],
+                &[],
+                &[],
+                size(
+                    n / SMALL_M_TILE_COLS as usize,
+                    m.div_ceil(tile.rows() as usize),
+                ),
+                size(
+                    32 * scratchy_target_metal::quantized::SMALL_M_SIMDGROUPS as usize,
+                    1,
+                ),
+            );
+            name
+        }
+        Kernel::W4a8(tile) => {
+            let scratch = shared(
+                device,
+                &vec![0u8; w4a8_scratch_bytes(g.bucket_m as u32, k as u32) as usize],
+            );
+            batch.encode(
+                &pipeline(w4a8_quant_static_name(g.act.act())),
+                &[(&x_buf, 0), (&scratch, 1)],
+                &[],
+                &[],
+                &[],
+                size((k / 64).div_ceil(16), m),
+                size(128, 1),
+            );
+            batch.barrier();
+            let name = qmm_w4a8_static_name(g.act.act(), g.scale.scale(), gs as u32, tile);
+            batch.encode(
+                &pipeline(name),
+                &[
+                    (&w_buf, 0),
+                    (&s_buf, 1),
+                    (&b_buf, 2),
+                    (&scratch, 3),
+                    (&y_buf, 4),
+                ],
+                &[],
+                &[],
+                &[],
+                size(
+                    n / tile.cols() as usize,
+                    m.div_ceil(W4A8_TILE_ROWS as usize),
+                ),
+                size(32 * tile.simdgroups() as usize, 1),
+            );
+            name
+        }
+    };
     batch.commit(true);
     let got: Vec<f32> =
         unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, m * n) }
@@ -248,7 +325,7 @@ fn small_m_eight_row_tile_across_dtypes_and_group_sizes() {
                             bucket_m: 8,
                             n: 256,
                             k: 1024,
-                            tile: SmallMTile::Rows8,
+                            kernel: Kernel::SmallM(SmallMTile::Rows8),
                         },
                     );
                 }
@@ -275,9 +352,45 @@ fn small_m_sixteen_row_tile() {
                     bucket_m: 64,
                     n: 512,
                     k,
-                    tile: SmallMTile::Rows16,
+                    kernel: Kernel::SmallM(SmallMTile::Rows16),
                 },
             );
+        }
+    });
+}
+
+/// W4A8 in the 64-token bucket, for every dtype pairing, both group sizes
+/// and both tiles: a partial row tile, a full bucket, and a live batch
+/// short of the bucket.
+#[test]
+fn w4a8_across_dtypes_group_sizes_and_tiles() {
+    with_nax(|device, cache| {
+        for (act, scale) in [
+            (Dtype::Bf16, Dtype::Bf16),
+            (Dtype::Bf16, Dtype::F16),
+            (Dtype::F16, Dtype::F16),
+            (Dtype::F16, Dtype::Bf16),
+        ] {
+            for group_size in [64, 128] {
+                for (n, tile) in [(384, W4a8Tile::Cols128), (192, W4a8Tile::Cols64)] {
+                    for m in [13, 45, 64] {
+                        run(
+                            device,
+                            cache,
+                            &Gemm {
+                                act,
+                                scale,
+                                group_size,
+                                m,
+                                bucket_m: 64,
+                                n,
+                                k: 1024,
+                                kernel: Kernel::W4a8(tile),
+                            },
+                        );
+                    }
+                }
+            }
         }
     });
 }

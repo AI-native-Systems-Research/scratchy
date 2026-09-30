@@ -221,6 +221,13 @@ pub enum KernelId {
     /// read once per 8 or 16 rows. Maps to `affine_qmm_small_m_*` in
     /// `quantized_qmm_nax.metallib`; runs on `SMALL_M_TOKENS` steps only.
     AffineQmmSmallM,
+    /// W4A8 pre-pass: quantizes a GEMM's activations to int8 per (row,
+    /// 64-chunk) into the shared scratch. `affine_w4a8_quant_<dtype>`.
+    AffineW4a8Quant,
+    /// W4A8 GEMM on the matrix unit's int8 lane: the pre-pass's int8
+    /// activations x the offset-8 4-bit codes.
+    /// `affine_qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<tn>_nsg_<nsg>`.
+    AffineQmmW4a8,
     /// NVFP4 int4 decode matvec (generic). Maps to
     /// `nvfp4_qmv_<dtype>_s_<scale>_gs_16_b_4_batch_0` in the
     /// `quantized_qmv.metallib` (nvfp4 kernels share that library with
@@ -520,6 +527,8 @@ impl KernelId {
             | Self::AffineQmmTSplitK
             | Self::AffineQmmTNax
             | Self::AffineQmmSmallM
+            | Self::AffineW4a8Quant
+            | Self::AffineQmmW4a8
             | Self::Nvfp4Qmv
             | Self::Nvfp4QmmT
             | Self::Nvfp4QmmTNax
@@ -1837,6 +1846,16 @@ impl GenClass {
             G::M2 | G::M3 | G::M4 => GenClass::Mid,
             G::M5 => GenClass::M5,
         }
+    }
+
+    /// Whether this class stores MLX-affine 4-bit weight codes XOR 0x88
+    /// (signed q - 8): the matrix unit's int8 x int4 lane reads them as
+    /// stored (the W4A8 GEMM). The weight loader flips them on load and the
+    /// lowering tells every other reader to flip them back
+    /// ([`AffineCodes`](super::kernel_constants::AffineCodes)) — one fact,
+    /// read by both.
+    pub fn stores_affine_b4_offset8(self) -> bool {
+        matches!(self, GenClass::M5)
     }
 }
 

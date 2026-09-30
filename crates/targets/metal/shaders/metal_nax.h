@@ -986,16 +986,20 @@ inline constexpr short get_bytes_per_pack() {
 // (== T_scale). MLX's loader uses one type; scratchy threads a distinct
 // scale dtype (e.g. bf16 act + f16 scale), so the type is split here.
 // Arithmetic is done in Tdst exactly as the upstream verbatim path.
+// `codes_xor` (4-bit only): 0x88 when the codes are stored XOR 0x88
+// (`AffineCodes::Offset8`), restoring them per byte; 0 otherwise.
 template <typename Tdst, typename Tsc, int N, int bits>
 inline void
-dequantize(const device uint8_t* w, Tdst scale, Tdst bias, threadgroup Tdst* w_local) {
+dequantize(const device uint8_t* w, Tdst scale, Tdst bias, threadgroup Tdst* w_local,
+           uint8_t codes_xor = 0) {
   static_assert(bits == 4 || bits == 8, "NAX dequantize: bits in {4,8}");
 
   if (bits == 4) {
     Tdst s[2] = {scale, scale / static_cast<Tdst>(16.0f)};
     for (int i = 0; i < (N / 2); i++) {
-      w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
-      w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+      const uint8_t wi = w[i] ^ codes_xor;
+      w_local[2 * i] = s[0] * (wi & 0x0f) + bias;
+      w_local[2 * i + 1] = s[1] * (wi & 0xf0) + bias;
     }
   }
 
@@ -1139,6 +1143,7 @@ struct QuantizedBlockLoader {
   const device uint8_t* src;
   const device Tsc* scales;
   const device Tsc* biases;
+  const uint8_t codes_xor;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -1147,7 +1152,8 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id,
-      ushort simd_lane_id) thread
+      ushort simd_lane_id,
+      uint8_t codes_xor_ = 0) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED * bytes_per_pack
@@ -1161,7 +1167,8 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
+        biases(biases_ + bi * src_ld / group_size),
+        codes_xor(codes_xor_) {}
 
   void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -1172,7 +1179,7 @@ struct QuantizedBlockLoader {
     T bias = T(*biases);
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, Tsc, pack_factor, bits>(
-          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor, codes_xor);
     }
   }
 
@@ -1202,7 +1209,8 @@ struct QuantizedBlockLoader {
           (device uint8_t*)(src + i * bytes_per_pack),
           scale,
           bias,
-          dst + i * pack_factor);
+          dst + i * pack_factor,
+          codes_xor);
     }
   }
 

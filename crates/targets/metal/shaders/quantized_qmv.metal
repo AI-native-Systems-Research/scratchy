@@ -50,6 +50,12 @@ MLX_MTL_CONST int QUAD_SIZE = 4;
 
 constant int IN_VEC_SIZE  [[function_constant(0)]];
 constant int OUT_VEC_SIZE [[function_constant(1)]];
+// 5: the 4-bit codes are stored XOR 0x88 (signed q - 8; `AffineCodes::Offset8`,
+// set on matrix-unit tapes, where the W4A8 prefill GEMM reads them as int4).
+// XOR-ing each loaded word restores the unsigned codes. Unset: as written.
+constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
+constant uint16_t AFFINE_CODES_XOR =
+    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x8888 : 0;
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26
@@ -310,11 +316,12 @@ inline U qdot(
   else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
+      const uint16_t wi = ws[i] ^ AFFINE_CODES_XOR;
       accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+          (x_thread[4 * i] * (wi & 0x000f) +
+           x_thread[4 * i + 1] * (wi & 0x00f0) +
+           x_thread[4 * i + 2] * (wi & 0x0f00) +
+           x_thread[4 * i + 3] * (wi & 0xf000));
     }
   }
 
@@ -412,11 +419,12 @@ inline U qdot_safe(
   else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (N / 4); i++) {
+      const uint16_t wi = ws[i] ^ AFFINE_CODES_XOR;
       accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+          (x_thread[4 * i] * (wi & 0x000f) +
+           x_thread[4 * i + 1] * (wi & 0x00f0) +
+           x_thread[4 * i + 2] * (wi & 0x0f00) +
+           x_thread[4 * i + 3] * (wi & 0xf000));
     }
   }
 

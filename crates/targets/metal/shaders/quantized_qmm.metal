@@ -121,6 +121,11 @@ constant int QMM_K_PARTITION_SIZE [[function_constant(3)]];
 // tiles whose expert index == QMM_NUM_EXPERTS are sentinels (trailing
 // unused rows) and skip — lets the host pad to a static row bound.
 constant int QMM_NUM_EXPERTS      [[function_constant(4)]];
+// 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8`, matrix-unit
+// tapes); XOR-ing each loaded byte restores them. Unset: as written.
+constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
+constant uint8_t AFFINE_CODES_XOR =
+    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x88 : 0;
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26 (same constants as
@@ -317,7 +322,8 @@ METAL_FUNC void qmm_t_impl_inline(
       /*src_ld=*/K,
       reinterpret_cast<threadgroup T_scale*>(Ws),
       simd_group_id,
-      simd_lane_id);
+      simd_lane_id,
+      bits == 4 ? AFFINE_CODES_XOR : uint8_t(0));
 
   // ── BlockMMA — VERBATIM MLX `BlockMMA<T_compute, T_act, BM, BN, BK,
   //    WM, WN, transpose_a=false, transpose_b=true, lda_tgp, ldb_tgp,
@@ -426,10 +432,11 @@ METAL_FUNC void qmm_t_impl_inline(
           Ws_dst_inline[i * pack_factor + 1] =
               scale * static_cast<T_compute>(nvfp4_decode((uint(b) >> 4) & 0x0fu));
         } else {
+          const uint8_t bq = b ^ (bits == 4 ? AFFINE_CODES_XOR : uint8_t(0));
           Ws_dst_inline[i * pack_factor + 0] =
-              s0 * static_cast<T_compute>(b & 0x0f) + bias;
+              s0 * static_cast<T_compute>(bq & 0x0f) + bias;
           Ws_dst_inline[i * pack_factor + 1] =
-              s1 * static_cast<T_compute>(b & 0xf0) + bias;
+              s1 * static_cast<T_compute>(bq & 0xf0) + bias;
         }
       }
     } else {

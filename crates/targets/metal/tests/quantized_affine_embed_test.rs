@@ -19,6 +19,7 @@ use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
 use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
+use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 
 /// CPU reference: gather-then-dequant. Each output element is
 /// `scale[vocab_idx, group] * nibble + bias[vocab_idx, group]` with
@@ -258,9 +259,9 @@ fn dispatch_affine_embed(
     scales: &[half::f16],
     biases: &[half::f16],
     indices: &[u32],
-    hidden_size: u32,
-    group_size: u32,
+    (hidden_size, group_size): (u32, u32),
     dtype: DequantDtype,
+    codes: AffineCodes,
 ) -> Option<common::Buffer> {
     let device = detect_device()?.device;
 
@@ -281,7 +282,9 @@ fn dispatch_affine_embed(
     );
     // `hidden_size` rides as function_constant(0) — see
     // `AFFINE_EMBED_HIDDEN_SIZE` in `quantized_dequantize.metal`.
-    let constants = [ConstantValue::uint(0u16, hidden_size)];
+    let constants: Vec<ConstantValue> = std::iter::once(ConstantValue::uint(0u16, hidden_size))
+        .chain(codes.constant())
+        .collect();
     let pipeline = cache
         .get_pipeline_specialized(&kernel_name, &constants)
         .expect("affine_embed pipeline");
@@ -337,9 +340,9 @@ fn run_kernel_f16(
         scales,
         biases,
         indices,
-        hidden_size,
-        group_size,
+        (hidden_size, group_size),
         DequantDtype::F16,
+        AffineCodes::AsWritten,
     ) {
         Some(out_buf) => common::read_slice(&out_buf, n_out),
         None => Vec::new(),
@@ -360,11 +363,55 @@ fn run_kernel_bf16(
         scales,
         biases,
         indices,
-        hidden_size,
-        group_size,
+        (hidden_size, group_size),
         DequantDtype::Bf16,
+        AffineCodes::AsWritten,
     ) {
         Some(out_buf) => common::read_slice(&out_buf, n_out),
         None => Vec::new(),
     }
+}
+
+/// Codes stored offset-8 (XOR 0x88, as an M5 target stores 4-bit codes)
+/// read under `AFFINE_CODES_OFFSET8` gather bit-identical rows to the codes
+/// as written.
+#[test]
+fn affine_embed_b4_offset8_codes_match_as_written() {
+    let (vocab_size, hidden_size, group_size) = (32usize, 256u32, 64u32);
+    let mut rng = SplitMix64(0x0FF5E7);
+    let packed: Vec<u8> = (0..vocab_size * hidden_size as usize / 2)
+        .map(|_| rng.next_byte())
+        .collect();
+    let groups = vocab_size * (hidden_size / group_size) as usize;
+    let scales: Vec<half::f16> = (0..groups)
+        .map(|_| half::f16::from_f32(0.1 + 0.9 * rng.next_unit_f32()))
+        .collect();
+    let biases: Vec<half::f16> = (0..groups)
+        .map(|_| half::f16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
+        .collect();
+    let indices: Vec<u32> = (0..16)
+        .map(|_| rng.next_u32_below(vocab_size as u32))
+        .collect();
+    let run = |packed: &[u8], codes| {
+        dispatch_affine_embed(
+            packed,
+            &scales,
+            &biases,
+            &indices,
+            (hidden_size, group_size),
+            DequantDtype::Bf16,
+            codes,
+        )
+        .map(|b| common::read_slice::<half::bf16>(&b, indices.len() * hidden_size as usize))
+    };
+    let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+        eprintln!("skipping: no Metal 4 GPU");
+        return;
+    };
+    let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
+    assert_ne!(
+        run(&offset8, AffineCodes::AsWritten).as_ref(),
+        Some(&as_written)
+    );
+    assert_eq!(run(&offset8, AffineCodes::Offset8), Some(as_written));
 }
