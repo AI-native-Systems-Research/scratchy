@@ -71,7 +71,7 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         let bytes = crate::http::get_bytes(&agent, url)?;
         std::fs::write(&parquet_path, &bytes)?;
 
-        let records = parquet_to_json_records(&parquet_path)?;
+        let records = crate::parquet_records::parquet_to_json_records(&parquet_path)?;
 
         eprintln!("Caching {} records as JSON...", records.len());
         let json_str = serde_json::to_string(&records)?;
@@ -79,12 +79,17 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         records
     };
 
-    // Build queries and corpus stats — only include answerable queries.
+    Ok(build_dataset(&raw, num_queries))
+}
+
+/// Build queries and corpus stats from the dataset's JSON rows, keeping only
+/// answerable queries.
+fn build_dataset(raw: &[serde_json::Value], num_queries: usize) -> Dataset {
     let mut queries: Vec<Query> = Vec::new();
     let mut corpus_texts: Vec<String> = Vec::new();
     let mut seen_texts: HashSet<String> = HashSet::new();
 
-    for record in &raw {
+    for record in raw {
         let question = record["query"].as_str().unwrap_or("").to_string();
         let query_type = record["query_type"].as_str().unwrap_or("").to_string();
 
@@ -150,35 +155,11 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         }
     }
 
-    Ok(Dataset {
+    Dataset {
         queries,
         corpus_size: corpus_texts.len(),
         corpus_texts,
-    })
-}
-
-/// Read a parquet file and return rows as JSON values.
-fn parquet_to_json_records(parquet_path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
-    use arrow::json::writer::{JsonArray, Writer};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    eprintln!("Reading parquet...");
-    let file = std::fs::File::open(parquet_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-
-    let batches: Vec<_> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-    let batch_refs: Vec<&_> = batches.iter().collect();
-
-    let mut buf = Vec::new();
-    let mut writer = Writer::<_, JsonArray>::new(&mut buf);
-    writer.write_batches(&batch_refs)?;
-    writer.finish()?;
-    drop(writer);
-
-    let records: Vec<serde_json::Value> = serde_json::from_slice(&buf)?;
-    eprintln!("Read {} records.", records.len());
-    Ok(records)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +605,10 @@ pub(crate) fn run_bench_msmarco(args: BenchMsmarcoArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use serde_json::json;
+
+    use crate::parquet_records::fixture::through_parquet;
 
     #[test]
     fn evaluate_exact_substring() {
@@ -676,5 +661,89 @@ mod tests {
     #[test]
     fn normalize_tokens_basic() {
         assert_eq!(normalize_tokens("hello, world!"), vec!["hello", "world"]);
+    }
+
+    /// MS MARCO's first validation row (passages cut to two, texts to their
+    /// first sentence) plus an unanswerable row, under the schema of the file
+    /// `scr bench msmarco` downloads: `passages` is a struct of per-passage
+    /// lists, and an unanswerable row's only answer is "No Answer Present.".
+    #[test]
+    fn parquet_rows_become_answerable_queries() {
+        let list = |item| DataType::new_list(item, true);
+        let schema = Schema::new(vec![
+            Field::new("answers", list(DataType::Utf8), true),
+            Field::new(
+                "passages",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("is_selected", list(DataType::Int32), true),
+                    Field::new("passage_text", list(DataType::Utf8), true),
+                    Field::new("url", list(DataType::Utf8), true),
+                ])),
+                true,
+            ),
+            Field::new("query", DataType::Utf8, true),
+            Field::new("query_id", DataType::Int32, true),
+            Field::new("query_type", DataType::Utf8, true),
+            Field::new("wellFormedAnswers", list(DataType::Utf8), true),
+        ]);
+        let passages = json!({
+            "is_selected": [0, 1],
+            "passage_text": [
+                "A company is incorporated in a specific nation, often within the bounds of a smaller subset of that nation, such as a state or province.",
+                "Today, there is a growing community of more than 2,100 Certified B Corps from 50 countries and over 130 industries working together toward 1 unifying goal: to redefine success in business.",
+            ],
+            "url": [
+                "http://www.wisegeek.com/what-is-a-corporation.htm",
+                "https://www.bcorporation.net/what-are-b-corps",
+            ],
+        });
+        let raw = through_parquet(
+            schema,
+            &[
+                json!({
+                    "answers": ["A corporation is a company or group of people authorized to act as a single entity and recognized as such in law."],
+                    "passages": passages,
+                    "query": ". what is a corporation?",
+                    "query_id": 1102432,
+                    "query_type": "DESCRIPTION",
+                    "wellFormedAnswers": [],
+                }),
+                json!({
+                    "answers": ["No Answer Present."],
+                    "passages": passages,
+                    "query": "an unanswerable question",
+                    "query_id": 1102433,
+                    "query_type": "DESCRIPTION",
+                    "wellFormedAnswers": [],
+                }),
+            ],
+        );
+
+        let dataset = build_dataset(&raw, 10);
+
+        assert_eq!(dataset.queries.len(), 1);
+        let query = &dataset.queries[0];
+        assert_eq!(query.question, ". what is a corporation?");
+        assert_eq!(
+            query.answers,
+            [
+                "A corporation is a company or group of people authorized to act as a single entity and recognized as such in law."
+            ]
+        );
+        assert_eq!(query.query_type, "DESCRIPTION");
+        assert_eq!(
+            query.passages,
+            [
+                (
+                    "http://www.wisegeek.com/what-is-a-corporation.htm".to_string(),
+                    "A company is incorporated in a specific nation, often within the bounds of a smaller subset of that nation, such as a state or province.".to_string(),
+                ),
+                (
+                    "https://www.bcorporation.net/what-are-b-corps".to_string(),
+                    "Today, there is a growing community of more than 2,100 Certified B Corps from 50 countries and over 130 industries working together toward 1 unifying goal: to redefine success in business.".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(dataset.corpus_size, 2);
     }
 }

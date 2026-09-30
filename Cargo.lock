@@ -3655,6 +3655,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "tempfile",
  "tokenizers 0.23.2",
  "tokio",
  "ureq 3.4.2",

@@ -40,3 +40,6 @@ csv = "1"
 dirs = { workspace = true }
 parquet = { version = "60", default-features = false, features = ["arrow", "snap"], optional = true }
 arrow = { version = "60", default-features = false, features = ["json"], optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

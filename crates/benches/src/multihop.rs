@@ -72,7 +72,7 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         let bytes = crate::http::get_bytes(&agent, url)?;
         std::fs::write(&parquet_path, &bytes)?;
 
-        let records = parquet_to_json_records(&parquet_path)?;
+        let records = crate::parquet_records::parquet_to_json_records(&parquet_path)?;
 
         eprintln!("Caching {} records as JSON...", records.len());
         let json_str = serde_json::to_string(&records)?;
@@ -80,7 +80,11 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         records
     };
 
-    // Build queries and corpus stats.
+    Ok(build_dataset(&raw, num_queries))
+}
+
+/// Build queries and corpus stats from the dataset's JSON rows.
+fn build_dataset(raw: &[serde_json::Value], num_queries: usize) -> Dataset {
     let mut queries: Vec<Query> = Vec::new();
     let mut unique_titles: HashSet<String> = HashSet::new();
     let mut corpus_texts: Vec<String> = Vec::new();
@@ -121,35 +125,11 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
         });
     }
 
-    Ok(Dataset {
+    Dataset {
         queries,
         corpus_size: unique_titles.len(),
         corpus_texts,
-    })
-}
-
-/// Read a parquet file and return rows as JSON values.
-fn parquet_to_json_records(parquet_path: &std::path::Path) -> Result<Vec<serde_json::Value>> {
-    use arrow::json::writer::{JsonArray, Writer};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
-    eprintln!("Reading parquet...");
-    let file = std::fs::File::open(parquet_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-
-    let batches: Vec<_> = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-    let batch_refs: Vec<&_> = batches.iter().collect();
-
-    let mut buf = Vec::new();
-    let mut writer = Writer::<_, JsonArray>::new(&mut buf);
-    writer.write_batches(&batch_refs)?;
-    writer.finish()?;
-    drop(writer);
-
-    let records: Vec<serde_json::Value> = serde_json::from_slice(&buf)?;
-    eprintln!("Read {} records.", records.len());
-    Ok(records)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +570,10 @@ pub(crate) fn run_bench_multihop(args: BenchMultihopArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use serde_json::json;
+
+    use crate::parquet_records::fixture::through_parquet;
 
     #[test]
     fn evaluate_exact_substring() {
@@ -646,5 +630,62 @@ mod tests {
     #[test]
     fn normalize_tokens_basic() {
         assert_eq!(normalize_tokens("hello, world!"), vec!["hello", "world"]);
+    }
+
+    /// 2WikiMultihopQA's first dev row (context cut to two paragraphs), under
+    /// the schema of the file `scr bench multihop` downloads: every column is
+    /// a string, and `context` is itself JSON, with Python's `\uXXXX` escapes.
+    #[test]
+    fn parquet_row_becomes_query() {
+        let schema = Schema::new(
+            [
+                "_id",
+                "type",
+                "question",
+                "context",
+                "supporting_facts",
+                "evidences",
+                "answer",
+            ]
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .to_vec(),
+        );
+        let raw = through_parquet(
+            schema,
+            &[json!({
+                "_id": "8813f87c0bdd11eba7f7acde48001122",
+                "type": "compositional",
+                "question": "Who is the mother of the director of film Polish-Russian War (Film)?",
+                "context": r#"[["Maheen Khan", ["Maheen Khan is a Pakistani fashion and costume designer, also an award winner fashion designer for fashion labels like\" The Embroidery HouseMaheen\" and\" Gulabo\".", "She has done many national and international fashion events and shows."]], ["Polish-Russian War (film)", ["Polish-Russian War", "(Wojna polsko-ruska) is a 2009 Polish film directed by Xawery \u017bu\u0142awski based on the novel Polish-Russian War under the white-red flag by Dorota Mas\u0142owska."]]]"#,
+                "supporting_facts": r#"[["Polish-Russian War (film)", 1], ["Xawery \u017bu\u0142awski", 2]]"#,
+                "evidences": r#"[["Polish-Russian War", "director", "Xawery \u017bu\u0142awski"], ["Xawery \u017bu\u0142awski", "mother", "Ma\u0142gorzata Braunek"]]"#,
+                "answer": "Małgorzata Braunek",
+            })],
+        );
+
+        let dataset = build_dataset(&raw, 10);
+
+        assert_eq!(dataset.queries.len(), 1);
+        let query = &dataset.queries[0];
+        assert_eq!(
+            query.question,
+            "Who is the mother of the director of film Polish-Russian War (Film)?"
+        );
+        assert_eq!(query.answer, "Małgorzata Braunek");
+        assert_eq!(query.question_type, "compositional");
+        assert_eq!(
+            query.documents,
+            [
+                (
+                    "Maheen Khan".to_string(),
+                    "Maheen Khan is a Pakistani fashion and costume designer, also an award winner fashion designer for fashion labels like\" The Embroidery HouseMaheen\" and\" Gulabo\". She has done many national and international fashion events and shows.".to_string(),
+                ),
+                (
+                    "Polish-Russian War (film)".to_string(),
+                    "Polish-Russian War (Wojna polsko-ruska) is a 2009 Polish film directed by Xawery Żuławski based on the novel Polish-Russian War under the white-red flag by Dorota Masłowska.".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(dataset.corpus_size, 2);
     }
 }

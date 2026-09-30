@@ -19,6 +19,8 @@ mod msmarco;
 mod multihop;
 mod musique;
 mod niah;
+#[cfg(feature = "datasets")]
+mod parquet_records;
 mod ragcsv;
 mod ruler;
 mod serve;
