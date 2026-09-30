@@ -40,7 +40,7 @@ mod imp {
     use scratchy_models as _;
 
     use half::bf16;
-    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice as _, MTLResourceOptions};
+    use objc2_metal::MTLCreateSystemDefaultDevice;
     use scratchy_forward_compiler::{HfFingerprint, hash_json_value, try_load};
     use scratchy_target_metal::device::Device;
     use scratchy_target_metal::kv_cache::KvCachePool;
@@ -305,20 +305,20 @@ mod imp {
                 128,        // BLOCKS_PER_CHUNK (metal target const)
                 usize::MAX, // eager: one chunk covers our tokens
                 |bytes| {
-                    let buf = device_arc
-                        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                        .expect("kv chunk alloc");
-                    // residency BEFORE the first forward's lazy commit —
+                    // new_pinned: allocates + holds residency in the set —
                     // a non-resident chunk reads structured garbage.
-                    allocator.residency().insert(&buf);
-                    Ok(MetalMem::from_buffer(buf))
+                    Ok(MetalMem::new_pinned(
+                        device_arc,
+                        allocator.residency(),
+                        bytes,
+                    ))
                 },
                 |bytes| {
-                    let buf = device_arc
-                        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                        .expect("kv table alloc");
-                    allocator.residency().insert(&buf);
-                    Ok(MetalMem::from_buffer(buf))
+                    Ok(MetalMem::new_pinned(
+                        device_arc,
+                        allocator.residency(),
+                        bytes,
+                    ))
                 },
             )
             .expect("KvCachePool::new_metal_chunked")
@@ -347,14 +347,11 @@ mod imp {
                     gdn_cfg.head_k_dim as usize,
                     |bytes| {
                         // f32 conv/ssm state; MUST be StorageModeShared.
-                        let buf = device_arc
-                            .newBufferWithLength_options(
-                                bytes,
-                                MTLResourceOptions::StorageModeShared,
-                            )
-                            .expect("GDN state buffer alloc");
-                        allocator.residency().insert(&buf);
-                        Ok(MetalMem::from_buffer(buf))
+                        Ok(MetalMem::new_pinned(
+                            device_arc,
+                            allocator.residency(),
+                            bytes,
+                        ))
                     },
                 )
                 .expect("GdnStatePool::new")
