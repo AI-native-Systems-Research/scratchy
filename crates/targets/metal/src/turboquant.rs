@@ -337,12 +337,6 @@ mod tests {
         (dot / (norm(a) * norm(b)).max(1e-12)) as f32
     }
 
-    /// `tq_compress_paged` in place at every (head_dim, bits) the metal path
-    /// provisions — NOT just (128, 3). `qwen2.5-0.5b` (head_dim 64) decodes
-    /// garbage under TurboQuant while `llama-3.2-1b` (also 64, but 3-bit) is
-    /// clean, and the host-side codebook is FINE at 64 (mean cosine 0.9849 /
-    /// 0.9958, better than at 128). So the untested combination is the suspect,
-    /// and this sweep is what makes it a test rather than an argument.
     /// The KV budget sizes a TurboQuant pool with `kv_bytes_per_token`; the
     /// buffers `build_tq_provision` sizes per token — every layer's packed
     /// codes and norms, and the K and V scratch — must add up to exactly that,
@@ -367,7 +361,7 @@ mod tests {
                 42,
             );
             let len = |b: &Buffer| b.length();
-            let per_token: usize = [&tq.packed_k, &tq.packed_v, &tq.norms_k, &tq.norms_v]
+            let allocated: usize = [&tq.packed_k, &tq.packed_v, &tq.norms_k, &tq.norms_v]
                 .into_iter()
                 .flatten()
                 .map(len)
@@ -375,7 +369,7 @@ mod tests {
                 + len(&tq.scratch_k_data)
                 + len(&tq.scratch_v_data);
             assert_eq!(
-                per_token,
+                allocated,
                 num_blocks
                     * block_size
                     * kv_bytes_per_token(
@@ -390,6 +384,12 @@ mod tests {
         }
     }
 
+    /// `tq_compress_paged` in place at every (head_dim, bits) the metal path
+    /// provisions — NOT just (128, 3). `qwen2.5-0.5b` (head_dim 64) decodes
+    /// garbage under TurboQuant while `llama-3.2-1b` (also 64, but 3-bit) is
+    /// clean, and the host-side codebook is FINE at 64 (mean cosine 0.9849 /
+    /// 0.9958, better than at 128). So the untested combination is the suspect,
+    /// and this sweep is what makes it a test rather than an argument.
     #[test]
     fn gpu_compress_paged_in_place() {
         let Some(device) = crate::detect_device().map(|d| d.device) else {
