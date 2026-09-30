@@ -64,9 +64,13 @@ const STEEL_PAGED_DTYPES: &[(&str, &str)] = &[("f16", "half"), ("bf16", "bfloat"
 ///
 /// So these stems are compiled with the extra
 /// `-fno-fast-math -mmacosx-version-min=26.2 -std=metal4.0` flags (math
-/// mode Safe matches what mlx's `MTLCompileOptions` and our runtime JIT
-/// fallback use). Every other shader keeps the plain `-O3` flags.
-const NAX_MPP_SHADER_STEMS: &[&str] = &["quantized_qmm_nax", "nax_probe"];
+/// mode Safe, what mlx's `MTLCompileOptions` use). Every other shader
+/// keeps the plain `-O3` flags.
+const NAX_MPP_SHADER_STEMS: &[&str] = &[
+    "quantized_qmm_nax",
+    "attention_steel_nax_paged",
+    "nax_probe",
+];
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -103,20 +107,6 @@ fn main() {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("metal"))
-        // NAX / MetalPerformancePrimitives kernels MUST be compiled at
-        // runtime via `newLibraryWithSource` (the offline `xcrun metal`
-        // toolchain miscompiles MPP `matmul2d` — see
-        // `shader_cache::compile_nax_*_from_source`). Skip them here so
-        // the build doesn't emit (and the loader doesn't embed) a wrong
-        // metallib. `attention_steel_nax_paged` also uses runtime-only
-        // intrinsics (`simd_shuffle_xor` via NAXTile) the offline path
-        // rejects.
-        .filter(|p| {
-            !matches!(
-                p.file_stem().and_then(|s| s.to_str()),
-                Some("attention_steel_nax_paged")
-            )
-        })
         .collect();
     entries.sort();
 

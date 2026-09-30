@@ -2,14 +2,9 @@
 //
 // NAX (matrix-accelerator) paged attention instantiations.
 //
-// IMPORTANT: like `quantized_qmm_nax.metal`, this kernel uses
-// MetalPerformancePrimitives `matmul2d` cooperative tensors and MUST be
-// compiled at runtime via `newLibraryWithSource` — the offline
-// `xcrun metal` / `metallib` toolchain miscompiles MPP (each matmul2d
-// reduces only half its K). It is therefore NOT registered as an
-// embedded metallib in `build.rs`; the test / dispatcher compiles it
-// from source (`metal_nax.h` inlined) the same way
-// `compile_nax_library_from_source` does for the qmm.
+// Like `quantized_qmm_nax.metal`, this kernel uses MetalPerformancePrimitives
+// `matmul2d` cooperative tensors, so build.rs compiles it with the MPP flags
+// (see `NAX_MPP_SHADER_STEMS`).
 //
 // Tile shape: BQ=64, BK=32, WM=4, WN=1, BLOCK_SIZE=16. BQ=64 = 4 warps *
 // 16 rows (one NAX Q-frag per warp). BK=32 = 2 paged blocks per K-tile.

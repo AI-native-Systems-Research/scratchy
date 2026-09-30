@@ -2475,11 +2475,7 @@ fn lower_one(
                 // M5+/A19+ only — `is_nax_capable` gates on arch gen ≥ 17
                 // (MLX `mlx/backend/metal/device.cpp:828`). M4 and earlier
                 // lack the unit (M4's `matmul2d` emulates and produces a
-                // wrong layout), so `is_nax_capable` is false there. The
-                // NAX library is runtime-compiled (`newLibraryWithSource`)
-                // because the offline metallib toolchain miscompiles MPP
-                // cooperative tensors — see
-                // `compile_nax_library_from_source`.
+                // wrong layout), so `is_nax_capable` is false there.
                 // ~3× prefill GEMM speedup on M5.
                 let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
                 // 8-bit weights (Gemma4 MLP projections): NAX has
@@ -4536,9 +4532,7 @@ fn lower_one(
             // the simdgroup steel kernel on the Llama-3B prefill shape
             // (11.76 vs 3.3 TFLOP/s). Only instantiated for head_dim 128,
             // so it serves Llama-3.x (hd 128) prefill; everything else
-            // falls through to the simdgroup steel path below. The library
-            // is runtime-compiled at startup in `specialized_pipeline_cache`
-            // (offline metallib miscompiles MPP).
+            // falls through to the simdgroup steel path below.
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
             let nax_symbol = if is_nax {
                 nax_paged_symbol(steel_dtype_tag, p.global_head_dim)

@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCompileOptions, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice,
-    MTLFunctionConstantValues, MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLPipelineOption,
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLFunctionConstantValues,
+    MTLLibrary, MTLPipelineOption,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -75,9 +75,10 @@ impl ShaderCache {
                 "quantized_qmm",
                 &crate::embedded_metallib!("quantized_qmm")[..],
             ),
-            // NOTE: `quantized_qmm_nax` is NOT loaded in this static
-            // list — its library is selected below (AOT metallib by
-            // default; runtime JIT only as an opt-in fallback).
+            (
+                "quantized_qmm_nax",
+                &crate::embedded_metallib!("quantized_qmm_nax")[..],
+            ),
             (
                 "quantized_qvm",
                 &crate::embedded_metallib!("quantized_qvm")[..],
@@ -111,30 +112,6 @@ impl ShaderCache {
             })?;
             libraries.insert(name.to_string(), lib);
         }
-
-        // NAX qmm_t: AOT-embedded metallib by DEFAULT.
-        //
-        // `quantized_qmm_nax.metal` pulls in MetalPerformancePrimitives
-        // `matmul2d` cooperative tensors. On SDK 26.5 the offline
-        // `xcrun metal` frontend used to miscompile those (each call
-        // reduced only half its K → `affine_qmm_t_nax_*` came out ~95%
-        // wrong, worst_abs ~10.45), which is why this library was JIT'd
-        // from source at startup. That was MLX issue #3586 and the fix
-        // (MLX PR #3622) is `-mmacosx-version-min=26.2`: build.rs now
-        // compiles this stem with that flag (see `NAX_MPP_SHADER_STEMS`)
-        // and the embedded metallib is bit-exact with the CPU reference
-        // (verified by the `affine_qmm_t_nax_*` golden) — and matches
-        // the mlx WHEEL's precompiled codegen at ~13 TFLOPS, faster than
-        // the ~10 TFLOPS the runtime `newLibraryWithSource` compile got.
-        //
-        let nax_lib =
-            load_library_from_bytes(&device, &crate::embedded_metallib!("quantized_qmm_nax")[..])
-                .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "load embedded `quantized_qmm_nax.metallib`: {e}"
-                ))
-            })?;
-        libraries.insert("quantized_qmm_nax".to_string(), nax_lib);
 
         Ok(Self {
             device,
@@ -350,87 +327,4 @@ pub fn load_library_from_bytes(device: &Device, bytes: &'static [u8]) -> Result<
     device
         .newLibraryWithData_error(&data)
         .map_err(|e| format!("newLibraryWithData failed: {:?}", e))
-}
-
-/// Compile the NAX qmm_t library (`quantized_qmm_nax`) from MSL **source
-/// at runtime** via `newLibraryWithSource`. `ShaderCache::new` loads the
-/// build.rs AOT metallib instead; this is used directly by
-/// `specialized_pipeline_cache` and tests.
-///
-/// History: anything that includes `metal_nax.h` uses MetalPerformance-
-/// Primitives `matmul2d` cooperative tensors. The offline `xcrun metal`
-/// toolchain **used to miscompile** those on SDK 26.5 — each `matmul2d`
-/// reduced only half its K, so `affine_qmm_t_nax_*` came out ~95% wrong
-/// (verified on M5/applegpu_g17g). That was MLX issue #3586; MLX PR #3622
-/// showed the fix is `-mmacosx-version-min=26.2`, which build.rs now
-/// passes. The AOT metallib is therefore correct AND matches mlx's
-/// precompiled codegen (~13 TFLOPS) — faster than this runtime compile
-/// (~10 TFLOPS). Math mode Safe (fastMath off) and Metal 4.0 match mlx's
-/// `MTLCompileOptions`.
-///
-/// The runtime compiler has no `-I` for our shader dir, so we inline the
-/// `#include "metal_nax.h"` ourselves; the `<MetalPerformancePrimitives/…>`
-/// framework include inside `metal_nax.h` is resolved by the runtime
-/// compiler. Function constants (`QMM_K/N/M`) and `[[host_name]]`
-/// instantiations resolve normally via `newFunctionWithName`.
-pub fn compile_nax_library_from_source(device: &Device) -> Result<Library, String> {
-    const NAX_HEADER: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/metal_nax.h"));
-    const QMM_NAX_SRC: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/shaders/quantized_qmm_nax.metal"
-    ));
-    let body = QMM_NAX_SRC.replace("#include \"metal_nax.h\"", "");
-    let source = format!("{NAX_HEADER}\n{body}");
-
-    nax_library_from_msl(device, &source, "quantized_qmm_nax")
-}
-
-/// Compile the NAX **paged attention** library (`attention_steel_nax_paged`)
-/// from MSL source at runtime via `newLibraryWithSource` — same reason as
-/// the qmm: anything pulling in `metal_nax.h` / MPP `matmul2d` must use the
-/// runtime driver compiler, not the offline `xcrun metal` toolchain (which
-/// reduces only half the K and silently miscompiles MPP). The kernel's
-/// `#include "metal_nax.h"` and the per-kernel header are inlined here since
-/// the runtime compiler has no `-I` for our shader dir.
-pub fn compile_nax_attention_paged_library_from_source(device: &Device) -> Result<Library, String> {
-    const NAX_HEADER: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/metal_nax.h"));
-    const KERNEL_HEADER: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/shaders/mlx_steel_attn/steel_attention_nax_paged_kernel.h"
-    ));
-    const NAX_PAGED_SRC: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/shaders/attention_steel_nax_paged.metal"
-    ));
-    // Inline both includes (runtime compiler has no include path).
-    let kernel_header = KERNEL_HEADER.replace("#include \"metal_nax.h\"", "");
-    let body = NAX_PAGED_SRC
-        .replace("#include \"metal_nax.h\"", "")
-        .replace(
-            "#include \"mlx_steel_attn/steel_attention_nax_paged_kernel.h\"",
-            "",
-        );
-    // `<metal_stdlib>`/`<metal_simdgroup>` + `using namespace metal` BEFORE
-    // metal_nax.h: NAXTile::row_reduce calls unqualified `simd_shuffle_xor`,
-    // which two-phase lookup only resolves if `metal` is in scope at the
-    // template's *definition* point (the qmm never instantiates row_reduce
-    // so this was latent).
-    let source = format!(
-        "#include <metal_stdlib>\n#include <metal_simdgroup>\nusing namespace metal;\n{NAX_HEADER}\n{kernel_header}\n{body}"
-    );
-
-    nax_library_from_msl(device, &source, "attention_steel_nax_paged")
-}
-
-/// Shared runtime NAX compile: math mode Safe (fastMath off) + Metal 4.0,
-/// matching mlx's `MTLCompileOptions` (the only correct config for MPP).
-fn nax_library_from_msl(device: &Device, source: &str, label: &str) -> Result<Library, String> {
-    let opts = MTLCompileOptions::new();
-    opts.setMathMode(MTLMathMode::Safe); // == fastMath off; what mlx uses
-    opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
-    device
-        .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&opts))
-        .map_err(|e| format!("newLibraryWithSource({label}) failed: {e:?}"))
 }

@@ -100,7 +100,7 @@ pub enum KernelId {
     /// the paged cache ONCE into the shared `Binding::RopedKScratch` buffer,
     /// so the NAX attention that follows reads pre-roped K with no per-tile
     /// rotation. Emitted only when `use_nax && W::ROPE_ON_READ`. Maps to
-    /// `rope_once_nax_<dtype>_bd<head_dim>_bs16` in the runtime-compiled
+    /// `rope_once_nax_<dtype>_bd<head_dim>_bs16` in the
     /// `attention_steel_nax_paged` library.
     RopeOnceNax,
     /// Spans rope-on-read (SIMDGROUP steel prefill): the simdgroup twin of
@@ -109,7 +109,7 @@ pub enum KernelId {
     /// `attention_steel_paged` attention that follows reads pre-roped K with no
     /// per-tile rotation. Emitted only when `use_steel && !use_nax &&
     /// W::ROPE_ON_READ`. Maps to `rope_once_steel_<dtype>_bd<head_dim>_bs16` in
-    /// the runtime-compiled `attention_steel_paged` library (covers the
+    /// the `attention_steel_paged` library (covers the
     /// simdgroup head dims 64/96/128/256, incl. SmolLM's hd64).
     RopeOnceSteel,
     /// Spans rope-on-read (GQA-COOPERATIVE shared prefill): the gqa_shared twin

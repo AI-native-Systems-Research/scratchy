@@ -211,13 +211,6 @@ macro_rules! embedded_metallib {
     };
 }
 
-/// The build.rs-embedded `quantized_qmm_nax.metallib` bytes (compiled
-/// with `-mmacosx-version-min=26.2` so the MPP `matmul2d` codegen is
-/// correct). Exposed for the AOT-vs-JIT startup timing probe.
-pub fn embedded_nax_metallib() -> &'static [u8] {
-    embedded_metallib!("quantized_qmm_nax")
-}
-
 pub use allocator::{AllocatorError, PooledBuffer, PooledBufferAllocator};
 pub use device::{MetalDevice, detect_device, metal4_available};
 pub use device_metal::GpuDevice;

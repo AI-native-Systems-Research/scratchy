@@ -553,8 +553,8 @@ fn steel_paged_bk32_bd128_matches_ref() {
 
 /// Correctness probe for the NAX (matrix-accelerator) PAGED attention
 /// kernel at BQ=64, BK=32, head_dim 128 vs the CPU reference. M5-only
-/// (the runtime `newLibraryWithSource` MPP compile only produces a
-/// usable library on NAX hardware); skips with a note on non-NAX GPUs.
+/// (the MPP pipeline only builds on NAX hardware); skips with a note on
+/// non-NAX GPUs.
 #[test]
 fn steel_nax_paged_bd128_matches_ref() {
     let Some(di) = detect_device() else {

@@ -438,10 +438,10 @@ struct BaseNAXFrag {
           Op::apply(inp_vals[i * kElemCols + 0], inp_vals[i * kElemCols + 1]),
           Op::apply(inp_vals[i * kElemCols + 2], inp_vals[i * kElemCols + 3]));
 
-      T qgr_reduce = simd_shuffle_xor(thr_reduce, ushort(1));
+      T qgr_reduce = metal::simd_shuffle_xor(thr_reduce, ushort(1));
       qgr_reduce = Op::apply(thr_reduce, qgr_reduce);
 
-      T sgr_reduce = simd_shuffle_xor(qgr_reduce, ushort(8));
+      T sgr_reduce = metal::simd_shuffle_xor(qgr_reduce, ushort(8));
       sgr_reduce = Op::apply(qgr_reduce, sgr_reduce);
 
       reduced_vals[i] = Op::apply(reduced_vals[i], sgr_reduce);
