@@ -397,7 +397,9 @@ pub struct LLM {
 }
 
 /// Stops an [`LLM`]'s generation from another thread: the one running, or — when none is — the
-/// next to start. After the step in flight, the generation aborts its request, steps the engine
+/// next to start. One that lands after a generation's last step, as it returns, is dropped: it
+/// neither stops that generation nor the next, so a caller that must not miss it (the chat) also
+/// hears the signal itself. After the step in flight, the generation aborts its request, steps the engine
 /// until nothing of it is queued, and returns [`Interrupted`]. What a termination signal does to
 /// an in-process generation, so the process exits through its normal teardown — the device idle,
 /// its residency released — instead of dying with GPU work in flight.
