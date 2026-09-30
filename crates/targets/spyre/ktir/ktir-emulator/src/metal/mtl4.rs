@@ -35,6 +35,22 @@ pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 
+/// Block until `event` reaches `value`: the GPU is done with every command buffer committed
+/// before the signal, however long that takes. Returning earlier hands back buffers a kernel is
+/// still using, and the caller drops them under it; so a kernel that never ends holds this wait.
+/// Each minute the wait goes on is reported.
+/// This crate's copy of `scratchy_target_metal::mtl4_dispatch::wait_drained` (see the module
+/// doc for why it is a copy).
+fn wait_drained(event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
+    let started = std::time::Instant::now();
+    while !event.waitUntilSignaledValue_timeoutMS(value, 60_000) {
+        eprintln!(
+            "[ktir-emulator] GPU work committed {:?} ago is still running; waiting for it",
+            started.elapsed(),
+        );
+    }
+}
+
 /// Whether `device` can actually mint an MTL4 command queue — a real
 /// capability probe, not string-matching a `dispatch`/`Batch::begin` error
 /// after the fact. `newMTL4CommandQueue()` returns `None` on some hosted CI
@@ -179,9 +195,7 @@ pub fn dispatch_readback(
         queue4.commit_count(std::ptr::NonNull::from(&mut cb_array[0]), 1);
     }
     queue4.signalEvent_value(ProtocolObject::from_ref(&*event), 1);
-    if !event.waitUntilSignaledValue_timeoutMS(1, 30_000) {
-        return Err("mtl4: dispatch timed out".into());
-    }
+    wait_drained(&event, 1);
     let elapsed = start.elapsed();
 
     let bytes = match readback {
@@ -351,9 +365,7 @@ impl Batch {
         }
         self.queue4
             .signalEvent_value(ProtocolObject::from_ref(&*self.event), 1);
-        if !self.event.waitUntilSignaledValue_timeoutMS(1, 60_000) {
-            return Err("mtl4: dispatch batch timed out".into());
-        }
+        wait_drained(&self.event, 1);
         Ok(start.elapsed())
     }
 }

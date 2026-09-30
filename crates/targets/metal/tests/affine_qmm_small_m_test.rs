@@ -185,7 +185,7 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
             depth: 1,
         },
     );
-    batch.commit(true).expect("small-M gemm");
+    batch.commit(true);
     let got: Vec<f32> =
         unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, m * n) }
             .iter()

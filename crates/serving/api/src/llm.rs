@@ -19,6 +19,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -391,7 +392,48 @@ pub struct LLM {
     /// Model-recommended sampling defaults (`generation_config.json`),
     /// Python vLLM `generation_config="auto"` parity.
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
+    /// Set by [`Interrupter::interrupt`]; the running generation reads it between steps.
+    interrupt: Arc<AtomicBool>,
 }
+
+/// Stops an [`LLM`]'s generation from another thread: the one running, or — when none is — the
+/// next to start. One that lands after a generation's last step, as it returns, is dropped: it
+/// neither stops that generation nor the next, so a caller that must not miss it (the chat) also
+/// hears the signal itself. After the step in flight, the generation aborts its request, steps the engine
+/// until nothing of it is queued, and returns [`Interrupted`]. What a termination signal does to
+/// an in-process generation, so the process exits through its normal teardown — the device idle,
+/// its residency released — instead of dying with GPU work in flight.
+#[derive(Clone)]
+pub struct Interrupter(Arc<AtomicBool>);
+
+impl Interrupter {
+    pub fn interrupt(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// A generation's hold on its [`LLM`]'s interrupt: taken when the generation starts, it clears
+/// the interrupt when the generation returns, however it returns. Cleared then rather than at the
+/// start, an interrupt that lands while the generation prepares its requests still stops it.
+struct Generation(Arc<AtomicBool>);
+
+impl Drop for Generation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The error an interrupted generation returns (see [`Interrupter`]).
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
 
 impl LLM {
     /// Create an LLM with default settings for the given model.
@@ -452,7 +494,43 @@ impl LLM {
             max_model_len: stack.max_model_len,
             block_size: stack.block_size,
             generation_defaults: stack.generation_defaults,
+            interrupt: Arc::default(),
         })
+    }
+
+    /// A handle that stops this LLM's running generation from another thread (a signal
+    /// handler). See [`Interrupter`].
+    pub fn interrupter(&self) -> Interrupter {
+        Interrupter(Arc::clone(&self.interrupt))
+    }
+
+    /// Whether [`Interrupter::interrupt`] was called since the last generation returned (a running
+    /// generation asks between steps).
+    fn interrupted(&self) -> bool {
+        self.interrupt.load(Ordering::Acquire)
+    }
+
+    /// A generation starts; see [`Generation`].
+    fn generation(&self) -> Generation {
+        Generation(Arc::clone(&self.interrupt))
+    }
+
+    /// Stop an interrupted generation: abort its requests and step the engine until they are
+    /// retired, then the [`Interrupted`] error it returns. Without the background pipeline a step
+    /// has finished on the GPU when it returns; with it (`max_num_seqs > 1`) up to two are queued,
+    /// and these steps are what finishes them.
+    fn stop(&mut self, request_ids: &[String]) -> anyhow::Error {
+        if let Err(e) = self.client.abort_requests(request_ids) {
+            return anyhow::anyhow!("abort_requests failed: {e}");
+        }
+        while self.client.has_unfinished_requests() {
+            match self.client.get_output() {
+                Ok(StepOutcome::Progressed { .. }) => {}
+                Ok(StepOutcome::Stalled | StepOutcome::Idle) => break,
+                Err(e) => return anyhow::anyhow!("engine step failed: {e}"),
+            }
+        }
+        Interrupted.into()
     }
 
     /// The model name / HuggingFace ID.
@@ -682,6 +760,7 @@ impl LLM {
         seal: bool,
         volatile: bool,
     ) -> Result<Vec<RequestOutput>> {
+        let _generation = self.generation();
         let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
         params
             .validate()
@@ -786,6 +865,9 @@ impl LLM {
         let mut itl_count: Vec<u32> = vec![0; total];
 
         while self.client.has_unfinished_requests() {
+            if self.interrupted() {
+                return Err(self.stop(&request_ids));
+            }
             let outcome = self
                 .client
                 .get_output()
@@ -956,6 +1038,7 @@ impl LLM {
         params: Option<SamplingParams>,
         mut on_token: impl FnMut(&str),
     ) -> Result<RequestOutput> {
+        let _generation = self.generation();
         let tpl = self
             .chat_template
             .as_ref()
@@ -1048,6 +1131,9 @@ impl LLM {
         let mut steps = 0usize;
         let mut _d_step0 = std::time::Duration::ZERO;
         while self.client.has_unfinished_requests() {
+            if self.interrupted() {
+                return Err(self.stop(std::slice::from_ref(&request_id)));
+            }
             let _t_step_i = std::time::Instant::now();
             let outcome = self
                 .client

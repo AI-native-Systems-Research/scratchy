@@ -146,9 +146,19 @@ impl BenchStats {
     }
 }
 
+/// What the in-process chat waits on between turns.
+#[cfg(feature = "chat")]
+enum Input {
+    Line(String),
+    End,
+    /// A termination signal.
+    Interrupt,
+}
+
 #[cfg(feature = "chat")]
 fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
-    use scratchy_serving_api::llm::{ChatMessage, LLM};
+    use scratchy_serving_api::llm::{ChatMessage, Interrupted, LLM};
+    use scratchy_serving_api::signal::termination_signal;
 
     // `init_tracing` honors `RUST_LOG` when set; "info" is just the default level so the
     // startup milestones (session ready, ladder built, KV pool sized, ...) still print without
@@ -190,6 +200,20 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     }
     let mut llm = builder.build()?;
     let startup_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // A termination signal stops the generation in flight after its current step and ends the
+    // chat through its normal teardown — the device idle, its residency released — instead of
+    // killing the process with GPU work in flight. A second signal exits at once.
+    let (input_tx, input) = std::sync::mpsc::channel();
+    let interrupter = llm.interrupter();
+    let on_signal = input_tx.clone();
+    tokio::runtime::Handle::current().spawn(async move {
+        termination_signal().await;
+        interrupter.interrupt();
+        let _ = on_signal.send(Input::Interrupt);
+        termination_signal().await;
+        std::process::exit(130);
+    });
 
     println!("Using model: {}", llm.model_name());
 
@@ -278,12 +302,39 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
             }
 
             conversation.push(ChatMessage::assistant(&output.outputs[0].text));
+            // A signal after the turn's last step: the turn finished, the run ends here.
+            if input.try_recv().is_ok() {
+                return Err(Interrupted.into());
+            }
         }
         return Ok(());
     }
 
+    // Lines come from a reader thread, so a signal ends the chat at the prompt too.
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if input_tx
+                .send(Input::Line(line.trim_end().to_string()))
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = input_tx.send(Input::End);
+    });
     println!("Please enter a message for the chat model:");
-    while let Some(input) = read_line("> ") {
+    loop {
+        print!("> ");
+        io::stdout().flush().ok();
+        let input = match input.recv() {
+            Ok(Input::Line(line)) => line,
+            Ok(Input::End) | Err(_) => break,
+            Ok(Input::Interrupt) => {
+                println!();
+                return Err(Interrupted.into());
+            }
+        };
         if input.is_empty() {
             continue;
         }
