@@ -19,6 +19,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -391,6 +392,59 @@ pub struct LLM {
     /// Model-recommended sampling defaults (`generation_config.json`),
     /// Python vLLM `generation_config="auto"` parity.
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
+    /// Set by [`Interrupter::interrupt`]; the running generation reads it between steps.
+    interrupt: Arc<AtomicBool>,
+}
+
+/// Stops an [`LLM`]'s running generation from another thread: after the step in flight, the
+/// generation aborts its request, steps the engine until nothing of it is in flight, and returns
+/// [`Interrupted`]. What a termination signal does to an in-process generation, so the process
+/// exits through its normal teardown — the device idle, its residency released — instead of dying
+/// with GPU work in flight.
+#[derive(Clone)]
+pub struct Interrupter(Arc<AtomicBool>);
+
+impl Interrupter {
+    pub fn interrupt(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// The error an interrupted generation returns (see [`Interrupter`]).
+#[derive(Debug)]
+pub struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// Resolves on the process's first SIGINT or SIGTERM after the call.
+pub async fn termination_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 impl LLM {
@@ -452,7 +506,33 @@ impl LLM {
             max_model_len: stack.max_model_len,
             block_size: stack.block_size,
             generation_defaults: stack.generation_defaults,
+            interrupt: Arc::default(),
         })
+    }
+
+    /// A handle that stops this LLM's running generation from another thread (a signal
+    /// handler). See [`Interrupter`].
+    pub fn interrupter(&self) -> Interrupter {
+        Interrupter(Arc::clone(&self.interrupt))
+    }
+
+    /// Abort `request_id` and step the engine until nothing it scheduled is still in flight, so the
+    /// device is idle when the generation returns [`Interrupted`].
+    fn stop(&mut self, request_id: &str) -> Result<RequestOutput> {
+        self.client
+            .abort_requests(&[request_id.to_owned()])
+            .map_err(|e| anyhow::anyhow!("abort_requests failed: {e}"))?;
+        while self.client.has_unfinished_requests() {
+            match self
+                .client
+                .get_output()
+                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?
+            {
+                StepOutcome::Progressed { .. } => {}
+                StepOutcome::Stalled | StepOutcome::Idle => break,
+            }
+        }
+        Err(Interrupted.into())
     }
 
     /// The model name / HuggingFace ID.
@@ -1048,6 +1128,9 @@ impl LLM {
         let mut steps = 0usize;
         let mut _d_step0 = std::time::Duration::ZERO;
         while self.client.has_unfinished_requests() {
+            if self.interrupt.swap(false, Ordering::AcqRel) {
+                return self.stop(&request_id);
+            }
             let _t_step_i = std::time::Instant::now();
             let outcome = self
                 .client

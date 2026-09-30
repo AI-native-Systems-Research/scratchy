@@ -26,6 +26,22 @@ pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 
+/// Block until `event` reaches `value`: the GPU is done with every command buffer committed
+/// before the signal, however long that takes. Returning earlier hands back buffers a kernel is
+/// still using — the caller frees, reuses or unpins them under it, and a process that then exits
+/// leaves the kernel running on the GPU. A command buffer the system ends (a GPU fault, its
+/// watchdog) still reaches the signal, its error arriving through the commit feedback; each minute
+/// the wait goes on is reported.
+pub fn wait_drained(event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
+    let started = std::time::Instant::now();
+    while !event.waitUntilSignaledValue_timeoutMS(value, 60_000) {
+        eprintln!(
+            "[scratchy-target-metal] GPU work committed {:?} ago is still running; waiting for it",
+            started.elapsed(),
+        );
+    }
+}
+
 /// `StorageModeShared` buffer initialized from `data`.
 pub fn shared_bytes(device: &Device, data: &[u8]) -> Buffer {
     let buf = device
@@ -167,10 +183,7 @@ pub fn dispatch_threadgroups(
         queue4.commit_count(std::ptr::NonNull::from(&mut cb_array[0]), 1);
     }
     queue4.signalEvent_value(ProtocolObject::from_ref(&*event), 1);
-    assert!(
-        event.waitUntilSignaledValue_timeoutMS(1, 30_000),
-        "MTL4 dispatch helper timed out"
-    );
+    wait_drained(&event, 1);
     true
 }
 
@@ -363,11 +376,7 @@ impl Mtl4DispatchBatch {
             }
             self.queue4
                 .signalEvent_value(ProtocolObject::from_ref(&*self.event), 1);
-            if !self.event.waitUntilSignaledValue_timeoutMS(1, 60_000) {
-                return Err(MetalStreamError::ShaderCompilationFailed(
-                    "MTL4 dispatch batch timed out".into(),
-                ));
-            }
+            wait_drained(&self.event, 1);
             // `self` drops here → residency set + pinned buffers + tables freed
             // AFTER the GPU has drained. Safe.
             Ok(())

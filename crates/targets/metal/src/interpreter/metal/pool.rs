@@ -23,7 +23,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBufferStatus};
 use objc2_metal::{
     MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTLDevice,
-    MTLSharedEvent,
 };
 
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
@@ -309,6 +308,24 @@ struct Mtl4Pool {
     /// otherwise produces all-zero outputs and degenerate logits
     /// (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode).
     commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Where one [`MetalWorkerPool::submit`] spent its time, for `SCRATCHY_METAL_TRACE`.
+struct Submitted {
+    encode: std::time::Duration,
+    commit: std::time::Duration,
+    wait: std::time::Duration,
+}
+
+impl std::fmt::Display for Submitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            encode,
+            commit,
+            wait,
+        } = self;
+        write!(f, "encode={encode:?} commit={commit:?} wait={wait:?}")
+    }
 }
 
 // `Retained<ProtocolObject<dyn MTL*>>` from objc2 isn't auto-Send/Sync
@@ -800,8 +817,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             usize,
         ) -> Result<(), ForwardError>,
     {
-        use objc2::runtime::AnyObject;
-        use std::ptr::NonNull;
         self.ensure_mtl4();
         // gemma3-mm SigLIP vision tower: the projector tail
         // (`AvgPool2d -> soft_emb_norm -> mm_input_projection`) hits an
@@ -843,16 +858,56 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             return Ok(());
         }
         let trace = std::env::var_os("SCRATCHY_METAL_TRACE").is_some();
+        let ((), took) = self.submit(|enc| {
+            worker
+                .run_bucket_mtl4(
+                    bucket_idx,
+                    num_tokens as u32,
+                    num_seqs,
+                    has_spec_tokens,
+                    enc,
+                )
+                .map_err(ForwardError::Worker)?;
+            // Caller-supplied encoder-tail hook (e.g. argmax dispatch)
+            // runs on the SAME MTL4 compute encoder as the forward —
+            // forward + tail share one CB, one commit, one host wait.
+            if let Some(t) = tail {
+                t(enc, worker, bucket_idx)?;
+            }
+            Ok(())
+        })?;
+        if trace {
+            eprintln!("[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4] {took}");
+        }
+        Ok(())
+    }
+
+    /// ONE command buffer on the pool's MTL4 queue. `encode` records onto
+    /// its compute encoder, the pool's residency sets declared on it; if it
+    /// fails, its error returns with the command buffer ended and nothing
+    /// committed. Otherwise the command buffer is committed and this returns
+    /// once the GPU is done with it ([`wait_drained`]) — completed, or ended
+    /// by the system, whose error the commit feedback reports — so nothing it
+    /// reads is still in use when the caller gets control back.
+    ///
+    /// [`wait_drained`]: crate::mtl4_dispatch::wait_drained
+    fn submit<R>(
+        &self,
+        encode: impl FnOnce(
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        ) -> Result<R, ForwardError>,
+    ) -> Result<(R, Submitted), ForwardError> {
+        use objc2::runtime::AnyObject;
+        use std::ptr::NonNull;
         let t_pre = std::time::Instant::now();
         let cb = self
             .device
             .newCommandBuffer()
             .expect("newCommandBuffer returned nil");
-        let (signal_value, queue_clone, event_clone, commit_opts, commit_err) = {
+        let (encoded, signal_value, queue, event, commit_opts, commit_err) = {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");
             let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
             cb.beginCommandBufferWithAllocator(&mtl4.allocator);
-            // Residency: MTL4 cmdbufs declare per-cmdbuf rather than
             // Residency: MTL4 cmdbufs declare per-cmdbuf.
             // Reuse the same set as the pool (weights + arenas + KV cache).
             let cb_ptr: *mut AnyObject =
@@ -872,59 +927,40 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let enc = cb
                 .computeCommandEncoder()
                 .expect("MTL4 computeCommandEncoder returned nil");
-            worker
-                .run_bucket_mtl4(
-                    bucket_idx,
-                    num_tokens as u32,
-                    num_seqs,
-                    has_spec_tokens,
-                    &enc,
-                )
-                .map_err(ForwardError::Worker)?;
-            // Caller-supplied encoder-tail hook (e.g. argmax dispatch)
-            // runs on the SAME MTL4 compute encoder as the forward —
-            // forward + tail share one CB, one commit, one host wait.
-            if let Some(t) = tail {
-                t(&enc, worker, bucket_idx)?;
-            }
+            let encoded = encode(&enc);
             enc.endEncoding();
             cb.endCommandBuffer();
+            // Propagate an encode error AFTER the encoder/CB have been ended
+            // (so allocator state stays consistent) and BEFORE committing
+            // any half-encoded work to the GPU.
+            let encoded = encoded?;
             mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
-            let val = mtl4.signal_counter;
-            let qc = mtl4.queue.clone();
-            let ec = mtl4.shared_event.clone();
             // Drop the lock before the host-side wait so a concurrent
             // pool consumer can probe `ensure_mtl4` while we wait.
             (
-                val,
-                qc,
-                ec,
+                encoded,
+                mtl4.signal_counter,
+                mtl4.queue.clone(),
+                mtl4.shared_event.clone(),
                 mtl4.commit_options.clone(),
                 std::sync::Arc::clone(&mtl4.commit_error),
             )
         };
-        let encoded = t_pre.elapsed();
+        let t_encoded = t_pre.elapsed();
         let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
             &cb;
-        let cb_nn = NonNull::from(cb_protocol);
-        let mut cb_array = [cb_nn];
+        let mut cb_array = [NonNull::from(cb_protocol)];
         unsafe {
-            queue_clone.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
+            queue.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
         }
         // Signal AFTER the cmdbuf so the wait fires only once GPU work
         // is fully drained.
-        queue_clone.signalEvent_value(
-            ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
+        queue.signalEvent_value(
+            ::objc2::runtime::ProtocolObject::from_ref(&*event),
             signal_value,
         );
-        let committed = t_pre.elapsed();
-        // 60s timeout — same order of magnitude as the longest single
-        // bucket we'd ever expect; any wait approaching this is a
-        // hang and we'd rather panic than spin forever.
-        let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
-        if !ok {
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
-        }
+        let t_committed = t_pre.elapsed();
+        crate::mtl4_dispatch::wait_drained(&event, signal_value);
         // GPU execution errors (e.g. command-buffer OOM) arrive via the
         // commit feedback handler and DO NOT fail the event wait — a
         // failed CB otherwise yields all-zero outputs and degenerate
@@ -941,24 +977,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 mtl4.allocator.reset();
             }
         }
-        let waited = t_pre.elapsed();
-        if trace {
-            eprintln!(
-                "[forward bucket={} num_tokens={} mtl4] encode={:?} commit={:?} wait={:?}",
-                bucket_idx,
-                num_tokens,
-                encoded,
-                committed - encoded,
-                waited - committed,
-            );
-        }
-        Ok(())
+        let t_waited = t_pre.elapsed();
+        Ok((
+            encoded,
+            Submitted {
+                encode: t_encoded,
+                commit: t_committed - t_encoded,
+                wait: t_waited - t_committed,
+            },
+        ))
     }
 
     /// One activation-dump replay segment: encode flat dispatch
     /// indices `range` of the bucket's baked tape on a fresh MTL4 CB,
-    /// commit, and host-wait. Mirrors `run_bucket_mtl4_with_tail`'s
-    /// CB machinery minus timing/tail.
+    /// commit, and host-wait.
     fn run_dump_segment(
         &self,
         worker: &MetalWorker<W>,
@@ -968,83 +1000,18 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         has_spec_tokens: bool,
         range: std::ops::Range<usize>,
     ) -> Result<(), ForwardError> {
-        use objc2::runtime::AnyObject;
-        use std::ptr::NonNull;
-        let cb = self
-            .device
-            .newCommandBuffer()
-            .expect("newCommandBuffer returned nil");
-        let (signal_value, queue_clone, event_clone, commit_opts, commit_err) = {
-            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
-            let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
-            cb.beginCommandBufferWithAllocator(&mtl4.allocator);
-            let cb_ptr: *mut AnyObject =
-                ::objc2::rc::Retained::as_ptr(&cb) as *const AnyObject as *mut AnyObject;
-            unsafe {
-                self.allocator
-                    .residency()
-                    .attach_to_mtl4_command_buffer(cb_ptr);
-                // Also declare the weights set. A distinct un-wired set by
-                // default, where this call is what keeps weights resident for
-                // the duration of the forward; the same object as residency()
-                // under WeightResidency::Wired (idempotent re-attach).
-                self.allocator
-                    .weights_residency()
-                    .attach_to_mtl4_command_buffer(cb_ptr);
-            }
-            let enc = cb
-                .computeCommandEncoder()
-                .expect("MTL4 computeCommandEncoder returned nil");
+        self.submit(|enc| {
             worker
                 .run_bucket_mtl4_range(
                     bucket_idx,
                     num_tokens as u32,
                     num_seqs,
                     has_spec_tokens,
-                    &enc,
-                    range.clone(),
+                    enc,
+                    range,
                 )
-                .map_err(ForwardError::Worker)?;
-            enc.endEncoding();
-            cb.endCommandBuffer();
-            mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
-            (
-                mtl4.signal_counter,
-                mtl4.queue.clone(),
-                mtl4.shared_event.clone(),
-                mtl4.commit_options.clone(),
-                std::sync::Arc::clone(&mtl4.commit_error),
-            )
-        };
-        let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
-            &cb;
-        let mut cb_array = [NonNull::from(cb_protocol)];
-        unsafe {
-            queue_clone.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
-        }
-        queue_clone.signalEvent_value(
-            ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
-            signal_value,
-        );
-        let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
-        if !ok {
-            eprintln!("[dump] segment {:?} TIMED OUT (60s)", range);
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
-        }
-        // GPU execution errors (e.g. command-buffer OOM) arrive via the
-        // commit feedback handler and DO NOT fail the event wait — a
-        // failed CB otherwise yields all-zero outputs and degenerate
-        // logits silently (macOS 26.5.1 / Qwen3.5-MoE "!!!!").
-        if let Some(msg) = commit_err.lock().expect("commit_error mutex").take() {
-            eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
-        }
-        {
-            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
-            if let Some(mtl4) = slot.as_mut() {
-                mtl4.allocator.reset();
-            }
-        }
+                .map_err(ForwardError::Worker)
+        })?;
         Ok(())
     }
 
@@ -1081,9 +1048,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         ) -> Result<R, ForwardError>,
     {
-        use objc2::runtime::AnyObject;
-        use std::ptr::NonNull;
-
         self.ensure_mtl4();
         let trace = std::env::var_os("SCRATCHY_METAL_TRACE").is_some();
 
@@ -1103,93 +1067,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let guard = self.checkout(weights)?;
         begin_step(&guard, inputs)?;
 
-        let t_pre = std::time::Instant::now();
-        let cb = self
-            .device
-            .newCommandBuffer()
-            .expect("newCommandBuffer returned nil");
-        let (signal_value, queue_clone, event_clone, body_result, commit_opts, commit_err) = {
-            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
-            let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
-            cb.beginCommandBufferWithAllocator(&mtl4.allocator);
-            let cb_ptr: *mut AnyObject =
-                ::objc2::rc::Retained::as_ptr(&cb) as *const AnyObject as *mut AnyObject;
-            unsafe {
-                self.allocator
-                    .residency()
-                    .attach_to_mtl4_command_buffer(cb_ptr);
-                // Also declare the weights set. A distinct un-wired set by
-                // default, where this call is what keeps weights resident for
-                // the duration of the forward; the same object as residency()
-                // under WeightResidency::Wired (idempotent re-attach).
-                self.allocator
-                    .weights_residency()
-                    .attach_to_mtl4_command_buffer(cb_ptr);
-            }
-            let enc = cb
-                .computeCommandEncoder()
-                .expect("MTL4 computeCommandEncoder returned nil");
-            // Caller's body encodes the entire chain onto `enc`.
-            let body_result = body(&guard.worker, &guard.runtime, &enc);
-            enc.endEncoding();
-            cb.endCommandBuffer();
-            mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
-            let val = mtl4.signal_counter;
-            let qc = mtl4.queue.clone();
-            let ec = mtl4.shared_event.clone();
-            (
-                val,
-                qc,
-                ec,
-                body_result,
-                mtl4.commit_options.clone(),
-                std::sync::Arc::clone(&mtl4.commit_error),
-            )
-        };
-        // Propagate body errors AFTER the encoder/CB have been ended
-        // (so allocator state stays consistent) and BEFORE committing
-        // any half-encoded work to the GPU.
-        let body_result = body_result?;
-
-        let encoded = t_pre.elapsed();
-        let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
-            &cb;
-        let cb_nn = NonNull::from(cb_protocol);
-        let mut cb_array = [cb_nn];
-        unsafe {
-            queue_clone.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
-        }
-        queue_clone.signalEvent_value(
-            ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
-            signal_value,
-        );
-        let committed = t_pre.elapsed();
-        let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
-        if !ok {
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
-        }
-        // GPU execution errors (e.g. command-buffer OOM) arrive via the
-        // commit feedback handler and DO NOT fail the event wait — a
-        // failed CB otherwise yields all-zero outputs and degenerate
-        // logits silently (macOS 26.5.1 / Qwen3.5-MoE "!!!!").
-        if let Some(msg) = commit_err.lock().expect("commit_error mutex").take() {
-            eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
-        }
-        {
-            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
-            if let Some(mtl4) = slot.as_mut() {
-                mtl4.allocator.reset();
-            }
-        }
-        let waited = t_pre.elapsed();
+        // Caller's body encodes the entire chain onto the encoder.
+        let (body_result, took) = self.submit(|enc| body(&guard.worker, &guard.runtime, enc))?;
         if trace {
-            eprintln!(
-                "[chain encoder mtl4] encode={:?} commit={:?} wait={:?}",
-                encoded,
-                committed - encoded,
-                waited - committed,
-            );
+            eprintln!("[chain encoder mtl4] {took}");
         }
         Ok(body_result)
     }
