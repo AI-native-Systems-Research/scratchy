@@ -38,5 +38,5 @@ libc = { workspace = true }
 shell-words = "1"
 csv = "1"
 dirs = { workspace = true }
-parquet = { version = "59", default-features = false, features = ["arrow", "snap"], optional = true }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"], optional = true }
 arrow = { version = "59", default-features = false, features = ["json"], optional = true }
