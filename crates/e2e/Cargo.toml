@@ -53,4 +53,4 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 safetensors = { workspace = true }
 half = { workspace = true }
 tempfile = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
