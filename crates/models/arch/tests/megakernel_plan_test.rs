@@ -54,6 +54,10 @@ fn check_class(name: &str, classed: &ClassedTape) {
         source_has(mk.source, &format!("void {}(", mk.kernel)),
         "{name}: the kernel is in the source"
     );
+    assert!(
+        mk.metallib.starts_with(b"MTLB"),
+        "{name}: the library is compiled at build time"
+    );
     // The work split is the launch's: every lane a function of the GPU's cores (`MK_P`).
     assert!(
         !source_has(mk.source, "mk_tg == ") || source_has(mk.source, "% MK_P;"),

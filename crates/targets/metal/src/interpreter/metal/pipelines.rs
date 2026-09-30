@@ -114,15 +114,15 @@ impl SpecializedPipelines {
             .map_err(PipelineLookupError::Build)
     }
 
-    /// Compile the generated megakernel library `name` from `source` unless a load already did;
-    /// how long this call's compile took (`None`: already compiled).
+    /// Load the megakernel library `name` (compiled at build time) from `metallib` unless a load
+    /// already did; how long this call's load took (`None`: already loaded).
     pub fn megakernel_library(
         &self,
         name: &'static str,
-        source: impl FnOnce() -> String,
+        metallib: &'static [u8],
     ) -> Result<Option<std::time::Duration>, PipelineLookupError> {
         self.cache
-            .compile_library(name, source)
+            .load_generated_library(name, metallib)
             .map_err(PipelineLookupError::Build)
     }
 

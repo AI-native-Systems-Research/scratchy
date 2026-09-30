@@ -122,6 +122,7 @@ pub mod device;
 /// in the target crate, beside spyre's `lower_subtile_tape_to_superdsc`.
 pub mod from_tape;
 pub mod grammar_mask;
+pub mod msl_offline;
 /// ⛔ THE METAL OP ABI — which operand a kernel writes over, which ops are in-place,
 /// the source/unary constructor tables. It lived in `compiler/macros/src/metal_op_abi.rs`:
 /// target ABI facts inside the shared compiler, which is the arrangement CLAUDE.md says

@@ -21,12 +21,16 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use std::num::NonZeroU32;
 
 use scratchy_subtile::megakernel_plan::{
     Items, MegakernelPlan, Placement, Schedule, StepFlow, UnitIx, plan, schedule,
 };
+use scratchy_target_metal::interpreter::metal::megakernel::MK_BODIES;
+use scratchy_target_metal::msl_offline::{AIR_TO_METALLIB, MSL_TO_AIR};
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantType, ConstantValue};
 use scratchy_target_metal::tape::ids::{
     ArenaSlotIdx, HeadDim, LayerId, NumKvHeads, NumQHeads, NumTokens, TqDecodeHeads,
@@ -1209,6 +1213,8 @@ impl<'a> Gen<'a> {
         Ok(MegakernelTape {
             library,
             source: String::leak(s),
+            // Compiled by `compile_metallib`; the emission includes its bytes.
+            metallib: &[],
             kernel: "mk_forward",
             commands: CommandSpan {
                 start: admitted[0] as u32,
@@ -1657,6 +1663,51 @@ fn replace_word(text: &str, word: &str, by: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Compiles `mk`'s library at build time into `dir` as every shader is compiled — the build
+/// machine's `xcrun metal` with [`MSL_TO_AIR`] then [`AIR_TO_METALLIB`], its toolchain's language
+/// standard — so its bodies compile exactly as their dispatch kernels; returns the metallib's
+/// path for the emission to include. Named by the library's content hash, and written through a
+/// file of this process's own, so builds expanding models in parallel never read a half-written
+/// one.
+pub fn compile_metallib(mk: &MegakernelTape, dir: &Path) -> Result<PathBuf, BakeDefect> {
+    let fail = |what: String| BakeDefect(format!("megakernel `{}`: {what}", mk.library));
+    std::fs::create_dir_all(dir).map_err(|e| fail(format!("create {}: {e}", dir.display())))?;
+    let metallib = dir.join(format!("{}.metallib", mk.library));
+    if metallib.exists() {
+        return Ok(metallib);
+    }
+    let own = |ext: &str| dir.join(format!("{}.{}.{ext}", mk.library, std::process::id()));
+    let (source, air, lib) = (own("metal"), own("air"), own("metallib"));
+    std::fs::write(&source, format!("{MK_BODIES}\n{}", mk.source))
+        .map_err(|e| fail(format!("write {}: {e}", source.display())))?;
+    let run = |args: &[&str], from: &Path, to: &Path, extra: &[&str]| {
+        let out = Command::new("xcrun")
+            .args(args)
+            .args(extra)
+            .arg(from)
+            .arg("-o")
+            .arg(to)
+            .output()
+            .map_err(|e| fail(format!("spawn xcrun: {e}")))?;
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(fail(format!(
+                "`xcrun {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            ))),
+        }
+    };
+    run(MSL_TO_AIR, &source, &air, &["-c"])?;
+    run(AIR_TO_METALLIB, &air, &lib, &[])?;
+    std::fs::rename(&lib, &metallib)
+        .map_err(|e| fail(format!("rename to {}: {e}", metallib.display())))?;
+    for f in [&source, &air] {
+        std::fs::remove_file(f).map_err(|e| fail(format!("remove {}: {e}", f.display())))?;
+    }
+    Ok(metallib)
 }
 
 /// FNV-1a, 64-bit: a deterministic content name (the bake must be reproducible).

@@ -2142,8 +2142,11 @@ pub struct CommandSpan {
 pub struct MegakernelTape {
     /// Names the library `source` compiles to (a content hash): workers of one load share it.
     pub library: &'static str,
-    /// The generated kernel; the worker appends it to the adapters' bodies at load.
+    /// The generated kernel, which follows the adapters' bodies in its library.
     pub source: &'static str,
+    /// The library, compiled at build time as every shader is ([`crate::msl_offline`]): the
+    /// adapters' bodies with `source` appended.
+    pub metallib: &'static [u8],
     /// Its `[[kernel]]` host name.
     pub kernel: &'static str,
     /// The expanded commands the launch replaces (the admitted ones run inside it).

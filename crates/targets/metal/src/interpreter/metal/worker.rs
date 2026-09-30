@@ -1123,7 +1123,7 @@ fn bake_bucket<W: CanonicalParams>(
             if std::env::var_os("SCRATCHY_METAL_TRACE").is_some() {
                 eprintln!(
                     "[megakernel] bucket_m={} ONE launch plays {} of {} commands; \
-                     grid barriers per forward={}; library {} ({} bytes MSL) compiled in {:?}; \
+                     grid barriers per forward={}; library {} ({} bytes metallib) loaded in {:?}; \
                      pipeline built in {:?}; maxTotalThreadsPerThreadgroup={}; persistent \
                      threadgroups P={}",
                     tape.bucket_m,
@@ -1131,8 +1131,8 @@ fn bake_bucket<W: CanonicalParams>(
                     expanded_commands.len(),
                     load.grid_barriers,
                     mk.library,
-                    load.source_bytes,
-                    load.compiled,
+                    load.metallib_bytes,
+                    load.loaded,
                     load.pipeline_built,
                     load.max_threads,
                     load.threadgroups,

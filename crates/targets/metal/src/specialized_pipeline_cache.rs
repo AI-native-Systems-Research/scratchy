@@ -65,8 +65,8 @@ impl PipelineKey {
 pub struct SpecializedPipelineCache {
     device: Device,
     libraries: HashMap<&'static str, Library>,
-    /// Libraries compiled at load from generated MSL (the decode megakernels), by name.
-    compiled: Mutex<HashMap<&'static str, Library>>,
+    /// Generated libraries (the decode megakernels, compiled at build time), by name.
+    generated: Mutex<HashMap<&'static str, Library>>,
     pipelines: Mutex<HashMap<PipelineKey, ComputePipelineState>>,
     /// Lazy-built MTL4 compiler. Pipelines built through this compiler
     /// run correctly when dispatched (`dispatchThreadgroups`) on an
@@ -91,7 +91,7 @@ impl SpecializedPipelineCache {
         Ok(Self {
             device,
             libraries,
-            compiled: Mutex::new(HashMap::new()),
+            generated: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
             compiler: OnceLock::new(),
         })
@@ -119,7 +119,7 @@ impl SpecializedPipelineCache {
         Ok(Self {
             device,
             libraries,
-            compiled: Mutex::new(HashMap::new()),
+            generated: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
             compiler: OnceLock::new(),
         })
@@ -268,32 +268,22 @@ impl SpecializedPipelineCache {
         )
     }
 
-    /// Compile the library `name` from generated MSL (`source`, built only when needed) as
-    /// `xcrun metal` compiles every shader — fast math (the default), Metal 4.1 (the offline
-    /// default; the runtime's is older) — unless it is already compiled; how long this call's
-    /// compile took (`None`: it was).
-    pub fn compile_library(
+    /// Load the generated library `name` — compiled at build time, as every shader is — from
+    /// `metallib` unless a load already did; how long this call's load took (`None`: it was).
+    pub fn load_generated_library(
         &self,
         name: &'static str,
-        source: impl FnOnce() -> String,
+        metallib: &'static [u8],
     ) -> Result<Option<std::time::Duration>, MetalStreamError> {
-        let mut compiled = self.compiled.lock().unwrap();
-        if compiled.contains_key(name) {
+        let mut generated = self.generated.lock().unwrap();
+        if generated.contains_key(name) {
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let opts = objc2_metal::MTLCompileOptions::new();
-        // `MTLLanguageVersion4_1` = (4 << 16) | 1; objc2-metal does not name it yet.
-        opts.setLanguageVersion(objc2_metal::MTLLanguageVersion((4 << 16) | 1));
-        let lib = self
-            .device
-            .newLibraryWithSource_options_error(&NSString::from_str(&source()), Some(&opts))
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "compile library `{name}`: {e:?}"
-                ))
-            })?;
-        compiled.insert(name, lib);
+        let lib = load_library_from_bytes(&self.device, metallib).map_err(|e| {
+            MetalStreamError::ShaderCompilationFailed(format!("load library `{name}`: {e}"))
+        })?;
+        generated.insert(name, lib);
         Ok(Some(started.elapsed()))
     }
 
@@ -316,11 +306,16 @@ impl SpecializedPipelineCache {
             }
         }
 
-        let compiled = self.compiled.lock().unwrap().get(key.library_name).cloned();
+        let generated = self
+            .generated
+            .lock()
+            .unwrap()
+            .get(key.library_name)
+            .cloned();
         let library = self
             .libraries
             .get(key.library_name)
-            .or(compiled.as_ref())
+            .or(generated.as_ref())
             .ok_or_else(|| {
                 MetalStreamError::ShaderCompilationFailed(format!(
                     "no library `{}` in SpecializedPipelineCache (call `new` with this library)",

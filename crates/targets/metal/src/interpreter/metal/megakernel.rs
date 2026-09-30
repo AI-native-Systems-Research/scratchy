@@ -2,10 +2,11 @@
 //! THE DECODE MEGAKERNEL, LAUNCHED: a worker's side of a baked [`MegakernelTape`].
 //!
 //! Everything was decided at expansion: the kernel's MSL — the whole decode forward, its work
-//! split, its grid barriers. At load the worker compiles the tape's library once ([`MK_BODIES`]
-//! and the generated source), specializes the kernel with the device's persistent threadgroups
-//! `MK_P` and the load's scalars, and fills the address table — the same resolved bindings its
-//! argument tables get — at the positions the bake fixed. A forward is then ONE launch.
+//! split in the GPU's cores `MK_P`, its grid barriers — compiled at build time into the tape's
+//! library ([`MK_BODIES`] and the generated source), as every shader is. At load the worker loads
+//! that library once, specializes the kernel with the device's persistent threadgroups `MK_P` and
+//! the load's scalars, and fills the address table — the same resolved bindings its argument
+//! tables get — at the positions the bake fixed. A forward is then ONE launch.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -30,7 +31,7 @@ use crate::tape::lowered::{
 };
 
 /// The adapters' bodies: `shaders/megakernel/megakernel.metal` with its local includes inlined
-/// (build.rs). A tape's generated kernel completes it.
+/// (build.rs). A tape's generated kernel completes it; the bake compiles the two together.
 pub const MK_BODIES: &str = include_str!(concat!(env!("OUT_DIR"), "/mk_bodies.metal"));
 
 /// Polls one grid-barrier wait may spend before it records a stall and gives up.
@@ -75,10 +76,10 @@ unsafe impl Sync for MegakernelBaking {}
 pub struct MegakernelLoad {
     pub steps: usize,
     pub grid_barriers: u32,
-    /// The generated library's compile, when this load compiled it (`None`: an earlier load of
-    /// the pool did).
-    pub compiled: Option<Duration>,
-    pub source_bytes: usize,
+    /// The generated library's load, when this load loaded it (`None`: an earlier load of the
+    /// pool did).
+    pub loaded: Option<Duration>,
+    pub metallib_bytes: usize,
     pub pipeline_built: Duration,
     pub max_threads: usize,
     pub threadgroups: usize,
@@ -107,8 +108,8 @@ impl MegakernelBaking {
             PipelineLookupError::Build(e) => mk_error(MegakernelError::Compile(e.to_string())),
             e => WorkerError::PipelineLookup(e),
         };
-        let compiled = pipelines
-            .megakernel_library(tape.library, || format!("{MK_BODIES}\n{}", tape.source))
+        let loaded = pipelines
+            .megakernel_library(tape.library, tape.metallib)
             .map_err(lookup)?;
         let threadgroups = crate::device::gpu_cores(device).map_or(1, |c| c.get() as usize);
         // The load's scalars, read from the materialized commands.
@@ -214,8 +215,8 @@ impl MegakernelBaking {
         let load = MegakernelLoad {
             steps: instances.iter().sum::<u32>() as usize,
             grid_barriers: tape.grid_barriers,
-            compiled,
-            source_bytes: MK_BODIES.len() + tape.source.len(),
+            loaded,
+            metallib_bytes: tape.metallib.len(),
             pipeline_built,
             max_threads,
             threadgroups,

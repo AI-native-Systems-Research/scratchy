@@ -506,12 +506,36 @@ pub fn bake_bucket_tapes(
                                 &l0.row_commands,
                                 input.steps,
                             )?;
-                            let toks = crate::const_tokens::const_tokens(&mk.as_slice())
-                                .map_err(|e| BakeDefect(format!("serialize megakernel: {e}")))?;
+                            // Each kernel's library, compiled now as every shader is.
+                            let dir = std::env::var_os("OUT_DIR")
+                                .map(|d| std::path::PathBuf::from(d).join("megakernels"))
+                                .ok_or_else(|| {
+                                    BakeDefect(
+                                        "megakernel: compiled into the build script's OUT_DIR, \
+                                         which is unset"
+                                            .into(),
+                                    )
+                                })?;
+                            let mut tapes = Vec::with_capacity(mk.len());
+                            for m in &mk {
+                                let lib = crate::megakernel_bake::compile_metallib(m, &dir)?;
+                                let lib = lib.to_str().ok_or_else(|| {
+                                    BakeDefect(format!(
+                                        "megakernel: {} is not UTF-8",
+                                        lib.display()
+                                    ))
+                                })?;
+                                let toks = crate::const_tokens::const_tokens(m).map_err(|e| {
+                                    BakeDefect(format!("serialize megakernel: {e}"))
+                                })?;
+                                tapes.push(quote! {
+                                    __tl::MegakernelTape { metallib: include_bytes!(#lib), ..#toks }
+                                });
+                            }
                             let ident =
                                 quote::format_ident!("__MEGAKERNEL_{uniq}_{}", mk_seen.len());
                             mk_statics.push(quote! {
-                                const #ident: &[__tl::MegakernelTape] = #toks;
+                                const #ident: &[__tl::MegakernelTape] = &[ #(#tapes),* ];
                             });
                             mk_seen.push(key);
                             mk_seen.len() - 1

@@ -132,6 +132,19 @@ METAL_FUNC void mk_enter(device MkSync* sync, uint tg, uint t, thread uint& gen,
   gen = ok[1];
 }
 
+// The grid barrier's fences: release before a threadgroup publishes its arrival, acquire after
+// it sees every other's. The acquire and release orders are Metal 4.1's; the standard this
+// library compiles with (the build toolchain's, as for every shader) is older where the
+// toolchain is (Xcode 26: 4.0), and there the barrier fences sequentially consistently — at least
+// the order it needs, in every standard from 3.2 on.
+#if __METAL_VERSION__ >= 410
+#define MK_FENCE_RELEASE memory_order_release
+#define MK_FENCE_ACQUIRE memory_order_acquire
+#else
+#define MK_FENCE_RELEASE memory_order_seq_cst
+#define MK_FENCE_ACQUIRE memory_order_seq_cst
+#endif
+
 // A GRID BARRIER: every threadgroup's device writes before it are visible to every threadgroup
 // after it. Release; thread 0 publishes this threadgroup's arrival on its own line; threads
 // 0..P-1 each spin (bounded) until one threadgroup's line shows the same barrier; acquire. No
@@ -146,7 +159,7 @@ METAL_FUNC void mk_enter(device MkSync* sync, uint tg, uint t, thread uint& gen,
 METAL_FUNC void mk_grid_sync(device MkSync* sync, uint tg, uint t, thread uint& gen, uint gen0,
                              threadgroup uint* ok, uint site) {
   const uint mine = gen + 1u;
-  atomic_thread_fence(mem_flags::mem_device, memory_order_release, thread_scope_device);
+  atomic_thread_fence(mem_flags::mem_device, MK_FENCE_RELEASE, thread_scope_device);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   if (t == 0) atomic_store_explicit(mk_arrived(sync, tg), mine, memory_order_relaxed);
   if (t < MK_P && ok[0] != 0u) {
@@ -177,7 +190,7 @@ METAL_FUNC void mk_grid_sync(device MkSync* sync, uint tg, uint t, thread uint& 
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  atomic_thread_fence(mem_flags::mem_device, memory_order_acquire, thread_scope_device);
+  atomic_thread_fence(mem_flags::mem_device, MK_FENCE_ACQUIRE, thread_scope_device);
   gen = mine;
 }
 
