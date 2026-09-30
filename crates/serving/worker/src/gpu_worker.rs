@@ -573,14 +573,19 @@ impl StepSlotMapping {
     }
 }
 
-/// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size × 2 bytes.
-/// bf16 and f16 are both 2 bytes/elt under metal; int4 KV is unsupported.
+/// Bytes per element of a metal KV pool's dense rows: bf16 and f16 are both 2;
+/// int4 KV is unsupported.
+#[cfg(feature = "metal")]
+const METAL_KV_ELEM_BYTES: usize = 2;
+
+/// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size
+/// × [`METAL_KV_ELEM_BYTES`].
 #[cfg(feature = "metal")]
 fn kv_per_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
 ) -> usize {
-    let elt_bytes: usize = 2;
+    let elt_bytes = METAL_KV_ELEM_BYTES;
     // Hybrid-attention-geometry arches (Gemma4) size each layer by its
     // own kv_heads*head_dim; uniform arches use the single product.
     // Mis-summing here mis-sizes the scheduler's KV budget.
@@ -615,12 +620,47 @@ fn pool_bytes_per_token(
     )
 }
 
+/// vLLM group-shared hybrid KV layout (gemma4): infer the per-layer sliding
+/// mask from `per_layer_kv_token_elems` (the bigger-page class is the sliding
+/// class) and compute the grouping. This is `Some` only for the
+/// page-differentiated case — the SAME trigger the scheduler's `hybrid_kv` uses
+/// in `init`, so the two never disagree on group count. `None` → one physical
+/// tensor per layer (the uniform pool).
+#[cfg(feature = "metal")]
+fn hybrid_kv_layout(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+    elem_bytes: usize,
+) -> Option<scratchy_core_config::HybridKvLayout> {
+    let elems = model.per_layer_kv_token_elems()?;
+    let max_e = *elems.iter().max()?;
+    let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
+        .iter()
+        .map(|&e| scratchy_core_config::LayerKvGeometry {
+            is_sliding: e == max_e,
+            // Page proxy: head_size 1 keeps the per-class page RATIO
+            // (only the ratio drives grouping + block_size scaling).
+            num_kv_heads: e,
+            head_size: 1,
+            head_size_v: None,
+            sliding_window: if e == max_e { Some(1) } else { None },
+        })
+        .collect();
+    // `available` is irrelevant here — the pool sizes from the passed
+    // `num_gpu_blocks`; callers only read the grouping fields.
+    scratchy_core_config::compute_hybrid_kv_layout(&geom, block_size, usize::MAX / 2, elem_bytes)
+}
+
 /// A uniform model built with TurboQuant: its KV lives in packed codes and the
 /// fp16 pool is a one-chunk seed (`initialize_cache`). A hybrid model's
 /// TurboQuant global layers share a pool sized to its context, not the budget.
 #[cfg(feature = "metal")]
-fn uniform_turboquant(model: &dyn scratchy_forward_compiler::ScratchyWeights) -> bool {
-    model.kv_codec().is_turboquant() && model.per_layer_kv_token_elems().is_none()
+fn uniform_turboquant(
+    model: &dyn scratchy_forward_compiler::ScratchyWeights,
+    block_size: usize,
+) -> bool {
+    model.kv_codec().is_turboquant()
+        && hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_none()
 }
 
 /// Bytes one block of the TARGET pool costs: a uniform TurboQuant model's
@@ -630,8 +670,12 @@ fn target_block_bytes(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     block_size: usize,
 ) -> usize {
-    if uniform_turboquant(model) {
-        block_size.saturating_mul(pool_bytes_per_token(model, model.kv_codec(), 2))
+    if uniform_turboquant(model, block_size) {
+        block_size.saturating_mul(pool_bytes_per_token(
+            model,
+            model.kv_codec(),
+            METAL_KV_ELEM_BYTES,
+        ))
     } else {
         kv_per_block_bytes(model, block_size)
     }
@@ -647,7 +691,7 @@ fn draft_block_bytes(
 ) -> usize {
     let codec = match model.kv_codec() {
         scratchy_forward_compiler::KvCodec::Dense => 0,
-        codec => block_size.saturating_mul(pool_bytes_per_token(model, codec, 2)),
+        codec => block_size.saturating_mul(pool_bytes_per_token(model, codec, METAL_KV_ELEM_BYTES)),
     };
     kv_per_block_bytes(model, block_size).saturating_add(codec)
 }
@@ -2601,7 +2645,7 @@ impl Worker for MetalWorker {
         // rows the engine would derive — the same cost the draft split in
         // `determine_available_memory` divides by.
         let model = self.model.as_deref()?;
-        uniform_turboquant(model).then(|| target_block_bytes(model, block_size))
+        uniform_turboquant(model, block_size).then(|| target_block_bytes(model, block_size))
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {
@@ -2986,36 +3030,7 @@ impl Worker for MetalWorker {
         let elem_bytes = cache_dtype.size_bytes();
         let chunk_bytes_logical = blocks_per_chunk * per_block_elems * elem_bytes;
 
-        // vLLM group-shared hybrid KV layout (gemma4): infer the per-layer
-        // sliding mask from `per_layer_kv_token_elems` (the bigger-page class
-        // is the sliding class) and compute the grouping. This is `Some` only
-        // for the page-differentiated case — the SAME trigger the scheduler's
-        // `hybrid_kv` uses in `init`, so the two never disagree on group count.
-        // `None` → one physical tensor per layer (the uniform pool).
-        let hybrid_layout: Option<scratchy_core_config::HybridKvLayout> =
-            model.per_layer_kv_token_elems().and_then(|elems| {
-                let max_e = *elems.iter().max()?;
-                let geom: Vec<scratchy_core_config::LayerKvGeometry> = elems
-                    .iter()
-                    .map(|&e| scratchy_core_config::LayerKvGeometry {
-                        is_sliding: e == max_e,
-                        // Page proxy: head_size 1 keeps the per-class page RATIO
-                        // (only the ratio drives grouping + block_size scaling).
-                        num_kv_heads: e,
-                        head_size: 1,
-                        head_size_v: None,
-                        sliding_window: if e == max_e { Some(1) } else { None },
-                    })
-                    .collect();
-                // `available` is irrelevant here — the pool sizes from the
-                // passed `num_gpu_blocks`; we only read the grouping fields.
-                scratchy_core_config::compute_hybrid_kv_layout(
-                    &geom,
-                    self.config.block_size,
-                    usize::MAX / 2,
-                    elem_bytes,
-                )
-            });
+        let hybrid_layout = hybrid_kv_layout(model.as_ref(), self.config.block_size, elem_bytes);
         // One physical tensor per group POSITION (gemma4: group_size=5) on the
         // hybrid path; one per layer otherwise.
         let num_tensors_for_pool = hybrid_layout
@@ -3397,7 +3412,7 @@ impl Worker for MetalWorker {
         let tq_seed = self
             .model
             .as_deref()
-            .filter(|m| uniform_turboquant(*m))
+            .filter(|m| uniform_turboquant(*m, self.config.block_size))
             .map_or(0, |m| {
                 scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
                     * kv_per_block_bytes(m, self.config.block_size)
