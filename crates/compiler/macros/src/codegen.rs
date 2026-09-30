@@ -11867,8 +11867,8 @@ pub fn emit_model(
                             &model.source_stem,
                             m,
                         );
-                        let (lv, tape_items, unrolled_items, layer_segs) =
-                            (tp.levels, tp.rolled, tp.unrolled, tp.segments);
+                        let (lv, tape_items, unrolled_items, layer_classes) =
+                            (tp.levels, tp.rolled, tp.unrolled, tp.layer_rolled);
                         let (tape_sm, tape_ns, tape_fs) =
                             scratchy_target_metal_compiler::from_subtile::tape_slot_map(
                                 &l, &plan, &lv,
@@ -12057,97 +12057,101 @@ pub fn emit_model(
                                         )
                                     })
                                     };
-                                let mut rolled_at: Option<u32> = None;
+                                // One cut, decoded and proven: the candidate bucket, or why not.
+                                let try_cut = |items: &[scratchy_target_metal::from_tape::TapeItem]| {
+                                    let b = scratchy_target_metal_compiler::from_subtile::decode_instruction_stream(
+                                        &l, &tape_sm, &facts, items,
+                                    )?;
+                                    let head = b.backbone_sigs.len();
+                                    let mut sigs = b.backbone_sigs.clone();
+                                    sigs.extend(b.lm_head_sigs.clone());
+                                    let flags =
+                                        scratchy_target_metal_compiler::from_subtile::barrier_flags_with(
+                                            &sigs, false,
+                                        );
+                                    let cand = crate::interpreter_codegen::LoweredBucket {
+                                        instances: b.backbone,
+                                        weight_slots: b.backbone_weight_slots,
+                                        num_slots: tape_ns,
+                                        final_slot: bb_final,
+                                        barriers: flags[..head].to_vec(),
+                                    };
+                                    proof(&cand).map(|()| cand)
+                                };
+                                let mut rolled_at: Option<String> = None;
                                 // ⛔ ONE ERROR PER CUT, NOT JUST CUT 0's. The refusal used to
                                 // report `proof(&bridge_bucket).err()` — always peel 0's — so
                                 // every deeper cut failed invisibly. gemma-3 was read for a
                                 // whole PR as a `FusedAddRmsNormWithOffset` fold problem on that
                                 // evidence, when peel 0 was the ONLY cut failing that way and
                                 // peels 1..3 were failing on a rope flag the log never showed.
-                                let mut peel_errs: Vec<(u32, String)> = Vec::new();
-                                if proof(&bridge_bucket).is_ok() {
-                                    rolled_at = Some(0);
-                                } else {
+                                let mut cut_errs: Vec<String> = Vec::new();
+                                match proof(&bridge_bucket) {
+                                    Ok(()) => rolled_at = Some("peel=0".into()),
+                                    Err(e) => cut_errs.push(format!("peel=0: {e}")),
+                                }
+                                // ⭐ EVERY LAYER BY ITS CLASS — kept when it proves and is shorter
+                                // than the shared tape's own roll. Consecutive layers of one class
+                                // are the same program, so they loop: gemma-3's six-layer `SSSSSG`
+                                // cell becomes one sliding body plus one global, and a
+                                // mixed-precision model — whose IDENTICAL cells are too few for
+                                // the whole-cell cut to find — still rolls every run of layers
+                                // that match (OptiQ gemma-4: 555 rows to 251).
+                                if let Some(items) = &layer_classes {
+                                    match try_cut(items) {
+                                        Ok(cand)
+                                            if rolled_at.is_none()
+                                                || cand.instances.len()
+                                                    < bridge_bucket.instances.len() =>
+                                        {
+                                            bridge_bucket = cand;
+                                            rolled_at = Some("layer-class".into());
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => cut_errs.push(format!("layer-class: {e}")),
+                                    }
+                                }
+                                if rolled_at.is_none() {
                                     // PEEL leading iterations into the prologue. The body's
                                     // source ops decide how metal folds them, and layer 0's
                                     // norm has no residual add to fuse with — so a body
                                     // drawn from layer 0 emits an unfused norm for every
                                     // layer. Peeling makes the body a representative middle
-                                    // layer. granite and micro-g3.3 need peel=1.
-                                    // ⭐ SPLIT FIRST, THEN WHOLE-CELL. Splitting a cell into its
-                                    // per-layer class runs is the difference between one body per
-                                    // LAYER and one per CLASS — gemma-3 goes 229 rows to 119. It
-                                    // is not universally legal (gemma-4-31b's arena is not
-                                    // periodic at one layer), so both are offered to the PROOF and
-                                    // whichever holds is kept.
-                                    for (peel, split) in
-                                        (1..4u32).flat_map(|p| [(p, true), (p, false)])
-                                    {
-                                        let Some(rot) =
-                                            scratchy_target_metal::from_tape::roll_at(
-                                                &unrolled_items,
-                                                &tape_items,
-                                                peel,
-                                                &layer_segs,
-                                                split,
-                                            )
-                                        else {
-                                            continue;
-                                        };
-                                        let k = peel;
-                                        let Ok(b) = scratchy_target_metal_compiler::from_subtile::decode_instruction_stream(
-                                            &l, &tape_sm, &facts, &rot,
+                                    // layer, whole cell at a time — which is what gemma-4-31b
+                                    // needs: its arena is not periodic at one layer, so the
+                                    // per-layer cut above does not prove there.
+                                    for peel in 1..4u32 {
+                                        let Some(rot) = scratchy_target_metal::from_tape::roll_at(
+                                            &unrolled_items,
+                                            &tape_items,
+                                            peel,
                                         ) else {
                                             continue;
                                         };
-                                        let head = b.backbone_sigs.len();
-                                        let mut sigs = b.backbone_sigs.clone();
-                                        sigs.extend(b.lm_head_sigs.clone());
-                                        let flags =
-                                            scratchy_target_metal_compiler::from_subtile::barrier_flags_with(
-                                                &sigs, false,
-                                            );
-                                        let cand = crate::interpreter_codegen::LoweredBucket {
-                                            instances: b.backbone.clone(),
-                                            weight_slots: b.backbone_weight_slots.clone(),
-                                            num_slots: tape_ns,
-                                            final_slot: bb_final,
-                                            barriers: flags[..head].to_vec(),
-                                        };
-                                        match proof(&cand) {
-                                            Ok(()) => {
+                                        match try_cut(&rot) {
+                                            Ok(cand) => {
                                                 bridge_bucket = cand;
-                                                rolled_at = Some(k);
+                                                rolled_at = Some(format!("peel={peel}"));
                                                 break;
                                             }
-                                            Err(e) => peel_errs
-                                                .push((k, format!("split={split}: {e}"))),
+                                            Err(e) => cut_errs.push(format!("peel={peel}: {e}")),
                                         }
                                     }
                                 }
                                 match rolled_at {
-                                    Some(peel) => eprintln!(
-                                        "[m2-roll] {} m={m}: rolled peel={peel} ({} rows \
+                                    Some(cut) => eprintln!(
+                                        "[m2-roll] {} m={m}: rolled {cut} ({} rows \
                                          from {})",
                                         model.source_stem,
                                         bridge_bucket.instances.len(),
                                         unrolled.backbone.len(),
                                     ),
                                     None => {
-                                        let mut why = vec![format!(
-                                            "peel=0: {}",
-                                            proof(&bridge_bucket)
-                                                .err()
-                                                .unwrap_or_else(|| "?".into())
-                                        )];
-                                        why.extend(
-                                            peel_errs.iter().map(|(k, e)| format!("peel={k}: {e}")),
-                                        );
                                         eprintln!(
                                             "[m2-roll] {} m={m}: NO cut rolls — emitting the \
                                              un-rolled tape. {}",
                                             model.source_stem,
-                                            why.join(" | "),
+                                            cut_errs.join(" | "),
                                         );
                                         bridge_bucket.instances = unrolled.backbone.clone();
                                         bridge_bucket.weight_slots =
@@ -12750,6 +12754,8 @@ pub fn emit_model(
     // themselves are backend-agnostic).
     let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
+    #[cfg(feature = "metal")]
+    let mut metal_tape_cmds = scratchy_target_metal_compiler::static_tape::CommandPool::default();
     // `(bucket_m, total_colored_arena_bytes)` per bucket — the per-bucket cost
     // the load-time `select_prefill_bucket` compares against the device's
     // affordable arena budget to prune the ladder target-reactively.
@@ -12859,29 +12865,30 @@ pub fn emit_model(
                 backbone_tape_index: (ci as u32) * 2,
                 lm_head_tape_index: (ci as u32) * 2 + 1,
             };
-            let tapes_expr =
-                match scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(mc, &input) {
-                    Ok(t) => t,
-                    Err(scratchy_target_metal_compiler::static_tape::BakeRefusal::Unlowerable(
-                        e,
-                    )) => {
-                        // Same timing as the old runtime-lowering path: this
-                        // preset builds, and the POOL refuses at load if a
-                        // metal run ever selects this canonical.
-                        eprintln!(
-                            "[metal static tape] {}: bucket_m={m}: NOT LOWERABLE on metal \
+            let tapes_expr = match scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
+                mc,
+                &input,
+                &mut metal_tape_cmds,
+            ) {
+                Ok(t) => t,
+                Err(scratchy_target_metal_compiler::static_tape::BakeRefusal::Unlowerable(e)) => {
+                    // Same timing as the old runtime-lowering path: this
+                    // preset builds, and the POOL refuses at load if a
+                    // metal run ever selects this canonical.
+                    eprintln!(
+                        "[metal static tape] {}: bucket_m={m}: NOT LOWERABLE on metal \
                          ({e}); baking an empty variant list — the pool refuses at load",
-                            model.source_stem
-                        );
-                        quote! { &[] }
-                    }
-                    Err(scratchy_target_metal_compiler::static_tape::BakeRefusal::Defect(e)) => {
-                        panic!(
-                            "[metal static tape] {}: bucket_m={m}: {e}",
-                            model.source_stem
-                        )
-                    }
-                };
+                        model.source_stem
+                    );
+                    quote! { &[] }
+                }
+                Err(scratchy_target_metal_compiler::static_tape::BakeRefusal::Defect(e)) => {
+                    panic!(
+                        "[metal static tape] {}: bucket_m={m}: {e}",
+                        model.source_stem
+                    )
+                }
+            };
             let ident = bucket_static_ident("METAL_TAPES_M", wp);
             metal_arena_bytes_statics.push(quote! {
                 #[cfg(feature = "metal")]
@@ -13111,6 +13118,8 @@ pub fn emit_model(
         },
     };
 
+    #[cfg(feature = "metal")]
+    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens());
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
 

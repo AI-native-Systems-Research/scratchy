@@ -20,8 +20,55 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_ir::Instruction;
 use scratchy_target_metal::tape::lowered::{
-    CapPatch, GenClass, LoweredMetalTape, LoweringError, PatchTarget, ScratchField, ScratchPatch,
+    CapPatch, GatedCommand, GenClass, LoweredMetalTape, LoweringError, PatchTarget, ScratchField,
+    ScratchPatch,
 };
+
+/// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
+///
+/// A bucket bakes up to six `(gen class × chunked)` variants, and the variants of one bucket —
+/// and the buckets of one model — share almost every command: the chunked variant differs in a
+/// single `ATTN_BLOCKS_PER_CHUNK` constant on the attention readers, the M5 variant in its GEMMs.
+/// Deduping whole bodies only helps when NOTHING differs, so one constant forked a full copy of
+/// the tape and rustc's single-threaded front end paid for every token of it.
+///
+/// Each distinct command is one `const` in the model's `__tape_cmds` module; a body's command
+/// list is references into it. The runtime types are untouched — the statics still hold
+/// `&'static [GatedCommand]`.
+#[derive(Default)]
+pub struct CommandPool {
+    index: std::collections::HashMap<String, usize>,
+    consts: Vec<TokenStream>,
+}
+
+impl CommandPool {
+    fn intern(&mut self, cmd: &GatedCommand) -> Result<TokenStream, BakeRefusal> {
+        let toks = crate::const_tokens::const_tokens(cmd)
+            .map_err(|e| BakeRefusal::Defect(format!("serialize command: {e}")))?;
+        let next = self.consts.len();
+        let ix = *self.index.entry(toks.to_string()).or_insert_with(|| {
+            let id = quote::format_ident!("C{next}");
+            self.consts
+                .push(quote! { pub(super) const #id: __tl::GatedCommand = #toks; });
+            next
+        });
+        let id = quote::format_ident!("C{ix}");
+        Ok(quote! { __tape_cmds::#id })
+    }
+
+    /// The `__tape_cmds` module the model's tape statics reference. Emit it once, beside them.
+    pub fn into_tokens(self) -> TokenStream {
+        let aliases = crate::const_tokens::alias_preamble();
+        let consts = self.consts;
+        quote! {
+            #[cfg(feature = "metal")]
+            mod __tape_cmds {
+                #aliases
+                #(#consts)*
+            }
+        }
+    }
+}
 
 /// Why a bucket's tape could not bake.
 pub enum BakeRefusal {
@@ -427,6 +474,7 @@ fn diff_probes(
 pub fn bake_bucket_tapes(
     mc: &MetalModelConsts,
     input: &BucketLowerInput<'_>,
+    pool: &mut CommandPool,
 ) -> Result<TokenStream, BakeRefusal> {
     let classes = [GenClass::M1, GenClass::Mid, GenClass::M5];
     let mut entries: Vec<TokenStream> = Vec::new();
@@ -456,8 +504,19 @@ pub fn bake_bucket_tapes(
                 Some(ix) => ix,
                 None => {
                     let (tape, const_patches, scratch_patches) = &body;
-                    let tape_toks = crate::const_tokens::const_tokens(tape)
-                        .map_err(|e| BakeRefusal::Defect(format!("serialize tape: {e}")))?;
+                    let cmd_refs = tape
+                        .commands
+                        .iter()
+                        .map(|c| pool.intern(c))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let rest_toks = crate::const_tokens::const_tokens(&LoweredMetalTape {
+                        commands: &[],
+                        ..*tape
+                    })
+                    .map_err(|e| BakeRefusal::Defect(format!("serialize tape: {e}")))?;
+                    let tape_toks = quote! {
+                        __tl::LoweredMetalTape { commands: &[ #(#cmd_refs),* ], ..#rest_toks }
+                    };
                     let cp_toks = crate::const_tokens::const_tokens(&const_patches.as_slice())
                         .map_err(|e| {
                             BakeRefusal::Defect(format!("serialize const patches: {e}"))
