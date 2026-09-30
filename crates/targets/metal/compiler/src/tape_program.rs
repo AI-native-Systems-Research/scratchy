@@ -73,8 +73,9 @@ pub struct TapeProgram {
     pub rolled: Vec<scratchy_target_metal::from_tape::TapeItem>,
     /// The UN-rolled tape's items: the reference the roll is proven against.
     pub unrolled: Vec<scratchy_target_metal::from_tape::TapeItem>,
-    /// How one cell divides into layers — `(length in steps, class id)`.
-    pub segments: Vec<(usize, u64)>,
+    /// Every layer rolled by its class ([`scratchy_target_metal::from_tape::roll_layer_classes`]),
+    /// when the tape's layers can be read that way. A cut like any other: kept only if it proves.
+    pub layer_rolled: Option<Vec<scratchy_target_metal::from_tape::TapeItem>>,
 }
 
 pub fn tape_program(
@@ -114,7 +115,7 @@ pub fn tape_program(
     };
     let rolled_items = from_tape::items_of(&graph, &rolled)
         .unwrap_or_else(|e| refuse("the rolled tape holds a step metal cannot play", e));
-    let segments = from_tape::cell_layer_segments(&graph, &tape, &rolled);
+    let layer_rolled = from_tape::roll_layer_classes(&graph, &tape, &rolled_items, &items);
     TapeProgram {
         levels: sched
             .level
@@ -123,6 +124,6 @@ pub fn tape_program(
             .collect(),
         rolled: rolled_items,
         unrolled: items,
-        segments,
+        layer_rolled,
     }
 }

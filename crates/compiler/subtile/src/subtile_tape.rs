@@ -1308,6 +1308,15 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
 
 // ── Loop re-roll ────────────────────────────────────────────────────
 
+/// How much of a node the re-roll fingerprint sees.
+#[derive(Clone, Copy)]
+enum KeyDepth {
+    /// The whole program, weight storage included ([`crate::subtile_ir::SubOp::reroll_class_key`]).
+    Class,
+    /// The program at any weight storage ([`crate::subtile_ir::SubOp::reroll_shape_key`]).
+    Shape,
+}
+
 /// Per-instruction fingerprint that MASKS the per-layer-varying ids
 /// (every `SlotId` and the `SubtileId` node), so two structurally-
 /// identical per-layer copies hash the same. Mirrors `detect_repeating_run`
@@ -1315,6 +1324,7 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
 fn reroll_fingerprint<F: crate::subtile_ir::RopeForm>(
     instr: &Instr,
     graph: &crate::subtile_ir::SubtileIR<F>,
+    depth: KeyDepth,
 ) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -1327,7 +1337,11 @@ fn reroll_fingerprint<F: crate::subtile_ir::RopeForm>(
             // ⭐ WHAT THE NODE DOES, not merely how many operands it takes. Without this a
             // Gemm and an RmsNorm hash alike — and so do a sliding-window layer and a global
             // one, which is how gemma-3 re-rolled 26 layers onto one body.
-            graph.nodes[node.index()].op.reroll_class_key(&mut h);
+            let op = &graph.nodes[node.index()].op;
+            match depth {
+                KeyDepth::Class => op.reroll_class_key(&mut h),
+                KeyDepth::Shape => op.reroll_shape_key(&mut h),
+            }
             // Structural shape of the inputs (kinds + arity), ids masked.
             inputs.len().hash(&mut h);
             for ci in inputs.iter() {
@@ -1391,20 +1405,224 @@ pub fn class_fingerprints<F: crate::subtile_ir::RopeForm>(
 ) -> Vec<u64> {
     tape.instrs
         .iter()
-        .map(|i| reroll_fingerprint(i, graph))
+        .map(|i| reroll_fingerprint(i, graph, KeyDepth::Class))
         .collect()
+}
+
+/// [`class_fingerprints`] with the weight storage masked — see [`crate::subtile_ir::SubOp::reroll_shape_key`].
+pub fn shape_fingerprints<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+) -> Vec<u64> {
+    tape.instrs
+        .iter()
+        .map(|i| reroll_fingerprint(i, graph, KeyDepth::Shape))
+        .collect()
+}
+
+/// [`find_layer_loop`] over [`shape_fingerprints`]: the layer run a mixed-precision model has
+/// once its per-layer bit widths are set aside. `(start, period, iters)` in `instrs()` positions.
+pub fn find_shape_loop<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+) -> Option<(usize, usize, u32)> {
+    detect_repeating_run_subtile(&shape_fingerprints(tape, graph))
+}
+
+/// How one cell of a layer run divides into layers, in its own positions: the shortest prefix
+/// that repeats back to back is one layer of the leading kind, and what follows its copies is
+/// the odd one out. One length for a cell with no repeat.
+///
+/// ⛔ LAYERS INSIDE A CELL ARE NOT ALL THE SAME LENGTH. gemma-4's cell is six layers, five
+/// sliding and one global of a different length; an even division refuses.
+fn cell_layer_lengths(cell: &[u64]) -> Vec<usize> {
+    let Some(lead) = (1..=cell.len() / 2).find(|&p| cell[..p] == cell[p..2 * p]) else {
+        return vec![cell.len()];
+    };
+    let copies = (1..)
+        .take_while(|&k| {
+            (k + 1) * lead <= cell.len() && cell[..lead] == cell[k * lead..(k + 1) * lead]
+        })
+        .count()
+        + 1;
+    let mut lens = vec![lead; copies];
+    if copies * lead < cell.len() {
+        lens.push(cell.len() - copies * lead);
+    }
+    lens
+}
+
+/// One entry of a [`layer_class_plan`], in STEP positions (`Compute` instructions only) of the
+/// un-rolled tape.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RollPlan {
+    /// Emit these steps once.
+    Steps(std::ops::Range<usize>),
+    /// Run `body` `iters` times, the layer advancing by `stride` each time.
+    Loop {
+        iters: u32,
+        stride: u32,
+        body: Vec<RollPlan>,
+    },
+}
+
+/// ⭐ EVERY LAYER ROLLED BY ITS CLASS: layer 0 alone, each run of same-class layers a loop, and
+/// the largest repeating group of runs an outer loop. `None` when the tape's layers cannot be
+/// read this way.
+///
+/// ⭐ FOUND ON THE SHAPE, CLASSED ON THE PROGRAM. [`find_layer_loop`] rolls the one run of
+/// IDENTICAL cells, and a mixed-precision model has few: OptiQ's gemma-4 quantizes layers 0–4 at
+/// 8 bits and 5–21 at 4, so two of its five cells match and eighteen layers emitted
+/// straight-line. Its cells are the same SHAPE ([`find_shape_loop`]), which finds all thirty
+/// layers; each layer's CLASS then says which are the same program, and a run of those is a
+/// loop whatever the cells around it hold.
+///
+/// ⛔ LAYER 0 STANDS ALONE. A target that fuses each residual `Add` into the next layer's norm
+/// emits layer 0 differently, and the tape cannot see that.
+///
+/// ⛔ A LAYER IS NAMED BY ITS KV WRITER. Every layer must hold exactly one step carrying a layer
+/// index, advancing by one constant — each loop's per-layer stride. Anything else is `None`.
+pub fn layer_class_plan<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+) -> Option<Vec<RollPlan>> {
+    use std::ops::Range;
+    let (start, period, iters) = find_shape_loop(tape, graph)?;
+    let computes: Vec<bool> = tape
+        .instrs
+        .iter()
+        .map(|i| matches!(i, Instr::Compute { .. }))
+        .collect();
+    let steps_before = |n: usize| computes[..n].iter().filter(|c| **c).count();
+    let in_steps = |fp: Vec<u64>| -> Vec<u64> {
+        fp.into_iter()
+            .zip(&computes)
+            .filter(|(_, c)| **c)
+            .map(|(f, _)| f)
+            .collect()
+    };
+    let shape = in_steps(shape_fingerprints(tape, graph));
+    let class = in_steps(class_fingerprints(tape, graph));
+    let layer_ids: Vec<Option<u32>> = tape
+        .instrs
+        .iter()
+        .filter_map(|i| match i {
+            Instr::Compute { node, .. } => Some(graph.nodes[node.index()].op.layer_index()),
+            _ => None,
+        })
+        .collect();
+    let run_start = steps_before(start);
+    let cell = &shape[run_start..steps_before(start + period)];
+    if cell.is_empty() {
+        return None;
+    }
+    let mut kinds: Vec<&[u64]> = Vec::new();
+    let mut at = run_start;
+    for l in cell_layer_lengths(cell) {
+        kinds.push(&shape[at..at + l]);
+        at += l;
+    }
+    let mut layers: Vec<Range<usize>> = Vec::new();
+    let mut end = run_start;
+    for _ in 0..iters {
+        for k in &kinds {
+            layers.push(end..end + k.len());
+            end += k.len();
+        }
+    }
+    // Whole layers of any kind past either end of the run are layers too.
+    let fits = |r: Range<usize>| kinds.iter().any(|k| shape.get(r.clone()) == Some(*k));
+    while let Some(l) = kinds.iter().map(|k| k.len()).find(|&l| fits(end..end + l)) {
+        layers.push(end..end + l);
+        end += l;
+    }
+    let mut first = run_start;
+    while let Some(l) = kinds
+        .iter()
+        .map(|k| k.len())
+        .find(|&l| l <= first && fits(first - l..first))
+    {
+        layers.insert(0, first - l..first);
+        first -= l;
+    }
+    let layer_of = |r: &Range<usize>| -> Option<u32> {
+        let mut ids = layer_ids[r.clone()].iter().flatten();
+        let id = *ids.next()?;
+        ids.next().is_none().then_some(id)
+    };
+    let ids: Vec<u32> = layers.iter().map(layer_of).collect::<Option<_>>()?;
+    let stride = ids.get(1)?.checked_sub(ids[0]).filter(|d| *d > 0)?;
+    if ids
+        .windows(2)
+        .any(|w| w[1].checked_sub(w[0]) != Some(stride))
+    {
+        return None;
+    }
+    // Runs of same-class layers after layer 0: `(first layer, count)`.
+    let key = |i: usize| &class[layers[i].clone()];
+    let mut runs: Vec<(usize, u32)> = Vec::new();
+    for i in 1..layers.len() {
+        match runs.last_mut() {
+            Some((f, n)) if key(*f) == key(i) => *n += 1,
+            _ => runs.push((i, 1)),
+        }
+    }
+    let same = |a: (usize, u32), b: (usize, u32)| a.1 == b.1 && key(a.0) == key(b.0);
+    // The repeating group of runs that saves the most steps: `(start, period, iters)`. A tie goes
+    // to the LATER start — gemma-4's `S×4 G [S×5 G]×4` groups equally well from layer 5 as
+    // `[G S×5]×4 G`, and the later cut is the one that runs to the last layer, as a peel does.
+    let mut outer: Option<(usize, usize, u32)> = None;
+    let mut saved = 0usize;
+    for s in 0..runs.len() {
+        for p in 1..=(runs.len() - s) / 2 {
+            let it = (1..)
+                .take_while(|&k| {
+                    s + (k + 1) * p <= runs.len()
+                        && (0..p).all(|j| same(runs[s + j], runs[s + k * p + j]))
+                })
+                .count()
+                + 1;
+            let body: usize = runs[s..s + p].iter().map(|(f, _)| layers[*f].len()).sum();
+            if it > 1 && (it - 1) * body >= saved {
+                saved = (it - 1) * body;
+                outer = Some((s, p, it as u32));
+            }
+        }
+    }
+    let plan = |rs: &[(usize, u32)]| -> Vec<RollPlan> {
+        rs.iter()
+            .map(|&(f, n)| match n {
+                1 => RollPlan::Steps(layers[f].clone()),
+                _ => RollPlan::Loop {
+                    iters: n,
+                    stride,
+                    body: vec![RollPlan::Steps(layers[f].clone())],
+                },
+            })
+            .collect()
+    };
+    let mut out = vec![RollPlan::Steps(0..layers[1].start)];
+    match outer {
+        Some((s, p, it)) => {
+            out.extend(plan(&runs[..s]));
+            out.push(RollPlan::Loop {
+                iters: it,
+                stride: stride * runs[s..s + p].iter().map(|(_, n)| n).sum::<u32>(),
+                body: plan(&runs[s..s + p]),
+            });
+            out.extend(plan(&runs[s + p * it as usize..]));
+        }
+        None => out.extend(plan(&runs)),
+    }
+    out.push(RollPlan::Steps(end..shape.len()));
+    Some(out)
 }
 
 pub fn find_layer_loop<F: crate::subtile_ir::RopeForm>(
     tape: &SubtileTape,
     graph: &crate::subtile_ir::SubtileIR<F>,
 ) -> Option<(usize, usize, u32)> {
-    let fp: Vec<u64> = tape
-        .instrs
-        .iter()
-        .map(|i| reroll_fingerprint(i, graph))
-        .collect();
-    detect_repeating_run_subtile(&fp)
+    detect_repeating_run_subtile(&class_fingerprints(tape, graph))
 }
 
 /// Largest contiguous run describable as `iters>=2` byte-identical
@@ -1605,10 +1823,7 @@ pub fn reroll_subtile_tape<F: crate::subtile_ir::RopeForm>(
 ) -> SubtileTape {
     use std::collections::{HashMap, HashSet};
     let instrs = &tape.instrs;
-    let fp: Vec<u64> = instrs
-        .iter()
-        .map(|i| reroll_fingerprint(i, graph))
-        .collect();
+    let fp = class_fingerprints(tape, graph);
     let Some((det_start, period, det_iters)) = detect_repeating_run_subtile(&fp) else {
         return tape.clone();
     };
@@ -2618,6 +2833,24 @@ pub(crate) mod tests {
             // provenance of, so the map is empty.
             op_output: Vec::new(),
         }
+    }
+
+    /// A cell's layers: the leading kind's copies, then the odd one out — at its OWN length.
+    /// gemma-4's six-layer cell is five sliding layers and one longer global one; an even
+    /// division would split it wrong, and a cell with no repeat is one layer.
+    #[test]
+    fn cell_layer_lengths_reads_uneven_layers() {
+        // The global layer differs inside the sliding layer's length (its attention's mask).
+        let (s, g) = ([1u64, 2, 3], [1u64, 9, 3, 4]);
+        let cell: Vec<u64> = [s.as_slice(); 5]
+            .into_iter()
+            .chain([g.as_slice()])
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(cell_layer_lengths(&cell), vec![3, 3, 3, 3, 3, 4]);
+        assert_eq!(cell_layer_lengths(&[1, 2, 3, 1, 2, 3]), vec![3, 3]);
+        assert_eq!(cell_layer_lengths(&[1, 2, 3, 4]), vec![4]);
     }
 
     /// THE GATHER PROOF (un-riggable): after re-roll, the single loop

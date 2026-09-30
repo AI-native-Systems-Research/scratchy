@@ -506,6 +506,55 @@ impl<F: RopeForm> SubOp<F> {
         }
     }
 
+    /// [`Self::reroll_class_key`] with the weight STORAGE masked: two nodes hash equal iff they
+    /// are the same program at any bit width / group size.
+    ///
+    /// ⭐ THIS IS WHERE A MIXED-PRECISION MODEL'S LAYERS ARE. OptiQ quantizes gemma-4's layers
+    /// 0–4 at 8 bits and 5–21 at 4, so under the class key only two of its five six-layer cells
+    /// match and the other eighteen layers emit straight-line. The storage-masked key sees the
+    /// same five cells plain gemma-4 has; the class key then says which LAYERS inside them are
+    /// the same program.
+    pub fn reroll_shape_key(&self, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match self {
+            SubOp::MatmulTile { weight } => {
+                std::mem::discriminant(self).hash(h);
+                std::mem::discriminant(weight).hash(h);
+            }
+            SubOp::GemmaMoe {
+                num_experts,
+                top_k,
+                moe_inter,
+                ..
+            } => {
+                std::mem::discriminant(self).hash(h);
+                (num_experts, top_k, moe_inter).hash(h);
+            }
+            SubOp::Moe {
+                qwen_shared,
+                num_experts,
+                top_k,
+                moe_inter,
+                shared_inter,
+                norm_topk,
+                ..
+            } => {
+                std::mem::discriminant(self).hash(h);
+                (
+                    qwen_shared,
+                    num_experts,
+                    top_k,
+                    moe_inter,
+                    shared_inter,
+                    norm_topk,
+                )
+                    .hash(h);
+            }
+            // Everything else carries no storage: its shape IS its class.
+            _ => self.reroll_class_key(h),
+        }
+    }
+
     pub fn reroll_class_key(&self, h: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         std::mem::discriminant(self).hash(h);
