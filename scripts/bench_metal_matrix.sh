@@ -287,8 +287,11 @@ numbers() { # bench-serve json -> one human line
     python3 - "$1" <<'PY' 2>/dev/null || echo "no result"
 import json, sys
 j = json.load(open(sys.argv[1]))
-print(f"{j['output_throughput']:7.1f} tok/s · TTFT p50 {j['median_ttft_ms']:6.0f} ms"
-      f" · TPOT p50 {j['median_tpot_ms']:5.1f} ms · {j['completed']} ok")
+f = lambda v, spec: "-".rjust(int(spec.split(".")[0])) if v is None else format(v, spec)
+un = j.get("unstreamed_requests") or 0
+print(f"{j['output_throughput']:7.1f} tok/s · TTFT p50 {f(j['median_ttft_ms'], '6.0f')} ms"
+      f" · TPOT p50 {f(j['median_tpot_ms'], '5.1f')} ms · {j['completed']} ok"
+      + (f" · {un} unstreamed (untimed)" if un else ""))
 PY
 }
 run_cell() { # prefix axis rung input output conc
@@ -596,7 +599,7 @@ import glob, json, os, re, sys
 js, raw, stem, mid, quant, feats, built, secs, size, otag, oquant = sys.argv[1:12]
 KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms", "median_itl_ms",
         "p99_itl_ms", "median_e2el_ms", "output_throughput", "request_throughput",
-        "completed", "total_output_tokens", "duration"]
+        "completed", "total_output_tokens", "duration", "unstreamed_requests"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?\.json$")
 def load(name):
     p = os.path.join(raw, name)

@@ -32,6 +32,8 @@ struct RequestResult {
     e2el: f64,
     /// Number of output tokens generated.
     output_tokens: usize,
+    /// SSE chunks that carried `choices` (what the timing clocks saw).
+    chunks: usize,
     /// Timestamp (seconds since benchmark start) when request was sent.
     start_time: f64,
     success: bool,
@@ -114,6 +116,7 @@ fn send_request(
                 itl: vec![],
                 e2el: request_start.elapsed().as_secs_f64(),
                 output_tokens: 0,
+                chunks: 0,
                 start_time,
                 success: false,
             };
@@ -131,6 +134,7 @@ fn send_request(
             itl: vec![],
             e2el: request_start.elapsed().as_secs_f64(),
             output_tokens: 0,
+            chunks: 0,
             start_time,
             success: false,
         };
@@ -142,6 +146,7 @@ fn send_request(
     let mut chunk = [0u8; 8192];
     let mut buf = String::new();
     let mut usage_completion_tokens: Option<usize> = None;
+    let mut chunks = 0usize;
 
     loop {
         let n = match reader.read(&mut chunk) {
@@ -173,6 +178,7 @@ fn send_request(
                         .is_some_and(|c| c.as_array().is_some_and(|a| !a.is_empty()))
                     {
                         let now = Instant::now();
+                        chunks += 1;
                         if first_token_time.is_none() {
                             first_token_time = Some(now);
                         } else {
@@ -203,9 +209,20 @@ fn send_request(
         itl,
         e2el,
         output_tokens,
+        chunks,
         start_time,
         success: first_token_time.is_some(),
     }
+}
+
+/// A request whose whole multi-token output arrived in one `choices` chunk
+/// was never observed streaming: its first-chunk time is its end time, so
+/// TTFT == E2EL and TPOT == 0 by construction, not by measurement.
+/// mlx_lm.server does this whenever the tokens decode to no printable text
+/// (random-token prompts often make models emit undecodable byte
+/// fragments), holding them back and flushing one empty final chunk.
+fn is_unstreamed(r: &RequestResult) -> bool {
+    r.output_tokens > 1 && r.chunks <= 1
 }
 
 /// Compute percentile of a sorted slice using linear interpolation
@@ -572,21 +589,26 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     let total_output_tokens: usize = successful.iter().map(|r| r.output_tokens).sum();
     let total_input_tokens: usize = num_success * args.input_len;
 
-    let mut ttfts: Vec<f64> = successful.iter().map(|r| r.ttft).collect();
+    // TTFT/TPOT/ITL come only from requests the stream actually timed.
+    let timed: Vec<&RequestResult> = successful
+        .iter()
+        .copied()
+        .filter(|r| !is_unstreamed(r))
+        .collect();
+    let num_unstreamed = num_success - timed.len();
+
+    let mut ttfts: Vec<f64> = timed.iter().map(|r| r.ttft).collect();
     ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     // TPOT = (e2el - ttft) / (output_tokens - 1) for requests with >1 token.
-    let mut tpots: Vec<f64> = successful
+    let mut tpots: Vec<f64> = timed
         .iter()
         .filter(|r| r.output_tokens > 1)
         .map(|r| (r.e2el - r.ttft) / (r.output_tokens - 1) as f64)
         .collect();
     tpots.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let mut itls: Vec<f64> = successful
-        .iter()
-        .flat_map(|r| r.itl.iter().copied())
-        .collect();
+    let mut itls: Vec<f64> = timed.iter().flat_map(|r| r.itl.iter().copied()).collect();
     itls.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let mut e2els: Vec<f64> = successful.iter().map(|r| r.e2el).collect();
@@ -648,6 +670,17 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         "{:<40} {:<10}",
         "Peak concurrent requests:", peak_concurrent
     );
+    if num_unstreamed > 0 {
+        println!(
+            "{:<40} {:<10}",
+            "Unstreamed requests (untimed):", num_unstreamed
+        );
+        eprintln!(
+            "warning: {num_unstreamed}/{num_success} requests delivered all their tokens in a \
+             single chunk, so their TTFT/TPOT/ITL are unobservable and were excluded; \
+             E2EL and throughput still count them"
+        );
+    }
 
     // Print per-metric stats (matches Python's process_one_metric format).
     let print_metric = |name: &str, header: &str, data: &[f64]| {
@@ -713,11 +746,27 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         "total_token_throughput": (total_input_tokens + total_output_tokens) as f64 / total_time,
         "peak_output_throughput": peak_output_tps,
         "peak_concurrent_requests": peak_concurrent,
+        "unstreamed_requests": num_unstreamed,
     });
     let obj = json.as_object_mut().unwrap();
 
     let add_metric_json =
         |obj: &mut serde_json::Map<String, serde_json::Value>, attr: &str, data: &[f64]| {
+            // No samples is "not measured", never 0 ms.
+            if data.is_empty() {
+                obj.insert(format!("mean_{attr}_ms"), serde_json::Value::Null);
+                obj.insert(format!("median_{attr}_ms"), serde_json::Value::Null);
+                obj.insert(format!("std_{attr}_ms"), serde_json::Value::Null);
+                for &p in &selected_pcts {
+                    let p_word = if p == p.floor() {
+                        format!("{}", p as i64)
+                    } else {
+                        format!("{p}")
+                    };
+                    obj.insert(format!("p{p_word}_{attr}_ms"), serde_json::Value::Null);
+                }
+                return;
+            }
             obj.insert(
                 format!("mean_{attr}_ms"),
                 serde_json::json!(mean(data) * 1000.0),
@@ -842,4 +891,37 @@ fn compute_peak_concurrent(results: &[&RequestResult]) -> usize {
     }
 
     peak as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(output_tokens: usize, chunks: usize, ttft: f64, e2el: f64) -> RequestResult {
+        RequestResult {
+            ttft,
+            itl: vec![],
+            e2el,
+            output_tokens,
+            chunks,
+            start_time: 0.0,
+            success: true,
+        }
+    }
+
+    #[test]
+    fn one_chunk_carrying_many_tokens_is_unstreamed() {
+        // mlx_lm.server holding back 128 undecodable tokens: one empty final
+        // chunk, TTFT == E2EL — would read as TPOT 0 ms.
+        assert!(is_unstreamed(&req(128, 1, 6.1, 6.1)));
+    }
+
+    #[test]
+    fn streamed_and_single_token_requests_are_timed() {
+        assert!(!is_unstreamed(&req(128, 129, 3.8, 6.1)));
+        // Partly held back but still streamed: the gap is real decode time.
+        assert!(!is_unstreamed(&req(128, 2, 8.0, 10.3)));
+        // max_tokens 1: one chunk is all there is to see.
+        assert!(!is_unstreamed(&req(1, 1, 0.3, 0.3)));
+    }
 }
