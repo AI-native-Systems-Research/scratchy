@@ -34,12 +34,12 @@ inline constexpr short get_bytes_per_pack() {
   return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
 }
 
-// `codes_xor` (4-bit only): 0x88 when the codes are stored XOR 0x88
-// (`AffineCodes::Offset8`), restoring them per byte; 0 otherwise.
-template <typename U, int N, int bits>
+// `offset8` (4-bit only): the codes are stored XOR 0x88
+// (`AffineCodes::Offset8`); each byte is XOR-ed back before use. A template
+// parameter, not a runtime value, so the as-written loop is the upstream one.
+template <typename U, int N, int bits, bool offset8 = false>
 inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local,
-           uint8_t codes_xor = 0) {
+dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -77,10 +77,17 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local,
 
   else if (bits == 4) {
     U s[2] = {scale, scale / static_cast<U>(16.0f)};
-    for (int i = 0; i < (N / 2); i++) {
-      const uint8_t wi = w[i] ^ codes_xor;
-      w_local[2 * i] = s[0] * (wi & 0x0f) + bias;
-      w_local[2 * i + 1] = s[1] * (wi & 0xf0) + bias;
+    if (offset8) {
+      for (int i = 0; i < (N / 2); i++) {
+        const uint8_t wi = w[i] ^ 0x88;
+        w_local[2 * i] = s[0] * (wi & 0x0f) + bias;
+        w_local[2 * i + 1] = s[1] * (wi & 0xf0) + bias;
+      }
+    } else {
+      for (int i = 0; i < (N / 2); i++) {
+        w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
+        w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+      }
     }
   }
 
@@ -126,7 +133,8 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits>
+    short bits,
+    bool offset8 = false>
 struct QuantizedBlockLoader {
   static_assert(
       BCOLS <= group_size,
@@ -159,7 +167,6 @@ struct QuantizedBlockLoader {
   const device uint8_t* src;
   const device T* scales;
   const device T* biases;
-  const uint8_t codes_xor;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -168,8 +175,7 @@ struct QuantizedBlockLoader {
       const int src_ld_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
-      ushort simd_lane_id [[thread_index_in_simdgroup]],
-      uint8_t codes_xor_ = 0) thread
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
       : src_ld(src_ld_),
         tile_stride(
             reduction_dim ? BCOLS_PACKED * bytes_per_pack
@@ -183,8 +189,7 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size),
-        codes_xor(codes_xor_) {}
+        biases(biases_ + bi * src_ld / group_size) {}
 
   void load_unsafe() const thread {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
@@ -194,8 +199,8 @@ struct QuantizedBlockLoader {
     T scale = *scales;
     T bias = *biases;
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
-          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor, codes_xor);
+      dequantize<T, pack_factor, bits, offset8>(
+          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
     }
   }
 
@@ -221,12 +226,11 @@ struct QuantizedBlockLoader {
     T scale = *scales;
     T bias = *biases;
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
+      dequantize<T, pack_factor, bits, offset8>(
           (device uint8_t*)(src + i * bytes_per_pack),
           scale,
           bias,
-          dst + i * pack_factor,
-          codes_xor);
+          dst + i * pack_factor);
     }
   }
 

@@ -73,9 +73,10 @@ constant int QMM_NUM_EXPERTS [[function_constant(4)]];
 // the case on the matrix-unit tapes this library serves); the dequantizing
 // loader XORs each byte back. The small-M and W4A8 kernels read the stored
 // codes directly as signed int4 (q - 8) and fold the 8 into the bias.
+// Kernel entries branch on it once, into a loader instantiated for it.
 constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
-constant uint8_t AFFINE_CODES_XOR =
-    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x88 : 0;
+constant bool AFFINE_CODES_ARE_OFFSET8 =
+    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8;
 
 // ─────────────────────────────────────────────────────────────────
 // NVFP4 E2M1 decode (sign-magnitude 4-bit). Same byte layout as affine
@@ -135,7 +136,7 @@ inline float nvfp4_decode(uint code) {
 // ─────────────────────────────────────────────────────────────────
 
 template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N,
-          bool nvfp4 = false>
+          bool nvfp4 = false, bool offset8 = false>
 METAL_FUNC void qmm_t_nax_impl(
     const device uint32_t*  w,
     const device T_scale*   scales,
@@ -257,7 +258,7 @@ METAL_FUNC void qmm_t_nax_impl(
     // `BCOLS<=group_size` invariant) so it keeps the inlined path.
     using loader_w_t = mlx::steel::QuantizedBlockLoader<
         T_act, T_scale, BN, BK, BK_padded, /*reduction_dim=*/1,
-        TGP, group_size, bits>;
+        TGP, group_size, bits, offset8>;
 
     // ── Outer K loop + M/N alignment dispatch ───────────────────────
     dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
@@ -266,8 +267,7 @@ METAL_FUNC void qmm_t_nax_impl(
           if constexpr (!nvfp4) {
             // ── Affine: MLX QuantizedBlockLoader-driven K loop ───────
             loader_w_t loader_w(
-                w_block, s_block, b_block, K, Ws, simd_gid, simd_lid,
-                bits == 4 ? AFFINE_CODES_XOR : uint8_t(0));
+                w_block, s_block, b_block, K, Ws, simd_gid, simd_lid);
 
             for (int k = 0; k < K; k += BK) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -397,10 +397,12 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));  // 72
     threadgroup T_act Ws[BN * BK_padded];  // 64 × 72 = 4608 elements
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N>(
+    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
         simd_gid, simd_lid, tgid);
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -445,10 +447,12 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     const device T_scale* b_e = biases + size_t(expert) * s_stride;
 
     threadgroup T_act Ws[BN * BK_padded];
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N>(
+    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w_e, s_e, b_e, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
         simd_gid, simd_lid, tgid);
+    });
 }
 
 #define INST_GATHER_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
@@ -579,10 +583,12 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
     threadgroup T_act Ws[BN * BK_padded];
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N>(
+    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
         K, N, M,
         simd_gid, simd_lid, tgid);
+    });
 }
 
 #define INST_QMM_T_NAX_DIMS(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \

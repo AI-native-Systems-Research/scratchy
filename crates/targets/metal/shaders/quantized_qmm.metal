@@ -123,9 +123,10 @@ constant int QMM_K_PARTITION_SIZE [[function_constant(3)]];
 constant int QMM_NUM_EXPERTS      [[function_constant(4)]];
 // 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8`, matrix-unit
 // tapes); XOR-ing each loaded byte restores them. Unset: as written.
+// Kernel entries branch on it once, into a loader instantiated for it.
 constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
-constant uint8_t AFFINE_CODES_XOR =
-    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x88 : 0;
+constant bool AFFINE_CODES_ARE_OFFSET8 =
+    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8;
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26 (same constants as
@@ -191,7 +192,8 @@ inline float nvfp4_decode(uint code) {
 // preserved (full-f16 streams break Llama-3.x exponent range — see
 // `instr.rs:199-202`).
 template <typename T_act, typename T_compute, typename T_scale,
-          int group_size, int bits, bool aligned_N, bool nvfp4 = false>
+          int group_size, int bits, bool aligned_N, bool nvfp4 = false,
+          bool offset8 = false>
 METAL_FUNC void qmm_t_impl_inline(
     const device uint32_t*  w,
     const device T_scale*   scales,
@@ -314,7 +316,8 @@ METAL_FUNC void qmm_t_impl_inline(
       /* reduction_dim = */ 1,
       /* tgp_size = */ TGP,
       /* group_size = */ loader_gs,
-      /* bits = */ bits>;
+      /* bits = */ bits,
+      /* offset8 = */ offset8>;
   loader_w_t loader_w(
       (const device uint8_t*)w_block,
       s_block,
@@ -322,8 +325,7 @@ METAL_FUNC void qmm_t_impl_inline(
       /*src_ld=*/K,
       reinterpret_cast<threadgroup T_scale*>(Ws),
       simd_group_id,
-      simd_lane_id,
-      bits == 4 ? AFFINE_CODES_XOR : uint8_t(0));
+      simd_lane_id);
 
   // ── BlockMMA — VERBATIM MLX `BlockMMA<T_compute, T_act, BM, BN, BK,
   //    WM, WN, transpose_a=false, transpose_b=true, lda_tgp, ldb_tgp,
@@ -432,7 +434,7 @@ METAL_FUNC void qmm_t_impl_inline(
           Ws_dst_inline[i * pack_factor + 1] =
               scale * static_cast<T_compute>(nvfp4_decode((uint(b) >> 4) & 0x0fu));
         } else {
-          const uint8_t bq = b ^ (bits == 4 ? AFFINE_CODES_XOR : uint8_t(0));
+          const uint8_t bq = (offset8 && bits == 4) ? uint8_t(b ^ 0x88) : b;
           Ws_dst_inline[i * pack_factor + 0] =
               s0 * static_cast<T_compute>(bq & 0x0f) + bias;
           Ws_dst_inline[i * pack_factor + 1] =
@@ -577,11 +579,19 @@ template <typename T_act, typename T_compute, typename T_scale,
   threadgroup T_compute Xs[BM * BK_padded];
   threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
+  if (bits == 4 && AFFINE_CODES_ARE_OFFSET8) {
+  qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
+      w, scales, biases, x, y,
+      Xs, Ws, out_scratch,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      simd_group_id, simd_lane_id, tgid);
+  } else {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
       w, scales, biases, x, y,
       Xs, Ws, out_scratch,
       QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
       simd_group_id, simd_lane_id, tgid);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -636,11 +646,19 @@ template <typename T_act, typename T_compute, typename T_scale,
   threadgroup T_compute Xs[BM * BK_padded];
   threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
+  if (bits == 4 && AFFINE_CODES_ARE_OFFSET8) {
+  qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
+      w_e, s_e, b_e, x, y,
+      Xs, Ws, out_scratch,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      simd_group_id, simd_lane_id, tgid);
+  } else {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
       w_e, s_e, b_e, x, y,
       Xs, Ws, out_scratch,
       QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
       simd_group_id, simd_lane_id, tgid);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -688,6 +706,18 @@ template <typename T_act, typename T_compute, typename T_scale,
   threadgroup T_compute Xs[BM * BK_padded];
   threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
+  if (bits == 4 && AFFINE_CODES_ARE_OFFSET8) {
+  qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
+      (const device uint32_t*)wl,
+      scales_shift,
+      biases_shift,
+      x_shift,
+      y_shift,
+      Xs, Ws, out_scratch,
+      QMM_K, QMM_N, QMM_M,
+      /*K_eff=*/QMM_K_PARTITION_SIZE,
+      simd_group_id, simd_lane_id, tgid);
+  } else {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
       (const device uint32_t*)wl,
       scales_shift,
@@ -698,6 +728,7 @@ template <typename T_act, typename T_compute, typename T_scale,
       QMM_K, QMM_N, QMM_M,
       /*K_eff=*/QMM_K_PARTITION_SIZE,
       simd_group_id, simd_lane_id, tgid);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────
