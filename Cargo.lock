@@ -3661,6 +3661,17 @@ name = "scratchy-builder-spyre"
 version = "0.1.0"
 
 [[package]]
+name = "scratchy-chat-template-survey"
+version = "0.1.0"
+dependencies = [
+ "minijinja",
+ "minijinja-contrib",
+ "serde_json",
+ "sha2 0.10.9",
+ "ureq 3.4.2",
+]
+
+[[package]]
 name = "scratchy-cli"
 version = "0.1.0"
 dependencies = [
