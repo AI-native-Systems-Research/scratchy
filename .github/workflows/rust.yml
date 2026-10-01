@@ -141,6 +141,14 @@ jobs:
           cargo clippy -p scratchy-serving-worker --all-targets \
             --features nccl,scratchy-models/smollm2-135m -- -D warnings
 
+      # The multi-node control plane, the rank rendezvous and the channel
+      # that carries `ControlMessage` to followers, is plain TCP + serde: no
+      # backend, no GPU. Only NCCL's own collectives need the hardware.
+      # Featureless, these are the same crate builds the bench steps use.
+      - name: Multi-node control plane tests (no backend feature)
+        run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
+          --lib -- tcp_store multinode
+
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is
       # invisible to it and no job anywhere compiles them. These three steps
@@ -193,14 +201,6 @@ jobs:
 
       - name: OpenTelemetry export tests
         run: cargo test -p scratchy-core-common --features otel
-
-      # The multi-node control plane, the rank rendezvous and the channel
-      # that carries `ControlMessage` to followers, is plain TCP + serde: no
-      # backend, no GPU. Only NCCL's own collectives need the hardware.
-      # Featureless, both crates are already built by the bench step above.
-      - name: Multi-node control plane tests (no backend feature)
-        run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
-          --lib -- tcp_store multinode
 
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.
