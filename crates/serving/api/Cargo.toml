@@ -20,7 +20,7 @@ live-stats = []
 serve = ["dep:axum", "dep:tower-http"]
 otel = ["scratchy-core-common/otel"]
 cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda", "scratchy-target-cuda/cuda"]
-nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
+nccl = ["cuda", "dep:scratchy-serving-transport", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
 metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
 spyre = ["scratchy-serving-worker/spyre"]
 # A card, and the emulator — siblings, forwarded to the worker's own tiers.
@@ -50,6 +50,8 @@ scratchy-forward-compiler = { workspace = true }
 # neutral `ScratchyWeights` trait into `scratchy-target-cuda`; multimodal.rs
 # resolves arch metadata through it. Optional + backend-gated like the rest.
 scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
+# The multi-node rendezvous + control channel, used only by the `nccl` bootstrap.
+scratchy-serving-transport = { workspace = true, optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 anyhow = { workspace = true }
 inventory = { workspace = true }

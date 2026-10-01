@@ -13,8 +13,7 @@ use anyhow::Context;
 use scratchy_serving_engine::error::{EngineError, EngineResult};
 use scratchy_serving_engine::executor::{Executor, ModelRunnerOutput};
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
-use scratchy_serving_transport::codec;
-use scratchy_target_cuda::TcpControlChannel;
+use scratchy_serving_transport::{TcpControlChannel, codec};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -145,6 +144,7 @@ mod tests {
     use scratchy_core_common::SamplingParams;
     use scratchy_core_common::sampling::GuidedGrammar;
     use scratchy_serving_scheduler::scheduler::output::NewRequestData;
+    use scratchy_serving_transport::tcp_store::CONTROL_CHANNEL_PORT_OFFSET;
 
     fn new_request(req_id: &str, guided_grammar: Option<GuidedGrammar>) -> NewRequestData {
         NewRequestData::new(
@@ -165,13 +165,13 @@ mod tests {
     /// the wire) and a JSON-schema grammar — reaches the follower intact.
     #[test]
     fn execute_model_reaches_follower_intact() {
-        // The channel binds `master_port + 2`: probe THAT port, not the base.
+        // Probe the port the channel actually binds, not the base.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port()
-            - 2;
+            - CONTROL_CHANNEL_PORT_OFFSET;
         let schema = serde_json::json!({"type": "object", "required": ["a"]});
 
         let mut step = SchedulerOutput::make_empty();

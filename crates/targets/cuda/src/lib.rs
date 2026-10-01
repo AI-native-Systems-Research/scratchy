@@ -306,10 +306,9 @@ pub mod targets;
 // ---------------------------------------------------------------------------
 // Serving-side CUDA worker runtime (absorbed from the dissolved
 // `scratchy-serving-cuda` crate): the `Worker` impl, CUDA-graph capture,
-// logits processing, quant config/weight loaders, and the TCP/NCCL
-// bootstrap. `pp` (pipeline-parallel index math) and `tcp_store`
-// (control-plane TCP store + NCCL-id exchange) are backend-neutral and stay
-// ungated so the metal build and the non-NCCL control plane reach them.
+// logits processing, quant config/weight loaders, and the NCCL-id exchange
+// (`tcp_store`). `pp` (pipeline-parallel index math) is backend-neutral and
+// stays ungated so the metal build reaches it.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "cuda")]
 pub mod cuda_worker;
@@ -324,6 +323,7 @@ pub mod model;
 pub mod pp;
 #[cfg(feature = "cuda")]
 pub mod quant;
+#[cfg(feature = "nccl")]
 pub mod tcp_store;
 #[cfg(feature = "cuda")]
 pub mod weights_quant;
@@ -337,7 +337,6 @@ mod layers_tests;
 #[cfg(feature = "cuda")]
 pub use cuda_worker::{CudaWorker, CudaWorkerFactory};
 pub use pp::PpConfig;
-pub use tcp_store::TcpControlChannel;
 
 /// Total memory (bytes) and name of the current CUDA device.
 ///
