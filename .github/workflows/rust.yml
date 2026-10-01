@@ -128,10 +128,11 @@ jobs:
       # changes the forward macro's codegen and has `not(nccl)` paths of its
       # own, so swapping it in would drop coverage, and every model expanded
       # twice would double that step. One small model is the whole Rust
-      # surface here. The worker's `--all-targets` type-checks the control
-      # protocol's test (it can't link without the kernels
-      # SCRATCHY_SKIP_CUDA_KERNELS skips); serving-api's test build carries
-      # lint debt no job has ever linted, so its lib only.
+      # surface here. The worker's `--all-targets` lints its test build under
+      # `nccl` (the tests themselves run featureless, below: a `cuda` test
+      # binary can't link without the kernels SCRATCHY_SKIP_CUDA_KERNELS
+      # skips); serving-api's test build carries lint debt no job has ever
+      # linted, so its lib only.
       - name: Clippy (nccl)
         run: |
           cargo clippy -p scratchy-serving-api -p scratchy-models \
@@ -192,6 +193,14 @@ jobs:
 
       - name: OpenTelemetry export tests
         run: cargo test -p scratchy-core-common --features otel
+
+      # The multi-node control plane, the rank rendezvous and the channel
+      # that carries `ControlMessage` to followers, is plain TCP + serde: no
+      # backend, no GPU. Only NCCL's own collectives need the hardware.
+      # Featureless, both crates are already built by the bench step above.
+      - name: Multi-node control plane tests (no backend feature)
+        run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
+          --lib -- tcp_store multinode
 
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.
