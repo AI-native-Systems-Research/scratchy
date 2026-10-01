@@ -134,8 +134,9 @@ jobs:
       # lint debt no job has ever linted, so its lib only.
       - name: Clippy (nccl)
         run: |
-          cargo clippy -p scratchy-serving-api \
-            --features nccl,scratchy-models/smollm2-135m -- -D warnings
+          cargo clippy -p scratchy-serving-api -p scratchy-models \
+            --features scratchy-serving-api/nccl,scratchy-models/smollm2-135m \
+            -- -D warnings
           cargo clippy -p scratchy-serving-worker --all-targets \
             --features nccl,scratchy-models/smollm2-135m -- -D warnings
 
