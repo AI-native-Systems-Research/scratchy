@@ -59,6 +59,15 @@ pub struct ServerConfig {
     /// Path to CA certificates file for client certificate verification (PEM).
     pub ssl_ca_certs: Option<String>,
 
+    /// Whether tools-bearing `/v1/messages` requests are served as per-tool
+    /// relocatable spans (`--no-tool-spans` turns this off).
+    ///
+    /// This is the one Claude-Code-specific optimization on the Anthropic
+    /// endpoint, so it needs an off-switch to be A/B-able: with it off, a
+    /// tools-bearing request takes exactly the same flat chat path as a
+    /// tool-free one. Default on.
+    pub tool_spans_enabled: bool,
+
     /// Instant when the process started, for total startup time reporting.
     pub startup_instant: Option<std::time::Instant>,
 }
@@ -74,6 +83,7 @@ impl Default for ServerConfig {
             ssl_certfile: None,
             ssl_ca_certs: None,
             startup_instant: None,
+            tool_spans_enabled: true,
         }
     }
 }

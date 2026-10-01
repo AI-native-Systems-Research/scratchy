@@ -364,7 +364,7 @@ pub(crate) async fn anthropic_spans_completion(
         .map(|t| t as u32)
         .unwrap_or(2048);
     let temperature = spec.metadata.temperature.unwrap_or(0.0);
-    let request = build_completion_request(
+    let mut request = build_completion_request(
         &spec.metadata.model,
         protocol::CompletionPrompt::TokenIds(span_tok.tokens),
         span_tok.annotations,
@@ -373,6 +373,12 @@ pub(crate) async fn anthropic_spans_completion(
         temperature,
         false,
     );
+    // An empty model is "the client named none" (see `build_spnl_query`): drop
+    // it so the engine reports the model it loaded, exactly as the flat chat
+    // path does for a `model`-less request.
+    if spec.metadata.model.is_empty() {
+        request.model = None;
+    }
     state.engine.completion(request).await
 }
 

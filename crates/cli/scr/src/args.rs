@@ -532,6 +532,16 @@ pub struct ServeArgs {
     /// Requires building with --features otel.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")]
     pub otlp_traces_endpoint: Option<String>,
+
+    /// Serve tools-bearing `/v1/messages` requests as ordinary flat chat
+    /// prompts instead of per-tool relocatable spans.
+    ///
+    /// ⛔ WIRED FOR A REASON: per-tool spans are the one Claude-Code-specific
+    /// optimization on the Anthropic endpoint, and with no off-switch it could
+    /// not be A/B'd — every measurement of it was a measurement of the whole
+    /// server. This is the off-arm. Default: spans on.
+    #[arg(long)]
+    pub no_tool_spans: bool,
 }
 
 impl ServeArgs {

@@ -65,6 +65,7 @@ impl TestServer {
             device: None,
             spawn: should_spawn(),
             enforce_eager: None,
+            tool_spans: true,
         }
     }
 
@@ -117,6 +118,7 @@ pub struct TestServerBuilder {
     pipeline_parallel_size: usize,
     spawn: bool,
     enforce_eager: Option<bool>,
+    tool_spans: bool,
 }
 
 impl TestServerBuilder {
@@ -216,6 +218,13 @@ impl TestServerBuilder {
         self
     }
 
+    /// Turn per-tool relocatable spans for `/v1/messages` on or off
+    /// (`scr serve --no-tool-spans` is the `false` arm). Default: on.
+    pub fn with_tool_spans(mut self, enabled: bool) -> Self {
+        self.tool_spans = enabled;
+        self
+    }
+
     /// Start the server and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         if self.spawn {
@@ -285,6 +294,10 @@ impl TestServerBuilder {
 
         if self.enforce_eager == Some(true) {
             cmd.arg("--enforce-eager");
+        }
+
+        if !self.tool_spans {
+            cmd.arg("--no-tool-spans");
         }
 
         for arg in &self.extra_args {
@@ -424,6 +437,7 @@ impl TestServerBuilder {
             ssl_certfile: None,
             ssl_ca_certs: None,
             startup_instant: None,
+            tool_spans_enabled: self.tool_spans,
         };
 
         let is_pooling = runner == "pooling";

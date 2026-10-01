@@ -19,7 +19,7 @@ use tracing::info;
 
 use crate::engine::StreamDelta;
 use crate::protocol;
-use crate::server::AppState;
+use crate::server::{AppState, ServerConfig};
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -427,12 +427,16 @@ fn convert_response(resp: protocol::ChatCompletionResponse) -> MessagesResponse 
 // Spans mode: each tool a relocatable Plus span
 // ---------------------------------------------------------------------------
 
-/// Per-tool relocatable spans for tools-bearing `/v1/messages` requests are
-/// always on — each tool becomes an independently-cacheable relocatable span
+/// Whether this request is served as per-tool relocatable spans — each tool
+/// becoming an independently-cacheable relocatable span
 /// (`Cross([system, Plus([tool₁…toolₙ]), conversation])`) with a
 /// block-diagonal attention bound.
-fn spans_enabled() -> bool {
-    true
+///
+/// True for a tools-bearing request unless the server was started with
+/// `--no-tool-spans`, which is the off-arm of the A/B: the request then takes
+/// the same flat chat path a tool-free one takes.
+fn spans_enabled(config: &ServerConfig, req: &MessagesRequest) -> bool {
+    config.tool_spans_enabled && req.tools.as_ref().is_some_and(|t| !t.is_empty())
 }
 
 /// Render one tool definition as the text of its relocatable span.
@@ -575,7 +579,14 @@ fn build_spnl_query(req: &MessagesRequest) -> String {
     cross.push(serde_json::json!({ "user": fresh.join("\n") }));
     serde_json::json!({
         "g": {
-            "model": req.model,
+            // SPNL's `Generate.model` is a required String, so a client that
+            // omitted `model` (it is optional on this endpoint, and the flat
+            // path just forwards the `None`) must not render as `null` — that
+            // failed the SPNL parse and 400'd a request the flat path serves.
+            // Empty means "unset" to `anthropic_spans_completion`, which then
+            // lets the engine name the model it actually loaded, as the flat
+            // path does. The two arms have to accept the same requests.
+            "model": req.model.clone().unwrap_or_default(),
             "max_tokens": req.max_tokens,
             "temperature": req.temperature.unwrap_or(0.0),
             "input": { "cross": cross }
@@ -758,13 +769,7 @@ pub async fn messages(
     // spans. The buffered
     // completion is tool-parsed and returned as JSON or, for `stream:true`,
     // replayed as Anthropic SSE so streaming clients (Claude Code) work too.
-    if spans_enabled()
-        && request
-            .tools
-            .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
-    {
+    if spans_enabled(&state.config, &request) {
         let spnl = build_spnl_query(&request);
         match crate::query::anthropic_spans_completion(&state, &spnl).await {
             Ok(resp) => {
@@ -1026,6 +1031,65 @@ fn stream_messages_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tools-bearing request, as Claude Code sends them.
+    fn tools_request() -> MessagesRequest {
+        serde_json::from_str(
+            r#"{
+            "model": "claude-3-sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "List the files"}],
+            "tools": [{
+                "name": "Bash",
+                "description": "Run a command",
+                "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }]
+        }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_spans_on_by_default_for_tools_request() {
+        assert!(spans_enabled(&ServerConfig::default(), &tools_request()));
+    }
+
+    #[test]
+    fn test_no_tool_spans_takes_the_flat_path() {
+        let config = ServerConfig {
+            tool_spans_enabled: false,
+            ..ServerConfig::default()
+        };
+        // Same request that the default config spans: the flag alone decides.
+        assert!(!spans_enabled(&config, &tools_request()));
+    }
+
+    #[test]
+    fn test_tool_free_request_never_spans() {
+        let json = r#"{
+            "model": "claude-3-sonnet",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(!spans_enabled(&ServerConfig::default(), &req));
+
+        // An empty `tools` array is not a tools-bearing request either.
+        let mut empty_tools = req;
+        empty_tools.tools = Some(vec![]);
+        assert!(!spans_enabled(&ServerConfig::default(), &empty_tools));
+    }
+
+    /// With spans off, a tools-bearing request must convert exactly like the
+    /// flat chat path it now shares — same prompt in, same tools declared.
+    #[test]
+    fn test_flat_conversion_of_tools_request_is_unchanged() {
+        let chat = convert_request(tools_request());
+        assert_eq!(chat.messages.len(), 1);
+        let tools = chat.tools.expect("tools should survive conversion");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "Bash");
+    }
 
     #[test]
     fn test_deserialize_simple_request() {
