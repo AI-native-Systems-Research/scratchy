@@ -112,6 +112,17 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
         Some(url) => {
             let url = url.trim_end_matches('/').to_string();
             eprintln!("Using existing scratchy server at {url}");
+            let ignored = ignored_with_server_url(&args);
+            if !ignored.is_empty() {
+                eprintln!(
+                    "Warning: --server-url reuses a server launch did not start, so {} {} no \
+                     effect here. Pass {} to that server's own `scr serve` command (or drop \
+                     --server-url) before reading a measurement that depends on them.",
+                    ignored.join(", "),
+                    if ignored.len() == 1 { "has" } else { "have" },
+                    if ignored.len() == 1 { "it" } else { "them" },
+                );
+            }
             (url, None)
         }
         None => {
@@ -198,6 +209,114 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Context window the spawned server gets when `--max-model-len` is unset. Big
+/// enough for Claude Code's own system prompt + tool schemas plus a real session,
+/// and under the ceiling of every model we launch.
+const DEFAULT_MAX_MODEL_LEN: usize = 65536;
+
+/// The `serve` argv for the server we spawn — everything from the subcommand name
+/// on. Pure, so the whole forwarding surface is unit-testable: a serving knob is
+/// reachable from `launch claude` exactly when it shows up in this vector.
+///
+/// Anything `--serve-arg` names, launch does not also push. clap rejects a
+/// repeated argument rather than letting the last one win (`args_override_self`
+/// is off), so suppressing our own occurrence is what makes the escape hatch
+/// *total* — it can replace a knob launch has an opinion about, not just add one
+/// launch has never heard of.
+fn serve_argv(
+    model: &str,
+    port: u16,
+    args: &LaunchClaudeArgs,
+    tool_parser: Option<&str>,
+) -> Result<Vec<String>> {
+    /// Launch's own occurrence, unless the passthrough already named this flag.
+    fn pair(argv: &mut Vec<String>, taken: &[&str], flag: &str, value: impl std::fmt::Display) {
+        if !taken.contains(&flag) {
+            argv.push(flag.to_string());
+            argv.push(value.to_string());
+        }
+    }
+
+    // Flag names the escape hatch mentions, `--flag=value` reduced to `--flag`.
+    let taken: Vec<&str> = args
+        .serve_arg
+        .iter()
+        .filter(|a| a.starts_with('-'))
+        .map(|a| a.split('=').next().unwrap_or(a.as_str()))
+        .collect();
+
+    // The two launch genuinely owns: it reserves the port and health-checks that
+    // exact address, so a server told to listen elsewhere would never look
+    // healthy — a 600 s timeout instead of an error. Say so now.
+    for owned in ["--host", "--port"] {
+        if taken.contains(&owned) {
+            bail!(
+                "`--serve-arg {owned}` is not supported: launch reserves a free port and \
+                 health-checks 127.0.0.1 on it, so a server listening elsewhere never becomes \
+                 healthy. Start that server yourself and point launch at it with --server-url."
+            );
+        }
+    }
+
+    let mut argv = vec!["serve".to_string(), model.to_string()];
+    pair(&mut argv, &taken, "--host", "127.0.0.1");
+    pair(&mut argv, &taken, "--port", port);
+    pair(&mut argv, &taken, "--device", &args.device);
+    pair(&mut argv, &taken, "--dtype", &args.dtype);
+    // Defaults, not hard-codes: each carries a launch-specific opinion `scr serve`
+    // does not share (see `LaunchClaudeArgs::max_num_seqs` for the batch-1 memory
+    // rationale), and each stays overridable from its own flag. The batch-1 one has
+    // already been lost once to a refactor (added in d555fd53, dropped, restored) —
+    // it OOMs a 32 GiB box when it goes missing, so keep it emitted here.
+    pair(&mut argv, &taken, "--max-num-seqs", args.max_num_seqs);
+    pair(
+        &mut argv,
+        &taken,
+        "--max-model-len",
+        args.max_model_len.unwrap_or(DEFAULT_MAX_MODEL_LEN),
+    );
+    if let Some(parser) = tool_parser {
+        pair(&mut argv, &taken, "--tool-call-parser", parser);
+    }
+    if let Some(dtype) = &args.kv_cache_dtype {
+        pair(&mut argv, &taken, "--kv-cache-dtype", dtype);
+    }
+    if let Some(spec) = &args.speculative_model {
+        pair(&mut argv, &taken, "--speculative-model", spec);
+    }
+    if let Some(k) = args.num_speculative_tokens {
+        pair(&mut argv, &taken, "--num-speculative-tokens", k);
+    }
+    if args.no_prefix_caching && !taken.contains(&"--no-prefix-caching") {
+        argv.push("--no-prefix-caching".to_string());
+    }
+    argv.extend(args.serve_arg.iter().cloned());
+    Ok(argv)
+}
+
+/// The serving flags that only reach a server `launch` starts itself, named so
+/// `--server-url` can say out loud which ones it is dropping. A silently ignored
+/// ablation flag is worse than a missing one: the run still produces numbers, and
+/// they look like the ablation.
+fn ignored_with_server_url(args: &LaunchClaudeArgs) -> Vec<&'static str> {
+    [
+        (args.max_num_seqs != 1, "--max-num-seqs"),
+        (args.max_model_len.is_some(), "--max-model-len"),
+        (args.tool_call_parser.is_some(), "--tool-call-parser"),
+        (args.kv_cache_dtype.is_some(), "--kv-cache-dtype"),
+        (args.speculative_model.is_some(), "--speculative-model"),
+        (
+            args.num_speculative_tokens.is_some(),
+            "--num-speculative-tokens",
+        ),
+        (args.no_prefix_caching, "--no-prefix-caching"),
+        (!args.serve_arg.is_empty(), "--serve-arg"),
+    ]
+    .into_iter()
+    .filter_map(|(present, flag)| present.then_some(flag))
+    .collect()
+}
+
 /// A scratchy server we spawned and own. Killed + reaped on drop.
 struct ServerProcess {
     child: std::process::Child,
@@ -227,30 +346,9 @@ impl ServerProcess {
             .context("failed to clone the server log file handle")?;
 
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("serve")
-            .arg(model)
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--device")
-            .arg(&args.device)
-            .arg("--dtype")
-            .arg(&args.dtype)
+        cmd.args(serve_argv(model, port, args, tool_parser)?)
             .stdout(std::process::Stdio::from(log_file))
             .stderr(std::process::Stdio::from(log_file2));
-        if let Some(parser) = tool_parser {
-            cmd.arg("--tool-call-parser").arg(parser);
-        }
-        // A single interactive Claude Code session needs only one in-flight
-        // sequence, and batch 1 keeps the GDN recurrent-state pool tiny: it is
-        // sized `--max-num-seqs × per-slot` (61 MiB/slot on Qwen3.5-MoE-35B), so
-        // the serve default of 256 reserves 15.7 GiB and OOMs a 32 GiB box before
-        // the first token. Restores the launch serving config dropped in a later
-        // refactor (originally added in d555fd53).
-        cmd.arg("--max-num-seqs").arg("1");
-        cmd.arg("--max-model-len")
-            .arg(args.max_model_len.unwrap_or(65536).to_string());
 
         eprintln!(
             "Starting scratchy server on 127.0.0.1:{port} (model: {model}); logs: {}",
@@ -463,10 +561,195 @@ fn gen_uuid_v4() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionInject, gen_uuid_v4, resolve_session_inject, session_id_from_args};
+    use super::{
+        LaunchClaudeArgs, SessionInject, gen_uuid_v4, ignored_with_server_url,
+        resolve_session_inject, serve_argv, session_id_from_args,
+    };
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Parse a `launch claude` command line the way clap will at runtime, so the
+    /// forwarding tests exercise the real flag surface rather than a hand-built
+    /// struct that can drift from it.
+    fn launch_args(extra: &[&str]) -> LaunchClaudeArgs {
+        use clap::Parser as _;
+        let mut argv = vec!["claude", "my-model"];
+        argv.extend_from_slice(extra);
+        LaunchClaudeArgs::try_parse_from(argv).expect("launch args should parse")
+    }
+
+    /// The value after the LAST occurrence of `flag` — clap's own
+    /// override-on-repeat semantics, so an assertion reads as what the spawned
+    /// `serve` will actually resolve.
+    fn last_val<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let i = argv.iter().rposition(|a| a == flag)?;
+        argv.get(i + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn serve_argv_defaults_keep_batch_one_and_restate_nothing_else() {
+        let argv = serve_argv("my-model", 1234, &launch_args(&[]), None).unwrap();
+        assert_eq!(&argv[..2], &s(&["serve", "my-model"])[..]);
+        assert_eq!(last_val(&argv, "--port"), Some("1234"));
+        // The batch-1 memory rationale survives as the default…
+        assert_eq!(last_val(&argv, "--max-num-seqs"), Some("1"));
+        assert_eq!(last_val(&argv, "--max-model-len"), Some("65536"));
+        // …while an unset knob is left to `serve`'s own default instead of being
+        // restated (and skewed) here.
+        for flag in [
+            "--kv-cache-dtype",
+            "--speculative-model",
+            "--num-speculative-tokens",
+            "--no-prefix-caching",
+            "--tool-call-parser",
+        ] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag} should be absent");
+        }
+    }
+
+    /// Every ablation switch the bench matrix names has to be expressible as
+    /// `scr launch claude` flags. This is that list, as flags.
+    #[test]
+    fn serve_argv_forwards_every_ablation_knob() {
+        let args = launch_args(&[
+            "--max-num-seqs",
+            "4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--speculative-model",
+            "ngram",
+            "--num-speculative-tokens",
+            "3",
+            "--no-prefix-caching",
+            "--max-model-len",
+            "32768",
+        ]);
+        let argv = serve_argv("my-model", 1, &args, Some("gemma4")).unwrap();
+        assert_eq!(last_val(&argv, "--max-num-seqs"), Some("4"));
+        assert_eq!(last_val(&argv, "--kv-cache-dtype"), Some("fp8_e4m3"));
+        assert_eq!(last_val(&argv, "--speculative-model"), Some("ngram"));
+        assert_eq!(last_val(&argv, "--num-speculative-tokens"), Some("3"));
+        assert_eq!(last_val(&argv, "--max-model-len"), Some("32768"));
+        assert_eq!(last_val(&argv, "--tool-call-parser"), Some("gemma4"));
+        assert!(argv.iter().any(|a| a == "--no-prefix-caching"));
+    }
+
+    #[test]
+    fn serve_arg_passthrough_reaches_serve_and_wins_last() {
+        // A `serve` flag launch has never heard of, a `=`-joined one, and one
+        // launch does have an opinion about: the passthrough must reach the child
+        // AND replace launch's own occurrence, since clap rejects a repeat.
+        let args = launch_args(&[
+            "--serve-arg",
+            "--no-tool-spans",
+            "--serve-arg",
+            "--block-size=32",
+            "--serve-arg",
+            "--max-num-seqs",
+            "--serve-arg",
+            "8",
+        ]);
+        let argv = serve_argv("my-model", 1, &args, None).unwrap();
+        assert!(argv.iter().any(|a| a == "--no-tool-spans"));
+        assert!(argv.iter().any(|a| a == "--block-size=32"));
+        // launch's own `--max-num-seqs 1` is gone, not merely outranked: a second
+        // occurrence is an ArgumentConflict in the child, not a last-one-wins.
+        assert_eq!(argv.iter().filter(|a| *a == "--max-num-seqs").count(), 1);
+        assert_eq!(last_val(&argv, "--max-num-seqs"), Some("8"));
+    }
+
+    /// The parity check that matters: `serve`'s own parser has to accept
+    /// everything launch emits and resolve it to the values launch meant. A knob
+    /// that only *looks* forwarded — renamed upstream, or value-taking where
+    /// launch passes a switch — would otherwise yield a server that parsed fine
+    /// and ran un-ablated.
+    #[test]
+    fn serve_accepts_and_resolves_the_forwarded_argv() {
+        use clap::Parser as _;
+        let args = launch_args(&[
+            "--max-num-seqs",
+            "4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--speculative-model",
+            "ngram",
+            "--num-speculative-tokens",
+            "3",
+            "--no-prefix-caching",
+            "--serve-arg",
+            "--enable-metrics",
+        ]);
+        // argv[0] ("serve") doubles as the binary name clap expects to skip.
+        let argv = serve_argv("my-model", 9999, &args, Some("gemma4")).unwrap();
+        let serve = crate::args::ServeArgs::try_parse_from(&argv)
+            .expect("serve must accept every argument launch forwards");
+        assert_eq!(serve.resolved_model().unwrap(), "my-model");
+        assert_eq!(serve.host, "127.0.0.1");
+        assert_eq!(serve.port, 9999);
+        assert_eq!(serve.max_num_seqs, Some(4));
+        assert_eq!(serve.max_model_len, Some(super::DEFAULT_MAX_MODEL_LEN));
+        assert_eq!(serve.kv_cache_dtype, "fp8_e4m3");
+        assert_eq!(serve.speculative_model.as_deref(), Some("ngram"));
+        assert_eq!(serve.num_speculative_tokens, 3);
+        assert!(serve.no_prefix_caching);
+        assert_eq!(serve.tool_call_parser.as_deref(), Some("gemma4"));
+        // …including the flag launch itself knows nothing about.
+        assert!(serve.enable_metrics);
+    }
+
+    /// The override has to hold where it counts: in the child's parser. clap
+    /// rejects a repeated argument instead of taking the last one, so this fails
+    /// the moment launch pushes its own occurrence alongside the passthrough.
+    #[test]
+    fn passthrough_override_parses_in_the_child() {
+        use clap::Parser as _;
+        let args = launch_args(&["--serve-arg", "--max-num-seqs", "--serve-arg", "8"]);
+        let argv = serve_argv("my-model", 1, &args, None).unwrap();
+        let serve = crate::args::ServeArgs::try_parse_from(&argv)
+            .expect("an override must not collide with launch's own default");
+        assert_eq!(serve.max_num_seqs, Some(8));
+    }
+
+    /// `--host`/`--port` are launch's own: it reserves the port and health-checks
+    /// that address. Overriding them would time out after 600 s instead of
+    /// failing, so they are refused up front.
+    #[test]
+    fn serve_arg_refuses_the_two_flags_launch_owns() {
+        for flag in ["--port", "--host", "--port=9000"] {
+            let args = launch_args(&["--serve-arg", flag]);
+            let err =
+                serve_argv("my-model", 1, &args, None).expect_err("launch owns the listen address");
+            assert!(
+                err.to_string().contains("--server-url"),
+                "the error should point at the supported way: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_arg_does_not_swallow_the_claude_args() {
+        let args = launch_args(&["--serve-arg", "--enable-metrics", "--", "-p", "hi"]);
+        assert_eq!(args.serve_arg, s(&["--enable-metrics"]));
+        assert_eq!(args.claude_args, s(&["-p", "hi"]));
+    }
+
+    #[test]
+    fn server_url_names_the_knobs_it_cannot_apply() {
+        assert!(ignored_with_server_url(&launch_args(&[])).is_empty());
+        assert_eq!(
+            ignored_with_server_url(&launch_args(&[
+                "--no-prefix-caching",
+                "--max-num-seqs",
+                "4"
+            ])),
+            vec!["--max-num-seqs", "--no-prefix-caching"]
+        );
+        assert_eq!(
+            ignored_with_server_url(&launch_args(&["--serve-arg", "--enable-metrics"])),
+            vec!["--serve-arg"]
+        );
     }
 
     #[test]

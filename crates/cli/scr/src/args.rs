@@ -126,6 +126,51 @@ pub struct LaunchClaudeArgs {
     #[arg(long)]
     pub max_model_len: Option<usize>,
 
+    /// Maximum number of concurrent sequences for the spawned server.
+    ///
+    /// Defaults to 1, unlike `scr serve` (which lets the backend pick, often
+    /// 256): one interactive Claude Code session needs a single in-flight
+    /// sequence, and batch 1 keeps the GDN recurrent-state pool tiny — it is
+    /// sized `--max-num-seqs × per-slot` (61 MiB/slot on Qwen3.5-MoE-35B), so
+    /// 256 reserves 15.7 GiB and OOMs a 32 GiB box before the first token.
+    /// Raise it to stop Claude Code's background haiku/subagent calls queueing
+    /// behind the main turn, at that per-slot memory cost.
+    #[arg(long, default_value_t = 1)]
+    pub max_num_seqs: usize,
+
+    /// KV cache data type for the spawned server: "auto" (model dtype) or
+    /// "fp8_e4m3" (halves KV memory). Unset leaves `serve`'s own default.
+    #[arg(long)]
+    pub kv_cache_dtype: Option<String>,
+
+    /// Speculative decoding model for the spawned server: `ngram` for the
+    /// n-gram proposer, otherwise a draft-model path / HuggingFace id.
+    #[arg(long)]
+    pub speculative_model: Option<String>,
+
+    /// Speculative tokens proposed per step. Unset leaves `serve`'s own default
+    /// (2). Only used with --speculative-model.
+    #[arg(long)]
+    pub num_speculative_tokens: Option<usize>,
+
+    /// Disable the spawned server's automatic prefix caching (KV reuse across
+    /// turns). Enabled by default, as in `serve`.
+    #[arg(long)]
+    pub no_prefix_caching: bool,
+
+    /// Pass one extra argument straight through to the spawned `serve`, once per
+    /// occurrence: `--serve-arg --enable-metrics`, or `--serve-arg
+    /// --block-size=32`. A value-taking flag written apart from its value needs
+    /// two occurrences (`--serve-arg --block-size --serve-arg 32`).
+    ///
+    /// Whatever this names, launch stops setting itself, so a passthrough also
+    /// *replaces* a knob launch has its own opinion about — a new `serve` flag
+    /// therefore never needs a new `launch claude` flag. `--host`/`--port` are
+    /// the exception: launch reserves and health-checks those, and rejects them
+    /// here rather than hanging on a server that listens elsewhere.
+    #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
+    pub serve_arg: Vec<String>,
+
     /// Path to the `claude` executable.
     #[arg(long, default_value = "claude")]
     pub claude_bin: String,
