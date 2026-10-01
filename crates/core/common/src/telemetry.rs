@@ -72,7 +72,7 @@ pub fn build_otlp_exporter(
 /// Separated from `init_tracing_with_otel` for testability.
 #[cfg(feature = "otel")]
 pub fn build_tracer_provider(
-    exporter: opentelemetry_otlp::SpanExporter,
+    exporter: impl opentelemetry_sdk::trace::SpanExporter + 'static,
 ) -> opentelemetry_sdk::trace::SdkTracerProvider {
     opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
@@ -84,6 +84,21 @@ pub fn build_tracer_provider(
         .build()
 }
 
+/// Build the `tracing` layer that records spans on a tracer from `provider`.
+///
+/// Separated from `init_tracing_with_otel` for testability.
+#[cfg(feature = "otel")]
+pub fn build_otel_layer<S>(
+    provider: &opentelemetry_sdk::trace::SdkTracerProvider,
+) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::SdkTracer>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use opentelemetry::trace::TracerProvider as _;
+
+    tracing_opentelemetry::layer().with_tracer(provider.tracer("vllm"))
+}
+
 /// Initialize tracing with both console output and OpenTelemetry export.
 ///
 /// Spans are sent to the OTLP collector at `otel_config.endpoint` via gRPC.
@@ -93,7 +108,6 @@ pub fn build_tracer_provider(
 /// after `init_tracing()`, this is a no-op (the plain subscriber wins).
 #[cfg(feature = "otel")]
 pub fn init_tracing_with_otel(log_level: &str, otel_config: &OtelConfig) -> Option<OtelGuard> {
-    use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -120,8 +134,7 @@ pub fn init_tracing_with_otel(log_level: &str, otel_config: &OtelConfig) -> Opti
         };
 
         let provider = build_tracer_provider(exporter);
-        let tracer = provider.tracer("vllm");
-        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let otel_layer = build_otel_layer(&provider);
 
         tracing_subscriber::registry()
             .with(filter)
@@ -230,6 +243,48 @@ mod tests {
             assert!(debug_str.contains("OtelGuard"));
             // Guard drop will call shutdown — should not panic.
             drop(guard);
+        }
+
+        #[test]
+        fn test_otel_layer_exports_tracing_spans() {
+            // Spans recorded through `tracing` must reach the provider's
+            // exporter, nested and with their fields, which needs the layer
+            // and the SDK to agree on one opentelemetry.
+            use opentelemetry::KeyValue;
+            use opentelemetry_sdk::trace::InMemorySpanExporter;
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let exporter = InMemorySpanExporter::default();
+            let provider = build_tracer_provider(exporter.clone());
+            let subscriber = tracing_subscriber::registry().with(build_otel_layer(&provider));
+            tracing::subscriber::with_default(subscriber, || {
+                let _request = tracing::info_span!("request", request_id = 7).entered();
+                tracing::info_span!("forward").in_scope(|| {});
+            });
+            provider.force_flush().unwrap();
+
+            let spans = exporter.get_finished_spans().unwrap();
+            assert_eq!(spans.len(), 2, "{spans:?}");
+            let span = |name: &str| {
+                spans
+                    .iter()
+                    .find(|s| s.name == name)
+                    .unwrap_or_else(|| panic!("no `{name}` span in {spans:?}"))
+            };
+            let (request, forward) = (span("request"), span("forward"));
+            assert_eq!(forward.parent_span_id, request.span_context.span_id());
+            assert_eq!(
+                forward.span_context.trace_id(),
+                request.span_context.trace_id()
+            );
+            assert!(
+                request
+                    .attributes
+                    .contains(&KeyValue::new("request_id", 7_i64)),
+                "{:?}",
+                request.attributes
+            );
+            assert_eq!(request.instrumentation_scope.name(), "vllm");
         }
     }
 }
