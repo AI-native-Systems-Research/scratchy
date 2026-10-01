@@ -3,6 +3,7 @@
 
     /            the hand-written landing page
     /book/       docs/*.md + CONTRIBUTING.md, rendered client-side by zero-md
+    /metal.html  Metal benchmark runs from site/data/metal/, see build_metal.py
 
 The Markdown under docs/ stays the single source of truth. Each chapter is
 copied (with internal links rewritten to point at the built .html shells)
@@ -18,6 +19,7 @@ import sys
 from pathlib import Path
 
 import build_archs
+import build_metal
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -149,6 +151,7 @@ PAGE_TEMPLATE = """\
 NAV = [
     ("architectures.html", "Models"),
     ("book/index.html", "Docs"),
+    ("metal.html", "Performance"),
 ]
 
 REPO_URL = "https://github.com/AI-native-Systems-Research/scratchy"
@@ -273,6 +276,7 @@ def main():
         build_chapter(title, src_rel, slug)
 
     build_archs.build(SITE / "architectures.html", header_html("", active="architectures.html"))
+    build_metal.build(SITE / "metal.html", header_html("", active="metal.html"))
 
     if check_markdown_links():
         print("link check failed", file=sys.stderr)

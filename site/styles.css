@@ -501,3 +501,90 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 @media (max-width: 900px) {
   .archbar cds-select { min-width: 100%; }
 }
+
+/* ---- Metal performance page (built by build_metal.py) ----------------------
+ * Engine colours are fixed per engine and the same in both themes: blue,
+ * orange, aqua from the data-viz reference palette, validated as a set
+ * (all pairs, CVD and normal vision) against cds--white and cds--g100
+ * surfaces. Aqua is under 3:1 on white, so every chart carries direct end
+ * labels and a table view. Every Carbon size token here has a fallback:
+ * this site only resolves Carbon's colour tokens. */
+.metalpage, .mtip {
+  --s1: #2a78d6;           /* scratchy */
+  --s2: #d95926;           /* mlx-lm */
+  --s3: #1baf7a;           /* ollama */
+  --div-pos: #2a78d6;      /* scratchy faster */
+  --div-neg: #e34948;      /* scratchy slower */
+}
+.metalpage {
+  padding: 0 var(--cds-spacing-07, 2rem) var(--cds-spacing-10, 4rem);
+  max-width: 72rem;
+}
+.metalpage h2 { font-size: var(--cds-heading-04-font-size, 1.75rem); font-weight: 400; margin: 2.5rem 0 0.5rem; }
+.metalpage h3 { font-size: var(--cds-heading-03-font-size, 1.25rem); font-weight: 600; margin: 2rem 0 0.25rem; }
+.metalpage .mmeta { color: var(--muted); margin: 0 0 1rem; font-size: var(--cds-body-01-font-size, 0.875rem); }
+.metalpage .dim { color: var(--muted); font-weight: 400; }
+.metalpage b { font-weight: 600; }
+.metalpage .caveats { padding-left: 1.25rem; max-width: 48rem; }
+.metalpage .caveats li { margin: 0 0 0.5rem; }
+.metalpage .empty { color: var(--muted); }
+.metalpage .mmodel { border-top: 1px solid var(--line); margin-top: 2rem; }
+
+/* Wide tables scroll inside their own box, never the page. */
+.mtable { overflow-x: auto; margin: 0 0 1rem; }
+.mtable table { border-collapse: collapse; font-size: var(--cds-body-01-font-size, 0.875rem); }
+.mtable th, .mtable td { padding: 0.4rem 0.75rem; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+.mtable thead th { color: var(--muted); font-weight: 600; vertical-align: bottom; }
+.mtable th[scope="row"], .mtable th.first { text-align: left; font-weight: 600; }
+.mtable th[scope="colgroup"] { text-align: center; border-bottom: 1px solid var(--line); }
+.mtable td { font-variant-numeric: tabular-nums; }
+.mtable td.gap { text-align: left; color: var(--muted); font-style: italic; }
+
+.key, .lkey { display: inline-block; vertical-align: middle; margin-right: 0.45rem; }
+.key { width: 8px; height: 8px; border-radius: 50%; }
+.lkey { width: 14px; height: 2px; border-radius: 1px; }
+.key.s1, .lkey.s1 { background: var(--s1); }
+.key.s2, .lkey.s2 { background: var(--s2); }
+.key.s3, .lkey.s3 { background: var(--s3); }
+
+.mfig { margin: 1.5rem 0; }
+.mfig figcaption { font-weight: 600; margin-bottom: 0.5rem; }
+.mfig details summary, .hist summary { cursor: pointer; color: var(--accent); font-size: var(--cds-label-01-font-size, 0.75rem); margin: 0.25rem 0 0.5rem; }
+.legend { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--fg); margin-bottom: 0.25rem; }
+.chartbox { max-width: 40rem; }
+.mchart { width: 100%; height: auto; display: block; overflow: visible; }
+.mchart .grid { stroke: var(--line); stroke-width: 1; }
+.mchart .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.mchart .axis { fill: var(--muted); font-size: 11px; }
+.mchart .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.mchart .dot { stroke: var(--bg); stroke-width: 2; }
+.mchart .ln.s1 { stroke: var(--s1); } .mchart .dot.s1 { fill: var(--s1); }
+.mchart .ln.s2 { stroke: var(--s2); } .mchart .dot.s2 { fill: var(--s2); }
+.mchart .ln.s3 { stroke: var(--s3); } .mchart .dot.s3 { fill: var(--s3); }
+.mchart .endlbl { fill: var(--fg); font-size: 12px; }
+.mchart .leader, .mchart .xhair { stroke: var(--muted); stroke-width: 1; }
+.mchart .hit { fill: transparent; outline: none; }
+.mchart .hit:focus-visible { fill: color-mix(in srgb, var(--fg) 6%, transparent); }
+
+.heatrow { display: flex; flex-wrap: wrap; gap: 2rem; }
+.heatttl { font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-bottom: 0.25rem; }
+.heat table { border-collapse: separate; border-spacing: 2px; font-size: var(--cds-body-01-font-size, 0.875rem); }
+.heat th { color: var(--muted); font-weight: 600; padding: 0.25rem 0.5rem; text-align: right; }
+.heat td { background: var(--bg-soft); color: var(--fg); padding: 0.4rem 0.6rem; min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums; border-radius: 2px; }
+.heat td b { display: block; font-size: 1rem; }
+.heat td span { display: block; color: var(--muted); font-size: var(--cds-label-01-font-size, 0.75rem); }
+.heat td:hover, .heat td:focus-visible { outline: 1px solid var(--fg); outline-offset: -1px; }
+.scale { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-top: 0.5rem; }
+.scale .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 0.35rem; }
+.scale .sw.neg { background: color-mix(in oklab, var(--div-neg) 50%, var(--bg-soft)); }
+.scale .sw.mid { background: var(--bg-soft); }
+.scale .sw.pos { background: color-mix(in oklab, var(--div-pos) 50%, var(--bg-soft)); }
+
+.mtip { position: absolute; z-index: 10; pointer-events: none; background: var(--panel); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 0.5rem 0.65rem; font-size: var(--cds-label-01-font-size, 0.75rem);
+  font-variant-numeric: tabular-nums; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2); }
+.mtip .mtiphead { color: var(--muted); margin-bottom: 0.25rem; }
+@media (max-width: 672px) {
+  .metalpage { padding: 0 1rem 3rem; }
+}
+.mtip b { font-weight: 600; }
