@@ -9,14 +9,16 @@
 //! NCCL is used only for the data plane (model forward-pass collectives).
 //! This matches Python vLLM's `mp` backend architecture.
 
+use anyhow::Context;
 use scratchy_serving_engine::error::{EngineError, EngineResult};
 use scratchy_serving_engine::executor::{Executor, ModelRunnerOutput};
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
+use scratchy_serving_transport::codec;
 use scratchy_target_cuda::TcpControlChannel;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Control protocol (serialized via bincode, broadcast via TCP)
+// Control protocol (msgpack, broadcast via TCP)
 // ---------------------------------------------------------------------------
 
 /// Messages broadcast from rank 0 to all follower nodes via TCP.
@@ -33,6 +35,26 @@ pub enum ControlMessage {
     Warmup,
     /// Shut down the remote worker loop.
     Shutdown,
+}
+
+impl ControlMessage {
+    /// Send this message to every follower (rank 0 only).
+    ///
+    /// Encoded with the transport codec (a msgpack map with named fields),
+    /// never positionally: `NewRequestData` omits its `None` optionals on the
+    /// wire, and `GuidedGrammar::JsonSchema` carries a `serde_json::Value`,
+    /// which only a self-describing format can decode.
+    pub fn broadcast(&self, channel: &mut TcpControlChannel) -> anyhow::Result<()> {
+        let data = codec::encode(self).context("failed to encode control message")?;
+        channel.broadcast(&data)
+    }
+
+    /// Block until the next message from rank 0 arrives (followers only).
+    pub fn recv(channel: &mut TcpControlChannel) -> anyhow::Result<Self> {
+        let data = channel.recv()?;
+        codec::decode(&data)
+            .with_context(|| format!("failed to decode control message ({} bytes)", data.len()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -57,13 +79,8 @@ impl MultiNodeExecutor {
 
     /// Serialize and broadcast a control message via TCP (rank 0 sends).
     fn broadcast_msg(&mut self, msg: &ControlMessage) -> EngineResult<()> {
-        let data = bincode::serialize(msg).map_err(|e| {
-            EngineError::Executor(format!("failed to serialize control message: {e}"))
-        })?;
-        self.channel
-            .broadcast(&data)
-            .map_err(|e| EngineError::Executor(format!("TCP broadcast failed: {e}")))?;
-        Ok(())
+        msg.broadcast(&mut self.channel)
+            .map_err(|e| EngineError::Executor(format!("control broadcast failed: {e:#}")))
     }
 }
 
@@ -119,5 +136,87 @@ impl Executor for MultiNodeExecutor {
     fn shutdown(&mut self) {
         let _ = self.broadcast_msg(&ControlMessage::Shutdown);
         self.inner.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scratchy_core_common::SamplingParams;
+    use scratchy_core_common::sampling::GuidedGrammar;
+    use scratchy_serving_scheduler::scheduler::output::NewRequestData;
+
+    fn new_request(req_id: &str, guided_grammar: Option<GuidedGrammar>) -> NewRequestData {
+        NewRequestData::new(
+            req_id.into(),
+            Some(vec![1, 2, 3]),
+            vec![vec![0]],
+            0,
+            Some(SamplingParams {
+                guided_grammar,
+                ..SamplingParams::default()
+            }),
+            None,
+            None,
+        )
+    }
+
+    /// A step scheduling two new requests — `None` span fields (skipped on
+    /// the wire) and a JSON-schema grammar — reaches the follower intact.
+    #[test]
+    fn execute_model_reaches_follower_intact() {
+        // The channel binds `master_port + 2`: probe THAT port, not the base.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+            - 2;
+        let schema = serde_json::json!({"type": "object", "required": ["a"]});
+
+        let mut step = SchedulerOutput::make_empty();
+        step.scheduled_new_reqs = vec![
+            new_request("plain", None),
+            new_request(
+                "json",
+                Some(GuidedGrammar::JsonSchema {
+                    schema: schema.clone(),
+                }),
+            ),
+        ];
+        step.total_num_scheduled_tokens = 6;
+
+        let leader = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(0, 2, "127.0.0.1", port).unwrap();
+            ControlMessage::ExecuteModel(Box::new(step))
+                .broadcast(&mut ch)
+                .unwrap();
+        });
+        let mut ch = TcpControlChannel::establish(1, 2, "127.0.0.1", port).unwrap();
+        let received = ControlMessage::recv(&mut ch).unwrap();
+        leader.join().unwrap();
+
+        let ControlMessage::ExecuteModel(step) = received else {
+            panic!("follower received a message other than ExecuteModel");
+        };
+        assert_eq!(step.total_num_scheduled_tokens, 6);
+        let [plain, json] = step.scheduled_new_reqs.as_slice() else {
+            panic!(
+                "expected 2 new requests, got {}",
+                step.scheduled_new_reqs.len()
+            );
+        };
+        assert_eq!(plain.req_id, "plain");
+        assert_eq!(json.req_id, "json");
+        assert_eq!(json.prompt_token_ids.as_deref(), Some(&[1, 2, 3][..]));
+        assert!(json.block_annotations.is_none() && json.reused_block_idxs.is_none());
+        let Some(GuidedGrammar::JsonSchema { schema: received }) = json
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.guided_grammar.as_ref())
+        else {
+            panic!("JSON-schema grammar lost in transit");
+        };
+        assert_eq!(*received, schema);
     }
 }

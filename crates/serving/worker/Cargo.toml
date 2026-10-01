@@ -42,6 +42,7 @@ scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-serving-scheduler = { workspace = true }
 scratchy-serving-engine = { workspace = true }
+scratchy-serving-transport = { workspace = true }
 scratchy-core-model = { workspace = true }
 scratchy-quantizations = { workspace = true }
 scratchy-forward-compiler = { path = "../../compiler", optional = true }
@@ -74,7 +75,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 cudarc = { workspace = true, optional = true }
 rand = { workspace = true }
-bincode = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]

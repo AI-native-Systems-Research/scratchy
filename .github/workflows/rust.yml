@@ -122,6 +122,24 @@ jobs:
           --exclude scratchy-target-metal-compiler
           -- -D warnings
 
+      # Multi-node tensor parallelism (the TCP control plane + NCCL bootstrap
+      # in serving-api/-worker) compiles only under `nccl`, which the clippy
+      # above never enables. Its own step, not a feature added above: `nccl`
+      # changes the forward macro's codegen and has `not(nccl)` paths of its
+      # own, so swapping it in would drop coverage, and every model expanded
+      # twice would double that step. One small model is the whole Rust
+      # surface here. The worker's `--all-targets` type-checks the control
+      # protocol's test (it can't link without the kernels
+      # SCRATCHY_SKIP_CUDA_KERNELS skips); serving-api's test build carries
+      # lint debt no job has ever linted, so its lib only.
+      - name: Clippy (nccl)
+        run: |
+          cargo clippy -p scratchy-serving-api -p scratchy-models \
+            --features scratchy-serving-api/nccl,scratchy-models/smollm2-135m \
+            -- -D warnings
+          cargo clippy -p scratchy-serving-worker --all-targets \
+            --features nccl,scratchy-models/smollm2-135m -- -D warnings
+
       # The `--workspace` clippy above has no `--all-targets`: it builds
       # lib+bins only, so every `#[cfg(test)]` block in the workspace is
       # invisible to it and no job anywhere compiles them. These three steps
