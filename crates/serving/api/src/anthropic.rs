@@ -432,9 +432,10 @@ fn convert_response(resp: protocol::ChatCompletionResponse) -> MessagesResponse 
 /// (`Cross([system, Plus([tool₁…toolₙ]), conversation])`) with a
 /// block-diagonal attention bound.
 ///
-/// True for a tools-bearing request unless the server was started with
-/// `--no-tool-spans`, which is the off-arm of the A/B: the request then takes
-/// the same flat chat path a tool-free one takes.
+/// False unless the server was started with `scr serve --tool-spans`: the
+/// default arm is the flat chat path, the one that renders tools through the
+/// model's own tool template and so actually produces `tool_use` blocks. See
+/// [`ServerConfig::tool_spans_enabled`] for why spans are not the default.
 fn spans_enabled(config: &ServerConfig, req: &MessagesRequest) -> bool {
     config.tool_spans_enabled && req.tools.as_ref().is_some_and(|t| !t.is_empty())
 }
@@ -1049,19 +1050,22 @@ mod tests {
         .unwrap()
     }
 
+    /// The default arm is the flat chat path, for a tools-bearing request as
+    /// much as a tool-free one — spans are opt-in because the spans renderer
+    /// bypasses the model's native tool template.
     #[test]
-    fn test_spans_on_by_default_for_tools_request() {
-        assert!(spans_enabled(&ServerConfig::default(), &tools_request()));
+    fn test_spans_off_by_default_for_tools_request() {
+        assert!(!spans_enabled(&ServerConfig::default(), &tools_request()));
     }
 
     #[test]
-    fn test_no_tool_spans_takes_the_flat_path() {
+    fn test_tool_spans_opts_a_tools_request_into_spans() {
         let config = ServerConfig {
-            tool_spans_enabled: false,
+            tool_spans_enabled: true,
             ..ServerConfig::default()
         };
-        // Same request that the default config spans: the flag alone decides.
-        assert!(!spans_enabled(&config, &tools_request()));
+        // Same request the default config serves flat: the flag alone decides.
+        assert!(spans_enabled(&config, &tools_request()));
     }
 
     #[test]
@@ -1072,18 +1076,24 @@ mod tests {
             "messages": [{"role": "user", "content": "Hello"}]
         }"#;
         let req: MessagesRequest = serde_json::from_str(json).unwrap();
-        assert!(!spans_enabled(&ServerConfig::default(), &req));
+        let spans_on = ServerConfig {
+            tool_spans_enabled: true,
+            ..ServerConfig::default()
+        };
+        // Not even with the flag on: there is nothing to make a span out of.
+        assert!(!spans_enabled(&spans_on, &req));
 
         // An empty `tools` array is not a tools-bearing request either.
         let mut empty_tools = req;
         empty_tools.tools = Some(vec![]);
-        assert!(!spans_enabled(&ServerConfig::default(), &empty_tools));
+        assert!(!spans_enabled(&spans_on, &empty_tools));
     }
 
-    /// With spans off, a tools-bearing request must convert exactly like the
-    /// flat chat path it now shares — same prompt in, same tools declared.
+    /// The default path for a tools-bearing request must declare the tools to
+    /// the engine — that is what lets the chat template render them in the
+    /// model's native tool format, which is the whole reason it is the default.
     #[test]
-    fn test_flat_conversion_of_tools_request_is_unchanged() {
+    fn test_flat_conversion_declares_the_tools() {
         let chat = convert_request(tools_request());
         assert_eq!(chat.messages.len(), 1);
         let tools = chat.tools.expect("tools should survive conversion");

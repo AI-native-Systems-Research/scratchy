@@ -90,14 +90,15 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
 
     print_banner(env!("CARGO_PKG_VERSION"), &model);
     info!("Device: {}, dtype: {}", args.device, args.dtype);
-    // Logged on both arms, not just the off one: a bench log has to name the
-    // arm it measured without the reader reconstructing it from the flags.
+    // Logged on both arms, not just the non-default one: a bench log has to
+    // name the arm it measured without the reader reconstructing it from the
+    // flags, and the default is the thing most likely to be assumed wrongly.
     info!(
         "Tool spans: {}",
-        if args.no_tool_spans {
-            "off (tools-bearing /v1/messages served as flat chat)"
+        if args.tool_spans {
+            "on (per-tool relocatable spans; no native tool template — see --help)"
         } else {
-            "on (per-tool relocatable spans)"
+            "off (tools-bearing /v1/messages served as flat chat)"
         }
     );
     if let Some(ref spec_model) = args.speculative_model {
@@ -261,7 +262,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         ssl_certfile: args.ssl_certfile.clone(),
         ssl_ca_certs: args.ssl_ca_certs.clone(),
         startup_instant: Some(startup_start),
-        tool_spans_enabled: !args.no_tool_spans,
+        tool_spans_enabled: args.tool_spans,
     };
 
     let is_pooling = args.runner == "pooling";

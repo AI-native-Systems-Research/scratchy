@@ -65,7 +65,7 @@ impl TestServer {
             device: None,
             spawn: should_spawn(),
             enforce_eager: None,
-            tool_spans: true,
+            tool_spans: false,
         }
     }
 
@@ -219,7 +219,8 @@ impl TestServerBuilder {
     }
 
     /// Turn per-tool relocatable spans for `/v1/messages` on or off
-    /// (`scr serve --no-tool-spans` is the `false` arm). Default: on.
+    /// (`scr serve --tool-spans` is the `true` arm). Default: off, matching
+    /// `ServerConfig`.
     pub fn with_tool_spans(mut self, enabled: bool) -> Self {
         self.tool_spans = enabled;
         self
@@ -296,8 +297,8 @@ impl TestServerBuilder {
             cmd.arg("--enforce-eager");
         }
 
-        if !self.tool_spans {
-            cmd.arg("--no-tool-spans");
+        if self.tool_spans {
+            cmd.arg("--tool-spans");
         }
 
         for arg in &self.extra_args {

@@ -60,12 +60,15 @@ pub struct ServerConfig {
     pub ssl_ca_certs: Option<String>,
 
     /// Whether tools-bearing `/v1/messages` requests are served as per-tool
-    /// relocatable spans (`--no-tool-spans` turns this off).
+    /// relocatable spans (`scr serve --tool-spans` turns this on).
     ///
-    /// This is the one Claude-Code-specific optimization on the Anthropic
-    /// endpoint, so it needs an off-switch to be A/B-able: with it off, a
-    /// tools-bearing request takes exactly the same flat chat path as a
-    /// tool-free one. Default on.
+    /// **Default off.** The spans renderer writes tool schemas as plain
+    /// `Tool: …` text rather than through the model's native tool template, so
+    /// the model is never put in its tool-calling format and the tool parser
+    /// never fires — a request that asked for a `tool_use` gets prose. Off, a
+    /// tools-bearing request takes exactly the same flat chat path a tool-free
+    /// one takes, and the tool call round-trips. The switch stays because the
+    /// Claude-Code benchmark has to be able to measure both arms.
     pub tool_spans_enabled: bool,
 
     /// Instant when the process started, for total startup time reporting.
@@ -83,7 +86,7 @@ impl Default for ServerConfig {
             ssl_certfile: None,
             ssl_ca_certs: None,
             startup_instant: None,
-            tool_spans_enabled: true,
+            tool_spans_enabled: false,
         }
     }
 }

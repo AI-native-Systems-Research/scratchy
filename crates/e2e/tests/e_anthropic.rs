@@ -24,7 +24,7 @@ async fn start_smollm() -> (TestServer, Client) {
 }
 
 /// Start SmolLM with per-tool relocatable spans explicitly on or off — the two
-/// arms of `scr serve --no-tool-spans`.
+/// arms of `scr serve --tool-spans` (off is the default).
 async fn start_smollm_tool_spans(enabled: bool) -> (TestServer, Client) {
     let server = TestServer::builder(TestModels::SMOLLM)
         .with_tool_spans(enabled)
@@ -427,7 +427,7 @@ async fn test_anthropic_empty_messages() {
 }
 
 // ===========================================================================
-// Tool spans A/B (`scr serve --no-tool-spans`)
+// Tool spans A/B (`scr serve --tool-spans`)
 // ===========================================================================
 
 /// Both arms of the A/B must serve the same tools-bearing requests.
@@ -443,7 +443,8 @@ async fn test_anthropic_empty_messages() {
 /// renders tool schemas as plain `Tool: …` text instead of through the model's
 /// native tool template, so on Granite 3.3 the same request is 105 prompt
 /// tokens and comes back as a `text` block, against 218 tokens and a real
-/// `tool_use` block on the flat arm. See the T0.3 notes on issue #162.
+/// `tool_use` block on the flat arm. That is why spans are opt-in rather than
+/// the default. See the T0.3 notes on issue #162.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_tool_spans_both_arms_serve_the_corpus() {
@@ -498,12 +499,12 @@ async fn test_tool_spans_arms_agree_on_model_less_requests() {
     }
 }
 
-/// The off arm must still serve tools-bearing requests — it takes the flat chat
+/// The default arm must serve tools-bearing requests — it takes the flat chat
 /// path, so a `tool_use` block can only come from the tool parser, never from
 /// the spans renderer.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_no_tool_spans_still_serves_tools_requests() {
+async fn test_default_arm_serves_tools_requests() {
     let (_server, client) = start_smollm_tool_spans(false).await;
 
     let resp = client
