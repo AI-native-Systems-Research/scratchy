@@ -376,9 +376,9 @@ impl SpecializedPipelineCache {
         // GUARD (threadgroup-overflow class): a kernel whose total threadgroup
         // memory exceeds the device limit faults at GPU exec with a cryptic
         // `MTLCommandBufferStatus(5)`. Catch it here at pipeline build with the
-        // FUNCTION NAME instead. Runtime-compiled MPP/NAX kernels' threadgroup
-        // size (incl. matmul2d internals) isn't knowable to Rust at compile
-        // time, so this build-time assert is the earliest possible guard.
+        // FUNCTION NAME instead. MPP/NAX kernels' threadgroup size (incl.
+        // matmul2d internals) isn't knowable to Rust at compile time, so this
+        // pipeline-build assert is the earliest possible guard.
 
         let mut map = self.pipelines.lock().unwrap();
         Ok(map.entry(key.clone()).or_insert(pipeline).clone())

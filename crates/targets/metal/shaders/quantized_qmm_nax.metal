@@ -85,8 +85,7 @@ constant int QMM_NUM_EXPERTS [[function_constant(4)]];
 // path does NOT run → uninitialized table → garbage under MTL4. E2M1 =
 // 1 sign · 2 exp · 1 mantissa: mag = (e==0) ? m·0.5 : (1+m·0.5)·2^(e-1)
 // → {0,.5,1,1.5,2,3,4,6} for codes 0..7, bit-identical to the old LUT.
-// (NAX is runtime-source-compiled, but keep this consistent so all
-// three nvfp4 decoders share one ctor-free definition.)
+// All three nvfp4 decoders share this one ctor-free definition.
 inline float nvfp4_decode(uint code) {
   uint e = (code >> 1u) & 0x3u;
   uint m = code & 0x1u;
