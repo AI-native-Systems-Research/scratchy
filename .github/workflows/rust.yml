@@ -128,18 +128,15 @@ jobs:
       # changes the forward macro's codegen and has `not(nccl)` paths of its
       # own, so swapping it in would drop coverage, and every model expanded
       # twice would double that step. One small model is the whole Rust
-      # surface here. The worker's `--all-targets` lints its test build under
-      # `nccl` (the tests themselves run featureless, below: a `cuda` test
-      # binary can't link without the kernels SCRATCHY_SKIP_CUDA_KERNELS
-      # skips); serving-api's test build carries lint debt no job has ever
-      # linted, so its lib only.
+      # surface here. `--all-targets` lints both crates' test builds too (the
+      # tests themselves run featureless, below: a `cuda` test binary can't
+      # link without the kernels SCRATCHY_SKIP_CUDA_KERNELS skips). The model
+      # feature resolves through the worker's dependency, so scratchy-models
+      # is built, not selected: its own test targets stay out of this step.
       - name: Clippy (nccl)
-        run: |
-          cargo clippy -p scratchy-serving-api -p scratchy-models \
-            --features scratchy-serving-api/nccl,scratchy-models/smollm2-135m \
-            -- -D warnings
-          cargo clippy -p scratchy-serving-worker --all-targets \
-            --features nccl,scratchy-models/smollm2-135m -- -D warnings
+        run: cargo clippy -p scratchy-serving-api -p scratchy-serving-worker --all-targets
+          --features scratchy-serving-api/nccl,scratchy-models/smollm2-135m
+          -- -D warnings
 
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no
