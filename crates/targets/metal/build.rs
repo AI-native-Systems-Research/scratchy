@@ -130,7 +130,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=tests");
-    println!("cargo:rerun-if-changed=benches");
 
     // 🛑 METAL 4 ONLY — FOR ALL TIME. Fail the build if classic-MTL3 dispatch
     // reappears anywhere in this backend. Runs on EVERY host (before the
@@ -291,7 +290,7 @@ fn write_steel_paged_kernels_rs(out_dir: &std::path::Path) {
 /// `MTL4CommandBuffer::beginCommandBufferWithAllocator` and NEVER calls
 /// `MTLCommandQueue::commandBuffer()`, so the exact substring `.commandBuffer()`
 /// is a precise, false-positive-free marker of classic MTL3. Any dispatch must
-/// go through `crate::mtl4_dispatch` (tests / benches / cost-sweep) or
+/// go through `crate::mtl4_dispatch` (tests / cost-sweep) or
 /// `interpreter::metal::run_bucket_mtl4` (production). Do NOT reintroduce classic
 /// command buffers — there is no exception (turboquant, the last holdout, was
 /// ported 2026-06-29). This is the build-time enforcement of the METAL-4-only
@@ -299,7 +298,7 @@ fn write_steel_paged_kernels_rs(out_dir: &std::path::Path) {
 fn guard_no_classic_mtl3(manifest_dir: &std::path::Path) {
     const BANNED: &str = ".commandBuffer()";
     let mut offenders = Vec::new();
-    for root in ["src", "tests", "benches", "cost-sweep/src"] {
+    for root in ["src", "tests", "cost-sweep/src"] {
         scan_for_banned(&manifest_dir.join(root), BANNED, &mut offenders);
     }
     if !offenders.is_empty() {
@@ -309,7 +308,7 @@ fn guard_no_classic_mtl3(manifest_dir: &std::path::Path) {
              The metal backend is METAL 4 ONLY, for all time. MTL4 builds command\n\
              buffers with `device.newCommandBuffer()` + `beginCommandBufferWithAllocator`,\n\
              NEVER `queue.commandBuffer()`. Dispatch through `crate::mtl4_dispatch`\n\
-             (tests/benches/cost-sweep) or `run_bucket_mtl4` (production).\n\n\
+             (tests/cost-sweep) or `run_bucket_mtl4` (production).\n\n\
              Offending site(s):\n  {sites}\n\n"
         );
     }
@@ -320,7 +319,7 @@ fn guard_no_classic_mtl3(manifest_dir: &std::path::Path) {
 /// line comments mentioning the pattern in prose don't trip it.
 fn scan_for_banned(dir: &std::path::Path, banned: &str, out: &mut Vec<String>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return; // dir may not exist (e.g. no benches/) — nothing to scan
+        return; // dir may not exist (e.g. no cost-sweep/) — nothing to scan
     };
     for entry in rd.flatten() {
         let path = entry.path();

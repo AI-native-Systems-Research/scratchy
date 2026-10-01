@@ -69,7 +69,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
-criterion = "0.8"
 # RMSNorm gain-dtype regression test (rmsnorm_scale_dtype_test): builds a tiny
 # bf16 safetensors fixture and loads it through the real metal loader.
 half = { workspace = true }
@@ -77,11 +76,3 @@ safetensors = { workspace = true }
 
 # build.rs uses only `xcrun` via std::process::Command — no crate
 # dependencies needed.
-
-[[bench]]
-name = "attention_benchmark"
-harness = false
-
-[[bench]]
-name = "fused_kernels_benchmark"
-harness = false
