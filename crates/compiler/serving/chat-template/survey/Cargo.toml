@@ -1,0 +1,29 @@
+[package]
+name = "scratchy-chat-template-survey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# ⛔ THIS CRATE IS THE EVIDENCE BEHIND SPEC.md, NOT PART OF THE PRODUCT.
+# Every quantitative claim in ../SPEC.md — "20 of 23", "21 of 23 factor",
+# "18,924 B of Jinja, nine declared lines" — came from running this. A spec whose
+# numbers cannot be re-derived is a spec nobody can argue with, so this stays
+# runnable rather than being deleted once the numbers are written down.
+#
+# It is deliberately NOT the leaf compiler crate and NOT a test:
+#   - not the leaf crate, because it fetches over the network and pulls deps the
+#     published crate must not carry;
+#   - not a test, because a test that needs the network is a test that fails on a
+#     train. Run the binary on demand. The one claim that CAN be checked hermetically
+#     -- the `tojson` serialization target of SPEC.md 6.1 -- is a real test in
+#     tests/tojson_target.rs and runs on every commit.
+
+[dependencies]
+# The ORACLE, and the whole point: feature set must match crates/serving/api's
+# exactly, or the survey classifies a different language than production renders.
+minijinja = { version = "=2.24.0", features = ["builtins", "json", "loader"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+sha2 = "0.10"
