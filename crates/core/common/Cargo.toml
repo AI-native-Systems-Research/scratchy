@@ -32,6 +32,8 @@ tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# `InMemorySpanExporter`, for the `otel` tests.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 # ⛔ THE KV ARITHMETIC PROOFS IN `kv.rs` LIVE BEHIND `cfg(kani)` AND NEED NO FEATURE FLAG — unlike
 # scratchy-subtile's, which are invisible without `--features spyre` (see that crate's manifest, and

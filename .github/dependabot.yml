@@ -14,6 +14,13 @@ updates:
         patterns:
           - "arrow"
           - "parquet"
+      # The OTLP exporter and the tracing layer each speak one
+      # opentelemetry_sdk's traits: bumped apart, the `otel` feature stops
+      # compiling.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
