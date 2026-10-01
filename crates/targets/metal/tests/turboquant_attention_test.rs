@@ -627,7 +627,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             tg(hd, 1, 1),
         );
     }
-    batch.commit(true);
+    batch.commit();
 
     // The attention's scratch: NaN except the keys this step's writer wrote.
     let nan = c.dtype.bits(f32::NAN);
@@ -792,7 +792,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             tg(32, 1, 1),
         );
     }
-    batch.commit(true);
+    batch.commit();
     let got: Vec<f32> = read::<u16>(&out, n_q * c.num_q_heads * hd)
         .into_iter()
         .map(|b| c.dtype.value(b))
@@ -1363,7 +1363,7 @@ fn check_per_row(c: Case, kernel: PerRow) {
         grid,
         threads,
     );
-    batch.commit(true);
+    batch.commit();
     let got: Vec<f32> = read::<u16>(&out, n_q * nq * hd)
         .into_iter()
         .map(|b| c.dtype.value(b))

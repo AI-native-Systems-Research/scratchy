@@ -304,7 +304,7 @@ struct RopeMk {
 // Body shared by both dispatch kernels and the megakernel adapter. `MK`: the barrier-uniform
 // form — every lane runs the K barrier; a lane of no real (virtual threadgroup, q_head, d) or of a
 // q_head owning no kv_head writes nothing. `QP`: the arena rows' pointer type, `KP` the KV
-// pages' (device-coherent in the megakernel).
+// pages'.
 template <typename T, typename C, bool MK, typename QP, typename KP>
 METAL_FUNC void rope_append_body(
     QP q_inout, QP k_inout, QP v_inout, device const T* cos_sin, device const uint* positions,
@@ -415,7 +415,7 @@ METAL_FUNC void rope_append_body(
     v_dst[d] = v_row[d];
 }
 
-// Megakernel adapter: q / k / v (0-2) and the KV pages (via 6 / 7) device-coherent.
+// Megakernel adapter: the barrier-uniform body over the virtual threadgroup's lanes.
 template <typename T, typename C>
 MK_FUNC void mk_rope_append(thread const MkStep& s, MkLane l, threadgroup uchar*) {
     rope_append_body<T, C, true, mk_ptr<T>, mk_ptr<T>>(
@@ -448,7 +448,7 @@ kernel void rope_append_##tag##_specialized(                                    
 }
 #else
 #define INST_ROPE_APPEND(tag, T)                                                            \
-  MK_ADAPTER(rope_append_##tag##_specialized, 0, 0xc7, (mk_rope_append<T, RopeMk<MK_C>>), \
+  MK_ADAPTER(rope_append_##tag##_specialized, 0, (mk_rope_append<T, RopeMk<MK_C>>),       \
              ROPE_CONSTS)
 #endif
 INST_ROPE_APPEND(f16, half)
@@ -604,7 +604,7 @@ inline float rope_norm_rms_256(
 // Body shared by the dispatch kernels and the megakernel adapter. `MK`: the barrier-uniform
 // form — every lane runs every norm barrier; a lane of no real (virtual threadgroup, q_head, d)
 // or of a q_head owning no kv_head writes nothing (its norms reduce rows no one stores). `QP` /
-// `IP`: the arena pointer types, `KP` the KV pages' (device-coherent in the megakernel);
+// `IP`: the arena pointer types, `KP` the KV pages';
 // `scratch` / `q_tg` / `k_tg` the kernel's threadgroup arrays.
 template <typename T_act, typename T_scale, typename C, bool MK, typename QP, typename IP,
           typename KP>
@@ -738,8 +738,8 @@ METAL_FUNC void rope_append_normed_body(
     v_dst[d] = v_final;
 }
 
-// Megakernel adapter: q (0), k (1), v (2) and the KV pages (via 6 / 7) device-coherent; one
-// virtual threadgroup's scratch[256] float + q_tg[512] + k_tg[512] T_act in its region.
+// Megakernel adapter: one virtual threadgroup's scratch[256] float + q_tg[512] + k_tg[512] T_act
+// in its region.
 template <typename T_act, typename T_scale, typename C>
 MK_FUNC void mk_rope_append_normed(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
     threadgroup uchar* region = mk_region(s, l, tg);
@@ -788,7 +788,7 @@ template <typename T_act, typename T_scale>
 #else
 // scratch[256] float + q_tg[512] + k_tg[512] of the activation type.
 #define INST_ROPE_APPEND_NORMED(act_tag, act_type, scale_tag, scale_type)                        \
-  MK_ADAPTER(rope_append_normed_##act_tag##_s_##scale_tag##_specialized, 3072, 0xc7,          \
+  MK_ADAPTER(rope_append_normed_##act_tag##_s_##scale_tag##_specialized, 3072,                \
              (mk_rope_append_normed<act_type, scale_type, RopeMk<MK_C>>), ROPE_CONSTS)
 #endif
 

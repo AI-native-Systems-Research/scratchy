@@ -53,9 +53,8 @@ inline void tq_wht_tg(threadgroup float* shared, uint dim, uint elem) {
 // (slot, kv_head); dim threads. Dispatched post-forward over the new slots of
 // one layer's K (and again for V).
 // Body shared by the dispatch kernel and the megakernel adapter. KVP / UP / FP are the pool-page,
-// packed-store and norm-store pointer types (device-coherent in the megakernel: another unit of the
-// same dispatch wrote the page and reads the stores). MK = barrier-uniform form: no early return,
-// every access predicated on `live`, every thread runs every barrier.
+// packed-store and norm-store pointer types. MK = barrier-uniform form: no early return, every
+// access predicated on `live`, every thread runs every barrier.
 template <typename T, bool MK, typename KVP, typename UP, typename FP, typename CU, typename CF>
 METAL_FUNC void tq_compress_body(
     device const uint64_t* chunk_table, device const uint* slots, device const float* signs,
@@ -125,8 +124,7 @@ METAL_FUNC void tq_compress_body(
 }
 
 // Megakernel adapter: the runtime scalars the dispatch kernel reads from its `constant` bindings
-// (Inline bindings, 7..23) are read from the same inline buffer by address; the pool pages (via
-// the chunk table, 0) and the packed / norm stores (5, 6) device-coherent.
+// (Inline bindings, 7..23) are read from the same inline buffer by address.
 template <typename T>
 MK_FUNC void mk_tq_compress_paged(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
     #define TQ_U(i) (*(const device uint*)s.addr[i])
@@ -189,6 +187,6 @@ TQ_INSTANTIATE(tq_compress_paged, "tq_compress_paged", half)
 TQ_INSTANTIATE(tq_compress_paged, "tq_compress_paged_bf16", bfloat)
 #else
 // shared[512] + ns[512] float + idx_shared[512] uint per virtual threadgroup.
-MK_ADAPTER(tq_compress_paged, 6144, 0x61, (mk_tq_compress_paged<half>), MK_NO_CONSTS)
-MK_ADAPTER(tq_compress_paged_bf16, 6144, 0x61, (mk_tq_compress_paged<bfloat>), MK_NO_CONSTS)
+MK_ADAPTER(tq_compress_paged, 6144, (mk_tq_compress_paged<half>), MK_NO_CONSTS)
+MK_ADAPTER(tq_compress_paged_bf16, 6144, (mk_tq_compress_paged<bfloat>), MK_NO_CONSTS)
 #endif

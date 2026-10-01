@@ -14,8 +14,8 @@
 
 using namespace metal;
 
-// Body shared by the dispatch kernel and the megakernel adapter (src / dst coherent there; the
-// sizes are the inline scalars, by reference).
+// Body shared by the dispatch kernel and the megakernel adapter (the sizes are the inline
+// scalars, by reference).
 template <typename SP, typename DP, typename CI>
 METAL_FUNC void slice_trailing_cols_body(SP src, DP dst, CI axis_size, CI top_k, uint2 gid) {
   uint k = gid.x;
@@ -42,5 +42,5 @@ MK_FUNC void mk_slice_trailing_cols_u32(thread const MkStep& s, MkLane l, thread
       src, dst, axis_size, top_k, gid);
 }
 #else
-MK_TAIL(slice_trailing_cols_u32, 0x3, (mk_slice_trailing_cols_u32), MK_NO_CONSTS)
+MK_TAIL(slice_trailing_cols_u32, (mk_slice_trailing_cols_u32), MK_NO_CONSTS)
 #endif

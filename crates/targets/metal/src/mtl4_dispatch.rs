@@ -10,6 +10,9 @@
 //! lifecycle — instead of a classic `queue.commandBuffer()` encoder.
 //! Scalars that the classic path passed via `setBytes` become tiny
 //! address-bound `StorageModeShared` buffers (see [`shared_u32`]).
+//!
+//! Every MTL4 commit whose results a caller reads — these helpers' and the
+//! worker pool's — goes through [`commit_and_wait`].
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -30,10 +33,9 @@ pub type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 /// still using — the caller frees, reuses or unpins them under it, and a process that then exits
 /// leaves the kernel running on the GPU. So a kernel that never ends holds this wait, and the
 /// thread, until the system ends its command buffer or the process is killed; each minute the wait
-/// goes on is reported. (A command buffer that failed with an out-of-memory error has been seen to
-/// reach its signal, with the error in the commit feedback — see the pool's `submit`; one ended by
-/// the GPU watchdog has not been observed here.)
-pub fn wait_drained(event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
+/// goes on is reported. Reaching the signal says nothing about whether the command buffers
+/// completed: see [`commit_and_wait`].
+fn wait_drained(event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
     let started = std::time::Instant::now();
     while !event.waitUntilSignaledValue_timeoutMS(value, 60_000) {
         eprintln!(
@@ -41,6 +43,129 @@ pub fn wait_drained(event: &ProtocolObject<dyn MTLSharedEvent>, value: u64) {
             started.elapsed(),
         );
     }
+}
+
+/// How long [`commit_and_wait`] waits for a commit's feedback once the GPU has signalled past the
+/// commit. Metal delivers it tens of microseconds after the signal; a report that has not come
+/// within this is not coming.
+const FEEDBACK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why a command buffer did not complete: the cause its commit feedback reports (Metal's
+/// `MTL4CommandQueueError` codes), or no feedback at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandFailure {
+    Timeout,
+    NotPermitted,
+    /// What a command buffer whose working set the GPU cannot hold resident reports (it does not
+    /// run): `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
+    OutOfMemory,
+    DeviceRemoved,
+    AccessRevoked,
+    Internal,
+    /// No error in `MTL4CommandQueueErrorDomain`, or a code the domain does not define: the top
+    /// error's code.
+    Other {
+        code: isize,
+    },
+    /// No feedback within [`FEEDBACK_WAIT`] of the GPU signalling past the commit.
+    Unreported,
+}
+
+impl CommandFailure {
+    /// The cause: the innermost `MTL4CommandQueueErrorDomain` error along `error`'s underlying
+    /// errors. Metal wraps it — a command buffer that ran out of memory reports a code-1
+    /// ("timeout") error whose underlying error is the out-of-memory one.
+    fn of(error: &objc2_foundation::NSError) -> Self {
+        use objc2_metal::MTL4CommandQueueError as E;
+        fn cause(error: &objc2_foundation::NSError) -> Option<isize> {
+            let domain = unsafe { objc2_metal::MTL4CommandQueueErrorDomain };
+            (error.underlyingErrors().iter())
+                .find_map(|under| cause(&under))
+                .or_else(|| error.domain().isEqualToString(domain).then(|| error.code()))
+        }
+        let Some(code) = cause(error) else {
+            return Self::Other { code: error.code() };
+        };
+        match E(code) {
+            E::Timeout => Self::Timeout,
+            E::NotPermitted => Self::NotPermitted,
+            E::OutOfMemory => Self::OutOfMemory,
+            E::DeviceRemoved => Self::DeviceRemoved,
+            E::AccessRevoked => Self::AccessRevoked,
+            E::Internal => Self::Internal,
+            _ => Self::Other { code },
+        }
+    }
+}
+
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other { code } => {
+                write!(f, "the GPU failed the command buffer (error code {code})")
+            }
+            Self::Unreported => write!(
+                f,
+                "Metal sent no report on the command buffer within {FEEDBACK_WAIT:?} of its completion"
+            ),
+            failure => write!(f, "the GPU failed the command buffer: {failure:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CommandFailure {}
+
+/// Commit `cb` alone on `queue`, then signal `event` to `value`; return once the GPU is done with
+/// it ([`wait_drained`]) AND Metal has reported on it — the error of a command buffer that did not
+/// complete. A failed command buffer still reaches the signal (one refused as out of memory under
+/// memory pressure does not run at all, its outputs left as they were), so the report is the only
+/// thing that tells it from a completed one. The commit carries its OWN `MTL4CommitOptions` and
+/// feedback handler: Metal calls a handler once, for the first commit of the options it was added
+/// to — a handler on options reused across commits never hears about any later one.
+pub fn commit_and_wait(
+    queue: &ProtocolObject<dyn MTL4CommandQueue>,
+    cb: &ProtocolObject<dyn MTL4CommandBuffer>,
+    event: &ProtocolObject<dyn MTLSharedEvent>,
+    value: u64,
+) -> Result<(), CommandFailure> {
+    use block2::RcBlock;
+    use objc2_metal::{MTL4CommitFeedback, MTL4CommitOptions};
+    use std::sync::{Arc, Condvar, Mutex};
+    let report: Arc<(Mutex<Option<Result<(), CommandFailure>>>, Condvar)> = Arc::default();
+    let options = MTL4CommitOptions::new();
+    let handler = {
+        let report = Arc::clone(&report);
+        RcBlock::new(
+            move |feedback: std::ptr::NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
+                let outcome = match unsafe { feedback.as_ref() }.error() {
+                    None => Ok(()),
+                    Some(error) => {
+                        // The NSError's userInfo (nested underlying errors) names the faulting
+                        // encoder, which the typed failure cannot carry; `description` renders
+                        // the whole tree.
+                        let tree: Retained<objc2_foundation::NSString> =
+                            unsafe { objc2::msg_send![&*error, description] };
+                        eprintln!("[scratchy-target-metal] GPU command buffer failed: {tree}");
+                        Err(CommandFailure::of(&error))
+                    }
+                };
+                let (slot, reported) = &*report;
+                *slot.lock().expect("commit report") = Some(outcome);
+                reported.notify_one();
+            },
+        )
+    };
+    unsafe { options.addFeedbackHandler(RcBlock::as_ptr(&handler) as _) };
+    let mut cbs = [std::ptr::NonNull::from(cb)];
+    unsafe { queue.commit_count_options(std::ptr::NonNull::from(&mut cbs[0]), 1, &options) };
+    queue.signalEvent_value(ProtocolObject::from_ref(event), value);
+    wait_drained(event, value);
+    let (slot, reported) = &*report;
+    let slot = slot.lock().expect("commit report");
+    let (mut slot, _) = reported
+        .wait_timeout_while(slot, FEEDBACK_WAIT, |outcome| outcome.is_none())
+        .expect("commit report");
+    slot.take().unwrap_or(Err(CommandFailure::Unreported))
 }
 
 /// `StorageModeShared` buffer initialized from `data`.
@@ -129,7 +254,8 @@ fn assert_within_pipeline_cap(pso: &Pipeline, threads_per_threadgroup: MTLSize) 
 }
 
 ///
-/// Returns `false` if the host has no MTL4 queue (caller should skip).
+/// Returns `false` if the host has no MTL4 queue (caller should skip); panics if the GPU fails the
+/// command buffer ([`commit_and_wait`]).
 pub fn dispatch_threadgroups(
     device: &Device,
     pso: &Pipeline,
@@ -178,13 +304,9 @@ pub fn dispatch_threadgroups(
     enc.endEncoding();
     cb.endCommandBuffer();
 
-    let cb_protocol: &ProtocolObject<dyn MTL4CommandBuffer> = &cb;
-    let mut cb_array = [std::ptr::NonNull::from(cb_protocol)];
-    unsafe {
-        queue4.commit_count(std::ptr::NonNull::from(&mut cb_array[0]), 1);
+    if let Err(failure) = commit_and_wait(&queue4, &cb, &event, 1) {
+        panic!("MTL4 dispatch: {failure}");
     }
-    queue4.signalEvent_value(ProtocolObject::from_ref(&*event), 1);
-    wait_drained(&event, 1);
     true
 }
 
@@ -226,20 +348,19 @@ pub fn build_arg_table(
 /// residency set; [`encode`](Self::encode) appends one dispatch (its own
 /// argument table, its buffers made resident, its `setBytes` scalars turned
 /// into address-bound scalar buffers); [`commit`](Self::commit) ends encoding,
-/// commits the residency set, ends the CB, and submits.
+/// commits the residency set, ends the CB, submits and waits.
 ///
 /// MTL4 has NO implicit resource tracking, so every address-bound buffer (and
 /// every buffer the kernel dereferences via a stored `gpuAddress`, e.g. the
 /// paged chunk-data buffers) must be in the committed residency set, and the
-/// scalar buffers / argument tables must stay ALIVE until the GPU drains. The
-/// sync `commit(true)` path event-waits, so `self`'s resources drop only after
-/// completion; the async `commit(false)` path can't wait, so it hands the
-/// resources to a commit-feedback handler that releases them on GPU completion.
+/// scalar buffers / argument tables must stay ALIVE until the GPU drains:
+/// `commit` waits, so `self`'s resources drop only after completion.
 pub struct Mtl4DispatchBatch {
     device: Device,
     queue4: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     res: MetalResidencySet,
-    alloc4: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    /// The command buffer's allocator, alive until it completes.
+    _alloc4: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     cb: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     enc: Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>,
@@ -271,7 +392,7 @@ impl Mtl4DispatchBatch {
             device: device.clone(),
             queue4,
             res,
-            alloc4,
+            _alloc4: alloc4,
             event,
             cb,
             enc,
@@ -348,13 +469,11 @@ impl Mtl4DispatchBatch {
             );
     }
 
-    /// End encoding, commit the residency set, end + submit the command buffer.
-    /// `wait == true` signals a shared event and blocks until the GPU drains
-    /// ([`wait_drained`]: however long that takes). `wait == false` submits fire-and-
-    /// forget — queue ordering guarantees a later dispatch on the same device
-    /// sees the result — and keeps the batch's resources alive via a commit-
-    /// feedback handler that drops them only after GPU completion.
-    pub fn commit(mut self, wait: bool) {
+    /// End encoding, commit the residency set, end + submit the command buffer
+    /// and block until the GPU is done with it ([`commit_and_wait`]: however long
+    /// that takes); `self`'s resources drop only then. Panics if the GPU fails
+    /// the command buffer.
+    pub fn commit(self) {
         self.enc.endEncoding();
         // Commit the now-populated residency set, THEN attach it to the CB
         // (between begin and endCommandBuffer) so the driver wires every bound +
@@ -366,56 +485,9 @@ impl Mtl4DispatchBatch {
         unsafe {
             self.res.attach_to_mtl4_command_buffer(cb_ptr);
         }
-        let cb_protocol: &ProtocolObject<dyn MTL4CommandBuffer> = &self.cb;
-        let cb_nn = std::ptr::NonNull::from(cb_protocol);
         self.cb.endCommandBuffer();
-        if wait {
-            let mut cb_array = [cb_nn];
-            unsafe {
-                self.queue4
-                    .commit_count(std::ptr::NonNull::from(&mut cb_array[0]), 1);
-            }
-            self.queue4
-                .signalEvent_value(ProtocolObject::from_ref(&*self.event), 1);
-            wait_drained(&self.event, 1);
-            // `self` drops here → residency set + pinned buffers + tables freed
-            // AFTER the GPU has drained. Safe.
-        } else {
-            use block2::RcBlock;
-            use objc2_metal::{MTL4CommitFeedback, MTL4CommitOptions};
-            // No host wait: the GPU still references the residency set, the
-            // pinned buffers, and the argument tables. MTL4 does
-            // NOT implicitly retain any of them, so move them into a commit-
-            // feedback handler that fires on completion — its captured handles
-            // (Arc/Retained clones) keep everything alive until the GPU is done.
-            let opts = MTL4CommitOptions::new();
-            let res = self.res.clone();
-            let pins = std::mem::take(&mut self.pins);
-            let tables = std::mem::take(&mut self.tables);
-            let alloc4 = self.alloc4.clone();
-            let queue4 = self.queue4.clone();
-            let cb_keep = self.cb.clone();
-            let block = RcBlock::new(
-                move |_fb: std::ptr::NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
-                    // Touch every captured handle so the closure owns them; the
-                    // handler runs once on GPU completion, then Metal releases
-                    // the block and these handles drop.
-                    let _ = (&res, &pins, &tables, &alloc4, &queue4, &cb_keep);
-                },
-            );
-            unsafe {
-                opts.addFeedbackHandler(RcBlock::as_ptr(&block) as _);
-            }
-            let mut cb_array = [cb_nn];
-            unsafe {
-                self.queue4.commit_count_options(
-                    std::ptr::NonNull::from(&mut cb_array[0]),
-                    1,
-                    &opts,
-                );
-            }
-            // Drop our `block` handle: Metal retained it in `addFeedbackHandler`
-            // and releases it after firing, dropping the captured resources.
+        if let Err(failure) = commit_and_wait(&self.queue4, &self.cb, &self.event, 1) {
+            panic!("MTL4 dispatch batch: {failure}");
         }
     }
 }

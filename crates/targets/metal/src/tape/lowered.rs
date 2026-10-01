@@ -744,10 +744,11 @@ impl RuntimeGate {
 pub enum TapePlay {
     /// One MTL4 dispatch per command.
     Dispatch,
-    /// Every megakernel run the tape carries as one persistent kernel; the commands outside the
-    /// runs are dispatched as [`Self::Dispatch`] dispatches them.
+    /// In the context a bucket's [`MegakernelTape`] was planned under, its segment kernels — one
+    /// launch per segment instance — in place of the commands; everywhere else as
+    /// [`Self::Dispatch`].
     #[default]
-    Megakernel,
+    Segmented,
 }
 
 impl DispatchShape {
@@ -2033,8 +2034,8 @@ pub struct ClassedTape {
     pub tape: LoweredMetalTape,
     pub const_patches: &'static [CapPatch],
     pub scratch_patches: &'static [ScratchPatch],
-    /// The decode megakernel, one per KV mode — baked for the bucket-1, M5, direct-addressing
-    /// variant only; empty everywhere else.
+    /// The decode megakernel, one per KV mode — baked for the bucket-1, direct-addressing variant
+    /// of every class; empty everywhere else.
     pub megakernel: &'static [MegakernelTape],
 }
 
@@ -2125,51 +2126,86 @@ impl ClassedTape {
     }
 }
 
-// ── The decode megakernel (compiled per bucket-1 tape at expansion, launched by the worker) ────
+// ── The decode megakernel (compiled per bucket-1 tape at expansion, played by the worker) ─────
 
-/// A span of [`LoweredMetalTape::commands_expanded`]: `[start, end)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct CommandSpan {
-    pub start: u32,
-    pub end: u32,
-}
-
-/// The decode megakernel of one bucket-1 tape, planned under [`GateCtx::decode_one`]: the WHOLE
-/// decode forward as ONE generated kernel — every command the gates admit, as straight-line
-/// adapter calls with every constant a literal, the tape's layer loops kept rolled — launched once
-/// per forward in place of `commands`.
+/// The decode megakernel of one bucket-1 tape, planned under [`GateCtx::decode_one`]: the
+/// decode forward as generated SEGMENT kernels — each
+/// a run of the admitted commands in which no threadgroup waits on another, as straight-line
+/// adapter calls with every constant a literal — one library holding one kernel per segment of
+/// the tape's rolled text. Played in that context in place of the commands: one launch per
+/// segment instance, in the order the tape's own loops expand.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct MegakernelTape {
     /// Names the library `source` compiles to (a content hash): workers of one load share it.
     pub library: &'static str,
-    /// The generated kernel, which follows the adapters' bodies in its library.
+    /// The generated kernels, which follow the adapters' bodies in their library.
     pub source: &'static str,
     /// The library, compiled at build time as every shader is ([`crate::msl_offline`]): the
     /// adapters' bodies with `source` appended.
     pub metallib: &'static [u8],
-    /// Its `[[kernel]]` host name.
-    pub kernel: &'static str,
-    /// The expanded commands the launch replaces (the admitted ones run inside it).
-    pub commands: CommandSpan,
-    /// Every baked command the kernel plays, in tape order.
+    /// The segment kernels, in the order the rolled tape first reaches them.
+    pub segments: &'static [MkSegment],
+    /// Every baked command the kernels play, in tape order.
     pub steps: &'static [MkKernelStep],
-    /// Addresses (`u64`) the kernel's address table holds.
+    /// Addresses (`u64`) the kernels' address table holds.
     pub table_len: u32,
-    /// Grid barriers one launch crosses, loops played out.
-    pub grid_barriers: u32,
-    /// The kernel's function constants the load supplies.
+    /// The kernels' function constants the load supplies.
     pub load_constants: &'static [MkLoadConstant],
 }
 
-/// A baked command the kernel plays: `baked` indexes [`LoweredMetalTape::commands`]; its `k`-th
-/// expanded instance (loop iteration) reads binding `i`'s address at table entry
-/// `table_at + k · row_len + i`. Named, so the load checks it plays what the bake saw.
+/// A segment kernel of a [`MegakernelTape`]: `kernel` plays the segment each expanded instance of
+/// the baked command `opens` starts — one launch per instance. Instance `k` binds the address
+/// table's block `[table_at + k · block_len, table_at + (k + 1) · block_len)`, so one kernel plays
+/// every iteration of the loop around it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkSegment {
+    pub kernel: &'static str,
+    pub opens: u32,
+    pub table_at: u32,
+    pub block_len: u32,
+    pub cut: MkCut,
+}
+
+/// Why a segment starts where it does (the plan's `Cut`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum MkCut {
+    /// The forward's first segment.
+    Start,
+    /// A rolled loop's iteration starts, or the loop ended.
+    Break,
+    /// Its first step waits on results one threadgroup cannot order: of the units these steps
+    /// ([`MegakernelTape::steps`]) open, in the segment before.
+    Waits(&'static [u32]),
+}
+
+/// A baked command a segment kernel plays: `baked` indexes [`LoweredMetalTape::commands`]; its
+/// `k`-th expanded instance (loop iteration) reads binding `i`'s address at table entry
+/// `table_at + k · block_len + row_at + i` of its segment. Named, so the load checks it plays
+/// what the bake saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct MkKernelStep {
     pub baked: u32,
     pub function: &'static str,
-    pub table_at: u32,
+    /// Its segment, in [`MegakernelTape::segments`].
+    pub segment: u32,
+    pub row_at: u32,
     pub row_len: u32,
+    /// Where its unit runs in the segment's launch.
+    pub place: MkPlace,
+    /// On the step opening a unit: the steps opening the units of the same segment it waits on.
+    pub after: &'static [u32],
+}
+
+/// Where a step's unit runs in its segment's launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum MkPlace {
+    /// Its items spread over the launch's threadgroups.
+    Spread,
+    /// One threadgroup plays it: the segment's lane group `g` — units that wait on one another
+    /// share one.
+    Lane(u32),
+    /// Every threadgroup plays it for itself.
+    Everywhere,
 }
 
 /// A scalar the load decides — the KV capacity's patches, the device's TurboQuant decode heads —
@@ -2240,8 +2276,6 @@ pub struct MkAdapter {
     pub library: &'static str,
     pub function: &'static str,
     pub tg_bytes: VtgBytes,
-    /// Bindings the adapter reads or writes device-coherently.
-    pub coherent: BindingMask,
     /// Threads one item plays at most: [`MK_THREADS`], or fewer for a streaming body that streams
     /// its weights faster with fewer live threads per core (`MK_STREAM` in the shader, measured).
     pub item_threads: u32,
@@ -2290,19 +2324,16 @@ impl MkAdapter {
     }
 }
 
-/// Threads of one persistent (physical) threadgroup of the megakernel.
+/// Threads of one (physical) threadgroup of a segment's launch.
 pub const MK_THREADS: u32 = 1024;
 /// Virtual threadgroups start on simdgroup boundaries.
 pub const MK_SIMD_WIDTH: u32 = 32;
-/// Threadgroup memory the steps of one persistent threadgroup may use: the 32 KiB a threadgroup
-/// has, less the 16 bytes the generated kernel keeps for its barrier flag.
-pub const MK_TG_MEMORY: u32 = 32 * 1024 - 16;
-/// The function constants of every generated kernel (`megakernel.metal`): the threadgroups a
-/// launch asks for `MK_P`, the grid-barrier spin bound `MK_SPIN_LIMIT` and the check-in's wait
-/// `MK_CHECKIN_POLLS`; the load constants ([`MkLoadConstant`]) follow from `MK_FC_LOAD`.
+/// Threadgroup memory the steps of one physical threadgroup may use: the 32 KiB a threadgroup has.
+pub const MK_TG_MEMORY: u32 = 32 * 1024;
+/// The function constants of every generated kernel (`megakernel.metal`): the threadgroups every
+/// launch runs, `MK_P` (the GPU's cores); the load constants ([`MkLoadConstant`]) follow from
+/// `MK_FC_LOAD`.
 pub const MK_FC_P: ConstSlot = ConstSlot(4096);
-pub const MK_FC_SPIN_LIMIT: ConstSlot = ConstSlot(4097);
-pub const MK_FC_CHECKIN_POLLS: ConstSlot = ConstSlot(4098);
 pub const MK_FC_LOAD: ConstSlot = ConstSlot(4200);
 
 /// How a step packs into items of at most [`MK_THREADS`] threads (its adapter's `item_threads`).
@@ -2362,8 +2393,8 @@ pub fn mk_geometry(
     })
 }
 
-/// Why the megakernel cannot bake, load or finish — never a silent fallback: a bucket-1 decode
-/// tape the megakernel cannot play fails the build.
+/// Why the megakernel cannot bake or load — never a silent fallback: a bucket-1 decode tape the
+/// megakernel cannot play fails the build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MegakernelError {
     /// A decode command whose kernel has no megakernel adapter (`MK_ADAPTER` line).
@@ -2385,9 +2416,6 @@ pub enum MegakernelError {
         symbol: &'static str,
         target: PatchTarget,
     },
-    /// A location the plan shares between threadgroups is bound by an adapter that does not
-    /// access it device-coherently.
-    IncoherentShared { symbol: &'static str, binding: u8 },
     /// A command binds a location its step row's dataflow does not state.
     UnstatedLocation { symbol: &'static str, binding: u8 },
     /// Two commands touch the KV codec's shared scratch with neither ordered after the other.
@@ -2395,9 +2423,9 @@ pub enum MegakernelError {
         first: &'static str,
         second: &'static str,
     },
-    /// A step's threadgroup, or the persistent threadgroup the pipeline can launch.
+    /// A step's threadgroup, or the threadgroup a segment kernel's pipeline can launch.
     ThreadCap { needed: u32, cap: u32 },
-    /// Threadgroup memory beyond what a persistent threadgroup has.
+    /// Threadgroup memory beyond what one threadgroup has.
     ThreadgroupMemory { needed: u32, budget: u32 },
     /// A command's constant disagrees in type with the adapter's declared constant.
     ConstantType {
@@ -2417,14 +2445,8 @@ pub enum MegakernelError {
     LoadConstant { symbol: &'static str },
     /// The generated library failed to compile at load.
     Compile(String),
-    /// The launch's `ordinal`-th grid barrier (site `site` of the kernel text) gave up waiting
-    /// (`arrived` of its `of` participants).
-    Stall {
-        site: u32,
-        ordinal: u32,
-        arrived: u32,
-        of: u32,
-    },
+    /// The GPU's cores — the threadgroups every launch runs — are unknown.
+    NoGpuCores,
 }
 
 impl std::fmt::Display for MegakernelError {
@@ -2451,11 +2473,6 @@ impl std::fmt::Display for MegakernelError {
             Self::LoadPatch { symbol, target } => write!(
                 f,
                 "megakernel: `{symbol}`: load patch {target:?} is not a function constant"
-            ),
-            Self::IncoherentShared { symbol, binding } => write!(
-                f,
-                "megakernel: `{symbol}` binds a location threadgroups share at {binding}, which \
-                 its adapter does not access device-coherently"
             ),
             Self::UnstatedLocation { symbol, binding } => write!(
                 f,
@@ -2492,16 +2509,7 @@ impl std::fmt::Display for MegakernelError {
                 "megakernel: a load constant of `{symbol}` is not on its materialized command"
             ),
             Self::Compile(e) => write!(f, "megakernel: the generated library: {e}"),
-            Self::Stall {
-                site,
-                ordinal,
-                arrived,
-                of,
-            } => write!(
-                f,
-                "megakernel: grid barrier {ordinal} (site {site}) gave up ({arrived} of its {of} \
-                 participants arrived)"
-            ),
+            Self::NoGpuCores => write!(f, "megakernel: the GPU's core count is unknown"),
         }
     }
 }

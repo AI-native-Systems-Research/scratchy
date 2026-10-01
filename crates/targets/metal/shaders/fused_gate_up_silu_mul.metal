@@ -270,7 +270,7 @@ struct FusedMlpDecodeFc {
 
 // Body shared by the dispatch kernels and the megakernel adapter, after the caller's `M == 1`
 // check. `MK` = played inside the megakernel: a thread past the rows (`live` false) skips the
-// work instead of returning, so every thread of the persistent threadgroup reaches the
+// work instead of returning, so every thread of the megakernel's threadgroup reaches the
 // reduction's barrier. The caller declares the per-thread state — the zeroed TM accumulators
 // `gate_result` / `up_result` and the TN staging buffers — and `tgp_gate` / `tgp_up`, the
 // reduction's `BN * (blockM + TM)` floats each.
@@ -429,8 +429,8 @@ METAL_FUNC void fused_mlp_decode_body(
     }
 }
 
-// Megakernel adapter: one virtual threadgroup of 256 threads per dispatch threadgroup; output (0)
-// and input (1) device-coherent; the two reductions (2 × 64 floats) in its region.
+// Megakernel adapter: one virtual threadgroup of 256 threads per dispatch threadgroup; the two
+// reductions (2 × 64 floats) in its region.
 template <typename T, typename C>
 MK_FUNC void mk_fused_mlp_decode(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
     thread float gate_result[4] = {0};
@@ -473,7 +473,7 @@ MK_FUNC void mk_fused_mlp_decode(thread const MkStep& s, MkLane l, threadgroup u
   }
 #else
 #define INST_FUSED_MLP_DECODE(tag, T)                                                     \
-  MK_ADAPTER(fused_gate_up_silu_mul_decode_##tag##_specialized, 512, 0x3,                 \
+  MK_ADAPTER(fused_gate_up_silu_mul_decode_##tag##_specialized, 512,                      \
              (mk_fused_mlp_decode<T, MK_C>), FUSED_MLP_DECODE_CONSTS)
 #endif
 

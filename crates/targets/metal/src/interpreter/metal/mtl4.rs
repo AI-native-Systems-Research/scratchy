@@ -34,8 +34,8 @@ pub const MTL4_MAX_BUFFER_BINDS: usize = 31;
 pub struct Mtl4Step {
     /// Kernel id of this step's dispatches (one kernel per Dispatch step;
     /// coalescing requires same pipeline = same kernel). Used for
-    /// the per-dispatch timing print label.
-    pub kernel: super::lowered::KernelId,
+    /// the per-dispatch timing print label. `None`: a segment kernel.
+    pub kernel: Option<super::lowered::KernelId>,
     pub pipeline: ComputePipelineState,
     pub tables: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
     pub dispatches: Vec<(MTLSize, MTLSize)>,

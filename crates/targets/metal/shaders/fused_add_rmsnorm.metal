@@ -185,7 +185,7 @@ METAL_FUNC void fused_add_rmsnorm_body(RP residual, DP delta, const device T_sca
     }
 }
 
-// Megakernel adapter: residual (0) and delta (1) device-coherent.
+// Megakernel adapter: one virtual threadgroup per dispatch row, its reduction in the region.
 template <typename T_act, typename T_scale, typename C>
 MK_FUNC void mk_fused_add_rmsnorm(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
     fused_add_rmsnorm_body<T_act, T_scale, C>((mk_ptr<T_act>)s.addr[0], (mk_ptr<T_act>)s.addr[1],
@@ -238,7 +238,7 @@ template <typename T_act, typename T_scale>
 // Megakernel mode: the same instantiation lines name the adapters (the dispatch kernel's
 // `shared_sum[1024]` per virtual threadgroup).
 #define INST_FUSED_ARN(act_tag, act_type, scale_tag, scale_type)                          \
-  MK_ADAPTER(fused_add_rmsnorm_##act_tag##_s_##scale_tag##_specialized, 4096, 0x3,     \
+  MK_ADAPTER(fused_add_rmsnorm_##act_tag##_s_##scale_tag##_specialized, 4096,          \
              (mk_fused_add_rmsnorm<act_type, scale_type, MK_C>), FUSED_ARN_CONSTS)
 #endif
 
@@ -376,7 +376,7 @@ METAL_FUNC void norm_add_scalar_mul_body(DP delta, RP residual, OP out,
     }
 }
 
-// Megakernel adapter: delta (0), residual (1) and out (2) device-coherent.
+// Megakernel adapter: one virtual threadgroup per dispatch row, its reduction in the region.
 template <typename T_act, typename T_scale, typename C>
 MK_FUNC void mk_norm_add_scalar_mul(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
     norm_add_scalar_mul_body<T_act, T_scale, C>(
@@ -412,7 +412,7 @@ template <typename T_act, typename T_scale>
       norm_add_scalar_mul_impl<act_type, scale_type>;
 #else
 #define INST_NORM_ADD_SCALAR_MUL(act_tag, act_type, scale_tag, scale_type)                \
-  MK_ADAPTER(norm_add_scalar_mul_##act_tag##_s_##scale_tag##_specialized, 4096, 0x7,     \
+  MK_ADAPTER(norm_add_scalar_mul_##act_tag##_s_##scale_tag##_specialized, 4096,          \
              (mk_norm_add_scalar_mul<act_type, scale_type, MK_C>), FUSED_ARN_CONSTS)
 #endif
 

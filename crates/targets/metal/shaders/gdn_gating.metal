@@ -49,7 +49,7 @@ METAL_FUNC void gdn_gating_body(FP g_out, FP beta_out, IP a, IP b, const device 
   beta_out[gid] = 1.0f / (1.0f + exp(-bv));
 }
 
-// Megakernel adapter: g_out (0), beta_out (1), a (2) and b (3) device-coherent.
+// Megakernel adapter: one lane per dispatch thread.
 template <typename T, typename C>
 MK_FUNC void mk_gdn_gating(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   const uint gid = mk_thread_in_grid(l).x;
@@ -88,7 +88,7 @@ template <typename T>
       uint gid [[thread_position_in_grid]]);
 #else
 #define INST_GDN_GATING(dtype_tag, mtl_type) \
-  MK_ADAPTER(gdn_gating_##dtype_tag, 0, 0xf, (mk_gdn_gating<mtl_type, MK_C>), GDN_GATING_CONSTS)
+  MK_ADAPTER(gdn_gating_##dtype_tag, 0, (mk_gdn_gating<mtl_type, MK_C>), GDN_GATING_CONSTS)
 #endif
 
 INST_GDN_GATING(f16,  half)

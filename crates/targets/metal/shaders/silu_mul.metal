@@ -59,8 +59,7 @@ METAL_FUNC void gelu_mul_body(OP out, IP gate, IP up, uint gid) {
   out[gid] = static_cast<T>(gelu_g * u);
 }
 
-// Megakernel adapters: one thread per element as the 1-D dispatch lays them out; out (0), gate
-// (1) and up (2) device-coherent.
+// Megakernel adapters: one thread per element as the 1-D dispatch lays them out.
 template <typename T, typename C>
 MK_FUNC void mk_silu_mul(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   const uint gid = l.tg_pos.x * l.tpg.x + l.tid3.x;
@@ -98,7 +97,7 @@ template <typename T>
       uint gid [[thread_position_in_grid]]);
 #else
 #define INST_SILU_MUL(dtype_tag, mtl_type) \
-  MK_TAIL(silu_mul_##dtype_tag, 0x7, (mk_silu_mul<mtl_type, MK_C>), SILU_MUL_CONSTS)
+  MK_TAIL(silu_mul_##dtype_tag, (mk_silu_mul<mtl_type, MK_C>), SILU_MUL_CONSTS)
 #endif
 
 INST_SILU_MUL(f16,  half)
@@ -135,7 +134,7 @@ template <typename T>
       uint gid [[thread_position_in_grid]]);
 #else
 #define INST_GELU_MUL(dtype_tag, mtl_type) \
-  MK_TAIL(gelu_mul_##dtype_tag, 0x7, (mk_gelu_mul<mtl_type, MK_C>), SILU_MUL_CONSTS)
+  MK_TAIL(gelu_mul_##dtype_tag, (mk_gelu_mul<mtl_type, MK_C>), SILU_MUL_CONSTS)
 #endif
 
 INST_GELU_MUL(f16,  half)

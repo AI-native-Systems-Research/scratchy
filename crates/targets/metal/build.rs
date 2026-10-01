@@ -249,15 +249,14 @@ fn compile_shader(shader: &Path, out_dir: &Path, shader_dir: &Path) {
 // Their instantiation lines are the ONLY list of what a megakernel may call: preprocessed with
 // `-DMK_ENUMERATE`, each `MK_ADAPTER` prints a marker, and the markers become `mk_adapters.rs`
 // (read by the bake, which generates each tape's kernels). The same TU with its local includes
-// inlined is `mk_bodies.metal`: the self-contained text the worker compiles a tape's generated
-// kernels against at load.
+// inlined is `mk_bodies.metal`: the self-contained text the bake compiles a tape's generated
+// kernels against.
 
 /// One `MK_ADAPTER` marker.
 struct MkMarker {
     library: String,
     function: String,
     tg_bytes: u32,
-    coherent: u32,
     item_threads: u32,
     writes: u32,
     /// An elementwise (`MK_TAIL`) adapter.
@@ -353,7 +352,6 @@ fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
             library,
             function,
             tg_bytes,
-            coherent,
             item_threads,
             writes,
             tail,
@@ -389,7 +387,6 @@ fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
             library: library.to_string(),
             function: function.to_string(),
             tg_bytes: int(tg_bytes),
-            coherent: int(coherent),
             item_threads: int(item_threads),
             writes: int(writes),
             tail: int(tail) != 0,
@@ -435,12 +432,11 @@ fn write_mk_adapters_rs(out_dir: &Path, markers: &[MkMarker]) {
             .collect();
         s += &format!(
             "    MkAdapter {{ library: {:?}, function: {:?}, tg_bytes: VtgBytes({}), \
-             coherent: BindingMask({:#x}), item_threads: {}, writes: BindingMask({:#x}), \
-             tail: {}, short_rows: {}, constants: &[{}], call: {:?} }},\n",
+             item_threads: {}, writes: BindingMask({:#x}), tail: {}, short_rows: {}, \
+             constants: &[{}], call: {:?} }},\n",
             m.library,
             m.function,
             m.tg_bytes,
-            m.coherent,
             m.item_threads,
             m.writes,
             m.tail,

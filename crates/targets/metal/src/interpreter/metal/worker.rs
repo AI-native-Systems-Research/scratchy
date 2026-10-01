@@ -53,8 +53,9 @@ pub enum BucketStep {
     Dispatch {
         /// Kernel id of every dispatch in this step. Coalescing
         /// requires same pipeline (same kernel), so one id is
-        /// authoritative for the whole step.
-        kernel: super::lowered::KernelId,
+        /// authoritative for the whole step. `None`: a segment kernel
+        /// of the bucket's decode megakernel.
+        kernel: Option<super::lowered::KernelId>,
         /// Pipeline state for this step's kernel(s).
         pipeline: ComputePipelineState,
         /// Per-command explicit bindings: (buffer, offset, index).
@@ -103,8 +104,9 @@ pub struct BucketBaking {
     /// top_k stamps. dispatch-bound commands access this via
     /// `setBuffer_offset_atIndex` like any other device buffer.
     pub moe_inline_buf: Option<Buffer>,
-    /// The bucket's decode megakernel in this worker's KV mode, when its tape carries one.
-    pub megakernel: Option<super::megakernel::MegakernelBaking>,
+    /// The bucket's decode megakernel in this worker's KV mode, when its tape carries one: its
+    /// segment launches, played in place of `mtl4_steps` in the context it was planned under.
+    pub segmented: Option<super::megakernel::Segmented>,
 }
 
 #[derive(Debug)]
@@ -263,10 +265,10 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// read such a block (`RuntimeGate::OnlyIfUnrotatedBlocks`).
     pub unrotated_blocks: std::sync::atomic::AtomicBool,
     /// How the next forward plays its tape ([`TapePlay`]); stashed from the forward's inputs
-    /// like `tq_dequant_max_blocks`. `true` = [`TapePlay::Megakernel`].
-    plays_megakernel: std::sync::atomic::AtomicBool,
-    /// Megakernel runs the last forward played (the trace reads it).
-    megakernel_runs: std::sync::atomic::AtomicU32,
+    /// like `tq_dequant_max_blocks`.
+    play: std::sync::Mutex<TapePlay>,
+    /// Segment launches the last forward played (the trace reads it).
+    segment_launches: std::sync::atomic::AtomicU32,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -308,7 +310,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// Llama-3.2-class working sets.
     ///
     /// `megakernels[i]` is bucket `i`'s baked megakernel tapes (one per KV mode, usually none);
-    /// the worker plays the one of its own KV mode.
+    /// the worker loads the one of its own KV mode.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_residency(
         device: Arc<Device>,
@@ -564,9 +566,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
             if let Some(b) = baking.moe_inline_buf.as_ref() {
                 pin(b);
             }
-            // The megakernel's addresses and sync words are bound by address too.
-            if let Some(m) = baking.megakernel.as_ref() {
-                m.buffers().into_iter().for_each(&mut pin);
+            // The segment launches' address table is bound by address too.
+            if let Some(s) = baking.segmented.as_ref() {
+                pin(&s.addresses);
             }
             bucket_bakings.push(baking);
         }
@@ -586,41 +588,21 @@ impl<W: CanonicalParams> MetalWorker<W> {
             attn_unfused_scratch,
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
-            plays_megakernel: std::sync::atomic::AtomicBool::new(false),
-            megakernel_runs: std::sync::atomic::AtomicU32::new(0),
+            play: std::sync::Mutex::new(TapePlay::Dispatch),
+            segment_launches: std::sync::atomic::AtomicU32::new(0),
             _marker: std::marker::PhantomData,
         })
     }
 
     /// How the next forward plays its tape — stashed from the forward's inputs.
     pub fn set_tape_play(&self, play: TapePlay) {
-        let mk = play == TapePlay::Megakernel;
-        self.plays_megakernel
-            .store(mk, std::sync::atomic::Ordering::Relaxed);
+        *self.play.lock().expect("tape play mutex") = play;
     }
 
-    /// Megakernel runs the last encoded forward played.
-    pub fn megakernel_runs_played(&self) -> u32 {
-        self.megakernel_runs
+    /// Segment launches the last encoded forward played.
+    pub fn segment_launches_played(&self) -> u32 {
+        self.segment_launches
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// After a forward of `bucket` completed: how many threadgroups ran its megakernel launch
-    /// (checked in), if it had one.
-    pub fn megakernel_participants(&self, bucket: usize) -> Option<u32> {
-        let mk = self.bucket_bakings.get(bucket)?.megakernel.as_ref()?;
-        Some(mk.participants())
-    }
-
-    /// After a forward's command buffer completed: the first bounded wait any megakernel run
-    /// gave up on, as a typed error (every stall word is cleared).
-    pub fn take_megakernel_stall(&self) -> Result<(), MegakernelError> {
-        let stalls = self
-            .bucket_bakings
-            .iter()
-            .filter_map(|b| b.megakernel.as_ref());
-        let words: Vec<_> = stalls.map(|m| m.take_stall()).collect();
-        words.into_iter().collect()
     }
 
     /// Phase A.3 MTL4 execution path. Encodes the
@@ -642,23 +624,36 @@ impl<W: CanonicalParams> MetalWorker<W> {
             MTL4CommandEncoder, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
         };
         let baking = &self.bucket_bakings[bucket];
-        let mtl4_steps =
-            baking
+        let ctx = GateCtx {
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            unrotated_blocks: self
+                .unrotated_blocks
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
+        // THE DECODE MEGAKERNEL plays only in the context it was planned under (bucket-1 decode
+        // of one sequence — its gates are constants there): its segment launches, in place of the
+        // commands, through this same loop.
+        let play = *self.play.lock().expect("tape play mutex");
+        let segmented = baking.segmented.as_ref().filter(|_| {
+            play == TapePlay::Segmented && ctx == GateCtx::decode_one(ctx.unrotated_blocks)
+        });
+        let mtl4_steps = match segmented {
+            Some(s) => &s.steps,
+            None => baking
                 .mtl4_steps
                 .as_ref()
                 .ok_or(WorkerError::WeightLookupFailed {
                     reason: "MTL4 path requested but bucket has no mtl4_steps (Gemm or too-many-bindings fallback)",
-                })?;
+                })?,
+        };
         // MTL4 compute encoders do NOT auto-serialize successive
         // dispatches the way MTL3's default-Serial encoder does;
         // the per-sub-dispatch `barrier_before` flag was computed
         // at macro time from the tape's dataflow (the metal compiler's
         // hazard walk). Runtime does zero analysis — just emits a
         // `Dispatch→Dispatch` barrier wherever the flag fires.
-        // Flat dispatch index across all steps. Counts EVERY dispatch
-        // slot (including gate-skipped ones) so it stays aligned with
-        // the expanded command order the megakernel's span names.
-        let mut flat_idx: usize = 0;
         // Opt-in kernel tape (forward-local; published once at encode end).
         #[cfg(feature = "forward-telemetry")]
         let tape_enabled = ForwardTelemetry::global().is_enabled();
@@ -668,26 +663,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
         } else {
             Vec::new()
         };
-        let ctx = GateCtx {
-            num_tokens,
-            num_seqs,
-            has_spec_tokens,
-            unrotated_blocks: self
-                .unrotated_blocks
-                .load(std::sync::atomic::Ordering::Relaxed),
-        };
-        // THE MEGAKERNEL plays only in the context it was planned under (bucket-1 decode of one
-        // sequence, this worker's KV mode — its gates are constants there). Its ONE launch
-        // replaces the forward's span of flat dispatch indices; a dispatch after it re-sets its
-        // pipeline and fences.
-        let plays = self
-            .plays_megakernel
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let megakernel = baking
-            .megakernel
-            .as_ref()
-            .filter(|_| plays && ctx == GateCtx::decode_one(ctx.unrotated_blocks));
-        let (mut runs_played, mut refence, mut repipeline) = (0u32, false, false);
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -698,23 +673,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .zip(step.m_scaling.iter())
                 .zip(step.runtime_gate.iter())
             {
-                let this_idx = flat_idx;
-                flat_idx += 1;
-                if let Some(mk) = megakernel {
-                    let span = mk.commands();
-                    if span.contains(&this_idx) {
-                        if this_idx == span.start {
-                            mk.encode(enc);
-                            (runs_played, refence, repipeline) = (runs_played + 1, true, true);
-                        }
-                        continue;
-                    }
-                }
-                // The compiler's own hazard-analysis verdict for the tape,
-                // captured before the megakernel's re-fence overrides it.
-                #[cfg(feature = "forward-telemetry")]
-                let compiler_barrier = *need_barrier;
-                let mut need_barrier = *need_barrier;
                 if !gate.is_none_or(|g| g.admits(ctx)) {
                     // Skipped: e.g. the lm_head slice's gather/qmv/scatter
                     // (`OnlyIfNoSpec`) on a spec-decode verify step, or
@@ -724,13 +682,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // doesn't run with stale per-dispatch state.
                     continue;
                 }
-                if std::mem::take(&mut repipeline) {
-                    enc.setComputePipelineState(&step.pipeline);
-                }
-                if std::mem::take(&mut refence) {
-                    need_barrier = true;
-                }
-                if need_barrier {
+                if *need_barrier {
                     // Default to `None` visibility — measured -30 ms
                     // TTFT @ 1024-tok / -89 ms @ 2048-tok on M4
                     // Llama-3.2-3B-4bit, coherent on the standard probes
@@ -762,7 +714,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // placeholder; the kernel needs (max_blocks, num_kv_heads,
                 // num_seqs) — block-table-driven, with early-exit past
                 // seqused_k; grid.z = the live batch's num_seqs.
-                let tg_scaled = if matches!(step.kernel, super::lowered::KernelId::TqStageRotated) {
+                let tg_scaled = if step.kernel == Some(super::lowered::KernelId::TqStageRotated) {
                     // grid.x must cover the host block-table ROW WIDTH
                     // (`max_blocks_eff`) — every block of the longest
                     // sequence. The static `W::MAX_BLOCKS_PER_SEQ` (128 for
@@ -803,9 +755,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // TqStageRotated grid override above.
                 let tg_scaled = if matches!(
                     step.kernel,
-                    super::lowered::KernelId::RopeOnceSteel
-                        | super::lowered::KernelId::RopeOnceNax
-                        | super::lowered::KernelId::RopeOnceGqaShared
+                    Some(
+                        super::lowered::KernelId::RopeOnceSteel
+                            | super::lowered::KernelId::RopeOnceNax
+                            | super::lowered::KernelId::RopeOnceGqaShared
+                    )
                 ) {
                     let runtime_mb = self
                         .tq_dequant_max_blocks
@@ -827,18 +781,21 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 };
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
+                // A segment kernel fuses the commands it plays.
                 #[cfg(feature = "forward-telemetry")]
                 if tape_enabled {
                     tape.push(TapeEntry {
-                        kind: kernel_kind(step.kernel),
-                        barrier: compiler_barrier,
-                        fused: is_fused(step.kernel),
+                        kind: step.kernel.map_or(KernelKind::Other, kernel_kind),
+                        barrier: *need_barrier,
+                        fused: step.kernel.is_none_or(is_fused),
                     });
                 }
             }
         }
-        self.megakernel_runs
-            .store(runs_played, std::sync::atomic::Ordering::Relaxed);
+        let launches: usize =
+            segmented.map_or(0, |s| s.steps.iter().map(|x| x.dispatches.len()).sum());
+        self.segment_launches
+            .store(launches as u32, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "forward-telemetry")]
         if tape_enabled {
             ForwardTelemetry::global().publish(ForwardRecord {
@@ -1018,7 +975,7 @@ fn bake_bucket<W: CanonicalParams>(
     let mut inline_cursor: u32 = 0;
 
     let mut steps: Vec<BucketStep> = Vec::new();
-    // Every command's resolved bindings, when the megakernel's step records need their addresses.
+    // Every command's resolved bindings, when the megakernel's address table needs them.
     let mut bound_by_command: Vec<Vec<super::megakernel::BoundBinding>> = Vec::new();
 
     for (cmd_idx, gated) in expanded_commands.iter().enumerate() {
@@ -1102,7 +1059,7 @@ fn bake_bucket<W: CanonicalParams>(
             }
             _ => {
                 steps.push(BucketStep::Dispatch {
-                    kernel: cmd.kernel,
+                    kernel: Some(cmd.kernel),
                     pipeline,
                     direct_bindings: vec![bindings_for_cmd],
                     direct_dispatch: vec![dispatch_for_cmd],
@@ -1115,11 +1072,10 @@ fn bake_bucket<W: CanonicalParams>(
     }
 
     let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &device);
-    let megakernel = match megakernel {
+    let segmented = match megakernel {
         Some(mk) => {
-            use super::megakernel::MegakernelBaking;
             let baked_of: Vec<usize> = tape.expanded_origins().iter().map(|o| o.baked).collect();
-            let (baking, load) = MegakernelBaking::bake(
+            let (segmented, load) = super::megakernel::bake(
                 mk,
                 &expanded_commands,
                 &baked_of,
@@ -1129,23 +1085,24 @@ fn bake_bucket<W: CanonicalParams>(
             )?;
             if std::env::var_os("SCRATCHY_METAL_TRACE").is_some() {
                 eprintln!(
-                    "[megakernel] bucket_m={} ONE launch plays {} of {} commands; \
-                     grid barriers per forward={}; library {} ({} bytes metallib) loaded in {:?}; \
-                     pipeline built in {:?}; maxTotalThreadsPerThreadgroup={}; persistent \
-                     threadgroups P={}",
+                    "[megakernel] bucket_m={} {} segment kernels play {} of {} \
+                     commands in {} launches per forward; library {} ({} bytes metallib) loaded \
+                     in {:?}; pipelines built in {:?}; maxTotalThreadsPerThreadgroup {:?}; \
+                     threadgroups per launch P={}",
                     tape.bucket_m,
-                    load.steps,
+                    load.kernels,
+                    load.commands,
                     expanded_commands.len(),
-                    load.grid_barriers,
+                    load.launches,
                     mk.library,
                     load.metallib_bytes,
                     load.loaded,
-                    load.pipeline_built,
+                    load.pipelines_built,
                     load.max_threads,
                     load.threadgroups,
                 );
             }
-            Some(baking)
+            Some(segmented)
         }
         None => None,
     };
@@ -1153,7 +1110,7 @@ fn bake_bucket<W: CanonicalParams>(
         bucket_m: tape.bucket_m,
         mtl4_steps,
         moe_inline_buf,
-        megakernel,
+        segmented,
     })
 }
 

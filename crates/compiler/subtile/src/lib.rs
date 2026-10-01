@@ -20,7 +20,8 @@
 pub mod ops;
 pub mod fixtures;
 pub mod lower;
-/// The dataflow facts one persistent kernel needs to play a tape: waits, units, coherence.
+/// How a tape's steps fuse into generated kernels: waits, units, and the segments one launch each
+/// plays, no segment waiting on another threadgroup.
 pub mod megakernel_plan;
 /// SubtileIR → KTIR (IBM Spyre target). The macro calls it under `-Fspyre`.
 /// ALSO needed by `-Fsuperdsc`: `emit_bundle` builds the source/dim manifest via

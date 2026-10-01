@@ -112,9 +112,9 @@ METAL_FUNC void gdn_conv1d_varlen_body(
   }
 }
 
-// Megakernel adapter: conv_out (0) and x (1) device-coherent; the layer's conv state is touched by
-// this step alone, one thread per (sequence, channel). Compiled alone: inlined into the megakernel,
-// the four-tap sum's products fuse into its adds differently than in the dispatch kernel.
+// Megakernel adapter: the layer's conv state is touched by this step alone, one thread per
+// (sequence, channel). Compiled alone: inlined into the megakernel, the four-tap sum's products
+// fuse into its adds differently than in the dispatch kernel.
 template <typename T, typename C>
 MK_FUNC_ALONE void mk_gdn_conv1d_varlen(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   if (!l.live) return;
@@ -155,7 +155,7 @@ template <typename T>
       uint3 tpig [[thread_position_in_grid]]);
 #else
 #define INST_GDN_CONV1D_VARLEN(dtype_tag, mtl_type)                                       \
-  MK_ADAPTER(gdn_conv1d_varlen_##dtype_tag, 0, 0x3, (mk_gdn_conv1d_varlen<mtl_type, MK_C>), \
+  MK_ADAPTER(gdn_conv1d_varlen_##dtype_tag, 0, (mk_gdn_conv1d_varlen<mtl_type, MK_C>),      \
              GDN_CONV_CONSTS)
 #endif
 

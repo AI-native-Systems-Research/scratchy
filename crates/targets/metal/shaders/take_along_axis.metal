@@ -22,8 +22,8 @@
 
 using namespace metal;
 
-// Body shared by the dispatch kernel and the megakernel adapter (every operand coherent there;
-// the sizes are the inline scalars, by reference).
+// Body shared by the dispatch kernel and the megakernel adapter (the sizes are the inline
+// scalars, by reference).
 template <typename SP, typename IP, typename OP, typename CI>
 METAL_FUNC void take_along_axis_body(SP src, IP indices, OP out, CI src_axis_size,
                                      CI idx_axis_size, uint2 gid, uint2 grid) {
@@ -72,7 +72,7 @@ template <typename T>
       uint2 grid [[threads_per_grid]]);
 #else
 #define INSTANTIATE_TAKE(tag, type)                                                  \
-  MK_TAIL(take_along_axis_2d_contig_##tag, 0x7, (mk_take_along_axis<type>), \
+  MK_TAIL(take_along_axis_2d_contig_##tag, (mk_take_along_axis<type>),      \
              MK_NO_CONSTS)
 #endif
 

@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE DECODE MEGAKERNEL, COMPILED — per bucket-1 tape, at expansion.
 //!
-//! The WHOLE decode forward becomes ONE kernel. Every command the planned context
+//! The decode forward becomes generated SEGMENT kernels. Every command the planned context
 //! ([`GateCtx::decode_one`]) admits is fed to the SHARED plan ([`plan`]) with the dataflow of the
 //! step row it came from ([`RowAccess`], the barrier walk's hazard signature named): all commands
 //! of a row carry the row's whole access set, so a multi-command row is ordered by its own
 //! writes. Every admitted command must be playable — an adapter ([`MkAdapter::of`]) and every
 //! load-time scalar modeled ([`MkLoadConstant`]) — or the bake fails, naming each command that
-//! stopped it; a kernel is never split.
+//! stopped it.
 //!
-//! The plan is SCHEDULED by the shared pass ([`schedule`]) and COMPILED here into MSL: one
-//! `[[kernel]]` whose body is the tape's steps in order as straight-line adapter calls — every
-//! constant a literal of the step's policy struct, every geometry a literal, the work split a
-//! compile-time round-robin over the `MK_P` persistent threadgroups, a grid barrier between
-//! phases and nothing else — with the tape's layer loops kept ROLLED exactly as the tape keeps
-//! them (a phase break at every iteration start makes every iteration schedule alike, which the
-//! bake checks). Only binding ADDRESSES and the load's scalars are runtime data: a step reads its
-//! addresses from the address table at a position fixed here (its row, plus the iteration times
-//! the row length), the scalars are function constants.
+//! The shared pass cuts the plan into segments ([`segment`]) — runs in which every wait is met by
+//! one threadgroup — and each segment is COMPILED here into MSL: one `[[kernel]]` whose body is
+//! the segment's steps in order as straight-line adapter calls — every constant a literal of the
+//! step's policy struct, every geometry a literal, the work split a compile-time round-robin over
+//! the launch's `MK_P` threadgroups — and nothing else: a kernel holds only its own segment's
+//! bodies, and nothing in it waits on another threadgroup. The tape's layer loops stay ROLLED
+//! exactly as the tape keeps them (a segment break at every iteration start makes every iteration
+//! segment alike, which the bake checks), so one kernel plays a segment in every iteration. Only
+//! binding ADDRESSES and the load's scalars are runtime data: a launch reads its steps' addresses
+//! from the block of the address table its instance binds, at positions fixed here; the scalars
+//! are function constants.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,7 +29,7 @@ use std::process::Command;
 use std::num::NonZeroU32;
 
 use scratchy_subtile::megakernel_plan::{
-    Items, MegakernelPlan, Placement, Schedule, StepFlow, UnitIx, plan, schedule,
+    Cut, FusionPlan, Items, LocalWait, Placement, Segments, StepFlow, UnitIx, plan, segment,
 };
 use scratchy_target_metal::interpreter::metal::megakernel::MK_BODIES;
 use scratchy_target_metal::msl_offline::{AIR_TO_METALLIB, MSL_TO_AIR};
@@ -39,10 +41,10 @@ use scratchy_target_metal::tape::kernel_constants::{
     AttentionViaCacheConstants, AttentionViaCacheTqConstants,
 };
 use scratchy_target_metal::tape::lowered::{
-    Binding, BindingMask, CapPatch, CommandOrigin, CommandSpan, GateCtx, GatedCommand, KernelId,
-    LoweredCommand, LoweredMetalTape, MK_FC_LOAD, MK_TG_MEMORY, MK_THREADS, MScaleAxis,
-    MegakernelError, MegakernelTape, MkAdapter, MkGeometry, MkKernelStep, MkLoadConstant,
-    MkLoadSource, PatchTarget, RuntimeBindingKind, TapeLoop, baked, mk_geometry,
+    Binding, BindingMask, CapPatch, CommandOrigin, GateCtx, GatedCommand, KernelId, LoweredCommand,
+    LoweredMetalTape, MK_FC_LOAD, MK_TG_MEMORY, MK_THREADS, MScaleAxis, MegakernelError,
+    MegakernelTape, MkAdapter, MkCut, MkGeometry, MkKernelStep, MkLoadConstant, MkLoadSource,
+    MkPlace, MkSegment, PatchTarget, RuntimeBindingKind, TapeLoop, baked, mk_geometry,
 };
 use scratchy_target_metal::tape::step::{MetalLoc, MetalStep, MetalStepTape, RowAccess, StepRow};
 
@@ -50,8 +52,8 @@ use crate::static_tape::BakeDefect;
 
 /// An elementwise step ([`MkAdapter::tail`]: a residual add, a scalar scale) of at most this many
 /// items may be played whole by the threadgroup that ran what it waits on, instead of spreading
-/// after a grid barrier: a few passes of one threadgroup cost less than the barrier (~3 us in the
-/// forward). A heavier step (a matvec, a gemm) is spread, however few its items.
+/// in a segment of its own: a few passes of one threadgroup cost less than the launch boundary
+/// (~3 us in the forward). A heavier step (a matvec, a gemm) is spread, however few its items.
 const MK_WHOLE_ITEMS: u32 = 4;
 
 /// K or V: the halves of a KV cache, of the codec's fp16 scratch and of a coded layer's store.
@@ -210,9 +212,9 @@ impl KvAliasing {
 }
 
 /// A decode attention's (fp16 KV) query heads per virtual threadgroup, as the device's pick for
-/// TurboQuant decode makes it ([`TqDecodeHeads::for_group`]) at the launch's persistent
-/// threadgroups — the GPU's cores, `MK_P`, known at load — so its items fill them instead of
-/// spilling into another round. The rule's candidates, most heads first: `(q / h, h)`, `h` taken
+/// TurboQuant decode makes it ([`TqDecodeHeads::for_group`]) at the launch's threadgroups — the
+/// GPU's cores, `MK_P`, known at load — so its items fill them instead of spilling into another
+/// round. The rule's candidates, most heads first: `(q / h, h)`, `h` taken
 /// when `q / h ≥ ⌊4·MK_P / 5⌋`, else one head. `None`: not a decode attention, or one head on
 /// every GPU. The body computes each head exactly as it does one head per threadgroup.
 fn heads_rule(cmd: &LoweredCommand) -> Option<Vec<(u32, u32)>> {
@@ -245,8 +247,9 @@ fn heads_msl(rule: &[(u32, u32)]) -> String {
     })
 }
 
-/// A command as the megakernel plays it: its constants and grid, one head per virtual threadgroup
-/// (a decode attention's grouping, [`heads_rule`], is spelled in `MK_P` where the step is).
+/// A command as a segment kernel plays it: its constants and grid, one head per virtual
+/// threadgroup (a decode attention's grouping, [`heads_rule`], is spelled in `MK_P` where the step
+/// is).
 fn played(cmd: &LoweredCommand) -> (Vec<ConstantValue>, (u32, u32, u32)) {
     (
         cmd.constants.to_vec(),
@@ -271,10 +274,10 @@ fn step_geometry(
     }
 }
 
-/// A spread step as its phase's packing reads it: its virtual threadgroups (MSL: a literal, or
+/// A spread step as its segment's packing reads it: its virtual threadgroups (MSL: a literal, or
 /// with its decode attention's heads grouped, [`heads_rule`]), its declared items (the plan's),
 /// and — `fit`: `None` for a grid the load sizes, played at its widest — its items' virtual
-/// threadgroups at its adapter's width and across the whole persistent threadgroup.
+/// threadgroups at its adapter's width and across the whole physical threadgroup.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct SpreadIn {
     vtgs: String,
@@ -282,17 +285,18 @@ struct SpreadIn {
     fit: Option<(u32, u32)>,
 }
 
-/// One phase's work split, as every phase of its shape spells it: its spread steps in order, its
-/// pinned units that wait on nothing in the phase (`free`: each keeps a slot of the last round),
-/// and its pinned lane groups (a unit and the in-phase units it waits on share a lane).
+/// One segment's work split, as every segment of its shape spells it: its spread steps in order,
+/// its pinned units that wait on nothing in the segment (`free`: each keeps a slot of the last
+/// round), and its pinned lane groups (a unit and the units of its segment it waits on share a
+/// lane).
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct PhaseShape {
+struct SegmentShape {
     spread: Vec<SpreadIn>,
     free: u32,
     groups: u32,
 }
 
-/// Where a unit runs, as the kernel spells it: spread step `ord` of phase shape `shape`, the
+/// Where a unit runs, as the kernel spells it: spread step `ord` of segment shape `shape`, the
 /// lane of pinned group `group` of it, or on every threadgroup.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Place {
@@ -301,40 +305,38 @@ enum Place {
     Everywhere,
 }
 
-/// A phase whose items, at their adapters' widths, fill at most this many rounds is bound by its
-/// rounds, not by its streams: its items widen up to the whole persistent threadgroup, so every
-/// lane plays one even share (Qwen3-0.6B's 128-tile down and output projections: -0.12 ms/token on
-/// a base M5; phases of up to 8 rounds measured the same there).
-const MK_ROUND_BOUND_PHASE: u32 = 4;
+/// A segment whose items, at their adapters' widths, fill at most this many rounds is bound by its
+/// rounds, not by its streams: its items widen up to the whole physical threadgroup, so every lane
+/// plays one even share (Qwen3-0.6B's 128-tile down and output projections: -0.12 ms/token on a
+/// base M5; segments of up to 8 rounds measured the same there).
+const MK_ROUND_BOUND_SEGMENT: u32 = 4;
 
-/// Places each phase's units ([`Place`]) and collects the phase shapes they spell. The split
-/// itself is the shape's [`PhaseShape::msl`]: a function of the launch's `MK_P`.
-fn pack_phases(
-    sched: &Schedule,
-    plan: &MegakernelPlan<MkLoc>,
+/// Places each segment's units ([`Place`]) and collects the segment shapes they spell. The split
+/// itself is the shape's [`SegmentShape::msl`]: a function of the launch's `MK_P`.
+fn pack_segments(
+    segs: &Segments,
+    plan: &FusionPlan,
     spread_in: &[SpreadIn],
-) -> (Vec<Place>, Vec<PhaseShape>) {
+) -> (Vec<Place>, Vec<SegmentShape>) {
     let mut places = vec![Place::Everywhere; plan.units.len()];
-    let mut shapes: Vec<PhaseShape> = Vec::new();
-    for phase in &sched.phases {
-        let units: Vec<usize> = phase.clone().map(|u| u as usize).collect();
-        let in_phase = |w: &UnitIx| phase.contains(&w.0);
+    let mut shapes: Vec<SegmentShape> = Vec::new();
+    let placements = segs.placements();
+    for seg in segs.segments() {
+        let units: Vec<usize> = seg.units.clone().map(|u| u as usize).collect();
         let first = |u: usize| plan.units[u].steps.start as usize;
+        let local = |u: usize| segs.local_waits(UnitIx(u as u32));
         let spread: Vec<usize> = units
             .iter()
             .copied()
-            .filter(|&u| matches!(sched.placements[u], Placement::Spread { .. }))
+            .filter(|&u| matches!(placements[u], Placement::Spread { .. }))
             .collect();
         let pinned: Vec<usize> = units
             .iter()
             .copied()
-            .filter(|&u| matches!(sched.placements[u], Placement::Pinned(_)))
+            .filter(|&u| matches!(placements[u], Placement::Pinned(_)))
             .collect();
-        let free = pinned
-            .iter()
-            .filter(|&&u| !plan.units[u].waits.iter().any(in_phase))
-            .count() as u32;
-        // The pinned units in lane groups: a unit and the in-phase units it waits on share a lane.
+        let free = pinned.iter().filter(|&&u| local(u).is_empty()).count() as u32;
+        // The pinned units in lane groups: a unit and the units it follows on their lane share it.
         let mut group: Vec<usize> = (0..pinned.len()).collect();
         let root = |g: &[usize], mut i: usize| {
             while g[i] != i {
@@ -343,7 +345,10 @@ fn pack_phases(
             i
         };
         for (i, &u) in pinned.iter().enumerate() {
-            for w in plan.units[u].waits.iter().filter(|w| in_phase(w)) {
+            for (w, _) in local(u)
+                .iter()
+                .filter(|(_, wait)| matches!(wait, LocalWait::SameLane(_)))
+            {
                 if let Some(j) = pinned.iter().position(|&p| p == w.0 as usize) {
                     let (a, b) = (root(&group, i), root(&group, j));
                     group[a.max(b)] = a.min(b);
@@ -361,7 +366,7 @@ fn pack_phases(
                 })
             })
             .collect();
-        let shape = PhaseShape {
+        let shape = SegmentShape {
             spread: spread
                 .iter()
                 .map(|&u| spread_in[first(u)].clone())
@@ -389,16 +394,15 @@ fn pack_phases(
     (places, shapes)
 }
 
-impl PhaseShape {
-    /// The split of every phase of shape `s` among the launch's `mk_p` participants — the
-    /// threadgroups that checked in — as functions of `mk_p` the phase inlines. The phase keeps the
-    /// fewest rounds its items allow — at their adapters' widths, or across the whole threadgroup
-    /// for a phase of few rounds ([`MK_ROUND_BOUND_PHASE`]) — a slot of the last round left to each
-    /// free pinned unit; the slots those rounds hold beyond the items go to the steps in proportion
-    /// to their virtual threadgroups, each step's items then even (`MK_S{s}_K{i}` virtual
-    /// threadgroups per item, `MK_S{s}_N{i}` items, starting at cursor `MK_S{s}_C{i}`); pinned group
-    /// `g` plays on the participant after the phase's last spread item (`MK_S{s}_L{g}`), the least
-    /// loaded.
+impl SegmentShape {
+    /// The split of every segment of shape `s` among the launch's `mk_p` threadgroups, as
+    /// functions of `mk_p` the kernel inlines. The segment keeps the fewest rounds its items allow
+    /// — at their adapters' widths, or across the whole threadgroup for a segment of few rounds
+    /// ([`MK_ROUND_BOUND_SEGMENT`]) — a slot of the last round left to each free pinned unit; the
+    /// slots those rounds hold beyond the items go to the steps in proportion to their virtual
+    /// threadgroups, each step's items then even (`MK_S{s}_K{i}` virtual threadgroups per item,
+    /// `MK_S{s}_N{i}` items, starting at cursor `MK_S{s}_C{i}`); pinned group `g` plays on the
+    /// threadgroup after the segment's last spread item (`MK_S{s}_L{g}`), the least loaded.
     fn msl(&self, s: usize, out: &mut String) {
         let p = |name: &str| format!("MK_S{s}_{name}(mk_p)");
         let mut def = |ty: &str, name: &str, expr: &str| {
@@ -415,7 +419,7 @@ impl PhaseShape {
         def(
             "bool",
             "RB",
-            &format!("({declared}u + mk_p - 1u) / mk_p <= {MK_ROUND_BOUND_PHASE}u"),
+            &format!("({declared}u + mk_p - 1u) / mk_p <= {MK_ROUND_BOUND_SEGMENT}u"),
         );
         let mut n0 = Vec::with_capacity(self.spread.len());
         for (i, x) in self.spread.iter().enumerate() {
@@ -614,11 +618,11 @@ impl NotAtDecode {
     }
 }
 
-/// Whether the ONE decode kernel plays `kernel` — EXHAUSTIVE over [`KernelId`], so a new kernel is
-/// classed before any tape can emit it. The bake holds every admitted bucket-1 decode command to
-/// it: a played kernel's symbol must have an adapter ([`MegakernelError::NoAdapter`]), and a decode
-/// command whose kernel is classed [`NotAtDecode`] fails the bake
-/// ([`MegakernelError::NotAtDecode`]: the class is wrong) — never a dispatch beside the kernel.
+/// Whether the decode's segment kernels play `kernel` — EXHAUSTIVE over [`KernelId`], so a new
+/// kernel is classed before any tape can emit it. The bake holds every admitted bucket-1 decode
+/// command to it: a played kernel's symbol must have an adapter ([`MegakernelError::NoAdapter`]),
+/// and a decode command whose kernel is classed [`NotAtDecode`] fails the bake
+/// ([`MegakernelError::NotAtDecode`]: the class is wrong) — never a dispatch beside the segments.
 fn at_decode(kernel: KernelId) -> Result<(), NotAtDecode> {
     use KernelId as K;
     match kernel {
@@ -700,15 +704,15 @@ fn at_decode(kernel: KernelId) -> Result<(), NotAtDecode> {
 }
 
 /// The planned decode forward: the admitted commands (expanded indices, in order), their
-/// plan and its schedule.
+/// plan and its segments.
 struct Planned {
     admitted: Vec<usize>,
-    plan: MegakernelPlan<MkLoc>,
-    sched: Schedule,
-    /// Per unit: where it runs ([`pack_phases`]).
+    plan: FusionPlan,
+    segs: Segments,
+    /// Per unit: where it runs ([`pack_segments`]).
     places: Vec<Place>,
-    /// The phase shapes the places name.
-    shapes: Vec<PhaseShape>,
+    /// The segment shapes the places name.
+    shapes: Vec<SegmentShape>,
     /// Per admitted step: what it reads and writes, as the plan ordered it.
     flows: Vec<StepFlow<MkLoc>>,
 }
@@ -731,8 +735,8 @@ fn decodes(steps: &MetalStepTape) -> bool {
     })
 }
 
-/// The megakernel of a bucket-1 decode tape: one [`MegakernelTape`] playing every command a
-/// decode step admits — a command it cannot play fails the bake. `tape` is the capacity-0
+/// The megakernel of a bucket-1 decode tape: one [`MegakernelTape`], its segment
+/// kernels playing every command a decode step admits — a command they cannot play fails the bake. `tape` is the capacity-0
 /// bake, `patches` its load patches, `row_commands` the commands each step row became, `steps`
 /// the rows' dataflow. A tape without a decode step ([`decodes`]) has none.
 pub fn bake_megakernel(
@@ -780,8 +784,8 @@ pub fn bake_megakernel(
     let admitted: Vec<usize> = (0..commands.len())
         .filter(|&i| commands[i].gate.is_none_or(|g| g.admits(ctx)))
         .collect();
-    // Every admitted command inside the ONE kernel: a command the kernel cannot play fails
-    // the bake (each distinct cause named). The worker plays the kernel whether or not the
+    // Every admitted command inside a segment kernel: a command they cannot play fails the
+    // bake (each distinct cause named). The worker plays the segments whether or not the
     // sequence holds an unrotated span block, so no gate may read that here.
     let mut stops: Vec<MegakernelError> = commands
         .iter()
@@ -817,8 +821,8 @@ pub fn bake_megakernel(
     if !stops.is_empty() {
         let stops: Vec<String> = stops.iter().map(ToString::to_string).collect();
         return Err(BakeDefect(format!(
-            "the bucket-1 decode tape is not playable inside one \
-             kernel: {}",
+            "the bucket-1 decode tape is not playable by segment \
+             kernels: {}",
             stops.join("; ")
         )));
     }
@@ -878,7 +882,7 @@ pub fn bake_megakernel(
             reads,
             writes,
             items,
-            phase_break: std::mem::take(&mut pending),
+            segment_break: std::mem::take(&mut pending),
             whole: adapter.tail && !load_sized && items.0.get() <= MK_WHOLE_ITEMS,
         });
     }
@@ -897,27 +901,29 @@ pub fn bake_megakernel(
         };
         return Err(defect("the codec's shared scratch", e));
     }
-    // The phase structure assumes no core count: every pinned unit is placed as if on a lane
-    // of its own. The split within each phase is a function of the launch's `MK_P`.
-    let sched = schedule(&plan, &flows, plan.units.len() as u32);
-    let (places, shapes) = pack_phases(&sched, &plan, &spread_in);
+    // The segments assume no core count: every pinned unit is placed as if on a lane of its
+    // own. The split within each segment is a function of the launch's `MK_P`.
+    let segs = segment(&plan, &flows, plan.units.len() as u32)
+        .map_err(|e| BakeDefect(format!("megakernel: {e}")))?;
+    let (places, shapes) = pack_segments(&segs, &plan, &spread_in);
     let planned = Planned {
         admitted,
         plan,
-        sched,
+        segs,
         places,
         shapes,
         flows,
     };
-    let generator = Gen::new(tape, patches, &commands, &origins, &planned, &kv)?;
-    let mk = generator.kernel(&tree)?;
+    let generator = Gen::new(tape, patches, &commands, &origins, &planned)?;
+    let mk = generator.kernels()?;
     eprintln!(
-        "[m2-megakernel] {}: ONE kernel, all {} admitted commands \
-         ({} baked steps), {} grid barriers per forward, {} load constants, {} bytes of MSL",
+        "[m2-megakernel] {}: {} segment kernels, {} launches per \
+         forward, all {} admitted commands ({} baked steps), {} load constants, {} bytes of MSL",
         mk.library,
+        mk.segments.len(),
+        planned.segs.segments().len(),
         planned.admitted.len(),
         mk.steps.len(),
-        mk.grid_barriers,
         mk.load_constants.len(),
         mk.source.len(),
     );
@@ -929,30 +935,40 @@ pub fn bake_megakernel(
 struct StepKey {
     /// The step opens its unit, which runs there.
     unit: Option<Place>,
-    /// The step opens a phase: a grid barrier stands before it (unless nothing ran before).
-    phase: bool,
-    /// A pinned unit whose waits include a unit of its own phase (on its lane).
+    /// The step opens a segment: a launch starts with it.
+    opens: bool,
+    /// A pinned unit whose waits include a unit of its own segment (met on its lane).
     follows: bool,
+}
+
+/// One segment kernel: the plan segment of its first instance (the rolled text's), how many
+/// instances a forward launches, and the address table's blocks they bind.
+struct Site {
+    segment: usize,
+    instances: u32,
+    table_at: u32,
+    block_len: u32,
 }
 
 /// The kernel generator of the decode tape.
 struct Gen<'a> {
     commands: &'a [GatedCommand],
     planned: &'a Planned,
-    kv: &'a KvAliasing,
-    /// Per admitted step: its baked position, its schedule key, its unit.
+    /// Per admitted step: its baked position, its segment key, its unit.
     baked: Vec<usize>,
     key: Vec<StepKey>,
     unit_of: Vec<usize>,
-    /// Per baked position: the admitted index of its first instance, and its address rows
-    /// (`table_at`, `row_len`).
+    /// Per baked position: the admitted index of its first instance, and its address row (its
+    /// kernel, the row's offset in the kernel's block, the row's length).
     first: Vec<Option<usize>>,
-    rows: Vec<Option<(u32, u32)>>,
-    table_len: u32,
+    rows: Vec<Option<(usize, u32, u32)>>,
+    /// The segment kernels, in the order the rolled text first reaches them.
+    sites: Vec<Site>,
     loads: Vec<MkLoadConstant>,
     load_types: Vec<ConstantType>,
     policies: Vec<String>,
-    /// Threadgroup memory the widest co-issued group needs ([`Gen::coissued`]).
+    /// Threadgroup memory the widest co-issued group of the kernel being spelled needs
+    /// ([`Gen::coissued`]).
     coissue_tg: u32,
 }
 
@@ -963,12 +979,11 @@ impl<'a> Gen<'a> {
         commands: &'a [GatedCommand],
         origins: &[CommandOrigin],
         planned: &'a Planned,
-        kv: &'a KvAliasing,
     ) -> Result<Self, BakeDefect> {
         let Planned {
             admitted,
             plan,
-            sched,
+            segs,
             places,
             ..
         } = planned;
@@ -979,46 +994,97 @@ impl<'a> Gen<'a> {
                 unit_of[s as usize] = u;
             }
         }
-        let phase_start: HashSet<u32> = sched.phases.iter().map(|p| p.start).collect();
-        let phase_of = |u: usize| sched.phases.iter().position(|p| p.contains(&(u as u32)));
+        let opening: HashSet<u32> = segs.segments().iter().map(|s| s.units.start).collect();
         let mut key = Vec::with_capacity(admitted.len());
         for (a, &u) in unit_of.iter().enumerate() {
             let unit = &plan.units[u];
             let opens = unit.steps.start as usize == a;
-            let follows = matches!(sched.placements[u], Placement::Pinned(_))
-                && unit
-                    .waits
-                    .iter()
-                    .any(|w| phase_of(w.0 as usize) == phase_of(u));
+            let follows = matches!(segs.placements()[u], Placement::Pinned(_))
+                && !segs.local_waits(UnitIx(u as u32)).is_empty();
             key.push(StepKey {
                 unit: opens.then_some(places[u]),
-                phase: opens && phase_start.contains(&(u as u32)),
+                opens: opens && opening.contains(&(u as u32)),
                 follows,
             });
         }
         let baked: Vec<usize> = admitted.iter().map(|&e| origins[e].baked).collect();
-        let mut instances = vec![0u32; n];
-        for &b in &baked {
-            instances[b] += 1;
-        }
         let mut first = vec![None; n];
-        let mut rows: Vec<Option<(u32, u32)>> = vec![None; n];
-        let mut table_len = 0u32;
-        let mut loads: Vec<MkLoadConstant> = Vec::new();
-        let mut load_types = Vec::new();
         for (a, &b) in baked.iter().enumerate() {
-            if first[b].is_some() {
+            first[b].get_or_insert(a);
+        }
+        // Every instance of a baked command runs as its first: a kernel spells the first once, for
+        // every iteration of the rolled loops around it.
+        for (a, &b) in baked.iter().enumerate() {
+            let f = first[b].expect("an admitted command has a first instance");
+            if key[a] != key[f] {
+                let symbol = commands[admitted[a]].command.function;
+                return Err(BakeDefect(format!(
+                    "megakernel: `{symbol}` (baked {b}) segments differently in a later loop \
+                     iteration"
+                )));
+            }
+        }
+        // The kernels: one per segment of the rolled text, its later instances holding the same
+        // baked steps; each step's address row in its kernel's block.
+        let held = |s: usize| {
+            let r = &segs.segments()[s].units;
+            let steps =
+                plan.units[r.start as usize].steps.start..plan.units[r.end as usize - 1].steps.end;
+            steps.map(|a| baked[a as usize]).collect::<Vec<usize>>()
+        };
+        let mut sites: Vec<Site> = Vec::new();
+        let mut site_of: HashMap<usize, usize> = HashMap::new();
+        let mut rows: Vec<Option<(usize, u32, u32)>> = vec![None; n];
+        for s in 0..segs.segments().len() {
+            let steps = held(s);
+            if let Some(&k) = site_of.get(&steps[0]) {
+                if held(sites[k].segment) != steps {
+                    return Err(BakeDefect(format!(
+                        "megakernel: the segment baked {} opens holds other steps in a later loop \
+                         iteration",
+                        steps[0]
+                    )));
+                }
+                sites[k].instances += 1;
                 continue;
             }
-            first[b] = Some(a);
+            let mut block_len = 0u32;
+            for &b in &steps {
+                let cmd = &commands[admitted[first[b].expect("admitted")]].command;
+                let row_len = cmd
+                    .bindings
+                    .iter()
+                    .map(|x| u32::from(x.binding_index()) + 1);
+                let row_len = row_len.max().unwrap_or(0);
+                if rows[b].replace((sites.len(), block_len, row_len)).is_some() {
+                    return Err(BakeDefect(format!(
+                        "megakernel: `{}` (baked {b}) is played by two segment kernels",
+                        cmd.function
+                    )));
+                }
+                block_len += row_len;
+            }
+            site_of.insert(steps[0], sites.len());
+            sites.push(Site {
+                segment: s,
+                instances: 1,
+                table_at: 0,
+                block_len,
+            });
+        }
+        let mut table_len = 0u32;
+        for site in &mut sites {
+            site.table_at = table_len;
+            table_len += site.instances * site.block_len;
+        }
+        let mut loads: Vec<MkLoadConstant> = Vec::new();
+        let mut load_types = Vec::new();
+        for (a, &b) in baked
+            .iter()
+            .enumerate()
+            .filter(|(a, b)| first[**b] == Some(*a))
+        {
             let cmd = &commands[admitted[a]].command;
-            let row_len = cmd
-                .bindings
-                .iter()
-                .map(|x| u32::from(x.binding_index()) + 1);
-            let row_len = row_len.max().unwrap_or(0);
-            rows[b] = Some((table_len, row_len));
-            table_len += instances[b] * row_len;
             let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
             let sources = load_sources(tape, patches, b).map_err(|e| defect(cmd.function, e))?;
             for source in sources {
@@ -1037,28 +1103,15 @@ impl<'a> Gen<'a> {
                 load_types.push(ty);
             }
         }
-        // Every instance of a baked command runs as its first: the kernel spells the first once
-        // inside the rolled loops.
-        for (a, &b) in baked.iter().enumerate() {
-            let f = first[b].expect("an admitted command has a first instance");
-            if key[a] != key[f] {
-                let symbol = commands[admitted[a]].command.function;
-                return Err(BakeDefect(format!(
-                    "megakernel: `{symbol}` (baked {b}) schedules differently in a later loop \
-                     iteration"
-                )));
-            }
-        }
         Ok(Self {
             commands,
             planned,
-            kv,
             baked,
             key,
             unit_of,
             first,
             rows,
-            table_len,
+            sites,
             loads,
             load_types,
             policies: Vec::new(),
@@ -1135,8 +1188,8 @@ impl<'a> Gen<'a> {
         Ok(format!("MkC{n}"))
     }
 
-    /// Admitted step `a`'s geometry at its adapter's width, or (`whole`) across the whole
-    /// persistent threadgroup — the widest items a phase's split may give it.
+    /// Admitted step `a`'s geometry at its adapter's width, or (`whole`) across the whole physical
+    /// threadgroup — the widest items a segment's split may give it.
     fn geometry(&self, a: usize, whole: bool) -> Result<MkGeometry, BakeDefect> {
         let cmd = self.command(a);
         let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
@@ -1148,22 +1201,38 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// The whole kernel: the tape's nodes in order, loops rolled.
-    fn kernel(mut self, tree: &[Node]) -> Result<MegakernelTape, BakeDefect> {
-        let mut body = String::new();
-        let mut at = Emit {
-            loops: Vec::new(),
-            prior: Prior::Nothing,
-            sites: 0,
-        };
-        self.emit(tree, &mut at, &mut body)?;
-        let mut tg_memory = self.coissue_tg.max(16);
-        for a in 0..self.baked.len() {
-            tg_memory = tg_memory.max(self.geometry(a, true)?.tg_memory);
+    /// Every segment kernel, one library: each kernel the units of its segment's first instance
+    /// in order, its rows at their offsets in the block its launch binds.
+    fn kernels(mut self) -> Result<MegakernelTape, BakeDefect> {
+        let planned = self.planned;
+        let (plan, segs) = (&planned.plan, &planned.segs);
+        let mut kernels = String::new();
+        for n in 0..self.sites.len() {
+            let units = segs.segments()[self.sites[n].segment].units.clone();
+            self.coissue_tg = 0;
+            let mut body = String::new();
+            let mut tg_memory = 16;
+            for u in units {
+                let steps = plan.units[u as usize].steps.clone();
+                self.unit(steps.start as usize, planned.places[u as usize], &mut body)?;
+                for a in steps {
+                    tg_memory = tg_memory.max(self.geometry(a as usize, true)?.tg_memory);
+                }
+            }
+            let tg_memory = tg_memory.max(self.coissue_tg).next_multiple_of(16);
+            let _ = write!(
+                kernels,
+                "[[kernel, max_total_threads_per_threadgroup(1024)]] void mk_seg_{n}(\n    \
+                 constant ulong* mk_a [[buffer(0)]],\n    \
+                 uint mk_t [[thread_index_in_threadgroup]],\n    \
+                 uint mk_idx [[threadgroup_position_in_grid]]) {{\n  \
+                 threadgroup uchar mk_tgm[{tg_memory}] __attribute__((aligned(16)));\n  \
+                 const uint mk_p = MK_P;\n{body}}}\n"
+            );
         }
-        let tg_memory = tg_memory.next_multiple_of(16);
         let mut s = String::from(
-            "// Generated by `megakernel_bake.rs`: the decode forward of one tape as one kernel.\n",
+            "// Generated by `megakernel_bake.rs`: the decode forward of one tape as segment \
+             kernels, one launch each.\n",
         );
         for (k, (l, ty)) in self.loads.iter().zip(&self.load_types).enumerate() {
             let _ = writeln!(
@@ -1173,119 +1242,95 @@ impl<'a> Gen<'a> {
                 l.index.get()
             );
         }
-        for (n, shape) in self.planned.shapes.iter().enumerate() {
+        for (n, shape) in planned.shapes.iter().enumerate() {
             shape.msl(n, &mut s);
         }
         for (n, p) in self.policies.iter().enumerate() {
             let _ = write!(s, "struct MkC{n} {{\n{p}}};\n");
         }
-        let _ = write!(
-            s,
-            "[[kernel, max_total_threads_per_threadgroup(1024)]] void mk_forward(\n    \
-             constant ulong* mk_a [[buffer(0)]],\n    device MkSync* mk_sync [[buffer(1)]],\n    \
-             uint mk_t [[thread_index_in_threadgroup]]) {{\n  \
-             threadgroup uchar mk_tgm[{tg_memory}] __attribute__((aligned(16)));\n  \
-             threadgroup uint mk_ok[3];\n  uint mk_idx, mk_p;\n  \
-             if (!mk_check_in(mk_sync, mk_t, mk_ok, mk_idx, mk_p)) return;\n  \
-             uint mk_gen = 0u;\n{body}}}\n"
-        );
+        s.push_str(&kernels);
         let library = String::leak(format!("megakernel_{:016x}", fnv1a(s.as_bytes())));
         let mut steps = Vec::new();
+        let mut step_at: HashMap<usize, u32> = HashMap::new();
         for (b, f) in self.first.iter().enumerate() {
-            let (Some(a), Some((table_at, row_len))) = (*f, self.rows[b]) else {
+            let (Some(a), Some((site, row_at, row_len))) = (*f, self.rows[b]) else {
                 continue;
             };
+            step_at.insert(b, steps.len() as u32);
             steps.push(MkKernelStep {
                 baked: b as u32,
                 function: self.command(a).function,
-                table_at,
+                segment: site as u32,
+                row_at,
                 row_len,
+                place: match planned.places[self.unit_of[a]] {
+                    Place::Spread { .. } => MkPlace::Spread,
+                    Place::Pinned { group, .. } => MkPlace::Lane(group),
+                    Place::Everywhere => MkPlace::Everywhere,
+                },
+                after: &[],
             });
         }
-        let admitted = &self.planned.admitted;
-        let grid_barriers = self.key.iter().filter(|k| k.phase).count() as u32 - 1;
+        // A unit by the step opening its first instance.
+        let opener = |w: UnitIx| {
+            let b = self.baked[plan.units[w.0 as usize].steps.start as usize];
+            step_at.get(&b).copied().ok_or_else(|| {
+                BakeDefect(format!(
+                    "megakernel: baked {b} opens a unit no kernel plays"
+                ))
+            })
+        };
+        for step in &mut steps {
+            let a = self.first[step.baked as usize].expect("played");
+            let u = self.unit_of[a];
+            if plan.units[u].steps.start as usize == a {
+                let local = segs.local_waits(UnitIx(u as u32)).iter();
+                let after = local.map(|(w, _)| opener(*w)).collect::<Result<_, _>>()?;
+                step.after = baked(after);
+            }
+        }
+        let mut segments = Vec::with_capacity(self.sites.len());
+        let mut table_len = 0;
+        for (n, site) in self.sites.iter().enumerate() {
+            let seg = &segs.segments()[site.segment];
+            let cut = match &seg.cut {
+                Cut::Start => MkCut::Start,
+                Cut::Break => MkCut::Break,
+                Cut::Waits(units) => {
+                    let on = units.iter().map(|w| opener(*w)).collect::<Result<_, _>>()?;
+                    MkCut::Waits(baked(on))
+                }
+            };
+            segments.push(MkSegment {
+                kernel: String::leak(format!("mk_seg_{n}")),
+                opens: self.baked[plan.units[seg.units.start as usize].steps.start as usize] as u32,
+                table_at: site.table_at,
+                block_len: site.block_len,
+                cut,
+            });
+            table_len += site.instances * site.block_len;
+        }
         Ok(MegakernelTape {
             library,
             source: String::leak(s),
             // Compiled by `compile_metallib`; the emission includes its bytes.
             metallib: &[],
-            kernel: "mk_forward",
-            commands: CommandSpan {
-                start: admitted[0] as u32,
-                end: admitted[admitted.len() - 1] as u32 + 1,
-            },
+            segments: baked(segments),
             steps: baked(steps),
-            table_len: self.table_len,
-            grid_barriers,
+            table_len,
             load_constants: baked(self.loads),
         })
     }
 
-    fn emit(&mut self, nodes: &[Node], at: &mut Emit, out: &mut String) -> Result<(), BakeDefect> {
-        for node in nodes {
-            let ind = "  ".repeat(at.loops.len() + 1);
-            match node {
-                Node::Cmd(b) => {
-                    // Gated off at decode, or emitted with the unit it belongs to.
-                    let Some(a) = self.first[*b] else { continue };
-                    let Some(placement) = self.key[a].unit else {
-                        continue;
-                    };
-                    if self.key[a].phase {
-                        at.barrier(&ind, out);
-                    }
-                    self.unit(a, placement, &at.loops, &ind, out)?;
-                    at.prior = Prior::Always;
-                }
-                Node::Loop { iters, body } => {
-                    let counter = format!("mk_l{}", at.loops.len());
-                    let _ = writeln!(
-                        out,
-                        "{ind}for (uint {counter} = 0u; {counter} < {iters}u; ++{counter}) {{"
-                    );
-                    let outer = std::mem::replace(&mut at.prior, Prior::Nothing);
-                    at.prior = match outer.clone() {
-                        Prior::Always => Prior::Always,
-                        Prior::Nothing => Prior::Unless(vec![counter.clone()]),
-                        Prior::Unless(mut cs) => {
-                            cs.push(counter.clone());
-                            Prior::Unless(cs)
-                        }
-                    };
-                    at.loops.push((counter, *iters));
-                    self.emit(body, at, out)?;
-                    at.loops.pop();
-                    let _ = writeln!(out, "{ind}}}");
-                    // After a loop that ran a step, something always ran.
-                    let ran = matches!(at.prior, Prior::Always);
-                    at.prior = if ran { Prior::Always } else { outer };
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The unit opened by admitted step `a`, at the loop nesting `loops`.
-    fn unit(
-        &mut self,
-        a: usize,
-        placement: Place,
-        loops: &[(String, u32)],
-        ind: &str,
-        out: &mut String,
-    ) -> Result<(), BakeDefect> {
+    /// The unit opened by admitted step `a`, as its segment's kernel plays it at `placement`.
+    fn unit(&mut self, a: usize, placement: Place, out: &mut String) -> Result<(), BakeDefect> {
+        let ind = "  ";
         let planned = self.planned;
         let unit = &planned.plan.units[self.unit_of[a]];
         let members = unit.steps.start as usize..unit.steps.end as usize;
-        // The iteration the steps run in: their instance among the baked command's.
-        let inst = loops.split_first().map(|((c0, _), rest)| {
-            rest.iter().fold(c0.clone(), |e, (c, iters)| {
-                format!("({e}) * {iters}u + {c}")
-            })
-        });
         match placement {
             Place::Spread { shape, ord } => {
-                let s = self.step_decl(a, inst.as_deref(), PerItem::Split { shape, ord })?;
+                let s = self.step_decl(a, PerItem::Split { shape, ord })?;
                 let _ = writeln!(
                     out,
                     "{ind}{{ // {}\n{ind}  {}\n{ind}  for (uint it = mk_first(mk_idx, mk_p, \
@@ -1309,7 +1354,7 @@ impl<'a> Gen<'a> {
                     Place::Pinned { shape, group } => {
                         writeln!(out, "{ind}if (mk_idx == MK_S{shape}_L{group}(mk_p)) {{")
                     }
-                    _ => writeln!(out, "{ind}{{ // on every participant"),
+                    _ => writeln!(out, "{ind}{{ // on every threadgroup"),
                 };
                 let mut last_tg = 0;
                 let members: Vec<usize> = members.collect();
@@ -1326,10 +1371,10 @@ impl<'a> Gen<'a> {
                     let m = members[j];
                     j += group.len();
                     if group.len() > 1 {
-                        last_tg = self.coissue(&group, inst.as_deref(), ind, out)?;
+                        last_tg = self.coissue(&group, ind, out)?;
                         continue;
                     }
-                    let s = self.step_decl(m, inst.as_deref(), PerItem::Widest)?;
+                    let s = self.step_decl(m, PerItem::Widest)?;
                     if s.items == "1u" {
                         let _ = writeln!(
                             out,
@@ -1427,18 +1472,12 @@ impl<'a> Gen<'a> {
 
     /// A co-issued group ([`Gen::coissued`]) as the kernel spells it; returns its threadgroup
     /// bytes per virtual threadgroup.
-    fn coissue(
-        &mut self,
-        group: &[usize],
-        inst: Option<&str>,
-        ind: &str,
-        out: &mut String,
-    ) -> Result<u32, BakeDefect> {
+    fn coissue(&mut self, group: &[usize], ind: &str, out: &mut String) -> Result<u32, BakeDefect> {
         let (_, grid) = played(self.command(group[0]));
         let vtgs = grid.0 * grid.1 * grid.2;
         let mut texts = Vec::with_capacity(group.len());
         for &m in group {
-            texts.push(self.step_decl(m, inst, PerItem::Coissued(vtgs))?);
+            texts.push(self.step_decl(m, PerItem::Coissued(vtgs))?);
         }
         let s0 = &texts[0];
         let width = vtgs * s0.stride;
@@ -1468,14 +1507,9 @@ impl<'a> Gen<'a> {
         Ok(s0.tg_bytes)
     }
 
-    /// Admitted step `a` as the kernel spells it, in the iteration `inst` (`None`: outside every
-    /// loop), its items as `per_item` says.
-    fn step_decl(
-        &mut self,
-        a: usize,
-        inst: Option<&str>,
-        per_item: PerItem,
-    ) -> Result<StepText, BakeDefect> {
+    /// Admitted step `a` as its segment's kernel spells it — its address row at its offset in the
+    /// block the launch binds, whatever the iteration — its items as `per_item` says.
+    fn step_decl(&mut self, a: usize, per_item: PerItem) -> Result<StepText, BakeDefect> {
         let b = self.baked[a];
         let cmd = self.command(a);
         let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
@@ -1485,11 +1519,8 @@ impl<'a> Gen<'a> {
             }
             PerItem::Widest | PerItem::Split { .. } => self.geometry(a, false)?,
         };
-        let (table_at, row_len) = self.rows[b].expect("a played command has rows");
-        let row = match inst {
-            Some(i) if row_len > 0 => format!("mk_a + {table_at}u + ({i}) * {row_len}u"),
-            _ => format!("mk_a + {table_at}u"),
-        };
+        let (_, row_at, _) = self.rows[b].expect("a played command has rows");
+        let row = format!("mk_a + {row_at}u");
         let (_, grid) = played(cmd);
         let axis = |ax: MScaleAxis, v: u32| {
             self.load(b, MkLoadSource::Threadgroups(ax))
@@ -1537,20 +1568,6 @@ impl<'a> Gen<'a> {
              {}u}};",
             t.0, t.1, t.2, g.vtg_stride, adapter.tg_bytes.0
         );
-        // What the plan shares must be read and written device-coherently.
-        for x in cmd.bindings {
-            let shared = self
-                .kv
-                .binding(x)
-                .is_some_and(|l| self.planned.plan.shared.contains(&l));
-            if shared && !adapter.coherent.contains(x.binding_index()) {
-                let e = MegakernelError::IncoherentShared {
-                    symbol: cmd.function,
-                    binding: x.binding_index(),
-                };
-                return Err(defect(cmd.function, e));
-            }
-        }
         let policy = self.policy(a)?;
         Ok(StepText {
             what: format!("{} (baked {b})", cmd.function),
@@ -1570,7 +1587,7 @@ enum PerItem {
     Widest,
     /// A co-issued member's whole grid in one item.
     Coissued(u32),
-    /// Spread step `ord` of phase shape `shape`: the shape's split, in `MK_P`.
+    /// Spread step `ord` of segment shape `shape`: the shape's split, in `MK_P`.
     Split { shape: usize, ord: usize },
 }
 
@@ -1582,44 +1599,6 @@ struct StepText {
     call: String,
     tg_bytes: u32,
     stride: u32,
-}
-
-/// Where the emission stands: the loops around it (counter, iterations), what ran before, and
-/// the grid-barrier sites so far.
-struct Emit {
-    loops: Vec<(String, u32)>,
-    prior: Prior,
-    sites: u32,
-}
-
-impl Emit {
-    /// The grid barrier opening a phase here: none before the kernel's first phase, guarded by
-    /// the counters of a loop the kernel starts in.
-    fn barrier(&mut self, ind: &str, out: &mut String) {
-        let site = self.sites;
-        let call = format!("mk_grid_sync(mk_sync, mk_idx, mk_p, mk_t, mk_gen, mk_ok, {site}u);");
-        match &self.prior {
-            Prior::Nothing => return,
-            Prior::Always => {
-                let _ = writeln!(out, "{ind}{call}");
-            }
-            Prior::Unless(cs) => {
-                let _ = writeln!(out, "{ind}if (({}) != 0u) {call}", cs.join(" | "));
-            }
-        }
-        self.sites += 1;
-    }
-}
-
-/// What ran before a point of the kernel text.
-#[derive(Clone, Debug)]
-enum Prior {
-    /// Nothing: the kernel's first phase needs no barrier.
-    Nothing,
-    /// Something, unless every one of these loop counters is 0 (loops the kernel starts in).
-    Unless(Vec<String>),
-    /// Something, always.
-    Always,
 }
 
 fn msl_type(ty: ConstantType) -> &'static str {
@@ -1754,12 +1733,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use scratchy_target_metal::tape::ids::GpuCores;
-    use std::collections::HashMap;
 
-    /// Evaluates the generated program-scope constants at one `MK_P`: the arithmetic the
-    /// pipeline's specialization folds (unsigned `+ - * / %`, comparisons, `?:`).
     /// Evaluates the generated program-scope constants and split functions with `p` threadgroups
-    /// launched and all `p` checked in (`MK_P` = `mk_p` = `p`): the arithmetic the kernel runs
+    /// launched (`MK_P` = `mk_p` = `p`): the arithmetic the pipeline's specialization folds
     /// (unsigned `+ - * / %`, comparisons, `?:`), each function of `mk_p` a name.
     fn eval_constants(text: &str, p: u32) -> HashMap<String, u64> {
         let mut env = HashMap::from([
@@ -1895,7 +1871,7 @@ mod tests {
             return v;
         }
         if t.get(*at).is_some_and(|y| y == "(") {
-            // A split function, called with the participants.
+            // A split function, called with the launch's threadgroups.
             assert_eq!(t[*at + 1..*at + 3], ["mk_p", ")"], "{x}(mk_p)");
             *at += 3;
         }
@@ -1939,39 +1915,39 @@ mod tests {
         }
     }
 
-    /// Every phase split is valid and even at every core count: each item plays at least one
+    /// Every segment split is valid and even at every core count: each item plays at least one
     /// virtual threadgroup and no more than the whole threadgroup holds, a step's items cover its
     /// grid with none empty, the cursors follow the items, no lane plays more rounds than the
     /// split's, and every pinned lane is a threadgroup of the launch.
     #[test]
-    fn a_phase_splits_evenly_at_every_core_count() {
+    fn a_segment_splits_evenly_at_every_core_count() {
         let fit = |vtgs: u32, widest: u32, whole: u32| SpreadIn {
             vtgs: format!("{vtgs}u"),
             declared: vtgs.div_ceil(widest),
             fit: Some((widest, whole)),
         };
         let shapes = [
-            PhaseShape {
+            SegmentShape {
                 spread: vec![fit(256, 1, 16)],
                 free: 0,
                 groups: 0,
             },
-            PhaseShape {
+            SegmentShape {
                 spread: vec![fit(128, 4, 32), fit(8, 1, 4)],
                 free: 2,
                 groups: 2,
             },
-            PhaseShape {
+            SegmentShape {
                 spread: vec![fit(3, 1, 1)],
                 free: 1,
                 groups: 1,
             },
-            PhaseShape {
+            SegmentShape {
                 spread: vec![fit(4096, 8, 32), fit(4096, 8, 32), fit(17, 2, 8)],
                 free: 0,
                 groups: 3,
             },
-            PhaseShape {
+            SegmentShape {
                 spread: vec![
                     fit(640, 16, 16),
                     SpreadIn {

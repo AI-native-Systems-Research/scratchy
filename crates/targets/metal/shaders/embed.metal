@@ -57,7 +57,7 @@ kernel void embed_bf16(
 
 // Megakernel adapter: the rows the dispatch threads of one virtual threadgroup gather (token
 // `tg_pos.x * tpg.x + t` for thread `t`), each row copied by all of its threads — a copy, so the
-// split writes the same bytes. The output (0) is device-coherent.
+// split writes the same bytes.
 template <typename T, typename C>
 MK_FUNC void mk_embed(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   if (!l.live) return;
@@ -113,6 +113,6 @@ kernel void embed_bf16_specialized(
     }
 }
 #else
-MK_TAIL(embed_f16_specialized, 0x1, (mk_embed<half, MK_C>), EMBED_CONSTS)
-MK_TAIL(embed_bf16_specialized, 0x1, (mk_embed<bfloat, MK_C>), EMBED_CONSTS)
+MK_TAIL(embed_f16_specialized, (mk_embed<half, MK_C>), EMBED_CONSTS)
+MK_TAIL(embed_bf16_specialized, (mk_embed<bfloat, MK_C>), EMBED_CONSTS)
 #endif // MK_BODIES_ONLY

@@ -2571,7 +2571,7 @@ impl Drop for MetalWorker {
 /// Releases the wired GPU residency if the guarded scope unwinds due to a panic.
 ///
 /// A worker-thread panic (e.g. a GPU command-buffer error the generated forward
-/// `.expect()`s — `ExecutionFailed(MTLCommandBufferStatus(5))`) unwinds under
+/// `.expect()`s — `GpuCommandFailed(OutOfMemory)`) unwinds under
 /// `panic = "unwind"` WITHOUT raising a signal, so it bypasses ec877a03's
 /// graceful teardown (SIGTERM → `worker.shutdown()`). The process is then left
 /// holding `requestResidency`-pinned GPU pages (a zombie server) that orphan on

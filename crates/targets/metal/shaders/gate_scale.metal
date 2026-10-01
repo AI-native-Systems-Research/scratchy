@@ -42,7 +42,7 @@ METAL_FUNC void gate_scale_body(OP out, IP routed, IP shared_y, IP g, uint gid) 
   out[gid] = static_cast<T>(r + s * sig_g);
 }
 
-// Megakernel adapter: out (0), routed (1), shared_y (2) and g (3) device-coherent.
+// Megakernel adapter: one lane per dispatch thread.
 template <typename T, typename C>
 MK_FUNC void mk_gate_scale(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   const uint gid = mk_thread_in_grid(l).x;
@@ -76,7 +76,7 @@ template <typename T>
       uint gid [[thread_position_in_grid]]);
 #else
 #define INST_GATE_SCALE(dtype_tag, mtl_type) \
-  MK_TAIL(gate_scale_##dtype_tag, 0xf, (mk_gate_scale<mtl_type, MK_C>), GATE_SCALE_CONSTS)
+  MK_TAIL(gate_scale_##dtype_tag, (mk_gate_scale<mtl_type, MK_C>), GATE_SCALE_CONSTS)
 #endif
 
 INST_GATE_SCALE(f16,  half)

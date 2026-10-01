@@ -324,8 +324,6 @@ struct AttnFc {
     static METAL_FUNC uint tq_heads() { return ATTN_TQ_HEADS; }
 };
 #endif
-// The megakernel adapter's region: the kernel's four threadgroup arrays (floats), then q.
-#define ATTN_MK_TG_FLOATS (1024 + 256 + 256 + 16)
 // A megakernel step's constants: its generated policy spells an unset constant as 0 — already the
 // derived value except the heads (default 1) and the bias switches (`has_…`: set or not).
 template <typename G>
@@ -692,7 +690,7 @@ INSTANTIATE_TQ_PREFILL(bf16, bfloat)
 // 1024 threads — the dispatch's own — so no lane is ever dead and the control flow is the
 // kernel's). `C`: the constant policy (`AttnFc` / `AttnMk`); `OP` / `QP`: output / q; `KP`: the
 // KV pages' pointer type (the chunk tables hand out addresses); `PP` / `NP`: the TurboQuant packed
-// codes / norms — device-coherent in the megakernel, where other units wrote them.
+// codes' / norms'.
 template <typename T, typename C, typename OP, typename QP, typename KP, typename PP, typename NP>
 METAL_FUNC void attention_via_cache_v2_body(
     OP output,
@@ -720,8 +718,8 @@ METAL_FUNC void attention_via_cache_v2_body(
     threadgroup float* tq_lut)      // [16]
 {
     // Source order, not the compiler's: fast math lets the GPU compiler re-associate these sums,
-    // and HOW it does depends on the size of the function it compiles — this body inside the
-    // whole-forward megakernel re-associated differently than in its own dispatch kernel
+    // and HOW it does depends on the size of the function it compiles — this body inside a
+    // generated megakernel re-associated differently than in its own dispatch kernel
     // (Gemma-4 sliding attention, one bf16 ulp at one element, then diverging tokens). With
     // re-association off both compile the same sums in the same order. Contraction likewise:
     // fast math may fuse any multiply into any later add, and which it fuses differed between the
@@ -1134,27 +1132,14 @@ METAL_FUNC void attention_via_cache_v2_body(
     }
 }
 
-// Megakernel adapter: output (0), the KV pages (via 4 / 5) and the TurboQuant stores (7-10)
-// device-coherent; tg_outputs / tg_max / tg_sum / tq_lut in the region. q (1) — written by another
-// unit — is copied (device-coherently, once) into the region and the body reads the copy: the
-// body's q loads must stay ordinary loads, which the compiler hoists and CSEs exactly as in the
-// dispatch kernel. (Read through coherent-load intrinsics, which it cannot move, the loop-invariant
-// `scale · q` is re-associated with the key — different bits whenever the scale is no power of 2.)
+// Megakernel adapter: tg_outputs / tg_max / tg_sum / tq_lut in the region; the body reads q (1)
+// in place, as the dispatch kernel does.
 template <typename T, typename C>
 MK_FUNC void mk_attention_via_cache_v2(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
     threadgroup float* region = (threadgroup float*)mk_region(s, l, tg);
-    // The rows the body reads: `heads` query heads from `q_head_idx` of sequence `seq_idx`.
-    const uint heads = C::tq_heads();
-    const uint row = (l.tg_pos.x * C::num_q() + l.tg_pos.y * heads) * C::head_dim();
-    threadgroup T* q_copy = (threadgroup T*)(region + ATTN_MK_TG_FLOATS);
-    mk_cptr<T> q = (mk_cptr<T>)s.addr[1] + row;
-    for (uint i = l.tid; i < heads * C::head_dim(); i += l.tpg.x) {
-        q_copy[i] = q[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    attention_via_cache_v2_body<T, C, mk_ptr<T>, threadgroup const T*, mk_cptr<T>, mk_cptr<uint>,
+    attention_via_cache_v2_body<T, C, mk_ptr<T>, mk_cptr<T>, mk_cptr<T>, mk_cptr<uint>,
                                 mk_cptr<float>>(
-        (mk_ptr<T>)s.addr[0], (threadgroup const T*)q_copy - row, (device const uint*)s.addr[2],
+        (mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1], (device const uint*)s.addr[2],
         (device const uint*)s.addr[3], (device const uint64_t*)s.addr[4],
         (device const uint64_t*)s.addr[5], (device const T*)s.addr[6],
         (mk_cptr<uint>)s.addr[7], (mk_cptr<uint>)s.addr[8], (mk_cptr<float>)s.addr[9],
@@ -1229,10 +1214,9 @@ template <typename T>
         uint simd_gid [[simdgroup_index_in_threadgroup]],                              \
         uint simd_lid [[thread_index_in_simdgroup]]);
 #else
-// tg_outputs[1024] + tg_max[256] + tg_sum[256] + tq_lut[16] float, then the q copy (at most
-// 1024 elements: heads · head_dim / 32 <= 32).
+// tg_outputs[1024] + tg_max[256] + tg_sum[256] + tq_lut[16] float.
 #define INSTANTIATE_ATTENTION_VIA_CACHE_V2(tag, T)                                             \
-    MK_ADAPTER(attention_via_cache_v2_##tag##_specialized, 8256, 0x7b3,                         \
+    MK_ADAPTER(attention_via_cache_v2_##tag##_specialized, 6208,                                \
                (mk_attention_via_cache_v2<T, AttnMk<MK_C>>), ATTN_CONSTS)
 #endif
 

@@ -51,7 +51,8 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         | "LoweredCommand" | "GatedCommand" | "WeightTensor" | "RuntimeBindingKind"
         | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape" | "CapPatch" | "ScratchPatch"
         | "ScratchField" | "GenClass" | "PatchTarget" | "TapeLoop" | "MegakernelTape"
-        | "MkKernelStep" | "MkLoadConstant" | "MkLoadSource" | "CommandSpan" => {
+        | "MkSegment" | "MkCut" | "MkKernelStep" | "MkPlace" | "MkLoadConstant"
+        | "MkLoadSource" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {

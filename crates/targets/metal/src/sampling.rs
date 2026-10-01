@@ -730,7 +730,7 @@ mod tests {
             1,
             vocab,
         );
-        batch.commit(true);
+        batch.commit();
 
         let got = read_slice::<u32>(&out, 1);
         assert_eq!(
@@ -978,7 +978,7 @@ mod tests {
             1,
             vocab,
         );
-        batch.commit(true);
+        batch.commit();
         Some(read_slice::<u32>(&out, 1)[0])
     }
 
@@ -1260,7 +1260,7 @@ mod tests {
                 max_out,
                 max_prompt,
             );
-            batch.commit(true);
+            batch.commit();
 
             let got = read_slice::<f32>(&logits_buf, vocab);
 
@@ -1373,7 +1373,7 @@ mod tests {
             max_out,
             max_prompt,
         );
-        batch.commit(true);
+        batch.commit();
 
         let got = read_slice::<f32>(&logits_buf, 2 * vocab);
 

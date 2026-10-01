@@ -135,8 +135,8 @@ METAL_FUNC void gdn_scan_varlen_body(
   }
 }
 
-// Megakernel adapter: o (0), conv_out (1), g (2) and beta (3) device-coherent; the layer's
-// recurrent state is touched by this step alone, one thread per (value-dim, head, sequence).
+// Megakernel adapter: the layer's recurrent state is touched by this step alone, one thread per
+// (value-dim, head, sequence).
 template <typename T, typename C>
 MK_FUNC void mk_gdn_scan_varlen(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   if (!l.live) return;
@@ -180,7 +180,7 @@ template <typename T>
       uint3 tpig [[thread_position_in_grid]]);
 #else
 #define INST_GDN_SCAN_VARLEN(dtype_tag, mtl_type)                                        \
-  MK_ADAPTER(gdn_scan_varlen_##dtype_tag, 0, 0xf, (mk_gdn_scan_varlen<mtl_type, MK_C>),  \
+  MK_ADAPTER(gdn_scan_varlen_##dtype_tag, 0, (mk_gdn_scan_varlen<mtl_type, MK_C>),       \
              GDN_SCAN_CONSTS)
 #endif
 

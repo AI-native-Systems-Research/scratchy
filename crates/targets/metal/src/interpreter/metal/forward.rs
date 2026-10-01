@@ -16,8 +16,6 @@
 //! buffers" — the forward path validates each present slice against
 //! the worker's per-buffer capacity and copies the bytes through.
 
-use crate::interpreter::metal::__re::MTLCommandBufferStatus;
-
 use super::worker::WorkerError;
 
 /// One forward step's runtime inputs.
@@ -251,15 +249,12 @@ pub enum ForwardError {
     /// Worker encoding / lookup failed (pipeline lookup, GEMM encode,
     /// arena slot out of range, …).
     Worker(WorkerError),
-    /// `commit` + `wait_until_completed` finished with a non-Completed
-    /// status. This is the GPU-side failure mode — Metal exposes only
-    /// the enum, not the underlying NSError.
-    ExecutionFailed(MTLCommandBufferStatus),
+    /// The GPU did not complete the forward's command buffer, as Metal's
+    /// report on its commit says: its outputs are not the forward's.
+    GpuCommandFailed(crate::mtl4_dispatch::CommandFailure),
     /// A caller-supplied followup hook (e.g. argmax encode + wait
     /// chained on the forward CB's shared event) failed.
     Followup(String),
-    /// A megakernel run of the forward gave up a bounded wait.
-    Megakernel(super::lowered::MegakernelError),
 }
 
 impl std::fmt::Display for ForwardError {
@@ -284,14 +279,10 @@ impl std::fmt::Display for ForwardError {
                  (needs {bytes_needed} bytes, have {bytes_available})"
             ),
             Self::Worker(e) => write!(f, "MetalWorkerPool::forward: {e}"),
-            Self::ExecutionFailed(status) => write!(
-                f,
-                "MetalWorkerPool::forward: command buffer status = {status:?} (expected Completed)"
-            ),
+            Self::GpuCommandFailed(failure) => write!(f, "MetalWorkerPool::forward: {failure}"),
             Self::Followup(msg) => {
                 write!(f, "MetalWorkerPool::forward: followup hook failed: {msg}")
             }
-            Self::Megakernel(e) => write!(f, "MetalWorkerPool::forward: {e}"),
         }
     }
 }

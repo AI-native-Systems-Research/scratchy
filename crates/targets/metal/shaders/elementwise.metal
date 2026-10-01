@@ -72,8 +72,7 @@ kernel void add_bf16(
 #endif // MK_BODIES_ONLY
 
 // Bodies shared by the dispatch kernels below and their megakernel adapters: element `gid` (the
-// dispatch's [[thread_position_in_grid]]; exact grids, no bounds check). The adapters bind the
-// tape-written operands device-coherently.
+// dispatch's [[thread_position_in_grid]]; exact grids, no bounds check).
 template <typename RP, typename DP>
 METAL_FUNC void residual_add_body(RP residual, DP delta, uint gid) {
     residual[gid] = residual[gid] + delta[gid];
@@ -94,7 +93,7 @@ MK_FUNC void mk_residual_add(thread const MkStep& s, MkLane l, threadgroup uchar
   }
 #else
 #define INST_RESIDUAL_ADD(tag, T) \
-  MK_TAIL(residual_add_##tag##_specialized, 0x3, (mk_residual_add<T>), MK_NO_CONSTS)
+  MK_TAIL(residual_add_##tag##_specialized, (mk_residual_add<T>), MK_NO_CONSTS)
 #endif
 INST_RESIDUAL_ADD(f16, half)
 INST_RESIDUAL_ADD(bf16, bfloat)
@@ -139,7 +138,7 @@ MK_FUNC void mk_mm_embed_splice(thread const MkStep& s, MkLane l, threadgroup uc
   }
 #else
 #define INST_MM_EMBED_SPLICE(tag, T) \
-  MK_TAIL(mm_embed_splice_##tag, 0x1, (mk_mm_embed_splice<T>), MK_NO_CONSTS)
+  MK_TAIL(mm_embed_splice_##tag, (mk_mm_embed_splice<T>), MK_NO_CONSTS)
 #endif
 INST_MM_EMBED_SPLICE(f16, half)
 INST_MM_EMBED_SPLICE(bf16, bfloat)
@@ -254,7 +253,7 @@ struct BiasAddFc {
 };
 #endif
 
-// Body shared by the dispatch kernels and the megakernel adapter (input / out coherent there).
+// Body shared by the dispatch kernels and the megakernel adapter.
 template <typename C, typename IP, typename BP, typename OP>
 METAL_FUNC void bias_add_body(IP input, BP bias, OP out, uint gid) {
     out[gid] = input[gid] + bias[gid % C::cols()];
@@ -277,7 +276,7 @@ MK_FUNC void mk_bias_add(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   }
 #else
 #define INST_BIAS_ADD(tag, T) \
-  MK_TAIL(bias_add_##tag##_specialized, 0x5, (mk_bias_add<T, MK_C>), BIAS_ADD_CONSTS)
+  MK_TAIL(bias_add_##tag##_specialized, (mk_bias_add<T, MK_C>), BIAS_ADD_CONSTS)
 #endif
 INST_BIAS_ADD(f16, half)
 INST_BIAS_ADD(bf16, bfloat)
@@ -370,10 +369,10 @@ MK_FUNC void mk_scalar_weight_mul(thread const MkStep& s, MkLane l, threadgroup 
   }
 #else
 #define INST_SCALAR_MUL(tag, T)                                                             \
-  MK_TAIL(scalar_mul_##tag##_specialized, 0x3, (mk_scalar_mul<T, MK_C>),            \
+  MK_TAIL(scalar_mul_##tag##_specialized, (mk_scalar_mul<T, MK_C>),                 \
              SCALAR_MUL_CONSTS)
 #define INST_SCALAR_WEIGHT_MUL(tag, T)                                                      \
-  MK_TAIL(scalar_weight_mul_##tag##_specialized, 0x3, (mk_scalar_weight_mul<T>),   \
+  MK_TAIL(scalar_weight_mul_##tag##_specialized, (mk_scalar_weight_mul<T>),        \
              MK_NO_CONSTS)
 #endif
 INST_SCALAR_MUL(f16, half)
@@ -417,7 +416,7 @@ MK_FUNC void mk_tanh_soft_cap(thread const MkStep& s, MkLane l, threadgroup ucha
   }
 #else
 #define INST_TANH_SOFT_CAP(tag, T)                                                          \
-  MK_TAIL(tanh_soft_cap_##tag##_specialized, 0x3, (mk_tanh_soft_cap<T, MK_C>),      \
+  MK_TAIL(tanh_soft_cap_##tag##_specialized, (mk_tanh_soft_cap<T, MK_C>),           \
              TANH_SOFTCAP_CONSTS)
 #endif
 INST_TANH_SOFT_CAP(f16, half)

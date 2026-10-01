@@ -28,7 +28,7 @@ struct MwsFc {
 };
 #endif
 
-// Body shared by the dispatch kernel and the megakernel adapter (every operand coherent there).
+// Body shared by the dispatch kernel and the megakernel adapter.
 template <typename T, typename C, typename EP, typename SP, typename OP>
 METAL_FUNC void moe_weighted_sum_body(EP expert_out, SP scores, OP out, uint2 gid, uint2 grid) {
   uint d = gid.x;
@@ -73,7 +73,7 @@ template <typename T>
       uint2 grid [[threads_per_grid]]);
 #else
 #define INSTANTIATE_MWS(tag, type)                                                            \
-  MK_TAIL(moe_weighted_sum_##tag, 0x7, (mk_moe_weighted_sum<type, MK_C>), MWS_CONSTS)
+  MK_TAIL(moe_weighted_sum_##tag, (mk_moe_weighted_sum<type, MK_C>), MWS_CONSTS)
 #endif
 
 INSTANTIATE_MWS(float16, half)

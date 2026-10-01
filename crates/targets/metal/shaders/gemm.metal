@@ -210,12 +210,12 @@ inline void gemm_t_f16_body(
     GEMM_T_BODY(half, simdgroup_half8x8)
 }
 
-// Megakernel adapter: one 8×8 output tile per virtual threadgroup (one simdgroup), output (0) /
-// input (1) coherent. The dispatch kernel's A tiles, B tiles and multiply-accumulate order, but
-// the A tiles of MK_GEMM_KB consecutive K steps staged at once (one simdgroup barrier per
-// MK_GEMM_KB steps instead of per step) and their weight (B) tiles loaded before the first of their
-// multiply-accumulates, so the loads overlap — at M = 1 (the MoE router logits) the body is a
-// serial chain of K / 8 steps, each otherwise waiting on its load.
+// Megakernel adapter: one 8×8 output tile per virtual threadgroup (one simdgroup). The dispatch
+// kernel's A tiles, B tiles and multiply-accumulate order, but the A tiles of MK_GEMM_KB
+// consecutive K steps staged at once (one simdgroup barrier per MK_GEMM_KB steps instead of per
+// step) and their weight (B) tiles loaded before the first of their multiply-accumulates, so the
+// loads overlap — at M = 1 (the MoE router logits) the body is a serial chain of K / 8 steps, each
+// otherwise waiting on its load.
 // Its a_rows / b_pad / c_scratch (MK_GEMM_KB·128 + 128 + 256 bytes) in its region.
 #define MK_GEMM_KB 8u
 template <typename T, typename MAT_T, typename C>
@@ -279,9 +279,9 @@ kernel void gemm_f16_specialized(
                     a_pad, b_pad, c_scratch, tgid, tid3.x);
 }
 #else
-MK_ADAPTER(gemm_bf16_specialized, 1408, 0x3, (mk_gemm<bfloat, simdgroup_bfloat8x8, MK_C>),
+MK_ADAPTER(gemm_bf16_specialized, 1408, (mk_gemm<bfloat, simdgroup_bfloat8x8, MK_C>),
            GEMM_CONSTS)
-MK_ADAPTER(gemm_f16_specialized, 1408, 0x3, (mk_gemm<half, simdgroup_half8x8, MK_C>), GEMM_CONSTS)
+MK_ADAPTER(gemm_f16_specialized, 1408, (mk_gemm<half, simdgroup_half8x8, MK_C>), GEMM_CONSTS)
 #endif
 
 #ifndef MK_BODIES_ONLY

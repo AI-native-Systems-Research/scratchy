@@ -123,7 +123,7 @@ constant uint AFFINE_CODES_XOR =
     is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x88u : 0u;
 #endif
 
-// `OP`: the output pointer type — device-coherent when the megakernel plays it.
+// `OP`: the output pointer type.
 template <typename T_act, typename T_scale, const int group_size, typename OP = device T_act*>
 inline void affine_embed_b4_kernel(
     const device uint8_t* w,
@@ -174,7 +174,7 @@ inline void affine_embed_b4_kernel(
     }
 #else
 #define DEFINE_AFFINE_EMBED_B4(act_tag, act_type, scale_tag, scale_type, gs)                  \
-    MK_ADAPTER(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_4, 0, 0x10,              \
+    MK_ADAPTER(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_4, 0,                    \
                (mk_affine_embed<act_type, scale_type, gs, 4, MK_C>), AFFINE_EMBED_CONSTS)
 #endif
 
@@ -216,7 +216,7 @@ inline void affine_embed_b8_kernel(
     out[out_offset] = scale * T_act(val) + bias;
 }
 
-// Megakernel adapters: the gather-dequant of one dispatch thread, the output (4) coherent.
+// Megakernel adapters: the gather-dequant of one dispatch thread.
 template <typename T_act, typename T_scale, int gs, int bits, typename C>
 MK_FUNC void mk_affine_embed(thread const MkStep& s, MkLane l, threadgroup uchar*) {
     if (!l.live) return;
@@ -251,7 +251,7 @@ MK_FUNC void mk_affine_embed(thread const MkStep& s, MkLane l, threadgroup uchar
     }
 #else
 #define DEFINE_AFFINE_EMBED_B8(act_tag, act_type, scale_tag, scale_type, gs)                  \
-    MK_ADAPTER(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_8, 0, 0x10,              \
+    MK_ADAPTER(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_8, 0,                    \
                (mk_affine_embed<act_type, scale_type, gs, 8, MK_C>), AFFINE_EMBED_CONSTS)
 #endif
 

@@ -32,7 +32,7 @@ METAL_FUNC void gate_apply_body(OP out, IP attn, IP gate, uint gid) {
   out[gid] = static_cast<T>(a * sig_g);
 }
 
-// Megakernel adapter: out (0), attn (1) and gate (2) device-coherent.
+// Megakernel adapter: one lane per dispatch thread.
 template <typename T, typename C>
 MK_FUNC void mk_gate_apply(thread const MkStep& s, MkLane l, threadgroup uchar*) {
   const uint gid = mk_thread_in_grid(l).x;
@@ -63,7 +63,7 @@ template <typename T>
       uint gid [[thread_position_in_grid]]);
 #else
 #define INST_GATE_APPLY(dtype_tag, mtl_type) \
-  MK_TAIL(gate_apply_##dtype_tag, 0x7, (mk_gate_apply<mtl_type, MK_C>), GATE_APPLY_CONSTS)
+  MK_TAIL(gate_apply_##dtype_tag, (mk_gate_apply<mtl_type, MK_C>), GATE_APPLY_CONSTS)
 #endif
 
 INST_GATE_APPLY(f16,  half)

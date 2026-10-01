@@ -20,10 +20,8 @@
 use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBufferStatus};
-use objc2_metal::{
-    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTLDevice,
-};
+use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer};
+use objc2_metal::{MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTLDevice};
 
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
@@ -294,32 +292,19 @@ struct Mtl4Pool {
     allocator: crate::interpreter::metal::__re::Mtl4Allocator,
     shared_event: crate::interpreter::metal::__re::SharedEvent,
     signal_counter: u64,
-    /// Commit options carrying the feedback handler that records GPU
-    /// execution errors (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory).
-    /// Reused across commits; access is serialized by the `mtl4` Mutex.
-    commit_options: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
-    /// Last GPU execution error reported via commit feedback. Checked
-    /// after every event wait — a silently-failed command buffer
-    /// otherwise produces all-zero outputs and degenerate logits
-    /// (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode).
-    commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// Where one [`MetalWorkerPool::submit`] spent its time, for `SCRATCHY_METAL_TRACE`.
+/// Where one [`MetalWorkerPool::submit`] spent its time, for `SCRATCHY_METAL_TRACE`: encoding, then
+/// commit to the GPU's completion report ([`commit_and_wait`](crate::mtl4_dispatch::commit_and_wait)).
 struct Submitted {
     encode: std::time::Duration,
-    commit: std::time::Duration,
-    wait: std::time::Duration,
+    complete: std::time::Duration,
 }
 
 impl std::fmt::Display for Submitted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            encode,
-            commit,
-            wait,
-        } = self;
-        write!(f, "encode={encode:?} commit={commit:?} wait={wait:?}")
+        let Self { encode, complete } = self;
+        write!(f, "encode={encode:?} complete={complete:?}")
     }
 }
 
@@ -731,61 +716,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .device
             .newSharedEvent()
             .expect("device.newSharedEvent() returned nil");
-        let commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let commit_options = objc2_metal::MTL4CommitOptions::new();
-        {
-            let err_slot = std::sync::Arc::clone(&commit_error);
-            let block = block2::RcBlock::new(
-                move |feedback: std::ptr::NonNull<
-                    objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
-                >| {
-                    use objc2_metal::MTL4CommitFeedback as _;
-                    let fb = unsafe { feedback.as_ref() };
-                    if let Some(e) = fb.error() {
-                        let msg = format!("{e}");
-                        eprintln!("[scratchy-target-metal] GPU COMMIT ERROR: {msg}");
-                        // Dump the FULL NSError — code/domain/userInfo. MTL
-                        // folds the faulting-encoder label + GPU fault info
-                        // into userInfo (MTLCommandBufferEncoderInfoErrorKey),
-                        // which the bare Display ("...error 1.") drops. This
-                        // is the only signal that names WHICH dispatch faulted.
-                        eprintln!(
-                            "[scratchy-target-metal] GPU COMMIT ERROR code={} domain={}",
-                            e.code(),
-                            e.domain(),
-                        );
-                        // userInfo carries NSUnderlyingError /
-                        // NSMultipleUnderlyingErrorsKey whose NESTED NSError
-                        // userInfo holds the real per-encoder fault reason.
-                        // Debug prints only pointers; NSObject `description`
-                        // recurses and renders the whole tree.
-                        {
-                            use objc2::runtime::AnyObject;
-                            let ui = e.userInfo();
-                            let ui_obj: &AnyObject = &ui;
-                            let desc: objc2::rc::Retained<objc2_foundation::NSString> =
-                                unsafe { objc2::msg_send![ui_obj, description] };
-                            eprintln!("[scratchy-target-metal] GPU COMMIT ERROR userInfo: {desc}");
-                        }
-                        *err_slot.lock().expect("commit_error mutex") = Some(msg);
-                    }
-                },
-            );
-            unsafe { commit_options.addFeedbackHandler(block2::RcBlock::as_ptr(&block) as _) };
-            // The options object retains the handler block per Apple's
-            // contract ("references your commit feedback handler after
-            // you add it"); leak our RcBlock so the pointer stays valid
-            // for the pool's lifetime regardless.
-            std::mem::forget(block);
-        }
         *slot = Some(Mtl4Pool {
             queue,
             allocator,
             shared_event,
             signal_counter: 0,
-            commit_options,
-            commit_error,
         });
     }
 
@@ -815,7 +750,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     {
         self.ensure_mtl4();
         let trace = std::env::var_os("SCRATCHY_METAL_TRACE").is_some();
-        let ((), took) = self.submit(worker, |enc| {
+        let ((), took) = self.submit(|enc| {
             worker
                 .run_bucket_mtl4(
                     bucket_idx,
@@ -836,14 +771,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if trace {
             eprintln!(
                 "[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4] {took} \
-                 megakernel_runs={} participants={}",
-                worker.megakernel_runs_played(),
-                match worker.megakernel_runs_played() {
-                    0 => "-".to_string(),
-                    _ => worker
-                        .megakernel_participants(bucket_idx)
-                        .map_or("-".to_string(), |p| p.to_string()),
-                },
+                 segment_launches={}",
+                worker.segment_launches_played(),
             );
         }
         Ok(())
@@ -853,27 +782,26 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// its compute encoder, the pool's residency sets declared on it; if it
     /// fails, its error returns with the command buffer ended and nothing
     /// committed. Otherwise the command buffer is committed and this returns
-    /// once the GPU is done with it ([`wait_drained`]) — completed, or failed
-    /// with the error the commit feedback reports, or with the first bounded
-    /// wait a megakernel run of `worker` gave up on — so nothing it reads is
-    /// still in use when the caller gets control back.
+    /// once the GPU is done with it and Metal has reported on it
+    /// ([`commit_and_wait`]), so nothing it reads is still in use when the
+    /// caller gets control back: a command buffer the report says failed
+    /// returns [`ForwardError::GpuCommandFailed`] — its outputs are not the
+    /// forward's.
     ///
-    /// [`wait_drained`]: crate::mtl4_dispatch::wait_drained
+    /// [`commit_and_wait`]: crate::mtl4_dispatch::commit_and_wait
     fn submit<R>(
         &self,
-        worker: &MetalWorker<W>,
         encode: impl FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         ) -> Result<R, ForwardError>,
     ) -> Result<(R, Submitted), ForwardError> {
         use objc2::runtime::AnyObject;
-        use std::ptr::NonNull;
         let t_pre = std::time::Instant::now();
         let cb = self
             .device
             .newCommandBuffer()
             .expect("newCommandBuffer returned nil");
-        let (encoded, signal_value, queue, event, commit_opts, commit_err) = {
+        let (encoded, signal_value, queue, event) = {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");
             let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
             cb.beginCommandBufferWithAllocator(&mtl4.allocator);
@@ -911,33 +839,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 mtl4.signal_counter,
                 mtl4.queue.clone(),
                 mtl4.shared_event.clone(),
-                mtl4.commit_options.clone(),
-                std::sync::Arc::clone(&mtl4.commit_error),
             )
         };
         let t_encoded = t_pre.elapsed();
-        let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
-            &cb;
-        let mut cb_array = [NonNull::from(cb_protocol)];
-        unsafe {
-            queue.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
-        }
-        // Signal AFTER the cmdbuf so the wait fires only once GPU work
-        // is fully drained.
-        queue.signalEvent_value(
-            ::objc2::runtime::ProtocolObject::from_ref(&*event),
-            signal_value,
-        );
-        let t_committed = t_pre.elapsed();
-        crate::mtl4_dispatch::wait_drained(&event, signal_value);
-        // GPU execution errors (e.g. command-buffer OOM) arrive via the
-        // commit feedback handler and DO NOT fail the event wait — a
-        // failed CB otherwise yields all-zero outputs and degenerate
-        // logits silently (macOS 26.5.1 / Qwen3.5-MoE "!!!!").
-        if let Some(msg) = commit_err.lock().expect("commit_error mutex").take() {
-            eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
-        }
+        let completed = crate::mtl4_dispatch::commit_and_wait(&queue, &cb, &event, signal_value);
         // Reset the allocator now that the GPU is done. Holds the
         // mutex briefly.
         {
@@ -946,16 +851,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 mtl4.allocator.reset();
             }
         }
-        worker
-            .take_megakernel_stall()
-            .map_err(ForwardError::Megakernel)?;
-        let t_waited = t_pre.elapsed();
+        completed.map_err(ForwardError::GpuCommandFailed)?;
         Ok((
             encoded,
             Submitted {
                 encode: t_encoded,
-                commit: t_committed - t_encoded,
-                wait: t_waited - t_committed,
+                complete: t_pre.elapsed() - t_encoded,
             },
         ))
     }
@@ -1012,9 +913,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         begin_step(&guard, inputs)?;
 
         // Caller's body encodes the entire chain onto the encoder.
-        let (body_result, took) = self.submit(&guard.worker, |enc| {
-            body(&guard.worker, &guard.runtime, enc)
-        })?;
+        let (body_result, took) = self.submit(|enc| body(&guard.worker, &guard.runtime, enc))?;
         if trace {
             eprintln!("[chain encoder mtl4] {took}");
         }

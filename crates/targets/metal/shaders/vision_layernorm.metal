@@ -82,8 +82,8 @@ METAL_FUNC void vision_layernorm_body(OP output, IP input, device const T_scale*
   }
 }
 
-// Megakernel adapter: output (0) and input (1) device-coherent; one virtual threadgroup per row
-// owns the dispatch kernel's `sh_sum[1024]` + `sh_sq[1024]`.
+// Megakernel adapter: one virtual threadgroup per row owns the dispatch kernel's `sh_sum[1024]` +
+// `sh_sq[1024]`.
 template <typename T, typename T_scale, typename C>
 MK_FUNC void mk_vision_layernorm(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
   threadgroup float* sh = (threadgroup float*)mk_region(s, l, tg);
@@ -126,7 +126,7 @@ template <typename T, typename T_scale>
       uint tg_size [[threads_per_threadgroup]]);
 #else
 #define INST_VISION_LAYERNORM(dtype_tag, mtl_type, scale_tag, mtl_scale)                   \
-  MK_ADAPTER(vision_layernorm_##dtype_tag##_s_##scale_tag, 8192, 0x3,                     \
+  MK_ADAPTER(vision_layernorm_##dtype_tag##_s_##scale_tag, 8192,                          \
              (mk_vision_layernorm<mtl_type, mtl_scale, MK_C>), LN_CONSTS)
 #endif
 

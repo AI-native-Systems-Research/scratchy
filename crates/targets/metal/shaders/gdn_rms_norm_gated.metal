@@ -80,8 +80,7 @@ METAL_FUNC void gdn_rms_norm_gated_body(OP out, XP x, ZP z, const device float* 
   }
 }
 
-// Megakernel adapter: out (0), x (1) and z (2) device-coherent; one virtual threadgroup per row
-// owns the dispatch kernel's `sdata[1024]`.
+// Megakernel adapter: one virtual threadgroup per row owns the dispatch kernel's `sdata[1024]`.
 template <typename T, typename C>
 MK_FUNC void mk_gdn_rms_norm_gated(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
   gdn_rms_norm_gated_body<T, C>((mk_ptr<T>)s.addr[0], (mk_cptr<float>)s.addr[1],
@@ -120,7 +119,7 @@ template <typename T>
       uint tg_size [[threads_per_threadgroup]]);
 #else
 #define INST_GDN_RMS_NORM_GATED(dtype_tag, mtl_type)                                    \
-  MK_ADAPTER(gdn_rms_norm_gated_##dtype_tag, 4096, 0x7,                                 \
+  MK_ADAPTER(gdn_rms_norm_gated_##dtype_tag, 4096,                                      \
              (mk_gdn_rms_norm_gated<mtl_type, MK_C>), GDN_RMS_CONSTS)
 #endif
 

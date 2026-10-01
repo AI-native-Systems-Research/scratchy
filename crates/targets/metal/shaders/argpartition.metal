@@ -329,9 +329,9 @@ struct KernelMergeSort {
   }
 };
 
-// Megakernel adapter of the contiguous arg-sort: inp (0) / out (1) coherent, the five sizes the
-// inline scalars by reference; `BYTES` (the instantiation line's declared threadgroup bytes) is
-// checked against the kernel's own arrays.
+// Megakernel adapter of the contiguous arg-sort: the five sizes the inline scalars by reference;
+// `BYTES` (the instantiation line's declared threadgroup bytes) is checked against the kernel's
+// own arrays.
 template <typename T, short BLOCK_THREADS, short N_PER_THREAD, uint BYTES>
 MK_FUNC void mk_arg_block_sort(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
   using sort_kernel = KernelMergeSort<T, uint, true, BLOCK_THREADS, N_PER_THREAD>;
@@ -433,7 +433,7 @@ block_sort(
       uint3 lid [[thread_position_in_threadgroup]]);
 #else
 #define INSTANTIATE_ARG_SORT(itname, itype, bn, tn, bytes)                                      \
-  MK_ADAPTER(c_arg_block_sort_##itname##_uint32_bn##bn##_tn##tn, bytes, 0x3,                 \
+  MK_ADAPTER(c_arg_block_sort_##itname##_uint32_bn##bn##_tn##tn, bytes,                      \
              (mk_arg_block_sort<itype, bn, tn, bytes>), MK_NO_CONSTS)
 #endif
 

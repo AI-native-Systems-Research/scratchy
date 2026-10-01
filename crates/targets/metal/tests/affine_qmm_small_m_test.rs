@@ -268,7 +268,7 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
             name
         }
     };
-    batch.commit(true);
+    batch.commit();
     let got: Vec<f32> =
         unsafe { std::slice::from_raw_parts(y_buf.contents().as_ptr() as *const u16, m * n) }
             .iter()

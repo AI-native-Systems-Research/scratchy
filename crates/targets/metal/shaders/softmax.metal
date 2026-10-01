@@ -127,8 +127,7 @@ inline T softmax_exp(T x) {
     }                                                                                   \
   }
 
-// Megakernel adapter: in (0) / out (1) coherent, `axis_size` the inline scalar by reference; the
-// two 32-entry reductions of one virtual threadgroup in its region.
+// Megakernel adapter: `axis_size` the inline scalar by reference; the two 32-entry reductions of one virtual threadgroup in its region.
 template <typename T, typename AccT>
 MK_FUNC void mk_softmax(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
   constexpr int N_READS = MLX_N_READS;
@@ -188,7 +187,7 @@ template <typename T, typename AccT = T, int N_READS = MLX_N_READS>
 #else
 // One virtual threadgroup owns `local_max[32]` + `local_normalizer[32]` of float.
 #define INSTANTIATE_PRECISE(tag, type) \
-  MK_ADAPTER(block_softmax_precise_##tag, 256, 0x3, (mk_softmax<type, float>), MK_NO_CONSTS)
+  MK_ADAPTER(block_softmax_precise_##tag, 256, (mk_softmax<type, float>), MK_NO_CONSTS)
 #define INSTANTIATE_NONPRECISE(tag, type)
 #endif
 
@@ -262,8 +261,7 @@ INSTANTIATE_NONPRECISE(float16, half)
     }                                                                                   \
   }
 
-// Megakernel adapter: in (0) / out (1) coherent, `axis_size` the inline scalar by reference; the
-// 32-entry reduction of one virtual threadgroup in its region.
+// Megakernel adapter: `axis_size` the inline scalar by reference; the 32-entry reduction of one virtual threadgroup in its region.
 template <typename T, typename AccT>
 MK_FUNC void mk_topk_renorm(thread const MkStep& st, MkLane l, threadgroup uchar* tg) {
   constexpr int N_READS = MLX_N_READS;
@@ -308,7 +306,7 @@ template <typename T, typename AccT = float, int N_READS = MLX_N_READS>
 #else
 // One virtual threadgroup owns `local_sum[32]` of float.
 #define INSTANTIATE_TOPK_RENORM(tag, type) \
-  MK_ADAPTER(topk_renorm_##tag, 128, 0x3, (mk_topk_renorm<type, float>), MK_NO_CONSTS)
+  MK_ADAPTER(topk_renorm_##tag, 128, (mk_topk_renorm<type, float>), MK_NO_CONSTS)
 #endif
 
 INSTANTIATE_TOPK_RENORM(float16, half)

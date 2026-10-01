@@ -193,7 +193,7 @@ mod tests {
     fn run(device: &Device, body: impl FnOnce(&mut Mtl4DispatchBatch)) {
         let mut batch = Mtl4DispatchBatch::begin(device).expect("no MTL4 queue");
         body(&mut batch);
-        batch.commit(true);
+        batch.commit();
     }
 
     /// One (dim, bits) codebook, uploaded exactly as `build_tq_provision` does.

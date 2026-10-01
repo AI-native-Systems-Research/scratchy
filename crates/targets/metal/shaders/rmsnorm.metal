@@ -118,7 +118,7 @@ METAL_FUNC void rmsnorm_body(OP output, IP input, const device T_scale* weight, 
     }
 }
 
-// Megakernel adapters: output / input device-coherent, one virtual threadgroup per dispatch row.
+// Megakernel adapters: one virtual threadgroup per dispatch row.
 template <typename T_act, typename T_scale, typename C>
 MK_FUNC void mk_rmsnorm(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
     rmsnorm_body<T_act, T_scale, C, false>((mk_ptr<T_act>)s.addr[0], (mk_cptr<T_act>)s.addr[1],
@@ -170,9 +170,9 @@ template <typename T_act, typename T_scale>
       rmsnorm_specialized_impl<act_type, scale_type>;
 #else
 // Megakernel mode: the same instantiation lines name the adapters. One virtual threadgroup owns
-// the dispatch kernel's `shared_sum[1024]`; output (0) and input (1) are coherent.
+// the dispatch kernel's `shared_sum[1024]`.
 #define INST_RMSNORM(act_tag, act_type, scale_tag, scale_type)                  \
-  MK_ADAPTER(rmsnorm_##act_tag##_s_##scale_tag##_specialized, 4096, 0x3,     \
+  MK_ADAPTER(rmsnorm_##act_tag##_s_##scale_tag##_specialized, 4096,          \
              (mk_rmsnorm<act_type, scale_type, MK_C>), RMSNORM_CONSTS)
 #endif
 
@@ -215,7 +215,7 @@ template <typename T_act>
       rmsnorm_unit_impl<act_type>;
 #else
 #define INST_RMSNORM_UNIT(act_tag, act_type)                                  \
-  MK_ADAPTER(rmsnorm_unit_##act_tag##_specialized, 4096, 0x3,              \
+  MK_ADAPTER(rmsnorm_unit_##act_tag##_specialized, 4096,                   \
              (mk_rmsnorm_unit<act_type, MK_C>), RMSNORM_UNIT_CONSTS)
 #endif
 

@@ -1,102 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
-//! THE DECODE MEGAKERNEL, LAUNCHED: a worker's side of a baked [`MegakernelTape`].
+//! THE DECODE MEGAKERNEL, LOADED: a worker's side of a baked [`MegakernelTape`].
 //!
-//! Everything was decided at expansion: the kernel's MSL — the whole decode forward, its work
-//! split in the GPU's cores `MK_P`, its grid barriers — compiled at build time into the tape's
-//! library ([`MK_BODIES`] and the generated source), as every shader is. At load the worker loads
-//! that library once, specializes the kernel with the device's persistent threadgroups `MK_P` and
-//! the load's scalars, and fills the address table — the same resolved bindings its argument
-//! tables get — at the positions the bake fixed. A forward is then ONE launch.
+//! Everything was decided at expansion: the segment kernels' MSL — each a run of the decode
+//! forward in which no threadgroup waits on another, its work split in the GPU's cores `MK_P` —
+//! compiled at build time into the tape's library ([`MK_BODIES`] and the generated source), as
+//! every shader is. At load the worker loads that library once, specializes each segment kernel
+//! with the device's cores `MK_P` and the load's scalars, and fills the address table — the same
+//! resolved bindings its argument tables get — at the positions the bake fixed. Every launch is
+//! then an ordinary dispatch step ([`BucketStep`]): `MK_P` threadgroups of its segment's kernel,
+//! binding its instance's block of the table, a barrier before it — played by the worker's
+//! dispatch loop like every other step.
 
-use std::ops::Range;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use ::objc2::rc::Retained;
-use ::objc2::runtime::ProtocolObject;
-use ::objc2_foundation::NSRange;
-use ::objc2_metal::{
-    MTL4ArgumentTable, MTL4CommandEncoder as _, MTL4ComputeCommandEncoder, MTL4VisibilityOptions,
-    MTLComputePipelineState as _, MTLStages,
-};
+use ::objc2_metal::MTLComputePipelineState as _;
 
-use super::__re::{
-    Buffer, ComputePipelineState, Device, MTL4ArgumentTableDescriptor, MTLBuffer, MTLDevice,
-    MTLResourceOptions, MTLSize,
-};
+use super::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use super::mtl4::{Mtl4Step, bake_mtl4_steps};
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
-use super::worker::WorkerError;
+use super::worker::{BucketStep, WorkerError};
 use crate::tape::constants::ConstantValue;
 use crate::tape::lowered::{
-    GatedCommand, MK_FC_CHECKIN_POLLS, MK_FC_P, MK_FC_SPIN_LIMIT, MK_THREADS, MegakernelError,
-    MegakernelTape, MkLoadSource,
+    GatedCommand, MK_FC_P, MK_THREADS, MegakernelError, MegakernelTape, MkLoadSource,
 };
 
 /// The adapters' bodies: `shaders/megakernel/megakernel.metal` with its local includes inlined
-/// (build.rs). A tape's generated kernel completes it; the bake compiles the two together.
+/// (build.rs). A tape's generated kernels complete it; the bake compiles the two together.
 pub const MK_BODIES: &str = include_str!(concat!(env!("OUT_DIR"), "/mk_bodies.metal"));
 
-/// Polls one grid-barrier wait may spend before it records a stall and gives up: about a second
-/// at the ~67 ns a poll took on an M1 Max. Every participant is running, so this bounds a wait for
-/// one the system holds up, not one that never started.
-const MK_SPIN_LIMIT: u32 = 1 << 24;
-
-/// Polls the first threadgroups to check in wait for the rest of the launch before it goes ahead
-/// without them: tens of microseconds. On an M1 Max every threadgroup normally checked in within
-/// 0 polls of the first; one held up by other work on the GPU came 1.6–2.3 million polls
-/// (120–155 ms) later.
-const MK_CHECKIN_POLLS: u32 = 1 << 10;
-
-/// The launch synchronization block: the stall word, the check-in's ticket counter and close word
-/// on one 128-byte line, then one 128-byte line per participant (the grid barriers it has arrived
-/// at this launch). Mirrors `MkSync` in `shaders/megakernel/megakernel.metal`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MkSyncBlock {
-    stall: [u32; 4],
-    checkin: u32,
-    closed: u32,
-    line: [u32; 26],
+/// A bucket's segmented decode, as one worker plays it: every launch of a forward as a step of
+/// the dispatch loop, and the address table they bind (pinned with the worker's buffers).
+pub struct Segmented {
+    pub steps: Vec<Mtl4Step>,
+    pub addresses: Buffer,
 }
-
-/// Where the block's per-launch state starts: everything after the stall word, which the host
-/// reads (and resets) after the forward.
-const MK_SYNC_LAUNCH_STATE: usize = std::mem::offset_of!(MkSyncBlock, checkin);
-
-/// Bytes of the synchronization block of a launch of `threadgroups`.
-fn sync_bytes(threadgroups: usize) -> usize {
-    size_of::<MkSyncBlock>() * (1 + threadgroups)
-}
-
-/// A bucket's megakernel, as one worker launches it.
-pub struct MegakernelBaking {
-    /// The expanded commands the launch replaces.
-    commands: Range<usize>,
-    pipeline: ComputePipelineState,
-    table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
-    /// Persistent threadgroups per launch (`MK_P`).
-    threadgroups: usize,
-    /// The address table; the argument table points at it.
-    addresses: Buffer,
-    /// The launch's synchronization block (host-visible: its stall word is read after every
-    /// forward).
-    sync: Buffer,
-}
-
-// Metal handles: retain/release is thread-safe, and a worker is checked out by one forward at a
-// time (the same grounds as `Mtl4Step`).
-unsafe impl Send for MegakernelBaking {}
-unsafe impl Sync for MegakernelBaking {}
 
 /// What one load measured, for the trace.
-pub struct MegakernelLoad {
-    pub steps: usize,
-    pub grid_barriers: u32,
+pub struct SegmentedLoad {
+    /// Commands the launches play, loops played out.
+    pub commands: usize,
+    pub kernels: usize,
+    pub launches: usize,
     /// The generated library's load, when this load loaded it (`None`: an earlier load of the
     /// pool did).
     pub loaded: Option<Duration>,
     pub metallib_bytes: usize,
-    pub pipeline_built: Duration,
-    pub max_threads: usize,
+    pub pipelines_built: Duration,
+    /// The kernels' `maxTotalThreadsPerThreadgroup`, least and most.
+    pub max_threads: (usize, usize),
     pub threadgroups: usize,
 }
 
@@ -107,214 +59,155 @@ fn mk_error(e: MegakernelError) -> WorkerError {
     WorkerError::Megakernel(e)
 }
 
-impl MegakernelBaking {
-    /// Compile `tape`'s library and kernel and fill its address table from `commands` (the
-    /// bucket's materialized, expanded commands), `baked_of` (each one's baked position) and
-    /// `bound` (each one's resolved bindings).
-    pub fn bake(
-        tape: &MegakernelTape,
-        commands: &[GatedCommand],
-        baked_of: &[usize],
-        bound: &[Vec<BoundBinding>],
-        pipelines: &SpecializedPipelines,
-        device: &Device,
-    ) -> Result<(Self, MegakernelLoad), WorkerError> {
-        let lookup = |e: PipelineLookupError| match e {
-            PipelineLookupError::Build(e) => mk_error(MegakernelError::Compile(e.to_string())),
-            e => WorkerError::PipelineLookup(e),
-        };
-        let loaded = pipelines
-            .megakernel_library(tape.library, tape.metallib)
-            .map_err(lookup)?;
-        let threadgroups = crate::device::gpu_cores(device).map_or(1, |c| c.get() as usize);
-        // The load's scalars, read from the materialized commands.
-        let mut constants = vec![
-            ConstantValue::uint(MK_FC_P, threadgroups as u32),
-            ConstantValue::uint(MK_FC_SPIN_LIMIT, MK_SPIN_LIMIT),
-            ConstantValue::uint(MK_FC_CHECKIN_POLLS, MK_CHECKIN_POLLS),
-        ];
-        for l in tape.load_constants {
-            let at = baked_of.iter().position(|&b| b == l.baked as usize);
-            let cmd = at.map(|i| &commands[i].command);
-            let value = cmd.and_then(|c| match l.source {
-                MkLoadSource::Constant(slot) => c
-                    .constants
+/// `tape`'s launches as dispatch steps: its library loaded and each kernel specialized, its
+/// address table filled from `commands` (the bucket's materialized, expanded commands),
+/// `baked_of` (each one's baked position) and `bound` (each one's resolved bindings). The
+/// launches follow the tape's own expansion: one per expanded instance of a segment's opening
+/// command.
+pub fn bake(
+    tape: &MegakernelTape,
+    commands: &[GatedCommand],
+    baked_of: &[usize],
+    bound: &[Vec<BoundBinding>],
+    pipelines: &SpecializedPipelines,
+    device: &Device,
+) -> Result<(Segmented, SegmentedLoad), WorkerError> {
+    let lookup = |e: PipelineLookupError| match e {
+        PipelineLookupError::Build(e) => mk_error(MegakernelError::Compile(e.to_string())),
+        e => WorkerError::PipelineLookup(e),
+    };
+    let loaded = pipelines
+        .megakernel_library(tape.library, tape.metallib)
+        .map_err(lookup)?;
+    let cores = crate::device::gpu_cores(device).ok_or(mk_error(MegakernelError::NoGpuCores))?;
+    let threadgroups = cores.get() as usize;
+    // The load's scalars, read from the materialized commands.
+    let mut constants = vec![ConstantValue::uint(MK_FC_P, cores.get())];
+    for l in tape.load_constants {
+        let at = baked_of.iter().position(|&b| b == l.baked as usize);
+        let cmd = at.map(|i| &commands[i].command);
+        let value = cmd.and_then(|c| match l.source {
+            MkLoadSource::Constant(slot) => {
+                c.constants
                     .iter()
                     .find(|v| v.index == slot.get())
                     .map(|v| ConstantValue {
                         index: l.index.get(),
                         ..*v
-                    }),
-                MkLoadSource::Threadgroups(ax) => {
-                    let (x, y, z) = c.dispatch.threadgroups;
-                    Some(ConstantValue::uint(l.index, [x, y, z][ax.index()]))
-                }
-            });
-            let symbol = cmd.map_or("?", |c| c.function);
-            constants.push(value.ok_or(mk_error(MegakernelError::LoadConstant { symbol }))?);
-        }
-        let started = Instant::now();
+                    })
+            }
+            MkLoadSource::Threadgroups(ax) => {
+                let (x, y, z) = c.dispatch.threadgroups;
+                Some(ConstantValue::uint(l.index, [x, y, z][ax.index()]))
+            }
+        });
+        let symbol = cmd.map_or("?", |c| c.function);
+        constants.push(value.ok_or(mk_error(MegakernelError::LoadConstant { symbol }))?);
+    }
+    let budget = device.maxThreadgroupMemoryLength();
+    let started = Instant::now();
+    let mut max_threads = (usize::MAX, 0);
+    let mut kernels = Vec::with_capacity(tape.segments.len());
+    for segment in tape.segments {
         let pipeline = pipelines
-            .megakernel(tape.library, tape.kernel, constants)
+            .megakernel(tape.library, segment.kernel, constants.clone())
             .map_err(lookup)?;
-        let pipeline_built = started.elapsed();
-        let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
-        if max_threads < MK_THREADS as usize {
+        let cap = pipeline.maxTotalThreadsPerThreadgroup();
+        if cap < MK_THREADS as usize {
             return Err(mk_error(MegakernelError::ThreadCap {
                 needed: MK_THREADS,
-                cap: max_threads as u32,
+                cap: cap as u32,
             }));
         }
         let needed = pipeline.staticThreadgroupMemoryLength();
-        let budget = device.maxThreadgroupMemoryLength();
         if needed > budget {
             return Err(mk_error(MegakernelError::ThreadgroupMemory {
                 needed: needed as u32,
                 budget: budget as u32,
             }));
         }
+        max_threads = (max_threads.0.min(cap), max_threads.1.max(cap));
+        kernels.push(pipeline);
+    }
+    let pipelines_built = started.elapsed();
 
-        // The address table: instance `k` of a step at `table_at + k · row_len`.
-        let mut table = vec![0u64; tape.table_len as usize];
-        let mut instances = vec![0u32; tape.steps.len()];
-        let span = tape.commands.start as usize..tape.commands.end as usize;
-        for i in span.clone() {
-            let Some(s) = tape
-                .steps
-                .iter()
-                .position(|s| s.baked as usize == baked_of[i])
-            else {
-                continue;
-            };
-            let step = &tape.steps[s];
-            let found = commands[i].command.function;
-            if found != step.function {
-                return Err(mk_error(MegakernelError::AdapterMismatch {
-                    expected: step.function,
-                    found,
-                }));
-            }
-            let row = (step.table_at + instances[s] * step.row_len) as usize;
-            instances[s] += 1;
-            for (buf, off, idx) in &bound[i] {
-                table[row + *idx as usize] = buf.gpuAddress() + off;
-            }
+    // The address table: instance `k` of a step at its segment's block `k`, the step's row in it.
+    let mut table = vec![0u64; tape.table_len as usize];
+    let step_of: HashMap<usize, usize> = (tape.steps.iter().enumerate())
+        .map(|(s, step)| (step.baked as usize, s))
+        .collect();
+    let mut instances = vec![0u32; tape.steps.len()];
+    for (i, b) in baked_of.iter().enumerate() {
+        let Some(&s) = step_of.get(b) else {
+            continue;
+        };
+        let step = &tape.steps[s];
+        let found = commands[i].command.function;
+        if found != step.function {
+            return Err(mk_error(MegakernelError::AdapterMismatch {
+                expected: step.function,
+                found,
+            }));
         }
-        let shared = MTLResourceOptions::StorageModeShared;
-        let alloc = |len: usize| {
-            device
-                .newBufferWithLength_options(len.max(16), shared)
-                .expect("newBufferWithLength_options returned nil (megakernel)")
-        };
-        let addresses = alloc(table.len() * 8);
-        let sync = alloc(sync_bytes(threadgroups));
-        // SAFETY: fresh shared buffers of at least these lengths, not yet visible to the GPU.
-        unsafe {
-            let dst = addresses.contents().as_ptr().cast::<u64>();
-            std::ptr::copy_nonoverlapping(table.as_ptr(), dst, table.len());
-            std::ptr::write_bytes(
-                sync.contents().as_ptr().cast::<u8>(),
-                0,
-                sync_bytes(threadgroups),
-            );
-        }
-        let desc = MTL4ArgumentTableDescriptor::new();
-        desc.setMaxBufferBindCount(2);
-        let arguments = device
-            .newArgumentTableWithDescriptor_error(&desc)
-            .expect("newArgumentTableWithDescriptor (megakernel)");
-        // SAFETY: a table of 2 slots; both addresses are inside live, resident buffers.
-        unsafe {
-            arguments.setAddress_atIndex(addresses.gpuAddress(), 0);
-            arguments.setAddress_atIndex(sync.gpuAddress(), 1);
-        }
-        let load = MegakernelLoad {
-            steps: instances.iter().sum::<u32>() as usize,
-            grid_barriers: tape.grid_barriers,
-            loaded,
-            metallib_bytes: tape.metallib.len(),
-            pipeline_built,
-            max_threads,
-            threadgroups,
-        };
-        let baking = Self {
-            commands: span,
-            pipeline,
-            table: arguments,
-            threadgroups,
-            addresses,
-            sync,
-        };
-        Ok((baking, load))
-    }
-
-    /// The buffers the GPU reads by address, for the worker's residency set.
-    pub fn buffers(&self) -> [&Buffer; 2] {
-        [&self.addresses, &self.sync]
-    }
-
-    /// The expanded commands the launch replaces.
-    pub fn commands(&self) -> Range<usize> {
-        self.commands.clone()
-    }
-
-    /// Encode the launch: its synchronization state zeroed (the check-in and every participant's
-    /// barrier count start afresh), a barrier, then the kernel over `MK_P` threadgroups. The
-    /// caller fences the next dispatch.
-    pub fn encode(&self, enc: &ProtocolObject<dyn MTL4ComputeCommandEncoder>) {
-        let state = NSRange {
-            location: MK_SYNC_LAUNCH_STATE,
-            length: sync_bytes(self.threadgroups) - MK_SYNC_LAUNCH_STATE,
-        };
-        // SAFETY: the range lies inside the live, resident synchronization buffer.
-        unsafe { enc.fillBuffer_range_value(&self.sync, state, 0) };
-        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-            MTLStages::Dispatch | MTLStages::Blit,
-            MTLStages::Dispatch,
-            MTL4VisibilityOptions::Device,
-        );
-        enc.setArgumentTable(Some(&self.table));
-        enc.setComputePipelineState(&self.pipeline);
-        let one = |width| MTLSize {
-            width,
-            height: 1,
-            depth: 1,
-        };
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
-            one(self.threadgroups),
-            one(MK_THREADS as usize),
-        );
-    }
-
-    /// After a forward's command buffer completed: the threadgroups that checked in to its launch
-    /// (0 if it played none since the last reset).
-    pub fn participants(&self) -> u32 {
-        // SAFETY: a shared `MkSyncBlock` the GPU no longer touches (the forward completed).
-        let block =
-            unsafe { std::ptr::read_volatile(self.sync.contents().as_ptr().cast::<MkSyncBlock>()) };
-        block.closed.saturating_sub(1)
-    }
-
-    /// After a forward's command buffer completed: a grid barrier that gave up, as a typed error
-    /// (the synchronization block is reset for the next forward).
-    pub fn take_stall(&self) -> Result<(), MegakernelError> {
-        // SAFETY: a shared `MkSyncBlock` the GPU no longer touches (the forward completed).
-        let block = unsafe {
-            let p = self.sync.contents().as_ptr().cast::<MkSyncBlock>();
-            let b = std::ptr::read_volatile(p);
-            if b.stall[0] != 0 {
-                std::ptr::write_bytes(p.cast::<u8>(), 0, sync_bytes(self.threadgroups));
-            }
-            b
-        };
-        match block.stall {
-            [0, ..] => Ok(()),
-            [site, arrived, ordinal, of] => Err(MegakernelError::Stall {
-                site: site - 1,
-                ordinal,
-                arrived,
-                of,
-            }),
+        let segment = &tape.segments[step.segment as usize];
+        let row = segment.table_at + instances[s] * segment.block_len + step.row_at;
+        instances[s] += 1;
+        for (buf, off, idx) in &bound[i] {
+            table[row as usize + *idx as usize] = buf.gpuAddress() + off;
         }
     }
+    let addresses = device
+        .newBufferWithLength_options(
+            table.len().max(1) * 8,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .expect("newBufferWithLength_options returned nil (megakernel)");
+    // SAFETY: a fresh shared buffer of at least this length, not yet visible to the GPU.
+    unsafe {
+        let dst = addresses.contents().as_ptr().cast::<u64>();
+        std::ptr::copy_nonoverlapping(table.as_ptr(), dst, table.len());
+    }
+
+    // The launches, in the tape's expanded order: instance `k` of a segment binds block `k`.
+    let segment_of: HashMap<usize, usize> = (tape.segments.iter().enumerate())
+        .map(|(k, segment)| (segment.opens as usize, k))
+        .collect();
+    let one = |width| MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let mut launched = vec![0u32; tape.segments.len()];
+    let mut steps: Vec<BucketStep> = Vec::new();
+    for b in baked_of {
+        let Some(&k) = segment_of.get(b) else {
+            continue;
+        };
+        let segment = &tape.segments[k];
+        let block = segment.table_at + launched[k] * segment.block_len;
+        launched[k] += 1;
+        steps.push(BucketStep::Dispatch {
+            kernel: None,
+            pipeline: kernels[k].clone(),
+            direct_bindings: vec![vec![(addresses.clone(), u64::from(block) * 8, 0)]],
+            direct_dispatch: vec![(one(threadgroups), one(MK_THREADS as usize))],
+            direct_m_scaling: vec![None],
+            barrier_before: vec![true],
+            runtime_gate: vec![None],
+        });
+    }
+    let load = SegmentedLoad {
+        commands: instances.iter().sum::<u32>() as usize,
+        kernels: kernels.len(),
+        launches: steps.len(),
+        loaded,
+        metallib_bytes: tape.metallib.len(),
+        pipelines_built,
+        max_threads,
+        threadgroups,
+    };
+    let steps = bake_mtl4_steps(&steps, device).ok_or(WorkerError::WeightLookupFailed {
+        reason: "a segment launch's argument table could not be made",
+    })?;
+    Ok((Segmented { steps, addresses }, load))
 }

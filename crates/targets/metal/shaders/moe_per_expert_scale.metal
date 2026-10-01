@@ -33,7 +33,7 @@ struct MpesFc {
 };
 #endif
 
-// Body shared by the dispatch kernel and the megakernel adapter (scores / indices coherent there).
+// Body shared by the dispatch kernel and the megakernel adapter.
 template <typename T, typename C, typename SP, typename IP>
 METAL_FUNC void moe_per_expert_scale_body(SP topk_scores, IP topk_inds,
                                           const device T* per_expert_scale, uint gid) {
@@ -73,7 +73,7 @@ template <typename T>
       uint gid [[thread_position_in_grid]]);
 #else
 #define INST_MPES(dtype_tag, mtl_type)                                                       \
-  MK_TAIL(moe_per_expert_scale_##dtype_tag, 0x3,                                    \
+  MK_TAIL(moe_per_expert_scale_##dtype_tag,                                         \
              (mk_moe_per_expert_scale<mtl_type, MK_C>), MPES_CONSTS)
 #endif
 
