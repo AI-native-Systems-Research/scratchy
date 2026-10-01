@@ -14534,6 +14534,11 @@ fn emit_shim_model(
     quote! {
         #weights
 
+        // `Weights` IS the canonical's type, so its KV codec is the
+        // canonical's too — and every backend's `ScratchyWeights::kv_codec()`
+        // arm names `<this module>::KV_CODEC`.
+        pub use super::#canonical::KV_CODEC;
+
         // Spyre: shim variants share the canonical's solve, so the
         // canonical owns the embedded `KTIR_BUNDLE` AND `SENGRAPH_BUNDLE`.
         // Re-export BOTH so this shim module's `ScratchyWeights::ktir_bundle()`
