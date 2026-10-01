@@ -162,6 +162,19 @@ jobs:
       - name: Bench harness tests (no backend feature)
         run: cargo test -p scratchy-bench --features datasets
 
+      # Nothing else enables scratchy-core-common's `otel` feature, so no
+      # other step compiles the OpenTelemetry export. Its OTLP exporter,
+      # tracer provider and tracing layer only type-check when every
+      # OpenTelemetry crate resolves to one version, which is exactly what a
+      # bump of one of them breaks. `otel` only adds code, so this lint and
+      # test run is a superset of the featureless ones. No backend feature:
+      # telemetry has no GPU in it.
+      - name: Clippy (OpenTelemetry export)
+        run: cargo clippy -p scratchy-core-common --all-targets --features otel -- -D warnings
+
+      - name: OpenTelemetry export tests
+        run: cargo test -p scratchy-core-common --features otel
+
   # ---------------------------------------------------------------------------
   # macOS / arm64 — Metal backend.
   #
