@@ -568,6 +568,112 @@ pub fn small_m_kernel_static_name(
         })
 }
 
+/// Rows of one W4A8 GEMM threadgroup (`affine_qmm_w4a8_*`, TM). Tiles of
+/// 64+ rows collapse on the int8 lane (measured 4-6 TOPS vs ~17).
+pub const W4A8_TILE_ROWS: u32 = 32;
+
+/// Columns of one W4A8 GEMM threadgroup: 128 over 4 simdgroups where N
+/// allows it, else 64 over 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum W4a8Tile {
+    Cols128,
+    Cols64,
+}
+
+impl W4a8Tile {
+    /// The widest tile that divides `n` (the kernel's N slices are static).
+    pub fn for_n(n: u32) -> Option<Self> {
+        if n.is_multiple_of(128) {
+            Some(Self::Cols128)
+        } else if n.is_multiple_of(64) {
+            Some(Self::Cols64)
+        } else {
+            None
+        }
+    }
+
+    pub fn cols(self) -> u32 {
+        match self {
+            Self::Cols128 => 128,
+            Self::Cols64 => 64,
+        }
+    }
+
+    pub fn simdgroups(self) -> u32 {
+        match self {
+            Self::Cols128 => 4,
+            Self::Cols64 => 2,
+        }
+    }
+}
+
+/// Scratch the W4A8 pre-pass writes for an `m x k` activation: int8
+/// `xq[m][k]`, then float2 `(scale, scale * sum)` per (row, 64-chunk).
+pub fn w4a8_scratch_bytes(m: u32, k: u32) -> u32 {
+    m * k + m * (k / 64) * 8
+}
+
+/// Which rows a W4A8 pair runs over: a GEMM's own `M` rows, or the MoE
+/// grouped layout's padded rows (each 32-row tile one expert's, sentinel
+/// rows and tiles skipped — the `affine_gather_*` kernels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum W4a8Rows {
+    Dense,
+    Grouped,
+}
+
+impl W4a8Rows {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Dense => "affine_",
+            Self::Grouped => "affine_gather_",
+        }
+    }
+}
+
+/// `affine_[gather_]w4a8_quant_<dtype>`.
+pub fn w4a8_quant_static_name(rows: W4a8Rows, dtype: DequantDtype) -> &'static str {
+    match (rows, dtype) {
+        (W4a8Rows::Dense, DequantDtype::F16) => "affine_w4a8_quant_f16",
+        (W4a8Rows::Dense, DequantDtype::Bf16) => "affine_w4a8_quant_bf16",
+        (W4a8Rows::Grouped, DequantDtype::F16) => "affine_gather_w4a8_quant_f16",
+        (W4a8Rows::Grouped, DequantDtype::Bf16) => "affine_gather_w4a8_quant_bf16",
+    }
+}
+
+/// `affine_[gather_]qmm_w4a8_<dtype>_s_<scale>_gs_<gs>_tn_<cols>_nsg_<simdgroups>`.
+pub fn qmm_w4a8_static_name(
+    rows: W4a8Rows,
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+    tile: W4a8Tile,
+) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (W4a8Rows, DequantDtype, ScaleDtype, u32, W4a8Tile);
+    static CACHE: OnceLock<Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
+    let mut guard = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("qmm_w4a8_static_name cache poisoned");
+    guard
+        .entry((rows, dtype, scale_dtype, group_size, tile))
+        .or_insert_with(|| {
+            Box::leak(
+                format!(
+                    "{}qmm_w4a8_{}_s_{}_gs_{group_size}_tn_{}_nsg_{}",
+                    rows.prefix(),
+                    dtype.symbol_infix(),
+                    scale_dtype.symbol_infix(),
+                    tile.cols(),
+                    tile.simdgroups(),
+                )
+                .into_boxed_str(),
+            )
+        })
+}
+
 /// Compute-aware variant. When `compute_dtype != dtype`, picks the
 /// extended `affine_qmm_t_<act>_c_<compute>_s_<scale>_*` symbol. Only
 /// the (Bf16-act, F16-compute) combo is currently instantiated — used

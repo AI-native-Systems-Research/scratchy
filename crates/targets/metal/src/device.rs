@@ -43,7 +43,7 @@ impl MetalDevice {
 /// Each chip routes to the profile whose embedded cost CSV was swept on that
 /// chip. Costs are analytical (roofline from the profile's bandwidth /
 /// TFLOPS figures) — there is no empirical cost table.
-fn profile_for_device(device: &Device) -> MetalTargetProfile {
+pub(crate) fn profile_for_device(device: &Device) -> MetalTargetProfile {
     let name = device.name().to_string();
     if name.contains("M1") {
         if name.contains("Max") {

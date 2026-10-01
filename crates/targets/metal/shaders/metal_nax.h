@@ -986,16 +986,29 @@ inline constexpr short get_bytes_per_pack() {
 // (== T_scale). MLX's loader uses one type; scratchy threads a distinct
 // scale dtype (e.g. bf16 act + f16 scale), so the type is split here.
 // Arithmetic is done in Tdst exactly as the upstream verbatim path.
-template <typename Tdst, typename Tsc, int N, int bits>
+// `offset8` (4-bit only): the codes are stored XOR 0x88 (`AffineCodes::
+// Offset8`), i.e. each nibble is the signed q - 8. Read signed and fold the 8
+// into the bias: 16·(q - 8) is the byte's high nibble as int8, and its low
+// nibble shifted up; s/16 of that plus (b + 8s) is s·q + b, exactly. A
+// template parameter, so the as-written loop is the upstream one.
+template <typename Tdst, typename Tsc, int N, int bits, bool offset8 = false>
 inline void
 dequantize(const device uint8_t* w, Tdst scale, Tdst bias, threadgroup Tdst* w_local) {
   static_assert(bits == 4 || bits == 8, "NAX dequantize: bits in {4,8}");
 
   if (bits == 4) {
     Tdst s[2] = {scale, scale / static_cast<Tdst>(16.0f)};
-    for (int i = 0; i < (N / 2); i++) {
-      w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
-      w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+    if (offset8) {
+      const Tdst bias8 = bias + static_cast<Tdst>(8.0f) * scale;
+      for (int i = 0; i < (N / 2); i++) {
+        w_local[2 * i] = s[1] * static_cast<int8_t>(w[i] << 4) + bias8;
+        w_local[2 * i + 1] = s[1] * static_cast<int8_t>(w[i] & 0xf0) + bias8;
+      }
+    } else {
+      for (int i = 0; i < (N / 2); i++) {
+        w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
+        w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+      }
     }
   }
 
@@ -1109,7 +1122,8 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits>
+    short bits,
+    bool offset8 = false>
 struct QuantizedBlockLoader {
   static_assert(
       BCOLS <= group_size,
@@ -1171,7 +1185,7 @@ struct QuantizedBlockLoader {
     T scale = T(*scales);
     T bias = T(*biases);
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, Tsc, pack_factor, bits>(
+      dequantize<T, Tsc, pack_factor, bits, offset8>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
     }
   }
@@ -1198,7 +1212,7 @@ struct QuantizedBlockLoader {
     T scale = T(*scales);
     T bias = T(*biases);
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, Tsc, pack_factor, bits>(
+      dequantize<T, Tsc, pack_factor, bits, offset8>(
           (device uint8_t*)(src + i * bytes_per_pack),
           scale,
           bias,

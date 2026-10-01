@@ -69,6 +69,14 @@ constant uint QK_SPAN_BLOCK_NAX =
 // MoE grouped GEMM only: number of valid experts. Padded tiles whose
 // expert index == QMM_NUM_EXPERTS are trailing sentinels and skip.
 constant int QMM_NUM_EXPERTS [[function_constant(4)]];
+// 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8` — always
+// the case on the matrix-unit tapes this library serves); the dequantizing
+// loader XORs each byte back. The small-M and W4A8 kernels read the stored
+// codes directly as signed int4 (q - 8) and fold the 8 into the bias.
+// Kernel entries branch on it once, into a loader instantiated for it.
+constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
+constant bool AFFINE_CODES_ARE_OFFSET8 =
+    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8;
 
 // ─────────────────────────────────────────────────────────────────
 // NVFP4 E2M1 decode (sign-magnitude 4-bit). Same byte layout as affine
@@ -127,7 +135,7 @@ inline float nvfp4_decode(uint code) {
 // ─────────────────────────────────────────────────────────────────
 
 template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N,
-          bool nvfp4 = false>
+          bool nvfp4 = false, bool offset8 = false>
 METAL_FUNC void qmm_t_nax_impl(
     const device uint32_t*  w,
     const device T_scale*   scales,
@@ -249,7 +257,7 @@ METAL_FUNC void qmm_t_nax_impl(
     // `BCOLS<=group_size` invariant) so it keeps the inlined path.
     using loader_w_t = mlx::steel::QuantizedBlockLoader<
         T_act, T_scale, BN, BK, BK_padded, /*reduction_dim=*/1,
-        TGP, group_size, bits>;
+        TGP, group_size, bits, offset8>;
 
     // ── Outer K loop + M/N alignment dispatch ───────────────────────
     dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
@@ -388,10 +396,12 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));  // 72
     threadgroup T_act Ws[BN * BK_padded];  // 64 × 72 = 4608 elements
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N>(
+    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
         simd_gid, simd_lid, tgid);
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -436,10 +446,12 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     const device T_scale* b_e = biases + size_t(expert) * s_stride;
 
     threadgroup T_act Ws[BN * BK_padded];
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N>(
+    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w_e, s_e, b_e, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
         simd_gid, simd_lid, tgid);
+    });
 }
 
 #define INST_GATHER_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
@@ -570,10 +582,12 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
     threadgroup T_act Ws[BN * BK_padded];
-    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N>(
+    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
         K, N, M,
         simd_gid, simd_lid, tgid);
+    });
 }
 
 #define INST_QMM_T_NAX_DIMS(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
@@ -859,12 +873,13 @@ METAL_FUNC void gemm_t_nax_impl(
 // ─────────────────────────────────────────────────────────────────
 // Small-M (decode-batch) MLX-affine 4-bit GEMM on the matrix unit:
 // `y = x · Wᵀ`, W = s·q + b per group of G along K. The 4-bit codes are
-// the `uint4b_format` matmul2d operand as stored — no dequant stage — and
-// one threadgroup's TM rows cover the whole batch (up to TM), so each
-// weight is read once per TM rows instead of once per row (qmv) or as a
+// stored offset-8 (q' = q - 8, `AffineCodes::Offset8`), so they are the
+// `int4b_format` matmul2d operand as stored — no dequant stage — and one
+// threadgroup's TM rows cover the whole batch (up to TM), so each weight is
+// read once per TM rows instead of once per row (qmv) or as a
 // mostly-padding 64-row tile (qmm_t NAX).
 //
-//   y[m,n] = Σ_g s[n,g]·(x_g·q_g[n]) + b[n,g]·xs[m,g],  xs[m,g] = Σ_{k∈g} x[m,k]
+//   y[m,n] = Σ_g s[n,g]·(x_g·q'_g[n]) + (b[n,g] + 8·s[n,g])·xs[m,g],  xs[m,g] = Σ_{k∈g} x[m,k]
 //
 // The group sums `xs` of the tile's rows are staged in threadgroup memory
 // SMALL_M_XS_GROUPS groups at a time — a small footprint, so it doesn't cap
@@ -898,7 +913,7 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
     const int rows = min(TM, M - row0);
 
     using XA = tensor<device T, Ext, tensor_inline>;
-    using XB = tensor<device uint4b_format, Ext, tensor_inline>;
+    using XB = tensor<device int4b_format, Ext, tensor_inline>;
     XA A((device T*)x, Ext(K, M));
     XB B((typename XB::data_handle_type)w, Ext(K, N));
     constexpr auto desc =
@@ -935,8 +950,9 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
                     const auto idx = part.get_multidimensional_index(i);
                     const int n = col0 + idx[0], m = idx[1];
                     if (m < rows) {
-                        acc[i] = fma(part[i], float(scales[n * KG + g]),
-                                     fma(float(biases[n * KG + g]),
+                        const float s = float(scales[n * KG + g]);
+                        acc[i] = fma(part[i], s,
+                                     fma(fma(8.0f, s, float(biases[n * KG + g])),
                                          xs[m * SMALL_M_XS_GROUPS + gg], acc[i]));
                     }
                 }
@@ -991,3 +1007,183 @@ INST_QMM_SMALL_M_GS(f16,  half,   f16,  half)
 INST_QMM_SMALL_M_GS(f16,  half,   bf16, bfloat)
 INST_QMM_SMALL_M_GS(bf16, bfloat, f16,  half)
 INST_QMM_SMALL_M_GS(bf16, bfloat, bf16, bfloat)
+
+// ─────────────────────────────────────────────────────────────────
+// W4A8 GEMM on the matrix unit: int8 activations × the offset-8 4-bit
+// codes (int4b_format, q' = q - 8), int32 per 64-wide K chunk, the affine
+// scale/bias and activation scale applied in float. Runs at the int8
+// lane (~2x the f16 rate on M5).
+//
+// `affine_w4a8_quant_<act>` quantizes each (row, 64-chunk) of x to int8
+// with its own scale a = amax/127 into the scratch buffer:
+//   int8 xq[M][K], then float2 qa[M][K/64] = (a, a·Σ xq)
+// `affine_qmm_w4a8_*` then computes, per chunk c (group g = c·64/G):
+//   y[m,n] += a·s[n,g]·(xq_c · q'_c[n]) + (b[n,g] + 8·s[n,g])·a·Σ xq_c
+// Buffers: quant x[0] scratch[1]; GEMM w[0] scales[1] biases[2]
+// scratch[3] y[4]. K/N/M from function constants 0/1/2. The lowering
+// guarantees K % 64 == 0, N % TN == 0 and M (the bucket) % 32 == 0 —
+// the tensor slices are static and unchecked. Grids: quant
+// (ceil(K/64 / 16), M), 128 threads; GEMM (N/TN, M/32), 32·NSG threads.
+//
+// The `affine_gather_*` pair is the MoE grouped expert GEMM: M is the
+// padded row bound, indices[5] (quant: [2]) holds each padded row's expert
+// (QMM_NUM_EXPERTS = sentinel), every expert's run starts on a 64-row
+// boundary, so each 32-row tile reads one expert's weight slab. Sentinel
+// rows are not quantized and sentinel tiles do not run.
+// ─────────────────────────────────────────────────────────────────
+
+template <typename T, bool gather>
+METAL_FUNC void w4a8_quant_impl(
+    const device T* x, device uchar* scratch, const device uint32_t* indices,
+    uint2 tgid, uint sgid, uint lid) {
+    const int K = QMM_K, M = QMM_M, KC = K / 64;
+    // One lane octet (8 lanes x 8 elements) per 64-chunk, 16 per threadgroup.
+    const int c = (int(tgid.x) * 4 + int(sgid)) * 4 + int(lid / 8);
+    const int m = int(tgid.y);
+    if (c >= KC) return;
+    if (gather && indices[m] >= uint(QMM_NUM_EXPERTS)) return;
+    const int l8 = int(lid % 8);
+    const device vec<T, 4>* p = (const device vec<T, 4>*)(x + int64_t(m) * K + c * 64 + l8 * 8);
+    const float4 v0 = float4(p[0]), v1 = float4(p[1]);
+    float amax = max(max(max(abs(v0.x), abs(v0.y)), max(abs(v0.z), abs(v0.w))),
+                     max(max(abs(v1.x), abs(v1.y)), max(abs(v1.z), abs(v1.w))));
+    amax = max(amax, simd_shuffle_xor(amax, 1));
+    amax = max(amax, simd_shuffle_xor(amax, 2));
+    amax = max(amax, simd_shuffle_xor(amax, 4));
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f, a = amax / 127.0f;
+    const float4 q0 = rint(v0 * inv), q1 = rint(v1 * inv);
+    float sum = (q0.x + q0.y) + (q0.z + q0.w) + (q1.x + q1.y) + (q1.z + q1.w);
+    sum += simd_shuffle_xor(sum, 1);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 4);
+    device uint2* xq = (device uint2*)(scratch + int64_t(m) * K + c * 64);
+    xq[l8] = uint2(as_type<uint>(char4(q0)), as_type<uint>(char4(q1)));
+    if (l8 == 0) {
+        ((device float2*)(scratch + int64_t(M) * K))[int64_t(m) * KC + c] = float2(a, a * sum);
+    }
+}
+
+template <typename T>
+[[kernel]] void affine_w4a8_quant(
+    const device T* x [[buffer(0)]], device uchar* scratch [[buffer(1)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_index_in_simdgroup]]) {
+    w4a8_quant_impl<T, false>(x, scratch, nullptr, tgid, sgid, lid);
+}
+
+template <typename T>
+[[kernel]] void affine_gather_w4a8_quant(
+    const device T* x [[buffer(0)]], device uchar* scratch [[buffer(1)]],
+    const device uint32_t* indices [[buffer(2)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_index_in_simdgroup]]) {
+    w4a8_quant_impl<T, true>(x, scratch, indices, tgid, sgid, lid);
+}
+
+template <typename T, typename S, int G, int TN, int NSG>
+METAL_FUNC void qmm_w4a8_impl(
+    const device uchar* w, const device S* scales, const device S* biases,
+    const device uchar* scratch, device T* y, uint2 tgid) {
+    using namespace mpp::tensor_ops;
+    using Ext = dextents<int32_t, 2>;
+    constexpr int TM = 32;
+    const int K = QMM_K, N = QMM_N, M = QMM_M, KG = K / G, KC = K / 64;
+    using XA = tensor<device int8_t, Ext, tensor_inline>;
+    using XB = tensor<device int4b_format, Ext, tensor_inline>;
+    XA A((device int8_t*)scratch, Ext(K, M));
+    XB B((typename XB::data_handle_type)w, Ext(K, N));
+    const device float2* qa = (const device float2*)(scratch + int64_t(M) * K);
+    constexpr auto desc =
+        matmul2d_descriptor(TM, TN, 64, false, true, false, matmul2d_descriptor::mode::multiply);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    const int row0 = int(tgid.y) * TM, col0 = int(tgid.x) * TN;
+    auto sA0 = A.template slice<64, TM>(0, row0);
+    auto sB0 = B.template slice<64, TN>(0, col0);
+    auto part = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), int>();
+    auto acc = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), float>();
+    _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+    }
+    for (int c = 0; c < KC; ++c) {
+        auto sA = A.template slice<64, TM>(c * 64, row0);
+        auto sB = B.template slice<64, TN>(c * 64, col0);
+        op.run(sA, sB, part);
+        const int g = c * 64 / G;
+        _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < part.get_capacity(); ++i) {
+            if (part.is_valid_element(i)) {
+                const auto idx = part.get_multidimensional_index(i);
+                const int n = col0 + idx[0], m = row0 + idx[1];
+                const float s = float(scales[n * KG + g]);
+                const float2 q = qa[int64_t(m) * KC + c];
+                acc[i] = fma(float(part[i]) * q.x, s,
+                             fma(fma(8.0f, s, float(biases[n * KG + g])), q.y, acc[i]));
+            }
+        }
+    }
+    auto out = op.template get_destination_cooperative_tensor<decltype(sA0), decltype(sB0), T>();
+    _Pragma("clang loop unroll(full)") for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) out[i] = T(acc[i]);
+    }
+    tensor<device T, Ext, tensor_inline> C(y, Ext(N, M));
+    auto mC = C.template slice<TN, TM>(col0, row0);
+    out.store(mC);
+}
+
+template <typename T, typename S, int G, int TN, int NSG>
+[[kernel]] void affine_qmm_w4a8(
+    const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
+    const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
+    device T* y [[buffer(4)]], uint2 tgid [[threadgroup_position_in_grid]]) {
+    qmm_w4a8_impl<T, S, G, TN, NSG>(w, scales, biases, scratch, y, tgid);
+}
+
+template <typename T, typename S, int G, int TN, int NSG>
+[[kernel]] void affine_gather_qmm_w4a8(
+    const device uchar* w [[buffer(0)]], const device S* scales [[buffer(1)]],
+    const device S* biases [[buffer(2)]], const device uchar* scratch [[buffer(3)]],
+    device T* y [[buffer(4)]], const device uint32_t* indices [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]]) {
+    const uint expert = indices[tgid.y * 32];
+    if (expert >= uint(QMM_NUM_EXPERTS)) return;  // sentinel tile
+    const size_t K = size_t(QMM_K), N = size_t(QMM_N);
+    qmm_w4a8_impl<T, S, G, TN, NSG>(
+        w + size_t(expert) * N * K / 2, scales + size_t(expert) * N * (K / G),
+        biases + size_t(expert) * N * (K / G), scratch, y, tgid);
+}
+
+template [[host_name("affine_w4a8_quant_bf16")]] [[kernel]] void affine_w4a8_quant<bfloat>(
+    const device bfloat*, device uchar*, uint2, uint, uint);
+template [[host_name("affine_w4a8_quant_f16")]] [[kernel]] void affine_w4a8_quant<half>(
+    const device half*, device uchar*, uint2, uint, uint);
+template [[host_name("affine_gather_w4a8_quant_bf16")]] [[kernel]] void
+affine_gather_w4a8_quant<bfloat>(const device bfloat*, device uchar*, const device uint32_t*,
+                                 uint2, uint, uint);
+template [[host_name("affine_gather_w4a8_quant_f16")]] [[kernel]] void
+affine_gather_w4a8_quant<half>(const device half*, device uchar*, const device uint32_t*,
+                               uint2, uint, uint);
+
+#define INST_QMM_W4A8(act_tag, act_type, scale_tag, scale_type, gs, tn, nsg)                   \
+    template [[host_name("affine_qmm_w4a8_" #act_tag "_s_" #scale_tag "_gs_" #gs "_tn_" #tn     \
+                         "_nsg_" #nsg)]] [[kernel]] void                                       \
+    affine_qmm_w4a8<act_type, scale_type, gs, tn, nsg>(                                         \
+        const device uchar*, const device scale_type*, const device scale_type*,               \
+        const device uchar*, device act_type*, uint2);                                         \
+    template [[host_name("affine_gather_qmm_w4a8_" #act_tag "_s_" #scale_tag "_gs_" #gs        \
+                         "_tn_" #tn "_nsg_" #nsg)]] [[kernel]] void                            \
+    affine_gather_qmm_w4a8<act_type, scale_type, gs, tn, nsg>(                                  \
+        const device uchar*, const device scale_type*, const device scale_type*,               \
+        const device uchar*, device act_type*, const device uint32_t*, uint2);
+
+// 128 columns x 4 simdgroups where N allows it; 64 x 2 otherwise.
+#define INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, gs)                      \
+    INST_QMM_W4A8(act_tag, act_type, scale_tag, scale_type, gs, 128, 4)                        \
+    INST_QMM_W4A8(act_tag, act_type, scale_tag, scale_type, gs, 64, 2)
+
+#define INST_QMM_W4A8_GS(act_tag, act_type, scale_tag, scale_type)                             \
+    INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, 64)                          \
+    INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, 128)
+
+INST_QMM_W4A8_GS(f16,  half,   f16,  half)
+INST_QMM_W4A8_GS(f16,  half,   bf16, bfloat)
+INST_QMM_W4A8_GS(bf16, bfloat, f16,  half)
+INST_QMM_W4A8_GS(bf16, bfloat, bf16, bfloat)

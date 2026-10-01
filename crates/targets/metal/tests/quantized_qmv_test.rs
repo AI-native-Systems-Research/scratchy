@@ -29,6 +29,7 @@ use scratchy_target_metal::quantized::{
 };
 use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
+use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -53,6 +54,7 @@ fn dispatch_qmv(
     k: usize,
     group_size: u32,
     scale_dtype: ScaleDtype,
+    codes: AffineCodes,
 ) -> bool {
     let kernel = pick_qmv_kernel(n as u32, k as u32, 4);
     let kernel_name = qmv_kernel_name(
@@ -63,10 +65,13 @@ fn dispatch_qmv(
         4,
         false,
     );
-    let constants = [
+    let constants: Vec<ConstantValue> = [
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),
-    ];
+    ]
+    .into_iter()
+    .chain(codes.constant())
+    .collect();
     let shader_cache = ShaderCache::new(device.clone()).expect("ShaderCache");
     let pipeline = shader_cache
         .get_pipeline_specialized(&kernel_name, &constants)
@@ -178,6 +183,26 @@ fn run_qmv_bf16(
     k: usize,
     group_size: u32,
 ) -> Option<Vec<half::bf16>> {
+    run_qmv_bf16_codes(
+        packed,
+        scales,
+        biases,
+        x,
+        (m, n, k),
+        group_size,
+        AffineCodes::AsWritten,
+    )
+}
+
+fn run_qmv_bf16_codes(
+    packed: &[u8],
+    scales: &[half::f16],
+    biases: &[half::f16],
+    x: &[half::bf16],
+    (m, n, k): (usize, usize, usize),
+    group_size: u32,
+    codes: AffineCodes,
+) -> Option<Vec<half::bf16>> {
     let device = detect_device()?.device;
 
     let packed_buf = buffer_from_bytes(&device, packed);
@@ -209,6 +234,7 @@ fn run_qmv_bf16(
         k,
         group_size,
         ScaleDtype::F16,
+        codes,
     ) {
         return Some(Vec::new());
     }
@@ -461,6 +487,7 @@ fn run_qmv_bf16_with_packed_prefix(
         k,
         group_size,
         ScaleDtype::F16,
+        AffineCodes::AsWritten,
     ) {
         return Some(Vec::new());
     }
@@ -724,6 +751,7 @@ fn run_qmv_bf16_s_bf16(
         k,
         group_size,
         ScaleDtype::Bf16,
+        AffineCodes::AsWritten,
     ) {
         return Some(Vec::new());
     }
@@ -808,6 +836,35 @@ fn affine_qmv_generic_b4_bf16_s_bf16_matches_cpu_reference() {
             abs_err <= allowed,
             "qmv generic s_bf16 gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
              (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+        );
+    }
+}
+
+/// Codes stored offset-8 (XOR 0x88, as an M5 target stores 4-bit codes)
+/// read under `AFFINE_CODES_OFFSET8` give bit-identical output to the codes
+/// as written, on every qmv kernel.
+#[test]
+fn affine_qmv_b4_offset8_codes_match_as_written() {
+    // qmv_quad, qmv_fast, generic qmv.
+    for (n, k) in [(64, 128), (64, 512), (12, 384)] {
+        let (packed, scales, biases, x) = make_inputs_bf16(0x0FF5E7 ^ k as u64, n, k, 1, 64);
+        let run = |packed: &[u8], codes| {
+            run_qmv_bf16_codes(packed, &scales, &biases, &x, (1, n, k), 64, codes)
+        };
+        let Some(as_written) = run(&packed, AffineCodes::AsWritten) else {
+            eprintln!("skipping: no Metal 4 GPU");
+            return;
+        };
+        assert!(!as_written.is_empty(), "no MTL4 queue");
+        let offset8: Vec<u8> = packed.iter().map(|b| b ^ 0x88).collect();
+        assert_ne!(
+            run(&offset8, AffineCodes::AsWritten).as_ref(),
+            Some(&as_written)
+        );
+        assert_eq!(
+            run(&offset8, AffineCodes::Offset8),
+            Some(as_written),
+            "n={n} k={k}"
         );
     }
 }

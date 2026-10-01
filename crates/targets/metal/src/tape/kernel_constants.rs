@@ -449,6 +449,67 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
     }
 }
 
+// ── MLX-affine code storage ──────────────────────────────────────
+
+/// How the MLX-affine packed codes a command reads are stored. On a
+/// [`GenClass::stores_affine_b4_offset8`](crate::tape::lowered::GenClass::stores_affine_b4_offset8)
+/// target every 4-bit weight's codes are stored XOR 0x88; every kernel
+/// that reads them carries this, and on `Offset8` gets `AFFINE_CODES_OFFSET8`
+/// (slot 5) to XOR them back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffineCodes {
+    AsWritten,
+    Offset8,
+}
+
+impl AffineCodes {
+    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>, bits: u32) -> Self {
+        AffineCodesTarget::of(profile).for_bits(bits)
+    }
+
+    /// Slot 5, set only on `Offset8` so every other pipeline keeps its key.
+    pub fn constant(self) -> Option<ConstantValue> {
+        match self {
+            AffineCodes::Offset8 => Some(ConstantValue::boolean(ConstSlot(5), true)),
+            AffineCodes::AsWritten => None,
+        }
+    }
+
+    /// What a command whose kernel reads codes declares, from its baked
+    /// constants (slot 5 is `bool` only on such kernels).
+    pub fn of_constants(constants: &[ConstantValue]) -> Self {
+        match AffineCodes::Offset8.constant() {
+            Some(c) if constants.contains(&c) => AffineCodes::Offset8,
+            _ => AffineCodes::AsWritten,
+        }
+    }
+}
+
+/// A target's code storage, before a weight's width picks its [`AffineCodes`]
+/// (only 4-bit codes are ever stored offset-8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineCodesTarget {
+    offset8_b4: bool,
+}
+
+impl AffineCodesTarget {
+    pub fn of(profile: Option<&crate::targets::MetalTargetProfile>) -> Self {
+        Self {
+            offset8_b4: profile.is_some_and(|t| {
+                crate::tape::lowered::GenClass::of(t.generation).stores_affine_b4_offset8()
+            }),
+        }
+    }
+
+    pub fn for_bits(self, bits: u32) -> AffineCodes {
+        if self.offset8_b4 && bits == 4 {
+            AffineCodes::Offset8
+        } else {
+            AffineCodes::AsWritten
+        }
+    }
+}
+
 // ── MLX-affine QMV (decode matvec) ────────────────────────────────
 
 /// `KernelId::AffineQmvQuad` / `AffineQmvFast` / `AffineQmv`
@@ -456,14 +517,17 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
 pub struct AffineQmvConstants {
     pub k: KDimI32,
     pub n: NDimI32,
+    pub codes: AffineCodes,
 }
 
 impl From<AffineQmvConstants> for Vec<ConstantValue> {
     fn from(c: AffineQmvConstants) -> Self {
-        vec![
+        let mut v = vec![
             ConstantValue::int(ConstSlot(0), c.k.get()),
             ConstantValue::int(ConstSlot(1), c.n.get()),
-        ]
+        ];
+        v.extend(c.codes.constant());
+        v
     }
 }
 
@@ -476,15 +540,18 @@ pub struct AffineQmmTConstants {
     pub k: KDimI32,
     pub n: NDimI32,
     pub m: MDimI32,
+    pub codes: AffineCodes,
 }
 
 impl From<AffineQmmTConstants> for Vec<ConstantValue> {
     fn from(c: AffineQmmTConstants) -> Self {
-        vec![
+        let mut v = vec![
             ConstantValue::int(ConstSlot(0), c.k.get()),
             ConstantValue::int(ConstSlot(1), c.n.get()),
             ConstantValue::int(ConstSlot(2), c.m.get()),
-        ]
+        ];
+        v.extend(c.codes.constant());
+        v
     }
 }
 
@@ -499,16 +566,19 @@ pub struct AffineQmmTSplitKConstants {
     pub n: NDimI32,
     pub m: MDimI32,
     pub k_partition_size: KPartitionSizeI32,
+    pub codes: AffineCodes,
 }
 
 impl From<AffineQmmTSplitKConstants> for Vec<ConstantValue> {
     fn from(c: AffineQmmTSplitKConstants) -> Self {
-        vec![
+        let mut v = vec![
             ConstantValue::int(ConstSlot(0), c.k.get()),
             ConstantValue::int(ConstSlot(1), c.n.get()),
             ConstantValue::int(ConstSlot(2), c.m.get()),
             ConstantValue::int(ConstSlot(3), c.k_partition_size.get()),
-        ]
+        ];
+        v.extend(c.codes.constant());
+        v
     }
 }
 
@@ -596,11 +666,14 @@ impl From<GateScaleConstants> for Vec<ConstantValue> {
 /// (`quantized_dequantize.metal::affine_embed_<dtype>_gs_<gs>_b_4`).
 pub struct AffineEmbedConstants {
     pub hidden_size: HiddenSize,
+    pub codes: AffineCodes,
 }
 
 impl From<AffineEmbedConstants> for Vec<ConstantValue> {
     fn from(c: AffineEmbedConstants) -> Self {
-        vec![ConstantValue::uint(ConstSlot(0), c.hidden_size.get())]
+        let mut v = vec![ConstantValue::uint(ConstSlot(0), c.hidden_size.get())];
+        v.extend(c.codes.constant());
+        v
     }
 }
 

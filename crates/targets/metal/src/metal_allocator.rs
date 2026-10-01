@@ -11,6 +11,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 use crate::residency::Pinned;
+use crate::tape::kernel_constants::{AffineCodes, AffineCodesTarget};
 use scratchy_tensors::DeviceAllocator;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -50,6 +51,23 @@ static WEIGHTS_LOAD_COMPLETE: std::sync::atomic::AtomicBool =
 pub fn signal_weights_load_complete() {
     WEIGHTS_LOAD_COMPLETE.store(true, std::sync::atomic::Ordering::Release);
 }
+
+/// Latch flipped once the tapes have bound their weights, so every 4-bit
+/// code range they read offset-8 has been stored that way
+/// ([`MetalAllocator::store_affine_codes_offset8`]). Sidecar writers wait on
+/// it too, so the cache they persist already holds the stored codes.
+static AFFINE_CODES_SETTLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the pool after it binds its tapes. Idempotent.
+pub fn signal_affine_codes_settled() {
+    AFFINE_CODES_SETTLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Set by [`join_sidecar_writers`]: no tape will bind after it, so a writer
+/// still waiting on [`AFFINE_CODES_SETTLED`] skips its build rather than
+/// persist codes stored in an unknown form.
+static SIDECAR_DRAINING: AtomicBool = AtomicBool::new(false);
 
 /// Last-resort cancel for the background weight-cache writer threads. `join_sidecar_writers` sets
 /// it only when a build overruns the drain budget — a genuinely wedged
@@ -94,6 +112,7 @@ pub fn join_sidecar_writers() {
     // exit. This is what turns the failed-load teardown from a 180 s stall
     // into an immediate return.
     signal_weights_load_complete();
+    SIDECAR_DRAINING.store(true, Ordering::Release);
 
     let handles: Vec<std::thread::JoinHandle<()>> = match SIDECAR_WRITERS.lock() {
         Ok(mut v) => std::mem::take(&mut *v),
@@ -152,8 +171,31 @@ pub fn join_sidecar_writers() {
 }
 
 /// Bump when the packed layout rule changes (MIN_BIND_ALIGN, packing
-/// order, …) — invalidates every existing sidecar.
-const ALIGNED_CACHE_LAYOUT_VERSION: u32 = 1;
+/// order, …) — invalidates every existing sidecar. 2: the blob stores the
+/// `offset8` code ranges XOR 0x88 and the meta lists them.
+const ALIGNED_CACHE_LAYOUT_VERSION: u32 = 2;
+
+/// A region's 4-bit code ranges stored XOR 0x88 (aligned-buffer offset →
+/// length; [`MetalAllocator::store_affine_codes_offset8`]). Shared with the
+/// region's sidecar writer, which snapshots the blob and the ranges under
+/// this lock.
+type Offset8Ranges = Arc<Mutex<std::collections::BTreeMap<usize, usize>>>;
+
+/// XOR 0x88 into every byte of `len` bytes at `ptr`: stores MLX-affine
+/// 4-bit codes as signed q - 8 (and back).
+///
+/// # Safety
+/// `ptr..ptr + len` must be writable and not concurrently accessed.
+unsafe fn xor_codes_0x88(ptr: *mut u8, len: usize) {
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+    let (head, words, tail) = unsafe { bytes.align_to_mut::<u64>() };
+    for b in head.iter_mut().chain(tail.iter_mut()) {
+        *b ^= 0x88;
+    }
+    for w in words {
+        *w ^= 0x8888_8888_8888_8888;
+    }
+}
 
 /// Identity + validity data for one shard's aligned sidecar.
 #[derive(Clone, Debug)]
@@ -177,39 +219,45 @@ impl AlignedCacheMeta {
     fn meta_json_path(&self) -> std::path::PathBuf {
         self.bin.with_extension("meta.json")
     }
-    fn to_json(&self) -> String {
+    fn to_json(&self, offset8: &std::collections::BTreeMap<usize, usize>) -> String {
         // `src_path` is JSON-escaped via serde (paths may contain quotes,
         // backslashes, unicode); the rest are numbers.
         let src_path = serde_json::to_string(&self.src_path).unwrap_or_else(|_| "\"\"".to_string());
+        let offset8: Vec<String> = offset8.iter().map(|(o, l)| format!("[{o},{l}]")).collect();
         format!(
-            "{{\"layout_version\":{},\"src_size\":{},\"src_mtime_ns\":{},\"aligned_capacity\":{},\"src_path\":{}}}",
+            "{{\"layout_version\":{},\"src_size\":{},\"src_mtime_ns\":{},\"aligned_capacity\":{},\"src_path\":{},\"offset8\":[{}]}}",
             ALIGNED_CACHE_LAYOUT_VERSION,
             self.src_size,
             self.src_mtime_ns,
             self.aligned_capacity,
             src_path,
+            offset8.join(","),
         )
     }
-    /// True iff bin + meta exist and match this source + layout. The
-    /// meta is the commit record: the builder renames it into place only
-    /// after the blob is fully written, synced, and renamed, so a meta
-    /// that exists and matches names a complete blob.
-    fn is_valid_on_disk(&self) -> bool {
-        let Ok(meta_str) = std::fs::read_to_string(self.meta_json_path()) else {
-            return false;
-        };
-        let Ok(j) = serde_json::from_str::<serde_json::Value>(&meta_str) else {
-            return false;
-        };
+    /// The code ranges the blob stores offset-8 (see [`Offset8Ranges`]),
+    /// iff bin + meta exist and match this source + layout. The meta is
+    /// the commit record: the builder renames it into place only after
+    /// the blob is fully written, synced, and renamed, so a meta that
+    /// exists and matches names a complete blob.
+    fn offset8_if_valid_on_disk(&self) -> Option<std::collections::BTreeMap<usize, usize>> {
+        let meta_str = std::fs::read_to_string(self.meta_json_path()).ok()?;
+        let j = serde_json::from_str::<serde_json::Value>(&meta_str).ok()?;
         let ok = j.get("layout_version").and_then(|v| v.as_u64())
             == Some(ALIGNED_CACHE_LAYOUT_VERSION as u64)
             && j.get("src_size").and_then(|v| v.as_u64()) == Some(self.src_size)
             && j.get("src_mtime_ns").and_then(|v| v.as_u128_lossy()) == Some(self.src_mtime_ns)
             && j.get("aligned_capacity").and_then(|v| v.as_u64())
-                == Some(self.aligned_capacity as u64);
-        ok && std::fs::metadata(&self.bin)
-            .map(|m| m.len() as usize == self.aligned_capacity)
-            .unwrap_or(false)
+                == Some(self.aligned_capacity as u64)
+            && std::fs::metadata(&self.bin)
+                .is_ok_and(|m| m.len() as usize == self.aligned_capacity);
+        if !ok {
+            return None;
+        }
+        j.get("offset8")?
+            .as_array()?
+            .iter()
+            .map(|r| Some((r.get(0)?.as_u64()? as usize, r.get(1)?.as_u64()? as usize)))
+            .collect()
     }
 }
 
@@ -223,6 +271,76 @@ impl U128Lossy for serde_json::Value {
         self.as_u64().map(|v| v as u128)
     }
 }
+
+/// The MLX-affine codes ranges a [`MetalAllocator`] has bound, keyed by
+/// source address.
+#[derive(Default)]
+struct BoundAffineCodes {
+    /// (length, how every reader reads it) — two readers can never disagree.
+    reads: std::collections::BTreeMap<usize, (usize, AffineCodes)>,
+    /// Ranges of a sidecar-served region its blob lacks offset-8: source
+    /// address → the stored copy's address.
+    copies: std::collections::HashMap<usize, usize>,
+}
+
+/// Why [`MetalAllocator::bind_affine_codes`] refused a codes range.
+#[derive(Debug)]
+pub enum AffineCodesBindError {
+    /// The range lies in none of this allocator's buffers.
+    NotAllocated { addr: usize },
+    /// Two commands read one range differently.
+    ReadersDisagree {
+        addr: usize,
+        first: AffineCodes,
+        then: AffineCodes,
+    },
+    /// The range partially overlaps one bound before it.
+    Overlap {
+        addr: usize,
+        len: usize,
+        bound: usize,
+        bound_len: usize,
+    },
+    /// A sidecar-served range is stored offset-8, but this command reads
+    /// it as written.
+    StoredOffset8 { addr: usize },
+    /// Allocating the stored copy of a stale sidecar's range failed.
+    Copy(anyhow::Error),
+}
+
+impl std::fmt::Display for AffineCodesBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAllocated { addr } => write!(f, "affine codes {addr:#x} are in no arena"),
+            Self::ReadersDisagree { addr, first, then } => {
+                write!(
+                    f,
+                    "affine codes {addr:#x}: one command reads them {first:?}, another {then:?}"
+                )
+            }
+            Self::Overlap {
+                addr,
+                len,
+                bound,
+                bound_len,
+            } => {
+                write!(
+                    f,
+                    "affine codes {addr:#x}+{len} overlap bound range {bound:#x}+{bound_len}"
+                )
+            }
+            Self::StoredOffset8 { addr } => {
+                write!(
+                    f,
+                    "affine codes {addr:#x} are stored offset-8 but read as written"
+                )
+            }
+            Self::Copy(e) => write!(f, "storing a copy of affine codes: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AffineCodesBindError {}
 
 /// Per-tensor record stored in the parent `MmapRegion`. Each tensor's
 /// bytes live at `aligned_buffer.contents() + dst_offset` (the
@@ -311,6 +429,13 @@ struct MmapRegion {
     /// `aligned_buffer` is a bytesNoCopy wrap of THIS mapping —
     /// keep it alive for the buffer's lifetime.
     _cache_mmap: Option<Arc<memmap2::Mmap>>,
+    /// Code ranges stored offset-8 in `aligned_buffer`.
+    offset8: Offset8Ranges,
+    /// The sidecar this region was served from, if any. Its mapping is
+    /// read-only: a code range its blob does not store offset-8 is bound
+    /// from a stored copy, and the sidecar is dropped so the next launch
+    /// rebuilds it.
+    served_from: Option<AlignedCacheMeta>,
 }
 
 unsafe impl Send for MmapRegion {}
@@ -361,6 +486,9 @@ pub struct MetalAllocator {
     /// `residency` (weights pinned alongside the working set — legacy).
     weights_residency: crate::residency::MetalResidencySet,
     mmaps: Arc<Mutex<Vec<MmapRegion>>>,
+    /// Every MLX-affine codes range bound so far; see
+    /// [`Self::bind_affine_codes`].
+    affine_codes: Arc<Mutex<BoundAffineCodes>>,
     /// Diagnostic counters for `alloc_and_copy_host` routing. Bumped
     /// once per call so the worker can print a one-shot "zero-copy
     /// vs memcpy" breakdown after `try_load` completes. Atomics are
@@ -434,6 +562,7 @@ impl Clone for MetalAllocator {
             residency: self.residency.clone(),
             weights_residency: self.weights_residency.clone(),
             mmaps: Arc::clone(&self.mmaps),
+            affine_codes: Arc::clone(&self.affine_codes),
             load_stats: Arc::clone(&self.load_stats),
         }
     }
@@ -504,6 +633,7 @@ impl MetalAllocator {
             residency,
             weights_residency,
             mmaps: Arc::new(Mutex::new(Vec::new())),
+            affine_codes: Arc::default(),
             load_stats: Arc::new(LoadStats::default()),
         }
     }
@@ -622,6 +752,135 @@ impl MetalAllocator {
         None
     }
 
+    /// How this device's kernels read MLX-affine codes.
+    fn affine_codes_target(&self) -> AffineCodesTarget {
+        AffineCodesTarget::of(Some(&crate::device::profile_for_device(&self.device)))
+    }
+
+    /// The buffer binding for the MLX-affine packed codes `ptr..ptr + len`,
+    /// stored the way the reading command's kernel reads them (`codes`,
+    /// from its constants). On `Offset8` they are stored XOR 0x88 — signed
+    /// q - 8 — once, in place: in a copied region (whose sidecar writer
+    /// persists them that way and lists the range) or a weight arena. A
+    /// region served from a sidecar that already stores the range binds it
+    /// as is; one whose sidecar lacks it binds a stored copy and drops the
+    /// sidecar, so the next launch rebuilds it.
+    ///
+    pub fn bind_affine_codes(
+        &self,
+        ptr: *const u8,
+        len: usize,
+        codes: AffineCodes,
+    ) -> std::result::Result<(Buffer, u64), AffineCodesBindError> {
+        let p = ptr as usize;
+        let mut bound = self.affine_codes.lock().expect("affine codes Mutex");
+        let prev = bound
+            .reads
+            .range(..p + len.max(1))
+            .next_back()
+            .map(|(&a, &r)| (a, r));
+        let first = match prev {
+            Some((a, (l, first))) if a == p && l == len => {
+                if first != codes {
+                    return Err(AffineCodesBindError::ReadersDisagree {
+                        addr: p,
+                        first,
+                        then: codes,
+                    });
+                }
+                false
+            }
+            Some((a, (l, _))) if a + l > p => {
+                return Err(AffineCodesBindError::Overlap {
+                    addr: p,
+                    len,
+                    bound: a,
+                    bound_len: l,
+                });
+            }
+            _ => {
+                bound.reads.insert(p, (len, codes));
+                true
+            }
+        };
+        if let Some(&copy) = bound.copies.get(&p) {
+            return self
+                .buffer_for(copy as *const u8)
+                .ok_or(AffineCodesBindError::NotAllocated { addr: copy });
+        }
+        // In a region: bind in place, storing on first bind; a stale sidecar
+        // hands back its meta and the range. Every write goes through the
+        // allocator's own mapping of the range, never the caller's pointer.
+        let in_region = {
+            let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
+            mmaps.iter().find_map(|r| {
+                let off = p
+                    .checked_sub(r.aligned_base as usize)
+                    .filter(|&o| o + len <= r.aligned_capacity)?;
+                let mut offset8 = r.offset8.lock().expect("offset8 ranges Mutex");
+                let stored = offset8.get(&off) == Some(&len);
+                // SAFETY: `off + len` is within the region's aligned mapping.
+                let at = unsafe { r.aligned_base.add(off) };
+                Some(match (codes, stored, &r.served_from) {
+                    (AffineCodes::AsWritten, true, _) => Err(None),
+                    (AffineCodes::AsWritten, false, _) | (AffineCodes::Offset8, true, _) => {
+                        Ok((r.aligned_buffer.clone(), off as u64))
+                    }
+                    (AffineCodes::Offset8, false, None) => {
+                        // SAFETY: inside the region's writable aligned buffer;
+                        // no command has run, and its writer snapshots under
+                        // this lock.
+                        unsafe { xor_codes_0x88(at, len) };
+                        offset8.insert(off, len);
+                        Ok((r.aligned_buffer.clone(), off as u64))
+                    }
+                    (AffineCodes::Offset8, false, Some(meta)) => Err(Some((meta.clone(), at))),
+                })
+            })
+        };
+        match in_region {
+            Some(Ok(binding)) => Ok(binding),
+            Some(Err(None)) => Err(AffineCodesBindError::StoredOffset8 { addr: p }),
+            Some(Err(Some((meta, at)))) => {
+                if std::fs::remove_file(meta.meta_json_path()).is_ok() {
+                    tracing::warn!(
+                        "aligned-cache: {} lacks offset-8 codes this launch reads; storing \
+                         copies and dropping the sidecar for the next launch to rebuild",
+                        meta.bin.display()
+                    );
+                }
+                let copy = self
+                    .alloc_uninit_weights(len)
+                    .map_err(AffineCodesBindError::Copy)?;
+                // SAFETY: `at..at + len` is inside the region's mapping and
+                // `copy` is a fresh `len`-byte weight allocation.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(at, copy, len);
+                    xor_codes_0x88(copy, len);
+                }
+                bound.copies.insert(p, copy as usize);
+                self.buffer_for(copy)
+                    .ok_or(AffineCodesBindError::NotAllocated {
+                        addr: copy as usize,
+                    })
+            }
+            None => {
+                let (buffer, off) = self
+                    .buffer_for(ptr)
+                    .ok_or(AffineCodesBindError::NotAllocated { addr: p })?;
+                if first && codes == AffineCodes::Offset8 {
+                    // SAFETY: the range lies in `buffer`'s shared contents
+                    // (resolved above); no command has run.
+                    unsafe {
+                        let at = buffer.contents().as_ptr().cast::<u8>().add(off as usize);
+                        xor_codes_0x88(at, len);
+                    }
+                }
+                Ok((buffer, off))
+            }
+        }
+    }
+
     /// Parse a safetensors header (`[u64 header_size_le][JSON header]
     /// [data section]`) and return the list of tensors with their
     /// **file-relative** byte offsets and sizes. Returns `None` if
@@ -734,14 +993,16 @@ impl MetalAllocator {
             .filter(|_| cache_enabled)
             .map(|m| m.cache_bin_path());
         if let (Some(cf), Some(m)) = (cache_file.as_ref(), meta.as_ref())
-            && m.is_valid_on_disk()
+            && let Some(offset8) = m.offset8_if_valid_on_disk().filter(|o| {
+                o.is_empty() || self.affine_codes_target().for_bits(4) == AffineCodes::Offset8
+            })
         {
             match Self::register_from_aligned_cache(
                 self,
-                cf,
+                m.clone(),
+                offset8,
                 base,
                 len,
-                aligned_capacity,
                 &packed,
                 mmap,
             ) {
@@ -823,14 +1084,15 @@ impl MetalAllocator {
     #[allow(clippy::result_large_err)]
     fn register_from_aligned_cache(
         &self,
-        cache_bin: &Path,
+        meta: AlignedCacheMeta,
+        offset8: std::collections::BTreeMap<usize, usize>,
         base: *const u8,
         len: usize,
-        aligned_capacity: usize,
         packed: &[(usize, usize, usize)],
         mmap: Arc<memmap2::Mmap>,
     ) -> std::result::Result<(), (anyhow::Error, Arc<memmap2::Mmap>)> {
-        let file = match std::fs::File::open(cache_bin) {
+        let aligned_capacity = meta.aligned_capacity;
+        let file = match std::fs::File::open(&meta.bin) {
             Ok(f) => f,
             Err(e) => return Err((e.into(), mmap)),
         };
@@ -901,6 +1163,8 @@ impl MetalAllocator {
                 tensors,
                 _mmap: mmap,
                 _cache_mmap: Some(cache_mmap),
+                offset8: Arc::new(Mutex::new(offset8)),
+                served_from: Some(meta),
             });
         Ok(())
     }
@@ -920,6 +1184,7 @@ impl MetalAllocator {
         len: usize,
         meta: AlignedCacheMeta,
         keepalive: BufKeepAlive,
+        offset8: Offset8Ranges,
     ) {
         let handle = std::thread::spawn(move || {
             let _keepalive = keepalive;
@@ -927,10 +1192,18 @@ impl MetalAllocator {
             // short-lived tools still build their cache eventually). Bail
             // early if teardown cancelled us mid-wait.
             let t_wait = std::time::Instant::now();
-            while !WEIGHTS_LOAD_COMPLETE.load(std::sync::atomic::Ordering::Acquire)
-                && t_wait.elapsed() < std::time::Duration::from_secs(180)
+            while !((WEIGHTS_LOAD_COMPLETE.load(Ordering::Acquire)
+                || t_wait.elapsed() >= std::time::Duration::from_secs(180))
+                && AFFINE_CODES_SETTLED.load(Ordering::Acquire))
             {
                 if cache_write_cancelled() {
+                    return;
+                }
+                if SIDECAR_DRAINING.load(Ordering::Acquire) {
+                    tracing::info!(
+                        "aligned-cache: no tape bound {}'s weights; skipping",
+                        cache_bin.display()
+                    );
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(250));
@@ -978,7 +1251,7 @@ impl MetalAllocator {
             // Holding the lock: re-check (the other process may have
             // finished the build while we waited on the latch) and
             // sweep any orphaned tmp from a killed builder.
-            if meta.is_valid_on_disk() {
+            if meta.offset8_if_valid_on_disk().is_some() {
                 tracing::info!(
                     "aligned-cache: {} already built; skipping",
                     cache_bin.display()
@@ -1003,6 +1276,8 @@ impl MetalAllocator {
                     }
                 }
             }
+            // Snapshot the blob and its offset8 ranges together.
+            let offset8 = offset8.lock().expect("offset8 ranges Mutex");
             let write = || -> std::io::Result<()> {
                 use std::io::Write;
                 let file = std::fs::File::create(&tmp)?;
@@ -1051,7 +1326,7 @@ impl MetalAllocator {
             let meta_tmp = meta
                 .meta_json_path()
                 .with_extension(format!("json.tmp.{}", std::process::id()));
-            if let Err(e) = std::fs::write(&meta_tmp, meta.to_json())
+            if let Err(e) = std::fs::write(&meta_tmp, meta.to_json(&offset8))
                 .and_then(|()| std::fs::rename(&meta_tmp, meta.meta_json_path()))
             {
                 tracing::warn!("aligned-cache: meta write failed: {e}");
@@ -1229,6 +1504,7 @@ impl MetalAllocator {
         // writer thread holds this to keep the allocation alive past a
         // short-run teardown (see spawn_aligned_cache_writer).
         let writer_keepalive = BufKeepAlive(dst_buffer.clone());
+        let offset8: Offset8Ranges = Arc::default();
         self.mmaps
             .lock()
             .expect("MetalAllocator mmaps Mutex")
@@ -1241,11 +1517,14 @@ impl MetalAllocator {
                 tensors,
                 _mmap: mmap,
                 _cache_mmap: None,
+                offset8: Arc::clone(&offset8),
+                served_from: None,
             });
 
         // Build the sidecar in the background so the NEXT launch takes
-        // the zero-copy path. Weights are immutable post-copy, so the
-        // writer reads a stable buffer.
+        // the zero-copy path. Weights are immutable post-copy apart from
+        // their code ranges' one-time offset-8 store, which the writer
+        // waits out and snapshots under the same lock.
         if let (Some(cp), Some(m)) = (cache_path, meta) {
             Self::spawn_aligned_cache_writer(
                 cp,
@@ -1253,6 +1532,7 @@ impl MetalAllocator {
                 aligned_capacity,
                 m,
                 writer_keepalive,
+                offset8,
             );
         } else {
             drop(writer_keepalive);
@@ -1691,10 +1971,11 @@ mod tests {
             bin: std::path::PathBuf::from("/tmp/x.bin"),
             src_path: "/weird/pa\"th/model.safetensors".to_string(),
         };
-        let json = meta.to_json();
+        let json = meta.to_json(&std::collections::BTreeMap::from([(64, 128)]));
         let v: serde_json::Value = serde_json::from_str(&json).expect("to_json emits valid JSON");
         assert_eq!(v["src_path"], "/weird/pa\"th/model.safetensors");
         assert_eq!(v["layout_version"], ALIGNED_CACHE_LAYOUT_VERSION);
+        assert_eq!(v["offset8"], serde_json::json!([[64, 128]]));
     }
 
     #[test]
@@ -1880,6 +2161,54 @@ mod tests {
         let p = unsafe { alloc.alloc_and_copy_host(std::ptr::null(), 0).unwrap() };
         assert!(!p.is_null());
         assert_eq!(alloc.used_bytes(), 0);
+    }
+
+    /// Codes in a weight arena are stored offset-8 once, however many
+    /// commands bind them; a reader that disagrees, a partially overlapping
+    /// range and a foreign pointer are refused; codes read as written stay.
+    #[test]
+    fn affine_codes_store_offset8_once_in_a_weight_arena() {
+        let Some(device) = try_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let mut alloc = MetalAllocator::new(device);
+        let codes: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37)).collect();
+        let [a, b] = [(); 2].map(|()| unsafe {
+            alloc
+                .alloc_and_copy_host(codes.as_ptr(), codes.len())
+                .expect("weight alloc")
+        });
+        let read = |p: *mut u8| unsafe { std::slice::from_raw_parts(p, codes.len()) }.to_vec();
+        let flipped: Vec<u8> = codes.iter().map(|c| c ^ 0x88).collect();
+
+        for _ in 0..2 {
+            let bound = alloc.bind_affine_codes(a, codes.len(), AffineCodes::Offset8);
+            assert_eq!(
+                bound.ok().map(|(_, o)| o),
+                alloc.buffer_for(a).map(|(_, o)| o)
+            );
+            assert_eq!(read(a), flipped);
+        }
+        assert!(matches!(
+            alloc.bind_affine_codes(a, codes.len(), AffineCodes::AsWritten),
+            Err(AffineCodesBindError::ReadersDisagree { .. })
+        ));
+        assert!(matches!(
+            alloc.bind_affine_codes(a.wrapping_add(16), 16, AffineCodes::Offset8),
+            Err(AffineCodesBindError::Overlap { .. })
+        ));
+        assert!(
+            alloc
+                .bind_affine_codes(b, codes.len(), AffineCodes::AsWritten)
+                .is_ok()
+        );
+        assert_eq!(read(b), codes);
+        let stack = [0u8; 4];
+        assert!(matches!(
+            alloc.bind_affine_codes(stack.as_ptr(), 4, AffineCodes::Offset8),
+            Err(AffineCodesBindError::NotAllocated { .. })
+        ));
     }
 
     #[test]

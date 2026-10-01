@@ -151,6 +151,9 @@ pub enum WorkerError {
     /// tensor (e.g. bias absent on a no-bias linear) or the tensor's
     /// raw pointer didn't fall inside any of the allocator's arenas.
     WeightLookupFailed { reason: &'static str },
+    /// A command's MLX-affine codes operand could not be bound stored the
+    /// way its kernel reads them.
+    AffineCodes(crate::metal_allocator::AffineCodesBindError),
     /// A command referenced `Binding::Scratch` but the worker has no
     /// SplitK scratch buffer allocated. Indicates a lowering /
     /// `LoweredMetalTape::splitk_scratch_bytes` accounting bug —
@@ -197,6 +200,7 @@ impl std::fmt::Display for WorkerError {
                 "MetalWorker: bucket {bucket_index} command {command_index}: \
                  GEMM bindings malformed ({reason})"
             ),
+            Self::AffineCodes(e) => write!(f, "MetalWorker: {e}"),
             Self::WeightLookupFailed { reason } => {
                 write!(f, "MetalWorker: weight lookup: {reason}")
             }
@@ -560,6 +564,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             }
             bucket_bakings.push(baking);
         }
+        // Every codes operand is now stored the way its readers read it.
+        crate::metal_allocator::signal_affine_codes_settled();
         if let Some(r) = residency {
             r.commit();
         }
@@ -920,6 +926,10 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineQmmTSplitK
         | K::AffineQmmTNax
         | K::AffineQmmSmallM
+        | K::AffineW4a8Quant
+        | K::AffineQmmW4a8
+        | K::AffineGatherW4a8Quant
+        | K::AffineGatherQmmW4a8
         | K::Nvfp4Qmv
         | K::Nvfp4QmmT
         | K::Nvfp4QmmTNax
@@ -930,6 +940,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::MoeGroupOffsets
         | K::MoeGroupInit
         | K::MoeGroupScatter
+        | K::MoeGroupScatterQ8
         | K::MoeGroupGather
         | K::MoePerExpertScale
         | K::GateApply
@@ -1334,6 +1345,7 @@ fn resolve_weight<W: scratchy_ir::CanonicalParams + scratchy_ir::WeightAccessors
     layer: u32,
     which: WeightTensor,
     locator: super::lowered::WeightLocator,
+    codes: crate::tape::kernel_constants::AffineCodes,
 ) -> Result<(Buffer, u64), WorkerError> {
     let bucket = locator.bucket;
     let op_idx = locator.op_idx;
@@ -1696,6 +1708,34 @@ fn resolve_weight<W: scratchy_ir::CanonicalParams + scratchy_ir::WeightAccessors
             }
         }
     };
+    // The MLX-affine packed codes bind stored the way this command's kernel
+    // reads them.
+    let codes_operand = match kind {
+        WeightBundleKind::LinearLayer => {
+            matches!(which, WeightTensor::Weight)
+                && matches!(
+                    weights.linear_at(bucket, op_idx, slot, layer),
+                    scratchy_layers::LinearLayer::AffineQuant(_)
+                )
+        }
+        WeightBundleKind::AffineQuantEmbedding => matches!(which, WeightTensor::Weight),
+        WeightBundleKind::FusedMoe
+        | WeightBundleKind::SharedFusedMoe
+        | WeightBundleKind::GemmaSwitchGlu => matches!(
+            which,
+            WeightTensor::MoeExpertGateW
+                | WeightTensor::MoeExpertUpW
+                | WeightTensor::MoeExpertDownW
+                | WeightTensor::MoeSharedGateUpW
+                | WeightTensor::MoeSharedDownW
+        ),
+        _ => false,
+    };
+    if codes_operand {
+        return allocator
+            .bind_affine_codes(tensor.raw_ptr(), tensor.size_bytes(), codes)
+            .map_err(WorkerError::AffineCodes);
+    }
     allocator
         .buffer_for(tensor.raw_ptr())
         .ok_or(WorkerError::WeightLookupFailed {
@@ -1781,8 +1821,15 @@ fn resolve_bindings<W: CanonicalParams>(
                         *binding_index as u64,
                     )
                 } else {
-                    let (b, off) =
-                        resolve_weight(weights, allocator, kind, layer.get(), *which, *locator)?;
+                    let (b, off) = resolve_weight(
+                        weights,
+                        allocator,
+                        kind,
+                        layer.get(),
+                        *which,
+                        *locator,
+                        crate::tape::kernel_constants::AffineCodes::of_constants(cmd.constants),
+                    )?;
                     (b, off, *binding_index as u64)
                 }
             }

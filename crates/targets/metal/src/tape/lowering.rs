@@ -66,10 +66,11 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
     if chunked { crate::BLOCKS_PER_CHUNK } else { 0 }
 }
 use crate::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
-    pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape, qmm_t_kernel_static_name,
-    qmm_t_kernel_static_name_with_compute, qmv_dispatch_shape, qmv_kernel_static_name,
-    small_m_kernel_static_name, splitk_reduce_kernel_static_name,
+    DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS,
+    W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape,
+    qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name,
+    qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
+    splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
 };
 use crate::specialized_pipeline_cache::ConstantValue;
 
@@ -195,11 +196,9 @@ pub fn lower_pair(
     //   * `lm_head` is exactly one `Instruction::AffineQmm` (the
     //     common case across Llama / Qwen / Mistral, tied embeddings
     //     included). Multi-step lm_heads fall through.
-    //   * It lowered to exactly one `LoweredCommand` — i.e. Standard
-    //     or Nax qmm_t, not SplitK (whose split partials and reduce
-    //     would need their own row handling). At num_tokens=1024 the
-    //     dispatcher always picks Standard, so this is the prefill
-    //     path in practice.
+    //   * It lowered to one Standard or Nax qmm_t, or the W4A8 pre-pass
+    //     + GEMM pair — not SplitK (whose split partials and reduce
+    //     would need their own row handling).
     // lm_head only needs the LAST token's row at prefill (the worker's
     // post-pass `embedding_gather` keys on `last_token_indices=[N-1]`
     // and discards every other row). Without this slice, lm_head runs
@@ -213,14 +212,21 @@ pub fn lower_pair(
     // the softcap's presence forced the FULL `M = bucket_m × vocab`
     // lm_head GEMM at every prefill chunk — ~0.75 s of the Gemma4-12B
     // T=2930 prefill was the discarded lm_head rows.
-    let qmm_cmd_ok = |idx: usize| {
-        matches!(
-            lh.commands.get(idx).map(|c| c.command.kernel),
-            Some(KernelId::AffineQmmT | KernelId::AffineQmmTNax)
-        )
+    // The lm_head GEMM's leading commands: one qmm_t, or the W4A8 pre-pass +
+    // GEMM pair. The slice replaces them with a qmv over the sample rows.
+    let kernel_at = |idx: usize| lh.commands.get(idx).map(|c| c.command.kernel);
+    let gemm_len = match (kernel_at(0), kernel_at(1)) {
+        (Some(KernelId::AffineW4a8Quant), Some(KernelId::AffineQmmW4a8)) => 2,
+        (Some(KernelId::AffineQmmT | KernelId::AffineQmmTNax), _) => 1,
+        _ => 0,
     };
+    let after_gemm = lh
+        .commands
+        .len()
+        .checked_sub(gemm_len)
+        .filter(|_| gemm_len > 0);
     let slice_info = if !slice_disabled && bucket_m > 1 {
-        match (lm_head, lh.commands.len()) {
+        match (lm_head, after_gemm) {
             // Plain lm_head (Llama / Qwen / Mistral).
             (
                 [
@@ -235,8 +241,8 @@ pub fn lower_pair(
                         _vector_limit,
                     ),
                 ],
-                1,
-            ) if qmm_cmd_ok(0) => Some(LmHeadSliceInfo {
+                Some(0),
+            ) => Some(LmHeadSliceInfo {
                 in_slot: *in_slot,
                 out_slot: *out_slot,
                 layer: *layer,
@@ -270,14 +276,8 @@ pub fn lower_pair(
                     ),
                     Instruction::TanhSoftCap(sc_in, sc_out),
                 ],
-                2,
-            ) if qmm_cmd_ok(0)
-                && matches!(
-                    lh.commands.get(1).map(|c| c.command.kernel),
-                    Some(KernelId::TanhSoftCap)
-                )
-                && sc_in == out_slot =>
-            {
+                Some(1),
+            ) if kernel_at(gemm_len) == Some(KernelId::TanhSoftCap) && sc_in == out_slot => {
                 Some(LmHeadSliceInfo {
                     in_slot: *in_slot,
                     out_slot: *out_slot,
@@ -315,7 +315,11 @@ pub fn lower_pair(
         ));
         barrier_before.push(true);
         commands.push(GatedCommand::gated(
-            lm_head_qmv_command(p, &info, bucket_m),
+            lm_head_qmv_command(
+                p,
+                &info,
+                super::kernel_constants::AffineCodes::of(profile, info.bits),
+            ),
             RuntimeGate::OnlyIfNoSpec,
         ));
         barrier_before.push(*lh.barrier_before.first().unwrap_or(&true));
@@ -419,7 +423,7 @@ struct LmHeadSliceInfo {
 fn lm_head_qmv_command(
     p: &MetalModelConsts,
     info: &LmHeadSliceInfo,
-    _bucket_m: u32,
+    codes: super::kernel_constants::AffineCodes,
 ) -> LoweredCommand {
     let dtype = dequant_dtype_for(p);
     let scale_dtype = scale_dtype_for(p);
@@ -445,6 +449,7 @@ fn lm_head_qmv_command(
         constants: super::kernel_constants::AffineQmvConstants {
             k: super::ids::KDimI32(k_v as i32),
             n: super::ids::NDimI32(n_v as i32),
+            codes,
         }
         .into_baked(),
         dispatch: DispatchShape {
@@ -1204,10 +1209,11 @@ fn route_small_m(
     else {
         return cmds;
     };
-    let is_nax = profile.is_some_and(|t| crate::targets::is_nax_capable(t.generation));
+    // The small-M kernel reads the codes as stored, signed (offset-8).
+    let codes = super::kernel_constants::AffineCodes::of(profile, 4);
     let tile = match SmallMTile::for_bucket(bucket_m) {
         Some(tile)
-            if is_nax
+            if codes == super::kernel_constants::AffineCodes::Offset8
                 && matches!(group_size, 32 | 64 | 128)
                 && n.is_multiple_of(SMALL_M_TILE_COLS) =>
         {
@@ -1228,6 +1234,7 @@ fn route_small_m(
             k: super::ids::KDimI32(k as i32),
             n: super::ids::NDimI32(n as i32),
             m: super::ids::MDimI32(bucket_m as i32),
+            codes,
         }
         .into_baked(),
         dispatch: DispatchShape {
@@ -1498,9 +1505,18 @@ pub fn lower(
                 let cmds = route_by_sequence_count(i, cmds)?;
                 update_shape_state(p, other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
+                // The macro's hazard flags track arena slots, not the shared
+                // scratch: a command that writes it (a W4A8 pre-pass, a
+                // split-K partial) must wait for the previous reader.
+                let writes_scratch = cmds.first().is_some_and(|c| {
+                    c.command
+                        .bindings
+                        .iter()
+                        .any(|b| matches!(b, Binding::Scratch { .. }))
+                });
                 commands.extend(cmds);
                 if n_cmds >= 1 {
-                    barrier_before.push(flag_for(i));
+                    barrier_before.push(flag_for(i) || writes_scratch);
                     barrier_before.extend(std::iter::repeat_n(true, n_cmds - 1));
                 }
                 i += 1;
@@ -2435,6 +2451,7 @@ fn lower_one(
                     constants: super::kernel_constants::AffineQmvConstants {
                         k: super::ids::KDimI32(k_v as i32),
                         n: super::ids::NDimI32(n_v as i32),
+                        codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
                     }
                     .into_baked(),
                     dispatch: DispatchShape {
@@ -2518,6 +2535,97 @@ fn lower_one(
                 } else {
                     dtype
                 };
+                // W4A8 on the matrix unit's int8 lane: a pre-pass quantizes
+                // the activations per (row, 64-chunk) into the shared scratch,
+                // then the GEMM multiplies them against the offset-8 codes.
+                let codes = super::kernel_constants::AffineCodes::of(profile, bits_v);
+                let w4a8_tile = W4a8Tile::for_n(n_v).filter(|_| {
+                    matches!(kernel, QmmTKernel::Nax)
+                        && codes == super::kernel_constants::AffineCodes::Offset8
+                        && matches!(gs, 64 | 128)
+                        && k_v.is_multiple_of(64)
+                        && bucket_m.is_multiple_of(W4A8_TILE_ROWS)
+                });
+                if let Some(tile) = w4a8_tile {
+                    *splitk_scratch_bytes =
+                        (*splitk_scratch_bytes).max(w4a8_scratch_bytes(bucket_m, k_v));
+                    let constants = || {
+                        super::kernel_constants::AffineQmmTConstants {
+                            k: super::ids::KDimI32(k_v as i32),
+                            n: super::ids::NDimI32(n_v as i32),
+                            m: super::ids::MDimI32(bucket_m as i32),
+                            codes,
+                        }
+                        .into_baked()
+                    };
+                    let rows = || {
+                        Some(crate::interpreter::metal::lowered::MScaling {
+                            seq_axis: None,
+                            axis: crate::tape::lowered::MScaleAxis::Y,
+                            bucket_m: super::ids::BucketM(bucket_m),
+                        })
+                    };
+                    let quant = LoweredCommand {
+                        kernel: KernelId::AffineW4a8Quant,
+                        library: "quantized_qmm_nax",
+                        function: w4a8_quant_static_name(W4a8Rows::Dense, dtype),
+                        constants: constants(),
+                        dispatch: DispatchShape {
+                            threadgroups: ((k_v / 64).div_ceil(16), bucket_m, 1),
+                            threads_per_threadgroup: (128, 1, 1),
+                            m_scaling: rows(),
+                        },
+                        bindings: baked(vec![
+                            Binding::ArenaSlot {
+                                slot: *in_slot,
+                                binding_index: 0,
+                            },
+                            Binding::Scratch { binding_index: 1 },
+                        ]),
+                        gemm_dims: None,
+                    };
+                    let mut bindings = affine_qmm_bindings(
+                        *in_slot,
+                        *out_slot,
+                        super::ids::LayerId(*layer + layer_offset),
+                        WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
+                    );
+                    for b in bindings.iter_mut() {
+                        if matches!(
+                            b,
+                            Binding::ArenaSlot {
+                                binding_index: 3,
+                                ..
+                            }
+                        ) {
+                            *b = Binding::Scratch { binding_index: 3 };
+                        }
+                    }
+                    let gemm = LoweredCommand {
+                        kernel: KernelId::AffineQmmW4a8,
+                        library: "quantized_qmm_nax",
+                        function: qmm_w4a8_static_name(
+                            W4a8Rows::Dense,
+                            dtype,
+                            scale_dtype,
+                            gs,
+                            tile,
+                        ),
+                        constants: constants(),
+                        dispatch: DispatchShape {
+                            threadgroups: (n_v / tile.cols(), bucket_m / W4A8_TILE_ROWS, 1),
+                            threads_per_threadgroup: (32 * tile.simdgroups(), 1, 1),
+                            m_scaling: rows(),
+                        },
+                        bindings: baked(bindings),
+                        gemm_dims: None,
+                    };
+                    return Ok(vec![quant, gemm]);
+                }
                 match kernel {
                     QmmTKernel::Nax => {
                         let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
@@ -2536,6 +2644,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
+                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -2579,6 +2688,7 @@ fn lower_one(
                                 k: super::ids::KDimI32(k_v as i32),
                                 n: super::ids::NDimI32(n_v as i32),
                                 m: super::ids::MDimI32(bucket_m as i32),
+                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -2649,6 +2759,7 @@ fn lower_one(
                                 k_partition_size: super::ids::KPartitionSizeI32(
                                     k_partition_size as i32,
                                 ),
+                                codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
                             }
                             .into_baked(),
                             dispatch: DispatchShape {
@@ -2747,6 +2858,7 @@ fn lower_one(
                     constants: super::kernel_constants::AffineQmvConstants {
                         k: super::ids::KDimI32(k_v as i32),
                         n: super::ids::NDimI32(n_v as i32),
+                        codes: super::kernel_constants::AffineCodes::AsWritten,
                     }
                     .into_baked(),
                     dispatch: DispatchShape {
@@ -2786,6 +2898,7 @@ fn lower_one(
                             k: super::ids::KDimI32(k_v as i32),
                             n: super::ids::NDimI32(n_v as i32),
                             m: super::ids::MDimI32(bucket_m as i32),
+                            codes: super::kernel_constants::AffineCodes::AsWritten,
                         }
                         .into_baked(),
                         dispatch: DispatchShape {
@@ -2819,6 +2932,7 @@ fn lower_one(
                             k: super::ids::KDimI32(k_v as i32),
                             n: super::ids::NDimI32(n_v as i32),
                             m: super::ids::MDimI32(bucket_m as i32),
+                            codes: super::kernel_constants::AffineCodes::AsWritten,
                         }
                         .into_baked(),
                         dispatch: DispatchShape {
@@ -3147,6 +3261,7 @@ fn lower_one(
                 function: affine_embed_kernel_static_name(dtype, scale_dtype, gs, bits_v),
                 constants: super::kernel_constants::AffineEmbedConstants {
                     hidden_size: super::ids::HiddenSize(hidden_size),
+                    codes: super::kernel_constants::AffineCodes::of(profile, bits_v),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -5408,6 +5523,7 @@ fn lower_one(
                     tape_index,
                     op_idx: index as u32,
                     bucket_m,
+                    codes: super::kernel_constants::AffineCodesTarget::of(profile),
                     is_shared: false,
                 },
                 moe_scratch_bytes,
@@ -5450,6 +5566,7 @@ fn lower_one(
                     tape_index,
                     op_idx: index as u32,
                     bucket_m,
+                    codes: super::kernel_constants::AffineCodesTarget::of(profile),
                     is_shared: true,
                 },
                 moe_scratch_bytes,
@@ -5486,6 +5603,7 @@ fn lower_one(
                     op_idx: index as u32,
                     bucket_m,
                     is_nax: profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation)),
+                    codes: super::kernel_constants::AffineCodesTarget::of(profile),
                 },
                 moe_scratch_bytes,
             );
@@ -7274,6 +7392,8 @@ struct MetalMoeLowering {
     tape_index: u32,
     op_idx: u32,
     bucket_m: u32,
+    /// How this target stores the experts' codes.
+    codes: super::kernel_constants::AffineCodesTarget,
     /// `false` → caller is `I::MetalFusedMoe` (Mixtral); emitted
     /// `Binding::Weight`s carry `WeightBundleKind::FusedMoe` so the
     /// worker resolves through `WeightAccessors::fused_moe_at`.
@@ -8058,10 +8178,13 @@ fn lower_metal_moe(
             kernel,
             "quantized_qmv",
             symbol,
-            vec![
+            [
                 ConstantValue::int(0, k_in as i32),
                 ConstantValue::int(1, n_out as i32),
-            ],
+            ]
+            .into_iter()
+            .chain(p.codes.for_bits(bits).constant())
+            .collect(),
             DispatchShape {
                 threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
                 threads_per_threadgroup: (32, 2, 1),
@@ -8255,10 +8378,13 @@ fn lower_metal_moe(
             kernel,
             "quantized_qmv",
             symbol,
-            vec![
+            [
                 ConstantValue::int(0, k_in as i32),
                 ConstantValue::int(1, n_out as i32),
-            ],
+            ]
+            .into_iter()
+            .chain(p.codes.for_bits(p.down_bits).constant())
+            .collect(),
             DispatchShape {
                 threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
                 threads_per_threadgroup: (32, 2, 1),
@@ -8396,6 +8522,8 @@ struct GemmaMoeLowering {
     /// to the NAX kernel (the dominant prefill lever; the steel grouped
     /// GEMM is ~5-10x slower per call).
     is_nax: bool,
+    /// How this target stores the experts' codes.
+    codes: super::kernel_constants::AffineCodesTarget,
 }
 
 /// Emit the multi-`LoweredCommand` decomposition for one `I::GemmaMoe`
@@ -8792,10 +8920,13 @@ fn lower_gemma_moe(
                 kernel,
                 "quantized_qmv",
                 symbol,
-                vec![
+                [
                     ConstantValue::int(0, k_in as i32),
                     ConstantValue::int(1, n_out as i32),
-                ],
+                ]
+                .into_iter()
+                .chain(p.codes.for_bits(p.bits).constant())
+                .collect(),
                 DispatchShape {
                     threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
                     threads_per_threadgroup: (32, 2, 1),
@@ -8909,21 +9040,89 @@ fn lower_gemma_moe(
                 },
             ],
         ));
+        // The grouped expert GEMMs run W4A8 on the matrix unit's int8 lane
+        // when the experts' codes are stored offset-8 and the shapes fit its
+        // tiles: every expert's run starts on a 64-row boundary, so each
+        // 32-row tile is one expert's.
+        let codes = p.codes.for_bits(p.bits);
+        let w4a8 = p.is_nax
+            && codes == super::kernel_constants::AffineCodes::Offset8
+            && matches!(p.group_size, 64 | 128)
+            && p.hidden.is_multiple_of(64)
+            && p.moe_inter.is_multiple_of(64)
+            && W4a8Tile::for_n(p.hidden).is_some()
+            && W4a8Tile::for_n(p.moe_inter).is_some()
+            && mpad_max.is_multiple_of(W4A8_TILE_ROWS);
+        // W4A8: the bucket's token rows are quantized once, into the
+        // `down_out` region (unused until G8), and scattered as int8 rows +
+        // scales into `x_pad` — not once per expert copy.
+        if w4a8 {
+            cmds.push(make_moe_command(
+                KernelId::AffineW4a8Quant,
+                "quantized_qmm_nax",
+                w4a8_quant_static_name(W4a8Rows::Dense, dtype),
+                vec![
+                    ConstantValue::int(0, p.hidden as i32),
+                    ConstantValue::int(2, p.bucket_m as i32),
+                ],
+                DispatchShape {
+                    threadgroups: ((p.hidden / 64).div_ceil(16), p.bucket_m, 1),
+                    threads_per_threadgroup: (128, 1, 1),
+                    m_scaling: Some(MScaling {
+                        seq_axis: None,
+                        axis: MScaleAxis::Y,
+                        bucket_m: bm,
+                    }),
+                },
+                vec![
+                    Binding::ArenaSlot {
+                        slot: p.expert_in_slot,
+                        binding_index: 0,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 1,
+                        byte_offset: layout.down_out,
+                    },
+                ],
+            ));
+        }
         // G3: scatter each real (token,expert) row to its padded slot
         //     (m-scaled over actual pairs).
+        let (scatter_kernel, scatter_symbol, scatter_src, scatter_threads) = if w4a8 {
+            (
+                KernelId::MoeGroupScatterQ8,
+                "moe_group_scatter_q8",
+                Binding::MoeScratch {
+                    binding_index: 2,
+                    byte_offset: layout.down_out,
+                },
+                (p.hidden / 16).min(256),
+            )
+        } else {
+            (
+                KernelId::MoeGroupScatter,
+                moe_group_scatter_symbol(elem_dtype),
+                Binding::ArenaSlot {
+                    slot: p.expert_in_slot,
+                    binding_index: 2,
+                },
+                p.hidden.min(256),
+            )
+        };
         cmds.push(make_moe_command(
-            KernelId::MoeGroupScatter,
+            scatter_kernel,
             "moe_group",
-            moe_group_scatter_symbol(elem_dtype),
+            scatter_symbol,
             vec![
                 ConstantValue::int(0, m_pairs as i32),
                 ConstantValue::int(1, p.num_experts as i32),
+                ConstantValue::int(2, mpad_max as i32),
                 ConstantValue::int(3, p.top_k as i32),
                 ConstantValue::int(4, p.hidden as i32),
             ],
             DispatchShape {
                 threadgroups: (1, m_pairs, 1),
-                threads_per_threadgroup: (p.hidden.min(256), 1, 1),
+                threads_per_threadgroup: (scatter_threads, 1, 1),
                 m_scaling: Some(MScaling {
                     seq_axis: None,
                     axis: MScaleAxis::Y,
@@ -8939,10 +9138,7 @@ fn lower_gemma_moe(
                     binding_index: 1,
                     byte_offset: layout.grp_offset,
                 },
-                Binding::ArenaSlot {
-                    slot: p.expert_in_slot,
-                    binding_index: 2,
-                },
+                scatter_src,
                 Binding::MoeScratch {
                     binding_index: 3,
                     byte_offset: layout.grp_fill,
@@ -8963,6 +9159,62 @@ fn lower_gemma_moe(
         ));
         // Grouped GEMM helper: y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad).
         let gemm = |which_w, which_s, which_b, x_byte: u32, y_byte: u32, n_out: u32, k_in: u32| {
+            if let (true, Some(tile)) = (w4a8, W4a8Tile::for_n(n_out)) {
+                return make_moe_command(
+                    KernelId::AffineGatherQmmW4a8,
+                    "quantized_qmm_nax",
+                    qmm_w4a8_static_name(W4a8Rows::Grouped, dtype, scale_dtype, p.group_size, tile),
+                    [
+                        ConstantValue::int(0, k_in as i32),
+                        ConstantValue::int(1, n_out as i32),
+                        ConstantValue::int(2, mpad_max as i32),
+                        ConstantValue::int(4, p.num_experts as i32),
+                    ]
+                    .into_iter()
+                    .chain(codes.constant())
+                    .collect(),
+                    DispatchShape {
+                        threadgroups: (n_out / tile.cols(), mpad_max / W4A8_TILE_ROWS, 1),
+                        threads_per_threadgroup: (32 * tile.simdgroups(), 1, 1),
+                        m_scaling: None,
+                    },
+                    vec![
+                        Binding::Weight {
+                            kind: experts_kind,
+                            which: which_w,
+                            layer: layer_id,
+                            locator: locator0,
+                            binding_index: 0,
+                        },
+                        Binding::Weight {
+                            kind: experts_kind,
+                            which: which_s,
+                            layer: layer_id,
+                            locator: locator0,
+                            binding_index: 1,
+                        },
+                        Binding::Weight {
+                            kind: experts_kind,
+                            which: which_b,
+                            layer: layer_id,
+                            locator: locator0,
+                            binding_index: 2,
+                        },
+                        Binding::MoeScratch {
+                            binding_index: 3,
+                            byte_offset: x_byte,
+                        },
+                        Binding::MoeScratch {
+                            binding_index: 4,
+                            byte_offset: y_byte,
+                        },
+                        Binding::MoeScratch {
+                            binding_index: 5,
+                            byte_offset: layout.grp_indices_pad,
+                        },
+                    ],
+                );
+            }
             // NAX (M5 matrix accelerator) is ~5-10x faster per call than
             // the steel grouped GEMM; use it when available + N%64==0 +
             // gs in {64,128} (BM=64 tile). The host padded to BM=64, so a
@@ -8995,12 +9247,15 @@ fn lower_gemma_moe(
                 kernel,
                 library,
                 symbol,
-                vec![
+                [
                     ConstantValue::int(0, k_in as i32),
                     ConstantValue::int(1, n_out as i32),
                     ConstantValue::int(2, mpad_max as i32),
                     ConstantValue::int(4, p.num_experts as i32),
-                ],
+                ]
+                .into_iter()
+                .chain(p.codes.for_bits(p.bits).constant())
+                .collect(),
                 DispatchShape {
                     threadgroups: (n_out.div_ceil(tile), mpad_max.div_ceil(tile), 1),
                     threads_per_threadgroup: (32, 2, 2),
@@ -9091,12 +9346,48 @@ fn lower_gemma_moe(
                 ],
             ));
         }
-        // G7: down (act = gate_pad → down_pad).
+        // G7: down (act = gate_pad → down_pad). W4A8 quantizes the act into
+        // `x_pad` first (gate/up are done with it; sentinel rows skipped).
+        if w4a8 {
+            cmds.push(make_moe_command(
+                KernelId::AffineGatherW4a8Quant,
+                "quantized_qmm_nax",
+                w4a8_quant_static_name(W4a8Rows::Grouped, dtype),
+                vec![
+                    ConstantValue::int(0, p.moe_inter as i32),
+                    ConstantValue::int(2, mpad_max as i32),
+                    ConstantValue::int(4, p.num_experts as i32),
+                ],
+                DispatchShape {
+                    threadgroups: ((p.moe_inter / 64).div_ceil(16), mpad_max, 1),
+                    threads_per_threadgroup: (128, 1, 1),
+                    m_scaling: None,
+                },
+                vec![
+                    Binding::MoeScratch {
+                        binding_index: 0,
+                        byte_offset: layout.grp_gate_pad,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 1,
+                        byte_offset: layout.grp_x_pad,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 2,
+                        byte_offset: layout.grp_indices_pad,
+                    },
+                ],
+            ));
+        }
         cmds.push(gemm(
             WeightTensor::MoeExpertDownW,
             WeightTensor::MoeExpertDownS,
             WeightTensor::MoeExpertDownB,
-            layout.grp_gate_pad,
+            if w4a8 {
+                layout.grp_x_pad
+            } else {
+                layout.grp_gate_pad
+            },
             layout.grp_down_pad,
             p.hidden,
             p.moe_inter,
@@ -9222,10 +9513,13 @@ fn lower_gemma_moe(
                 kernel,
                 "quantized_qmv",
                 symbol,
-                vec![
+                [
                     ConstantValue::int(0, k_in as i32),
                     ConstantValue::int(1, n_out as i32),
-                ],
+                ]
+                .into_iter()
+                .chain(p.codes.for_bits(p.bits).constant())
+                .collect(),
                 DispatchShape {
                     threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
                     threads_per_threadgroup: (32, 2, 1),
@@ -9752,19 +10046,38 @@ mod tests {
         };
         let m5 = Some(&crate::targets::M5_10CORE);
         for (bucket_m, own, tile) in [
-            (8, KernelId::AffineQmvFast, SmallMTile::Rows8),
-            (64, KernelId::AffineQmmTNax, SmallMTile::Rows16),
+            (8, &[KernelId::AffineQmvFast][..], SmallMTile::Rows8),
+            (
+                64,
+                &[KernelId::AffineW4a8Quant, KernelId::AffineQmmW4a8][..],
+                SmallMTile::Rows16,
+            ),
         ] {
             let tape = lower_at(gemm(4), bucket_m, m5);
-            let steps: Vec<_> = gated_steps(&tape);
-            assert_eq!(
-                steps,
-                [
-                    (own, Some(UnlessSmallMTokens)),
-                    (KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)),
-                ]
+            let mut want: Vec<_> = own.iter().map(|&k| (k, Some(UnlessSmallMTokens))).collect();
+            want.push((KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)));
+            assert_eq!(gated_steps(&tape), want);
+            let (gemm_cmd, small) = (
+                &tape.commands[own.len() - 1].command,
+                &tape.commands[own.len()].command,
             );
-            let (gemm_cmd, small) = (&tape.commands[0].command, &tape.commands[1].command);
+            // Weights and output; the W4A8 GEMM reads its activation from
+            // the pre-pass's scratch (binding 3).
+            let but_input = |c: &LoweredCommand| -> Vec<Binding> {
+                c.bindings
+                    .iter()
+                    .filter(|b| {
+                        !matches!(
+                            b,
+                            Binding::ArenaSlot {
+                                binding_index: 3,
+                                ..
+                            } | Binding::Scratch { binding_index: 3 }
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            };
             let p = tp();
             assert_eq!(
                 small.function,
@@ -9775,7 +10088,18 @@ mod tests {
                 (3072 / SMALL_M_TILE_COLS, bucket_m / tile.rows(), 1)
             );
             assert!(
-                small.bindings == gemm_cmd.bindings,
+                but_input(small) == but_input(gemm_cmd)
+                    && small.bindings[..]
+                        == affine_qmm_bindings(
+                            0,
+                            1,
+                            crate::tape::ids::LayerId(0),
+                            WeightLocator {
+                                bucket: 0,
+                                op_idx: 0,
+                                slot: 0,
+                            },
+                        )[..],
                 "same weights and slots"
             );
         }
@@ -9793,6 +10117,116 @@ mod tests {
                 "bucket {bucket_m}: no small-M twin"
             );
         }
+    }
+
+    /// On an M5 target, an MLX-affine 4-bit GEMM in a prefill bucket runs
+    /// W4A8: the pre-pass quantizes the GEMM's input into the shared scratch
+    /// (behind a barrier), and the GEMM reads it there with the GEMM's own
+    /// weights and output. Both declare the codes offset-8. 8-bit weights,
+    /// a group size the kernel lacks and older devices keep their qmm_t; only
+    /// the 4-bit codes on M5 are offset-8. The lm_head slice replaces the
+    /// pair on non-spec steps and keeps it for spec verification.
+    #[test]
+    fn w4a8_serves_prefill_gemms_on_m5() {
+        use crate::tape::kernel_constants::AffineCodes;
+        use crate::tape::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
+        let gemm = |gs, bits| Instruction::AffineQmm(0, 1, 0, 3072, 8192, gs, bits, 10);
+        let lower_at = |backbone: &[Instruction], lm_head: &[Instruction], profile| {
+            lower_pair(
+                &tp(),
+                false,
+                backbone,
+                lm_head,
+                &vec![true; backbone.len()],
+                &vec![true; lm_head.len()],
+                512,
+                8,
+                0,
+                1,
+                128,
+                profile,
+            )
+            .expect("lower_pair")
+        };
+        let codes = |tape: &LoweredMetalTape| -> Vec<AffineCodes> {
+            tape.commands
+                .iter()
+                .map(|c| AffineCodes::of_constants(c.command.constants))
+                .collect()
+        };
+        let m5 = Some(&crate::targets::M5_10CORE);
+
+        let tape = lower_at(&[gemm(64, 4)], &[], m5);
+        assert_eq!(
+            gated_steps(&tape),
+            [
+                (KernelId::AffineW4a8Quant, None),
+                (KernelId::AffineQmmW4a8, None)
+            ]
+        );
+        let (quant, qmm) = (&tape.commands[0].command, &tape.commands[1].command);
+        assert_eq!(
+            quant.bindings,
+            [
+                Binding::ArenaSlot {
+                    slot: 0,
+                    binding_index: 0
+                },
+                Binding::Scratch { binding_index: 1 },
+            ]
+        );
+        assert_eq!(quant.dispatch.threadgroups, (8192 / 64 / 16, 512, 1));
+        let p = tp();
+        assert_eq!(
+            qmm.function,
+            qmm_w4a8_static_name(
+                W4a8Rows::Dense,
+                dequant_dtype_for(&p),
+                scale_dtype_for(&p),
+                64,
+                W4a8Tile::Cols128
+            )
+        );
+        assert_eq!(
+            qmm.dispatch.threadgroups,
+            (3072 / 128, 512 / W4A8_TILE_ROWS, 1)
+        );
+        assert!(
+            qmm.bindings
+                .contains(&Binding::Scratch { binding_index: 3 })
+        );
+        assert!(tape.splitk_scratch_bytes >= w4a8_scratch_bytes(512, 8192));
+        assert!(
+            tape.barrier_before[0],
+            "the pre-pass waits out the scratch's last reader"
+        );
+        assert_eq!(codes(&tape), [AffineCodes::Offset8; 2]);
+
+        for (instruction, profile, want) in [
+            (gemm(64, 8), m5, AffineCodes::AsWritten),
+            (gemm(32, 4), m5, AffineCodes::Offset8),
+            (
+                gemm(64, 4),
+                Some(&crate::targets::M1_8CORE),
+                AffineCodes::AsWritten,
+            ),
+        ] {
+            let tape = lower_at(&[instruction], &[], profile);
+            assert!(
+                tape.commands
+                    .iter()
+                    .all(|c| c.command.kernel != KernelId::AffineQmmW4a8),
+                "{instruction:?}: no W4A8"
+            );
+            assert!(codes(&tape).iter().all(|&c| c == want), "{instruction:?}");
+        }
+
+        let steps = gated_steps(&lower_at(&[], &[gemm(64, 4)], m5));
+        assert!(steps.contains(&(KernelId::GatherLastToken, Some(OnlyIfNoSpec))));
+        assert!(steps.ends_with(&[
+            (KernelId::AffineW4a8Quant, Some(OnlyIfSpec)),
+            (KernelId::AffineQmmW4a8, Some(OnlyIfSpec)),
+        ]));
     }
 
     /// A multi-token tape runs its own attention off decode steps, in the
