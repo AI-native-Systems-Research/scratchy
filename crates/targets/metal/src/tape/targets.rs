@@ -119,9 +119,7 @@ pub const M5_10CORE: MetalTargetProfile = MetalTargetProfile {
 /// `is_nax_available`). `MetalPerformancePrimitives matmul2d` is callable
 /// on M4 but emulates via the standard simdgroup matmul with a
 /// cooperative-tensor per-thread layout that does NOT match
-/// `BaseNAXFrag`'s 2-row × 4-col assumption — see the diagnostic
-/// `nax_probe_dump_layout` reproducer in
-/// `crates/targets/metal/tests/quantized_qmm_test.rs`.
+/// `BaseNAXFrag`'s 2-row × 4-col assumption.
 ///
 /// Returns `false` for M1–M4 (gen ≤ 16, no NAX hardware — M4 emulates
 /// `matmul2d` via the standard simdgroup matmul, yielding a
@@ -129,7 +127,7 @@ pub const M5_10CORE: MetalTargetProfile = MetalTargetProfile {
 /// `true` for M5+ (gen ≥ 17), validated against the layout probe on an
 /// Apple M5 (MacBook Pro, macOS 26.5): the `ct_c` per-thread coords come
 /// back in the contiguous 2×4 `BaseNAXFrag` pattern, distinct from the
-/// M4 emulation layout. See `nax_probe_dump_layout`.
+/// M4 emulation layout.
 pub fn is_nax_capable(g: AppleSiliconGen) -> bool {
     matches!(g, AppleSiliconGen::M5)
 }

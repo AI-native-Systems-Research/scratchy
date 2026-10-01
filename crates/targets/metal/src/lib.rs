@@ -47,9 +47,9 @@ pub mod steel_paged {
 
     /// MSL symbol for the spans rope-once kernel (`rope_once_nax`), which
     /// ropes a request's K ONCE into the dense scratch so the NAX attention
-    /// reads pre-roped K with no per-tile rotation. Lives in the same runtime-
-    /// compiled `attention_steel_nax_paged` library and is instantiated at the
-    /// same (dtype, head_dim 128) combos as `nax_paged_symbol`.
+    /// reads pre-roped K with no per-tile rotation. Lives in the same
+    /// `attention_steel_nax_paged` library and is instantiated at the same
+    /// (dtype, head_dim 128) combos as `nax_paged_symbol`.
     pub fn rope_once_nax_symbol(dtype_tag: &str, head_dim: u32) -> Option<&'static str> {
         match (dtype_tag, head_dim) {
             ("f16", 64) => Some("rope_once_nax_f16_bd64_bs16"),
@@ -209,13 +209,6 @@ macro_rules! embedded_metallib {
     ($name:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".metallib"))
     };
-}
-
-/// The build.rs-embedded `quantized_qmm_nax.metallib` bytes (compiled
-/// with `-mmacosx-version-min=26.2` so the MPP `matmul2d` codegen is
-/// correct). Exposed for the AOT-vs-JIT startup timing probe.
-pub fn embedded_nax_metallib() -> &'static [u8] {
-    embedded_metallib!("quantized_qmm_nax")
 }
 
 pub use allocator::{AllocatorError, PooledBuffer, PooledBufferAllocator};

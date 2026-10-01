@@ -21,6 +21,21 @@ use scratchy_target_metal::specialized_pipeline_cache::{
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
 
+/// A Metal 4 device with NAX matrix units, or `None` (with a note) on anything
+/// else. The NAX tests gate on this, so on NAX hardware a pipeline that fails
+/// to build fails the test instead of reading as "not a NAX GPU".
+fn detect_nax_device() -> Option<scratchy_target_metal::MetalDevice> {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal 4 device");
+        return None;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+        eprintln!("skipping: non-NAX GPU ({:?})", di.profile.generation);
+        return None;
+    }
+    Some(di)
+}
+
 fn buf_f16(device: &Device, data: &[f32]) -> Buffer {
     let h: Vec<f16> = data.iter().map(|&v| f16::from_f32(v)).collect();
     let bytes = (h.len() * 2).max(4);
@@ -552,13 +567,11 @@ fn steel_paged_bk32_bd128_matches_ref() {
 }
 
 /// Correctness probe for the NAX (matrix-accelerator) PAGED attention
-/// kernel at BQ=64, BK=32, head_dim 128 vs the CPU reference. M5-only
-/// (the runtime `newLibraryWithSource` MPP compile only produces a
-/// usable library on NAX hardware); skips with a note on non-NAX GPUs.
+/// kernel at BQ=64, BK=32, head_dim 128 vs the CPU reference. M5-only;
+/// skips with a note on non-NAX GPUs.
 #[test]
 fn steel_nax_paged_bd128_matches_ref() {
-    let Some(di) = detect_device() else {
-        eprintln!("skipping: no Metal device");
+    let Some(di) = detect_nax_device() else {
         return;
     };
     let device = di.device.clone();
@@ -606,13 +619,7 @@ fn steel_nax_paged_bd128_matches_ref() {
         "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = match cache.get_or_build(&key) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("skipping steel_nax_paged: pipeline build failed (non-NAX GPU?): {e:?}");
-            return;
-        }
-    };
+    let pipeline = cache.get_or_build(&key).expect("steel_nax_paged pipeline");
 
     let nq_blocks = total_q.div_ceil(64);
     if !common::dispatch_threadgroups(
@@ -674,8 +681,7 @@ fn steel_nax_paged_bd128_matches_ref() {
 /// on non-NAX GPUs.
 #[test]
 fn steel_nax_paged_limiter_bench() {
-    let Some(detected) = detect_device() else {
-        eprintln!("skip steel_nax_paged_limiter_bench: no metal device");
+    let Some(detected) = detect_nax_device() else {
         return;
     };
     let device = detected.device.clone();
@@ -714,15 +720,7 @@ fn steel_nax_paged_limiter_bench() {
         "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = match cache.get_or_build(&key) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "skip steel_nax_paged_limiter_bench: pipeline build failed (non-NAX?): {e:?}"
-            );
-            return;
-        }
-    };
+    let pipeline = cache.get_or_build(&key).expect("steel_nax_paged pipeline");
 
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     let tew = pipeline.threadExecutionWidth();
@@ -810,8 +808,7 @@ struct NaxRopeCase {
 /// observed max_err so the caller can assert. block_size is fixed at 16
 /// (the bs16 NAX instantiation); BQ=64 → 128 threads / 4 simdgroups.
 fn run_rope_on_read_nax_case(case: NaxRopeCase) {
-    let Some(di) = detect_device() else {
-        eprintln!("skipping: no Metal device");
+    let Some(di) = detect_nax_device() else {
         return;
     };
     let device = di.device.clone();
@@ -878,33 +875,19 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     ];
     // Rope-once kernel reads constants 1,2,5,6,8,9 + the cache; instantiated
     // per (dtype, head_dim) like the attention kernel.
-    let rope_pipe = match cache.get_or_build(&PipelineKey::new(
-        "attention_steel_nax_paged",
-        "rope_once_nax_f16_bd128_bs16",
-        consts.clone(),
-    )) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "skipping nax rope-on-read {name}: rope-once build failed (non-NAX GPU?): {e:?}"
-            );
-            return;
-        }
-    };
+    let rope_pipe = cache
+        .get_or_build(&PipelineKey::new(
+            "attention_steel_nax_paged",
+            "rope_once_nax_f16_bd128_bs16",
+            consts.clone(),
+        ))
+        .expect("rope_once_nax pipeline");
     let key = PipelineKey::new(
         "attention_steel_nax_paged",
         "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = match cache.get_or_build(&key) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "skipping nax rope-on-read {name}: pipeline build failed (non-NAX GPU?): {e:?}"
-            );
-            return;
-        }
-    };
+    let pipeline = cache.get_or_build(&key).expect("steel_nax_paged pipeline");
 
     // ── Pass 1: rope K ONCE into the scratch (k_buf read via k_tab). ──
     // Grid: x = num_kv_heads * block_size * (rot_dim/2), y = num_blocks.

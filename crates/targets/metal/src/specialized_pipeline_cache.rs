@@ -148,7 +148,7 @@ impl SpecializedPipelineCache {
     }
 
     pub fn with_standard_shaders(device: Device) -> Result<Self, MetalStreamError> {
-        let mut cache = Self::new(
+        Self::new(
             device,
             &[
                 ("rmsnorm", crate::embedded_metallib!("rmsnorm")),
@@ -190,6 +190,10 @@ impl SpecializedPipelineCache {
                     crate::embedded_metallib!("attention_steel_paged"),
                 ),
                 (
+                    "attention_steel_nax_paged",
+                    crate::embedded_metallib!("attention_steel_nax_paged"),
+                ),
+                (
                     "gather_last_token",
                     crate::embedded_metallib!("gather_last_token"),
                 ),
@@ -204,8 +208,10 @@ impl SpecializedPipelineCache {
                 ),
                 ("quantized_qmv", crate::embedded_metallib!("quantized_qmv")),
                 ("quantized_qmm", crate::embedded_metallib!("quantized_qmm")),
-                // `quantized_qmm_nax` is intentionally absent — runtime-
-                // compiled below (offline metallib miscompiles MPP).
+                (
+                    "quantized_qmm_nax",
+                    crate::embedded_metallib!("quantized_qmm_nax"),
+                ),
                 ("quantized_qvm", crate::embedded_metallib!("quantized_qvm")),
                 (
                     "quantized_splitk_reduce",
@@ -281,31 +287,7 @@ impl SpecializedPipelineCache {
                 ),
                 ("avg_pool_2d", crate::embedded_metallib!("avg_pool_2d")),
             ],
-        )?;
-        // NAX qmm_t (`affine_qmm_t_nax_*`) MUST be compiled from source at
-        // runtime via `newLibraryWithSource`: the offline `xcrun metal`
-        // metallib toolchain miscompiles MetalPerformancePrimitives
-        // `matmul2d` cooperative tensors (each MMA reduces only half its
-        // K → ~95%-wrong qmm_t). The runtime compiler is correct; this is
-        // also the path mlx uses. The cross-generation `newLibraryWithSource`
-        // caveat noted on `register_metallib_library` does not apply here —
-        // NAX only runs on M5+ (`is_nax_capable`), and there it's the only
-        // correct option.
-        let nax_lib = crate::shader_cache::compile_nax_library_from_source(&cache.device)
-            .map_err(MetalStreamError::ShaderCompilationFailed)?;
-        cache.libraries.insert("quantized_qmm_nax", nax_lib);
-        // NAX paged attention (`attention_steel_nax_paged`) — same runtime-
-        // compile requirement as the qmm (MPP miscompiled offline). Only
-        // compiled where the runtime driver supports MPP; on non-NAX GPUs
-        // the source still parses but the dispatcher never selects it.
-        if let Ok(nax_attn_lib) =
-            crate::shader_cache::compile_nax_attention_paged_library_from_source(&cache.device)
-        {
-            cache
-                .libraries
-                .insert("attention_steel_nax_paged", nax_attn_lib);
-        }
-        Ok(cache)
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -394,9 +376,9 @@ impl SpecializedPipelineCache {
         // GUARD (threadgroup-overflow class): a kernel whose total threadgroup
         // memory exceeds the device limit faults at GPU exec with a cryptic
         // `MTLCommandBufferStatus(5)`. Catch it here at pipeline build with the
-        // FUNCTION NAME instead. Runtime-compiled MPP/NAX kernels' threadgroup
-        // size (incl. matmul2d internals) isn't knowable to Rust at compile
-        // time, so this build-time assert is the earliest possible guard.
+        // FUNCTION NAME instead. MPP/NAX kernels' threadgroup size (incl.
+        // matmul2d internals) isn't knowable to Rust at compile time, so this
+        // pipeline-build assert is the earliest possible guard.
 
         let mut map = self.pipelines.lock().unwrap();
         Ok(map.entry(key.clone()).or_insert(pipeline).clone())
