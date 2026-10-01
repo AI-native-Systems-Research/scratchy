@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate site/_site/architectures.html from crates/models/arch/dsl/*.rs.in.
+"""Generate site/_site/architectures.html from crates/models/arch/dsl/*.py.
 
 The DSL files stay the single source of truth: this reads them at site-build
 time, so the page cannot drift from the compiler input. Called from build.py,
@@ -19,10 +19,10 @@ ROOT = HERE.parent
 
 # Same token classes as the snippet on the landing page (.c-* in styles.css).
 TOKENS = re.compile(
-    r"""(?P<cm>//.*$)
-      | (?P<at>\#\[[A-Za-z_][A-Za-z0-9_]*\])
+    r"""(?P<cm>\#.*$)
+      | (?P<at>@[A-Za-z_][A-Za-z0-9_]*)
       | (?P<s>"(?:[^"\\]|\\.)*")
-      | (?P<kw>\b(?:fn|for|in|let|if|else|match|while|return|mut|as|true|false)\b)
+      | (?P<kw>\b(?:def|for|in|if|elif|else|while|return|import|from|as|and|or|not|True|False|None)\b)
       | (?P<fn>\b[A-Za-z_][A-Za-z0-9_]*\b(?=\s*\())
       | (?P<n>\b\d[A-Za-z0-9_.]*\b)
     """,
@@ -41,19 +41,17 @@ def highlight(line):
 
 
 def strip_comment(line):
-    return line.split("//", 1)[0]
+    return line.split("#", 1)[0]
 
 
-# Some architectures wrap in a `mod <name> { fn forward() { ... } }` and
-# already call their entry point `forward`; the simpler ones (no `mod`
-# wrapper) still name it after themselves, `fn llama() {`. That's a purely
-# nominal difference, not a structural one — left alone it shows up as a
-# diff line (and inflates the ranking's "distance from baseline") on every
-# single comparison. Rewritten for display/diffing only; the compiler's
-# actual DSL files are untouched.
+# Every carrier names its entry point after itself, `def llama():`. That's
+# a purely nominal difference, not a structural one — left alone it shows
+# up as a diff line (and inflates the ranking's "distance from baseline")
+# on every single comparison. Rewritten for display/diffing only; the
+# compiler's actual DSL files are untouched.
 def normalize_entry_fn(stem, lines):
     ident = stem.replace("-", "_")
-    pattern = re.compile(rf"^(fn ){re.escape(ident)}(\(\))")
+    pattern = re.compile(rf"^(def ){re.escape(ident)}(\(\))")
     return [pattern.sub(r"\1forward\2", l, count=1) for l in lines]
 
 
@@ -89,9 +87,9 @@ DIFF_VIEW_CDN = (
     "https://cdn.jsdelivr.net/npm/diff-view-element@1"
     "/cdn/exports/components/diff-view-element/diff-view-element-register.js"
 )
-# Rust isn't one of diff-view-element's built-in languages; this loads the
+# Python isn't one of diff-view-element's built-in languages; this loads the
 # grammar into its own PrismJS instance on first use (see the JS below).
-PRISM_RUST_CDN = "https://cdn.jsdelivr.net/npm/prism-esm/components/prism-rust.js"
+PRISM_PYTHON_CDN = "https://cdn.jsdelivr.net/npm/prism-esm/components/prism-python.js"
 
 
 def select(el_id, label, chosen, order, archs, placeholder=None):
@@ -121,13 +119,13 @@ def side_nav(order, chosen):
 
 def page(header):
     """The whole standalone page. `header` is build.py's shared site chrome."""
-    files = sorted((ROOT / "crates/models/arch/dsl").glob("*.rs.in"))
+    files = sorted((ROOT / "crates/models/arch/dsl").glob("*.py"))
     if not files:
         sys.exit(f"no DSL files under {ROOT / 'crates/models/arch/dsl'}")
 
     archs = {}
     for f in files:
-        stem = f.name[: -len(".rs.in")]
+        stem = f.stem
         lines = normalize_entry_fn(stem, f.read_text().splitlines())
         archs[stem] = {
             "path": str(f.relative_to(ROOT)),
@@ -155,7 +153,7 @@ def page(header):
         "{right}": select("right", "Diff against", "", order, archs, placeholder="— none —"),
         "{nav}": side_nav(order, base),
         "{data}": json.dumps({"base": base, "order": order, "archs": archs,
-                              "left": base, "right": "", "prismRustUrl": PRISM_RUST_CDN},
+                              "left": base, "right": "", "prismPythonUrl": PRISM_PYTHON_CDN},
                              separators=(",", ":")),
         "{count}": str(len(archs)),
         "{total}": f"{total:,}",
@@ -236,7 +234,7 @@ PAGE = r"""<!doctype html>
 
   <cds-tile id="diffpane" class="archpane" style="display: none">
     <div class="codehead"><span id="diffhead"></span></div>
-    <diff-view-element id="diffview" language="rust" disable-line-numbers></diff-view-element>
+    <diff-view-element id="diffview" language="python" disable-line-numbers></diff-view-element>
   </cds-tile>
 </main>
 </div>
@@ -252,21 +250,21 @@ const $ = id => document.getElementById(id);
 // are the authority afterwards. R === '' means "no diff — just show L".
 let L = DATA.left, R = DATA.right;
 
-// diff-view-element ships without Rust highlighting; load the grammar into
+// diff-view-element ships without Python highlighting; load the grammar into
 // its own PrismJS instance once, the first time a diff is actually shown —
 // not on page load, since most visits never open one. Must wait for the
 // element to actually be upgraded first: its register <script type=module>
 // loads asynchronously, so on a fresh page load (or a #left..right deep
 // link) this can run before `.highlighter`/`.requestUpdate` exist yet.
-let rustLoaded = false;
-async function ensureRustHighlighting() {
-  if (rustLoaded) return;
+let pythonLoaded = false;
+async function ensurePythonHighlighting() {
+  if (pythonLoaded) return;
   const [{ loader }] = await Promise.all([
-    import(DATA.prismRustUrl),
+    import(DATA.prismPythonUrl),
     customElements.whenDefined('diff-view-element'),
   ]);
-  if (rustLoaded) return;
-  rustLoaded = true;
+  if (pythonLoaded) return;
+  pythonLoaded = true;
   loader($('diffview').highlighter);
   $('diffview').requestUpdate();
 }
@@ -290,7 +288,7 @@ function render() {
     diffview.oldValue = A[L].raw.join('\n');
     diffview.newValue = A[R].raw.join('\n');
     $('diffhead').textContent = `${A[L].path} → ${A[R].path}`;
-    ensureRustHighlighting();
+    ensurePythonHighlighting();
   }
 
   for (const link of document.querySelectorAll('#model-nav cds-side-nav-link[data-arch]')) {

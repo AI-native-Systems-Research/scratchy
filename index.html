@@ -60,7 +60,7 @@
         <span class="tnum">1</span>
         <h3>A forward DSL</h3>
         <p>The entire forward pass of an architecture, written as the math.</p>
-        <a href="https://github.com/AI-native-Systems-Research/scratchy/blob/main/crates/models/arch/dsl/gemma4-moe.rs.in#L58"><code>gemma4-moe</code></a>
+        <a href="https://github.com/AI-native-Systems-Research/scratchy/blob/main/crates/models/arch/dsl/gemma4-moe.py#L9"><code>gemma4-moe</code></a>
       </cds-tile>
       <cds-tile class="tcard cds--css-grid-column cds--sm:col-span-4 cds--md:col-span-4 cds--lg:col-span-5">
         <span class="tnum">2</span>
@@ -155,26 +155,24 @@
   </div>
 
   <div class="idea-code">
-    <div class="codehead">crates/models/arch/dsl/llama.rs.in</div>
-<cds-code-snippet type="multi"><span class="c-at">#[forward]</span>
-<span class="c-kw">fn</span> <span class="c-fn">llama</span>() {
-    hidden_states = <span class="c-fn">embed</span>(input_ids, embed_tokens);
-    <span class="c-kw">for</span> layer <span class="c-kw">in</span> <span class="c-n">0</span>..num_hidden_layers {
-        normed = <span class="c-fn">rmsnorm</span>(hidden_states, input_layernorm[layer]);
-        q = <span class="c-fn">gemm</span>(normed, self_attn.q_proj[layer]);
-        k = <span class="c-fn">gemm</span>(normed, self_attn.k_proj[layer]);
-        v = <span class="c-fn">gemm</span>(normed, self_attn.v_proj[layer]);
-        (q, k, v) = <span class="c-fn">rope_append</span>(q, k, v, positions, rotary, kv_cache[layer]);
-        attn = <span class="c-fn">attention</span>(q, k, v, kv_cache[layer], block_table);
-        oproj = <span class="c-fn">gemm</span>(attn, self_attn.o_proj[layer]);
-        hidden_states = <span class="c-fn">add</span>(oproj, hidden_states);
+    <div class="codehead">crates/models/arch/dsl/llama.py</div>
+<cds-code-snippet type="multi"><span class="c-at">@forward</span>
+<span class="c-kw">def</span> <span class="c-fn">llama</span>():
+    hidden_states = <span class="c-fn">embed</span>(input_ids, embed_tokens)
+    <span class="c-kw">for</span> layer <span class="c-kw">in</span> <span class="c-fn">range</span>(num_hidden_layers):
+        normed = <span class="c-fn">rmsnorm</span>(hidden_states, input_layernorm[layer])
+        q = <span class="c-fn">gemm</span>(normed, self_attn.q_proj[layer])
+        k = <span class="c-fn">gemm</span>(normed, self_attn.k_proj[layer])
+        v = <span class="c-fn">gemm</span>(normed, self_attn.v_proj[layer])
+        (q, k, v) = <span class="c-fn">rope_append</span>(q, k, v, positions, rotary, kv_cache[layer])
+        attn = <span class="c-fn">attention</span>(q, k, v, kv_cache[layer], block_table)
+        oproj = <span class="c-fn">gemm</span>(attn, self_attn.o_proj[layer])
+        hidden_states = <span class="c-fn">add</span>(oproj, hidden_states)
 
-        normed2 = <span class="c-fn">rmsnorm</span>(hidden_states, post_attention_layernorm[layer]);
-        gate = <span class="c-fn">silu</span>(<span class="c-fn">gemm</span>(normed2, mlp.gate_proj[layer]));
-        up = <span class="c-fn">gemm</span>(normed2, mlp.up_proj[layer]);
-        <span class="c-cm">// ...</span>
-    }
-}</cds-code-snippet>
+        normed2 = <span class="c-fn">rmsnorm</span>(hidden_states, post_attention_layernorm[layer])
+        gate = <span class="c-fn">silu</span>(<span class="c-fn">gemm</span>(normed2, mlp.gate_proj[layer]))
+        up = <span class="c-fn">gemm</span>(normed2, mlp.up_proj[layer])
+        <span class="c-cm"># ...</span></cds-code-snippet>
     <a class="more" href="architectures.html">See all 25 architectures, side by side &rarr;</a>
   </div>
 </section>
