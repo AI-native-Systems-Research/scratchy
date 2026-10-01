@@ -43,24 +43,29 @@ const BACKOFF: Duration = Duration::from_millis(500);
 /// mean five for the file, which is what a caller asking for five expects
 /// and what hf-hub's own setting means.
 pub(crate) struct RetryBudget {
-    remaining: std::sync::atomic::AtomicUsize,
+    /// Retries the file may take, across all its ranges.
+    retries: usize,
+    /// Retries claimed so far. It only counts up, so a claim is one
+    /// `fetch_add`, not a compare-and-swap loop. A refused claim still counts,
+    /// but it also ends that range's retrying, so this grows past `retries` by
+    /// at most one per range.
+    claimed: std::sync::atomic::AtomicUsize,
 }
 
 impl RetryBudget {
     pub(crate) fn new(retries: usize) -> Self {
         Self {
             // The first attempt is not a retry, so N attempts is N-1 retries.
-            remaining: std::sync::atomic::AtomicUsize::new(retries.saturating_sub(1)),
+            retries: retries.saturating_sub(1),
+            claimed: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Claim one retry, or `None` when the file's budget is spent.
+    /// Claim one retry, returning how many were left before it, or `None`
+    /// when the file's budget is spent.
     fn claim(&self) -> Option<usize> {
-        self.remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                (left > 0).then(|| left - 1)
-            })
-            .ok()
+        let before = self.claimed.fetch_add(1, Ordering::SeqCst);
+        (before < self.retries).then(|| self.retries - before)
     }
 }
 
