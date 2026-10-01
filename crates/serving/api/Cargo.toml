@@ -79,7 +79,7 @@ leann-core = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
 # ureq, not reqwest: one blocking POST to an embedding endpoint.
 ureq = { workspace = true, optional = true }
-itertools = "0.14"
+itertools = "0.15"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
