@@ -35,16 +35,7 @@ pub fn run_headless(
 
     loop {
         // Receive broadcast from rank 0 via TCP.
-        let data = channel.recv()?;
-
-        let msg: ControlMessage = bincode::deserialize(&data).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to deserialize control message ({} bytes): {e}",
-                data.len(),
-            )
-        })?;
-
-        match msg {
+        match ControlMessage::recv(&mut channel)? {
             ControlMessage::ExecuteModel(scheduler_output) => {
                 if let Err(e) = executor.execute_model(&scheduler_output) {
                     error!("Headless worker: execute_model failed: {e}");

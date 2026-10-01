@@ -2144,12 +2144,12 @@ fn initialize_stack_multinode(
         // then run locally. Both sides participate in any NCCL collectives.
         {
             use scratchy_serving_worker::multinode::ControlMessage;
-            let msg = ControlMessage::InitCache {
+            ControlMessage::InitCache {
                 num_gpu_blocks,
                 num_cpu_blocks: 0,
-            };
-            let data = bincode::serialize(&msg).context("serialize InitCache")?;
-            channel.broadcast(&data).context("broadcast InitCache")?;
+            }
+            .broadcast(&mut channel)
+            .context("broadcast InitCache")?;
         }
         let mut worker: Box<dyn Worker> = Box::new(worker);
         worker
@@ -2160,9 +2160,9 @@ fn initialize_stack_multinode(
         // Both sides' forward passes hit NCCL collectives simultaneously.
         {
             use scratchy_serving_worker::multinode::ControlMessage;
-            let msg = ControlMessage::Warmup;
-            let data = bincode::serialize(&msg).context("serialize Warmup")?;
-            channel.broadcast(&data).context("broadcast Warmup")?;
+            ControlMessage::Warmup
+                .broadcast(&mut channel)
+                .context("broadcast Warmup")?;
         }
         worker
             .compile_or_warm_up_model()

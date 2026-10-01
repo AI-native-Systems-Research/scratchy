@@ -16,7 +16,7 @@ metal = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-t
 # Multimodal capability, forwarded from `scr`'s `multimodal` feature via
 # scratchy-serving-api. No-op unless a backend that has one is also active.
 vision = ["scratchy-target-metal?/vision"]
-nccl = ["cuda", "scratchy-forward-compiler/nccl", "scratchy-target-cuda/nccl", "scratchy-models/nccl"]
+nccl = ["cuda", "dep:rmp-serde", "scratchy-forward-compiler/nccl", "scratchy-target-cuda/nccl", "scratchy-models/nccl"]
 # IBM Spyre / KTIR: a host-only worker that runs the macro-emitted KTIR bundle
 # on the ktir-emulator (no GPU toolchain). NEVER touches target-cuda: the
 # neutral `GpuWeights` comes from scratchy-layers, the registry/`try_load` +
@@ -74,7 +74,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 cudarc = { workspace = true, optional = true }
 rand = { workspace = true }
-bincode = { workspace = true }
+rmp-serde = { workspace = true, optional = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
