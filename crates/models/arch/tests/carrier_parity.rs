@@ -457,7 +457,6 @@ mod imp {
             gdn_state_indices: gdn_indices_view,
             gdn_is_fresh: gdn_fresh_view,
             has_spec_tokens: false,
-            kv_turboquant: false,
             mm_embeds: None,
             embed_patches: &[],
             vision_rope_cos: None,

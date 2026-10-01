@@ -3830,7 +3830,6 @@ dependencies = [
  "scratchy-tensors",
  "scratchy-vision",
  "serde_json",
- "syn 3.0.6",
  "ureq 3.4.2",
 ]
 
