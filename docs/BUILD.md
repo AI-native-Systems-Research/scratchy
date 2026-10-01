@@ -21,7 +21,7 @@ see [CUDA: build the kernels first](#cuda-build-the-kernels-first). Add
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
 HuggingFace model ids is on by default (`hf-completions`); pass
 `--no-default-features` to build with no network access at all. TurboQuant KV
-compression on metal is on by default too, and fixed at build time — see
+compression is on with `metal` (and off for cuda and spyre), fixed at build time — see
 [`turboquant`](#turboquant--kv-cache-compression-fixed-at-build-time).
 
 ## CUDA: build the kernels first
@@ -165,8 +165,8 @@ No `quant/*` feature named at all = every selected model compiles dense only.
 
 On metal, a model's KV cache is either dense (the model's own dtype) or
 TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
-decides which: nothing chooses at runtime. The `turboquant` feature is **on by
-default** in `scratchy-cli` and does nothing on cuda or spyre.
+decides which: nothing chooses at runtime. `scratchy-cli`'s `metal` feature
+turns `turboquant` **on**; a cuda or spyre build does not have it.
 
 With it on, every selected model whose geometry the codec takes is emitted with
 `KV_CODEC = TurboQuant`; the rest stay dense and the build names each one and
@@ -185,12 +185,7 @@ server logs the loaded model's codec at start (`KV cache codec: TurboQuant
 
 `--kv-cache-dtype` on metal takes the codec by default (`auto`) and can only
 *assert* it: `fp16` or `turboquant` refuses to start if the binary stores the
-model's KV cache the other way. For a dense-KV metal binary, drop the feature:
-
-```bash
-cargo build -p scratchy-cli --no-default-features \
-    --features chat,hf-completions,metal,model/llama-3.2-1b
-```
+model's KV cache the other way.
 
 ## `hf-completions` — shell tab completion over real model ids
 

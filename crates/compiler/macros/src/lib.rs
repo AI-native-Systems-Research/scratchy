@@ -2670,6 +2670,7 @@ fn emit_arch_dispatcher(
             fn num_key_value_heads(&self) -> u64 { self.num_key_value_heads() }
             fn head_dim(&self) -> u64 { self.head_dim() }
             fn vocab_size(&self) -> u64 { self.vocab_size() }
+            #[cfg(any(feature = "cuda", feature = "metal"))]
             fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
                 match self {
                     #(#kv_codec_arms)*
