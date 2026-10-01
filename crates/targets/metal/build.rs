@@ -29,7 +29,8 @@
 //! Adding a head-dim is a one-line edit to `STEEL_PAGED_HEAD_DIMS`
 //! below.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// HEAD_DIMs (BD template arg of `attention_paged<...>` in
@@ -52,8 +53,10 @@ const STEEL_PAGED_HEAD_DIMS: &[(u32, u32)] = &[(64, 16), (96, 16), (128, 32), (2
 /// `INST_STEEL_PAGED` macro expansion.
 const STEEL_PAGED_DTYPES: &[(&str, &str)] = &[("f16", "half"), ("bf16", "bfloat")];
 
-/// Shaders that `#include "metal_nax.h"` and therefore pull in the
-/// MetalPerformancePrimitives `matmul2d` cooperative-tensor intrinsics.
+/// Whether `file` reaches `<MetalPerformancePrimitives/...>` through its
+/// `#include "..."` graph, i.e. uses the MPP `matmul2d` cooperative-tensor
+/// intrinsics (today: everything that includes `metal_nax.h`).
+///
 /// On SDK 26.5 / metalfe-32023.883, the offline `xcrun metal` frontend
 /// miscompiles MPP `matmul2d` (each call reduces only half its K → the
 /// `affine_qmm_t_nax_*` symbols come out ~95% wrong, worst_abs ~10.45)
@@ -62,15 +65,34 @@ const STEEL_PAGED_DTYPES: &[(&str, &str)] = &[("f16", "half"), ("bf16", "bfloat"
 /// correct indexed-operand intrinsics. This is MLX issue #3586, fixed by
 /// MLX PR #3622 (the fix is exactly `-mmacosx-version-min=26.2`).
 ///
-/// So these stems are compiled with the extra
+/// So these shaders are compiled with the extra
 /// `-fno-fast-math -mmacosx-version-min=26.2 -std=metal4.0` flags (math
 /// mode Safe, what mlx's `MTLCompileOptions` use). Every other shader
-/// keeps the plain `-O3` flags.
-const NAX_MPP_SHADER_STEMS: &[&str] = &[
-    "quantized_qmm_nax",
-    "attention_steel_nax_paged",
-    "nax_probe",
-];
+/// keeps the plain `-O3` flags. Deriving the set from the includes, not a
+/// hand-kept list, means a new MPP shader can't silently miss the flags.
+fn reaches_mpp(file: &Path, include_dirs: &[&Path], seen: &mut HashSet<PathBuf>) -> bool {
+    if !seen.insert(file.to_path_buf()) {
+        return false;
+    }
+    let src = std::fs::read_to_string(file)
+        .unwrap_or_else(|e| panic!("read {} failed: {e}", file.display()));
+    src.lines()
+        .filter_map(|l| l.trim_start().strip_prefix("#include"))
+        .any(|inc| {
+            let inc = inc.trim_start();
+            if inc.starts_with("<MetalPerformancePrimitives/") {
+                return true;
+            }
+            let Some(name) = inc.strip_prefix('"').and_then(|s| s.split('"').next()) else {
+                return false;
+            };
+            std::iter::once(file.parent().unwrap())
+                .chain(include_dirs.iter().copied())
+                .map(|dir| dir.join(name))
+                .find(|p| p.is_file())
+                .is_some_and(|p| reaches_mpp(&p, include_dirs, seen))
+        })
+}
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -122,9 +144,9 @@ fn main() {
         //
         // MPP/NAX shaders additionally need
         // `-fno-fast-math -mmacosx-version-min=26.2 -std=metal4.0` to
-        // dodge the SDK-26.5 `matmul2d` miscompile (see
-        // `NAX_MPP_SHADER_STEMS`). Without `-mmacosx-version-min=26.2`
-        // the embedded `affine_qmm_t_nax_*` metallib is ~95% wrong.
+        // dodge the SDK-26.5 `matmul2d` miscompile (see `reaches_mpp`).
+        // Without `-mmacosx-version-min=26.2` the embedded
+        // `affine_qmm_t_nax_*` metallib is ~95% wrong.
         let mut cmd = Command::new("xcrun");
         cmd.args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat"]);
         // Only compile the sampler's telemetry-spill params/entropy when the
@@ -133,7 +155,7 @@ fn main() {
         if std::env::var_os("CARGO_FEATURE_SAMPLER_TELEMETRY").is_some() {
             cmd.arg("-DSCRATCHY_SAMPLER_TELEMETRY");
         }
-        if NAX_MPP_SHADER_STEMS.contains(&stem) {
+        if reaches_mpp(shader, &[&out_dir, &shader_dir], &mut HashSet::new()) {
             cmd.args([
                 "-fno-fast-math",
                 "-mmacosx-version-min=26.2",

@@ -4,7 +4,7 @@
 //
 // Like `quantized_qmm_nax.metal`, this kernel uses MetalPerformancePrimitives
 // `matmul2d` cooperative tensors, so build.rs compiles it with the MPP flags
-// (see `NAX_MPP_SHADER_STEMS`).
+// (see `reaches_mpp`).
 //
 // Tile shape: BQ=64, BK=32, WM=4, WN=1, BLOCK_SIZE=16. BQ=64 = 4 warps *
 // 16 rows (one NAX Q-frag per warp). BK=32 = 2 paged blocks per K-tile.
