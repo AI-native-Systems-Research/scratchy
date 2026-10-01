@@ -1989,16 +1989,16 @@ fn emit_arch_dispatcher(
         .collect();
 
     // Per-variant `ScratchyWeights::kv_codec()` arms: each reads its own
-    // module's `CanonicalParams::KV_CODEC`, so the dispatcher keeps no second
-    // record of it.
+    // module's `KV_CODEC` const — the one its `CanonicalParams::KV_CODEC` is
+    // — so the dispatcher keeps no second record of it. Not the impl itself:
+    // spyre implements `ScratchyWeights` but emits no `CanonicalParams`.
     let kv_codec_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
         .map(|a| {
             let variant_ident = pascal_case(&a.model_ident);
             let model_ident = &a.model_ident;
             quote! {
-                Weights::#variant_ident(_) => <#model_ident::Weights as
-                    ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC,
+                Weights::#variant_ident(_) => #model_ident::KV_CODEC,
             }
         })
         .collect();
