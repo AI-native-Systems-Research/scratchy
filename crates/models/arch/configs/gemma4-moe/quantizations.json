@@ -1,7 +1,7 @@
 {
+  "_comment": "The MLX preset is PINNED to `mlx-affine-b4-g64`. `mlx-affine-b4-g64-mlp8-router8` is deliberately NOT declared: it compiles fine (26.5 s) and then cannot load the only checkpoint this arch has. `mlx-community/gemma-4-26b-a4b-it-4bit` declares scalar `bits: 4, group_size: 64` plus 30 per-module overrides — every one of them `language_model.model.layers.<l>.router.proj -> {bits: 8, group_size: 64}` and nothing else. So the ROUTER is 8-bit and the mlp projections are NOT, while that preset declares `mlp.{gate,up,down}_proj: 8` as well; the per-role bit map is part of the dedup signature and drives per-layer kernel selection, so the wrong map is an unloadable build, not a slow one. Declaring both left `quant/mlx` (and anyone naming a preset by hand) a coin flip between a working build and an unusable one. Re-add it only for a checkpoint whose mlp really is 8-bit. `gemma4-moe-ct-int4-sym` stays declared but is cuda-only — `quant_preset_active` skips it on metal.",
   "quantizations": [
     "mlx-affine-b4-g64",
-    "mlx-affine-b4-g64-mlp8-router8",
     "gemma4-moe-ct-int4-sym"
   ]
 }
