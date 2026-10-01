@@ -2092,7 +2092,7 @@ fn initialize_stack_multinode(
             .context("failed to determine available memory")?;
 
         // Step 5: All-reduce MIN across ranks via TCP store.
-        let min_memory = scratchy_target_cuda::tcp_store::allreduce_min(
+        let min_memory = scratchy_serving_transport::tcp_store::allreduce_min(
             0,
             tp_size,
             available_memory,
@@ -2131,7 +2131,7 @@ fn initialize_stack_multinode(
         );
 
         // Step 7: Establish TCP control channel (persistent connections).
-        let mut channel = scratchy_target_cuda::TcpControlChannel::establish(
+        let mut channel = scratchy_serving_transport::TcpControlChannel::establish(
             0,
             tp_size,
             &config.master_addr,
@@ -2371,7 +2371,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         .context("failed to determine available memory")?;
 
     // Step 5: All-reduce MIN across ranks via TCP store.
-    let min_memory = scratchy_target_cuda::tcp_store::allreduce_min(
+    let min_memory = scratchy_serving_transport::tcp_store::allreduce_min(
         node_rank,
         tp_size,
         available_memory,
@@ -2388,7 +2388,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
     );
 
     // Step 6: Establish TCP control channel.
-    let channel = scratchy_target_cuda::TcpControlChannel::establish(
+    let channel = scratchy_serving_transport::TcpControlChannel::establish(
         node_rank,
         tp_size,
         &config.master_addr,
@@ -3362,7 +3362,7 @@ fn initialize_stack_external(
             .context("failed to determine available memory")?;
 
         // Step 5: All-reduce MIN across ranks via TCP store.
-        let min_memory = scratchy_target_cuda::tcp_store::allreduce_min(
+        let min_memory = scratchy_serving_transport::tcp_store::allreduce_min(
             rank,
             world_size,
             available_memory,

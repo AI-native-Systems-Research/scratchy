@@ -14,11 +14,11 @@
 #[cfg(feature = "nccl")]
 use scratchy_serving_engine::executor::Executor;
 #[cfg(feature = "nccl")]
+use scratchy_serving_transport::TcpControlChannel;
+#[cfg(feature = "nccl")]
 use scratchy_serving_worker::multinode::ControlMessage;
 #[cfg(feature = "nccl")]
 use scratchy_serving_worker::uniproc::UniProcExecutor;
-#[cfg(feature = "nccl")]
-use scratchy_target_cuda::TcpControlChannel;
 #[cfg(feature = "nccl")]
 use tracing::{error, info};
 

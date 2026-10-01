@@ -21,7 +21,6 @@ pub mod gpu_worker_base;
 pub mod input_batch;
 #[cfg(feature = "metal")]
 pub mod metal_info;
-#[cfg(feature = "nccl")]
 pub mod multinode;
 pub mod parallel;
 #[cfg(any(feature = "spyre", feature = "spyre-hw"))]

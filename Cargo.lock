@@ -3932,6 +3932,7 @@ dependencies = [
 name = "scratchy-serving-transport"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "rmp-serde",
  "scratchy-core-common",
@@ -3939,6 +3940,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "zeromq",
 ]
 
