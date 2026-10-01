@@ -107,19 +107,27 @@ pub fn unpack_indices(packed: &[u32], bits: u32, dim: usize) -> Vec<u8> {
 
 /// Hardcoded optimal Lloyd-Max centroids for N(0,1) (port of
 /// `_compute_gaussian_codebook` — well-known values).
+///
+/// Held in ten-thousandths, the precision the tables are published at. Both
+/// operands of `n / 1e4` are exact in f32, so each centroid is the correctly
+/// rounded f32 of its 4-decimal value: bit-identical to the decimal literal.
+/// Written as decimals, the 4-bit table's ±1.6180 trips clippy's
+/// `approx_constant` as the golden ratio, which it only resembles.
 fn gaussian_codebook(bits: u32) -> Vec<f32> {
-    match bits {
-        1 => vec![-0.7979, 0.7979],
-        2 => vec![-1.5104, -0.4528, 0.4528, 1.5104],
-        3 => vec![
-            -2.1520, -1.3440, -0.7560, -0.2451, 0.2451, 0.7560, 1.3440, 2.1520,
-        ],
-        4 => vec![
-            -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3881, -0.1284, 0.1284, 0.3881,
-            0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
+    let ten_thousandths: &[i16] = match bits {
+        1 => &[-7979, 7979],
+        2 => &[-15104, -4528, 4528, 15104],
+        3 => &[-21520, -13440, -7560, -2451, 2451, 7560, 13440, 21520],
+        4 => &[
+            -27326, -20690, -16180, -12562, -9423, -6568, -3881, -1284, 1284, 3881, 6568, 9423,
+            12562, 16180, 20690, 27326,
         ],
         _ => panic!("unsupported bit width: {bits} (use 1-4)"),
-    }
+    };
+    ten_thousandths
+        .iter()
+        .map(|&n| f32::from(n) / 1e4)
+        .collect()
 }
 
 /// PolarQuant quantizer for a fixed dim + bit width. Port of `PolarQuantizer`.
