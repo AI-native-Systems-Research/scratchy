@@ -35,9 +35,7 @@ compile_error!("features 'metal' and 'spyre' are mutually exclusive — enable e
 
 use proc_macro2::Span;
 use quote::quote;
-use syn::parse::{Parse, ParseStream};
-use syn::spanned::Spanned;
-use syn::{Ident, ItemFn, LitInt, Token};
+use syn::Ident;
 
 mod alias_rules;
 mod arch_spec;
@@ -66,15 +64,19 @@ mod impl_lib;
 mod interpreter_codegen;
 #[cfg(feature = "metal")]
 mod opcode_shapes;
-mod parse;
+// The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
+mod parse_python;
 mod quantization;
+/// The front end, exposed for the `scratchy-forwards` build driver in
+/// scratchy-models.
+pub use parse_python::{PythonCarrier, parse_python_file};
 // Exposed so build scripts (`hf_registry_build.rs`) can parse a Hub
 // candidate's OWN `quantization_config` with the exact same logic that
 // decides what a checkpoint means at compile time — not a second,
 // drifting copy of "what counts as e.g. 4-bit affine".
 pub use quantization::{ParseError, QuantMethod, QuantizationConfig};
 mod render;
-/// The build script's other half: `compile_in_dir` makes the tokens,
+/// The build script's other half: `compile_carrier` makes the tokens,
 /// `render_tokens` turns them into the text rustc reads.
 pub use render::render_tokens;
 mod schedule;
@@ -105,21 +107,20 @@ mod weights_manifest;
 
 mod vision_glue;
 
-// ── Attribute argument parsing ────────────────────────────────────
+// ── Carrier decorator arguments ───────────────────────────────────
 
-pub struct ForwardArgs {
+struct ForwardArgs {
     /// Discrete `num_tokens` points to solve at. Non-empty.
-    pub workloads: Vec<u64>,
+    workloads: Vec<u64>,
     /// Discrete `sk_bucket` (KV-cache span in tokens) points to solve
-    /// at. Optional — when absent, the solver sweeps only the
-    /// `num_tokens` axis with `sk_bucket = 0` (the sentinel "sk
-    /// axis unused"). Declare this for models where attention
-    /// dispatch wants to pick different kernels at different KV
-    /// spans — e.g. FlashInfer decode wins on long sk, FA2 wins at
-    /// small prefill.
+    /// at. Empty ⇒ the solver sweeps only the `num_tokens` axis with
+    /// `sk_bucket = 0` (the sentinel "sk axis unused"). Declare this
+    /// for models where attention dispatch wants to pick different
+    /// kernels at different KV spans — e.g. FlashInfer decode wins on
+    /// long sk, FA2 wins at small prefill.
     sk_buckets: Vec<u64>,
-    /// Path to the per-arch CPU pixel-pack fn. Required for
-    /// `#[vision_forward]`, ignored by `#[forward]`. The fn signature
+    /// Path to the per-arch CPU pixel-pack fn. Optional for
+    /// `@vision_forward`, ignored by `@forward`. The fn signature
     /// must match `fn(&VisionConfig, &[f32], u32, u32) -> (Vec<u16>,
     /// (u32, u32, u32))`. The macro-emitted `VisionArchWeights` impl
     /// forwards its `pixel_pack` associated fn to this path.
@@ -127,93 +128,47 @@ pub struct ForwardArgs {
     /// Path to a `pub const PROCESSOR: scratchy_vision::MmMetadata` in
     /// the per-arch crate declaring CPU-side host preprocessing
     /// metadata (placeholder token id key, size policy, tokens-per-
-    /// image policy, preprocess fn). Required for `#[vision_forward]`,
-    /// ignored by `#[forward]`. Baked into every emitted
+    /// image policy, preprocess fn). Required for `@vision_forward`,
+    /// ignored by `@forward`. Baked into every emitted
     /// `ScratchyMmRegistration` row. scratchy stays arch-agnostic — every
     /// arch-specific knob is data on the const, not a switch in scratchy.
     processor: Option<syn::Path>,
     /// Span used for error reporting when a required arg is
     /// missing.
-    pub span: Span,
+    span: Span,
 }
 
-impl Parse for ForwardArgs {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let span = input.span();
-        let mut workloads: Option<Vec<u64>> = None;
-        let mut sk_buckets: Option<Vec<u64>> = None;
-        let mut pixel_pack: Option<syn::Path> = None;
-        let mut processor: Option<syn::Path> = None;
-
-        fn parse_u64_list(input: ParseStream) -> syn::Result<Vec<u64>> {
-            let list;
-            syn::bracketed!(list in input);
-            let mut pts = Vec::new();
-            while !list.is_empty() {
-                let n: LitInt = list.parse()?;
-                pts.push(n.base10_parse::<u64>()?);
-                if !list.is_empty() {
-                    list.parse::<Token![,]>()?;
-                }
-            }
-            Ok(pts)
+impl ForwardArgs {
+    /// The carrier decorator's arguments, with the defaults applied.
+    fn from_carrier(carrier: &PythonCarrier) -> Self {
+        Self {
+            // Omitting `workloads` gives the global default ladder.
+            // Per-bucket affordability is decided at load time by
+            // `select_prefill_bucket`, so declaring the full ladder here
+            // is free on small devices — they just prune it. Vision
+            // carriers always declare theirs (image-patch counts, not
+            // the text-decode ladder).
+            workloads: carrier
+                .workloads
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DECODER_WORKLOADS.to_vec()),
+            // Omitting `sk_buckets` gives the standard KV-span ladder
+            // (every decoder arch wants the same one). An explicit empty
+            // list `sk_buckets=[]` opts into the legacy 1-D sweep, where
+            // `sk_bucket = 0` is the sentinel that non-sk-constrained
+            // impls (Any / NumTokensRange) accept unconditionally and FI
+            // impls with a real sk range can never match.
+            sk_buckets: carrier
+                .sk_buckets
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SK_BUCKETS.to_vec()),
+            pixel_pack: carrier.pixel_pack.clone(),
+            processor: carrier.processor.clone(),
+            span: Span::call_site(),
         }
-
-        while !input.is_empty() {
-            let key: Ident = input.parse()?;
-            input.parse::<Token![=]>()?;
-
-            match key.to_string().as_str() {
-                "workloads" => workloads = Some(parse_u64_list(input)?),
-                "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
-                "pixel_pack" => pixel_pack = Some(input.parse::<syn::Path>()?),
-                "processor" => processor = Some(input.parse::<syn::Path>()?),
-                other => {
-                    return Err(syn::Error::new(
-                        key.span(),
-                        format!("unknown #[forward] argument: `{other}`"),
-                    ));
-                }
-            }
-
-            if !input.is_empty() {
-                input.parse::<Token![,]>()?;
-            }
-        }
-
-        // `workloads` is now OPTIONAL. When omitted, `#[forward]` fills the
-        // global default ladder (`DEFAULT_DECODER_WORKLOADS`, applied in the
-        // `forward` entry point); `#[vision_forward]` still requires it (its
-        // workloads are image-patch counts, not the text-decode ladder, so it
-        // re-validates non-empty). Per-bucket affordability is decided at load
-        // time by `select_prefill_bucket`, so declaring the full ladder here is
-        // free on small devices — they just prune it.
-        let workloads = workloads.unwrap_or_default();
-        // Omitting `sk_buckets` gives the standard KV-span ladder (every
-        // decoder arch wants the same one). Pass an explicit empty list
-        // `sk_buckets = []` to opt into the legacy 1-D sweep, where
-        // `sk_bucket = 0` is the sentinel that non-sk-constrained impls
-        // (Any / NumTokensRange) accept unconditionally and FI impls with a
-        // real sk range can never match.
-        let sk_buckets = sk_buckets.unwrap_or_else(|| DEFAULT_SK_BUCKETS.to_vec());
-
-        Ok(Self {
-            workloads,
-            sk_buckets,
-            pixel_pack,
-            processor,
-            span,
-        })
     }
 }
 
-/// Discover the configs directory for `arch`. Standard layout:
-/// each arch used to be its own crate, so configs lived
-/// at `<MANIFEST_DIR>/configs/`. Fallback for #[forward] usages
-/// outside a per-arch crate (e.g. integration tests in
-/// `scratchy-forward-compiler/tests/`): walk up to the workspace root and
-/// look in `crates/scratchy-model-<arch>/configs/` (a layout that predates the
-/// consolidated `scratchy-models` crate; kept only for standalone test fixtures).
 /// Format a microsecond value adaptively for human scanning:
 /// `<1000µs` as `Nµs`, `<100ms` as `N.Xms`, else `Nms`.
 /// Cross-variant forward-fn dedup. Returns a map `variant_idx →
@@ -392,42 +347,7 @@ fn fmt_us(us: f64) -> String {
     }
 }
 
-fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path::PathBuf, String> {
-    // Per-arch crates own their JSONs under `configs/` next to
-    // `Cargo.toml` — fast path for the standard layout.
-    let local = start.join("configs");
-    if local.is_dir() {
-        return Ok(local);
-    }
-    // Fallback for #[forward] invocations that live OUTSIDE the
-    // consolidated scratchy-models crate (e.g. integration tests in
-    // `scratchy-forward-compiler/tests/`). Walk up to the workspace root
-    // and look in `crates/models/arch/configs/<arch>/` — the same
-    // consolidated location every real arch's configs live under.
-    // The `_` → `-` conversion mirrors probe-weights' arch-name handling.
-    let arch_dir_name = arch.replace('_', "-");
-    let mut cur: Option<&std::path::Path> = Some(start);
-    while let Some(d) = cur {
-        let candidate = d
-            .join("crates")
-            .join("models")
-            .join("arch")
-            .join("configs")
-            .join(&arch_dir_name);
-        if candidate.is_dir() {
-            return Ok(candidate);
-        }
-        cur = d.parent();
-    }
-    Err(format!(
-        "no `configs/` at {} and no `crates/models/arch/configs/{}/` walking up to the \
-         workspace root",
-        local.display(),
-        arch_dir_name,
-    ))
-}
-
-// ── Macro entry point ─────────────────────────────────────────────
+// ── Pipeline entry point ──────────────────────────────────────────
 
 /// Global, target-reactive prefill/decode bucket ladder. Every `#[forward]`
 /// arch that does not explicitly override `workloads` compiles THIS ladder
@@ -435,7 +355,7 @@ fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path:
 /// the affordable subset is chosen per device at load time by
 /// `select_prefill_bucket` (Metal prunes its colored arena, CUDA its captured
 /// graph shapes). Mirrors the llama arch's historical ladder.
-pub const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
+const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
 
 /// Default KV-cache-span (`sk_bucket`) ladder. Every `#[forward]` arch that
 /// does not explicitly override `sk_buckets` solves at THESE spans; all
@@ -443,61 +363,12 @@ pub const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048,
 /// `sk_buckets = []` for the legacy 1-D (sk-axis-unused) sweep.
 const DEFAULT_SK_BUCKETS: &[u64] = &[128, 512, 2048, 8192];
 
-/// The macro's carrier item: ONE `#[forward] fn <arch>()` whose body
-/// is the arch's math, and nothing else.
-///
-/// There is no second form. An arch's non-math facts — safetensors
-/// layout, rope style, decoder prefix, bound defaults, the `Params`
-/// bound schema — are DATA about the checkpoints, so they live with
-/// the checkpoints, in `configs/<arch>/arch.json` (read by
-/// [`config::load_arch_json`]). They used to be declared as `const`
-/// items inside a `mod` carrier, which meant the DSL file carried a
-/// config file written as fake Rust: the type ascriptions never
-/// resolved, and the macro string-matched const NAMES and scraped
-/// literals back out. The DSL declares math; the configs declare
-/// themselves.
-pub struct Carrier {
-    /// The DSL-bearing fn; its ident names the arch.
-    func: ItemFn,
-    arch_name: String,
-    /// Span for error reporting anchored at the arch's name.
-    name_span: Span,
-}
-
-pub fn parse_carrier(item: syn::Item) -> syn::Result<Carrier> {
-    match item {
-        syn::Item::Fn(func) => {
-            let arch_name = func.sig.ident.to_string();
-            let name_span = func.sig.ident.span();
-            Ok(Carrier {
-                func,
-                arch_name,
-                name_span,
-            })
-        }
-        // A `mod` carrier is what the const-declaration surface used to
-        // require. Point at where those declarations go now rather than
-        // just rejecting the shape.
-        syn::Item::Mod(m) => Err(syn::Error::new(
-            m.ident.span(),
-            "#[forward] / #[vision_forward] expects a bare `fn <arch>()` carrier — \
-             the DSL declares only the arch's math. Move declarations \
-             (SAFETENSORS, SCALE_DTYPE, BOUND_DEFAULTS, `struct Params`, …) \
-             to configs/<arch>/arch.json",
-        )),
-        other => Err(syn::Error::new(
-            other.span(),
-            "#[forward] / #[vision_forward] expects a bare `fn <arch>()` carrier",
-        )),
-    }
-}
-
-/// Per-macro overrides on the shared compile pipeline. Selected
-/// once at the proc-macro entry; threaded through the prelude /
-/// fanout / lowering passes so the body of [`compile_common`]
-/// stays almost-uniform across the decoder and vision variants.
+/// Per-carrier overrides on the shared compile pipeline. Selected by
+/// the carrier's decorator; threaded through the prelude / fanout /
+/// lowering passes so the body of [`compile_carrier`] stays
+/// almost-uniform across the decoder and vision variants.
 #[derive(Clone, Copy)]
-pub struct CompileMode {
+struct CompileMode {
     /// Selects the DSL extern set used by [`classify::classify_with`].
     prelude: classified::Prelude,
     /// True for `#[forward]` (decoder), false for `#[vision_forward]`.
@@ -530,7 +401,7 @@ pub struct CompileMode {
 }
 
 impl CompileMode {
-    pub const DECODER: Self = Self {
+    const DECODER: Self = Self {
         prelude: classified::Prelude::Decoder,
         apply_tp_lowering: true,
         #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -538,7 +409,7 @@ impl CompileMode {
         enable_tp_fanout: true,
         emit_arch_dispatch: true,
     };
-    pub const VISION: Self = Self {
+    const VISION: Self = Self {
         prelude: classified::Prelude::Vision,
         apply_tp_lowering: false,
         #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -548,39 +419,21 @@ impl CompileMode {
     };
 }
 
-pub fn compile_common(
-    args: &ForwardArgs,
-    carrier: &Carrier,
-    mode: CompileMode,
-) -> syn::Result<proc_macro2::TokenStream> {
-    // CARGO_MANIFEST_DIR at macro-expansion time is the invoking crate's root;
-    // the configs directory is `<MANIFEST_DIR>/configs/` for per-arch crates,
-    // with a workspace-walk fallback for tests outside model crates. The
-    // consolidated arch crate drives many arches from one manifest, so it calls
-    // `compile_in_dir` directly with each arch's own configs dir instead.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
-        syn::Error::new(
-            args.span,
-            "CARGO_MANIFEST_DIR not set — cannot resolve paths",
-        )
-    })?;
-    let base = std::path::PathBuf::from(manifest_dir);
-    let models_dir = discover_models_dir(&base, &carrier.arch_name)
-        .map_err(|e| syn::Error::new(carrier.name_span, e))?;
-    compile_in_dir(args, carrier, mode, &models_dir)
-}
-
-/// Like [`compile_common`] but with the per-arch configs directory supplied
-/// explicitly, rather than discovered from `CARGO_MANIFEST_DIR`. The
-/// consolidated arch crate's build.rs drives every arch from one crate, so it
-/// passes each arch's own `<arch>/configs` here.
-pub fn compile_in_dir(
-    args: &ForwardArgs,
-    carrier: &Carrier,
-    mode: CompileMode,
+/// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
+/// its arch's `configs/<arch>/` directory — in vision mode for a
+/// `@vision_forward` carrier, decoder mode for `@forward`.
+pub fn compile_carrier(
+    carrier: PythonCarrier,
     models_dir: &std::path::Path,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let arch_name = carrier.arch_name.clone();
+    let args = &ForwardArgs::from_carrier(&carrier);
+    let mode = if carrier.vision {
+        CompileMode::VISION
+    } else {
+        CompileMode::DECODER
+    };
+    let name_span = args.span;
+    let PythonCarrier { ast, arch_name, .. } = carrier;
 
     // `pixel_pack = path::to::fn` is OPTIONAL under VISION mode.
     // When unset, the trait's default `pixel_pack` (which delegates
@@ -590,9 +443,7 @@ pub fn compile_in_dir(
     // Override only for arches with different patch ordering
     // (SigLIP raster, etc.). Decoder mode ignores the arg if set.
 
-    // ── Front end: parse + classify ───────────────────────────────
-    let ast = parse::parse_block(&carrier.func.block)
-        .map_err(|e| syn::Error::new(args.span, format!("parse: {e}")))?;
+    // ── Front end: classify ────────────────────────────────────────
     let classified = classify::classify_with(&ast, mode.prelude)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
 
@@ -611,7 +462,7 @@ pub fn compile_in_dir(
     // common case.
     let spec = config::load_arch_json(models_dir).map_err(|e| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("models_dir `{}`: {e}", models_dir.display()),
         )
     })?;
@@ -626,7 +477,7 @@ pub fn compile_in_dir(
     }
     .map_err(|e| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("models_dir `{}`: {e}", models_dir.display()),
         )
     })?;
@@ -651,13 +502,13 @@ pub fn compile_in_dir(
             return Ok(quote! {});
         }
         return Err(syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("no *.json configs in {}", models_dir.display()),
         ));
     }
     let manifest = weights_manifest::load_or_empty(models_dir).map_err(|e| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             format!("weights.json in {}: {e}", models_dir.display()),
         )
     })?;
@@ -722,7 +573,7 @@ pub fn compile_in_dir(
                  tensor literally uses an underscore (`{dotted}`), add a WEIGHT_LEAF_RENAMES \
                  entry in lib.rs mapping a non-digit DSL leaf to it. If the on-disk key really \
                  is a dotted nn.Sequential/submodule index, this is intended — ignore.",
-                arch = carrier.arch_name,
+                arch = arch_name,
             );
         }
     }
@@ -835,7 +686,7 @@ pub fn compile_in_dir(
                      downstream with an unrelated unclaimed-tile error. Declare each in \
                      {wjpath} — a marker/bundle family as \
                      `\"{first}\": [\"hidden_size\"]`, or the explicit leaf shape.",
-                    arch = carrier.arch_name,
+                    arch = arch_name,
                     names = unresolved.join(", "),
                     wjpath = models_dir.join("weights.json").display(),
                     first = first,
@@ -847,8 +698,8 @@ pub fn compile_in_dir(
     // Backend selection via feature flags (compile-time, not runtime)
     #[cfg(feature = "cuda")]
     let target_profile = {
-        let target_def = scratchy_target_cuda::targets::detect()
-            .map_err(|e| syn::Error::new(carrier.name_span, e))?;
+        let target_def =
+            scratchy_target_cuda::targets::detect().map_err(|e| syn::Error::new(name_span, e))?;
         target::from_profile_def(target_def)
     };
 
@@ -862,7 +713,7 @@ pub fn compile_in_dir(
     #[cfg(feature = "metal")]
     scratchy_target_metal::device::detect_metal_profile().ok_or_else(|| {
         syn::Error::new(
-            carrier.name_span,
+            name_span,
             "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
         )
     })?;
@@ -1801,7 +1652,7 @@ pub fn compile_in_dir(
     // empty-arms early-return — but the explicit skip here makes the
     // intent visible at the call site.
     let arch_dispatch_ts = if mode.emit_arch_dispatch {
-        let arch_ident = Ident::new(&arch_name, carrier.name_span);
+        let arch_ident = Ident::new(&arch_name, name_span);
         // Hybrid (Gated-DeltaNet) arches: the per-arch
         // `ScratchyWeights::gdn_runtime_config` override the worker reads
         // to size + allocate the GDN state pool. Empty for non-hybrid
@@ -1987,7 +1838,7 @@ pub fn compile_in_dir(
             &hf_arches,
             &arch_dispatch_arms,
             models_dir,
-            carrier.name_span,
+            name_span,
             gdn_runtime_config_tokens,
         )?
     } else {

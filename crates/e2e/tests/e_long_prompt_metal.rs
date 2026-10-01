@@ -4,7 +4,7 @@
 //! E2E coverage for long-prompt / chunked-prefill on Metal.
 //!
 //! The metal Llama bucket spec is `workloads = [1, 8, 64, 512, 4096]`
-//! (`crates/models/arch/dsl/llama.rs.in`). A prompt that fits in
+//! (`crates/models/arch/dsl/llama.py`). A prompt that fits in
 //! the largest bucket runs as ONE contiguous prefill call; a prompt
 //! larger than 4096 tokens forces the engine to chunk, and chunks
 //! 2+ must read the prior chunk's K from the paged KV cache.

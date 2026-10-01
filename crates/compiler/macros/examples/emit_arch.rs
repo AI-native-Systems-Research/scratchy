@@ -10,7 +10,7 @@
 //! is entirely target-neutral up to the final emit.
 //!
 //! This driver runs that same pipeline directly — the identical
-//! `parse_carrier` + `compile_in_dir` + `render_tokens` sequence
+//! `parse_python_file` + `compile_carrier` + `render_tokens` sequence
 //! `emit_arch()` uses — with no backend gate, and prints the rendered
 //! emit to stdout. Diffing its output across a refactor proves the
 //! change was semantics-preserving for arches the host cannot compile.
@@ -21,49 +21,8 @@
 //!
 //! Writes nothing; redirect stdout to capture. Stderr carries progress.
 
-use scratchy_forward_compiler_macro::{
-    CompileMode, DEFAULT_DECODER_WORKLOADS, ForwardArgs, compile_in_dir, parse_carrier,
-    render_tokens,
-};
+use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
 use std::path::PathBuf;
-
-/// Mirrors `scratchy-forwards.rs`'s `args_from_attr`: the carrier's
-/// attribute args, defaulted to the standard decoder workload set when
-/// the DSL doesn't name its own.
-fn args_from_attr(attr: &syn::Attribute) -> ForwardArgs {
-    let mut args: ForwardArgs = match &attr.meta {
-        syn::Meta::List(list) => syn::parse2(list.tokens.clone()).expect("parse #[forward] args"),
-        _ => syn::parse_str("").expect("empty #[forward] args"),
-    };
-    if args.workloads.is_empty() {
-        args.workloads = DEFAULT_DECODER_WORKLOADS.to_vec();
-    }
-    args
-}
-
-fn carrier_attr(attrs: &[syn::Attribute]) -> Option<(CompileMode, usize)> {
-    attrs.iter().enumerate().find_map(|(i, a)| {
-        match a
-            .path()
-            .segments
-            .last()
-            .map(|s| s.ident.to_string())
-            .as_deref()
-        {
-            Some("forward") => Some((CompileMode::DECODER, i)),
-            Some("vision_forward") => Some((CompileMode::VISION, i)),
-            _ => None,
-        }
-    })
-}
-
-fn item_attrs_mut(item: &mut syn::Item) -> Option<&mut Vec<syn::Attribute>> {
-    match item {
-        syn::Item::Fn(f) => Some(&mut f.attrs),
-        syn::Item::Mod(m) => Some(&mut m.attrs),
-        _ => None,
-    }
-}
 
 fn main() {
     let arch = std::env::args().nth(1).unwrap_or_else(|| {
@@ -79,7 +38,7 @@ fn main() {
         .canonicalize()
         .expect("resolve repo root");
     let models = root.join("crates/models/arch");
-    let dsl_path = models.join(format!("dsl/{arch}.rs.in"));
+    let dsl_path = models.join(format!("dsl/{arch}.py"));
     let configs_dir = models.join(format!("configs/{arch}"));
     assert!(dsl_path.is_file(), "no DSL at {}", dsl_path.display());
     assert!(
@@ -90,25 +49,9 @@ fn main() {
 
     eprintln!("emit_arch: {arch}");
     let text = std::fs::read_to_string(&dsl_path).expect("read DSL");
-    let file = syn::parse_file(&text).expect("parse DSL file");
-
-    let mut carrier_item = None;
-    let mut mode = CompileMode::DECODER;
-    let mut args = None;
-    for mut item in file.items {
-        let found = item_attrs_mut(&mut item).and_then(|attrs| carrier_attr(attrs));
-        if let Some((m, i)) = found {
-            let attr = item_attrs_mut(&mut item).unwrap().remove(i);
-            mode = m;
-            args = Some(args_from_attr(&attr));
-            carrier_item = Some(item);
-            break;
-        }
-    }
-    let carrier_item = carrier_item.expect("no #[forward]/#[vision_forward] carrier");
-
-    let carrier = parse_carrier(carrier_item).expect("parse carrier");
-    let tokens = compile_in_dir(&args.unwrap(), &carrier, mode, &configs_dir)
+    let carrier =
+        parse_python_file(&text).unwrap_or_else(|e| panic!("carrier {}: {e}", dsl_path.display()));
+    let tokens = compile_carrier(carrier, &configs_dir)
         .unwrap_or_else(|e| panic!("forward pipeline ({arch}): {e}"));
 
     let mut rendered = String::with_capacity(1 << 20);

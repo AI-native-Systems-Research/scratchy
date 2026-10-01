@@ -426,16 +426,11 @@ mod tests {
     use super::*;
     use crate::classify::classify;
     use crate::config::{self};
-    use crate::parse::parse_block;
+    use crate::parse_python::parse_body;
     use std::path::PathBuf;
 
     fn classify_src(src: &str) -> Program {
-        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {src} }}")).expect("parse");
-        let block = match &file.items[0] {
-            syn::Item::Fn(f) => &*f.block,
-            _ => unreachable!(),
-        };
-        let ast = parse_block(block).expect("parse DSL");
+        let ast = parse_body(src).expect("parse DSL");
         classify(&ast).expect("classify")
     }
 
@@ -468,7 +463,10 @@ mod tests {
     #[test]
     fn for_loop_creates_header_body_after_blocks() {
         let p = classify_src(
-            "for layer in 0..num_hidden_layers { x = embed(input_ids, embed_tokens); }",
+            "
+            for layer in range(num_hidden_layers):
+                x = embed(input_ids, embed_tokens)
+            ",
         );
         let params = llama_3_2_1b_params();
         let cfg = build_cfg(&p, &params).expect("build cfg");
@@ -511,7 +509,12 @@ mod tests {
 
     #[test]
     fn unknown_bound_errors() {
-        let p = classify_src("for i in 0..totally_bogus_bound { x = embed(input_ids, e); }");
+        let p = classify_src(
+            "
+            for i in range(totally_bogus_bound):
+                x = embed(input_ids, e)
+            ",
+        );
         let params = llama_3_2_1b_params();
         let err = build_cfg(&p, &params).unwrap_err();
         let msg = err.to_string();
@@ -523,7 +526,12 @@ mod tests {
 
     #[test]
     fn literal_bounds_pass_through() {
-        let p = classify_src("for i in 0..5 { x = embed(input_ids, e); }");
+        let p = classify_src(
+            "
+            for i in range(5):
+                x = embed(input_ids, e)
+            ",
+        );
         let params = llama_3_2_1b_params();
         let cfg = build_cfg(&p, &params).expect("build cfg");
 
@@ -563,11 +571,14 @@ mod tests {
     #[test]
     fn if_creates_condjump_and_two_jumpwithcarry_tails() {
         let p = classify_src(
-            "for layer in 0..4 { \
-                if layer % 2 == 0 { attn = attention(q, k, v, kv_cache, block_table); } \
-                else { attn = sliding_attention(q, k, v, kv_cache, block_table); } \
-                hidden_states = add(attn, attn); \
-            }",
+            "
+            for layer in range(4):
+                if layer % 2 == 0:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(attn, attn)
+            ",
         );
         let params = llama_3_2_1b_params();
         let cfg = build_cfg(&p, &params).expect("build cfg");
@@ -613,14 +624,14 @@ mod tests {
     #[test]
     fn if_in_literal_array_resolves_to_in_pred() {
         let p = classify_src(
-            "for layer in 0..4 { \
-                if [0, 2].contains(&layer) { \
-                    attn = attention(q, k, v, kv_cache, block_table); \
-                } else { \
-                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
-                } \
-                hidden_states = add(attn, attn); \
-            }",
+            "
+            for layer in range(4):
+                if layer in [0, 2]:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(attn, attn)
+            ",
         );
         let cfg = build_cfg(&p, &llama_3_2_1b_params()).expect("build cfg");
         let condjump = cfg
@@ -648,14 +659,14 @@ mod tests {
             .bounds
             .insert("sliding_window_pattern".to_string(), 2);
         let p = classify_src(
-            "for layer in 0..4 { \
-                if layer % sliding_window_pattern == 0 { \
-                    attn = attention(q, k, v, kv_cache, block_table); \
-                } else { \
-                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
-                } \
-                hidden_states = add(attn, attn); \
-            }",
+            "
+            for layer in range(4):
+                if layer % sliding_window_pattern == 0:
+                    attn = attention(q, k, v, kv_cache, block_table)
+                else:
+                    attn = sliding_attention(q, k, v, kv_cache, block_table)
+                hidden_states = add(attn, attn)
+            ",
         );
         let cfg = build_cfg(&p, &params).expect("build cfg");
         let condjump = cfg
@@ -681,15 +692,14 @@ mod tests {
     #[test]
     fn full_llama_body_cfg() {
         let p = classify_src(
-            r#"
-            hidden_states = embed(input_ids, embed_tokens);
-            for layer in 0..num_hidden_layers {
-                normed = rmsnorm(hidden_states, input_layernorm[layer]);
-                q = gemm(normed, self_attn.q_proj[layer]);
-                hidden_states = add(normed, hidden_states);
-            }
-            normed = rmsnorm(hidden_states, norm);
-            "#,
+            "
+            hidden_states = embed(input_ids, embed_tokens)
+            for layer in range(num_hidden_layers):
+                normed = rmsnorm(hidden_states, input_layernorm[layer])
+                q = gemm(normed, self_attn.q_proj[layer])
+                hidden_states = add(normed, hidden_states)
+            normed = rmsnorm(hidden_states, norm)
+            ",
         );
         let cfg = build_cfg(&p, &llama_3_2_1b_params()).unwrap();
 
