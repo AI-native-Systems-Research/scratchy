@@ -53,6 +53,34 @@ const STEEL_PAGED_HEAD_DIMS: &[(u32, u32)] = &[(64, 16), (96, 16), (128, 32), (2
 /// `INST_STEEL_PAGED` macro expansion.
 const STEEL_PAGED_DTYPES: &[(&str, &str)] = &[("f16", "half"), ("bf16", "bfloat")];
 
+/// Oldest macOS (major, minor) the metal backend runs on. The MPP shaders are
+/// built for this deployment target (see `reaches_mpp`), and a metallib built
+/// for a newer OS refuses to load, so the backend can't start below it.
+const MIN_MACOS: (u32, u32) = (26, 2);
+
+/// Fail the build, with a clear message, when the macOS SDK is older than
+/// `MIN_MACOS`, rather than producing a binary that can't load its shaders.
+fn require_min_macos_sdk() {
+    let out = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-version"])
+        .output()
+        .unwrap_or_else(|e| panic!("spawn `xcrun --show-sdk-version` failed: {e}"));
+    let version = String::from_utf8_lossy(&out.stdout);
+    let mut parts = version.trim().split('.').map(|p| {
+        p.parse::<u32>()
+            .unwrap_or_else(|e| panic!("unparseable macOS SDK version {version:?}: {e}"))
+    });
+    let sdk = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    let (major, minor) = MIN_MACOS;
+    if sdk < MIN_MACOS {
+        panic!(
+            "the metal backend needs macOS {major}.{minor} or newer and its Xcode SDK; \
+             found macOS SDK {}",
+            version.trim()
+        );
+    }
+}
+
 /// Whether `file` reaches `<MetalPerformancePrimitives/...>` through its
 /// `#include "..."` graph, i.e. uses the MPP `matmul2d` cooperative-tensor
 /// intrinsics (today: everything that includes `metal_nax.h`).
@@ -122,6 +150,8 @@ fn main() {
         return;
     }
 
+    require_min_macos_sdk();
+
     let shader_dir = manifest_dir.join("shaders");
 
     let mut entries: Vec<_> = std::fs::read_dir(&shader_dir)
@@ -156,11 +186,10 @@ fn main() {
             cmd.arg("-DSCRATCHY_SAMPLER_TELEMETRY");
         }
         if reaches_mpp(shader, &[&out_dir, &shader_dir], &mut HashSet::new()) {
-            cmd.args([
-                "-fno-fast-math",
-                "-mmacosx-version-min=26.2",
-                "-std=metal4.0",
-            ]);
+            let (major, minor) = MIN_MACOS;
+            cmd.arg("-fno-fast-math")
+                .arg(format!("-mmacosx-version-min={major}.{minor}"))
+                .arg("-std=metal4.0");
         }
         let status = cmd
             .arg("-I")
