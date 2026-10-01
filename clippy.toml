@@ -7,8 +7,8 @@
 # the classic `MTLCommandQueue::commandBuffer` call site directly, and CI runs
 # clippy with `-D warnings` (.github/workflows/rust.yml) so it fails there too.
 #
-# Dispatch through `scratchy_target_metal::mtl4_dispatch` (tests/benches/
-# cost-sweep) or `interpreter::metal::run_bucket_mtl4` (production). MTL4 builds
+# Dispatch through `scratchy_target_metal::mtl4_dispatch` (tests/cost-sweep)
+# or `interpreter::metal::run_bucket_mtl4` (production). MTL4 builds
 # command buffers via `device.newCommandBuffer()` +
 # `beginCommandBufferWithAllocator`, never `queue.commandBuffer()`.
 disallowed-methods = [

@@ -6,7 +6,7 @@
 //!
 //! The `MetalStream` classic-command-buffer wrapper (and `wait_for_completion`)
 //! were removed: production dispatches through the MTL4 path
-//! (`interpreter::metal::run_bucket_mtl4`), and tests / benches / the
+//! (`interpreter::metal::run_bucket_mtl4`), and tests and the
 //! cost-sweep profiler use [`crate::mtl4_dispatch`]. Only the error enum
 //! remains, since it is the common `Result` error across the backend.
 

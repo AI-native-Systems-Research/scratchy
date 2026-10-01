@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Single-op Metal-4 dispatch helper for tests, benches, and cost-sweeps.
+//! Single-op Metal-4 dispatch helper for tests and cost-sweeps.
 //!
 //! Production runs every kernel through the MTL4 tape (`bake_mtl4_steps`
 //! / `run_bucket_mtl4`). This helper lets out-of-band callers (isolated
-//! kernel parity tests, the perf benches, and the cost-sweep profiler)
+//! kernel parity tests and the cost-sweep profiler)
 //! exercise the SAME kernel on the SAME MTL4 path — argument-table
 //! `setAddress`/`gpuAddress` bindings, a committed residency set, and the
 //! `begin → useResidencySet → encode → commit → event-wait` command
