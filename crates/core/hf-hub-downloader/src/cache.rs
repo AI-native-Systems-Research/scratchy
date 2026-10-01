@@ -15,8 +15,13 @@
 //! produces a cache that nothing else can read.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
+
+/// Numbers this process's ref writes, so each gets its own temp file; the
+/// pid tells apart processes sharing one cache.
+static REF_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// Root of the Hub cache, matching Python `huggingface_hub`'s resolution
 /// order.
@@ -110,8 +115,16 @@ pub fn link_into_snapshot(
     let refs_parent = refs.parent().expect("ref path always has a parent");
     std::fs::create_dir_all(refs_parent).map_err(|e| Error::io(refs_parent, e))?;
     // Write-then-rename: concurrent downloads from the same repo all write
-    // this, and a truncated ref file makes the whole repo unresolvable.
-    let tmp = refs.with_extension("tmp");
+    // this, and a truncated ref file makes the whole repo unresolvable. Each
+    // writer renames its own temp file: with a shared name, one writer's
+    // rename takes another's file, and that writer's rename finds nothing.
+    let name = refs.file_name().expect("ref path ends in the revision");
+    let tmp = refs.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        name.display(),
+        std::process::id(),
+        REF_WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, commit).map_err(|e| Error::io(&tmp, e))?;
     std::fs::rename(&tmp, &refs).map_err(|e| Error::io(&refs, e))?;
 
@@ -195,6 +208,43 @@ mod tests {
         assert!(
             cached_path(&dir, "a/b", "main", "config.json").is_none(),
             "an evicted blob must read as absent, not as a usable path"
+        );
+    }
+
+    /// Shards of one repo finish together, and each records the same
+    /// revision -> commit ref. Every writer must get its own temp file: with
+    /// one shared temp name, a writer's rename finds it already renamed away
+    /// by another and fails with `NotFound` on the ref.
+    #[test]
+    fn concurrent_shards_record_the_ref_without_racing() {
+        const SHARDS: usize = 8;
+        const ROUNDS: usize = 50;
+        let dir = tempdir();
+        let repo = dir.join("models--a--b");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::write(repo.join("blobs").join("etag1"), b"x").unwrap();
+
+        std::thread::scope(|s| {
+            for shard in 0..SHARDS {
+                let repo = &repo;
+                s.spawn(move || {
+                    for round in 0..ROUNDS {
+                        let filename = format!("shard-{shard}-{round}.safetensors");
+                        link_into_snapshot(repo, "commit0", &filename, "etag1", "main")
+                            .unwrap_or_else(|e| panic!("shard {shard}, round {round}: {e:?}"));
+                    }
+                });
+            }
+        });
+
+        let refs = std::fs::read_dir(repo.join("refs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(refs, ["main"], "a temp ref file was left behind");
+        assert_eq!(
+            std::fs::read_to_string(ref_path(&repo, "main")).unwrap(),
+            "commit0"
         );
     }
 
