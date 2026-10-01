@@ -435,7 +435,7 @@ fn print_table(results: &[BenchResult], models: &[String], batch_sizes: &[usize]
                         results
                             .iter()
                             .find(|r| r.model == *m && r.batch_size == bs)
-                            .map(&fmt_cell)
+                            .map(fmt_cell)
                             .unwrap_or_default()
                     })
                     .collect()
