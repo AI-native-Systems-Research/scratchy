@@ -11,7 +11,7 @@ description = "`scr`: the scratchy inference engine CLI"
 # vision was unconditionally compiled anyway. Off by default so a plain
 # `-Fmetal` build is genuinely chat-only-sized; pass `--features
 # chat,multimodal` (or `--features metal,multimodal`) explicitly for vision.
-default = ["chat", "hf-completions", "turboquant"]
+default = ["chat", "hf-completions"]
 
 # The in-process ENGINE (local model inference), no HTTP server: `scr chat`
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
@@ -42,7 +42,7 @@ profiling = ["cuda"]
 # `commands/model_info.rs`. Backends enable the ENGINE (via scratchy-serving-api/
 # <backend>), not the HTTP server — a backend is only meaningful with local
 # inference.
-metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
+metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal", "turboquant"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
@@ -83,12 +83,10 @@ guided-decoding = ["scratchy-serving-api?/guided-decoding"]
 # To build with NO network access at all (air-gapped), drop it:
 #   cargo build -p scratchy-cli --no-default-features #       --features chat,metal,model/<stem>
 hf-completions = ["model?/hf-completions"]
-# TurboQuant KV compression, built in: every metal model whose geometry the
-# codec takes stores its KV cache as TurboQuant codes, the rest stay dense (the
-# build output names them). No effect on cuda or spyre. `--kv-cache-dtype`
-# cannot change it at runtime; for a dense-KV metal binary drop the feature:
-#   cargo build -p scratchy-cli --no-default-features \
-#       --features chat,hf-completions,metal,model/<stem>
+# TurboQuant KV compression, on with `metal`: every metal model whose geometry
+# the codec takes stores its KV cache as TurboQuant codes, the rest stay dense
+# (the build output names them). Off for cuda and spyre. `--kv-cache-dtype`
+# cannot change it at runtime.
 turboquant = ["model?/turboquant"]
 # Gates the real image-decode stack: scratchy-serving-api/multimodal makes
 # its `scratchy-vision`/`image` deps optional-and-on, forwards

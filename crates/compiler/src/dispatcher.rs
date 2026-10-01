@@ -94,7 +94,9 @@ pub trait ScratchyWeights: Send + Sync {
     fn head_dim(&self) -> u64;
     fn vocab_size(&self) -> u64;
     /// The loaded variant's `CanonicalParams::KV_CODEC`: how its KV cache is
-    /// stored, fixed when it was built.
+    /// stored, fixed when it was built. Gated like [`Self::forward`]: spyre
+    /// has no `CanonicalParams`, and no KV codec.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     fn kv_codec(&self) -> crate::KvCodec;
 
     /// The embedded KTIR bundle for the host Spyre run path, or `None` for

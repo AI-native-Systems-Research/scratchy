@@ -645,7 +645,7 @@ nccl = [
 spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
 # TurboQuant KV compression for every metal model whose geometry the codec
 # takes (see scratchy-forward-compiler-macro's `turboquant`); no effect on the
-# other backends. Off here like every other scope; `scratchy-cli` defaults it on.
+# other backends. Off here like every other scope; `scratchy-cli`'s `metal` turns it on.
 turboquant = ["scratchy-forward-compiler-macro/turboquant"]
 spyre = [
     "scratchy-forward-compiler-macro/spyre",

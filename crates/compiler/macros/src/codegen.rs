@@ -7186,17 +7186,6 @@ fn kv_codec_for(
     }
 }
 
-/// [`emit_canonical_params_impl`]'s output: the `CanonicalParams` impl, and the model's KV codec as a
-/// module-level `KV_CODEC` const.
-///
-/// ⛔ THE CODEC IS NOT ONLY INSIDE THE IMPL. The impl exists only where `WeightAccessors` does (cuda,
-/// metal), but `ScratchyWeights::kv_codec` is implemented on every backend, spyre included — so it
-/// reads the module const, and the impl's `KV_CODEC` is that same const.
-struct CanonicalParamsEmit {
-    impl_tokens: TokenStream,
-    kv_codec_const: TokenStream,
-}
-
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
@@ -7210,7 +7199,7 @@ fn emit_canonical_params_impl(
     #[cfg(feature = "metal")] metal_consts_out: &mut Option<
         scratchy_target_metal::tape::model_consts::MetalModelConsts,
     >,
-) -> CanonicalParamsEmit {
+) -> TokenStream {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
@@ -7588,37 +7577,6 @@ fn emit_canonical_params_impl(
         quote! { false }
     };
 
-    // TurboQuant KV bit-width policy (Metal). 3-bit (~4.7x) is validated
-    // coherent for the Llama family; outlier-heavy KV (Qwen-class massive
-    // activations) degrades at 3-bit and needs 4-bit. Promote arches to 3 here
-    // as the validation sweep confirms them.
-    let tq_bits = {
-        let rides_3bit = model
-            .architectures
-            .iter()
-            .any(|a| a.starts_with("Llama") || a.contains("TinyLlama"));
-        scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
-    };
-    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, uses_kv_cache, tq_bits);
-    let kv_codec_tokens = match kv_codec {
-        scratchy_forward_compiler::KvCodec::Dense => {
-            quote! { ::scratchy_forward_compiler::KvCodec::Dense }
-        }
-        scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
-            let bits_lit = proc_macro2::Literal::u32_unsuffixed(bits.get());
-            quote! {
-                ::scratchy_forward_compiler::KvCodec::TurboQuant(
-                    ::scratchy_forward_compiler::TqBits::new(#bits_lit),
-                )
-            }
-        }
-    };
-    // Built BEFORE the refusal below: a refusal replaces the impl, but the
-    // module's `KV_CODEC` is still read by `ScratchyWeights::kv_codec`.
-    let kv_codec_const = quote! {
-        pub const KV_CODEC: ::scratchy_forward_compiler::KvCodec = #kv_codec_tokens;
-    };
-
     // MRoPE section override. `Some([t, h, w])` only when the
     // config carries `rope_scaling.mrope_section` (Qwen2-VL /
     // Qwen2.5-VL); every text-only arch keeps the default `None`
@@ -7647,10 +7605,7 @@ fn emit_canonical_params_impl(
                     model.source_stem,
                     t + h + w,
                 );
-                return CanonicalParamsEmit {
-                    impl_tokens: quote! { compile_error!(#msg); },
-                    kv_codec_const,
-                };
+                return quote! { compile_error!(#msg); };
             }
             let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
             let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
@@ -7722,6 +7677,32 @@ fn emit_canonical_params_impl(
         quote! {}
     };
 
+    // TurboQuant KV bit-width policy (Metal). 3-bit (~4.7x) is validated
+    // coherent for the Llama family; outlier-heavy KV (Qwen-class massive
+    // activations) degrades at 3-bit and needs 4-bit. Promote arches to 3 here
+    // as the validation sweep confirms them.
+    let tq_bits = {
+        let rides_3bit = model
+            .architectures
+            .iter()
+            .any(|a| a.starts_with("Llama") || a.contains("TinyLlama"));
+        scratchy_forward_compiler::TqBits::new(if rides_3bit { 3 } else { 4 })
+    };
+    let kv_codec = kv_codec_for(model, head_dim, global_head_dim, uses_kv_cache, tq_bits);
+    let kv_codec_tokens = match kv_codec {
+        scratchy_forward_compiler::KvCodec::Dense => {
+            quote! { ::scratchy_forward_compiler::KvCodec::Dense }
+        }
+        scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(bits.get());
+            quote! {
+                ::scratchy_forward_compiler::KvCodec::TurboQuant(
+                    ::scratchy_forward_compiler::TqBits::new(#bits_lit),
+                )
+            }
+        }
+    };
+
     #[cfg(feature = "metal")]
     {
         use scratchy_target_metal::interpreter::metal::{MetalDtype, ScaleDtype};
@@ -7777,7 +7758,7 @@ fn emit_canonical_params_impl(
         });
     }
 
-    let impl_tokens = quote! {
+    quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
         // CanonicalParams>::HEAD_DIM`) live in `scratchy-forward-compiler` with
@@ -7797,7 +7778,7 @@ fn emit_canonical_params_impl(
             const ATTN_SCALE: f32 = #attn_scale_lit;
             const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
             const SLIDING_WINDOW: i32 = #sliding_window_lit;
-            const KV_CODEC: ::scratchy_forward_compiler::KvCodec = self::KV_CODEC;
+            const KV_CODEC: ::scratchy_forward_compiler::KvCodec = #kv_codec_tokens;
             const KV_LORA_RANK: usize = #kv_lora_rank_lit;
             const QK_NOPE_HEAD_DIM: usize = #qk_nope_head_dim_lit;
             const QK_ROPE_HEAD_DIM: usize = #qk_rope_head_dim_lit;
@@ -7834,10 +7815,6 @@ fn emit_canonical_params_impl(
             #synth_sources_override
             #scale_dtype_override
         }
-    };
-    CanonicalParamsEmit {
-        impl_tokens,
-        kv_codec_const,
     }
 }
 
@@ -11649,10 +11626,7 @@ pub fn emit_model(
     let mut resolved_metal_consts: Option<
         scratchy_target_metal::tape::model_consts::MetalModelConsts,
     > = None;
-    let CanonicalParamsEmit {
-        impl_tokens: canonical_params_impl,
-        kv_codec_const,
-    } = emit_canonical_params_impl(
+    let canonical_params_impl = emit_canonical_params_impl(
         model,
         tp_world_size,
         has_bias_add,
@@ -14389,8 +14363,6 @@ pub fn emit_model(
 
         #ktir_bundle_const
 
-        #kv_codec_const
-
         #canonical_params_impl
 
         #weight_accessors_impl
@@ -14534,11 +14506,6 @@ fn emit_shim_model(
     quote! {
         #weights
 
-        // `Weights` IS the canonical's type, so its KV codec is the
-        // canonical's too — and every backend's `ScratchyWeights::kv_codec()`
-        // arm names `<this module>::KV_CODEC`.
-        pub use super::#canonical::KV_CODEC;
-
         // Spyre: shim variants share the canonical's solve, so the
         // canonical owns the embedded `KTIR_BUNDLE` AND `SENGRAPH_BUNDLE`.
         // Re-export BOTH so this shim module's `ScratchyWeights::ktir_bundle()`
@@ -14628,7 +14595,6 @@ mod tests {
             #[cfg(feature = "metal")]
             &mut None,
         )
-        .impl_tokens
         .to_string();
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
@@ -14667,7 +14633,6 @@ mod tests {
             #[cfg(feature = "metal")]
             &mut None,
         )
-        .impl_tokens
         .to_string();
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 16"),
@@ -14718,7 +14683,6 @@ mod tests {
             #[cfg(feature = "metal")]
             &mut None,
         )
-        .impl_tokens
         .to_string();
         // 32 / 8 = 4
         assert!(
