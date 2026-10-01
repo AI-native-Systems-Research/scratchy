@@ -8,38 +8,64 @@ on:
       - 'docs/**'
       - 'CONTRIBUTING.md'
       - '.github/workflows/pages.yml'
+  # Build on PRs too, without deploying. site/build.py validates as it goes —
+  # broken markdown links, nav drift, and every leaderboard data rule — and none
+  # of that was exercised before merge, so a failure only showed up on main.
+  # 'site/**' already covers site/data/**, which is why the leaderboard's data
+  # lives there: data outside these paths would never redeploy the site.
+  pull_request:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'docs/**'
+      - 'CONTRIBUTING.md'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One deploy at a time; let an in-flight run finish rather than cancelling it.
+# PR builds get their own group so they neither queue behind a deploy nor block
+# one, and a new push to a PR supersedes its own earlier run.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.event.pull_request.number) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    # Forks don't have Pages enabled, so configure-pages would fail there.
-    if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
+      # Stdlib only, so no setup-python: the runner's own python3 is what
+      # site/build.sh uses.
+      - name: Site tests
+        run: python3 -m unittest discover -s site/tests -t site/tests -v
+
       - name: Build site
         run: ./site/build.sh
 
+      # Forks don't have Pages enabled, so these would fail there. Gating the
+      # steps rather than the whole job means a fork's PR still runs the tests
+      # and the build above — which are the parts a PR most needs.
       - uses: actions/configure-pages@v6
+        if: ${{ github.event_name != 'pull_request' && !github.event.repository.fork }}
 
       - uses: actions/upload-pages-artifact@v5
+        if: ${{ github.event_name != 'pull_request' && !github.event.repository.fork }}
         with:
           path: site/_site
 
   deploy:
     needs: build
+    if: ${{ github.event_name != 'pull_request' && !github.event.repository.fork }}
     runs-on: ubuntu-latest
+    # Pages-write lives only here, so a PR build can never hold it.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

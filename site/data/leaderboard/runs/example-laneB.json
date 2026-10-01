@@ -1,0 +1,262 @@
+{
+  "schema": 1,
+  "run_id": "example-laneB",
+  "lane": "B",
+  "status": "example",
+  "provenance": {
+    "machine": "m5max-64",
+    "rung": "R1",
+    "scratchy_sha": "0000000",
+    "claude_version": "2.1.285",
+    "ollama_version": "0.34.2",
+    "context_length_tokens": 262144,
+    "kv_cache_dtype": {
+      "scratchy": "turboquant-3bit",
+      "ollama": "f16"
+    },
+    "quantization": {
+      "scratchy": "mlx-affine-b4-g64",
+      "ollama": "Q4_K_M"
+    },
+    "checkpoint_revision": {
+      "scratchy": "mlx-community/<model>-4bit@0000000",
+      "ollama": "<tag>@sha256:0000000"
+    },
+    "sampling": {
+      "temperature": 0.0
+    },
+    "trace_corpus": {
+      "id": "example-tasks",
+      "turns": 0,
+      "claude_version": "2.1.285"
+    },
+    "engine_order": [
+      "ollama",
+      "scratchy",
+      "ollama",
+      "scratchy"
+    ],
+    "thermal_state_start": "nominal",
+    "artifacts": [],
+    "disclosed": [
+      "kv-dtype-unmatched",
+      "quantizer-differs",
+      "daemon-vs-spawn"
+    ]
+  },
+  "measurements": [
+    {
+      "lane": "B",
+      "metric": "task_pass",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "n": 5,
+      "stat": {
+        "median": 0.9,
+        "p10": 0.8,
+        "p90": 1.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "tool_call_parse_failure_rate",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "n": 5,
+      "stat": {
+        "median": 0.0,
+        "p10": 0.0,
+        "p90": 0.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "task_pass",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "n": 5,
+      "stat": {
+        "median": 0.9,
+        "p10": 0.8,
+        "p90": 1.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "tool_call_parse_failure_rate",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "n": 5,
+      "stat": {
+        "median": 0.02,
+        "p10": 0.0,
+        "p90": 0.04
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "task_pass",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 5,
+      "stat": {
+        "median": 1.0,
+        "p10": 1.0,
+        "p90": 1.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "tool_call_parse_failure_rate",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 5,
+      "stat": {
+        "median": 0.0,
+        "p10": 0.0,
+        "p90": 0.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "task_pass",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 5,
+      "stat": {
+        "median": 0.8,
+        "p10": 0.6,
+        "p90": 1.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "tool_call_parse_failure_rate",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 5,
+      "stat": {
+        "median": 0.0,
+        "p10": 0.0,
+        "p90": 0.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "task_pass",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "n": 5,
+      "stat": {
+        "median": 0.8,
+        "p10": 0.6,
+        "p90": 1.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "tool_call_parse_failure_rate",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "n": 5,
+      "stat": {
+        "median": 0.0,
+        "p10": 0.0,
+        "p90": 0.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "task_pass",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "n": 5,
+      "stat": {
+        "median": 0.8,
+        "p10": 0.6,
+        "p90": 1.0
+      }
+    },
+    {
+      "lane": "B",
+      "metric": "tool_call_parse_failure_rate",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "n": 5,
+      "stat": {
+        "median": 0.0,
+        "p10": 0.0,
+        "p90": 0.0
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "lane": "B",
+      "metric": "joules_per_task",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "No energy measurement exists in the tree yet: the powermetrics sampler, its idle baseline and the cooldown discipline land with #164 T2.2b. Nothing here is estimated.",
+      "issue": 164
+    },
+    {
+      "lane": "B",
+      "metric": "joules_per_task",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "No energy measurement exists in the tree yet: the powermetrics sampler, its idle baseline and the cooldown discipline land with #164 T2.2b. Nothing here is estimated.",
+      "issue": 164
+    },
+    {
+      "lane": "B",
+      "metric": "joules_per_task",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "No energy measurement exists in the tree yet: the powermetrics sampler, its idle baseline and the cooldown discipline land with #164 T2.2b. Nothing here is estimated.",
+      "issue": 164
+    },
+    {
+      "lane": "B",
+      "metric": "joules_per_task",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "No energy measurement exists in the tree yet: the powermetrics sampler, its idle baseline and the cooldown discipline land with #164 T2.2b. Nothing here is estimated.",
+      "issue": 164
+    },
+    {
+      "lane": "B",
+      "metric": "joules_per_task",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "No energy measurement exists in the tree yet: the powermetrics sampler, its idle baseline and the cooldown discipline land with #164 T2.2b. Nothing here is estimated.",
+      "issue": 164
+    },
+    {
+      "lane": "B",
+      "metric": "joules_per_task",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "machine": "m5max-64",
+      "rung": "R1",
+      "state": "not-run",
+      "reason": "No energy measurement exists in the tree yet: the powermetrics sampler, its idle baseline and the cooldown discipline land with #164 T2.2b. Nothing here is estimated.",
+      "issue": 164
+    }
+  ],
+  "ablations": []
+}

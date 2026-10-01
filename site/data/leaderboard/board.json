@@ -1,0 +1,458 @@
+{
+  "schema": 1,
+  "title": "Launch Claude Leaderboard",
+  "tagline": "Local inference engines under a real coding-agent workload.",
+  "epic": 158,
+  "method_issue": 161,
+  "measurement_issue": 166,
+  "repo": "https://github.com/AI-native-Systems-Research/scratchy",
+  "unaffiliated": "Not affiliated with or endorsed by Anthropic. Claude Code is the workload under test, not the subject of the ranking — the models being served are open-weight.",
+  "entry_rule": "An engine is on the board if `<engine> launch claude` runs, or if Claude Code can be pointed at its /v1/messages endpoint via ANTHROPIC_BASE_URL.",
+  "workload": {
+    "client": "claude",
+    "endpoint": "/v1/messages",
+    "why": "Claude Code re-sends the whole prompt every turn, mutates its tool schemas between turns and tiers, and emits bimodal output — ~30-token tool calls, then long file writes that echo the input back verbatim. None of that is what a synthetic fixed-shape benchmark measures."
+  },
+  "correctness_gate": "tool_call_parse_failure_rate",
+  "no_composite_score": "The board ranks within a metric, inside a (model, machine, rung) group, and nowhere else. A single score would need TTFT weighted against joules against pass rate, and that weighting is where a thumb goes on the scale.",
+  "lanes": {
+    "A": {
+      "name": "trace replay",
+      "min_n": 3,
+      "summary": "A captured /v1/messages trace replayed against both engines with pinned sampling. Owns every latency claim.",
+      "owns": [
+        "ttft_ms",
+        "tpot_ms",
+        "itl_p99_ms",
+        "reprefill_ratio",
+        "spec_accept_rate",
+        "turn_e2e_ms",
+        "e2e_star_ms"
+      ]
+    },
+    "B": {
+      "name": "live Claude Code",
+      "min_n": 5,
+      "summary": "Headless Claude Code runs on a pinned sandbox repo with deterministic graders. Owns every “did it finish the job” claim, and is the only lane that catches a serving bug costing turns rather than milliseconds.",
+      "owns": [
+        "task_pass",
+        "turns_to_completion",
+        "tool_call_parse_failure_rate",
+        "wall_clock_s",
+        "peak_rss_mib",
+        "peak_gpu_bytes",
+        "context_ceiling_tokens",
+        "joules_per_task",
+        "joules_per_1k_output_tokens",
+        "tokens_in",
+        "tokens_out"
+      ]
+    }
+  },
+  "metrics": [
+    {
+      "id": "ttft_ms",
+      "label": "TTFT",
+      "unit": "ms",
+      "lower_is_better": true,
+      "digits": 1,
+      "note": "What the user feels, and where the prefix/span work lands."
+    },
+    {
+      "id": "tpot_ms",
+      "label": "TPOT",
+      "unit": "ms",
+      "lower_is_better": true,
+      "digits": 2,
+      "note": "Per-token decode interval over N-1 intervals."
+    },
+    {
+      "id": "reprefill_ratio",
+      "label": "reprefill",
+      "unit": "",
+      "lower_is_better": true,
+      "digits": 3,
+      "note": "Prompt tokens actually prefilled divided by prompt tokens sent. The most diagnostic number for an agent workload: 1.0 means every turn repays the whole prompt."
+    },
+    {
+      "id": "task_pass",
+      "label": "task pass",
+      "unit": "",
+      "lower_is_better": false,
+      "digits": 2,
+      "note": "Deterministic grader, fraction of N runs."
+    },
+    {
+      "id": "tool_call_parse_failure_rate",
+      "label": "tool-call failures",
+      "unit": "",
+      "lower_is_better": true,
+      "digits": 3,
+      "note": "Malformed tool calls divided by tool calls. The metric that can make a faster engine lose: a fast wrong answer costs a whole turn."
+    },
+    {
+      "id": "joules_per_task",
+      "label": "joules / task",
+      "unit": "",
+      "lower_is_better": true,
+      "digits": 1,
+      "note": "Whole-machine energy over the task window minus a measured idle baseline. This is where wasted prefill shows up when agent think-time hides it in the wall clock."
+    },
+    {
+      "id": "itl_p99_ms",
+      "label": "ITL p99",
+      "unit": "ms",
+      "lower_is_better": true,
+      "digits": 2,
+      "note": "Jitter is reported, not smoothed: a stuttering stream reads as slower than a uniformly slower one."
+    },
+    {
+      "id": "spec_accept_rate",
+      "label": "spec accept",
+      "unit": "",
+      "lower_is_better": false,
+      "digits": 3,
+      "note": "Explains TPOT instead of just reporting it."
+    },
+    {
+      "id": "turn_e2e_ms",
+      "label": "turn e2e",
+      "unit": "ms",
+      "lower_is_better": true,
+      "digits": 1
+    },
+    {
+      "id": "e2e_star_ms",
+      "label": "E2E*",
+      "unit": "ms",
+      "lower_is_better": true,
+      "digits": 1,
+      "note": "Work-normalized: median_ttft + (output_len - 1) x median_tpot, because an engine that stops early otherwise wins by under-generating."
+    },
+    {
+      "id": "turns_to_completion",
+      "label": "turns",
+      "unit": "",
+      "lower_is_better": true,
+      "digits": 1,
+      "note": "A faster engine that needs more turns is not faster."
+    },
+    {
+      "id": "wall_clock_s",
+      "label": "wall clock",
+      "unit": "s",
+      "lower_is_better": true,
+      "digits": 1
+    },
+    {
+      "id": "peak_rss_mib",
+      "label": "peak RSS",
+      "unit": "MiB",
+      "lower_is_better": true,
+      "digits": 0
+    },
+    {
+      "id": "peak_gpu_bytes",
+      "label": "peak GPU",
+      "unit": "B",
+      "lower_is_better": true,
+      "digits": 0
+    },
+    {
+      "id": "context_ceiling_tokens",
+      "label": "context ceiling",
+      "unit": "tok",
+      "lower_is_better": false,
+      "digits": 0
+    },
+    {
+      "id": "joules_per_1k_output_tokens",
+      "label": "joules / 1k out",
+      "unit": "",
+      "lower_is_better": true,
+      "digits": 2
+    },
+    {
+      "id": "tokens_in",
+      "label": "tokens in",
+      "unit": "tok",
+      "lower_is_better": true,
+      "digits": 0
+    },
+    {
+      "id": "tokens_out",
+      "label": "tokens out",
+      "unit": "tok",
+      "lower_is_better": true,
+      "digits": 0
+    }
+  ],
+  "engines": [
+    {
+      "id": "scratchy",
+      "label": "scratchy",
+      "series": 1,
+      "launch": "scr launch claude"
+    },
+    {
+      "id": "ollama",
+      "label": "ollama",
+      "series": 2,
+      "launch": "ollama launch claude"
+    }
+  ],
+  "models": [
+    {
+      "id": "gemma-4-12b-it",
+      "label": "gemma-4-12b-it",
+      "family": "dense + SWA",
+      "note": "The dense control, same family as the 26b: shared tokenizer, chat template, tool conventions and sliding-window design, so the MoE-to-dense delta isolates sparsity. Smallest, so the harness is built against it."
+    },
+    {
+      "id": "gemma-4-26b-a4b-it",
+      "label": "gemma-4-26b-a4b-it",
+      "family": "MoE + SWA",
+      "note": "Carries the prefix-cache and tool-span headline."
+    },
+    {
+      "id": "qwen3.6-35b-a3b",
+      "label": "Qwen3.6-35B-A3B",
+      "family": "MoE + GDN",
+      "note": "Prefix caching is off by design: 30 of its 40 layers hold recurrent conv/ssm state that cannot be rebuilt from cached KV. This model measures the cost, not the win."
+    }
+  ],
+  "machines": [
+    {
+      "id": "m5max-64",
+      "label": "Apple M5 Max / 64 GB",
+      "os": "macOS 26.1",
+      "power": "AC, lid open, no other load; arms serialized and order-alternated"
+    }
+  ],
+  "rungs": [
+    {
+      "id": "R1",
+      "label": "what a user gets",
+      "detail": "mlx-community 4-bit against ollama's default tag. The real-world question; the two quantizers differ, disclosed per row."
+    },
+    {
+      "id": "R2",
+      "label": "matched weights",
+      "detail": "The same mlx 4-bit weights on both engines, isolating the engine from the quantizer. Gated on proving ollama's -mlx tag is the same checkpoint."
+    }
+  ],
+  "optimizations": [
+    {
+      "id": "prefix-cache",
+      "label": "automatic prefix caching",
+      "switch": "--no-prefix-caching",
+      "expected": "Large TTFT drop from turn 2 on, on the gemma-4 pair only."
+    },
+    {
+      "id": "tool-spans",
+      "label": "per-tool relocatable spans",
+      "switch": "--no-tool-spans",
+      "expected": "Wins exactly where the tool subset or order changes between turns; about zero elsewhere."
+    },
+    {
+      "id": "ngram-spec",
+      "label": "n-gram speculative decode",
+      "switch": "--speculative-model ngram",
+      "expected": "TPOT down on file-write turns, where the output echoes the input verbatim. Report per turn class: acceptance can collapse on prose turns."
+    },
+    {
+      "id": "kv-quant",
+      "label": "TurboQuant KV compression",
+      "switch": "--kv-cache-dtype",
+      "expected": "Deferred on this model set — see the applicability grid."
+    }
+  ],
+  "applicability": [
+    {
+      "optimization": "prefix-cache",
+      "model": "gemma-4-12b-it",
+      "state": "live",
+      "reason": "Full-attention and sliding-window layers both cache.",
+      "evidence": "crates/serving/api/src/init.rs:1258"
+    },
+    {
+      "optimization": "prefix-cache",
+      "model": "gemma-4-26b-a4b-it",
+      "state": "live",
+      "reason": "Full-attention and sliding-window layers both cache.",
+      "evidence": "crates/serving/api/src/init.rs:1258"
+    },
+    {
+      "optimization": "prefix-cache",
+      "model": "qwen3.6-35b-a3b",
+      "state": "off-by-design",
+      "reason": "is_recurrent_hybrid_arch matches Qwen3_5/Qwen3_6 and switches prefix caching off: the GDN conv/ssm state cannot be rebuilt from cached KV. 30 of 40 layers are linear attention, with no sliding window.",
+      "evidence": "crates/serving/api/src/init.rs:1018-1034, gate at :1258",
+      "issue": 166
+    },
+    {
+      "optimization": "tool-spans",
+      "model": "gemma-4-12b-it",
+      "state": "live",
+      "reason": "Spans relocate against a live prefix cache.",
+      "evidence": "crates/serving/api/src/anthropic.rs:431-436"
+    },
+    {
+      "optimization": "tool-spans",
+      "model": "gemma-4-26b-a4b-it",
+      "state": "live",
+      "reason": "Spans relocate against a live prefix cache.",
+      "evidence": "crates/serving/api/src/anthropic.rs:431-436"
+    },
+    {
+      "optimization": "tool-spans",
+      "model": "qwen3.6-35b-a3b",
+      "state": "inert",
+      "reason": "Relocating a span within a prefix cache is meaningless while prefix caching is off, so this reads about zero for an architectural reason, not because the optimization does not work.",
+      "evidence": "crates/serving/api/src/init.rs:1258",
+      "issue": 166
+    },
+    {
+      "optimization": "ngram-spec",
+      "model": "gemma-4-12b-it",
+      "state": "live",
+      "reason": "Draft-free speculation is independent of attention geometry.",
+      "evidence": "docs/BENCHMARKING.md"
+    },
+    {
+      "optimization": "ngram-spec",
+      "model": "gemma-4-26b-a4b-it",
+      "state": "live",
+      "reason": "Draft-free speculation is independent of attention geometry.",
+      "evidence": "docs/BENCHMARKING.md"
+    },
+    {
+      "optimization": "ngram-spec",
+      "model": "qwen3.6-35b-a3b",
+      "state": "live",
+      "reason": "Draft-free speculation is independent of attention geometry.",
+      "evidence": "docs/BENCHMARKING.md"
+    },
+    {
+      "optimization": "kv-quant",
+      "model": "gemma-4-12b-it",
+      "state": "deferred",
+      "reason": "TurboQuant only compresses full-attention layers and gemma-4 is sliding-window by majority: 8 of 48 layers here. Publishing a near-zero would read as “KV quant does not help agents”, which this model set cannot support.",
+      "evidence": "aa-personal-space/benchmarks/METAL_M5MAX.md:450",
+      "issue": 166
+    },
+    {
+      "optimization": "kv-quant",
+      "model": "gemma-4-26b-a4b-it",
+      "state": "deferred",
+      "reason": "5 of 30 layers compress. Measured at +1.0% TPOT on the sibling 31b, against 28/28 layers and +57% on llama-3.2-3b: the knob tracks the compressed fraction, and on this model set that fraction is small everywhere.",
+      "evidence": "aa-personal-space/benchmarks/METAL_M5MAX.md:450",
+      "issue": 166
+    },
+    {
+      "optimization": "kv-quant",
+      "model": "qwen3.6-35b-a3b",
+      "state": "deferred",
+      "reason": "30 of 40 layers hold recurrent state rather than KV, so there is almost nothing to compress. A llama-geometry model, all-global attention with head_dim 128, is what this question needs.",
+      "evidence": "crates/serving/api/src/init.rs:1018-1034",
+      "issue": 166
+    }
+  ],
+  "expects": {
+    "metrics": [
+      "ttft_ms",
+      "tpot_ms",
+      "reprefill_ratio",
+      "task_pass",
+      "tool_call_parse_failure_rate",
+      "joules_per_task"
+    ],
+    "engines": [
+      "scratchy",
+      "ollama"
+    ],
+    "models": [
+      "gemma-4-12b-it",
+      "gemma-4-26b-a4b-it",
+      "qwen3.6-35b-a3b"
+    ],
+    "machines": [
+      "m5max-64"
+    ],
+    "rungs": [
+      "R1"
+    ]
+  },
+  "kpis": [
+    {
+      "id": "ttft-gemma26",
+      "label": "TTFT, gemma-4-26b-a4b-it",
+      "hero": true,
+      "metric": "ttft_ms",
+      "model": "gemma-4-26b-a4b-it",
+      "numerator": "ollama",
+      "denominator": "scratchy",
+      "spark": "scratchy"
+    },
+    {
+      "id": "ttft-qwen36",
+      "label": "TTFT, Qwen3.6-35B-A3B",
+      "metric": "ttft_ms",
+      "model": "qwen3.6-35b-a3b",
+      "numerator": "ollama",
+      "denominator": "scratchy",
+      "spark": "scratchy"
+    },
+    {
+      "id": "reprefill-gemma26",
+      "label": "reprefill, gemma-4-26b-a4b-it",
+      "metric": "reprefill_ratio",
+      "model": "gemma-4-26b-a4b-it",
+      "numerator": "ollama",
+      "denominator": "scratchy"
+    }
+  ],
+  "disclosures": [
+    {
+      "id": "kv-dtype-unmatched",
+      "text": "KV-cache dtype is not matched across engines. On metal scratchy compresses KV with TurboQuant by default; ollama's cache is not the same thing. This is a quality difference as well as a performance one, and it is recorded per row rather than normalised away.",
+      "source": "docs/BENCHMARKING.md §4"
+    },
+    {
+      "id": "quantizer-differs",
+      "text": "On rung R1 the two engines load checkpoints produced by different quantizers (mlx-community affine 4-bit against ollama's default GGUF). R1 answers “what does a user get”; only R2 isolates the engine from the quantizer.",
+      "source": "#161 quantization rungs"
+    },
+    {
+      "id": "build-time-forward",
+      "text": "scratchy expands the whole forward pass during cargo build, so work other engines do at runtime is already in the binary. A real engineering advantage, and also why startup numbers flatter scratchy. The build cost is recorded as a footnote, never folded into a scenario.",
+      "source": "docs/BENCHMARKING.md §4"
+    },
+    {
+      "id": "daemon-vs-spawn",
+      "text": "ollama keeps a resident daemon; scr launch claude spawns a server per session and tears it down on exit. That is an asymmetry, not a result: cold and warm rungs are reported separately and one engine's cold is never quoted against the other's warm.",
+      "source": "#161 fairness rule 5"
+    },
+    {
+      "id": "powermetrics-estimates",
+      "text": "Apple's own help text: average power values reported by powermetrics are estimated and may be inaccurate, so they should not be used for comparison between devices, but can be used to help optimize apps for energy efficiency. Back-to-back A/B on one machine with idle subtracted is valid; absolute or cross-machine energy claims are not.",
+      "source": "#161 disclosures"
+    },
+    {
+      "id": "vision-tower-footprint",
+      "text": "Both MoE checkpoints carry a vision tower Claude Code never exercises. It is disclosed as footprint rather than excluded, because a user loading the checkpoint pays for it.",
+      "source": "#158 deferred / out of scope"
+    },
+    {
+      "id": "thermal-order",
+      "text": "This is a laptop: a long run heats the SoC, so whichever engine is measured second can be throttled, corrupting both its energy and its latency. Arms cool to a fixed idle state between runs, engine order alternates across repeats, and the starting thermal state is recorded per cell.",
+      "source": "#161 fairness rule 6"
+    }
+  ],
+  "status": {
+    "pending": {
+      "issue": 166,
+      "text": "No measured numbers are published yet. Phase 4 (#166) has not run: every figure below is example data, shown so the page and its checks can be reviewed before any measurement exists."
+    }
+  }
+}

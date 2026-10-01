@@ -1,5 +1,6 @@
 # Build output.
 /_site/
 
-# build.py imports build_archs.py
+# build.py imports build_archs.py and build_leaderboard.py (which imports
+# charts.py), and tests/ imports all of them.
 __pycache__/
