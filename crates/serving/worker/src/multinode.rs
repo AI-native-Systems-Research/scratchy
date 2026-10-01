@@ -13,6 +13,7 @@ use anyhow::Context;
 use scratchy_serving_engine::error::{EngineError, EngineResult};
 use scratchy_serving_engine::executor::{Executor, ModelRunnerOutput};
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
+use scratchy_serving_transport::codec;
 use scratchy_target_cuda::TcpControlChannel;
 use serde::{Deserialize, Serialize};
 
@@ -39,19 +40,19 @@ pub enum ControlMessage {
 impl ControlMessage {
     /// Send this message to every follower (rank 0 only).
     ///
-    /// Encoded as a msgpack map with named fields, never positionally:
-    /// `NewRequestData` omits its `None` optionals on the wire, and
-    /// `GuidedGrammar::JsonSchema` carries a `serde_json::Value`, which only a
-    /// self-describing format can decode.
+    /// Encoded with the transport codec (a msgpack map with named fields),
+    /// never positionally: `NewRequestData` omits its `None` optionals on the
+    /// wire, and `GuidedGrammar::JsonSchema` carries a `serde_json::Value`,
+    /// which only a self-describing format can decode.
     pub fn broadcast(&self, channel: &mut TcpControlChannel) -> anyhow::Result<()> {
-        let data = rmp_serde::to_vec_named(self).context("failed to encode control message")?;
+        let data = codec::encode(self).context("failed to encode control message")?;
         channel.broadcast(&data)
     }
 
     /// Block until the next message from rank 0 arrives (followers only).
     pub fn recv(channel: &mut TcpControlChannel) -> anyhow::Result<Self> {
         let data = channel.recv()?;
-        rmp_serde::from_slice(&data)
+        codec::decode(&data)
             .with_context(|| format!("failed to decode control message ({} bytes)", data.len()))
     }
 }
@@ -164,11 +165,13 @@ mod tests {
     /// the wire) and a JSON-schema grammar — reaches the follower intact.
     #[test]
     fn execute_model_reaches_follower_intact() {
+        // The channel binds `master_port + 2`: probe THAT port, not the base.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
-            .port();
+            .port()
+            - 2;
         let schema = serde_json::json!({"type": "object", "required": ["a"]});
 
         let mut step = SchedulerOutput::make_empty();
