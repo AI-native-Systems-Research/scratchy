@@ -110,7 +110,7 @@ indexmap = { version = "2", features = ["serde"] }
 hashbrown = "0.17"
 smallvec = "1"
 bytes = "1"
-rand = "0.9"
+rand = "0.10"
 
 # ZeroMQ
 zeromq = "0.6"
