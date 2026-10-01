@@ -49,15 +49,6 @@ pub struct IncrementalDetokenizer {
 }
 
 impl IncrementalDetokenizer {
-    /// Create a minimal detokenizer for testing (no real tokenizer attached).
-    #[cfg(test)]
-    pub(crate) fn dummy() -> Self {
-        use crate::tokenizer::make_test_tokenizer;
-        let tok = Arc::new(make_test_tokenizer());
-        let prompt_ids = tok.encode("", false).unwrap();
-        Self::new(tok, &prompt_ids, vec![], 0, false, false)
-    }
-
     /// Create new detokenizer
     ///
     /// Python: FastIncrementalDetokenizer.__init__ (line 170-208)
