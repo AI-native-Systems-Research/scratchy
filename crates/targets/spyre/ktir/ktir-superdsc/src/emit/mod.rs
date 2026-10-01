@@ -713,6 +713,13 @@ pub struct PointwiseGather<'a, O: KindTag> {
     /// The index buffer's operand spelling — `crate::place::act_name(index_tid)`, the same form every
     /// data operand here uses, so it resolves through the SAME [`BundleLayout`].
     pub index_name: &'a str,
+    /// ⭐ WHERE THIS GATHER'S RUN OF ENTRIES STARTS IN THE INDEX BUFFER — the program's own anchor
+    /// for this gather ([`Gather::first_entry`]), in ENTRIES. Zero for every gather whose index is
+    /// read from its start; an unrolled sweep's trip `b` states `b · BLOCK_N`, and each leg below
+    /// ADDS its own stick offset to it, so a trip's leg `k` reads index words
+    /// `[first_entry + k·32, first_entry + (k+1)·32)` of the SAME buffer the one-block form reads
+    /// from its start.
+    pub first_entry: u32,
     pub o: &'a Stk<O>,
 }
 
@@ -773,6 +780,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         inputs,
         gathered_input,
         index_name,
+        first_entry,
         o,
     } = g;
     // ⛔ THE GATHERED INPUT MUST BE THE **LAST** ONE, because that is the only position at which the
@@ -833,7 +841,13 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 gathered_input,
                 index_name,
                 page,
-                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                // ⭐ THE NODE'S OWN ANCHOR — the whole run starts where the program says, which is
+                // index word `first_entry` (an uncut gather's run and a one-stick gather's are both
+                // the program's own; only the CUT below adds to it). Stick-aligned, checked here:
+                // the IBR is loaded one `SenUint32` stick at a time.
+                first_entry: crate::superdsc_opspec::EntryBase::of_entries(first_entry)
+                    .assert_stick_aligned()
+                    .map_err(SuperDscError)?,
                 o_name: o.name(),
                 head_major,
             },
@@ -934,12 +948,17 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 gathered_input,
                 index_name,
                 page,
-                // ⭐ THE RUN'S BASE IN THE INDEX TENSOR — a STICK count, which is what `EntryBase` is.
-                // Leg `k` reads index words `[k·cap, k·cap + leg_rows/page)`, and dropping this is
-                // every leg reading leg 0's entries (the `EntryBase` type exists because that
-                // happened). MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry
-                // `SenUint32` stick further on than leg `k-1`'s, for all eight.
-                first_entry: crate::superdsc_opspec::EntryBase::of_sticks(k),
+                // ⭐ THE RUN'S BASE IN THE INDEX TENSOR — the program's own anchor PLUS this leg's
+                // own stick offset, both in ENTRIES. Leg `k` of a run starting at the program's
+                // `first_entry` reads index words `[first_entry + k·cap, first_entry + k·cap +
+                // leg_rows/page)`, and dropping either term is every leg reading the run's first
+                // stick (the `EntryBase` type exists because the run-half of that happened).
+                // MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry `SenUint32`
+                // stick further on than leg `k-1`'s, for all eight. The anchor's stick alignment
+                // was checked at the uncut arm above; `k·cap` is a whole stick by construction.
+                first_entry: crate::superdsc_opspec::EntryBase::of_entries(
+                    first_entry + k * cap,
+                ),
                 o_name: o.name(),
                 head_major,
             },
@@ -2844,9 +2863,9 @@ pub fn emit_sdsc(
     }
 
     let constant_info = match op.op_info {
-        OpInfo::SfpConstTable => sfp_constant_table(),
-        OpInfo::ReduceScaling(packed) => scaling_factor_const(packed),
-        OpInfo::ReduceScalingFp32(bits) => scaling_factor_const_fp32(bits),
+        OpInfo::SfpConstTable => sfp_constant_table(folds),
+        OpInfo::ReduceScaling(packed) => scaling_factor_const(packed, folds),
+        OpInfo::ReduceScalingFp32(bits) => scaling_factor_const_fp32(bits, folds),
         OpInfo::None | OpInfo::FusedEpilogue { .. } => serde_json::json!({}),
     };
     // torch-spyre's `generate_constant_info` returns the JSON *string* "{}" for the
@@ -4879,13 +4898,38 @@ pub fn sen169_bits(v: f32) -> u16 {
     sign | ((exp_field as u16) << 9) | (mant as u16 & 0x1FF)
 }
 
-fn scaling_factor_const(packed: u32) -> serde_json::Value {
+/// `constantInfo_.data_` as the NEW (post-2026-09) dxp contract demands it: a FoldManager
+/// OBJECT, not a bare array. `sdscJsonValidate.cpp::validate_constant_info` admits only
+/// {name_, dataFormat_, data_} (additionalProperties-style rejection killed `allocations_`)
+/// and `validate_fold_manager` requires `data_` to be an object with `dim_prop_func` /
+/// `dim_prop_attr` arrays. `dsc2.cpp` imports it as `data_.importFromJson(data_, sdscFoldProps)`
+/// where the deque is the FULL fold space — `[coreFoldProp_, coreletFoldProp_, *sdscFoldProps_]`
+/// (dsc2.cpp:1012-1021) — so `dim_prop_attr` MUST have one entry per dim with factors matching
+/// the same sdsc's own fold props (importFromJson checks each `props[i]->getSize() == factor_`).
+/// The value lands at coordinate "[0, 0, 0]" and is a DECIMAL STRING inside a one-element
+/// array: the dtype is `FoldManager<std::vector<int64_t>>`, so the array imports element-wise,
+/// and json11's bare-number path truncates at int width (import_utils.h's own comment:
+/// 0xFF7FFFFF came back as -2147483648) — which the SFP table's u32 entries and any negative
+/// fp32 bit pattern would hit. Shape matches the golden `ddc/ddl_templates/test/sdsc_mean.json`
+/// (`"data_": {"[0, 0, 0]": ["65534"]}`).
+fn fold_manager_const(value: u32, folds: &SdscFoldSet) -> serde_json::Value {
+    serde_json::json!({
+        "dim_prop_func": [{"Const": {}}, {"Const": {}}, {"Const": {}}],
+        "dim_prop_attr": [
+            {"factor_": folds.core_fold() as i64, "label_": "core"},
+            {"factor_": folds.corelet_fold() as i64, "label_": "corelet"},
+            {"factor_": folds.time_fold() as i64, "label_": "time"}
+        ],
+        "data_": {"[0, 0, 0]": [value.to_string()]}
+    })
+}
+
+fn scaling_factor_const(packed: u32, folds: &SdscFoldSet) -> serde_json::Value {
     serde_json::json!({
         "0": {
             "dataFormat_": "SEN169_FP16",
             "name_": "scaling_factor",
-            "data_": [packed],
-            "allocations_": {}
+            "data_": fold_manager_const(packed, folds)
         }
     })
 }
@@ -4901,18 +4945,17 @@ fn scaling_factor_const(packed: u32) -> serde_json::Value {
 /// this returns; the test stayed
 /// where it was so the roster did not move, and the crate boundary now sits between them. Its sibling
 /// [`sen169_bits`] is `pub` for the same reason.
-pub fn scaling_factor_const_fp32(bits: u32) -> serde_json::Value {
+pub fn scaling_factor_const_fp32(bits: u32, folds: &SdscFoldSet) -> serde_json::Value {
     serde_json::json!({
         "0": {
             "dataFormat_": "IEEE_FP32",
             "name_": "scaling_factor",
-            "data_": [bits],
-            "allocations_": {}
+            "data_": fold_manager_const(bits, folds)
         }
     })
 }
 
-fn sfp_constant_table() -> serde_json::Value {
+fn sfp_constant_table(folds: &SdscFoldSet) -> serde_json::Value {
     const ENTRIES: &[(&str, u32)] = &[
         ("dontSplatOutput", 0),
         ("negInf", 0xFFFE_FFFE),
@@ -4942,8 +4985,7 @@ fn sfp_constant_table() -> serde_json::Value {
             serde_json::json!({
                 "dataFormat_": "SEN169_FP16",
                 "name_": name,
-                "data_": [val],
-                "allocations_": {}
+                "data_": fold_manager_const(*val, folds)
             }),
         );
     }
@@ -5260,6 +5302,7 @@ mod gather_cut {
                 inputs: &[In::scalar(&scale).ew(), In::full(&table).ew()],
                 gathered_input: 1,
                 index_name: "t0",
+                first_entry: 0,
                 o: &out,
             },
             &mut sid,
