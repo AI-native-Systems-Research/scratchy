@@ -3044,6 +3044,10 @@ impl AsyncEngine {
                 .iter()
                 .map(|msg| {
                     let mut val = serde_json::to_value(msg).unwrap_or_default();
+                    // A `tool_calls`-only assistant message serializes with no
+                    // `content` key; templates that write `message['content']`
+                    // need a string there or they fail.
+                    crate::chat_template::default_absent_content(&mut val);
                     // For tool_calls where function.arguments is a JSON string,
                     // parse it into a JSON object so templates using `| items` work.
                     if let Some(tool_calls) = val.get_mut("tool_calls")

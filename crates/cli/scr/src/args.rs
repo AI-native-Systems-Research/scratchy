@@ -532,20 +532,6 @@ pub struct ServeArgs {
     /// Requires building with --features otel.
     #[arg(long, env = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")]
     pub otlp_traces_endpoint: Option<String>,
-
-    /// Serve tools-bearing `/v1/messages` requests as per-tool relocatable
-    /// spans instead of ordinary flat chat prompts. Default: off.
-    ///
-    /// ⛔ OFF BY DEFAULT FOR A REASON: the spans renderer writes tool schemas
-    /// as plain `Tool: …` text rather than through the model's native tool
-    /// template, so the model is never put in its tool-calling format and the
-    /// tool parser never fires — the client gets prose where it asked for a
-    /// `tool_use`. On granite-3.3-2b that is 105 prompt tokens and a `text`
-    /// block against 218 and a real `tool_use` on the flat path. It stays
-    /// reachable because it is the arm the Claude-Code benchmark wants to
-    /// measure; it is not yet correct enough to be what a user gets.
-    #[arg(long)]
-    pub tool_spans: bool,
 }
 
 impl ServeArgs {

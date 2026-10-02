@@ -327,6 +327,32 @@ impl ChatTemplate {
     }
 }
 
+/// Give a serialized chat message the `content` key the serializer omitted.
+///
+/// `protocol::ChatCompletionMessageParam::content` is
+/// `skip_serializing_if = "Option::is_none"`, so an assistant message carrying
+/// only `tool_calls` — i.e. every "the model called a tool" turn — arrives here
+/// with **no** `content` key at all. A template that writes
+/// `message['content'] + …` (granite 3.3, SmolLM2, and plenty more do, without
+/// guarding the key) then evaluates `string + undefined` and fails, which 500'd
+/// every conversation turn after a tool call.
+///
+/// Templates universally expect a string here, so supply the empty one. This
+/// touches only the value handed to the template: the wire format keeps
+/// `content` optional, which is correct per the OpenAI request schema.
+///
+/// Call this at every site that renders messages through a [`ChatTemplate`].
+pub(crate) fn default_absent_content(val: &mut serde_json::Value) {
+    if let Some(obj) = val.as_object_mut()
+        && !obj.contains_key("content")
+    {
+        obj.insert(
+            "content".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+    }
+}
+
 /// Extract a token string from the `bos_token` / `eos_token` field in
 /// tokenizer_config.json. These can be either a plain string or an object
 /// with a `content` field.
@@ -487,6 +513,7 @@ fn day_of_year(year: u64, month: u64, day: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol;
 
     #[test]
     fn test_simple_template() {
@@ -642,6 +669,64 @@ mod tests {
         let result = tpl.apply(&messages, false, Some(&tools)).unwrap();
         assert!(result.contains("TOOLS:"));
         assert!(result.contains("get_weather"));
+    }
+
+    /// A `tool_calls`-only assistant message must render, not blow up.
+    ///
+    /// The real shape: `protocol::ChatCompletionMessageParam` with
+    /// `content: None`, serialized the way the serving paths serialize it. The
+    /// `skip_serializing_if` on `content` drops the key entirely, and a template
+    /// doing `message['content'] + …` then evaluates `string + undefined`. This
+    /// goes through serialization on purpose — testing a hand-written
+    /// `{"content": ""}` literal would not have caught the bug.
+    #[test]
+    fn test_tool_calls_only_message_renders_without_content_key() {
+        let msg = protocol::ChatCompletionMessageParam {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_calls: Some(vec![protocol::ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: protocol::FunctionCall {
+                    name: "Bash".to_string(),
+                    arguments: r#"{"command":"ls"}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+
+        let mut val = serde_json::to_value(&msg).unwrap();
+        assert!(
+            val.get("content").is_none(),
+            "precondition: the serializer drops a None content"
+        );
+
+        default_absent_content(&mut val);
+        assert_eq!(val["content"], "");
+
+        // The template shape that used to fail: string + content.
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}{{ message.role }}: {{ message.content + \"|\" }}{% endfor %}"
+                .to_string(),
+        )
+        .unwrap();
+        let out = tpl.apply(&[val], false, None).unwrap();
+        assert_eq!(out, "assistant: |");
+    }
+
+    /// Normalization must not overwrite content a message actually has.
+    #[test]
+    fn test_present_content_is_left_alone() {
+        let mut val = serde_json::json!({"role": "user", "content": "Hello"});
+        default_absent_content(&mut val);
+        assert_eq!(val["content"], "Hello");
+
+        // An explicit null is a present key — leave it to the template, which
+        // is what distinguishes "client sent null" from "serializer omitted it".
+        let mut explicit_null = serde_json::json!({"role": "user", "content": null});
+        default_absent_content(&mut explicit_null);
+        assert!(explicit_null["content"].is_null());
     }
 
     #[test]

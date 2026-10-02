@@ -90,17 +90,16 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
 
     print_banner(env!("CARGO_PKG_VERSION"), &model);
     info!("Device: {}, dtype: {}", args.device, args.dtype);
-    // Logged on both arms, not just the non-default one: a bench log has to
-    // name the arm it measured without the reader reconstructing it from the
-    // flags, and the default is the thing most likely to be assumed wrongly.
-    info!(
-        "Tool spans: {}",
-        if args.tool_spans {
-            "on (per-tool relocatable spans; no native tool template — see --help)"
-        } else {
-            "off (tools-bearing /v1/messages served as flat chat)"
-        }
-    );
+    // Only ever logged by an experimental `tool-spans` build, and loudly: a
+    // bench log has to say when it measured the broken arm, and a normal build
+    // says nothing because it has no spans code in it to talk about.
+    if cfg!(feature = "tool-spans") {
+        tracing::warn!(
+            "Tool spans: ON — EXPERIMENTAL build. Tools-bearing /v1/messages \
+             requests bypass the model's tool template and will NOT produce \
+             tool_use blocks. See issue #193."
+        );
+    }
     if let Some(ref spec_model) = args.speculative_model {
         if spec_model == "ngram" {
             info!(
@@ -262,7 +261,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         ssl_certfile: args.ssl_certfile.clone(),
         ssl_ca_certs: args.ssl_ca_certs.clone(),
         startup_instant: Some(startup_start),
-        tool_spans_enabled: args.tool_spans,
     };
 
     let is_pooling = args.runner == "pooling";

@@ -63,7 +63,6 @@ async fn start_otel_server() -> (u16, String, OtelTestServer) {
         ssl_certfile: None,
         ssl_ca_certs: None,
         startup_instant: None,
-        tool_spans_enabled: true,
     };
 
     let app_state = Arc::new(scratchy_serving_api::server::AppState {

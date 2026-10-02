@@ -59,18 +59,6 @@ pub struct ServerConfig {
     /// Path to CA certificates file for client certificate verification (PEM).
     pub ssl_ca_certs: Option<String>,
 
-    /// Whether tools-bearing `/v1/messages` requests are served as per-tool
-    /// relocatable spans (`scr serve --tool-spans` turns this on).
-    ///
-    /// **Default off.** The spans renderer writes tool schemas as plain
-    /// `Tool: …` text rather than through the model's native tool template, so
-    /// the model is never put in its tool-calling format and the tool parser
-    /// never fires — a request that asked for a `tool_use` gets prose. Off, a
-    /// tools-bearing request takes exactly the same flat chat path a tool-free
-    /// one takes, and the tool call round-trips. The switch stays because the
-    /// Claude-Code benchmark has to be able to measure both arms.
-    pub tool_spans_enabled: bool,
-
     /// Instant when the process started, for total startup time reporting.
     pub startup_instant: Option<std::time::Instant>,
 }
@@ -86,7 +74,6 @@ impl Default for ServerConfig {
             ssl_certfile: None,
             ssl_ca_certs: None,
             startup_instant: None,
-            tool_spans_enabled: false,
         }
     }
 }
@@ -629,7 +616,13 @@ async fn tokenize(
             };
             let message_values: Vec<serde_json::Value> = messages
                 .iter()
-                .map(|msg| serde_json::to_value(msg).unwrap_or_default())
+                .map(|msg| {
+                    let mut val = serde_json::to_value(msg).unwrap_or_default();
+                    // Same normalization the engine's own render does — this
+                    // endpoint has to be able to tokenize a tool-call turn.
+                    crate::chat_template::default_absent_content(&mut val);
+                    val
+                })
                 .collect();
             match template.apply(&message_values, request.add_generation_prompt, None) {
                 Ok(text) => text,
