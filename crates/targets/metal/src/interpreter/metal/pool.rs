@@ -17,7 +17,6 @@
 //! side is sync (one forward per checked-out worker), so async
 //! primitives buy nothing.
 
-use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer};
@@ -28,7 +27,7 @@ use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 use super::forward::{ForwardError, ForwardInputs};
 use super::lowered::{LoweredMetalTape, MegakernelTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
-use super::runtime::RuntimeBindings;
+use super::runtime::{Padding, RuntimeBindings};
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
 use scratchy_ir::{CanonicalParams, Instruction};
@@ -295,16 +294,23 @@ struct Mtl4Pool {
 }
 
 /// Where one [`MetalWorkerPool::submit`] spent its time, for `SCRATCHY_METAL_TRACE`: encoding, then
-/// commit to the GPU's completion report ([`commit_and_wait`](crate::mtl4_dispatch::commit_and_wait)).
+/// commit to the GPU's completion report ([`commit_and_time`](crate::mtl4_dispatch::commit_and_time)),
+/// of which the GPU ran the command buffer for `gpu`.
 struct Submitted {
     encode: std::time::Duration,
     complete: std::time::Duration,
+    /// How long the GPU ran the command buffer, as Metal reports it.
+    gpu: std::time::Duration,
 }
 
 impl std::fmt::Display for Submitted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { encode, complete } = self;
-        write!(f, "encode={encode:?} complete={complete:?}")
+        let Self {
+            encode,
+            complete,
+            gpu,
+        } = self;
+        write!(f, "encode={encode:?} complete={complete:?} gpu={gpu:?}")
     }
 }
 
@@ -783,12 +789,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// fails, its error returns with the command buffer ended and nothing
     /// committed. Otherwise the command buffer is committed and this returns
     /// once the GPU is done with it and Metal has reported on it
-    /// ([`commit_and_wait`]), so nothing it reads is still in use when the
+    /// ([`commit_and_time`]), so nothing it reads is still in use when the
     /// caller gets control back: a command buffer the report says failed
     /// returns [`ForwardError::GpuCommandFailed`] — its outputs are not the
     /// forward's.
     ///
-    /// [`commit_and_wait`]: crate::mtl4_dispatch::commit_and_wait
+    /// [`commit_and_time`]: crate::mtl4_dispatch::commit_and_time
     fn submit<R>(
         &self,
         encode: impl FnOnce(
@@ -842,7 +848,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             )
         };
         let t_encoded = t_pre.elapsed();
-        let completed = crate::mtl4_dispatch::commit_and_wait(&queue, &cb, &event, signal_value);
+        let completed = crate::mtl4_dispatch::commit_and_time(&queue, &cb, &event, signal_value);
         // Reset the allocator now that the GPU is done. Holds the
         // mutex briefly.
         {
@@ -851,12 +857,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 mtl4.allocator.reset();
             }
         }
-        completed.map_err(ForwardError::GpuCommandFailed)?;
+        let gpu = completed.map_err(ForwardError::GpuCommandFailed)?;
         Ok((
             encoded,
             Submitted {
                 encode: t_encoded,
                 complete: t_pre.elapsed() - t_encoded,
+                gpu,
             },
         ))
     }
@@ -1176,8 +1183,20 @@ fn write_runtime_inputs(
     runtime: &RuntimeBindings,
     inputs: &ForwardInputs<'_>,
 ) -> Result<(), ForwardError> {
-    write_slice("input_ids", &runtime.input_ids, inputs.input_ids)?;
-    write_slice("positions", &runtime.positions, inputs.positions)?;
+    write_input(
+        runtime,
+        "input_ids",
+        &runtime.input_ids,
+        bytes_of(inputs.input_ids),
+        Padding::Zero,
+    )?;
+    write_input(
+        runtime,
+        "positions",
+        &runtime.positions,
+        bytes_of(inputs.positions),
+        Padding::Zero,
+    )?;
     // Per-KV-cache-group slot_mappings (vLLM hybrid layout). Padding lanes
     // get sentinel `u32::MAX` so the rope_append kernel early-outs before
     // writing the paged K/V cache. Zero-fill would otherwise route every
@@ -1186,30 +1205,45 @@ fn write_runtime_inputs(
     // so they all write K_proj(token 0) to slot 0, racing with — and winning
     // against — the real position-0 write).
     for (g, s) in inputs.slot_mappings.iter().enumerate() {
-        write_slot_mapping(&runtime.slot_mappings[g], s)?;
+        write_input(
+            runtime,
+            "slot_mapping",
+            &runtime.slot_mappings[g],
+            bytes_of(s),
+            Padding::NoSlot,
+        )?;
     }
     if let Some(s) = inputs.cu_seqlens_q {
-        write_slice("cu_seqlens_q", &runtime.cu_seqlens_q, s)?;
+        write_input(
+            runtime,
+            "cu_seqlens_q",
+            &runtime.cu_seqlens_q,
+            bytes_of(s),
+            Padding::Zero,
+        )?;
     }
     if let Some(s) = inputs.seq_used_k {
-        write_slice("seq_used_k", &runtime.seq_used_k, s)?;
+        write_input(
+            runtime,
+            "seq_used_k",
+            &runtime.seq_used_k,
+            bytes_of(s),
+            Padding::Zero,
+        )?;
     }
-    // Span labels for block-diagonal attention. `write_slice` zero-fills the
-    // whole buffer first, so a `None` (non-spans) forward leaves it all-zero ⇒
-    // the kernel's span mask is a no-op ⇒ byte-identical to the legacy path.
-    if let Some(s) = inputs.span_ids {
-        write_slice("span_ids", &runtime.span_ids, s)?;
-    } else {
-        // No spans this forward — but the prefill kernel still READS span_ids
-        // under ATTN_ROR (every rope-on-read pipeline). A stale buffer (labels
-        // left from a prior forward) makes a query's q_span mismatch every key
-        // → fully-masked rows → NaN/crash. Zero it: label 0 = attends-all =
-        // mask inert. Cheap (a few hundred bytes to a few KB).
-        unsafe {
-            let ptr = runtime.span_ids.contents().as_ptr() as *mut u8;
-            std::ptr::write_bytes(ptr, 0, runtime.span_ids.length());
-        }
-    }
+    // Span labels for block-diagonal attention: past the labels, zero — so a forward without
+    // spans leaves it all-zero ⇒ the kernel's span mask is a no-op. The prefill kernel READS
+    // span_ids under ATTN_ROR (every rope-on-read pipeline) whether or not the forward has spans:
+    // labels left from a prior forward would make a query's q_span mismatch every key →
+    // fully-masked rows → NaN/crash. Label 0 = attends-all = mask inert.
+    let spans = inputs.span_ids.unwrap_or(&[]);
+    write_input(
+        runtime,
+        "span_ids",
+        &runtime.span_ids,
+        bytes_of(spans),
+        Padding::Zero,
+    )?;
     if std::env::var("SCRATCHY_METAL_TRACE").is_ok() {
         if let Some(s) = inputs.block_tables.first() {
             eprintln!(
@@ -1227,7 +1261,13 @@ fn write_runtime_inputs(
     }
     // Per-KV-cache-group block tables (group 0 = full, then sliding).
     for (g, s) in inputs.block_tables.iter().enumerate() {
-        write_slice("block_table", &runtime.block_tables[g], s)?;
+        write_input(
+            runtime,
+            "block_table",
+            &runtime.block_tables[g],
+            bytes_of(s),
+            Padding::Zero,
+        )?;
     }
     // Tell the gather kernel (used right before lm_head) what the
     // actual num_tokens of this forward is so it can pick the
@@ -1250,168 +1290,156 @@ fn write_runtime_inputs(
         std::ptr::write(ptr, num_sample_rows);
     }
     if let Some(s) = inputs.last_token_indices {
-        write_slice("last_token_indices", &runtime.sample_indices, s)?;
+        write_input(
+            runtime,
+            "last_token_indices",
+            &runtime.sample_indices,
+            bytes_of(s),
+            Padding::Zero,
+        )?;
     }
     // GDN per-forward indices (hybrid arches only). i32 slot ids + u32
     // fresh flags, one per batched sequence in cu_seqlens order.
     if let Some(idx) = inputs.gdn_state_indices {
         // i32 and u32 share the 4-byte layout the kernels read as int.
         let as_u32 = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u32, idx.len()) };
-        write_slice("gdn_state_indices", &runtime.gdn_state_indices, as_u32)?;
+        write_input(
+            runtime,
+            "gdn_state_indices",
+            &runtime.gdn_state_indices,
+            bytes_of(as_u32),
+            Padding::Zero,
+        )?;
     }
     if let Some(fresh) = inputs.gdn_is_fresh {
-        write_slice("gdn_is_fresh", &runtime.gdn_is_fresh, fresh)?;
+        write_input(
+            runtime,
+            "gdn_is_fresh",
+            &runtime.gdn_is_fresh,
+            bytes_of(fresh),
+            Padding::Zero,
+        )?;
     }
     // Vision externs (vision-tower arches only). Copied verbatim as
     // bytes — `freqs` is f32, `pixels` is the model dtype (bf16); the
     // runtime buffers are untyped and the kernels reinterpret.
     if let Some(b) = inputs.vision_rope_freqs {
-        write_bytes("vision_rope_freqs", &runtime.vision_rope_freqs, b)?;
+        write_input(
+            runtime,
+            "vision_rope_freqs",
+            &runtime.vision_rope_freqs,
+            b,
+            Padding::Zero,
+        )?;
     }
     if let Some(b) = inputs.pixels {
-        write_bytes("pixels", &runtime.pixels, b)?;
+        write_input(runtime, "pixels", &runtime.pixels, b, Padding::Zero)?;
     }
     if let Some(b) = inputs.pos_embeds {
-        write_bytes("pos_embeds", &runtime.vision_pos_embeds, b)?;
+        write_input(
+            runtime,
+            "pos_embeds",
+            &runtime.vision_pos_embeds,
+            b,
+            Padding::Zero,
+        )?;
     }
     // Qwen2.5-VL windowed-attention externs (i32/u32 bytes, verbatim).
     if let Some(b) = inputs.vision_cu_seqlens_full {
-        write_bytes("vision_cu_seqlens_full", &runtime.vision_cu_seqlens_full, b)?;
+        write_input(
+            runtime,
+            "vision_cu_seqlens_full",
+            &runtime.vision_cu_seqlens_full,
+            b,
+            Padding::Zero,
+        )?;
     }
     if let Some(b) = inputs.vision_cu_seqlens_window {
-        write_bytes(
+        write_input(
+            runtime,
             "vision_cu_seqlens_window",
             &runtime.vision_cu_seqlens_window,
             b,
+            Padding::Zero,
         )?;
     }
     if let Some(b) = inputs.vision_window_index {
-        write_bytes("vision_window_index", &runtime.vision_window_index, b)?;
+        write_input(
+            runtime,
+            "vision_window_index",
+            &runtime.vision_window_index,
+            b,
+            Padding::Zero,
+        )?;
     }
     if let Some(b) = inputs.vision_reverse_indices {
-        write_bytes("vision_reverse_indices", &runtime.vision_reverse_indices, b)?;
+        write_input(
+            runtime,
+            "vision_reverse_indices",
+            &runtime.vision_reverse_indices,
+            b,
+            Padding::Zero,
+        )?;
     }
     if let Some(b) = inputs.vision_position_ids {
-        write_bytes("vision_position_ids", &runtime.vision_position_ids, b)?;
+        write_input(
+            runtime,
+            "vision_position_ids",
+            &runtime.vision_position_ids,
+            b,
+            Padding::Zero,
+        )?;
     }
     // Multimodal splice (MM-bearing batches only). mm_embeds = the
     // projected vision output (bytes); mm_dst_rows = per-row dst (u32).
     if let Some(b) = inputs.mm_embeds {
-        write_bytes("mm_embeds", &runtime.mm_embeds, b)?;
+        write_input(runtime, "mm_embeds", &runtime.mm_embeds, b, Padding::Zero)?;
     }
     if let Some(d) = inputs.mm_dst_rows {
-        write_slice("mm_dst_rows", &runtime.mm_dst_rows, d)?;
+        write_input(
+            runtime,
+            "mm_dst_rows",
+            &runtime.mm_dst_rows,
+            bytes_of(d),
+            Padding::Zero,
+        )?;
     }
     // MRoPE cos/sin override (MRoPE text decoders only). Bytes in the
     // rope kernel's element dtype; the worker binds it at the cos/sin slot.
     if let Some(b) = inputs.mrope_cos_sin {
-        write_bytes("mrope_cos_sin", &runtime.mrope_cos_sin, b)?;
+        write_input(
+            runtime,
+            "mrope_cos_sin",
+            &runtime.mrope_cos_sin,
+            b,
+            Padding::Zero,
+        )?;
     }
     Ok(())
 }
 
-/// Write `src` into `buffer`, filling padding lanes with `u32::MAX`
-/// (the rope_append sentinel that means "skip cache write"). Mirrors
-/// `write_slice` except for the padding fill value.
-fn write_slot_mapping(buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> {
-    let bytes_needed = std::mem::size_of_val(src);
-    let bytes_available = buffer.length();
-    if bytes_needed > bytes_available {
-        return Err(ForwardError::BufferTooSmall {
-            kind: "slot_mapping",
-            bytes_needed,
-            bytes_available,
-        });
-    }
-    unsafe {
-        // 0xFF byte-fill = u32::MAX in every lane.
-        std::ptr::write_bytes(
-            buffer.contents().as_ptr() as *mut u8,
-            0xFFu8,
-            bytes_available,
-        );
-        if bytes_needed > 0 {
-            copy_nonoverlapping(
-                src.as_ptr() as *const u8,
-                buffer.contents().as_ptr() as *mut u8,
-                bytes_needed,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> {
-    let bytes_needed = std::mem::size_of_val(src);
-    let bytes_available = buffer.length();
-    if bytes_needed > bytes_available {
-        return Err(ForwardError::BufferTooSmall {
+/// Write `src` at the head of runtime input `buffer`, every byte past it `padding`
+/// ([`WrittenExtents::write`]: only what the last forward wrote past it is re-padded).
+fn write_input(
+    runtime: &RuntimeBindings,
+    kind: &'static str,
+    buffer: &Buffer,
+    src: &[u8],
+    padding: Padding,
+) -> Result<(), ForwardError> {
+    (runtime.written)
+        .write(buffer, src, padding)
+        .map_err(|bytes_needed| ForwardError::BufferTooSmall {
             kind,
             bytes_needed,
-            bytes_available,
-        });
-    }
-    // Zero the WHOLE runtime buffer first, then overwrite the leading
-    // `bytes_needed` from `src`. The kernels dispatch over the bucket's
-    // padded M (= the buffer's full length), but only the first
-    // `actual_num_tokens` of input data is meaningful — without this
-    // zero-fill, padding lanes read whatever was left in the buffer
-    // from a previous forward's RuntimeBindings allocation. RoPE is
-    // the canary: `positions[t]` for `t >= actual_n` indexes the
-    // cos_sin table, and a stale (uninitialized) value blows past the
-    // table's bounds, faulting the GPU and hanging the command
-    // buffer in `wait_until_completed`.
-    //
-    // Zero-pad is only correct for inputs whose `0`-th index is a valid
-    // no-op for the consuming kernel: positions[t]=0 ↦ row-0 of the
-    // cos_sin table; seq_used_k[s]=0 ↦ no kv tokens scanned;
-    // block_table[s][b]=0 ↦ readable physical block with whatever was
-    // already there. `slot_mapping` does NOT satisfy this — slot 0 is a
-    // valid storage location, so a padding-lane write to it corrupts
-    // real K/V data — and goes through `write_slot_mapping` (sentinel
-    // u32::MAX + early-out in rope_append) instead.
-    //
-    // Safety: shared-storage buffers expose `contents()` as a
-    // host-visible pointer; we've bounds-checked the byte count
-    // against `length()` above; src and dst don't overlap (src is a
-    // Rust slice in CPU memory).
-    unsafe {
-        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0u8, bytes_available);
-        if bytes_needed > 0 {
-            copy_nonoverlapping(
-                src.as_ptr() as *const u8,
-                buffer.contents().as_ptr() as *mut u8,
-                bytes_needed,
-            );
-        }
-    }
-    Ok(())
+            bytes_available: buffer.length(),
+        })
 }
 
-/// Byte-accurate sibling of [`write_slice`] for runtime externs whose
-/// element type isn't `u32` (vision `freqs` = f32, `pixels` = bf16).
-/// Zero-fills the whole buffer then copies `src` verbatim into the head.
-fn write_bytes(kind: &'static str, buffer: &Buffer, src: &[u8]) -> Result<(), ForwardError> {
-    let bytes_needed = src.len();
-    let bytes_available = buffer.length();
-    if bytes_needed > bytes_available {
-        return Err(ForwardError::BufferTooSmall {
-            kind,
-            bytes_needed,
-            bytes_available,
-        });
-    }
-    unsafe {
-        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0u8, bytes_available);
-        if bytes_needed > 0 {
-            copy_nonoverlapping(
-                src.as_ptr(),
-                buffer.contents().as_ptr() as *mut u8,
-                bytes_needed,
-            );
-        }
-    }
-    Ok(())
+/// `src`'s bytes.
+fn bytes_of(src: &[u32]) -> &[u8] {
+    // SAFETY: `u32` has no padding and every byte of it is initialized.
+    unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), std::mem::size_of_val(src)) }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1524,6 +1552,7 @@ mod tests {
             vision_window_index: alloc(device, 16),
             vision_reverse_indices: alloc(device, 16),
             vision_position_ids: alloc(device, 16),
+            written: Default::default(),
         }
     }
 
@@ -1839,6 +1868,7 @@ mod tests {
             vision_window_index: alloc(d, 16),
             vision_reverse_indices: alloc(d, 16),
             vision_position_ids: alloc(d, 16),
+            written: Default::default(),
         });
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,

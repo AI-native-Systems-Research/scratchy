@@ -457,6 +457,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // TurboQuant packed stores + codebook — pinned below when Some
                 // (dispatch-bound by baked gpuAddress, same lazy-pager hazard).
                 tq,
+                // Host bookkeeping of the input buffers' written bytes, not a GPU buffer.
+                written: _,
             } = runtime;
             pin(input_ids);
             pin(positions);
@@ -1650,6 +1652,7 @@ mod tests {
             vision_window_index: alloc_buffer(device, 16),
             vision_reverse_indices: alloc_buffer(device, 16),
             vision_position_ids: alloc_buffer(device, 16),
+            written: Default::default(),
         }
     }
 

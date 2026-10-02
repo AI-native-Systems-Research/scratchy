@@ -12314,6 +12314,7 @@ pub fn emit_model(
                             vision_position_ids: alloc(
                                 (METAL_MAX_BUCKET_M as u64 + 8) * 4,
                             ),
+                            written: ::std::default::Default::default(),
                         }
                     });
                 ::scratchy_target_metal::interpreter::metal::MetalWorkerPool::for_buckets(

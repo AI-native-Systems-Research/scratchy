@@ -16,7 +16,7 @@
 //! variants (each layer gets its own `Buffer`); other runtime tensors
 //! are global per worker.
 
-use crate::interpreter::metal::__re::Buffer;
+use crate::interpreter::metal::__re::{Buffer, MTLBuffer as _};
 
 use super::lowered::RuntimeBindingKind;
 
@@ -161,6 +161,61 @@ pub struct RuntimeBindings {
     pub vision_reverse_indices: Buffer,
     /// u32 SigLIP positional-embedding indices (`PosEmbed` gather).
     pub vision_position_ids: Buffer,
+    /// How much of each input buffer the last forward wrote ([`WrittenExtents`]).
+    pub written: WrittenExtents,
+}
+
+/// What a runtime input buffer's bytes past a forward's own input must hold: the kernels dispatch
+/// over the bucket's padded rows and read the padding lanes, so each lane past the input holds a
+/// value its reader takes as a no-op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Padding {
+    /// Zero: position 0's row of the rope table, no KV tokens scanned, a readable block.
+    Zero,
+    /// `u32::MAX` in every lane: the slot mapping's "write no cache slot" (slot 0 is real storage).
+    NoSlot,
+}
+
+impl Padding {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Zero => 0,
+            Self::NoSlot => 0xff,
+        }
+    }
+}
+
+/// How many leading bytes of each runtime input buffer the last forward wrote, by the buffer's
+/// address: everything past them still holds its [`Padding`]. The buffers are sized for the
+/// largest bucket and the longest sequence (a block table: rows × blocks per sequence), while a
+/// decode step writes one short row — so a forward re-pads only what the last one wrote, never
+/// the whole buffer. A buffer no forward wrote yet is padded whole.
+#[derive(Debug, Default)]
+pub struct WrittenExtents(std::sync::Mutex<std::collections::HashMap<u64, usize>>);
+
+impl WrittenExtents {
+    /// Write `src` at the head of `buffer`, every byte past it the `padding`. `Err`: the bytes
+    /// `src` needs, more than the buffer holds.
+    pub fn write(&self, buffer: &Buffer, src: &[u8], padding: Padding) -> Result<(), usize> {
+        let len = buffer.length();
+        if src.len() > len {
+            return Err(src.len());
+        }
+        let mut written = self.0.lock().expect("written extents");
+        let stale = written
+            .insert(buffer.gpuAddress(), src.len())
+            .unwrap_or(len);
+        // SAFETY: a shared-storage buffer's `contents()` is a host pointer to its `len` bytes;
+        // both ranges are inside them, and `src` (host memory) does not overlap the buffer.
+        unsafe {
+            let dst = buffer.contents().as_ptr().cast::<u8>();
+            if stale > src.len() {
+                std::ptr::write_bytes(dst.add(src.len()), padding.byte(), stale - src.len());
+            }
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        }
+        Ok(())
+    }
 }
 
 impl RuntimeBindings {
