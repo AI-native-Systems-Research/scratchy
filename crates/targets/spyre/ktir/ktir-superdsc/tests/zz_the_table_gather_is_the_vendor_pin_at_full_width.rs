@@ -72,8 +72,13 @@ fn h(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
 }
 
 /// The embedding op exactly as `scalarmul_at`'s gathered branch builds it: `[scalar, table]` with the
-/// TABLE LAST, `multiply`, a row-blocked output. ONE LEG PER INDEX STICK.
-fn emit_legs(rows: u32, cols: u32) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+/// TABLE LAST, `multiply`, a row-blocked output. ONE LEG PER INDEX STICK. `first_entry` is the
+/// program's own anchor, so a run starting past the index buffer's first word can be stated.
+fn emit_legs_at(
+    rows: u32,
+    cols: u32,
+    first_entry: u32,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
     let table = h("EmbTable", rows, cols);
     let scale = h("EmbScale", rows, cols);
     let out = h("EmbOut", rows, cols);
@@ -90,13 +95,17 @@ fn emit_legs(rows: u32, cols: u32) -> Result<Vec<ktir_superdsc::emit::EmittedOp>
             inputs: &inputs,
             gathered_input: 1,
             index_name: "EmbIds",
-            first_entry: 0,
+            first_entry,
             o: &out,
         },
         &mut sym,
         None,
     )
     .map_err(|e| e.0)
+}
+
+fn emit_legs(rows: u32, cols: u32) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+    emit_legs_at(rows, cols, 0)
 }
 
 /// LEG 0's descriptor, with the LEG COUNT checked on the way past — so no assertion below can be
@@ -364,5 +373,94 @@ fn the_same_op_without_a_gather_declares_none() {
             .as_array()
             .is_none_or(|a| a.is_empty()),
         "an op that declares no gather names no index"
+    );
+}
+
+// ── ISSUE 201 ITEM 1: the anchor's stick alignment is the CONSTRUCTOR's to check ──────────────
+//
+// Both the ≤32-entry arm and the >32-entry CUT arm build the run's `first_entry` through
+// `EntryBase::of_entries`. Before the fix, only the uncut arm checked alignment (and by calling a
+// separate `assert_stick_aligned`); the cut arm ran `of_entries(first_entry + k · cap)` unchecked,
+// so an unaligned program anchor (an unrolled sweep's trip starting mid-stick — BLOCK_N = 48)
+// gathered another run's rows from a clean bake. These tests pin BOTH arms.
+
+/// The control: an unaligned start on the UNCUT arm (≤32 entries, one stick) must be refused, and
+/// the refusal must name the entry and the stick size.
+#[test]
+fn an_unaligned_first_entry_is_refused_uncut() {
+    let msg = match emit_legs_at(32, COLS, 48) {
+        Err(e) => e,
+        Ok(_) => panic!("a run starting at entry 48 is 1.5 sticks in — refused, not emitted"),
+    };
+    assert!(
+        msg.contains("48") && msg.contains("stick"),
+        "the refusal must name the entry and the stick. Got: {msg}"
+    );
+}
+
+/// THE GAP ITSELF: the same unaligned start on the CUT arm (>32 entries, several legs). Trip 1 of
+/// a BLOCK_N = 48 sweep starts at entry 48 with 48 entries; before the fix this arm emitted
+/// silently. Now leg 0's `of_entries(48 + 0·cap)` must refuse at build time.
+#[test]
+fn an_unaligned_first_entry_is_refused_on_the_cut_arm() {
+    let msg = match emit_legs_at(48, COLS, 48) {
+        Err(e) => e,
+        Ok(_) => {
+            panic!("a 48-entry run starting at entry 48 spans sticks 1.5–3 — refused, not emitted")
+        }
+    };
+    assert!(
+        msg.contains("48") && msg.contains("stick"),
+        "the refusal must name the entry and the stick. Got: {msg}"
+    );
+}
+
+/// An ALIGNED start on the cut arm still emits, and every leg's index `allocate` steps one stick
+/// further on — the measured multi-block shape (leg k starts `first_entry + k·cap` words in).
+#[test]
+fn an_aligned_start_on_the_cut_arm_emits_legs_one_stick_apart() {
+    let legs = emit_legs_at(64, COLS, 64).expect("64 entries starting at entry 64: whole sticks");
+    assert_eq!(legs.len(), 2, "a 64-entry run is two 32-entry legs");
+    let d0 = serde_json::to_value(legs[0].op.as_ref().expect("leg 0 has a descriptor")).unwrap();
+    let d1 = serde_json::to_value(legs[1].op.as_ref().expect("leg 1 has a descriptor")).unwrap();
+    // The INDEX operand's `allocate` node carries the run base in its start address (the
+    // `offset_elems` the gather declaration set, × the `SenUint32` word length, on top of the
+    // buffer's seg base): leg 1's must be leg 0's + 32 words = one whole `SenUint32` stick, with
+    // the program's 64-entry anchor under both. `KERNEL_IDX` is the index's `indirectAllocType_`.
+    let index_addr = |j: &serde_json::Value| -> u64 {
+        for i in 0.. {
+            let a = &body(j)["scheduleTree_"][i];
+            if a.is_null() {
+                break;
+            }
+            if a["indirectAllocType_"] == "index_tensor" {
+                return a["startAddressCoreCorelet_"]["data_"]["[0, 0, 0]"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("the index alloc carries a concrete start address");
+            }
+        }
+        panic!("no index_tensor alloc in the descriptor");
+    };
+    let a0 = index_addr(&d0);
+    let a1 = index_addr(&d1);
+    assert_eq!(a0 % 4, 0, "the index base is word-aligned");
+    assert_eq!(
+        (a1 - a0) / 4,
+        32,
+        "leg 1's index start is one 32-entry (128 B) stick past leg 0's"
+    );
+}
+
+/// And the leg stride itself: a `cap` that is not a whole stick cannot shift the base by it. The
+/// stride is `CopyDims::ENTRIES_PER_OP`; pinning it here means a change to that constant breaks
+/// this file instead of the card.
+#[test]
+fn the_leg_stride_is_a_whole_stick() {
+    assert!(
+        CopyDims::ENTRIES_PER_OP.is_multiple_of(
+            <ktir_superdsc::superdsc_opspec::SenUint32 as ktir_superdsc::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        ),
+        "the cut's leg stride must be a whole index stick"
     );
 }

@@ -846,7 +846,6 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 // the program's own; only the CUT below adds to it). Stick-aligned, checked here:
                 // the IBR is loaded one `SenUint32` stick at a time.
                 first_entry: crate::superdsc_opspec::EntryBase::of_entries(first_entry)
-                    .assert_stick_aligned()
                     .map_err(SuperDscError)?,
                 o_name: o.name(),
                 head_major,
@@ -954,9 +953,12 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 // leg_rows/page)`, and dropping either term is every leg reading the run's first
                 // stick (the `EntryBase` type exists because the run-half of that happened).
                 // MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry `SenUint32`
-                // stick further on than leg `k-1`'s, for all eight. The anchor's stick alignment
-                // was checked at the uncut arm above; `k·cap` is a whole stick by construction.
-                first_entry: crate::superdsc_opspec::EntryBase::of_entries(first_entry + k * cap),
+                // stick further on than leg `k-1`'s, for all eight. `of_entries` IS the alignment
+                // check — it refuses both an unaligned program anchor and a leg stride that is
+                // not a whole stick (a `cap` change that breaks the stride fails HERE, at bake
+                // time, instead of gathering another run's rows on card).
+                first_entry: crate::superdsc_opspec::EntryBase::of_entries(first_entry + k * cap)
+                    .map_err(SuperDscError)?,
                 o_name: o.name(),
                 head_major,
             },

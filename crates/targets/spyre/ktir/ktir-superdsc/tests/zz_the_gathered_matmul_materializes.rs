@@ -328,7 +328,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
 fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
     let layout = layout_for(k);
     let mut sid = 0i64;
-    Ok(lower_function(k, Some(&layout), &mut sid).map_err(|e| e.message)?)
+    lower_function(k, Some(&layout), &mut sid).map_err(|e| e.message)
 }
 
 /// The device address the `dsType_`-tagged operand of `op` starts at — the alloc's per-core

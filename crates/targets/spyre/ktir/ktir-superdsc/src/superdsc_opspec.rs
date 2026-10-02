@@ -2186,30 +2186,32 @@ impl EntryBase {
     /// A base stated directly in ENTRIES — the program's own anchor for a gather whose run starts
     /// past its index buffer's first word (an unrolled sweep's trip `b` states `b · BLOCK_N`).
     ///
-    /// ⛔ THE BASE MUST BE STICK-ALIGNED, and that is this constructor's one job to check: the IBR
-    /// is loaded one `SenUint32` stick at a time, so a base straddling two sticks hands the core 32
-    /// words of the wrong run — the same clean-bake address `of_sticks`'s spelling removes for the
-    /// cut. A whole number of BLOCKS over a whole number of entries is aligned; a program stating
-    /// otherwise is refused here rather than emitted at a fractional stick.
-    pub const fn of_entries(entries: u32) -> EntryBase {
-        EntryBase(entries)
-    }
-
-    /// Refuse a base that is not a whole number of index sticks — see [`EntryBase::of_entries`].
-    pub fn assert_stick_aligned(self) -> Result<Self, String> {
-        if !self
-            .0
-            .is_multiple_of(<SenUint32 as DataFormat>::ELEMS_PER_STICK)
-        {
+    /// ⛔ THE BASE MUST BE STICK-ALIGNED, and this constructor IS the check: the IBR is loaded one
+    /// `SenUint32` stick at a time, so a base straddling two sticks hands the core 32 words of the
+    /// wrong run — the same clean-bake address `of_sticks`'s spelling removes for the cut. A whole
+    /// number of BLOCKS over a whole number of entries is aligned; a program stating otherwise is
+    /// refused here rather than emitted at a fractional stick. There is no other constructor from
+    /// entries, so an unaligned base cannot be built.
+    ///
+    /// `>32-entry` CUT legs reach this through
+    /// [`super::emit::EntryBase::of_entries`] (`first_entry + k · cap`, the leg stride), which is
+    /// why the stride must itself be a whole stick.
+    pub fn of_entries(entries: u32) -> Result<Self, String> {
+        if !entries.is_multiple_of(<SenUint32 as DataFormat>::ELEMS_PER_STICK) {
             return Err(format!(
-                "a gather run starts at entry {}, which is not a whole {}-entry `SenUint32` stick — \
-                 the IBR is loaded one stick at a time, so the core would read words of two different \
-                 runs with a clean bake",
-                self.0,
+                "a gather run starts at entry {entries}, which is not a whole {}-entry \
+                 `SenUint32` stick — the IBR is loaded one stick at a time, so the core would read \
+                 words of two different runs with a clean bake",
                 <SenUint32 as DataFormat>::ELEMS_PER_STICK,
             ));
         }
-        Ok(self)
+        Ok(EntryBase(entries))
+    }
+
+    /// Refuse a base that is not a whole number of index sticks — see [`EntryBase::of_entries`].
+    /// Kept only for callers holding a bare `u32` from outside the crate's own walks.
+    pub fn assert_stick_aligned(self) -> Result<Self, String> {
+        EntryBase::of_entries(self.0)
     }
 
     /// The base in ENTRIES — what the operand's `offset_elems` is, since an entry is one SENUINT32
