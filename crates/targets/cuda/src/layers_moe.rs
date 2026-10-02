@@ -396,8 +396,9 @@ pub trait Gemma4RouterOps {
 #[cfg(feature = "cuda")]
 impl Gemma4RouterOps for GemmaRouterLayer {
     /// Load the Gemma-4 router bundle from `{prefix}` (= `...layers.N.router`):
-    /// * `{prefix}.proj` — **8-bit** MLX-affine `[E, hidden]`, dequantized to a
-    ///   dense BF16 `gate` tensor at load (the router GEMM stays dense BF16).
+    /// * `{prefix}.proj` — MLX-affine `[E, hidden]` at the caller-resolved
+    ///   `bits` (8 on every checkpoint shipped so far), dequantized to a dense
+    ///   BF16 `gate` tensor at load (the router GEMM stays dense BF16).
     /// * `{prefix}.per_expert_scale` — `[E]` bf16, kept verbatim.
     /// * `{prefix}.scale` — `[hidden]` bf16 RMSNorm gain, kept verbatim.
     fn load(
@@ -406,6 +407,7 @@ impl Gemma4RouterOps for GemmaRouterLayer {
         num_experts: usize,
         hidden_size: usize,
         group_size: u32,
+        bits: u32,
     ) -> anyhow::Result<Self> {
         use crate::driver;
 
@@ -465,7 +467,11 @@ impl Gemma4RouterOps for GemmaRouterLayer {
              group_size={group_size}"
         );
 
-        // router.proj: 8-bit MLX-affine, packed `[E, hidden/4]` U32 on disk.
+        // router.proj: MLX-affine, packed `[E, hidden / (32 / bits)]` U32 on disk
+        // — `[E, hidden/4]` at the 8 bits every Gemma-4-MoE checkpoint ships. The
+        // width comes from the macro (resolved through `affine_role_bits` from the
+        // arch's declared `bits_overrides`) rather than being baked here, so this
+        // call and the fingerprint's bit map cannot disagree (#202).
         let proj_w = gw.take(&format!("{prefix}.proj.weight"))?;
         let proj_s = gw.take_keep_dtype(&format!("{prefix}.proj.scales"))?;
         let proj_b = gw.take_keep_dtype(&format!("{prefix}.proj.biases"))?;
@@ -484,7 +490,7 @@ impl Gemma4RouterOps for GemmaRouterLayer {
                 proj_b,
                 num_experts,
                 hidden_size,
-                8,
+                bits,
                 group_size as usize,
                 stream,
             )?

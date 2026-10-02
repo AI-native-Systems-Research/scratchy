@@ -1131,30 +1131,6 @@ fn per_module_lookup(
         .map(|&(_, v)| v)
 }
 
-/// Affine weight roles whose on-disk bit-width is FIXED BY THE LOADER rather
-/// than derived from a variant's quant config — `(dot-anchored role suffix,
-/// bits)`.
-///
-/// Declared data, not logic: the affine bit-map fingerprint gate
-/// (`emit_fingerprint_check`) takes this as input and bakes these widths ahead
-/// of the preset's own map, so the gate asserts what the loader will actually
-/// assume instead of what the preset happens to say.
-///
-/// ⛔ WITHOUT THIS the gate false-rejects `mlx-community/gemma-4-26b-a4b-it-4bit`.
-/// Gemma-4-MoE's router ships 8-bit MLX-affine on disk while everything else in
-/// that checkpoint is 4-bit, and BOTH loaders hardcode the 8 —
-/// `Gemma4RouterOps::load` in `crates/targets/metal/src/layers_moe.rs` and its
-/// cuda twin in `crates/targets/cuda/src/layers_moe.rs`. The in-tree
-/// `gemma-4-26b-a4b-it.json` is a dense base carrying no quantization block at
-/// all, so the synthesized `mlx-affine-b4-g64` variant's map says "4-bit
-/// everywhere" and is simply silent about the router — correct for the loader,
-/// which never consults it, and a contradiction for any gate that reads the map
-/// as exhaustive.
-///
-/// Keep this in step with those two loaders: a role added here must be one whose
-/// `take_affine_dequant_b4` call site passes a literal width.
-pub const LOADER_FIXED_AFFINE_BITS: &[(&str, u32)] = &[(".router.proj", 8)];
-
 /// Effective on-disk bits for an arbitrary affine weight-role — used by
 /// the MoE codegen to resolve the router `gate` bits (and any other
 /// bundle sub-weight not visible as its own `WeightId`). Honors the same

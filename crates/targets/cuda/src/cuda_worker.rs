@@ -3501,7 +3501,7 @@ impl Worker for CudaWorker {
         // `arch.as_str()` wins. Auto-registered via
         // `inventory::submit!` at macro expansion — adding a new
         // arch to scratchy-models touches zero lines here.
-        let scratchy_loaded: Option<CudaModel> = {
+        let scratchy_loaded: CudaModel = {
             let stream = device.compute_stream;
             // Thread a minimal HF-config view into scratchy so per-
             // variant `fingerprint_matches` can disambiguate
@@ -3572,7 +3572,7 @@ impl Worker for CudaWorker {
             // helpers when world == 1.
             let scratchy_tp = u8::try_from(tp_world).unwrap_or(1);
             let scratchy_rank = u8::try_from(tp_rank).unwrap_or(0);
-            if let Some(scratchy_weights) = crate::try_load(
+            let loaded = crate::try_load(
                 &mut weights,
                 stream,
                 arch.as_str(),
@@ -3583,7 +3583,22 @@ impl Worker for CudaWorker {
             )
             .map_err(|e| {
                 ExecutorError::WorkerInit(format!("scratchy-forward-compiler load: {e}"))
-            })? {
+            })?;
+            // There is nothing to fall back to here — hand-written CUDA model
+            // forwards are gone and scratchy is the sole load path — so each miss
+            // becomes its own error instead of one conflated message. See
+            // `ArchLoad`: "the arch isn't compiled" and "the arch is compiled but
+            // no variant describes this checkpoint" point at different fixes.
+            let scratchy_weights = match loaded {
+                crate::ArchLoad::Loaded(w) => w,
+                crate::ArchLoad::NoVariantMatched => {
+                    return Err(ExecutorError::NoVariantMatched(arch.clone()));
+                }
+                crate::ArchLoad::ArchNotCompiled => {
+                    return Err(ExecutorError::ArchNotSupported(arch.clone()));
+                }
+            };
+            {
                 // Scratchy owns rotary construction: the emitted
                 // `Weights::load` built the RotaryCache (plus any
                 // dual-rotary arch-local variant) inline from the
@@ -3619,28 +3634,16 @@ impl Worker for CudaWorker {
                         arch
                     );
                 }
-                Some(CudaModel::Scratchy(Box::new(ScratchyModel {
+                CudaModel::Scratchy(Box::new(ScratchyModel {
                     weights: scratchy_weights,
                     mm,
                     #[cfg(feature = "nccl")]
                     tp_group: None,
                     tp_world_size: self.config.tp_world_size,
-                })))
-            } else {
-                None
+                }))
             }
         };
-        let model = scratchy_loaded.ok_or_else(|| {
-            ExecutorError::WorkerInit(format!(
-                "no scratchy-forward-compiler variant matched arch=`{arch}` at tp={tp_world}. \
-                 Hand-written CUDA model forwards have been removed; scratchy-forward-compiler \
-                 is the sole model-load path. Rebuild with the matching \
-                 `scratchy-models/<stem>` feature (or \
-                 `all` to compile every variant), and confirm \
-                 the arch's `configs/quantizations.json` lists this checkpoint's \
-                 quantization scheme."
-            ))
-        })?;
+        let model = scratchy_loaded;
 
         let t_construct = t_construct.elapsed();
 

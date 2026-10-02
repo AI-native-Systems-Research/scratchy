@@ -44,9 +44,25 @@ pub enum ExecutorError {
     WorkerInit(String),
 
     /// The worker backend has no implementation for this model architecture.
-    /// Surfaced when `scratchy_target_cuda::try_load` returns `Ok(None)`.
+    /// Surfaced when `try_load` returns `ArchLoad::ArchNotCompiled` — no
+    /// `#[forward]` registration claims the HF arch at this tp size.
     #[error("architecture `{0}` not supported by this backend")]
     ArchNotSupported(String),
+
+    /// The architecture IS compiled, but no compiled model variant's
+    /// fingerprint accepted this checkpoint — `ArchLoad::NoVariantMatched`.
+    /// Distinct from [`ExecutorError::ArchNotSupported`] because the fix is the
+    /// build's model/quant scope, not a missing backend: the checkpoint's shapes
+    /// or quantization layout differ from every `(model stem, quant preset)`
+    /// pair this binary compiled.
+    #[error(
+        "architecture `{0}` is compiled, but no compiled model variant matches this checkpoint: \
+         its shapes or quantization layout differ from every (model stem, quant preset) pair in \
+         this build. Check that the build names this checkpoint's stem (`model/<stem>`) and, for \
+         a quantized repo, a quant preset describing its actual on-disk widths (`quant/<preset>`, \
+         declared in crates/models/arch/configs/<arch>/quantizations.json)."
+    )]
+    NoVariantMatched(String),
 
     /// Worker execution failed.
     #[error("worker execution failed: {0}")]

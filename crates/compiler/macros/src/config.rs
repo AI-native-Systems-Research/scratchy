@@ -655,12 +655,7 @@ fn load_dir_mode(
         // synthesized quant variants already get). Tracked so cargo
         // rebuilds on override edits.
         let mut tracked: Vec<PathBuf> = Vec::new();
-        let override_path = dir.join(format!("{stem}.overrides.json"));
-        if override_path.exists() {
-            let (_, override_json) = read_json_file(&override_path)?;
-            deep_merge(&mut json, &override_json);
-            tracked.push(override_path);
-        }
+        apply_overrides_file(dir, &stem, &mut json, &mut tracked)?;
         // Build filter gates the DENSE emission only — a filter naming a
         // quant suffix never matches a base's own stem, but the base still
         // needs to stay in `base_raw` so a matching quant variant can be
@@ -757,16 +752,14 @@ fn load_dir_mode(
                 if !stem_matches_build_filter(&variant_stem) {
                     continue;
                 }
-                let override_path = dir.join(format!("{variant_stem}.overrides.json"));
-
-                let mut merged = base_json.clone();
-                deep_merge(&mut merged, &preset_json);
                 let mut extra_tracked = vec![preset_path.clone()];
-                if override_path.exists() {
-                    let (_, override_json) = read_json_file(&override_path)?;
-                    deep_merge(&mut merged, &override_json);
-                    extra_tracked.push(override_path);
-                }
+                let merged = merge_variant_config(
+                    dir,
+                    base_json,
+                    &variant_stem,
+                    &preset_json,
+                    &mut extra_tracked,
+                )?;
 
                 tracing::info!("[COMPILING] variant {}", variant_stem);
                 let variant = model_params_from_json_mode(
@@ -827,6 +820,48 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     )
 }
 
+/// Deep-merge `<stem>.overrides.json` onto `json` when the file exists, pushing
+/// its path onto `tracked` so cargo rebuilds on override edits.
+///
+/// Both drift tiers go through here: the dense base (`<stem>`) and a synthesized
+/// quant variant (`<stem>-<preset>`).
+fn apply_overrides_file(
+    dir: &Path,
+    stem: &str,
+    json: &mut serde_json::Value,
+    tracked: &mut Vec<PathBuf>,
+) -> Result<(), ConfigError> {
+    let path = dir.join(format!("{stem}.overrides.json"));
+    if path.exists() {
+        let (_, override_json) = read_json_file(&path)?;
+        deep_merge(json, &override_json);
+        tracked.push(path);
+    }
+    Ok(())
+}
+
+/// Build the config a synthesized `(stem, preset)` variant compiles from, in
+/// precedence order: `base_json` (the verbatim checkpoint config with its own
+/// `<stem>.overrides.json` already applied) → the preset fragment → the
+/// per-`(stem, preset)` `<variant_stem>.overrides.json`.
+///
+/// ⛔ ONE definition, called by both [`load_dir_mode`]'s overlay loop and
+/// [`load_file_with_preset`]. A test that rebuilt this sequence by hand could
+/// assert against a merge the build never performs — and did: it applied the
+/// variant drift file while skipping the base's own `<stem>.overrides.json`.
+fn merge_variant_config(
+    dir: &Path,
+    base_json: &serde_json::Value,
+    variant_stem: &str,
+    preset_json: &serde_json::Value,
+    tracked: &mut Vec<PathBuf>,
+) -> Result<serde_json::Value, ConfigError> {
+    let mut merged = base_json.clone();
+    deep_merge(&mut merged, preset_json);
+    apply_overrides_file(dir, variant_stem, &mut merged, tracked)?;
+    Ok(merged)
+}
+
 /// Load a single config.json with one quant preset deep-merged onto it —
 /// the `(size, preset)` variant the overlay-synthesis loop in [`load_dir`]
 /// builds, reachable one pair at a time.
@@ -834,37 +869,35 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
 /// Test-only, and for the same reason [`load_file`] is: a proc-macro crate has
 /// no model/quant features, so `load_dir` selects ZERO configs there and any
 /// test iterating its result passes vacuously. Naming the base and the preset
-/// explicitly skips the build's scope. Mirrors the synthesis order exactly
-/// (base → preset) AND loads the arch's own [`load_arch_json`] spec, so what
-/// comes back is what a real build would compile — including arch-level facts
-/// like `decoder_safetensors_prefix`, which a `DeclaredArchSpec::default()`
-/// would silently drop and leave tests asserting against the wrong on-disk
-/// tensor names.
+/// explicitly skips the build's scope.
+///
+/// The merge itself is NOT rebuilt here — it goes through the same
+/// [`apply_overrides_file`] + [`merge_variant_config`] the build uses, and the
+/// arch's own [`load_arch_json`] spec is loaded too, so what comes back is what
+/// a real build compiles. Both matter: a hand-rolled sequence previously skipped
+/// the base's `<stem>.overrides.json`, and a `DeclaredArchSpec::default()` drops
+/// arch-level facts like `decoder_safetensors_prefix`, either of which leaves a
+/// test asserting against something the build never produces.
 #[cfg(test)]
 pub fn load_file_with_preset(
     config_path: &Path,
     preset_path: &Path,
 ) -> Result<ModelParams, ConfigError> {
-    let (_, mut json) = read_json_file(config_path)?;
-    let (_, preset_json) = read_json_file(preset_path)?;
-    deep_merge(&mut json, &preset_json);
     let base_stem = stem_of(config_path)?;
     let preset_stem = stem_of(preset_path)?;
     let variant_stem = format!("{base_stem}-{preset_stem}");
     let dir = config_path
         .parent()
         .ok_or_else(|| ConfigError::NotADirectory(config_path.to_path_buf()))?;
-    // `<variant_stem>.overrides.json` deep-merges LAST, same as synthesis. This
-    // is where per-(stem, preset) bit-map drift lives — omitting it would hand a
-    // test the arch-wide preset's map and quietly assert against widths the
-    // build never compiles.
-    let override_path = dir.join(format!("{variant_stem}.overrides.json"));
-    if override_path.exists() {
-        let (_, override_json) = read_json_file(&override_path)?;
-        deep_merge(&mut json, &override_json);
-    }
+
+    let (_, mut base_json) = read_json_file(config_path)?;
+    let mut tracked: Vec<PathBuf> = Vec::new();
+    apply_overrides_file(dir, &base_stem, &mut base_json, &mut tracked)?;
+    let (_, preset_json) = read_json_file(preset_path)?;
+    let merged = merge_variant_config(dir, &base_json, &variant_stem, &preset_json, &mut tracked)?;
+
     let spec = load_arch_json(dir)?;
-    model_params_from_json(&json, &variant_stem, config_path, Vec::new(), &spec)
+    model_params_from_json(&merged, &variant_stem, config_path, tracked, &spec)
 }
 
 /// Read + parse a JSON file, returning the raw string (for

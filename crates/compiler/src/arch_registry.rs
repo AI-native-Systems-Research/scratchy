@@ -246,38 +246,32 @@ pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static ScratchyMmRe
     })
 }
 
-/// Whether any compiled arch registration CLAIMS `arch_hint` at this
-/// `tp_world_size` — the same `inventory` filter [`try_load`] applies before it
-/// starts sniffing fingerprints.
+/// Outcome of [`try_load`]. The two miss cases are DISTINCT, and callers want
+/// different diagnostics for them:
 ///
-/// [`try_load`] deliberately collapses its two miss cases into `Ok(None)` so a
-/// caller can fall back to a hand-written path without hard-failing, but those
-/// cases want very different diagnostics:
+/// * [`ArchLoad::ArchNotCompiled`] — nothing claims this HF arch at this tp
+///   size. The build genuinely has no implementation, so "unsupported arch" is
+///   the honest answer and a hand-written fallback is the right next move.
+/// * [`ArchLoad::NoVariantMatched`] — the arch IS compiled, but no compiled
+///   variant's fingerprint accepted the live `GpuWeights`: none of its
+///   `(stem, preset)` pairs describes THIS checkpoint. Reporting that as
+///   "unsupported arch" sends the reader hunting for a missing backend when the
+///   actual fix is the build's model/quant scope or a `quantizations.json`
+///   entry.
 ///
-/// * **Nothing claims the arch** — the build genuinely has no implementation.
-///   `ArchNotSupported` is the honest answer.
-/// * **The arch is compiled, but every variant's fingerprint rejected** — the
-///   build has the arch and none of its `(stem, preset)` pairs describes THIS
-///   checkpoint. Reporting that as "unsupported arch" sends the reader looking
-///   for a missing backend when the actual fix is a model/quant scope or a
-///   `quantizations.json` entry.
-///
-/// This lets the caller tell them apart without duplicating the filter.
-pub fn arch_is_registered(arch_hint: &str, tp_world_size: u8) -> bool {
-    inventory::iter::<ScratchyArchRegistration>().any(|reg| {
-        (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
-            && reg.tp_world_size == tp_world_size
-    })
+/// Returning them as data rather than a collapsed `Option` is what lets every
+/// caller — the metal main and draft paths, cuda, spyre — map each to its own
+/// error without re-deriving the registry filter.
+pub enum ArchLoad {
+    Loaded(Box<dyn ScratchyWeights>),
+    ArchNotCompiled,
+    NoVariantMatched,
 }
 
 /// Top-level architecture loader. Walks every `#[forward]`-registered
 /// arch; the first whose `hf_arches` list contains `arch_hint`
 /// AND whose `tp_world_size` matches the runtime `tp_world_size`
-/// wins and attempts to load. Returns `Ok(None)` when either
-/// (a) no registered (arch, tp) pair claims the request, or
-/// (b) a pair matched but no compiled variant's fingerprint sniff
-/// accepted the live `GpuWeights`. Both cases let the caller
-/// fall back to the hand-written path without hard-failing.
+/// wins and attempts to load. See [`ArchLoad`] for the two miss cases.
 ///
 /// Generic over the backend allocator `A`: the worker passes its concrete
 /// `&mut GpuWeights<A>` and `A` is inferred. The borrow is wrapped in a
@@ -286,8 +280,8 @@ pub fn arch_is_registered(arch_hint: &str, tp_world_size: u8) -> bool {
 ///
 /// Until task #7's outer-loop fanout lands, every emitted
 /// registration is at `tp_world_size = 1`, so callers passing
-/// `tp_world_size > 1` always see `Ok(None)` (and fall back) —
-/// matching the current behavior, since the gpu worker already gates
+/// `tp_world_size > 1` always see [`ArchLoad::ArchNotCompiled`] (and fall
+/// back) — matching the current behavior, since the gpu worker already gates
 /// eligibility on `!use_tp`.
 pub fn try_load<A: DeviceAllocator>(
     gw: &mut scratchy_layers::weights::GpuWeights<A>,
@@ -297,29 +291,36 @@ pub fn try_load<A: DeviceAllocator>(
     tp_rank: u8,
     max_model_len: usize,
     hf: HfFingerprint<'_>,
-) -> ::anyhow::Result<Option<Box<dyn ScratchyWeights>>> {
+) -> ::anyhow::Result<ArchLoad> {
     let handle = GpuWeightsHandle::new(gw);
-    // Walk every registration that claims this HF arch identifier
-    // for this TP world size. `Ok(Some(_))` and `Err(_)` terminate;
-    // `Ok(None)` (this registration's variants all rejected the
-    // live `GpuWeights`) falls through to the next claimant —
-    // required when more than one registration claims the same
-    // HF arch (e.g. the `deepseek-v3` LoRA-Q variants alongside the
+    // Walk every registration that claims this HF arch identifier for this TP
+    // world size. A variant hit and an `Err` terminate; a registration whose
+    // variants all rejected the live `GpuWeights` falls through to the next
+    // claimant — required when more than one registration claims the same HF
+    // arch (e.g. the `deepseek-v3` LoRA-Q variants alongside the
     // `deepseek-v3-flat` direct-Q variants for `DeepseekV3ForCausalLM`
-    // checkpoints with `q_lora_rank=null`, and the `mistral` arch
-    // claiming `LlamaForCausalLM` as an alias for GGUFs whose
-    // `general.architecture = "llama"` flattens Llama-2 and Mistral
-    // together).
-    // The inner `transpose` flips `Result<Option<W>>` →
-    // `Option<Result<W>>` so `find_map` treats `Ok(None)` as
-    // "keep looking" and any other shape as a hit.
-    inventory::iter::<ScratchyArchRegistration>()
-        .filter(|reg| {
-            (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
-                && reg.tp_world_size == tp_world_size
-        })
-        .find_map(|reg| (reg.try_load)(handle, stream, max_model_len, tp_rank, hf).transpose())
-        .transpose()
+    // checkpoints with `q_lora_rank=null`, and the `mistral` arch claiming
+    // `LlamaForCausalLM` as an alias for GGUFs whose
+    // `general.architecture = "llama"` flattens Llama-2 and Mistral together).
+    //
+    // `claimed` is what separates the two miss cases: it records that SOME
+    // registration owned the arch name even though every one of its variants
+    // declined the checkpoint.
+    let mut claimed = false;
+    for reg in inventory::iter::<ScratchyArchRegistration>().filter(|reg| {
+        (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
+            && reg.tp_world_size == tp_world_size
+    }) {
+        claimed = true;
+        if let Some(weights) = (reg.try_load)(handle, stream, max_model_len, tp_rank, hf)? {
+            return Ok(ArchLoad::Loaded(weights));
+        }
+    }
+    Ok(if claimed {
+        ArchLoad::NoVariantMatched
+    } else {
+        ArchLoad::ArchNotCompiled
+    })
 }
 
 /// MM-handle counterpart to [`try_load`]. Walks
