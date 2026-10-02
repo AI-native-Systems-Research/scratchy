@@ -105,7 +105,11 @@ scratchy-vision = { path = "../models/vision", optional = true }
 # Optional, pulled in by `spyre` (KTIR emit).
 scratchy-subtile = { path = "subtile", optional = true }
 objc2 = { version = "0.6", optional = true }
-objc2-metal = { version = "0.3", optional = true, features = [
+objc2-metal = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLResource",
     # MTL4 surfaces for the in-progress migration off the
     # MTLCommandBuffer + Serial-encoder + ICB pattern. Probed at
     # runtime via `device.newMTL4CommandQueue()`; falls back to MTL3
