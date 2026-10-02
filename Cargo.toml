@@ -98,7 +98,6 @@ inventory = "0.3"
 
 # System info
 libc = "0.2"
-core-foundation = "0.10"
 fs2 = "0.4"
 dirs = "7"
 

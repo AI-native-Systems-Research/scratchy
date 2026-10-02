@@ -30,14 +30,6 @@ ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 # `spyre` for the same reason every other Spyre-only piece here is: a cuda/metal build compiles
 # none of it.
 scratchy-spyre-bundle = { path = "../../targets/spyre/bundle", optional = true }
-# Emit the IBM Spyre op-graph as JSON — a
-# pure-Rust serde model serialized to the graph schema `compile_graph` consumes.
-# No SDK linkage: the graph is plain JSON; the SDK compiles it downstream.
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-# f16 encoding for embedded `ConstInput` tensors in that graph (e.g. the
-# RMSNorm mean-reduction `ones/h` vector + the eps scalar).
-half = { workspace = true }
 
 [build-dependencies]
 # The build script reads every model `config.json` in the workspace and writes the head geometries

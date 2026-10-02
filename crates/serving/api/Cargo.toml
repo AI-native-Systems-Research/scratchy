@@ -17,7 +17,7 @@ live-stats = []
 # in-process engine — `llm`/`init`/`engine` + the sync span-query path used by
 # `LLM::chat_stream` — compiles WITHOUT this, so a local-inference client
 # (`scr chat`) never pulls axum/tower/axum-server.
-serve = ["dep:axum", "dep:tower-http"]
+serve = ["dep:axum", "dep:tower-http", "dep:http"]
 otel = ["scratchy-core-common/otel"]
 cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda", "scratchy-target-cuda/cuda"]
 nccl = ["cuda", "dep:scratchy-serving-transport", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
@@ -68,7 +68,13 @@ thiserror = { workspace = true }
 tower-http = { version = "0.7", features = ["cors", "trace"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 rand = { workspace = true }
-http = "1"
+# Only `server.rs` (behind `serve`) names it, and it stays optional for that
+# reason: the `scratchy-models` build script compiles its own copy of the stack
+# below `ureq`, which enables `http` WITHOUT `default`. Enabling `http/default`
+# in the binary too gives the two copies different feature sets, and cargo then
+# compiles every crate between them (scratchy-target-metal, -layers,
+# -forward-compiler, -ir, -quantizations, -core-model, hf-hub-downloader) twice.
+http = { version = "1", optional = true }
 tokenizers = { workspace = true }
 rayon = { workspace = true }
 minijinja = { workspace = true }
