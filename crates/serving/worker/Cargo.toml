@@ -63,7 +63,7 @@ scratchy-builder-cuda = { path = "../../targets/cuda/builder", optional = true }
 scratchy-builder-spyre = { path = "../../targets/spyre/builder", optional = true }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
 objc2 = { version = "0.6", optional = true }
-objc2-metal = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true, default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLCommandQueue", "MTLDevice", "MTLResource", "MTL4ArgumentTable"] }
 half = { workspace = true }
 tokenizers = { workspace = true }
 anyhow = { workspace = true }

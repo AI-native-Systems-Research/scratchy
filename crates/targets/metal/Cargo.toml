@@ -45,8 +45,24 @@ rand = { workspace = true }
 libc = "0.2"
 objc2 = "0.6"
 block2 = "0.6"
-objc2-metal = { version = "0.3", features = [
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
     "dispatch2",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDataType",
+    "MTLDevice",
+    "MTLEvent",
+    "MTLFunctionConstantValues",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLTypes",
     # MTL4 surfaces for the migration off MTLCommandBuffer + ICB.
     # Runtime-probed via
     # `device.newMTL4CommandQueue()`; absent on macOS 14, so kept as
@@ -57,10 +73,17 @@ objc2-metal = { version = "0.3", features = [
     "MTL4CommandBuffer",
     "MTL4CommandEncoder",
     "MTL4CommandQueue",
+    "MTL4CommitFeedback",
+    "MTL4Compiler",
     "MTL4ComputeCommandEncoder",
     "MTL4ComputePipeline",
+    "MTL4Counters",
+    "MTL4FunctionDescriptor",
+    "MTL4LibraryFunctionDescriptor",
+    "MTL4PipelineState",
+    "MTL4SpecializedFunctionDescriptor",
 ] }
-objc2-foundation = "0.3"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 # `device::gpu_cores` reads the GPU core count from the IO registry.
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFNumber", "CFString"] }
 dispatch2 = "0.3"
