@@ -246,6 +246,30 @@ pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static ScratchyMmRe
     })
 }
 
+/// Whether any compiled arch registration CLAIMS `arch_hint` at this
+/// `tp_world_size` — the same `inventory` filter [`try_load`] applies before it
+/// starts sniffing fingerprints.
+///
+/// [`try_load`] deliberately collapses its two miss cases into `Ok(None)` so a
+/// caller can fall back to a hand-written path without hard-failing, but those
+/// cases want very different diagnostics:
+///
+/// * **Nothing claims the arch** — the build genuinely has no implementation.
+///   `ArchNotSupported` is the honest answer.
+/// * **The arch is compiled, but every variant's fingerprint rejected** — the
+///   build has the arch and none of its `(stem, preset)` pairs describes THIS
+///   checkpoint. Reporting that as "unsupported arch" sends the reader looking
+///   for a missing backend when the actual fix is a model/quant scope or a
+///   `quantizations.json` entry.
+///
+/// This lets the caller tell them apart without duplicating the filter.
+pub fn arch_is_registered(arch_hint: &str, tp_world_size: u8) -> bool {
+    inventory::iter::<ScratchyArchRegistration>().any(|reg| {
+        (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
+            && reg.tp_world_size == tp_world_size
+    })
+}
+
 /// Top-level architecture loader. Walks every `#[forward]`-registered
 /// arch; the first whose `hf_arches` list contains `arch_hint`
 /// AND whose `tp_world_size` matches the runtime `tp_world_size`
