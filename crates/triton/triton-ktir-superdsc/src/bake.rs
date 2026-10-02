@@ -18,11 +18,11 @@
 //! * `deeptools/dxp/test/test_scatter_1core/` — the whole all-concrete form, in nine lines:
 //!   ```text
 //!   module {
-//!   	func.func @sdsc_bundle() {
-//!   		sdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}
-//!   		sdscbundle.sdsc_execute () {sdsc_filename="sdsc_1.json"}
-//!   		return
-//!   	}
+//!       func.func @sdsc_bundle() {
+//!           sdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}
+//!           sdscbundle.sdsc_execute () {sdsc_filename="sdsc_1.json"}
+//!           return
+//!       }
 //!   }
 //!   ```
 //!   No signature, no operands, NO `symbol_ids` attribute at all — and its `sdsc_N.json` carry

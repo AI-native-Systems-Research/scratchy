@@ -752,7 +752,7 @@ mod decoder_from_the_fixture {
             ("HALF", Val::Int(64)),
             ("EPS", Val::Float(1e-05)),
             ("INV_D", Val::Float(1.0 / 128.0)),
-            ("QK_SCALE", Val::Float(0.0078125 * 1.44269504)),
+            ("QK_SCALE", Val::Float(0.011271055)), // 0.0078125 * 1.44269504, folded (Python's literal, bit-identical; do NOT substitute std's LOG2_E — its f64 spelling differs)
             ("RM", Val::Float(0.22)),
         ] {
             signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));

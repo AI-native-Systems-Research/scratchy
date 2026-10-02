@@ -180,14 +180,12 @@ fn main() {
         };
         match triton_ktir_superdsc::emit_whole(&node, Some(&layout)) {
             Err(e) => refused!(e.stage, e.message),
-            Ok(ops) => match {
+            Ok(ops) => {
                 // The launch map, from the SAME layout this emission used — see
                 // `bake::write_placements` for why the directory cannot yield it on its own.
-                if let Err(e) = triton_ktir_superdsc::bake::write_placements(&out_dir, &layout) {
-                    refused!(e.stage, e.message);
-                }
-                triton_ktir_superdsc::bake::write_dir(&out_dir, &ops)
-            } {
+                let written = triton_ktir_superdsc::bake::write_placements(&out_dir, &layout)
+                    .and_then(|()| triton_ktir_superdsc::bake::write_dir(&out_dir, &ops));
+                match written {
                 Err(e) => refused!("bake", e),
                 Ok(w) => {
                     println!(
@@ -198,7 +196,8 @@ fn main() {
                     );
                     return;
                 }
-            },
+                }
+            }
         }
     }
 

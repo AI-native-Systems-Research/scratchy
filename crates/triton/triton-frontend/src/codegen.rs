@@ -206,12 +206,6 @@ impl Scope {
         self.map.get(name)
     }
 
-    fn remove(&mut self, name: &str) {
-        if self.map.remove(name).is_some() {
-            self.order.retain(|n| n != name);
-        }
-    }
-
     /// Names in insertion order.
     fn names(&self) -> Vec<String> {
         self.order.clone()
