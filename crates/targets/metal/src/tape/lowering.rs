@@ -7408,7 +7408,6 @@ mod tests {
     /// dequant pass on any step.
     #[test]
     fn prefill_turboquant_attends_in_the_rotated_domain() {
-        use crate::tape::lowered::RuntimeGate::UnlessDecodeStep;
         let prefill = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
         let tape = lower_tq_layer(prefill, 64);
         let mut want = vec![
