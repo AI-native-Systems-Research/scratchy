@@ -1962,7 +1962,14 @@ pub fn lower_function(
                 // `k = a.c_len` the emitter itself reads; A is `per_op`'s first input).
                 Lowering::Node(Program::Matmul) => {
                     let k = per_op.first().map_or(dims[1], |a| a.c_len);
-                    [dims[0], DeviceWidth::for_output(dims[0], dims[1], k).get()]
+                    // The SAME `for_matmul` the emitter's `n_dev` takes — one decision for the
+                    // buffer this mint reserves and the width the emit writes, so they cannot
+                    // disagree (issue 201 item 4). `windowed = true`: this is the whole-function
+                    // door, where the padded weight columns would come from the caller's windows.
+                    [
+                        dims[0],
+                        DeviceWidth::for_matmul(dims[0], dims[1], k, true).get(),
+                    ]
                 }
                 _ => dims,
             };

@@ -156,12 +156,18 @@ pub fn bump_sticks_to_splittable(n64: u32) -> u32 {
     if (full - sticks) * 8 <= sticks {
         return full * FP16_ELEMS_PER_STICK;
     }
-    if cur >= 8 {
+    if cur >= UTIL_FLOOR_CORES {
         n64
     } else {
         sticks.next_multiple_of(8) * FP16_ELEMS_PER_STICK
     }
 }
+
+/// ⭐ THE UTIL-FLOOR CORE COUNT — the minimum cores a FLOP-heavy matmul (`macs ≥ 2^20`) may be
+/// split onto. One constant for every reader: `DeviceWidth::for_matmul`'s windowed drop test,
+/// guard #11's refusal in the emitter, and `out_width_the_weight_holds`' floor test in the
+/// bridge. Previously three hard-coded `8`s that had to agree by hand (issue 201 item 5).
+pub const UTIL_FLOOR_CORES: u32 = 8;
 
 /// A matmul OUTPUT/KERNEL **device stick width** — 64-aligned, and (for a FLOP-heavy gemm) core-splittable
 /// to ≥8 cores — BY CONSTRUCTION. TYPE-SAFE LOCK-DOWN of the padding/alignment invariant: the SOLE
@@ -175,6 +181,30 @@ pub fn bump_sticks_to_splittable(n64: u32) -> u32 {
 pub struct DeviceWidth(u32);
 
 impl DeviceWidth {
+    /// The device width of a WHOLE-FUNCTION matmul output — the ONE decision both the
+    /// intermediate's reservation and the emitter's `n_dev` take (issue 201 item 4: two sites
+    /// computed the same fact differently and over-reserved 8× on granite tiled_k).
+    ///
+    /// `windowed = true` is the whole-function door's minted-intermediate arm: the padded weight
+    /// columns would be read from the CALLER'S parameter windows (`for_output`'s staged-buffer
+    /// contract does not exist there), so the util-floor bump is dropped when the LOGICAL width
+    /// already meets the floor. ⛔ ONLY THE FLOOR BUP IS DROPPED — the rounding to a whole
+    /// 64-stick STAYS (issue 201 item 5): an unaligned `n` with a ≥8-core split still emits at
+    /// `n.next_multiple_of(64)`, so it cannot fall into the per-core stick guard that a raw
+    /// `n_dev = n` would hit. `UTIL_FLOOR_CORES` is the floor both the drop test and guard #11
+    /// use — named once, not three hard-coded `8`s.
+    pub fn for_matmul(m: u32, logical_n: u32, k: u32, windowed: bool) -> DeviceWidth {
+        if windowed {
+            let n64 = logical_n.next_multiple_of(FP16_ELEMS_PER_STICK);
+            if n64 > logical_n && CoreSplit::plan(m, logical_n).ncores() >= UTIL_FLOOR_CORES {
+                // The logical width already meets the util floor the bump was buying — and its
+                // stick rounding is kept by returning `n64`, not `logical_n`.
+                return DeviceWidth(n64);
+            }
+        }
+        DeviceWidth::for_output(m, logical_n, k)
+    }
+
     /// The device width of a matmul output `[m, logical_n]` with contraction `k`: round `logical_n` up to a
     /// 64-stick, then (only if `m·n64·k ≥ 2^20`) bump the stick count to ≥8-splittable.
     pub fn for_output(m: u32, logical_n: u32, k: u32) -> DeviceWidth {

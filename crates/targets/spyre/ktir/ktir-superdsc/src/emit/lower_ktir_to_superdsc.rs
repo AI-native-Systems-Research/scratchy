@@ -56,7 +56,7 @@ use crate::reserved_tids::{
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
-use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK};
+use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
@@ -3944,30 +3944,14 @@ pub fn matmul_oriented(
     // zero-pad so the staged buffer matches the emitted device width). The kernel's extra (n_dev − n)
     // columns are ZERO; the SubtileIR/manifest LOGICAL shape stays `n`; the host reads the leading
     // `vocab = n` (contiguous, m=1). ONLY the on-device layout uses `n_dev` (a whole stick by construction).
-    // TYPE-SAFE device width (the padding/alignment invariant): `DeviceWidth::for_output` is the SOLE
-    // rule, SHARED with the worker's weight zero-pad + `kernel0`, so they cannot diverge.
-    let mut n_dev = DeviceWidth::for_output(m, n, k).get();
-    // ⛔ A WHOLE-FUNCTION WINDOWED PROGRAM MAY NOT TAKE A PAD ITS PARAMETER WINDOWS CANNOT HOLD.
-    //
-    // `bump_sticks_to_splittable` decides the pad from the STICK COUNT alone (n=64 is one stick ⇒
-    // bumps to 512), but guard #11's own floor test is `CoreSplit::plan(m, n_dev)` — a split that
-    // ROW-SPLITS first. At m=64, n=64 the LOGICAL width already gives `plan(64,64) = 32 cores`: the
-    // util floor is met and the pad is spurious. And on a whole-function program the padded weight
-    // columns are read from the CALLER'S windows: the last `[k, 64]` n-window of a `[4096, 12800]`
-    // weight at `n_dev = 512` reads columns 12544..13056 of a 12800-wide placement — MEASURED as
-    // `resolve_seg_base`'s refusal on granite tiled_k BLOCK_N=64 (`t1: 103022592B + 2097152B exceeds
-    // footprint 104857600B`). The staged-buffer contract the bump exists for (the worker's weight
-    // zero-pad makes the pad real) does not exist here — the second party on this door is the mint,
-    // and the mint only ever sees ONE window.
-    //
-    // So the pad is dropped under exactly `out_width_the_weight_holds`'s own discipline: only when
-    // the LOGICAL width still meets the util floor the pad was buying (the same `floor_ok` the base
-    // emission's cap re-checks), so a width that genuinely needs the pad keeps it and reaches the
-    // windowed arm's own pad refusal by name. No-op for every staged program (their widths come
-    // pre-padded from `for_output` and their weights' placements hold the pad by contract).
-    if windowed_program && n_dev > n && CoreSplit::plan(m, n).ncores() >= 8 {
-        n_dev = n;
-    }
+    // TYPE-SAFE device width (the padding/alignment invariant): `DeviceWidth::for_matmul` is the
+    // SOLE rule for this door, SHARED with the intermediate's reservation in the whole-function
+    // walk — the same `m, n, k, windowed` facts, so the buffer the mint reserves and the width the
+    // emitter writes cannot disagree (issue 201 item 4: they previously over-reserved 8× on
+    // granite tiled_k). `windowed_program` carries whether the padded weight columns would be read
+    // from the caller's parameter windows — the one fact the staged-buffer contract of
+    // `for_output` does not hold here.
+    let n_dev = DeviceWidth::for_matmul(m, n, k, windowed_program).get();
     let macs = m as u64 * n_dev as u64 * k as u64;
     // ── GUARD #11 (util floor) computed on the PROVEN partition `CoreSplit::plan` (Kani: disjoint +
     //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for
@@ -3975,7 +3959,7 @@ pub fn matmul_oriented(
     //    exists to fix; the padding above is what fills them for a prime-stick output. ──
     let sp = CoreSplit::plan(m, n_dev);
     let cores = sp.ncores();
-    if macs >= (1 << 20) && cores < 8 {
+    if macs >= (1 << 20) && cores < UTIL_FLOOR_CORES {
         return err(format!(
             "MatmulTile t{}: {m}×{n_dev}×{k} ({macs} MACs) CoreSplit-divided onto only {cores} \
              core(s) — below the util floor; the OUTPUT stick count is not splittable to ≥8 even \
