@@ -32,6 +32,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// HEAD_DIMs (BD template arg of `attention_paged<...>` in
 /// `mlx_steel_attn/steel_attention_paged_kernel.h`) instantiated in
@@ -161,63 +162,78 @@ fn main() {
         .collect();
     entries.sort();
 
-    for shader in &entries {
-        let stem = shader.file_stem().unwrap().to_str().unwrap();
-        let air = out_dir.join(format!("{stem}.air"));
-        let metallib = out_dir.join(format!("{stem}.metallib"));
+    // Each shader is an independent compile, and this step gates every crate
+    // downstream, so run up to cargo's `-j` of them at once. A panic in any
+    // worker still fails the build: the scope re-raises it on exit.
+    let jobs: usize = std::env::var("NUM_JOBS").unwrap().parse().unwrap();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..jobs.min(entries.len()) {
+            s.spawn(|| {
+                while let Some(shader) = entries.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    compile_shader(shader, &out_dir, &shader_dir);
+                }
+            });
+        }
+    });
+}
 
-        // MSL → AIR. `-O3` and `-frecord-sources=flat` so debug
-        // captures retain source mapping; matches what MLX ships.
-        // `-I OUT_DIR` so codegen-emitted headers (e.g.
-        // `attention_steel_paged_instantiations.h`) resolve.
-        //
-        // MPP/NAX shaders additionally need
-        // `-fno-fast-math -mmacosx-version-min=26.2 -std=metal4.0` to
-        // dodge the SDK-26.5 `matmul2d` miscompile (see `reaches_mpp`).
-        // Without `-mmacosx-version-min=26.2` the embedded
-        // `affine_qmm_t_nax_*` metallib is ~95% wrong.
-        let mut cmd = Command::new("xcrun");
-        cmd.args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat"]);
-        // Only compile the sampler's telemetry-spill params/entropy when the
-        // `sampler-telemetry` feature is on, so a plain engine kernel is
-        // byte-identical to before (see #ifdef in sampling.metal).
-        if std::env::var_os("CARGO_FEATURE_SAMPLER_TELEMETRY").is_some() {
-            cmd.arg("-DSCRATCHY_SAMPLER_TELEMETRY");
-        }
-        if reaches_mpp(shader, &[&out_dir, &shader_dir], &mut HashSet::new()) {
-            let (major, minor) = MIN_MACOS;
-            cmd.arg("-fno-fast-math")
-                .arg(format!("-mmacosx-version-min={major}.{minor}"))
-                .arg("-std=metal4.0");
-        }
-        let status = cmd
-            .arg("-I")
-            .arg(&out_dir)
-            // `-I shaders` so headers in subdirs (mlx_steel_attn/) can
-            // include top-level shader headers like `metal_nax.h`.
-            .arg("-I")
-            .arg(&shader_dir)
-            .arg("-c")
-            .arg(shader)
-            .arg("-o")
-            .arg(&air)
-            .status()
-            .unwrap_or_else(|e| panic!("spawn `xcrun metal` failed: {e}"));
-        if !status.success() {
-            panic!("`xcrun metal` failed for {}", shader.display());
-        }
+fn compile_shader(shader: &Path, out_dir: &Path, shader_dir: &Path) {
+    let stem = shader.file_stem().unwrap().to_str().unwrap();
+    let air = out_dir.join(format!("{stem}.air"));
+    let metallib = out_dir.join(format!("{stem}.metallib"));
 
-        // AIR → metallib.
-        let status = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metallib"])
-            .arg(&air)
-            .arg("-o")
-            .arg(&metallib)
-            .status()
-            .unwrap_or_else(|e| panic!("spawn `xcrun metallib` failed: {e}"));
-        if !status.success() {
-            panic!("`xcrun metallib` failed for {}", shader.display());
-        }
+    // MSL → AIR. `-O3` and `-frecord-sources=flat` so debug
+    // captures retain source mapping; matches what MLX ships.
+    // `-I OUT_DIR` so codegen-emitted headers (e.g.
+    // `attention_steel_paged_instantiations.h`) resolve.
+    //
+    // MPP/NAX shaders additionally need
+    // `-fno-fast-math -mmacosx-version-min=26.2 -std=metal4.0` to
+    // dodge the SDK-26.5 `matmul2d` miscompile (see `reaches_mpp`).
+    // Without `-mmacosx-version-min=26.2` the embedded
+    // `affine_qmm_t_nax_*` metallib is ~95% wrong.
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat"]);
+    // Only compile the sampler's telemetry-spill params/entropy when the
+    // `sampler-telemetry` feature is on, so a plain engine kernel is
+    // byte-identical to before (see #ifdef in sampling.metal).
+    if std::env::var_os("CARGO_FEATURE_SAMPLER_TELEMETRY").is_some() {
+        cmd.arg("-DSCRATCHY_SAMPLER_TELEMETRY");
+    }
+    if reaches_mpp(shader, &[out_dir, shader_dir], &mut HashSet::new()) {
+        let (major, minor) = MIN_MACOS;
+        cmd.arg("-fno-fast-math")
+            .arg(format!("-mmacosx-version-min={major}.{minor}"))
+            .arg("-std=metal4.0");
+    }
+    let status = cmd
+        .arg("-I")
+        .arg(out_dir)
+        // `-I shaders` so headers in subdirs (mlx_steel_attn/) can
+        // include top-level shader headers like `metal_nax.h`.
+        .arg("-I")
+        .arg(shader_dir)
+        .arg("-c")
+        .arg(shader)
+        .arg("-o")
+        .arg(&air)
+        .status()
+        .unwrap_or_else(|e| panic!("spawn `xcrun metal` failed: {e}"));
+    if !status.success() {
+        panic!("`xcrun metal` failed for {}", shader.display());
+    }
+
+    // AIR → metallib.
+    let status = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metallib"])
+        .arg(&air)
+        .arg("-o")
+        .arg(&metallib)
+        .status()
+        .unwrap_or_else(|e| panic!("spawn `xcrun metallib` failed: {e}"));
+    if !status.success() {
+        panic!("`xcrun metallib` failed for {}", shader.display());
     }
 }
 
