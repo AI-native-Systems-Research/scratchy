@@ -111,8 +111,11 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
         a.expr(AffineExpr::Dim(0)),
     ));
     let ops = vec![
-        Operation::new(a, Some(zero), OpKind::ArithConstant, &[])
-            .with_attr(a, AttrKey::Value, Attr::Int(0)),
+        Operation::new(a, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+            a,
+            AttrKey::Value,
+            Attr::Int(0),
+        ),
         // P: [8, 64]
         shape(
             Operation::new(a, Some(v_a), OpKind::KtdpConstructMemoryView, &[p_p]),
@@ -120,11 +123,20 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             K,
         ),
         shape(
-            Operation::new(a, Some(t_a), OpKind::KtdpConstructAccessTile, &[v_a, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_a),
+                OpKind::KtdpConstructAccessTile,
+                &[v_a, zero, zero],
+            ),
             M,
             K,
         ),
-        shape(Operation::new(a, Some(val_a), OpKind::KtdpLoad, &[t_a]), M, K),
+        shape(
+            Operation::new(a, Some(val_a), OpKind::KtdpLoad, &[t_a]),
+            M,
+            K,
+        ),
         // V: [128, 64] — the table.
         shape(
             Operation::new(a, Some(v_v), OpKind::KtdpConstructMemoryView, &[p_v]),
@@ -132,17 +144,31 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             HEAD,
         ),
         shape(
-            Operation::new(a, Some(t_v), OpKind::KtdpConstructAccessTile, &[v_v, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_v),
+                OpKind::KtdpConstructAccessTile,
+                &[v_v, zero, zero],
+            ),
             V,
             HEAD,
         ),
-        shape(Operation::new(a, Some(val_v), OpKind::KtdpLoad, &[t_v]), V, HEAD),
+        shape(
+            Operation::new(a, Some(val_v), OpKind::KtdpLoad, &[t_v]),
+            V,
+            HEAD,
+        ),
         // ids: [64] i32 — the index vector.
         Operation::new(a, Some(v_i), OpKind::KtdpConstructMemoryView, &[p_ids])
             .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![K])))
             .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::I32)),
         shape(
-            Operation::new(a, Some(t_i), OpKind::KtdpConstructAccessTile, &[v_i, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_i),
+                OpKind::KtdpConstructAccessTile,
+                &[v_i, zero, zero],
+            ),
             K,
             1,
         ),
@@ -159,7 +185,12 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
         // subscript `gather_subscripts` builds, `Sym(0)` named by `intermediate_vars[0]` = the
         // zero constant — a one-block gather anchored at index word 0.
         shape(
-            Operation::new(a, Some(ind), OpKind::KtdpConstructIndirectAccessTile, &[v_v, v_i]),
+            Operation::new(
+                a,
+                Some(ind),
+                OpKind::KtdpConstructIndirectAccessTile,
+                &[v_v, v_i],
+            ),
             K,
             HEAD,
         )
@@ -169,7 +200,11 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             Attr::StrList(a.names(vec!["indirect", "direct_sub"])),
         )
         .with_attr(a, AttrKey::DimData, Attr::IntList(a.ints(vec![0, 0])))
-        .with_attr(a, AttrKey::IntermediateVars, Attr::Ssas(a.ssa(vec![zero, zero])))
+        .with_attr(
+            a,
+            AttrKey::IntermediateVars,
+            Attr::Ssas(a.ssa(vec![zero, zero])),
+        )
         .with_attr(
             a,
             AttrKey::DimSubs,
@@ -186,7 +221,11 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
                 },
             ])),
         ),
-        shape(Operation::new(a, Some(prod), OpKind::KtdpLoad, &[ind]), K, HEAD),
+        shape(
+            Operation::new(a, Some(prod), OpKind::KtdpLoad, &[ind]),
+            K,
+            HEAD,
+        ),
         // OUT: [8, 64]
         shape(
             Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
@@ -194,15 +233,29 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             HEAD,
         ),
         shape(
-            Operation::new(a, Some(t_o), OpKind::KtdpConstructAccessTile, &[v_o, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_o),
+                OpKind::KtdpConstructAccessTile,
+                &[v_o, zero, zero],
+            ),
             M,
             HEAD,
         ),
         // The zero outs.
-        shape(Operation::new(a, Some(outs), OpKind::TensorEmpty, &[]), M, HEAD),
+        shape(
+            Operation::new(a, Some(outs), OpKind::TensorEmpty, &[]),
+            M,
+            HEAD,
+        ),
         // THE CONTRACTION — plain-B, NO indexing maps: the gathered rows contracted where they lie.
         shape(
-            Operation::new(a, Some(matmul), OpKind::LinalgMatmul, &[a_operand, b_operand, outs]),
+            Operation::new(
+                a,
+                Some(matmul),
+                OpKind::LinalgMatmul,
+                &[a_operand, b_operand, outs],
+            ),
             M,
             HEAD,
         ),
@@ -286,11 +339,7 @@ fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> 
 fn alloc_address(op: &ktir_superdsc::emit::EmittedOp, tag: &str) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
-    let idx = dsc
-        .labeledDs_
-        .iter()
-        .find(|ds| ds.dsType_ == tag)?
-        .ldsIdx_;
+    let idx = dsc.labeledDs_.iter().find(|ds| ds.dsType_ == tag)?.ldsIdx_;
     let node = dsc
         .scheduleTree_
         .iter()
@@ -306,9 +355,10 @@ fn alloc_address(op: &ktir_superdsc::emit::EmittedOp, tag: &str) -> Option<u64> 
 fn value_tensor_address(op: &ktir_superdsc::emit::EmittedOp) -> Option<u64> {
     let dsc = op.dsc();
     let dsc = dsc.dscs_.first()?.values().next()?;
-    let node = dsc.scheduleTree_.iter().find(|n| {
-        n.nodeType_ == "allocate" && n.indirectAllocType_ == "value_tensor"
-    })?;
+    let node = dsc
+        .scheduleTree_
+        .iter()
+        .find(|n| n.nodeType_ == "allocate" && n.indirectAllocType_ == "value_tensor")?;
     node.startAddressCoreCorelet_
         .data_
         .get("[0, 0, 0]")?
@@ -362,9 +412,9 @@ fn the_gathered_matmul_emits_the_copy_then_the_matmul() {
             copy.op_name
         );
         let has_pair = dsc.scheduleTree_.iter().any(|n| {
-            n.indirectAllocType_ == "value_tensor"
-                && n.relatedIndirectAccessAlloc_.is_some()
-        }) && dsc.scheduleTree_
+            n.indirectAllocType_ == "value_tensor" && n.relatedIndirectAccessAlloc_.is_some()
+        }) && dsc
+            .scheduleTree_
             .iter()
             .any(|n| n.indirectAllocType_ == "index_tensor");
         assert!(

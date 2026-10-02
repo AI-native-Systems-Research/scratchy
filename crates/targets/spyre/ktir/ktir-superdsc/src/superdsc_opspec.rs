@@ -2197,7 +2197,10 @@ impl EntryBase {
 
     /// Refuse a base that is not a whole number of index sticks — see [`EntryBase::of_entries`].
     pub fn assert_stick_aligned(self) -> Result<Self, String> {
-        if self.0 % <SenUint32 as DataFormat>::ELEMS_PER_STICK != 0 {
+        if !self
+            .0
+            .is_multiple_of(<SenUint32 as DataFormat>::ELEMS_PER_STICK)
+        {
             return Err(format!(
                 "a gather run starts at entry {}, which is not a whole {}-entry `SenUint32` stick — \
                  the IBR is loaded one stick at a time, so the core would read words of two different \

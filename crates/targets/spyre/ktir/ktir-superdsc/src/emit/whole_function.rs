@@ -1468,10 +1468,11 @@ pub fn lower_function(
         {
             let Some(tv) = tile.result else { continue };
             for o in f.operations.iter() {
-                if o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&tv) {
-                    if let Some(r) = o.result {
-                        m.insert(r, i);
-                    }
+                if o.op_type == OpKind::KtdpLoad
+                    && o.operands.first() == Some(&tv)
+                    && let Some(r) = o.result
+                {
+                    m.insert(r, i);
                 }
             }
         }
@@ -1755,10 +1756,12 @@ pub fn lower_function(
             gathered_matmul_materializes(
                 k,
                 layout,
-                sym_id_base,
-                &mut out,
-                &mut next_tid,
-                &mut inter,
+                &mut GatherEmit {
+                    sym_id_base,
+                    out: &mut out,
+                    next_tid: &mut next_tid,
+                    inter: &mut inter,
+                },
                 g,
                 ti,
                 gi,
@@ -1769,7 +1772,10 @@ pub fn lower_function(
         };
         if op_gather.is_some()
             && !gathered_b
-            && !matches!(program, Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_))
+            && !matches!(
+                program,
+                Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_)
+            )
         {
             return err(format!(
                 "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` (t{} gathered through \
@@ -1793,7 +1799,9 @@ pub fn lower_function(
         // `matmul_oriented`'s `ins.len() != 2` arity check would read a three-input list as the fp8
         // W8A8 form and refuse it.
         if gathered_b {
-            let Some((_, _, gi)) = op_gather else { unreachable!("gathered_b implies op_gather") };
+            let Some((_, _, gi)) = op_gather else {
+                unreachable!("gathered_b implies op_gather")
+            };
             let b_value = in_values[gi];
             let Some(r) = inter.get(&b_value) else {
                 return err(format!(
@@ -2259,18 +2267,32 @@ fn emit_one(
 /// Returns `true` when it did the work, so the caller's refusal stands down for exactly this op.
 /// `false` is not an error: a matmul whose B is NOT the gathered table still falls to the
 /// fail-closed refusal below, with its own name in the message.
+///
+/// The emission's mutable scratch (`sym_id_base`, `out`, `next_tid`, `inter`) travels in
+/// [`GatherEmit`] rather than as four more arguments — the walk owns one of these, threading it
+/// to every materialization.
+struct GatherEmit<'a> {
+    sym_id_base: &'a mut i64,
+    out: &'a mut Vec<super::EmittedOp>,
+    next_tid: &'a mut u32,
+    inter: &'a mut std::collections::HashMap<Ssa, Region>,
+}
+
 fn gathered_matmul_materializes(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
-    sym_id_base: &mut i64,
-    out: &mut Vec<super::EmittedOp>,
-    next_tid: &mut u32,
-    inter: &mut std::collections::HashMap<Ssa, Region>,
+    emit: &mut GatherEmit<'_>,
     g: Gather,
     tile_idx: usize,
     gathered_input: usize,
     in_values: &[Ssa],
 ) -> Result<bool, Error> {
+    let GatherEmit {
+        sym_id_base,
+        out,
+        next_tid,
+        inter,
+    } = emit;
     let f = &k.func;
     // ⛔ THE GATHERED OPERAND MUST BE THE MATMUL'S **B** (input 1) — rung 4's own rule, unchanged
     // by the multi-tile reading. A gather feeding **A** is not this exception's shape: the
@@ -2360,8 +2382,8 @@ fn gathered_matmul_materializes(
             f.name
         ));
     };
-    let tid = *next_tid;
-    *next_tid += 1;
+    let tid = **next_tid;
+    **next_tid += 1;
     layout.synth(crate::place::PlaceId::Act(tid), &[rows, head]);
     let r = Region {
         tid,

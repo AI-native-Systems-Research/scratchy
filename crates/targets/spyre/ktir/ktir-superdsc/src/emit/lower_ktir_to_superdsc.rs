@@ -368,8 +368,11 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
             let kinds = tile.attr(AttrKey::DimKinds);
             let vars = tile.attr(AttrKey::IntermediateVars);
             let subs = tile.attr(AttrKey::DimSubs);
-            let (Some(Attr::StrList(kinds)), Some(Attr::Ssas(vars)), Some(Attr::AffineMapList(subs))) =
-                (kinds, vars, subs)
+            let (
+                Some(Attr::StrList(kinds)),
+                Some(Attr::Ssas(vars)),
+                Some(Attr::AffineMapList(subs)),
+            ) = (kinds, vars, subs)
             else {
                 return err(format!(
                     "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
@@ -430,18 +433,19 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         // pair really is two gathers on one descriptor-shaped program — the shape `gather_of`
         // exists to refuse — and refusing it HERE names the pair instead of letting the walk
         // half-materialize one of them.
-        if let Some(first) = out.first() {
-            if first.index_tid != index_tid || first.value_tid != value_tid {
-                return err(format!(
-                    "{}: {} `ktdp.construct_indirect_access_tile` op(s) over {} different \
-                     index/value parameter pairs — one descriptor carries ONE index operand \
-                     (DSC2ToDataflowIR.cpp:51), so gathers over different buffers need one node \
-                     per gather. Tiles over the SAME pair (an unrolled sweep's trips) are fine.",
-                    f.name,
-                    tile_count,
-                    out.len() + 1
-                ));
-            }
+        if out
+            .first()
+            .is_some_and(|first| first.index_tid != index_tid || first.value_tid != value_tid)
+        {
+            return err(format!(
+                "{}: {} `ktdp.construct_indirect_access_tile` op(s) over {} different \
+                 index/value parameter pairs — one descriptor carries ONE index operand \
+                 (DSC2ToDataflowIR.cpp:51), so gathers over different buffers need one node \
+                 per gather. Tiles over the SAME pair (an unrolled sweep's trips) are fine.",
+                f.name,
+                tile_count,
+                out.len() + 1
+            ));
         }
         out.push(Gather {
             index_tid,
@@ -3984,10 +3988,7 @@ pub fn matmul_oriented(
     // emission's cap re-checks), so a width that genuinely needs the pad keeps it and reaches the
     // windowed arm's own pad refusal by name. No-op for every staged program (their widths come
     // pre-padded from `for_output` and their weights' placements hold the pad by contract).
-    if windowed_program
-        && n_dev > n
-        && CoreSplit::plan(m, n).ncores() >= 8
-    {
+    if windowed_program && n_dev > n && CoreSplit::plan(m, n).ncores() >= 8 {
         n_dev = n;
     }
     let macs = m as u64 * n_dev as u64 * k as u64;

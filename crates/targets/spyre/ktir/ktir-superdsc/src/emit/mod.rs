@@ -956,9 +956,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 // MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry `SenUint32`
                 // stick further on than leg `k-1`'s, for all eight. The anchor's stick alignment
                 // was checked at the uncut arm above; `k·cap` is a whole stick by construction.
-                first_entry: crate::superdsc_opspec::EntryBase::of_entries(
-                    first_entry + k * cap,
-                ),
+                first_entry: crate::superdsc_opspec::EntryBase::of_entries(first_entry + k * cap),
                 o_name: o.name(),
                 head_major,
             },
