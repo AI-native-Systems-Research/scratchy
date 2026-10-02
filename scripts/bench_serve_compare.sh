@@ -291,6 +291,8 @@ print("TTFT/TPOT are per-request medians (ms). gen/req = mean generated")
 print("tokens per request — mlx-lm ignores `ignore_eos`, so it under-")
 print("generates; E2E* = ttft + (out-1)*tpot is the work-normalized")
 print("end-to-end estimate that stays fair under early EOS.")
+print("\"N unstreamed\": requests that arrived in one chunk, left out of TTFT/TPOT")
+print("(— when all were).")
 print()
 hdr = ["cell (in×out×conc)"]
 for b in backends:
@@ -302,7 +304,18 @@ print("| " + " | ".join(hdr) + " |")
 print("|" + "---|" * len(hdr))
 
 def e2e_star(d, out_len):
+    # null TTFT/TPOT: every request was unstreamed, nothing to estimate from.
+    if d["median_ttft_ms"] is None or d["median_tpot_ms"] is None:
+        return None
     return d["median_ttft_ms"] + (out_len - 1) * d["median_tpot_ms"]
+
+def ms(v, nd):
+    return "—" if v is None else f"{v:.{nd}f}"
+
+def caveat(d):
+    # Unstreamed requests are left out of TTFT/TPOT.
+    un = d.get("unstreamed_requests") or 0
+    return f" ({un} unstreamed)" if un else ""
 
 for cell in cells:
     il, ol, conc = (int(x) for x in cell.split("x"))
@@ -316,13 +329,13 @@ for cell in cells:
             continue
         gen = d["total_output_tokens"] / max(d["completed"], 1)
         row += [
-            f"{d['median_ttft_ms']:.0f}",
-            f"{d['median_tpot_ms']:.1f}",
+            ms(d["median_ttft_ms"], 0),
+            ms(d["median_tpot_ms"], 1) + caveat(d),
             f"{gen:.0f}/{ol}",
         ]
-    if len(backends) == 2 and all(datas):
-        ratio = e2e_star(datas[1], ol) / e2e_star(datas[0], ol)
-        row += [f"{ratio:.2f}×"]
+    stars = [e2e_star(d, ol) for d in datas] if all(datas) else []
+    if len(backends) == 2 and all(stars):
+        row += [f"{stars[1] / stars[0]:.2f}×"]
     elif len(backends) == 2:
         row += ["—"]
     print("| " + " | ".join(row) + " |")

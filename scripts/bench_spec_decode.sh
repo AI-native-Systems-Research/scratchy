@@ -205,7 +205,9 @@ import json, sys
 label, path = sys.argv[1], sys.argv[2]
 with open(path) as f:
     d = json.load(f)
-def g(k): return d.get(k, "")
+def g(k):
+    v = d.get(k)
+    return "—" if v is None else v
 print(f"| {label} | {g('request_throughput')} | {g('output_throughput')} | {g('mean_ttft_ms')} | {g('mean_tpot_ms')} |")
 PY
         else
