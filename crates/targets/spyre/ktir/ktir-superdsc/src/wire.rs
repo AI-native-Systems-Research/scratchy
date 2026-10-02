@@ -592,7 +592,16 @@ pub fn gen_coord_info_value(
                     {"factor_": nsplits, "label_": "core_fold"},
                     {"factor_": 1, "label_": "corelet_fold"},
                     {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": if is_stick_reduction { 1 } else { size / elems_per_stick }, "label_": "elem_arr_1"},
+                    // ⛔ CEILING, NOT FLOOR — the vendor's compute_ops.py emits
+                    // `-(-size // elems_per_stick)` here, never 0: a stick-dim extent
+                    // SMALLER than one stick (the gather's U32 index tensor: mb=4
+                    // against elems_per_stick=32) folds to 1, not 0. The dev stack's
+                    // SDSC-JSON validator rejects factor_ < 1 ("Must be >= 1"), which
+                    // is how the floored port surfaced on the gemma-4 bake. Python's
+                    // `//` floors, so its double-negation is a ceiling — Rust's `/`
+                    // truncates toward zero, making the same spelling a floor again;
+                    // `div_ceil` says it outright.
+                    {"factor_": if is_stick_reduction { 1 } else { (size + elems_per_stick - 1) / elems_per_stick }, "label_": "elem_arr_1"},
                     {"factor_": elems_per_stick, "label_": "elem_arr_0"},
                 ],
             },
