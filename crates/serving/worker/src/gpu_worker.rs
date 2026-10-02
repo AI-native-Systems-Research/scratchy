@@ -2833,7 +2833,27 @@ impl Worker for MetalWorker {
             hf_fp,
         )
         .map_err(|e| ExecutorError::WorkerInit(format!("scratchy-forward-compiler load: {e}")))?
-        .ok_or_else(|| ExecutorError::ArchNotSupported(arch.clone()))?;
+        // `try_load` returns `Ok(None)` both when NOTHING claims the arch and
+        // when the arch is compiled but every variant's `fingerprint_matches`
+        // rejected this checkpoint. Reporting the second as "unsupported arch"
+        // sends the reader hunting for a missing backend when the real cause is
+        // that no compiled `(stem, preset)` pair describes the checkpoint on
+        // disk — e.g. a 4-bit MLX repo against a build whose only quant preset
+        // claims 8-bit router gates (#202). Separate the two.
+        .ok_or_else(|| {
+            if scratchy_forward_compiler::arch_is_registered(arch.as_str(), 1) {
+                ExecutorError::WorkerInit(format!(
+                    "arch `{arch}` IS compiled, but no compiled model variant matches this \
+                     checkpoint: its shapes or quantization layout differ from every \
+                     (model stem, quant preset) pair in this build. Check that the build names \
+                     this checkpoint's stem (`model/<stem>`) and, for a quantized repo, a quant \
+                     preset describing its actual on-disk widths (`quant/<preset>`, declared in \
+                     crates/models/arch/configs/<arch>/quantizations.json).",
+                ))
+            } else {
+                ExecutorError::ArchNotSupported(arch.clone())
+            }
+        })?;
 
         info!(
             "ScratchyWorker(metal): try_load in {:?} ({} via scratchy-forward-compiler, {})",

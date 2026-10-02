@@ -827,6 +827,46 @@ pub fn load_file(path: &Path) -> Result<ModelParams, ConfigError> {
     )
 }
 
+/// Load a single config.json with one quant preset deep-merged onto it —
+/// the `(size, preset)` variant the overlay-synthesis loop in [`load_dir`]
+/// builds, reachable one pair at a time.
+///
+/// Test-only, and for the same reason [`load_file`] is: a proc-macro crate has
+/// no model/quant features, so `load_dir` selects ZERO configs there and any
+/// test iterating its result passes vacuously. Naming the base and the preset
+/// explicitly skips the build's scope. Mirrors the synthesis order exactly
+/// (base → preset) AND loads the arch's own [`load_arch_json`] spec, so what
+/// comes back is what a real build would compile — including arch-level facts
+/// like `decoder_safetensors_prefix`, which a `DeclaredArchSpec::default()`
+/// would silently drop and leave tests asserting against the wrong on-disk
+/// tensor names.
+#[cfg(test)]
+pub fn load_file_with_preset(
+    config_path: &Path,
+    preset_path: &Path,
+) -> Result<ModelParams, ConfigError> {
+    let (_, mut json) = read_json_file(config_path)?;
+    let (_, preset_json) = read_json_file(preset_path)?;
+    deep_merge(&mut json, &preset_json);
+    let base_stem = stem_of(config_path)?;
+    let preset_stem = stem_of(preset_path)?;
+    let variant_stem = format!("{base_stem}-{preset_stem}");
+    let dir = config_path
+        .parent()
+        .ok_or_else(|| ConfigError::NotADirectory(config_path.to_path_buf()))?;
+    // `<variant_stem>.overrides.json` deep-merges LAST, same as synthesis. This
+    // is where per-(stem, preset) bit-map drift lives — omitting it would hand a
+    // test the arch-wide preset's map and quietly assert against widths the
+    // build never compiles.
+    let override_path = dir.join(format!("{variant_stem}.overrides.json"));
+    if override_path.exists() {
+        let (_, override_json) = read_json_file(&override_path)?;
+        deep_merge(&mut json, &override_json);
+    }
+    let spec = load_arch_json(dir)?;
+    model_params_from_json(&json, &variant_stem, config_path, Vec::new(), &spec)
+}
+
 /// Read + parse a JSON file, returning the raw string (for
 /// diagnostics) and the parsed `Value`. Centralized so
 /// `ConfigError::{Io, Json}` always carry the right path.

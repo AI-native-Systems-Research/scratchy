@@ -1839,6 +1839,13 @@ fn collect_accessors(
 ///    (granite 3.0 vs 3.1 vs 3.3; phi-4 vs phi-4-reasoning) — see
 ///    the `rope_theta_check` comment for why guessing wrong here is
 ///    silent rather than loud.
+/// 7. **Per-role affine bit widths**. For MLX-affine variants, every
+///    quantized weight under the decoder root must be packed at the
+///    width this variant's baked bit map (`bits` + `bits_overrides`
+///    / `per_module`) claims for its role. The only discriminator
+///    for variants differing solely in that map — qwen3.5 vs
+///    qwen3.6 35B-A3B, whose gates are 4- vs 8-bit with every other
+///    axis identical. See the `affine_bit_map_gate` comment.
 fn emit_fingerprint_check(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
@@ -2288,6 +2295,84 @@ fn emit_fingerprint_check(
         }
     };
 
+    // Per-role affine BIT-WIDTH gate. The group-size gate above probes one
+    // tensor at one width; this one bakes the variant's WHOLE bit map and
+    // checks every affine weight under the decoder root against it.
+    //
+    // ⛔ THE ONLY DISCRIMINATOR FOR VARIANTS THAT DIFFER ONLY IN `bits_overrides`
+    // / `per_module`. `Qwen3.5-35B-A3B-4bit` and `Qwen3.6-35B-A3B-4bit` agree on
+    // every other axis here — hidden 2048, 40 layers, 256 experts, vocab 248320,
+    // g64, no declared `rope_scaling` or top-level `rope_theta` — and differ only
+    // in `mlp.gate` + `mlp.shared_expert_gate` being 4-bit on 3.5 and 8-bit on
+    // 3.6. Without this gate the alphabetically-earlier variant claims both, and
+    // the mismatch surfaces as a shape `ensure!` deep inside
+    // `affine_dequant_b4_bytes` rather than as a rejection (#202).
+    //
+    // The table must describe the variant's FULL map, not just the roles it
+    // overrides: a uniform-bits variant has no overrides at all, so a probe set
+    // built from override keys alone would make the check one-directional and the
+    // uniform variant would still accept an overridden checkpoint. Baking the
+    // section default as a catch-all row makes it symmetric.
+    //
+    // `per_module` (MLX mixed/dynamic, OptiQ) keys are exact on-disk paths and
+    // take precedence over the preset suffix map — the same order
+    // `affine_role_bits` resolves in. Rows that merely restate the section
+    // default are dropped, since the catch-all already answers for them.
+    let affine_bit_map_gate: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Affine {
+            bits,
+            group_size,
+            bits_overrides,
+            per_module,
+            ..
+        }) => {
+            // Loader-fixed widths come FIRST: for these roles the loader passes
+            // a literal width and never consults the variant's map, so the map
+            // is silent about them and reading it as exhaustive would
+            // false-reject (gemma-4-26b-a4b's 8-bit router against a 4-bit
+            // preset). Table, not a match arm — see `LOADER_FIXED_AFFINE_BITS`.
+            let mut rows: Vec<(String, u32, u32)> = crate::quantization::LOADER_FIXED_AFFINE_BITS
+                .iter()
+                .map(|&(role, b)| (role.to_string(), b, *group_size))
+                .collect();
+            rows.extend::<Vec<(String, u32, u32)>>(if per_module.is_empty() {
+                bits_overrides
+                    .iter()
+                    // Keys are DOT-ANCHORED so `.mlp.gate_proj` cannot alias
+                    // into `…mlp.switch_mlp.gate_proj`, whose bits the loader
+                    // resolves by infix (`affine_moe_expert_bits`) and leaves at
+                    // the section default. See `affine_role_width`.
+                    .map(|(suffix, b)| (format!(".{suffix}"), *b, *group_size))
+                    .filter(|&(_, b, g)| (b, g) != (*bits, *group_size))
+                    .collect()
+            } else {
+                per_module
+                    .iter()
+                    .map(|(path, (b, g))| (path.clone(), *b, *g))
+                    .filter(|&(_, b, g)| (b, g) != (*bits, *group_size))
+                    .collect()
+            });
+            rows.push((String::new(), *bits, *group_size));
+            let row_toks = rows.iter().map(|(key, b, g)| {
+                let key = proc_macro2::Literal::string(key);
+                let b = proc_macro2::Literal::u32_unsuffixed(*b);
+                let g = proc_macro2::Literal::u32_unsuffixed(*g);
+                quote! { (#key, #b, #g) }
+            });
+            // Scoped to the decoder root the rest of the fingerprint already
+            // uses, so a separately quantized sibling tower (`vision_tower.*`)
+            // — which this variant never loads — can't false-reject it.
+            let scan_prefix = format!("{dec_root}.");
+            quote! {
+                const __AFFINE_BIT_MAP: &[(&str, u32, u32)] = &[#(#row_toks),*];
+                if !gw.affine_widths_agree(#scan_prefix, __AFFINE_BIT_MAP) {
+                    return false;
+                }
+            }
+        }
+        _ => quote! {},
+    };
+
     // Backing-store reject: every non-Ggml variant must reject a
     // GGUF-backed `GpuWeights`, and the Ggml variant must require
     // one. Without this the dense variant's shape-only fingerprint
@@ -2571,6 +2656,11 @@ fn emit_fingerprint_check(
             // q_proj. See `emit_fingerprint_check` for the rationale.
             #mlx_marker_check
             #qweight_shape_gate
+            // Per-role affine bit widths — the only thing separating two
+            // variants whose configs differ solely in `bits_overrides` /
+            // `per_module` (qwen3.5 vs qwen3.6 35B-A3B). See
+            // `emit_fingerprint_check`.
+            #affine_bit_map_gate
             #is_gguf_gate
             #g_idx_disambiguation
             #input_scale_disambiguation
@@ -14297,6 +14387,20 @@ mod fingerprint_tests {
         crate::config::load_file(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()))
     }
 
+    /// Load ONE synthesized `(stem, preset)` quant variant — the same deep
+    /// merge `load_dir`'s overlay loop performs, for one pair. Same reason
+    /// [`config_of`] bypasses `load_dir`: a proc-macro crate has no quant
+    /// features, so the overlay loop synthesizes nothing here.
+    fn variant_of(arch: &str, stem: &str, preset: &str) -> crate::config::ModelParams {
+        let config = arch_configs(arch).join(format!("{stem}.json"));
+        let preset_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/quantization/presets")
+            .join(format!("{preset}.json"));
+        crate::config::load_file_with_preset(&config, &preset_path).unwrap_or_else(|e| {
+            panic!("load {} + {}: {e}", config.display(), preset_path.display())
+        })
+    }
+
     /// The `rope_theta` literal a variant's fingerprint gates on, if any.
     /// Parsed back out of the emitted token stream so the assertion is about
     /// what the generated code will actually compare, not about our intent.
@@ -14376,6 +14480,200 @@ mod fingerprint_tests {
         assert!(
             emitted_rope_theta(&model, "llama").is_none(),
             "a config with no declared rope_theta must not gate on one",
+        );
+    }
+
+    /// The affine bit-map rows a variant's fingerprint bakes, parsed back out
+    /// of the emitted token stream so the assertion is about what the generated
+    /// code will actually compare rather than about our intent.
+    ///
+    /// `quote`'s stringification spaces tokens out:
+    /// `& [(".mlp.gate" , 8 , 64) , ("" , 4 , 64)]`.
+    fn emitted_affine_bit_map(
+        model: &crate::config::ModelParams,
+        arch: &str,
+    ) -> Vec<(String, u32, u32)> {
+        let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
+            .expect("load weights manifest");
+        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
+        let table = ts
+            .split("__AFFINE_BIT_MAP : & [(& str , u32 , u32)] = & [")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no affine bit map emitted, got:\n{ts}"));
+        let table = &table[..table.find(']').expect("table is bracket-terminated")];
+        table
+            .split(") , (")
+            .map(|row| {
+                let row = row.trim_start_matches('(').trim_end_matches(')');
+                let mut parts = row.split(" , ");
+                let key = parts.next().expect("row has a key").trim();
+                let bits = parts.next().expect("row has bits").trim();
+                let group_size = parts.next().expect("row has a group size").trim();
+                (
+                    key.trim_matches('"').to_string(),
+                    bits.parse().expect("bits literal parses"),
+                    group_size.parse().expect("group_size literal parses"),
+                )
+            })
+            .collect()
+    }
+
+    /// The subtree prefix a variant's affine bit-map gate scans, read back out
+    /// of the emitted call.
+    fn emitted_affine_scan_prefix(model: &crate::config::ModelParams, arch: &str) -> String {
+        let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
+            .expect("load weights manifest");
+        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
+        let tail = ts
+            .split("gw . affine_widths_agree (")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no affine bit-map gate emitted, got:\n{ts}"));
+        let lit = &tail[..tail.find(',').expect("call has a second argument")];
+        lit.trim().trim_matches('"').to_string()
+    }
+
+    /// ⛔ A WRONG PREFIX MAKES THE GATE SILENTLY VACUOUS. The scan is permissive
+    /// on absence by design, so a prefix that matches no tensor name rejects
+    /// nothing and every bit-map assertion still passes while the collision is
+    /// wide open. Qwen3.5 nests its decoder under `language_model.*` on disk
+    /// (`decoder_safetensors_prefix` in arch.json), so the prefix has to be the
+    /// namespace-wrapped `language_model.model.` — not `model.`, and not the
+    /// bare `language_model.`.
+    #[test]
+    fn the_affine_bit_map_gate_scans_the_real_decoder_root() {
+        let uniform = variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", "mlx-affine-b4-g64-qembed");
+        assert_eq!(
+            emitted_affine_scan_prefix(&uniform, "qwen3-5-moe"),
+            "language_model.model.",
+            "the scan prefix must be a real on-disk prefix of this arch's decoder tensors; \
+             anything else makes the gate a no-op",
+        );
+
+        // An arch with no `decoder_safetensors_prefix` keeps the plain root.
+        let llama = variant_of("llama", "smollm2-135m", "mlx-affine-b4-g64-qembed");
+        assert_eq!(
+            emitted_affine_scan_prefix(&llama, "llama"),
+            "model.",
+            "an unprefixed arch scans `model.`",
+        );
+    }
+
+    /// ⛔ THE REGRESSION THIS GATE EXISTS FOR (#202). The two in-tree
+    /// qwen3-5-moe stems are byte-identical on every other fingerprint axis —
+    /// same hidden size, layer count, expert count, vocab, group size, no
+    /// `rope_scaling` and no top-level `rope_theta` — and their real checkpoints
+    /// (`Qwen3.5-35B-A3B-4bit`, `Qwen3.6-35B-A3B-4bit`) differ only in
+    /// `mlp.gate` + `mlp.shared_expert_gate` being 4-bit on 3.5 and 8-bit on
+    /// 3.6, which 3.6 declares through its `.overrides.json`.
+    ///
+    /// Before this gate nothing in `fingerprint_matches` read the bit map, so
+    /// the alphabetically-earlier variant claimed BOTH checkpoints and the loser
+    /// surfaced as `affine_dequant_b4: scales shape [256, 32] != [256, N]` from
+    /// inside a dequant helper, far from the cause.
+    #[test]
+    fn the_two_qwen3_5_moe_stems_bake_different_affine_bit_maps() {
+        let uniform = variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", "mlx-affine-b4-g64-qembed");
+        let gate8 = variant_of("qwen3-5-moe", "qwen3.6-35b-a3b", "mlx-affine-b4-g64-qembed");
+
+        // The premise: nothing else can tell them apart.
+        for key in [
+            "hidden_size",
+            "num_hidden_layers",
+            "vocab_size",
+            "num_experts",
+        ] {
+            assert_eq!(
+                uniform.bounds.get(key),
+                gate8.bounds.get(key),
+                "premise broken: the two stems now differ in {key}, so this test is no \
+                 longer exercising the collision the bit-map gate was added for",
+            );
+        }
+
+        let uniform_map = emitted_affine_bit_map(&uniform, "qwen3-5-moe");
+        let gate8_map = emitted_affine_bit_map(&gate8, "qwen3-5-moe");
+        assert_ne!(
+            uniform_map, gate8_map,
+            "the two presets must bake DIFFERENT affine bit maps — equal maps mean both \
+             variants accept the other's checkpoint and the #202 collision is back",
+        );
+
+        // Every affine variant leads with the loader-fixed rows
+        // (`LOADER_FIXED_AFFINE_BITS`), which are arch-agnostic and inert here —
+        // qwen3-5-moe ships no `router.proj`, and an absent role is permissive.
+        // Drop them so this test stays about the PRESET-derived rows.
+        let preset_rows = |map: Vec<(String, u32, u32)>| -> Vec<(String, u32, u32)> {
+            map.into_iter()
+                .filter(|(key, _, _)| {
+                    !crate::quantization::LOADER_FIXED_AFFINE_BITS
+                        .iter()
+                        .any(|(fixed, _)| fixed == key)
+                })
+                .collect()
+        };
+
+        // 3.5 takes the arch-wide preset unmodified (no overrides file), so its
+        // only preset-derived row is the catch-all carrying the section default.
+        assert_eq!(
+            preset_rows(uniform_map),
+            vec![(String::new(), 4, 64)],
+            "the 3.5 variant must bake the 4-bit/g64 section default as a catch-all; that \
+             catch-all is what makes the gate REJECT the 8-bit-gate 3.6 checkpoint rather \
+             than shrug at a role it has no override for",
+        );
+        // 3.6's `.overrides.json` adds the two gate widths, dot-anchored, ahead
+        // of the default.
+        assert_eq!(
+            preset_rows(gate8_map),
+            vec![
+                (".mlp.gate".to_string(), 8, 64),
+                (".mlp.shared_expert_gate".to_string(), 8, 64),
+                (String::new(), 4, 64),
+            ],
+            "the 3.6 variant must bake its two 8-bit router-gate roles, dot-anchored, \
+             ahead of the 4-bit catch-all — this is what its `.overrides.json` is for",
+        );
+    }
+
+    /// ⛔ THE FALSE-REJECT THE LOADER-FIXED TABLE EXISTS FOR.
+    /// `mlx-community/gemma-4-26b-a4b-it-4bit` ships `router.proj` at 8-bit
+    /// while every other role in it is 4-bit, and both backends' router loaders
+    /// hardcode that 8 (`Gemma4RouterOps::load`) instead of reading the
+    /// variant's map. The in-tree `gemma-4-26b-a4b-it.json` is a DENSE base with
+    /// no quantization block, so the synthesized `mlx-affine-b4-g64` variant's
+    /// map says "4-bit everywhere" — correct for the loader, which never asks,
+    /// and a trap for a gate that reads the map as exhaustive. Without the
+    /// loader-fixed row the gate computes `router.proj` at 4-bit and rejects a
+    /// checkpoint that loads fine today.
+    #[test]
+    fn the_gemma4_moe_router_is_gated_at_the_width_its_loader_hardcodes() {
+        let uniform = variant_of("gemma4-moe", "gemma-4-26b-a4b-it", "mlx-affine-b4-g64");
+
+        // The premise: the preset says nothing about the router.
+        match uniform.quantization.as_ref().map(|qc| &qc.method) {
+            Some(crate::quantization::QuantMethod::Affine {
+                bits,
+                bits_overrides,
+                per_module,
+                ..
+            }) => {
+                assert_eq!(*bits, 4, "premise broken: this preset is no longer 4-bit");
+                assert!(
+                    !bits_overrides.iter().any(|(s, _)| s.contains("router"))
+                        && !per_module.iter().any(|(k, _)| k.contains("router")),
+                    "premise broken: this variant's map now describes the router itself, so the \
+                     loader-fixed table is no longer what keeps the gate honest here",
+                );
+            }
+            other => panic!("expected an Affine variant, got {other:?}"),
+        }
+
+        let map = emitted_affine_bit_map(&uniform, "gemma4-moe");
+        assert_eq!(
+            map.first(),
+            Some(&(".router.proj".to_string(), 8, 64)),
+            "the router must be gated at the 8 bits its loader passes, ahead of the 4-bit \
+             catch-all — otherwise gemma-4-26b-a4b-it-4bit stops loading. Got: {map:?}",
         );
     }
 
