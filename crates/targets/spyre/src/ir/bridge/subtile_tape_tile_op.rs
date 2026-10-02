@@ -109,8 +109,7 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::VarlenAttention { .. }
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
-        | SubOp::GemmaMoe { .. }
-        | SubOp::Moe { .. }
+        | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Err(format!("{:?} is not a spyre standard tile op", n.op)),
         crate::op_abi::spyre_standard_tile_pat!() => {
             let n_operands = match crate::op_abi::spyre_standard_operands(&n.op)
@@ -130,7 +129,7 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         // elementwise walk over `[mb, out_active, y]`. Refused here rather than
         // silently admitted to the standard class, whose dims would describe
         // the wrong movement.
-        SubOp::Reshape => Err(
+        SubOp::Reshape { .. } => Err(
             "SubOp::Reshape is a restickify, not a standard tile — the device layout is a \
              function of the ROW COUNT, so this is a re-laying copy the SuperDSC lowering must \
              emit, never a pointwise walk"

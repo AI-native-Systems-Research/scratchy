@@ -586,7 +586,7 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_shape() {
 fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_top_k_1_workaround() {
     // Production lowering passes `top_k=1` to the kernel for the
     // down-projection step (handoff workaround in
-    // `lower_metal_moe`). x layout is `[T*top_k, moe_inter]` — one
+    // `lower_moe_step`). x layout is `[T*top_k, moe_inter]` — one
     // row per (token, slot), not per-token broadcast. rhs_indices
     // has `T*top_k` entries.
     //

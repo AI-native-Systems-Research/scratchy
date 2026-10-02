@@ -32,7 +32,7 @@ pub use ids::{
 };
 pub use lowered::{
     Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
-    RuntimeBindingKind, WeightBundleKind, WeightTensor,
+    ModelSources, RuntimeBindingKind, SourceRef, WeightTensor,
 };
 pub use pipelines::{PipelineLookupError, SpecializedPipelines};
 
@@ -47,7 +47,10 @@ pub use pool::{
     MetalBucketSpec, MetalWorkerPool, PoolBuildError, PooledWorker, RuntimeFactory, WorkerGuard,
 };
 pub use runtime::RuntimeBindings;
-pub use worker::{ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker, WorkerError};
+pub use worker::{
+    ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker, ResolvedSources, SourceMiss,
+    WorkerError,
+};
 
 // Centralized type aliases for the objc2-metal `Retained` wrapper
 // types so per-model crates whose macro expansion emits e.g.

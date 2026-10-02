@@ -15,7 +15,7 @@
 //! the per-bucket dispatch is fully baked).
 
 use crate::tape::constants::ConstantValue;
-use crate::tape::ids::{BucketM, LayerId};
+use crate::tape::ids::{BucketM, LayerId, SourceIx};
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
 ///
@@ -27,9 +27,7 @@ use crate::tape::ids::{BucketM, LayerId};
 ///
 /// The set is closed and small on purpose: the TinyLlama-1.1B critical
 /// path covers ~13 of these, with more added as additional models come
-/// online. Variants the lowering pass cannot yet produce surface as a
-/// `LoweringError::UnsupportedVariant` rather than appearing here as a
-/// stub.
+/// online.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum KernelId {
     /// Token embedding gather: rows of `embed_tokens.weight` indexed
@@ -833,12 +831,10 @@ impl ActivationWidth {
 /// Where the worker should source the buffer for a binding at worker
 /// init time.
 ///
-/// Weight bindings carry a `(bucket, op_idx, slot, kind)` locator the
-/// worker passes into the per-arch [`scratchy_ir::WeightAccessors`] impl at
-/// dispatch-record time to recover the `&Layer` struct (`linear_at`,
-/// `rms_norm_at`, etc.). The resolved tensor's pointer is then looked
-/// up against the `MetalAllocator`'s arena registry. No fn pointers
-/// live here, so `Binding` is fully backend-neutral.
+/// A model tensor is a [`Binding::Source`]: a family of the model's source
+/// manifest, resolved ONCE at load through the macro-generated
+/// [`ModelSources`] impl. No fn pointers live here, so `Binding` is fully
+/// backend-neutral.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub enum Binding {
     /// `MetalWorker.arena[slot]` — the worker's private tile-arena
@@ -847,25 +843,15 @@ pub enum Binding {
     /// performed by `colored_slot_map()` in
     /// `scratchy-forward-compiler-macro/src/interpreter_codegen.rs`).
     ArenaSlot { slot: u32, binding_index: u8 },
-    /// A model tensor named by its SOURCE INDEX in the macro-emitted
-    /// static tape. The player resolves it ONCE at load through the
-    /// tape's generated resolver fn (the macro knows every source's
-    /// field path at expansion) — there is no locator, no accessor
-    /// table, and no per-dispatch lookup on this path. The
-    /// accessor-based `Weight` variant above serves only the legacy
-    /// runtime-lowered tapes and dies with them.
-    Source { ix: u32, binding_index: u8 },
-    /// A weight bundle resolved at dispatch-record time through the per-arch
-    /// [`scratchy_ir::WeightAccessors`] impl. `locator` is the
-    /// `(bucket, op_idx, slot)` triple the macro baked at codegen time;
-    /// the trait method picked by `kind` returns the named field on
-    /// `Weights`. `which` then selects which tensor inside the bundle
-    /// to bind (e.g. weight vs bias vs affine scales).
-    Weight {
-        kind: WeightBundleKind,
+    /// A model tensor: `which` tensor of source family `ix` at `layer`. The family is the
+    /// model's source manifest entry (a weight bundle, every layer); the pool resolves each
+    /// distinct `(ix, which, layer)` ONCE at load through the macro-generated [`ModelSources`]
+    /// impl — no locator, no accessor table, no per-dispatch lookup. A rolled loop's later
+    /// iterations advance only `layer` ([`Binding::bump_layer`]).
+    Source {
+        ix: SourceIx,
         which: WeightTensor,
         layer: LayerId,
-        locator: WeightLocator,
         binding_index: u8,
     },
     /// A buffer drawn from `ForwardCtx`-equivalent runtime state at
@@ -932,100 +918,133 @@ pub enum Binding {
     MoeScratch { binding_index: u8, byte_offset: u32 },
 }
 
-/// Per-bundle locator for the macro-emitted `WeightAccessors` impl.
-/// The worker invokes the matching `<kind>_at(bucket, op_idx, slot,
-/// layer)` method to recover the `&Layer` reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct WeightLocator {
-    /// Bucket id baked at codegen — matches the bucket axis of the
-    /// per-arch `WeightAccessors` match arm.
-    pub bucket: u32,
-    /// Flat tape position of the source `Instruction` (post loop
-    /// unrolling for backbone slices; absolute index in the lm_head
-    /// slice for lm_head).
-    pub op_idx: u32,
-    /// Sub-position within the same `(bucket, op_idx)` for variants
-    /// that resolve multiple accessors of the same kind — e.g.
-    /// `SynthPreAttn` consumes 3 `LinearLayer`s (Q/K/V at slots 0/1/2).
-    pub slot: u32,
+/// A model's weight bundle, as its source manifest names it — what [`ModelSources::source`]
+/// hands back and [`SourceRef::tensor`] picks a [`WeightTensor`] out of.
+#[derive(Clone, Copy)]
+pub enum SourceRef<'w> {
+    Embedding(&'w scratchy_layers::Embedding),
+    /// MLX-affine int4 quantized embedding.
+    AffineQuantEmbedding(&'w scratchy_quantizations::AffineQuantEmbedding),
+    RmsNorm(&'w scratchy_layers::RmsNorm),
+    /// Torch-style LayerNorm with bias (vision towers).
+    LayerNorm(&'w scratchy_layers::LayerNorm),
+    Linear(&'w scratchy_layers::LinearLayer),
+    /// A RoPE table's packed cos/sin cache (layer-independent).
+    CosSin(scratchy_tensors::tensor::GpuTensor),
+    /// Mixtral-style MoE: dense router + packed per-expert slabs.
+    FusedMoe(&'w scratchy_layers::layers_moe::FusedMoELayer),
+    /// Qwen-style MoE with an optional shared expert.
+    SharedFusedMoe(&'w scratchy_layers::layers_moe::SharedFusedMoELayer),
+    /// Gemma-4 router (dense gate, per-expert scale, norm gain).
+    GemmaRouter(&'w scratchy_layers::layers_moe::GemmaRouterLayer),
+    /// Gemma-4 SwitchGLU experts (router-less).
+    GemmaSwitchGlu(&'w scratchy_layers::layers_moe::SwitchGluExpertsLayer),
+    /// Qwen3.5 Gated-DeltaNet per-layer weights.
+    GatedDeltaNet(&'w scratchy_layers::GatedDeltaNetLayer),
 }
 
-/// Discriminator selecting which per-arch [`scratchy_ir::WeightAccessors`]
-/// method the worker should call to resolve this binding.
-///
-/// Pure tag — fn pointers are gone after the lift; weight resolution
-/// lives at the tape level via `(bucket, op_idx, slot)` keys.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub enum WeightBundleKind {
-    /// Calls `WeightAccessors::embedding_at` → `&Embedding`.
-    Embedding,
-    /// Calls `WeightAccessors::rms_norm_at` → `&RmsNorm`.
-    RmsNorm,
-    /// Calls `WeightAccessors::linear_at` → `&LinearLayer`.
-    LinearLayer,
-    /// Calls `WeightAccessors::cos_sin_at` → `GpuTensor` (per-layer
-    /// RoPE table; no struct wrapper).
-    CosSin,
-    /// Spans rope-on-read: the cos/sin table the paged attention
-    /// kernels re-rope cached K with. Resolved by LAYER CLASS via
-    /// `WeightAccessors::rope_on_read_cos_sin(is_global, layer)`
-    /// (`is_global` = global/full-attention `rotary` vs sliding
-    /// `rotary_local`), not by an op operand — attention ops carry no
-    /// cos_sin weight slot. The binding's `locator` is unused. Only
-    /// emitted when `W::ROPE_ON_READ`.
-    RopeOnReadCosSin { is_global: bool },
-    /// MLX-affine int4 quantized embedding (Metal-only). Calls
-    /// `WeightAccessors::affine_quant_embedding_at` →
-    /// `&AffineQuantEmbedding`. P6 macro emission decides between this
-    /// and `Embedding` per-layer based on safetensors layout (U32
-    /// weight ⇒ AffineQuantEmbedding, else Embedding).
-    AffineQuantEmbedding,
-    /// Mixtral-style fused MoE bundle (no shared expert). Metal-only —
-    /// resolves through `WeightAccessors::fused_moe_at(...)` to a
-    /// `&FusedMoELayer` whose Metal arm carries packed per-expert
-    /// {gate, up, down} weight slabs in MLX-affine int4 layout plus
-    /// the dense router gate. The Metal worker treats this as the
-    /// arbitrator for the 19-ish `WeightTensor::Moe*` variants below.
-    FusedMoe,
-    /// Qwen-MoE-style fused MoE + shared expert bundle. Metal-only —
-    /// resolves through `WeightAccessors::shared_fused_moe_at(...)`.
-    /// Carries the same per-expert slabs as `FusedMoe` plus the
-    /// shared-expert {gate_up, down} affine slabs + the dense
-    /// `shared_expert_gate` (`[1, hidden]` sigmoid gate). On variants
-    /// where `shared_expert_intermediate_size == 0` (modern
-    /// Qwen3-MoE-30B-A3B), the shared-expert tensors are absent and
-    /// the lowering arm skips the shared-expert tail.
-    SharedFusedMoe,
-    /// Gemma-4 router bundle (`GemmaMoe` op). Resolves through
-    /// `WeightAccessors::gemma_router_at(...)` to a `&GemmaRouterLayer`
-    /// carrying the dequant'd dense router gate, the per-expert score scale,
-    /// and the RMSNorm gain. The `WeightTensor::GemmaRouter{Gate,PerExpertScale,Scale}`
-    /// variants select which sub-tensor.
-    GemmaRouter,
-    /// Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op). Resolves through
-    /// `WeightAccessors::gemma_switch_glu_at(...)` to a
-    /// `&SwitchGluExpertsLayer` carrying the stacked 4-bit per-expert
-    /// gate/up/down. Reuses the `WeightTensor::MoeExpert{Gate,Up,Down}{W,S,B}`
-    /// variants (same expert-major affine layout as the routed FusedMoe path).
-    GemmaSwitchGlu,
-    /// Qwen3.5 / Qwen3-Next Gated-DeltaNet per-layer weight bundle.
-    /// Resolves through `WeightAccessors::gated_delta_net_at(...)` to a
-    /// `&GatedDeltaNetLayer` (conv1d / A_log / dt_bias / norm); the
-    /// `WeightTensor::Gdn*` variants select which sub-tensor.
-    GatedDeltaNet,
-    /// Torch-style LayerNorm-with-bias bundle (vision towers:
-    /// Qwen3.5-VL norm1/norm2/merger.norm). Resolves through
-    /// `WeightAccessors::layer_norm_at(...)` to a `&LayerNorm`
-    /// (`.weight` + `.bias`); `WeightTensor::Weight` selects the gain
-    /// and `WeightTensor::Bias` the (mandatory) bias.
-    LayerNorm,
+impl SourceRef<'_> {
+    /// Whether the `which` tensor of this bundle is MLX-affine packed codes — what a kernel reads
+    /// as written or offset-8 ([`crate::tape::kernel_constants::AffineCodes`]).
+    pub fn is_affine_codes(self, which: WeightTensor) -> bool {
+        use WeightTensor as T;
+        match self {
+            Self::Linear(scratchy_layers::LinearLayer::AffineQuant(_))
+            | Self::AffineQuantEmbedding(_) => which == T::Weight,
+            Self::FusedMoe(_) | Self::SharedFusedMoe(_) | Self::GemmaSwitchGlu(_) => matches!(
+                which,
+                T::MoeExpertGateW
+                    | T::MoeExpertUpW
+                    | T::MoeExpertDownW
+                    | T::MoeSharedGateUpW
+                    | T::MoeSharedDownW
+            ),
+            _ => false,
+        }
+    }
+
+    /// The `which` tensor of this bundle; `None` when the bundle holds no such tensor (a `which`
+    /// of another kind, an absent optional bias or shared expert, a Dense MoE on metal).
+    pub fn tensor(self, which: WeightTensor) -> Option<scratchy_tensors::tensor::GpuTensor> {
+        use WeightTensor as T;
+        use scratchy_layers::LinearLayer as L;
+        use scratchy_layers::layers_moe::{FusedMoELayer as F, SharedFusedMoELayer as Sh};
+        let routed = |r: &scratchy_layers::layers_moe::AffineFusedMoELayer| match which {
+            T::MoeRouterGate => Some(r.router_gate),
+            T::MoeExpertGateW => Some(r.expert_gate_w),
+            T::MoeExpertGateS => Some(r.expert_gate_scales),
+            T::MoeExpertGateB => Some(r.expert_gate_biases),
+            T::MoeExpertUpW => Some(r.expert_up_w),
+            T::MoeExpertUpS => Some(r.expert_up_scales),
+            T::MoeExpertUpB => Some(r.expert_up_biases),
+            T::MoeExpertDownW => Some(r.expert_down_w),
+            T::MoeExpertDownS => Some(r.expert_down_scales),
+            T::MoeExpertDownB => Some(r.expert_down_biases),
+            _ => None,
+        };
+        match (self, which) {
+            (Self::Embedding(e), T::Weight) => Some(e.weight),
+            (Self::AffineQuantEmbedding(e), T::Weight) => Some(e.weight),
+            (Self::AffineQuantEmbedding(e), T::AffineScales) => Some(e.scales),
+            (Self::AffineQuantEmbedding(e), T::AffineBiases) => Some(e.affine_biases),
+            (Self::RmsNorm(n), T::Weight) => Some(n.weight),
+            (Self::LayerNorm(n), T::Weight) => Some(n.weight),
+            (Self::LayerNorm(n), T::Bias) => n.bias,
+            (Self::CosSin(t), T::Weight) => Some(t),
+            (Self::Linear(l @ L::Dense(_)), T::Weight) => Some(l.dense_weight()),
+            (Self::Linear(l @ L::Dense(_)), T::Bias) => l.dense_bias(),
+            (Self::Linear(l @ L::AffineQuant(_)), T::Weight) => Some(l.affine_weight()),
+            (Self::Linear(l @ L::AffineQuant(_)), T::AffineScales) => Some(l.affine_scales()),
+            (Self::Linear(l @ L::AffineQuant(_)), T::AffineBiases) => Some(l.affine_biases()),
+            (Self::Linear(l @ L::AffineQuant(_)), T::AffineLinearBias) => l.affine_linear_bias(),
+            (Self::Linear(l @ L::Nvfp4(_)), T::Weight) => Some(l.nvfp4_weight()),
+            (Self::Linear(l @ L::Nvfp4(_)), T::Nvfp4Scales) => Some(l.nvfp4_scales()),
+            (Self::GatedDeltaNet(g), T::GdnConv1d) => Some(g.conv1d),
+            (Self::GatedDeltaNet(g), T::GdnALog) => Some(g.a_log),
+            (Self::GatedDeltaNet(g), T::GdnDtBias) => Some(g.dt_bias),
+            (Self::GatedDeltaNet(g), T::GdnNorm) => Some(g.norm),
+            (Self::GemmaRouter(r), T::GemmaRouterGate) => Some(r.gate),
+            (Self::GemmaRouter(r), T::GemmaPerExpertScale) => Some(r.per_expert_scale),
+            (Self::GemmaRouter(r), T::GemmaRouterScale) => Some(r.scale),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertGateW) => Some(e.expert_gate_w),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertGateS) => Some(e.expert_gate_scales),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertGateB) => Some(e.expert_gate_biases),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertUpW) => Some(e.expert_up_w),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertUpS) => Some(e.expert_up_scales),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertUpB) => Some(e.expert_up_biases),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertDownW) => Some(e.expert_down_w),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertDownS) => Some(e.expert_down_scales),
+            (Self::GemmaSwitchGlu(e), T::MoeExpertDownB) => Some(e.expert_down_biases),
+            (Self::FusedMoe(F::Affine(a)), _) => routed(a),
+            (Self::SharedFusedMoe(Sh::Affine(s)), _) => match which {
+                T::MoeSharedGateUpW => s.shared_gate_up_w,
+                T::MoeSharedGateUpS => s.shared_gate_up_scales,
+                T::MoeSharedGateUpB => s.shared_gate_up_biases,
+                T::MoeSharedDownW => s.shared_down_w,
+                T::MoeSharedDownS => s.shared_down_scales,
+                T::MoeSharedDownB => s.shared_down_biases,
+                T::MoeSharedExpertGate => s.shared_expert_gate,
+                _ => routed(&s.routed),
+            },
+            _ => None,
+        }
+    }
+}
+
+/// A model's tensors by source index — implemented per model by the `#[forward]` macro from
+/// the tapes' source manifest (one arm per family), and read ONCE at load by the pool.
+pub trait ModelSources {
+    /// Each source family's accessor, by index — for error messages only, never a key.
+    const SOURCES: &'static [&'static str];
+    /// Source family `ix` at `layer`; `None` when the manifest has no such family.
+    fn source(&self, ix: SourceIx, layer: LayerId) -> Option<SourceRef<'_>>;
 }
 
 /// Which tensor inside a multi-tensor weight bundle this binding
 /// references. Most bundles have a single weight tensor (`Weight`);
 /// MLX-affine `LinearLayer::AffineQuant` carries four (packed weight,
 /// per-group scales, per-group affine offsets, optional fp linear bias).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum WeightTensor {
     /// The bundle's primary weight (`RmsNorm.weight`,
     /// `LinearLayer::Dense(Linear { weight, .. })`,
@@ -1060,11 +1079,9 @@ pub enum WeightTensor {
     Nvfp4Scales,
     // ── MoE bundle tensors ──────────────────────────────────────────
     //
-    // Valid only against `WeightBundleKind::{FusedMoe, SharedFusedMoe}`.
-    // The Metal worker resolves these against the MetalSwitchGluMoeWeights
-    // payload on the FusedMoELayer / SharedFusedMoELayer struct. Each
-    // names a concrete tensor; the worker reads its arena-backed pointer
-    // and stamps it onto the encoder.
+    // Valid only against the `SourceRef::{FusedMoe, SharedFusedMoe}` bundles (the expert slabs
+    // also against `GemmaSwitchGlu`). Each names a concrete tensor; the worker reads its
+    // arena-backed pointer and stamps it onto the encoder.
     /// `[num_experts, hidden_size]` dense router gate weight (BF16 /
     /// F16 — not quantized). Output of `Gemm(x, router_gate)` produces
     /// `[num_tokens, num_experts]` router logits.
@@ -1119,9 +1136,7 @@ pub enum WeightTensor {
     MoeSharedExpertGate,
     // ── Gated-DeltaNet bundle tensors ───────────────────────────────
     //
-    // Valid only against `WeightBundleKind::GatedDeltaNet`. The worker
-    // resolves these against the `GatedDeltaNetLayer` struct returned by
-    // `WeightAccessors::gated_delta_net_at`.
+    // Valid only against the `SourceRef::GatedDeltaNet` bundle.
     /// Causal depthwise conv1d weight `[conv_dim, 1, kernel]` (on-disk dtype).
     GdnConv1d,
     /// Per-value-head log-decay base `A_log` `[num_v_heads]`.
@@ -1257,9 +1272,8 @@ pub enum RuntimeBindingKind {
     /// band-split (`mrope_section` T/H/W) cos/sin for token `t`; combined
     /// with identity positions (`positions[t] = t`) it lets the unmodified
     /// 1D `rope_append_*`/fused-qkv-rope kernels read the correct row
-    /// without an in-kernel band-split (option (b)). The worker
-    /// `resolve_bindings` redirects the baked `WeightBundleKind::CosSin`
-    /// pointer to this buffer when `W::MROPE_SECTION.is_some()`; the macro
+    /// without an in-kernel band-split (option (b)). The lowering binds it in
+    /// place of the static cos/sin source when `MetalModelConsts::mrope`; the macro
     /// forward builds + writes it per forward via `ForwardInputs`. 16-byte
     /// placeholder on 1D-rope arches (never bound).
     MropeCosSin,
@@ -1537,17 +1551,15 @@ impl Binding {
     /// Advance every layer this binding names by `by` loop iterations.
     pub fn bump_layer(self, by: u32) -> Self {
         match self {
-            Self::Weight {
-                locator,
+            Self::Source {
+                ix,
+                which,
                 layer,
-                kind,
-                which,
                 binding_index,
-            } => Self::Weight {
-                locator,
-                layer: layer.advance(by),
-                kind,
+            } => Self::Source {
+                ix,
                 which,
+                layer: layer.advance(by),
                 binding_index,
             },
             Self::Runtime {
@@ -1558,7 +1570,6 @@ impl Binding {
                 binding_index,
             },
             Self::ArenaSlot { .. }
-            | Self::Source { .. }
             | Self::Scratch { .. }
             | Self::RopedKScratch { .. }
             | Self::AttnUnfusedScratch { .. }
@@ -1573,7 +1584,6 @@ impl Binding {
             Self::RopedKScratch { .. } | Self::AttnUnfusedScratch { .. } => SeqScope::RowZero,
             Self::ArenaSlot { .. }
             | Self::Source { .. }
-            | Self::Weight { .. }
             | Self::Runtime { .. }
             | Self::Scratch { .. }
             | Self::Inline { .. }
@@ -1586,8 +1596,8 @@ impl Binding {
 ///
 /// `commands[start .. start + period]` is ONE copy of the body; it runs `iters` times, and the
 /// only thing that differs between iterations is the layer — `lower_one`'s `layer_offset` is
-/// used in exactly one pattern, `LayerId(literal + layer_offset)`, and the weight locator's
-/// `op_idx` is the BODY position, identical across iterations. So iteration `i` is the baked
+/// used in exactly one pattern, `LayerId(literal + layer_offset)`, and a weight's source family
+/// is the same every iteration (the roll proof checks it). So iteration `i` is the baked
 /// body with every [`LayerId`] advanced by `i`, which is what [`Binding::bump_layer`] does.
 ///
 /// Unrolling at bake time is what made the emitted tape enormous: five llama configs came to
@@ -1621,8 +1631,8 @@ impl LoweredMetalTape {
     /// file for ~46s. Doing it here costs one `Vec` per bucket at load.
     ///
     /// Exact because the only per-iteration input to the lowering is `layer_offset`, consumed
-    /// in exactly one pattern (`LayerId(literal + layer_offset)`); the weight locator's
-    /// `op_idx` is the body position and does not vary.
+    /// in exactly one pattern (`LayerId(literal + layer_offset)`); a weight's source family
+    /// does not vary.
     pub fn commands_expanded(&self) -> Vec<GatedCommand> {
         let mut out = Vec::with_capacity(self.commands.len());
         let cmds = self.commands;
@@ -1742,27 +1752,12 @@ pub struct LoweredMetalTape {
     pub attn_unfused_scratch_bytes: u32,
 }
 
-/// Errors produced by the lowering pass.
-///
-/// `LoweringError::UnsupportedVariant` is the most common case during
-/// Phase 5.A: each model adds new `Instruction<W>` variants that the
-/// TinyLlama-only lowering doesn't yet handle. The variant name and
-/// the `Instruction<W>` index are surfaced so the model author knows
-/// exactly which instruction to add support for.
+/// Errors produced by the lowering pass. Every step kind lowers (the
+/// match over `MetalStep` is exhaustive), so these are malformed tapes.
 #[derive(Debug)]
 pub enum LoweringError {
-    /// The lowering pass doesn't yet handle this `Instruction<W>`
-    /// variant. Add a match arm in `lowering::lower_one()` and a
-    /// matching kernel in `KernelId`.
-    UnsupportedVariant {
-        /// Index of the offending instruction in the source tape.
-        index: usize,
-        /// `std::any::type_name_of_val()` of the offending variant
-        /// — gives the variant name without requiring `Debug`.
-        variant_type: &'static str,
-    },
-    /// A `Loop(count, body_len)` instruction overran the source tape
-    /// when unrolling: the body extended past the end of the slice.
+    /// A `StepRow::Loop` whose body overran the step tape: the body
+    /// extended past the end of the slice.
     /// Indicates malformed codegen — every tape the macro produces
     /// has been validated by the time it reaches lowering.
     MalformedLoop {
@@ -1773,40 +1768,36 @@ pub enum LoweringError {
     },
     /// A TurboQuant codec command could not bind the additive offset of the
     /// KV operand it compresses — quantizing without removing it would let the
-    /// offset's norm, not the signal's, set the codec's error.
-    TurboQuantOffsetUnbound { index: usize, missing: TqUnbound },
+    /// offset's norm, not the signal's, set the codec's error: a K bias, with no
+    /// rotary table to rotate it to each key (rope-on-read off).
+    TurboQuantOffsetUnbound { index: usize },
+    /// A step at tape index `index` binds the `slot`-th `kind` weight of its site, and its
+    /// site holds no such source — the step records and the opcode lowering disagree.
+    NoSource {
+        index: usize,
+        kind: scratchy_subtile::handoff::WeightKind,
+        slot: u32,
+    },
+    /// A rope-on-read attention binds its layer class's rotary table, and the model has none.
+    NoRotaryTable { index: usize },
+    /// A gated row whose realization already gates its commands: one command, two gates.
+    DoubleGate { index: usize },
     /// A command computes batch row 0 only ([`SeqScope::RowZero`]) and its
-    /// instruction has no per-row twin re-roping span blocks, so some step with
+    /// step has no per-row twin re-roping span blocks, so some step with
     /// several sequences would run no attention, or row 0's for every sequence.
     RowZeroWithoutPerRowTwin { index: usize, kernel: KernelId },
     /// The model's KV codec is TurboQuant, but its backbone binds the KV cache
     /// without compressing any of it: the factory would provision packed stores
     /// nothing writes, and the worker would stop growing a pool the tape reads.
     TurboQuantCompressesNothing,
-}
-
-/// What a TurboQuant codec command at [`LoweringError::TurboQuantOffsetUnbound`]
-/// lacked.
-#[derive(Clone, Copy, Debug)]
-pub enum TqUnbound {
-    /// No KV writer precedes it, so its operands' offsets are unknown.
-    Writer,
-    /// A K bias, with no rotary table bound to rotate it to each key.
-    RotaryTable,
+    /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
+    /// runs only on a TurboQuant model.
+    CodecStepOnDenseModel,
 }
 
 impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedVariant {
-                index,
-                variant_type,
-            } => write!(
-                f,
-                "lowering: unsupported instruction variant `{variant_type}` at tape index {index} \
-                 (TinyLlama-1.1B critical path is the only set covered in Phase 5.A; \
-                 add a match arm in `interpreter::metal::lowering::lower_one`)"
-            ),
             Self::MalformedLoop {
                 index,
                 count,
@@ -1815,22 +1806,40 @@ impl std::fmt::Display for LoweringError {
             } => write!(
                 f,
                 "lowering: malformed Loop({count}, {body_len}) at tape index {index} \
-                 — body extends past tape end (only {remaining} instructions remain)"
+                 — body extends past tape end (only {remaining} rows remain)"
             ),
-            Self::TurboQuantOffsetUnbound { index, missing } => write!(
+            Self::TurboQuantOffsetUnbound { index } => write!(
                 f,
                 "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
-                 operand's additive offset ({missing:?} missing)"
+                 operand's additive offset (no rotary table rotates its K bias)"
+            ),
+            Self::NoSource { index, kind, slot } => write!(
+                f,
+                "lowering: the step at tape index {index} binds {kind:?} weight #{slot} of its \
+                 site, which has no such source"
+            ),
+            Self::NoRotaryTable { index } => write!(
+                f,
+                "lowering: the attention at tape index {index} re-ropes on read, and the model \
+                 has no rotary table"
+            ),
+            Self::DoubleGate { index } => write!(
+                f,
+                "lowering: the row at tape index {index} is gated, and its realization gates a \
+                 command of its own"
             ),
             Self::RowZeroWithoutPerRowTwin { index, kernel } => write!(
                 f,
                 "lowering: `{kernel:?}` at tape index {index} computes sequence 0 only, and \
-                 the instruction has no per-row twin re-roping span blocks for steps with \
+                 its step has no per-row twin re-roping span blocks for steps with \
                  several sequences"
             ),
             Self::TurboQuantCompressesNothing => f.write_str(
                 "lowering: the model's KV codec is TurboQuant, but no KV writer in its \
                  backbone is one the codec compresses",
+            ),
+            Self::CodecStepOnDenseModel => f.write_str(
+                "lowering: a KV codec step in the tape of a model whose KV cache is dense",
             ),
         }
     }

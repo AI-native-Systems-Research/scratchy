@@ -5,8 +5,8 @@
 //! These are test/dev fixtures only — production wiring derives
 //! `LoweringInput` directly from a solved decode FUF via the proc-macro.
 
-use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
-use crate::subtile_ir::SourceShape;
+use crate::lower::{InputRef, LoweringInput, OpDesc};
+use crate::subtile_ir::{AttnMask, EwKind, GainConvention, RopeFormTag, SourceShape, SubOp};
 use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
@@ -89,16 +89,16 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
         ops: vec![
             // 0: x_norm = rmsnorm(x, rms_w0)
             OpDesc {
-                op: LoweredOp::RmsNorm {
+                op: SubOp::RmsNorm {
                     eps: 1e-5,
-                    gain_offset: 0.0,
+                    gain: GainConvention::Scale,
                 },
                 m: 1,
                 inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
             },
             // 1: q = x_norm @ q_w   [1, q_dim=h]
             OpDesc {
-                op: LoweredOp::Gemm {
+                op: SubOp::MatmulTile {
                     n: h,
                     weight: crate::lower::GemmWeight::Dense,
                 },
@@ -107,7 +107,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 2: k = x_norm @ k_w   [1, kv_dim]
             OpDesc {
-                op: LoweredOp::Gemm {
+                op: SubOp::MatmulTile {
                     n: kv,
                     weight: crate::lower::GemmWeight::Dense,
                 },
@@ -116,7 +116,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 3: v = x_norm @ v_w   [1, kv_dim]
             OpDesc {
-                op: LoweredOp::Gemm {
+                op: SubOp::MatmulTile {
                     n: kv,
                     weight: crate::lower::GemmWeight::Dense,
                 },
@@ -125,19 +125,14 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 4: q' = rope(q)
             OpDesc {
-                op: LoweredOp::RopeRotate { head_dim },
+                op: SubOp::rope_rotate(head_dim),
                 m: 1,
                 inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
             },
             // 5: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
             //    (rotate K + write rotated K / un-roped V to layer 0 cache)
             OpDesc {
-                op: LoweredOp::RopeAppend {
-                    head_dim,
-                    layer: 0,
-                    is_global: true,
-                    interleaved: false,
-                },
+                op: SubOp::rope_append(head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),
                 m: 1,
                 inputs: vec![
                     InputRef::Op(2),
@@ -151,15 +146,10 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             // 6: attn = AttnDecode(q', prefix_k, prefix_v, new_k, v)
             //    Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads, head_dim=64.
             OpDesc {
-                op: LoweredOp::AttnDecode {
-                    geom, // Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads
-                    scale,
-                    // decode_position=1 → 1 prefix row + 1 new = 2 valid
-                    // positions. Decoupled from the cache TENSOR capacity
-                    // (sources 7,8 may be sized larger).
-                    valid_len: 2,
-                    sliding: false,
-                },
+                // Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads. valid_len 2: decode_position=1 →
+                // 1 prefix row + 1 new = 2 valid positions. Decoupled from the cache TENSOR
+                // capacity (sources 7,8 may be sized larger).
+                op: SubOp::attn_decode(geom, scale, 2, AttnMask::Causal),
                 m: 1,
                 inputs: vec![
                     InputRef::Op(4),
@@ -171,7 +161,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 7: o = attn @ o_w
             OpDesc {
-                op: LoweredOp::Gemm {
+                op: SubOp::MatmulTile {
                     n: h,
                     weight: crate::lower::GemmWeight::Dense,
                 },
@@ -180,22 +170,22 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 8: res1 = x + o
             OpDesc {
-                op: LoweredOp::Add,
+                op: SubOp::Elementwise(EwKind::Add),
                 m: 1,
                 inputs: vec![InputRef::Ext(0), InputRef::Op(7)],
             },
             // 9: x_norm2 = rmsnorm(res1, rms_w1)
             OpDesc {
-                op: LoweredOp::RmsNorm {
+                op: SubOp::RmsNorm {
                     eps: 1e-5,
-                    gain_offset: 0.0,
+                    gain: GainConvention::Scale,
                 },
                 m: 1,
                 inputs: vec![InputRef::Op(8), InputRef::Ext(10)],
             },
             // 10: gate = x_norm2 @ gate_w
             OpDesc {
-                op: LoweredOp::Gemm {
+                op: SubOp::MatmulTile {
                     n: i,
                     weight: crate::lower::GemmWeight::Dense,
                 },
@@ -204,7 +194,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 11: up = x_norm2 @ up_w
             OpDesc {
-                op: LoweredOp::Gemm {
+                op: SubOp::MatmulTile {
                     n: i,
                     weight: crate::lower::GemmWeight::Dense,
                 },
@@ -213,13 +203,13 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 12: mlp = silu(gate) * up
             OpDesc {
-                op: LoweredOp::SiluMul,
+                op: SubOp::SiluMul,
                 m: 1,
                 inputs: vec![InputRef::Op(10), InputRef::Op(11)],
             },
             // 13: down = mlp @ down_w
             OpDesc {
-                op: LoweredOp::Gemm {
+                op: SubOp::MatmulTile {
                     n: h,
                     weight: crate::lower::GemmWeight::Dense,
                 },
@@ -228,7 +218,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             },
             // 14: res2 = x + down
             OpDesc {
-                op: LoweredOp::Add,
+                op: SubOp::Elementwise(EwKind::Add),
                 m: 1,
                 inputs: vec![InputRef::Ext(0), InputRef::Op(13)],
             },
@@ -272,16 +262,16 @@ pub fn mlp_chain_distinct_m(n: u32, h: u32, m: u32) -> LoweringInput {
         };
         // norm = rmsnorm(x_in, rms_w_L)
         ops.push(OpDesc {
-            op: LoweredOp::RmsNorm {
+            op: SubOp::RmsNorm {
                 eps: 1e-5,
-                gain_offset: 0.0,
+                gain: GainConvention::Scale,
             },
             m,
             inputs: vec![x_in(), InputRef::Ext(rms_w)],
         });
         // y = norm @ w_L   [m, h]
         ops.push(OpDesc {
-            op: LoweredOp::Gemm {
+            op: SubOp::MatmulTile {
                 n: h,
                 weight: crate::lower::GemmWeight::Dense,
             },
@@ -290,7 +280,7 @@ pub fn mlp_chain_distinct_m(n: u32, h: u32, m: u32) -> LoweringInput {
         });
         // res = x_in + y
         ops.push(OpDesc {
-            op: LoweredOp::Add,
+            op: SubOp::Elementwise(EwKind::Add),
             m,
             inputs: vec![x_in(), InputRef::Op(base_op + 1)],
         });
@@ -452,9 +442,9 @@ pub fn rmsnorm_only_input() -> LoweringInput {
             SourceShape { rows: 1, cols: h }, // 1  rms_w
         ],
         ops: vec![OpDesc {
-            op: LoweredOp::RmsNorm {
+            op: SubOp::RmsNorm {
                 eps: 1e-5,
-                gain_offset: 0.0,
+                gain: GainConvention::Scale,
             },
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
@@ -474,7 +464,7 @@ pub fn add_only_input() -> LoweringInput {
             SourceShape { rows: 1, cols: h }, // 1  b
         ],
         ops: vec![OpDesc {
-            op: LoweredOp::Add,
+            op: SubOp::Elementwise(EwKind::Add),
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
         }],
@@ -500,7 +490,7 @@ pub fn silu_mul_only_input() -> LoweringInput {
             }, // 1  up
         ],
         ops: vec![OpDesc {
-            op: LoweredOp::SiluMul,
+            op: SubOp::SiluMul,
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
         }],
@@ -528,9 +518,7 @@ pub fn rope_rotate_only_input() -> LoweringInput {
             }, // 2  sin
         ],
         ops: vec![OpDesc {
-            op: LoweredOp::RopeRotate {
-                head_dim: HeadDim::new(head_dim),
-            },
+            op: SubOp::rope_rotate(HeadDim::new(head_dim)),
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
         }],
@@ -551,7 +539,7 @@ pub fn gemm_m1_only_input() -> LoweringInput {
             SourceShape { rows: n, cols: k }, // 1  w
         ],
         ops: vec![OpDesc {
-            op: LoweredOp::Gemm {
+            op: SubOp::MatmulTile {
                 n,
                 weight: crate::lower::GemmWeight::Dense,
             },
@@ -593,9 +581,9 @@ pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
         // from a copy of its rules kept here: this match used to
         // enumerate every op a second time, and the two sites could
         // disagree silently.
-        let cols = crate::ops::lowered_op_out_cols(&desc.op, |k| {
-            shape_for(desc.inputs[k], &op_shapes, &input.sources).1
-        });
+        let cols = desc
+            .op
+            .out_cols(|k| shape_for(desc.inputs[k], &op_shapes, &input.sources).1);
         op_shapes.push((m, cols));
         out.push((m as usize) * (cols as usize) * 2);
     }

@@ -57,10 +57,10 @@ pub enum WeightKind {
     DeepSeekMoeGgml,
     FusedMoe,
     SharedFusedMoe,
-    /// Gemma-4 router bundle (`GemmaMoe` op) — resolves to
+    /// Gemma-4 router bundle (`RouterBundle::Gemma`) — resolves to
     /// `WeightAccessors::gemma_router_at` → `&GemmaRouterLayer`.
     GemmaRouter,
-    /// Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op) — resolves to
+    /// Gemma-4 SwitchGLU experts bundle (`ExpertBundle::SwitchGlu`) — resolves to
     /// `WeightAccessors::gemma_switch_glu_at` → `&SwitchGluExpertsLayer`.
     GemmaSwitchGlu,
     /// Gated-DeltaNet per-layer weight bundle — resolves to
@@ -171,8 +171,9 @@ pub enum SourceBinding {
     },
     /// The per-CHANNEL fp8 `weight_scale` sibling of a [`SourceBinding::Weight`]: SAME `(id, index)` as
     /// the fp8 weight, but the worker loads it from `{prefix}.weight_scale` (vs `.weight`). It is the
-    /// 3rd input of an arity-3 fp8 W8A8 [`LoweredOp::Gemm`] (`[act, weight_fp8, weight_scale]`). Shape
-    /// `[1, n]` (n = output channels), byte-identical to the on-disk `[n, 1]` per-output-channel scale.
+    /// 3rd input of an arity-3 fp8 W8A8 [`crate::subtile_ir::SubOp::MatmulTile`]
+    /// (`[act, weight_fp8, weight_scale]`). Shape `[1, n]` (n = output channels), byte-identical
+    /// to the on-disk `[n, 1]` per-output-channel scale.
     WeightScale {
         id: u32,
         index: Option<UnrollIndex>,
@@ -216,6 +217,21 @@ pub struct LoweredDecode {
     /// impls CLAIM that tile, so its colored slot participates in their
     /// hazard signatures — emitters must mirror it.
     pub norm_gain_add_tiles: std::collections::HashMap<usize, u32>,
+    /// Parallel to `input.ops`: the construct an op was expanded from, when it was (every op of
+    /// one MoE block, or of one KV codec site, shares one id), and the runtime guard it runs
+    /// under. A target fences a construct's steps as one.
+    pub op_expansion: Vec<Option<Expansion>>,
+}
+
+/// One construct's expansion into ops (see [`LoweredDecode::op_expansion`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExpansionId(pub u32);
+
+/// An op's place in an expansion: the construct, and the guard it runs under (`None`: always).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expansion {
+    pub id: ExpansionId,
+    pub guard: Option<crate::kv_codec::CodecGuard>,
 }
 
 impl WeightKind {

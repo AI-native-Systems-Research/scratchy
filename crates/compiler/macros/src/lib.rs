@@ -62,8 +62,6 @@ mod emit;
 mod fuf;
 mod impl_lib;
 mod interpreter_codegen;
-#[cfg(feature = "metal")]
-mod opcode_shapes;
 // The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
 mod parse_python;
 mod quantization;
