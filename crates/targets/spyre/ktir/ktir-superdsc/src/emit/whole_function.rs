@@ -1729,9 +1729,12 @@ pub fn lower_function(
                     idx_r.is_out = false;
                     per_op.push(idx_r);
                     gather_carried[ti] = true;
-                    // ⛔ AND A SECOND CONSUMER OF ONE TILE'S GATHERED LOAD IS REFUSED HERE rather
-                    // than after the walk: the counts seal below checks the whole function, but a
-                    // mid-walk consumer list keeps the message at the op that read it twice.
+                    // ⭐ THE OP'S FIRST GATHERED INPUT, by identity. A second gathered input of the
+                    // same op is NOT checked here: this loop takes the first match, and the whole-
+                    // function consumer counting that refuses a gathered load with two consumers is
+                    // the matmul materializer's own (`gathered_matmul_materializes`). An op whose
+                    // SECOND input is also a gathered load of another tile reaches that refusal, or
+                    // the ScalarMul-only rule below — not a mid-walk one.
                     break 'g Some((g, ti, i));
                 }
             }
