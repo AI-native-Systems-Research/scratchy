@@ -1401,20 +1401,24 @@ impl MetalWorker {
         // vocab_size). Take it + the compute dtype from the model so the sampler
         // is preparable BEFORE this step's forward; the logits BUFFER itself is
         // bound later, in the forward's followup (it's the forward's own output).
-        let (is_bf16, vocab) = {
+        let (cast_dtype, vocab) = {
             let model = self.model.as_deref().ok_or_else(|| {
                 ExecutorError::WorkerExecution("gpu sampler: model not loaded".into())
             })?;
-            let is_bf16 = match model.metal_dtype() {
-                scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => true,
-                scratchy_target_metal::interpreter::metal::MetalDtype::F16 => false,
+            let cast_dtype = match model.metal_dtype() {
+                scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => {
+                    scratchy_target_metal::sampling::CastDtype::Bf16
+                }
+                scratchy_target_metal::interpreter::metal::MetalDtype::F16 => {
+                    scratchy_target_metal::sampling::CastDtype::F16
+                }
                 scratchy_target_metal::interpreter::metal::MetalDtype::Int4 => {
                     return Err(ExecutorError::WorkerExecution(
                         "gpu sampler: int4 logits dtype unsupported".into(),
                     ));
                 }
             };
-            (is_bf16, model.vocab_size() as u32)
+            (cast_dtype, model.vocab_size() as u32)
         };
         let gpu_device = self
             .gpu_device
@@ -1441,7 +1445,7 @@ impl MetalWorker {
             &params,
             jobs.len() as u32,
             vocab,
-            is_bf16,
+            cast_dtype,
         ))
     }
 }
