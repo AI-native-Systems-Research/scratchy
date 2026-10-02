@@ -5,12 +5,13 @@
 //! threadgroup waits on another — at build time into the tape's library ([`MK_BODIES`] and the
 //! generated source), as every shader is. At load the worker measures the device
 //! ([`DeviceFacts`]), solves which launches play each region and how each run's work splits over
-//! the cores ([`split::solve`]), loads the library once, specializes each chosen run's kernel
-//! with the device's cores `MK_P`, the load's scalars and its split, and fills the address table
-//! — the same resolved bindings its argument tables get — at the positions the bake fixed. Every
-//! launch is then an ordinary dispatch step ([`BucketStep`]): `MK_P` threadgroups of a run's
-//! kernel binding its region instance's block of the table, or a command's own dispatch kernel,
-//! a barrier before each — played by the worker's dispatch loop like every other step.
+//! its threadgroups ([`split::solve`]), loads the library once, specializes each chosen run's
+//! kernel with the load's scalars and its split (its threadgroups `MK_P` among them), and fills
+//! the address table — the same resolved bindings its argument tables get — at the positions the
+//! bake fixed. Every launch is then an ordinary dispatch step ([`BucketStep`]): `MK_P`
+//! threadgroups of a run's kernel binding its region instance's block of the table, or a
+//! command's own dispatch kernel, a barrier before each — played by the worker's dispatch loop
+//! like every other step.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -27,8 +28,8 @@ use super::split::{self, Costed, DeviceFacts, RegionPlan, Tile};
 use super::worker::{BucketStep, WorkerError};
 use crate::tape::constants::ConstantValue;
 use crate::tape::lowered::{
-    GateCtx, GatedCommand, KernelId, MK_FC_P, MK_THREADS, MScaling, MegakernelError,
-    MegakernelTape, MkLoadSource, MkPlace,
+    GateCtx, GatedCommand, KernelId, MK_THREADS, MScaling, MegakernelError, MegakernelTape,
+    MkLoadSource, MkPlace,
 };
 
 /// The adapters' bodies: `shaders/megakernel/megakernel.metal` with its local includes inlined
@@ -67,7 +68,8 @@ pub struct SegmentedLoad {
     pub pipelines_built: Duration,
     /// The kernels' `maxTotalThreadsPerThreadgroup`, least and most.
     pub max_threads: (usize, usize),
-    pub threadgroups: usize,
+    /// The threadgroups of the chosen runs' launches, least and most.
+    pub threadgroups: (u32, u32),
     /// The device's facts (this load's measuring of them, `measured`: none when an earlier load
     /// measured everything), and each region's plan and instances per forward.
     pub facts: DeviceFacts,
@@ -105,7 +107,6 @@ pub fn bake(
         .megakernel_library(tape.library, tape.metallib)
         .map_err(lookup)?;
     let cores = crate::device::gpu_cores(device).ok_or(mk_error(MegakernelError::NoGpuCores))?;
-    let threadgroups = cores.get() as usize;
 
     // The region instances, in the tape's expanded order: each the admitted commands of its steps.
     let ctx = GateCtx::decode_one(false);
@@ -173,7 +174,7 @@ pub fn bake(
         .collect();
 
     // The load's scalars, read from the materialized commands, and the device's heads.
-    let mut constants = vec![ConstantValue::uint(MK_FC_P, cores.get())];
+    let mut constants = Vec::with_capacity(tape.load_constants.len());
     for l in tape.load_constants {
         let at = baked_of.iter().position(|&b| b == l.baked as usize);
         let cmd = at.map(|i| &commands[i].command);
@@ -208,6 +209,7 @@ pub fn bake(
     let budget = device.maxThreadgroupMemoryLength();
     let started = Instant::now();
     let mut max_threads = (usize::MAX, 0);
+    let mut threadgroups = (u32::MAX, 0);
     let mut kernels: Vec<Vec<Option<ComputePipelineState>>> = Vec::with_capacity(plans.len());
     for (region, plan) in tape.regions.iter().zip(&plans) {
         let mut chosen = Vec::with_capacity(plan.tiles.len());
@@ -217,6 +219,10 @@ pub fn bake(
                 continue;
             };
             let run = &region.runs[*run];
+            threadgroups = (
+                threadgroups.0.min(split.threadgroups),
+                threadgroups.1.max(split.threadgroups),
+            );
             let mut c = constants.clone();
             c.extend(split.constants(run));
             let pipeline = pipelines
@@ -284,11 +290,14 @@ pub fn bake(
         launched[*r] += 1;
         for (tile, kernel) in plans[*r].tiles.iter().zip(&kernels[*r]) {
             match (tile, kernel) {
-                (Tile::Run { .. }, Some(pipeline)) => steps.push(BucketStep::Dispatch {
+                (Tile::Run { split, .. }, Some(pipeline)) => steps.push(BucketStep::Dispatch {
                     kernel: None,
                     pipeline: pipeline.clone(),
                     direct_bindings: vec![vec![(addresses.clone(), u64::from(block) * 8, 0)]],
-                    direct_dispatch: vec![(one(threadgroups), one(MK_THREADS as usize))],
+                    direct_dispatch: vec![(
+                        one(split.threadgroups as usize),
+                        one(MK_THREADS as usize),
+                    )],
                     direct_m_scaling: vec![None],
                     barrier_before: vec![true],
                     runtime_gate: vec![None],
@@ -354,18 +363,23 @@ impl SegmentedLoad {
             self.measured,
         );
         for (c, s) in tape.calibrations.iter().zip(&f.streams) {
-            let lane: Vec<String> = s.lane.iter().map(ToString::to_string).collect();
+            let lane: Vec<String> = (s.lane.iter().enumerate())
+                .map(|(m, rates)| {
+                    let rates: Vec<String> = rates.iter().map(ToString::to_string).collect();
+                    format!("{} per core: {}", m + 1, rates.join(" "))
+                })
+                .collect();
             let _ = writeln!(
                 out,
                 "[split]   {} (k {}, {} rows of {}-bit codes per virtual threadgroup): GB/s one \
-                 core streams by virtual threadgroups per item 1..{}: {}; its own kernel, every \
-                 core: {}; a launch boundary streaming it: {}",
+                 threadgroup streams by virtual threadgroups per item 1..{}, threadgroups {}; its \
+                 own kernel, every core: {}; a launch boundary streaming it: {}",
                 c.lane,
                 c.k,
                 c.rows,
                 c.bits,
                 c.widest,
-                lane.join(" "),
+                lane.join("; "),
                 s.native,
                 s.boundary,
             );
@@ -414,13 +428,22 @@ impl SegmentedLoad {
                                     format!("spread, {} vtgs/item", split.k[ord - 1])
                                 }
                                 MkPlace::Lane(g) => format!("lane {}", split.lanes[g as usize]),
-                                MkPlace::Everywhere => "every core".to_string(),
+                                MkPlace::Everywhere => "every threadgroup".to_string(),
                             }
                         }
                     };
                     parts.push(format!("{} ({how})", names.join(" > ")));
                 }
-                let _ = writeln!(out, "[split]   {}: {}", tile.seconds(), parts.join(" | "));
+                let threadgroups = match tile {
+                    Tile::Run { split, .. } => format!(" ({} threadgroups)", split.threadgroups),
+                    Tile::Native { .. } => String::new(),
+                };
+                let _ = writeln!(
+                    out,
+                    "[split]   {}{threadgroups}: {}",
+                    tile.seconds(),
+                    parts.join(" | ")
+                );
             }
         }
         out

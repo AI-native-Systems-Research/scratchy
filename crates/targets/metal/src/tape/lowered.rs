@@ -2420,11 +2420,11 @@ pub const MK_THREADS: u32 = 1024;
 pub const MK_SIMD_WIDTH: u32 = 32;
 /// Threadgroup memory the steps of one physical threadgroup may use: the 32 KiB a threadgroup has.
 pub const MK_TG_MEMORY: u32 = 32 * 1024;
-/// The function constants of every generated kernel (`megakernel.metal`): the threadgroups every
-/// launch runs, `MK_P` (the GPU's cores); the load constants ([`MkLoadConstant`]) follow from
-/// `MK_FC_LOAD`; the decode attentions' heads ([`MkHeads`]) from `MK_FC_HEADS`; the runs' work
-/// splits ([`MkRun::split_at`]) from `MK_FC_SPLIT`. A calibration ([`MkCalibration`]) reads its
-/// rows `MK_CAL_N` at `MK_FC_CAL`.
+/// The function constants of every generated kernel (`megakernel.metal`): the threadgroups its
+/// launch runs, `MK_P` (its split's: a whole number per core); the load constants
+/// ([`MkLoadConstant`]) follow from `MK_FC_LOAD`; the decode attentions' heads ([`MkHeads`]) from
+/// `MK_FC_HEADS`; the runs' work splits ([`MkRun::split_at`]) from `MK_FC_SPLIT`. A calibration
+/// ([`MkCalibration`]) reads its rows `MK_CAL_N` at `MK_FC_CAL`.
 pub const MK_FC_P: ConstSlot = ConstSlot(4096);
 pub const MK_FC_CAL: ConstSlot = ConstSlot(4100);
 pub const MK_FC_LOAD: ConstSlot = ConstSlot(4200);

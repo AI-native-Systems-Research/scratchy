@@ -1099,7 +1099,7 @@ fn bake_bucket<W: CanonicalParams>(
                     "[megakernel] bucket_m={} {} generated kernels and {} commands' own kernels \
                      play {} of {} commands in {} launches per forward; library {} ({} bytes \
                      metallib) loaded in {:?}; pipelines built in {:?}; \
-                     maxTotalThreadsPerThreadgroup {:?}; threadgroups per launch P={}",
+                     maxTotalThreadsPerThreadgroup {:?}; threadgroups per launch {:?}",
                     tape.bucket_m,
                     load.kernels,
                     load.natives,

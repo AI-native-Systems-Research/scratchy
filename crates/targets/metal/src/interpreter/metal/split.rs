@@ -6,17 +6,20 @@
 //! ([`MkWork`]). What those cost differs from GPU to GPU, so it is measured HERE, on the GPU the
 //! forward runs on, with synthetic work — no model, no weights ([`DeviceFacts`]) — and the plan is
 //! solved from it: per region, the cheapest tiling of its units by runs and dispatch kernels
-//! ([`cheapest_tiling`], exact), each run's work split over the cores chosen to finish its busiest
-//! core first ([`split_run`]).
+//! ([`cheapest_tiling`], exact), each run's work split over the threadgroups chosen to finish its
+//! busiest threadgroup first ([`split_run`]).
 //!
 //! # The costs
 //!
 //! A launch costs a dependent launch boundary — a bare launch's ([`DeviceFacts::launch`]), or
 //! for a launch streaming weights its body's draining and filling ([`StreamFacts::boundary`]) —
-//! plus its busiest core's work. A spread step's items go round-robin over the cores; an item of `K` virtual threadgroups
-//! of a streaming step costs its weight bytes at the rate ONE core streams its body's calibration
-//! ([`MkCalibration`]: the matvec body on synthetic weights at the step's row length) with items
-//! of `K` while every core does ([`StreamFacts::lane`]); every other item, and every step of a
+//! plus its busiest threadgroup's work. A launch runs `m` threadgroups per core: no threadgroup
+//! of it waits on another, so they need never run at once, and more than one per core keeps more
+//! of the memory system busy where one cannot. A spread step's items go round-robin over the
+//! threadgroups; an item of `K` virtual threadgroups of a streaming step costs its weight bytes at
+//! the rate ONE threadgroup streams its body's calibration ([`MkCalibration`]: the matvec body on
+//! synthetic weights at the step's row length) with items of `K` while every threadgroup of the
+//! launch does, `m` per core ([`StreamFacts::lane`]); every other item, and every step of a
 //! pinned or copied unit, costs at least a dependent step inside one threadgroup
 //! ([`DeviceFacts::step`]). A step played by its own dispatch kernel costs a launch boundary plus
 //! its weight bytes at the rate the whole GPU streams the calibration one virtual threadgroup per
@@ -37,7 +40,8 @@ use crate::mtl4_dispatch::{Buffer, Mtl4DispatchBatch, shared_slice, shared_zeroe
 use crate::tape::constants::{ConstSlot, ConstantValue};
 use crate::tape::ids::{GpuCores, HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
 use crate::tape::lowered::{
-    MK_FC_CAL, MK_THREADS, MegakernelError, MkCalibration, MkPlace, MkRegion, MkRun, MkWork,
+    MK_FC_CAL, MK_FC_P, MK_THREADS, MegakernelError, MkCalibration, MkPlace, MkRegion, MkRun,
+    MkWork,
 };
 
 /// Time on the GPU.
@@ -82,7 +86,7 @@ impl fmt::Display for BytesPerSecond {
 /// What the split's costs are, on one GPU — each measured with synthetic work.
 #[derive(Clone, Debug)]
 pub struct DeviceFacts {
-    /// The threadgroups a generated launch runs: one per core.
+    /// The GPU's cores: a generated launch runs a whole number of threadgroups per core.
     pub cores: GpuCores,
     /// A dependent launch boundary before a launch streaming nothing: a barrier, then a launch (a
     /// chain of launches of a generated launch's shape that each bump what the last wrote). A
@@ -98,9 +102,10 @@ pub struct DeviceFacts {
 /// How fast the device streams one calibration's matvec body.
 #[derive(Clone, Debug)]
 pub struct StreamFacts {
-    /// Bytes per second ONE core streams with items of `K` virtual threadgroups (at `K − 1`), one
-    /// threadgroup per core taking items round-robin as a run spreads a step.
-    pub lane: Vec<BytesPerSecond>,
+    /// Bytes per second ONE threadgroup streams with items of `K` virtual threadgroups, `m`
+    /// threadgroups per core taking items round-robin as a run spreads a step (at `[m − 1][K − 1]`):
+    /// for `m = 1, 2, …` while the GPU streams faster with each — at least one.
+    pub lane: Vec<Vec<BytesPerSecond>>,
     /// Bytes per second the whole GPU streams one virtual threadgroup per threadgroup, as the
     /// step's own dispatch kernel.
     pub native: BytesPerSecond,
@@ -113,13 +118,15 @@ pub struct StreamFacts {
 /// Weight bytes a streaming calibration reads per pass: far beyond any Apple GPU's last-level
 /// cache, so every pass streams from DRAM.
 const STREAM_BYTES: u64 = 128 << 20;
-/// GPU time the first calibration streams untimed before any is measured; dependent steps run
-/// untimed before the first launch and step are.
+/// GPU time each calibration streams untimed before it is measured (the GPU idles while the load
+/// builds pipelines between calibrations, and may slow its clocks); dependent steps run untimed
+/// before the first launch and step are.
 const WARM: Seconds = Seconds(0.05);
 const WARM_STEPS: u32 = 25_000;
-/// Passes per timed batch, and timed batches per measurement (the fastest counts).
+/// Passes per timed batch, and timed batches per measurement: the fastest counts, since what
+/// disturbs a measurement only ever slows it.
 const PASSES: usize = 2;
-const TRIALS: usize = 2;
+const TRIALS: usize = 4;
 /// Dependent launches a calibration's stream is split into to time a launch boundary.
 const SPLITS: u32 = 64;
 /// Timed batches of each, the fastest counting.
@@ -203,9 +210,6 @@ struct Probe<'a> {
     pipelines: &'a SpecializedPipelines,
     cores: GpuCores,
     sink: Buffer,
-    /// Whether the GPU has streamed long enough to run as a decode keeps it (clocks up, the
-    /// weights' pages mapped).
-    warm: std::cell::Cell<bool>,
 }
 
 impl<'a> Probe<'a> {
@@ -219,7 +223,6 @@ impl<'a> Probe<'a> {
             pipelines,
             cores,
             sink: shared_zeroed(device, 16),
-            warm: std::cell::Cell::new(false),
         })
     }
 
@@ -317,9 +320,10 @@ impl<'a> Probe<'a> {
     }
 
     /// How fast the device streams calibration `c` (in `library`) over synthetic weights: per
-    /// items of `K = 1..=widest` virtual threadgroups round-robin over one threadgroup per core
-    /// (the busiest core's bytes over the pass), and as its own dispatch kernel (every byte over
-    /// the pass).
+    /// items of `K = 1..=widest` virtual threadgroups round-robin over `m` threadgroups per core
+    /// (the busiest threadgroup's bytes over the pass) — `m = 1, 2, …` until the fastest `K` of
+    /// one `m` streams the pass no faster than the last's — and as its own dispatch kernel (every
+    /// byte over the pass).
     fn stream(
         &self,
         library: &'static str,
@@ -389,13 +393,11 @@ impl<'a> Probe<'a> {
             height: ty as usize,
             depth: tz as usize,
         };
-        // The GPU streaming first, as a decode keeps it, untimed: a batch — and before the
-        // probe's first measurement, at least `WARM` of streaming.
-        let mut warmed = batch(&pso, 1, vtgs, tpg, 1)?;
-        if !self.warm.replace(true) {
-            while warmed < WARM {
-                warmed = warmed + batch(&pso, 1, vtgs, tpg, 1)?;
-            }
+        // The GPU streaming first, as a decode keeps it (clocks up, the weights' pages mapped),
+        // untimed: at least `WARM` of it.
+        let mut warmed = Seconds(0.0);
+        while warmed < WARM {
+            warmed = warmed + batch(&pso, 1, vtgs, tpg, 1)?;
         }
         let pass = |pso: &ComputePipelineState, k: u32, grid: u32, tpg: MTLSize| {
             let secs = batch(pso, k, grid, tpg, TRIALS)?;
@@ -438,13 +440,24 @@ impl<'a> Probe<'a> {
             }
         })?;
         let boundary = Seconds(((split.0 - one.0) / f64::from(SPLITS - 1)).max(0.0));
-        let cores = self.cores.get();
         let pso = self.pipeline(library, c.lane, vec![ConstantValue::uint(n_slot, n)])?;
-        let mut lane = Vec::with_capacity(c.widest as usize);
-        for k in 1..=c.widest {
-            let secs = pass(&pso, k, cores, size(MK_THREADS))?;
-            let busiest = vtgs.div_ceil(k).div_ceil(cores) * k;
-            lane.push(BytesPerSecond(f64::from(busiest) * vtg_bytes as f64 / secs));
+        let mut lane: Vec<Vec<BytesPerSecond>> = Vec::new();
+        let mut fastest = 0.0;
+        for m in 1.. {
+            let p = m * self.cores.get();
+            let mut rates = Vec::with_capacity(c.widest as usize);
+            let mut pass_rate: f64 = 0.0;
+            for k in 1..=c.widest {
+                let secs = pass(&pso, k, p, size(MK_THREADS))?;
+                let busiest = vtgs.div_ceil(k).div_ceil(p) * k;
+                rates.push(BytesPerSecond(f64::from(busiest) * vtg_bytes as f64 / secs));
+                pass_rate = pass_rate.max(f64::from(vtgs) * vtg_bytes as f64 / secs);
+            }
+            if !lane.is_empty() && pass_rate <= fastest {
+                break;
+            }
+            fastest = pass_rate;
+            lane.push(rates);
         }
         Ok(StreamFacts {
             lane,
@@ -489,12 +502,13 @@ pub struct Costed {
 }
 
 impl Costed {
-    /// One item of `k` virtual threadgroups on one core.
-    fn item(&self, k: u32, facts: &DeviceFacts) -> Seconds {
+    /// One item of `k` virtual threadgroups on one threadgroup, `m` per core.
+    fn item(&self, k: u32, m: u32, facts: &DeviceFacts) -> Seconds {
         match self.work.stream {
             None => facts.step,
             Some(st) => {
-                let lane = &facts.streams[st.calibration as usize].lane;
+                let lanes = &facts.streams[st.calibration as usize].lane;
+                let lane = &lanes[(m.clamp(1, lanes.len() as u32) - 1) as usize];
                 let rate = lane[(k.clamp(1, lane.len() as u32) - 1) as usize];
                 facts
                     .step
@@ -503,10 +517,10 @@ impl Costed {
         }
     }
 
-    /// Every item, one threadgroup playing them all at its widest.
-    fn whole(&self, facts: &DeviceFacts) -> Seconds {
+    /// Every item, one threadgroup (`m` per core) playing them all at its widest.
+    fn whole(&self, m: u32, facts: &DeviceFacts) -> Seconds {
         let k = self.vtgs.min(self.work.widest).max(1);
-        let one = self.item(k, facts);
+        let one = self.item(k, m, facts);
         Seconds(one.0 * f64::from(self.vtgs.div_ceil(k)))
     }
 
@@ -538,11 +552,12 @@ impl Costed {
     }
 }
 
-/// A run's work split over the launch's threadgroups: per spread unit (in order) its items'
-/// virtual threadgroups `k` and its first item's cursor `c`; per lane group its threadgroup; and
-/// what the launch costs.
+/// A run's work split: the launch's threadgroups; per spread unit (in order) its items' virtual
+/// threadgroups `k` and its first item's cursor `c`; per lane group its threadgroup; and what the
+/// launch costs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunSplit {
+    pub threadgroups: u32,
     pub k: Vec<u32>,
     pub c: Vec<u32>,
     pub lanes: Vec<u32>,
@@ -550,19 +565,19 @@ pub struct RunSplit {
 }
 
 impl RunSplit {
-    /// The run's split as its kernel's function constants ([`MkRun::split_at`]).
+    /// The run's split as its kernel's function constants: its threadgroups `MK_P`, then from
+    /// [`MkRun::split_at`] its spread units' and lane groups'.
     pub fn constants(&self, run: &MkRun) -> Vec<ConstantValue> {
         let at = run.split_at.get();
         let spread = self.k.iter().zip(&self.c).enumerate();
-        let mut out: Vec<ConstantValue> = spread
-            .flat_map(|(i, (&k, &c))| {
-                let i = i as u16;
-                [
-                    ConstantValue::uint(ConstSlot(at + 2 * i), k),
-                    ConstantValue::uint(ConstSlot(at + 2 * i + 1), c),
-                ]
-            })
-            .collect();
+        let mut out = vec![ConstantValue::uint(MK_FC_P, self.threadgroups)];
+        out.extend(spread.flat_map(|(i, (&k, &c))| {
+            let i = i as u16;
+            [
+                ConstantValue::uint(ConstSlot(at + 2 * i), k),
+                ConstantValue::uint(ConstSlot(at + 2 * i + 1), c),
+            ]
+        }));
         let groups = (2 * self.k.len()) as u16;
         out.extend(
             (self.lanes.iter().enumerate())
@@ -572,44 +587,29 @@ impl RunSplit {
     }
 }
 
-/// `run`'s work split over the device's cores, and its cost: every spread streaming step plays
-/// items of the same threads per core `t` (as many virtual threadgroups as `t` holds, at least
-/// one, at most its widest), every other spread step its widest; items go round-robin, the
-/// cursor continuing from step to step; each lane group takes the least loaded threadgroup,
-/// heaviest first; copied units load every threadgroup. The `t` whose busiest threadgroup
-/// finishes first wins, the fewest threads on a tie.
+/// `run`'s work split over `m` threadgroups per core, and its cost: every spread streaming step
+/// plays items of the same threads per threadgroup `t` (as many virtual threadgroups as `t`
+/// holds, at least one, at most its widest), every other spread step its widest; items go
+/// round-robin, the cursor continuing from step to step; each lane group takes the least loaded
+/// threadgroup, heaviest first; copied units load every threadgroup. `m` runs over every count
+/// per core the run's streaming bodies were measured at (one without any). The `(m, t)` whose
+/// busiest threadgroup finishes first wins, the fewest threadgroups then threads on a tie.
 pub fn split_run(
     region: &MkRegion,
     run: &MkRun,
     steps: &[Costed],
     facts: &DeviceFacts,
 ) -> RunSplit {
-    let p = facts.cores.get() as usize;
     let units = &region.units[run.first as usize..run.end as usize];
     let unit_steps = |u: usize| &steps[units[u].first as usize..units[u].end as usize];
-    // A pinned or copied unit's work: each step whole on its threadgroup.
-    let held = |u: usize| {
-        (unit_steps(u).iter())
-            .map(|s| s.whole(facts))
-            .fold(Seconds(0.0), Add::add)
-    };
-    let mut copies = Seconds(0.0);
-    let mut groups = vec![
-        Seconds(0.0);
-        run.places
-            .iter()
-            .filter_map(lane_group)
-            .max()
-            .map_or(0, |g| g + 1) as usize
-    ];
-    let mut spread: Vec<Costed> = Vec::new();
-    for (u, place) in run.places.iter().enumerate() {
-        match *place {
-            MkPlace::Spread => spread.push(unit_steps(u)[0]),
-            MkPlace::Lane(g) => groups[g as usize] = groups[g as usize] + held(u),
-            MkPlace::Everywhere => copies = copies + held(u),
-        }
-    }
+    let lane_groups = (run.places.iter())
+        .filter_map(lane_group)
+        .max()
+        .map_or(0, |g| g + 1) as usize;
+    let spread: Vec<Costed> = (run.places.iter().enumerate())
+        .filter(|(_, place)| matches!(place, MkPlace::Spread))
+        .map(|(u, _)| unit_steps(u)[0])
+        .collect();
     let mut widths: BTreeSet<u32> = (spread.iter())
         .filter(|s| s.work.stream.is_some())
         .flat_map(|s| lane_threads(&s.work))
@@ -621,52 +621,76 @@ pub fn split_run(
     let boundary = (spread.iter())
         .map(|s| s.boundary(facts))
         .fold(facts.launch, Seconds::max);
-    let mut order: Vec<usize> = (0..groups.len()).collect();
-    order.sort_by(|&a, &b| {
-        groups[b]
-            .partial_cmp(&groups[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let per_core = (spread.iter())
+        .filter_map(|s| s.work.stream)
+        .map(|st| facts.streams[st.calibration as usize].lane.len() as u32)
+        .min()
+        .unwrap_or(1);
     let mut best: Option<RunSplit> = None;
-    for t in widths {
-        let k: Vec<u32> = (spread.iter())
-            .map(|s| match s.work.stream {
-                None => s.work.widest,
-                Some(_) => (t / s.work.vtg_threads).clamp(1, s.work.widest),
-            })
-            .collect();
-        let mut load = vec![copies; p];
-        let mut cursor = 0u32;
-        let mut c = Vec::with_capacity(spread.len());
-        for (s, &k) in spread.iter().zip(&k) {
-            let n = s.vtgs.div_ceil(k);
-            let one = s.item(k, facts);
-            let (base, extra) = (n / p as u32, n as usize % p);
-            for (l, w) in load.iter_mut().enumerate() {
-                let at = (l + p - cursor as usize % p) % p;
-                let mine = base + u32::from(at < extra);
-                *w = *w + Seconds(one.0 * f64::from(mine));
-            }
-            c.push(cursor);
-            cursor += n;
-        }
-        let mut lanes = vec![0u32; groups.len()];
-        for &g in &order {
-            let (l, _) = (load.iter().enumerate())
-                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                .expect("a launch has a threadgroup");
-            load[l] = load[l] + groups[g];
-            lanes[g] = l as u32;
-        }
-        let busiest = load.iter().copied().fold(Seconds(0.0), Seconds::max);
-        let split = RunSplit {
-            k,
-            c,
-            lanes,
-            seconds: boundary + busiest,
+    for m in 1..=per_core {
+        let p = (m * facts.cores.get()) as usize;
+        // A pinned or copied unit's work: each step whole on its threadgroup.
+        let held = |u: usize| {
+            (unit_steps(u).iter())
+                .map(|s| s.whole(m, facts))
+                .fold(Seconds(0.0), Add::add)
         };
-        if best.as_ref().is_none_or(|b| split.seconds < b.seconds) {
-            best = Some(split);
+        let mut copies = Seconds(0.0);
+        let mut groups = vec![Seconds(0.0); lane_groups];
+        for (u, place) in run.places.iter().enumerate() {
+            match *place {
+                MkPlace::Spread => {}
+                MkPlace::Lane(g) => groups[g as usize] = groups[g as usize] + held(u),
+                MkPlace::Everywhere => copies = copies + held(u),
+            }
+        }
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by(|&a, &b| {
+            groups[b]
+                .partial_cmp(&groups[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &t in &widths {
+            let k: Vec<u32> = (spread.iter())
+                .map(|s| match s.work.stream {
+                    None => s.work.widest,
+                    Some(_) => (t / s.work.vtg_threads).clamp(1, s.work.widest),
+                })
+                .collect();
+            let mut load = vec![copies; p];
+            let mut cursor = 0u32;
+            let mut c = Vec::with_capacity(spread.len());
+            for (s, &k) in spread.iter().zip(&k) {
+                let n = s.vtgs.div_ceil(k);
+                let one = s.item(k, m, facts);
+                let (base, extra) = (n / p as u32, n as usize % p);
+                for (l, w) in load.iter_mut().enumerate() {
+                    let at = (l + p - cursor as usize % p) % p;
+                    let mine = base + u32::from(at < extra);
+                    *w = *w + Seconds(one.0 * f64::from(mine));
+                }
+                c.push(cursor);
+                cursor += n;
+            }
+            let mut lanes = vec![0u32; groups.len()];
+            for &g in &order {
+                let (l, _) = (load.iter().enumerate())
+                    .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .expect("a launch has a threadgroup");
+                load[l] = load[l] + groups[g];
+                lanes[g] = l as u32;
+            }
+            let busiest = load.iter().copied().fold(Seconds(0.0), Seconds::max);
+            let split = RunSplit {
+                threadgroups: p as u32,
+                k,
+                c,
+                lanes,
+                seconds: boundary + busiest,
+            };
+            if best.as_ref().is_none_or(|b| split.seconds < b.seconds) {
+                best = Some(split);
+            }
         }
     }
     best.expect("at least one width is weighed")
@@ -776,9 +800,11 @@ mod tests {
             launch: Seconds(5e-6),
             step: Seconds(1.5e-6),
             streams: vec![StreamFacts {
-                lane: (1..=16)
-                    .map(|k| BytesPerSecond(10e9 + 1e8 * f64::from(k)))
-                    .collect(),
+                lane: vec![
+                    (1..=16)
+                        .map(|k| BytesPerSecond(10e9 + 1e8 * f64::from(k)))
+                        .collect(),
+                ],
                 native: BytesPerSecond(100e9),
                 boundary: Seconds(5e-6),
             }],
@@ -858,9 +884,50 @@ mod tests {
                 s.k
             );
             assert_eq!(s.c, vec![0, 384u32.div_ceil(s.k[0])], "{p} cores");
-            assert!(s.lanes.iter().all(|&l| l < p), "{p} cores: {:?}", s.lanes);
+            assert_eq!(s.threadgroups, p, "one measured per core: one per core");
+            assert!(
+                s.lanes.iter().all(|&l| l < s.threadgroups),
+                "{p} cores: {:?}",
+                s.lanes
+            );
             assert!(s.seconds > f.launch, "{p} cores");
         }
+    }
+
+    /// Where two threadgroups per core stream faster than one, a spread matvec's launch runs two
+    /// per core, its lanes among them; where they do not, one.
+    #[test]
+    fn a_launch_runs_as_many_threadgroups_per_core_as_stream_fastest() {
+        let steps = [qmv(640), norm()];
+        let units: &[MkUnit] = &[MkUnit { first: 0, end: 1 }, MkUnit { first: 1, end: 2 }];
+        let run = MkRun {
+            kernel: "mk_r0",
+            first: 0,
+            end: 2,
+            places: &[MkPlace::Spread, MkPlace::Lane(0)],
+            waits: &[],
+            split_at: ConstSlot(16384),
+        };
+        let region = MkRegion {
+            opens: 0,
+            required: 1,
+            table_at: 0,
+            block_len: 0,
+            units,
+            runs: Box::leak(Box::new([run])),
+        };
+        let mut f = facts(10);
+        let one = f.streams[0].lane[0].clone();
+        // Each of two per core streams at 3/4 of one alone: 1.5x the core.
+        let two: Vec<BytesPerSecond> = one.iter().map(|r| BytesPerSecond(r.0 * 0.75)).collect();
+        f.streams[0].lane.push(two);
+        let s = split_run(&region, &region.runs[0], &steps, &f);
+        assert_eq!(s.threadgroups, 20, "{s:?}");
+        assert!(s.lanes.iter().all(|&l| l < 20), "{s:?}");
+        // Each at 2/5: slower than one alone.
+        f.streams[0].lane[1] = one.iter().map(|r| BytesPerSecond(r.0 * 0.4)).collect();
+        let s = split_run(&region, &region.runs[0], &steps, &f);
+        assert_eq!(s.threadgroups, 10, "{s:?}");
     }
 
     /// The tiling weighs a launch boundary against a copy and against a step's own kernel: with
