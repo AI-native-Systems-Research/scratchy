@@ -162,6 +162,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 /// Log the available API routes.
 fn log_routes(state: &AppState) {
+    #[cfg(feature = "tool-spans")]
+    tracing::warn!(
+        "tool-spans: EXPERIMENTAL build. Tools-bearing /v1/messages requests \
+         bypass the model's tool template and will NOT produce tool_use \
+         blocks. See issue #193."
+    );
+
     info!("Available routes are:");
     info!("Route: /v1/chat/completions, Methods: POST");
     info!("Route: /v1/chat/completions/render, Methods: POST");
@@ -593,11 +600,7 @@ async fn tokenize(
                     .into_response();
                 }
             };
-            let message_values: Vec<serde_json::Value> = messages
-                .iter()
-                .map(|msg| serde_json::to_value(msg).unwrap_or_default())
-                .collect();
-            match template.apply(&message_values, request.add_generation_prompt, None) {
+            match template.render_chat(messages, None, None, None, request.add_generation_prompt) {
                 Ok(text) => text,
                 Err(e) => {
                     return Json(protocol::ErrorResponse::new(

@@ -425,17 +425,28 @@ fn convert_response(resp: protocol::ChatCompletionResponse) -> MessagesResponse 
 
 // ---------------------------------------------------------------------------
 // Spans mode: each tool a relocatable Plus span
+//
+// EXPERIMENTAL and KNOWN BROKEN. Gated on the off-by-default `tool-spans`
+// feature: `render_tool` writes its own plain text rather than going through
+// the model's chat template, so the model is never put in its native
+// tool-calling format, the tool parser never fires, and a request that asked
+// for a `tool_use` gets prose. Tracked, with measurements, in
+// https://github.com/AI-native-Systems-Research/scratchy/issues/193.
+//
+// The idea: tool schemas are a position-independent *set*, so each tool can be
+// its own independently-cacheable relocatable span
+// (`Cross([system, Plus([tool₁…toolₙ]), conversation])`) with a block-diagonal
+// attention bound, instead of one ordered prefix that any edit invalidates.
 // ---------------------------------------------------------------------------
 
-/// Per-tool relocatable spans for tools-bearing `/v1/messages` requests are
-/// always on — each tool becomes an independently-cacheable relocatable span
-/// (`Cross([system, Plus([tool₁…toolₙ]), conversation])`) with a
-/// block-diagonal attention bound.
-fn spans_enabled() -> bool {
-    true
+/// Whether this request is served as per-tool relocatable spans.
+#[cfg(feature = "tool-spans")]
+fn spans_enabled(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|t| !t.is_empty())
 }
 
 /// Render one tool definition as the text of its relocatable span.
+#[cfg(feature = "tool-spans")]
 fn render_tool(t: &AnthropicTool) -> String {
     format!(
         "Tool: {}\nDescription: {}\nInput schema: {}",
@@ -447,6 +458,7 @@ fn render_tool(t: &AnthropicTool) -> String {
 
 /// Flatten the conversation (text + tool-result text) into ordered blocks,
 /// each with its client-declared `cache_control` breakpoint flag.
+#[cfg(feature = "tool-spans")]
 fn conversation_blocks(messages: &[AnthropicMessage]) -> Vec<(String, bool)> {
     let mut parts = Vec::new();
     for m in messages {
@@ -497,6 +509,7 @@ fn conversation_blocks(messages: &[AnthropicMessage]) -> Vec<(String, bool)> {
 /// guessing about block sizes or shapes. A request with no breakpoints keeps
 /// the conservative shape: fresh system, per-tool spans (tool schemas are
 /// position-independent sets by definition), fresh conversation.
+#[cfg(feature = "tool-spans")]
 fn build_spnl_query(req: &MessagesRequest) -> String {
     let sys_blocks: Vec<(String, bool)> = match &req.system {
         None => vec![],
@@ -587,6 +600,7 @@ fn build_spnl_query(req: &MessagesRequest) -> String {
 /// Convert a raw completion response (from the spans path) into a `MessagesResponse`,
 /// applying the engine's tool-call parser so the model's tool calls surface as
 /// `tool_use` blocks (exactly what the flat chat path does internally).
+#[cfg(feature = "tool-spans")]
 fn completion_to_messages_response(
     resp: protocol::CompletionResponse,
     parser: Option<&std::sync::Arc<dyn crate::tool_parser::ToolCallParser>>,
@@ -649,6 +663,7 @@ fn completion_to_messages_response(
 /// streaming SSE sequence so `stream:true` clients (Claude Code) get a valid
 /// event stream. The prefill — the part spans accelerates — already happened;
 /// the decode is small, so buffering it before replaying is fine.
+#[cfg(feature = "tool-spans")]
 fn stream_buffered_messages_response(
     msg: MessagesResponse,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
@@ -755,16 +770,14 @@ pub async fn messages(
     let is_stream = request.stream;
 
     // Spans mode: render a tools-bearing request as per-tool relocatable
-    // spans. The buffered
-    // completion is tool-parsed and returned as JSON or, for `stream:true`,
-    // replayed as Anthropic SSE so streaming clients (Claude Code) work too.
-    if spans_enabled()
-        && request
-            .tools
-            .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
-    {
+    // spans. The buffered completion is tool-parsed and returned as JSON or,
+    // for `stream:true`, replayed as Anthropic SSE so streaming clients
+    // (Claude Code) work too.
+    //
+    // Compiled out unless the build names the experimental `tool-spans`
+    // feature — see the spans section above for why it is not shipped.
+    #[cfg(feature = "tool-spans")]
+    if spans_enabled(&request) {
         let spnl = build_spnl_query(&request);
         match crate::query::anthropic_spans_completion(&state, &spnl).await {
             Ok(resp) => {
@@ -1026,6 +1039,36 @@ fn stream_messages_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a tools-bearing request takes the span path.
+    #[cfg(feature = "tool-spans")]
+    #[test]
+    fn test_spans_only_for_tools_bearing_requests() {
+        let with_tools: MessagesRequest = serde_json::from_str(
+            r#"{
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "List the files"}],
+            "tools": [{
+                "name": "Bash",
+                "description": "Run a command",
+                "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }]
+        }"#,
+        )
+        .unwrap();
+        assert!(spans_enabled(&with_tools));
+
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}"#,
+        )
+        .unwrap();
+        assert!(!spans_enabled(&req));
+
+        // An empty `tools` array is not a tools-bearing request either.
+        let mut empty_tools = req;
+        empty_tools.tools = Some(vec![]);
+        assert!(!spans_enabled(&empty_tools));
+    }
 
     #[test]
     fn test_deserialize_simple_request() {

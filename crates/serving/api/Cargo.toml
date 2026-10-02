@@ -33,6 +33,18 @@ multimodal = ["scratchy-core-model/multimodal", "dep:image", "dep:scratchy-visio
 # means a non-TLS server build never pulls tokio-rustls/arc-swap/fs-err.
 tls = ["serve", "dep:axum-server", "rustls", "rustls-pemfile"]
 metrics = ["prometheus"]
+# EXPERIMENTAL, off by default: serve a tools-bearing `/v1/messages` request as
+# per-tool relocatable spans instead of one flat chat prompt.
+#
+# ⛔ KNOWN BROKEN — the span renderer bypasses the model's chat template, so the
+# model never enters its native tool-calling format and a request that asked for
+# a `tool_use` gets prose. See the tracking issue named in `anthropic.rs`'s
+# spans section. A compile-time feature rather than a server flag because it is
+# not a mode to offer anyone: nothing but a build naming this feature can reach
+# the code.
+#
+# No-op without `serve` (everything it gates lives in modules `serve` owns).
+tool-spans = []
 multiproc = ["scratchy-serving-engine/multiproc"]
 rag = ["spnl-core/rag", "dep:leann-core", "dep:ndarray", "dep:ureq"]
 

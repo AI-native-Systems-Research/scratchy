@@ -270,14 +270,26 @@ jobs:
       - name: KTIR optimizer tests
         run: cargo test -p ktir-optimizer
 
-      # Tool-call parser logic (Hermes / Llama / Kimi / Mistral / Jamba /
-      # Granite / Gemma-4). Pure-logic unit tests with no GPU dependency —
-      # don't need a real model at runtime, but scratchy-models has no
-      # default model scope (build-time panic otherwise), so name the same
-      # tiny one the SmolLM e2e steps below use, to reuse that build.
-      - name: Tool parser unit tests
+      # Serving-layer unit tests: tool-call parsers (Hermes / Llama / Kimi /
+      # Mistral / Jamba / Granite / Gemma-4), chat-template rendering, the
+      # Anthropic `/v1/messages` translation. Pure logic, no GPU and no real
+      # model at runtime, but scratchy-models has no default model scope
+      # (build-time panic otherwise), so name the same tiny one the SmolLM e2e
+      # steps below use, to reuse that build.
+      #
+      # `serve` is required, not optional: without it `anthropic` and `server`
+      # are not compiled, so their tests cannot run. The e2e steps below need
+      # that build anyway.
+      - name: Serving-layer unit tests
         run: cargo test -p scratchy-serving-api -p scratchy-models
-          --features metal,scratchy-models/smollm2-135m --lib tool_parser
+          --features metal,serve,scratchy-models/smollm2-135m --lib
+
+      # The quarantined per-tool-spans path (#193) is off by default, so
+      # nothing above compiles it. Type-check it and run its gated tests so it
+      # cannot rot. Cheap: same deps as the step above, one extra cfg.
+      - name: Serving-layer unit tests (tool-spans quarantine)
+        run: cargo test -p scratchy-serving-api -p scratchy-models
+          --features metal,serve,tool-spans,scratchy-models/smollm2-135m --lib
 
       # Real-model e2e smoke: boot the server on Metal against SmolLM-135M and
       # generate. This exercises the full load → prefill → decode → HTTP path

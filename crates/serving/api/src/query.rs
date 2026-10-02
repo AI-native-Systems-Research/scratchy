@@ -326,6 +326,7 @@ async fn execute_single(
 /// child → `BlockKind::Relocatable`, so the prefill attention takes the
 /// block-diagonal `[span_lo, q_pos]` bound and the per-tool spans are
 /// independently cacheable across launches.
+#[cfg(feature = "tool-spans")]
 pub(crate) async fn anthropic_spans_completion(
     state: &AppState,
     spnl_json: &str,
