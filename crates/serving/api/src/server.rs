@@ -162,10 +162,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 /// Log the available API routes.
 fn log_routes(state: &AppState) {
-    // Under the SAME cfg as the code it describes, and in the crate that owns
-    // that cfg — keying it on scratchy-cli's passthrough feature instead let
-    // anything else enabling scratchy-serving-api/tool-spans (the e2e crate,
-    // another binary) serve the broken path silently.
     #[cfg(feature = "tool-spans")]
     tracing::warn!(
         "tool-spans: EXPERIMENTAL build. Tools-bearing /v1/messages requests \
@@ -625,16 +621,7 @@ async fn tokenize(
                     .into_response();
                 }
             };
-            // The same routine the engine's own prompt build uses, so the
-            // count reported here is the count of the prompt that would
-            // actually be run — normalizations, tools and kwargs included.
-            match template.render_chat(
-                messages,
-                request.tools.as_ref(),
-                None,
-                state.engine.default_chat_template_kwargs(),
-                request.add_generation_prompt,
-            ) {
+            match template.render_chat(messages, None, None, None, request.add_generation_prompt) {
                 Ok(text) => text,
                 Err(e) => {
                     return Json(protocol::ErrorResponse::new(

@@ -36,14 +36,12 @@ metrics = ["prometheus"]
 # EXPERIMENTAL, off by default: serve a tools-bearing `/v1/messages` request as
 # per-tool relocatable spans instead of one flat chat prompt.
 #
-# ⛔ KNOWN BROKEN — see the tracking issue in `anthropic.rs`'s spans section.
-# The span renderer writes tool schemas as its own `Tool: …` plain text rather
-# than through the model's chat template, so the model is never put in its
-# native tool-calling format and the tool parser never fires: a request that
-# asked for a `tool_use` gets prose. It is a compile-time feature and not a
-# server flag precisely because it is not a mode to offer anyone — a `--flag`
-# in `--help` reads as a supported option. Nothing but a build that names this
-# feature can reach the code.
+# ⛔ KNOWN BROKEN — the span renderer bypasses the model's chat template, so the
+# model never enters its native tool-calling format and a request that asked for
+# a `tool_use` gets prose. See the tracking issue named in `anthropic.rs`'s
+# spans section. A compile-time feature rather than a server flag because it is
+# not a mode to offer anyone: nothing but a build naming this feature can reach
+# the code.
 #
 # No-op without `serve` (everything it gates lives in modules `serve` owns).
 tool-spans = []

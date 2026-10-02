@@ -426,30 +426,20 @@ fn convert_response(resp: protocol::ChatCompletionResponse) -> MessagesResponse 
 // ---------------------------------------------------------------------------
 // Spans mode: each tool a relocatable Plus span
 //
-// EXPERIMENTAL and KNOWN BROKEN — everything below is gated on the off-by-
-// default `tool-spans` feature, so a normal build does not contain it. See
+// EXPERIMENTAL and KNOWN BROKEN. Gated on the off-by-default `tool-spans`
+// feature: `render_tool` writes its own plain text rather than going through
+// the model's chat template, so the model is never put in its native
+// tool-calling format, the tool parser never fires, and a request that asked
+// for a `tool_use` gets prose. Tracked, with measurements, in
 // https://github.com/AI-native-Systems-Research/scratchy/issues/193.
 //
 // The idea: tool schemas are a position-independent *set*, so each tool can be
 // its own independently-cacheable relocatable span
 // (`Cross([system, Plus([tool₁…toolₙ]), conversation])`) with a block-diagonal
 // attention bound, instead of one ordered prefix that any edit invalidates.
-//
-// Why it is off: `render_tool` writes its own `Tool: …` plain text rather than
-// going through the model's chat template, so the model is never put in its
-// native tool-calling format, the tool parser never fires, and a request that
-// asked for a `tool_use` gets prose. Measured on granite-3.3-2b-instruct-4bit,
-// one `Bash` tool: 105 prompt tokens and a `text` block here, against 218 and a
-// real `tool_use` on the flat path. The cheaper prompt is not a saving — it is
-// the tool definitions never being rendered properly.
 // ---------------------------------------------------------------------------
 
 /// Whether this request is served as per-tool relocatable spans.
-///
-/// Only ever true in a `tool-spans` build; the `cfg(not)` arm below is what a
-/// shipped binary compiles, and it sends every request down the flat chat path
-/// — the one that renders tools through the model's own template and so
-/// actually produces `tool_use` blocks.
 #[cfg(feature = "tool-spans")]
 fn spans_enabled(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|t| !t.is_empty())
@@ -598,14 +588,7 @@ fn build_spnl_query(req: &MessagesRequest) -> String {
     cross.push(serde_json::json!({ "user": fresh.join("\n") }));
     serde_json::json!({
         "g": {
-            // SPNL's `Generate.model` is a required String, so a client that
-            // omitted `model` (it is optional on this endpoint, and the flat
-            // path just forwards the `None`) must not render as `null` — that
-            // failed the SPNL parse and 400'd a request the flat path serves.
-            // Empty means "unset" to `anthropic_spans_completion`, which then
-            // lets the engine name the model it actually loaded, as the flat
-            // path does. The two arms have to accept the same requests.
-            "model": req.model.clone().unwrap_or_default(),
+            "model": req.model,
             "max_tokens": req.max_tokens,
             "temperature": req.temperature.unwrap_or(0.0),
             "input": { "cross": cross }
@@ -1057,11 +1040,12 @@ fn stream_messages_response(
 mod tests {
     use super::*;
 
-    /// A tools-bearing request, as Claude Code sends them.
-    fn tools_request() -> MessagesRequest {
-        serde_json::from_str(
+    /// Only a tools-bearing request takes the span path.
+    #[cfg(feature = "tool-spans")]
+    #[test]
+    fn test_spans_only_for_tools_bearing_requests() {
+        let with_tools: MessagesRequest = serde_json::from_str(
             r#"{
-            "model": "claude-3-sonnet",
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "List the files"}],
             "tools": [{
@@ -1071,72 +1055,8 @@ mod tests {
             }]
         }"#,
         )
-        .unwrap()
-    }
-
-    /// The shipped path for a tools-bearing request must declare the tools to
-    /// the engine — that is what lets the chat template render them in the
-    /// model's native tool format, which is the whole reason the span renderer
-    /// is not shipped.
-    #[test]
-    fn test_tools_request_declares_the_tools_to_the_engine() {
-        let chat = convert_request(tools_request());
-        assert_eq!(chat.messages.len(), 1);
-        let tools = chat.tools.expect("tools should survive conversion");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].function.name, "Bash");
-    }
-
-    /// A `tool_use` assistant turn must convert to a `tool_calls` message with
-    /// its arguments intact — the shape the chat template then has to render.
-    #[test]
-    fn test_tool_use_turn_converts_to_tool_calls() {
-        let req: MessagesRequest = serde_json::from_str(
-            r#"{
-            "max_tokens": 100,
-            "messages": [
-                {"role": "user", "content": "Run ls"},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "toolu_1", "name": "Bash",
-                     "input": {"command": "ls"}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Cargo.toml"}
-                ]}
-            ]
-        }"#,
-        )
         .unwrap();
-
-        let chat = convert_request(req);
-        let assistant = chat
-            .messages
-            .iter()
-            .find(|m| m.role == "assistant")
-            .expect("assistant turn");
-        let calls = assistant
-            .tool_calls
-            .as_ref()
-            .expect("tool_use becomes tool_calls");
-        assert_eq!(calls[0].function.name, "Bash");
-        // No text in the block, so no content — which is exactly the shape that
-        // needs `chat_template::default_absent_content` to render at all.
-        assert!(assistant.content.is_none());
-
-        let tool_msg = chat
-            .messages
-            .iter()
-            .find(|m| m.role == "tool")
-            .expect("tool_result becomes a tool message");
-        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("toolu_1"));
-    }
-
-    /// In a `tool-spans` build, only a tools-bearing request takes the span
-    /// path; the gate is otherwise compiled out entirely.
-    #[cfg(feature = "tool-spans")]
-    #[test]
-    fn test_spans_only_for_tools_bearing_requests() {
-        assert!(spans_enabled(&tools_request()));
+        assert!(spans_enabled(&with_tools));
 
         let req: MessagesRequest = serde_json::from_str(
             r#"{"max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}"#,
@@ -1148,19 +1068,6 @@ mod tests {
         let mut empty_tools = req;
         empty_tools.tools = Some(vec![]);
         assert!(!spans_enabled(&empty_tools));
-    }
-
-    /// In a `tool-spans` build, a request that named no `model` must still
-    /// render a parseable SPNL query — `Generate.model` is a required String,
-    /// and emitting `null` there 400'd a request the flat path serves.
-    #[cfg(feature = "tool-spans")]
-    #[test]
-    fn test_spnl_query_for_model_less_request_parses() {
-        let mut req = tools_request();
-        req.model = None;
-        let q = build_spnl_query(&req);
-        let parsed: serde_json::Value = serde_json::from_str(&q).unwrap();
-        assert_eq!(parsed["g"]["model"], "");
     }
 
     #[test]

@@ -226,18 +226,16 @@ jobs:
       # (build-time panic otherwise), so name the same tiny one the SmolLM e2e
       # steps below use, to reuse that build.
       #
-      # `serve` is NOT optional here and the run is NOT filtered: without the
-      # feature `anthropic`/`server` are not even compiled, and filtering to
-      # `tool_parser` is how the chat-template regression guard for the
-      # tool-call render 500 (#194) came to exist without CI ever running it.
-      # The e2e steps below need `serve` anyway, so this reuses their build.
+      # `serve` is required, not optional: without it `anthropic` and `server`
+      # are not compiled, so their tests cannot run. The e2e steps below need
+      # that build anyway.
       - name: Serving-layer unit tests
         run: cargo test -p scratchy-serving-api -p scratchy-models
           --features metal,serve,scratchy-models/smollm2-135m --lib
 
       # The quarantined per-tool-spans path (#193) is off by default, so
-      # nothing above compiles it and it would rot silently. Type-check it and
-      # run its own gated tests. Cheap: same deps as the step above, one cfg.
+      # nothing above compiles it. Type-check it and run its gated tests so it
+      # cannot rot. Cheap: same deps as the step above, one extra cfg.
       - name: Serving-layer unit tests (tool-spans quarantine)
         run: cargo test -p scratchy-serving-api -p scratchy-models
           --features metal,serve,tool-spans,scratchy-models/smollm2-135m --lib

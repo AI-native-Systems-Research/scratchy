@@ -1105,13 +1105,6 @@ pub struct TokenizeRequest {
     /// Whether to add the generation prompt when using chat messages.
     #[serde(default = "default_true")]
     pub add_generation_prompt: bool,
-
-    /// Tool definitions to render into the prompt, as `/v1/chat/completions`
-    /// takes them. Without these the count comes back short of what the same
-    /// messages would actually cost — the tool block is usually the largest
-    /// part of an agent's prompt.
-    #[serde(default)]
-    pub tools: Option<Vec<ChatCompletionToolsParam>>,
 }
 
 /// Response body for `POST /tokenize`.

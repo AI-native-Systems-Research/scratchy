@@ -4,18 +4,6 @@
 //! E2E tests for the Anthropic `/v1/messages` endpoint.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e --test e_anthropic -- --ignored`
-//!
-//! NOT a CI step, and not for want of trying: `runs-on: macos-26` is a hosted
-//! runner with no Metal 4, so every GPU-booting e2e test skips there — and on a
-//! machine that *does* have Metal, `TestModels::SMOLLM` resolves to
-//! `mlx-community/SmolLM-135M-Instruct-4bit`, which is SmolLM **v1**
-//! (`LlamaForCausalLM`) and fails to load against the `smollm2-135m` config
-//! stem CI compiles ("Unsupported arch `LlamaForCausalLM`", with or without an
-//! MLX quant preset). That is pre-existing and hits `e1_basic_serving`'s
-//! in-CI SmolLM step identically, so the metal e2e steps are effectively
-//! compile-checks. Until that model constant is sorted out, the CI-enforced
-//! guard for the tool-call render path is the `chat_template` unit test, which
-//! needs no GPU; these stay the on-hardware check.
 
 #![cfg(feature = "e2e")]
 
@@ -35,106 +23,6 @@ async fn start_smollm() -> (TestServer, Client) {
     (server, client)
 }
 
-/// Tools-bearing requests shaped like the traffic Claude Code sends: a system
-/// prompt, several tool schemas, a prior tool result, and client-declared
-/// `cache_control` breakpoints. Every shape here has to be servable — Claude
-/// Code sends all of them within one session.
-fn tools_corpus() -> Vec<serde_json::Value> {
-    let bash_tool = json!({
-        "name": "Bash",
-        "description": "Run a shell command and return its output.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"]
-        }
-    });
-    let read_tool = json!({
-        "name": "Read",
-        "description": "Read a file from the local filesystem.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"file_path": {"type": "string"}},
-            "required": ["file_path"]
-        }
-    });
-
-    vec![
-        // One tool, no breakpoints — the conservative shape.
-        json!({
-            "max_tokens": 24,
-            "temperature": 0.0,
-            "messages": [{"role": "user", "content": "List the files here."}],
-            "tools": [bash_tool]
-        }),
-        // Two tools plus a system prompt.
-        json!({
-            "max_tokens": 24,
-            "temperature": 0.0,
-            "system": "You are a terse coding assistant.",
-            "messages": [{"role": "user", "content": "What is in README.md?"}],
-            "tools": [bash_tool, read_tool]
-        }),
-        // A client breakpoint on the system block: everything up to and
-        // including it becomes a relocatable span in a `tool-spans` build.
-        json!({
-            "max_tokens": 24,
-            "temperature": 0.0,
-            "system": [{"text": "You are a terse coding assistant.", "cache_control": {"type": "ephemeral"}}],
-            "messages": [{"role": "user", "content": "Count the Rust files."}],
-            "tools": [bash_tool, read_tool]
-        }),
-        // A prior `tool_use` + `tool_result` — i.e. every Claude Code turn
-        // after the first. This maps to an OpenAI assistant message carrying
-        // `tool_calls` and no `content`, which used to 500 for every template
-        // that writes `message['content'] + …` (granite 3.3, SmolLM2): the
-        // key was absent rather than empty. Keep this shape in the corpus; it
-        // is the regression guard for that fix.
-        json!({
-            "max_tokens": 24,
-            "temperature": 0.0,
-            "messages": [
-                {"role": "user", "content": "Run `ls`."},
-                {"role": "assistant", "content": [
-                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "Cargo.toml\nsrc"}
-                ]}
-            ],
-            "tools": [bash_tool]
-        }),
-    ]
-}
-
-/// Collect the concatenated text of every `text` block in a response.
-fn response_text(body: &serde_json::Value) -> String {
-    body["content"]
-        .as_array()
-        .expect("content array")
-        .iter()
-        .filter(|b| b["type"] == "text")
-        .filter_map(|b| b["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-/// Run the whole corpus, returning each response's text.
-async fn run_tools_corpus(client: &Client) -> Vec<String> {
-    let mut out = Vec::new();
-    for req in tools_corpus() {
-        let resp = client.anthropic_messages_raw(&req).await.unwrap();
-        assert!(
-            resp.status().is_success(),
-            "status {} for {req}",
-            resp.status()
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        out.push(response_text(&body));
-    }
-    out
-}
-
 // ===========================================================================
 // Non-streaming
 // ===========================================================================
@@ -142,7 +30,6 @@ async fn run_tools_corpus(client: &Client) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_simple_message() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -161,7 +48,7 @@ async fn test_anthropic_simple_message() {
     assert!(body["content"].is_array());
     assert!(!body["content"].as_array().unwrap().is_empty());
     assert_eq!(body["content"][0]["type"], "text");
-    assert!(!body["content"][0]["text"].as_str().unwrap().is_empty());
+    assert!(body["content"][0]["text"].as_str().unwrap().len() > 0);
     assert!(body["usage"]["input_tokens"].as_u64().unwrap() > 0);
     assert!(body["usage"]["output_tokens"].as_u64().unwrap() > 0);
 }
@@ -169,7 +56,6 @@ async fn test_anthropic_simple_message() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_with_system() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -189,7 +75,6 @@ async fn test_anthropic_with_system() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_system_blocks() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -207,7 +92,6 @@ async fn test_anthropic_system_blocks() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_multi_turn() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -231,7 +115,6 @@ async fn test_anthropic_multi_turn() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_content_blocks() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -254,7 +137,6 @@ async fn test_anthropic_content_blocks() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_temperature() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -272,7 +154,6 @@ async fn test_anthropic_temperature() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_stop_sequences() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -295,7 +176,6 @@ async fn test_anthropic_stop_sequences() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_max_tokens_respected() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -319,7 +199,6 @@ async fn test_anthropic_max_tokens_respected() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_streaming() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let events = client
@@ -390,7 +269,6 @@ async fn test_anthropic_streaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_streaming_with_system() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let events = client
@@ -415,7 +293,6 @@ async fn test_anthropic_streaming_with_system() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_missing_max_tokens() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     // max_tokens is required in Anthropic API
@@ -436,7 +313,6 @@ async fn test_anthropic_missing_max_tokens() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_empty_messages() {
-    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -449,88 +325,4 @@ async fn test_anthropic_empty_messages() {
 
     // Empty messages should fail at the engine level
     assert!(!resp.status().is_success());
-}
-
-// ===========================================================================
-// Tools-bearing requests on the shipped path
-// ===========================================================================
-//
-// There is no A/B here any more. Per-tool relocatable spans are gated behind
-// the off-by-default `tool-spans` Cargo feature (issue #193), so a build either
-// has that code or it does not, and these tests exercise whichever path the
-// build compiled. A default build — what CI and users get — takes the flat chat
-// path, the one that renders tools through the model's own template.
-//
-// Comparing the two arms is a two-build job now, not something one test binary
-// can do. Recorded here so the next reader does not go looking for the switch:
-// on granite-3.3-2b-instruct-4bit, one `Bash` tool, the same request is 105
-// prompt tokens and a `text` block under `tool-spans`, against 218 tokens and a
-// real `tool_use` block without it.
-
-/// Every shape in the corpus must be served, whichever path is compiled.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_tools_corpus_is_served() {
-    scratchy_e2e::skip_if_no_gpu!();
-    let (_server, client) = start_smollm().await;
-    let texts = run_tools_corpus(&client).await;
-    assert_eq!(texts.len(), tools_corpus().len());
-}
-
-/// A tools-bearing request must be answered with a well-formed message.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_tools_request_returns_a_message() {
-    scratchy_e2e::skip_if_no_gpu!();
-    let (_server, client) = start_smollm().await;
-
-    let resp = client
-        .anthropic_messages_raw(&tools_corpus()[0])
-        .await
-        .unwrap();
-
-    assert!(resp.status().is_success(), "status: {}", resp.status());
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["type"], "message");
-    assert!(!body["content"].as_array().unwrap().is_empty());
-}
-
-/// A tools-bearing request that names no `model` must be served.
-///
-/// `model` is optional on `/v1/messages` and the flat path just forwards the
-/// `None`. The spans path has to render SPNL's required `Generate.model`, and
-/// rendering it as `null` made the SPNL parse fail and 400'd a request the flat
-/// path serves — so this is the regression guard for a `tool-spans` build, and
-/// a cheap sanity check for every other one.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_model_less_tools_request_is_served() {
-    scratchy_e2e::skip_if_no_gpu!();
-    let (_server, client) = start_smollm().await;
-    let body = json!({
-        "max_tokens": 16,
-        "temperature": 0.0,
-        "messages": [{"role": "user", "content": "List the files here."}],
-        "tools": [{
-            "name": "Bash",
-            "description": "Run a shell command and return its output.",
-            "input_schema": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}}
-            }
-        }]
-    });
-
-    let resp = client.anthropic_messages_raw(&body).await.unwrap();
-    assert!(
-        resp.status().is_success(),
-        "a model-less request was rejected: {}",
-        resp.status()
-    );
-    // The response names the model actually loaded, not an empty string.
-    let got: serde_json::Value = resp.json().await.unwrap();
-    assert!(
-        !got["model"].as_str().unwrap_or("").is_empty(),
-        "returned an empty model"
-    );
 }

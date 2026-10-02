@@ -91,9 +91,8 @@ hf-completions = ["model?/hf-completions"]
 multimodal = ["scratchy-serving-api?/multimodal"]
 tls = ["scratchy-serving-api?/tls"]
 metrics = ["scratchy-serving-api?/metrics"]
-# EXPERIMENTAL, off by default, and deliberately NOT a `scr serve` flag: see
-# the feature's own comment in crates/serving/api/Cargo.toml. A build that does
-# not name it has no per-tool-spans code in it at all.
+# EXPERIMENTAL, off by default, and deliberately not a `scr serve` flag: see
+# the feature's own comment in crates/serving/api/Cargo.toml.
 tool-spans = ["scratchy-serving-api?/tool-spans"]
 multiproc = ["scratchy-serving-api?/multiproc"]
 rag = ["scratchy-serving-api?/rag"]

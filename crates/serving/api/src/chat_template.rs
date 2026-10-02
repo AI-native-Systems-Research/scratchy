@@ -327,21 +327,17 @@ impl ChatTemplate {
         &self.template_str
     }
 
-    /// Render a chat request's messages and tools into a prompt.
+    /// Render chat messages, and any tools, into a prompt.
     ///
-    /// **The one implementation.** Two callers reach a template from
-    /// `ChatCompletionRequest`-shaped input — the engine's prompt build and the
-    /// `/tokenize` handler — and each needs the same message normalization
-    /// (see [`message_to_template_value`]) and the same `tool_choice`-aware
-    /// tools rendering. They used to spell it out separately and had already
-    /// drifted: `/tokenize` did none of it, so it reported the token count of a
-    /// prompt the engine would never build, and omitted the tool definitions
-    /// entirely. Anything that has to change here has to change for both, so
-    /// there is one routine rather than two copies to keep in step.
+    /// The single entry point for every caller holding
+    /// `ChatCompletionMessageParam`s — the engine's prompt build and the
+    /// `/tokenize` handler. Both need the message normalization
+    /// [`message_to_template_value`] does and the same `tool_choice`-aware
+    /// tools rendering, so both get it from here rather than from a copy.
     pub(crate) fn render_chat(
         &self,
         messages: &[protocol::ChatCompletionMessageParam],
-        tools: Option<&Vec<protocol::ChatCompletionToolsParam>>,
+        tools: Option<&[protocol::ChatCompletionToolsParam]>,
         tool_choice: Option<&serde_json::Value>,
         extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
         add_generation_prompt: bool,
@@ -766,13 +762,10 @@ mod tests {
     }
 
     /// `render_chat` must serve a `tool_calls`-only turn that raw serialization
-    /// cannot — and this shows the difference rather than asserting the fix.
+    /// cannot.
     ///
-    /// The first half renders the un-normalized value and requires it to FAIL:
-    /// without that, the test would pass just as happily if the normalization
-    /// were deleted, which is exactly the hole in the version it replaces.
-    /// `render_chat` is also the routine the engine and `/tokenize` actually
-    /// call, so deleting the normalization inside it cannot slip past this.
+    /// Rendering the un-normalized value is required to FAIL first: without
+    /// that half, the test would pass with the normalization deleted.
     #[test]
     fn test_render_chat_serves_a_tool_call_turn_that_raw_json_cannot() {
         // A template that writes `content` into a string expression without
@@ -804,8 +797,7 @@ mod tests {
         assert_eq!(out, "assistant: |");
     }
 
-    /// `render_chat` must also parse `function.arguments` and keep real content
-    /// — the other normalizations `/tokenize` silently did without.
+    /// `render_chat` must parse `function.arguments` from its wire string form.
     #[test]
     fn test_render_chat_parses_tool_call_arguments() {
         let tpl = ChatTemplate::new(

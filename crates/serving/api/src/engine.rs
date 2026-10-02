@@ -600,17 +600,6 @@ impl AsyncEngine {
         self.chat_template.as_ref()
     }
 
-    /// The server-wide default chat-template kwargs (`--default-chat-template-kwargs`).
-    ///
-    /// Exposed so `/tokenize` renders under the same kwargs the engine would:
-    /// a template branching on one of them (`enable_thinking`, say) otherwise
-    /// produces a different prompt there than in the request being counted.
-    pub fn default_chat_template_kwargs(
-        &self,
-    ) -> Option<&std::collections::HashMap<String, serde_json::Value>> {
-        self.default_chat_template_kwargs.as_ref()
-    }
-
     // -----------------------------------------------------------------------
     // Request handling
     // -----------------------------------------------------------------------
@@ -3056,7 +3045,7 @@ impl AsyncEngine {
 
             template.render_chat(
                 &request.messages,
-                request.tools.as_ref(),
+                request.tools.as_deref(),
                 request.tool_choice.as_ref(),
                 merged_kwargs.as_ref(),
                 true,
