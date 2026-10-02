@@ -776,20 +776,21 @@ mod tests {
             pres_penalties: vec![0.0],
             ..Default::default()
         };
-        run_pipeline(device, kernels, &params, logits, 1, vocab)
+        run_pipeline(device, kernels, &params, logits, CastDtype::F32, 1, vocab).map(|(t, _)| t)
     }
 
     /// Prepare + run the pipeline on one command buffer; read back the sampled
-    /// token (row 0). `logits` is the TOTAL logits buffer; `row_indices`
-    /// (in `params`) picks the row(s).
-    fn run_pipeline(
+    /// token (row 0) and the commit-wait time. `logits` is the TOTAL logits
+    /// buffer, of `dtype`; `row_indices` (in `params`) picks the row(s).
+    fn run_pipeline<T: Copy>(
         device: &Device,
         kernels: &SamplerKernels,
         params: &scratchy_core_common::GpuSampleParams,
-        logits: &[f32],
+        logits: &[T],
+        dtype: CastDtype,
         njobs: u32,
         vocab: u32,
-    ) -> Option<u32> {
+    ) -> Option<(u32, std::time::Duration)> {
         let logits_buf = shared_slice(device, logits);
         let batch = Mtl4DispatchBatch::begin(device)?;
         // The sampler's buffers AND the logits row must be resident for THIS
@@ -799,19 +800,20 @@ mod tests {
         // wait; the logits pin lives to the end of this scope).
         let (pending, logits_pin) = {
             let res = batch.residency();
-            let pending =
-                PendingSampler::prepare(device, res, params, njobs, vocab, CastDtype::F32);
+            let pending = PendingSampler::prepare(device, res, params, njobs, vocab, dtype);
             (pending, res.pin(logits_buf.clone()))
         };
         use objc2_metal::MTLBuffer as _;
         let logits_addr = logits_buf.gpuAddress();
         let enc = batch.encoder();
         pending.encode_into(enc, logits_addr, kernels);
+        let t0 = std::time::Instant::now();
         batch.commit(true);
+        let wait = t0.elapsed();
         drop(logits_pin);
         let (out, n) = pending.output();
         assert_eq!(n, njobs);
-        Some(read_slice::<u32>(&out, 1)[0])
+        Some((read_slice::<u32>(&out, 1)[0], wait))
     }
 
     /// Dispatch `sample` on a synthetic f32 logits row with a near-zero
@@ -1580,5 +1582,81 @@ mod tests {
             exact >= run / 2,
             "too few exact at large vocab: {exact}/{run}"
         );
+    }
+
+    /// Times the full pipeline on gemma-4-26b-shaped bf16 logits (vocab
+    /// 262144) — the exact sizes `scr chat`'s decode pays — at the default
+    /// sampling settings, top_k=0, and a 4-job batch. Median commit-wait of
+    /// `run_pipeline` — an upper bound on the GPU time (includes the host
+    /// event wait).
+    ///
+    /// Run:
+    ///   cargo test --release -p scratchy-target-metal --lib time_sampler_stages -- --nocapture
+    #[test]
+    fn time_sampler_stages() {
+        let Some(device) = crate::device::detect_device() else {
+            eprintln!("skipping: no metal device");
+            return;
+        };
+        let device = device.device.clone();
+        let kernels = match SamplerKernels::new(&device) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("skipping: sampler kernels build failed: {e:?}");
+                return;
+            }
+        };
+
+        let vocab: u32 = 262_144;
+        let mut rng = Rng(0x1234_5678);
+        // Mostly-negative noise plus a few strong tokens, so the descent's
+        // histogram rounds count a real distribution.
+        let row: Vec<half::bf16> = (0..vocab)
+            .map(|i| match i {
+                1000 => 20.0,
+                _ if i % 4096 == 0 => 10.0,
+                _ => rng.range(-15.0, 5.0),
+            })
+            .map(half::bf16::from_f32)
+            .collect();
+
+        for (label, njobs, top_k, top_p) in [
+            ("top_k=64, top_p=0.95, 1 row", 1u32, 64, 0.95),
+            ("top_k=0 → 1024 cap, 1 row", 1, 0, 1.0),
+            ("top_k=64, top_p=0.95, 4 rows", 4, 64, 0.95),
+        ] {
+            let n = njobs as usize;
+            let params = scratchy_core_common::GpuSampleParams {
+                row_indices: (0..njobs).collect(),
+                temperatures: vec![1.0; n],
+                top_ks: vec![top_k; n],
+                top_ps: vec![top_p; n],
+                min_ps: vec![0.0; n],
+                uniforms: vec![0.5; n],
+                ..Default::default()
+            };
+            let logits = row.repeat(n);
+            let (warm, reps) = (3, 10);
+            let mut us = Vec::with_capacity(reps);
+            for r in 0..warm + reps {
+                let Some((_, wait)) = run_pipeline(
+                    &device,
+                    &kernels,
+                    &params,
+                    &logits,
+                    CastDtype::Bf16,
+                    njobs,
+                    vocab,
+                ) else {
+                    eprintln!("skipping: no MTL4 queue");
+                    return;
+                };
+                if r >= warm {
+                    us.push(wait.as_secs_f64() * 1e6);
+                }
+            }
+            us.sort_by(f64::total_cmp);
+            println!("sample ({label}, bf16): {:8.1} µs", us[reps / 2]);
+        }
     }
 }
