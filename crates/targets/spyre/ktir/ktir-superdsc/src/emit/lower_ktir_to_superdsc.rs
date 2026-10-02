@@ -43,7 +43,7 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
-    assemble_rmsnorm,
+    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap,
 };
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
@@ -1907,7 +1907,10 @@ fn param_read_rows(f: &IRFunction<'static>, ptr: &Ssa) -> u32 {
 
 /// The `[rows, cols]` of the FIRST window the program takes of one parameter's buffer — its access
 /// tile's own `Shape`, which is stated whatever its corner is made of.
-fn param_first_tile(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
+/// PUBLIC for the door: the geometry mint reads a program's head dim here, the same way rope's
+/// head dim is read — the door (`ktir_superdsc_door::attn`) mints `ModelAttnGeometry` off the
+/// program's own views because a hybrid model's bundle carries more than one.
+pub fn param_first_tile(f: &IRFunction<'static>, ptr: &Ssa) -> Option<(u32, u32)> {
     param_tiles(f, ptr).find_map(shape_2d)
 }
 
@@ -2139,6 +2142,65 @@ pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
             }
             Some(*splat_of.get(rr)? as f32)
         })
+}
+
+/// The CAP a [`Program::TanhSoftCap`](crate::ktir_node::Program::TanhSoftCap)
+/// program states, read structurally: the ONE `math.tanh` root, then the
+/// `arith.divf` that feeds it — whose non-tile operand is the splatted cap.
+///
+/// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds
+/// the registry the `[1,1]` const is resolved in BY BITS (`scale_slot`), so a
+/// producer-side value and an emit-side reading must be ONE fact, not two
+/// matchers that can drift.
+///
+/// ONE CAP, however many `math.tanh` roots state it. [`KtirFunc::tanhsoftcap`]
+/// emits one `divf → tanh → mulf` chain per ROW BLOCK — prefill's vocab-wide
+/// logits exceed the emulator's LX budget as one tile, so a prefill program is
+/// N blocks of the same softcap, and the reader must resolve the ONE value all
+/// of them state. Two roots with DIFFERENT caps is still refused: that is two
+/// softcaps in one program (or something that is not one at all), and picking
+/// either's cap would be a guess about which node is being lowered. The divisor
+/// is pinned to the `arith.divf` FEEDING each root — not "any divf" — so a
+/// program that divides by something else first cannot hand this reader the
+/// wrong constant.
+pub fn program_tanhsoftcap_cap(f: &IRFunction<'static>) -> Option<f32> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(kk, v)| match (kk, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    let mut cap: Option<f64> = None;
+    for tanh in f.operations.iter().filter(|o| o.op_type == OpKind::MathTanh) {
+        let div = def_of(*tanh.operands.first()?)?;
+        if div.op_type != OpKind::ArithDivf {
+            return None;
+        }
+        // Exactly one operand of the divide is the splatted cap; the other is
+        // the tile being capped.
+        let mut splats = div.operands.iter().filter_map(|&s| splat_value(s));
+        let this = splats.next()?;
+        if splats.next().is_some() {
+            return None;
+        }
+        match cap {
+            None => cap = Some(this),
+            Some(c) if c == this => {}
+            // Two softcaps in one program — the cap each block states must be
+            // the same value or this is not one softcap at all.
+            Some(_) => return None,
+        }
+    }
+    Some(cap? as f32)
 }
 
 /// main's `lower_rope_node` (main 8696-9528), waiting for its head dim to become a const — the
@@ -4962,6 +5024,290 @@ pub fn rmsnorm_at(
         sym_id_base,
         layout,
     ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RmsNormUnit`] —
+/// `out = x · rsqrt(mean(x²) + eps)`, no gain.
+///
+/// Same shape as [`rmsnorm`]: the epsilon is read off the program (the value the
+/// emulator adds), resolved to its registry slot by that value, and the body is
+/// [`assemble_rmsnorm_unit`] — the first five steps of the gained form with the
+/// normalising multiply writing `out` directly. ONE tensor parameter where
+/// `rmsnorm` splits two, which is the only structural difference.
+pub fn rmsnorm_unit(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::rmsnorm_unit` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let eps = program_rmsnorm_eps(&k.func).ok_or_else(|| Error {
+        message: format!(
+            "RmsNormUnit {name}: the program states no epsilon. `KtirFunc::rmsnorm_unit` splats \
+             it into the `arith.addf` that feeds its one root op, and the descriptor's `[1,1]` \
+             const is resolved from that value, so a program without it cannot be lowered."
+        ),
+    })?;
+    let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
+        message: format!(
+            "RmsNormUnit {name}: epsilon {eps}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor adds it as a bound `[1,1]` const, so \
+             the value the program uses must have a registry slot (registry desync)"
+        )
+    })?;
+    check_pointwise_cols(out.c_len, "RmsNormUnit", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
+    let x = tensors[0].name();
+    let t = out.tid;
+    Ok(assemble_rmsnorm_unit(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        PlaceId::Act(t),
+        &eps_const,
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::TanhSoftCap`] —
+/// `out = cap · tanh(x / cap)`, Gemma's final-logit soft cap.
+///
+/// Same shape as [`rmsnorm_unit`]: the cap is read off the program (the value
+/// the emulator divides and multiplies by), resolved to its registry slot by
+/// that value, and the body is [`assemble_tanhsoftcap`] — ONE `realdiv` by the
+/// bound `[1,1]` cap const, ONE `tanh`, ONE `multiply` by the same const.
+/// ONE tensor parameter, exactly like the unit norm.
+pub fn tanhsoftcap(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::tanhsoftcap` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let cap = program_tanhsoftcap_cap(&k.func).ok_or_else(|| Error {
+        message: format!(
+            "TanhSoftCap {name}: the program states no cap. `KtirFunc::tanhsoftcap` splats \
+             it as the divisor of the `arith.divf` that feeds its one `math.tanh` root, and \
+             the descriptor's `[1,1]` const is resolved from that value, so a program \
+             without it cannot be lowered."
+        ),
+    })?;
+    let cap_idx = scale_slot(layout, cap).ok_or_else(|| Error {
+        message: format!(
+            "TanhSoftCap {name}: cap {cap}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor divides and multiplies by a \
+             bound `[1,1]` const, so the value the program uses must have a registry slot \
+             (registry desync)"
+        )
+    })?;
+    check_pointwise_cols(out.c_len, "TanhSoftCap", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let cap_const = crate::place::act_name(scalarmul_scale_tid(cap_idx));
+    let x = tensors[0].name();
+    let t = out.tid;
+    Ok(assemble_tanhsoftcap(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        PlaceId::Act(t),
+        &cap_const,
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::ScalarWeightMul`] —
+/// `out = x · w`, `w` a host-staged `[1]`-shaped weight (gemma4
+/// `layer_scalar[layer]`).
+///
+/// ONE pointwise `multiply` whose second operand is the weight buffer read in
+/// the SCALAR broadcast mode (`In::scalar`) — exactly the operand mode
+/// [`scalarmul_at`] gives its registry const and `assemble_rmsnorm` gives its
+/// epsilon, over a weight the WORKER stages from the checkpoint instead of a
+/// const the bake binds. The weight's placement pads its `[1]` extent to a
+/// whole stick (`nbytes` → `[1, 64]` f16 = 128 B), so the one-stick scalar
+/// read is in bounds by construction.
+pub fn scalarweightmul(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x, the weight, and the output — the parameters `KtirFunc::scalar_weight_mul` mints.
+    let (tensors, out) = split_out(name, r, layout, 2)?;
+    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out)?;
+    check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let x = tensors[0].name();
+    let w = tensors[1].name();
+    let t = out.tid;
+    let x_h = rbo(&x);
+    // The weight is `[1]` on disk and `[1, stick]` in its placement — the same
+    // one-stick shape the rmsnorm's `[1,1]` epsilon const takes, read in the
+    // same `In::scalar` broadcast mode (lane 0 sprayed over rows and cols).
+    let w_h = rb(&w, 1, crate::work::FP16_ELEMS_PER_STICK);
+    let out_h = rbo(&out.name());
+    let op_name = format!("scalarmul_o{t}");
+    Ok(vec![pw2(
+        &op_name,
+        "multiply",
+        crate::sdsc_abstract::RowCount::of_token_rows(rows),
+        crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+        In::full(&x_h),
+        In::scalar(&w_h),
+        &out_h,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::Reshape`] — a RE-LAYING COPY that
+/// re-sticks a whole buffer from `[r_in, c_in]` to `[r_out, c_out]` preserving the flat element
+/// sequence.
+///
+/// ⛔⛔⛔ THE VIEW CANNOT BE AN ALIAS, AND THE LAW IS ARITHMETIC, NOT A PREFERENCE. A device
+/// tensor is stick-blocked: logical `(i, j)` sits at `dev_off([rows, cols], ·) =
+/// (j/stk)·(rows·stk) + i·stk + (j%stk)` (see [`crate::sdsc_abstract`]), where `rows` is the
+/// tensor's own ROW COUNT. Two views over one buffer with different extents therefore disagree
+/// about where EVERY element lives — and `declare_arrangement` cannot catch the alias, because
+/// it keys on tensor NAME and an alias gives the two views two names. So the reshape is a real
+/// copy, and this door is the only spelling of it.
+///
+/// ⭐⭐ THE DECOMPOSITION IS SINGLE-STICK IDENTITY COPIES — the proven `lmlast` mechanism, and
+/// for the same reason its own comment gives: a whole stick is the one rectangle whose address is
+/// a corner a rank-2 view can name. Walk the flat sequence a stick at a time. Stick `q` covers
+/// flat elements `64q..64q+64`; on the input those are `r = 64q / c_in`, `j = 64q % c_in`
+/// (one or two adjacent column sticks — a stick never straddles three, because a column stick
+/// IS 64 elements), and on the output `ρ = 64q / c_out`, `d = 64q % c_out`. Every address is an
+/// [`rc_of`] corner of that side's OWN view, so the emitter never writes a hand-derived
+/// multiplier: the nest law IS the address. At `m=1` (decode) the input is one flat row and
+/// this degenerates to a row-blocked re-blocking — exactly the shape gemma4's per-head
+/// `[1, H·D] → [H, D]` views and their flatten-backs take.
+///
+/// ⛔ THE STICK LAWS, BOTH SIDES, BECAUSE A PARTIAL STICK IS AN ADDRESS A VIEW CANNOT NAME.
+/// `c_in` and `c_out` must each be whole 64-stick multiples (the producer's column widths are
+/// feature widths, which are); the element counts must agree exactly (the SubOp's own contract,
+/// re-stated here because a descriptor pair that moved a different number of elements than the
+/// program claims would be silently-wrong on both ends); and the windows must be whole views
+/// (`split_out` refuses a corner). A violated law is a build `Err` naming it.
+pub fn reshape(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The source and the destination — the parameters `KtirFunc::reshape` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    let src = &tensors[0];
+    let stk = crate::work::FP16_ELEMS_PER_STICK;
+    let (r_in, c_in) = (src.v_rows, src.v_cols);
+    let (r_out, c_out) = (out.v_rows, out.v_cols);
+    // WHOLE VIEWS: a re-laying copy moves a whole buffer; a windowed one is a different op the
+    // producer must materialize first (the same law [`transpose]` states for its two sides).
+    for (x, role) in [(src, "input"), (&out, "output")] {
+        if x.c_start != 0 || x.c_len != x.v_cols || x.r_len != x.v_rows {
+            return err(format!(
+                "{name}: the {role} t{} takes a `[{}, {}]` window of its `[{}, {}]` view at \
+                 ({}, {}) — a reshape re-sticks a WHOLE buffer, and the relayout builder names a \
+                 tensor and its two extents with no corner and no window. Materialize the window \
+                 first.",
+                x.tid, x.r_len, x.c_len, x.v_rows, x.v_cols, x.r_start, x.c_start,
+            ));
+        }
+    }
+    if !c_in.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: the input t{}'s column extent {c_in} is not a whole {stk}-element fp16 stick. \
+             The copies below read whole input column sticks, so a partial one is an address no \
+             rank-2 view can name. Pad the producer's width to a stick multiple.",
+            src.tid,
+        ));
+    }
+    if !c_out.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: the output t{}'s column extent {c_out} is not a whole {stk}-element fp16 \
+             stick. The copies below write whole output column sticks, so a partial one is an \
+             address no rank-2 view can name. Pad the destination's width to a stick multiple.",
+            out.tid,
+        ));
+    }
+    // THE COUNT LAW: a reshape preserves the element count (the SubOp's host oracle asserts the
+    // same). Stated here because these descriptors move exactly that many — a mismatch would be a
+    // build error in the producer's graph, not something this door can repair.
+    if u64::from(r_in) * u64::from(c_in) != u64::from(r_out) * u64::from(c_out) {
+        return err(format!(
+            "{name}: re-sticking t{} `[{r_in}, {c_in}]` into t{} `[{r_out}, {c_out}]` does not \
+             preserve the element count — a reshape moves the same elements to new coordinates, so \
+             these extents do not describe one.",
+            src.tid, out.tid,
+        ));
+    }
+    let total = u64::from(r_out) * u64::from(c_out);
+    // The store windows must tile the output (`node_rows` is that guard); the input's access
+    // tiles must likewise cover it.
+    node_rows(name, &out)?;
+    if src.r_cover != (0, r_in) {
+        return err(format!(
+            "{name}: the program's access tiles over its input t{} cover rows {}..{} of a \
+             {r_in}-row view — a reshape reads all of it, so the windows must tile `0..{r_in}`.",
+            src.tid, src.r_cover.0, src.r_cover.1,
+        ));
+    }
+    // ⭐ ONE `identity` COPY PER STICK — the `lmlast` mechanism over a two-sided coordinate
+    // walk. Each op is `[1, stk]` on the card (the one representable row offset, per `lmlast`'s
+    // own addressing note) and the addresses below are corners of each side's OWN view, so the
+    // nest law carries the stick-block arithmetic rather than a hand-derived multiplier.
+    //
+    // A STICK NEVER STRADDLES A ROW ON EITHER SIDE: `base`, `c_in` and `c_out` are all
+    // multiples of `stk`, so `base % c_in` (and `base % c_out`) is a multiple of `stk` at most
+    // `c − stk` — the 64-element run lies inside ONE row's column stick on both the input and
+    // the output, one copy covers it, and no partial-stick address is ever formed.
+    let src_name = rb(&src.name(), 1, stk);
+    let dst = rbo(&out.name());
+    let n_sticks = total / u64::from(stk);
+    let mut ops = Vec::with_capacity(n_sticks as usize);
+    for q in 0..n_sticks {
+        let base = q * u64::from(stk);
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("reshape{q}_o{}", out.tid),
+            "identity",
+            crate::sdsc_abstract::RowCount::of_token_rows(1),
+            crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+            &[In::sliced(
+                &src_name,
+                crate::addr::rc_of(
+                    r_in,
+                    c_in,
+                    (base / u64::from(c_in)) as u32,
+                    (base % u64::from(c_in)) as u32,
+                    Df::Fp16,
+                ),
+            )
+            .ew()],
+            &dst,
+            crate::addr::rc_of(
+                r_out,
+                c_out,
+                (base / u64::from(c_out)) as u32,
+                (base % u64::from(c_out)) as u32,
+                Df::Fp16,
+            ),
+            sym_id_base,
+            layout,
+        ));
+    }
+    Ok(ops)
 }
 
 /// [`scalarmul`] with the multiplier SUPPLIED rather than read off the whole function.

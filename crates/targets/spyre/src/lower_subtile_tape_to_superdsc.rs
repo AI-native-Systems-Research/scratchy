@@ -660,10 +660,21 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // bundle_layout.json genuinely never had IDENTITY_TID, exactly as this predicts. Moved OUTSIDE that
     // mq>1 guard so it runs for ANY AttnDecode node regardless of mq, matching the consumer's real,
     // unconditional need (assemble_attn_head references `ident` at every mq, decode included).
-    if let Some(hd) = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::AttnDecode { geom, .. } => Some(geom.hd().get() as u64),
-        _ => None,
-    }) {
+    // ⭐⭐ THE WIDEST CLASS, NOT THE FIRST. A hybrid model (gemma-4) carries TWO attention classes in
+    // one tape — sliding (hd=256) and global (hd=512) — and both reserved tids below are sized by a
+    // head dim. Taking the first node's sized them for the sliding class, and the global class's
+    // zero-copy then read 63·512·2 = 64512 B out of a 64·256·2 = 32768 B placement — the footprint
+    // check caught it, but the same understatement would have aliased seg3 on the card. The max is
+    // over every AttnDecode's own declared geometry, so each class's consumer fits.
+    if let Some(hd) = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode { geom, .. } => Some(geom.hd().get() as u64),
+            _ => None,
+        })
+        .max()
+    {
         let seg = SegRole::Activation.segment();
         let off = seg_bytes[seg];
         let sz = hd * hd * 2; // [hd,hd] fp16 identity
@@ -1405,6 +1416,14 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // which is where `subtile→superdsc` reads it from; pushing it here as well added one
             // registry slot per rmsnorm node, shifting the tid of every constant registered after it.
             SubOp::RmsNorm { eps, .. } => push_scale(*eps, &mut scalarmul_scales),
+            // The unit form's epsilon rides the SAME registry — `assemble_rmsnorm_unit`
+            // resolves its `[1,1]` const by value through `scale_slot`, exactly as the
+            // gained form does.
+            SubOp::RmsNormUnit { eps } => push_scale(*eps, &mut scalarmul_scales),
+            // The softcap's cap rides the SAME registry — `assemble_tanhsoftcap`
+            // resolves its `[1,1]` const by value through `scale_slot`, for the divide
+            // and the multiply alike.
+            SubOp::TanhSoftCap { cap } => push_scale(*cap, &mut scalarmul_scales),
             _ => {}
         }
     }
@@ -3954,13 +3973,19 @@ mod tests {
             "fp32 reduce const must be raw IEEE f32 bits of 1/N"
         );
         // The serialized const carries dataFormat_ = IEEE_FP32 and the 32-bit word.
-        let ci = scaling_factor_const_fp32((1.0f32 / 576.0).to_bits());
+        let ci =
+            scaling_factor_const_fp32((1.0f32 / 576.0).to_bits(), &SdscFoldSet::new(f32_spec.iter.cores_used()));
         assert_eq!(ci["0"]["dataFormat_"], "IEEE_FP32");
-        let got = ci["0"]["data_"][0].as_u64().unwrap();
-        assert_eq!(got, (1.0f32 / 576.0).to_bits() as u64);
+        // #197 wraps the const's payload in the fold-manager form: the raw word
+        // is the `data_` map's `"[0, 0, 0]"` entry, a DECIMAL string.
+        let raw = ci["0"]["data_"]["data_"]["[0, 0, 0]"][0]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("fold-manager const word");
+        assert_eq!(raw, (1.0f32 / 576.0).to_bits() as u64);
         assert!(
-            got > 0xFFFF,
-            "a true fp32 word exceeds 16 bits; got {got:#x}"
+            raw > 0xFFFF,
+            "a true fp32 word exceeds 16 bits; got {raw:#x}"
         );
 
         // fp16 reduce path is untouched: still SEN169_FP16, 16-bit word.

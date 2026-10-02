@@ -506,6 +506,21 @@ impl RowScale {
     pub const fn preserves_rows(self) -> bool {
         matches!(self, Self::Times(k) if k.get() == 1)
     }
+    /// The numerator of `m · mult / div` — 1 for `Over` (a view that divides
+    /// cannot also multiply).
+    pub const fn mult(self) -> u32 {
+        match self {
+            Self::Times(k) => k.get(),
+            Self::Over(_) => 1,
+        }
+    }
+    /// The denominator of `m · mult / div` — 1 for `Times`.
+    pub const fn div(self) -> u32 {
+        match self {
+            Self::Times(_) => 1,
+            Self::Over(k) => k.get(),
+        }
+    }
 }
 
 // ── Sub-operations ─────────────────────────────────────────────────
@@ -769,7 +784,6 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             // No attributes: the discriminant is the whole class.
             SubOp::SumReduce { .. }
             | SubOp::SiluMul
-            | SubOp::TanhSoftCap
             | SubOp::ScalarWeightMul
             | SubOp::GateApply
             | SubOp::GateScale
@@ -803,9 +817,14 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::SampleRowsGather
             | SubOp::SampleRowsScatter
             | SubOp::AllRowsMatmul => {}
+            // The row scale is a fact of the VIEW's shape class (per-head vs
+            // merger), not per-layer identity — a sliding layer's per-head
+            // view and a global layer's re-roll onto different extents than
+            // its cells claim.
             SubOp::Reshape { rows, cols } => (rows, cols).hash(h),
             SubOp::Elementwise(k) => std::mem::discriminant(k).hash(h),
             SubOp::ScalarMul { scale } => scale.to_bits().hash(h),
+            SubOp::TanhSoftCap { cap } => cap.to_bits().hash(h),
             SubOp::RmsNorm { eps, gain } => {
                 eps.to_bits().hash(h);
                 std::mem::discriminant(gain).hash(h);
@@ -942,6 +961,15 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// Element COUNT is preserved and row-major order is preserved; only the
     /// extents change. Host semantics are the identity.
     ///
+    /// The target extents are a function of the TOKEN COUNT:
+    /// `out_rows = m · rows_mult / rows_div`, `out_cols = cols` — the same
+    /// fact [`crate::lower::LoweredOp::Reshape`] carries, threaded here so
+    /// the node's regions can state the TRUE re-laid extents (a per-head
+    /// view `[m, heads·hd] → [m·heads, hd]` MULTIPLIES rows; the vision
+    /// patch merger DIVIDES). Without it the node understates the output by
+    /// the mult factor and every downstream region (the per-head norms, the
+    /// placement pool) inherits the lie.
+    ///
     /// ⛔ IT IS NOT FREE ON A STICK-LAID-OUT DEVICE, and that is the whole
     /// reason it is an OP rather than a view. `sdsc_abstract::dev_off_stk`
     /// places element `(i, j)` at `(j/stk)*(a*stk) + i*stk + (j%stk)`, where
@@ -1072,10 +1100,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // place that can answer it: the target's opcode lowering.
     /// `cap · tanh(x / cap)` — Gemma's logit/attention soft cap.
     ///
-    /// ⛔ THE CAP IS NOT HERE, AND THAT IS A REPORTED GAP, NOT A DESIGN. The value is a model
-    /// constant resolved at emission, so the tape has never held it. `eval_node` therefore has no host reference for this op and says so instead
-    /// of inventing a cap.
-    TanhSoftCap,
+    /// The cap is the model constant `final_logit_softcapping`, threaded from
+    /// `to_wavefront` — it used to be resolved
+    /// only at each target's emission, so the tape never held it and `eval_node`
+    /// had no host reference. It holds it now, and the oracle below is real.
+    TanhSoftCap { cap: f32 },
     /// Unit-gain RmsNorm — no learnable scale (Gemma4 `v_norm`). `inputs[0]` = x.
     RmsNormUnit { eps: f32 },
     /// Multiply by a loaded `[1]`-shaped weight (Gemma4 `layer_scalar[layer]`).
@@ -1664,12 +1693,13 @@ pub fn eval_node<F: RopeForm>(
         // is not a gatherable tensor) has no oracle, and returning zeros or the
         // input unchanged would make the comparison PASS while proving nothing.
         // That is strictly worse than no oracle, so it is not on offer.
-        SubOp::TanhSoftCap => panic!(
-            "SubOp::TanhSoftCap has no host reference: the cap is a model constant \
-             resolved at emission and has never been carried on the tape (neither \
-             SubOp::TanhSoftCap nor Instruction::TanhSoftCap holds it), so there \
-             is no value here to divide by"
-        ),
+        SubOp::TanhSoftCap { cap } => {
+            // `cap · tanh(x / cap)` — the same form every target lowers. The cap
+            // is on the tape now, so this is a real oracle, not a panic.
+            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+            debug_assert_eq!((xr, xc), (out_rows, out_cols), "softcap shape mismatch");
+            x.into_iter().map(|v| cap * (v / cap).tanh()).collect()
+        }
         SubOp::GateSplit { .. } => panic!(
             "SubOp::GateSplit has no host reference: it has TWO outputs (q and gate) \
              and eval_node returns the buffer for ONE region, so the gate half would \
@@ -2105,9 +2135,33 @@ pub fn lower_region(
         let out_cols = desc
             .op
             .out_cols(|k| resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).2);
+        // ⭐ TRUE OUTPUT ROW COUNT — `desc.m` is the TOKEN count, and the two
+        // diverge exactly once a Reshape view enters the chain. Every op in
+        // the vocabulary preserves operand 0's row count (matmul: rows(A);
+        // attention: rows(q); mean: rows(x); gather: rows(x)); Reshape is the
+        // one exception and states its own rescale of the token count. So the
+        // graph's tensor shapes and node regions state the RE-LAID extents —
+        // a per-head chain `[m, heads·hd] → [m·heads, hd] → norm → back`
+        // multiplies rows through the norm and divides them back at the
+        // flatten. Under-stating them (registering everything at `m`) made
+        // the Reshape count law fire on every per-head view AND reserved the
+        // re-laid buffer at a fraction of its size.
+        let out_rows: u32 = match &desc.op {
+            SubOp::Reshape { rows, .. } => {
+                let r = u64::from(m) * u64::from(rows.mult());
+                let d = u64::from(rows.div());
+                assert!(
+                    r % d == 0,
+                    "Reshape over [{m} rows] with scale {rows:?} is not a \
+                     whole row count — the bridge only mints whole multiples"
+                );
+                (r / d) as u32
+            }
+            _ => in0.map(|(_, r, _)| r).unwrap_or(m),
+        };
         let out_t = TensorId(tensors.len() as u32);
         tensors.push(TensorShape {
-            rows: m,
+            rows: out_rows,
             cols: out_cols,
         });
 
@@ -2224,7 +2278,7 @@ pub fn lower_region(
                     mask,
                 }
             }
-            SubOp::TanhSoftCap => SubOp::TanhSoftCap,
+            SubOp::TanhSoftCap { cap } => SubOp::TanhSoftCap { cap },
             SubOp::RmsNormUnit { eps } => SubOp::RmsNormUnit { eps },
             SubOp::ScalarWeightMul => SubOp::ScalarWeightMul,
             SubOp::GateSplit { half_cols } => SubOp::GateSplit { half_cols },
@@ -2425,7 +2479,7 @@ pub fn lower_region(
                     output: TensorRegion {
                         tensor: out_t,
                         region: Region {
-                            rows: Range::new(0, m),
+                            rows: Range::new(0, out_rows),
                             cols: blk,
                         },
                     },

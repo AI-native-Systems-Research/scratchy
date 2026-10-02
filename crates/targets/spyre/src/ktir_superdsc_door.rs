@@ -62,10 +62,19 @@ use ktir_superdsc::placement::BundleLayout;
 /// error naming them, never a descriptor built on a default.
 #[derive(Clone, Copy, Debug)]
 pub struct BundleAttnParams {
-    /// main's `SubOp::AttnDecode { geom }` — the model's head geometry, as the VALUE the two doors
-    /// below turn into const generics.
-    pub geom: ktir_superdsc::head_counts::ModelAttnGeometry,
     /// main's `lower_one_node(.., rows_are_requests, ..)`.
+    ///
+    /// ⛔ THE GEOMETRY IS NO LONGER HERE, AND THE REASON IS THE HYBRID MODEL. This used to carry the
+    /// bundle's ONE `SubOp::AttnDecode { geom }` — a fact under the assumption that one `#[forward]`
+    /// expansion has one attention geometry. Gemma-4 falsifies that assumption: its sliding layers run
+    /// (nqh=16, nkvh=8, hd=256) and every sixth layer runs a GLOBAL class (nqh=16, nkvh=1, hd=512), so
+    /// one graph carries TWO and no per-bundle value can describe both. The program's own views state
+    /// the geometry of the attention they compute (`q`'s view is `[mq, nqh·hd]`, a kv stream's is
+    /// `[·, nkvh·hd]`, and its first access tile on `q` is `hd` wide), so the door MINTS the geometry
+    /// there — the same reading rope already does for its head dim, and the same direction the scale,
+    /// `mq` and the swept extent all took: facts the program states are read from the program, and a
+    /// fact only the caller knows stays a caller's argument. The row KIND is the one that stays: no
+    /// program states it, for the reason its own comment gives.
     pub rows_are_requests: bool,
 }
 
@@ -112,6 +121,10 @@ pub fn lower(
         Program::Elementwise(ew) => elementwise(name, ew, &r, &[], sym_id_base, layout),
         Program::SiluMul => silumul(name, &r, sym_id_base, layout),
         Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
+        Program::RmsNormUnit => lk::rmsnorm_unit(name, k, &r, sym_id_base, layout),
+        Program::TanhSoftCap => lk::tanhsoftcap(name, k, &r, sym_id_base, layout),
+        Program::ScalarWeightMul => lk::scalarweightmul(name, &r, sym_id_base, layout),
+        Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
         Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),
         Program::Matmul => matmul(name, &r, sym_id_base, layout, quantized),
         Program::LmLast => lmlast(name, k, &r, sym_id_base, layout),
@@ -139,9 +152,20 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for AttnAt<'_> {
 
 /// ⭐ THE DOOR. main's `lower_attn_node` read its cache identity off `node.inputs` and `ir.tensors`,
 /// its geometry and multiplier off the node's `SubOp`, and `active_cap`/`rows_are_requests` off its
-/// call site. The first group the PROGRAM states, so `attn_at` reads it there (`attn_operands`); the
-/// rest are [`BundleAttnParams`], main's own remaining parameters, stated for this bundle by the
-/// caller. `mq` is [`KtirNode::out_shape`]'s row count, which is what main's `TileOp` `mb` dim was.
+/// call site. The cache identity and multiplier the PROGRAM states, so `attn_at` reads them there
+/// (`attn_operands`); the row kind is [`BundleAttnParams`], main's own walk parameter, stated for
+/// this bundle by the caller. `mq` is `q`'s own view's row count, which is what main's `TileOp` `mb`
+/// dim was.
+///
+/// ⭐⭐ THE GEOMETRY IS MINTED HERE, OFF THE PROGRAM'S OWN VIEWS. It used to ride the bundle as one
+/// `SubOp::AttnDecode { geom }` per expansion — sound only while one model had one attention class.
+/// Gemma-4's layers alternate a SLIDING class (nqh=16, nkvh=8, hd=256) with a GLOBAL one
+/// (nqh=16, nkvh=1, hd=512), so one graph carries two and no per-bundle value describes both. The
+/// program states its own: `q`'s view is `[mq, nqh·hd]`, a kv stream's is `[·, nkvh·hd]`, and the
+/// first access tile over `q` is `hd` wide — the same three readings `attn_operands` already makes
+/// under a caller-stated geometry, so minting from them is not a new derivation but the existing one
+/// with its input source moved. The GQA divisibility proof is spent at the same `mint` it always
+/// was; a program whose views do not divide is a build error naming them.
 fn attn(
     name: &str,
     k: &KtirNode,
@@ -152,17 +176,78 @@ fn attn(
 ) -> Result<Vec<EmittedOp>, Error> {
     let p = attn_params.ok_or_else(|| Error {
         message: format!(
-            "{name}: an attention program reached the lowering with no `BundleAttnParams`. Its head \
-             geometry and multiplier are the model's (main reads them off `SubOp::AttnDecode`) and \
-             its swept rung and row kind are this bundle's (main's own walk parameters) — no KTIR \
-             states any of the four, so the caller must state them at the door."
+            "{name}: an attention program reached the lowering with no `BundleAttnParams`. Its row \
+             kind is this bundle's (main's own walk parameter — whether its rows are separate \
+             requests or one prompt's positions) and no KTIR states it, so the caller must state it \
+             at the door."
+        ),
+    })?;
+    // ── THE PROGRAM'S OWN GEOMETRY ── `q` is parameter 0 (checked against the store order in
+    // `attn_operands`); a kv stream is the first K view after `q`/`out`; the head dim is the first
+    // access tile's width over `q` — the tile whose corner is `arith.constant` at decode and
+    // `pid·hd` at prefill, so the TILE's own Shape is the one reading that holds at both.
+    let q = r.first().ok_or_else(|| Error {
+        message: format!(
+            "{name}: an attention program states {} parameter(s); its construction mints at least \
+             six (q, out, and each segment's K then V)",
+            r.len()
+        ),
+    })?;
+    let kv_cols = {
+        // The runtime length mask is a SYNTHETIC parameter (`[1, cap]`) that `KtirFunc::attn` mints
+        // between `out` and the segments — `attn_operands` filters it by `k.mask`, and so does this
+        // reading, or the mask's capacity would be read as a kv stream's width.
+        let mask_tid = k.mask.map(|b| b.get());
+        r.iter()
+            .skip(2)
+            .find_map(|x| (x.tid != q.tid && Some(x.tid) != mask_tid && !x.is_out).then_some(x.v_cols))
+    };
+    let (Some(q_cols), Some(kv_cols), Some((_, hd))) = (
+        Some(q.v_cols),
+        kv_cols,
+        lk::param_first_tile(&k.func, &k.func.arguments[0].0),
+    )
+    else {
+        return Err(Error {
+            message: format!(
+                "{name}: the program does not state a complete geometry — `q`'s view is \
+                 `[{}, ·]`, a kv stream is {} wide, and `q`'s first access tile is {} — one of the \
+                 three is absent, so the head counts this door needs cannot be read off it",
+                q.v_rows,
+                kv_cols.map(|c| c.to_string()).unwrap_or_else(|| "missing".into()),
+                lk::param_first_tile(&k.func, &k.func.arguments[0].0)
+                    .map(|(_, c)| c.to_string())
+                    .unwrap_or_else(|| "absent".into()),
+            ),
+        });
+    };
+    if hd == 0 || q_cols % hd != 0 || kv_cols % hd != 0 {
+        return Err(Error {
+            message: format!(
+                "{name}: the program's own views do not divide into a geometry — `q` is {q_cols} \
+                 wide, a kv stream {kv_cols}, the head-dim window {hd}; a head must tile both \
+                 widths exactly or no GQA grouping exists"
+            ),
+        });
+    }
+    let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
+        ktir_superdsc::head_counts::QueryHeads::new(q_cols / hd),
+        ktir_superdsc::head_counts::KvHeads::new(kv_cols / hd),
+        ktir_superdsc::head_counts::HeadDim::new(hd),
+    )
+    .ok_or_else(|| Error {
+        message: format!(
+            "{name}: the geometry read off the program's views (nqh={}, nkvh={}, head_dim={hd}) has \
+             no GQA grouping — the kv-head count does not divide the query-head count, so \
+             `AttnGeometry` cannot be named at it",
+            q_cols / hd,
+            kv_cols / hd,
         ),
     })?;
     // ⭐⭐ THE ONE PLACE THE MODEL'S HEAD GEOMETRY STOPS BEING VALUES for the attention path — the SAME
-    // door `lower_one_node` crossed, on the SAME value it crossed it with (carried, not re-minted, so
-    // the GQA division is still evaluated exactly once).
+    // door `lower_one_node` crossed, now crossed with the geometry the program itself states.
     scratchy_subtile::model_geometry::with_config_attn_geometry(
-        p.geom,
+        geom,
         AttnAt(lk::AttnAt {
             name,
             k,
@@ -174,7 +259,7 @@ fn attn(
     )
     .ok_or_else(|| Error {
         message: format!(
-            "{name}: AttnDecode geometry has no const-generic instantiation. The head counts and \
+            "{name}: AttnDecode geometry ({geom}) has no const-generic instantiation. The head counts and \
              the head dim parameterise the device layout (GQA grouping, slabs, head strides), so \
              they must be consts, not values. The instantiations are read from the model configs in \
              scope ({}); this geometry belongs to none of them.",

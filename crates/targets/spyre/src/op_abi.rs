@@ -50,6 +50,9 @@ macro_rules! spyre_standard_tile_pat {
             | SubOp::SiluMul
             | SubOp::RmsNormApply { .. }
             | SubOp::RmsNorm { .. }
+            | SubOp::RmsNormUnit { .. }
+            | SubOp::TanhSoftCap { .. }
+            | SubOp::ScalarWeightMul
             | SubOp::RopeRotate { .. }
             | SubOp::RopeAppend { .. }
             | SubOp::AttnDecode { .. }
@@ -75,6 +78,14 @@ pub(crate) fn spyre_standard_operands<F: RopeForm>(op: &SubOp<F>) -> Option<Oper
         | SubOp::SiluMul => Operands::Fixed(3),
         // data + gain + accum + output.
         SubOp::RmsNormApply { .. } | SubOp::RmsNorm { .. } => Operands::Fixed(4),
+        // data + accum + output — the unit form has no gain operand.
+        SubOp::RmsNormUnit { .. } => Operands::Fixed(3),
+        // data + accum + output — the softcap's cap is a bound `[1,1]` const,
+        // not a tiled operand, so like the unit form it is 1 input + 2.
+        SubOp::TanhSoftCap { .. } => Operands::Fixed(3),
+        // x + weight + accum + output — the `[1]` weight is a real tiled
+        // operand (a staged weight source, not a baked const).
+        SubOp::ScalarWeightMul => Operands::Fixed(4),
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Operands::FromInputs,
         SubOp::AttnDecode { .. } => Operands::FromInputs,
         _ => return None,

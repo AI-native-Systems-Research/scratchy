@@ -49,4 +49,4 @@ pub use reduce::{
     assemble_reduce, assemble_reduce_df, assemble_reduce_off, assemble_reduce_seeded,
     reduce_opspec, reduce_opspec_df, reduce_opspec_off,
 };
-pub use rmsnorm::assemble_rmsnorm;
+pub use rmsnorm::{assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};

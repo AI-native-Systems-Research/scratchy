@@ -203,7 +203,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 | EwKind::Sub,
             )
             | O::RmsNormReduce { .. }
-            | O::TanhSoftCap
+            | O::TanhSoftCap { .. }
             | O::ScalarWeightMul
             | O::GateSplit { .. }
             | O::GateApply

@@ -96,10 +96,7 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         // Not members of the standard tile class: the shared front end expresses the
         // whole arch vocabulary now, so these reach every target and each one answers
         // for itself. Enumerated rather than `_` so a new SubOp is E0004 here.
-        SubOp::TanhSoftCap
-        | SubOp::RmsNormUnit { .. }
-        | SubOp::ScalarWeightMul
-        | SubOp::GateSplit { .. }
+        SubOp::GateSplit { .. }
         | SubOp::GateApply
         | SubOp::GateScale
         | SubOp::LoadPixels { .. }

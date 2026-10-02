@@ -67,7 +67,7 @@ macro_rules! for_each_subop {
             // `[Q, (K_seg, V_seg)...]`.
             AttnDecode [SubOp::AttnDecode { .. }] arity = (|n| n >= 3 && n % 2 == 1),
                 cols = [q_width geom];
-            TanhSoftCap [SubOp::TanhSoftCap] arity = (|n| n == 1), cols = [in0];
+            TanhSoftCap [SubOp::TanhSoftCap { .. }] arity = (|n| n == 1), cols = [in0];
             RmsNormUnit [SubOp::RmsNormUnit { .. }] arity = (|n| n == 1), cols = [in0];
             ScalarWeightMul [SubOp::ScalarWeightMul] arity = (|n| n == 2), cols = [in0];
             GateSplit [SubOp::GateSplit { .. }] arity = (|n| n == 1), cols = [field half_cols];

@@ -167,6 +167,34 @@ pub enum Program {
     /// does not, so the producer writes silu longhand and this recognises it.
     SiluMul,
     RmsNorm,
+    /// `x · rsqrt(mean(x²) + eps)` with NO gain — gemma's per-head V/K norms
+    /// (`rmsnorm_unit` in the DSL). Same chain as [`Program::RmsNorm`] minus the
+    /// final gamma multiply: the normalising multiply IS the output, so the
+    /// program has ONE tensor parameter where RmsNorm has two.
+    RmsNormUnit,
+    /// `cap · tanh(x / cap)` — Gemma's final-logit soft cap, written longhand as
+    /// `realdiv` by the cap, `tanh`, then `multiply` by the cap. The cap is a
+    /// model constant (`final_logit_softcapping`) carried on the SubOp; the
+    /// program splats it as an immediate, and [`program_tanhsoftcap_cap`] reads
+    /// that splat back so the emit side resolves the `[1,1]` registry slot by
+    /// value — the same contract `program_rmsnorm_eps` holds for the epsilon.
+    TanhSoftCap,
+    /// `out = x · w` where `w` is a LOADED `[1]`-shaped weight (gemma4
+    /// `layer_scalar[layer]`) — a bound weight-source operand broadcast on
+    /// both dims, the same operand mode ScalarMul gives its registry const
+    /// but with the value staged by the host rather than baked. TWO tensor
+    /// parameters (x and the weight) where ScalarMul has one.
+    ScalarWeightMul,
+    /// A RE-LAYING COPY that re-sticks a whole buffer `[r_in, c_in]` →
+    /// `[r_out, c_out]`, preserving the flat element sequence (gemma4's
+    /// per-head q/k/v-norm views `[1, H·D] → [H, D]` and their
+    /// flatten-backs). ONE tensor parameter. It cannot be a view alias —
+    /// the device layout is a function of the ROW COUNT, so two views over
+    /// one buffer with different extents disagree about every element; the
+    /// door lowers it to single-stick `identity` copies (the `lmlast`
+    /// mechanism). See
+    /// [`reshape`](crate::emit::lower_ktir_to_superdsc::reshape).
+    Reshape,
     ScalarMul,
     Matmul,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].

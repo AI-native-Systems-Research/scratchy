@@ -54,6 +54,10 @@ pub enum SynthRole {
     Meps,
     Rinv,
     Xn,
+    // ── tanh softcap scratch ──
+    /// `tanh(x/cap)` — the divided half of `cap·tanh(x/cap)`, one `[rows, cols]`
+    /// buffer reused as its own tanh's destination.
+    Tanhc,
     // ── the HARDWARE GATHER's contiguous destinations ──
     //
     // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
@@ -119,6 +123,7 @@ impl fmt::Display for SynthRole {
             Self::Meps => f.write_str("meps"),
             Self::Rinv => f.write_str("rinv"),
             Self::Xn => f.write_str("xn"),
+            Self::Tanhc => f.write_str("tanhc"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
             Self::NewKt => f.write_str("newkt"),

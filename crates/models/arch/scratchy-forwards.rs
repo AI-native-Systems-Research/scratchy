@@ -206,7 +206,7 @@ const CUDA_ONLY: &[&str] = &[
 ///
 /// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
 /// is dropped by the `supported` gate below before its configs are read.
-const SPYRE_CAPABLE: &[&str] = &["llama", "granite"];
+const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

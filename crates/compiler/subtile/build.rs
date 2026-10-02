@@ -104,6 +104,28 @@ fn emit_config_geometry() {
                     used = true;
                 }
             }
+            // The GLOBAL attention class of a per-layer-class model (Gemma-4: global layers run
+            // `global_head_dim` with `num_global_key_value_heads`). The macro's config loader
+            // derives the same defaults (`num_global_key_value_heads` ← `num_key_value_heads`,
+            // `global_head_dim` ← `head_dim`), so a uniform-geometry model reproduces the base
+            // triple here — deduped away — while a dual-class model yields its second triple. The
+            // door must know BOTH: an AttnDecode node carries its own class's geometry, and a
+            // global-class node whose triple has no arm is a bake refusal, not a fallback.
+            let g_kv = bounds
+                .get("num_global_key_value_heads")
+                .or_else(|| bounds.get("num_key_value_heads"));
+            let g_hd = bounds.get("global_head_dim").or_else(|| bounds.get("head_dim"));
+            #[expect(clippy::collapsible_if)]
+            if let (Some(&nqh), Some(&gkvh), Some(&ghd)) = (
+                bounds.get("num_attention_heads"),
+                g_kv,
+                g_hd,
+            ) {
+                if nqh > 0 && gkvh > 0 && ghd > 0 && nqh % gkvh == 0 {
+                    geometries.push((nqh, gkvh, ghd));
+                    used = true;
+                }
+            }
             // Every head dim a rotary op of this model can carry. `head_dim` is the decoder's;
             // `global_head_dim` is the second head dim of a per-layer-class model (Gemma-4's global
             // layers), and `qk_rope_head_dim` is MLA's rope width.

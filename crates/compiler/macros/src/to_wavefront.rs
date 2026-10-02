@@ -253,7 +253,7 @@ struct Builder<'a> {
     cos_sin: BTreeMap<(u32, bool), (usize, usize)>,
     /// Prefix KV-cache source pair `(prefix_k, prefix_v)` per kv-cache
     /// extern index (one per layer).
-    prefix: HashMap<u64, (usize, usize)>,
+    prefix: HashMap<(u64, u32), (usize, usize)>,
     /// The model's head geometry, minted once at the bounds parse below — one value, with its GQA
     /// grouping already proven, rather than three integers this builder could pair up wrongly.
     geom: Option<ModelAttnGeometry>,
@@ -472,20 +472,22 @@ impl<'a> Builder<'a> {
         (cos, sin)
     }
 
-    fn prefix_for(&mut self, layer: u64) -> (usize, usize) {
-        if let Some(pp) = self.prefix.get(&layer) {
+    /// The per-layer prefix-KV source pair at the CALLING CLASS's kv width.
+    ///
+    /// ⭐ THE WIDTH IS AN ARGUMENT, NOT A MODEL FACT. A hybrid model (gemma-4) has TWO attention
+    /// classes — its sliding layers run (nkvh=8, hd=256) and its global layers (nkvh=1, hd=512) —
+    /// so "the model's kv width" does not exist; each call site passes its own class's, read off
+    /// the same class geometry the `AttnDecode` it feeds gets. Memoized per `(layer, width)`:
+    /// one layer's K and V caches share a width, and a second call from the SAME class finds its
+    /// pair; a wrong pairing would be caught by the SubtileIR shape validator, which refuses a
+    /// cache region wider than its source.
+    fn prefix_for(&mut self, layer: u64, kvdim: u32) -> (usize, usize) {
+        if let Some(pp) = self.prefix.get(&(layer, kvdim)) {
             return *pp;
         }
-        let kvdim = self
-            .geom
-            .expect(
-                "prefix_for is only reachable from KV-cache arms, which refuse \
-                 on canonicals without attention geometry",
-            )
-            .kv_width();
         let pk = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixK { layer });
         let pv = self.push_source(self.prefix_len, kvdim, SourceBinding::PrefixV { layer });
-        self.prefix.insert(layer, (pk, pv));
+        self.prefix.insert((layer, kvdim), (pk, pv));
         (pk, pv)
     }
 }
@@ -970,9 +972,12 @@ pub fn lower_decode_to_wavefront(
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
                 // E.12 — RopeAppend writes rotated K and V into the
                 // paged KV cache. Pull the per-layer PrefixK / PrefixV
-                // source indices via the cached `prefix_for(layer)`
-                // helper (same indices Attention will receive later).
-                let (pk, pv) = bx.prefix_for(layer as u64);
+                // source indices via the cached `prefix_for(layer, k_cols)`
+                // helper (same indices Attention will receive later). The
+                // WIDTH is this layer's own k-rope width — a hybrid model's
+                // classes have different kv widths, so the cache the append
+                // writes must be THIS class's.
+                let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
                 let qi = bx.push_op(
                     SubOp::rope_rotate(head_dim),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
@@ -1034,14 +1039,6 @@ pub fn lower_decode_to_wavefront(
                     result = Some(idx);
                     continue;
                 };
-                let (pk, pv) = bx.prefix_for(layer);
-                // valid_len = the modeled prefix-cache rows: the RopeAppend
-                // above wrote the new token into the cache at decode_position,
-                // so the cache `[prefix_len, kv]` already spans prefix ++ new
-                // = `prefix_len` valid positions. The eval_node prefix slice
-                // uses `valid_len - 1` (the read-only prefix rows; the new
-                // row arrives via the separate k/v segments). The GPU mask
-                // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
                 let mask = match node.op {
                     OpKind::SlidingAttention => AttnMask::SlidingWindow,
@@ -1054,6 +1051,10 @@ pub fn lower_decode_to_wavefront(
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
                     AttnMask::SlidingWindow => base_geom,
                 };
+                // The prefix cache at THIS layer's class width — a hybrid model's
+                // sliding and global layers have different kv widths, and the cache
+                // this attention reads is the one its own class's RopeAppend wrote.
+                let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
                 if mask == AttnMask::SlidingWindow {
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
@@ -1359,7 +1360,20 @@ pub fn lower_decode_to_wavefront(
             }
             OpKind::TanhSoftCap => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(SubOp::TanhSoftCap, vec![x]);
+                // The cap is a MODEL CONSTANT (`final_logit_softcapping`, HF
+                // naming) — the only models that emit a `tanh_softcap(...)` tile
+                // are the capping ones, so it is present whenever this arm runs.
+                // Read at the same site every other model-const scalar is (the
+                // parsed `scalars` table, which hoists nested `text_config`),
+                // and carried on the op so the tape holds it — metal/cuda bake
+                // it into kernels and spyre binds it as a registry const.
+                let cap = bx
+                    .model
+                    .scalars
+                    .get("final_logit_softcapping")
+                    .copied()
+                    .unwrap_or(0.0) as f32;
+                let idx = bx.push_op(SubOp::TanhSoftCap { cap }, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

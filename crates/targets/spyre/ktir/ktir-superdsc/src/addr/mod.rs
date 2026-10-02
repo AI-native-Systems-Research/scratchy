@@ -221,8 +221,18 @@ impl Nest {
     /// hands out.
     ///
     /// The axis is a TYPE, so one nest's head stride and its row stride cannot be confused.
+    ///
+    /// ⛔ A STRIDE IS A DIFFERENCE, NOT AN ADDRESS — evaluated through [`Nest::off`], NOT
+    /// [`View::off`]. On a DEGENERATE axis (extent 1 — gemma-4's global class walks a one-kv-head
+    /// nest) the `hi` corner is necessarily ONE-PAST-THE-END, and `View::off`'s footprint assert
+    /// guards addresses handed OUT, not differences of them. The value is still the axis's own
+    /// linear coefficient from `dense_strides`, so the invariant this primitive exists for — a
+    /// nest cannot report a stride that disagrees with the addresses it hands out — is intact.
     pub fn span<A: Axis>(&self, lo: Idx<A>, hi: Idx<A>) -> AxisStride {
-        let at = |i: Idx<A>| self.view().at(i).off();
+        let at = |i: Idx<A>| {
+            let v = self.view().at(i);
+            self.off(&v.corner)
+        };
         AxisStride {
             elems: at(hi) - at(lo),
             lanes: self.lanes(),

@@ -8481,6 +8481,7 @@ fn synth_role_tokens(
         R::Meps => quote! { #b::Meps },
         R::Rinv => quote! { #b::Rinv },
         R::Xn => quote! { #b::Xn },
+        R::Tanhc => quote! { #b::Tanhc },
         R::GatherKt => quote! { #b::GatherKt },
         R::GatherV => quote! { #b::GatherV },
         R::NewKt => quote! { #b::NewKt },

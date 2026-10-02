@@ -61,11 +61,17 @@ pub mod gemma3;
 #[path = "arch/gemma3_mm.rs"]
 pub mod gemma3_mm;
 
-#[cfg(all(feature = "arch-gemma4", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(
+    feature = "arch-gemma4",
+    any(feature = "cuda", feature = "metal", feature = "spyre")
+))]
 #[path = "arch/gemma4.rs"]
 pub mod gemma4;
 
-#[cfg(all(feature = "arch-gemma4-moe", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(
+    feature = "arch-gemma4-moe",
+    any(feature = "cuda", feature = "metal", feature = "spyre")
+))]
 #[path = "arch/gemma4_moe.rs"]
 pub mod gemma4_moe;
 

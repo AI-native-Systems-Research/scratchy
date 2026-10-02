@@ -211,6 +211,10 @@ fn lower_elementwise_node_rows<F: RopeForm>(
                 let den = st.binop(OpKind::ArithAddf, one, e, dims.clone());
                 st.binop(OpKind::ArithDivf, x, den, dims.clone())
             }
+            EwKind::Gelu => {
+                let x = st.load_region(&sub_rows(&node.inputs[0], off, h));
+                st.gelu(x, dims.clone())
+            }
             ref other => {
                 return Err(SuperDscError(format!(
                     "no KTIR lowering for elementwise {other:?} on t{}",
@@ -293,6 +297,14 @@ fn lower_elementwise_node<F: RopeForm>(
             let den = st.binop(OpKind::ArithAddf, one, e, dims.clone());
             st.binop(OpKind::ArithDivf, x, den, dims)
         }
+        // ⭐ GELU IS ONE DEVICE OP — `OpFunc::Gelu` is a real DDL primitive (the SFP
+        // constant table ships the tanh polynomial). The program states the SAME function
+        // longhand (`KtirFunc::gelu`) and stamps `Elementwise(Gelu)`, so the door emits the
+        // single op and the emulator interprets the identical math — the silu pattern.
+        EwKind::Gelu => {
+            let x = st.load_region(&node.inputs[0]);
+            st.gelu(x, dims)
+        }
         ref other => {
             return Err(SuperDscError(format!(
                 "no KTIR lowering for elementwise {other:?} on t{}",
@@ -366,6 +378,157 @@ fn lower_rmsnorm_node<F: RopeForm>(
     let name = Arena::global().str(format!("rmsnorm_s{}", node.id.index()));
     st.rmsnorm(&node.inputs[0], &node.inputs[1], &node.output, eps);
     let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RmsNorm);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::RmsNormUnit`] — the gainless twin of [`lower_rmsnorm_node`].
+/// One input (x), no gamma, and the program kind the consumer door dispatches on is
+/// `Program::RmsNormUnit`, whose assembler stops at the normalising multiply.
+fn lower_rmsnorm_unit_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    eps: f32,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "RmsNormUnit t{} expects 1 input (x), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("rmsnormunit_s{}", node.id.index()));
+    st.rmsnorm_unit(&node.inputs[0], &node.output, eps);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RmsNormUnit);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::TanhSoftCap`] — `out = cap · tanh(x / cap)`, the gemma
+/// final-logit soft cap. One input (the logits), shape-preserving, and the cap
+/// is the model constant `final_logit_softcapping` the tape now carries.
+///
+/// The program is [`KtirFunc::tanhsoftcap`]'s longhand chain (divf by the
+/// splatted cap → tanh → mulf by it), stamped `Program::TanhSoftCap`; the
+/// emit side reads the SAME cap back structurally
+/// ([`program_tanhsoftcap_cap`]) and resolves the `[1,1]` registry const by
+/// value — the RmsNormUnit contract, verbatim.
+fn lower_tanhsoftcap_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    cap: f32,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "TanhSoftCap t{} expects 1 input (x), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    if cap <= 0.0 {
+        return Err(SuperDscError(format!(
+            "TanhSoftCap t{} has a non-positive cap {cap} — the cap divides the logits, so a \
+             model with `final_logit_softcapping` <= 0 must not emit a softcap tile at all",
+            node.output.tensor.index() as u32
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("tanhsoftcap_s{}", node.id.index()));
+    let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
+    // Whole tiles where they fit, rows where they do not — the same bound, and
+    // the same reason, as `lower_elementwise_node`: the softcap spans the
+    // VOCAB-wide logits, wider than any activation.
+    let by_row = rows > 1 && u64::from(rows) * u64::from(cols) * 3 > u64::from(EW_LX_ELEMS);
+    if by_row {
+        let blk = rows_per_block(cols, 3);
+        let mut off = 0u32;
+        while off < rows {
+            let h = blk.min(rows - off);
+            let dims = vec![i64::from(h), i64::from(cols)];
+            let x = st.load_region(&sub_rows(&node.inputs[0], off, h));
+            let y = st.tanhsoftcap(x, dims, f64::from(cap));
+            st.store_region(y, &sub_rows(&node.output, off, h));
+            off += h;
+        }
+    } else {
+        let dims = vec![i64::from(rows), i64::from(cols)];
+        let x = st.load_region(&node.inputs[0]);
+        let y = st.tanhsoftcap(x, dims, f64::from(cap));
+        st.store_region(y, &node.output);
+    }
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::TanhSoftCap);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::ScalarWeightMul`] — `out = x · w`, gemma4's per-layer
+/// `layer_scalar` multiply. Two inputs (x and the `[1]` weight), shape-
+/// preserving. The weight is a HOST-STAGED weight-source (RmsNorm-kind
+/// accessor, `.weight` bound by `superdsc_weights`), so the program LOADS it
+/// and the descriptor reads the staged `[1,1]` buffer with the scalar
+/// broadcast — the ATTN_SCALE operand mode over a worker-bound weight instead
+/// of a registry const.
+fn lower_scalar_weight_mul_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "ScalarWeightMul t{} expects 2 inputs (x, weight), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("scalarwmul_s{}", node.id.index()));
+    st.scalar_weight_mul(&node.inputs[0], &node.inputs[1], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::ScalarWeightMul);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::Reshape`] — a re-laying copy `[r_in, c_in]` → `[r_out, c_out]` preserving
+/// the flat element sequence (gemma4's per-head q/k/v-norm views and flatten-backs). ONE input.
+///
+/// ⛔ THE COUNT LAW IS CHECKED AT THE PRODUCER TOO: the emit door re-states it (against its own
+/// descriptors), but the host oracle's `assert_eq` fires first at expansion — and this producer
+/// refusing a malformed node here names the NODE, before any program is minted.
+fn lower_reshape_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "Reshape t{} expects 1 input, found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let (r_in, c_in) = (
+        node.inputs[0].region.rows.len,
+        node.inputs[0].region.cols.len,
+    );
+    let (r_out, c_out) = (node.output.region.rows.len, node.output.region.cols.len);
+    if u64::from(r_in) * u64::from(c_in) != u64::from(r_out) * u64::from(c_out) {
+        return Err(SuperDscError(format!(
+            "Reshape t{}: `[{r_in}, {c_in}]` → `[{r_out}, {c_out}]` does not preserve the element \
+             count — a reshape moves the same elements to new coordinates",
+            node.output.tensor.index() as u32,
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("reshape_s{}", node.id.index()));
+    st.reshape(&node.inputs[0], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::Reshape);
     let mut e = EmittedOp::bare(name.to_string());
     e.ktir = Some(k);
     Ok(vec![e])
@@ -877,52 +1040,33 @@ pub(crate) enum NodeLowering {
     HostRouted(&'static str),
 }
 
-/// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETERS, READ WHERE MAIN READ THEM.
+/// ⭐⭐⭐ THE BUNDLE'S ATTENTION PARAMETER, READ WHERE MAIN READ IT.
 ///
-/// `ibm/main`'s `lower_one_node` lowered each node during the tape walk, so `SubOp::AttnDecode`'s
-/// `geom` and `scale` were in its hand and `active_cap` / `rows_are_requests` were its own walk
-/// parameters. This split lowers KTIR → SuperDSC one pass later, per BUNDLE, so the same four facts
-/// are read HERE — off the graph's own `AttnDecode` nodes and off this walk's parameters — and travel
-/// to the door as [`crate::ktir_superdsc_door::BundleAttnParams`], an argument of the call.
+/// `ibm/main`'s `lower_one_node` lowered each node during the tape walk, so `rows_are_requests` was
+/// its own walk parameter. This split lowers KTIR → SuperDSC one pass later, per BUNDLE, so the fact
+/// is read HERE — off this walk's parameters — and travels to the door as
+/// [`crate::ktir_superdsc_door::BundleAttnParams`], an argument of the call.
 ///
-/// ⛔ THE MODEL FACTS MUST BE THE MODEL'S, SO A DISAGREEMENT IS AN ERROR AND NOT A CHOICE. One
-/// `#[forward]` expansion is one model, so every `AttnDecode` node in one graph carries the same
-/// geometry and the same multiplier. If two ever differed, one value per bundle could not describe
-/// both, and picking the first would silently give one layer another layer's registry slot — so this
-/// refuses instead, naming both.
+/// ⛔ THE GEOMETRY IS NO LONGER A BUNDLE FACT, AND GEMMA-4 IS WHY. It used to be read off the
+/// graph's first `AttnDecode` with a refusal if two disagreed — sound only while one expansion had
+/// one attention class. Gemma-4's layers alternate a sliding class (nqh=16, nkvh=8, hd=256) with a
+/// global one (nqh=16, nkvh=1, hd=512), so one graph carries TWO; the door now mints each attention
+/// program's own geometry off the program's views (`ktir_superdsc_door::attn`), which is where
+/// every other program-stated fact (scale, `mq`, the swept extent) was already read.
 ///
-/// `None` when the graph has no attention node: there is then nothing for the four to be facts of, and
-/// an attention program arriving at the door without them is that door's own build error.
+/// `None` when the graph has no attention node: there is then nothing for the row kind to be a fact
+/// of, and an attention program arriving at the door without it is that door's own build error.
 pub(crate) fn attn_bundle_params<F: RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> Result<Option<crate::ktir_superdsc_door::BundleAttnParams>, SuperDscError> {
-    let mut found: Option<(ktir_superdsc::head_counts::ModelAttnGeometry, u32)> = None;
-    for n in &ir.nodes {
-        let SubOp::AttnDecode { geom, .. } = &n.op else {
-            continue;
-        };
-        let t = n.output.tensor.index() as u32;
-        match found {
-            None => found = Some((*geom, t)),
-            Some((g0, t0)) => {
-                if g0 != *geom {
-                    return Err(SuperDscError(format!(
-                        "AttnDecode t{t0} declares geometry ({g0}) while AttnDecode t{t} declares \
-                         ({geom}). One bundle is one model, and the geometry door the lowering \
-                         crosses takes ONE geometry for the whole bundle; a graph carrying two would \
-                         give one layer the other's."
-                    )));
-                }
-            }
-        }
-    }
-    Ok(
-        found.map(|(geom, _)| crate::ktir_superdsc_door::BundleAttnParams {
-            geom,
-            rows_are_requests,
-        }),
-    )
+    let has_attn = ir
+        .nodes
+        .iter()
+        .any(|n| matches!(n.op, SubOp::AttnDecode { .. }));
+    Ok(has_attn.then_some(crate::ktir_superdsc_door::BundleAttnParams {
+        rows_are_requests,
+    }))
 }
 
 /// The rotary lowering, waiting for its head dim to become a const — the consumer side of
@@ -1025,9 +1169,16 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // in `lower_region` — which is the point: the IR carries the fact and the
         // TARGET says whether it has a kernel. Enumerated, never `_`, so adding a
         // SubOp is E0004 here rather than a surprise at emission.
-        SubOp::TanhSoftCap
-        | SubOp::RmsNormUnit { .. }
-        | SubOp::ScalarWeightMul
+        SubOp::TanhSoftCap { cap } => match lower_tanhsoftcap_node(node, ir, *cap, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        SubOp::ScalarWeightMul => {
+            match lower_scalar_weight_mul_node(node, ir, sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
         | SubOp::GateSplit { .. }
         | SubOp::GateApply
         | SubOp::GateScale
@@ -1040,17 +1191,10 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::GatedDeltaNet
         | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
-        // ⛔ THE ONE PLACE THAT MUST IMPLEMENT IT, so the refusal lives here
-        // and names the required lowering rather than the op.
-        SubOp::Reshape { .. } => Unhandled(
-            "SubOp::Reshape reached the SuperDSC lowering. It must become a RESTICKIFY \
-                 (a real re-laying copy), NOT a placement alias: `dev_off_stk` places (i,j) \
-                 at (j/stk)*(a*stk)+i*stk+(j%stk) where `a` is the ROW COUNT, so two views \
-                 over one buffer with different extents disagree about every element. And \
-                 `declare_arrangement` will NOT catch an alias — it keys on tensor NAME, and \
-                 an alias gives the two views two names."
-                .to_string(),
-        ),
+        SubOp::Reshape { .. } => match lower_reshape_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
         SubOp::MatmulTile { .. } if is_prefill_lm_head_tail => {
             match lower_prefill_lm_head_at_m1(node, ir, sym_id_base, layout, quantized) {
                 Ok(v) => Ops(v),
@@ -1119,6 +1263,14 @@ pub(crate) fn lower_one_node<F: RopeForm>(
              no kernel — its rmsnorm multiplies by the stored gain",
             node.output.tensor.index() as u32,
         )),
+        // The GAINLESS form — gemma's per-head V/K norms. The same chain as `RmsNorm`
+        // minus the gamma multiply, so it is the same 6-op decomposition with the
+        // normalising multiply terminal. Unit gain means there is no GainConvention to
+        // refuse here: nothing is applied.
+        SubOp::RmsNormUnit { eps } => match lower_rmsnorm_unit_node(node, ir, *eps, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
         SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
             // ⭐⭐ THE ONE PLACE THE HEAD DIM STOPS BEING A VALUE. Every head_dim-dependent decision
             // downstream is a branch on a CONST, which is reviewable and guardable; a branch on a
@@ -2637,6 +2789,61 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         self.splat_of(c, dims)
     }
 
+    /// `tanh(x)`, the whole-tensor unary — `MathTanh` is a legal KTIR kind and
+    /// `OpFunc::Tanh` a real DDL primitive (see `elementwise_op_func`), so unlike
+    /// silu it needs no longhand decomposition. Used by the gelu polynomial below.
+    fn tanh(&mut self, x: Ssa, dims: Vec<i64>) -> Ssa {
+        self.unop(OpKind::MathTanh, x, dims)
+    }
+
+    /// `gelu(x)` as the TANH POLYNOMIAL, written longhand — `0.5x(1 + tanh(c(x + 0.044715x³)))`
+    /// with `c = √(2/π)` — because that IS the function the DDL's `OpFunc::Gelu` primitive
+    /// computes (`elementwise_op_func`'s "a REAL DDL primitive … the SFP constant table ships
+    /// gelu's polynomial"), so the program the emulator interprets and the single device op the
+    /// door emits are the same function by construction. ⛔ NOT the erf form: `GeluErf` stays
+    /// refused in `elementwise_op_func` for exactly this reason, and this producer must not
+    /// become a side door for it.
+    fn gelu(&mut self, x: Ssa, dims: Vec<i64>) -> Ssa {
+        let half = self.scalar(0.5);
+        let half = self.splat_of(half, dims.clone());
+        let c = self.scalar((2.0 / std::f64::consts::PI).sqrt());
+        let c = self.splat_of(c, dims.clone());
+        let k = self.scalar(0.044715);
+        let k = self.splat_of(k, dims.clone());
+        let one = self.splat_one(dims.clone());
+        // inner = x + 0.044715·x³
+        let x2 = self.binop(OpKind::ArithMulf, x, x, dims.clone());
+        let x3 = self.binop(OpKind::ArithMulf, x2, x, dims.clone());
+        let kx3 = self.binop(OpKind::ArithMulf, k, x3, dims.clone());
+        let inner = self.binop(OpKind::ArithAddf, x, kx3, dims.clone());
+        // t = tanh(c·inner); y = 0.5·x·(1 + t)
+        let ci = self.binop(OpKind::ArithMulf, c, inner, dims.clone());
+        let t = self.tanh(ci, dims.clone());
+        let onept = self.binop(OpKind::ArithAddf, one, t, dims.clone());
+        let xh = self.binop(OpKind::ArithMulf, x, half, dims.clone());
+        self.binop(OpKind::ArithMulf, xh, onept, dims)
+    }
+
+    /// `cap · tanh(x / cap)` — Gemma's final-logit soft cap, written longhand as
+    /// ONE `arith.divf` by the splatted cap, ONE `math.tanh`, ONE `arith.mulf`
+    /// by the same splat. `MathTanh` is a legal KTIR kind and `OpFunc::Tanh` a
+    /// real DDL primitive, so the tanh needs no decomposition; the divide and
+    /// the multiply are the device's `realdiv` and `multiply`.
+    ///
+    /// ⭐ THE CAP IS AN IMMEDIATE (`splat(cap)`), WHICH IS WHAT THE EMIT SIDE
+    /// READS BACK — [`program_tanhsoftcap_cap`] resolves the `[1,1]` registry
+    /// const from the DIVF's splatted operand, so the value this program
+    /// interprets and the value the descriptor binds are one fact, the same
+    /// contract [`Self::rmsnorm_unit`]'s epsilon holds through
+    /// [`program_rmsnorm_eps`].
+    fn tanhsoftcap(&mut self, x: Ssa, dims: Vec<i64>, cap: f64) -> Ssa {
+        let capt = self.splat(cap, dims.clone());
+        let scaled = self.binop(OpKind::ArithDivf, x, capt, dims.clone());
+        let t = self.tanh(scaled, dims.clone());
+        let capt2 = self.splat(cap, dims.clone());
+        self.binop(OpKind::ArithMulf, t, capt2, dims)
+    }
+
     /// `-x`, as `0 - x`.
     ///
     /// ⛔ NOT `arith.negf`, BECAUSE THE DEVICE HAS NO NEGATE. `OpFuncs` (deeptools
@@ -2922,7 +3129,106 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         self.store_region(y, out);
     }
 
+    /// RmsNormUnit — `out = x · rsqrt(mean(x²) + eps)`, the gainless form. The same
+    /// chain as [`Self::rmsnorm`] minus the gamma multiply: the normalising multiply
+    /// is the terminal one, so `xs` is stored directly. The epsilon is an immediate
+    /// (`f32_splat(eps)`), which is what `program_rmsnorm_eps` reads back on the
+    /// consumer side to resolve the `[1,1]` const slot.
+    fn rmsnorm_unit(&mut self, x_r: &TensorRegion, out: &TensorRegion, eps: f32) {
+        let c = out.region.cols.len;
+        let m = out.region.rows.len;
+        let x = self.load_region(x_r);
+        let dims = vec![i64::from(m), i64::from(c)];
+        let rows = vec![i64::from(m)];
+
+        let xf = {
+            let v = self.fresh();
+            let op = Operation::new(self.a, Some(v), OpKind::ArithExtf, &[x]);
+            let ty = self.f32_ty(dims.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let x2 = self.f32_binop(OpKind::ArithMulf, xf, xf, dims.clone());
+        let sinit = self.f32_splat(0.0, rows.clone());
+        let ssum = {
+            let a = self.a;
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::LinalgReduce, &[x2, sinit])
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![1])))
+                .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+            let ty = self.f32_ty(rows.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let dts = self.f32_splat(f64::from(c), rows.clone());
+        let mean = self.f32_binop(OpKind::ArithDivf, ssum, dts, rows.clone());
+        let epst = self.f32_splat(f64::from(eps), rows.clone());
+        let meps = self.f32_binop(OpKind::ArithAddf, mean, epst, rows.clone());
+        let rms = {
+            let v = self.fresh();
+            let op = Operation::new(self.a, Some(v), OpKind::MathSqrt, &[meps]);
+            let ty = self.f32_ty(rows.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let onet = self.f32_splat(1.0, rows.clone());
+        let inv = self.f32_binop(OpKind::ArithDivf, onet, rms, rows.clone());
+        let inv_e = {
+            let v = self.fresh();
+            let op = Operation::new(self.a, Some(v), OpKind::ArithTruncf, &[inv]);
+            let ty = self.tensor_ty(rows);
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let invb = self.broadcast(inv_e, dims.clone(), 1);
+        let y = self.binop(OpKind::ArithMulf, x, invb, dims);
+        self.store_region(y, out);
+    }
+
     /// SiluMul — `out[j] = (gate / (1 + exp(-gate))) · up`.
+    /// ScalarWeightMul — `out = x · w`, `w` a LOADED `[1]`-shaped weight
+    /// (gemma4 `layer_scalar[layer]`). The weight is loaded RANK-1 (`load_1d`,
+    /// one element) and broadcast along the ROW axis to `[m, c]` — the same
+    /// construction `rmsnorm` uses for its `[1, c]` gamma, so the broadcast
+    /// produces a 2-D tile and never a `[1, 1, c]` the emulator cannot
+    /// rank-reduce.
+    ///
+    /// ⭐ THE WEIGHT IS A REAL PARAMETER, not a splat: the value is staged by
+    /// the host from the checkpoint (`superdsc_weights` binds the
+    /// `RmsNorm`-kind accessor's `.weight`), so the program must LOAD it —
+    /// unlike [`Self::tanhsoftcap`]'s cap, which is a config constant the
+    /// program states inline.
+    fn scalar_weight_mul(&mut self, x_r: &TensorRegion, w_r: &TensorRegion, out: &TensorRegion) {
+        let c = out.region.cols.len;
+        let m = out.region.rows.len;
+        let x = self.load_region(x_r);
+        let dims = vec![i64::from(m), i64::from(c)];
+        // The `[1]` weight, loaded rank-1 and sprayed over every row.
+        let w = self.load_1d(w_r.tensor, 1, 0, 1);
+        let wb = self.broadcast(w, dims.clone(), 0);
+        let y = self.binop(OpKind::ArithMulf, x, wb, dims);
+        self.store_region(y, out);
+    }
+
+    /// A reshape — the WHOLE source region loaded through its own view, stored through the
+    /// output's. The load/store views carry each side's `[rows, cols]`, so the emit door reads
+    /// both extents off the program's own parameters and decomposes into single-stick copies;
+    /// this body's job is only to move all `r·c` elements once, which a whole-tensor load +
+    /// store does exactly.
+    ///
+    /// ⛔ NO `tensor.reshape` OP EXISTS HERE, DELIBERATELY: KTIR's op set has none, and the
+    /// emulator's `eval_dag` oracle already treats a reshape as the identity over the flat
+    /// sequence — a load/store pair through two differently-shaped views is exactly that, with
+    /// the views stating both extents.
+    fn reshape(&mut self, x_r: &TensorRegion, out: &TensorRegion) {
+        let x = self.load_region(x_r);
+        self.store_region(x, out);
+    }
+
     fn silu_mul(&mut self, gate_r: &TensorRegion, up_r: &TensorRegion, out: &TensorRegion) {
         // ROW BLOCKS THAT FIT, not one row at a time. The gate and up tiles are the widest in the
         // model, so a whole `[mq, intermediate]` region does not fit a core's LX at prefill — but a
