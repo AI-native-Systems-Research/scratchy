@@ -21,7 +21,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{MTLBuffer as _, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
 
-use crate::mtl4_dispatch::{Buffer, shared_slice, shared_zeroed};
+use crate::mtl4_dispatch::{Buffer, shared_zeroed};
 use crate::residency::{MetalResidencySet, Pinned};
 use crate::shader_cache::load_library_from_bytes;
 use crate::stream::MetalStreamError;
@@ -304,53 +304,59 @@ const SAMPLER_TELEM_K: u32 = 8;
 /// `shaders/sampling.metal`.
 const ROW_STATE_LEN: usize = 16;
 
-/// One step's non-greedy sampler work: GPU buffers + the ONE argument table
-/// every pipeline stage shares, prepared BEFORE the forward so it can be
-/// encoded onto the forward's OWN command buffer
-/// ([`encode_into`](Self::encode_into), from the argmax followup) — one
-/// commit, one host wait, no second command buffer. Read the sampled tokens
-/// after the wait via [`output`](Self::output).
-pub struct PendingSampler {
-    njobs: u32,
-    nslices: u32,
+/// The sampler's persistent GPU state: every buffer and argument table the
+/// pipeline needs, allocated and bound ONCE (at model load, like
+/// `RuntimeBindings` — vocab, max rows and history bounds are compile-time
+/// facts of the loaded config, so per-step allocation was pure waste).
+/// Buffers live in the worker's own (already-committed) residency set, so
+/// every forward command buffer sees them resident with no per-step pinning.
+///
+/// Per step, [`prepare_step`](Self::prepare_step) only writes this step's
+/// params/row-state words into the shared buffers (host memcpy — the buffers
+/// are `StorageModeShared`) and returns a lightweight [`PendingSampler`]
+/// handle; the descent state itself is reset by `sample_stats_pick` each
+/// step, so no zeroing pass is needed between steps.
+pub struct SamplerArena {
+    max_rows: u32,
+    vocab: u32,
+    /// The largest `nrows * nslices` any step can reach (see
+    /// [`sliced_max_for`]); sliced buffers are indexed `[row * nslices +
+    /// slice]` with the CURRENT step's nslices, so they must cover this.
+    sliced_max: usize,
     cast_dtype: CastDtype,
-    // Every buffer is bound by gpuAddress in `encode_into`, so each is pinned
-    // for as long as this lives: keep it until the forward's host wait.
-    scratch_f32: Pinned,    // slot 0: f32 logits → prob bits, [nrows, vocab]
-    out_buf: Pinned,        // slot 13: sampled token ids
-    row_idx_buf: Pinned,    // slot 2
-    out_ids_buf: Pinned,    // slot 3 (penalties; dummy when none)
-    prompt_ids_buf: Pinned, // slot 4
-    reps_buf: Pinned,       // slot 5
-    freqs_buf: Pinned,      // slot 6
-    press_buf: Pinned,      // slot 7
-    row_state_buf: Pinned,  // slot 8
-    partials_buf: Pinned,   // slot 9
-    hist_buf: Pinned,       // slot 10
-    counts_buf: Pinned,     // slot 11
-    staging_buf: Pinned,    // slot 12
-    consts_buf: Pinned,     // slot 14: (vocab, nslices, nrows, max_out, max_prompt)
-    // Sampler-telemetry spill (only compiled under `sampler-telemetry`): real
-    // buffers when `telem_on`, else a reused dummy.
+    /// Persistent pins: dropped only when the arena drops (worker teardown).
+    _pins: Vec<Pinned>,
+    scratch_f32: Buffer, // f32 logits → prob bits, [max_rows, vocab]
+    out_buf: Buffer,     // sampled token ids, [max_rows]
+    row_idx_buf: Buffer, // [max_rows]
+    out_ids_buf: Buffer, // penalties histories, [max_rows, max_hist]
+    prompt_ids_buf: Buffer,
+    reps_buf: Buffer, // [max_rows] f32 each
+    freqs_buf: Buffer,
+    press_buf: Buffer,
+    row_state_buf: Buffer, // [max_rows, ROW_STATE_LEN]
+    partials_buf: Buffer,  // [sliced_max, 3]
+    hist_buf: Buffer,      // [sliced_max, 256]
+    counts_buf: Buffer,    // [sliced_max, 4]
+    staging_buf: Buffer,   // [sliced_max, 2 * MAX_CANDIDATES]
+    consts_buf: Buffer,    // (vocab, nslices, nrows, max_out, max_prompt)
+    max_hist: u32,
+    // Sampler-telemetry spill (only compiled under `sampler-telemetry`).
     #[cfg(feature = "sampler-telemetry")]
-    topk_probs_buf: Pinned,
+    topk_probs_buf: Buffer,
     #[cfg(feature = "sampler-telemetry")]
-    topk_indices_buf: Pinned,
+    topk_indices_buf: Buffer,
     #[cfg(feature = "sampler-telemetry")]
-    stats_buf: Pinned,
+    stats_buf: Buffer,
     #[cfg(feature = "sampler-telemetry")]
-    telem_consts_buf: Pinned,
-    #[cfg(feature = "sampler-telemetry")]
-    telem_on: bool,
-    #[cfg(feature = "sampler-telemetry")]
-    telem_k: u32,
+    telem_consts_buf: Buffer,
     // Per-stage argument tables: MTL4 binds buffer attributes by signature
-    // position (the old sampler's kernels used contiguous 0..N attributes and
-    // one table; these kernels keep that convention per stage, so each stage
-    // has its own table). The cast's table is the one whose slot 1
-    // (the forward's logits) [`encode_into`](Self::encode_into) rebinds.
+    // position; each kernel's buffers sit at contiguous 0..k-1, so each stage
+    // has its own table. Built + fully bound once here; the cast's slot 1
+    // (the forward's logits) is rebound per forward by
+    // [`PendingSampler::encode_into`].
     cast_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    penalties_at: Option<Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>>,
+    penalties_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
     softmax_reduce_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
     stats_pick_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
     softmax_materialize_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
@@ -363,10 +369,25 @@ pub struct PendingSampler {
 }
 
 // SAFETY: the Retained Metal handles are created + only touched on the worker
-// thread (prepared, then encoded in the same thread's forward followup); never
-// actually sent across threads. Mirrors how the argmax/grammar followup closures
-// move Retained Metal objects into the (Send) followup.
-unsafe impl Send for PendingSampler {}
+// thread (built at load, then encoded in the same thread's forward followup);
+// never actually shared across threads — the `Arc` exists only so the
+// per-step `PendingSampler` handle can hold a refcount into the (Send)
+// followup. Mirrors `MetalArena`'s Send+Sync pair in `metal_allocator.rs`.
+unsafe impl Send for SamplerArena {}
+unsafe impl Sync for SamplerArena {}
+
+/// One step's non-greedy sampler work: a lightweight handle into a
+/// [`SamplerArena`] (whose buffers `prepare_step` already filled with this
+/// step's params), encoded onto the forward's OWN command buffer
+/// ([`encode_into`](Self::encode_into)) — one commit, one host wait, no
+/// second command buffer. Read the sampled tokens after the wait via
+/// [`output`](Self::output). Holds one `Arc` refcount on the arena, so it
+/// moves freely into the forward followup.
+pub struct PendingSampler {
+    arena: std::sync::Arc<SamplerArena>,
+    njobs: u32,
+    nslices: u32,
+}
 
 /// Vocab slices the pipeline cuts a row into: enough threadgroups to occupy
 /// the GPU's cores (two per core), without staging memory exploding at large
@@ -380,114 +401,91 @@ fn nslices_for(device: &Device, nrows: u32) -> u32 {
     (target / nrows.max(1)).clamp(1, 32)
 }
 
-impl PendingSampler {
-    /// Upload the neutral [`GpuSampleParams`](scratchy_core_common::GpuSampleParams)
-    /// into GPU buffers pinned in `residency` (committed) + build the shared
-    /// argument table. Address binding is deferred to
-    /// [`encode_into`](Self::encode_into) (which also binds the forward's own
-    /// logits).
-    pub fn prepare(
+/// The largest `nrows * nslices_for(nrows)` over `1..=max_rows` — the extent
+/// the sliced buffers (partials/hist/counts/staging) must cover. The product
+/// is `clamp(target/nrows, 1, 32) * nrows`: at most `target` while the slice
+/// count is interior, `32 * nrows` while clamped high, and `nrows` once rows
+/// alone fill the machine. The maximum over the whole range is therefore
+/// `max(target, max_rows)` — verified by `sliced_max_covers_every_step`.
+fn sliced_max_for(device: &Device, max_rows: u32) -> usize {
+    let cores = crate::device::gpu_cores(device).map(|c| c.0).unwrap_or(8);
+    let target = (cores * 2).max(8);
+    target.max(max_rows) as usize
+}
+
+impl SamplerArena {
+    /// Allocate + bind everything the sampler pipeline needs, once. Sizes are
+    /// compile-time facts of the loaded config: `vocab` from the model,
+    /// `max_rows` from the worker's `max_num_seqs`, `max_hist` from the
+    /// request-length bounds. All buffers are `StorageModeShared`, pinned into
+    /// the worker's persistent residency set (the one the pool commits once),
+    /// so every forward command buffer sees them resident. Returned behind an
+    /// `Arc`: the per-step [`PendingSampler`] handle holds a refcount so it
+    /// can move freely into the forward followup.
+    pub fn new(
         device: &Device,
         residency: &MetalResidencySet,
-        params: &scratchy_core_common::GpuSampleParams,
-        njobs: u32,
+        max_rows: u32,
         vocab: u32,
+        max_hist: u32,
         cast_dtype: CastDtype,
-    ) -> Self {
-        let pin = |buffer| residency.pin(buffer);
-        let n = njobs as usize;
-        let nslices = nslices_for(device, njobs);
+    ) -> std::sync::Arc<Self> {
+        let max_rows = max_rows.max(1);
+        let max_hist = max_hist.max(1);
+        let sliced_max = sliced_max_for(device, max_rows);
+        let n = max_rows as usize;
+        let h = max_hist as usize;
 
-        let row_idx_buf = pin(shared_slice(device, &params.row_indices));
-        let (out_ids_buf, prompt_ids_buf) = if params.any_penalty {
-            (
-                pin(shared_slice(device, &params.output_token_ids)),
-                pin(shared_slice(device, &params.prompt_token_ids)),
-            )
-        } else {
-            (pin(shared_zeroed(device, 4)), pin(shared_zeroed(device, 4)))
+        let mut pins: Vec<Pinned> = Vec::new();
+        let mut mk = |bytes: usize, what: &str| -> Buffer {
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1),
+                    objc2_metal::MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap_or_else(|| {
+                    panic!(
+                        "sampler arena: newBufferWithLength returned nil ({what}, {bytes} bytes)"
+                    )
+                });
+            pins.push(residency.pin(buf.clone()));
+            unsafe {
+                std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes.max(1));
+            }
+            buf
         };
-        let reps_buf = pin(shared_slice(device, &params.rep_penalties));
-        let freqs_buf = pin(shared_slice(device, &params.freq_penalties));
-        let press_buf = pin(shared_slice(device, &params.pres_penalties));
-
-        // row_state: the pipeline's per-row decision block. Host words:
-        // temperature, top_k, top_p, min_p, uniform, cap. GPU words (max, sum,
-        // threshold, round, counts) start zeroed and are (re)written by the
-        // kernels each dispatch.
-        let mut row_state: Vec<u32> = vec![0; n * ROW_STATE_LEN];
-        for r in 0..n {
-            let s = &mut row_state[r * ROW_STATE_LEN..(r + 1) * ROW_STATE_LEN];
-            s[0] = params.temperatures[r].to_bits();
-            s[3] = params.top_ks[r].max(0) as u32;
-            s[4] = params.top_ps[r].to_bits();
-            s[5] = params.min_ps[r].to_bits();
-            s[6] = params.uniforms[r].to_bits();
-            // cap = effective k; top_k == 0 → MAX_CANDIDATES (the shader's
-            // `effective_k` fallback, computed host-side so the descent's
-            // `pick` kernel never needs vocab).
-            let k = if params.top_ks[r] > 0 {
-                (params.top_ks[r] as u32).min(vocab)
-            } else {
-                1024u32.min(vocab)
-            };
-            s[8] = k;
-        }
-        let row_state_buf = pin(shared_slice(device, &row_state));
-
-        // Element counts × 4: these are u32 arrays, and `shared_zeroed`
-        // takes a byte length.
-        let partials_buf = pin(shared_zeroed(device, n * nslices as usize * 3 * 4));
-        let hist_buf = pin(shared_zeroed(device, n * nslices as usize * 256 * 4));
-        let counts_buf = pin(shared_zeroed(device, n * nslices as usize * 4 * 4));
-        let staging_buf = pin(shared_zeroed(device, n * nslices as usize * 2 * 1024 * 4));
-        let scratch_f32 = pin(shared_zeroed(device, n * vocab as usize * 4));
-        let out_buf = pin(shared_zeroed(device, n * 4));
-        let consts_buf = pin(shared_slice(
-            device,
-            &[
-                vocab,
-                nslices,
-                njobs,
-                params.max_output_len,
-                params.max_prompt_len,
-            ],
-        ));
-
-        // Sampler telemetry: spill the sorted top-K + confidence/entropy only
-        // when a consumer is watching (decided once here, honored at readback so
-        // a mid-step toggle can't desync). When not watching, one reused dummy
-        // backs the (never-read) spill buffers + a zeroed consts the shader reads.
+        let scratch_f32 = mk(n * vocab as usize * 4, "scratch");
+        let out_buf = mk(n * 4, "out");
+        let row_idx_buf = mk(n * 4, "row_idx");
+        let out_ids_buf = mk(n * h * 4, "out_ids");
+        let prompt_ids_buf = mk(n * h * 4, "prompt_ids");
+        let reps_buf = mk(n * 4, "reps");
+        let freqs_buf = mk(n * 4, "freqs");
+        let press_buf = mk(n * 4, "press");
+        let row_state_buf = mk(n * ROW_STATE_LEN * 4, "row_state");
+        let partials_buf = mk(sliced_max * 3 * 4, "partials");
+        let hist_buf = mk(sliced_max * 256 * 4, "hist");
+        let counts_buf = mk(sliced_max * 4 * 4, "counts");
+        let staging_buf = mk(sliced_max * 2 * 1024 * 4, "staging");
+        let consts_buf = mk(5 * 4, "consts");
         #[cfg(feature = "sampler-telemetry")]
-        let telem_on =
-            scratchy_core_common::sampler_telemetry::SamplerTelemetry::global().is_enabled();
+        let telem_k: u32 = SAMPLER_TELEM_K;
         #[cfg(feature = "sampler-telemetry")]
-        let telem_k: u32 = if telem_on { SAMPLER_TELEM_K } else { 0 };
-        #[cfg(feature = "sampler-telemetry")]
-        let (topk_probs_buf, topk_indices_buf, stats_buf, telem_consts_buf) = if telem_on {
+        let (topk_probs_buf, topk_indices_buf, stats_buf, telem_consts_buf) = {
             let k = telem_k as usize;
             (
-                pin(shared_zeroed(device, n * k * 4)),
-                pin(shared_zeroed(device, n * k * 4)),
-                pin(shared_zeroed(device, n * 2 * 4)),
-                pin(shared_slice(device, &[1u32, telem_k])),
-            )
-        } else {
-            let dummy = shared_zeroed(device, 4);
-            (
-                pin(dummy.clone()),
-                pin(dummy.clone()),
-                pin(dummy),
-                pin(shared_slice(device, &[0u32, 0u32])),
+                mk(n * k * 4, "topk_probs"),
+                mk(n * k * 4, "topk_indices"),
+                mk(n * 2 * 4, "stats"),
+                mk(2 * 4, "telem_consts"),
             )
         };
-        residency.commit();
 
-        // Per-stage argument tables: one per kernel, sized to its contiguous
-        // signature positions (0..k-1) and gap-filled with a zero buffer so an
-        // unused slot can never hold a stale address. Every real binding is
-        // deferred to `encode_into` (which also binds the forward's logits),
-        // matching main's deferred-address pattern.
+        // Per-stage argument tables, gap-filled with a zero buffer so an
+        // unused slot can never hold a stale address, then fully bound ONCE:
+        // every stage's buffers are arena-persistent, so the bindings never
+        // change. Only the cast's slot 1 (the forward's logits) is rebound
+        // per forward by `PendingSampler::encode_into`.
         let mk_table =
             |count: usize| -> Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>> {
                 use objc2_metal::MTL4ArgumentTable as _;
@@ -503,7 +501,7 @@ impl PendingSampler {
                 }
                 table
             };
-        // Buffer-index layouts per kernel (bound in `encode_into`):
+        // Buffer-index layouts per kernel (as in the shaders' signatures):
         //   cast: 0=scratch, 1=logits(forward), 2=row_idx, 3=consts.
         //   penalties: 0=scratch, 1=out_ids, 2=prompt_ids, 3=rep, 4=freq,
         //   5=pres, 6=consts.
@@ -521,11 +519,7 @@ impl PendingSampler {
         //   5=partials, 6..9=telemetry spill (only under sampler-telemetry),
         //   10=consts.
         let cast_at = mk_table(4);
-        let penalties_at = if params.any_penalty {
-            Some(mk_table(7))
-        } else {
-            None
-        };
+        let penalties_at = mk_table(7);
         let softmax_reduce_at = mk_table(4);
         let stats_pick_at = mk_table(3);
         let softmax_materialize_at = mk_table(4);
@@ -536,10 +530,12 @@ impl PendingSampler {
         let compact_tied_at = mk_table(5);
         let finalize_at = mk_table(11);
 
-        Self {
-            njobs,
-            nslices,
+        let arena = std::sync::Arc::new(Self {
+            max_rows,
+            vocab,
+            sliced_max,
             cast_dtype,
+            _pins: pins,
             scratch_f32,
             out_buf,
             row_idx_buf,
@@ -554,6 +550,7 @@ impl PendingSampler {
             counts_buf,
             staging_buf,
             consts_buf,
+            max_hist,
             #[cfg(feature = "sampler-telemetry")]
             topk_probs_buf,
             #[cfg(feature = "sampler-telemetry")]
@@ -562,10 +559,6 @@ impl PendingSampler {
             stats_buf,
             #[cfg(feature = "sampler-telemetry")]
             telem_consts_buf,
-            #[cfg(feature = "sampler-telemetry")]
-            telem_on,
-            #[cfg(feature = "sampler-telemetry")]
-            telem_k,
             cast_at,
             penalties_at,
             softmax_reduce_at,
@@ -577,15 +570,18 @@ impl PendingSampler {
             quota_pick_at,
             compact_tied_at,
             finalize_at,
-        }
+        });
+        arena.bind_stage_tables(device);
+        arena
     }
 
-    /// Bind every stage's buffers into its argument table (the tables were
-    /// gap-filled with a zero buffer at prepare time; only the forward's own
-    /// logits address is new per encode). Idempotent — rebinding the same
-    /// addresses is a no-op.
-    fn bind_stage_tables(&self, logits_addr: u64) {
-        use objc2_metal::{MTL4ArgumentTable, MTLBuffer};
+    /// Bind every stage's buffers into its (already gap-filled) argument
+    /// table, reading the owning fields. Called once at construction; the
+    /// bindings never change because the buffers are arena-persistent. Only
+    /// the cast's slot 1 (the forward's logits) is rebound per forward by
+    /// [`PendingSampler::encode_into`].
+    fn bind_stage_tables(&self, device: &Device) {
+        use objc2_metal::{MTL4ArgumentTable as _, MTLBuffer as _};
         let scratch = self.scratch_f32.gpuAddress();
         let partials = self.partials_buf.gpuAddress();
         let row_state = self.row_state_buf.gpuAddress();
@@ -593,21 +589,25 @@ impl PendingSampler {
         let counts = self.counts_buf.gpuAddress();
         let staging = self.staging_buf.gpuAddress();
         let consts = self.consts_buf.gpuAddress();
+        let zero_addr = shared_zeroed(device, 16).gpuAddress();
         unsafe {
             self.cast_at.setAddress_atIndex(scratch, 0);
-            self.cast_at.setAddress_atIndex(logits_addr, 1);
+            self.cast_at.setAddress_atIndex(zero_addr, 1);
             self.cast_at
                 .setAddress_atIndex(self.row_idx_buf.gpuAddress(), 2);
             self.cast_at.setAddress_atIndex(consts, 3);
-            if let Some(ref pen) = self.penalties_at {
-                pen.setAddress_atIndex(scratch, 0);
-                pen.setAddress_atIndex(self.out_ids_buf.gpuAddress(), 1);
-                pen.setAddress_atIndex(self.prompt_ids_buf.gpuAddress(), 2);
-                pen.setAddress_atIndex(self.reps_buf.gpuAddress(), 3);
-                pen.setAddress_atIndex(self.freqs_buf.gpuAddress(), 4);
-                pen.setAddress_atIndex(self.press_buf.gpuAddress(), 5);
-                pen.setAddress_atIndex(consts, 6);
-            }
+            self.penalties_at.setAddress_atIndex(scratch, 0);
+            self.penalties_at
+                .setAddress_atIndex(self.out_ids_buf.gpuAddress(), 1);
+            self.penalties_at
+                .setAddress_atIndex(self.prompt_ids_buf.gpuAddress(), 2);
+            self.penalties_at
+                .setAddress_atIndex(self.reps_buf.gpuAddress(), 3);
+            self.penalties_at
+                .setAddress_atIndex(self.freqs_buf.gpuAddress(), 4);
+            self.penalties_at
+                .setAddress_atIndex(self.press_buf.gpuAddress(), 5);
+            self.penalties_at.setAddress_atIndex(consts, 6);
             self.softmax_reduce_at.setAddress_atIndex(scratch, 0);
             self.softmax_reduce_at.setAddress_atIndex(partials, 1);
             self.softmax_reduce_at.setAddress_atIndex(row_state, 2);
@@ -661,85 +661,212 @@ impl PendingSampler {
         }
     }
 
+    /// Fill the arena's shared buffers with THIS step's sampler inputs and
+    /// return the lightweight handle the forward followup encodes. Pure host
+    /// memcpy — no Metal calls, no allocation. The penalties stage always
+    /// runs (rows without penalties carry neutral coefficients + all-padding
+    /// histories, which the kernel's `count > 0` test makes a no-op), so
+    /// `any_penalty` only gates whether real histories are written.
+    pub fn prepare_step(
+        self: &std::sync::Arc<Self>,
+        device: &Device,
+        params: &scratchy_core_common::GpuSampleParams,
+        njobs: u32,
+    ) -> PendingSampler {
+        assert!(
+            njobs <= self.max_rows,
+            "sampler step rows ({njobs}) exceed arena max_rows ({})",
+            self.max_rows
+        );
+        let n = njobs as usize;
+        let nslices = nslices_for(device, njobs);
+        assert!(
+            (n * nslices as usize) <= self.sliced_max,
+            "sampler step sliced extent ({n} * {nslices}) exceeds arena ({})",
+            self.sliced_max
+        );
+
+        // Shared-storage contents are plain host memory: fill via memcpy.
+        let write = |buf: &Buffer, bytes: &[u8]| {
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, bytes.len())
+            };
+            dst.copy_from_slice(bytes);
+        };
+        let u32s = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+
+        write(&self.row_idx_buf, &u32s(&params.row_indices));
+        write(&self.reps_buf, &f32s(&params.rep_penalties));
+        write(&self.freqs_buf, &f32s(&params.freq_penalties));
+        write(&self.press_buf, &f32s(&params.pres_penalties));
+
+        // row_state: host words (temperature, top_k, top_p, min_p, uniform,
+        // cap). GPU words (max, sum, threshold, round, counts) are (re)written
+        // by the kernels every step — `sample_stats_pick` resets the descent
+        // state — so stale words never leak into a step.
+        let mut row_state: Vec<u32> = vec![0; n * ROW_STATE_LEN];
+        for r in 0..n {
+            let s = &mut row_state[r * ROW_STATE_LEN..(r + 1) * ROW_STATE_LEN];
+            s[0] = params.temperatures[r].to_bits();
+            s[3] = params.top_ks[r].max(0) as u32;
+            s[4] = params.top_ps[r].to_bits();
+            s[5] = params.min_ps[r].to_bits();
+            s[6] = params.uniforms[r].to_bits();
+            // cap = effective k; top_k == 0 → MAX_CANDIDATES (the shader's
+            // `effective_k` fallback, computed host-side so the descent's
+            // `pick` kernel never needs vocab).
+            let k = if params.top_ks[r] > 0 {
+                (params.top_ks[r] as u32).min(self.vocab)
+            } else {
+                1024u32.min(self.vocab)
+            };
+            s[8] = k;
+        }
+        write(&self.row_state_buf, &u32s(&row_state));
+
+        // Penalties histories: row-major [njobs, max_*] padded with `vocab`
+        // (never a real index). The arena's max_hist bound is a worker-config
+        // fact; a longer history is a config violation, not data.
+        let max_out = params.max_output_len.max(1);
+        let max_prompt = params.max_prompt_len.max(1);
+        assert!(
+            max_out <= self.max_hist && max_prompt <= self.max_hist,
+            "sampler history ({max_out}/{max_prompt}) exceeds arena max_hist ({})",
+            self.max_hist
+        );
+        let pad = self.vocab as i32;
+        let i32s = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let mut flat_out = vec![pad; n * max_out as usize];
+        let mut flat_prompt = vec![pad; n * max_prompt as usize];
+        if params.any_penalty {
+            // Re-key the gatherer's own [njobs, its_max_*] layout into this
+            // step's strides (equal in practice; kept general).
+            for r in 0..n {
+                let src = params
+                    .output_token_ids
+                    .chunks_exact(params.max_output_len.max(1) as usize)
+                    .nth(r)
+                    .map(|c| c.to_vec())
+                    .unwrap_or_default();
+                flat_out[r * max_out as usize..r * max_out as usize + src.len()]
+                    .copy_from_slice(&src);
+                let src = params
+                    .prompt_token_ids
+                    .chunks_exact(params.max_prompt_len.max(1) as usize)
+                    .nth(r)
+                    .map(|c| c.to_vec())
+                    .unwrap_or_default();
+                flat_prompt[r * max_prompt as usize..r * max_prompt as usize + src.len()]
+                    .copy_from_slice(&src);
+            }
+        }
+        write(&self.out_ids_buf, &i32s(&flat_out));
+        write(&self.prompt_ids_buf, &i32s(&flat_prompt));
+
+        write(
+            &self.consts_buf,
+            &u32s(&[self.vocab, nslices, njobs, max_out, max_prompt]),
+        );
+        #[cfg(feature = "sampler-telemetry")]
+        {
+            let telem_on = u32::from(
+                scratchy_core_common::sampler_telemetry::SamplerTelemetry::global().is_enabled(),
+            );
+            write(&self.telem_consts_buf, &u32s(&[telem_on, SAMPLER_TELEM_K]));
+        }
+
+        PendingSampler {
+            arena: self.clone(),
+            njobs,
+            nslices,
+        }
+    }
+}
+
+impl PendingSampler {
     /// Encode the whole sample pipeline onto the forward's OWN MTL4 compute
-    /// encoder (from the argmax followup): cast (and penalties, when any) →
-    /// softmax reduce → stats pick → materialize → 4 × (histogram, threshold
-    /// pick) → count/compact → quota pick → compact tied → finalize. Every
-    /// stage rides its own argument table; the forward's logits buffer is
-    /// bound into the cast's table (slot 1) first.
+    /// encoder (from the argmax followup): cast (and penalties) → softmax
+    /// reduce → stats pick → materialize → 4 × (histogram, threshold pick) →
+    /// count/compact → quota pick → compact tied → finalize. Every stage
+    /// rides its own (arena-persistent) argument table; the forward's logits
+    /// buffer is bound into the cast's table (slot 1) first.
     pub fn encode_into(
         &self,
         enc: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         logits_addr: u64,
         kernels: &SamplerKernels,
     ) {
+        use objc2_metal::MTL4ArgumentTable;
         let rows = self.njobs;
         let sliced = rows * self.nslices;
-        self.bind_stage_tables(logits_addr);
+        unsafe {
+            self.arena.cast_at.setAddress_atIndex(logits_addr, 1);
+        }
 
         let stage =
             |pso: &ComputePipelineState,
              table: &Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
              tgs: u32| { encode_sampler_stage_into_mtl4(enc, pso, table, tgs) };
 
-        // Cast (and penalties) — only the cast's dtype differs.
-        let cast = match self.cast_dtype {
+        // Cast — only the dtype differs.
+        let cast = match self.arena.cast_dtype {
             CastDtype::Bf16 => &kernels.cast_bf16,
             CastDtype::F16 => &kernels.cast_f16,
             CastDtype::F32 => &kernels.cast_f32,
         };
-        stage(cast, &self.cast_at, sliced);
-        if let Some(ref pen) = self.penalties_at {
-            stage(&kernels.penalties, pen, sliced);
-        }
+        stage(cast, &self.arena.cast_at, sliced);
+        // Penalties always run: rows without penalties carry neutral
+        // coefficients + all-padding histories, which the kernel's `count
+        // > 0` test makes a no-op.
+        stage(&kernels.penalties, &self.arena.penalties_at, sliced);
 
         // Softmax: per-slice partials, merged to row stats, materialized.
-        stage(&kernels.softmax_reduce, &self.softmax_reduce_at, sliced);
-        stage(&kernels.stats_pick, &self.stats_pick_at, rows);
+        stage(
+            &kernels.softmax_reduce,
+            &self.arena.softmax_reduce_at,
+            sliced,
+        );
+        stage(&kernels.stats_pick, &self.arena.stats_pick_at, rows);
         stage(
             &kernels.softmax_materialize,
-            &self.softmax_materialize_at,
+            &self.arena.softmax_materialize_at,
             sliced,
         );
 
         // Byte-histogram descent: four rounds.
         for _ in 0..4 {
-            stage(&kernels.histogram, &self.histogram_at, sliced);
-            stage(&kernels.threshold_pick, &self.threshold_pick_at, rows);
+            stage(&kernels.histogram, &self.arena.histogram_at, sliced);
+            stage(&kernels.threshold_pick, &self.arena.threshold_pick_at, rows);
         }
 
         // Compaction: strict candidates + counts, tie quotas, tied candidates.
-        stage(&kernels.count_compact, &self.count_compact_at, sliced);
-        stage(&kernels.quota_pick, &self.quota_pick_at, rows);
-        stage(&kernels.compact_tied, &self.compact_tied_at, sliced);
+        stage(&kernels.count_compact, &self.arena.count_compact_at, sliced);
+        stage(&kernels.quota_pick, &self.arena.quota_pick_at, rows);
+        stage(&kernels.compact_tied, &self.arena.compact_tied_at, sliced);
 
         // Sort + top-p + draw.
-        stage(&kernels.finalize, &self.finalize_at, rows);
+        stage(&kernels.finalize, &self.arena.finalize_at, rows);
     }
 
     /// The sampled-token output buffer + row count, for reading back after the
     /// forward's single host wait (the sampler rode the forward CB).
     pub fn output(&self) -> (Buffer, u32) {
-        (self.out_buf.clone(), self.njobs)
+        (self.arena.out_buf.clone(), self.njobs)
     }
 
-    /// Telemetry spill buffers `(topk_probs, topk_indices, stats, njobs, k)` for
-    /// reading back after the forward's host wait — `None` when telemetry was
-    /// off at prepare time (so the readback matches what the kernel actually
-    /// wrote). `stats` holds `[max_prob, entropy_nats]` per row; `topk_*` hold
-    /// `k` entries per row, descending by prob (prob 0.0 = padding past the
-    /// candidate count).
+    /// Telemetry spill buffers `(topk_probs, topk_indices, stats, njobs, k)`
+    /// for reading back after the forward's host wait. `stats` holds
+    /// `[max_prob, entropy_nats]` per row; `topk_*` hold `k` entries per row,
+    /// descending by prob (prob 0.0 = padding past the candidate count).
     #[cfg(feature = "sampler-telemetry")]
     pub fn telemetry_output(&self) -> Option<(Buffer, Buffer, Buffer, u32, u32)> {
-        if !self.telem_on {
-            return None;
-        }
         Some((
-            self.topk_probs_buf.clone(),
-            self.topk_indices_buf.clone(),
-            self.stats_buf.clone(),
+            self.arena.topk_probs_buf.clone(),
+            self.arena.topk_indices_buf.clone(),
+            self.arena.stats_buf.clone(),
             self.njobs,
-            self.telem_k,
+            SAMPLER_TELEM_K,
         ))
     }
 }
@@ -794,13 +921,15 @@ mod tests {
         let logits_buf = shared_slice(device, logits);
         let batch = Mtl4DispatchBatch::begin(device)?;
         // The sampler's buffers AND the logits row must be resident for THIS
-        // command buffer: prepare against the batch's own set and pin the
-        // logits into it too (the batch's commit attaches exactly that set,
-        // and `pending`'s pins keep the buffers in it until after the host
-        // wait; the logits pin lives to the end of this scope).
+        // command buffer: build the arena against the batch's own set and pin
+        // the logits into it too (the batch's commit attaches exactly that
+        // set; the arena's pins keep its buffers in it for as long as both
+        // live — the logits pin lives to the end of this scope).
         let (pending, logits_pin) = {
             let res = batch.residency();
-            let pending = PendingSampler::prepare(device, res, params, njobs, vocab, dtype);
+            let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
+            let arena = SamplerArena::new(device, res, njobs, vocab, max_hist, dtype);
+            let pending = arena.prepare_step(device, params, njobs);
             (pending, res.pin(logits_buf.clone()))
         };
         use objc2_metal::MTLBuffer as _;
@@ -1279,29 +1408,32 @@ mod tests {
         use objc2_metal::MTLBuffer as _;
         let logits_buf = shared_slice(device, logits);
         let batch = Mtl4DispatchBatch::begin(device)?;
-        let (pending, _logits_pin) = {
+        let (pending, arena, _logits_pin) = {
             let res = batch.residency();
-            let pending =
-                PendingSampler::prepare(device, res, params, njobs, vocab, CastDtype::F32);
-            (pending, res.pin(logits_buf.clone()))
+            let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
+            let arena = SamplerArena::new(device, res, njobs, vocab, max_hist, CastDtype::F32);
+            let pending = arena.prepare_step(device, params, njobs);
+            (pending, arena, res.pin(logits_buf.clone()))
         };
         let enc = batch.encoder();
         // The cast + penalties stages are the pipeline's first two; the rest
-        // would consume/rewrite the scratch, so stop after penalties.
+        // would consume/rewrite the scratch, so stop after penalties. Bind the
+        // logits into the cast's table first (the arena's tables are already
+        // fully bound otherwise).
+        use objc2_metal::MTL4ArgumentTable as _;
+        unsafe {
+            arena.cast_at.setAddress_atIndex(logits_buf.gpuAddress(), 1);
+        }
         let sliced = njobs * pending.nslices;
-        pending.bind_stage_tables(logits_buf.gpuAddress());
-        let cast = match pending.cast_dtype {
+        let cast = match arena.cast_dtype {
             CastDtype::Bf16 => &kernels.cast_bf16,
             CastDtype::F16 => &kernels.cast_f16,
             CastDtype::F32 => &kernels.cast_f32,
         };
-        encode_sampler_stage_into_mtl4(enc, cast, &pending.cast_at, sliced);
-        if let Some(ref pen) = pending.penalties_at {
-            encode_sampler_stage_into_mtl4(enc, &kernels.penalties, pen, sliced);
-        }
+        encode_sampler_stage_into_mtl4(enc, cast, &arena.cast_at, sliced);
+        encode_sampler_stage_into_mtl4(enc, &kernels.penalties, &arena.penalties_at, sliced);
         batch.commit(true);
-        use std::ops::Deref;
-        let scratch = pending.scratch_f32.deref();
+        let scratch = &arena.scratch_f32;
         Some(read_slice::<f32>(scratch, njobs as usize * vocab as usize))
     }
 

@@ -263,6 +263,12 @@ pub struct MetalWorker {
     /// penalties). Cached once at load_model alongside `argmax_kernels`; used
     /// only for non-greedy requests (greedy decode stays on the argmax path).
     sampler_kernels: Option<scratchy_target_metal::sampling::SamplerKernels>,
+    /// The sampler's persistent GPU arena (buffers + argument tables), built
+    /// once at load_model — vocab, max rows and history bounds are
+    /// compile-time facts of the loaded config, so per-step allocation was
+    /// pure waste. Buffers are pinned in the allocator's residency set, so
+    /// every forward command buffer sees them resident.
+    sampler_arena: Option<std::sync::Arc<scratchy_target_metal::sampling::SamplerArena>>,
     /// Terminal logits slot + its runtime column count, captured by the
     /// `forward_argmax_blocking` followup on the last TARGET forward. The
     /// sampler reads sampling requests' logits rows out of this buffer (on the
@@ -773,6 +779,7 @@ impl MetalWorker {
             draft_kv_cache: None,
             argmax_kernels: None,
             sampler_kernels: None,
+            sampler_arena: None,
             sampler_logits: None,
             pending_sampler: None,
             fused_sampled: None,
@@ -1398,34 +1405,23 @@ impl MetalWorker {
         req_ids: &[String],
     ) -> ExecutorResult<scratchy_target_metal::sampling::PendingSampler> {
         // `vocab` is the lm_head logits width (== METAL_VOCAB_SIZE == config
-        // vocab_size). Take it + the compute dtype from the model so the sampler
-        // is preparable BEFORE this step's forward; the logits BUFFER itself is
-        // bound later, in the forward's followup (it's the forward's own output).
-        let (cast_dtype, vocab) = {
+        // vocab_size). Take it from the model so the sampler params assemble
+        // BEFORE this step's forward; the logits BUFFER itself is bound later,
+        // in the forward's followup (it's the forward's own output).
+        let vocab = {
             let model = self.model.as_deref().ok_or_else(|| {
                 ExecutorError::WorkerExecution("gpu sampler: model not loaded".into())
             })?;
-            let cast_dtype = match model.metal_dtype() {
-                scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => {
-                    scratchy_target_metal::sampling::CastDtype::Bf16
-                }
-                scratchy_target_metal::interpreter::metal::MetalDtype::F16 => {
-                    scratchy_target_metal::sampling::CastDtype::F16
-                }
-                scratchy_target_metal::interpreter::metal::MetalDtype::Int4 => {
-                    return Err(ExecutorError::WorkerExecution(
-                        "gpu sampler: int4 logits dtype unsupported".into(),
-                    ));
-                }
-            };
-            (cast_dtype, model.vocab_size() as u32)
+            model.vocab_size() as u32
         };
         let gpu_device = self
             .gpu_device
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: no gpu_device".into()))?;
-        let device = gpu_device.device.clone();
-        let residency = gpu_device.allocator.residency().clone();
+        let arena = self
+            .sampler_arena
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: arena not built".into()))?;
 
         // Assemble this step's sampler inputs (metal's `GpuSampleParams` layout)
         // and hand them to the metal sampler. The per-request seed inside comes
@@ -1439,14 +1435,7 @@ impl MetalWorker {
             |id| self.input_batch.history(id),
             vocab,
         );
-        Ok(scratchy_target_metal::sampling::PendingSampler::prepare(
-            &device,
-            &residency,
-            &params,
-            jobs.len() as u32,
-            vocab,
-            cast_dtype,
-        ))
+        Ok(arena.prepare_step(&gpu_device.device, &params, jobs.len() as u32))
     }
 }
 
@@ -2860,6 +2849,35 @@ impl Worker for MetalWorker {
             t_sampler.elapsed()
         );
 
+        // The sampler's persistent arena: every buffer + argument table,
+        // sized by the compile-time facts of this config (vocab, max_num_seqs
+        // rows, max_model_len history bound) and pinned into the allocator's
+        // residency set so every forward command buffer sees it resident.
+        // Per-step sampler work is then a pure host memcpy (`prepare_step`).
+        let t_arena = std::time::Instant::now();
+        let sampler_arena = scratchy_target_metal::sampling::SamplerArena::new(
+            &gpu_device.device,
+            gpu_device.allocator.residency(),
+            self.config.max_num_seqs.max(1) as u32,
+            model.vocab_size() as u32,
+            max_model_len.max(1) as u32,
+            match model.metal_dtype() {
+                scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => {
+                    scratchy_target_metal::sampling::CastDtype::Bf16
+                }
+                scratchy_target_metal::interpreter::metal::MetalDtype::F16 => {
+                    scratchy_target_metal::sampling::CastDtype::F16
+                }
+                scratchy_target_metal::interpreter::metal::MetalDtype::Int4 => {
+                    scratchy_target_metal::sampling::CastDtype::Bf16
+                }
+            },
+        );
+        info!(
+            "ScratchyWorker(metal): sampler arena in {:?}",
+            t_arena.elapsed()
+        );
+
         // Phase 6 chain-advance pipeline. Tiny kernel — one-time build
         // alongside argmax so the K-step chain driver never falls into
         // pipeline-compile latency on the first call.
@@ -2902,6 +2920,7 @@ impl Worker for MetalWorker {
         }
         self.argmax_kernels = Some(argmax);
         self.sampler_kernels = Some(sampler);
+        self.sampler_arena = Some(sampler_arena);
         self.chain_advance_kernel = Some(chain_advance);
         self.pooling_strategy = scratchy_core_model::embedding::resolve_pooling_strategy(
             &self.config.pooling_strategy,
