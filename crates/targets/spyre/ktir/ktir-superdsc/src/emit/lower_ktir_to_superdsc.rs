@@ -4974,11 +4974,6 @@ pub fn scalarmul_at(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
-    // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
-    // than by relaxing the count. See [`split_out_excluding`].
-    let skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
-    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
     let idx = scale_slot(layout, scale).ok_or_else(|| Error {
         message: format!(
             "ScalarMul {name}: multiplier {scale}, read off the program, is absent from \
@@ -4986,6 +4981,93 @@ pub fn scalarmul_at(
              the value the program uses must have a registry slot (registry desync)"
         ),
     })?;
+    scalarmul_scaled(
+        name,
+        &ScaleSource::Registry {
+            slot: scalarmul_scale_tid(idx),
+        },
+        gather,
+        r,
+        sym_id_base,
+        layout,
+    )
+}
+
+/// ⭐ THE RUNG-3 BODY: a scalar multiply whose multiplier is a LAUNCH BINDING, not a baked value.
+///
+/// Same emission as [`scalarmul_at`] — the descriptor is identical, `In::scalar` over the bound
+/// `[1,1]` const — with the ONE difference that matters: the scale's operand NAME is the
+/// parameter's own binding tid (`In::scalar(&rbo(&act_name(tid)))`), so the value the card
+/// multiplies by is whatever the launch bound at `const:t<tid>`, read at RUN TIME.
+///
+/// ⛔ THE SLOT IS THE TID, NOT A REGISTRY INDEX. `scalarmul_at` looks its multiplier up in
+/// `BundleLayout::scalarmul_scales` BY BITS (`scale_slot`), which is exact for a baked constant
+/// and wrong for a bound one: nothing at bake time knows the launch's value, and the registry is
+/// empty on this path (`scales_for_program_shape` registers only constant-backed splats). The
+/// scale's ADDRESS is the parameter's placement — 2 B, `SegRole::Activation`, placed by the
+/// `[1,1]`-region arm in `triton-ktir-superdsc`'s `for_regions` — and the runner's `const:t<id>`
+/// bind fills it.
+///
+/// ⛔ AND THE `[1,1]` REGION MUST NOT COUNT AS ARITY. `split_out_excluding` drops scale regions
+/// by RESERVED tid (`scale_idx_of`); a positional binding is not one, so the bound scale's tid
+/// travels in the skip list explicitly — one filter, the same mechanism, keyed by the fact the
+/// source owns.
+pub fn scalarmul_bound(
+    name: &str,
+    bound: &crate::emit::whole_function::BoundScale,
+    // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
+    // answer, so the whole-function door and the per-`Program` door cannot disagree about whether a
+    // node gathers.
+    gather: Option<Gather>,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    scalarmul_scaled(
+        name,
+        &ScaleSource::Bound { tid: bound.tid },
+        gather,
+        r,
+        sym_id_base,
+        layout,
+    )
+}
+
+/// WHERE A SCALARMUL'S MULTIPLIER COMES FROM — the one axis on which [`scalarmul_at`] (a baked
+/// constant, in a registry slot) and [`scalarmul_bound`] (a launch binding, at its own parameter
+/// placement) differ. Everything else about the emission is one body (issue 201 item 6): the skip
+/// list, the split, the width rule, the tile op, the gathered arm, the guards.
+enum ScaleSource {
+    /// A baked constant: the operand name is the registry slot's scale tid, already excluded from
+    /// arity by `split_out_excluding`'s reserved-tid filter — no extra skip needed.
+    Registry { slot: u32 },
+    /// A launch binding: the operand name is the parameter's own binding tid, which is NOT a
+    /// reserved slot and so must travel in the skip list explicitly.
+    Bound { tid: u32 },
+}
+
+fn scalarmul_scaled(
+    name: &str,
+    scale: &ScaleSource,
+    gather: Option<Gather>,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
+    // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
+    // than by relaxing the count. See [`split_out_excluding`]. A BOUND scale joins the skip list for
+    // the same reason (its `[1,1]` region is not tensor arity either); a registry slot needs no skip
+    // because `split_out_excluding` already drops reserved scale tids.
+    let mut skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
+    if let ScaleSource::Bound { tid } = scale {
+        skip.push(*tid);
+    }
+    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
+    let scale_tid = match scale {
+        ScaleSource::Registry { slot } => *slot,
+        ScaleSource::Bound { tid } => *tid,
+    };
     let x = ins[0].name();
     let out_name = out.name();
     let rows = node_rows(name, &out)?;
@@ -5002,7 +5084,7 @@ pub fn scalarmul_at(
         rows,
         DeviceWidth::for_pointwise(out.c_len).get(),
     );
-    let scale_name = crate::place::act_name(scalarmul_scale_tid(idx));
+    let scale_name = crate::place::act_name(scale_tid);
     let op_name = format!("scalarmul_o{}", out.tid);
     let x_h = rbo(&x);
     let scale_h = rbo(&scale_name);
@@ -5124,128 +5206,6 @@ pub fn scalarmul_at(
         // with more entries than that is a leg per stick — each writing its own row window of the
         // output in place. `assemble_pointwise_broadcast_gather` owns that cut, and the node's own
         // 32-entry ceiling with it, so nothing here counts entries.
-        .map_err(Error::from);
-    }
-    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &op_name,
-        &tile_op,
-        "multiply",
-        rows,
-        cols,
-        &inputs,
-        &rbo(&out_name),
-        0,
-        sym_id_base,
-        layout,
-    )])
-}
-
-/// THE RUNG-3 BODY: a scalar multiply whose multiplier is a LAUNCH BINDING, not a baked value.
-///
-/// Same emission as [`scalarmul_at`] — the descriptor is identical, `In::scalar` over the bound
-/// `[1,1]` const — with the ONE difference that matters: the scale's operand NAME is the
-/// parameter's own binding tid (`In::scalar(&rbo(&act_name(tid)))`), so the value the card
-/// multiplies by is whatever the launch bound at `const:t<tid>`, read at RUN TIME.
-///
-/// ⛔ THE SLOT IS THE TID, NOT A REGISTRY INDEX. `scalarmul_at` looks its multiplier up in
-/// `BundleLayout::scalarmul_scales` BY BITS (`scale_slot`), which is exact for a baked constant
-/// and wrong for a bound one: nothing at bake time knows the launch's value, and the registry is
-/// empty on this path (`scales_for_program_shape` registers only constant-backed splats). The
-/// scale's ADDRESS is the parameter's placement — 2 B, `SegRole::Activation`, placed by the
-/// `[1,1]`-region arm in `triton-ktir-superdsc`'s `for_regions` — and the runner's `const:t<id>`
-/// bind fills it.
-///
-/// ⛔ AND THE `[1,1]` REGION MUST NOT COUNT AS ARITY. `split_out_excluding` drops scale regions
-/// by RESERVED tid (`scale_idx_of`); a positional binding is not one, so this body passes the
-/// bound scale's tid in `skip_tids` explicitly — one filter, the same mechanism, keyed by the
-/// fact this body owns.
-pub fn scalarmul_bound(
-    name: &str,
-    bound: &crate::emit::whole_function::BoundScale,
-    // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
-    // answer, so the whole-function door and the per-`Program` door cannot disagree about whether a
-    // node gathers.
-    gather: Option<Gather>,
-    r: &[Region],
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
-    // The bound scale is an ADDRESSING operand of the op, not a tensor input — the same rule
-    // the gather's index follows, and for the same reason: nothing about the descriptor's
-    // tensor arity changes because a number arrives by binding.
-    let mut skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
-    skip.push(bound.tid);
-    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
-    let x = ins[0].name();
-    let out_name = out.name();
-    let rows = node_rows(name, &out)?;
-    // DEVICE width, the same padding invariant [`scalarmul_at`] states: the producer's width,
-    // capped at what the output's placement holds.
-    let cols = pointwise_width_the_output_holds(
-        layout,
-        &[&out_name, &x],
-        rows,
-        DeviceWidth::for_pointwise(out.c_len).get(),
-    );
-    let scale_name = crate::place::act_name(bound.tid);
-    let op_name = format!("scalarmul_o{}", out.tid);
-    let x_h = rbo(&x);
-    let scale_h = rbo(&scale_name);
-    let inputs = [In::full(&x_h).ew(), In::scalar(&scale_h).ew()];
-    let mut tile_op = pointwise_tile_op(rows, cols, 2);
-    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
-    if let Some(g) = gather {
-        if g.value_tid != ins[0].tid {
-            return err(format!(
-                "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
-                 operand must sit immediately after the tensor it indexes, so a gather of a tensor this \
-                 op does not read has no position in the descriptor.",
-                g.value_tid, ins[0].tid,
-            ));
-        }
-        if g.entries == 0 || !rows.is_multiple_of(g.entries) {
-            return err(format!(
-                "{name}: the indirect access tile takes {} entries and the node writes {rows} row(s), \
-                 which {} does not divide. The emitted descriptor spans the whole node, so the work \
-                 items have to TILE it — the same obligation `node_rows` puts on the store windows.",
-                g.entries, g.entries,
-            ));
-        }
-        let idx_r = r.iter().find(|x| x.tid == g.index_tid).ok_or_else(|| Error {
-            message: format!(
-                "{name}: the program gathers through t{}, which is not one of this node's parameters — \
-                 an index buffer with no binding has no placement and no stated length",
-                g.index_tid
-            ),
-        })?;
-        let idx_len = (idx_r.v_rows as u64) * (idx_r.v_cols as u64);
-        if idx_len != rows as u64 {
-            return err(format!(
-                "{name}: the index buffer t{} states a `[{}, {}]` view — {idx_len} index(es) — while \
-                 this descriptor gathers {rows} row(s). The index operand is described rank-1 over the \
-                 op's `mb`, so dbo's idx→address program converts exactly {rows} entries: a shorter \
-                 buffer is read past its end and the surplus rows gather from whatever is placed next. \
-                 Emit one node per work item, or bind an index buffer covering the node.",
-                g.index_tid, idx_r.v_rows, idx_r.v_cols,
-            ));
-        }
-        let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
-        return crate::emit::assemble_pointwise_broadcast_gather(
-            crate::emit::PointwiseGather {
-                op_name: &op_name,
-                tile_op: &tile_op,
-                op_func: "multiply",
-                rows,
-                cols,
-                inputs: &gathered_inputs,
-                gathered_input: 1,
-                index_name: &crate::place::act_name(g.index_tid),
-                first_entry: g.first_entry,
-                o: &rbo(&out_name),
-            },
-            sym_id_base,
-            layout,
-        )
         .map_err(Error::from);
     }
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
