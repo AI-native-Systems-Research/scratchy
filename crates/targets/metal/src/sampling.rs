@@ -2,28 +2,26 @@
 // Copyright contributors to the vLLM project
 
 //! On-GPU token sampler dispatcher — the Metal port of cuda's
-//! `sampling_kernels.cu` sampler (see `shaders/sampling.metal`).
+//! `sampling_kernels.cu` sampler (see `shaders/sampling.metal`), sliced across
+//! the GPU's cores.
 //!
-//! Four kernels, each dispatched one threadgroup (256 threads) per request row:
-//!   * `cast_rows_{f16,bf16}_to_f32` — gather the sample logits row (f16/bf16)
-//!     into a compact f32 scratch buffer;
-//!   * `apply_penalties` — repetition / frequency / presence penalties (f32,
-//!     in-place);
-//!   * `sample_top_k_top_p` — softmax → top-k radix-select → min-p → compact →
-//!     bitonic sort → top-p cutoff → categorical sample (f32).
-//!
-//! The three stages have a producer→consumer dependency (cast writes the f32
-//! scratch, penalties mutate it, sample reads it), so callers encode them onto
-//! ONE [`Mtl4DispatchBatch`] with a [`Mtl4DispatchBatch::barrier`] between the
-//! dependent dispatches, then `commit(true)` once. This mirrors argmax's
-//! MTL4-only lifecycle (`embedded_metallib!` + `build_pipeline`).
+//! The first revision of this port (like its cuda source) ran one 256-thread
+//! threadgroup per request row, which at chat batch sizes serialized every
+//! full-vocab pass through ONE core: 4.2 ms per sampled token at a 262k vocab
+//! (see `tests/sampling_bench.rs`). The kernels are now a pipeline of sliced
+//! passes (cast, penalties, softmax, byte-histogram descent, compaction) plus
+//! tiny one-threadgroup-per-row decision kernels, all sharing ONE argument
+//! table so the whole pipeline rides the forward's command buffer with Device
+//! barriers between the dependent dispatches — the same MTL4-only lifecycle
+//! as before (`embedded_metallib!` + `build_pipeline`), with
+//! [`encode_into`] encoding the pipeline onto the forward's own encoder.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
-use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
+use objc2_metal::{MTLBuffer as _, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
 
-use crate::mtl4_dispatch::{Buffer, Mtl4DispatchBatch};
+use crate::mtl4_dispatch::{Buffer, shared_slice, shared_zeroed};
 use crate::residency::{MetalResidencySet, Pinned};
 use crate::shader_cache::load_library_from_bytes;
 use crate::stream::MetalStreamError;
@@ -37,22 +35,42 @@ pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 /// and size their `warp_buf` for `SAMPLING_BLOCK_SIZE / 32` warps).
 pub const SAMPLER_TG_SIZE: usize = 256;
 
-/// Simdgroup width the `sample_top_k_top_p` block reductions assume — MUST equal
-/// `WARP_SIZE` in `shaders/sampling.metal`. The reductions derive
-/// `simdgroup = tid / 32`, `lane = tid % 32`, shuffle across 32 lanes, and size
-/// `warp_buf` for `SAMPLER_TG_SIZE / 32` slots. Every shipping Apple GPU is
-/// 32-wide, but the width is a device property (not a compile-time constant), so
+/// Simdgroup width the block reductions assume — MUST equal `WARP_SIZE` in
+/// `shaders/sampling.metal`. The reductions derive `simdgroup = tid / 32`,
+/// `lane = tid % 32`, shuffle across 32 lanes, and size `warp_buf` for
+/// `SAMPLER_TG_SIZE / 32` slots. Every shipping Apple GPU is 32-wide, but the
+/// width is a device property (not a compile-time constant), so
 /// [`SamplerKernels::new`] hard-fails the load on any device that disagrees
 /// rather than let the reductions silently mis-index and sample wrong tokens.
 pub const SAMPLER_WARP_SIZE: usize = 32;
 
-/// Compiled sampler pipelines. Cached once per device at model load (like
-/// `ArgmaxKernels`) to avoid recompiling the MSL each step.
+/// The dtype of the logits rows the cast kernel gathers: the model's compute
+/// dtype in production, or [`CastDtype::F32`] to feed host f32 data through
+/// the same pipeline (the parity harness).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastDtype {
+    F16,
+    Bf16,
+    F32,
+}
+
+/// The sampler pipeline's kernels (see `shaders/sampling.metal` for the
+/// dispatch order and binding table). Cached once per device at model load
+/// (like `ArgmaxKernels`) to avoid recompiling the MSL each step.
 pub struct SamplerKernels {
     pub cast_f16: ComputePipelineState,
     pub cast_bf16: ComputePipelineState,
+    pub cast_f32: ComputePipelineState,
     pub penalties: ComputePipelineState,
-    pub sample: ComputePipelineState,
+    pub softmax_reduce: ComputePipelineState,
+    pub stats_pick: ComputePipelineState,
+    pub softmax_materialize: ComputePipelineState,
+    pub histogram: ComputePipelineState,
+    pub threshold_pick: ComputePipelineState,
+    pub count_compact: ComputePipelineState,
+    pub quota_pick: ComputePipelineState,
+    pub compact_tied: ComputePipelineState,
+    pub finalize: ComputePipelineState,
     _library: Library,
 }
 
@@ -60,33 +78,53 @@ impl SamplerKernels {
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
         let library = load_library_from_bytes(device, crate::embedded_metallib!("sampling"))
             .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("load `sampling.metallib`: {e}"))
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "load `sampling.metallib`: {e:?}"
+                ))
             })?;
         let cast_f16 = build_pipeline(device, &library, "cast_rows_f16_to_f32")?;
         let cast_bf16 = build_pipeline(device, &library, "cast_rows_bf16_to_f32")?;
+        let cast_f32 = build_pipeline(device, &library, "cast_rows_f32_to_f32")?;
         let penalties = build_pipeline(device, &library, "apply_penalties")?;
-        let sample = build_pipeline(device, &library, "sample_top_k_top_p")?;
+        let softmax_reduce = build_pipeline(device, &library, "sample_softmax_reduce")?;
+        let stats_pick = build_pipeline(device, &library, "sample_stats_pick")?;
+        let softmax_materialize = build_pipeline(device, &library, "sample_softmax_materialize")?;
+        let histogram = build_pipeline(device, &library, "sample_histogram_pass")?;
+        let threshold_pick = build_pipeline(device, &library, "sample_threshold_pick")?;
+        let count_compact = build_pipeline(device, &library, "sample_count_compact")?;
+        let quota_pick = build_pipeline(device, &library, "sample_quota_pick")?;
+        let compact_tied = build_pipeline(device, &library, "sample_compact_tied")?;
+        let finalize = build_pipeline(device, &library, "sample_finalize")?;
 
-        // Fence the one runtime assumption the shader cannot check itself: the
-        // `sample_top_k_top_p` block reductions require a 32-lane simdgroup (see
+        // Fence the one runtime assumption the shaders cannot check themselves:
+        // the block reductions require a 32-lane simdgroup (see
         // `SAMPLER_WARP_SIZE`). This is true on every shipping Apple GPU, but a
         // device could in principle report a different execution width, which
         // would make `warp_buf` indexing / the shuffle reductions wrong. Refuse
         // to load loudly instead of silently sampling wrong tokens.
-        let width = sample.threadExecutionWidth();
+        let width = softmax_reduce.threadExecutionWidth();
         if width != SAMPLER_WARP_SIZE {
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
-                "sample_top_k_top_p requires a {SAMPLER_WARP_SIZE}-lane simdgroup, \
-                 but this device reports execution width {width}; the sampler's \
-                 block reductions would mis-index. Refusing to load."
+                "the sampler's block reductions require a {SAMPLER_WARP_SIZE}-lane simdgroup, \
+                 but this device reports execution width {width}; they would mis-index. \
+                 Refusing to load."
             )));
         }
 
         Ok(Self {
             cast_f16,
             cast_bf16,
+            cast_f32,
             penalties,
-            sample,
+            softmax_reduce,
+            stats_pick,
+            softmax_materialize,
+            histogram,
+            threshold_pick,
+            count_compact,
+            quota_pick,
+            compact_tied,
+            finalize,
             _library: library,
         })
     }
@@ -106,149 +144,29 @@ fn build_pipeline(
         .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{name} pipeline: {e:?}")))
 }
 
-fn tg_dims(nrows: u32) -> (MTLSize, MTLSize) {
-    let threadgroups = MTLSize {
-        width: nrows as usize,
+fn tg(n: u32) -> MTLSize {
+    MTLSize {
+        width: n as usize,
         height: 1,
         depth: 1,
-    };
-    let threads_per_tg = MTLSize {
-        width: SAMPLER_TG_SIZE,
-        height: 1,
-        depth: 1,
-    };
-    (threadgroups, threads_per_tg)
+    }
 }
 
-/// Encode the row-gather cast: `out_f32[r, :] = f32(logits[row_indices[r], :])`.
-/// `is_bf16` selects the `bfloat` vs `half` reader (the model's compute dtype).
-///
-/// Bindings mirror `cast_rows_{f16,bf16}_to_f32`:
-///   0=out_f32, 1=logits, 2=row_indices, 3=vocab(u32).
-pub fn encode_cast_rows(
-    batch: &mut Mtl4DispatchBatch,
-    kernels: &SamplerKernels,
-    is_bf16: bool,
-    out_f32: &Buffer,
-    logits: &Buffer,
-    row_indices: &Buffer,
-    nrows: u32,
-    vocab: u32,
-) {
-    let pso = if is_bf16 {
-        &kernels.cast_bf16
-    } else {
-        &kernels.cast_f16
-    };
-    let (tgs, tpt) = tg_dims(nrows);
-    batch.encode(
-        pso,
-        &[(out_f32, 0), (logits, 1), (row_indices, 2)],
-        &[(vocab, 3)],
-        &[],
-        &[],
-        tgs,
-        tpt,
-    );
-}
-
-/// Encode the penalties pass (in-place on the f32 scratch). Bindings mirror
-/// `apply_penalties`:
-///   0=logits_f32, 1=output_token_ids, 2=prompt_token_ids,
-///   3=rep, 4=freq, 5=pres, 6=vocab, 7=max_output_len, 8=max_prompt_len.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_apply_penalties(
-    batch: &mut Mtl4DispatchBatch,
-    kernels: &SamplerKernels,
-    logits_f32: &Buffer,
-    output_token_ids: &Buffer,
-    prompt_token_ids: &Buffer,
-    rep: &Buffer,
-    freq: &Buffer,
-    pres: &Buffer,
-    nrows: u32,
-    vocab: u32,
-    max_output_len: u32,
-    max_prompt_len: u32,
-) {
-    let (tgs, tpt) = tg_dims(nrows);
-    batch.encode(
-        &kernels.penalties,
-        &[
-            (logits_f32, 0),
-            (output_token_ids, 1),
-            (prompt_token_ids, 2),
-            (rep, 3),
-            (freq, 4),
-            (pres, 5),
-        ],
-        &[(vocab, 6), (max_output_len, 7), (max_prompt_len, 8)],
-        &[],
-        &[],
-        tgs,
-        tpt,
-    );
-}
-
-/// Encode the top-k/top-p/min-p sample pass. Bindings mirror
-/// `sample_top_k_top_p`:
-///   0=output(u32), 1=logits_f32, 2=temperatures, 3=top_ks(i32),
-///   4=top_ps, 5=min_ps, 6=uniforms, 7=vocab.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_sample_top_k_top_p(
-    batch: &mut Mtl4DispatchBatch,
-    kernels: &SamplerKernels,
-    output: &Buffer,
-    logits_f32: &Buffer,
-    temperatures: &Buffer,
-    top_ks: &Buffer,
-    top_ps: &Buffer,
-    min_ps: &Buffer,
-    uniforms: &Buffer,
-    nrows: u32,
-    vocab: u32,
-) {
-    let (tgs, tpt) = tg_dims(nrows);
-    batch.encode(
-        &kernels.sample,
-        &[
-            (output, 0),
-            (logits_f32, 1),
-            (temperatures, 2),
-            (top_ks, 3),
-            (top_ps, 4),
-            (min_ps, 5),
-            (uniforms, 6),
-        ],
-        &[(vocab, 7)],
-        &[],
-        &[],
-        tgs,
-        tpt,
-    );
-}
-
-/// Encode ONE sampler stage (cast / penalties / sample) onto an EXISTING MTL4
-/// compute encoder — the forward's own encoder — so the sampler rides the
-/// forward's command buffer (one commit, one host wait) instead of a second
+/// Encode one sampler pipeline stage onto an EXISTING MTL4 compute encoder —
+/// the forward's own encoder — so the sampler rides the forward's command
+/// buffer (one commit, one host wait) instead of a second
 /// [`Mtl4DispatchBatch`]. Mirrors `argmax::encode_argmax_*_into_mtl4`.
 ///
 /// Emits a `Device`-visibility barrier first: every stage reads what a prior
 /// same-encoder dispatch wrote (cast reads the forward/grammar-mask logits;
-/// penalties + sample read the f32 scratch cast/penalties produced) and MTL4
-/// compute encoders do NOT auto-serialize same-encoder dispatches. Then
-/// set-pipeline / set-arg-table / dispatch (`njobs` threadgroups × 256 threads,
-/// one threadgroup per sampling row — identical to the batched dispatch).
-///
-/// The caller binds the stage's buffers into `arg_table` at the indices the
-/// kernel expects (see the `encode_*` doc comments); for the cast stage the
-/// `logits` binding (index 1) is the forward's lm_head output, bound by
-/// `gpuAddress` inside the followup.
+/// every later stage reads the previous stage's scratch) and MTL4 compute
+/// encoders do NOT auto-serialize same-encoder dispatches. Then
+/// set-pipeline / set-arg-table / dispatch.
 pub fn encode_sampler_stage_into_mtl4(
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     pipeline: &ComputePipelineState,
     arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
-    njobs: u32,
+    threadgroups: u32,
 ) {
     use objc2_metal::{
         MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
@@ -260,17 +178,8 @@ pub fn encode_sampler_stage_into_mtl4(
     );
     encoder.setComputePipelineState(pipeline);
     encoder.setArgumentTable(Some(arg_table));
-    let threadgroups = MTLSize {
-        width: njobs as usize,
-        height: 1,
-        depth: 1,
-    };
-    let threads_per_tg = MTLSize {
-        width: SAMPLER_TG_SIZE,
-        height: 1,
-        depth: 1,
-    };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+    encoder
+        .dispatchThreadgroups_threadsPerThreadgroup(tg(threadgroups), tg(SAMPLER_TG_SIZE as u32));
 }
 
 /// Assemble one step's non-greedy sampler inputs into the [`GpuSampleParams`]
@@ -391,30 +300,36 @@ pub fn gather_gpu_sample_params<'h>(
 #[cfg(feature = "sampler-telemetry")]
 const SAMPLER_TELEM_K: u32 = 8;
 
-/// One step's non-greedy sampler work: GPU buffers + argument tables, prepared
-/// BEFORE the forward so it can be encoded onto the forward's
-/// OWN command buffer ([`encode_into`](Self::encode_into), from the argmax
-/// followup) — one commit, one host wait, no second command buffer. Read the
-/// sampled tokens after the wait via [`output`](Self::output).
+/// `row_state` word count per row — MUST equal `ROW_STATE_LEN` in
+/// `shaders/sampling.metal`.
+const ROW_STATE_LEN: usize = 16;
+
+/// One step's non-greedy sampler work: GPU buffers + the ONE argument table
+/// every pipeline stage shares, prepared BEFORE the forward so it can be
+/// encoded onto the forward's OWN command buffer
+/// ([`encode_into`](Self::encode_into), from the argmax followup) — one
+/// commit, one host wait, no second command buffer. Read the sampled tokens
+/// after the wait via [`output`](Self::output).
 pub struct PendingSampler {
     njobs: u32,
-    is_bf16: bool,
+    nslices: u32,
+    cast_dtype: CastDtype,
     // Every buffer is bound by gpuAddress in `encode_into`, so each is pinned
     // for as long as this lives: keep it until the forward's host wait.
-    scratch_f32: Pinned,
-    out_buf: Pinned,
-    row_idx_buf: Pinned,
-    temps_buf: Pinned,
-    top_ks_buf: Pinned,
-    top_ps_buf: Pinned,
-    min_ps_buf: Pinned,
-    uniforms_buf: Pinned,
-    reps_buf: Pinned,
-    freqs_buf: Pinned,
-    press_buf: Pinned,
-    out_ids_buf: Pinned,
-    prompt_ids_buf: Pinned,
-    consts_buf: Pinned,
+    scratch_f32: Pinned,    // slot 0: f32 logits → prob bits, [nrows, vocab]
+    out_buf: Pinned,        // slot 13: sampled token ids
+    row_idx_buf: Pinned,    // slot 2
+    out_ids_buf: Pinned,    // slot 3 (penalties; dummy when none)
+    prompt_ids_buf: Pinned, // slot 4
+    reps_buf: Pinned,       // slot 5
+    freqs_buf: Pinned,      // slot 6
+    press_buf: Pinned,      // slot 7
+    row_state_buf: Pinned,  // slot 8
+    partials_buf: Pinned,   // slot 9
+    hist_buf: Pinned,       // slot 10
+    counts_buf: Pinned,     // slot 11
+    staging_buf: Pinned,    // slot 12
+    consts_buf: Pinned,     // slot 14: (vocab, nslices, nrows, max_out, max_prompt)
     // Sampler-telemetry spill (only compiled under `sampler-telemetry`): real
     // buffers when `telem_on`, else a reused dummy.
     #[cfg(feature = "sampler-telemetry")]
@@ -429,9 +344,22 @@ pub struct PendingSampler {
     telem_on: bool,
     #[cfg(feature = "sampler-telemetry")]
     telem_k: u32,
+    // Per-stage argument tables: MTL4 binds buffer attributes by signature
+    // position (the old sampler's kernels used contiguous 0..N attributes and
+    // one table; these kernels keep that convention per stage, so each stage
+    // has its own table). The cast's table is the one whose slot 1
+    // (the forward's logits) [`encode_into`](Self::encode_into) rebinds.
     cast_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-    sample_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
     penalties_at: Option<Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>>,
+    softmax_reduce_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    stats_pick_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    softmax_materialize_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    histogram_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    threshold_pick_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    count_compact_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    quota_pick_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    compact_tied_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+    finalize_at: Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
 }
 
 // SAFETY: the Retained Metal handles are created + only touched on the worker
@@ -440,33 +368,37 @@ pub struct PendingSampler {
 // move Retained Metal objects into the (Send) followup.
 unsafe impl Send for PendingSampler {}
 
+/// Vocab slices the pipeline cuts a row into: enough threadgroups to occupy
+/// the GPU's cores (two per core), without staging memory exploding at large
+/// batch — capped at 32 (the per-slice staging is `2 * MAX_CANDIDATES` u32
+/// per row, and the one-threadgroup-per-row kernels' serial walks scale with
+/// slice count).
+fn nslices_for(device: &Device, nrows: u32) -> u32 {
+    let cores = crate::device::gpu_cores(device).map(|c| c.0).unwrap_or(8);
+    let target = (cores * 2).max(8);
+    // Small batches slice hard; a full batch of rows already fills the GPU.
+    (target / nrows.max(1)).clamp(1, 32)
+}
+
 impl PendingSampler {
     /// Upload the neutral [`GpuSampleParams`](scratchy_core_common::GpuSampleParams)
-    /// into GPU buffers pinned in `residency` (committed) + build the argument
-    /// tables. Address binding is deferred to [`encode_into`](Self::encode_into)
-    /// (which also binds the forward's own logits).
+    /// into GPU buffers pinned in `residency` (committed) + build the shared
+    /// argument table. Address binding is deferred to
+    /// [`encode_into`](Self::encode_into) (which also binds the forward's own
+    /// logits).
     pub fn prepare(
         device: &Device,
         residency: &MetalResidencySet,
         params: &scratchy_core_common::GpuSampleParams,
         njobs: u32,
         vocab: u32,
-        is_bf16: bool,
+        cast_dtype: CastDtype,
     ) -> Self {
-        use crate::mtl4_dispatch::{shared_slice, shared_zeroed};
-        use objc2_metal::{MTL4ArgumentTableDescriptor, MTLDevice};
         let pin = |buffer| residency.pin(buffer);
-
         let n = njobs as usize;
+        let nslices = nslices_for(device, njobs);
+
         let row_idx_buf = pin(shared_slice(device, &params.row_indices));
-        let temps_buf = pin(shared_slice(device, &params.temperatures));
-        let top_ks_buf = pin(shared_slice(device, &params.top_ks));
-        let top_ps_buf = pin(shared_slice(device, &params.top_ps));
-        let min_ps_buf = pin(shared_slice(device, &params.min_ps));
-        let uniforms_buf = pin(shared_slice(device, &params.uniforms));
-        let reps_buf = pin(shared_slice(device, &params.rep_penalties));
-        let freqs_buf = pin(shared_slice(device, &params.freq_penalties));
-        let press_buf = pin(shared_slice(device, &params.pres_penalties));
         let (out_ids_buf, prompt_ids_buf) = if params.any_penalty {
             (
                 pin(shared_slice(device, &params.output_token_ids)),
@@ -475,11 +407,51 @@ impl PendingSampler {
         } else {
             (pin(shared_zeroed(device, 4)), pin(shared_zeroed(device, 4)))
         };
+        let reps_buf = pin(shared_slice(device, &params.rep_penalties));
+        let freqs_buf = pin(shared_slice(device, &params.freq_penalties));
+        let press_buf = pin(shared_slice(device, &params.pres_penalties));
+
+        // row_state: the pipeline's per-row decision block. Host words:
+        // temperature, top_k, top_p, min_p, uniform, cap. GPU words (max, sum,
+        // threshold, round, counts) start zeroed and are (re)written by the
+        // kernels each dispatch.
+        let mut row_state: Vec<u32> = vec![0; n * ROW_STATE_LEN];
+        for r in 0..n {
+            let s = &mut row_state[r * ROW_STATE_LEN..(r + 1) * ROW_STATE_LEN];
+            s[0] = params.temperatures[r].to_bits();
+            s[3] = params.top_ks[r].max(0) as u32;
+            s[4] = params.top_ps[r].to_bits();
+            s[5] = params.min_ps[r].to_bits();
+            s[6] = params.uniforms[r].to_bits();
+            // cap = effective k; top_k == 0 → MAX_CANDIDATES (the shader's
+            // `effective_k` fallback, computed host-side so the descent's
+            // `pick` kernel never needs vocab).
+            let k = if params.top_ks[r] > 0 {
+                (params.top_ks[r] as u32).min(vocab)
+            } else {
+                1024u32.min(vocab)
+            };
+            s[8] = k;
+        }
+        let row_state_buf = pin(shared_slice(device, &row_state));
+
+        // Element counts × 4: these are u32 arrays, and `shared_zeroed`
+        // takes a byte length.
+        let partials_buf = pin(shared_zeroed(device, n * nslices as usize * 3 * 4));
+        let hist_buf = pin(shared_zeroed(device, n * nslices as usize * 256 * 4));
+        let counts_buf = pin(shared_zeroed(device, n * nslices as usize * 4 * 4));
+        let staging_buf = pin(shared_zeroed(device, n * nslices as usize * 2 * 1024 * 4));
         let scratch_f32 = pin(shared_zeroed(device, n * vocab as usize * 4));
         let out_buf = pin(shared_zeroed(device, n * 4));
         let consts_buf = pin(shared_slice(
             device,
-            &[vocab, params.max_output_len, params.max_prompt_len],
+            &[
+                vocab,
+                nslices,
+                njobs,
+                params.max_output_len,
+                params.max_prompt_len,
+            ],
         ));
 
         // Sampler telemetry: spill the sorted top-K + confidence/entropy only
@@ -511,43 +483,76 @@ impl PendingSampler {
         };
         residency.commit();
 
-        let mk_table = |count: usize| {
-            let desc = MTL4ArgumentTableDescriptor::new();
-            desc.setMaxBufferBindCount(count);
-            device
-                .newArgumentTableWithDescriptor_error(&desc)
-                .expect("sampler arg table alloc")
-        };
+        // Per-stage argument tables: one per kernel, sized to its contiguous
+        // signature positions (0..k-1) and gap-filled with a zero buffer so an
+        // unused slot can never hold a stale address. Every real binding is
+        // deferred to `encode_into` (which also binds the forward's logits),
+        // matching main's deferred-address pattern.
+        let mk_table =
+            |count: usize| -> Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>> {
+                use objc2_metal::MTL4ArgumentTable as _;
+                let desc = objc2_metal::MTL4ArgumentTableDescriptor::new();
+                desc.setMaxBufferBindCount(count);
+                let table = device
+                    .newArgumentTableWithDescriptor_error(&desc)
+                    .expect("sampler arg table alloc");
+                let zero = shared_zeroed(device, 16);
+                let zero_addr = zero.gpuAddress();
+                for i in 0..count {
+                    unsafe { table.setAddress_atIndex(zero_addr, i) };
+                }
+                table
+            };
+        // Buffer-index layouts per kernel (bound in `encode_into`):
+        //   cast: 0=scratch, 1=logits(forward), 2=row_idx, 3=consts.
+        //   penalties: 0=scratch, 1=out_ids, 2=prompt_ids, 3=rep, 4=freq,
+        //   5=pres, 6=consts.
+        //   softmax_reduce: 0=scratch, 1=partials, 2=row_state, 3=consts.
+        //   stats_pick: 0=partials, 1=row_state, 2=consts.
+        //   softmax_materialize: 0=scratch, 1=partials, 2=row_state, 3=consts.
+        //   histogram: 0=prob_bits(scratch), 1=hist, 2=row_state, 3=consts.
+        //   threshold_pick: 0=hist, 1=row_state, 2=consts.
+        //   count_compact: 0=prob_bits, 1=counts, 2=staging, 3=row_state,
+        //   4=consts.
+        //   quota_pick: 0=counts, 1=row_state, 2=consts.
+        //   compact_tied: 0=prob_bits, 1=counts, 2=staging, 3=row_state,
+        //   4=consts.
+        //   finalize: 0=staging, 1=counts, 2=row_state, 3=prob_bits, 4=output,
+        //   5=partials, 6..9=telemetry spill (only under sampler-telemetry),
+        //   10=consts.
         let cast_at = mk_table(4);
-        // 8 buffers without telemetry; +5 (topk_probs/indices/stats + 2 consts)
-        // when the sampler-telemetry spill params are compiled into the kernel.
-        let sample_at = mk_table(if cfg!(feature = "sampler-telemetry") {
-            13
-        } else {
-            8
-        });
         let penalties_at = if params.any_penalty {
-            Some(mk_table(9))
+            Some(mk_table(7))
         } else {
             None
         };
+        let softmax_reduce_at = mk_table(4);
+        let stats_pick_at = mk_table(3);
+        let softmax_materialize_at = mk_table(4);
+        let histogram_at = mk_table(4);
+        let threshold_pick_at = mk_table(3);
+        let count_compact_at = mk_table(5);
+        let quota_pick_at = mk_table(3);
+        let compact_tied_at = mk_table(5);
+        let finalize_at = mk_table(11);
 
         Self {
             njobs,
-            is_bf16,
+            nslices,
+            cast_dtype,
             scratch_f32,
             out_buf,
             row_idx_buf,
-            temps_buf,
-            top_ks_buf,
-            top_ps_buf,
-            min_ps_buf,
-            uniforms_buf,
+            out_ids_buf,
+            prompt_ids_buf,
             reps_buf,
             freqs_buf,
             press_buf,
-            out_ids_buf,
-            prompt_ids_buf,
+            row_state_buf,
+            partials_buf,
+            hist_buf,
+            counts_buf,
+            staging_buf,
             consts_buf,
             #[cfg(feature = "sampler-telemetry")]
             topk_probs_buf,
@@ -562,87 +567,154 @@ impl PendingSampler {
             #[cfg(feature = "sampler-telemetry")]
             telem_k,
             cast_at,
-            sample_at,
             penalties_at,
+            softmax_reduce_at,
+            stats_pick_at,
+            softmax_materialize_at,
+            histogram_at,
+            threshold_pick_at,
+            count_compact_at,
+            quota_pick_at,
+            compact_tied_at,
+            finalize_at,
         }
     }
 
-    /// Encode cast → [penalties] → sample onto the forward's OWN encoder (after
-    /// argmax). Binds every argument-table address (reading the retained buffers)
-    /// plus the forward's `logits_addr` (the cast input, index 1).
+    /// Bind every stage's buffers into its argument table (the tables were
+    /// gap-filled with a zero buffer at prepare time; only the forward's own
+    /// logits address is new per encode). Idempotent — rebinding the same
+    /// addresses is a no-op.
+    fn bind_stage_tables(&self, logits_addr: u64) {
+        use objc2_metal::{MTL4ArgumentTable, MTLBuffer};
+        let scratch = self.scratch_f32.gpuAddress();
+        let partials = self.partials_buf.gpuAddress();
+        let row_state = self.row_state_buf.gpuAddress();
+        let hist = self.hist_buf.gpuAddress();
+        let counts = self.counts_buf.gpuAddress();
+        let staging = self.staging_buf.gpuAddress();
+        let consts = self.consts_buf.gpuAddress();
+        unsafe {
+            self.cast_at.setAddress_atIndex(scratch, 0);
+            self.cast_at.setAddress_atIndex(logits_addr, 1);
+            self.cast_at
+                .setAddress_atIndex(self.row_idx_buf.gpuAddress(), 2);
+            self.cast_at.setAddress_atIndex(consts, 3);
+            if let Some(ref pen) = self.penalties_at {
+                pen.setAddress_atIndex(scratch, 0);
+                pen.setAddress_atIndex(self.out_ids_buf.gpuAddress(), 1);
+                pen.setAddress_atIndex(self.prompt_ids_buf.gpuAddress(), 2);
+                pen.setAddress_atIndex(self.reps_buf.gpuAddress(), 3);
+                pen.setAddress_atIndex(self.freqs_buf.gpuAddress(), 4);
+                pen.setAddress_atIndex(self.press_buf.gpuAddress(), 5);
+                pen.setAddress_atIndex(consts, 6);
+            }
+            self.softmax_reduce_at.setAddress_atIndex(scratch, 0);
+            self.softmax_reduce_at.setAddress_atIndex(partials, 1);
+            self.softmax_reduce_at.setAddress_atIndex(row_state, 2);
+            self.softmax_reduce_at.setAddress_atIndex(consts, 3);
+            self.stats_pick_at.setAddress_atIndex(partials, 0);
+            self.stats_pick_at.setAddress_atIndex(row_state, 1);
+            self.stats_pick_at.setAddress_atIndex(consts, 2);
+            self.softmax_materialize_at.setAddress_atIndex(scratch, 0);
+            self.softmax_materialize_at.setAddress_atIndex(partials, 1);
+            self.softmax_materialize_at.setAddress_atIndex(row_state, 2);
+            self.softmax_materialize_at.setAddress_atIndex(consts, 3);
+            self.histogram_at.setAddress_atIndex(scratch, 0);
+            self.histogram_at.setAddress_atIndex(hist, 1);
+            self.histogram_at.setAddress_atIndex(row_state, 2);
+            self.histogram_at.setAddress_atIndex(consts, 3);
+            self.threshold_pick_at.setAddress_atIndex(hist, 0);
+            self.threshold_pick_at.setAddress_atIndex(row_state, 1);
+            self.threshold_pick_at.setAddress_atIndex(consts, 2);
+            self.count_compact_at.setAddress_atIndex(scratch, 0);
+            self.count_compact_at.setAddress_atIndex(counts, 1);
+            self.count_compact_at.setAddress_atIndex(staging, 2);
+            self.count_compact_at.setAddress_atIndex(row_state, 3);
+            self.count_compact_at.setAddress_atIndex(consts, 4);
+            self.quota_pick_at.setAddress_atIndex(counts, 0);
+            self.quota_pick_at.setAddress_atIndex(row_state, 1);
+            self.quota_pick_at.setAddress_atIndex(consts, 2);
+            self.compact_tied_at.setAddress_atIndex(scratch, 0);
+            self.compact_tied_at.setAddress_atIndex(counts, 1);
+            self.compact_tied_at.setAddress_atIndex(staging, 2);
+            self.compact_tied_at.setAddress_atIndex(row_state, 3);
+            self.compact_tied_at.setAddress_atIndex(consts, 4);
+            self.finalize_at.setAddress_atIndex(staging, 0);
+            self.finalize_at.setAddress_atIndex(counts, 1);
+            self.finalize_at.setAddress_atIndex(row_state, 2);
+            self.finalize_at.setAddress_atIndex(scratch, 3);
+            self.finalize_at
+                .setAddress_atIndex(self.out_buf.gpuAddress(), 4);
+            self.finalize_at.setAddress_atIndex(partials, 5);
+            #[cfg(feature = "sampler-telemetry")]
+            {
+                self.finalize_at
+                    .setAddress_atIndex(self.topk_probs_buf.gpuAddress(), 6);
+                self.finalize_at
+                    .setAddress_atIndex(self.topk_indices_buf.gpuAddress(), 7);
+                self.finalize_at
+                    .setAddress_atIndex(self.stats_buf.gpuAddress(), 8);
+                self.finalize_at
+                    .setAddress_atIndex(self.telem_consts_buf.gpuAddress(), 9);
+            }
+            self.finalize_at.setAddress_atIndex(consts, 10);
+        }
+    }
+
+    /// Encode the whole sample pipeline onto the forward's OWN MTL4 compute
+    /// encoder (from the argmax followup): cast (and penalties, when any) →
+    /// softmax reduce → stats pick → materialize → 4 × (histogram, threshold
+    /// pick) → count/compact → quota pick → compact tied → finalize. Every
+    /// stage rides its own argument table; the forward's logits buffer is
+    /// bound into the cast's table (slot 1) first.
     pub fn encode_into(
         &self,
         enc: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         logits_addr: u64,
         kernels: &SamplerKernels,
     ) {
-        use objc2_metal::{MTL4ArgumentTable, MTLBuffer};
-        let ca = self.consts_buf.gpuAddress();
-        unsafe {
-            // cast: 0=scratch(out), 1=logits(forward), 2=row_idx, 3=vocab.
-            self.cast_at
-                .setAddress_atIndex(self.scratch_f32.gpuAddress(), 0);
-            self.cast_at.setAddress_atIndex(logits_addr, 1);
-            self.cast_at
-                .setAddress_atIndex(self.row_idx_buf.gpuAddress(), 2);
-            self.cast_at.setAddress_atIndex(ca, 3);
-            // sample: 0=out,1=scratch,2=temps,3=top_ks,4=top_ps,5=min_ps,6=uniforms,7=vocab.
-            self.sample_at
-                .setAddress_atIndex(self.out_buf.gpuAddress(), 0);
-            self.sample_at
-                .setAddress_atIndex(self.scratch_f32.gpuAddress(), 1);
-            self.sample_at
-                .setAddress_atIndex(self.temps_buf.gpuAddress(), 2);
-            self.sample_at
-                .setAddress_atIndex(self.top_ks_buf.gpuAddress(), 3);
-            self.sample_at
-                .setAddress_atIndex(self.top_ps_buf.gpuAddress(), 4);
-            self.sample_at
-                .setAddress_atIndex(self.min_ps_buf.gpuAddress(), 5);
-            self.sample_at
-                .setAddress_atIndex(self.uniforms_buf.gpuAddress(), 6);
-            self.sample_at.setAddress_atIndex(ca, 7);
-            // telemetry: 8=topk_probs, 9=topk_indices, 10=stats, 11=telem_on,
-            // 12=telem_k — only present when the kernel is compiled with the
-            // sampler-telemetry params (matching the shader's #ifdef).
-            #[cfg(feature = "sampler-telemetry")]
-            {
-                self.sample_at
-                    .setAddress_atIndex(self.topk_probs_buf.gpuAddress(), 8);
-                self.sample_at
-                    .setAddress_atIndex(self.topk_indices_buf.gpuAddress(), 9);
-                self.sample_at
-                    .setAddress_atIndex(self.stats_buf.gpuAddress(), 10);
-                let tca = self.telem_consts_buf.gpuAddress();
-                self.sample_at.setAddress_atIndex(tca, 11);
-                self.sample_at.setAddress_atIndex(tca + 4, 12);
-            }
-        }
-        if let Some(ref pen) = self.penalties_at {
-            unsafe {
-                // penalties: 0=scratch,1=out_ids,2=prompt_ids,3=reps,4=freqs,
-                // 5=press,6=vocab,7=max_out,8=max_prompt.
-                pen.setAddress_atIndex(self.scratch_f32.gpuAddress(), 0);
-                pen.setAddress_atIndex(self.out_ids_buf.gpuAddress(), 1);
-                pen.setAddress_atIndex(self.prompt_ids_buf.gpuAddress(), 2);
-                pen.setAddress_atIndex(self.reps_buf.gpuAddress(), 3);
-                pen.setAddress_atIndex(self.freqs_buf.gpuAddress(), 4);
-                pen.setAddress_atIndex(self.press_buf.gpuAddress(), 5);
-                pen.setAddress_atIndex(ca, 6);
-                pen.setAddress_atIndex(ca + 4, 7);
-                pen.setAddress_atIndex(ca + 8, 8);
-            }
-        }
-        let cast_pso = if self.is_bf16 {
-            &kernels.cast_bf16
-        } else {
-            &kernels.cast_f16
+        let rows = self.njobs;
+        let sliced = rows * self.nslices;
+        self.bind_stage_tables(logits_addr);
+
+        let stage =
+            |pso: &ComputePipelineState,
+             table: &Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+             tgs: u32| { encode_sampler_stage_into_mtl4(enc, pso, table, tgs) };
+
+        // Cast (and penalties) — only the cast's dtype differs.
+        let cast = match self.cast_dtype {
+            CastDtype::Bf16 => &kernels.cast_bf16,
+            CastDtype::F16 => &kernels.cast_f16,
+            CastDtype::F32 => &kernels.cast_f32,
         };
-        encode_sampler_stage_into_mtl4(enc, cast_pso, &self.cast_at, self.njobs);
+        stage(cast, &self.cast_at, sliced);
         if let Some(ref pen) = self.penalties_at {
-            encode_sampler_stage_into_mtl4(enc, &kernels.penalties, pen, self.njobs);
+            stage(&kernels.penalties, pen, sliced);
         }
-        encode_sampler_stage_into_mtl4(enc, &kernels.sample, &self.sample_at, self.njobs);
+
+        // Softmax: per-slice partials, merged to row stats, materialized.
+        stage(&kernels.softmax_reduce, &self.softmax_reduce_at, sliced);
+        stage(&kernels.stats_pick, &self.stats_pick_at, rows);
+        stage(
+            &kernels.softmax_materialize,
+            &self.softmax_materialize_at,
+            sliced,
+        );
+
+        // Byte-histogram descent: four rounds.
+        for _ in 0..4 {
+            stage(&kernels.histogram, &self.histogram_at, sliced);
+            stage(&kernels.threshold_pick, &self.threshold_pick_at, rows);
+        }
+
+        // Compaction: strict candidates + counts, tie quotas, tied candidates.
+        stage(&kernels.count_compact, &self.count_compact_at, sliced);
+        stage(&kernels.quota_pick, &self.quota_pick_at, rows);
+        stage(&kernels.compact_tied, &self.compact_tied_at, sliced);
+
+        // Sort + top-p + draw.
+        stage(&kernels.finalize, &self.finalize_at, rows);
     }
 
     /// The sampled-token output buffer + row count, for reading back after the
@@ -675,13 +747,78 @@ impl PendingSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mtl4_dispatch::{read_slice, shared_slice};
+    use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice, shared_slice};
 
-    /// Dispatch `sample_top_k_top_p` on a synthetic f32 logits row with a
-    /// near-zero temperature + top_k=1: the softmax collapses onto the argmax,
-    /// the radix-select keeps exactly one candidate, and the categorical draw
-    /// (any uniform) must return the argmax index. Guarded to skip when no
-    /// Metal device / MTL4 queue is available (CI Linux, headless).
+    /// Run the full pipeline on `logits` (one row) and return the sampled
+    /// token — the parity harness's metal side. Returns `None` when no metal
+    /// device / MTL4 queue exists.
+    #[allow(clippy::too_many_arguments)]
+    fn run_metal_sample(
+        device: &Device,
+        kernels: &SamplerKernels,
+        logits: &[f32],
+        temp: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        uniform: f32,
+    ) -> Option<u32> {
+        let vocab = logits.len() as u32;
+        let params = scratchy_core_common::GpuSampleParams {
+            row_indices: vec![0],
+            temperatures: vec![temp],
+            top_ks: vec![top_k],
+            top_ps: vec![top_p],
+            min_ps: vec![min_p],
+            uniforms: vec![uniform],
+            rep_penalties: vec![1.0],
+            freq_penalties: vec![0.0],
+            pres_penalties: vec![0.0],
+            ..Default::default()
+        };
+        run_pipeline(device, kernels, &params, logits, 1, vocab)
+    }
+
+    /// Prepare + run the pipeline on one command buffer; read back the sampled
+    /// token (row 0). `logits` is the TOTAL logits buffer; `row_indices`
+    /// (in `params`) picks the row(s).
+    fn run_pipeline(
+        device: &Device,
+        kernels: &SamplerKernels,
+        params: &scratchy_core_common::GpuSampleParams,
+        logits: &[f32],
+        njobs: u32,
+        vocab: u32,
+    ) -> Option<u32> {
+        let logits_buf = shared_slice(device, logits);
+        let batch = Mtl4DispatchBatch::begin(device)?;
+        // The sampler's buffers AND the logits row must be resident for THIS
+        // command buffer: prepare against the batch's own set and pin the
+        // logits into it too (the batch's commit attaches exactly that set,
+        // and `pending`'s pins keep the buffers in it until after the host
+        // wait; the logits pin lives to the end of this scope).
+        let (pending, logits_pin) = {
+            let res = batch.residency();
+            let pending =
+                PendingSampler::prepare(device, res, params, njobs, vocab, CastDtype::F32);
+            (pending, res.pin(logits_buf.clone()))
+        };
+        use objc2_metal::MTLBuffer as _;
+        let logits_addr = logits_buf.gpuAddress();
+        let enc = batch.encoder();
+        pending.encode_into(enc, logits_addr, kernels);
+        batch.commit(true);
+        drop(logits_pin);
+        let (out, n) = pending.output();
+        assert_eq!(n, njobs);
+        Some(read_slice::<u32>(&out, 1)[0])
+    }
+
+    /// Dispatch `sample` on a synthetic f32 logits row with a near-zero
+    /// temperature + top_k=1: the softmax collapses onto the argmax, the
+    /// descent keeps exactly one candidate, and the categorical draw (any
+    /// uniform) must return the argmax index. Guarded to skip when no Metal
+    /// device / MTL4 queue is available (CI Linux, headless).
     #[test]
     fn sample_top_k1_returns_argmax() {
         let Some(device) = crate::device::detect_device() else {
@@ -705,42 +842,19 @@ mod tests {
         logits[7] = 3.0;
         logits[42] = 2.0;
 
-        let out = shared_slice(&device, &[0u32]);
-        let logits_buf = shared_slice(&device, &logits);
-        let temps = shared_slice(&device, &[0.01f32]); // ~greedy
-        let top_ks = shared_slice(&device, &[1i32]);
-        let top_ps = shared_slice(&device, &[1.0f32]);
-        let min_ps = shared_slice(&device, &[0.0f32]);
-        let uniforms = shared_slice(&device, &[0.73f32]);
-
-        let Some(mut batch) = Mtl4DispatchBatch::begin(&device) else {
+        let got = run_metal_sample(&device, &kernels, &logits, 0.01, 1, 1.0, 0.0, 0.73);
+        let Some(got) = got else {
             eprintln!("skipping: no MTL4 queue");
             return;
         };
-        encode_sample_top_k_top_p(
-            &mut batch,
-            &kernels,
-            &out,
-            &logits_buf,
-            &temps,
-            &top_ks,
-            &top_ps,
-            &min_ps,
-            &uniforms,
-            1,
-            vocab,
-        );
-        batch.commit(true);
-
-        let got = read_slice::<u32>(&out, 1);
         assert_eq!(
-            got[0] as usize, argmax_idx,
+            got as usize, argmax_idx,
             "top_k=1 near-zero-temp sample must return the argmax index"
         );
     }
 
     // =======================================================================
-    // Parity harness: pure-Rust CPU golden vs the REAL metal sampler kernel.
+    // Parity harness: pure-Rust CPU golden vs the REAL metal sampler pipeline.
     //
     // The golden mirrors cuda `sample_top_k_top_p_core` (the spec) EXACTLY:
     //   softmax(logit/T) -> radix-select top-k threshold -> min-p ->
@@ -942,46 +1056,6 @@ mod tests {
         }
     }
 
-    /// Dispatch the real metal `sample_top_k_top_p` on one row and return the
-    /// sampled token. Returns `None` when no metal device / MTL4 queue exists.
-    #[allow(clippy::too_many_arguments)]
-    fn run_metal_sample(
-        device: &Device,
-        kernels: &SamplerKernels,
-        logits: &[f32],
-        temp: f32,
-        top_k: i32,
-        top_p: f32,
-        min_p: f32,
-        uniform: f32,
-    ) -> Option<u32> {
-        let vocab = logits.len() as u32;
-        let out = shared_slice(device, &[0u32]);
-        let logits_buf = shared_slice(device, logits);
-        let temps = shared_slice(device, &[temp]);
-        let top_ks = shared_slice(device, &[top_k]);
-        let top_ps = shared_slice(device, &[top_p]);
-        let min_ps = shared_slice(device, &[min_p]);
-        let uniforms = shared_slice(device, &[uniform]);
-
-        let mut batch = Mtl4DispatchBatch::begin(device)?;
-        encode_sample_top_k_top_p(
-            &mut batch,
-            kernels,
-            &out,
-            &logits_buf,
-            &temps,
-            &top_ks,
-            &top_ps,
-            &min_ps,
-            &uniforms,
-            1,
-            vocab,
-        );
-        batch.commit(true);
-        Some(read_slice::<u32>(&out, 1)[0])
-    }
-
     #[derive(Clone, Copy, Debug)]
     enum Mode {
         Greedy,
@@ -1137,7 +1211,8 @@ mod tests {
 
     // =======================================================================
     // apply_penalties parity: rep/freq/pres must reshape logits exactly, and
-    // shift the argmax off a penalized token.
+    // shift the argmax off a penalized token. Runs the cast + penalties stages
+    // of the sliced pipeline and reads the scratch back.
     // =======================================================================
 
     fn golden_penalties(
@@ -1189,6 +1264,45 @@ mod tests {
         bi
     }
 
+    /// Cast + penalties stages only, on `njobs` rows; returns the scratch
+    /// (post-penalty f32 logits) for row 0 and row `njobs-1`.
+    fn run_penalties(
+        device: &Device,
+        kernels: &SamplerKernels,
+        params: &scratchy_core_common::GpuSampleParams,
+        logits: &[f32],
+        njobs: u32,
+        vocab: u32,
+    ) -> Option<Vec<f32>> {
+        use objc2_metal::MTLBuffer as _;
+        let logits_buf = shared_slice(device, logits);
+        let batch = Mtl4DispatchBatch::begin(device)?;
+        let (pending, _logits_pin) = {
+            let res = batch.residency();
+            let pending =
+                PendingSampler::prepare(device, res, params, njobs, vocab, CastDtype::F32);
+            (pending, res.pin(logits_buf.clone()))
+        };
+        let enc = batch.encoder();
+        // The cast + penalties stages are the pipeline's first two; the rest
+        // would consume/rewrite the scratch, so stop after penalties.
+        let sliced = njobs * pending.nslices;
+        pending.bind_stage_tables(logits_buf.gpuAddress());
+        let cast = match pending.cast_dtype {
+            CastDtype::Bf16 => &kernels.cast_bf16,
+            CastDtype::F16 => &kernels.cast_f16,
+            CastDtype::F32 => &kernels.cast_f32,
+        };
+        encode_sampler_stage_into_mtl4(enc, cast, &pending.cast_at, sliced);
+        if let Some(ref pen) = pending.penalties_at {
+            encode_sampler_stage_into_mtl4(enc, &kernels.penalties, pen, sliced);
+        }
+        batch.commit(true);
+        use std::ops::Deref;
+        let scratch = pending.scratch_f32.deref();
+        Some(read_slice::<f32>(scratch, njobs as usize * vocab as usize))
+    }
+
     #[test]
     fn penalties_parity_vs_cpu_golden() {
         let Some(device) = crate::device::detect_device() else {
@@ -1235,34 +1349,27 @@ mod tests {
 
             let golden = golden_penalties(&logits, &out_ids, &prompt_ids, rep, freq, pres, vocab);
 
-            let logits_buf = shared_slice(&device, &logits);
-            let out_buf = shared_slice(&device, &out_ids);
-            let prompt_buf = shared_slice(&device, &prompt_ids);
-            let rep_buf = shared_slice(&device, &[rep]);
-            let freq_buf = shared_slice(&device, &[freq]);
-            let pres_buf = shared_slice(&device, &[pres]);
-
-            let Some(mut batch) = Mtl4DispatchBatch::begin(&device) else {
+            let params = scratchy_core_common::GpuSampleParams {
+                row_indices: vec![0],
+                rep_penalties: vec![rep],
+                freq_penalties: vec![freq],
+                pres_penalties: vec![pres],
+                output_token_ids: out_ids.clone(),
+                prompt_token_ids: prompt_ids.clone(),
+                max_output_len: max_out,
+                max_prompt_len: max_prompt,
+                any_penalty: true,
+                temperatures: vec![1.0],
+                top_ks: vec![0],
+                top_ps: vec![1.0],
+                min_ps: vec![0.0],
+                uniforms: vec![0.5],
+            };
+            let Some(got) = run_penalties(&device, &kernels, &params, &logits, 1, vocab as u32)
+            else {
                 eprintln!("skipping: no MTL4 queue");
                 return;
             };
-            encode_apply_penalties(
-                &mut batch,
-                &kernels,
-                &logits_buf,
-                &out_buf,
-                &prompt_buf,
-                &rep_buf,
-                &freq_buf,
-                &pres_buf,
-                1,
-                vocab as u32,
-                max_out,
-                max_prompt,
-            );
-            batch.commit(true);
-
-            let got = read_slice::<f32>(&logits_buf, vocab);
 
             // Bit-exact row parity (identical scalar arithmetic).
             for i in 0..vocab {
@@ -1348,34 +1455,27 @@ mod tests {
             vocab,
         );
 
-        let logits_buf = shared_slice(&device, &logits);
-        let out_buf = shared_slice(&device, &out_ids);
-        let prompt_buf = shared_slice(&device, &prompt_ids);
-        let rep_buf = shared_slice(&device, &reps);
-        let freq_buf = shared_slice(&device, &freqs);
-        let pres_buf = shared_slice(&device, &press);
+        let params = scratchy_core_common::GpuSampleParams {
+            row_indices: vec![0, 1],
+            rep_penalties: reps.to_vec(),
+            freq_penalties: freqs.to_vec(),
+            pres_penalties: press.to_vec(),
+            output_token_ids: out_ids.clone(),
+            prompt_token_ids: prompt_ids.clone(),
+            max_output_len: max_out,
+            max_prompt_len: max_prompt,
+            any_penalty: true,
+            temperatures: vec![1.0, 1.0],
+            top_ks: vec![0, 0],
+            top_ps: vec![1.0, 1.0],
+            min_ps: vec![0.0, 0.0],
+            uniforms: vec![0.5, 0.5],
+        };
 
-        let Some(mut batch) = Mtl4DispatchBatch::begin(&device) else {
+        let Some(got) = run_penalties(&device, &kernels, &params, &logits, 2, vocab as u32) else {
             eprintln!("skipping: no MTL4 queue");
             return;
         };
-        encode_apply_penalties(
-            &mut batch,
-            &kernels,
-            &logits_buf,
-            &out_buf,
-            &prompt_buf,
-            &rep_buf,
-            &freq_buf,
-            &pres_buf,
-            2,
-            vocab as u32,
-            max_out,
-            max_prompt,
-        );
-        batch.commit(true);
-
-        let got = read_slice::<f32>(&logits_buf, 2 * vocab);
 
         // Row 1 (the neutral / all-padding row) must be bit-for-bit unchanged.
         for i in 0..vocab {
@@ -1399,9 +1499,9 @@ mod tests {
     }
 
     /// Radix-select + softmax at production-scale vocabularies (up to qwen3.5's
-    /// 248320) — exercises the 32-pass radix select and the full-vocab max/sum
-    /// passes far past the 4096 used elsewhere. A dominant peak makes the draw
-    /// deterministic, so every case is an exact parity match.
+    /// 248320) — exercises the byte-histogram descent and the full-vocab
+    /// softmax passes far past the 4096 used elsewhere. A dominant peak makes
+    /// the draw deterministic, so every case is an exact parity match.
     #[test]
     fn sample_parity_large_vocab() {
         let Some(device) = crate::device::detect_device() else {

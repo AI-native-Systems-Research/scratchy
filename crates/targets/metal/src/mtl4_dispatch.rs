@@ -330,6 +330,23 @@ impl Mtl4DispatchBatch {
         self.tables.push(table);
     }
 
+    /// The batch's residency set — where a caller encoding its own stages onto
+    /// the batch's encoder (e.g. the sampler's [`PendingSampler`]) pins its
+    /// buffers. Same lifetime as the batch: committing drops both together,
+    /// after the GPU has drained.
+    ///
+    /// [`PendingSampler`]: crate::sampling::PendingSampler
+    pub fn residency(&self) -> &MetalResidencySet {
+        &self.res
+    }
+
+    /// The batch's MTL4 compute encoder, for callers encoding their own
+    /// pipeline stages (with their own argument tables) onto the same command
+    /// buffer. The encoder is live until [`commit`](Self::commit) ends it.
+    pub fn encoder(&self) -> &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder> {
+        &self.enc
+    }
+
     /// Insert an intra-encoder dispatch→dispatch barrier so a later
     /// [`encode`](Self::encode) reads what an earlier one wrote. MTL4 compute
     /// encoders do NOT auto-serialize same-encoder dispatches, so a producer→
