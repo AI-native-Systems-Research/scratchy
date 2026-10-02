@@ -3,7 +3,7 @@
 // flex-rs's real senlib FFI binding. This is the ONLY C++ compiled into
 // flex-rs, and it calls ONLY `senlib::` — never `flex::`. Device bring-up
 // (opening the card, reading its real HBM size, obtaining CB/RB interface
-// pointers) is done here directly against `senlib::v2::PfWrapper`/
+// pointers) is done here directly against `senlib::snt1p0::PfWrapper`/
 // `PfInterface`, the same primitives flex's own `PfDeviceHandle` constructor
 // uses internally (verified against
 // flex/src/device_types/pf_device/pf_device_handle.cpp) — but the
@@ -19,13 +19,21 @@
 // across the C ABI into Rust (UB) — errors are logged to stderr and reported
 // as a sentinel/null return instead.
 
-#include <senlib/1p0/senpci.hpp>
-#include <senlib/1p0/pf_wrapper.hpp>
-#include <senlib/1p0/pf_interface.hpp>
-#include <senlib/1p0/control_block_interface.hpp>
-#include <senlib/1p0/response_block_interface.hpp>
+#include <senlib/snt1p0/senpci.hpp>
+#include <senlib/snt1p0/pf_wrapper.hpp>
+#include <senlib/snt1p0/pf_interface.hpp>
+#include <senlib/snt1p0/control_block_interface.hpp>
+#include <senlib/snt1p0/response_block_interface.hpp>
 #include <senlib/shared/memory_allocator.hpp>
 #include <senlib/shared/senpci_shared.hpp>
+
+// senlib's dev stack reorg (its "D-2" step) moved everything from the
+// historical `senlib::v2` / `SentientSoc::V1` namespaces to
+// `senlib::snt1p0` / `hal::snt1p0`, and the shared allocator types
+// (MemoryAllocator, pinned_memory, sgpair, SenPciShared) to
+// `senlib::shared`. The old `senlib/1p0/` include paths survive only as
+// generated compat stubs scheduled for deletion, so this shim uses the final
+// `senlib/snt1p0/` paths.
 
 #include <cstdint>
 #include <cstdio>
@@ -40,7 +48,7 @@ namespace {
 // call_once/shared_ptr pattern for the same reason: opening the device is
 // expensive (real hardware bring-up) and must happen exactly once per
 // process, not once per FFI call.
-std::shared_ptr<senlib::v2::PfWrapper> g_pfw;
+std::shared_ptr<senlib::snt1p0::PfWrapper> g_pfw;
 std::once_flag g_pfw_once;
 int g_pfw_init_rc = -1;
 
@@ -78,14 +86,14 @@ extern "C" const char* flex_shim_last_error(void) {
 void init_pfw_once(int32_t /*logical_device_id*/) {
     std::call_once(g_pfw_once, [] {
         try {
-            // Real device identification + open: senlib::v2::SenPci::pf()
+            // Real device identification + open: senlib::snt1p0::SenPci::pf()
             // with no argument selects "first available device", matching
             // flex's own CreatePciId() fallback path
             // (pf_device_handle.cpp:145) for the single-device case this ABI
-            // slice needs. senlib::v2::PfWrapper's constructor is the actual
+            // slice needs. senlib::snt1p0::PfWrapper's constructor is the actual
             // VFIO device open.
-            auto pci_id = senlib::v2::SenPci::pf();
-            g_pfw = std::make_shared<senlib::v2::PfWrapper>(pci_id);
+            auto pci_id = senlib::snt1p0::SenPci::pf();
+            g_pfw = std::make_shared<senlib::snt1p0::PfWrapper>(pci_id);
             g_pfw_init_rc = 0;
         } catch (const std::exception& e) {
             fprintf(stderr, "[senlib-ffi] init_pfw: %s\n", e.what());
@@ -106,20 +114,20 @@ void init_pfw_once(int32_t /*logical_device_id*/) {
 // allocator.rs::DEVICE_ALIGNMENT).
 constexpr uint64_t kDeviceAlignment = 128;
 
-std::shared_ptr<senlib::v2::MemoryAllocator> g_mem_allocator;
+std::shared_ptr<senlib::shared::MemoryAllocator> g_mem_allocator;
 std::once_flag g_mem_allocator_once;
 
-senlib::v2::MemoryAllocator* mem_allocator() {
+senlib::shared::MemoryAllocator* mem_allocator() {
     std::call_once(g_mem_allocator_once, [] {
         auto size = g_pfw->interface()->GetLPDDRSize();
-        g_mem_allocator = std::make_shared<senlib::v2::MemoryAllocator>(
+        g_mem_allocator = std::make_shared<senlib::shared::MemoryAllocator>(
             reinterpret_cast<void*>(kDeviceAlignment), size, kDeviceAlignment);
     });
     return g_mem_allocator.get();
 }
 
 // Process-wide handle table for outstanding device-memory allocations.
-// senlib::v2::MemoryAllocator::Allocate returns a raw void*; Rust's
+// senlib::shared::MemoryAllocator::Allocate returns a raw void*; Rust's
 // senlib_ffi_allocator::SenlibAllocationHandle is a bare u64, so this table
 // is what turns "free this u64" back into "free this void*" (the pointer
 // value itself, widened to u64, IS the handle — no separate ownership object
@@ -148,7 +156,7 @@ int32_t flex_shim_init_runtime(int32_t logical_device_id) {
     }
 }
 
-// Real device memory capacity, in bytes — senlib::v2::PfInterface::GetLPDDRSize(),
+// Real device memory capacity, in bytes — senlib::snt1p0::PfInterface::GetLPDDRSize(),
 // the exact senlib call flex's own PfDeviceHandle constructor uses
 // (pf_device_handle.cpp:153: `pfw_->interface()->GetLPDDRSize()`).
 uint64_t flex_senlib_device_memory_size(void) {
@@ -168,14 +176,14 @@ uint64_t flex_senlib_device_memory_size(void) {
 }
 
 // Real RCU (compute-core) count on the open card —
-// senlib::v2::SenPci::RCU_num_cores(), the exact senlib call
+// senlib::snt1p0::SenPci::RCU_num_cores(), the exact senlib call
 // flex::populateDomainTopology uses to build the 1p0 target's single-domain
 // core-affinity vector (device_memory_topology.cpp:32). Static/no bring-up
 // prerequisite, but declared alongside flex_senlib_device_memory_size since
 // both feed the same DeviceTopology population call.
 uint32_t flex_senlib_rcu_num_cores(void) {
     try {
-        return static_cast<uint32_t>(senlib::v2::SenPci::RCU_num_cores());
+        return static_cast<uint32_t>(senlib::snt1p0::SenPci::RCU_num_cores());
     } catch (const std::exception& e) {
         fprintf(stderr, "[senlib-ffi] flex_senlib_rcu_num_cores: %s\n", e.what());
         return 0;
@@ -187,7 +195,7 @@ uint32_t flex_senlib_rcu_num_cores(void) {
 
 // ---------------------------------------------------------------------
 // senlib_ffi_allocator.rs — device memory allocate/free
-//   senlib::v2::MemoryAllocator::Allocate(bytes) -> void* / Free(void*)
+//   senlib::shared::MemoryAllocator::Allocate(bytes) -> void* / Free(void*)
 // ---------------------------------------------------------------------
 
 uint64_t flex_senlib_memory_allocate(uint64_t num_bytes) {
@@ -253,9 +261,9 @@ int32_t flex_senlib_memory_free(uint64_t handle) {
 // ---------------------------------------------------------------------
 // senlib_ffi_scheduler.rs — control-block-interface capacity / doorbell,
 // response-block receive.
-//   senlib::v2::PfInterface::GetComputeCbi()/GetDmaiCbi()/GetDmaoCbi()
-//   senlib::v2::PfInterface::GetRbi()
-// (senlib/1p0/pf_interface.hpp)
+//   senlib::snt1p0::PfInterface::GetComputeCbi()/GetDmaiCbi()/GetDmaoCbi()
+//   senlib::snt1p0::PfInterface::GetRbi()
+// (senlib/snt1p0/pf_interface.hpp)
 // ---------------------------------------------------------------------
 
 enum FlexShimPipeline : int32_t {
@@ -264,7 +272,7 @@ enum FlexShimPipeline : int32_t {
     kFlexShimPipelineAsyncDmaOCbi = 2,
 };
 
-static senlib::v2::ControlBlockInterface* cbi_for_pipeline(int32_t pipeline) {
+static senlib::snt1p0::ControlBlockInterface* cbi_for_pipeline(int32_t pipeline) {
     if (!g_pfw) {
         return nullptr;
     }
@@ -298,12 +306,12 @@ void* flex_shim_rbi_for_pipeline(int32_t /*pipeline*/) {
         // senlib exposes exactly one Rbi() per device.
         //
         // `PfInterface::GetRbi()` is declared as returning
-        // `ResponseBlockInterfaceImpl*` (senlib/1p0/pf_interface.hpp:88), but
+        // `ResponseBlockInterfaceImpl*` (senlib/snt1p0/pf_interface.hpp:94), but
         // the type every consumer works with -- and the type
         // `senlib_response_block_interface_receive_responses_sbf` below casts
         // this void* back to -- is the polymorphic base
-        // `senlib::v2::ResponseBlockInterface`
-        // (senlib/1p0/response_block_interface.hpp:31,52). The upcast must
+        // `senlib::snt1p0::ResponseBlockInterface`
+        // (senlib/snt1p0/response_block_interface.hpp:37,42). The upcast must
         // therefore happen HERE, on the typed pointer, not implicitly through
         // void*: `static_cast<void*>(Impl*)` followed by
         // `static_cast<Base*>(void*)` reinterprets the derived address as a
@@ -311,7 +319,7 @@ void* flex_shim_rbi_for_pipeline(int32_t /*pipeline*/) {
         // subobject happens to sit at offset 0. Matches how
         // `cbi_for_pipeline` above already returns the base
         // `ControlBlockInterface*`.
-        return static_cast<void*>(static_cast<senlib::v2::ResponseBlockInterface*>(g_pfw->interface()->GetRbi()));
+        return static_cast<void*>(static_cast<senlib::snt1p0::ResponseBlockInterface*>(g_pfw->interface()->GetRbi()));
     } catch (...) {
         fprintf(stderr, "[senlib-ffi] flex_shim_rbi_for_pipeline: exception\n");
         return nullptr;
@@ -329,7 +337,7 @@ int32_t senlib_control_block_interface_capacity(void* cbi, size_t* out_capacity)
             shim_record_error("senlib_control_block_interface_capacity", "null cbi/out_capacity");
             return -1;
         }
-        *out_capacity = static_cast<senlib::v2::ControlBlockInterface*>(cbi)->capacity();
+        *out_capacity = static_cast<senlib::snt1p0::ControlBlockInterface*>(cbi)->capacity();
         return 0;
     } catch (const std::exception& e) {
         shim_record_error("senlib_control_block_interface_capacity", e.what());
@@ -359,8 +367,8 @@ int32_t senlib_control_block_interface_queue_control_blocks_sbf(void* cbi, const
             fprintf(stderr, "[senlib-ffi] senlib_control_block_interface_queue_control_blocks_sbf: null cbi/cbs\n");
             return -1;
         }
-        auto* iface = static_cast<senlib::v2::ControlBlockInterface*>(cbi);
-        auto* src = static_cast<const SentientSoc::V1::ControlBlockSBF*>(cbs);
+        auto* iface = static_cast<senlib::snt1p0::ControlBlockInterface*>(cbi);
+        auto* src = static_cast<const hal::snt1p0::ControlBlockSBF*>(cbs);
         // `count == 0` is forwarded, not short-circuited: the real code passes
         // `GetNumberOfCBs()` straight through and senlib owns the semantics.
         iface->QueueControlBlocksSBF(src, static_cast<uint64_t>(count));
@@ -376,7 +384,7 @@ int32_t senlib_control_block_interface_queue_control_blocks_sbf(void* cbi, const
 }
 
 // Port of `ControlBlockInterface::FreeResponses(uint64_t num_responses = 0)`
-// (`senlib/1p0/control_block_interface.hpp:49`, pure virtual). Called by
+// (`senlib/snt1p0/control_block_interface.hpp:54`, pure virtual). Called by
 // `ResponseWorker::ParseResponseBlocks` once per pipeline per drain
 // (`response_worker.cpp:1141-1152`) to return consumed response-block slots to
 // senlib. Until this symbol existed the port never returned that credit, so
@@ -391,7 +399,7 @@ int32_t senlib_control_block_interface_free_responses(void* cbi, uint64_t num_re
             fprintf(stderr, "[senlib-ffi] senlib_control_block_interface_free_responses: null cbi\n");
             return -1;
         }
-        auto* iface = static_cast<senlib::v2::ControlBlockInterface*>(cbi);
+        auto* iface = static_cast<senlib::snt1p0::ControlBlockInterface*>(cbi);
         iface->FreeResponses(num_responses);
         return 0;
     } catch (const std::exception& e) {
@@ -415,8 +423,8 @@ int32_t senlib_response_block_interface_receive_responses_sbf(void* rbi, void* o
             shim_record_error("senlib_response_block_interface_receive_responses_sbf", "null rbi/out/out_received");
             return -1;
         }
-        auto* iface = static_cast<senlib::v2::ResponseBlockInterface*>(rbi);
-        auto* dest = static_cast<SentientSoc::V1::ResponseBlockSBF*>(out);
+        auto* iface = static_cast<senlib::snt1p0::ResponseBlockInterface*>(rbi);
+        auto* dest = static_cast<hal::snt1p0::ResponseBlockSBF*>(out);
         *out_received = iface->ReceiveResponsesSBF(dest, static_cast<uint64_t>(max_count),
                                                    static_cast<uint64_t>(min_count));
         return 0;
@@ -431,13 +439,13 @@ int32_t senlib_response_block_interface_receive_responses_sbf(void* rbi, void* o
 
 // ---------------------------------------------------------------------
 // senlib_ffi_runtime.rs / senlib_ffi_config_util.rs — card count
-//   senlib::v2::SenPci::ncards() — a trivial static query with no bring-up
+//   senlib::snt1p0::SenPci::ncards() — a trivial static query with no bring-up
 //   prerequisite.
 // ---------------------------------------------------------------------
 
 uint64_t flex_senlib_pci_ncards(void) {
     try {
-        return static_cast<uint64_t>(senlib::v2::SenPci::ncards());
+        return static_cast<uint64_t>(senlib::snt1p0::SenPci::ncards());
     } catch (const std::exception& e) {
         fprintf(stderr, "[senlib-ffi] flex_senlib_pci_ncards: %s\n", e.what());
         return 0;
@@ -449,7 +457,7 @@ uint64_t flex_senlib_pci_ncards(void) {
 
 // ---------------------------------------------------------------------
 // senlib_ffi_config_util.rs — per-card PCIe bus address
-//   senlib::v2::SenPciShared::pf(card_index).to_string()
+//   senlib::shared::SenPciShared::pf(card_index).to_string()
 //   (flex/src/util/flex_config.cpp:471, FlexConfig::RdmaGetPCIeAddress)
 // ---------------------------------------------------------------------
 
@@ -461,7 +469,7 @@ const char* senlib_senpci_pf_address(uint32_t card_index) {
         // the returned c_str() matches that contract (stable until the next
         // call on this thread, no ownership transfer to Rust).
         static thread_local std::string addr;
-        addr = senlib::v2::SenPciShared::pf(card_index).to_string();
+        addr = senlib::shared::SenPciShared::pf(card_index).to_string();
         return addr.c_str();
     } catch (const std::exception& e) {
         fprintf(stderr, "[senlib-ffi] senlib_senpci_pf_address: %s\n", e.what());
@@ -531,10 +539,10 @@ int32_t flex_senlib_iommu_unmap_and_unregister(void* hmva, void* iova, uint64_t 
         // by UnregisterMemForIOMMU with the SAME page-rounded size (the
         // rounding itself is done by the caller, iommu.rs::unmap, mirroring
         // `sendnn::ceil_to(mapping.SizeInBytes(), page_size_)`).
-        // `senlib::v2::sgpair` is `{void* ptr; size_t length;}`
-        // (senlib/shared/memory_allocator_util.hpp:31-34), so this
+        // `senlib::shared::sgpair` is `{void* ptr; size_t length;}`
+        // (senlib/shared/memory_allocator_util.hpp:34-37), so this
         // brace-initializer order matches the C++'s.
-        senlib::v2::pinned_memory pm;
+        senlib::shared::pinned_memory pm;
         pm.dev_shm_sglist.push_back({iova, static_cast<size_t>(size_bytes)});
         g_pfw->interface()->unpin_and_unmap(pm);
         g_pfw->interface()->UnregisterMemForIOMMU(hmva, static_cast<size_t>(size_bytes));
