@@ -732,7 +732,17 @@ impl Drop for ChildProc<'_> {
 /// Counted in BYTES rather than groups because a group is 64 ops in one place and 512 in another, so
 /// a group count bounds nothing in particular. The emitter knows a group's exact size before it
 /// writes it (it already holds the rendered json), so the reservation is exact, not an estimate.
-pub const MAX_STAGED_BYTES: usize = 512 * 1024 * 1024;
+///
+/// ⛔ AND A BUDGET THAT BLOCKS THE EMITTER CAPS THE COMPILE WIDTH, WHICH IS WHAT 512 MB DID. That
+/// value was sized on granite-3.1-2b — measured peak staging 85 MB for the WHOLE bake — so it
+/// admitted ~6 concurrent granite groups and never approached [`COMPILE_WIDTH`]. A gemma-4-12b
+/// rolled body is 6 layers fused into one loop unit: one launch group stages ~55 MB (8,300
+/// descriptors), so 512 MB admitted ~9 groups and the emitter sat blocked in `reserve` while 11 of
+/// the pod's 20 CPU-quota cores idled — MEASURED on the pod: 9 live `dxp_standalone` children, each
+/// ~90% of one core, against `cpu.max` = 20. 4 GB admits the full width at gemma group sizes
+/// (32 × 55 MB ≈ 1.8 GB) with headroom, and is still nothing against the staging volume (the build
+/// pod's `/tmp` has 1.7 TB free; the old `superdscforge` tree routinely held more).
+pub const MAX_STAGED_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 /// ⭐ THE CPU BOUND: concurrent `dxp_standalone` processes.
 ///
