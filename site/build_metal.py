@@ -272,7 +272,9 @@ def conc_chart(m, mid):
                    f'data-tip="{tip(rows)}"><title>{x} users</title></rect>')
     out.append("</svg>")
 
-    legend = "".join(f'<span><span class="lkey {cls}"></span>{esc(label)}</span>' for label, cls, _ in series)
+    # One engine needs no legend: its end label and the caption already name it.
+    legend = "".join(f'<span><span class="lkey {cls}"></span>{esc(label)}</span>'
+                     for label, cls, _ in series) if len(series) > 1 else ""
     head = "".join(f"<th scope=\"col\">{x}</th>" for x in xs)
     trs = []
     for key, label, _lk, sk, cls in ENGINES:
@@ -314,6 +316,12 @@ def grid_maps(m, run):
     if not have["scratchy"] or not ins or not outs:
         return ""
     conc = (sc.get("base") or {}).get("conc", "?")
+    # Colour against mlx-lm, which runs the same MLX checkpoint; failing that,
+    # against ollama; with neither, show scratchy's own values uncoloured rather
+    # than a grid of blanks. The caption and scale say which.
+    present = [k for k in ("mlx-lm", "ollama") if have[k]]
+    rival = present[0] if present else None
+    other = present[1] if len(present) > 1 else None
 
     def one(metric, title, faster):
         rows = []
@@ -321,18 +329,23 @@ def grid_maps(m, run):
             tds = []
             for o in outs:
                 rung = f"{i}x{o}"
-                cs, cm, co = (have[k].get(rung) for k in ("scratchy", "mlx-lm", "ollama"))
-                s, mx, ol = timing(cs, metric), timing(cm, metric), timing(co, metric)
-                r_m, r_o = faster(s, mx), faster(s, ol)
+                get = lambda k: have[k].get(rung) if k else None
+                cs, cr, co = get("scratchy"), get(rival), get(other)
+                s, vr, vo = timing(cs, metric), timing(cr, metric), timing(co, metric)
+                r_r, r_o = faster(s, vr), faster(s, vo)
                 nd = 1 if metric == "output_throughput" else 0
-                tiprows = [[cfmt(c, metric, nd), name, cls] for c, name, cls in
-                           ((cs, "scratchy", "s1"), (cm, "mlx-lm", "s2"), (co, "ollama", "s3"))]
+                tiprows = [[cfmt(have[k].get(rung), metric, nd), k, cls]
+                           for k, _l, _lk, _sk, cls in ENGINES if have[k]]
                 why = lambda c, name: f"{name}: {NO_STREAM}" if c else f"no {name}"
-                big = (f"×{r_m:.2f}" if r_m is not None
-                       else why(cs, "scratchy") if s is None else why(cm, "mlx-lm"))
-                small = (f"vs ollama ×{r_o:.2f}" if r_o is not None
-                         else "" if s is None else why(co, "ollama"))
-                tds.append(f'<td{ratio_tint(r_m)} tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
+                unit = "tok/s" if metric == "output_throughput" else "ms"
+                if rival is None:                 # nothing to compare against
+                    big, small = cfmt(cs, metric, nd), unit if s is not None else ""
+                else:
+                    big = (f"×{r_r:.2f}" if r_r is not None
+                           else why(cs, "scratchy") if s is None else why(cr, rival))
+                    small = (f"vs {other} ×{r_o:.2f}" if r_o is not None
+                             else "" if s is None or not other else why(co, other))
+                tds.append(f'<td{ratio_tint(r_r)} tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
                            f'data-tip="{tip(tiprows)}"><b>{big}</b><span>{small}</span></td>')
             rows.append(f'<tr><th scope="row">{i}</th>{"".join(tds)}</tr>')
         head = "".join(f'<th scope="col">{o}</th>' for o in outs)
@@ -344,13 +357,24 @@ def grid_maps(m, run):
 
     tput = lambda s, o: s / o if s and o else None    # higher is better
     ttft = lambda s, o: o / s if s and o else None    # lower is better
+    if rival is None:
+        note = "scratchy's own values; this run has no mlx-lm or ollama to compare against"
+        scale = ""
+    else:
+        missing = [k for k in ("mlx-lm", "ollama") if not have[k]]
+        note = (f"how many times faster scratchy is than {rival}"
+                + (f", since this run has no {missing[0]}" if missing else "")
+                + "; hover for every engine's value")
+        scale = (f'<div class="scale"><span><i class="sw neg"></i>{rival} faster</span>'
+                 '<span><i class="sw mid"></i>about the same</span>'
+                 '<span><i class="sw pos"></i>scratchy faster</span></div>')
     return f"""<figure class="mfig">
-  <figcaption>Prompt size × answer size, {esc(conc)} users <span class="dim">(how many times faster scratchy is than mlx-lm; hover for every engine's value)</span></figcaption>
+  <figcaption>Prompt size × answer size, {esc(conc)} users <span class="dim">({note})</span></figcaption>
   <div class="heatrow">
   {one("output_throughput", "throughput", tput)}
   {one("median_ttft_ms", "time to first token", ttft)}
   </div>
-  <div class="scale"><span><i class="sw neg"></i>mlx-lm faster</span><span><i class="sw mid"></i>about the same</span><span><i class="sw pos"></i>scratchy faster</span></div>
+  {scale}
 </figure>"""
 
 
@@ -557,6 +581,9 @@ PAGE = r"""<!doctype html>
       <li><b>"no stream"</b> means the engine sent its whole answer at once (or a single
       token), so there was no first token or per-token interval to time; its TTFT would be
       the whole answer's time. ollama's gemma4 does this.</li>
+      <li><b>Greedy decoding everywhere.</b> Every request sends <code>temperature: 0</code>
+      explicitly, so no engine falls back to its own default sampling; each prompt is still
+      unique.</li>
       <li><b>Users are offered, not achieved:</b> "16 users" means up to 16 requests in flight;
       an engine may batch fewer.</li>
       <li><b>Peak RSS</b> is the server process. For ollama that is <code>ollama serve</code>
