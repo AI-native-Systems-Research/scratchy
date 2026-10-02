@@ -57,6 +57,7 @@ use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
 use crate::work::{CoreSplit, DeviceWidth, FP16_ELEMS_PER_STICK};
+use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
@@ -165,6 +166,16 @@ pub struct Gather {
     pub value_tid: u32,
     /// Entries the gather takes: the gathered tile's SLOW extent, one index per gathered row.
     pub entries: u32,
+    /// ⭐ WHERE THIS GATHER'S RUN OF ENTRIES STARTS IN THE INDEX BUFFER — the indirect dim's own
+    /// subscript offset, which an unrolled sweep states per trip. The tile's `dim_subs[0]` is
+    /// `Add(Sym(0), Dim(0))`: enumeration row `Dim(0)` reads index word `Sym(0) + row`, and
+    /// `Sym(0)` is `intermediate_vars[0]`'s constant. A one-block program states 0; an unrolled
+    /// KV sweep's trip `b` states `b · BLOCK_N`, and dropping it gathers every trip's rows through
+    /// block 0's ids — the right shape, the right dtype, the wrong rows, from a clean bake. The
+    /// value is in ENTRIES (one `SenUint32` word per entry), which is what
+    /// [`crate::superdsc_opspec::EntryBase`] reports and what the index operand's
+    /// `with_offset` takes.
+    pub first_entry: u32,
 }
 
 /// [`Gather`] for this program, or `None` when it states no indirect access.
@@ -256,7 +267,194 @@ pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
         index_tid,
         value_tid,
         entries,
+        first_entry: 0,
     }))
+}
+
+/// ⭐⭐⭐ EVERY `Gather` THE PROGRAM STATES, ONE PER INDIRECT TILE — the multi-gather reading.
+///
+/// The vendor's contract carries ONE index operand per descriptor (`DSC2ToDataflowIR.cpp:51` pairs
+/// an index with the tensor it gathers BY POSITION), which is why [`gather_of`] refuses two tiles
+/// in one program: one descriptor cannot carry two indices. But the Triton front end's trip unroll
+/// (`unroll_constant_trip_loops`) SPLICES a time-tiled KV sweep into straight-line trips, each trip
+/// carrying its own `ktdp.construct_indirect_access_tile` over the SAME index and table parameters
+/// — the paged multi-block shape, where every trip gathers a different block's rows through the
+/// same two buffers. That is not two descriptors on one op; it is N ops, each with its own index
+/// operand, which the contract admits and the one-gather reading refuses only because it counts
+/// tiles instead of ops.
+///
+/// The joins stay EXACTLY `gather_of`'s — same param walk, same self-reference refusal, same
+/// `entries` off the tile's own shape — with one added DISCRIMINATOR the single-gather reading
+/// never needed: every tile must name the SAME index and value parameters. Tiles over different
+/// pairs really would need two index operands on one descriptor-shaped op and are refused by name
+/// here rather than half-lowered; tiles over the same pair are the unrolled sweep's trips.
+///
+/// A gather the walk below does not carry is still the silent-direct-read hazard `gather_of`'s
+/// comment names, so callers refuse an uncarried one exactly as before.
+pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
+    let f = &k.func;
+    let consts = index_constants(&k.func);
+    let tiles: Vec<&Operation<'_>> = f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .collect();
+    let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
+    let tile_count = tiles.len();
+    for tile in &tiles {
+        // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
+        // the two readings cannot disagree about which parameter a tile's view names.
+        let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
+            let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
+                message: format!(
+                    "{}: the indirect access tile states no {what} operand — a gather needs both the \
+                     tensor it reads and the index vector that chooses the rows",
+                    f.name
+                ),
+            })?;
+            let view = f
+                .operations
+                .iter()
+                .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
+                .ok_or_else(|| Error {
+                    message: format!(
+                        "{}: the indirect access tile's {what} operand is not a \
+                         `ktdp.construct_memory_view`, so no parameter can be named for it",
+                        f.name
+                    ),
+                })?;
+            let ptr = view.operands.first().copied();
+            let i = f
+                .arguments
+                .iter()
+                .position(|(a, _)| Some(*a) == ptr)
+                .ok_or_else(|| Error {
+                    message: format!(
+                        "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, \
+                         so the buffer it names has no binding and no placement",
+                        f.name
+                    ),
+                })?;
+            k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+                message: format!("{}: parameter {i} has no bound buffer", f.name),
+            })
+        };
+        let value_tid = param_tid(0, "gathered")?;
+        let index_tid = param_tid(1, "index")?;
+        if value_tid == index_tid {
+            return err(format!(
+                "{}: the gather's index view and the tensor it gathers are the SAME parameter \
+                 (t{value_tid}) — one HBM allocation cannot be both this gather's `index_tensor` and \
+                 its `value_tensor`, which is the bidirectional `relatedIndirectAccessAlloc_` pair dbo \
+                 follows in both directions.",
+                f.name
+            ));
+        }
+        let (entries, _) = shape_2d(tile).ok_or_else(|| Error {
+            message: format!(
+                "{}: the indirect access tile states no 2-D `shape`, so the number of gathered \
+                 entries is unknown",
+                f.name
+            ),
+        })?;
+        // ⭐⭐⭐ THE TRIP'S ANCHOR — where this tile's run of entries starts in the index buffer.
+        // `dim_kinds[0]` is `"indirect"` and its `dim_subs[0]` is `Add(Sym(0), Dim(0))`: enumeration
+        // row `Dim(0)` reads index word `Sym(0) + row`, with `Sym(0)` named by `intermediate_vars[0]`.
+        // A one-block program states 0 (folded away or cast, both of which `index_constants`
+        // resolves); an unrolled sweep's trip `b` states `b · BLOCK_N`, and this walk refuses a
+        // tile whose anchor is NOT a constant by name rather than gathering from index word 0 —
+        // the silent wrong-row shape `EntryBase` exists to make unrepresentable at the emitter.
+        let first_entry = {
+            let kinds = tile.attr(AttrKey::DimKinds);
+            let vars = tile.attr(AttrKey::IntermediateVars);
+            let subs = tile.attr(AttrKey::DimSubs);
+            let (
+                Some(Attr::StrList(kinds)),
+                Some(Attr::Ssas(vars)),
+                Some(Attr::AffineMapList(subs)),
+            ) = (kinds, vars, subs)
+            else {
+                return err(format!(
+                    "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
+                     triple, so where its run of entries starts in the index buffer is unknown — the \
+                     gather would read index word 0 by default",
+                    f.name
+                ));
+            };
+            let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
+                return err(format!(
+                    "{}: an indirect access tile states no `indirect` dim, so no subscript names the \
+                     index buffer it reads",
+                    f.name
+                ));
+            };
+            let Some(sub) = subs.get(d) else {
+                return err(format!(
+                    "{}: the indirect access tile's dim {d} carries no `dim_subs` map",
+                    f.name
+                ));
+            };
+            // ⛔ THE SUBSCRIPT MUST BE `Sym(0) + Dim(0)` AND NOTHING ELSE — the one form
+            // `gather_subscripts` builds and the one this reading can fold into an entry base. A
+            // tile with a scaled or second-symbol subscript names a different addressing program,
+            // and guessing its constant is an address; refusing names the map.
+            let anchor = match sub.exprs.first() {
+                Some(AffineExpr::Add(a, b)) => match (a, b) {
+                    (AffineExpr::Sym(i), AffineExpr::Dim(j)) if *i < vars.len() && *j == 0 => {
+                        consts.get(&vars[*i]).copied()
+                    }
+                    (AffineExpr::Dim(j), AffineExpr::Sym(i)) if *i < vars.len() && *j == 0 => {
+                        consts.get(&vars[*i]).copied()
+                    }
+                    _ => None,
+                },
+                Some(AffineExpr::Dim(j)) if *j == 0 => Some(0),
+                _ => None,
+            };
+            let Some(anchor) = anchor else {
+                return err(format!(
+                    "{}: the indirect access tile's subscript for dim {d} is not the form this \
+                     reader folds (`Sym(0) + Dim(0)` with `Sym(0)` a constant, or a bare `Dim(0)`), so \
+                     where this gather's entries start in the index buffer is unknown — the gather \
+                     would read index word 0 by default. State the trip's anchor as a constant.",
+                    f.name
+                ));
+            };
+            if anchor < 0 || anchor > u32::MAX as i64 {
+                return err(format!(
+                    "{}: the indirect access tile's index anchor is {anchor}, which is not a u32 \
+                     entry count",
+                    f.name
+                ));
+            }
+            anchor as u32
+        };
+        // ⛔ THE ONE NEW DISCRIMINATOR: every tile must name the SAME parameter pair. A second
+        // pair really is two gathers on one descriptor-shaped program — the shape `gather_of`
+        // exists to refuse — and refusing it HERE names the pair instead of letting the walk
+        // half-materialize one of them.
+        if out
+            .first()
+            .is_some_and(|first| first.index_tid != index_tid || first.value_tid != value_tid)
+        {
+            return err(format!(
+                "{}: {} `ktdp.construct_indirect_access_tile` op(s) over {} different \
+                 index/value parameter pairs — one descriptor carries ONE index operand \
+                 (DSC2ToDataflowIR.cpp:51), so gathers over different buffers need one node \
+                 per gather. Tiles over the SAME pair (an unrolled sweep's trips) are fine.",
+                f.name,
+                tile_count,
+                out.len() + 1
+            ));
+        }
+        out.push(Gather {
+            index_tid,
+            value_tid,
+            entries,
+            first_entry,
+        });
+    }
+    Ok(out)
 }
 
 /// ⛔⛔⛔ THE GUARD FOR THE FACT THIS FILE USED TO DROP: an operand this emitter addresses at the
@@ -614,7 +812,7 @@ fn scale_idx_of(layout: Option<&BundleLayout>, tid: u32) -> Option<usize> {
 /// output's rows, `out` from its cols (`is_stick`), a size-1 `y`, and `n_operands` from the operand
 /// count — pure shape, nothing that needs the node. `in`(K) is added for a matmul, and a ScalarMul's
 /// `out` is the DEVICE width. Those are the three arms, and they are the three arms here.
-fn pointwise_tile_op(rows: u32, cols: u32, n_operands: u32) -> TileOp {
+pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, n_operands: u32) -> TileOp {
     TileOp {
         kind: TileOpKind::PointwiseOrReduce { n_operands },
         dims: vec![
@@ -3609,6 +3807,7 @@ pub fn matmul(
         layout,
         quantized,
         super::whole_function::BOrient::TransposeB,
+        false,
     )
 }
 
@@ -3621,6 +3820,10 @@ pub fn matmul_oriented(
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
     b: super::whole_function::BOrient,
+    // ⛔ TRUE when this call is the WHOLE-FUNCTION DOOR's, so the operands are one WINDOW of the
+    // caller's parameters rather than a staged whole tensor — the fact the spurious-pad drop below
+    // discriminates on (see its note). The per-`Program` door passes `false`.
+    windowed_program: bool,
 ) -> Result<Vec<EmittedOp>, Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
     let [out] = outs[..] else {
@@ -3766,7 +3969,28 @@ pub fn matmul_oriented(
     // `vocab = n` (contiguous, m=1). ONLY the on-device layout uses `n_dev` (a whole stick by construction).
     // TYPE-SAFE device width (the padding/alignment invariant): `DeviceWidth::for_output` is the SOLE
     // rule, SHARED with the worker's weight zero-pad + `kernel0`, so they cannot diverge.
-    let n_dev = DeviceWidth::for_output(m, n, k).get();
+    let mut n_dev = DeviceWidth::for_output(m, n, k).get();
+    // ⛔ A WHOLE-FUNCTION WINDOWED PROGRAM MAY NOT TAKE A PAD ITS PARAMETER WINDOWS CANNOT HOLD.
+    //
+    // `bump_sticks_to_splittable` decides the pad from the STICK COUNT alone (n=64 is one stick ⇒
+    // bumps to 512), but guard #11's own floor test is `CoreSplit::plan(m, n_dev)` — a split that
+    // ROW-SPLITS first. At m=64, n=64 the LOGICAL width already gives `plan(64,64) = 32 cores`: the
+    // util floor is met and the pad is spurious. And on a whole-function program the padded weight
+    // columns are read from the CALLER'S windows: the last `[k, 64]` n-window of a `[4096, 12800]`
+    // weight at `n_dev = 512` reads columns 12544..13056 of a 12800-wide placement — MEASURED as
+    // `resolve_seg_base`'s refusal on granite tiled_k BLOCK_N=64 (`t1: 103022592B + 2097152B exceeds
+    // footprint 104857600B`). The staged-buffer contract the bump exists for (the worker's weight
+    // zero-pad makes the pad real) does not exist here — the second party on this door is the mint,
+    // and the mint only ever sees ONE window.
+    //
+    // So the pad is dropped under exactly `out_width_the_weight_holds`'s own discipline: only when
+    // the LOGICAL width still meets the util floor the pad was buying (the same `floor_ok` the base
+    // emission's cap re-checks), so a width that genuinely needs the pad keeps it and reaches the
+    // windowed arm's own pad refusal by name. No-op for every staged program (their widths come
+    // pre-padded from `for_output` and their weights' placements hold the pad by contract).
+    if windowed_program && n_dev > n && CoreSplit::plan(m, n).ncores() >= 8 {
+        n_dev = n;
+    }
     let macs = m as u64 * n_dev as u64 * k as u64;
     // ── GUARD #11 (util floor) computed on the PROVEN partition `CoreSplit::plan` (Kani: disjoint +
     //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for
@@ -4929,6 +5153,7 @@ pub fn scalarmul_at(
                 inputs: &gathered_inputs,
                 gathered_input: 1,
                 index_name: &crate::place::act_name(g.index_tid),
+                first_entry: g.first_entry,
                 o: &rbo(&out_name),
             },
             sym_id_base,
@@ -4938,6 +5163,128 @@ pub fn scalarmul_at(
         // with more entries than that is a leg per stick — each writing its own row window of the
         // output in place. `assemble_pointwise_broadcast_gather` owns that cut, and the node's own
         // 32-entry ceiling with it, so nothing here counts entries.
+        .map_err(Error::from);
+    }
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &op_name,
+        &tile_op,
+        "multiply",
+        rows,
+        cols,
+        &inputs,
+        &rbo(&out_name),
+        0,
+        sym_id_base,
+        layout,
+    )])
+}
+
+/// THE RUNG-3 BODY: a scalar multiply whose multiplier is a LAUNCH BINDING, not a baked value.
+///
+/// Same emission as [`scalarmul_at`] — the descriptor is identical, `In::scalar` over the bound
+/// `[1,1]` const — with the ONE difference that matters: the scale's operand NAME is the
+/// parameter's own binding tid (`In::scalar(&rbo(&act_name(tid)))`), so the value the card
+/// multiplies by is whatever the launch bound at `const:t<tid>`, read at RUN TIME.
+///
+/// ⛔ THE SLOT IS THE TID, NOT A REGISTRY INDEX. `scalarmul_at` looks its multiplier up in
+/// `BundleLayout::scalarmul_scales` BY BITS (`scale_slot`), which is exact for a baked constant
+/// and wrong for a bound one: nothing at bake time knows the launch's value, and the registry is
+/// empty on this path (`scales_for_program_shape` registers only constant-backed splats). The
+/// scale's ADDRESS is the parameter's placement — 2 B, `SegRole::Activation`, placed by the
+/// `[1,1]`-region arm in `triton-ktir-superdsc`'s `for_regions` — and the runner's `const:t<id>`
+/// bind fills it.
+///
+/// ⛔ AND THE `[1,1]` REGION MUST NOT COUNT AS ARITY. `split_out_excluding` drops scale regions
+/// by RESERVED tid (`scale_idx_of`); a positional binding is not one, so this body passes the
+/// bound scale's tid in `skip_tids` explicitly — one filter, the same mechanism, keyed by the
+/// fact this body owns.
+pub fn scalarmul_bound(
+    name: &str,
+    bound: &crate::emit::whole_function::BoundScale,
+    // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
+    // answer, so the whole-function door and the per-`Program` door cannot disagree about whether a
+    // node gathers.
+    gather: Option<Gather>,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The bound scale is an ADDRESSING operand of the op, not a tensor input — the same rule
+    // the gather's index follows, and for the same reason: nothing about the descriptor's
+    // tensor arity changes because a number arrives by binding.
+    let mut skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
+    skip.push(bound.tid);
+    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
+    let x = ins[0].name();
+    let out_name = out.name();
+    let rows = node_rows(name, &out)?;
+    // DEVICE width, the same padding invariant [`scalarmul_at`] states: the producer's width,
+    // capped at what the output's placement holds.
+    let cols = pointwise_width_the_output_holds(
+        layout,
+        &[&out_name, &x],
+        rows,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    );
+    let scale_name = crate::place::act_name(bound.tid);
+    let op_name = format!("scalarmul_o{}", out.tid);
+    let x_h = rbo(&x);
+    let scale_h = rbo(&scale_name);
+    let inputs = [In::full(&x_h).ew(), In::scalar(&scale_h).ew()];
+    let mut tile_op = pointwise_tile_op(rows, cols, 2);
+    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
+    if let Some(g) = gather {
+        if g.value_tid != ins[0].tid {
+            return err(format!(
+                "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
+                 operand must sit immediately after the tensor it indexes, so a gather of a tensor this \
+                 op does not read has no position in the descriptor.",
+                g.value_tid, ins[0].tid,
+            ));
+        }
+        if g.entries == 0 || !rows.is_multiple_of(g.entries) {
+            return err(format!(
+                "{name}: the indirect access tile takes {} entries and the node writes {rows} row(s), \
+                 which {} does not divide. The emitted descriptor spans the whole node, so the work \
+                 items have to TILE it — the same obligation `node_rows` puts on the store windows.",
+                g.entries, g.entries,
+            ));
+        }
+        let idx_r = r.iter().find(|x| x.tid == g.index_tid).ok_or_else(|| Error {
+            message: format!(
+                "{name}: the program gathers through t{}, which is not one of this node's parameters — \
+                 an index buffer with no binding has no placement and no stated length",
+                g.index_tid
+            ),
+        })?;
+        let idx_len = (idx_r.v_rows as u64) * (idx_r.v_cols as u64);
+        if idx_len != rows as u64 {
+            return err(format!(
+                "{name}: the index buffer t{} states a `[{}, {}]` view — {idx_len} index(es) — while \
+                 this descriptor gathers {rows} row(s). The index operand is described rank-1 over the \
+                 op's `mb`, so dbo's idx→address program converts exactly {rows} entries: a shorter \
+                 buffer is read past its end and the surplus rows gather from whatever is placed next. \
+                 Emit one node per work item, or bind an index buffer covering the node.",
+                g.index_tid, idx_r.v_rows, idx_r.v_cols,
+            ));
+        }
+        let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
+        return crate::emit::assemble_pointwise_broadcast_gather(
+            crate::emit::PointwiseGather {
+                op_name: &op_name,
+                tile_op: &tile_op,
+                op_func: "multiply",
+                rows,
+                cols,
+                inputs: &gathered_inputs,
+                gathered_input: 1,
+                index_name: &crate::place::act_name(g.index_tid),
+                first_entry: g.first_entry,
+                o: &rbo(&out_name),
+            },
+            sym_id_base,
+            layout,
+        )
         .map_err(Error::from);
     }
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
