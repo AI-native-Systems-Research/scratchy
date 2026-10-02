@@ -4971,10 +4971,37 @@ const THREADS_PER_GROUP: u32 = 256;
 /// function constants 0 / 1 / 2 and one simdgroup per 8×8 output tile, grid
 /// `(⌈N/8⌉, ⌈M/8⌉, 1)`. M is baked, never rescaled at runtime: tiles past the live rows compute
 /// rows nothing reads. Bindings: output 0, input 1, weight 2.
+///
+/// One row (`M == 1`, at least a block of outputs) is a matrix-vector product: MLX's GEMV,
+/// `gemv_{f16,bf16}_specialized` beside the fused decode MLP it shares its body with — M / N / K
+/// as that library's constants 3 / 4 / 5, a threadgroup of 256 threads per `MLP_DECODE_BLOCK_M`
+/// outputs, the same bindings.
 pub fn gemm_command(dtype: MetalDtype, dims: GemmDims, bindings: Vec<Binding>) -> LoweredCommand {
     const TILE: u32 = 8;
     const SIMDGROUP: u32 = 32;
     let GemmDims { m, n, k } = dims;
+    if m == 1 && n >= MLP_DECODE_BLOCK_M {
+        return LoweredCommand {
+            kernel: KernelId::Gemm,
+            library: "fused_gate_up_silu_mul",
+            function: pick_specialized_symbol(
+                "gemv_f16_specialized",
+                "gemv_bf16_specialized",
+                dtype,
+            ),
+            constants: baked(vec![
+                ConstantValue::uint(3, m),
+                ConstantValue::uint(4, n),
+                ConstantValue::uint(5, k),
+            ]),
+            dispatch: DispatchShape {
+                threadgroups: (n.div_ceil(MLP_DECODE_BLOCK_M), 1, 1),
+                threads_per_threadgroup: (256, 1, 1),
+                m_scaling: None,
+            },
+            bindings: baked(bindings),
+        };
+    }
     LoweredCommand {
         kernel: KernelId::Gemm,
         library: "gemm",

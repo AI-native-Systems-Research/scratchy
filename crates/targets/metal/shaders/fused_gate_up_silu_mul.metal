@@ -271,10 +271,12 @@ struct FusedMlpDecodeFc {
 // Body shared by the dispatch kernels and the megakernel adapter, after the caller's `M == 1`
 // check. `MK` = played inside the megakernel: a thread past the rows (`live` false) skips the
 // work instead of returning, so every thread of the megakernel's threadgroup reaches the
-// reduction's barrier. The caller declares the per-thread state — the zeroed TM accumulators
-// `gate_result` / `up_result` and the TN staging buffers — and `tgp_gate` / `tgp_up`, the
-// reduction's `BN * (blockM + TM)` floats each.
-template <typename T, typename C, bool MK, typename OP, typename IP>
+// reduction's barrier. `UP`: the fused gate+up pass; without it, MLX's plain GEMV
+// `output = weight @ input` over the gate rows alone (the `up_*` arguments unread). The caller
+// declares the per-thread state — the zeroed TM accumulators `gate_result` / `up_result` and the
+// TN staging buffers — and `tgp_gate` / `tgp_up`, the reduction's `BN * (blockM + TM)` floats
+// each.
+template <typename T, typename C, bool MK, bool UP, typename OP, typename IP>
 METAL_FUNC void fused_mlp_decode_body(
     OP output, IP input, device const T* weight, uint3 tid, uint simd_gid, uint simd_lid,
     bool live, uint N, uint K, thread float* gate_result, thread float* up_result,
@@ -343,13 +345,13 @@ METAL_FUNC void fused_mlp_decode_body(
                 MLX_MTL_PRAGMA_UNROLL
                 for (int tn = 0; tn < TN; tn++) {
                     gate_buf[tn] = gate_mat[mat_offset + bn + tn];
-                    up_buf[tn]   = up_mat  [mat_offset + bn + tn];
+                    if constexpr (UP) up_buf[tn] = up_mat[mat_offset + bn + tn];
                 }
                 // Accumulate.
                 MLX_MTL_PRAGMA_UNROLL
                 for (int tn = 0; tn < TN; tn++) {
                     gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
-                    up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+                    if constexpr (UP) up_result[tm] += float(up_buf[tn]) * float(in_buf[tn]);
                 }
                 mat_offset += int(matrix_ld);
             }
@@ -370,14 +372,16 @@ METAL_FUNC void fused_mlp_decode_body(
                     gate_buf[tn] = (bn + tn < K_int)
                         ? gate_mat[tm * int(matrix_ld) + bn + tn]
                         : T(0);
-                    up_buf[tn] = (bn + tn < K_int)
-                        ? up_mat  [tm * int(matrix_ld) + bn + tn]
-                        : T(0);
+                    if constexpr (UP) {
+                        up_buf[tn] = (bn + tn < K_int)
+                            ? up_mat  [tm * int(matrix_ld) + bn + tn]
+                            : T(0);
+                    }
                 }
                 MLX_MTL_PRAGMA_UNROLL
                 for (int tn = 0; tn < TN; tn++) {
                     gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
-                    up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+                    if constexpr (UP) up_result[tm] += float(up_buf[tn]) * float(in_buf[tn]);
                 }
             }
         }
@@ -388,7 +392,7 @@ METAL_FUNC void fused_mlp_decode_body(
             MLX_MTL_PRAGMA_UNROLL
             for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
                 gate_result[tm] += simd_shuffle_down(gate_result[tm], sn);
-                up_result[tm]   += simd_shuffle_down(up_result[tm], sn);
+                if constexpr (UP) up_result[tm] += simd_shuffle_down(up_result[tm], sn);
             }
         }
     }
@@ -401,7 +405,7 @@ METAL_FUNC void fused_mlp_decode_body(
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
             gate_results[tm] = gate_result[tm];
-            up_results[tm]   = up_result[tm];
+            if constexpr (UP) up_results[tm] = up_result[tm];
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -412,19 +416,23 @@ METAL_FUNC void fused_mlp_decode_body(
             MLX_MTL_PRAGMA_UNROLL
             for (int tm = 0; tm < TM; tm++) {
                 gate_result[tm] += tgp_gate[sgn * (blockM + TM) + bm + tm];
-                up_result[tm]   += tgp_up  [sgn * (blockM + TM) + bm + tm];
+                if constexpr (UP) up_result[tm] += tgp_up[sgn * (blockM + TM) + bm + tm];
             }
         }
 
-        // SwiGLU epilogue + write.
+        // SwiGLU epilogue + write (the GEMV: the sums as they are).
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
             const float g = gate_result[tm];
-            const float u = up_result[tm];
-            const float act = C::is_gelu()
-                ? gelu_approx(g)
-                : g / (1.0f + exp(-g));
-            output[out_row + tm] = T(act * u);
+            if constexpr (UP) {
+                const float u = up_result[tm];
+                const float act = C::is_gelu()
+                    ? gelu_approx(g)
+                    : g / (1.0f + exp(-g));
+                output[out_row + tm] = T(act * u);
+            } else {
+                output[out_row + tm] = T(g);
+            }
         }
     }
 }
@@ -437,11 +445,23 @@ MK_FUNC void mk_fused_mlp_decode(thread const MkStep& s, MkLane l, threadgroup u
     thread float up_result  [4] = {0};
     thread T in_buf[4], gate_buf[4], up_buf[4];
     threadgroup float* gate = (threadgroup float*)mk_region(s, l, tg);
-    fused_mlp_decode_body<T, C, true>((mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1],
-                                      (device const T*)s.addr[2], l.tg_pos, l.simd_gid,
-                                      l.simd_lid, l.live && C::m() == 1u, C::n(), C::k(),
-                                      gate_result, up_result, in_buf, gate_buf, up_buf, gate,
-                                      gate + 64);
+    fused_mlp_decode_body<T, C, true, true>((mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1],
+                                            (device const T*)s.addr[2], l.tg_pos, l.simd_gid,
+                                            l.simd_lid, l.live && C::m() == 1u, C::n(), C::k(),
+                                            gate_result, up_result, in_buf, gate_buf, up_buf,
+                                            gate, gate + 64);
+}
+
+// The plain GEMV's adapter: the reduction (64 floats) in its region.
+template <typename T, typename C>
+MK_FUNC void mk_gemv(thread const MkStep& s, MkLane l, threadgroup uchar* tg) {
+    thread float result[4] = {0};
+    thread T in_buf[4], buf[4];
+    threadgroup float* tgp = (threadgroup float*)mk_region(s, l, tg);
+    fused_mlp_decode_body<T, C, true, false>((mk_ptr<T>)s.addr[0], (mk_cptr<T>)s.addr[1],
+                                             (device const T*)s.addr[2], l.tg_pos, l.simd_gid,
+                                             l.simd_lid, l.live && C::m() == 1u, C::n(), C::k(),
+                                             result, result, in_buf, buf, buf, tgp, tgp);
 }
 
 #ifndef MK_BODIES_ONLY
@@ -466,15 +486,36 @@ MK_FUNC void mk_fused_mlp_decode(thread const MkStep& s, MkLane l, threadgroup u
     thread T up_buf  [4];                                                                 \
     threadgroup float tgp_gate[8 * (4 + 4)];                                              \
     threadgroup float tgp_up  [8 * (4 + 4)];                                              \
-    fused_mlp_decode_body<T, FusedMlpDecodeFc, false>(output, input, weight, tid,         \
+    fused_mlp_decode_body<T, FusedMlpDecodeFc, false, true>(output, input, weight, tid,   \
                                                       simd_gid, simd_lid, true, N, K,     \
                                                       gate_result, up_result, in_buf,     \
                                                       gate_buf, up_buf, tgp_gate, tgp_up); \
+  }                                                                                       \
+  kernel void gemv_##tag##_specialized(                                                   \
+      device       T* output  [[buffer(0)]],                                              \
+      device const T* input   [[buffer(1)]],                                              \
+      device const T* weight  [[buffer(2)]],                                              \
+      uint3 tid     [[threadgroup_position_in_grid]],                                     \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                                  \
+      uint  simd_lid [[thread_index_in_simdgroup]])                                       \
+  {                                                                                       \
+    if (FUSED_MLP_DECODE_M != 1u) return;                                                 \
+    thread float result[4] = {0};                                                         \
+    thread T in_buf[4];                                                                   \
+    thread T buf[4];                                                                      \
+    threadgroup float tgp[8 * (4 + 4)];                                                   \
+    fused_mlp_decode_body<T, FusedMlpDecodeFc, false, false>(                             \
+        output, input, weight, tid, simd_gid, simd_lid, true, FUSED_MLP_DECODE_N,         \
+        FUSED_MLP_DECODE_K, result, result, in_buf, buf, buf, tgp, tgp);                  \
   }
 #else
+// The plain GEMV streams its weights: a virtual threadgroup reads its 4 rows of `k` (slot 5)
+// 16-bit values, of `n` (slot 4) rows; bound output 0, input 1, weights 2.
 #define INST_FUSED_MLP_DECODE(tag, T)                                                     \
   MK_ADAPTER(fused_gate_up_silu_mul_decode_##tag##_specialized, 512,                      \
-             (mk_fused_mlp_decode<T, MK_C>), FUSED_MLP_DECODE_CONSTS)
+             (mk_fused_mlp_decode<T, MK_C>), FUSED_MLP_DECODE_CONSTS)                     \
+  MK_STREAMING(gemv_##tag##_specialized, 256, 4, 16, 1, 0, 5, 4, 2, 255, 255, 1, 0, 0x1,  \
+               (mk_gemv<T, MK_C>), (mk_gemv<T, MK_C>), FUSED_MLP_DECODE_CONSTS)
 #endif
 
 // f16 and the BF16 translation (`bfloat` device pointers and thread-local buffers; accumulators

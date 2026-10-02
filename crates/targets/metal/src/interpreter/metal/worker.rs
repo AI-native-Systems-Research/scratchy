@@ -1993,7 +1993,7 @@ mod tests {
     }
 
     /// A tape carrying one `KernelId::Gemm` command bakes to an MTL4
-    /// `Dispatch` step (the `gemm_{f16,bf16}_specialized` kernel), so the
+    /// `Dispatch` step (at one row, the `gemv_{f16,bf16}_specialized` kernel), so the
     /// bucket is MTL4-eligible (`mtl4_steps` is `Some`). There is no
     /// longer an MPS / classic-command-buffer GEMM path.
     #[test]
