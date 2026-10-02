@@ -275,19 +275,6 @@ jobs:
           --features e2e,metal,scratchy-models/smollm2-135m
           --test e5_gemma4_tool_parser -- --ignored --test-threads=1
 
-      # REGRESSION GUARD — the Anthropic `/v1/messages` path Claude Code talks
-      # to, over the Claude-Code-shaped corpus in e_anthropic.rs: tool schemas,
-      # system blocks, `cache_control` breakpoints, and a turn carrying a prior
-      # `tool_use` + `tool_result`. That last shape is every Claude Code turn
-      # after the first, and it 500'd on EVERY model whose chat template writes
-      # `message['content']` unguarded (#194) while CI stayed green, because no
-      # CI step ran this file. Shares the SmolLM build above.
-      - name: E2E Anthropic messages (metal, SmolLM-135M)
-        timeout-minutes: 15
-        run: cargo test -p scratchy-e2e -p scratchy-models
-          --features e2e,metal,scratchy-models/smollm2-135m
-          --test e_anthropic -- --ignored --test-threads=1
-
       # REGRESSION GUARD — gemma-4 hd512 unfused attention on a chunked-prefill
       # CONTINUATION (> 2048-token prompt → chunk 2 has lq != kv_len). This is the ONLY
       # test that catches the NAX-gemm K-tail / padding-row class of bug: a short prompt

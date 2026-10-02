@@ -4,6 +4,18 @@
 //! E2E tests for the Anthropic `/v1/messages` endpoint.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e --test e_anthropic -- --ignored`
+//!
+//! NOT a CI step, and not for want of trying: `runs-on: macos-26` is a hosted
+//! runner with no Metal 4, so every GPU-booting e2e test skips there — and on a
+//! machine that *does* have Metal, `TestModels::SMOLLM` resolves to
+//! `mlx-community/SmolLM-135M-Instruct-4bit`, which is SmolLM **v1**
+//! (`LlamaForCausalLM`) and fails to load against the `smollm2-135m` config
+//! stem CI compiles ("Unsupported arch `LlamaForCausalLM`", with or without an
+//! MLX quant preset). That is pre-existing and hits `e1_basic_serving`'s
+//! in-CI SmolLM step identically, so the metal e2e steps are effectively
+//! compile-checks. Until that model constant is sorted out, the CI-enforced
+//! guard for the tool-call render path is the `chat_template` unit test, which
+//! needs no GPU; these stay the on-hardware check.
 
 #![cfg(feature = "e2e")]
 
@@ -130,6 +142,7 @@ async fn run_tools_corpus(client: &Client) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_simple_message() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -156,6 +169,7 @@ async fn test_anthropic_simple_message() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_with_system() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -175,6 +189,7 @@ async fn test_anthropic_with_system() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_system_blocks() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -192,6 +207,7 @@ async fn test_anthropic_system_blocks() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_multi_turn() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -215,6 +231,7 @@ async fn test_anthropic_multi_turn() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_content_blocks() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -237,6 +254,7 @@ async fn test_anthropic_content_blocks() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_temperature() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -254,6 +272,7 @@ async fn test_anthropic_temperature() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_stop_sequences() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -276,6 +295,7 @@ async fn test_anthropic_stop_sequences() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_max_tokens_respected() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -299,6 +319,7 @@ async fn test_anthropic_max_tokens_respected() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_streaming() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let events = client
@@ -369,6 +390,7 @@ async fn test_anthropic_streaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_streaming_with_system() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let events = client
@@ -393,6 +415,7 @@ async fn test_anthropic_streaming_with_system() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_missing_max_tokens() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     // max_tokens is required in Anthropic API
@@ -413,6 +436,7 @@ async fn test_anthropic_missing_max_tokens() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_anthropic_empty_messages() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -447,6 +471,7 @@ async fn test_anthropic_empty_messages() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_tools_corpus_is_served() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
     let texts = run_tools_corpus(&client).await;
     assert_eq!(texts.len(), tools_corpus().len());
@@ -456,6 +481,7 @@ async fn test_tools_corpus_is_served() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_tools_request_returns_a_message() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
 
     let resp = client
@@ -479,6 +505,7 @@ async fn test_tools_request_returns_a_message() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_model_less_tools_request_is_served() {
+    scratchy_e2e::skip_if_no_gpu!();
     let (_server, client) = start_smollm().await;
     let body = json!({
         "max_tokens": 16,
