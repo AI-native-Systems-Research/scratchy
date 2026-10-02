@@ -2901,9 +2901,13 @@ pub fn emit_sdsc(
                     dataFormat_: Fp16::NAME,
                     fidelity_: "regular",
                 },
-                // The golden's biasadd entry carries `"location": "invalid"` (vs the matmul's "Inner") —
-                // mirrored verbatim rather than guessed.
-                location: "invalid",
+                // The golden's biasadd entry historically carried `"location": "invalid"`, mirrored
+                // verbatim — but `"invalid"` is not a member of deeptools' `LoopNames` enum
+                // (dscdefn.h:48; its string table is Inner/dbin/dbout/...), and the dev stack's
+                // new SDSC-JSON validator rejects it outright ("Must be 'Inner'"). The epilogue
+                // runs in the same loop nest as its matmul, so "Inner" — the same location every
+                // other computeOp in a bundle carries — is also the semantically right value.
+                location: "Inner",
                 auxLoopName: None,
                 isAtMainLoop: None,
                 isAtTop: None,
