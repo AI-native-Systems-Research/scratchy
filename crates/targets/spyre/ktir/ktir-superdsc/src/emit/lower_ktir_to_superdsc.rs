@@ -189,86 +189,18 @@ pub struct Gather {
 /// out of the buffer it indexes is a self-reference the alloc pair cannot express (one alloc node cannot
 /// be both `index_tensor` and `value_tensor`), and it is also certainly a producer bug.
 pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
-    let f = &k.func;
-    let tiles: Vec<&Operation<'_>> = f
-        .operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
-        .collect();
-    let tile = match tiles[..] {
-        [] => return Ok(None),
-        [one] => one,
-        _ => {
-            return err(format!(
-                "{}: {} `ktdp.construct_indirect_access_tile` op(s). One descriptor carries ONE index \
-                 operand, paired with the tensor it gathers by POSITION (the index sits immediately \
-                 after it, which is what `DSC2ToDataflowIR.cpp:51` requires), and two indices cannot \
-                 both be adjacent to their own operand. Split the program into one node per gather.",
-                f.name,
-                tiles.len()
-            ));
-        }
-    };
-    // Parameter of the view an operand of this tile reads: tile -> view -> parameter -> its binding.
-    let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
-        let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
-            message: format!(
-                "{}: the indirect access tile states no {what} operand — a gather needs both the \
-                 tensor it reads and the index vector that chooses the rows",
-                f.name
-            ),
-        })?;
-        let view = f
-            .operations
-            .iter()
-            .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
-            .ok_or_else(|| Error {
-                message: format!(
-                    "{}: the indirect access tile's {what} operand is not a \
-                     `ktdp.construct_memory_view`, so no parameter can be named for it",
-                    f.name
-                ),
-            })?;
-        let ptr = view.operands.first().copied();
-        let i = f
-            .arguments
-            .iter()
-            .position(|(a, _)| Some(*a) == ptr)
-            .ok_or_else(|| Error {
-                message: format!(
-                    "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, so \
-                     the buffer it names has no binding and no placement",
-                    f.name
-                ),
-            })?;
-        k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
-            message: format!("{}: parameter {i} has no bound buffer", f.name),
-        })
-    };
-    let value_tid = param_tid(0, "gathered")?;
-    let index_tid = param_tid(1, "index")?;
-    if value_tid == index_tid {
-        return err(format!(
-            "{}: the gather's index view and the tensor it gathers are the SAME parameter (t{value_tid}) \
-             — one HBM allocation cannot be both this gather's `index_tensor` and its `value_tensor`, \
-             which is the bidirectional `relatedIndirectAccessAlloc_` pair dbo follows in both \
-             directions.",
-            f.name
-        ));
+    let mut all = gathers_of(k)?;
+    match all.len() {
+        0 => Ok(None),
+        1 => Ok(Some(all.remove(0))),
+        n => err(format!(
+            "{}: {n} `ktdp.construct_indirect_access_tile` op(s). One descriptor carries ONE index \
+             operand, paired with the tensor it gathers by POSITION (the index sits immediately \
+             after it, which is what `DSC2ToDataflowIR.cpp:51` requires), and two indices cannot \
+             both be adjacent to their own operand. Split the program into one node per gather.",
+            k.func.name,
+        )),
     }
-    let (entries, _) = shape_2d(tile).ok_or_else(|| Error {
-        message: format!(
-            "{}: the indirect access tile states no 2-D `shape`, so the number of gathered entries is \
-             unknown",
-            f.name
-        ),
-    })?;
-    Ok(Some(Gather {
-        index_tid,
-        value_tid,
-        entries,
-        first_entry: 0,
-    }))
 }
 
 /// ⭐⭐⭐ EVERY `Gather` THE PROGRAM STATES, ONE PER INDIRECT TILE — the multi-gather reading.
