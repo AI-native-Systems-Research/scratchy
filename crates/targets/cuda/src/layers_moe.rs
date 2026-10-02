@@ -388,6 +388,7 @@ pub trait Gemma4RouterOps {
         num_experts: usize,
         hidden_size: usize,
         group_size: u32,
+        bits: u32,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;

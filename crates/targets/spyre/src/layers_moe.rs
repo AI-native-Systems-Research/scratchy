@@ -165,6 +165,7 @@ pub trait Gemma4RouterOps {
         num_experts: usize,
         hidden_size: usize,
         group_size: u32,
+        bits: u32,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -178,6 +179,7 @@ impl Gemma4RouterOps for GemmaRouterLayer {
         _num_experts: usize,
         _hidden_size: usize,
         _group_size: u32,
+        _bits: u32,
     ) -> anyhow::Result<Self> {
         anyhow::bail!("scratchy-target-spyre: GemmaRouterLayer load not yet implemented")
     }

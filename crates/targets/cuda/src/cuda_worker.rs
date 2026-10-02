@@ -3501,7 +3501,7 @@ impl Worker for CudaWorker {
         // `arch.as_str()` wins. Auto-registered via
         // `inventory::submit!` at macro expansion — adding a new
         // arch to scratchy-models touches zero lines here.
-        let scratchy_loaded: CudaModel = {
+        let model: CudaModel = {
             let stream = device.compute_stream;
             // Thread a minimal HF-config view into scratchy so per-
             // variant `fingerprint_matches` can disambiguate
@@ -3643,7 +3643,6 @@ impl Worker for CudaWorker {
                 }))
             }
         };
-        let model = scratchy_loaded;
 
         let t_construct = t_construct.elapsed();
 
