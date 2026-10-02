@@ -17,6 +17,7 @@ use minijinja::Environment;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServeError;
+use crate::protocol;
 
 // ---------------------------------------------------------------------------
 // ChatTemplate
@@ -325,24 +326,67 @@ impl ChatTemplate {
     pub fn template_str(&self) -> &str {
         &self.template_str
     }
+
+    /// Render a chat request's messages and tools into a prompt.
+    ///
+    /// **The one implementation.** Two callers reach a template from
+    /// `ChatCompletionRequest`-shaped input — the engine's prompt build and the
+    /// `/tokenize` handler — and each needs the same message normalization
+    /// (see [`message_to_template_value`]) and the same `tool_choice`-aware
+    /// tools rendering. They used to spell it out separately and had already
+    /// drifted: `/tokenize` did none of it, so it reported the token count of a
+    /// prompt the engine would never build, and omitted the tool definitions
+    /// entirely. Anything that has to change here has to change for both, so
+    /// there is one routine rather than two copies to keep in step.
+    pub(crate) fn render_chat(
+        &self,
+        messages: &[protocol::ChatCompletionMessageParam],
+        tools: Option<&Vec<protocol::ChatCompletionToolsParam>>,
+        tool_choice: Option<&serde_json::Value>,
+        extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        add_generation_prompt: bool,
+    ) -> Result<String, ServeError> {
+        let message_values: Vec<serde_json::Value> =
+            messages.iter().map(message_to_template_value).collect();
+
+        // `tool_choice: "none"` means "do not tell the model about the tools",
+        // so the template must not see them at all.
+        let tools_value = match tool_choice {
+            Some(tc) if tc.as_str() == Some("none") => None,
+            _ => tools.and_then(|t| serde_json::to_value(t).ok()),
+        };
+
+        self.apply_with_kwargs(
+            &message_values,
+            add_generation_prompt,
+            tools_value.as_ref(),
+            extra_kwargs,
+        )
+    }
 }
 
-/// Give a serialized chat message the `content` key the serializer omitted.
+/// Turn one `ChatCompletionMessageParam` into the value a template expects.
 ///
-/// `protocol::ChatCompletionMessageParam::content` is
-/// `skip_serializing_if = "Option::is_none"`, so an assistant message carrying
-/// only `tool_calls` — i.e. every "the model called a tool" turn — arrives here
-/// with **no** `content` key at all. A template that writes
-/// `message['content'] + …` (granite 3.3, SmolLM2, and plenty more do, without
-/// guarding the key) then evaluates `string + undefined` and fails, which 500'd
-/// every conversation turn after a tool call.
+/// [`ChatTemplate::apply_with_kwargs`] takes raw JSON, and plain
+/// `serde_json::to_value` is never what a template wants:
 ///
-/// Templates universally expect a string here, so supply the empty one. This
-/// touches only the value handed to the template: the wire format keeps
-/// `content` optional, which is correct per the OpenAI request schema.
-///
-/// Call this at every site that renders messages through a [`ChatTemplate`].
-pub(crate) fn default_absent_content(val: &mut serde_json::Value) {
+/// 1. **`content` may be missing entirely.** The field is
+///    `skip_serializing_if = "Option::is_none"`, so an assistant message
+///    carrying only `tool_calls` — every "the model called a tool" turn —
+///    serializes without the key. A template writing `message['content'] + …`
+///    (granite 3.3, SmolLM2 and plenty more, none of them guarding the key)
+///    then evaluates `string + undefined` and fails. Templates universally
+///    expect a string, so supply the empty one. The wire format keeps `content`
+///    optional, which is correct per the OpenAI schema; only this view changes.
+/// 2. **`tool_calls[].function.arguments` is a JSON *string*** on the wire.
+///    Parsed into an object so templates using `| items` work.
+/// 3. **Image parts arrive as `type: "image_url"`.** Renamed to `"image"`:
+///    Gemma3's template only checks `== "image"`, Qwen2-VL accepts either, and
+///    renaming universally keeps this arch-agnostic — scratchy-serving-api
+///    never names an arch.
+fn message_to_template_value(msg: &protocol::ChatCompletionMessageParam) -> serde_json::Value {
+    let mut val = serde_json::to_value(msg).unwrap_or_default();
+
     if let Some(obj) = val.as_object_mut()
         && !obj.contains_key("content")
     {
@@ -351,6 +395,39 @@ pub(crate) fn default_absent_content(val: &mut serde_json::Value) {
             serde_json::Value::String(String::new()),
         );
     }
+
+    if let Some(tool_calls) = val.get_mut("tool_calls")
+        && let Some(arr) = tool_calls.as_array_mut()
+    {
+        for tc in arr.iter_mut() {
+            if let Some(func) = tc.get_mut("function")
+                && let Some(args) = func.get("arguments")
+                && let Some(args_str) = args.as_str()
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args_str)
+            {
+                func.as_object_mut()
+                    .unwrap()
+                    .insert("arguments".to_string(), parsed);
+            }
+        }
+    }
+
+    if let Some(content) = val.get_mut("content")
+        && let Some(parts) = content.as_array_mut()
+    {
+        for part in parts.iter_mut() {
+            if let Some(obj) = part.as_object_mut()
+                && obj.get("type").and_then(|t| t.as_str()) == Some("image_url")
+            {
+                obj.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("image".to_string()),
+                );
+            }
+        }
+    }
+
+    val
 }
 
 /// Extract a token string from the `bos_token` / `eos_token` field in
@@ -513,7 +590,6 @@ fn day_of_year(year: u64, month: u64, day: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol;
 
     #[test]
     fn test_simple_template() {
@@ -671,17 +747,9 @@ mod tests {
         assert!(result.contains("get_weather"));
     }
 
-    /// A `tool_calls`-only assistant message must render, not blow up.
-    ///
-    /// The real shape: `protocol::ChatCompletionMessageParam` with
-    /// `content: None`, serialized the way the serving paths serialize it. The
-    /// `skip_serializing_if` on `content` drops the key entirely, and a template
-    /// doing `message['content'] + …` then evaluates `string + undefined`. This
-    /// goes through serialization on purpose — testing a hand-written
-    /// `{"content": ""}` literal would not have caught the bug.
-    #[test]
-    fn test_tool_calls_only_message_renders_without_content_key() {
-        let msg = protocol::ChatCompletionMessageParam {
+    /// An assistant message whose arguments the template will try to iterate.
+    fn tool_call_turn() -> protocol::ChatCompletionMessageParam {
+        protocol::ChatCompletionMessageParam {
             role: "assistant".to_string(),
             content: None,
             name: None,
@@ -694,39 +762,113 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
-        };
+        }
+    }
 
-        let mut val = serde_json::to_value(&msg).unwrap();
-        assert!(
-            val.get("content").is_none(),
-            "precondition: the serializer drops a None content"
-        );
-
-        default_absent_content(&mut val);
-        assert_eq!(val["content"], "");
-
-        // The template shape that used to fail: string + content.
+    /// `render_chat` must serve a `tool_calls`-only turn that raw serialization
+    /// cannot — and this shows the difference rather than asserting the fix.
+    ///
+    /// The first half renders the un-normalized value and requires it to FAIL:
+    /// without that, the test would pass just as happily if the normalization
+    /// were deleted, which is exactly the hole in the version it replaces.
+    /// `render_chat` is also the routine the engine and `/tokenize` actually
+    /// call, so deleting the normalization inside it cannot slip past this.
+    #[test]
+    fn test_render_chat_serves_a_tool_call_turn_that_raw_json_cannot() {
+        // A template that writes `content` into a string expression without
+        // guarding the key — granite 3.3 and SmolLM2 both do this.
         let tpl = ChatTemplate::new(
             "{% for message in messages %}{{ message.role }}: {{ message.content + \"|\" }}{% endfor %}"
                 .to_string(),
         )
         .unwrap();
-        let out = tpl.apply(&[val], false, None).unwrap();
+        let msg = tool_call_turn();
+
+        // Raw `to_value` drops `content` entirely (`skip_serializing_if`), and
+        // the template then evaluates `string + undefined`.
+        let raw = serde_json::to_value(&msg).unwrap();
+        assert!(
+            raw.get("content").is_none(),
+            "precondition: the serializer omits a None content"
+        );
+        let err = tpl
+            .apply(&[raw], false, None)
+            .expect_err("rendering the raw value must fail — that is the bug");
+        assert!(
+            format!("{err}").contains("undefined"),
+            "expected a string + undefined failure, got: {err}"
+        );
+
+        // Through the shared routine it renders.
+        let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
         assert_eq!(out, "assistant: |");
+    }
+
+    /// `render_chat` must also parse `function.arguments` and keep real content
+    /// — the other normalizations `/tokenize` silently did without.
+    #[test]
+    fn test_render_chat_parses_tool_call_arguments() {
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}{{ message.tool_calls[0].function.arguments.command }}{% endfor %}"
+                .to_string(),
+        )
+        .unwrap();
+        // Indexing `.command` only works once the JSON *string* is an object.
+        let out = tpl
+            .render_chat(&[tool_call_turn()], None, None, None, false)
+            .unwrap();
+        assert_eq!(out, "ls");
     }
 
     /// Normalization must not overwrite content a message actually has.
     #[test]
-    fn test_present_content_is_left_alone() {
-        let mut val = serde_json::json!({"role": "user", "content": "Hello"});
-        default_absent_content(&mut val);
-        assert_eq!(val["content"], "Hello");
+    fn test_render_chat_leaves_present_content_alone() {
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}[{{ message.content }}]{% endfor %}".to_string(),
+        )
+        .unwrap();
+        let msg = protocol::ChatCompletionMessageParam {
+            role: "user".to_string(),
+            content: Some(serde_json::Value::String("Hello".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let out = tpl.render_chat(&[msg], None, None, None, false).unwrap();
+        assert_eq!(out, "[Hello]");
+    }
 
-        // An explicit null is a present key — leave it to the template, which
-        // is what distinguishes "client sent null" from "serializer omitted it".
-        let mut explicit_null = serde_json::json!({"role": "user", "content": null});
-        default_absent_content(&mut explicit_null);
-        assert!(explicit_null["content"].is_null());
+    /// `tool_choice: "none"` means the template must not see the tools at all.
+    #[test]
+    fn test_render_chat_honours_tool_choice_none() {
+        let tpl =
+            ChatTemplate::new("{% if tools %}TOOLS{% else %}NONE{% endif %}".to_string()).unwrap();
+        let msg = protocol::ChatCompletionMessageParam {
+            role: "user".to_string(),
+            content: Some(serde_json::Value::String("hi".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let tools = vec![protocol::ChatCompletionToolsParam {
+            tool_type: "function".to_string(),
+            function: protocol::FunctionDefinition {
+                name: "Bash".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({"type": "object"})),
+            },
+        }];
+
+        let with = tpl
+            .render_chat(std::slice::from_ref(&msg), Some(&tools), None, None, false)
+            .unwrap();
+        assert_eq!(with, "TOOLS");
+
+        let none = serde_json::Value::String("none".to_string());
+        let without = tpl
+            .render_chat(&[msg], Some(&tools), Some(&none), None, false)
+            .unwrap();
+        assert_eq!(without, "NONE");
     }
 
     #[test]

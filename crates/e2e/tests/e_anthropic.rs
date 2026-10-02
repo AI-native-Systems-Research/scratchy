@@ -148,7 +148,7 @@ async fn test_anthropic_simple_message() {
     assert!(body["content"].is_array());
     assert!(!body["content"].as_array().unwrap().is_empty());
     assert_eq!(body["content"][0]["type"], "text");
-    assert!(body["content"][0]["text"].as_str().unwrap().len() > 0);
+    assert!(!body["content"][0]["text"].as_str().unwrap().is_empty());
     assert!(body["usage"]["input_tokens"].as_u64().unwrap() > 0);
     assert!(body["usage"]["output_tokens"].as_u64().unwrap() > 0);
 }

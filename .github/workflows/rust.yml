@@ -219,14 +219,28 @@ jobs:
       - name: KTIR optimizer tests
         run: cargo test -p ktir-optimizer
 
-      # Tool-call parser logic (Hermes / Llama / Kimi / Mistral / Jamba /
-      # Granite / Gemma-4). Pure-logic unit tests with no GPU dependency —
-      # don't need a real model at runtime, but scratchy-models has no
-      # default model scope (build-time panic otherwise), so name the same
-      # tiny one the SmolLM e2e steps below use, to reuse that build.
-      - name: Tool parser unit tests
+      # Serving-layer unit tests: tool-call parsers (Hermes / Llama / Kimi /
+      # Mistral / Jamba / Granite / Gemma-4), chat-template rendering, the
+      # Anthropic `/v1/messages` translation. Pure logic, no GPU and no real
+      # model at runtime, but scratchy-models has no default model scope
+      # (build-time panic otherwise), so name the same tiny one the SmolLM e2e
+      # steps below use, to reuse that build.
+      #
+      # `serve` is NOT optional here and the run is NOT filtered: without the
+      # feature `anthropic`/`server` are not even compiled, and filtering to
+      # `tool_parser` is how the chat-template regression guard for the
+      # tool-call render 500 (#194) came to exist without CI ever running it.
+      # The e2e steps below need `serve` anyway, so this reuses their build.
+      - name: Serving-layer unit tests
         run: cargo test -p scratchy-serving-api -p scratchy-models
-          --features metal,scratchy-models/smollm2-135m --lib tool_parser
+          --features metal,serve,scratchy-models/smollm2-135m --lib
+
+      # The quarantined per-tool-spans path (#193) is off by default, so
+      # nothing above compiles it and it would rot silently. Type-check it and
+      # run its own gated tests. Cheap: same deps as the step above, one cfg.
+      - name: Serving-layer unit tests (tool-spans quarantine)
+        run: cargo test -p scratchy-serving-api -p scratchy-models
+          --features metal,serve,tool-spans,scratchy-models/smollm2-135m --lib
 
       # Real-model e2e smoke: boot the server on Metal against SmolLM-135M and
       # generate. This exercises the full load → prefill → decode → HTTP path
@@ -260,6 +274,19 @@ jobs:
         run: cargo test -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/smollm2-135m
           --test e5_gemma4_tool_parser -- --ignored --test-threads=1
+
+      # REGRESSION GUARD — the Anthropic `/v1/messages` path Claude Code talks
+      # to, over the Claude-Code-shaped corpus in e_anthropic.rs: tool schemas,
+      # system blocks, `cache_control` breakpoints, and a turn carrying a prior
+      # `tool_use` + `tool_result`. That last shape is every Claude Code turn
+      # after the first, and it 500'd on EVERY model whose chat template writes
+      # `message['content']` unguarded (#194) while CI stayed green, because no
+      # CI step ran this file. Shares the SmolLM build above.
+      - name: E2E Anthropic messages (metal, SmolLM-135M)
+        timeout-minutes: 15
+        run: cargo test -p scratchy-e2e -p scratchy-models
+          --features e2e,metal,scratchy-models/smollm2-135m
+          --test e_anthropic -- --ignored --test-threads=1
 
       # REGRESSION GUARD — gemma-4 hd512 unfused attention on a chunked-prefill
       # CONTINUATION (> 2048-token prompt → chunk 2 has lq != kv_len). This is the ONLY

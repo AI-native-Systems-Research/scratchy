@@ -162,6 +162,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
 /// Log the available API routes.
 fn log_routes(state: &AppState) {
+    // Under the SAME cfg as the code it describes, and in the crate that owns
+    // that cfg — keying it on scratchy-cli's passthrough feature instead let
+    // anything else enabling scratchy-serving-api/tool-spans (the e2e crate,
+    // another binary) serve the broken path silently.
+    #[cfg(feature = "tool-spans")]
+    tracing::warn!(
+        "tool-spans: EXPERIMENTAL build. Tools-bearing /v1/messages requests \
+         bypass the model's tool template and will NOT produce tool_use \
+         blocks. See issue #193."
+    );
+
     info!("Available routes are:");
     info!("Route: /v1/chat/completions, Methods: POST");
     info!("Route: /v1/chat/completions/render, Methods: POST");
@@ -614,17 +625,16 @@ async fn tokenize(
                     .into_response();
                 }
             };
-            let message_values: Vec<serde_json::Value> = messages
-                .iter()
-                .map(|msg| {
-                    let mut val = serde_json::to_value(msg).unwrap_or_default();
-                    // Same normalization the engine's own render does — this
-                    // endpoint has to be able to tokenize a tool-call turn.
-                    crate::chat_template::default_absent_content(&mut val);
-                    val
-                })
-                .collect();
-            match template.apply(&message_values, request.add_generation_prompt, None) {
+            // The same routine the engine's own prompt build uses, so the
+            // count reported here is the count of the prompt that would
+            // actually be run — normalizations, tools and kwargs included.
+            match template.render_chat(
+                messages,
+                request.tools.as_ref(),
+                None,
+                state.engine.default_chat_template_kwargs(),
+                request.add_generation_prompt,
+            ) {
                 Ok(text) => text,
                 Err(e) => {
                     return Json(protocol::ErrorResponse::new(

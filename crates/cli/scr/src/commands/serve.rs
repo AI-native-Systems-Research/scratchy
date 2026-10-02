@@ -90,16 +90,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
 
     print_banner(env!("CARGO_PKG_VERSION"), &model);
     info!("Device: {}, dtype: {}", args.device, args.dtype);
-    // Only ever logged by an experimental `tool-spans` build, and loudly: a
-    // bench log has to say when it measured the broken arm, and a normal build
-    // says nothing because it has no spans code in it to talk about.
-    if cfg!(feature = "tool-spans") {
-        tracing::warn!(
-            "Tool spans: ON — EXPERIMENTAL build. Tools-bearing /v1/messages \
-             requests bypass the model's tool template and will NOT produce \
-             tool_use blocks. See issue #193."
-        );
-    }
     if let Some(ref spec_model) = args.speculative_model {
         if spec_model == "ngram" {
             info!(
