@@ -176,6 +176,17 @@ pub struct Gather {
     /// [`crate::superdsc_opspec::EntryBase`] reports and what the index operand's
     /// `with_offset` takes.
     pub first_entry: u32,
+    /// ⭐ THE TILE'S OWN RESULT — the `ktdp.construct_indirect_access_tile` value this gather was
+    /// read from. Carried so every joiner (the whole-function walk, the matmul materializer) reads
+    /// THIS gather's tile by identity instead of re-filtering `KtdpConstructIndirectAccessTile` and
+    /// matching by enumeration index — three walks that must agree by position are three walks that
+    /// can silently disagree (issue 201 item 3).
+    pub tile: Ssa,
+    /// ⭐ THE GATHERED LOAD — the `ktdp.load` over [`Gather::tile`] whose result carries the
+    /// gathered rows. This is the identity an op's input must BE for this gather to be the one it
+    /// reads: a TID comparison cannot prove it (a plain load of the same table resolves to the
+    /// same tid), the load's own SSA can.
+    pub load: Ssa,
 }
 
 /// [`Gather`] for this program, or `None` when it states no indirect access.
@@ -379,11 +390,45 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
                 out.len() + 1
             ));
         }
+        // ⭐ THIS TILE'S GATHERED LOAD — the `ktdp.load` over the tile, found HERE so the value
+        // travels with the gather. Exactly one load per tile: the tile IS the statement "the row
+        // index is data", and a tile with no load states a gather nothing reads (refused below as
+        // uncarried) while two loads over one tile would be two gathers on one descriptor shape.
+        let Some(tv) = tile.result else {
+            return err(format!(
+                "{}: an indirect access tile states no result, so no `ktdp.load` can read it and \
+                 the gather it describes never happens",
+                f.name,
+            ));
+        };
+        let loads: Vec<&Operation<'_>> = f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&tv))
+            .collect();
+        let [load] = loads[..] else {
+            return err(format!(
+                "{}: {} `ktdp.load` op(s) over one indirect access tile — one tile is ONE gather \
+                 (one index operand per descriptor, DSC2ToDataflowIR.cpp:51), and its rows reach \
+                 consumers through one value",
+                f.name,
+                loads.len(),
+            ));
+        };
+        let Some(load) = load.result else {
+            return err(format!(
+                "{}: the indirect access tile's `ktdp.load` states no result, so the gathered rows \
+                 have no identity to join by",
+                f.name,
+            ));
+        };
         out.push(Gather {
             index_tid,
             value_tid,
             entries,
             first_entry,
+            tile: tv,
+            load,
         });
     }
     Ok(out)
