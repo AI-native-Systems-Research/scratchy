@@ -1,0 +1,8 @@
+{
+  "_comment": "Per-(stem, preset) drift: `mlx-community/gemma-4-26b-a4b-it-4bit` is 4-bit/g64 everywhere EXCEPT its router, which it ships 8-bit — the checkpoint says so itself, as 30 per-module `quantization` entries that are all `language_model.model.layers.<l>.router.proj -> {bits: 8, group_size: 64}`. The dense base this variant is synthesized from carries no quantization block, so without this the arch-wide preset would claim 4-bit for the router too. Both backends' `Gemma4RouterOps::load` used to hardcode the 8 instead, which left the compiled bit map silently disagreeing with the tensor the loader reads (#202); the width is declared here and resolved through `affine_role_bits`, so the loader and the fingerprint read one value. NOTE this is NOT `mlx-affine-b4-g64-mlp8-router8`: that preset also claims `mlp.{gate,up,down}_proj: 8`, which this checkpoint's mlp is not.",
+  "quantization_config": {
+    "bits_overrides": {
+      "router.proj": 8
+    }
+  }
+}

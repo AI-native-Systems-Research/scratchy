@@ -584,14 +584,27 @@ impl SpyreWorker {
             max_model_len,
             hf_fp,
         )
-        .map_err(|e| werr(format!("try_load {arch:?}: {e}")))?
-        .ok_or_else(|| {
-            werr(format!(
-                "no compiled spyre model matched the {arch:?} checkpoint — \
-                 build the CLI with this model's feature \
-                 (e.g. --features spyre,model/llama-3.2-1b)"
-            ))
-        })?;
+        .map_err(|e| werr(format!("try_load {arch:?}: {e}")))?;
+        let model = match model {
+            scratchy_forward_compiler::ArchLoad::Loaded(m) => m,
+            // The arch is compiled; the checkpoint just doesn't match any of its
+            // variants, so widening the model feature won't help — the
+            // quantization layout or shapes are the mismatch.
+            scratchy_forward_compiler::ArchLoad::NoVariantMatched => {
+                return Err(werr(format!(
+                    "the {arch:?} arch is compiled for spyre, but no compiled model variant \
+                     matches this checkpoint — its shapes or quantization layout differ from \
+                     every (model stem, quant preset) pair in this build"
+                )));
+            }
+            scratchy_forward_compiler::ArchLoad::ArchNotCompiled => {
+                return Err(werr(format!(
+                    "no compiled spyre model matched the {arch:?} checkpoint — \
+                     build the CLI with this model's feature \
+                     (e.g. --features spyre,model/llama-3.2-1b)"
+                )));
+            }
+        };
         // `try_load` runs the GENERATED loader over every tensor, so it is a whole pass
         // across the checkpoint in its own right — timed apart from the raw byte extraction
         // that follows it.

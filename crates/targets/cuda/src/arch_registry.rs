@@ -14,7 +14,7 @@
 //! called by the serving workers — keep resolving unchanged.
 
 pub use scratchy_forward_compiler::{
-    ArchTryLoadFn, MmTryLoadFn, ScratchyArchRegistration, ScratchyMmRegistration,
+    ArchLoad, ArchTryLoadFn, MmTryLoadFn, ScratchyArchRegistration, ScratchyMmRegistration,
     resolve_mm_metadata, try_load, try_load_mm,
 };
 

@@ -439,14 +439,18 @@ enum FieldLoad {
         gate_bits: Option<u32>,
     },
     /// Gemma-4 router bundle (`GemmaMoe` op, base `router`). Dispatches to
-    /// the metal-only `GemmaRouterLayer::load`. The router.proj 8-bit dequant
-    /// is hardcoded inside the loader, so no `affine` field is threaded here;
-    /// `group_size` is the model's affine group width (64).
+    /// `GemmaRouterLayer::load`. `group_size` is the model's affine group width
+    /// (64); `bits` is `router.proj`'s own on-disk width, resolved through
+    /// `affine_role_bits` like every other affine role rather than hardcoded in
+    /// the loader — the backends used to bake an 8 that no config stated, which
+    /// left the variant's bit map silently disagreeing with the tensor the
+    /// loader would read (#202).
     GemmaRouter {
         prefix: String,
         num_experts: usize,
         hidden_size: usize,
         group_size: u32,
+        bits: u32,
     },
     /// Gemma-4 SwitchGLU experts bundle (`GemmaMoe` op, base
     /// `experts.switch_glu`). Dispatches to `SwitchGluExpertsLayer::load`
@@ -460,6 +464,126 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
     },
+}
+
+/// The MLX-affine `.weight` tensors this field load will read, each paired with
+/// the `(bits, group_size)` THE LOAD CALL IS GIVEN.
+///
+/// ⛔ SINGLE SOURCE OF TRUTH for the fingerprint's affine bit table. The widths
+/// are read straight off the `FieldLoad` the loader is about to be handed — not
+/// re-derived — so the compiled fingerprint cannot claim a width the loader
+/// won't use. A second resolver that merely *agreed* in the cases we tested is
+/// what made #202's gate need a hand-maintained patch table for Gemma-4's
+/// router.
+///
+/// Names are exact on-disk paths (the prefixes are layer-0 concrete, the same
+/// ones `layer_templated_prefix_expr` templates for the load calls), so the
+/// runtime does equality, never suffix matching: `mlp.gate_proj` can never
+/// collide with `switch_mlp.gate_proj`.
+///
+/// Only tensors whose width this function can state are listed. Stacked routed
+/// experts (`switch_mlp.*`, `GemmaSwitchGlu`) are deliberately absent: their
+/// sub-leaf names live in the backend loaders, and the fingerprint must claim
+/// nothing it cannot source from here. Unlisted tensors are simply not checked.
+fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
+    let one = |p: &str, bits: u32, gs: u32| vec![(format!("{p}.weight"), bits, gs)];
+    match fl {
+        FieldLoad::EmbeddingAffine {
+            prefix,
+            group_size,
+            bits,
+            ..
+        }
+        | FieldLoad::EmbeddingAffineDequant {
+            prefix,
+            group_size,
+            bits,
+            ..
+        }
+        | FieldLoad::LinearAffine {
+            prefix,
+            group_size,
+            bits,
+            ..
+        } => one(prefix, *bits, *group_size),
+        FieldLoad::LinearAffineConcat {
+            prefixes,
+            group_size,
+            bits,
+            ..
+        } => prefixes
+            .iter()
+            .map(|p| (format!("{p}.weight"), *bits, *group_size))
+            .collect(),
+        // MoE router gate: `gate_bits` is what the `load_affine` call receives
+        // for `{prefix}.gate`, and it is the role qwen3.5 and qwen3.6 disagree
+        // about. The routed expert stack under the same prefix is omitted (see
+        // the fn doc).
+        FieldLoad::FusedMoe {
+            prefix,
+            affine: Some((group_size, _)),
+            gate_bits: Some(gate_bits),
+            ..
+        }
+        | FieldLoad::SharedFusedMoe {
+            prefix,
+            affine: Some((group_size, _)),
+            gate_bits: Some(gate_bits),
+            ..
+        } => one(&format!("{prefix}.gate"), *gate_bits, *group_size),
+        FieldLoad::GemmaRouter {
+            prefix,
+            group_size,
+            bits,
+            ..
+        } => one(&format!("{prefix}.proj"), *bits, *group_size),
+        _ => Vec::new(),
+    }
+}
+
+/// Collapse exact per-layer affine rows into one row per role wherever every
+/// layer agrees on `(bits, group_size)`, by replacing the layer index with `*`.
+///
+/// Keeps the table at one row per role for a uniform checkpoint (17 for
+/// qwen3.5, not 40 x 17) while staying exact: a role whose width VARIES by layer
+/// — MLX mixed/dynamic, i.e. OptiQ — keeps its concrete per-layer rows, because
+/// starring it would claim layer 0's width for all 40 layers.
+fn compress_affine_rows(rows: Vec<(String, u32, u32)>) -> Vec<(String, u32, u32)> {
+    /// Replace a path's layer index with `*`. The FIRST all-digits segment is
+    /// the layer slot (`model.layers.7.…`, `visual.blocks.7.…`); rows arrive one
+    /// per concrete layer, so this must match any index, not just layer 0.
+    fn starred(name: &str) -> Option<String> {
+        let segments: Vec<&str> = name.split('.').collect();
+        let at = segments
+            .iter()
+            .position(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?;
+        let mut out = segments;
+        out[at] = "*";
+        Some(out.join("."))
+    }
+    let mut widths: std::collections::BTreeMap<String, std::collections::BTreeSet<(u32, u32)>> =
+        Default::default();
+    for (name, bits, gs) in &rows {
+        if let Some(pat) = starred(name) {
+            widths.entry(pat).or_default().insert((*bits, *gs));
+        }
+    }
+    let mut out: Vec<(String, u32, u32)> = Vec::new();
+    for (name, bits, gs) in rows {
+        match starred(&name) {
+            // One width across every layer of this role — one starred row.
+            Some(pat) if widths.get(&pat).is_some_and(|w| w.len() == 1) => {
+                if !out.iter().any(|(n, _, _)| *n == pat) {
+                    out.push((pat, bits, gs));
+                }
+            }
+            // Per-layer variation, or not layered at all — keep it concrete.
+            _ => out.push((name, bits, gs)),
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -1199,11 +1323,30 @@ fn plan_field_load(
             Some(crate::quantization::QuantMethod::Affine { group_size, .. }) => *group_size,
             _ => 64,
         };
+        // `router.proj`'s own width, resolved exactly as the `FusedMoe` arm
+        // resolves its gate — the preset's `bits_overrides` (gemma4-moe declares
+        // `router.proj: 8`) or an MLX per-module entry. Defaults to 8, the width
+        // both backends hardcoded before this was threaded, so the dense/verbatim
+        // config that still has to codegen keeps its old values.
+        let only_idx = accessor.source_weights[0].1;
+        let bits = model
+            .quantization
+            .as_ref()
+            .and_then(|qc| {
+                crate::quantization::affine_role_bits(
+                    program,
+                    &qc.method,
+                    &format!("{prefix}.proj"),
+                    only_idx,
+                )
+            })
+            .unwrap_or(8);
         return FieldLoad::GemmaRouter {
             prefix,
             num_experts,
             hidden_size,
             group_size,
+            bits,
         };
     }
 
@@ -1839,10 +1982,18 @@ fn collect_accessors(
 ///    (granite 3.0 vs 3.1 vs 3.3; phi-4 vs phi-4-reasoning) — see
 ///    the `rope_theta_check` comment for why guessing wrong here is
 ///    silent rather than loud.
+/// 7. **Per-role affine bit widths**. For MLX-affine variants, every
+///    quantized weight under the decoder root must be packed at the
+///    width this variant's baked bit map (`bits` + `bits_overrides`
+///    / `per_module`) claims for its role. The only discriminator
+///    for variants differing solely in that map — qwen3.5 vs
+///    qwen3.6 35B-A3B, whose gates are 4- vs 8-bit with every other
+///    axis identical. See the `affine_bit_map_gate` comment.
 fn emit_fingerprint_check(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     tp_world_size: u8,
+    affine_rows: &[(String, u32, u32)],
 ) -> TokenStream {
     let num_hidden_layers = *model
         .bounds
@@ -2288,6 +2439,46 @@ fn emit_fingerprint_check(
         }
     };
 
+    // Per-role affine BIT-WIDTH gate. The group-size gate above probes one
+    // tensor at one width; this one asserts the width of EVERY affine tensor the
+    // emitted loader is about to read.
+    //
+    // ⛔ THE ONLY DISCRIMINATOR FOR VARIANTS THAT DIFFER ONLY IN THEIR PER-ROLE
+    // BIT MAP. `Qwen3.5-35B-A3B-4bit` and `Qwen3.6-35B-A3B-4bit` agree on every
+    // other axis here — hidden 2048, 40 layers, 256 experts, vocab 248320, g64,
+    // no declared `rope_scaling` or top-level `rope_theta` — and differ only in
+    // `mlp.gate` + `mlp.shared_expert_gate` being 4-bit on 3.5 and 8-bit on 3.6.
+    // Without this gate the alphabetically-earlier variant claims both, and the
+    // mismatch surfaces as a shape `ensure!` deep inside `affine_dequant_b4_bytes`
+    // rather than as a rejection (#202).
+    //
+    // The rows come from `affine_tensors_of` — read off the same `FieldLoad`s the
+    // load calls are emitted from — so the gate cannot assert a width the loader
+    // won't use, and there is no second bit-resolution algorithm to drift from
+    // `affine_role_bits`. Names are exact (patterns star only the layer index),
+    // so nothing is matched by suffix and nothing is claimed about a tensor this
+    // variant does not read.
+    //
+    // Symmetry comes from both variants listing the SAME tensor at their OWN
+    // width: 3.5 lists `…layers.*.mlp.gate` at 4 and so rejects 3.6's 8-bit gate,
+    // exactly as 3.6 lists it at 8 and rejects 3.5's.
+    let affine_bit_map_gate: TokenStream = if affine_rows.is_empty() {
+        quote! {}
+    } else {
+        let row_toks = affine_rows.iter().map(|(name, b, g)| {
+            let name = proc_macro2::Literal::string(name);
+            let b = proc_macro2::Literal::u32_unsuffixed(*b);
+            let g = proc_macro2::Literal::u32_unsuffixed(*g);
+            quote! { (#name, #b, #g) }
+        });
+        quote! {
+            const __AFFINE_WIDTHS: &[(&str, u32, u32)] = &[#(#row_toks),*];
+            if !gw.affine_widths_agree(__AFFINE_WIDTHS) {
+                return false;
+            }
+        }
+    };
+
     // Backing-store reject: every non-Ggml variant must reject a
     // GGUF-backed `GpuWeights`, and the Ggml variant must require
     // one. Without this the dense variant's shape-only fingerprint
@@ -2571,6 +2762,11 @@ fn emit_fingerprint_check(
             // q_proj. See `emit_fingerprint_check` for the rationale.
             #mlx_marker_check
             #qweight_shape_gate
+            // Per-role affine bit widths — the only thing separating two
+            // variants whose configs differ solely in `bits_overrides` /
+            // `per_module` (qwen3.5 vs qwen3.6 35B-A3B). See
+            // `emit_fingerprint_check`.
+            #affine_bit_map_gate
             #is_gguf_gate
             #g_idx_disambiguation
             #input_scale_disambiguation
@@ -2853,6 +3049,10 @@ fn emit_weights_struct(
         .iter()
         .map(|a| plan_field_load(a, program, fuf, model, manifest, embed_is_affine_repr))
         .collect();
+    // The affine widths the emitted load calls will use, harvested from the very
+    // `FieldLoad`s they are emitted from, then collapsed per role. This is what
+    // the fingerprint's bit table is built from — see `affine_tensors_of`.
+    let affine_rows = compress_affine_rows(plans.iter().flat_map(affine_tensors_of).collect());
     // Per-arch decoder root for embed_tokens probes etc. `model` for
     // text-only and Qwen-style VL, `<prefix>.model` for arches whose
     // variant config sets `decoder_safetensors_prefix` (Gemma3-MM nests
@@ -3131,7 +3331,7 @@ fn emit_weights_struct(
     // `hidden_size` / `vocab_size` panics in `emit_fingerprint_check`
     // — vision configs (`vision_*` + `d_model` only) lack those keys.
     let fingerprint_method = if emit_fingerprint {
-        emit_fingerprint_check(model, manifest, tp_world_size)
+        emit_fingerprint_check(model, manifest, tp_world_size, &affine_rows)
     } else {
         TokenStream::new()
     };
@@ -5010,10 +5210,12 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             num_experts,
             hidden_size,
             group_size,
+            bits,
         } => {
             let num_experts = *num_experts;
             let hidden_size = *hidden_size;
             let group_size = *group_size;
+            let bits = *bits;
             quote! {
                 let #name = crate::__gpu::layers_moe::GemmaRouterLayer::load(
                     gw,
@@ -5021,6 +5223,7 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                     #num_experts,
                     #hidden_size,
                     #group_size,
+                    #bits,
                 )?;
             }
         }
@@ -5962,6 +6165,7 @@ fn emit_layered_load_body(
             num_experts,
             hidden_size,
             group_size,
+            bits,
         } => {
             let p = layer_templated_prefix_expr(
                 prefix,
@@ -5971,6 +6175,7 @@ fn emit_layered_load_body(
             let num_experts = *num_experts;
             let hidden_size = *hidden_size;
             let group_size = *group_size;
+            let bits = *bits;
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
@@ -5980,6 +6185,7 @@ fn emit_layered_load_body(
                             #num_experts,
                             #hidden_size,
                             #group_size,
+                            #bits,
                         )
                     })
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
@@ -14385,7 +14591,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one V3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
         assert!(
             ts.contains("q_a_proj.weight_scale_inv"),
             "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale_inv, got:\n{ts}",
@@ -14425,7 +14631,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one deepseek-v3-flat FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "flat-Q MLA FP8-block fingerprint should use q_proj.weight_scale_inv \
@@ -14460,7 +14666,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one Qwen3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "non-MLA FP8-block fingerprint should still use q_proj, got:\n{ts}",
@@ -14481,13 +14687,27 @@ mod fingerprint_tests {
         crate::config::load_file(&path).unwrap_or_else(|e| panic!("load {}: {e}", path.display()))
     }
 
+    /// Load ONE synthesized `(stem, preset)` quant variant — the same deep
+    /// merge `load_dir`'s overlay loop performs, for one pair. Same reason
+    /// [`config_of`] bypasses `load_dir`: a proc-macro crate has no quant
+    /// features, so the overlay loop synthesizes nothing here.
+    fn variant_of(arch: &str, stem: &str, preset: &str) -> crate::config::ModelParams {
+        let config = arch_configs(arch).join(format!("{stem}.json"));
+        let preset_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/quantization/presets")
+            .join(format!("{preset}.json"));
+        crate::config::load_file_with_preset(&config, &preset_path).unwrap_or_else(|e| {
+            panic!("load {} + {}: {e}", config.display(), preset_path.display())
+        })
+    }
+
     /// The `rope_theta` literal a variant's fingerprint gates on, if any.
     /// Parsed back out of the emitted token stream so the assertion is about
     /// what the generated code will actually compare, not about our intent.
     fn emitted_rope_theta(model: &crate::config::ModelParams, arch: &str) -> Option<f64> {
         let manifest = crate::weights_manifest::load_or_empty(&arch_configs(arch))
             .expect("load weights manifest");
-        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1, &[]).to_string();
         // `quote`'s stringification spaces tokens out: `theta - 100000.0`.
         let tail = ts.split("theta - ").nth(1)?;
         let lit: String = tail
@@ -14563,6 +14783,209 @@ mod fingerprint_tests {
         );
     }
 
+    /// `affine_role_bits` resolved against a variant's own config — the single
+    /// resolver the load calls and the fingerprint table both go through.
+    fn resolved_role_bits(model: &crate::config::ModelParams, role: &str) -> Option<u32> {
+        let program = layout_test_program(&[]);
+        crate::quantization::affine_role_bits(
+            &program,
+            &model.quantization.as_ref().expect("a quant variant").method,
+            role,
+            None,
+        )
+    }
+
+    /// ⛔ THE REGRESSION THIS GATE EXISTS FOR (#202), at the layer that decides
+    /// it. The two in-tree qwen3-5-moe stems are byte-identical on every other
+    /// fingerprint axis — same hidden size, layer count, expert count, vocab, no
+    /// `rope_scaling` and no top-level `rope_theta` — and their real checkpoints
+    /// differ only in the router gates' width, which 3.6 declares through its
+    /// `.overrides.json`. If both resolve the same width, both variants claim
+    /// both checkpoints and the loser dequantizes with the wrong stride.
+    #[test]
+    fn the_two_qwen3_5_moe_stems_resolve_different_gate_widths() {
+        let v3_5 = variant_of("qwen3-5-moe", "qwen3.5-35b-a3b", "mlx-affine-b4-g64-qembed");
+        let v3_6 = variant_of("qwen3-5-moe", "qwen3.6-35b-a3b", "mlx-affine-b4-g64-qembed");
+
+        // The premise: nothing else can tell them apart.
+        for key in [
+            "hidden_size",
+            "num_hidden_layers",
+            "vocab_size",
+            "num_experts",
+        ] {
+            assert_eq!(
+                v3_5.bounds.get(key),
+                v3_6.bounds.get(key),
+                "premise broken: the two stems now differ in {key}, so this test is no longer \
+                 exercising the collision the width gate was added for",
+            );
+        }
+
+        for role in ["mlp.gate", "mlp.shared_expert_gate"] {
+            assert_eq!(
+                resolved_role_bits(&v3_5, role),
+                Some(4),
+                "3.5 is uniformly 4-bit; {role} must resolve to 4",
+            );
+            assert_eq!(
+                resolved_role_bits(&v3_6, role),
+                Some(8),
+                "3.6 ships {role} at 8-bit — that is what its `.overrides.json` declares, and \
+                 what `affine_tensors_of` puts in the fingerprint table",
+            );
+        }
+    }
+
+    /// Gemma-4-MoE's router is 8-bit while the rest of the checkpoint is 4-bit.
+    /// That width must come from the arch's DECLARED override, so the loader and
+    /// the fingerprint read one value — it used to be hardcoded inside both
+    /// backends' `Gemma4RouterOps::load`, leaving the compiled bit map silently
+    /// disagreeing with the tensor the loader reads.
+    #[test]
+    fn the_gemma4_moe_router_width_comes_from_the_declared_override() {
+        let v = variant_of("gemma4-moe", "gemma-4-26b-a4b-it", "mlx-affine-b4-g64");
+        assert_eq!(
+            resolved_role_bits(&v, "router.proj"),
+            Some(8),
+            "router.proj must resolve to the 8 bits the checkpoint ships; without the declared \
+             override it falls back to the 4-bit section default and the gate rejects \
+             gemma-4-26b-a4b-it-4bit",
+        );
+        assert_eq!(
+            resolved_role_bits(&v, "self_attn.q_proj"),
+            Some(4),
+            "the override must be scoped to the router, not widen the whole model",
+        );
+    }
+
+    /// `affine_tensors_of` must report the width THE LOAD CALL GETS, so the
+    /// fingerprint cannot assert something the loader won't do. The MoE arm's
+    /// gate is the #202 role; the Gemma router is the one that used to be
+    /// hardcoded.
+    #[test]
+    fn affine_tensors_of_reports_the_width_the_load_call_receives() {
+        let moe = FieldLoad::SharedFusedMoe {
+            prefix: "model.layers.0.mlp".to_string(),
+            num_experts: 8,
+            top_k: 2,
+            moe_intermediate_size: 128,
+            shared_expert_intermediate_size: 0,
+            hidden_size: 128,
+            affine: Some((64, 4)),
+            gate_bits: Some(8),
+        };
+        assert_eq!(
+            affine_tensors_of(&moe),
+            vec![("model.layers.0.mlp.gate.weight".to_string(), 8, 64)],
+            "the router gate must carry `gate_bits` (8), NOT the expert width (4) — they are \
+             different tensors at different widths",
+        );
+
+        let router = FieldLoad::GemmaRouter {
+            prefix: "model.layers.0.router".to_string(),
+            num_experts: 128,
+            hidden_size: 2816,
+            group_size: 64,
+            bits: 8,
+        };
+        assert_eq!(
+            affine_tensors_of(&router),
+            vec![("model.layers.0.router.proj.weight".to_string(), 8, 64)],
+        );
+
+        let leaf = FieldLoad::LinearAffine {
+            prefix: "model.layers.0.self_attn.q_proj".to_string(),
+            group_size: 64,
+            bits: 4,
+            in_features: 128,
+        };
+        assert_eq!(
+            affine_tensors_of(&leaf),
+            vec![("model.layers.0.self_attn.q_proj.weight".to_string(), 4, 64)],
+        );
+
+        // Nothing is claimed for a dense load.
+        assert!(affine_tensors_of(&FieldLoad::LinearDense("x".into())).is_empty());
+
+        // ⛔ EVERY row names the `.weight` TENSOR, not the role. The runtime
+        // matcher compares patterns against full tensor names, so a row that
+        // stopped at the role would match nothing and the gate would go silently
+        // dead — it fails open, so no test of the widths themselves would notice.
+        for fl in [&moe, &router, &leaf] {
+            for (name, _, _) in affine_tensors_of(fl) {
+                assert!(
+                    name.ends_with(".weight"),
+                    "row `{name}` must name the .weight tensor",
+                );
+            }
+        }
+    }
+
+    /// Compression keeps the table at one row per role when every layer agrees,
+    /// and MUST fall back to concrete per-layer rows when they don't.
+    ///
+    /// ⛔ THE MLX MIXED/DYNAMIC (OptiQ) CASE. Those checkpoints give individual
+    /// layers their own widths through the `per_module` map, so starring the
+    /// layer index would claim layer 0's width for all of them — the exact kind
+    /// of unbacked claim that makes a fingerprint false-reject. No OptiQ
+    /// checkpoint is in tree today, which is why this is covered here rather
+    /// than left to one.
+    #[test]
+    fn compression_stars_a_uniform_role_and_keeps_a_per_layer_one_concrete() {
+        let uniform: Vec<(String, u32, u32)> = (0..3)
+            .map(|l| (format!("model.layers.{l}.self_attn.q_proj.weight"), 4, 64))
+            .collect();
+        assert_eq!(
+            compress_affine_rows(uniform),
+            vec![("model.layers.*.self_attn.q_proj.weight".to_string(), 4, 64)],
+            "a role every layer agrees on collapses to ONE starred row",
+        );
+
+        // Layer 1 is 8-bit (sensitivity-aware quant); 0 and 2 stay 4-bit.
+        let mixed: Vec<(String, u32, u32)> = vec![
+            ("model.layers.0.self_attn.q_proj.weight".to_string(), 4, 64),
+            ("model.layers.1.self_attn.q_proj.weight".to_string(), 8, 64),
+            ("model.layers.2.self_attn.q_proj.weight".to_string(), 4, 64),
+        ];
+        let got = compress_affine_rows(mixed.clone());
+        assert_eq!(
+            got.len(),
+            3,
+            "a role whose width varies by layer must keep every concrete row — starring it \
+             would claim one layer's width for all of them. Got: {got:?}",
+        );
+        for row in &mixed {
+            assert!(got.contains(row), "missing {row:?} from {got:?}");
+        }
+        assert!(
+            !got.iter().any(|(n, _, _)| n.contains('*')),
+            "no starred row may survive per-layer variation",
+        );
+    }
+
+    /// The emitted gate calls the runtime helper with the collected rows. A
+    /// variant with no affine tensors emits nothing at all.
+    #[test]
+    fn the_affine_width_gate_is_emitted_from_the_collected_rows() {
+        let model = config_of("llama", "smollm2-135m");
+        let manifest =
+            crate::weights_manifest::load_or_empty(&arch_configs("llama")).expect("load manifest");
+
+        let rows = vec![("model.layers.*.mlp.gate.weight".to_string(), 8, 64)];
+        let ts = emit_fingerprint_check(&model, &manifest, 1, &rows).to_string();
+        assert!(
+            ts.contains("affine_widths_agree") && ts.contains("model.layers.*.mlp.gate.weight"),
+            "the gate must pass the collected rows to the runtime helper, got:\n{ts}",
+        );
+
+        let ts_none = emit_fingerprint_check(&model, &manifest, 1, &[]).to_string();
+        assert!(
+            !ts_none.contains("affine_widths_agree"),
+            "a variant with no affine tensors must emit no width gate",
+        );
+    }
+
     /// The gate reads `hf.rope_theta` through `if let Some(..)`, so a caller
     /// that supplies nothing stays on the variant's baked value rather than
     /// being rejected. The cuda worker relies on this for GGUF, whose metadata
@@ -14572,7 +14995,7 @@ mod fingerprint_tests {
         let model = config_of("llama", "smollm2-135m");
         let manifest =
             crate::weights_manifest::load_or_empty(&arch_configs("llama")).expect("load manifest");
-        let ts = emit_fingerprint_check(&model, &manifest, 1).to_string();
+        let ts = emit_fingerprint_check(&model, &manifest, 1, &[]).to_string();
         let gate = ts
             .split("rope_theta")
             .nth(1)

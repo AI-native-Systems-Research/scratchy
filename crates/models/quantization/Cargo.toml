@@ -40,7 +40,6 @@ mlx-affine-b4-g128 = []
 mlx-affine-b4-g128-qembed = []
 mlx-affine-b4-g32 = []
 mlx-affine-b4-g64 = []
-mlx-affine-b4-g64-gate8-qembed = []
 mlx-affine-b4-g64-mlp8-router8 = []
 mlx-affine-b4-g64-qembed = []
 nvfp4 = []
@@ -58,7 +57,6 @@ mlx = [
     "mlx-affine-b4-g32",
     "mlx-affine-b4-g64",
     "mlx-affine-b4-g64-qembed",
-    "mlx-affine-b4-g64-gate8-qembed",
     "mlx-affine-b4-g64-mlp8-router8",
     "mlx-affine-b4-g128",
     "mlx-affine-b4-g128-qembed",
