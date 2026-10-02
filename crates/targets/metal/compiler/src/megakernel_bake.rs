@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scratchy_subtile::megakernel_plan::{
-    FusionPlan, Items, Placement, Run, StepFlow, UnitIx, plan, runs,
+    FusionPlan, Items, Placement, Run, StepFlow, UnitIx, plan, required_launches, runs,
 };
 use scratchy_target_metal::interpreter::metal::megakernel::MK_BODIES;
 use scratchy_target_metal::msl_offline::{AIR_TO_METALLIB, MSL_TO_AIR};
@@ -47,8 +47,9 @@ use scratchy_target_metal::tape::lowered::{
     Binding, BindingMask, CapPatch, CommandOrigin, GateCtx, GatedCommand, KernelId, LoweredCommand,
     LoweredMetalTape, MK_FC_CAL, MK_FC_HEADS, MK_FC_LOAD, MK_FC_SPLIT, MK_TG_MEMORY, MK_THREADS,
     MScaleAxis, MegakernelError, MegakernelTape, MkAdapter, MkCalibration, MkConst, MkGeometry,
-    MkHeads, MkKernelStep, MkLoadConstant, MkLoadSource, MkPlace, MkRegion, MkRun, MkStreamWork,
-    MkUnit, MkWork, PatchTarget, RuntimeBindingKind, TapeLoop, baked, mk_geometry,
+    MkHeads, MkKernelStep, MkLoadConstant, MkLoadSource, MkPlace, MkRegion, MkRun,
+    MkStreamBindings, MkStreamWork, MkUnit, MkWork, PatchTarget, RuntimeBindingKind, TapeLoop,
+    baked, mk_geometry,
 };
 use scratchy_target_metal::tape::step::{MetalLoc, MetalStep, MetalStepTape, RowAccess, StepRow};
 
@@ -457,6 +458,81 @@ fn at_decode(kernel: KernelId) -> Result<(), NotAtDecode> {
     }
 }
 
+/// Whether a step touches every location item by item ([`StepFlow::local`]) — EXHAUSTIVE over
+/// [`MetalStep`], so a new step is classed before any tape can emit it: an elementwise step, a
+/// per-head or per-head-group one (rope, attention, the KV codec), the experts' per-row combine.
+/// A matmul (every output reads the whole input), a norm (a reduction over the row), and the
+/// router's ranking are not.
+fn item_local(step: &MetalStep) -> bool {
+    use MetalStep as S;
+    use scratchy_target_metal::tape::step::MoeStep as M;
+    match step {
+        S::SpliceMmEmbeds(..)
+        | S::ScalarWeightMul(..)
+        | S::ScalarMul(..)
+        | S::MetalBiasAdd(..)
+        | S::SiluMul(..)
+        | S::GeluMul(..)
+        | S::Gelu(..)
+        | S::GeluErf(..)
+        | S::QuickGelu(..)
+        | S::TanhSoftCap(..)
+        | S::Add(..)
+        | S::RopeAppend(..)
+        | S::RopeAppendNormed(..)
+        | S::AttentionViaCache(..)
+        | S::SlidingAttentionViaCache(..)
+        | S::GateSplit(..)
+        | S::GateApply(..)
+        | S::GateScale(..)
+        | S::GatedDeltaNet(..)
+        | S::KvEncode(..)
+        | S::KvStage(..)
+        | S::RotateRows(..)
+        | S::AttnPackedKv(..)
+        | S::Moe(_, M::GatedAct(..) | M::Combine(..)) => true,
+        S::Embed(..)
+        | S::AffineEmbed(..)
+        | S::Reshape(..)
+        | S::RmsNorm(..)
+        | S::ScalarOffsetRmsNorm(..)
+        | S::RmsNormUnit(..)
+        | S::MeanSubRmsNorm(..)
+        | S::MeanSubRmsNormBiasAdd(..)
+        | S::FusedAddRmsNorm(..)
+        | S::FusedAddRmsNormWithOffset(..)
+        | S::NormAddScalarMul(..)
+        | S::Gemm(..)
+        | S::AffineQmm(..)
+        | S::FusedGateUpSiluMul(..)
+        | S::FusedGateUpGeluMul(..)
+        | S::AttentionPrefillPaged(..)
+        | S::SlidingAttentionPrefillPaged(..)
+        | S::EncoderAttention(..)
+        | S::VarlenAttention(..)
+        | S::VisionRope(..)
+        | S::LoadPixels(..)
+        | S::LoadPosEmbeds(..)
+        | S::EmbeddingGather(..)
+        | S::SampleRows(..)
+        | S::Moe(
+            _,
+            M::RouterNorm(..)
+            | M::RouterLogits(..)
+            | M::Softmax(..)
+            | M::Argsort
+            | M::TopK
+            | M::GatherScores
+            | M::Scale(..)
+            | M::Renorm
+            | M::ExpertScale(..)
+            | M::Sort(..)
+            | M::ExpertMatmul(..)
+            | M::Unsort,
+        ) => false,
+    }
+}
+
 /// The planned decode forward: the admitted commands (expanded indices, in order), their plan,
 /// every run a launch may play, and each admitted step's dataflow and work.
 struct Planned {
@@ -466,6 +542,8 @@ struct Planned {
     flows: Vec<StepFlow<MkLoc>>,
     work: Vec<MkWork>,
     calibrations: Vec<Calibration>,
+    /// The units that open a launch on any placement ([`required_launches`]).
+    required: Vec<UnitIx>,
 }
 
 /// A matvec body the load measures the device with ([`MkCalibration`]): `call` (the streaming
@@ -480,12 +558,20 @@ struct Calibration {
     bits: u32,
     group: u32,
     scale_bytes: u32,
+    bindings: MkStreamBindings,
     tpg: (u32, u32, u32),
+    /// The axis of the step's grid its rows run along (its extent: rows ÷ `rows`); any other
+    /// axis repeats the stream (an expert, a batch row), each a stream of the same rows.
+    rows_axis: usize,
     stride: u32,
     widest: u32,
+    tg_bytes: u32,
+    tg_memory: u32,
     constants: &'static [MkConst],
     k_slot: ConstSlot,
     n_slot: ConstSlot,
+    /// The step's other constants, as its policy spells them.
+    fixed: Vec<ConstantValue>,
 }
 
 /// Whether a step tape decodes: it attends over the KV cache earlier forwards filled, or scans a
@@ -521,6 +607,7 @@ pub fn bake_megakernel(
         .iter()
         .chain(&steps.lm_head_access)
         .collect();
+    let rows: Vec<&StepRow> = steps.backbone.iter().chain(&steps.lm_head).collect();
     if !decodes(steps) {
         return Ok(Vec::new());
     }
@@ -619,11 +706,6 @@ pub fn bake_megakernel(
             .any(|s| matches!(s, MkLoadSource::Threadgroups(_)));
         let g = step_geometry(cmd, adapter, None).map_err(|e| defect(cmd.function, e))?;
         let (constants, grid) = played(cmd);
-        // The plan sees one head per virtual threadgroup: the most items the step can have.
-        let items = match load {
-            true => Items(g.items.0.max(NonZeroU32::MIN.saturating_add(1))),
-            false => g.items,
-        };
         let heads = heads_of(cmd).map(|(head_dim, q, kv)| {
             let next = ConstSlot(MK_FC_HEADS.0 + heads_slots.len() as u16);
             let slot = *heads_slots.entry(origin.baked).or_insert(next);
@@ -640,6 +722,14 @@ pub fn bake_megakernel(
             let bytes = st.bytes_per_vtg(&constants)?;
             let k = constants.iter().find(|c| c.index == st.k.get())?.bits;
             let tpg = cmd.dispatch.threads_per_threadgroup;
+            let n = constants.iter().find(|c| c.index == st.n.get())?.bits;
+            let rows_axis = [grid.0, grid.1, grid.2]
+                .iter()
+                .position(|&e| e == n.div_ceil(st.rows))?;
+            let fixed = (constants.iter())
+                .filter(|c| c.index != st.k.get() && c.index != st.n.get())
+                .copied()
+                .collect();
             let cal = Calibration {
                 call: st.calibrate,
                 k,
@@ -647,12 +737,17 @@ pub fn bake_megakernel(
                 bits: st.bits,
                 group: st.group,
                 scale_bytes: st.scale_bytes,
+                bindings: st.bindings,
                 tpg,
+                rows_axis,
                 stride: g.vtg_stride,
                 widest: g.vtgs_per_item,
+                tg_bytes: adapter.tg_bytes.0,
+                tg_memory: g.tg_memory,
                 constants: adapter.constants,
                 k_slot: st.k,
                 n_slot: st.n,
+                fixed,
             };
             let at = calibrations
                 .iter()
@@ -666,6 +761,15 @@ pub fn bake_megakernel(
                 calibration: at as u32,
             })
         });
+        // The plan sees one head per virtual threadgroup: the most items the step can have.
+        // A streaming step's items are its virtual threadgroups — the work split packs them —
+        // so it is never folded into one threadgroup's chain because they fit one item.
+        let vtgs = NonZeroU32::new(grid.0 * grid.1 * grid.2);
+        let items = match (load, stream.and(vtgs)) {
+            (true, _) => Items(g.items.0.max(NonZeroU32::MIN.saturating_add(1))),
+            (false, Some(vtgs)) => Items(vtgs),
+            (false, None) => g.items,
+        };
         work.push(MkWork {
             vtg_threads: g.vtg_stride,
             widest: g.vtgs_per_item,
@@ -683,12 +787,21 @@ pub fn bake_megakernel(
         let (reads, writes) = kv
             .flow(cmd, adapter.writes, &reads, &writes)
             .map_err(|e| defect(cmd.function, e))?;
+        let row_step = match rows[row_of[origin.baked]] {
+            StepRow::Step(step, _) => Some(step),
+            StepRow::Loop { .. } => None,
+        };
+        let local = match row_step.is_some_and(item_local) {
+            true => reads.iter().chain(&writes).copied().collect(),
+            false => Vec::new(),
+        };
         flows.push(StepFlow {
             reads,
             writes,
             items,
             segment_break: std::mem::take(&mut pending),
             whole: adapter.tail && !load,
+            local,
         });
     }
     let plan = plan(&flows);
@@ -707,6 +820,7 @@ pub fn bake_megakernel(
         return Err(defect("the codec's shared scratch", e));
     }
     let runs = runs(&plan, &flows);
+    let required = required_launches(&plan, &flows);
     let planned = Planned {
         admitted,
         plan,
@@ -714,12 +828,15 @@ pub fn bake_megakernel(
         flows,
         work,
         calibrations,
+        required,
     };
     let generator = Gen::new(tape, patches, &commands, &origins, &planned)?;
+    let generator_longest = generator.longest_launches();
     let mk = generator.kernels()?;
     eprintln!(
         "[m2-megakernel] {}: {} regions, {} runs a launch may play, all {} admitted commands \
-         ({} baked steps), {} load constants, {} bytes of MSL",
+         ({} baked steps), {} load constants, {} bytes of MSL; launches per forward the dataflow \
+         requires: {}, the longest runs take: {}",
         mk.library,
         mk.regions.len(),
         mk.regions.iter().map(|r| r.runs.len()).sum::<usize>(),
@@ -727,6 +844,8 @@ pub fn bake_megakernel(
         mk.steps.len(),
         mk.load_constants.len(),
         mk.source.len(),
+        planned.required.len(),
+        generator_longest,
     );
     Ok(vec![mk])
 }
@@ -932,6 +1051,26 @@ impl<'a> Gen<'a> {
             policies: Vec::new(),
             coissue_tg: 0,
         })
+    }
+
+    /// Launches per forward the regions' longest runs take.
+    fn longest_launches(&self) -> u32 {
+        let runs = &self.planned.runs;
+        (self.regions.iter())
+            .map(|r| {
+                let (mut at, mut n) = (r.units.start, 0);
+                while at < r.units.end {
+                    let longest = r.runs.iter().map(|&k| runs[k].units());
+                    at = longest
+                        .filter(|u| u.start == at)
+                        .map(|u| u.end)
+                        .max()
+                        .unwrap_or(at + 1);
+                    n += 1;
+                }
+                n * r.instances
+            })
+            .sum()
     }
 
     fn command(&self, a: usize) -> &'a LoweredCommand {
@@ -1141,8 +1280,12 @@ impl<'a> Gen<'a> {
                     end: step_at + u.steps.end - first_step,
                 })
                 .collect();
+            let required = (planned.required.iter())
+                .filter(|u| units.contains(&u.0))
+                .count() as u32;
             regions.push(MkRegion {
                 opens: self.baked[first_step as usize] as u32,
+                required,
                 table_at: region.table_at,
                 block_len: region.block_len,
                 units: baked(mk_units),
@@ -1212,12 +1355,13 @@ impl<'a> Gen<'a> {
         for (j, c) in calibrations.iter().enumerate() {
             let _ = writeln!(decls, "struct MkCal{j} {{");
             for k in c.constants {
+                let given = c.fixed.iter().find(|v| v.index == k.slot.get());
                 let value = match k.slot {
                     slot if slot == c.k_slot => literal(k.ty, c.k),
                     slot if slot == c.n_slot => format!("{}(MK_CAL_N)", msl_type(k.ty)),
-                    _ => literal(k.ty, 0),
+                    _ => literal(k.ty, given.map_or(0, |v| v.bits)),
                 };
-                let set = k.slot == c.k_slot || k.slot == c.n_slot;
+                let set = k.slot == c.k_slot || k.slot == c.n_slot || given.is_some();
                 let _ = writeln!(
                     decls,
                     "  static METAL_FUNC {} {}() {{ return {value}; }}\n  \
@@ -1230,13 +1374,22 @@ impl<'a> Gen<'a> {
             let _ = writeln!(decls, "}};");
             let call = replace_word(c.call, "MK_C", &format!("MkCal{j}"));
             let (tx, ty, tz) = c.tpg;
+            // One stream: the calibration's rows along the step's rows axis.
+            let mut grid = ["1u".to_string(), "1u".to_string(), "1u".to_string()];
+            grid[c.rows_axis] = format!("MK_CAL_N / {}u", c.rows);
+            let [gx, gy, gz] = grid;
             let step = |k: &str| {
                 format!(
-                    "const MkStep s = {{mk_a, uint3(1u, MK_CAL_N / {}u, 1u), uint3({tx}u, {ty}u, \
-                     {tz}u), {k}, {}u, 0u}};",
-                    c.rows, c.stride
+                    "const MkStep s = {{mk_a, uint3({gx}, {gy}, {gz}), uint3({tx}u, {ty}u, \
+                     {tz}u), {k}, {}u, {}u}};",
+                    c.stride, c.tg_bytes
                 )
             };
+            let after = match c.tg_bytes {
+                0 => "",
+                _ => "\n    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            };
+            let tg_memory = c.tg_memory.max(16).next_multiple_of(16);
             let head = |name: String| {
                 format!(
                     "[[kernel, max_total_threads_per_threadgroup(1024)]] void {name}(\n    \
@@ -1245,7 +1398,7 @@ impl<'a> Gen<'a> {
                      uint mk_t [[thread_index_in_threadgroup]],\n    \
                      uint mk_idx [[threadgroup_position_in_grid]],\n    \
                      uint mk_p [[threadgroups_per_grid]]) {{\n  \
-                     threadgroup uchar mk_tgm[16] __attribute__((aligned(16)));\n"
+                     threadgroup uchar mk_tgm[{tg_memory}] __attribute__((aligned(16)));\n"
                 )
             };
             let (lane, native) = (format!("mk_cal{j}"), format!("mk_cal{j}_native"));
@@ -1253,7 +1406,7 @@ impl<'a> Gen<'a> {
                 kernels,
                 "{}  {}\n  const uint items = (MK_CAL_N / {}u + mk_cal_k - 1u) / mk_cal_k;\n  \
                  for (uint it = mk_idx; it < items; it += mk_p) {{\n    \
-                 {call}(s, mk_lane(s, it, mk_t), mk_tgm);\n  }}\n}}\n\
+                 {call}(s, mk_lane(s, it, mk_t), mk_tgm);{after}\n  }}\n}}\n\
                  {}  {}\n  {call}(s, mk_lane(s, mk_idx, mk_t), mk_tgm);\n}}\n",
                 head(lane.clone()),
                 step("mk_cal_k"),
@@ -1269,6 +1422,7 @@ impl<'a> Gen<'a> {
                 bits: c.bits,
                 group: c.group,
                 scale_bytes: c.scale_bytes,
+                bindings: c.bindings,
                 act_bytes: 4,
                 tpg: c.tpg,
                 widest: c.widest,

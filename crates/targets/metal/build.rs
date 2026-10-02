@@ -260,9 +260,9 @@ struct MkMarker {
     writes: u32,
     /// An elementwise (`MK_TAIL`) adapter.
     tail: bool,
-    /// `(rows, bits, group size, scale bytes, k slot, n slot)` of an `MK_STREAM` adapter, and the
-    /// adapter call it calibrates with.
-    stream: Option<([u32; 6], String)>,
+    /// `(rows, bits, group size, scale bytes, k slot, n slot)` of an `MK_STREAMING` adapter, its
+    /// binding slots `(w, s, b, x, y)` (255: none), and the adapter call it calibrates with.
+    stream: Option<([u32; 6], [u32; 5], String)>,
     /// `(MSL type, name, index)` of the dispatch kernel's function constants.
     constants: Vec<(String, String, u32)>,
     /// The adapter call, `MK_C` standing for the step's constant policy.
@@ -360,6 +360,11 @@ fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
             scale_bytes,
             k,
             n,
+            w,
+            sc,
+            bi,
+            x,
+            y,
         ] = head[..]
         else {
             panic!("malformed MK_ADAPTER marker head: {head:?}");
@@ -406,7 +411,7 @@ fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
                     .clone()
                     .unwrap_or_else(|| panic!("MK_STREAM {function}: no calibration call"));
                 let geometry = [rows, bits, gs, scale_bytes, k, n].map(int);
-                (geometry, calibrate)
+                (geometry, [w, sc, bi, x, y].map(int), calibrate)
             }),
             constants,
             call,
@@ -457,13 +462,20 @@ fn write_mk_adapters_rs(out_dir: &Path, markers: &[MkMarker]) {
             m.tail,
             m.stream.as_ref().map_or(
                 "None".to_string(),
-                |([rows, bits, gs, scale, k, n], cal)| {
+                |([rows, bits, gs, scale, k, n], [w, sc, bi, x, y], cal)| {
+                    let opt = |v: &u32| match v {
+                        255 => "None".to_string(),
+                        v => format!("Some({v})"),
+                    };
                     format!(
                         "Some(MkStream {{ rows: {rows}, bits: {bits}, group: {gs}, \
-                     scale_bytes: {scale}, k: ConstSlot({k}), n: ConstSlot({n}), \
-                     calibrate: {cal:?} }})"
+                         scale_bytes: {scale}, k: ConstSlot({k}), n: ConstSlot({n}), \
+                         bindings: MkStreamBindings {{ weights: {w}, scales: {}, biases: {}, \
+                         input: {x}, output: {y} }}, calibrate: {cal:?} }})",
+                        opt(sc),
+                        opt(bi),
                     )
-                }
+                },
             ),
             constants.join(", "),
             m.call,

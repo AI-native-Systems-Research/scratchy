@@ -73,6 +73,10 @@ pub struct StepFlow<L> {
     /// inside a run are one lane group's, it follows them there — beside the run in which it
     /// spreads after a launch boundary of its own.
     pub whole: bool,
+    /// The locations this step touches ITEM BY ITEM: each of its items reads and writes there only
+    /// what the same-index items of the location's other touchers do (an elementwise step, a
+    /// per-head one), so its items placed with theirs wait on no other threadgroup.
+    pub local: Vec<L>,
 }
 
 /// A run of consecutive steps one threadgroup plays item by item.
@@ -546,6 +550,39 @@ where
     Some(tiling)
 }
 
+/// The units that open a launch on ANY placement of the plan (made from `steps`): the first, each
+/// at a segment break, and each that touches — other than item by item ([`StepFlow::local`]) — a
+/// location a multi-item unit wrote since the last such opening, or writes one a multi-item unit
+/// read there. Every other wait can be met inside a launch: on a single-item producer by a copy on
+/// every threadgroup, on a local one by playing each item where its producer's items run.
+pub fn required_launches<L: PartialEq>(plan: &FusionPlan, steps: &[StepFlow<L>]) -> Vec<UnitIx> {
+    let mut out = Vec::new();
+    // What multi-item units read and wrote since the last opening.
+    let (mut read, mut written): (Vec<&L>, Vec<&L>) = (Vec::new(), Vec::new());
+    for (u, unit) in (0u32..).zip(&plan.units) {
+        let flows = &steps[unit.steps.start as usize..unit.steps.end as usize];
+        let crosses = flows.iter().any(|f| {
+            let far = |l: &&L| !f.local.contains(l);
+            let reads = f.reads.iter().filter(far).any(|l| written.contains(&l));
+            let writes =
+                (f.writes.iter().filter(far)).any(|l| written.contains(&l) || read.contains(&l));
+            reads || writes
+        });
+        if u == 0 || flows[0].segment_break || crosses {
+            out.push(UnitIx(u));
+            read.clear();
+            written.clear();
+        }
+        if unit.items != Items::ONE {
+            for f in flows {
+                read.extend(&f.reads);
+                written.extend(&f.writes);
+            }
+        }
+    }
+    out
+}
+
 /// A unit every threadgroup may play for itself: a single item, whose copies write the same
 /// values ([`replicable`]).
 fn copyable<L: PartialEq>(unit: &Unit, steps: &[StepFlow<L>]) -> bool {
@@ -593,6 +630,7 @@ mod tests {
             items: items(n),
             segment_break: false,
             whole: false,
+            local: Vec::new(),
         }
     }
     /// The longest run each unit opens, from the first unit on: the fewest launches the runs
@@ -601,7 +639,7 @@ mod tests {
         let all = runs(&plan(steps), steps);
         let mut out: Vec<Run> = Vec::new();
         let mut at = 0;
-        while let Some(r) = all.iter().filter(|r| r.units.start == at).next_back() {
+        while let Some(r) = all.iter().rfind(|r| r.units.start == at) {
             at = r.units.end;
             out.push(r.clone());
         }
@@ -963,6 +1001,35 @@ mod tests {
         };
         assert_eq!(solve(10, 1), vec![0..2]);
         assert_eq!(solve(1, 50), vec![0..1, 1..2]);
+    }
+
+    /// A launch opens only where no placement meets a wait: a multi-item result read whole (a
+    /// matvec of a matvec), not one read item by item (an elementwise step of a matvec) nor a
+    /// single-item one (a norm, copied).
+    #[test]
+    fn a_launch_is_required_only_where_a_spread_result_is_read_whole() {
+        // norm (1) -> gate (4) and up (4) -> silu (4, item by item) -> down (4, whole) -> norm (1).
+        let mut steps = [
+            step(&[0], &[1], 1),
+            step(&[1], &[2], 4),
+            step(&[1], &[3], 4),
+            step(&[2, 3], &[4], 4),
+            step(&[4], &[5], 4),
+            step(&[5], &[6], 1),
+        ];
+        steps[3].local = vec![2, 3, 4];
+        let p = plan(&steps);
+        assert_eq!(
+            required_launches(&p, &steps),
+            vec![UnitIx(0), UnitIx(4), UnitIx(5)]
+        );
+        // silu read whole too: one more.
+        steps[3].local.clear();
+        let q = plan(&steps);
+        assert_eq!(
+            required_launches(&q, &steps),
+            vec![UnitIx(0), UnitIx(3), UnitIx(4), UnitIx(5)]
+        );
     }
 
     #[test]

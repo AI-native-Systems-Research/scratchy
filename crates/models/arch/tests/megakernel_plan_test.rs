@@ -15,7 +15,7 @@ use std::collections::HashSet;
 
 use scratchy_target_metal::interpreter::metal::MetalBucketSpec;
 use scratchy_target_metal::tape::lowered::{
-    ClassedTape, GateCtx, GenClass, MegakernelTape, MkPlace,
+    ClassedTape, GateCtx, GenClass, MegakernelTape, MkPlace, MkRegion,
 };
 
 fn check(name: &str, buckets: &[MetalBucketSpec]) {
@@ -239,14 +239,36 @@ fn check_class(name: &str, classed: &ClassedTape, printed: &mut HashSet<&'static
     }
     let fences = classed.tape.barriers_expanded();
     let dispatch_barriers = admitted.iter().filter(|&&i| fences[i]).count();
+    // Launches per forward: the fewest the dataflow allows on any placement, and the regions'
+    // longest runs.
+    let per_forward = |each: &dyn Fn(&MkRegion) -> u32| -> u32 {
+        (mk.regions.iter().zip(&instances))
+            .map(|(r, &n)| each(r) * n)
+            .sum()
+    };
+    let longest = |r: &MkRegion| {
+        let (mut at, mut n) = (0, 0);
+        while at < r.units.len() as u32 {
+            let ends = r.runs.iter().filter(|run| run.first == at);
+            at = ends
+                .map(|run| run.end)
+                .max()
+                .expect("every unit opens a run");
+            n += 1;
+        }
+        n
+    };
     println!(
         "{name}: {} commands, {} run at decode (dispatch: {dispatch_barriers} barriers), in {} \
-         regions ({} instances per forward) offering {runs} runs a launch may play; {} load \
-         constants; {} bytes of MSL",
+         regions ({} instances per forward) offering {runs} runs a launch may play; launches per \
+         forward the dataflow requires {}, the longest runs take {}; {} load constants; {} bytes \
+         of MSL",
         commands.len(),
         admitted.len(),
         mk.regions.len(),
         instances.iter().sum::<u32>(),
+        per_forward(&|r| r.required),
+        per_forward(&longest),
         mk.load_constants.len(),
         mk.source.len(),
     );

@@ -331,14 +331,38 @@ impl<'a> Probe<'a> {
         let vtgs = (STREAM_BYTES / vtg_bytes / slices).max(1) * slices;
         let vtgs = u32::try_from(vtgs).map_err(facts_error)?;
         let n = vtgs * c.rows;
-        let scales = u64::from(n) * u64::from(c.k.div_ceil(c.group) * c.scale_bytes);
-        let w = self.touched(u64::from(n) * u64::from(c.k * c.bits / 8))?;
-        let s = self.touched(scales)?;
-        let b = self.touched(scales)?;
-        let x = self.touched(u64::from(c.k * c.act_bytes))?;
-        let y = self.touched(u64::from(n * c.act_bytes))?;
-        let table = shared_slice(self.device, &[&w, &s, &b, &x, &y].map(|v| v.gpuAddress()));
-        let resident = [&w, &s, &b, &x, &y];
+        let w_row = u64::from(c.k * c.bits / 8);
+        let s_row = u64::from(c.k.div_ceil(c.group) * c.scale_bytes);
+        let at = c.bindings;
+        // Every buffer the body binds, at its binding, and how far a row moves it.
+        let mut bound = vec![
+            (at.weights, self.touched(u64::from(n) * w_row)?, w_row),
+            (at.input, self.touched(u64::from(c.k * c.act_bytes))?, 0),
+            (
+                at.output,
+                self.touched(u64::from(n * c.act_bytes))?,
+                u64::from(c.act_bytes),
+            ),
+        ];
+        for slot in [at.scales, at.biases].into_iter().flatten() {
+            bound.push((slot, self.touched(u64::from(n) * s_row)?, s_row));
+        }
+        let addresses = |first: u64| {
+            let mut a = vec![
+                0u64;
+                bound
+                    .iter()
+                    .map(|(i, ..)| usize::from(*i) + 1)
+                    .max()
+                    .unwrap_or(0)
+            ];
+            for (i, buf, row) in &bound {
+                a[usize::from(*i)] = buf.gpuAddress() + first * row;
+            }
+            a
+        };
+        let table = shared_slice(self.device, &addresses(0));
+        let resident: Vec<&Buffer> = bound.iter().map(|(_, b, _)| b).collect();
         let n_slot = MK_FC_CAL;
         let batch = |pso: &ComputePipelineState, k: u32, grid: u32, tpg: MTLSize, trials| {
             self.fastest(trials, |batch| {
@@ -383,20 +407,8 @@ impl<'a> Probe<'a> {
         let slice = vtgs / SPLITS;
         let sliced = vec![ConstantValue::uint(n_slot, slice * c.rows)];
         let sliced = self.pipeline(library, c.native, sliced)?;
-        let w_row = u64::from(c.k * c.bits / 8);
-        let s_row = u64::from(c.k.div_ceil(c.group) * c.scale_bytes);
         let tables: Vec<Buffer> = (0..SPLITS)
-            .map(|i| {
-                let first = u64::from(i * slice * c.rows);
-                let at = [
-                    w.gpuAddress() + first * w_row,
-                    s.gpuAddress() + first * s_row,
-                    b.gpuAddress() + first * s_row,
-                    x.gpuAddress(),
-                    y.gpuAddress() + first * u64::from(c.act_bytes),
-                ];
-                shared_slice(self.device, &at)
-            })
+            .map(|i| shared_slice(self.device, &addresses(u64::from(i * slice * c.rows))))
             .collect();
         let one = self.fastest(SPLIT_TRIALS, |batch| {
             batch.encode(
@@ -831,6 +843,7 @@ mod tests {
         };
         let region = MkRegion {
             opens: 0,
+            required: 1,
             table_at: 0,
             block_len: 0,
             units,
@@ -885,6 +898,7 @@ mod tests {
         ];
         let region = MkRegion {
             opens: 0,
+            required: 1,
             table_at: 0,
             block_len: 0,
             units,

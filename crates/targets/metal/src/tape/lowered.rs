@@ -2165,6 +2165,8 @@ pub struct MegakernelTape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct MkRegion {
     pub opens: u32,
+    /// Launches an instance needs on ANY placement: where a multi-item result is read whole.
+    pub required: u32,
     pub table_at: u32,
     pub block_len: u32,
     /// Its units in order, each the steps `[first, end)` of [`MegakernelTape::steps`]: a
@@ -2253,9 +2255,9 @@ pub struct MkStreamWork {
 /// items of `K` virtual threadgroups (the `uint` at binding 1) round-robin over one threadgroup of
 /// [`MK_THREADS`] per core, as a run spreads a step; kernel `native` plays one virtual threadgroup
 /// per threadgroup of `tpg`, as the step's own dispatch kernel. Both read `n` rows (function constant `MK_CAL_N`, a
-/// multiple of `rows` per virtual threadgroup) of `k` codes of `bits` bits, a scale and a bias of
-/// `scale_bytes` per `group` codes, from bindings `w, scales, biases, x, y` (activations of
-/// `act_bytes`). `widest`: the most virtual threadgroups an item may hold.
+/// multiple of `rows` per virtual threadgroup) of `k` values of `bits` bits, a scale and a bias of
+/// `scale_bytes` per `group` values, through `bindings` (activations of at most `act_bytes`).
+/// `widest`: the most virtual threadgroups an item may hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct MkCalibration {
     pub lane: &'static str,
@@ -2265,6 +2267,7 @@ pub struct MkCalibration {
     pub bits: u32,
     pub group: u32,
     pub scale_bytes: u32,
+    pub bindings: MkStreamBindings,
     pub act_bytes: u32,
     pub tpg: (u32, u32, u32),
     pub widest: u32,
@@ -2363,10 +2366,10 @@ pub struct MkAdapter {
 }
 
 /// The weights one virtual threadgroup of a streaming body reads: `rows` of the step's constant at
-/// slot `n` rows, each the constant at slot `k` codes of `bits` bits plus a scale and a bias of
-/// `scale_bytes` per `group` codes; and `calibrate`, a matvec adapter call (`MK_C` the constant policy, bindings
-/// `w, scales, biases, x, y`) that streams them the same way — what the load measures the device
-/// with.
+/// slot `n` rows, each the constant at slot `k` values of `bits` bits plus a scale and a bias of
+/// `scale_bytes` per `group` values, through `bindings`; and `calibrate`, an adapter call (`MK_C`
+/// the constant policy, the same bindings) that streams them the same way — what the load measures
+/// the device with.
 #[derive(Clone, Copy, Debug)]
 pub struct MkStream {
     pub rows: u32,
@@ -2375,7 +2378,19 @@ pub struct MkStream {
     pub scale_bytes: u32,
     pub k: ConstSlot,
     pub n: ConstSlot,
+    pub bindings: MkStreamBindings,
     pub calibrate: &'static str,
+}
+
+/// Where a streaming body binds its weights (their scales and biases, when it reads any), its
+/// input vector and its output, by binding index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkStreamBindings {
+    pub weights: u8,
+    pub scales: Option<u8>,
+    pub biases: Option<u8>,
+    pub input: u8,
+    pub output: u8,
 }
 
 impl MkStream {

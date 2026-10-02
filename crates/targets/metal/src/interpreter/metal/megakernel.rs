@@ -386,11 +386,12 @@ impl SegmentedLoad {
         for (r, (region, plan)) in tape.regions.iter().zip(&self.plans).enumerate() {
             let _ = writeln!(
                 out,
-                "[split] region {r} (opens baked {}, x{} per forward): {} launches, {} (longest \
-                 runs {}, every command its own kernel {})",
+                "[split] region {r} (opens baked {}, x{} per forward): {} launches (the dataflow \
+                 requires {}), {} (longest runs {}, every command its own kernel {})",
                 region.opens,
                 self.instances[r],
                 plan.tiles.len(),
+                region.required,
                 plan.seconds(),
                 plan.longest,
                 plan.dispatch,

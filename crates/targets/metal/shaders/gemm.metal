@@ -279,9 +279,14 @@ kernel void gemm_f16_specialized(
                     a_pad, b_pad, c_scratch, tgid, tid3.x);
 }
 #else
-MK_ADAPTER(gemm_bf16_specialized, 1408, (mk_gemm<bfloat, simdgroup_bfloat8x8, MK_C>),
-           GEMM_CONSTS)
-MK_ADAPTER(gemm_f16_specialized, 1408, (mk_gemm<half, simdgroup_half8x8, MK_C>), GEMM_CONSTS)
+// Streaming its weights: a virtual threadgroup reads the 8 weight rows of its output tile, each
+// `k` (constant slot 2) 16-bit values; bound output 0, input 1, weights 2.
+MK_STREAMING(gemm_bf16_specialized, 1408, 8, 16, 1, 0, 2, 1, 2, 255, 255, 1, 0, 0x1,
+             (mk_gemm<bfloat, simdgroup_bfloat8x8, MK_C>),
+             (mk_gemm<bfloat, simdgroup_bfloat8x8, MK_C>), GEMM_CONSTS)
+MK_STREAMING(gemm_f16_specialized, 1408, 8, 16, 1, 0, 2, 1, 2, 255, 255, 1, 0, 0x1,
+             (mk_gemm<half, simdgroup_half8x8, MK_C>), (mk_gemm<half, simdgroup_half8x8, MK_C>),
+             GEMM_CONSTS)
 #endif
 
 #ifndef MK_BODIES_ONLY
