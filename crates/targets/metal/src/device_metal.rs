@@ -26,8 +26,8 @@ pub struct GpuDevice {
     /// ladder so the activation arena matches the KV budget. `None` = keep all
     /// compiled buckets (no pruning).
     pub metal_bucket_max_m: Option<u32>,
-    /// How the forward plays the baked tapes: the decode megakernel's segment kernels they carry
-    /// (the default), or one dispatch per command. Read per forward, never from the environment.
+    /// How the forward plays the baked tapes: the decode megakernel's launches they carry, solved
+    /// for the device (the default), or one dispatch per command. Read per forward, never from the environment.
     pub metal_tape_play: crate::tape::lowered::TapePlay,
 }
 

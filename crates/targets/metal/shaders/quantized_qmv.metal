@@ -1106,21 +1106,28 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,1)
 #else
-// Megakernel mode: each instantiation line names the decode (batch_0) adapters. Item widths
-// measured on the base M5 (10 threadgroups of 1024, weights streamed from DRAM): qmv_fast
-// K 3072 / 8192 streams 135 GB/s at 256 threads per item, 128 at 512, 123 at 1024 (dispatch 130);
-// qmv K 2816: 106 at 256, 130 at 512, 123 at 1024 (dispatch 127); K 4864 / 6912: 123 / 126 at 512,
-// 110 / 118 at 1024. SHORT rows (K below 2048, a few 256-value passes per row) want every thread:
-// K 896 / 1152 stream 88 / 93 GB/s at 512, 113 / 112 at 1024 (dispatch 101 / 107).
+// Megakernel mode: each instantiation line names the decode (batch_0) adapters, each streaming
+// its weights: a virtual threadgroup reads 8 rows (qmv_fast, qmv) or 64 (qmv_quad) of `k` codes
+// (constant slot 0), of `n` rows (slot 1).
+#define MK_SCALE_BYTES_f16 2
+#define MK_SCALE_BYTES_bf16 2
 #define INST_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs)                            \
-  MK_STREAM(affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, 256, 0x10,       \
+  MK_STREAM(affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, 8, 4, gs,       \
+            MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                           \
+            (mk_affine_qmv_fast<act_type, scale_type, gs, 4, MK_C>),                          \
             (mk_affine_qmv_fast<act_type, scale_type, gs, 4, MK_C>), QMV_CONSTS)              \
-  MK_STREAM_ROWS(affine_qmv_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, 512, 1024, 0, 2048, \
-                 0x10, (mk_affine_qmv<act_type, scale_type, gs, 4, MK_C>), QMV_CONSTS)        \
-  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_d_64_batch_0, 1024,       \
-            0x10, (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 64, MK_C>), QMV_CONSTS)  \
-  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_d_128_batch_0, 1024,       \
-            0x10, (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 128, MK_C>), QMV_CONSTS)
+  MK_STREAM(affine_qmv_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, 8, 4, gs,            \
+            MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                           \
+            (mk_affine_qmv<act_type, scale_type, gs, 4, MK_C>),                               \
+            (mk_affine_qmv<act_type, scale_type, gs, 4, MK_C>), QMV_CONSTS)                   \
+  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_d_64_batch_0, 64, 4, gs, \
+            MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                           \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 64, MK_C>),                      \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 64, MK_C>), QMV_CONSTS)          \
+  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_d_128_batch_0, 64, 4,    \
+            gs, MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                       \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 128, MK_C>),                     \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 4, 128, MK_C>), QMV_CONSTS)
 #endif
 
 // Coverage: T_scale=half always (every sampled mlx-community 4bit ships
@@ -1156,14 +1163,22 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 128,0)
 #else
 #define INST_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs)                         \
-  MK_ADAPTER(affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_batch_0, 0,         \
-             (mk_affine_qmv_fast<act_type, scale_type, gs, 8, MK_C>), QMV_CONSTS)             \
-  MK_ADAPTER(affine_qmv_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_batch_0, 0,              \
-             (mk_affine_qmv<act_type, scale_type, gs, 8, MK_C>), QMV_CONSTS)                  \
-  MK_ADAPTER(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_d_64_batch_0, 0,       \
-             (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 64, MK_C>), QMV_CONSTS)         \
-  MK_ADAPTER(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_d_128_batch_0, 0,       \
-             (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 128, MK_C>), QMV_CONSTS)
+  MK_STREAM(affine_qmv_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_batch_0, 8, 8, gs,       \
+            MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                           \
+            (mk_affine_qmv_fast<act_type, scale_type, gs, 8, MK_C>),                          \
+            (mk_affine_qmv_fast<act_type, scale_type, gs, 8, MK_C>), QMV_CONSTS)              \
+  MK_STREAM(affine_qmv_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_batch_0, 8, 8, gs,            \
+            MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                           \
+            (mk_affine_qmv<act_type, scale_type, gs, 8, MK_C>),                               \
+            (mk_affine_qmv<act_type, scale_type, gs, 8, MK_C>), QMV_CONSTS)                   \
+  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_d_64_batch_0, 64, 8, gs, \
+            MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                           \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 64, MK_C>),                      \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 64, MK_C>), QMV_CONSTS)          \
+  MK_STREAM(affine_qmv_quad_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_d_128_batch_0, 64, 8,    \
+            gs, MK_SCALE_BYTES_##scale_tag, 0, 1, 0x10,                                       \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 128, MK_C>),                     \
+            (mk_affine_qmv_quad<act_type, scale_type, gs, 8, 128, MK_C>), QMV_CONSTS)
 #endif
 
 INST_QMV_ALL_B8(bf16, bfloat, bf16, bfloat, 64)
@@ -1496,17 +1511,18 @@ template <typename T_act, typename T_scale, int group_size, int bits>
   [[kernel]] decltype(name<act_type, scale_type, gs, bits>)                                      \
       name<act_type, scale_type, gs, bits>;
 #else
-// Megakernel mode: each instantiation line names its adapter (`fast` from the kernel's name), its
-// item width that of its matvec body (INST_QMV_ALL).
+// Megakernel mode: each instantiation line names its adapter (`fast` from the kernel's name), a
+// virtual threadgroup streaming 8 rows of one expert as its matvec body does (INST_QMV_ALL) — the
+// adapter it calibrates with.
 #define MK_GATHER_FAST_affine_gather_qmv_fast true
 #define MK_GATHER_FAST_affine_gather_qmv false
-#define MK_GATHER_ITEM_affine_gather_qmv_fast 256
-#define MK_GATHER_ITEM_affine_gather_qmv 512
+#define MK_GATHER_DENSE_affine_gather_qmv_fast mk_affine_qmv_fast
+#define MK_GATHER_DENSE_affine_gather_qmv mk_affine_qmv
 #define INST_GATHER_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits)                 \
-  MK_STREAM(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits, MK_GATHER_ITEM_##name,       \
-            0x20,                                                                                \
+  MK_STREAM(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits, 8, bits, gs,                  \
+            MK_SCALE_BYTES_##scale_tag, 0, 1, 0x20,                                               \
             (mk_affine_gather_qmv<act_type, scale_type, gs, bits, MK_GATHER_FAST_##name, MK_C>), \
-            QMV_CONSTS)
+            (MK_GATHER_DENSE_##name<act_type, scale_type, gs, bits, MK_C>), QMV_CONSTS)
 #endif
 
 #define INST_GATHER_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs) \

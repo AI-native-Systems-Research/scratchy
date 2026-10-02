@@ -128,17 +128,32 @@ pub fn commit_and_wait(
     event: &ProtocolObject<dyn MTLSharedEvent>,
     value: u64,
 ) -> Result<(), CommandFailure> {
+    commit_and_time(queue, cb, event, value).map(drop)
+}
+
+/// [`commit_and_wait`], returning how long the GPU ran the command buffer: from its start to its
+/// end, as Metal reports them.
+pub fn commit_and_time(
+    queue: &ProtocolObject<dyn MTL4CommandQueue>,
+    cb: &ProtocolObject<dyn MTL4CommandBuffer>,
+    event: &ProtocolObject<dyn MTLSharedEvent>,
+    value: u64,
+) -> Result<std::time::Duration, CommandFailure> {
     use block2::RcBlock;
     use objc2_metal::{MTL4CommitFeedback, MTL4CommitOptions};
     use std::sync::{Arc, Condvar, Mutex};
-    let report: Arc<(Mutex<Option<Result<(), CommandFailure>>>, Condvar)> = Arc::default();
+    type Report = Option<Result<std::time::Duration, CommandFailure>>;
+    let report: Arc<(Mutex<Report>, Condvar)> = Arc::default();
     let options = MTL4CommitOptions::new();
     let handler = {
         let report = Arc::clone(&report);
         RcBlock::new(
             move |feedback: std::ptr::NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
-                let outcome = match unsafe { feedback.as_ref() }.error() {
-                    None => Ok(()),
+                let feedback = unsafe { feedback.as_ref() };
+                let outcome = match feedback.error() {
+                    None => Ok(std::time::Duration::from_secs_f64(
+                        (feedback.GPUEndTime() - feedback.GPUStartTime()).max(0.0),
+                    )),
                     Some(error) => {
                         // The NSError's userInfo (nested underlying errors) names the faulting
                         // encoder, which the typed failure cannot carry; `description` renders
@@ -474,6 +489,14 @@ impl Mtl4DispatchBatch {
     /// that takes); `self`'s resources drop only then. Panics if the GPU fails
     /// the command buffer.
     pub fn commit(self) {
+        if let Err(failure) = self.try_commit() {
+            panic!("MTL4 dispatch batch: {failure}");
+        }
+    }
+
+    /// [`Self::commit`], the GPU's failure returned; on success, how long the GPU ran the batch
+    /// ([`commit_and_time`]).
+    pub fn try_commit(self) -> Result<std::time::Duration, CommandFailure> {
         self.enc.endEncoding();
         // Commit the now-populated residency set, THEN attach it to the CB
         // (between begin and endCommandBuffer) so the driver wires every bound +
@@ -486,8 +509,6 @@ impl Mtl4DispatchBatch {
             self.res.attach_to_mtl4_command_buffer(cb_ptr);
         }
         self.cb.endCommandBuffer();
-        if let Err(failure) = commit_and_wait(&self.queue4, &self.cb, &self.event, 1) {
-            panic!("MTL4 dispatch batch: {failure}");
-        }
+        commit_and_time(&self.queue4, &self.cb, &self.event, 1)
     }
 }

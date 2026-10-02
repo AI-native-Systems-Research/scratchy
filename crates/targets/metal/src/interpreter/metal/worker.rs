@@ -53,7 +53,7 @@ pub enum BucketStep {
     Dispatch {
         /// Kernel id of every dispatch in this step. Coalescing
         /// requires same pipeline (same kernel), so one id is
-        /// authoritative for the whole step. `None`: a segment kernel
+        /// authoritative for the whole step. `None`: a generated kernel
         /// of the bucket's decode megakernel.
         kernel: Option<super::lowered::KernelId>,
         /// Pipeline state for this step's kernel(s).
@@ -781,7 +781,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 };
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
-                // A segment kernel fuses the commands it plays.
+                // A generated kernel fuses the commands it plays.
                 #[cfg(feature = "forward-telemetry")]
                 if tape_enabled {
                     tape.push(TapeEntry {
@@ -975,8 +975,10 @@ fn bake_bucket<W: CanonicalParams>(
     let mut inline_cursor: u32 = 0;
 
     let mut steps: Vec<BucketStep> = Vec::new();
-    // Every command's resolved bindings, when the megakernel's address table needs them.
+    // Every command's resolved bindings and own dispatch kernel, when the megakernel's address
+    // table and native launches need them.
     let mut bound_by_command: Vec<Vec<super::megakernel::BoundBinding>> = Vec::new();
+    let mut natives: Vec<super::megakernel::Native> = Vec::new();
 
     for (cmd_idx, gated) in expanded_commands.iter().enumerate() {
         let cmd = &gated.command;
@@ -1014,9 +1016,6 @@ fn bake_bucket<W: CanonicalParams>(
             .iter()
             .map(|(b, off, idx)| ((*b).clone(), *off, *idx))
             .collect();
-        if megakernel.is_some() {
-            bound_by_command.push(bindings_for_cmd.clone());
-        }
         let dispatch_for_cmd = (
             MTLSize {
                 width: (tg.width),
@@ -1032,6 +1031,15 @@ fn bake_bucket<W: CanonicalParams>(
         let cmd_barrier = expanded_barriers.get(cmd_idx).copied().unwrap_or(true);
         let cmd_gate = gated.gate;
         let cmd_m_scaling = cmd.dispatch.m_scaling;
+        if megakernel.is_some() {
+            bound_by_command.push(bindings_for_cmd.clone());
+            natives.push(super::megakernel::Native {
+                kernel: cmd.kernel,
+                pipeline: pipeline.clone(),
+                dispatch: dispatch_for_cmd,
+                m_scaling: cmd_m_scaling,
+            });
+        }
         // Coalesce only when the gate matches too — a `OnlyIfSingleSeq`
         // dispatch can't share a step with an ungated dispatch since
         // they fire under different runtime conditions.
@@ -1080,17 +1088,19 @@ fn bake_bucket<W: CanonicalParams>(
                 &expanded_commands,
                 &baked_of,
                 &bound_by_command,
+                &natives,
                 pipelines,
                 &device,
             )?;
             if std::env::var_os("SCRATCHY_METAL_TRACE").is_some() {
                 eprintln!(
-                    "[megakernel] bucket_m={} {} segment kernels play {} of {} \
-                     commands in {} launches per forward; library {} ({} bytes metallib) loaded \
-                     in {:?}; pipelines built in {:?}; maxTotalThreadsPerThreadgroup {:?}; \
-                     threadgroups per launch P={}",
+                    "[megakernel] bucket_m={} {} generated kernels and {} commands' own kernels \
+                     play {} of {} commands in {} launches per forward; library {} ({} bytes \
+                     metallib) loaded in {:?}; pipelines built in {:?}; \
+                     maxTotalThreadsPerThreadgroup {:?}; threadgroups per launch P={}",
                     tape.bucket_m,
                     load.kernels,
+                    load.natives,
                     load.commands,
                     expanded_commands.len(),
                     load.launches,
@@ -1101,6 +1111,7 @@ fn bake_bucket<W: CanonicalParams>(
                     load.max_threads,
                     load.threadgroups,
                 );
+                eprint!("{}", load.explain(mk));
             }
             Some(segmented)
         }

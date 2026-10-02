@@ -264,6 +264,7 @@ impl SpecializedPipelineCache {
                     crate::embedded_metallib!("embedding_gather"),
                 ),
                 ("avg_pool_2d", crate::embedded_metallib!("avg_pool_2d")),
+                ("device_facts", crate::embedded_metallib!("device_facts")),
             ],
         )
     }

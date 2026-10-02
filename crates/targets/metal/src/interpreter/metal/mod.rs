@@ -20,6 +20,7 @@ pub mod megakernel;
 pub mod mtl4;
 pub mod pool;
 pub mod runtime;
+pub mod split;
 pub mod worker;
 
 /// Re-export of `crate::quantized::ScaleDtype` so the

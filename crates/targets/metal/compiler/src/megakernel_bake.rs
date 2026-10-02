@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE DECODE MEGAKERNEL, COMPILED — per bucket-1 tape, at expansion.
 //!
-//! The decode forward becomes generated SEGMENT kernels. Every command the planned context
+//! The decode forward becomes generated kernels. Every command the planned context
 //! ([`GateCtx::decode_one`]) admits is fed to the SHARED plan ([`plan`]) with the dataflow of the
 //! step row it came from ([`RowAccess`], the barrier walk's hazard signature named): all commands
 //! of a row carry the row's whole access set, so a multi-command row is ordered by its own
@@ -9,27 +9,30 @@
 //! load-time scalar modeled ([`MkLoadConstant`]) — or the bake fails, naming each command that
 //! stopped it.
 //!
-//! The shared pass cuts the plan into segments ([`segment`]) — runs in which every wait is met by
-//! one threadgroup — and each segment is COMPILED here into MSL: one `[[kernel]]` whose body is
-//! the segment's steps in order as straight-line adapter calls — every constant a literal of the
-//! step's policy struct, every geometry a literal, the work split a compile-time round-robin over
-//! the launch's `MK_P` threadgroups — and nothing else: a kernel holds only its own segment's
-//! bodies, and nothing in it waits on another threadgroup. The tape's layer loops stay ROLLED
-//! exactly as the tape keeps them (a segment break at every iteration start makes every iteration
-//! segment alike, which the bake checks), so one kernel plays a segment in every iteration. Only
-//! binding ADDRESSES and the load's scalars are runtime data: a launch reads its steps' addresses
-//! from the block of the address table its instance binds, at positions fixed here; the scalars
-//! are function constants.
+//! The shared pass offers every RUN one launch may play ([`runs`]: units in which every wait is
+//! met by one threadgroup), and each run is COMPILED here into MSL: one `[[kernel]]` whose body is
+//! the run's steps in order as straight-line adapter calls — every constant a literal of the
+//! step's policy struct, every geometry a literal — and nothing else: nothing in it waits on
+//! another threadgroup. Its work split over the launch's `MK_P` threadgroups — each spread step's
+//! virtual threadgroups per item and its items' cursor, each lane group's threadgroup — is
+//! function constants. Which runs play the forward, beside each command's own dispatch kernel,
+//! and how each splits, is solved at load from the device's measured facts (the runtime's
+//! `split`). The tape's layer loops stay ROLLED exactly as the tape keeps them: a REGION — the
+//! units from a loop iteration's start to the next boundary every plan keeps — offers the same
+//! runs in every iteration, which the bake checks, so one kernel plays a run in every iteration.
+//! Only binding ADDRESSES and the load's scalars are runtime data: a launch reads its steps'
+//! addresses from the block of the address table its region instance binds, at positions fixed
+//! here.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::num::NonZeroU32;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use std::num::NonZeroU32;
-
 use scratchy_subtile::megakernel_plan::{
-    Cut, FusionPlan, Items, LocalWait, Placement, Segments, StepFlow, UnitIx, plan, segment,
+    FusionPlan, Items, Placement, Run, StepFlow, UnitIx, plan, runs,
 };
 use scratchy_target_metal::interpreter::metal::megakernel::MK_BODIES;
 use scratchy_target_metal::msl_offline::{AIR_TO_METALLIB, MSL_TO_AIR};
@@ -42,19 +45,14 @@ use scratchy_target_metal::tape::kernel_constants::{
 };
 use scratchy_target_metal::tape::lowered::{
     Binding, BindingMask, CapPatch, CommandOrigin, GateCtx, GatedCommand, KernelId, LoweredCommand,
-    LoweredMetalTape, MK_FC_LOAD, MK_TG_MEMORY, MK_THREADS, MScaleAxis, MegakernelError,
-    MegakernelTape, MkAdapter, MkCut, MkGeometry, MkKernelStep, MkLoadConstant, MkLoadSource,
-    MkPlace, MkSegment, PatchTarget, RuntimeBindingKind, TapeLoop, baked, mk_geometry,
+    LoweredMetalTape, MK_FC_CAL, MK_FC_HEADS, MK_FC_LOAD, MK_FC_SPLIT, MK_TG_MEMORY, MK_THREADS,
+    MScaleAxis, MegakernelError, MegakernelTape, MkAdapter, MkCalibration, MkConst, MkGeometry,
+    MkHeads, MkKernelStep, MkLoadConstant, MkLoadSource, MkPlace, MkRegion, MkRun, MkStreamWork,
+    MkUnit, MkWork, PatchTarget, RuntimeBindingKind, TapeLoop, baked, mk_geometry,
 };
 use scratchy_target_metal::tape::step::{MetalLoc, MetalStep, MetalStepTape, RowAccess, StepRow};
 
 use crate::static_tape::BakeDefect;
-
-/// An elementwise step ([`MkAdapter::tail`]: a residual add, a scalar scale) of at most this many
-/// items may be played whole by the threadgroup that ran what it waits on, instead of spreading
-/// in a segment of its own: a few passes of one threadgroup cost less than the launch boundary
-/// (~3 us in the forward). A heavier step (a matvec, a gemm) is spread, however few its items.
-const MK_WHOLE_ITEMS: u32 = 4;
 
 /// K or V: the halves of a KV cache, of the codec's fp16 scratch and of a coded layer's store.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -211,13 +209,12 @@ impl KvAliasing {
     }
 }
 
-/// A decode attention's (fp16 KV) query heads per virtual threadgroup, as the device's pick for
-/// TurboQuant decode makes it ([`TqDecodeHeads::for_group`]) at the launch's threadgroups — the
-/// GPU's cores, `MK_P`, known at load — so its items fill them instead of spilling into another
-/// round. The rule's candidates, most heads first: `(q / h, h)`, `h` taken
-/// when `q / h ≥ ⌊4·MK_P / 5⌋`, else one head. `None`: not a decode attention, or one head on
-/// every GPU. The body computes each head exactly as it does one head per threadgroup.
-fn heads_rule(cmd: &LoweredCommand) -> Option<Vec<(u32, u32)>> {
+/// A decode attention (fp16 KV) whose query heads may group per virtual threadgroup — the
+/// device's pick for TurboQuant decode at the launch's threadgroups ([`TqDecodeHeads::for_group`]),
+/// made at load ([`MkHeads`]) — by its geometry `(head_dim, q heads, kv heads)`. `None`: not a
+/// decode attention, or one head on every GPU. The body computes each head exactly as it does one
+/// head per threadgroup.
+fn heads_of(cmd: &LoweredCommand) -> Option<(u32, u32, u32)> {
     if cmd.kernel != KernelId::AttentionViaCache {
         return None;
     }
@@ -226,30 +223,15 @@ fn heads_rule(cmd: &LoweredCommand) -> Option<Vec<(u32, u32)>> {
         c.map(|v| v.bits)
     };
     use AttentionViaCacheConstants as A;
-    let q = at(A::NUM_Q_HEADS)?;
-    let candidates = TqDecodeHeads::candidates(
-        HeadDim(at(A::HEAD_DIM)?),
-        NumQHeads(q),
-        NumKvHeads(at(A::NUM_KV_HEADS)?),
-    );
-    let mut rule: Vec<(u32, u32)> = candidates
-        .map(|h| (q / h.get(), h.get()))
-        .filter(|&(_, h)| h > 1)
-        .collect();
-    rule.reverse();
-    (!rule.is_empty()).then_some(rule)
+    let (hd, q, kv) = (at(A::HEAD_DIM)?, at(A::NUM_Q_HEADS)?, at(A::NUM_KV_HEADS)?);
+    TqDecodeHeads::candidates(HeadDim(hd), NumQHeads(q), NumKvHeads(kv))
+        .any(|h| h.get() > 1)
+        .then_some((hd, q, kv))
 }
 
-/// [`heads_rule`] as MSL: a function of `MK_P` the pipeline's specialization folds.
-fn heads_msl(rule: &[(u32, u32)]) -> String {
-    rule.iter().rev().fold("1u".into(), |e, (threadgroups, h)| {
-        format!("({threadgroups}u >= MK_P * 4u / 5u ? {h}u : {e})")
-    })
-}
-
-/// A command as a segment kernel plays it: its constants and grid, one head per virtual
-/// threadgroup (a decode attention's grouping, [`heads_rule`], is spelled in `MK_P` where the step
-/// is).
+/// A command as a generated kernel plays it: its constants and grid, one head per virtual
+/// threadgroup (a decode attention's grouping, [`heads_of`], divides the grid where the step is
+/// spelled).
 fn played(cmd: &LoweredCommand) -> (Vec<ConstantValue>, (u32, u32, u32)) {
     (
         cmd.constants.to_vec(),
@@ -257,247 +239,19 @@ fn played(cmd: &LoweredCommand) -> (Vec<ConstantValue>, (u32, u32, u32)) {
     )
 }
 
-/// A step's geometry: its adapter's widest packing — what the plan and schedule see — or items of
-/// `vtgs_per_item` virtual threadgroups.
+/// A step's geometry in items of `vtgs_per_item` virtual threadgroups, or (`None`) of as many as
+/// one threadgroup's threads and memory hold — its widest, what the plan sees.
 fn step_geometry(
     cmd: &LoweredCommand,
     adapter: &MkAdapter,
     vtgs_per_item: Option<u32>,
 ) -> Result<MkGeometry, MegakernelError> {
-    let (constants, grid) = played(cmd);
+    let (_, grid) = played(cmd);
     let tpg = cmd.dispatch.threads_per_threadgroup;
-    let item_threads = adapter.item_threads_for(&constants);
-    let widest = mk_geometry(grid, tpg, adapter.tg_bytes, item_threads)?;
+    let widest = mk_geometry(grid, tpg, adapter.tg_bytes, MK_THREADS)?;
     match vtgs_per_item {
         Some(k) => mk_geometry(grid, tpg, adapter.tg_bytes, k * widest.vtg_stride),
         None => Ok(widest),
-    }
-}
-
-/// A spread step as its segment's packing reads it: its virtual threadgroups (MSL: a literal, or
-/// with its decode attention's heads grouped, [`heads_rule`]), its declared items (the plan's),
-/// and — `fit`: `None` for a grid the load sizes, played at its widest — its items' virtual
-/// threadgroups at its adapter's width and across the whole physical threadgroup.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct SpreadIn {
-    vtgs: String,
-    declared: u32,
-    fit: Option<(u32, u32)>,
-}
-
-/// One segment's work split, as every segment of its shape spells it: its spread steps in order,
-/// its pinned units that wait on nothing in the segment (`free`: each keeps a slot of the last
-/// round), and its pinned lane groups (a unit and the units of its segment it waits on share a
-/// lane).
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct SegmentShape {
-    spread: Vec<SpreadIn>,
-    free: u32,
-    groups: u32,
-}
-
-/// Where a unit runs, as the kernel spells it: spread step `ord` of segment shape `shape`, the
-/// lane of pinned group `group` of it, or on every threadgroup.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Place {
-    Spread { shape: usize, ord: usize },
-    Pinned { shape: usize, group: u32 },
-    Everywhere,
-}
-
-/// A segment whose items, at their adapters' widths, fill at most this many rounds is bound by its
-/// rounds, not by its streams: its items widen up to the whole physical threadgroup, so every lane
-/// plays one even share (Qwen3-0.6B's 128-tile down and output projections: -0.12 ms/token on a
-/// base M5; segments of up to 8 rounds measured the same there).
-const MK_ROUND_BOUND_SEGMENT: u32 = 4;
-
-/// Places each segment's units ([`Place`]) and collects the segment shapes they spell. The split
-/// itself is the shape's [`SegmentShape::msl`]: a function of the launch's `MK_P`.
-fn pack_segments(
-    segs: &Segments,
-    plan: &FusionPlan,
-    spread_in: &[SpreadIn],
-) -> (Vec<Place>, Vec<SegmentShape>) {
-    let mut places = vec![Place::Everywhere; plan.units.len()];
-    let mut shapes: Vec<SegmentShape> = Vec::new();
-    let placements = segs.placements();
-    for seg in segs.segments() {
-        let units: Vec<usize> = seg.units.clone().map(|u| u as usize).collect();
-        let first = |u: usize| plan.units[u].steps.start as usize;
-        let local = |u: usize| segs.local_waits(UnitIx(u as u32));
-        let spread: Vec<usize> = units
-            .iter()
-            .copied()
-            .filter(|&u| matches!(placements[u], Placement::Spread { .. }))
-            .collect();
-        let pinned: Vec<usize> = units
-            .iter()
-            .copied()
-            .filter(|&u| matches!(placements[u], Placement::Pinned(_)))
-            .collect();
-        let free = pinned.iter().filter(|&&u| local(u).is_empty()).count() as u32;
-        // The pinned units in lane groups: a unit and the units it follows on their lane share it.
-        let mut group: Vec<usize> = (0..pinned.len()).collect();
-        let root = |g: &[usize], mut i: usize| {
-            while g[i] != i {
-                i = g[i];
-            }
-            i
-        };
-        for (i, &u) in pinned.iter().enumerate() {
-            for (w, _) in local(u)
-                .iter()
-                .filter(|(_, wait)| matches!(wait, LocalWait::SameLane(_)))
-            {
-                if let Some(j) = pinned.iter().position(|&p| p == w.0 as usize) {
-                    let (a, b) = (root(&group, i), root(&group, j));
-                    group[a.max(b)] = a.min(b);
-                }
-            }
-        }
-        let mut ordinal: Vec<Option<u32>> = vec![None; pinned.len()];
-        let mut groups = 0u32;
-        let group_of: Vec<u32> = (0..pinned.len())
-            .map(|i| {
-                let r = root(&group, i);
-                *ordinal[r].get_or_insert_with(|| {
-                    groups += 1;
-                    groups - 1
-                })
-            })
-            .collect();
-        let shape = SegmentShape {
-            spread: spread
-                .iter()
-                .map(|&u| spread_in[first(u)].clone())
-                .collect(),
-            free,
-            groups,
-        };
-        let shape = match shapes.iter().position(|s| *s == shape) {
-            Some(s) => s,
-            None => {
-                shapes.push(shape);
-                shapes.len() - 1
-            }
-        };
-        for (ord, &u) in spread.iter().enumerate() {
-            places[u] = Place::Spread { shape, ord };
-        }
-        for (i, &u) in pinned.iter().enumerate() {
-            places[u] = Place::Pinned {
-                shape,
-                group: group_of[i],
-            };
-        }
-    }
-    (places, shapes)
-}
-
-impl SegmentShape {
-    /// The split of every segment of shape `s` among the launch's `mk_p` threadgroups, as
-    /// functions of `mk_p` the kernel inlines. The segment keeps the fewest rounds its items allow
-    /// — at their adapters' widths, or across the whole threadgroup for a segment of few rounds
-    /// ([`MK_ROUND_BOUND_SEGMENT`]) — a slot of the last round left to each free pinned unit; the
-    /// slots those rounds hold beyond the items go to the steps in proportion to their virtual
-    /// threadgroups, each step's items then even (`MK_S{s}_K{i}` virtual threadgroups per item,
-    /// `MK_S{s}_N{i}` items, starting at cursor `MK_S{s}_C{i}`); pinned group `g` plays on the
-    /// threadgroup after the segment's last spread item (`MK_S{s}_L{g}`), the least loaded.
-    fn msl(&self, s: usize, out: &mut String) {
-        let p = |name: &str| format!("MK_S{s}_{name}(mk_p)");
-        let mut def = |ty: &str, name: &str, expr: &str| {
-            let _ = writeln!(
-                out,
-                "METAL_FUNC {ty} MK_S{s}_{name}(uint mk_p) {{ return {expr}; }}"
-            );
-        };
-        let (min, max) = (
-            |a: &str, b: &str| format!("({a} < {b} ? {a} : {b})"),
-            |a: &str, b: &str| format!("({a} > {b} ? {a} : {b})"),
-        );
-        let declared: u32 = self.spread.iter().map(|x| x.declared).sum();
-        def(
-            "bool",
-            "RB",
-            &format!("({declared}u + mk_p - 1u) / mk_p <= {MK_ROUND_BOUND_SEGMENT}u"),
-        );
-        let mut n0 = Vec::with_capacity(self.spread.len());
-        for (i, x) in self.spread.iter().enumerate() {
-            def("uint", &format!("V{i}"), &x.vtgs);
-            match x.fit {
-                Some((widest, whole)) => {
-                    def(
-                        "uint",
-                        &format!("KA{i}"),
-                        &format!("{} ? {whole}u : {widest}u", p("RB")),
-                    );
-                    let (v, ka) = (p(&format!("V{i}")), p(&format!("KA{i}")));
-                    def(
-                        "uint",
-                        &format!("NA{i}"),
-                        &format!("({v} + {ka} - 1u) / {ka}"),
-                    );
-                    n0.push(p(&format!("NA{i}")));
-                }
-                None => n0.push(format!("{}u", x.declared)),
-            }
-        }
-        let sum = |v: &[String]| match v {
-            [] => "0u".to_string(),
-            _ => v.join(" + "),
-        };
-        let fit_v: Vec<String> = (0..self.spread.len())
-            .filter(|&i| self.spread[i].fit.is_some())
-            .map(|i| p(&format!("V{i}")))
-            .collect();
-        def("uint", "NT", &sum(&n0));
-        def("uint", "RES", &min(&format!("{}u", self.free), "mk_p - 1u"));
-        def(
-            "uint",
-            "R",
-            &format!("({} + {} + mk_p - 1u) / mk_p", p("NT"), p("RES")),
-        );
-        def(
-            "uint",
-            "SLOTS",
-            &max(&format!("{} * mk_p - {}", p("R"), p("RES")), &p("NT")),
-        );
-        def("uint", "VF", &sum(&fit_v));
-        def("uint", "C0", "0u");
-        for (i, x) in self.spread.iter().enumerate() {
-            let (v, k) = (p(&format!("V{i}")), p(&format!("K{i}")));
-            match x.fit {
-                Some(_) => {
-                    let share = format!(
-                        "{} + ({} - {}) * {v} / {}",
-                        p(&format!("NA{i}")),
-                        p("SLOTS"),
-                        p("NT"),
-                        p("VF")
-                    );
-                    let items = min(&v, &share);
-                    def(
-                        "uint",
-                        &format!("K{i}"),
-                        &format!("({v} + {items} - 1u) / {items}"),
-                    );
-                    def("uint", &format!("N{i}"), &format!("({v} + {k} - 1u) / {k}"));
-                }
-                None => def("uint", &format!("N{i}"), &format!("{}u", x.declared)),
-            }
-            def(
-                "uint",
-                &format!("C{}", i + 1),
-                &format!("{} + {}", p(&format!("C{i}")), p(&format!("N{i}"))),
-            );
-        }
-        for g in 0..self.groups {
-            def(
-                "uint",
-                &format!("L{g}"),
-                &format!("({} + {g}u) % mk_p", p(&format!("C{}", self.spread.len()))),
-            );
-        }
     }
 }
 
@@ -703,18 +457,35 @@ fn at_decode(kernel: KernelId) -> Result<(), NotAtDecode> {
     }
 }
 
-/// The planned decode forward: the admitted commands (expanded indices, in order), their
-/// plan and its segments.
+/// The planned decode forward: the admitted commands (expanded indices, in order), their plan,
+/// every run a launch may play, and each admitted step's dataflow and work.
 struct Planned {
     admitted: Vec<usize>,
     plan: FusionPlan,
-    segs: Segments,
-    /// Per unit: where it runs ([`pack_segments`]).
-    places: Vec<Place>,
-    /// The segment shapes the places name.
-    shapes: Vec<SegmentShape>,
-    /// Per admitted step: what it reads and writes, as the plan ordered it.
+    runs: Vec<Run>,
     flows: Vec<StepFlow<MkLoc>>,
+    work: Vec<MkWork>,
+    calibrations: Vec<Calibration>,
+}
+
+/// A matvec body the load measures the device with ([`MkCalibration`]): `call` (the streaming
+/// adapter's calibration adapter) at row length `k`, its constant policy spelled from `constants`
+/// (`k` at slot `k_slot`, the rows at `n_slot`), its virtual threadgroups `tpg` (`stride` threads)
+/// of `rows` rows, at most `widest` to an item.
+#[derive(Clone, PartialEq, Debug)]
+struct Calibration {
+    call: &'static str,
+    k: u32,
+    rows: u32,
+    bits: u32,
+    group: u32,
+    scale_bytes: u32,
+    tpg: (u32, u32, u32),
+    stride: u32,
+    widest: u32,
+    constants: &'static [MkConst],
+    k_slot: ConstSlot,
+    n_slot: ConstSlot,
 }
 
 /// Whether a step tape decodes: it attends over the KV cache earlier forwards filled, or scans a
@@ -735,10 +506,10 @@ fn decodes(steps: &MetalStepTape) -> bool {
     })
 }
 
-/// The megakernel of a bucket-1 decode tape: one [`MegakernelTape`], its segment
-/// kernels playing every command a decode step admits — a command they cannot play fails the bake. `tape` is the capacity-0
-/// bake, `patches` its load patches, `row_commands` the commands each step row became, `steps`
-/// the rows' dataflow. A tape without a decode step ([`decodes`]) has none.
+/// The megakernel of a bucket-1 decode tape: one [`MegakernelTape`], its generated kernels able
+/// to play every command a decode step admits — a command they cannot play fails the bake. `tape`
+/// is the capacity-0 bake, `patches` its load patches, `row_commands` the commands each step row
+/// became, `steps` the rows' dataflow. A tape without a decode step ([`decodes`]) has none.
 pub fn bake_megakernel(
     tape: &LoweredMetalTape,
     patches: &[CapPatch],
@@ -784,9 +555,9 @@ pub fn bake_megakernel(
     let admitted: Vec<usize> = (0..commands.len())
         .filter(|&i| commands[i].gate.is_none_or(|g| g.admits(ctx)))
         .collect();
-    // Every admitted command inside a segment kernel: a command they cannot play fails the
-    // bake (each distinct cause named). The worker plays the segments whether or not the
-    // sequence holds an unrotated span block, so no gate may read that here.
+    // Every admitted command inside a generated kernel: a command they cannot play fails the
+    // bake (each distinct cause named). The worker plays the kernels whether or not the sequence
+    // holds an unrotated span block, so no gate may read that here.
     let mut stops: Vec<MegakernelError> = commands
         .iter()
         .filter(|c| c.gate.is_some_and(|g| g.admits(ctx) != g.admits(span)))
@@ -821,14 +592,15 @@ pub fn bake_megakernel(
     if !stops.is_empty() {
         let stops: Vec<String> = stops.iter().map(ToString::to_string).collect();
         return Err(BakeDefect(format!(
-            "the bucket-1 decode tape is not playable by segment \
-             kernels: {}",
+            "the bucket-1 decode tape is not playable by generated kernels: {}",
             stops.join("; ")
         )));
     }
     let kv = KvAliasing::of(&commands, &admitted);
     let mut flows = Vec::with_capacity(admitted.len());
-    let mut spread_in: Vec<SpreadIn> = Vec::with_capacity(admitted.len());
+    let mut work = Vec::with_capacity(admitted.len());
+    let mut heads_slots: HashMap<usize, ConstSlot> = HashMap::new();
+    let mut calibrations: Vec<Calibration> = Vec::new();
     let mut pending = false;
     let mut next = admitted.iter().peekable();
     for (e, &(_, brk)) in walk.iter().enumerate() {
@@ -842,32 +614,65 @@ pub fn bake_megakernel(
         let sources = load_sources(tape, patches, origin.baked).expect("checked above");
         // A grid the load sizes is spread whatever its baked size: a pinned unit plays one
         // item.
-        let load_sized = sources
+        let load = sources
             .iter()
             .any(|s| matches!(s, MkLoadSource::Threadgroups(_)));
-        let geometry = |k| step_geometry(cmd, adapter, k).map_err(|e| defect(cmd.function, e));
-        let g = geometry(None)?;
-        let (_, grid) = played(cmd);
-        let whole = geometry(Some(MK_THREADS / g.vtg_stride))?;
-        let items = match load_sized {
+        let g = step_geometry(cmd, adapter, None).map_err(|e| defect(cmd.function, e))?;
+        let (constants, grid) = played(cmd);
+        // The plan sees one head per virtual threadgroup: the most items the step can have.
+        let items = match load {
             true => Items(g.items.0.max(NonZeroU32::MIN.saturating_add(1))),
             false => g.items,
         };
-        // The plan sees one head per virtual threadgroup: the most items the step can have.
-        let vtgs = match heads_rule(cmd) {
-            Some(rule) => format!(
-                "({}u * ({}u / {}) * {}u)",
-                grid.0,
-                grid.1,
-                heads_msl(&rule),
-                grid.2
-            ),
-            None => format!("{}u", grid.0 * grid.1 * grid.2),
-        };
-        spread_in.push(SpreadIn {
-            vtgs,
-            declared: items.0.get(),
-            fit: (!load_sized).then_some((g.vtgs_per_item, whole.vtgs_per_item)),
+        let heads = heads_of(cmd).map(|(head_dim, q, kv)| {
+            let next = ConstSlot(MK_FC_HEADS.0 + heads_slots.len() as u16);
+            let slot = *heads_slots.entry(origin.baked).or_insert(next);
+            MkHeads {
+                slot,
+                head_dim,
+                q,
+                kv,
+            }
+        });
+        // A streaming step streams at the rates its body's calibration measures, at its row
+        // length.
+        let stream = adapter.stream.and_then(|st| {
+            let bytes = st.bytes_per_vtg(&constants)?;
+            let k = constants.iter().find(|c| c.index == st.k.get())?.bits;
+            let tpg = cmd.dispatch.threads_per_threadgroup;
+            let cal = Calibration {
+                call: st.calibrate,
+                k,
+                rows: st.rows,
+                bits: st.bits,
+                group: st.group,
+                scale_bytes: st.scale_bytes,
+                tpg,
+                stride: g.vtg_stride,
+                widest: g.vtgs_per_item,
+                constants: adapter.constants,
+                k_slot: st.k,
+                n_slot: st.n,
+            };
+            let at = calibrations
+                .iter()
+                .position(|c| *c == cal)
+                .unwrap_or_else(|| {
+                    calibrations.push(cal);
+                    calibrations.len() - 1
+                });
+            Some(MkStreamWork {
+                bytes,
+                calibration: at as u32,
+            })
+        });
+        work.push(MkWork {
+            vtg_threads: g.vtg_stride,
+            widest: g.vtgs_per_item,
+            stream,
+            grid,
+            load,
+            heads,
         });
         let row = access[row_of[origin.baked]];
         let at = |l: &MetalLoc| kv.row(l.advanced(origin.layers));
@@ -883,7 +688,7 @@ pub fn bake_megakernel(
             writes,
             items,
             segment_break: std::mem::take(&mut pending),
-            whole: adapter.tail && !load_sized && items.0.get() <= MK_WHOLE_ITEMS,
+            whole: adapter.tail && !load,
         });
     }
     let plan = plan(&flows);
@@ -901,27 +706,23 @@ pub fn bake_megakernel(
         };
         return Err(defect("the codec's shared scratch", e));
     }
-    // The segments assume no core count: every pinned unit is placed as if on a lane of its
-    // own. The split within each segment is a function of the launch's `MK_P`.
-    let segs = segment(&plan, &flows, plan.units.len() as u32)
-        .map_err(|e| BakeDefect(format!("megakernel: {e}")))?;
-    let (places, shapes) = pack_segments(&segs, &plan, &spread_in);
+    let runs = runs(&plan, &flows);
     let planned = Planned {
         admitted,
         plan,
-        segs,
-        places,
-        shapes,
+        runs,
         flows,
+        work,
+        calibrations,
     };
     let generator = Gen::new(tape, patches, &commands, &origins, &planned)?;
     let mk = generator.kernels()?;
     eprintln!(
-        "[m2-megakernel] {}: {} segment kernels, {} launches per \
-         forward, all {} admitted commands ({} baked steps), {} load constants, {} bytes of MSL",
+        "[m2-megakernel] {}: {} regions, {} runs a launch may play, all {} admitted commands \
+         ({} baked steps), {} load constants, {} bytes of MSL",
         mk.library,
-        mk.segments.len(),
-        planned.segs.segments().len(),
+        mk.regions.len(),
+        mk.regions.iter().map(|r| r.runs.len()).sum::<usize>(),
         planned.admitted.len(),
         mk.steps.len(),
         mk.load_constants.len(),
@@ -930,22 +731,22 @@ pub fn bake_megakernel(
     Ok(vec![mk])
 }
 
-/// How a step runs, as the generated code spells it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct StepKey {
-    /// The step opens its unit, which runs there.
-    unit: Option<Place>,
-    /// The step opens a segment: a launch starts with it.
-    opens: bool,
-    /// A pinned unit whose waits include a unit of its own segment (met on its lane).
-    follows: bool,
+/// A run as its region holds it, relative to the region's first unit: its units, where each
+/// runs, and each wait inside — what must be alike in every instance of the region.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct RunShape {
+    units: Range<u32>,
+    places: Vec<Placement>,
+    waits: Vec<(u32, u32)>,
 }
 
-/// One segment kernel: the plan segment of its first instance (the rolled text's), how many
-/// instances a forward launches, and the address table's blocks they bind.
-struct Site {
-    segment: usize,
+/// A region of the rolled text: the plan's units of its first instance, how many instances a
+/// forward plays, its runs (indices into [`Planned::runs`], those of the first instance), and the
+/// address table's blocks its instances bind.
+struct Region {
+    units: Range<u32>,
     instances: u32,
+    runs: Vec<usize>,
     table_at: u32,
     block_len: u32,
 }
@@ -954,16 +755,14 @@ struct Site {
 struct Gen<'a> {
     commands: &'a [GatedCommand],
     planned: &'a Planned,
-    /// Per admitted step: its baked position, its segment key, its unit.
+    /// Per admitted step: its baked position, its unit.
     baked: Vec<usize>,
-    key: Vec<StepKey>,
     unit_of: Vec<usize>,
-    /// Per baked position: the admitted index of its first instance, and its address row (its
-    /// kernel, the row's offset in the kernel's block, the row's length).
-    first: Vec<Option<usize>>,
+    /// Per baked position: its address row (its region, the row's offset in the region's block,
+    /// the row's length).
     rows: Vec<Option<(usize, u32, u32)>>,
-    /// The segment kernels, in the order the rolled text first reaches them.
-    sites: Vec<Site>,
+    /// The regions, in the order the rolled text first reaches them.
+    regions: Vec<Region>,
     loads: Vec<MkLoadConstant>,
     load_types: Vec<ConstantType>,
     policies: Vec<String>,
@@ -983,8 +782,8 @@ impl<'a> Gen<'a> {
         let Planned {
             admitted,
             plan,
-            segs,
-            places,
+            runs,
+            flows,
             ..
         } = planned;
         let n = tape.commands.len();
@@ -994,88 +793,106 @@ impl<'a> Gen<'a> {
                 unit_of[s as usize] = u;
             }
         }
-        let opening: HashSet<u32> = segs.segments().iter().map(|s| s.units.start).collect();
-        let mut key = Vec::with_capacity(admitted.len());
-        for (a, &u) in unit_of.iter().enumerate() {
-            let unit = &plan.units[u];
-            let opens = unit.steps.start as usize == a;
-            let follows = matches!(segs.placements()[u], Placement::Pinned(_))
-                && !segs.local_waits(UnitIx(u as u32)).is_empty();
-            key.push(StepKey {
-                unit: opens.then_some(places[u]),
-                opens: opens && opening.contains(&(u as u32)),
-                follows,
-            });
-        }
         let baked: Vec<usize> = admitted.iter().map(|&e| origins[e].baked).collect();
         let mut first = vec![None; n];
         for (a, &b) in baked.iter().enumerate() {
             first[b].get_or_insert(a);
         }
-        // Every instance of a baked command runs as its first: a kernel spells the first once, for
-        // every iteration of the rolled loops around it.
-        for (a, &b) in baked.iter().enumerate() {
-            let f = first[b].expect("an admitted command has a first instance");
-            if key[a] != key[f] {
-                let symbol = commands[admitted[a]].command.function;
-                return Err(BakeDefect(format!(
-                    "megakernel: `{symbol}` (baked {b}) segments differently in a later loop \
-                     iteration"
-                )));
-            }
-        }
-        // The kernels: one per segment of the rolled text, its later instances holding the same
-        // baked steps; each step's address row in its kernel's block.
-        let held = |s: usize| {
-            let r = &segs.segments()[s].units;
-            let steps =
-                plan.units[r.start as usize].steps.start..plan.units[r.end as usize - 1].steps.end;
-            steps.map(|a| baked[a as usize]).collect::<Vec<usize>>()
+        // The region instances: from the plan's first unit and every unit a segment break opens.
+        let units = plan.units.len() as u32;
+        let starts: Vec<u32> = (0..units)
+            .filter(|&u| u == 0 || flows[plan.units[u as usize].steps.start as usize].segment_break)
+            .collect();
+        let ends = starts.iter().skip(1).copied().chain([units]);
+        let steps_of = |r: &Range<u32>| {
+            let s = plan.units[r.start as usize].steps.start;
+            let e = plan.units[r.end as usize - 1].steps.end;
+            s..e
         };
-        let mut sites: Vec<Site> = Vec::new();
-        let mut site_of: HashMap<usize, usize> = HashMap::new();
+        // What every instance of a region must share: its baked steps, its units (relative to
+        // its first step) and its runs (relative to its first unit).
+        let shape = |r: &Range<u32>| {
+            let steps = steps_of(r);
+            let held: Vec<usize> = steps.clone().map(|a| baked[a as usize]).collect();
+            let unit_steps: Vec<(u32, u32)> = plan.units[r.start as usize..r.end as usize]
+                .iter()
+                .map(|u| (u.steps.start - steps.start, u.steps.end - steps.start))
+                .collect();
+            let inside: Vec<usize> = (0..runs.len())
+                .filter(|&k| runs[k].units().start >= r.start && runs[k].units().end <= r.end)
+                .collect();
+            let shapes: Vec<RunShape> = inside
+                .iter()
+                .map(|&k| {
+                    let run = &runs[k];
+                    let waits = run
+                        .units()
+                        .flat_map(|u| {
+                            run.local_waits(UnitIx(u))
+                                .iter()
+                                .map(move |(w, _)| (u, w.0))
+                        })
+                        .map(|(u, w)| (u - r.start, w - r.start))
+                        .collect();
+                    RunShape {
+                        units: run.units().start - r.start..run.units().end - r.start,
+                        places: run.placements().to_vec(),
+                        waits,
+                    }
+                })
+                .collect();
+            (held, unit_steps, shapes, inside)
+        };
+        let mut regions: Vec<Region> = Vec::new();
+        let mut region_of: HashMap<usize, usize> = HashMap::new();
         let mut rows: Vec<Option<(usize, u32, u32)>> = vec![None; n];
-        for s in 0..segs.segments().len() {
-            let steps = held(s);
-            if let Some(&k) = site_of.get(&steps[0]) {
-                if held(sites[k].segment) != steps {
+        for (s, e) in starts.iter().copied().zip(ends) {
+            let r = s..e;
+            let (held, unit_steps, shapes, inside) = shape(&r);
+            let key = held[0];
+            if let Some(&k) = region_of.get(&key) {
+                let (h0, u0, s0, _) = shape(&regions[k].units);
+                if (h0, u0, s0) != (held, unit_steps, shapes) {
                     return Err(BakeDefect(format!(
-                        "megakernel: the segment baked {} opens holds other steps in a later loop \
-                         iteration",
-                        steps[0]
+                        "megakernel: the region baked {key} opens plays differently in a later \
+                         loop iteration"
                     )));
                 }
-                sites[k].instances += 1;
+                regions[k].instances += 1;
                 continue;
             }
             let mut block_len = 0u32;
-            for &b in &steps {
+            for &b in &held {
                 let cmd = &commands[admitted[first[b].expect("admitted")]].command;
                 let row_len = cmd
                     .bindings
                     .iter()
                     .map(|x| u32::from(x.binding_index()) + 1);
                 let row_len = row_len.max().unwrap_or(0);
-                if rows[b].replace((sites.len(), block_len, row_len)).is_some() {
+                if rows[b]
+                    .replace((regions.len(), block_len, row_len))
+                    .is_some()
+                {
                     return Err(BakeDefect(format!(
-                        "megakernel: `{}` (baked {b}) is played by two segment kernels",
+                        "megakernel: `{}` (baked {b}) is played by two regions",
                         cmd.function
                     )));
                 }
                 block_len += row_len;
             }
-            site_of.insert(steps[0], sites.len());
-            sites.push(Site {
-                segment: s,
+            region_of.insert(held[0], regions.len());
+            regions.push(Region {
+                units: r,
                 instances: 1,
+                runs: inside,
                 table_at: 0,
                 block_len,
             });
         }
         let mut table_len = 0u32;
-        for site in &mut sites {
-            site.table_at = table_len;
-            table_len += site.instances * site.block_len;
+        for region in &mut regions {
+            region.table_at = table_len;
+            table_len += region.instances * region.block_len;
         }
         let mut loads: Vec<MkLoadConstant> = Vec::new();
         let mut load_types = Vec::new();
@@ -1107,11 +924,9 @@ impl<'a> Gen<'a> {
             commands,
             planned,
             baked,
-            key,
             unit_of,
-            first,
             rows,
-            sites,
+            regions,
             loads,
             load_types,
             policies: Vec::new(),
@@ -1132,6 +947,12 @@ impl<'a> Gen<'a> {
         at.map(|k| format!("MK_LOAD_{k}"))
     }
 
+    /// The function constant holding admitted step `a`'s heads per virtual threadgroup, by name.
+    fn heads(&self, a: usize) -> Option<String> {
+        let h = self.planned.work[a].heads?;
+        Some(format!("MK_H{}", h.slot.get() - MK_FC_HEADS.get()))
+    }
+
     /// The policy struct spelling the constants of admitted step `a` for its adapter (defined
     /// once per text): each a literal, or the load constant a slot is served by
     /// ([`MkLoadConstant`]); `has_…` = set.
@@ -1140,7 +961,7 @@ impl<'a> Gen<'a> {
         let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
         let mut body = String::new();
         let (constants, _) = played(cmd);
-        let heads = heads_rule(cmd).map(|rule| heads_msl(&rule));
+        let heads = self.heads(a);
         for c in adapter.constants {
             if let Some(h) = heads
                 .as_ref()
@@ -1188,51 +1009,149 @@ impl<'a> Gen<'a> {
         Ok(format!("MkC{n}"))
     }
 
-    /// Admitted step `a`'s geometry at its adapter's width, or (`whole`) across the whole physical
-    /// threadgroup — the widest items a segment's split may give it.
-    fn geometry(&self, a: usize, whole: bool) -> Result<MkGeometry, BakeDefect> {
+    /// Admitted step `a`'s geometry at its widest: as many virtual threadgroups per item as one
+    /// threadgroup's threads and memory hold.
+    fn geometry(&self, a: usize) -> Result<MkGeometry, BakeDefect> {
         let cmd = self.command(a);
         let adapter = MkAdapter::of(cmd.library, cmd.function).expect("playable");
-        let at = |k| step_geometry(cmd, adapter, k).map_err(|e| defect(cmd.function, e));
-        let widest = at(None)?;
-        match whole {
-            true => at(Some(MK_THREADS / widest.vtg_stride)),
-            false => Ok(widest),
-        }
+        step_geometry(cmd, adapter, None).map_err(|e| defect(cmd.function, e))
     }
 
-    /// Every segment kernel, one library: each kernel the units of its segment's first instance
-    /// in order, its rows at their offsets in the block its launch binds.
+    /// Every run's kernel, one library: each the units of the run in order, their rows at their
+    /// offsets in the block of the region instance the launch binds.
     fn kernels(mut self) -> Result<MegakernelTape, BakeDefect> {
         let planned = self.planned;
-        let (plan, segs) = (&planned.plan, &planned.segs);
+        let plan = &planned.plan;
         let mut kernels = String::new();
-        for n in 0..self.sites.len() {
-            let units = segs.segments()[self.sites[n].segment].units.clone();
-            self.coissue_tg = 0;
-            let mut body = String::new();
-            let mut tg_memory = 16;
-            for u in units {
-                let steps = plan.units[u as usize].steps.clone();
-                self.unit(steps.start as usize, planned.places[u as usize], &mut body)?;
-                for a in steps {
-                    tg_memory = tg_memory.max(self.geometry(a as usize, true)?.tg_memory);
+        let mut splits = String::new();
+        let mut split_at = MK_FC_SPLIT.get();
+        let mut regions = Vec::with_capacity(self.regions.len());
+        let mut steps: Vec<MkKernelStep> = Vec::new();
+        let mut kernel_count = 0usize;
+        for ri in 0..self.regions.len() {
+            let (units, run_ids) = {
+                let r = &self.regions[ri];
+                (r.units.clone(), r.runs.clone())
+            };
+            let first_step = plan.units[units.start as usize].steps.start;
+            let step_at = steps.len() as u32;
+            let mut mk_runs = Vec::with_capacity(run_ids.len());
+            for k in run_ids {
+                let run = &planned.runs[k];
+                let n = kernel_count;
+                kernel_count += 1;
+                let spread = (run.placements().iter())
+                    .filter(|p| matches!(p, Placement::Spread { .. }))
+                    .count() as u16;
+                for i in 0..spread {
+                    let _ = writeln!(
+                        splits,
+                        "constant uint MK_R{n}_K{i} [[function_constant({})]];\n\
+                         constant uint MK_R{n}_C{i} [[function_constant({})]];",
+                        split_at + 2 * i,
+                        split_at + 2 * i + 1
+                    );
                 }
+                for g in 0..run.groups() as u16 {
+                    let _ = writeln!(
+                        splits,
+                        "constant uint MK_R{n}_L{g} [[function_constant({})]];",
+                        split_at + 2 * spread + g
+                    );
+                }
+                self.coissue_tg = 0;
+                let mut body = String::new();
+                let mut tg_memory = 16;
+                let mut ord = 0;
+                for (u, placement) in run.units().zip(run.placements()) {
+                    let place = match *placement {
+                        Placement::Spread { .. } => {
+                            ord += 1;
+                            Place::Spread {
+                                run: n,
+                                ord: ord - 1,
+                            }
+                        }
+                        Placement::Pinned(l) => Place::Pinned { run: n, group: l.0 },
+                        Placement::Everywhere => Place::Everywhere,
+                    };
+                    let follows = matches!(place, Place::Pinned { .. })
+                        && !run.local_waits(UnitIx(u)).is_empty();
+                    let unit_steps = plan.units[u as usize].steps.clone();
+                    self.unit(unit_steps.start as usize, place, follows, &mut body)?;
+                    for a in unit_steps {
+                        tg_memory = tg_memory.max(self.geometry(a as usize)?.tg_memory);
+                    }
+                }
+                let tg_memory = tg_memory.max(self.coissue_tg).next_multiple_of(16);
+                let _ = write!(
+                    kernels,
+                    "[[kernel, max_total_threads_per_threadgroup(1024)]] void mk_r{n}(\n    \
+                     constant ulong* mk_a [[buffer(0)]],\n    \
+                     uint mk_t [[thread_index_in_threadgroup]],\n    \
+                     uint mk_idx [[threadgroup_position_in_grid]]) {{\n  \
+                     threadgroup uchar mk_tgm[{tg_memory}] __attribute__((aligned(16)));\n  \
+                     const uint mk_p = MK_P;\n{body}}}\n"
+                );
+                let places: Vec<MkPlace> = (run.placements().iter())
+                    .map(|p| match p {
+                        Placement::Spread { .. } => MkPlace::Spread,
+                        Placement::Pinned(l) => MkPlace::Lane(l.0),
+                        Placement::Everywhere => MkPlace::Everywhere,
+                    })
+                    .collect();
+                let waits: Vec<(u32, u32)> = run
+                    .units()
+                    .flat_map(|u| {
+                        run.local_waits(UnitIx(u))
+                            .iter()
+                            .map(move |(w, _)| (u, w.0))
+                    })
+                    .map(|(u, w)| (u - units.start, w - units.start))
+                    .collect();
+                mk_runs.push(MkRun {
+                    kernel: String::leak(format!("mk_r{n}")),
+                    first: run.units().start - units.start,
+                    end: run.units().end - units.start,
+                    places: baked(places),
+                    waits: baked(waits),
+                    split_at: ConstSlot(split_at),
+                });
+                split_at += 2 * spread + run.groups() as u16;
             }
-            let tg_memory = tg_memory.max(self.coissue_tg).next_multiple_of(16);
-            let _ = write!(
-                kernels,
-                "[[kernel, max_total_threads_per_threadgroup(1024)]] void mk_seg_{n}(\n    \
-                 constant ulong* mk_a [[buffer(0)]],\n    \
-                 uint mk_t [[thread_index_in_threadgroup]],\n    \
-                 uint mk_idx [[threadgroup_position_in_grid]]) {{\n  \
-                 threadgroup uchar mk_tgm[{tg_memory}] __attribute__((aligned(16)));\n  \
-                 const uint mk_p = MK_P;\n{body}}}\n"
-            );
+            let region = &self.regions[ri];
+            let held = plan.units[units.start as usize].steps.start
+                ..plan.units[units.end as usize - 1].steps.end;
+            for a in held {
+                let b = self.baked[a as usize];
+                let (_, row_at, row_len) = self.rows[b].expect("a played command has a row");
+                steps.push(MkKernelStep {
+                    baked: b as u32,
+                    function: self.command(a as usize).function,
+                    region: ri as u32,
+                    row_at,
+                    row_len,
+                    work: planned.work[a as usize],
+                });
+            }
+            let mk_units: Vec<MkUnit> = plan.units[units.start as usize..units.end as usize]
+                .iter()
+                .map(|u| MkUnit {
+                    first: step_at + u.steps.start - first_step,
+                    end: step_at + u.steps.end - first_step,
+                })
+                .collect();
+            regions.push(MkRegion {
+                opens: self.baked[first_step as usize] as u32,
+                table_at: region.table_at,
+                block_len: region.block_len,
+                units: baked(mk_units),
+                runs: baked(mk_runs),
+            });
         }
         let mut s = String::from(
-            "// Generated by `megakernel_bake.rs`: the decode forward of one tape as segment \
-             kernels, one launch each.\n",
+            "// Generated by `megakernel_bake.rs`: every launch the decode forward of one tape may \
+             play, one kernel each.\n",
         );
         for (k, (l, ty)) in self.loads.iter().zip(&self.load_types).enumerate() {
             let _ = writeln!(
@@ -1242,99 +1161,142 @@ impl<'a> Gen<'a> {
                 l.index.get()
             );
         }
-        for (n, shape) in planned.shapes.iter().enumerate() {
-            shape.msl(n, &mut s);
+        let mut heads: Vec<ConstSlot> = (planned.work.iter())
+            .filter_map(|w| w.heads.map(|h| h.slot))
+            .collect();
+        heads.sort();
+        heads.dedup();
+        for slot in heads {
+            let _ = writeln!(
+                s,
+                "constant uint MK_H{} [[function_constant({})]];",
+                slot.get() - MK_FC_HEADS.get(),
+                slot.get()
+            );
         }
+        s.push_str(&splits);
+        let calibrations = self.calibrations(&mut kernels, &mut s);
         for (n, p) in self.policies.iter().enumerate() {
             let _ = write!(s, "struct MkC{n} {{\n{p}}};\n");
         }
         s.push_str(&kernels);
         let library = String::leak(format!("megakernel_{:016x}", fnv1a(s.as_bytes())));
-        let mut steps = Vec::new();
-        let mut step_at: HashMap<usize, u32> = HashMap::new();
-        for (b, f) in self.first.iter().enumerate() {
-            let (Some(a), Some((site, row_at, row_len))) = (*f, self.rows[b]) else {
-                continue;
-            };
-            step_at.insert(b, steps.len() as u32);
-            steps.push(MkKernelStep {
-                baked: b as u32,
-                function: self.command(a).function,
-                segment: site as u32,
-                row_at,
-                row_len,
-                place: match planned.places[self.unit_of[a]] {
-                    Place::Spread { .. } => MkPlace::Spread,
-                    Place::Pinned { group, .. } => MkPlace::Lane(group),
-                    Place::Everywhere => MkPlace::Everywhere,
-                },
-                after: &[],
-            });
-        }
-        // A unit by the step opening its first instance.
-        let opener = |w: UnitIx| {
-            let b = self.baked[plan.units[w.0 as usize].steps.start as usize];
-            step_at.get(&b).copied().ok_or_else(|| {
-                BakeDefect(format!(
-                    "megakernel: baked {b} opens a unit no kernel plays"
-                ))
-            })
-        };
-        for step in &mut steps {
-            let a = self.first[step.baked as usize].expect("played");
-            let u = self.unit_of[a];
-            if plan.units[u].steps.start as usize == a {
-                let local = segs.local_waits(UnitIx(u as u32)).iter();
-                let after = local.map(|(w, _)| opener(*w)).collect::<Result<_, _>>()?;
-                step.after = baked(after);
-            }
-        }
-        let mut segments = Vec::with_capacity(self.sites.len());
-        let mut table_len = 0;
-        for (n, site) in self.sites.iter().enumerate() {
-            let seg = &segs.segments()[site.segment];
-            let cut = match &seg.cut {
-                Cut::Start => MkCut::Start,
-                Cut::Break => MkCut::Break,
-                Cut::Waits(units) => {
-                    let on = units.iter().map(|w| opener(*w)).collect::<Result<_, _>>()?;
-                    MkCut::Waits(baked(on))
-                }
-            };
-            segments.push(MkSegment {
-                kernel: String::leak(format!("mk_seg_{n}")),
-                opens: self.baked[plan.units[seg.units.start as usize].steps.start as usize] as u32,
-                table_at: site.table_at,
-                block_len: site.block_len,
-                cut,
-            });
-            table_len += site.instances * site.block_len;
-        }
+        let table_len = (self.regions.iter())
+            .map(|r| r.instances * r.block_len)
+            .sum();
         Ok(MegakernelTape {
             library,
             source: String::leak(s),
             // Compiled by `compile_metallib`; the emission includes its bytes.
             metallib: &[],
-            segments: baked(segments),
+            regions: baked(regions),
             steps: baked(steps),
+            calibrations: baked(calibrations),
             table_len,
             load_constants: baked(self.loads),
         })
     }
 
-    /// The unit opened by admitted step `a`, as its segment's kernel plays it at `placement`.
-    fn unit(&mut self, a: usize, placement: Place, out: &mut String) -> Result<(), BakeDefect> {
+    /// Every calibration's kernels ([`MkCalibration`]): its policy and the function constants it
+    /// reads into `decls`, its `lane` and `native` kernels into `kernels`.
+    fn calibrations(&self, kernels: &mut String, decls: &mut String) -> Vec<MkCalibration> {
+        let calibrations = &self.planned.calibrations;
+        if !calibrations.is_empty() {
+            let _ = writeln!(
+                decls,
+                "constant uint MK_CAL_N [[function_constant({})]];",
+                MK_FC_CAL.get()
+            );
+        }
+        let mut out = Vec::with_capacity(calibrations.len());
+        for (j, c) in calibrations.iter().enumerate() {
+            let _ = writeln!(decls, "struct MkCal{j} {{");
+            for k in c.constants {
+                let value = match k.slot {
+                    slot if slot == c.k_slot => literal(k.ty, c.k),
+                    slot if slot == c.n_slot => format!("{}(MK_CAL_N)", msl_type(k.ty)),
+                    _ => literal(k.ty, 0),
+                };
+                let set = k.slot == c.k_slot || k.slot == c.n_slot;
+                let _ = writeln!(
+                    decls,
+                    "  static METAL_FUNC {} {}() {{ return {value}; }}\n  \
+                     static METAL_FUNC bool has_{}() {{ return {set}; }}",
+                    msl_type(k.ty),
+                    k.name,
+                    k.name,
+                );
+            }
+            let _ = writeln!(decls, "}};");
+            let call = replace_word(c.call, "MK_C", &format!("MkCal{j}"));
+            let (tx, ty, tz) = c.tpg;
+            let step = |k: &str| {
+                format!(
+                    "const MkStep s = {{mk_a, uint3(1u, MK_CAL_N / {}u, 1u), uint3({tx}u, {ty}u, \
+                     {tz}u), {k}, {}u, 0u}};",
+                    c.rows, c.stride
+                )
+            };
+            let head = |name: String| {
+                format!(
+                    "[[kernel, max_total_threads_per_threadgroup(1024)]] void {name}(\n    \
+                     constant ulong* mk_a [[buffer(0)]],\n    \
+                     constant uint& mk_cal_k [[buffer(1)]],\n    \
+                     uint mk_t [[thread_index_in_threadgroup]],\n    \
+                     uint mk_idx [[threadgroup_position_in_grid]],\n    \
+                     uint mk_p [[threadgroups_per_grid]]) {{\n  \
+                     threadgroup uchar mk_tgm[16] __attribute__((aligned(16)));\n"
+                )
+            };
+            let (lane, native) = (format!("mk_cal{j}"), format!("mk_cal{j}_native"));
+            let _ = write!(
+                kernels,
+                "{}  {}\n  const uint items = (MK_CAL_N / {}u + mk_cal_k - 1u) / mk_cal_k;\n  \
+                 for (uint it = mk_idx; it < items; it += mk_p) {{\n    \
+                 {call}(s, mk_lane(s, it, mk_t), mk_tgm);\n  }}\n}}\n\
+                 {}  {}\n  {call}(s, mk_lane(s, mk_idx, mk_t), mk_tgm);\n}}\n",
+                head(lane.clone()),
+                step("mk_cal_k"),
+                c.rows,
+                head(native.clone()),
+                step("1u"),
+            );
+            out.push(MkCalibration {
+                lane: String::leak(lane),
+                native: String::leak(native),
+                rows: c.rows,
+                k: c.k,
+                bits: c.bits,
+                group: c.group,
+                scale_bytes: c.scale_bytes,
+                act_bytes: 4,
+                tpg: c.tpg,
+                widest: c.widest,
+            });
+        }
+        out
+    }
+
+    /// The unit opened by admitted step `a`, as its run's kernel plays it at `placement`
+    /// (`follows`: a pinned unit after a unit of its run it waits on, on its lane).
+    fn unit(
+        &mut self,
+        a: usize,
+        placement: Place,
+        follows: bool,
+        out: &mut String,
+    ) -> Result<(), BakeDefect> {
         let ind = "  ";
         let planned = self.planned;
         let unit = &planned.plan.units[self.unit_of[a]];
         let members = unit.steps.start as usize..unit.steps.end as usize;
         match placement {
-            Place::Spread { shape, ord } => {
-                let s = self.step_decl(a, PerItem::Split { shape, ord })?;
+            Place::Spread { run, ord } => {
+                let s = self.step_decl(a, PerItem::Split { run, ord })?;
                 let _ = writeln!(
                     out,
                     "{ind}{{ // {}\n{ind}  {}\n{ind}  for (uint it = mk_first(mk_idx, mk_p, \
-                     MK_S{shape}_C{ord}(mk_p)); it < {}; it += mk_p) {{\n{ind}    {}(s, \
+                     MK_R{run}_C{ord}); it < {}; it += mk_p) {{\n{ind}    {}(s, \
                      mk_lane(s, it, mk_t), mk_tgm);{}\n{ind}  }}\n{ind}}}",
                     s.what,
                     s.decl,
@@ -1351,8 +1313,8 @@ impl<'a> Gen<'a> {
             // its own copy's writes after it.
             Place::Pinned { .. } | Place::Everywhere => {
                 let _ = match placement {
-                    Place::Pinned { shape, group } => {
-                        writeln!(out, "{ind}if (mk_idx == MK_S{shape}_L{group}(mk_p)) {{")
+                    Place::Pinned { run, group } => {
+                        writeln!(out, "{ind}if (mk_idx == MK_R{run}_L{group}) {{")
                     }
                     _ => writeln!(out, "{ind}{{ // on every threadgroup"),
                 };
@@ -1360,7 +1322,7 @@ impl<'a> Gen<'a> {
                 let members: Vec<usize> = members.collect();
                 let mut j = 0;
                 while j < members.len() {
-                    if j > 0 || self.key[a].follows {
+                    if j > 0 || follows {
                         let _ = writeln!(
                             out,
                             "{ind}  threadgroup_barrier(mem_flags::mem_device | \
@@ -1425,18 +1387,17 @@ impl<'a> Gen<'a> {
     /// constant), each whole in one item, none touching what an earlier one writes nor writing what
     /// it reads — member `j` on threads `[j·W, (j+1)·W)` of the threadgroup (`W` = a member's
     /// threads), its own share of threadgroup memory. The body is ONE call, so every member runs
-    /// every barrier of it. A TurboQuant K and V compress of a one-KV-head layer play at once
-    /// (Gemma-3-1B: -0.22 ms/token on the base M5).
+    /// every barrier of it. A TurboQuant K and V compress of a one-KV-head layer play at once.
     fn coissued(&self, rest: &[usize]) -> Vec<usize> {
         let first = self.command(rest[0]);
-        // A grid the launch's `MK_P` sizes plays alone.
-        if heads_rule(first).is_some() {
+        // A grid the device's heads size plays alone.
+        if self.planned.work[rest[0]].heads.is_some() {
             return vec![rest[0]];
         }
         let (constants, grid) = played(first);
         let tpg = first.dispatch.threads_per_threadgroup;
         let vtgs = grid.0 * grid.1 * grid.2;
-        let Ok(g) = self.geometry(rest[0], false) else {
+        let Ok(g) = self.geometry(rest[0]) else {
             return vec![rest[0]];
         };
         let adapter = MkAdapter::of(first.library, first.function).expect("playable");
@@ -1507,7 +1468,7 @@ impl<'a> Gen<'a> {
         Ok(s0.tg_bytes)
     }
 
-    /// Admitted step `a` as its segment's kernel spells it — its address row at its offset in the
+    /// Admitted step `a` as its run's kernel spells it — its address row at its offset in the
     /// block the launch binds, whatever the iteration — its items as `per_item` says.
     fn step_decl(&mut self, a: usize, per_item: PerItem) -> Result<StepText, BakeDefect> {
         let b = self.baked[a];
@@ -1517,7 +1478,7 @@ impl<'a> Gen<'a> {
             PerItem::Coissued(k) => {
                 step_geometry(cmd, adapter, Some(k)).map_err(|e| defect(cmd.function, e))?
             }
-            PerItem::Widest | PerItem::Split { .. } => self.geometry(a, false)?,
+            PerItem::Widest | PerItem::Split { .. } => self.geometry(a)?,
         };
         let (_, row_at, _) = self.rows[b].expect("a played command has rows");
         let row = format!("mk_a + {row_at}u");
@@ -1532,32 +1493,28 @@ impl<'a> Gen<'a> {
             axis(MScaleAxis::Z, grid.2),
         );
         let load_sized = [&gx, &gy, &gz].iter().any(|v| v.starts_with("MK_LOAD_"));
-        // A decode attention's heads grouped per virtual threadgroup, in `MK_P`.
-        let heads = heads_rule(cmd).map(|rule| heads_msl(&rule));
+        // A decode attention's heads grouped per virtual threadgroup, as the load picks them.
+        let heads = self.heads(a);
         let gy = match &heads {
             Some(h) => format!("({gy} / {h})"),
             None => gy,
         };
-        let split = match per_item {
-            PerItem::Split { shape, ord } => self.planned.shapes[shape].spread[ord]
-                .fit
-                .map(|_| (shape, ord)),
-            PerItem::Widest | PerItem::Coissued(_) => None,
-        };
-        let (k, items) = match (load_sized, split) {
-            (true, _) => (
+        // A spread step's virtual threadgroups per item are its run's split (a function constant);
+        // its items follow from them, from its grid where the load sizes it.
+        let (k, items) = match per_item {
+            PerItem::Split { run, ord } => {
+                let k = format!("MK_R{run}_K{ord}");
+                let items = match load_sized || heads.is_some() {
+                    true => format!("mk_items(s.grid, {k})"),
+                    false => format!("({}u + {k} - 1u) / {k}", grid.0 * grid.1 * grid.2),
+                };
+                (k, items)
+            }
+            _ if load_sized || heads.is_some() => (
                 format!("{}u", g.vtgs_per_item),
                 format!("mk_items(s.grid, {}u)", g.vtgs_per_item),
             ),
-            (false, Some((shape, ord))) => (
-                format!("MK_S{shape}_K{ord}(mk_p)"),
-                format!("MK_S{shape}_N{ord}(mk_p)"),
-            ),
-            (false, None) if heads.is_some() => (
-                format!("{}u", g.vtgs_per_item),
-                format!("mk_items(s.grid, {}u)", g.vtgs_per_item),
-            ),
-            (false, None) => (
+            _ => (
                 format!("{}u", g.vtgs_per_item),
                 format!("{}u", g.items.0.get()),
             ),
@@ -1580,15 +1537,25 @@ impl<'a> Gen<'a> {
     }
 }
 
+/// Where a unit runs, as its run's kernel spells it: spread unit `ord` of run `run` (its split
+/// the run's function constants), the threadgroup of the run's lane group `group`, or every
+/// threadgroup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    Spread { run: usize, ord: usize },
+    Pinned { run: usize, group: u32 },
+    Everywhere,
+}
+
 /// How many virtual threadgroups a step's items play, as its spelling says.
 #[derive(Clone, Copy)]
 enum PerItem {
-    /// Its adapter's width (a pinned unit's member).
+    /// Its widest (a pinned unit's member).
     Widest,
     /// A co-issued member's whole grid in one item.
     Coissued(u32),
-    /// Spread step `ord` of segment shape `shape`: the shape's split, in `MK_P`.
-    Split { shape: usize, ord: usize },
+    /// Spread unit `ord` of run `run`: the run's split.
+    Split { run: usize, ord: usize },
 }
 
 /// One step's spelling.
@@ -1727,278 +1694,4 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use scratchy_target_metal::tape::ids::GpuCores;
-
-    /// Evaluates the generated program-scope constants and split functions with `p` threadgroups
-    /// launched (`MK_P` = `mk_p` = `p`): the arithmetic the pipeline's specialization folds
-    /// (unsigned `+ - * / %`, comparisons, `?:`), each function of `mk_p` a name.
-    fn eval_constants(text: &str, p: u32) -> HashMap<String, u64> {
-        let mut env = HashMap::from([
-            ("MK_P".to_string(), u64::from(p)),
-            ("mk_p".to_string(), u64::from(p)),
-        ]);
-        for line in text.lines() {
-            let line = line.trim();
-            let (name, expr) = if let Some(rest) = line.strip_prefix("constant ") {
-                let (_, rest) = rest.split_once(' ').expect("a typed constant");
-                rest.split_once(" = ").expect("an initialized constant")
-            } else if let Some(rest) = line.strip_prefix("METAL_FUNC ") {
-                let (_, rest) = rest.split_once(' ').expect("a typed function");
-                let (name, rest) = rest
-                    .split_once("(uint mk_p) { return ")
-                    .expect("a split function");
-                (name, rest.trim_end_matches(" }"))
-            } else {
-                continue;
-            };
-            let v = eval(expr.trim_end_matches(';'), &env);
-            env.insert(name.to_string(), v);
-        }
-        env
-    }
-
-    fn tokens(expr: &str) -> Vec<String> {
-        let chars: Vec<char> = expr.chars().collect();
-        let mut out = Vec::new();
-        let mut word = String::new();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c.is_ascii_alphanumeric() || c == '_' {
-                word.push(c);
-                i += 1;
-                continue;
-            }
-            if !word.is_empty() {
-                out.push(std::mem::take(&mut word));
-            }
-            if (c == '<' || c == '>') && chars.get(i + 1) == Some(&'=') {
-                out.push(format!("{c}="));
-                i += 2;
-                continue;
-            }
-            if !c.is_whitespace() {
-                out.push(c.to_string());
-            }
-            i += 1;
-        }
-        if !word.is_empty() {
-            out.push(word);
-        }
-        out
-    }
-
-    fn eval(expr: &str, env: &HashMap<String, u64>) -> u64 {
-        let t = tokens(expr);
-        let mut at = 0;
-        let v = ternary(&t, &mut at, env);
-        assert_eq!(at, t.len(), "trailing tokens in {expr}");
-        v
-    }
-
-    fn ternary(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
-        let c = compare(t, at, env);
-        if t.get(*at).is_some_and(|x| x == "?") {
-            *at += 1;
-            let a = ternary(t, at, env);
-            assert_eq!(t[*at], ":");
-            *at += 1;
-            let b = ternary(t, at, env);
-            return if c != 0 { a } else { b };
-        }
-        c
-    }
-
-    fn compare(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
-        let a = additive(t, at, env);
-        let op = t.get(*at).cloned().unwrap_or_default();
-        if !["<", ">", "<=", ">="].contains(&op.as_str()) {
-            return a;
-        }
-        *at += 1;
-        let b = additive(t, at, env);
-        u64::from(match op.as_str() {
-            "<" => a < b,
-            ">" => a > b,
-            "<=" => a <= b,
-            _ => a >= b,
-        })
-    }
-
-    fn additive(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
-        let mut v = multiplicative(t, at, env);
-        while let Some(op) = t.get(*at).filter(|x| *x == "+" || *x == "-").cloned() {
-            *at += 1;
-            let b = multiplicative(t, at, env);
-            v = match op.as_str() {
-                "+" => v + b,
-                _ => v.checked_sub(b).expect("no unsigned underflow"),
-            };
-        }
-        v
-    }
-
-    fn multiplicative(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
-        let mut v = primary(t, at, env);
-        while let Some(op) = t
-            .get(*at)
-            .filter(|x| ["*", "/", "%"].contains(&x.as_str()))
-            .cloned()
-        {
-            *at += 1;
-            let b = primary(t, at, env);
-            v = match op.as_str() {
-                "*" => v * b,
-                "/" => v / b,
-                _ => v % b,
-            };
-        }
-        v
-    }
-
-    fn primary(t: &[String], at: &mut usize, env: &HashMap<String, u64>) -> u64 {
-        let x = t[*at].clone();
-        *at += 1;
-        if x == "(" {
-            let v = ternary(t, at, env);
-            assert_eq!(t[*at], ")");
-            *at += 1;
-            return v;
-        }
-        if t.get(*at).is_some_and(|y| y == "(") {
-            // A split function, called with the launch's threadgroups.
-            assert_eq!(t[*at + 1..*at + 3], ["mk_p", ")"], "{x}(mk_p)");
-            *at += 3;
-        }
-        match x.strip_suffix('u').and_then(|n| n.parse().ok()) {
-            Some(n) => n,
-            None => *env.get(&x).unwrap_or_else(|| panic!("unbound {x}")),
-        }
-    }
-
-    /// The megakernel's heads grouping, spelled in `MK_P`, is the device's pick for TurboQuant
-    /// decode ([`TqDecodeHeads::for_group`]) at every core count.
-    #[test]
-    fn heads_are_the_devices_pick_at_every_core_count() {
-        let geometries = [
-            (64, 32, 8),
-            (128, 24, 8),
-            (128, 32, 8),
-            (256, 16, 8),
-            (512, 16, 2),
-            (128, 28, 4),
-            (64, 9, 3),
-        ];
-        for (hd, q, kv) in geometries {
-            let geometry = (HeadDim(hd), NumQHeads(q), NumKvHeads(kv));
-            let mut rule: Vec<(u32, u32)> =
-                TqDecodeHeads::candidates(geometry.0, geometry.1, geometry.2)
-                    .map(|h| (q / h.get(), h.get()))
-                    .filter(|&(_, h)| h > 1)
-                    .collect();
-            rule.reverse();
-            let text = format!("constant uint H = {};", heads_msl(&rule));
-            for p in 1..=128 {
-                let pick =
-                    TqDecodeHeads::for_group(geometry.0, geometry.1, geometry.2, GpuCores(p));
-                assert_eq!(
-                    eval_constants(&text, p)["H"],
-                    u64::from(pick.get()),
-                    "hd {hd}, {q} q / {kv} kv heads, {p} cores"
-                );
-            }
-        }
-    }
-
-    /// Every segment split is valid and even at every core count: each item plays at least one
-    /// virtual threadgroup and no more than the whole threadgroup holds, a step's items cover its
-    /// grid with none empty, the cursors follow the items, no lane plays more rounds than the
-    /// split's, and every pinned lane is a threadgroup of the launch.
-    #[test]
-    fn a_segment_splits_evenly_at_every_core_count() {
-        let fit = |vtgs: u32, widest: u32, whole: u32| SpreadIn {
-            vtgs: format!("{vtgs}u"),
-            declared: vtgs.div_ceil(widest),
-            fit: Some((widest, whole)),
-        };
-        let shapes = [
-            SegmentShape {
-                spread: vec![fit(256, 1, 16)],
-                free: 0,
-                groups: 0,
-            },
-            SegmentShape {
-                spread: vec![fit(128, 4, 32), fit(8, 1, 4)],
-                free: 2,
-                groups: 2,
-            },
-            SegmentShape {
-                spread: vec![fit(3, 1, 1)],
-                free: 1,
-                groups: 1,
-            },
-            SegmentShape {
-                spread: vec![fit(4096, 8, 32), fit(4096, 8, 32), fit(17, 2, 8)],
-                free: 0,
-                groups: 3,
-            },
-            SegmentShape {
-                spread: vec![
-                    fit(640, 16, 16),
-                    SpreadIn {
-                        vtgs: "12u".into(),
-                        declared: 6,
-                        fit: None,
-                    },
-                ],
-                free: 5,
-                groups: 5,
-            },
-        ];
-        for (s, shape) in shapes.iter().enumerate() {
-            let mut text = String::new();
-            shape.msl(s, &mut text);
-            for p in 1..=128u32 {
-                let env = eval_constants(&text, p);
-                let get = |n: String| env[&format!("MK_S{s}_{n}")];
-                let mut total = 0;
-                for (i, x) in shape.spread.iter().enumerate() {
-                    assert_eq!(
-                        get(format!("C{i}")),
-                        total,
-                        "shape {s}, {p} cores: cursor {i}"
-                    );
-                    let n = get(format!("N{i}"));
-                    total += n;
-                    if let Some((_, whole)) = x.fit {
-                        let (v, k) = (get(format!("V{i}")), get(format!("K{i}")));
-                        assert!(
-                            (1..=u64::from(whole)).contains(&k),
-                            "shape {s}, {p} cores: step {i} plays {k} per item"
-                        );
-                        assert!(
-                            n * k >= v && (n - 1) * k < v,
-                            "shape {s}, {p} cores: step {i}'s {n} items of {k} and its grid of {v}"
-                        );
-                    }
-                }
-                let rounds = get("R".into());
-                assert!(
-                    total.div_ceil(u64::from(p)) <= rounds,
-                    "shape {s}, {p} cores: {total} items over {rounds} rounds"
-                );
-                for g in 0..shape.groups {
-                    assert!(
-                        get(format!("L{g}")) < u64::from(p),
-                        "shape {s}, {p} cores: lane of group {g}"
-                    );
-                }
-            }
-        }
-    }
 }

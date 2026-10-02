@@ -744,9 +744,9 @@ impl RuntimeGate {
 pub enum TapePlay {
     /// One MTL4 dispatch per command.
     Dispatch,
-    /// In the context a bucket's [`MegakernelTape`] was planned under, its segment kernels — one
-    /// launch per segment instance — in place of the commands; everywhere else as
-    /// [`Self::Dispatch`].
+    /// In the context a bucket's [`MegakernelTape`] was planned under, the launches the load
+    /// solved for the device — generated kernels of runs, commands' own kernels — in place of the
+    /// commands; everywhere else as [`Self::Dispatch`].
     #[default]
     Segmented,
 }
@@ -2128,12 +2128,14 @@ impl ClassedTape {
 
 // ── The decode megakernel (compiled per bucket-1 tape at expansion, played by the worker) ─────
 
-/// The decode megakernel of one bucket-1 tape, planned under [`GateCtx::decode_one`]: the
-/// decode forward as generated SEGMENT kernels — each
-/// a run of the admitted commands in which no threadgroup waits on another, as straight-line
-/// adapter calls with every constant a literal — one library holding one kernel per segment of
-/// the tape's rolled text. Played in that context in place of the commands: one launch per
-/// segment instance, in the order the tape's own loops expand.
+/// The decode megakernel of one bucket-1 tape, planned under [`GateCtx::decode_one`]: the decode
+/// forward's REGIONS — the stretches between the launch boundaries every way of playing it keeps
+/// (a rolled loop's iteration start, the loop's end) — each with every LAUNCH a generated kernel
+/// may play there ([`MkRun`]: a run of its admitted commands in which no threadgroup waits on
+/// another, as straight-line adapter calls with every constant a literal), all in one library.
+/// Which launches play the forward — runs, or a command's own dispatch kernel — and how each run's
+/// work splits over the device's cores is solved at load from the device's measured facts. Played
+/// in that context in place of the commands, in the order the tape's own loops expand.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct MegakernelTape {
     /// Names the library `source` compiles to (a content hash): workers of one load share it.
@@ -2143,69 +2145,140 @@ pub struct MegakernelTape {
     /// The library, compiled at build time as every shader is ([`crate::msl_offline`]): the
     /// adapters' bodies with `source` appended.
     pub metallib: &'static [u8],
-    /// The segment kernels, in the order the rolled tape first reaches them.
-    pub segments: &'static [MkSegment],
-    /// Every baked command the kernels play, in tape order.
+    /// The regions, in the order the rolled tape first reaches them.
+    pub regions: &'static [MkRegion],
+    /// Every baked command the kernels play, in tape order: a region's steps are consecutive.
     pub steps: &'static [MkKernelStep],
+    /// The matvec bodies the load measures the device with, one per streaming body and row length
+    /// the steps stream.
+    pub calibrations: &'static [MkCalibration],
     /// Addresses (`u64`) the kernels' address table holds.
     pub table_len: u32,
     /// The kernels' function constants the load supplies.
     pub load_constants: &'static [MkLoadConstant],
 }
 
-/// A segment kernel of a [`MegakernelTape`]: `kernel` plays the segment each expanded instance of
-/// the baked command `opens` starts — one launch per instance. Instance `k` binds the address
-/// table's block `[table_at + k · block_len, table_at + (k + 1) · block_len)`, so one kernel plays
-/// every iteration of the loop around it.
+/// A region of a [`MegakernelTape`]: each expanded instance of the baked command `opens` starts
+/// one. Instance `k` binds the address table's block `[table_at + k · block_len, table_at +
+/// (k + 1) · block_len)`, a row per step of the region, so every run of it plays every iteration
+/// of the loop around it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct MkSegment {
-    pub kernel: &'static str,
+pub struct MkRegion {
     pub opens: u32,
     pub table_at: u32,
     pub block_len: u32,
-    pub cut: MkCut,
+    /// Its units in order, each the steps `[first, end)` of [`MegakernelTape::steps`]: a
+    /// multi-item step, or a chain of single-item steps one threadgroup plays back to back.
+    pub units: &'static [MkUnit],
+    /// Every launch a generated kernel may play in it.
+    pub runs: &'static [MkRun],
 }
 
-/// Why a segment starts where it does (the plan's `Cut`).
+/// A unit of a [`MkRegion`]: steps `[first, end)` of [`MegakernelTape::steps`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub enum MkCut {
-    /// The forward's first segment.
-    Start,
-    /// A rolled loop's iteration starts, or the loop ended.
-    Break,
-    /// Its first step waits on results one threadgroup cannot order: of the units these steps
-    /// ([`MegakernelTape::steps`]) open, in the segment before.
-    Waits(&'static [u32]),
+pub struct MkUnit {
+    pub first: u32,
+    pub end: u32,
 }
 
-/// A baked command a segment kernel plays: `baked` indexes [`LoweredMetalTape::commands`]; its
-/// `k`-th expanded instance (loop iteration) reads binding `i`'s address at table entry
-/// `table_at + k · block_len + row_at + i` of its segment. Named, so the load checks it plays
-/// what the bake saw.
+/// A launch a generated kernel may play: units `[first, end)` of its region, each placed
+/// (`places`), every wait inside met by one threadgroup (`waits`: a unit and the unit of the run
+/// it waits on). `kernel` reads its work split from function constants: spread unit `i` (in
+/// order) its items' virtual threadgroups `K` at `split_at + 3·i`, its items `N` at
+/// `split_at + 3·i + 1` and its first item's cursor `C` at `split_at + 3·i + 2`; then lane group
+/// `g` its threadgroup at `split_at + 3·spread + g`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct MkKernelStep {
-    pub baked: u32,
-    pub function: &'static str,
-    /// Its segment, in [`MegakernelTape::segments`].
-    pub segment: u32,
-    pub row_at: u32,
-    pub row_len: u32,
-    /// Where its unit runs in the segment's launch.
-    pub place: MkPlace,
-    /// On the step opening a unit: the steps opening the units of the same segment it waits on.
-    pub after: &'static [u32],
+pub struct MkRun {
+    pub kernel: &'static str,
+    pub first: u32,
+    pub end: u32,
+    pub places: &'static [MkPlace],
+    pub waits: &'static [(u32, u32)],
+    pub split_at: ConstSlot,
 }
 
-/// Where a step's unit runs in its segment's launch.
+/// Where a unit runs in a run's launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum MkPlace {
     /// Its items spread over the launch's threadgroups.
     Spread,
-    /// One threadgroup plays it: the segment's lane group `g` — units that wait on one another
-    /// share one.
+    /// One threadgroup plays it: lane group `g` of the run — units that wait on one another share
+    /// one.
     Lane(u32),
     /// Every threadgroup plays it for itself.
     Everywhere,
+}
+
+/// A baked command the kernels play: `baked` indexes [`LoweredMetalTape::commands`]; its `k`-th
+/// expanded instance (loop iteration) reads binding `i`'s address at table entry
+/// `table_at + k · block_len + row_at + i` of its region. Named, so the load checks it plays what
+/// the bake saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkKernelStep {
+    pub baked: u32,
+    pub function: &'static str,
+    /// Its region, in [`MegakernelTape::regions`].
+    pub region: u32,
+    pub row_at: u32,
+    pub row_len: u32,
+    pub work: MkWork,
+}
+
+/// A step's work, in the tape's own terms — what the split's costs read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkWork {
+    /// Threads of one virtual threadgroup: its dispatch threadgroup's, rounded up to a simdgroup.
+    pub vtg_threads: u32,
+    /// The most virtual threadgroups one item may play: as many as a threadgroup's threads and
+    /// memory hold.
+    pub widest: u32,
+    /// A streaming step's weights ([`MkStreamWork`]).
+    pub stream: Option<MkStreamWork>,
+    /// The grid: baked, or (`load`) sized by the load — the materialized command's.
+    pub grid: (u32, u32, u32),
+    pub load: bool,
+    /// A decode attention whose heads group per virtual threadgroup ([`MkHeads`]).
+    pub heads: Option<MkHeads>,
+}
+
+/// The weights a streaming step's virtual threadgroup reads — `bytes` — and the calibration
+/// ([`MegakernelTape::calibrations`]) whose measured rates it streams them at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkStreamWork {
+    pub bytes: u32,
+    pub calibration: u32,
+}
+
+/// A matvec body the load measures the device with, on synthetic weights: kernel `lane` plays
+/// items of `K` virtual threadgroups (the `uint` at binding 1) round-robin over one threadgroup of
+/// [`MK_THREADS`] per core, as a run spreads a step; kernel `native` plays one virtual threadgroup
+/// per threadgroup of `tpg`, as the step's own dispatch kernel. Both read `n` rows (function constant `MK_CAL_N`, a
+/// multiple of `rows` per virtual threadgroup) of `k` codes of `bits` bits, a scale and a bias of
+/// `scale_bytes` per `group` codes, from bindings `w, scales, biases, x, y` (activations of
+/// `act_bytes`). `widest`: the most virtual threadgroups an item may hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkCalibration {
+    pub lane: &'static str,
+    pub native: &'static str,
+    pub rows: u32,
+    pub k: u32,
+    pub bits: u32,
+    pub group: u32,
+    pub scale_bytes: u32,
+    pub act_bytes: u32,
+    pub tpg: (u32, u32, u32),
+    pub widest: u32,
+}
+
+/// A decode attention's query heads per virtual threadgroup: the device's pick for its cores
+/// ([`TqDecodeHeads::for_group`] at the launch's threadgroups), function constant `slot` of the
+/// kernels, the grid's `y` divided by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MkHeads {
+    pub slot: ConstSlot,
+    pub head_dim: u32,
+    pub q: u32,
+    pub kv: u32,
 }
 
 /// A scalar the load decides — the KV capacity's patches, the device's TurboQuant decode heads —
@@ -2260,7 +2333,7 @@ impl BindingMask {
 }
 
 /// A function constant of a dispatch kernel, as its adapter's policy names it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MkConst {
     pub slot: ConstSlot,
     pub ty: ConstantType,
@@ -2276,46 +2349,48 @@ pub struct MkAdapter {
     pub library: &'static str,
     pub function: &'static str,
     pub tg_bytes: VtgBytes,
-    /// Threads one item plays at most: [`MK_THREADS`], or fewer for a streaming body that streams
-    /// its weights faster with fewer live threads per core (`MK_STREAM` in the shader, measured).
-    pub item_threads: u32,
     /// Bindings the adapter may write (every one, unless its `MK_STREAM` line says which).
     pub writes: BindingMask,
-    /// An elementwise adapter (`MK_TAIL`): a step of a few of its items may be played whole by one
+    /// An elementwise adapter (`MK_TAIL`): a step of its items may be played whole by one
     /// threadgroup.
     pub tail: bool,
-    /// A streaming body whose fastest width depends on its row length (`MK_STREAM_ROWS`).
-    pub short_rows: Option<ShortRows>,
+    /// A streaming body (`MK_STREAM`): the weights one virtual threadgroup reads.
+    pub stream: Option<MkStream>,
     /// The dispatch kernel's function constants.
     pub constants: &'static [MkConst],
     /// The adapter, `MK_C` standing for the step's constant policy.
     pub call: &'static str,
 }
 
-/// The width a streaming body plays SHORT rows at: a step whose constant at `row` is below `below`
-/// plays items of up to `item_threads` (few passes per row: more rows in flight hide each row's
-/// latency).
+/// The weights one virtual threadgroup of a streaming body reads: `rows` of the step's constant at
+/// slot `n` rows, each the constant at slot `k` codes of `bits` bits plus a scale and a bias of
+/// `scale_bytes` per `group` codes; and `calibrate`, a matvec adapter call (`MK_C` the constant policy, bindings
+/// `w, scales, biases, x, y`) that streams them the same way — what the load measures the device
+/// with.
 #[derive(Clone, Copy, Debug)]
-pub struct ShortRows {
-    pub item_threads: u32,
-    pub row: ConstSlot,
-    pub below: u32,
+pub struct MkStream {
+    pub rows: u32,
+    pub bits: u32,
+    pub group: u32,
+    pub scale_bytes: u32,
+    pub k: ConstSlot,
+    pub n: ConstSlot,
+    pub calibrate: &'static str,
+}
+
+impl MkStream {
+    /// Bytes one virtual threadgroup of a step with `constants` streams; `None` when its `k` is
+    /// not set.
+    pub fn bytes_per_vtg(&self, constants: &[ConstantValue]) -> Option<u32> {
+        let k = constants.iter().find(|c| c.index == self.k.get())?.bits;
+        let row = k * self.bits / 8 + 2 * k.div_ceil(self.group) * self.scale_bytes;
+        Some(self.rows * row)
+    }
 }
 
 include!(concat!(env!("OUT_DIR"), "/mk_adapters.rs"));
 
 impl MkAdapter {
-    /// Threads one item of a step with `constants` plays at most: [`Self::item_threads`], or the
-    /// [`ShortRows`] width for a short-row step.
-    pub fn item_threads_for(&self, constants: &[ConstantValue]) -> u32 {
-        let short = self.short_rows.filter(|r| {
-            constants
-                .iter()
-                .any(|c| c.index == r.row.get() && c.bits < r.below)
-        });
-        short.map_or(self.item_threads, |r| r.item_threads)
-    }
-
     /// The adapter of the kernel a command names, if a megakernel can call it.
     pub fn of(library: &str, function: &str) -> Option<&'static MkAdapter> {
         MK_ADAPTERS
@@ -2332,11 +2407,16 @@ pub const MK_SIMD_WIDTH: u32 = 32;
 pub const MK_TG_MEMORY: u32 = 32 * 1024;
 /// The function constants of every generated kernel (`megakernel.metal`): the threadgroups every
 /// launch runs, `MK_P` (the GPU's cores); the load constants ([`MkLoadConstant`]) follow from
-/// `MK_FC_LOAD`.
+/// `MK_FC_LOAD`; the decode attentions' heads ([`MkHeads`]) from `MK_FC_HEADS`; the runs' work
+/// splits ([`MkRun::split_at`]) from `MK_FC_SPLIT`. A calibration ([`MkCalibration`]) reads its
+/// rows `MK_CAL_N` at `MK_FC_CAL`.
 pub const MK_FC_P: ConstSlot = ConstSlot(4096);
+pub const MK_FC_CAL: ConstSlot = ConstSlot(4100);
 pub const MK_FC_LOAD: ConstSlot = ConstSlot(4200);
+pub const MK_FC_HEADS: ConstSlot = ConstSlot(12288);
+pub const MK_FC_SPLIT: ConstSlot = ConstSlot(16384);
 
-/// How a step packs into items of at most [`MK_THREADS`] threads (its adapter's `item_threads`).
+/// How a step packs into items of at most [`MK_THREADS`] threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MkGeometry {
     /// Threads per virtual threadgroup, rounded up to a simdgroup.
@@ -2423,7 +2503,7 @@ pub enum MegakernelError {
         first: &'static str,
         second: &'static str,
     },
-    /// A step's threadgroup, or the threadgroup a segment kernel's pipeline can launch.
+    /// A step's threadgroup, or the threadgroup a generated kernel's pipeline can launch.
     ThreadCap { needed: u32, cap: u32 },
     /// Threadgroup memory beyond what one threadgroup has.
     ThreadgroupMemory { needed: u32, budget: u32 },
@@ -2447,6 +2527,8 @@ pub enum MegakernelError {
     Compile(String),
     /// The GPU's cores — the threadgroups every launch runs — are unknown.
     NoGpuCores,
+    /// The device's facts the launch split is solved from could not be measured.
+    DeviceFacts(String),
 }
 
 impl std::fmt::Display for MegakernelError {
@@ -2510,6 +2592,7 @@ impl std::fmt::Display for MegakernelError {
             ),
             Self::Compile(e) => write!(f, "megakernel: the generated library: {e}"),
             Self::NoGpuCores => write!(f, "megakernel: the GPU's core count is unknown"),
+            Self::DeviceFacts(e) => write!(f, "megakernel: measuring the device: {e}"),
         }
     }
 }
@@ -2542,8 +2625,8 @@ mod megakernel_tests {
         assert_eq!(g((25, 1, 1), (96, 1, 1), 1024), (96, 10, 3, 11 * 1024));
     }
 
-    /// A streaming body's items play at most its measured width, never less than one virtual
-    /// threadgroup.
+    /// Items of at most a given width (a run's split) hold whole virtual threadgroups, never less
+    /// than one.
     #[test]
     fn a_streaming_step_packs_to_its_item_width() {
         assert_eq!(streamed((1, 384, 1), (32, 2, 1), 0, 256), (64, 4, 96, 0));

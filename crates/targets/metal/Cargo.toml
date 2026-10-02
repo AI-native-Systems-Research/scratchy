@@ -49,6 +49,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "std",
     "block2",
     "dispatch2",
+    # `MTL4CommitFeedback`'s GPU start and end times (`CFTimeInterval`).
+    "objc2-core-foundation",
     "MTLAllocation",
     "MTLBuffer",
     "MTLCommandBuffer",
@@ -85,7 +87,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 # `device::gpu_cores` reads the GPU core count from the IO registry.
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFNumber", "CFString"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDate", "CFNumber", "CFString"] }
 dispatch2 = "0.3"
 half = "2.3"
 serde = { version = "1.0", features = ["derive"] }

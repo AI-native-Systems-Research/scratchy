@@ -257,12 +257,12 @@ struct MkMarker {
     library: String,
     function: String,
     tg_bytes: u32,
-    item_threads: u32,
     writes: u32,
     /// An elementwise (`MK_TAIL`) adapter.
     tail: bool,
-    /// `(item threads, row constant slot, below)` of an `MK_STREAM_ROWS` adapter.
-    short_rows: Option<(u32, u32, u32)>,
+    /// `(rows, bits, group size, scale bytes, k slot, n slot)` of an `MK_STREAM` adapter, and the
+    /// adapter call it calibrates with.
+    stream: Option<([u32; 6], String)>,
     /// `(MSL type, name, index)` of the dispatch kernel's function constants.
     constants: Vec<(String, String, u32)>,
     /// The adapter call, `MK_C` standing for the step's constant policy.
@@ -352,12 +352,14 @@ fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
             library,
             function,
             tg_bytes,
-            item_threads,
             writes,
             tail,
-            short,
-            row,
-            below,
+            rows,
+            bits,
+            gs,
+            scale_bytes,
+            k,
+            n,
         ] = head[..]
         else {
             panic!("malformed MK_ADAPTER marker head: {head:?}");
@@ -378,21 +380,36 @@ fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
                 _ => panic!("MK_ADAPTER {function}: malformed constant {c:?}"),
             })
             .collect();
-        let call = call.split_whitespace().collect::<Vec<_>>().join(" ");
-        let call = call
-            .strip_prefix('(')
-            .and_then(|c| c.strip_suffix(')'))
-            .unwrap_or_else(|| panic!("MK_ADAPTER {function}: call `{call}` is not parenthesized"));
+        let (call, calibrate) = match call.split_once("@@CALIB") {
+            Some((call, calibrate)) => (call, Some(calibrate)),
+            None => (call, None),
+        };
+        let unwrap = |call: &str| {
+            let call = call.split_whitespace().collect::<Vec<_>>().join(" ");
+            call.strip_prefix('(')
+                .and_then(|c| c.strip_suffix(')'))
+                .unwrap_or_else(|| {
+                    panic!("MK_ADAPTER {function}: call `{call}` is not parenthesized")
+                })
+                .to_string()
+        };
+        let call = unwrap(call);
+        let calibrate = calibrate.map(unwrap);
         markers.push(MkMarker {
             library: library.to_string(),
             function: function.to_string(),
             tg_bytes: int(tg_bytes),
-            item_threads: int(item_threads),
             writes: int(writes),
             tail: int(tail) != 0,
-            short_rows: (int(short) != 0).then(|| (int(short), int(row), int(below))),
+            stream: (int(rows) != 0).then(|| {
+                let calibrate = calibrate
+                    .clone()
+                    .unwrap_or_else(|| panic!("MK_STREAM {function}: no calibration call"));
+                let geometry = [rows, bits, gs, scale_bytes, k, n].map(int);
+                (geometry, calibrate)
+            }),
             constants,
-            call: call.to_string(),
+            call,
         });
     }
     assert!(
@@ -432,17 +449,22 @@ fn write_mk_adapters_rs(out_dir: &Path, markers: &[MkMarker]) {
             .collect();
         s += &format!(
             "    MkAdapter {{ library: {:?}, function: {:?}, tg_bytes: VtgBytes({}), \
-             item_threads: {}, writes: BindingMask({:#x}), tail: {}, short_rows: {}, \
-             constants: &[{}], call: {:?} }},\n",
+             writes: BindingMask({:#x}), tail: {}, stream: {}, constants: &[{}], call: {:?} }},\n",
             m.library,
             m.function,
             m.tg_bytes,
-            m.item_threads,
             m.writes,
             m.tail,
-            m.short_rows.map_or("None".to_string(), |(threads, row, below)| format!(
-                "Some(ShortRows {{ item_threads: {threads}, row: ConstSlot({row}), below: {below} }})"
-            )),
+            m.stream.as_ref().map_or(
+                "None".to_string(),
+                |([rows, bits, gs, scale, k, n], cal)| {
+                    format!(
+                        "Some(MkStream {{ rows: {rows}, bits: {bits}, group: {gs}, \
+                     scale_bytes: {scale}, k: ConstSlot({k}), n: ConstSlot({n}), \
+                     calibrate: {cal:?} }})"
+                    )
+                }
+            ),
             constants.join(", "),
             m.call,
         );

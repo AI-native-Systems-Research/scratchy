@@ -95,11 +95,11 @@
 
 #ifndef MK_ENUMERATE
 // The threadgroups every launch runs — the GPU's cores, known at load. The generated work split
-// reads it as `mk_p`: item `i` of a spread step at segment cursor `c` runs on threadgroup
-// `(c + i) mod mk_p`, a pinned unit on the threadgroup its segment's split names.
+// reads it as `mk_p`: item `i` of a spread step at run cursor `c` runs on threadgroup
+// `(c + i) mod mk_p`, a pinned unit on the threadgroup its run's split names.
 constant uint MK_P [[function_constant(4096)]];
 
-// The first work item of a spread step on threadgroup `idx` of `p`, the segment cursor at `c`.
+// The first work item of a spread step on threadgroup `idx` of `p`, the run cursor at `c`.
 METAL_FUNC uint mk_first(uint idx, uint p, uint c) { return (idx + p - c % p) % p; }
 
 // The work items of a grid the load sizes (`vpi` virtual threadgroups per item).

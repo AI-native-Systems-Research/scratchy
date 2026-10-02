@@ -34,36 +34,31 @@ using namespace metal;
 // `MK_ADAPTER(symbol, tg_bytes, call, CONSTS)`: the megakernel form of one instantiation line —
 // `symbol` is the dispatch kernel's host name, `tg_bytes` the threadgroup memory one virtual
 // threadgroup owns, `call` the adapter with `MK_C` standing for the step's constant policy. Under
-// `MK_ENUMERATE` it prints a marker build.rs parses into `MK_ADAPTERS`; otherwise it is empty. An
-// item plays up to all 1024 threads of the threadgroup; every binding of the step's row counts as
-// written.
-// `MK_STREAM(symbol, item_threads, writes, call, CONSTS)`: a STREAMING adapter (no threadgroup
-// memory) whose items play at most `item_threads` threads, the rest of the threadgroup idling
-// through them — the width its body streams weights fastest at (`MkAdapter::item_threads`) — and
-// that writes only the bindings of the mask `writes`.
-// `MK_STREAM_ROWS(symbol, item_threads, short_threads, row, short_below, writes, call, CONSTS)`:
-// an `MK_STREAM` whose fastest width depends on its row length — a step whose constant at slot
-// `row` is below `short_below` plays items of up to `short_threads` (few passes per row: more rows
-// in flight hide each row's latency) (`MkAdapter::short_rows`).
+// `MK_ENUMERATE` it prints a marker build.rs parses into `MK_ADAPTERS`; otherwise it is empty.
+// Every binding of the step's row counts as written.
+// `MK_STREAM(symbol, rows, bits, gs, scale_bytes, k, n, writes, call, calibrate, CONSTS)`: a
+// STREAMING adapter (no threadgroup memory) — each virtual threadgroup reads `rows` rows of
+// weights, a row the step's constant at slot `k` codes of `bits` bits plus a scale and a bias of
+// `scale_bytes` per `gs` codes, of the constant at slot `n` rows (`MkAdapter::stream`) — that
+// writes only the bindings of the mask `writes`. `calibrate` is a matvec adapter that streams the same rows the same way, its bindings
+// `w, scales, biases, x, y`: the load measures the device with it on synthetic weights. How many
+// threads an item plays is the launch's work split, solved from those measurements.
 // `MK_TAIL(symbol, call, CONSTS)`: an ELEMENTWISE adapter (a few loads and stores per thread, no
-// threadgroup memory) — a step of a few such items may be played whole by the threadgroup that ran
-// what it waits on instead of spreading in a segment of its own (`MkAdapter::tail`); a heavier
-// step never is.
+// threadgroup memory) — a step of such items may be played whole by the threadgroup that ran what
+// it waits on (`MkAdapter::tail`), a run the split weighs against spreading it after a launch
+// boundary of its own.
 #ifdef MK_ENUMERATE
 #define MK_ENUM_C(ty, name, NAME, i) ty name i ;
 #define MK_ADAPTER(sym, tg_bytes, call, CONSTS) \
-  @@MK MK_LIB sym tg_bytes 1024 0xffffffff 0 0 0 0 @@C CONSTS(MK_ENUM_C) @@CALL call @@END
-#define MK_STREAM(sym, item_threads, writes, call, CONSTS) \
-  @@MK MK_LIB sym 0 item_threads writes 0 0 0 0 @@C CONSTS(MK_ENUM_C) @@CALL call @@END
-#define MK_STREAM_ROWS(sym, item_threads, short_threads, row, short_below, writes, call, CONSTS) \
-  @@MK MK_LIB sym 0 item_threads writes 0 short_threads row short_below @@C                     \
-      CONSTS(MK_ENUM_C) @@CALL call @@END
+  @@MK MK_LIB sym tg_bytes 0xffffffff 0 0 0 0 0 0 0 @@C CONSTS(MK_ENUM_C) @@CALL call @@END
+#define MK_STREAM(sym, rows, bits, gs, scale_bytes, k, n, writes, call, calibrate, CONSTS)     \
+  @@MK MK_LIB sym 0 writes 0 rows bits gs scale_bytes k n @@C CONSTS(MK_ENUM_C) @@CALL call     \
+      @@CALIB calibrate @@END
 #define MK_TAIL(sym, call, CONSTS) \
-  @@MK MK_LIB sym 0 1024 0xffffffff 1 0 0 0 @@C CONSTS(MK_ENUM_C) @@CALL call @@END
+  @@MK MK_LIB sym 0 0xffffffff 1 0 0 0 0 0 0 @@C CONSTS(MK_ENUM_C) @@CALL call @@END
 #else
 #define MK_ADAPTER(sym, tg_bytes, call, CONSTS)
-#define MK_STREAM(sym, item_threads, writes, call, CONSTS)
-#define MK_STREAM_ROWS(sym, item_threads, short_threads, row, short_below, writes, call, CONSTS)
+#define MK_STREAM(sym, rows, bits, gs, scale_bytes, k, n, writes, call, calibrate, CONSTS)
 #define MK_TAIL(sym, call, CONSTS)
 #endif
 

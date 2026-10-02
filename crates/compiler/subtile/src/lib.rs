@@ -20,8 +20,8 @@
 pub mod ops;
 pub mod fixtures;
 pub mod lower;
-/// How a tape's steps fuse into generated kernels: waits, units, and the segments one launch each
-/// plays, no segment waiting on another threadgroup.
+/// How a tape's steps fuse into generated kernels: waits, units, the runs a launch may play — none
+/// waiting on another threadgroup — and the cheapest tiling by them.
 pub mod megakernel_plan;
 /// SubtileIR → KTIR (IBM Spyre target). The macro calls it under `-Fspyre`.
 /// ALSO needed by `-Fsuperdsc`: `emit_bundle` builds the source/dim manifest via
