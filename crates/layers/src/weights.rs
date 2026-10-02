@@ -1586,17 +1586,15 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             || self.gguf_dense.contains_key(name)
     }
 
-    /// Whether every MLX-affine weight under `prefix` is packed at the
-    /// bit-width the caller's compile-time `bit_map` claims for it. The
-    /// per-variant affine bit-map gate in the macro-emitted
-    /// `fingerprint_matches` — see [`affine_widths_agree_in`] for the rule and
-    /// the permissiveness contract.
-    pub fn affine_widths_agree(&self, prefix: &str, bit_map: &[(&str, u32, u32)]) -> bool {
+    /// Whether every listed MLX-affine weight is packed at the bit-width the
+    /// compiled variant will read it as. The per-variant affine bit-map gate in
+    /// the macro-emitted `fingerprint_matches` — see [`affine_widths_agree_in`]
+    /// for the rule and the permissiveness contract.
+    pub fn affine_widths_agree(&self, widths: &[(&str, u32, u32)]) -> bool {
         affine_widths_agree_in(
             self.names(),
             |name| self.tensor_info(name).map(|(shape, _)| shape),
-            prefix,
-            bit_map,
+            widths,
         )
     }
 
@@ -2430,85 +2428,90 @@ impl<A: DeviceAllocator> Drop for GpuWeights<A> {
 }
 
 // ---------------------------------------------------------------------------
-// MLX-affine per-role bit-width agreement
+// MLX-affine width agreement
 // ---------------------------------------------------------------------------
 
-/// Resolve `(bits, group_size)` for one on-disk weight role out of a
-/// compile-time affine bit map.
+/// Whether `name` is the tensor `pattern` names. `pattern` is an exact on-disk
+/// path except for at most one `*`, which stands for the layer index — one
+/// segment of ASCII digits. Equality otherwise.
 ///
-/// `bit_map` is `(key, bits, group_size)` consulted IN ORDER; the first key
-/// that is a suffix of `role` wins, and the empty key matches anything (the
-/// macro always bakes a final `("", default_bits, default_group_size)` row for
-/// the quant section's own defaults).
-///
-/// Keys arrive DOT-ANCHORED (`".mlp.gate"`, or an exact MLX per-module path).
-/// That anchoring is load-bearing: a bare `ends_with("mlp.gate_proj")` also
-/// matches `…mlp.switch_mlp.gate_proj`, whereas the loader resolves stacked
-/// routed experts by their `switch_mlp`/`experts` infix
-/// (`affine_moe_expert_bits`) and leaves them at the section default. Requiring
-/// the leading `.` keeps this lookup and the loader's in agreement.
-fn affine_role_width(role: &str, bit_map: &[(&str, u32, u32)]) -> Option<(u32, u32)> {
-    bit_map
-        .iter()
-        .find(|(key, _, _)| key.is_empty() || role.ends_with(key))
-        .map(|&(_, bits, group_size)| (bits, group_size))
+/// Exact, segment-anchored matching is the point. The suffix matching this
+/// replaced could not tell `…mlp.gate_proj` from `…switch_mlp.gate_proj`, which
+/// is precisely where a per-role bit map and the loader's own resolution drift
+/// apart.
+fn affine_pattern_matches(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((head, tail)) => {
+            let Some(rest) = name.strip_prefix(head) else {
+                return false;
+            };
+            let Some(digits) = rest.strip_suffix(tail) else {
+                return false;
+            };
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
 }
 
-/// Whether every MLX-affine weight under `prefix` agrees with `bit_map` about
-/// its packed bit-width.
+/// Whether every MLX-affine weight the compiled variant will read is packed at
+/// the width that variant resolved for it.
+///
+/// `widths` is `(pattern, bits, group_size)`, emitted by the `#[forward]` macro
+/// from the very `FieldLoad`s the load calls are built from (see
+/// `affine_tensors_of`), so these are the widths the loader WILL use — not a
+/// re-derivation that could drift from it.
 ///
 /// `mlx_lm.convert` ships each quantized linear as a `.{weight,scales,biases}`
 /// triple where the U32 `.weight` is `[.., K / (32 / bits)]` and `.scales` is
-/// `[.., K / group_size]`. Both encode the same `K`, so for every weight whose
-/// `.scales` sibling exists:
+/// `[.., K / group_size]`. Both encode the same `K`, so for every listed weight
+/// whose `.scales` sibling exists:
 ///
 /// ```text
 /// weight.last() * (32 / bits) == scales.last() * group_size
 /// ```
 ///
-/// That is exactly the invariant `affine_dequant_b4_bytes` asserts at load
-/// time, lifted to fingerprint time: a variant whose baked bit map disagrees
-/// with the checkpoint now REJECTS instead of being selected and then panicking
-/// inside a dequant helper, far from the cause.
+/// That is exactly the invariant `affine_dequant_b4_bytes` asserts at load time,
+/// lifted to fingerprint time: a variant whose widths disagree with the
+/// checkpoint now REJECTS instead of being selected and then panicking inside a
+/// dequant helper, far from the cause.
 ///
 /// ⛔ THIS IS WHAT SEPARATES TWO VARIANTS DIFFERING ONLY IN THEIR PER-ROLE BIT
 /// MAP. `Qwen3.5-35B-A3B-4bit` and `Qwen3.6-35B-A3B-4bit` are byte-identical on
 /// every other fingerprint axis — same hidden/layers/experts/vocab, same group
 /// size, same (absent) rope_scaling — and differ only in `mlp.gate` +
-/// `mlp.shared_expert_gate` being 4-bit on 3.5 and 8-bit on 3.6. The check is
-/// symmetric by construction because it tests EVERY affine tensor against the
-/// variant's WHOLE map (defaults included), not just the roles that variant
-/// happens to override: a uniform-4bit variant rejects 3.6's 8-bit gate
-/// (`512 * 8 != 32 * 64`) exactly as the gate8 variant rejects 3.5's 4-bit one
-/// (`256 * 4 != 32 * 64`).
+/// `mlp.shared_expert_gate` being 4-bit on 3.5 and 8-bit on 3.6. It is symmetric
+/// because both variants list the SAME tensors at their OWN widths: the 4-bit
+/// variant rejects 3.6's 8-bit gate (`512 * 8 != 32 * 64`) exactly as the 8-bit
+/// one rejects 3.5's (`256 * 4 != 32 * 64`).
 ///
-/// Rank-agnostic: `last()` also covers the 3-D stacked-expert tensors
-/// (`switch_mlp.gate_proj` `[256, 512, 256]` against `.scales` `[256, 512, 32]`).
+/// Rank-agnostic: `last()` also covers 3-D stacked-expert tensors.
 ///
-/// **Permissive by design.** A weight with no `.scales` sibling, either shape
-/// missing or empty, or a `bits` that doesn't divide 32 yields no opinion — the
-/// checkpoint simply says nothing about that role. Only a genuine arithmetic
-/// disagreement rejects, so this can never false-reject on a tensor the variant
-/// would not have dequantized anyway. Callers scope `prefix` to the subtree
-/// their variant actually loads (the decoder root), which keeps separately
-/// quantized sibling towers out of the scan.
+/// **Permissive by design.** A listed weight that is absent, has no `.scales`
+/// sibling, or whose shapes are empty yields no opinion — and a tensor NOT
+/// listed is never examined, so the gate can only ever speak about weights this
+/// variant actually reads at a width it actually resolved. Only a genuine
+/// arithmetic disagreement rejects.
 pub fn affine_widths_agree_in<'a, S>(
     names: impl Iterator<Item = &'a str>,
     shape_of: S,
-    prefix: &str,
-    bit_map: &[(&str, u32, u32)],
+    widths: &[(&str, u32, u32)],
 ) -> bool
 where
     S: Fn(&str) -> Option<&'a [usize]>,
 {
     for name in names {
-        if !name.starts_with(prefix) {
-            continue;
-        }
-        let Some(role) = name.strip_suffix(".weight") else {
+        // Patterns name the `.weight` tensor itself (that is what
+        // `affine_tensors_of` collects), so match the FULL name and derive the
+        // `.scales` sibling from it — matching a stripped role against a pattern
+        // that still carries `.weight` silently matches nothing at all.
+        let Some(&(_, bits, group_size)) = widths
+            .iter()
+            .find(|(pattern, _, _)| affine_pattern_matches(pattern, name))
+        else {
             continue;
         };
-        let Some((bits, group_size)) = affine_role_width(role, bit_map) else {
+        let Some(role) = name.strip_suffix(".weight") else {
             continue;
         };
         if bits == 0 || !32_u32.is_multiple_of(bits) || group_size == 0 {
@@ -2526,11 +2529,11 @@ where
         if packed * (32 / bits) as usize != groups * group_size as usize {
             tracing::debug!(
                 tensor = name,
-                baked_bits = bits,
-                baked_group_size = group_size,
+                resolved_bits = bits,
+                resolved_group_size = group_size,
                 packed_cols = packed,
                 scale_cols = groups,
-                "affine bit map disagrees with checkpoint; variant rejected",
+                "affine width disagrees with checkpoint; variant rejected",
             );
             return false;
         }
@@ -2539,35 +2542,55 @@ where
 }
 
 #[cfg(test)]
-mod affine_bit_map_tests {
+mod affine_width_tests {
     use std::collections::HashMap;
 
-    use super::{affine_role_width, affine_widths_agree_in};
+    use super::{affine_pattern_matches, affine_widths_agree_in};
 
-    /// The uniform-4bit map a `mlx-affine-b4-g64-qembed` variant bakes.
-    const UNIFORM_B4: &[(&str, u32, u32)] = &[("", 4, 64)];
-    /// The map a `mlx-affine-b4-g64-gate8-qembed` variant bakes.
-    const GATE8: &[(&str, u32, u32)] = &[
-        (".mlp.gate", 8, 64),
-        (".mlp.shared_expert_gate", 8, 64),
-        ("", 4, 64),
+    /// What a `mlx-affine-b4-g64-qembed` variant of qwen3-5-moe emits: one
+    /// starred row per role, at the width its own load call will use.
+    const V3_5: &[(&str, u32, u32)] = &[
+        ("language_model.model.layers.*.mlp.gate.weight", 4, 64),
+        (
+            "language_model.model.layers.*.mlp.shared_expert_gate.weight",
+            4,
+            64,
+        ),
+        (
+            "language_model.model.layers.*.self_attn.q_proj.weight",
+            4,
+            64,
+        ),
+    ];
+    /// The same, for the stem whose `.overrides.json` widens both router gates.
+    const V3_6: &[(&str, u32, u32)] = &[
+        ("language_model.model.layers.*.mlp.gate.weight", 8, 64),
+        (
+            "language_model.model.layers.*.mlp.shared_expert_gate.weight",
+            8,
+            64,
+        ),
+        (
+            "language_model.model.layers.*.self_attn.q_proj.weight",
+            4,
+            64,
+        ),
     ];
 
-    fn check(tensors: &HashMap<String, Vec<usize>>, bit_map: &[(&str, u32, u32)]) -> bool {
+    fn check(tensors: &HashMap<String, Vec<usize>>, widths: &[(&str, u32, u32)]) -> bool {
         affine_widths_agree_in(
             tensors.keys().map(|s| s.as_str()),
             |name| tensors.get(name).map(|s| s.as_slice()),
-            "language_model.model.",
-            bit_map,
+            widths,
         )
     }
 
-    /// `(role, weight_cols, scale_cols)` → the `.weight`/`.scales` pair under
-    /// the decoder root, shaped the way `mlx_lm.convert` writes them.
+    /// `(role, weight_cols, scale_cols)` → the `.weight`/`.scales` pair under a
+    /// layer, shaped the way `mlx_lm.convert` writes them.
     fn ckpt(roles: &[(&str, usize, usize)]) -> HashMap<String, Vec<usize>> {
         let mut m = HashMap::new();
         for &(role, w, s) in roles {
-            let base = format!("language_model.model.layers.0.{role}");
+            let base = format!("language_model.model.layers.7.{role}");
             m.insert(format!("{base}.weight"), vec![256, w]);
             m.insert(format!("{base}.scales"), vec![256, s]);
         }
@@ -2577,119 +2600,122 @@ mod affine_bit_map_tests {
     /// ⛔ THE COLLISION THIS GATE EXISTS FOR (#202). The two checkpoints differ
     /// only in the width of two router gates; each variant must accept its own
     /// and reject its sibling's, or whichever variant is declared first claims
-    /// both and the 3.6 checkpoint silently dequantizes with the wrong stride.
+    /// both and the loser dequantizes with the wrong stride.
     #[test]
     fn the_two_qwen3_5_moe_gate_widths_select_different_variants() {
         // Real shapes, read off the cached snapshots' safetensors headers.
-        let v3_5 = ckpt(&[
+        let c3_5 = ckpt(&[
             ("self_attn.q_proj", 256, 32),
             ("mlp.gate", 256, 32),
             ("mlp.shared_expert_gate", 256, 32),
         ]);
-        let v3_6 = ckpt(&[
+        let c3_6 = ckpt(&[
             ("self_attn.q_proj", 256, 32),
             ("mlp.gate", 512, 32),
             ("mlp.shared_expert_gate", 512, 32),
         ]);
 
+        assert!(check(&c3_5, V3_5), "3.5's variant must accept 3.5");
         assert!(
-            check(&v3_5, UNIFORM_B4),
-            "the uniform-4bit variant must accept the uniform-4bit checkpoint",
+            !check(&c3_6, V3_5),
+            "3.5's variant must REJECT 3.6 — accepting it is the #202 mis-selection, which \
+             surfaces later as `affine_dequant_b4: scales shape [256, 32] != [256, 64]`",
         );
+        assert!(check(&c3_6, V3_6), "3.6's variant must accept 3.6");
         assert!(
-            !check(&v3_6, UNIFORM_B4),
-            "the uniform-4bit variant must REJECT the 8-bit-gate checkpoint — accepting it is \
-             the #202 mis-selection, which surfaces later as `affine_dequant_b4: scales shape \
-             [256, 32] != [256, 64]`",
-        );
-        assert!(
-            check(&v3_6, GATE8),
-            "the gate8 variant must accept the 8-bit-gate checkpoint",
-        );
-        assert!(
-            !check(&v3_5, GATE8),
-            "the gate8 variant must REJECT the uniform-4bit checkpoint — accepting it is the \
-             originally reported `[256, 32] != [256, 16]`",
+            !check(&c3_5, V3_6),
+            "3.6's variant must REJECT 3.5 — accepting it is the originally reported \
+             `[256, 32] != [256, 16]`",
         );
     }
 
-    /// Stacked routed experts are 3-D (`[num_experts, out, in/pack]`); the
-    /// check keys off the LAST dim so the same arithmetic covers them.
+    /// Stacked routed experts are 3-D (`[num_experts, out, in/pack]`); the check
+    /// keys off the LAST dim so the same arithmetic covers them.
     #[test]
     fn stacked_expert_tensors_are_checked_on_their_last_dim() {
+        let widths: &[(&str, u32, u32)] = &[(
+            "language_model.model.layers.*.mlp.switch_mlp.gate_proj.weight",
+            4,
+            64,
+        )];
         let mut m = HashMap::new();
-        m.insert(
-            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight".to_string(),
-            vec![256, 512, 256],
-        );
-        m.insert(
-            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.scales".to_string(),
-            vec![256, 512, 32],
-        );
-        assert!(check(&m, UNIFORM_B4), "256 * 8 == 32 * 64");
+        let base = "language_model.model.layers.7.mlp.switch_mlp.gate_proj";
+        m.insert(format!("{base}.weight"), vec![256, 512, 256]);
+        m.insert(format!("{base}.scales"), vec![256, 512, 32]);
+        assert!(check(&m, widths), "256 * 8 == 32 * 64");
 
-        m.insert(
-            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight".to_string(),
-            vec![256, 512, 512],
+        m.insert(format!("{base}.weight"), vec![256, 512, 512]);
+        assert!(
+            !check(&m, widths),
+            "an 8-bit-packed expert stack must not satisfy a 4-bit row",
+        );
+    }
+
+    /// ⛔ WHY THE PATTERNS ARE EXACT. Suffix matching could not tell
+    /// `mlp.gate_proj` from `switch_mlp.gate_proj`, so a row meant for the dense
+    /// MLP silently claimed the routed expert stack too — a width the loader
+    /// resolves separately. Segment-anchored matching makes that impossible.
+    #[test]
+    fn a_pattern_matches_only_the_tensor_it_names() {
+        let p = "language_model.model.layers.*.mlp.gate_proj";
+        assert!(affine_pattern_matches(
+            p,
+            "language_model.model.layers.3.mlp.gate_proj"
+        ));
+        assert!(
+            !affine_pattern_matches(p, "language_model.model.layers.3.mlp.switch_mlp.gate_proj"),
+            "the routed expert stack is a different tensor at a separately resolved width",
         );
         assert!(
-            !check(&m, UNIFORM_B4),
-            "an 8-bit-packed expert stack must not satisfy a 4-bit map",
+            !affine_pattern_matches(
+                p,
+                "language_model.model.layers.3.mlp.shared_expert.gate_proj"
+            ),
+            "so is the shared expert's projection",
         );
+        assert!(
+            !affine_pattern_matches(p, "language_model.model.layers.X.mlp.gate_proj"),
+            "`*` stands for a layer INDEX, not an arbitrary segment",
+        );
+        assert!(
+            !affine_pattern_matches(p, "language_model.model.layers..mlp.gate_proj"),
+            "`*` requires at least one digit",
+        );
+        // A row with no `*` is plain equality (embeddings, lm_head).
+        assert!(affine_pattern_matches(
+            "language_model.model.embed_tokens",
+            "language_model.model.embed_tokens"
+        ));
+        assert!(!affine_pattern_matches(
+            "language_model.model.embed_tokens",
+            "language_model.lm_head"
+        ));
     }
 
-    /// Dot-anchoring. A bare `ends_with("mlp.gate_proj")` ALSO matches
-    /// `…mlp.switch_mlp.gate_proj`, but the loader resolves stacked experts via
-    /// `affine_moe_expert_bits`' `switch_mlp` infix and leaves them at the
-    /// section default. The leading `.` is what keeps the two in agreement.
-    #[test]
-    fn a_dotted_key_does_not_alias_into_a_longer_segment() {
-        let map = &[(".mlp.gate_proj", 8, 64), ("", 4, 64)];
-        assert_eq!(
-            affine_role_width("language_model.model.layers.0.mlp.gate_proj", map),
-            Some((8, 64)),
-            "the leaf the key names must resolve to the override",
-        );
-        assert_eq!(
-            affine_role_width(
-                "language_model.model.layers.0.mlp.switch_mlp.gate_proj",
-                map
-            ),
-            Some((4, 64)),
-            "`switch_mlp.gate_proj` must fall through to the section default, matching \
-             `affine_moe_expert_bits`",
-        );
-        assert_eq!(
-            affine_role_width(
-                "language_model.model.layers.0.mlp.shared_expert.gate_proj",
-                map
-            ),
-            Some((4, 64)),
-            "`shared_expert.gate_proj` is a different role and must not pick up the override",
-        );
-    }
-
-    /// Permissiveness: no `.scales` sibling means the checkpoint says nothing
-    /// about that role, so the gate must stay silent rather than reject. Dense
-    /// bf16 norms under the decoder root are the common case.
+    /// Permissiveness: a listed weight with no `.scales` sibling means the
+    /// checkpoint says nothing about it, so the gate must stay silent.
     #[test]
     fn a_weight_without_a_scales_sibling_is_not_an_opinion() {
+        let widths: &[(&str, u32, u32)] = &[(
+            "language_model.model.layers.*.self_attn.q_proj.weight",
+            4,
+            64,
+        )];
         let mut m = HashMap::new();
         m.insert(
-            "language_model.model.layers.0.input_layernorm.weight".to_string(),
-            vec![2048],
+            "language_model.model.layers.7.self_attn.q_proj.weight".to_string(),
+            vec![4096, 4096],
         );
-        m.insert("language_model.model.norm.weight".to_string(), vec![2048]);
-        assert!(check(&m, UNIFORM_B4));
+        assert!(check(&m, widths));
     }
 
-    /// The scan is scoped to the prefix the variant actually loads, so a
-    /// separately quantized sibling tower cannot false-reject it.
+    /// A tensor no row names is never examined — so a separately quantized
+    /// sibling tower, or any role whose width the macro could not state, cannot
+    /// false-reject the variant.
     #[test]
-    fn tensors_outside_the_prefix_are_not_scanned() {
+    fn an_unlisted_tensor_is_never_examined() {
         let mut m = HashMap::new();
-        // An 8-bit-packed vision tower: inconsistent with the 4-bit map, but
-        // outside `language_model.model.` and never read by the decoder.
+        // 8-bit-packed and inconsistent with anything 4-bit, but unlisted.
         m.insert(
             "vision_tower.blocks.0.attn.qkv.weight".to_string(),
             vec![256, 512],
@@ -2698,6 +2724,6 @@ mod affine_bit_map_tests {
             "vision_tower.blocks.0.attn.qkv.scales".to_string(),
             vec![256, 32],
         );
-        assert!(check(&m, UNIFORM_B4));
+        assert!(check(&m, V3_5));
     }
 }

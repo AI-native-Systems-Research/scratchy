@@ -322,7 +322,7 @@ pub mod arch_registry;
 // reachable under spyre too — the spyre worker fingerprint-loads through this
 // SAME registry (with `GpuWeights<SpyreAllocator>`).
 #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
-pub use arch_registry::{ArchTryLoadFn, ScratchyArchRegistration, arch_is_registered, try_load};
+pub use arch_registry::{ArchLoad, ArchTryLoadFn, ScratchyArchRegistration, try_load};
 // Read-only KTIR bundle resolver — spyre fetches its forward bundle without
 // consuming `GpuWeights` (so the worker keeps the live tensors for the runner).
 #[cfg(feature = "spyre")]

@@ -47,7 +47,6 @@ pub fn enabled_presets() -> Vec<&'static str> {
     preset!(v, "mlx-affine-b4-g128-qembed");
     preset!(v, "mlx-affine-b4-g32");
     preset!(v, "mlx-affine-b4-g64");
-    preset!(v, "mlx-affine-b4-g64-gate8-qembed");
     preset!(v, "mlx-affine-b4-g64-mlp8-router8");
     preset!(v, "mlx-affine-b4-g64-qembed");
     preset!(v, "nvfp4");
