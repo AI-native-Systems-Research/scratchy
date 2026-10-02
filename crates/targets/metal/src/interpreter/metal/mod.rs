@@ -31,10 +31,10 @@ pub use ids::{
     PhysicalBlockIdx, QTokenIdx, SeqIdx, SlotInBlock,
 };
 pub use lowered::{
-    Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
-    ModelSources, RuntimeBindingKind, SourceRef, WeightTensor,
+    Binding, DispatchShape, GemmDims, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
+    MetalDtype, ModelSources, RuntimeBindingKind, SourceRef, WeightTensor,
 };
-pub use pipelines::{PipelineLookupError, SpecializedPipelines};
+pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 
 /// Reactive (chunked) KV pool granularity — re-exported single source
 /// of truth so the worker (chunk-pool sizing) and the lowering

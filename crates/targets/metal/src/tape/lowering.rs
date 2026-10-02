@@ -1811,8 +1811,8 @@ fn lower_one(
 
         // ── Generic dense GEMM ─────────────────────────────────────
         I::Gemm(Slot(in_slot), Slot(out_slot), LayerId(layer), NDim(n), KDim(k)) => {
-            // The worker reads `gemm_dims` and dispatches the
-            // `gemm_{f16,bf16}_specialized` kernel (M/N/K baked into
+            // The worker reads `gemm_dims` and dispatches the kernel
+            // `pipeline_for_gemm` picks for them (M/N/K baked into
             // function constants), so this tile-shape hint is a
             // placeholder; the GEMM bake picks its own grid.
             // `eff_m` shrinks by the merge factor for the merger's
@@ -1825,9 +1825,8 @@ fn lower_one(
             let tg_y = (*n).div_ceil(GEMM_TILE_N);
             LoweredCommand {
                 kernel: KernelId::Gemm,
-                // GEMM is opaque to `pipeline_for_command` — f16 takes the
-                // MPS branch, bf16 has its own dims-keyed builder
-                // (`pipeline_for_gemm_bf16`). Empty library/function +
+                // GEMM is opaque to `pipeline_for_command` — it has its own
+                // dims-keyed builder (`pipeline_for_gemm`). Empty library/function +
                 // empty constants signal the worker to route GEMM commands
                 // through the special-case path instead.
                 library: "",
