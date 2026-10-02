@@ -225,6 +225,15 @@ fn is_unstreamed(r: &RequestResult) -> bool {
     r.output_tokens > 1 && r.chunks <= 1
 }
 
+/// `50` for 50.0, `99.9` for 99.9: the percentile's name in labels and keys.
+fn p_word(p: f64) -> String {
+    if p == p.floor() {
+        format!("{}", p as i64)
+    } else {
+        format!("{p}")
+    }
+}
+
 /// Compute percentile of a sorted slice using linear interpolation
 /// matching numpy.percentile(method='linear').
 pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -244,6 +253,14 @@ pub(crate) fn percentile(sorted: &[f64], p: f64) -> f64 {
         let frac = idx - lo as f64;
         sorted[lo] + frac * (sorted[hi] - sorted[lo])
     }
+}
+
+/// Arithmetic mean (0 for no samples).
+fn mean(data: &[f64]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    data.iter().sum::<f64>() / data.len() as f64
 }
 
 /// Compute standard deviation.
@@ -678,7 +695,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         eprintln!(
             "warning: {num_unstreamed}/{num_success} requests delivered all their tokens in a \
              single chunk, so their TTFT/TPOT/ITL are unobservable and were excluded; \
-             E2EL and throughput still count them"
+             E2EL and output throughput still count them"
         );
     }
 
@@ -687,7 +704,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         if data.is_empty() {
             return;
         }
-        let mean = data.iter().sum::<f64>() / data.len() as f64;
+        let mean = mean(data);
         let median = percentile(data, 50.0);
         let sd = std_dev(data);
         println!("{:-^50}", header);
@@ -703,14 +720,9 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         );
         println!("{:<40} {:<10.2}", format!("Std {name} (ms):"), sd * 1000.0);
         for &p in &selected_pcts {
-            let p_word = if p == p.floor() {
-                format!("{}", p as i64)
-            } else {
-                format!("{p}")
-            };
             println!(
                 "{:<40} {:<10.2}",
-                format!("P{p_word} {name} (ms):"),
+                format!("P{} {name} (ms):", p_word(p)),
                 percentile(data, p) * 1000.0
             );
         }
@@ -728,14 +740,6 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     println!("{:=^50}", "");
 
     // Build JSON result object.
-    let mean = |d: &[f64]| {
-        if d.is_empty() {
-            0.0
-        } else {
-            d.iter().sum::<f64>() / d.len() as f64
-        }
-    };
-
     let mut json = serde_json::json!({
         "duration": total_time,
         "completed": num_success,
@@ -750,45 +754,19 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     });
     let obj = json.as_object_mut().unwrap();
 
+    // No samples is "not measured" (null), never 0 ms.
     let add_metric_json =
         |obj: &mut serde_json::Map<String, serde_json::Value>, attr: &str, data: &[f64]| {
-            // No samples is "not measured", never 0 ms.
-            if data.is_empty() {
-                obj.insert(format!("mean_{attr}_ms"), serde_json::Value::Null);
-                obj.insert(format!("median_{attr}_ms"), serde_json::Value::Null);
-                obj.insert(format!("std_{attr}_ms"), serde_json::Value::Null);
-                for &p in &selected_pcts {
-                    let p_word = if p == p.floor() {
-                        format!("{}", p as i64)
-                    } else {
-                        format!("{p}")
-                    };
-                    obj.insert(format!("p{p_word}_{attr}_ms"), serde_json::Value::Null);
-                }
-                return;
-            }
-            obj.insert(
-                format!("mean_{attr}_ms"),
-                serde_json::json!(mean(data) * 1000.0),
-            );
+            let ms = |stat: fn(&[f64]) -> f64| (!data.is_empty()).then(|| stat(data) * 1000.0);
+            obj.insert(format!("mean_{attr}_ms"), serde_json::json!(ms(mean)));
             obj.insert(
                 format!("median_{attr}_ms"),
-                serde_json::json!(percentile(data, 50.0) * 1000.0),
+                serde_json::json!(ms(|d| percentile(d, 50.0))),
             );
-            obj.insert(
-                format!("std_{attr}_ms"),
-                serde_json::json!(std_dev(data) * 1000.0),
-            );
+            obj.insert(format!("std_{attr}_ms"), serde_json::json!(ms(std_dev)));
             for &p in &selected_pcts {
-                let p_word = if p == p.floor() {
-                    format!("{}", p as i64)
-                } else {
-                    format!("{p}")
-                };
-                obj.insert(
-                    format!("p{p_word}_{attr}_ms"),
-                    serde_json::json!(percentile(data, p) * 1000.0),
-                );
+                let v = (!data.is_empty()).then(|| percentile(data, p) * 1000.0);
+                obj.insert(format!("p{}_{attr}_ms", p_word(p)), serde_json::json!(v));
             }
         };
 
@@ -919,7 +897,11 @@ mod tests {
     #[test]
     fn streamed_and_single_token_requests_are_timed() {
         assert!(!is_unstreamed(&req(128, 129, 3.8, 6.1)));
-        // Partly held back but still streamed: the gap is real decode time.
+        // Two chunks for 128 tokens: 126 were held back and flushed at the
+        // end, so its one ITL means nothing. TPOT spans first to last chunk,
+        // so it holds as long as the first chunk came on time, which chunk
+        // counts can't show. Nor can they tell this from spec decode sending
+        // several tokens per chunk on purpose, so it stays timed.
         assert!(!is_unstreamed(&req(128, 2, 8.0, 10.3)));
         // max_tokens 1: one chunk is all there is to see.
         assert!(!is_unstreamed(&req(1, 1, 0.3, 0.3)));
