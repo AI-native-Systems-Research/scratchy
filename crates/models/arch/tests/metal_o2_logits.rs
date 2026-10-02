@@ -749,7 +749,11 @@ o2_cases! {
 /// ```text
 /// PERF <case> arm=<path> round=<r> n=<DECODE> median_ms=… mean_ms=… p10_ms=… p90_ms=… min_ms=… max_ms=… prefill_ms=… nan=<count>
 /// ```
-#[cfg(any(feature = "llama-3.2-3b", feature = "gemma-4-26b-a4b-it"))]
+#[cfg(any(
+    feature = "llama-3.2-3b",
+    feature = "gemma-4-26b-a4b-it",
+    feature = "qwen3-0.6b"
+))]
 mod perf {
     use super::*;
 
@@ -939,6 +943,16 @@ mod perf {
             prompt: concat!("<bos><|turn>user\n", request!(), "<turn|>\n<|turn>model\n"),
             bos: "<bos>",
             markup: &["<|turn>", "<turn|>"],
+        }
+        "qwen3-0.6b" => perf_qwen3_0_6b_mlx {
+            repo: "mlx-community/Qwen3-0.6B-4bit",
+            prompt: concat!(
+                "<|im_start|>user\n",
+                request!(),
+                "<|im_end|>\n<|im_start|>assistant\n",
+            ),
+            bos: "<|im_start|>",
+            markup: &["<|im_start|>", "<|im_end|>"],
         }
     }
 }
