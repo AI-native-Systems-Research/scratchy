@@ -1,8 +1,7 @@
 //! The macro-side metal tape bake.
 //!
-//! Runs the SAME `lower_pair` the runtime used (now living in
-//! `scratchy_target_metal::tape::lowering`, de-generic'd) at expansion,
-//! once per (generation class × chunked-addressing) variant, and emits
+//! Runs `scratchy_target_metal::tape::lowering::lower_subtile_tape_to_metal`
+//! at expansion, once per (generation class × chunked-addressing) variant, and emits
 //! the results as `ClassedTape` statics via the generic serializer in
 //! [`crate::const_tokens`]. Nothing here re-implements lowering logic —
 //! zero per-op surface.
@@ -18,10 +17,8 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use scratchy_ir::Instruction;
 use scratchy_target_metal::tape::lowered::{
-    CapPatch, GatedCommand, GenClass, LoweredMetalTape, LoweringError, PatchTarget, ScratchField,
-    ScratchPatch,
+    CapPatch, GatedCommand, GenClass, LoweredMetalTape, PatchTarget, ScratchField, ScratchPatch,
 };
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
@@ -42,9 +39,9 @@ pub struct CommandPool {
 }
 
 impl CommandPool {
-    fn intern(&mut self, cmd: &GatedCommand) -> Result<TokenStream, BakeRefusal> {
+    fn intern(&mut self, cmd: &GatedCommand) -> Result<TokenStream, BakeDefect> {
         let toks = crate::const_tokens::const_tokens(cmd)
-            .map_err(|e| BakeRefusal::Defect(format!("serialize command: {e}")))?;
+            .map_err(|e| BakeDefect(format!("serialize command: {e}")))?;
         let next = self.consts.len();
         let ix = *self.index.entry(toks.to_string()).or_insert_with(|| {
             let id = quote::format_ident!("C{next}");
@@ -69,21 +66,19 @@ impl CommandPool {
         }
     }
 }
-
-/// Why a bucket's tape could not bake.
-pub enum BakeRefusal {
-    /// The stream contains an instruction the metal lowering has no arm
-    /// for. On the old runtime-lowering path this surfaced at LOAD, not
-    /// at build — the caller bakes an EMPTY variant list so the pool
-    /// refuses at the same point, and buildability is preserved for
-    /// presets that never load on metal.
-    Unlowerable(String),
-    /// Anything else — a real bake defect; the caller must panic.
-    Defect(String),
-}
 use scratchy_target_metal::tape::lowering as tl;
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
+use scratchy_target_metal::tape::step::{MetalStepTape, RotaryTables};
 use scratchy_target_metal::tape::targets::MetalTargetProfile;
+
+/// Why a bucket's tape could not bake — a defect; the caller panics with it.
+pub struct BakeDefect(pub String);
+
+impl std::fmt::Display for BakeDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Probe capacities. `CAP_ZERO` bakes the floors; A/B derive the slope;
 /// `CAP_CHECK` (off the A–B line) verifies the max-affine model.
@@ -92,17 +87,21 @@ const CAP_A: u32 = 1024;
 const CAP_B: u32 = 2048;
 const CAP_CHECK: u32 = 1536;
 
-/// One per-bucket lowering input set — exactly what the runtime pool
-/// used to pass to `lower_pair` at load, minus the two runtime values.
+/// One bucket's lowering input: its step tape, minus the two runtime values.
 pub struct BucketLowerInput<'a> {
-    pub backbone: &'a [Instruction],
-    pub lm_head: &'a [Instruction],
-    pub backbone_barriers: &'a [bool],
-    pub lm_head_barriers: &'a [bool],
+    pub steps: &'a MetalStepTape,
     pub bucket_m: u32,
     pub num_arena_slots: u32,
-    pub backbone_tape_index: u32,
-    pub lm_head_tape_index: u32,
+    /// The model's class rotary tables (rope-on-read), from its source manifest.
+    pub rotary: Option<RotaryTables>,
+}
+
+/// A bucket's MTL4 barrier flags as a `static`.
+pub fn emit_bucket_barriers_static(static_ident: &syn::Ident, barriers: &[bool]) -> TokenStream {
+    quote! {
+        #[cfg(feature = "metal")]
+        static #static_ident: &[bool] = &[ #(#barriers),* ];
+    }
 }
 
 fn profile_for(class: GenClass) -> MetalTargetProfile {
@@ -120,27 +119,17 @@ fn run_lower(
     cap: u32,
     profile: &MetalTargetProfile,
     chunked: bool,
-) -> Result<LoweredMetalTape, BakeRefusal> {
-    tl::lower_pair(
-        mc,
+) -> Result<LoweredMetalTape, BakeDefect> {
+    let at = tl::BakePoint {
         chunked,
-        input.backbone,
-        input.lm_head,
-        input.backbone_barriers,
-        input.lm_head_barriers,
-        input.bucket_m,
-        input.num_arena_slots,
-        input.backbone_tape_index,
-        input.lm_head_tape_index,
-        cap,
-        Some(profile),
-    )
-    .map_err(|e| match e {
-        LoweringError::UnsupportedVariant { .. } => {
-            BakeRefusal::Unlowerable(format!("bucket_m={}: {e}", input.bucket_m))
-        }
-        other => BakeRefusal::Defect(format!("bucket_m={}: {other}", input.bucket_m)),
-    })
+        bucket_m: input.bucket_m,
+        num_arena_slots: input.num_arena_slots,
+        rotary: input.rotary,
+        block_cap: cap,
+        profile: Some(profile),
+    };
+    tl::lower_subtile_tape_to_metal(input.steps, mc, at)
+        .map_err(|e| BakeDefect(format!("bucket_m={}: {e}", input.bucket_m)))
 }
 
 /// The fitted rational capacity model:
@@ -475,7 +464,7 @@ pub fn bake_bucket_tapes(
     mc: &MetalModelConsts,
     input: &BucketLowerInput<'_>,
     pool: &mut CommandPool,
-) -> Result<TokenStream, BakeRefusal> {
+) -> Result<TokenStream, BakeDefect> {
     let classes = [GenClass::M1, GenClass::Mid, GenClass::M5];
     let mut entries: Vec<TokenStream> = Vec::new();
     let mut body_statics: Vec<TokenStream> = Vec::new();
@@ -489,7 +478,7 @@ pub fn bake_bucket_tapes(
     // linear scan over `PartialEq` beats stringifying every body.
     type Body = (LoweredMetalTape, Vec<CapPatch>, Vec<ScratchPatch>);
     let mut seen: Vec<Body> = Vec::new();
-    let uniq = format!("M{}_T{}", input.bucket_m, input.backbone_tape_index);
+    let uniq = format!("M{}", input.bucket_m);
     for class in classes {
         let profile = profile_for(class);
         for chunked in [false, true] {
@@ -497,9 +486,9 @@ pub fn bake_bucket_tapes(
             let ta = run_lower(mc, input, CAP_A, &profile, chunked)?;
             let tb = run_lower(mc, input, CAP_B, &profile, chunked)?;
             let tc = run_lower(mc, input, CAP_CHECK, &profile, chunked)?;
-            let body = diff_probes(t0, &ta, &tb, &tc).map_err(BakeRefusal::Defect)?;
+            let body = diff_probes(t0, &ta, &tb, &tc).map_err(BakeDefect)?;
             let class_toks = crate::const_tokens::const_tokens(&class)
-                .map_err(|e| BakeRefusal::Defect(format!("serialize class: {e}")))?;
+                .map_err(|e| BakeDefect(format!("serialize class: {e}")))?;
             let body_ix = match seen.iter().position(|b| *b == body) {
                 Some(ix) => ix,
                 None => {
@@ -513,18 +502,14 @@ pub fn bake_bucket_tapes(
                         commands: &[],
                         ..*tape
                     })
-                    .map_err(|e| BakeRefusal::Defect(format!("serialize tape: {e}")))?;
+                    .map_err(|e| BakeDefect(format!("serialize tape: {e}")))?;
                     let tape_toks = quote! {
                         __tl::LoweredMetalTape { commands: &[ #(#cmd_refs),* ], ..#rest_toks }
                     };
                     let cp_toks = crate::const_tokens::const_tokens(&const_patches.as_slice())
-                        .map_err(|e| {
-                            BakeRefusal::Defect(format!("serialize const patches: {e}"))
-                        })?;
+                        .map_err(|e| BakeDefect(format!("serialize const patches: {e}")))?;
                     let sp_toks = crate::const_tokens::const_tokens(&scratch_patches.as_slice())
-                        .map_err(|e| {
-                            BakeRefusal::Defect(format!("serialize scratch patches: {e}"))
-                        })?;
+                        .map_err(|e| BakeDefect(format!("serialize scratch patches: {e}")))?;
                     let ix = body_statics.len();
                     let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{ix}");
                     body_statics.push(quote! {

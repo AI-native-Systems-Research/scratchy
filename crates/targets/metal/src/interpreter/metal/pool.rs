@@ -28,10 +28,10 @@ use objc2_metal::{
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
 use super::forward::{ForwardError, ForwardInputs};
-use super::lowered::LoweredMetalTape;
+use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::RuntimeBindings;
-use super::worker::{ArenaLayout, MetalWorker, WorkerError};
+use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
 use scratchy_ir::{CanonicalParams, Instruction};
 
@@ -59,15 +59,6 @@ use scratchy_ir::{CanonicalParams, Instruction};
 /// an `Arc<[MetalBucketSpec]>` cheaply.
 pub struct MetalBucketSpec {
     pub bucket_m: u32,
-    /// Tape index passed to the per-arch [`scratchy_ir::WeightAccessors`]
-    /// impl when resolving weight bindings inside this bucket's
-    /// backbone slice. The macro emits a unique id per
-    /// `(canonical, backbone/lm_head)` pair so the trait's match
-    /// arms can disambiguate same-op_idx-different-canonical cases.
-    pub backbone_tape_index: u32,
-    /// Tape index for the lm_head slice. See
-    /// [`Self::backbone_tape_index`].
-    pub lm_head_tape_index: u32,
     pub num_arena_slots: u32,
     /// Index in the colored arena where this bucket's terminal
     /// activation lands (lm_head output for decoder layouts; the
@@ -249,10 +240,10 @@ impl<W: CanonicalParams> Drop for WorkerGuard<'_, W> {
 ///
 /// The pool stays parameterized over `W` for the per-bucket
 /// `LoweredMetalTape` (workers bake dispatchs from these), but it
-/// does *not* hold a back-reference to the loaded `Weights`
-/// itself — callers pass `&W` into `forward`/`checkout` so the
-/// pool can be stored as a field on the `Weights` struct without
-/// an `Arc`-cycle.
+/// does *not* hold a back-reference to the loaded `Weights`: it
+/// resolves the tapes' model sources once at construction
+/// ([`ResolvedSources`]) and keeps only their buffers, so it can be
+/// stored as a field on the `Weights` struct without an `Arc`-cycle.
 pub struct MetalWorkerPool<W: CanonicalParams> {
     device: Arc<Device>,
     /// Allocator that owns the `MTLBuffer` arenas the loaded
@@ -271,6 +262,8 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape]>,
+    /// Every model tensor the tapes bind, resolved once in [`Self::new`].
+    sources: ResolvedSources,
     arena_layout: Arc<ArenaLayout>,
     runtime_factory: RuntimeFactory,
     max_workers: usize,
@@ -376,8 +369,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
-    ) -> Result<Self, WorkerError> {
+    ) -> Result<Self, WorkerError>
+    where
+        W: ModelSources,
+    {
         assert!(max_workers >= 1, "max_workers must be >= 1");
+        let sources = ResolvedSources::resolve(weights, &allocator, &bucket_tapes)?;
 
         // The shared `MetalResidencySet` lives on the allocator now —
         // arena buffers are pinned automatically as `push_arena_locked`
@@ -398,6 +395,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
+            sources,
             arena_layout: Arc::new(arena_layout),
             runtime_factory,
             max_workers,
@@ -409,7 +407,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }),
             cv: Condvar::new(),
         };
-        let first = pool.spawn_worker(weights)?;
+        let first = pool.spawn_worker()?;
         {
             let mut inner = pool.inner.lock().unwrap();
             inner.total_created = 1;
@@ -443,7 +441,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // constant + the rope-once `roped_k_scratch` size, so long context
         // isn't truncated and the host block-table stride matches.
         block_cap: usize,
-    ) -> Result<Self, PoolBuildError> {
+    ) -> Result<Self, PoolBuildError>
+    where
+        W: ModelSources,
+    {
         if bucket_specs.is_empty() {
             return Err(PoolBuildError::NoBuckets);
         }
@@ -601,7 +602,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     ///    condvar until a peer thread checks one back in.
     ///
     /// Spawn failures release the reserved slot and are propagated.
-    pub fn checkout(&self, weights: &W) -> Result<WorkerGuard<'_, W>, WorkerError> {
+    pub fn checkout(&self) -> Result<WorkerGuard<'_, W>, WorkerError> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(pooled) = inner.available.pop() {
@@ -613,7 +614,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if inner.total_created < self.max_workers {
                 inner.total_created += 1;
                 drop(inner);
-                match self.spawn_worker(weights) {
+                match self.spawn_worker() {
                     Ok(pooled) => {
                         return Ok(WorkerGuard {
                             pool: self,
@@ -642,7 +643,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// Spawn failures inside `try_checkout` produce `Some(Err(...))`
     /// so callers can distinguish "pool is full" (`None`) from
     /// "GPU allocation failed" (`Some(Err)`).
-    pub fn try_checkout(&self, weights: &W) -> Option<Result<WorkerGuard<'_, W>, WorkerError>> {
+    pub fn try_checkout(&self) -> Option<Result<WorkerGuard<'_, W>, WorkerError>> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(pooled) = inner.available.pop() {
             return Some(Ok(WorkerGuard {
@@ -653,7 +654,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if inner.total_created < self.max_workers {
             inner.total_created += 1;
             drop(inner);
-            match self.spawn_worker(weights) {
+            match self.spawn_worker() {
                 Ok(pooled) => Some(Ok(WorkerGuard {
                     pool: self,
                     inner: Some(pooled),
@@ -1037,7 +1038,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// `useResidencySet:`; the commit runs on the pool's MTL4 queue.
     pub fn with_chain_encoder<F, R>(
         &self,
-        weights: &W,
         inputs: &ForwardInputs<'_>,
         body: F,
     ) -> Result<R, ForwardError>
@@ -1064,7 +1064,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             self.allocator.weights_residency().commit();
         }
 
-        let guard = self.checkout(weights)?;
+        let guard = self.checkout()?;
         begin_step(&guard, inputs)?;
 
         // Caller's body encodes the entire chain onto the encoder.
@@ -1091,7 +1091,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// All validation runs before any GPU work is submitted.
     pub fn forward<R>(
         &self,
-        weights: &W,
         inputs: &ForwardInputs<'_>,
         with_output: impl FnOnce(&MetalWorker<W>, usize) -> R,
     ) -> Result<R, ForwardError> {
@@ -1099,7 +1098,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
             usize,
-        ) -> Result<(), ForwardError>>(weights, inputs, with_output, None)
+        ) -> Result<(), ForwardError>>(inputs, with_output, None)
     }
 
     /// Same as [`forward`], but takes an optional encoder-tail hook
@@ -1110,7 +1109,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// buffer with one commit and one host wait.
     pub fn forward_with_tail<R, F>(
         &self,
-        weights: &W,
         inputs: &ForwardInputs<'_>,
         with_output: impl FnOnce(&MetalWorker<W>, usize) -> R,
         tail: Option<F>,
@@ -1162,7 +1160,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             self.allocator.weights_residency().commit();
         }
 
-        let guard = self.checkout(weights)?;
+        let guard = self.checkout()?;
         begin_step(&guard, inputs)?;
 
         // All execution goes through the MTL4 path. (The opt-in MTL3
@@ -1234,15 +1232,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(with_output(&guard.worker, bucket_idx))
     }
 
-    fn spawn_worker(&self, weights: &W) -> Result<PooledWorker<W>, WorkerError> {
+    fn spawn_worker(&self) -> Result<PooledWorker<W>, WorkerError> {
         let runtime = self.runtime_factory.build(&self.device);
         let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
             &self.arena_layout,
             &self.bucket_tapes,
             &self.pipelines,
-            weights,
-            &self.allocator,
+            &self.sources,
             &runtime,
             Some(self.allocator.residency()),
         )?;
@@ -1575,19 +1572,19 @@ mod tests {
     use super::*;
     use crate::interpreter::metal::__re::{Buffer, MTLDevice, MTLResourceOptions};
     use crate::interpreter::metal::lowered::{
-        Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, WeightBundleKind,
-        WeightTensor,
+        Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, SourceRef, WeightTensor,
     };
     use crate::specialized_pipeline_cache::SpecializedPipelineCache;
+    use crate::tape::ids::{LayerId, SourceIx};
     use scratchy_layers::RmsNorm;
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
-    /// instances the WtFn thunks below dereference. Pool tests only
-    /// exercise RmsNorm bindings (the `synthetic_tape` builder
-    /// below), so only the rmsnorm layer needs real backing.
+    /// its one model source resolves to. Pool tests only exercise
+    /// RmsNorm bindings (the `synthetic_tape` builder below), so only
+    /// the rmsnorm layer needs real backing.
     struct TestWeights {
         rmsnorm_layer: RmsNorm,
     }
@@ -1610,21 +1607,20 @@ mod tests {
         const MLA_ATTN_SCALE: f32 = 0.0;
     }
 
-    // Weight resolution moved to the tape level: the worker bakes the
-    // synthetic RmsNorm command by calling `rms_norm_at`, so this probe
-    // overrides exactly that one accessor to hand back its single backing
-    // layer. Every other accessor keeps its `unreachable!` default (the
-    // synthetic tape never resolves those bundle kinds).
-    impl scratchy_ir::WeightAccessors for TestWeights {
-        fn rms_norm_at(&self, _bucket: u32, _op_idx: u32, _slot: u32, _layer: u32) -> &RmsNorm {
-            &self.rmsnorm_layer
+    // `WeightAccessors` is a supertrait of `CanonicalParams` (every method defaults); metal
+    // resolves the synthetic RmsNorm command's weight through the one-family source manifest.
+    impl scratchy_ir::WeightAccessors for TestWeights {}
+    impl ModelSources for TestWeights {
+        const SOURCES: &'static [&'static str] = &["rmsnorm"];
+        fn source(&self, ix: SourceIx, _layer: LayerId) -> Option<SourceRef<'_>> {
+            (ix == SourceIx(0)).then_some(SourceRef::RmsNorm(&self.rmsnorm_layer))
         }
     }
 
     /// Build a `TestWeights` + the allocator that owns its RmsNorm
     /// weight's backing MTLBuffer. The allocator is also threaded
-    /// into the pool so the worker can map `weight.raw_ptr()` back
-    /// to `(&MTLBuffer, offset)` at dispatch-record time.
+    /// into the pool so it can map `weight.raw_ptr()` back to
+    /// `(&MTLBuffer, offset)` when it resolves the tapes' sources.
     fn build_test_weights(device: &Device) -> (Arc<TestWeights>, Arc<MetalAllocator>) {
         let mut allocator = MetalAllocator::new(device.clone());
         let bytes = vec![0u8; TestWeights::Q_SIZE * 2];
@@ -1717,15 +1713,10 @@ mod tests {
                     slot: 1,
                     binding_index: 1,
                 },
-                Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm,
+                Binding::Source {
+                    ix: SourceIx(0),
                     which: WeightTensor::Weight,
-                    layer: crate::interpreter::metal::ids::LayerId(0),
-                    locator: crate::interpreter::metal::lowered::WeightLocator {
-                        bucket: 0,
-                        op_idx: 0,
-                        slot: 0,
-                    },
+                    layer: LayerId(0),
                     binding_index: 2,
                 },
             ]),
@@ -1748,7 +1739,7 @@ mod tests {
     /// Build a pool with `max_workers = max` for a one-bucket
     /// TinyLlama-shaped synthetic tape. Returns `None` when no
     /// Metal device is present (lets each test silent-skip).
-    fn build_pool(max: usize) -> Option<(Arc<TestWeights>, MetalWorkerPool<TestWeights>)> {
+    fn build_pool(max: usize) -> Option<MetalWorkerPool<TestWeights>> {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
 
@@ -1775,12 +1766,12 @@ mod tests {
             max,
         )
         .expect("pool builds");
-        Some((weights, pool))
+        Some(pool)
     }
 
     #[test]
     fn pool_starts_with_one_worker() {
-        let Some((_w, pool)) = build_pool(4) else {
+        let Some(pool) = build_pool(4) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -1791,28 +1782,28 @@ mod tests {
 
     #[test]
     fn checkout_returns_eagerly_created_worker_first() {
-        let Some((w, pool)) = build_pool(4) else {
+        let Some(pool) = build_pool(4) else {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let _g = pool.checkout(&w).expect("checkout 1");
+        let _g = pool.checkout().expect("checkout 1");
         assert_eq!(pool.current_size(), 1, "first checkout reuses eager worker");
         assert_eq!(pool.available(), 0);
     }
 
     #[test]
     fn pool_grows_under_demand_up_to_cap() {
-        let Some((w, pool)) = build_pool(3) else {
+        let Some(pool) = build_pool(3) else {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let g1 = pool.checkout(&w).expect("checkout 1");
-        let g2 = pool.checkout(&w).expect("checkout 2");
-        let g3 = pool.checkout(&w).expect("checkout 3");
+        let g1 = pool.checkout().expect("checkout 1");
+        let g2 = pool.checkout().expect("checkout 2");
+        let g3 = pool.checkout().expect("checkout 3");
         assert_eq!(pool.current_size(), 3, "grew to cap");
         assert_eq!(pool.available(), 0);
         // try_checkout at cap returns None, not Some(Err).
-        assert!(pool.try_checkout(&w).is_none());
+        assert!(pool.try_checkout().is_none());
         drop(g1);
         drop(g2);
         drop(g3);
@@ -1822,18 +1813,18 @@ mod tests {
 
     #[test]
     fn guard_drop_returns_worker_to_pool() {
-        let Some((w, pool)) = build_pool(2) else {
+        let Some(pool) = build_pool(2) else {
             eprintln!("skipping: no Metal device");
             return;
         };
         {
-            let _g = pool.checkout(&w).expect("checkout");
+            let _g = pool.checkout().expect("checkout");
             assert_eq!(pool.available(), 0);
         }
         assert_eq!(pool.available(), 1, "drop returns worker");
         // Subsequent checkout reuses the existing worker rather than
         // growing the pool.
-        let _g2 = pool.checkout(&w).expect("checkout 2");
+        let _g2 = pool.checkout().expect("checkout 2");
         assert_eq!(pool.current_size(), 1, "no growth on reuse");
     }
 
@@ -1847,16 +1838,15 @@ mod tests {
     /// `checkout()` returns.
     #[test]
     fn checkout_blocks_when_at_cap_unblocks_on_checkin() {
-        let Some((w, pool)) = build_pool(1) else {
+        let Some(pool) = build_pool(1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
         let pool = Arc::new(pool);
-        let g1 = pool.checkout(&w).expect("checkout 1");
+        let g1 = pool.checkout().expect("checkout 1");
         assert_eq!(pool.available(), 0);
 
         let pool_c = pool.clone();
-        let w_c = w.clone();
         let started = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let started_c = started.clone();
@@ -1864,7 +1854,7 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             started_c.store(true, Ordering::SeqCst);
-            let _g = pool_c.checkout(&w_c).expect("blocking checkout");
+            let _g = pool_c.checkout().expect("blocking checkout");
             completed_c.store(true, Ordering::SeqCst);
         });
 
@@ -1895,12 +1885,12 @@ mod tests {
     /// "GPU OOM".
     #[test]
     fn try_checkout_at_cap_returns_none() {
-        let Some((w, pool)) = build_pool(1) else {
+        let Some(pool) = build_pool(1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let _g = pool.checkout(&w).expect("checkout");
-        match pool.try_checkout(&w) {
+        let _g = pool.checkout().expect("checkout");
+        match pool.try_checkout() {
             None => {}
             Some(Ok(_)) => panic!("try_checkout should not have succeeded at cap"),
             Some(Err(e)) => panic!("try_checkout should be None at cap, got Err({e:?})"),
@@ -1912,22 +1902,20 @@ mod tests {
     /// doesn't double-allocate or deadlock.
     #[test]
     fn concurrent_growth_to_cap() {
-        let Some((w, pool)) = build_pool(2) else {
+        let Some(pool) = build_pool(2) else {
             eprintln!("skipping: no Metal device");
             return;
         };
         let pool = Arc::new(pool);
         let pool_a = pool.clone();
         let pool_b = pool.clone();
-        let w_a = w.clone();
-        let w_b = w.clone();
 
         let h_a = std::thread::spawn(move || {
-            let _g = pool_a.checkout(&w_a).expect("checkout a");
+            let _g = pool_a.checkout().expect("checkout a");
             std::thread::sleep(Duration::from_millis(10));
         });
         let h_b = std::thread::spawn(move || {
-            let _g = pool_b.checkout(&w_b).expect("checkout b");
+            let _g = pool_b.checkout().expect("checkout b");
             std::thread::sleep(Duration::from_millis(10));
         });
 
@@ -1951,7 +1939,7 @@ mod tests {
     fn build_multi_bucket_pool(
         bucket_ms: &[u32],
         max_workers: usize,
-    ) -> Option<(Arc<TestWeights>, MetalWorkerPool<TestWeights>)> {
+    ) -> Option<MetalWorkerPool<TestWeights>> {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
         let cache = Arc::new(
@@ -2016,12 +2004,12 @@ mod tests {
             max_workers,
         )
         .expect("pool builds");
-        Some((weights, pool))
+        Some(pool)
     }
 
     #[test]
     fn pick_bucket_returns_smallest_fit() {
-        let Some((_w, pool)) = build_multi_bucket_pool(&[1, 8, 32], 1) else {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8, 32], 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2036,7 +2024,7 @@ mod tests {
 
     #[test]
     fn pick_bucket_zero_tokens_errors() {
-        let Some((_w, pool)) = build_multi_bucket_pool(&[1, 8], 1) else {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2045,7 +2033,7 @@ mod tests {
 
     #[test]
     fn pick_bucket_overflow_errors() {
-        let Some((_w, pool)) = build_multi_bucket_pool(&[1, 8], 1) else {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2063,7 +2051,7 @@ mod tests {
     /// order.
     #[test]
     fn pick_bucket_handles_unsorted_tape_order() {
-        let Some((_w, pool)) = build_multi_bucket_pool(&[32, 1, 8], 1) else {
+        let Some(pool) = build_multi_bucket_pool(&[32, 1, 8], 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2125,7 +2113,7 @@ mod tests {
 
     #[test]
     fn forward_runs_one_decode_step() {
-        let Some((w, pool)) = build_multi_bucket_pool(&[1], 1) else {
+        let Some(pool) = build_multi_bucket_pool(&[1], 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2158,7 +2146,7 @@ mod tests {
         // is that we got it (not on numerical correctness; that's
         // 5.G's job via cpu_golden).
         let saw = pool
-            .forward(&w, &inputs, |worker, _bucket_idx| {
+            .forward(&inputs, |worker, _bucket_idx| {
                 // Worker arena is alive in the closure; reading its
                 // contents would inspect the rmsnorm output. We only
                 // assert structural facts here.
@@ -2172,7 +2160,7 @@ mod tests {
 
     #[test]
     fn forward_rejects_zero_tokens() {
-        let Some((w, pool)) = build_multi_bucket_pool(&[1], 1) else {
+        let Some(pool) = build_multi_bucket_pool(&[1], 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2202,7 +2190,7 @@ mod tests {
             mrope_cos_sin: None,
         };
         let err = pool
-            .forward(&w, &inputs, |_, _| ())
+            .forward(&inputs, |_, _| ())
             .expect_err("zero-token forward rejected");
         assert!(matches!(err, ForwardError::ZeroTokens));
         // Worker was never checked out — pool stays at the eager 1.
@@ -2211,7 +2199,7 @@ mod tests {
 
     #[test]
     fn forward_rejects_oversized_token_count() {
-        let Some((w, pool)) = build_multi_bucket_pool(&[1, 8], 1) else {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2241,7 +2229,7 @@ mod tests {
             mm_dst_rows: None,
             mrope_cos_sin: None,
         };
-        match pool.forward(&w, &inputs, |_, _| ()) {
+        match pool.forward(&inputs, |_, _| ()) {
             Err(ForwardError::NoBucketFits {
                 num_tokens: 9,
                 max_bucket: 8,
@@ -2260,7 +2248,7 @@ mod tests {
         // Single-bucket pool with the *smaller* runtime layout — the
         // existing `build_pool` allocates 16-byte runtime buffers,
         // perfect for triggering the overflow path.
-        let Some((w, pool)) = build_pool(1) else {
+        let Some(pool) = build_pool(1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
@@ -2292,7 +2280,7 @@ mod tests {
             mrope_cos_sin: None,
         };
         let err = pool
-            .forward(&w, &inputs, |_, _| ())
+            .forward(&inputs, |_, _| ())
             .expect_err("oversized slice rejected");
         match err {
             ForwardError::BufferTooSmall {
@@ -2425,8 +2413,6 @@ mod tests {
     fn for_buckets_builds_pool_for_single_empty_bucket() {
         let specs = [MetalBucketSpec {
             bucket_m: 1,
-            backbone_tape_index: 0,
-            lm_head_tape_index: 1,
             num_arena_slots: 2,
             terminal_slot: 1,
             arena_bytes: TEST_ARENA_BYTES,
@@ -2456,8 +2442,6 @@ mod tests {
     fn for_buckets_refuses_bucket_with_no_tape_variants() {
         let specs = [MetalBucketSpec {
             bucket_m: 1,
-            backbone_tape_index: 0,
-            lm_head_tape_index: 1,
             num_arena_slots: 2,
             terminal_slot: 1,
             arena_bytes: TEST_ARENA_BYTES,
@@ -2491,8 +2475,6 @@ mod tests {
         let specs = [
             MetalBucketSpec {
                 bucket_m: 1,
-                backbone_tape_index: 0,
-                lm_head_tape_index: 1,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 arena_bytes: TEST_ARENA_BYTES,
@@ -2504,8 +2486,6 @@ mod tests {
             },
             MetalBucketSpec {
                 bucket_m: 8,
-                backbone_tape_index: 2,
-                lm_head_tape_index: 3,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 arena_bytes: TEST_ARENA_BYTES,

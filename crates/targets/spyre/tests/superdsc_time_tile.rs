@@ -471,6 +471,7 @@ fn single_matmul_ir(m: u32, n: u32, k: u32) -> scratchy_subtile::subtile_ir::Sub
     let node = SubtileNode {
         id: SubtileId::from_index(0),
         op: SubOp::MatmulTile {
+            n,
             weight: scratchy_subtile::lower::GemmWeight::Dense,
         },
         inputs: vec![whole(0, &tensors), whole(1, &tensors)],

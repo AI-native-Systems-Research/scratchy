@@ -125,6 +125,11 @@ pub enum EwKind {
     GeluErf,
     /// `a - b`, with a `[m, 1]` broadcast on `b` (the mean-centering half of a LayerNorm).
     Sub,
+    /// `a + bias`, with a `[1, n]` row broadcast on `bias` — a weight source (a projection's
+    /// bias). Kept apart from [`EwKind::Add`] because the operand is a WEIGHT, not an
+    /// activation: a target binds it through the projection's accessor, and the bias is the
+    /// learned constant a KV codec must remove before quantizing a cached K/V.
+    BiasAdd,
 }
 
 // ── Tensors & regions ──────────────────────────────────────────────
@@ -419,14 +424,98 @@ impl SoftmaxStateId {
     }
 }
 
+// ── Op stages ──────────────────────────────────────────────────────
+
+/// Which side of [`lower_region`] a [`SubOp`] value lives on.
+///
+/// ⭐ ONE VOCABULARY, TWO STAGES. The front end states each op of a forward as a `SubOp` of the
+/// [`Arch`] stage — [`crate::lower::LoweringInput`]'s ops — and `lower_region` turns each into
+/// the [`Tiled`] nodes of a [`SubtileIR`], binding what only the lowering knows: the KV-cache
+/// tensors a rope writes and an attention reads, which node produced that cache, and each
+/// attention's softmax accumulator. The op is the same value on both sides; the stage says which
+/// of those witnesses it can carry.
+pub trait OpStage:
+    stage_seal::Sealed + Copy + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + 'static
+{
+    /// The cache tensors a `RopeAppend` writes / an `AttnDecode` reads.
+    type KvLayout: Copy + std::fmt::Debug + PartialEq;
+    /// How an `AttnDecode`'s cache got populated.
+    type KvProducer: Copy + std::fmt::Debug + PartialEq;
+    /// An `AttnDecode`'s online-softmax accumulator.
+    type SoftmaxState: Copy + std::fmt::Debug + PartialEq;
+    /// Carried by the ops only the lowering mints (the split-K combine, the two phases of a
+    /// decomposed RmsNorm). Uninhabited on the arch stage, so no front end can state one.
+    type Minted: Copy + std::fmt::Debug + PartialEq;
+}
+
+/// The op as the front end states it: nothing the lowering binds is known yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Arch {}
+
+/// The op on a node of a lowered [`SubtileIR`], every witness bound. The default stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tiled {}
+
+/// A witness [`lower_region`] has not bound yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Unbound;
+
+/// Marks an op the lowering minted. Constructible only in this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Minted(sealed::Seal);
+
+impl Minted {
+    const BY_LOWERING: Self = Self(sealed::Seal(()));
+}
+
+#[doc(hidden)]
+pub mod stage_seal {
+    pub trait Sealed {}
+    impl Sealed for super::Arch {}
+    impl Sealed for super::Tiled {}
+}
+
+impl OpStage for Arch {
+    type KvLayout = Unbound;
+    type KvProducer = Unbound;
+    type SoftmaxState = Unbound;
+    type Minted = std::convert::Infallible;
+}
+
+impl OpStage for Tiled {
+    type KvLayout = KvCacheLayout;
+    type KvProducer = KvCacheProducer;
+    type SoftmaxState = SoftmaxStateId;
+    type Minted = Minted;
+}
+
+/// How a view's row count relates to the op's token count `m`.
+///
+/// ⛔ NOT A `(mult, div)` PAIR. A pair admits a view that both multiplies and divides, and a zero
+/// in either place; a view does exactly one of the two, by a positive factor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowScale {
+    /// `m · k` rows — a per-head view splits each token's row into `k` (`k = 1` keeps the rows).
+    Times(std::num::NonZeroU32),
+    /// `m / k` rows — the vision patch merger folds `k` tokens into one.
+    Over(std::num::NonZeroU32),
+}
+
+impl RowScale {
+    /// The view keeps one row per token.
+    pub const fn preserves_rows(self) -> bool {
+        matches!(self, Self::Times(k) if k.get() == 1)
+    }
+}
+
 // ── Sub-operations ─────────────────────────────────────────────────
 
 /// How an RmsNorm reads its gain vector.
 ///
-/// ⛔ NOT AN `f32` OFFSET. `LoweredOp::RmsNorm` carries `gain_offset: f32`, and a float admits
-/// values — 0.5, NaN — that no checkpoint convention means and no kernel implements. There are
-/// exactly two conventions in the world, so they get exactly two names, and the conversion is
-/// the place a third one has to be rejected instead of silently scaling wrong.
+/// ⛔ NOT AN `f32` OFFSET. The DSL folds the gain as `w + offset`, and a float admits values —
+/// 0.5, NaN — that no checkpoint convention means and no kernel implements. There are exactly two
+/// conventions in the world, so they get exactly two names, and the conversion is the place a
+/// third one has to be rejected instead of silently scaling wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GainConvention {
     /// `y = x̂ · w` — llama, qwen, granite.
@@ -444,7 +533,7 @@ impl GainConvention {
         }
     }
 
-    /// Read the convention off a `LoweredOp::RmsNorm`'s offset.
+    /// Read the convention off the DSL's folded `w + offset` gain.
     ///
     /// ⛔ REFUSES A THIRD VALUE. An offset that is neither 0 nor 1 is not a convention this
     /// pipeline has a kernel for, and rounding it to the nearest one would scale every
@@ -457,14 +546,23 @@ impl GainConvention {
             _ => None,
         }
     }
+
+    /// The constant added to the stored gain — the inverse of [`Self::from_offset`].
+    pub const fn offset(self) -> f32 {
+        match self {
+            Self::Scale => 0.0,
+            Self::OnePlusScale => 1.0,
+        }
+    }
 }
 
 /// Which positions a decode-time attention may attend to.
 ///
-/// ⛔ NOT A `bool`. `LoweredOp::AttnDecode` carries `sliding: bool`, and a bare boolean at a
-/// struct literal is the shape that lets a `sliding` land in a `is_global` (they are negations
-/// of each other, and both are in scope at the same call). Naming the two masks makes the swap
-/// a type error instead of a model that quietly attends to the wrong span.
+/// ⛔ NOT A `bool`. A bare `sliding` / `is_global` boolean at a struct literal is the shape that
+/// lets one land in the other (they are negations of each other, and both are in scope at the
+/// same call). Naming the two masks makes the swap a type error instead of a model that quietly
+/// attends to the wrong span. An attention and the rope that appends its K/V carry the same
+/// value: the class of the layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnMask {
     /// Every position up to and including the query's own.
@@ -473,6 +571,122 @@ pub enum AttnMask {
     /// positions. The WINDOW SIZE is not here — like the tanh soft cap it is a model constant
     /// resolved at emission and has never ridden the tape.
     SlidingWindow,
+}
+
+// ── The mixture-of-experts vocabulary ──────────────────────────────
+//
+// A MoE block is its math, stated as ops: router logits → top-k → score transforms → the chosen
+// experts' projections over (token, expert) PAIR rows → their weighted sum. The pair rows and the
+// routing tables are not activations; which values a target keeps off its arena is the target's
+// fact (its colour rules), not the op's.
+
+/// How many routed experts a MoE block holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NumExperts(std::num::NonZeroU32);
+
+/// How many experts each token is routed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TopK(std::num::NonZeroU32);
+
+macro_rules! nonzero_count {
+    ($($t:ident),*) => {$(
+        impl $t {
+            pub const fn new(n: std::num::NonZeroU32) -> Self {
+                Self(n)
+            }
+            pub const fn get(self) -> u32 {
+                self.0.get()
+            }
+        }
+    )*};
+}
+nonzero_count!(NumExperts, TopK);
+
+/// Which of an expert's three projections a matmul is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpertProj {
+    Gate,
+    Up,
+    Down,
+}
+
+/// The activation an expert gates its up projection with: `act(gate) * up`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatedAct {
+    Silu,
+    Gelu,
+}
+
+/// The weight bundle a router reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RouterBundle {
+    /// Gemma-4's own router (pre-norm gain, projection, per-expert scale).
+    Gemma,
+    /// The router inside a Mixtral-style fused MoE bundle.
+    Fused,
+    /// The router inside a Qwen-style fused MoE bundle.
+    SharedFused,
+}
+
+/// The weight bundle an expert projection reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpertBundle {
+    /// Gemma-4's SwitchGLU expert stack.
+    SwitchGlu,
+    Fused,
+    SharedFused,
+}
+
+impl RouterBundle {
+    /// THE bundle table: the weight kind a router bundle binds as.
+    pub const fn weight_kind(self) -> crate::handoff::WeightKind {
+        use crate::handoff::WeightKind as K;
+        match self {
+            Self::Gemma => K::GemmaRouter,
+            Self::Fused => K::FusedMoe,
+            Self::SharedFused => K::SharedFusedMoe,
+        }
+    }
+}
+
+impl ExpertBundle {
+    /// THE bundle table: the weight kind an expert bundle binds as.
+    pub const fn weight_kind(self) -> crate::handoff::WeightKind {
+        use crate::handoff::WeightKind as K;
+        match self {
+            Self::SwitchGlu => K::GemmaSwitchGlu,
+            Self::Fused => K::FusedMoe,
+            Self::SharedFused => K::SharedFusedMoe,
+        }
+    }
+}
+
+/// A fused MoE bundle's shared-expert width, as the config declares it (`None`: no shared
+/// expert). A DSL that states its shared expert as ops owns it; a target decides what an
+/// undeclared one means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SharedExpertBound(pub Option<std::num::NonZeroU32>);
+
+// ── The KV codec vocabulary ────────────────────────────────────────
+//
+// A KV codec stores a layer's cache compressed: each writer's new K and V are encoded into a
+// packed store, and each attention either decodes that store directly or reads it staged back
+// into the codec's rotated domain. Which classes a target codes, and when each step runs, are its
+// facts (`crate::kv_codec`).
+
+/// Which half of a layer's KV cache a codec step touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvOperand {
+    K,
+    V,
+}
+
+/// Which rows a codec rotation turns: the query into the codebook's domain (`R·q`), or the
+/// attention's output back out of it (`Rᵀ·o`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RotatedRows {
+    Query,
+    Output,
 }
 
 /// What makes two nodes the SAME PROGRAM for re-rolling purposes.
@@ -492,7 +706,7 @@ pub enum AttnMask {
 /// ⛔ ENUMERATED, NEVER A CATCH-ALL. A new `SubOp` is a compile error here, not a silent
 /// mis-roll — the failure mode this exists to end is invisible at the tape and only shows up as
 /// wrong tokens on the device.
-impl<F: RopeForm> SubOp<F> {
+impl<F: RopeForm, S: OpStage> SubOp<F, S> {
     /// The layer this node belongs to, when it carries one.
     ///
     /// Only the KV-cache writer names its layer on the tape; everything else in a layer is
@@ -517,38 +731,20 @@ impl<F: RopeForm> SubOp<F> {
     pub fn reroll_shape_key(&self, h: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         match self {
-            SubOp::MatmulTile { weight } => {
+            SubOp::MatmulTile { n, weight } => {
                 std::mem::discriminant(self).hash(h);
+                n.hash(h);
                 std::mem::discriminant(weight).hash(h);
             }
-            SubOp::GemmaMoe {
-                num_experts,
-                top_k,
-                moe_inter,
-                ..
+            SubOp::ExpertMatmul {
+                proj,
+                n,
+                k,
+                quant: _,
+                bundle,
             } => {
                 std::mem::discriminant(self).hash(h);
-                (num_experts, top_k, moe_inter).hash(h);
-            }
-            SubOp::Moe {
-                qwen_shared,
-                num_experts,
-                top_k,
-                moe_inter,
-                shared_inter,
-                norm_topk,
-                ..
-            } => {
-                std::mem::discriminant(self).hash(h);
-                (
-                    qwen_shared,
-                    num_experts,
-                    top_k,
-                    moe_inter,
-                    shared_inter,
-                    norm_topk,
-                )
-                    .hash(h);
+                (proj, n, k, bundle).hash(h);
             }
             // Everything else carries no storage: its shape IS its class.
             _ => self.reroll_class_key(h),
@@ -562,7 +758,8 @@ impl<F: RopeForm> SubOp<F> {
             // The weight's storage scheme IS part of the class: a 4-bit and an
             // 8-bit affine matmul are different programs. Without this, OptiQ's
             // mixed-precision layers all hash alike and re-roll onto one body.
-            SubOp::MatmulTile { weight } => {
+            SubOp::MatmulTile { n, weight } => {
+                n.hash(h);
                 std::mem::discriminant(weight).hash(h);
                 if let crate::lower::GemmWeight::Affine { affine } = weight {
                     affine.bits().get().hash(h);
@@ -570,8 +767,7 @@ impl<F: RopeForm> SubOp<F> {
                 }
             }
             // No attributes: the discriminant is the whole class.
-            SubOp::SumReduce
-            | SubOp::Reshape
+            SubOp::SumReduce { .. }
             | SubOp::SiluMul
             | SubOp::TanhSoftCap
             | SubOp::ScalarWeightMul
@@ -579,18 +775,55 @@ impl<F: RopeForm> SubOp<F> {
             | SubOp::GateScale
             | SubOp::VisionRope
             | SubOp::GatedDeltaNet
-            | SubOp::Mean => {}
+            | SubOp::Mean
+            | SubOp::RouteSoftmax
+            | SubOp::RouteArgsort
+            | SubOp::RouteGatherScores
+            | SubOp::RouteRenorm
+            | SubOp::ExpertUnsort => {}
+            SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
+            SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
+            SubOp::RouteTopK { k } => k.hash(h),
+            SubOp::RouteScale { scale } => scale.to_bits().hash(h),
+            SubOp::RouteExpertScale { router } => router.hash(h),
+            SubOp::ExpertSort { experts, k, bundle } => (experts, k, bundle).hash(h),
+            // The per-layer expert width is class: an 8-bit and a 4-bit layer are different programs.
+            SubOp::ExpertMatmul {
+                proj,
+                n,
+                k,
+                quant,
+                bundle,
+            } => (proj, n, k, quant.group().get(), quant.bits().get(), bundle).hash(h),
+            SubOp::ExpertGatedAct { act } => act.hash(h),
+            SubOp::ExpertCombine { hidden, shared } => (hidden, shared).hash(h),
+            SubOp::KvEncode { operand } | SubOp::KvStage { operand } => operand.hash(h),
+            SubOp::RotateRows { rows } => rows.hash(h),
+            SubOp::AttnPackedKv
+            | SubOp::SampleRowsGather
+            | SubOp::SampleRowsScatter
+            | SubOp::AllRowsMatmul => {}
+            SubOp::Reshape { rows, cols } => (rows, cols).hash(h),
             SubOp::Elementwise(k) => std::mem::discriminant(k).hash(h),
             SubOp::ScalarMul { scale } => scale.to_bits().hash(h),
             SubOp::RmsNorm { eps, gain } => {
                 eps.to_bits().hash(h);
                 std::mem::discriminant(gain).hash(h);
             }
-            SubOp::RmsNormReduce { eps } | SubOp::RmsNormUnit { eps } => eps.to_bits().hash(h),
-            SubOp::RmsNormApply { gain } => std::mem::discriminant(gain).hash(h),
+            SubOp::RmsNormReduce { eps, .. } | SubOp::RmsNormUnit { eps } => eps.to_bits().hash(h),
+            SubOp::RmsNormApply { gain, .. } => std::mem::discriminant(gain).hash(h),
             SubOp::RopeRotate { head_dim, .. } => head_dim.get().hash(h),
             // `layer` and `layout`'s cache tensors are per-layer IDENTITY, not class.
-            SubOp::RopeAppend { head_dim, .. } => head_dim.get().hash(h),
+            SubOp::RopeAppend {
+                head_dim,
+                attn,
+                pairing,
+                ..
+            } => {
+                head_dim.get().hash(h);
+                std::mem::discriminant(attn).hash(h);
+                pairing.hash(h);
+            }
             // `layout`, `producer`'s node index and `softmax_state` are per-layer identity;
             // `mask` is the class (sliding-window vs full) and is exactly what gemma-3 needs.
             SubOp::AttnDecode {
@@ -620,45 +853,68 @@ impl<F: RopeForm> SubOp<F> {
                 geom.hd().get().hash(h);
                 scale.to_bits().hash(h);
             }
-            SubOp::GemmaMoe {
-                num_experts,
-                top_k,
-                moe_inter,
-                group_size,
-                bits,
-            } => (num_experts, top_k, moe_inter, group_size, bits).hash(h),
-            SubOp::Moe {
-                qwen_shared,
-                num_experts,
-                top_k,
-                moe_inter,
-                shared_inter,
-                norm_topk,
-                group_size,
-                bits,
-            } => (
-                qwen_shared,
-                num_experts,
-                top_k,
-                moe_inter,
-                shared_inter,
-                norm_topk,
-                group_size,
-                bits,
-            )
-                .hash(h),
         }
     }
 }
 
-/// The sub-operation a node performs. Generic over `F: RopeForm`
-/// (default [`NeoX`]) so a SubtileIR's rope nodes share the same
-/// pairing form by construction.
+/// The ops whose lowering binds a witness, as a front end states them.
+impl<F: RopeForm> SubOp<F, Arch> {
+    /// `RopeRotate` in the graph's pairing form `F`.
+    pub const fn rope_rotate(head_dim: HeadDim) -> Self {
+        SubOp::RopeRotate {
+            head_dim,
+            _form: PhantomData,
+        }
+    }
+
+    /// `RopeAppend` for `layer`: the cache tensors it writes are bound by [`lower_region`].
+    pub const fn rope_append(
+        head_dim: HeadDim,
+        layer: u32,
+        attn: AttnMask,
+        pairing: RopeFormTag,
+    ) -> Self {
+        SubOp::RopeAppend {
+            head_dim,
+            layer,
+            attn,
+            pairing,
+            layout: Unbound,
+            _form: PhantomData,
+        }
+    }
+
+    /// `AttnDecode`: its cache, that cache's producer and its softmax accumulator are bound by
+    /// [`lower_region`].
+    pub const fn attn_decode(
+        geom: ModelAttnGeometry,
+        scale: f32,
+        valid_len: u32,
+        mask: AttnMask,
+    ) -> Self {
+        SubOp::AttnDecode {
+            geom,
+            scale,
+            valid_len,
+            layout: Unbound,
+            producer: Unbound,
+            softmax_state: Unbound,
+            mask,
+        }
+    }
+}
+
+/// THE op vocabulary: what the front end states a forward's ops as, and what every node of a
+/// lowered [`SubtileIR`] performs. Generic over `F: RopeForm` (default [`NeoX`]) so a SubtileIR's
+/// rope nodes share the same pairing form by construction, and over `S: OpStage` (default
+/// [`Tiled`]) — the [`Arch`] stage is the front end's, before [`lower_region`] binds the KV-cache
+/// witnesses. Every fact the registry derives (kind, name, arity, output width) is declared once,
+/// in [`crate::ops`].
 ///
 /// Every variant has a `cpu_golden`-backed host evaluation in
 /// [`eval_node`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SubOp<F: RopeForm = NeoX> {
+pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// Matmul output tile over one K-chunk:
     /// `out[i, j] = Σ_l A[i, l] · W[l, j]`.
     /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[kr, nr]`
@@ -672,10 +928,16 @@ pub enum SubOp<F: RopeForm = NeoX> {
     /// class (see `reroll_class_key`) and a mixed-precision model re-rolls
     /// layers that do not match. It is not the operand arity — fp8 is arity-3
     /// and affine is arity-2, but `Dense` and `Affine` are both arity-2.
-    MatmulTile { weight: crate::lower::GemmWeight },
+    ///
+    /// `n` is the Linear's full output width N — the op's output columns as the front end
+    /// states it. A tile of the matmul keeps its Linear's `n`.
+    MatmulTile {
+        n: u32,
+        weight: crate::lower::GemmWeight,
+    },
     /// Elementwise sum of equal-shaped inputs — the split-K combine. All
     /// inputs and the output are `[out_rows, out_cols]`.
-    SumReduce,
+    SumReduce { minted: S::Minted },
     /// Re-interpret `inputs[0]`'s elements under a new `[out_rows, out_cols]`.
     /// Element COUNT is preserved and row-major order is preserved; only the
     /// extents change. Host semantics are the identity.
@@ -687,7 +949,10 @@ pub enum SubOp<F: RopeForm = NeoX> {
     /// A target must lower this to a RESTICKIFY (a real re-laying copy); it
     /// must NOT give the output the input's placement. Pinned by
     /// `sdsc_abstract::tests::reshape_is_not_a_placement_alias_under_stick_layout`.
-    Reshape,
+    ///
+    /// The target extents: `rows` relative to the token count (per-head views multiply, the
+    /// vision patch merger divides) and `cols`. Per-head norms read their row multiplier here.
+    Reshape { rows: RowScale, cols: u32 },
     /// Shape-preserving elementwise op over a tile. Unary (`Silu`) reads
     /// `inputs[0]`; binary (`Mul`, `Add`) read `inputs[0]` and
     /// `inputs[1]`, both matching the output shape. Col-tiling never
@@ -703,8 +968,7 @@ pub enum SubOp<F: RopeForm = NeoX> {
     SiluMul,
     /// `out[j] = x[j] * scale` — shape-preserving multiply by a compile-time
     /// constant. `inputs[0]` = x `[rows, cols]`; the scalar rides in the field,
-    /// not as an operand. Emitted from [`crate::lower::LoweredOp::ScalarMul`]
-    /// for architectures with scalar activation multipliers (Granite's
+    /// not as an operand. Emitted for architectures with scalar activation multipliers (Granite's
     /// `embedding_multiplier` / `residual_multiplier` / `recip(logits_scaling)`).
     /// Col-tiling is bit-exact (per-element scale), so it joins the elementwise
     /// tiling set. Mirrors `ir::Instruction::ScalarMul(_, _, f32)`.
@@ -715,10 +979,10 @@ pub enum SubOp<F: RopeForm = NeoX> {
     ///
     /// **Whole** form. Lower-stage decomposes into [`SubOp::RmsNormReduce`]
     /// (one reduce node) + N [`SubOp::RmsNormApply`] nodes (one per
-    /// chunk of `cols`) when `nb < cols`; the whole form is kept as a
-    /// canonical IR-level op for the eval_node host reference and the
-    /// `LoweredOp::RmsNorm` translation path that pre-decomposition
-    /// callers (validate-only tests, partition lowering) consume.
+    /// chunk of `cols`) when `nb < cols`; the whole form is the op the front end
+    /// states, and the canonical IR-level op for the eval_node host reference
+    /// that pre-decomposition callers (validate-only tests, partition lowering)
+    /// consume.
     RmsNorm { eps: f32, gain: GainConvention },
     /// Phase 1 of chunked RmsNorm: reads x `[m, hidden]` (whole),
     /// computes `inv_rms[i] = 1 / sqrt(mean(x[i,:]^2) + eps)`. Output
@@ -730,7 +994,7 @@ pub enum SubOp<F: RopeForm = NeoX> {
     /// the inv_rms vec via `LoweringState` so that downstream
     /// [`SubOp::RmsNormApply`] nodes can broadcast it without a tile-
     /// shaped re-store.
-    RmsNormReduce { eps: f32 },
+    RmsNormReduce { eps: f32, minted: S::Minted },
     /// Phase 2 of chunked RmsNorm: per-chunk apply.
     /// `inputs[0]` = x chunk `[m, chunk_cols]`,
     /// `inputs[1]` = inv_rms `[m, 1]` (the producing
@@ -738,7 +1002,10 @@ pub enum SubOp<F: RopeForm = NeoX> {
     /// reads the side-channelled smem-vec slot, not this tile-region),
     /// `inputs[2]` = gamma chunk `[1, chunk_cols]`.
     /// Output: `y[m, chunk_cols] = x * inv_rms[per row] * gamma[per col]`.
-    RmsNormApply { gain: GainConvention },
+    RmsNormApply {
+        gain: GainConvention,
+        minted: S::Minted,
+    },
     /// Rotary embedding over `[rows, heads * head_dim]` in the
     /// `F: RopeForm` pairing. `inputs[0]` = x, `inputs[1]` = cos row,
     /// `inputs[2]` = sin row.
@@ -751,11 +1018,19 @@ pub enum SubOp<F: RopeForm = NeoX> {
     /// **and** write the rotated K + un-rotated V into the paged KV
     /// cache (the cache identity is bound by `layout`). The host eval is
     /// **rotation only** (identical to [`SubOp::RopeRotate`]); V and the
-    /// cache write are GPU-only.
+    /// cache write are GPU-only. `inputs` = `[K, cos, sin, V, K_cache, V_cache]`.
     RopeAppend {
         head_dim: HeadDim,
         layer: u32,
-        layout: KvCacheLayout,
+        /// The class of the layer whose K/V this appends — the value its attention's `mask`
+        /// carries. On a hybrid sliding/global arch it selects the rotary table and head
+        /// geometry; `Causal` on a uniform model.
+        attn: AttnMask,
+        /// The pairing the checkpoint declares (commandr interleaves). [`lower_region`] builds
+        /// every graph in the NeoX form `F`, so a target with an interleaved kernel reads the
+        /// checkpoint's pairing here.
+        pairing: RopeFormTag,
+        layout: S::KvLayout,
         #[doc(hidden)]
         _form: PhantomData<F>,
     },
@@ -781,9 +1056,9 @@ pub enum SubOp<F: RopeForm = NeoX> {
         /// un-rigged host-verification pin). The GPU mask uses the runtime
         /// `DecodePosition` kernel arg (= `valid_len - 1`).
         valid_len: u32,
-        layout: KvCacheLayout,
-        producer: KvCacheProducer,
-        softmax_state: SoftmaxStateId,
+        layout: S::KvLayout,
+        producer: S::KvProducer,
+        softmax_state: S::SoftmaxState,
         mask: AttnMask,
     },
 
@@ -797,9 +1072,8 @@ pub enum SubOp<F: RopeForm = NeoX> {
     // place that can answer it: the target's opcode lowering.
     /// `cap · tanh(x / cap)` — Gemma's logit/attention soft cap.
     ///
-    /// ⛔ THE CAP IS NOT HERE, AND THAT IS A REPORTED GAP, NOT A DESIGN. `LoweredOp::TanhSoftCap`
-    /// carries no cap either: the value is a model constant resolved at emission, so the tape has
-    /// never held it. `eval_node` therefore has no host reference for this op and says so instead
+    /// ⛔ THE CAP IS NOT HERE, AND THAT IS A REPORTED GAP, NOT A DESIGN. The value is a model
+    /// constant resolved at emission, so the tape has never held it. `eval_node` therefore has no host reference for this op and says so instead
     /// of inventing a cap.
     TanhSoftCap,
     /// Unit-gain RmsNorm — no learnable scale (Gemma4 `v_norm`). `inputs[0]` = x.
@@ -837,32 +1111,82 @@ pub enum SubOp<F: RopeForm = NeoX> {
     /// `inputs` = `[qkv, z, a, b, weight_bundle]`; the conv/ssm state is runtime-ambient per
     /// layer, which is why there is no host reference.
     GatedDeltaNet,
-    /// Gemma-4 fused MoE block: router (own leading rmsnorm, temperature softmax, per-expert
-    /// score scale) over `router_in`, GeGLU experts over `expert_in`.
-    /// `inputs` = `[router_in, expert_in, router_bundle, experts_bundle]`.
-    GemmaMoe {
-        num_experts: u32,
-        top_k: u32,
-        moe_inter: u32,
-        group_size: u32,
-        bits: u32,
-    },
-    /// Fused mixture-of-experts: router → top-k → gathered expert MLPs → weighted sum, plus an
-    /// optional shared-expert tail. `inputs` = `[x, moe_weight_bundle]`.
-    Moe {
-        /// Qwen order (`softmax → topk → gather`, optional renorm + shared expert) vs Mixtral
-        /// order (`topk → softmax`).
-        qwen_shared: bool,
-        num_experts: u32,
-        top_k: u32,
-        moe_inter: u32,
-        shared_inter: u32,
-        norm_topk: bool,
-        group_size: u32,
-        bits: u32,
-    },
     /// Row mean: `out[m, 1] = mean(x, axis = -1)`. `inputs` = `[x]`.
     Mean,
+
+    // ── A MoE block, op by op (see `NumExperts`) ──────────────────
+    /// The router's own pre-norm: `rmsnorm(x, router.scale)`. `inputs` = `[x, router]`.
+    RouterNorm { eps: f32, router: RouterBundle },
+    /// Router logits `x · W_router`, `[m, experts]`. `inputs` = `[x, router]`.
+    RouterLogits {
+        experts: NumExperts,
+        router: RouterBundle,
+    },
+    /// Row softmax. `inputs` = `[scores]`.
+    RouteSoftmax,
+    /// Each row's indices sorted by ascending score. `inputs` = `[scores]`.
+    RouteArgsort,
+    /// The last `k` sorted indices of each row — its top-k experts. `inputs` = `[sorted]`.
+    RouteTopK { k: TopK },
+    /// The scores at the chosen indices, `[m, k]`. `inputs` = `[scores, indices]`.
+    RouteGatherScores,
+    /// Scores times a constant (a softmax temperature). `inputs` = `[scores]`.
+    RouteScale { scale: f32 },
+    /// Scores divided by their row sum. `inputs` = `[scores]`.
+    RouteRenorm,
+    /// Each score times its expert's learned scale. `inputs` = `[scores, indices, router]`.
+    RouteExpertScale { router: RouterBundle },
+    /// The (token, expert) pair rows, ordered by expert. `inputs` = `[x, indices]`; the output
+    /// is also the routing every expert projection of the block reads.
+    ExpertSort {
+        experts: NumExperts,
+        k: TopK,
+        bundle: ExpertBundle,
+    },
+    /// One projection of each pair's expert, `n` wide. `inputs` = `[rows, routing, experts]`.
+    ExpertMatmul {
+        proj: ExpertProj,
+        n: u32,
+        k: TopK,
+        quant: crate::lower::ExpertQuant,
+        bundle: ExpertBundle,
+    },
+    /// `act(gate) * up` over the pair rows. `inputs` = `[gate, up]`.
+    ExpertGatedAct { act: GatedAct },
+    /// The pair rows back in token order. `inputs` = `[rows, routing]`.
+    ExpertUnsort,
+    /// Each token's pair rows summed by its scores, `[m, hidden]`. `inputs` = `[rows, scores]`.
+    ExpertCombine {
+        hidden: u32,
+        shared: SharedExpertBound,
+    },
+
+    // ── A KV codec, step by step (see `KvOperand`) ────────────────
+    /// A writer's new `operand` rows, encoded into the layer's packed store, their additive
+    /// offset removed first. `inputs` = `[cache, cos, bias?]`: the cache half the writer filled,
+    /// its rotary row, and the projection whose bias the operand carries.
+    KvEncode { operand: KvOperand },
+    /// The layer's `operand`, decoded out of its packed store into the codec's rotated domain,
+    /// where the attention reads it. `inputs` = `[packed]`.
+    KvStage { operand: KvOperand },
+    /// `rows` turned into or out of the codebook's domain, in place. `inputs` = `[x]`.
+    RotateRows { rows: RotatedRows },
+    /// An attention read straight off the packed store: its query, the output it replaces, and
+    /// the store's two halves. `inputs` = `[q, out, packed_k, packed_v]`.
+    AttnPackedKv,
+
+    // ── The sampled rows of a result matmul (see `sample_rows`) ───
+    /// Each sequence's sampled row moved to the front of `x`, in place. `inputs` = `[x]`.
+    SampleRowsGather,
+    /// The front rows of `x` moved back to their sequences' sampled rows, in place.
+    /// `inputs` = `[x]`.
+    SampleRowsScatter,
+    /// The sampled matmul over EVERY row, taking over its scattered output: the alternative a
+    /// step that reads every row runs instead of the gather, the matmul and the scatter — never
+    /// on a step they run on, so its rows are the activation untouched.
+    /// `inputs` = `[rows, over, weight…]`: the gathered activation, the output it replaces, and
+    /// the matmul's weight operands.
+    AllRowsMatmul,
 }
 
 // ── Nodes & graph ──────────────────────────────────────────────────
@@ -898,7 +1222,7 @@ pub struct SubtileIR<F: RopeForm = NeoX> {
     ///
     /// ⭐ A LOWERING IS A MAP, AND THIS IS THE MAP. A target that plays
     /// the tape reads its schedule and its slot coloring from the tape,
-    /// but the WEIGHTS a step binds live on the source `LoweredOp` — its
+    /// but the WEIGHTS a step binds live on the source op's operands — its
     /// accessor path, its quant preset, its scale. Without this, a tape
     /// player can say what to compute and where to put it but not what
     /// to multiply by, and the only way back is to re-derive the map by
@@ -1035,7 +1359,7 @@ pub fn eval_node<F: RopeForm>(
             }
             out
         }
-        SubOp::SumReduce => {
+        SubOp::SumReduce { .. } => {
             let len = (out_rows * out_cols) as usize;
             let mut out = vec![0f32; len];
             for inp in &node.inputs {
@@ -1047,7 +1371,7 @@ pub fn eval_node<F: RopeForm>(
             }
             out
         }
-        SubOp::Reshape => {
+        SubOp::Reshape { .. } => {
             let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
             // A reshape moves no data in the HOST/logical view — the element
             // sequence is identical and only the extents change. It refuses on
@@ -1068,7 +1392,7 @@ pub fn eval_node<F: RopeForm>(
                 // The TANH approximation, not the erf form — this is the
                 // reference the device's `gelu` SFP polynomial approximates, so
                 // matching it here keeps `eval_dag` a usable oracle for the
-                // on-card result. (`LoweredOp::GeluErf` is a DISTINCT op and
+                // on-card result. (`EwKind::GeluErf` is a DISTINCT op and
                 // must not fold into this one.)
                 EwKind::Gelu => a
                     .iter()
@@ -1120,6 +1444,13 @@ pub fn eval_node<F: RopeForm>(
                         })
                         .collect()
                 }
+                EwKind::BiasAdd => {
+                    // The bias is ONE `[1, n]` row, added to every row of `a`.
+                    let (b, br, bc) = gather(&node.inputs[1], graph, bufs);
+                    debug_assert_eq!((br, bc), (1, ac), "bias_add bias must be one [1, n] row");
+                    let d = ac as usize;
+                    (0..a.len()).map(|i| a[i] + b[i % d]).collect()
+                }
             }
         }
         SubOp::ScalarMul { scale } => {
@@ -1156,7 +1487,7 @@ pub fn eval_node<F: RopeForm>(
             }
             out
         }
-        SubOp::RmsNormReduce { eps } => {
+        SubOp::RmsNormReduce { eps, .. } => {
             // Phase 1: compute inv_rms[i] = 1/sqrt(mean(x[i,:]^2) + eps).
             // Output is `[m, 1]` — one scalar per row.
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
@@ -1171,7 +1502,7 @@ pub fn eval_node<F: RopeForm>(
             }
             out
         }
-        SubOp::RmsNormApply { gain } => {
+        SubOp::RmsNormApply { gain, .. } => {
             // Phase 2: y[m, chunk_cols] = x * inv_rms[per row] * gamma[per col].
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             let (inv_rms, ir, ic) = gather(&node.inputs[1], graph, bufs);
@@ -1336,7 +1667,7 @@ pub fn eval_node<F: RopeForm>(
         SubOp::TanhSoftCap => panic!(
             "SubOp::TanhSoftCap has no host reference: the cap is a model constant \
              resolved at emission and has never been carried on the tape (neither \
-             LoweredOp::TanhSoftCap nor Instruction::TanhSoftCap holds it), so there \
+             SubOp::TanhSoftCap nor Instruction::TanhSoftCap holds it), so there \
              is no value here to divide by"
         ),
         SubOp::GateSplit { .. } => panic!(
@@ -1366,10 +1697,12 @@ pub fn eval_node<F: RopeForm>(
              runtime-ambient per layer, so a single node's output is not a function of \
              its operands alone"
         ),
-        SubOp::Moe { .. } | SubOp::GemmaMoe { .. } => panic!(
-            "SubOp::Moe / GemmaMoe have no host reference: the router and expert \
-             weights arrive as ONE opaque bundle source, which `gather` cannot read as \
-             a tensor region"
+        expansion_ops!() => panic!(
+            "{} has no host reference: the router and expert weights arrive as opaque \
+             bundle sources, a KV codec's packed stores as runtime buffers, and the sampled \
+             rows at the runtime's sequence boundaries, none of which `gather` can read as \
+             a tensor region",
+            node.op.name()
         ),
 
         SubOp::AttnDecode {
@@ -1571,10 +1904,9 @@ pub fn validate<F: RopeForm>(graph: &SubtileIR<F>) -> Result<usize, String> {
             return Err(format!("node {i} has non-dense id {}", node.id.0));
         }
         let arity = node.inputs.len();
-        // Arity comes from THE SubOp registry (`crate::subops`) — one
-        // row per op, no hand-maintained parallel match.
-        let arity_ok = crate::subops::subop_arity_ok(&node.op, arity);
-        if !arity_ok {
+        // Arity comes from THE op registry (`crate::ops`) — one row per
+        // op, no hand-maintained parallel match.
+        if !node.op.arity_ok(arity) {
             return Err(format!("node {i} op {:?} bad arity {arity}", node.op));
         }
         // Output must target an op-output tensor, in bounds.
@@ -1683,14 +2015,6 @@ pub fn head_blocks(
     n_blocks(total, block)
 }
 
-/// Out-columns of an op (mirrors `crate::lower`): GEMM → n, attention → the geometry's own
-/// token-stream width, everything else preserves input-0 width.
-pub(crate) fn op_out_cols(op: crate::lower::LoweredOp, operand_cols: impl Fn(usize) -> u32) -> u32 {
-    // Derived from THE op registry (`crate::ops`) — one row per op, no
-    // hand-maintained parallel match.
-    crate::ops::lowered_op_out_cols(&op, operand_cols)
-}
-
 /// Lower a flat [`crate::lower::LoweringInput`] to a SubtileIR,
 /// **N-block tiling every GEMM** by `nb` (output columns split into
 /// `ceil(n/nb)` MatmulTile subtiles, each writing a disjoint column
@@ -1705,11 +2029,14 @@ pub(crate) fn op_out_cols(op: crate::lower::LoweredOp, operand_cols: impl Fn(usi
 /// forms in one IR is impossible by construction (the IR's rope nodes
 /// carry `PhantomData<F>`, so a SubtileIR<NeoX> cannot hold an
 /// Interleaved-form rope node).
+///
+/// Each node performs its source op — the SAME [`SubOp`], moved from the [`Arch`] stage to the
+/// [`Tiled`] one: the KV-cache witnesses are bound here and nothing else about the op changes.
 pub fn lower_region(
     input: &crate::lower::LoweringInput,
     nb: std::num::NonZeroU32,
 ) -> SubtileIR<NeoX> {
-    use crate::lower::{InputRef, LoweredOp};
+    use crate::lower::InputRef;
     let num_sources = input.sources.len() as u32;
     let mut tensors: Vec<TensorShape> = input
         .sources
@@ -1775,371 +2102,334 @@ pub fn lower_region(
         };
         // The registry decides which operand sets the output width, so
         // hand it a lookup rather than in0 alone.
-        let out_cols = op_out_cols(desc.op, |k| {
-            resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).2
-        });
+        let out_cols = desc
+            .op
+            .out_cols(|k| resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).2);
         let out_t = TensorId(tensors.len() as u32);
         tensors.push(TensorShape {
             rows: m,
             cols: out_cols,
         });
 
-        match desc.op {
-            LoweredOp::Gemm { n, weight } => {
-                // k is structurally derived from the activation's
-                // column count — it is not a separate field. See
-                // LoweredOp::Gemm doc.
-                let (in0_t, _r, in0_cols) = in0_named("Gemm");
-                let k = in0_cols;
-                let (w_t, _wr, _wc) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
-                let act = TensorRegion {
-                    tensor: in0_t,
+        // The node's op: the source op with the witnesses only this walk knows bound.
+        // RopeAppend's KvCacheLayout is keyed on its `K_cache` input (desc.inputs[4] per the
+        // arity contract); AttnDecode's KvCacheLayout/KvCacheProducer are keyed on its
+        // prefix-K input (desc.inputs[1] in the fused decode shape).
+        let subop: SubOp<NeoX> = match desc.op {
+            SubOp::MatmulTile { n, weight } => SubOp::MatmulTile { n, weight },
+            SubOp::SumReduce { minted }
+            | SubOp::RmsNormReduce { minted, .. }
+            | SubOp::RmsNormApply { minted, .. } => match minted {},
+            // ⛔ A RESHAPE IS NOT AN ALIAS, and the obvious implementation of one is wrong: a
+            // device tensor is STICK-laid-out and `sdsc_abstract::dev_off_stk` places element
+            // (i, j) at
+            //     (j / stk) * (a * stk) + i * stk + (j % stk)
+            // where `a` is the ROW COUNT. Two tensors over the same bytes with different
+            // (rows, cols) therefore disagree on where every element lives. gemma-4's reshapes
+            // are per-head views ([M, heads*hd] -> [M*heads, hd]) — rows change, so an alias
+            // moves everything.
+            //
+            // Nor does the arrangement authority catch it: `declare_arrangement` keys on tensor
+            // NAME, and an alias gives the two views two names, so no conflict is seen.
+            //
+            // A reshape needs a RESTICKIFY — a real copy re-laying out from the old stick
+            // layout to the new. Spyre already has that machinery; this pipeline just has no op
+            // for it yet.
+            SubOp::Reshape { rows, cols } => SubOp::Reshape { rows, cols },
+            // A row-broadcast bias (`EwKind::BiasAdd`) is exact at decode (m = 1, both rows);
+            // m > 1 broadcasts its `[1, n]` source across the rows.
+            SubOp::Elementwise(kind) => SubOp::Elementwise(kind),
+            SubOp::SiluMul => SubOp::SiluMul,
+            SubOp::ScalarMul { scale } => SubOp::ScalarMul { scale },
+            SubOp::RmsNorm { eps, gain } => SubOp::RmsNorm { eps, gain },
+            SubOp::RopeRotate { head_dim, _form } => SubOp::RopeRotate { head_dim, _form },
+            SubOp::RopeAppend {
+                head_dim,
+                layer,
+                attn,
+                pairing,
+                _form,
+                ..
+            } => {
+                // K-cache TensorId comes from desc.inputs[4]
+                // (the validate arity-6 contract); for legacy
+                // 4-input fixtures (K, cos, sin, V only) fall
+                // back to the K input's own tensor — the layout
+                // witness is consulted only when the producer/
+                // consumer pair is end-to-end (RopeAppend +
+                // AttnDecode), so the sentinel never escapes.
+                let k_cache_t = if desc.inputs.len() > 4 {
+                    resolve(desc.inputs[4], &op_tensor, &op_cols, &tensors).0
+                } else {
+                    in0_named("RopeAppend").0
+                };
+                // V-cache TensorId from desc.inputs[5] (arity-6
+                // contract). Without it the layout aliases V=K
+                // (`for_cache_tensor`) and the V-cache StoreAsync lands
+                // in the K cache — clobbering the rotated K, leaving the
+                // real V cache unwritten (caught by the full-tape interp
+                // diff). Legacy 4-input fixtures fall back to the K
+                // cache (sentinel; never escapes end-to-end).
+                let v_cache_t = if desc.inputs.len() > 5 {
+                    resolve(desc.inputs[5], &op_tensor, &op_cols, &tensors).0
+                } else {
+                    k_cache_t
+                };
+                // The per-model dims (num_kv_heads / head_dim) live
+                // on the op itself — stamped from `model.bounds`
+                // upstream — and flow into the byte-offset math via the
+                // SubOp fields. No separate shape-table to check against.
+                let layout = KvCacheLayout::for_cache_tensors(k_cache_t, v_cache_t);
+                k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
+                SubOp::RopeAppend {
+                    head_dim,
+                    layer,
+                    attn,
+                    pairing,
+                    layout,
+                    _form,
+                }
+            }
+            SubOp::AttnDecode {
+                geom,
+                scale,
+                valid_len,
+                mask,
+                ..
+            } => {
+                let (prefix_k_t, _, _) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
+                // prefix_v (inputs[2]) is a DISTINCT cache tensor from
+                // prefix_k (inputs[1]). `for_cache_tensor(t)` aliases
+                // V=K — using it here made the lowering's V load read
+                // the K cache (attn output == K, caught by the
+                // full-tape interp diff). Inputs = [q, prefix_k,
+                // prefix_v, new_k, new_v].
+                let (prefix_v_t, _, _) = resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors);
+                // The head geometry rides on the AttnDecode op (minted from `model.bounds`);
+                // the layout witness is just the cache-tensor identity pair.
+                let layout = KvCacheLayout::for_cache_tensors(prefix_k_t, prefix_v_t);
+                let producer = match k_cache_producer_node.get(&prefix_k_t) {
+                    Some(&node_idx) => KvCacheProducer::from_rope_append(node_idx),
+                    None => KvCacheProducer::pre_populated_ext(),
+                };
+                let softmax_state = SoftmaxStateId::new(next_softmax_state);
+                next_softmax_state += 1;
+                SubOp::AttnDecode {
+                    geom,
+                    scale,
+                    valid_len,
+                    layout,
+                    producer,
+                    softmax_state,
+                    mask,
+                }
+            }
+            SubOp::TanhSoftCap => SubOp::TanhSoftCap,
+            SubOp::RmsNormUnit { eps } => SubOp::RmsNormUnit { eps },
+            SubOp::ScalarWeightMul => SubOp::ScalarWeightMul,
+            SubOp::GateSplit { half_cols } => SubOp::GateSplit { half_cols },
+            SubOp::GateApply => SubOp::GateApply,
+            SubOp::GateScale => SubOp::GateScale,
+            SubOp::LoadPixels { in_features } => SubOp::LoadPixels { in_features },
+            SubOp::LoadPosEmbeds { width } => SubOp::LoadPosEmbeds { width },
+            SubOp::EmbeddingGather { indices_kind } => SubOp::EmbeddingGather { indices_kind },
+            SubOp::VisionRope => SubOp::VisionRope,
+            SubOp::VarlenAttention { cu_kind } => SubOp::VarlenAttention { cu_kind },
+            SubOp::EncoderAttn { geom, scale } => SubOp::EncoderAttn { geom, scale },
+            SubOp::GatedDeltaNet => SubOp::GatedDeltaNet,
+            SubOp::Mean => SubOp::Mean,
+            SubOp::RouterNorm { eps, router } => SubOp::RouterNorm { eps, router },
+            SubOp::RouterLogits { experts, router } => SubOp::RouterLogits { experts, router },
+            SubOp::RouteSoftmax => SubOp::RouteSoftmax,
+            SubOp::RouteArgsort => SubOp::RouteArgsort,
+            SubOp::RouteTopK { k } => SubOp::RouteTopK { k },
+            SubOp::RouteGatherScores => SubOp::RouteGatherScores,
+            SubOp::RouteScale { scale } => SubOp::RouteScale { scale },
+            SubOp::RouteRenorm => SubOp::RouteRenorm,
+            SubOp::RouteExpertScale { router } => SubOp::RouteExpertScale { router },
+            SubOp::ExpertSort { experts, k, bundle } => SubOp::ExpertSort { experts, k, bundle },
+            SubOp::ExpertMatmul {
+                proj,
+                n,
+                k,
+                quant,
+                bundle,
+            } => SubOp::ExpertMatmul {
+                proj,
+                n,
+                k,
+                quant,
+                bundle,
+            },
+            SubOp::ExpertGatedAct { act } => SubOp::ExpertGatedAct { act },
+            SubOp::ExpertUnsort => SubOp::ExpertUnsort,
+            SubOp::ExpertCombine { hidden, shared } => SubOp::ExpertCombine { hidden, shared },
+            SubOp::KvEncode { operand } => SubOp::KvEncode { operand },
+            SubOp::KvStage { operand } => SubOp::KvStage { operand },
+            SubOp::RotateRows { rows } => SubOp::RotateRows { rows },
+            SubOp::AttnPackedKv => SubOp::AttnPackedKv,
+            SubOp::SampleRowsGather => SubOp::SampleRowsGather,
+            SubOp::SampleRowsScatter => SubOp::SampleRowsScatter,
+            SubOp::AllRowsMatmul => SubOp::AllRowsMatmul,
+        };
+
+        if let SubOp::MatmulTile { n, weight } = subop {
+            // k is structurally derived from the activation's
+            // column count — it is not a separate field. See
+            // SubOp::MatmulTile doc.
+            let (in0_t, _r, in0_cols) = in0_named("MatmulTile");
+            let k = in0_cols;
+            let (w_t, _wr, _wc) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
+            let act = TensorRegion {
+                tensor: in0_t,
+                region: Region {
+                    rows: Range::new(0, m),
+                    cols: Range::new(0, k),
+                },
+            };
+            // Gemms are emitted WHOLE: one MatmulTile per logical Linear
+            // with the FULL [M, N] output. N+K tiling is owned by
+            // `split_oversized_loads_pass` (the NK path), which strides
+            // the B operand by the SOURCE matrix's full N — so a
+            // column-slice of a row-major [K, N] weight can never be
+            // mis-strided (the per-N-block-at-lowering bug the host
+            // interpreter caught: the K-only path used the slice width
+            // 128 as the row stride instead of N). `nb` still tiles
+            // rmsnorm / rope / elementwise below.
+            let whole = Range::new(0, n);
+            let id = SubtileId(nodes.len() as u32);
+            let mut mm_inputs = vec![
+                act,
+                // W is row-major [K, N] per FUF `gemm(x: [..., K],
+                // w: [K, N])`; read all K rows of the full N.
+                TensorRegion {
+                    tensor: w_t,
+                    region: Region {
+                        rows: Range::new(0, k),
+                        cols: whole,
+                    },
+                },
+            ];
+            if matches!(weight, crate::lower::GemmWeight::Fp8Dynamic) {
+                // fp8 W8A8: carry the PER-CHANNEL weight_scale (desc.inputs[2], shape [N,1]) as the
+                // MatmulTile's THIRD input, so `lower_matmul_node` sees arity-3 == fp8 and dequants via
+                // `Fp8W8A8Dequant` (w_scale[n]). Dense matmul stays arity-2 [act, W] (byte-identical).
+                let (ws_t, ws_r, ws_c) = resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors);
+                mm_inputs.push(TensorRegion {
+                    tensor: ws_t,
+                    region: Region {
+                        rows: Range::new(0, ws_r),
+                        cols: Range::new(0, ws_c),
+                    },
+                });
+            }
+            nodes.push(SubtileNode {
+                id,
+                op: subop,
+                inputs: mm_inputs,
+                output: TensorRegion {
+                    tensor: out_t,
                     region: Region {
                         rows: Range::new(0, m),
-                        cols: Range::new(0, k),
+                        cols: whole,
                     },
-                };
-                // Gemms are emitted WHOLE: one MatmulTile per logical Linear
-                // with the FULL [M, N] output. N+K tiling is owned by
-                // `split_oversized_loads_pass` (the NK path), which strides
-                // the B operand by the SOURCE matrix's full N — so a
-                // column-slice of a row-major [K, N] weight can never be
-                // mis-strided (the per-N-block-at-lowering bug the host
-                // interpreter caught: the K-only path used the slice width
-                // 128 as the row stride instead of N). `nb` still tiles
-                // rmsnorm / rope / elementwise below.
-                let whole = Range::new(0, n);
-                let id = SubtileId(nodes.len() as u32);
-                let mut mm_inputs = vec![
-                    act,
-                    // W is row-major [K, N] per FUF `gemm(x: [..., K],
-                    // w: [K, N])`; read all K rows of the full N.
-                    TensorRegion {
-                        tensor: w_t,
-                        region: Region {
-                            rows: Range::new(0, k),
-                            cols: whole,
-                        },
-                    },
-                ];
-                if matches!(weight, crate::lower::GemmWeight::Fp8Dynamic) {
-                    // fp8 W8A8: carry the PER-CHANNEL weight_scale (desc.inputs[2], shape [N,1]) as the
-                    // MatmulTile's THIRD input, so `lower_matmul_node` sees arity-3 == fp8 and dequants via
-                    // `Fp8W8A8Dequant` (w_scale[n]). Dense matmul stays arity-2 [act, W] (byte-identical).
-                    let (ws_t, ws_r, ws_c) =
-                        resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors);
-                    mm_inputs.push(TensorRegion {
-                        tensor: ws_t,
-                        region: Region {
-                            rows: Range::new(0, ws_r),
-                            cols: Range::new(0, ws_c),
-                        },
-                    });
+                },
+            });
+        } else {
+            // A pure elementwise op (silu/mul/add/silu·mul) is tiled by the
+            // output column slice like the GEMM N-blocks, so a downstream
+            // per-target lowering can dispatch the tiles independently.
+            // rope / attn (head structure) and
+            // rmsnorm (RMS reduction) stay WHOLE here — this is the bit-exact,
+            // GPU-correct reference lowering + the live per-op-schedule path.
+            // The head-tiling, split-K all-reduce and replication of the
+            // tensor-parallel partition live in
+            // [`crate::partition::lower_partitioned`], kept separate because
+            // split-K reassociates (breaks this fn's bit-exact contract) and
+            // because the partition needs the new GPU emit/player arms.
+            let elementwise = matches!(
+                subop,
+                SubOp::Elementwise(EwKind::Silu | EwKind::Mul | EwKind::Add)
+                    | SubOp::ScalarMul { .. }
+                    | SubOp::SiluMul
+            );
+            let blocks = if elementwise {
+                n_blocks(out_cols, nb)
+            } else {
+                vec![Range::new(0, out_cols)]
+            };
+            for blk in blocks {
+                let mut inputs: Vec<TensorRegion> = desc
+                    .inputs
+                    .iter()
+                    .map(|r| {
+                        let (t, _, _) = resolve(*r, &op_tensor, &op_cols, &tensors);
+                        if elementwise {
+                            TensorRegion {
+                                tensor: t,
+                                region: Region {
+                                    rows: Range::new(0, m),
+                                    cols: blk,
+                                },
+                            }
+                        } else {
+                            whole(t, &tensors)
+                        }
+                    })
+                    .collect();
+                if let SubOp::AttnDecode {
+                    producer,
+                    valid_len,
+                    ..
+                } = &subop
+                {
+                    // Full-cache decode model (cache written by a RopeAppend THIS
+                    // forward): prefix_k/prefix_v (inputs 1,2) are the full KV cache
+                    // TENSOR [prefix(rows 0..dp) ++ new(row dp) ++ uninitialized
+                    // capacity]. eval_node's prefix SEGMENT must be EXACTLY the
+                    // `valid_len - 1` real prefix rows (`= decode_position`), and it
+                    // reads the new row via the separate new_k/new_v segments — so
+                    // it attends to `valid_len` positions TOTAL.
+                    //
+                    // The slice bound is `valid_len - 1`, NOT `cache_rows - 1`:
+                    // tying it to the cache tensor's row count is the rigging the
+                    // un-rigged honest test exposes (a cache sized [capacity, kv]
+                    // with capacity > valid_len would otherwise drag uninitialized
+                    // rows into the softmax). `valid_len` is the structural
+                    // host-verification pin (= decode_position + 1), decoupled from
+                    // capacity. A PrePopulatedExt cache is a READ-ONLY prefix
+                    // (new_k a separate segment, no append) — NOT sliced (e.g. the
+                    // RopeRotate-based bit-exact fixture, where prefix_k holds all
+                    // l prefix rows and the whole cache is valid).
+                    if matches!(producer, KvCacheProducer::SameForwardRopeAppend { .. }) {
+                        let prefix_rows = (*valid_len).saturating_sub(1).max(1);
+                        for idx in [1usize, 2usize] {
+                            if let Some(r) = inputs.get_mut(idx) {
+                                let rows = r.region.rows;
+                                debug_assert!(
+                                    prefix_rows <= rows.len,
+                                    "AttnDecode valid_len-1 prefix ({prefix_rows}) exceeds \
+                                     cache capacity ({}) — valid_len must be <= cache rows",
+                                    rows.len,
+                                );
+                                r.region.rows = Range::new(rows.start, prefix_rows);
+                            }
+                        }
+                    }
                 }
+                let id = SubtileId(nodes.len() as u32);
                 nodes.push(SubtileNode {
                     id,
-                    op: SubOp::MatmulTile { weight },
-                    inputs: mm_inputs,
+                    op: subop,
+                    inputs,
                     output: TensorRegion {
                         tensor: out_t,
                         region: Region {
                             rows: Range::new(0, m),
-                            cols: whole,
+                            cols: blk,
                         },
                     },
                 });
-            }
-            other => {
-                // Populate per-variant typed witnesses. RopeAppend's
-                // KvCacheLayout is keyed on its `K_cache` input
-                // (desc.inputs[4] per the validate-arity contract);
-                // AttnDecode's KvCacheLayout/KvCacheProducer are keyed
-                // on its prefix-K input (desc.inputs[1] in the fused
-                // decode shape).
-                let subop: SubOp<NeoX> = match other {
-                    LoweredOp::RmsNorm { eps, gain_offset } => {
-                        // The (1+w) convention is CARRIED, not dropped and not folded into the
-                        // weights at load: folding would make the loaded gain disagree with the
-                        // checkpoint, so every consumer that re-reads it (dumps, the numeric
-                        // reference, a second target) would see a different tensor.
-                        let gain = GainConvention::from_offset(gain_offset).unwrap_or_else(|| {
-                            panic!(
-                                "rmsnorm gain_offset={gain_offset} is neither the w nor the \
-                                 (1+w) convention, and no kernel implements a third"
-                            )
-                        });
-                        SubOp::RmsNorm { eps, gain }
-                    }
-                    LoweredOp::Silu => SubOp::Elementwise(EwKind::Silu),
-                    LoweredOp::GateSplit { half_cols } => SubOp::GateSplit { half_cols },
-                    LoweredOp::GateApply => SubOp::GateApply,
-                    LoweredOp::GateScale => SubOp::GateScale,
-                    LoweredOp::EmbeddingGather { indices_kind } => {
-                        SubOp::EmbeddingGather { indices_kind }
-                    }
-                    LoweredOp::LoadPosEmbeds { width } => SubOp::LoadPosEmbeds { width },
-                    LoweredOp::LoadPixels { in_features } => SubOp::LoadPixels { in_features },
-                    LoweredOp::VisionRope => SubOp::VisionRope,
-                    LoweredOp::GeluErf => SubOp::Elementwise(EwKind::GeluErf),
-                    LoweredOp::QuickGelu => SubOp::Elementwise(EwKind::QuickGelu),
-                    LoweredOp::VarlenAttention { cu_kind } => SubOp::VarlenAttention { cu_kind },
-                    LoweredOp::EncoderAttn { geom, scale } => SubOp::EncoderAttn { geom, scale },
-                    LoweredOp::GatedDeltaNet => SubOp::GatedDeltaNet,
-                    LoweredOp::GemmaMoe {
-                        num_experts,
-                        top_k,
-                        moe_inter,
-                        group_size,
-                        bits,
-                    } => SubOp::GemmaMoe {
-                        num_experts,
-                        top_k,
-                        moe_inter,
-                        group_size,
-                        bits,
-                    },
-                    LoweredOp::Moe {
-                        qwen_shared,
-                        num_experts,
-                        top_k,
-                        moe_inter,
-                        shared_inter,
-                        norm_topk,
-                        group_size,
-                        bits,
-                    } => SubOp::Moe {
-                        qwen_shared,
-                        num_experts,
-                        top_k,
-                        moe_inter,
-                        shared_inter,
-                        norm_topk,
-                        group_size,
-                        bits,
-                    },
-                    LoweredOp::RmsNormUnit { eps } => SubOp::RmsNormUnit { eps },
-                    LoweredOp::ScalarWeightMul => SubOp::ScalarWeightMul,
-                    LoweredOp::TanhSoftCap => SubOp::TanhSoftCap,
-                    LoweredOp::Gelu => SubOp::Elementwise(EwKind::Gelu),
-                    LoweredOp::Mul => SubOp::Elementwise(EwKind::Mul),
-                    LoweredOp::ScalarMul { scale } => SubOp::ScalarMul { scale },
-                    LoweredOp::SiluMul => SubOp::SiluMul,
-                    LoweredOp::Add => SubOp::Elementwise(EwKind::Add),
-                    // ⛔ THE OBVIOUS IMPLEMENTATION IS WRONG, SO THE MESSAGE
-                    // SAYS WHICH ONE. "It is a view, so alias the buffer" is
-                    // the first thing anyone tries and it silently corrupts:
-                    // a device tensor is STICK-laid-out and
-                    // `sdsc_abstract::dev_off_stk` places element (i, j) at
-                    //     (j / stk) * (a * stk) + i * stk + (j % stk)
-                    // where `a` is the ROW COUNT. Two tensors over the same
-                    // bytes with different (rows, cols) therefore disagree on
-                    // where every element lives. gemma-4's reshapes are
-                    // per-head views ([M, heads*hd] -> [M*heads, hd]) — rows
-                    // change, so an alias moves everything.
-                    //
-                    // Nor does the arrangement authority catch it:
-                    // `declare_arrangement` keys on tensor NAME, and an alias
-                    // gives the two views two names, so no conflict is seen.
-                    //
-                    // A reshape needs a RESTICKIFY — a real copy re-laying out
-                    // from the old stick layout to the new. Spyre already has
-                    // that machinery; this pipeline just has no op for it yet.
-                    LoweredOp::Reshape { .. } => SubOp::Reshape,
-                    // Row-broadcast bias: elementwise add whose second
-                    // operand is a `[1, n]` source. Exact at decode
-                    // (m = 1, both rows); m > 1 relies on the same
-                    // broadcast row-stride handling `Add` has for
-                    // `[1, n]` operands.
-                    LoweredOp::BiasAdd => SubOp::Elementwise(EwKind::Add),
-                    LoweredOp::RopeRotate { head_dim } => SubOp::RopeRotate {
-                        head_dim,
-                        _form: PhantomData,
-                    },
-                    LoweredOp::Mean => SubOp::Mean,
-                    LoweredOp::Sub => SubOp::Elementwise(EwKind::Sub),
-                    LoweredOp::RopeAppend {
-                        head_dim,
-                        layer,
-                        is_global: _,
-                        interleaved: _,
-                    } => {
-                        // K-cache TensorId comes from desc.inputs[4]
-                        // (the validate arity-6 contract); for legacy
-                        // 4-input fixtures (K, cos, sin, V only) fall
-                        // back to the K input's own tensor — the layout
-                        // witness is consulted only when the producer/
-                        // consumer pair is end-to-end (RopeAppend +
-                        // AttnDecode), so the sentinel never escapes.
-                        let k_cache_t = if desc.inputs.len() > 4 {
-                            resolve(desc.inputs[4], &op_tensor, &op_cols, &tensors).0
-                        } else {
-                            in0_named("RopeAppend").0
-                        };
-                        // V-cache TensorId from desc.inputs[5] (arity-6
-                        // contract). Without it the layout aliases V=K
-                        // (`for_cache_tensor`) and the V-cache StoreAsync lands
-                        // in the K cache — clobbering the rotated K, leaving the
-                        // real V cache unwritten (caught by the full-tape interp
-                        // diff). Legacy 4-input fixtures fall back to the K
-                        // cache (sentinel; never escapes end-to-end).
-                        let v_cache_t = if desc.inputs.len() > 5 {
-                            resolve(desc.inputs[5], &op_tensor, &op_cols, &tensors).0
-                        } else {
-                            k_cache_t
-                        };
-                        // The per-model dims (num_kv_heads / head_dim) live
-                        // on the lowered op itself — stamped from
-                        // `model.bounds` upstream — and flow into the
-                        // byte-offset math via the SubOp fields. No
-                        // separate shape-table to check against.
-                        let layout = KvCacheLayout::for_cache_tensors(k_cache_t, v_cache_t);
-                        k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
-                        SubOp::RopeAppend {
-                            head_dim,
-                            layer,
-                            layout,
-                            _form: PhantomData,
-                        }
-                    }
-                    LoweredOp::AttnDecode {
-                        geom,
-                        scale,
-                        valid_len,
-                        sliding,
-                    } => {
-                        let mask = if sliding {
-                            AttnMask::SlidingWindow
-                        } else {
-                            AttnMask::Causal
-                        };
-                        let (prefix_k_t, _, _) =
-                            resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
-                        // prefix_v (inputs[2]) is a DISTINCT cache tensor from
-                        // prefix_k (inputs[1]). `for_cache_tensor(t)` aliases
-                        // V=K — using it here made the lowering's V load read
-                        // the K cache (attn output == K, caught by the
-                        // full-tape interp diff). Inputs = [q, prefix_k,
-                        // prefix_v, new_k, new_v].
-                        let (prefix_v_t, _, _) =
-                            resolve(desc.inputs[2], &op_tensor, &op_cols, &tensors);
-                        // The head geometry rides on the AttnDecode op (minted from `model.bounds`);
-                        // the layout witness is just the cache-tensor identity pair.
-                        let layout = KvCacheLayout::for_cache_tensors(prefix_k_t, prefix_v_t);
-                        let producer = match k_cache_producer_node.get(&prefix_k_t) {
-                            Some(&node_idx) => KvCacheProducer::from_rope_append(node_idx),
-                            None => KvCacheProducer::pre_populated_ext(),
-                        };
-                        let softmax_state = SoftmaxStateId::new(next_softmax_state);
-                        next_softmax_state += 1;
-                        SubOp::AttnDecode {
-                            geom,
-                            scale,
-                            valid_len,
-                            layout,
-                            producer,
-                            softmax_state,
-                            mask,
-                        }
-                    }
-                    LoweredOp::Gemm { .. } => unreachable!("gemm handled above"),
-                };
-                // A pure elementwise op (silu/mul/add/silu·mul) is tiled by the
-                // output column slice like the GEMM N-blocks, so a downstream
-                // per-target lowering can dispatch the tiles independently.
-                // rope / attn (head structure) and
-                // rmsnorm (RMS reduction) stay WHOLE here — this is the bit-exact,
-                // GPU-correct reference lowering + the live per-op-schedule path.
-                // The head-tiling, split-K all-reduce and replication of the
-                // tensor-parallel partition live in
-                // [`crate::partition::lower_partitioned`], kept separate because
-                // split-K reassociates (breaks this fn's bit-exact contract) and
-                // because the partition needs the new GPU emit/player arms.
-                let elementwise = matches!(
-                    other,
-                    LoweredOp::Silu
-                        | LoweredOp::Mul
-                        | LoweredOp::ScalarMul { .. }
-                        | LoweredOp::Add
-                        | LoweredOp::SiluMul
-                );
-                let blocks = if elementwise {
-                    n_blocks(out_cols, nb)
-                } else {
-                    vec![Range::new(0, out_cols)]
-                };
-                for blk in blocks {
-                    let mut inputs: Vec<TensorRegion> = desc
-                        .inputs
-                        .iter()
-                        .map(|r| {
-                            let (t, _, _) = resolve(*r, &op_tensor, &op_cols, &tensors);
-                            if elementwise {
-                                TensorRegion {
-                                    tensor: t,
-                                    region: Region {
-                                        rows: Range::new(0, m),
-                                        cols: blk,
-                                    },
-                                }
-                            } else {
-                                whole(t, &tensors)
-                            }
-                        })
-                        .collect();
-                    if let SubOp::AttnDecode {
-                        producer,
-                        valid_len,
-                        ..
-                    } = &subop
-                    {
-                        // Full-cache decode model (cache written by a RopeAppend THIS
-                        // forward): prefix_k/prefix_v (inputs 1,2) are the full KV cache
-                        // TENSOR [prefix(rows 0..dp) ++ new(row dp) ++ uninitialized
-                        // capacity]. eval_node's prefix SEGMENT must be EXACTLY the
-                        // `valid_len - 1` real prefix rows (`= decode_position`), and it
-                        // reads the new row via the separate new_k/new_v segments — so
-                        // it attends to `valid_len` positions TOTAL.
-                        //
-                        // The slice bound is `valid_len - 1`, NOT `cache_rows - 1`:
-                        // tying it to the cache tensor's row count is the rigging the
-                        // un-rigged honest test exposes (a cache sized [capacity, kv]
-                        // with capacity > valid_len would otherwise drag uninitialized
-                        // rows into the softmax). `valid_len` is the structural
-                        // host-verification pin (= decode_position + 1), decoupled from
-                        // capacity. A PrePopulatedExt cache is a READ-ONLY prefix
-                        // (new_k a separate segment, no append) — NOT sliced (e.g. the
-                        // RopeRotate-based bit-exact fixture, where prefix_k holds all
-                        // l prefix rows and the whole cache is valid).
-                        if matches!(producer, KvCacheProducer::SameForwardRopeAppend { .. }) {
-                            let prefix_rows = (*valid_len).saturating_sub(1).max(1);
-                            for idx in [1usize, 2usize] {
-                                if let Some(r) = inputs.get_mut(idx) {
-                                    let rows = r.region.rows;
-                                    debug_assert!(
-                                        prefix_rows <= rows.len,
-                                        "AttnDecode valid_len-1 prefix ({prefix_rows}) exceeds \
-                                         cache capacity ({}) — valid_len must be <= cache rows",
-                                        rows.len,
-                                    );
-                                    r.region.rows = Range::new(rows.start, prefix_rows);
-                                }
-                            }
-                        }
-                    }
-                    let id = SubtileId(nodes.len() as u32);
-                    nodes.push(SubtileNode {
-                        id,
-                        op: subop,
-                        inputs,
-                        output: TensorRegion {
-                            tensor: out_t,
-                            region: Region {
-                                rows: Range::new(0, m),
-                                cols: blk,
-                            },
-                        },
-                    });
-                }
             }
         }
         op_tensor.push(out_t);
@@ -2215,7 +2505,10 @@ pub fn decompose_rmsnorm<F: RopeForm>(
                 // 1 RmsNormReduce: reads x (whole), writes inv_rms (whole).
                 nodes.push(SubtileNode {
                     id: SubtileId(nodes.len() as u32),
-                    op: SubOp::RmsNormReduce { eps },
+                    op: SubOp::RmsNormReduce {
+                        eps,
+                        minted: Minted::BY_LOWERING,
+                    },
                     inputs: vec![x_in],
                     output: TensorRegion {
                         tensor: inv_rms_t,
@@ -2235,7 +2528,10 @@ pub fn decompose_rmsnorm<F: RopeForm>(
                         id: SubtileId(nodes.len() as u32),
                         // The convention rides the decomposition: the apply phase is
                         // where the gain multiplies, so it is the phase that has to know.
-                        op: SubOp::RmsNormApply { gain },
+                        op: SubOp::RmsNormApply {
+                            gain,
+                            minted: Minted::BY_LOWERING,
+                        },
                         inputs: vec![
                             TensorRegion {
                                 tensor: x_in.tensor,
@@ -2412,6 +2708,8 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
             SubOp::RopeAppend {
                 head_dim,
                 layer,
+                attn,
+                pairing,
                 layout,
                 _form: _,
             } => {
@@ -2436,6 +2734,8 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                         op: SubOp::RopeAppend {
                             head_dim,
                             layer,
+                            attn,
+                            pairing,
                             layout,
                             _form: PhantomData,
                         },
@@ -2566,7 +2866,10 @@ mod tests {
             num_sources: 1,
             nodes: vec![SubtileNode {
                 id: SubtileId::from_index(0),
-                op: SubOp::Reshape,
+                op: SubOp::Reshape {
+                    rows: RowScale::Times(std::num::NonZeroU32::new(heads as u32).unwrap()),
+                    cols: hd as u32,
+                },
                 inputs: vec![TensorRegion {
                     tensor: TensorId::from_index(0),
                     region: Region {
@@ -2595,7 +2898,7 @@ mod tests {
             "reshape is the identity on the element sequence"
         );
     }
-    use crate::lower::{InputRef, LoweredOp, OpDesc};
+    use crate::lower::{InputRef, OpDesc};
     use crate::model_geometry::{KvHeads, QueryHeads};
 
     /// Patch 1 producer-side milestone + fixture-orientation guard.
@@ -2653,7 +2956,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm {
+                    op: SubOp::MatmulTile {
                         n,
                         weight: crate::lower::GemmWeight::Dense,
                     },
@@ -2661,7 +2964,7 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Silu,
+                    op: SubOp::Elementwise(EwKind::Silu),
                     m,
                     inputs: vec![InputRef::Op(0)],
                 },
@@ -2698,7 +3001,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm {
+                    op: SubOp::MatmulTile {
                         n,
                         weight: crate::lower::GemmWeight::Dense,
                     },
@@ -2706,7 +3009,7 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)], // gate = x @ Wg
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm {
+                    op: SubOp::MatmulTile {
                         n,
                         weight: crate::lower::GemmWeight::Dense,
                     },
@@ -2714,7 +3017,7 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(2)], // up   = x @ Wu
                 },
                 OpDesc {
-                    op: LoweredOp::SiluMul,
+                    op: SubOp::SiluMul,
                     m,
                     inputs: vec![InputRef::Op(0), InputRef::Op(1)], // SiluMul(gate, up)
                 },
@@ -2759,15 +3062,15 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::RmsNorm {
+                    op: SubOp::RmsNorm {
                         eps: 1e-6,
-                        gain_offset: 0.0,
+                        gain: GainConvention::Scale,
                     },
                     m,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Mul,
+                    op: SubOp::Elementwise(EwKind::Mul),
                     m,
                     inputs: vec![InputRef::Op(0), InputRef::Op(0)], // self-mul keeps it elementwise
                 },
@@ -2843,7 +3146,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm {
+                    op: SubOp::MatmulTile {
                         n: qdim,
                         weight: crate::lower::GemmWeight::Dense,
                     },
@@ -2851,9 +3154,7 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::RopeRotate {
-                        head_dim: HeadDim::new(hd),
-                    },
+                    op: SubOp::rope_rotate(HeadDim::new(hd)),
                     m,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(2), InputRef::Ext(3)],
                 },
@@ -2927,12 +3228,12 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::RopeAppend {
-                        head_dim: HeadDim::new(hd),
-                        layer: 0,
-                        is_global: true,
-                        interleaved: false,
-                    },
+                    op: SubOp::rope_append(
+                        HeadDim::new(hd),
+                        0,
+                        AttnMask::Causal,
+                        RopeFormTag::NeoX,
+                    ),
                     m,
                     inputs: vec![
                         InputRef::Ext(1),
@@ -2944,18 +3245,18 @@ mod tests {
                     ],
                 },
                 OpDesc {
-                    op: LoweredOp::AttnDecode {
-                        geom: ModelAttnGeometry::mint(
+                    // l prefix rows (fully valid) ++ 1 new = l+1 valid positions.
+                    op: SubOp::attn_decode(
+                        ModelAttnGeometry::mint(
                             QueryHeads::new(hq),
                             KvHeads::new(hkv),
                             HeadDim::new(hd),
                         )
                         .expect("the fixture's kv heads divide its query heads"),
                         scale,
-                        // l prefix rows (fully valid) ++ 1 new = l+1.
-                        valid_len: l + 1,
-                        sliding: false,
-                    },
+                        l + 1,
+                        AttnMask::Causal,
+                    ),
                     m,
                     inputs: vec![
                         InputRef::Ext(0),

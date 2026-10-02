@@ -45,7 +45,7 @@ pub(crate) enum Operands {
 /// side, `714860e08`).
 macro_rules! spyre_standard_tile_pat {
     () => {
-        SubOp::SumReduce
+        SubOp::SumReduce { .. }
             | SubOp::Elementwise(_)
             | SubOp::SiluMul
             | SubOp::RmsNormApply { .. }
@@ -60,7 +60,7 @@ pub(crate) use spyre_standard_tile_pat;
 /// The operand rule for a member of that class.
 pub(crate) fn spyre_standard_operands<F: RopeForm>(op: &SubOp<F>) -> Option<Operands> {
     Some(match op {
-        SubOp::SumReduce => Operands::FromInputs,
+        SubOp::SumReduce { .. } => Operands::FromInputs,
         // Silu/Gelu are 1 input + output; Mul/Add are 2 + output.
         //
         // ⛔ GELU IS LISTED EXPLICITLY BECAUSE THE ARM BELOW IS A WILDCARD.
@@ -71,8 +71,8 @@ pub(crate) fn spyre_standard_operands<F: RopeForm>(op: &SubOp<F>) -> Option<Oper
         SubOp::Elementwise(EwKind::Silu | EwKind::Gelu | EwKind::QuickGelu | EwKind::GeluErf) => {
             Operands::Fixed(2)
         }
-        SubOp::Elementwise(EwKind::Mul | EwKind::Add | EwKind::Sub) => Operands::Fixed(3),
-        SubOp::SiluMul => Operands::Fixed(3),
+        SubOp::Elementwise(EwKind::Mul | EwKind::Add | EwKind::Sub | EwKind::BiasAdd)
+        | SubOp::SiluMul => Operands::Fixed(3),
         // data + gain + accum + output.
         SubOp::RmsNormApply { .. } | SubOp::RmsNorm { .. } => Operands::Fixed(4),
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Operands::FromInputs,

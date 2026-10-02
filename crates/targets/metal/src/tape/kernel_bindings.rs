@@ -19,36 +19,51 @@
 //! the per-kernel struct boilerplate isn't pulling its weight at that
 //! size, and the visual inspection is trivial.
 
-use crate::tape::ids::{ArenaSlotIdx, LayerId};
-use crate::tape::lowered::{
-    Binding, RuntimeBindingKind, WeightBundleKind, WeightLocator, WeightTensor,
-};
+use crate::tape::ids::{ArenaSlotIdx, LayerId, SourceIx};
+use crate::tape::lowered::{Binding, RuntimeBindingKind, WeightTensor};
 
-/// Spans rope-on-read: append the one extra attention binding — the
-/// class-resolved cos_sin table at `cossin_idx`. The per-block "stored
-/// unrotated → rotate on read" flag rides in `block_table` bit 31 (set
-/// by the worker), so there is NO separate flag buffer. cos_sin is
-/// resolved by layer class via `WeightBundleKind::RopeOnReadCosSin`, so
-/// its `WeightLocator` is unused (a nominal zero locator). Only called
-/// when the BindingSet's `rope_on_read` is `Some`.
+/// A weight source's `which` tensor at `layer`, bound at `binding_index`.
+pub fn source(ix: SourceIx, which: WeightTensor, layer: LayerId, binding_index: u8) -> Binding {
+    Binding::Source {
+        ix,
+        which,
+        layer,
+        binding_index,
+    }
+}
+
+/// The cos/sin table a rope reads: the model's rotary source, or — MRoPE — the per-forward
+/// band-split table the forward writes (read with identity positions).
+#[derive(Clone, Copy)]
+pub enum CosSinTable {
+    Static(SourceIx),
+    Mrope,
+}
+
+impl CosSinTable {
+    pub fn binding(self, layer: LayerId, binding_index: u8) -> Binding {
+        match self {
+            Self::Static(ix) => source(ix, WeightTensor::Weight, layer, binding_index),
+            Self::Mrope => Binding::Runtime {
+                kind: RuntimeBindingKind::MropeCosSin,
+                binding_index,
+            },
+        }
+    }
+}
+
+/// Spans rope-on-read: append the one extra attention binding — the layer
+/// class's rotary `table` at `cossin_idx`. The per-block "stored unrotated →
+/// rotate on read" flag rides in `block_table` bit 31 (set by the worker), so
+/// there is NO separate flag buffer. Only called when the BindingSet's
+/// `rope_on_read` is `Some`.
 fn push_rope_on_read_bindings(
     v: &mut Vec<Binding>,
     layer: LayerId,
-    is_global: bool,
+    table: SourceIx,
     cossin_idx: u8,
 ) {
-    v.push(Binding::Weight {
-        kind: WeightBundleKind::RopeOnReadCosSin { is_global },
-        which: WeightTensor::Weight,
-        layer,
-        // Unused for RopeOnReadCosSin (resolved by class, not operand).
-        locator: WeightLocator {
-            bucket: 0,
-            op_idx: 0,
-            slot: 0,
-        },
-        binding_index: cossin_idx,
-    });
+    v.push(source(table, WeightTensor::Weight, layer, cossin_idx));
 }
 
 // ── AttentionPrefillSdpaPaged (both sdpa_vector and steel variants) ─
@@ -61,12 +76,12 @@ pub struct AttentionPrefillPagedBindingSet {
     pub output: ArenaSlotIdx,
     pub q: ArenaSlotIdx,
     pub kv_layer: LayerId,
-    /// Spans rope-on-read: `Some(is_global)` binds the class-resolved
-    /// cos_sin (slot 7) for the IN-KERNEL rope path (sdpa-paged,
+    /// Spans rope-on-read: `Some(table)` binds the layer class's rotary
+    /// table (slot 7) for the IN-KERNEL rope path (sdpa-paged,
     /// gqa_shared, simdgroup steel); `None` → the 7-binding ABI
     /// (byte-identical). The per-block "stored unrotated" flag rides in
     /// `block_table` bit 31, so there is no separate flag buffer.
-    pub rope_on_read: Option<bool>,
+    pub rope_on_read: Option<SourceIx>,
     /// Spans rope-on-read on NAX (rope-once-to-scratch): when `true`,
     /// slot 7 binds the shared `Binding::RopedKScratch` (the pre-roped K
     /// written by `KernelId::RopeOnceNax`) INSTEAD of cos_sin — the NAX
@@ -111,8 +126,8 @@ impl From<AttentionPrefillPagedBindingSet> for Vec<Binding> {
         if s.nax_roped_k_scratch {
             // NAX spans: pre-roped K from the scratch at slot 7.
             v.push(Binding::RopedKScratch { binding_index: 7 });
-        } else if let Some(is_global) = s.rope_on_read {
-            push_rope_on_read_bindings(&mut v, s.kv_layer, is_global, 7);
+        } else if let Some(table) = s.rope_on_read {
+            push_rope_on_read_bindings(&mut v, s.kv_layer, table, 7);
         }
         // Block-diagonal span attention: the per-block span-label buffer at slot
         // 8, bound whenever spans/rope-on-read is active (the kernel reads it
@@ -131,10 +146,10 @@ impl From<AttentionPrefillPagedBindingSet> for Vec<Binding> {
 /// ropes the cache's K into the shared `Binding::RopedKScratch` ONCE.
 ///   0 = RopedKScratch (out)   1 = BlockTable[layer] (bit 31 = unrotated)
 ///   2 = KvCacheK[layer]       3 = SeqUsedK
-///   4 = class-resolved cos_sin (`RopeOnReadCosSin`)
+///   4 = the layer class's rotary table
 pub struct RopeOnceNaxBindingSet {
     pub kv_layer: LayerId,
-    pub is_global: bool,
+    pub table: SourceIx,
 }
 
 impl From<RopeOnceNaxBindingSet> for Vec<Binding> {
@@ -154,7 +169,7 @@ impl From<RopeOnceNaxBindingSet> for Vec<Binding> {
                 binding_index: 3,
             },
         ];
-        push_rope_on_read_bindings(&mut v, s.kv_layer, s.is_global, 4);
+        push_rope_on_read_bindings(&mut v, s.kv_layer, s.table, 4);
         v
     }
 }
@@ -172,11 +187,10 @@ pub struct AttentionViaCacheBindingSet {
     pub output: ArenaSlotIdx,
     pub q: ArenaSlotIdx,
     pub kv_layer: LayerId,
-    /// Spans rope-on-read: `Some(is_global)` binds the per-physical-block
-    /// unrotated-flag buffer (slot 6) + the class-resolved cos_sin (slot
-    /// 7); `None` (every non-spans dispatch) → the 6-binding ABI, exactly
-    /// as before. `is_global` selects the global vs sliding RoPE cache.
-    pub rope_on_read: Option<bool>,
+    /// Spans rope-on-read: `Some(table)` binds the layer class's rotary
+    /// table (slot 6); `None` (every non-spans dispatch) → the 6-binding
+    /// ABI, exactly as before.
+    pub rope_on_read: Option<SourceIx>,
 }
 
 impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
@@ -208,8 +222,8 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
                 binding_index: 5,
             },
         ];
-        if let Some(is_global) = s.rope_on_read {
-            push_rope_on_read_bindings(&mut v, s.kv_layer, is_global, 6);
+        if let Some(table) = s.rope_on_read {
+            push_rope_on_read_bindings(&mut v, s.kv_layer, table, 6);
         }
         v
     }
@@ -250,8 +264,8 @@ impl From<TqAttentionBindingSet> for Vec<Binding> {
 pub struct TqStageBindingSet {
     pub kv_layer: LayerId,
     pub is_v: bool,
-    /// `Some(is_global)` for K under rope-on-read.
-    pub rope_on_read: Option<bool>,
+    /// The layer class's rotary table, for K under rope-on-read.
+    pub rope_on_read: Option<SourceIx>,
 }
 
 impl From<TqStageBindingSet> for Vec<Binding> {
@@ -288,8 +302,8 @@ impl From<TqStageBindingSet> for Vec<Binding> {
             binding_index,
         })
         .collect();
-        if let Some(is_global) = s.rope_on_read {
-            push_rope_on_read_bindings(&mut v, layer, is_global, 9);
+        if let Some(table) = s.rope_on_read {
+            push_rope_on_read_bindings(&mut v, layer, table, 9);
         }
         v
     }
@@ -319,7 +333,7 @@ impl From<TqRotateRowsBindingSet> for Vec<Binding> {
 
 /// Bindings for `KernelId::RopeAppend`. Eight slots:
 /// 0 = Q-rotated out (arena), 1 = K out (arena), 2 = V out (arena),
-/// 3 = CosSin\[layer\] (weight), 4 = Positions (runtime),
+/// 3 = the cos/sin table, 4 = Positions (runtime),
 /// 5 = SlotMapping (runtime), 6 = KvCacheK\[layer\] (runtime),
 /// 7 = KvCacheV\[layer\] (runtime).
 ///
@@ -330,7 +344,7 @@ pub struct RopeAppendBindingSet {
     pub q_out: ArenaSlotIdx,
     pub k_out: ArenaSlotIdx,
     pub v_out: ArenaSlotIdx,
-    pub cos_sin_locator: WeightLocator,
+    pub cos_sin: CosSinTable,
     pub layer: LayerId,
     // Spans rope-on-read: the "store K unrotated" flag rides in
     // slot_mapping bit 31 (set by the worker), so this kernel needs no
@@ -352,13 +366,7 @@ impl From<RopeAppendBindingSet> for Vec<Binding> {
                 slot: s.v_out.get(),
                 binding_index: 2,
             },
-            Binding::Weight {
-                kind: WeightBundleKind::CosSin,
-                which: WeightTensor::Weight,
-                layer: s.layer,
-                locator: s.cos_sin_locator,
-                binding_index: 3,
-            },
+            s.cos_sin.binding(s.layer, 3),
             Binding::Runtime {
                 kind: RuntimeBindingKind::Positions,
                 binding_index: 4,
@@ -385,14 +393,14 @@ impl From<RopeAppendBindingSet> for Vec<Binding> {
 /// Bindings for `KernelId::RopeAppendNormed`. Slots 0..7 mirror
 /// [`RopeAppendBindingSet`] except 1/2 bind the RAW (pre-norm) K/V
 /// inputs (read-only; the kernel writes K/V to the cache only);
-/// 8/9 = q/k norm gains (RmsNorm-kind weight sub-slots 0/1).
+/// 8/9 = q/k norm gains (the site's RmsNorm sources 0/1).
 pub struct RopeAppendNormedBindingSet {
     pub q_out: ArenaSlotIdx,
     pub k_in: ArenaSlotIdx,
     pub v_in: ArenaSlotIdx,
-    pub cos_sin_locator: WeightLocator,
-    pub q_gains_locator: WeightLocator,
-    pub k_gains_locator: WeightLocator,
+    pub cos_sin: CosSinTable,
+    pub q_gains: SourceIx,
+    pub k_gains: SourceIx,
     pub layer: LayerId,
     // Spans rope-on-read: flag rides in slot_mapping bit 31 (no binding;
     // only the ROPE_ROR fn-const at slot 9).
@@ -413,13 +421,7 @@ impl From<RopeAppendNormedBindingSet> for Vec<Binding> {
                 slot: s.v_in.get(),
                 binding_index: 2,
             },
-            Binding::Weight {
-                kind: WeightBundleKind::CosSin,
-                which: WeightTensor::Weight,
-                layer: s.layer,
-                locator: s.cos_sin_locator,
-                binding_index: 3,
-            },
+            s.cos_sin.binding(s.layer, 3),
             Binding::Runtime {
                 kind: RuntimeBindingKind::Positions,
                 binding_index: 4,
@@ -437,81 +439,8 @@ impl From<RopeAppendNormedBindingSet> for Vec<Binding> {
                 kind: RuntimeBindingKind::KvCacheV { layer: s.layer },
                 binding_index: 7,
             },
-            Binding::Weight {
-                kind: WeightBundleKind::RmsNorm,
-                which: WeightTensor::Weight,
-                layer: s.layer,
-                locator: s.q_gains_locator,
-                binding_index: 8,
-            },
-            Binding::Weight {
-                kind: WeightBundleKind::RmsNorm,
-                which: WeightTensor::Weight,
-                layer: s.layer,
-                locator: s.k_gains_locator,
-                binding_index: 9,
-            },
-        ]
-    }
-}
-
-// ── FusedQkvRopeCache (dense BF16/F16) ─────────────────────────────
-
-/// Bindings for `KernelId::FusedQkvRopeCache`. Eight slots:
-/// 0 = Q out (arena), 1 = input (arena),
-/// 2 = packed \[Q|K|V\] weight (LinearLayer, weight),
-/// 3 = CosSin\[layer\] (weight), 4 = Positions (runtime),
-/// 5 = SlotMapping (runtime), 6 = KvCacheK\[layer\] (runtime),
-/// 7 = KvCacheV\[layer\] (runtime).
-pub struct FusedQkvRopeCacheBindingSet {
-    pub q_out: ArenaSlotIdx,
-    pub input: ArenaSlotIdx,
-    pub qkv_locator: WeightLocator,
-    pub cos_sin_locator: WeightLocator,
-    pub layer: LayerId,
-}
-
-impl From<FusedQkvRopeCacheBindingSet> for Vec<Binding> {
-    fn from(s: FusedQkvRopeCacheBindingSet) -> Vec<Binding> {
-        vec![
-            Binding::ArenaSlot {
-                slot: s.q_out.get(),
-                binding_index: 0,
-            },
-            Binding::ArenaSlot {
-                slot: s.input.get(),
-                binding_index: 1,
-            },
-            Binding::Weight {
-                kind: WeightBundleKind::LinearLayer,
-                which: WeightTensor::Weight,
-                layer: s.layer,
-                locator: s.qkv_locator,
-                binding_index: 2,
-            },
-            Binding::Weight {
-                kind: WeightBundleKind::CosSin,
-                which: WeightTensor::Weight,
-                layer: s.layer,
-                locator: s.cos_sin_locator,
-                binding_index: 3,
-            },
-            Binding::Runtime {
-                kind: RuntimeBindingKind::Positions,
-                binding_index: 4,
-            },
-            Binding::Runtime {
-                kind: RuntimeBindingKind::SlotMapping { layer: s.layer },
-                binding_index: 5,
-            },
-            Binding::Runtime {
-                kind: RuntimeBindingKind::KvCacheK { layer: s.layer },
-                binding_index: 6,
-            },
-            Binding::Runtime {
-                kind: RuntimeBindingKind::KvCacheV { layer: s.layer },
-                binding_index: 7,
-            },
+            source(s.q_gains, WeightTensor::Weight, s.layer, 8),
+            source(s.k_gains, WeightTensor::Weight, s.layer, 9),
         ]
     }
 }

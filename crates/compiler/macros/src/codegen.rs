@@ -6172,11 +6172,6 @@ fn emit_weight_accessors_impl(
         (CanonicalLowered, u32, u32, u32, SlotMap),
     >,
     variant_name: &str,
-    // Spans rope-on-read: whether this arch has a global (`rotary`) and/or
-    // sliding (`rotary_local`) RoPE cache, so `rope_on_read_cos_sin` can be
-    // generated to return the right one by layer class.
-    uses_rotary: bool,
-    uses_rotary_local: bool,
 ) -> TokenStream {
     use crate::weight_vocab::WeightKind;
 
@@ -6454,42 +6449,6 @@ fn emit_weight_accessors_impl(
     let gemma_router = method_emit_kind(&crate::weight_vocab::WeightKind::GemmaRouter);
     let gemma_switch_glu = method_emit_kind(&crate::weight_vocab::WeightKind::GemmaSwitchGlu);
     let cos_sin = method_emit_kind(&crate::weight_vocab::WeightKind::CosSin);
-    // Spans rope-on-read: resolve cos/sin by layer CLASS (global `rotary`
-    // vs sliding `rotary_local`), not by op operand. Emitted only when the
-    // arch has a rotary cache; otherwise the trait default (unreachable)
-    // stands and is never called (no spans binding without ROPE_ON_READ).
-    let rope_on_read_cos_sin: TokenStream = if uses_rotary {
-        // With a sliding rotary, the global (`rotary`) and local
-        // (`rotary_local`) caches differ, so dispatch on the layer class.
-        // Without one, both classes resolve to the global cache — return it
-        // directly (and mark `is_global` unused) rather than emit an `if`
-        // with two identical arms. `GpuTensor` is `Copy`, so no `.clone()`.
-        let (is_global_param, body) = if uses_rotary_local {
-            (
-                quote! { is_global },
-                quote! {
-                    if is_global {
-                        self.rotary.cos_sin_cache
-                    } else {
-                        self.rotary_local.cos_sin_cache
-                    }
-                },
-            )
-        } else {
-            (quote! { _is_global }, quote! { self.rotary.cos_sin_cache })
-        };
-        quote! {
-            fn rope_on_read_cos_sin(
-                &self,
-                #is_global_param: bool,
-                _layer: u32,
-            ) -> crate::__gpu::tensor::GpuTensor {
-                #body
-            }
-        }
-    } else {
-        quote! {}
-    };
     // `affine_quant_embedding_at` is gated `#[cfg(feature = "metal")]`
     // on the trait so we must emit the cfg attribute together with the
     // method body, or skip both when the arch never resolves an
@@ -6566,7 +6525,6 @@ fn emit_weight_accessors_impl(
             #gemma_router
             #gemma_switch_glu
             #cos_sin
-            #rope_on_read_cos_sin
             #affine_quant_embedding
         }
     }
@@ -7735,6 +7693,7 @@ fn emit_canonical_params_impl(
             global_rot_dim,
             rope_on_read: uses_rotary,
             rope_proportional,
+            mrope: model.mrope_section.is_some(),
             max_blocks_per_seq: model
                 .bounds
                 .get("max_blocks_per_seq")
@@ -8388,10 +8347,11 @@ fn emit_superdsc_wiring(
     // ══════════════════════════════════════════════════════════════════════════════════════════
     {
         use crate::to_wavefront::SourceBinding as SB;
-        use scratchy_subtile::lower::{InputRef, LoweredOp};
+        use scratchy_subtile::lower::InputRef;
+        use scratchy_subtile::subtile_ir::SubOp;
         let mut bad: Vec<String> = Vec::new();
         for od in &lwd.input.ops {
-            let LoweredOp::Gemm { n, .. } = od.op else {
+            let SubOp::MatmulTile { n, .. } = od.op else {
                 continue;
             };
             let Some(InputRef::Ext(e)) = od.inputs.get(1) else {
@@ -9177,7 +9137,7 @@ fn dump_wavefront_mega(
             if l.input.ops.iter().any(|od| {
                 matches!(
                     od.op,
-                    scratchy_subtile::lower::LoweredOp::Gemm {
+                    scratchy_subtile::subtile_ir::SubOp::MatmulTile {
                         weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
                         ..
                     }
@@ -9918,11 +9878,12 @@ fn dump_wavefront_mega(
                 man.push_str("],\"sources\":[");
                 {
                     use crate::to_wavefront::SourceBinding;
-                    use scratchy_subtile::lower::{InputRef, LoweredOp};
+                    use scratchy_subtile::lower::InputRef;
+                    use scratchy_subtile::subtile_ir::SubOp;
                     let mut gemm_weight: std::collections::HashSet<usize> =
                         std::collections::HashSet::new();
                     for od in &fused.ops {
-                        if matches!(od.op, LoweredOp::Gemm { .. })
+                        if matches!(od.op, SubOp::MatmulTile { .. })
                             && let Some(InputRef::Ext(e)) = od.inputs.get(1)
                         {
                             gemm_weight.insert(*e);
@@ -11367,19 +11328,11 @@ pub fn emit_model(
                         backbone: crate::interpreter_codegen::LoweredBucket {
                             instances: Vec::new(),
                             weight_slots: Vec::new(),
-                            #[cfg(any(feature = "metal", feature = "spyre"))]
-                            num_slots: 0,
-                            #[cfg(any(feature = "metal", feature = "spyre"))]
-                            final_slot: 0,
                             barriers: Vec::new(),
                         },
                         lm_head: crate::interpreter_codegen::LoweredBucket {
                             instances: Vec::new(),
                             weight_slots: Vec::new(),
-                            #[cfg(any(feature = "metal", feature = "spyre"))]
-                            num_slots: 0,
-                            #[cfg(any(feature = "metal", feature = "spyre"))]
-                            final_slot: 0,
                             barriers: Vec::new(),
                         },
                     },
@@ -11451,7 +11404,6 @@ pub fn emit_model(
             skip_subgraph,
             &protected_bb,
             &mut arch_opcodes,
-            backbone_out,
             &slots,
         );
 
@@ -11478,10 +11430,6 @@ pub fn emit_model(
                         instances: Vec::new(),
                         barriers: Vec::new(),
                         weight_slots: Vec::new(),
-                        #[cfg(any(feature = "metal", feature = "spyre"))]
-                        num_slots,
-                        #[cfg(any(feature = "metal", feature = "spyre"))]
-                        final_slot: terminal_slot,
                     }
                 } else {
                     let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
@@ -11523,10 +11471,6 @@ pub fn emit_model(
                         // claimed tiles.
                         barriers: vec![true; n],
                         weight_slots: term_weight_slots,
-                        #[cfg(any(feature = "metal", feature = "spyre"))]
-                        num_slots,
-                        #[cfg(any(feature = "metal", feature = "spyre"))]
-                        final_slot: terminal_slot,
                     }
                 }
             }
@@ -11534,10 +11478,6 @@ pub fn emit_model(
                 instances: Vec::new(),
                 barriers: Vec::new(),
                 weight_slots: Vec::new(),
-                #[cfg(any(feature = "metal", feature = "spyre"))]
-                num_slots,
-                #[cfg(any(feature = "metal", feature = "spyre"))]
-                final_slot: terminal_slot,
             },
         };
 
@@ -11688,13 +11628,13 @@ pub fn emit_model(
             let bb_barriers_ident = bucket_static_ident("BACKBONE_BARRIERS_M", *wp);
             let lh_barriers_ident = bucket_static_ident("LM_HEAD_BARRIERS_M", *wp);
             static_slices.push(
-                scratchy_target_metal_compiler::from_subtile::emit_bucket_barriers_static(
+                scratchy_target_metal_compiler::static_tape::emit_bucket_barriers_static(
                     &bb_barriers_ident,
                     &lowered.backbone.barriers,
                 ),
             );
             static_slices.push(
-                scratchy_target_metal_compiler::from_subtile::emit_bucket_barriers_static(
+                scratchy_target_metal_compiler::static_tape::emit_bucket_barriers_static(
                     &lh_barriers_ident,
                     &lowered.lm_head.barriers,
                 ),
@@ -11754,17 +11694,6 @@ pub fn emit_model(
     // `pub const KTIR_BUNDLE` for the per-model module; empty otherwise.
     let mut ktir_bundle_const = proc_macro2::TokenStream::new();
 
-    // Canonic­als the m2 front-end swap refused for want of a metal kernel
-    // (dense MoE today: `NoMetalRealization`). The bucket-table emission
-    // bakes these NO tape variants so `MetalWorkerPool::for_buckets`
-    // refuses at load (`BucketLower`) — the documented contract. Without
-    // this set the bake would lower the empty placeholder stream into
-    // VALID empty-command tapes, the forward would run a no-op dispatch,
-    // and the generated tail would die on `arena[terminal_slot]` with an
-    // inscrutable index-OOB.
-    #[cfg(feature = "metal")]
-    let mut metal_refused_buckets: HashSet<crate::assignment::WorkloadPoint> = HashSet::new();
-
     // PD-wavefront macro-emission (env-gated, diagnostic + the const builder).
     // HERE — not in the pre-emit drive — because the decode bucket's
     // `weight_slots` (the real weight-locator source) only exists post-lowering
@@ -11775,913 +11704,170 @@ pub fn emit_model(
     // fused KTIR/SuperDSC bundle. Plain cuda/metal dispatch per-op and skip
     // this; the expensive lowering + its hard panic on un-lowerable models
     // must not run for them.
-    // M2 equality harness: build the decode instruction stream from the
-    // SHARED subtile tape and diff it against the instruction-selection
-    // stream. Iteration scaffold (M2_SCOUT env); becomes a hard assert
-    // at the flip.
+
+    // THE METAL FRONT END. Each decode canonical is lowered from the SHARED subtile tape by
+    // `scratchy_target_metal_compiler::canonical::lower_canonical` — metal's orchestration lives in
+    // the target's compiler crate. This computes the facts only the macro can (the weight table's
+    // paths, the embed's storage, the MLP form, the per-module MoE widths), makes the one call, and
+    // writes back what the bucket table, the arena statics, the accessor table and the bake read.
     #[cfg(feature = "metal")]
-    // THE FRONT-END SWAP (M2): for every canonical this arch can bridge,
-    // the SHARED subtile tape is the producer of the metal instruction
-    // stream, barriers, and accessor weight slots. During the rollout,
-    // instruction selection still runs and a HARD ASSERT proves the
-    // bridge byte-identical; a refusal keeps that canonical on
-    // instruction selection and is logged loudly — the rollout
-    // frontier, not a silent fallback.
+    let mut metal_steps: BTreeMap<
+        crate::assignment::WorkloadPoint,
+        scratchy_target_metal::tape::step::MetalStepTape,
+    > = BTreeMap::new();
+    // THE MODEL'S SOURCE MANIFEST: every weight family its tapes bind, interned as the canonicals
+    // lower, plus the class rotary tables rope-on-read binds (the same caches the Weights struct
+    // declares: `rotary`, and `rotary_local` on a dual-rotary arch).
     #[cfg(feature = "metal")]
+    let mut metal_sources = scratchy_target_metal_compiler::canonical::SourceManifest::default();
+    #[cfg(feature = "metal")]
+    let metal_rotary = fuf_uses_rotary(fuf).then(|| {
+        let local = fuf.nodes.iter().any(|n| {
+            n.inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    crate::fuf::FufInput::Extern {
+                        kind: crate::classified::ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        metal_sources.rotary_tables(local)
+    });
+    #[cfg(feature = "metal")]
+    for (canonical, (_, ns_field, bb_slot_field, term_field, slots_dec)) in
+        canonical_lowered.iter_mut()
     {
-        // Register THE shape table for every bridge variant. The impls'
-        // own registrations already happened during lower_bucket;
-        // ArchOpcodes panics on any disagreement — the table is proven
-        // identical at every expansion until the impls die (M2b).
-        for name in crate::opcode_shapes::BRIDGE_VARIANTS {
-            if let Some(shape) = crate::opcode_shapes::bridge_shape(name) {
-                arch_opcodes.register(shape);
-            }
-        }
-        for (canonical, (cl, ns_field, bb_slot_field, term_field, slots_dec)) in
-            canonical_lowered.iter_mut()
-        {
-            let m = canonical.num_tokens;
-            // Key the assignment by the canonical's OWN workload point —
-            // get_nt(m) missed multimodal canonicals entirely (qwen2.5-VL
-            // never entered this loop: a SILENT skip).
-            // Pilots run tape-authoritative: no assignment needed (and
-            // once the per-arch solve skip lands, none exists).
-            // A pilot runs tape-authoritative: passing the (now empty)
-            // assignment would make the walk's coverage check reject
-            // every tile and leave the canonical on placeholders — a
-            // SILENT empty arena, which is how this surfaced.
-            let asn_opt = if tape_pilot_arch {
-                None
-            } else {
-                sfufs.per_workload.get(canonical)
-            };
-            if asn_opt.is_none() && !tape_pilot_arch {
-                eprintln!(
-                    "[m2-swap] {} m={m}: NO assignment for canonical workload point — \
-                     staying on instruction selection",
-                    model.source_stem
+        use crate::weight_bindings::{EmbedStorage, MlpPacking, WeightAbi};
+        use scratchy_target_metal::tape::step as st;
+        use scratchy_target_metal_compiler::canonical as mc3;
+        let (m, stem) = (canonical.num_tokens, &model.source_stem);
+        let bounds = bounds_for_wp(model, *canonical, tp_world_size);
+        let prefix =
+            crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
+        let l = match crate::to_wavefront::lower_decode_to_wavefront(
+            fuf, None, inferred, &bounds, model, prefix, m as u32,
+        ) {
+            Ok(l) => l,
+            // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
+            // so the bake bakes NO variants and the pool refuses at load. Anything else has no
+            // fallback.
+            Err(e) => {
+                assert!(
+                    e.is_no_metal_realization(),
+                    "[m2-flip] {stem} m={m}: the shared tape refused a DECLARED pilot ({e:?}) — \
+                     with the solve off there is no fallback",
                 );
+                eprintln!("[m2-eq] {stem} m={m} wavefront REFUSED: {e}");
                 continue;
             }
-            {
-                // The scheduler's wave order, flattened to a per-tile
-                // emission rank — the bridge emits in this order.
-                let mut wave_rank: std::collections::HashMap<u32, usize> =
-                    std::collections::HashMap::new();
-                // The loop AND the assignment must come from the SAME
-                // workload point — the canonical's (mixing get_nt's
-                // sk-variant assignment with the canonical's loop gave
-                // ranks from two different schedules).
-                if let (Some(loop_ir), Some(c_asn)) = (
-                    loops.per_workload.get(canonical),
-                    sfufs.per_workload.get(canonical),
-                ) {
-                    let mut r = 0usize;
-                    for wave in &loop_ir.waves {
-                        for (sg, _) in &wave.subgraphs {
-                            for t in c_asn.tiles_in_subgraph(*sg) {
-                                wave_rank.insert(t.0, r);
-                            }
-                            r += 1;
-                        }
-                    }
-                }
-                let decode_bounds = bounds_for_wp(model, *canonical, tp_world_size);
-                match crate::to_wavefront::lower_decode_to_wavefront(
-                    fuf,
-                    asn_opt,
-                    inferred,
-                    &decode_bounds,
-                    model,
-                    crate::to_wavefront::PrefixCapacity::new(
-                        std::num::NonZeroU32::new(8192).unwrap(),
-                    ),
-                    m as u32,
-                ) {
-                    Ok(l) => {
-                        let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
-                        // Real derivations — the SAME sources instruction
-                        // selection read: the embed tile's weight storage
-                        // (FUF), and the tape's own gemm weight form.
-                        let embed_quant = fuf.nodes.iter().find_map(|n| {
-                            if n.op != OpKind::Embed {
-                                return None;
-                            }
-                            match crate::weight_vocab::weight_storage_of(n) {
-                                Some(crate::quantization::StorageFormat::Affine {
-                                    group_size,
-                                    bits,
-                                }) => Some((*group_size, *bits)),
-                                _ => None,
-                            }
-                        });
-                        let fused_mlp = l.input.ops.iter().all(|od| {
-                            !matches!(
-                                od.op,
-                                scratchy_subtile::lower::LoweredOp::Gemm {
-                                    weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
-                                    ..
-                                }
-                            )
-                        });
-                        // Embed base: the weight table entry the embed
-                        // accessor uses (single-segment path; llama-class
-                        // arches name it embed_tokens).
-                        let embed_base = (0..)
-                            .map(crate::classified::WeightId)
-                            .take_while(|id| (id.0 as usize) < program.weights.len())
-                            .map(|id| program.weights.path(id).join("_"))
-                            .find(|p| p.contains("embed"))
-                            .unwrap_or_else(|| "embed_tokens".into());
-                        // The metal lowering takes DATA, not the compiler's weight types: the
-                        // `WeightTable`/`Program`/`ModelParams` are this crate's, and handing
-                        // them across would drag the classified-weights layer into the target.
-                        let weight_paths: Vec<Vec<String>> = (0..program.weights.len())
-                            .map(|i| {
-                                program
-                                    .weights
-                                    .path(crate::classified::WeightId(i as u32))
-                                    .to_vec()
-                            })
-                            .collect();
-                        let dsl_shared_expert_bases: Vec<String> = weight_paths
-                            .iter()
-                            .filter_map(|p| p.first().cloned())
-                            .collect::<std::collections::BTreeSet<_>>()
-                            .into_iter()
-                            .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
-                            .collect();
-                        let facts = scratchy_target_metal_compiler::from_subtile::StreamFacts {
-                            weight_paths: &weight_paths,
-                            dsl_shared_expert_bases: &dsl_shared_expert_bases,
-                            wave_rank: &wave_rank,
-                            embed_base,
-                            hidden_size: mc.hidden_size as u32,
-                            embed_quant,
-                            fused_mlp,
-                            intermediate_size: mc.intermediate_size as u32,
-                        };
-                        // M2b step-2 FLIP: pilot arches take their order,
-                        // groups, and coloring from the TAPE (wave levels +
-                        // tape_slot_map). Gate = per-arch runtime bit-exact
-                        // output + TTFT/ITL parity vs the pre-flip build
-                        // (PLAN e10642b78) — a tape-scheduled stream is
-                        // legitimately not byte-equal to the solver's, so
-                        // the equality assert applies only to non-pilots.
-                        // A pilot refusal is a build defect, not a fallback.
-                        let plan =
-                            scratchy_target_metal_compiler::from_subtile::fold_plan(&l, &facts);
-                        // ⭐ THE ORDER COMES OFF THE SHARED `SubtileTape` — the same object
-                        // spyre lowers, built by the same `lower_region`/`lower_dag_to_tape`,
-                        // read through `scratchy_target_metal::from_tape`. It replaces
-                        // `wave_schedule::wave_levels`, which was metal's own re-derivation
-                        // of a schedule over the pre-SubtileIR op list.
-                        //
-                        // The COLORING stays metal's: `tape_slot_map` knows which kernels
-                        // write over an operand in place and that the embed is colour 0.
-                        // That is target ABI, an INPUT to a shared pass — the tape's SSA
-                        // alloc/free cannot express it, and using it would hand an in-place
-                        // kernel a buffer another op still owns.
-                        let tp = scratchy_target_metal_compiler::tape_program::tape_program(
-                            &l,
-                            &model.source_stem,
-                            m,
-                        );
-                        let (lv, tape_items, unrolled_items, layer_classes) =
-                            (tp.levels, tp.rolled, tp.unrolled, tp.layer_rolled);
-                        let (tape_sm, tape_ns, tape_fs) =
-                            scratchy_target_metal_compiler::from_subtile::tape_slot_map(
-                                &l, &plan, &lv,
-                            )
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "[m2-flip] {} m={m}: tape colorer refused a \
-                                         DECLARED pilot: {e}",
-                                    model.source_stem
-                                )
-                            });
-                        match scratchy_target_metal_compiler::from_subtile::decode_instruction_stream(
-                            &l,
-                            &tape_sm,
-                            &facts,
-                            &tape_items,
-                        ) {
-                            Ok(bridged) => {
-                                // ⛔ THE MoE BIT REPACK, HOISTED OUT OF THE BRIDGE. It needs
-                                // the weight `Program` + `ModelParams`, which are this
-                                // crate's, so the metal lowering can no longer run it
-                                // itself. Dropping it would silently lose the OptiQ
-                                // per-projection widths packed into `bits` on MoE arches.
-                                let mut bridged = bridged;
-                                bridged.backbone =
-                                    crate::interpreter_codegen::repack_moe_expert_bits(
-                                        bridged.backbone,
-                                        program,
-                                        model,
-                                    );
-                                bridged.lm_head =
-                                    crate::interpreter_codegen::repack_moe_expert_bits(
-                                        bridged.lm_head,
-                                        program,
-                                        model,
-                                    );
-                                // One hazard replay over backbone ++ lm
-                                // rows: the walk is prefix-deterministic,
-                                // so the backbone flags are the prefix.
-                                let head_start = bridged.backbone_sigs.len();
-                                let mut all_sigs = bridged.backbone_sigs;
-                                all_sigs.extend(bridged.lm_head_sigs);
-                                let all_flags =
-                                    scratchy_target_metal_compiler::from_subtile::barrier_flags_with(
-                                        &all_sigs, false,
-                                    );
-                                let bb_barriers = all_flags[..head_start].to_vec();
-                                // Terminal slots come from the TAPE's
-                                // result chain, not from hazard
-                                // signatures: the logits slot is the
-                                // result op's color, and the backbone's
-                                // output is the lm_head Gemm's input.
-                                // (Reading the last signature's first
-                                // write breaks on arches whose lm_head
-                                // slice carries a trailing op — granite's
-                                // logits scaling — which emitted an
-                                // empty completion.)
-                                let lm_final = tape_fs;
-                                let bb_final = {
-                                    let mut cur = l.input.result;
-                                    let mut hops = 0;
-                                    loop {
-                                        hops += 1;
-                                        assert!(hops < 64, "lm_head chain walk runaway");
-                                        let od = &l.input.ops[cur];
-                                        let feed = od.inputs.iter().find_map(|r| match r {
-                                            scratchy_subtile::lower::InputRef::Op(j) => {
-                                                Some(*j)
-                                            }
-                                            _ => None,
-                                        });
-                                        match (&od.op, feed) {
-                                            (
-                                                scratchy_subtile::lower::LoweredOp::Gemm {
-                                                    ..
-                                                },
-                                                Some(j),
-                                            ) => {
-                                                break l.op_tiles[j]
-                                                    .map(|(t, sl)| {
-                                                        tape_sm.of(crate::fuf::TileId(t), sl)
-                                                    })
-                                                    .unwrap_or(tape_fs);
-                                            }
-                                            (_, Some(j)) => cur = j,
-                                            _ => break tape_fs,
-                                        }
-                                    }
-                                };
-                                let acc_instances: Vec<scratchy_forward_compiler::Instruction> =
-                                    bridged
-                                        .backbone
-                                        .iter()
-                                        .chain(bridged.lm_head.iter())
-                                        .copied()
-                                        .collect();
-                                let acc_slots: Vec<Vec<crate::weight_vocab::WeightSlot>> =
-                                    bridged
-                                        .backbone_weight_slots
-                                        .iter()
-                                        .chain(bridged.lm_head_weight_slots.iter())
-                                        .cloned()
-                                        .collect();
-                                let mut bridge_bucket =
-                                    crate::interpreter_codegen::LoweredBucket {
-                                        instances: bridged.backbone,
-                                        weight_slots: bridged.backbone_weight_slots,
-                                        num_slots: tape_ns,
-                                        final_slot: bb_final,
-                                        barriers: bb_barriers,
-                                    };
-                                // ⛔ NOTHING COMPRESSES THIS STREAM. It was emitted from the
-                                // ROLLED tape, so the layer loop is already in it as an
-                                // `Instruction::Loop`. Running a repeating-run search over
-                                // it would be the second re-roll this removes.
-                                //
-                                // ⭐ SO THE CHECK CHANGED, AND GOT STRONGER. It used to ask
-                                // "did compressing this stream preserve it?" — meaningless
-                                // now that nothing compresses it. It now asks the question
-                                // that actually matters: does the ROLLED emission expand to
-                                // exactly the UNROLLED one? That is the claim the re-roll
-                                // makes, and it is checked against a second emission from
-                                // the un-rolled tape rather than against itself.
-                                let mut unrolled = scratchy_target_metal_compiler::from_subtile::decode_instruction_stream(
-                                    &l,
-                                    &tape_sm,
-                                    &facts,
-                                    &unrolled_items,
-                                )
-                                .unwrap_or_else(|e| {
-                                    panic!(
-                                        "[m2-flip] {} m={m}: the UNROLLED tape refused: {e}",
-                                        model.source_stem
-                                    )
-                                });
-                                // Same MoE bit repack as `bridged` above — this is a
-                                // SEPARATE decode of the un-rolled tape, so it needs its
-                                // own repack or the "NO cut rolls" fallback below hands
-                                // the final lowering un-packed `bits` (OptiQ models only).
-                                unrolled.backbone = crate::interpreter_codegen::repack_moe_expert_bits(
-                                    unrolled.backbone,
-                                    program,
-                                    model,
-                                );
-                                unrolled.lm_head = crate::interpreter_codegen::repack_moe_expert_bits(
-                                    unrolled.lm_head,
-                                    program,
-                                    model,
-                                );
-                                // ⭐ THE ROLL IS KEPT ONLY IF IT IS PROVABLY THE SAME
-                                // PROGRAM, AND THE CUT IS MOVED UNTIL IT IS.
-                                //
-                                // The rolled emission must expand — instructions AND
-                                // barrier flags — to the emission from the un-rolled tape.
-                                // Where it does not, the body was cut across a fold: metal
-                                // merges a layer's residual `Add` with the NEXT layer's
-                                // norm into one `FusedAddRmsNorm`, so a cut between layers
-                                // splits that dispatch. The run is periodic, so any offset
-                                // is a legal body — rotate the cut and re-check.
-                                //
-                                // ⛔ NOT AN ARCH LIST. The PROOF decides, per model, per
-                                // bucket. granite / gemma-3 / micro-g3.3 are the ones that
-                                // need a rotation today; nothing names them.
-                                let unrolled_barriers = {
-                                    let mut sigs = unrolled.backbone_sigs.clone();
-                                    sigs.extend(unrolled.lm_head_sigs.clone());
-                                    let flags =
-                                        scratchy_target_metal_compiler::from_subtile::barrier_flags_with(
-                                            &sigs, false,
-                                        );
-                                    flags[..unrolled.backbone_sigs.len()].to_vec()
-                                };
-                                let proof =
-                                    |bucket: &crate::interpreter_codegen::LoweredBucket| {
-                                        crate::interpreter_codegen::verify_loop_compression(
-                                        &unrolled.backbone,
-                                        &bucket.instances,
-                                        &arch_opcodes,
-                                        "layer",
-                                    )
-                                    .and_then(|()| {
-                                        crate::interpreter_codegen::verify_loop_compression_barriers(
-                                            &unrolled_barriers,
-                                            &bucket.instances,
-                                            &bucket.barriers,
-                                        )
-                                    })
-                                    };
-                                // One cut, decoded and proven: the candidate bucket, or why not.
-                                let try_cut = |items: &[scratchy_target_metal::from_tape::TapeItem]| {
-                                    let b = scratchy_target_metal_compiler::from_subtile::decode_instruction_stream(
-                                        &l, &tape_sm, &facts, items,
-                                    )?;
-                                    let head = b.backbone_sigs.len();
-                                    let mut sigs = b.backbone_sigs.clone();
-                                    sigs.extend(b.lm_head_sigs.clone());
-                                    let flags =
-                                        scratchy_target_metal_compiler::from_subtile::barrier_flags_with(
-                                            &sigs, false,
-                                        );
-                                    let cand = crate::interpreter_codegen::LoweredBucket {
-                                        instances: b.backbone,
-                                        weight_slots: b.backbone_weight_slots,
-                                        num_slots: tape_ns,
-                                        final_slot: bb_final,
-                                        barriers: flags[..head].to_vec(),
-                                    };
-                                    proof(&cand).map(|()| cand)
-                                };
-                                let mut rolled_at: Option<String> = None;
-                                // ⛔ ONE ERROR PER CUT, NOT JUST CUT 0's. The refusal used to
-                                // report `proof(&bridge_bucket).err()` — always peel 0's — so
-                                // every deeper cut failed invisibly. gemma-3 was read for a
-                                // whole PR as a `FusedAddRmsNormWithOffset` fold problem on that
-                                // evidence, when peel 0 was the ONLY cut failing that way and
-                                // peels 1..3 were failing on a rope flag the log never showed.
-                                let mut cut_errs: Vec<String> = Vec::new();
-                                match proof(&bridge_bucket) {
-                                    Ok(()) => rolled_at = Some("peel=0".into()),
-                                    Err(e) => cut_errs.push(format!("peel=0: {e}")),
-                                }
-                                // ⭐ EVERY LAYER BY ITS CLASS — kept when it proves and is shorter
-                                // than the shared tape's own roll. Consecutive layers of one class
-                                // are the same program, so they loop: gemma-3's six-layer `SSSSSG`
-                                // cell becomes one sliding body plus one global, and a
-                                // mixed-precision model — whose IDENTICAL cells are too few for
-                                // the whole-cell cut to find — still rolls every run of layers
-                                // that match (OptiQ gemma-4: 555 rows to 251).
-                                if let Some(items) = &layer_classes {
-                                    match try_cut(items) {
-                                        Ok(cand)
-                                            if rolled_at.is_none()
-                                                || cand.instances.len()
-                                                    < bridge_bucket.instances.len() =>
-                                        {
-                                            bridge_bucket = cand;
-                                            rolled_at = Some("layer-class".into());
-                                        }
-                                        Ok(_) => {}
-                                        Err(e) => cut_errs.push(format!("layer-class: {e}")),
-                                    }
-                                }
-                                if rolled_at.is_none() {
-                                    // PEEL leading iterations into the prologue. The body's
-                                    // source ops decide how metal folds them, and layer 0's
-                                    // norm has no residual add to fuse with — so a body
-                                    // drawn from layer 0 emits an unfused norm for every
-                                    // layer. Peeling makes the body a representative middle
-                                    // layer, whole cell at a time — which is what gemma-4-31b
-                                    // needs: its arena is not periodic at one layer, so the
-                                    // per-layer cut above does not prove there.
-                                    for peel in 1..4u32 {
-                                        let Some(rot) = scratchy_target_metal::from_tape::roll_at(
-                                            &unrolled_items,
-                                            &tape_items,
-                                            peel,
-                                        ) else {
-                                            continue;
-                                        };
-                                        match try_cut(&rot) {
-                                            Ok(cand) => {
-                                                bridge_bucket = cand;
-                                                rolled_at = Some(format!("peel={peel}"));
-                                                break;
-                                            }
-                                            Err(e) => cut_errs.push(format!("peel={peel}: {e}")),
-                                        }
-                                    }
-                                }
-                                match rolled_at {
-                                    Some(cut) => eprintln!(
-                                        "[m2-roll] {} m={m}: rolled {cut} ({} rows \
-                                         from {})",
-                                        model.source_stem,
-                                        bridge_bucket.instances.len(),
-                                        unrolled.backbone.len(),
-                                    ),
-                                    None => {
-                                        eprintln!(
-                                            "[m2-roll] {} m={m}: NO cut rolls — emitting the \
-                                             un-rolled tape. {}",
-                                            model.source_stem,
-                                            cut_errs.join(" | "),
-                                        );
-                                        bridge_bucket.instances = unrolled.backbone.clone();
-                                        bridge_bucket.weight_slots =
-                                            unrolled.backbone_weight_slots.clone();
-                                        bridge_bucket.barriers = unrolled_barriers.clone();
-                                    }
-                                }
-                                let lm_barriers: Vec<bool> = all_flags[head_start..].to_vec();
-                                eprintln!(
-                                    "[m2-flip] {} m={m}: TAPE-SCHEDULED stream ACTIVE \
-                                     ({} instr, slots={tape_ns} final={tape_fs})",
-                                    model.source_stem,
-                                    bridge_bucket.instances.len(),
-                                );
-                                // M2b: every accessor field the tape
-                                // implies must exist in what
-                                // instruction selection's
-                                // `required_weights` walk produces —
-                                // the gate that lets the Weights struct
-                                // (and with it the solve) come off the
-                                // solver.
-                                {
-                                    let tape_names =
-                                        scratchy_target_metal_compiler::from_subtile::tape_accessor_names(
-                                            &acc_slots,
-                                        );
-                                    // Instruction-selection accessors are
-                                    // per-(weight, unroll index) —
-                                    // `input_layernorm_0..N`; the tape's
-                                    // slot bases are layer-free (the
-                                    // layer is a runtime arg of
-                                    // `<kind>_at`). Compare on the
-                                    // FAMILY: strip the trailing
-                                    // numeral, which is exactly what
-                                    // `split_base_layer` does when the
-                                    // bridge derives a base.
-                                    let solve_ran = !sfufs
-                                        .per_workload
-                                        .values()
-                                        .all(|a| a.impls.is_empty());
-                                    let isel_names: std::collections::BTreeSet<String> =
-                                        match collect_accessors(program, fuf, sfufs, lib, model)
-                                        {
-                                            Ok(accs) => accs
-                                                .iter()
-                                                .map(|a| {
-                                                    crate::codegen::split_base_layer(
-                                                        &a.name.to_string(),
-                                                    )
-                                                    .0
-                                                })
-                                                .collect(),
-                                            Err(_) => Default::default(),
-                                        };
-                                    // The rotary caches are NOT weight
-                                    // inputs in the FUF — instruction
-                                    // selection carries them as a
-                                    // side-channel flag into the Weights
-                                    // struct (`wa_uses_rotary`), while
-                                    // the tape declares them uniformly
-                                    // as `cos_sin_at` slots. Union them
-                                    // in so the comparison is over the
-                                    // same universe.
-                                    let mut isel_names = isel_names;
-                                    if fuf_uses_rotary(fuf) {
-                                        isel_names.insert("rotary".to_string());
-                                    }
-                                    // `rotary_local` exists only for the
-                                    // dual-theta classes (a RotaryLocal
-                                    // extern on some layer's rope) —
-                                    // the same predicate the Weights
-                                    // struct emission uses.
-                                    if fuf.nodes.iter().any(|n| {
-                                        n.inputs.iter().any(|i| {
-                                            matches!(
-                                                i,
-                                                crate::fuf::FufInput::Extern {
-                                                    kind:
-                                                        crate::classified::ExternKind::RotaryLocal,
-                                                    ..
-                                                }
-                                            )
-                                        })
-                                    }) {
-                                        isel_names.insert("rotary_local".to_string());
-                                    }
-                                    let missing: Vec<_> = if solve_ran {
-                                        tape_names.difference(&isel_names).collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    assert!(
-                                        missing.is_empty(),
-                                        "[m2-acc] {} m={m}: tape implies accessor families \
-                                         the instruction-selection set lacks: {missing:?} \
-                                         (isel families: {:?})",
-                                        model.source_stem,
-                                        isel_names,
-                                    );
-                                    let isel_only: Vec<_> = if solve_ran {
-                                        isel_names.difference(&tape_names).collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    assert!(
-                                        isel_only.is_empty(),
-                                        "[m2-acc] {} m={m}: instruction selection declares \
-                                         accessor families the tape does not: {isel_only:?}",
-                                        model.source_stem,
-                                    );
-                                    // Group signature: base → (type,
-                                    // layer coverage). This is what the
-                                    // Weights STRUCT is built from
-                                    // (Unindexed / LayeredContiguous /
-                                    // LayeredSparse + field type), so
-                                    // agreement here is the property the
-                                    // tape needs to emit the struct.
-                                    let layer_idx: std::collections::HashMap<String, usize> =
-                                        arch_opcodes
-                                            .iter()
-                                            .filter_map(|(name, shape)| {
-                                                shape
-                                                    .fields
-                                                    .iter()
-                                                    .position(|(f, _)| f == "layer")
-                                                    .map(|i| (name.clone(), i))
-                                            })
-                                            .collect();
-                                    let layer_of =
-                                        |ins: &scratchy_forward_compiler::Instruction| {
-                                            let v = crate::interpreter_codegen::
-                                            instruction_variant_name(ins);
-                                            layer_idx.get(v).and_then(|&i| {
-                                            crate::interpreter_codegen::instruction_field_at(
-                                                ins, i,
-                                            )
-                                        })
-                                        };
-                                    let tape_groups =
-                                        scratchy_target_metal_compiler::from_subtile::tape_accessor_groups(
-                                            &acc_instances,
-                                            &acc_slots,
-                                            &layer_of,
-                                        );
-                                    type GroupSig =
-                                        (String, std::collections::BTreeSet<Option<u64>>);
-                                    let isel_groups: std::collections::BTreeMap<
-                                        String,
-                                        GroupSig,
-                                    > = match collect_accessors(program, fuf, sfufs, lib, model)
-                                    {
-                                        Ok(accs) => group_accessors_by_base(&accs)
-                                            .iter()
-                                            .map(|g| {
-                                                let layers = g
-                                                    .entries
-                                                    .iter()
-                                                    .map(|(idx, _)| idx.map(|u| u.0))
-                                                    .collect();
-                                                (
-                                                    g.base.clone(),
-                                                    (
-                                                        g.rust_type
-                                                            .to_string()
-                                                            .replace(' ', "")
-                                                            .trim_start_matches('&')
-                                                            .to_string(),
-                                                        layers,
-                                                    ),
-                                                )
-                                            })
-                                            .collect(),
-                                        Err(_) => Default::default(),
-                                    };
-                                    // Whether a family is LAYERED is the
-                                    // binding's business, not the
-                                    // instruction's: an unindexed weight
-                                    // (embed, final norm, lm_head) still
-                                    // rides an instruction whose `layer`
-                                    // field reads 0. The tape carries the
-                                    // authoritative fact —
-                                    // `SourceBinding::Weight { index }` —
-                                    // so families bound with no unroll
-                                    // index normalize to the unindexed
-                                    // signature.
-                                    let unindexed_bases: std::collections::BTreeSet<String> = l
-                                        .bindings
-                                        .iter()
-                                        .filter_map(|b| match b {
-                                            crate::to_wavefront::SourceBinding::Weight {
-                                                id,
-                                                index: None,
-                                            } => Some(
-                                                split_base_layer(
-                                                    &crate::emit::weight_field_name(
-                                                        program,
-                                                        crate::classified::WeightId(*id),
-                                                        None,
-                                                    )
-                                                    .to_string(),
-                                                )
-                                                .0,
-                                            ),
-                                            _ => None,
-                                        })
-                                        .collect();
-                                    // `acc_instances` is the UNCOMPRESSED
-                                    // stream (captured before
-                                    // `apply_loop_compression`), so its
-                                    // layer values are the full 0..N
-                                    // coverage — directly comparable to
-                                    // the isel group's entries.
-                                    for (base, (ty, layers)) in
-                                        tape_groups.iter().filter(|_| solve_ran)
-                                    {
-                                        if let Some((isel_ty, isel_layers)) =
-                                            isel_groups.get(base)
-                                        {
-                                            assert_eq!(
-                                                ty, isel_ty,
-                                                "[m2-acc] {} m={m}: accessor `{base}` type \
-                                                 disagrees with instruction selection",
-                                                model.source_stem,
-                                            );
-                                            let layers = if unindexed_bases.contains(base) {
-                                                std::iter::once(None).collect()
-                                            } else {
-                                                layers.clone()
-                                            };
-                                            assert_eq!(
-                                                &layers, isel_layers,
-                                                "[m2-acc] {} m={m}: accessor `{base}` layer \
-                                                 coverage disagrees with instruction \
-                                                 selection",
-                                                model.source_stem,
-                                            );
-                                        }
-                                    }
-                                    // ⭐ ONE PRODUCER. This was ~75 lines building the same `Vec<WeightAccessor>` from
-                                    // `tape_groups` — a second derivation of a fact that is already a property of the
-                                    // MODEL (`LoweredDecode.bindings` plus the op consuming each one), not of the target.
-                                    // The one thing it knew that the shared walk did not is metal's kernel ABI: a gate/up
-                                    // pair is ONE packed `__fused__` buffer here and two weights on spyre. That is a bool.
-                                    //
-                                    // ⛔ VERIFIED EQUAL BEFORE THE SWAP, not after: a probe built both sets under metal and
-                                    // compared name + type + SOURCES, and they agreed on all 131 accessors for
-                                    // llama-3.2-1b. The emitted metal code is byte-identical to the previous build.
-                                    let synth = crate::weight_bindings::from_tape(
-                                        &l,
-                                        program,
-                                        crate::weight_bindings::WeightAbi {
-                                            mlp: if facts.fused_mlp {
-                                                crate::weight_bindings::MlpPacking::Packed
-                                            } else {
-                                                crate::weight_bindings::MlpPacking::Split
-                                            },
-                                            embed: if facts.embed_quant.is_some() {
-                                                crate::weight_bindings::EmbedStorage::AffineQuant
-                                            } else {
-                                                crate::weight_bindings::EmbedStorage::Dense
-                                            },
-                                        },
-                                    )
-                                        .unwrap_or_else(|e| panic!("[weight-bindings] {}: {e}", model.source_stem))
-                                        .accessors;
-                                    tape_accessors_for_struct = Some(synth.clone());
-                                    let synth_sig: Vec<(String, String, usize)> =
-                                        group_accessors_by_base(&synth)
-                                            .iter()
-                                            .map(|g| {
-                                                (
-                                                    g.base.clone(),
-                                                    g.rust_type.to_string().replace(' ', ""),
-                                                    g.entries.len(),
-                                                )
-                                            })
-                                            .collect();
-                                    let isel_sig: Vec<(String, String, usize)> =
-                                        match collect_accessors(program, fuf, sfufs, lib, model)
-                                        {
-                                            Ok(accs) => group_accessors_by_base(&accs)
-                                                .iter()
-                                                .map(|g| {
-                                                    (
-                                                        g.base.clone(),
-                                                        g.rust_type
-                                                            .to_string()
-                                                            .replace(' ', ""),
-                                                        g.entries.len(),
-                                                    )
-                                                })
-                                                .collect(),
-                                            Err(_) => Vec::new(),
-                                        };
-                                    assert_eq!(
-                                        synth_sig,
-                                        if solve_ran {
-                                            isel_sig
-                                        } else {
-                                            synth_sig.clone()
-                                        },
-                                        "[m2-acc] {} m={m}: tape-synthesized accessor GROUPS \
-                                         differ from instruction selection's",
-                                        model.source_stem,
-                                    );
-                                    // …and the SOURCE WEIGHTS per
-                                    // accessor, which the
-                                    // storage-format guard and the
-                                    // per-field load consume. Rotary is
-                                    // excluded on both sides (side
-                                    // channel, no accessor).
-                                    let srcs =
-                                        |accs: &[crate::weight_vocab::WeightAccessor]| {
-                                            accs.iter()
-                                                .map(|a| {
-                                                    let mut w: Vec<String> = a
-                                                        .source_weights
-                                                        .iter()
-                                                        .map(|(id, ix)| {
-                                                            format!(
-                                                                "{}#{:?}",
-                                                                id.0,
-                                                                ix.map(|u| u.0)
-                                                            )
-                                                        })
-                                                        .collect();
-                                                    w.sort();
-                                                    (a.name.to_string(), w)
-                                                })
-                                                .collect::<std::collections::BTreeMap<_, _>>()
-                                        };
-                                    let synth_srcs = srcs(&synth);
-                                    let isel_srcs = match collect_accessors(
-                                        program, fuf, sfufs, lib, model,
-                                    ) {
-                                        Ok(accs) => srcs(&accs),
-                                        Err(_) => Default::default(),
-                                    };
-                                    for (name, w) in synth_srcs.iter().filter(|_| solve_ran) {
-                                        if let Some(isel_w) = isel_srcs.get(name) {
-                                            assert_eq!(
-                                                w, isel_w,
-                                                "[m2-acc] {} m={m}: accessor `{name}` source \
-                                                 weights differ from instruction selection's",
-                                                model.source_stem,
-                                            );
-                                        }
-                                    }
-                                    eprintln!(
-                                        "[m2-acc] {} m={m}: accessor families EQUAL ({}), \
-                                         {} groups typed-equal",
-                                        model.source_stem,
-                                        tape_names.len(),
-                                        tape_groups.len(),
-                                    );
-                                    eprintln!(
-                                        "[m2-acc] {} m={m}: tape fields {} of isel {}",
-                                        model.source_stem,
-                                        tape_names.len(),
-                                        isel_names.len(),
-                                    );
-                                }
-                                cl.backbone = bridge_bucket;
-                                cl.lm_head.instances = bridged.lm_head;
-                                cl.lm_head.weight_slots = bridged.lm_head_weight_slots;
-                                cl.lm_head.barriers = lm_barriers;
-                                cl.lm_head.num_slots = tape_ns;
-                                cl.lm_head.final_slot = lm_final;
-                                // The bucket-table + arena-sizing reads
-                                // go through the canonical tuple, not
-                                // `cl` — flip them too, or the runtime
-                                // arena is sized for the SOLVER coloring
-                                // (ArenaSlotOutOfRange on device).
-                                *ns_field = tape_ns;
-                                *bb_slot_field = tape_fs;
-                                *term_field = lm_final;
-                                let mut tape_sm = tape_sm;
-                                // Arena sizing iterates the SlotMap and
-                                // evaluates fuf shapes per color; color
-                                // 0 (the embedded hidden) must appear —
-                                // key it by the fuf Embed tile.
-                                if let Some(et) = fuf
-                                    .nodes
-                                    .iter()
-                                    .find(|nd| nd.op == crate::classified::OpKind::Embed)
-                                {
-                                    tape_sm.insert_at(et.id, 0, 0);
-                                }
-                                *slots_dec = tape_sm;
-                            }
-                            Err(e) => panic!(
-                                "[m2-flip] {} m={m}: bridge refused a DECLARED pilot: {e}",
-                                model.source_stem
-                            ),
-                        }
-                    }
-                    Err(e) => {
-                        // A refusal that means METAL HAS NO KERNEL is not a
-                        // front-end gap: the runtime-lowering path refused
-                        // these too, at load. Panicking would make a
-                        // dense-MoE preset abort the whole build for an arch
-                        // whose QUANTIZED presets lower fine (mixtral).
-                        assert!(
-                            !tape_pilot_arch || e.is_no_metal_realization(),
-                            "[m2-flip] {} m={m}: the shared tape refused a DECLARED pilot \
-                             ({e:?}) — with the solve off there is no fallback",
-                            model.source_stem,
-                        );
-                        // ⛔ THE REFUSAL MUST REACH THE POOL. The bake lowers
-                        // the placeholder stream into VALID empty-command
-                        // tapes unless this canonical is marked: the pool
-                        // then builds, the forward runs a no-op dispatch,
-                        // and the generated tail dies on
-                        // `arena[terminal_slot]` index-OOB. Marking the
-                        // canonical makes the bake emit `tapes: &[]` so
-                        // `MetalWorkerPool::for_buckets` refuses at load —
-                        // the documented contract.
-                        metal_refused_buckets.insert(*canonical);
-                        eprintln!("[m2-eq] {} m={m} wavefront REFUSED: {e}", model.source_stem)
-                    }
-                }
+        };
+        let embed_quant = fuf.nodes.iter().find_map(|n| {
+            match (n.op, crate::weight_vocab::weight_storage_of(n)) {
+                (
+                    OpKind::Embed,
+                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }),
+                ) => Some((st::AffineGroupSize(*group_size), st::AffineBits(*bits))),
+                _ => None,
             }
-        }
-    }
-    // Emitted AFTER the front-end swap: the `(bucket, op_idx, slot)`
-    // accessor table must be built from the SAME (possibly
-    // tape-scheduled) streams the baked tapes execute — a pre-swap
-    // snapshot only agreed by accident of the byte-equality era.
-    // Spans rope-on-read: detect the arch's rotary caches (same predicates
-    // as the Weights-struct emission) so `rope_on_read_cos_sin` resolves
-    // the right cos/sin by layer class.
-    let wa_uses_rotary = fuf_uses_rotary(fuf);
-    let wa_uses_rotary_local = fuf.nodes.iter().any(|n| {
-        n.inputs.iter().any(|i| {
-            matches!(
-                i,
-                crate::fuf::FufInput::Extern {
-                    kind: crate::classified::ExternKind::RotaryLocal,
+        });
+        let fused_mlp = l.input.ops.iter().all(|od| {
+            !matches!(
+                od.op,
+                scratchy_subtile::subtile_ir::SubOp::MatmulTile {
+                    weight: scratchy_subtile::lower::GemmWeight::Affine { .. },
                     ..
                 }
             )
-        })
-    });
-    let weight_accessors_impl = emit_weight_accessors_impl(
-        &canonical_lowered,
-        model.source_stem.as_str(),
-        wa_uses_rotary,
-        wa_uses_rotary_local,
-    );
+        });
+        let weight_paths: Vec<Vec<String>> = (0..program.weights.len())
+            .map(|i| program.weights.path(WeightId(i as u32)).to_vec())
+            .collect();
+        let embed_base = weight_paths
+            .iter()
+            .map(|p| p.join("_"))
+            .find(|p| p.contains("embed"));
+        let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
+        let dsl_shared_expert_bases: Vec<String> = weight_paths
+            .iter()
+            .filter_map(|p| p.first().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
+            .collect();
+        let quant = model.quantization.as_ref();
+        let widths = |layer: st::LayerId| {
+            let qc = quant.expect("MoE widths are read for a quantized model only");
+            ["gate_proj", "up_proj", "down_proj"].map(|p| {
+                let role = format!("mlp.switch_mlp.{p}");
+                let at = Some(UnrollIndex(layer.0 as u64));
+                crate::quantization::affine_role_bits(program, &qc.method, &role, at)
+                    .map(st::AffineBits)
+            })
+        };
+        let facts = mc3::MetalStepFacts {
+            weight_paths: &weight_paths,
+            dsl_shared_expert_bases: &dsl_shared_expert_bases,
+            embed_base: &embed_base,
+            embed_quant,
+            mlp: if fused_mlp {
+                mc3::MlpForm::Packed
+            } else {
+                mc3::MlpForm::Split
+            },
+            moe_expert_bits: quant
+                .map(|_| &widths as &dyn Fn(st::LayerId) -> [Option<st::AffineBits>; 3]),
+        };
+        let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
+        let at = mc3::CanonicalAt { stem, m };
+        let lowered = mc3::lower_canonical(&l, &facts, mc, at, &mut metal_sources)
+            .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
+        *ns_field = lowered.colours.get();
+        *bb_slot_field = lowered.result.index();
+        *term_field = lowered.result.index();
+        // Arena sizing evaluates a FUF shape per colour, so colour 0 (the embedded hidden) is
+        // keyed by the FUF Embed tile.
+        let mut arena = lowered.arena;
+        if let Some(et) = fuf.nodes.iter().find(|nd| nd.op == OpKind::Embed) {
+            arena.insert_at(et.id, 0, 0);
+        }
+        *slots_dec = arena;
+        metal_steps.insert(*canonical, lowered.steps);
+        // THE WEIGHTS STRUCT, from the tape's bindings. Metal's one ABI fact in it: a gate/up
+        // pair is ONE packed `__fused__` buffer.
+        let abi = WeightAbi {
+            mlp: if fused_mlp {
+                MlpPacking::Packed
+            } else {
+                MlpPacking::Split
+            },
+            embed: match embed_quant {
+                Some(_) => EmbedStorage::AffineQuant,
+                None => EmbedStorage::Dense,
+            },
+        };
+        let synth = crate::weight_bindings::from_tape(&l, program, abi)
+            .unwrap_or_else(|e| panic!("[weight-bindings] {stem}: {e}"));
+        tape_accessors_for_struct = Some(synth.accessors);
+    }
+    // Instruction selection's `(bucket, op_idx, slot)` accessor table (cuda); on metal no stream
+    // records a slot, so it is the trait's defaults, and the model's tensors resolve through the
+    // source manifest's resolver instead.
+    let weight_accessors_impl =
+        emit_weight_accessors_impl(&canonical_lowered, model.source_stem.as_str());
+    #[cfg(feature = "metal")]
+    let weight_accessors_impl = {
+        let stem = &model.source_stem;
+        let resolver = metal_sources
+            .resolver()
+            .unwrap_or_else(|e| panic!("[metal sources] {stem}: {e:?}"));
+        quote! {
+            #weight_accessors_impl
+            #[cfg(feature = "metal")]
+            #resolver
+        }
+    };
     // M2b: for a tape-scheduled arch the Weights struct is emitted
     // from the TAPE's accessor set (asserted to produce the same
     // struct as instruction selection's inside `emit_weights_struct`).
@@ -12871,16 +12057,6 @@ pub fn emit_model(
         let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
         let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
-        // tape-index ids matching the keys `emit_weight_accessors_impl`
-        // bakes into the per-arch `WeightAccessors` match arms:
-        // `ci*2` for backbone, `ci*2 + 1` for lm_head, where `ci` is
-        // the canonical's position in `canonical_lowered.iter()`.
-        let ci = canonical_lowered
-            .keys()
-            .position(|wp| *wp == canonical)
-            .expect("canonical present in canonical_lowered");
-        let backbone_tape_index_lit = proc_macro2::Literal::u32_unsuffixed((ci as u32) * 2);
-        let lm_head_tape_index_lit = proc_macro2::Literal::u32_unsuffixed((ci as u32) * 2 + 1);
 
         // Per-tape_index arena_bytes: register-coloring tells us which
         // (tile, output_slot) pairs share an arena slot; for THIS
@@ -12940,60 +12116,41 @@ pub fn emit_model(
         // handled as variants + patches. See metal_static_tape.rs.
         #[cfg(feature = "metal")]
         let tapes_static_toks = {
-            let (cl_b, _, _, _, _) = &canonical_lowered[&canonical];
             let mc = resolved_metal_consts
                 .as_ref()
                 .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
-            let input = scratchy_target_metal_compiler::static_tape::BucketLowerInput {
-                backbone: &cl_b.backbone.instances,
-                lm_head: &cl_b.lm_head.instances,
-                backbone_barriers: &cl_b.backbone.barriers,
-                lm_head_barriers: &cl_b.lm_head.barriers,
-                bucket_m: m as u32,
-                num_arena_slots: *num_slots_b,
-                backbone_tape_index: (ci as u32) * 2,
-                lm_head_tape_index: (ci as u32) * 2 + 1,
-            };
-            let tapes_expr = match scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
-                mc,
-                &input,
-                &mut metal_tape_cmds,
-            ) {
-                Ok(t) => t,
-                Err(scratchy_target_metal_compiler::static_tape::BakeRefusal::Unlowerable(e)) => {
-                    // Same timing as the old runtime-lowering path: this
-                    // preset builds, and the POOL refuses at load if a
-                    // metal run ever selects this canonical.
+            // A canonical metal has no kernel for (`[m2-eq] … REFUSED`: it has no steps) bakes NO
+            // variants, so `MetalWorkerPool::for_buckets` refuses at load (`BucketLower`), naming
+            // the bucket. Baking its empty step tape instead would build VALID empty-command tapes:
+            // the forward would no-op and the tail would index the arena out of bounds.
+            let tapes_expr = match metal_steps.get(&canonical) {
+                None => {
                     eprintln!(
-                        "[metal static tape] {}: bucket_m={m}: NOT LOWERABLE on metal \
-                         ({e}); baking an empty variant list — the pool refuses at load",
+                        "[metal static tape] {}: bucket_m={m}: front-end REFUSED this canonical — \
+                         baking an empty variant list so the pool refuses at load",
                         model.source_stem
                     );
                     quote! { &[] }
                 }
-                Err(scratchy_target_metal_compiler::static_tape::BakeRefusal::Defect(e)) => {
-                    panic!(
-                        "[metal static tape] {}: bucket_m={m}: {e}",
-                        model.source_stem
+                Some(steps) => {
+                    let input = scratchy_target_metal_compiler::static_tape::BucketLowerInput {
+                        steps,
+                        bucket_m: m as u32,
+                        num_arena_slots: *num_slots_b,
+                        rotary: metal_rotary,
+                    };
+                    scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
+                        mc,
+                        &input,
+                        &mut metal_tape_cmds,
                     )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "[metal static tape] {}: bucket_m={m}: {e}",
+                            model.source_stem
+                        )
+                    })
                 }
-            };
-            // A canonical the m2 front-end swap refused (dense MoE: no
-            // metal kernel) must reach the pool as a refusal too. Baking
-            // the placeholder stream would lower VALID empty-command
-            // tapes — the pool builds, the forward runs a no-op, and the
-            // generated tail panics on `arena[terminal_slot]` index-OOB.
-            // Empty variant list = the pool refuses at load (`BucketLower`)
-            // with the bucket named. Same contract as `Unlowerable` above.
-            let tapes_expr = if metal_refused_buckets.contains(&canonical) {
-                eprintln!(
-                    "[metal static tape] {}: bucket_m={m}: front-end REFUSED this canonical — \
-                     baking an empty variant list so the pool refuses at load",
-                    model.source_stem
-                );
-                quote! { &[] }
-            } else {
-                tapes_expr
             };
             let ident = bucket_static_ident("METAL_TAPES_M", wp);
             metal_arena_bytes_statics.push(quote! {
@@ -13008,8 +12165,6 @@ pub fn emit_model(
         metal_bucket_entries.push(quote! {
             ::scratchy_target_metal::interpreter::metal::MetalBucketSpec {
                 bucket_m: #bucket_m_lit,
-                backbone_tape_index: #backbone_tape_index_lit,
-                lm_head_tape_index: #lm_head_tape_index_lit,
                 num_arena_slots: #num_slots_lit,
                 terminal_slot: #terminal_slot_lit,
                 arena_bytes: #arena_static_ident,
@@ -13317,10 +12472,10 @@ pub fn emit_model(
         /// the elementwise max so the single per-worker arena fits the
         /// largest activation across every tape_index.
         ///
-        /// `weights` is borrowed; the pool stores no back-reference,
-        /// caller passes `&weights` again at every `forward` /
-        /// `checkout` so the pool can live as a field on the
-        /// `Weights` struct without an `Arc`-cycle.
+        /// `weights` is borrowed once: the pool resolves the tapes'
+        /// model sources at construction and keeps only their
+        /// buffers, so it can live as a field on the `Weights` struct
+        /// without an `Arc`-cycle.
         ///
         /// [`MetalWorkerPool`]: ::scratchy_target_metal::interpreter::metal::MetalWorkerPool
         /// [`MetalWorkerPool::for_buckets`]: ::scratchy_target_metal::interpreter::metal::MetalWorkerPool::for_buckets
@@ -13935,7 +13090,6 @@ pub fn emit_model(
             });
 
             pool.forward_with_tail(
-                wm,
                 &inputs,
                 |worker, bucket_idx| {
                     let spec = &METAL_BUCKETS[bucket_idx];
@@ -14226,7 +13380,6 @@ pub fn emit_model(
             let vocab = METAL_VOCAB_SIZE as u32;
 
             pool.with_chain_encoder(
-                wm,
                 &inputs,
                 |worker, runtime, enc| {
                     // Concrete adapter that satisfies the non-generic

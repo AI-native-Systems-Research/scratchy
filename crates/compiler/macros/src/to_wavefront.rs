@@ -36,8 +36,14 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
-use scratchy_subtile::lower::{AffineInt4, GemmWeight, InputRef, LoweredOp, LoweringInput, OpDesc};
-use scratchy_subtile::subtile_ir::SourceShape;
+use scratchy_subtile::handoff::{Expansion, ExpansionId};
+use scratchy_subtile::lower::{
+    AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
+};
+use scratchy_subtile::subtile_ir::{
+    AttnMask, EwKind, ExpertBundle, ExpertProj, GainConvention, GatedAct, NumExperts, RopeFormTag,
+    RouterBundle, RowScale, SharedExpertBound, SourceShape, SubOp, TopK,
+};
 
 use crate::assignment::Assignment;
 use crate::classified::{ExternKind, OpKind, UnrollIndex};
@@ -86,6 +92,10 @@ pub enum BridgeError {
     /// The FUF produced no result op (empty, or the last tile wasn't a
     /// value-producing op).
     NoResult,
+    /// An RmsNorm's folded `w + offset` gain is neither the `w` nor the `(1 + w)` convention, and no
+    /// kernel implements a third — rounding it to the nearest would scale every normalized
+    /// activation by the wrong constant.
+    UnknownGainConvention { tile: TileId, offset: f32 },
     /// A Gemm's weight carries a quantization `StorageFormat` the SDSC/wavefront lowering does not yet
     /// emit (fp8 needs the weight_scale wired as a 3rd Gemm input + 1-byte staging; int4/ggml unwired).
     /// A build-time refusal — NOT a silent mis-lower of a packed weight as dense fp16.
@@ -145,6 +155,12 @@ impl std::fmt::Display for BridgeError {
                  not divide the query-head count, so this model has no GQA grouping to emit"
             ),
             Self::NoResult => write!(f, "FUF produced no result op"),
+            Self::UnknownGainConvention { tile, offset } => write!(
+                f,
+                "tile {} rmsnorm gain offset {offset} is neither the w nor the (1+w) convention, \
+                 and no kernel implements a third",
+                tile.0
+            ),
             Self::NoMetalRealization { tile, detail } => {
                 write!(f, "tile {}: {detail}", tile.0)
             }
@@ -176,7 +192,7 @@ pub struct BridgeStats {
     pub subgraphs: usize,
     pub sources: usize,
     pub ops: usize,
-    /// `(LoweredOp kind name, count)`, sorted by name.
+    /// `(op kind name, count)`, sorted by name.
     pub op_histogram: Vec<(&'static str, usize)>,
     /// Source bindings bucketed: weights, prefix-KV pairs, and the
     /// fixed singletons (embed/cos/sin).
@@ -247,17 +263,90 @@ struct Builder<'a> {
     /// Modeled prefix length for the KV-cache `Source` rows (structural;
     /// the host eval / GPU player binds the real length at run time).
     prefix_len: u32,
+    /// Parallel to `ops`: the construct each op was expanded from.
+    op_expansion: Vec<Option<Expansion>>,
+    /// The construct being expanded, while its ops are pushed.
+    expanding: Option<ExpansionId>,
+    expansions: u32,
+}
+
+/// The expert half of a MoE block, which every router shares.
+struct Experts {
+    experts: NumExperts,
+    k: TopK,
+    inter: u32,
+    hidden: u32,
+    quant: ExpertQuant,
+    bundle: ExpertBundle,
+    act: GatedAct,
+    shared: SharedExpertBound,
 }
 
 impl<'a> Builder<'a> {
-    fn push_op(&mut self, op: LoweredOp, inputs: Vec<InputRef>) -> usize {
+    fn push_op(&mut self, op: ArchOp, inputs: Vec<InputRef>) -> usize {
         let idx = self.ops.len();
         self.ops.push(OpDesc {
             op,
             m: self.m,
             inputs,
         });
+        let guard = None;
+        let expansion = self.expanding.map(|id| Expansion { id, guard });
+        self.op_expansion.push(expansion);
         idx
+    }
+
+    fn push(&mut self, op: ArchOp, inputs: &[usize]) -> usize {
+        self.push_op(op, inputs.iter().map(|&i| InputRef::Op(i)).collect())
+    }
+
+    /// Open the next construct's expansion: every op pushed until it closes shares its id.
+    fn expand(&mut self) {
+        self.expanding = Some(ExpansionId(self.expansions));
+        self.expansions += 1;
+    }
+
+    /// Each row's `k` highest-scoring experts, from the router's `logits`.
+    fn route_top_k(&mut self, logits: usize, k: TopK) -> usize {
+        let sorted = self.push(SubOp::RouteArgsort, &[logits]);
+        self.push(SubOp::RouteTopK { k }, &[sorted])
+    }
+
+    /// The expert half: the `(token, expert)` pairs of `x` sorted by expert, projected by
+    /// `bank`, gated, projected back, restored to token order, summed by `scores`. Closes the
+    /// expansion; returns the sum.
+    fn experts(
+        &mut self,
+        x: InputRef,
+        indices: usize,
+        scores: usize,
+        bank: InputRef,
+        e: Experts,
+    ) -> usize {
+        let (k, quant, bundle) = (e.k, e.quant, e.bundle);
+        let matmul = |proj, n| SubOp::ExpertMatmul {
+            proj,
+            n,
+            k,
+            quant,
+            bundle,
+        };
+        let sort = SubOp::ExpertSort {
+            experts: e.experts,
+            k,
+            bundle,
+        };
+        let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
+        let rows = |r: usize| vec![InputRef::Op(r), InputRef::Op(pairs), bank];
+        let gate = self.push_op(matmul(ExpertProj::Gate, e.inter), rows(pairs));
+        let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs));
+        let act = self.push(SubOp::ExpertGatedAct { act: e.act }, &[gate, up]);
+        let down = self.push_op(matmul(ExpertProj::Down, e.hidden), rows(act));
+        let tokens = self.push(SubOp::ExpertUnsort, &[down, pairs]);
+        let (hidden, shared) = (e.hidden, e.shared);
+        let sum = self.push(SubOp::ExpertCombine { hidden, shared }, &[tokens, scores]);
+        self.expanding = None;
+        sum
     }
 
     fn push_source(&mut self, rows: u32, cols: u32, binding: SourceBinding) -> usize {
@@ -411,6 +500,18 @@ fn kv_cache_index(node: &FufNode) -> Option<u64> {
         } => index.map(|i| i.0),
         _ => None,
     })
+}
+
+/// A MoE block's expert and top-k counts; a block routing to none is a malformed config.
+fn moe_counts(tile: TileId, experts: u32, k: u32) -> Result<(NumExperts, TopK), BridgeError> {
+    let nz = std::num::NonZeroU32::new;
+    match (nz(experts), nz(k)) {
+        (Some(e), Some(k)) => Ok((NumExperts::new(e), TopK::new(k))),
+        _ => Err(BridgeError::UnresolvedShape {
+            tile,
+            what: "a MoE block with zero experts or zero top-k",
+        }),
+    }
 }
 
 /// The resident prefix-KV cache capacity (prefix `Source` rows == length-mask
@@ -569,6 +670,9 @@ pub fn lower_decode_to_wavefront(
         scale,
         m,
         prefix_len,
+        op_expansion: Vec::new(),
+        expanding: None,
+        expansions: 0,
     };
 
     // The result is the last value-producing op (the lm_head GEMM).
@@ -653,7 +757,7 @@ pub fn lower_decode_to_wavefront(
             // runtime no-op — the megakernel sees its input slot
             // verbatim. Pass the upstream (Embed's output) through to
             // the splice's output slot so downstream tiles read the
-            // same `EmbeddedHidden` source. No `LoweredOp` is emitted
+            // same `EmbeddedHidden` source. No op is emitted
             // — this op is structurally absent from the megakernel.
             OpKind::MmEmbedSplice => {
                 let upstream = bx.input_at(tile, 0)?;
@@ -674,8 +778,18 @@ pub fn lower_decode_to_wavefront(
                 let gain_offset = gain_tile
                     .and_then(|t| bx.gain_offsets.get(&t).copied())
                     .unwrap_or(0.0);
+                // The (1+w) convention is CARRIED, not dropped and not folded into the weights at
+                // load: folding would make the loaded gain disagree with the checkpoint, so every
+                // consumer that re-reads it (dumps, the numeric reference, a second target) would
+                // see a different tensor.
+                let gain = GainConvention::from_offset(gain_offset).ok_or(
+                    BridgeError::UnknownGainConvention {
+                        tile,
+                        offset: gain_offset,
+                    },
+                )?;
                 let w = bx.input_at(tile, 1)?;
-                let idx = bx.push_op(LoweredOp::RmsNorm { eps, gain_offset }, vec![x, w]);
+                let idx = bx.push_op(SubOp::RmsNorm { eps, gain }, vec![x, w]);
                 if gain_offset != 0.0
                     && let Some(t) = gain_tile
                 {
@@ -706,33 +820,28 @@ pub fn lower_decode_to_wavefront(
                         });
                     }
                 };
-                // rows = m * mult / div: multiplying views (per-head)
+                // rows = m * k or m / k: multiplying views (per-head)
                 // have m | rows; the patch merger DIVIDES (rows | m).
-                let (rows_mult, rows_div) = if rows != 0 && rows.is_multiple_of(bx.m) {
-                    (rows / bx.m, 1)
+                let factor = |k: u32| std::num::NonZeroU32::new(k);
+                let rows = if rows != 0 && rows.is_multiple_of(bx.m) {
+                    factor(rows / bx.m).map(RowScale::Times)
                 } else if rows != 0 && bx.m.is_multiple_of(rows) {
-                    (1, bx.m / rows)
+                    factor(bx.m / rows).map(RowScale::Over)
                 } else {
-                    return Err(BridgeError::UnresolvedShape {
-                        tile,
-                        what: "reshape rows neither multiply nor divide num_tokens",
-                    });
-                };
-                let idx = bx.push_op(
-                    LoweredOp::Reshape {
-                        rows_mult,
-                        rows_div,
-                        cols,
-                    },
-                    vec![x],
-                );
+                    None
+                }
+                .ok_or(BridgeError::UnresolvedShape {
+                    tile,
+                    what: "reshape rows neither multiply nor divide num_tokens",
+                })?;
+                let idx = bx.push_op(SubOp::Reshape { rows, cols }, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::BiasAdd => {
                 let x = bx.input_at(tile, 0)?;
                 let b = bx.input_at(tile, 1)?;
-                let idx = bx.push_op(LoweredOp::BiasAdd, vec![x, b]);
+                let idx = bx.push_op(SubOp::Elementwise(EwKind::BiasAdd), vec![x, b]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -812,7 +921,7 @@ pub fn lower_decode_to_wavefront(
                     }
                     _ => vec![act, w],
                 };
-                let idx = bx.push_op(LoweredOp::Gemm { n, weight }, inputs);
+                let idx = bx.push_op(SubOp::MatmulTile { n, weight }, inputs);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -865,18 +974,17 @@ pub fn lower_decode_to_wavefront(
                 // helper (same indices Attention will receive later).
                 let (pk, pv) = bx.prefix_for(layer as u64);
                 let qi = bx.push_op(
-                    LoweredOp::RopeRotate { head_dim },
+                    SubOp::rope_rotate(head_dim),
                     vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
                 );
+                let pairing = match node.op {
+                    OpKind::RopeAppendInterleaved => RopeFormTag::Interleaved,
+                    _ => RopeFormTag::NeoX,
+                };
                 let ki = bx.push_op(
-                    LoweredOp::RopeAppend {
-                        head_dim,
-                        layer,
-                        // Default; the consuming attention arm backpatches
-                        // `false` for sliding layers.
-                        is_global: true,
-                        interleaved: node.op == OpKind::RopeAppendInterleaved,
-                    },
+                    // `Causal` by default; the consuming attention arm backpatches
+                    // `SlidingWindow` for sliding layers.
+                    SubOp::rope_append(head_dim, layer, AttnMask::Causal, pairing),
                     vec![
                         k,
                         InputRef::Ext(cos_k),
@@ -914,7 +1022,7 @@ pub fn lower_decode_to_wavefront(
                     let k = bx.input_at(tile, 1)?;
                     let v = bx.input_at(tile, 2)?;
                     let idx = bx.push_op(
-                        LoweredOp::EncoderAttn {
+                        SubOp::EncoderAttn {
                             geom: bx
                                 .geom
                                 .ok_or(BridgeError::MissingBound { key: "head_dim" })?,
@@ -935,31 +1043,28 @@ pub fn lower_decode_to_wavefront(
                 // row arrives via the separate k/v segments). The GPU mask
                 // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
-                let sliding = node.op == OpKind::SlidingAttention;
+                let mask = match node.op {
+                    OpKind::SlidingAttention => AttnMask::SlidingWindow,
+                    _ => AttnMask::Causal,
+                };
                 let base_geom = bx
                     .geom
                     .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
-                let geom = if !sliding {
-                    bx.geom_global.unwrap_or(base_geom)
-                } else {
-                    base_geom
+                let geom = match mask {
+                    AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
+                    AttnMask::SlidingWindow => base_geom,
                 };
-                if sliding {
+                if mask == AttnMask::SlidingWindow {
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
                     if let InputRef::Op(ri) = k
-                        && let LoweredOp::RopeAppend { is_global, .. } = &mut bx.ops[ri].op
+                        && let SubOp::RopeAppend { attn, .. } = &mut bx.ops[ri].op
                     {
-                        *is_global = false;
+                        *attn = AttnMask::SlidingWindow;
                     }
                 }
                 let idx = bx.push_op(
-                    LoweredOp::AttnDecode {
-                        geom,
-                        scale,
-                        valid_len,
-                        sliding,
-                    },
+                    SubOp::attn_decode(geom, scale, valid_len, mask),
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -967,19 +1072,19 @@ pub fn lower_decode_to_wavefront(
             }
             OpKind::Silu => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(LoweredOp::Silu, vec![x]);
+                let idx = bx.push_op(SubOp::Elementwise(EwKind::Silu), vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::Gelu => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(LoweredOp::Gelu, vec![x]);
+                let idx = bx.push_op(SubOp::Elementwise(EwKind::Gelu), vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::RmsNormUnit => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(LoweredOp::RmsNormUnit { eps }, vec![x]);
+                let idx = bx.push_op(SubOp::RmsNormUnit { eps }, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -997,7 +1102,7 @@ pub fn lower_decode_to_wavefront(
                         op: OpKind::ScalarWeightMul,
                         detail: "scalar_weight_mul without a weight input",
                     })??;
-                let idx = bx.push_op(LoweredOp::ScalarWeightMul, vec![x, w]);
+                let idx = bx.push_op(SubOp::ScalarWeightMul, vec![x, w]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1063,26 +1168,46 @@ pub fn lower_decode_to_wavefront(
                         });
                     }
                 };
-                let idx = bx.push_op(
-                    LoweredOp::Moe {
-                        qwen_shared,
-                        num_experts,
-                        top_k,
-                        moe_inter,
-                        shared_inter,
-                        norm_topk,
-                        group_size,
-                        bits,
-                    },
-                    vec![x, w],
-                );
+                let (experts, k) = moe_counts(tile, num_experts, top_k)?;
+                // Qwen order: softmax over every expert, then top-k (renormalised when the
+                // config says so); Mixtral: top-k, then softmax over the chosen.
+                let (router, bundle) = match qwen_shared {
+                    true => (RouterBundle::SharedFused, ExpertBundle::SharedFused),
+                    false => (RouterBundle::Fused, ExpertBundle::Fused),
+                };
+                let shared = std::num::NonZeroU32::new(shared_inter).filter(|_| qwen_shared);
+                bx.expand();
+                let lg = bx.push_op(SubOp::RouterLogits { experts, router }, vec![x, w]);
+                let lg = match qwen_shared {
+                    true => bx.push(SubOp::RouteSoftmax, &[lg]),
+                    false => lg,
+                };
+                let indices = bx.route_top_k(lg, k);
+                let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
+                let scores = match (qwen_shared, norm_topk) {
+                    (true, true) => bx.push(SubOp::RouteRenorm, &[scores]),
+                    (true, false) => scores,
+                    (false, _) => bx.push(SubOp::RouteSoftmax, &[scores]),
+                };
+                let hidden = bx.out_cols(tile, 0, "moe_block output")?;
+                let experts = Experts {
+                    experts,
+                    k,
+                    inter: moe_inter,
+                    hidden,
+                    quant: ExpertQuant::declared(group_size, bits),
+                    bundle,
+                    act: GatedAct::Silu,
+                    shared: SharedExpertBound(shared),
+                };
+                let idx = bx.experts(x, indices, scores, w, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::GateSplit => {
                 let x = bx.input_at(tile, 0)?;
                 let cols = bx.out_cols(tile, 0, "gate_split q cols")?;
-                let idx = bx.push_op(LoweredOp::GateSplit { half_cols: cols }, vec![x]);
+                let idx = bx.push_op(SubOp::GateSplit { half_cols: cols }, vec![x]);
                 // TWO outputs: slot 0 = q, slot 1 = gate.
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 bx.produced.insert((tile.0, 1), Producer::Op(idx));
@@ -1091,7 +1216,7 @@ pub fn lower_decode_to_wavefront(
             OpKind::GateApply => {
                 let attn = bx.input_at(tile, 0)?;
                 let gate = bx.input_at(tile, 1)?;
-                let idx = bx.push_op(LoweredOp::GateApply, vec![attn, gate]);
+                let idx = bx.push_op(SubOp::GateApply, vec![attn, gate]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1099,7 +1224,7 @@ pub fn lower_decode_to_wavefront(
                 let routed = bx.input_at(tile, 0)?;
                 let shared = bx.input_at(tile, 1)?;
                 let g = bx.input_at(tile, 2)?;
-                let idx = bx.push_op(LoweredOp::GateScale, vec![routed, shared, g]);
+                let idx = bx.push_op(SubOp::GateScale, vec![routed, shared, g]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1123,7 +1248,7 @@ pub fn lower_decode_to_wavefront(
                         op: OpKind::GatedDeltaNet,
                         detail: "gated_delta_net without a weight bundle",
                     })?;
-                let idx = bx.push_op(LoweredOp::GatedDeltaNet, vec![qkv, z, a, b2, w]);
+                let idx = bx.push_op(SubOp::GatedDeltaNet, vec![qkv, z, a, b2, w]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1195,27 +1320,46 @@ pub fn lower_decode_to_wavefront(
                     }
                     _ => (64, 4),
                 };
-                let idx = bx.push_op(
-                    LoweredOp::GemmaMoe {
-                        num_experts,
-                        top_k,
-                        moe_inter,
-                        group_size,
-                        bits,
-                    },
-                    vec![
-                        router_in,
-                        expert_in,
-                        InputRef::Ext(rsrc),
-                        InputRef::Ext(esrc),
-                    ],
-                );
+                let (router, bank) = (InputRef::Ext(rsrc), InputRef::Ext(esrc));
+                // Routes off its own pre-norm of `router_in`: logits → top-k → scores at a
+                // `hidden^-0.5` temperature → softmax → × per-expert scale. GeGLU experts over
+                // `expert_in`.
+                let (experts, k) = moe_counts(tile, num_experts, top_k)?;
+                let hidden = bx.out_cols(tile, 0, "gemma_moe output")?;
+                let gemma = RouterBundle::Gemma;
+                bx.expand();
+                let norm = SubOp::RouterNorm { eps, router: gemma };
+                let xr = bx.push_op(norm, vec![router_in, router]);
+                let logits = SubOp::RouterLogits {
+                    experts,
+                    router: gemma,
+                };
+                let lg = bx.push_op(logits, vec![InputRef::Op(xr), router]);
+                let indices = bx.route_top_k(lg, k);
+                let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
+                let scale = (hidden as f32).powf(-0.5);
+                let scores = bx.push(SubOp::RouteScale { scale }, &[scores]);
+                let scores = bx.push(SubOp::RouteSoftmax, &[scores]);
+                let scale = SubOp::RouteExpertScale { router: gemma };
+                let (s, i) = (InputRef::Op(scores), InputRef::Op(indices));
+                let scores = bx.push_op(scale, vec![s, i, router]);
+                let experts = Experts {
+                    experts,
+                    k,
+                    inter: moe_inter,
+                    hidden,
+                    quant: ExpertQuant::declared(group_size, bits),
+                    bundle: ExpertBundle::SwitchGlu,
+                    act: GatedAct::Gelu,
+                    shared: SharedExpertBound(None),
+                };
+                let idx = bx.experts(expert_in, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::TanhSoftCap => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(LoweredOp::TanhSoftCap, vec![x]);
+                let idx = bx.push_op(SubOp::TanhSoftCap, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1250,14 +1394,14 @@ pub fn lower_decode_to_wavefront(
                                      constant-folded before lowering",
                         })?;
                         let x = bx.input_at(tile, tensor_idx)?;
-                        let idx = bx.push_op(LoweredOp::ScalarMul { scale }, vec![x]);
+                        let idx = bx.push_op(SubOp::ScalarMul { scale }, vec![x]);
                         bx.produced.insert((tile.0, 0), Producer::Op(idx));
                         result = Some(idx);
                     }
                     None => {
                         let a = bx.input_at(tile, 0)?;
                         let b2 = bx.input_at(tile, 1)?;
-                        let idx = bx.push_op(LoweredOp::Mul, vec![a, b2]);
+                        let idx = bx.push_op(SubOp::Elementwise(EwKind::Mul), vec![a, b2]);
                         bx.produced.insert((tile.0, 0), Producer::Op(idx));
                         result = Some(idx);
                     }
@@ -1265,7 +1409,7 @@ pub fn lower_decode_to_wavefront(
             }
             OpKind::LoadPixels => {
                 let cols = bx.out_cols(tile, 0, "pixels cols")?;
-                let idx = bx.push_op(LoweredOp::LoadPixels { in_features: cols }, vec![]);
+                let idx = bx.push_op(SubOp::LoadPixels { in_features: cols }, vec![]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1273,27 +1417,27 @@ pub fn lower_decode_to_wavefront(
                 // Same shape as LoadPixels: a synthesized source tile
                 // whose width the FUF already carries.
                 let cols = bx.out_cols(tile, 0, "pos_embeds cols")?;
-                let idx = bx.push_op(LoweredOp::LoadPosEmbeds { width: cols }, vec![]);
+                let idx = bx.push_op(SubOp::LoadPosEmbeds { width: cols }, vec![]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::VisionRope => {
                 let q = bx.input_at(tile, 0)?;
                 let k = bx.input_at(tile, 1)?;
-                let idx = bx.push_op(LoweredOp::VisionRope, vec![q, k]);
+                let idx = bx.push_op(SubOp::VisionRope, vec![q, k]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 bx.produced.insert((tile.0, 1), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::QuickGelu => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(LoweredOp::QuickGelu, vec![x]);
+                let idx = bx.push_op(SubOp::Elementwise(EwKind::QuickGelu), vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::GeluErf => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(LoweredOp::GeluErf, vec![x]);
+                let idx = bx.push_op(SubOp::Elementwise(EwKind::GeluErf), vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1318,7 +1462,7 @@ pub fn lower_decode_to_wavefront(
                         op: OpKind::EmbeddingGather,
                         detail: "embedding_gather without a window/reverse index extern",
                     })?;
-                let idx = bx.push_op(LoweredOp::EmbeddingGather { indices_kind }, vec![x]);
+                let idx = bx.push_op(SubOp::EmbeddingGather { indices_kind }, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1343,20 +1487,20 @@ pub fn lower_decode_to_wavefront(
                         op: OpKind::VarlenAttention,
                         detail: "varlen attention without a cu_seqlens extern",
                     })?;
-                let idx = bx.push_op(LoweredOp::VarlenAttention { cu_kind }, vec![q, k, v]);
+                let idx = bx.push_op(SubOp::VarlenAttention { cu_kind }, vec![q, k, v]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::Mean => {
                 let x = bx.input_at(tile, 0)?;
-                let idx = bx.push_op(LoweredOp::Mean, vec![x]);
+                let idx = bx.push_op(SubOp::Mean, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
             OpKind::Sub => {
                 let a = bx.input_at(tile, 0)?;
                 let b2 = bx.input_at(tile, 1)?;
-                let idx = bx.push_op(LoweredOp::Sub, vec![a, b2]);
+                let idx = bx.push_op(SubOp::Elementwise(EwKind::Sub), vec![a, b2]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1401,7 +1545,7 @@ pub fn lower_decode_to_wavefront(
                 } else {
                     let a = bx.input_at(tile, 0)?;
                     let b2 = bx.input_at(tile, 1)?;
-                    let idx = bx.push_op(LoweredOp::Add, vec![a, b2]);
+                    let idx = bx.push_op(SubOp::Elementwise(EwKind::Add), vec![a, b2]);
                     bx.produced.insert((tile.0, 0), Producer::Op(idx));
                     result = Some(idx);
                 }
@@ -1437,6 +1581,7 @@ pub fn lower_decode_to_wavefront(
         bindings: bx.bindings,
         op_tiles,
         norm_gain_add_tiles: bx.norm_gain_add_tiles,
+        op_expansion: bx.op_expansion,
     })
 }
 
@@ -1543,9 +1688,8 @@ pub fn stats(fuf: &Fuf, asn: &Assignment, lowered: &LoweredDecode) -> BridgeStat
     let mut hist: HashMap<&'static str, usize> = HashMap::new();
     for od in &input.ops {
         // Names come from THE op registry, not a second table that
-        // can drift from it (`lowered_op_name` is derived from the
-        // same rows the enum lock guard checks).
-        let name = scratchy_subtile::ops::lowered_op_name(&od.op);
+        // can drift from it.
+        let name = od.op.name();
         *hist.entry(name).or_default() += 1;
     }
     let mut op_histogram: Vec<(&'static str, usize)> = hist.into_iter().collect();

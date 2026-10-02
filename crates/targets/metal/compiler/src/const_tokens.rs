@@ -48,21 +48,21 @@ pub(crate) fn alias_preamble() -> TokenStream {
 fn module_of(ty: &str) -> Result<TokenStream, Error> {
     let m = match ty {
         "KernelId" | "Binding" | "DispatchShape" | "MScaling" | "MScaleAxis" | "RuntimeGate"
-        | "LoweredCommand" | "GatedCommand" | "GemmDims" | "WeightLocator" | "WeightTensor"
-        | "WeightBundleKind" | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape"
-        | "ClassedTape" | "CapPatch" | "ScratchPatch" | "ScratchField" | "GenClass"
-        | "PatchTarget" | "TapeLoop" => {
+        | "LoweredCommand" | "GatedCommand" | "GemmDims" | "WeightTensor"
+        | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
+        | "CapPatch" | "ScratchPatch" | "ScratchField" | "GenClass" | "PatchTarget"
+        | "TapeLoop" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {
             quote!(__tc)
         }
-        "BucketM" | "LayerId" | "ArenaSlotIdx" | "PhysicalBlockIdx" | "LogicalBlockIdx"
-        | "SlotInBlock" | "SeqIdx" | "QTokenIdx" | "NumTokens" | "BindingIdx" | "HeadDim"
-        | "NumQHeads" | "NumKvHeads" | "RotDim" | "RopePairOff" | "BlockSize"
-        | "BlocksPerChunk" | "MaxBlocksPerSeq" | "QSize" | "IntermediateSize" | "HiddenSize"
-        | "KDim" | "NDim" | "SplitK" | "AttnDebugMode" | "AttnWindow" | "KDimI32" | "NDimI32"
-        | "MDimI32" | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
+        "BucketM" | "LayerId" | "SourceIx" | "ArenaSlotIdx" | "PhysicalBlockIdx"
+        | "LogicalBlockIdx" | "SlotInBlock" | "SeqIdx" | "QTokenIdx" | "NumTokens"
+        | "BindingIdx" | "HeadDim" | "NumQHeads" | "NumKvHeads" | "RotDim" | "RopePairOff"
+        | "BlockSize" | "BlocksPerChunk" | "MaxBlocksPerSeq" | "QSize" | "IntermediateSize"
+        | "HiddenSize" | "KDim" | "NDim" | "SplitK" | "AttnDebugMode" | "AttnWindow"
+        | "KDimI32" | "NDimI32" | "MDimI32" | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
             quote!(__ti)
         }
         other => return Err(Error(format!("const_tokens: unmapped type `{other}`"))),
@@ -342,8 +342,9 @@ impl ser::SerializeStructVariant for StructVariantEmit {
 mod tests {
     use super::*;
     use scratchy_target_metal::tape::constants::{ConstantType, ConstantValue};
+    use scratchy_target_metal::tape::ids::{LayerId, SourceIx};
     use scratchy_target_metal::tape::lowered::{
-        Binding, DispatchShape, GatedCommand, KernelId, LoweredCommand, RuntimeGate,
+        Binding, DispatchShape, GatedCommand, KernelId, LoweredCommand, RuntimeGate, WeightTensor,
     };
 
     /// A command exercising every emission form: unit variant, struct
@@ -370,7 +371,9 @@ mod tests {
                         binding_index: 0,
                     },
                     Binding::Source {
-                        ix: 7,
+                        ix: SourceIx(7),
+                        which: WeightTensor::AffineScales,
+                        layer: LayerId(3),
                         binding_index: 1,
                     },
                 ]),
@@ -391,7 +394,8 @@ mod tests {
         for needle in [
             ":: scratchy_target_metal :: tape :: lowered :: KernelId :: Embed",
             "Binding :: ArenaSlot { slot : 2u32 , binding_index : 0u8 }",
-            "Binding :: Source { ix : 7u32 , binding_index : 1u8 }",
+            "Binding :: Source { ix : __ti :: SourceIx (7u32) , which : __tl :: WeightTensor :: \
+             AffineScales , layer : __ti :: LayerId (3u32) , binding_index : 1u8 }",
             "index : 3u16",
             "RuntimeGate :: OnlyIfDecodeStep",
             "\"metal_embed_f16\"",

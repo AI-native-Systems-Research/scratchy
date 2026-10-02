@@ -90,7 +90,7 @@ pub struct DenseFusedMoELayer {
 
 /// MLX-affine int4 fused MoE layer (Metal-only at runtime).
 ///
-/// Mirrors the binding shape consumed by `lower_metal_moe` in
+/// Mirrors the binding shape consumed by `lower_moe_step` in
 /// `scratchy-forward-compiler/src/interpreter/metal/lowering.rs`:
 /// * `router_gate` — dense `[num_experts, hidden_size]` BF16/F16 — fed
 ///   to the routing Gemm.
@@ -224,7 +224,7 @@ pub enum FusedMoELayer {
     Dense(Box<DenseFusedMoELayer>),
     /// MLX-affine int4 MoE (Metal-only). Per-expert (W, scales,
     /// biases) triples + dense fp router; lowered to a 10-step ICB
-    /// decomposition by `lower_metal_moe`.
+    /// decomposition by `lower_moe_step`.
     Affine(Box<AffineFusedMoELayer>),
 }
 

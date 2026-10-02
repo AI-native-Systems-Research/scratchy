@@ -24,8 +24,8 @@ use crate::argmax::{Buffer, Device};
 ///
 /// `is_global[L]` flags whether layer L is in the GLOBAL group (group 0). Only
 /// global layers get a real packed/norms store; sliding layers get a tiny
-/// placeholder buffer that the tape never binds (the inject_tq pass only wraps
-/// the global KV-writer). Uniform arches pass all-true → every layer real
+/// placeholder buffer that the tape never binds (the KV codec pass codes only
+/// the global KV writers). Uniform arches pass all-true → every layer real
 /// (byte-identical to before, when `is_global` was implicitly all-true).
 #[allow(clippy::too_many_arguments)]
 pub fn build_tq_provision(

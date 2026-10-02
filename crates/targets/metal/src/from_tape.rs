@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! METAL, LOWERED FROM THE SHARED `SubtileTape`.
 //!
-//! ⭐ THIS IS THE FORK POINT MOVING. Metal's existing bridge consumes `LoweredDecode` — the op
-//! list one stage BEFORE `SubtileIR` — and touches neither the graph nor the tape. Spyre
-//! consumes the `SubtileTape`, two stages later. This module is metal reading the SAME artifact
-//! spyre reads, so "one front end" names one object rather than one crate boundary.
+//! ⭐ ONE FRONT END. Metal reads the SAME artifact spyre lowers — the `SubtileTape` — so "one
+//! front end" names one object rather than one crate boundary.
 //!
 //! ⛔ AND IT LIVES IN THE TARGET CRATE, not in `compiler/macros`. Spyre's emitter is
 //! `targets/spyre/src/lower_subtile_tape_to_superdsc.rs`; this is its metal counterpart. A
@@ -14,7 +12,7 @@
 //! ## What the tape gives
 //!
 //! An [`Instr::Compute`] names a node in the graph, the slot it writes, and its positional
-//! inputs as either earlier slots or graph sources. So the vocabulary to match on is [`SubOp`] —
+//! inputs as either earlier slots or graph sources. So the vocabulary to match on is `SubOp` —
 //! `lower_region` has already resolved the arch-level ops into it.
 //!
 //! ## Tiling is a target fact
@@ -23,7 +21,7 @@
 //! (`decompose_rmsnorm`, `head_tile_rope`) because its substrate requires it; metal's kernels
 //! take a whole `RmsNorm` and a whole rope. Same builder, same tape, different `nb`.
 
-use scratchy_subtile::subtile_ir::{SubOp, SubtileIR, SubtileId, TensorId};
+use scratchy_subtile::subtile_ir::{SubtileIR, SubtileId, TensorId};
 use scratchy_subtile::subtile_tape::{
     ComputeInput, ComputeInputs, Instr, LoopBound, LoopVarId, SlotId, SubtileTape,
 };
@@ -107,7 +105,7 @@ pub enum TapeItem {
 /// ⛔ NO `fuse_silu_mul`, AND NOT BECAUSE IT IS HARD. That pass DROPS ops and renumbers the
 /// rest, so provenance would point at the fused list while metal's emitter indexes the original
 /// — every weight off by the number of fusions before it. It is also spyre's fusion: spyre has a
-/// SiluMul kernel, metal fuses gate/up in its own `fold_plan`. WHICH FUSIONS TO APPLY IS A
+/// SiluMul kernel, metal declares its own (`op_abi::METAL_FUSIONS`). WHICH FUSIONS TO APPLY IS A
 /// TARGET FACT; the builder underneath is the shared one.
 ///
 /// Likewise `nb = u32::MAX` — WHOLE ops. `decompose_rmsnorm` and `head_tile_rope` exist because
@@ -221,120 +219,6 @@ pub fn items_of(graph: &SubtileIR, tape: &SubtileTape) -> Result<Vec<TapeItem>, 
         }
     }
     Ok(items)
-}
-
-/// The steps of a program, ignoring loop boundaries — the UNROLLED view.
-///
-/// Used by the callers that still want a flat order (the schedule projection below). A caller
-/// that emits a loop reads [`items_of`] directly; one that flattens must say so by name.
-pub fn steps_only(items: &[TapeItem]) -> Vec<&TapeStep> {
-    items
-        .iter()
-        .filter_map(|i| match i {
-            TapeItem::Step(s) => Some(s),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The layer loop, in terms of the SOURCE OPS of its first body copy.
-///
-/// ⭐ READ FROM THE SHARED SEARCH, NOT RE-DERIVED. `find_layer_loop` answers once, on the shared
-/// tape; `reroll_subtile_tape` uses the same answer to build the rolled tape spyre lowers. This
-/// translates it into the only currency metal's emitter speaks — source-op indices — so metal
-/// can locate the same body in its own instruction stream WITHOUT searching that stream.
-///
-/// Returns `(body source ops in emission order, iterations)`.
-pub fn layer_loop_source_ops(
-    graph: &SubtileIR,
-    tape: &SubtileTape,
-) -> Result<Option<(Vec<SourceOp>, u32)>, TapeLoweringError> {
-    let Some((start, period, iters)) = scratchy_subtile::subtile_tape::find_layer_loop(tape, graph)
-    else {
-        return Ok(None);
-    };
-    let source_of: std::collections::HashMap<TensorId, SourceOp> = graph
-        .op_output
-        .iter()
-        .enumerate()
-        .map(|(j, t)| (*t, SourceOp(j)))
-        .collect();
-    // `find_layer_loop` answers in `instrs()` positions, which include the slot bookkeeping;
-    // only the `Compute`s in the first body copy carry a source op.
-    let mut body = Vec::new();
-    for instr in &tape.instrs()[start..start + period] {
-        if let Instr::Compute { node, .. } = instr {
-            let out = graph.nodes[node.index()].output.tensor;
-            let op = source_of.get(&out).ok_or_else(|| {
-                TapeLoweringError(format!(
-                    "loop body node {} writes tensor {} which no source op produces",
-                    node.index(),
-                    out.index(),
-                ))
-            })?;
-            body.push(*op);
-        }
-    }
-    if body.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some((body, iters)))
-}
-
-/// The op each step computes, in tape order — what the opcode emitter matches on.
-pub fn ops_of<'g>(graph: &'g SubtileIR, steps: &[&TapeStep]) -> Vec<&'g SubOp> {
-    steps
-        .iter()
-        .map(|s| &graph.nodes[s.node.index()].op)
-        .collect()
-}
-
-/// ⭐ THE FLIP, AS DATA: emission order and slot coloring for every source op, both READ OFF THE
-/// TAPE.
-///
-/// These are the two things metal used to compute for itself — `wave_levels` for the order,
-/// `tape_slot_map` for the coloring — over the pre-`SubtileIR` op list. Sourcing both from the
-/// `SubtileTape` is what "metal is on the tape" means concretely: the schedule metal runs and
-/// the schedule spyre runs are now the same object's, not two agreeing derivations.
-///
-/// Indexed by source-op position, because that is what metal's emitter walks.
-pub struct TapeSchedule {
-    /// `level[j]` = tape position of source op `j`; `None` for an op the lowering folded away
-    /// (it produces no tape step, and the emitter skips it).
-    pub level: Vec<Option<usize>>,
-    /// `slot[j]` = the slot source op `j` writes.
-    pub slot: Vec<Option<SlotId>>,
-    pub num_slots: u32,
-}
-
-impl TapeSchedule {
-    /// The slot holding the forward's result.
-    pub fn final_slot(&self, result_op: SourceOp) -> Result<SlotId, TapeLoweringError> {
-        self.slot
-            .get(result_op.0)
-            .copied()
-            .flatten()
-            .ok_or_else(|| {
-                TapeLoweringError(format!("result op {} writes no tape slot", result_op.0))
-            })
-    }
-}
-
-/// Project the tape's order and coloring back onto the source op list.
-pub fn schedule_of(num_source_ops: usize, steps: &[&TapeStep]) -> TapeSchedule {
-    let mut level = vec![None; num_source_ops];
-    let mut slot = vec![None; num_source_ops];
-    let mut num_slots = 0u32;
-    for (pos, s) in steps.iter().enumerate() {
-        level[s.source_op.0] = Some(pos);
-        slot[s.source_op.0] = Some(s.writes);
-        num_slots = num_slots.max(s.writes.index() + 1);
-    }
-    TapeSchedule {
-        level,
-        slot,
-        num_slots,
-    }
 }
 
 /// How many layers one iteration of the detected run covers.

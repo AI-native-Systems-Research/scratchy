@@ -146,7 +146,7 @@ impl AffineFusedMoEOps for AffineFusedMoELayer {
         // Router gate: quantized in mlx-community 4bit MoE
         // checkpoints (verified on Qwen3-30B-A3B-4bit and
         // Mixtral-8x7B-Instruct-v0.1-4bit). Dequant to a typed dense
-        // tensor so the routing Gemm step in `lower_metal_moe`
+        // tensor so the routing Gemm step in `lower_moe_step`
         // (Step 1) reads it as a normal `[E, hidden]` BF16/F16
         // weight — same shape contract as the cuda Dense path.
         // Choose dequant dtype from the model's target_dtype (BF16

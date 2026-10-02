@@ -215,6 +215,9 @@ macro_rules! f32_newtype {
 }
 
 u32_newtype!(
+    /// A model tensor family (a `(WeightKind, accessor)` bundle, every layer) in the model's
+    /// source manifest — what a `Binding::Source` names; the macro's generated resolver maps it.
+    SourceIx,
     /// Per-head feature width (`W::HEAD_DIM`).
     HeadDim,
     /// Number of query heads (`W::NUM_Q_HEADS`).
@@ -255,6 +258,27 @@ u32_newtype!(
     NDim,
     /// Split-K partition count (for `affine_qmm_t_splitk`).
     SplitK,
+    /// MLX-affine quantization group size.
+    AffineGroupSize,
+    /// MLX-affine bits per quantized weight.
+    AffineBits,
+    /// An MLX-affine GEMM's matvec/matmul boundary (`get_qmv_batch_limit`).
+    QmvBatchLimit,
+    /// Routed experts of a MoE layer.
+    NumExperts,
+    /// Experts each token routes to.
+    TopK,
+    /// Rows a per-row op runs per token (a per-head norm's head count; 1 on the
+    /// residual stream).
+    RowsPerToken,
+    /// A reshape's row divisor (`num_tokens / d` rows — the vision merger's factor).
+    RowsDivisor,
+    /// Iterations of a rolled loop.
+    LoopIters,
+    /// Rows in a rolled loop's body.
+    BodyLen,
+    /// Layers one iteration of a rolled loop advances.
+    LayerStride,
     /// Steel attention `[[function_constant(99)]]` debug-mode toggle.
     /// Bound to `0` for production; `>0` selects diagnostic paths.
     AttnDebugMode,

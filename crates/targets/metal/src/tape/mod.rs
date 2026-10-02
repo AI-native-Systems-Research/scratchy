@@ -15,4 +15,5 @@ pub mod lowered;
 pub mod lowering;
 pub mod model_consts;
 pub mod quantized;
+pub mod step;
 pub mod targets;

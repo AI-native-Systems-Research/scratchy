@@ -221,21 +221,6 @@ pub trait WeightAccessors {
     ) -> ::scratchy_tensors::tensor::GpuTensor {
         unreachable!("cos_sin_at not implemented for this arch")
     }
-    /// Spans rope-on-read: the cos/sin table the paged attention kernels
-    /// use to re-rope cached unrotated K on read. Resolved by LAYER
-    /// CLASS, not by op operand (attention ops carry no cos_sin slot):
-    /// `is_global` selects the global/full-attention `rotary` cache vs
-    /// the sliding/local `rotary_local` cache (dual-rotary arches like
-    /// Gemma4). Only called when `W::ROPE_ON_READ` and the attention
-    /// lowering binds `WeightBundleKind::RopeOnReadCosSin`; the default
-    /// is unreachable (non-spans arches never bind it).
-    fn rope_on_read_cos_sin(
-        &self,
-        _is_global: bool,
-        _layer: u32,
-    ) -> ::scratchy_tensors::tensor::GpuTensor {
-        unreachable!("rope_on_read_cos_sin not implemented for this arch")
-    }
     /// Metal-only: MLX-affine int4 quantized embedding. Resolves the
     /// `AffineQuantEmbedding` field on `Weights` for the
     /// `Instruction::AffineEmbed` lowering.
@@ -931,6 +916,15 @@ pub enum KvOffset {
 pub struct KvOffsets {
     pub k: KvOffset,
     pub v: KvOffset,
+}
+
+impl KvOffsets {
+    /// A writer whose K and V both classify [`KvOffset::Centered`] (bias-free projections, or
+    /// norms of them).
+    pub const CENTERED: Self = Self {
+        k: KvOffset::Centered,
+        v: KvOffset::Centered,
+    };
 }
 
 /// Pack the three routed-expert projection bit-widths (gate / up / down)
