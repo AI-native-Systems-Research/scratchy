@@ -17,7 +17,7 @@ live-stats = []
 # in-process engine — `llm`/`init`/`engine` + the sync span-query path used by
 # `LLM::chat_stream` — compiles WITHOUT this, so a local-inference client
 # (`scr chat`) never pulls axum/tower/axum-server.
-serve = ["dep:axum", "dep:tower-http", "dep:http"]
+serve = ["dep:axum", "dep:tower-http", "dep:http", "tokio/net"]
 otel = ["scratchy-core-common/otel"]
 cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda", "scratchy-target-cuda/cuda"]
 nccl = ["cuda", "dep:scratchy-serving-transport", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
@@ -59,7 +59,7 @@ axum = { workspace = true, optional = true }
 axum-server = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

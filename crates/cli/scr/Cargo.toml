@@ -132,7 +132,7 @@ scratchy-forward-compiler = { path = "../../compiler", optional = true }
 model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
 scratchy-bench = { workspace = true, optional = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 dotenvy = { workspace = true }

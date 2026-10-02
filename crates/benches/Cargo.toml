@@ -20,7 +20,7 @@ scratchy-core-config = { workspace = true }
 scratchy-serving-api = { workspace = true }
 scratchy-serving-engine = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 indicatif = { workspace = true }

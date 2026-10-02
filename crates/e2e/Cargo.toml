@@ -25,7 +25,7 @@ reqwest = { workspace = true }
 rustls = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 # Serialization (reuse protocol types from scratchy-serving-api)
 serde = { workspace = true }
