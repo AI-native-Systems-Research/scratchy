@@ -2200,7 +2200,7 @@ fn emit_one(
                 b,
                 // This door's operands are WINDOWS of the caller's parameters — the fact the
                 // spurious-pad drop in `matmul_oriented` discriminates on.
-                true,
+                super::lower_ktir_to_superdsc::OperandOrigin::Windowed,
             )?
         }
         Program::Elementwise(e) => {

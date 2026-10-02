@@ -2208,6 +2208,18 @@ impl EntryBase {
         Ok(EntryBase(entries))
     }
 
+    /// `entries` whole sticks further on — the CUT leg's stride add, checked with the same rule
+    /// [`EntryBase::of_entries`] states: a stride that is not a whole stick (or a base that would
+    /// overflow) refuses rather than emitting at a fractional stick.
+    pub fn plus_entries(self, entries: u32) -> Result<Self, String> {
+        EntryBase::of_entries(self.0.checked_add(entries).ok_or_else(|| {
+            format!(
+                "a gather run starting at entry {} plus a {}-entry stride overflows the entry count",
+                self.0, entries
+            )
+        })?)
+    }
+
     /// Refuse a base that is not a whole number of index sticks — see [`EntryBase::of_entries`].
     /// Kept only for callers holding a bare `u32` from outside the crate's own walks.
     pub fn assert_stick_aligned(self) -> Result<Self, String> {

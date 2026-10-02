@@ -174,8 +174,10 @@ pub struct Gather {
     /// block 0's ids — the right shape, the right dtype, the wrong rows, from a clean bake. The
     /// value is in ENTRIES (one `SenUint32` word per entry), which is what
     /// [`crate::superdsc_opspec::EntryBase`] reports and what the index operand's
-    /// `with_offset` takes.
-    pub first_entry: u32,
+    /// `with_offset` takes. An [`EntryBase`], so it is stick-aligned by construction (issue 201
+    /// item 7) — `gathers_of` builds it through `of_entries` and an unaligned anchor refuses at
+    /// the walk, before any descriptor exists.
+    pub first_entry: crate::superdsc_opspec::EntryBase,
     /// ⭐ THE TILE'S OWN RESULT — the `ktdp.construct_indirect_access_tile` value this gather was
     /// read from. Carried so every joiner (the whole-function walk, the matmul materializer) reads
     /// THIS gather's tile by identity instead of re-filtering `KtdpConstructIndirectAccessTile` and
@@ -370,7 +372,12 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
                     f.name
                 ));
             }
-            anchor as u32
+            // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
+            // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
+            // before any descriptor exists — on both the uncut and the cut arm.
+            crate::superdsc_opspec::EntryBase::of_entries(anchor as u32).map_err(|msg| Error {
+                message: format!("{}: {msg}", f.name),
+            })?
         };
         // ⛔ THE ONE NEW DISCRIMINATOR: every tile must name the SAME parameter pair. A second
         // pair really is two gathers on one descriptor-shaped program — the shape `gather_of`
@@ -3784,8 +3791,20 @@ pub fn matmul(
         layout,
         quantized,
         super::whole_function::BOrient::TransposeB,
-        false,
+        OperandOrigin::Staged,
     )
+}
+
+/// WHO THE OPERANDS OF THIS MATMUL CALL ARE — the typed discriminator the spurious-pad drop in
+/// [`matmul_oriented`] reads (issue 201 item 7: a bool cannot say why).
+pub enum OperandOrigin {
+    /// Staged whole tensors: the per-`Program` door. The staged-buffer contract behind
+    /// `DeviceWidth::for_output`'s bump holds — the worker's weight zero-pad makes the pad real.
+    Staged,
+    /// One WINDOW of the caller's parameters: the whole-function door. The padded weight columns
+    /// would be read past the window's end, so [`DeviceWidth::for_matmul`] drops the util-floor
+    /// bump when the logical width already meets the floor.
+    Windowed,
 }
 
 /// [`matmul`] with the weight orientation PROVEN by the caller instead of assumed — see
@@ -3797,10 +3816,7 @@ pub fn matmul_oriented(
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
     b: super::whole_function::BOrient,
-    // ⛔ TRUE when this call is the WHOLE-FUNCTION DOOR's, so the operands are one WINDOW of the
-    // caller's parameters rather than a staged whole tensor — the fact the spurious-pad drop below
-    // discriminates on (see its note). The per-`Program` door passes `false`.
-    windowed_program: bool,
+    origin: OperandOrigin,
 ) -> Result<Vec<EmittedOp>, Error> {
     let outs: Vec<Region> = r.iter().copied().filter(|x| x.is_out).collect();
     let [out] = outs[..] else {
@@ -3951,7 +3967,7 @@ pub fn matmul_oriented(
     // granite tiled_k). `windowed_program` carries whether the padded weight columns would be read
     // from the caller's parameter windows — the one fact the staged-buffer contract of
     // `for_output` does not hold here.
-    let n_dev = DeviceWidth::for_matmul(m, n, k, windowed_program).get();
+    let n_dev = DeviceWidth::for_matmul(m, n, k, matches!(origin, OperandOrigin::Windowed)).get();
     let macs = m as u64 * n_dev as u64 * k as u64;
     // ── GUARD #11 (util floor) computed on the PROVEN partition `CoreSplit::plan` (Kani: disjoint +
     //    covering, #50-free) — the SAME split the emit uses (`matmul_split_map` defers to CoreSplit for

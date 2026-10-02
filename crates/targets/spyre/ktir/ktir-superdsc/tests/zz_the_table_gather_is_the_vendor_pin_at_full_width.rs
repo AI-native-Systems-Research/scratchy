@@ -95,7 +95,9 @@ fn emit_legs_at(
             inputs: &inputs,
             gathered_input: 1,
             index_name: "EmbIds",
-            first_entry,
+            // The typed base: of_entries IS the alignment check, so the unaligned-start tests
+            // exercise the constructor's own refusal (issue 201 item 1).
+            first_entry: ktir_superdsc::superdsc_opspec::EntryBase::of_entries(first_entry)?,
             o: &out,
         },
         &mut sym,
@@ -274,7 +276,7 @@ fn the_gathered_operand_must_be_the_last_input() {
             inputs: &inputs,
             gathered_input: 0,
             index_name: "EmbIds",
-            first_entry: 0,
+            first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
             o: &out,
         },
         &mut sym,
