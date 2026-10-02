@@ -41,7 +41,7 @@ nccl = ["scratchy-ir/nccl"]
 # `objc2`/`objc2_metal` types directly in the `MetalForwardFollowup` /
 # `ChainStepHandle` / `MetalChainBody` surface. `MetalDtype` is named from
 # `scratchy-tensors`; `RuntimeBindings` is erased behind `MetalRuntimeHandle`.
-metal = ["scratchy-ir/metal", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+metal = ["scratchy-ir/metal", "dep:objc2", "dep:objc2-metal"]
 # Spyre (KTIR): host-pure KTIR emit via scratchy-subtile + the ir spyre gate.
 # Deliberately does NOT pull `scratchy-target-cuda/spyre` — the compiler is
 # decoupled from every target crate; spyre rides the compiler-owned arch
@@ -121,7 +121,6 @@ objc2-metal = { version = "0.3", optional = true, features = [
     "MTL4CommitFeedback",
     "block2",
 ] }
-objc2-foundation = { version = "0.3", optional = true }
 anyhow = { workspace = true }
 inventory = { workspace = true }
 # Optional deps used only by the `probe-weights` bin under the

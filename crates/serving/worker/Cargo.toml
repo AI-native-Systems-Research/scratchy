@@ -12,7 +12,7 @@ default = []
 forward-telemetry = ["scratchy-target-metal?/forward-telemetry", "scratchy-core-common/forward-telemetry"]
 sampler-telemetry = ["scratchy-target-metal?/sampler-telemetry", "scratchy-core-common/sampler-telemetry"]
 cuda = ["cudarc", "dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-cuda", "dep:scratchy-builder-cuda", "scratchy-builder-cuda/cuda", "scratchy-forward-compiler/cuda", "scratchy-models/cuda", "scratchy-target-cuda/cuda"]
-metal = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-metal", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "scratchy-forward-compiler/metal", "scratchy-models/metal"]
+metal = ["dep:scratchy-forward-compiler", "dep:scratchy-models", "dep:scratchy-target-metal", "dep:objc2", "dep:objc2-metal", "scratchy-forward-compiler/metal", "scratchy-models/metal"]
 # Multimodal capability, forwarded from `scr`'s `multimodal` feature via
 # scratchy-serving-api. No-op unless a backend that has one is also active.
 vision = ["scratchy-target-metal?/vision"]
@@ -44,7 +44,6 @@ scratchy-serving-scheduler = { workspace = true }
 scratchy-serving-engine = { workspace = true }
 scratchy-serving-transport = { workspace = true }
 scratchy-core-model = { workspace = true }
-scratchy-quantizations = { workspace = true }
 scratchy-forward-compiler = { path = "../../compiler", optional = true }
 scratchy-models = { path = "../../models/arch", optional = true, default-features = false }
 # Weight staging shares the emitter's TYPE-SAFE `DeviceWidth` (padding/alignment lock-down) so the
@@ -65,10 +64,8 @@ scratchy-builder-spyre = { path = "../../targets/spyre/builder", optional = true
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true }
-objc2-foundation = { version = "0.3", optional = true }
 half = { workspace = true }
 tokenizers = { workspace = true }
-tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

@@ -15,8 +15,8 @@ default = ["chat", "hf-completions"]
 
 # The in-process ENGINE (local model inference), no HTTP server: `scr chat`
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
-# feature, so no axum) + -worker.
-chat = ["dep:scratchy-serving-api", "dep:scratchy-serving-worker"]
+# feature, so no axum), which brings scratchy-serving-worker with it.
+chat = ["dep:scratchy-serving-api"]
 # The OpenAI/Anthropic HTTP server ON TOP of the engine: `scr serve` (and the
 # offline `batch` command). Adds axum/tower via scratchy-serving-api/serve.
 # Pulls `guided-decoding` too: OpenAI's `response_format: json_schema` /
@@ -24,15 +24,15 @@ chat = ["dep:scratchy-serving-api", "dep:scratchy-serving-worker"]
 # exposes a grammar flag, so plain `chat` builds skip the llguidance stack
 # (17 crates incl. a duplicate `tokenizers` pulled by toktrie_hf_tokenizers,
 # which is pinned to tokenizers 0.21 upstream while we're on 0.23).
-serve = ["dep:scratchy-serving-api", "dep:scratchy-serving-worker", "scratchy-serving-api/serve", "guided-decoding"]
+serve = ["dep:scratchy-serving-api", "scratchy-serving-api/serve", "guided-decoding"]
 # `scr launch claude` spawns `<this binary> serve` as a child, so it needs the
 # server compiled in.
 claude = ["serve"]
 
 otel = ["scratchy-serving-api?/otel"]
 bench = ["scratchy-bench"]
-cuda = ["scratchy-serving-api/cuda", "scratchy-serving-worker/cuda", "scratchy-bench?/cuda", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda"]
-nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-api/nccl", "scratchy-serving-worker/nccl"]
+cuda = ["scratchy-serving-api/cuda", "scratchy-bench?/cuda", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda"]
+nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-api/nccl"]
 profiling = ["cuda"]
 # `dep:scratchy-forward-compiler` + `scratchy-forward-compiler/metal` surface
 # `BackboneDumpRegistration` + `Instruction::normalize` so
@@ -47,7 +47,7 @@ metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-fo
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
 # get something that can actually run a model.
-spyre = ["scratchy-serving-api/spyre", "scratchy-serving-worker/spyre"]
+spyre = ["scratchy-serving-api/spyre"]
 # ANY CARD — the ONE card tier, the same name the api, worker and target crates use. This crate
 # REFERENCES it: `main.rs`'s `libc::_exit` (senlib's atexit resets the device, so the process must
 # not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never
@@ -56,12 +56,11 @@ spyre = ["scratchy-serving-api/spyre", "scratchy-serving-worker/spyre"]
 spyre-hw = [
   "spyre",
   "scratchy-serving-api/spyre-hw",
-  "scratchy-serving-worker/spyre-hw",
   # `scr bundle run`: the executor and the bundle types, directly.
   "dep:scratchy-target-spyre",
   "scratchy-target-spyre/spyre-hw",
 ]
-spyre-emu = ["scratchy-serving-api/spyre-emu", "scratchy-serving-worker/spyre-emu"]
+spyre-emu = ["scratchy-serving-api/spyre-emu"]
 # Server-side modifiers: no-op without `serve` (`?/` only forwards when
 # scratchy-serving-api is present). `guided-decoding` is pulled in by `serve`
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
@@ -128,7 +127,6 @@ scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 scratchy-serving-api = { workspace = true, optional = true }
-scratchy-serving-worker = { workspace = true, optional = true }
 scratchy-core-model = { workspace = true }
 scratchy-forward-compiler = { path = "../../compiler", optional = true }
 model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
@@ -138,11 +136,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 libc = { workspace = true }
-core-foundation = { workspace = true }
 # ureq, not reqwest: see src/http.rs. Not optional — `scr chat --url`
 # and `scr complete` are always built, and ureq is already in the tree via
 # hf-hub-downloader, so they cost no additional crates.

@@ -75,7 +75,6 @@ ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 syn = { version = "3", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
-serde = { version = "1" }
 serde_json = { workspace = true }
 rayon = { workspace = true }
 # `Implementation::fan_out` returns
