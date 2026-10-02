@@ -718,8 +718,8 @@ pub struct PointwiseGather<'a, O: KindTag> {
     /// read from its start; an unrolled sweep's trip `b` states `b · BLOCK_N`, and each leg below
     /// ADDS its own stick offset to it, so a trip's leg `k` reads index words
     /// `[first_entry + k·32, first_entry + (k+1)·32)` of the SAME buffer the one-block form reads
-    /// from its start.
-    pub first_entry: u32,
+    /// from its start. An [`EntryBase`], so it is stick-aligned by construction (issue 201 item 7).
+    pub first_entry: crate::superdsc_opspec::EntryBase,
     pub o: &'a Stk<O>,
 }
 
@@ -845,9 +845,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 // index word `first_entry` (an uncut gather's run and a one-stick gather's are both
                 // the program's own; only the CUT below adds to it). Stick-aligned, checked here:
                 // the IBR is loaded one `SenUint32` stick at a time.
-                first_entry: crate::superdsc_opspec::EntryBase::of_entries(first_entry)
-                    .assert_stick_aligned()
-                    .map_err(SuperDscError)?,
+                first_entry,
                 o_name: o.name(),
                 head_major,
             },
@@ -954,9 +952,11 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 // leg_rows/page)`, and dropping either term is every leg reading the run's first
                 // stick (the `EntryBase` type exists because the run-half of that happened).
                 // MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry `SenUint32`
-                // stick further on than leg `k-1`'s, for all eight. The anchor's stick alignment
-                // was checked at the uncut arm above; `k·cap` is a whole stick by construction.
-                first_entry: crate::superdsc_opspec::EntryBase::of_entries(first_entry + k * cap),
+                // stick further on than leg `k-1`'s, for all eight. `of_entries` IS the alignment
+                // check — it refuses both an unaligned program anchor and a leg stride that is
+                // not a whole stick (a `cap` change that breaks the stride fails HERE, at bake
+                // time, instead of gathering another run's rows on card).
+                first_entry: first_entry.plus_entries(k * cap).map_err(SuperDscError)?,
                 o_name: o.name(),
                 head_major,
             },
@@ -5304,7 +5304,7 @@ mod gather_cut {
                 inputs: &[In::scalar(&scale).ew(), In::full(&table).ew()],
                 gathered_input: 1,
                 index_name: "t0",
-                first_entry: 0,
+                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
                 o: &out,
             },
             &mut sid,

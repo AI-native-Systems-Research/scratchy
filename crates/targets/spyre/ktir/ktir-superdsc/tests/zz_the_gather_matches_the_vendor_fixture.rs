@@ -115,7 +115,9 @@ fn gather_copy_base() -> ktir_superdsc::superdsc_opspec::OpSpec {
 }
 
 /// The vendor fixture, as ground truth for the field NAMES and SHAPES.
-const VENDOR: &str = "/Users/nickm/git/deeptools/dxp/test/test_gather_1core/sdsc_1.json";
+const VENDOR_TEXT: &str = include_str!("fixtures/sdsc_gather_1core.json");
+/// IBM's paged-attention scheduler fixture — the second oracle for the kernel-less rule below.
+const PAGED_L3LU_TEXT: &str = include_str!("fixtures/sdsc_add_paged_l3lu.json");
 
 fn node<'a>(j: &'a serde_json::Value, op: &str, arg: usize) -> &'a serde_json::Value {
     &j["dscs_"][0][op]["scheduleTree_"][arg]
@@ -377,13 +379,8 @@ fn attach_gather_index_refuses_the_output_and_a_missing_operand() {
 /// instead of passing quietly: a skipped oracle is not a satisfied one.
 #[test]
 fn our_shapes_agree_with_the_vendor_fixtures_own_values() {
-    let Ok(text) = std::fs::read_to_string(VENDOR) else {
-        panic!(
-            "vendor gather fixture missing at {VENDOR} — this test's oracle is gone, so it can \
-                neither pass nor be trusted. Restore the deeptools checkout."
-        );
-    };
-    let v: serde_json::Value = serde_json::from_str(&text).expect("the fixture parses");
+    let text: &str = VENDOR_TEXT;
+    let v: serde_json::Value = serde_json::from_str(text).expect("the fixture parses");
     let tree = &v["1_identity"]["dscs_"][0]["identity"]["scheduleTree_"];
 
     // Find the vendor's index and value nodes by their own annotations.
@@ -487,13 +484,10 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
     }
 
     // ── the two vendor fixtures: neither op has a KERNEL, so neither reaches the explorer ──
-    for path in [
-        VENDOR,
-        "/Users/nickm/git/deeptools/dcg/dcg_fe/scheduler/test/sdsc_add_paged_l3lu.json",
+    for (fixture, text) in [
+        ("sdsc_gather_1core", VENDOR_TEXT),
+        ("sdsc_add_paged_l3lu", PAGED_L3LU_TEXT),
     ] {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            panic!("vendor fixture missing at {path} — this test's oracle is gone");
-        };
         // A lit-test fixture carries `//` lines; strip them before parsing.
         let json: String = text
             .lines()
@@ -501,7 +495,7 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
             .collect::<Vec<_>>()
             .join("\n");
         let v: serde_json::Value = serde_json::from_str(&json)
-            .unwrap_or_else(|e| panic!("{path} does not parse after stripping comments: {e}"));
+            .expect("a vendored fixture must parse after stripping comments");
         // Find every `primaryDsInfo_` in the file and check the ones belonging to a gather.
         let mut found = 0usize;
         let mut stack = vec![v];
@@ -513,7 +507,7 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
                     found += 1;
                     assert!(
                         !has_dimension_reuse(p),
-                        "{path}: a vendor gather op DOES have dimension reuse — the premise of this \
+                        "{fixture}: a vendor gather op DOES have dimension reuse — the premise of this \
                          test (that the vendor never gathers on a KERNEL-bearing op) is wrong, and \
                          the card refusal needs another explanation"
                     );
@@ -525,7 +519,7 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
         }
         assert!(
             found > 0,
-            "{path}: no gather op with a KERNEL_IDX role found — the fixture moved and this oracle \
+            "{fixture}: no gather op with a KERNEL_IDX role found — the fixture moved and this oracle \
              checked nothing"
         );
     }
@@ -584,13 +578,8 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
 #[test]
 fn the_index_operand_carries_the_vendors_own_dtype_and_its_own_layout() {
     // ── the ORACLE ──
-    let Ok(text) = std::fs::read_to_string(VENDOR) else {
-        panic!(
-            "vendor gather fixture missing at {VENDOR} — this test's oracle is gone, so it can \
-             neither pass nor be trusted. Restore the deeptools checkout."
-        );
-    };
-    let v: serde_json::Value = serde_json::from_str(&text).expect("the fixture parses");
+    let text: &str = VENDOR_TEXT;
+    let v: serde_json::Value = serde_json::from_str(text).expect("the fixture parses");
     let vdsc = &v["1_identity"]["dscs_"][0]["identity"];
     let vlabeled = vdsc["labeledDs_"]
         .as_array()

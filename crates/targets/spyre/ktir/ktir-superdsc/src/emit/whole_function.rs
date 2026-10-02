@@ -1456,28 +1456,15 @@ pub fn lower_function(
     // compares an emitted descriptor against the program's indirect tile.
     let gathers = gathers_of(k)?;
     // The gathered LOAD each tile's `ktdp.load` produced — the value an op's input must BE (by
-    // identity) for that tile's gather to be the one it reads. Built once here so the per-op join
-    // below is a lookup, not a re-walk the walk could disagree with.
-    let gathered_loads: std::collections::HashMap<Ssa, usize> = {
-        let mut m = std::collections::HashMap::new();
-        for (i, tile) in f
-            .operations
-            .iter()
-            .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
-            .enumerate()
-        {
-            let Some(tv) = tile.result else { continue };
-            for o in f.operations.iter() {
-                if o.op_type == OpKind::KtdpLoad
-                    && o.operands.first() == Some(&tv)
-                    && let Some(r) = o.result
-                {
-                    m.insert(r, i);
-                }
-            }
-        }
-        m
-    };
+    // identity) for that tile's gather to be the one it reads. Read straight off [`Gather::load`]:
+    // the tile walk in `gathers_of` already found each tile's load, so this is a lookup, not a
+    // re-walk that could disagree with the walk about which load belongs to which tile (issue 201
+    // item 3).
+    let gathered_loads: std::collections::HashMap<Ssa, usize> = gathers
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (g.load, i))
+        .collect();
     let mut gather_carried = vec![false; gathers.len()];
 
     for op in f.operations.iter() {
@@ -1729,9 +1716,12 @@ pub fn lower_function(
                     idx_r.is_out = false;
                     per_op.push(idx_r);
                     gather_carried[ti] = true;
-                    // ⛔ AND A SECOND CONSUMER OF ONE TILE'S GATHERED LOAD IS REFUSED HERE rather
-                    // than after the walk: the counts seal below checks the whole function, but a
-                    // mid-walk consumer list keeps the message at the op that read it twice.
+                    // ⭐ THE OP'S FIRST GATHERED INPUT, by identity. A second gathered input of the
+                    // same op is NOT checked here: this loop takes the first match, and the whole-
+                    // function consumer counting that refuses a gathered load with two consumers is
+                    // the matmul materializer's own (`gathered_matmul_materializes`). An op whose
+                    // SECOND input is also a gathered load of another tile reaches that refusal, or
+                    // the ScalarMul-only rule below — not a mid-walk one.
                     break 'g Some((g, ti, i));
                 }
             }
@@ -1750,7 +1740,7 @@ pub fn lower_function(
         // way and this is it: a KERNEL-less gathered copy writing a minted intermediate, the matmul
         // reading the intermediate as plain-B. See [`gathered_matmul_materializes`], which states the
         // whole argument and does the work.
-        let gathered_b = if let Some((g, ti, gi)) = op_gather
+        let gathered_b = if let Some((g, _ti, gi)) = op_gather
             && matches!(program, Lowering::Node(Program::Matmul))
         {
             gathered_matmul_materializes(
@@ -1763,7 +1753,6 @@ pub fn lower_function(
                     inter: &mut inter,
                 },
                 g,
-                ti,
                 gi,
                 &in_values,
             )?
@@ -1973,7 +1962,14 @@ pub fn lower_function(
                 // `k = a.c_len` the emitter itself reads; A is `per_op`'s first input).
                 Lowering::Node(Program::Matmul) => {
                     let k = per_op.first().map_or(dims[1], |a| a.c_len);
-                    [dims[0], DeviceWidth::for_output(dims[0], dims[1], k).get()]
+                    // The SAME `for_matmul` the emitter's `n_dev` takes — one decision for the
+                    // buffer this mint reserves and the width the emit writes, so they cannot
+                    // disagree (issue 201 item 4). `windowed = true`: this is the whole-function
+                    // door, where the padded weight columns would come from the caller's windows.
+                    [
+                        dims[0],
+                        DeviceWidth::for_matmul(dims[0], dims[1], k, true).get(),
+                    ]
                 }
                 _ => dims,
             };
@@ -2204,7 +2200,7 @@ fn emit_one(
                 b,
                 // This door's operands are WINDOWS of the caller's parameters — the fact the
                 // spurious-pad drop in `matmul_oriented` discriminates on.
-                true,
+                super::lower_ktir_to_superdsc::OperandOrigin::Windowed,
             )?
         }
         Program::Elementwise(e) => {
@@ -2283,7 +2279,6 @@ fn gathered_matmul_materializes(
     layout: Option<&BundleLayout>,
     emit: &mut GatherEmit<'_>,
     g: Gather,
-    tile_idx: usize,
     gathered_input: usize,
     in_values: &[Ssa],
 ) -> Result<bool, Error> {
@@ -2313,41 +2308,23 @@ fn gathered_matmul_materializes(
     let Some(b_value) = in_values.get(gathered_input).copied() else {
         return Ok(false);
     };
-    // ⭐⭐⭐ THIS TILE'S LOAD — the `ti`-th `ktdp.construct_indirect_access_tile` and the
-    // `ktdp.load` over it, enumerated in the SAME order `gathered_loads` numbered them, so the
-    // walk's join and this materializer cannot disagree about which trip's gather this is. The
-    // single-tile reading found "the" tile with `find`; a multi-trip sweep has one per trip and
-    // only the identity of the load this matmul reads picks the right one.
-    let tiles: Vec<&Operation<'_>> = f
-        .operations
-        .iter()
-        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
-        .collect();
-    let Some(indirect) = tiles.get(tile_idx) else {
+    // ⭐⭐⭐ THIS TILE, BY IDENTITY — `g.tile` is the tile's own result SSA, read once by the same
+    // walk (`gathers_of`) that built the join, so the walk and this materializer cannot disagree
+    // about which trip's gather this is (issue 201 item 3: the previous re-filter matched by
+    // enumeration index, which only agrees while every walk filters identically).
+    let Some(indirect) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
         return err(format!(
-            "{}: the walk proved input {gathered_input} reads gather #{tile_idx}, but the program \
-             states {} indirect access tile(s) — the walk and the materializer disagree about the \
-             program",
-            f.name,
-            tiles.len(),
+            "{}: the walk proved input {gathered_input} reads a gather whose tile is t{}, but no \
+             operation in this function states that result — the walk and the program disagree",
+            f.name, g.tile.0,
         ));
     };
-    let Some(indirect_result) = indirect.result else {
-        return Ok(false);
-    };
-    let gathered_result = f
-        .operations
-        .iter()
-        .find(|o| o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&indirect_result))
-        .and_then(|o| o.result);
-    let Some(gathered_result) = gathered_result else {
-        return Ok(false);
-    };
-    // ⛔ AND THE MATMUL'S GATHERED INPUT IS THAT VALUE — the identity check the tid check cannot
-    // make.
-    if b_value != gathered_result {
+    // ⛔ AND THE MATMUL'S GATHERED INPUT IS THE GATHERED LOAD — the identity check the tid check
+    // cannot make. `g.load` is the `ktdp.load` over this tile, found by the walk.
+    if b_value != g.load {
         return Ok(false);
     }
+    let gathered_result = g.load;
     let consumers = f
         .operations
         .iter()
