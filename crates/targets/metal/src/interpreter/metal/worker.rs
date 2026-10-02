@@ -10,8 +10,8 @@
 //! The execution plan partitions the bucket's command stream into
 //! [`BucketStep`]s: contiguous runs of commands sharing a pipeline
 //! become a single `BucketStep::Dispatch`; dense GEMM (f16 and bf16)
-//! bakes to a `gemm_{f16,bf16}_specialized` Dispatch step like every
-//! other kernel. MTL4 execution reads the pre-baked `mtl4_steps` from
+//! bakes to a `gemm_{f16,bf16}_specialized` Dispatch step (one row:
+//! `gemv_{f16,bf16}_specialized`) like every other kernel. MTL4 execution reads the pre-baked `mtl4_steps` from
 //! each baking; a bucket is ineligible only if a kernel exceeds the
 //! 31-entry argument-table bind cap.
 
@@ -26,9 +26,7 @@ use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 
 use super::ids::LayerId;
-use super::lowered::{
-    Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightTensor,
-};
+use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape, WeightTensor};
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
@@ -51,7 +49,8 @@ pub type ArenaLayout = Vec<u64>;
 ///
 /// `Dispatch` is a contiguous run of commands sharing a single pipeline.
 /// Dense GEMM (f16 and bf16) is a `Dispatch` step like every other
-/// kernel — `gemm_{f16,bf16}_specialized`, no MPS.
+/// kernel — `gemm_{f16,bf16}_specialized`, or `gemv_{f16,bf16}_specialized`
+/// at one row; no MPS.
 pub enum BucketStep {
     Dispatch {
         /// Kernel id of every dispatch in this step. Coalescing
@@ -1101,84 +1100,58 @@ fn bake_bucket<W: CanonicalParams>(
                 sources,
                 runtime,
             )?;
-            // f16 → `gemm_f16_specialized` (simdgroup_half8x8), bf16 →
-            // `gemm_bf16_specialized` (simdgroup_bfloat8x8). Both are
-            // custom MMA kernels routed through the same per-step
-            // dispatch plumbing as every other compute kernel — no MPS,
-            // no classic command buffer. (MPS rejects BFloat16, and we
-            // drive f16 the same way so the backend has one MTL4 GEMM
-            // path.)
-            match W::METAL_DTYPE {
-                MetalDtype::F16 | MetalDtype::Bf16 => {
-                    let pipeline = match W::METAL_DTYPE {
-                        MetalDtype::F16 => pipelines.pipeline_for_gemm_f16(dims.m, dims.n, dims.k),
-                        _ => pipelines.pipeline_for_gemm_bf16(dims.m, dims.n, dims.k),
-                    }
-                    .map_err(WorkerError::PipelineLookup)?;
-                    // gemm_{f16,bf16}_specialized binding contract:
-                    //   buffer(0) = output, buffer(1) = input, buffer(2) = weight
-                    let bindings_for_cmd: Vec<(Buffer, u64, u64)> = vec![
-                        (c.buffer.clone(), c.offset, 0u64),
-                        (a.buffer.clone(), a.offset, 1u64),
-                        (b.buffer.clone(), b.offset, 2u64),
-                    ];
-                    // Dispatch: (ceil(N/8), ceil(M/8), 1) threadgroups,
-                    // 32 threads (one simdgroup) per threadgroup.
-                    let dispatch_for_cmd = (
-                        MTLSize {
-                            width: (dims.n as u64).div_ceil(8) as usize,
-                            height: (dims.m as u64).div_ceil(8) as usize,
-                            depth: 1_usize,
-                        },
-                        MTLSize {
-                            width: 32_usize,
-                            height: 1_usize,
-                            depth: 1_usize,
-                        },
-                    );
-                    let cmd_barrier = expanded_barriers.get(cmd_idx).copied().unwrap_or(true);
-                    // Dense GEMM: M is the height axis but the bake here
-                    // is for a dense linear that always dispatches at the
-                    // actual M (no bucket_m baking), so leave m_scaling
-                    // as None.
-                    match steps.last_mut() {
-                        Some(BucketStep::Dispatch {
-                            pipeline: prev,
-                            direct_bindings,
-                            direct_dispatch,
-                            direct_m_scaling,
-                            barrier_before,
-                            runtime_gate,
-                            ..
-                        }) if same_pipeline(prev, &pipeline) => {
-                            direct_bindings.push(bindings_for_cmd);
-                            direct_dispatch.push(dispatch_for_cmd);
-                            direct_m_scaling.push(None);
-                            barrier_before.push(cmd_barrier);
-                            // Gemm path is never gated (no slice); push None
-                            // to keep the Vec aligned with `direct_dispatch`.
-                            runtime_gate.push(None);
-                        }
-                        _ => {
-                            steps.push(BucketStep::Dispatch {
-                                kernel: KernelId::Gemm,
-                                pipeline,
-                                direct_bindings: vec![bindings_for_cmd],
-                                direct_dispatch: vec![dispatch_for_cmd],
-                                direct_m_scaling: vec![None],
-                                barrier_before: vec![cmd_barrier],
-                                runtime_gate: vec![None],
-                            });
-                        }
-                    }
+            // One row: MLX's GEMV; otherwise the 8×8-tile MMA GEMM (`pipeline_for_gemm`). Both are
+            // custom kernels on the same per-step dispatch plumbing as every other compute
+            // kernel — no MPS (it rejects BFloat16), no classic command buffer.
+            let (pipeline, shape) = pipelines
+                .pipeline_for_gemm(W::METAL_DTYPE, dims)
+                .map_err(WorkerError::PipelineLookup)?;
+            // Binding contract: buffer(0) = output, buffer(1) = input, buffer(2) = weight.
+            let bindings_for_cmd: Vec<(Buffer, u64, u64)> = vec![
+                (c.buffer.clone(), c.offset, 0u64),
+                (a.buffer.clone(), a.offset, 1u64),
+                (b.buffer.clone(), b.offset, 2u64),
+            ];
+            let size = |(width, height, depth): (u32, u32, u32)| MTLSize {
+                width: width as usize,
+                height: height as usize,
+                depth: depth as usize,
+            };
+            let dispatch_for_cmd = (
+                size(shape.threadgroups),
+                size(shape.threads_per_threadgroup),
+            );
+            let cmd_barrier = expanded_barriers.get(cmd_idx).copied().unwrap_or(true);
+            // Dense GEMM: M is the height axis but the bake here is for a dense linear that
+            // always dispatches at the actual M (no bucket_m baking), so leave m_scaling as None.
+            match steps.last_mut() {
+                Some(BucketStep::Dispatch {
+                    pipeline: prev,
+                    direct_bindings,
+                    direct_dispatch,
+                    direct_m_scaling,
+                    barrier_before,
+                    runtime_gate,
+                    ..
+                }) if same_pipeline(prev, &pipeline) => {
+                    direct_bindings.push(bindings_for_cmd);
+                    direct_dispatch.push(dispatch_for_cmd);
+                    direct_m_scaling.push(None);
+                    barrier_before.push(cmd_barrier);
+                    // Gemm path is never gated (no slice); push None to keep the Vec aligned
+                    // with `direct_dispatch`.
+                    runtime_gate.push(None);
                 }
-                MetalDtype::Int4 => {
-                    return Err(WorkerError::PipelineLookup(
-                        super::pipelines::PipelineLookupError::DtypeNotYetWired(
-                            KernelId::Gemm,
-                            MetalDtype::Int4,
-                        ),
-                    ));
+                _ => {
+                    steps.push(BucketStep::Dispatch {
+                        kernel: KernelId::Gemm,
+                        pipeline,
+                        direct_bindings: vec![bindings_for_cmd],
+                        direct_dispatch: vec![dispatch_for_cmd],
+                        direct_m_scaling: vec![None],
+                        barrier_before: vec![cmd_barrier],
+                        runtime_gate: vec![None],
+                    });
                 }
             }
             continue;
@@ -1675,7 +1648,8 @@ fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
 mod tests {
     use super::*;
     use crate::interpreter::metal::lowered::{
-        Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, SourceRef, WeightTensor,
+        Binding, DispatchShape, LoweredCommand, MetalDtype, RuntimeBindingKind, SourceRef,
+        WeightTensor,
     };
     use crate::specialized_pipeline_cache::{ConstantValue, SpecializedPipelineCache};
     use scratchy_ir::CanonicalParams;
@@ -2317,7 +2291,7 @@ mod tests {
     }
 
     /// A tape carrying one `KernelId::Gemm` command bakes to an MTL4
-    /// `Dispatch` step (the `gemm_{f16,bf16}_specialized` kernel), so the
+    /// `Dispatch` step (at one row, the `gemv_{f16,bf16}_specialized` kernel), so the
     /// bucket is MTL4-eligible (`mtl4_steps` is `Some`). There is no
     /// longer an MPS / classic-command-buffer GEMM path.
     #[test]

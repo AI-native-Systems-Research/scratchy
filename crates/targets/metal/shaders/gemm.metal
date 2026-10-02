@@ -440,3 +440,141 @@ kernel void gemm_bf16_pv(
     gemm_t_bf16_blocked(output, input, weight, GEMM_M, GEMM_N, seq_used[0], GEMM_K,
                         As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
 }
+
+// ---------------------------------------------------------------------------
+// gemv_{f16,bf16}_specialized
+// ---------------------------------------------------------------------------
+//
+// One row (M == 1): output = weight @ input, the GEMM's product as MLX's GEMVKernel computes it
+// at its standard instantiation (`instantiate_gemv(name, itype, 1, 8, 1, 32, 4, 4)`; the same
+// loop `fused_gate_up_silu_mul_decode_*_specialized` runs for its gate rows). Each threadgroup's
+// 8 simdgroups split K, each thread holding 4 outputs' float sums over its 4-element slices;
+// the simdgroups reduce by shuffle, then through threadgroup memory.
+//
+// Bindings and constants are the GEMM's: buffer(0) = output [1, N], buffer(1) = input [1, K],
+// buffer(2) = weight [N, K]; 0 / 1 / 2 = M / N / K (M must be 1).
+//
+// Dispatch: threadgroups (ceil(N/4), 1, 1), threads (256, 1, 1). Needs N >= 4: the last
+// threadgroup moves back to the last 4 rows.
+// ---------------------------------------------------------------------------
+
+#ifndef MLX_MTL_PRAGMA_UNROLL
+#define MLX_MTL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
+#endif
+
+template <typename T>
+[[kernel]] void gemv_specialized(
+    device       T* output [[buffer(0)]],
+    device const T* input  [[buffer(1)]],
+    device const T* weight [[buffer(2)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    if (GEMM_M != 1u) return;
+
+    constexpr int BN = 8;              // simdgroups per threadgroup, all along K
+    constexpr int SN = 32;             // threads per simdgroup, all along K
+    constexpr int TM = 4;              // outputs per thread
+    constexpr int TN = 4;              // K elements per thread per step
+    constexpr int blockM = TM;         // outputs per threadgroup
+    constexpr int blockN = BN * SN * TN;
+
+    const int N = int(GEMM_N);
+    const int K = int(GEMM_K);
+
+    thread float result[TM] = {0};
+    thread T in_buf[TN];
+    thread T w_buf[TN];
+
+    const int sgN = int(simd_gid) % BN;
+    int bn = (SN * sgN + int(simd_lid)) * TN;
+
+    int out_row = int(tid.x) * blockM;
+    if (out_row >= N) return;
+    out_row = out_row + TM <= N ? out_row : N - TM;
+    device const T* mat = weight + uint(out_row) * uint(K);
+
+    const int n_iter = K / blockN;
+    const int leftover = K - blockN * n_iter;
+
+    for (int i = 0; i < n_iter; ++i) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+            in_buf[tn] = input[bn + tn];
+        }
+        int mat_offset = 0;
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                w_buf[tn] = mat[mat_offset + bn + tn];
+            }
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                result[tm] += float(w_buf[tn]) * float(in_buf[tn]);
+            }
+            mat_offset += K;
+        }
+        bn += blockN;
+    }
+
+    if (leftover > 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+            in_buf[tn] = (bn + tn < K) ? input[bn + tn] : T(0);
+        }
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                w_buf[tn] = (bn + tn < K) ? mat[tm * K + bn + tn] : T(0);
+            }
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                result[tm] += float(w_buf[tn]) * float(in_buf[tn]);
+            }
+        }
+    }
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int tm = 0; tm < TM; tm++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+            result[tm] += simd_shuffle_down(result[tm], sn);
+        }
+    }
+
+    threadgroup float tgp[BN * (blockM + TM)];
+    if (simd_lid == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            tgp[sgN * (blockM + TM) + tm] = result[tm];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgN == 0 && simd_lid == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int sgn = 1; sgn < BN; sgn++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                result[tm] += tgp[sgn * (blockM + TM) + tm];
+            }
+        }
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            output[out_row + tm] = T(result[tm]);
+        }
+    }
+}
+
+#define INST_GEMV(tag, T)                                                                     \
+    template [[host_name("gemv_" #tag "_specialized")]] [[kernel]] void gemv_specialized<T>(  \
+        device T* output [[buffer(0)]], device const T* input [[buffer(1)]],                  \
+        device const T* weight [[buffer(2)]], uint3 tid [[threadgroup_position_in_grid]],    \
+        uint simd_gid [[simdgroup_index_in_threadgroup]],                                     \
+        uint simd_lid [[thread_index_in_simdgroup]]);
+
+INST_GEMV(f16, half)
+INST_GEMV(bf16, bfloat)

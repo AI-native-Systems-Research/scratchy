@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-//! GEMM kernel goldens on the production MTL4 dispatch path:
-//! `gemm_{f16,bf16}_specialized` vs the CPU reference across Llama
-//! Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to
-//! 8192). These custom MMA kernels replace MPS' `MPSMatrixMultiplication`;
-//! M/N/K are baked into the pipeline as function constants, so the only
-//! bindings are output(0), input(1), weight(2).
+//! Dense GEMM goldens on the production MTL4 dispatch path, the kernel and dispatch the worker
+//! picks (`pipeline_for_gemm`: one row runs MLX's GEMV, `gemv_{f16,bf16}_specialized`; more rows
+//! the MMA GEMM, `gemm_{f16,bf16}_specialized`) vs the CPU reference across Llama
+//! Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to 8192) and Gemma-4's MoE
+//! router. M/N/K are baked into the pipeline as function constants, so the only bindings are
+//! output(0), input(1), weight(2).
 
 mod common;
 
@@ -12,7 +12,8 @@ use half::{bf16, f16};
 use objc2_metal::MTLSize;
 use scratchy_target_metal::cpu_golden;
 use scratchy_target_metal::device::detect_device;
-use scratchy_target_metal::interpreter::metal::SpecializedPipelines;
+use scratchy_target_metal::interpreter::metal::__re::ComputePipelineState;
+use scratchy_target_metal::interpreter::metal::{GemmDims, MetalDtype, SpecializedPipelines};
 use scratchy_target_metal::specialized_pipeline_cache::SpecializedPipelineCache;
 
 const SHAPES: &[(usize, usize, usize)] = &[
@@ -29,22 +30,30 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (1, 128256, 2048), // Llama-3.2-1B lm_head decode
     (1, 2048, 2048),   // Llama-3.2-1B Q/O decode
     (1, 8192, 2048),   // Llama-3.2-1B gate/up decode
+    (1, 128, 2816),    // Gemma-4-26B-A4B MoE router decode
 ];
 
-fn gemm_grid(m: usize, n: usize) -> (MTLSize, MTLSize) {
-    // Dispatch: (ceil(N/8), ceil(M/8), 1) threadgroups, one simdgroup
-    // (32 threads) each — matches the worker's bf16/f16 GEMM bake.
+/// The pipeline the worker plays a dense GEMM of `(m, n, k)` with, and its dispatch as MTL sizes.
+fn gemm(
+    pl: &SpecializedPipelines,
+    dtype: MetalDtype,
+    (m, n, k): (usize, usize, usize),
+) -> (ComputePipelineState, MTLSize, MTLSize) {
+    let dims = GemmDims {
+        m: m as u32,
+        n: n as u32,
+        k: k as u32,
+    };
+    let (pso, shape) = pl.pipeline_for_gemm(dtype, dims).expect("gemm pipeline");
+    let size = |(width, height, depth): (u32, u32, u32)| MTLSize {
+        width: width as usize,
+        height: height as usize,
+        depth: depth as usize,
+    };
     (
-        MTLSize {
-            width: (n as u64).div_ceil(8) as usize,
-            height: (m as u64).div_ceil(8) as usize,
-            depth: 1,
-        },
-        MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        },
+        pso,
+        size(shape.threadgroups),
+        size(shape.threads_per_threadgroup),
     )
 }
 
@@ -78,10 +87,7 @@ fn gemm_bf16_matches_cpu_golden() {
         let w_buf = common::shared_slice(&device, &weight);
         let out_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<bf16>());
 
-        let pso = pl
-            .pipeline_for_gemm_bf16(m as u32, n as u32, k as u32)
-            .expect("gemm_bf16 pipeline");
-        let (grid, threads) = gemm_grid(m, n);
+        let (pso, grid, threads) = gemm(&pl, MetalDtype::Bf16, (m, n, k));
         if !common::dispatch_threadgroups(
             &device,
             &pso,
@@ -136,10 +142,7 @@ fn gemm_f16_matches_cpu_golden() {
         let w_buf = common::shared_slice(&device, &weight);
         let out_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<f16>());
 
-        let pso = pl
-            .pipeline_for_gemm_f16(m as u32, n as u32, k as u32)
-            .expect("gemm_f16 pipeline");
-        let (grid, threads) = gemm_grid(m, n);
+        let (pso, grid, threads) = gemm(&pl, MetalDtype::F16, (m, n, k));
         if !common::dispatch_threadgroups(
             &device,
             &pso,

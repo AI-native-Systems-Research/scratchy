@@ -61,7 +61,11 @@ use crate::specialized_pipeline_cache::{ConstantValue, PipelineKey, SpecializedP
 use crate::stream::MetalStreamError;
 use scratchy_ir::CanonicalParams;
 
-use super::lowered::{KernelId, LoweredCommand, MetalDtype};
+use super::lowered::{DispatchShape, GemmDims, KernelId, LoweredCommand, MetalDtype};
+
+/// Outputs one threadgroup of the dense GEMV computes (MLX's `blockM`): the fewest a GEMV
+/// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
+pub const GEMV_ROWS: u32 = 4;
 
 // `KernelExtras` and friends used to live here. Every field has been
 // promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
@@ -125,54 +129,54 @@ impl SpecializedPipelines {
             .map_err(PipelineLookupError::Build)
     }
 
-    /// Bf16 GEMM pipeline keyed on the dynamic `(M, N, K)` triple.
-    /// MPS' `MPSMatrixMultiplication` doesn't accept
-    /// `MPSDataTypeBFloat16`, so the bf16 path uses the custom
-    /// `gemm_bf16_specialized` kernel (uses `simdgroup_bfloat8x8`
-    /// MMA tiles, native on M3+). Shape goes through function
-    /// constants 0 / 1 / 2 = M / N / K.
-    ///
-    /// Caller supplies the dims directly (the lowering pass has them
-    /// on `LoweredCommand.gemm_dims`); they don't sit on
-    /// `CanonicalParams` since each GEMM step has its own shape.
-    pub fn pipeline_for_gemm_bf16(
+    /// A dense GEMM's pipeline at `dtype` and its dispatch, keyed on its `(M, N, K)` (function
+    /// constants 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). One row of at
+    /// least [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV
+    /// (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per [`GEMV_ROWS`] outputs.
+    /// Otherwise the 8×8-tile GEMM (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one
+    /// simdgroup per tile. Bindings for both: output 0, input 1, weight 2.
+    pub fn pipeline_for_gemm(
         &self,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> Result<ComputePipelineState, PipelineLookupError> {
+        dtype: MetalDtype,
+        dims: GemmDims,
+    ) -> Result<(ComputePipelineState, DispatchShape), PipelineLookupError> {
+        let GemmDims { m, n, k } = dims;
+        let gemv = m == 1 && n >= GEMV_ROWS;
+        let function = match (dtype, gemv) {
+            (MetalDtype::F16, false) => "gemm_f16_specialized",
+            (MetalDtype::Bf16, false) => "gemm_bf16_specialized",
+            (MetalDtype::F16, true) => "gemv_f16_specialized",
+            (MetalDtype::Bf16, true) => "gemv_bf16_specialized",
+            (MetalDtype::Int4, _) => {
+                return Err(PipelineLookupError::DtypeNotYetWired(
+                    KernelId::Gemm,
+                    MetalDtype::Int4,
+                ));
+            }
+        };
+        let dispatch = match gemv {
+            true => DispatchShape {
+                threadgroups: (n.div_ceil(GEMV_ROWS), 1, 1),
+                threads_per_threadgroup: (256, 1, 1),
+                m_scaling: None,
+            },
+            false => DispatchShape {
+                threadgroups: (n.div_ceil(8), m.div_ceil(8), 1),
+                threads_per_threadgroup: (32, 1, 1),
+                m_scaling: None,
+            },
+        };
         let constants = vec![
             ConstantValue::uint(0, m),
             ConstantValue::uint(1, n),
             ConstantValue::uint(2, k),
         ];
-        let key = PipelineKey::new("gemm", "gemm_bf16_specialized", constants);
-        self.cache
+        let key = PipelineKey::new("gemm", function, constants);
+        let pipeline = self
+            .cache
             .get_or_build(&key)
-            .map_err(PipelineLookupError::Build)
-    }
-
-    /// f16 GEMM pipeline keyed on the dynamic `(M, N, K)` triple — the
-    /// `gemm_f16_specialized` kernel (`simdgroup_half8x8` MMA). Mirrors
-    /// [`Self::pipeline_for_gemm_bf16`] so f16 dense GEMM dispatches as a
-    /// normal MTL4 compute step instead of going through MPS' classic
-    /// `MPSMatrixMultiplication`. Shape via function constants
-    /// 0 / 1 / 2 = M / N / K.
-    pub fn pipeline_for_gemm_f16(
-        &self,
-        m: u32,
-        n: u32,
-        k: u32,
-    ) -> Result<ComputePipelineState, PipelineLookupError> {
-        let constants = vec![
-            ConstantValue::uint(0, m),
-            ConstantValue::uint(1, n),
-            ConstantValue::uint(2, k),
-        ];
-        let key = PipelineKey::new("gemm", "gemm_f16_specialized", constants);
-        self.cache
-            .get_or_build(&key)
-            .map_err(PipelineLookupError::Build)
+            .map_err(PipelineLookupError::Build)?;
+        Ok((pipeline, dispatch))
     }
 
     /// For diagnostics / tests: how many pipelines are currently

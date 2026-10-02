@@ -9,7 +9,8 @@
 //! returns `None` only when a kernel exceeds the 31-entry
 //! argument-table bind cap, and the pool asserts eligibility at forward
 //! time. (f16 and bf16 dense GEMM both run as `gemm_{f16,bf16}_specialized`
-//! Dispatch steps — there is no MPS / classic command-buffer path.)
+//! Dispatch steps, `gemv_{f16,bf16}_specialized` at one row — there is no
+//! MPS / classic command-buffer path.)
 
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
