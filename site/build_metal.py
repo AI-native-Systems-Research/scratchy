@@ -195,7 +195,10 @@ def summary_table(m, run):
         ]
         rows.append(f'<tr><th scope="row"><span class="key {cls}"></span>{name}</th>'
                     + "".join(f"<td>{v}</td>" for v in vals) + "</tr>")
-    return f"""<div class="mtable"><table>
+    return f"""<div class="mpart">
+  <h4>Startup and single-user speed</h4>
+  <p class="msub">One row per engine. Startup in seconds (warm in ms); one user at {shape or 'the base shape'}.</p>
+<div class="mtable"><table>
   <thead>
     <tr><th rowspan="2" scope="col" class="first">engine</th>
         <th colspan="4" scope="colgroup">startup</th>
@@ -209,29 +212,22 @@ def summary_table(m, run):
   <tbody>
 {chr(10).join(rows)}
   </tbody>
-</table></div>"""
+</table></div>
+</div>"""
 
 
-def conc_chart(m, mid):
-    """tok/s against offered users, one line per engine."""
-    series = []
-    for key, label, _lk, sk, cls in ENGINES:
-        pts = sorted((c["rung"], c.get("output_throughput")) for c in m.get(sk) or []
-                     if c.get("axis") == "conc" and c.get("output_throughput") is not None)
-        if pts:
-            series.append((label, cls, pts))
-    if not series:
-        return ""
-    xs = sorted({x for _, _, pts in series for x, _ in pts})
-    W, H, L, R, T, B = 560, 240, 52, 96, 14, 40
+def line_svg(series, xs, cid, ylabel, nd, title, head):
+    """One line chart: offered users on x, one line per engine. A point that
+    was not measured (None) leaves a gap in its line rather than a bridge."""
+    W, H, L, R, T, B = 400, 230, 46, 72, 12, 38
     pw, ph = W - L - R, H - T - B
-    ymax = nice_max(max(v for _, _, pts in series for _, v in pts))
+    vals = [v for _, _, pts in series for _, v in pts if v is not None]
+    ymax = nice_max(max(vals))
     xpos = {x: L + (pw * i / (len(xs) - 1) if len(xs) > 1 else pw / 2) for i, x in enumerate(xs)}
     ypos = lambda v: T + ph - ph * v / ymax
 
     out = [f'<svg viewBox="0 0 {W} {H}" class="mchart" role="img" '
-           f'aria-labelledby="{mid}-ct"><title id="{mid}-ct">Output tokens per second against '
-           f'offered concurrent users, per engine</title>']
+           f'aria-labelledby="{cid}-t"><title id="{cid}-t">{esc(title)}</title>']
     for i in range(6):
         v = ymax * i / 5
         y = ypos(v)
@@ -241,15 +237,24 @@ def conc_chart(m, mid):
         out.append(f'<text class="tick" x="{xpos[x]:.1f}" y="{T + ph + 18}" text-anchor="middle">{x}</text>')
     out.append(f'<text class="axis" x="{L + pw / 2:.1f}" y="{H - 4}" text-anchor="middle">offered concurrent users</text>')
     out.append(f'<text class="axis" x="12" y="{T + ph / 2:.1f}" text-anchor="middle" '
-               f'transform="rotate(-90 12 {T + ph / 2:.1f})">tok/s</text>')
+               f'transform="rotate(-90 12 {T + ph / 2:.1f})">{esc(ylabel)}</text>')
     out.append(f'<line class="xhair" x1="0" x2="0" y1="{T}" y2="{T + ph}" style="display:none"/>')
     ends = []
     for label, cls, pts in series:
-        d = " ".join(f"{'M' if i == 0 else 'L'}{xpos[x]:.1f},{ypos(v):.1f}" for i, (x, v) in enumerate(pts))
-        out.append(f'<path class="ln {cls}" d="{d}"/>')
-        out += [f'<circle class="dot {cls}" cx="{xpos[x]:.1f}" cy="{ypos(v):.1f}" r="4"/>' for x, v in pts]
-        x, v = pts[-1]
-        ends.append([ypos(v), xpos[x], label, cls])
+        d, pen = [], "M"
+        for x, v in pts:
+            if v is None:
+                pen = "M"
+                continue
+            d.append(f"{pen}{xpos[x]:.1f},{ypos(v):.1f}")
+            pen = "L"
+        out.append(f'<path class="ln {cls}" d="{" ".join(d)}"/>')
+        out += [f'<circle class="dot {cls}" cx="{xpos[x]:.1f}" cy="{ypos(v):.1f}" r="4"/>'
+                for x, v in pts if v is not None]
+        last = [(x, v) for x, v in pts if v is not None]
+        if last:
+            x, v = last[-1]
+            ends.append([ypos(v), xpos[x], label, cls])
     # End labels in text ink beside their line; pushed apart where lines
     # converge, with a leader back to the line end so none detaches.
     ends.sort()
@@ -266,27 +271,68 @@ def conc_chart(m, mid):
     for i, x in enumerate(xs):
         left = (xpos[xs[i - 1]] + xpos[x]) / 2 if i else L
         right = (xpos[x] + xpos[xs[i + 1]]) / 2 if i + 1 < len(xs) else L + pw
-        rows = [[fmt(dict(pts).get(x), 1), label, cls] for label, cls, pts in series]
+        rows = [[NO_STREAM if dict(pts).get(x, 0) is None else fmt(dict(pts).get(x), nd), label, cls]
+                for label, cls, pts in series]
         out.append(f'<rect class="hit" x="{left:.1f}" y="{T}" width="{right - left:.1f}" height="{ph}" '
-                   f'tabindex="0" data-x="{xpos[x]:.1f}" data-head="{x} offered users · tok/s" '
+                   f'tabindex="0" data-x="{xpos[x]:.1f}" data-head="{x} offered users · {esc(head)}" '
                    f'data-tip="{tip(rows)}"><title>{x} users</title></rect>')
     out.append("</svg>")
+    return "".join(out)
 
-    legend = "".join(f'<span><span class="lkey {cls}"></span>{esc(label)}</span>' for label, cls, _ in series)
+
+def conc_chart(m, mid):
+    """Throughput and time per output token against offered users, side by
+    side: two measures, so two charts on one x axis rather than two y axes."""
+    cells = {key: {c["rung"]: c for c in m.get(sk) or [] if c.get("axis") == "conc"}
+             for key, _l, _lk, sk, _c in ENGINES}
+    xs = sorted({x for cs in cells.values() for x in cs})
+    if not xs:
+        return ""
+
+    def series(metric):
+        out = []
+        for key, label, _lk, _sk, cls in ENGINES:
+            cs = cells[key]
+            if cs:
+                out.append((label, cls, [(x, timing(cs[x], metric)) for x in xs if x in cs]))
+        return [s for s in out if any(v is not None for _, v in s[2])]
+
+    tput, tpot = series("output_throughput"), series("median_tpot_ms")
+    charts = []
+    if tput:
+        charts.append(("Throughput", "tok/s, higher is better",
+                       line_svg(tput, xs, f"{mid}-tput", "tok/s", 1,
+                                "Output tokens per second against offered concurrent users, per engine", "tok/s"), ""))
+    if tpot:
+        # An engine that never streamed has no TPOT; say so rather than let
+        # its line silently vanish from this chart.
+        gone = [label for label, _, _ in tput if label not in {l for l, _, _ in tpot}]
+        note = f'<p class="msub">{esc(", ".join(gone))}: {NO_STREAM}, not plotted.</p>' if gone else ""
+        charts.append(("Time per output token", "ms, lower is better",
+                       line_svg(tpot, xs, f"{mid}-tpot", "ms", 1,
+                                "Median time per output token against offered concurrent users, per engine", "TPOT ms"), note))
+    shown = {label for label, _, _ in tput + tpot}
+    engines = [(label, cls) for _k, label, _lk, _sk, cls in ENGINES if label in shown]
+    # One engine needs no legend: its end label and the caption already name it.
+    legend = "".join(f'<span><span class="lkey {cls}"></span>{esc(label)}</span>'
+                     for label, cls in engines) if len(engines) > 1 else ""
     head = "".join(f"<th scope=\"col\">{x}</th>" for x in xs)
     trs = []
-    for key, label, _lk, sk, cls in ENGINES:
-        cs = {c["rung"]: c for c in m.get(sk) or [] if c.get("axis") == "conc"}
+    for key, label, _lk, _sk, cls in ENGINES:
+        cs = cells[key]
         if not cs:
             continue
         for metric, nd, name in (("output_throughput", 1, "tok/s"), ("median_ttft_ms", 0, "TTFT ms"),
                                  ("median_tpot_ms", 1, "TPOT ms")):
             trs.append(f'<tr><th scope="row">{esc(label)} · {name}</th>'
                        + "".join(f"<td>{cfmt(cs.get(x), metric, nd)}</td>" for x in xs) + "</tr>")
+    panes = "".join(f'<div class="chartpane"><div class="heatttl">{esc(t)} <span class="dim">({esc(u)})</span></div>{svg}{note}</div>'
+                    for t, u, svg, note in charts)
     return f"""<figure class="mfig">
-  <figcaption>Throughput as users are added <span class="dim">(input {esc(_base(m, 'input'))}, output {esc(_base(m, 'output'))} tokens)</span></figcaption>
+  <figcaption><h4>As users are added</h4>
+    <p class="msub">Throughput and time per output token with 1, 4 and 16 users at once; {esc(_base(m, 'input'))}-token prompts, {esc(_base(m, 'output'))}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine.</p></figcaption>
   <div class="legend">{legend}</div>
-  <div class="chartbox">{''.join(out)}</div>
+  <div class="chartrow">{panes}</div>
   <details><summary>Table view</summary><div class="mtable"><table>
     <thead><tr><th scope="col">offered users</th>{head}</tr></thead><tbody>{''.join(trs)}</tbody>
   </table></div></details>
@@ -314,6 +360,12 @@ def grid_maps(m, run):
     if not have["scratchy"] or not ins or not outs:
         return ""
     conc = (sc.get("base") or {}).get("conc", "?")
+    # Colour against mlx-lm, which runs the same MLX checkpoint; failing that,
+    # against ollama; with neither, show scratchy's own values uncoloured rather
+    # than a grid of blanks. The caption and scale say which.
+    present = [k for k in ("mlx-lm", "ollama") if have[k]]
+    rival = present[0] if present else None
+    other = present[1] if len(present) > 1 else None
 
     def one(metric, title, faster):
         rows = []
@@ -321,18 +373,23 @@ def grid_maps(m, run):
             tds = []
             for o in outs:
                 rung = f"{i}x{o}"
-                cs, cm, co = (have[k].get(rung) for k in ("scratchy", "mlx-lm", "ollama"))
-                s, mx, ol = timing(cs, metric), timing(cm, metric), timing(co, metric)
-                r_m, r_o = faster(s, mx), faster(s, ol)
+                get = lambda k: have[k].get(rung) if k else None
+                cs, cr, co = get("scratchy"), get(rival), get(other)
+                s, vr, vo = timing(cs, metric), timing(cr, metric), timing(co, metric)
+                r_r, r_o = faster(s, vr), faster(s, vo)
                 nd = 1 if metric == "output_throughput" else 0
-                tiprows = [[cfmt(c, metric, nd), name, cls] for c, name, cls in
-                           ((cs, "scratchy", "s1"), (cm, "mlx-lm", "s2"), (co, "ollama", "s3"))]
+                tiprows = [[cfmt(have[k].get(rung), metric, nd), k, cls]
+                           for k, _l, _lk, _sk, cls in ENGINES if have[k]]
                 why = lambda c, name: f"{name}: {NO_STREAM}" if c else f"no {name}"
-                big = (f"×{r_m:.2f}" if r_m is not None
-                       else why(cs, "scratchy") if s is None else why(cm, "mlx-lm"))
-                small = (f"vs ollama ×{r_o:.2f}" if r_o is not None
-                         else "" if s is None else why(co, "ollama"))
-                tds.append(f'<td{ratio_tint(r_m)} tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
+                unit = "tok/s" if metric == "output_throughput" else "ms"
+                if rival is None:                 # nothing to compare against
+                    big, small = cfmt(cs, metric, nd), unit if s is not None else ""
+                else:
+                    big = (f"×{r_r:.2f}" if r_r is not None
+                           else why(cs, "scratchy") if s is None else why(cr, rival))
+                    small = (f"vs {other} ×{r_o:.2f}" if r_o is not None
+                             else "" if s is None or not other else why(co, other))
+                tds.append(f'<td{ratio_tint(r_r)} tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
                            f'data-tip="{tip(tiprows)}"><b>{big}</b><span>{small}</span></td>')
             rows.append(f'<tr><th scope="row">{i}</th>{"".join(tds)}</tr>')
         head = "".join(f'<th scope="col">{o}</th>' for o in outs)
@@ -344,13 +401,25 @@ def grid_maps(m, run):
 
     tput = lambda s, o: s / o if s and o else None    # higher is better
     ttft = lambda s, o: o / s if s and o else None    # lower is better
+    if rival is None:
+        note = "scratchy's own values; this run has no mlx-lm or ollama to compare against"
+        scale = ""
+    else:
+        missing = [k for k in ("mlx-lm", "ollama") if not have[k]]
+        note = (f"how many times faster scratchy is than {rival}"
+                + (f", since this run has no {missing[0]}" if missing else "")
+                + "; hover for every engine's value")
+        scale = (f'<div class="scale"><span><i class="sw neg"></i>{rival} faster</span>'
+                 '<span><i class="sw mid"></i>about the same</span>'
+                 '<span><i class="sw pos"></i>scratchy faster</span></div>')
     return f"""<figure class="mfig">
-  <figcaption>Prompt size × answer size, {esc(conc)} users <span class="dim">(how many times faster scratchy is than mlx-lm; hover for every engine's value)</span></figcaption>
+  <figcaption><h4>Prompt size × answer size</h4>
+    <p class="msub">{esc(conc)} users at once. {note[0].upper() + note[1:]}.</p></figcaption>
   <div class="heatrow">
   {one("output_throughput", "throughput", tput)}
   {one("median_ttft_ms", "time to first token", ttft)}
   </div>
-  <div class="scale"><span><i class="sw neg"></i>mlx-lm faster</span><span><i class="sw mid"></i>about the same</span><span><i class="sw pos"></i>scratchy faster</span></div>
+  {scale}
 </figure>"""
 
 
@@ -370,7 +439,7 @@ def history(entries):
             tds = '<td colspan="4" class="gap">no numbers</td>'
         rows.append(f'<tr><th scope="row">{run["generated_utc"][:10]}</th>'
                     f'<td><a href="{REPO}/commit/{esc(run["repo"]["sha"])}"><code>{sha}</code></a>'
-                    f'{" <span class=dim>+ uncommitted</span>" if run["repo"].get("dirty") else ""}</td>'
+                    '</td>'
                     f'<td>{esc(m.get("quant") or "")}</td>{tds}</tr>')
     return f"""<details class="hist"><summary>Earlier runs of this model ({len(entries) - 1})</summary><div class="mtable"><table>
   <thead><tr><th scope="col">run</th><th scope="col">scratchy</th><th scope="col">quant</th>
@@ -381,20 +450,19 @@ def history(entries):
 def runs_table(runs):
     rows = []
     for run in reversed(runs):
-        r, c, mc = run["repo"], run["config"], run["machine"]
+        r, c = run["repo"], run["config"]
         prime = c.get("cold_priming_launches")
         rows.append(
             f'<tr><th scope="row">{esc(run["generated_utc"][:16].replace("T", " "))} UTC</th>'
             f'<td><a href="{REPO}/commit/{esc(r["sha"])}"><code>{esc(str(r["sha"])[:8])}</code></a>'
-            f'{" <span class=dim>+ uncommitted changes</span>" if r.get("dirty") else ""}</td>'
+            '</td>'
             f'<td>{esc(", ".join(c.get("scenarios") or []))}</td>'
             f'<td>{prime if prime is not None else "not recorded"}</td>'
             f'<td>{esc(c.get("kv_cache_dtype") or "")}</td>'
-            f'<td>{esc(mc.get("power") or "not recorded")}</td>'
             f'<td><a href="data/metal/{esc(run["_file"].name)}">json</a></td></tr>')
     return f"""<details class="hist"><summary>Runs on this machine ({len(runs)})</summary><div class="mtable"><table>
   <thead><tr><th scope="col">when</th><th scope="col">scratchy</th><th scope="col">steps</th>
-  <th scope="col">cold priming launches</th><th scope="col">scratchy KV cache</th><th scope="col">power</th><th scope="col">data</th></tr></thead>
+  <th scope="col">cold priming launches</th><th scope="col">scratchy KV cache</th><th scope="col">data</th></tr></thead>
   <tbody>{''.join(rows)}</tbody></table></div></details>"""
 
 
@@ -421,7 +489,7 @@ def machine_section(chip, runs):
         if f.get("build_seconds") is not None:
             build = f' · scratchy build {f["build_seconds"]} s, {round(f["binary_bytes"] / 1048576)} MiB binary'
         parts.append(f"""  <article class="mmodel" id="{mid}">
-    <h3>{esc(stem)}</h3>
+    <h3>{esc(stem)} <span class="onmachine">on {esc(chip)}</span></h3>
     <p class="mmeta"><a href="https://huggingface.co/{esc(m["model_id"])}">{esc(m["model_id"])}</a>
       · {esc(m.get("quant") or "default")}{build}
       · run {esc(run["generated_utc"][:10])}, <code>{esc(str(run["repo"]["sha"])[:8])}</code></p>
@@ -448,17 +516,10 @@ def page(header, data_dir):
     nav = "\n".join(
         f'      <cds-side-nav-link href="#{slug(chip)}">{esc(chip)}</cds-side-nav-link>'
         for chip in sorted(machines))
-    flags = []
-    if any(r["repo"].get("dirty") for r in runs):
-        flags.append("<li>Some runs were made from a tree with <b>uncommitted changes</b>; the runs table marks which.</li>")
-    if any("battery" in (r["machine"].get("power") or "").lower() for r in runs):
-        flags.append("<li>Some runs were made <b>on battery power</b>, which can slow a Mac down; the runs table marks which.</li>")
-
     out = PAGE
     for key, val in {
         "{header}": header,
         "{nav}": nav,
-        "{flags}": "\n".join(flags),
         "{body}": body,
         "{count}": str(len(runs)),
         "{machines}": str(len(machines)),
@@ -536,33 +597,33 @@ PAGE = r"""<!doctype html>
 
   <section class="msection" id="about">
     <h2>About these numbers</h2>
-    <ul class="caveats">
-      <li><b>Made-up prompts, not real traffic.</b> Each request gets a unique random prompt at a
-      fixed size, so no engine can answer from a cache. This measures the engine, not a workload.</li>
-      <li><b>Startup:</b> <i>frozen</i> is a first-ever launch (memory cleared, scratchy's weights
-      cache deleted); <i>cold</i> is a normal launch after earlier ones. Both are launch until the
-      server answers "ready", with no request in them. <i>1st req</i> is the cold server's first
-      request, send to first token. <i>warm</i> is the median send to first token over unique
-      prompts to a server that has already answered once.</li>
-      <li><b>ollama says "ready" before it loads the model.</b> Its server answers at once and
-      loads the model on the first request, so its frozen and cold times are small and its
-      load time shows up in <i>1st req</i> instead.</li>
-      <li><b>scratchy compiles the model into its binary.</b> Build time and binary size are shown
-      per model and are not part of any startup number. Build time is the runner's own
-      <code>cargo build</code>, so a model built just before reads as a second or two.</li>
-      <li><b>ollama runs different weights</b> (its own GGUF quantization, named per row), so its
-      numbers mix engine and quantizer. mlx-lm runs the same MLX checkpoint as scratchy.</li>
-      <li><b>mlx-lm and ollama can stop answers early</b> (they ignore "don't stop"), so compare
-      TTFT and TPOT; tok/s can flatter an engine that generated less.</li>
-      <li><b>"no stream"</b> means the engine sent its whole answer at once (or a single
-      token), so there was no first token or per-token interval to time; its TTFT would be
-      the whole answer's time. ollama's gemma4 does this.</li>
-      <li><b>Users are offered, not achieved:</b> "16 users" means up to 16 requests in flight;
-      an engine may batch fewer.</li>
-      <li><b>Peak RSS</b> is the server process. For ollama that is <code>ollama serve</code>
-      only; its runner process is not counted.</li>
-{flags}
-    </ul>
+    <dl class="defs">
+      <dt>Prompts</dt>
+      <dd>Made up, a fixed size, and unique per request so no cache can answer them. Greedy
+      decoding (<code>temperature 0</code>) on every engine.</dd>
+      <dt>frozen · cold</dt>
+      <dd>Launch until the server is ready, no request included. <i>frozen</i>: memory and
+      scratchy's weights cache cleared first. <i>cold</i>: a normal relaunch.</dd>
+      <dt>1st req · warm</dt>
+      <dd>Send to first token: the cold server's first request, then the median over many
+      requests once it is running.</dd>
+      <dt>Users</dt>
+      <dd>Requests in flight at once. An engine may batch fewer.</dd>
+      <dt>Weights</dt>
+      <dd>mlx-lm runs the same MLX checkpoint as scratchy; ollama runs its own GGUF
+      quantization, named on its row.</dd>
+      <dt>ollama startup</dt>
+      <dd>It reports ready before loading the model, so its load time lands in
+      <i>1st req</i>.</dd>
+      <dt>tok/s</dt>
+      <dd>mlx-lm and ollama can stop early, which flatters tok/s; TTFT and TPOT compare
+      fairly.</dd>
+      <dt>no stream</dt>
+      <dd>The answer arrived in one piece, so TTFT and TPOT could not be timed.</dd>
+      <dt>Build · RSS</dt>
+      <dd>scratchy's build time is shown per model, never in startup. Peak RSS is the server
+      process (<code>ollama serve</code> only, for ollama).</dd>
+    </dl>
   </section>
 
 {body}
