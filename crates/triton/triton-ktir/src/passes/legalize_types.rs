@@ -77,23 +77,20 @@ fn is_descriptor_or_ktdp_op(op: &Op) -> bool {
 
 /// --- Step 1: remove `arith.extf` (f16 -> f32).
 fn step_1_remove_extf(module: &mut Module) {
-    loop {
-        // ONE `find` with the WHOLE predicate. Finding on `kind` and then filtering
-        // the Option stops at the first extf that is not f16->f32 and leaves every
-        // later one in place -- a partial collapse, which is the silent-wrong-answer
-        // shape this pass exists to avoid.
-        let Some(path) = walk::paths(module).into_iter().find(|p| {
-            let op = walk::at(module, p).expect("path");
-            if op.kind != OpKind::ArithExtf {
-                return false;
-            }
-            let in_elem =
-                op.operands.first().and_then(|v| module.type_of(*v)).and_then(|t| t.elem());
-            let out_elem = op.result_type().and_then(|t| t.elem());
-            in_elem == Some(DType::F16) && out_elem == Some(DType::F32)
-        }) else {
-            break;
-        };
+    // ONE `find` with the WHOLE predicate. Finding on `kind` and then filtering
+    // the Option stops at the first extf that is not f16->f32 and leaves every
+    // later one in place -- a partial collapse, which is the silent-wrong-answer
+    // shape this pass exists to avoid.
+    while let Some(path) = walk::paths(module).into_iter().find(|p| {
+        let op = walk::at(module, p).expect("path");
+        if op.kind != OpKind::ArithExtf {
+            return false;
+        }
+        let in_elem =
+            op.operands.first().and_then(|v| module.type_of(*v)).and_then(|t| t.elem());
+        let out_elem = op.result_type().and_then(|t| t.elem());
+        in_elem == Some(DType::F16) && out_elem == Some(DType::F32)
+    }) {
         let op = walk::at(module, &path).expect("path").clone();
         let (from, to) = (op.results[0], op.operands[0]);
         walk::replace_all_uses(module, from, to);
@@ -228,18 +225,15 @@ fn step_2b_island_constants(module: &mut Module) {
 
 /// --- Step 3: remove the now-redundant `arith.truncf` (f16 -> f16).
 fn step_3_remove_truncf(module: &mut Module) {
-    loop {
-        let Some(path) = walk::paths(module).into_iter().find(|p| {
-            let op = walk::at(module, p).expect("path");
-            if op.kind != OpKind::ArithTruncf {
-                return false;
-            }
-            let in_elem = op.operands.first().and_then(|v| module.type_of(*v)).and_then(|t| t.elem());
-            let out_elem = op.result_type().and_then(|t| t.elem());
-            in_elem == Some(DType::F16) && out_elem == Some(DType::F16)
-        }) else {
-            break;
-        };
+    while let Some(path) = walk::paths(module).into_iter().find(|p| {
+        let op = walk::at(module, p).expect("path");
+        if op.kind != OpKind::ArithTruncf {
+            return false;
+        }
+        let in_elem = op.operands.first().and_then(|v| module.type_of(*v)).and_then(|t| t.elem());
+        let out_elem = op.result_type().and_then(|t| t.elem());
+        in_elem == Some(DType::F16) && out_elem == Some(DType::F16)
+    }) {
         let op = walk::at(module, &path).expect("path").clone();
         let (from, to) = (op.results[0], op.operands[0]);
         walk::replace_all_uses(module, from, to);

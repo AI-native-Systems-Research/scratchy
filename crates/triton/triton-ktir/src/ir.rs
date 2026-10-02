@@ -815,11 +815,7 @@ impl IrType {
     /// Is this a COMPUTE-DOMAIN f32 -- an f32 scalar or an f32-elemented tensor?
     /// `LegalizeTypes::isComputeF32`.
     pub fn is_compute_f32(&self) -> bool {
-        match self {
-            IrType::Scalar(DType::F32) => true,
-            IrType::Tensor { elem: DType::F32, .. } => true,
-            _ => false,
-        }
+        matches!(self, IrType::Scalar(DType::F32) | IrType::Tensor { elem: DType::F32, .. })
     }
 
     /// Does this carry f32 but sit OUT OF SCOPE for `LegalizeTypes` -- a ptr,

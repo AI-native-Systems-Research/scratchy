@@ -320,9 +320,7 @@ fn an_absent_table_row_expands_to_zero_and_that_diverges() {
     // RETARGET ONE ID AT THAT ABSENT ROW. Token 0 then reads zeros, so its whole output row becomes
     // zero and the deviation from the fixture's reference is that row's own energy.
     let mut mutated = reference.clone();
-    for j in 0..d_model {
-        mutated[j] = 0.0;
-    }
+    mutated[..d_model].fill(0.0);
     let (dev, bound) = mutants::max_abs_deviation(&reference, &mutated, &env);
     let ratio = mutants::worst_ratio(&reference, &mutated, &env);
     let range = reference.iter().fold(0.0f64, |m, &x| m.max(x.abs()));

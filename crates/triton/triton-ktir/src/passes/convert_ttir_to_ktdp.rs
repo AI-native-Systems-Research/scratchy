@@ -68,14 +68,11 @@ pub fn run(module: &mut Module) -> Result<()> {
 /// wrapped in an `unrealized_conversion_cast` so the `!tt.tensordesc`-typed uses
 /// keep verifying. The access-op patterns pick the memref up through that cast.
 fn walk_1_descriptors(module: &mut Module) -> Result<()> {
-    loop {
-        let Some(path) = walk::paths(module).into_iter().find(|p| {
-            walk::at(module, p)
-                .map(|o| o.kind == OpKind::TtMakeTensorDescriptor)
-                .unwrap_or(false)
-        }) else {
-            break;
-        };
+    while let Some(path) = walk::paths(module).into_iter().find(|p| {
+        walk::at(module, p)
+            .map(|o| o.kind == OpKind::TtMakeTensorDescriptor)
+            .unwrap_or(false)
+    }) {
         let desc = walk::at(module, &path).expect("path").clone();
         let result = desc.result().ok_or_else(|| {
             Refusal::new(PASS, "tt.make_tensor_descriptor defines no descriptor")
@@ -330,16 +327,13 @@ fn descriptor_mem_view(module: &Module, access: &Op) -> Option<Ssa> {
 }
 
 fn convert_access_ops(module: &mut Module) -> Result<()> {
-    loop {
-        let Some(path) = walk::paths(module).into_iter().find(|p| {
-            walk::at(module, p)
-                .map(|o| {
-                    matches!(o.kind, OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore)
-                })
-                .unwrap_or(false)
-        }) else {
-            break;
-        };
+    while let Some(path) = walk::paths(module).into_iter().find(|p| {
+        walk::at(module, p)
+            .map(|o| {
+                matches!(o.kind, OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore)
+            })
+            .unwrap_or(false)
+    }) {
         let op = walk::at(module, &path).expect("path").clone();
         let view = descriptor_mem_view(module, &op)
             .ok_or_else(|| Refusal::new(PASS, "descriptor operand was not lowered by walk 1"))?;

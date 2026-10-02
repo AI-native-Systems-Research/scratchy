@@ -51,19 +51,10 @@ fn fmt_float(bits: F64Bits, ty: &Type) -> String {
 }
 
 /// MLIR's full-precision fallback spelling: shortest round-tripping digits, capital `E`, and an
-/// unpadded exponent -- `9.99999974E-6`.
+/// unpadded exponent -- `9.99999974E-6`. Rust's `{:E}` already omits the fractional part when
+/// the mantissa is integral, so no re-spelling is needed.
 fn fmt_exp_upper(v: f64) -> String {
-    let s = format!("{v:E}");
-    match s.split_once('E') {
-        Some((mant, exp)) => {
-            if mant.contains('.') {
-                format!("{mant}E{exp}")
-            } else {
-                format!("{mant}E{exp}")
-            }
-        }
-        None => s,
-    }
+    format!("{v:E}")
 }
 
 fn fmt_float_6(bits: F64Bits) -> String {

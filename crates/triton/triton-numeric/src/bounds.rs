@@ -422,14 +422,13 @@ pub fn round_f16(x: f64) -> f64 {
     let n = a / quantum;
     let fl = n.floor();
     let frac = n - fl;
-    let r = if frac > 0.5 {
+    // Round to nearest, ties to EVEN (the codec's mode). Below the tie and tie-to-even
+    // both stay on `fl`; above the tie and tie-to-odd both move up -- four cases, two
+    // values, kept spelled out because the tie is the rule this function models.
+    let r = if frac > 0.5 || (frac == 0.5 && (fl as i64) % 2 != 0) {
         fl + 1.0
-    } else if frac < 0.5 {
-        fl
-    } else if (fl as i64) % 2 == 0 {
-        fl // tie -> even
     } else {
-        fl + 1.0
+        fl
     };
     sign * r * quantum
 }
@@ -962,7 +961,9 @@ mod tests {
         assert!(f16_exact(12.0));
         assert_eq!(const_rel_error(12.0), 0.0);
         // 1e-5 is BELOW f16's smallest normal, so it lands on the subnormal grid and is not exact.
-        assert!(1e-5 < F16_MIN_NORMAL);
+        // A const block, not a runtime assert: the fact this test reasons from is a property of
+        // the constants themselves, and the compiler can check it for free.
+        const { assert!(1e-5 < F16_MIN_NORMAL) };
         assert!(!f16_exact(1e-5));
         let e = const_rel_error(1e-5);
         assert!(e > 1e-4 && e < 2e-3, "eps rel error {e} out of expected decade");

@@ -295,7 +295,7 @@ fn cases() -> Vec<Case> {
             ("HALF", Val::Int(64)),
             ("EPS", Val::Float(1e-05)),
             ("INV_D", Val::Float(1.0 / 128.0)),
-            ("QK_SCALE", Val::Float(0.0078125 * 1.44269504)),
+            ("QK_SCALE", Val::Float(0.011271055)), // 0.0078125 * 1.44269504, folded (Python's literal, bit-identical)
             ("RM", Val::Float(0.22)),
         ]
     };
@@ -565,7 +565,7 @@ fn canonicalize_leading_constants(m: &mut Module) {
         };
         format!("{}|{ty}|{payload}", o.kind.spelling())
     }
-    fn walk(ops: &mut Vec<triton_ktir::ir::Op>) {
+    fn walk(ops: &mut [triton_ktir::ir::Op]) {
         for o in ops.iter_mut() {
             for r in &mut o.regions {
                 walk(&mut r.ops);
@@ -578,7 +578,7 @@ fn canonicalize_leading_constants(m: &mut Module) {
                     && o.regions.is_empty()
             })
             .count();
-        let snapshot = ops.clone();
+        let snapshot = ops.to_vec();
         ops[..n].sort_by_key(|o| key(&snapshot, o));
     }
     walk(&mut m.ops);
@@ -661,9 +661,10 @@ fn fold_dead_dot_transposes(m: &mut Module) {
     walk(&mut m.ops, &fold, &dead);
 }
 
-/// What one configuration produced, so the report is data rather than prose.
+/// What one configuration produced, so the report is data rather than prose. The
+/// configuration's own name is not repeated here: every report site has the `Case` in
+/// hand and prints `case.name` directly.
 struct Outcome {
-    name: &'static str,
     /// `Ok` carries the converted-and-lowered module; `Err` a refusal, verbatim.
     result: std::result::Result<Module, String>,
     /// Ops in the post-`make_ttir` ttir, and ops after the adapter. MUST be equal.
@@ -679,7 +680,6 @@ fn run(case: &Case) -> Outcome {
         Ok(m) => m,
         Err(e) => {
             return Outcome {
-                name: case.name,
                 result: Err(format!("bridge one refused: {e}")),
                 census_in: 0,
                 census_out: 0,
@@ -688,7 +688,6 @@ fn run(case: &Case) -> Outcome {
     };
     if let Err(e) = opt::make_ttir(&mut m) {
         return Outcome {
-            name: case.name,
             result: Err(format!("make_ttir refused: {e}")),
             census_in: 0,
             census_out: 0,
@@ -699,7 +698,6 @@ fn run(case: &Case) -> Outcome {
         Ok(k) => k,
         Err(e) => {
             return Outcome {
-                name: case.name,
                 result: Err(format!("from_ttir refused: {e}")),
                 census_in,
                 census_out: 0,
@@ -709,13 +707,12 @@ fn run(case: &Case) -> Outcome {
     let (_, census_out) = from_ttir::census_ktir(&k);
     if let Err(e) = triton_ktir::make_ktir(&mut k, &case.grid) {
         return Outcome {
-            name: case.name,
             result: Err(format!("make_ktir refused: {e}")),
             census_in,
             census_out,
         };
     }
-    Outcome { name: case.name, result: Ok(k), census_in, census_out }
+    Outcome { result: Ok(k), census_in, census_out }
 }
 
 /// THE HEADLINE: our KTIR against the C++ chain's, per configuration.
@@ -1288,7 +1285,7 @@ fn the_control_agrees_with_itself() {
 /// asserts nothing, which is the failure this helper exists to remove.
 fn mutate_first(m: &mut Module, f: &mut impl FnMut(&mut triton_ktir::ir::Op) -> bool) -> bool {
     fn walk(
-        ops: &mut Vec<triton_ktir::ir::Op>,
+        ops: &mut [triton_ktir::ir::Op],
         f: &mut impl FnMut(&mut triton_ktir::ir::Op) -> bool,
     ) -> bool {
         for o in ops.iter_mut() {

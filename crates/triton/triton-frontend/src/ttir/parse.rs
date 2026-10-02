@@ -123,16 +123,13 @@ pub fn unquote_symbol(s: &str) -> String {
 fn parse_shaped(s: &str) -> Option<(Vec<i64>, Type)> {
     let mut dims = Vec::new();
     let mut rest = s;
-    loop {
-        match rest.split_once('x') {
-            Some((head, tail)) => match head.parse::<i64>() {
-                Ok(d) => {
-                    dims.push(d);
-                    rest = tail;
-                }
-                Err(_) => break,
-            },
-            None => break,
+    while let Some((head, tail)) = rest.split_once('x') {
+        match head.parse::<i64>() {
+            Ok(d) => {
+                dims.push(d);
+                rest = tail;
+            }
+            Err(_) => break,
         }
     }
     Some((dims, parse_type(rest)?))
@@ -493,6 +490,7 @@ fn parse_func(p: &mut Parser, no: usize, line: &str) -> Result<Func, ParseError>
 ///   * `^bb1:  // no predecessors` -- the unreachable block `visit_Return` creates so the
 ///     terminator ends its own block; every generated `standard.*` helper has one.
 ///   * `^bb0(%a: f32, %b: f32):`   -- a `tt.reduce` region's entry block and its arguments.
+///
 /// Returns the CLOSING LINE, which is not incidental: MLIR prints a region-carrying op's
 /// location AFTER its body, so `scf.for`'s `loc(...)` is on the `}` line and the opening line
 /// has none. Reading only the opening line left every `scf.for` with an unnamed location and
@@ -775,8 +773,8 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
                 ),
                 None => (spec.trim_start_matches('%').to_string(), 1),
             };
-            for k in 0..count.min(result_types.len()) {
-                let id = p.new_value(result_types[k].clone(), loc.clone());
+            for (k, ty) in result_types.iter().take(count).enumerate() {
+                let id = p.new_value(ty.clone(), loc.clone());
                 op.results.push(id);
                 if count == 1 {
                     p.scope.insert(base.clone(), id);
@@ -854,8 +852,8 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
                 result_types.len()
             );
         }
-        for k in 0..count {
-            let id = p.new_value(result_types[k].clone(), loc.clone());
+        for (k, ty) in result_types.iter().take(count).enumerate() {
+            let id = p.new_value(ty.clone(), loc.clone());
             op.results.push(id);
             if count == 1 {
                 p.scope.insert(base.clone(), id);

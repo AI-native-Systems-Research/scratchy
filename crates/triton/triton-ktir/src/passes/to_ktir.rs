@@ -1610,7 +1610,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
         }
         // The tile feeds a matmul input: some linalg.matmul's operand, transitively
         // through the cast/broadcast chain the conversions build.
-        feeds_matmul_input(module, &body, o.result().expect("load result"))
+        feeds_matmul_input(&body, o.result().expect("load result"))
     });
     if !fires {
         return Ok(());
@@ -1880,8 +1880,8 @@ fn replace_operand_everywhere(ops: &mut [Op], from: &[Ssa], to: Ssa) {
 /// `matmul_oriented`'s `base_addressed` refuses a computed row corner on a matmul input,
 /// while pointwise/store operands ride the door's whole-node addressing -- so the unroll
 /// must fire on the one and not the other.
-fn feeds_matmul_input(module: &Module, ops: &[Op], v: Ssa) -> bool {
-    fn go(module: &Module, ops: &[Op], v: Ssa, depth: usize) -> bool {
+fn feeds_matmul_input(ops: &[Op], v: Ssa) -> bool {
+    fn go(ops: &[Op], v: Ssa, depth: usize) -> bool {
         if depth > 16 {
             return false;
         }
@@ -1915,17 +1915,13 @@ fn feeds_matmul_input(module: &Module, ops: &[Op], v: Ssa) -> bool {
                 continue;
             }
             // Recurse into regions (a loop-carried feed still lands in the matmul).
-            if !o.regions.is_empty()
-                && o.regions
-                    .iter()
-                    .any(|r| go(module, &r.ops, v, depth + 1))
-            {
+            if !o.regions.is_empty() && o.regions.iter().any(|r| go(&r.ops, v, depth + 1)) {
                 return true;
             }
         }
         false
     }
-    go(module, ops, v, 0)
+    go(ops, v, 0)
 }
 
 /// A `linalg.matmul`'s THIRD OPERAND IS AN ACCUMULATOR, AND THE WHOLE-FUNCTION DOOR READS TWO.
@@ -2407,7 +2403,9 @@ fn sub_feeds_only_exp2(module: &Module, sub: Ssa) -> bool {
         }
         let other = if u.operands[0] == sub { u.operands[1] } else { u.operands[0] };
         let Some(s) = splat_value(module, other) else { return false };
-        if !(s.as_f64() > 0.0) {
+        // `<=` rather than `!(> )`: the splat could be NaN, and a NaN is not a positive
+        // scale -- the partial-order comparison makes that explicit.
+        if s.as_f64() <= 0.0 {
             return false;
         }
         let mul_res = u.results.first().copied().expect("mulf has a result");

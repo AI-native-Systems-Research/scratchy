@@ -9,8 +9,7 @@
 //!
 //!   * [`Expect::Matches`] -- compiles AND agrees with its `.ttir_raw.mlir` golden
 //!     structurally, field by field.
-//!   * [`Expect::RefusedContaining`] -- does NOT compile, and the refusal message contains
-//!     the given text. This is the FAIL-CLOSED half: an unimplemented construct must
+//!   * [`Expect::RefusedWithNoGolden`] -- does NOT compile (refusal message pinned), and This is the FAIL-CLOSED half: an unimplemented construct must
 //!     produce a named error, never a partial module that looks plausible. A fixture that
 //!     starts compiling will fail this test and force the status to be updated with a
 //!     golden diff, which is the point.
@@ -43,10 +42,9 @@ enum Expect {
     /// [`Expect::MatchesAt`]. A stale golden must not be able to fail silently OR pass
     /// silently.
     MatchesStaleGolden(Target, usize),
-    /// Refused, with a message containing this substring.
-    RefusedContaining(&'static str),
     /// Refused, and there is deliberately NO golden either -- the Python toolchain cannot
-    /// produce one.
+    /// produce one. (A refused-with-golden expectation existed in the source tree but no
+    /// fixture used it; resurrect it with its two match arms when one lands.)
     RefusedWithNoGolden(&'static str),
 }
 
@@ -209,32 +207,6 @@ fn every_fixture_has_the_expected_status() {
             (Expect::MatchesStaleGolden(_, _), Err(e)) => {
                 failures.push(format!(
                     "{}: expected to compile against a STALE golden but was refused: {e}",
-                    case.name
-                ));
-            }
-            (Expect::RefusedContaining(needle), Err(e)) => {
-                let msg = e.to_string();
-                if !msg.contains(needle) {
-                    failures.push(format!(
-                        "{}: refused, but the message does not name `{needle}`. \
-                         A refusal that does not say what is missing is not fail-closed. \
-                         Got: {msg}",
-                        case.name
-                    ));
-                }
-                if golden.is_none() {
-                    failures.push(format!(
-                        "{}: expected a golden to exist for this configuration, but none \
-                         was found -- regenerate with tools/gen_ttir_goldens.py",
-                        case.name
-                    ));
-                }
-            }
-            (Expect::RefusedContaining(_), Ok(_)) => {
-                failures.push(format!(
-                    "{}: NOW COMPILES. That is progress, but the status table says it \
-                     should be refused -- change its entry to Expect::Matches and make the \
-                     golden diff pass.",
                     case.name
                 ));
             }

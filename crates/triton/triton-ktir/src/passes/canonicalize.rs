@@ -266,7 +266,7 @@ fn hoist_constants(module: &mut Module) {
 }
 
 /// Lift constants out of nested regions, in program order.
-fn collect_constants(ops: &mut Vec<Op>, out: &mut Vec<Op>) {
+fn collect_constants(ops: &mut [Op], out: &mut Vec<Op>) {
     for op in ops.iter_mut() {
         for r in op.regions.iter_mut() {
             let mut keep: Vec<Op> = Vec::new();

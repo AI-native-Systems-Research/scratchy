@@ -50,13 +50,13 @@ pub struct Target {
     pub div_promotes_narrow_floats: bool,
 
     /// Emit the integer-overflow check `binary_op_sanitize_overflow_impl` builds around
-    /// every `+`, `-`, `*` on integers narrower than 64 bits
+    /// every `+`, `-`, or `*` on integers narrower than 64 bits
     /// (`semantic.py:212`): widen both operands to i64, redo the op, compare against the
     /// type's min and max, and `and` the two predicates.
     ///
     /// Triton's default is ON, and the goldens were generated with it on -- it is the
     /// single largest source of ops in the raw TTIR (68 `arith.extsi`, 35 `arith.cmpi sle`
-    /// + 35 `sge`, 35 `arith.andi` across the seven configurations). Kept as a switch
+    /// plus 35 `sge`, and 35 `arith.andi` across the seven configurations). Kept as a switch
     /// because it must be ON to match the oracle but is pure dead code the canonicalizer
     /// deletes, so a future direct-to-KTIR path will want it off.
     pub sanitize_overflow: bool,

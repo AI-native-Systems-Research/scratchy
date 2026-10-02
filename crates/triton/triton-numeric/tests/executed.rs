@@ -66,7 +66,9 @@ fn envelope(f: &data::Fixture) -> bounds::Envelope {
 /// causes that a reader must be able to tell apart: data that is not in the tree (expected, for the
 /// one oversized configuration) and a stage that REFUSED (a defect, wherever it is).
 enum Outcome {
-    Ran(data::Fixture, Comparison),
+    // Boxed: the payload (a whole fixture plus its comparison) towers over the two String
+    // variants, and every outcome moves through a Vec on its way to the report.
+    Ran(Box<(data::Fixture, Comparison)>),
     /// No bytes to compare against.
     Missing(String),
     /// A stage refused. THIS IS NOT A SKIP -- the configuration is unverified and something is
@@ -111,7 +113,7 @@ fn run(config: &str) -> Outcome {
         env.k_plus, env.k_minus, env.floor
     );
     println!("  {}", c.report());
-    Outcome::Ran(f, c)
+    Outcome::Ran(Box::new((f, c)))
 }
 
 /// THE BRACKETING CONTROL, on the configuration's OWN reference.
@@ -295,8 +297,9 @@ fn every_configuration_executes_and_matches_its_fixture_reference() {
                     None => refused.push(format!("{config}: {why}")),
                 }
             }
-            Outcome::Ran(f, c) => {
-                let env = envelope(&f);
+            Outcome::Ran(b) => {
+                let (f, c) = &*b;
+                let env = envelope(f);
                 let reference = f.reference().expect("the reference re-reads");
                 bracket_control(config, &reference, &env);
                 if !c.within_bound() {

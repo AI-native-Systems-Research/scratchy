@@ -197,7 +197,8 @@ fn the_trip_count_does_not_change_which_buffers_state_a_width() {
     let a = Arena::global();
     // desc_x, desc_cos, desc_sin, desc_o. The x/o extent is heads*seq: 32*256 = 8192 rows at
     // q32, 8*256 = 2048 at kv8. cos/sin are shared across heads, so [256, 64] at both.
-    let cases: &[(&str, &[i64], &[&[i64]])] = &[
+    type Widths = &'static [i64];
+    let cases: &[(&str, &[i64], &[Widths])] = &[
         ("rope_kv8", &[4, 8], &[&[2048, 128], &[256, 64], &[256, 64], &[2048, 128]]),
         ("rope_q32", &[4, 32], &[&[8192, 128], &[256, 64], &[256, 64], &[8192, 128]]),
     ];
