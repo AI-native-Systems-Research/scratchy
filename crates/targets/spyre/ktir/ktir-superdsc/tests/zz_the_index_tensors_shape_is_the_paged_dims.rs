@@ -55,13 +55,11 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::{
 use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
 use ktir_superdsc::superdsc_opspec::{Fp16, GatherIndex, SdscFoldSet};
 
-const GATHER_1CORE: &str = "/Users/nickm/git/deeptools/dxp/test/test_gather_1core/sdsc_1.json";
-const PAGED_L3LU: &str =
-    "/Users/nickm/git/deeptools/dcg/dcg_fe/scheduler/test/sdsc_add_paged_l3lu.json";
+const GATHER_1CORE_TEXT: &str = include_str!("fixtures/sdsc_gather_1core.json");
+const PAGED_L3LU_TEXT: &str = include_str!("fixtures/sdsc_add_paged_l3lu.json");
 
 /// Parse a lit-style fixture (leading `// RUN:` lines) as JSON.
-fn fixture(path: &str) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
+fn fixture(text: &str) -> Option<serde_json::Value> {
     let body: String = text
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
@@ -115,15 +113,18 @@ fn vendor_shapes(j: &serde_json::Value) -> Option<(Vec<String>, Vec<i64>, Vec<St
 #[test]
 fn the_vendors_index_layout_is_exactly_the_values_pinned_dims() {
     let mut checked = 0;
-    for path in [GATHER_1CORE, PAGED_L3LU] {
-        let Some(j) = fixture(path) else {
+    for (name, text) in [
+        ("sdsc_gather_1core", GATHER_1CORE_TEXT),
+        ("sdsc_add_paged_l3lu", PAGED_L3LU_TEXT),
+    ] {
+        let Some(j) = fixture(text) else {
             // ⛔ NOT SILENTLY SKIPPED-AND-GREEN: counted, and the count is asserted below. A missing
             // oracle must not read as a satisfied one.
-            println!("fixture unavailable: {path}");
+            println!("fixture does not parse: {name}");
             continue;
         };
         let Some((val_layout, pins, idx_layout)) = vendor_shapes(&j) else {
-            println!("fixture has no gathered op: {path}");
+            println!("fixture has no gathered op: {name}");
             continue;
         };
         let want: Vec<String> = val_layout
@@ -133,18 +134,18 @@ fn the_vendors_index_layout_is_exactly_the_values_pinned_dims() {
             .map(|(d, _)| d.clone())
             .collect();
         println!(
-            "{path}\n  value {val_layout:?} pins {pins:?}\n  index {idx_layout:?} (pinned dims {want:?})"
+            "{name}\n  value {val_layout:?} pins {pins:?}\n  index {idx_layout:?} (pinned dims {want:?})"
         );
         assert_eq!(
             idx_layout, want,
-            "{path}: the index's layout must be the value's pinned dims, in the value's order"
+            "{name}: the index's layout must be the value's pinned dims, in the value's order"
         );
         checked += 1;
     }
     assert!(
         checked > 0,
-        "neither vendor fixture was readable, so this test proved nothing — it must not pass by \
-         finding no oracle. Fixture paths are absolute into ~/git/deeptools."
+        "neither vendor fixture parsed, so this test proved nothing — it must not pass by \
+         finding no oracle"
     );
 }
 
@@ -157,7 +158,7 @@ fn the_vendors_index_layout_is_exactly_the_values_pinned_dims() {
 /// dim and reports the gather done.
 #[test]
 fn a_paged_gather_pins_a_page_axis_and_a_per_position_axis() {
-    let Some(j) = fixture(PAGED_L3LU) else {
+    let Some(j) = fixture(PAGED_L3LU_TEXT) else {
         panic!("IBM's paged-attention fixture is the oracle for this requirement and is missing");
     };
     let (val_layout, pins, idx_layout) = vendor_shapes(&j).expect("a gathered op");

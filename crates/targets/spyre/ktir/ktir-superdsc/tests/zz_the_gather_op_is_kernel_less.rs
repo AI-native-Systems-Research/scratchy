@@ -46,7 +46,7 @@ use ktir_superdsc::superdsc_opspec::{
 /// could not do (a matmul has no `mb` on its kernel; this op does).
 const VENDOR_DECL: (KernelAxis, PageExtent) = (KernelAxis::Batch, PageExtent::single_position());
 
-const VENDOR: &str = "/Users/nickm/git/deeptools/dxp/test/test_gather_1core/sdsc_1.json";
+const VENDOR_TEXT: &str = include_str!("fixtures/sdsc_gather_1core.json");
 
 fn gather_copy(decl: (KernelAxis, PageExtent)) -> ktir_superdsc::superdsc_opspec::OpSpec {
     // ⛔ `out` IS ONE STICK, WHICH THE BUILDER REQUIRES — it was 256. The gathered destination has to be
@@ -87,10 +87,8 @@ fn emit(op: &ktir_superdsc::superdsc_opspec::OpSpec) -> serde_json::Value {
 /// rather than against a list typed into this file.
 #[test]
 fn the_gather_ops_role_set_is_exactly_the_vendors() {
-    let Ok(text) = std::fs::read_to_string(VENDOR) else {
-        panic!("vendor gather fixture missing at {VENDOR} — this test's oracle is gone");
-    };
-    let v: serde_json::Value = serde_json::from_str(&text).expect("the fixture parses");
+    let text: &str = VENDOR_TEXT;
+    let v: serde_json::Value = serde_json::from_str(text).expect("the fixture parses");
     let mut vendor_roles: Vec<String> = v["1_identity"]["dscs_"][0]["identity"]["primaryDsInfo_"]
         .as_object()
         .expect("the vendor's primaryDsInfo_")
@@ -159,10 +157,8 @@ fn a_gather_on_a_matmul_is_refused_at_build_time() {
 /// stick size and its own layout — now on the op that can actually bake.
 #[test]
 fn the_index_keeps_its_dtype_and_its_own_layout_on_the_gather_op() {
-    let Ok(text) = std::fs::read_to_string(VENDOR) else {
-        panic!("vendor gather fixture missing at {VENDOR}");
-    };
-    let v: serde_json::Value = serde_json::from_str(&text).expect("parses");
+    let text: &str = VENDOR_TEXT;
+    let v: serde_json::Value = serde_json::from_str(text).expect("parses");
     let vd = &v["1_identity"]["dscs_"][0]["identity"];
     let vidx = vd["labeledDs_"]
         .as_array()
