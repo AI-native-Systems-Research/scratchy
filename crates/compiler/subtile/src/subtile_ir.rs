@@ -3154,12 +3154,11 @@ mod tests {
         // Each Apply reads the inv_rms tensor (whole) → single
         // predecessor = RmsNormReduce. (x and gamma are sources, so
         // they contribute no node preds.)
-        for apply in 1..4 {
+        for (apply, p) in preds.iter().enumerate().take(4).skip(1) {
             assert_eq!(
-                preds[apply],
+                *p,
                 vec![SubtileId(0)],
-                "RmsNormApply {} reads inv_rms from the sole reduce writer",
-                apply,
+                "RmsNormApply {apply} reads inv_rms from the sole reduce writer",
             );
         }
         // Each Mul tile k reads cols [k*2..(k+1)*2] of out_t — exactly
@@ -3257,6 +3256,7 @@ mod tests {
         // chain. Uses 1 KV head, head_dim 4.
         let (m, hq, hkv, hd, l) = (1u32, 1u32, 1u32, 4u32, 3u32);
         let (qdim, kvdim) = (hq * hd, hkv * hd); // both = 4
+        let _ = (qdim, kvdim);
         let scale = 0.5f32;
         let input = crate::lower::LoweringInput {
             sources: vec![

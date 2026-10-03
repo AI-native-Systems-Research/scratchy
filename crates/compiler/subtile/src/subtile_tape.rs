@@ -1467,6 +1467,110 @@ pub enum RollPlan {
     },
 }
 
+/// ⭐ THE TAPE'S LAYERS AS SLICES — the shared half of every class-aware roll.
+///
+/// [`layer_class_plan`] (metal) and [`reroll_layer_classes`] (spyre) both need the same answer:
+/// where each layer's steps live on the un-rolled tape, which ABSOLUTE layer it is, and where the
+/// pre-layer prefix / post-layer suffix start. Derived ONCE here so the two targets cannot disagree
+/// about where the layer boundary is — the same discipline as [`find_layer_loop`] being "one search,
+/// one answer" for the single-class roll.
+///
+/// ⛔ A LAYER IS NAMED BY ITS KV WRITER. Every layer must hold exactly one step carrying a layer
+/// index, advancing by one constant stride. Anything else is `None`.
+pub(crate) struct LayerSlices {
+    /// Step range (`Compute` instructions only) of each layer, in tape order.
+    pub layers: Vec<std::ops::Range<usize>>,
+    /// The absolute layer index of each entry of `layers` (same length, `ids[i] < ids[i+1]`).
+    pub ids: Vec<u32>,
+    /// Steps before the first layer (the prefix).
+    pub prefix_end: usize,
+    /// Steps from the end of the last layer (the suffix starts here).
+    pub suffix_start: usize,
+}
+
+/// [`LayerSlices`] for `tape` — see there. `None` when the layers cannot be read this way.
+pub(crate) fn layer_slices<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+) -> Option<LayerSlices> {
+    let (start, period, iters) = find_shape_loop(tape, graph)?;
+    let computes: Vec<bool> = tape
+        .instrs
+        .iter()
+        .map(|i| matches!(i, Instr::Compute { .. }))
+        .collect();
+    let in_steps = |fp: Vec<u64>| -> Vec<u64> {
+        fp.into_iter()
+            .zip(&computes)
+            .filter(|(_, c)| **c)
+            .map(|(f, _)| f)
+            .collect()
+    };
+    let shape = in_steps(shape_fingerprints(tape, graph));
+    let layer_ids: Vec<Option<u32>> = tape
+        .instrs
+        .iter()
+        .filter_map(|i| match i {
+            Instr::Compute { node, .. } => Some(graph.nodes[node.index()].op.layer_index()),
+            _ => None,
+        })
+        .collect();
+    let steps_before = |n: usize| computes[..n].iter().filter(|c| **c).count();
+    let run_start = steps_before(start);
+    let cell = &shape[run_start..steps_before(start + period)];
+    if cell.is_empty() {
+        return None;
+    }
+    let mut kinds: Vec<&[u64]> = Vec::new();
+    let mut at = run_start;
+    for l in cell_layer_lengths(cell) {
+        kinds.push(&shape[at..at + l]);
+        at += l;
+    }
+    let mut layers: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut end = run_start;
+    for _ in 0..iters {
+        for k in &kinds {
+            layers.push(end..end + k.len());
+            end += k.len();
+        }
+    }
+    // Whole layers of any kind past either end of the run are layers too.
+    let fits = |r: std::ops::Range<usize>| kinds.iter().any(|k| shape.get(r.clone()) == Some(*k));
+    while let Some(l) = kinds.iter().map(|k| k.len()).find(|&l| fits(end..end + l)) {
+        layers.push(end..end + l);
+        end += l;
+    }
+    let mut first = run_start;
+    while let Some(l) = kinds
+        .iter()
+        .map(|k| k.len())
+        .find(|&l| l <= first && fits(first - l..first))
+    {
+        layers.insert(0, first - l..first);
+        first -= l;
+    }
+    let layer_of = |r: &std::ops::Range<usize>| -> Option<u32> {
+        let mut ids = layer_ids[r.clone()].iter().flatten();
+        let id = *ids.next()?;
+        ids.next().is_none().then_some(id)
+    };
+    let ids: Vec<u32> = layers.iter().map(layer_of).collect::<Option<_>>()?;
+    let stride = ids.get(1)?.checked_sub(ids[0]).filter(|d| *d > 0)?;
+    if ids
+        .windows(2)
+        .any(|w| w[1].checked_sub(w[0]) != Some(stride))
+    {
+        return None;
+    }
+    Some(LayerSlices {
+        layers,
+        ids,
+        prefix_end: first,
+        suffix_start: end,
+    })
+}
+
 /// ⭐ EVERY LAYER ROLLED BY ITS CLASS: layer 0 alone, each run of same-class layers a loop, and
 /// the largest repeating group of runs an outer loop. `None` when the tape's layers cannot be
 /// read this way.
@@ -1487,14 +1591,11 @@ pub fn layer_class_plan<F: crate::subtile_ir::RopeForm>(
     tape: &SubtileTape,
     graph: &crate::subtile_ir::SubtileIR<F>,
 ) -> Option<Vec<RollPlan>> {
-    use std::ops::Range;
-    let (start, period, iters) = find_shape_loop(tape, graph)?;
     let computes: Vec<bool> = tape
         .instrs
         .iter()
         .map(|i| matches!(i, Instr::Compute { .. }))
         .collect();
-    let steps_before = |n: usize| computes[..n].iter().filter(|c| **c).count();
     let in_steps = |fp: Vec<u64>| -> Vec<u64> {
         fp.into_iter()
             .zip(&computes)
@@ -1502,63 +1603,14 @@ pub fn layer_class_plan<F: crate::subtile_ir::RopeForm>(
             .map(|(f, _)| f)
             .collect()
     };
-    let shape = in_steps(shape_fingerprints(tape, graph));
     let class = in_steps(class_fingerprints(tape, graph));
-    let layer_ids: Vec<Option<u32>> = tape
-        .instrs
-        .iter()
-        .filter_map(|i| match i {
-            Instr::Compute { node, .. } => Some(graph.nodes[node.index()].op.layer_index()),
-            _ => None,
-        })
-        .collect();
-    let run_start = steps_before(start);
-    let cell = &shape[run_start..steps_before(start + period)];
-    if cell.is_empty() {
-        return None;
-    }
-    let mut kinds: Vec<&[u64]> = Vec::new();
-    let mut at = run_start;
-    for l in cell_layer_lengths(cell) {
-        kinds.push(&shape[at..at + l]);
-        at += l;
-    }
-    let mut layers: Vec<Range<usize>> = Vec::new();
-    let mut end = run_start;
-    for _ in 0..iters {
-        for k in &kinds {
-            layers.push(end..end + k.len());
-            end += k.len();
-        }
-    }
-    // Whole layers of any kind past either end of the run are layers too.
-    let fits = |r: Range<usize>| kinds.iter().any(|k| shape.get(r.clone()) == Some(*k));
-    while let Some(l) = kinds.iter().map(|k| k.len()).find(|&l| fits(end..end + l)) {
-        layers.push(end..end + l);
-        end += l;
-    }
-    let mut first = run_start;
-    while let Some(l) = kinds
-        .iter()
-        .map(|k| k.len())
-        .find(|&l| l <= first && fits(first - l..first))
-    {
-        layers.insert(0, first - l..first);
-        first -= l;
-    }
-    let layer_of = |r: &Range<usize>| -> Option<u32> {
-        let mut ids = layer_ids[r.clone()].iter().flatten();
-        let id = *ids.next()?;
-        ids.next().is_none().then_some(id)
-    };
-    let ids: Vec<u32> = layers.iter().map(layer_of).collect::<Option<_>>()?;
+    let LayerSlices {
+        layers,
+        ids,
+        suffix_start: end,
+        ..
+    } = layer_slices(tape, graph)?;
     let stride = ids.get(1)?.checked_sub(ids[0]).filter(|d| *d > 0)?;
-    if ids
-        .windows(2)
-        .any(|w| w[1].checked_sub(w[0]) != Some(stride))
-    {
-        return None;
-    }
     // Runs of same-class layers after layer 0: `(first layer, count)`.
     let key = |i: usize| &class[layers[i].clone()];
     let mut runs: Vec<(usize, u32)> = Vec::new();
@@ -1615,7 +1667,7 @@ pub fn layer_class_plan<F: crate::subtile_ir::RopeForm>(
         }
         None => out.extend(plan(&runs)),
     }
-    out.push(RollPlan::Steps(end..shape.len()));
+    out.push(RollPlan::Steps(end..class.len()));
     Some(out)
 }
 
@@ -2146,8 +2198,419 @@ pub fn reroll_subtile_tape<F: crate::subtile_ir::RopeForm>(
     b.finish()
 }
 
-/// Construct a sealed [`SlotId`] for the given dense index (loop-carried
-/// re-roll only — the slot already exists on the tape).
+// ── The class-split re-roll ─────────────────────────────────────────
+
+/// ⭐⭐⭐ RE-ROLL BY ATTENTION CLASS — one loop PER LAYER CLASS, not one welded cell.
+///
+/// [`reroll_subtile_tape`] finds the smallest REPEATING unit and rolls it. For a hybrid-attention
+/// model that unit is the whole CELL — gemma-4's is six layers (five sliding + one global), so the
+/// rolled body is ~8,300 descriptors and each dxp bake of one launch group takes 15–20 minutes on
+/// the pod, with five of every six identical layers recompiled inside the welded body.
+///
+/// This roll splits the unit by class instead: ONE body per distinct layer class, ONE loop per
+/// class running over that class's layers only. The resulting tape is
+///
+/// ```text
+/// prefix; OpenLoop{class 0} body₀ CloseLoop; OpenLoop{class 1} body₁ CloseLoop; …; suffix
+/// ```
+///
+/// — sibling loops, OUT OF TRUE LAYER ORDER (all of class 0's layers, then all of class 1's). The
+/// true order is not lost: every body `Compute` carries its class's per-layer node table
+/// (`per_layer_out`, indexed by class-relative position), and the spyre lowering re-derives the
+/// launch sequence from those tables + the nodes' own layer indices. The loop-carried residual
+/// threads through ONE shared carried slot per carried value, seeded by the prefix and phi'd
+/// through EVERY loop, so linear SSA order is exactly the true dataflow.
+///
+/// ⭐ THE DEDUP WIN IS STRUCTURAL. Identical layers (5 of every 6 for gemma-4) become literally the
+/// same body executed by a different loop iteration — the descriptor count per bake unit drops by
+/// the cell size, and the global-class body is baked ONCE instead of five times inside the cell.
+///
+/// `None` — and the caller falls back to [`reroll_subtile_tape`] — when the tape is single-class
+/// (the welded roll is already the finest unit), when [`layer_slices`] cannot read the layers, or
+/// when the carried-value structure is not expressible (a boundary carrying a different NUMBER of
+/// values than the others, or a body reading a slot written two or more layers back — the roll
+/// would need a second phi and refuses rather than mis-thread).
+///
+/// ⛔ EVERY CLASS'S LAYERS MUST BE FINGERPRINT-IDENTICAL COPIES. The class grouping IS the
+/// fingerprint comparison ([`class_fingerprints`], which masks the per-layer ids), so a layer 0
+/// emitted differently from its siblings simply forms its own class and keeps its own body — the
+/// layer-0-stands-alone hazard is caught by construction, not assumed away.
+pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+) -> Option<SubtileTape> {
+    use std::collections::{HashMap, HashSet};
+    let instrs = &tape.instrs;
+
+    // ── Layers, their absolute ids, and their per-step class fingerprints ──
+    let ls = layer_slices(tape, graph)?;
+    let computes: Vec<bool> = instrs
+        .iter()
+        .map(|i| matches!(i, Instr::Compute { .. }))
+        .collect();
+    let class: Vec<u64> = class_fingerprints(tape, graph)
+        .into_iter()
+        .zip(&computes)
+        .filter(|(_, c)| **c)
+        .map(|(f, _)| f)
+        .collect();
+
+    // ── Classes: distinct layer step-fingerprint slices, ordered by first appearance ──
+    // A class with fewer than 2 layers is not worth a loop of its own; a SINGLE class total means
+    // the welded roll is already the finest unit and this roll has nothing to split.
+    let mut classes: Vec<(Vec<u64>, Vec<usize>)> = Vec::new(); // (fingerprint, layer indices)
+    for (i, r) in ls.layers.iter().enumerate() {
+        let fp = class[r.clone()].to_vec();
+        match classes.iter_mut().find(|(f, _)| *f == fp) {
+            Some((_, ls)) => ls.push(i),
+            None => classes.push((fp, vec![i])),
+        }
+    }
+    if classes.len() < 2 || classes.iter().any(|(_, ls)| ls.len() < 2) {
+        return None;
+    }
+
+    // ── Instr boundaries per layer ──
+    // A layer's INSTR range starts at its first Compute's index; Alloc/Free instructions are
+    // assigned to the layer of the Compute they bracket (alloc precedes its compute; a free follows
+    // its last consumer). `lower_dag_to_tape` emits each node's alloc immediately before its
+    // compute and each free immediately after the consuming node, so both are inside the layer
+    // their compute names.
+    let compute_layer: Vec<Option<usize>> = {
+        let mut per_compute: Vec<Option<usize>> = Vec::new();
+        let mut step = 0;
+        let mut layer = 0usize;
+        for is_c in &computes {
+            if *is_c {
+                // `ls.layers` ranges are ABSOLUTE step coordinates, so the prefix's steps
+                // (< prefix_end) and the suffix's (>= suffix_start) must map to no layer —
+                // without this, the prefix compute would be folded into layer 0's instr span
+                // and every class span guard would refuse.
+                if step < ls.prefix_end || step >= ls.suffix_start {
+                    per_compute.push(None);
+                } else {
+                    while layer + 1 < ls.layers.len() && step >= ls.layers[layer].end {
+                        layer += 1;
+                    }
+                    per_compute.push(Some(layer));
+                }
+                step += 1;
+            } else {
+                per_compute.push(None);
+            }
+        }
+        per_compute
+    };
+    let mut first_compute_of_layer: Vec<usize> = vec![usize::MAX; ls.layers.len()];
+    for (i, l) in compute_layer.iter().enumerate() {
+        if let Some(l) = l && first_compute_of_layer[*l] == usize::MAX {
+            first_compute_of_layer[*l] = i;
+        }
+    }
+    // Instr range of layer L: [first instr owned by L, first instr owned by L+1). The prefix
+    // boundary: layer 0's range starts at `first_compute_of_layer[0]` minus its own leading
+    // allocs — every instr between the last prefix compute and layer 0's first compute belongs to
+    // layer 0 (its allocs), so the prefix ends at the first instr assigned to layer 0, which is
+    // the alloc run immediately before its first compute. Walk back over allocs.
+    let layer_instr_start = |l: usize| -> usize {
+        let mut i = first_compute_of_layer[l];
+        while i > 0
+            && matches!(instrs[i - 1], Instr::AllocSlot { .. })
+            && compute_layer[i - 1].is_none()
+        {
+            i -= 1;
+        }
+        i
+    };
+    let instr_start: Vec<usize> = (0..ls.layers.len()).map(layer_instr_start).collect();
+    let instr_end: Vec<usize> = (0..ls.layers.len())
+        .map(|l| {
+            if l + 1 < ls.layers.len() {
+                instr_start[l + 1]
+            } else {
+                // The suffix starts at ITS first compute minus its own leading allocs — the
+                // same walk-back as `layer_instr_start`, applied to the suffix. A plain
+                // "walk back over non-computes" cannot tell the last layer's trailing frees
+                // from the suffix's allocs apart (both are layer-None), and would eat into
+                // the layer, shortening its span.
+                let first_suffix_compute = instrs
+                    .iter()
+                    .enumerate()
+                    .skip(first_compute_of_layer[l])
+                    .find(|(i, instr)| {
+                        matches!(instr, Instr::Compute { .. }) && compute_layer[*i].is_none()
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(instrs.len());
+                let mut i = first_suffix_compute;
+                while i > instr_start[l]
+                    && matches!(instrs[i - 1], Instr::AllocSlot { .. })
+                    && compute_layer[i - 1].is_none()
+                {
+                    i -= 1;
+                }
+                i
+            }
+        })
+        .collect();
+
+    // ⚔ compile-time guard (cheap form): every class's layers must have IDENTICAL instr-span
+    // lengths, or the body-relative gather index cannot map copy j's instr. The class fingerprint
+    // already covers the Compute/Alloc/Free discriminant sequence, so a disagreement here means
+    // the phase/slice derivation misaligned — refuse rather than gather across a boundary.
+    for (_, ls_idx) in &classes {
+        let lens: HashSet<usize> = ls_idx.iter().map(|&i| instr_end[i] - instr_start[i]).collect();
+        if lens.len() != 1 {
+            return None;
+        }
+    }
+
+    // ── Carried values: writes of layer L read by layer L+1, ONE shared slot per rank ──
+    // `writes(L)` / `reads(L)` in ORIGINAL slot ids. The prefix→layer-0 boundary seeds the chain.
+    let writes_of = |r: std::ops::Range<usize>| -> HashSet<u32> {
+        instrs[r]
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Compute { writes, .. } => Some(writes.index()),
+                _ => None,
+            })
+            .collect()
+    };
+    let reads_of = |r: std::ops::Range<usize>| -> HashSet<u32> {
+        let mut s = HashSet::new();
+        for instr in &instrs[r] {
+            if let Instr::Compute { inputs, .. } = instr {
+                for ci in inputs.iter() {
+                    if let ComputeInput::Computed(slots) = ci {
+                        for sl in slots {
+                            s.insert(sl.index());
+                        }
+                    }
+                }
+            }
+        }
+        s
+    };
+    // carried[boundary] = sorted write slots of the writer side that the reader side reads.
+    // boundary 0 = prefix → layer 0; boundary b>0 = layer b-1 → layer b; the LAST boundary is
+    // last-layer → suffix.
+    let n_layers = ls.layers.len();
+    let sorted_writes = |r: std::ops::Range<usize>| -> Vec<u32> {
+        let mut v: Vec<u32> = writes_of(r).into_iter().collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    // Build every boundary's carried list.
+    let mut boundaries: Vec<Vec<u32>> = Vec::with_capacity(n_layers + 1);
+    // prefix → layer 0
+    let w0 = sorted_writes(0..instr_start[0]);
+    let l0_reads = reads_of(instr_start[0]..instr_end[0]);
+    let mut c0: Vec<u32> = w0.iter().copied().filter(|s| l0_reads.contains(s)).collect();
+    c0.sort_unstable();
+    boundaries.push(c0);
+    for l in 0..n_layers {
+        let wl = sorted_writes(instr_start[l]..instr_end[l]);
+        let r = if l + 1 < n_layers {
+            reads_of(instr_start[l + 1]..instr_end[l + 1])
+        } else {
+            reads_of(instr_end[l]..instrs.len())
+        };
+        let mut c: Vec<u32> = wl.iter().copied().filter(|s| r.contains(s)).collect();
+        c.sort_unstable();
+        boundaries.push(c);
+    }
+    let carried = boundaries;
+    // ⛔ ONE RANK SCHEMA ACROSS EVERY BOUNDARY. The shared-slot mapping is by RANK within the
+    // boundary's carried list; a boundary carrying a different count than the seed boundary has no
+    // consistent rank schema, and a layer-to-layer value that is not the hidden would silently
+    // alias another carried slot. Refuse (the caller takes the welded roll).
+    let rank_len = carried[0].len();
+    if carried.iter().any(|c| c.len() != rank_len) || rank_len == 0 {
+        return None;
+    }
+    // slot → (shared seed slot, rank). The seed slot for rank k = the PREFIX's carried write for
+    // rank k (boundary 0's writer side is the prefix, so carried[0][k] IS the prefix's write).
+    let seeds: Vec<u32> = carried[0].clone();
+    let carried_to: HashMap<u32, (u32, usize)> = carried
+        .iter()
+        .flat_map(|c| {
+            c.iter()
+                .enumerate()
+                .map(|(k, &s)| (s, (seeds[k], k)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // A body read of a slot NOT in carried_to and NOT written earlier in the same body replay
+    // means a value live across 2+ layers — un expressible with one phi per rank. Detected during
+    // the replay below (returns None).
+
+    // ── Rebuild ──
+    let mut written: HashMap<u32, SlotWritten> = HashMap::new();
+    let mut handles: HashMap<u32, SlotHandle> = HashMap::new();
+    let mut b = TapeBuilder::new();
+
+    // Prefix: everything before layer 0's first instr.
+    for instr in &instrs[..instr_start[0]] {
+        reroll_replay_outside(&mut b, instr, &mut written, &mut handles);
+    }
+
+    // One loop per class. The per-layer gather for body-relative index `bi` reads copy j's instr at
+    // `instr_start[layer_j] + bi` (the equal-span guard above makes that the same op).
+    for (_fp, class_layers) in &classes {
+        let layers: Vec<usize> = class_layers.clone();
+        let iters = layers.len() as u32;
+        let gather_nodes = |bi_idx: usize| -> Vec<SubtileId> {
+            layers
+                .iter()
+                .map(|&l| {
+                    let abs = instr_start[l] + bi_idx;
+                    match &instrs[abs] {
+                        Instr::Compute { node, .. } => *node,
+                        other => panic!(
+                            "reroll_layer_classes: copy at layer {l}, body idx {bi_idx} is not a \
+                             Compute (got {other:?}); class span guard misaligned"
+                        ),
+                    }
+                })
+                .collect()
+        };
+        let gather_ext =
+            |bi_idx: usize, pos: usize| -> Vec<crate::subtile_ir::TensorId> {
+                layers
+                    .iter()
+                    .map(|&l| {
+                        let abs = instr_start[l] + bi_idx;
+                        match &instrs[abs] {
+                            Instr::Compute { inputs, .. } => match inputs.iter().nth(pos) {
+                                Some(ComputeInput::External { tensor, .. }) => *tensor,
+                                other => panic!(
+                                    "reroll_layer_classes: copy at layer {l} input[{pos}] is not \
+                                     External (got {other:?})"
+                                ),
+                            },
+                            other => panic!(
+                                "reroll_layer_classes: copy at layer {l} body idx {bi_idx} is not \
+                                 a Compute (got {other:?})"
+                            ),
+                        }
+                    })
+                    .collect()
+            };
+        let rep = layers[0];
+        let body_range = instr_start[rep]..instr_end[rep];
+        let (mut bi, _var) = b.open_loop(LoopBound::Const(iters));
+        for (bi_idx, instr) in instrs[body_range.clone()].iter().enumerate() {
+            match instr {
+                Instr::AllocSlot { slot } => {
+                    if !carried_to.contains_key(&slot.index()) {
+                        handles.insert(slot.index(), bi.alloc_slot());
+                    }
+                }
+                Instr::FreeSlot { slot } => {
+                    if !carried_to.contains_key(&slot.index())
+                        && let Some(w) = written.remove(&slot.index())
+                    {
+                        bi.free_slot(w);
+                    }
+                }
+                Instr::Compute {
+                    node,
+                    writes,
+                    inputs,
+                    ..
+                } => {
+                    // Carried reads first (mirroring `reroll_subtile_tape`): `carried_in` needs `&bi`
+                    // while the ordinary reads borrow `written`, so collect the phi tokens before
+                    // building the input list.
+                    let carried_tokens: Vec<(usize, SlotWritten)> = inputs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(pos, ci)| match ci {
+                            ComputeInput::Computed(slots) if slots.len() == 1 => {
+                                carried_to
+                                    .get(&slots[0].index())
+                                    .map(|&(seed, _)| (pos, bi.carried_in(slot_id(seed))))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let built: Option<Vec<ComputeInputBuild<'_>>> = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(pos, ci)| match ci {
+                            ComputeInput::Computed(slots) => {
+                                if let Some((_, tok)) = carried_tokens.iter().find(|(p, _)| *p == pos)
+                                {
+                                    Some(ComputeInputBuild::Computed(vec![tok]))
+                                } else {
+                                    // An ordinary read must be either carried or written earlier in
+                                    // THIS body's replay — a miss is a value live across a layer
+                                    // boundary this roll cannot thread, and the caller takes the
+                                    // welded roll rather than mis-threading it.
+                                    written
+                                        .get(&slots[0].index())
+                                        .map(|w| ComputeInputBuild::Computed(vec![w]))
+                                }
+                            }
+                            ComputeInput::External {
+                                tensor,
+                                region,
+                                ..
+                            } => Some(ComputeInputBuild::External {
+                                tensor: *tensor,
+                                region: *region,
+                                per_layer: gather_ext(bi_idx, pos),
+                            }),
+                        })
+                        .collect();
+                    let built = built?;
+                    let per_layer_out = gather_nodes(bi_idx);
+                    let w = match carried_to.get(&writes.index()) {
+                        Some(&(seed, _)) => {
+                            let h = bi.carried_handle(slot_id(seed));
+                            bi.compute_to_per_layer(*node, h, &built, per_layer_out)
+                        }
+                        None => {
+                            let h = handles.remove(&writes.index())?;
+                            bi.compute_to_per_layer(*node, h, &built, per_layer_out)
+                        }
+                    };
+                    drop(built);
+                    drop(carried_tokens);
+                    written.insert(writes.index(), w);
+                }
+                Instr::OpenLoop { .. } | Instr::CloseLoop { .. } => {
+                    unreachable!("reroll_layer_classes: unrolled tape has no loop brackets")
+                }
+            }
+        }
+        // Body temporaries die with the loop; carried slots persist (the `written` entries keyed by
+        // their ORIGINAL ids remain live for the next class's body / the suffix).
+        b = bi.close_loop();
+    }
+
+    // Suffix: remap any carried slot reference to its seed (the live carried slot holds the final
+    // layer's value). Non-carried suffix reads must resolve against the prefix's writes only — a
+    // body temporary read by the suffix would be a value live out of the loop, which the per-body
+    // free already retired; refuse if the rebuild never established it (same contract as
+    // `reroll_subtile_tape`'s suffix).
+    let remap = |s: u32| -> Option<u32> { carried_to.get(&s).map(|&(seed, _)| seed) };
+    for instr in &instrs[instr_end[n_layers - 1]..] {
+        reroll_replay_outside_remap(&mut b, instr, &mut written, &mut handles, &remap)?;
+    }
+    // Free the carried seeds (the suffix consumed them).
+    for &seed in carried[0].iter() {
+        if let Some(w) = written.remove(&seed) {
+            b.free_slot(w);
+        }
+    }
+    drop(carried_to);
+    Some(b.finish())
+}
+
+
 fn slot_id(idx: u32) -> SlotId {
     SlotId {
         id: idx,
@@ -3022,5 +3485,239 @@ pub(crate) mod tests {
         assert_eq!(first[..5], second[..5], "the routers are the same program");
         assert_ne!(first[5], second[5], "the projections differ in width");
         assert_ne!(first[6], second[6], "so do the weighted sums over them");
+    }
+
+    // ── Re-roll by class ──────────────────────────────────────────
+    //
+    // A hybrid-attention-shaped fixture: 2 cells of [S, S, G] (6 layers), each layer
+    // `r_{k+1} = mul(rope_append(r_k, layer=k, hd=class), W_k)` — the RopeAppend names the
+    // layer (its `layer` field is what `layer_slices` reads) and its head dim is the CLASS
+    // (256 for S, 512 for G, exactly gemma-4's two attention geometries). Every layer also
+    // reads its own external weight W_k, and a trailing suffix consumes r_6.
+    fn hybrid_class_chain() -> SubtileIR<NeoX> {
+        use crate::subtile_ir::KvCacheLayout;
+        // Pattern S S G | S S G — layer → class head dim.
+        let hd_of = |layer: u32| if layer % 3 == 2 { 512 } else { 256 };
+        // sources, contiguous at the front (num_sources covers all of them):
+        // 0 = x; 1..7 = W_0..W_5; 7 = cos; 8 = sin; 9..15 = pk_0..pk_5; 15..21 = pv_0..pv_5.
+        // (The rope's operand list is [k, cos, sin, v, prefix_k, prefix_v] — the cache
+        // tensors are separate sources per layer, like the real KV pool.)
+        let mut tensors = Vec::new();
+        for _ in 0..21 {
+            tensors.push(TensorShape { rows: 1, cols: 4 });
+        }
+        let cos = TensorId(7);
+        let sin = TensorId(8);
+        // op outputs: 21 = r_0; 22..28 = r_1..r_6; 29 = y; 30..36 = rope intermediates.
+        for _ in 0..16 {
+            tensors.push(TensorShape { rows: 1, cols: 4 });
+        }
+        let r0 = TensorId(21);
+        let r_out = |layer: u32| TensorId(22 + layer);
+        let y = TensorId(29);
+        let rope_out = |layer: u32| TensorId(30 + layer);
+        let tr = |t: u32| TensorRegion {
+            tensor: TensorId(t),
+            region: Region {
+                rows: Range::new(0, 1),
+                cols: Range::new(0, 4),
+            },
+        };
+        let mut nodes = vec![
+            // prefix: r_0 = silu(x)
+            silu_node(0, TensorId(0), Range::new(0, 4), r0, Range::new(0, 4)),
+        ];
+        for layer in 0..6u32 {
+            let r_in = if layer == 0 { r0 } else { r_out(layer - 1) };
+            let w = TensorId(1 + layer);
+            nodes.push(SubtileNode {
+                id: SubtileId(1 + 2 * layer),
+                op: SubOp::RopeAppend {
+                    head_dim: HeadDim::new(hd_of(layer)),
+                    layer,
+                    layout: KvCacheLayout::for_cache_tensors(
+                        TensorId(9 + layer),
+                        TensorId(15 + layer),
+                    ),
+                    _form: std::marker::PhantomData,
+                },
+                inputs: vec![
+                    tr(r_in.0),
+                    tr(cos.0),
+                    tr(sin.0),
+                    tr(r_in.0),
+                    tr(9 + layer),
+                    tr(15 + layer),
+                ],
+                output: tr(rope_out(layer).0),
+            });
+            nodes.push(SubtileNode {
+                id: SubtileId(2 + 2 * layer),
+                op: SubOp::Elementwise(EwKind::Mul),
+                inputs: vec![tr(rope_out(layer).0), tr(w.0)],
+                output: tr(r_out(layer).0),
+            });
+        }
+        // suffix: y = silu(r_6).
+        nodes.push(silu_node(13, r_out(5), Range::new(0, 4), y, Range::new(0, 4)));
+        SubtileIR {
+            tensors,
+            num_sources: 21,
+            nodes,
+            result: y,
+            op_output: Vec::new(),
+        }
+    }
+
+    /// ⭐ THE CLASS SPLIT: two sibling loops, one per class, in class order — and the tables
+    /// carry each class's OWN layers. The S loop runs 4 iterations over layers [0,1,3,4]; the G
+    /// loop runs 2 over [2,5]. A welded roll (the fallback) would be ONE loop of 3 iterations
+    /// over cells [0..3),[3..6) — the loop count and bounds are what distinguish them.
+    #[test]
+    fn reroll_layer_classes_splits_the_loops() {
+        let g = hybrid_class_chain();
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).expect("validates");
+        let tape = lower_dag_to_tape(&valid);
+        let rolled = reroll_layer_classes(&tape, &g).expect("the hybrid chain must split by class");
+        let instrs = rolled.instrs();
+        // TWO sibling loops.
+        let opens: Vec<usize> = instrs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, instr)| match instr {
+                Instr::OpenLoop { .. } => Some(i),
+                _ => None,
+            })
+            .collect();
+        let closes: Vec<usize> = instrs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, instr)| match instr {
+                Instr::CloseLoop { .. } => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            (opens.len(), closes.len()),
+            (2, 2),
+            "one loop per class: S(4 layers) + G(2 layers)"
+        );
+        assert!(
+            opens[0] < closes[0] && closes[0] < opens[1] && opens[1] < closes[1],
+            "sibling loops, not nested"
+        );
+        // Loop bounds: the first-opened loop covers the class of layer 0 (S: 4 layers), the
+        // second the other (G: 2 layers).
+        let bound = |i: usize| match &instrs[opens[i]] {
+            Instr::OpenLoop {
+                bound: LoopBound::Const(it),
+                ..
+            } => *it,
+            other => panic!("expected a Const-bound loop, got {other:?}"),
+        };
+        let mut bounds = vec![bound(0), bound(1)];
+        bounds.sort_unstable();
+        assert_eq!(
+            bounds,
+            vec![2, 4],
+            "S class has 4 layers, G class has 2 — got bounds {bounds:?}"
+        );
+        // Every node computed exactly once across the two bodies (per-layer tables carry the
+        // class's layers only).
+        let mut depth = 0i32;
+        let mut bodies: Vec<Vec<&Instr>> = vec![Vec::new(), Vec::new()];
+        let mut cur = 0usize;
+        for instr in instrs {
+            match instr {
+                Instr::OpenLoop { .. } => {
+                    depth += 1;
+                }
+                Instr::CloseLoop { .. } => {
+                    depth -= 1;
+                    cur += 1;
+                }
+                Instr::Compute { .. } if depth > 0 => bodies[cur].push(instr),
+                Instr::Compute { .. } | Instr::AllocSlot { .. } | Instr::FreeSlot { .. } => {}
+            }
+        }
+        // The S body's rope node's per_layer_out lists the S layers' rope node ids.
+        let rope_table = |body: &Vec<&Instr>| -> Vec<u32> {
+            body.iter()
+                .find_map(|instr| match instr {
+                    Instr::Compute {
+                        node,
+                        per_layer_out,
+                        ..
+                    } => match &g.nodes[node.0 as usize].op {
+                        SubOp::RopeAppend { .. } => Some(
+                            per_layer_out
+                                .iter()
+                                .map(|n| n.0)
+                                .collect::<Vec<u32>>(),
+                        ),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("each body holds a RopeAppend")
+        };
+        let t0 = rope_table(&bodies[0]);
+        let t1 = rope_table(&bodies[1]);
+        // The two tables are the two classes' layer sets, in true layer order.
+        let mut all: Vec<u32> = t0.iter().chain(t1.iter()).copied().collect();
+        all.sort_unstable();
+        let want: Vec<u32> = (1..=12u32).step_by(2).collect(); // rope node ids are 1,3,5,7,9,11
+        assert_eq!(all, want, "the two tables together cover every layer exactly once");
+        // And each table's layers are same-class: their rope head dims agree.
+        let hd = |n: u32| match &g.nodes[n as usize].op {
+            SubOp::RopeAppend { head_dim, .. } => head_dim.get(),
+            _ => panic!("not a rope node"),
+        };
+        for t in [&t0, &t1] {
+            let hds: Vec<u32> = t.iter().map(|&n| hd(n)).collect();
+            assert!(
+                hds.iter().all(|&h| h == hds[0]),
+                "one class per table: {hds:?}"
+            );
+        }
+        assert_ne!(hd(t0[0]), hd(t1[0]), "the two bodies are the two classes");
+        // The weight gather: each body's mul External carries its class's weight ids.
+        let weight_table = |body: &Vec<&Instr>| -> Vec<u32> {
+            body.iter()
+                .find_map(|instr| match instr {
+                    Instr::Compute { node, inputs, .. } => {
+                        if matches!(&g.nodes[node.0 as usize].op, SubOp::Elementwise(EwKind::Mul)) {
+                            inputs.iter().find_map(|ci| match ci {
+                                ComputeInput::External { per_layer, .. } => {
+                                    Some(per_layer.iter().map(|t| t.0).collect::<Vec<u32>>())
+                                }
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .expect("each body holds a weight-reading mul")
+        };
+        let w0 = weight_table(&bodies[0]);
+        let w1 = weight_table(&bodies[1]);
+        let mut ws: Vec<u32> = w0.iter().chain(w1.iter()).copied().collect();
+        ws.sort_unstable();
+        assert_eq!(ws, vec![1, 2, 3, 4, 5, 6], "all six weights gathered, each once");
+    }
+
+    /// A SINGLE-class tape must NOT take the class split (the welded/`reroll_subtile_tape` path
+    /// is already the finest roll, and granite's byte-identity depends on it).
+    #[test]
+    fn reroll_layer_classes_refuses_a_single_class() {
+        let g = per_layer_weight_chain();
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).expect("validates");
+        let tape = lower_dag_to_tape(&valid);
+        assert!(
+            reroll_layer_classes(&tape, &g).is_none(),
+            "one class ⇒ no split; the caller must take the welded roll"
+        );
     }
 }
