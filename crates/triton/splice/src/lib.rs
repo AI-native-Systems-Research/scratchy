@@ -61,8 +61,8 @@ use std::path::{Path, PathBuf};
 
 use ktir_core::arena::Arena;
 use ktir_superdsc::emit::EmittedOp;
-use ktir_superdsc::ktir_node::{BufferId, KtirNode, Program};
-use scratchy_subtile::subtile_ir::{GainConvention, SubOp, SubtileIR, SubtileNode};
+use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
+use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
 
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
@@ -119,6 +119,33 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Opt
             entry: "matmul_fwd",
             program: Program::Matmul,
         }),
+        // THE FOURTH SPLICE — the split elementwise kinds, one entry per `EwKind` the
+        // builder's own arm lowers (`lower_elementwise_node`): Add AND BiasAdd share
+        // `add_fwd` (the builder maps both to `Elementwise::Add` and the same
+        // `add_s{id}` name), Mul, Sub, and the standalone Silu. The kinds the builder
+        // REFUSES (Gelu/QuickGelu/GeluErf) have no row: the splice never widens the
+        // lowering's reach beyond the builder arm it replaces — that is the
+        // byte-identity golden's precondition.
+        SubOp::Elementwise(EwKind::Add | EwKind::BiasAdd) => Some(TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "add_fwd",
+            program: Program::Elementwise(Elementwise::Add),
+        }),
+        SubOp::Elementwise(EwKind::Mul) => Some(TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "mul_fwd",
+            program: Program::Elementwise(Elementwise::Mul),
+        }),
+        SubOp::Elementwise(EwKind::Sub) => Some(TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "sub_fwd",
+            program: Program::Elementwise(Elementwise::Sub),
+        }),
+        SubOp::Elementwise(EwKind::Silu) => Some(TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "silu_fwd",
+            program: Program::Elementwise(Elementwise::Silu),
+        }),
         // ⛔ NO ROW FOR attention/rope (consumer bake-plan facts), fp8 matmul (bundle-level
         // quantize dedup), or (1 + w) gains (no kernel exists). See the module header.
         _ => None,
@@ -174,12 +201,31 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             // batched-decode lm_head) is spliced below like any other matmul.
         }
     }
+    // ⛔ AN ELEMENTWISE NODE THE BUILDER WOULD ROW-BLOCK IS NOT A SPLICE TARGET. The
+    // builder's own arm (`lower_elementwise_node`) blocks a whole-region lowering whose
+    // live set — `rows × cols × live_tiles`, the same `EW_LX_ELEMS = 1M`-element budget
+    // — does not fit a core's 2 MB LX, emitting MULTIPLE row blocks inside ONE program.
+    // A one-tile kernel cannot spell that shape, so the splice mirrors the builder's
+    // own guard and falls through: the two paths never disagree about which of them
+    // takes the node. (`m == 1` is never blocked, so every decode node splices.)
+    if let SubOp::Elementwise(kind) = &node.op {
+        let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
+        let live: u32 = match kind {
+            EwKind::Silu => 6,
+            _ => 3,
+        };
+        if u64::from(rows) * u64::from(cols) * u64::from(live) > 1024 * 1024 {
+            return Ok(None);
+        }
+    }
     // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind so the splice and
     // the builder cannot disagree about it. The builder arm's own check is identical.
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
         SubOp::MatmulTile { .. } => 2,
+        SubOp::Elementwise(EwKind::Silu) => 1,
+        SubOp::Elementwise(_) => 2,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => return Err(format!(
@@ -200,7 +246,7 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     let spec = kernel_spec(node, ir, &row)?;
     let m = compile_kernel(&src, &spec, &grid(node, ir)?)?;
     let k = mint(node, m, &row)?;
-    let name = format!("{}_s{}", program_stem(&row), node.id.index());
+    let name = format!("{}_s{}", program_stem(node, &row), node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
     Ok(Some(e))
@@ -311,6 +357,38 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
         }
+        (SubOp::Elementwise(EwKind::Silu), "silu_fwd") => {
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+        }
+        (SubOp::Elementwise(_), "add_fwd" | "mul_fwd" | "sub_fwd") => {
+            // The kernel's own parameter spellings: desc_a, desc_b, desc_o for every
+            // binary entry, then the constexprs M / N / BLOCK_M / BLOCK_N — the same
+            // whole-region single-tile law `lower_elementwise_node` states when the
+            // region fits (the splice refused the node otherwise, above).
+            for p in ["desc_a", "desc_b", "desc_o"] {
+                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -339,6 +417,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::RmsNorm { .. } => Ok(vec![1]),
         SubOp::SiluMul => Ok(vec![1]),
         SubOp::MatmulTile { .. } => Ok(vec![1]),
+        SubOp::Elementwise(_) => Ok(vec![1]),
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
     }
 }
@@ -394,7 +473,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     // identical between the two paths — the byte-identity golden's requirement.
     let name = Arena::global().str(format!(
         "{}_s{}",
-        program_stem(row),
+        program_stem(node, row),
         node.id.index()
     ));
     let KtirNode { func, program, .. } = positional;
@@ -416,8 +495,27 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     })
 }
 
-/// The program stem the builder's naming law uses for this row (`rmsnorm_s{id}`).
-fn program_stem(row: &TritonKernelRow) -> &'static str {
+/// The program stem the builder's naming law uses for this node (`rmsnorm_s{id}`,
+/// `add_s{id}`, …). ⛔ READ OFF THE NODE, NOT THE ROW: the elementwise rows carry the
+/// CONSUMER's kind (`Elementwise::Add`), and the builder's name comes from the
+/// PRODUCER's `EwKind` (`ew_kind_stem` — BiasAdd is named `add`, not `biasadd`). One
+/// row may therefore mint several stems; the node states which.
+fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    row: &TritonKernelRow,
+) -> &'static str {
+    if let SubOp::Elementwise(kind) = &node.op {
+        return match kind {
+            EwKind::Add | EwKind::BiasAdd => "add",
+            EwKind::Mul => "mul",
+            EwKind::Sub => "sub",
+            EwKind::Silu => "silu",
+            // ⛔ NO `_` ARM. A spliced elementwise kind has a row above; reaching here
+            // with a kind that has none is an unreachable — the same discipline the
+            // arity match holds.
+            other => unreachable!("elementwise kind {other:?} has no program stem"),
+        };
+    }
     match row.program {
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
