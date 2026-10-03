@@ -3617,10 +3617,6 @@ fn tiled_trips_alias(e: &EmittedOp) -> bool {
     if e.time <= 1 {
         return false;
     }
-    // ldsIdx of every OUTPUT (write) tensor: the computeOp_ outputLabeledDs names
-    // are `Tensor{i}-idx{i}`, so the output ldsIdx set is derivable, but the simpler
-    // robust signal is the LabeledDs dsType_ == "OUTPUT". Collect those ldsIdx.
-    //
     // A K-SPLIT (reduction/`in`-dim) matmul legitimately has MULTIPLE cores accumulate a partial
     // product into the SAME shared output address WITHIN one trip (dxp PSUM-accumulates them) —
     // the exact case the #50 disjoint-output guard already relaxes elsewhere (`reduction_split` at
@@ -3641,11 +3637,28 @@ fn tiled_trips_alias(e: &EmittedOp) -> bool {
             std::collections::BTreeSet::new();
         for dsc_map in &trip.dscs_ {
             for dsc in dsc_map.values() {
+                // ldsIdx of every WRITTEN tensor — the set this guard polices. ⛔ THE DIRECTION
+                // SIGNAL IS `arg_bindings[ldsIdx].is_input`, NOT `labeledDs_.dsType_`: the
+                // pointwise builder gives EVERY operand `Role::Output` (the vendor golden
+                // convention — `dsType_` names a dataspace ROLE, not a direction), so filtering
+                // `dsType_ == "OUTPUT"` counts READ operands too. The tanhsoftcap's `[1,1]` cap
+                // const is exactly such a read: it is a broadcast operand the time-tile rewrite
+                // DELIBERATELY exempts from the per-trip advance (every trip's out-window reads
+                // the SAME value — commit 8c9cb3f5f), so its fixed address appears in every
+                // trip's dsType_-derived "output" set and the trips falsely intersect.
+                // `arg_bindings` is positionally parallel to `labeledDs_` (one entry per op arg,
+                // same order), and `is_input` is the one true direction signal — the write set is
+                // exactly the non-input slots.
                 let out_lds: std::collections::BTreeSet<u32> = dsc
                     .labeledDs_
                     .iter()
-                    .filter(|l| l.dsType_ == "OUTPUT")
                     .map(|l| l.ldsIdx_)
+                    .filter(|&i| {
+                        e.arg_bindings
+                            .get(i as usize)
+                            .map(|b| !b.is_input)
+                            .unwrap_or(false)
+                    })
                     .collect();
                 for node in &dsc.scheduleTree_ {
                     if node.component_ != "hbm" || !out_lds.contains(&node.ldsIdx_) {
@@ -4954,6 +4967,57 @@ mod tests {
         assert_eq!(sen169_bits(0.5), 0x3C00); // 2^-1 ⇒ exp field 30
         assert_eq!(sen169_bits(0.0), 0); // zero
         assert_ne!(sen169_bits(1.0), 0x3C00); // NOT IEEE-f16 1.0 (0x3C00) — the mismatch that WAS the bug
+    }
+
+    /// ⛔⛔⛔ THE GUARD'S WRITE SET IS DIRECTIONAL, NOT ROLE-VALUED (the gemma-4 prefill refusal).
+    ///
+    /// `tiled_trips_alias` derived its "output" ldsIdx set from `labeledDs_.dsType_ == "OUTPUT"` —
+    /// but the pointwise builder gives EVERY operand `Role::Output` (the vendor golden convention:
+    /// `dsType_` names a dataspace ROLE, not a direction), so the tanhsoftcap's `[1,1]` cap const
+    /// (a broadcast READ, deliberately address-stable across trips per commit 8c9cb3f5f) landed in
+    /// every trip's "output" set and the trips falsely intersected — the prefill bake refused with
+    /// "ALIASING per-trip OUTPUT addresses" on an op whose only fixed address is a read. The guard
+    /// now takes direction from `arg_bindings[ldsIdx].is_input` (positionally parallel to
+    /// `labeledDs_`), the same signal the pinned trap (`dsType_ is not a direction signal`) names.
+    ///
+    /// This test rebuilds the EXACT failing op — `tscdiv_o2326`, realdiv of x by the broadcast cap
+    /// at gemma-4 prefill geometry (rows=35, cols=262144, vocab-wide) — through the real door and
+    /// asserts the guard accepts it. The emit-side halves (the op tiles, the cap keeps its address,
+    /// the real output advances) are pinned in ktir-superdsc's
+    /// `time_tiled_broadcast_operand_is_address_stable`; this one pins the SPYRE-side guard.
+    #[test]
+    fn a_time_tiled_broadcast_read_is_not_an_aliasing_output() {
+        use ktir_superdsc::emit::{In, assemble_pointwise_broadcast_off};
+        use ktir_superdsc::sdsc_abstract::{BlockCols, RowCount};
+        // The gemma-4 prefill softcap geometry — the same constants ktir-superdsc's own fixture
+        // carries, so the time-tile search provably lands on time > 1 here.
+        const ROWS: u32 = 35;
+        const COLS: u32 = 262144;
+        let x = rb("tsc_x", ROWS, COLS);
+        let cap = rb("tsc_cap", 1, 64);
+        let out = rb("tsc_o", ROWS, COLS);
+        let e = assemble_pointwise_broadcast_off(
+            "tscdiv_o2326",
+            "realdiv",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+            &[In::full(&x).ew(), In::scalar(&cap).ew()],
+            &out,
+            ktir_superdsc::addr::DevOff::ZERO,
+            &mut 0i64,
+            None,
+        );
+        assert!(
+            e.time > 1,
+            "control: the vocab-wide softcap geometry must time-tile (got time={}) — otherwise \
+             this test asserts nothing about the guard's tiled path",
+            e.time
+        );
+        assert!(
+            !tiled_trips_alias(&e),
+            "a broadcast READ with a fixed per-trip address (the cap const) is not an aliasing \
+             OUTPUT write — the write set must come from arg_bindings.is_input, not dsType_"
+        );
     }
 }
 
