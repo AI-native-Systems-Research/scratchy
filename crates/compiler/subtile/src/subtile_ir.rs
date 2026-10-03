@@ -2135,30 +2135,21 @@ pub fn lower_region(
         let out_cols = desc
             .op
             .out_cols(|k| resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).2);
-        // ⭐ TRUE OUTPUT ROW COUNT — `desc.m` is the TOKEN count, and the two
-        // diverge exactly once a Reshape view enters the chain. Every op in
-        // the vocabulary preserves operand 0's row count (matmul: rows(A);
-        // attention: rows(q); mean: rows(x); gather: rows(x)); Reshape is the
-        // one exception and states its own rescale of the token count. So the
-        // graph's tensor shapes and node regions state the RE-LAID extents —
-        // a per-head chain `[m, heads·hd] → [m·heads, hd] → norm → back`
-        // multiplies rows through the norm and divides them back at the
-        // flatten. Under-stating them (registering everything at `m`) made
-        // the Reshape count law fire on every per-head view AND reserved the
-        // re-laid buffer at a fraction of its size.
-        let out_rows: u32 = match &desc.op {
-            SubOp::Reshape { rows, .. } => {
-                let r = u64::from(m) * u64::from(rows.mult());
-                let d = u64::from(rows.div());
-                assert!(
-                    r % d == 0,
-                    "Reshape over [{m} rows] with scale {rows:?} is not a \
-                     whole row count — the bridge only mints whole multiples"
-                );
-                (r / d) as u32
-            }
-            _ => in0.map(|(_, r, _)| r).unwrap_or(m),
-        };
+        // ⭐ TRUE OUTPUT ROW COUNT — `desc.m` is the TOKEN count, and the two diverge
+        // exactly once a Reshape view enters the chain. The bridge stamps every op's
+        // `m` with the token count (it never rescales through a per-head view), so the
+        // row scale lives in the TENSORS: a shape-preserving op INHERITS operand 0's
+        // registered rows through the registry's `rows = [in0]` class, and Reshape —
+        // the one op the front end states a scale for — rescales the token count by its
+        // own payload. So the graph's tensor shapes and node regions state the RE-LAID
+        // extents: a per-head chain `[m, heads·hd] → [m·heads, hd] → norm → back`
+        // multiplies rows through the norm and divides them back at the flatten.
+        // Under-stating them (registering everything at `m`) made the Reshape count law
+        // fire on every per-head view AND reserved the re-laid buffer at a fraction of
+        // its size.
+        let out_rows: u32 = desc
+            .op
+            .out_rows(m, |k| resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).1);
         let out_t = TensorId(tensors.len() as u32);
         tensors.push(TensorShape {
             rows: out_rows,
@@ -2334,10 +2325,13 @@ pub fn lower_region(
             let (in0_t, _r, in0_cols) = in0_named("MatmulTile");
             let k = in0_cols;
             let (w_t, _wr, _wc) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
+            // The activation's OWN registered rows — not the token count: a matmul
+            // consuming a per-head view computes `m·heads` output rows.
+            let act_rows = tensors[in0_t.0 as usize].rows;
             let act = TensorRegion {
                 tensor: in0_t,
                 region: Region {
-                    rows: Range::new(0, m),
+                    rows: Range::new(0, act_rows),
                     cols: Range::new(0, k),
                 },
             };
@@ -2384,7 +2378,7 @@ pub fn lower_region(
                 output: TensorRegion {
                     tensor: out_t,
                     region: Region {
-                        rows: Range::new(0, m),
+                        rows: Range::new(0, act_rows),
                         cols: whole,
                     },
                 },
@@ -2422,7 +2416,10 @@ pub fn lower_region(
                             TensorRegion {
                                 tensor: t,
                                 region: Region {
-                                    rows: Range::new(0, m),
+                                    // The op's OWN registered rows — shape-preserving, so
+                                    // every operand is read at the output's row count (the
+                                    // token count rescaled by any upstream per-head view).
+                                    rows: Range::new(0, out_rows),
                                     cols: blk,
                                 },
                             }
@@ -2950,6 +2947,119 @@ mod tests {
             result_buffer(&g, &bufs),
             &src[..],
             "reshape is the identity on the element sequence"
+        );
+    }
+
+    /// ⭐ THE ROW LAW, end to end through `lower_region`. `desc.m` is the TOKEN count and the
+    /// bridge never rescales it through a per-head view, so the row scale must ride the
+    /// TENSORS: the split Reshape states `Times(heads)`, every shape-preserving consumer
+    /// INHERITS operand 0's registered rows, and the flatten-back states `Times(1)` —
+    /// registering everything at the token count instead understates the per-head domain
+    /// (the reshape count law then fires on the flatten-back, and the buffer is reserved at
+    /// a fraction of its size).
+    #[test]
+    fn a_per_head_chain_registers_its_re_laid_rows() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let (heads, hd) = (2u32, 64u32);
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                SourceShape {
+                    rows: 1,
+                    cols: 128,
+                },
+                SourceShape {
+                    rows: 128,
+                    cols: 128,
+                },
+                SourceShape {
+                    rows: 1,
+                    cols: 64,
+                },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: 128,
+                        weight: crate::lower::GemmWeight::Dense,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: SubOp::Reshape {
+                        rows: RowScale::Times(nz(heads)),
+                        cols: hd,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Op(0)],
+                },
+                OpDesc {
+                    op: SubOp::RmsNormUnit { eps: 1e-6 },
+                    m: 1,
+                    inputs: vec![InputRef::Op(1)],
+                },
+                OpDesc {
+                    op: SubOp::Reshape {
+                        rows: RowScale::Times(nz(1)),
+                        cols: heads * hd,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Op(2)],
+                },
+            ],
+            result: 3,
+        };
+        let g = lower_region(&input, nz(64));
+        assert!(validate(&g).is_ok(), "a per-head chain must validate");
+        // The projections stay at the token count; the per-head view and its norm register
+        // the RE-LAID rows; the flatten-back divides them back.
+        let shape = |i: usize| (g.tensors[i].rows, g.tensors[i].cols);
+        assert_eq!(shape(3), (1, 128), "the projection is [m, heads·hd]");
+        assert_eq!(shape(4), (heads, hd), "the view is [m·heads, hd]");
+        assert_eq!(shape(5), (heads, hd), "the norm inherits the view's rows");
+        assert_eq!(shape(6), (1, heads * hd), "the flatten-back restores the flat row");
+        // And the node regions state the same extents — the regions are what every target's
+        // lowering reads.
+        let rows_of = |n: usize| g.nodes[n].output.region.rows.len;
+        assert_eq!((rows_of(0), rows_of(1), rows_of(2), rows_of(3)), (1, heads, heads, 1));
+    }
+
+    /// The OTHER direction of the row law: the vision patch merger's `Over` view divides the
+    /// token count, and the ops after it inherit the DIVIDED rows.
+    #[test]
+    fn a_merger_view_registers_its_divided_rows() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                SourceShape {
+                    rows: 4,
+                    cols: 64,
+                },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::Reshape {
+                        rows: RowScale::Over(nz(2)),
+                        cols: 128,
+                    },
+                    m: 4,
+                    inputs: vec![InputRef::Ext(0)],
+                },
+                OpDesc {
+                    op: SubOp::RmsNormUnit { eps: 1e-6 },
+                    m: 4,
+                    inputs: vec![InputRef::Op(0)],
+                },
+            ],
+            result: 1,
+        };
+        let g = lower_region(&input, nz(64));
+        assert!(validate(&g).is_ok(), "a merger chain must validate");
+        assert_eq!((g.tensors[1].rows, g.tensors[1].cols), (2, 128));
+        assert_eq!(
+            (g.tensors[2].rows, g.tensors[2].cols),
+            (2, 128),
+            "the op after the merger inherits the DIVIDED rows, not the token count"
         );
     }
     use crate::lower::{InputRef, OpDesc};

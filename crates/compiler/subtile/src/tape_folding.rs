@@ -1360,22 +1360,26 @@ mod tests {
     /// rotation and the K/V rope. `tail` reads the rope and the rotation, and the V norm when
     /// `v_read_again` holds.
     fn rope_ops(v_read_again: bool) -> Vec<OpDesc> {
-        let view = |heads, m, cols, x| {
+        // The per-head views as the bridge mints them: `desc.m` is the TOKEN count (1, decode —
+        // the bridge never rescales it through a view), the row scale rides the Reshape payload
+        // and the tensors it registers. A view `Times(heads)` takes `[1, heads·hd]` to
+        // `[heads, hd]`; the flatten-back is `Times(1)` back to the flat row.
+        let view = |heads, cols, x| {
             let rows = RowScale::Times(std::num::NonZeroU32::new(heads).unwrap());
-            op(SubOp::Reshape { rows, cols }, m, vec![Op(x)])
+            op(SubOp::Reshape { rows, cols }, 1, vec![Op(x)])
         };
         let head_dim = HeadDim::new(64);
         let mut v = vec![
             gemm(128, vec![Ext(0), Ext(1)]),
             gemm(128, vec![Ext(0), Ext(2)]),
             gemm(128, vec![Ext(0), Ext(3)]),
-            view(2, 2, 64, 0),
-            op(RMS, 2, vec![Op(3), Ext(4)]),
-            view(1, 1, 128, 4),
+            view(2, 64, 0),
+            op(RMS, 1, vec![Op(3), Ext(4)]),
+            view(1, 128, 4),
             op(SubOp::rope_rotate(head_dim), 1, vec![Op(5), Ext(6), Ext(7)]),
-            view(2, 2, 64, 1),
-            op(RMS, 2, vec![Op(7), Ext(5)]),
-            view(1, 1, 128, 8),
+            view(2, 64, 1),
+            op(RMS, 1, vec![Op(7), Ext(5)]),
+            view(1, 128, 8),
             op(SubOp::RmsNormUnit { eps: 1e-6 }, 1, vec![Op(2)]),
             op(
                 SubOp::rope_append(head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),

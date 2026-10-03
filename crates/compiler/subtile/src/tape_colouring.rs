@@ -794,11 +794,14 @@ mod tests {
         let ops = || {
             let k = |k| std::num::NonZeroU32::new(k).unwrap();
             let view = |rows, cols| SubOp::Reshape { rows, cols };
+            // The per-head chain as the bridge mints it at decode (m = 1 throughout —
+            // `desc.m` is the TOKEN count, and the row scale rides the tensors):
+            // `[1, 128] → [1·2, 64] → norm → [1, 128]`.
             vec![
                 gemm(128, vec![Ext(0), Ext(1)]),
-                op(view(RowScale::Times(k(2)), 64), 2, vec![Op(0)]),
-                op(NORM, 2, vec![Op(1), Ext(2)]),
-                op(view(RowScale::Over(k(2)), 128), 1, vec![Op(2)]),
+                op(view(RowScale::Times(k(2)), 64), 1, vec![Op(0)]),
+                op(NORM, 1, vec![Op(1), Ext(2)]),
+                op(view(RowScale::Times(k(1)), 128), 1, vec![Op(2)]),
                 op(
                     SubOp::rope_rotate(HeadDim::new(64)),
                     1,
