@@ -38,6 +38,11 @@ pub(crate) struct LayerWiring {
     pub(crate) new_k_id: usize,
     /// Op-output tensor id of the new token's V (AttnDecode's seg-1 V).
     pub(crate) new_v_id: usize,
+    /// THIS layer's per-token KV width — `kv_heads * head_dim` off the baked
+    /// prefix-K shape. A hybrid-attention arch (gemma-4) gives sliding and global
+    /// layers different widths, so every per-layer buffer size, readback count and
+    /// extend length reads THIS, never the model-wide `kv_dim`.
+    pub(crate) kv_width: usize,
 }
 
 /// Per-phase metadata for one program (decode m=1 or prefill m=M) inside the
@@ -60,9 +65,10 @@ pub(crate) struct BundleMeta {
     pub(crate) m_cap: usize,
     /// Runtime source ids (shared id space across phases).
     pub(crate) embed_src: usize,
-    /// cos / sin sources as `(id, full width)` — GQA gives >1 width.
-    pub(crate) cos_srcs: Vec<(usize, usize)>,
-    pub(crate) sin_srcs: Vec<(usize, usize)>,
+    /// cos / sin sources as `(id, full width, rotary class)` — GQA gives >1
+    /// width, and a hybrid-attention arch gives classes different tables.
+    pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
     /// One per layer, in layer order.
     pub(crate) layers: Vec<LayerWiring>,
@@ -409,13 +415,25 @@ impl SuperDscBundle {
 // across 30 gate runs on granite-3.1-2b (hd=64) and granite-3.1-8b (hd=128).
 
 /// Model-level state shared by both bundles, borrowed alongside a `&mut Bundle`.
+///
+/// ⛔ NO `kv_dim` HERE, AND ITS ABSENCE IS THE LOCK. A hybrid-attention arch (gemma-4)
+/// gives layers DIFFERENT kv widths (sliding `kv_heads*head_dim` vs global
+/// `g_kv*g_hd`), so a model-wide kv width is a number no per-layer question may
+/// read — every per-layer size, readback count and extend length goes through
+/// [`LayerWiring::kv_width`], off the layer's own baked prefix-K shape.
 pub(crate) struct Shared<'a> {
     pub(crate) embed_tokens: &'a [f32],
     pub(crate) hidden: usize,
+    /// spyre-hw ONLY (the sendnn prefill/batch paths size pool entries with it).
+    /// The KTIR path reads no model-wide head dim — each cos/sin source carries
+    /// its own `RotaryKind`, and per-layer KV widths come off `LayerWiring`.
+    #[cfg(feature = "spyre-hw")]
     pub(crate) head_dim: usize,
-    pub(crate) kv_dim: usize,
     pub(crate) vocab: usize,
-    pub(crate) rope_theta: f32,
+    // ⛔ NO `rope_theta` HERE — same law as `kv_dim` below on `Loaded`. A hybrid-
+    // attention arch has no single θ: each cos/sin source carries its own
+    // `RotaryKind` (θ as bits) in the wiring, and the rotary tables are built
+    // from that. A model-wide θ here built the WRONG class's table silently.
 }
 
 /// Everything [`Worker::load_model`] resolves: model-level shared state + the
@@ -429,10 +447,21 @@ pub(crate) struct Loaded {
     /// `embed_tokens.weight` `[vocab, hidden]` kept for the per-token gather.
     pub(crate) embed_tokens: Vec<f32>,
     pub(crate) hidden: usize,
+    /// spyre-hw ONLY (pool-entry sizing and the sendnn prefill/batch paths). The
+    /// KTIR path reads no model-wide head dim: rotary classes are per cos/sin
+    /// source (`RotaryKind`) and KV widths per layer (`LayerWiring::kv_width`).
+    #[cfg(feature = "spyre-hw")]
     pub(crate) head_dim: usize,
+    /// spyre-hw ONLY: the paged-KV pool's per-head group count comes off it. The
+    /// KTIR path reads each layer's own `LayerWiring::kv_width` instead (a hybrid
+    /// arch has no single kv width), so it is unread there.
+    #[cfg(feature = "spyre-hw")]
     pub(crate) kv_dim: usize,
     pub(crate) vocab: usize,
-    pub(crate) rope_theta: f32,
+    // ⛔ NO `rope_theta` FIELD. The KTIR path builds every rotary table from the
+    // per-source `RotaryKind` the wiring carries; the info! at load time prints
+    // θ from the wiring's own geometry, where the single answer still lives.
+    // A field here invites a reader the classes can disagree with.
     /// KTIR path: ONE resident session holding both programs (weights once).
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) session: SpyreSession,

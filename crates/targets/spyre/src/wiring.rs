@@ -253,33 +253,28 @@ impl Wiring {
     /// the diagonal zeroes every copy-via-matmul it drives, and a wrong rope-P rotates into the
     /// wrong lane. Both read as fluent-but-incoherent output, not as an error.
     pub fn verify_kernel_tables(&self) -> Result<(), String> {
-        use scratchy_subtile::sdsc_abstract::{StickLayout, rope_p_entry, stage_2d};
+        use scratchy_subtile::sdsc_abstract::{rope_p_entry, stage_kernel_table};
         let hd = self.geometry.head_dim as usize;
-        let want_ident = stage_2d(
-            &StickLayout::kernel(hd, hd),
-            |i, j| {
-                if i == j { 1.0 } else { 0.0 }
-            },
-        );
+        let want_ident = stage_kernel_table(hd, |i, j| {
+            if i == j { 1.0 } else { 0.0 }
+        });
         if self.identity != want_ident.as_slice() {
             return Err(format!(
-                "emitted identity table ({} elems) does not match `stage_2d(kernel({hd},{hd}))` \
+                "emitted identity table ({} elems) does not match `stage_kernel_table({hd})` \
                  ({} elems) — the bake and the device layout law disagree",
                 self.identity.len(),
                 want_ident.len(),
             ));
         }
         let want_rope: Vec<f32> = if hd >= 2 {
-            stage_2d(&StickLayout::kernel(hd, hd), |inn, o| {
-                rope_p_entry(hd, inn, o) as f32
-            })
+            stage_kernel_table(hd, |inn, o| rope_p_entry(hd, inn, o) as f32)
         } else {
             Vec::new()
         };
         if self.rope_p != want_rope.as_slice() {
             return Err(format!(
                 "emitted rope-P table ({} elems) does not match `rope_p_entry` over \
-                 `kernel({hd},{hd})` ({} elems)",
+                 `stage_kernel_table({hd})` ({} elems)",
                 self.rope_p.len(),
                 want_rope.len(),
             ));
@@ -539,6 +534,13 @@ pub struct LayerWiring {
     pub prefix_v: u32,
     pub new_k: u32,
     pub new_v: u32,
+    /// THIS layer's per-token KV width (`kv_heads * head_dim`), off the prefix-K
+    /// source's own baked shape. Hybrid-attention arches (gemma-4: sliding
+    /// 8×256 vs global 1×512) give different layers different widths, so a
+    /// single `Geometry::kv_dim` cannot size a per-layer buffer or readback —
+    /// this is the per-layer answer, from the same `tensor_shapes` the tape
+    /// was lowered at.
+    pub kv_width: u32,
 }
 
 /// Model geometry, baked.
@@ -568,6 +570,63 @@ impl Geometry {
     }
 }
 
+/// ⭐ WHICH ROTARY TABLE A COS/SIN SOURCE CARRIES — the class of the layer(s) it
+/// rotates. A uniform model has ONE class; a hybrid-attention arch (gemma-4:
+/// sliding layers vs every-6th global layers) has TWO, and a table built from
+/// the wrong one is silent garbage — the rotation multiplies Q/K by wrong
+/// frequencies, which is fluent-but-wrong output, not a fault.
+///
+/// ⛔ NOT A `bool`. `local`/`global` are negations of each other and both are in
+/// scope at every construction site — the exact shape that lets one land in the
+/// other. The two classes here have DIFFERENT ARITY of parameters (the
+/// proportional class carries its own rotated-dim count), which a bool cannot.
+///
+/// Every class's frequency law, from mlx `rope_utils.py` (the reference):
+/// - `Default` — `freq_i = θ^(-2i/hd)` for the full head dim, NeoX pairing
+///   (d, d+hd/2).
+/// - `Proportional` — mlx `ProportionalRoPE`: `freq_i = θ^(-2i/hd)` for
+///   `2i < rotated`, INFINITE past it (the pass-through lanes — identity, the
+///   tail stays unrotated). The exponent's denominator is the FULL hd, not
+///   `rotated`: that is the class's defining difference.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RotaryKind {
+    /// The base class: full rotary at the class's own head dim and θ.
+    Default {
+        /// The class's head dim — the width of one head in THIS table's
+        /// consumers (sliding: `head_dim`; a uniform model: `head_dim`).
+        head_dim: u32,
+        /// The class's rope base θ.
+        theta_bits: u32,
+    },
+    /// mlx `ProportionalRoPE` — partial rotary whose exponent denominator is
+    /// the FULL head dim (gemma-4 global layers: hd 512, rotated 128, θ 1e6).
+    Proportional {
+        head_dim: u32,
+        theta_bits: u32,
+        /// How many leading dims of the head actually rotate; the rest are
+        /// pass-through (freq = ∞ ⇒ cos 1, sin 0).
+        rotated: u32,
+    },
+}
+
+impl RotaryKind {
+    /// The class's head dim — the width one row of its table spans.
+    pub const fn head_dim(self) -> u32 {
+        match self {
+            Self::Default { head_dim, .. } | Self::Proportional { head_dim, .. } => head_dim,
+        }
+    }
+
+    /// The class's rope base θ, as bits (see [`Geometry::rope_theta_bits`]).
+    pub const fn theta(self) -> f32 {
+        match self {
+            Self::Default { theta_bits, .. } | Self::Proportional { theta_bits, .. } => {
+                f32::from_bits(theta_bits)
+            }
+        }
+    }
+}
+
 /// Everything the worker needs to launch one baked bundle, emitted whole.
 pub struct Wiring {
     /// Tensor id of the logits.
@@ -589,10 +648,12 @@ pub struct Wiring {
     /// strings this replaced, just with a nicer type. The roles are still an
     /// exhaustive enum where they belong: in the macro, over `SourceBinding`.
     pub embed_src: u32,
-    /// Rotary `cos` / `sin` sources as `(id, full column width)`. GQA gives
-    /// more than one width (Q vs K), so this is a list, not a pair.
-    pub cos_srcs: &'static [(u32, u32)],
-    pub sin_srcs: &'static [(u32, u32)],
+    /// Rotary `cos` / `sin` sources as `(id, full column width, rotary class)`.
+    /// GQA gives more than one width (Q vs K), so this is a list, not a pair;
+    /// a hybrid-attention arch (gemma-4) additionally gives CLASSES different
+    /// rotary tables, so every source carries its own [`RotaryKind`].
+    pub cos_srcs: &'static [(u32, u32, RotaryKind)],
+    pub sin_srcs: &'static [(u32, u32, RotaryKind)],
     /// Per-layer AttnDecode wiring, in layer order.
     pub layers: &'static [LayerWiring],
     pub geometry: Geometry,

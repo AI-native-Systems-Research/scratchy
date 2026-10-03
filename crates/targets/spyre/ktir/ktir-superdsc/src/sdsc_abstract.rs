@@ -2238,6 +2238,29 @@ pub fn stage_2d(layout: &StickLayout, get: impl Fn(usize, usize) -> f32) -> Vec<
     out
 }
 
+/// [`stage_2d`] for a SQUARE `[hd, hd]` KERNEL table (the identity and rope-P rotation matrices),
+/// at ANY head dim — the one staging a reserved kernel table needs, because a model config may
+/// declare a head dim the stick does not divide (a parity-tiny fixture at `head_dim = 32` against
+/// the 64-fp16 stick).
+///
+/// ⭐ PADDED, NEVER TRUNCATED. The table is staged at `hd_pad = ceil(hd / lanes) · lanes` with the
+/// entries outside `hd` reading zero — the padding every whole-stick device read of a
+/// sub-stick-wide row already assumes. At a stick-divisible head dim `hd_pad == hd`, so the bytes
+/// are IDENTICAL to `stage_2d(&StickLayout::kernel(hd, hd), entry)` and every real model's table is
+/// unchanged; the pad exists only where the unpadded call would have refused.
+pub fn stage_kernel_table(hd: usize, entry: impl Fn(usize, usize) -> f32) -> Vec<f32> {
+    let lanes = Df::Fp16.elems_per_stick() as usize;
+    let pad = lanes.max(1);
+    let hd_pad = hd.div_ceil(pad) * pad;
+    stage_2d(&StickLayout::kernel(hd_pad, hd_pad), |i, j| {
+        if i < hd && j < hd {
+            entry(i, j)
+        } else {
+            0.0
+        }
+    })
+}
+
 /// A device-bind buffer whose bytes were placed THROUGH a layout — the TYPE-LEVEL worker↔emit firewall.
 /// There is NO `Vec<f32> → Staged` conversion (the field is private, the only ctors are `tiled`/`filled`),
 /// so a caller CANNOT bind a hand-written-`(c/64)*(rows*64)+…`-offset buffer: 2-D layout math is forced

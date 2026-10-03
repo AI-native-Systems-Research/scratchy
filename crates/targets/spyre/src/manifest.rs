@@ -365,6 +365,60 @@ pub fn attn_causal_mask_fill(mq: usize) -> Vec<f32> {
     m
 }
 
+/// NeoX rotary `cos`/`sin` tables for one position, BY ROTARY CLASS —
+/// [`rope_cos_sin`]'s per-source generalization for hybrid-attention arches
+/// (gemma-4) whose sliding and global layers carry DIFFERENT tables.
+///
+/// Returns a `[kind.head_dim()]`-wide row pair:
+/// - [`RotaryKind::Default`] — the same duplicated-halves row
+///   [`rope_cos_sin`] builds, at the CLASS's own head dim and θ.
+/// - [`RotaryKind::Proportional`] — mlx `ProportionalRoPE`: pair `(d, d+half)`
+///   where `half = head_dim/2` (NOT `rotated/2` — the pairing spans the FULL
+///   head), freq `θ^(-2i/head_dim)` for `2i < rotated`, and the pairs past
+///   `rotated/2` are IDENTITY (freq ∞ ⇒ cos 1, sin 0 — the pass-through lanes
+///   `mx.fast.rope` leaves unrotated).
+///
+/// ⛔ THE PAIRING IS THE FULL-HEAD PAIRING IN BOTH CLASSES. This emitter's rope
+/// body (`KtirFunc::rope`) pairs `(d, d+half)` at `half = hd/2`, which is the
+/// form both classes take here; a proportional class whose rotated lanes paired
+/// at `rotated/2` would disagree with the body and rotate wrong lanes.
+pub fn rope_cos_sin_kind(
+    pos: u32,
+    kind: crate::wiring::RotaryKind,
+) -> (Vec<f32>, Vec<f32>) {
+    let (hd, theta) = (kind.head_dim() as usize, kind.theta());
+    let half = hd / 2;
+    let mut cos = vec![0.0f32; hd];
+    let mut sin = vec![0.0f32; hd];
+    let rotated_pairs = match kind {
+        crate::wiring::RotaryKind::Default { .. } => half,
+        crate::wiring::RotaryKind::Proportional { rotated, .. } => {
+            (rotated / 2) as usize
+        }
+    };
+    for i in 0..half {
+        if i < rotated_pairs {
+            // The exponent's denominator is the FULL hd — the Default class's
+            // own law at rotated == hd, and ProportionalRoPE's defining
+            // difference from ordinary partial rope.
+            let inv_freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+            let ang = pos as f32 * inv_freq;
+            let (s, c) = ang.sin_cos();
+            cos[i] = c;
+            sin[i] = s;
+            cos[i + half] = c;
+            sin[i + half] = s;
+        } else {
+            // Pass-through: freq ∞ ⇒ angle 0 ⇒ identity.
+            cos[i] = 1.0;
+            sin[i] = 0.0;
+            cos[i + half] = 1.0;
+            sin[i + half] = 0.0;
+        }
+    }
+    (cos, sin)
+}
+
 /// argmax of a logits row.
 pub fn argmax(logits: &[f32]) -> usize {
     logits

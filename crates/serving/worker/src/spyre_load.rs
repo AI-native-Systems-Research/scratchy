@@ -137,11 +137,12 @@ pub(crate) struct Parsed {
     pub(crate) embed_src: usize,
     /// The attention length-mask source, when the wiring names one.
     pub(crate) attn_mask_src: Option<usize>,
-    /// cos / sin runtime sources as `(source id, full column width)`. GQA gives
-    /// more than one width (Q vs K); each is filled by tiling the per-position
-    /// rotary row across heads (the sendnn rope consumes them full-width).
-    pub(crate) cos_srcs: Vec<(usize, usize)>,
-    pub(crate) sin_srcs: Vec<(usize, usize)>,
+    /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
+    /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
+    /// gives classes different tables. Each is filled by tiling the class's own
+    /// per-position rotary row across heads.
+    pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
     pub(crate) capacity: usize,
     pub(crate) m_cap: usize,
@@ -188,19 +189,48 @@ pub(crate) fn wiring_to_parsed(
             prefix_v_src: l.prefix_v as usize,
             new_k_id: l.new_k as usize,
             new_v_id: l.new_v as usize,
+            kv_width: l.kv_width as usize,
         })
         .collect();
     if layers.is_empty() {
         return Err(werr("wiring carries no per-layer AttnDecode wiring"));
     }
-    let pairs = |v: &'static [(u32, u32)]| -> Vec<(usize, usize)> {
-        v.iter().map(|&(i, w)| (i as usize, w as usize)).collect()
+    // TEMP-PROBE-4 (remove before commit): dump shapes of the tensors the layer wiring names.
+    {
+        let n = w.tensor_shapes.len();
+        eprintln!("PROBE4 wiring has {n} tensor shapes");
+        for (li, l) in w.layers.iter().enumerate().take(6) {
+            let get = |id: u32| w.tensor_shapes.get(id as usize).copied();
+            eprintln!(
+                "PROBE4 layer {li}: pk t{} {:?} nk t{} {:?} nv t{} {:?}",
+                l.prefix_k,
+                get(l.prefix_k),
+                l.new_k,
+                get(l.new_k),
+                l.new_v,
+                get(l.new_v),
+            );
+        }
+        for &(cid, wd, _) in w.cos_srcs.iter() {
+            eprintln!(
+                "PROBE4 cos t{cid} w={wd} shape={:?}",
+                w.tensor_shapes.get(cid as usize).copied()
+            );
+        }
+    }
+    // END TEMP-PROBE-4
+    let triples = |v: &'static [(u32, u32, scratchy_target_spyre::wiring::RotaryKind)]| -> Vec<
+        (usize, usize, scratchy_target_spyre::wiring::RotaryKind),
+    > {
+        v.iter()
+            .map(|&(i, w, k)| (i as usize, w as usize, k))
+            .collect()
     };
     let embed_src = w.embed_src as usize;
     Ok(Parsed {
         embed_src,
-        cos_srcs: pairs(w.cos_srcs),
-        sin_srcs: pairs(w.sin_srcs),
+        cos_srcs: triples(w.cos_srcs),
+        sin_srcs: triples(w.sin_srcs),
         result_id: w.result as usize,
         capacity,
         m_cap: (w.tensor_shapes[embed_src].0 as usize).max(1),
@@ -1960,7 +1990,7 @@ impl SpyreWorker {
         let head_dim = hf_config
             .head_dim()
             .ok_or_else(|| werr("config missing head_dim / num_attention_heads"))?;
-        let kv_dim = dparsed.kv_dim;
+        let kv_dim = dparsed.kv_dim; // the info! below prints it on BOTH paths; the Loaded field is spyre-hw-only
         let vocab = dparsed.vocab;
         // ⭐ ROPE θ FROM THE BAKE.
         //
@@ -2033,10 +2063,11 @@ impl SpyreWorker {
             hf_config,
             embed_tokens,
             hidden,
+            #[cfg(feature = "spyre-hw")]
             head_dim,
+            #[cfg(feature = "spyre-hw")]
             kv_dim,
             vocab,
-            rope_theta,
             session,
             decode,
             prefill,

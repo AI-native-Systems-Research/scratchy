@@ -81,11 +81,9 @@ pub enum PrefixSource<'a, Valid: Fn(usize) -> bool> {
 /// `Valid` is a GENERIC BOUND, never `&dyn Fn`: monomorphised, no runtime dispatch.
 pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
     pub hidden: usize,
-    pub head_dim: usize,
     pub num_q_heads: usize,
     /// The stick-padded row count the emitter reads the causal mask at (`rows.div_ceil(64)*64`).
     pub mq_pad: usize,
-    pub rope_theta: f32,
     /// The whole embedding table.
     pub embed_tokens: &'a [f32],
     /// Token id per row.
@@ -129,7 +127,11 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
     shape: &ForwardShape,
     inp: &ForwardInputs<'_, Valid>,
 ) -> Result<Staged, String> {
-    let (rows, h, hd) = (shape.rows, inp.hidden, inp.head_dim);
+    // ⭐ NO `head_dim`/`rope_theta` HERE ANY MORE. The rotary kernels read BOTH
+    // off each source's own `RotaryKind` — a hybrid-attention arch (gemma-4)
+    // has no single head dim or θ, and the model-wide pair this used to read
+    // built every table from the WRONG class's facts.
+    let (rows, h) = (shape.rows, inp.hidden);
     // The one kernel whose output is already in the device's format.
     if let ForwardKernel::PrefixMask = step.kernel {
         let src = inp
@@ -206,21 +208,24 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
             } else {
                 &shape.sin_srcs
             };
-            let w = srcs
+            let &(_, w, kind) = srcs
                 .get(i)
-                .ok_or_else(|| format!("no rotary source {i}"))?
-                .1 as usize;
+                .ok_or_else(|| format!("no rotary source {i}"))?;
+            let (w, kind_hd) = (w as usize, kind.head_dim() as usize);
             let mut col = vec![0.0f32; rows * w];
             for r in 0..rows {
                 let pos = *inp
                     .positions
                     .get(r)
                     .ok_or_else(|| format!("no position for row {r}"))?;
-                let (c, sn) = crate::manifest::rope_cos_sin(pos, hd, inp.rope_theta);
+                // ⭐ THE SOURCE'S OWN CLASS, not the model-wide head_dim/θ: a
+                // hybrid-attention arch (gemma-4) gives sliding and global
+                // layers different tables, and the wrong one is silent garbage.
+                let (c, sn) = crate::manifest::rope_cos_sin_kind(pos, kind);
                 col[r * w..(r + 1) * w].copy_from_slice(&tile_rotary_row(
                     if want_cos { &c } else { &sn },
                     w,
-                    hd,
+                    kind_hd,
                 ));
             }
             if inp.stick_major {
@@ -380,12 +385,14 @@ pub struct ForwardShape {
     /// nearly true.
     pub rows: usize,
     pub embed_src: u32,
-    /// Rotary sources as `(id, full column width)`. GQA gives more than one width (Q spans
-    /// `hidden`, K spans `kv_dim`), which is why this is a list and not a pair.
+    /// Rotary sources as `(id, full column width, rotary class)`. GQA gives more
+    /// than one width (Q spans `hidden`, K spans `kv_dim`), which is why this is
+    /// a list and not a pair; the class says which table the source carries —
+    /// a hybrid-attention arch (gemma-4) gives classes DIFFERENT tables.
     /// ⛔ BORROWED FROM THE EMITTED `Wiring`, NOT COPIED OUT OF IT. `to_vec()`-ing these
     /// duplicated a `&'static` slice the macro put in the binary, once per forward, per token.
-    pub cos_srcs: &'static [(u32, u32)],
-    pub sin_srcs: &'static [(u32, u32)],
+    pub cos_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
+    pub sin_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
     /// `false` when the bundle placed no broadcast prefix mask, so nothing reads one.
     pub prefix_mask: bool,
     /// ⭐⭐⭐ THIS BUNDLE READS KV THROUGH AN INDEX, so the tape has a [`ForwardKernel::KvBlockIndex`]
@@ -411,13 +418,13 @@ impl ForwardShape {
             kernel: ForwardKernel::EmbedRow,
             tensor: PlaceId::Act(self.embed_src),
         });
-        for (i, &(t, _)) in self.cos_srcs.iter().enumerate() {
+        for (i, &(t, ..)) in self.cos_srcs.iter().enumerate() {
             v.push(ForwardStep {
                 kernel: ForwardKernel::Cos(i),
                 tensor: PlaceId::Act(t),
             });
         }
-        for (i, &(t, _)) in self.sin_srcs.iter().enumerate() {
+        for (i, &(t, ..)) in self.sin_srcs.iter().enumerate() {
             v.push(ForwardStep {
                 kernel: ForwardKernel::Sin(i),
                 tensor: PlaceId::Act(t),
@@ -531,12 +538,19 @@ pub fn tape_steps<'a>(steps: &[ForwardStep], ops: &'a [Operand]) -> Vec<Step<'a>
 mod tests {
     use super::*;
 
+    /// A single-class rotary table for the shape below — a const so the `&'static` slices can
+    /// borrow it (a literal in place is a dropped temporary).
+    const KIND: crate::wiring::RotaryKind = crate::wiring::RotaryKind::Default {
+        head_dim: 64,
+        theta_bits: 1_232_348_160, // f32::to_bits(1e6), spelled as bits: const-evaluable.
+    };
+
     fn shape() -> ForwardShape {
         ForwardShape {
             rows: 1,
             embed_src: 0,
-            cos_srcs: &[(5, 64), (7, 64)],
-            sin_srcs: &[(6, 64), (8, 64)],
+            cos_srcs: &[(5, 64, KIND), (7, 64, KIND)],
+            sin_srcs: &[(6, 64, KIND), (8, 64, KIND)],
             prefix_mask: true,
             // The shipped non-gathering shape, so the ORDER assertion below stays the order every
             // existing bundle plays. The gathering variant is asserted separately.
@@ -685,10 +699,8 @@ mod tests {
     fn inputs_without_table() -> ForwardInputs<'static, fn(usize) -> bool> {
         ForwardInputs {
             hidden: 64,
-            head_dim: 64,
             num_q_heads: 1,
             mq_pad: 64,
-            rope_theta: 10000.0,
             embed_tokens: &[],
             tokens: &[],
             positions: &[],
@@ -868,10 +880,8 @@ mod tests {
             .expect("the shape carries a prefix step");
         let inp = ForwardInputs {
             hidden: 64,
-            head_dim: 64,
             num_q_heads: 1,
             mq_pad: 64,
-            rope_theta: 1e4,
             embed_tokens: &[0.0; 64],
             tokens: &[0],
             positions: &[0],

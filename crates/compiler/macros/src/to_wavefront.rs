@@ -974,12 +974,12 @@ pub fn lower_decode_to_wavefront(
                 // ⭐ THE HEAD DIM IS THE ROTARY CLASS'S OWN, NOT THE MODEL'S. A hybrid-attention
                 // arch (gemma-4) binds TWO rotary externs: `rotary_local` names the BASE class
                 // (`bx.geom`) and plain `rotary` names the GLOBAL one (`bx.geom_global`, head_dim
-                // 512 where the base is 256). Stamping `bx.geom.hd()` on every rope node rotates
-                // a global layer's 512-wide head as two 256-wide heads with a 256-half pairing —
-                // a rotation the consumer's own geometry contradicts. The class selection mirrors
-                // the attention arm's (`AttnMask::Causal ⇒ geom_global`): the base class never
-                // has a global twin (its geometry IS the model's), and a global twin exists
-                // exactly when the two classes differ.
+                // 512 where the base is 256). This used to stamp `bx.geom.hd()` on every rope
+                // node, so a global layer's 512-wide head rotated as two 256-wide heads with a
+                // 256-half pairing — a rotation the consumer's own geometry contradicts. The
+                // class selection mirrors the attention arm's (`AttnMask::Causal ⇒ geom_global`):
+                // the base class never has a global twin (its geometry IS the model's), and a
+                // global twin exists exactly when the two classes differ.
                 let head_dim = if local_rope {
                     bx.geom
                 } else {
@@ -1058,6 +1058,13 @@ pub fn lower_decode_to_wavefront(
                     result = Some(idx);
                     continue;
                 };
+                // valid_len = the modeled prefix-cache rows: the RopeAppend
+                // above wrote the new token into the cache at decode_position,
+                // so the cache `[prefix_len, kv]` already spans prefix ++ new
+                // = `prefix_len` valid positions. The eval_node prefix slice
+                // uses `valid_len - 1` (the read-only prefix rows; the new
+                // row arrives via the separate k/v segments). The GPU mask
+                // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
                 let mask = match node.op {
                     OpKind::SlidingAttention => AttnMask::SlidingWindow,
@@ -1438,7 +1445,9 @@ pub fn lower_decode_to_wavefront(
                     .scalars
                     .get("final_logit_softcapping")
                     .copied()
-                    .unwrap_or(0.0) as f32;
+                    .ok_or(BridgeError::MissingScalar {
+                        key: "final_logit_softcapping",
+                    })? as f32;
                 let idx = bx.push_op(SubOp::TanhSoftCap { cap }, vec![x]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);

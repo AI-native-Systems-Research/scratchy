@@ -678,9 +678,7 @@ impl Worker for SpyreWorker {
                     embed_tokens: &model.embed_tokens,
                     hidden: model.hidden,
                     head_dim: model.head_dim,
-                    kv_dim: model.kv_dim,
                     vocab: model.vocab,
-                    rope_theta: model.rope_theta,
                 };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block

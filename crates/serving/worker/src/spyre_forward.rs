@@ -375,10 +375,8 @@ pub(crate) fn run_prefill_batch(
     );
     let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
         hidden: h,
-        head_dim: hd,
         num_q_heads: nqh,
         mq_pad,
-        rope_theta: sh.rope_theta,
         embed_tokens: sh.embed_tokens,
         tokens: &tokens,
         positions: &positions,
@@ -1279,10 +1277,8 @@ pub(crate) fn superdsc_forward_chunk(
         }
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
             hidden: h,
-            head_dim: hd,
             num_q_heads: h / hd,
             mq_pad: 64,
-            rope_theta: sh.rope_theta,
             embed_tokens: sh.embed_tokens,
             tokens: &[tok],
             positions: &[p as u32],
@@ -1470,8 +1466,19 @@ pub(crate) fn forward_chunk(
             start + n
         )));
     }
-    let (kvd, h, hd) = (sh.kv_dim, sh.hidden, sh.head_dim);
-    let have = req.kv_k.first().map_or(0, |c| c.len() / kvd);
+    // ⭐ NO `hd` HERE EITHER. The rotary tables are built per class (each cos/sin
+    // source's own `RotaryKind`), so this function no longer reads a model-wide
+    // head dim.
+    let h = sh.hidden;
+    // ⭐ A LAYER'S OWN WIDTH, NOT THE MODEL'S. A hybrid-attention arch (gemma-4) gives sliding
+    // layers `num_kv*hd` and global layers `g_kv*g_hd` — different numbers — so every per-layer
+    // quantity below (cache row count, prefix buffer size, readback count, extend length) reads
+    // the layer's baked `kv_width`, never the model-wide `sh.kv_dim`.
+    let have = req
+        .kv_k
+        .first()
+        .zip(b.layers.first())
+        .map_or(0, |(c, lw)| c.len() / lw.kv_width);
     if have != start {
         return Err(werr(format!(
             "KV cache desync: {have} cached rows but forwarding from position {start}"
@@ -1486,37 +1493,51 @@ pub(crate) fn forward_chunk(
     // RoPE tables for the n real rows; the remaining rows-n stay zero (padding,
     // causally after every real row).
     let mut emb = vec![0.0f32; rows * h];
-    // Per-position rotary rows (head_dim-wide), computed once; tiled into each
-    // per-width cos/sin source below (the sendnn rope consumes them full-width).
-    let mut cos_rows: Vec<Vec<f32>> = Vec::with_capacity(toks.len());
-    let mut sin_rows: Vec<Vec<f32>> = Vec::with_capacity(toks.len());
+    // ⭐ PER-CLASS rotary rows, computed once per position per CLASS. A hybrid-
+    // attention arch (gemma-4) gives sliding and global layers DIFFERENT tables
+    // (head dim, θ and partial-rotary all differ), and every cos/sin source
+    // names its own class in the wiring — one table per class, then each source
+    // tiles the one it carries. The wrong table is silent garbage (fluent,
+    // wrong output), never a fault.
+    let classes: Vec<scratchy_target_spyre::wiring::RotaryKind> = b
+        .cos_srcs
+        .iter()
+        .map(|&(_, _, k)| k)
+        .chain(b.sin_srcs.iter().map(|&(_, _, k)| k))
+        .collect();
+    // Per-class, per-position `[class_head_dim]` rows.
+    let mut cos_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(toks.len()); classes.len()];
+    let mut sin_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(toks.len()); classes.len()];
     for (i, &t) in toks.iter().enumerate() {
         if t >= sh.vocab {
             return Err(werr(format!("token {t} >= vocab {}", sh.vocab)));
         }
         emb[i * h..(i + 1) * h].copy_from_slice(&sh.embed_tokens[t * h..(t + 1) * h]);
-        let (c, s) =
-            scratchy_target_spyre::manifest::rope_cos_sin((start + i) as u32, hd, sh.rope_theta);
-        cos_rows.push(c);
-        sin_rows.push(s);
-    }
-    // Tile the head_dim-wide rotary rows across heads to fill a `[rows, width]`
-    // source. Padding rows (>= toks.len()) stay zero (causally after every real
-    // row). `width` is a multiple of `hd` (= heads * hd).
-    let tile = |rrows: &[Vec<f32>], width: usize| -> Vec<f32> {
-        let mut buf = vec![0.0f32; rows * width];
-        let reps = width / hd;
-        for (i, row) in rrows.iter().enumerate() {
-            for r in 0..reps {
-                let off = i * width + r * hd;
-                buf[off..off + hd].copy_from_slice(row);
-            }
+        for (ci, &k) in classes.iter().enumerate() {
+            let (c, s) = scratchy_target_spyre::manifest::rope_cos_sin_kind((start + i) as u32, k);
+            cos_tab[ci].push(c);
+            sin_tab[ci].push(s);
         }
-        buf
-    };
+    }
+    // Tile a class's head_dim-wide rotary rows across heads to fill a
+    // `[rows, width]` source. Padding rows (>= toks.len()) stay zero (causally
+    // after every real row). `width` is a multiple of the class's own head dim.
+    let tile =
+        |rrows: &[Vec<f32>], width: usize, kind: scratchy_target_spyre::wiring::RotaryKind| {
+            let chd = kind.head_dim() as usize;
+            let mut buf = vec![0.0f32; rows * width];
+            let reps = width / chd;
+            for (i, row) in rrows.iter().enumerate() {
+                for r in 0..reps {
+                    let off = i * width + r * chd;
+                    buf[off..off + chd].copy_from_slice(row);
+                }
+            }
+            buf
+        };
     // KTIR builds ONE dynamic-source list (embed + cos/sin + per-layer prefix-KV)
     // for the single fused forward. sendnn builds per-GROUP lists below (it threads
-    // the hidden state group→group), reusing `emb`/`cos_rows`/`sin_rows` directly.
+    // the hidden state group→group), reusing `emb`/`cos_tab`/`sin_tab` directly.
     let mut dynamic: Vec<(u64, Vec<f32>, Vec<usize>)> = {
         let mut dynamic =
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
@@ -1533,12 +1554,23 @@ pub(crate) fn forward_chunk(
             let tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::scalarmul_scale_tid(i);
             dynamic.push((u64::from(tid), vec![*v], vec![1, 1]));
         }
-        // Each rope table is tiled to the width its consumer reads.
-        for &(cid, w) in &b.cos_srcs {
-            dynamic.push((cid as u64, tile(&cos_rows, w), vec![n, w as usize]));
+        // Each rope table is tiled to the width its consumer reads, from THE
+        // SOURCE'S OWN CLASS's rows. `classes` is cos-then-sin, so a sin
+        // source's class index is offset past the cos sources.
+        let n_cos = b.cos_srcs.len();
+        for (ci, &(cid, w, kind)) in b.cos_srcs.iter().enumerate() {
+            dynamic.push((
+                cid as u64,
+                tile(&cos_tab[ci], w as usize, kind),
+                vec![n, w as usize],
+            ));
         }
-        for &(sid, w) in &b.sin_srcs {
-            dynamic.push((sid as u64, tile(&sin_rows, w), vec![n, w as usize]));
+        for (ci, &(sid, w, kind)) in b.sin_srcs.iter().enumerate() {
+            dynamic.push((
+                sid as u64,
+                tile(&sin_tab[n_cos + ci], w as usize, kind),
+                vec![n, w as usize],
+            ));
         }
         dynamic
     };
@@ -1549,12 +1581,13 @@ pub(crate) fn forward_chunk(
     {
         let cap = b.capacity;
         for (li, lw) in b.layers.iter().enumerate() {
-            let mut kbuf = vec![0.0f32; cap * kvd];
-            let mut vbuf = vec![0.0f32; cap * kvd];
+            let kvw = lw.kv_width;
+            let mut kbuf = vec![0.0f32; cap * kvw];
+            let mut vbuf = vec![0.0f32; cap * kvw];
             kbuf[..req.kv_k[li].len()].copy_from_slice(&req.kv_k[li]);
             vbuf[..req.kv_v[li].len()].copy_from_slice(&req.kv_v[li]);
-            dynamic.push((lw.prefix_k_src as u64, kbuf, vec![cap, kvd]));
-            dynamic.push((lw.prefix_v_src as u64, vbuf, vec![cap, kvd]));
+            dynamic.push((lw.prefix_k_src as u64, kbuf, vec![cap, kvw]));
+            dynamic.push((lw.prefix_v_src as u64, vbuf, vec![cap, kvw]));
         }
         // ⭐ THE LENGTH MASK IS FILLED BY WHOEVER KNOWS THE DECODE POSITION. The prefix cache tensor
         // spans the full structural capacity while only `start` of its rows are valid this step, so
@@ -1582,12 +1615,16 @@ pub(crate) fn forward_chunk(
         // ⭐ ASK FOR THE ROWS THIS FORWARD WROTE, NOT THE WHOLE RESIDENT TENSOR. Decode and prefill
         // share one session, so every tensor is resident at the WIDEST program's row count: a
         // one-row decode step had its outputs decoded at the prefill's `m`. The counts are the ones
-        // the reads below already slice to — `vocab` of the result, `n * kvd` of each new K/V.
+        // the reads below already slice to — `vocab` of the result, `n * kv_width` of each layer's
+        // new K/V (per LAYER: a hybrid arch's layers differ in width).
         let wanted: std::collections::HashMap<u64, usize> =
             std::iter::once((b.result_id as u64, vocab))
                 .chain(
                     b.layers.iter().flat_map(|lw| {
-                        [(lw.new_k_id as u64, n * kvd), (lw.new_v_id as u64, n * kvd)]
+                        [
+                            (lw.new_k_id as u64, n * lw.kv_width),
+                            (lw.new_v_id as u64, n * lw.kv_width),
+                        ]
                     }),
                 )
                 .collect();
@@ -1596,15 +1633,57 @@ pub(crate) fn forward_chunk(
             .iter()
             .map(|id| (*id as u64, wanted.get(&(*id as u64)).copied().unwrap_or(0)))
             .collect();
+        // TEMP-PROBE-2 (remove before commit): snapshot the staged cos tables.
+        let mut cos_snap: Vec<(usize, u64, String, Vec<f32>)> = Vec::new();
+        for (ci, &(cid, w, kind)) in b.cos_srcs.iter().enumerate() {
+            if let Some((_, data, _)) = dynamic.iter().find(|(t, _, _)| *t == cid as u64) {
+                cos_snap.push((ci, cid as u64, format!("{kind:?}"), data[..w.min(24) as usize].to_vec()));
+            }
+        }
+        let dyn_len = dynamic.len();
+        // END TEMP-PROBE-2
         let out = session
             .run_step(b.prog, dynamic, &outputs)
             .map_err(|e| werr(format!("run_step: {e}")))?;
         tokens.set_tokens_in_pool(id, start + n);
         for (li, lw) in b.layers.iter().enumerate() {
-            req.kv_k[li].extend_from_slice(&out[&(lw.new_k_id as u64)][..n * kvd]);
-            req.kv_v[li].extend_from_slice(&out[&(lw.new_v_id as u64)][..n * kvd]);
+            let kvw = lw.kv_width;
+            req.kv_k[li].extend_from_slice(&out[&(lw.new_k_id as u64)][..n * kvw]);
+            req.kv_v[li].extend_from_slice(&out[&(lw.new_v_id as u64)][..n * kvw]);
         }
         let res = &out[&(b.result_id as u64)];
+        // TEMP-PROBE (remove before commit)
+        {
+            let nnan = res[..vocab].iter().filter(|v| v.is_nan()).count();
+            let ninf = res[..vocab].iter().filter(|v| v.is_infinite()).count();
+            let mx = res[..vocab].iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            eprintln!(
+                "PROBE result: len={} nan={} inf={} maxabs={}",
+                res.len(),
+                nnan,
+                ninf,
+                mx
+            );
+            for (li, lw) in b.layers.iter().enumerate().take(6) {
+                let k = &out[&(lw.new_k_id as u64)];
+                let v = &out[&(lw.new_v_id as u64)];
+                eprintln!(
+                    "PROBE layer {li} (kvw={}): k nan={} maxabs={:.3} | v nan={} maxabs={:.3}",
+                    lw.kv_width,
+                    k.iter().filter(|x| x.is_nan()).count(),
+                    k.iter().fold(0.0f32, |a, x| a.max(x.abs())),
+                    v.iter().filter(|x| x.is_nan()).count(),
+                    v.iter().fold(0.0f32, |a, x| a.max(x.abs())),
+                );
+            }
+        }
+        // END TEMP-PROBE
+        // TEMP-PROBE-2 print (remove before commit)
+        eprintln!("PROBE2 dyn sources = {dyn_len}");
+        for (ci, cid, kind, row) in &cos_snap {
+            eprintln!("PROBE2 cos[{ci}] t{cid} {kind}: first-row = {row:?}");
+        }
+        // END TEMP-PROBE-2
         // ⭐⭐⭐ ONE LOGITS ROW, AT ROW 0 — because that is what the bundle COMPUTES.
         //
         // A prefill bundle does not run its vocab-wide lm_head at `mq`. `lower_one_node`'s
@@ -1676,10 +1755,9 @@ pub(crate) fn run_request_step(
     let sh = Shared {
         embed_tokens: &model.embed_tokens,
         hidden: model.hidden,
+        #[cfg(feature = "spyre-hw")]
         head_dim: model.head_dim,
-        kv_dim: model.kv_dim,
         vocab: model.vocab,
-        rope_theta: model.rope_theta,
     };
     // A decode step runs on the smallest cap bucket whose capacity covers the last position
     // this step reaches, so a short context pays cap-256 decode cost rather than max-cap.

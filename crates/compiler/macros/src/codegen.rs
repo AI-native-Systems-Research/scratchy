@@ -7726,8 +7726,8 @@ fn refuse_if_wiring_disagrees_with_manifest(
     manifest_json: &str,
     emitted_layers: &[(u64, u32, u32, u32, u32)],
     emitted_embed: u32,
-    emitted_cos: &[(u32, u32)],
-    emitted_sin: &[(u32, u32)],
+    emitted_cos: &[(u32, u32, proc_macro2::TokenStream)],
+    emitted_sin: &[(u32, u32, proc_macro2::TokenStream)],
     // Which source indices the GENERATED loader will emit a `BoundWeight` for.
     emitted_weight_ids: &std::collections::BTreeSet<u32>,
 ) {
@@ -7761,8 +7761,8 @@ fn refuse_if_wiring_disagrees_with_manifest(
             "embed source: manifest says {embed:?}, wiring says {emitted_embed}"
         ));
     }
-    let emit_cos: Vec<u32> = emitted_cos.iter().map(|&(i, _)| i).collect();
-    let emit_sin: Vec<u32> = emitted_sin.iter().map(|&(i, _)| i).collect();
+    let emit_cos: Vec<u32> = emitted_cos.iter().map(|&(i, ..)| i).collect();
+    let emit_sin: Vec<u32> = emitted_sin.iter().map(|&(i, ..)| i).collect();
     if cos != emit_cos {
         fail.push(format!(
             "cos sources: manifest {cos:?}, wiring {emit_cos:?}"
@@ -7890,9 +7890,116 @@ fn emit_superdsc_wiring(
                 model.source_stem
             )
         });
+    // ── Geometry, from the bounds the tape was lowered at ──
+    let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
+    let hidden = u32l(b("hidden_size") as u32);
+    let vocab = u32l(b("vocab_size") as u32);
+    let n_layers = u32l(b("num_hidden_layers") as u32);
+    // head_dim is declared by most arches and derived by the rest — the same
+    // `hidden/heads` fallback the emitter itself uses, resolved HERE so the
+    // worker never re-derives it (that re-derivation, against a config whose
+    // `num_attention_heads` disagreed with the baked bundle, is a known
+    // gemma-4-class failure).
+    let heads = b("num_attention_heads").max(1);
+    let hd = match b("head_dim") {
+        0 => b("hidden_size") / heads,
+        v => v,
+    };
+    let head_dim = u32l(hd as u32);
+    let kv_dim = u32l((b("num_key_value_heads").max(1) * hd) as u32);
+    // ⛔ SCALARS FIRST, AND NO DEFAULT. `rope_theta` is a FLOAT, so it lives in
+    // `model.scalars`; `bounds` is integer-valued and a bounds-only lookup
+    // misses it entirely. With an `unwrap_or(1e4)` behind it that miss is
+    // SILENT and emits θ=10000 for llama-3.2 (whose real θ is 500000) — a
+    // wrong baked constant that produces fluent, subtly-wrong output. The
+    // whole point of baking geometry is to have ONE answer, so a missing θ
+    // fails the build here exactly as metal's `.expect` does.
+    let theta = model
+        .scalars
+        .get("rope_theta")
+        .copied()
+        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+        .unwrap_or_else(|| {
+            panic!(
+                "[superdsc-wiring] {}: no rope_theta in scalars or bounds — refusing to bake a \
+                 default; the baked table would silently disagree with the checkpoint",
+                model.source_stem
+            )
+        }) as f32;
+    let theta_bits = u32l(theta.to_bits());
+
     // cos/sin carry their FULL column width: GQA gives more than one (Q vs K),
     // each filled by tiling the per-position rotary row across heads.
-    let rot_srcs = |want_cos: bool| -> Vec<(u32, u32)> {
+    //
+    // ⭐ AND EACH CARRIES ITS ROTARY CLASS. A hybrid-attention arch (gemma-4)
+    // gives sliding and global layers DIFFERENT tables (hd/θ/partial-rotary all
+    // differ), and the binding's own `local` flag says which class a source
+    // serves: `local` = the sliding class's `rotary_local` table, else the
+    // global/base class. The class FACTS come from the same bounds the tape was
+    // lowered at, so the baked table and the bundle cannot disagree. A uniform
+    // model has `local: false` everywhere and `global_head_dim == head_dim`
+    // with no partial factor, which folds to the base `Default` class.
+    let rot_theta_bits = |theta: f64| u32l((theta as f32).to_bits());
+    let rot_kind = |local: bool| -> proc_macro2::TokenStream {
+        if local {
+            // The sliding class: full rotary at the base head dim and the local
+            // base frequency (falls back to the model's main θ, the same
+            // precedence `rotary_local_load` uses).
+            let hd = u32l(hd as u32);
+            let local_theta = model
+                .scalars
+                .get("rope_local_base_freq")
+                .copied()
+                .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
+                .or_else(|| model.scalars.get("rope_theta").copied())
+                .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "[superdsc-wiring] {}: no rope_local_base_freq for a local rotary source",
+                        model.source_stem
+                    )
+                });
+            let tb = rot_theta_bits(local_theta);
+            quote! {
+                ::scratchy_target_spyre::wiring::RotaryKind::Default {
+                    head_dim: #hd, theta_bits: #tb,
+                }
+            }
+        } else {
+            // The global/base class: proportional partial rotary when the config
+            // declares `global_partial_rotary_factor` on a WIDER global head dim
+            // (gemma-4), else the base class.
+            let g_hd = model
+                .bounds
+                .get("global_head_dim")
+                .map(|v| *v as u32)
+                .unwrap_or(hd as u32);
+            match model.scalars.get("global_partial_rotary_factor").copied() {
+                Some(f) if g_hd != hd as u32 && (f - 1.0).abs() > 1e-9 => {
+                    let g_hd_lit = u32l(g_hd);
+                    let rotated = u32l((f * g_hd as f64).round() as u32);
+                    let tb = rot_theta_bits(f64::from(theta));
+                    quote! {
+                        ::scratchy_target_spyre::wiring::RotaryKind::Proportional {
+                            head_dim: #g_hd_lit, theta_bits: #tb, rotated: #rotated,
+                        }
+                    }
+                }
+                _ => {
+                    // Uniform: the class is the base head dim and θ (g_hd == hd
+                    // here whenever the factor is absent).
+                    let hd_lit = u32l(g_hd);
+                    let tb = rot_theta_bits(f64::from(theta));
+                    quote! {
+                        ::scratchy_target_spyre::wiring::RotaryKind::Default {
+                            head_dim: #hd_lit, theta_bits: #tb,
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let rot_srcs = |want_cos: bool| -> Vec<(u32, u32, proc_macro2::TokenStream)> {
         lwd.bindings
             .iter()
             .enumerate()
@@ -7901,7 +8008,13 @@ fn emit_superdsc_wiring(
                 SourceBinding::Sin { .. } => !want_cos,
                 _ => false,
             })
-            .map(|(i, _)| (i as u32, gk.tensor_shapes[i].1))
+            .map(|(i, b)| {
+                let local = match b {
+                    SourceBinding::Cos { local } | SourceBinding::Sin { local } => *local,
+                    _ => false,
+                };
+                (i as u32, gk.tensor_shapes[i].1, rot_kind(local))
+            })
             .collect()
     };
     let (cos_v, sin_v) = (rot_srcs(true), rot_srcs(false));
@@ -7911,14 +8024,15 @@ fn emit_superdsc_wiring(
             model.source_stem
         );
     }
-    let pair_toks = |v: &[(u32, u32)]| -> Vec<proc_macro2::TokenStream> {
-        v.iter()
-            .map(|(i, w)| {
-                let (i, w) = (u32l(*i), u32l(*w));
-                quote! { (#i, #w) }
-            })
-            .collect()
-    };
+    let pair_toks =
+        |v: &[(u32, u32, proc_macro2::TokenStream)]| -> Vec<proc_macro2::TokenStream> {
+            v.iter()
+                .map(|(i, w, k)| {
+                    let (i, w) = (u32l(*i), u32l(*w));
+                    quote! { (#i, #w, #k) }
+                })
+                .collect()
+        };
     let (cos_toks, sin_toks) = (pair_toks(&cos_v), pair_toks(&sin_v));
     let embed_src_lit = u32l(embed_src);
 
@@ -8036,8 +8150,8 @@ fn emit_superdsc_wiring(
         }
 
         // ── every caller-filled source is covered by exactly one filler ──
-        let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, _)| i).collect();
-        let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, _)| i).collect();
+        let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
+        let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings.get(id as usize) else {
@@ -8178,51 +8292,23 @@ fn emit_superdsc_wiring(
     );
 
     let layer_toks = layers.iter().map(|(_, ks, vs, nk, nv)| {
+        // ⭐ THE LAYER'S OWN KV WIDTH, off the prefix-K source's baked shape. A hybrid-attention
+        // arch (gemma-4) gives sliding and global layers DIFFERENT kv_heads×head_dim, so the
+        // model-wide `Geometry::kv_dim` cannot size a per-layer host buffer or readback — the
+        // prefix-K source's column count IS the width this layer's K/V rows carry.
+        let kvw = u32l(gk.tensor_shapes[*ks as usize].1);
         let (ks, vs, nk, nv) = (u32l(*ks), u32l(*vs), u32l(*nk), u32l(*nv));
         quote! {
             ::scratchy_target_spyre::wiring::LayerWiring {
                 prefix_k: #ks, prefix_v: #vs, new_k: #nk, new_v: #nv,
+                kv_width: #kvw,
             }
         }
     });
 
     // ── Geometry, from the bounds the tape was lowered at ──
-    let b = |k: &str| model.bounds.get(k).copied().unwrap_or(0);
-    let hidden = u32l(b("hidden_size") as u32);
-    let vocab = u32l(b("vocab_size") as u32);
-    let n_layers = u32l(b("num_hidden_layers") as u32);
-    // head_dim is declared by most arches and derived by the rest — the same
-    // `hidden/heads` fallback the emitter itself uses, resolved HERE so the
-    // worker never re-derives it (that re-derivation, against a config whose
-    // `num_attention_heads` disagreed with the baked bundle, is a known
-    // gemma-4-class failure).
-    let heads = b("num_attention_heads").max(1);
-    let hd = match b("head_dim") {
-        0 => b("hidden_size") / heads,
-        v => v,
-    };
-    let head_dim = u32l(hd as u32);
-    let kv_dim = u32l((b("num_key_value_heads").max(1) * hd) as u32);
-    // ⛔ SCALARS FIRST, AND NO DEFAULT. `rope_theta` is a FLOAT, so it lives in
-    // `model.scalars`; `bounds` is integer-valued and a bounds-only lookup
-    // misses it entirely. With an `unwrap_or(1e4)` behind it that miss is
-    // SILENT and emits θ=10000 for llama-3.2 (whose real θ is 500000) — a
-    // wrong baked constant that produces fluent, subtly-wrong output. The
-    // whole point of baking geometry is to have ONE answer, so a missing θ
-    // fails the build here exactly as metal's `.expect` does.
-    let theta = model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-        .unwrap_or_else(|| {
-            panic!(
-                "[superdsc-wiring] {}: no rope_theta in scalars or bounds — refusing to bake a \
-                 default; the baked table would silently disagree with the checkpoint",
-                model.source_stem
-            )
-        }) as f32;
-    let theta_bits = u32l(theta.to_bits());
+    // (Moved above the rotary-source emission: `hd` and `theta` are the base
+    // class's facts, and each cos/sin source's `RotaryKind` reads them.)
     let result = u32l(gk.result_tensor);
     let num_sources = u32l(gk.num_sources);
     let dp = u32l(decode_position);
@@ -8244,16 +8330,14 @@ fn emit_superdsc_wiring(
     // RetileDescriptor, so the host fill IS the device layout. The two coincide only at hd == 64;
     // at hd == 128 16,256 of 16,384 identity entries would come from the wrong byte.
     let (identity_lits, rope_p_lits) = {
-        use scratchy_subtile::sdsc_abstract::{StickLayout, rope_p_entry, stage_2d};
+        use scratchy_subtile::sdsc_abstract::{rope_p_entry, stage_kernel_table};
         let hdu = hd as usize;
-        let ident = stage_2d(&StickLayout::kernel(hdu, hdu), |i, j| {
+        let ident = stage_kernel_table(hdu, |i, j| {
             if i == j { 1.0 } else { 0.0 }
         });
         // `hd >= 2` is the runtime's own guard on emitting a rope-P at all.
         let ropep: Vec<f32> = if hdu >= 2 {
-            stage_2d(&StickLayout::kernel(hdu, hdu), |inn, o| {
-                rope_p_entry(hdu, inn, o) as f32
-            })
+            stage_kernel_table(hdu, |inn, o| rope_p_entry(hdu, inn, o) as f32)
         } else {
             Vec::new()
         };

@@ -2495,19 +2495,23 @@ const _: () = {
 /// ⛔ THE LARGEST SINGLE dxp GROUP A BUNDLE MAY STAGE (descriptors). Distinct from
 /// [`GroupSize::CEILING`]: that is the largest value the per-kind cap may be SET to; this is the
 /// largest group the whole partition may produce once the uncapped kinds (gathered PageFold,
-/// `run_may_be_chunked == false`) and time-trip fan-out have had their say. MEASURED: granite-8b
-/// fp8 — the accepted 30-minute bake — never exceeds ~512; gemma-4-12b fp8 staged 8,300 (one dxp
-/// child, 2.5+ h, killed still running) and 4.1-4.2k siblings on the same curve. A group past this
+/// `run_may_be_chunked == false`) and time-trip fan-out have had their say. A group past this
 /// ceiling is a build error (the oversized-group guard in `ktir_groups_via_superdsc`), not a
 /// multi-hour dxp that looks like a hang.
 pub struct DxGroupCeiling;
 
 impl DxGroupCeiling {
-    /// 512: the granite baseline's largest observed group, deliberately equal to
-    /// `GroupSize::CEILING` so the capped kinds cannot drift past it either. Headroom above the
-    /// baseline's real max exists if a legitimate model needs it — but it must be a MEASURED
-    /// decision that moves this constant, never a silent one that lets a monster group through.
-    pub const MAX_DESCRIPTORS: usize = 512;
+    /// 4204: the granite-8b fp8 baseline's LARGEST MEASURED GROUP — the accepted 30-minute bake's
+    /// own maximum (bundle `4f460f8b68a6c85a` group_1, an mq=32 gathered fold: 4 windows ×
+    /// (2·32·8·2 legs + 11 ladder) + 64 gather copies = 4204, verified against the plan-only dump
+    /// three ways: file count, `bundle_id.json` (mq=32, attn=4722), and the fan-out formula).
+    /// ⛔ NOT 512/`GroupSize::CEILING`: the ORIGINAL guard doc claimed the baseline "never exceeds
+    /// ~512" and 512 would refuse granite-8b's own accepted bake — a doc comment is not evidence,
+    /// and the dump is. Gemma-4-12b fp8's ladder is lawful under 4204 except ONE group: the
+    /// 8,300-descriptor mq=32 sliding-class fold, which the batch rung skips by its documented
+    /// contract (that batch runs one rung narrower); the next-largest gemma group is 4,183.
+    /// Moving this constant is a MEASURED decision that names the bake, never a silent one.
+    pub const MAX_DESCRIPTORS: usize = 4204;
 }
 
 /// Medium-grain fusion group size (trips per concrete dxp bundle) — [`GroupSize::PRODUCTION`].

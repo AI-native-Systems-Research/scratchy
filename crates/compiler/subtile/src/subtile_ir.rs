@@ -829,6 +829,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 eps.to_bits().hash(h);
                 std::mem::discriminant(gain).hash(h);
             }
+            SubOp::TanhSoftCap { cap } => cap.to_bits().hash(h),
             SubOp::RmsNormReduce { eps, .. } | SubOp::RmsNormUnit { eps } => eps.to_bits().hash(h),
             SubOp::RmsNormApply { gain, .. } => std::mem::discriminant(gain).hash(h),
             SubOp::RopeRotate { head_dim, .. } => head_dim.get().hash(h),
@@ -1100,10 +1101,11 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // place that can answer it: the target's opcode lowering.
     /// `cap · tanh(x / cap)` — Gemma's logit/attention soft cap.
     ///
-    /// The cap is the model constant `final_logit_softcapping`, threaded from
-    /// `to_wavefront` — it used to be resolved
-    /// only at each target's emission, so the tape never held it and `eval_node`
-    /// had no host reference. It holds it now, and the oracle below is real.
+    /// ⭐ THE CAP IS ON THE TAPE, following the `RmsNormUnit { eps }` precedent: a model constant
+    /// the device-side decomposition needs (`x / cap`, `· cap`) is carried on the op, minted from
+    /// `model.scalars["final_logit_softcapping"]` at the bridge, so `eval_node`'s host reference
+    /// and every target's emitter read ONE value rather than the front end's own knowledge of the
+    /// config key.
     TanhSoftCap { cap: f32 },
     /// Unit-gain RmsNorm — no learnable scale (Gemma4 `v_norm`). `inputs[0]` = x.
     RmsNormUnit { eps: f32 },
@@ -1684,6 +1686,14 @@ pub fn eval_node<F: RopeForm>(
             out
         }
 
+        // ⭐ THE CAP IS ON THE TAPE now, so the host reference exists — the same
+        // `cap · tanh(x / cap)` every target's emitter states.
+        SubOp::TanhSoftCap { cap } => {
+            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+            debug_assert_eq!((xr, xc), (out_rows, out_cols), "tanh_softcap shape");
+            x.iter().map(|&v| cap * (v / cap).tanh()).collect()
+        }
+
         // ── Ops with NO host reference ──────────────────────────────
         //
         // ⛔ THESE PANIC, AND THE MESSAGE NAMES WHAT IS MISSING. `eval_node` is the
@@ -1693,13 +1703,6 @@ pub fn eval_node<F: RopeForm>(
         // is not a gatherable tensor) has no oracle, and returning zeros or the
         // input unchanged would make the comparison PASS while proving nothing.
         // That is strictly worse than no oracle, so it is not on offer.
-        SubOp::TanhSoftCap { cap } => {
-            // `cap · tanh(x / cap)` — the same form every target lowers. The cap
-            // is on the tape now, so this is a real oracle, not a panic.
-            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
-            debug_assert_eq!((xr, xc), (out_rows, out_cols), "softcap shape mismatch");
-            x.into_iter().map(|v| cap * (v / cap).tanh()).collect()
-        }
         SubOp::GateSplit { .. } => panic!(
             "SubOp::GateSplit has no host reference: it has TWO outputs (q and gate) \
              and eval_node returns the buffer for ONE region, so the gate half would \

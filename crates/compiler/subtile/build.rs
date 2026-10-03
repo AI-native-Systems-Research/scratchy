@@ -254,5 +254,19 @@ fn geometry_bounds(json: &serde_json::Value) -> std::collections::BTreeMap<Strin
     {
         flat.insert("num_key_value_heads".into(), heads);
     }
+    // The same per-class defaults `apply_generic_bound_defaults` applies to the macro's own bounds:
+    // a uniform-geometry arch declares neither `global_*` key, and the global class then IS the base
+    // class — default these so the global-geometry arm above dedups onto the base one rather than
+    // being silently absent.
+    if !flat.contains_key("global_head_dim")
+        && let Some(&hd) = flat.get("head_dim")
+    {
+        flat.insert("global_head_dim".to_string(), hd);
+    }
+    if !flat.contains_key("num_global_key_value_heads")
+        && let Some(&kv) = flat.get("num_key_value_heads")
+    {
+        flat.insert("num_global_key_value_heads".to_string(), kv);
+    }
     flat
 }

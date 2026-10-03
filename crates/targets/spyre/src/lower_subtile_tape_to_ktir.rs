@@ -391,6 +391,7 @@ fn lower_rmsnorm_node<F: RopeForm>(
     // The graph the node belongs to — the shapes its program's views state.
     ir: &SubtileIR<F>,
     eps: f32,
+    gain: scratchy_subtile::subtile_ir::GainConvention,
     _sym_id_base: &mut i64,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
     if node.inputs.len() != 2 {
@@ -406,9 +407,18 @@ fn lower_rmsnorm_node<F: RopeForm>(
     // every constant after it. The ported body emits that path's own descriptors and reads
     // `RMS_INVCOLS_TID` itself; this value exists only for the KTIR the emulator interprets, where an
     // immediate costs nothing and is invisible to the device's constant surface.
+    //
+    // ⭐ THE GAIN OFFSET IS AN IMMEDIATE TOO, for the same reason and with the same law: the (1 + w)
+    // convention is the same chain with `gamma + 1` in the multiply, and the addition is computed in
+    // the PROGRAM rather than folded into the loaded weight — folding would make the bound tensor
+    // disagree with the checkpoint.
+    let gain_offset = match gain {
+        scratchy_subtile::subtile_ir::GainConvention::Scale => 0.0,
+        scratchy_subtile::subtile_ir::GainConvention::OnePlusScale => 1.0,
+    };
     let mut st = KtirFunc::new(ir);
     let name = Arena::global().str(format!("rmsnorm_s{}", node.id.index()));
-    st.rmsnorm(&node.inputs[0], &node.inputs[1], &node.output, eps);
+    st.rmsnorm(&node.inputs[0], &node.inputs[1], &node.output, eps, gain_offset);
     let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RmsNorm);
     let mut e = EmittedOp::bare(name.to_string());
     e.ktir = Some(k);
@@ -465,7 +475,7 @@ fn lower_router_norm_node<F: RopeForm>(
     }
     let mut st = KtirFunc::new(ir);
     let name = Arena::global().str(format!("routernorm_s{}", node.id.index()));
-    st.rmsnorm(&node.inputs[0], &node.inputs[1], &node.output, eps);
+    st.rmsnorm(&node.inputs[0], &node.inputs[1], &node.output, eps, 0.0);
     let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RmsNorm);
     let mut e = EmittedOp::bare(name.to_string());
     e.ktir = Some(k);
@@ -808,6 +818,16 @@ fn lower_rope_node<F: RopeForm, const HD: u32>(
     }
     let mut st = KtirFunc::new(ir);
     let name = Arena::global().str(format!("rope_s{}", node.id.index()));
+    // TEMP-PROBE-5 (remove before commit)
+    eprintln!(
+        "PROBE5 rope_s{}: HD={HD} total={total} rows={} in0={:?} in1={:?} out={:?}",
+        node.id.index(),
+        node.output.region.rows.len,
+        node.inputs[0].region,
+        node.inputs[1].region,
+        node.output.region,
+    );
+    // END TEMP-PROBE-5
     st.rope(
         RopeTensors {
             x_t: node.inputs[0].tensor,
@@ -1113,10 +1133,64 @@ fn lower_scalarmul_node<F: RopeForm>(
     Ok(e)
 }
 
-/// Narrow a node to its FIRST row: the OUTPUT and the leading (activation) input keep their columns but
-/// contract to one row. Used by the m>1 prefill lm-head tail, whose activation is a `[1, ·]` slice
-/// written at offset 0 by the ops above it, so the whole tail lowers through the SAME `lower_*_node` the
-/// PROVEN m=1 decode path uses — no parallel emitter for the folded form.
+/// `SubOp::TanhSoftCap { cap }` — `cap · tanh(x / cap)`, Gemma's logit soft cap, as one KTIR program
+
+/// The arity refusal helper the pointwise arms below share — one spelling of "this op takes exactly
+/// `n` operands", naming the op the way every other refusal here does.
+fn arity_error<F: RopeForm>(node: &SubtileNode<F>, n: usize) -> SuperDscError {
+    SuperDscError(format!(
+        "{:?} t{} expects {} input(s), found {}",
+        node.op,
+        node.output.tensor.index() as u32,
+        n,
+        node.inputs.len()
+    ))
+}
+
+/// `SubOp::ScalarWeightMul` — multiply by a loaded `[1]`-shaped weight (Gemma4 `layer_scalar[layer]`),
+/// NOT a compile-time constant like [`ScalarMul`]. The weight is a rank-1 load broadcast along the
+/// column axis, the same shape the rmsnorm gain takes, so the broadcast produces `[rows, cols]` from
+/// a one-element source without a rank change.
+fn lower_scalarweightmul_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<EmittedOp, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(arity_error(node, 2));
+    }
+    let w = &node.inputs[1];
+    if w.region.rows.len != 1 || w.region.cols.len != 1 {
+        return Err(SuperDscError(format!(
+            "ScalarWeightMul t{}: the weight operand t{} is `[{}, {}]` — the op multiplies by a \
+             loaded `[1]`-shaped scalar (gemma4 `layer_scalar[layer]`), so any other shape is not a \
+             scalar and not this op",
+            node.output.tensor.index() as u32,
+            w.tensor.index() as u32,
+            w.region.rows.len,
+            w.region.cols.len
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("scalarwmul_s{}", node.id.index()));
+    let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
+    let dims = vec![i64::from(rows), i64::from(cols)];
+    let x = st.load_region(&node.inputs[0]);
+    // Rank-1 one-element load → broadcast along columns: every column of a row shares the weight.
+    let wv = st.load_1d(w.tensor, 1, 0, 1);
+    let wb = st.broadcast(wv, dims.clone(), 0);
+    let y = st.binop(OpKind::ArithMulf, x, wb, dims);
+    st.store_region(y, &node.output);
+    let k = st.finish_shaped(
+        name,
+        ktir_superdsc::ktir_node::Program::Elementwise(ktir_superdsc::ktir_node::Elementwise::Mul),
+    );
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(e)
+}
+
+
 ///
 /// ONLY `inputs[0]` is contracted. A matmul's `inputs[1]` is the WEIGHT `[k, n]`, whose `rows` is the
 /// REDUCTION extent K, not the query count — narrowing it to one row claims K=1 and fails
@@ -1293,6 +1367,16 @@ struct LowerRope<'a, F: RopeForm> {
 impl<F: RopeForm> scratchy_subtile::model_geometry::OnHeadDim for LowerRope<'_, F> {
     type Out = Result<Vec<EmittedOp>, SuperDscError>;
     fn on_head_dim<const HD: u32>(self) -> Self::Out {
+        // TEMP-PROBE-5 (remove before commit)
+        eprintln!(
+            "PROBE5 rope HD={HD} node id={} rows={:?} out={:?} in0={:?} in1={:?}",
+            self.node.id.index(),
+            self.node.output.region.rows,
+            self.node.output.region,
+            self.node.inputs[0].region,
+            self.node.inputs[1].region,
+        );
+        // END TEMP-PROBE-5
         lower_rope_node::<F, HD>(
             self.node,
             self.ir,
@@ -1561,37 +1645,19 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             Ok(v) => Ops(v),
             Err(e) => Unhandled(e.0),
         },
-        // ⛔ SPYRE'S RMSNORM MULTIPLIES BY THE STORED GAIN. The gemma-class (1 + w)
-        // convention needs a different kernel, and running the Scale one over a
-        // zero-centred gain scales every normalized activation by roughly nothing — a
-        // model that loads, runs, and is quietly wrong. So it refuses BY NAME.
-        //
-        // It can reach here at all because the shared front end now EXPRESSES the
-        // convention instead of asserting it away in `lower_region`. That is the trade:
-        // the IR carries the fact, and the target says whether it has a kernel for it.
-        SubOp::RmsNorm {
-            eps,
-            gain: scratchy_subtile::subtile_ir::GainConvention::Scale,
-        } => match lower_rmsnorm_node(node, ir, *eps, sym_id_base) {
-            Ok(v) => Ops(v),
-            Err(e) => Unhandled(e.0),
-        },
-        SubOp::RmsNorm {
-            gain: scratchy_subtile::subtile_ir::GainConvention::OnePlusScale,
-            ..
-        } => Unhandled(format!(
-            "RmsNorm t{} uses the (1 + w) gain convention, for which this emitter has \
-             no kernel — its rmsnorm multiplies by the stored gain",
-            node.output.tensor.index() as u32,
-        )),
-        // The GAINLESS form — gemma's per-head V/K norms. The same chain as `RmsNorm`
-        // minus the gamma multiply, so it is the same 6-op decomposition with the
-        // normalising multiply terminal. Unit gain means there is no GainConvention to
-        // refuse here: nothing is applied.
-        SubOp::RmsNormUnit { eps } => match lower_rmsnorm_unit_node(node, ir, *eps, sym_id_base) {
-            Ok(v) => Ops(v),
-            Err(e) => Unhandled(e.0),
-        },
+        // ⭐ THE GAIN CONVENTION IS THE OFFSET THE CHAIN ADDS TO THE LOADED ROW — one kernel, two
+        // offsets. `Scale` is the stored-gain form llama/granite use (`+0.0`); the gemma-class
+        // (1 + w) convention is the SAME chain with `+1.0` applied to the gamma row inside the
+        // program, never folded into the bound weight (folding would make the loaded gain disagree
+        // with the checkpoint — the same reason the bridge CARRIES the convention instead of
+        // folding it at `to_wavefront`). Before this, the (1 + w) form was refused BY NAME because
+        // the program had no way to say the offset; now it does.
+        SubOp::RmsNorm { eps, gain } => {
+            match lower_rmsnorm_node(node, ir, *eps, *gain, sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
         SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
             // ⭐⭐ THE ONE PLACE THE HEAD DIM STOPS BEING A VALUE. Every head_dim-dependent decision
             // downstream is a branch on a CONST, which is reviewable and guardable; a branch on a
@@ -2461,8 +2527,15 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // the tape walk would have, and the real pass in `ktir_groups_via_superdsc` finds each one already
     // declared and resolves the identical address. The symbol counter and the fp8-quantize set are
     // throwaways because only the layout is wanted; the descriptors are dropped.
-    // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
-    // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
+    //
+    // ⛔ CARD ONLY, for exactly the reason its own doc gives: the one consumer that reads those
+    // synthetics is `ktir_groups_via_superdsc`, which `emit_bundle_inner` calls only under
+    // `spyre-hw`. The emulator executes the programs' SSA directly and addresses every REAL tensor
+    // through the placements `compute_bundle_layout` already made — running the door here for it
+    // would demand a SuperDSC descriptor body for every program kind before the emulator could run
+    // ANY of them, which is the card's admission predicate applied to a device that has no
+    // descriptors. The same device split codegen's own bake makes (`let card = cfg!(feature =
+    // "spyre-hw")`).
     let attn_params = attn_bundle_params(ir, rows_are_requests)?;
     let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
     for ops in std::iter::once(&prefix)
@@ -3616,7 +3689,14 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
     /// `ktir-optimizer`, which is `spyre-emu`-gated; the producer states the shape the node has.
     /// ⭐⭐ BUT THE VARIANCE PHASE IS **COLUMN**-BLOCKED when the region does not fit a core's LX —
     /// see [`Self::rmsnorm_inv`] for why that is the one legal blocking axis.
-    fn rmsnorm(&mut self, x_r: &TensorRegion, gamma: &TensorRegion, out: &TensorRegion, eps: f32) {
+    fn rmsnorm(
+        &mut self,
+        x_r: &TensorRegion,
+        gamma: &TensorRegion,
+        out: &TensorRegion,
+        eps: f32,
+        gain_offset: f32,
+    ) {
         // The region's extents, read off the output — ONE spelling of each quantity. The width used to
         // arrive as a registry index beside it too, and two spellings of one number is what lets them
         // disagree.
@@ -3631,6 +3711,14 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         // gamma is one row `[1, c]`, loaded RANK-1 so the broadcast produces `[r, c]` — a `[1, c]`
         // load would broadcast to `[1, 1, c]`, since the emulator does not rank-reduce.
         let gcol = self.load_1d(gamma.tensor, c, 0, c);
+        // The (1 + w) convention: offset the loaded gain row BEFORE the broadcast. Computed here,
+        // never folded into the weight — see `lower_rmsnorm_node`'s gain_offset note.
+        let gcol = if gain_offset != 0.0 {
+            let off = self.f32_splat(f64::from(gain_offset), vec![i64::from(c)]);
+            self.f32_binop(OpKind::ArithAddf, gcol, off, vec![i64::from(c)])
+        } else {
+            gcol
+        };
         let gb = self.broadcast(gcol, dims.clone(), 0);
         let y = self.binop(OpKind::ArithMulf, xs, gb, dims);
         self.store_region(y, out);

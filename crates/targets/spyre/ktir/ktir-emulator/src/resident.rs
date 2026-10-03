@@ -752,6 +752,47 @@ impl ResidentExecutor {
                 self.programs.len()
             ));
         }
+        // TEMP-PROBE-7 (remove before commit): once, dump program 0's node list with
+        // bindings, to see which node should write each output tensor.
+        if std::env::var_os("SCRATCHY_SEG_TRACE").is_some() && idx == 0 {
+            let prog = &self.programs[idx];
+            for (ni, n) in prog.nodes.iter().enumerate() {
+                let f = prog.module.get_function(&n.func);
+                let grid = f.map(|f| f.grid).unwrap_or((0, 0, 0));
+                let binds: Vec<String> = n
+                    .bindings
+                    .iter()
+                    .map(|b| format!("t{}{}", b.tensor, if b.is_output { "*" } else { "" }))
+                    .collect();
+                // Only the first ~40 nodes plus any node touching t784.
+                if ni < 40 || n.bindings.iter().any(|b| b.tensor == 784) {
+                    eprintln!("PROBE7 node{ni} {} grid={grid:?} binds={binds:?}", n.func);
+                }
+            }
+            // TEMP-PROBE-8 (remove before commit): dump the segment list with its node
+            // membership + fused args, and the rope_s13 function's ops.
+            let segs = &self.programs[idx].segments;
+            for (si, s) in segs.iter().enumerate().take(12) {
+                match s {
+                    Segment::Fused(fs) => {
+                        let args: Vec<String> =
+                            fs.args.iter().map(|(_, t)| format!("t{t}")).collect();
+                        let outs: Vec<String> =
+                            fs.outputs.iter().map(|t| format!("t{t}")).collect();
+                        eprintln!(
+                            "PROBE8 seg{si} FUSED {} grid={:?} args={args:?} outputs={outs:?}",
+                            fs.func.name,
+                            fs.func.grid
+                        );
+                    }
+                    Segment::Native(n) => {
+                        eprintln!("PROBE8 seg{si} NATIVE {}", n.func);
+                    }
+                }
+            }
+        }
+        // END TEMP-PROBE-8
+        // END TEMP-PROBE-7
         self.zero_non_sources();
 
         // Resident weights are uploaded once (and the weight cache is cleared on
@@ -811,6 +852,33 @@ impl ResidentExecutor {
             if tile_dataflow {
                 break;
             }
+            // TEMP-PROBE-6 (remove before commit): after each segment, dump the
+            // requested outputs' stick contents, to find which segment fails to
+            // write a tensor.
+            let probe6 = std::env::var_os("SCRATCHY_SEG_TRACE").is_some();
+            let probe6_pre: Vec<(u64, f64, usize)> = if probe6 {
+                outputs
+                    .iter()
+                    .filter_map(|&(tid, _)| {
+                        let s = *self.stick.get(&tid)?;
+                        let n = *self.numel.get(&tid)?;
+                        let bytes =
+                            self.mem
+                                .hbm
+                                .borrow()
+                                .read_bytes(s * STICK_BYTES, n * self.dtype.bytes_per_elem());
+                        let d = crate::codec::decode(&bytes, n, self.dtype);
+                        Some((
+                            tid,
+                            d.iter().fold(0.0f64, |a, x| a + x.abs() as f64),
+                            d.iter().filter(|x| x.is_nan()).count(),
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // END TEMP-PROBE-6
             // Reset every core's LX scratchpad before each segment run. The
             // persistent `mem` reuses the SAME LX across segments/passes, but each
             // function run is a self-contained SPMD execution that bump-allocates
@@ -946,6 +1014,31 @@ impl ResidentExecutor {
                     }
                 }
             }
+            // TEMP-PROBE-6 (remove before commit): dump requested-output sticks after this segment.
+            if probe6 {
+                for (i, &(tid, _)) in outputs.iter().enumerate().take(10) {
+                    let Some(&s) = self.stick.get(&tid) else { continue };
+                    let Some(&n) = self.numel.get(&tid) else { continue };
+                    let bytes = self
+                        .mem
+                        .hbm
+                        .borrow()
+                        .read_bytes(s * STICK_BYTES, n.min(2048) * self.dtype.bytes_per_elem());
+                    let d = crate::codec::decode(&bytes, n.min(2048), self.dtype);
+                    let (pre_sum, pre_nan) = probe6_pre
+                        .get(i)
+                        .map(|&(t, s, nn)| (s, nn))
+                        .unwrap_or((0.0, 0));
+                    let sum: f64 = d.iter().fold(0.0, |a, x| a + x.abs() as f64);
+                    let nan = d.iter().filter(|x| x.is_nan()).count();
+                    if (sum - pre_sum).abs() > 1e-6 || nan != pre_nan {
+                        eprintln!(
+                            "PROBE6 prog{idx} seg{seg_i} t{tid} n={n}: sum {pre_sum:.3} -> {sum:.3}, nan {pre_nan} -> {nan}"
+                        );
+                    }
+                }
+            }
+            // END TEMP-PROBE-6
         }
         if diag {
             eprintln!(
