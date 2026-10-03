@@ -240,7 +240,9 @@ fn sample_rows(
             let x = Some(crate::tape::lowered::MScaleAxis::X);
             let ix = w.of(WeightKind::Linear, 0)?;
             let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
-            sampled(affine_qmv_command(p, &g, 1, x, g.layer, ix, codes, /*wide_ok=*/ false))
+            sampled(affine_qmv_command(
+                p, &g, 1, x, g.layer, ix, codes, /*wide_ok=*/ false,
+            ))
         }
         (true, R::Scatter) => sampled(scatter_first_to_last_row_command(p, g.output, g.n.get())),
         (true, R::AllRows) => plain
@@ -1963,7 +1965,8 @@ fn lower_one(
                 let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
                 // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539); our
                 // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
-                let wide_ok = profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
+                let wide_ok =
+                    profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
                 affine_qmv_command(
                     p,
                     g,
