@@ -33,6 +33,11 @@ metal = ["dep:scratchy-ir", "scratchy-ir/metal",
 # `spyre` gate (registry + IR); NEVER target-cuda — spyre rides the
 # compiler-owned registry, not the cuda crate.
 spyre = ["scratchy-forward-compiler/spyre", "scratchy-subtile/spyre", "dep:scratchy-target-spyre", "dep:ktir-core"]
+# The Triton splice: this crate's copy of scratchy-target-spyre is the one the
+# #[forward] expansion-time lowering runs in (the models crate's BUILD script is
+# the caller), so the feature must be forwarded HERE for the splice's cfg to be
+# live at expansion — the cli→api→worker chain only reaches the binary's copy.
+spyre-triton = ["spyre", "scratchy-target-spyre/spyre-triton"]
 
 # A CARD. The device image is compiled from the KTIR at bake time, so this build has a device
 # compiler to drain; the emulator build has nothing to compile and nothing to wait for.

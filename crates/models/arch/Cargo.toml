@@ -655,6 +655,14 @@ spyre = [
     "scratchy-forward-compiler/spyre",
     "dep:scratchy-target-spyre",
 ]
+# The Triton splice at EXPANSION time: the #[forward] pipeline (a build-dependency
+# on scratchy-forward-compiler-macro, which drives the lowering inside the models
+# crate's build script) compiles a registered op kind's Triton kernel instead of
+# the hand-written Rust builder. Must be named here AND on the macro, because the
+# macro's own copy of scratchy-target-spyre is the one whose `#[cfg(feature =
+# "spyre-triton")]` the expansion-time lowering sees — the cli→api→worker chain
+# alone only reaches the binary's copy.
+spyre-triton = ["spyre", "scratchy-forward-compiler-macro/spyre-triton"]
 # Shell tab-completion over REAL HuggingFace model ids. Off by default, and
 # deliberately so: the build script resolves the candidate list by querying
 # huggingface.co (one tag search per compiled arch, then one `config.json` per

@@ -2093,9 +2093,27 @@ pub fn program_scalarmul_scale(f: &IRFunction<'static>) -> Option<f32> {
 /// so the slot is the one thing that has to be looked up rather than read.
 fn scale_slot(layout: Option<&BundleLayout>, value: f32) -> Option<usize> {
     layout.and_then(|l| {
+        // ⭐ EXACT BITS FIRST, THEN THE f16 IMAGE — and the fallback is not a tolerance.
+        //
+        // `compute_bundle_layout` registers the tape's f32 constant, and the worker binds ONE
+        // fp16 per slot (`SCALE_BYTES = 2`), so the value the descriptor reads is the f16 image
+        // of the registry entry either way. A Triton producer's program states its epsilon as
+        // the f16 image directly: `LegalizeTypes::step_2b_island_constants` ROUNDS the splat
+        // value (`f.to_f16()`) when it feeds an op with an f16 operand — MEASURED, the
+        // triton-spyre layout docs record `1e-5` arriving as `0.00001001358`. Matching that
+        // against the f32 registry by bits alone refused the CORRECT descriptor, so the f16
+        // image is the second query — exact equality of the bound value, not an approximation.
+        // The builder path's program keeps its f32 constant, so it still matches on the first
+        // query and this changes nothing for it.
         l.scalarmul_scales
             .iter()
             .position(|s| s.to_bits() == value.to_bits())
+            .or_else(|| {
+                let v16 = half::f16::from_f32(value);
+                l.scalarmul_scales
+                    .iter()
+                    .position(|s| half::f16::from_f32(*s) == v16)
+            })
     })
 }
 

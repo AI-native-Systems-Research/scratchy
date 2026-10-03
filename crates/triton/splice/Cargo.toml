@@ -1,0 +1,25 @@
+[package]
+name = "scratchy-triton-splice"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# The splice: a SubtileTape node whose KTIR comes from a Triton kernel
+# (crates/triton/PROVENANCE.md), compiled at `#[forward]` expansion time, instead
+# of the Rust builder in scratchy-target-spyre. A LEAF between the two ladders:
+# scratchy-subtile (the tape types) below, the re-hosted Triton front end above.
+# scratchy-target-spyre hooks it in behind its `spyre-triton` feature — the target
+# crate gains a hook, not a second copy of the lowering.
+
+[dependencies]
+scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
+ktir-core = { path = "../../targets/spyre/ktir/ktir-core" }
+ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
+# ⭐ THE RUST LADDER, from this workspace's own re-host. `codegen::compile` is behind
+# `ruff` (the Python parser); the splice compiles .py kernels at expansion time, so it
+# names the feature. The pod-offline constraint is recorded in crates/triton/PROVENANCE.md:
+# a pod build never turns on `spyre-triton`, so ruff stays out of the offline graph.
+triton-frontend = { path = "../triton-frontend", features = ["ruff"] }
+triton-ktir = { path = "../triton-ktir" }
+triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }

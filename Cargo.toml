@@ -37,6 +37,10 @@ members = [
     "crates/triton/triton-ktir",
     "crates/triton/triton-numeric",
     "crates/triton/triton-ktir-superdsc",
+    # The splice: a SubtileTape node whose KTIR comes from a Triton kernel, not the Rust
+    # builder. A leaf between the tape types and the ladder, so scratchy-target-spyre
+    # hooks it in without a second copy of the lowering.
+    "crates/triton/splice",
     "crates/models/arch",
     "crates/models/vision",
     "crates/models/quantization",
