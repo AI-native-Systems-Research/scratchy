@@ -678,16 +678,19 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// (typically ascending), and a linear scan over a handful of
     /// buckets is cheaper than maintaining a sorted invariant.
     ///
-    /// **Safe-bucket floor:** the fused MLP / MLX-steel kernels at
-    /// `bucket_m >= 2` assume the steel BM=32 tile size; arenas sized
-    /// for `bucket_m < SAFE_MULTI_ROW_BUCKET_M` can be overrun by the
-    /// kernel writing beyond the slot. Until the small-bucket kernel
-    /// path is hardened, we refuse to select buckets in the
-    /// `(1, SAFE_MULTI_ROW_BUCKET_M)` range — `num_tokens=2..7` rounds
-    /// up to the safe-floor bucket (typically 8), at the cost of
-    /// padded compute for small batches.
+    /// **Safe-bucket floor:** multi-row buckets are only selected from
+    /// `SAFE_MULTI_ROW_BUCKET_M` up. The historical reason — the fused
+    /// MLP / MLX-steel kernels' BM=32 tile overrunning arenas sized for
+    /// `bucket_m < 8` — is stale: the steel kernel has carried M-tail
+    /// guards since its initial commit and the arenas are
+    /// elementwise-maxed across buckets. Validated at 2–7 concurrent
+    /// sequences on Llama-3.2-1B (dense fused-MLP) and gemma-4-26b-a4b
+    /// (MoE, qmv_wide) with greedy-output checks; the floor now exists
+    /// to keep `num_tokens=2..7` off the (correct but slow) M=8
+    /// grouped-MoE bucket's padded compute only when no smaller bucket
+    /// fits.
     pub fn pick_bucket(&self, num_tokens: u32) -> Result<usize, ForwardError> {
-        const SAFE_MULTI_ROW_BUCKET_M: u32 = 8;
+        const SAFE_MULTI_ROW_BUCKET_M: u32 = 2;
         if num_tokens == 0 {
             return Err(ForwardError::ZeroTokens);
         }
@@ -877,7 +880,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             Ok(())
         })?;
         if trace {
-            eprintln!("[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4] {took}");
+            let dispatches = worker.count_dispatches(bucket_idx);
+            eprintln!(
+                "[forward bucket={bucket_idx} num_tokens={num_tokens} mtl4 dispatches={dispatches}] {took}"
+            );
         }
         Ok(())
     }

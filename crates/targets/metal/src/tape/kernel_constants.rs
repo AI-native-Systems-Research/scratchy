@@ -551,6 +551,29 @@ impl From<AffineQmvConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::AffineQmvWide` — the small-M band matvec. Same K/N
+/// slots as the other qmv kernels plus M at slot 7
+/// (`QMV_WIDE_M`, a function constant like K/N so the dispatch is
+/// recordable).
+pub struct AffineQmvWideConstants {
+    pub k: KDimI32,
+    pub n: NDimI32,
+    pub m: MDimI32,
+    pub codes: AffineCodes,
+}
+
+impl From<AffineQmvWideConstants> for Vec<ConstantValue> {
+    fn from(c: AffineQmvWideConstants) -> Self {
+        let mut v = vec![
+            ConstantValue::int(ConstSlot(0), c.k.get()),
+            ConstantValue::int(ConstSlot(1), c.n.get()),
+            ConstantValue::int(ConstSlot(7), c.m.get()),
+        ];
+        v.extend(c.codes.constant());
+        v
+    }
+}
+
 // ── MLX-affine QMM_T (prefill matmul) ─────────────────────────────
 
 /// `KernelId::AffineQmmT` / `AffineQmmTNax`

@@ -1026,6 +1026,183 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 }
 
 // ─────────────────────────────────────────────────────────────────
+// dequantize — quantized.h:482-556. Decode one quantized block
+// (scale * q + bias) into w_local. Bits 4 and 8 only (the wide
+// kernel's instantiations); the other branches dropped rather than
+// kept dead — this copy exists solely for qmv_wide_impl.
+// ─────────────────────────────────────────────────────────────────
+
+template <typename U, int N, int bits, typename W>
+inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
+  static_assert(
+      bits == 4 || bits == 8,
+      "dequantize: scratchy instantiates bits 4 and 8 only");
+
+  const float s = float(scale);
+  const float b = float(bias);
+
+  if (bits == 4) {
+    // Codes as stored are UNSIGNED in MLX; our storage may hold them
+    // XOR 0x88 (signed q - 8, `AffineCodes::Offset8`, function constant
+    // 5) — the same `AFFINE_CODES_XOR` every other kernel in this file
+    // applies. Un-XOR the byte before splitting its nibbles.
+    const uint8_t xor8 = AFFINE_CODES_XOR ? 0x88 : 0;
+    float sc[2] = {s, s / 16.0f};
+    for (int i = 0; i < (N / 2); i++) {
+      const uint8_t wb = w[i] ^ xor8;
+      w_local[2 * i] = static_cast<U>(sc[0] * (wb & 0x0f) + b);
+      w_local[2 * i + 1] = static_cast<U>(sc[1] * (wb & 0xf0) + b);
+    }
+  }
+
+  else if (bits == 8) {
+    for (int i = 0; i < N; i++) {
+      w_local[i] = static_cast<U>(s * w[i] + b);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// qmv_wide_impl — quantized.h:984-1075. The small-M band kernel
+// (2 ≤ M < vector_limit): each weight group is dequantized ONCE and
+// reused across the `vecs_per_tg` input vectors, so the weight
+// traffic is M-independent where the plain qmv re-streams the whole
+// matrix per row. `k_lanes` lanes reduce K per output row;
+// 32/k_lanes rows per simdgroup; the partials fold with a shuffle
+// ladder (simd_sum would mix the rows a simdgroup spans).
+// ─────────────────────────────────────────────────────────────────
+
+template <typename T_act, typename T_scale, int group_size, int bits, int vecs_per_tg, int k_lanes>
+METAL_FUNC void qmv_wide_impl(
+    const device uint32_t* w,
+    const device T_scale* scales,
+    const device T_scale* biases,
+    const device T_act* x,
+    device T_act* y,
+    int M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
+  constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
+
+  typedef float U;
+
+  const short k_lane = simd_lid % k_lanes;
+  const short sg_row = simd_lid / k_lanes;
+
+  const int out_row = tid.y * (results_per_simdgroup * num_simdgroups) +
+      results_per_simdgroup * simd_gid + sg_row;
+  const int vec0 = tid.x * vecs_per_tg;
+
+  const int row = min(out_row, OUT_VEC_SIZE - 1);
+
+  const int in_vec_size_w = IN_VEC_SIZE * bits / 8; // bytes per weight row
+  const int in_vec_size_g = IN_VEC_SIZE / group_size;
+  const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
+  const device T_scale* srow = scales + row * in_vec_size_g;
+  const device T_scale* brow = biases + row * in_vec_size_g;
+
+  // One device pointer per streamed vector; the clamp keeps an out-of-range
+  // tail slot reading a valid row (it is never written below).
+  const device T_act* xv[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; v++) {
+    xv[v] = x + min(vec0 + v, M - 1) * IN_VEC_SIZE;
+  }
+
+  U result[vecs_per_tg] = {0};
+
+  // Each lane reduces a strided subset of the row's groups: decode the group
+  // in 8-value sub-chunks and reuse each chunk across the streamed vectors.
+  for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
+    U scale = srow[g];
+    U bias = brow[g];
+#pragma unroll
+    for (int sc = 0; sc < group_size / sub; sc++) {
+      const int k0 = g * group_size + sc * sub;
+      const device uint8_t* wc = wrow + k0 * bits / 8;
+      U w_dq[sub];
+      dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        const device T_act* xc = xv[v] + k0;
+        U acc = 0;
+#pragma unroll
+        for (int i = 0; i < sub; i++) {
+          acc += static_cast<U>(xc[i]) * w_dq[i];
+        }
+        result[v] += acc;
+      }
+    }
+  }
+
+  // Reduce each vector's partial over its k_lanes with a shuffle ladder:
+  // simd_sum would mix the results_per_simdgroup rows a simdgroup spans.
+  for (int v = 0; v < vecs_per_tg; v++) {
+    if constexpr (k_lanes >= 32) {
+      result[v] += simd_shuffle_down(result[v], 16);
+    }
+    if constexpr (k_lanes >= 16) {
+      result[v] += simd_shuffle_down(result[v], 8);
+    }
+    if constexpr (k_lanes >= 8) {
+      result[v] += simd_shuffle_down(result[v], 4);
+    }
+    if constexpr (k_lanes >= 4) {
+      result[v] += simd_shuffle_down(result[v], 2);
+    }
+    if constexpr (k_lanes >= 2) {
+      result[v] += simd_shuffle_down(result[v], 1);
+    }
+  }
+
+  if (k_lane == 0 && out_row < OUT_VEC_SIZE) {
+    for (int v = 0; v < vecs_per_tg; v++) {
+      if (vec0 + v < M) {
+        y[(vec0 + v) * OUT_VEC_SIZE + out_row] = static_cast<T_act>(result[v]);
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// affine_qmv_wide — quantized.h:1723-1775. Non-batched only: the
+// small-M band is a decode-batch shape, never an MoE weight batch.
+// M rides as a function constant (per-bucket constant) like K/N.
+// ─────────────────────────────────────────────────────────────────
+
+constant int QMV_WIDE_M [[function_constant(7)]];
+
+template <
+    typename T_act,
+    typename T_scale,
+    const int group_size,
+    const int bits,
+    int vecs_per_tg,
+    int k_lanes>
+[[kernel]] void affine_qmv_wide(
+    const device uint32_t* w [[buffer(0)]],
+    const device T_scale* scales [[buffer(1)]],
+    const device T_scale* biases [[buffer(2)]],
+    const device T_act* x [[buffer(3)]],
+    device T_act* y [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  qmv_wide_impl<T_act, T_scale, group_size, bits, vecs_per_tg, k_lanes>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      QMV_WIDE_M,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Instantiations — bits=4, gs in {32, 64, 128}, dtype in {f16, bf16}
 // ─────────────────────────────────────────────────────────────────
 
@@ -1085,6 +1262,33 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 
 INST_QMV_ALL_B8(bf16, bfloat, bf16, bfloat, 64)
 INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
+
+// qmv_wide instantiations — the small-M band (2 ≤ M < vector_limit).
+// k_lanes=8 (the affine pick, quantized.cpp:567): 4 output rows per
+// simdgroup × 2 simdgroups = 8 rows per threadgroup. vecs_per_tg in
+// {2,3,4,5} covers the decode buckets (bucket_m 2..8 on one tile, 16
+// on 4×4). bits 4 and 8, gs 64 (the MLX-affine presets), batch_0
+// only — the band is a decode-batch shape, never an MoE weight batch.
+#define INST_QMV_WIDE(name, act_tag, act_type, scale_tag, scale_type, gs, bits, nv, kl) \
+  template [[host_name(                                                             \
+      #name "_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_" #bits "_nv_" #nv          \
+      "_kl_" #kl "_batch_0")]]                                                       \
+  [[kernel]] decltype(name<act_type, scale_type, gs, bits, nv, kl>)                  \
+      name<act_type, scale_type, gs, bits, nv, kl>;
+
+#define INST_QMV_WIDE_ALL(act_tag, act_type, scale_tag, scale_type, gs)              \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 2, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 3, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 4, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 4, 5, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 2, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 3, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 4, 8)  \
+  INST_QMV_WIDE(affine_qmv_wide, act_tag, act_type, scale_tag, scale_type, gs, 8, 5, 8)
+
+INST_QMV_WIDE_ALL(bf16, bfloat, f16, half, 64)
+INST_QMV_WIDE_ALL(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_WIDE_ALL(f16, half, f16, half, 64)
 
 // ─────────────────────────────────────────────────────────────────
 // nvfp4 CLEAN decode-matvec — FAITHFUL PORT of MLX `fp_qmv_impl`
