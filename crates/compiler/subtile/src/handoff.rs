@@ -221,6 +221,10 @@ pub struct LoweredDecode {
     /// one MoE block, or of one KV codec site, shares one id), and the runtime guard it runs
     /// under. A target fences a construct's steps as one.
     pub op_expansion: Vec<Option<Expansion>>,
+    /// `(writer, reader)`: op `reader` reads storage op `writer` wrote that none of its operands
+    /// names — a KV encode packs the cache half its writer filled, a coded attention reads the
+    /// K/V its stage steps staged. Every other read is an operand.
+    pub unnamed_reads: Vec<(usize, usize)>,
 }
 
 /// One construct's expansion into ops (see [`LoweredDecode::op_expansion`]).

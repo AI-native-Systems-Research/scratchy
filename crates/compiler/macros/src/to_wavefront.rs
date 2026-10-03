@@ -1582,6 +1582,7 @@ pub fn lower_decode_to_wavefront(
         op_tiles,
         norm_gain_add_tiles: bx.norm_gain_add_tiles,
         op_expansion: bx.op_expansion,
+        unnamed_reads: Vec::new(),
     })
 }
 

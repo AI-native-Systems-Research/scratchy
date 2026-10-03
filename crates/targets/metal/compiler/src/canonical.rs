@@ -19,9 +19,11 @@ use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, ColourError, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, fold_tape};
+use scratchy_subtile::wave_schedule::wave_order;
 use scratchy_target_metal::from_tape::{TapeItem, roll_at};
 use scratchy_target_metal::op_abi::{
-    METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS,
+    METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS, METAL_WAVE_ORDER_ROWS,
+    metal_colour_rule,
 };
 use scratchy_target_metal::tape::ids::SourceIx;
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
@@ -242,11 +244,24 @@ pub fn lower_canonical(
     };
     // Metal's lm_head slice: the sampled rows its declared facts insert.
     let l = &expand_sample_rows(l, &METAL_SAMPLE_ROWS).map_err(CanonicalRefusal::SampleRows)?;
-    let tp = crate::tape_program::tape_program(l, stem, m);
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
     // projection kernel.
     let fold_projections = facts.mlp == MlpForm::Packed;
     let model = ModelFoldFacts { fold_projections };
+    // Metal's barriers drain everything in flight: independent branches run between the same ones.
+    // A fused command reads what its fold absorbed, so the folds the tape order makes keep every
+    // absorbed step ahead of the step it folds into.
+    let waved;
+    let l = if m <= METAL_WAVE_ORDER_ROWS {
+        let tp = crate::tape_program::tape_program(l, stem, m);
+        let folds = fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model)
+            .map_err(CanonicalRefusal::Fold)?;
+        waved = wave_order(l, metal_colour_rule, folds.absorbed_ops());
+        &waved
+    } else {
+        l
+    };
+    let tp = crate::tape_program::tape_program(l, stem, m);
     let folds =
         fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model).map_err(CanonicalRefusal::Fold)?;
     let colouring = colour_tape(

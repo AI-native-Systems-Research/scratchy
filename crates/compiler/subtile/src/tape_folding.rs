@@ -207,6 +207,8 @@ pub struct TapeFolds<K> {
     epilogue: BTreeMap<SlotId, SlotId>,
     /// Per driver, the folds it drives in the order they were applied; the last is its command.
     fusions: BTreeMap<SlotId, Vec<Fusion<K>>>,
+    /// `absorbed`, by source op.
+    absorbed_ops: Vec<(usize, usize)>,
 }
 
 impl<K> TapeFolds<K> {
@@ -229,6 +231,12 @@ impl<K> TapeFolds<K> {
     /// Every absorbed step, with the step whose fused command computes it.
     pub fn absorbed(&self) -> impl Iterator<Item = (SlotId, SlotId)> + '_ {
         self.absorbed.iter().map(|(a, w)| (*a, *w))
+    }
+
+    /// Every absorbed step's source op, with the source op of the step whose fused command
+    /// computes it.
+    pub fn absorbed_ops(&self) -> &[(usize, usize)] {
+        &self.absorbed_ops
     }
 
     /// Every fold, with the step driving it: by driver, then in the order they were applied.
@@ -763,6 +771,9 @@ impl<K: Copy> Folder<'_, K> {
                 .collect()
         };
         TapeFolds {
+            absorbed_ops: (self.absorbed.iter().enumerate())
+                .filter_map(|(j, w)| w.map(|w| (j, w)))
+                .collect(),
             absorbed: by_slot(&self.absorbed),
             epilogue: by_slot(&self.epilogue),
             fusions: self
@@ -911,6 +922,7 @@ mod tests {
             op_tiles,
             norm_gain_add_tiles: Default::default(),
             op_expansion,
+            unnamed_reads: Vec::new(),
         };
         let graph = lower_region(&lowered.input, std::num::NonZeroU32::MAX);
         let tape = lower_dag_to_tape(&ValidatedGraph::new(&graph).expect("a valid fixture"));

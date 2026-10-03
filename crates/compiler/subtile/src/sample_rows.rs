@@ -120,6 +120,9 @@ pub fn expand_sample_rows(
     x.norm_gain_add_tiles = (l.norm_gain_add_tiles.iter())
         .map(|(op, tile)| (op_of(*op), *tile))
         .collect();
+    x.unnamed_reads = (l.unnamed_reads.iter())
+        .map(|(w, r)| (op_of(*w), op_of(*r)))
+        .collect();
     Ok(x)
 }
 
@@ -176,6 +179,7 @@ mod tests {
             op_tiles: vec![Some((0, 0)), Some((1, 0))],
             norm_gain_add_tiles: Default::default(),
             op_expansion: vec![None; 2],
+            unnamed_reads: Vec::new(),
         }
     }
 
