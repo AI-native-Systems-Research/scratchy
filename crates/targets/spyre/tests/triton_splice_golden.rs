@@ -28,7 +28,7 @@ use std::collections::HashSet;
 
 use ktir_superdsc::ktir_node::ActiveCap;
 use scratchy_subtile::subtile_ir::{
-    GainConvention, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
+    EwKind, GainConvention, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
 };
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_ktir;
@@ -228,6 +228,140 @@ fn silumul_ir(m: u32, c: u32) -> SubtileIR {
     }
 }
 
+/// The elementwise shapes that matter for the delivery scope: granite's hidden 2048
+/// (the residual adds' width) at decode rows and a prefill rung's width, all inside
+/// the splice's LX budget (a blocked region is a builder-only node by the splice's own
+/// guard, so it has no splice side to compare). (M, N).
+const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096)];
+
+/// Every `EwKind` the splice has a row for. The kinds the builder REFUSES
+/// (Gelu/QuickGelu/GeluErf) are absent: they have no builder side, so a byte-identity
+/// comparison would pin nothing.
+const EW_KINDS: &[EwKind] = &[
+    EwKind::Add,
+    EwKind::BiasAdd,
+    EwKind::Mul,
+    EwKind::Sub,
+    EwKind::Silu,
+];
+
+#[test]
+fn spliced_elementwise_is_byte_identical_to_the_builder() {
+    for &kind in EW_KINDS {
+        for &(m, c) in EW_SHAPES {
+            let ir = elementwise_ir(m, c, kind);
+            let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+
+            // 1. The builder path — the control.
+            let (builder_ops, layout) =
+                lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
+                    .unwrap_or_else(|e| panic!("builder lowered {kind:?} m={m} c={c}: {e}"));
+            let [builder] = &builder_ops[..] else {
+                panic!(
+                    "one {kind:?} node lowers to one op, got {}",
+                    builder_ops.len()
+                )
+            };
+            let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+
+            // 2. The splice — the row compiles the kernel for this node. A region whose
+            // live set exceeds the builder's LX budget is a BUILDER-ONLY node (the
+            // builder row-blocks it inside one program; a one-tile kernel cannot spell
+            // that), and the splice's own guard falls through — pinned here, because a
+            // splice that took such a node would emit a program the descriptor-level
+            // golden cannot compare and the emulator could not run.
+            let node = &ir.nodes[0];
+            let spliced = scratchy_triton_splice::lower(node, &ir, false)
+                .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
+            let Some(spliced) = spliced else {
+                let live: u32 = if matches!(kind, EwKind::Silu) { 6 } else { 3 };
+                assert!(
+                    m > 1 && u64::from(m) * u64::from(c) * u64::from(live) > 1024 * 1024,
+                    "{kind:?} m={m} c={c}: the splice fell through but the region FITS the \
+                     builder's LX budget — the registry row is missing or the guard is wrong"
+                );
+                continue;
+            };
+
+            // ⛔ THE NAME LAW IS PART OF THE GATE — the BUILDER's `ew_kind_stem`
+            // (`add_s{id}`, `mul_s{id}`, `sub_s{id}`, `silu_s{id}`; BiasAdd is `add`),
+            // read off the producer's kind on both paths.
+            assert_eq!(spliced.op_name, builder.op_name, "op_name ({kind:?} m={m} c={c})");
+
+            // 3. Both programs go through the SAME door under the SAME layout.
+            let mut sym = 0i64;
+            let mut quantized = HashSet::new();
+            let builder_emitted = door_lower(
+                builder_ktir,
+                &mut sym,
+                Some(&layout),
+                &mut quantized,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("builder program lowered ({kind:?} m={m} c={c}): {}", e.message));
+            let mut sym = 0i64;
+            let spliced_emitted = door_lower(
+                spliced.ktir.as_ref().expect("spliced op carries its program"),
+                &mut sym,
+                Some(&layout),
+                &mut quantized,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("spliced program lowered ({kind:?} m={m} c={c}): {}", e.message));
+
+            assert_eq!(
+                builder_emitted.len(),
+                spliced_emitted.len(),
+                "op count ({kind:?} m={m} c={c})"
+            );
+            for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+                let bj = serde_json::to_string(b.dsc()).unwrap();
+                let sj = serde_json::to_string(s.dsc()).unwrap();
+                assert_eq!(
+                    bj, sj,
+                    "descriptor bytes ({kind:?} m={m} c={c}): builder vs splice diverged"
+                );
+                assert_eq!(b.op_name, s.op_name, "emitted op_name ({kind:?} m={m} c={c})");
+            }
+        }
+    }
+}
+
+/// One elementwise node as a one-node [`SubtileIR`]: unary kinds read t0 and write t2;
+/// binary kinds read t0 and t1 and write t2. All operands the output's shape (a
+/// broadcast operand is a builder `EwOperand` path this splice deliberately does not
+/// state, and the door's own extent guard would refuse it).
+fn elementwise_ir(m: u32, c: u32, kind: EwKind) -> SubtileIR {
+    let unary = matches!(kind, EwKind::Silu);
+    let tensors = vec![
+        TensorShape { rows: m, cols: c },
+        TensorShape { rows: m, cols: c },
+        TensorShape { rows: m, cols: c },
+    ];
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let inputs = if unary {
+        vec![whole(0)]
+    } else {
+        vec![whole(0), whole(1)]
+    };
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::Elementwise(kind),
+        inputs,
+        output: whole(2),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 2,
+        nodes: vec![node],
+        result: TensorId::from_index(2),
+        op_output: Vec::new(),
+    }
+}
+
 /// The dense fp16 matmul shapes that matter for the delivery scope: granite 2b's hidden
 /// 2048 projections at decode and a prefill rung, plus the wide qkv form. (M, K, N).
 const MATMUL_SHAPES: &[(u32, u32, u32)] = &[
@@ -396,6 +530,95 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
     assert!(
         max_abs < 0.05,
         "the REAL spliced matmul program diverged from the host reference: max abs err {max_abs}"
+    );
+}
+
+/// The elementwise rows' EXECUTION gate — same calibration as the matmul one above: the
+/// REAL spliced program through the production session entry, against a host reference.
+/// Every kind the splice has a row for, at a decode shape and a prefill rung.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn spliced_elementwise_executes_the_real_program() {
+    for &kind in EW_KINDS {
+        for (m, c) in [(1u32, 2048u32), (31u32, 2048u32)] {
+            // Skip the builder-only combinations (the LX-budget fallthrough, pinned by
+            // the golden above).
+            let live: u32 = if matches!(kind, EwKind::Silu) { 6 } else { 3 };
+            if m > 1 && u64::from(m) * u64::from(c) * u64::from(live) > 1024 * 1024 {
+                continue;
+            }
+            execute_one_spliced_elementwise(m, c, kind);
+        }
+    }
+}
+
+/// One spliced elementwise program through the production session entry, checked
+/// against a host reference.
+fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
+    use std::borrow::Cow;
+
+    let ir = elementwise_ir(m, c, kind);
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"))
+        .unwrap_or_else(|| panic!("registry has a row for {kind:?}"));
+    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+
+    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+        .func
+        .arguments
+        .iter()
+        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .collect();
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: Cow::Borrowed(&[]),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
+
+    // Two operands and the host reference over them, per kind — the same f16 values
+    // the program reads (run_step narrows to f16).
+    let n = (m * c) as usize;
+    let a: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
+    let b: Vec<f32> = (0..n).map(|i| ((i % 17) as f32) * 0.02 - 0.16).collect();
+    let want: Vec<f32> = match kind {
+        EwKind::Add | EwKind::BiasAdd => a.iter().zip(&b).map(|(x, y)| x + y).collect(),
+        EwKind::Mul => a.iter().zip(&b).map(|(x, y)| x * y).collect(),
+        EwKind::Sub => a.iter().zip(&b).map(|(x, y)| x - y).collect(),
+        EwKind::Silu => a.iter().map(|&x| x / (1.0 + (-x).exp())).collect(),
+        other => unreachable!("exec fixture for {other:?}"),
+    };
+
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+    )
+    .expect("build the one-program session");
+    let sources = if matches!(kind, EwKind::Silu) {
+        vec![(0u64, a, vec![m as usize, c as usize])]
+    } else {
+        vec![
+            (0u64, a, vec![m as usize, c as usize]),
+            (1u64, b, vec![m as usize, c as usize]),
+        ]
+    };
+    let out = session
+        .run_step(0, sources, &[(2, 0)])
+        .unwrap_or_else(|_| panic!("run the spliced {kind:?} program"));
+    let got = &out[&2];
+    assert_eq!(got.len(), n, "{kind:?} m={m} c={c}");
+    let mut max_abs = 0.0f32;
+    for (g, w) in got.iter().zip(&want) {
+        max_abs = max_abs.max((g - w).abs());
+    }
+    assert!(
+        max_abs < 0.05,
+        "the REAL spliced {kind:?} program diverged from the host reference: max abs err {max_abs}"
     );
 }
 
