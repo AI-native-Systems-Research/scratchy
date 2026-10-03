@@ -99,6 +99,14 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Opt
             entry: "rmsnorm_fwd",
             program: Program::RmsNorm,
         }),
+        // THE SECOND SPLICE, and the pattern for every `Program::Elementwise` kind to
+        // come: the consumer dispatches on the STATED kind (not the op soup), so the
+        // spliced descriptors reach the same assembly the builder's program does.
+        SubOp::SiluMul => Some(TritonKernelRow {
+            kernel: "silumul.py",
+            entry: "silumul_fwd",
+            program: Program::SiluMul,
+        }),
         // ⛔ NO ROW FOR attention/rope (consumer bake-plan facts), fp8 matmul (bundle-level
         // quantize dedup), or (1 + w) gains (no kernel exists). See the module header.
         _ => None,
@@ -127,6 +135,7 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     // the builder cannot disagree about it. The builder arm's own check is identical.
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
+        SubOp::SiluMul => 2,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => return Err(format!(
@@ -218,6 +227,24 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // `RMS_INVCOLS_TID`, never through `scalarmul_scales`).
             ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
         }
+        (SubOp::SiluMul, "silumul_fwd") => {
+            // The kernel's own parameter spellings: desc_g, desc_u, desc_o, then the
+            // constexprs M / N / BLOCK_M / BLOCK_N.
+            for p in ["desc_g", "desc_u", "desc_o"] {
+                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            // The whole region, one tile: `BLOCK_M = M` rows and `BLOCK_N = N` columns,
+            // the same no-row-blocking law `KtirFunc::silu_mul` states for itself.
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -244,6 +271,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 ) -> Result<Vec<i64>, String> {
     match &node.op {
         SubOp::RmsNorm { .. } => Ok(vec![1]),
+        SubOp::SiluMul => Ok(vec![1]),
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
     }
 }
@@ -325,6 +353,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
 fn program_stem(row: &TritonKernelRow) -> &'static str {
     match row.program {
         Program::RmsNorm => "rmsnorm",
+        Program::SiluMul => "silumul",
         _ => "triton",
     }
 }
