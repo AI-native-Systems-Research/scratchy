@@ -925,10 +925,13 @@ impl Executor {
     /// manifest, which is what makes the servable context an allocation instead of a baked constant.
     fn latch_paged_geometry(&mut self) {
         let mut page_slots = 0i64;
+        // A rung holds ONE `Ops` PER ATTENTION CLASS (the roll split by class), so the ladder's
+        // contribution to the sweep is the rungs' class vectors FLATTENED — the same `&Ops` items
+        // `lists()` yields.
         for ops in self
             .lists()
             .into_iter()
-            .chain(self.body_rungs.iter().map(|(_, o)| o))
+            .chain(self.body_rungs.iter().flat_map(|(_, o)| o))
         {
             for o in ops {
                 if o.kv.page_slots > 0 {
@@ -3120,8 +3123,16 @@ impl Executor {
         // A class-split model runs its bodies OUT of tape order here — the table is TRUE ORDER
         // (sorted by absolute layer id), which a single-class roll degenerates to
         // `[(0,0), (0,1), …]`: the sequence the `for v in 0..iters` loop used to run.
-        let rolled = self.rolled.as_ref().expect("checked above");
-        for &(body, wbank, woff, kvoff) in &rolled.launches {
+        // COPIED OUT before the loop: each launch takes `&mut self`, so the table cannot be
+        // borrowed out of `self.rolled` across them. It is one small tuple per layer — the copy
+        // is the table's bytes, not a graph.
+        let launches: Vec<_> = self
+            .rolled
+            .as_ref()
+            .expect("checked above")
+            .launches
+            .clone();
+        for (body, wbank, woff, kvoff) in launches {
             let mut off = [0u64; NUM_SEGMENTS];
             off[SEG_WEIGHT.get()] = woff;
             off[SEG_KV.get()] = kvoff;
