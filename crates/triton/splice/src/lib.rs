@@ -43,11 +43,19 @@
 //!
 //! # ⛔ WHAT THIS CRATE DELIBERATELY DOES NOT SPLICE
 //!
-//! Attention and rope: their `EmittedOp`s carry consumer bake-plan facts (`kv_page_fold`,
+//! Attention: its `EmittedOp`s carry consumer bake-plan facts (`kv_page_fold`,
 //! `kv_request`, fold roles, const-generic geometry) that no Triton kernel states and no
-//! registry row can carry. The registry simply has no row for them — a request to splice
+//! registry row can carry. The registry simply has no row for it — a request to splice
 //! one returns `Ok(None)` and the caller falls through to the builder arm, which keeps its
-//! own refusals. They land when their facts sidecars land.
+//! own refusals. It lands when its facts sidecar lands.
+//!
+//! ⭐ ROPE, BY CONTRAST, SPLICES — and the module-header claim that it could not was
+//! OVERSTATED, audited against the door: `rope_at` derives every fact it needs (`mq`,
+//! `total`, `hd`) from the PROGRAM's own views and access tiles, and the one bundle fact
+//! (`rows_are_requests`) is re-read by the door off `BundleAttnParams` AFTER the splice
+//! returns. The kernel states the builder's own view extents (`[mq·heads, hd]`) and takes
+//! one `[heads, half]` access tile per position, which is what the door's first-tile read
+//! needs. See the rope row in [`registry`].
 //!
 //! fp8 `MatmulTile`: the builder threads a cross-node activation-quantize dedup
 //! (`quantized`) that is a bundle-level fact, not a node-level one. Not a row.
@@ -146,7 +154,21 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Opt
             entry: "silu_fwd",
             program: Program::Elementwise(Elementwise::Silu),
         }),
-        // ⛔ NO ROW FOR attention/rope (consumer bake-plan facts), fp8 matmul (bundle-level
+        // THE FIFTH SPLICE — rope, the first op whose consumer (`rope_at`) runs through
+        // the const-generic head-dim door. The node's own `head_dim` states the kernel's
+        // HEAD_DIM/HALF; `rows_are_requests` already arrives as `lower`'s parameter and
+        // the DOOR re-reads it off `BundleAttnParams` after the splice, so the only
+        // facts this row needs are the node's. `RopeAppend` carries 6 inputs but only
+        // the first three are the rotation (V and the KV-cache destinations flow through
+        // GRAPH edges — the builder's own `lower_rope_node` reads `inputs[0..3]`), so
+        // the kernel consumes x/cos/sin/out and the row covers BOTH `RopeAppend` and
+        // the standalone `RopeRotate`.
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Some(TritonKernelRow {
+            kernel: "rope.py",
+            entry: "rope_fwd",
+            program: Program::Rope,
+        }),
+        // ⛔ NO ROW FOR attention (consumer bake-plan facts), fp8 matmul (bundle-level
         // quantize dedup), or (1 + w) gains (no kernel exists). See the module header.
         _ => None,
     }
@@ -254,12 +276,18 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
     // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind so the splice and
     // the builder cannot disagree about it. The builder arm's own check is identical.
+    // ⭐ ROPE'S ARITY IS 3, NOT THE NODE'S INPUT COUNT: `lower_rope_node` reads only
+    // `inputs[0..3]` (x, cos, sin) — a `RopeAppend` carries 6 inputs but its V and
+    // KV-cache destinations flow through GRAPH edges, not through the op — so the
+    // splice binds the same first three operands the builder's program does, and the
+    // check below is `>= 3` exactly as the builder's own `inputs.len() < 3` refusal is.
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
         SubOp::MatmulTile { .. } => 2,
         SubOp::Elementwise(EwKind::Silu) => 1,
         SubOp::Elementwise(_) => 2,
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => return Err(format!(
@@ -267,9 +295,9 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             row.kernel
         )),
     };
-    if node.inputs.len() != arity {
+    if node.inputs.len() < arity {
         return Err(format!(
-            "triton splice: {} t{} expects {} operand(s), found {}",
+            "triton splice: {} t{} expects at least {} operand(s), found {}",
             row.kernel,
             node.output.tensor.index(),
             arity,
@@ -423,6 +451,36 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
         }
+        (SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. }, "rope_fwd") => {
+            // The door's contract, stated from the node's own facts: total = the output's
+            // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
+            // the same derivation `KtirFunc::rope`'s views state. The builder's own
+            // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
+            // as an `Err`, not a fallthrough: the node is malformed, and the builder arm
+            // would refuse it identically.
+            let hd = head_dim.get();
+            let total = c;
+            if hd == 0 || total % hd != 0 {
+                return Err(format!(
+                    "triton splice: rope t{}: {total} cols is not a whole number of \
+                     {hd}-wide heads",
+                    node.output.tensor.index()
+                ));
+            }
+            let heads = total / hd;
+            for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
+                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("H", Val::Int(i128::from(heads)))?;
+            ce("MQ", Val::Int(i128::from(m)))?;
+            ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
+            ce("HALF", Val::Int(i128::from(hd / 2)))?;
+        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -452,6 +510,10 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::SiluMul => Ok(vec![1]),
         SubOp::MatmulTile { .. } => Ok(vec![1]),
         SubOp::Elementwise(_) => Ok(vec![1]),
+        // ONE WORK ITEM: the position loop is a constant-trip `tl.range` inside the
+        // kernel, unrolled by the ladder (`to_ktir::unroll_constant_trip_loops`), so the
+        // spliced program is straight-line like the builder's — no grid axis at all.
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(vec![1]),
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
     }
 }
@@ -497,9 +559,16 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     // output LAST — the exact law `KtirFunc::finish_shaped` states. `regions()` reads
     // `bindings[i]` for `arguments[i]`, so the kernel's parameter order must be the
     // node's operand order (the registry row's contract, checked at the signature above).
+    // ⭐ ROPE BINDS THREE, not the node's whole input list: the kernel consumes x, cos,
+    // sin (the rotation), while a `RopeAppend`'s V and KV-cache inputs flow through
+    // GRAPH edges — `lower_rope_node` binds exactly these three plus the output, and so
+    // does the splice. The arity match above pinned `inputs.len() >= 3`.
+    let rope = matches!(node.op, SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. });
+    let n_bound = if rope { 3 } else { node.inputs.len() };
     let mut bindings: Vec<BufferId> = node
         .inputs
         .iter()
+        .take(n_bound)
         .map(|tr| BufferId::new(tr.tensor.index() as u32))
         .collect();
     bindings.push(BufferId::new(node.output.tensor.index() as u32));
@@ -554,6 +623,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
         Program::Matmul => "matmul",
+        Program::Rope => "rope",
         _ => "triton",
     }
 }
