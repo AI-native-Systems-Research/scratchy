@@ -395,6 +395,8 @@ pub struct TapeFolds<K> {
     epilogue: BTreeMap<SlotId, SlotId>,
     /// Per driver, the folds it drives in the order they were applied; the last is its command.
     fusions: BTreeMap<SlotId, Vec<Fusion<K>>>,
+    /// `absorbed`, by source op.
+    absorbed_ops: Vec<(usize, usize)>,
 }
 
 impl<K> TapeFolds<K> {
@@ -422,6 +424,12 @@ impl<K> TapeFolds<K> {
     /// Every absorbed step, with the step whose fused command computes it.
     pub fn absorbed(&self) -> impl Iterator<Item = (SlotId, SlotId)> + '_ {
         self.absorbed.iter().map(|(a, w)| (*a, *w))
+    }
+
+    /// Every absorbed step's source op, with the source op of the step whose fused command
+    /// computes it.
+    pub fn absorbed_ops(&self) -> &[(usize, usize)] {
+        &self.absorbed_ops
     }
 
     /// Every fold, with the step driving it: by driver, then in the order they were applied.
@@ -1031,8 +1039,15 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             && free(self, c)
         {
             let at = (0..2u8).find(|&k| self.ops.in_op(c, k).ok().flatten() == Some(cur));
-            if let Some(k) = at {
-                self.ops.arg(c, 1 - k)?;
+            // The command adds the residual as it stores its rows: a step must have computed it
+            // by then.
+            let ready = |k: u8| -> Result<bool, FoldError> {
+                let r = self.ops.in_op(c, 1 - k)?;
+                Ok(r.is_none_or(|r| self.ops.pos[r] < self.ops.pos[i]))
+            };
+            if let Some(k) = at
+                && ready(k)?
+            {
                 residual = Some((c, self.ops.operand(c, 1 - k)));
                 chain.push(c);
             }
@@ -1522,6 +1537,9 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
                 .collect()
         };
         TapeFolds {
+            absorbed_ops: (self.absorbed.iter().enumerate())
+                .filter_map(|(j, w)| w.map(|w| (j, w)))
+                .collect(),
             absorbed: by_slot(&self.absorbed),
             epilogue: by_slot(&self.epilogue),
             fusions: self
@@ -1742,6 +1760,7 @@ mod tests {
             op_tiles,
             norm_gain_add_tiles: Default::default(),
             op_expansion,
+            unnamed_reads: Vec::new(),
         };
         fold_lowered(&lowered, table, model)
     }

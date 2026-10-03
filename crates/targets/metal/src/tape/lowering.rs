@@ -1136,13 +1136,17 @@ fn lower(
     let mut i = 0usize;
     // One barrier flag per row, rolled: the loop body's flags serve every
     // iteration (body equivalence is what let the loop roll, so each
-    // iteration has the same hazard signature). A metadata-only row
-    // (Reshape) emits no command, so its flag is unused. A step that
-    // lowers to several commands (the SplitK matmul pair) gives its flag
-    // to the first; the rest get `true` (intra-step scratch RAW).
+    // iteration has the same hazard signature). A row that emits no command —
+    // a view, or a step its bake elides (a gathered MoE's sort) — passes its
+    // fence on to the next command: the fence orders what came before against
+    // what comes after, whichever row dispatches. A step that lowers to several
+    // commands (the SplitK matmul pair) gives its flag to the first; the rest get
+    // `true` (intra-step scratch RAW).
     let flag_for = |idx: usize| -> bool { barriers_in.get(idx).copied().unwrap_or(true) };
+    let mut carried = false;
 
     while i < rows.len() {
+        let closed = loops.len();
         close_spans(
             &mut open_spans,
             i,
@@ -1151,6 +1155,15 @@ fn lower(
             rows,
             &mut m_divisor,
         );
+        // A fence a body's last rows carry past every command reaches the next
+        // iteration's first command too.
+        if carried {
+            for l in &loops[closed..] {
+                if let Some(b) = barrier_before.get_mut(l.start as usize) {
+                    *b = true;
+                }
+            }
+        }
         match &rows[i] {
             StepRow::Loop {
                 iters,
@@ -1221,8 +1234,11 @@ fn lower(
                 });
                 commands.extend(cmds);
                 if n_cmds >= 1 {
-                    barrier_before.push(flag_for(i) || writes_scratch);
+                    barrier_before.push(flag_for(i) || writes_scratch || carried);
                     barrier_before.extend(std::iter::repeat_n(true, n_cmds - 1));
+                    carried = false;
+                } else {
+                    carried |= flag_for(i);
                 }
                 i += 1;
             }
@@ -8069,21 +8085,25 @@ mod tests {
         assert_eq!(tape.splitk_scratch_bytes, 0);
     }
 
-    /// Where the matmul does not lower to one qmm_t command it runs plain and ungated under its
-    /// own row's flag, and the gather, the scatter and the all-rows matmul emit nothing: one row
-    /// (bucket 1), qmv (bucket 8, under its batch limit), SplitK's pair (bucket 64), the small-M
-    /// twin (bucket 64 on a NAX device).
+    /// Where the matmul does not lower to one qmm_t command it runs plain and ungated, and the
+    /// gather, the scatter and the all-rows matmul emit nothing: one row (bucket 1), qmv (bucket
+    /// 8, under its batch limit), SplitK's pair (bucket 64), the small-M twin (bucket 64 on a NAX
+    /// device). It runs under its own row's flag and the fence its elided gather carried.
     #[test]
     fn sampled_rows_run_plain_where_the_matmul_does_not_slice() {
         use KernelId as K;
         let m5 = Some(&crate::targets::M5_10CORE);
-        let rows = sampled_rows([true, false, true, true]);
-        for (bucket_m, profile, last) in [
+        let cases = [
             (1, None, K::AffineQmvFast),
             (8, None, K::AffineQmvFast),
             (64, None, K::SplitKReduceSum),
             (64, m5, K::AffineQmmSmallM),
-        ] {
+        ];
+        for (gather_fences, (bucket_m, profile, last)) in [false, true]
+            .into_iter()
+            .flat_map(|g| cases.map(|c| (g, c)))
+        {
+            let rows = sampled_rows([gather_fences, false, true, true]);
             let at = bake_point(bucket_m, profile);
             let tape = lower_subtile_tape_to_metal(&rows, &tp(), at).expect("lowers");
             let plain = plain_q_proj(at);
@@ -8098,9 +8118,12 @@ mod tests {
                     .any(|b| matches!(b, Binding::Scratch { .. }))
             });
             let flags: Vec<bool> = (0..tape.commands.len())
-                .map(|c| c > 0 || writes_scratch)
+                .map(|c| c > 0 || writes_scratch || gather_fences)
                 .collect();
-            assert_eq!(tape.barrier_before, flags, "bucket {bucket_m}");
+            assert_eq!(
+                tape.barrier_before, flags,
+                "bucket {bucket_m}, {gather_fences}"
+            );
             assert_eq!(tape.splitk_scratch_bytes, plain.splitk_scratch_bytes);
         }
     }

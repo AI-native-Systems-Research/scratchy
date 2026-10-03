@@ -19,9 +19,11 @@ use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, ColourError, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, fold_tape};
+use scratchy_subtile::wave_schedule::wave_order;
 use scratchy_target_metal::from_tape::{TapeItem, roll_at};
 use scratchy_target_metal::op_abi::{
-    METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS,
+    METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS, METAL_WAVE_ORDER_ROWS,
+    metal_colour_rule,
 };
 use scratchy_target_metal::tape::ids::SourceIx;
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
@@ -220,6 +222,24 @@ impl std::fmt::Display for CanonicalRefusal {
     }
 }
 
+/// The barriers a decode step of `m` sequences runs on the unrolled tape `t` (flags `flags`): the
+/// fenced rows whose runtime gate lets them run on it.
+fn decode_barriers(t: &Assembled, flags: &[bool], m: u64) -> usize {
+    use scratchy_target_metal::interpreter::metal::worker::{StepFacts, gate_matches};
+    use scratchy_target_metal::tape::step::StepRow;
+    let rows = m as u32;
+    let decode = StepFacts {
+        num_tokens: rows,
+        num_seqs: rows,
+        has_spec_tokens: false,
+        unrotated_blocks: false,
+    };
+    let runs = |r: &StepRow| matches!(r, StepRow::Step(_, g) if gate_matches(*g, decode));
+    (t.rows.iter().zip(flags))
+        .filter(|&(r, &f)| f && runs(r))
+        .count()
+}
+
 /// Lower one decode canonical: step tape (its weights interned into the model's `sources`),
 /// colours and arena.
 pub fn lower_canonical(
@@ -242,7 +262,6 @@ pub fn lower_canonical(
     };
     // Metal's lm_head slice: the sampled rows its declared facts insert.
     let l = &expand_sample_rows(l, &METAL_SAMPLE_ROWS).map_err(CanonicalRefusal::SampleRows)?;
-    let tp = crate::tape_program::tape_program(l, stem, m);
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
     // projection kernel, and an affine one the fused one-row matvec, for its one-row bucket.
     let fold_projections = facts.mlp == MlpForm::Packed || m == 1;
@@ -252,6 +271,20 @@ pub fn lower_canonical(
         matvec_ends: m == 1,
         row_programs: m == 1,
     };
+    // Metal's barriers drain everything in flight: independent branches run between the same ones.
+    // A fused command reads what its fold absorbed, so the folds the tape order makes keep every
+    // absorbed step ahead of the step it folds into.
+    let waved;
+    let l = if m <= METAL_WAVE_ORDER_ROWS {
+        let tp = crate::tape_program::tape_program(l, stem, m);
+        let folds = fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model)
+            .map_err(CanonicalRefusal::Fold)?;
+        waved = wave_order(l, metal_colour_rule, folds.absorbed_ops());
+        &waved
+    } else {
+        l
+    };
+    let tp = crate::tape_program::tape_program(l, stem, m);
     let folds =
         fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model).map_err(CanonicalRefusal::Fold)?;
     let colouring = colour_tape(
@@ -281,6 +314,7 @@ pub fn lower_canonical(
     // ⛔ THE LM_HEAD'S FLAGS ARE THE ROLLED WALK'S, whichever backbone layout is kept.
     let (rolled_flags, lm_head_barriers) = rolled.flags();
     let (unrolled_flags, _) = unrolled.flags();
+    let barriers = decode_barriers(&unrolled, &unrolled_flags, m);
     let proof = |b: &Assembled, flags: &[bool]| proves(b, flags, &unrolled, &unrolled_flags);
 
     // ⭐ THE ROLL IS KEPT ONLY IF IT IS PROVABLY THE SAME PROGRAM, AND THE CUT IS MOVED UNTIL IT
@@ -355,10 +389,12 @@ pub fn lower_canonical(
     }
     let (colour_count, result) = (colours.count(), colours.result());
     eprintln!(
-        "[m2-flip] {stem} m={m}: TAPE-SCHEDULED stream ACTIVE ({} instr, slots={} final={})",
+        "[m2-flip] {stem} m={m}: TAPE-SCHEDULED stream ACTIVE ({} instr, slots={} final={}, \
+         {} barriers a decode step)",
         backbone.len(),
         colour_count.get(),
         result.index(),
+        barriers,
     );
     Ok(MetalCanonical {
         steps: MetalStepTape {

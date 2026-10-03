@@ -1462,7 +1462,7 @@ fn resolve_bindings(
 /// full-`M=bucket_m` lm_head fallback is gated this way so the
 /// slice's per-seq-incorrect logits get overwritten with a
 /// correct multi-row GEMM result.
-pub(super) fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
+pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
     let StepFacts {
         num_tokens,
         num_seqs,
@@ -1504,7 +1504,7 @@ pub(super) fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: Step
 
 /// What a runtime gate can ask about the step being encoded.
 #[derive(Clone, Copy)]
-pub(super) struct StepFacts {
+pub struct StepFacts {
     pub num_tokens: u32,
     pub num_seqs: u32,
     pub has_spec_tokens: bool,

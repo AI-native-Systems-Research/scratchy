@@ -24,7 +24,7 @@ use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::ops::SubOpKind;
 use scratchy_subtile::sample_rows::SampleRowsFacts;
 use scratchy_subtile::subtile_ir::{
-    AttnMask, EwKind, ExpertBundle, ExpertProj, KvOperand, RouterBundle, SubOp,
+    AttnMask, EwKind, ExpertBundle, ExpertProj, KvOperand, OpStage, RopeForm, RouterBundle, SubOp,
 };
 
 use crate::tape::lowered::{RuntimeGate, WeightTensor};
@@ -74,6 +74,10 @@ pub fn rope_append_bias_slots(o: KvOffsets) -> [Option<(BiasStorage, u32)>; 2] {
 
 /// Metal's colouring facts: the per-op rule table, and the embedded hidden as colour 0 (the
 /// step records' head emits the embed at slot 0).
+/// The widest bucket metal lays out in wave order (`wave_schedule::wave_order`): a one-row tape,
+/// whose steps are latency-bound — a wider bucket would hold more rows' buffers live at once.
+pub const METAL_WAVE_ORDER_ROWS: u64 = 1;
+
 pub const METAL_COLOUR_FACTS: ColourFacts = ColourFacts {
     rule: metal_colour_rule,
     colour_zero: SourceBinding::EmbeddedHidden,
@@ -84,7 +88,7 @@ pub const METAL_COLOUR_FACTS: ColourFacts = ColourFacts {
 /// The match is exhaustive: a new `SubOp` fails to compile here
 /// (E0004) until its author states which case it is, rather than
 /// silently defaulting to "fresh buffer" and losing a color.
-pub fn metal_colour_rule(op: &SubOp) -> ColourRule {
+pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule {
     use EwKind as E;
     use OutputAlias as A;
     use SubOp as L;
