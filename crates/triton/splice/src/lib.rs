@@ -227,7 +227,13 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     //    `recover_matmul_n` RED-stops an N that N/2 cannot tile, a FAITHFUL port of the
     //    C++ oracle (fixing it here would make the port disagree with the field). So an
     //    odd-N result-width matmul stays on the builder path until the ladder learns a
-    //    single-corelet matmul plan.
+    //    single-corelet matmul plan. ⛔ AT ANY ROW COUNT: the batched-decode lm_head
+    //    (rows > 1, `rows_are_requests`) carries the SAME odd N, and the first cut of
+    //    this guard tested `rows == 1` only — so a batched-decode lm_head slipped past
+    //    BOTH lm-head fallthroughs into `compile_kernel`, whose `PlanCorelets` refusal
+    //    turned this guard's `Ok(None)` design into a loud `Err` bake failure on granite
+    //    batched decode. Parity does not depend on the row count; the guard does not
+    //    either.
     if matches!(node.op, SubOp::MatmulTile { .. }) {
         let result_cols = ir.tensors[ir.result.index()].cols;
         if node.output.region.cols.len == result_cols {
@@ -235,8 +241,8 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             if rows > 1 && !rows_are_requests {
                 return Ok(None); // 1. the prefill fold
             }
-            if rows == 1 && node.output.region.cols.len % 2 == 1 {
-                return Ok(None); // 2. the odd vocab
+            if node.output.region.cols.len % 2 == 1 {
+                return Ok(None); // 2. the odd vocab, at any row count
             }
             // An EVEN result-width matmul at m>1 with `rows_are_requests` (the
             // batched-decode lm_head) is spliced below like any other matmul.
