@@ -67,7 +67,7 @@ fn attention_blocks_per_chunk(chunked: bool) -> u32 {
 }
 use crate::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile, W4A8_TILE_ROWS,
-    W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape,
+    W4a8Rows, W4a8Tile, pick_qmm_t_kernel, pick_qmv_kernel_wide, qmm_t_dispatch_shape,
     qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute, qmm_w4a8_static_name,
     qmv_dispatch_shape, qmv_kernel_static_name, small_m_kernel_static_name,
     splitk_reduce_kernel_static_name, w4a8_quant_static_name, w4a8_scratch_bytes,
@@ -240,7 +240,7 @@ fn sample_rows(
             let x = Some(crate::tape::lowered::MScaleAxis::X);
             let ix = w.of(WeightKind::Linear, 0)?;
             let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
-            sampled(affine_qmv_command(p, &g, 1, x, g.layer, ix, codes))
+            sampled(affine_qmv_command(p, &g, 1, x, g.layer, ix, codes, /*wide_ok=*/ false))
         }
         (true, R::Scatter) => sampled(scatter_first_to_last_row_command(p, g.output, g.n.get())),
         (true, R::AllRows) => plain
@@ -277,35 +277,79 @@ fn affine_qmv_command(
     layer: LayerId,
     ix: SourceIx,
     codes: super::kernel_constants::AffineCodes,
+    wide_ok: bool,
 ) -> LoweredCommand {
     let (n, k, bits) = (g.n.get(), g.k.get(), g.bits.get());
-    let kernel = pick_qmv_kernel(n, k, bits);
+    // The small-M band (MLX `qmv_wide`, gen-15+): weight groups are
+    // dequantized once and reused across the threadgroup's row tile,
+    // so the per-sequence weight re-stream the plain row-parallel qmv
+    // pays disappears. `rows` here is the bucket's row count; the wide
+    // grid is exact per bucket (nv baked), no m_scaling on X.
+    let kernel = pick_qmv_kernel_wide(n, k, bits, rows, wide_ok);
     let (tg, tpg) = qmv_dispatch_shape(kernel, rows, n, /*B=*/ 1);
-    let kernel_id = match kernel {
-        QmvKernel::Quad { .. } => KernelId::AffineQmvQuad,
-        QmvKernel::Fast => KernelId::AffineQmvFast,
-        QmvKernel::Generic => KernelId::AffineQmv,
+    let (kernel_id, constants) = match kernel {
+        QmvKernel::Quad { .. } => (
+            KernelId::AffineQmvQuad,
+            super::kernel_constants::AffineQmvConstants {
+                k: super::ids::KDimI32(k as i32),
+                n: super::ids::NDimI32(n as i32),
+                codes,
+            }
+            .into_baked(),
+        ),
+        QmvKernel::Fast => (
+            KernelId::AffineQmvFast,
+            super::kernel_constants::AffineQmvConstants {
+                k: super::ids::KDimI32(k as i32),
+                n: super::ids::NDimI32(n as i32),
+                codes,
+            }
+            .into_baked(),
+        ),
+        QmvKernel::Generic => (
+            KernelId::AffineQmv,
+            super::kernel_constants::AffineQmvConstants {
+                k: super::ids::KDimI32(k as i32),
+                n: super::ids::NDimI32(n as i32),
+                codes,
+            }
+            .into_baked(),
+        ),
+        QmvKernel::Wide { .. } => (
+            KernelId::AffineQmvWide,
+            super::kernel_constants::AffineQmvWideConstants {
+                k: super::ids::KDimI32(k as i32),
+                n: super::ids::NDimI32(n as i32),
+                m: super::ids::MDimI32(rows as i32),
+                codes,
+            }
+            .into_baked(),
+        ),
     };
     let (dtype, scale_dtype) = (dequant_dtype_for(p), scale_dtype_for(p));
     let (x, y) = (g.input.get(), g.output.get());
+    // The wide kernel's grid is exact for the bucket (nv covers rows)
+    // and over-dispatch is safe — the kernel clamps every row index
+    // against the baked M — so it takes no m_scaling. The others take
+    // the X-axis runtime m_scaling; `seq_axis` SETs the live sequence
+    // count for the lm_head slice (a rows=1 path, never Wide).
+    let m_scaling = match kernel {
+        QmvKernel::Wide { .. } => None,
+        _ => Some(crate::tape::lowered::MScaling {
+            axis: crate::tape::lowered::MScaleAxis::X,
+            bucket_m: super::ids::BucketM(rows),
+            seq_axis,
+        }),
+    };
     LoweredCommand {
         kernel: kernel_id,
         library: "quantized_qmv",
         function: qmv_kernel_static_name(kernel, dtype, scale_dtype, bits, g.group_size.get()),
-        constants: super::kernel_constants::AffineQmvConstants {
-            k: super::ids::KDimI32(k as i32),
-            n: super::ids::NDimI32(n as i32),
-            codes,
-        }
-        .into_baked(),
+        constants,
         dispatch: DispatchShape {
             threadgroups: tg,
             threads_per_threadgroup: tpg,
-            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                seq_axis,
-                axis: crate::tape::lowered::MScaleAxis::X,
-                bucket_m: super::ids::BucketM(rows),
-            }),
+            m_scaling,
         },
         bindings: baked(affine_qmm_bindings(x, y, layer, ix)),
         gemm_dims: None,
@@ -1917,6 +1961,9 @@ fn lower_one(
                 // biased it toward generic).
                 let layer = super::ids::LayerId(*layer + layer_offset);
                 let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
+                // MLX gates affine qmv_wide on arch gen >= 15 (quantized.cpp:537-539); our
+                // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
+                let wide_ok = profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
                 affine_qmv_command(
                     p,
                     g,
@@ -1925,6 +1972,7 @@ fn lower_one(
                     layer,
                     w.of(WeightKind::Linear, 0)?,
                     codes,
+                    wide_ok,
                 )
             } else {
                 // Matmul branch (prefill-shape). `pick_qmm_t_kernel`
@@ -7106,7 +7154,10 @@ mod tests {
         };
         let m5 = Some(&crate::targets::M5_10CORE);
         for (bucket_m, own, tile) in [
-            (8, &[KernelId::AffineQmvFast][..], SmallMTile::Rows8),
+            // The matvec branch's multi-row pick on NAX is the wide
+            // kernel (`qmv_wide`, M ≥ 2) — weight groups dequantized
+            // once per threadgroup instead of re-streamed per row.
+            (8, &[KernelId::AffineQmvWide][..], SmallMTile::Rows8),
             (
                 64,
                 &[KernelId::AffineW4a8Quant, KernelId::AffineQmmW4a8][..],

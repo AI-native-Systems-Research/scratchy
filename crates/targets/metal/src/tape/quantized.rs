@@ -69,30 +69,46 @@ pub enum QmvKernel {
     Fast,
     /// `affine_qmv_*` — generic fallback with bounds-checked tail.
     Generic,
+    /// `affine_qmv_wide_*_nv_<nv>_kl_8` — the small-M band (`2 ≤ M <
+    /// vector_limit`): each weight group is dequantized once and
+    /// reused across `nv` input vectors, so weight traffic is
+    /// M-independent where the plain qmv re-streams the whole matrix
+    /// per row. MLX `qmv_wide` (gen-15+ for affine). `nv` is the
+    /// per-threadgroup vector tile, `ceil(M / ceil(M/5))` capped at 5
+    /// (`quantized.cpp:555`).
+    Wide { nv: u32 },
 }
 
-/// Pick the right qmv variant per MLX `dispatch_qmv` (`quantized.cpp:1365`)
-/// followed by the inner `qmv_fast` vs `qmv` choice (`:259`).
-///
-/// Mirrors the C++ exactly:
+/// Pick the right qmv variant per MLX `quantized.cpp:1826 dispatch_qmv`:
+/// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+,
+/// which maps to our `is_nax_capable` boundary — M5), then fast/generic.
 ///
 /// ```text
-/// // dispatch_qmv:
 /// if ((K == 128 || K == 64) && is_power_of_2(bits)) → qmv_quad(d=K)
+/// else if (M >= 2 && gen >= 15)                     → qmv_wide(nv)
 /// else                                              → qmv(...)
-/// // qmv():
-/// bool fast = N % bn == 0 && K % 512 == 0;  // bn = 8
-/// kernel = fast ? "qmv_fast" : "qmv";
+///   bool fast = N % bn == 0 && K % 512 == 0;  // bn = 8
 /// ```
-pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
+pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) -> QmvKernel {
     let pow2_bits = bits != 0 && (bits & (bits - 1)) == 0;
     if (k == 64 || k == 128) && pow2_bits {
         QmvKernel::Quad { d: k }
+    } else if m >= 2 && wide_ok {
+        // vecs_per_tg = ceil(M / ceil(M/5)) capped at 5 (quantized.cpp:555).
+        let n_tiles = m.div_ceil(5);
+        QmvKernel::Wide {
+            nv: m.div_ceil(n_tiles),
+        }
     } else if n.is_multiple_of(8) && k.is_multiple_of(512) {
         QmvKernel::Fast
     } else {
         QmvKernel::Generic
     }
+}
+
+/// The M=1 form — `pick_qmv_kernel_wide` with `m = 1, wide_ok = false`.
+pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
+    pick_qmv_kernel_wide(n, k, bits, 1, false)
 }
 
 /// Threadgroup grid + threads-per-group for a picked qmv variant.
@@ -117,6 +133,15 @@ pub fn qmv_dispatch_shape(
         QmvKernel::Fast | QmvKernel::Generic => {
             let bn: u32 = 8;
             ((m, n.div_ceil(bn), b), (32, 2, 1))
+        }
+        QmvKernel::Wide { nv } => {
+            // quantized.cpp:559-571: rows_per_tg = (32 / k_lanes=8) × 2
+            // simdgroups = 8; group (32, 2, 1); grid
+            // (ceil(M / nv), ceil(N / 8), B). The M axis does NOT take
+            // an m_scaling — nv is baked per bucket so the grid is exact.
+            let _ = nv;
+            let rows_per_tg: u32 = 8;
+            ((m.div_ceil(nv), n.div_ceil(rows_per_tg), b), (32, 2, 1))
         }
     }
 }
@@ -143,6 +168,9 @@ pub fn qmv_kernel_name(
         }
         QmvKernel::Generic => {
             format!("affine_qmv_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
+        }
+        QmvKernel::Wide { nv } => {
+            format!("affine_qmv_wide_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_nv_{nv}_kl_8_batch_{batch}",)
         }
     }
 }
@@ -206,6 +234,17 @@ pub fn qmv_kernel_static_name(
         }
         QmvKernel::Generic => {
             format!("affine_qmv_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
+        }
+        QmvKernel::Wide { nv } => {
+            if !matches!(nv, 2..=5) {
+                panic!(
+                    "qmv_kernel_static_name: QmvKernel::Wide with unsupported nv={nv} \
+                     — only 2..=5 instantiated"
+                );
+            }
+            format!(
+                "affine_qmv_wide_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_nv_{nv}_kl_8_batch_0"
+            )
         }
     };
     let leaked: &'static str = Box::leak(owned.into_boxed_str());
