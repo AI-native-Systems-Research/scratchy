@@ -477,20 +477,53 @@ impl From<String> for SiblingFp<'static> {
 /// BATCH WIDTH ([`RungSeqs`]); while all three were `(u32, fingerprint)` pairs, reading the wrong one to
 /// answer "which body serves four live requests" type-checked and returned a plausible, wrong body —
 /// one baked for a 64-column sweep, which attends the prompt and the newest token and nothing between.
+///
+/// ⭐ ONE BODY **PER ATTENTION CLASS**. A hybrid-attention model (gemma-4: sliding nqh=16/nkvh=8/hd=256
+/// alternating with global nqh=16/nkvh=1/hd=512) re-rolls into one body per class, and a rung at a
+/// narrower sweep needs BOTH of them — one fingerprint per class, in the SAME order as
+/// [`RerollMeta::bodies`]. A single-class model's rungs carry exactly one, which is the case every
+/// existing rung was.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LadderRung<'a> {
     /// The columns one fold pass of this rung's body sweeps.
     pub active_cap: SweptCols,
-    /// This rung's body.
-    pub body: SiblingFp<'a>,
-    /// The same body with the per-page fold fused in — one fewer launch per layer, run whenever the
-    /// context fits ONE page. [`SiblingFp::none`] when this rung has no fused twin, which simply
-    /// means it always uses the split body: correct, one launch per layer dearer.
-    pub body_fused: SiblingFp<'a>,
+    /// This rung's body per class, in the meta's `bodies` order.
+    pub bodies: Cow<'a, [SiblingFp<'a>]>,
+    /// The same bodies with the per-page fold fused in — one fewer launch per layer, run whenever the
+    /// context fits ONE page. [`SiblingFp::none`] entries simply mean that class always uses the
+    /// split body: correct, one launch per layer dearer.
+    pub bodies_fused: Cow<'a, [SiblingFp<'a>]>,
 }
 
-/// The re-rolled layer loop: the body is ONE layer, re-launched `iters` times with the weight and KV
-/// segment bases advanced per layer, between a prefix (embed) and a suffix (lm_head).
+/// ⭐ ONE LAYER LAUNCH, IN TRUE LAYER ORDER — the whole of the executor's per-layer arithmetic.
+///
+/// A class-split roll runs its bodies OUT of true order (all of class 0's layers, then class 1's), so
+/// the tape alone cannot say which body serves layer `v`. This is that answer, as DECLARED DATA: one
+/// entry per layer, in the order the layers actually execute, each naming its body (an index into
+/// [`RerollMeta::bodies`]) and its class-relative iteration.
+///
+/// ⛔ THE OFFSETS ARE THE PLACEMENTS', DISTILLED. `w_off`/`w_bank`/`kv_off` are the per-segment shifts
+/// the launch applies: `(w_bank, w_off + placement(t₀).offset)` must equal `placement(t_v)` for every
+/// per-layer weight `t` of the body's class — a relation the lowering PROVES at cargo-build for every
+/// tensor and every layer, so the runtime never re-derives an address from a stride. This is what
+/// makes a per-class stride, a class-major KV base and a weight BANK all the same thing at launch
+/// time: three columns of one table instead of three formulae that could disagree with the layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerLaunch {
+    /// Which body (index into [`RerollMeta::bodies`]) runs this layer.
+    pub body: u8,
+    /// The class-relative iteration this layer is for that body.
+    pub iter: u32,
+    /// The weight-segment bank this layer's weights live in.
+    pub w_bank: u8,
+    /// The weight-segment offset shift (from the body's baked layer-0 offsets).
+    pub w_off: u64,
+    /// The KV-segment offset shift.
+    pub kv_off: u64,
+}
+
+/// The re-rolled layer loop: ONE BODY PER ATTENTION CLASS, each re-launched for its own layers with
+/// the weight and KV segment bases advanced per layer, between a prefix (embed) and a suffix (lm_head).
 ///
 /// ⛔ THE DESTRUCTURE THAT BAKES THIS IS EXHAUSTIVE (`codegen::reroll_tokens`), so adding a field here
 /// is a build error until it is baked.
@@ -500,25 +533,23 @@ pub struct RerollMeta<'a> {
     pub prefix: SiblingFp<'a>,
     /// The suffix (final norm → lm_head → logits).
     pub suffix: SiblingFp<'a>,
-    /// This body with the per-page fold fused in, or [`SiblingFp::none`].
-    pub body_fused: SiblingFp<'a>,
-    /// The sk_bucket ladder, ASCENDING by `active_cap`; the top rung is this body itself.
+    /// ⭐ ONE BODY PER ATTENTION CLASS, in a fixed order. `bodies[0]` is the ANCHOR — the bundle this
+    /// meta is attached to — and the executor binds the others by the fingerprints they carry. A
+    /// single-class model (every model but the hybrid-attention ones) has exactly one, which is the
+    /// case every existing rolled bundle was.
+    pub bodies: Cow<'a, [SiblingFp<'a>]>,
+    /// Each body's fold-fused twin, in the SAME order as [`Self::bodies`].
+    pub bodies_fused: Cow<'a, [SiblingFp<'a>]>,
+    /// The sk_bucket ladder, ASCENDING by `active_cap`; each rung carries one body per class.
     pub rungs: Cow<'a, [LadderRung<'a>]>,
-    /// How many times the body runs — the layer count.
-    pub iters: u32,
-    /// Byte stride between one layer's weights and the next (seg1).
-    pub weight_stride: u64,
-    /// Byte stride between one layer's KV and the next (seg2). `page_stride = iters × kv_stride`,
-    /// which is why an absent meta used to yield a zero-byte KV pool rather than an error.
-    pub kv_stride: u64,
-    /// ⭐ HOW MANY LAYERS ONE WEIGHT BANK HOLDS — the divisor that turns a layer index into
-    /// `(bank, offset)`: layer `v` lives in bank `v / layers_per_bank` at
-    /// `(v % layers_per_bank) · weight_stride`.
-    ///
-    /// `iters` (every layer in one bank) whenever the weights fit one device region, which makes the
-    /// division a no-op and every existing bundle's launch sequence byte-identical. See
-    /// [`Placement::bank`].
-    pub layers_per_bank: u32,
+    /// One entry per layer, IN TRUE LAYER ORDER — see [`LayerLaunch`]. The executor runs exactly
+    /// this sequence; there is no per-layer arithmetic left at runtime.
+    pub launches: Cow<'a, [LayerLaunch]>,
+    /// ⭐ THE WHOLE PAGE, STATED ONCE — bytes of one pool page = every layer of every class
+    /// (`Σ_c n_c · kv_stride_c`). It used to be derived at runtime as `iters × kv_stride`, which is
+    /// only the same thing when every layer has the same KV geometry; gemma-4's two classes do not
+    /// (sliding 8×256 vs global 1×512), so the number is baked where the packing that decided it is.
+    pub kv_page_stride: u64,
     /// The weight bank the PREFIX program's weight operands live in, and the SUFFIX's.
     ///
     /// ⛔ A LAUNCH HAS ONE BASE PER SEGMENT, so each group's weights must be in ONE bank — proven at
@@ -532,9 +563,15 @@ impl<'a> RerollMeta<'a> {
     /// Every sibling fingerprint this meta names, whatever kind it is — one walk over the fields, so a
     /// sibling cannot be named in the struct and missed by the resolver.
     pub fn siblings(&self) -> impl Iterator<Item = &str> {
-        [&self.prefix, &self.suffix, &self.body_fused]
+        [&self.prefix, &self.suffix]
             .into_iter()
-            .chain(self.rungs.iter().flat_map(|r| [&r.body, &r.body_fused]))
+            .chain(self.bodies.iter())
+            .chain(self.bodies_fused.iter())
+            .chain(
+                self.rungs
+                    .iter()
+                    .flat_map(|r| r.bodies.iter().chain(r.bodies_fused.iter())),
+            )
             .filter(|s| !s.is_none())
             .map(|s| s.as_str())
     }
@@ -749,24 +786,31 @@ mod tests {
         let m = RerollMeta {
             prefix: SiblingFp::from("cdfd5b3768384100".to_string()),
             suffix: SiblingFp::from("de8ab8a9205d4b1e".to_string()),
-            body_fused: SiblingFp::from("443aebd9890d269af".to_string()),
+            bodies: Cow::Owned(vec![SiblingFp::from("443aebd9890d269af".to_string())]),
+            bodies_fused: Cow::Owned(vec![SiblingFp::from("443aebd9890d269af".to_string())]),
             rungs: Cow::Owned(vec![
                 LadderRung {
                     active_cap: SweptCols::new(64),
-                    body: SiblingFp::from("2f65540feaf0b24b".to_string()),
-                    body_fused: SiblingFp::from("2f65540feaf0b24bf".to_string()),
+                    bodies: Cow::Owned(vec![SiblingFp::from("2f65540feaf0b24b".to_string())]),
+                    bodies_fused: Cow::Owned(vec![SiblingFp::from(
+                        "2f65540feaf0b24bf".to_string(),
+                    )]),
                 },
                 LadderRung {
                     active_cap: SweptCols::new(256),
-                    body: SiblingFp::from("443aebd9890d269a".to_string()),
-                    body_fused: SiblingFp::none(),
+                    bodies: Cow::Owned(vec![SiblingFp::from("443aebd9890d269a".to_string())]),
+                    bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
                 },
             ]),
-            iters: 40,
-            weight_stride: 60872704,
-            kv_stride: 786432,
-            // Every layer in one bank — the unbanked case, where `v / layers_per_bank` is always 0.
-            layers_per_bank: 40,
+            launches: Cow::Owned(vec![LayerLaunch {
+                body: 0,
+                iter: 0,
+                w_bank: 0,
+                w_off: 0,
+                kv_off: 0,
+            }]),
+            kv_page_stride: 786432,
+            // Every layer in one bank — the unbanked case, where every launch binds bank 0.
             prefix_weight_bank: 0,
             suffix_weight_bank: 0,
         };
@@ -784,7 +828,10 @@ mod tests {
         // An ABSENT sibling contributes nothing — an empty fingerprint used to name the scratch
         // ROOT as if it were a bundle.
         assert!(!sibs.iter().any(|s| s.is_empty()));
-        assert_eq!(sibs.len(), 6);
+        // DISTINCT coverage is what the resolver needs; a class's scalar body and its fold-fused
+        // twin are LEGALLY the same fingerprint (an unfused-emitting class), so count the set.
+        let unique: std::collections::BTreeSet<&str> = sibs.iter().copied().collect();
+        assert_eq!(unique.len(), 6);
     }
 
     /// ⭐ A LAYOUT ANSWERS BY IDENTITY. It used to answer by NAME *and* by TID — two keys for one

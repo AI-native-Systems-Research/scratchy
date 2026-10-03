@@ -1383,7 +1383,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
     let bundle_layout =
-        compute_bundle_layout(ir, weight_ids, rows_are_requests, &Default::default())?;
+        compute_bundle_layout(ir, weight_ids, rows_are_requests, &[])?;
     let layout = Some(&bundle_layout);
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // The SINGLE monotonic negative-symbol-id counter for the WHOLE bundle (design
@@ -1562,7 +1562,7 @@ pub fn graph_wiring<F: RopeForm>(
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ NO LAYER CLASSES, for the same reason [`lower_graph_to_superdsc`] passes none: this walks
     // the UNROLLED graph, which has no layer loop and so no boundary a weight BANK may fall on.
-    let layout = compute_bundle_layout(ir, weight_ids, false, &Default::default())?;
+    let layout = compute_bundle_layout(ir, weight_ids, false, &[])?;
     let mut sym_id_base: i64 = 0;
     let mut quantized = std::collections::HashSet::new();
     let mut nodes = Vec::with_capacity(ir.nodes.len());
@@ -1652,6 +1652,35 @@ pub fn graph_wiring<F: RopeForm>(
 /// `lower_one_node`); post-loop Computes → `suffix`. Collects the per-layer tid map
 /// (`Compute::per_layer_out` for outputs + `ComputeInput::External::per_layer` for
 /// weights) for the executor's per-iteration address advance.
+/// Collect a matmul KERNEL weight (layer-0 tid, in=k, out=n) for the device re-tile manifest.
+/// w = inputs[1] is `[k,n]=[in,out]` row-major; the PT array needs the device tile layout
+/// `[out/64, in, 64]`. Arity-3 fp8 W8A8 matmuls MUST be collected too: their weight (inputs[1];
+/// inputs[2] is w_scale) needs the 1-byte packed RetileDescriptor from the `fp8_weight_tids`
+/// branch. in_k/out derive identically (inputs[0].cols=k, output.cols=n); the KSPLIT branch
+/// (out>16384) never fires for fp8 projs. Excluding arity-3 staged them FLAT → scrambled weights
+/// → garbage (`scr chat` incoherent); root-caused + on-card confirmed 2026-07-16.
+///
+/// Per segment now: the walk calls this once per node it emits, and the per-layer copies are
+/// attached later by the manifest loop (`per_layer.get(w_tid)`).
+fn collect_kernel0<F: RopeForm>(n: &SubtileNode<F>, out: &mut Vec<(u32, u32, u32)>) {
+    if matches!(n.op, SubOp::MatmulTile { .. }) && (n.inputs.len() == 2 || n.inputs.len() == 3) {
+        out.push((
+            n.inputs[1].tensor.index() as u32,
+            n.inputs[0].region.cols.len,
+            // DEVICE out extent via the TYPE-SAFE `DeviceWidth` (the SAME rule as
+            // `lower_matmul_node`'s `n_dev` and the worker's weight zero-pad): granite lm_head
+            // 49159→49664. So the RetileDescriptor device_size, the per-core address, and the
+            // staged buffer all agree by construction.
+            DeviceWidth::for_output(
+                n.output.region.rows.len,
+                n.output.region.cols.len,
+                n.inputs[0].region.cols.len,
+            )
+            .get(),
+        ));
+    }
+}
+
 pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     tape: &scratchy_subtile::subtile_tape::SubtileTape,
     ir: &SubtileIR<F>,
@@ -1690,62 +1719,145 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // ⭐ THE LAYER STRUCTURE FIRST, because the layout needs it: a weight BANK boundary may only fall
     // on a LAYER boundary, and `compute_bundle_layout` is where the weight segment is packed. Same
     // tape, same `ComputeInput::External::per_layer` the walk below reads — collected once, here.
+    // ONE MAP PER ATTENTION CLASS: a class-split roll's loops carry different-length per-layer
+    // tables, and the layout needs to know which class a tensor belongs to before it can pack.
     let per_layer_ext = per_layer_external_tids(tape);
+    // The layout's budget passes (spill/bank) take the per-loop maps directly: the spill reasons
+    // over WHICH tids are per-layer at all (flattened internally), and the BANK needs the class
+    // boundaries to know which (class, iteration) launches must stay in one bank.
     let mut bundle_layout =
         compute_bundle_layout(ir, weight_ids, rows_are_requests, &per_layer_ext)?;
-    // ON-CARD RESIDUAL (unconditional): thread the loop-carried hidden IN-PLACE, no copy. Pre-scan the
-    // loop body for hidden_in (first body node input[0]) + hidden_out (last body node output) and ALIAS
-    // hidden_out's placement to hidden_in's → every iteration reads+writes ONE resident buffer, so the
-    // residual threads with NO host round-trip and NO device copy (replaces the host thread_hidden).
-    // WAR-safe: within a layer hidden_in's last read (computing h1 = h_in+attn) precedes hidden_out's
-    // write (the final h_out = h1+mlp add); across iters the shared buffer carries the residual. The
-    // shim's thread_hidden becomes a no-op once the placements coincide.
+    // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
+    // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
+    // — sibling loops, never nested (the TapeBuilder typestate forbids nesting). One `(range,
+    // iters)` per loop, in tape order; the walk below lowers each separately.
+    let instrs = tape.instrs();
+    let mut loops: Vec<(std::ops::Range<usize>, u32)> = Vec::new();
     {
-        let (mut pseg, mut pf, mut plast, mut psuf): (u8, Option<u32>, Option<u32>, Option<u32>) =
-            (0, None, None, None);
-        for instr in tape.instrs() {
+        let mut open: Option<(usize, u32)> = None;
+        for (i, instr) in instrs.iter().enumerate() {
             match instr {
-                Instr::OpenLoop { .. } => pseg = 1,
-                Instr::CloseLoop { .. } => pseg = 2,
-                Instr::Compute { node, .. } => {
-                    if pseg == 1 {
-                        if pf.is_none() {
-                            pf = Some(node.index() as u32);
-                        }
-                        plast = Some(node.index() as u32);
-                    } else if pseg == 2 && psuf.is_none() {
-                        psuf = Some(node.index() as u32);
+                Instr::OpenLoop { bound, .. } => {
+                    if open.is_some() {
+                        return Err(SuperDscError(
+                            "reroll-superdsc: a nested layer loop — the TapeBuilder typestate \
+                             forbids nesting, so the tape is not one this walk built"
+                                .into(),
+                        ));
                     }
+                    let it = match bound {
+                        LoopBound::Const(it) => *it,
+                        LoopBound::Runtime(_) => {
+                            return Err(SuperDscError(
+                                "reroll-superdsc: a runtime-bounded layer loop is unsupported \
+                                 (the decode layer count is a compile-time Const)"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    if it == 0 {
+                        return Err(SuperDscError(
+                            "reroll-superdsc: a zero-iteration layer loop — reroll found a \
+                             repeating body of no layers"
+                                .into(),
+                        ));
+                    }
+                    open = Some((i, it));
+                }
+                Instr::CloseLoop { .. } => {
+                    let Some((o, it)) = open.take() else {
+                        return Err(SuperDscError(
+                            "reroll-superdsc: a CloseLoop with no OpenLoop — unbalanced brackets"
+                                .into(),
+                        ));
+                    };
+                    loops.push((o + 1..i, it));
                 }
                 _ => {}
             }
         }
-        if let (Some(f), Some(l)) = (pf, plast)
-            && let Some(p) = bundle_layout
-                .placements
-                .get(&(ir.nodes[f as usize].inputs[0].tensor.index() as u32))
-                .cloned()
-        {
-            let hout = ir.nodes[l as usize].output.tensor.index() as u32;
-            // hidden_out (last body op) → hidden_in's buffer: per-iter residual threads in place.
+        if open.is_some() {
+            return Err(SuperDscError(
+                "reroll-superdsc: an OpenLoop with no CloseLoop — unbalanced brackets".into(),
+            ));
+        }
+    }
+    if loops.is_empty() {
+        return Err(SuperDscError(
+            "reroll-superdsc: no layer loop in the rerolled tape (no OpenLoop/CloseLoop) — \
+             reroll_subtile_tape found no repeating body"
+                .into(),
+        ));
+    }
+    let prefix_end = loops[0].0.start - 1;
+    let suffix_start = loops[loops.len() - 1].0.end + 1;
+    // ⛔ `iters` per body, from the loop bounds — NOT the count of instrs in the range.
+    debug_assert_eq!(loops.len(), per_layer_ext.len()); // one map per sibling loop, by construction
+    // ── The walk: prefix, each body, suffix, with per-segment lowering context ──
+    // The residual-stream aliasing pre-pass first: thread the loop-carried hidden IN-PLACE, no copy.
+    // Pre-scan EVERY body for hidden_in (its first node's input[0]) + hidden_out (its last node's
+    // output) and alias them ALL onto the FIRST body's hidden_in placement → every launch of every
+    // class reads+writes ONE resident buffer, so the residual threads with NO host round-trip and NO
+    // device copy. WAR-safe: within a layer hidden_in's last read (computing h1 = h_in+attn)
+    // precedes hidden_out's write (the final h_out = h1+mlp add); across launches the shared buffer
+    // carries the residual. The suffix's input aliases the same buffer (the body→suffix seam).
+    {
+        let mut hidden_placement: Option<crate::lower_subtile_tape_to_superdsc::TensorPlacement> =
+            None;
+        let mut first_suffix_node: Option<u32> = None;
+        for instr in &instrs[suffix_start..] {
+            if let Instr::Compute { node, .. } = instr {
+                first_suffix_node = Some(node.index() as u32);
+                break;
+            }
+        }
+        for (range, _) in &loops {
+            let first = instrs[range.clone()]
+                .iter()
+                .find_map(|i| match i {
+                    Instr::Compute { node, .. } => Some(*node),
+                    _ => None,
+                })
+                .expect("a loop body holds at least one Compute");
+            let last = instrs[range.clone()]
+                .iter()
+                .rev()
+                .find_map(|i| match i {
+                    Instr::Compute { node, .. } => Some(*node),
+                    _ => None,
+                })
+                .expect("a loop body holds at least one Compute");
+            let hin = ir.nodes[first.index()].inputs[0].tensor.index() as u32;
+            let hout = ir.nodes[last.index()].output.tensor.index() as u32;
+            let p = hidden_placement
+                .take()
+                .or_else(|| bundle_layout.placements.get(&hin).cloned())
+                .expect("the first body's hidden-in has a layout placement");
+            // hidden_out (last body op) → the shared hidden buffer: per-launch residual threads in
+            // place; the NEXT body's hidden_in aliases the same buffer, so the cross-class seam
+            // threads in place too.
             bundle_layout.placements.insert(hout, p);
-            // suffix_in (first suffix op's input[0]) → the same buffer: the body→suffix seam threads
-            // in place too, so BOTH host routings (thread_hidden + thread_to_suffix) are unnecessary.
-            if let Some(s) = psuf {
-                let sin = ir.nodes[s as usize].inputs[0].tensor.index() as u32;
+            bundle_layout.placements.insert(hin, p);
+            hidden_placement = Some(p);
+        }
+        // suffix_in (first suffix op's input[0]) → the same buffer.
+        if let Some(s) = first_suffix_node {
+            let sin = ir.nodes[s as usize].inputs[0].tensor.index() as u32;
+            if let Some(p) = hidden_placement {
                 bundle_layout.placements.insert(sin, p);
             }
         }
     }
     let layout = Some(&bundle_layout);
     let mut sym_id_base: i64 = 0;
-    let (mut prefix, mut body, mut suffix): (Vec<EmittedOp>, Vec<EmittedOp>, Vec<EmittedOp>) =
-        (Vec::new(), Vec::new(), Vec::new());
-    let mut iters: u32 = 0;
-    let mut seg: u8 = 0; // 0 = prefix, 1 = body (inside the layer loop), 2 = suffix
-    // fp8 activation-quantize dedup (see `lower_matmul_node`): keyed on the activation `t{id}`. Within the
-    // once-walked body, q/k/v (same rms₁ tid) share ONE quant; distinct-tid activations never false-share,
-    // and the reusing matmul lands in the SAME segment as the quant it reuses (shared tid ⇒ same segment).
+    let mut prefix: Vec<EmittedOp> = Vec::new();
+    let mut suffix: Vec<EmittedOp> = Vec::new();
+    // fp8 activation-quantize dedup (see `lower_matmul_node`): keyed on the activation `t{id}`. Within
+    // a once-walked body, q/k/v (same rms₁ tid) share ONE quant; distinct-tid activations never
+    // false-share, and the reusing matmul lands in the SAME segment as the quant it reuses (shared
+    // tid ⇒ same segment). RESET PER BODY: two classes' bodies are different programs over different
+    // representative tids, so a stale entry from class 0 could only suppress a legitimate quant in
+    // class 1 by tid collision — there is none, but the reset states the scope.
     let mut fp8_quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut unhandled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // ⭐ SEEDED FROM THE PRE-PASS RATHER THAN REBUILT. `per_layer_external_tids` already read every
@@ -1753,178 +1865,214 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // the layer boundaries to decide weight BANKS, and that runs before any op is emitted. The walk
     // below then adds only what the pre-pass cannot see (node outputs, the resident Kᵀ), and its own
     // `or_insert_with` is a no-op for anything already here.
-    //
-    // ⛔ A DISAGREEMENT BETWEEN THE TWO IS CAUGHT, NOT ASSUMED AWAY: a class the pre-pass missed was
-    // never banked, so its layers sit at their un-banked offsets and the per-layer FORMULA check
-    // after this walk refuses the bundle naming that tensor.
-    let mut per_layer: std::collections::BTreeMap<u32, Vec<u32>> = per_layer_ext.clone();
-    // Which weight BANKS each launch group addresses (0 = prefix, 1 = body, 2 = suffix), accumulated
-    // as the ops are emitted. A launch has ONE base per segment, so a group may address exactly one;
-    // `group_bank` checks that after the walk.
-    let mut group_weight_banks: [std::collections::BTreeSet<u32>; 3] = Default::default();
-    // First/last body Compute node (for the residual-stream hidden in/out tids).
-    let mut first_body_node: Option<u32> = None;
-    let mut last_body_node: Option<u32> = None;
-    // First SUFFIX Compute node — its input[0] is the residual the suffix reads (the
-    // last layer's post-attn residual, e.g. t780). The rerolled body writes its output
-    // to the REPRESENTATIVE-iteration tid (hidden_out_tid, e.g. t360), NOT t780, so the
-    // body→suffix seam must thread hidden_out → suffix_in at runtime (else the suffix
-    // reads an unwritten slot = 0 → rmsnorm(0)=inf → garbage logits).
+    // ⭐ SEEDED FROM THE PRE-PASS RATHER THAN REBUILT (flattened — the walk's `or_insert`s below
+    // are no-ops for anything already here). A table's KEY is its class's layer-0 tid; a table's
+    // LENGTH is its class's `iters`.
+    let mut per_layer: std::collections::BTreeMap<u32, Vec<u32>> = per_layer_ext
+        .iter()
+        .flat_map(|m| m.iter())
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+    // Which weight BANKS each launch group addresses — one set per GROUP, where a group is now the
+    // prefix (index 0), each body (1 + body index), or the suffix (last). A launch has ONE base per
+    // segment, so a group may address exactly one; checked after the walk.
+    let n_groups = loops.len() + 2;
+    let mut group_weight_banks: Vec<std::collections::BTreeSet<u32>> =
+        vec![Default::default(); n_groups];
+    // First SUFFIX Compute node — its input[0] is the residual the suffix reads.
     let mut first_suffix_node: Option<u32> = None;
     // Matmul KERNEL weights (layer-0 tid, in=k, out=n) for the device re-tile manifest.
     let mut kernel0: Vec<(u32, u32, u32)> = Vec::new();
-    // LAYER blocked-f16 (SCRATCHY_LAYER_KSPLIT): collected down_proj `(dp_per_layer tids, dev_out, b_blocks)`
-    // for POST-LOOP block-weight placement overlay (bundle_layout is borrowed by `layout` inside the loop).
-    for instr in tape.instrs() {
-        match instr {
-            Instr::OpenLoop { bound, .. } => {
-                iters = match bound {
-                    LoopBound::Const(it) => *it,
-                    LoopBound::Runtime(_) => {
-                        return Err(SuperDscError(
-                            "reroll-superdsc: a runtime-bounded layer loop is unsupported (the \
-                             decode layer count is a compile-time Const)"
-                                .into(),
-                        ));
-                    }
-                };
-                seg = 1;
+    // ⭐ ONE `group` PER SEGMENT: 0 = prefix, 1..=n = body i, n+1 = suffix. The closure takes the
+    // fp8-quantize dedup set BY PARAMETER (not by capture) so the walk can CLEAR it between bodies
+    // — the reset is the scope statement, and a captured set would forbid the clear outright.
+    let mut emit_seg =
+        |group: usize,
+         n: &SubtileNode<F>,
+         fp8_quantized: &mut std::collections::HashSet<String>,
+         ops_out: &mut Vec<EmittedOp>|
+         -> Result<(), SuperDscError> {
+            for r in &n.inputs {
+                let tid = r.tensor.index() as u32;
+                if let Some(p) = bundle_layout.placements.get(&tid)
+                    && matches!(p.role, SegRole::Weight)
+                {
+                    group_weight_banks[group].insert(p.bank);
+                }
             }
-            Instr::CloseLoop { .. } => seg = 2,
-            Instr::Compute {
+            match lower_one_node(
+                n,
+                ir,
+                active_cap,
+                rows_are_requests,
+                &mut sym_id_base,
+                layout,
+                fp8_quantized,
+            ) {
+                NodeLowering::Ops(v) => {
+                    ops_out.extend(v);
+                    Ok(())
+                }
+                NodeLowering::Unhandled(s) => {
+                    if matches!(n.op, SubOp::MatmulTile { .. }) {
+                        Err(SuperDscError(s))
+                    } else {
+                        unhandled.insert(s);
+                        Ok(())
+                    }
+                }
+                NodeLowering::HostRouted(_) => Ok(()),
+            }
+        };
+    // ── Prefix ──
+    for instr in &instrs[..prefix_end] {
+        if let Instr::Compute { node, .. } = instr {
+            let n = &ir.nodes[node.index()];
+            collect_kernel0(n, &mut kernel0);
+            emit_seg(0, n, &mut fp8_quantized, &mut prefix)?;
+        }
+    }
+    // ── Bodies: one RolledBody per loop, its iters, its layer ids, its hidden tids ──
+    let mut bodies: Vec<crate::lower_subtile_tape_to_superdsc::RolledBody> = Vec::new();
+    // Each body's PER-LAYER REPRESENTATIVE tids — every External table + per-layer node output
+    // this body's own instrs name, plus its kct. `body_of_tid` (the launch-table guard) uses this
+    // to know which class a `per_layer` table belongs to; a table's KEY is the class's layer-0 tid,
+    // and only the body that READS (or writes) that tid can own it.
+    let mut body_representatives: Vec<Vec<u32>> = Vec::with_capacity(loops.len());
+    for (bi, (range, iters)) in loops.iter().enumerate() {
+        let mut ops: Vec<EmittedOp> = Vec::new();
+        let mut first_node: Option<u32> = None;
+        let mut last_node: Option<u32> = None;
+        let mut representatives: Vec<u32> = Vec::new();
+        for instr in &instrs[range.clone()] {
+            let Instr::Compute {
                 node,
                 inputs,
                 per_layer_out,
                 ..
-            } => {
-                let n = &ir.nodes[node.index()];
-                // Collect matmul KERNEL weights for the device re-tile manifest: w =
-                // inputs[1] is [k,n]=[in,out] row-major; the PT array needs the device
-                // tile layout [out/64, in, 64]. in=A.cols (k), out=output.cols (n).
-                // Arity-3 fp8 W8A8 matmuls MUST be collected here too: their weight (inputs[1]; inputs[2] is
-                // w_scale) needs the 1-byte packed RetileDescriptor from the `fp8_weight_tids` branch below.
-                // They were EXCLUDED (arity-2 only), so the shim staged them FLAT → scrambled weights → garbage
-                // (`scr chat` incoherent). in_k/out derive identically (inputs[0].cols=k, output.cols=n); the
-                // KSPLIT branch (out>16384) never fires for fp8 projs. Root-caused + on-card confirmed 2026-07-16.
-                if matches!(n.op, SubOp::MatmulTile { .. })
-                    && (n.inputs.len() == 2 || n.inputs.len() == 3)
+            } = instr
+            else {
+                continue;
+            };
+            let n = &ir.nodes[node.index()];
+            collect_kernel0(n, &mut kernel0);
+            if first_node.is_none() {
+                first_node = Some(node.index() as u32);
+            }
+            last_node = Some(node.index() as u32);
+            // Per-layer OUTPUT tids (the node's output tensor in each layer copy of THIS class).
+            if *iters > 1 && per_layer_out.len() as u32 == *iters {
+                let outs: Vec<u32> = per_layer_out
+                    .iter()
+                    .map(|nid| ir.nodes[nid.index()].output.tensor.index() as u32)
+                    .collect();
+                representatives.push(n.output.tensor.index() as u32);
+                per_layer
+                    .entry(n.output.tensor.index() as u32)
+                    .or_insert(outs);
+            }
+            // Per-layer WEIGHT/external tids of THIS class.
+            for ci in inputs.iter() {
+                if let ComputeInput::External {
+                    tensor,
+                    per_layer: pl,
+                    ..
+                } = ci
+                    && *iters > 1
+                    && pl.len() as u32 == *iters
                 {
-                    kernel0.push((
-                        n.inputs[1].tensor.index() as u32,
-                        n.inputs[0].region.cols.len,
-                        // DEVICE out extent via the TYPE-SAFE `DeviceWidth` (the SAME rule as
-                        // `lower_matmul_node`'s `n_dev` and the worker's weight zero-pad): granite lm_head
-                        // 49159→49664. So the RetileDescriptor device_size, the per-core address, and the
-                        // staged buffer all agree by construction.
-                        DeviceWidth::for_output(
-                            n.output.region.rows.len,
-                            n.output.region.cols.len,
-                            n.inputs[0].region.cols.len,
-                        )
-                        .get(),
-                    ));
-                    // KSPLIT fp32-merge (lm_head first-test, n>16384): the split weight ALSO needs B
-                    // block-weight descriptors `[KB,N]` under reserved tids `ksplit_block_tid(b)`, matching
-                    // the emit branch's block matmuls. Same gate + condition. The kernel0 descriptor loop
-                    // below builds each as `[dev_out/64, KB, 64]` (in=KB) — exactly the block matmul's read
-                    // (`ksplit_block_weight_kslice_offset_matches_read`). Worker gathers the K-slice bytes.
-                }
-                if seg == 1 {
-                    if first_body_node.is_none() {
-                        first_body_node = Some(node.index() as u32);
-                    }
-                    last_body_node = Some(node.index() as u32);
-                }
-                if seg == 2 && first_suffix_node.is_none() {
-                    first_suffix_node = Some(node.index() as u32);
-                }
-                // Per-layer OUTPUT tids (the node's output tensor in each layer copy).
-                if iters > 1 && per_layer_out.len() as u32 == iters {
-                    let outs: Vec<u32> = per_layer_out
-                        .iter()
-                        .map(|nid| ir.nodes[nid.index()].output.tensor.index() as u32)
-                        .collect();
+                    representatives.push(tensor.index() as u32);
                     per_layer
-                        .entry(n.output.tensor.index() as u32)
-                        .or_insert(outs);
-                }
-                // Per-layer WEIGHT/external tids.
-                for ci in inputs.iter() {
-                    if let ComputeInput::External {
-                        tensor,
-                        per_layer: pl,
-                        ..
-                    } = ci
-                        && iters > 1
-                        && pl.len() as u32 == iters
-                    {
-                        per_layer
-                            .entry(tensor.index() as u32)
-                            .or_insert_with(|| pl.iter().map(|t| t.index() as u32).collect());
-                    }
-                }
-                // RESIDENT kct per-layer registration (kill-the-restickify residency): the score reads a
-                // per-layer RESIDENT Kᵀ kernel `kct_resident_tid(k_id)`. It's neither an External nor a node
-                // output, so the loops above never add it — insert it manually (mirror the downproj block
-                // insert below): map each layer's K-cache source tid k_Lv → kct_resident_tid(k_Lv), keyed
-                // under the layer-0 kct tid. REQUIRED so the seg2 uniformity guard validates kct's per-layer
-                // stride matches k/v — the executor advances kct's seg2 base by v·kv_stride automatically, so
-                // a non-uniform kct packing would SILENTLY read the wrong layer (runtime-errors-need-compile-
-                // time-checks). per_layer[k_id] was just inserted by the External loop above.
-                if let SubOp::AttnDecode { layout: kv, .. } = &n.op
-                    && iters > 1
-                    && let Some(k_layers) =
-                        per_layer.get(&(kv.cache_tensor().index() as u32)).cloned()
-                    && k_layers.len() as u32 == iters
-                {
-                    let kct_tids: Vec<u32> = k_layers
-                        .iter()
-                        .map(|&k_lv| kct_resident_tid(k_lv))
-                        .collect();
-                    per_layer
-                        .entry(kct_resident_tid(kv.cache_tensor().index() as u32))
-                        .or_insert(kct_tids);
-                }
-                // LAYER blocked-f16 (SCRATCHY_LAYER_KSPLIT): down_proj (large K) → B per-layer block weights.
-                // Push each block's kernel0 `[KB,dev_out]` descriptor + its per-layer tid list; collect the
-                // down_proj weight's per-layer list for the POST-LOOP placement overlay (block (v,b) at
-                // dp_Lv.offset + b·KB·dev_out·2, so weight_stride is unchanged). All offsets Kani-proven.
-                // ⭐ THE WEIGHT BANK THIS OP'S GROUP NEEDS. Recorded per group as the ops are emitted
-                // because it is a property of the OPERANDS, which only the node knows; a launch binds
-                // ONE base per segment, so the set for each group must end up with at most one
-                // member. Empty for every op of every unbanked bundle.
-                for r in &n.inputs {
-                    let tid = r.tensor.index() as u32;
-                    if let Some(p) = bundle_layout.placements.get(&tid)
-                        && matches!(p.role, SegRole::Weight)
-                    {
-                        group_weight_banks[(seg as usize).min(2)].insert(p.bank);
-                    }
-                }
-                match lower_one_node(
-                    n,
-                    ir,
-                    active_cap,
-                    rows_are_requests,
-                    &mut sym_id_base,
-                    layout,
-                    &mut fp8_quantized,
-                ) {
-                    NodeLowering::Ops(v) => match seg {
-                        0 => prefix.extend(v),
-                        1 => body.extend(v),
-                        _ => suffix.extend(v),
-                    },
-                    NodeLowering::Unhandled(s) => {
-                        if matches!(n.op, SubOp::MatmulTile { .. }) {
-                            return Err(SuperDscError(s));
-                        }
-                        unhandled.insert(s);
-                    }
-                    NodeLowering::HostRouted(_) => {}
+                        .entry(tensor.index() as u32)
+                        .or_insert_with(|| pl.iter().map(|t| t.index() as u32).collect());
                 }
             }
-            Instr::AllocSlot { .. } | Instr::FreeSlot { .. } => {}
+            // RESIDENT kct per-layer registration (kill-the-restickify residency): the score reads a
+            // per-layer RESIDENT Kᵀ kernel `kct_resident_tid(k_id)`. It's neither an External nor a
+            // node output, so the loops above never add it — insert it manually: map each layer's
+            // K-cache source tid k_Lv → kct_resident_tid(k_Lv), keyed under the layer-0 kct tid.
+            // REQUIRED so the launch-table guard validates kct's per-layer offset matches k/v — the
+            // executor shifts seg2 by the launch's kv_off for every op, so a kct packed out of step
+            // with k/v would SILENTLY read the wrong layer (runtime-errors-need-compile-time-checks).
+            if let SubOp::AttnDecode { layout: kv, .. } = &n.op
+                && *iters > 1
+                && let Some(k_layers) =
+                    per_layer.get(&(kv.cache_tensor().index() as u32)).cloned()
+                && k_layers.len() as u32 == *iters
+            {
+                let kct_tids: Vec<u32> = k_layers
+                    .iter()
+                    .map(|&k_lv| kct_resident_tid(k_lv))
+                    .collect();
+                representatives.push(kct_resident_tid(kv.cache_tensor().index() as u32));
+                per_layer
+                    .entry(kct_resident_tid(kv.cache_tensor().index() as u32))
+                    .or_insert(kct_tids);
+            }
+            emit_seg(1 + bi, n, &mut fp8_quantized, &mut ops)?;
+        }
+        let first = first_node.unwrap_or(u32::MAX);
+        let last = last_node.unwrap_or(u32::MAX);
+        // The body's hidden in/out tids.
+        let hidden_in_tid = if first == u32::MAX {
+            u32::MAX
+        } else {
+            ir.nodes[first as usize].inputs[0].tensor.index() as u32
+        };
+        let hidden_out_tid = if last == u32::MAX {
+            u32::MAX
+        } else {
+            ir.nodes[last as usize].output.tensor.index() as u32
+        };
+        // ⭐ THE CLASS'S LAYER IDS, from its OWN rope table: the body's RopeAppend node (the KV
+        // writer — "a layer is named by its KV writer") carries `per_layer_out` naming this class's
+        // rope nodes; `layer_index()` on each gives the ABSOLUTE layer id per class-relative
+        // iteration. This is the only source of the true order, and it is the tape's own.
+        let mut layer_ids: Vec<u32> = Vec::with_capacity(*iters as usize);
+        for instr in &instrs[range.clone()] {
+            if let Instr::Compute {
+                node,
+                per_layer_out,
+                ..
+            } = instr
+                && matches!(ir.nodes[node.index()].op, SubOp::RopeAppend { .. })
+                && per_layer_out.len() as u32 == *iters
+            {
+                layer_ids = per_layer_out
+                    .iter()
+                    .map(|nid| ir.nodes[nid.index()].op.layer_index().expect("a RopeAppend names a layer"))
+                    .collect();
+                break;
+            }
+        }
+        if layer_ids.len() != *iters as usize {
+            return Err(SuperDscError(format!(
+                "reroll-superdsc: body {bi} has {} RopeAppend layer ids but its loop runs {} \
+                 iterations — the layer cannot be named for every launch, so the true layer order \
+                 is unknown and the launch table cannot be built",
+                layer_ids.len(),
+                iters
+            )));
+        }
+        bodies.push(crate::lower_subtile_tape_to_superdsc::RolledBody {
+            ops,
+            iters: *iters,
+            layer_ids,
+            hidden_in_tid,
+            hidden_out_tid,
+        });
+        body_representatives.push(representatives);
+        fp8_quantized.clear();
+    }
+    // ── Suffix ──
+    for instr in &instrs[suffix_start..] {
+        if let Instr::Compute { node, .. } = instr {
+            let n = &ir.nodes[node.index()];
+            if first_suffix_node.is_none() {
+                first_suffix_node = Some(node.index() as u32);
+            }
+            collect_kernel0(n, &mut kernel0);
+            emit_seg(n_groups - 1, n, &mut fp8_quantized, &mut suffix)?;
         }
     }
     if !unhandled.is_empty() {
@@ -1934,14 +2082,31 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             unhandled.into_iter().collect::<Vec<_>>().join(", "),
         )));
     }
-    if iters == 0 {
-        return Err(SuperDscError(
-            "reroll-superdsc: no layer loop in the rerolled tape (no OpenLoop/CloseLoop) — \
-             reroll_subtile_tape found no repeating body"
-                .into(),
-        ));
+    // ⭐ THE LAUNCH SEQUENCE, in TRUE LAYER ORDER. Each body names its layers (absolute ids); the
+    // model's layers run in ascending id order, so one sort of `(body, iter, layer_id)` triples is
+    // the whole sequence. A single-class body has `layer_ids == [0..iters)`, which yields exactly
+    // the `for v in 0..iters` sequence the executor ran before classes existed.
+    let mut order: Vec<(u8, u32, u32)> = bodies
+        .iter()
+        .enumerate()
+        .flat_map(|(bi, b)| {
+            b.layer_ids
+                .iter()
+                .enumerate()
+                .map(move |(it, &id)| (bi as u8, it as u32, id))
+        })
+        .collect();
+    let total_layers = order.len();
+    order.sort_by_key(|&(_, _, id)| id);
+    if let Some(w) = order.windows(2).find(|w| w[0].2 == w[1].2) {
+        return Err(SuperDscError(format!(
+            "reroll-superdsc: two launches name layer {} (bodies {} and {}) — a layer id appears \
+             in two classes' rope tables, so neither owns it",
+            w[0].2, w[0].0, w[1].0
+        )));
     }
-    // ⛔⛔⛔ THE SHARED PLAN IS COMPLETED HERE, BEFORE ANY BUNDLE CAN SNAPSHOT IT.
+    let launches: Vec<(u8, u32)> = order.iter().map(|&(b, i, _)| (b, i)).collect();
+    let launch_layer: Vec<u32> = order.iter().map(|&(_, _, l)| l).collect();
     //
     // MEASURED, granite-3.1-2b on the card: main's decode bundle places rmsnorm scratch for tids
     // {448, 458, 1128}; ours placed {448, 458}. t1128 is the FINAL `model.norm` — the lm-head tail,
@@ -1976,7 +2141,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
     // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
     let attn_params = attn_bundle_params(ir, rows_are_requests)?;
-    for ops in [&prefix, &body, &suffix] {
+    let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
+    for ops in std::iter::once(&prefix)
+        .chain(body_op_lists.iter().copied())
+        .chain(std::iter::once(&suffix))
+    {
         let mut declare_syms: i64 = 0;
         let mut declare_fp8: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in ops.iter() {
@@ -2070,157 +2239,201 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     if synth_high > bundle_layout.segment_bytes[seg3] {
         bundle_layout.segment_bytes[seg3] = synth_high;
     }
-    // Per-layer SEGMENT strides for the executor: WEIGHTS (seg1) + KV (seg2) advance
-    // by `v·stride` per iteration (the body's baked layer-0 offsets shift to layer-v
-    // when the executor passes `seg_base + v·stride`). Verify UNIFORMITY here (a
-    // build-time guard) — a non-uniform packing would make the seg-base advance read
-    // the WRONG layer's weights (silent garbage). seg3 intermediates (the loop-carried
-    // hidden) are EXCLUDED (host-threaded, not strided). 0 = no per-layer tensor there.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    //  ⭐ THE LAUNCH TABLE — one `(w_bank, w_off, kv_off)` per layer, GENERATED from the
+    //  placements and PROVEN against them, so the executor never re-derives an address from a
+    //  stride.
+    //
+    //  The old contract was arithmetic: layer `v` at `(v / layers_per_bank, (v % lpb)·weight_stride)`
+    //  and `v·kv_stride`. That formula is only correct while every layer has the SAME geometry —
+    //  gemma-4's two attention classes do not (sliding 8×256 KV vs global 1×512, and weight blocks
+    //  that differ by class), so the formula would become three formulae (one per class, plus a
+    //  class base) that could disagree with the packing that actually happened. The table replaces
+    //  all of them: for the launch of (body c, iteration j), the shift is read straight off class
+    //  c's own placements, and the guard below holds EVERY per-layer tensor of EVERY class to the
+    //  table — strictly stronger than the pairwise stride check it replaces, because it also
+    //  validates the bank and the class base, per layer, not per consecutive pair.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
     let w_seg = SegRole::Weight.segment();
     let kv_seg = SegRole::Kv.segment();
-    let mut weight_stride: u64 = 0;
-    let mut kv_stride: u64 = 0;
-    for tids in per_layer.values() {
+    // Which body owns a `per_layer` table: its key (the class's layer-0 tid) was collected from
+    // that body's own instrs — see `body_representatives`. Only that body's launches shift for it.
+    let body_of_tid = |tid: u32| -> Option<usize> {
+        body_representatives
+            .iter()
+            .position(|reps| reps.contains(&tid))
+    };
+    // ⛔⛔⛔ A PER-LAYER **WEIGHT** OUTSIDE THE STRIDED SEGMENT IS SILENT GARBAGE: a launch shifts
+    // only seg{w_seg}'s base, so layer v would read layer 0's copy of this tensor for every layer —
+    // fluent output, wrong model. [`spill_weight_tail`] may only move the NON-per-layer tail, and
+    // this is what holds it to that.
+    //
+    // ⛔ KEYED ON THE **ROLE**, NOT THE SEGMENT. A per-layer INTERMEDIATE colored into a spill slot
+    // is legitimate and must keep falling through — the `WeightOverflow = 5` attempt refused
+    // exactly that case (per-layer intermediate t448 in seg5) and read it as proof no segment was
+    // available, when the real defect was taking a COLOR.
+    //
+    // A per-layer tensor must also not change SEGMENT across its class's layers: the launch shift
+    // is one segment-wide byte offset, so a tensor that moved would be read at a wrong address on
+    // one side of the move.
+    for (t0, tids) in &per_layer {
         if tids.len() < 2 {
             continue;
         }
-        let Some(p0) = bundle_layout.placements.get(&tids[0]) else {
+        let Some(p0) = bundle_layout.placements.get(t0) else {
             continue;
         };
-        let seg = p0.segment;
-        let target = if seg == w_seg {
-            &mut weight_stride
-        } else if seg == kv_seg {
-            &mut kv_stride
-        } else if matches!(p0.role, SegRole::Weight) {
-            // ⛔⛔⛔ A PER-LAYER **WEIGHT** OUTSIDE THE STRIDED SEGMENT IS SILENT GARBAGE, and the
-            // arm below would have `continue`d past it. The rolled body advances only seg{w_seg}'s
-            // base, so layer v would read layer 0's copy of this tensor for all `iters` layers:
-            // fluent output, wrong model. [`spill_weight_tail`] may only move the NON-per-layer tail,
-            // and this is what holds it to that.
-            //
-            // ⛔ KEYED ON THE **ROLE**, NOT THE SEGMENT. A per-layer INTERMEDIATE colored into a
-            // spill slot is legitimate and must keep falling through — the `WeightOverflow = 5`
-            // attempt refused exactly that case (per-layer intermediate t448 in seg5) and read it as
-            // proof no segment was available, when the real defect was taking a COLOR.
+        if p0.segment != w_seg && p0.segment != kv_seg && matches!(p0.role, SegRole::Weight) {
             return Err(SuperDscError(format!(
-                "reroll-superdsc: per-layer WEIGHT t{} is placed in seg{seg}, which gets no \
-                 per-layer stride — the rolled body advances only seg{w_seg}, so every one of the \
-                 {} layers would read layer 0's copy. Only NON-per-layer weights (the final norm, \
-                 the lm_head / tied embedding) may spill; see `spill_weight_tail`.",
-                tids[0],
+                "reroll-superdsc: per-layer WEIGHT t{t0} is placed in seg{}, which no launch \
+                 shifts — every one of the {} layers would read layer 0's copy. Only NON-per-layer \
+                 weights (the final norm, the lm_head / tied embedding) may spill; see \
+                 `spill_weight_tail`.",
+                p0.segment,
                 tids.len(),
             )));
-        } else {
-            continue; // seg3 hidden / per-layer intermediate color: not stride-advanced
-        };
-        for w in tids.windows(2) {
-            let (Some(a), Some(b)) = (
-                bundle_layout.placements.get(&w[0]),
-                bundle_layout.placements.get(&w[1]),
+        }
+        // Segment stability is required ONLY of the tensors a launch SHIFTS — the weight and KV
+        // classes. A per-layer INTERMEDIATE may be colored differently per layer (a seg5 spill
+        // slot for one, seg3 for another): intermediates are re-bound per launch from the launch's
+        // own placement, so no shift ever crosses the move. Refusing those is what broke the first
+        // attempt at this guard — the old pairwise check `continue`d them, and so does this one.
+        let shifted = (p0.segment == w_seg && matches!(p0.role, SegRole::Weight))
+            || p0.segment == kv_seg;
+        if shifted {
+            for t in tids {
+                if let Some(p) = bundle_layout.placements.get(t)
+                    && p.segment != p0.segment
+                {
+                    return Err(SuperDscError(format!(
+                        "reroll-superdsc: per-layer tensor t{t0} changes segment ({} → {}) across \
+                         its class's layers — the launch shift is one segment-wide offset, so one \
+                         side of the move would be read at a wrong address",
+                        p0.segment, p.segment
+                    )));
+                }
+            }
+        }
+    }
+    // ── GENERATE: for each launch (body c, iter j), the weight shift from ANY of c's per-layer
+    //    weight tables and the KV shift from c's per-layer KV tables. A body with no per-layer
+    //    weight/KV gets (0, 0, 0) — nothing to shift. The proof below then holds EVERY tensor of
+    //    the class to the entry, so which table generated it cannot matter; a class whose tables
+    //    DISAGREE is refused here with both readings named.
+    let mut launch_w: Vec<(u8, u64)> = Vec::with_capacity(total_layers);
+    let mut launch_kv: Vec<u64> = Vec::with_capacity(total_layers);
+    for &(body, iter) in &launches {
+        let mut w_entry: Option<(u8, u64)> = None;
+        let mut kv_entry: Option<u64> = None;
+        for (t0, tids) in &per_layer {
+            if body_of_tid(*t0) != Some(body as usize) {
+                continue;
+            }
+            let (Some(p0), Some(pj)) = (
+                bundle_layout.placements.get(t0),
+                bundle_layout.placements.get(&tids[iter as usize]),
             ) else {
-                return Err(SuperDscError(
-                    "reroll-superdsc: a per-layer tensor is missing a layout placement".into(),
-                ));
+                continue;
             };
-            if a.segment != seg || b.segment != seg {
-                return Err(SuperDscError(
-                    "reroll-superdsc: a per-layer tensor changes segment across layers".into(),
-                ));
+            if p0.segment == w_seg && matches!(p0.role, SegRole::Weight) {
+                let entry = (pj.bank as u8, pj.offset.wrapping_sub(p0.offset));
+                if let Some(prev) = w_entry
+                    && prev != entry
+                {
+                    return Err(SuperDscError(format!(
+                        "reroll-superdsc: body {body}'s per-layer weights DISAGREE about layer \
+                         {iter}'s launch shift ({prev:?} vs {entry:?}, generated from t{t0}) — the \
+                         packing did not advance the class's weights together, so no one shift \
+                         addresses them all"
+                    )));
+                }
+                w_entry = Some(entry);
+            } else if p0.segment == kv_seg {
+                let entry = pj.offset.wrapping_sub(p0.offset);
+                if let Some(prev) = kv_entry
+                    && prev != entry
+                {
+                    return Err(SuperDscError(format!(
+                        "reroll-superdsc: body {body}'s per-layer KV tensors DISAGREE about layer \
+                         {iter}'s launch shift ({prev} vs {entry} B, generated from t{t0}) — k, v \
+                         and Kᵀ must advance together or the score reads one layer's keys against \
+                         another's values"
+                    )));
+                }
+                kv_entry = Some(entry);
             }
-            // ⭐ A BANK BOUNDARY IS THE ONE PLACE THE STRIDE LEGITIMATELY DOES NOT APPLY: layer `v`
-            // is `(v / lpb, (v % lpb)·stride)`, so crossing into the next bank resets the offset
-            // instead of advancing it. Skipping the pair here is not a hole in the guard — the FULL
-            // per-layer formula (bank AND offset, for every layer, not just consecutive pairs) is
-            // checked below, which is strictly stronger than this pairwise delta ever was.
-            if a.bank != b.bank {
+        }
+        launch_w.push(w_entry.unwrap_or((0, 0)));
+        launch_kv.push(kv_entry.unwrap_or(0));
+    }
+    // ── PROVE, EVERY TENSOR, EVERY LAYER. The launch addresses
+    //    `(bank: L.w_bank, offset: L.w_off + placement(t₀).offset)` — hold each per-layer weight
+    //    to the placement its layer actually got, and each per-layer KV tensor likewise. This is
+    //    the check the generator cannot make: generation read ONE tensor per segment per launch;
+    //    this holds ALL of them.
+    for (li, &(body, iter)) in launches.iter().enumerate() {
+        let (wb, wo) = launch_w[li];
+        let ko = launch_kv[li];
+        for (t0, tids) in &per_layer {
+            if body_of_tid(*t0) != Some(body as usize) {
                 continue;
             }
-            let d = b.offset.wrapping_sub(a.offset);
-            if *target == 0 {
-                *target = d;
-            } else if *target != d {
+            let (Some(p0), Some(pj)) = (
+                bundle_layout.placements.get(t0),
+                bundle_layout.placements.get(&tids[iter as usize]),
+            ) else {
+                continue;
+            };
+            if p0.segment == w_seg && matches!(p0.role, SegRole::Weight) {
+                if pj.bank as u8 != wb || pj.offset != wo.wrapping_add(p0.offset) {
+                    return Err(SuperDscError(format!(
+                        "reroll-superdsc: per-layer weight t{tid} (layer {layer} of body {body}, \
+                         class-relative {iter}) is placed at bank {bank} offset {off}, but the \
+                         launch table addresses it at bank {wb} offset {want} (shift {wo} + \
+                         layer-0 offset {base}). Every layer must sit where the launch looks, or \
+                         that layer reads another layer's weights.",
+                        tid = tids[iter as usize],
+                        layer = launch_layer[li],
+                        bank = pj.bank,
+                        off = pj.offset,
+                        want = wo.wrapping_add(p0.offset),
+                        wo = wo,
+                        base = p0.offset,
+                        body = body,
+                        iter = iter,
+                        wb = wb,
+                    )));
+                }
+            } else if p0.segment == kv_seg && pj.offset != ko.wrapping_add(p0.offset) {
                 return Err(SuperDscError(format!(
-                    "reroll-superdsc: NON-UNIFORM per-layer stride in seg{seg} ({} vs {} bytes) — \
-                     the executor advances the segment base by v·stride, which needs layers packed \
-                     at a uniform stride. Reorder compute_bundle_layout to pack each layer's \
-                     {} contiguously.",
-                    *target,
-                    d,
-                    if seg == w_seg { "weights" } else { "KV" },
+                    "reroll-superdsc: per-layer KV tensor t{tid} (layer {layer} of body {body}) is \
+                     placed at offset {off}, but the launch table addresses it at {want} (shift \
+                     {ko} + layer-0 offset {base}). The score would read one layer's keys against \
+                     another's values.",
+                    tid = tids[iter as usize],
+                    layer = launch_layer[li],
+                    off = pj.offset,
+                    want = ko.wrapping_add(p0.offset),
+                    ko = ko,
+                    base = p0.offset,
+                    body = body,
                 )));
             }
         }
     }
-    // ══════════════════════════════════════════════════════════════════════════════════════════
-    //  ⭐ THE WEIGHT BANK CONTRACT — the launch-time arithmetic, proven here against the addresses
-    //  that were actually baked.
-    //
-    //  The executor reaches layer `v` with `bank = v / layers_per_bank` and
-    //  `off[SEG_WEIGHT] = (v % layers_per_bank) · weight_stride`. Every term of that is decided in
-    //  `bank_weight_segment`, so all three checks below compare the FORMULA against the placements
-    //  rather than re-deriving the policy — the failure mode is a layer reading another layer's
-    //  weights, which is fluent, wrong output and nothing else.
-    // ══════════════════════════════════════════════════════════════════════════════════════════
-    //
-    // `layers_per_bank` is READ OFF the placements: how many layers share bank 0. Every layer in one
-    // bank (the unbanked case) gives `iters`, which makes the division a no-op.
-    let mut layers_per_bank: u32 = iters.max(1);
-    for tids in per_layer.values() {
-        let Some(p0) = bundle_layout.placements.get(&tids[0]) else {
-            continue;
-        };
-        if p0.segment != w_seg || !matches!(p0.role, SegRole::Weight) || tids.len() as u32 != iters
-        {
-            continue;
-        }
-        let in_bank0 = tids
-            .iter()
-            .filter(|t| {
-                bundle_layout
-                    .placements
-                    .get(*t)
-                    .is_some_and(|p| p.bank == 0)
-            })
-            .count() as u32;
-        if in_bank0 == 0 {
-            return Err(SuperDscError(format!(
-                "reroll-superdsc: per-layer weight class t{} has NO layer in bank 0, but the rolled \
-                 body is baked at LAYER 0 — its addresses would name a bank no launch binds.",
-                tids[0],
-            )));
-        }
-        layers_per_bank = layers_per_bank.min(in_bank0);
-    }
-    // Now hold EVERY per-layer weight to `(v / lpb, (v % lpb)·stride + its layer-0 offset)`. This is
-    // the check the pairwise delta above cannot make: it validates the bank as well as the offset,
-    // and it validates every layer rather than every consecutive pair.
-    for tids in per_layer.values() {
-        let Some(p0) = bundle_layout.placements.get(&tids[0]) else {
-            continue;
-        };
-        if p0.segment != w_seg || !matches!(p0.role, SegRole::Weight) || tids.len() as u32 != iters
-        {
-            continue;
-        }
-        for (v, t) in tids.iter().enumerate() {
-            let Some(p) = bundle_layout.placements.get(t) else {
-                continue;
-            };
-            let want_bank = v as u32 / layers_per_bank;
-            let want_off = (v as u64 % layers_per_bank as u64) * weight_stride + p0.offset;
-            if p.bank != want_bank || p.offset != want_off {
-                return Err(SuperDscError(format!(
-                    "reroll-superdsc: per-layer weight t{t} (layer {v} of class t{}) is placed at \
-                     bank {} offset {}, but the executor will address layer {v} at bank \
-                     {want_bank} offset {want_off} ({} layer(s)/bank, stride {weight_stride} B, \
-                     layer-0 offset {}). Every layer must sit where the per-layer advance looks, or \
-                     that layer reads another layer's weights.",
-                    tids[0], p.bank, p.offset, layers_per_bank, p0.offset,
-                )));
-            }
-        }
-    }
+    // The PAGE stride: one pool page covers every layer of every class, so the stride is the
+    // extent of the packed per-layer KV — the max end over every class's LAST layer placement
+    // (classes are packed contiguously; per-class strides differ, which is exactly why this is a
+    // max and not a count × stride). 0 when there is no paged KV.
+    let kv_page_stride = per_layer
+        .values()
+        .filter_map(|tids| {
+            let last = tids.last()?;
+            let p = bundle_layout.placements.get(last)?;
+            (p.segment == kv_seg).then(|| p.offset + p.size)
+        })
+        .max()
+        .unwrap_or(0);
     // ⛔ AND ONE BANK PER LAUNCH GROUP. A launch is handed ONE base per segment, so a program whose
     // weight operands span two banks cannot be expressed AT ALL — there is no offset that reaches
     // both. `group_weight_banks` was accumulated over the ops as they were emitted, so this is the
@@ -2240,31 +2453,30 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         }
     };
     let prefix_weight_bank = group_bank(0, "prefix")?;
-    let suffix_weight_bank = group_bank(2, "suffix")?;
-    // The BODY is baked at layer 0, which the loop above has already proven lives in bank 0, so any
-    // OTHER bank in the body means it also reads a weight that is not per-layer — the replication
-    // case, refused with its own name rather than as a stride mismatch three steps later.
-    if group_bank(1, "body")? != 0 {
-        return Err(SuperDscError(format!(
-            "reroll-superdsc: the body program addresses weight bank(s) {:?}, but it is baked at \
-             LAYER 0 and every launch of it advances bank 0's base. A NON-per-layer weight read \
-             inside the layer loop would need replicating into every bank.",
-            group_weight_banks[1],
-        )));
+    let suffix_weight_bank = group_bank(n_groups - 1, "suffix")?;
+    // Each BODY's weight reads must all sit in the bank its OWN launches bind — the launch-table
+    // proof above already held its per-layer weights there, so a disagreement here means the body
+    // also reads a NON-per-layer weight from another bank: the replication case, refused with its
+    // own name rather than as a launch-table mismatch.
+    for bi in 0..bodies.len() {
+        let launch_bank = launches
+            .iter()
+            .zip(&launch_w)
+            .find(|(l, _)| l.0 as usize == bi)
+            .map(|(_, w)| w.0 as u32)
+            .unwrap_or(0);
+        if group_bank(1 + bi, "body")? != launch_bank {
+            return Err(SuperDscError(format!(
+                "reroll-superdsc: body {bi}'s program addresses weight bank(s) {:?}, but its \
+                 launches bind bank {launch_bank} — a NON-per-layer weight read inside the layer \
+                 loop would need replicating into every bank.",
+                group_weight_banks[1 + bi],
+            )));
+        }
     }
-    // Residual-stream hidden in/out tids for the executor's loop-carried threading:
-    // the FIRST body node's input[0] (the layer's hidden-in, e.g. the rmsnorm x) and
-    // the LAST body node's output (the layer's hidden-out, the final residual add).
-    let hidden_in_tid = first_body_node
-        .and_then(|nid| ir.nodes[nid as usize].inputs.first())
-        .map(|r| r.tensor.index() as u32)
-        .unwrap_or(u32::MAX);
-    let hidden_out_tid = last_body_node
-        .map(|nid| ir.nodes[nid as usize].output.tensor.index() as u32)
-        .unwrap_or(u32::MAX);
-    // The suffix's residual input (first suffix node's input[0]) — the executor threads
-    // hidden_out → suffix_in once after the layer loop (the body→suffix seam). Same
-    // input-ordering convention as hidden_in_tid (rmsnorm input[0] = x = the residual).
+    // The suffix's residual input (first suffix node's input[0]) — the executor threads the last
+    // launch's hidden_out → suffix_in once after the launch sequence (the body→suffix seam). Same
+    // input-ordering convention as a body's hidden_in (rmsnorm input[0] = x = the residual).
     let suffix_in_tid = first_suffix_node
         .and_then(|nid| ir.nodes[nid as usize].inputs.first())
         .map(|r| r.tensor.index() as u32)
@@ -2275,7 +2487,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         let sb = &bundle_layout.segment_bytes;
         let tot: u64 = sb.iter().sum();
         eprintln!(
-            "[SEGDUMP] iters={iters} total={:.3}GB segs(GB)=[{}]",
+            "[SEGDUMP] layers={total_layers} total={:.3}GB segs(GB)=[{}]",
             tot as f64 / 1e9,
             sb.iter()
                 .map(|b| format!("{:.3}", *b as f64 / 1e9))
@@ -2305,26 +2517,19 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         }
     }
     let kv_request_stride = bundle_layout.kv_request_stride_bytes;
-    // Stated only when there IS a request dimension, so an unpaged bundle refuses nothing.
-    // ⛔ ALWAYS 0. There is no request dimension in a page any more, so there are no "request rows" for
-    // the runtime to bound a shift by. A request is reached by its PAGE, through the host's block table.
-    let kv_request_rows = 0u32;
     Ok(RolledSuperDsc {
         prefix,
-        body,
+        bodies,
         suffix,
-        iters,
         layout: bundle_layout,
         per_layer,
-        weight_stride,
-        layers_per_bank,
+        launches,
+        launch_w,
+        launch_kv,
+        kv_page_stride,
         prefix_weight_bank,
         suffix_weight_bank,
-        kv_stride,
         kv_request_stride,
-        kv_request_rows,
-        hidden_in_tid,
-        hidden_out_tid,
         suffix_in_tid,
         attn_params,
     })

@@ -8744,12 +8744,11 @@ fn reroll_tokens(
     let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::RerollMeta {
         prefix,
         suffix,
-        body_fused,
+        bodies,
+        bodies_fused,
         rungs,
-        iters,
-        weight_stride,
-        kv_stride,
-        layers_per_bank,
+        launches,
+        kv_page_stride,
         prefix_weight_bank,
         suffix_weight_bank,
     } = m;
@@ -8757,30 +8756,57 @@ fn reroll_tokens(
         let inner = cow_str(s.as_str());
         quote! { ::scratchy_target_spyre::bundle_code::SiblingFp(#inner) }
     };
-    let (prefix, suffix, body_fused) = (sib(prefix), sib(suffix), sib(body_fused));
+    let (prefix, suffix) = (sib(prefix), sib(suffix));
+    let bodies = bodies.iter().map(sib);
+    let bodies_fused = bodies_fused.iter().map(sib);
     let rungs = rungs.iter().map(|r| {
         let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LadderRung {
             active_cap,
-            body,
-            body_fused,
+            bodies,
+            bodies_fused,
         } = r;
         let cap = proc_macro2::Literal::u32_unsuffixed(active_cap.get());
-        let (body, body_fused) = (sib(body), sib(body_fused));
+        let bodies = bodies.iter().map(sib);
+        let bodies_fused = bodies_fused.iter().map(sib);
         quote! {
             ::scratchy_target_spyre::bundle_code::LadderRung {
                 active_cap: ::scratchy_target_spyre::bundle_code::SweptCols::new(#cap),
-                body: #body,
-                body_fused: #body_fused,
+                bodies: ::std::borrow::Cow::Borrowed(&[#(#bodies),*]),
+                bodies_fused: ::std::borrow::Cow::Borrowed(&[#(#bodies_fused),*]),
             }
         }
     });
-    let iters = proc_macro2::Literal::u32_unsuffixed(*iters);
-    let (ws, ks) = (
-        proc_macro2::Literal::u64_unsuffixed(*weight_stride),
-        proc_macro2::Literal::u64_unsuffixed(*kv_stride),
-    );
-    let (lpb, pwb, swb) = (
-        proc_macro2::Literal::u32_unsuffixed(*layers_per_bank),
+    // ⭐ THE LAUNCH TABLE, ONE ROW PER LAYER, IN TRUE LAYER ORDER — the executor runs exactly this
+    // sequence; there is no per-layer stride arithmetic left to bake differently.
+    let launches = launches.iter().map(|l| {
+        let scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LayerLaunch {
+            body,
+            iter,
+            w_bank,
+            w_off,
+            kv_off,
+        } = l;
+        let (b, it, wb) = (
+            proc_macro2::Literal::u8_unsuffixed(*body),
+            proc_macro2::Literal::u32_unsuffixed(*iter),
+            proc_macro2::Literal::u8_unsuffixed(*w_bank),
+        );
+        let (wo, ko) = (
+            proc_macro2::Literal::u64_unsuffixed(*w_off),
+            proc_macro2::Literal::u64_unsuffixed(*kv_off),
+        );
+        quote! {
+            ::scratchy_target_spyre::bundle_code::LayerLaunch {
+                body: #b,
+                iter: #it,
+                w_bank: #wb,
+                w_off: #wo,
+                kv_off: #ko,
+            }
+        }
+    });
+    let (kps, pwb, swb) = (
+        proc_macro2::Literal::u64_unsuffixed(*kv_page_stride),
         proc_macro2::Literal::u32_unsuffixed(*prefix_weight_bank),
         proc_macro2::Literal::u32_unsuffixed(*suffix_weight_bank),
     );
@@ -8788,12 +8814,11 @@ fn reroll_tokens(
         ::scratchy_target_spyre::bundle_code::RerollMeta {
             prefix: #prefix,
             suffix: #suffix,
-            body_fused: #body_fused,
+            bodies: ::std::borrow::Cow::Borrowed(&[#(#bodies),*]),
+            bodies_fused: ::std::borrow::Cow::Borrowed(&[#(#bodies_fused),*]),
             rungs: ::std::borrow::Cow::Borrowed(&[#(#rungs),*]),
-            iters: #iters,
-            weight_stride: #ws,
-            kv_stride: #ks,
-            layers_per_bank: #lpb,
+            launches: ::std::borrow::Cow::Borrowed(&[#(#launches),*]),
+            kv_page_stride: #kps,
             prefix_weight_bank: #pwb,
             suffix_weight_bank: #swb,
         }
@@ -9162,11 +9187,20 @@ fn dump_wavefront_mega(
                     // prefix(embed)/suffix(lm_head) bundles + the executor loop over `iters`
                     // layers (per_layer weight/KV/hidden ivar threading).
                     use scratchy_subtile::subtile_ir::ValidatedGraph;
-                    use scratchy_subtile::subtile_tape::{lower_dag_to_tape, reroll_subtile_tape};
+                    use scratchy_subtile::subtile_tape::{
+                        lower_dag_to_tape, reroll_layer_classes, reroll_subtile_tape,
+                    };
                     match ValidatedGraph::new(&krg) {
                         Ok(valid) => {
                             let tape_unrolled = lower_dag_to_tape(&valid);
-                            let tape_rolled = reroll_subtile_tape(&tape_unrolled, &krg);
+                            // ⭐ THE CLASS-SPLIT ROLL FIRST. A hybrid-attention model (gemma-4:
+                            // alternating sliding/global layers) has TWO distinct layer shapes, and
+                            // the welded roll's smallest repeat unit is the whole 6-layer cell — a
+                            // bake-unit ~6× larger than either class's body. `reroll_layer_classes`
+                            // splits it into one sibling loop per class; `reroll_subtile_tape`
+                            // remains the single-class roll every other model takes, byte-identical.
+                            let tape_rolled = reroll_layer_classes(&tape_unrolled, &krg)
+                                .unwrap_or_else(|| reroll_subtile_tape(&tape_unrolled, &krg));
                             match superdsc::lower_subtile_tape_to_superdsc(
                                 &tape_rolled,
                                 &krg,
@@ -9179,12 +9213,16 @@ fn dump_wavefront_mega(
                                 !is_prefill && decode_rows > 1,
                             ) {
                                 Ok(rolled) => {
+                                    let total_layers: u32 =
+                                        rolled.bodies.iter().map(|b| b.iters).sum();
                                     eprintln!(
-                                        "[spyre-superdsc] {base}: RE-ROLLED — prefix {} / body {} (loop ×{} layers) \
-                                     / suffix {} ops ({} per-layer tids). Baking the BODY bundle (STAGE 1).",
+                                        "[spyre-superdsc] {base}: RE-ROLLED — prefix {} / {} body \
+                                         class(es) ({} ops each, ×{} layers total) / suffix {} ops \
+                                         ({} per-layer tids). Baking the body bundle(s) (STAGE 1).",
                                         rolled.prefix.len(),
-                                        rolled.body.len(),
-                                        rolled.iters,
+                                        rolled.bodies.len(),
+                                        rolled.bodies.first().map(|b| b.ops.len()).unwrap_or(0),
+                                        total_layers,
                                         rolled.suffix.len(),
                                         rolled.per_layer.len(),
                                     );
@@ -9237,12 +9275,34 @@ fn dump_wavefront_mega(
                                     } else {
                                         Ok(String::new())
                                     };
-                                    let bod = superdsc::emit_bundle(
-                                        if card { &rolled.body } else { &unrolled },
-                                        Some(&rolled.layout),
-                                        superdsc::FoldGrouping::Split,
-                                        rolled.attn_params,
-                                    );
+                                    // ONE BUNDLE PER CLASS, class 0 first — class 0 is the ANCHOR
+                                    // (`RerollMeta::bodies[0]` names THIS bundle), and every other
+                                    // class becomes a sibling fingerprint. The emulator's single
+                                    // unrolled bundle stays ONE bundle: `unroll_layers` already
+                                    // walks the launch sequence across classes.
+                                    let mut body_fps: Vec<String> = Vec::new();
+                                    for (ci, b) in rolled.bodies.iter().enumerate() {
+                                        let r = superdsc::emit_bundle(
+                                            if card { &b.ops } else { &unrolled },
+                                            Some(&rolled.layout),
+                                            superdsc::FoldGrouping::Split,
+                                            rolled.attn_params,
+                                        );
+                                        match r {
+                                            Ok(fp) => body_fps.push(fp),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[spyre-superdsc] {base}: body class {ci} emit \
+                                                     failed: {e}"
+                                                );
+                                                body_fps.push(String::new());
+                                            }
+                                        }
+                                    }
+                                    let bod: Result<String, std::io::Error> = Ok(body_fps
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_default());
                                     // The SAME body, with the per-page fold fused back into the
                                     // surrounding work instead of standing alone. Splitting the fold
                                     // costs one extra launch per layer (measured: 5 groups vs the
@@ -9268,25 +9328,38 @@ fn dump_wavefront_mega(
                                     // only reader (`superdsc_exec::select_body_paged`) is
                                     // `spyre-hw`-gated. Same rule as the prefix/suffix below: bake it
                                     // where it is read.
-                                    let bod_fused = if card {
-                                        superdsc::emit_bundle(
-                                            &rolled.body,
-                                            Some(&rolled.layout),
-                                            superdsc::FoldGrouping::Fused,
-                                            rolled.attn_params,
-                                        )
-                                        .map_err(|e| {
-                                            // ⚠️ A LOST TWIN IS SILENT AT RUNTIME — the selector just
-                                            // falls through to the split ladder — so say it here.
-                                            eprintln!(
-                                                "[spyre-superdsc] {base}: fold-fused body twin emit \
-                                                 failed: {e}"
-                                            );
-                                        })
-                                        .ok()
-                                    } else {
-                                        None
-                                    };
+                                    // One fold-fused twin PER CLASS, same order as the bodies. An
+                                    // emit failure is logged and left `none()` — silent at runtime
+                                    // only in the sense the selector documented: it falls through
+                                    // to the split body, one launch per layer dearer.
+                                    let bodies_fused: Vec<superdsc::bundle::SiblingFp<'static>> =
+                                        if card {
+                                            rolled
+                                                .bodies
+                                                .iter()
+                                                .map(|b| {
+                                                    superdsc::emit_bundle(
+                                                        &b.ops,
+                                                        Some(&rolled.layout),
+                                                        superdsc::FoldGrouping::Fused,
+                                                        rolled.attn_params,
+                                                    )
+                                                    .map(superdsc::bundle::SiblingFp::from)
+                                                    .unwrap_or_else(|e| {
+                                                        eprintln!(
+                                                            "[spyre-superdsc] {base}: fold-fused \
+                                                             body twin emit failed: {e}"
+                                                        );
+                                                        superdsc::bundle::SiblingFp::none()
+                                                    })
+                                                })
+                                                .collect()
+                                        } else {
+                                            vec![
+                                                superdsc::bundle::SiblingFp::none();
+                                                rolled.bodies.len()
+                                            ]
+                                        };
                                     // ⭐ THE SUFFIX IS ITS OWN BUNDLE ON THE CARD. Rolling the body
                                     // means the lm-head tail can no longer ride inside it: the body is
                                     // ONE layer now, run `iters` times. The emulator keeps the single
@@ -9314,20 +9387,32 @@ fn dump_wavefront_mega(
                                             // (prefill sweeps its whole chunk); a rung that fails to bake is
                                             // logged + skipped (the runtime falls back to the next rung up).
                                             let cap = prefix_len.get();
-                                            // ⭐ EACH RUNG NAMES ITS OWN FUSED TWIN, rather than the
-                                            // runtime reconstructing the name by appending "f" — a
+                                            // ⭐ EACH RUNG NAMES ITS OWN FUSED TWINS, rather than the
+                                            // runtime reconstructing names by appending "f" — a
                                             // convention whose miss is silently "this rung has no fused
                                             // twin", and one extra launch per layer.
                                             let sib = |fp: Option<String>| match fp {
                                                 Some(fp) => superdsc::bundle::SiblingFp::from(fp),
                                                 None => superdsc::bundle::SiblingFp::none(),
                                             };
+                                            // ⭐ ONE BODY FINGERPRINT PER CLASS per rung — the same
+                                            // order as `bodies`. The ceiling rung's are the bodies
+                                            // just baked; class 0's fp is the anchor `bfp`.
+                                            let rung_fps = |fps: &[String]| {
+                                                std::borrow::Cow::Owned(
+                                                    fps.iter()
+                                                        .map(|fp| sib(Some(fp.clone())))
+                                                        .collect::<Vec<_>>(),
+                                                )
+                                            };
                                             let mut decode_rungs: Vec<
                                                 superdsc::bundle::LadderRung<'static>,
                                             > = vec![superdsc::bundle::LadderRung {
                                                 active_cap: superdsc::bundle::SweptCols::new(cap),
-                                                body: sib(Some(bfp.clone())),
-                                                body_fused: sib(bod_fused.clone()),
+                                                bodies: rung_fps(&body_fps),
+                                                bodies_fused: std::borrow::Cow::Owned(
+                                                    bodies_fused.clone(),
+                                                ),
                                             }];
                                             if !is_prefill {
                                                 for rung in scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap) {
@@ -9339,64 +9424,103 @@ fn dump_wavefront_mega(
                                                     !is_prefill && decode_rows > 1,
                                                 ) {
                                                     // Same device split as the ceiling rung above: the
-                                                    // card bakes the ROLLED body, the emulator the
-                                                    // unrolled one. Without this each of the three
-                                                    // interior rungs pays the same 40x.
+                                                    // card bakes the ROLLED bodies (one per class),
+                                                    // the emulator the single unrolled one. Without
+                                                    // this each of the three interior rungs pays the
+                                                    // same 40x.
                                                     Ok(rr) => {
                                                         let rung_unrolled = if card {
                                                             Vec::new()
                                                         } else {
                                                             superdsc::unroll_layers(&rr)
                                                         };
-                                                        match superdsc::emit_bundle(
-                                                        if card { &rr.body } else { &rung_unrolled },
-                                                        Some(&rr.layout),
-                                                        superdsc::FoldGrouping::Split,
-                                                        // THIS rung's own params — `rr` was lowered at
-                                                        // `rung`, so its swept extent is `rung`'s and
-                                                        // not the ceiling bundle's.
-                                                        rr.attn_params,
-                                                    ) {
-                                                        Ok(rfp) => {
-                                                            // Each rung also gets a fold-fused
-                                                            // variant: the rung bounds the sweep,
-                                                            // this bounds the launch count, and a
-                                                            // short context needs BOTH.
-                                                            // ⭐ ON THE CARD, for the ceiling twin's
-                                                            // reason above — and here it also keeps
-                                                            // the twin's NAME lawful. `bundle_fp`
-                                                            // says a twin is `<split fp>f`, so it
-                                                            // must hash the ops the split hashed;
-                                                            // off-card the split is
-                                                            // `&rung_unrolled` while this is
-                                                            // `&rr.body`, so the "twin" was named
-                                                            // after a bundle nothing else emitted.
-                                                            let rfused = if card {
-                                                                superdsc::emit_bundle(
-                                                                    &rr.body,
-                                                                    Some(&rr.layout),
-                                                                    superdsc::FoldGrouping::Fused,
-                                                                    rr.attn_params,
-                                                                )
-                                                                .ok()
-                                                            } else {
-                                                                None
-                                                            };
-                                                            eprintln!(
-                                                                "[spyre-superdsc] {base}: ladder rung active_cap={} → body {rfp}",
-                                                                rung.get()
-                                                            );
-                                                            decode_rungs.push(superdsc::bundle::LadderRung {
-                                                                active_cap: superdsc::bundle::SweptCols::new(rung.get()),
-                                                                body: sib(Some(rfp)),
-                                                                body_fused: sib(rfused),
-                                                            });
+                                                        // ONE FP PER CLASS; a class whose emit fails
+                                                        // is `none()` in the rung — the runtime falls
+                                                        // back to the next rung up for that class.
+                                                        let mut rfps: Vec<String> = Vec::new();
+                                                        let mut rfused: Vec<
+                                                            superdsc::bundle::SiblingFp<'static>,
+                                                        > = Vec::new();
+                                                        let mut ok = true;
+                                                        for (ci, b) in rr.bodies.iter().enumerate()
+                                                        {
+                                                            match superdsc::emit_bundle(
+                                                                if card { &b.ops } else { &rung_unrolled },
+                                                                Some(&rr.layout),
+                                                                superdsc::FoldGrouping::Split,
+                                                                // THIS rung's own params — `rr` was
+                                                                // lowered at `rung`, so its swept
+                                                                // extent is `rung`'s and not the
+                                                                // ceiling bundle's.
+                                                                rr.attn_params,
+                                                            ) {
+                                                                Ok(rfp) => {
+                                                                    rfps.push(rfp);
+                                                                    // Each rung also gets a
+                                                                    // fold-fused variant per class:
+                                                                    // the rung bounds the sweep,
+                                                                    // this bounds the launch count,
+                                                                    // and a short context needs
+                                                                    // BOTH. ON THE CARD, for the
+                                                                    // ceiling twin's reason above —
+                                                                    // and here it also keeps the
+                                                                    // twin's NAME lawful. `bundle_fp`
+                                                                    // says a twin is `<split fp>f`,
+                                                                    // so it must hash the ops the
+                                                                    // split hashed; off-card the
+                                                                    // split is `&rung_unrolled`
+                                                                    // while this is `&b.ops`, so the
+                                                                    // "twin" was named after a
+                                                                    // bundle nothing else emitted.
+                                                                    rfused.push(if card {
+                                                                        superdsc::emit_bundle(
+                                                                            &b.ops,
+                                                                            Some(&rr.layout),
+                                                                            superdsc::FoldGrouping::Fused,
+                                                                            rr.attn_params,
+                                                                        )
+                                                                        .map(
+                                                                            superdsc::bundle::SiblingFp::from,
+                                                                        )
+                                                                        .unwrap_or_else(|e| {
+                                                                            eprintln!(
+                                                                                "[spyre-superdsc] \
+                                                                                 {base}: rung {} class {ci} \
+                                                                                 fused twin emit failed: {e}",
+                                                                                rung.get()
+                                                                            );
+                                                                            superdsc::bundle::SiblingFp::none()
+                                                                        })
+                                                                    } else {
+                                                                        superdsc::bundle::SiblingFp::none()
+                                                                    });
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!(
+                                                                        "[spyre-superdsc] {base}: \
+                                                                         ladder rung {} class {ci} body \
+                                                                         emit failed: {e}",
+                                                                        rung.get()
+                                                                    );
+                                                                    ok = false;
+                                                                }
+                                                            }
                                                         }
-                                                        Err(e) => eprintln!(
-                                                            "[spyre-superdsc] {base}: ladder rung {} body emit failed: {e}",
-                                                            rung.get()
-                                                        ),
-                                                    }
+                                                        if ok {
+                                                            eprintln!(
+                                                                "[spyre-superdsc] {base}: ladder rung \
+                                                                 active_cap={} → {} body class(es)",
+                                                                rung.get(),
+                                                                rfps.len()
+                                                            );
+                                                            decode_rungs.push(
+                                                                superdsc::bundle::LadderRung {
+                                                                    active_cap: superdsc::bundle::SweptCols::new(rung.get()),
+                                                                    bodies: rung_fps(&rfps),
+                                                                    bodies_fused: std::borrow::Cow::Owned(rfused),
+                                                                },
+                                                            );
+                                                        }
                                                     },
                                                     Err(e) => eprintln!(
                                                         "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
@@ -9411,12 +9535,79 @@ fn dump_wavefront_mega(
                                             // resolves at load, and `RerollMeta::siblings` walks the
                                             // fields themselves — so there is no second list of
                                             // "which fields hold a fingerprint" to fall out of step.
+                                            //
+                                            // ⛔⛔⛔ THE CARD PLAYS THE LAUNCH TABLE; THE EMULATOR
+                                            // PLAYS ONE UNROLLED BUNDLE. `bod` above is `&unrolled`
+                                            // when `!card`, so the emulator's single bundle really is
+                                            // the whole program and its launch table is ONE row —
+                                            // which is the truth about that bundle, not a stub (the
+                                            // same fact the old `iters: 1` carried, as the ONE row
+                                            // the old `for v in 0..1` ran). The CARD's bodies are
+                                            // ONE layer each, played `launches.len()` times with the
+                                            // per-segment shifts each row names.
+                                            //
+                                            // MEASURED, granite-3.1-2b, the defect this guards
+                                            // against repeating: the runtime reported `iters=1
+                                            // wstride=0 kvstride=0` where main reported `iters=40
+                                            // wstride=121643008 kvstride=786432`, and the card ran
+                                            // ONE of forty layers per token — 3.1 ms ITL against
+                                            // main's 42 ms — answering with a single repeated token,
+                                            // while the log beside it printed ×40. The launch table
+                                            // is now ONE artifact both the bake and the runtime
+                                            // read, so the two cannot disagree about the count.
+                                            let baked_launches: Vec<
+                                                superdsc::bundle::LayerLaunch,
+                                            > = if card {
+                                                rolled
+                                                    .launches
+                                                    .iter()
+                                                    .zip(&rolled.launch_w)
+                                                    .zip(&rolled.launch_kv)
+                                                    .map(|((&(b, it), &(wb, wo)), &ko)| {
+                                                        superdsc::bundle::LayerLaunch {
+                                                            body: b,
+                                                            iter: it,
+                                                            w_bank: wb,
+                                                            w_off: wo,
+                                                            kv_off: ko,
+                                                        }
+                                                    })
+                                                    .collect()
+                                            } else {
+                                                vec![superdsc::bundle::LayerLaunch {
+                                                    body: 0,
+                                                    iter: 0,
+                                                    w_bank: 0,
+                                                    w_off: 0,
+                                                    kv_off: 0,
+                                                }]
+                                            };
                                             superdsc::attach_reroll(
                                                 &bfp,
                                                 superdsc::bundle::RerollMeta {
                                                     prefix: sib(Some(pfp.clone())),
                                                     suffix: sib(Some(sfp.clone())),
-                                                    body_fused: sib(bod_fused.clone()),
+                                                    // ⭐ ONE PER CLASS, class 0 = the ANCHOR (`bfp`,
+                                                    // the bundle this meta attaches to). The
+                                                    // emulator's unrolled bundle has no siblings —
+                                                    // one row, one body, run once.
+                                                    bodies: std::borrow::Cow::Owned(
+                                                        (if card {
+                                                            body_fps.clone()
+                                                        } else {
+                                                            vec![bfp.clone()]
+                                                        })
+                                                        .iter()
+                                                        .map(|fp| sib(Some(fp.clone())))
+                                                        .collect(),
+                                                    ),
+                                                    bodies_fused: std::borrow::Cow::Owned(
+                                                        if card {
+                                                            bodies_fused.clone()
+                                                        } else {
+                                                            vec![superdsc::bundle::SiblingFp::none()]
+                                                        },
+                                                    ),
                                                     // ⛔ `rungs` IS KEYED BY ACTIVE_CAP — the columns one
                                                     // fold pass sweeps — NOT by the batch width. Two other
                                                     // lists of `(u32, fingerprint)` in this file are keyed
@@ -9424,57 +9615,13 @@ fn dump_wavefront_mega(
                                                     // baked for a 64-column sweep because four requests are
                                                     // live.
                                                     rungs: std::borrow::Cow::Owned(decode_rungs),
-                                                    // ⛔⛔⛔ THE ITERATION COUNT IS THE BODY'S, AND
-                                                    // WHICH BODY THAT IS DEPENDS ON `card`.
-                                                    //
-                                                    // This read `iters: 1, weight_stride: 0,
-                                                    // kv_stride: 0` unconditionally, under a comment
-                                                    // asserting that was "the truth about this
-                                                    // bundle, not a stub: the layer loop is unrolled
-                                                    // into its launches". That IS true of the
-                                                    // EMULATOR's bundle — `bod` above is
-                                                    // `&unrolled` when `!card`, so the body really is
-                                                    // the whole program and running it once runs
-                                                    // every layer. It is false of the CARD's, where
-                                                    // `bod` is `&rolled.body`: ONE layer, to be
-                                                    // played `iters` times with the weight and KV
-                                                    // segment bases advanced per layer.
-                                                    //
-                                                    // MEASURED, granite-3.1-2b: the runtime reported
-                                                    // `RE-ROLLED — iters=1 wstride=0 kvstride=0`
-                                                    // where main reports `iters=40
-                                                    // wstride=121643008 kvstride=786432`. The card
-                                                    // therefore ran ONE of forty layers per token —
-                                                    // 3.1 ms ITL against main's 42 ms — and answered
-                                                    // with a single repeated token. The `eprintln!`
-                                                    // a few lines below has been printing
-                                                    // `rolled.iters` (40) beside this 1 the whole
-                                                    // time: the log said x40 while the baked
-                                                    // metadata said 1.
-                                                    iters: if card { rolled.iters } else { 1 },
-                                                    weight_stride: if card {
-                                                        rolled.weight_stride
+                                                    launches: std::borrow::Cow::Owned(
+                                                        baked_launches,
+                                                    ),
+                                                    kv_page_stride: if card {
+                                                        rolled.kv_page_stride
                                                     } else {
                                                         0
-                                                    },
-                                                    kv_stride: if card {
-                                                        rolled.kv_stride
-                                                    } else {
-                                                        0
-                                                    },
-                                                    // ⭐ THE WEIGHT BANKS RIDE WITH THE STRIDE THEY
-                                                    // DIVIDE. The executor reaches layer `v` at
-                                                    // `bank = v / layers_per_bank`, so the unrolled
-                                                    // body's single iteration needs
-                                                    // `layers_per_bank: 1` for that division to be
-                                                    // the same no-op its `iters: 1` already is —
-                                                    // conditioned on `card` for the same reason the
-                                                    // strides above are, and not left at 0, which
-                                                    // would divide by zero.
-                                                    layers_per_bank: if card {
-                                                        rolled.layers_per_bank
-                                                    } else {
-                                                        1
                                                     },
                                                     prefix_weight_bank: if card {
                                                         rolled.prefix_weight_bank
@@ -9511,11 +9658,11 @@ fn dump_wavefront_mega(
                                                 }
                                             }
                                             eprintln!(
-                                                "[spyre-superdsc] {base}: 3 bundles baked — prefix {pfp} / body {bfp} (×{} layers) \
-                                             / suffix {sfp}; wstride={} kvstride={} (dxp: 3 SMALL bundles → seconds)",
-                                                rolled.iters,
-                                                rolled.weight_stride,
-                                                rolled.kv_stride,
+                                                "[spyre-superdsc] {base}: 3 bundles baked — prefix {pfp} / body {bfp} + {} class(es), {} launch(es) \
+                                             / suffix {sfp}; page_stride={} B (dxp: SMALL bundles → seconds)",
+                                                rolled.bodies.len(),
+                                                rolled.launches.len(),
+                                                rolled.kv_page_stride,
                                             );
                                             // Stamp the DECODE body_fp or the PREFILL body_fp by phase
                                             // (the prefill reroll must NOT clobber the decode fp).
