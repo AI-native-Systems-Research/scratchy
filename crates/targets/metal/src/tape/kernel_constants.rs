@@ -19,10 +19,10 @@
 use crate::tape::constants::{ConstSlot, ConstantValue};
 
 use crate::tape::ids::{
-    AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
-    IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
-    NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TqCodeBits,
-    TqDecodeHeads,
+    AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
+    HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32,
+    MaxBlocksPerSeq, NDim, NDimI32, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim,
+    SplitK, TqCodeBits, TqDecodeHeads,
 };
 
 /// Append the spans rope-on-read function constants (slot 8 = rotary
@@ -90,6 +90,26 @@ impl From<RmsNormConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(1), c.q_size.get()),
             ConstantValue::float(ConstSlot(2), c.rms_norm_eps.get()),
             ConstantValue::float(ConstSlot(3), c.weight_offset),
+        ]
+    }
+}
+
+// ── ScalarMul ──────────────────────────────────────────────────────
+
+/// `KernelId::ScalarMul` (`scalar_mul_<T>_specialized`, `elementwise.metal`): the scale (slot 2;
+/// slots 0 / 1 are the file's other kernels') and the elements the buffer holds (slot 3) — its
+/// dispatch rounds up to whole threadgroups, and a thread past the buffer would scale whatever
+/// lies beyond it.
+pub struct ScalarMulConstants {
+    pub scale: f32,
+    pub elements: ElementCount,
+}
+
+impl From<ScalarMulConstants> for Vec<ConstantValue> {
+    fn from(c: ScalarMulConstants) -> Self {
+        vec![
+            ConstantValue::float(ConstSlot(2), c.scale),
+            ConstantValue::uint(ConstSlot(3), c.elements.get()),
         ]
     }
 }

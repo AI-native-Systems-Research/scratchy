@@ -3951,9 +3951,11 @@ fn lower_one(
                 "scalar_mul_bf16_specialized",
                 p.metal_dtype,
             ),
-            // Slot 2: elementwise.metal fn-const indices are file-scoped
-            // (0 = BIAS_ADD_NUM_COLS, 1 = TANH_SOFTCAP_CAP).
-            constants: baked(vec![ConstantValue::float(2, *scale)]),
+            constants: super::kernel_constants::ScalarMulConstants {
+                scale: *scale,
+                elements: super::ids::ElementCount(eff_m * cur_width.get()),
+            }
+            .into_baked(),
             // A scalar-multiply must cover the FULL activation row.
             // `cur_width` is the shape-tracked activation width: vocab
             // after the lm_head Gemm for granite's
@@ -6199,7 +6201,11 @@ fn lower_moe_step(
             let symbol = pick_specialized_symbol(f16, bf16, p.metal_dtype);
             let bindings = vec![s.at(0, R::TopKScores), s.at(1, R::TopKScores)];
             let shape = rows_1d(pairs, THREADS_PER_GROUP, A::X);
-            let constants = vec![C::float(2, scale.0)];
+            let constants = super::kernel_constants::ScalarMulConstants {
+                scale: scale.0,
+                elements: super::ids::ElementCount(pairs),
+            }
+            .into();
             vec![cmd(
                 KernelId::ScalarMul,
                 "elementwise",

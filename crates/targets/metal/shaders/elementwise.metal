@@ -276,12 +276,15 @@ kernel void tanh_soft_cap_bf16(
 // First exercised by Gemma4-on-metal — the arm previously referenced
 // these symbols without any .metal definition (latent dead arm).
 constant float SCALAR_MUL_SCALE [[function_constant(2)]];
+// The elements the buffer holds: the dispatch rounds up to whole threadgroups.
+constant uint SCALAR_MUL_N [[function_constant(3)]];
 
 kernel void scalar_mul_f16_specialized(
     device       half* out    [[buffer(0)]],
     device const half* input  [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    if (gid >= SCALAR_MUL_N) return;
     out[gid] = half(float(input[gid]) * SCALAR_MUL_SCALE);
 }
 
@@ -290,6 +293,7 @@ kernel void scalar_mul_bf16_specialized(
     device const bfloat* input  [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    if (gid >= SCALAR_MUL_N) return;
     out[gid] = bfloat(float(input[gid]) * SCALAR_MUL_SCALE);
 }
 
