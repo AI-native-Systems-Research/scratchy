@@ -1031,7 +1031,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     // registry a lie.
     #[cfg(feature = "spyre-triton")]
     {
-        match scratchy_triton_splice::lower(node, ir) {
+        match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
             Ok(Some(e)) => return Ops(vec![e]),
             Ok(None) => {}
             Err(reason) => return Unhandled(format!("triton splice refused: {reason}")),

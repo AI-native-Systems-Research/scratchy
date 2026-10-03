@@ -107,6 +107,18 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Opt
             entry: "silumul_fwd",
             program: Program::SiluMul,
         }),
+        // THE THIRD SPLICE — the biggest family by op count (every projection in every
+        // layer). DENSE fp16 ONLY: the arity-3 W8A8 form is a bundle-level deliberate
+        // non-splice (see the module header), and `GemmWeight` on the node states which
+        // is which.
+        SubOp::MatmulTile {
+            weight: scratchy_subtile::lower::GemmWeight::Dense,
+            ..
+        } => Some(TritonKernelRow {
+            kernel: "matmul.py",
+            entry: "matmul_fwd",
+            program: Program::Matmul,
+        }),
         // ⛔ NO ROW FOR attention/rope (consumer bake-plan facts), fp8 matmul (bundle-level
         // quantize dedup), or (1 + w) gains (no kernel exists). See the module header.
         _ => None,
@@ -127,15 +139,47 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Opt
 pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
+    // See `lower_one_node`: whether this bundle's rows are separate requests. Only the
+    // prefill lm-head-tail fallthrough reads it — the builder's own fold guard, mirrored.
+    rows_are_requests: bool,
 ) -> Result<Option<EmittedOp>, String> {
     let Some(row) = registry(&node.op) else {
         return Ok(None);
     };
+    // ⛔ THE LM-HEAD IS NOT A SPLICE TARGET, for two separate reasons, both detected by
+    // the builder's own vocab-width test (the lm_head matmul and the logits ScalarMul are
+    // the ONLY ops whose output spans the result cols — every intermediate is hidden or
+    // intermediate width):
+    //
+    // 1. THE PREFILL FOLD. At m>1 the builder REWRITES the node (last-row extraction at
+    //    m=1 over a synthetic buffer), which no registry row can state — fall through so
+    //    the builder takes its own `is_prefill_lm_head_tail` arm (`!rows_are_requests`).
+    // 2. THE ODD VOCAB. A decode lm_head at vocab 49155 (granite) has N odd, and the
+    //    ladder's `PlanCorelets` partitions a matmul across exactly 2 corelets —
+    //    `recover_matmul_n` RED-stops an N that N/2 cannot tile, a FAITHFUL port of the
+    //    C++ oracle (fixing it here would make the port disagree with the field). So an
+    //    odd-N result-width matmul stays on the builder path until the ladder learns a
+    //    single-corelet matmul plan.
+    if matches!(node.op, SubOp::MatmulTile { .. }) {
+        let result_cols = ir.tensors[ir.result.index()].cols;
+        if node.output.region.cols.len == result_cols {
+            let rows = node.output.region.rows.len;
+            if rows > 1 && !rows_are_requests {
+                return Ok(None); // 1. the prefill fold
+            }
+            if rows == 1 && node.output.region.cols.len % 2 == 1 {
+                return Ok(None); // 2. the odd vocab
+            }
+            // An EVEN result-width matmul at m>1 with `rows_are_requests` (the
+            // batched-decode lm_head) is spliced below like any other matmul.
+        }
+    }
     // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind so the splice and
     // the builder cannot disagree about it. The builder arm's own check is identical.
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
+        SubOp::MatmulTile { .. } => 2,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
         _ => return Err(format!(
@@ -227,6 +271,28 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // `RMS_INVCOLS_TID`, never through `scalarmul_scales`).
             ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
         }
+        (SubOp::MatmulTile { n, weight: scratchy_subtile::lower::GemmWeight::Dense }, "matmul_fwd") => {
+            // A is [M, K] (m from the node's output rows, k from A's own columns); W is
+            // the FUF convention's [K, N] region, n from the Linear's own stated width —
+            // the tile keeps its Linear's `n` even when col-tiling split the output.
+            let k = node.inputs[0].region.cols.len;
+            for p in ["desc_a", "desc_w", "desc_o"] {
+                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            // ONE tile, the whole region — `KtirFunc::matmul`'s own whole-region law
+            // (one linalg.matmul, no K loop).
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("K", Val::Int(i128::from(k)))?;
+            ce("N", Val::Int(i128::from(*n)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_K", Val::Int(i128::from(k)))?;
+            ce("BLOCK_N", Val::Int(i128::from(*n)))?;
+        }
         (SubOp::SiluMul, "silumul_fwd") => {
             // The kernel's own parameter spellings: desc_g, desc_u, desc_o, then the
             // constexprs M / N / BLOCK_M / BLOCK_N.
@@ -272,6 +338,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
     match &node.op {
         SubOp::RmsNorm { .. } => Ok(vec![1]),
         SubOp::SiluMul => Ok(vec![1]),
+        SubOp::MatmulTile { .. } => Ok(vec![1]),
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
     }
 }
@@ -354,6 +421,7 @@ fn program_stem(row: &TritonKernelRow) -> &'static str {
     match row.program {
         Program::RmsNorm => "rmsnorm",
         Program::SiluMul => "silumul",
+        Program::Matmul => "matmul",
         _ => "triton",
     }
 }

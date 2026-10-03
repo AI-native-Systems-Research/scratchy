@@ -55,7 +55,7 @@ fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
 
         // 2. The splice — the row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir)
+        let spliced = scratchy_triton_splice::lower(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"))
             .expect("registry has a row for Scale-gain RmsNorm");
 
@@ -155,7 +155,7 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
 
         // 2. The splice — the row compiles the kernel for this node.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir)
+        let spliced = scratchy_triton_splice::lower(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"))
             .expect("registry has a row for SiluMul");
 
@@ -216,6 +216,207 @@ fn silumul_ir(m: u32, c: u32) -> SubtileIR {
     let node = SubtileNode {
         id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
         op: SubOp::SiluMul,
+        inputs: vec![whole(0), whole(1)],
+        output: whole(2),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 2,
+        nodes: vec![node],
+        result: TensorId::from_index(2),
+        op_output: Vec::new(),
+    }
+}
+
+/// The dense fp16 matmul shapes that matter for the delivery scope: granite 2b's hidden
+/// 2048 projections at decode and a prefill rung, plus the wide qkv form. (M, K, N).
+const MATMUL_SHAPES: &[(u32, u32, u32)] = &[
+    (1, 2048, 2048),   // DECODE — the shape every chat token runs
+    (1, 2048, 512),    // decode, non-square
+    (31, 2048, 2048),  // prefill rung, square (both orientations pass extents)
+    (31, 2048, 512),   // NON-SQUARE — the orientation discriminator (a tile of a wide N)
+];
+
+#[test]
+fn spliced_dense_matmul_is_byte_identical_to_the_builder() {
+    for &(m, k, n) in MATMUL_SHAPES {
+        let ir = matmul_ir(m, k, n);
+        let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+
+        // 1. The builder path — the control. `rows_are_requests: true` disables the
+        // prefill lm-head tail fold (the builder's own `!rows_are_requests` guard): this
+        // fixture's matmul IS the graph result, so its cols equal `result_cols` and the
+        // fold would otherwise rewrite the node instead of lowering it — the same
+        // condition the splice's own fallthrough conservatively honors.
+        let (builder_ops, layout) =
+            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
+                .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
+        let [builder] = &builder_ops[..] else {
+            panic!("one matmul node lowers to one op, got {}", builder_ops.len())
+        };
+        let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+
+        // 2. The splice — the row compiles the kernel for this node.
+        let node = &ir.nodes[0];
+        let spliced = scratchy_triton_splice::lower(node, &ir, true)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"))
+            .expect("registry has a row for Dense MatmulTile");
+
+        // ⛔ THE NAME LAW IS PART OF THE GATE — `matmul_s{id}` on both paths.
+        assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} k={k} n={n})");
+
+        // 3. Both programs go through the SAME door under the SAME layout.
+        let mut sym = 0i64;
+        let mut quantized = HashSet::new();
+        let builder_emitted = door_lower(
+            builder_ktir,
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message));
+        let mut sym = 0i64;
+        let spliced_emitted = door_lower(
+            spliced.ktir.as_ref().expect("spliced op carries its program"),
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
+
+        assert_eq!(
+            builder_emitted.len(),
+            spliced_emitted.len(),
+            "op count (m={m} k={k} n={n})"
+        );
+        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+            let bj = serde_json::to_string(b.dsc()).unwrap();
+            let sj = serde_json::to_string(s.dsc()).unwrap();
+            assert_eq!(
+                bj, sj,
+                "descriptor bytes (m={m} k={k} n={n}): builder vs splice diverged"
+            );
+            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} k={k} n={n})");
+        }
+    }
+}
+
+/// ⛔ THE GOLDEN IS NOT EXECUTION. The byte-identity gate pins the DESCRIPTOR emission
+/// through the door, but the E2E serving path (`spyre-emu`) executes the spliced KTIR
+/// programs themselves through the emulator's fused/resident path — a different consumer
+/// with its own rewrite set (the `matmul_tile` LX re-tiling among them). This test drives
+/// the REAL spliced program — `scratchy_triton_splice::lower`'s own output, never a
+/// hand-built copy — through the production session entry (`SpyreSession::new_multi` /
+/// `run_step`, the same `build_spec` walk the worker's session takes) and checks the
+/// numbers against a host reference. The rmsnorm and silumul rows pass both gates; a
+/// matmul row that passes the golden but fails here is exactly the divergence this
+/// catches.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn spliced_dense_matmul_executes_the_real_program() {
+    // DECODE (m=1, the shape every chat token runs) and a PREFILL rung (m=31), both
+    // NON-SQUARE on purpose: a square `[k, k]` W satisfies both orientation readings,
+    // so it cannot catch a transposed read.
+    for (m, k, n) in [(1u32, 2048u32, 512u32), (31u32, 2048u32, 512u32)] {
+        execute_one_spliced_matmul(m, k, n);
+    }
+}
+
+/// One spliced dense matmul through the production session entry, checked against a
+/// host reference over the SAME on-disk `[n, k]` weight bytes the worker binds.
+fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
+    use std::borrow::Cow;
+
+    let ir = matmul_ir(m, k, n);
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, true)
+        .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"))
+        .expect("registry has a row for Dense MatmulTile");
+    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+
+    // The launch binding: parameter `i` -> `bindings[i]`, exactly the pairing
+    // `build_spec` reads off `LaunchProgram::args` — the tape's own numbering.
+    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+        .func
+        .arguments
+        .iter()
+        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .collect();
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: Cow::Borrowed(&[]),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
+
+    // The host data, bound EXACTLY as the worker binds it (`spyre_load.rs`'s
+    // non-hw arm): A `[m, k]` and the GEMM weight VERBATIM in its on-disk `[n, k]`
+    // orientation — the same bytes the builder's transpose-B maps read. The f32
+    // reference is over that same buffer: `W[ni, ki]` at `ni * k + ki`.
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
+    let w: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32) * 0.02 - 0.16).collect();
+    let mut want = vec![0.0f32; (m * n) as usize];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for ki in 0..k {
+                acc += a[(mi * k + ki) as usize] * w[(ni * k + ki) as usize];
+            }
+            want[(mi * n + ni) as usize] = acc;
+        }
+    }
+
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+    )
+    .expect("build the one-program session");
+    let out = session
+        .run_step(
+            0,
+            vec![
+                (0, a, vec![m as usize, k as usize]),
+                (1, w, vec![n as usize, k as usize]),
+            ],
+            &[(2, 0)],
+        )
+        .expect("run the spliced matmul program");
+    let got = &out[&2];
+    assert_eq!(got.len(), (m * n) as usize);
+    let mut max_abs = 0.0f32;
+    for (g, wnt) in got.iter().zip(&want) {
+        max_abs = max_abs.max((g - wnt).abs());
+    }
+    assert!(
+        max_abs < 0.05,
+        "the REAL spliced matmul program diverged from the host reference: max abs err {max_abs}"
+    );
+}
+
+/// `hidden[m, k] @ W[k, n] -> out[m, n]` as a one-node [`SubtileIR`], dense weights —
+/// the same fixture shape `superdsc_time_tile.rs`'s `single_matmul_ir` mints.
+fn matmul_ir(m: u32, k: u32, n: u32) -> SubtileIR {
+    let tensors = vec![
+        TensorShape { rows: m, cols: k },
+        TensorShape { rows: k, cols: n },
+        TensorShape { rows: m, cols: n },
+    ];
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::MatmulTile {
+            n,
+            weight: scratchy_subtile::lower::GemmWeight::Dense,
+        },
         inputs: vec![whole(0), whole(1)],
         output: whole(2),
     };

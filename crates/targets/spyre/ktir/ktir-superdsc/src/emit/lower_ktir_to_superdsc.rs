@@ -3813,6 +3813,59 @@ pub fn matmul(
     )
 }
 
+/// [`matmul`] with the orientation PROVEN from the node's own `linalg.matmul`, for a producer
+/// that states its maps instead of sharing the builder's `[n, k]`-view convention — the same
+/// law `whole_function`'s door applies (`matmul_b_orientation`), opened to the per-`Program`
+/// door when the splice landed. The Triton ladder's canonical single-dot kernel declares its
+/// weight descriptor `[K, N]` (the direct-load contract `verify_canonical_matmul_kernel`
+/// pins), so its weight region reads PlainB and the door must not assume TransposeB for it.
+///
+/// `Err` when the program states NO `linalg.matmul` — a `Program::Matmul` node without one is
+/// malformed and says so rather than falling back to the assumed orientation.
+pub fn matmul_proven(
+    k: &crate::ktir_node::KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    quantized: &mut std::collections::HashSet<String>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The node's ONE matmul op — the same op `regions()` read the views off, found deep
+    // (a K-looped form nests it in an `scf.for`).
+    fn deep<'a>(
+        ops: &'a [ktir_core::ir::Operation<'static>],
+        out: &mut Vec<&'a ktir_core::ir::Operation<'static>>,
+    ) {
+        for o in ops {
+            out.push(o);
+            for reg in o.regions.iter() {
+                deep(reg, out);
+            }
+        }
+    }
+    let mut all: Vec<&ktir_core::ir::Operation> = Vec::new();
+    deep(k.func.operations, &mut all);
+    let mm = all
+        .iter()
+        .find(|o| matches!(o.op_type, ktir_core::opkind::OpKind::LinalgMatmul))
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: a `Program::Matmul` node whose function states no `linalg.matmul` — there \
+                 is nothing to prove the weight orientation from",
+                k.func.name
+            ),
+        })?;
+    let b = super::whole_function::matmul_b_orientation(&k.func, mm)?;
+    matmul_oriented(
+        k.func.name,
+        r,
+        sym_id_base,
+        layout,
+        quantized,
+        b,
+        OperandOrigin::Staged,
+    )
+}
+
 /// WHO THE OPERANDS OF THIS MATMUL CALL ARE — the typed discriminator the spurious-pad drop in
 /// [`matmul_oriented`] reads (issue 201 item 7: a bool cannot say why).
 pub enum OperandOrigin {

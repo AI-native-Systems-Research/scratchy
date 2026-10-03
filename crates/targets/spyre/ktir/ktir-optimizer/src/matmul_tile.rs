@@ -81,6 +81,13 @@ struct Untiled {
     out_view: Ssa,
     /// The activation's row corner — an `scf`-free `index`, carried through unchanged.
     a_row: Ssa,
+    /// ⭐ THE WEIGHT'S ORIENTATION, read off the loaded W tile's shape — the same two
+    /// framings [`whole_function::matmul_b_orientation`] proves from the maps. The
+    /// builder's programs state a `[n, k]` W tile (transpose-B); the Triton ladder's
+    /// canonical single-dot kernel states `[k, n]` (plain-B, the direct-load contract
+    /// `verify_canonical_matmul_kernel` pins). The rewrite emits whichever it found —
+    /// one law, two spellings, no re-laying of bytes.
+    plain_b: bool,
     /// The untiled contraction's `outs` seed. ⛔ REUSED, NOT REBUILT: it is a splat of the BOUND
     /// zero constant at its reserved tid (`KtirFunc::splat_zero`), so minting a fresh immediate in
     /// its place orphans that parameter — the `dce` below then drops its view chain and the emulator
@@ -162,11 +169,21 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         let (Some(&m), Some(&k)) = (a_dims.first(), a_dims.get(1)) else {
             continue;
         };
-        let Some(&n) = w_dims.first() else { continue };
-        // Already tiled (a K-blocked A tile) ⇒ not ours.
-        if w_dims.get(1) != Some(&k) {
-            continue;
-        }
+        // ⭐ THE W TILE'S FRAMING DECIDES THE ORIENTATION — and at `k == n` the shapes
+        // cannot tell the two apart, so BOTH readings are admitted and the rewrite
+        // preserves whichever it found (a mismatched rewrite would silently contract
+        // the other way round, which no extent guard catches on a square weight).
+        //   * `[n, k]` (transpose-B): the builder's own spelling — `w_dims == [n, k]`.
+        //   * `[k, n]` (plain-B): the Triton ladder's canonical single-dot kernel —
+        //     `w_dims == [k, n]` with `n != k`.
+        // A square tile `[k, k]` is BOTH framings and either reading contracts the
+        // same bytes; anything else is a K-blocked (already-tiled) A tile or a foreign
+        // form — not ours, left alone.
+        let (n, plain_b) = match (w_dims.first(), w_dims.get(1)) {
+            (Some(&d0), Some(&d1)) if d1 == k => (d0, false),
+            (Some(&d0), Some(&d1)) if d0 == k => (d1, true),
+            _ => continue,
+        };
         let elem = op.result_type.and_then(|t| t.elem()).unwrap_or(DType::F16);
         out.push(Untiled {
             at: i,
@@ -175,6 +192,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             w_view,
             out_view,
             a_row,
+            plain_b,
             init,
             m,
             n,
@@ -293,39 +311,62 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             la.result_type = Some(tensor(vec![1, kb]));
             body.push(la);
 
-            // B tile = the contiguous row-block `[n_off ..+bw, kv ..+kb]` of `[n, k]`.
+            // B tile = the contiguous row-block of the weight, WINDOWED IN THE ORIENTATION
+            // THE PROGRAM STATED:
+            //   * transpose-B (`[n, k]` view): `[n_off ..+bw, kv ..+kb]`, tile `[bw, kb]`.
+            //   * plain-B (`[k, n]` view, the Triton ladder's canonical single-dot kernel):
+            //     `[kv ..+kb, n_off ..+bw]`, tile `[kb, bw]` — the same bytes, the other axis
+            //     order, contracted where they lie.
             let (w_acc, w_val) = (g.mint(), g.mint());
+            let (wt_dims, wt_corner) = if p.plain_b {
+                (vec![kb, bw], vec![kv, noff])
+            } else {
+                (vec![bw, kb], vec![noff, kv])
+            };
             let mut tw = Operation::new(
                 a,
                 Some(w_acc),
                 OpKind::KtdpConstructAccessTile,
-                &[p.w_view, noff, kv],
+                &[p.w_view, wt_corner[0], wt_corner[1]],
             )
-            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![bw, kb])));
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(wt_dims.clone())));
             tw.result_type = Some(IrType::AccessTile {
-                dims: a.ints(vec![bw, kb]),
+                dims: a.ints(wt_dims.clone()),
             });
             body.push(tw);
             let mut lw = Operation::new(a, Some(w_val), OpKind::KtdpLoad, &[w_acc]).with_attr(
                 a,
                 AttrKey::Shape,
-                Attr::IntList(a.ints(vec![bw, kb])),
+                Attr::IntList(a.ints(wt_dims.clone())),
             );
-            lw.result_type = Some(tensor(vec![bw, kb]));
+            lw.result_type = Some(tensor(wt_dims));
             body.push(lw);
 
-            // ⭐ W BINDS VERBATIM as its on-disk `[out, in]` = `[n, k]` buffer: the matmul reads it
-            // with transpose-B `indexing_maps` (B's map ends in the reduction dim), so there is no
-            // transpose and no strided gather.
-            let part = g.mint();
-            let maps: Vec<AffineMap<'a>> = [[0i64, 2], [1, 2], [0, 1]]
-                .iter()
-                .map(|mm| AffineMap {
-                    num_dims: 3,
-                    num_syms: 0,
-                    exprs: a.exprs(mm.iter().map(|d| AffineExpr::Dim(*d as usize)).collect()),
-                })
-                .collect();
+            // ⭐ THE MAPS SAY WHICH AXIS OF W IS k, AND THEY MATCH THE ORIENTATION FOUND:
+            //   * transpose-B `[[0,2],[1,2],[0,1]]` — W's map ends in the reduction dim,
+            //     the builder's own spelling (W binds verbatim as its on-disk `[n, k]`).
+            //   * plain-B `[[0,2],[2,1],[0,1]]` — MLIR's plain form, W as `[k, n]` read
+            //     where it lies. Stated explicitly so `matmul_b_orientation` proves it
+            //     rather than reading a missing attribute as the default.
+            let (part, maps): (Ssa, Vec<AffineMap<'a>>) = {
+                let part = g.mint();
+                let table: &[&[i64]] = if p.plain_b {
+                    &[&[0, 2], &[2, 1], &[0, 1]]
+                } else {
+                    &[&[0, 2], &[1, 2], &[0, 1]]
+                };
+                let maps = table
+                    .iter()
+                    .map(|mm| AffineMap {
+                        num_dims: 3,
+                        num_syms: 0,
+                        exprs: a.exprs(
+                            mm.iter().map(|d| AffineExpr::Dim(*d as usize)).collect(),
+                        ),
+                    })
+                    .collect();
+                (part, maps)
+            };
             let mut mmop =
                 Operation::new(a, Some(part), OpKind::LinalgMatmul, &[a_val, w_val, cinit])
                     .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(acc_dims.clone())))
