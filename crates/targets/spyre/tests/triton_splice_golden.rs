@@ -133,3 +133,97 @@ fn rmsnorm_ir(m: u32, c: u32) -> SubtileIR {
         op_output: Vec::new(),
     }
 }
+
+/// The silu-mul shapes that matter for the delivery scope: granite's d_ff (2b: 0, 8b:
+/// 12800) at decode rows and a prefill rung's width. (M, N).
+const SILUMUL_SHAPES: &[(u32, u32)] = &[(1, 4096), (1, 12800), (31, 4096), (64, 12800)];
+
+#[test]
+fn spliced_silumul_is_byte_identical_to_the_builder() {
+    for &(m, c) in SILUMUL_SHAPES {
+        let ir = silumul_ir(m, c);
+        let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+
+        // 1. The builder path — the control.
+        let (builder_ops, layout) =
+            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
+                .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
+        let [builder] = &builder_ops[..] else {
+            panic!("one silumul node lowers to one op, got {}", builder_ops.len())
+        };
+        let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+
+        // 2. The splice — the row compiles the kernel for this node.
+        let node = &ir.nodes[0];
+        let spliced = scratchy_triton_splice::lower(node, &ir)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"))
+            .expect("registry has a row for SiluMul");
+
+        // ⛔ THE NAME LAW IS PART OF THE GATE — `silumul_s{id}` on both paths.
+        assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} c={c})");
+
+        // 3. Both programs go through the SAME door under the SAME layout.
+        let mut sym = 0i64;
+        let mut quantized = HashSet::new();
+        let builder_emitted = door_lower(
+            builder_ktir,
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
+        let mut sym = 0i64;
+        let spliced_emitted = door_lower(
+            spliced.ktir.as_ref().expect("spliced op carries its program"),
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} c={c}): {}", e.message));
+
+        assert_eq!(
+            builder_emitted.len(),
+            spliced_emitted.len(),
+            "op count (m={m} c={c})"
+        );
+        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+            let bj = serde_json::to_string(b.dsc()).unwrap();
+            let sj = serde_json::to_string(s.dsc()).unwrap();
+            assert_eq!(
+                bj, sj,
+                "descriptor bytes (m={m} c={c}): builder vs splice diverged"
+            );
+            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} c={c})");
+        }
+    }
+}
+
+/// `silu(gate) * up -> out` as a one-node [`SubtileIR`]. t0 = gate source, t1 = up
+/// source, t2 = result. Both operands are activations, but the builder path is
+/// shape-driven and does not read the distinction, so the fixture pins both as sources.
+fn silumul_ir(m: u32, c: u32) -> SubtileIR {
+    let tensors = vec![
+        TensorShape { rows: m, cols: c },
+        TensorShape { rows: m, cols: c },
+        TensorShape { rows: m, cols: c },
+    ];
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::SiluMul,
+        inputs: vec![whole(0), whole(1)],
+        output: whole(2),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 2,
+        nodes: vec![node],
+        result: TensorId::from_index(2),
+        op_output: Vec::new(),
+    }
+}
