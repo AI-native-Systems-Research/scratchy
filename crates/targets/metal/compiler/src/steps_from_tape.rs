@@ -1300,7 +1300,7 @@ impl Recording<'_> {
             L::Elementwise(E::Gelu) => unary(&S::Gelu)?,
             L::Elementwise(E::QuickGelu) => unary(&S::QuickGelu)?,
             L::Elementwise(E::GeluErf) => unary(&S::GeluErf)?,
-            L::TanhSoftCap => unary(&S::TanhSoftCap)?,
+            L::TanhSoftCap { .. } => unary(&S::TanhSoftCap)?,
             L::RmsNorm { gain, .. } => self.norm(i, gain)?,
             L::MatmulTile { .. } => {
                 let sampled = self
