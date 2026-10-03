@@ -645,6 +645,124 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
     );
 }
 
+/// The rope row's EXECUTION gate — same calibration as the matmul one above: the REAL
+/// spliced program through the production session entry, against a host reference over
+/// the SAME worker-staged bytes. ⛔ THE ORIENTATION LAW, AND ROPE HAS TWO OF THEM: the
+/// golden cannot catch a wrong-but-legal binding, so this test stages cos/sin the way
+/// `spyre_forward.rs`'s `tile` does (per-position `rope_cos_sin` rows replicated across
+/// heads, token-major `[mq*heads, hd]`), and a kernel that read the head-major nest or
+/// a position-indexed table would come out with wrong numbers here, not at the golden.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn spliced_rope_executes_the_real_program() {
+    // DECODE (mq=1, the shape every chat token runs, hd 64 = 2b's q plane) and a
+    // PREFILL rung (mq=31, hd 128 = 8b's slab form) — both with heads > 1, because a
+    // head-count of 1 cannot discriminate the token-major nest from the head-major one.
+    for (mq, heads, hd) in [(1u32, 32u32, 64u32), (31u32, 8u32, 128u32)] {
+        execute_one_spliced_rope(mq, heads, hd);
+    }
+}
+
+/// One spliced rope program through the production session entry, checked against a
+/// host NeoX reference over the worker-staged bytes.
+fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
+    use std::borrow::Cow;
+
+    let ir = rope_ir(mq, heads, hd);
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"))
+        .expect("registry has a row for rope");
+    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+
+    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+        .func
+        .arguments
+        .iter()
+        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .collect();
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: Cow::Borrowed(&[]),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
+
+    // The host data, staged EXACTLY as the worker stages it: x token-major
+    // `[mq*heads, hd]` (row = position*heads + head), and cos/sin as `spyre_forward`'s
+    // `tile` builds them — `rope_cos_sin(pos, hd, theta)` rows replicated across the
+    // heads of each position (granite's theta 1e7). The f32 reference is NeoX
+    // `x*cos + rotate_half(x)*sin` over the same bytes.
+    let tall = (mq * heads) as usize;
+    let half = (hd / 2) as usize;
+    let theta = 1e7f32;
+    let x: Vec<f32> = (0..tall * hd as usize)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
+    let table = |which: usize| -> Vec<f32> {
+        let mut buf = vec![0.0f32; tall * hd as usize];
+        for p in 0..mq as usize {
+            // `rope_cos_sin`'s own row: full-width, both halves equal.
+            let mut row = vec![0.0f32; hd as usize];
+            for i in 0..half {
+                let inv_freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+                let ang = p as f32 * inv_freq;
+                let (s, c) = ang.sin_cos();
+                row[i] = if which == 0 { c } else { s };
+                row[i + half] = if which == 0 { c } else { s };
+            }
+            for h in 0..heads as usize {
+                let off = (p * heads as usize + h) * hd as usize;
+                buf[off..off + hd as usize].copy_from_slice(&row);
+            }
+        }
+        buf
+    };
+    let cos = table(0);
+    let sin = table(1);
+    let mut want = vec![0.0f32; tall * hd as usize];
+    for r in 0..tall {
+        for i in 0..half {
+            let (x1, x2) = (x[r * hd as usize + i], x[r * hd as usize + i + half]);
+            let (c, s) = (cos[r * hd as usize + i], sin[r * hd as usize + i]);
+            want[r * hd as usize + i] = x1 * c - x2 * s;
+            want[r * hd as usize + i + half] = x2 * c + x1 * s;
+        }
+    }
+
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+    )
+    .expect("build the one-program session");
+    let out = session
+        .run_step(
+            0,
+            vec![
+                (0, x, vec![tall, hd as usize]),
+                (1, cos, vec![tall, hd as usize]),
+                (2, sin, vec![tall, hd as usize]),
+            ],
+            &[(3, 0)],
+        )
+        .unwrap_or_else(|_| panic!("run the spliced rope program (mq={mq} heads={heads} hd={hd})"));
+    let got = &out[&3];
+    assert_eq!(got.len(), tall * hd as usize, "mq={mq} heads={heads} hd={hd}");
+    let mut max_abs = 0.0f32;
+    for (g, w) in got.iter().zip(&want) {
+        max_abs = max_abs.max((g - w).abs());
+    }
+    assert!(
+        max_abs < 0.05,
+        "the REAL spliced rope program diverged from the host reference (mq={mq} \
+         heads={heads} hd={hd}): max abs err {max_abs}"
+    );
+}
+
 /// `hidden[m, k] @ W[k, n] -> out[m, n]` as a one-node [`SubtileIR`], dense weights —
 /// the same fixture shape `superdsc_time_tile.rs`'s `single_matmul_ir` mints.
 fn matmul_ir(m: u32, k: u32, n: u32) -> SubtileIR {
@@ -671,6 +789,171 @@ fn matmul_ir(m: u32, k: u32, n: u32) -> SubtileIR {
         num_sources: 2,
         nodes: vec![node],
         result: TensorId::from_index(2),
+        op_output: Vec::new(),
+    }
+}
+
+/// The rope shapes that matter for the delivery scope: granite 2b (hd 64, the
+/// collapsed head-major form — 32 q-heads decode, 8 kv-heads decode) and 8b (hd 128,
+/// the slab form), at decode mq=1 and a prefill rung mq=31. (MQ, HEADS, HD).
+const ROPE_SHAPES: &[(u32, u32, u32)] = &[
+    (1, 32, 64),   // 2b decode, the q plane
+    (1, 8, 64),    // 2b decode, the kv plane
+    (31, 32, 64),  // 2b prefill rung
+    (1, 32, 128),  // 8b decode, the q plane
+    (1, 8, 128),   // 8b decode, the kv plane
+    (31, 32, 128), // 8b prefill rung (the slab form)
+];
+
+#[test]
+fn spliced_rope_is_byte_identical_to_the_builder() {
+    for &(mq, heads, hd) in ROPE_SHAPES {
+        for rows_are_requests in [false, true] {
+            let ir = rope_ir(mq, heads, hd);
+            let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
+
+            // 1. The builder path — the control.
+            let (builder_ops, layout) = lower_graph_to_ktir(
+                &ir,
+                &weight_ids,
+                ActiveCap::FULL,
+                rows_are_requests,
+            )
+            .unwrap_or_else(|e| {
+                panic!("builder lowered mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
+            });
+            let [builder] = &builder_ops[..] else {
+                panic!(
+                    "one rope node lowers to one op, got {}",
+                    builder_ops.len()
+                )
+            };
+            let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+
+            // 2. The splice — the row compiles the kernel for this node. The splice has
+            // no rope-specific fallthrough (the builder's own `total % hd` refusal is
+            // mirrored as an Err, not a fallthrough), so a `None` here is a missing row.
+            let node = &ir.nodes[0];
+            let spliced = scratchy_triton_splice::lower(node, &ir, rows_are_requests)
+                .unwrap_or_else(|e| {
+                    panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}")
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "mq={mq} heads={heads} hd={hd}: the splice fell through but rope has a \
+                         registry row — the row is missing or a guard is wrong"
+                    )
+                });
+
+            // ⛔ THE NAME LAW IS PART OF THE GATE — `rope_s{id}` on both paths.
+            assert_eq!(
+                spliced.op_name, builder.op_name,
+                "op_name (mq={mq} heads={heads} hd={hd})"
+            );
+
+            // 3. Both programs go through the SAME door under the SAME layout. Rope's
+            // door arm reads `rows_are_requests` off `BundleAttnParams`, so the bundle
+            // fact is stated here exactly as the tape walk states it (a geometry from
+            // the same config the model declares — 32/8 at the node's head dim).
+            let geom = ktir_superdsc::head_counts::ModelAttnGeometry::mint(
+                ktir_superdsc::head_counts::QueryHeads::new(32),
+                ktir_superdsc::head_counts::KvHeads::new(8),
+                ktir_superdsc::head_counts::HeadDim::new(hd),
+            )
+            .expect("granite's 32/8 geometry mints");
+            let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
+                geom,
+                rows_are_requests,
+            };
+            let mut sym = 0i64;
+            let mut quantized = HashSet::new();
+            let builder_emitted = door_lower(
+                builder_ktir,
+                &mut sym,
+                Some(&layout),
+                &mut quantized,
+                Some(attn_params),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "builder program lowered (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}): {}",
+                    e.message
+                )
+            });
+            let mut sym = 0i64;
+            let spliced_emitted = door_lower(
+                spliced.ktir.as_ref().expect("spliced op carries its program"),
+                &mut sym,
+                Some(&layout),
+                &mut quantized,
+                Some(attn_params),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "spliced program lowered (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}): {}",
+                    e.message
+                )
+            });
+
+            assert_eq!(
+                builder_emitted.len(),
+                spliced_emitted.len(),
+                "op count (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests})"
+            );
+            for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+                let bj = serde_json::to_string(b.dsc()).unwrap();
+                let sj = serde_json::to_string(s.dsc()).unwrap();
+                assert_eq!(
+                    bj, sj,
+                    "descriptor bytes (mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}): \
+                     builder vs splice diverged"
+                );
+                assert_eq!(
+                    b.op_name, s.op_name,
+                    "emitted op_name (mq={mq} heads={heads} hd={hd})"
+                );
+            }
+        }
+    }
+}
+
+/// One rope node as a one-node [`SubtileIR`]: `rotate(x, cos, sin) -> out` over
+/// `[mq, heads*hd]`. The x/cos/sin/out tensors carry the WORKER's staging — x/out as
+/// `[mq*heads, hd]` tall views of the `[mq, heads*hd]` plane (same bytes, the
+/// arrangement `addr_eq` admits), cos/sin as the worker's head-tiled
+/// `[mq*heads, hd]` tables (`spyre_forward.rs`'s `tile` over `rope_cos_sin` rows) —
+/// because that is the binding the spliced kernel and the builder's program both
+/// address. The node kind is `RopeRotate` (the pure rotation); `RopeAppend`'s extra
+/// inputs are cache destinations that flow through graph edges, and the splice covers
+/// both kinds with the same row.
+fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
+    let tall = mq * heads;
+    // t0 = x source (staged [mq*heads, hd], i.e. the [mq, heads*hd] plane reshaped),
+    // t1 = cos source (head-tiled [mq*heads, hd]), t2 = sin, t3 = result.
+    let tensors = vec![
+        TensorShape { rows: tall, cols: hd },
+        TensorShape { rows: tall, cols: hd },
+        TensorShape { rows: tall, cols: hd },
+        TensorShape { rows: tall, cols: hd },
+    ];
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::RopeRotate {
+            head_dim: ktir_superdsc::head_counts::HeadDim::new(hd),
+            _form: std::marker::PhantomData,
+        },
+        inputs: vec![whole(0), whole(1), whole(2)],
+        output: whole(3),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 3,
+        nodes: vec![node],
+        result: TensorId::from_index(3),
         op_output: Vec::new(),
     }
 }
