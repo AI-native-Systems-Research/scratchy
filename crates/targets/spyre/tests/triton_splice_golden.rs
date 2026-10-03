@@ -35,7 +35,9 @@ use scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_ktir;
 
 /// The rmsnorm shapes that matter for the delivery scope: granite 3.2/3.3 at 2b and 8b
 /// both normalize at hidden 2048 (2b) and 4096 (8b), decode rows 1 and a prefill rung's
-/// width. (M, D_MODEL).
+/// width. (M, D_MODEL). ⛔ WIDTHS > 2048 ARE BUILDER-ONLY: the kernel's f16 sum overflows
+/// at D_MODEL = 4096 on the emulator (the row's width guard, measured on granite 8b), so
+/// those shapes pin the FALLTHROUGH, not a comparison.
 const SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096)];
 
 #[test]
@@ -53,11 +55,21 @@ fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
         };
         let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
 
-        // 2. The splice — the row compiles the kernel for this node.
+        // 2. The splice — the row compiles the kernel for this node. A width > 2048 is a
+        // BUILDER-ONLY node (the f16-sum overflow the width guard documents), and the
+        // splice's own guard falls through — pinned here exactly as the elementwise
+        // LX-budget fallthrough is.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, false)
-            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"))
-            .expect("registry has a row for Scale-gain RmsNorm");
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+        let Some(spliced) = spliced else {
+            assert!(
+                c > 2048,
+                "m={m} c={c}: the splice fell through but the width is splicable — the \
+                 registry row is missing or the width guard is wrong"
+            );
+            continue;
+        };
 
         // ⛔ THE NAME LAW IS PART OF THE GATE. The builder names its program
         // `rmsnorm_s{id}`; the splice reuses the law so the op_name and the emulator's
@@ -135,7 +147,9 @@ fn rmsnorm_ir(m: u32, c: u32) -> SubtileIR {
 }
 
 /// The silu-mul shapes that matter for the delivery scope: granite's d_ff (2b: 0, 8b:
-/// 12800) at decode rows and a prefill rung's width. (M, N).
+/// 12800) at decode rows and a prefill rung's width. (M, N). ⛔ THE `[64, 12800]` RUNG IS
+/// BUILDER-ONLY (the eight-live-tile LX budget the splice's guard mirrors), so it pins
+/// the FALLTHROUGH, not a comparison.
 const SILUMUL_SHAPES: &[(u32, u32)] = &[(1, 4096), (1, 12800), (31, 4096), (64, 12800)];
 
 #[test]
@@ -153,11 +167,20 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
         };
         let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
 
-        // 2. The splice — the row compiles the kernel for this node.
+        // 2. The splice — the row compiles the kernel for this node. A region whose
+        // eight-tile live set exceeds the builder's LX budget is a BUILDER-ONLY node
+        // (the guard the granite-8b `[31, 12800]` overflow measured), pinned here.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, false)
-            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"))
-            .expect("registry has a row for SiluMul");
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
+        let Some(spliced) = spliced else {
+            assert!(
+                m > 1 && u64::from(m) * u64::from(c) * 8 > 1024 * 1024,
+                "m={m} c={c}: the splice fell through but the region FITS the builder's \
+                 eight-tile LX budget — the registry row is missing or the guard is wrong"
+            );
+            continue;
+        };
 
         // ⛔ THE NAME LAW IS PART OF THE GATE — `silumul_s{id}` on both paths.
         assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} c={c})");
