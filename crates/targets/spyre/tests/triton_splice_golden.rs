@@ -763,6 +763,29 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     );
 }
 
+/// ⛔ THE BATCHED-DECODE LM-HEAD PIN. A result-width matmul with an ODD vocab at
+/// `rows > 1` under `rows_are_requests` — granite's batched-decode lm_head
+/// (vocab 49155) — must FALL THROUGH, not refuse: the first cut of the splice's
+/// odd-vocab guard tested `rows == 1` only, so this shape slipped past BOTH
+/// lm-head fallthroughs into `compile_kernel`, whose `PlanCorelets` parity refusal
+/// turned the guard's `Ok(None)` design into a loud `Err` bake failure. The guard
+/// is parity-based, not row-count-based; this pins that.
+#[test]
+fn batched_decode_odd_vocab_lm_head_falls_through() {
+    // rows > 1 AND rows_are_requests (so the prefill-fold guard does not take it)
+    // AND odd result-width cols — the exact conjunction that used to escape.
+    let (m, k, n) = (8u32, 2048u32, 49155u32);
+    let ir = matmul_ir(m, k, n);
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, true)
+        .expect("the odd-vocab fallthrough is an Ok(None), never an Err");
+    assert!(
+        spliced.is_none(),
+        "odd vocab must fall through at ANY row count — the ladder's PlanCorelets \
+         refuses odd N, and a refusal here would fail the bake loudly"
+    );
+}
+
 /// `hidden[m, k] @ W[k, n] -> out[m, n]` as a one-node [`SubtileIR`], dense weights —
 /// the same fixture shape `superdsc_time_tile.rs`'s `single_matmul_ir` mints.
 fn matmul_ir(m: u32, k: u32, n: u32) -> SubtileIR {
