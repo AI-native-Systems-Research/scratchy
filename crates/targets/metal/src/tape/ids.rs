@@ -271,6 +271,8 @@ u32_newtype!(
     /// Rows a per-row op runs per token (a per-head norm's head count; 1 on the
     /// residual stream).
     RowsPerToken,
+    /// Elements an elementwise kernel's buffer holds: its threads past it write nothing.
+    ElementCount,
     /// A reshape's row divisor (`num_tokens / d` rows — the vision merger's factor).
     RowsDivisor,
     /// Iterations of a rolled loop.
