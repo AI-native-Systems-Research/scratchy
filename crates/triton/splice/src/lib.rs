@@ -173,6 +173,25 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     let Some(row) = registry(&node.op) else {
         return Ok(None);
     };
+    // ⛔ AN RMSNORM WIDER THAN 2048 IS NOT A SPLICE TARGET — THE EMULATOR'S OWN
+    // PRECISION, MEASURED. Post-`LegalizeTypes` the kernel sums D_MODEL f16 squares in
+    // f16 (the builder's hand-written program kept an f32 reduce because an emulator
+    // immediate is free), and the kernel's own provenance note records the headroom:
+    // at D_MODEL = 4096 an RMS above ~4 overflows the f16 accumulator. MEASURED on
+    // granite 3.2 8b (hidden 4096) on the emulator: 2b (hidden 2048) answers Paris,
+    // 8b emits fluent garbage from the first prefill token — the sum saturates, the
+    // rsqrt yields 0, every normalised row zeroes. The CARD is unaffected (it runs the
+    // descriptors, whose EXX2_ZEROMEAN reduce is the device's own precision), but this
+    // splice's consumers include the emulator, so the row is width-guarded: the ladder
+    // kernel keeps its card-validated body VERBATIM (a widening island would break the
+    // byte-identity golden's control) and wide models keep the builder's f32 reduce
+    // until the kernel lands an f32-sum revision WITH its own card validation.
+    if let SubOp::RmsNorm { .. } = &node.op {
+        let cols = node.output.region.cols.len;
+        if cols > 2048 {
+            return Ok(None);
+        }
+    }
     // ⛔ THE LM-HEAD IS NOT A SPLICE TARGET, for two separate reasons, both detected by
     // the builder's own vocab-width test (the lm_head matmul and the logits ScalarMul are
     // the ONLY ops whose output spans the result cols — every intermediate is hidden or
@@ -215,6 +234,21 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             _ => 3,
         };
         if u64::from(rows) * u64::from(cols) * u64::from(live) > 1024 * 1024 {
+            return Ok(None);
+        }
+    }
+    // ⛔ AND SILU-MUL IS THE SAME LAW AT EIGHT LIVE TILES. The builder's
+    // `KtirFunc::silu_mul` row-blocks a whole `[mq, intermediate]` region that does not
+    // fit (gate, up, neg, exp, the splat, denom, silu, y — EIGHT tiles, the widest live
+    // set in the model; granite 8b's `[31, 12800]` prefill silu-mul is exactly the
+    // region that overflows). MEASURED: without this guard the spliced one-tile program
+    // declares a whole-region view the emulator's allocation bounds-check refuses
+    // (`view [31, 12800] ... spans 793600 bytes but the tensor ... holds only 507904`),
+    // while the builder's blocked program runs. The splice mirrors the builder's own
+    // budget and falls through.
+    if matches!(node.op, SubOp::SiluMul) {
+        let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
+        if u64::from(rows) * u64::from(cols) * 8 > 1024 * 1024 {
             return Ok(None);
         }
     }
