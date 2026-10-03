@@ -750,6 +750,7 @@ mod tests {
             op_tiles: vec![None; n_ops],
             norm_gain_add_tiles: Default::default(),
             op_expansion: vec![None; n_ops],
+            unnamed_reads: Vec::new(),
         }
     }
 
