@@ -3535,6 +3535,8 @@ pub(crate) mod tests {
                 op: SubOp::RopeAppend {
                     head_dim: HeadDim::new(hd_of(layer)),
                     layer,
+                    attn: crate::subtile_ir::AttnMask::Causal,
+                    pairing: crate::subtile_ir::RopeFormTag::NeoX,
                     layout: KvCacheLayout::for_cache_tensors(
                         TensorId(9 + layer),
                         TensorId(15 + layer),

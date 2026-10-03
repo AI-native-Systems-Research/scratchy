@@ -232,7 +232,7 @@ mod tests {
         unchanged(head(2, GemmWeight::Dense));
         let mut capped = head(2, affine(256));
         let cap = OpDesc {
-            op: SubOp::TanhSoftCap,
+            op: SubOp::TanhSoftCap { cap: 30.0 },
             m: 2,
             inputs: vec![Op(1)],
         };
