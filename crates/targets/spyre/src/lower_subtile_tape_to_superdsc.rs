@@ -2426,39 +2426,16 @@ pub fn bundle_mlir(sdsc_filenames: &[String]) -> String {
     format!("module {{\n  func.func @sdsc_bundle() {{\n{body}    return\n  }}\n}}\n")
 }
 
-/// Expand one [`EmittedOp`] into its CONCRETE per-trip [`SdscOp`]s. A time=1 op
-/// yields `[op.clone()]`. A time=N op yields N copies: in trip `t`, every tiled
-/// tensor's AllocNode start addresses are bumped by `t · stride_bytes` (the
-/// `affine_strides[ti]["out"]` advance); addresses stay CONCRETE. This PRE-UNROLL
-/// replaces a symbolic `scf.for` — dxp's always-on `LoopUnroll` would otherwise
-/// clone an in-loop `sdsc_execute` with IDENTICAL `symbol_ids` and double-reserve
-/// them (DtException "Symbol already reserved", VariableDefinition.cpp:629; #53).
+/// Expand one [`EmittedOp`] into its CONCRETE per-trip [`SdscOp`]s — a thin delegate to
+/// [`EmittedOp::concrete_trips`] (the ONE implementation, on the type that owns `time` and
+/// `affine_strides`). A time=1 op yields `[op.clone()]`. A time=N op yields N copies: in trip `t`,
+/// every tiled tensor's AllocNode start addresses are bumped by `t · stride_bytes` (the
+/// `affine_strides[ti]["out"]` advance); addresses stay CONCRETE. This PRE-UNROLL replaces a
+/// symbolic `scf.for` — dxp's always-on `LoopUnroll` would otherwise clone an in-loop
+/// `sdsc_execute` with IDENTICAL `symbol_ids` and double-reserve them (DtException "Symbol
+/// already reserved", VariableDefinition.cpp:629; #53).
 pub fn concrete_trips(e: &EmittedOp) -> Vec<SdscOp> {
-    if e.time <= 1 {
-        return vec![e.dsc().clone()];
-    }
-    (0..e.time)
-        .map(|t| {
-            let mut op = e.dsc().clone();
-            for dsc_map in op.dscs_.iter_mut() {
-                for dsc in dsc_map.values_mut() {
-                    for node in dsc.scheduleTree_.iter_mut() {
-                        let ti = node.ldsIdx_ as usize;
-                        let Some(stride) = e.affine_strides.get(ti).and_then(|m| m.get("out"))
-                        else {
-                            continue; // non-tiled tensor — base address unchanged.
-                        };
-                        let bump = t as i64 * *stride;
-                        for v in node.startAddressCoreCorelet_.data_.values_mut() {
-                            let base: i64 = v.parse().unwrap_or(0);
-                            *v = (base + bump).to_string();
-                        }
-                    }
-                }
-            }
-            op
-        })
-        .collect()
+    e.concrete_trips()
 }
 
 /// The `bundle.mlir` orchestration `dxp_standalone --bundle -d <dir>` consumes:

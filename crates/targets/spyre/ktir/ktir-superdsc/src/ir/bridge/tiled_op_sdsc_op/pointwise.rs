@@ -473,13 +473,15 @@ pub fn pointwise_broadcast_opspec_from_tile(
             .all(|i| i.out_broadcast() || block_aligned(i.col_offset()));
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
 
-    if time_tile.is_some() && inputs.iter().any(|i| i.out_broadcast()) {
-        return Err(format!(
-            "pointwise_broadcast '{o_name}': a broadcast-over-`out` operand in a TIME-TILED op \
-             is not yet supported — concrete_trips would wrongly advance the broadcast operand's \
-             address per trip (silently-wrong). Refusing (build guard). [rows={rows} cols={cols}]"
-        ));
-    }
+    // ⛔ INVARIANT (was a refusal — see the exemption note in `rewrite_op_for_time_tile`): a
+    // broadcast-over-`out` operand in a TIME-TILED op must NOT advance per trip, and it
+    // now provably does not — `rewrite_op_for_time_tile` classifies a tensor as tiled only
+    // when it RANGES over the tiled dim (scale `Active`), so a RedStick/RedNonStick
+    // broadcast operand keeps the collapsed fold `build_coordinates` wrote and gets NO
+    // affine stride, which is `concrete_trips`' no-bump path (base address fixed across
+    // trips). If that classification ever regresses, the SFP-transcendental guard above
+    // and `tiled_trips_alias` (the OUTPUT-side backstop) still fire; the broadcast side
+    // is pinned by `time_tiled_broadcast_operand_is_address_stable` in `emit/mod.rs`.
 
     // Build a rank-2 stick-major (`stickmajor`) or the legacy rank-3 flat operand. rank-2 drops the
     // size-1 `y` dim + its scale so `for_view_df` classifies it RowBlocked (stick-major), matching

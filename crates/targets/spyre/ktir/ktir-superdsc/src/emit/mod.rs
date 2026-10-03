@@ -470,10 +470,10 @@ impl<'a> EwOperand<'a> {
 /// PER-OPERAND broadcast (the generalization of [`pointwise_opspec`], which is the
 /// all-`full` case). Inputs may broadcast over `mb` or `out` ([`EwOperand`]); the
 /// output spans full `[mb,out,y]`. `out` is the 64-stick axis. Broadcast over the
-/// stick (`out`) is proven on-card (RedStick `alpha_=0` fold). A TILED broadcast op
-/// is REFUSED (build `Err`): a broadcast-over-`out` operand must NOT advance per
-/// trip, which `concrete_trips` does not yet special-case — better a build failure
-/// than a silently-wrong per-trip address.
+/// stick (`out`) is proven on-card (RedStick `alpha_=0` fold). A TIME-TILED op MAY
+/// carry a broadcast operand: [`rewrite_op_for_time_tile`] exempts any operand whose
+/// scale along the tiled dim is not `Active`, so its address never advances per trip
+/// (pinned by `time_tiled_broadcast_operand_is_address_stable`).
 /// fp16 wrapper (the 64-stick default): every existing caller. fp32 (the torch-spyre RMSNorm) uses
 /// [`pointwise_broadcast_opspec_df`].
 pub(crate) fn pointwise_broadcast_opspec(
@@ -1769,6 +1769,43 @@ impl EmittedOp {
             .unwrap_or_else(|| panic!("{}: a KTIR op has no SuperDSC descriptor", self.op_name))
     }
 
+    /// Expand this op into its CONCRETE per-trip [`SdscOp`]s — the ONE implementation, living with
+    /// the `time`/`affine_strides` fields it reads. A time=1 op yields `[dsc().clone()]`. A time=N
+    /// op yields N copies: in trip `t`, every tensor with an `affine_strides[ti]["out"]` entry has
+    /// its AllocNode start addresses bumped by `t · stride_bytes`; an operand with an EMPTY stride
+    /// map (an out-broadcast const, an LX tensor, a matmul's A) keeps its base — which is exactly
+    /// the address-stability a broadcast operand in a time-tiled op requires (see
+    /// [`rewrite_op_for_time_tile`]'s tiled predicate). The spyre crate's free `concrete_trips` is
+    /// a thin delegate to this, so the bundle writer and this crate's tests cannot drift apart.
+    pub fn concrete_trips(&self) -> Vec<SdscOp> {
+        if self.time <= 1 {
+            return vec![self.dsc().clone()];
+        }
+        (0..self.time)
+            .map(|t| {
+                let mut op = self.dsc().clone();
+                for dsc_map in op.dscs_.iter_mut() {
+                    for dsc in dsc_map.values_mut() {
+                        for node in dsc.scheduleTree_.iter_mut() {
+                            let ti = node.ldsIdx_ as usize;
+                            let Some(stride) =
+                                self.affine_strides.get(ti).and_then(|m| m.get("out"))
+                            else {
+                                continue; // non-tiled tensor — base address unchanged.
+                            };
+                            let bump = t as i64 * *stride;
+                            for v in node.startAddressCoreCorelet_.data_.values_mut() {
+                                let base: i64 = v.parse().unwrap_or(0);
+                                *v = (base + bump).to_string();
+                            }
+                        }
+                    }
+                }
+                op
+            })
+            .collect()
+    }
+
     /// An op that carries ONLY its program.
     ///
     /// ⛔ EVERY OTHER FIELD IS THE SuperDSC DESCRIPTOR'S. `arg_bindings`, `affine_strides`, the
@@ -2012,10 +2049,28 @@ fn rewrite_op_for_time_tile(
     // `out` coordInfo; the AllocNode stays CONCRETE (isStartAddrSymbolic_ = None).
     let _ = (cores, sym_id_base, folds); // (no longer mints symbols; kept for sig parity)
     let mut affine_strides: Vec<BTreeMap<&'static str, i64>> = vec![BTreeMap::new(); views.len()];
-    // Which tensors are tiled: HBM tensors whose layout contains `tiled_dim` (the
-    // out stick dim). INPUT (A) does NOT carry `out`, so it stays un-bumped.
+    // Which tensors are tiled: HBM tensors that RANGE over `tiled_dim` — their layout
+    // contains it AND its scale is `Active`. Two operands are thereby exempt:
+    //   • an op whose layout lacks the dim (a matmul's INPUT/A does not carry `out`);
+    //   • ⭐ a BROADCAST/REDUCED operand, collapsed along the tiled dim (`out_broadcast`
+    //     → RedStick, `mb_broadcast` → RedNonStick — the tanhsoftcap cap const, the
+    //     rmsnorm eps). Its coordInfo is ALREADY the collapsed one-stick/one-row fold
+    //     `build_coordinates` wrote, and its address must NOT advance per trip: every
+    //     trip's out-window reads the SAME broadcast value. The old predicate
+    //     (`layout.contains(tiled_dim)` alone) handed such an operand a per-trip stride
+    //     AND re-derived its collapsed coordinate as a FULL per-time fold
+    //     (`divide_out_coordinate`) — silently-wrong on both counts, which the
+    //     pointwise_broadcast builder refused outright. The exemption IS the fix: the
+    //     operand is left byte-identical to what `emit_sdsc` wrote, and `concrete_trips`
+    //     keeps its base (an empty stride map is its no-bump path).
     for (ti, v) in views.iter().enumerate() {
-        let tiled = !v.allocation.is_lx() && v.layout.contains(&tiled_dim);
+        let tiled = !v.allocation.is_lx()
+            && v.layout
+                .iter()
+                .position(|&d| d == tiled_dim)
+                .is_some_and(|si| {
+                    v.scale.get(si).is_none_or(|s| matches!(s, Scale::Active))
+                });
         if !tiled {
             continue;
         }
@@ -5546,5 +5601,137 @@ mod gather_cut {
             .is_ok(),
             "one index stick in one leg emits"
         );
+    }
+}
+
+/// ⛔⛔⛔ A BROADCAST OPERAND IN A TIME-TILED POINTWISE OP MUST BE **ADDRESS-STABLE** ACROSS TRIPS.
+///
+/// This is the class that fired on the gemma-4-12b fp8 bake (~80 min in): the prefill tanhsoftcap's
+/// `tscdiv` — `realdiv` of the vocab-wide logits `[rows=35, cols=262144]` by the `[1,1]` cap const
+/// (`In::scalar`, `out` scale `RedStick`) — overflows LX residency at full width, so the tiler picks
+/// `time > 1`, and the old refusal (`"a broadcast-over-'out' operand in a TIME-TILED op is not yet
+/// supported"`) turned the model's own softcap into a build failure.
+///
+/// The correct semantics is NOT "refuse" and NOT "advance": every trip's out-window must read the
+/// SAME broadcast value at the SAME base address. That is what `rewrite_op_for_time_tile`'s tiled
+/// predicate now guarantees — an operand is tiled only when it RANGES the tiled dim (`scale` ==
+/// `Active` there); a RedStick/RedNonStick operand is exempt, keeps the collapsed fold
+/// `build_coordinates` wrote, and gets an EMPTY affine-stride map, which is `concrete_trips`'s
+/// no-bump path (an empty map keeps the base address).
+///
+/// The properties below pin the three observable halves of that contract on the real door
+/// (`assemble_pointwise_broadcast_off`, the same one `assemble_tanhsoftcap` calls):
+///   1. the op is genuinely time-tiled (`time > 1`) and the broadcast operand survives;
+///   2. the broadcast operand has NO affine stride (the no-bump path) while some full-width operand
+///      DOES (the control — an empty stride map everywhere would make (2) vacuous);
+///   3. across the expanded concrete trips, the broadcast operand's start address is IDENTICAL in
+///      every trip while a strided operand's moves — and it actually advances (a stride of 0 would
+///      silently re-read trip 0, the #53-class bug).
+#[cfg(test)]
+mod time_tiled_broadcast_operand_is_address_stable {
+    use super::*;
+    use crate::sdsc_abstract::{BlockCols, RowCount};
+
+    /// The gemma-4 tanhsoftcap prefill geometry: vocab-wide cols (262144, many sticks) with few
+    /// rows, so `n_operands · per_core_mb · out_per_time · 2` overflows the 1,677,721-B usable LX
+    /// at `out_per_time == full` and the divisor search lands on `time > 1`.
+    const ROWS: u32 = 35;
+    const COLS: u32 = 262144;
+
+    /// The failing op itself, verbatim: `tscdiv` = realdiv(x, cap), x full, cap `[1,1]` broadcast.
+    fn tscdiv() -> EmittedOp {
+        let x = rb("tsc_x", ROWS, COLS);
+        let cap = rb("tsc_cap", 1, Fp16::ELEMS_PER_STICK);
+        let out = rb("tsc_o", ROWS, COLS);
+        assemble_pointwise_broadcast_off(
+            "tscdiv_t2326",
+            "realdiv",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+            &[In::full(&x).ew(), In::scalar(&cap).ew()],
+            &out,
+            crate::addr::DevOff::ZERO,
+            &mut 0i64,
+            None,
+        )
+    }
+
+    /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
+    fn trip_start(e: &EmittedOp, t: usize, lds: u32) -> u64 {
+        let trips = e.concrete_trips();
+        let node = trips
+            .get(t)
+            .expect("a trip per time")
+            .dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc")
+            .scheduleTree_
+            .iter()
+            .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+            .expect("an allocate node per operand");
+        node.startAddressCoreCorelet_
+            .data_
+            .values()
+            .next()
+            .expect("a per-core address")
+            .parse()
+            .expect("a decimal address")
+    }
+
+    #[test]
+    fn the_op_time_tiles_and_keeps_the_broadcast_operand() {
+        let e = tscdiv();
+        assert!(
+            e.time > 1,
+            "vocab-wide softcap must time-tile, got time={}",
+            e.time
+        );
+        assert_eq!(e.arg_bindings.len(), 3, "x, cap, out — in door order");
+        assert_eq!(
+            e.arg_bindings[1].footprint_bytes,
+            Fp16::ELEMS_PER_STICK as u64 * 2,
+            "the cap's materialized footprint is ONE stick — the broadcast survived the door"
+        );
+    }
+
+    #[test]
+    fn the_broadcast_operand_takes_no_stride_but_the_full_operand_does() {
+        let e = tscdiv();
+        assert!(
+            e.affine_strides[1].is_empty(),
+            "the cap (out-broadcast) must have NO per-trip stride — concrete_trips keeps its base"
+        );
+        assert!(
+            e.affine_strides.iter().any(|m| !m.is_empty()),
+            "control: at least one operand (x and/or out) IS tiled and carries a stride"
+        );
+    }
+
+    #[test]
+    fn across_trips_the_broadcast_address_is_fixed_and_the_full_operand_advances() {
+        let e = tscdiv();
+        // The cap (lds 1): identical address in EVERY trip.
+        let cap0 = trip_start(&e, 0, 1);
+        for t in 1..e.time as usize {
+            assert_eq!(
+                trip_start(&e, t, 1),
+                cap0,
+                "trip {t} moved the broadcast operand's address — every trip must read the same value"
+            );
+        }
+        // x (lds 0) and out (lds 2): whichever carries a stride must actually advance.
+        for lds in [0u32, 2] {
+            if e.affine_strides[lds as usize].is_empty() {
+                continue; // only the strided operand is under test here
+            }
+            let a0 = trip_start(&e, 0, lds);
+            let a1 = trip_start(&e, 1, lds);
+            assert!(
+                a1 > a0,
+                "strided operand {lds} did not advance between trips 0→1 ({a0:#x} → {a1:#x}) — \
+                 a zero stride would re-read trip 0's window"
+            );
+        }
     }
 }
