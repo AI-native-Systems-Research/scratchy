@@ -934,6 +934,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         K::Gemm
         | K::AffineQmvQuad
         | K::AffineQmvFast
+        | K::AffineQmvWide
         | K::AffineQmv
         | K::AffineQmmT
         | K::AffineGatherQmmT

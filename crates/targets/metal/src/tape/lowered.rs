@@ -163,6 +163,12 @@ pub enum KernelId {
     /// Maps to `affine_qmv_<dtype>_gs_<gs>_b_4_batch_<batched>`.
     /// Faithful port of MLX's `affine_qmv` (`quantized.h:1548`).
     AffineQmv,
+    /// MLX-affine int4 small-M band matvec (`2 ≤ M < vector_limit`):
+    /// each weight group dequantized once, reused across the
+    /// threadgroup's `nv` input vectors. Maps to
+    /// `affine_qmv_wide_<dtype>_gs_<gs>_b_4_nv_<nv>_kl_8_batch_0`.
+    /// Faithful port of MLX's `affine_qmv_wide` (`quantized.h:1723`).
+    AffineQmvWide,
     /// MLX-affine int4 prefill matmul, transpose=true. Maps to
     /// `affine_qmm_t_<dtype>_gs_<gs>_b_4_alN_<bool>_batch_0` in
     /// `quantized_qmm.metallib`. Faithful port of MLX's
@@ -508,6 +514,7 @@ impl KernelId {
             | Self::AffineQmvQuad
             | Self::AffineQmvFast
             | Self::AffineQmv
+            | Self::AffineQmvWide
             | Self::AffineQmmT
             | Self::AffineGatherQmmT
             | Self::AffineGatherQmmTNax

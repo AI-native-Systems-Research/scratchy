@@ -679,6 +679,28 @@ impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::AffineQmvWide` — the small-M band matvec. Same K/N
+/// slots as the other qmv kernels plus the bucket's M at slot 7
+/// (`QMV_WIDE_M`), baked like K/N.
+pub struct AffineQmvWideConstants {
+    pub k: KDimI32,
+    pub n: NDimI32,
+    pub m: MDimI32,
+    pub codes: AffineCodes,
+}
+
+impl From<AffineQmvWideConstants> for Vec<ConstantValue> {
+    fn from(c: AffineQmvWideConstants) -> Self {
+        let mut v = vec![
+            ConstantValue::int(ConstSlot(0), c.k.get()),
+            ConstantValue::int(ConstSlot(1), c.n.get()),
+            ConstantValue::int(ConstSlot(7), c.m.get()),
+        ];
+        v.extend(c.codes.constant());
+        v
+    }
+}
+
 // ── MoE routing ───────────────────────────────────────────────────
 
 /// `KernelId::Softmax` (`block_softmax_precise_<T>`, `topk_renorm_<T>`, `softmax.metal`): the
