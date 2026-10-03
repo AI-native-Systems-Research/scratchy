@@ -359,8 +359,22 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     // A and B must be DIRECT descriptor loads: no prologue or reshape on the
     // operands. This is the guard the swiglu fixture's docstring quotes -- the
     // tutorial's pointer-arithmetic load form is refused right here.
+    //
+    // ⭐ B's ONE permitted wrapper is a `tt.trans` DIRECTLY over the load -- the
+    // `.T` form, which `dot_to_linalg` folds into the transpose-B `indexing_maps`
+    // (B's region `[n, k]`, the bytes as a presented weight binds them). The
+    // canonical form is then the transposed mirror of the plain one, checked with
+    // the same discipline below: B's descriptor is `[n, k]` blocking `[bn, bk]`
+    // and its load offset is `[pid, k]` (an n ROW selected by pid, k in place).
+    // Anything else between the load and the dot -- a reshape, a second trans, a
+    // gather -- is refused here exactly as before.
+    let b_trans = module.def_of(b).filter(|o| o.kind == OpKind::TtTrans);
+    let b_load_val = match b_trans {
+        Some(t) => t.operands.first().copied(),
+        None => Some(b),
+    };
     let a_ld = module.def_of(a).filter(|o| o.kind == OpKind::TtDescriptorLoad);
-    let b_ld = module.def_of(b).filter(|o| o.kind == OpKind::TtDescriptorLoad);
+    let b_ld = b_load_val.and_then(|v| module.def_of(v).filter(|o| o.kind == OpKind::TtDescriptorLoad));
     let (Some(a_ld), Some(b_ld)) = (a_ld, b_ld) else {
         return Err(refuse("A and B must be direct tt.descriptor_load results"));
     };
@@ -374,8 +388,24 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     let b_desc = descriptor_of(module, b_ld)?;
     let (m, k) = desc_shape2(module, a_desc)
         .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
-    let (_bk_full, ns) = desc_shape2(module, b_desc)
-        .ok_or_else(|| refuse("A/B descriptor M/N/K are not compile-time constants"))?;
+    // B's descriptor extents, framed by the orientation: plain B is `[k, ns]`, a `.T`
+    // B is the presented weight's own `[ns, k]` (the fold in `run` states the
+    // transpose-B maps over exactly this view). The axis that equals A's k names the
+    // reduction dim; the other one is n. (A square `[k, k]` satisfies both readings
+    // and gives the same `ns` either way.)
+    let ns = match desc_shape2(module, b_desc) {
+        Some((d0, d1)) if d0 == k => d1,
+        Some((d0, d1)) if d1 == k => d0,
+        Some((d0, d1)) => {
+            return Err(refuse(format!(
+                "B's descriptor [{d0},{d1}] contracts no axis of A's K={k} -- the \
+                 weight extents do not state a matmul"
+            )));
+        }
+        None => {
+            return Err(refuse("A/B descriptor M/N/K are not compile-time constants"));
+        }
+    };
 
     // Single-program tile: the emitter emits ONE M x N program and DISCARDS the
     // block size, so a multi-block tiling would be silently collapsed.
@@ -411,6 +441,8 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
                 | OpKind::ScfYield
                 | OpKind::ArithConstant
                 | OpKind::ArithIndexCast
+                // The `.T` form's ONE wrapper (the trans the fold consumes).
+                | OpKind::TtTrans
         );
         if !structural {
             return Err(refuse(
@@ -439,9 +471,15 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     }
     let pid = pid_op.result().ok_or_else(|| refuse("program id defines no value"))?;
 
-    // Descriptor shapes/strides/blocks: contiguous row-major, canonical layout.
+    // Descriptor shapes/strides/blocks: contiguous row-major, canonical layout. B is
+    // framed by the orientation: plain `[k, ns]` blocking `[bk, bn]`, or the `.T`
+    // form's presented `[ns, k]` blocking `[bn, bk]`.
     check_desc(module, a_desc, "A", m, k, bm, bk)?;
-    check_desc(module, b_desc, "B", k, ns, bk, bn)?;
+    if b_trans.is_some() {
+        check_desc(module, b_desc, "B", ns, k, bn, bk)?;
+    } else {
+        check_desc(module, b_desc, "B", k, ns, bk, bn)?;
+    }
     let store = all
         .iter()
         .find(|o| o.kind == OpKind::TtDescriptorStore)
@@ -541,7 +579,14 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     if a_idx.len() != 2 || a_idx[0] != pid || !is_k_idx(a_idx[1]) {
         return Err(refuse("A load offset is not the canonical [pid, k]"));
     }
-    if b_idx.len() != 2 || !is_k_idx(b_idx[0]) || b_idx[1] != pid {
+    // B's offset, framed by the orientation: plain B reads `[k, pid]` out of its
+    // `[k, n]` region; the `.T` form loads its `[n, k]` slice at `[pid, k]` (an n ROW
+    // selected by pid, k in place) and the trans produces the `[bk, bn]` operand.
+    if b_trans.is_some() {
+        if b_idx.len() != 2 || b_idx[0] != pid || !is_k_idx(b_idx[1]) {
+            return Err(refuse("B load offset is not the canonical transposed [pid, k]"));
+        }
+    } else if b_idx.len() != 2 || !is_k_idx(b_idx[0]) || b_idx[1] != pid {
         return Err(refuse("B load offset is not the canonical [k, pid]"));
     }
     // The store's operands are [desc, indices..., src]; drop the trailing src.

@@ -33,8 +33,8 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
-    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at, scalarmul,
-    silumul, split_out,
+    Error, Region, attn_at, elementwise, err, lmlast, matmul_proven, regions, rmsnorm, rope_at,
+    scalarmul, silumul, split_out,
 };
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
@@ -113,7 +113,7 @@ pub fn lower(
         Program::SiluMul => silumul(name, &r, sym_id_base, layout),
         Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
         Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),
-        Program::Matmul => matmul(name, &r, sym_id_base, layout, quantized),
+        Program::Matmul => matmul_proven(k, &r, sym_id_base, layout, quantized),
         Program::LmLast => lmlast(name, k, &r, sym_id_base, layout),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         Program::Attn => attn(name, k, &r, sym_id_base, layout, attn_params),
