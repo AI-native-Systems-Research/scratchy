@@ -170,7 +170,9 @@ pub fn qmv_kernel_name(
             format!("affine_qmv_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
         }
         QmvKernel::Wide { nv } => {
-            format!("affine_qmv_wide_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_nv_{nv}_kl_8_batch_{batch}",)
+            format!(
+                "affine_qmv_wide_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_nv_{nv}_kl_8_batch_{batch}",
+            )
         }
     }
 }
