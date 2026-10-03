@@ -1019,6 +1019,24 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     let is_prefill_lm_head_tail = node.output.region.cols.len == result_cols
         && node.output.region.rows.len > 1
         && !rows_are_requests;
+    // ── THE TRITON SPLICE, CONSULTED FIRST ── a registered op kind compiles its
+    // Triton kernel (`crates/targets/spyre/kernels/`) at expansion time and hands
+    // back the same `EmittedOp` the builder arm in the match below produces.
+    // `Ok(None)` = no registry row, and the fallthrough to the builder is the migration
+    // mechanism itself: a row lands WITH its byte-identity golden
+    // (`tests/triton_splice_golden.rs`), the builder arm is deleted only when every
+    // shape in scope passes, and until then both paths coexist. A row that FAILS to
+    // compile or lower is an `Unhandled` (a loud bake error), never a silent
+    // fallthrough — a registry row that quietly stops working would make the
+    // registry a lie.
+    #[cfg(feature = "spyre-triton")]
+    {
+        match scratchy_triton_splice::lower(node, ir) {
+            Ok(Some(e)) => return Ops(vec![e]),
+            Ok(None) => {}
+            Err(reason) => return Unhandled(format!("triton splice refused: {reason}")),
+        }
+    }
     match &node.op {
         // The rest of the arch vocabulary. It reaches this emitter because the SHARED
         // front end expresses every op instead of asserting the unsupported ones away

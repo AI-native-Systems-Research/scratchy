@@ -3954,9 +3954,19 @@ mod tests {
             "fp32 reduce const must be raw IEEE f32 bits of 1/N"
         );
         // The serialized const carries dataFormat_ = IEEE_FP32 and the 32-bit word.
-        let ci = scaling_factor_const_fp32((1.0f32 / 576.0).to_bits());
+        // ⛔ #197 MOVED THE WORD INSIDE THE FOLD MANAGER: `data_` is now
+        // `fold_manager_const(bits, folds)` — an object whose value lands at
+        // `["[0, 0, 0]"][0]` as a DECIMAL STRING (the FoldManager deque dtype), not
+        // the bare array this test read before. The call site below missed that
+        // change (#197 updated the emitter, not this test), which is why this
+        // module had not compiled since.
+        let folds = SdscFoldSet::new(f32_spec.iter.cores_used());
+        let ci = scaling_factor_const_fp32((1.0f32 / 576.0).to_bits(), &folds);
         assert_eq!(ci["0"]["dataFormat_"], "IEEE_FP32");
-        let got = ci["0"]["data_"][0].as_u64().unwrap();
+        let got = ci["0"]["data_"]["data_"]["[0, 0, 0]"][0]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("the fold manager holds the word as a decimal string");
         assert_eq!(got, (1.0f32 / 576.0).to_bits() as u64);
         assert!(
             got > 0xFFFF,

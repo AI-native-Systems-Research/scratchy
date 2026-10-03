@@ -27,7 +27,10 @@ pub fn preamble() -> proc_macro2::TokenStream {
     quote! {
         #[allow(unused_imports)]
         use ::scratchy_target_spyre::ktir::{
-            affine::{AffineExpr as __KExpr, AffineMap as __KMap},
+            affine::{
+                AffineExpr as __KExpr, AffineMap as __KMap, AffineSet as __KSet,
+                Constraint as __KConstraint, ConstraintKind as __KSetKind,
+            },
             attrkey::AttrKey as __KAttrKey,
             dtypes::DType as __KDTy,
             ir::{Attr as __KAttr, IRFunction as __KFn, Operation as __KOp, Ssa as __KSsa},
@@ -161,6 +164,36 @@ fn affine_map(m: &ktir_core::affine::AffineMap<'_>) -> proc_macro2::TokenStream 
     }
 }
 
+/// A tile's constraint set, as literal tokens — the same shape [`affine_map`] emits,
+/// over the set's constraints instead of its result exprs.
+///
+/// ⭐ A TRITON-PRODUCED PROGRAM CARRIES THEM. The builder's programs state a tile's
+/// coordinate set by its ABSENCE ("the full one", the arm below used to refuse), because
+/// `KtirFunc` never minted a partial window. The Triton ladder's
+/// `convert_ttir_to_ktdp` DOES: every `tt.make_tensor_descriptor` becomes a
+/// `ktdp.construct_memory_view` with a `CoordinateSet` range set, and every block load
+/// an `AccessTileSet`. Those attributes are part of the program the splice bakes, so
+/// the serializer states them rather than panicking on them.
+fn affine_set(s: &ktir_core::affine::AffineSet<'_>) -> proc_macro2::TokenStream {
+    let nd = proc_macro2::Literal::usize_unsuffixed(s.num_dims);
+    let ns = proc_macro2::Literal::usize_unsuffixed(s.num_syms);
+    let cs = s.constraints.iter().map(|c| {
+        let e = affine_expr(&c.expr);
+        let k = match c.kind {
+            ktir_core::affine::ConstraintKind::GreaterEq => quote! { __KSetKind::GreaterEq },
+            ktir_core::affine::ConstraintKind::Equal => quote! { __KSetKind::Equal },
+        };
+        quote! { __KConstraint { expr: #e, kind: #k } }
+    });
+    quote! {
+        __KSet {
+            num_dims: #nd,
+            num_syms: #ns,
+            constraints: &[#(#cs),*],
+        }
+    }
+}
+
 fn attr(a: &ktir_core::ir::Attr<'_>) -> proc_macro2::TokenStream {
     use ktir_core::ir::Attr as A;
     let path = quote! { __KAttr };
@@ -207,10 +240,12 @@ fn attr(a: &ktir_core::ir::Attr<'_>) -> proc_macro2::TokenStream {
             let it = v.iter().map(affine_map);
             quote! { #path::AffineMapList(&[#(#it),*]) }
         }
-        // An affine SET is a constraint system, and nothing this lowering emits carries one: a
-        // tile's coordinate set is the full one, which is what its absence means.
-        A::AffineSet(_) => {
-            panic!("an affine set in a baked program: this lowering emits none")
+        // An affine SET — see [`affine_set`]: the Triton ladder's tiles carry them, so
+        // they are stated; a producer whose set is the FULL coordinate set omits the
+        // attribute, and that absence means the same thing it always meant.
+        A::AffineSet(s) => {
+            let s = affine_set(s);
+            quote! { #path::AffineSet(#s) }
         }
     }
 }

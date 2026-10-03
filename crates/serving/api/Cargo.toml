@@ -23,6 +23,9 @@ cuda = ["scratchy-serving-worker/cuda", "scratchy-forward-compiler/cuda", "dep:s
 nccl = ["cuda", "dep:scratchy-serving-transport", "scratchy-target-cuda/nccl", "scratchy-serving-worker/nccl", "scratchy-forward-compiler/nccl"]
 metal = ["scratchy-serving-worker/metal", "scratchy-forward-compiler/metal"]
 spyre = ["scratchy-serving-worker/spyre"]
+# The Triton splice (see `scratchy-target-spyre`'s `spyre-triton`): forwarded down the
+# same chain the `spyre` tiers ride.
+spyre-triton = ["scratchy-serving-worker/spyre-triton"]
 # A card, and the emulator — siblings, forwarded to the worker's own tiers.
 spyre-hw = ["scratchy-serving-worker/spyre-hw"]
 spyre-emu = ["scratchy-serving-worker/spyre-emu"]

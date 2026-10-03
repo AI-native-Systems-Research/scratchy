@@ -48,6 +48,13 @@ metal = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-fo
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
 # get something that can actually run a model.
 spyre = ["scratchy-serving-api/spyre"]
+# The Triton splice, live: every SubtileTape op kind with a registry row
+# (`crates/triton/splice`) compiles its Triton kernel at `#[forward]` expansion
+# time instead of using the hand-written Rust builder. The registry grows one op
+# at a time, each row landing with its byte-identity golden
+# (`scratchy-target-spyre`'s `triton_splice_golden` test) before the builder arm
+# for that op is deleted.
+spyre-triton = ["spyre", "scratchy-serving-api/spyre-triton", "model/spyre-triton"]
 # ANY CARD — the ONE card tier, the same name the api, worker and target crates use. This crate
 # REFERENCES it: `main.rs`'s `libc::_exit` (senlib's atexit resets the device, so the process must
 # not run it) is `#[cfg(feature = "spyre-hw")]`, and without the declaration here that cfg is never

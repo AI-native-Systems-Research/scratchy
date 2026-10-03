@@ -29,6 +29,15 @@ description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR targ
 spyre = []
 spyre-hw = ["spyre", "dep:flex-rs"]
 spyre-emu = ["spyre", "dep:ktir-emulator"]
+# ⭐ THE TRITON SPLICE, IN PRODUCTION. `lower_one_node` asks the splice crate's registry
+# for a Triton kernel BEFORE its builder arm, so a registered op kind is compiled from
+# `.py` at `#[forward]` expansion time instead of hand-written Rust. OFF BY DEFAULT —
+# the registry is grown one op at a time, each row landing with its byte-identity
+# golden (`tests/triton_splice_golden.rs`) — and deliberately NOT implied by `spyre`:
+# it pulls `triton-frontend/ruff` (the Python parser) into the build, and the pod's
+# offline build must keep a path through this crate without it (see
+# crates/triton/PROVENANCE.md).
+spyre-triton = ["dep:scratchy-triton-splice"]
 
 [dependencies]
 # ⭐ THE BAKED BUNDLE ITSELF — re-exported from this crate's root as `bundle_code`, which is the path
@@ -37,6 +46,10 @@ spyre-emu = ["spyre", "dep:ktir-emulator"]
 # `spyre-hw`, so a gate here would make them fail to resolve in a build that has the target but not
 # the card runtime.
 scratchy-spyre-bundle = { path = "bundle" }
+# ⭐ THE TRITON SPLICE (see the `spyre-triton` feature): the registry + ladder driver that
+# compiles a Triton kernel for a SubtileNode. Optional so the default build — and the
+# pod's offline build — carries no ruff dependency.
+scratchy-triton-splice = { path = "../../triton/splice", optional = true }
 scratchy-tensors = { path = "../../tensors" }
 # `kill(-pid, SIGKILL)` on a `dxp_standalone` process group — see `superdsc_bake`'s worker pool.
 libc = { workspace = true }
@@ -83,6 +96,13 @@ cc = "1"
 # intermediate rep strides) through the same `sdsc_abstract` laws production
 # uses, so a fixture cannot encode a relationship production can't.
 [dev-dependencies]
+# ⭐ THE SPLICE, as a dev-dependency because the BYTE-IDENTITY GOLDEN is this crate's
+# test: `tests/triton_splice_golden.rs` lowers one rmsnorm node both ways — the builder
+# (the control, private to this crate) and the Triton kernel — through the same door and
+# asserts descriptor-level identity. The splice hooks into PRODUCTION behind the
+# `spyre-triton` feature (see [features]); this edge exists so the gate runs wherever the
+# builder runs.
+scratchy-triton-splice = { path = "../../triton/splice" }
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
 # EXAMPLES ONLY. `bundle_run_dev` installs a subscriber so flex's completion thread has somewhere to
 # write its CB-error lines — the `hmi_syndrome` / `qgi_syndrome` / `job_count` that say why a launch was

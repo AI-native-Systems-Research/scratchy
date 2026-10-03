@@ -4359,6 +4359,7 @@ dependencies = [
  "scratchy-spyre-bundle",
  "scratchy-subtile",
  "scratchy-tensors",
+ "scratchy-triton-splice",
  "serde",
  "serde_json",
  "tracing",
@@ -4372,6 +4373,18 @@ dependencies = [
  "anyhow",
  "cudarc",
  "memmap2",
+]
+
+[[package]]
+name = "scratchy-triton-splice"
+version = "0.1.0"
+dependencies = [
+ "ktir-core",
+ "ktir-superdsc",
+ "scratchy-subtile",
+ "triton-frontend",
+ "triton-ktir",
+ "triton-ktir-superdsc",
 ]
 
 [[package]]
