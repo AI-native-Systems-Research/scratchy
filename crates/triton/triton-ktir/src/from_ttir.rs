@@ -229,7 +229,9 @@ fn func(m: &ttir::Module, f: &ttir::Func) -> Result<Op> {
     }
     let mut region = Region::default();
     for (a, t) in block.args.iter().zip(f.arg_types.iter()) {
-        region.args.push((Ssa(a.0), ty(m, t, "a function argument")?));
+        region
+            .args
+            .push((Ssa(a.0), ty(m, t, "a function argument")?));
     }
     for o in &block.ops {
         region.ops.push(operation(m, o)?);
@@ -403,7 +405,9 @@ fn ty(m: &ttir::Module, t: &ttir::Type, what: &str) -> Result<IrType> {
                     ),
                 ));
             }
-            IrType::Ptr { elem: dtype(elem, false, what)? }
+            IrType::Ptr {
+                elem: dtype(elem, false, what)?,
+            }
         }
         ttir::Type::Int(..) | ttir::Type::Float(..) => IrType::Scalar(dtype(t, false, what)?),
         ttir::Type::Void => {
@@ -416,12 +420,7 @@ fn ty(m: &ttir::Module, t: &ttir::Type, what: &str) -> Result<IrType> {
 // Attributes
 //===----------------------------------------------------------------------===//
 
-fn attr(
-    m: &ttir::Module,
-    op_name: &str,
-    key: &str,
-    v: &ttir::Attr,
-) -> Result<(AttrKey, Attr)> {
+fn attr(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Result<(AttrKey, Attr)> {
     let k = AttrKey::from_spelling(key);
     Ok((k, attr_value(m, op_name, key, v)?))
 }
@@ -432,12 +431,7 @@ fn attr(
 /// from the C++ KTIR. So "the right answer" for each arm is not "a faithful
 /// representation" -- it is "the SAME `Attr` variant the reader makes", or the diff
 /// reports a difference whose cause is here. Each arm names the reader path it matches.
-fn attr_value(
-    m: &ttir::Module,
-    op_name: &str,
-    key: &str,
-    v: &ttir::Attr,
-) -> Result<Attr> {
+fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Result<Attr> {
     let _ = m;
     Ok(match v {
         // `axis = 1 : i32` -> `parse_attr_value`'s `" : "` split then `parse_int`.

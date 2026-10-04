@@ -74,9 +74,9 @@ fn walk_1_descriptors(module: &mut Module) -> Result<()> {
             .unwrap_or(false)
     }) {
         let desc = walk::at(module, &path).expect("path").clone();
-        let result = desc.result().ok_or_else(|| {
-            Refusal::new(PASS, "tt.make_tensor_descriptor defines no descriptor")
-        })?;
+        let result = desc
+            .result()
+            .ok_or_else(|| Refusal::new(PASS, "tt.make_tensor_descriptor defines no descriptor"))?;
 
         // A descriptor nothing uses is simply erased -- `attention_flash`'s
         // `desc_mask` in the non-causal configuration is exactly this.
@@ -141,7 +141,10 @@ fn build_base_memory_view(module: &mut Module, desc: &Op, elem: DType) -> Result
     // Fallback: no explicit shape -> the block shape; no explicit strides ->
     // row-major from the shape.
     if shape.is_empty() {
-        shape = desc.result_type().and_then(|t| t.dims().map(|d| d.to_vec())).unwrap_or_default();
+        shape = desc
+            .result_type()
+            .and_then(|t| t.dims().map(|d| d.to_vec()))
+            .unwrap_or_default();
     }
     if strides.is_empty() {
         let mut s = 1i64;
@@ -197,11 +200,20 @@ fn build_base_memory_view(module: &mut Module, desc: &Op, elem: DType) -> Result
 
     let view = module.fresh_named(&base_hint);
     let view_op = Op::new(OpKind::KtdpConstructMemoryView)
-        .with_result(view, IrType::MemRef { dims: shape.clone(), elem })
+        .with_result(
+            view,
+            IrType::MemRef {
+                dims: shape.clone(),
+                elem,
+            },
+        )
         .with_operands(std::iter::once(base_idx).chain(dyn_sizes.iter().copied()))
         .with_attr(AttrKey::Shape, Attr::IntList(static_sizes))
         .with_attr(AttrKey::Strides, Attr::IntList(strides))
-        .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(build_range_set_nd(&shape)))
+        .with_attr(
+            AttrKey::CoordinateSet,
+            Attr::AffineSet(build_range_set_nd(&shape)),
+        )
         .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into()));
 
     // The descriptor-typed placeholder cast, so the `!tt.tensordesc` uses keep
@@ -209,7 +221,9 @@ fn build_base_memory_view(module: &mut Module, desc: &Op, elem: DType) -> Result
     let cast = Op::new(OpKind::UnrealizedConversionCast)
         .with_result(
             module.fresh_named(&base_hint),
-            desc.result_type().cloned().unwrap_or(IrType::Verbatim("!tt.tensordesc".into())),
+            desc.result_type()
+                .cloned()
+                .unwrap_or(IrType::Verbatim("!tt.tensordesc".into())),
         )
         .with_operands([view]);
 
@@ -329,9 +343,7 @@ fn descriptor_mem_view(module: &Module, access: &Op) -> Option<Ssa> {
 fn convert_access_ops(module: &mut Module) -> Result<()> {
     while let Some(path) = walk::paths(module).into_iter().find(|p| {
         walk::at(module, p)
-            .map(|o| {
-                matches!(o.kind, OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore)
-            })
+            .map(|o| matches!(o.kind, OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore))
             .unwrap_or(false)
     }) {
         let op = walk::at(module, &path).expect("path").clone();
@@ -356,9 +368,16 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
         } else {
             op.operands[1..op.operands.len() - 1].to_vec()
         };
-        let src = if is_load { None } else { op.operands.last().copied() };
+        let src = if is_load {
+            None
+        } else {
+            op.operands.last().copied()
+        };
 
-        let hint = op.result().map(|r| module.hint(r)).unwrap_or_else(|| "0".into());
+        let hint = op
+            .result()
+            .map(|r| module.hint(r))
+            .unwrap_or_else(|| "0".into());
         let (casts, tile_op) =
             build_direct_access_tile(module, view, &block_shape, &indices, &[], &hint);
         let tile = tile_op.result().expect("the tile defines a value");
@@ -367,14 +386,19 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
         replacement.push(tile_op);
         if is_load {
             let res = op.result().expect("a descriptor_load defines a value");
-            let ty = op.result_type().cloned().ok_or_else(|| {
-                Refusal::new(PASS, "tt.descriptor_load has no result type")
-            })?;
-            replacement
-                .push(Op::new(OpKind::KtdpLoad).with_result(res, ty).with_operands([tile]));
+            let ty = op
+                .result_type()
+                .cloned()
+                .ok_or_else(|| Refusal::new(PASS, "tt.descriptor_load has no result type"))?;
+            replacement.push(
+                Op::new(OpKind::KtdpLoad)
+                    .with_result(res, ty)
+                    .with_operands([tile]),
+            );
         } else {
             replacement.push(
-                Op::new(OpKind::KtdpStore).with_operands([src.expect("a store has a source"), tile]),
+                Op::new(OpKind::KtdpStore)
+                    .with_operands([src.expect("a store has a source"), tile]),
             );
         }
 
@@ -436,7 +460,10 @@ fn build_direct_access_tile(
         .with_result(tile, IrType::AccessTile { dims: tile_shape })
         .with_operands(operands)
         .with_attr(AttrKey::BaseMap, Attr::AffineMap(identity_map(rank)))
-        .with_attr(AttrKey::AccessTileSet, Attr::AffineSet(build_range_set_nd(block_shape)))
+        .with_attr(
+            AttrKey::AccessTileSet,
+            Attr::AffineSet(build_range_set_nd(block_shape)),
+        )
         .with_attr(AttrKey::AccessTileOrder, Attr::AffineMap(order_str));
     (casts, tile_op)
 }
@@ -459,13 +486,20 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
     loop {
         let mut folded = false;
         for path in walk::paths(module) {
-            let Some(op) = walk::at(module, &path) else { continue };
+            let Some(op) = walk::at(module, &path) else {
+                continue;
+            };
             if op.kind != OpKind::TtTrans {
                 continue;
             }
             let trans = op.clone();
-            let Some(src) = trans.operands.first().copied() else { continue };
-            let Some(load) = module.def_of(src).filter(|o| o.kind == OpKind::KtdpLoad).cloned()
+            let Some(src) = trans.operands.first().copied() else {
+                continue;
+            };
+            let Some(load) = module
+                .def_of(src)
+                .filter(|o| o.kind == OpKind::KtdpLoad)
+                .cloned()
             else {
                 continue;
             };
@@ -473,7 +507,9 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
             if count_uses(module, src) != 1 {
                 continue;
             }
-            let Some(tile_v) = load.operands.first().copied() else { continue };
+            let Some(tile_v) = load.operands.first().copied() else {
+                continue;
+            };
             let Some(tile) = module
                 .def_of(tile_v)
                 .filter(|o| o.kind == OpKind::KtdpConstructAccessTile)
@@ -508,7 +544,10 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
             let mut new_tile = tile.clone();
             let tile_out = new_tile.results[0];
             new_tile.result_types[0] = IrType::AccessTile { dims: new_shape };
-            new_tile.set_attr(AttrKey::AccessTileOrder, Attr::AffineMap(order_map(rank, &order)));
+            new_tile.set_attr(
+                AttrKey::AccessTileOrder,
+                Attr::AffineMap(order_map(rank, &order)),
+            );
 
             let mut new_load = load.clone();
             new_load.results = trans.results.clone();
@@ -548,9 +587,11 @@ fn count_uses(module: &Module, v: Ssa) -> usize {
 }
 
 fn find_path_of_result(module: &Module, v: Ssa) -> Option<OpPath> {
-    walk::paths(module)
-        .into_iter()
-        .find(|p| walk::at(module, p).map(|o| o.results.contains(&v)).unwrap_or(false))
+    walk::paths(module).into_iter().find(|p| {
+        walk::at(module, p)
+            .map(|o| o.results.contains(&v))
+            .unwrap_or(false)
+    })
 }
 
 //===----------------------------------------------------------------------===//
@@ -562,7 +603,10 @@ fn find_path_of_result(module: &Module, v: Ssa) -> Option<OpPath> {
 fn refuse_raw_tile_access(module: &Module) -> Result<()> {
     for op in module.ops_deep() {
         let shaped = match op.kind {
-            OpKind::TtLoad => op.result_type().map(|t| t.dims().is_some()).unwrap_or(false),
+            OpKind::TtLoad => op
+                .result_type()
+                .map(|t| t.dims().is_some())
+                .unwrap_or(false),
             OpKind::TtStore => op
                 .operands
                 .last()
@@ -592,7 +636,6 @@ fn refuse_raw_tile_access(module: &Module) -> Result<()> {
     Ok(())
 }
 
-
 //===----------------------------------------------------------------------===//
 // The gather: tt.descriptor_gather -> ktdp.construct_indirect_access_tile
 //===----------------------------------------------------------------------===//
@@ -615,10 +658,7 @@ fn refuse_raw_tile_access(module: &Module) -> Result<()> {
 /// printed body -- and the spelling has to be MLIR's exactly, because the golden diff
 /// compares it against what `text::parse` read out of the C++'s own output. That is why the
 /// upper bound prints `-d0 + 127` rather than `127 - d0`.
-fn gather_subscripts(
-    index_rank: usize,
-    result_shape: &[i64],
-) -> Result<(Attr, Attr, Attr, Attr)> {
+fn gather_subscripts(index_rank: usize, result_shape: &[i64]) -> Result<(Attr, Attr, Attr, Attr)> {
     let result_rank = result_shape.len();
     if result_rank < 2 {
         return Err(Refusal::new(
@@ -645,7 +685,10 @@ fn gather_subscripts(
     let d0 = k + 1;
 
     let dims = |n: usize| -> String {
-        (0..n).map(|i| format!("d{i}")).collect::<Vec<_>>().join(", ")
+        (0..n)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     let domain = dims(dim_count);
 
@@ -765,7 +808,10 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
         let (kinds, maps, space_set, space_order) =
             gather_subscripts(anchors.len(), &result_shape)?;
 
-        let hint = op.result().map(|r| module.hint(r)).unwrap_or_else(|| "gather".into());
+        let hint = op
+            .result()
+            .map(|r| module.hint(r))
+            .unwrap_or_else(|| "gather".into());
         // The y_offset arrives as i32 and is cast to index, exactly as the direct path casts
         // its own indices. `canonicalize` folds the cast of a constant afterwards, which is
         // why the golden shows a bare `%c0 : index`.
@@ -816,7 +862,10 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
             // was that `text::parse` skips the `^bb0` line and therefore the golden side would
             // have no args either -- it does read them, and guessing rather than checking is
             // what the diff is for.
-            .with_region(Region { args: region_args, ops: Vec::new() });
+            .with_region(Region {
+                args: region_args,
+                ops: Vec::new(),
+            });
 
         let res = op.result().expect("a gather defines a value");
         let load = Op::new(OpKind::KtdpLoad)
@@ -859,7 +908,10 @@ mod tests {
         // not be printed as a constant, or a recompile-per-shape assumption is
         // baked into a set that claims to be shape-generic.
         let s = build_range_set_nd(&[DYNAMIC, 64]);
-        assert_eq!(s, "(d0, d1)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0, d1 >= 0, -d1 + 63 >= 0)");
+        assert_eq!(
+            s,
+            "(d0, d1)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0, d1 >= 0, -d1 + 63 >= 0)"
+        );
     }
 
     #[test]

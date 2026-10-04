@@ -112,7 +112,9 @@ fn main() {
         let ce = |k: &str| match kspec.constexprs.get(k) {
             Some(Val::Int(v)) => u32::try_from(*v)
                 .map_err(|_| format!("`{k}` = {v} does not fit the geometry's u32")),
-            _ => Err(format!("`{k}` is not an integer tl.constexpr of this configuration")),
+            _ => Err(format!(
+                "`{k}` is not an integer tl.constexpr of this configuration"
+            )),
         };
         let (hd, h, n_tok) = match (ce("HEAD_DIM"), ce("H"), ce("N_TOK")) {
             (Ok(a), Ok(b), Ok(c)) => (a, b, c),
@@ -136,7 +138,8 @@ fn main() {
             Err(e) => refused!(e.stage, e.message),
         };
         // `rows_are_requests` is false: these are prefill token rows, not one row per decode request.
-        match triton_ktir_superdsc::drive_rope(&node, hd, n_tok, h * hd, rows, false, Some(&layout)) {
+        match triton_ktir_superdsc::drive_rope(&node, hd, n_tok, h * hd, rows, false, Some(&layout))
+        {
             Err(e) => refused!(e.stage, e.message),
             Ok(ops) => match triton_ktir_superdsc::bake::write_dir(&out_dir, &ops) {
                 Err(e) => refused!("bake", e),
@@ -145,7 +148,8 @@ fn main() {
                     // and this one did not, so a rope baked 35 descriptors and then had no
                     // `placements.json` for the launcher to bind against — the bake looked like a
                     // success and was unrunnable. Same call, same reason as the whole-function arm.
-                    if let Err(e) = triton_ktir_superdsc::bake::write_placements(&out_dir, &layout) {
+                    if let Err(e) = triton_ktir_superdsc::bake::write_placements(&out_dir, &layout)
+                    {
                         refused!("bake", e);
                     }
                     println!(
@@ -186,16 +190,16 @@ fn main() {
                 let written = triton_ktir_superdsc::bake::write_placements(&out_dir, &layout)
                     .and_then(|()| triton_ktir_superdsc::bake::write_dir(&out_dir, &ops));
                 match written {
-                Err(e) => refused!("bake", e),
-                Ok(w) => {
-                    println!(
-                        "BAKED    {config:24} {:<12} whole-function: ops={} files={}",
-                        "",
-                        ops.len(),
-                        w.len()
-                    );
-                    return;
-                }
+                    Err(e) => refused!("bake", e),
+                    Ok(w) => {
+                        println!(
+                            "BAKED    {config:24} {:<12} whole-function: ops={} files={}",
+                            "",
+                            ops.len(),
+                            w.len()
+                        );
+                        return;
+                    }
                 }
             }
         }

@@ -370,8 +370,7 @@ pub enum Attr {
 /// `%ssa` name from it. That makes it real AST-derived content, so the golden diff
 /// compares it. What the diff does NOT compare is the `#locN` numbering or the SSA
 /// suffixes MLIR appends to disambiguate -- those are printer bookkeeping.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Loc {
     #[default]
     Unknown,
@@ -531,7 +530,6 @@ pub struct Module {
     pub funcs: Vec<Func>,
     pub loc: Loc,
 }
-
 
 impl Module {
     pub fn ty(&self, v: ValueId) -> &Type {

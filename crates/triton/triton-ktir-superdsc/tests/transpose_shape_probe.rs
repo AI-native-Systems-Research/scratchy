@@ -111,8 +111,8 @@
 //! list, and the install/obfuscate rules iterate that list alone (`:59-72`) — so a run against an
 //! INSTALL rather than a source checkout dies earlier, on a missing template.
 
-use ktir_superdsc::emit::{assemble_restickify_kt_2d, try_assemble_transpose};
 use ktir_superdsc::emit::EmittedOp;
+use ktir_superdsc::emit::{assemble_restickify_kt_2d, try_assemble_transpose};
 
 /// The shapes, and why each one is in the list.
 ///
@@ -134,7 +134,10 @@ const SHAPES: &[(u32, u32, &str)] = &[
 /// The output stick's `(dim order, sizes)` — the property `Ddc::transformForInterSliceRestickify`
 /// reads and the V3 translator's 1-D limit is a function of.
 fn output_stick(op: &EmittedOp) -> (Vec<&'static str>, Vec<u32>) {
-    let dsc = op.op.as_ref().expect("a relayout carries a SuperDSC descriptor");
+    let dsc = op
+        .op
+        .as_ref()
+        .expect("a relayout carries a SuperDSC descriptor");
     let one = dsc.dscs_.first().expect("one dsc");
     let body = one.values().next().expect("one op in the dsc");
     let out = body.primaryDsInfo_.get("OUTPUT").expect("an OUTPUT layout");
@@ -142,7 +145,9 @@ fn output_stick(op: &EmittedOp) -> (Vec<&'static str>, Vec<u32>) {
 }
 
 fn write_probe_dir(label: &str, op: &EmittedOp) {
-    let Ok(root) = std::env::var("TRANSPOSE_PROBE_DIR") else { return };
+    let Ok(root) = std::env::var("TRANSPOSE_PROBE_DIR") else {
+        return;
+    };
     let path = std::path::Path::new(&root).join(label);
     let w = triton_ktir_superdsc::bake::write_dir(&path, std::slice::from_ref(op))
         .expect("write the dxp input dir");
@@ -185,7 +190,10 @@ fn every_transpose_shape_carries_the_two_dim_block_stick_that_dxp_refuses() {
             Ok(op) => op,
         };
         emitted += 1;
-        let dsc = op.op.as_ref().expect("a transpose carries a SuperDSC descriptor");
+        let dsc = op
+            .op
+            .as_ref()
+            .expect("a transpose carries a SuperDSC descriptor");
         let (order, sizes) = output_stick(&op);
         println!(
             "BAKED    {label:16} [mb {mb}, out {out}]  numWkSlicesPerDim_={:?}  OUTPUT stick {order:?} {sizes:?}",
@@ -259,7 +267,10 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
         &mut sid,
         None,
     );
-    let dsc = op.op.as_ref().expect("a restickify carries a SuperDSC descriptor");
+    let dsc = op
+        .op
+        .as_ref()
+        .expect("a restickify carries a SuperDSC descriptor");
     let (order, sizes) = output_stick(&op);
     println!(
         "BAKED    restickify_kt    [slots 64, feats 64]  numWkSlicesPerDim_={:?}  OUTPUT stick {order:?} {sizes:?}",
@@ -308,9 +319,15 @@ fn the_rerouted_ktir_door_transposes_with_a_one_dim_output_stick_at_every_shape(
                  the reroute solves nothing: {e}"
             )
         });
-        let dsc = op.op.as_ref().expect("a relayout carries a SuperDSC descriptor");
+        let dsc = op
+            .op
+            .as_ref()
+            .expect("a relayout carries a SuperDSC descriptor");
         let body = dsc.dscs_[0].values().next().expect("one op in the dsc");
-        let (inp, outp) = (&body.primaryDsInfo_["INPUT"], &body.primaryDsInfo_["OUTPUT"]);
+        let (inp, outp) = (
+            &body.primaryDsInfo_["INPUT"],
+            &body.primaryDsInfo_["OUTPUT"],
+        );
         let (order, sizes) = output_stick(&op);
         println!(
             "REROUTED {label:16} [mb {mb}, out {out}]  numWkSlicesPerDim_={:?}  \

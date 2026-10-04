@@ -95,8 +95,16 @@ fn refuse(why: impl std::fmt::Display) -> Refusal {
 fn is_scheduler_dialect(ns: &str) -> bool {
     matches!(
         ns,
-        "builtin" | "func" | "arith" | "math" | "scf" | "tensor" | "memref" | "linalg"
-            | "ktdp" | "ktdf_arch"
+        "builtin"
+            | "func"
+            | "arith"
+            | "math"
+            | "scf"
+            | "tensor"
+            | "memref"
+            | "linalg"
+            | "ktdp"
+            | "ktdf_arch"
     )
 }
 
@@ -197,7 +205,12 @@ fn convert_func(module: &mut Module, grid_size: i64) -> Result<()> {
                 module.ops[i].result_types.len()
             )));
         }
-        if module.ops[i].regions.first().map(|r| r.ops.is_empty()).unwrap_or(true) {
+        if module.ops[i]
+            .regions
+            .first()
+            .map(|r| r.ops.is_empty())
+            .unwrap_or(true)
+        {
             return Err(refuse("kernel has no body"));
         }
         let fnop = &mut module.ops[i];
@@ -233,7 +246,9 @@ fn drop_corelet_plans(module: &mut Module) {
     let victims: Vec<OpPath> = walk::paths(module)
         .into_iter()
         .filter(|p| {
-            walk::at(module, p).map(|o| o.kind == OpKind::KtdfCoreletPlan).unwrap_or(false)
+            walk::at(module, p)
+                .map(|o| o.kind == OpKind::KtdfCoreletPlan)
+                .unwrap_or(false)
         })
         .collect();
     walk::erase(module, &victims);
@@ -486,11 +501,20 @@ fn expand_splat_of_scalar_argument(module: &mut Module) -> Result<()> {
     let body = &mut kernel.regions[0].ops;
     for (j, (arg, elem, view, r0, c0, tile, loaded)) in named.into_iter().enumerate() {
         let view_op = Op::new(OpKind::KtdpConstructMemoryView)
-            .with_result(view, IrType::MemRef { dims: vec![1, 1], elem })
+            .with_result(
+                view,
+                IrType::MemRef {
+                    dims: vec![1, 1],
+                    elem,
+                },
+            )
             .with_operands([arg])
             .with_attr(AttrKey::Shape, Attr::IntList(vec![1, 1]))
             .with_attr(AttrKey::Strides, Attr::IntList(vec![1, 1]))
-            .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(build_range_set_nd(&[1, 1])))
+            .with_attr(
+                AttrKey::CoordinateSet,
+                Attr::AffineSet(build_range_set_nd(&[1, 1])),
+            )
             .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into()));
 
         let zero_r = Op::new(OpKind::ArithConstant)
@@ -503,11 +527,20 @@ fn expand_splat_of_scalar_argument(module: &mut Module) -> Result<()> {
             .with_result(tile, IrType::AccessTile { dims: vec![1, 1] })
             .with_operands([view, r0, c0])
             .with_attr(AttrKey::BaseMap, Attr::AffineMap(identity_map(2)))
-            .with_attr(AttrKey::AccessTileSet, Attr::AffineSet(build_range_set_nd(&[1, 1])))
+            .with_attr(
+                AttrKey::AccessTileSet,
+                Attr::AffineSet(build_range_set_nd(&[1, 1])),
+            )
             .with_attr(AttrKey::AccessTileOrder, Attr::AffineMap(identity_map(2)));
 
         let load_op = Op::new(OpKind::KtdpLoad)
-            .with_result(loaded, IrType::Tensor { dims: vec![1, 1], elem })
+            .with_result(
+                loaded,
+                IrType::Tensor {
+                    dims: vec![1, 1],
+                    elem,
+                },
+            )
             .with_operands([tile]);
 
         // THE SPLAT IS RE-POINTED, not moved: the chain dominates it wherever the splat
@@ -639,21 +672,45 @@ fn combiner_identity(kind: &OpKind, elem: DType) -> Option<FloatBits> {
     let f16 = elem == DType::F16;
     Some(match kind {
         OpKind::ArithAddf => {
-            if f16 { FloatBits { bits: 0x0000, width: 16 } } else { FloatBits::f32(0.0) }
+            if f16 {
+                FloatBits {
+                    bits: 0x0000,
+                    width: 16,
+                }
+            } else {
+                FloatBits::f32(0.0)
+            }
         }
         OpKind::ArithMulf => {
-            if f16 { FloatBits { bits: 0x3c00, width: 16 } } else { FloatBits::f32(1.0) }
+            if f16 {
+                FloatBits {
+                    bits: 0x3c00,
+                    width: 16,
+                }
+            } else {
+                FloatBits::f32(1.0)
+            }
         }
         // -inf for a max, +inf for a min.
         OpKind::ArithMaxnumf => {
             if f16 {
-                FloatBits { bits: 0xFC00, width: 16 }
+                FloatBits {
+                    bits: 0xFC00,
+                    width: 16,
+                }
             } else {
                 FloatBits::f32(f32::NEG_INFINITY)
             }
         }
         OpKind::ArithMinnumf => {
-            if f16 { FloatBits { bits: 0x7C00, width: 16 } } else { FloatBits::f32(f32::INFINITY) }
+            if f16 {
+                FloatBits {
+                    bits: 0x7C00,
+                    width: 16,
+                }
+            } else {
+                FloatBits::f32(f32::INFINITY)
+            }
         }
         _ => return None,
     })
@@ -686,38 +743,52 @@ fn convert_reduce(module: &mut Module, path: &OpPath) -> Result<()> {
     let src_ty = module
         .type_of(op.operands[0])
         .ok_or_else(|| refuse("tt.reduce's operand has no type"))?;
-    let res_ty = op.result_type().cloned().ok_or_else(|| refuse("tt.reduce has no result type"))?;
+    let res_ty = op
+        .result_type()
+        .cloned()
+        .ok_or_else(|| refuse("tt.reduce has no result type"))?;
     let (src_rank, res_rank) = (src_ty.rank(), res_ty.rank());
     if src_ty.dims().is_none() || res_ty.dims().is_none() || res_rank + 1 != src_rank {
         return Err(refuse(
             "tt.reduce does not drop exactly one dimension of a ranked tensor",
         ));
     }
-    let axis = op.attr(&AttrKey::Axis).and_then(|a| a.as_int()).unwrap_or(-1);
+    let axis = op
+        .attr(&AttrKey::Axis)
+        .and_then(|a| a.as_int())
+        .unwrap_or(-1);
     if axis < 0 || axis as usize >= src_rank {
         return Err(refuse(format!("tt.reduce axis {axis} is out of range")));
     }
-    let elem = src_ty
-        .elem()
-        .filter(|e| e.is_float())
-        .ok_or_else(|| refuse(
+    let elem = src_ty.elem().filter(|e| e.is_float()).ok_or_else(|| {
+        refuse(
             "only a float tt.reduce is supported (an integer reduction needs its own \
              identity table)",
-        ))?;
+        )
+    })?;
 
     // The combiner must be ONE recognized associative op plus the terminator.
-    let region = op.regions.first().ok_or_else(|| refuse("tt.reduce has no combiner region"))?;
+    let region = op
+        .regions
+        .first()
+        .ok_or_else(|| refuse("tt.reduce has no combiner region"))?;
     if region.args.len() != 2 {
         return Err(refuse(
             "tt.reduce combiner does not take exactly two arguments",
         ));
     }
-    let body: Vec<&Op> = region.ops.iter().filter(|o| o.kind != OpKind::TtReduceReturn).collect();
+    let body: Vec<&Op> = region
+        .ops
+        .iter()
+        .filter(|o| o.kind != OpKind::TtReduceReturn)
+        .collect();
     let ret = region
         .ops
         .iter()
         .find(|o| o.kind == OpKind::TtReduceReturn)
-        .ok_or_else(|| refuse("tt.reduce combiner does not end in a single-value tt.reduce.return"))?;
+        .ok_or_else(|| {
+            refuse("tt.reduce combiner does not end in a single-value tt.reduce.return")
+        })?;
     if body.len() != 1 {
         return Err(refuse(format!(
             "tt.reduce combiner must be exactly one associative op with a known \
@@ -763,7 +834,13 @@ fn convert_reduce(module: &mut Module, path: &OpPath) -> Result<()> {
     // ins: identity over the source rank; outs: drop the reduced axis.
     let keep: Vec<usize> = (0..src_rank).filter(|i| *i as i64 != axis).collect();
     let iters: Vec<String> = (0..src_rank)
-        .map(|i| if i as i64 == axis { "reduction".to_string() } else { "parallel".to_string() })
+        .map(|i| {
+            if i as i64 == axis {
+                "reduction".to_string()
+            } else {
+                "parallel".to_string()
+            }
+        })
         .collect();
 
     // The combiner's block arg 0 is the incoming element and arg 1 the accumulator,
@@ -802,12 +879,19 @@ fn convert_broadcast(module: &mut Module, path: &OpPath) -> Result<()> {
     let src_ty = module
         .type_of(op.operands[0])
         .ok_or_else(|| refuse("tt.broadcast's operand has no type"))?;
-    let res_ty = op.result_type().cloned().ok_or_else(|| refuse("tt.broadcast has no result"))?;
+    let res_ty = op
+        .result_type()
+        .cloned()
+        .ok_or_else(|| refuse("tt.broadcast has no result"))?;
     let (Some(sd), Some(rd)) = (src_ty.dims(), res_ty.dims()) else {
-        return Err(refuse("tt.broadcast operands are not equal-rank ranked tensors"));
+        return Err(refuse(
+            "tt.broadcast operands are not equal-rank ranked tensors",
+        ));
     };
     if sd.len() != rd.len() {
-        return Err(refuse("tt.broadcast operands are not equal-rank ranked tensors"));
+        return Err(refuse(
+            "tt.broadcast operands are not equal-rank ranked tensors",
+        ));
     }
     let rank = rd.len();
     let mut kept: Vec<usize> = Vec::new();
@@ -849,7 +933,10 @@ fn convert_broadcast(module: &mut Module, path: &OpPath) -> Result<()> {
     let collapse = Op::new(OpKind::TensorCollapseShape)
         .with_result(src, collapsed_ty)
         .with_operands([op.operands[0]])
-        .with_attr(AttrKey::Reassociation, Attr::IntList(kept.iter().map(|d| *d as i64).collect()));
+        .with_attr(
+            AttrKey::Reassociation,
+            Attr::IntList(kept.iter().map(|d| *d as i64).collect()),
+        );
 
     let init = module.fresh_named(&hint);
     let empty = Op::new(OpKind::TensorEmpty).with_result(init, res_ty.clone());
@@ -888,13 +975,19 @@ fn convert_expand_dims(module: &mut Module, path: &OpPath) -> Result<()> {
     let src_ty = module
         .type_of(op.operands[0])
         .ok_or_else(|| refuse("tt.expand_dims' operand has no type"))?;
-    let res_ty = op.result_type().cloned().ok_or_else(|| refuse("tt.expand_dims has no result"))?;
+    let res_ty = op
+        .result_type()
+        .cloned()
+        .ok_or_else(|| refuse("tt.expand_dims has no result"))?;
     if src_ty.dims().is_none() || res_ty.dims().is_none() || res_ty.rank() != src_ty.rank() + 1 {
         return Err(refuse(
             "tt.expand_dims is not a rank-increasing reshape of ranked tensors",
         ));
     }
-    let axis = op.attr(&AttrKey::Axis).and_then(|a| a.as_int()).unwrap_or(-1);
+    let axis = op
+        .attr(&AttrKey::Axis)
+        .and_then(|a| a.as_int())
+        .unwrap_or(-1);
     let rd = res_ty.dims().unwrap();
     if axis < 0 || axis as usize >= rd.len() || rd[axis as usize] != 1 {
         return Err(refuse(format!(
@@ -1039,8 +1132,7 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
             let idx = path.index();
             let outer: HashSet<Ssa> = match module.kernel() {
                 Ok(f) if !f.regions.is_empty() => {
-                    let mut set: HashSet<Ssa> =
-                        f.regions[0].args.iter().map(|(v, _)| *v).collect();
+                    let mut set: HashSet<Ssa> = f.regions[0].args.iter().map(|(v, _)| *v).collect();
                     // Only ops the loop is actually below. When the loop is NOT at the kernel's
                     // top level this under-counts, which costs a hoist and never correctness.
                     for op in f.regions[0].ops.iter().take(idx) {
@@ -1131,7 +1223,9 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
         // That clone predates the rewire, so inlining it puts the loop's dead induction
         // variable back into every address the body computes: the fold appears to work,
         // the loop is gone, and the grid position is still a value nothing defines.
-        let body = walk::at(module, &path).expect("path").regions[0].ops.clone();
+        let body = walk::at(module, &path).expect("path").regions[0]
+            .ops
+            .clone();
         let idx = path.index();
         {
             let block = walk::block_mut(module, &path).expect("path");
@@ -1215,7 +1309,11 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
     // it visits children before parents and later siblings before earlier ones.
     let paths: Vec<OpPath> = walk::paths(module)
         .into_iter()
-        .filter(|p| walk::at(module, p).map(|o| o.kind == OpKind::ScfFor).unwrap_or(false))
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| o.kind == OpKind::ScfFor)
+                .unwrap_or(false)
+        })
         .collect();
     for path in paths.into_iter().rev() {
         let loopp = walk::at(module, &path).expect("path").clone();
@@ -1265,20 +1363,19 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
         // The body, minus its terminator. `scf.yield`'s operands are the carries, so it is a
         // JOIN between copies rather than an op any copy contains.
         let mut body = loopp.regions[0].ops.clone();
-        let yielded: Vec<Ssa> = match body.last() {
-            Some(o) if o.kind == OpKind::ScfYield => {
-                let ops = o.operands.clone();
-                body.pop();
-                ops
-            }
-            _ if carried.is_empty() => Vec::new(),
-            _ => {
-                return Err(refuse(
+        let yielded: Vec<Ssa> =
+            match body.last() {
+                Some(o) if o.kind == OpKind::ScfYield => {
+                    let ops = o.operands.clone();
+                    body.pop();
+                    ops
+                }
+                _ if carried.is_empty() => Vec::new(),
+                _ => return Err(refuse(
                     "an `scf.for` with iter_args does not end in `scf.yield`, so what each trip \
                      carries to the next is not stated and cannot be inferred",
-                ))
-            }
-        };
+                )),
+            };
         if yielded.len() != carried.len() {
             return Err(refuse(format!(
                 "an `scf.for` carries {} iter_arg(s) but yields {} value(s)",
@@ -1401,7 +1498,9 @@ fn fold_unit_grid_tile_id(module: &mut Module) {
     // type, so the fold works anywhere in the body (regions included) without a numbering pass.
     let mut replacements: Vec<(OpPath, Ssa, i64)> = Vec::new();
     for path in walk::paths(module) {
-        let Some(o) = walk::at(module, &path) else { continue };
+        let Some(o) = walk::at(module, &path) else {
+            continue;
+        };
         if o.kind != OpKind::KtdpGetComputeTileId {
             continue;
         }
@@ -1447,40 +1546,56 @@ fn fold_index_arithmetic(module: &mut Module) {
     loop {
         let mut folded = false;
         for path in walk::paths(module) {
-            let Some(o) = walk::at(module, &path) else { continue };
+            let Some(o) = walk::at(module, &path) else {
+                continue;
+            };
             let (a, b) = match o.kind {
-                OpKind::ArithMuli | OpKind::ArithAddi | OpKind::ArithDivsi | OpKind::ArithRemui
-                | OpKind::ArithDivui | OpKind::ArithRemsi => {
-                    (o.operands[0], o.operands[1])
-                }
+                OpKind::ArithMuli
+                | OpKind::ArithAddi
+                | OpKind::ArithDivsi
+                | OpKind::ArithRemui
+                | OpKind::ArithDivui
+                | OpKind::ArithRemsi => (o.operands[0], o.operands[1]),
                 OpKind::ArithIndexCast => (o.operands[0], o.operands[0]),
                 _ => continue,
             };
             let val = match o.kind {
-                OpKind::ArithMuli => crate::passes::dot_to_linalg::const_int(module, a).zip(crate::passes::dot_to_linalg::const_int(module, b)).map(|(x, y)| x * y),
-                OpKind::ArithAddi => crate::passes::dot_to_linalg::const_int(module, a).zip(crate::passes::dot_to_linalg::const_int(module, b)).map(|(x, y)| x + y),
+                OpKind::ArithMuli => crate::passes::dot_to_linalg::const_int(module, a)
+                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                    .map(|(x, y)| x * y),
+                OpKind::ArithAddi => crate::passes::dot_to_linalg::const_int(module, a)
+                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                    .map(|(x, y)| x + y),
                 // Truncating division, the C semantics the op has; division by zero is left standing
                 // rather than turned into a build error in a fold.
-                OpKind::ArithDivsi => crate::passes::dot_to_linalg::const_int(module, a).zip(crate::passes::dot_to_linalg::const_int(module, b)).and_then(|(x, y)| {
-                    if y == 0 { None } else { Some(x / y) }
-                }),
+                OpKind::ArithDivsi => crate::passes::dot_to_linalg::const_int(module, a)
+                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                    .and_then(|(x, y)| if y == 0 { None } else { Some(x / y) }),
                 // Unsigned remainder/division: the semantics `remui`/`divui` name. `remsi` is
                 // signed, but on the non-negative constants a grid chain produces the two agree;
                 // a negative operand is left standing rather than guessed at.
-                OpKind::ArithRemui => crate::passes::dot_to_linalg::const_int(module, a).zip(crate::passes::dot_to_linalg::const_int(module, b)).and_then(|(x, y)| {
-                    if y == 0 || x < 0 { None } else { Some(x % y) }
-                }),
-                OpKind::ArithDivui => crate::passes::dot_to_linalg::const_int(module, a).zip(crate::passes::dot_to_linalg::const_int(module, b)).and_then(|(x, y)| {
-                    if y == 0 || x < 0 { None } else { Some(x / y) }
-                }),
-                OpKind::ArithRemsi => crate::passes::dot_to_linalg::const_int(module, a).zip(crate::passes::dot_to_linalg::const_int(module, b)).and_then(|(x, y)| {
-                    if y == 0 { None } else { Some(x.wrapping_rem(y)) }
-                }),
+                OpKind::ArithRemui => crate::passes::dot_to_linalg::const_int(module, a)
+                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                    .and_then(|(x, y)| if y == 0 || x < 0 { None } else { Some(x % y) }),
+                OpKind::ArithDivui => crate::passes::dot_to_linalg::const_int(module, a)
+                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                    .and_then(|(x, y)| if y == 0 || x < 0 { None } else { Some(x / y) }),
+                OpKind::ArithRemsi => crate::passes::dot_to_linalg::const_int(module, a)
+                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                    .and_then(|(x, y)| {
+                        if y == 0 {
+                            None
+                        } else {
+                            Some(x.wrapping_rem(y))
+                        }
+                    }),
                 OpKind::ArithIndexCast => crate::passes::dot_to_linalg::const_int(module, a),
                 _ => continue,
             };
             let Some(val) = val else { continue };
-            let Some(res) = o.results.first().copied() else { continue };
+            let Some(res) = o.results.first().copied() else {
+                continue;
+            };
             let ty = o.result_types.first().cloned().expect("folded op type");
             let c = module.fresh_named(&module.hint(res));
             let idx = path.index();
@@ -1557,19 +1672,13 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     }
     let kernel = module.kernel().map_err(|e| refuse(e.to_string()))?.clone();
     let body: Vec<Op> = kernel.regions[0].ops.clone();
-    let Some(landmark_op) = body
-        .iter()
-        .find(|o| o.kind == OpKind::KtdpGetComputeTileId)
-    else {
+    let Some(landmark_op) = body.iter().find(|o| o.kind == OpKind::KtdpGetComputeTileId) else {
         return Ok(());
     };
     let Some(landmark) = landmark_op.result() else {
         return Ok(());
     };
-    let landmark_ty = landmark_op
-        .result_type()
-        .cloned()
-        .unwrap_or(IrType::Index);
+    let landmark_ty = landmark_op.result_type().cloned().unwrap_or(IrType::Index);
 
     // ── FIRE GATE ──
     // ── FIRE GATE ──
@@ -1737,7 +1846,9 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     }
     let mut materialize: HashSet<Ssa> = HashSet::new();
     for (view, ptr) in &view_of {
-        let Some(idxs) = tiles_of.get(view) else { continue };
+        let Some(idxs) = tiles_of.get(view) else {
+            continue;
+        };
         if idxs.len() != n as usize {
             continue;
         }
@@ -1958,17 +2069,25 @@ fn decompose_matmul_accumulators(module: &mut Module) -> Result<()> {
         // A zero splat (or a zero scalar constant) is the `tl.dot` default init: the matmul
         // stands alone and the door's two-input reading is already the whole computation.
         if crate::passes::dot_to_linalg::is_zero_const(module, acc)
-            || module.def_of(acc).is_some_and(|d| d.kind == OpKind::TensorSplat
-                && d.operands.first().is_some_and(|s|
-                    crate::passes::dot_to_linalg::is_zero_const(module, *s)))
+            || module.def_of(acc).is_some_and(|d| {
+                d.kind == OpKind::TensorSplat
+                    && d.operands
+                        .first()
+                        .is_some_and(|s| crate::passes::dot_to_linalg::is_zero_const(module, *s))
+            })
         {
             continue;
         }
-        let Some(res) = mm.results.first().copied() else { continue };
+        let Some(res) = mm.results.first().copied() else {
+            continue;
+        };
         let res_ty = mm.result_types.first().cloned();
         let Some(res_ty) = res_ty else {
-            return Err(refuse("a `linalg.matmul` with an accumulator states no result type, so the zero \
-                 splat that replaces the accumulator cannot be shaped".to_string()));
+            return Err(refuse(
+                "a `linalg.matmul` with an accumulator states no result type, so the zero \
+                 splat that replaces the accumulator cannot be shaped"
+                    .to_string(),
+            ));
         };
         let elem = match &res_ty {
             IrType::Tensor { elem, .. } => *elem,
@@ -2145,7 +2264,9 @@ fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
     };
     let mut folds: Vec<(usize, Fold)> = Vec::new();
     for (i, op) in block.iter().enumerate() {
-        let Some(res) = op.results.first().copied() else { continue };
+        let Some(res) = op.results.first().copied() else {
+            continue;
+        };
         let (a, b) = (op.operands.first().copied(), op.operands.get(1).copied());
         match op.kind {
             // ── the identity folds. The seed is the LEFT operand of every flash chain
@@ -2190,7 +2311,8 @@ fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
                     folds.push((i, Fold::Forward(a)));
                 }
                 // ── splat × splat: fold in f64, re-round to the element type.
-                else if let (Some(x), Some(y)) = (splat_value(module, a), splat_value(module, b)) {
+                else if let (Some(x), Some(y)) = (splat_value(module, a), splat_value(module, b))
+                {
                     folds.push((i, Fold::Const(x.as_f64() * y.as_f64())));
                 }
             }
@@ -2292,12 +2414,20 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
         action: Plan,
     }
     enum Plan {
-        Drop { to: Ssa },
-        Splat { konst: Ssa, elem: DType, val: FloatBits },
+        Drop {
+            to: Ssa,
+        },
+        Splat {
+            konst: Ssa,
+            elem: DType,
+            val: FloatBits,
+        },
     }
     let mut planned: Vec<Planned> = Vec::new();
     for (i, fold) in folds.into_iter().rev() {
-        let Some(op) = walk::at(module, path) else { continue };
+        let Some(op) = walk::at(module, path) else {
+            continue;
+        };
         let _ = op;
         // The op's index within the block may have shifted for earlier splices in this
         // batch -- but the batch was collected in one snapshot and applied in reverse,
@@ -2308,9 +2438,15 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
             full.last_mut().expect("nonempty").1 = i;
             full
         });
-        let Some(op) = walk::at(module, &target) else { continue };
-        let Some(res) = op.results.first().copied() else { continue };
-        let Some(res_ty) = op.result_types.first().cloned() else { continue };
+        let Some(op) = walk::at(module, &target) else {
+            continue;
+        };
+        let Some(res) = op.results.first().copied() else {
+            continue;
+        };
+        let Some(res_ty) = op.result_types.first().cloned() else {
+            continue;
+        };
         let elem = match &res_ty {
             IrType::Tensor { elem, .. } => *elem,
             _ => DType::F32,
@@ -2326,7 +2462,12 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
             Fold::ToSplat(src) => {
                 let val = splat_value(module, src).expect("collected while immutable");
                 let konst = module.fresh_named(&hint);
-                planned.push(Planned { i, res, res_ty, action: Plan::Splat { konst, elem, val } });
+                planned.push(Planned {
+                    i,
+                    res,
+                    res_ty,
+                    action: Plan::Splat { konst, elem, val },
+                });
             }
             Fold::Const(v) => {
                 let val = if elem == DType::F16 {
@@ -2335,12 +2476,19 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
                     FloatBits::f32(v as f32)
                 };
                 let konst = module.fresh_named(&hint);
-                planned.push(Planned { i, res, res_ty, action: Plan::Splat { konst, elem, val } });
+                planned.push(Planned {
+                    i,
+                    res,
+                    res_ty,
+                    action: Plan::Splat { konst, elem, val },
+                });
             }
         }
     }
     for p in planned {
-        let Some(block) = walk::block_mut(module, path) else { continue };
+        let Some(block) = walk::block_mut(module, path) else {
+            continue;
+        };
         if p.i >= block.len() {
             continue;
         }
@@ -2401,8 +2549,14 @@ fn sub_feeds_only_exp2(module: &Module, sub: Ssa) -> bool {
         if u.kind != OpKind::ArithMulf {
             return false;
         }
-        let other = if u.operands[0] == sub { u.operands[1] } else { u.operands[0] };
-        let Some(s) = splat_value(module, other) else { return false };
+        let other = if u.operands[0] == sub {
+            u.operands[1]
+        } else {
+            u.operands[0]
+        };
+        let Some(s) = splat_value(module, other) else {
+            return false;
+        };
         // `<=` rather than `!(> )`: the splat could be NaN, and a NaN is not a positive
         // scale -- the partial-order comparison makes that explicit.
         if s.as_f64() <= 0.0 {
@@ -2413,7 +2567,9 @@ fn sub_feeds_only_exp2(module: &Module, sub: Ssa) -> bool {
             .ops_deep()
             .into_iter()
             .filter(|o| o.operands.contains(&mul_res));
-        let Some(exp) = mul_uses.next() else { return false };
+        let Some(exp) = mul_uses.next() else {
+            return false;
+        };
         if mul_uses.next().is_some() {
             return false;
         }
@@ -2577,7 +2733,9 @@ fn strip_triton_attrs(module: &mut Module) {
     walk::for_each_mut(module, |op| {
         op.attrs.retain(|(k, _)| !k.spelling().starts_with("tt."));
     });
-    module.attrs.retain(|(k, _)| !k.spelling().starts_with("tt."));
+    module
+        .attrs
+        .retain(|(k, _)| !k.spelling().starts_with("tt."));
 }
 
 /// FAIL CLOSED on any op outside the scheduler's dialect list.
@@ -2598,7 +2756,6 @@ fn verify_only_scheduler_dialects(module: &Module) -> Result<()> {
     }
     Ok(())
 }
-
 
 /// THE KTDP -> KTIR STAGE, WHOLE: rewrite, then state the result as `ktir_core::ir::IRFunction`.
 ///
@@ -2677,12 +2834,11 @@ module {
         let zero_splat = ops.iter().any(|o| {
             o.kind == OpKind::TensorSplat
                 && o.operands.first().is_some_and(|s| {
-                    m.def_of(*s)
-                        .is_some_and(|d| {
-                            d.attr(&AttrKey::Value)
-                                .and_then(|a| a.as_float())
-                                .is_some_and(|f| f.as_f64() == 0.0)
-                        })
+                    m.def_of(*s).is_some_and(|d| {
+                        d.attr(&AttrKey::Value)
+                            .and_then(|a| a.as_float())
+                            .is_some_and(|f| f.as_f64() == 0.0)
+                    })
                 })
         });
         assert!(zero_splat, "a splat(0) survives as trip 1's fast-path seed");
@@ -2714,7 +2870,11 @@ module {
         assert!(e.message.contains("the launch grid is required"), "got {e}");
         // 2 x 4 delinearized upstream -> the FLAT extent 8 is the faithful form.
         let m = run_on(REDUCE, &[2, 4]).unwrap();
-        let f = m.ops.iter().find(|o| o.kind == OpKind::FuncFunc).expect("func.func");
+        let f = m
+            .ops
+            .iter()
+            .find(|o| o.kind == OpKind::FuncFunc)
+            .expect("func.func");
         assert_eq!(f.attr(&AttrKey::Grid), Some(&Attr::IntList(vec![8])));
     }
 
@@ -2754,10 +2914,15 @@ module {
         let seed = m
             .ops_deep()
             .into_iter()
-            .find(|o| o.kind == OpKind::ArithConstant && o.result_type() == Some(&IrType::Scalar(DType::F16)))
+            .find(|o| {
+                o.kind == OpKind::ArithConstant
+                    && o.result_type() == Some(&IrType::Scalar(DType::F16))
+            })
             .expect("the identity constant");
         assert_eq!(
-            seed.attr(&AttrKey::Value).and_then(|a| a.as_float()).map(|f| f.bits),
+            seed.attr(&AttrKey::Value)
+                .and_then(|a| a.as_float())
+                .map(|f| f.bits),
             Some(0xFC00),
             "-inf is the identity of max"
         );
@@ -2767,7 +2932,10 @@ module {
     fn a_combiner_with_no_known_identity_is_refused_rather_than_seeded() {
         let src = REDUCE.replace("arith.maxnumf", "arith.divf");
         let e = run_on(&src, &[8]).unwrap_err();
-        assert!(e.message.contains("has no known identity element"), "got {e}");
+        assert!(
+            e.message.contains("has no known identity element"),
+            "got {e}"
+        );
         assert!(e.message.contains("fabricating a seed"), "got {e}");
     }
 
@@ -2792,11 +2960,17 @@ module {
         // legality check accepts the generic and rejects the named op (probe p07), so
         // "improving" this is a silent break.
         assert_eq!(
-            g.regions[0].ops.iter().map(|o| o.kind.spelling()).collect::<Vec<_>>(),
+            g.regions[0]
+                .ops
+                .iter()
+                .map(|o| o.kind.spelling())
+                .collect::<Vec<_>>(),
             vec!["linalg.yield"]
         );
         assert!(
-            !m.ops_deep().iter().any(|o| o.kind.spelling() == "linalg.broadcast"),
+            !m.ops_deep()
+                .iter()
+                .any(|o| o.kind.spelling() == "linalg.broadcast"),
             "the named linalg.broadcast must never be emitted"
         );
         // ins maps the kept dim, outs is the identity.
@@ -2808,7 +2982,10 @@ module {
             ]))
         );
         // And the unit dim was collapsed away first.
-        assert!(m.ops_deep().iter().any(|o| o.kind == OpKind::TensorCollapseShape));
+        assert!(m
+            .ops_deep()
+            .iter()
+            .any(|o| o.kind == OpKind::TensorCollapseShape));
     }
 
     #[test]
@@ -2822,14 +2999,20 @@ module {
             );
         }
         // The corelet plan is DROPPED, not converted -- `ktdf` is a name collision.
-        assert!(!m.ops_deep().iter().any(|o| o.kind == OpKind::KtdfCoreletPlan));
+        assert!(!m
+            .ops_deep()
+            .iter()
+            .any(|o| o.kind == OpKind::KtdfCoreletPlan));
         // And the guard fires on a planted foreign op.
         let mut bad = parse::parse(REDUCE).unwrap();
         bad.ops[0].regions[0]
             .ops
             .push(Op::new(OpKind::Other("tt.histogram".into())));
         let e = run(&mut bad, &[8]).unwrap_err();
-        assert!(e.message.contains("which the scheduler does not register"), "got {e}");
+        assert!(
+            e.message.contains("which the scheduler does not register"),
+            "got {e}"
+        );
     }
 
     /// A MULTI-TRIP GRID LOOP IS UNROLLED, AND `grid` BECOMES `num_cores`.
@@ -2874,11 +3057,18 @@ module {
             "the multi-trip work loop must be unrolled away: every reader downstream walks the \
              function's top level, so a surviving loop hides the body from all of them"
         );
-        let f = m.ops.iter().find(|o| o.kind == OpKind::FuncFunc).expect("func.func");
+        let f = m
+            .ops
+            .iter()
+            .find(|o| o.kind == OpKind::FuncFunc)
+            .expect("func.func");
         let top = &f.regions[0].ops;
 
         // TWO COPIES OF THE BODY, one per trip. One would be a fold in disguise.
-        let casts: Vec<&Op> = top.iter().filter(|o| o.kind == OpKind::ArithIndexCast).collect();
+        let casts: Vec<&Op> = top
+            .iter()
+            .filter(|o| o.kind == OpKind::ArithIndexCast)
+            .collect();
         assert_eq!(
             casts.len(),
             2,
@@ -2894,7 +3084,10 @@ module {
             .find(|o| o.kind == OpKind::KtdpGetComputeTileId)
             .and_then(|o| o.result())
             .expect("the work-distribution landmark survives");
-        assert_eq!(casts[0].operands[0], tid, "trip 0 addresses the landmark itself");
+        assert_eq!(
+            casts[0].operands[0], tid,
+            "trip 0 addresses the landmark itself"
+        );
         let addi = top
             .iter()
             .find(|o| o.kind == OpKind::ArithAddi)
@@ -2905,7 +3098,11 @@ module {
             Some(32),
             "trip t addresses `core_id + t * num_cores`, so trip 1's offset is num_cores"
         );
-        assert_eq!(casts[1].operands[0], addi.result().unwrap(), "trip 1 reads that sum");
+        assert_eq!(
+            casts[1].operands[0],
+            addi.result().unwrap(),
+            "trip 1 reads that sum"
+        );
 
         // AND THE COPY DEFINES ITS OWN NAME. Two copies sharing one SSA name is one trip whose
         // definition the second shadows, and every use would pair with whichever came first.
@@ -3046,20 +3243,30 @@ module {
         assert_eq!(splat.operands, vec![load.results[0]]);
         // The load reads a [1,1] access tile over a [1,1] view of the RETYPED argument:
         // the argument is an `index` now, exactly a pointer parameter.
-        let f = m.ops.iter().find(|o| o.kind == OpKind::FuncFunc).expect("func.func");
+        let f = m
+            .ops
+            .iter()
+            .find(|o| o.kind == OpKind::FuncFunc)
+            .expect("func.func");
         assert_eq!(f.regions[0].args[1].1, IrType::Index);
         let tile = ops
             .iter()
             .find(|o| o.kind == OpKind::KtdpConstructAccessTile)
             .expect("a [1,1] access tile");
-        assert_eq!(tile.result_types[0], IrType::AccessTile { dims: vec![1, 1] });
+        assert_eq!(
+            tile.result_types[0],
+            IrType::AccessTile { dims: vec![1, 1] }
+        );
         let view = ops
             .iter()
             .find(|o| o.kind == OpKind::KtdpConstructMemoryView)
             .expect("a [1,1] memory view");
         assert_eq!(
             view.result_types[0],
-            IrType::MemRef { dims: vec![1, 1], elem: DType::F16 }
+            IrType::MemRef {
+                dims: vec![1, 1],
+                elem: DType::F16
+            }
         );
         // The view's address operand is the argument itself (retyped), and the tile's
         // corner operands are index constants — the form `index_constants` resolves.
@@ -3087,7 +3294,10 @@ module {
             .iter()
             .position(|o| o.kind == OpKind::TensorSplat)
             .unwrap();
-        assert!(view_idx < splat_idx, "the chain dominates the splat at the top level");
+        assert!(
+            view_idx < splat_idx,
+            "the chain dominates the splat at the top level"
+        );
         // And no `tt.*` op survived: the dialect gate is the pass's own contract.
         assert!(
             !ops.iter().any(|o| o.kind.spelling().starts_with("tt.")),
@@ -3113,10 +3323,7 @@ module {
     #[test]
     fn a_splat_of_a_non_float_scalar_argument_is_refused_by_name() {
         let e = run_on(SPLAT_ARG_I32, &[1]).unwrap_err();
-        assert!(
-            e.message.contains("no bind spelling"),
-            "got {e:?}"
-        );
+        assert!(e.message.contains("no bind spelling"), "got {e:?}");
     }
 
     // THE FAIL-CLOSED ARM: a splat of an INTERIOR value. No golden produces this and

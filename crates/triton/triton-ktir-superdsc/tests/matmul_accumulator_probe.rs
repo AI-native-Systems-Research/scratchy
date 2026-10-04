@@ -147,11 +147,20 @@ fn pv_program(acc: Acc) -> KtirNode {
             64,
         ),
         shape(
-            Operation::new(a, Some(t_p), OpKind::KtdpConstructAccessTile, &[v_p, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_p),
+                OpKind::KtdpConstructAccessTile,
+                &[v_p, zero, zero],
+            ),
             64,
             64,
         ),
-        shape(Operation::new(a, Some(val_p), OpKind::KtdpLoad, &[t_p]), 64, 64),
+        shape(
+            Operation::new(a, Some(val_p), OpKind::KtdpLoad, &[t_p]),
+            64,
+            64,
+        ),
         // V: [64, 128]
         shape(
             Operation::new(a, Some(v_v), OpKind::KtdpConstructMemoryView, &[p_v]),
@@ -159,11 +168,20 @@ fn pv_program(acc: Acc) -> KtirNode {
             128,
         ),
         shape(
-            Operation::new(a, Some(t_v), OpKind::KtdpConstructAccessTile, &[v_v, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_v),
+                OpKind::KtdpConstructAccessTile,
+                &[v_v, zero, zero],
+            ),
             64,
             128,
         ),
-        shape(Operation::new(a, Some(val_v), OpKind::KtdpLoad, &[t_v]), 64, 128),
+        shape(
+            Operation::new(a, Some(val_v), OpKind::KtdpLoad, &[t_v]),
+            64,
+            128,
+        ),
         // OUT: [64, 128]
         shape(
             Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
@@ -171,7 +189,12 @@ fn pv_program(acc: Acc) -> KtirNode {
             128,
         ),
         shape(
-            Operation::new(a, Some(t_o), OpKind::KtdpConstructAccessTile, &[v_o, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_o),
+                OpKind::KtdpConstructAccessTile,
+                &[v_o, zero, zero],
+            ),
             64,
             128,
         ),
@@ -192,7 +215,12 @@ fn pv_program(acc: Acc) -> KtirNode {
     };
 
     ops.push(shape(
-        Operation::new(a, Some(prod), OpKind::LinalgMatmul, &[val_p, val_v, acc_operand]),
+        Operation::new(
+            a,
+            Some(prod),
+            OpKind::LinalgMatmul,
+            &[val_p, val_v, acc_operand],
+        ),
         64,
         128,
     ));
@@ -225,11 +253,10 @@ fn descriptors_of(k: &KtirNode) -> Result<String, String> {
     Ok(ops
         .iter()
         .map(|o| {
-            let body = o
-                .op
-                .as_ref()
-                .map(|d| serde_json::to_string(d).expect("a descriptor serializes"))
-                .unwrap_or_else(|| "<no descriptor>".to_string());
+            let body =
+                o.op.as_ref()
+                    .map(|d| serde_json::to_string(d).expect("a descriptor serializes"))
+                    .unwrap_or_else(|| "<no descriptor>".to_string());
             format!("{}\n{}", o.op_name, body)
         })
         .collect::<Vec<_>>()
@@ -267,8 +294,14 @@ fn a_live_accumulator_and_a_zero_one_emit_the_same_descriptor() {
         Ok(j) => j,
     };
 
-    println!("ZERO-INIT `outs`  -> {} bytes of descriptor JSON", zero.len());
-    println!("LIVE      `outs`  -> {} bytes of descriptor JSON", live.len());
+    println!(
+        "ZERO-INIT `outs`  -> {} bytes of descriptor JSON",
+        zero.len()
+    );
+    println!(
+        "LIVE      `outs`  -> {} bytes of descriptor JSON",
+        live.len()
+    );
 
     assert_eq!(
         live, zero,
@@ -306,8 +339,7 @@ fn the_comparison_is_sensitive_to_an_operand_the_door_does_read() {
                 matches!((key, v), (AttrKey::Shape, Attr::IntList(s)) if *s == [64, 128])
             });
             if wide {
-                (*o)
-                    .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![64, 64])))
+                (*o).with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![64, 64])))
             } else {
                 *o
             }

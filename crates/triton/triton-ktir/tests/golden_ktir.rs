@@ -81,7 +81,10 @@ fn the_op_census_matches_the_cpp_per_fixture() {
                 "\n=== {config} ===\ngolden: {}\nours:   {}\n{}",
                 census_line(&g),
                 census_line(&o),
-                d.iter().map(|x| format!("  {x}")).collect::<Vec<_>>().join("\n")
+                d.iter()
+                    .map(|x| format!("  {x}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
     }
@@ -102,11 +105,19 @@ fn the_structure_matches_the_cpp_per_fixture() {
             failures.push(format!(
                 "\n=== {config} ===  {} difference(s)\n{}",
                 d.len(),
-                d.iter().take(25).map(|x| format!("  {x}")).collect::<Vec<_>>().join("\n")
+                d.iter()
+                    .take(25)
+                    .map(|x| format!("  {x}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
     }
-    assert!(failures.is_empty(), "structure differs:{}", failures.join(""));
+    assert!(
+        failures.is_empty(),
+        "structure differs:{}",
+        failures.join("")
+    );
 }
 
 /// THE ONE PLACE WE DELIBERATELY DIVERGE FROM THE C++, recorded rather than silenced.
@@ -154,25 +165,53 @@ fn planted_differences_are_each_caught_by_name() {
         ("op kind", "arith.maxnumf %m_i", "arith.minnumf %m_i"),
         // A TYPE changed: the f16 score tile becomes f32, which is exactly what
         // LegalizeTypes exists to prevent.
-        ("result types", "%p = math.exp2 %qk_44 : tensor<64x64xf16>", "%p = math.exp2 %qk_44 : tensor<64x64xf32>"),
+        (
+            "result types",
+            "%p = math.exp2 %qk_44 : tensor<64x64xf16>",
+            "%p = math.exp2 %qk_44 : tensor<64x64xf32>",
+        ),
         // AN OPERAND REWIRED: the second matmul reads the score tile instead of the
         // probabilities. A rename would be invisible; this is not a rename.
-        ("operands", "linalg.matmul ins(%p, %v_50", "linalg.matmul ins(%qk, %v_50"),
+        (
+            "operands",
+            "linalg.matmul ins(%p, %v_50",
+            "linalg.matmul ins(%qk, %v_50",
+        ),
         // AN ATTRIBUTE changed: the reduction axis. Axis 1 is the last axis, which is
         // what makes the body `independent_rows`; axis 0 mixes rows.
         ("attributes", "<{axis = 1 : i32}>", "<{axis = 0 : i32}>"),
         // THE TRANSPOSE FOLD UNDONE: K read in identity order instead of transposed.
         // This is the fold whose absence doubles the KV cache.
-        ("attributes", "access_tile_order = #map1", "access_tile_order = #map"),
+        (
+            "attributes",
+            "access_tile_order = #map1",
+            "access_tile_order = #map",
+        ),
         // A CONSTANT changed: the qk_scale.
-        ("constant set", "arith.constant 1.275630e-01 : f16", "arith.constant 1.375630e-01 : f16"),
+        (
+            "constant set",
+            "arith.constant 1.275630e-01 : f16",
+            "arith.constant 1.375630e-01 : f16",
+        ),
         // AN OP ADDED.
-        ("op count", "    tt.return", "    %planted = arith.addf %acc_32, %acc_32 : tensor<64x128xf16>\n    tt.return"),
+        (
+            "op count",
+            "    tt.return",
+            "    %planted = arith.addf %acc_32, %acc_32 : tensor<64x128xf16>\n    tt.return",
+        ),
         // THE CORELET PLAN's bounds -- an overlapping split, which the verifier would
         // refuse but which a diff must also see.
-        ("attributes", "ktdf.corelet 1 {data_bounds = [32, 64]}", "ktdf.corelet 1 {data_bounds = [16, 64]}"),
+        (
+            "attributes",
+            "ktdf.corelet 1 {data_bounds = [32, 64]}",
+            "ktdf.corelet 1 {data_bounds = [16, 64]}",
+        ),
         // THE PATTERN itself.
-        ("attributes", "pattern = \"independent_rows\"", "pattern = \"split\""),
+        (
+            "attributes",
+            "pattern = \"independent_rows\"",
+            "pattern = \"split\"",
+        ),
     ];
 
     let mut missed: Vec<String> = Vec::new();
@@ -216,7 +255,10 @@ fn the_golden_agrees_with_itself_so_the_control_is_not_vacuous() {
         let a = parse::parse(&text).unwrap();
         let b = parse::parse(&text).unwrap();
         let d = diff::diff(&a, &b);
-        assert!(d.is_empty(), "{config}: the golden disagrees with itself: {d:?}");
+        assert!(
+            d.is_empty(),
+            "{config}: the golden disagrees with itself: {d:?}"
+        );
     }
 }
 
@@ -240,7 +282,11 @@ fn the_measured_laws_hold_in_the_ports_output() {
                 continue;
             }
             let axis = op.attr(&AttrKey::Axis).and_then(|a| a.as_int());
-            let rank = op.operands.first().and_then(|v| o.type_of(*v)).map(|t| t.rank() as i64);
+            let rank = op
+                .operands
+                .first()
+                .and_then(|v| o.type_of(*v))
+                .map(|t| t.rank() as i64);
             assert_eq!(
                 axis,
                 rank.map(|r| r - 1),
@@ -339,7 +385,11 @@ fn no_accumulation_is_tiled_into_the_kv_loop() {
             if is_grid {
                 continue;
             }
-            let stores = op.ops_deep().iter().filter(|x| x.kind == OpKind::KtdpStore).count();
+            let stores = op
+                .ops_deep()
+                .iter()
+                .filter(|x| x.kind == OpKind::KtdpStore)
+                .count();
             assert_eq!(
                 stores, 0,
                 "{config}: the KV loop contains a store, so the recurrence has been \

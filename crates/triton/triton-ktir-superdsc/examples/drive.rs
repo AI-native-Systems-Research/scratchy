@@ -81,7 +81,11 @@ fn main() {
     let grid: Vec<i64> = args[1]
         .split(',')
         .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().parse().expect("grid is a comma-separated integer list"))
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("grid is a comma-separated integer list")
+        })
         .collect();
     let Some(program) = program_from(program_s) else {
         eprintln!("unknown program `{program_s}`");
@@ -98,7 +102,10 @@ fn main() {
 
     macro_rules! refused {
         ($stage:expr, $err:expr) => {{
-            println!("REFUSED  {config:32} {program_s:10} {:<12} {}", $stage, $err);
+            println!(
+                "REFUSED  {config:32} {program_s:10} {:<12} {}",
+                $stage, $err
+            );
             return;
         }};
     }
@@ -199,8 +206,8 @@ fn main() {
         }
         _ => None,
     };
-    let emitted =
-        geometry_driven.unwrap_or_else(|| triton_ktir_superdsc::emit_node_with(&node, layout.as_ref()));
+    let emitted = geometry_driven
+        .unwrap_or_else(|| triton_ktir_superdsc::emit_node_with(&node, layout.as_ref()));
     match emitted {
         Err(e) => refused!(e.stage, e.message),
         Ok(ops) => {
@@ -232,7 +239,8 @@ fn main() {
             }
             println!(
                 "EMITTED  {config:32} {program_s:10} {:<12} ops={}",
-                "", ops.len()
+                "",
+                ops.len()
             )
         }
     }

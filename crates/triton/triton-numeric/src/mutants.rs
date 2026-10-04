@@ -82,7 +82,10 @@ pub const MUTANT_MIN_ROW_FRACTION: f64 = 0.90;
 /// under-report the changed fraction.
 pub fn changed_row_fraction(a: &[f64], b: &[f64], row_len: usize) -> f64 {
     assert_eq!(a.len(), b.len(), "changed_row_fraction: length mismatch");
-    assert!(row_len > 0, "changed_row_fraction: row_len must be positive");
+    assert!(
+        row_len > 0,
+        "changed_row_fraction: row_len must be positive"
+    );
     assert_eq!(
         a.len() % row_len,
         0,
@@ -406,7 +409,10 @@ pub mod rmsnorm {
         assert_eq!(x.len(), m * d_model, "rmsnorm: x is not [m, d_model]");
         assert_eq!(w.len(), d_model, "rmsnorm: w is not [d_model]");
         if drop.is_some() {
-            assert!(lanes > 0 && d_model.is_multiple_of(lanes), "rmsnorm: d_model must be a whole number of {lanes}-wide sticks");
+            assert!(
+                lanes > 0 && d_model.is_multiple_of(lanes),
+                "rmsnorm: d_model must be a whole number of {lanes}-wide sticks"
+            );
         }
         let mut out = vec![0.0f64; x.len()];
         for r in 0..m {
@@ -599,7 +605,10 @@ pub mod mlp {
     /// that one by `silu_gate_is_the_swiglu_modules_truth`.
     pub fn silu_gate(g: &[f64], u: &[f64]) -> Vec<f64> {
         assert_eq!(g.len(), u.len(), "mlp: g and u must be the same length");
-        g.iter().zip(u).map(|(&gv, &uv)| (gv * sigmoid(gv)) * uv).collect()
+        g.iter()
+            .zip(u)
+            .map(|(&gv, &uv)| (gv * sigmoid(gv)) * uv)
+            .collect()
     }
 
     /// The down projection, `o[i,j] = sum_n h[i,n] * wd[j,n]` with `wd` as `[d_model, d_ff]`.
@@ -718,8 +727,16 @@ pub mod rope {
         assert_eq!(head_dim % 2, 0, "rope: head_dim must be even");
         let half = head_dim / 2;
         assert_eq!(x.len(), rows * head_dim, "rope: x is not [rows, head_dim]");
-        assert_eq!(cos.len(), rows * head_dim, "rope: cos is not [rows, head_dim]");
-        assert_eq!(sin.len(), rows * head_dim, "rope: sin is not [rows, head_dim]");
+        assert_eq!(
+            cos.len(),
+            rows * head_dim,
+            "rope: cos is not [rows, head_dim]"
+        );
+        assert_eq!(
+            sin.len(),
+            rows * head_dim,
+            "rope: sin is not [rows, head_dim]"
+        );
         let mut out = vec![0.0f64; x.len()];
         for r in 0..rows {
             let base = r * head_dim;
@@ -756,13 +773,7 @@ pub mod embedding {
 
     /// The faithful gather: `o[t, :] = table[ids[t], :] * emb_scale` — `embedding.py:113-117`,
     /// which is `GraniteModel.forward`'s first two lines (`embedding.py:162-168`).
-    pub fn truth(
-        ids: &[i64],
-        table: &[f64],
-        v: usize,
-        d_model: usize,
-        emb_scale: f64,
-    ) -> Vec<f64> {
+    pub fn truth(ids: &[i64], table: &[f64], v: usize, d_model: usize, emb_scale: f64) -> Vec<f64> {
         gather(ids, table, v, d_model, emb_scale, 0)
     }
 
@@ -828,7 +839,11 @@ pub mod embedding {
         emb_scale: f64,
         skew: i64,
     ) -> Vec<f64> {
-        assert_eq!(table.len(), v * d_model, "embedding: table is not [v, d_model]");
+        assert_eq!(
+            table.len(),
+            v * d_model,
+            "embedding: table is not [v, d_model]"
+        );
         let mut out = vec![0.0f64; ids.len() * d_model];
         for (t, &id) in ids.iter().enumerate() {
             assert!(
@@ -883,11 +898,7 @@ pub mod decoder {
     ) -> f64 {
         let t = matmul::truth(a, b, m, k, n);
         let x = matmul::transposed_b(a, b, m, k, n);
-        let s: f64 = t
-            .iter()
-            .zip(&x)
-            .map(|(&p, &q)| (p - q) * (p - q))
-            .sum();
+        let s: f64 = t.iter().zip(&x).map(|(&p, &q)| (p - q) * (p - q)).sum();
         (s / t.len() as f64).sqrt()
     }
 }
@@ -950,7 +961,10 @@ mod tests {
         ] {
             let (over, i_over) = bracket(&reference, &env, 1.5);
             let (under, i_under) = bracket(&reference, &env, 0.5);
-            assert_eq!(i_over, i_under, "bracket must pick the same element both ways");
+            assert_eq!(
+                i_over, i_under,
+                "bracket must pick the same element both ways"
+            );
             assert!(
                 exceeds(&reference, &over, &env),
                 "1.5x the per-element bound must EXCEED (env {env:?})"
@@ -962,13 +976,12 @@ mod tests {
             // and exactly at the edge it is still within: the threshold is where the derivation
             // put it, not a hair above or below.
             let (edge, _) = bracket(&reference, &env, 1.0);
-            assert!(!exceeds(&reference, &edge, &env), "1.0x must sit ON the edge");
+            assert!(
+                !exceeds(&reference, &edge, &env),
+                "1.0x must sit ON the edge"
+            );
             // one element only
-            let diff = reference
-                .iter()
-                .zip(&over)
-                .filter(|(a, b)| a != b)
-                .count();
+            let diff = reference.iter().zip(&over).filter(|(a, b)| a != b).count();
             assert_eq!(diff, 1, "bracket must perturb exactly one element");
         }
     }
@@ -1070,9 +1083,17 @@ mod tests {
         // (MUTANT_MIN_ROW_FRACTION) is 0.90 and not 1.0.
         let t = swiglu::truth(&g, &u);
         let differing = t.iter().zip(&swapped).filter(|(a, b)| a != b).count();
-        let fixed_points = g.iter().zip(&u).filter(|(a, b)| **a == 0.0 || **b == 0.0).count();
+        let fixed_points = g
+            .iter()
+            .zip(&u)
+            .filter(|(a, b)| **a == 0.0 || **b == 0.0)
+            .count();
         assert_eq!(fixed_points, 1, "one g == 0 in this fixture");
-        assert_eq!(differing, g.len() - fixed_points, "every non-fixed-point element should move");
+        assert_eq!(
+            differing,
+            g.len() - fixed_points,
+            "every non-fixed-point element should move"
+        );
         // THE WEAK CONTROL, ASSERTED AS WEAK RATHER THAN ASSUMED STRONG: on an exact-f64 path
         // sig_of_u IS swap_gu -- both are g*u*sigmoid(u), differing only in association. The pod's
         // two entries separate only because its model rounds the intermediate product.
@@ -1098,7 +1119,10 @@ mod tests {
         let t = swiglu::truth(&g, &u);
         let ns = swiglu::no_sigmoid(&g, &u);
         for (a, b) in t.iter().zip(&ns) {
-            assert!(a.abs() <= b.abs() + 1e-15, "silu magnitude gate violated by truth");
+            assert!(
+                a.abs() <= b.abs() + 1e-15,
+                "silu magnitude gate violated by truth"
+            );
         }
     }
 
@@ -1138,7 +1162,10 @@ mod tests {
         let env = bounds::rmsnorm(d);
         let (material, total) = rmsnorm::stick_drop_materiality(&x, &w, m, d, 1e-5, lanes, &env);
         assert_eq!(total, d / lanes);
-        assert!(material >= 1, "the max-energy stick must at least be material");
+        assert!(
+            material >= 1,
+            "the max-energy stick must at least be material"
+        );
         assert!(
             material < total,
             "this stimulus was built so some sticks are sub-ULP no-ops; if all {total} are \

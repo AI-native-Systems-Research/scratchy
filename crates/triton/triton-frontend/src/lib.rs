@@ -60,11 +60,11 @@ pub mod diff;
 pub mod mangle;
 pub mod ttir;
 
+pub mod codegen;
+pub mod opt;
 pub mod py;
 pub mod semantic;
 pub mod target;
-pub mod codegen;
-pub mod opt;
 
 pub use ttir::Module;
 

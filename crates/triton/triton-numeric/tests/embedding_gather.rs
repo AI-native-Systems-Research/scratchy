@@ -40,12 +40,23 @@ const CONFIG: &str = "embedding_granite";
 fn table_row(bytes: &[u8], row: usize, d_model: usize) -> Vec<f64> {
     let bpe = 2usize;
     let off = row * d_model * bpe;
-    data::decode_f64(&bytes[off..off + d_model * bpe], d_model, ktir_core::dtypes::DType::F16)
-        .expect("an f16 row decodes")
+    data::decode_f64(
+        &bytes[off..off + d_model * bpe],
+        d_model,
+        ktir_core::dtypes::DType::F16,
+    )
+    .expect("an f16 row decodes")
 }
 
 /// The fixture, its bindings, and the extents read from `meta.json` rather than restated.
-fn load() -> (data::Fixture, Vec<triton_numeric::Binding>, usize, usize, usize, f64) {
+fn load() -> (
+    data::Fixture,
+    Vec<triton_numeric::Binding>,
+    usize,
+    usize,
+    usize,
+    f64,
+) {
     let f = data::Fixture::load(CONFIG).expect("the embedding data");
     let bindings = f.bindings().expect("the embedding bindings");
     let n_tok = f.int("N_TOK").expect("N_TOK") as usize;
@@ -56,14 +67,23 @@ fn load() -> (data::Fixture, Vec<triton_numeric::Binding>, usize, usize, usize, 
 }
 
 fn binding<'a>(b: &'a [triton_numeric::Binding], name: &str) -> &'a triton_numeric::Binding {
-    b.iter().find(|x| x.name == name).unwrap_or_else(|| panic!("no binding `{name}`"))
+    b.iter()
+        .find(|x| x.name == name)
+        .unwrap_or_else(|| panic!("no binding `{name}`"))
 }
 
 /// The token ids, as the kernel reads them: raw i32 little-endian.
 fn ids_of(b: &[triton_numeric::Binding], n_tok: usize) -> Vec<i64> {
     let raw = &binding(b, "desc_ids").bytes;
-    assert_eq!(raw.len(), n_tok * 4, "desc_ids is {} bytes for {n_tok} i32 ids", raw.len());
-    raw.as_chunks::<4>().0.iter()
+    assert_eq!(
+        raw.len(),
+        n_tok * 4,
+        "desc_ids is {} bytes for {n_tok} i32 ids",
+        raw.len()
+    );
+    raw.as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
         .collect()
 }
@@ -112,7 +132,10 @@ fn the_real_gathers_off_by_one_row_exceeds_the_embedding_bound() {
     // anything.
     let truth = mutants::embedding::truth(&cids, &compact, cv, d_model, emb_scale);
     let c = Comparison::new(CONFIG, &truth, &reference, &env).expect("a comparison");
-    println!("  reindexed faithful gather vs ref_out.bin:\n  {}", c.report());
+    println!(
+        "  reindexed faithful gather vs ref_out.bin:\n  {}",
+        c.report()
+    );
     assert!(
         c.within_bound(),
         "the compact reindexing does NOT reproduce the fixture's answer, so this control's mutant \
@@ -219,7 +242,10 @@ fn the_real_gathers_index_stick_wrap_exceeds_the_embedding_bound() {
     // THE CONSTRUCTION'S OWN GATE, before any margin below means anything.
     let truth = mutants::embedding::truth(&cids, &compact, cv, d_model, emb_scale);
     let c = Comparison::new(CONFIG, &truth, &reference, &env).expect("a comparison");
-    println!("  reindexed faithful gather vs ref_out.bin:\n  {}", c.report());
+    println!(
+        "  reindexed faithful gather vs ref_out.bin:\n  {}",
+        c.report()
+    );
     assert!(
         c.within_bound(),
         "the compact reindexing does NOT reproduce the fixture's answer, so this control's mutant \
@@ -291,7 +317,11 @@ fn an_absent_table_row_expands_to_zero_and_that_diverges() {
     let reference = f.reference().expect("ref_out.bin");
     let ids = ids_of(&b, n_tok);
     let table = &binding(&b, "desc_table").bytes;
-    assert_eq!(table.len(), v * d_model * 2, "the expanded table is not [V, D_MODEL] f16");
+    assert_eq!(
+        table.len(),
+        v * d_model * 2,
+        "the expanded table is not [V, D_MODEL] f16"
+    );
 
     // `write_sparse` stores exactly the DISTINCT ids, so any other row index is absent. Which rows
     // those are is not assumed from that rule: the expansion itself is read below.

@@ -73,8 +73,10 @@ fn spec(ids: &str, block_m: i128) -> codegen::KernelSpec {
             ("BLOCK_M", "constexpr"),
         ],
     );
-    s.constexprs
-        .insert("N_TOK".to_string(), triton_frontend::semantic::Val::Int(256));
+    s.constexprs.insert(
+        "N_TOK".to_string(),
+        triton_frontend::semantic::Val::Int(256),
+    );
     s.constexprs
         .insert("V".to_string(), triton_frontend::semantic::Val::Int(512));
     s.constexprs.insert(
@@ -180,12 +182,19 @@ fn control_a_swapped_gather_index_is_caught() {
     let mut hit = false;
     for op in &mut ours.funcs[0].body.blocks[0].ops {
         if op.name == "tt.descriptor_gather" {
-            assert_eq!(op.operands.len(), 3, "gather takes desc, x_offsets, y_offset");
+            assert_eq!(
+                op.operands.len(),
+                3,
+                "gather takes desc, x_offsets, y_offset"
+            );
             op.operands.swap(1, 2);
             hit = true;
         }
     }
-    assert!(hit, "control could not find a tt.descriptor_gather to mutate");
+    assert!(
+        hit,
+        "control could not find a tt.descriptor_gather to mutate"
+    );
     let r = diff::compare(&expected, &ours);
     let found: Vec<&String> = r
         .findings

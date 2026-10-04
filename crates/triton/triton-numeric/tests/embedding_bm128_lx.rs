@@ -72,7 +72,9 @@ fn bm128_refuses_on_residency_at_2_mib_and_computes_the_right_function_at_3() {
     // because bm128's own meta.json records that file's sha256 and the bytes match it. Two configs
     // with the same shape are one `data_dir` apart, so nothing else in this crate could tell the
     // wrong answer from the right one — see `Fixture::reference_dir`.
-    let reference = f.reference().expect("ref_out.bin, through the verified sibling");
+    let reference = f
+        .reference()
+        .expect("ref_out.bin, through the verified sibling");
     let env = bounds::embedding(f.float("EMB_SCALE").expect("EMB_SCALE"));
     println!(
         "  bound   k+ = {:.6e}  k- = {:.6e}  floor = {:.6e}",
@@ -163,7 +165,8 @@ fn bm128_refuses_on_residency_at_2_mib_and_computes_the_right_function_at_3() {
     let cross = Comparison::new("bm128 vs bm64", &got, &got64, &env).expect("a cross comparison");
     println!("  the two blockings against each other: {}", cross.report());
     assert_eq!(
-        cross.max_abs_err, 0.0,
+        cross.max_abs_err,
+        0.0,
         "the two blockings of the SAME kernel over the SAME bytes disagree. `BLOCK_M` is a tiling \
          knob and the gather is data movement, so their outputs are the same f16 values or one of \
          the two reads the wrong rows: {}",

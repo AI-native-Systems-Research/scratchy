@@ -75,7 +75,10 @@ struct Aliases {
 
 impl Aliases {
     fn of(module: &Module) -> Aliases {
-        let mut a = Aliases { map: HashMap::new(), decls: Vec::new() };
+        let mut a = Aliases {
+            map: HashMap::new(),
+            decls: Vec::new(),
+        };
         let mut maps = 0usize;
         let mut sets = 0usize;
         let mut visit = |attrs: &[(AttrKey, Attr)], a: &mut Aliases| {
@@ -108,11 +111,25 @@ impl Aliases {
                 let (n, name) = if kind == "map" {
                     let n = maps;
                     maps += 1;
-                    (n, if n == 0 { "#map".to_string() } else { format!("#map{n}") })
+                    (
+                        n,
+                        if n == 0 {
+                            "#map".to_string()
+                        } else {
+                            format!("#map{n}")
+                        },
+                    )
                 } else {
                     let n = sets;
                     sets += 1;
-                    (n, if n == 0 { "#set".to_string() } else { format!("#set{n}") })
+                    (
+                        n,
+                        if n == 0 {
+                            "#set".to_string()
+                        } else {
+                            format!("#set{n}")
+                        },
+                    )
                 };
                 let _ = n;
                 a.decls.push(format!("{name} = affine_{kind}<{body}>\n"));
@@ -214,7 +231,10 @@ fn indent(n: usize, out: &mut String) {
 
 /// The type of an operand, for the formats that state it.
 fn ty_of(module: &Module, v: Ssa) -> String {
-    module.type_of(v).map(|t| print_type(&t)).unwrap_or_else(|| "<?>".into())
+    module
+        .type_of(v)
+        .map(|t| print_type(&t))
+        .unwrap_or_else(|| "<?>".into())
 }
 
 /// An access tile's ABBREVIATED spelling, which is what `ktdp.load`/`store` use.
@@ -222,9 +242,14 @@ fn abbrev(module: &Module, v: Ssa) -> String {
     match module.type_of(v) {
         Some(IrType::AccessTile { dims }) => format!(
             "<{}xindex>",
-            dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x")
+            dims.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("x")
         ),
-        other => other.map(|t| print_type(&t)).unwrap_or_else(|| "<?>".into()),
+        other => other
+            .map(|t| print_type(&t))
+            .unwrap_or_else(|| "<?>".into()),
     }
 }
 
@@ -250,12 +275,18 @@ fn print_op(
 
     match op.kind {
         OpKind::TtFunc => {
-            let name = op.attr(&AttrKey::SymName).and_then(|a| a.as_str()).unwrap_or("kernel");
+            let name = op
+                .attr(&AttrKey::SymName)
+                .and_then(|a| a.as_str())
+                .unwrap_or("kernel");
             let args: Vec<String> = op
                 .regions
                 .first()
                 .map(|r| {
-                    r.args.iter().map(|(v, t)| format!("{}: {}", n(*v), print_type(t))).collect()
+                    r.args
+                        .iter()
+                        .map(|(v, t)| format!("{}: {}", n(*v), print_type(t)))
+                        .collect()
                 })
                 .unwrap_or_default();
             out.push_str(&format!(
@@ -270,12 +301,18 @@ fn print_op(
         // attribute dictionary and no region), which made the text instrument useless
         // on every post-`ToSchedulerKTIR` module.
         OpKind::FuncFunc => {
-            let name = op.attr(&AttrKey::SymName).and_then(|a| a.as_str()).unwrap_or("kernel");
+            let name = op
+                .attr(&AttrKey::SymName)
+                .and_then(|a| a.as_str())
+                .unwrap_or("kernel");
             let args: Vec<String> = op
                 .regions
                 .first()
                 .map(|r| {
-                    r.args.iter().map(|(v, t)| format!("{}: {}", n(*v), print_type(t))).collect()
+                    r.args
+                        .iter()
+                        .map(|(v, t)| format!("{}: {}", n(*v), print_type(t)))
+                        .collect()
                 })
                 .unwrap_or_default();
             out.push_str(&format!("func.func @{name}({})", args.join(", ")));
@@ -318,7 +355,9 @@ fn print_op(
             };
             out.push_str(&format!(
                 "arith.constant {val} : {}",
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::UnrealizedConversionCast => {
@@ -326,7 +365,9 @@ fn print_op(
                 "builtin.unrealized_conversion_cast {} : {} to {}",
                 list(&op.operands),
                 ty_of(module, op.operands[0]),
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::KtdpGetComputeTileId => out.push_str("ktdp.get_compute_tile_id : index"),
@@ -336,7 +377,13 @@ fn print_op(
                     .and_then(|a| a.as_int_list())
                     .map(|s| {
                         s.iter()
-                            .map(|x| if *x == DYNAMIC { "?".into() } else { x.to_string() })
+                            .map(|x| {
+                                if *x == DYNAMIC {
+                                    "?".into()
+                                } else {
+                                    x.to_string()
+                                }
+                            })
                             .collect::<Vec<_>>()
                             .join(", ")
                     })
@@ -347,8 +394,7 @@ fn print_op(
             // static ones print as literals in the same list, so a mixed view interleaves --
             // no fixture has one, and `build_base_memory_view` emits all-static or all-dynamic
             // for a given descriptor, so the two lists are concatenated rather than merged.
-            let dynamic_ops: Vec<String> =
-                op.operands[1..].iter().map(|v| n(*v)).collect();
+            let dynamic_ops: Vec<String> = op.operands[1..].iter().map(|v| n(*v)).collect();
             let sizes = {
                 let statics = ints(&AttrKey::Shape);
                 let mut parts: Vec<String> = Vec::new();
@@ -382,7 +428,9 @@ fn print_op(
             }
             out.push_str(&format!(
                 " : {}",
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::KtdpConstructAccessTile => {
@@ -400,7 +448,9 @@ fn print_op(
             out.push_str(&format!(
                 " : {} -> {}",
                 ty_of(module, op.operands[0]),
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::KtdpLoad => {
@@ -408,7 +458,9 @@ fn print_op(
                 "ktdp.load {} : {} -> {}",
                 n(op.operands[0]),
                 abbrev(module, op.operands[0]),
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::KtdpStore => {
@@ -421,12 +473,18 @@ fn print_op(
             ));
         }
         OpKind::KtdfCoreletPlan => {
-            let p = op.attr(&AttrKey::Pattern).and_then(|a| a.as_str()).unwrap_or("split");
+            let p = op
+                .attr(&AttrKey::Pattern)
+                .and_then(|a| a.as_str())
+                .unwrap_or("split");
             out.push_str(&format!("ktdf.corelet_plan pattern = \"{p}\""));
             has_body = true;
         }
         OpKind::KtdfCorelet => {
-            let i = op.attr(&AttrKey::Index).and_then(|a| a.as_int()).unwrap_or(0);
+            let i = op
+                .attr(&AttrKey::Index)
+                .and_then(|a| a.as_int())
+                .unwrap_or(0);
             let d = print_attr_dict_of(&op.attrs, &[AttrKey::Index], aliases);
             out.push_str(&format!("ktdf.corelet {i} {{{d}}}"));
         }
@@ -439,19 +497,27 @@ fn print_op(
                 in_tys.join(", "),
                 n(op.operands[2]),
                 ty_of(module, op.operands[2]),
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::TtReduce => {
-            let axis = op.attr(&AttrKey::Axis).and_then(|a| a.as_int()).unwrap_or(0);
+            let axis = op
+                .attr(&AttrKey::Axis)
+                .and_then(|a| a.as_int())
+                .unwrap_or(0);
             out.push_str(&format!(
                 "\"tt.reduce\"({}) <{{axis = {axis} : i32}}> ({{\n",
                 list(&op.operands)
             ));
             let r = &op.regions[0];
             indent(depth, out);
-            let args: Vec<String> =
-                r.args.iter().map(|(v, t)| format!("{}: {}", n(*v), print_type(t))).collect();
+            let args: Vec<String> = r
+                .args
+                .iter()
+                .map(|(v, t)| format!("{}: {}", n(*v), print_type(t)))
+                .collect();
             out.push_str(&format!("^bb0({}):\n", args.join(", ")));
             for inner in &r.ops {
                 print_op(module, names, aliases, inner, depth + 1, out);
@@ -460,7 +526,9 @@ fn print_op(
             out.push_str(&format!(
                 "}}) : ({}) -> {}\n",
                 ty_of(module, op.operands[0]),
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
             return;
         }
@@ -472,12 +540,17 @@ fn print_op(
             ));
         }
         OpKind::TtExpandDims => {
-            let axis = op.attr(&AttrKey::Axis).and_then(|a| a.as_int()).unwrap_or(0);
+            let axis = op
+                .attr(&AttrKey::Axis)
+                .and_then(|a| a.as_int())
+                .unwrap_or(0);
             out.push_str(&format!(
                 "tt.expand_dims {} {{axis = {axis} : i32}} : {} -> {}",
                 list(&op.operands),
                 ty_of(module, op.operands[0]),
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::TtBroadcast
@@ -491,13 +564,19 @@ fn print_op(
                 _ => "to",
             };
             let d = print_attr_dict_of(&op.attrs, &[], aliases);
-            let dict = if d.is_empty() { String::new() } else { format!(" {{{d}}}") };
+            let dict = if d.is_empty() {
+                String::new()
+            } else {
+                format!(" {{{d}}}")
+            };
             out.push_str(&format!(
                 "{}{dict} {} : {} {sep} {}",
                 op.kind.spelling(),
                 list(&op.operands),
                 ty_of(module, op.operands[0]),
-                op.result_type().map(print_type).unwrap_or_else(|| "?".into())
+                op.result_type()
+                    .map(print_type)
+                    .unwrap_or_else(|| "?".into())
             ));
         }
         OpKind::ScfYield | OpKind::TtReturn => {
@@ -555,11 +634,7 @@ fn print_op(
 }
 
 /// An attribute dictionary, skipping the keys a custom format already printed.
-fn print_attr_dict_of(
-    attrs: &[(AttrKey, Attr)],
-    skip: &[AttrKey],
-    aliases: &Aliases,
-) -> String {
+fn print_attr_dict_of(attrs: &[(AttrKey, Attr)], skip: &[AttrKey], aliases: &Aliases) -> String {
     let mut parts: Vec<String> = Vec::new();
     for (k, v) in attrs {
         if skip.contains(k) || matches!(k, AttrKey::SymName | AttrKey::Value | AttrKey::Noinline) {
@@ -581,7 +656,10 @@ fn print_attr_aliased(a: &Attr, aliases: &Aliases) -> String {
         Attr::AffineSet(s) => aliases.name("set", s),
         Attr::AffineMapList(v) => format!(
             "[{}]",
-            v.iter().map(|s| aliases.name("map", s)).collect::<Vec<_>>().join(", ")
+            v.iter()
+                .map(|s| aliases.name("map", s))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         other => print_attr(other),
     }
@@ -593,7 +671,10 @@ pub fn print_attr(a: &Attr) -> String {
         Attr::Int(i) => i.to_string(),
         Attr::IntList(v) => format!(
             "array<i64: {}>",
-            v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Attr::Float(f) | Attr::SplatFloat(f) => print_float(*f),
         Attr::Str(s) => format!("\"{s}\""),
@@ -602,7 +683,10 @@ pub fn print_attr(a: &Attr) -> String {
         Attr::AffineMap(s) => format!("affine_map<{s}>"),
         Attr::AffineMapList(v) => format!(
             "[{}]",
-            v.iter().map(|s| format!("affine_map<{s}>")).collect::<Vec<_>>().join(", ")
+            v.iter()
+                .map(|s| format!("affine_map<{s}>"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Attr::AffineSet(s) => format!("affine_set<{s}>"),
         Attr::Verbatim(s) => s.clone(),
@@ -645,7 +729,13 @@ pub fn print_float(f: FloatBits) -> String {
 pub fn print_type(t: &IrType) -> String {
     let dims = |d: &[i64]| -> String {
         d.iter()
-            .map(|x| if *x == DYNAMIC { "?".to_string() } else { x.to_string() })
+            .map(|x| {
+                if *x == DYNAMIC {
+                    "?".to_string()
+                } else {
+                    x.to_string()
+                }
+            })
             .collect::<Vec<_>>()
             .join("x")
     };
@@ -676,26 +766,43 @@ mod tests {
 
     #[test]
     fn mlir_float_spelling_round_trips_the_flash_constants() {
-        assert_eq!(print_float(FloatBits::f16_from_f32(0.127_517_43)), "1.275630e-01");
+        assert_eq!(
+            print_float(FloatBits::f16_from_f32(0.127_517_43)),
+            "1.275630e-01"
+        );
         // And the f32 the ttir carries, before the re-round.
         assert_eq!(print_float(FloatBits::f32(0.127_517_43)), "1.275170e-01");
         assert_eq!(print_float(FloatBits::f16_from_f32(0.0)), "0.000000e+00");
         assert_eq!(print_float(FloatBits::f16_from_f32(1.0)), "1.000000e+00");
-        assert_eq!(print_float(FloatBits { bits: 0xFC00, width: 16 }), "0xFC00");
+        assert_eq!(
+            print_float(FloatBits {
+                bits: 0xFC00,
+                width: 16
+            }),
+            "0xFC00"
+        );
     }
 
     #[test]
     fn types_print_the_way_mlir_prints_them() {
         assert_eq!(
-            print_type(&IrType::Tensor { dims: vec![64, 128], elem: DType::F16 }),
+            print_type(&IrType::Tensor {
+                dims: vec![64, 128],
+                elem: DType::F16
+            }),
             "tensor<64x128xf16>"
         );
         assert_eq!(
-            print_type(&IrType::AccessTile { dims: vec![128, 64] }),
+            print_type(&IrType::AccessTile {
+                dims: vec![128, 64]
+            }),
             "!ktdp.access_tile<128x64xindex>"
         );
         assert_eq!(
-            print_type(&IrType::MemRef { dims: vec![512, 128], elem: DType::F16 }),
+            print_type(&IrType::MemRef {
+                dims: vec![512, 128],
+                elem: DType::F16
+            }),
             "memref<512x128xf16>"
         );
     }
@@ -724,10 +831,12 @@ mod tests {
                         Op::new(OpKind::ArithConstant)
                             .with_result(c, IrType::Index)
                             .with_attr(AttrKey::Value, Attr::Int(32)),
-                        Op::new(OpKind::ScfFor).with_operands([a, b, c]).with_region(Region {
-                            args: vec![(iv, IrType::Index)],
-                            ops: vec![],
-                        }),
+                        Op::new(OpKind::ScfFor)
+                            .with_operands([a, b, c])
+                            .with_region(Region {
+                                args: vec![(iv, IrType::Index)],
+                                ops: vec![],
+                            }),
                         Op::new(OpKind::TtReturn),
                     ],
                 }),
@@ -782,6 +891,9 @@ module {
         );
         assert_eq!(printed, print(&b), "printing is idempotent\n{printed}");
         let d = super::super::diff::diff(&a, &b);
-        assert!(d.is_empty(), "the round trip changed the structure: {d:?}\n{printed}");
+        assert!(
+            d.is_empty(),
+            "the round trip changed the structure: {d:?}\n{printed}"
+        );
     }
 }

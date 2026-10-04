@@ -29,7 +29,11 @@ fn main() {
     let run = execute(&lowered, &bindings).expect("the emulator runs");
     let got = run.f64s("desc_o").expect("desc_o comes back");
     let reference = f.reference().expect("the reference re-reads");
-    println!("got {} element(s), reference {}", got.len(), reference.len());
+    println!(
+        "got {} element(s), reference {}",
+        got.len(),
+        reference.len()
+    );
 
     // The launch is grid [1,1]: query rows 0..64 of the [1024,128] output, HEAD_DIM=128 wide.
     // Compare the window and the rest separately — the rest must be ZERO in both.

@@ -541,10 +541,7 @@ impl Semantic {
 
     /// `integer_promote_impl` (`semantic.py:50`): C's usual arithmetic conversions.
     pub fn integer_promote(&self, a: &Type, b: &Type) -> Result<Type> {
-        let (ab, bb) = (
-            a.int_bitwidth().unwrap_or(0),
-            b.int_bitwidth().unwrap_or(0),
-        );
+        let (ab, bb) = (a.int_bitwidth().unwrap_or(0), b.int_bitwidth().unwrap_or(0));
         let (asn, bsn) = (a.signedness(), b.signedness());
         if asn == bsn {
             return Ok(if ab > bb { a.clone() } else { b.clone() });
@@ -598,11 +595,13 @@ impl Semantic {
         }
         let (asc, bsc) = (a.scalar(), b.scalar());
         // 1) fp64 wins.
-        if matches!(asc, Type::Float(FloatKind::F64)) || matches!(bsc, Type::Float(FloatKind::F64)) {
+        if matches!(asc, Type::Float(FloatKind::F64)) || matches!(bsc, Type::Float(FloatKind::F64))
+        {
             return Ok(Type::Float(FloatKind::F64));
         }
         // 2) fp32 wins.
-        if matches!(asc, Type::Float(FloatKind::F32)) || matches!(bsc, Type::Float(FloatKind::F32)) {
+        if matches!(asc, Type::Float(FloatKind::F32)) || matches!(bsc, Type::Float(FloatKind::F32))
+        {
             return Ok(Type::f32());
         }
         // 3) fp16.
@@ -690,7 +689,9 @@ impl Semantic {
                 Type::Float(FloatKind::F16) | Type::Float(FloatKind::BF16)
             )
         };
-        if is_narrow_fp(&src) && dst_sca.is_floating() && !matches!(dst_sca, Type::Float(FloatKind::F32))
+        if is_narrow_fp(&src)
+            && dst_sca.is_floating()
+            && !matches!(dst_sca, Type::Float(FloatKind::F32))
         {
             let mid = self.cast(v, &Type::f32())?;
             return self.cast(mid, &dst_sca);
@@ -737,11 +738,7 @@ impl Semantic {
             };
             return Ok(self.emit1(name, &[v], dst_ty, &[]));
         }
-        Err(Error::new(
-            format!("cannot cast {src} to {dst_sca}"),
-            0,
-            0,
-        ))
+        Err(Error::new(format!("cannot cast {src} to {dst_sca}"), 0, 0))
     }
 
     /// `create_int_cast` used directly (not through `cast`), which is what `visit_For`
@@ -858,7 +855,10 @@ impl Semantic {
         };
         if ax > shape.len() {
             return Err(Error::new(
-                format!("expand_dims axis {axis} is out of range for rank {}", shape.len()),
+                format!(
+                    "expand_dims axis {axis} is out of range for rank {}",
+                    shape.len()
+                ),
                 0,
                 0,
             ));
@@ -994,10 +994,7 @@ impl Semantic {
         let ret = self.emit1(name, &[wl, wr], wide_ty, &[]);
         let signed = lt.signedness() != Signedness::Unsigned;
         let (max_v, min_v) = if signed {
-            (
-                (1i128 << (bits - 1)) - 1,
-                -(1i128 << (bits - 1)),
-            )
+            ((1i128 << (bits - 1)) - 1, -(1i128 << (bits - 1)))
         } else {
             ((1i128 << bits) - 1, 0)
         };
@@ -1467,9 +1464,7 @@ impl Semantic {
             Type::Int(16, _) | Type::Int(32, _) => {}
             other => {
                 return Err(Error::new(
-                    format!(
-                        "`.gather`'s index vector must have dtype int16 or int32, got {other}"
-                    ),
+                    format!("`.gather`'s index vector must have dtype int16 or int32, got {other}"),
                     0,
                     0,
                 ))
@@ -1920,7 +1915,10 @@ impl Semantic {
         let shape = ty.shape();
         if axis >= shape.len() {
             return Err(Error::new(
-                format!("reduction axis {axis} is out of range for rank {}", shape.len()),
+                format!(
+                    "reduction axis {axis} is out of range for rank {}",
+                    shape.len()
+                ),
                 0,
                 0,
             ));

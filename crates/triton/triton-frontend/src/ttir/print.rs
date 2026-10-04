@@ -571,8 +571,7 @@ fn print_op(
                 Some(Attr::Str(s)) => symbol(s),
                 _ => "<no callee>".to_string(),
             };
-            let opnd_tys: Vec<String> =
-                op.operands.iter().map(|v| m.ty(*v).to_string()).collect();
+            let opnd_tys: Vec<String> = op.operands.iter().map(|v| m.ty(*v).to_string()).collect();
             let rets = if res_tys.is_empty() {
                 "()".to_string()
             } else {
@@ -676,7 +675,12 @@ fn print_op(
                     if !namer.has(*a) {
                         let hint = m.loc_of(*a).name().map(|s| s.to_string());
                         let nm = namer.assign(*a, hint);
-                        decls.push(format!("%{}: {} {}", nm, m.ty(*a), locs.render_def(&Loc::Unknown)));
+                        decls.push(format!(
+                            "%{}: {} {}",
+                            nm,
+                            m.ty(*a),
+                            locs.render_def(&Loc::Unknown)
+                        ));
                     }
                 }
                 // MLIR prints a region's entry-block label ONLY when the block has arguments,

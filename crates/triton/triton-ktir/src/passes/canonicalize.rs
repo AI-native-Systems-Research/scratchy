@@ -97,7 +97,9 @@ fn fold_index_casts(module: &mut Module) -> bool {
             let k = super::dot_to_linalg::const_int(module, src)?;
             Some((p, op.results[0], k))
         });
-        let Some((path, result, k)) = target else { break };
+        let Some((path, result, k)) = target else {
+            break;
+        };
         // Rewrite the cast in place as the index constant, keeping its result name so
         // every use is already wired.
         {
@@ -139,7 +141,12 @@ fn cse_key(op: &Op) -> Option<String> {
         .map(|(k, v)| format!("{}={:?}", k.spelling(), v))
         .collect();
     attrs.sort();
-    Some(format!("{}|{:?}|{}", op.kind.spelling(), op.result_types, attrs.join(",")))
+    Some(format!(
+        "{}|{:?}|{}",
+        op.kind.spelling(),
+        op.result_types,
+        attrs.join(",")
+    ))
 }
 
 /// Replace later duplicate constants with the first one.
@@ -155,7 +162,9 @@ fn dedup_constants(module: &mut Module) -> bool {
         let mut victims: Vec<OpPath> = Vec::new();
         let mut rewires: Vec<(Ssa, Ssa)> = Vec::new();
         for path in block {
-            let Some(op) = walk::at(module, &path) else { continue };
+            let Some(op) = walk::at(module, &path) else {
+                continue;
+            };
             let Some(key) = cse_key(op) else { continue };
             let result = op.results[0];
             match seen.get(&key) {
@@ -320,7 +329,11 @@ module {
         assert_eq!(def.kind, OpKind::ArithConstant);
         assert_eq!(def.result_type(), Some(&IrType::Index));
         // And the now-dead i32 constant is GONE, not merely unused.
-        assert_eq!(get("arith.constant"), 1, "the dead i32 constant is erased too");
+        assert_eq!(
+            get("arith.constant"),
+            1,
+            "the dead i32 constant is erased too"
+        );
     }
 
     #[test]
@@ -346,7 +359,11 @@ module {
         // AND THE TWO IDENTICAL MULTIPLIES SURVIVE. `canonicalize` is not CSE: the
         // golden keeps two identical index_casts, and a port that merges them is
         // wrong by one op. See `cse_key`.
-        assert_eq!(get("arith.muli"), 2, "canonicalize does NOT CSE non-constants");
+        assert_eq!(
+            get("arith.muli"),
+            2,
+            "canonicalize does NOT CSE non-constants"
+        );
     }
 
     /// THE REGRESSION THE BRIEF NAMES. A value used ONLY inside a loop body is LIVE.
@@ -476,6 +493,9 @@ module {
         let mut m = parse::parse(src).unwrap();
         run(&mut m).unwrap();
         let c = m.census();
-        assert_eq!(c.iter().find(|(k, _)| k == "ktdp.load").map(|(_, v)| *v), Some(1));
+        assert_eq!(
+            c.iter().find(|(k, _)| k == "ktdp.load").map(|(_, v)| *v),
+            Some(1)
+        );
     }
 }

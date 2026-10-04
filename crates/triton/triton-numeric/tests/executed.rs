@@ -56,7 +56,11 @@ fn envelope(f: &data::Fixture) -> bounds::Envelope {
             // ONE LAYER OR TWO IS THE CONFIGURATION, and the kernel name is where it is stated.
             // `constexprs` does not carry a layer count, so reading it off the kernel is reading it
             // from the program rather than from a second statement that could disagree.
-            if f.kernel.contains("two_layers") { 2 } else { 1 },
+            if f.kernel.contains("two_layers") {
+                2
+            } else {
+                1
+            },
         ),
         other => panic!("{}: no derived envelope for fixture `{other}`", f.config),
     }
@@ -310,7 +314,11 @@ fn every_configuration_executes_and_matches_its_fixture_reference() {
         }
     }
 
-    println!("\n=== SUMMARY ===\nran {}/{}: {ran:?}", ran.len(), TEN.len());
+    println!(
+        "\n=== SUMMARY ===\nran {}/{}: {ran:?}",
+        ran.len(),
+        TEN.len()
+    );
     if !missing.is_empty() {
         println!("missing: {missing:?}");
     }
@@ -340,7 +348,10 @@ fn every_configuration_executes_and_matches_its_fixture_reference() {
          gap closed -- delete them from the list and let the comparison gate them."
     );
     // A configuration may be missing ONLY because it is one of the staged-only ones.
-    let unexpected: Vec<&&str> = missing.iter().filter(|c| !STAGED_ONLY.contains(c)).collect();
+    let unexpected: Vec<&&str> = missing
+        .iter()
+        .filter(|c| !STAGED_ONLY.contains(c))
+        .collect();
     assert!(
         unexpected.is_empty(),
         "these configurations have no data and are not on the staged-only list, so the sweep \
@@ -575,8 +586,10 @@ fn granite_width_swiglu_at_three_blockings() {
     /// exactly as designed and the config moved to the running comparisons below, with its own
     /// `test/numeric/swiglu_mlp_granite/` fixture and envelope. The full attribution is in this
     /// test's doc comment.
-    const REFUSE: &[(&str, &[&str])] =
-        &[("swiglu_mlp_granite_flat", &["TensorSplat", "LX capacity exceeded", "[64, 12800]"])];
+    const REFUSE: &[(&str, &[&str])] = &[(
+        "swiglu_mlp_granite_flat",
+        &["TensorSplat", "LX capacity exceeded", "[64, 12800]"],
+    )];
 
     // ---- the configuration that RUNS, and its bytes ----------------------------------------
     let var = format!("TRITON_NUMERIC_STAGED_{}", RUNS.to_uppercase());
@@ -608,7 +621,10 @@ fn granite_width_swiglu_at_three_blockings() {
         (m, d_model, d_ff)
     );
     assert_eq!(
-        (f.int("BLOCK_N").expect("BLOCK_N"), f.int("BLOCK_K").expect("BLOCK_K")),
+        (
+            f.int("BLOCK_N").expect("BLOCK_N"),
+            f.int("BLOCK_K").expect("BLOCK_K")
+        ),
         (64, 2048),
         "the blocking the envelope was derived for"
     );
@@ -675,7 +691,10 @@ fn granite_width_swiglu_at_three_blockings() {
     // loosely than its own arithmetic allows, which is exactly the arrangement this suite refuses.
     let fm = data::Fixture::load(MIDDLE).expect("the middle blocking's fixture metadata");
     assert_eq!(
-        (fm.int("BLOCK_N").expect("BLOCK_N"), fm.int("BLOCK_K").expect("BLOCK_K")),
+        (
+            fm.int("BLOCK_N").expect("BLOCK_N"),
+            fm.int("BLOCK_K").expect("BLOCK_K")
+        ),
         (64, 4096),
         "the middle blocking the envelope below was derived for"
     );
@@ -723,7 +742,10 @@ fn granite_width_swiglu_at_three_blockings() {
     // say which.
     let cross = Comparison::new("mlp::truth vs ref_out", &truth, &reference, &env)
         .expect("the cross comparison");
-    println!("  cross-check (f64 model vs torch reference)\n  {}", cross.report());
+    println!(
+        "  cross-check (f64 model vs torch reference)\n  {}",
+        cross.report()
+    );
     assert!(
         cross.within_bound(),
         "⛔ THE AUTHORED f64 MODEL AND THE AUTHORED TORCH REFERENCE DISAGREE at Granite width, so \
@@ -797,7 +819,10 @@ fn the_granite_blockings_share_one_recorded_sha_map() {
     let flat = read("swiglu_mlp_granite_flat");
     let tiled = read("swiglu_mlp_granite_tiled_k");
     let middle = read("swiglu_mlp_granite");
-    assert!(!flat.trim().is_empty(), "an empty sha map would make this assertion vacuous");
+    assert!(
+        !flat.trim().is_empty(),
+        "an empty sha map would make this assertion vacuous"
+    );
     assert!(
         flat == tiled && flat == middle,
         "⛔ THE THREE GRANITE BLOCKINGS' RECORDED BYTES DIFFER, so executing them against ONE set of \
@@ -836,13 +861,21 @@ fn one_layer_and_two_layers_are_not_interchangeable() {
          advertised"
     );
 
-    for (name, got, wrong_ref) in
-        [("decoder_layer_one_flat", &r1, &r2), ("decoder_two_layers_flat", &r2, &r1)]
-    {
-        let f = if name == "decoder_layer_one_flat" { &one } else { &two };
+    for (name, got, wrong_ref) in [
+        ("decoder_layer_one_flat", &r1, &r2),
+        ("decoder_two_layers_flat", &r2, &r1),
+    ] {
+        let f = if name == "decoder_layer_one_flat" {
+            &one
+        } else {
+            &two
+        };
         let env = envelope(f);
         let c = Comparison::new(name, got, wrong_ref, &env).expect("a cross comparison");
-        println!("cross-control {name} vs the other configuration's reference:\n  {}", c.report());
+        println!(
+            "cross-control {name} vs the other configuration's reference:\n  {}",
+            c.report()
+        );
         assert!(
             !c.within_bound(),
             "⛔⛔ {name}'s OUTPUT SITS INSIDE ITS BOUND AGAINST THE **OTHER** CONFIGURATION'S \

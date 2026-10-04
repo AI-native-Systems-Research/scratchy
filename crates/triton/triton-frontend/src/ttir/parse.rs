@@ -78,7 +78,11 @@ pub fn parse_type(s: &str) -> Option<Type> {
         if let Ok(b) = bits.parse::<u32>() {
             return Some(Type::Int(
                 b,
-                if b == 1 { Signedness::Signless } else { Signedness::Signed },
+                if b == 1 {
+                    Signedness::Signless
+                } else {
+                    Signedness::Signed
+                },
             ));
         }
     }
@@ -264,8 +268,15 @@ impl<'a> Parser<'a> {
             Some(l) => {
                 let inner = l.trim();
                 // loc(#loc12)
-                if let Some(r) = inner.strip_prefix("loc(#").and_then(|r| r.strip_suffix(')')) {
-                    return self.locs.get(&format!("#{r}")).cloned().unwrap_or(Loc::Unknown);
+                if let Some(r) = inner
+                    .strip_prefix("loc(#")
+                    .and_then(|r| r.strip_suffix(')'))
+                {
+                    return self
+                        .locs
+                        .get(&format!("#{r}"))
+                        .cloned()
+                        .unwrap_or(Loc::Unknown);
                 }
                 if inner == "loc(unknown)" {
                     return Loc::Unknown;
@@ -286,7 +297,11 @@ impl<'a> Parser<'a> {
             return Loc::Unknown;
         }
         if let Some(r) = s.strip_prefix('#') {
-            return self.locs.get(&format!("#{r}")).cloned().unwrap_or(Loc::Unknown);
+            return self
+                .locs
+                .get(&format!("#{r}"))
+                .cloned()
+                .unwrap_or(Loc::Unknown);
         }
         if let Some(rest) = s.strip_prefix('"') {
             let close = rest.find('"').unwrap_or(0);
@@ -336,7 +351,10 @@ pub fn parse_module(text: &str) -> Result<Module, ParseError> {
             let t = line.trim();
             if let Some((lhs, rhs)) = t.split_once(" = ") {
                 if lhs.starts_with("#loc") {
-                    if let Some(body) = rhs.trim().strip_prefix("loc(").and_then(|x| x.strip_suffix(')'))
+                    if let Some(body) = rhs
+                        .trim()
+                        .strip_prefix("loc(")
+                        .and_then(|x| x.strip_suffix(')'))
                     {
                         let loc = p.parse_loc_body(body);
                         p.locs.insert(lhs.trim().to_string(), loc);
@@ -457,7 +475,8 @@ fn parse_func(p: &mut Parser, no: usize, line: &str) -> Result<Func, ParseError>
         };
         let loc = p.loc_ref(&loc_s);
         let id = p.new_value(ty.clone(), loc);
-        p.scope.insert(nm.trim().trim_start_matches('%').to_string(), id);
+        p.scope
+            .insert(nm.trim().trim_start_matches('%').to_string(), id);
         arg_types.push(ty);
         block_args.push(id);
     }
@@ -599,7 +618,10 @@ fn apply_close_line(p: &mut Parser, op: &mut Op, close: Option<String>) {
     if let Some(i) = find_top(&body, " -> ") {
         let rhs = body[i + 4..].trim();
         let rhs = rhs.trim_start_matches('(').trim_end_matches(')');
-        let tys: Vec<Type> = split_top(rhs, ',').iter().filter_map(|t| parse_type(t)).collect();
+        let tys: Vec<Type> = split_top(rhs, ',')
+            .iter()
+            .filter_map(|t| parse_type(t))
+            .collect();
         if tys.len() == op.results.len() {
             for (r, t) in op.results.iter().zip(tys) {
                 p.m.values[r.0 as usize].ty = t;
@@ -623,7 +645,9 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
 
     // Split `%res = rest` / `%res:2 = rest`.
     let (result_spec, rest) = match find_top(&body, " = ") {
-        Some(i) if body.starts_with('%') => (Some(body[..i].to_string()), body[i + 3..].to_string()),
+        Some(i) if body.starts_with('%') => {
+            (Some(body[..i].to_string()), body[i + 3..].to_string())
+        }
         _ => (None, body.clone()),
     };
 
@@ -651,7 +675,8 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
     if let Some(s) = extract_braced(&work) {
         for kv in split_top(&s.inner, ',') {
             if let Some((k, v)) = kv.split_once('=') {
-                op.attrs.insert(k.trim().to_string(), parse_attr_value(v.trim()));
+                op.attrs
+                    .insert(k.trim().to_string(), parse_attr_value(v.trim()));
             }
         }
         work = format!("{}{}", &work[..s.start], &work[s.end..]);
@@ -673,9 +698,7 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
                     None => bail!((no, t), "tt.call with an unterminated quoted callee"),
                 }
             } else {
-                let end = rest
-                    .find(['(', ' '])
-                    .unwrap_or(rest.len());
+                let end = rest.find(['(', ' ']).unwrap_or(rest.len());
                 rest[..end].to_string()
             };
             op.attrs.insert("callee".to_string(), Attr::Str(sym));
@@ -692,7 +715,13 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
 
     // ---- comparison predicate --------------------------------------------------
     if name == "arith.cmpi" || name == "arith.cmpf" {
-        let first = work.trim().split(',').next().unwrap_or("").trim().to_string();
+        let first = work
+            .trim()
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let pred: &'static str = match first.as_str() {
             "eq" => "eq",
             "ne" => "ne",
@@ -748,7 +777,10 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
             Some(x) => x,
             None => bail!((no, t), "could not read the scf.for header"),
         };
-        for nm in [lb, ub, step].iter().chain(iter_pairs.iter().map(|(_, r)| r)) {
+        for nm in [lb, ub, step]
+            .iter()
+            .chain(iter_pairs.iter().map(|(_, r)| r))
+        {
             match p.scope.get(nm.as_str()).copied() {
                 Some(id) => op.operands.push(id),
                 None => bail!((no, t), "scf.for refers to an unknown value %{nm}"),
@@ -826,7 +858,11 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
             let base = r.split('#').next().unwrap_or(r);
             // `%V#1` selects result 1 of a multi-result op; the scope stores each result
             // under `base#k`, and `base` alone for single-result ops.
-            let key = if r.contains('#') { r.to_string() } else { base.to_string() };
+            let key = if r.contains('#') {
+                r.to_string()
+            } else {
+                base.to_string()
+            };
             if let Some(id) = p.scope.get(&key).copied() {
                 op.operands.push(id);
             } else if let Some(id) = p.scope.get(base).copied() {
@@ -842,7 +878,10 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
     if let Some(spec) = &result_spec {
         let spec = spec.trim();
         let (base, count) = match spec.split_once(':') {
-            Some((b, c)) => (b.trim_start_matches('%').to_string(), c.trim().parse::<usize>().unwrap_or(1)),
+            Some((b, c)) => (
+                b.trim_start_matches('%').to_string(),
+                c.trim().parse::<usize>().unwrap_or(1),
+            ),
             None => (spec.trim_start_matches('%').to_string(), 1),
         };
         if result_types.len() < count {
@@ -884,7 +923,14 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
 #[allow(clippy::type_complexity)]
 fn parse_scf_for_head(
     work: &str,
-) -> Option<(String, String, String, Vec<(String, String)>, String, String)> {
+) -> Option<(
+    String,
+    String,
+    String,
+    Vec<(String, String)>,
+    String,
+    String,
+)> {
     // `%n = %0 to %1 step %2 iter_args(...) -> (...)  : i32`
     let (iv, rest) = work.trim().split_once(" = ")?;
     let (lb, rest) = rest.split_once(" to ")?;
@@ -1091,7 +1137,10 @@ fn infer_result_types(name: &str, work: &str, op: &Op, p: &Parser) -> Vec<Type> 
             rhs = rhs[..j].trim();
         }
         let rhs = rhs.trim_start_matches('(').trim_end_matches(')');
-        return split_top(rhs, ',').iter().filter_map(|t| parse_type(t)).collect();
+        return split_top(rhs, ',')
+            .iter()
+            .filter_map(|t| parse_type(t))
+            .collect();
     }
     // `scf.for ... -> (types)` was handled above. `iter_args` form without `->` cannot
     // happen in MLIR output.
@@ -1108,7 +1157,10 @@ fn infer_result_types(name: &str, work: &str, op: &Op, p: &Parser) -> Vec<Type> 
                 .filter_map(|t| parse_type(t))
                 .collect();
         }
-        let tys: Vec<Type> = split_top(rhs, ',').iter().filter_map(|t| parse_type(t)).collect();
+        let tys: Vec<Type> = split_top(rhs, ',')
+            .iter()
+            .filter_map(|t| parse_type(t))
+            .collect();
         // Comparisons narrow to i1 (or a tensor of i1).
         if name == "arith.cmpi" || name == "arith.cmpf" {
             return tys
@@ -1127,5 +1179,8 @@ fn infer_result_types(name: &str, work: &str, op: &Op, p: &Parser) -> Vec<Type> 
         };
     }
     // Fall back to the first operand's type (e.g. a bare `arith.negf %x`).
-    op.operands.first().map(|v| vec![p.m.ty(*v).clone()]).unwrap_or_default()
+    op.operands
+        .first()
+        .map(|v| vec![p.m.ty(*v).clone()])
+        .unwrap_or_default()
 }

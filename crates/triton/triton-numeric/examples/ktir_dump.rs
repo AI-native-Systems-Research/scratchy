@@ -5,13 +5,20 @@
 use triton_numeric::lower;
 
 fn main() {
-    let config = std::env::args().nth(1).expect("usage: ktir_dump <config> [ssa]");
+    let config = std::env::args()
+        .nth(1)
+        .expect("usage: ktir_dump <config> [ssa]");
     let ssa_want: Option<u32> = std::env::args().nth(2).and_then(|s| s.parse().ok());
     let l = lower(&config).expect("the config lowers");
 
     // Map SSA -> defining op, so producers can be named on demand.
     let ops: Vec<&ktir_core::ir::Operation> = l.func.ops_deep().into_iter().collect();
-    println!("{}: {} deep ops, {} arguments", config, ops.len(), l.func.arguments.len());
+    println!(
+        "{}: {} deep ops, {} arguments",
+        config,
+        ops.len(),
+        l.func.arguments.len()
+    );
     for (i, (name, ty)) in l.func.arguments.iter().enumerate() {
         println!("  arg{i}: %{name:?} {ty:?}");
     }
@@ -47,8 +54,12 @@ fn main() {
                 if let Some(i) = find(*s) {
                     show(ops[i], &format!("L{level} "));
                     next.extend(ops[i].operands.iter().copied());
-                } else if let Some((i, _)) =
-                    l.func.arguments.iter().enumerate().find(|(_, (a, _))| a == s)
+                } else if let Some((i, _)) = l
+                    .func
+                    .arguments
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (a, _))| a == s)
                 {
                     println!("L{level} %{s:?} is argument {i}");
                 }

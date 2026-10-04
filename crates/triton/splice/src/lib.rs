@@ -83,9 +83,9 @@ use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
 
+use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
-use triton_frontend::codegen::{ArgSpec, KernelSpec};
 
 /// One registry row: the kernel's file and entry, and the STATED classification — declared
 /// data, not logic. Adding a kernel is a row; nothing else in this crate changes.
@@ -104,7 +104,9 @@ pub struct TritonKernelRow {
 /// ⭐ ONE KERNEL PER OP KIND, AND THE OPERAND ORDER IS THE NODE'S. The builder's
 /// `KtirFunc::rmsnorm(x, gamma, out)` and the kernel's `(x, gamma, out)` parameters must
 /// agree parameter-for-parameter; the registry does not permute.
-pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Option<TritonKernelRow> {
+pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(
+    op: &SubOp<F>,
+) -> Option<TritonKernelRow> {
     match op {
         // THE FIRST SPLICE. `Program::RmsNorm`'s consumer body already reads the epsilon
         // off EITHER producer spelling (`math.sqrt` chains — the builder's — or
@@ -321,8 +323,7 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     // A windowed kernel is a follow-on row; until then a node whose regions are not the
     // whole tensors falls through to the builder, which states the corner itself.
     if matches!(node.op, SubOp::SiluMul | SubOp::Elementwise(_)) {
-        let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion,
-                     ir: &SubtileIR<F>| {
+        let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion, ir: &SubtileIR<F>| {
             let s = &ir.tensors[tr.tensor.index()];
             tr.region.rows.start == 0
                 && tr.region.rows.len == s.rows
@@ -359,10 +360,12 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
-        _ => return Err(format!(
-            "triton splice: {} has a registry row but no arity — the row is incomplete",
-            row.kernel
-        )),
+        _ => {
+            return Err(format!(
+                "triton splice: {} has a registry row but no arity — the row is incomplete",
+                row.kernel
+            ))
+        }
     };
     if node.inputs.len() < arity {
         return Err(format!(
@@ -420,7 +423,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // signature entry (`ArgSpec::Constexpr`) and a binding, exactly as the case
             // table's `spec` helper states a configuration.
             for p in ["desc_x", "desc_w", "desc_o"] {
-                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
             }
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -448,13 +454,22 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // `RMS_INVCOLS_TID`, never through `scalarmul_scales`).
             ce("INV_D", Val::Float(1.0 / f64::from(c)))?;
         }
-        (SubOp::MatmulTile { n, weight: scratchy_subtile::lower::GemmWeight::Dense }, "matmul_fwd") => {
+        (
+            SubOp::MatmulTile {
+                n,
+                weight: scratchy_subtile::lower::GemmWeight::Dense,
+            },
+            "matmul_fwd",
+        ) => {
             // A is [M, K] (m from the node's output rows, k from A's own columns); W is
             // the FUF convention's [K, N] region, n from the Linear's own stated width —
             // the tile keeps its Linear's `n` even when col-tiling split the output.
             let k = node.inputs[0].region.cols.len;
             for p in ["desc_a", "desc_w", "desc_o"] {
-                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
             }
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -470,7 +485,13 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("BLOCK_K", Val::Int(i128::from(k)))?;
             ce("BLOCK_N", Val::Int(i128::from(*n)))?;
         }
-        (SubOp::MatmulTile { n, weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic }, "matmul_fp8_fwd") => {
+        (
+            SubOp::MatmulTile {
+                n,
+                weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
+            },
+            "matmul_fp8_fwd",
+        ) => {
             // The arity-3 twin of the dense arm: A [M, K], W fp8-packed [N, K] (the
             // checkpoint's own on-disk layout, 1 byte per element — the descriptor's
             // elem says fp8, the load widens on read), ws the [1, N] per-channel scale
@@ -478,10 +499,22 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // derivations the dense arm states, and the ones `KtirFunc::matmul_fp8`
             // states for the builder path.
             let k = node.inputs[0].region.cols.len;
-            signature.insert("desc_x".to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
-            signature.insert("desc_w".to_string(), ArgSpec::parse("*fp8e4nv").map_err(|e| e.to_string())?);
-            signature.insert("desc_ws".to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
-            signature.insert("desc_o".to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            signature.insert(
+                "desc_x".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+            signature.insert(
+                "desc_w".to_string(),
+                ArgSpec::parse("*fp8e4nv").map_err(|e| e.to_string())?,
+            );
+            signature.insert(
+                "desc_ws".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+            signature.insert(
+                "desc_o".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
                 constexprs.insert(k.to_string(), v);
@@ -501,7 +534,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // The kernel's own parameter spellings: desc_g, desc_u, desc_o, then the
             // constexprs M / N / BLOCK_M / BLOCK_N.
             for p in ["desc_g", "desc_u", "desc_o"] {
-                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
             }
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -517,7 +553,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
         (SubOp::Elementwise(EwKind::Silu), "silu_fwd") => {
             for p in ["desc_x", "desc_o"] {
-                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
             }
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -535,7 +574,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // whole-region single-tile law `lower_elementwise_node` states when the
             // region fits (the splice refused the node otherwise, above).
             for p in ["desc_a", "desc_b", "desc_o"] {
-                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
             }
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -565,7 +607,10 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             }
             let heads = total / hd;
             for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
-                signature.insert(p.to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
             }
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -627,8 +672,7 @@ fn compile_kernel(
         .map_err(|e| format!("triton splice: make_ttir: {e}"))?;
     let mut m = triton_ktir::from_ttir::convert(&tt)
         .map_err(|e| format!("triton splice: from_ttir: {e}"))?;
-    triton_ktir::make_ktir(&mut m, grid)
-        .map_err(|e| format!("triton splice: make_ktir: {e}"))?;
+    triton_ktir::make_ktir(&mut m, grid).map_err(|e| format!("triton splice: make_ktir: {e}"))?;
     triton_ktir::passes::to_ktir::run(&mut m, grid)
         .map_err(|e| format!("triton splice: to_ktir: {e}"))?;
     Ok(m)
@@ -670,11 +714,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
     bindings.push(BufferId::new(node.output.tensor.index() as u32));
     // ⭐ THE NAME IS THE BUILDER'S LAW, so the op_name and the emulator's function key are
     // identical between the two paths — the byte-identity golden's requirement.
-    let name = Arena::global().str(format!(
-        "{}_s{}",
-        program_stem(node, row),
-        node.id.index()
-    ));
+    let name = Arena::global().str(format!("{}_s{}", program_stem(node, row), node.id.index()));
     let KtirNode { func, program, .. } = positional;
     if func.arguments.len() != bindings.len() {
         return Err(format!(

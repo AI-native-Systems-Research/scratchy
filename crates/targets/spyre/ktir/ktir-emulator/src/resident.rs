@@ -324,7 +324,8 @@ impl ResidentExecutor {
             // gets the attention IR rewrites, applied ONCE here before planning.
             let mut module = crate::segmented::module_of(funcs);
             crate::segmented::apply_attention_rewrites(arena, &mut module);
-            let (prog_shapes, prog_dtypes) = crate::segmented::derive_shapes_and_dtypes(&module, spec)?;
+            let (prog_shapes, prog_dtypes) =
+                crate::segmented::derive_shapes_and_dtypes(&module, spec)?;
             for (&id, shp) in &prog_shapes {
                 shapes.entry(id).or_insert_with(|| shp.clone());
             }

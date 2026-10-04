@@ -34,7 +34,10 @@ fn main() {
         .trim()
         .split(',')
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse().expect("grid.txt is a comma-separated integer list"))
+        .map(|s| {
+            s.parse()
+                .expect("grid.txt is a comma-separated integer list")
+        })
         .collect();
 
     let mut m = parse::parse(&ttir).unwrap_or_else(|e| panic!("ttir: {e}"));

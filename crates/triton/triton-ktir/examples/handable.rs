@@ -32,7 +32,11 @@ fn main() {
     let grid: Vec<i64> = args[1]
         .split(',')
         .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().parse().expect("grid is a comma-separated integer list"))
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("grid is a comma-separated integer list")
+        })
         .collect();
 
     let ttir_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -48,13 +48,18 @@ fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // 1. The builder path — the control.
-        let (builder_ops, layout) =
-            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
-                .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
+        let (builder_ops, layout) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
+            .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
         let [builder] = &builder_ops[..] else {
-            panic!("one rmsnorm node lowers to one op, got {}", builder_ops.len())
+            panic!(
+                "one rmsnorm node lowers to one op, got {}",
+                builder_ops.len()
+            )
         };
-        let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+        let builder_ktir = builder
+            .ktir
+            .as_ref()
+            .expect("builder op carries its program");
 
         // 2. The splice — the row compiles the kernel for this node. A width > 2048 is a
         // BUILDER-ONLY node (the f16-sum overflow the width guard documents), and the
@@ -81,17 +86,15 @@ fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
         //    is the thing being pinned.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted = door_lower(
-            builder_ktir,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
+        let builder_emitted =
+            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
+                .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
         let mut sym = 0i64;
         let spliced_emitted = door_lower(
-            spliced.ktir.as_ref().expect("spliced op carries its program"),
+            spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
             &mut quantized,
@@ -160,13 +163,18 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // 1. The builder path — the control.
-        let (builder_ops, layout) =
-            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
-                .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
+        let (builder_ops, layout) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
+            .unwrap_or_else(|e| panic!("builder lowered m={m} c={c}: {e}"));
         let [builder] = &builder_ops[..] else {
-            panic!("one silumul node lowers to one op, got {}", builder_ops.len())
+            panic!(
+                "one silumul node lowers to one op, got {}",
+                builder_ops.len()
+            )
         };
-        let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+        let builder_ktir = builder
+            .ktir
+            .as_ref()
+            .expect("builder op carries its program");
 
         // 2. The splice — the row compiles the kernel for this node. A region whose
         // eight-tile live set exceeds the builder's LX budget is a BUILDER-ONLY node
@@ -189,17 +197,15 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
         // 3. Both programs go through the SAME door under the SAME layout.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted = door_lower(
-            builder_ktir,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
+        let builder_emitted =
+            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
+                .unwrap_or_else(|e| panic!("builder program lowered (m={m} c={c}): {}", e.message));
         let mut sym = 0i64;
         let spliced_emitted = door_lower(
-            spliced.ktir.as_ref().expect("spliced op carries its program"),
+            spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
             &mut quantized,
@@ -223,7 +229,6 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
         }
     }
 }
-
 
 /// `silu(gate) * up -> out` as a one-node [`SubtileIR`]. t0 = gate source, t1 = up
 /// source, t2 = result. Both operands are activations, but the builder path is
@@ -268,7 +273,10 @@ fn a_column_chunked_silumul_falls_through_to_the_builder() {
     let chunk = Range::new(8192, 12800 - 8192);
     let window = |t: usize| TensorRegion {
         tensor: TensorId::from_index(t),
-        region: Region { rows: Range::new(0, 1), cols: chunk },
+        region: Region {
+            rows: Range::new(0, 1),
+            cols: chunk,
+        },
     };
     let mut chunked = ir.clone();
     chunked.nodes[0].inputs = vec![window(0), window(1)];
@@ -328,7 +336,10 @@ fn spliced_elementwise_is_byte_identical_to_the_builder() {
                     builder_ops.len()
                 )
             };
-            let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+            let builder_ktir = builder
+                .ktir
+                .as_ref()
+                .expect("builder op carries its program");
 
             // 2. The splice — the row compiles the kernel for this node. A region whose
             // live set exceeds the builder's LX budget is a BUILDER-ONLY node (the
@@ -352,28 +363,39 @@ fn spliced_elementwise_is_byte_identical_to_the_builder() {
             // ⛔ THE NAME LAW IS PART OF THE GATE — the BUILDER's `ew_kind_stem`
             // (`add_s{id}`, `mul_s{id}`, `sub_s{id}`, `silu_s{id}`; BiasAdd is `add`),
             // read off the producer's kind on both paths.
-            assert_eq!(spliced.op_name, builder.op_name, "op_name ({kind:?} m={m} c={c})");
+            assert_eq!(
+                spliced.op_name, builder.op_name,
+                "op_name ({kind:?} m={m} c={c})"
+            );
 
             // 3. Both programs go through the SAME door under the SAME layout.
             let mut sym = 0i64;
             let mut quantized = HashSet::new();
-            let builder_emitted = door_lower(
-                builder_ktir,
-                &mut sym,
-                Some(&layout),
-                &mut quantized,
-                None,
-            )
-            .unwrap_or_else(|e| panic!("builder program lowered ({kind:?} m={m} c={c}): {}", e.message));
+            let builder_emitted =
+                door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "builder program lowered ({kind:?} m={m} c={c}): {}",
+                            e.message
+                        )
+                    });
             let mut sym = 0i64;
             let spliced_emitted = door_lower(
-                spliced.ktir.as_ref().expect("spliced op carries its program"),
+                spliced
+                    .ktir
+                    .as_ref()
+                    .expect("spliced op carries its program"),
                 &mut sym,
                 Some(&layout),
                 &mut quantized,
                 None,
             )
-            .unwrap_or_else(|e| panic!("spliced program lowered ({kind:?} m={m} c={c}): {}", e.message));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "spliced program lowered ({kind:?} m={m} c={c}): {}",
+                    e.message
+                )
+            });
 
             assert_eq!(
                 builder_emitted.len(),
@@ -387,7 +409,10 @@ fn spliced_elementwise_is_byte_identical_to_the_builder() {
                     bj, sj,
                     "descriptor bytes ({kind:?} m={m} c={c}): builder vs splice diverged"
                 );
-                assert_eq!(b.op_name, s.op_name, "emitted op_name ({kind:?} m={m} c={c})");
+                assert_eq!(
+                    b.op_name, s.op_name,
+                    "emitted op_name ({kind:?} m={m} c={c})"
+                );
             }
         }
     }
@@ -431,10 +456,10 @@ fn elementwise_ir(m: u32, c: u32, kind: EwKind) -> SubtileIR {
 /// The dense fp16 matmul shapes that matter for the delivery scope: granite 2b's hidden
 /// 2048 projections at decode and a prefill rung, plus the wide qkv form. (M, K, N).
 const MATMUL_SHAPES: &[(u32, u32, u32)] = &[
-    (1, 2048, 2048),   // DECODE — the shape every chat token runs
-    (1, 2048, 512),    // decode, non-square
-    (31, 2048, 2048),  // prefill rung, square (both orientations pass extents)
-    (31, 2048, 512),   // NON-SQUARE — the orientation discriminator (a tile of a wide N)
+    (1, 2048, 2048),  // DECODE — the shape every chat token runs
+    (1, 2048, 512),   // decode, non-square
+    (31, 2048, 2048), // prefill rung, square (both orientations pass extents)
+    (31, 2048, 512),  // NON-SQUARE — the orientation discriminator (a tile of a wide N)
 ];
 
 #[test]
@@ -448,13 +473,18 @@ fn spliced_dense_matmul_is_byte_identical_to_the_builder() {
         // fixture's matmul IS the graph result, so its cols equal `result_cols` and the
         // fold would otherwise rewrite the node instead of lowering it — the same
         // condition the splice's own fallthrough conservatively honors.
-        let (builder_ops, layout) =
-            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
-                .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
+        let (builder_ops, layout) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
+            .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
         let [builder] = &builder_ops[..] else {
-            panic!("one matmul node lowers to one op, got {}", builder_ops.len())
+            panic!(
+                "one matmul node lowers to one op, got {}",
+                builder_ops.len()
+            )
         };
-        let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+        let builder_ktir = builder
+            .ktir
+            .as_ref()
+            .expect("builder op carries its program");
 
         // 2. The splice — the row compiles the kernel for this node.
         let node = &ir.nodes[0];
@@ -463,22 +493,24 @@ fn spliced_dense_matmul_is_byte_identical_to_the_builder() {
             .expect("registry has a row for Dense MatmulTile");
 
         // ⛔ THE NAME LAW IS PART OF THE GATE — `matmul_s{id}` on both paths.
-        assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} k={k} n={n})");
+        assert_eq!(
+            spliced.op_name, builder.op_name,
+            "op_name (m={m} k={k} n={n})"
+        );
 
         // 3. Both programs go through the SAME door under the SAME layout.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted = door_lower(
-            builder_ktir,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message));
+        let builder_emitted =
+            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None).unwrap_or_else(
+                |e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message),
+            );
         let mut sym = 0i64;
         let spliced_emitted = door_lower(
-            spliced.ktir.as_ref().expect("spliced op carries its program"),
+            spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
             &mut quantized,
@@ -534,15 +566,26 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
     let spliced = scratchy_triton_splice::lower(node, &ir, true)
         .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"))
         .expect("registry has a row for Dense MatmulTile");
-    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+    let k_node = spliced
+        .ktir
+        .as_ref()
+        .expect("spliced op carries its program");
 
     // The launch binding: parameter `i` -> `bindings[i]`, exactly the pairing
     // `build_spec` reads off `LaunchProgram::args` — the tape's own numbering.
-    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+    let args: Vec<(
+        ktir_core::ir::Ssa,
+        scratchy_target_spyre::bundle_code::PlaceId,
+    )> = k_node
         .func
         .arguments
         .iter()
-        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .map(|(ssa, _ty)| {
+            (
+                *ssa,
+                scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get()),
+            )
+        })
         .collect();
     let group = scratchy_target_spyre::bundle_code::LaunchGroup {
         kv: Default::default(),
@@ -559,8 +602,12 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
     // non-hw arm): A `[m, k]` and the GEMM weight VERBATIM in its on-disk `[n, k]`
     // orientation — the same bytes the builder's transpose-B maps read. The f32
     // reference is over that same buffer: `W[ni, ki]` at `ni * k + ki`.
-    let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
-    let w: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32) * 0.02 - 0.16).collect();
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
+        .collect();
     let mut want = vec![0.0f32; (m * n) as usize];
     for mi in 0..m {
         for ni in 0..n {
@@ -572,11 +619,9 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
         }
     }
 
-    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
-        &[(&[group], &[2u64])],
-        Vec::new(),
-    )
-    .expect("build the one-program session");
+    let mut session =
+        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
+            .expect("build the one-program session");
     let out = session
         .run_step(
             0,
@@ -628,13 +673,24 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
     let spliced = scratchy_triton_splice::lower(node, &ir, false)
         .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"))
         .unwrap_or_else(|| panic!("registry has a row for {kind:?}"));
-    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+    let k_node = spliced
+        .ktir
+        .as_ref()
+        .expect("spliced op carries its program");
 
-    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+    let args: Vec<(
+        ktir_core::ir::Ssa,
+        scratchy_target_spyre::bundle_code::PlaceId,
+    )> = k_node
         .func
         .arguments
         .iter()
-        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .map(|(ssa, _ty)| {
+            (
+                *ssa,
+                scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get()),
+            )
+        })
         .collect();
     let group = scratchy_target_spyre::bundle_code::LaunchGroup {
         kv: Default::default(),
@@ -660,11 +716,9 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         other => unreachable!("exec fixture for {other:?}"),
     };
 
-    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
-        &[(&[group], &[2u64])],
-        Vec::new(),
-    )
-    .expect("build the one-program session");
+    let mut session =
+        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
+            .expect("build the one-program session");
     let sources = if matches!(kind, EwKind::Silu) {
         vec![(0u64, a, vec![m as usize, c as usize])]
     } else {
@@ -716,13 +770,24 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     let spliced = scratchy_triton_splice::lower(node, &ir, false)
         .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"))
         .expect("registry has a row for rope");
-    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+    let k_node = spliced
+        .ktir
+        .as_ref()
+        .expect("spliced op carries its program");
 
-    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+    let args: Vec<(
+        ktir_core::ir::Ssa,
+        scratchy_target_spyre::bundle_code::PlaceId,
+    )> = k_node
         .func
         .arguments
         .iter()
-        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .map(|(ssa, _ty)| {
+            (
+                *ssa,
+                scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get()),
+            )
+        })
         .collect();
     let group = scratchy_target_spyre::bundle_code::LaunchGroup {
         kv: Default::default(),
@@ -777,11 +842,9 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
         }
     }
 
-    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
-        &[(&[group], &[2u64])],
-        Vec::new(),
-    )
-    .expect("build the one-program session");
+    let mut session =
+        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
+            .expect("build the one-program session");
     let out = session
         .run_step(
             0,
@@ -794,7 +857,11 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
         )
         .unwrap_or_else(|_| panic!("run the spliced rope program (mq={mq} heads={heads} hd={hd})"));
     let got = &out[&3];
-    assert_eq!(got.len(), tall * hd as usize, "mq={mq} heads={heads} hd={hd}");
+    assert_eq!(
+        got.len(),
+        tall * hd as usize,
+        "mq={mq} heads={heads} hd={hd}"
+    );
     let mut max_abs = 0.0f32;
     for (g, w) in got.iter().zip(&want) {
         max_abs = max_abs.max((g - w).abs());
@@ -863,13 +930,18 @@ fn spliced_fp8_matmul_is_byte_identical_to_the_builder() {
 
         // 1. The builder path — the control. `rows_are_requests: true` disables the
         // prefill lm-head tail fold, as the dense golden states it.
-        let (builder_ops, layout) =
-            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
-                .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
+        let (builder_ops, layout) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
+            .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
         let [builder] = &builder_ops[..] else {
-            panic!("one fp8 matmul node lowers to one op, got {}", builder_ops.len())
+            panic!(
+                "one fp8 matmul node lowers to one op, got {}",
+                builder_ops.len()
+            )
         };
-        let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+        let builder_ktir = builder
+            .ktir
+            .as_ref()
+            .expect("builder op carries its program");
 
         // 2. The splice — the Fp8Dynamic row compiles the kernel for this node.
         let node = &ir.nodes[0];
@@ -879,25 +951,27 @@ fn spliced_fp8_matmul_is_byte_identical_to_the_builder() {
 
         // ⛔ THE NAME LAW — `matmul_s{id}` on both paths (the stem is the PROGRAM's,
         // and fp8 shares dense's `Program::Matmul`).
-        assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} k={k} n={n})");
+        assert_eq!(
+            spliced.op_name, builder.op_name,
+            "op_name (m={m} k={k} n={n})"
+        );
 
         // 3. Both programs go through the SAME door under the SAME layout. A FRESH
         // `quantized` set per program: at one-node grain neither path dedups, so
         // both emit the full quant chain and the chain itself is compared.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_emitted = door_lower(
-            builder_ktir,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-            None,
-        )
-        .unwrap_or_else(|e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message));
+        let builder_emitted =
+            door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None).unwrap_or_else(
+                |e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message),
+            );
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
         let spliced_emitted = door_lower(
-            spliced.ktir.as_ref().expect("spliced op carries its program"),
+            spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program"),
             &mut sym,
             Some(&layout),
             &mut quantized,
@@ -940,7 +1014,12 @@ fn spliced_fp8_matmul_is_byte_identical_to_the_builder() {
 fn spliced_fp8_matmul_executes_the_real_program() {
     // DECODE (m=1) and a PREFILL rung (m=31), both NON-SQUARE: a square W
     // satisfies both orientation readings.
-    for (m, k, n) in [(1u32, 2048u32, 512u32), (31u32, 2048u32, 512u32), (1u32, 2048u32, 2048u32), (31u32, 2048u32, 2048u32)] {
+    for (m, k, n) in [
+        (1u32, 2048u32, 512u32),
+        (31u32, 2048u32, 512u32),
+        (1u32, 2048u32, 2048u32),
+        (31u32, 2048u32, 2048u32),
+    ] {
         execute_one_spliced_fp8_matmul(m, k, n);
     }
 }
@@ -955,7 +1034,10 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     let spliced = scratchy_triton_splice::lower(node, &ir, true)
         .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"))
         .expect("registry has a row for Fp8Dynamic MatmulTile");
-    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+    let k_node = spliced
+        .ktir
+        .as_ref()
+        .expect("spliced op carries its program");
 
     // The host data, bound EXACTLY as the worker binds it: x `[m, k]` as f16
     // (run_step narrows), W as PACKED e4m3 bytes in its on-disk `[n, k]`
@@ -963,8 +1045,12 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     // checkpoint's own codec), ws `[1, n]` as f16. The reference decodes the
     // same bytes back through `e4m3_to_f32`, so the quantization error is
     // inside both sides and only the COMPUTE is compared.
-    let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
-    let w_val: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32) * 0.02 - 0.16).collect();
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+        .collect();
+    let w_val: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
+        .collect();
     let w: Vec<u8> = w_val
         .iter()
         .map(|&v| ktir_emulator::codec::f32_to_e4m3(v))
@@ -988,13 +1074,22 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     // executor's fp8 binding bug: both paths failed identically before it).
     let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
     let builder_ktir = {
-        let (builder_ops, _layout) =
-            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
-                .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
-        builder_ops[0].ktir.clone().expect("builder op carries its program")
+        let (builder_ops, _layout) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
+            .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
+        builder_ops[0]
+            .ktir
+            .clone()
+            .expect("builder op carries its program")
     };
-    let builder_got = execute_fp8_program(m, k, n, a.clone(), w.clone(), ws.clone(), builder_ktir.clone());
-
+    let builder_got = execute_fp8_program(
+        m,
+        k,
+        n,
+        a.clone(),
+        w.clone(),
+        ws.clone(),
+        builder_ktir.clone(),
+    );
 
     let got = execute_fp8_program(m, k, n, a, w, ws, k_node.clone());
     assert_eq!(got.len(), (m * n) as usize, "m={m} k={k} n={n}");
@@ -1029,11 +1124,19 @@ fn execute_fp8_program(
 ) -> Vec<f32> {
     use std::borrow::Cow;
 
-    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+    let args: Vec<(
+        ktir_core::ir::Ssa,
+        scratchy_target_spyre::bundle_code::PlaceId,
+    )> = k_node
         .func
         .arguments
         .iter()
-        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .map(|(ssa, _ty)| {
+            (
+                *ssa,
+                scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get()),
+            )
+        })
         .collect();
     let group = scratchy_target_spyre::bundle_code::LaunchGroup {
         kv: Default::default(),
@@ -1052,14 +1155,24 @@ fn execute_fp8_program(
     let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
         &[(&[group], &[3u64])],
         vec![
-            (1, w, scratchy_tensors::DType::Fp8E4m3, vec![n as usize, k as usize]),
-            (2, {
-                // ws as f16 bytes: encode the f32 row through the codec the
-                // `Arg::TensorBytes { F16 }` arm expects (typed, zero f32 hop).
-                use ktir_emulator::codec;
-                let f16s: Vec<u16> = ws.iter().map(|&v| codec::f32_to_f16_bits(v)).collect();
-                f16s.iter().flat_map(|&b| b.to_le_bytes()).collect()
-            }, scratchy_tensors::DType::F16, vec![1, n as usize]),
+            (
+                1,
+                w,
+                scratchy_tensors::DType::Fp8E4m3,
+                vec![n as usize, k as usize],
+            ),
+            (
+                2,
+                {
+                    // ws as f16 bytes: encode the f32 row through the codec the
+                    // `Arg::TensorBytes { F16 }` arm expects (typed, zero f32 hop).
+                    use ktir_emulator::codec;
+                    let f16s: Vec<u16> = ws.iter().map(|&v| codec::f32_to_f16_bits(v)).collect();
+                    f16s.iter().flat_map(|&b| b.to_le_bytes()).collect()
+                },
+                scratchy_tensors::DType::F16,
+                vec![1, n as usize],
+            ),
         ],
     )
     .unwrap_or_else(|e| panic!("build the one-program session (m={m} k={k} n={n}): {e}"));
@@ -1166,24 +1279,24 @@ fn spliced_rope_is_byte_identical_to_the_builder() {
                 rows_are_requests,
             )
             .unwrap_or_else(|e| {
-                panic!("builder lowered mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
+                panic!(
+                    "builder lowered mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}"
+                )
             });
             let [builder] = &builder_ops[..] else {
-                panic!(
-                    "one rope node lowers to one op, got {}",
-                    builder_ops.len()
-                )
+                panic!("one rope node lowers to one op, got {}", builder_ops.len())
             };
-            let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+            let builder_ktir = builder
+                .ktir
+                .as_ref()
+                .expect("builder op carries its program");
 
             // 2. The splice — the row compiles the kernel for this node. The splice has
             // no rope-specific fallthrough (the builder's own `total % hd` refusal is
             // mirrored as an Err, not a fallthrough), so a `None` here is a missing row.
             let node = &ir.nodes[0];
             let spliced = scratchy_triton_splice::lower(node, &ir, rows_are_requests)
-                .unwrap_or_else(|e| {
-                    panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}")
-                })
+                .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"))
                 .unwrap_or_else(|| {
                     panic!(
                         "mq={mq} heads={heads} hd={hd}: the splice fell through but rope has a \
@@ -1277,10 +1390,22 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     // t0 = x source (staged [mq*heads, hd], i.e. the [mq, heads*hd] plane reshaped),
     // t1 = cos source (head-tiled [mq*heads, hd]), t2 = sin, t3 = result.
     let tensors = vec![
-        TensorShape { rows: tall, cols: hd },
-        TensorShape { rows: tall, cols: hd },
-        TensorShape { rows: tall, cols: hd },
-        TensorShape { rows: tall, cols: hd },
+        TensorShape {
+            rows: tall,
+            cols: hd,
+        },
+        TensorShape {
+            rows: tall,
+            cols: hd,
+        },
+        TensorShape {
+            rows: tall,
+            cols: hd,
+        },
+        TensorShape {
+            rows: tall,
+            cols: hd,
+        },
     ];
     let whole = |t: usize| TensorRegion {
         tensor: TensorId::from_index(t),

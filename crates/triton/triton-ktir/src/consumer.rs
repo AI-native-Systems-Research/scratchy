@@ -256,8 +256,15 @@ pub const WALKED_OPS: &[&str] = &[
 
 /// The seven `AttrKey`s their walker reads. Anything else we attach is ignored --
 /// which is why gap 4 above is silent rather than loud.
-pub const READ_ATTRS: &[&str] =
-    &["iter_args", "iter_var", "predicate", "reduce_fn", "sizes", "strides", "value"];
+pub const READ_ATTRS: &[&str] = &[
+    "iter_args",
+    "iter_var",
+    "predicate",
+    "reduce_fn",
+    "sizes",
+    "strides",
+    "value",
+];
 
 /// Ops scratchy's own PRODUCER emits that their own WALKER has no arm for.
 ///
@@ -266,8 +273,12 @@ pub const READ_ATTRS: &[&str] =
 /// the evidence that the walker is an incomplete slice against their own producer, not
 /// that our KTIR is unusual -- and because the RUNTIME BROADCAST every softmax needs is
 /// in this list.
-pub const THEIR_PRODUCER_EMITS_BUT_WALKER_LACKS: &[&str] =
-    &["linalg.broadcast", "tensor.empty", "tensor.extract", "linalg.transpose"];
+pub const THEIR_PRODUCER_EMITS_BUT_WALKER_LACKS: &[&str] = &[
+    "linalg.broadcast",
+    "tensor.empty",
+    "tensor.extract",
+    "linalg.transpose",
+];
 
 /// One reason a module cannot be handed to their lowering.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,7 +348,11 @@ pub fn check(module: &Module) -> Vec<Incompatibility> {
                      AttrKey::ReduceFn; probe p07 says the deeptools scheduler wants the \
                      generic and REJECTS the named broadcast. An owner decision, not a \
                      port fix",
-                    if is_reduction { "reduction" } else { "broadcast/elementwise" }
+                    if is_reduction {
+                        "reduction"
+                    } else {
+                        "broadcast/elementwise"
+                    }
                 ),
             });
         }
@@ -502,11 +517,15 @@ module {
         let gaps = summary(&m);
         let names: Vec<&String> = gaps.iter().map(|(g, _)| g).collect();
         assert!(
-            names.iter().any(|g| g.as_str() == "gap1-tt-not-in-vocabulary"),
+            names
+                .iter()
+                .any(|g| g.as_str() == "gap1-tt-not-in-vocabulary"),
             "a tt.* op must be reported as unrepresentable: {gaps:?}"
         );
         assert!(
-            names.iter().any(|g| g.as_str() == "gap2-reduce-combiner-in-a-region"),
+            names
+                .iter()
+                .any(|g| g.as_str() == "gap2-reduce-combiner-in-a-region"),
             "and its region-body combiner named separately: {gaps:?}"
         );
     }
@@ -527,7 +546,9 @@ module {
         let m = parse::parse(src).unwrap();
         let found = check(&m);
         assert!(
-            found.iter().any(|i| i.gap == "gap4-transpose-dropped-silently"),
+            found
+                .iter()
+                .any(|i| i.gap == "gap4-transpose-dropped-silently"),
             "the K^T read must be flagged: {found:?}"
         );
     }
@@ -550,7 +571,9 @@ module {
         let m = parse::parse(src).unwrap();
         let found = check(&m);
         assert!(
-            !found.iter().any(|i| i.gap == "gap4-transpose-dropped-silently"),
+            !found
+                .iter()
+                .any(|i| i.gap == "gap4-transpose-dropped-silently"),
             "an identity order is fine: {found:?}"
         );
     }
@@ -563,7 +586,10 @@ module {
         );
         // And the attribute set is the seven their walker reads.
         assert_eq!(READ_ATTRS.len(), 7);
-        assert!(!READ_ATTRS.contains(&"access_tile_order"), "gap 4's premise");
+        assert!(
+            !READ_ATTRS.contains(&"access_tile_order"),
+            "gap 4's premise"
+        );
         // Gap 4's premise is that their WALKER reads no order attribute -- not that
         // their type lacks one. `CoordinateOrder` and `Permutation` both exist in their
         // AttrKey, which is why the fix is small.

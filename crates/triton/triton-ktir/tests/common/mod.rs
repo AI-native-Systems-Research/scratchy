@@ -49,7 +49,10 @@ pub fn grid(config: &str) -> Vec<i64> {
         .trim()
         .split(',')
         .filter(|s| !s.is_empty())
-        .map(|s| s.parse().expect("grid.txt holds a comma-separated integer list"))
+        .map(|s| {
+            s.parse()
+                .expect("grid.txt holds a comma-separated integer list")
+        })
         .collect()
 }
 

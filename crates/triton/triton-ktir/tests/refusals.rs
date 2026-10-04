@@ -91,7 +91,11 @@ fn a_one_stick_tile_is_planned_as_single_corelet_and_matches_the_cpp() {
             findings.is_empty(),
             "{config}: our KTIR differs from the C++'s in {} place(s):{}",
             findings.len(),
-            findings.iter().map(|f| format!("\n    {f}")).collect::<Vec<_>>().join("")
+            findings
+                .iter()
+                .map(|f| format!("\n    {f}"))
+                .collect::<Vec<_>>()
+                .join("")
         );
 
         // AND THE PLAN MUST SAY `single_corelet`, named separately: a diff that agreed on
@@ -101,7 +105,11 @@ fn a_one_stick_tile_is_planned_as_single_corelet_and_matches_the_cpp() {
             .into_iter()
             .filter(|o| o.kind == triton_ktir::ir::OpKind::KtdfCoreletPlan)
             .collect();
-        assert_eq!(plans.len(), 1, "{config}: expected exactly one corelet plan");
+        assert_eq!(
+            plans.len(),
+            1,
+            "{config}: expected exactly one corelet plan"
+        );
         assert_eq!(
             plans[0]
                 .attr(&triton_ktir::ir::AttrKey::Pattern)
@@ -151,7 +159,10 @@ fn the_same_kernel_at_two_sticks_is_accepted() {
     // [0, 1] and [1, 2], which the verifier accepts.
     let ttir = golden("vector_add", "0_ttir.mlir")
         .replace("64xf16", "128xf16")
-        .replace("%c64_i32 = arith.constant 64 : i32", "%c64_i32 = arith.constant 128 : i32");
+        .replace(
+            "%c64_i32 = arith.constant 64 : i32",
+            "%c64_i32 = arith.constant 128 : i32",
+        );
     let mut m = parse::parse(&ttir).expect("the widened ttir must parse");
     triton_ktir::make_ktir(&mut m, &[8]).unwrap_or_else(|e| {
         panic!(
@@ -166,10 +177,19 @@ fn the_same_kernel_at_two_sticks_is_accepted() {
         .into_iter()
         .find(|o| o.kind == OpKind::KtdfCoreletPlan)
         .expect("a plan is inserted");
-    assert_eq!(plan.attr(&AttrKey::Pattern).and_then(|a| a.as_str()), Some("split"));
+    assert_eq!(
+        plan.attr(&AttrKey::Pattern).and_then(|a| a.as_str()),
+        Some("split")
+    );
     let cs = &plan.regions[0].ops;
-    assert_eq!(cs[0].attr(&AttrKey::DataBounds), Some(&Attr::IntList(vec![0, 1])));
-    assert_eq!(cs[1].attr(&AttrKey::DataBounds), Some(&Attr::IntList(vec![1, 2])));
+    assert_eq!(
+        cs[0].attr(&AttrKey::DataBounds),
+        Some(&Attr::IntList(vec![0, 1]))
+    );
+    assert_eq!(
+        cs[1].attr(&AttrKey::DataBounds),
+        Some(&Attr::IntList(vec![1, 2]))
+    );
 }
 
 /// `bias_add_f32` never reaches this crate: it dies in bridge one.
@@ -279,7 +299,11 @@ fn the_runtime_extent_path_matches_the_cpp() {
     );
     // Still asserted: no op we emit is absent from the C++'s. A real miscompile here would not
     // look like the omission this used to be.
-    let theirs: Vec<&str> = golden_m.ops_deep().iter().map(|o| o.kind.spelling()).collect();
+    let theirs: Vec<&str> = golden_m
+        .ops_deep()
+        .iter()
+        .map(|o| o.kind.spelling())
+        .collect();
     for op in m.ops_deep() {
         assert!(
             theirs.contains(&op.kind.spelling()),
@@ -299,7 +323,8 @@ fn the_runtime_extent_path_matches_the_cpp() {
         "the base plus one runtime extent; a sentinel in the static list is not an extent"
     );
     assert_eq!(
-        view.attr(&triton_ktir::ir::AttrKey::Shape).and_then(|a| a.as_int_list()),
+        view.attr(&triton_ktir::ir::AttrKey::Shape)
+            .and_then(|a| a.as_int_list()),
         Some(&[][..]),
         "a fully dynamic rank-1 view has an EMPTY static `sizes` list"
     );

@@ -61,7 +61,10 @@ fn check_case_on(case: &common::Case, target: Target) {
     };
     let report = diff::compare_to_golden_text(&golden, &ours);
     if !report.ok() {
-        eprintln!("---- OUR TTIR for {name} ----\n{}", ttir::print::print_module(&ours));
+        eprintln!(
+            "---- OUR TTIR for {name} ----\n{}",
+            ttir::print::print_module(&ours)
+        );
         panic!(
             "`{name}` does not match its golden structurally:\n{}",
             report.render()
@@ -98,7 +101,8 @@ fn check_case_stale_on(case: &common::Case, target: Target, pinned_findings: usi
         "`{name}`: the diff matched ZERO ops -- that is a diff comparing nothing"
     );
     assert_eq!(
-        got, pinned_findings,
+        got,
+        pinned_findings,
         "`{name}`: the stale-golden pin moved ({pinned_findings} recorded, {got} now): \
          regenerate the golden and use check_case_on, or re-record the pin AND file why.\n{}",
         report.render()
@@ -284,8 +288,8 @@ fn every_matching_fixture_is_target_independent() {
 fn both_sides() -> (ttir::Module, ttir::Module) {
     let src = common::fixture_src("vector_add");
     let golden = common::golden("vector_add").expect("vector_add golden");
-    let expected = ttir::parse::parse_module(&golden)
-        .unwrap_or_else(|e| panic!("golden did not parse: {e}"));
+    let expected =
+        ttir::parse::parse_module(&golden).unwrap_or_else(|e| panic!("golden did not parse: {e}"));
     let ours = codegen::compile(&src, &common::vector_add().spec, Target::spyre())
         .expect("vector_add compiles");
     (expected, ours)
@@ -395,7 +399,10 @@ fn control_planted_attribute_is_caught() {
             }
         }
     }
-    assert!(hit, "control could not find an `arith.constant 64` to mutate");
+    assert!(
+        hit,
+        "control could not find an `arith.constant 64` to mutate"
+    );
     let r = diff::compare(&expected, &ours);
     let found = findings_mentioning(&r, ".attr[value]:");
     assert!(
@@ -413,8 +420,7 @@ fn control_planted_predicate_is_caught() {
     for op in first_func_ops(&mut ours) {
         if op.name == "arith.cmpi" {
             if let Some(Attr::Pred("sle")) = op.attrs.get("predicate") {
-                op.attrs
-                    .insert("predicate".to_string(), Attr::Pred("sgt"));
+                op.attrs.insert("predicate".to_string(), Attr::Pred("sgt"));
                 hit = true;
                 break;
             }

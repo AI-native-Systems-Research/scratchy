@@ -93,9 +93,16 @@ pub fn node_for(m: &triton_ktir::ir::Module, program: Program) -> Result<KtirNod
     // it renders an operand name for it and looks it up in a `BundleLayout`, never asking what
     // the buffer holds, because extents/strides/format all come from the program's own
     // `ktdp.construct_memory_view`. So there is nothing to invent here.
-    let bindings: Vec<BufferId> =
-        (0..func.arguments.len()).map(|i| BufferId::new(i as u32)).collect();
-    Ok(KtirNode { func, program, bindings, mask: None, node_out_tid: None })
+    let bindings: Vec<BufferId> = (0..func.arguments.len())
+        .map(|i| BufferId::new(i as u32))
+        .collect();
+    Ok(KtirNode {
+        func,
+        program,
+        bindings,
+        mask: None,
+        node_out_tid: None,
+    })
 }
 
 /// Hand one node to the entry point its `Program` names, under a layout DERIVED FROM THE PROGRAM.
@@ -153,10 +160,10 @@ fn emit_regions(
             // dense", which is what a `Program::Elementwise` node with resolved regions is.
             emit::lower_ktir_to_superdsc::elementwise(name, kind, regions, &[], &mut sym, layout)
         }
-        Program::SiluMul => {
-            emit::lower_ktir_to_superdsc::silumul(name, regions, &mut sym, layout)
+        Program::SiluMul => emit::lower_ktir_to_superdsc::silumul(name, regions, &mut sym, layout),
+        Program::LmLast => {
+            emit::lower_ktir_to_superdsc::lmlast(name, node, regions, &mut sym, layout)
         }
-        Program::LmLast => emit::lower_ktir_to_superdsc::lmlast(name, node, regions, &mut sym, layout),
         Program::Transpose => {
             emit::lower_ktir_to_superdsc::transpose(name, regions, &mut sym, layout)
         }
@@ -180,7 +187,12 @@ fn emit_regions(
             let mut disagree = false;
             for op in &mms {
                 match emit::whole_function::matmul_b_orientation(&node.func, op) {
-                    Err(e) => return Err(Error { stage: "b-orientation", message: e.message }),
+                    Err(e) => {
+                        return Err(Error {
+                            stage: "b-orientation",
+                            message: e.message,
+                        })
+                    }
                     Ok(b) => match orient {
                         None => orient = Some(b),
                         Some(prev) if prev != b => disagree = true,
@@ -233,7 +245,10 @@ fn emit_regions(
             })
         }
     };
-    out.map_err(|e| Error { stage: "ktir-superdsc", message: format!("{e:?}") })
+    out.map_err(|e| Error {
+        stage: "ktir-superdsc",
+        message: format!("{e:?}"),
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -337,12 +352,11 @@ pub fn drive_rope(
         message: format!("{e:?}"),
     })?;
     // x, cos, sin, out — `KtirFunc::rope`'s parameters, and `RopeAt`'s four names in order.
-    let (ins, out) = emit::lower_ktir_to_superdsc::split_out(name, &r, layout, 3).map_err(|e| {
-        Error {
+    let (ins, out) =
+        emit::lower_ktir_to_superdsc::split_out(name, &r, layout, 3).map_err(|e| Error {
             stage: "ktir-superdsc",
             message: format!("{e:?}"),
-        }
-    })?;
+        })?;
     if head_dim == 0 || total == 0 || !total.is_multiple_of(head_dim) {
         return Err(Error {
             stage: "geometry",
@@ -471,8 +485,11 @@ pub fn dump(node: &KtirNode) -> String {
             let pad = "  ".repeat(depth + 1);
             let res = o.result.map(|r| format!("%{} = ", r.0)).unwrap_or_default();
             let ins: Vec<String> = o.operands.iter().map(|v| format!("%{}", v.0)).collect();
-            let attrs: Vec<String> =
-                o.attributes.iter().map(|(k, v)| format!("{k:?}={v:?}")).collect();
+            let attrs: Vec<String> = o
+                .attributes
+                .iter()
+                .map(|(k, v)| format!("{k:?}={v:?}"))
+                .collect();
             let _ = writeln!(
                 s,
                 "{pad}{res}{:?}({}) {}",
@@ -497,17 +514,13 @@ pub fn dump(node: &KtirNode) -> String {
 /// decoder layer. `emit::whole_function::lower_function` walks the ops instead, handing each body
 /// only its own operands' regions. It recognises nothing: an op with no 1:1 `Program` is refused by
 /// name rather than assigned a node kind on the producer's behalf.
-pub fn emit_whole(
-    node: &KtirNode,
-    layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
+pub fn emit_whole(node: &KtirNode, layout: Option<&BundleLayout>) -> Result<Vec<EmittedOp>, Error> {
     let mut sym = 0i64;
     ktir_superdsc::emit::whole_function::lower_function(node, layout, &mut sym).map_err(|e| Error {
         stage: "whole-function",
         message: format!("{e:?}"),
     })
 }
-
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE ROPE PATH, DRIVEN FROM THE FIXTURE — the measurement `examples/bake_py` cannot make.
@@ -543,7 +556,10 @@ mod rope_from_the_fixture {
             ("BLOCK_M", Val::Int(64)),
             ("HALF", Val::Int(64)),
         ] {
-            signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
             constexprs.insert(k.to_string(), v);
         }
         let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -557,7 +573,8 @@ mod rope_from_the_fixture {
             file: file.to_string_lossy().to_string(),
         };
         let src = std::fs::read_to_string(&file).expect("read rope.py");
-        let mut tt = triton_frontend::codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
+        let mut tt =
+            triton_frontend::codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
         triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
         let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
         let grid = vec![4, 8];
@@ -671,7 +688,11 @@ mod rope_from_the_fixture {
         // `rope_fwd`'s parameters are `desc_x, desc_cos, desc_sin, desc_o` and `regions()` pairs them
         // BY POSITION with the bindings, so 1 and 2 are the two angle tables. `[N_TOK, HALF]` =
         // `[256, 64]` is the extent `rope.py` declared before `bad6820b5` widened it.
-        assert_eq!(r.len(), 4, "four parameters, or 1 and 2 are not cos and sin");
+        assert_eq!(
+            r.len(),
+            4,
+            "four parameters, or 1 and 2 are not cos and sin"
+        );
         r[1].v_rows = 256;
         r[1].v_cols = 64;
         r[2].v_rows = 256;
@@ -713,7 +734,11 @@ mod rope_from_the_fixture {
             ),
         };
         assert_eq!(e.stage, "geometry");
-        assert!(e.message.contains("does not belong to this program"), "{}", e.message);
+        assert!(
+            e.message.contains("does not belong to this program"),
+            "{}",
+            e.message
+        );
     }
 }
 
@@ -738,8 +763,20 @@ mod decoder_from_the_fixture {
         use triton_frontend::target::Target;
         let mut signature = std::collections::HashMap::new();
         for p in [
-            "desc_x", "desc_o", "desc_n1", "desc_wq", "desc_wk", "desc_wv", "desc_wo", "desc_mask",
-            "desc_cos", "desc_sin", "desc_n2", "desc_wg", "desc_wu", "desc_wd",
+            "desc_x",
+            "desc_o",
+            "desc_n1",
+            "desc_wq",
+            "desc_wk",
+            "desc_wv",
+            "desc_wo",
+            "desc_mask",
+            "desc_cos",
+            "desc_sin",
+            "desc_n2",
+            "desc_wg",
+            "desc_wu",
+            "desc_wd",
         ] {
             signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("signature"));
         }
@@ -755,7 +792,10 @@ mod decoder_from_the_fixture {
             ("QK_SCALE", Val::Float(0.011271055)), // 0.0078125 * 1.44269504, folded (Python's literal, bit-identical; do NOT substitute std's LOG2_E — its f64 spelling differs)
             ("RM", Val::Float(0.22)),
         ] {
-            signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
             constexprs.insert(k.to_string(), v);
         }
         let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -815,7 +855,10 @@ mod decoder_from_the_fixture {
             ktir_superdsc::placement::SegRole::Logits.segment(),
         ];
         want.sort();
-        assert_eq!(segs, want, "reads pack into one segment, stores into another");
+        assert_eq!(
+            segs, want,
+            "reads pack into one segment, stores into another"
+        );
         // AND THE PROOF THAT MAKES PACKING SAFE, re-stated as a test rather than trusted of the
         // arithmetic: no two placements share a 128-B granule of one segment. `for_regions` runs
         // `overlaps_none` itself, so this asserts the same fact the other way round — from the
@@ -885,7 +928,10 @@ mod paged_score_from_the_fixture {
             ("BLOCK_M", Val::Int(8)),
             ("HEAD_DIM", Val::Int(64)),
         ] {
-            signature.insert(k.to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
+            signature.insert(
+                k.to_string(),
+                ArgSpec::parse("constexpr").expect("constexpr"),
+            );
             constexprs.insert(k.to_string(), v);
         }
         let file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -928,7 +974,10 @@ mod paged_score_from_the_fixture {
             "the ids' span must end at the pre-fix high-water 17664 B, or the slack test is \
              not measuring this defect"
         );
-        assert_eq!(ids.segment, ktir_superdsc::placement::SegRole::Activation.segment());
+        assert_eq!(
+            ids.segment,
+            ktir_superdsc::placement::SegRole::Activation.segment()
+        );
     }
 
     /// ⭐ THE FIX: the same layout now advances the high-water ONE GRANULE past the ids' span —
