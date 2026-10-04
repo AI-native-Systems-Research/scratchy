@@ -2481,6 +2481,24 @@ const _: () = {
     assert!(GroupSize::PRODUCTION.trips() <= GroupSize::CEILING);
 };
 
+/// ⛔ THE LARGEST SINGLE dxp GROUP A BUNDLE MAY STAGE (descriptors). Distinct from
+/// [`GroupSize::CEILING`]: that is the largest value the per-kind cap may be SET to; this is the
+/// largest group the whole partition may produce once the uncapped kinds (gathered PageFold,
+/// `run_may_be_chunked == false`) and time-trip fan-out have had their say. MEASURED: granite-8b
+/// fp8 — the accepted 30-minute bake — never exceeds ~512; gemma-4-12b fp8 staged 8,300 (one dxp
+/// child, 2.5+ h, killed still running) and 4.1-4.2k siblings on the same curve. A group past this
+/// ceiling is a build error (the oversized-group guard in `ktir_groups_via_superdsc`), not a
+/// multi-hour dxp that looks like a hang.
+pub struct DxGroupCeiling;
+
+impl DxGroupCeiling {
+    /// 512: the granite baseline's largest observed group, deliberately equal to
+    /// `GroupSize::CEILING` so the capped kinds cannot drift past it either. Headroom above the
+    /// baseline's real max exists if a legitimate model needs it — but it must be a MEASURED
+    /// decision that moves this constant, never a silent one that lets a monster group through.
+    pub const MAX_DESCRIPTORS: usize = 512;
+}
+
 /// Medium-grain fusion group size (trips per concrete dxp bundle) — [`GroupSize::PRODUCTION`].
 /// Stays a function so the pure `group_ranges` takes it as an argument and CBMC keeps its bound
 /// (see `plan_capped`); it no longer reads the environment.
@@ -2657,6 +2675,30 @@ fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usiz
         }
     }
     (kinds, owner)
+}
+
+/// The FIRST launch group whose descriptor count exceeds `ceiling`, as `(group index, size, first
+/// op name, last op name)` — `None` when every group is at or under it. This is the whole
+/// oversized-dxp-group guard's decision, factored PURE (no I/O, no bake state) so the tests drive
+/// the REAL partition walk — `trip_kinds_for` + [`group_ranges`] at [`group_size`] — exactly as
+/// `ktir_groups_via_superdsc` calls it, and a drift between the two is impossible by construction.
+fn oversized_group(
+    ops: &[EmittedOp],
+    fold: FoldGrouping,
+    ceiling: usize,
+) -> Option<(usize, usize, String, String)> {
+    let (kinds, owner) = trip_kinds_for(ops, fold);
+    let partition = group_ranges(&kinds, group_size());
+    let gi = partition
+        .iter()
+        .position(|r| r.end - r.start > ceiling)?;
+    let r = &partition[gi];
+    let name_at = |ti: usize| {
+        ops.get(*owner.get(ti).unwrap_or(&usize::MAX))
+            .map(|e| e.op_name.clone())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    Some((gi, r.end - r.start, name_at(r.start), name_at(r.end - 1)))
 }
 
 /// This op's own single `Dsc` (every `EmittedOp` wraps exactly one `dscs_` entry — `emit_sdsc`/
@@ -5023,6 +5065,85 @@ mod tests {
              OUTPUT write — the write set must come from arg_bindings.is_input, not dsType_"
         );
     }
+
+    /// ⛔⛔⛔ THE OVERSIZED-GROUP GUARD FIRES ON THE REAL PARTITION WALK (the gemma-4 bake hang).
+    ///
+    /// `ktir_groups_via_superdsc` used to stage ANY group the partition produced, and a gathered
+    /// PageFold run — uncapped by design, `run_may_be_chunked == false` ⇒ `cap = usize::MAX` — fused
+    /// a whole gemma-4-12b body's attention ops into ONE 8,300-descriptor group that one
+    /// `dxp_standalone` child ground for 2.5+ measured hours while looking exactly like a hang. The
+    /// guard must turn that class into a build error BEFORE anything is staged. These tests drive
+    /// `oversized_group` — the guard's own decision function, through the REAL
+    /// `trip_kinds_for` + `group_ranges` at the production `group_size()` — with synthetic ops
+    /// (`EmittedOp::bare` mutated field-by-field), so what fires is the walk that fires in the bake,
+    /// not a copy of it.
+    ///
+    /// Three cases, because each guards a distinct way the check could be inert:
+    /// 1. **The observed defect**: a `Split` gathered PageFold run past the ceiling MUST be caught
+    ///    and must NAME its boundaries (a group the error cannot localize is a 2.5-hour diagnosis
+    ///    again, just with a nicer message).
+    /// 2. **Fused folding must NOT defuse the guard** — under `FoldGrouping::Fused` the fold trips
+    ///    reclassify to `Pure` and take the ordinary `g` cap, so the SAME op list must come out
+    ///    clean: the defect is the uncapped run, not the ops themselves. This is also the control
+    ///    that proves the split case is failing for the RIGHT reason.
+    /// 3. **Time-trip fan-out multiplies the count**: `time = N` means N trips from one op, so
+    ///    `MAX/2 + 1` trips each on TWO ops must cross the ceiling even though neither op alone
+    ///    does — the fan-out is the second term of the observed 8,300.
+    fn gathered_page_fold_op(name: &str, time: u32) -> ktir_superdsc::emit::EmittedOp {
+        let mut e = ktir_superdsc::emit::EmittedOp::bare(name.to_string());
+        e.kv_page_fold = true;
+        e.kv_gathered = true;
+        e.time = time;
+        e
+    }
+
+    #[test]
+    fn an_oversized_gathered_fold_run_is_a_build_error_that_names_its_boundaries() {
+        // `DxGroupCeiling::MAX_DESCRIPTORS + 1` trips: one more than the ceiling, all one
+        // gathered PageFold run under `Split` — the minimal reproduction of the observed group.
+        let ops: Vec<_> = (0..DxGroupCeiling::MAX_DESCRIPTORS + 1)
+            .map(|i| gathered_page_fold_op(&format!("attn_p{i}"), 1))
+            .collect();
+        let (gi, size, first, last) = oversized_group(&ops, FoldGrouping::Split, DxGroupCeiling::MAX_DESCRIPTORS)
+            .expect("a gathered PageFold run past the ceiling must be caught");
+        assert_eq!(gi, 0, "the whole run is the first group");
+        assert_eq!(size, DxGroupCeiling::MAX_DESCRIPTORS + 1);
+        assert_eq!(first, "attn_p0", "the error must name the group's FIRST op");
+        assert_eq!(
+            last,
+            format!("attn_p{}", DxGroupCeiling::MAX_DESCRIPTORS),
+            "the error must name the group's LAST op"
+        );
+    }
+
+    #[test]
+    fn fused_folding_takes_the_ordinary_cap_and_the_same_ops_stay_clean() {
+        let ops: Vec<_> = (0..DxGroupCeiling::MAX_DESCRIPTORS + 1)
+            .map(|i| gathered_page_fold_op(&format!("attn_p{i}"), 1))
+            .collect();
+        assert!(
+            oversized_group(&ops, FoldGrouping::Fused, DxGroupCeiling::MAX_DESCRIPTORS).is_none(),
+            "under Fused the fold trips reclassify to Pure and chunk at group_size() = {} — \
+             the guard must NOT fire",
+            group_size()
+        );
+    }
+
+    #[test]
+    fn time_trip_fan_out_counts_against_the_ceiling() {
+        // Half the ceiling's trips on each of two fusable ops: no single op crosses, the RUN does.
+        let half = DxGroupCeiling::MAX_DESCRIPTORS / 2;
+        let ops = vec![
+            gathered_page_fold_op("fan_a", half as u32 + 1),
+            gathered_page_fold_op("fan_b", half as u32),
+        ];
+        let (gi, size, first, last) = oversized_group(&ops, FoldGrouping::Split, DxGroupCeiling::MAX_DESCRIPTORS)
+            .expect("time-trip fan-out must be counted against the ceiling");
+        assert_eq!(gi, 0);
+        assert_eq!(size, DxGroupCeiling::MAX_DESCRIPTORS + 1);
+        assert_eq!(first, "fan_a");
+        assert_eq!(last, "fan_b");
+    }
 }
 
 /// ⭐⭐⭐ THIS BUNDLE'S LAUNCH GROUPS: ITS PROGRAMS, IN LAUNCH ORDER.
@@ -5349,6 +5470,36 @@ fn ktir_groups_via_superdsc(
         ops.len(),
         sdsc_ops.len(),
     );
+
+    // ⛔⛔⛔ GUARD (oversized-dxp-group, OBSERVED on the gemma-4-12b fp8 bake 2026-10-03/04): a single
+    // launch group whose DESCRIPTOR count runs into the thousands makes one `dxp_standalone` child
+    // grind for HOURS (MEASURED: an 8,300-descriptor gathered-PageFold group compiled 2.5+ h at ~98%
+    // CPU and was still going when killed; the same build's next-largest groups, 4.1-4.2k, were on
+    // the same curve). The granite-8b fp8 baseline — the 30-minute bake this target accepts — never
+    // emits a group larger than ~512 descriptors (its largest measured group; also the
+    // `GroupSize::CEILING`, the largest value dxp has been observed to bake at all). Groups past that
+    // at 12b geometry are dominated by the uncuttable gathered-PageFold exemption
+    // (`run_may_be_chunked == false` ⇒ cap = usize::MAX) times the per-op time-trip fan-out, so the
+    // number only grows with model width. A silent multi-hour dxp is indistinguishable from a hang
+    // until it resolves; this turns it into a BUILD error that names the group, its size, and the ops
+    // at its boundaries — the difference between a 30-second diagnosis and the 2.5-hour one this
+    // class actually cost. Refusing here (before `render_dxp_input` stages anything) means no
+    // oversized group ever reaches the bake. The check itself lives in [`oversized_group`] so the
+    // tests pin the REAL walk, not a copy of it.
+    if let Some((gi, size, first, last)) =
+        oversized_group(&sdsc_ops, fold, DxGroupCeiling::MAX_DESCRIPTORS)
+    {
+        return Err(SuperDscError(format!(
+            "[spyre-superdsc] BUNDLE {fp}: launch group {gi} holds {size} descriptor(s) \
+             ('{first}' .. '{last}') — over the {}-descriptor dxp bake ceiling. A group this \
+                 large takes a single dxp_standalone HOURS (measured 2.5+ h at 8,300 on \
+                 gemma-4-12b) and is indistinguishable from a hang. The usual cause is a gathered \
+                 PageFold run (uncapped by design, the group-major reps law) fused across a whole \
+                 body's attention ops, times per-op time-trip fan-out. Split the emission so no \
+                 group exceeds the ceiling, or shrink the fan-out. Refusing to bake.",
+                DxGroupCeiling::MAX_DESCRIPTORS,
+            )));
+    }
 
     // ── from here down this is main's block, verbatim ──
     let shifts = launch_index(&sdsc_ops, fold);
