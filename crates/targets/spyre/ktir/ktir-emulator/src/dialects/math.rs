@@ -418,15 +418,23 @@ fn f16_bits_to_f32(half: u16) -> f32 {
         if mant == 0 {
             sign // signed zero
         } else {
-            // Subnormal: normalize into the f32 normal range.
-            let mut e = -1i32;
+            // Subnormal: normalize into the f32 normal range. The value is
+            // `mant × 2^-24`; after `s` left shifts bit 10 is set, so the value
+            // is `(1 + frac/1024) × 2^(-14-s)` — unbiased exponent `-14 - s`,
+            // NOT `-1 - s`: the seed `-1` counted the f16 exponent bias
+            // (−15) plus the normal-range implicit one (+14), which silently
+            // HALVED every widened subnormal (MEASURED on the MoE router at
+            // m=64: exp(−10.90625) widened to 154 subnormal units where the
+            // value IS 308 — every softmax weight below ~6e−5 came out at
+            // half, and the fused prefill chain diverged past its gate).
+            let mut e = -14i32;
             let mut m = mant;
             while (m & 0x0400) == 0 {
                 m <<= 1;
                 e -= 1;
             }
             m &= 0x03ff;
-            let f32_exp = (127 - 15 + 1 + e) as u32;
+            let f32_exp = (127 + e) as u32;
             sign | (f32_exp << 23) | (m << 13)
         }
     } else if exp == 0x1f {
@@ -806,6 +814,24 @@ mod tests {
         for v in [1.0f32, 1.5, std::f32::consts::E, 0.1, -7.25] {
             let once = f16_round(v);
             assert_eq!(f16_round(once), once, "{v}");
+        }
+    }
+
+    #[test]
+    fn f16_subnormal_widening_is_exact() {
+        // `f16_round`'s widen-back is the ONLY seam a subnormal f16 result
+        // passes through (every math-dialect unary rounds through it), and it
+        // HALVED every subnormal for the whole life of the emulator: the seed
+        // exponent counted the f16 bias (−15) plus the normal-range implicit
+        // one (+14), landing one binade low. MEASURED on the MoE router at
+        // m=64: exp(−10.90625) came back 9.179115295e−6 where the f16 grid
+        // point is 1.835823059e−5 (subnormal units 154 vs 308) — every
+        // softmax weight below ~6e−5 at half value. Pin the exact widening
+        // over the whole subnormal range, both signs.
+        for units in 1u16..0x0400 {
+            let v = (units as f32) * 2.0f32.powi(-24);
+            assert_eq!(f16_round(v), v, "positive subnormal {units} units");
+            assert_eq!(f16_round(-v), -v, "negative subnormal {units} units");
         }
     }
 
