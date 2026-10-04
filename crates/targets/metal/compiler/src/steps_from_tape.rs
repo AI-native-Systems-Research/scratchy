@@ -1057,6 +1057,45 @@ impl Recording<'_> {
                 }
                 Ok(e)
             }
+            // The routing, as the program its folded steps spell.
+            (
+                F::MoeRoute,
+                Sh::Route {
+                    pre,
+                    tail: [scale, post, expert_scale],
+                    ..
+                },
+            ) => {
+                let op = |s| -> Result<(usize, &SubOp), StepRefusal> {
+                    let j = self.op_at(i, s)?;
+                    Ok((j, self.op(j)))
+                };
+                let scale = match scale.map(op).transpose()? {
+                    None => None,
+                    Some((_, &SubOp::RouteScale { scale })) => Some(st::Scale(scale)),
+                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
+                };
+                let post = match post.map(op).transpose()? {
+                    None => st::RoutePost::None,
+                    Some((_, SubOp::RouteSoftmax)) => st::RoutePost::Softmax,
+                    Some((_, SubOp::RouteRenorm)) => st::RoutePost::Renorm,
+                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
+                };
+                let weight = match expert_scale.map(op).transpose()? {
+                    None => None,
+                    Some((j, &SubOp::RouteExpertScale { router })) => {
+                        Some((router.weight_kind(), self.source_arg(j, 2)?))
+                    }
+                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
+                };
+                let program = st::RouteProgram {
+                    pre_softmax: pre.is_some(),
+                    scale,
+                    post,
+                    expert_scale: weight.as_ref().map(|&(_, e)| self.layer(e)),
+                };
+                self.moe(i, MoeStep::Route(program), &[], &[], weight)
+            }
             _ => Err(self.no(i, Refused::FusionShape)),
         }
     }

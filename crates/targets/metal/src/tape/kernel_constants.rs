@@ -739,6 +739,40 @@ impl From<MoeTopKConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::MoeRoute` (`moe_route_<T>_bn<bn>`, `moe_route.metal`): the experts a router scores
+/// (slot 0), the top-k it keeps (slot 1), and its program — a softmax first (slot 2), the scores'
+/// scale (slot 3, set only when they scale), what follows (slot 4: 0 nothing, 1 softmax,
+/// 2 renorm), and the per-expert scale (slot 5).
+pub struct MoeRouteConstants {
+    pub experts: NumExperts,
+    pub top_k: TopK,
+    pub program: crate::tape::step::RouteProgram,
+}
+
+impl From<MoeRouteConstants> for Vec<ConstantValue> {
+    fn from(c: MoeRouteConstants) -> Self {
+        use crate::tape::step::RoutePost;
+        let p = c.program;
+        let post = match p.post {
+            RoutePost::None => 0,
+            RoutePost::Softmax => 1,
+            RoutePost::Renorm => 2,
+        };
+        let mut v = vec![
+            ConstantValue::int(ConstSlot(0), c.experts.get() as i32),
+            ConstantValue::int(ConstSlot(1), c.top_k.get() as i32),
+            ConstantValue::int(ConstSlot(2), i32::from(p.pre_softmax)),
+        ];
+        v.extend(p.scale.map(|s| ConstantValue::float(ConstSlot(3), s.0)));
+        v.push(ConstantValue::int(ConstSlot(4), post));
+        v.push(ConstantValue::int(
+            ConstSlot(5),
+            i32::from(p.expert_scale.is_some()),
+        ));
+        v
+    }
+}
+
 // ── MLX-affine QMM_T (prefill matmul) ─────────────────────────────
 
 /// `KernelId::AffineQmmT` / `AffineQmmTNax`

@@ -352,6 +352,11 @@ pub enum KernelId {
     /// `scores @ 6`, `out @ 7` (`AffineCombineQmvConstants`). Dispatch `(1, N/4, num_tokens)` ×
     /// `(32, top_k, 1)`. Symbol: `affine_gather_qmv_combine[_fast]_<dtype>_s_<sdtype>_gs_<gs>_b_<bits>`.
     MoeDownCombine,
+    /// A MoE block's routing, from the router logits to each token's top-k indices and scores,
+    /// in one command (`MoeRouteConstants`). Bindings: `(logits @ 0, sorted @ 1, indices @ 2,
+    /// scores @ 3, per-expert scales @ 4)`. Dispatch `(1, num_tokens, 1)` × `(bn, 1, 1)`. Symbol:
+    /// `moe_route_<dtype>_bn<bn>`.
+    MoeRoute,
     /// `out[n, d] = Σ_k expert[n, k, d] * scores[n, k]` — the final
     /// MoE reduction. Function-constant specialization on top_k
     /// (constant 0) and hidden (constant 1). Bindings:
@@ -534,6 +539,7 @@ impl KernelId {
             | Self::AffineGatherQmv
             | Self::MoeGateUpAct
             | Self::MoeDownCombine
+            | Self::MoeRoute
             | Self::MoeWeightedSum
             | Self::MoeGroupOffsets
             | Self::MoeGroupInit

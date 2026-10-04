@@ -5671,6 +5671,17 @@ fn argpartition_symbol(p: &MetalModelConsts, num_experts: u32) -> &'static str {
     }
 }
 
+/// The routing kernel over `num_experts`: the argsort's dtype and threadgroup.
+fn moe_route_symbol(p: &MetalModelConsts, num_experts: u32) -> &'static str {
+    match (p.metal_dtype, num_experts > 128) {
+        (MetalDtype::F16, false) => "moe_route_float16_bn32",
+        (MetalDtype::Bf16, false) => "moe_route_bfloat16_bn32",
+        (MetalDtype::F16, true) => "moe_route_float16_bn64",
+        (MetalDtype::Bf16, true) => "moe_route_bfloat16_bn64",
+        (MetalDtype::Int4, _) => panic!("moe_route_symbol: MoE routing over int4 is nonsensical"),
+    }
+}
+
 /// Memoize + leak a formatted kernel symbol as `&'static str` (the type
 /// `LoweredCommand.function` requires). Distinct names are bounded by the
 /// (dtype, scale, gs, bits, …) cross-product, so the leak is a handful of
@@ -5937,8 +5948,8 @@ fn lower_moe_step(
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
     use super::kernel_constants::{
         AffineCombineQmvConstants, AffineGatedQmvConstants, AffineGatherQmvConstants,
-        AffineQmvConstants, ArgsortConstants, GatherRows, MoeTopKConstants, ScoresRow,
-        SoftmaxConstants,
+        AffineQmvConstants, ArgsortConstants, GatherRows, MoeRouteConstants, MoeTopKConstants,
+        ScoresRow, SoftmaxConstants,
     };
     use crate::tape::lowered::{MScaleAxis as A, MScaling};
     use ConstantValue as C;
@@ -6162,6 +6173,36 @@ fn lower_moe_step(
                 library,
                 symbol,
                 vec![C::uint(0, pairs)],
+                shape,
+                bindings,
+            )]
+        }
+        // One command, one threadgroup per token, as wide as the argsort's.
+        S::Route(program) => {
+            let bn = if e > 128 { 64 } else { 32 };
+            let mut bindings = vec![
+                s.at(0, R::RouterLogits),
+                s.at(1, R::SortedExperts),
+                s.at(2, R::TopKIndices),
+                s.at(3, R::TopKScores),
+            ];
+            if let Some(l) = program.expert_scale {
+                let scale = WeightTensor::GemmaPerExpertScale;
+                bindings.push(source(router()?, scale, layer(&l), 4));
+            }
+            let shape = grid((1, bucket_m, 1), (bn, 1, 1), ms(A::Y));
+            let constants = MoeRouteConstants {
+                experts: b.experts,
+                top_k: b.top_k,
+                program,
+            }
+            .into();
+            let symbol = moe_route_symbol(p, e);
+            vec![cmd(
+                KernelId::MoeRoute,
+                "moe_route",
+                symbol,
+                constants,
                 shape,
                 bindings,
             )]

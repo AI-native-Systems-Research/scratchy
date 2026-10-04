@@ -297,6 +297,7 @@ pub enum MetalFusion {
     NormAddScalarMul,
     MoeGateUpAct,
     MoeDownCombine,
+    MoeRoute,
 }
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
@@ -368,6 +369,20 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     unsort: K::ExpertUnsort,
                     matmul: K::ExpertMatmul,
                     kernel: F::MoeDownCombine,
+                },
+                // `moe_route.metal`'s program: a softmax over every expert first, then the scores
+                // scaled, softmaxed or renormalized, and scaled per expert.
+                FoldPattern::Route {
+                    top_k: K::RouteTopK,
+                    sort: K::RouteArgsort,
+                    pre: K::RouteSoftmax,
+                    gather: K::RouteGatherScores,
+                    tail: &[
+                        &[K::RouteScale],
+                        &[K::RouteSoftmax, K::RouteRenorm],
+                        &[K::RouteExpertScale],
+                    ],
+                    kernel: F::MoeRoute,
                 },
             ],
         ],

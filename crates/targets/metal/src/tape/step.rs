@@ -348,6 +348,31 @@ pub enum MoeStep {
     GateUpAct(ExpertMatmul, ExpertWidth, GatedAct),
     /// `(down, out)`: the down projection, the unsort and the combine into `out`.
     DownCombine(ExpertMatmul, Slot),
+    /// The routing from the router logits to the top-k indices and scores.
+    Route(RouteProgram),
+}
+
+/// A MoE block's routing from its router logits to each token's top-k experts and their scores,
+/// as one command (`moe_route.metal`): the sort, the top-k and their scores always, the rest as
+/// the router says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteProgram {
+    /// A softmax over every expert before the sort (Qwen's shared-expert router).
+    pub pre_softmax: bool,
+    /// The top-k scores times a constant (Gemma's `hidden^-0.5`).
+    pub scale: Option<Scale>,
+    /// What the top-k scores go through next.
+    pub post: RoutePost,
+    /// Each score times its expert's learned scale, from layer `l`'s router (Gemma).
+    pub expert_scale: Option<LayerId>,
+}
+
+/// The top-k scores' last row-wide step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutePost {
+    None,
+    Softmax,
+    Renorm,
 }
 
 /// One expert projection: its `rows` times the layer's `proj` experts, packed `width` wide in
@@ -413,7 +438,11 @@ impl MetalStep {
                 | MoeStep::ExpertScale(l)
                 | MoeStep::ExpertMatmul(ExpertMatmul { layer: l, .. })
                 | MoeStep::GateUpAct(ExpertMatmul { layer: l, .. }, ..)
-                | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, _),
+                | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, _)
+                | MoeStep::Route(RouteProgram {
+                    expert_scale: Some(l),
+                    ..
+                }),
             ) => Some(l),
             S::Embed(..)
             | S::AffineEmbed(..)

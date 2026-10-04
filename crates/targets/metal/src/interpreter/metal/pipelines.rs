@@ -417,6 +417,7 @@ mod tests {
             | KernelId::AffineGatherQmv
             | KernelId::MoeGateUpAct
             | KernelId::MoeDownCombine
+            | KernelId::MoeRoute
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets
@@ -578,6 +579,7 @@ mod tests {
             | KernelId::AffineGatherQmv
             | KernelId::MoeGateUpAct
             | KernelId::MoeDownCombine
+            | KernelId::MoeRoute
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets
