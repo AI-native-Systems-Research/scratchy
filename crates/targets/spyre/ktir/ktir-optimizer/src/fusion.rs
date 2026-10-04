@@ -1277,11 +1277,24 @@ mod tests {
             let o = ops.op(Some(res), OpKind::KtdpConstructAccessTile, &[view]);
             ops.attr(o, AttrKey::Shape, ops.int_list(vec![tile_shape]))
         };
+        // ⭐ THE PRODUCED VALUE IS TYPED, as the lowering always emits it
+        // (`self.typed(op, ty)`): the store-forward guard reads the value's own
+        // shape off `result_type` and declines an untyped one (it cannot prove the
+        // value spells the view's shape). An untyped fixture here would pin the
+        // DECLINE, not the forward.
+        let y_op = ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]);
+        let y_op = ops.ty(
+            y_op,
+            IrType::Tensor {
+                dims: ops.arena().ints(vec![tile_shape]),
+                elem: DType::F16,
+            },
+        );
         let body = vec![
             mk_view(&mut ops, "%vin", "%in"),
             mk_tile(&mut ops, "%tin", "%vin"),
             ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]),
-            ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]),
+            y_op,
             mk_view(&mut ops, "%vout", "%out"),
             mk_tile(&mut ops, "%tout", "%vout"),
             ops.op(None, OpKind::KtdpStore, &["%y", "%tout"]),
@@ -1319,7 +1332,16 @@ mod tests {
         );
         let tin = ops.attr(tin, AttrKey::Shape, ops.int_list(vec![tile]));
         let loaded = ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]);
+        // ⭐ TYPED, as the lowering emits it — see copy_node's note: the
+        // store-forward guard declines untyped values.
         let y = ops.op(Some("%y"), OpKind::MathExp, &["%loaded"]);
+        let y = ops.ty(
+            y,
+            IrType::Tensor {
+                dims: ops.arena().ints(vec![tile]),
+                elem: DType::F16,
+            },
+        );
         let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%out"]);
         let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![tile]));
         let vout = ops.attr(vout, AttrKey::Strides, ops.int_list(vec![1]));
