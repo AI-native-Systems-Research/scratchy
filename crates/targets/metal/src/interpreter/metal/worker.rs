@@ -791,6 +791,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // need cache-coherent reads of. The final cmdbuf
                     // commit point flushes everything before the next
                     // encoder runs.
+                    //
+                    // ⛔ NOT a fence pair: `updateFence`/`waitForFence`
+                    // between two dispatches of ONE MTL4 compute encoder
+                    // does NOT order them (measured, M5 Max: all-zero
+                    // logits, deterministic). MTL4 fences order work
+                    // across encoder boundaries, not within one —
+                    // the stage barrier is the only in-encoder
+                    // producer→consumer mechanism.
+                    // ⛔ `None` beats `Device` on M5 decode too: A/B on
+                    // gemma-4-26b (conc 1/2/4): None 9.8/14.7/19.0 vs
+                    // Device 10.1/15.6/20.9 ms TPOT — the flush costs
+                    // more than it saves at back-to-back dispatch scale.
                     enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                         MTLStages::Dispatch,
                         MTLStages::Dispatch,
