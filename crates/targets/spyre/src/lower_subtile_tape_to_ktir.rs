@@ -757,6 +757,59 @@ fn lower_expert_sort_node<F: RopeForm>(
     Ok(vec![e])
 }
 
+/// Lower a [`SubOp::ExpertMatmul`] — one projection of each pair's expert
+/// over the stacked `[E·out, in]` fp8 weight bank, the gathered form of
+/// [`KtirFunc::matmul_fp8`]: metal's `affine_gather_qmv` semantics (the
+/// expert's slab selected by the pair's index, the f32-accumulated
+/// contraction, the per-channel dequant scale).
+///
+/// ⭐ THE INDICES ARE NOT THE MATMUL'S INPUT. The wavefront wires the node
+/// as `[rows, pairs, w, s]`, where `pairs` is the SORT's `[m, k·w]` output —
+/// the routing the projections read. The expert INDICES tensor is the sort
+/// node's input 1, so this walks one producer up (`producer_of`) to bind it
+/// as the program's fourth parameter. A pairs tensor whose producer is not
+/// a two-input ExpertSort is refused here, naming the node.
+fn lower_expert_matmul_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    k: u32,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 4 {
+        return Err(SuperDscError(format!(
+            "ExpertMatmul t{} expects 4 inputs (rows, routing, weights, scales) — the fp8 \
+             expert-bank form the gemma-4 wavefront emits; found {}. A 3-input dense-bank form \
+             is a different loader's work, and this lowering refuses it rather than guess",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let pairs = &node.inputs[1];
+    let idx = match producer_of(ir, pairs.tensor) {
+        Some(sort)
+            if matches!(sort.op, SubOp::ExpertSort { .. }) && sort.inputs.len() == 2 =>
+        {
+            &sort.inputs[1]
+        }
+        _ => {
+            return Err(SuperDscError(format!(
+                "ExpertMatmul t{} reads its routing from t{} whose producer is not a \
+                 two-input ExpertSort — the expert indices cannot be bound, and a projection \
+                 without them would read slab 0 for every pair",
+                node.output.tensor.index() as u32,
+                pairs.tensor.index() as u32
+            )))
+        }
+    };
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("expertmatmul_s{}", node.id.index()));
+    st.expert_matmul(&node.inputs[0], idx, &node.inputs[2], &node.inputs[3], &node.output, k);
+    let k_node = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::ExpertMatmul);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k_node);
+    Ok(vec![e])
+}
+
 /// Lower a [`SubOp::ExpertUnsort`] — the pair rows back in token order: the
 /// identity copy of [`KtirFunc::expert_unsort`] in the (token, slot) layout.
 fn lower_expert_unsort_node<F: RopeForm>(
@@ -1897,15 +1950,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(e) => Unhandled(e.0),
             }
         }
-        SubOp::ExpertMatmul { .. } => Unhandled(format!(
-            "SubOp::ExpertMatmul t{} (one projection of each pair's expert, over the stacked \
-             `[E·out, in]` weight bank) has no SuperDSC lowering yet: the contraction itself is \
-             `KtirFunc::matmul_fp8` over the pair rows, but the weight ROW each pair reads is \
-             selected by its expert index — an indexed operand the dense matmul's fixed region \
-             does not state. Needs the gather-bound weight binding (the paged-KV gather \
-             vocabulary) before the program can be minted.",
-            node.output.tensor.index() as u32,
-        )),
+        SubOp::ExpertMatmul { k, .. } => {
+            match lower_expert_matmul_node(node, ir, k.get(), sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
         SubOp::ExpertGatedAct { act } => {
             match lower_expert_gated_act_node(node, ir, *act, sym_id_base) {
                 Ok(v) => Ops(v),
@@ -4937,6 +4987,236 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
             v
         };
         self.store_region(narrowed, out);
+    }
+
+    /// ⛔ W-BLOCK BUDGET: the largest power-of-two divisor of `n` whose fp8→f16
+    /// widened weight block `nb · in` keeps the per-core LX live set inside the
+    /// 512 KB the emulator's own `n_block` charges an accumulator
+    /// (`matmul_tile.rs`'s `BLOCK_MN_BUDGET`, the same number for the same
+    /// reason — a few `[nb, in]`-scale siblings resident while the block is
+    /// worked). The block is a divisor of `n` so every expert's slab tiles
+    /// identically; a non-divisor would ragged the last block per expert.
+    fn expert_w_block(n: u32, in_dim: u32) -> u32 {
+        const W_BLOCK_BUDGET_BYTES: u64 = 512 * 1024;
+        let mut nb = 1u32;
+        let mut cand = 1u32;
+        while cand <= n / 2 && n.is_multiple_of(cand) {
+            if u64::from(cand) * u64::from(in_dim) * 2 <= W_BLOCK_BUDGET_BYTES {
+                nb = cand;
+            }
+            cand *= 2;
+        }
+        if u64::from(n) * u64::from(in_dim) * 2 <= W_BLOCK_BUDGET_BYTES {
+            n
+        } else {
+            nb
+        }
+    }
+
+    /// EXPERT MATMUL — [`SubOp::ExpertMatmul`], the gathered form of
+    /// [`Self::matmul_fp8`]: one projection of each (token, slot) pair, the
+    /// weight slab selected by the pair's expert index out of the stacked
+    /// `[E·out, in]` bank.
+    ///
+    /// `out[n, slot·n + c] = Σ_k rows[n, k] · W[e(n,slot), c, k] ·
+    /// s[e(n,slot)·n + c]`, with `e(n, slot) = indices[n, slot]` — metal's
+    /// `affine_gather_qmv` exactly: the kernel's `expert_idx =
+    /// rhs_indices[n·top_k + slot]` slab base, its f32-accumulated contraction
+    /// (one narrowing to `T_act` at the end of the accumulation,
+    /// `qmv_impl`'s `static_cast`), and its per-output-channel scale
+    /// multiply on the narrowed result. The rows this reads are the SORT's
+    /// `[m, k·w]` pair rows — token row `n`'s activation in slot `j`'s
+    /// column block, which is what the gathered kernel's `per_row = k`
+    /// token-row re-read means once the sort is materialized.
+    ///
+    /// ⭐ THE EXPERT INDEX IS A RUNTIME VALUE AND THE EMISSION IS PER PAIR.
+    /// Each (token, slot) pair's expert id is read OUT of the indices tensor
+    /// (`tensor.extract` → `arith.fptosi` → an `index` multiply for the slab
+    /// row offset), and the pair's whole projection is emitted against that
+    /// dynamic corner — `construct_access_tile` takes SSA corner operands,
+    /// so the block window names `e·out` in the bank without any
+    /// data-dependent permutation. `m·k` pairs at `k ≤ 8` is the decode/pair
+    /// regime the gathered bake covers; the count is a compile-time constant
+    /// of the graph, so the per-pair unroll is too.
+    ///
+    /// ⛔ SELF-BLOCKED OVER OUTPUT COLUMNS, AND INVISIBLY TO
+    /// `ktir_optimizer::matmul_tile`. The 26b bank's gate/up slab is
+    /// `[128·704, 2816]` fp8 — half a gigabyte widened, never one tile — so
+    /// each pair's contraction walks `nb`-wide column blocks of its expert's
+    /// slab ([`Self::expert_w_block`]'s budget). The optimizer's `recognize`
+    /// would re-tile a recognized contraction and DROP the W corner
+    /// (`matmul_tile.rs` keeps `a_row`, discards the W one — every expert
+    /// would read slab 0), so this emission must not match its forms: the
+    /// plain form's store must drain the matmul result and it does not (the
+    /// scale multiply intervenes), and the fp8 form requires the scale
+    /// operand to be a `[1, n]`-shaped access-tile LOAD — the scale here is
+    /// a rank-1 `[nb]` slice of the expert's scale block, broadcast to
+    /// `[1, nb]` by an `linalg.broadcast` the recognizer never looks
+    /// through. Both arms refuse; the blocking below is the only one.
+    ///
+    /// ⛔ AND THE PER-TOKEN LOOP IS OVER PAIRS, NOT TOKENS. Pair `p`'s token
+    /// row is `p / k` and its slot is `p % k` — the flat `(n, slot)`
+    /// enumeration the kernel's `nk = tid.z` is, stated as emit-time
+    /// constants because `m` and `k` are graph constants.
+    fn expert_matmul(
+        &mut self,
+        rows_r: &TensorRegion,
+        idx_r: &TensorRegion,
+        w_r: &TensorRegion,
+        s_r: &TensorRegion,
+        out: &TensorRegion,
+        k: u32,
+    ) {
+        let m = out.region.rows.len;
+        let n = out.region.cols.len / k;
+        let in_dim = rows_r.region.cols.len / k;
+        debug_assert_eq!(
+            out.region.cols.len,
+            n * k,
+            "ExpertMatmul output is the [m, k·n] pair layout"
+        );
+        debug_assert_eq!(
+            rows_r.region.cols.len,
+            in_dim * k,
+            "ExpertMatmul rows are the [m, k·in] pair rows"
+        );
+        let a = self.a;
+        // The stacked banks, viewed once: fp8 codes `[E·n, in]` (1 byte per
+        // element — `ktdp.load` widens on read), scales RANK-1 `[E·n]` (bf16
+        // staged, f16 in HBM — one scale per bank row, read as the flat
+        // sequence so a `[bw]` slice at the block's rows is one window).
+        // The bank extents come from the weight REGIONS' own shapes — the
+        // launch source's declared `[E·out, in]`.
+        let bank_rows = w_r.region.rows.len;
+        let w_ptr = self.arg_for(w_r.tensor);
+        let w_view = self.view_fp8(w_ptr, bank_rows, in_dim);
+        let s_ptr = self.arg_for(s_r.tensor);
+        let s_view = self.view_of(s_ptr, vec![i64::from(bank_rows)], vec![1]);
+        // The expert indices, loaded whole as their `[m, k]` tile.
+        let idx = self.load_region(idx_r);
+        let nb = Self::expert_w_block(n, in_dim);
+        for p in 0..m * k {
+            let (n_tok, slot) = (p / k, p % k);
+            // ⭐ THE PAIR'S EXPERT ID — a scalar read out of the indices
+            // tile, integerized, and multiplied by the slab height: the
+            // dynamic row corner of every window this pair opens into the
+            // bank. `tensor.extract` of an f16 tile yields an f32 scalar;
+            // `arith.fptosi` narrows it to the i64 the index arithmetic
+            // takes (the tile path's i32 is for whole tiles — the SCALAR
+            // path is i64, which `construct_access_tile`'s corner reader
+            // accepts).
+            let e_f = {
+                let (ri, ci) = (self.idx(n_tok), self.idx(slot));
+                let v = self.fresh();
+                let op = Operation::new(a, Some(v), OpKind::TensorExtract, &[idx, ri, ci]);
+                let op = self.typed(op, IrType::Scalar(KTIR_ELEM));
+                self.push(op);
+                v
+            };
+            let e_i = {
+                let v = self.fresh();
+                let op = Operation::new(a, Some(v), OpKind::ArithFptosi, &[e_f]);
+                let op = self.typed(op, IrType::Scalar(ktir_core::dtypes::DType::I64));
+                self.push(op);
+                v
+            };
+            let slab_stride = self.idx(n);
+            let row_off = self.index_op(OpKind::ArithMuli, e_i, slab_stride);
+            // The pair's activation row: slot `slot`'s `[in]` block of the
+            // token's pair rows, rank-1 (the contraction's A is a vector —
+            // the kernel's matrix-VECTOR product at one token).
+            let x = self.load_region(&sub_cols(&sub_rows(rows_r, n_tok, 1), slot * in_dim, in_dim));
+            // The output column blocks of this pair's slot.
+            let mut c_off = 0u32;
+            while c_off < n {
+                let bw = nb.min(n - c_off);
+                // The expert's weight block `[bw, in]` — rows `row_off +
+                // c_off ..+bw` of the stacked `[E·n, in]` bank, ALL its
+                // columns (the output-column block is a ROW block of the
+                // on-disk `[out, in]` slab), fp8 widened to f16 on load.
+                let w_coff = self.idx(c_off);
+                let w_row = self.index_op(OpKind::ArithAddi, row_off, w_coff);
+                let w_zero = self.idx(0);
+                let w_acc = self.tile(w_view, w_row, w_zero, bw, in_dim);
+                let w_val = self.load_tile(w_acc, bw, in_dim);
+                // Transpose-B contraction `[1, in] · [bw, in]ᵀ` — the bank's
+                // on-disk `[out, in]` read in place, the same maps the
+                // dense [`Self::matmul_fp8`] states.
+                let dims = vec![1i64, i64::from(bw)];
+                let init = self.splat_zero(dims.clone());
+                let maps: Vec<AffineMap<'static>> = [[0i64, 2], [1, 2], [0, 1]]
+                    .iter()
+                    .map(|mm| AffineMap {
+                        num_dims: 3,
+                        num_syms: 0,
+                        exprs: a.exprs(
+                            mm.iter()
+                                .map(|d| AffineExpr::Dim(*d as usize))
+                                .collect(),
+                        ),
+                    })
+                    .collect();
+                let part = self.fresh();
+                let op = Operation::new(a, Some(part), OpKind::LinalgMatmul, &[x, w_val, init])
+                    .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())))
+                    .with_attr(a, AttrKey::IndexingMaps, Attr::AffineMapList(a.maps(maps)));
+                let ty = self.tensor_ty(dims.clone());
+                let op = self.typed(op, ty);
+                self.push(op);
+                // ⭐ THE PER-CHANNEL DEQUANT — rank-1 `[bw]` slice of the
+                // expert's scale block (rows `[row_off + c_off, +bw)` of the
+                // stacked `[E·n, 1]` bank, read as the bank's flat `[E·n]`
+                // sequence), inserted an axis to the result's `[1, bw]`. The
+                // rank-1 load + broadcast shape is what keeps
+                // `matmul_tile::recognize`'s fp8 arm — which requires a
+                // directly-loaded `[1, n]` scale tile — off this contraction;
+                // see the method doc.
+                let s_rank1 = {
+                    // The scale rows are `row_off + c_off ..+bw` — the same
+                    // rows the weight block read — as a RANK-1 `[bw]` slice
+                    // of the bank's flat `[E·n]` scale sequence (the
+                    // `[E·n, 1]` bank read as one column).
+                    let s_coff = self.idx(c_off);
+                    let s_row = self.index_op(OpKind::ArithAddi, row_off, s_coff);
+                    let acc = self.fresh();
+                    let dims1 = vec![i64::from(bw)];
+                    let op = Operation::new(
+                        a,
+                        Some(acc),
+                        OpKind::KtdpConstructAccessTile,
+                        &[s_view, s_row],
+                    )
+                    .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims1.clone())));
+                    let op = self.typed(
+                        op,
+                        IrType::AccessTile {
+                            dims: a.ints(dims1.clone()),
+                        },
+                    );
+                    self.push(op);
+                    let v = self.fresh();
+                    let op = Operation::new(a, Some(v), OpKind::KtdpLoad, &[acc]).with_attr(
+                        a,
+                        AttrKey::Shape,
+                        Attr::IntList(a.ints(dims1.clone())),
+                    );
+                    let ty = self.tensor_ty(dims1);
+                    let op = self.typed(op, ty);
+                    self.push(op);
+                    v
+                };
+                // Insert axis 0: `[bw] → [1, bw]` — the broadcast's
+                // insertion form (`self.broadcast` with `dim = 0`).
+                let s_val = self.broadcast(s_rank1, dims.clone(), 0);
+                let scaled = self.binop(OpKind::ArithMulf, part, s_val, dims);
+                // The slot's `c_off` column block of this token's output row.
+                self.store_region(
+                    scaled,
+                    &sub_cols(&sub_rows(out, n_tok, 1), slot * n + c_off, bw),
+                );
+                c_off += bw;
+            }
+        }
     }
 
     /// A reshape — the WHOLE source region loaded through its own view, stored through the
