@@ -97,6 +97,21 @@ struct Untiled {
     n: i64,
     k: i64,
     elem: DType,
+    /// ⭐ THE DEQUANT SCALE, when the store drains a trailing `arith.mulf(matmul, scale)` instead
+    /// of the matmul itself. Both fp8 producers end that way — the builder's
+    /// `KtirFunc::matmul_fp8` and the spliced `matmul_fp8_fwd` (whose ladder lowering spells the
+    /// same `p * ws` the kernel states) — and WITHOUT recognizing it the whole `[n, k]` weight
+    /// tile loads UNTILED: at granite-2b's q_proj that is a `[2048, 2048]` fp8 tile (4 MB)
+    /// against a 2 MB LX, and the MEASURED failure is `KtdpLoad: LX capacity exceeded
+    /// 4194304 over budget 2097152 charging %21 tile [2048, 2048]` — on the BUILDER path
+    /// identically (the splice falls through to it at prefill m=31), so this is the fp8 E2E
+    /// wall for both producers. `None` for the dense contraction (store drains the matmul
+    /// directly), which keeps every dense program byte-identical to what this pass emitted
+    /// before the field existed.
+    scale: Option<Ssa>,
+    /// The matmul's own result SSA — the operand the surviving scaled epilogue's
+    /// mulf must be re-pointed from, onto the nest's result.
+    matmul_res: Ssa,
 }
 
 fn shape_of(op: &Operation<'_>) -> Option<Vec<i64>> {
@@ -134,6 +149,32 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         let corner = *acc.operands.get(1)?;
         Some((view, corner, shape_of(acc)?))
     };
+    // ⭐ THE WSCALE READ, AS THE REAL PROGRAMS SPELL IT: the loaded `[1, n]` row
+    // flows through `TensorCollapseShape` (`[1, n] → [n]`, the fusion's
+    // canonical 1-D form) and `LinalgBroadcast` (the mulf's own broadcast to the
+    // result's shape) before the mulf sees it. Unwrap both — MEASURED on
+    // granite-3.1-2b-fp8's `matmul_s*` functions, where the chain is
+    // `mulf ← broadcast ← collapse ← load(access_tile(view))`.
+    let through_scale = |v: Ssa| -> Option<Vec<i64>> {
+        let mut v = v;
+        for _ in 0..4 {
+            let (_, op) = def.get(&v)?;
+            match op.op_type {
+                OpKind::LinalgBroadcast | OpKind::TensorCollapseShape => {
+                    v = *op.operands.first()?;
+                }
+                OpKind::KtdpLoad => {
+                    let (_, acc) = def.get(op.operands.first()?)?;
+                    if acc.op_type != OpKind::KtdpConstructAccessTile {
+                        return None;
+                    }
+                    return shape_of(acc);
+                }
+                _ => return None,
+            }
+        }
+        None
+    };
 
     let mut out = Vec::new();
     for (i, op) in func.operations.iter().enumerate() {
@@ -151,12 +192,67 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             continue;
         };
         let Some(res) = op.result else { continue };
+        // ⭐ THE STORE DRAINS EITHER THE MATMUL OR ITS DEQUANT SCALE — `KtirFunc::matmul`
+        // stores the contraction directly, while BOTH fp8 producers (`KtirFunc::matmul_fp8`,
+        // the spliced `matmul_fp8_fwd`) end `linalg.matmul → arith.mulf(part, scale) →
+        // ktdp.store`. The mulf is admitted ONLY as the exact fp8 epilogue: one operand must
+        // BE the matmul result and the other a loaded `[1, n]` scale row whose width is this
+        // contraction's n — anything else (a fused activation multiplier, a residual add) is a
+        // different epilogue this rewrite must not touch, so it disqualifies the node. A
+        // non-fp8 example exists and is exactly that: attention's `scores = matmul(q, k) ·
+        // (1/sqrt(hd))` multiplies by a SPLAT, not a loaded row, so it never matches the
+        // loaded-scale-row shape test and keeps the direct-store recognition.
+        let (store_val, scale) = {
+            let direct = func
+                .operations
+                .iter()
+                .find(|o| o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&res));
+            match direct {
+                Some(_) => (res, None),
+                None => {
+                    // Find the mulf that consumes `res`, then the store that drains it.
+                    let Some(mulf) = func
+                        .operations
+                        .iter()
+                        .find(|o| {
+                            o.op_type == OpKind::ArithMulf
+                                && o.operands.contains(&res)
+                        })
+                    else {
+                        continue;
+                    };
+                    let other = if mulf.operands[0] == res { mulf.operands[1] } else { mulf.operands[0] };
+                    // The scale side must be a loaded `[1, n]` row — the load chain
+                    // every fp8 producer's wscale read states (`KtirFunc::matmul_fp8`'s
+                    // `tile(scale_view, 0, 0, 1, n)`; the ladder's ws descriptor `[1, N]`),
+                    // possibly through collapse/broadcast (see `through_scale`).
+                    let Some(s_dims) = through_scale(other) else {
+                        continue;
+                    };
+                    if s_dims.len() != 2 || s_dims[0] != 1 {
+                        continue;
+                    }
+                    let Some(mulf_res) = mulf.result else { continue };
+                    if !func
+                        .operations
+                        .iter()
+                        .any(|o| {
+                            o.op_type == OpKind::KtdpStore
+                                && o.operands.first() == Some(&mulf_res)
+                        })
+                    {
+                        continue;
+                    }
+                    (mulf_res, Some(other))
+                }
+            }
+        };
         // The store that drains it, and the view it writes.
         let Some((store_at, st)) = func
             .operations
             .iter()
             .enumerate()
-            .find(|(_, o)| o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&res))
+            .find(|(_, o)| o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&store_val))
         else {
             continue;
         };
@@ -185,6 +281,19 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             _ => continue,
         };
         let elem = op.result_type.and_then(|t| t.elem()).unwrap_or(DType::F16);
+        // ⛔ THE SCALED FORM NEEDS ONE N-BLOCK. The rewrite replaces only the matmul
+        // with the K-loop nest and leaves the surviving `arith.mulf(result, scale)`
+        // untouched (below) — and that mulf broadcasts the `[1, n]` scale row against
+        // the matmul result, which is only well-formed when the result spans the WHOLE
+        // output width. A multi-N-block nest yields `[m, bw]` partial products whose
+        // mulf against the `[1, n]` row would silently misbroadcast. Dense programs
+        // keep any N-blocking they had (the store tiles each block separately); the
+        // scaled form takes exactly one block, which is the fp8 door's own
+        // single-tile contract (`verify_canonical_fp8_matmul_kernel` refuses
+        // `BLOCK_N < N`).
+        if scale.is_some() && n_block(n, m) < n {
+            continue;
+        }
         out.push(Untiled {
             at: i,
             store_at,
@@ -198,6 +307,8 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             n,
             k,
             elem,
+            scale,
+            matmul_res: res,
         });
     }
     out
@@ -269,6 +380,11 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
 
         let nblk = n_block(p.n, p.m);
         let mut n_off = 0i64;
+        // The nest's result SSA (the loop's yield) — the scaled form has exactly
+        // one N-block, so the single loop's result IS the contraction the
+        // surviving mulf scales. Captured so the epilogue rewire below can point
+        // the mulf's matmul operand at it.
+        let mut nest_result: Option<Ssa> = None;
         while n_off < p.n {
             let bw = nblk.min(p.n - n_off);
             let kb = k_block(p.k, bw);
@@ -390,26 +506,32 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             };
             forop.result_type = Some(tensor(acc_dims.clone()));
             pre.push(forop);
+            nest_result = Some(result);
 
-            // Store this N block.
-            let st_acc = g.mint();
-            let mut ts = Operation::new(
-                a,
-                Some(st_acc),
-                OpKind::KtdpConstructAccessTile,
-                &[p.out_view, row_idx, noff],
-            )
-            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(acc_dims.clone())));
-            ts.result_type = Some(IrType::AccessTile {
-                dims: a.ints(acc_dims.clone()),
-            });
-            pre.push(ts);
-            pre.push(Operation::new(
-                a,
-                None,
-                OpKind::KtdpStore,
-                &[result, st_acc],
-            ));
+            // Store this N block — unless the store is the scaled epilogue's (the
+            // fp8 form): there the ORIGINAL `arith.mulf(result, scale) → store`
+            // survives, re-pointed at the nest's result below, so the wscale load
+            // chain keeps its consumer and the store's tile is the mulf's own.
+            if p.scale.is_none() {
+                let st_acc = g.mint();
+                let mut ts = Operation::new(
+                    a,
+                    Some(st_acc),
+                    OpKind::KtdpConstructAccessTile,
+                    &[p.out_view, row_idx, noff],
+                )
+                .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(acc_dims.clone())));
+                ts.result_type = Some(IrType::AccessTile {
+                    dims: a.ints(acc_dims.clone()),
+                });
+                pre.push(ts);
+                pre.push(Operation::new(
+                    a,
+                    None,
+                    OpKind::KtdpStore,
+                    &[result, st_acc],
+                ));
+            }
 
             n_off += bw;
         }
@@ -420,13 +542,47 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
         let mut ops: Vec<Operation<'a>> = func.operations.to_vec();
         let store_at = p.store_at;
         let at = p.at;
-        // Remove the store first when it sits after the matmul, so both indices stay valid.
-        if store_at > at {
-            ops.remove(store_at);
+        // ⭐ THE SCALED FORM KEEPS ITS EPILOGUE: the store at `store_at` drains
+        // `arith.mulf(matmul, wscale)`, and that mulf survives the splice — only
+        // its MATMUL operand is re-pointed at the nest's result (the scaled form
+        // takes exactly one N-block, so the nest's single result IS the whole
+        // `[m, n]` contraction the mulf scales). The wscale load chain therefore
+        // keeps its consumer through `dce`, which is what keeps the wscale
+        // tensor's shape derivable downstream.
+        if let Some(_scale) = p.scale {
+            let matmul_res = p.matmul_res;
+            let nest_result = nest_result.expect("the scaled form takes one N-block");
+            let mulf_at = ops
+                .iter()
+                .position(|o| {
+                    o.op_type == OpKind::ArithMulf && o.operands.contains(&matmul_res)
+                })
+                .expect("recognize found the mulf draining the matmul");
+            let pos = ops[mulf_at]
+                .operands
+                .iter()
+                .position(|&o| o == matmul_res)
+                .expect("the mulf's operand IS the matmul result");
+            // `operands` is an arena slice — the rewire is a REPLACED op, same
+            // everything, one operand swapped for the nest's result.
+            let mut mulf = ops[mulf_at];
+            mulf.operands = a.ssa({
+                let mut v = ops[mulf_at].operands.to_vec();
+                v[pos] = nest_result;
+                v
+            });
+            ops[mulf_at] = mulf;
+            // The store stays where it is; only the matmul is replaced.
             ops.splice(at..=at, pre);
         } else {
-            ops.splice(at..=at, pre);
-            ops.remove(store_at);
+            // Remove the store first when it sits after the matmul, so both indices stay valid.
+            if store_at > at {
+                ops.remove(store_at);
+                ops.splice(at..=at, pre);
+            } else {
+                ops.splice(at..=at, pre);
+                ops.remove(store_at);
+            }
         }
         func.operations = a.ops(ops);
         done += 1;

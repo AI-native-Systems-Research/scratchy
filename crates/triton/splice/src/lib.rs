@@ -57,8 +57,19 @@
 //! one `[heads, half]` access tile per position, which is what the door's first-tile read
 //! needs. See the rope row in [`registry`].
 //!
-//! fp8 `MatmulTile`: the builder threads a cross-node activation-quantize dedup
-//! (`quantized`) that is a bundle-level fact, not a node-level one. Not a row.
+//! fp8 `MatmulTile` — a row after all: the module header's old claim that the
+//! activation-quantize dedup (`quantized`) is "a bundle-level fact, not a
+//! node-level one" described the PRE-door splice design and was OVERSTATED for
+//! the current architecture. The dedup set is threaded BUNDLE-WIDE by the door's
+//! callers (`lower_graph_to_ktir`'s walk creates one per bundle and hands it to
+//! `ktir_superdsc_door::lower`), which runs DOWNSTREAM of the splice: both
+//! producers' `EmittedOp`s flow through the SAME door call, and
+//! `matmul_fp8_descriptors` dedups there (`quantized.insert(a_name)` — q/k/v
+//! share one quant, gate/up share another). The splice only has to mint a
+//! `Program::Matmul` `KtirNode` whose weight view is fp8 and whose bindings are
+//! arity-3; fp8-ness is recognized from the weight view's `is_fp8`, cross-checked
+//! against arity, exactly as the builder's program is. See the fp8 row in
+//! [`registry`].
 //!
 //! `RmsNorm { gain: OnePlusScale }`: refused by name, exactly as the builder arm refuses
 //! it — the kernel does not exist for the (1 + w) convention and a silent fallback to the
@@ -116,15 +127,29 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Opt
             program: Program::SiluMul,
         }),
         // THE THIRD SPLICE — the biggest family by op count (every projection in every
-        // layer). DENSE fp16 ONLY: the arity-3 W8A8 form is a bundle-level deliberate
-        // non-splice (see the module header), and `GemmWeight` on the node states which
-        // is which.
+        // layer). DENSE fp16 (arity-2, `matmul.py`) and fp8 W8A8 (arity-3,
+        // `matmul_fp8.py`) are separate rows: `GemmWeight` on the node states which is
+        // which, and the fp8 kernel's spelled `* w_scale` epilogue is what the ladder's
+        // `verify_canonical_fp8_matmul_kernel` requires — see the module header for why
+        // the door-side activation-quantize dedup is not this row's concern.
         SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Dense,
             ..
         } => Some(TritonKernelRow {
             kernel: "matmul.py",
             entry: "matmul_fwd",
+            program: Program::Matmul,
+        }),
+        // THE SIXTH SPLICE — fp8 W8A8, the delivery target (granite 8b fp8). Same
+        // `Program::Matmul` classification as dense: the DOOR discriminates fp8 from
+        // the weight view's `is_fp8` + arity-3 bindings, never from the program kind,
+        // so both rows reach the same `matmul_proven` door arm.
+        SubOp::MatmulTile {
+            weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
+            ..
+        } => Some(TritonKernelRow {
+            kernel: "matmul_fp8.py",
+            entry: "matmul_fp8_fwd",
             program: Program::Matmul,
         }),
         // THE FOURTH SPLICE — the split elementwise kinds, one entry per `EwKind` the
@@ -168,8 +193,8 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> Opt
             entry: "rope_fwd",
             program: Program::Rope,
         }),
-        // ⛔ NO ROW FOR attention (consumer bake-plan facts), fp8 matmul (bundle-level
-        // quantize dedup), or (1 + w) gains (no kernel exists). See the module header.
+        // ⛔ NO ROW FOR attention (consumer bake-plan facts), Affine-int4 weights (no
+        // kernel exists), or (1 + w) gains (no kernel exists). See the module header.
         _ => None,
     }
 }
@@ -290,7 +315,16 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
-        SubOp::MatmulTile { .. } => 2,
+        // ⭐ THE MATMUL'S ARITY IS THE WEIGHT SCHEME'S OWN: Dense is arity-2
+        // `[act, weight]`, Fp8Dynamic is arity-3 `[act, weight_fp8, weight_scale]`
+        // (the same routing `lower_matmul_node` does on `node.inputs.get(2)`). The
+        // Affine scheme stays arity-2 but has NO row — it cannot reach this match,
+        // and the registry's `None` returns before it.
+        SubOp::MatmulTile { weight, .. } => match weight {
+            scratchy_subtile::lower::GemmWeight::Dense => 2,
+            scratchy_subtile::lower::GemmWeight::Fp8Dynamic => 3,
+            scratchy_subtile::lower::GemmWeight::Affine { .. } => 2,
+        },
         SubOp::Elementwise(EwKind::Silu) => 1,
         SubOp::Elementwise(_) => 2,
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
@@ -400,6 +434,33 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             };
             // ONE tile, the whole region — `KtirFunc::matmul`'s own whole-region law
             // (one linalg.matmul, no K loop).
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("K", Val::Int(i128::from(k)))?;
+            ce("N", Val::Int(i128::from(*n)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_K", Val::Int(i128::from(k)))?;
+            ce("BLOCK_N", Val::Int(i128::from(*n)))?;
+        }
+        (SubOp::MatmulTile { n, weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic }, "matmul_fp8_fwd") => {
+            // The arity-3 twin of the dense arm: A [M, K], W fp8-packed [N, K] (the
+            // checkpoint's own on-disk layout, 1 byte per element — the descriptor's
+            // elem says fp8, the load widens on read), ws the [1, N] per-channel scale
+            // row. K from A's own columns, n from the Linear's stated width — the same
+            // derivations the dense arm states, and the ones `KtirFunc::matmul_fp8`
+            // states for the builder path.
+            let k = node.inputs[0].region.cols.len;
+            signature.insert("desc_x".to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            signature.insert("desc_w".to_string(), ArgSpec::parse("*fp8e4nv").map_err(|e| e.to_string())?);
+            signature.insert("desc_ws".to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            signature.insert("desc_o".to_string(), ArgSpec::parse("*fp16").map_err(|e| e.to_string())?);
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            // ONE tile, the whole region — and the fp8 contract REFUSES anything else
+            // (`verify_canonical_fp8_matmul_kernel`: `BLOCK_K < K` and `BLOCK_N < N`
+            // are refused by name; a K-looped fp8 form is a follow-on, not this row).
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(*n)))?;

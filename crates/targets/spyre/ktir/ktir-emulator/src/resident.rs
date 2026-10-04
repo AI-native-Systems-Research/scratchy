@@ -192,6 +192,17 @@ pub struct ResidentExecutor {
     /// The model dtype the per-node oracle threads (F16). All sticks are sized and
     /// read back at this dtype.
     dtype: DType,
+    /// ⭐ THE VIEW dtype EACH TENSOR'S POINTERS ARE BOUND AT — the dtype of its
+    /// own `construct_memory_view` ops, recovered by [`derive_shapes`]'s walk.
+    /// `F16` for every tensor a normal model touches, so the default binding is
+    /// unchanged; `Fp8E4m3` for an fp8-packed weight, whose views read ONE BYTE
+    /// per element (RFC #110: `byte_address = base_ptr · view_bpe`). The Fused/
+    /// Native pointer binding must divide the stick's byte base by THE VIEW's
+    /// bpe — always dividing by the model dtype's binds an fp8 view at half its
+    /// true byte address, landing it INSIDE the previous tensor's allocation
+    /// (garbage reads), and `set_source_bytes`' verbatim arm must keep the
+    /// packed 1-byte layout instead of re-encoding it as F16.
+    view_dtype: HashMap<u64, DType>,
     /// Per-segment plan-cache key (`comm_sched::plan_key`), memoized by the ops
     /// slice address. The deep ops-tree hash that keys the scheduler's Metal/
     /// liveness plan caches is otherwise recomputed every forward pass (~7% of a
@@ -302,6 +313,9 @@ impl ResidentExecutor {
         let mut forward_written: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         let mut planned: Vec<PlannedProgram> = Vec::with_capacity(programs.len());
+        // Per-tensor view dtypes (F16 everywhere except an fp8-packed weight) —
+        // filled by the per-program walk below; see the `view_dtype` field.
+        let mut view_dtypes: HashMap<u64, DType> = HashMap::new();
 
         let arena = crate::arena::Arena::global();
         for (funcs, spec) in programs {
@@ -310,9 +324,13 @@ impl ResidentExecutor {
             // gets the attention IR rewrites, applied ONCE here before planning.
             let mut module = crate::segmented::module_of(funcs);
             crate::segmented::apply_attention_rewrites(arena, &mut module);
-            let prog_shapes = crate::segmented::derive_shapes(&module, spec)?;
+            let (prog_shapes, prog_dtypes) = crate::segmented::derive_shapes_and_dtypes(&module, spec)?;
             for (&id, shp) in &prog_shapes {
                 shapes.entry(id).or_insert_with(|| shp.clone());
+            }
+            for (&id, dt) in &prog_dtypes {
+                // First view wins; a disagreement is an error the collector raises.
+                view_dtypes.entry(id).or_insert(*dt);
             }
             // Plan segments under the LX live-set budget (per program).
             let tensor_bytes: HashMap<u64, usize> = prog_shapes
@@ -407,6 +425,7 @@ impl ResidentExecutor {
             mem,
             stick,
             numel,
+            view_dtype: view_dtypes,
             sources,
             forward_written,
             dtype,
@@ -565,7 +584,14 @@ impl ResidentExecutor {
         let s = *self.stick.get(&tensor).ok_or_else(|| {
             format!("set_source_bytes: t{tensor} is not a tensor this program uses")
         })?;
-        if dtype == self.dtype {
+        // ⭐ VERBATIM WHEN THE BYTES MATCH THE VIEW the program reads them
+        // through — the model dtype OR the tensor's own view dtype (an
+        // fp8-packed weight's views decode each byte as e4m3, so its 1-byte
+        // layout is the stick layout; re-encoding it as F16 would leave the
+        // view reading half the bytes as garbage). A dtype that matches
+        // neither (e.g. f32 host bytes into an f16 stick) falls through f32.
+        let view_dt = self.view_dtype.get(&tensor).copied().unwrap_or(self.dtype);
+        if dtype == self.dtype || dtype == view_dt {
             // Verbatim: typed bytes already match the stick layout.
             self.mem
                 .hbm
@@ -597,7 +623,9 @@ impl ResidentExecutor {
         let s = *self.stick.get(&tensor).ok_or_else(|| {
             format!("set_source_bytes_owned: t{tensor} is not a tensor this program uses")
         })?;
-        if dtype == self.dtype {
+        // See `set_source_bytes`: verbatim when the bytes match the view dtype.
+        let view_dt = self.view_dtype.get(&tensor).copied().unwrap_or(self.dtype);
+        if dtype == self.dtype || dtype == view_dt {
             self.mem
                 .hbm
                 .borrow_mut()
@@ -839,7 +867,16 @@ impl ResidentExecutor {
                         // base_ptr is an ELEMENT index (RFC #110): the view's
                         // byte_address = base_ptr*bpe must land on the resident
                         // stick (byte s*STICK_BYTES), so bind elem = s*STICK_BYTES/bpe.
-                        let elem = s * STICK_BYTES / self.dtype.bytes_per_elem() as i64;
+                        // ⭐ bpe is the VIEW's own — an fp8-packed weight's views read
+                        // one byte per element, so dividing by the model dtype's bpe
+                        // would bind it at HALF its true byte address, inside the
+                        // previous tensor's allocation.
+                        let bpe = self
+                            .view_dtype
+                            .get(&tid)
+                            .unwrap_or(&self.dtype)
+                            .bytes_per_elem() as i64;
+                        let elem = s * STICK_BYTES / bpe;
                         input_ptrs.push((arg, Value::Index(elem)));
                     }
                     // Run against the persistent HBM, NO per-segment read-back: the
@@ -899,7 +936,14 @@ impl ResidentExecutor {
                             })?;
                             // base_ptr is an ELEMENT index (RFC #110): bind
                             // elem = s*STICK_BYTES/bpe so byte_address lands on stick s.
-                            let elem = s * STICK_BYTES / self.dtype.bytes_per_elem() as i64;
+                            // bpe is the VIEW's own (see the Fused arm: an fp8 view
+                            // reads one byte per element).
+                            let bpe = self
+                                .view_dtype
+                                .get(&b.tensor)
+                                .unwrap_or(&self.dtype)
+                                .bytes_per_elem() as i64;
+                            let elem = s * STICK_BYTES / bpe;
                             input_ptrs.push((b.arg, Value::Index(elem)));
                         }
                         // No per-segment read-back (outputs flow via HBM; see the

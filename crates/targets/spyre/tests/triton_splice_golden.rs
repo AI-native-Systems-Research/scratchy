@@ -150,7 +150,7 @@ fn rmsnorm_ir(m: u32, c: u32) -> SubtileIR {
 /// 12800) at decode rows and a prefill rung's width. (M, N). ⛔ THE `[64, 12800]` RUNG IS
 /// BUILDER-ONLY (the eight-live-tile LX budget the splice's guard mirrors), so it pins
 /// the FALLTHROUGH, not a comparison.
-const SILUMUL_SHAPES: &[(u32, u32)] = &[(1, 4096), (1, 12800), (31, 4096), (64, 12800)];
+const SILUMUL_SHAPES: &[(u32, u32)] = &[(1, 4096), (1, 12800), (31, 4096), (64, 12800), (96, 4096)];
 
 #[test]
 fn spliced_silumul_is_byte_identical_to_the_builder() {
@@ -223,7 +223,7 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
     }
 }
 
-/// `silu(gate) * up -> out` as a one-node [`SubtileIR`]. t0 = gate source, t1 = up
+
 /// source, t2 = result. Both operands are activations, but the builder path is
 /// shape-driven and does not read the distinction, so the fixture pins both as sources.
 fn silumul_ir(m: u32, c: u32) -> SubtileIR {
@@ -255,7 +255,7 @@ fn silumul_ir(m: u32, c: u32) -> SubtileIR {
 /// (the residual adds' width) at decode rows and a prefill rung's width, all inside
 /// the splice's LX budget (a blocked region is a builder-only node by the splice's own
 /// guard, so it has no splice side to compare). (M, N).
-const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096)];
+const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096), (96, 4096)];
 
 /// Every `EwKind` the splice has a row for. The kinds the builder REFUSES
 /// (Gelu/QuickGelu/GeluErf) are absent: they have no builder side, so a byte-identity
@@ -786,6 +786,281 @@ fn batched_decode_odd_vocab_lm_head_falls_through() {
     );
 }
 
+/// The fp8 shapes that matter for the delivery scope: granite 3.2's projections
+/// at decode rows and a prefill rung, non-square on purpose (the orientation
+/// discriminator). (M, K, N) — N is the weight's own out-features; the wscale row
+/// is `[1, N]`.
+const MATMUL_FP8_SHAPES: &[(u32, u32, u32)] = &[
+    (1, 2048, 512),   // DECODE — the shape every chat token runs
+    (1, 2048, 2048),  // decode, square
+    (31, 2048, 512),  // prefill rung, non-square
+    (31, 2048, 2048), // prefill rung, square
+    // The 8b's own shapes (hidden 4096): q/k/v at n=4096 square, o_proj
+    // n=4096, the MLP gate/up n=12800, down n=4096 — at the real PREFILL rung's
+    // mq=96 (the rung the card bakes) as well as decode. The byte-identity law
+    // is shape-independent but the LADDER's compile is not — these pin that the
+    // wide-kernel monomorphisation still yields the builder's descriptors.
+    (1, 4096, 4096),
+    (31, 4096, 12800),
+    (96, 4096, 4096),
+    (96, 4096, 12800),
+];
+
+/// The fp8 W8A8 row's byte-identity gate: the spliced `matmul_fp8.py` program vs
+/// the builder's `KtirFunc::matmul_fp8` through the SAME door. Both programs are
+/// `Program::Matmul` with an fp8 weight view and arity-3 bindings, so the door
+/// emits its 12-op W8A8 chain (abs→amax→amaxfl→ascale→invs→sc→chi→cl→qfp8ch→
+/// batchmatmulfp8→dqa→dqw) for BOTH — at one-node grain the `quantized` set is
+/// fresh, so neither path can dedup and the comparison is per-node exact.
+#[test]
+fn spliced_fp8_matmul_is_byte_identical_to_the_builder() {
+    for &(m, k, n) in MATMUL_FP8_SHAPES {
+        let ir = matmul_fp8_ir(m, k, n);
+        let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
+
+        // 1. The builder path — the control. `rows_are_requests: true` disables the
+        // prefill lm-head tail fold, as the dense golden states it.
+        let (builder_ops, layout) =
+            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
+                .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
+        let [builder] = &builder_ops[..] else {
+            panic!("one fp8 matmul node lowers to one op, got {}", builder_ops.len())
+        };
+        let builder_ktir = builder.ktir.as_ref().expect("builder op carries its program");
+
+        // 2. The splice — the Fp8Dynamic row compiles the kernel for this node.
+        let node = &ir.nodes[0];
+        let spliced = scratchy_triton_splice::lower(node, &ir, true)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"))
+            .expect("registry has a row for Fp8Dynamic MatmulTile");
+
+        // ⛔ THE NAME LAW — `matmul_s{id}` on both paths (the stem is the PROGRAM's,
+        // and fp8 shares dense's `Program::Matmul`).
+        assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} k={k} n={n})");
+
+        // 3. Both programs go through the SAME door under the SAME layout. A FRESH
+        // `quantized` set per program: at one-node grain neither path dedups, so
+        // both emit the full quant chain and the chain itself is compared.
+        let mut sym = 0i64;
+        let mut quantized = HashSet::new();
+        let builder_emitted = door_lower(
+            builder_ktir,
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message));
+        let mut sym = 0i64;
+        let mut quantized = HashSet::new();
+        let spliced_emitted = door_lower(
+            spliced.ktir.as_ref().expect("spliced op carries its program"),
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("spliced program lowered (m={m} k={k} n={n}): {}", e.message));
+
+        // The 12-op W8A8 chain is the door's own signature — pin the count so a
+        // divergence in WHICH chain the door picked is caught by name, not just by
+        // byte comparison.
+        assert_eq!(
+            builder_emitted.len(),
+            spliced_emitted.len(),
+            "op count (m={m} k={k} n={n})"
+        );
+        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+            let bj = serde_json::to_string(b.dsc()).unwrap();
+            let sj = serde_json::to_string(s.dsc()).unwrap();
+            assert_eq!(
+                bj, sj,
+                "descriptor bytes (m={m} k={k} n={n}): builder vs splice diverged"
+            );
+            assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} k={k} n={n})");
+        }
+    }
+}
+
+/// The fp8 row's EXECUTION gate. ⛔ THE ORIENTATION LAW, AND fp8 HAS TWO BINDING
+/// LAWS THE GOLDEN CANNOT SEE: (1) the weight orientation (non-square W, same as
+/// the dense gate); (2) the BYTES-VERBATIM law — the fp8 weight must cross as
+/// PACKED 1-byte e4m3 through `weight_arg`'s `Fp8E4m3` arm (`new_multi`'s weights
+/// parameter), not as f32-narrowed data, because the program's weight VIEW is
+/// what widens each byte on read. The emulator executes the program's own compute
+/// — `o[m,n] = Σ_k a[m,k]·e4m3(W[n,k])·ws[n]` — NOT the device's
+/// activation-quantized W8A8 (that chain is door-emitted and is a CARD fact,
+/// exercised by E2E). The host reference is that same function over the same
+/// packed bytes.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn spliced_fp8_matmul_executes_the_real_program() {
+    // DECODE (m=1) and a PREFILL rung (m=31), both NON-SQUARE: a square W
+    // satisfies both orientation readings.
+    for (m, k, n) in [(1u32, 2048u32, 512u32), (31u32, 2048u32, 512u32), (1u32, 2048u32, 2048u32), (31u32, 2048u32, 2048u32)] {
+        execute_one_spliced_fp8_matmul(m, k, n);
+    }
+}
+
+/// One spliced fp8 matmul through the production session entry, checked against
+/// a host reference over the SAME packed e4m3 bytes and per-channel scale the
+/// worker binds (`spyre_load.rs`'s fp8 arm stages the weight verbatim 1-byte;
+/// `weight_arg`'s `Fp8E4m3` arm mirrors it here).
+fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
+    let ir = matmul_fp8_ir(m, k, n);
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, true)
+        .unwrap_or_else(|e| panic!("splice compiled m={m} k={k} n={n}: {e}"))
+        .expect("registry has a row for Fp8Dynamic MatmulTile");
+    let k_node = spliced.ktir.as_ref().expect("spliced op carries its program");
+
+    // The host data, bound EXACTLY as the worker binds it: x `[m, k]` as f16
+    // (run_step narrows), W as PACKED e4m3 bytes in its on-disk `[n, k]`
+    // orientation (each byte = `f32_to_e4m3` of the reference value — the
+    // checkpoint's own codec), ws `[1, n]` as f16. The reference decodes the
+    // same bytes back through `e4m3_to_f32`, so the quantization error is
+    // inside both sides and only the COMPUTE is compared.
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
+    let w_val: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32) * 0.02 - 0.16).collect();
+    let w: Vec<u8> = w_val
+        .iter()
+        .map(|&v| ktir_emulator::codec::f32_to_e4m3(v))
+        .collect();
+    let ws: Vec<f32> = (0..n).map(|i| ((i % 7) as f32) * 0.05 + 0.1).collect();
+    let mut want = vec![0.0f32; (m * n) as usize];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for ki in 0..k {
+                let wq = ktir_emulator::codec::e4m3_to_f32(w[(ni * k + ki) as usize]);
+                acc += a[(mi * k + ki) as usize] * wq;
+            }
+            want[(mi * n + ni) as usize] = acc * ws[ni as usize];
+        }
+    }
+
+    // CONTROL: the BUILDER's own program for the same node, through the identical
+    // session/binding/data. Its result must match the spliced one — the exec-level
+    // twin of the byte-identity gate (and the control that LOCATED the resident
+    // executor's fp8 binding bug: both paths failed identically before it).
+    let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
+    let builder_ktir = {
+        let (builder_ops, _layout) =
+            lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, true)
+                .unwrap_or_else(|e| panic!("builder lowered m={m} k={k} n={n}: {e}"));
+        builder_ops[0].ktir.clone().expect("builder op carries its program")
+    };
+    let builder_got = execute_fp8_program(m, k, n, a.clone(), w.clone(), ws.clone(), builder_ktir.clone());
+
+
+    let got = execute_fp8_program(m, k, n, a, w, ws, k_node.clone());
+    assert_eq!(got.len(), (m * n) as usize, "m={m} k={k} n={n}");
+    for (g, b) in got.iter().zip(&builder_got) {
+        assert!(
+            (g - b).abs() < 1e-6,
+            "spliced vs builder program diverged at execution (m={m} k={k} n={n}): {g} vs {b}"
+        );
+    }
+    let mut max_abs = 0.0f32;
+    for (g, wnt) in got.iter().zip(&want) {
+        max_abs = max_abs.max((g - wnt).abs());
+    }
+    assert!(
+        max_abs < 0.05,
+        "the REAL spliced fp8 matmul program diverged from the host reference (m={m} \
+         k={k} n={n}): max abs err {max_abs}"
+    );
+}
+
+/// Run ONE fp8 matmul KtirNode through the production session entry with the
+/// given host bytes, returning the `[m, n]` output — the shared body of the
+/// splice's exec gate and its builder control.
+fn execute_fp8_program(
+    m: u32,
+    k: u32,
+    n: u32,
+    a: Vec<f32>,
+    w: Vec<u8>,
+    ws: Vec<f32>,
+    k_node: ktir_superdsc::ktir_node::KtirNode,
+) -> Vec<f32> {
+    use std::borrow::Cow;
+
+    let args: Vec<(ktir_core::ir::Ssa, scratchy_target_spyre::bundle_code::PlaceId)> = k_node
+        .func
+        .arguments
+        .iter()
+        .map(|(ssa, _ty)| (*ssa, scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get())))
+        .collect();
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            args: Cow::Owned(args),
+        }]),
+        init_binary: Cow::Borrowed(&[]),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
+
+    // W and ws are WEIGHTS (resident, typed bytes); x is the per-step SOURCE.
+    // Both cross through `new_multi`/`weight_arg`'s own dtype mapping — the
+    // production entry, not a test-side bypass.
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[3u64])],
+        vec![
+            (1, w, scratchy_tensors::DType::Fp8E4m3, vec![n as usize, k as usize]),
+            (2, {
+                // ws as f16 bytes: encode the f32 row through the codec the
+                // `Arg::TensorBytes { F16 }` arm expects (typed, zero f32 hop).
+                use ktir_emulator::codec;
+                let f16s: Vec<u16> = ws.iter().map(|&v| codec::f32_to_f16_bits(v)).collect();
+                f16s.iter().flat_map(|&b| b.to_le_bytes()).collect()
+            }, scratchy_tensors::DType::F16, vec![1, n as usize]),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("build the one-program session (m={m} k={k} n={n}): {e}"));
+    let out = session
+        .run_step(0, vec![(0, a, vec![m as usize, k as usize])], &[(3, 0)])
+        .unwrap_or_else(|e| panic!("run the fp8 matmul program (m={m} k={k} n={n}): {e}"));
+    out.into_iter()
+        .next()
+        .map(|(_, v)| v)
+        .expect("session produced the output tensor")
+}
+
+/// `hidden[m, k] @ W_fp8[k, n] * ws[n] -> out[m, n]` as a one-node
+/// [`SubtileIR`], fp8-dynamic weights — the arity-3 twin of [`matmul_ir`]:
+/// t0 = x, t1 = W (on-disk `[n, k]`), t2 = wscale (`[1, n]`), t3 = result.
+fn matmul_fp8_ir(m: u32, k: u32, n: u32) -> SubtileIR {
+    let tensors = vec![
+        TensorShape { rows: m, cols: k },
+        TensorShape { rows: n, cols: k },
+        TensorShape { rows: 1, cols: n },
+        TensorShape { rows: m, cols: n },
+    ];
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::MatmulTile {
+            n,
+            weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
+        },
+        inputs: vec![whole(0), whole(1), whole(2)],
+        output: whole(3),
+    };
+    SubtileIR {
+        tensors,
+        num_sources: 3,
+        nodes: vec![node],
+        result: TensorId::from_index(3),
+        op_output: Vec::new(),
+    }
+}
+
 /// `hidden[m, k] @ W[k, n] -> out[m, n]` as a one-node [`SubtileIR`], dense weights —
 /// the same fixture shape `superdsc_time_tile.rs`'s `single_matmul_ir` mints.
 fn matmul_ir(m: u32, k: u32, n: u32) -> SubtileIR {
@@ -826,6 +1101,11 @@ const ROPE_SHAPES: &[(u32, u32, u32)] = &[
     (1, 32, 128),  // 8b decode, the q plane
     (1, 8, 128),   // 8b decode, the kv plane
     (31, 32, 128), // 8b prefill rung (the slab form)
+    // The 8b's REAL prefill rung — mq=96 (the rung the card bakes) and the q
+    // plane's own head count at hd=128 (32 heads = the slab form at its widest
+    // head-major extent the 2b never reaches).
+    (96, 8, 128),
+    (96, 32, 128),
 ];
 
 #[test]
