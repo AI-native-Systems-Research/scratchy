@@ -1,0 +1,4 @@
+/Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/fixtures/swiglu_mlp.py:259:27: error: spyre-lane-major-layout: this tile is 64 wide over a view 256 wide, so it is not a contiguous flat block and its base cannot be renamed with different extents. Refusing
+            g = tl.dot(x, wg_desc.load([k, n]), g)
+                          ^
+/Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/fixtures/swiglu_mlp.py:259:27: note: see current operation: %35 = "ktdp.construct_access_tile"(%17, %2, %34) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<256x128x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>

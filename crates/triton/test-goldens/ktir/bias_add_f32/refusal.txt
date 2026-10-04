@@ -1,0 +1,15 @@
+CompilationError: at 14:28:
+    offset = pid * BLOCK
+    a_desc = tl.make_tensor_descriptor(a_ptr, shape=[n], strides=[1],
+                                       block_shape=[BLOCK])
+    b_desc = tl.make_tensor_descriptor(b_ptr, shape=[n], strides=[1],
+                                       block_shape=[BLOCK])
+    c_desc = tl.make_tensor_descriptor(c_ptr, shape=[n], strides=[1],
+                                       block_shape=[BLOCK])
+    # Load f16, widen to f32 for the accumulate (Triton stability widening).
+    a = a_desc.load([offset]).to(tl.float32)
+    b = b_desc.load([offset]).to(tl.float32)
+    # Splat f32 bias constant (forces DecomposeDenseConstants).
+    bias = tl.full([BLOCK], BIAS, tl.float32)
+                            ^
+NameError("Cannot access global variable BIAS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.")

@@ -1,0 +1,102 @@
+{
+  "config": "rope_q32",
+  "fixture": "rope",
+  "kernel": "rope_fwd",
+  "inputs_fn": "inputs",
+  "reference_fn": "reference",
+  "seed": 0,
+  "torch": "2.11.0+cpu",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "H": 32,
+    "N_TOK": 256,
+    "HEAD_DIM": 128,
+    "HALF": 64
+  },
+  "grid": [
+    256
+  ],
+  "inputs": [
+    {
+      "arg": "desc_x",
+      "file": "in_desc_x.bin",
+      "shape": [
+        8192,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_cos",
+      "file": "in_desc_cos.rep",
+      "shape": [
+        8192,
+        128
+      ],
+      "dtype": "f16",
+      "replicate": {
+        "rule": "repeat_interleave",
+        "axis": 0,
+        "factor": 32,
+        "block": 256,
+        "stored_shape": [
+          256,
+          128
+        ],
+        "stored_bytes": 65536,
+        "full_shape": [
+          8192,
+          128
+        ],
+        "expand": "full[i * factor + j] = stored[i] for i in [0, block), j in [0, factor)",
+        "not": "torch.repeat / tiling -- same shape, different values"
+      }
+    },
+    {
+      "arg": "desc_sin",
+      "file": "in_desc_sin.rep",
+      "shape": [
+        8192,
+        128
+      ],
+      "dtype": "f16",
+      "replicate": {
+        "rule": "repeat_interleave",
+        "axis": 0,
+        "factor": 32,
+        "block": 256,
+        "stored_shape": [
+          256,
+          128
+        ],
+        "stored_bytes": 65536,
+        "full_shape": [
+          8192,
+          128
+        ],
+        "expand": "full[i * factor + j] = stored[i] for i in [0, block), j in [0, factor)",
+        "not": "torch.repeat / tiling -- same shape, different values"
+      }
+    },
+    {
+      "arg": "desc_o",
+      "file": "in_desc_o.bin",
+      "shape": [
+        8192,
+        128
+      ],
+      "dtype": "f16",
+      "zeroed": true
+    }
+  ],
+  "output": {
+    "arg": "desc_o",
+    "file": "ref_out.bin",
+    "shape": [
+      8192,
+      128
+    ],
+    "dtype": "f16"
+  },
+  "reference_note": "desc_cos and desc_sin are stored as ONE [N_TOK, HEAD_DIM] block plus a `replicate` rule, not as the full [N_TOK * H, HEAD_DIM] buffer: rope.stage_table's repeat_interleave(h, dim=0) makes the full buffer H consecutive copies of each distinct row. The rule is repeat_interleave, NOT repeat -- full[i*factor + j] = stored[i], not stored[i] tiled factor times -- and those two differ only in their VALUES, never in their shape, which is the same token-major/head-major trap stage_table's own docstring records. So the rule is not merely asserted here: the generator expands the stored block by the recorded rule and requires it to reproduce the full buffer BIT FOR BIT before writing, and requires the `repeat` reading NOT to."
+}

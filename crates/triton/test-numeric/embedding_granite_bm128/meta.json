@@ -1,0 +1,129 @@
+{
+  "config": "embedding_granite_bm128",
+  "fixture": "embedding",
+  "kernel": "embedding_fwd",
+  "inputs_fn": "inputs",
+  "reference_fn": "reference",
+  "seed": 0,
+  "torch": "2.11.0+cpu",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "N_TOK": 256,
+    "V": 49159,
+    "D_MODEL": 4096,
+    "BLOCK_M": 128,
+    "EMB_SCALE": 12.0
+  },
+  "grid": [
+    2
+  ],
+  "inputs": [
+    {
+      "arg": "desc_ids",
+      "file": "in_desc_ids.bin",
+      "shape": [
+        256
+      ],
+      "dtype": "i32"
+    },
+    {
+      "arg": "desc_table",
+      "file": "in_desc_table.sparse",
+      "shape": [
+        49159,
+        4096
+      ],
+      "dtype": "f16",
+      "sparse": {
+        "format": "SPRSTBL1",
+        "full_shape": [
+          49159,
+          4096
+        ],
+        "dtype": "f16",
+        "itemsize": 2,
+        "n_present": 255,
+        "absent_rows": "zero",
+        "endian": "little",
+        "header": [
+          {
+            "field": "magic",
+            "offset": 0,
+            "size": 8,
+            "type": "ascii",
+            "value": "SPRSTBL1"
+          },
+          {
+            "field": "rows",
+            "offset": 8,
+            "size": 8,
+            "type": "u64"
+          },
+          {
+            "field": "cols",
+            "offset": 16,
+            "size": 8,
+            "type": "u64"
+          },
+          {
+            "field": "itemsize",
+            "offset": 24,
+            "size": 4,
+            "type": "u32"
+          },
+          {
+            "field": "n_present",
+            "offset": 28,
+            "size": 4,
+            "type": "u32"
+          }
+        ],
+        "records": {
+          "offset": 32,
+          "count": 255,
+          "stride": 8196,
+          "order": "row_index ascending, each row_index distinct and < rows",
+          "layout": [
+            {
+              "field": "row_index",
+              "size": 4,
+              "type": "u32"
+            },
+            {
+              "field": "row",
+              "size": 8192,
+              "type": "4096 x f16 contiguous"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "arg": "desc_o",
+      "file": "in_desc_o.bin",
+      "shape": [
+        256,
+        4096
+      ],
+      "dtype": "f16",
+      "zeroed": true
+    }
+  ],
+  "output": {
+    "arg": "desc_o",
+    "file": "ref_out.bin",
+    "shape": [
+      256,
+      4096
+    ],
+    "dtype": "f16"
+  },
+  "reference_note": "desc_table is stored SPARSELY: the kernel gathers 256 rows of a 49159-row table, so only the distinct rows desc_ids names are kept -- 2 MiB instead of 384 MiB. THE PROPERTY THAT MAKES THIS SOUND: an absent row expands to ZERO, so if the kernel ever reads a row the ids did not name it reads zeros and the comparison DIVERGES. Sparsification can therefore produce a false FAILURE but never a false PASS -- it cannot mask a wrong gather, which is the bug class this configuration exists to catch. A reader that expands to anything other than zero (uninitialised memory, a splat, a wrap-around) breaks that guarantee and must not.",
+  "data_dir": "embedding_granite",
+  "sha256": {
+    "in_desc_ids.bin": "ae793efe5329c61ef3bef5c3f013249bc849fecdc5d96e9fad472d654fbf6827",
+    "in_desc_o.bin": "5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee",
+    "in_desc_table.sparse": "99b8ffa043a0db83fd14a7c286230ec207863ae53e6aeb7d8a7bf66f2a0d16d4",
+    "ref_out.bin": "95c5ab61d59e76554ee33ce8dab8afdc94909fbdd379135e89b68fd57e959f91"
+  }
+}

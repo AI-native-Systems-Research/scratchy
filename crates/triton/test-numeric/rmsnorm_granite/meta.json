@@ -1,0 +1,58 @@
+{
+  "config": "rmsnorm_granite",
+  "fixture": "rmsnorm",
+  "kernel": "rmsnorm_fwd",
+  "inputs_fn": "inputs",
+  "reference_fn": "reference",
+  "seed": 0,
+  "torch": "2.11.0+cpu",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "M": 64,
+    "D_MODEL": 4096,
+    "BLOCK_M": 64,
+    "EPS": 1e-05,
+    "INV_D": 0.000244140625
+  },
+  "grid": [
+    1
+  ],
+  "inputs": [
+    {
+      "arg": "desc_x",
+      "file": "in_desc_x.bin",
+      "shape": [
+        64,
+        4096
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_w",
+      "file": "in_desc_w.bin",
+      "shape": [
+        4096
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_o",
+      "file": "in_desc_o.bin",
+      "shape": [
+        64,
+        4096
+      ],
+      "dtype": "f16",
+      "zeroed": true
+    }
+  ],
+  "output": {
+    "arg": "desc_o",
+    "file": "ref_out.bin",
+    "shape": [
+      64,
+      4096
+    ],
+    "dtype": "f16"
+  }
+}

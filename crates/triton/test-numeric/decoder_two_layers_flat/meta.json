@@ -1,0 +1,240 @@
+{
+  "config": "decoder_two_layers_flat",
+  "fixture": "decoder_block",
+  "kernel": "decoder_two_layers_fwd",
+  "inputs_fn": "inputs",
+  "reference_fn": "reference",
+  "seed": 0,
+  "torch": "2.11.0+cpu",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "M": 64,
+    "D_MODEL": 128,
+    "D_FF": 256,
+    "BLOCK_N": 256,
+    "HALF": 64,
+    "EPS": 1e-05,
+    "INV_D": 0.0078125,
+    "QK_SCALE": 0.011271055,
+    "RM": 0.22
+  },
+  "grid": [
+    1
+  ],
+  "inputs": [
+    {
+      "arg": "desc_x",
+      "file": "in_desc_x.bin",
+      "shape": [
+        64,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_o",
+      "file": "in_desc_o.bin",
+      "shape": [
+        64,
+        128
+      ],
+      "dtype": "f16",
+      "zeroed": true
+    },
+    {
+      "arg": "desc_n1a",
+      "file": "in_desc_n1a.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wqa",
+      "file": "in_desc_wqa.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wka",
+      "file": "in_desc_wka.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wva",
+      "file": "in_desc_wva.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_woa",
+      "file": "in_desc_woa.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_n2a",
+      "file": "in_desc_n2a.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wga",
+      "file": "in_desc_wga.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wua",
+      "file": "in_desc_wua.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wda",
+      "file": "in_desc_wda.bin",
+      "shape": [
+        128,
+        256
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_n1b",
+      "file": "in_desc_n1b.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wqb",
+      "file": "in_desc_wqb.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wkb",
+      "file": "in_desc_wkb.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wvb",
+      "file": "in_desc_wvb.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wob",
+      "file": "in_desc_wob.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_n2b",
+      "file": "in_desc_n2b.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wgb",
+      "file": "in_desc_wgb.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wub",
+      "file": "in_desc_wub.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wdb",
+      "file": "in_desc_wdb.bin",
+      "shape": [
+        128,
+        256
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_mask",
+      "file": "in_desc_mask.bin",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_cos",
+      "file": "in_desc_cos.bin",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_sin",
+      "file": "in_desc_sin.bin",
+      "shape": [
+        64,
+        64
+      ],
+      "dtype": "f16"
+    }
+  ],
+  "output": {
+    "arg": "desc_o",
+    "file": "ref_out.bin",
+    "shape": [
+      64,
+      128
+    ],
+    "dtype": "f16"
+  },
+  "reference_note": "decoder_block.reference() verbatim, on decoder_block.inputs()'s own dict. THE WEIGHT BUFFERS ARE TRANSPOSED ON THE WAY OUT: layer_weights() builds them in the orientation reference() multiplies (h @ w, [in, out]), but every dot in _decoder_layer carries .T on the weight and wg_desc's shape is [D_FF, D_MODEL] against layer_weights' [d_model, d_ff] -- so the kernel's buffer is the transpose. layer_weights' docstring calls its orientation 'the [in, out] orientation the kernel reads', and that phrase is wrong; the code decides. n1/n2 are 1-D and mask/cos/sin are passed through untouched."
+}

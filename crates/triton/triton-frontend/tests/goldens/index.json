@@ -1,0 +1,487 @@
+[
+  {
+    "constexprs": {
+      "BLOCK": 64
+    },
+    "grid": [
+      16
+    ],
+    "kernel": "vector_add_kernel",
+    "name": "vector_add",
+    "post_lines": 38,
+    "raw_lines": 48,
+    "signature": {
+      "BLOCK": "constexpr",
+      "a_ptr": "*fp16",
+      "b_ptr": "*fp16",
+      "c_ptr": "*fp16",
+      "n": "i32"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK": 64
+    },
+    "grid": [
+      16
+    ],
+    "kernel": "mul_kernel",
+    "name": "mul",
+    "post_lines": 38,
+    "raw_lines": 48,
+    "signature": {
+      "BLOCK": "constexpr",
+      "a_ptr": "*fp16",
+      "b_ptr": "*fp16",
+      "c_ptr": "*fp16",
+      "n": "i32"
+    }
+  },
+  {
+    "error": "bias_add_f32: CompilationError: at 14:28:",
+    "name": "bias_add_f32",
+    "xfail": "module global read inside a @triton.jit kernel"
+  },
+  {
+    "constexprs": {
+      "BLOCK_K": 128,
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "M": 64
+    },
+    "grid": [
+      1
+    ],
+    "kernel": "swiglu_mlp_fwd",
+    "name": "swiglu_mlp",
+    "post_lines": 99,
+    "raw_lines": 169,
+    "signature": {
+      "BLOCK_K": "constexpr",
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_K": 4096,
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "D_FF": 12800,
+      "D_MODEL": 4096,
+      "M": 64
+    },
+    "grid": [
+      1
+    ],
+    "kernel": "swiglu_mlp_fwd",
+    "name": "swiglu_mlp_granite",
+    "post_lines": 99,
+    "raw_lines": 169,
+    "signature": {
+      "BLOCK_K": "constexpr",
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_K": 64,
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "M": 64
+    },
+    "grid": [
+      1
+    ],
+    "kernel": "swiglu_mlp_fwd",
+    "name": "swiglu_mlp_tiledk",
+    "post_lines": 105,
+    "raw_lines": 169,
+    "signature": {
+      "BLOCK_K": "constexpr",
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_M": 64,
+      "D_MODEL": 128,
+      "EMB_SCALE": 12.0,
+      "N_TOK": 256,
+      "V": 512
+    },
+    "grid": [
+      4
+    ],
+    "kernel": "embedding_fwd",
+    "name": "embedding",
+    "post_lines": 43,
+    "raw_lines": 59,
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "D_MODEL": "constexpr",
+      "EMB_SCALE": "constexpr",
+      "N_TOK": "constexpr",
+      "V": "constexpr",
+      "desc_ids": "*i32",
+      "desc_o": "*fp16",
+      "desc_table": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_M": 64,
+      "D_MODEL": 4096,
+      "EMB_SCALE": 12.0,
+      "N_TOK": 256,
+      "V": 49159
+    },
+    "grid": [
+      4
+    ],
+    "kernel": "embedding_fwd",
+    "name": "embedding_granite",
+    "post_lines": 43,
+    "raw_lines": 59,
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "D_MODEL": "constexpr",
+      "EMB_SCALE": "constexpr",
+      "N_TOK": "constexpr",
+      "V": "constexpr",
+      "desc_ids": "*i32",
+      "desc_o": "*fp16",
+      "desc_table": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_M": 64,
+      "D_MODEL": 128,
+      "EPS": 1e-05,
+      "INV_D": 0.0078125,
+      "M": 64
+    },
+    "grid": [
+      1
+    ],
+    "kernel": "rmsnorm_fwd",
+    "name": "rmsnorm",
+    "post_lines": 75,
+    "raw_lines": 115,
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "D_MODEL": "constexpr",
+      "EPS": "constexpr",
+      "INV_D": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_w": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_M": 64,
+      "D_MODEL": 4096,
+      "EPS": 1e-05,
+      "INV_D": 0.000244140625,
+      "M": 64
+    },
+    "grid": [
+      1
+    ],
+    "kernel": "rmsnorm_fwd",
+    "name": "rmsnorm_granite",
+    "post_lines": 75,
+    "raw_lines": 115,
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "D_MODEL": "constexpr",
+      "EPS": "constexpr",
+      "INV_D": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_w": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "H": 4,
+      "HALF": 64,
+      "HEAD_DIM": 128,
+      "N_TOK": 256
+    },
+    "grid": [
+      256
+    ],
+    "kernel": "rope_fwd",
+    "name": "rope",
+    "post_lines": 64,
+    "raw_lines": 85,
+    "signature": {
+      "H": "constexpr",
+      "HALF": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_TOK": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "H": 32,
+      "HALF": 64,
+      "HEAD_DIM": 128,
+      "N_TOK": 256
+    },
+    "grid": [
+      256
+    ],
+    "kernel": "rope_fwd",
+    "name": "rope_granite_q",
+    "post_lines": 64,
+    "raw_lines": 85,
+    "signature": {
+      "H": "constexpr",
+      "HALF": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_TOK": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "H": 8,
+      "HALF": 64,
+      "HEAD_DIM": 128,
+      "N_TOK": 256
+    },
+    "grid": [
+      256
+    ],
+    "kernel": "rope_fwd",
+    "name": "rope_granite_kv",
+    "post_lines": 64,
+    "raw_lines": 85,
+    "signature": {
+      "H": "constexpr",
+      "HALF": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_TOK": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "EPS": 1e-05,
+      "HALF": 64,
+      "INV_D": 0.0078125,
+      "M": 64,
+      "QK_SCALE": 0.011271055,
+      "RM": 0.22
+    },
+    "grid": [
+      1
+    ],
+    "kernel": "decoder_layer_fwd",
+    "name": "decoder_layer",
+    "post_lines": 443,
+    "raw_lines": 596,
+    "signature": {
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "EPS": "constexpr",
+      "HALF": "constexpr",
+      "INV_D": "constexpr",
+      "M": "constexpr",
+      "QK_SCALE": "constexpr",
+      "RM": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_n1": "*fp16",
+      "desc_n2": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wk": "*fp16",
+      "desc_wo": "*fp16",
+      "desc_wq": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_wv": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "EPS": 1e-05,
+      "HALF": 64,
+      "INV_D": 0.0078125,
+      "M": 64,
+      "QK_SCALE": 0.011271055,
+      "RM": 0.22
+    },
+    "grid": [
+      1
+    ],
+    "kernel": "decoder_two_layers_fwd",
+    "name": "decoder_two_layers",
+    "post_lines": 677,
+    "raw_lines": 667,
+    "signature": {
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "EPS": "constexpr",
+      "HALF": "constexpr",
+      "INV_D": "constexpr",
+      "M": "constexpr",
+      "QK_SCALE": "constexpr",
+      "RM": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_n1a": "*fp16",
+      "desc_n1b": "*fp16",
+      "desc_n2a": "*fp16",
+      "desc_n2b": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_wda": "*fp16",
+      "desc_wdb": "*fp16",
+      "desc_wga": "*fp16",
+      "desc_wgb": "*fp16",
+      "desc_wka": "*fp16",
+      "desc_wkb": "*fp16",
+      "desc_woa": "*fp16",
+      "desc_wob": "*fp16",
+      "desc_wqa": "*fp16",
+      "desc_wqb": "*fp16",
+      "desc_wua": "*fp16",
+      "desc_wub": "*fp16",
+      "desc_wva": "*fp16",
+      "desc_wvb": "*fp16",
+      "desc_x": "*fp16"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "GQA": 2,
+      "H": 4,
+      "HEAD_DIM": 128,
+      "N_CTX": 256,
+      "STAGE": 1,
+      "Z": 1,
+      "sm_scale": 1.0
+    },
+    "grid": [
+      4,
+      4
+    ],
+    "kernel": "attn_fwd",
+    "name": "attention_flash_noncausal",
+    "post_lines": 218,
+    "raw_lines": 482,
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "GQA": "constexpr",
+      "H": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_CTX": "constexpr",
+      "STAGE": "constexpr",
+      "Z": "constexpr",
+      "desc_k": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_o": "*fp16",
+      "desc_q": "*fp16",
+      "desc_v": "*fp16",
+      "sm_scale": "constexpr"
+    }
+  },
+  {
+    "constexprs": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "GQA": 2,
+      "H": 4,
+      "HEAD_DIM": 128,
+      "N_CTX": 256,
+      "STAGE": 3,
+      "Z": 1,
+      "sm_scale": 1.0
+    },
+    "grid": [
+      4,
+      4
+    ],
+    "kernel": "attn_fwd",
+    "name": "attention_flash_causal",
+    "post_lines": 319,
+    "raw_lines": 647,
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "GQA": "constexpr",
+      "H": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_CTX": "constexpr",
+      "STAGE": "constexpr",
+      "Z": "constexpr",
+      "desc_k": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_o": "*fp16",
+      "desc_q": "*fp16",
+      "desc_v": "*fp16",
+      "sm_scale": "constexpr"
+    }
+  }
+]

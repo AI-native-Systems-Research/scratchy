@@ -1,0 +1,61 @@
+# NUMERIC VERIFICATION: does each Granite kernel compute the RIGHT FUNCTION?
+#
+# ⛔ WHY THIS CRATE EXISTS. Seven of nine configurations compile from their `.py` all the way to
+# SpyreCode, and NOT ONE of them was numerically validated, because `dxp_standalone` compiles and
+# executes no arithmetic. That is not a theoretical gap: two decoders passed that gate for HOURS
+# while contracting `q @ k` where the program says `q @ k.T`. A green bake cannot see the
+# difference; an executor can.
+#
+# ⚠️ WHAT THE ORACLE IS AND IS NOT. `ktir-emulator` accumulates a CONTRACTION in f32 and rounds it
+# once, rounds EVERY ELEMENTWISE step to the tile dtype, rounds to nearest-EVEN where the device
+# rounds half-up, and has NO sigmoid and no Newton rsqrt at all. So it is a CORRECTNESS oracle, not
+# a fidelity one: it proves the program computes the right FUNCTION -- a wrong contraction, a
+# dropped transpose, a reduction on the wrong axis -- and it does NOT prove the device's rounding
+# matches. Every claim in this paragraph has a file:line in `src/lib.rs`; that is exactly the right
+# instrument for the bug class this tree has, and the wrong one for a fidelity claim.
+#
+# ⛔ SEPARATE FROM `triton-ktir` AND `triton-ktir-superdsc` ON PURPOSE. `triton-ktir`'s default
+# feature set is dependency-free and `cargo test --offline` on the pod is its gate; `ktir-superdsc`'s
+# manifest states "⛔ NEVER `ktir-emulator`". The emulator edge lives here, where nothing in the
+# lowering path can acquire it.
+[package]
+name = "triton-numeric"
+description = "the nine Granite configurations, EXECUTED: .py -> ttir -> KTIR -> emulator -> vs torch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+# LEG 1 -- `.py` source to ttir. `ruff` is not optional here: every configuration starts from
+# PYTHON SOURCE, which is the point. A test fed a checked-in ttir golden cannot see a fixture change,
+# and reading one cost this tree an afternoon (`bake_py.rs`'s KTIR_DUMP note).
+triton-frontend = { path = "../triton-frontend", features = ["ruff"] }
+# LEG 2 -- ttir value to our KTIR value, then `passes::to_ktir_emit::lower` to THEIR `IRFunction`.
+triton-ktir = { path = "../triton-ktir", features = ["ruff"] }
+# THE FOURTEEN CONFIGURATIONS, stated once. `cases::case(name)` is the same table `examples/bake_py`
+# drives, so "what is `rope_q32`?" has one answer in this repo and not two.
+triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }
+# LEG 3 -- the executor. Re-hosted: scratchy's own `ktir-emulator`, in-tree.
+#
+# `default-features = false` drops `optimizer`, which gates `resident`/`segmented`/`program` --
+# whole-program fusion drivers this crate does not use. `interpreter` and `comm_sched` are not
+# behind it.
+ktir-emulator = { path = "../../targets/spyre/ktir/ktir-emulator", default-features = false }
+ktir-core = { path = "../../targets/spyre/ktir/ktir-core" }
+# THE REFERENCE DATA'S PROVENANCE IS A JSON FILE. `test/numeric/<config>/meta.json` records the
+# shapes, dtypes, seed, fixture function names and torch version behind every checked-in `.bin`, so
+# the bytes' origin is in the tree rather than in a commit message. Hand-rolling a reader for it is
+# how the `constantInfo_` class of bug gets written; `ktir-superdsc` and `triton-ktir-superdsc`
+# already declare this edge and the pod's cache holds it (see ../vendor/PROVENANCE.md).
+serde_json = "1"
+
+[features]
+default = []
+# ⭐ NO `accelerate` FEATURE, DELIBERATELY. The snapshot this crate was re-hosted from
+# carried one (`accelerate = ["ktir-emulator/accelerate"]`), but that named a feature of
+# an OLDER vendored copy of scratchy's `ktir-emulator` — the crate was always scratchy's,
+# and scratchy's current tree has no such feature: on macOS it links Accelerate via
+# `blas-src` unconditionally (ktir-emulator/Cargo.toml, target_os = "macos"), and
+# `naive_sgemm` remains the parity oracle for any BLAS path either way. The stale
+# reference is a snapshot-drift casualty, not a lost knob.
