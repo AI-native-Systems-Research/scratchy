@@ -340,11 +340,8 @@ mod imp {
                     layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
-                    gdn_cfg.conv_dim as usize,
-                    gdn_cfg.conv_kernel as usize,
-                    gdn_cfg.num_v_heads as usize,
-                    gdn_cfg.head_v_dim as usize,
-                    gdn_cfg.head_k_dim as usize,
+                    scratchy_target_metal::gdn_state::CheckpointRows::NONE,
+                    gdn_cfg.state_dims(),
                     |bytes| {
                         // f32 conv/ssm state; MUST be StorageModeShared.
                         Ok(MetalMem::new_pinned(

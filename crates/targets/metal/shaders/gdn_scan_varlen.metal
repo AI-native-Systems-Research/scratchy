@@ -21,8 +21,9 @@
 // math). GVA: the key head is `i_hv / (HV/H)`.
 //
 // `conv_out` is model dtype (`T`); `g`/`beta`/`ssm_state`/`o` are f32.
-// State layout (cuda-symmetric): ssm_state[num_slots, HV, head_v, head_k],
-//   row = ((slot*HV + i_hv)*head_v + i_v)*head_k. is_fresh → S starts at 0.
+// State layout (cuda-symmetric): ssm_state[entries, HV, head_v, head_k], row =
+//   ((entry*HV + i_hv)*head_v + i_v)*head_k; a slot's entry is followed by its checkpoints.
+//   `gdn_step[seq]` is `scratchy_layers::gdn_state::GdnStep::encode`.
 //
 // Baked constants:
 //   GDN_SCAN_NUM_K_HEADS (H), GDN_SCAN_NUM_V_HEADS (HV),
@@ -53,7 +54,7 @@ template <typename T>
     device       float* ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device int*   state_indices [[buffer(6)]],
-    const device uint*  is_fresh      [[buffer(7)]],
+    const device uint*  gdn_step      [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
 {
@@ -81,17 +82,20 @@ template <typename T>
   if (seq_len <= 0) {
     return;
   }
-  int slot = state_indices[i_n];
-  if (slot < 0) {
+  int entry = state_indices[i_n];
+  if (entry < 0) {
     return;
   }
-  bool fresh = is_fresh[i_n] != 0u;
+  uint start = gdn_step[i_n] & 0xffu;
+  uint checkpoint_rows = (gdn_step[i_n] >> 8) & 0xffu;
+  uint entry_len = HV * Vd * K;
 
   device float* state_row =
-      ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K;
+      ssm_state + ((uint(entry) * HV + i_hv) * Vd + i_v) * K;
+  const device float* start_row = state_row + (start >= 2u ? (start - 1u) * entry_len : 0u);
   float b_h[GDN_SCAN_KMAX];
   for (uint ki = 0; ki < K; ki++) {
-    b_h[ki] = fresh ? 0.0f : state_row[ki];
+    b_h[ki] = start == 1u ? 0.0f : start_row[ki];
   }
 
   for (int i_t = 0; i_t < seq_len; i_t++) {
@@ -130,6 +134,9 @@ template <typename T>
       b_o += b_h[ki] * qn;
     }
     o[t * value_dim + i_hv * Vd + i_v] = b_o;
+    for (uint ki = 0; uint(i_t) < checkpoint_rows && ki < K; ki++) {
+      state_row[(uint(i_t) + 1u) * entry_len + ki] = b_h[ki];
+    }
   }
 
   for (uint ki = 0; ki < K; ki++) {

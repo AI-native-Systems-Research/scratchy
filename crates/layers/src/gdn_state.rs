@@ -27,12 +27,104 @@
 //! Like `KvCachePool` the buffer-allocation is a caller-supplied closure (cuda
 //! wraps `driver::mem_alloc`, metal wraps `device.new_buffer`); the layout /
 //! sizing / accessor logic is backend-neutral.
+//!
+//! **Checkpoints (speculative decoding).** A verify step runs a sequence's last token and its
+//! drafts as rows of one step, and a rejected draft must not stay in the recurrent state. With
+//! `checkpoint_rows = k`, each slot owns `1 + k` state entries: the state itself, then the
+//! state after each of the step's first `k` rows ([`GdnStep::checkpoint_rows`]). The next step
+//! starts from the checkpoint at the accepted row ([`GdnStart::Checkpoint`]) — the accepted
+//! count is data the step reads, so nothing is copied or replayed.
 
 use anyhow::Result;
 use scratchy_tensors::{DType, GpuTensor, PoolMemory, TensorView};
 
 /// GDN recurrent-state buffers are always f32 (kernels + `mamba_ssm_dtype`).
 pub const GDN_STATE_DTYPE: DType = DType::F32;
+
+/// State entries a GDN slot keeps after its own: the state after each of a verify step's first
+/// rows (module docs) — the most drafts one verify step may carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CheckpointRows(pub u8);
+
+impl CheckpointRows {
+    /// No checkpoints: a deployment without speculative decoding.
+    pub const NONE: Self = Self(0);
+
+    /// State entries per slot: its own and its checkpoints.
+    pub fn entries_per_slot(self) -> usize {
+        1 + usize::from(self.0)
+    }
+}
+
+/// The state a sequence's GDN layers start a step from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnStart {
+    /// The state its slot holds — the previous step's last row.
+    Slot,
+    /// Zero: the sequence's first step.
+    Fresh,
+    /// The state after row `r` of the previous step: a verify step accepted the drafts up to it.
+    Checkpoint(u8),
+}
+
+/// What one step does with one sequence's GDN state, as the per-sequence `u32` the GDN kernels
+/// read (the buffer the forward calls `is_fresh`: `0` and `1` keep their meaning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnStep {
+    pub start: GdnStart,
+    /// Rows whose resulting state the step also writes to the slot's checkpoints, `0..rows`:
+    /// a verify step's drafts. [`CheckpointRows::NONE`] outside speculative decoding.
+    pub checkpoint_rows: CheckpointRows,
+}
+
+impl GdnStep {
+    /// The kernels' encoding: bits 0–7 the start (`0` slot, `1` fresh, `2 + r` checkpoint `r`),
+    /// bits 8–15 the checkpoint rows.
+    pub fn encode(self) -> u32 {
+        let start = match self.start {
+            GdnStart::Slot => 0,
+            GdnStart::Fresh => 1,
+            GdnStart::Checkpoint(r) => 2 + u32::from(r),
+        };
+        start | (u32::from(self.checkpoint_rows.0) << 8)
+    }
+}
+
+/// One GDN layer's state geometry: its causal conv's channels and width, and its delta-rule
+/// heads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnStateDims {
+    pub conv_dim: usize,
+    /// Causal conv kernel width (e.g. 4).
+    pub conv_kernel: usize,
+    pub num_v_heads: usize,
+    pub head_v_dim: usize,
+    pub head_k_dim: usize,
+}
+
+impl GdnStateDims {
+    /// Conv-state ring length: `conv_kernel - 1` past tokens retained per channel.
+    fn conv_state_len(self) -> usize {
+        self.conv_kernel - 1
+    }
+
+    /// One state entry's shapes and bytes, `(conv, ssm)`, `entries` of them.
+    fn shapes(self, entries: usize) -> ([usize; 3], [usize; 4]) {
+        let conv = [entries, self.conv_dim, self.conv_state_len()];
+        let ssm = [entries, self.num_v_heads, self.head_v_dim, self.head_k_dim];
+        (conv, ssm)
+    }
+
+    /// Bytes of `entries` conv and ssm state entries.
+    fn bytes(self, entries: usize) -> (usize, usize) {
+        let (conv, ssm) = self.shapes(entries);
+        let sz = GDN_STATE_DTYPE.size_bytes();
+        (
+            conv.iter().product::<usize>() * sz,
+            ssm.iter().product::<usize>() * sz,
+        )
+    }
+}
 
 /// Recurrent-state pool for the GDN (linear-attention) layers of a hybrid model.
 ///
@@ -41,11 +133,11 @@ pub const GDN_STATE_DTYPE: DType = DType::F32;
 /// host allocator's job — this struct just owns the storage and hands out
 /// lifetime-checked views.
 pub struct GdnStatePool<M: PoolMemory> {
-    /// Causal-conv1d ring per layer: `[num_slots, conv_dim, conv_kernel-1]`.
+    /// Causal-conv1d ring per layer: `[num_slots · entries_per_slot, conv_dim, conv_kernel-1]`.
     /// `None` for non-linear (full-attention) layers.
     conv_states: Vec<Option<GpuTensor>>,
     /// Recurrent delta-rule state per layer:
-    /// `[num_slots, num_v_heads, head_v_dim, head_k_dim]`. `None` for
+    /// `[num_slots · entries_per_slot, num_v_heads, head_v_dim, head_k_dim]`. `None` for
     /// non-linear layers.
     ssm_states: Vec<Option<GpuTensor>>,
     /// RAII wrappers for the conv-state GPU allocations — auto-freed on drop.
@@ -53,12 +145,9 @@ pub struct GdnStatePool<M: PoolMemory> {
     _ssm_ptrs: Vec<Option<M>>,
     pub num_layers: usize,
     pub num_slots: usize,
-    pub conv_dim: usize,
-    /// Causal conv kernel width (e.g. 4).
-    pub conv_kernel: usize,
-    pub num_v_heads: usize,
-    pub head_v_dim: usize,
-    pub head_k_dim: usize,
+    /// Checkpoint entries each slot owns after its state (module docs).
+    pub checkpoint_rows: CheckpointRows,
+    pub dims: GdnStateDims,
 }
 
 // Safety: GdnStatePool holds GPU device pointers (GpuTensor views + PoolMem
@@ -69,31 +158,22 @@ unsafe impl<M: PoolMemory> Send for GdnStatePool<M> {}
 unsafe impl<M: PoolMemory> Sync for GdnStatePool<M> {}
 
 impl<M: PoolMemory> GdnStatePool<M> {
-    /// Conv-state ring length: `conv_kernel - 1` past tokens retained per channel.
-    #[inline]
-    fn conv_state_len(conv_kernel: usize) -> usize {
-        conv_kernel - 1
-    }
-
     /// Allocate the GDN state pool.
     ///
     /// `is_linear_layer[l]` selects which of the `num_layers` global layers are
     /// GDN (linear-attention) layers — only those get `conv_state`/`ssm_state`
-    /// buffers; the rest store `None`. `num_slots = max_num_seqs`.
+    /// buffers; the rest store `None`. `num_slots = max_num_seqs`; `checkpoint_rows` the most
+    /// drafts a verify step carries.
     ///
     /// # Safety
     /// Caller must ensure the backend context is current (the `alloc_buffer`
     /// closure performs GPU allocations).
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn new(
         num_layers: usize,
         is_linear_layer: &[bool],
         num_slots: usize,
-        conv_dim: usize,
-        conv_kernel: usize,
-        num_v_heads: usize,
-        head_v_dim: usize,
-        head_k_dim: usize,
+        checkpoint_rows: CheckpointRows,
+        dims: GdnStateDims,
         mut alloc_buffer: impl FnMut(usize) -> Result<M>,
     ) -> Result<Self> {
         assert_eq!(
@@ -101,14 +181,15 @@ impl<M: PoolMemory> GdnStatePool<M> {
             num_layers,
             "GdnStatePool: is_linear_layer mask length must equal num_layers"
         );
-        assert!(conv_kernel >= 1, "GdnStatePool: conv_kernel must be >= 1");
+        assert!(
+            dims.conv_kernel >= 1,
+            "GdnStatePool: conv_kernel must be >= 1"
+        );
 
         let dtype = GDN_STATE_DTYPE;
-        let conv_state_len = Self::conv_state_len(conv_kernel);
-        let conv_shape = [num_slots, conv_dim, conv_state_len];
-        let ssm_shape = [num_slots, num_v_heads, head_v_dim, head_k_dim];
-        let conv_bytes = num_slots * conv_dim * conv_state_len * dtype.size_bytes();
-        let ssm_bytes = num_slots * num_v_heads * head_v_dim * head_k_dim * dtype.size_bytes();
+        let entries = num_slots * checkpoint_rows.entries_per_slot();
+        let (conv_shape, ssm_shape) = dims.shapes(entries);
+        let (conv_bytes, ssm_bytes) = dims.bytes(entries);
 
         let mut conv_states = Vec::with_capacity(num_layers);
         let mut ssm_states = Vec::with_capacity(num_layers);
@@ -141,8 +222,9 @@ impl<M: PoolMemory> GdnStatePool<M> {
 
         let total_mb = (num_linear * (conv_bytes + ssm_bytes)) as f64 / (1024.0 * 1024.0);
         tracing::info!(
-            "GdnStatePool: {num_linear}/{num_layers} linear layers × {num_slots} slots \
-             (conv_dim {conv_dim}, ssm {num_v_heads}×{head_v_dim}×{head_k_dim}) = {total_mb:.0} MB f32"
+            "GdnStatePool: {num_linear}/{num_layers} linear layers × {num_slots} slots × \
+             {} entries ({dims:?}) = {total_mb:.0} MB f32",
+            checkpoint_rows.entries_per_slot()
         );
 
         Ok(Self {
@@ -152,11 +234,8 @@ impl<M: PoolMemory> GdnStatePool<M> {
             _ssm_ptrs: ssm_ptrs,
             num_layers,
             num_slots,
-            conv_dim,
-            conv_kernel,
-            num_v_heads,
-            head_v_dim,
-            head_k_dim,
+            checkpoint_rows,
+            dims,
         })
     }
 
@@ -172,11 +251,14 @@ impl<M: PoolMemory> GdnStatePool<M> {
             _ssm_ptrs: Vec::new(),
             num_layers: 0,
             num_slots: 0,
-            conv_dim: 0,
-            conv_kernel: 0,
-            num_v_heads: 0,
-            head_v_dim: 0,
-            head_k_dim: 0,
+            checkpoint_rows: CheckpointRows::NONE,
+            dims: GdnStateDims {
+                conv_dim: 0,
+                conv_kernel: 0,
+                num_v_heads: 0,
+                head_v_dim: 0,
+                head_k_dim: 0,
+            },
         }
     }
 
@@ -186,15 +268,10 @@ impl<M: PoolMemory> GdnStatePool<M> {
     pub fn reserve_bytes(
         num_linear: usize,
         num_slots: usize,
-        conv_dim: usize,
-        conv_kernel: usize,
-        num_v_heads: usize,
-        head_v_dim: usize,
-        head_k_dim: usize,
+        checkpoint_rows: CheckpointRows,
+        dims: GdnStateDims,
     ) -> usize {
-        let sz = GDN_STATE_DTYPE.size_bytes();
-        let conv_bytes = num_slots * conv_dim * Self::conv_state_len(conv_kernel) * sz;
-        let ssm_bytes = num_slots * num_v_heads * head_v_dim * head_k_dim * sz;
+        let (conv_bytes, ssm_bytes) = dims.bytes(num_slots * checkpoint_rows.entries_per_slot());
         num_linear * (conv_bytes + ssm_bytes)
     }
 

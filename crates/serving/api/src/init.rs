@@ -485,6 +485,7 @@ fn create_worker(
         max_model_len: config.max_model_len,
         draft_model_path: spec_decode_draft_model_path(config),
         draft_model_dtype: config.draft_model_dtype.clone(),
+        num_speculative_tokens: spec_decode_max_drafts(config),
     };
 
     // Progress closure (the former cuda-arm body). For now it just observes
@@ -669,6 +670,15 @@ fn spec_decode_draft_model_path(config: &VllmConfig) -> Option<String> {
         Some("ngram") | None => None,
         Some(path) => Some(path.to_string()),
     }
+}
+
+/// The most drafts one verify step carries: `--num-speculative-tokens` when speculative decoding
+/// is on, else 0. Threaded into each `WorkerCreateConfig`.
+fn spec_decode_max_drafts(config: &VllmConfig) -> usize {
+    config
+        .speculative_model
+        .as_ref()
+        .map_or(0, |_| config.num_speculative_tokens)
 }
 
 /// Build the speculative-decoding proposer config from a `VllmConfig`.
@@ -1503,6 +1513,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 max_model_len: config.max_model_len,
                 draft_model_path: spec_decode_draft_model_path(config),
                 draft_model_dtype: config.draft_model_dtype.clone(),
+                num_speculative_tokens: spec_decode_max_drafts(config),
             })
             .collect();
 
@@ -2060,6 +2071,7 @@ fn initialize_stack_multinode(
             max_model_len: config.max_model_len,
             draft_model_path: spec_decode_draft_model_path(config),
             draft_model_dtype: config.draft_model_dtype.clone(),
+            num_speculative_tokens: spec_decode_max_drafts(config),
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -2346,6 +2358,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         max_model_len: config.max_model_len,
         draft_model_path: spec_decode_draft_model_path(config),
         draft_model_dtype: config.draft_model_dtype.clone(),
+        num_speculative_tokens: spec_decode_max_drafts(config),
     };
 
     let mut worker = CudaWorker::new(cuda_config);
@@ -2514,6 +2527,7 @@ fn initialize_stack_tp_pp(
                         max_model_len: config.max_model_len,
                         draft_model_path: spec_decode_draft_model_path(config),
                         draft_model_dtype: config.draft_model_dtype.clone(),
+                        num_speculative_tokens: spec_decode_max_drafts(config),
                     }
                 })
                 .collect();
@@ -2892,6 +2906,7 @@ fn initialize_stack_tp(
                 max_model_len: config.max_model_len,
                 draft_model_path: spec_decode_draft_model_path(config),
                 draft_model_dtype: config.draft_model_dtype.clone(),
+                num_speculative_tokens: spec_decode_max_drafts(config),
             })
             .collect();
 
@@ -3330,6 +3345,7 @@ fn initialize_stack_external(
             max_model_len: config.max_model_len,
             draft_model_path: spec_decode_draft_model_path(config),
             draft_model_dtype: config.draft_model_dtype.clone(),
+            num_speculative_tokens: spec_decode_max_drafts(config),
         };
 
         let mut worker = CudaWorker::new(cuda_config);

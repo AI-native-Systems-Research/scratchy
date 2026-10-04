@@ -288,11 +288,8 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 layers,
                 &cfg.linear_layers,
                 1,
-                cfg.conv_dim as usize,
-                cfg.conv_kernel as usize,
-                cfg.num_v_heads as usize,
-                cfg.head_v_dim as usize,
-                cfg.head_k_dim as usize,
+                scratchy_target_metal::gdn_state::CheckpointRows::NONE,
+                cfg.state_dims(),
                 |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
             )
         }

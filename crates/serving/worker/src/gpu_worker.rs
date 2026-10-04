@@ -934,6 +934,21 @@ impl MetalWorker {
         self.model.as_ref().is_some_and(|m| m.rope_on_read())
     }
 
+    /// Checkpoints each GDN state slot keeps: one per draft of a verify step, so a rejected draft
+    /// can be dropped. Sizes both the pool and its memory reservation.
+    fn gdn_checkpoint_rows(
+        &self,
+    ) -> ExecutorResult<scratchy_target_metal::gdn_state::CheckpointRows> {
+        let drafts = self.config.num_speculative_tokens;
+        u8::try_from(drafts)
+            .map(scratchy_target_metal::gdn_state::CheckpointRows)
+            .map_err(|_| {
+                ExecutorError::WorkerInit(format!(
+                    "GdnStatePool: {drafts} speculative tokens exceed a slot's u8 checkpoints"
+                ))
+            })
+    }
+
     /// Run the vision tower for every MM-bearing request at its first
     /// prefill step and return `(mm_embeds [n_img_tokens, hidden],
     /// embed_patches)`. Metal twin of the cuda `run_mm_vision_forward`
@@ -3188,17 +3203,15 @@ impl Worker for MetalWorker {
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
             let num_slots = self.config.max_num_seqs.max(1);
             let num_layers = model.num_hidden_layers() as usize;
+            let checkpoint_rows = self.gdn_checkpoint_rows()?;
             let t_gdn = std::time::Instant::now();
             let gdn_pool = unsafe {
                 scratchy_target_metal::gdn_state::GdnStatePool::new(
                     num_layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
-                    gdn_cfg.conv_dim as usize,
-                    gdn_cfg.conv_kernel as usize,
-                    gdn_cfg.num_v_heads as usize,
-                    gdn_cfg.head_v_dim as usize,
-                    gdn_cfg.head_k_dim as usize,
+                    checkpoint_rows,
+                    gdn_cfg.state_dims(),
                     // f32 conv/ssm state. Every per-layer conv/ssm pointer
                     // derives from the CPU base of this StorageModeShared
                     // buffer (a Private one gave the Qwen3.5-MoE-35B pool wild
@@ -3216,7 +3229,7 @@ impl Worker for MetalWorker {
                 t_gdn.elapsed(),
             );
             self.gdn_state = Some(gdn_pool);
-            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots));
+            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots, checkpoint_rows));
         }
 
         // Allocate the draft model's
@@ -3286,8 +3299,9 @@ impl Worker for MetalWorker {
         // NOT yet in `currentAllocatedSize`; fold it into the non-KV
         // overhead here so the engine doesn't hand back KV blocks that
         // leave no room for it. Persistent f32 state, one slot per
-        // resident seq — sized identically to the pool built later. Zero
-        // for non-hybrid arches.
+        // resident seq (and its checkpoints) — sized identically to the pool
+        // built later. Zero for non-hybrid arches.
+        let checkpoint_rows = self.gdn_checkpoint_rows()?;
         let gdn_reserve = self
             .model
             .as_ref()
@@ -3296,11 +3310,8 @@ impl Worker for MetalWorker {
                 scratchy_target_metal::gdn_state::GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                     cfg.num_linear_layers(),
                     self.config.max_num_seqs.max(1),
-                    cfg.conv_dim as usize,
-                    cfg.conv_kernel as usize,
-                    cfg.num_v_heads as usize,
-                    cfg.head_v_dim as usize,
-                    cfg.head_k_dim as usize,
+                    checkpoint_rows,
+                    cfg.state_dims(),
                 )
             })
             .unwrap_or(0);
@@ -3972,37 +3983,25 @@ impl Worker for MetalWorker {
             }
         }
 
-        // GDN per-step state-slot indices (hybrid arches only). One i32
-        // slot id + u32 fresh flag per batched sequence, in the SAME
-        // order as `cu_seqlens_q` / `req_ids_in_order`. The metal
-        // `forward_argmax_blocking` uploads these into
-        // `ForwardCtx::{gdn_state_indices, gdn_is_fresh}`. `slot_for`
-        // returns `is_fresh=true` on a request's FIRST forward (including
-        // a recycled slot's new owner) so the GDN conv1d/scan kernels
-        // zero-init the slot's conv/ssm state instead of continuing from
-        // a finished sequence's stale data (the degeneration guard).
-        self.gdn_pending = if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
-            let mut indices = Vec::with_capacity(req_ids_in_order.len());
-            let mut fresh = Vec::with_capacity(req_ids_in_order.len());
-            for req_id in &req_ids_in_order {
-                match alloc.slot_for(gdn_slot_key(req_id)) {
-                    Some((slot, is_fresh)) => {
-                        indices.push(slot as i32);
-                        fresh.push(u32::from(is_fresh));
-                    }
-                    None => {
-                        return Err(ExecutorError::WorkerExecution(format!(
-                            "GDN state-slot pool exhausted (capacity {}): scheduler \
-                             admitted more concurrent sequences than max_num_seqs",
-                            alloc.capacity(),
-                        )));
-                    }
-                }
-            }
-            Some((indices, fresh))
-        } else {
-            None
-        };
+        // GDN per-step state entries + step codes (hybrid arches only), one per batched
+        // sequence in the SAME order as `cu_seqlens_q` / `req_ids_in_order`. The metal
+        // `forward_argmax_blocking` uploads these into `ForwardCtx::{gdn_state_indices,
+        // gdn_is_fresh}`. A request's FIRST forward (including a recycled slot's new owner)
+        // starts from zero instead of a finished sequence's stale data (the degeneration
+        // guard); a verify step checkpoints its drafts.
+        self.gdn_pending = self
+            .gdn_slot_allocator
+            .as_mut()
+            .map(|alloc| {
+                alloc.step(
+                    req_ids_in_order
+                        .iter()
+                        .zip(&prepared.req_inputs)
+                        .map(|(req_id, input)| (gdn_slot_key(req_id), input.spec_token_ids.len())),
+                )
+            })
+            .transpose()
+            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
         // ── 5b. Vision encoder for any MM-bearing req at its first
         // prefill step. Output [n_img_tokens, hidden] + per-image patch
@@ -4688,6 +4687,13 @@ impl Worker for MetalWorker {
                     target_ids,
                     &req_slice.spec_token_ids,
                 );
+                if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
+                    alloc.verified(
+                        gdn_slot_key(req_id),
+                        rejection.num_accepted_drafts,
+                        req_slice.spec_token_ids.len(),
+                    );
+                }
                 sampled_token_ids.push(rejection.accepted_tokens);
                 was_spec_decode.push(true);
             }

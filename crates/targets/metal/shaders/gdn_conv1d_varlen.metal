@@ -20,10 +20,11 @@
 //
 //   out[t,c] = SiLU( Σ_{j} w[c,j] · x_pad[t-(K-1)+j, c] )
 //
-// left-padded from the per-sequence `conv_state` ring (or zero when is_fresh).
+// left-padded from the per-sequence `conv_state` ring (or zero when fresh).
 //
-// State layout (cuda-symmetric): conv_state[num_slots, conv_dim, state_len],
-//   state_len = kernel-1, base = (slot*conv_dim + d)*state_len, oldest-first.
+// State layout (cuda-symmetric): conv_state[entries, conv_dim, state_len], state_len =
+//   kernel-1, base = (entry*conv_dim + d)*state_len, oldest-first; a slot's entry is followed
+//   by its checkpoints. `gdn_step[seq]` is `scratchy_layers::gdn_state::GdnStep::encode`.
 //
 // `x`/`w` are model dtype (`T`), f32-accumulated; `conv_out` + `conv_state`
 // are f32. Per-channel (depthwise) so GVA / head grouping does not apply here.
@@ -54,7 +55,7 @@ template <typename T>
     device       float* conv_state    [[buffer(3)]],
     const device int*   cu_seqlens    [[buffer(4)]],
     const device int*   state_indices [[buffer(5)]],
-    const device uint*  is_fresh      [[buffer(6)]],
+    const device uint*  gdn_step      [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
 {
@@ -73,8 +74,10 @@ template <typename T>
   if (seqlen <= 0) {
     return;
   }
-  int slot = state_indices[seq];
-  bool fresh = is_fresh[seq] != 0u;
+  int entry = state_indices[seq];
+  uint start = gdn_step[seq] & 0xffu;
+  uint checkpoint_rows = (gdn_step[seq] >> 8) & 0xffu;
+  uint entry_len = conv_dim * state_len;
 
   // Load conv weights for this channel.
   float wlocal[GDN_CONV_KMAX];
@@ -82,11 +85,12 @@ template <typename T>
     wlocal[ki] = float(w[d * kernel_size + ki]);
   }
 
-  // Seed the causal window from per-sequence state (zero when fresh).
-  device float* state_ptr = conv_state + (uint(slot) * conv_dim + d) * state_len;
+  // Seed the causal window from the start entry (zero when fresh).
+  device float* state_ptr = conv_state + (uint(entry) * conv_dim + d) * state_len;
+  const device float* start_ptr = state_ptr + (start >= 2u ? (start - 1u) * entry_len : 0u);
   float window[GDN_CONV_KMAX];
   for (uint ki = 0; ki < state_len; ki++) {
-    window[ki] = fresh ? 0.0f : state_ptr[ki];
+    window[ki] = start == 1u ? 0.0f : start_ptr[ki];
   }
 
   // Walk the sequence's tokens; the window slides through registers.
@@ -103,6 +107,9 @@ template <typename T>
     }
     if (state_len > 0) {
       window[state_len - 1] = x_t;
+    }
+    for (uint ki = 0; uint(t) < checkpoint_rows && ki < state_len; ki++) {
+      state_ptr[(uint(t) + 1u) * entry_len + ki] = window[ki];
     }
   }
 

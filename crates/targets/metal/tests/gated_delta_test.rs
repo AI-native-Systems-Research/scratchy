@@ -17,6 +17,7 @@ mod common;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::gdn_state::{CheckpointRows, GdnStart, GdnStep};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -758,4 +759,217 @@ fn gdn_scan_varlen_continuity() {
             ref_last[c]
         );
     }
+}
+
+/// Compares a kernel's rows against the reference's.
+fn assert_close(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: row count");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() < 1e-4, "{what}[{i}] metal={g} ref={w}");
+    }
+}
+
+/// Inputs for a verify step's rejected drafts: unlike anything `fill` produces.
+fn rejected(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i as f32 * 0.37).cos() * 0.5).collect()
+}
+
+/// A verify step's checkpoints, conv ring: 3 tokens, then a verify step of the next token, a kept
+/// draft and two rejected drafts, then one token resuming from the kept row's checkpoint — equals
+/// the sequence that never saw the rejected drafts. In slot 1 of a 2-slot pool keeping 3
+/// checkpoints, so the entries are offset and slot 0's must stay untouched.
+#[test]
+fn gdn_conv1d_varlen_resumes_from_checkpoint() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    let (conv_dim, kernel) = (32usize, 4usize);
+    let entry_len = conv_dim * (kernel - 1);
+    let rows = CheckpointRows(3);
+    let slot_entries = rows.entries_per_slot();
+    let t_full = 6usize;
+    let x_full = fill(t_full * conv_dim);
+    let w = fill(conv_dim * kernel);
+    let out_full = conv1d_ref(&x_full, &w, conv_dim, kernel, t_full);
+    let x_verify = [
+        &x_full[3 * conv_dim..5 * conv_dim],
+        &rejected(2 * conv_dim)[..],
+    ]
+    .concat();
+
+    let key = PipelineKey::new(
+        "gdn_conv1d_varlen",
+        "gdn_conv1d_varlen_f32",
+        vec![
+            ConstantValue::uint(0, conv_dim as u32),
+            ConstantValue::uint(1, kernel as u32),
+        ],
+    );
+    let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
+    let w_buf = buf_f32(&device, &w);
+    let state_buf = buf_zero_f32(&device, 2 * slot_entries * entry_len);
+    let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
+        let num_tokens = x.len() / conv_dim;
+        let out_buf = buf_zero_f32(&device, x.len());
+        let x_buf = buf_f32(&device, x);
+        let cu = buf_i32(&device, &[0, num_tokens as i32]);
+        let si = buf_i32(&device, &[slot_entries as i32]);
+        let step = buf_u32(
+            &device,
+            &[GdnStep {
+                start,
+                checkpoint_rows,
+            }
+            .encode()],
+        );
+        common::dispatch_threadgroups(
+            &device,
+            &pipeline,
+            &[&out_buf, &x_buf, &w_buf, &state_buf, &cu, &si, &step],
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: conv_dim,
+                depth: 1,
+            },
+        )
+        .then(|| read_f32(&out_buf, x.len()))
+    };
+
+    let Some(_) = run(
+        &x_full[..3 * conv_dim],
+        GdnStart::Fresh,
+        CheckpointRows::NONE,
+    ) else {
+        return;
+    };
+    let Some(verify) = run(&x_verify, GdnStart::Slot, rows) else {
+        return;
+    };
+    assert_close(
+        &verify[..2 * conv_dim],
+        &out_full[3 * conv_dim..5 * conv_dim],
+        "verify kept rows",
+    );
+    let Some(next) = run(
+        &x_full[5 * conv_dim..],
+        GdnStart::Checkpoint(1),
+        CheckpointRows::NONE,
+    ) else {
+        return;
+    };
+    assert_close(&next, &out_full[5 * conv_dim..], "resumed row");
+    let slot0 = read_f32(&state_buf, slot_entries * entry_len);
+    assert!(
+        slot0.iter().all(|&v| v == 0.0),
+        "slot 0's entries were written"
+    );
+}
+
+/// [`gdn_conv1d_varlen_resumes_from_checkpoint`] for the recurrent (ssm) state.
+#[test]
+fn gdn_scan_varlen_resumes_from_checkpoint() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    let (nk, nv, hk, hv) = (2usize, 4usize, 4usize, 4usize);
+    let key_dim = nk * hk;
+    let value_dim = nv * hv;
+    let conv_dim = 2 * key_dim + value_dim;
+    let scale = (hk as f32).powf(-0.5);
+    let entry_len = nv * hv * hk;
+    let rows = CheckpointRows(3);
+    let slot_entries = rows.entries_per_slot();
+    let t_full = 6usize;
+
+    let conv_full = fill(t_full * conv_dim);
+    let g_full = fill(t_full * nv);
+    let beta_full = fill(t_full * nv);
+    let (q, k, v) = split_conv(&conv_full, nk, nv, hk, hv, t_full);
+    let o_full = recurrent_ref(
+        &q, &k, &v, &g_full, &beta_full, nk, nv, hk, hv, t_full, scale,
+    );
+    // Rows `3..5` of the kept sequence, then two rejected drafts.
+    let verify = |full: &[f32], width: usize| {
+        [&full[3 * width..5 * width], &rejected(2 * width)[..]].concat()
+    };
+
+    let state_buf = buf_zero_f32(&device, 2 * slot_entries * entry_len);
+    let entry = [slot_entries as i32];
+    let step = |start, checkpoint_rows| {
+        [GdnStep {
+            start,
+            checkpoint_rows,
+        }
+        .encode()]
+    };
+    let run = |conv: &[f32], g: &[f32], beta: &[f32], step: [u32; 1]| {
+        let num_tokens = g.len() / nv;
+        dispatch_scan(
+            &device,
+            &cache,
+            conv,
+            g,
+            beta,
+            &state_buf,
+            &[0, num_tokens as i32],
+            &entry,
+            &step,
+            nk,
+            nv,
+            hk,
+            hv,
+            num_tokens,
+        )
+    };
+
+    let Some(_) = run(
+        &conv_full[..3 * conv_dim],
+        &g_full[..3 * nv],
+        &beta_full[..3 * nv],
+        step(GdnStart::Fresh, CheckpointRows::NONE),
+    ) else {
+        return;
+    };
+    let Some(o_verify) = run(
+        &verify(&conv_full, conv_dim),
+        &verify(&g_full, nv),
+        &verify(&beta_full, nv),
+        step(GdnStart::Slot, rows),
+    ) else {
+        return;
+    };
+    assert_close(
+        &o_verify[..2 * value_dim],
+        &o_full[3 * value_dim..5 * value_dim],
+        "verify kept rows",
+    );
+    let Some(o_next) = run(
+        &conv_full[5 * conv_dim..],
+        &g_full[5 * nv..],
+        &beta_full[5 * nv..],
+        step(GdnStart::Checkpoint(1), CheckpointRows::NONE),
+    ) else {
+        return;
+    };
+    assert_close(&o_next, &o_full[5 * value_dim..], "resumed row");
+    let slot0 = read_f32(&state_buf, slot_entries * entry_len);
+    assert!(
+        slot0.iter().all(|&v| v == 0.0),
+        "slot 0's entries were written"
+    );
 }
