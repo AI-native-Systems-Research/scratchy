@@ -1064,9 +1064,7 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         .nodes
         .iter()
         .any(|n| matches!(n.op, SubOp::AttnDecode { .. }));
-    Ok(has_attn.then_some(crate::ktir_superdsc_door::BundleAttnParams {
-        rows_are_requests,
-    }))
+    Ok(has_attn.then_some(crate::ktir_superdsc_door::BundleAttnParams { rows_are_requests }))
 }
 
 /// The rotary lowering, waiting for its head dim to become a const — the consumer side of
@@ -1173,13 +1171,11 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             Ok(v) => Ops(v),
             Err(e) => Unhandled(e.0),
         },
-        SubOp::ScalarWeightMul => {
-            match lower_scalar_weight_mul_node(node, ir, sym_id_base) {
-                Ok(v) => Ops(v),
-                Err(e) => Unhandled(e.0),
-            }
-        }
-        | SubOp::GateSplit { .. }
+        SubOp::ScalarWeightMul => match lower_scalar_weight_mul_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        SubOp::GateSplit { .. }
         | SubOp::GateApply
         | SubOp::GateScale
         | SubOp::LoadPixels { .. }
@@ -1382,8 +1378,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout =
-        compute_bundle_layout(ir, weight_ids, rows_are_requests, &[])?;
+    let bundle_layout = compute_bundle_layout(ir, weight_ids, rows_are_requests, &[])?;
     let layout = Some(&bundle_layout);
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // The SINGLE monotonic negative-symbol-id counter for the WHOLE bundle (design
@@ -1886,44 +1881,43 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // ⭐ ONE `group` PER SEGMENT: 0 = prefix, 1..=n = body i, n+1 = suffix. The closure takes the
     // fp8-quantize dedup set BY PARAMETER (not by capture) so the walk can CLEAR it between bodies
     // — the reset is the scope statement, and a captured set would forbid the clear outright.
-    let mut emit_seg =
-        |group: usize,
-         n: &SubtileNode<F>,
-         fp8_quantized: &mut std::collections::HashSet<String>,
-         ops_out: &mut Vec<EmittedOp>|
-         -> Result<(), SuperDscError> {
-            for r in &n.inputs {
-                let tid = r.tensor.index() as u32;
-                if let Some(p) = bundle_layout.placements.get(&tid)
-                    && matches!(p.role, SegRole::Weight)
-                {
-                    group_weight_banks[group].insert(p.bank);
-                }
+    let mut emit_seg = |group: usize,
+                        n: &SubtileNode<F>,
+                        fp8_quantized: &mut std::collections::HashSet<String>,
+                        ops_out: &mut Vec<EmittedOp>|
+     -> Result<(), SuperDscError> {
+        for r in &n.inputs {
+            let tid = r.tensor.index() as u32;
+            if let Some(p) = bundle_layout.placements.get(&tid)
+                && matches!(p.role, SegRole::Weight)
+            {
+                group_weight_banks[group].insert(p.bank);
             }
-            match lower_one_node(
-                n,
-                ir,
-                active_cap,
-                rows_are_requests,
-                &mut sym_id_base,
-                layout,
-                fp8_quantized,
-            ) {
-                NodeLowering::Ops(v) => {
-                    ops_out.extend(v);
+        }
+        match lower_one_node(
+            n,
+            ir,
+            active_cap,
+            rows_are_requests,
+            &mut sym_id_base,
+            layout,
+            fp8_quantized,
+        ) {
+            NodeLowering::Ops(v) => {
+                ops_out.extend(v);
+                Ok(())
+            }
+            NodeLowering::Unhandled(s) => {
+                if matches!(n.op, SubOp::MatmulTile { .. }) {
+                    Err(SuperDscError(s))
+                } else {
+                    unhandled.insert(s);
                     Ok(())
                 }
-                NodeLowering::Unhandled(s) => {
-                    if matches!(n.op, SubOp::MatmulTile { .. }) {
-                        Err(SuperDscError(s))
-                    } else {
-                        unhandled.insert(s);
-                        Ok(())
-                    }
-                }
-                NodeLowering::HostRouted(_) => Ok(()),
             }
-        };
+            NodeLowering::HostRouted(_) => Ok(()),
+        }
+    };
     // ── Prefix ──
     for instr in &instrs[..prefix_end] {
         if let Instr::Compute { node, .. } = instr {
@@ -1996,8 +1990,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             // with k/v would SILENTLY read the wrong layer (runtime-errors-need-compile-time-checks).
             if let SubOp::AttnDecode { layout: kv, .. } = &n.op
                 && *iters > 1
-                && let Some(k_layers) =
-                    per_layer.get(&(kv.cache_tensor().index() as u32)).cloned()
+                && let Some(k_layers) = per_layer.get(&(kv.cache_tensor().index() as u32)).cloned()
                 && k_layers.len() as u32 == *iters
             {
                 let kct_tids: Vec<u32> = k_layers
@@ -2040,7 +2033,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             {
                 layer_ids = per_layer_out
                     .iter()
-                    .map(|nid| ir.nodes[nid.index()].op.layer_index().expect("a RopeAppend names a layer"))
+                    .map(|nid| {
+                        ir.nodes[nid.index()]
+                            .op
+                            .layer_index()
+                            .expect("a RopeAppend names a layer")
+                    })
                     .collect();
                 break;
             }
@@ -2298,8 +2296,8 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         // slot for one, seg3 for another): intermediates are re-bound per launch from the launch's
         // own placement, so no shift ever crosses the move. Refusing those is what broke the first
         // attempt at this guard — the old pairwise check `continue`d them, and so does this one.
-        let shifted = (p0.segment == w_seg && matches!(p0.role, SegRole::Weight))
-            || p0.segment == kv_seg;
+        let shifted =
+            (p0.segment == w_seg && matches!(p0.role, SegRole::Weight)) || p0.segment == kv_seg;
         if shifted {
             for t in tids {
                 if let Some(p) = bundle_layout.placements.get(t)

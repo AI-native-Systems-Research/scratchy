@@ -1779,9 +1779,9 @@ fn bank_weight_segment(
             m.values()
                 .filter(|tids| {
                     tids.first().is_some_and(|t0| {
-                        placements
-                            .get(t0)
-                            .is_some_and(|p| p.segment == w_seg && matches!(p.role, SegRole::Weight))
+                        placements.get(t0).is_some_and(|p| {
+                            p.segment == w_seg && matches!(p.role, SegRole::Weight)
+                        })
                     })
                 })
                 .cloned()
@@ -1815,11 +1815,7 @@ fn bank_weight_segment(
     // class's own iteration order.
     let mut launches: Vec<Vec<u32>> = Vec::new();
     for class in &classes {
-        let iters = class
-            .iter()
-            .map(|c| c.len())
-            .max()
-            .unwrap_or(0);
+        let iters = class.iter().map(|c| c.len()).max().unwrap_or(0);
         if class.iter().any(|c| c.len() != iters) {
             return Err(SuperDscError(
                 "bank_weight_segment: one class's per-layer weights disagree on that class's \
@@ -1932,9 +1928,7 @@ fn bank_weight_segment(
     let mut tail: Vec<u32> = placements
         .values()
         .filter(|p| {
-            p.segment == w_seg
-                && matches!(p.role, SegRole::Weight)
-                && !launched.contains(&p.tid)
+            p.segment == w_seg && matches!(p.role, SegRole::Weight) && !launched.contains(&p.tid)
         })
         .map(|p| p.tid)
         .collect();
@@ -3839,7 +3833,8 @@ pub fn unroll_layers(rolled: &RolledSuperDsc) -> Vec<EmittedOp> {
     // tensor id, `per_layer[body_c.hidden_out_tid][j]` — the same value the card's alias writes
     // in place), launch 0 reads the prefix's own output, and the suffix reads the last launch's.
     let hidden_of = |body: usize, iter: usize| -> Option<u32> {
-        rolled.bodies
+        rolled
+            .bodies
             .get(body)
             .and_then(|b| rolled.per_layer.get(&b.hidden_out_tid))
             .and_then(|ids| ids.get(iter))
@@ -4105,8 +4100,10 @@ mod tests {
             "fp32 reduce const must be raw IEEE f32 bits of 1/N"
         );
         // The serialized const carries dataFormat_ = IEEE_FP32 and the 32-bit word.
-        let ci =
-            scaling_factor_const_fp32((1.0f32 / 576.0).to_bits(), &SdscFoldSet::new(f32_spec.iter.cores_used()));
+        let ci = scaling_factor_const_fp32(
+            (1.0f32 / 576.0).to_bits(),
+            &SdscFoldSet::new(f32_spec.iter.cores_used()),
+        );
         assert_eq!(ci["0"]["dataFormat_"], "IEEE_FP32");
         // #197 wraps the const's payload in the fold-manager form: the raw word
         // is the `data_` map's `"[0, 0, 0]"` entry, a DECIMAL string.
