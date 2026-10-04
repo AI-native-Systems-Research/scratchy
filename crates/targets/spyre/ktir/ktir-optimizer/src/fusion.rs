@@ -698,12 +698,21 @@ pub fn fuse_program<'a>(
         // An OUTPUT arg is forwarded iff the producer writes the whole tensor and
         // every consuming node can forward it (same full-shape + whole/sliceable).
         // Record the resident SSA so later nodes can forward off it.
+        //
+        // ⭐ AND THE STORED VALUE MUST SPELL THE VIEW'S SHAPE. A Reshape's store is
+        // whole-tensor over a view whose shape it deliberately does NOT have: the
+        // value is `[31, 4096]`, the view `[496, 256]`. Forwarding that value as the
+        // tensor's identity hands every consumer a differently-shaped SSA — the
+        // gemma-4 fused segment died as `ArithDivf: shape mismatch [31] vs [496]`.
+        // The store stays an HBM round-trip instead, which is what a reshape IS.
+        // A shape we could not read (`value_shape` empty) also declines.
         for st in &an.stores {
             let Some(b) = arg_to_tensor.get(&st.arg) else {
                 continue;
             };
             if b.is_output
                 && st.whole_tensor
+                && st.value_shape == st.view_shape
                 && is_intermediate(b.tensor)
                 && all_consumers_forwardable(spec, &analyses, b.tensor, &st.view_shape)
             {
@@ -922,6 +931,14 @@ struct StoreChain {
     tile: Ssa,
     whole_tensor: bool,
     view_shape: Vec<i64>,
+    /// ⭐ THE STORED VALUE'S OWN SHAPE — the type of the `ktdp.store`'s value operand,
+    /// which is NOT always the view's. A Reshape stores a `[31, 4096]` value through
+    /// a `[496, 256]` view: the flat bytes agree, but the LAYOUTS disagree, and an
+    /// SSA forward of that value as the tensor's identity would hand every consumer
+    /// a `[31, 4096]` value where their own `m` says 496 — the gemma-4 fused segment
+    /// died as `ArithDivf: shape mismatch [31] vs [496]`. Forwarding is only sound
+    /// when the two spellings agree.
+    value_shape: Vec<i64>,
 }
 
 /// A construct_access_tile's decoded fields.
@@ -941,6 +958,11 @@ struct Analysis {
     views: HashMap<Ssa, (Ssa, Vec<i64>)>,
     /// access tile -> decoded tile.
     tiles: HashMap<Ssa, TileInfo>,
+    /// ⭐ SSA VALUE -> ITS TYPE'S DIMS, the reader side of the store-forward guard. A
+    /// store's value operand resolves here to the shape the producing op gave it,
+    /// which the view it is stored through does not state (and, for a Reshape,
+    /// deliberately disagrees with).
+    value_dims: HashMap<Ssa, Vec<i64>>,
 }
 
 /// Trace every `ktdp.load`/`ktdp.store` — at any region depth — back through its
@@ -951,14 +973,16 @@ struct Analysis {
 fn analyze(func: &IRFunction<'_>) -> Analysis {
     let mut a = Analysis::default();
     collect_views_tiles(func.operations, &mut a);
-    // Borrow-split: read views/tiles while pushing into loads/stores.
+    collect_value_dims(func.operations, &mut a.value_dims);
+    // Borrow-split: read views/tiles/value types while pushing into loads/stores.
     let Analysis {
         views,
         tiles,
         loads,
         stores,
+        value_dims,
     } = &mut a;
-    collect_loads_stores(func.operations, views, tiles, loads, stores);
+    collect_loads_stores(func.operations, views, tiles, value_dims, loads, stores);
     a
 }
 
@@ -1003,6 +1027,7 @@ fn collect_loads_stores(
     ops: &[Operation],
     views: &HashMap<Ssa, (Ssa, Vec<i64>)>,
     tiles: &HashMap<Ssa, TileInfo>,
+    value_dims: &HashMap<Ssa, Vec<i64>>,
     loads: &mut Vec<LoadChain>,
     stores: &mut Vec<StoreChain>,
 ) {
@@ -1037,19 +1062,38 @@ fn collect_loads_stores(
                     && let Some((arg, vshape)) = views.get(&ti.view)
                 {
                     let whole = !ti.shape.is_empty() && &ti.shape == vshape;
+                    let value_shape = value_dims.get(stored).cloned().unwrap_or_default();
                     stores.push(StoreChain {
                         arg: *arg,
                         stored: *stored,
                         tile: *tile_ssa,
                         whole_tensor: whole,
                         view_shape: vshape.clone(),
+                        value_shape,
                     });
                 }
             }
             _ => {}
         }
         for rg in op.regions {
-            collect_loads_stores(rg, views, tiles, loads, stores);
+            collect_loads_stores(rg, views, tiles, value_dims, loads, stores);
+        }
+    }
+}
+
+/// Record every op result's type dims, at any region depth — the reader the
+/// store-forward guard resolves a stored value's own shape through. Unshaped
+/// results are simply absent from the map (the guard then treats the shape as
+/// unknown and declines to forward).
+fn collect_value_dims(ops: &[Operation<'_>], dims: &mut HashMap<Ssa, Vec<i64>>) {
+    for op in ops {
+        if let Some(res) = op.result
+            && let Some(d) = op.result_type.and_then(|t| t.dims())
+        {
+            dims.insert(res, d.to_vec());
+        }
+        for rg in op.regions {
+            collect_value_dims(rg, dims);
         }
     }
 }

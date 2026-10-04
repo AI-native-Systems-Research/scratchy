@@ -102,9 +102,17 @@ const EW_LX_ELEMS: u32 = 1024 * 1024;
 /// produced `ArithMulf: LX capacity exceeded: 2097152 + 1048576 > 2097152` on a `[64, 8192]` block:
 /// each tile was 1 MB and three of them were resident. Silu's decomposition is the worst case here
 /// (`x`, `neg`, `exp`, the splat `1.0`, the denominator, the result); a binary op holds three.
+/// ⛔ GELU IS NOT THREE. Its tanh polynomial holds `x` to the very end plus the transient chain
+/// AND the ±15 clamp's two splats — peak seven once the clamp landed, budgeted eight — so the `_`
+/// arm's three would size a block far below what the chain holds at the MLP's
+/// `[m, intermediate]` width. MEASURED at six: `TensorSplat: LX capacity exceeded on core 0:
+/// 2027520 + 337920 > 2097152` (five resident, charging the sixth) on gemma-4-12b-it's fused
+/// seg10 map window — the fused window's gelu neighbors keep operands live across the chain,
+/// so the standalone chain's peak is not the window's peak.
 fn ew_live_tiles(kind: EwKind) -> u32 {
     match kind {
         EwKind::Silu => 6,
+        EwKind::Gelu => 8,
         _ => 3,
     }
 }
@@ -119,6 +127,19 @@ fn rows_per_block(cols: u32, live: u32) -> u32 {
     (EW_LX_ELEMS / live.max(1) / cols.max(1)).max(1)
 }
 
+/// How many f16-tile-equivalents an rmsnorm body's variance chain holds at once.
+///
+/// ⛔ SIX, NOT THREE — THE CHAIN IS f32, DELIBERATELY (see `KtirFunc::rmsnorm`'s head
+/// comment: an f16 square overflows at |x| > 256 and zeroes the row). At the square's
+/// charge `x` (f16), the `ArithExtf`'d `xf` (f32) and the `xf·xf` being charged (f32)
+/// are all live: `1 + 2 + 2` f16-tile equivalents, budgeted six for margin (the
+/// gemma-4 error this constant exists for was `1523712 + 1015808 > 2097152` — one f16
+/// `[496,512]` plus one f32 `[496,512]` resident, charging a SECOND f32). The
+/// fused-segment planner cannot see these temporaries at all — it charges HBM tensor
+/// ids at f16 bytes-per-elem — so the ONLY bound on the chain is the block width
+/// chosen in `rmsnorm_inv`.
+const RMS_LIVE_TILES: u32 = 6;
+
 /// `tr` narrowed to `h` rows starting `off` rows into its own region.
 fn sub_rows(tr: &TensorRegion, off: u32, h: u32) -> TensorRegion {
     TensorRegion {
@@ -126,6 +147,17 @@ fn sub_rows(tr: &TensorRegion, off: u32, h: u32) -> TensorRegion {
         region: scratchy_subtile::subtile_ir::Region {
             rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start + off, h),
             cols: tr.region.cols,
+        },
+    }
+}
+
+/// `tr` narrowed to `w` columns starting `off` columns into its own region.
+fn sub_cols(tr: &TensorRegion, off: u32, w: u32) -> TensorRegion {
+    TensorRegion {
+        tensor: tr.tensor,
+        region: scratchy_subtile::subtile_ir::Region {
+            rows: tr.region.rows,
+            cols: scratchy_subtile::subtile_ir::Range::new(tr.region.cols.start + off, w),
         },
     }
 }
@@ -1350,6 +1382,14 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             Err(e) => Unhandled(e.0),
         },
         SubOp::ScalarWeightMul => match lower_scalar_weight_mul_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        // The GAINLESS form — gemma's per-head V/K norms. The same chain as `RmsNorm`
+        // minus the gamma multiply, so it is the same 6-op decomposition with the
+        // normalising multiply terminal. Unit gain means there is no GainConvention to
+        // refuse here: nothing is applied.
+        SubOp::RmsNormUnit { eps } => match lower_rmsnorm_unit_node(node, ir, *eps, sym_id_base) {
             Ok(v) => Ops(v),
             Err(e) => Unhandled(e.0),
         },
@@ -3284,34 +3324,6 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         self.unop(OpKind::MathTanh, x, dims)
     }
 
-    /// `gelu(x)` as the TANH POLYNOMIAL, written longhand — `0.5x(1 + tanh(c(x + 0.044715x³)))`
-    /// with `c = √(2/π)` — because that IS the function the DDL's `OpFunc::Gelu` primitive
-    /// computes (`elementwise_op_func`'s "a REAL DDL primitive … the SFP constant table ships
-    /// gelu's polynomial"), so the program the emulator interprets and the single device op the
-    /// door emits are the same function by construction. ⛔ NOT the erf form: `GeluErf` stays
-    /// refused in `elementwise_op_func` for exactly this reason, and this producer must not
-    /// become a side door for it.
-    fn gelu(&mut self, x: Ssa, dims: Vec<i64>) -> Ssa {
-        let half = self.scalar(0.5);
-        let half = self.splat_of(half, dims.clone());
-        let c = self.scalar((2.0 / std::f64::consts::PI).sqrt());
-        let c = self.splat_of(c, dims.clone());
-        let k = self.scalar(0.044715);
-        let k = self.splat_of(k, dims.clone());
-        let one = self.splat_one(dims.clone());
-        // inner = x + 0.044715·x³
-        let x2 = self.binop(OpKind::ArithMulf, x, x, dims.clone());
-        let x3 = self.binop(OpKind::ArithMulf, x2, x, dims.clone());
-        let kx3 = self.binop(OpKind::ArithMulf, k, x3, dims.clone());
-        let inner = self.binop(OpKind::ArithAddf, x, kx3, dims.clone());
-        // t = tanh(c·inner); y = 0.5·x·(1 + t)
-        let ci = self.binop(OpKind::ArithMulf, c, inner, dims.clone());
-        let t = self.tanh(ci, dims.clone());
-        let onept = self.binop(OpKind::ArithAddf, one, t, dims.clone());
-        let xh = self.binop(OpKind::ArithMulf, x, half, dims.clone());
-        self.binop(OpKind::ArithMulf, xh, onept, dims)
-    }
-
     /// `cap · tanh(x / cap)` — Gemma's final-logit soft cap, written longhand as
     /// ONE `arith.divf` by the splatted cap, ONE `math.tanh`, ONE `arith.mulf`
     /// by the same splat. `MathTanh` is a legal KTIR kind and `OpFunc::Tanh` a
@@ -3348,6 +3360,51 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
     fn negate(&mut self, x: Ssa, dims: Vec<i64>) -> Ssa {
         let z = self.splat_zero(dims.clone());
         self.binop(OpKind::ArithSubf, z, x, dims)
+    }
+
+    /// The tanh-approximation gelu `OpFunc::Gelu`'s DDL polynomial implements:
+    /// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`, spelled longhand for the interpreter the way
+    /// silu is — KTIR has no gelu op, and the constants are immediates (`splat`), never registry
+    /// slots.
+    ///
+    /// ⛔ THE TANH ARGUMENT IS CLAMPED TO ±15, the same clamp the metal target's own
+    /// `gelu_tanh_f16` applies (activation.metal): `tanh` evaluates via `exp(2·inner)`,
+    /// which overflows to Inf (→ NaN through the `1 + tanh` add) for large `inner`.
+    /// `tanh` is already saturated to ±1 well before ±15, so the clamp is bit-exact
+    /// there while killing the overflow. MEASURED on gemma-4-12b-it: the layer-0 MLP
+    /// drove `inner` past f16's `exp` range, and the metal-offloaded map window
+    /// NaN'd every gelu output — layer 1's k/v were all-NaN from the first forward
+    /// on (nan=38912 of 38912) while the pure interpreter path stayed clean.
+    ///
+    /// ⛔ F16 OPS, NOT `f32_*`. The elementwise LX budget ([`EW_LX_ELEMS`], [`ew_live_tiles`]) is
+    /// calibrated in f16 tiles — an `f32_splat` here made every constant a 4-byte-per-element tile,
+    /// and gelma-4's `[22, 15360]` block died with `TensorSplat: LX capacity exceeded: 2027520 +
+    /// 1351680 > 2097152` (one f16 operand + ONE f32 splat already over the pad). Silu's chain is
+    /// f16 end to end for the same reason; f32 is for the variance reduction ([`Self::rmsnorm`]),
+    /// whose [m, hidden] tiles are far narrower than the MLP's [m, intermediate].
+    fn gelu(&mut self, x: Ssa, dims: Vec<i64>) -> Ssa {
+        let k = self.splat((2.0f32 / std::f32::consts::PI).sqrt() as f64, dims.clone());
+        let c = self.splat(0.044_715, dims.clone());
+        let x2 = self.binop(OpKind::ArithMulf, x, x, dims.clone());
+        let x3 = self.binop(OpKind::ArithMulf, x2, x, dims.clone());
+        let cx3 = self.binop(OpKind::ArithMulf, c, x3, dims.clone());
+        let inner0 = self.binop(OpKind::ArithAddf, x, cx3, dims.clone());
+        let inner = self.binop(OpKind::ArithMulf, k, inner0, dims.clone());
+        // `min(max(inner, -15), 15)` — one splat each, dying at its own use.
+        let lo = self.splat(-15.0, dims.clone());
+        let hi = self.splat(15.0, dims.clone());
+        let clamped_lo = self.binop(OpKind::ArithMaximumf, inner, lo, dims.clone());
+        let inner = self.binop(OpKind::ArithMinimumf, clamped_lo, hi, dims.clone());
+        let t = self.unop(OpKind::MathTanh, inner, dims.clone());
+        // `0.5·x·(1+t) = 0.5·x + 0.5·x·t`, with the `0.5` splat DEFERRED to here and
+        // the `1` splat GONE — the polynomial's transients are dead by now, so the
+        // clamp's two splats never overlap them. MEASURED: with all constants splatted
+        // up front the fused map window held 7 tiles and died at
+        // `TensorSplat: LX capacity exceeded: 2027520 + 337920 > 2097152`.
+        let half = self.splat(0.5, dims.clone());
+        let hx = self.binop(OpKind::ArithMulf, half, x, dims.clone());
+        let ht = self.binop(OpKind::ArithMulf, hx, t, dims.clone());
+        self.binop(OpKind::ArithAddf, hx, ht, dims)
     }
 
     /// An `index` computed at run time — the per-core head arithmetic.
@@ -3527,7 +3584,10 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
     /// |x| ≈ 256, where x² overflows f16 (361k > 65504 → inf → mean=inf → scale=0 → the layer
     /// dies). HBM and the tiles stay f16 — the residual itself fits — and only this reduction
     /// widens; the rescale narrows back, where the scale ≈ 1/rms is small and safe. A synthetic
-    /// source never exercises this, because its values are tiny.
+    /// source never exercises this, because its values are tiny. MEASURED on gemma-4-12b-it:
+    /// layer 11's `down_proj` output reaches |x| = 651, whose f16 square is inf — every row
+    /// carrying such an element was ZEROED by the scale=0, and the dead rows then re-exploded
+    /// at the next norm (1/sqrt(eps) × gamma), NaN-ing the whole forward from layer 12 on.
     ///
     /// ⭐ AND THE SCALE IS PER ROW. Each of the `r` rows has its own inverse rms, narrowed and
     /// broadcast across the columns — at r=1 that is one row, identical to a scalar splat, but at
@@ -3549,63 +3609,22 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
     /// yields `[m]`, one value per row, which is what `KtirFunc::reduce`'s own doc describes as
     /// letting "a whole block of rows share one reduce instead of one reduce each".
     ///
-    /// ⭐ NO ROW BLOCKING HERE EITHER, unlike [`KtirFunc::silu_mul`]. Blocking would hand the consumer
-    /// the block height instead of `m` and declare the scratch at that height — the same divergence in
-    /// a smaller denomination. An emulator-motivated tiling of this program belongs in
+    /// ⭐ NO ROW BLOCKING HERE, unlike [`KtirFunc::silu_mul`]. Row blocking would hand the consumer
+    /// the block height instead of `m` and declare the scratch at that height — the same divergence
+    /// in a smaller denomination — AND it would give one program N `math.sqrt` roots where the
+    /// consumer's `program_rmsnorm_eps` reads exactly one. An emulator-motivated tiling belongs in
     /// `ktir-optimizer`, which is `spyre-emu`-gated; the producer states the shape the node has.
+    /// ⭐⭐ BUT THE VARIANCE PHASE IS **COLUMN**-BLOCKED when the region does not fit a core's LX —
+    /// see [`Self::rmsnorm_inv`] for why that is the one legal blocking axis.
     fn rmsnorm(&mut self, x_r: &TensorRegion, gamma: &TensorRegion, out: &TensorRegion, eps: f32) {
         // The region's extents, read off the output — ONE spelling of each quantity. The width used to
         // arrive as a registry index beside it too, and two spellings of one number is what lets them
         // disagree.
         let c = out.region.cols.len;
         let m = out.region.rows.len;
-        let x = self.load_region(x_r);
         let dims = vec![i64::from(m), i64::from(c)];
-        let rows = vec![i64::from(m)];
 
-        let xf = {
-            let v = self.fresh();
-            let op = Operation::new(self.a, Some(v), OpKind::ArithExtf, &[x]);
-            let ty = self.f32_ty(dims.clone());
-            let op = self.typed(op, ty);
-            self.push(op);
-            v
-        };
-        let x2 = self.f32_binop(OpKind::ArithMulf, xf, xf, dims.clone());
-        let sinit = self.f32_splat(0.0, rows.clone());
-        let ssum = {
-            let a = self.a;
-            let v = self.fresh();
-            let op = Operation::new(a, Some(v), OpKind::LinalgReduce, &[x2, sinit])
-                .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![1])))
-                .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
-            let ty = self.f32_ty(rows.clone());
-            let op = self.typed(op, ty);
-            self.push(op);
-            v
-        };
-        let dts = self.f32_splat(f64::from(c), rows.clone());
-        let mean = self.f32_binop(OpKind::ArithDivf, ssum, dts, rows.clone());
-        let epst = self.f32_splat(f64::from(eps), rows.clone());
-        let meps = self.f32_binop(OpKind::ArithAddf, mean, epst, rows.clone());
-        let rms = {
-            let v = self.fresh();
-            let op = Operation::new(self.a, Some(v), OpKind::MathSqrt, &[meps]);
-            let ty = self.f32_ty(rows.clone());
-            let op = self.typed(op, ty);
-            self.push(op);
-            v
-        };
-        let onet = self.f32_splat(1.0, rows.clone());
-        let inv = self.f32_binop(OpKind::ArithDivf, onet, rms, rows.clone());
-        let inv_e = {
-            let v = self.fresh();
-            let op = Operation::new(self.a, Some(v), OpKind::ArithTruncf, &[inv]);
-            let ty = self.tensor_ty(rows);
-            let op = self.typed(op, ty);
-            self.push(op);
-            v
-        };
+        let (x, inv_e) = self.rmsnorm_inv(x_r, eps);
         // `[m]` → `[m, c]` along the COLUMN axis: every column of a row shares that row's scale.
         let invb = self.broadcast(inv_e, dims.clone(), 1);
         let xs = self.binop(OpKind::ArithMulf, x, invb, dims.clone());
@@ -3617,39 +3636,68 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         self.store_region(y, out);
     }
 
-    /// RmsNormUnit — `out = x · rsqrt(mean(x²) + eps)`, the gainless form. The same
-    /// chain as [`Self::rmsnorm`] minus the gamma multiply: the normalising multiply
-    /// is the terminal one, so `xs` is stored directly. The epsilon is an immediate
-    /// (`f32_splat(eps)`), which is what `program_rmsnorm_eps` reads back on the
-    /// consumer side to resolve the `[1,1]` const slot.
-    fn rmsnorm_unit(&mut self, x_r: &TensorRegion, out: &TensorRegion, eps: f32) {
-        let c = out.region.cols.len;
-        let m = out.region.rows.len;
-        let x = self.load_region(x_r);
-        let dims = vec![i64::from(m), i64::from(c)];
+    /// THE VARIANCE PHASE OF EVERY RMSNORM — load `x` whole, compute the per-row
+    /// `inv = 1/sqrt(mean(x²) + eps)` in f32, narrow it to f16, and return
+    /// `(the whole-region x tile, inv_e)` for the caller's own tail multiply.
+    ///
+    /// ⛔ THE SQUARE IS f32, NOT f16. An f16 square overflows at |x| > 256 — see
+    /// [`Self::rmsnorm`]'s head comment for the measured gemma-4 failure — so the
+    /// chain widens `x` BEFORE squaring, exactly as `assemble_rmsnorm`'s f32 mean
+    /// reduce widens its operands on the card.
+    ///
+    /// ⭐⭐ AND THE SQUARE IS **COLUMN**-BLOCKED WHEN THE REGION DOES NOT FIT LX. The
+    /// f32 chain holds `x`'s block (f16), its widening and its square (f32 each) at
+    /// once — 5 f16-tile-equivalents per column — which on gemma-4's `[496, 512]`
+    /// global-layer Q norm is 2,539,520 B > 2 MiB (MEASURED as `ArithMulf: LX
+    /// capacity exceeded ... charging %75 tile [496, 512]`). COLUMN blocking is the
+    /// one legal axis because everything after the reduce is `[m]`-shaped: the
+    /// partial sums concatenate by ADDING (an `[m]` `addf` per block), the ONE
+    /// `math.sqrt` root survives (a row block would mint one root per block and
+    /// break `program_rmsnorm_eps`'s single-root reading), and the final multiply
+    /// and store stay whole-region so `node_rows`/`r_cover` still see one node.
+    /// Every block's access tiles keep row corner 0 — `base_addressed`'s law.
+    fn rmsnorm_inv(&mut self, x_r: &TensorRegion, eps: f32) -> (Ssa, Ssa) {
+        let c = x_r.region.cols.len;
+        let m = x_r.region.rows.len;
         let rows = vec![i64::from(m)];
+        let x = self.load_region(x_r);
 
-        let xf = {
-            let v = self.fresh();
-            let op = Operation::new(self.a, Some(v), OpKind::ArithExtf, &[x]);
-            let ty = self.f32_ty(dims.clone());
-            let op = self.typed(op, ty);
-            self.push(op);
-            v
+        // The f32 square chain holds `RMS_LIVE_TILES` f16-tile-equivalents of a
+        // column block plus two `[m]` f32 accumulators (see that constant's comment).
+        let live = u64::from(RMS_LIVE_TILES);
+        let w: u32 = if u64::from(m) * u64::from(c) * live > u64::from(EW_LX_ELEMS) {
+            ((u64::from(EW_LX_ELEMS) / live / u64::from(m.max(1))) as u32)
+                .max(64)
+                .min(c)
+        } else {
+            c
         };
-        let x2 = self.f32_binop(OpKind::ArithMulf, xf, xf, dims.clone());
-        let sinit = self.f32_splat(0.0, rows.clone());
-        let ssum = {
-            let a = self.a;
-            let v = self.fresh();
-            let op = Operation::new(a, Some(v), OpKind::LinalgReduce, &[x2, sinit])
-                .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![1])))
-                .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
-            let ty = self.f32_ty(rows.clone());
-            let op = self.typed(op, ty);
-            self.push(op);
-            v
-        };
+
+        // The per-row sum of squares, accumulated across column blocks.
+        let mut ssum = self.f32_splat(0.0, rows.clone());
+        let mut off = 0u32;
+        while off < c {
+            let h = w.min(c - off);
+            let blk_dims = vec![i64::from(m), i64::from(h)];
+            let xb = if w >= c {
+                x
+            } else {
+                self.load_region(&sub_cols(x_r, off, h))
+            };
+            let xbf = {
+                let v = self.fresh();
+                let op = Operation::new(self.a, Some(v), OpKind::ArithExtf, &[xb]);
+                let ty = self.f32_ty(blk_dims.clone());
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            let x2 = self.f32_binop(OpKind::ArithMulf, xbf, xbf, blk_dims);
+            let part = self.reduce(x2, ssum.clone(), OpKind::ArithAddf, 1, rows.clone());
+            ssum = part;
+            off += h;
+        }
+
         let dts = self.f32_splat(f64::from(c), rows.clone());
         let mean = self.f32_binop(OpKind::ArithDivf, ssum, dts, rows.clone());
         let epst = self.f32_splat(f64::from(eps), rows.clone());
@@ -3672,6 +3720,23 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
             self.push(op);
             v
         };
+        (x, inv_e)
+    }
+
+    /// Unit-gain RmsNorm — [`Self::rmsnorm`]'s chain WITHOUT the gamma multiply: the same f32
+    /// mean-of-squares / `1/rms` / broadcast, stopping at `x · inv_rms` (Gemma4 `v_norm`, no
+    /// learnable scale). A separate entry point rather than a `gamma: Option` on [`Self::rmsnorm`],
+    /// because the gain operand changes the PARAMETER set (the emulator binds one address per
+    /// argument), and an op that never had a gamma must not mint a parameter for one.
+    ///
+    /// ⛔ NOT ROW-BLOCKED, for the same reason [`Self::rmsnorm`] is not: the consumer reads the
+    /// program's ONE `math.sqrt` root structurally (`program_rmsnorm_eps`), and N blocks would be
+    /// N roots. An emulator-motivated tiling belongs in `ktir-optimizer` (`spyre-emu`-gated).
+    fn rmsnorm_unit(&mut self, x_r: &TensorRegion, out: &TensorRegion, eps: f32) {
+        let c = out.region.cols.len;
+        let m = out.region.rows.len;
+        let dims = vec![i64::from(m), i64::from(c)];
+        let (x, inv_e) = self.rmsnorm_inv(x_r, eps);
         let invb = self.broadcast(inv_e, dims.clone(), 1);
         let y = self.binop(OpKind::ArithMulf, x, invb, dims);
         self.store_region(y, out);

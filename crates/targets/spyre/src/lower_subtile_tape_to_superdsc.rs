@@ -603,12 +603,23 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // manifest's model weights, so a synthetic seg1 P stays ZERO ⇒ rot=matmul(x,0)=0 ⇒
     // RoPE collapses to `x·cos` (rotate-half/sin term DROPPED) ⇒ wrong positional
     // encoding ⇒ wrong content. Same P for every head/position/layer.
-    if let Some(hd) = ir.nodes.iter().find_map(|n| match &n.op {
-        SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-            Some(head_dim.get() as u64)
-        }
-        _ => None,
-    }) {
+    // ⭐ THE MAX, NOT THE FIRST — a hybrid model (gemma-4) carries TWO rope classes
+    // (sliding hd=256, global hd=512) and every class's `matmul(x, P)` reads THIS
+    // one placement. Sized at the first rope node's hd, a global layer's P addressed
+    // 4× past its own footprint (`rope_rot ... access offset 180224B + 8192B exceeds
+    // its placement footprint 131072B`) — the same first-vs-max fix the IDENTITY_TID
+    // placement already makes for a hybrid's attention classes.
+    let hd = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
+                Some(head_dim.get() as u64)
+            }
+            _ => None,
+        })
+        .max();
+    if let Some(hd) = hd {
         let seg = SegRole::Activation.segment();
         let off = seg_bytes[seg];
         let sz = hd * hd * 2; // [hd,hd] fp16
