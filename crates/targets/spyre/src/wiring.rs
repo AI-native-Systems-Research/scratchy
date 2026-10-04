@@ -71,6 +71,56 @@ pub fn fp8_scale(l: &scratchy_layers::layers::Fp8AnyLinear) -> GpuTensor {
     }
 }
 
+// ── The MoE bundle tensors, one accessor per (bundle, tensor) ─────────────────
+//
+// A MoE bundle field holds SEVERAL tensors where every other weight kind holds one, so
+// `superdsc_weights`'s per-source arms reach INSIDE the field through these. They return the
+// tensor VERBATIM — staging (orientation, device-width pad) is the worker's, decided by the
+// source's baked shape, exactly as for a single-tensor weight.
+
+/// The gemma-4 router's dense `[num_experts, hidden]` projection.
+pub fn gemma_router_gate(l: &scratchy_layers::layers_moe::GemmaRouterLayer) -> GpuTensor {
+    l.gate
+}
+
+/// The gemma-4 router's `[num_experts]` per-expert score scale.
+pub fn gemma_router_per_expert_scale(
+    l: &scratchy_layers::layers_moe::GemmaRouterLayer,
+) -> GpuTensor {
+    l.per_expert_scale
+}
+
+/// The gemma-4 router's `[hidden]` RMSNorm gain on its input.
+pub fn gemma_router_scale(l: &scratchy_layers::layers_moe::GemmaRouterLayer) -> GpuTensor {
+    l.scale
+}
+
+/// The SwitchGLU experts' gate-projection codes, stacked `[E, out, in]`.
+pub fn switch_glu_gate_w(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_gate_w
+}
+
+/// The SwitchGLU experts' gate-projection per-channel scale, stacked `[E, out, 1]`.
+pub fn switch_glu_gate_s(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_gate_scales
+}
+
+pub fn switch_glu_up_w(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_up_w
+}
+
+pub fn switch_glu_up_s(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_up_scales
+}
+
+pub fn switch_glu_down_w(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_down_w
+}
+
+pub fn switch_glu_down_s(l: &scratchy_layers::layers_moe::SwitchGluExpertsLayer) -> GpuTensor {
+    l.expert_down_scales
+}
+
 // ── WHAT THE BAKE PLACED ────────────────────────────────────────────────────
 
 /// The bundle's own answers about what it placed.

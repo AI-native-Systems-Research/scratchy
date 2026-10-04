@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
-use scratchy_subtile::handoff::{Expansion, ExpansionId};
+use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
     AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
@@ -315,12 +315,15 @@ impl<'a> Builder<'a> {
     /// The expert half: the `(token, expert)` pairs of `x` sorted by expert, projected by
     /// `bank`, gated, projected back, restored to token order, summed by `scores`. Closes the
     /// expansion; returns the sum.
+    ///
+    /// `bank` resolves one projection's WEIGHT and SCALE sources — the two are separate
+    /// launch tensors (a bundle holds both), so the matmul binds them as operands 2 and 3.
     fn experts(
         &mut self,
         x: InputRef,
         indices: usize,
         scores: usize,
-        bank: InputRef,
+        bank: &dyn Fn(ExpertProj) -> (InputRef, InputRef),
         e: Experts,
     ) -> usize {
         let (k, quant, bundle) = (e.k, e.quant, e.bundle);
@@ -337,11 +340,15 @@ impl<'a> Builder<'a> {
             bundle,
         };
         let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
-        let rows = |r: usize| vec![InputRef::Op(r), InputRef::Op(pairs), bank];
-        let gate = self.push_op(matmul(ExpertProj::Gate, e.inter), rows(pairs));
-        let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs));
+        let rows =
+            |r: usize, w: InputRef, s: InputRef| vec![InputRef::Op(r), InputRef::Op(pairs), w, s];
+        let (gw, gs) = bank(ExpertProj::Gate);
+        let gate = self.push_op(matmul(ExpertProj::Gate, e.inter), rows(pairs, gw, gs));
+        let (uw, us) = bank(ExpertProj::Up);
+        let up = self.push_op(matmul(ExpertProj::Up, e.inter), rows(pairs, uw, us));
         let act = self.push(SubOp::ExpertGatedAct { act: e.act }, &[gate, up]);
-        let down = self.push_op(matmul(ExpertProj::Down, e.hidden), rows(act));
+        let (dw, ds) = bank(ExpertProj::Down);
+        let down = self.push_op(matmul(ExpertProj::Down, e.hidden), rows(act, dw, ds));
         let tokens = self.push(SubOp::ExpertUnsort, &[down, pairs]);
         let (hidden, shared) = (e.hidden, e.shared);
         let sum = self.push(SubOp::ExpertCombine { hidden, shared }, &[tokens, scores]);
@@ -1201,7 +1208,11 @@ pub fn lower_decode_to_wavefront(
                     act: GatedAct::Silu,
                     shared: SharedExpertBound(shared),
                 };
-                let idx = bx.experts(x, indices, scores, w, experts);
+                // The fused MoE bundle is ONE source (its affine scales resolve by tensor
+                // role at the target, not as separate operands), so both of a projection's
+                // weight operands bind it.
+                let bank = &|_proj: ExpertProj| (w, w);
+                let idx = bx.experts(x, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
@@ -1274,22 +1285,37 @@ pub fn lower_decode_to_wavefront(
                         });
                     }
                 };
-                let rsrc = bx.push_source(
-                    1,
-                    1,
-                    SourceBinding::Weight {
-                        id: rw.0,
-                        index: rw.1,
-                    },
-                );
-                let esrc = bx.push_source(
-                    1,
-                    1,
-                    SourceBinding::Weight {
-                        id: ew.0,
-                        index: ew.1,
-                    },
-                );
+                // ⭐ ONE SOURCE PER BUNDLE TENSOR, NOT ONE PER BUNDLE. A MoE bundle is ONE
+                // `Weights` field (one accessor, one load) holding SEVERAL tensors, and a
+                // launch source must carry exactly one staged tensor — so the block binds as
+                // many sources as it has tensors, each naming the bundle's `(id, index)` plus
+                // WHICH tensor (`BundleTensor`). The single-tensor `Weight` binding this arm
+                // used to push had shape `[1,1]` and bound NOTHING a worker could stage, which
+                // is why the spyre weight-bindings walk refused the kind.
+                //
+                // Shapes are the STACKED ON-DISK extents (the expert axis folded into rows,
+                // the same fold `weight_source` gives a rank-3 `[E, r, c]`), stated from the
+                // model bounds the block already read. The router's projection is FUF-layout
+                // `[k=hidden, n=E]` like every other gemm weight; its two gains are rows of a
+                // `[1, ·]` vector like every other norm gain.
+                let bundle_src = |bx: &mut Builder,
+                                  id: u32,
+                                  index: Option<UnrollIndex>,
+                                  tensor: BundleTensor,
+                                  rows: u32,
+                                  cols: u32| {
+                    bx.push_source(
+                        rows,
+                        cols,
+                        SourceBinding::BundleTensor { id, index, tensor },
+                    )
+                };
+                let router_src = |bx: &mut Builder, tensor: BundleTensor, rows: u32, cols: u32| {
+                    bundle_src(bx, rw.0, rw.1, tensor, rows, cols)
+                };
+                let expert_src = |bx: &mut Builder, tensor: BundleTensor, rows: u32, cols: u32| {
+                    bundle_src(bx, ew.0, ew.1, tensor, rows, cols)
+                };
                 let b = &bx.bounds;
                 let num_experts = b
                     .get("num_experts")
@@ -1321,21 +1347,41 @@ pub fn lower_decode_to_wavefront(
                     }
                     _ => (64, 4),
                 };
-                let (router, bank) = (InputRef::Ext(rsrc), InputRef::Ext(esrc));
                 // Routes off its own pre-norm of `router_in`: logits → top-k → scores at a
                 // `hidden^-0.5` temperature → softmax → × per-expert scale. GeGLU experts over
                 // `expert_in`.
                 let (experts, k) = moe_counts(tile, num_experts, top_k)?;
                 let hidden = bx.out_cols(tile, 0, "gemma_moe output")?;
                 let gemma = RouterBundle::Gemma;
+                // The bundle's tensors as launch sources, in block order: the router's
+                // projection (FUF `[k=hidden, n=E]`), its two gains, then each expert
+                // projection's codes and per-channel scale (stacked on-disk extents
+                // `[E·out, in]` / `[E·out, 1]`).
+                let e_rows = num_experts;
+                let r_gate = router_src(&mut bx, BundleTensor::RouterGate, hidden, e_rows);
+                let r_scale = router_src(&mut bx, BundleTensor::RouterScale, 1, hidden);
+                let r_per_expert =
+                    router_src(&mut bx, BundleTensor::RouterPerExpertScale, 1, e_rows);
+                let w_src = |bx: &mut Builder, t: BundleTensor, out: u32, inp: u32| {
+                    expert_src(bx, t, e_rows * out, inp)
+                };
+                let s_src = |bx: &mut Builder, t: BundleTensor, out: u32| {
+                    expert_src(bx, t, e_rows * out, 1)
+                };
+                let gate_w = w_src(&mut bx, BundleTensor::ExpertGateW, moe_inter, hidden);
+                let gate_s = s_src(&mut bx, BundleTensor::ExpertGateS, moe_inter);
+                let up_w = w_src(&mut bx, BundleTensor::ExpertUpW, moe_inter, hidden);
+                let up_s = s_src(&mut bx, BundleTensor::ExpertUpS, moe_inter);
+                let down_w = w_src(&mut bx, BundleTensor::ExpertDownW, hidden, moe_inter);
+                let down_s = s_src(&mut bx, BundleTensor::ExpertDownS, hidden);
                 bx.expand();
                 let norm = SubOp::RouterNorm { eps, router: gemma };
-                let xr = bx.push_op(norm, vec![router_in, router]);
+                let xr = bx.push_op(norm, vec![router_in, InputRef::Ext(r_scale)]);
                 let logits = SubOp::RouterLogits {
                     experts,
                     router: gemma,
                 };
-                let lg = bx.push_op(logits, vec![InputRef::Op(xr), router]);
+                let lg = bx.push_op(logits, vec![InputRef::Op(xr), InputRef::Ext(r_gate)]);
                 let indices = bx.route_top_k(lg, k);
                 let scores = bx.push(SubOp::RouteGatherScores, &[lg, indices]);
                 let scale = (hidden as f32).powf(-0.5);
@@ -1343,7 +1389,7 @@ pub fn lower_decode_to_wavefront(
                 let scores = bx.push(SubOp::RouteSoftmax, &[scores]);
                 let scale = SubOp::RouteExpertScale { router: gemma };
                 let (s, i) = (InputRef::Op(scores), InputRef::Op(indices));
-                let scores = bx.push_op(scale, vec![s, i, router]);
+                let scores = bx.push_op(scale, vec![s, i, InputRef::Ext(r_per_expert)]);
                 let experts = Experts {
                     experts,
                     k,
@@ -1353,6 +1399,14 @@ pub fn lower_decode_to_wavefront(
                     bundle: ExpertBundle::SwitchGlu,
                     act: GatedAct::Gelu,
                     shared: SharedExpertBound(None),
+                };
+                let bank = &|proj: ExpertProj| {
+                    let (w, s) = match proj {
+                        ExpertProj::Gate => (gate_w, gate_s),
+                        ExpertProj::Up => (up_w, up_s),
+                        ExpertProj::Down => (down_w, down_s),
+                    };
+                    (InputRef::Ext(w), InputRef::Ext(s))
                 };
                 let idx = bx.experts(expert_in, indices, scores, bank, experts);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));

@@ -141,7 +141,7 @@ macro_rules! for_each_subop {
             // derive. ExpertUnsort restores TOKEN order from pair rows.
             ExpertSort [SubOp::ExpertSort { .. }] arity = (|n| n == 2), cols = [pairs in0 k],
                 rows = [m];
-            ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = (|n| n == 3), cols = [pairs n k],
+            ExpertMatmul [SubOp::ExpertMatmul { .. }] arity = (|n| n == 3 || n == 4), cols = [pairs n k],
                 rows = [m];
             ExpertGatedAct [SubOp::ExpertGatedAct { .. }] arity = (|n| n == 2), cols = [in0],
                 rows = [m];

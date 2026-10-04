@@ -8049,7 +8049,7 @@ fn emit_superdsc_wiring(
             // ⛔ EXHAUSTIVE, NO CATCH-ALL. A new role must be taught a filler here, at build time.
             match b {
                 // The generated weight loader binds these once, before prepare.
-                SB::Weight { .. } | SB::WeightScale { .. } => {}
+                SB::Weight { .. } | SB::WeightScale { .. } | SB::BundleTensor { .. } => {}
                 SB::EmbeddedHidden => {
                     embeds += 1;
                     if id != embed_src {
@@ -9115,9 +9115,9 @@ fn dump_wavefront_mega(
                         .filter_map(|(i, b)| match b {
                             // The fp8 per-channel weight_scale is a STATIC resident tensor (loaded once,
                             // like a weight) — not a per-step activation — so it joins seg1 (SegRole::Weight).
-                            SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. } => {
-                                Some(i as u32)
-                            }
+                            SourceBinding::Weight { .. }
+                            | SourceBinding::WeightScale { .. }
+                            | SourceBinding::BundleTensor { .. } => Some(i as u32),
                             _ => None,
                         })
                         .collect()
@@ -9299,10 +9299,8 @@ fn dump_wavefront_mega(
                                             }
                                         }
                                     }
-                                    let bod: Result<String, std::io::Error> = Ok(body_fps
-                                        .first()
-                                        .cloned()
-                                        .unwrap_or_default());
+                                    let bod: Result<String, std::io::Error> =
+                                        Ok(body_fps.first().cloned().unwrap_or_default());
                                     // The SAME body, with the per-page fold fused back into the
                                     // surrounding work instead of standing alone. Splitting the fold
                                     // costs one extra launch per layer (measured: 5 groups vs the
@@ -9555,33 +9553,32 @@ fn dump_wavefront_mega(
                                             // while the log beside it printed ×40. The launch table
                                             // is now ONE artifact both the bake and the runtime
                                             // read, so the two cannot disagree about the count.
-                                            let baked_launches: Vec<
-                                                superdsc::bundle::LayerLaunch,
-                                            > = if card {
-                                                rolled
-                                                    .launches
-                                                    .iter()
-                                                    .zip(&rolled.launch_w)
-                                                    .zip(&rolled.launch_kv)
-                                                    .map(|((&(b, it), &(wb, wo)), &ko)| {
-                                                        superdsc::bundle::LayerLaunch {
-                                                            body: b,
-                                                            iter: it,
-                                                            w_bank: wb,
-                                                            w_off: wo,
-                                                            kv_off: ko,
-                                                        }
-                                                    })
-                                                    .collect()
-                                            } else {
-                                                vec![superdsc::bundle::LayerLaunch {
-                                                    body: 0,
-                                                    iter: 0,
-                                                    w_bank: 0,
-                                                    w_off: 0,
-                                                    kv_off: 0,
-                                                }]
-                                            };
+                                            let baked_launches: Vec<superdsc::bundle::LayerLaunch> =
+                                                if card {
+                                                    rolled
+                                                        .launches
+                                                        .iter()
+                                                        .zip(&rolled.launch_w)
+                                                        .zip(&rolled.launch_kv)
+                                                        .map(|((&(b, it), &(wb, wo)), &ko)| {
+                                                            superdsc::bundle::LayerLaunch {
+                                                                body: b,
+                                                                iter: it,
+                                                                w_bank: wb,
+                                                                w_off: wo,
+                                                                kv_off: ko,
+                                                            }
+                                                        })
+                                                        .collect()
+                                                } else {
+                                                    vec![superdsc::bundle::LayerLaunch {
+                                                        body: 0,
+                                                        iter: 0,
+                                                        w_bank: 0,
+                                                        w_off: 0,
+                                                        kv_off: 0,
+                                                    }]
+                                                };
                                             superdsc::attach_reroll(
                                                 &bfp,
                                                 superdsc::bundle::RerollMeta {
@@ -9890,6 +9887,39 @@ fn dump_wavefront_mega(
                                     "{{\"id\":{i},\"role\":\"weight_scale\",\"name\":\"{name}\",\
                                  \"base\":\"{scale_base}\",\"disk\":\"{disk}\",\"layer\":{layer},\
                                  \"is_gemm\":false,\"loc\":{loc_json}}}"
+                                )
+                            }
+                            SourceBinding::BundleTensor { id, index, tensor } => {
+                                // One tensor of a MULTI-TENSOR MoE bundle: same field, disk
+                                // prefix and layer as the bundle's own `Weight` binding; the
+                                // `tensor` discriminant says which staged tensor fills the
+                                // source. `is_gemm` follows the tensor: codes are gemm
+                                // operands, scales and gains are not.
+                                let name =
+                                    crate::emit::weight_field_name(program, WeightId(*id), *index)
+                                        .to_string();
+                                let (wbase, _) = split_base_layer(&name);
+                                let layer = index.as_ref().map(|u| u.0).unwrap_or(0);
+                                let disk = safetensors_prefix(
+                                    program,
+                                    model.arch.decoder_prefix.as_deref(),
+                                    model.arch.safetensors.as_ref(),
+                                    WeightId(*id),
+                                    *index,
+                                );
+                                let which = tensor.name();
+                                let is_gemm = tensor.is_gemm_operand();
+                                let loc_json = match base_to_loc.get(&wbase) {
+                                    Some(li) => format!(
+                                        "{{\"bucket\":{},\"op_idx\":{},\"slot\":{}}}",
+                                        li.bucket, li.op_idx, li.slot
+                                    ),
+                                    None => "null".to_string(),
+                                };
+                                format!(
+                                    "{{\"id\":{i},\"role\":\"bundle_tensor\",\"name\":\"{name}\",\
+                                 \"base\":\"{wbase}\",\"disk\":\"{disk}\",\"layer\":{layer},\
+                                 \"tensor\":\"{which}\",\"is_gemm\":{is_gemm},\"loc\":{loc_json}}}"
                                 )
                             }
                         };

@@ -30,6 +30,7 @@
 use crate::classified::{Program, UnrollIndex, WeightId};
 use crate::to_wavefront::{LoweredDecode, SourceBinding};
 use crate::weight_vocab::{WeightAccessor, WeightKind};
+use scratchy_subtile::handoff::BundleTensor;
 use scratchy_subtile::lower::{GemmWeight, InputRef};
 use scratchy_subtile::subtile_ir::{EwKind, SubOp};
 
@@ -182,7 +183,9 @@ fn weight_exts(lowered: &LoweredDecode, op_idx: usize) -> Vec<usize> {
             InputRef::Ext(e)
                 if matches!(
                     lowered.bindings[*e],
-                    SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. }
+                    SourceBinding::Weight { .. }
+                        | SourceBinding::WeightScale { .. }
+                        | SourceBinding::BundleTensor { .. }
                 ) =>
             {
                 Some(*e)
@@ -195,9 +198,9 @@ fn weight_exts(lowered: &LoweredDecode, op_idx: usize) -> Vec<usize> {
 /// `(WeightId, layer)` of a weight-carrying binding.
 fn weight_of(lowered: &LoweredDecode, ext: usize) -> Option<(WeightId, Option<UnrollIndex>)> {
     match &lowered.bindings[ext] {
-        SourceBinding::Weight { id, index } | SourceBinding::WeightScale { id, index } => {
-            Some((WeightId(*id), *index))
-        }
+        SourceBinding::Weight { id, index }
+        | SourceBinding::WeightScale { id, index }
+        | SourceBinding::BundleTensor { id, index, .. } => Some((WeightId(*id), *index)),
         _ => None,
     }
 }
@@ -326,9 +329,16 @@ pub(crate) fn emit_weight_bindings(
 
     let mut arms: Vec<proc_macro2::TokenStream> = Vec::new();
     for (i, b) in lowered.bindings.iter().enumerate() {
+        // Which tensor inside the field the source binds — `None` for the field's own
+        // primary tensor, `Some(..)` for a tensor of a MULTI-TENSOR bundle.
+        let mut bundle_tensor = None;
         let (id, index, is_scale) = match b {
             SourceBinding::Weight { id, index } => (WeightId(*id), *index, false),
             SourceBinding::WeightScale { id, index } => (WeightId(*id), *index, true),
+            SourceBinding::BundleTensor { id, index, tensor } => {
+                bundle_tensor = Some(*tensor);
+                (WeightId(*id), *index, false)
+            }
             _ => continue,
         };
         let name = crate::emit::weight_field_name(program, id, index).to_string();
@@ -358,6 +368,55 @@ pub(crate) fn emit_weight_bindings(
             (WeightKind::RmsNorm | WeightKind::LayerNorm | WeightKind::Embedding, _) => {
                 quote! { #expr.weight }
             }
+            // A MoE bundle's tensor: `bundle_tensor` names WHICH one (the source's own
+            // `BundleTensor`), and the wiring accessors are per-(kind, tensor) — one free
+            // function per combination, so an unmodelled combination is a MISSING arm here
+            // rather than a wrong-tensor guess.
+            (WeightKind::GemmaRouter, false) => match bundle_tensor {
+                Some(BundleTensor::RouterGate) => {
+                    quote! { ::scratchy_target_spyre::wiring::gemma_router_gate(&#expr) }
+                }
+                Some(BundleTensor::RouterPerExpertScale) => {
+                    quote! { ::scratchy_target_spyre::wiring::gemma_router_per_expert_scale(&#expr) }
+                }
+                Some(BundleTensor::RouterScale) => {
+                    quote! { ::scratchy_target_spyre::wiring::gemma_router_scale(&#expr) }
+                }
+                other => {
+                    return Err(format!(
+                        "weight_bindings: GemmaRouter field `{name}` binds bundle tensor \
+                         {other:?}, which is not a router tensor — the source and the field \
+                         kind disagree"
+                    ));
+                }
+            },
+            (WeightKind::GemmaSwitchGlu, false) => match bundle_tensor {
+                Some(BundleTensor::ExpertGateW) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_gate_w(&#expr) }
+                }
+                Some(BundleTensor::ExpertGateS) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_gate_s(&#expr) }
+                }
+                Some(BundleTensor::ExpertUpW) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_up_w(&#expr) }
+                }
+                Some(BundleTensor::ExpertUpS) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_up_s(&#expr) }
+                }
+                Some(BundleTensor::ExpertDownW) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_down_w(&#expr) }
+                }
+                Some(BundleTensor::ExpertDownS) => {
+                    quote! { ::scratchy_target_spyre::wiring::switch_glu_down_s(&#expr) }
+                }
+                other => {
+                    return Err(format!(
+                        "weight_bindings: SwitchGluExperts field `{name}` binds bundle tensor \
+                         {other:?}, which is not an expert tensor — the source and the field \
+                         kind disagree"
+                    ));
+                }
+            },
             (other, _) => {
                 return Err(format!(
                     "weight_bindings: no staged-tensor accessor for weight kind {other:?} (field \

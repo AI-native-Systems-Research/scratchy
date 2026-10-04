@@ -38,6 +38,63 @@ impl std::fmt::Display for UnrollIndex {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TileId(pub u32);
 
+/// Which tensor inside a multi-tensor MoE weight bundle a
+/// [`SourceBinding::BundleTensor`] names.
+///
+/// ⭐ THE SHARED SUBSET ONLY. A variant belongs here when MORE THAN ONE target binds that
+/// tensor off the bundle — spyre stages each as its own `BoundWeight` and metal reads it
+/// through its own `WeightTensor` at lowering, so both must agree on the vocabulary. A
+/// tensor exactly one target reads (a shared-expert slab, a GDN table) stays that target's
+/// own enum and never appears here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BundleTensor {
+    /// Gemma-4 router: the dense `[num_experts, hidden]` projection (`router.proj`,
+    /// dequantized at load when the checkpoint ships it quantized).
+    RouterGate,
+    /// Gemma-4 router: `[num_experts]` per-expert score scale
+    /// (`router.per_expert_scale`), gathered after the softmax.
+    RouterPerExpertScale,
+    /// Gemma-4 router: `[hidden]` RMSNorm gain on the router input (`router.scale`).
+    RouterScale,
+    /// Experts: the gate projection's codes. Rank-3 `[E, out, in]` (or its packed
+    /// form — the LOADER decides the representation, the target reads what the
+    /// bundle's kind says it holds).
+    ExpertGateW,
+    /// Experts: the gate projection's per-channel fp8 scale (`[E, out, 1]` stacked).
+    ExpertGateS,
+    ExpertUpW,
+    ExpertUpS,
+    ExpertDownW,
+    ExpertDownS,
+}
+
+impl BundleTensor {
+    /// The tensor's registry name — for dumps and the manifest, so no consumer keeps a
+    /// parallel string table. Lowercase snake, matching the on-disk leaf it loads.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RouterGate => "router_gate",
+            Self::RouterPerExpertScale => "router_per_expert_scale",
+            Self::RouterScale => "router_scale",
+            Self::ExpertGateW => "expert_gate_w",
+            Self::ExpertGateS => "expert_gate_s",
+            Self::ExpertUpW => "expert_up_w",
+            Self::ExpertUpS => "expert_up_s",
+            Self::ExpertDownW => "expert_down_w",
+            Self::ExpertDownS => "expert_down_s",
+        }
+    }
+
+    /// Whether this tensor is a GEMM's weight operand — the fact that decides its staged
+    /// shape's orientation (a gemm weight is `[n, k]` on disk; a gain or scale is not).
+    pub const fn is_gemm_operand(self) -> bool {
+        matches!(
+            self,
+            Self::RouterGate | Self::ExpertGateW | Self::ExpertUpW | Self::ExpertDownW
+        )
+    }
+}
+
 /// Kind of weight a tape position consumes. The variant of
 /// the carrying [`Instruction`] determines the *count* and *kind
 /// list*; what the proc-macro records per-instance is the per-arch
@@ -177,6 +234,25 @@ pub enum SourceBinding {
     WeightScale {
         id: u32,
         index: Option<UnrollIndex>,
+    },
+    /// ONE TENSOR inside a MULTI-TENSOR weight bundle (a MoE block's router or expert bank).
+    ///
+    /// ⭐ WHY A DISTINCT VARIANT, NOT A `Weight` WITH A SUFFIXED PATH. A bundle is ONE
+    /// `Weights`-struct field (one accessor, one load, one on-disk prefix) that HOLDS several
+    /// tensors — gemma-4's router alone is a projection, a per-expert scale, and a norm gain.
+    /// The source a tape operand binds must name BOTH the bundle (`id`, `index`, exactly as
+    /// [`SourceBinding::Weight`] names a single-tensor weight) and WHICH tensor inside it
+    /// (`tensor`). Suffixing the path instead would mint a phantom accessor the load walk never
+    /// declared, exactly the two-producers-disagree shape this file exists to prevent.
+    ///
+    /// The `tensor` vocabulary is the SHARED one — the subset of a bundle's tensors that more
+    /// than one target binds ([`BundleTensor`]). A target-only tensor stays the target's own
+    /// fact (metal's `WeightTensor` is its superset, with shared-expert and GDN arms); nothing
+    /// here may name a tensor only one target reads.
+    BundleTensor {
+        id: u32,
+        index: Option<UnrollIndex>,
+        tensor: BundleTensor,
     },
     /// The embedded hidden-state row the runtime gathers from
     /// `embed_tokens[input_id]` before the kernel — embed is a cheap
