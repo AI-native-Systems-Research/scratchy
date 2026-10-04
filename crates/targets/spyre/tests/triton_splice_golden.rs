@@ -110,6 +110,47 @@ fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
             );
             assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} c={c})");
         }
+
+        // 4. THE PRODUCTION HOOK, not the direct call. This test file compiles with
+        //    `spyre-triton` enabled (the CI job's feature set), so `lower_graph_to_ktir`
+        //    — the same entry the `#[forward]` walk uses — routes the node through
+        //    `lower_one_node`'s splice hook BEFORE the builder arm. The graph-level
+        //    call must produce EXACTLY the splice's own `EmittedOp` (same op_name,
+        //    byte-identical descriptors through the door), which covers the hook
+        //    itself: what it computes before the splice, the `Ok(None)`/`Err` mapping
+        //    into `Ops`/`Unhandled`, and its order relative to the builder's own
+        //    pre-match rewrites (the lm-head fold guard reads `rows_are_requests`
+        //    before the hook fires).
+        let (hook_ops, _) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
+            .unwrap_or_else(|e| panic!("graph lowered through the hook (m={m} c={c}): {e}"));
+        let [hooked] = &hook_ops[..] else {
+            panic!(
+                "one rmsnorm node lowers to one op through the hook, got {}",
+                hook_ops.len()
+            )
+        };
+        assert_eq!(
+            hooked.op_name, spliced.op_name,
+            "the graph-level hook must name the splice's own op (m={m} c={c})"
+        );
+        let mut sym = 0i64;
+        let mut quantized = HashSet::new();
+        let hook_emitted = door_lower(
+            hooked.ktir.as_ref().expect("hooked op carries its program"),
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("hooked program lowered (m={m} c={c}): {}", e.message));
+        for (h, s) in hook_emitted.iter().zip(spliced_emitted.iter()) {
+            let hj = serde_json::to_string(h.dsc()).unwrap();
+            let sj = serde_json::to_string(s.dsc()).unwrap();
+            assert_eq!(
+                hj, sj,
+                "descriptor bytes (m={m} c={c}): the production hook diverged from the splice"
+            );
+        }
     }
 }
 
