@@ -31,7 +31,9 @@ mod hf_registry_build;
 /// own crate, so `crate::__gpu` / `crate::<Model>` meant "this arch's root").
 /// In the consolidated crate every arch lives under `pub mod <mod>`, so rewrite
 /// every path-root `crate ::` → `crate :: <mod> ::`. Leaves `pub(crate)` (a
-/// `crate` not followed by `::`) and absolute `::foo` paths untouched.
+/// `crate` not followed by `::`), absolute `::foo` paths and `crate::__metal_bake`
+/// — the one module every arch shares, at the crate root (`write_metal_bake`) —
+/// untouched.
 fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
     let mut out: Vec<TokenTree> = Vec::new();
     let mut it = ts.into_iter().peekable();
@@ -49,9 +51,13 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
                 if is_path {
                     out.push(it.next().unwrap()); // ':'
                     out.push(it.next().unwrap()); // ':'
-                    out.push(TokenTree::Ident(Ident::new(mod_name, Span::call_site())));
-                    out.push(TokenTree::Punct(Punct::new(':', Spacing::Joint)));
-                    out.push(TokenTree::Punct(Punct::new(':', Spacing::Alone)));
+                    let shared =
+                        matches!(it.peek(), Some(TokenTree::Ident(id)) if id == "__metal_bake");
+                    if !shared {
+                        out.push(TokenTree::Ident(Ident::new(mod_name, Span::call_site())));
+                        out.push(TokenTree::Punct(Punct::new(':', Spacing::Joint)));
+                        out.push(TokenTree::Punct(Punct::new(':', Spacing::Alone)));
+                    }
                 }
             }
             other => out.push(other),
@@ -134,11 +140,7 @@ fn write_hf_registry_file(out_dir: &Path, ids: &BTreeSet<String>) {
          pub static COMPILED_HF_REGISTRY: &[&str] = &[{}];\n",
         lits.join(", ")
     );
-    let out = out_dir.join("hf_registry.rs");
-    let unchanged = std::fs::read_to_string(&out).is_ok_and(|old| old == rendered);
-    if !unchanged {
-        std::fs::write(&out, rendered).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
-    }
+    write_if_changed(&out_dir.join("hf_registry.rs"), &rendered);
 }
 
 /// Emit one arch: parse its DSL carrier (`dsl/<arch>.py`), run the pipeline
@@ -166,12 +168,28 @@ fn emit_arch(dsl_path: &Path, configs_dir: &Path, out_dir: &Path, mod_name: &str
 
     let mut rendered = String::with_capacity(1 << 20);
     render_tokens(tokens, &mut rendered);
-    let out = out_dir.join(format!("{mod_name}.rs"));
-    // Write only when the emit changed, so a build-script rerun with identical
-    // output doesn't bump the file mtime and force rustc to recompile the crate.
-    let unchanged = std::fs::read_to_string(&out).is_ok_and(|old| old == rendered);
+    write_if_changed(&out_dir.join(format!("{mod_name}.rs")), &rendered);
+}
+
+/// Write `$OUT_DIR/metal_bake.rs`: the crate-root `__metal_bake` module (`src/lib.rs`) the
+/// emitted models' baked kernels resolve in — every kernel the arches named, baked once. Runs
+/// after every arch is emitted.
+#[cfg(feature = "metal")]
+fn write_metal_bake(out_dir: &Path) {
+    let mut rendered = String::with_capacity(1 << 20);
+    render_tokens(
+        scratchy_forward_compiler_macro::metal_bake_module(),
+        &mut rendered,
+    );
+    write_if_changed(&out_dir.join("metal_bake.rs"), &rendered);
+}
+
+/// Write `text` to `out` only when it changed, so a build-script rerun with identical output
+/// doesn't bump the file's mtime and force rustc to recompile the crate.
+fn write_if_changed(out: &Path, text: &str) {
+    let unchanged = std::fs::read_to_string(out).is_ok_and(|old| old == text);
     if !unchanged {
-        std::fs::write(&out, rendered).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
+        std::fs::write(out, text).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
     }
 }
 
@@ -299,6 +317,8 @@ fn main() {
         .for_each(|(dsl_path, mod_name, configs_dir)| {
             emit_arch(dsl_path, configs_dir, &out_dir, mod_name);
         });
+    #[cfg(feature = "metal")]
+    write_metal_bake(&out_dir);
 
     // Shell-completion registry. Resolving it needs the network, so it happens
     // only under `hf-completions`; WRITING it is unconditional, because

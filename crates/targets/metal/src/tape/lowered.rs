@@ -1954,9 +1954,32 @@ pub struct ClassedTape {
     /// the tape has no TurboQuant decode attention (it serves every device alike).
     pub tq_heads: Option<TqDecodeHeads>,
     pub tape: LoweredMetalTape,
-    /// Every kernel of a baked library ([`crate::aot::baked_library`]) the tape's commands name,
-    /// compiled with their constants.
-    pub kernels: &'static [&'static BakedKernel],
+}
+
+impl ClassedTape {
+    /// The rung `(gen_class, addressing, cap, tq_heads)` of `body`, the tape its rungs share, with
+    /// the roped-K and unfused-attention scratch bytes its cap sizes.
+    pub const fn rung(
+        body: LoweredMetalTape,
+        gen_class: GenClass,
+        addressing: KvAddressing,
+        cap: MaxBlocksPerSeq,
+        tq_heads: Option<TqDecodeHeads>,
+        [roped_k_scratch_bytes, attn_unfused_scratch_bytes]: [u32; 2],
+    ) -> Self {
+        let tape = LoweredMetalTape {
+            roped_k_scratch_bytes,
+            attn_unfused_scratch_bytes,
+            ..body
+        };
+        Self {
+            gen_class,
+            addressing,
+            cap,
+            tq_heads,
+            tape,
+        }
+    }
 }
 
 /// A kernel compiled at expansion with a command's constants as `constexpr`s
@@ -1967,5 +1990,8 @@ pub struct BakedKernel {
     pub library: &'static str,
     pub function: &'static str,
     pub constants: &'static [ConstantValue],
+    /// The metallib of the bake compile that holds the kernel, with the rest of its batch.
     pub metallib: &'static [u8],
+    /// The kernel's function in `metallib`.
+    pub entry: &'static str,
 }

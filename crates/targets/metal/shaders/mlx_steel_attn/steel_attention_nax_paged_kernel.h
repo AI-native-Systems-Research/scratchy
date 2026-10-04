@@ -69,8 +69,9 @@
 // Gate: NAX hardware only (M5+/Apple9). The dispatcher selects this
 // kernel iff `is_nax_capable(profile.generation)` — same gate the NAX
 // qmm uses.
-
-#pragma once
+//
+// No include guard: it declares the bake's per-kernel constants, so each kernel of a bake batch
+// re-reads it in its own namespace (`baked.h`).
 
 #include <metal_stdlib>
 

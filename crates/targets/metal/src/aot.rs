@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! AOT-compile MSL source to a `.metallib` blob via `xcrun metal -c`
-//! and `xcrun metallib`. Shared by `scratchy-forward-compiler-macro` (proc-macro
-//! expansion baking) and `scratchy-cost-sweep-metal` (benchmark of
-//! the synthesized kernels) — and THE BAKE: every kernel of a shader that includes `baked.h`
-//! compiled once per constant set a command carries, its constants compiled in ([`bake`]).
+//! THE BAKE: every kernel of a shader that includes `baked.h`, compiled once per constant set a
+//! command carries, its constants compiled in ([`bake`]) — `xcrun metal -c` then
+//! `xcrun metallib`, the flow `scratchy-target-metal/build.rs` compiles the standard shaders with.
 //!
-//! Same flow as `scratchy-target-metal/build.rs`.
-//!
-//! Panics on `xcrun` failure — synth compile errors are build errors
-//! that need to surface, not runtime soft-fail.
+//! Panics on `xcrun` failure — a bake compile error is a build error that needs to surface, not a
+//! runtime soft-fail.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,6 +21,7 @@ use crate::specialized_pipeline_cache::{
     SpecializedPipelineCache,
 };
 use crate::stream::MetalStreamError;
+use crate::tape::constants::{TapeVariant, UnboundConstant};
 use crate::tape::lowered::{
     BakedKernel, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, baked,
 };
@@ -37,109 +35,94 @@ pub struct BakedLibrary {
 
 include!(concat!(env!("OUT_DIR"), "/baked_shaders_generated.rs"));
 
-/// Per-call sequence so concurrent compiles of the SAME synth symbol get
-/// distinct temp dirs. Many arches/models share synth kernels, and the
-/// consolidated `scratchy-models` build script runs this from a rayon fan-out,
-/// so `std::process::id()` is identical across the racing threads — without a
-/// unique suffix they clobber each other's `.metal`/`.air` files (and one
-/// thread's cleanup deletes another's dir mid-compile).
-static SYNTH_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Per-call sequence, so concurrent compiles in one process (the build script's rayon fan-out
+/// shares one `std::process::id()`) get distinct temp dirs and never clobber or delete each other's
+/// files.
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Compile `source` (written as `<symbol>.metal`, beside `sources` — the files it includes, by
-/// relative path) to a metallib.
-pub fn aot_compile_metallib(symbol: &str, source: &str, sources: &[(&str, &str)]) -> Vec<u8> {
-    compile_metallib(symbol, source, sources, &[])
+/// FNV-1a over `parts`, each closed by a separator so `["ab", "c"]` and `["a", "bc"]` differ.
+fn fnv<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u64 {
+    parts.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, part| {
+        let h = (part.iter()).fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        (h ^ 0xff).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
-/// [`aot_compile_metallib`] with `flags` added to the MSL compile.
-fn compile_metallib(
-    symbol: &str,
-    source: &str,
-    sources: &[(&str, &str)],
-    flags: &[&str],
-) -> Vec<u8> {
-    // Skip on non-macOS hosts (no `xcrun`). The synth metallibs are
-    // only ever consumed by the metal backend.
+/// The hash of every [`BAKED_SOURCES`] file, path and text.
+fn sources_hash() -> u64 {
+    static HASH: OnceLock<u64> = OnceLock::new();
+    *HASH.get_or_init(|| {
+        fnv(BAKED_SOURCES
+            .iter()
+            .flat_map(|(p, t)| [p.as_bytes(), t.as_bytes()]))
+    })
+}
+
+/// Every [`BAKED_SOURCES`] file at its path, written once per process — under the build's
+/// `OUT_DIR` in a build, else the temp dir — and named by their [`sources_hash`]: every bake
+/// compile includes from it.
+fn baked_sources() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let root = std::env::var_os("OUT_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let dir = root.join(format!("metal-bake/src-{:016x}", sources_hash()));
+        if !dir.exists() {
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.with_extension(format!("{}.{seq}.tmp", std::process::id()));
+            for (path, text) in BAKED_SOURCES {
+                let path = tmp.join(path);
+                std::fs::create_dir_all(path.parent().expect("a source's dir"))
+                    .and_then(|()| std::fs::write(&path, text))
+                    .unwrap_or_else(|e| panic!("bake: write {}: {e}", path.display()));
+            }
+            // Another process may have put its copy — the same files — in place first.
+            if std::fs::rename(&tmp, &dir).is_err() {
+                let _ = std::fs::remove_dir_all(&tmp);
+            }
+        }
+        dir
+    })
+}
+
+/// Compile `source` — including from [`baked_sources`] — with `flags` to a metallib; empty on a
+/// host with no Metal toolchain (only the metal backend reads it).
+fn compile_metallib(name: &str, source: &str, flags: &[&str]) -> Vec<u8> {
     let host_os =
         std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| std::env::consts::OS.to_string());
     if host_os != "macos" {
         return Vec::new();
     }
-
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "scratchy-synth-{}-{}-{}",
-        symbol,
-        std::process::id(),
-        SYNTH_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp_dir = std::env::temp_dir().join(format!("scratchy-bake-{name}-{pid}-{seq}"));
     std::fs::create_dir_all(&tmp_dir)
-        .unwrap_or_else(|e| panic!("synth: create tmp dir {tmp_dir:?}: {e}"));
-
-    let metal_path = tmp_dir.join(format!("{symbol}.metal"));
-    // Only the final artifact needs an absolute path (it is read back
-    // below). The compiler steps run with `tmp_dir` as their working
-    // directory and take BARE filenames, so no build-specific path can
-    // reach the emitted bytes — see the flag comment below.
-    let metallib_path = tmp_dir.join(format!("{symbol}.metallib"));
-
-    let main = format!("{symbol}.metal");
-    for (path, text) in sources.iter().copied().chain([(main.as_str(), source)]) {
-        let path = tmp_dir.join(path);
-        std::fs::create_dir_all(path.parent().unwrap())
-            .and_then(|()| std::fs::write(&path, text))
-            .unwrap_or_else(|e| panic!("synth: write {path:?}: {e}"));
-    }
-
-    // Run the compiler INSIDE `tmp_dir` and hand it BARE filenames.
-    // `-frecord-sources` bakes the source path it was given into the
-    // blob's DEPF section, so an absolute path here puts this build's
-    // PID and sequence number inside the emitted `&[u8]` — two
-    // identical builds then differ by five lines and metal emission is
-    // not byte-reproducible, which voids any bit-equality gate over the
-    // generated code. Relative names record as `<symbol>.metal`.
-    // The directory stays PID+seq unique: that is what keeps concurrent
-    // compiles of the same symbol from clobbering each other, and it no
-    // longer leaks into the output.
-    let status = Command::new("xcrun")
-        .current_dir(&tmp_dir)
-        .args([
-            "-sdk", "macosx", "metal", "-O3",
-            // NO `-frecord-sources`. It attaches a source archive whose
-            // SARC section records the compiler's WORKING DIRECTORY —
-            // this build's PID-and-sequence temp dir — directly inside
-            // the emitted `&[u8]`. Two identical builds then produce
-            // different generated code, which voids any bit-equality
-            // gate over metal emission. Dropping it
-            // also shrinks each synth blob ~4x (13,976 -> 3,479 bytes
-            // measured on a trivial kernel).
-            //
-            "-c",
-        ])
-        .args(flags)
-        .arg(format!("{symbol}.metal"))
-        .arg("-o")
-        .arg(format!("{symbol}.air"))
-        .status()
-        .unwrap_or_else(|e| panic!("synth: spawn xcrun metal: {e}"));
-    if !status.success() {
-        panic!("synth: `xcrun metal` failed for `{symbol}` (source at {metal_path:?})");
-    }
-
-    let status = Command::new("xcrun")
-        .current_dir(&tmp_dir)
-        .args(["-sdk", "macosx", "metallib"])
-        .arg(format!("{symbol}.air"))
-        .arg("-o")
-        .arg(format!("{symbol}.metallib"))
-        .status()
-        .unwrap_or_else(|e| panic!("synth: spawn xcrun metallib: {e}"));
-    if !status.success() {
-        panic!("synth: `xcrun metallib` failed for `{symbol}`");
-    }
-
-    let bytes = std::fs::read(&metallib_path)
-        .unwrap_or_else(|e| panic!("synth: read {metallib_path:?}: {e}"));
-
+        .and_then(|()| std::fs::write(tmp_dir.join(format!("{name}.metal")), source))
+        .unwrap_or_else(|e| panic!("bake: write {}: {e}", tmp_dir.display()));
+    // The compiler runs INSIDE `tmp_dir` on BARE file names and without `-frecord-sources`, whose
+    // source archive records the working directory: no build-specific path reaches the bytes, so
+    // identical inputs bake identical metallibs.
+    let run = |tool: &str, args: &[&str]| {
+        let status = Command::new("xcrun")
+            .current_dir(&tmp_dir)
+            .args(["-sdk", "macosx", tool])
+            .args(args)
+            .status()
+            .unwrap_or_else(|e| panic!("bake: spawn xcrun {tool}: {e}"));
+        assert!(
+            status.success(),
+            "bake: `xcrun {tool}` failed for `{name}` (in {tmp_dir:?})"
+        );
+    };
+    let include = baked_sources().to_str().expect("a UTF-8 bake source dir");
+    let (src, air) = (format!("{name}.metal"), format!("{name}.air"));
+    let lib = format!("{name}.metallib");
+    let mut args = vec!["-O3", "-c", "-I", include];
+    args.extend(flags);
+    args.extend([src.as_str(), "-o", air.as_str()]);
+    run("metal", &args);
+    run("metallib", &[air.as_str(), "-o", lib.as_str()]);
+    let bytes = std::fs::read(tmp_dir.join(&lib))
+        .unwrap_or_else(|e| panic!("bake: read {}: {e}", tmp_dir.join(&lib).display()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     bytes
 }
@@ -150,51 +133,192 @@ pub fn baked_library(library: &str) -> Option<&'static BakedLibrary> {
     BAKED_LIBRARIES.iter().find(|l| l.name == library)
 }
 
-/// The key [`bake`] compiles `cmd`'s kernel under at activation `dtype`, when its library is baked.
-pub fn bake_key(cmd: &LoweredCommand, dtype: MetalDtype) -> Option<PipelineKey> {
+/// The key [`bake`] compiles `cmd`'s kernel under for tape `variant` at activation `dtype`, when its
+/// library is baked: its variant-bound constants take the variant's values.
+pub fn bake_key(
+    cmd: &LoweredCommand,
+    dtype: MetalDtype,
+    variant: TapeVariant,
+) -> Result<Option<PipelineKey>, UnboundConstant> {
     let key = match (cmd.kernel, cmd.gemm_dims) {
-        (KernelId::Gemm, Some(dims)) => gemm_pipeline(dtype, dims).ok()?.0,
-        _ => PipelineKey::new(cmd.library, cmd.function, cmd.constants.to_vec()),
+        (KernelId::Gemm, Some(dims)) => match gemm_pipeline(dtype, dims) {
+            Ok((key, _)) => key,
+            Err(_) => return Ok(None),
+        },
+        _ => {
+            let constants = cmd.constants.iter().map(|c| c.resolve(variant));
+            let constants = constants.collect::<Result<Vec<_>, _>>()?;
+            PipelineKey::new(cmd.library, cmd.function, constants)
+        }
     };
-    baked_library(key.library_name).map(|_| key)
+    Ok(baked_library(key.library_name).map(|_| key))
+}
+
+/// One kernel [`bake`] compiled: the metallib holding it — its batch's — and its name there.
+#[derive(Clone)]
+pub struct BakedEntry {
+    pub metallib: Arc<[u8]>,
+    pub entry: String,
 }
 
 /// What one [`bake`] compiled.
 pub struct Bake {
-    /// One metallib per key, in order.
-    pub metallibs: Vec<Arc<[u8]>>,
-    /// The keys this call compiled; an earlier call in this process had the rest.
+    /// Each key's kernel, in order.
+    pub kernels: Vec<BakedEntry>,
+    /// The compiles this call ran; an earlier call in this process ran the rest of its batches.
     pub compiled: usize,
 }
 
+/// Kernels one bake compile holds at most. A compile starts the compiler and reads the shader's
+/// headers once for all of its kernels — a kernel alone costs ~40 ms, one of a batch a few — and a
+/// library's batches still spread over the cores.
+const BATCH: usize = 32;
+
 /// Compile the kernel each of `keys` names — `function` of a baked library, with the key's
-/// constants as `constexpr`s (`shaders/baked.h`) — once per distinct key in this process, the
-/// misses in parallel.
+/// constants as `constexpr`s (`shaders/baked.h`). One compile per batch: up to [`BATCH`] kernels
+/// of one library, in the order of their constants, each in its own namespace. The batches are a
+/// function of the key set alone, so the same keys bake the same metallibs; they compile in
+/// parallel, each once per process.
 pub fn bake(keys: &[PipelineKey]) -> Bake {
     type Cell = Arc<OnceLock<Arc<[u8]>>>;
-    static BAKED: OnceLock<Mutex<HashMap<PipelineKey, Cell>>> = OnceLock::new();
-    let cells: Vec<Cell> = {
-        let mut baked = BAKED.get_or_init(Mutex::default).lock().unwrap();
-        keys.iter()
-            .map(|k| baked.entry(k.clone()).or_default().clone())
-            .collect()
-    };
+    static BAKED: OnceLock<Mutex<HashMap<u64, Cell>>> = OnceLock::new();
+    let mut order: Vec<(&PipelineKey, Macros)> = keys.iter().map(|k| (k, macros(k))).collect();
+    order.sort_by(|(a, x), (b, y)| (a.library_name, x).cmp(&(b.library_name, y)));
+    order.dedup_by(|(a, x), (b, y)| (a.library_name, &*x) == (b.library_name, &*y));
+    let runs = order.chunk_by(|(a, _), (b, _)| a.library_name == b.library_name);
+    let batches: Vec<&[(&PipelineKey, Macros)]> = runs.flat_map(|r| r.chunks(BATCH)).collect();
     let compiled = AtomicUsize::new(0);
-    let metallibs = keys
-        .par_iter()
-        .zip(&cells)
-        .map(|(key, cell)| {
-            let bytes = cell.get_or_init(|| {
+    let baked: Vec<Vec<(&PipelineKey, BakedEntry)>> = (batches.par_iter())
+        .map(|batch| {
+            let library = batch[0].0.library_name;
+            let lib =
+                baked_library(library).unwrap_or_else(|| panic!("bake: `{library}` is not baked"));
+            let source = batch_source(library, batch);
+            let mut flags = vec!["-Wno-modules-import-nested-redundant"];
+            flags.extend(MPP_FLAGS.iter().copied().filter(|_| lib.mpp));
+            let inputs = [toolchain(), &source, &format!("{:016x}", sources_hash())];
+            let hash = fnv(inputs
+                .into_iter()
+                .chain(flags.iter().copied())
+                .map(str::as_bytes));
+            let cell = (BAKED.get_or_init(Mutex::default).lock().unwrap())
+                .entry(hash)
+                .or_default()
+                .clone();
+            let metallib = cell.get_or_init(|| {
                 compiled.fetch_add(1, Ordering::Relaxed);
-                compile_baked(key).into()
+                kept_compile(hash, library, &source, &flags).into()
             });
-            bytes.clone()
+            let entries = batch.iter().enumerate().map(|(i, (key, _))| {
+                let entry = format!("k{i}::{}", key.kernel_name);
+                let named = metallib.windows(entry.len()).any(|w| w == entry.as_bytes());
+                assert!(
+                    named || metallib.is_empty(),
+                    "bake: no instantiation of `{library}.metal` is named `{entry}`"
+                );
+                let metallib = metallib.clone();
+                (*key, BakedEntry { metallib, entry })
+            });
+            entries.collect()
         })
         .collect();
+    let by_key: HashMap<&PipelineKey, BakedEntry> = baked.into_iter().flatten().collect();
     Bake {
-        metallibs,
+        kernels: keys.iter().map(|k| by_key[k].clone()).collect(),
         compiled: compiled.into_inner(),
     }
+}
+
+/// The macros `baked.h` reads for one kernel, by name: each of its constants' value and set flag,
+/// and the kernel's own flag.
+type Macros = Vec<(String, String)>;
+
+/// `key`'s [`Macros`].
+fn macros(key: &PipelineKey) -> Macros {
+    let set = || "~, 1".to_owned();
+    let constants = key.constants.iter().flat_map(|c| {
+        let slot = c.index;
+        [
+            (format!("SCRATCHY_CONSTANT_{slot}"), msl_literal(c)),
+            (format!("SCRATCHY_SET_{slot}"), set()),
+        ]
+    });
+    let kernel = (format!("SCRATCHY_KERNEL_{}", key.kernel_name), set());
+    constants.chain([kernel]).collect()
+}
+
+/// One bake compile of `library`'s kernels `batch`: the guarded headers its shader reaches, once,
+/// then per kernel `i` its macros defined around the shader, included in namespace `k<i>`.
+fn batch_source(library: &str, batch: &[(&PipelineKey, Macros)]) -> String {
+    let mut source: String = guarded_headers(library)
+        .iter()
+        .map(|h| format!("#include {h}\n"))
+        .collect();
+    for (i, (_, macros)) in batch.iter().enumerate() {
+        let ns = ("SCRATCHY_NS".to_owned(), format!("k{i}"));
+        let macros = || macros.iter().chain([&ns]);
+        source.extend(macros().map(|(name, value)| format!("#define {name} {value}\n")));
+        source += &format!("namespace SCRATCHY_NS {{\n#include \"{library}.metal\"\n}}\n");
+        source.extend(macros().map(|(name, _)| format!("#undef {name}\n")));
+    }
+    source
+}
+
+/// The `#pragma once` headers `library`'s shader reaches through its includes, in the order a
+/// compile first reads them. A batch includes them ahead of its kernels, so each kernel's namespace
+/// re-reads only the shader and the unguarded headers that declare its constants (`baked.h`).
+fn guarded_headers(library: &str) -> Vec<String> {
+    let text = |path: &str| {
+        BAKED_SOURCES
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, t)| *t)
+    };
+    fn walk(
+        text: &dyn Fn(&str) -> Option<&'static str>,
+        path: &str,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        let dir = Path::new(path).parent().unwrap_or(Path::new(""));
+        let includes = text(path).into_iter().flat_map(str::lines);
+        for inc in includes.filter_map(|l| l.trim_start().strip_prefix("#include")) {
+            let inc = inc.trim();
+            if let Some(system) = inc.strip_prefix('<') {
+                let header = format!("<{}>", system.split('>').next().unwrap_or_default());
+                if seen.insert(header.clone()) {
+                    out.push(header);
+                }
+                continue;
+            }
+            let name = inc
+                .trim_start_matches('"')
+                .split('"')
+                .next()
+                .unwrap_or_default();
+            let beside = dir.join(name).to_string_lossy().into_owned();
+            let path = if text(&beside).is_some() {
+                beside
+            } else {
+                name.to_owned()
+            };
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            walk(text, &path, seen, out);
+            if text(&path).is_some_and(|t| t.contains("#pragma once")) {
+                out.push(format!("\"{path}\""));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        &text,
+        &format!("{library}.metal"),
+        &mut Default::default(),
+        &mut out,
+    );
+    out
 }
 
 /// `keys`' kernels, baked, as the statics a baked tape holds
@@ -202,31 +326,36 @@ pub fn bake(keys: &[PipelineKey]) -> Bake {
 /// dispatched outside the macro (kernel tests).
 pub fn baked_kernels(keys: &[PipelineKey]) -> Vec<BakedKernel> {
     let bake = bake(keys);
-    let kernels = keys.iter().zip(bake.metallibs);
+    let kernels = keys.iter().zip(bake.kernels);
     kernels
-        .map(|(key, metallib)| BakedKernel {
+        .map(|(key, kernel)| BakedKernel {
             library: key.library_name,
             function: key.kernel_name,
             constants: baked(key.constants.clone()),
-            metallib: baked(metallib.to_vec()),
+            metallib: baked(kernel.metallib.to_vec()),
+            entry: Box::leak(kernel.entry.into_boxed_str()),
         })
         .collect()
 }
 
-/// The standard shaders and every baked kernel `tapes` name at `dtype`, as the pool registers a
-/// model's — for tapes lowered outside the macro (tests).
+/// The standard shaders and every baked kernel `tapes` name at `dtype` for tape `variant`, as the
+/// pool registers a model's — for tapes lowered outside the macro (tests).
 pub fn tape_pipelines(
     device: &Device,
     tapes: &[LoweredMetalTape],
     dtype: MetalDtype,
+    variant: TapeVariant,
 ) -> Result<SpecializedPipelines, MetalStreamError> {
     let commands = tapes.iter().flat_map(|t| t.commands.iter());
-    let keys: Vec<_> = commands
-        .filter_map(|c| bake_key(&c.command, dtype))
+    let keys = commands.map(|c| bake_key(&c.command, dtype, variant));
+    let keys: Vec<_> = (keys.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| MetalStreamError::ShaderCompilationFailed(e.to_string()))?
+        .into_iter()
+        .flatten()
         .collect();
     let cache = SpecializedPipelineCache::new(device.clone(), &[])?;
-    cache.register_baked(&baked_kernels(&keys))?;
-    Ok(SpecializedPipelines::new(Arc::new(cache)))
+    cache.register_baked(&baked_kernels(&keys));
+    Ok(SpecializedPipelines::new(Arc::new(cache), variant))
 }
 
 /// `key`'s pipeline from `cache`, its kernel baked first — for kernel tests that build several
@@ -236,7 +365,7 @@ pub fn baked_build(
     key: &PipelineKey,
 ) -> Result<ComputePipelineState, MetalStreamError> {
     if baked_library(key.library_name).is_some() {
-        cache.register_baked(&baked_kernels(std::slice::from_ref(key)))?;
+        cache.register_baked(&baked_kernels(std::slice::from_ref(key)));
     }
     cache.get_or_build(key)
 }
@@ -286,57 +415,26 @@ fn toolchain() -> &'static str {
     })
 }
 
-/// `key`'s kernel, compiled alone with its constants defined, with the flags `build.rs` compiles
-/// its shader with.
-fn compile_baked(key: &PipelineKey) -> Vec<u8> {
-    let (library, function) = (key.library_name, key.kernel_name);
-    let lib = baked_library(library).unwrap_or_else(|| panic!("bake: `{library}` is not baked"));
-    let mut main = String::new();
-    for c in &key.constants {
-        let (slot, literal) = (c.index, msl_literal(c));
-        main += &format!(
-            "#define SCRATCHY_CONSTANT_{slot} {literal}\n#define SCRATCHY_SET_{slot} ~, 1\n"
-        );
-    }
-    main += &format!("#define SCRATCHY_KERNEL_{function} ~, 1\n#include \"{library}.metal\"\n");
-    let mut flags = vec!["-I", "."];
-    flags.extend(MPP_FLAGS.iter().copied().filter(|_| lib.mpp));
-    // In a build (`OUT_DIR`), the compile is kept beside the build's other outputs, keyed by
-    // every input of it — the Metal toolchain, its source, flags and every file it can include —
-    // so a re-expansion that changed none of them reads it back instead of compiling it again.
-    let kept = std::env::var_os("OUT_DIR").map(|out| {
-        let inputs = [toolchain(), main.as_str()]
-            .into_iter()
-            .chain(flags.iter().copied());
-        let inputs = inputs.chain(BAKED_SOURCES.iter().flat_map(|(path, text)| [*path, *text]));
-        let hash = inputs.fold(0xcbf2_9ce4_8422_2325u64, |h, s| {
-            let h = s
-                .bytes()
-                .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-            (h ^ 0xff).wrapping_mul(0x0100_0000_01b3)
-        });
-        std::path::Path::new(&out).join(format!("metal-bake/key-{hash:016x}.metallib"))
-    });
+/// The compile of `source` with `flags`, whose inputs hash to `hash`. In a build (`OUT_DIR`) it is
+/// kept beside the build's other outputs under that hash — of every input: the Metal toolchain,
+/// the source, its flags and every file it can include — so a re-expansion that changed none of
+/// them reads it back instead of compiling it again.
+fn kept_compile(hash: u64, library: &str, source: &str, flags: &[&str]) -> Vec<u8> {
+    let kept = std::env::var_os("OUT_DIR")
+        .map(|out| Path::new(&out).join(format!("metal-bake/batch-{hash:016x}.metallib")));
     if let Some(bytes) = kept.as_ref().and_then(|path| std::fs::read(path).ok()) {
         return bytes;
     }
-    let symbol = format!("{library}.{function}");
-    let bytes = compile_metallib(&symbol, &main, BAKED_SOURCES, &flags);
+    // Not `<library>.metal`: the source includes that file, and would find itself first.
+    let bytes = compile_metallib(&format!("{library}-batch"), source, flags);
     if let Some(path) = kept {
-        let seq = SYNTH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
         std::fs::create_dir_all(path.parent().expect("metal-bake dir"))
             .and_then(|()| std::fs::write(&tmp, &bytes))
             .and_then(|()| std::fs::rename(&tmp, &path))
             .unwrap_or_else(|e| panic!("bake: keep {}: {e}", path.display()));
     }
-    let named = bytes
-        .windows(function.len())
-        .any(|w| w == function.as_bytes());
-    assert!(
-        named || bytes.is_empty(),
-        "bake: no instantiation of `{library}.metal` is named `{function}`"
-    );
     bytes
 }
 
@@ -352,5 +450,9 @@ fn msl_literal(c: &ConstantValue) -> String {
             format!("({f:e}f)")
         }
         ConstantType::Bool => (c.bits != 0).to_string(),
+        ConstantType::KvCap | ConstantType::TqHeads => panic!(
+            "bake: constant slot {} is bound to its tape variant; `bake_key` resolves it",
+            c.index
+        ),
     }
 }

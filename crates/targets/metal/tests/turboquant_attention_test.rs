@@ -534,9 +534,7 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         };
         PipelineKey::new("turboquant", c.dtype.compress(), constants.into())
     });
-    cache
-        .register_baked(&baked_kernels(&compress))
-        .expect("bake tq_compress_paged");
+    cache.register_baked(&baked_kernels(&compress));
     let pso = |lib: &'static str, name: String, consts: Vec<ConstantValue>| {
         let name: &'static str = Box::leak(name.into_boxed_str());
         baked_build(&cache, &PipelineKey::new(lib, name, consts)).expect("pipeline")

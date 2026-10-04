@@ -30,6 +30,7 @@ use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape, Weight
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
+use crate::tape::constants::TapeVariant;
 use crate::tape::ids::SourceIx;
 use crate::tape::lowered::ModelSources;
 #[cfg(feature = "forward-telemetry")]
@@ -835,16 +836,14 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 } else {
                     tg_scaled
                 };
-                // RopeOnce{Steel,Nax,GqaShared}: the pre-roped-K scratch is sized to
-                // MAX_BLOCKS_PER_SEQ logical blocks (lowering), and the steel/gqa
-                // attention reads the WHOLE sequence's roped K (computed prefix +
-                // new). The baked grid M-scales by num_tokens (the NEW tokens only)
-                // — too few for a chunked-prefill CONTINUATION, leaving the prefix
-                // blocks past one bucket un-roped → garbage K → `!!!!` past 4096
-                // tokens. Override grid.y to the live block-table width
-                // (`tq_dequant_max_blocks`, == kv_len/block_size), capped at the
-                // baked num_pages (the scratch's block capacity). Mirrors the
-                // TqStageRotated grid override above.
+                // RopeOnce{Steel,Nax,GqaShared}: the pre-roped-K scratch holds the KV cap rung's
+                // logical blocks (lowering), and the steel/gqa attention reads the WHOLE
+                // sequence's roped K (computed prefix + new). The baked grid M-scales by
+                // num_tokens (the NEW tokens only) — too few for a chunked-prefill CONTINUATION,
+                // leaving the prefix blocks past one bucket un-roped → garbage K → `!!!!` past
+                // 4096 tokens. Override grid.y to the step's block-table width
+                // (`tq_dequant_max_blocks`), which is the rung's cap: the scratch holds it.
+                // Mirrors the TqStageRotated grid override above.
                 let tg_scaled = if matches!(
                     step.kernel,
                     super::lowered::KernelId::RopeOnceSteel
@@ -855,11 +854,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         .tq_dequant_max_blocks
                         .load(std::sync::atomic::Ordering::Relaxed)
                         as usize;
-                    let cap = tg.height; // baked num_pages = MAX_BLOCKS_PER_SEQ
                     let cover = if runtime_mb == 0 {
-                        cap
+                        tg.height
                     } else {
-                        runtime_mb.min(cap)
+                        runtime_mb
                     };
                     MTLSize {
                         width: tg_scaled.width,
@@ -1118,7 +1116,7 @@ fn bake_bucket<W: CanonicalParams>(
         )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
-        let (tg, tpt) = mtl_size_pair(cmd);
+        let (tg, tpt) = mtl_size_pair(cmd, pipelines.variant());
 
         // Coalesce with the previous step iff (a) it's an dispatch step
         // (a Gemm step forces an encoder boundary) and (b) its
@@ -1535,10 +1533,16 @@ fn scale_tg_for_num_tokens(
     tg
 }
 
-fn mtl_size_pair(cmd: &LoweredCommand) -> (MTLSize, MTLSize) {
+fn mtl_size_pair(cmd: &LoweredCommand, variant: TapeVariant) -> (MTLSize, MTLSize) {
+    // A TurboQuant decode threadgroup serves the variant's query heads (`ConstantType::TqHeads`):
+    // its threadgroups count heads. Its pipeline lookup refuses a variant without them.
+    let heads = match (cmd.kernel, variant.tq_heads) {
+        (KernelId::AttentionViaCacheTq, Some(h)) => h.get(),
+        _ => 1,
+    };
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as usize,
-        height: cmd.dispatch.threadgroups.1 as usize,
+        height: (cmd.dispatch.threadgroups.1 / heads) as usize,
         depth: cmd.dispatch.threadgroups.2 as usize,
     };
     let tpt = MTLSize {
@@ -1571,6 +1575,46 @@ mod tests {
     use scratchy_layers::{Linear, LinearLayer, RmsNorm};
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::Arc;
+
+    /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
+    const TEST_VARIANT: TapeVariant = TapeVariant {
+        cap: crate::tape::ids::MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
+        tq_heads: None,
+    };
+
+    /// A TurboQuant decode attention's threadgroups count query heads: one serves the picked
+    /// variant's heads, so the variant divides them. Every other command dispatches as baked.
+    #[test]
+    fn tq_decode_threadgroups_serve_the_variants_heads() {
+        use crate::tape::ids::{MaxBlocksPerSeq, TqDecodeHeads};
+        let command = |kernel| LoweredCommand {
+            kernel,
+            library: "attention",
+            function: "attention_via_cache_v2_f16_specialized",
+            constants: crate::interpreter::metal::lowered::baked(Vec::new()),
+            dispatch: DispatchShape {
+                threadgroups: (1, 32, 2),
+                threads_per_threadgroup: (64, 1, 1),
+                m_scaling: None,
+            },
+            bindings: crate::interpreter::metal::lowered::baked(Vec::new()),
+            gemm_dims: None,
+        };
+        let (tq, fp16) = (
+            command(KernelId::AttentionViaCacheTq),
+            command(KernelId::AttentionViaCache),
+        );
+        for heads in [1, 2, 4, 8] {
+            let variant = TapeVariant {
+                cap: MaxBlocksPerSeq(128),
+                tq_heads: Some(TqDecodeHeads(heads)),
+            };
+            let (tg, _) = mtl_size_pair(&tq, variant);
+            assert_eq!((tg.width, tg.height, tg.depth), (1, 32 / heads as usize, 2));
+            let (tg, _) = mtl_size_pair(&fp16, variant);
+            assert_eq!((tg.width, tg.height, tg.depth), (1, 32, 2));
+        }
+    }
 
     /// The decode-step gates follow whether every sequence contributes one
     /// token; the sequence gates follow the step's sequence count, not its
@@ -1669,7 +1713,7 @@ mod tests {
                 cmd.constants.to_vec(),
             );
             let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
-            let (grid, threads) = mtl_size_pair(&cmd);
+            let (grid, threads) = mtl_size_pair(&cmd, TEST_VARIANT);
             let grid = scale_tg_for_num_tokens(
                 grid,
                 cmd.dispatch.m_scaling,
@@ -1980,8 +2024,9 @@ mod tests {
 
         // Two buckets: M=1 (decode) and M=8 (small prefill).
         let tapes = vec![build_synthetic_tape(1), build_synthetic_tape(8)];
-        let pipelines = crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE)
-            .expect("pipelines");
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
         let arena_layout: ArenaLayout = vec![4 * 1024, 4 * 1024];
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2033,8 +2078,9 @@ mod tests {
         let runtime = empty_runtime(&device, 1);
 
         let tapes = vec![build_synthetic_tape(1)]; // num_arena_slots = 2
-        let pipelines = crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE)
-            .expect("pipelines");
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         // Layout has only 1 slot — should error.
         let bad_layout: ArenaLayout = vec![4 * 1024];
@@ -2139,8 +2185,9 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
-        let pipelines = crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE)
-            .expect("pipelines");
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,
@@ -2228,8 +2275,9 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
-        let pipelines = crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE)
-            .expect("pipelines");
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,
@@ -2351,8 +2399,9 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
-        let pipelines = crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE)
-            .expect("pipelines");
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,

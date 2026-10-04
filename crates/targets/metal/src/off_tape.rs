@@ -122,7 +122,7 @@ impl OffTapePipeline {
             |what: &str| MetalStreamError::ShaderCompilationFailed(format!("{name}: {what}"));
         let library = load_library_from_bytes(device, kernel.metallib).map_err(|e| fail(&e))?;
         let function = library
-            .newFunctionWithName(&NSString::from_str(kernel.function))
+            .newFunctionWithName(&NSString::from_str(kernel.entry))
             .ok_or_else(|| fail("function missing"))?;
         let pipeline = device
             .newComputePipelineStateWithFunction_error(&function)

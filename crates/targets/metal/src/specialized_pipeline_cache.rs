@@ -50,11 +50,20 @@ impl PipelineKey {
     }
 }
 
+/// The baked kernels a cache can build, by key, and each metallib a pipeline was built from,
+/// loaded once (a bake batch holds many kernels) and keyed by its address: a batch no pipeline
+/// needs is never loaded.
+#[derive(Default)]
+struct Baked {
+    libraries: HashMap<usize, Library>,
+    kernels: HashMap<PipelineKey, BakedKernel>,
+}
+
 pub struct SpecializedPipelineCache {
     device: Device,
     libraries: HashMap<&'static str, Library>,
     /// Kernels compiled at expansion with their constants ([`crate::aot::bake`]), by their key.
-    baked: Mutex<HashMap<PipelineKey, Library>>,
+    baked: Mutex<Baked>,
     pipelines: Mutex<HashMap<PipelineKey, ComputePipelineState>>,
     /// Lazy-built MTL4 compiler. Pipelines built through this compiler
     /// run correctly when dispatched (`dispatchThreadgroups`) on an
@@ -85,26 +94,37 @@ impl SpecializedPipelineCache {
         })
     }
 
-    /// Load each of `kernels` not yet loaded: the libraries of [`crate::aot::baked_library`]
-    /// kernels.
-    pub fn register_baked<'k>(
-        &self,
-        kernels: impl IntoIterator<Item = &'k BakedKernel>,
-    ) -> Result<(), MetalStreamError> {
-        let mut baked = self.baked.lock().unwrap();
-        for k in kernels {
+    /// Make each of `kernels` — of [`crate::aot::baked_library`] libraries — buildable.
+    pub fn register_baked<'k>(&self, kernels: impl IntoIterator<Item = &'k BakedKernel>) {
+        let by_key = &mut self.baked.lock().unwrap().kernels;
+        for &k in kernels {
             let key = PipelineKey::new(k.library, k.function, k.constants.to_vec());
-            if let Entry::Vacant(slot) = baked.entry(key) {
-                let lib = load_library_from_bytes(&self.device, k.metallib).map_err(|e| {
+            by_key.entry(key).or_insert(k);
+        }
+    }
+
+    /// The library of baked `key`'s metallib, loaded on its first use, and its function there.
+    fn baked_function(
+        &self,
+        key: &PipelineKey,
+    ) -> Result<Option<(Library, &'static str)>, MetalStreamError> {
+        let Baked { libraries, kernels } = &mut *self.baked.lock().unwrap();
+        let Some(k) = kernels.get(key) else {
+            return Ok(None);
+        };
+        let library = match libraries.entry(k.metallib.as_ptr() as usize) {
+            Entry::Occupied(library) => library.get().clone(),
+            Entry::Vacant(slot) => {
+                let library = load_library_from_bytes(&self.device, k.metallib).map_err(|e| {
                     MetalStreamError::ShaderCompilationFailed(format!(
                         "load baked `{}`: {e}",
-                        k.function
+                        k.entry
                     ))
                 })?;
-                slot.insert(lib);
+                slot.insert(library).clone()
             }
-        }
-        Ok(())
+        };
+        Ok(Some((library, k.entry)))
     }
 
     pub fn len(&self) -> usize {
@@ -129,13 +149,14 @@ impl SpecializedPipelineCache {
         // A baked kernel has its constants compiled in, under the full key; any other kernel
         // takes no constants.
         let library = if crate::aot::baked_library(key.library_name).is_some() {
-            self.baked.lock().unwrap().get(key).cloned()
+            self.baked_function(key)?
         } else if key.constants.is_empty() {
-            self.libraries.get(key.library_name).cloned()
+            let library = self.libraries.get(key.library_name).cloned();
+            library.map(|library| (library, key.kernel_name))
         } else {
             None
         };
-        let library = library.ok_or_else(|| {
+        let (library, function) = library.ok_or_else(|| {
             MetalStreamError::ShaderCompilationFailed(format!(
                 "`{}` of `{}` has no library compiled with constants {:?}",
                 key.kernel_name, key.library_name, key.constants
@@ -145,7 +166,7 @@ impl SpecializedPipelineCache {
         // MTL4 function-descriptor chain: the library function (library + entry-point name) in
         // the descriptor the compiler consumes, which carries the MTL4 dispatch-support flag.
         let lib_fn_desc = MTL4LibraryFunctionDescriptor::new();
-        lib_fn_desc.setName(Some(&NSString::from_str(key.kernel_name)));
+        lib_fn_desc.setName(Some(&NSString::from_str(function)));
         lib_fn_desc.setLibrary(Some(&library));
         let pipe_desc = MTL4ComputePipelineDescriptor::new();
         let lib_fn_super: &::objc2_metal::MTL4FunctionDescriptor = &lib_fn_desc;

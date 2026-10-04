@@ -32,6 +32,7 @@ use super::pipelines::SpecializedPipelines;
 use super::runtime::{Padding, RuntimeBindings};
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
+use crate::tape::constants::TapeVariant;
 use crate::tape::ids::{HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads};
 use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
@@ -91,6 +92,9 @@ pub struct MetalBucketSpec {
     /// pool picks one at load. Empty in cuda-macro builds, where the metal
     /// statics are cfg'd out anyway, and for a canonical the front end refused.
     pub tapes: &'static [crate::tape::lowered::ClassedTape],
+    /// Every kernel of a baked library ([`crate::aot::baked_library`]) the model's tapes name,
+    /// compiled with its constants: the model's one table, which each of its buckets names.
+    pub kernels: &'static [crate::tape::lowered::BakedKernel],
 }
 
 impl Clone for MetalBucketSpec {
@@ -392,7 +396,19 @@ pub struct MetalRungs {
 /// the tape each kept bucket runs.
 pub struct PickedRung<'a> {
     pub cap: MaxBlocksPerSeq,
+    /// The query heads one TurboQuant decode threadgroup serves on this device.
+    pub tq_heads: TqDecodeHeads,
     pub tapes: Vec<(&'a MetalBucketSpec, &'a ClassedTape)>,
+}
+
+impl PickedRung<'_> {
+    /// The values the picked tapes' variant-bound constants take.
+    pub fn variant(&self) -> TapeVariant {
+        TapeVariant {
+            cap: self.cap,
+            tq_heads: Some(self.tq_heads),
+        }
+    }
 }
 
 impl PickedRung<'_> {
@@ -466,7 +482,11 @@ pub fn pick_rung<'a>(
         buckets = tapes.len(),
         "baked tape rung"
     );
-    Ok(PickedRung { cap, tapes })
+    Ok(PickedRung {
+        cap,
+        tq_heads,
+        tapes,
+    })
 }
 
 impl MetalRungs {
@@ -603,6 +623,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             block_cap,
             addressing,
         )?;
+        let variant = rung.variant();
         let picked = rung.tapes;
 
         // Worker arena is sized for the largest activation across every
@@ -632,14 +653,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 
         let cache = SpecializedPipelineCache::new((*device).clone(), &[])
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
-        for (_, rung) in &picked {
-            cache
-                .register_baked(rung.kernels.iter().copied())
-                .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
+        let mut tables: Vec<&[crate::tape::lowered::BakedKernel]> = Vec::new();
+        for (spec, _) in &picked {
+            if !tables.iter().any(|t| std::ptr::eq(*t, spec.kernels)) {
+                tables.push(spec.kernels);
+                cache.register_baked(spec.kernels);
+            }
         }
         let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
-        let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache)));
+        let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
 
         Self::new(
             device,
@@ -647,7 +670,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
-            rung.cap,
+            variant.cap,
             arena_layout,
             runtime_factory,
             max_workers,
@@ -1700,6 +1723,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
+    const TEST_VARIANT: TapeVariant = TapeVariant {
+        cap: MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
+        tq_heads: None,
+    };
+
     /// Test fixture: holds `CanonicalParams` constants AND the layer
     /// its one model source resolves to. Pool tests only exercise
     /// RmsNorm bindings (the `synthetic_tape` builder below), so only
@@ -1867,7 +1896,7 @@ mod tests {
 
         let tapes: Arc<[_]> = Arc::from(vec![synthetic_tape(1)]);
         let pipelines = Arc::new(
-            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE)
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
                 .expect("pipelines"),
         );
 
@@ -2072,7 +2101,7 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         let pipelines = Arc::new(
-            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE)
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
                 .expect("pipelines"),
         );
         // Arena slot for the synthetic RmsNorm: M × hidden_size f16 =
@@ -2462,7 +2491,6 @@ mod tests {
                     cap: MaxBlocksPerSeq(128),
                     tq_heads: None,
                     tape,
-                    kernels: &[],
                 });
             }
         }
@@ -2547,6 +2575,7 @@ mod tests {
             backbone_barriers: EMPTY_BARRIERS,
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: test_empty_tapes(1, 2),
+            kernels: &[],
         }];
         let Some(res) = build_via_for_buckets(&specs, 2) else {
             eprintln!("skipping: no Metal device");
@@ -2576,6 +2605,7 @@ mod tests {
             backbone_barriers: EMPTY_BARRIERS,
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: &[],
+            kernels: &[],
         }];
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
@@ -2609,6 +2639,7 @@ mod tests {
                 backbone_barriers: EMPTY_BARRIERS,
                 lm_head_barriers: EMPTY_BARRIERS,
                 tapes: test_empty_tapes(1, 2),
+                kernels: &[],
             },
             MetalBucketSpec {
                 bucket_m: 8,
@@ -2620,6 +2651,7 @@ mod tests {
                 backbone_barriers: EMPTY_BARRIERS,
                 lm_head_barriers: EMPTY_BARRIERS,
                 tapes: test_empty_tapes(8, 2),
+                kernels: &[],
             },
         ];
         let Some(res) = build_via_for_buckets(&specs, 1) else {

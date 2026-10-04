@@ -6668,51 +6668,19 @@ enum BackboneLayout {
 /// `LoadPosEmbeds` nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
 /// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
-/// logits `width` and `dtype` (`scratchy_target_metal::off_tape`), each distinct kernel once.
+/// logits `width` and `dtype` (`scratchy_target_metal::off_tape`).
 #[cfg(feature = "metal")]
 fn metal_off_tape_tokens(
     width: u64,
     mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
-    stem: &str,
 ) -> TokenStream {
     use scratchy_target_metal::off_tape::OffTape;
-    use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
     use scratchy_target_metal::tape::ids::{BlockSize, LogitsWidth};
     let width = u32::try_from(width).expect("logits width fits u32");
     // The chain advances the full-context group's slots (KV group 0).
     let block_size = BlockSize(mc.global_block_size);
     let keys = OffTape::keys(LogitsWidth(width), mc.metal_dtype, block_size);
-    let mut distinct: Vec<PipelineKey> = Vec::new();
-    let ids = keys.map(|key| {
-        let ix = distinct.iter().position(|d| *d == key).unwrap_or_else(|| {
-            distinct.push(key);
-            distinct.len() - 1
-        });
-        quote::format_ident!("K{ix}")
-    });
-    let bake = scratchy_target_metal::aot::bake(&distinct);
-    eprintln!(
-        "[metal bake] {stem}: {} off-tape kernels, {} compiled here",
-        distinct.len(),
-        bake.compiled
-    );
-    let kernels = distinct.iter().zip(&bake.metallibs).enumerate();
-    let kernels = kernels.map(|(ix, (key, metallib))| {
-        let id = quote::format_ident!("K{ix}");
-        let (library, function) = (key.library_name, key.kernel_name);
-        let constants =
-            scratchy_target_metal_compiler::const_tokens::const_tokens(&key.constants.as_slice())
-                .expect("serialize off-tape kernel constants");
-        let metallib = syn::LitByteStr::new(metallib, proc_macro2::Span::call_site());
-        quote! {
-            const #id: __tl::BakedKernel = __tl::BakedKernel {
-                library: #library,
-                function: #function,
-                constants: #constants,
-                metallib: #metallib,
-            };
-        }
-    });
+    let ids = keys.map(|key| scratchy_target_metal_compiler::static_tape::kernel_ref(&key));
     let OffTape {
         vocab,
         argmax,
@@ -6730,9 +6698,6 @@ fn metal_off_tape_tokens(
         /// This model's off-tape kernels, baked for its logits.
         #[cfg(feature = "metal")]
         pub static METAL_OFF_TAPE: ::scratchy_target_metal::off_tape::OffTapeKernels = {
-            use ::scratchy_target_metal::tape::constants as __tc;
-            use ::scratchy_target_metal::tape::lowered as __tl;
-            #(#kernels)*
             ::scratchy_target_metal::off_tape::OffTape {
                 vocab: ::scratchy_target_metal::tape::ids::LogitsWidth(#vocab),
                 argmax: #argmax,
@@ -11989,6 +11954,11 @@ pub fn emit_model(
         };
         #[cfg(not(feature = "metal"))]
         let tapes_static_toks = quote! { &[] };
+        // The model's baked kernels (`CommandPool::into_tokens`).
+        let kernels_toks = match cfg!(feature = "metal") {
+            true => quote! { METAL_KERNELS },
+            false => quote! { &[] },
+        };
         metal_bucket_entries.push(quote! {
             ::scratchy_target_metal::interpreter::metal::MetalBucketSpec {
                 bucket_m: #bucket_m_lit,
@@ -12000,6 +11970,7 @@ pub fn emit_model(
                 backbone_barriers: #bb_barriers_static,
                 lm_head_barriers: #lh_barriers_static,
                 tapes: #tapes_static_toks,
+                kernels: #kernels_toks,
             },
         });
     }
@@ -12205,12 +12176,12 @@ pub fn emit_model(
     };
 
     #[cfg(feature = "metal")]
-    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens(&model.source_stem));
+    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens());
     #[cfg(feature = "metal")]
     {
         let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
         metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc.kv_codec, mc.global_head_dim));
-        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, &model.source_stem));
+        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc));
     }
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*

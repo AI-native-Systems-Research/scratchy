@@ -7,6 +7,12 @@
 // `SCRATCHY_KERNEL_<symbol>` for the one kernel it compiles. A shader that includes this header
 // is compiled by the bake only (`build.rs`), and declares no function constant: the pipeline built
 // from a baked kernel sets none.
+//
+// One compile holds a batch of a shader's kernels: each includes the shader inside its own
+// namespace `SCRATCHY_NS` with its own constants defined, so a kernel's name in the metallib is
+// `<SCRATCHY_NS>::<symbol>`. The headers a shader includes are included once ahead of the batch
+// (`#pragma once`), except a header that declares constants itself, which has no guard and is
+// re-read by every kernel of the batch.
 
 #pragma once
 
@@ -32,9 +38,14 @@
 // `1` in the compile the bake made for kernel `sym`, else `0` — usable in `#if`.
 #define SCRATCHY_COMPILES(sym) SCRATCHY_SECOND(SCRATCHY_KERNEL_##sym, 0, ~)
 
-// The explicit instantiation `fn` under host name `sym`, emitted only in the compile the bake made
-// for `sym`: there `SCRATCHY_KERNEL_<sym>` expands to `~, 1` and the probe's second element is
-// `1`; anywhere else the probe is the bare token and its second element is `0`.
+#define SCRATCHY_STR_(x) #x
+#define SCRATCHY_STR(x) SCRATCHY_STR_(x)
+
+// The explicit instantiation `fn` under host name `<SCRATCHY_NS>::sym` (the name a plain kernel
+// has there), emitted only in the compile the bake made for `sym`: there `SCRATCHY_KERNEL_<sym>`
+// expands to `~, 1` and the probe's second element is `1`; anywhere else the probe is the bare
+// token and its second element is `0`.
 #define SCRATCHY_KERNEL(sym, ...)                                                   \
   SCRATCHY_CAT(SCRATCHY_IF_, SCRATCHY_COMPILES(sym))(                               \
-      template [[host_name(#sym)]] [[kernel]] decltype(__VA_ARGS__) __VA_ARGS__;)
+      template [[host_name(SCRATCHY_STR(SCRATCHY_NS) "::" #sym)]] [[kernel]]        \
+      decltype(__VA_ARGS__) __VA_ARGS__;)

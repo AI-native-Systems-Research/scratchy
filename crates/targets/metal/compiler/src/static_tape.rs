@@ -15,13 +15,14 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
+use scratchy_target_metal::tape::constants::ConstantValue;
 use scratchy_target_metal::tape::ids::{
     BlockSize, CommandIx, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads,
     TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
-    GatedCommand, GenClass, KernelId, KvAddressing, LoweredMetalTape, LoweringError, MetalDtype,
-    TapeCommands,
+    Binding, DispatchShape, GatedCommand, GenClass, KernelId, KvAddressing, LoweredCommand,
+    LoweredMetalTape, LoweringError, MetalDtype, TapeCommands,
 };
 
 /// ⭐ EVERY DISTINCT COMMAND OF ONE MODEL'S BAKED TAPES, SPELLED ONCE.
@@ -37,15 +38,54 @@ use scratchy_target_metal::tape::lowered::{
 /// once and each rung pays two bytes for it. A model with more distinct commands than a
 /// [`CommandIx`] indexes refuses the bake.
 ///
-/// So is each distinct kernel of a baked library the commands name ([`aot::is_baked`]): one
-/// `static` [`BakedKernel`](scratchy_target_metal::tape::lowered::BakedKernel), its metallib
-/// compiled by [`aot::bake`] when the pool is emitted.
+/// So are the bulky parts of the commands: a model's thousands of commands are combinations of a
+/// few hundred constant sets, a few hundred dispatch shapes and a few dozen binding lists, each
+/// spelled once as its own `const` the commands name.
+///
+/// So is each distinct kernel of a baked library the commands name for any variant
+/// ([`aot::baked_library`]): one entry of the model's kernel table (`__tape_cmds::KERNELS`), naming
+/// its [`BakedKernel`](scratchy_target_metal::tape::lowered::BakedKernel) in the build's
+/// `__metal_bake` module ([`kernel_ref`]).
 #[derive(Default)]
 pub struct CommandPool {
     index: std::collections::HashMap<GatedCommand, CommandIx>,
     table: Vec<TokenStream>,
-    kernel_index: std::collections::HashMap<PipelineKey, usize>,
+    constants: Parts<&'static [ConstantValue]>,
+    dispatches: Parts<DispatchShape>,
+    bindings: Parts<&'static [Binding]>,
+    named_kernels: std::collections::HashSet<PipelineKey>,
     kernels: Vec<PipelineKey>,
+}
+
+/// Each distinct value of one command field, as a `const` of its own.
+struct Parts<T> {
+    index: std::collections::HashMap<T, proc_macro2::Ident>,
+    items: Vec<TokenStream>,
+}
+
+impl<T> Default for Parts<T> {
+    fn default() -> Self {
+        Self {
+            index: Default::default(),
+            items: Vec::new(),
+        }
+    }
+}
+
+impl<T: std::hash::Hash + Eq + Copy + serde::Serialize> Parts<T> {
+    /// The `const` (`<prefix><n>: <ty>`) spelling `value`.
+    fn name(&mut self, value: T, prefix: &str, ty: TokenStream) -> Result<TokenStream, BakeDefect> {
+        if let Some(id) = self.index.get(&value) {
+            return Ok(quote!(#id));
+        }
+        let id = quote::format_ident!("{prefix}{}", self.items.len());
+        let toks = crate::const_tokens::const_tokens(&value)
+            .map_err(|e| BakeDefect(format!("serialize {prefix}: {e}")))?;
+        self.items
+            .push(quote! { pub(super) const #id: #ty = #toks; });
+        self.index.insert(value, id.clone());
+        Ok(quote!(#id))
+    }
 }
 
 impl CommandPool {
@@ -59,11 +99,43 @@ impl CommandPool {
                         self.table.len()
                     ))
                 })?;
-                let toks = crate::const_tokens::const_tokens(cmd)
-                    .map_err(|e| BakeDefect(format!("serialize command: {e}")))?;
+                let GatedCommand { command, gate } = *cmd;
+                let LoweredCommand {
+                    kernel,
+                    library,
+                    function,
+                    constants,
+                    dispatch,
+                    bindings,
+                    gemm_dims,
+                } = command;
+                let constants =
+                    (self.constants).name(constants, "CS", quote!(&[__tc::ConstantValue]))?;
+                let dispatch = self
+                    .dispatches
+                    .name(dispatch, "DS", quote!(__tl::DispatchShape))?;
+                let bindings = (self.bindings).name(bindings, "BS", quote!(&[__tl::Binding]))?;
+                let tok = |r: Result<TokenStream, crate::const_tokens::Error>| {
+                    r.map_err(|e| BakeDefect(format!("serialize command: {e}")))
+                };
+                let kernel = tok(crate::const_tokens::const_tokens(&kernel))?;
+                let gemm_dims = tok(crate::const_tokens::const_tokens(&gemm_dims))?;
+                let gate = tok(crate::const_tokens::const_tokens(&gate))?;
                 let id = quote::format_ident!("C{}", ix.0);
-                self.table
-                    .push(quote! { pub(super) const #id: __tl::GatedCommand = #toks; });
+                self.table.push(quote! {
+                    pub(super) const #id: __tl::GatedCommand = __tl::GatedCommand {
+                        command: __tl::LoweredCommand {
+                            kernel: #kernel,
+                            library: #library,
+                            function: #function,
+                            constants: #constants,
+                            dispatch: #dispatch,
+                            bindings: #bindings,
+                            gemm_dims: #gemm_dims,
+                        },
+                        gate: #gate,
+                    };
+                });
                 self.index.insert(*cmd, ix);
                 ix
             }
@@ -72,82 +144,138 @@ impl CommandPool {
         Ok(quote! { I(#ix) })
     }
 
-    /// The baked kernels `commands` name at activation `dtype`, each once.
-    fn kernels_of(&mut self, commands: TapeCommands, dtype: MetalDtype) -> Vec<TokenStream> {
-        let mut ixs = std::collections::BTreeSet::new();
-        for key in commands
-            .iter()
-            .filter_map(|c| aot::bake_key(&c.command, dtype))
-        {
-            let next = self.kernels.len();
-            ixs.insert(*self.kernel_index.entry(key.clone()).or_insert_with(|| {
+    /// Add the baked kernels `commands` name for tape `variant` at activation `dtype` to the
+    /// model's kernels, each once.
+    fn name_kernels(
+        &mut self,
+        commands: TapeCommands,
+        dtype: MetalDtype,
+        variant: TapeVariant,
+    ) -> Result<(), BakeDefect> {
+        for c in commands.iter() {
+            let key = aot::bake_key(&c.command, dtype, variant)
+                .map_err(|e| BakeDefect(format!("bake key: {e}")))?;
+            let Some(key) = key else { continue };
+            if self.named_kernels.insert(key.clone()) {
                 self.kernels.push(key);
-                next
-            }));
+            }
         }
-        let ids = ixs.into_iter().map(|ix| quote::format_ident!("K{ix}"));
-        ids.map(|id| quote! { &__tape_cmds::#id }).collect()
+        Ok(())
     }
 
-    /// The `__tape_cmds` module the model's tape statics reference. Emit it once, beside them.
-    pub fn into_tokens(self, stem: &str) -> TokenStream {
+    /// The `__tape_cmds` module the model's tape statics reference, and `METAL_KERNELS`, the
+    /// model's baked kernels its buckets name. Emit it once, beside them.
+    pub fn into_tokens(self) -> TokenStream {
         // A model metal lowers no tape for (a dense MoE has no metal realization) names nothing.
         if self.table.is_empty() && self.kernels.is_empty() {
-            return TokenStream::new();
+            return quote! {
+                #[cfg(feature = "metal")]
+                static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] = &[];
+            };
         }
         let aliases = crate::const_tokens::alias_preamble();
         let table = self.table;
         let len = proc_macro2::Literal::usize_unsuffixed(table.len());
         let ids = (0..table.len()).map(|i| quote::format_ident!("C{i}"));
-        let bake = aot::bake(&self.kernels);
-        eprintln!(
-            "[metal bake] {stem}: {} kernels, {} compiled here, {} shared with an earlier model",
-            self.kernels.len(),
-            bake.compiled,
-            self.kernels.len() - bake.compiled,
-        );
-        // Kernels whose compiles come out byte-identical (a constant the kernel never reads)
-        // share one embedded metallib.
-        let mut metallibs = std::collections::HashMap::new();
-        let mut metallib_statics = Vec::new();
-        let kernels = self.kernels.iter().zip(&bake.metallibs).enumerate();
-        let kernels = kernels.map(|(ix, (key, metallib))| {
-            let id = quote::format_ident!("K{ix}");
-            let (library, function) = (key.library_name, key.kernel_name);
-            let constants = crate::const_tokens::const_tokens(&key.constants.as_slice())
-                .expect("serialize baked kernel constants");
-            let next = metallibs.len();
-            let lib = *metallibs.entry(metallib.clone()).or_insert_with(|| {
-                let (lib, bytes) = (quote::format_ident!("M{next}"), metallib_file(metallib));
-                let len = proc_macro2::Literal::usize_unsuffixed(metallib.len());
-                metallib_statics.push(quote! { static #lib: [u8; #len] = *#bytes; });
-                next
-            });
-            let metallib = quote::format_ident!("M{lib}");
-            quote! {
-                pub(super) static #id: __tl::BakedKernel = __tl::BakedKernel {
-                    library: #library,
-                    function: #function,
-                    constants: #constants,
-                    metallib: &#metallib,
-                };
-            }
-        });
-        let kernels: Vec<TokenStream> = kernels.collect();
+        let kernels: Vec<TokenStream> = self.kernels.iter().map(kernel_ref).collect();
+        let kernels_len = proc_macro2::Literal::usize_unsuffixed(kernels.len());
+        let parts = (self.constants.items.iter())
+            .chain(&self.dispatches.items)
+            .chain(&self.bindings.items);
         quote! {
             #[cfg(feature = "metal")]
             mod __tape_cmds {
                 #aliases
+                #(#parts)*
                 #(#table)*
                 pub(super) static TABLE: [__tl::GatedCommand; #len] = [ #(#ids),* ];
-                #(#metallib_statics)*
-                #(#kernels)*
+                pub(super) static KERNELS: [__tl::BakedKernel; #kernels_len] = [ #(#kernels),* ];
             }
+            #[cfg(feature = "metal")]
+            static METAL_KERNELS: &[::scratchy_target_metal::tape::lowered::BakedKernel] =
+                &__tape_cmds::KERNELS;
         }
     }
 }
 
-/// `metallib` as a file under the build's `OUT_DIR`, named by its content (models sharing a kernel
+/// ⭐ EVERY BAKED KERNEL THE BUILD'S MODELS NAME, BY NAME. A model names each of its kernels by
+/// its key as it is emitted ([`kernel_ref`]); [`bake_module`] then bakes them all at once — each
+/// distinct key compiled once across the build, each metallib embedded once — as the crate-root
+/// `__metal_bake` module the names resolve in.
+static NAMED: std::sync::Mutex<std::collections::BTreeMap<String, PipelineKey>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// `key`'s baked kernel, as the path of its `static` in the crate-root `__metal_bake` module
+/// ([`bake_module`]).
+pub fn kernel_ref(key: &PipelineKey) -> TokenStream {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let name = format!("K_{:016X}", hasher.finish());
+    let mut named = NAMED.lock().unwrap();
+    let prior = named.entry(name.clone()).or_insert_with(|| key.clone());
+    assert!(prior == key, "metal bake: {prior:?} and {key:?} hash alike");
+    let id = quote::format_ident!("{name}");
+    quote!(crate::__metal_bake::#id)
+}
+
+/// The items of the crate-root `__metal_bake` module: every kernel [`kernel_ref`] named, baked
+/// ([`aot::bake`]), as a `BakedKernel` static under its name, beside one `static` per metallib —
+/// a bake batch's, which its kernels share.
+pub fn bake_module() -> TokenStream {
+    let named = std::mem::take(&mut *NAMED.lock().unwrap());
+    let (names, keys): (Vec<String>, Vec<PipelineKey>) = named.into_iter().unzip();
+    let bake = aot::bake(&keys);
+    eprintln!(
+        "[metal bake] {} kernels, {} compiles here",
+        keys.len(),
+        bake.compiled
+    );
+    let mut metallibs = std::collections::HashMap::new();
+    let mut statics = Vec::new();
+    for ((name, key), kernel) in names.iter().zip(&keys).zip(&bake.kernels) {
+        let next = metallibs.len();
+        let lib = *(metallibs.entry(std::sync::Arc::as_ptr(&kernel.metallib).cast::<u8>()))
+            .or_insert_with(|| {
+                let (lib, bytes) = (
+                    quote::format_ident!("M{next}"),
+                    metallib_file(&kernel.metallib),
+                );
+                let len = proc_macro2::Literal::usize_unsuffixed(kernel.metallib.len());
+                // The bytes ARE the static (an array, not a `&[u8]` to an anonymous allocation):
+                // the models' kernel tables copy these kernels, and each codegen unit that holds a
+                // copy would otherwise embed its own copy of the anonymous bytes.
+                statics.push(quote! { static #lib: [u8; #len] = *#bytes; });
+                next
+            });
+        let (id, metallib) = (
+            quote::format_ident!("{name}"),
+            quote::format_ident!("M{lib}"),
+        );
+        let (library, function, entry) = (key.library_name, key.kernel_name, &kernel.entry);
+        let constants = crate::const_tokens::const_tokens(&key.constants.as_slice())
+            .expect("serialize baked kernel constants");
+        statics.push(quote! {
+            pub(crate) static #id: __tl::BakedKernel = __tl::BakedKernel {
+                library: #library,
+                function: #function,
+                constants: #constants,
+                metallib: &#metallib,
+                entry: #entry,
+            };
+        });
+    }
+    if statics.is_empty() {
+        return TokenStream::new();
+    }
+    quote! {
+        use ::scratchy_target_metal::tape::constants as __tc;
+        use ::scratchy_target_metal::tape::lowered as __tl;
+        #(#statics)*
+    }
+}
+
+/// `metallib` as a file under the build's `OUT_DIR`, named by its content (models sharing a batch
 /// share the file), and the `include_bytes!` that embeds it: rustc reads the bytes rather than
 /// lexing them as a literal.
 fn metallib_file(metallib: &[u8]) -> TokenStream {
@@ -169,6 +297,7 @@ fn metallib_file(metallib: &[u8]) -> TokenStream {
 }
 use scratchy_target_metal::aot;
 use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
+use scratchy_target_metal::tape::constants::TapeVariant;
 use scratchy_target_metal::tape::lowering as tl;
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{MetalStepTape, RotaryTables};
@@ -245,12 +374,11 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     })
 }
 
-/// One rung of a bucket's tape: its class, addressing, KV cap and TurboQuant decode heads.
+/// One rung of a bucket's tape: its class, addressing and KV cap.
 struct Rung<'a> {
     profile: &'a MetalTargetProfile,
     addressing: KvAddressing,
     cap: MaxBlocksPerSeq,
-    tq_heads: TqDecodeHeads,
 }
 
 fn run_lower(
@@ -265,18 +393,23 @@ fn run_lower(
         rotary: input.rotary,
         block_cap: rung.cap.get(),
         profile: Some(rung.profile),
-        tq_heads: rung.tq_heads,
     };
     tl::lower_subtile_tape_to_metal(input.steps, mc, at)
 }
 
-/// Bake every `(gen class × KV addressing × KV cap × TurboQuant decode heads)` rung of one bucket's tape
-/// and emit the `&'static [ClassedTape]` expression. A tape with no TurboQuant decode attention is
-/// baked once for every device (`tq_heads: None`); one with it, once per head count its geometry
-/// admits ([`TqDecodeHeads::candidates`]), which the device picks among. A cap rung whose scratch
-/// cannot exist for this bucket ([`LoweringError::ScratchTooLarge`]) ends the bucket's ladder: it
-/// and every rung above it are not baked. Rungs that lower identically share one hoisted body (see
-/// below).
+/// Bake every `(gen class × KV addressing × KV cap × TurboQuant decode heads)` variant of one
+/// bucket's tape and emit the `&'static [ClassedTape]` expression. A tape with no TurboQuant decode
+/// attention serves every device (`tq_heads: None`); one with it has a variant per head count its
+/// geometry admits ([`TqDecodeHeads::candidates`]), which the device picks among. A cap rung whose
+/// scratch cannot exist for this bucket ([`LoweringError::ScratchTooLarge`]) ends the bucket's
+/// ladder: it and every rung above it are not baked.
+///
+/// A variant's cap and heads reach its commands only as variant-bound constants
+/// ([`ConstantType::KvCap`](scratchy_target_metal::tape::constants::ConstantType::KvCap)), so the
+/// variants of a `(class, addressing)` share one hoisted body and each carries only its cap-sized
+/// scratch ([`ClassedTape::rung`]); the kernels its values bake join the model's kernel table.
+///
+/// [`ClassedTape::rung`]: scratchy_target_metal::tape::lowered::ClassedTape::rung
 pub fn bake_bucket_tapes(
     mc: &MetalModelConsts,
     input: &BucketLowerInput<'_>,
@@ -291,9 +424,9 @@ pub fn bake_bucket_tapes(
     .collect();
     let mut entries: Vec<TokenStream> = Vec::new();
     let mut body_statics: Vec<TokenStream> = Vec::new();
-    // Dedupe: identical bodies share ONE hoisted static — every labelled rung would otherwise
+    // Dedupe: identical bodies share ONE hoisted static — every labelled variant would otherwise
     // repeat the full command tape and rustc drowns in tokens (a 10-family build OOM-killed the
-    // compiler before this).
+    // compiler before this). The cap-sized scratch is the variant's, outside the body.
     //
     // Keyed on the LOWERED VALUES, not on their rendered token text: the tape is megabytes of
     // tokens, so hashing the values beats stringifying every body.
@@ -311,30 +444,15 @@ pub fn bake_bucket_tapes(
         .collect();
     let lowered = par_map(&points, |&(class, addressing, cap)| {
         let profile = profile_for(class);
-        let rung = |tq_heads| Rung {
+        let rung = Rung {
             profile: &profile,
             addressing,
             cap,
-            tq_heads,
         };
-        let one = match run_lower(mc, input, &rung(TqDecodeHeads(1))) {
-            Err(LoweringError::ScratchTooLarge { .. }) => return Ok(None),
-            one => one?,
-        };
-        let serves_tq =
-            (one.commands.iter()).any(|c| c.command.kernel == KernelId::AttentionViaCacheTq);
-        if !serves_tq {
-            return Ok(Some(vec![(None, one)]));
+        match run_lower(mc, input, &rung) {
+            Err(LoweringError::ScratchTooLarge { .. }) => Ok(None),
+            tape => tape.map(Some),
         }
-        let lower = |h| match h {
-            TqDecodeHeads(1) => Ok((Some(h), one)),
-            _ => run_lower(mc, input, &rung(h)).map(|t| (Some(h), t)),
-        };
-        candidates
-            .iter()
-            .map(|&h| lower(h))
-            .collect::<Result<_, _>>()
-            .map(Some)
     });
     // The scratch grows with the cap: the first rung of a `(class, addressing)` ladder that cannot
     // exist ends it (`points` holds each ladder contiguous, ascending).
@@ -343,7 +461,7 @@ pub fn bake_bucket_tapes(
         if ended == Some((class, addressing)) {
             continue;
         }
-        let Some(tapes) = tapes.map_err(defect)? else {
+        let Some(tape) = tapes.map_err(defect)? else {
             eprintln!(
                 "[metal bake] bucket_m={}: ladder ends below KV cap rung {}",
                 input.bucket_m,
@@ -352,58 +470,61 @@ pub fn bake_bucket_tapes(
             ended = Some((class, addressing));
             continue;
         };
-        for (tq_heads, tape) in tapes {
-            let body_ix = match seen.get(&tape).copied() {
-                Some(ix) => ix,
-                None => {
-                    let kernel_refs = pool.kernels_of(tape.commands, mc.metal_dtype);
-                    let cmd_refs = (tape.commands.iter())
-                        .map(|c| pool.intern(c))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let rest = LoweredMetalTape {
-                        commands: TapeCommands::EMPTY,
-                        ..tape
+        // The cap-sized scratch is the variant's; the rest of the tape is the body.
+        let (roped_k, attn_unfused) = (tape.roped_k_scratch_bytes, tape.attn_unfused_scratch_bytes);
+        let body = LoweredMetalTape {
+            roped_k_scratch_bytes: 0,
+            attn_unfused_scratch_bytes: 0,
+            ..tape
+        };
+        let body_ix = match seen.get(&body).copied() {
+            Some(ix) => ix,
+            None => {
+                let cmd_refs = (body.commands.iter())
+                    .map(|c| pool.intern(c))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let rest = LoweredMetalTape {
+                    commands: TapeCommands::EMPTY,
+                    ..body
+                };
+                let rest_toks = tok("tape", crate::const_tokens::const_tokens(&rest))?;
+                let ix = body_statics.len();
+                let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{ix}");
+                body_statics.push(quote! {
+                    // A `static`: a `const` holding `&TABLE` would have rustc validate the whole
+                    // table once per body.
+                    static #ident: __tl::LoweredMetalTape = __tl::LoweredMetalTape {
+                        commands: __tl::TapeCommands {
+                            table: &__tape_cmds::TABLE,
+                            ixs: { use __ti::CommandIx as I; &[ #(#cmd_refs),* ] },
+                        },
+                        ..#rest_toks
                     };
-                    let rest_toks = tok("tape", crate::const_tokens::const_tokens(&rest))?;
-                    let ix = body_statics.len();
-                    let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{ix}");
-                    body_statics.push(quote! {
-                        // A `static`: a `const` holding `&TABLE` would have rustc validate the whole
-                        // table once per body.
-                        static #ident: __tl::ClassedTape = __tl::ClassedTape {
-                            // Placeholder labels; entries override below.
-                            gen_class: __tl::GenClass::M1,
-                            addressing: __tl::KvAddressing::Direct,
-                            cap: __ti::MaxBlocksPerSeq(0),
-                            tq_heads: None,
-                            tape: __tl::LoweredMetalTape {
-                                commands: __tl::TapeCommands {
-                                    table: &__tape_cmds::TABLE,
-                                    ixs: { use __ti::CommandIx as I; &[ #(#cmd_refs),* ] },
-                                },
-                                ..#rest_toks
-                            },
-                            kernels: &[ #(#kernel_refs),* ],
-                        };
-                    });
-                    seen.insert(tape, ix);
-                    ix
-                }
-            };
-            let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{body_ix}");
+                });
+                seen.insert(body, ix);
+                ix
+            }
+        };
+        let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{body_ix}");
+        let serves_tq =
+            (tape.commands.iter()).any(|c| c.command.kernel == KernelId::AttentionViaCacheTq);
+        let heads: Vec<Option<TqDecodeHeads>> = match serves_tq {
+            true => candidates.iter().copied().map(Some).collect(),
+            false => vec![None],
+        };
+        for tq_heads in heads {
+            let variant = TapeVariant { cap, tq_heads };
+            pool.name_kernels(tape.commands, mc.metal_dtype, variant)?;
             let class_toks = tok("class", crate::const_tokens::const_tokens(&class))?;
             let addressing_toks =
                 tok("addressing", crate::const_tokens::const_tokens(&addressing))?;
             let cap_toks = tok("cap", crate::const_tokens::const_tokens(&cap))?;
             let tq_toks = tok("tq heads", crate::const_tokens::const_tokens(&tq_heads))?;
             entries.push(quote! {
-                __tl::ClassedTape {
-                    gen_class: #class_toks,
-                    addressing: #addressing_toks,
-                    cap: #cap_toks,
-                    tq_heads: #tq_toks,
-                    ..#ident
-                },
+                __tl::ClassedTape::rung(
+                    #ident, #class_toks, #addressing_toks, #cap_toks, #tq_toks,
+                    [#roped_k, #attn_unfused],
+                ),
             });
         }
     }

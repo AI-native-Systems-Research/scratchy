@@ -20,9 +20,9 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
-    HeadDim, HiddenSize, IntermediateSize, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq,
-    NDim, NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim,
-    SplitK, TopK, TqCodeBits, TqDecodeHeads,
+    HeadDim, HiddenSize, IntermediateSize, KDimI32, KPartitionSizeI32, MDimI32, NDim, NDimI32,
+    NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TopK,
+    TqCodeBits,
 };
 use crate::tape::lowered::ActivationWidth;
 
@@ -253,7 +253,6 @@ pub struct AttentionViaCacheConstants {
     pub num_kv_heads: NumKvHeads,
     pub attn_scale: AttnScale,
     pub block_size: BlockSize,
-    pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
     /// Sliding-window width (`ATTN_WINDOW`, slot 7). `0` = disabled
     /// (full attention); the sliding lowering arm passes
@@ -285,7 +284,7 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
             ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
             ConstantValue::int(ConstSlot(7), c.window.get()),
         ];
@@ -306,11 +305,10 @@ pub struct AttentionViaCacheTqConstants {
     pub bits: TqCodeBits,
     pub k_bias: bool,
     pub v_bias: bool,
-    pub heads: TqDecodeHeads,
 }
 
 impl AttentionViaCacheTqConstants {
-    /// `ATTN_TQ_HEADS`, the slot of [`Self::heads`].
+    /// `ATTN_TQ_HEADS`: the query heads one threadgroup serves, the tape variant's.
     pub const HEADS: ConstSlot = ConstSlot(16);
 }
 
@@ -319,10 +317,7 @@ impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
         let mut v = vec![ConstantValue::uint(ConstSlot(13), c.bits.get())];
         v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
-        v.push(ConstantValue::uint(
-            AttentionViaCacheTqConstants::HEADS,
-            c.heads.get(),
-        ));
+        v.push(ConstantValue::tq_heads(AttentionViaCacheTqConstants::HEADS));
         v
     }
 }
@@ -334,7 +329,6 @@ pub struct TqStageConstants {
     pub head_dim: HeadDim,
     pub num_kv_heads: NumKvHeads,
     pub block_size: BlockSize,
-    pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
     pub bits: TqCodeBits,
     pub rot_dim: Option<RotDim>,
@@ -365,7 +359,7 @@ impl From<TqStageConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
         ];
         push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
@@ -467,7 +461,6 @@ pub struct AttentionPrefillPagedConstants {
     pub num_kv_heads: NumKvHeads,
     pub attn_scale: AttnScale,
     pub block_size: BlockSize,
-    pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
     /// Sliding-window width (`ATTN_WINDOW` / `ATTN_PAGED_WINDOW`,
     /// slot 7). `0` = disabled. Read by BOTH the sdpa_vector paged
@@ -516,7 +509,7 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
             ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
             ConstantValue::int(ConstSlot(7), c.window.get()),
         ];

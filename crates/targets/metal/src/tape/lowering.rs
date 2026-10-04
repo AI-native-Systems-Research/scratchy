@@ -68,12 +68,13 @@ pub struct BakePoint<'a> {
     /// The rotary table each attention class re-ropes cached K with (rope-on-read); `None`
     /// when the model has no rotary.
     pub rotary: Option<RotaryTables>,
-    /// The KV cap rung: per-sequence block-table capacity, at the `MaxBlocksPerSeq` sites, the
-    /// rope-once `roped_k_scratch` and the hd512 unfused-attention sizing.
+    /// The KV cap rung: per-sequence block-table capacity, sizing the rope-once
+    /// `roped_k_scratch` and the hd512 unfused attention. The commands that read the block table
+    /// take the rung's cap as a variant-bound constant ([`ConstantType::KvCap`]).
+    ///
+    /// [`ConstantType::KvCap`]: super::constants::ConstantType::KvCap
     pub block_cap: u32,
     pub profile: Option<&'a crate::targets::MetalTargetProfile>,
-    /// The query heads each TurboQuant decode threadgroup serves ([`serve_tq_decode_heads`]).
-    pub tq_heads: super::ids::TqDecodeHeads,
 }
 
 /// The weights a row can bind: its site's sources and the model's class rotary tables.
@@ -169,11 +170,7 @@ pub fn lower_subtile_tape_to_metal(
     {
         return Err(LoweringError::TurboQuantCompressesNothing);
     }
-    let commands = (bb.commands.iter().chain(lh.commands.iter())).map(|c| {
-        let mut served = *c;
-        serve_tq_decode_heads(&mut served.command, at.tq_heads);
-        served
-    });
+    let commands = (bb.commands.iter().chain(lh.commands.iter())).copied();
     Ok(LoweredMetalTape {
         bucket_m: at.bucket_m,
         num_arena_slots: at.num_arena_slots,
@@ -451,7 +448,6 @@ fn tq_stage_command<const IS_K: bool>(
     is_global: bool,
     table: Option<SourceIx>,
     bucket_m: u32,
-    block_cap: u32,
     pass: super::kernel_constants::TqStagePass,
     bits: TqBits,
 ) -> LoweredCommand {
@@ -478,7 +474,6 @@ fn tq_stage_command<const IS_K: bool>(
             head_dim: super::ids::HeadDim(p.global_head_dim),
             num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
             block_size: super::ids::BlockSize(p.global_block_size),
-            max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
             bits: super::ids::TqCodeBits(bits.get()),
             rot_dim: ror_rd,
@@ -643,8 +638,11 @@ fn tq_quantize_command<const IS_K: bool>(
 /// `ATTN_TQ_BITS` and the packed-store bindings, so it reads every key but the
 /// one this step appended straight from the packed store, restoring each
 /// operand's offset (a rotated K bias by the rope-on-read table and pairing).
-/// One query head per threadgroup until [`serve_tq_decode_heads`] sets the
-/// bake point's count.
+/// Its threadgroups count query heads; one serves the tape variant's
+/// [`ConstantType::TqHeads`] of them, which divides them where the worker
+/// builds the dispatch.
+///
+/// [`ConstantType::TqHeads`]: super::constants::ConstantType::TqHeads
 fn tq_attention_command(
     attn: &LoweredCommand,
     layer: u32,
@@ -657,7 +655,6 @@ fn tq_attention_command(
             bits: super::ids::TqCodeBits(bits.get()),
             k_bias: ops.k.0.is_some(),
             v_bias: ops.v.0.is_some(),
-            heads: super::ids::TqDecodeHeads(1),
         },
     ));
     let mut bindings = attn.bindings.to_vec();
@@ -691,26 +688,6 @@ fn tq_bits(p: &MetalModelConsts) -> Result<TqBits, LoweringError> {
         KvCodec::TurboQuant(bits) => Ok(bits),
         KvCodec::Dense => Err(LoweringError::CodecStepOnDenseModel),
     }
-}
-
-/// Have a TurboQuant decode command serve `heads` query heads per
-/// threadgroup: one tape is baked per count the geometry admits, and the
-/// device's core count picks among them at load.
-/// Every other command is left as it is.
-fn serve_tq_decode_heads(command: &mut LoweredCommand, heads: super::ids::TqDecodeHeads) {
-    if command.kernel != KernelId::AttentionViaCacheTq {
-        return;
-    }
-    let slot = super::kernel_constants::AttentionViaCacheTqConstants::HEADS;
-    let constants = command.constants.iter().map(|c| {
-        if c.index == slot.get() {
-            ConstantValue::uint(slot, heads.get())
-        } else {
-            *c
-        }
-    });
-    command.constants = baked(constants.collect());
-    command.dispatch.threadgroups.1 /= heads.get();
 }
 
 /// A command that computes batch row 0 only ([`SeqScope::RowZero`]: the
@@ -2776,7 +2753,6 @@ fn lower_one(
                     // class UP to the sliding page (Gemma4: 32 vs sliding 16).
                     // Defaults to BLOCK_SIZE on uniform arches.
                     block_size: super::ids::BlockSize(p.global_block_size),
-                    max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                     blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
                         chunked,
                     )),
@@ -3264,7 +3240,6 @@ fn lower_one(
                 attn_scale: super::ids::AttnScale(p.attn_scale),
                 // GLOBAL class block size (page-unified; Gemma4: 32).
                 block_size: super::ids::BlockSize(p.global_block_size),
-                max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                 // Prefill kernels (steel + sdpa paged) stay at the standard
                 // BPC; the steel loader (paged_loader.h) has its own chunk
                 // arithmetic that hasn't been adapted to the BPC=0 fast
@@ -3425,12 +3400,13 @@ fn lower_one(
                         crate::tape::lowered::MetalDtype::Bf16 => 2u32,
                         _ => 2u32,
                     };
-                    // Size the rope-once scratch + grid to the PER-SEQUENCE block
-                    // capacity (block_cap), not one prefill bucket: a
-                    // chunked-prefill continuation attends the whole sequence, so
-                    // the scratch must hold every logical block the attention reads.
-                    // The worker caps the live grid.y to this value.
-                    let num_pages = block_cap.max(bucket_m.div_ceil(p.global_block_size));
+                    // Size the rope-once scratch to the PER-SEQUENCE block capacity
+                    // (the rung's cap), not one prefill bucket: a chunked-prefill
+                    // continuation attends the whole sequence, so the scratch must
+                    // hold every logical block the attention reads. The grid's y is
+                    // the step's block-table width, which the worker sets per step.
+                    let bucket_pages = bucket_m.div_ceil(p.global_block_size);
+                    let num_pages = block_cap.max(bucket_pages);
                     let scratch_bytes = roped_k_bytes(
                         [
                             num_pages,
@@ -3443,7 +3419,7 @@ fn lower_one(
                     )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
                     // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
-                    // y = num_pages (one logical block per row).
+                    // y = one logical block per row (the bucket's, until the worker sets the step's).
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
                     let rope_threads = p.num_global_kv_heads * p.global_block_size * rot_half;
                     let rope_cmd = LoweredCommand {
@@ -3452,14 +3428,10 @@ fn lower_one(
                         function: rope_sym,
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
-                            threadgroups: (rope_threads.div_ceil(64), num_pages, 1),
+                            threadgroups: (rope_threads.div_ceil(64), bucket_pages, 1),
                             threads_per_threadgroup: (64, 1, 1),
-                            // num_pages scales with the live num_tokens.
-                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                seq_axis: None,
-                                axis: crate::tape::lowered::MScaleAxis::Y,
-                                bucket_m: super::ids::BucketM(num_pages),
-                            }),
+                            // The worker sets y to the step's block-table width.
+                            m_scaling: None,
                         },
                         bindings: super::kernel_bindings::RopeOnceNaxBindingSet {
                             kv_layer: super::ids::LayerId(*layer + layer_offset),
@@ -3519,12 +3491,13 @@ fn lower_one(
                         .expect("rope_once_gqa_shared_symbol is Some for f16/bf16");
                     // f16 and bf16 are both 2 B/elem.
                     let elem_bytes = 2u32;
-                    // Size the rope-once scratch + grid to the PER-SEQUENCE block
-                    // capacity (block_cap), not one prefill bucket: a
-                    // chunked-prefill continuation attends the whole sequence, so
-                    // the scratch must hold every logical block the attention reads.
-                    // The worker caps the live grid.y to this value.
-                    let num_pages = block_cap.max(bucket_m.div_ceil(p.global_block_size));
+                    // Size the rope-once scratch to the PER-SEQUENCE block capacity
+                    // (the rung's cap), not one prefill bucket: a chunked-prefill
+                    // continuation attends the whole sequence, so the scratch must
+                    // hold every logical block the attention reads. The grid's y is
+                    // the step's block-table width, which the worker sets per step.
+                    let bucket_pages = bucket_m.div_ceil(p.global_block_size);
+                    let num_pages = block_cap.max(bucket_pages);
                     let scratch_bytes = roped_k_bytes(
                         [
                             num_pages,
@@ -3537,8 +3510,8 @@ fn lower_one(
                     )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
                     // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
-                    // y = num_pages (one logical block per row). Same decode as
-                    // the rope_once_gqa_shared kernel's gid.x.
+                    // y = one logical block per row (the bucket's, until the worker sets the step's).
+                    // Same decode as the rope_once_gqa_shared kernel's gid.x.
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
                     let rope_threads = p.num_global_kv_heads * p.global_block_size * rot_half;
                     let rope_cmd = LoweredCommand {
@@ -3547,13 +3520,10 @@ fn lower_one(
                         function: rope_sym,
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
-                            threadgroups: (rope_threads.div_ceil(64), num_pages, 1),
+                            threadgroups: (rope_threads.div_ceil(64), bucket_pages, 1),
                             threads_per_threadgroup: (64, 1, 1),
-                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                seq_axis: None,
-                                axis: crate::tape::lowered::MScaleAxis::Y,
-                                bucket_m: super::ids::BucketM(num_pages),
-                            }),
+                            // The worker sets y to the step's block-table width.
+                            m_scaling: None,
                         },
                         // Same 5 bindings as RopeOnceNax (scratch out, block
                         // table, k_cache, seq_used_k, class-resolved cos_sin).
@@ -3607,7 +3577,6 @@ fn lower_one(
                     num_kv_heads: super::ids::NumKvHeads(p.num_kv_heads),
                     attn_scale: super::ids::AttnScale(p.attn_scale),
                     block_size: super::ids::BlockSize(p.block_size),
-                    max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                     blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
                         chunked,
                     )),
@@ -3684,7 +3653,6 @@ fn lower_one(
                 num_kv_heads: super::ids::NumKvHeads(p.num_kv_heads),
                 attn_scale: super::ids::AttnScale(p.attn_scale),
                 block_size: super::ids::BlockSize(p.block_size),
-                max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                 blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
                 window: super::ids::AttnWindow(p.sliding_window),
                 // Steel reads slot 99 (the b3ddb3b46 lesson);
@@ -3758,7 +3726,8 @@ fn lower_one(
                     // f16 and bf16 are both 2 B/elem.
                     let elem_bytes = 2u32;
                     // Per-sequence block capacity (see the GLOBAL site above).
-                    let num_pages = block_cap.max(bucket_m.div_ceil(p.block_size));
+                    let bucket_pages = bucket_m.div_ceil(p.block_size);
+                    let num_pages = block_cap.max(bucket_pages);
                     let scratch_bytes = roped_k_bytes(
                         [
                             num_pages,
@@ -3771,7 +3740,7 @@ fn lower_one(
                     )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
                     // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
-                    // y = num_pages (one logical block per row).
+                    // y = one logical block per row (the bucket's, until the worker sets the step's).
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
                     let rope_threads = p.num_kv_heads * p.block_size * rot_half;
                     let rope_cmd = LoweredCommand {
@@ -3780,13 +3749,10 @@ fn lower_one(
                         function: rope_sym,
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
-                            threadgroups: (rope_threads.div_ceil(64), num_pages, 1),
+                            threadgroups: (rope_threads.div_ceil(64), bucket_pages, 1),
                             threads_per_threadgroup: (64, 1, 1),
-                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                seq_axis: None,
-                                axis: crate::tape::lowered::MScaleAxis::Y,
-                                bucket_m: super::ids::BucketM(num_pages),
-                            }),
+                            // The worker sets y to the step's block-table width.
+                            m_scaling: None,
                         },
                         // SLIDING-class cos_sin (is_global: false).
                         bindings: super::kernel_bindings::RopeOnceNaxBindingSet {
@@ -4048,17 +4014,17 @@ fn lower_one(
             let global = *class == AttnMask::Causal;
             // Span blocks of K re-rope with the attention class's table.
             let table = w.rotary(p.rope_on_read.then_some(global))?;
-            let (layer, cap) = (layer.get() + layer_offset, block_cap);
+            let layer = layer.get() + layer_offset;
             // A row new for one sequence can be a prefix hit for another in the same step: the
             // step's new rows stage first, the cached rows after.
             use super::kernel_constants::TqStagePass;
             return Ok([TqStagePass::New, TqStagePass::Cached]
                 .map(|pass| match operand {
                     KvOperand::K => {
-                        tq_stage_command(p, layer, ops.k, global, table, bucket_m, cap, pass, bits)
+                        tq_stage_command(p, layer, ops.k, global, table, bucket_m, pass, bits)
                     }
                     KvOperand::V => {
-                        tq_stage_command(p, layer, ops.v, global, table, bucket_m, cap, pass, bits)
+                        tq_stage_command(p, layer, ops.v, global, table, bucket_m, pass, bits)
                     }
                 })
                 .to_vec());
@@ -6623,7 +6589,6 @@ mod tests {
             rotary: Some(TEST_ROTARY),
             block_cap: 128,
             profile,
-            tq_heads: crate::tape::ids::TqDecodeHeads(1),
         }
     }
 
@@ -6791,7 +6756,7 @@ mod tests {
         assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
         assert_eq!(
             tq.constants[fp16.constants.len()..],
-            [ConstantValue::uint(13, bits), ConstantValue::uint(16, 1)]
+            [ConstantValue::uint(13, bits), ConstantValue::tq_heads(16)]
         );
         assert_eq!(tq.bindings[..fp16.bindings.len()], *fp16.bindings);
         let layer = crate::tape::ids::LayerId(0);
@@ -6860,7 +6825,14 @@ mod tests {
         let (x, y, z) = fp16.dispatch.threadgroups;
         assert_eq!(y, p.num_q_heads);
         assert_eq!(tq.dispatch.threadgroups, (x, y, z));
-        assert_eq!(tq.constants.last(), Some(&ConstantValue::uint(16, 1)));
+        assert_eq!(tq.constants.last(), Some(&ConstantValue::tq_heads(16)));
+        let bound_heads = |c: &LoweredCommand| {
+            (c.constants.iter()).any(|k| k.ty == super::super::constants::ConstantType::TqHeads)
+        };
+        assert!(
+            !bound_heads(&fp16),
+            "only the TurboQuant decode command takes the heads"
+        );
         for (cores, heads) in [(8, 4), (16, 2), (32, 1)] {
             let served_heads = TqDecodeHeads::for_group(
                 HeadDim(p.global_head_dim),
@@ -6869,18 +6841,15 @@ mod tests {
                 GpuCores(cores),
             );
             assert_eq!(served_heads, TqDecodeHeads(heads), "{cores} cores");
-            let (mut served, mut other) = (tq, fp16);
-            serve_tq_decode_heads(&mut served, served_heads);
-            serve_tq_decode_heads(&mut other, served_heads);
-            assert_eq!(served.dispatch.threadgroups, (x, y / heads, z));
-            assert_eq!(
-                served.constants.last(),
-                Some(&ConstantValue::uint(16, heads))
-            );
-            assert!(
-                other == fp16,
-                "only the TurboQuant decode command is served"
-            );
+            let variant = super::super::constants::TapeVariant {
+                cap: crate::tape::ids::MaxBlocksPerSeq(128),
+                tq_heads: Some(served_heads),
+            };
+            let served = (tq.constants.iter())
+                .map(|k| k.resolve(variant))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("the variant binds the heads");
+            assert_eq!(served.last(), Some(&ConstantValue::uint(16, heads)));
         }
     }
 
