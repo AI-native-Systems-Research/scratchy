@@ -289,14 +289,20 @@ impl SamplingParams {
     /// path vs the on-GPU sampler. Stricter than `sampling_type() == Greedy`,
     /// which only looks at temperature.
     pub fn is_greedy(&self) -> bool {
-        self.temperature < SAMPLING_EPS
-            && (self.repetition_penalty - 1.0).abs() < 1e-9
-            && self.presence_penalty == 0.0
-            && self.frequency_penalty == 0.0
+        self.temperature < SAMPLING_EPS && !self.reads_history()
         // top-k / top-p / min-p intentionally NOT checked: at temperature ~0 the
         // distribution is one-hot on the argmax, which is always inside any
         // top-k/top-p/min-p kept set — so those filters cannot change the result.
         // (Penalties CAN move the argmax, so they stay above.)
+    }
+
+    /// Whether sampling a token reads the request's token history: a repetition,
+    /// presence or frequency penalty.
+    pub fn reads_history(&self) -> bool {
+        let penalty_free = (self.repetition_penalty - 1.0).abs() < 1e-9
+            && self.presence_penalty == 0.0
+            && self.frequency_penalty == 0.0;
+        !penalty_free
     }
 
     /// Validate the sampling parameters, returning an error message on failure.

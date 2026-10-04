@@ -630,6 +630,13 @@ impl InputBatch {
         })
     }
 
+    /// How many tokens this request has generated, those still on the device included.
+    pub fn num_generated(&self, req_id: &str) -> usize {
+        self.req_id_to_slot
+            .get(req_id)
+            .map_or(0, |&slot| self.generated[slot].len() + self.in_flight[slot])
+    }
+
     /// One token by ABSOLUTE position in `prompt ++ generated`.
     ///
     /// The two vecs are one sequence; which of them a position falls in is arithmetic done here rather

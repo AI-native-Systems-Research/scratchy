@@ -1507,8 +1507,9 @@ fn commit_options(
 /// `W::MAX_BLOCKS_PER_SEQ` truncated it at 2048 tokens for uniform arches.
 /// Returns 0 when there is no block table (decode-via-cache buckets etc.) — the
 /// dispatch then falls back to the baked const.
-/// Record the step's writes into the worker's runtime buffers — its inputs, then the tokens an
-/// earlier forward wrote on the device — and set the per-step values its dispatch reads.
+/// Record the step's writes — into the worker's runtime buffers, its deferral's other buffers,
+/// then the tokens an earlier forward wrote on the device — and set the per-step values its
+/// dispatch reads.
 fn begin_step<W: CanonicalParams>(
     worker: &PooledWorker<W>,
     inputs: &ForwardInputs<'_>,
@@ -1517,6 +1518,9 @@ fn begin_step<W: CanonicalParams>(
     use std::sync::atomic::Ordering::Relaxed;
     let mut writes = InputWrites::default();
     write_runtime_inputs(&worker.runtime, inputs, block_table_stride, &mut writes)?;
+    for (to, bytes) in inputs.deferred.iter().flat_map(|d| &d.host_writes) {
+        writes.stage(to, bytes);
+    }
     for input in inputs.deferred.iter().flat_map(|d| &d.device_inputs) {
         writes.ops.push(InputWrite::Device {
             src: input.src.clone(),

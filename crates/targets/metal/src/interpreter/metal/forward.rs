@@ -156,6 +156,9 @@ pub struct Deferral {
     /// Input tokens an earlier forward wrote on the device, copied into `input_ids` before this one
     /// reads them.
     pub device_inputs: Vec<DeviceInput>,
+    /// Bytes for buffers outside the runtime inputs that an earlier command buffer may still be
+    /// reading (the sampler's per-step parameters), written on the device like the runtime inputs.
+    pub host_writes: Vec<(super::__re::Buffer, Vec<u8>)>,
     in_flight: std::sync::OnceLock<InFlight>,
 }
 
@@ -164,6 +167,7 @@ impl Deferral {
     pub fn new(device_inputs: Vec<DeviceInput>) -> Self {
         Self {
             device_inputs,
+            host_writes: Vec::new(),
             in_flight: std::sync::OnceLock::new(),
         }
     }

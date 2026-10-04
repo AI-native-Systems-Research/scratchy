@@ -212,15 +212,7 @@ impl WrittenExtents {
             .insert(buffer.gpuAddress(), src.len())
             .unwrap_or(len);
         if !src.is_empty() {
-            let at = writes.staged.len().next_multiple_of(4);
-            writes.staged.resize(at, 0);
-            writes.staged.extend_from_slice(src);
-            let to = buffer.clone();
-            writes.ops.push(InputWrite::Staged {
-                to,
-                at,
-                len: src.len(),
-            });
+            writes.stage(buffer, src);
         }
         if stale > src.len() {
             let range = src.len()..stale;
@@ -241,6 +233,17 @@ impl WrittenExtents {
 pub struct InputWrites {
     pub(super) staged: Vec<u8>,
     pub(super) ops: Vec<InputWrite>,
+}
+
+impl InputWrites {
+    /// `src`, staged for the head of `to`.
+    pub(super) fn stage(&mut self, to: &Buffer, src: &[u8]) {
+        let at = self.staged.len().next_multiple_of(4);
+        self.staged.resize(at, 0);
+        self.staged.extend_from_slice(src);
+        let (to, len) = (to.clone(), src.len());
+        self.ops.push(InputWrite::Staged { to, at, len });
+    }
 }
 
 /// One of [`InputWrites::ops`], in order.
