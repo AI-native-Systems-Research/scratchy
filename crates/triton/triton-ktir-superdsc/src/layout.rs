@@ -441,7 +441,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     if let Some((seg, bytes)) = segment_bytes
         .iter()
         .enumerate()
-        .find(|(_, &b)| b > SEGMENT_SIZE)
+        .find(|&(_, b)| *b > SEGMENT_SIZE)
     {
         return Err(Error {
             stage: "layout",

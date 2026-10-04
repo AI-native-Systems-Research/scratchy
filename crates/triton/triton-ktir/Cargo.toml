@@ -2,7 +2,7 @@
 name = "triton-ktir"
 description = "ttir -> KTIR in Rust: the nine KTDP/KTDF passes, ported for behaviour"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 publish = false
 

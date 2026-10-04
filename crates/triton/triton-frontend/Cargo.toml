@@ -2,7 +2,7 @@
 name = "triton-frontend"
 description = "Python -> TTIR, in Rust: bridge one of Triton -> KTIR -> SuperDSC, with no Python at runtime"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 publish = false
 
