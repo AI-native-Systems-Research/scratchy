@@ -33,7 +33,7 @@ use scratchy_core_config::{LayerKvGeometry, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_forward_compiler::{HfFingerprint, ScratchyWeights, hash_json_value, try_load};
 use scratchy_target_metal::gdn_state::GdnStatePool;
-use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype};
+use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
 use scratchy_target_metal::kv_cache::KvCachePool;
 use scratchy_target_metal::single_buffer_kv::SingleBufferKvLayer;
 use scratchy_target_metal::weights::GpuWeights;
@@ -232,7 +232,12 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
             SingleBufferKvLayer::new(&device, &residency, bytes, 1).expect("SingleBufferKvLayer")
         })
         .collect();
-    let block_cap = max_model_len.div_ceil(BLOCK_SIZE).clamp(1, NUM_BLOCKS);
+    // The block-table width: the model's KV cap rung for the capacity, as the worker sizes it.
+    gpu.metal_bucket_max_m = Some(bucket_cap);
+    let rungs = MetalRungs::of(model.metal_rungs()).expect("MetalRungs");
+    let capacity = max_model_len.div_ceil(BLOCK_SIZE).clamp(1, NUM_BLOCKS);
+    let rung = rungs.pick(&device, gpu.metal_bucket_max_m, capacity, gpu.kv_addressing);
+    let block_cap = rung.expect("a KV cap rung").cap.get() as usize;
     let n_slots = num_tensors * 2;
     let calls = std::cell::Cell::new(0usize);
     let mut kv = unsafe {
@@ -294,7 +299,6 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
         .expect("GdnStatePool::new")
     });
 
-    gpu.metal_bucket_max_m = Some(bucket_cap);
     let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
         .unwrap_or_else(|e| panic!("{repo}: tokenizer.json: {e}"));
     Loaded {

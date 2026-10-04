@@ -125,12 +125,10 @@ pub type SeqMmInfo = (u32, u32, u32, u32, u32);
 struct GrammarMaskHost {
     rows: Vec<u32>,
     allow_bits: Vec<u32>,
-    vocab: u32,
-    words_per_row: u32,
 }
 
 /// GPU-resident form of [`GrammarMaskHost`]: the uploaded bitset / row
-/// buffers + a small `[vocab, words_per_row]` consts buffer + the MTL4
+/// buffers + the MTL4
 /// argument table, captured by the forward followup closure to dispatch
 /// the grammar mask just before argmax. `kernels_addr` is a raw pointer
 /// to the worker's `GrammarMaskKernels` (same `'static` trick the argmax
@@ -140,7 +138,6 @@ struct GrammarMaskHost {
 struct GrammarMaskGpu {
     allow_bits: scratchy_target_metal::grammar_mask::Buffer,
     rows: scratchy_target_metal::grammar_mask::Buffer,
-    gconsts: scratchy_target_metal::grammar_mask::Buffer,
     arg_table: ::objc2::rc::Retained<
         ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ArgumentTable>,
     >,
@@ -259,6 +256,8 @@ pub struct MetalWorker {
     /// Compiled greedy-sampling pipeline. Cached once at load_model
     /// to avoid recompiling the MSL kernel each step.
     argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
+    /// The argmax baked for the draft model's logits (its forwards and chain).
+    draft_argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
     /// Compiled on-GPU token sampler (temperature / top-k / top-p / min-p +
     /// penalties). Cached once at load_model alongside `argmax_kernels`; used
     /// only for non-greedy requests (greedy decode stays on the argmax path).
@@ -312,19 +311,19 @@ pub struct MetalWorker {
     /// `forward_argmax_blocking` to dispatch the mask before argmax.
     #[cfg(feature = "guided-decoding")]
     grammar_pending: Option<GrammarMaskHost>,
-    /// The grammar mask's allow-bitsets, row map and constants, reused across
+    /// The grammar mask's allow-bitsets and row map, reused across
     /// decode steps (memcpy per step) and grown only when a batch needs more.
     #[cfg(feature = "guided-decoding")]
     grammar_buf_allow: Option<scratchy_target_metal::residency::Pinned>,
     #[cfg(feature = "guided-decoding")]
     grammar_buf_rows: Option<scratchy_target_metal::residency::Pinned>,
-    #[cfg(feature = "guided-decoding")]
-    grammar_buf_gconsts: Option<scratchy_target_metal::residency::Pinned>,
     /// Phase 6 chain-advance kernel. One small kernel that bumps
     /// per-req `runtime.positions` / `slot_mapping` / `seqused_k` in
     /// place between K-step chain iters. Cached at load_model so the
     /// pipeline is built once.
     chain_advance_kernel: Option<scratchy_target_metal::chain_advance::ChainAdvanceKernel>,
+    /// The chain advance baked for the draft model's KV block size.
+    draft_chain_advance_kernel: Option<scratchy_target_metal::chain_advance::ChainAdvanceKernel>,
     /// Second `MTLCommandQueue` on the same device, dedicated to the
     /// draft chain. Metal device-level parallelism: dispatches on
     /// distinct queues run concurrently on Apple Silicon when they
@@ -778,6 +777,7 @@ impl MetalWorker {
             draft_hf_config: None,
             draft_kv_cache: None,
             argmax_kernels: None,
+            draft_argmax_kernels: None,
             sampler_kernels: None,
             sampler_arena: None,
             sampler_logits: None,
@@ -797,9 +797,8 @@ impl MetalWorker {
             grammar_buf_allow: None,
             #[cfg(feature = "guided-decoding")]
             grammar_buf_rows: None,
-            #[cfg(feature = "guided-decoding")]
-            grammar_buf_gconsts: None,
             chain_advance_kernel: None,
+            draft_chain_advance_kernel: None,
             draft_queue: None,
             target_kv_single_buffers: Vec::new(),
             kv_full_block_size: 0,
@@ -889,6 +888,27 @@ impl MetalWorker {
             .div_ceil(self.config.block_size.max(1))
             .min(num_blocks)
             .max(1)
+    }
+
+    /// The KV cap rung `model`'s pool runs on for a capacity of `block_cap` blocks per sequence,
+    /// on this worker's device and workload (`MetalRungs::pick`): `(cap, scratch bytes)`. The cap
+    /// is the KV pool's block-table width; the scratch counts in the memory budget.
+    fn metal_rung(
+        &self,
+        model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        block_cap: usize,
+    ) -> ExecutorResult<(usize, u64)> {
+        let dev = (self.gpu_device.as_ref())
+            .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
+        let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(model.metal_rungs());
+        let (max_m, addressing) = (dev.metal_bucket_max_m, dev.kv_addressing);
+        let pick = |r: &scratchy_target_metal::interpreter::metal::MetalRungs| {
+            r.pick(&dev.device, max_m, block_cap, addressing)
+        };
+        let rung = rungs
+            .and_then(pick)
+            .map_err(|e| ExecutorError::WorkerInit(format!("KV cap rung: {e}")))?;
+        Ok((rung.cap.get() as usize, rung.scratch_bytes()))
     }
 
     /// Bytes per element for the model's KV cache dtype. Metal forces
@@ -1076,9 +1096,31 @@ impl MetalWorker {
             draft_model.arch_name()
         );
 
+        let draft_off_tape =
+            scratchy_target_metal::off_tape::OffTapeKernels::of(draft_model.metal_off_tape())
+                .map_err(|e| ExecutorError::WorkerInit(format!("draft off-tape kernels: {e}")))?;
+        self.draft_argmax_kernels = Some(
+            scratchy_target_metal::argmax::ArgmaxKernels::new(&gpu_device.device, draft_off_tape)
+                .map_err(|e| ExecutorError::WorkerInit(format!("draft argmax compile: {e:?}")))?,
+        );
+        self.draft_chain_advance_kernel = Some(
+            scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
+                &gpu_device.device,
+                draft_off_tape,
+            )
+            .map_err(|e| {
+                ExecutorError::WorkerInit(format!("draft chain_advance compile: {e:?}"))
+            })?,
+        );
         self.draft_model = Some(draft_model);
         self.draft_model_dir = Some(draft_dir);
         self.draft_hf_config = Some(draft_hf_config);
+        // Spec-decode runs the chunked-addressing tape rung: the direct (BPC=0) path has an
+        // unresolved interaction with the draft K-step chain on 3B-class+ models (out-of-vocab
+        // draft tokens). Every pool picks its rung by this device field.
+        if let Some(dev) = self.gpu_device.as_mut() {
+            dev.kv_addressing = scratchy_target_metal::tape::lowered::KvAddressing::Chunked;
+        }
 
         // Phase 8 foundation: dedicated MTLCommandQueue for the draft
         // chain. Two queues on the same device run concurrently on
@@ -1236,9 +1278,10 @@ impl MetalWorker {
         // engine's `num_gpu_blocks` is the post-split target count and
         // the draft can mirror it exactly.
         let draft_blocks = num_gpu_blocks;
-        // Runtime per-sequence block-table capacity for the draft pool (mirrors
-        // the target: same max_model_len, capped at the draft block count).
-        let draft_block_cap = self.kv_block_cap(draft_blocks);
+        // The draft pool's block-table width: the draft model's KV cap rung for the target's
+        // max_model_len, capped at the draft block count.
+        let (draft_block_cap, _) =
+            self.metal_rung(model.as_ref(), self.kv_block_cap(draft_blocks))?;
         let device = self
             .gpu_device
             .as_ref()
@@ -1256,18 +1299,6 @@ impl MetalWorker {
 
         let mtl_device = device.device.clone();
         let residency = device.allocator.residency().clone();
-
-        // The `attention_via_cache_v2_*` kernel's BPC=0 fast path has an
-        // unresolved interaction with the draft K-step chain on 3B-class+
-        // models (out-of-vocab token IDs from the draft proposer). The
-        // chunked-addressing path produces coherent output. Force it now
-        // — single-buffer backing still applies; only the kernel's per-
-        // block addressing differs.
-        scratchy_target_metal::interpreter::metal::lowering::force_chunked_attention_addressing();
-        info!(
-            "ScratchyWorker(metal): draft model loaded — engaging chunked attention \
-             addressing (BPC=0 fast path off for spec-decode safety)"
-        );
 
         let t_pool = std::time::Instant::now();
         let blocks_per_chunk = scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize;
@@ -1414,10 +1445,6 @@ impl MetalWorker {
             })?;
             model.vocab_size() as u32
         };
-        let gpu_device = self
-            .gpu_device
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: no gpu_device".into()))?;
         let arena = self
             .sampler_arena
             .as_ref()
@@ -1435,7 +1462,7 @@ impl MetalWorker {
             |id| self.input_batch.history(id),
             vocab,
         );
-        Ok(arena.prepare_step(&gpu_device.device, &params, jobs.len() as u32))
+        Ok(arena.prepare_step(&params, jobs.len() as u32))
     }
 }
 
@@ -1452,7 +1479,6 @@ impl MetalWorker {
 /// the K argmax buffers and returns iter-major `[k][num_reqs]`
 /// argmax IDs.
 #[cfg(feature = "metal")]
-#[allow(clippy::too_many_arguments)]
 fn metal_chain_dispatch(
     model_ref: &dyn scratchy_forward_compiler::ScratchyWeights,
     kv_cache_ref: &KvCachePool,
@@ -1460,7 +1486,6 @@ fn metal_chain_dispatch(
     argmax_kernels: &scratchy_target_metal::argmax::ArgmaxKernels,
     chain_kernel: &scratchy_target_metal::chain_advance::ChainAdvanceKernel,
     req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
-    block_size: usize,
     k: usize,
 ) -> Result<Vec<Vec<u32>>, String> {
     use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
@@ -1546,16 +1571,13 @@ fn metal_chain_dispatch(
         pinned_argmax.iter().map(|b| (**b).clone()).collect();
 
     // ── 3. Pack constants ───────────────────────────────────────
-    let pinned_consts = pin_zeroed(16);
+    let pinned_consts = pin_zeroed(8);
     residency.commit();
     let consts_buf = (*pinned_consts).clone();
-    let vocab_u32 = model_ref.vocab_size() as u32;
     unsafe {
         let p = consts_buf.contents().as_ptr() as *mut u32;
         *p.add(0) = req.num_tokens as u32;
-        *p.add(1) = vocab_u32;
-        *p.add(2) = block_size as u32;
-        *p.add(3) = req.block_table_stride as u32;
+        *p.add(1) = req.block_table_stride as u32;
     }
 
     // ── 4. Build K argmax_dual_write argument tables ────────────
@@ -1563,7 +1585,7 @@ fn metal_chain_dispatch(
         .map(|_| {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
             let desc = MTL4ArgumentTableDescriptor::new();
-            desc.setMaxBufferBindCount(5);
+            desc.setMaxBufferBindCount(4);
             mtl_device
                 .newArgumentTableWithDescriptor_error(&desc)
                 .expect("argmax dual_write arg_table alloc returned nil")
@@ -1574,7 +1596,7 @@ fn metal_chain_dispatch(
     let chain_arg_table = {
         use ::objc2_metal::MTL4ArgumentTableDescriptor;
         let desc = MTL4ArgumentTableDescriptor::new();
-        desc.setMaxBufferBindCount(7);
+        desc.setMaxBufferBindCount(6);
         mtl_device
             .newArgumentTableWithDescriptor_error(&desc)
             .expect("chain_advance arg_table alloc returned nil")
@@ -1629,7 +1651,6 @@ fn metal_chain_dispatch(
         argmax_kernels as *const scratchy_target_metal::argmax::ArgmaxKernels as usize;
     let chain_kernel_addr: usize =
         chain_kernel as *const scratchy_target_metal::chain_advance::ChainAdvanceKernel as usize;
-    let dtype = model_ref.metal_dtype();
 
     let argmax_bufs_for_closure = argmax_bufs.clone();
     let consts_buf_for_closure = consts_buf.clone();
@@ -1657,7 +1678,6 @@ fn metal_chain_dispatch(
             };
 
             let logits_buf = handle.logits_buf();
-            let vocab = handle.vocab();
             let logits_addr = logits_buf.gpuAddress();
             let consts_addr = consts_buf_for_closure.gpuAddress();
             let next_in_addr = runtime.input_ids.gpuAddress();
@@ -1670,9 +1690,8 @@ fn metal_chain_dispatch(
                 chain_arg_table_for_closure.setAddress_atIndex(runtime.seq_used_k.gpuAddress(), 2);
                 chain_arg_table_for_closure
                     .setAddress_atIndex(runtime.block_tables[0].gpuAddress(), 3);
-                chain_arg_table_for_closure.setAddress_atIndex(consts_addr + 8, 4);
-                chain_arg_table_for_closure.setAddress_atIndex(consts_addr + 12, 5);
-                chain_arg_table_for_closure.setAddress_atIndex(consts_addr, 6);
+                chain_arg_table_for_closure.setAddress_atIndex(consts_addr + 4, 4);
+                chain_arg_table_for_closure.setAddress_atIndex(consts_addr, 5);
             }
 
             for iter in 0..k_usize {
@@ -1684,33 +1703,15 @@ fn metal_chain_dispatch(
                     table.setAddress_atIndex(logits_addr, 0);
                     table.setAddress_atIndex(out_addr, 1);
                     table.setAddress_atIndex(consts_addr, 2);
-                    table.setAddress_atIndex(consts_addr + 4, 3);
-                    table.setAddress_atIndex(next_in_addr, 4);
+                    table.setAddress_atIndex(next_in_addr, 3);
                 }
-                let _ = vocab;
-                match dtype {
-                    scratchy_target_metal::interpreter::metal::MetalDtype::F16 => {
-                        scratchy_target_metal::argmax::encode_argmax_f16_dual_write_into_mtl4(
-                            argmax_kernels_ref,
-                            enc,
-                            table,
-                            num_reqs_u32,
-                        )
-                        .map_err(|e| format!("encode argmax_f16_dual_write: {e:?}"))?;
-                    }
-                    scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => {
-                        scratchy_target_metal::argmax::encode_argmax_bf16_dual_write_into_mtl4(
-                            argmax_kernels_ref,
-                            enc,
-                            table,
-                            num_reqs_u32,
-                        )
-                        .map_err(|e| format!("encode argmax_bf16_dual_write: {e:?}"))?;
-                    }
-                    scratchy_target_metal::interpreter::metal::MetalDtype::Int4 => {
-                        return Err("argmax: int4 dtype has no direct kernel".into());
-                    }
-                }
+                scratchy_target_metal::argmax::encode_argmax_dual_write_into_mtl4(
+                    argmax_kernels_ref,
+                    enc,
+                    table,
+                    num_reqs_u32,
+                )
+                .map_err(|e| format!("encode argmax_dual_write: {e:?}"))?;
 
                 if iter + 1 < k_usize {
                     scratchy_target_metal::chain_advance::encode_chain_advance_into_mtl4(
@@ -1819,10 +1820,12 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // buffers can be pinned without extending `device_buf`'s borrow.
         let residency = device_buf.allocator.residency().clone();
 
-        let argmax_kernels = self
-            .argmax_kernels
-            .as_ref()
-            .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
+        let argmax_kernels = match model {
+            ModelHandle::TARGET => &self.argmax_kernels,
+            _ => &self.draft_argmax_kernels,
+        }
+        .as_ref()
+        .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
 
         // ── 1. Upload host slices to fresh shared-storage MTLBuffers ─────
         let buf_input_ids = Self::alloc_shared_u32_buf(&mtl_device, req.input_ids);
@@ -1925,6 +1928,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 queue: draft_q,
                 allocator: main_dev.allocator.clone(),
                 metal_bucket_max_m: main_dev.metal_bucket_max_m,
+                kv_addressing: main_dev.kv_addressing,
             })
         } else {
             None
@@ -2064,7 +2068,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             &mtl_device,
             &residency,
             req.num_tokens.max(1) * 4,
-        ) | reserve_pinned(&mut self.argmax_consts, &mtl_device, &residency, 8);
+        ) | reserve_pinned(&mut self.argmax_consts, &mtl_device, &residency, 4);
         if grew {
             residency.commit();
         }
@@ -2073,12 +2077,11 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         let arg_table = {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
             let desc = MTL4ArgumentTableDescriptor::new();
-            desc.setMaxBufferBindCount(4);
+            desc.setMaxBufferBindCount(3);
             mtl_device
                 .newArgumentTableWithDescriptor_error(&desc)
                 .expect("argmax arg_table alloc returned nil")
         };
-        let dtype = model_ref.metal_dtype();
         let argmax_out_for_closure = argmax_out.clone();
         let consts_for_closure = consts_buf.clone();
         let arg_table_for_closure = arg_table.clone();
@@ -2101,24 +2104,22 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             use ::objc2_metal::{MTLBuffer, MTLDevice};
             let kernels_addr =
                 kernels as *const scratchy_target_metal::grammar_mask::GrammarMaskKernels as usize;
-            let grew =
-                reserve_pinned(
-                    &mut self.grammar_buf_allow,
-                    &mtl_device,
-                    &residency,
-                    h.allow_bits.len().max(1) * 4,
-                ) | reserve_pinned(
-                    &mut self.grammar_buf_rows,
-                    &mtl_device,
-                    &residency,
-                    h.rows.len().max(1) * 4,
-                ) | reserve_pinned(&mut self.grammar_buf_gconsts, &mtl_device, &residency, 8);
+            let grew = reserve_pinned(
+                &mut self.grammar_buf_allow,
+                &mtl_device,
+                &residency,
+                h.allow_bits.len().max(1) * 4,
+            ) | reserve_pinned(
+                &mut self.grammar_buf_rows,
+                &mtl_device,
+                &residency,
+                h.rows.len().max(1) * 4,
+            );
             if grew {
                 residency.commit();
             }
             let allow = self.grammar_buf_allow.as_ref().unwrap();
             let rows = self.grammar_buf_rows.as_ref().unwrap();
-            let gconsts = self.grammar_buf_gconsts.as_ref().unwrap();
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     h.allow_bits.as_ptr(),
@@ -2130,17 +2131,11 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                     rows.contents().as_ptr() as *mut u32,
                     h.rows.len(),
                 );
-                let gc = [h.vocab, h.words_per_row];
-                std::ptr::copy_nonoverlapping(
-                    gc.as_ptr(),
-                    gconsts.contents().as_ptr() as *mut u32,
-                    gc.len(),
-                );
             }
             let arg_table = {
                 use ::objc2_metal::MTL4ArgumentTableDescriptor;
                 let desc = MTL4ArgumentTableDescriptor::new();
-                desc.setMaxBufferBindCount(5);
+                desc.setMaxBufferBindCount(3);
                 mtl_device
                     .newArgumentTableWithDescriptor_error(&desc)
                     .expect("grammar_mask arg_table alloc returned nil")
@@ -2148,7 +2143,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             Some(GrammarMaskGpu {
                 allow_bits: (**allow).clone(),
                 rows: (**rows).clone(),
-                gconsts: (**gconsts).clone(),
                 arg_table,
                 num_rows: h.rows.len() as u32,
                 kernels_addr,
@@ -2198,7 +2192,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 let consts_ptr = consts_for_closure.contents().as_ptr() as *mut u32;
                 unsafe {
                     *consts_ptr = total_n_actual;
-                    *consts_ptr.add(1) = vocab_actual;
                 }
                 use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
                 let logits_addr = logits_buf.gpuAddress();
@@ -2208,7 +2201,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                     arg_table_for_closure.setAddress_atIndex(logits_addr, 0);
                     arg_table_for_closure.setAddress_atIndex(out_addr, 1);
                     arg_table_for_closure.setAddress_atIndex(consts_addr, 2);
-                    arg_table_for_closure.setAddress_atIndex(consts_addr + 4, 3);
                 }
                 // ── Grammar mask (constrained / guided decoding) ─────────
                 // Runs on THIS encoder before argmax: forces every token
@@ -2218,79 +2210,38 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 // pre-barrier then orders mask-write -> argmax-read.
                 #[cfg(feature = "guided-decoding")]
                 if let Some(ref gm) = grammar_mask_ctx {
-                    // Mask the FULL runtime logits width. The shader treats any
-                    // slot beyond the bitset (`words_per_row*32`, i.e. the
-                    // lm_head's vocab padding past the tokenizer vocab) as
-                    // disallowed, so padded tokens can never be sampled and the
-                    // bits[] read stays in bounds — no host-side clamp needed.
-                    // gconsts[1] (words_per_row) was set on the host.
-                    let gconsts_ptr = gm.gconsts.contents().as_ptr() as *mut u32;
-                    unsafe {
-                        *gconsts_ptr = vocab_actual;
-                    }
-                    let gconsts_addr = gm.gconsts.gpuAddress();
+                    // Mask the FULL logits width. The shader treats any slot
+                    // beyond the bitset (the lm_head's vocab padding past the
+                    // tokenizer vocab) as disallowed, so padded tokens can never
+                    // be sampled and the bits[] read stays in bounds.
                     unsafe {
                         gm.arg_table.setAddress_atIndex(logits_addr, 0);
                         gm.arg_table
                             .setAddress_atIndex(gm.allow_bits.gpuAddress(), 1);
                         gm.arg_table.setAddress_atIndex(gm.rows.gpuAddress(), 2);
-                        gm.arg_table.setAddress_atIndex(gconsts_addr, 3);
-                        gm.arg_table.setAddress_atIndex(gconsts_addr + 4, 4);
                     }
                     let gm_kernels: &scratchy_target_metal::grammar_mask::GrammarMaskKernels = unsafe {
                         &*(gm.kernels_addr
                             as *const scratchy_target_metal::grammar_mask::GrammarMaskKernels)
                     };
-                    match dtype {
-                        scratchy_target_metal::interpreter::metal::MetalDtype::F16 => {
-                            scratchy_target_metal::grammar_mask::encode_grammar_mask_f16_into_mtl4(
-                                gm_kernels,
-                                enc,
-                                &gm.arg_table,
-                                gm.num_rows,
-                            )
-                            .map_err(|e| format!("encode_grammar_mask_f16: {e:?}"))?;
-                        }
-                        scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => {
-                            scratchy_target_metal::grammar_mask::encode_grammar_mask_bf16_into_mtl4(
-                                gm_kernels,
-                                enc,
-                                &gm.arg_table,
-                                gm.num_rows,
-                            )
-                            .map_err(|e| format!("encode_grammar_mask_bf16: {e:?}"))?;
-                        }
-                        scratchy_target_metal::interpreter::metal::MetalDtype::Int4 => {
-                            return Err("grammar_mask: int4 dtype has no direct kernel".into());
-                        }
-                    }
+                    scratchy_target_metal::grammar_mask::encode_grammar_mask_into_mtl4(
+                        gm_kernels,
+                        enc,
+                        &gm.arg_table,
+                        gm.num_rows,
+                    )
+                    .map_err(|e| format!("encode_grammar_mask: {e:?}"))?;
                 }
                 let argmax_kernels_ref: &scratchy_target_metal::argmax::ArgmaxKernels = unsafe {
                     &*(argmax_kernels_addr as *const scratchy_target_metal::argmax::ArgmaxKernels)
                 };
-                match dtype {
-                    scratchy_target_metal::interpreter::metal::MetalDtype::F16 => {
-                        scratchy_target_metal::argmax::encode_argmax_f16_into_mtl4(
-                            argmax_kernels_ref,
-                            enc,
-                            &arg_table_for_closure,
-                            total_n_actual,
-                        )
-                        .map_err(|e| format!("encode_argmax_f16: {e:?}"))?;
-                    }
-                    scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => {
-                        scratchy_target_metal::argmax::encode_argmax_bf16_into_mtl4(
-                            argmax_kernels_ref,
-                            enc,
-                            &arg_table_for_closure,
-                            total_n_actual,
-                        )
-                        .map_err(|e| format!("encode_argmax_bf16: {e:?}"))?;
-                    }
-                    scratchy_target_metal::interpreter::metal::MetalDtype::Int4 => {
-                        return Err("argmax: int4 dtype has no direct kernel".into());
-                    }
-                }
+                scratchy_target_metal::argmax::encode_argmax_into_mtl4(
+                    argmax_kernels_ref,
+                    enc,
+                    &arg_table_for_closure,
+                    total_n_actual,
+                )
+                .map_err(|e| format!("encode_argmax: {e:?}"))?;
                 // Fused sampler: encode cast → [penalties] → sample onto THIS
                 // encoder, after argmax, reading the (grammar-masked) logits.
                 if let Some(ps) = sampler
@@ -2393,7 +2344,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         model: ::scratchy_serving_engine::spec_decode::ModelHandle,
         kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
-        block_size: usize,
+        _block_size: usize,
         k: usize,
     ) -> Result<Vec<Vec<u32>>, ::scratchy_serving_engine::spec_decode::BackendError> {
         use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
@@ -2425,14 +2376,18 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
             };
 
-        let argmax_kernels = self
-            .argmax_kernels
-            .as_ref()
-            .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
-        let chain_kernel = self
-            .chain_advance_kernel
-            .as_ref()
-            .ok_or_else(|| BackendError::Backend("chain_advance_kernel not built".into()))?;
+        let argmax_kernels = match model {
+            ModelHandle::TARGET => &self.argmax_kernels,
+            _ => &self.draft_argmax_kernels,
+        }
+        .as_ref()
+        .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
+        let chain_kernel = match model {
+            ModelHandle::TARGET => &self.chain_advance_kernel,
+            _ => &self.draft_chain_advance_kernel,
+        }
+        .as_ref()
+        .ok_or_else(|| BackendError::Backend("chain_advance_kernel not built".into()))?;
 
         // Phase 8 routing: when the call is for the draft model AND a
         // dedicated `draft_queue` exists, route through a shadow
@@ -2447,6 +2402,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 queue: draft_q,
                 allocator: main_dev.allocator.clone(),
                 metal_bucket_max_m: main_dev.metal_bucket_max_m,
+                kv_addressing: main_dev.kv_addressing,
             })
         } else {
             None
@@ -2466,7 +2422,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             argmax_kernels,
             chain_kernel,
             req,
-            block_size,
             k,
         )
         .map_err(BackendError::Backend)
@@ -2829,8 +2784,11 @@ impl Worker for MetalWorker {
         // here on the worker rather than living in the per-canonical
         // `MetalWorkerPool`.
         let t_argmax = std::time::Instant::now();
-        let argmax = scratchy_target_metal::argmax::ArgmaxKernels::new(&gpu_device.device)
-            .map_err(|e| ExecutorError::WorkerInit(format!("argmax kernel compile: {e:?}")))?;
+        let off_tape = scratchy_target_metal::off_tape::OffTapeKernels::of(model.metal_off_tape())
+            .map_err(|e| ExecutorError::WorkerInit(format!("off-tape kernels: {e}")))?;
+        let argmax =
+            scratchy_target_metal::argmax::ArgmaxKernels::new(&gpu_device.device, off_tape)
+                .map_err(|e| ExecutorError::WorkerInit(format!("argmax kernel compile: {e:?}")))?;
         info!(
             "ScratchyWorker(metal): ArgmaxKernels::new in {:?}",
             t_argmax.elapsed()
@@ -2842,8 +2800,12 @@ impl Worker for MetalWorker {
         // engaged when a request is non-greedy; greedy decode keeps the fused
         // argmax fast-path.
         let t_sampler = std::time::Instant::now();
-        let sampler = scratchy_target_metal::sampling::SamplerKernels::new(&gpu_device.device)
-            .map_err(|e| ExecutorError::WorkerInit(format!("sampler kernel compile: {e:?}")))?;
+        let sampler = scratchy_target_metal::sampling::SamplerKernels::new(
+            &gpu_device.device,
+            off_tape.vocab,
+            off_tape.sampler(),
+        )
+        .map_err(|e| ExecutorError::WorkerInit(format!("sampler kernel compile: {e:?}")))?;
         info!(
             "ScratchyWorker(metal): SamplerKernels::new in {:?}",
             t_sampler.elapsed()
@@ -2859,19 +2821,8 @@ impl Worker for MetalWorker {
             &gpu_device.device,
             gpu_device.allocator.residency(),
             self.config.max_num_seqs.max(1) as u32,
-            model.vocab_size() as u32,
+            &sampler,
             max_model_len.max(1) as u32,
-            match model.metal_dtype() {
-                scratchy_target_metal::interpreter::metal::MetalDtype::Bf16 => {
-                    scratchy_target_metal::sampling::CastDtype::Bf16
-                }
-                scratchy_target_metal::interpreter::metal::MetalDtype::F16 => {
-                    scratchy_target_metal::sampling::CastDtype::F16
-                }
-                scratchy_target_metal::interpreter::metal::MetalDtype::Int4 => {
-                    scratchy_target_metal::sampling::CastDtype::Bf16
-                }
-            },
         );
         info!(
             "ScratchyWorker(metal): sampler arena in {:?}",
@@ -2882,11 +2833,11 @@ impl Worker for MetalWorker {
         // alongside argmax so the K-step chain driver never falls into
         // pipeline-compile latency on the first call.
         let t_chain = std::time::Instant::now();
-        let chain_advance =
-            scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(&gpu_device.device)
-                .map_err(|e| {
-                    ExecutorError::WorkerInit(format!("chain_advance kernel compile: {e:?}"))
-                })?;
+        let chain_advance = scratchy_target_metal::chain_advance::ChainAdvanceKernel::new(
+            &gpu_device.device,
+            off_tape,
+        )
+        .map_err(|e| ExecutorError::WorkerInit(format!("chain_advance kernel compile: {e:?}")))?;
         info!(
             "ScratchyWorker(metal): ChainAdvanceKernel::new in {:?}",
             t_chain.elapsed()
@@ -2900,11 +2851,13 @@ impl Worker for MetalWorker {
         #[cfg(feature = "guided-decoding")]
         {
             let t_gm = std::time::Instant::now();
-            let grammar_mask =
-                scratchy_target_metal::grammar_mask::GrammarMaskKernels::new(&gpu_device.device)
-                    .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("grammar_mask kernel compile: {e:?}"))
-                    })?;
+            let grammar_mask = scratchy_target_metal::grammar_mask::GrammarMaskKernels::new(
+                &gpu_device.device,
+                &off_tape.grammar_mask,
+            )
+            .map_err(|e| {
+                ExecutorError::WorkerInit(format!("grammar_mask kernel compile: {e:?}"))
+            })?;
             info!(
                 "ScratchyWorker(metal): GrammarMaskKernels::new in {:?}",
                 t_gm.elapsed()
@@ -2999,13 +2952,12 @@ impl Worker for MetalWorker {
             }
         };
 
-        // Runtime per-sequence block-table capacity for this pool. Replaces the
-        // compile-time `W::MAX_BLOCKS_PER_SEQ` (default 128 ≈ 2k tokens) so long
-        // context isn't silently truncated. Stored on the pool; the host
-        // block-table stride (execute_model), the kernel `MaxBlocksPerSeq`
-        // function constant, and the rope-once scratch all read it back so the
-        // three agree. Capped at `num_gpu_blocks` (the blocks actually allocated).
-        let pool_block_cap = self.kv_block_cap(num_gpu_blocks);
+        // Per-sequence block-table width for this pool: the model's KV cap rung for the
+        // max_model_len-derived capacity, capped at `num_gpu_blocks` (the blocks actually
+        // allocated). Stored on the pool; the host block-table stride (execute_model) reads it
+        // back, and the pool's tapes are baked for it.
+        let (pool_block_cap, _) =
+            self.metal_rung(model.as_ref(), self.kv_block_cap(num_gpu_blocks))?;
         info!(
             "ScratchyWorker(metal): KV block-table capacity (max_blocks_per_seq) = {pool_block_cap} \
              (max_model_len-derived, pool {num_gpu_blocks} blocks × {} tokens/block)",
@@ -3423,7 +3375,16 @@ impl Worker for MetalWorker {
         } else {
             arena_peak
         };
-        let peak_activation_estimate = arena_peak_pair.saturating_add(64 * 1024 * 1024);
+        // The scratch buffers of the KV cap rung each pool runs on, at the largest capacity a
+        // sequence can reach (max_model_len): counted before the KV pool takes the rest, so a
+        // rung whose scratch does not fit is refused here (the guard below), not at allocation.
+        let full_cap = self.kv_block_cap(usize::MAX);
+        let models = [self.model.as_deref(), self.draft_model.as_deref()];
+        let rung_scratch = (models.into_iter().flatten())
+            .map(|m| self.metal_rung(m, full_cap).map(|(_, scratch)| scratch))
+            .sum::<ExecutorResult<u64>>()?;
+        let peak_activation_estimate = (arena_peak_pair.saturating_add(64 * 1024 * 1024))
+            .saturating_add(usize::try_from(rung_scratch).unwrap_or(usize::MAX));
         // `total` already folds in `gpu_memory_utilization` and is capped at
         // the wireable `maxBufferLength`, so pass util=1.0 here — applying it
         // again would shrink the KV budget a second time below the headroom
@@ -3463,12 +3424,13 @@ impl Worker for MetalWorker {
         };
         info!(
             "ScratchyWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
-             arena_peak={:.1} MiB (pair={:.1} MiB), tq_seed={:.1} MiB, kv_budget={:.1} GiB \
+             arena_peak={:.1} MiB (pair={:.1} MiB), rung_scratch={:.1} MiB, tq_seed={:.1} MiB, kv_budget={:.1} GiB \
              (target_share={:.1} GiB, draft_reserve={:.1} GiB)",
             total as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
             arena_peak as f64 / 1_048_576.0,
             arena_peak_pair as f64 / 1_048_576.0,
+            rung_scratch as f64 / 1_048_576.0,
             tq_seed as f64 / 1_048_576.0,
             available as f64 / 1_073_741_824.0,
             available_reported as f64 / 1_073_741_824.0,
@@ -3978,7 +3940,6 @@ impl Worker for MetalWorker {
             if !self.grammar_states.is_empty() {
                 let vocab = self.model.as_deref().map(|m| m.vocab_size()).unwrap_or(0) as u32;
                 if vocab > 0 {
-                    let wpr = scratchy_target_metal::grammar_mask::words_per_row(vocab);
                     let mut rows: Vec<u32> = Vec::new();
                     let mut allow_bits: Vec<u32> = Vec::new();
                     for (i, req_id) in req_ids_in_order.iter().enumerate() {
@@ -4005,12 +3966,7 @@ impl Worker for MetalWorker {
                         );
                     }
                     if !rows.is_empty() {
-                        self.grammar_pending = Some(GrammarMaskHost {
-                            rows,
-                            allow_bits,
-                            vocab,
-                            words_per_row: wpr,
-                        });
+                        self.grammar_pending = Some(GrammarMaskHost { rows, allow_bits });
                     }
                 }
             }
@@ -4280,12 +4236,14 @@ impl Worker for MetalWorker {
                 // kernels so the speculative chain can call
                 // `metal_chain_dispatch` from inside the thread
                 // (no `&self` access while target verify is in flight).
-                let spec9_argmax_addr: usize = self.argmax_kernels.as_ref().map_or(0, |k| {
+                let spec9_argmax_addr: usize = self.draft_argmax_kernels.as_ref().map_or(0, |k| {
                     k as *const scratchy_target_metal::argmax::ArgmaxKernels as usize
                 });
-                let spec9_chain_addr: usize = self.chain_advance_kernel.as_ref().map_or(0, |k| {
-                    k as *const scratchy_target_metal::chain_advance::ChainAdvanceKernel as usize
-                });
+                let spec9_chain_addr: usize =
+                    self.draft_chain_advance_kernel.as_ref().map_or(0, |k| {
+                        k as *const scratchy_target_metal::chain_advance::ChainAdvanceKernel
+                            as usize
+                    });
                 let main_dev = self.gpu_device.as_ref().expect("init");
                 let mtl_device_clone = main_dev.device.clone();
                 let allocator_clone = main_dev.allocator.clone();
@@ -4328,6 +4286,9 @@ impl Worker for MetalWorker {
                             // Draft chain shadow device: draft is a small
                             // non-GDN model; keep all its buckets (no prune).
                             metal_bucket_max_m: None,
+                            // The draft chain runs under spec-decode: chunked addressing.
+                            kv_addressing:
+                                scratchy_target_metal::tape::lowered::KvAddressing::Chunked,
                         };
                         // Upload host slices into fresh shared
                         // MTLBuffers (thread-local, dropped at thread
@@ -4531,7 +4492,6 @@ impl Worker for MetalWorker {
                                 argmax_kernels_ref,
                                 chain_kernel_ref,
                                 &spec_req,
-                                spec9_block_size_thread,
                                 spec9_k_thread,
                             )
                             .unwrap_or_else(|_e| Vec::new())
@@ -4913,7 +4873,6 @@ impl Worker for MetalWorker {
             self.grammar_pending = None;
             self.grammar_buf_allow = None;
             self.grammar_buf_rows = None;
-            self.grammar_buf_gconsts = None;
             self.grammar_states.clear();
             self.grammar_factory = None;
         }

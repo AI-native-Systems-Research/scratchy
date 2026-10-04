@@ -15,6 +15,9 @@ use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::grammar_mask::{
     GRAMMAR_MASK_TG_SIZE, GrammarMaskKernels, push_allow_bitset_row, words_per_row,
 };
+use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
+use scratchy_target_metal::tape::ids::{BitsetWords, LogitsWidth};
+use scratchy_target_metal::tape::kernel_constants::GrammarMaskConstants;
 
 /// argmax of a masked logits row (smaller index wins ties), matching the
 /// `argmax` kernel convention. Treats -inf as "never chosen".
@@ -31,9 +34,9 @@ fn argmax_row(row: &[f32]) -> usize {
 }
 
 /// grammar_mask kernel binding contract: `buffer(0)=logits` (in/out),
-/// `buffer(1)=allow_bits`, `buffer(2)=rows`, `buffer(3)=vocab` (u32),
-/// `buffer(4)=words_per_row` (u32); grid is one threadgroup per masked
-/// row, `GRAMMAR_MASK_TG_SIZE` threads striding the vocab axis.
+/// `buffer(1)=allow_bits`, `buffer(2)=rows`; the logits width and bitset
+/// stride baked in; grid is one threadgroup per masked row,
+/// `GRAMMAR_MASK_TG_SIZE` threads striding the vocab axis.
 fn run_grammar_mask_mtl4(
     use_bf16: bool,
     logits: &common::Buffer,
@@ -46,18 +49,22 @@ fn run_grammar_mask_mtl4(
     let device = detect_device()
         .expect("Metal 4 GPU present (caller pre-guards)")
         .device;
-    let kernels = GrammarMaskKernels::new(&device).expect("grammar_mask kernels");
-    let pso = if use_bf16 {
-        &kernels.bf16
+    let function = if use_bf16 {
+        "grammar_mask_bf16"
     } else {
-        &kernels.f16
+        "grammar_mask_f16"
     };
-    let vocab_buf = common::shared_u32(&device, vocab);
-    let wpr_buf = common::shared_u32(&device, words_per_row);
+    let constants = GrammarMaskConstants {
+        vocab: LogitsWidth(vocab),
+        words_per_row: BitsetWords(words_per_row),
+    };
+    let key = PipelineKey::new("grammar_mask", function, constants.into());
+    let baked = scratchy_target_metal::aot::baked_kernels(&[key]);
+    let kernels = GrammarMaskKernels::new(&device, &baked[0]).expect("grammar_mask kernels");
     common::dispatch_threadgroups(
         &device,
-        pso,
-        &[logits, allow_buf, rows_buf, &vocab_buf, &wpr_buf],
+        &kernels.mask,
+        &[logits, allow_buf, rows_buf],
         MTLSize {
             width: num_rows as usize,
             height: 1,

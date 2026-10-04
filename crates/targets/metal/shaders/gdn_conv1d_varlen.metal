@@ -28,18 +28,19 @@
 // `x`/`w` are model dtype (`T`), f32-accumulated; `conv_out` + `conv_state`
 // are f32. Per-channel (depthwise) so GVA / head grouping does not apply here.
 //
-// Function constants:
+// Baked constants:
 //   GDN_CONV_DIM    — conv_dim (= 2*key_dim + value_dim)
 //   GDN_CONV_KERNEL — kernel_size (<= GDN_CONV_KMAX)
 //
 // Dispatch: grid (num_seqs, ceil(conv_dim/tg), 1); one thread per (seq, channel).
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint GDN_CONV_DIM    [[function_constant(0)]];
-constant uint GDN_CONV_KERNEL [[function_constant(1)]];
+SCRATCHY_CONSTANT(uint, GDN_CONV_DIM, 0);
+SCRATCHY_CONSTANT(uint, GDN_CONV_KERNEL, 1);
 
 // Upper bound for the register window/weights (kernel-1 and kernel). GDN conv
 // kernels are tiny (Qwen3.5 uses 4); 8 is a safe compile-time ceiling.
@@ -111,18 +112,8 @@ template <typename T>
   }
 }
 
-#define INST_GDN_CONV1D_VARLEN(dtype_tag, mtl_type)                          \
-  template [[host_name("gdn_conv1d_varlen_" #dtype_tag)]] [[kernel]] void    \
-  gdn_conv1d_varlen<mtl_type>(                                               \
-      device       float*    conv_out      [[buffer(0)]],                    \
-      const device mtl_type* x             [[buffer(1)]],                    \
-      const device mtl_type* w             [[buffer(2)]],                    \
-      device       float*    conv_state    [[buffer(3)]],                    \
-      const device int*      cu_seqlens    [[buffer(4)]],                    \
-      const device int*      state_indices [[buffer(5)]],                    \
-      const device uint*     is_fresh      [[buffer(6)]],                    \
-      uint3 tgid [[threadgroup_position_in_grid]],                           \
-      uint3 tpig [[thread_position_in_grid]]);
+#define INST_GDN_CONV1D_VARLEN(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gdn_conv1d_varlen_##dtype_tag, gdn_conv1d_varlen<mtl_type>)
 
 INST_GDN_CONV1D_VARLEN(f16,  half)
 INST_GDN_CONV1D_VARLEN(bf16, bfloat)

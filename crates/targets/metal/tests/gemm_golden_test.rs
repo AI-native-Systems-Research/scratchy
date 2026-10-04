@@ -3,16 +3,18 @@
 //! picks (`pipeline_for_gemm`: one row runs MLX's GEMV, `gemv_{f16,bf16}_specialized`; more rows
 //! the MMA GEMM, `gemm_{f16,bf16}_specialized`) vs the CPU reference across Llama
 //! Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to 8192) and Gemma-4's MoE
-//! router. M/N/K are baked into the pipeline as function constants, so the only bindings are
+//! router. M/N/K are compiled into the kernel, so the only bindings are
 //! output(0), input(1), weight(2).
 
 mod common;
 
 use half::{bf16, f16};
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_kernels;
 use scratchy_target_metal::cpu_golden;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::interpreter::metal::__re::ComputePipelineState;
+use scratchy_target_metal::interpreter::metal::pipelines::gemm_pipeline;
 use scratchy_target_metal::interpreter::metal::{GemmDims, MetalDtype, SpecializedPipelines};
 use scratchy_target_metal::specialized_pipeline_cache::SpecializedPipelineCache;
 
@@ -57,10 +59,23 @@ fn gemm(
     )
 }
 
+/// The pipelines, every `SHAPES` GEMM baked at both dtypes as a model's tape bakes its own.
 fn make_pipelines() -> Option<(common::Device, SpecializedPipelines)> {
     let device = detect_device()?.device;
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    let keys: Vec<_> = [MetalDtype::Bf16, MetalDtype::F16]
+        .into_iter()
+        .flat_map(|dtype| SHAPES.iter().map(move |&(m, n, k)| (dtype, m, n, k)))
+        .map(|(dtype, m, n, k)| {
+            let (m, n, k) = (m as u32, n as u32, k as u32);
+            gemm_pipeline(dtype, GemmDims { m, n, k })
+                .expect("gemm key")
+                .0
+        })
+        .collect();
+    cache
+        .register_baked(&baked_kernels(&keys))
+        .expect("register baked gemms");
     Some((
         device,
         SpecializedPipelines::new(std::sync::Arc::new(cache)),

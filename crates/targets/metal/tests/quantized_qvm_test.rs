@@ -19,12 +19,12 @@
 mod common;
 
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::affine_qvm_b4_bf16 as cpu_qvm_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
     DequantDtype, QvmKernel, ScaleDtype, pick_qvm_kernel, qvm_dispatch_shape, qvm_kernel_name,
 };
-use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 // ─────────────────────────────────────────────────────────────────
@@ -144,9 +144,7 @@ fn run_qvm_bf16(
         ],
     };
     let kernel_name = qvm_kernel_name(kernel, DequantDtype::Bf16, ScaleDtype::F16, group_size, 4);
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
-    let pipeline = cache
-        .get_pipeline_specialized(&kernel_name, &constants)
+    let pipeline = baked_pipeline(&device, "quantized_qvm", &kernel_name, constants)
         .expect("qvm specialized pipeline");
 
     let (tg, tpg) = qvm_dispatch_shape(kernel, m as u32, n as u32, 1, group_size);

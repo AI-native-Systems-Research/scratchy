@@ -1,73 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! `argmax_f16` — greedy-sample MSL kernel + Rust dispatcher.
+//! `argmax` — greedy-sample MSL kernel + Rust dispatcher, baked per model
+//! ([`crate::off_tape`]).
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
-use objc2_metal::{
-    MTLBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions,
-    MTLSize,
-};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 
-use crate::shader_cache::load_library_from_bytes;
+use crate::off_tape::{OffTapeKernels, OffTapePipeline};
+use crate::shader_cache::ComputePipelineState;
 use crate::stream::MetalStreamError;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
-pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
-pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
-pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 
 pub const ARGMAX_DEFAULT_TG_SIZE: usize = 256;
 
 pub struct ArgmaxKernels {
-    pub f16: ComputePipelineState,
-    pub bf16: ComputePipelineState,
-    /// Phase 6 dual-write variants. Each writes the argmax to BOTH
-    /// the per-iter output buffer (host-visible draft target) AND a
+    pub argmax: OffTapePipeline,
+    /// Phase 6 dual-write variant: writes the argmax to BOTH the
+    /// per-iter output buffer (host-visible draft target) AND a
     /// second buffer (the next K-step iter's `runtime.input_ids`).
     /// Encoded into the same MTL4 compute encoder as the forward; the
     /// next iter's embed kernel reads from `next_in` and Metal's
     /// intra-encoder write→read hazard tracking serializes them.
-    pub f16_dual_write: ComputePipelineState,
-    pub bf16_dual_write: ComputePipelineState,
-    _library: Library,
+    pub dual_write: OffTapePipeline,
 }
 
 impl ArgmaxKernels {
-    pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library = load_library_from_bytes(device, crate::embedded_metallib!("argmax"))
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("load `argmax.metallib`: {e}"))
-            })?;
-        let f16 = build_pipeline(device, &library, "argmax_f16")?;
-        let bf16 = build_pipeline(device, &library, "argmax_bf16")?;
-        let f16_dual_write = build_pipeline(device, &library, "argmax_f16_dual_write")?;
-        let bf16_dual_write = build_pipeline(device, &library, "argmax_bf16_dual_write")?;
+    pub fn new(device: &Device, kernels: &OffTapeKernels) -> Result<Self, MetalStreamError> {
         Ok(Self {
-            f16,
-            bf16,
-            f16_dual_write,
-            bf16_dual_write,
-            _library: library,
+            argmax: OffTapePipeline::new(device, &kernels.argmax)?,
+            dual_write: OffTapePipeline::new(device, &kernels.argmax_dual_write)?,
         })
     }
-}
-
-fn build_pipeline(
-    device: &Device,
-    library: &Library,
-    name: &str,
-) -> Result<ComputePipelineState, MetalStreamError> {
-    let ns_name = NSString::from_str(name);
-    let function = library
-        .newFunctionWithName(&ns_name)
-        .ok_or_else(|| MetalStreamError::ShaderCompilationFailed(format!("{name} fn missing")))?;
-    device
-        .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{name} pipeline: {e:?}")))
 }
 
 /// MTL4 encoder-tail argmax dispatcher.
@@ -83,60 +50,34 @@ fn build_pipeline(
 /// - index 0: logits GPU address
 /// - index 1: output GPU address
 /// - index 2: 4-byte address holding `batch` (u32)
-/// - index 3: 4-byte address holding `vocab` (u32)
-pub fn encode_argmax_f16_into_mtl4(
+pub fn encode_argmax_into_mtl4(
     kernels: &ArgmaxKernels,
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
     batch: u32,
 ) -> Result<(), MetalStreamError> {
-    encode_argmax_into_mtl4_inner(&kernels.f16, encoder, arg_table, batch, "argmax_f16")
-}
-
-pub fn encode_argmax_bf16_into_mtl4(
-    kernels: &ArgmaxKernels,
-    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-    arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
-    batch: u32,
-) -> Result<(), MetalStreamError> {
-    encode_argmax_into_mtl4_inner(&kernels.bf16, encoder, arg_table, batch, "argmax_bf16")
+    encode_argmax_into_mtl4_inner(&kernels.argmax, encoder, arg_table, batch, "argmax")
 }
 
 /// Phase 6 dual-write argmax — writes argmax to TWO buffers in one
-/// dispatch. Bindings (must match `argmax_{bf16,f16}_dual_write` in
+/// dispatch. Bindings (must match `argmax_dual_write` in
 /// `shaders/argmax.metal`):
 ///   index 0: logits      (read)
 ///   index 1: output      (write — host-visible draft buffer)
 ///   index 2: batch       (read const u32)
-///   index 3: vocab       (read const u32)
-///   index 4: next_in     (write — next iter's input_ids buffer)
-pub fn encode_argmax_f16_dual_write_into_mtl4(
+///   index 3: next_in     (write — next iter's input_ids buffer)
+pub fn encode_argmax_dual_write_into_mtl4(
     kernels: &ArgmaxKernels,
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
     batch: u32,
 ) -> Result<(), MetalStreamError> {
     encode_argmax_into_mtl4_inner(
-        &kernels.f16_dual_write,
+        &kernels.dual_write,
         encoder,
         arg_table,
         batch,
-        "argmax_f16_dual_write",
-    )
-}
-
-pub fn encode_argmax_bf16_dual_write_into_mtl4(
-    kernels: &ArgmaxKernels,
-    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-    arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
-    batch: u32,
-) -> Result<(), MetalStreamError> {
-    encode_argmax_into_mtl4_inner(
-        &kernels.bf16_dual_write,
-        encoder,
-        arg_table,
-        batch,
-        "argmax_bf16_dual_write",
+        "argmax_dual_write",
     )
 }
 

@@ -622,7 +622,7 @@ pub enum Instruction {
     /// shape baked at macro-expansion time from the model config, so
     /// the Metal lowering pass + worker can specialize pipelines
     /// (`function_constant`s for moe_weighted_sum, affine_gather_qmv),
-    /// stamp `Binding::Inline` u32s (top_k, axis_size), and size the
+    /// bake the routing kernels' widths (top_k, axis_size), and size the
     /// per-bucket MoE scratch buffer — all without a runtime
     /// shape-resolution detour.
     ///
@@ -993,21 +993,6 @@ pub trait CanonicalParams: WeightAccessors {
     /// Set by `#[vision_forward]` from the vision config.
     const VISION_NUM_HEADS: u32 = 0;
 
-    /// Metal-only: list of compiler-synthesized kernel sources (per
-    /// `scratchy-forward-compiler-macro::fuse_pass`). Each entry is
-    /// `(symbol_name, precompiled .metallib bytes)`. The proc-macro
-    /// AOT-compiles synthesized MSL via `xcrun metal -c` +
-    /// `xcrun metallib` at macro-expansion time and embeds the
-    /// resulting bytes as `&'static [u8]`. The MetalWorkerPool
-    /// registers each via
-    /// `SpecializedPipelineCache::register_metallib_library`
-    /// (`newLibraryWithData`) — same path used by every hand-written
-    /// shader, NOT `newLibraryWithSource`. Default empty — the macro
-    /// overrides this per Metal arch with the actual synthesized
-    /// metallibs from the FUF analysis.
-    fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
-        &[]
-    }
     /// Vision-tower attention head dimension. Same defaults / set-by
     /// rule as [`Self::VISION_NUM_HEADS`].
     const VISION_HEAD_DIM: u32 = 0;

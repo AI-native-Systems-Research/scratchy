@@ -12,23 +12,25 @@
 //! passes (cast, penalties, softmax, byte-histogram descent, compaction) plus
 //! tiny one-threadgroup-per-row decision kernels, all sharing ONE argument
 //! table so the whole pipeline rides the forward's command buffer with Device
-//! barriers between the dependent dispatches — the same MTL4-only lifecycle
-//! as before (`embedded_metallib!` + `build_pipeline`), with
-//! [`encode_into`] encoding the pipeline onto the forward's own encoder.
+//! barriers between the dependent dispatches, with [`encode_into`] encoding the
+//! pipeline onto the forward's own encoder. Each stage is baked per model with
+//! its logits width compiled in ([`crate::off_tape`]).
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
-use objc2_metal::{MTLBuffer as _, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
+use objc2_metal::{MTLBuffer as _, MTLComputePipelineState, MTLDevice, MTLSize};
 
 use crate::mtl4_dispatch::{Buffer, shared_zeroed};
+use crate::off_tape::OffTapePipeline;
 use crate::residency::{MetalResidencySet, Pinned};
-use crate::shader_cache::load_library_from_bytes;
+use crate::specialized_pipeline_cache::PipelineKey;
 use crate::stream::MetalStreamError;
+use crate::tape::ids::LogitsWidth;
+use crate::tape::kernel_constants::SamplerConstants;
+use crate::tape::lowered::BakedKernel;
 
 pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
-pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 
 /// Threads per threadgroup — MUST equal `SAMPLING_BLOCK_SIZE` in
 /// `shaders/sampling.metal` (the kernels stride the vocab axis by exactly this
@@ -54,47 +56,94 @@ pub enum CastDtype {
     F32,
 }
 
-/// The sampler pipeline's kernels (see `shaders/sampling.metal` for the
-/// dispatch order and binding table). Cached once per device at model load
-/// (like `ArgmaxKernels`) to avoid recompiling the MSL each step.
+/// A stage of the sampler pipeline (see `shaders/sampling.metal` for the
+/// dispatch order and binding table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplerStage {
+    Cast,
+    Penalties,
+    SoftmaxReduce,
+    StatsPick,
+    SoftmaxMaterialize,
+    Histogram,
+    ThresholdPick,
+    CountCompact,
+    QuotaPick,
+    CompactTied,
+    Finalize,
+}
+
+impl SamplerStage {
+    pub const COUNT: usize = 11;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Cast,
+        Self::Penalties,
+        Self::SoftmaxReduce,
+        Self::StatsPick,
+        Self::SoftmaxMaterialize,
+        Self::Histogram,
+        Self::ThresholdPick,
+        Self::CountCompact,
+        Self::QuotaPick,
+        Self::CompactTied,
+        Self::Finalize,
+    ];
+
+    fn function(self, cast: CastDtype) -> &'static str {
+        match (self, cast) {
+            (Self::Cast, CastDtype::F16) => "cast_rows_f16_to_f32",
+            (Self::Cast, CastDtype::Bf16) => "cast_rows_bf16_to_f32",
+            (Self::Cast, CastDtype::F32) => "cast_rows_f32_to_f32",
+            (Self::Penalties, _) => "apply_penalties",
+            (Self::SoftmaxReduce, _) => "sample_softmax_reduce",
+            (Self::StatsPick, _) => "sample_stats_pick",
+            (Self::SoftmaxMaterialize, _) => "sample_softmax_materialize",
+            (Self::Histogram, _) => "sample_histogram_pass",
+            (Self::ThresholdPick, _) => "sample_threshold_pick",
+            (Self::CountCompact, _) => "sample_count_compact",
+            (Self::QuotaPick, _) => "sample_quota_pick",
+            (Self::CompactTied, _) => "sample_compact_tied",
+            (Self::Finalize, _) => "sample_finalize",
+        }
+    }
+
+    /// The key this stage's kernel is baked under for logits `vocab` wide,
+    /// cast from `cast`; the stages that spill telemetry carry `telemetry`.
+    pub fn key(self, vocab: LogitsWidth, cast: CastDtype, telemetry: bool) -> PipelineKey {
+        let spills = matches!(self, Self::SoftmaxMaterialize | Self::Finalize);
+        let telemetry = spills.then_some(telemetry);
+        let constants = SamplerConstants { vocab, telemetry };
+        PipelineKey::new("sampling", self.function(cast), constants.into())
+    }
+}
+
+/// The sampler pipeline's kernels, built once per worker at model load (like
+/// `ArgmaxKernels`).
 pub struct SamplerKernels {
-    pub cast_f16: ComputePipelineState,
-    pub cast_bf16: ComputePipelineState,
-    pub cast_f32: ComputePipelineState,
-    pub penalties: ComputePipelineState,
-    pub softmax_reduce: ComputePipelineState,
-    pub stats_pick: ComputePipelineState,
-    pub softmax_materialize: ComputePipelineState,
-    pub histogram: ComputePipelineState,
-    pub threshold_pick: ComputePipelineState,
-    pub count_compact: ComputePipelineState,
-    pub quota_pick: ComputePipelineState,
-    pub compact_tied: ComputePipelineState,
-    pub finalize: ComputePipelineState,
-    _library: Library,
+    vocab: LogitsWidth,
+    slicing: SliceTarget,
+    /// One per [`SamplerStage`], in its order.
+    stages: Vec<OffTapePipeline>,
 }
 
 impl SamplerKernels {
-    pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library = load_library_from_bytes(device, crate::embedded_metallib!("sampling"))
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "load `sampling.metallib`: {e:?}"
-                ))
-            })?;
-        let cast_f16 = build_pipeline(device, &library, "cast_rows_f16_to_f32")?;
-        let cast_bf16 = build_pipeline(device, &library, "cast_rows_bf16_to_f32")?;
-        let cast_f32 = build_pipeline(device, &library, "cast_rows_f32_to_f32")?;
-        let penalties = build_pipeline(device, &library, "apply_penalties")?;
-        let softmax_reduce = build_pipeline(device, &library, "sample_softmax_reduce")?;
-        let stats_pick = build_pipeline(device, &library, "sample_stats_pick")?;
-        let softmax_materialize = build_pipeline(device, &library, "sample_softmax_materialize")?;
-        let histogram = build_pipeline(device, &library, "sample_histogram_pass")?;
-        let threshold_pick = build_pipeline(device, &library, "sample_threshold_pick")?;
-        let count_compact = build_pipeline(device, &library, "sample_count_compact")?;
-        let quota_pick = build_pipeline(device, &library, "sample_quota_pick")?;
-        let compact_tied = build_pipeline(device, &library, "sample_compact_tied")?;
-        let finalize = build_pipeline(device, &library, "sample_finalize")?;
+    /// `stages`: a model's [`OffTapeKernels::sampler`](crate::off_tape::OffTapeKernels::sampler),
+    /// baked for logits `vocab` wide.
+    pub fn new(
+        device: &Device,
+        vocab: LogitsWidth,
+        stages: &[BakedKernel; SamplerStage::COUNT],
+    ) -> Result<Self, MetalStreamError> {
+        let slicing = SliceTarget::of(device)?;
+        let stages = stages
+            .iter()
+            .map(|k| OffTapePipeline::new(device, k))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kernels = Self {
+            vocab,
+            slicing,
+            stages,
+        };
 
         // Fence the one runtime assumption the shaders cannot check themselves:
         // the block reductions require a 32-lane simdgroup (see
@@ -102,7 +151,9 @@ impl SamplerKernels {
         // device could in principle report a different execution width, which
         // would make `warp_buf` indexing / the shuffle reductions wrong. Refuse
         // to load loudly instead of silently sampling wrong tokens.
-        let width = softmax_reduce.threadExecutionWidth();
+        let width = kernels
+            .stage(SamplerStage::SoftmaxReduce)
+            .threadExecutionWidth();
         if width != SAMPLER_WARP_SIZE {
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
                 "the sampler's block reductions require a {SAMPLER_WARP_SIZE}-lane simdgroup, \
@@ -110,38 +161,12 @@ impl SamplerKernels {
                  Refusing to load."
             )));
         }
-
-        Ok(Self {
-            cast_f16,
-            cast_bf16,
-            cast_f32,
-            penalties,
-            softmax_reduce,
-            stats_pick,
-            softmax_materialize,
-            histogram,
-            threshold_pick,
-            count_compact,
-            quota_pick,
-            compact_tied,
-            finalize,
-            _library: library,
-        })
+        Ok(kernels)
     }
-}
 
-fn build_pipeline(
-    device: &Device,
-    library: &Library,
-    name: &str,
-) -> Result<ComputePipelineState, MetalStreamError> {
-    let ns_name = NSString::from_str(name);
-    let function = library
-        .newFunctionWithName(&ns_name)
-        .ok_or_else(|| MetalStreamError::ShaderCompilationFailed(format!("{name} fn missing")))?;
-    device
-        .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{name} pipeline: {e:?}")))
+    fn stage(&self, stage: SamplerStage) -> &ComputePipelineState {
+        &self.stages[stage as usize]
+    }
 }
 
 fn tg(n: u32) -> MTLSize {
@@ -319,11 +344,11 @@ const ROW_STATE_LEN: usize = 16;
 pub struct SamplerArena {
     max_rows: u32,
     vocab: u32,
+    slicing: SliceTarget,
     /// The largest `nrows * nslices` any step can reach (see
-    /// [`sliced_max_for`]); sliced buffers are indexed `[row * nslices +
+    /// [`SliceTarget::sliced_max`]); sliced buffers are indexed `[row * nslices +
     /// slice]` with the CURRENT step's nslices, so they must cover this.
     sliced_max: usize,
-    cast_dtype: CastDtype,
     /// Persistent pins: dropped only when the arena drops (worker teardown).
     _pins: Vec<Pinned>,
     scratch_f32: Buffer, // f32 logits → prob bits, [max_rows, vocab]
@@ -339,7 +364,7 @@ pub struct SamplerArena {
     hist_buf: Buffer,      // [sliced_max, 256]
     counts_buf: Buffer,    // [sliced_max, 4]
     staging_buf: Buffer,   // [sliced_max, 2 * MAX_CANDIDATES]
-    consts_buf: Buffer,    // (vocab, nslices, nrows, max_out, max_prompt)
+    consts_buf: Buffer,    // (nslices, nrows, max_out, max_prompt)
     max_hist: u32,
     // Sampler-telemetry spill (only compiled under `sampler-telemetry`).
     #[cfg(feature = "sampler-telemetry")]
@@ -389,50 +414,56 @@ pub struct PendingSampler {
     nslices: u32,
 }
 
-/// Vocab slices the pipeline cuts a row into: enough threadgroups to occupy
-/// the GPU's cores (two per core), without staging memory exploding at large
-/// batch — capped at 32 (the per-slice staging is `2 * MAX_CANDIDATES` u32
-/// per row, and the one-threadgroup-per-row kernels' serial walks scale with
-/// slice count).
-fn nslices_for(device: &Device, nrows: u32) -> u32 {
-    let cores = crate::device::gpu_cores(device).map(|c| c.0).unwrap_or(8);
-    let target = (cores * 2).max(8);
-    // Small batches slice hard; a full batch of rows already fills the GPU.
-    (target / nrows.max(1)).clamp(1, 32)
-}
+/// Threadgroups the sliced passes aim to occupy: two per GPU core, at least 8.
+/// The device's core count picks it; a device without one is an error.
+#[derive(Clone, Copy, Debug)]
+struct SliceTarget(u32);
 
-/// The largest `nrows * nslices_for(nrows)` over `1..=max_rows` — the extent
-/// the sliced buffers (partials/hist/counts/staging) must cover. The product
-/// is `clamp(target/nrows, 1, 32) * nrows`: at most `target` while the slice
-/// count is interior, `32 * nrows` while clamped high, and `nrows` once rows
-/// alone fill the machine. The maximum over the whole range is therefore
-/// `max(target, max_rows)` — verified by `sliced_max_covers_every_step`.
-fn sliced_max_for(device: &Device, max_rows: u32) -> usize {
-    let cores = crate::device::gpu_cores(device).map(|c| c.0).unwrap_or(8);
-    let target = (cores * 2).max(8);
-    target.max(max_rows) as usize
+impl SliceTarget {
+    fn of(device: &Device) -> Result<Self, MetalStreamError> {
+        crate::device::gpu_cores(device)
+            .map(|c| Self((c.get() * 2).max(8)))
+            .ok_or(MetalStreamError::UnknownGpuCores)
+    }
+
+    /// Vocab slices a step of `nrows` rows cuts each row into — per-step data,
+    /// as the row count is. Capped at 32 (the per-slice staging is
+    /// `2 * MAX_CANDIDATES` u32 per row, and the one-threadgroup-per-row
+    /// kernels' serial walks scale with slice count). Small batches slice hard;
+    /// a full batch of rows already fills the GPU.
+    fn nslices(self, nrows: u32) -> u32 {
+        (self.0 / nrows.max(1)).clamp(1, 32)
+    }
+
+    /// The largest `nrows * nslices(nrows)` over `1..=max_rows` — the extent
+    /// the sliced buffers (partials/hist/counts/staging) must cover: at most
+    /// the target while the slice count is interior, `32 * nrows` while
+    /// clamped high, and `nrows` once rows alone fill the machine.
+    fn sliced_max(self, max_rows: u32) -> usize {
+        self.0.max(max_rows) as usize
+    }
 }
 
 impl SamplerArena {
     /// Allocate + bind everything the sampler pipeline needs, once. Sizes are
-    /// compile-time facts of the loaded config: `vocab` from the model,
-    /// `max_rows` from the worker's `max_num_seqs`, `max_hist` from the
-    /// request-length bounds. All buffers are `StorageModeShared`, pinned into
-    /// the worker's persistent residency set (the one the pool commits once),
-    /// so every forward command buffer sees them resident. Returned behind an
-    /// `Arc`: the per-step [`PendingSampler`] handle holds a refcount so it
-    /// can move freely into the forward followup.
+    /// compile-time facts of the loaded config: the logits width `kernels`
+    /// were baked for, `max_rows` from the worker's `max_num_seqs`, `max_hist`
+    /// from the request-length bounds. All buffers are `StorageModeShared`,
+    /// pinned into the worker's persistent residency set (the one the pool
+    /// commits once), so every forward command buffer sees them resident.
+    /// Returned behind an `Arc`: the per-step [`PendingSampler`] handle holds a
+    /// refcount so it can move freely into the forward followup.
     pub fn new(
         device: &Device,
         residency: &MetalResidencySet,
         max_rows: u32,
-        vocab: u32,
+        kernels: &SamplerKernels,
         max_hist: u32,
-        cast_dtype: CastDtype,
     ) -> std::sync::Arc<Self> {
         let max_rows = max_rows.max(1);
         let max_hist = max_hist.max(1);
-        let sliced_max = sliced_max_for(device, max_rows);
+        let (vocab, slicing) = (kernels.vocab.get(), kernels.slicing);
+        let sliced_max = slicing.sliced_max(max_rows);
         let n = max_rows as usize;
         let h = max_hist as usize;
 
@@ -467,7 +498,7 @@ impl SamplerArena {
         let hist_buf = mk(sliced_max * 256 * 4, "hist");
         let counts_buf = mk(sliced_max * 4 * 4, "counts");
         let staging_buf = mk(sliced_max * 2 * 1024 * 4, "staging");
-        let consts_buf = mk(5 * 4, "consts");
+        let consts_buf = mk(4 * 4, "consts");
         #[cfg(feature = "sampler-telemetry")]
         let telem_k: u32 = SAMPLER_TELEM_K;
         #[cfg(feature = "sampler-telemetry")]
@@ -533,8 +564,8 @@ impl SamplerArena {
         let arena = std::sync::Arc::new(Self {
             max_rows,
             vocab,
+            slicing,
             sliced_max,
-            cast_dtype,
             _pins: pins,
             scratch_f32,
             out_buf,
@@ -669,7 +700,6 @@ impl SamplerArena {
     /// `any_penalty` only gates whether real histories are written.
     pub fn prepare_step(
         self: &std::sync::Arc<Self>,
-        device: &Device,
         params: &scratchy_core_common::GpuSampleParams,
         njobs: u32,
     ) -> PendingSampler {
@@ -679,7 +709,7 @@ impl SamplerArena {
             self.max_rows
         );
         let n = njobs as usize;
-        let nslices = nslices_for(device, njobs);
+        let nslices = self.slicing.nslices(njobs);
         assert!(
             (n * nslices as usize) <= self.sliced_max,
             "sampler step sliced extent ({n} * {nslices}) exceeds arena ({})",
@@ -766,7 +796,7 @@ impl SamplerArena {
 
         write(
             &self.consts_buf,
-            &u32s(&[self.vocab, nslices, njobs, max_out, max_prompt]),
+            &u32s(&[nslices, njobs, max_out, max_prompt]),
         );
         #[cfg(feature = "sampler-telemetry")]
         {
@@ -804,49 +834,41 @@ impl PendingSampler {
             self.arena.cast_at.setAddress_atIndex(logits_addr, 1);
         }
 
-        let stage =
-            |pso: &ComputePipelineState,
-             table: &Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
-             tgs: u32| { encode_sampler_stage_into_mtl4(enc, pso, table, tgs) };
-
-        // Cast — only the dtype differs.
-        let cast = match self.arena.cast_dtype {
-            CastDtype::Bf16 => &kernels.cast_bf16,
-            CastDtype::F16 => &kernels.cast_f16,
-            CastDtype::F32 => &kernels.cast_f32,
+        let stage = |s: SamplerStage,
+                     table: &Retained<ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>>,
+                     tgs: u32| {
+            encode_sampler_stage_into_mtl4(enc, kernels.stage(s), table, tgs)
         };
-        stage(cast, &self.arena.cast_at, sliced);
+        let a = &self.arena;
+
+        stage(SamplerStage::Cast, &a.cast_at, sliced);
         // Penalties always run: rows without penalties carry neutral
         // coefficients + all-padding histories, which the kernel's `count
         // > 0` test makes a no-op.
-        stage(&kernels.penalties, &self.arena.penalties_at, sliced);
+        stage(SamplerStage::Penalties, &a.penalties_at, sliced);
 
         // Softmax: per-slice partials, merged to row stats, materialized.
+        stage(SamplerStage::SoftmaxReduce, &a.softmax_reduce_at, sliced);
+        stage(SamplerStage::StatsPick, &a.stats_pick_at, rows);
         stage(
-            &kernels.softmax_reduce,
-            &self.arena.softmax_reduce_at,
-            sliced,
-        );
-        stage(&kernels.stats_pick, &self.arena.stats_pick_at, rows);
-        stage(
-            &kernels.softmax_materialize,
-            &self.arena.softmax_materialize_at,
+            SamplerStage::SoftmaxMaterialize,
+            &a.softmax_materialize_at,
             sliced,
         );
 
         // Byte-histogram descent: four rounds.
         for _ in 0..4 {
-            stage(&kernels.histogram, &self.arena.histogram_at, sliced);
-            stage(&kernels.threshold_pick, &self.arena.threshold_pick_at, rows);
+            stage(SamplerStage::Histogram, &a.histogram_at, sliced);
+            stage(SamplerStage::ThresholdPick, &a.threshold_pick_at, rows);
         }
 
         // Compaction: strict candidates + counts, tie quotas, tied candidates.
-        stage(&kernels.count_compact, &self.arena.count_compact_at, sliced);
-        stage(&kernels.quota_pick, &self.arena.quota_pick_at, rows);
-        stage(&kernels.compact_tied, &self.arena.compact_tied_at, sliced);
+        stage(SamplerStage::CountCompact, &a.count_compact_at, sliced);
+        stage(SamplerStage::QuotaPick, &a.quota_pick_at, rows);
+        stage(SamplerStage::CompactTied, &a.compact_tied_at, sliced);
 
         // Sort + top-p + draw.
-        stage(&kernels.finalize, &self.arena.finalize_at, rows);
+        stage(SamplerStage::Finalize, &a.finalize_at, rows);
     }
 
     /// The sampled-token output buffer + row count, for reading back after the
@@ -876,13 +898,23 @@ mod tests {
     use super::*;
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice, shared_slice};
 
+    /// The sampler's kernels baked for logits `vocab` wide of `dtype`, as a
+    /// model's are.
+    fn baked(device: &Device, vocab: usize, dtype: CastDtype) -> SamplerKernels {
+        let vocab = LogitsWidth(vocab as u32);
+        let telemetry = cfg!(feature = "sampler-telemetry");
+        let keys = SamplerStage::ALL.map(|s| s.key(vocab, dtype, telemetry));
+        let stages: [BakedKernel; SamplerStage::COUNT] = crate::aot::baked_kernels(&keys)
+            .try_into()
+            .unwrap_or_else(|_| panic!("one baked kernel per stage"));
+        SamplerKernels::new(device, vocab, &stages).expect("sampler kernels")
+    }
+
     /// Run the full pipeline on `logits` (one row) and return the sampled
     /// token — the parity harness's metal side. Returns `None` when no metal
     /// device / MTL4 queue exists.
-    #[allow(clippy::too_many_arguments)]
     fn run_metal_sample(
         device: &Device,
-        kernels: &SamplerKernels,
         logits: &[f32],
         temp: f32,
         top_k: i32,
@@ -890,7 +922,7 @@ mod tests {
         min_p: f32,
         uniform: f32,
     ) -> Option<u32> {
-        let vocab = logits.len() as u32;
+        let kernels = baked(device, logits.len(), CastDtype::F32);
         let params = scratchy_core_common::GpuSampleParams {
             row_indices: vec![0],
             temperatures: vec![temp],
@@ -903,20 +935,19 @@ mod tests {
             pres_penalties: vec![0.0],
             ..Default::default()
         };
-        run_pipeline(device, kernels, &params, logits, CastDtype::F32, 1, vocab).map(|(t, _)| t)
+        run_pipeline(device, &kernels, &params, logits, 1).map(|(t, _)| t)
     }
 
     /// Prepare + run the pipeline on one command buffer; read back the sampled
     /// token (row 0) and the commit-wait time. `logits` is the TOTAL logits
-    /// buffer, of `dtype`; `row_indices` (in `params`) picks the row(s).
+    /// buffer, of the dtype `kernels` cast from; `row_indices` (in `params`)
+    /// picks the row(s).
     fn run_pipeline<T: Copy>(
         device: &Device,
         kernels: &SamplerKernels,
         params: &scratchy_core_common::GpuSampleParams,
         logits: &[T],
-        dtype: CastDtype,
         njobs: u32,
-        vocab: u32,
     ) -> Option<(u32, std::time::Duration)> {
         let logits_buf = shared_slice(device, logits);
         let batch = Mtl4DispatchBatch::begin(device)?;
@@ -928,8 +959,8 @@ mod tests {
         let (pending, logits_pin) = {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
-            let arena = SamplerArena::new(device, res, njobs, vocab, max_hist, dtype);
-            let pending = arena.prepare_step(device, params, njobs);
+            let arena = SamplerArena::new(device, res, njobs, kernels, max_hist);
+            let pending = arena.prepare_step(params, njobs);
             (pending, res.pin(logits_buf.clone()))
         };
         use objc2_metal::MTLBuffer as _;
@@ -957,13 +988,6 @@ mod tests {
             return;
         };
         let device = device.device.clone();
-        let kernels = match SamplerKernels::new(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("skipping: sampler kernels build failed: {e:?}");
-                return;
-            }
-        };
 
         // Row of 4096 logits; index 1234 is the clear maximum.
         let vocab: u32 = 4096;
@@ -973,7 +997,7 @@ mod tests {
         logits[7] = 3.0;
         logits[42] = 2.0;
 
-        let got = run_metal_sample(&device, &kernels, &logits, 0.01, 1, 1.0, 0.0, 0.73);
+        let got = run_metal_sample(&device, &logits, 0.01, 1, 1.0, 0.0, 0.73);
         let Some(got) = got else {
             eprintln!("skipping: no MTL4 queue");
             return;
@@ -1206,13 +1230,6 @@ mod tests {
             return;
         };
         let device = device.device.clone();
-        let kernels = match SamplerKernels::new(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("skipping: sampler kernels build failed: {e:?}");
-                return;
-            }
-        };
         // Probe for an MTL4 queue once so we skip cleanly on headless hosts.
         if Mtl4DispatchBatch::begin(&device).is_none() {
             eprintln!("skipping: no MTL4 queue");
@@ -1285,9 +1302,8 @@ mod tests {
             let uniform = rng.unit();
 
             let g = golden_sample(&logits, temp, top_k, top_p, min_p, uniform);
-            let Some(got) = run_metal_sample(
-                &device, &kernels, &logits, temp, top_k, top_p, min_p, uniform,
-            ) else {
+            let Some(got) = run_metal_sample(&device, &logits, temp, top_k, top_p, min_p, uniform)
+            else {
                 eprintln!("skipping: no MTL4 queue mid-run");
                 return;
             };
@@ -1399,20 +1415,20 @@ mod tests {
     /// (post-penalty f32 logits) for row 0 and row `njobs-1`.
     fn run_penalties(
         device: &Device,
-        kernels: &SamplerKernels,
         params: &scratchy_core_common::GpuSampleParams,
         logits: &[f32],
         njobs: u32,
         vocab: u32,
     ) -> Option<Vec<f32>> {
         use objc2_metal::MTLBuffer as _;
+        let kernels = baked(device, vocab as usize, CastDtype::F32);
         let logits_buf = shared_slice(device, logits);
         let batch = Mtl4DispatchBatch::begin(device)?;
         let (pending, arena, _logits_pin) = {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
-            let arena = SamplerArena::new(device, res, njobs, vocab, max_hist, CastDtype::F32);
-            let pending = arena.prepare_step(device, params, njobs);
+            let arena = SamplerArena::new(device, res, njobs, &kernels, max_hist);
+            let pending = arena.prepare_step(params, njobs);
             (pending, arena, res.pin(logits_buf.clone()))
         };
         let enc = batch.encoder();
@@ -1425,13 +1441,10 @@ mod tests {
             arena.cast_at.setAddress_atIndex(logits_buf.gpuAddress(), 1);
         }
         let sliced = njobs * pending.nslices;
-        let cast = match arena.cast_dtype {
-            CastDtype::Bf16 => &kernels.cast_bf16,
-            CastDtype::F16 => &kernels.cast_f16,
-            CastDtype::F32 => &kernels.cast_f32,
-        };
+        let cast = kernels.stage(SamplerStage::Cast);
         encode_sampler_stage_into_mtl4(enc, cast, &arena.cast_at, sliced);
-        encode_sampler_stage_into_mtl4(enc, &kernels.penalties, &arena.penalties_at, sliced);
+        let penalties = kernels.stage(SamplerStage::Penalties);
+        encode_sampler_stage_into_mtl4(enc, penalties, &arena.penalties_at, sliced);
         batch.commit(true);
         let scratch = &arena.scratch_f32;
         Some(read_slice::<f32>(scratch, njobs as usize * vocab as usize))
@@ -1444,13 +1457,6 @@ mod tests {
             return;
         };
         let device = device.device.clone();
-        let kernels = match SamplerKernels::new(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("skipping: sampler kernels build failed: {e:?}");
-                return;
-            }
-        };
 
         let mut rng = Rng(0x0BAD_C0DE_9999);
         let mut shifted = 0usize;
@@ -1499,8 +1505,7 @@ mod tests {
                 min_ps: vec![0.0],
                 uniforms: vec![0.5],
             };
-            let Some(got) = run_penalties(&device, &kernels, &params, &logits, 1, vocab as u32)
-            else {
+            let Some(got) = run_penalties(&device, &params, &logits, 1, vocab as u32) else {
                 eprintln!("skipping: no MTL4 queue");
                 return;
             };
@@ -1548,13 +1553,6 @@ mod tests {
             return;
         };
         let device = device.device.clone();
-        let kernels = match SamplerKernels::new(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("skipping: sampler kernels build failed: {e:?}");
-                return;
-            }
-        };
 
         let vocab: usize = 512;
         let max_out = 8u32;
@@ -1606,7 +1604,7 @@ mod tests {
             uniforms: vec![0.5, 0.5],
         };
 
-        let Some(got) = run_penalties(&device, &kernels, &params, &logits, 2, vocab as u32) else {
+        let Some(got) = run_penalties(&device, &params, &logits, 2, vocab as u32) else {
             eprintln!("skipping: no MTL4 queue");
             return;
         };
@@ -1643,13 +1641,6 @@ mod tests {
             return;
         };
         let device = device.device.clone();
-        let kernels = match SamplerKernels::new(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("skipping: sampler kernels build failed: {e:?}");
-                return;
-            }
-        };
         if Mtl4DispatchBatch::begin(&device).is_none() {
             eprintln!("skipping: no MTL4 queue");
             return;
@@ -1674,9 +1665,9 @@ mod tests {
             for &(temp, top_k, top_p, min_p) in &params {
                 let uniform = rng.unit();
                 let g = golden_sample(&logits, temp, top_k, top_p, min_p, uniform);
-                let Some(got) = run_metal_sample(
-                    &device, &kernels, &logits, temp, top_k, top_p, min_p, uniform,
-                ) else {
+                let Some(got) =
+                    run_metal_sample(&device, &logits, temp, top_k, top_p, min_p, uniform)
+                else {
                     eprintln!("skipping: no MTL4 queue mid-run");
                     return;
                 };
@@ -1731,13 +1722,6 @@ mod tests {
             return;
         };
         let device = device.device.clone();
-        let kernels = match SamplerKernels::new(&device) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("skipping: sampler kernels build failed: {e:?}");
-                return;
-            }
-        };
 
         let vocab: u32 = 262_144;
         let mut rng = Rng(0x1234_5678);
@@ -1751,6 +1735,7 @@ mod tests {
             })
             .map(half::bf16::from_f32)
             .collect();
+        let kernels = baked(&device, vocab as usize, CastDtype::Bf16);
 
         for (label, njobs, top_k, top_p) in [
             ("top_k=64, top_p=0.95, 1 row", 1u32, 64, 0.95),
@@ -1771,15 +1756,8 @@ mod tests {
             let (warm, reps) = (3, 10);
             let mut us = Vec::with_capacity(reps);
             for r in 0..warm + reps {
-                let Some((_, wait)) = run_pipeline(
-                    &device,
-                    &kernels,
-                    &params,
-                    &logits,
-                    CastDtype::Bf16,
-                    njobs,
-                    vocab,
-                ) else {
+                let Some((_, wait)) = run_pipeline(&device, &kernels, &params, &logits, njobs)
+                else {
                     eprintln!("skipping: no MTL4 queue");
                     return;
                 };

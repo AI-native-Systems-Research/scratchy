@@ -18,18 +18,19 @@
 //
 // Verified == mlx-vlm golden (rope_block0_q): max_abs_err 9.5e-7, cosine 1.0.
 //
-// Function constants:
+// Baked constants:
 //   VR_HEAD_DIM  (D), VR_NUM_HEADS (H), VR_N_ELEMS (L*H*D, dispatch guard).
 //
 // Dispatch: 1 thread per output element, flat grid of ceil(N/tg) threadgroups.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint VR_HEAD_DIM  [[function_constant(0)]];
-constant uint VR_NUM_HEADS [[function_constant(1)]];
-constant uint VR_N_ELEMS   [[function_constant(2)]];
+SCRATCHY_CONSTANT(uint, VR_HEAD_DIM, 0);
+SCRATCHY_CONSTANT(uint, VR_NUM_HEADS, 1);
+SCRATCHY_CONSTANT(uint, VR_N_ELEMS, 2);
 
 template <typename T>
 [[kernel]] void vision_rope_2d(
@@ -60,13 +61,8 @@ template <typename T>
   out[gid] = T(xv * c + partner * s);
 }
 
-#define INST_VISION_ROPE_2D(dtype_tag, mtl_type)                              \
-  template [[host_name("vision_rope_2d_" #dtype_tag)]] [[kernel]] void        \
-  vision_rope_2d<mtl_type>(                                                   \
-      device       mtl_type* out   [[buffer(0)]],                            \
-      const device mtl_type* x     [[buffer(1)]],                            \
-      const device float*    freqs [[buffer(2)]],                            \
-      uint gid [[thread_position_in_grid]]);
+#define INST_VISION_ROPE_2D(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(vision_rope_2d_##dtype_tag, vision_rope_2d<mtl_type>)
 
 INST_VISION_ROPE_2D(f16,  half)
 INST_VISION_ROPE_2D(bf16, bfloat)
@@ -120,13 +116,8 @@ template <typename T>
   out[gid] = T(xv * c + partner * s);
 }
 
-#define INST_VISION_ROPE_2D_INTERLEAVED(dtype_tag, mtl_type)                  \
-  template [[host_name("vision_rope_2d_interleaved_" #dtype_tag)]]            \
-  [[kernel]] void vision_rope_2d_interleaved<mtl_type>(                       \
-      device       mtl_type* out   [[buffer(0)]],                            \
-      const device mtl_type* x     [[buffer(1)]],                            \
-      const device float*    freqs [[buffer(2)]],                            \
-      uint gid [[thread_position_in_grid]]);
+#define INST_VISION_ROPE_2D_INTERLEAVED(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(vision_rope_2d_interleaved_##dtype_tag, vision_rope_2d_interleaved<mtl_type>)
 
 INST_VISION_ROPE_2D_INTERLEAVED(f16,  half)
 INST_VISION_ROPE_2D_INTERLEAVED(bf16, bfloat)

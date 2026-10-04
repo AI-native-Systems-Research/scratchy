@@ -24,14 +24,21 @@
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_layers::turboquant::{PolarQuantizer, packed_dim, unpack_indices};
+use scratchy_target_metal::aot::baked_build;
+use scratchy_target_metal::aot::baked_kernels;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
 use scratchy_target_metal::steel_paged::{nax_paged_symbol, steel_paged_symbol};
-use scratchy_target_metal::tape::ids::{HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
-use scratchy_target_metal::tape::kernel_constants::TqStagePass;
+use scratchy_target_metal::tape::ids::{
+    BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, NumQHeads, RopePairOff, RotDim, TqCodeBits,
+    TqDecodeHeads,
+};
+use scratchy_target_metal::tape::kernel_constants::{
+    TqCompressConstants, TqOffset, TqStagePass, TqWriteback,
+};
 use scratchy_target_metal::targets::is_nax_capable;
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
@@ -505,12 +512,34 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         return None;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+    // The quantize of each operand, K then V, baked with its offset: K's bias rotated, V's as-is.
+    let compress: [PipelineKey; 2] = [false, true].map(|is_v| {
+        let offset = match (restore && c.bias.is_some(), is_v) {
+            (false, _) => TqOffset::None,
+            (true, false) => TqOffset::RotatedBias,
+            (true, true) => TqOffset::Bias,
+        };
+        let (rot_dim, pair_off) = c.rope.map_or((0, 0), |r| (r.rot_dim, r.pair_off));
+        let constants = TqCompressConstants {
+            head_dim: HeadDim(c.head_dim as u32),
+            bits: TqCodeBits(c.bits),
+            num_kv_heads: NumKvHeads(c.num_kv_heads as u32),
+            block_size: BlockSize(c.block_size as u32),
+            blocks_per_chunk: BlocksPerChunk(c.blocks_per_chunk as u32),
+            writeback: TqWriteback::Raw,
+            offset,
+            rot_dim: RotDim(rot_dim as u32),
+            pair_off: RopePairOff(pair_off as u32),
+        };
+        PipelineKey::new("turboquant", c.dtype.compress(), constants.into())
+    });
+    cache
+        .register_baked(&baked_kernels(&compress))
+        .expect("bake tq_compress_paged");
     let pso = |lib: &'static str, name: String, consts: Vec<ConstantValue>| {
         let name: &'static str = Box::leak(name.into_boxed_str());
-        cache
-            .get_or_build(&PipelineKey::new(lib, name, consts))
-            .expect("pipeline")
+        baked_build(&cache, &PipelineKey::new(lib, name, consts)).expect("pipeline")
     };
     let f = &Fixture::new(c);
     let (hd, nkv, bs) = (c.head_dim, c.num_kv_heads, c.block_size);
@@ -575,23 +604,14 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         shared(&device, &dt_bits(&f.vb)),
     );
     let offset_on = restore && c.bias.is_some();
-    let (rot_dim, pair_off) = c
-        .rope
-        .map_or((0, 0), |r| (r.rot_dim as u32, r.pair_off as u32));
-    // `tq_offset` mode per operand: K's bias rotated (2), V's as-is (1).
-    let mode = |is_v: bool| match (offset_on, is_v) {
-        (false, _) => 0u32,
-        (true, false) => 2,
-        (true, true) => 1,
-    };
     let src_k = f.pool(&device, &f.k, 0, cached);
     let src_v = f.pool(&device, &f.v, 0, cached);
-    let compress = pso("turboquant", c.dtype.compress().to_owned(), vec![]);
     let mut batch = Mtl4DispatchBatch::begin(&device)?;
-    for (src, packed, norms, bias, is_v) in [
-        (&src_k, &packed_k, &norms_k, &kb, false),
-        (&src_v, &packed_v, &norms_v, &vb, true),
+    for (src, packed, norms, bias, key) in [
+        (&src_k, &packed_k, &norms_k, &kb, &compress[0]),
+        (&src_v, &packed_v, &norms_v, &vb, &compress[1]),
     ] {
+        let compress = baked_build(&cache, key).expect("tq_compress_paged");
         batch.encode(
             &compress,
             &[
@@ -607,21 +627,8 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
                 (&cos_sin, 19),
                 (&quant_pos, 20),
             ],
-            &[
-                (hd as u32, 7),
-                (c.bits, 8),
-                (32 / c.bits, 9),
-                (pdim as u32, 10),
-                (1 << c.bits, 11),
-                (nkv as u32, 13),
-                (bs as u32, 14),
-                (c.blocks_per_chunk as u32, 15),
-                (0, 17),
-                (mode(is_v), 21),
-                (rot_dim, 22),
-                (pair_off, 23),
-            ],
-            &[(quant.scale(), 12)],
+            &[],
+            &[],
             &[&src.data],
             tg(quant_slots.len(), nkv, 1),
             tg(hd, 1, 1),
@@ -1254,7 +1261,7 @@ fn check_per_row(c: Case, kernel: PerRow) {
         return;
     }
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
     let f = &Fixture::new(&c);
     let (hd, nq, nkv) = (c.head_dim, c.num_q_heads, c.num_kv_heads);
     let n_q = *f.cu_seqlens.last().unwrap() as usize;
@@ -1324,13 +1331,11 @@ fn check_per_row(c: Case, kernel: PerRow) {
         ),
     };
     let function: &'static str = Box::leak(function.into_boxed_str());
-    let pso = cache
-        .get_or_build(&PipelineKey::new(
-            library,
-            function,
-            f.attn_constants(extra.as_slice()),
-        ))
-        .expect("pipeline");
+    let pso = baked_build(
+        &cache,
+        &PipelineKey::new(library, function, f.attn_constants(extra.as_slice())),
+    )
+    .expect("pipeline");
 
     let nan = c.dtype.bits(f32::NAN);
     let k = f.pool(&device, &f.k, nan, |_, _| true);

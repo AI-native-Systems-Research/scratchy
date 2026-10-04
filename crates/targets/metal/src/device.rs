@@ -44,8 +44,23 @@ impl MetalDevice {
 /// chip. Costs are analytical (roofline from the profile's bandwidth /
 /// TFLOPS figures) — there is no empirical cost table.
 pub(crate) fn profile_for_device(device: &Device) -> MetalTargetProfile {
+    known_profile(device).unwrap_or_else(|| {
+        // GitHub's hosted "Apple Paravirtual device" legitimately has no cost
+        // profile (it can't run the kernels anyway — see `detect_device`), so
+        // don't spam the build/test log for it; only warn for genuinely
+        // unexpected hardware.
+        let name = device.name().to_string();
+        if !name.contains("Paravirtual") {
+            eprintln!("Warning: Unknown Metal device '{name}', defaulting to M1 profile");
+        }
+        crate::targets::M1_8CORE
+    })
+}
+
+/// The profile of the chip `device`'s name names; `None` for a device no profile was swept on.
+pub(crate) fn known_profile(device: &ProtocolObject<dyn MTLDevice>) -> Option<MetalTargetProfile> {
     let name = device.name().to_string();
-    if name.contains("M1") {
+    Some(if name.contains("M1") {
         if name.contains("Max") {
             crate::targets::M1_MAX
         } else {
@@ -60,15 +75,8 @@ pub(crate) fn profile_for_device(device: &Device) -> MetalTargetProfile {
     } else if name.contains("M5") {
         crate::targets::M5_10CORE
     } else {
-        // GitHub's hosted "Apple Paravirtual device" legitimately has no cost
-        // profile (it can't run the kernels anyway — see `detect_device`), so
-        // don't spam the build/test log for it; only warn for genuinely
-        // unexpected hardware.
-        if !name.contains("Paravirtual") {
-            eprintln!("Warning: Unknown Metal device '{name}', defaulting to M1 profile");
-        }
-        crate::targets::M1_8CORE
-    }
+        return None;
+    })
 }
 
 /// COMPILE-TIME cost profile for the default Metal device, chosen by chip name.

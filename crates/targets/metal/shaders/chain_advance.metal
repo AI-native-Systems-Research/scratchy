@@ -2,6 +2,7 @@
 // Copyright contributors to the vLLM project
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -32,34 +33,35 @@ using namespace metal;
 // the K-step horizon — which the scheduler reserves
 // `num_lookahead_tokens = K` blocks per req for.)
 //
-// Bindings (must match `chain_advance::dispatch_chain_advance`):
+// Bindings (must match `chain_advance::encode_chain_advance_into_mtl4`):
 //   buffer(0) = positions    [num_reqs]                              read+write u32
 //   buffer(1) = slot_mapping [num_reqs]                              write u32
 //   buffer(2) = seqused_k    [num_reqs]                              write u32
 //   buffer(3) = block_table  [num_reqs * block_table_stride]         read u32
-//   buffer(4) = block_size           constant uint
-//   buffer(5) = block_table_stride   constant uint
-//   buffer(6) = num_reqs             constant uint
+//   buffer(4) = block_table_stride   constant uint
+//   buffer(5) = num_reqs             constant uint
+// The model's KV block size is baked (`CHAIN_BLOCK_SIZE`).
 //
 // Dispatch: one threadgroup, num_reqs threads. Cheap (~1 us).
 // ---------------------------------------------------------------------------
+SCRATCHY_CONSTANT(uint, CHAIN_BLOCK_SIZE, 0);
+
 kernel void chain_advance(
     device       uint*  positions          [[buffer(0)]],
     device       uint*  slot_mapping       [[buffer(1)]],
     device       uint*  seqused_k          [[buffer(2)]],
     device const uint*  block_table        [[buffer(3)]],
-    constant     uint&  block_size         [[buffer(4)]],
-    constant     uint&  block_table_stride [[buffer(5)]],
-    constant     uint&  num_reqs           [[buffer(6)]],
+    constant     uint&  block_table_stride [[buffer(4)]],
+    constant     uint&  num_reqs           [[buffer(5)]],
     uint  tid [[thread_position_in_threadgroup]])
 {
     if (tid >= num_reqs) return;
     uint new_pos = positions[tid] + 1u;
-    uint block_idx = new_pos / block_size;
-    uint offset    = new_pos - block_idx * block_size;
+    uint block_idx = new_pos / CHAIN_BLOCK_SIZE;
+    uint offset    = new_pos - block_idx * CHAIN_BLOCK_SIZE;
     // Block-table row for this req starts at tid * block_table_stride.
     uint block_id = block_table[tid * block_table_stride + block_idx];
-    uint new_slot = block_id * block_size + offset;
+    uint new_slot = block_id * CHAIN_BLOCK_SIZE + offset;
     positions[tid]    = new_pos;
     slot_mapping[tid] = new_slot;
     seqused_k[tid]    = new_pos + 1u;

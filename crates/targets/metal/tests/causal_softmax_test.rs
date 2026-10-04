@@ -9,13 +9,11 @@
 
 mod common;
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
-
 use half::{bf16, f16};
-use objc2_foundation::NSString;
-use objc2_metal::{MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLibrary, MTLSize};
+use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 const Q_HEADS: u32 = 2;
 const LQ: u32 = 3;
@@ -30,17 +28,13 @@ fn causal_softmax_matches_reference() {
     };
     let device = __dev.device;
 
-    let src = include_str!("../shaders/attention_causal_softmax.metal");
-    let opts = objc2_metal::MTLCompileOptions::new();
-    let library = device
-        .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
-        .expect("compile attention_causal_softmax.metal");
-    let func = library
-        .newFunctionWithName(&NSString::from_str("causal_softmax_f16"))
-        .expect("causal_softmax_f16");
-    let pipeline = device
-        .newComputePipelineStateWithFunction_error(&func)
-        .expect("pipeline");
+    let pipeline = baked_pipeline(
+        &device,
+        "attention_causal_softmax",
+        "causal_softmax_f16",
+        Vec::new(),
+    )
+    .expect("causal_softmax_f16");
 
     // Input scores [q_heads, Lq, kv_len], deterministic small fp16-exact values.
     let n = (Q_HEADS * LQ * KV_LEN) as usize;
@@ -125,31 +119,14 @@ fn causal_softmax_prod_handles_bucket_larger_than_kv() {
     };
     let device = __dev.device;
 
-    let src = include_str!("../shaders/attention_causal_softmax.metal");
-    let opts = objc2_metal::MTLCompileOptions::new();
-    let library = device
-        .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
-        .expect("compile attention_causal_softmax.metal");
-
-    // SOFT_SCALE is function_constant(1).
-    let fcv = MTLFunctionConstantValues::new();
-    let scale = SCALE;
-    unsafe {
-        fcv.setConstantValue_type_atIndex(
-            NonNull::new(&scale as *const f32 as *mut c_void).unwrap(),
-            MTLDataType::Float,
-            1,
-        );
-    }
-    let func = library
-        .newFunctionWithName_constantValues_error(
-            &NSString::from_str("causal_softmax_prod_bf16"),
-            &fcv,
-        )
-        .expect("causal_softmax_prod_bf16");
-    let pipeline = device
-        .newComputePipelineStateWithFunction_error(&func)
-        .expect("pipeline");
+    // SOFT_SCALE is constant slot 1.
+    let pipeline = baked_pipeline(
+        &device,
+        "attention_causal_softmax",
+        "causal_softmax_prod_bf16",
+        vec![ConstantValue::float(1, SCALE)],
+    )
+    .expect("causal_softmax_prod_bf16");
 
     // scores [BUCKET_ROWS, KVP] bf16, row i at i*KVP (prod variant is single-head).
     let n = (BUCKET_ROWS * KVP) as usize;

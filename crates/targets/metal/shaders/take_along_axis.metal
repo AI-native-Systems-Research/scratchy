@@ -18,39 +18,30 @@
 // One thread per (n, k). Dispatch (top_k, N, 1).
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
+
+// `MoeTopKConstants`, compiled in: the source row's width and the index row's.
+SCRATCHY_CONSTANT(int, SRC_AXIS_SIZE, 0);
+SCRATCHY_CONSTANT(int, IDX_AXIS_SIZE, 1);
 
 template <typename T>
 [[kernel]] void take_along_axis_2d_contig(
     const device T*    src        [[buffer(0)]],
     const device uint* indices    [[buffer(1)]],
     device T*          out        [[buffer(2)]],
-    const constant int& src_axis_size [[buffer(3)]],
-    const constant int& idx_axis_size [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 grid [[threads_per_grid]]) {
   uint k = gid.x;
   uint n = gid.y;
   if (k >= grid.x || n >= grid.y) return;
-  uint idx = indices[n * uint(idx_axis_size) + k];
+  uint idx = indices[n * uint(IDX_AXIS_SIZE) + k];
   // No negative-index normalization: argpartition outputs u32 in
-  // [0, src_axis_size). MLX's `is_signed_v<IdxT>` branch is dead
+  // [0, SRC_AXIS_SIZE). MLX's `is_signed_v<IdxT>` branch is dead
   // for our uint indices.
-  out[n * uint(idx_axis_size) + k] = src[n * uint(src_axis_size) + idx];
+  out[n * uint(IDX_AXIS_SIZE) + k] = src[n * uint(SRC_AXIS_SIZE) + idx];
 }
 
-#define INSTANTIATE_TAKE(tag, type)                                     \
-  template [[host_name("take_along_axis_2d_contig_" #tag)]]             \
-  [[kernel]] void take_along_axis_2d_contig<type>(                      \
-      const device type*  src     [[buffer(0)]],                        \
-      const device uint*  indices [[buffer(1)]],                        \
-      device type*        out     [[buffer(2)]],                        \
-      const constant int& src_axis_size [[buffer(3)]],                  \
-      const constant int& idx_axis_size [[buffer(4)]],                  \
-      uint2 gid [[thread_position_in_grid]],                            \
-      uint2 grid [[threads_per_grid]]);
-
-INSTANTIATE_TAKE(float32, float)
-INSTANTIATE_TAKE(float16, half)
-INSTANTIATE_TAKE(bfloat16, bfloat)
+SCRATCHY_KERNEL(take_along_axis_2d_contig_float16, take_along_axis_2d_contig<half>)
+SCRATCHY_KERNEL(take_along_axis_2d_contig_bfloat16, take_along_axis_2d_contig<bfloat>)

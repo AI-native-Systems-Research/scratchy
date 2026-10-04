@@ -5,8 +5,8 @@ edition = "2024"
 
 [features]
 # Observability hooks in the encode loop / sampler — gated per-seam so a plain
-# engine build carries none of it. `sampler-telemetry` also drives a shader
-# `-D` define (see build.rs) so the kernel's telemetry params vanish too.
+# engine build carries none of it. `sampler-telemetry` also picks the sampler
+# kernels baked with the telemetry spill (`off_tape::OffTapeKernels::sampler`).
 forward-telemetry = ["scratchy-core-common/forward-telemetry"]
 sampler-telemetry = ["scratchy-core-common/sampler-telemetry"]
 # Multimodal capability: the `MultimodalForward`/`PixelInput` device-runtime

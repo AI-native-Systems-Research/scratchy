@@ -25,6 +25,7 @@
 // (= bucket_m * top_k). `MG_NUM_EXPERTS` ≤ 128 (gemma4 = 128).
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
@@ -35,8 +36,8 @@ using namespace metal;
 //   offset[e] = Σ_{e'<e} ceil(count[e']/BM)*BM ,  total = Σ ceil(..)*BM
 // `count`/`offset` are [MG_NUM_EXPERTS] u32; `total` is [1] u32 (the
 // padded row count Mpad, ≤ MG_M + (BM-1)*MG_NUM_EXPERTS).
-constant int MG_M           [[function_constant(0)]];
-constant int MG_NUM_EXPERTS [[function_constant(1)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_M, 0);
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_NUM_EXPERTS, 1);
 
 // Pad each expert's run to a multiple of 64 = the NAX grouped GEMM's
 // m-tile (BM=64). 64 is also a multiple of the steel grouped GEMM's
@@ -44,6 +45,7 @@ constant int MG_NUM_EXPERTS [[function_constant(1)]];
 constant int MG_BM = 64;
 constant int MG_MAX_EXPERTS = 128;
 
+#if SCRATCHY_COMPILES(moe_group_offsets)
 kernel void moe_group_offsets(
     const device uint* topk_inds [[buffer(0)]],
     device uint*       count     [[buffer(1)]],
@@ -78,14 +80,16 @@ kernel void moe_group_offsets(
     total[0] = acc;
   }
 }
+#endif
 
 // ── moe_group_init ─────────────────────────────────────────────────
 // Sentinel-fills `indices_pad[Mpad_max]` with MG_NUM_EXPERTS (an
 // invalid expert → the GEMM skips that tile) and zeroes `fill[E]`.
 // `MG_MPAD_MAX` = MG_M + (BM-1)*MG_NUM_EXPERTS (worst-case padded rows;
 // the static dispatch upper bound). One thread per padded row.
-constant int MG_MPAD_MAX [[function_constant(2)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_MPAD_MAX, 2);
 
+#if SCRATCHY_COMPILES(moe_group_init)
 kernel void moe_group_init(
     device uint* indices_pad [[buffer(0)]],
     device uint* fill        [[buffer(1)]],
@@ -97,6 +101,7 @@ kernel void moe_group_init(
     fill[gid] = 0u;
   }
 }
+#endif
 
 // ── moe_group_scatter ──────────────────────────────────────────────
 // For each real (token,expert) pair i in [0, MG_M): compute its padded
@@ -104,8 +109,8 @@ kernel void moe_group_init(
 // indices_pad[p]=e, and gather the token's x row into x_pad[p].
 // x is [bucket_m, K]; the token of pair i is i / MG_TOP_K. One
 // threadgroup row-block per pair (grid.y = MG_M), threads cover K.
-constant int MG_TOP_K [[function_constant(3)]];
-constant int MG_K     [[function_constant(4)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_TOP_K, 3);
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_K, 4);
 
 template <typename T>
 kernel void moe_group_scatter(
@@ -142,19 +147,8 @@ kernel void moe_group_scatter(
   }
 }
 
-#define INST_MG_SCATTER(tag, type)                                       \
-  template [[host_name("moe_group_scatter_" #tag)]]                      \
-  [[kernel]] void moe_group_scatter<type>(                               \
-      const device uint* topk_inds [[buffer(0)]],                        \
-      const device uint* offset    [[buffer(1)]],                        \
-      const device type* x         [[buffer(2)]],                        \
-      device atomic_uint* fill     [[buffer(3)]],                        \
-      device uint*       pos       [[buffer(4)]],                        \
-      device uint*       indices_pad [[buffer(5)]],                      \
-      device type*       x_pad     [[buffer(6)]],                        \
-      uint2 tid  [[thread_position_in_threadgroup]],                     \
-      uint2 tgid [[threadgroup_position_in_grid]],                       \
-      uint2 tgsz [[threads_per_threadgroup]]);
+#define INST_MG_SCATTER(tag, type) \
+  SCRATCHY_KERNEL(moe_group_scatter_##tag, moe_group_scatter<type>)
 
 INST_MG_SCATTER(float16, half)
 INST_MG_SCATTER(bfloat16, bfloat)
@@ -166,6 +160,7 @@ INST_MG_SCATTER(float32, float)
 // then float2 qa[rows][K/64]) at its padded slot, so the tokens are
 // quantized once, not once per expert copy. x holds the bucket's
 // MG_M / MG_TOP_K token rows; x_pad holds MG_MPAD_MAX padded rows.
+#if SCRATCHY_COMPILES(moe_group_scatter_q8)
 kernel void moe_group_scatter_q8(
     const device uint* topk_inds [[buffer(0)]],
     const device uint* offset    [[buffer(1)]],
@@ -204,6 +199,7 @@ kernel void moe_group_scatter_q8(
     qa_pad[c] = qa[c];
   }
 }
+#endif
 
 // ── moe_group_gather (un-scatter) ──────────────────────────────────
 // Restores token order after the grouped GEMM:
@@ -212,7 +208,7 @@ kernel void moe_group_scatter_q8(
 // [bucket_m*top_k, MG_W] = the matvec path's layout, so the existing
 // moe_weighted_sum reduces it unchanged). One threadgroup row-block per
 // pair (grid.y = MG_M, m-scaled to actual pairs); threads cover MG_W.
-constant int MG_W [[function_constant(5)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_W, 5);
 
 template <typename T>
 kernel void moe_group_gather(
@@ -231,15 +227,8 @@ kernel void moe_group_gather(
   }
 }
 
-#define INST_MG_GATHER(tag, type)                                        \
-  template [[host_name("moe_group_gather_" #tag)]]                       \
-  [[kernel]] void moe_group_gather<type>(                                \
-      const device type* src [[buffer(0)]],                              \
-      const device uint* pos [[buffer(1)]],                              \
-      device type*       out [[buffer(2)]],                              \
-      uint2 tid  [[thread_position_in_threadgroup]],                     \
-      uint2 tgid [[threadgroup_position_in_grid]],                       \
-      uint2 tgsz [[threads_per_threadgroup]]);
+#define INST_MG_GATHER(tag, type) \
+  SCRATCHY_KERNEL(moe_group_gather_##tag, moe_group_gather<type>)
 
 INST_MG_GATHER(float16, half)
 INST_MG_GATHER(bfloat16, bfloat)

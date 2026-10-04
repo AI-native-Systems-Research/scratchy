@@ -22,9 +22,9 @@
 mod common;
 
 use objc2_metal::{MTLComputePipelineState, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, splitk_reduce_kernel_static_name};
-use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 /// SplitMix64 — same deterministic PRNG used by the qmv/qmm tests.
@@ -57,15 +57,13 @@ fn run_splitk_reduce_mtl4(
     split_k: u32,
     dtype: DequantDtype,
 ) -> bool {
-    let cache = ShaderCache::new(device.clone()).expect("MetalSplitKReduce shader cache");
-    let constants = [
+    let constants = vec![
         ConstantValue::uint(0, m),
         ConstantValue::uint(1, n),
         ConstantValue::uint(2, split_k),
     ];
     let kernel_name = splitk_reduce_kernel_static_name(dtype);
-    let pso = cache
-        .get_pipeline_specialized(kernel_name, &constants)
+    let pso = baked_pipeline(device, "quantized_splitk_reduce", kernel_name, constants)
         .expect("splitk_reduce pipeline");
 
     let nthreads = m as u64 * n as u64;

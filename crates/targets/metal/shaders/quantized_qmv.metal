@@ -28,6 +28,7 @@
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
@@ -37,25 +38,17 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 
 // ─────────────────────────────────────────────────────────────────
-// Function constants — baked at pipeline build time by
-// `MetalAffineQmv::execute` (and the lower_one path once
-// `Instruction::AffineQmm` lands). These hold the K/N dims that MLX
-// passes as setBytes runtime args; scratchy specializes per-shape so
-// the values are pipeline-constants the Metal compiler can fold.
-//
-// Indices match `ConstantValue::uint(0, K)` / `ConstantValue::uint(1, N)`
-// in the dispatcher; keep them stable, ICB-recorded commands key on
-// the constant bag.
+// `AffineQmvConstants`, compiled in: the K/N dims MLX passes as
+// setBytes runtime args, folded into each kernel the bake compiles.
 // ─────────────────────────────────────────────────────────────────
 
-constant int IN_VEC_SIZE  [[function_constant(0)]];
-constant int OUT_VEC_SIZE [[function_constant(1)]];
+SCRATCHY_CONSTANT(int, IN_VEC_SIZE,  0);
+SCRATCHY_CONSTANT(int, OUT_VEC_SIZE, 1);
 // 5: the 4-bit codes are stored XOR 0x88 (signed q - 8; `AffineCodes::Offset8`,
 // set on matrix-unit tapes, where the W4A8 prefill GEMM reads them as int4).
 // XOR-ing each loaded word restores the unsigned codes. Unset: as written.
-constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
-constant uint16_t AFFINE_CODES_XOR =
-    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x8888 : 0;
+SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
+constant constexpr uint16_t AFFINE_CODES_XOR = AFFINE_CODES_OFFSET8 ? 0x8888 : 0;
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26
@@ -565,7 +558,7 @@ METAL_FUNC void qmv_quad_impl(
     const device T_scale* biases,
     const device T_act* x,
     device T_act* y,
-    // K / N now baked as function constants on the kernel side
+    // K / N are compiled-in constants on the kernel side
     // (IN_VEC_SIZE / OUT_VEC_SIZE) and forwarded by-value here so
     // the impl body matches the MLX C++ source line-for-line.
     int in_vec_size,
@@ -867,7 +860,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
     const device T_act* x [[buffer(3)]],
     device T_act* y [[buffer(4)]],
     // buffer(5) / buffer(6) (in_vec_size / out_vec_size) replaced by
-    // file-scope function constants IN_VEC_SIZE / OUT_VEC_SIZE so this
+    // file-scope constants IN_VEC_SIZE / OUT_VEC_SIZE so this
     // kernel is recordable into an MTLIndirectComputeCommand (which
     // exposes setKernelBuffer but not setKernelBytes).
     const constant int& x_batch_ndims [[buffer(7)]],
@@ -925,7 +918,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
     const device T_act* x [[buffer(3)]],
     device T_act* y [[buffer(4)]],
     // buffer(5) / buffer(6): see note on affine_qmv_quad above —
-    // K / N now ride as function constants IN_VEC_SIZE / OUT_VEC_SIZE.
+    // K / N are the compiled-in IN_VEC_SIZE / OUT_VEC_SIZE.
     const constant int& x_batch_ndims [[buffer(7)]],
     const constant int* x_shape [[buffer(8)]],
     const constant int64_t* x_strides [[buffer(9)]],
@@ -981,7 +974,7 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
     const device T_act* x [[buffer(3)]],
     device T_act* y [[buffer(4)]],
     // buffer(5) / buffer(6): see note on affine_qmv_quad above —
-    // K / N now ride as function constants IN_VEC_SIZE / OUT_VEC_SIZE.
+    // K / N are the compiled-in IN_VEC_SIZE / OUT_VEC_SIZE.
     const constant int& x_batch_ndims [[buffer(7)]],
     const constant int* x_shape [[buffer(8)]],
     const constant int64_t* x_strides [[buffer(9)]],
@@ -1030,17 +1023,13 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 // ─────────────────────────────────────────────────────────────────
 
 #define INST_QMV_BATCHED(name, act_tag, act_type, scale_tag, scale_type, gs, bits, batched) \
-  template [[host_name(                                                                     \
-      #name "_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_" #bits "_batch_" #batched)]]      \
-  [[kernel]] decltype(name<act_type, scale_type, gs, bits, batched>)                        \
-      name<act_type, scale_type, gs, bits, batched>;
+  SCRATCHY_KERNEL(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_batch_##batched,  \
+                  name<act_type, scale_type, gs, bits, batched>)
 
 #define INST_QMV_QUAD(name, act_tag, act_type, scale_tag, scale_type, gs, bits, D, batched) \
-  template [[host_name(                                                                     \
-      #name "_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_" #bits "_d_" #D                   \
-      "_batch_" #batched)]]                                                                 \
-  [[kernel]] decltype(name<act_type, scale_type, gs, bits, D, batched>)                     \
-      name<act_type, scale_type, gs, bits, D, batched>;
+  SCRATCHY_KERNEL(                                                                          \
+      name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_d_##D##_batch_##batched,      \
+      name<act_type, scale_type, gs, bits, D, batched>)
 
 #define INST_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs)                          \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
@@ -1287,10 +1276,8 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 }
 
 #define INST_NVFP4_QMV(act_tag, act_type, scale_tag, scale_type, gs)      \
-  template [[host_name(                                                   \
-      "nvfp4_qmv_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_4_batch_0")]] \
-  [[kernel]] decltype(nvfp4_qmv<act_type, scale_type, gs, 4>)             \
-      nvfp4_qmv<act_type, scale_type, gs, 4>;
+  SCRATCHY_KERNEL(nvfp4_qmv_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, \
+                  nvfp4_qmv<act_type, scale_type, gs, 4>)
 
 // group_size is always 16 for NVFP4; T_scale always half (folded F16).
 INST_NVFP4_QMV(f16, half, f16, half, 16)
@@ -1313,11 +1300,10 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 //   buffer(3) = x           [N, in_vec]                       T_act
 //   buffer(4) = rhs_indices [N, top_k]                        uint32
 //   buffer(5) = y           [N, top_k, out_vec]               T_act
-//   buffer(6) = top_k       constant int
 //
-// IN_VEC_SIZE / OUT_VEC_SIZE ride as function constants 0/1 just
-// like the non-gather affine_qmv variants — the lowering arm
-// reuses the same SpecializedPipelineCache key shape.
+// IN_VEC_SIZE / OUT_VEC_SIZE are constant slots 0/1, compiled in just
+// like the non-gather affine_qmv variants; GATHER_PER_ROW (slot 2,
+// `AffineGatherQmvConstants`) is the output rows each x row feeds.
 //
 // Dispatch: tid.x = 0 (we feed the broadcast token via z-axis),
 // tid.y = output-block-row index, tid.z = n * top_k + slot_k. The
@@ -1327,6 +1313,9 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 //
 // ─────────────────────────────────────────────────────────────────
 
+#ifdef SCRATCHY_CONSTANT_2
+SCRATCHY_CONSTANT(int, GATHER_PER_ROW, 2);
+
 template <typename T_act, typename T_scale, int group_size, int bits>
 [[kernel]] void affine_gather_qmv_fast(
     const device uint32_t* w           [[buffer(0)]],
@@ -1335,14 +1324,13 @@ template <typename T_act, typename T_scale, int group_size, int bits>
     const device T_act*    x           [[buffer(3)]],
     const device uint32_t* rhs_indices [[buffer(4)]],
     device T_act*          y           [[buffer(5)]],
-    const constant int&    top_k       [[buffer(6)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
   // `tid.z` flattens the (token, top_k_slot) axis. tid.x is fixed
   // to 0 — the M-axis broadcast is folded into z.
   uint nk = tid.z;
-  uint token_n = nk / uint(top_k);
+  uint token_n = nk / uint(GATHER_PER_ROW);
   uint expert_idx = rhs_indices[nk];
 
   // Per-expert weight slab strides: w is packed int4 with
@@ -1370,12 +1358,11 @@ template <typename T_act, typename T_scale, int group_size, int bits>
     const device T_act*    x           [[buffer(3)]],
     const device uint32_t* rhs_indices [[buffer(4)]],
     device T_act*          y           [[buffer(5)]],
-    const constant int&    top_k       [[buffer(6)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
   uint nk = tid.z;
-  uint token_n = nk / uint(top_k);
+  uint token_n = nk / uint(GATHER_PER_ROW);
   uint expert_idx = rhs_indices[nk];
 
   size_t expert_stride_w = size_t(IN_VEC_SIZE / (32 / bits)) * size_t(OUT_VEC_SIZE);
@@ -1391,12 +1378,11 @@ template <typename T_act, typename T_scale, int group_size, int bits>
       w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
       inner_tid, simd_gid, simd_lid);
 }
+#endif
 
 #define INST_GATHER_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits)               \
-  template [[host_name(                                                                          \
-      #name "_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_" #bits)]]                              \
-  [[kernel]] decltype(name<act_type, scale_type, gs, bits>)                                      \
-      name<act_type, scale_type, gs, bits>;
+  SCRATCHY_KERNEL(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits,                        \
+                  name<act_type, scale_type, gs, bits>)
 
 #define INST_GATHER_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs) \
   INST_GATHER_QMV(affine_gather_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4) \

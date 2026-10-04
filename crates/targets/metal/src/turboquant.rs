@@ -12,6 +12,37 @@ use scratchy_layers::turboquant::{SCRATCH_ELEM_BYTES, TqBits};
 
 use crate::argmax::{Buffer, Device};
 
+/// Seed of the production codebook's rotation signs.
+pub const TQ_CODEBOOK_SEED: u64 = 42;
+
+/// A model's TurboQuant codebook at its GLOBAL head dim (`signs.len()`): the rotation signs, the
+/// `bits`-bit centroids, their midpoints and the packed words per head — computed at expansion
+/// ([`TqCodebook::compute`]) and emitted as a static per model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TqCodebook {
+    pub bits: TqBits,
+    pub packed_dim: u32,
+    pub signs: &'static [f32],
+    pub centroids: &'static [f32],
+    pub boundaries: &'static [f32],
+}
+
+impl TqCodebook {
+    pub fn compute(head_dim: usize, bits: TqBits) -> Self {
+        use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
+        let q = PolarQuantizer::new(head_dim, bits.get(), TQ_CODEBOOK_SEED);
+        let boundaries = q.centroids().windows(2).map(|w| (w[0] + w[1]) / 2.0);
+        let baked = crate::tape::lowered::baked;
+        Self {
+            bits,
+            packed_dim: packed_dim(head_dim, bits.get()) as u32,
+            signs: baked(q.signs().to_vec()),
+            centroids: baked(q.centroids().to_vec()),
+            boundaries: baked(boundaries.collect()),
+        }
+    }
+}
+
 /// Build the TurboQuant provisioning for one worker at the GLOBAL (full-context)
 /// geometry. `num_blocks` is the shared KV pool capacity (the packed store is the
 /// canonical cache of that size); the scratch is ONE layer's fp16 (num_blocks
@@ -27,35 +58,25 @@ use crate::argmax::{Buffer, Device};
 /// placeholder buffer that the tape never binds (the KV codec pass codes only
 /// the global KV writers). Uniform arches pass all-true → every layer real
 /// (byte-identical to before, when `is_global` was implicitly all-true).
-#[allow(clippy::too_many_arguments)]
 pub fn build_tq_provision(
     device: &Device,
     is_global: &[bool],
     num_blocks: usize,
     block_size: usize,
     num_kv_heads: usize,
-    head_dim: usize,
     blocks_per_chunk: usize,
-    bits: TqBits,
-    seed: u64,
+    codebook: &TqCodebook,
 ) -> crate::interpreter::metal::runtime::TqRuntimeBuffers {
     use objc2_metal::{MTLBuffer, MTLResourceOptions};
-    use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
-    let bits = bits.get();
+    let (bits, head_dim) = (codebook.bits.get(), codebook.signs.len());
     let num_layers = is_global.len();
     let n_global = is_global.iter().filter(|&&g| g).count();
-    let pdim = packed_dim(head_dim, bits);
+    let pdim = codebook.packed_dim as usize;
     tracing::info!(
         "TurboQuant KV: {bits}-bit codebook (head_dim={head_dim}, \
          num_kv_heads={num_kv_heads}, block_size={block_size}, packed_dim={pdim}, \
          {num_blocks} blocks, {n_global}/{num_layers} global layers compressed)"
     );
-    let q = PolarQuantizer::new(head_dim, bits, seed);
-    let boundaries: Vec<f32> = q
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
 
     let alloc = |bytes: usize| {
         // NB: do NOT touch the pages here. The packed/norms/scratch are sized to
@@ -153,9 +174,9 @@ pub fn build_tq_provision(
         packed_v,
         norms_k,
         norms_v,
-        signs: crate::argmax::upload_shared_buffer(device, q.signs()),
-        boundaries: crate::argmax::upload_shared_buffer(device, &boundaries),
-        centroids: crate::argmax::upload_shared_buffer(device, q.centroids()),
+        signs: crate::argmax::upload_shared_buffer(device, codebook.signs),
+        boundaries: crate::argmax::upload_shared_buffer(device, codebook.boundaries),
+        centroids: crate::argmax::upload_shared_buffer(device, codebook.centroids),
         scratch_k_table,
         scratch_v_table,
         scratch_k_data,
@@ -166,27 +187,30 @@ pub fn build_tq_provision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::argmax::{ComputePipelineState, upload_shared_buffer};
+    use crate::argmax::upload_shared_buffer;
     use crate::mtl4_dispatch::{Mtl4DispatchBatch, read_slice};
-    use objc2_foundation::NSString;
-    use objc2_metal::{MTLBuffer, MTLLibrary, MTLSize};
-    use scratchy_layers::turboquant::{
-        KvCodec, PolarQuantizer, pack_indices, packed_dim, vals_per_word,
-    };
+    use objc2_metal::{MTLBuffer, MTLSize};
+    use scratchy_layers::turboquant::{KvCodec, PolarQuantizer, pack_indices, packed_dim};
 
-    /// The embedded `turboquant.metallib`'s pipeline for kernel `name`.
-    fn pipeline(device: &Device, name: &str) -> ComputePipelineState {
-        let library = crate::shader_cache::load_library_from_bytes(
-            device,
-            crate::embedded_metallib!("turboquant"),
-        )
-        .expect("turboquant lib");
-        let f = library
-            .newFunctionWithName(&NSString::from_str(name))
-            .expect(name);
-        device
-            .newComputePipelineStateWithFunction_error(&f)
-            .expect(name)
+    /// `tq_compress_paged` baked for `kv` with no offset, writing its dequant back into the pool.
+    fn compress_pipeline(device: &Device, kv: PagedKv) -> crate::aot::BakedPipeline {
+        use crate::tape::ids::{
+            BlockSize, BlocksPerChunk, HeadDim, NumKvHeads, RopePairOff, RotDim, TqCodeBits,
+        };
+        use crate::tape::kernel_constants::{TqCompressConstants, TqOffset, TqWriteback};
+        let constants = TqCompressConstants {
+            head_dim: HeadDim(kv.cb.dim as u32),
+            bits: TqCodeBits(kv.cb.bits),
+            num_kv_heads: NumKvHeads(kv.num_kv_heads as u32),
+            block_size: BlockSize(kv.block_size as u32),
+            blocks_per_chunk: BlocksPerChunk(kv.bpc as u32),
+            writeback: TqWriteback::Dequantized,
+            offset: TqOffset::None,
+            rot_dim: RotDim(0),
+            pair_off: RopePairOff(0),
+        };
+        crate::aot::baked_pipeline(device, "turboquant", "tq_compress_paged", constants.into())
+            .expect("tq_compress_paged")
     }
 
     /// Encode with `body` into one MTL4 batch and commit it, waiting for the GPU.
@@ -209,18 +233,13 @@ mod tests {
 
     impl Codebook {
         fn new(device: &Device, dim: usize, bits: u32) -> Self {
-            let q = PolarQuantizer::new(dim, bits, 42);
-            let boundaries: Vec<f32> = q
-                .centroids()
-                .windows(2)
-                .map(|w| (w[0] + w[1]) / 2.0)
-                .collect();
+            let cb = TqCodebook::compute(dim, TqBits::new(bits));
             Self {
-                pdim: packed_dim(dim, bits),
-                signs: upload_shared_buffer(device, q.signs()),
-                boundaries: upload_shared_buffer(device, &boundaries),
-                centroids: upload_shared_buffer(device, q.centroids()),
-                q,
+                pdim: cb.packed_dim as usize,
+                signs: upload_shared_buffer(device, cb.signs),
+                boundaries: upload_shared_buffer(device, cb.boundaries),
+                centroids: upload_shared_buffer(device, cb.centroids),
+                q: PolarQuantizer::new(dim, bits, TQ_CODEBOOK_SEED),
                 dim,
                 bits,
             }
@@ -260,11 +279,11 @@ mod tests {
     }
 
     /// `tq_compress_paged` over token slots `slots[..n_slots]`, bound as the
-    /// kernel declares (0..=23, no offset): `slots` doubles as `logical_slots`
-    /// (in place) and `do_writeback = 1`, so `kv.data` ends up holding the
-    /// lossy dequant.
+    /// kernel declares (no offset): `slots` doubles as `logical_slots`
+    /// (in place) and the dequant is written back, so `kv.data` ends up holding
+    /// the lossy dequant.
     fn compress(device: &Device, kv: PagedKv, slots: &Buffer, n_slots: usize) {
-        let pso = pipeline(device, "tq_compress_paged");
+        let pso = compress_pipeline(device, kv);
         let cb = kv.cb;
         run(device, |batch| {
             // `kv.data` is reached via the chunk table: resident, not bound.
@@ -280,21 +299,8 @@ mod tests {
                     (kv.norms, 6),
                     (slots, 16),
                 ],
-                &[
-                    (cb.dim as u32, 7),
-                    (cb.bits, 8),
-                    (vals_per_word(cb.bits) as u32, 9),
-                    (cb.pdim as u32, 10),
-                    (cb.q.centroids().len() as u32, 11),
-                    (kv.num_kv_heads as u32, 13),
-                    (kv.block_size as u32, 14),
-                    (kv.bpc as u32, 15),
-                    (1, 17),
-                    (0, 21),
-                    (0, 22),
-                    (0, 23),
-                ],
-                &[(cb.q.scale(), 12)],
+                &[],
+                &[],
                 &[kv.data],
                 MTLSize {
                     width: n_slots,
@@ -355,10 +361,8 @@ mod tests {
                 num_blocks,
                 block_size,
                 num_kv_heads,
-                head_dim,
                 4,
-                bits,
-                42,
+                &TqCodebook::compute(head_dim, bits),
             );
             let len = |b: &Buffer| b.length();
             let allocated: usize = [&tq.packed_k, &tq.packed_v, &tq.norms_k, &tq.norms_v]
@@ -480,5 +484,54 @@ mod tests {
             pool_out[zb..zb + dim].iter().all(|&h| h == 0),
             "dim {dim} bits {bits}: uncompressed slot {n_slots} must be untouched"
         );
+    }
+
+    /// FNV-1a over the bits of `tables`, in order.
+    fn digest(tables: &[&[f32]]) -> u64 {
+        let words = tables.iter().flat_map(|t| t.iter().map(|v| v.to_bits()));
+        words.fold(0xcbf2_9ce4_8422_2325, |h, w| {
+            (h ^ u64::from(w)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// The baked codebook equals what `build_tq_provision` computed at load (a `PolarQuantizer` at
+    /// the production seed, centroid midpoints, `packed_dim`), bit for bit, at every gate-model
+    /// geometry; the digests pin those tables.
+    #[test]
+    fn baked_codebook_equals_load_time_tables() {
+        let golden: [(usize, u32, u64); 4] = [
+            (128, 3, 0xc6f921dfd2b14ed1),
+            (128, 4, 0xc7badbedda5da1f3),
+            (256, 4, 0x42e728170bcf8ff3),
+            (512, 4, 0xcda751c0cdee0bf3),
+        ];
+        for (dim, bits, want) in golden {
+            let cb = TqCodebook::compute(dim, TqBits::new(bits));
+            let q = PolarQuantizer::new(dim, bits, TQ_CODEBOOK_SEED);
+            let mids: Vec<f32> = q
+                .centroids()
+                .windows(2)
+                .map(|w| (w[0] + w[1]) / 2.0)
+                .collect();
+            let bits_of = |t: &[f32]| t.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits_of(cb.signs), bits_of(q.signs()), "signs {dim}/{bits}");
+            assert_eq!(
+                bits_of(cb.centroids),
+                bits_of(q.centroids()),
+                "centroids {dim}/{bits}"
+            );
+            assert_eq!(
+                bits_of(cb.boundaries),
+                bits_of(&mids),
+                "boundaries {dim}/{bits}"
+            );
+            assert_eq!(
+                cb.packed_dim as usize,
+                packed_dim(dim, bits),
+                "packed_dim {dim}/{bits}"
+            );
+            let got = digest(&[cb.signs, cb.centroids, cb.boundaries]);
+            assert_eq!(got, want, "codebook digest {dim}/{bits}: {got:#018x}");
+        }
     }
 }

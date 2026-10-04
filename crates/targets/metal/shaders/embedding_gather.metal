@@ -17,49 +17,26 @@
 // row count, so no guard beyond `gid >= n` is needed).
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
 
-kernel void embedding_gather_rows_f16(
-    device half* output [[buffer(0)]],
-    device const half* input [[buffer(1)]],
+// `EmbeddingGatherConstants`, compiled in.
+SCRATCHY_CONSTANT(uint, GATHER_N, 0);
+SCRATCHY_CONSTANT(uint, GATHER_WIDTH, 1);
+
+template <typename T>
+[[kernel]] void embedding_gather_rows(
+    device T* output [[buffer(0)]],
+    device const T* input [[buffer(1)]],
     device const uint* indices [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant uint& width [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= n) return;
+    if (gid >= GATHER_N) return;
 
-    uint row = gid / width;
-    uint col = gid % width;
-    output[gid] = input[indices[row] * width + col];
+    uint row = gid / GATHER_WIDTH;
+    uint col = gid % GATHER_WIDTH;
+    output[gid] = input[indices[row] * GATHER_WIDTH + col];
 }
 
-kernel void embedding_gather_rows_bf16(
-    device bfloat* output [[buffer(0)]],
-    device const bfloat* input [[buffer(1)]],
-    device const uint* indices [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant uint& width [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= n) return;
-
-    uint row = gid / width;
-    uint col = gid % width;
-    output[gid] = input[indices[row] * width + col];
-}
-
-kernel void embedding_gather_rows_f32(
-    device float* output [[buffer(0)]],
-    device const float* input [[buffer(1)]],
-    device const uint* indices [[buffer(2)]],
-    constant uint& n [[buffer(3)]],
-    constant uint& width [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= n) return;
-
-    uint row = gid / width;
-    uint col = gid % width;
-    output[gid] = input[indices[row] * width + col];
-}
+SCRATCHY_KERNEL(embedding_gather_rows_f16, embedding_gather_rows<half>)
+SCRATCHY_KERNEL(embedding_gather_rows_bf16, embedding_gather_rows<bfloat>)

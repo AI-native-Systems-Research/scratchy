@@ -35,7 +35,7 @@ use quote::{format_ident, quote};
 use syn::Ident;
 
 use crate::assignment::WorkloadAssignments;
-use crate::classified::{Expr, OpKind, Program, Stmt, UnrollIndex, WeightId};
+use crate::classified::{OpKind, Program, UnrollIndex, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::ImplementationLibrary;
@@ -6667,6 +6667,120 @@ enum BackboneLayout {
 /// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadPixels` /
 /// `LoadPosEmbeds` nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
+/// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
+/// logits `width` and `dtype` (`scratchy_target_metal::off_tape`), each distinct kernel once.
+#[cfg(feature = "metal")]
+fn metal_off_tape_tokens(
+    width: u64,
+    mc: &scratchy_target_metal::tape::model_consts::MetalModelConsts,
+    stem: &str,
+) -> TokenStream {
+    use scratchy_target_metal::off_tape::OffTape;
+    use scratchy_target_metal::specialized_pipeline_cache::PipelineKey;
+    use scratchy_target_metal::tape::ids::{BlockSize, LogitsWidth};
+    let width = u32::try_from(width).expect("logits width fits u32");
+    // The chain advances the full-context group's slots (KV group 0).
+    let block_size = BlockSize(mc.global_block_size);
+    let keys = OffTape::keys(LogitsWidth(width), mc.metal_dtype, block_size);
+    let mut distinct: Vec<PipelineKey> = Vec::new();
+    let ids = keys.map(|key| {
+        let ix = distinct.iter().position(|d| *d == key).unwrap_or_else(|| {
+            distinct.push(key);
+            distinct.len() - 1
+        });
+        quote::format_ident!("K{ix}")
+    });
+    let bake = scratchy_target_metal::aot::bake(&distinct);
+    eprintln!(
+        "[metal bake] {stem}: {} off-tape kernels, {} compiled here",
+        distinct.len(),
+        bake.compiled
+    );
+    let kernels = distinct.iter().zip(&bake.metallibs).enumerate();
+    let kernels = kernels.map(|(ix, (key, metallib))| {
+        let id = quote::format_ident!("K{ix}");
+        let (library, function) = (key.library_name, key.kernel_name);
+        let constants =
+            scratchy_target_metal_compiler::const_tokens::const_tokens(&key.constants.as_slice())
+                .expect("serialize off-tape kernel constants");
+        let metallib = syn::LitByteStr::new(metallib, proc_macro2::Span::call_site());
+        quote! {
+            const #id: __tl::BakedKernel = __tl::BakedKernel {
+                library: #library,
+                function: #function,
+                constants: #constants,
+                metallib: #metallib,
+            };
+        }
+    });
+    let OffTape {
+        vocab,
+        argmax,
+        argmax_dual_write,
+        grammar_mask,
+        sampler,
+        chain_advance,
+    } = ids;
+    let vocab = vocab.get();
+    let sampler = sampler.iter().map(|row| {
+        let row = row.iter();
+        quote!([#(#row),*])
+    });
+    quote! {
+        /// This model's off-tape kernels, baked for its logits.
+        #[cfg(feature = "metal")]
+        pub static METAL_OFF_TAPE: ::scratchy_target_metal::off_tape::OffTapeKernels = {
+            use ::scratchy_target_metal::tape::constants as __tc;
+            use ::scratchy_target_metal::tape::lowered as __tl;
+            #(#kernels)*
+            ::scratchy_target_metal::off_tape::OffTape {
+                vocab: ::scratchy_target_metal::tape::ids::LogitsWidth(#vocab),
+                argmax: #argmax,
+                argmax_dual_write: #argmax_dual_write,
+                grammar_mask: #grammar_mask,
+                sampler: [#(#sampler),*],
+                chain_advance: #chain_advance,
+            }
+        };
+    }
+}
+
+/// The model's `METAL_TQ_CODEBOOK`: its TurboQuant codebook at the global head dim, computed here
+/// (`None` for a dense KV cache).
+#[cfg(feature = "metal")]
+fn metal_tq_codebook_tokens(
+    kv_codec: scratchy_forward_compiler::KvCodec,
+    global_head_dim: u32,
+) -> TokenStream {
+    use scratchy_target_metal::turboquant::TqCodebook;
+    let codebook = match kv_codec {
+        scratchy_forward_compiler::KvCodec::Dense => quote!(::core::option::Option::None),
+        scratchy_forward_compiler::KvCodec::TurboQuant(bits) => {
+            let cb = TqCodebook::compute(global_head_dim as usize, bits);
+            let table = |t: &[f32]| {
+                let words = t.iter().map(|v| v.to_bits());
+                quote!(&[#(f32::from_bits(#words)),*])
+            };
+            let (signs, centroids) = (table(cb.signs), table(cb.centroids));
+            let (boundaries, bits, packed_dim) = (table(cb.boundaries), bits.get(), cb.packed_dim);
+            quote!(::core::option::Option::Some(::scratchy_target_metal::turboquant::TqCodebook {
+                bits: ::scratchy_forward_compiler::TqBits::new(#bits),
+                packed_dim: #packed_dim,
+                signs: #signs,
+                centroids: #centroids,
+                boundaries: #boundaries,
+            }))
+        }
+    };
+    quote! {
+        /// This model's TurboQuant codebook (`None`: dense KV cache).
+        #[cfg(feature = "metal")]
+        pub static METAL_TQ_CODEBOOK: ::core::option::Option<
+            ::scratchy_target_metal::turboquant::TqCodebook,
+        > = #codebook;
+    }
+}
+
 fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
     const LM_HEAD_PREFIX: &str = "lm_head";
 
@@ -6777,296 +6891,6 @@ fn bounds_for_wp(
     bounds
 }
 
-/// Emit the full per-model module body: Weights struct + loader,
-/// one forward fn per workload tape_index, and a dispatching wrapper.
-///
-/// When `canonical_override` is `Some(ident)`, this variant is a
-/// shim for that canonical sibling — emit `pub type Weights =
-/// super::<ident>::Weights;` instead of a fresh struct, emit the
-/// variant-specific `load` + `fingerprint_matches` bodies
-/// (loaders differ per quant preset, fingerprints differ per
-/// tensor-suffix gate), and `pub use` the canonical's forward +
-/// forward_backbone + per-tape_index forward_m_<N> fns. rustc doesn't
-/// re-monomorphize `pub use` re-exports, so the canonical fn body
-/// is optimized ONCE regardless of how many variants share it.
-#[cfg(feature = "metal")]
-fn emit_synthesized_kernel_sources_override(
-    model: &ModelParams,
-    tp_world_size: u8,
-    has_linear_bias: bool,
-    mlp_uses_gelu: bool,
-) -> TokenStream {
-    use crate::quantization::QuantMethod;
-    let (bits, group_size, mlp_bits) = match model.quantization.as_ref().map(|q| &q.method) {
-        Some(QuantMethod::Affine {
-            bits,
-            group_size,
-            bits_overrides,
-            ..
-        }) => {
-            // MLP projection width: the preset's bits_overrides carry
-            // per-suffix widths (Gemma4: mlp.{gate,up,down}_proj → 8).
-            let mlp_bits = bits_overrides
-                .iter()
-                .find(|(path, _)| path.contains("mlp."))
-                .map(|(_, b)| *b)
-                .unwrap_or(*bits);
-            (*bits, *group_size, mlp_bits)
-        }
-        _ => return quote! {},
-    };
-    if bits != 4 {
-        return quote! {};
-    }
-    let mlp_act = if mlp_uses_gelu {
-        ::scratchy_target_metal::atom_lib::MlpAct::Gelu
-    } else {
-        ::scratchy_target_metal::atom_lib::MlpAct::Silu
-    };
-    // bf16 activation is the default for every modern Llama / Qwen /
-    // Mistral / Gemma metal arch (per CanonicalParams::METAL_DTYPE).
-    // Future: thread W::METAL_DTYPE through and emit per-dtype variants.
-    let t_act = "bfloat";
-    // T_scale tracks on-disk scale convention. Mirrors the SCALE_DTYPE
-    // override in `emit_canonical_params_impl`: Qwen3 family ships BF16
-    // scales+biases, everything else ships F16. Synth kernel symbol
-    // must match the corresponding `MetalSynth*Impl` instantiation
-    // registered in `starter_library` (otherwise the solver's pick and
-    // the runtime pipeline cache disagree on the library key).
-    // Whole Qwen3 family (Qwen3 / Qwen3Moe / Qwen3.5 / Qwen3.6 /
-    // Qwen3-Next, dense + MoE + the VL-wrapped `Qwen3_5ForConditional
-    // Generation` text decoders) ships BF16 scales+biases. Match by
-    // family prefix so new members are covered automatically.
-    let is_bf16_scale = model.arch.scale_dtype.as_deref() == Some("bf16");
-    let t_scale = if is_bf16_scale { "bfloat" } else { "half" };
-
-    // Model dims baked as MSL `constant constexpr` literals at synth
-    // time. Same TP-sharding rules as `emit_canonical_params_impl`:
-    // num_q / num_kv / intermediate split per-rank; hidden stays
-    // replicated (residual stream is post-allreduce).
-    let tp = tp_world_size as u32;
-    let tp_us = tp_world_size as usize;
-    let hidden = *model.bounds.get("hidden_size").unwrap_or(&0) as u32;
-    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
-    let num_q = (*model.bounds.get("num_attention_heads").unwrap_or(&0) as u32) / tp;
-    let num_kv = (*model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32) / tp;
-    let intermediate = (*model.bounds.get("intermediate_size").unwrap_or(&0) as u32) / tp;
-    let partial = model
-        .scalars
-        .get("partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9);
-    let rot_dim = match partial {
-        Some(f) => (f * head_dim as f64).round() as u32,
-        None => head_dim,
-    };
-    let eps = rms_norm_eps(model);
-    let _ = tp_us;
-
-    // Sanity-gate: if any required dim is zero, skip emission (the
-    // model isn't a standard transformer-decoder we can synthesize for).
-    if hidden == 0 || head_dim == 0 || num_q == 0 || num_kv == 0 || intermediate == 0 {
-        return quote! {};
-    }
-
-    let consts = crate::fuse_pass::ChunkConstants {
-        // Baked as `constant constexpr` literals in the emitted MSL.
-        // M is the only remaining function constant (varies per
-        // tape_index; can't be baked).
-        hidden,
-        num_q_heads: num_q,
-        num_kv_heads: num_kv,
-        head_dim,
-        rot_dim,
-        block_size: 16, // scratchy_forward_compiler::CanonicalParams::BLOCK_SIZE default
-        intermediate,
-        m: 0,
-        group_size,
-        rms_norm_eps: eps,
-        // Pre-attn synth gains 3 extra `__{q,k,v}_linear_bias` buffer
-        // params + a bias epilogue inside each per-band AffineQmvAtom
-        // when this is `true`. Threaded down from
-        // `program_has_bias_add` so Qwen2/Qwen2.5 (DSL emits
-        // `bias_add` on QKV) gets the biased variant; Llama (no DSL
-        // bias_add) keeps the existing one. MLP / gate-up synths
-        // ignore this — Qwen2 MLP has no biases.
-        has_linear_bias,
-    };
-    let pre_attn = crate::fuse_pass::synthesize_pre_attn_chunk(
-        crate::fuse_pass::SynthesisBackend::Metal,
-        t_act,
-        t_scale,
-        &consts,
-    );
-    let pre_attn_init = crate::fuse_pass::synthesize_pre_attn_init_chunk(
-        crate::fuse_pass::SynthesisBackend::Metal,
-        t_act,
-        t_scale,
-        &consts,
-    );
-    // MLP pre-down synth: bake BOTH the 4-bit and 8-bit kernels.
-    //
-    // The solver picks a `MetalSynthMlpPreDown` impl by the shared
-    // expert's *actual* per-module quant width (`synth_mlp_pre_down.rs`
-    // registers a b4 and a b8 variant, each `matches()`-gated on the
-    // weight's bits). A mixed-width OptiQ checkpoint therefore dispatches
-    // b4 on some layers and b8 on others, but `mlp_bits` — derived from a
-    // `bits_overrides` suffix match — only knows one width, so it would
-    // register a single library and leave the other width's pipeline
-    // lookup unresolved (→ silent garble). Emit both; a uniform model
-    // simply never looks up the unused one.
-    let _ = mlp_bits;
-    let mlp_pre_down_variants: ::std::vec::Vec<_> = [4u32, 8u32]
-        .into_iter()
-        .map(|b| {
-            crate::fuse_pass::synthesize_mlp_pre_down_chunk(
-                crate::fuse_pass::SynthesisBackend::Metal,
-                t_act,
-                t_scale,
-                &consts,
-                mlp_act,
-                b,
-            )
-        })
-        .collect();
-    // AOT-compile each synth source to a `.metallib` blob at macro
-    // expansion time. Same `xcrun metal -c` + `xcrun metallib`
-    // pipeline used by `scratchy-target-metal/build.rs` for every
-    // hand-written shader. Runtime loads via `newLibraryWithData`
-    // (NOT `newLibraryWithSource`) so the resulting Metal binaries
-    // are identical to the AOT-compiled shaders — same compiler
-    // path, same behavior across Apple GPU generations.
-    let gate_up = ::scratchy_target_metal::fuse_pass::synthesize_gate_up_silu_mul_large_chunk(
-        ::scratchy_target_metal::fuse_pass::SynthesisBackend::Metal,
-        t_act,
-        t_scale,
-        &consts,
-    );
-    let gu_bytes =
-        ::scratchy_target_metal::aot::aot_compile_metallib(&gate_up.symbol, &gate_up.source);
-
-    let pa_bytes =
-        ::scratchy_target_metal::aot::aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
-    let pi_bytes = ::scratchy_target_metal::aot::aot_compile_metallib(
-        &pre_attn_init.symbol,
-        &pre_attn_init.source,
-    );
-    // Dedup by symbol so a model whose b4 and b8 chunks collide (they
-    // don't today — the width is baked into the symbol) never registers
-    // the same key twice.
-    let mut seen_md: ::std::collections::HashSet<String> = ::std::collections::HashSet::new();
-    let md_symbol_lits: ::std::vec::Vec<syn::LitStr> = ::std::vec::Vec::new();
-    let md_bytes_lits: ::std::vec::Vec<syn::LitByteStr> = ::std::vec::Vec::new();
-    let (md_symbol_lits, md_bytes_lits) = mlp_pre_down_variants.iter().fold(
-        (md_symbol_lits, md_bytes_lits),
-        |(mut syms, mut blobs), chunk| {
-            if seen_md.insert(chunk.symbol.clone()) {
-                let bytes = ::scratchy_target_metal::aot::aot_compile_metallib(
-                    &chunk.symbol,
-                    &chunk.source,
-                );
-                syms.push(syn::LitStr::new(
-                    &chunk.symbol,
-                    proc_macro2::Span::call_site(),
-                ));
-                blobs.push(syn::LitByteStr::new(&bytes, proc_macro2::Span::call_site()));
-            }
-            (syms, blobs)
-        },
-    );
-    // One named const per md variant (byte-string literals aren't
-    // `'static`-promotable inside the returned array; a `const` binding is).
-    let md_idents: ::std::vec::Vec<proc_macro2::Ident> = (0..md_bytes_lits.len())
-        .map(|i| quote::format_ident!("__SYNTH_MLP_PRE_DOWN_LIB_{}", i))
-        .collect();
-
-    let gu_symbol_lit = syn::LitStr::new(&gate_up.symbol, proc_macro2::Span::call_site());
-    let gu_bytes_lit = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
-
-    let pa_symbol_lit = syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
-    let pi_symbol_lit = syn::LitStr::new(&pre_attn_init.symbol, proc_macro2::Span::call_site());
-
-    let pa_bytes_lit = syn::LitByteStr::new(&pa_bytes, proc_macro2::Span::call_site());
-    let pi_bytes_lit = syn::LitByteStr::new(&pi_bytes, proc_macro2::Span::call_site());
-
-    quote! {
-        fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
-            const __SYNTH_PRE_ATTN_LIB: &[u8] = #pa_bytes_lit;
-            const __SYNTH_PRE_ATTN_INIT_LIB: &[u8] = #pi_bytes_lit;
-            const __SYNTH_GATE_UP_SILU_MUL_LIB: &[u8] = #gu_bytes_lit;
-            #( const #md_idents: &[u8] = #md_bytes_lits; )*
-            &[
-                (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
-                (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_LIB),
-                (#gu_symbol_lit, __SYNTH_GATE_UP_SILU_MUL_LIB),
-                #( (#md_symbol_lits, #md_idents) ),*
-            ]
-        }
-    }
-}
-
-/// Walk the classified DSL `Program` looking for any
-/// `Expr::Call { op: OpKind::BiasAdd, .. }`. Returns `true` on the
-/// first hit. Drives the biased variant of the synth pre-attn
-/// megakernel — Qwen2/Qwen2.5 DSL emits `bias_add` on QKV, Llama
-/// does not.
-/// True when the DSL's MLP uses a tanh-GELU gate (`gelu(gemm(...)) *
-/// up`) — Gemma-family GeGLU. Drives the gelu variant of the synth MLP
-/// megakernel (`synth_mlp_pre_down_gelu_*`).
-pub fn program_has_gelu(program: &Program) -> bool {
-    fn scan_stmt(stmt: &Stmt) -> bool {
-        match stmt {
-            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => scan_expr(value),
-            Stmt::For { body, .. } => body.iter().any(scan_stmt),
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => then_body.iter().any(scan_stmt) || else_body.iter().any(scan_stmt),
-        }
-    }
-    fn scan_expr(expr: &Expr) -> bool {
-        match expr {
-            Expr::Call { op, args } => matches!(op, OpKind::Gelu) || args.iter().any(scan_expr),
-            Expr::Mul { lhs, rhs } => scan_expr(lhs) || scan_expr(rhs),
-            Expr::Local(_)
-            | Expr::Extern { .. }
-            | Expr::Weight { .. }
-            | Expr::ScalarLit(_)
-            | Expr::SqrtBound(_)
-            | Expr::ConfigScalar { .. } => false,
-        }
-    }
-    program.statements.iter().any(scan_stmt)
-}
-
-pub fn program_has_bias_add(program: &Program) -> bool {
-    fn scan_stmt(stmt: &Stmt) -> bool {
-        match stmt {
-            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => scan_expr(value),
-            Stmt::For { body, .. } => body.iter().any(scan_stmt),
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => then_body.iter().any(scan_stmt) || else_body.iter().any(scan_stmt),
-        }
-    }
-    fn scan_expr(expr: &Expr) -> bool {
-        match expr {
-            Expr::Call { op, args } => matches!(op, OpKind::BiasAdd) || args.iter().any(scan_expr),
-            Expr::Mul { lhs, rhs } => scan_expr(lhs) || scan_expr(rhs),
-            Expr::Local(_)
-            | Expr::Extern { .. }
-            | Expr::Weight { .. }
-            | Expr::ScalarLit(_)
-            | Expr::SqrtBound(_)
-            | Expr::ConfigScalar { .. } => false,
-        }
-    }
-    program.statements.iter().any(scan_stmt)
-}
-
 /// Whether this model uses rotary position embeddings — any `Rotary` extern
 /// input in the Fuf. Drives `CanonicalParams::ROPE_ON_READ` (rope-on-read is
 /// the universal default for rope models) and the matching
@@ -7147,8 +6971,6 @@ fn kv_codec_for(
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
-    has_bias_add: bool,
-    has_gelu_mlp: bool,
     uses_rotary: bool,
     uses_kv_cache: bool,
     // Filled with the SAME values the impl's consts are emitted from —
@@ -7576,26 +7398,6 @@ fn emit_canonical_params_impl(
         None => quote! {},
     };
 
-    // Synthesized-kernel sources override (Metal-only, affine-int4
-    // gated). Empty for cuda models and any model that doesn't ship
-    // an MLX-affine int4 quantization config; default `&[]` from the
-    // CanonicalParams trait kicks in there.
-    //
-    // `has_bias_add` is threaded through so Qwen2/Qwen2.5 (whose DSL
-    // emits `bias_add` on QKV) gets the biased synth kernel variants
-    // — `synth_pre_attn{,_init}_<dtype>_<scale>_gs<N>_bias` — and the
-    // lowering arm's `kernel_symbol` matches the registered library.
-    // Mismatch surfaces at worker init as
-    // `PipelineLookup(no library …_bias in SpecializedPipelineCache)`.
-    #[cfg(feature = "metal")]
-    let synth_sources_override =
-        emit_synthesized_kernel_sources_override(model, tp_world_size, has_bias_add, has_gelu_mlp);
-    #[cfg(not(feature = "metal"))]
-    let synth_sources_override = {
-        let _ = (tp_world_size, has_bias_add, has_gelu_mlp);
-        TokenStream::new()
-    };
-
     // SCALE_DTYPE override — only matters under `--features metal`.
     // mlx-community 4bit convention (probed across cached HF snapshots):
     // Llama-3.x / Qwen2.5 / SmolLM ship F16 scales+biases+norm gains,
@@ -7771,7 +7573,6 @@ fn emit_canonical_params_impl(
             const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
             #mrope_section_tokens
-            #synth_sources_override
             #scale_dtype_override
         }
     }
@@ -11561,7 +11362,6 @@ pub fn emit_model(
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row short instead of
     // repeating `::scratchy_forward_compiler::Instruction::<Weights>::Variant(…)`.
-    let has_bias_add = program_has_bias_add(program);
     #[cfg(feature = "metal")]
     let mut resolved_metal_consts: Option<
         scratchy_target_metal::tape::model_consts::MetalModelConsts,
@@ -11569,8 +11369,6 @@ pub fn emit_model(
     let canonical_params_impl = emit_canonical_params_impl(
         model,
         tp_world_size,
-        has_bias_add,
-        program_has_gelu(program),
         fuf_uses_rotary(fuf),
         fuf_uses_kv_cache(fuf),
         #[cfg(feature = "metal")]
@@ -12035,6 +11833,35 @@ pub fn emit_model(
     // the load-time `select_prefill_bucket` compares against the device's
     // affordable arena budget to prune the ladder target-reactively.
     let mut metal_bucket_cost_entries: Vec<TokenStream> = Vec::new();
+    // The KV cap rungs every bucket bakes, topped by every block the model's positions fill.
+    #[cfg(feature = "metal")]
+    let metal_cap_ladder = {
+        use scratchy_target_metal::tape::ids::{BlockSize, MaxPositions};
+        let mc = resolved_metal_consts
+            .as_ref()
+            .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
+        let max_pos = fuf_uses_kv_cache(fuf).then(|| {
+            let max_pos = model.bounds.get("max_position_embeddings").copied();
+            max_pos
+                .and_then(|p| u32::try_from(p).ok())
+                .map(MaxPositions)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "model `{}`: no u32 max_position_embeddings to top the KV cap ladder",
+                        model.source_stem
+                    )
+                })
+        });
+        let ladder = scratchy_target_metal_compiler::static_tape::kv_cap_ladder(
+            max_pos,
+            BlockSize(mc.block_size),
+        );
+        eprintln!(
+            "[metal bake] {}: KV cap rungs {ladder:?}",
+            model.source_stem
+        );
+        ladder
+    };
     for &m in &num_tokens_points {
         // Prefer the sk=0 canonical for this `m`; fall back to any wp
         // at `m` if the model never declared sk=0 explicitly.
@@ -12110,17 +11937,16 @@ pub fn emit_model(
             #[cfg(feature = "metal")]
             static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
         });
-        // Bake this bucket's tape variants at expansion — the SAME
-        // lower_pair the pool used to run at load, now run here, with
-        // the two runtime inputs (device generation, block capacity)
-        // handled as variants + patches. See metal_static_tape.rs.
+        // Bake this bucket's tape rungs at expansion — one per device
+        // generation, addressing, KV cap and TurboQuant decode heads —
+        // every fact baked; the pool picks one. See static_tape.rs.
         #[cfg(feature = "metal")]
         let tapes_static_toks = {
             let mc = resolved_metal_consts
                 .as_ref()
                 .expect("emit_canonical_params_impl fills metal consts under -Fmetal");
             // A canonical metal has no kernel for (`[m2-eq] … REFUSED`: it has no steps) bakes NO
-            // variants, so `MetalWorkerPool::for_buckets` refuses at load (`BucketLower`), naming
+            // variants, so `MetalWorkerPool::for_buckets` refuses at load (`NoRung`), naming
             // the bucket. Baking its empty step tape instead would build VALID empty-command tapes:
             // the forward would no-op and the tail would index the arena out of bounds.
             let tapes_expr = match metal_steps.get(&canonical) {
@@ -12138,6 +11964,7 @@ pub fn emit_model(
                         bucket_m: m as u32,
                         num_arena_slots: *num_slots_b,
                         rotary: metal_rotary,
+                        cap_ladder: &metal_cap_ladder,
                     };
                     scratchy_target_metal_compiler::static_tape::bake_bucket_tapes(
                         mc,
@@ -12256,13 +12083,11 @@ pub fn emit_model(
     // there would stride rows by ~65x the real row and read past the
     // slot. Vision-only encoders carry no vocab at all and would get
     // 0. Cuda builds skip the constant entirely.
-    let vocab_size_lit = {
-        let width = match layout {
-            BackboneLayout::Decoder { .. } => model.bounds.get("vocab_size").copied().unwrap_or(0),
-            BackboneLayout::Encoder => model.bounds.get("hidden_size").copied().unwrap_or(0),
-        };
-        proc_macro2::Literal::u64_unsuffixed(width)
+    let logits_width = match layout {
+        BackboneLayout::Decoder { .. } => model.bounds.get("vocab_size").copied().unwrap_or(0),
+        BackboneLayout::Encoder => model.bounds.get("hidden_size").copied().unwrap_or(0),
     };
+    let vocab_size_lit = proc_macro2::Literal::u64_unsuffixed(logits_width);
 
     // Per-worker arena peak in bytes — sum across every slot of the
     // worker's arena layout, where each slot is sized to fit the
@@ -12380,7 +12205,13 @@ pub fn emit_model(
     };
 
     #[cfg(feature = "metal")]
-    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens());
+    metal_arena_bytes_statics.push(metal_tape_cmds.into_tokens(&model.source_stem));
+    #[cfg(feature = "metal")]
+    {
+        let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
+        metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc.kv_codec, mc.global_head_dim));
+        metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc, &model.source_stem));
+    }
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
 
@@ -12393,6 +12224,25 @@ pub fn emit_model(
             = &[
                 #(#metal_bucket_entries)*
             ];
+
+        /// [`METAL_BUCKETS`]' baked rungs, which the worker picks the rung a pool runs on from
+        /// before the pool exists: the KV pool's block-table width, the memory budget.
+        #[cfg(feature = "metal")]
+        pub static METAL_RUNGS: ::scratchy_target_metal::interpreter::metal::MetalRungs =
+            ::scratchy_target_metal::interpreter::metal::MetalRungs {
+                buckets: METAL_BUCKETS,
+                tq: ::scratchy_target_metal::interpreter::metal::TqGroup {
+                    head_dim: ::scratchy_target_metal::tape::ids::HeadDim(
+                        <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM,
+                    ),
+                    q_heads: ::scratchy_target_metal::tape::ids::NumQHeads(
+                        <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_Q_HEADS,
+                    ),
+                    kv_heads: ::scratchy_target_metal::tape::ids::NumKvHeads(
+                        <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS,
+                    ),
+                },
+            };
 
         /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
         /// metal forward body's `RuntimeFactory` allocates per-worker
@@ -12489,9 +12339,9 @@ pub fn emit_model(
             runtime_factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory,
             max_workers: usize,
             // Runtime per-sequence block-table capacity
-            // (`KvCachePool::max_blocks_per_seq`); drives the kernel's
-            // `MaxBlocksPerSeq` function constant + the rope-once scratch.
+            // (`KvCachePool::max_blocks_per_seq`); picks the KV cap rung.
             block_cap: usize,
+            addressing: ::scratchy_target_metal::tape::lowered::KvAddressing,
         ) -> ::core::result::Result<
             ::scratchy_target_metal::interpreter::metal::MetalWorkerPool<Weights>,
             ::scratchy_target_metal::interpreter::metal::PoolBuildError,
@@ -12507,6 +12357,7 @@ pub fn emit_model(
                 // all buckets. The lazy-init path below passes the real cap.
                 None,
                 block_cap,
+                addressing,
             )
         }
 
@@ -12623,20 +12474,17 @@ pub fn emit_model(
                         // call (every layer global). gemma4 provisions GLOBAL-sized
                         // packed/norms/scratch (head_dim 512, NUM_GLOBAL_KV_HEADS,
                         // GLOBAL_BLOCK_SIZE) for the group-0 layers only.
-                        let __tq_prov = match <Weights as ::scratchy_forward_compiler::CanonicalParams>::KV_CODEC {
-                            ::scratchy_forward_compiler::KvCodec::TurboQuant(bits) => Some(::scratchy_target_metal::turboquant::build_tq_provision(
+                        let __tq_prov = METAL_TQ_CODEBOOK.as_ref().map(|codebook| {
+                            ::scratchy_target_metal::turboquant::build_tq_provision(
                                 dev,
                                 &__tq_is_global,
                                 __tq_nb,
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_BLOCK_SIZE as usize,
                                 <Weights as ::scratchy_forward_compiler::CanonicalParams>::NUM_GLOBAL_KV_HEADS as usize,
-                                <Weights as ::scratchy_forward_compiler::CanonicalParams>::GLOBAL_HEAD_DIM as usize,
                                 ::scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize,
-                                bits,
-                                42,
-                            )),
-                            ::scratchy_forward_compiler::KvCodec::Dense => None,
-                        };
+                                codebook,
+                            )
+                        });
                         ::scratchy_target_metal::interpreter::metal::RuntimeBindings {
                             input_ids: alloc(max_m * 4),
                             positions: alloc(max_m * 4),
@@ -12769,10 +12617,10 @@ pub fn emit_model(
                     // after `determine_available_memory`. Prunes the compiled
                     // ladder so the colored arena fits the KV budget.
                     device.metal_bucket_max_m,
-                    // Runtime per-sequence block-table capacity. Read off the KV
-                    // pool so the kernel's `MaxBlocksPerSeq` function constant +
-                    // rope-once scratch agree with the host block-table stride.
+                    // Runtime per-sequence block-table capacity, read off the KV
+                    // pool: it picks the KV cap rung.
                     ctx.kv_cache.max_blocks_per_seq,
+                    device.kv_addressing,
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
             })
@@ -13682,7 +13530,8 @@ fn emit_shim_model(
         #[cfg(feature = "metal")]
         pub use super::#canonical::{
             forward, forward_chain_with_encoder, forward_with_metal_followup,
-            METAL_ARENA_PEAK_BYTES, METAL_BUCKET_ARENA_COSTS, METAL_BUCKETS, metal_pool,
+            METAL_ARENA_PEAK_BYTES, METAL_BUCKET_ARENA_COSTS, METAL_BUCKETS, METAL_OFF_TAPE, METAL_RUNGS,
+            metal_pool,
         };
     }
 }
@@ -13743,8 +13592,6 @@ mod tests {
             &m,
             1,
             false,
-            false,
-            false,
             true,
             #[cfg(feature = "metal")]
             &mut None,
@@ -13780,8 +13627,6 @@ mod tests {
         let ts = emit_canonical_params_impl(
             &m,
             2,
-            false,
-            false,
             false,
             true,
             #[cfg(feature = "metal")]
@@ -13830,8 +13675,6 @@ mod tests {
         let ts = emit_canonical_params_impl(
             &m,
             8,
-            false,
-            false,
             false,
             true,
             #[cfg(feature = "metal")]

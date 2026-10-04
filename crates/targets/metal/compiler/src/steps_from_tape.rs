@@ -401,6 +401,11 @@ impl Recording<'_> {
         &self.graph.nodes[self.steps.node[i].index()].op
     }
 
+    /// The width of the rows source op `i` writes: its output tensor's columns.
+    fn width(&self, i: usize) -> st::ActivationWidth {
+        st::ActivationWidth::of_cols(self.graph.shape(self.graph.op_output[i]).cols)
+    }
+
     fn no(&self, i: usize, why: Refused) -> StepRefusal {
         StepRefusal {
             op: Some((i, self.op(i).name())),
@@ -787,7 +792,7 @@ impl Recording<'_> {
             // An identity multiply emits nothing.
             if scale != 1.0 {
                 let out = self.colour(i0)?;
-                let step = MetalStep::ScalarMul(zero, out, st::Scale(scale));
+                let step = MetalStep::ScalarMul(zero, out, st::Scale(scale), self.width(i0));
                 rows.push(em(step, &[zero], &[out], Vec::new()));
             }
         }
@@ -874,7 +879,8 @@ impl Recording<'_> {
                     // the command writes the BiasAdd's buffer.
                     (F::MeanSubRmsNormBiasAdd, Some(b)) => {
                         let out = self.colour(self.op_at(i, b)?)?;
-                        let step = MetalStep::MeanSubRmsNormBiasAdd(input, out, layer);
+                        let step =
+                            MetalStep::MeanSubRmsNormBiasAdd(input, out, layer, self.width(i));
                         Ok(em(
                             step,
                             &[input],
@@ -884,7 +890,7 @@ impl Recording<'_> {
                     }
                     // The gain is an `RmsNorm` source like every other norm's.
                     (F::MeanSubRmsNorm, None) => {
-                        let step = MetalStep::MeanSubRmsNorm(input, out, layer);
+                        let step = MetalStep::MeanSubRmsNorm(input, out, layer, self.width(i));
                         Ok(em(
                             step,
                             &[input],
@@ -1095,19 +1101,21 @@ impl Recording<'_> {
         use MetalStep as S;
         use SubOp as L;
         let out = || self.colour(i);
-        let unary = |f: &dyn Fn(Slot, Slot) -> MetalStep| -> Result<Emission, StepRefusal> {
+        type Unary<'a> = &'a dyn Fn(Slot, Slot, st::ActivationWidth) -> MetalStep;
+        let unary = |f: Unary| -> Result<Emission, StepRefusal> {
             let (input, out) = (self.read(i, 0)?, out()?);
-            Ok(em(f(input, out), &[input], &[out], Vec::new()))
+            let step = f(input, out, self.width(i));
+            Ok(em(step, &[input], &[out], Vec::new()))
         };
         Ok(Some(match *self.op(i) {
             // A view: no kernel runs, so the barrier walk neither fences on it nor bookkeeps it.
-            L::Reshape { rows, cols } => {
+            L::Reshape { rows, .. } => {
                 let (input, out) = (self.read(i, 0)?, out()?);
                 let (mult, div) = match rows {
                     RowScale::Times(k) => (k.get(), 1),
                     RowScale::Over(k) => (1, k.get()),
                 };
-                let step = S::Reshape(input, out, Rows(mult), st::RowsDivisor(div), W(cols));
+                let step = S::Reshape(input, out, Rows(mult), st::RowsDivisor(div));
                 let mut e = em(step, &[input], &[out], Vec::new());
                 e.sig.metadata = true;
                 e
@@ -1123,7 +1131,7 @@ impl Recording<'_> {
                 };
                 let (input, out) = (self.read(i, 0)?, out()?);
                 em(
-                    S::EmbeddingGather(input, out, indices),
+                    S::EmbeddingGather(input, out, indices, self.width(i)),
                     &[input],
                     &[out],
                     Vec::new(),
@@ -1239,7 +1247,7 @@ impl Recording<'_> {
             L::SiluMul => return Err(self.no(i, Refused::SplitSiluMul)),
             // Identity — the op's buffer IS its operand's (in place by contract).
             L::ScalarMul { scale: 1.0 } => return Ok(None),
-            L::ScalarMul { scale } => unary(&|a, b| S::ScalarMul(a, b, st::Scale(scale)))?,
+            L::ScalarMul { scale } => unary(&|a, b, w| S::ScalarMul(a, b, st::Scale(scale), w))?,
             // The accessor is the UPSTREAM gemm's LinearLayer (the bias rides on it): base name,
             // layer and storage all come from that gemm.
             L::Elementwise(E::BiasAdd) => {
@@ -1270,7 +1278,8 @@ impl Recording<'_> {
                 let out = out()?;
                 let (a, b) = (self.read(i, 0)?, self.read(i, 1)?);
                 let other = if out == b { a } else { b };
-                em(S::Add(other, out), &[a, b], &[out], Vec::new())
+                let step = S::Add(other, out, self.width(i));
+                em(step, &[a, b], &[out], Vec::new())
             }
             L::ScalarWeightMul => {
                 let (out, input, e) = (out()?, self.read(i, 0)?, self.weight_of(i)?);

@@ -7,45 +7,24 @@
 //! iter's forward dispatches read the right values without a host
 //! roundtrip. Encoded onto the SAME MTL4 compute encoder as the
 //! adjacent forward dispatches; Metal's intra-encoder hazard tracking
-//! serializes the write→read on the shared buffers.
+//! serializes the write→read on the shared buffers. Baked per model with
+//! its KV block size ([`crate::off_tape`]).
 
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
-use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
+use objc2_metal::MTLSize;
 
-use crate::shader_cache::load_library_from_bytes;
+use crate::off_tape::{OffTapeKernels, OffTapePipeline};
+use crate::shader_cache::Device;
 use crate::stream::MetalStreamError;
 
-pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
-pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
-pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
-
 pub struct ChainAdvanceKernel {
-    pub pipeline: ComputePipelineState,
-    _library: Library,
+    pub pipeline: OffTapePipeline,
 }
 
 impl ChainAdvanceKernel {
-    pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library = load_library_from_bytes(device, crate::embedded_metallib!("chain_advance"))
-            .map_err(|e| {
-            MetalStreamError::ShaderCompilationFailed(format!("load `chain_advance.metallib`: {e}"))
-        })?;
-        let ns_name = NSString::from_str("chain_advance");
-        let function = library.newFunctionWithName(&ns_name).ok_or_else(|| {
-            MetalStreamError::ShaderCompilationFailed("chain_advance fn missing".into())
-        })?;
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "newComputePipelineStateWithFunction(chain_advance): {e:?}"
-                ))
-            })?;
+    pub fn new(device: &Device, kernels: &OffTapeKernels) -> Result<Self, MetalStreamError> {
         Ok(Self {
-            pipeline,
-            _library: library,
+            pipeline: OffTapePipeline::new(device, &kernels.chain_advance)?,
         })
     }
 }
@@ -56,9 +35,8 @@ impl ChainAdvanceKernel {
 ///   index 1: slot_mapping  [num_reqs]  write u32
 ///   index 2: seqused_k     [num_reqs]  write u32
 ///   index 3: block_table   [num_reqs * block_table_stride]  read u32
-///   index 4: block_size           constant uint (8-byte buffer with u32 at offset 0)
-///   index 5: block_table_stride   constant uint (8-byte buffer with u32 at offset 0)
-///   index 6: num_reqs             constant uint (8-byte buffer with u32 at offset 0)
+///   index 4: block_table_stride   constant uint
+///   index 5: num_reqs             constant uint
 ///
 /// A barrier is inserted before the dispatch so the previous iter's
 /// argmax_dual_write (which wrote `runtime.input_ids`) is visible to

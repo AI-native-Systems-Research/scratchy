@@ -194,6 +194,23 @@ macro_rules! u32_newtype {
     )*}
 }
 
+/// A command's position in its tape's command table ([`crate::tape::lowered::TapeCommands`]):
+/// two bytes per command a tape runs, where a reference would be eight plus a load-time fixup. A
+/// table too large for it is refused ([`Self::of`]), never truncated.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, serde::Serialize)]
+pub struct CommandIx(pub u16);
+
+impl CommandIx {
+    /// The index of the command at `position` of its table; `None` past the last index.
+    pub fn of(position: usize) -> Option<Self> {
+        u16::try_from(position).ok().map(Self)
+    }
+
+    pub fn get(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
 macro_rules! i32_newtype {
     ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
         $(#[$m])*
@@ -241,10 +258,13 @@ u32_newtype!(
     /// The KV cache bindings are per-layer chunk-address tables (device
     /// uint64 gpuAddresses); a physical block id `pb` derefs
     /// `table[pb / BLOCKS_PER_CHUNK]` and addresses `pb % BLOCKS_PER_CHUNK`
-    /// within that chunk. Same value baked into the `SynthPreAttn` MSL.
+    /// within that chunk.
     BlocksPerChunk,
-    /// Block-table fanout per sequence (`W::MAX_BLOCKS_PER_SEQ`).
+    /// Block-table fanout per sequence: the KV cap rung a tape is baked for.
+    #[derive(PartialOrd, Ord)]
     MaxBlocksPerSeq,
+    /// The positions a model attends over (`max_position_embeddings`): the top KV cap rung.
+    MaxPositions,
     /// Hidden / Q-projection size (`W::Q_SIZE` — `num_q_heads * head_dim`).
     QSize,
     /// MLP intermediate size (`W::INTERMEDIATE_SIZE`).
@@ -293,6 +313,11 @@ u32_newtype!(
     /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
     GpuCores,
+    /// Logits per row a model's forward leaves (`METAL_VOCAB_SIZE`): the width the off-tape
+    /// kernels (argmax, grammar mask, sampler) read ([`crate::off_tape`]).
+    LogitsWidth,
+    /// `u32` words per row of a grammar allow-bitset (one bit per token).
+    BitsetWords,
 );
 
 impl TqDecodeHeads {

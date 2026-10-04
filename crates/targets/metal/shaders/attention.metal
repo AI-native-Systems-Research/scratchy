@@ -18,7 +18,7 @@
 //       (Phase B macro adapter at metal/attention.rs always emits
 //       `Instruction::AttentionPrefillPaged`).
 //
-// Function constant indices (must match `pipelines::constants_for`):
+// Baked constant slots (must match the typed `*Constants` in `tape/kernel_constants.rs`):
 //   0  ATTN_HEAD_DIM           uint
 //   1  ATTN_NUM_Q_HEADS        uint
 //   2  ATTN_NUM_KV_HEADS       uint
@@ -27,17 +27,18 @@
 //   5  ATTN_MAX_BLOCKS_PER_SEQ uint
 
 #include <metal_stdlib>
+#include "baked.h"
 #include "turboquant_offset.h"
 using namespace metal;
 
 
 
-constant uint  ATTN_HEAD_DIM           [[function_constant(0)]];
-constant uint  ATTN_NUM_Q_HEADS        [[function_constant(1)]];
-constant uint  ATTN_NUM_KV_HEADS       [[function_constant(2)]];
-constant float ATTN_SCALE_FC           [[function_constant(3)]];
-constant uint  ATTN_BLOCK_SIZE         [[function_constant(4)]];
-constant uint  ATTN_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_HEAD_DIM, 0);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_NUM_Q_HEADS, 1);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_NUM_KV_HEADS, 2);
+SCRATCHY_CONSTANT_OPTIONAL(float, ATTN_SCALE_FC, 3);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_BLOCK_SIZE, 4);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_MAX_BLOCKS_PER_SEQ, 5);
 // Reactive (chunked) KV pool: the `k_cache`/`v_cache` bindings are
 // per-layer chunk-address TABLES (device uint64 gpuAddresses), not the
 // cache buffers. A resolved physical block id derefs
@@ -46,7 +47,7 @@ constant uint  ATTN_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
 // scratchy-target-metal's `BLOCKS_PER_CHUNK`. (`attention_via_cache_v2_*`
 // reads constant slot 6 via `AttentionViaCacheConstants`;
 // `attention_prefill_sdpa_v2_paged_*` via `AttentionPrefillPagedConstants`.)
-constant uint  ATTN_BLOCKS_PER_CHUNK   [[function_constant(6)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_BLOCKS_PER_CHUNK, 6);
 
 // Sliding-window attention (Gemma2/3/4 alternating layers). A query at
 // absolute position `q` attends to keys `k` with `0 <= q - k < window`
@@ -54,7 +55,7 @@ constant uint  ATTN_BLOCKS_PER_CHUNK   [[function_constant(6)]];
 // `linds < rinds + window_size` and HF's `(q-k) >= window` masking).
 // `0` disables the window entirely; the compiler folds the checks away
 // for non-sliding pipelines (full-attention models pass 0).
-constant int   ATTN_WINDOW             [[function_constant(7)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, ATTN_WINDOW, 7);
 
 // Cap on `seq_used_k[seq]` the shared-logits buffer can hold.
 // Each token uses 4 bytes; this cap × 4 == threadgroup memory bytes
@@ -71,9 +72,9 @@ constant int   ATTN_WINDOW             [[function_constant(7)]];
 // Span (relocatable) K blocks are stored UNROTATED; attention re-ropes
 // each cached K to the reader's own position on read, so one cached copy
 // is shared across every reuse position (zero-copy block sharing). These
-// constants are OPTIONAL: when a pipeline does not set slot 10, the
-// `is_function_constant_defined` guard folds the whole rotation path away
-// and buffers 6/7 are never accessed — non-spans pipelines are byte-
+// constants are OPTIONAL: when the bake does not set slot 10, that
+// slot's `_SET` flag folds the whole rotation path away and buffers
+// 6/7 are never accessed — non-spans pipelines are byte-
 // identical to before. Set by `AttentionViaCacheConstants` only when
 // rope-on-read is active.
 //   8  ATTN_ROT_DIM       uint  — rotary dim (full head_dim for NeoX;
@@ -83,10 +84,10 @@ constant int   ATTN_WINDOW             [[function_constant(7)]];
 //                                  rope, head_dim/2 for proportional rope
 //                                  (MUST match rope_append's ROPE_PAIR_OFF)
 //  10  ATTN_ROPE_ON_READ  uint  — 0/1 master switch
-constant uint ATTN_ROT_DIM      [[function_constant(8)]];
-constant uint ATTN_PAIR_OFF     [[function_constant(9)]];
-constant uint ATTN_ROPE_ON_READ [[function_constant(10)]];
-constant bool ATTN_ROR_DEFINED  = is_function_constant_defined(ATTN_ROPE_ON_READ);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_ROT_DIM, 8);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAIR_OFF, 9);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_ROPE_ON_READ, 10);
+constant bool ATTN_ROR_DEFINED  = ATTN_ROPE_ON_READ_SET;
 constant uint ATTN_ROR          = ATTN_ROR_DEFINED ? ATTN_ROPE_ON_READ : 0u;
 
 // ── Rope-once-to-scratch (spans, gqa_shared path) ───────────────────
@@ -100,12 +101,12 @@ constant uint ATTN_ROR          = ATTN_ROR_DEFINED ? ATTN_ROPE_ON_READ : 0u;
 //      the gqa_shared twin of steel/NAX's `rope_once_{steel,nax}` (head_dim
 //      512 has no steel instantiation, so gemma4 global prefill falls to
 //      gqa_shared and pays the per-tile rope without this). When unset the
-//      `is_function_constant_defined` guard folds the scratch path away and
+//      slot's `_SET` flag folds the scratch path away and
 //      the kernel keeps the in-kernel cos_sin rotation (or, with ROR also
 //      unset, the byte-identical non-spans cache read). The rope-once kernel
 //      itself reads ATTN_ROT_DIM / ATTN_PAIR_OFF / the per-block bit-31 flag.
-constant uint ATTN_K_SCRATCH        [[function_constant(11)]];
-constant bool ATTN_K_SCRATCH_DEF    = is_function_constant_defined(ATTN_K_SCRATCH);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_K_SCRATCH, 11);
+constant bool ATTN_K_SCRATCH_DEF    = ATTN_K_SCRATCH_SET;
 constant uint ATTN_KSCR             = ATTN_K_SCRATCH_DEF ? ATTN_K_SCRATCH : 0u;
 
 // ── Co-resident NeoX-pair lane layout (decode rope-on-read) ─────────
@@ -121,8 +122,8 @@ constant uint ATTN_KSCR             = ATTN_K_SCRATCH_DEF ? ATTN_K_SCRATCH : 0u;
 //      addressing helpers below fold to the plain contiguous slice when
 //      this is 0 (every non-spans dispatch + the A/B-off case), keeping
 //      that path byte-identical.
-constant uint ATTN_PAIR_CORESIDENT     [[function_constant(12)]];
-constant bool ATTN_PAIR_CORESIDENT_DEF = is_function_constant_defined(ATTN_PAIR_CORESIDENT);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAIR_CORESIDENT, 12);
+constant bool ATTN_PAIR_CORESIDENT_DEF = ATTN_PAIR_CORESIDENT_SET;
 constant uint ATTN_PCR                 = ATTN_PAIR_CORESIDENT_DEF ? ATTN_PAIR_CORESIDENT : 0u;
 
 // Per-lane element offset (within a key's head_dim row) for local index
@@ -247,7 +248,7 @@ inline void rope_on_read_k_pairs_inlane(
 //  13  ATTN_TQ_BITS  uint — codebook width (bits per code) of the TurboQuant
 //      packed KV store. Set on the TurboQuant twin of the decode command and
 //      on the prefill staging pass (`tq_stage_rotated`); unset, the
-//      `is_function_constant_defined` guard folds the decode path away and
+//      slot's `_SET` flag folds the decode path away and
 //      buffers 7..13 are never accessed.
 //
 // A TurboQuant vector is stored as codes `c` into an N(0,1) codebook plus its
@@ -258,8 +259,8 @@ inline void rope_on_read_k_pairs_inlane(
 //   Σ_t p_t x_t  = s² · D · H · (Σ_t p_t · norm_t · c_t)  — rotate the output once.
 // No key is ever decoded, so the per-layer full-context dequant pass is gone
 // for decode.
-constant uint ATTN_TQ_BITS [[function_constant(13)]];
-constant bool ATTN_TQ_DEF  = is_function_constant_defined(ATTN_TQ_BITS);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_BITS, 13);
+constant bool ATTN_TQ_DEF  = ATTN_TQ_BITS_SET;
 constant uint ATTN_TQ      = ATTN_TQ_DEF ? ATTN_TQ_BITS : 0u;
 
 //  14  ATTN_TQ_K_BIAS / 15  ATTN_TQ_V_BIAS — set when the packed codes hold that
@@ -269,18 +270,17 @@ constant uint ATTN_TQ      = ATTN_TQ_DEF ? ATTN_TQ_BITS : 0u;
 //      gains q·R_i·b (needs the rope-on-read table and pairing); V's is added
 //      once to the output, since the softmax weights sum to 1. Prefill staging
 //      (bias at buffer 10) restores it into each cached key's rotated image.
-constant uint ATTN_TQ_K_BIAS [[function_constant(14)]];
-constant bool ATTN_TQ_KB = is_function_constant_defined(ATTN_TQ_K_BIAS);
-constant uint ATTN_TQ_V_BIAS [[function_constant(15)]];
-constant bool ATTN_TQ_VB = is_function_constant_defined(ATTN_TQ_V_BIAS);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_K_BIAS, 14);
+constant bool ATTN_TQ_KB = ATTN_TQ_K_BIAS_SET;
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_V_BIAS, 15);
+constant bool ATTN_TQ_VB = ATTN_TQ_V_BIAS_SET;
 
 //  16  ATTN_TQ_HEADS — query heads per decode threadgroup under TurboQuant:
 //      consecutive heads of one KV head, so each key's codes are decoded once
 //      for all of them (decode is ALU-bound on that decode). Unset: 1.
 //      heads * head_dim / 32 <= 32.
-constant uint ATTN_TQ_HEADS_FC [[function_constant(16)]];
-constant uint ATTN_TQ_HEADS =
-    is_function_constant_defined(ATTN_TQ_HEADS_FC) ? ATTN_TQ_HEADS_FC : 1u;
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_HEADS_FC, 16);
+constant uint ATTN_TQ_HEADS = ATTN_TQ_HEADS_FC_SET ? ATTN_TQ_HEADS_FC : 1u;
 
 //  17  ATTN_TQ_STAGE_PASS — the rows one `tq_stage_rotated` dispatch stages:
 //      1 = the step's new rows (read from the cache their writer just filled),
@@ -288,7 +288,7 @@ constant uint ATTN_TQ_HEADS =
 //      pass 1 then pass 2: a row that is new for one sequence can be a
 //      prefix-cache hit for another in the same step, and both rewrite it in
 //      place, so the two writes must be ordered, not concurrent.
-constant uint ATTN_TQ_STAGE_PASS [[function_constant(17)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_STAGE_PASS, 17);
 
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
@@ -546,29 +546,10 @@ kernel void tq_rotate_rows(
     }
 }
 
-#define INSTANTIATE_TQ_PREFILL(tag, T)                                                   \
-    template [[host_name("tq_stage_rotated_" #tag)]] [[kernel]] void tq_stage_rotated<T>( \
-        device const uint64_t* cache [[buffer(0)]],                                     \
-        device const uint* block_table [[buffer(1)]],                                   \
-        device const uint* seq_used_k [[buffer(2)]],                                    \
-        device const uint* cu_seqlens_q [[buffer(3)]],                                  \
-        device const uint* slot_mapping [[buffer(4)]],                                  \
-        device const uint* packed [[buffer(5)]],                                        \
-        device const float* norms [[buffer(6)]],                                        \
-        device const float* signs [[buffer(7)]],                                        \
-        device const float* centroids [[buffer(8)]],                                    \
-        device const T* cos_sin [[buffer(9)]],                                          \
-        device const T* bias [[buffer(10)]],                                            \
-        uint3 tg [[threadgroup_position_in_grid]],                                      \
-        uint simd_lid [[thread_index_in_simdgroup]]);                                   \
-    template [[host_name("tq_rotate_rows_" #tag)]] [[kernel]] void tq_rotate_rows<T, false>( \
-        device T* rows [[buffer(0)]], device const float* signs [[buffer(1)]],          \
-        uint2 tg [[threadgroup_position_in_grid]],                                      \
-        uint simd_lid [[thread_index_in_simdgroup]]);                                   \
-    template [[host_name("tq_unrotate_rows_" #tag)]] [[kernel]] void tq_rotate_rows<T, true>( \
-        device T* rows [[buffer(0)]], device const float* signs [[buffer(1)]],          \
-        uint2 tg [[threadgroup_position_in_grid]],                                      \
-        uint simd_lid [[thread_index_in_simdgroup]]);
+#define INSTANTIATE_TQ_PREFILL(tag, T) \
+  SCRATCHY_KERNEL(tq_stage_rotated_##tag, tq_stage_rotated<T>) \
+  SCRATCHY_KERNEL(tq_rotate_rows_##tag, tq_rotate_rows<T, false>) \
+  SCRATCHY_KERNEL(tq_unrotate_rows_##tag, tq_rotate_rows<T, true>)
 
 INSTANTIATE_TQ_PREFILL(f16, half)
 INSTANTIATE_TQ_PREFILL(bf16, bfloat)
@@ -888,7 +869,7 @@ template <typename T>
             }
         } else {
             // Chunked KV: deref the chunk backing this physical block.
-            // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+            // ATTN_BLOCKS_PER_CHUNK is a baked constant. When it is 0 the
             // compiler dead-eliminates the chunked branch — used by the
             // single-buffer-per-layer mode where `k_cache[0]` holds the layer
             // base address and physical_block is the full offset (no modulo,
@@ -1059,30 +1040,8 @@ template <typename T>
     }
 }
 
-#define INSTANTIATE_ATTENTION_VIA_CACHE_V2(name, T)                                   \
-    template [[host_name(name)]] [[kernel]]                                            \
-    void attention_via_cache_v2<T>(                                                    \
-        device T* output [[buffer(0)]], device const T* q [[buffer(1)]],               \
-        device const uint* seq_used_k [[buffer(2)]],                                   \
-        device const uint* block_table [[buffer(3)]],                                  \
-        device const uint64_t* k_cache [[buffer(4)]],                                  \
-        device const uint64_t* v_cache [[buffer(5)]],                                  \
-        device const T* cos_sin [[buffer(6)]],                                         \
-        device const uint* tq_packed_k [[buffer(7)]],                                  \
-        device const uint* tq_packed_v [[buffer(8)]],                                  \
-        device const float* tq_norms_k [[buffer(9)]],                                  \
-        device const float* tq_norms_v [[buffer(10)]],                                 \
-        device const float* tq_signs [[buffer(11)]],                                   \
-        device const float* tq_centroids [[buffer(12)]],                               \
-        device const uint* slot_mapping [[buffer(13)]],                                \
-        device const T* tq_k_bias [[buffer(14)]],                                      \
-        device const T* tq_v_bias [[buffer(15)]],                                      \
-        uint3 tg_pos [[threadgroup_position_in_grid]],                                 \
-        uint simd_gid [[simdgroup_index_in_threadgroup]],                              \
-        uint simd_lid [[thread_index_in_simdgroup]]);
-
-INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_f16_specialized", half)
-INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bfloat)
+SCRATCHY_KERNEL(attention_via_cache_v2_f16_specialized, attention_via_cache_v2<half>)
+SCRATCHY_KERNEL(attention_via_cache_v2_bf16_specialized, attention_via_cache_v2<bfloat>)
 
 // ─────────────────────────────────────────────────────────────────────
 // attention_prefill_sdpa_v2_paged — paged-cache variant of the prefill
@@ -1119,7 +1078,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
 //      cu_seqlens_q[seq]`. The `(seqused_k - new_q_for_seq)` shift
 //      is the prefix-length offset that contiguous prefill doesn't
 //      need (it has no prior cached K).
-//   4. Function constants extend to BLOCK_SIZE + MAX_BLOCKS_PER_SEQ
+//   4. Baked constants extend to BLOCK_SIZE + MAX_BLOCKS_PER_SEQ
 //      (paging) — same set as the decode kernel.
 //
 // Buffer bindings:
@@ -1131,7 +1090,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
 //   buffer(5) = k_cache      [num_blocks, num_kv_heads, BLOCK_SIZE, HEAD_DIM]
 //   buffer(6) = v_cache      [num_blocks, num_kv_heads, BLOCK_SIZE, HEAD_DIM]
 //
-// Function constants 0..5: HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS,
+// Baked constants 0..5: HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS,
 // ATTN_SCALE_FC, BLOCK_SIZE, MAX_BLOCKS_PER_SEQ. Same indices as
 // `attention_via_cache_v2_*`.
 //
@@ -1145,6 +1104,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
 // max_total_threads_per_threadgroup(1024) = BN*BD (32*32) — REQUIRED, same as
 // attention_via_cache_v2 (see there): the 1024-thread launch under-launches on
 // M1 at Gemma head_dim 256/512 (pipeline cap 768) without it → silent garbage.
+#if SCRATCHY_COMPILES(attention_prefill_sdpa_v2_paged_f16_specialized)
 [[kernel, max_total_threads_per_threadgroup(1024)]] void attention_prefill_sdpa_v2_paged_f16_specialized(
     device       half* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
     device const half* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
@@ -1285,7 +1245,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
         const bool do_rot = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
         const uint token_in_block = i - logical_block * block_size;
         // Chunked KV: deref the chunk backing this physical block.
-        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+        // ATTN_BLOCKS_PER_CHUNK is a baked constant. When it is 0 the
         // compiler dead-eliminates the chunked branch — used by the
         // single-buffer-per-layer mode where `k_cache[0]` holds the layer
         // base address and physical_block is the full offset (no modulo,
@@ -1379,6 +1339,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
         }
     }
 }
+#endif
 
 /// BF16 sibling of `attention_prefill_sdpa_v2_paged_f16_specialized`.
 /// Same algorithm; sole difference is the `bfloat`/`half` element
@@ -1386,6 +1347,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
 ///
 /// max_total_threads_per_threadgroup(1024): see the f16 sibling — REQUIRED so
 /// the 1024-thread (32-simdgroup) launch is guaranteed dispatchable on M1.
+#if SCRATCHY_COMPILES(attention_prefill_sdpa_v2_paged_bf16_specialized)
 [[kernel, max_total_threads_per_threadgroup(1024)]] void attention_prefill_sdpa_v2_paged_bf16_specialized(
     device       bfloat* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
     device const bfloat* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
@@ -1509,7 +1471,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
         const bool do_rot = (ATTN_ROR != 0u) && ((bt_raw & 0x80000000u) != 0u);
         const uint token_in_block = i - logical_block * block_size;
         // Chunked KV: deref the chunk backing this physical block.
-        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+        // ATTN_BLOCKS_PER_CHUNK is a baked constant. When it is 0 the
         // compiler dead-eliminates the chunked branch — used by the
         // single-buffer-per-layer mode where `k_cache[0]` holds the layer
         // base address and physical_block is the full offset (no modulo,
@@ -1601,6 +1563,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
         }
     }
 }
+#endif
 
 // ── rope-once kernel (spans rope-on-read, gqa_shared global prefill) ─────────
 //
@@ -1612,7 +1575,7 @@ INSTANTIATE_ATTENTION_VIA_CACHE_V2("attention_via_cache_v2_bf16_specialized", bf
 // has no steel instantiation, so the steel/NAX rope-once symbols don't cover
 // it. Unlike those (template BLOCK_SIZE_), this reads ATTN_HEAD_DIM /
 // ATTN_BLOCK_SIZE / ATTN_NUM_KV_HEADS / ATTN_ROT_DIM / ATTN_PAIR_OFF /
-// ATTN_BLOCKS_PER_CHUNK / ATTN_MAX_BLOCKS_PER_SEQ from function constants, so
+// ATTN_BLOCKS_PER_CHUNK / ATTN_MAX_BLOCKS_PER_SEQ from baked constants, so
 // one symbol covers any (head_dim, block_size) the gqa_shared kernel takes
 // (gemma4 global: hd 512, bs 32).
 //
@@ -1733,6 +1696,7 @@ inline void rope_once_gqa_shared_body(
     dst_row[pair_off + d] = T(x1 * c + x0 * s);
 }
 
+#if SCRATCHY_COMPILES(rope_once_gqa_shared_f16_specialized)
 kernel void rope_once_gqa_shared_f16_specialized(
     device       half*     k_scratch   [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -1744,7 +1708,9 @@ kernel void rope_once_gqa_shared_f16_specialized(
     rope_once_gqa_shared_body<half>(
         k_scratch, block_table, k_cache, seq_used_k, cos_sin, gid);
 }
+#endif
 
+#if SCRATCHY_COMPILES(rope_once_gqa_shared_bf16_specialized)
 kernel void rope_once_gqa_shared_bf16_specialized(
     device       bfloat*   k_scratch   [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -1756,6 +1722,7 @@ kernel void rope_once_gqa_shared_bf16_specialized(
     rope_once_gqa_shared_body<bfloat>(
         k_scratch, block_table, k_cache, seq_used_k, cos_sin, gid);
 }
+#endif
 
 /// GQA-cooperative paged SDPA prefill (f16): one threadgroup per
 /// (kv_head, query); each simdgroup owns ONE q-head of the GQA group
@@ -1779,6 +1746,7 @@ kernel void rope_once_gqa_shared_bf16_specialized(
 ///
 /// Constraints (enforced by the lowering arm): HEAD_DIM % 32 == 0,
 /// HEAD_DIM <= 512, BLOCK_SIZE <= 16, 2 <= gqa <= 32.
+#if SCRATCHY_COMPILES(attention_prefill_sdpa_gqa_shared_f16_specialized)
 kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
     device       half* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
     device const half* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
@@ -1788,7 +1756,7 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
     device const uint64_t* k_cache  [[buffer(5)]],   // chunk-address table
     device const uint64_t* v_cache  [[buffer(6)]],   // chunk-address table
     // Spans, slot 7 has TWO mutually-exclusive uses (only one is bound per
-    // dispatch; folded by ATTN_KSCR / ATTN_ROR function constants):
+    // dispatch; folded by the baked ATTN_KSCR / ATTN_ROR):
     //   ATTN_K_SCRATCH (rope-once-to-scratch): the DENSE pre-roped K scratch
     //     written ONCE by `rope_once_gqa_shared_*`. K is staged from here with
     //     the byte-identical cache-load math (logical-block base) and NO
@@ -2038,6 +2006,7 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
         o_ptr[j] = half(o_reg[j] * inv);
     }
 }
+#endif
 
 /// GQA-cooperative paged SDPA prefill (bf16): one threadgroup per
 /// (kv_head, query); each simdgroup owns ONE q-head of the GQA group
@@ -2061,6 +2030,7 @@ kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
 ///
 /// Constraints (enforced by the lowering arm): HEAD_DIM % 32 == 0,
 /// HEAD_DIM <= 512, BLOCK_SIZE <= 16, 2 <= gqa <= 32.
+#if SCRATCHY_COMPILES(attention_prefill_sdpa_gqa_shared_bf16_specialized)
 kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
     device       bfloat* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
     device const bfloat* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
@@ -2306,3 +2276,4 @@ kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
         o_ptr[j] = bfloat(o_reg[j] * inv);
     }
 }
+#endif

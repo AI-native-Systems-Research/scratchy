@@ -10,17 +10,18 @@
 //   scores      [N, top_k]           T_act
 //   out         [N, hidden]          T_act
 //
-// `MWS_TOP_K` and `MWS_HIDDEN` are baked as function_constants so
+// `MWS_TOP_K` and `MWS_HIDDEN` are baked constants so
 // the inner-loop bound is a compile-time constant the optimizer
 // can fully unroll for the small top_k values we care about (2-8).
 // One thread per (n, d). Dispatch (hidden, N, 1).
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant int MWS_TOP_K  [[function_constant(0)]];
-constant int MWS_HIDDEN [[function_constant(1)]];
+SCRATCHY_CONSTANT(int, MWS_TOP_K, 0);
+SCRATCHY_CONSTANT(int, MWS_HIDDEN, 1);
 
 template <typename T>
 [[kernel]] void moe_weighted_sum(
@@ -43,14 +44,8 @@ template <typename T>
   out[n * uint(MWS_HIDDEN) + d] = T(acc);
 }
 
-#define INSTANTIATE_MWS(tag, type)                                       \
-  template [[host_name("moe_weighted_sum_" #tag)]]                       \
-  [[kernel]] void moe_weighted_sum<type>(                                \
-      const device type* expert_out [[buffer(0)]],                       \
-      const device type* scores     [[buffer(1)]],                       \
-      device type*       out        [[buffer(2)]],                       \
-      uint2 gid [[thread_position_in_grid]],                             \
-      uint2 grid [[threads_per_grid]]);
+#define INSTANTIATE_MWS(tag, type) \
+  SCRATCHY_KERNEL(moe_weighted_sum_##tag, moe_weighted_sum<type>)
 
 INSTANTIATE_MWS(float16, half)
 INSTANTIATE_MWS(bfloat16, bfloat)

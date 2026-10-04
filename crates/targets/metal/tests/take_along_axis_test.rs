@@ -7,16 +7,19 @@ mod common;
 
 use half::bf16;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
-use scratchy_target_metal::take_along_axis::{TakeAlongAxisKernels, TakeAlongDType};
+use scratchy_target_metal::tape::ids::{NumExperts, TopK};
+use scratchy_target_metal::tape::kernel_constants::MoeTopKConstants;
 
 /// take_along_axis binding contract (`buffer(0)=src, buffer(1)=indices,
-/// buffer(2)=out, buffer(3)=src_axis_size, buffer(4)=idx_axis_size`):
-/// one thread per (k, n). The kernel bounds-checks against
-/// `threads_per_grid`, so the threadgroup count is sized to reproduce the
-/// classic `dispatchThreads` extent `(idx_axis_size, rows, 1)` exactly.
+/// buffer(2)=out`; src_axis_size and idx_axis_size baked as
+/// `MoeTopKConstants`): one thread per (k, n). The kernel bounds-checks
+/// against `threads_per_grid`, so the threadgroup count is sized to
+/// reproduce the classic `dispatchThreads` extent `(idx_axis_size, rows, 1)`
+/// exactly.
 fn run_take_along_axis_mtl4(
-    dtype: TakeAlongDType,
+    symbol: &str,
     src_buf: &common::Buffer,
     idx_buf: &common::Buffer,
     out_buf: &common::Buffer,
@@ -27,12 +30,12 @@ fn run_take_along_axis_mtl4(
     let device = detect_device()
         .expect("Metal 4 GPU present (caller pre-guards)")
         .device;
-    // The classic path passed these as `setBytes` i32 scalars at
-    // buffer(3)/buffer(4); for the positive axis sizes here a u32 has the
-    // identical byte layout the kernel reads as `int`.
-    let src_axis_buf = common::shared_u32(&device, src_axis_size);
-    let idx_axis_buf = common::shared_u32(&device, idx_axis_size);
-    let kernels = TakeAlongAxisKernels::new(&device).expect("take_along_axis kernels");
+    let constants = MoeTopKConstants {
+        experts: NumExperts(src_axis_size),
+        top_k: TopK(idx_axis_size),
+    };
+    let pipeline = baked_pipeline(&device, "take_along_axis", symbol, constants.into())
+        .expect("take_along_axis pipeline");
 
     let tg_width = idx_axis_size.min(32) as usize;
     let threadgroups = MTLSize {
@@ -47,8 +50,8 @@ fn run_take_along_axis_mtl4(
     };
     common::dispatch_threadgroups(
         &device,
-        kernels.pipeline_for(dtype),
-        &[src_buf, idx_buf, out_buf, &src_axis_buf, &idx_axis_buf],
+        &pipeline,
+        &[src_buf, idx_buf, out_buf],
         threadgroups,
         threads_per_tg,
     )
@@ -96,7 +99,7 @@ fn take_along_axis_bf16_qwen3_moe_topk() {
     let out_buf = common::shared_zeroed(&device, rows * top_k * std::mem::size_of::<bf16>());
 
     if !run_take_along_axis_mtl4(
-        TakeAlongDType::BF16,
+        "take_along_axis_2d_contig_bfloat16",
         &src_buf,
         &idx_buf,
         &out_buf,
@@ -159,30 +162,36 @@ fn take_along_axis_bf16_qwen3_5_moe_topk_e256() {
 
     let src_buf = common::shared_slice(&device, &gates_bf16);
     let idx_buf = common::shared_slice(&device, &indices);
-    let out_buf = common::shared_zeroed(&device, rows * top_k * std::mem::size_of::<bf16>());
 
-    if !run_take_along_axis_mtl4(
-        TakeAlongDType::BF16,
-        &src_buf,
-        &idx_buf,
-        &out_buf,
-        rows as u32,
-        e as u32,
-        top_k as u32,
-    ) {
-        return;
-    }
+    // A gather moves 16-bit elements as they are: the f16 kernel moves the same bits.
+    for symbol in [
+        "take_along_axis_2d_contig_bfloat16",
+        "take_along_axis_2d_contig_float16",
+    ] {
+        let out_buf = common::shared_zeroed(&device, rows * top_k * std::mem::size_of::<bf16>());
+        if !run_take_along_axis_mtl4(
+            symbol,
+            &src_buf,
+            &idx_buf,
+            &out_buf,
+            rows as u32,
+            e as u32,
+            top_k as u32,
+        ) {
+            return;
+        }
 
-    let got: Vec<bf16> = common::read_slice(&out_buf, rows * top_k);
+        let got: Vec<bf16> = common::read_slice(&out_buf, rows * top_k);
 
-    for r in 0..rows {
-        for k in 0..top_k {
-            let want = gates_bf16[r * e + indices[r * top_k + k] as usize];
-            assert_eq!(
-                got[r * top_k + k].to_bits(),
-                want.to_bits(),
-                "row {r} k {k}"
-            );
+        for r in 0..rows {
+            for k in 0..top_k {
+                let want = gates_bf16[r * e + indices[r * top_k + k] as usize];
+                assert_eq!(
+                    got[r * top_k + k].to_bits(),
+                    want.to_bits(),
+                    "{symbol} row {r} k {k}"
+                );
+            }
         }
     }
 }

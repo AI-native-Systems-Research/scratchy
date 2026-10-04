@@ -25,7 +25,7 @@
 // `pick_qmm_t_kernel`.
 //
 // Scratchy adaptations relative to MLX's kernel:
-//   - K, N, M come from file-scope function constants (indices 0/1/2)
+//   - K, N, M come from file-scope baked constants (slots 0/1/2)
 //     rather than `const constant int& [[buffer(5/6/7)]]` — required
 //     so the pipeline is recordable into an MTLIndirectComputeCommand.
 //   - W-loader is inlined (QuantizedBlockLoader struct not imported);
@@ -40,6 +40,7 @@
 
 #include "metal_nax.h"   // vendors NAXTile + tile_matmad_nax + MPP internals
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 using namespace mlx::steel;
@@ -53,30 +54,29 @@ using namespace mlx::steel;
 MLX_MTL_CONST int NAX_SIMD_SIZE = 32;
 
 // ─────────────────────────────────────────────────────────────────
-// Function constants — same slot indices as quantized_qmm.metal so
+// Constants, compiled in — same slot indices as quantized_qmm.metal so
 // the lowering pass shares the same ConstantValue::int slot map.
 // ─────────────────────────────────────────────────────────────────
 
-constant int QMM_K [[function_constant(0)]];
-constant int QMM_N [[function_constant(1)]];
-constant int QMM_M [[function_constant(2)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_K, 0);
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_N, 1);
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_M, 2);
 // Block-diagonal span attention (hd512 unfused QKᵀ): per-position span-label
-// granularity (== metal KV block size). 0 / undefined → no bound (dense path
+// granularity (== metal KV block size). 0 / unset → no bound (dense path
 // byte-identical).
-constant uint QK_SPAN_BLOCK_NAX_RAW [[function_constant(3)]];
-constant uint QK_SPAN_BLOCK_NAX =
-    is_function_constant_defined(QK_SPAN_BLOCK_NAX_RAW) ? QK_SPAN_BLOCK_NAX_RAW : 0u;
+SCRATCHY_CONSTANT_OPTIONAL(uint, QK_SPAN_BLOCK_NAX, 3);
 // MoE grouped GEMM only: number of valid experts. Padded tiles whose
 // expert index == QMM_NUM_EXPERTS are trailing sentinels and skip.
-constant int QMM_NUM_EXPERTS [[function_constant(4)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_NUM_EXPERTS, 4);
 // 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8` — always
 // the case on the matrix-unit tapes this library serves); the dequantizing
 // loader XORs each byte back. The small-M and W4A8 kernels read the stored
 // codes directly as signed int4 (q - 8) and fold the 8 into the bias.
 // Kernel entries branch on it once, into a loader instantiated for it.
-constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
-constant bool AFFINE_CODES_ARE_OFFSET8 =
-    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8;
+SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
+// The unfused attention PV's V^T row stride: the STATIC max_kv, sized from the
+// block capacity at load.
+SCRATCHY_CONSTANT_OPTIONAL(int, NAX_PV_W_LD, 6);
 
 // ─────────────────────────────────────────────────────────────────
 // NVFP4 E2M1 decode (sign-magnitude 4-bit). Same byte layout as affine
@@ -386,7 +386,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     const device T_scale*   biases   [[buffer(2)]],
     const device T_act*     x        [[buffer(3)]],
     device T_act*           y        [[buffer(4)]],
-    // K, N, M ride as file-scope function constants QMM_K/N/M so this
+    // K, N, M ride as file-scope baked constants QMM_K/N/M so this
     // kernel is recordable into an MTLIndirectComputeCommand.
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]],
@@ -396,7 +396,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));  // 72
     threadgroup T_act Ws[BN * BK_padded];  // 64 × 72 = 4608 elements
-    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
@@ -446,7 +446,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     const device T_scale* b_e = biases + size_t(expert) * s_stride;
 
     threadgroup T_act Ws[BN * BK_padded];
-    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w_e, s_e, b_e, x, y, Ws,
         QMM_K, QMM_N, QMM_M,
@@ -455,19 +455,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 }
 
 #define INST_GATHER_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
-    template [[host_name(                                                                \
-        "affine_gather_qmm_t_nax_" #act_tag "_s_" #scale_tag "_gs_" #gs                \
-        "_b_" #bits "_alN_" #aln_tag "_batch_0")]] [[kernel]] void                      \
-    affine_gather_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val>(           \
-        const device uint32_t*   w        [[buffer(0)]],                                \
-        const device scale_type* scales   [[buffer(1)]],                                \
-        const device scale_type* biases   [[buffer(2)]],                                \
-        const device act_type*   x        [[buffer(3)]],                                \
-        device act_type*         y        [[buffer(4)]],                                \
-        const device uint32_t*   indices  [[buffer(5)]],                                \
-        uint  simd_gid [[simdgroup_index_in_threadgroup]],                              \
-        uint  simd_lid [[thread_index_in_simdgroup]],                                   \
-        uint3 tgid     [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_gather_qmm_t_nax_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_gather_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val>)
 
 // ─────────────────────────────────────────────────────────────────
 // Instantiations — one symbol per (dtype, group_size, aligned_N).
@@ -482,18 +470,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 // ─────────────────────────────────────────────────────────────────
 
 #define INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
-    template [[host_name(                                                                \
-        "affine_qmm_t_nax_" #act_tag "_s_" #scale_tag "_gs_" #gs                       \
-        "_b_" #bits "_alN_" #aln_tag "_batch_0")]] [[kernel]] void                      \
-    affine_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val>(                  \
-        const device uint32_t*   w        [[buffer(0)]],                                \
-        const device scale_type* scales   [[buffer(1)]],                                \
-        const device scale_type* biases   [[buffer(2)]],                                \
-        const device act_type*   x        [[buffer(3)]],                                \
-        device act_type*         y        [[buffer(4)]],                                \
-        uint  simd_gid [[simdgroup_index_in_threadgroup]],                              \
-        uint  simd_lid [[thread_index_in_simdgroup]],                                   \
-        uint3 tgid     [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_qmm_t_nax_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val>)
 
 #define INST_QMM_T_NAX_ALL(act_tag, act_type, scale_tag, scale_type, gs, bits) \
     INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, true,  true)  \
@@ -557,12 +534,9 @@ INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 8)
 
 // ─────────────────────────────────────────────────────────────────
 // Buffer-dims variant: K/N/M as `const constant int&` buffer args
-// (5/6/7) exactly like MLX — NO function constants, so the pipeline
-// is built from the unspecialized function. The fn-const variants
-// above force a specialization recompile at pipeline creation; this
-// entry exists to A/B whether that specialization pass de-optimizes
-// MPP cooperative-tensor code (the fn-consts were for ICB
-// recordability, which was removed).
+// (5/6/7) exactly like MLX — no baked dims, so one kernel serves every
+// shape. It exists to A/B baked dims against runtime dims on MPP
+// cooperative-tensor code.
 // ─────────────────────────────────────────────────────────────────
 template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
 [[kernel]] void affine_qmm_t_nax_dims_kernel(
@@ -582,7 +556,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     constexpr int BK = 64;
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
     threadgroup T_act Ws[BN * BK_padded];
-    dispatch_bool(bits == 4 && AFFINE_CODES_ARE_OFFSET8, [&](auto kOffset8) {
+    dispatch_bool(bits == 4 && AFFINE_CODES_OFFSET8, [&](auto kOffset8) {
     qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, false, kOffset8.value>(
         w, scales, biases, x, y, Ws,
         K, N, M,
@@ -591,21 +565,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 }
 
 #define INST_QMM_T_NAX_DIMS(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
-    template [[host_name(                                                                \
-        "affine_qmm_t_nax_dims_" #act_tag "_s_" #scale_tag "_gs_" #gs                  \
-        "_b_" #bits "_alN_" #aln_tag "_batch_0")]] [[kernel]] void                      \
-    affine_qmm_t_nax_dims_kernel<act_type, scale_type, gs, bits, aln_val>(             \
-        const device uint32_t*   w        [[buffer(0)]],                                \
-        const device scale_type* scales   [[buffer(1)]],                                \
-        const device scale_type* biases   [[buffer(2)]],                                \
-        const device act_type*   x        [[buffer(3)]],                                \
-        device act_type*         y        [[buffer(4)]],                                \
-        const constant int&      K        [[buffer(5)]],                                \
-        const constant int&      N        [[buffer(6)]],                                \
-        const constant int&      M        [[buffer(7)]],                                \
-        uint  simd_gid [[simdgroup_index_in_threadgroup]],                              \
-        uint  simd_lid [[thread_index_in_simdgroup]],                                   \
-        uint3 tgid     [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_qmm_t_nax_dims_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits##_alN_##aln_tag##_batch_0, affine_qmm_t_nax_dims_kernel<act_type, scale_type, gs, bits, aln_val>)
 
 INST_QMM_T_NAX_DIMS(bf16, bfloat, bf16, bfloat, 64, 8, true, true)
 INST_QMM_T_NAX_DIMS(bf16, bfloat, bf16, bfloat, 64, 4, true, true)
@@ -644,18 +604,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 }
 
 #define INST_NVFP4_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
-    template [[host_name(                                                                     \
-        "nvfp4_qmm_t_nax_" #act_tag "_s_" #scale_tag "_gs_" #gs                                \
-        "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                     \
-    nvfp4_qmm_t_nax_kernel<act_type, scale_type, gs, 4, aln_val>(                              \
-        const device uint32_t*   w       [[buffer(0)]],                                       \
-        const device scale_type* scales  [[buffer(1)]],                                       \
-        const device scale_type* biases  [[buffer(2)]],                                       \
-        const device act_type*   x       [[buffer(3)]],                                       \
-        device act_type*         y       [[buffer(4)]],                                        \
-        uint  simd_gid [[simdgroup_index_in_threadgroup]],                                    \
-        uint  simd_lid [[thread_index_in_simdgroup]],                                         \
-        uint3 tgid     [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(nvfp4_qmm_t_nax_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag##_batch_0, nvfp4_qmm_t_nax_kernel<act_type, scale_type, gs, 4, aln_val>)
 
 // gs=16 only for NVFP4; T_scale always half (folded F16).
 INST_NVFP4_QMM_T_NAX(f16, half, f16, half, 16, true, true)
@@ -765,6 +714,7 @@ METAL_FUNC void gemm_t_nax_impl(
     });
 }
 
+#if SCRATCHY_COMPILES(gemm_nax_bf16)
 [[kernel, max_total_threads_per_threadgroup(128)]] void gemm_nax_bf16(
     const device bfloat* x   [[buffer(0)]],   // A [M, K]
     const device bfloat* w   [[buffer(1)]],   // B [N, K]
@@ -781,11 +731,13 @@ METAL_FUNC void gemm_t_nax_impl(
     gemm_t_nax_impl<bfloat>(x, w, y, Ws, QMM_K, QMM_N, QMM_M, QMM_K, simd_gid, simd_lid, tgid,
                             0, QMM_K);
 }
+#endif
 
 // Dynamic-kv_len GEMM wrappers for hd512 unfused attention. kv_len grows per
 // forward but the tape bakes dims, so the changing dim is read from
 // seq_used[0] at runtime (grid baked at the max; tiles with y_col>=N or the
 // K-loop past K early-return / stop). QK^T: N=kv_len. PV: K=kv_len.
+#if SCRATCHY_COMPILES(gemm_nax_bf16_qk)
 [[kernel, max_total_threads_per_threadgroup(128)]] void gemm_nax_bf16_qk(
     const device bfloat* x        [[buffer(0)]],   // Q head [M=Lq, K=hd]
     const device bfloat* w        [[buffer(1)]],   // K dense [N=kv_len, K=hd]
@@ -831,10 +783,12 @@ METAL_FUNC void gemm_t_nax_impl(
     gemm_t_nax_impl<bfloat>(x, w, y, Ws, QMM_K, int(seq_used[0]), QMM_M, QMM_K,
                             simd_gid, simd_lid, tgid, 0, QMM_K);
 }
+#endif
 
+#if SCRATCHY_COMPILES(gemm_nax_bf16_pv)
 [[kernel, max_total_threads_per_threadgroup(128)]] void gemm_nax_bf16_pv(
     const device bfloat* x        [[buffer(0)]],   // probs [M=Lq, K=kv_len]
-    const device bfloat* w        [[buffer(1)]],   // V^T dense [N=hd, rows strided by QMM_K=max_kv]
+    const device bfloat* w        [[buffer(1)]],   // V^T dense [N=hd, rows strided by max_kv]
     device bfloat*       y        [[buffer(2)]],   // out head [M=Lq, N=hd]
     const device uint*   seq_used     [[buffer(3)]],   // [1] kv_len
     const device uint*   span_ids     [[buffer(4)]],   // per-block span label; 0 = no span
@@ -865,10 +819,11 @@ METAL_FUNC void gemm_t_nax_impl(
     }
     threadgroup bfloat Ws[BN * BK_padded];
     // PV: contraction K=kv_len (seq_used), but V^T dense rows are strided by the
-    // STATIC max_kv (= QMM_K, the gather's GDK_MAX_KV) — decoupled via w_ld.
-    gemm_t_nax_impl<bfloat>(x, w, y, Ws, K, QMM_N, QMM_M, QMM_K,
+    // STATIC max_kv (= NAX_PV_W_LD, the gather's GDK_MAX_KV) — decoupled via w_ld.
+    gemm_t_nax_impl<bfloat>(x, w, y, Ws, K, QMM_N, QMM_M, NAX_PV_W_LD,
                             simd_gid, simd_lid, tgid, k_lo, k_hi);
 }
+#endif
 
 // ─────────────────────────────────────────────────────────────────
 // Small-M (decode-batch) MLX-affine 4-bit GEMM on the matrix unit:
@@ -887,7 +842,7 @@ METAL_FUNC void gemm_t_nax_impl(
 // its own matmul over every NSG-th group, and their partial tiles are summed
 // through threadgroup memory. Buffers as
 // `affine_qmm_t_nax`: w[0], scales[1], biases[2], x[3], y[4]; K/N/M from
-// function constants 0/1/2. N % TN == 0 (static N slices skip bounds
+// baked constants 0/1/2. N % TN == 0 (static N slices skip bounds
 // checks — the lowering checks it); M rows are bounds-checked. Grid:
 // (N/TN, ceil(M/TM)), 32·NSG threads.
 // ─────────────────────────────────────────────────────────────────
@@ -977,19 +932,8 @@ template <typename T, typename S, int G, int TM, int TN, int NSG>
     }
 }
 
-#define INST_QMM_SMALL_M(act_tag, act_type, scale_tag, scale_type, gs, tm, tn, nsg)          \
-    template [[host_name(                                                                 \
-        "affine_qmm_small_m_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_4_tm_" #tm "_tn_" #tn \
-        "_nsg_" #nsg)]] [[kernel]] void                                                    \
-    affine_qmm_small_m_kernel<act_type, scale_type, gs, tm, tn, nsg>(                      \
-        const device uint32_t*   w      [[buffer(0)]],                                    \
-        const device scale_type* scales [[buffer(1)]],                                    \
-        const device scale_type* biases [[buffer(2)]],                                    \
-        const device act_type*   x      [[buffer(3)]],                                    \
-        device act_type*         y      [[buffer(4)]],                                    \
-        uint2 tgid [[threadgroup_position_in_grid]],                                      \
-        uint  tid  [[thread_index_in_threadgroup]],                                       \
-        uint  sg   [[simdgroup_index_in_threadgroup]]);
+#define INST_QMM_SMALL_M(act_tag, act_type, scale_tag, scale_type, gs, tm, tn, nsg) \
+  SCRATCHY_KERNEL(affine_qmm_small_m_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_tm_##tm##_tn_##tn##_nsg_##nsg, affine_qmm_small_m_kernel<act_type, scale_type, gs, tm, tn, nsg>)
 
 // 16 columns, 4 simdgroups (`quantized::SMALL_M_SIMDGROUPS`): the 16-column
 // tile keeps enough threadgroups in flight on narrow layers, and splitting K
@@ -1020,7 +964,7 @@ INST_QMM_SMALL_M_GS(bf16, bfloat, bf16, bfloat)
 // `affine_qmm_w4a8_*` then computes, per chunk c (group g = c·64/G):
 //   y[m,n] += a·s[n,g]·(xq_c · q'_c[n]) + (b[n,g] + 8·s[n,g])·a·Σ xq_c
 // Buffers: quant x[0] scratch[1]; GEMM w[0] scales[1] biases[2]
-// scratch[3] y[4]. K/N/M from function constants 0/1/2. The lowering
+// scratch[3] y[4]. K/N/M from baked constants 0/1/2. The lowering
 // guarantees K % 64 == 0, N % TN == 0 and M (the bucket) % 32 == 0 —
 // the tensor slices are static and unchecked. Grids: quant
 // (ceil(K/64 / 16), M), 128 threads; GEMM (N/TN, M/32), 32·NSG threads.
@@ -1151,28 +1095,16 @@ template <typename T, typename S, int G, int TN, int NSG>
         biases + size_t(expert) * N * (K / G), scratch, y, tgid);
 }
 
-template [[host_name("affine_w4a8_quant_bf16")]] [[kernel]] void affine_w4a8_quant<bfloat>(
-    const device bfloat*, device uchar*, uint2, uint, uint);
-template [[host_name("affine_w4a8_quant_f16")]] [[kernel]] void affine_w4a8_quant<half>(
-    const device half*, device uchar*, uint2, uint, uint);
-template [[host_name("affine_gather_w4a8_quant_bf16")]] [[kernel]] void
-affine_gather_w4a8_quant<bfloat>(const device bfloat*, device uchar*, const device uint32_t*,
-                                 uint2, uint, uint);
-template [[host_name("affine_gather_w4a8_quant_f16")]] [[kernel]] void
-affine_gather_w4a8_quant<half>(const device half*, device uchar*, const device uint32_t*,
-                               uint2, uint, uint);
+SCRATCHY_KERNEL(affine_w4a8_quant_bf16, affine_w4a8_quant<bfloat>)
+SCRATCHY_KERNEL(affine_w4a8_quant_f16, affine_w4a8_quant<half>)
+SCRATCHY_KERNEL(affine_gather_w4a8_quant_bf16, affine_gather_w4a8_quant<bfloat>)
+SCRATCHY_KERNEL(affine_gather_w4a8_quant_f16, affine_gather_w4a8_quant<half>)
 
 #define INST_QMM_W4A8(act_tag, act_type, scale_tag, scale_type, gs, tn, nsg)                   \
-    template [[host_name("affine_qmm_w4a8_" #act_tag "_s_" #scale_tag "_gs_" #gs "_tn_" #tn     \
-                         "_nsg_" #nsg)]] [[kernel]] void                                       \
-    affine_qmm_w4a8<act_type, scale_type, gs, tn, nsg>(                                         \
-        const device uchar*, const device scale_type*, const device scale_type*,               \
-        const device uchar*, device act_type*, uint2);                                         \
-    template [[host_name("affine_gather_qmm_w4a8_" #act_tag "_s_" #scale_tag "_gs_" #gs        \
-                         "_tn_" #tn "_nsg_" #nsg)]] [[kernel]] void                            \
-    affine_gather_qmm_w4a8<act_type, scale_type, gs, tn, nsg>(                                  \
-        const device uchar*, const device scale_type*, const device scale_type*,               \
-        const device uchar*, device act_type*, const device uint32_t*, uint2);
+  SCRATCHY_KERNEL(affine_qmm_w4a8_##act_tag##_s_##scale_tag##_gs_##gs##_tn_##tn##_nsg_##nsg,    \
+                  affine_qmm_w4a8<act_type, scale_type, gs, tn, nsg>)                          \
+  SCRATCHY_KERNEL(affine_gather_qmm_w4a8_##act_tag##_s_##scale_tag##_gs_##gs##_tn_##tn##_nsg_##nsg, \
+                  affine_gather_qmm_w4a8<act_type, scale_type, gs, tn, nsg>)
 
 // 128 columns x 4 simdgroups where N allows it; 64 x 2 otherwise.
 #define INST_QMM_W4A8_TILES(act_tag, act_type, scale_tag, scale_type, gs)                      \

@@ -23,29 +23,13 @@
 
 /// Shaders that consume worker-tagged index tables and write/read the KV cache.
 /// Add new such shaders here.
-const SHADERS: &[(&str, &str)] = &[
-    (
-        "turboquant.metal",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/shaders/turboquant.metal"
-        )),
-    ),
-    (
-        "fused_qkv_rope_cache.metal",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/shaders/fused_qkv_rope_cache.metal"
-        )),
-    ),
-    (
-        "fused_affine_qkv_rope_cache.metal",
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/shaders/fused_affine_qkv_rope_cache.metal"
-        )),
-    ),
-];
+const SHADERS: &[(&str, &str)] = &[(
+    "turboquant.metal",
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/shaders/turboquant.metal"
+    )),
+)];
 
 /// Spellings that count as "bit 31 stripped".
 const MASK_TOKENS: &[&str] = &["0x7FFFFFFF", "ATTN_BT_MASK"];
@@ -106,11 +90,11 @@ fn kv_kernels_strip_bit31_from_tagged_index_tables() {
 
     // Anti-vacuity: the guard must actually be seeing masked tagged reads, so a
     // future refactor that removes/renames the tagged reads can't make this test
-    // pass by having nothing to check. turboquant.metal alone strips 4 (slots,
-    // logical_slots, 2x block_table); the fused-QKV K+V heads add more.
+    // pass by having nothing to check. turboquant.metal carries 3 (its slot and
+    // logical-slot strips, and the contract line at its head).
     assert!(
-        total_masks >= 6,
-        "expected >= 6 bit-31 strips across the KV kernels; found {total_masks}. \
+        total_masks >= 3,
+        "expected >= 3 bit-31 strips across the KV kernels; found {total_masks}. \
          Did a tagged-table read get removed/renamed without updating this guard?"
     );
 }

@@ -9,6 +9,7 @@
 // over the scratchy-target-metal paged cache. See
 // `mlx_steel_attn/steel_attention_paged_kernel.h`.
 
+#include "baked.h"
 #include "mlx_steel_attn/steel_attention_paged_kernel.h"
 
 // Tile shape: BQ=32, BK=16, WM=4, WN=1. BLOCK_SIZE=16 matches the
@@ -29,15 +30,8 @@
 // new dim and the dispatcher would silently fall through to SDPA;
 // adding it in Rust without here would call `library.get_function()`
 // for an absent symbol and panic at pipeline-build time.
-#define INST_STEEL_PAGED(dt_tag, dt_type, bk, bd)                               \
-  template [[host_name(                                                         \
-      "attention_steel_paged_" #dt_tag "_bq32_bk" #bk "_bd" #bd "_wm4_wn1_bs16" \
-  )]] [[kernel]]                                                                \
-  decltype(attention_paged<dt_type, 32, bk, bd, 4, 1, 16, float>)               \
-      attention_paged<dt_type, 32, bk, bd, 4, 1, 16, float>;                    \
-  template [[host_name("rope_once_steel_" #dt_tag "_bd" #bd "_bs16")]]          \
-  [[kernel]]                                                                    \
-  decltype(rope_once_steel_kernel<dt_type, bd, 16>)                             \
-      rope_once_steel_kernel<dt_type, bd, 16>;
+#define INST_STEEL_PAGED(dt_tag, dt_type, bk, bd) \
+  SCRATCHY_KERNEL(attention_steel_paged_##dt_tag##_bq32_bk##bk##_bd##bd##_wm4_wn1_bs16, attention_paged<dt_type, 32, bk, bd, 4, 1, 16, float>) \
+  SCRATCHY_KERNEL(rope_once_steel_##dt_tag##_bd##bd##_bs16, rope_once_steel_kernel<dt_type, bd, 16>)
 
 #include "attention_steel_paged_instantiations.h"

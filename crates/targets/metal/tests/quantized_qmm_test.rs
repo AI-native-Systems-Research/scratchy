@@ -22,13 +22,13 @@ use std::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::cpu_reference::affine_qmm_t_b4_bf16 as cpu_qmm_t_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
     DequantDtype, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, qmm_t_dispatch_shape,
     qmm_t_kernel_name,
 };
-use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 
@@ -45,7 +45,7 @@ type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 /// `bake_mtl4_steps` path instead of the classic `MetalStream` encoder.
 #[allow(clippy::too_many_arguments)]
 fn build_qmm_t_pipeline(
-    cache: &ShaderCache,
+    device: &common::Device,
     kernel: QmmTKernel,
     m: u32,
     n: u32,
@@ -55,7 +55,7 @@ fn build_qmm_t_pipeline(
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
     codes: AffineCodes,
-) -> scratchy_target_metal::shader_cache::ComputePipelineState {
+) -> BakedPipeline {
     let aligned_n = match kernel {
         QmmTKernel::Nax => n.is_multiple_of(64),
         _ => n.is_multiple_of(32),
@@ -73,9 +73,11 @@ fn build_qmm_t_pipeline(
         constants.push(ConstantValue::int(3, k_partition_size as i32));
     }
     constants.extend(codes.constant());
-    cache
-        .get_pipeline_specialized(&kernel_name, &constants)
-        .expect("qmm_t pipeline")
+    let library = match kernel {
+        QmmTKernel::Nax => "quantized_qmm_nax",
+        _ => "quantized_qmm",
+    };
+    baked_pipeline(device, library, &kernel_name, constants).expect("qmm_t pipeline")
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -187,7 +189,6 @@ fn run_qmm_t_bf16_codes(
     codes: AffineCodes,
 ) -> Option<Vec<half::bf16>> {
     let device = detect_device()?.device;
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
 
     let packed_buf = buffer_from_bytes(&device, packed);
     let scales_bytes: &[u8] = unsafe {
@@ -216,7 +217,7 @@ fn run_qmm_t_bf16_codes(
     // pipeline + grid for that exact variant (same name/constants/grid
     // as `execute_with_kernel`) and dispatch on MTL4.
     let pipeline = build_qmm_t_pipeline(
-        &cache,
+        &device,
         expected_kernel,
         m as u32,
         n as u32,
@@ -693,7 +694,6 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
         return;
     };
     let device = __dev.device;
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
 
     let packed_buf = buffer_from_bytes(&device, &packed);
     let scales_bytes: &[u8] = unsafe {
@@ -717,7 +717,7 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
     let y_buf = zeroed_buffer(&device, m * n * std::mem::size_of::<half::bf16>());
 
     let pipeline = build_qmm_t_pipeline(
-        &cache,
+        &device,
         QmmTKernel::Nax,
         m as u32,
         n as u32,

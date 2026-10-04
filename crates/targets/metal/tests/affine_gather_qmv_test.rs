@@ -10,13 +10,28 @@ use std::ptr::NonNull;
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{
     affine_qmm_t_b8_bf16_s_bf16, affine_qmv_b4_bf16, affine_qmv_b4_bf16_s_bf16,
 };
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
-use scratchy_target_metal::shader_cache::ShaderCache;
-use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
+use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, TopK};
+use scratchy_target_metal::tape::kernel_constants::{
+    AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows,
+};
+
+/// The gather matvec's baked constants: K / N, codes as written, `top_k` output rows per x row.
+fn gather_constants(k: u32, n_out: u32, top_k: u32) -> AffineGatherQmvConstants {
+    AffineGatherQmvConstants {
+        qmv: AffineQmvConstants {
+            k: KDimI32(k as i32),
+            n: NDimI32(n_out as i32),
+            codes: AffineCodes::AsWritten,
+        },
+        rows: GatherRows::Tokens(TopK(top_k)),
+    }
+}
 
 fn buf_from_bytes(
     device: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>,
@@ -53,9 +68,8 @@ fn read_bf16(
 /// Build the gather-qmv pipeline for the given shape and dispatch it on
 /// the production MTL4 path. Replicates the bindings of
 /// `MetalAffineGatherQmv::execute` (buffer 0=packed_w, 1=scales,
-/// 2=biases, 3=x, 4=rhs_indices, 5=y; the `top_k` scalar — bound via
-/// `setBytes` at index 6 on the classic path — rides as a tiny
-/// address-bound buffer at index 6 here) and the same Fast-vs-Generic
+/// 2=biases, 3=x, 4=rhs_indices, 5=y; `top_k` baked with K / N,
+/// `AffineGatherQmvConstants`) and the same Fast-vs-Generic
 /// heuristic + `(1, n_out/8, num_tokens*top_k)` grid. `bits` is fixed at
 /// 4 (only width the kernel wires). Returns `false` if the host has no
 /// MTL4 queue (caller should skip).
@@ -87,18 +101,9 @@ fn dispatch_gather_qmv(
     let dt = dtype.symbol_infix();
     let sdt = scale_dtype.symbol_infix();
     let kernel_name = format!("{kernel}_{dt}_s_{sdt}_gs_{group_size}_b_{bits}");
-    let constants = [
-        ConstantValue::int(0, k as i32),
-        ConstantValue::int(1, n_out as i32),
-    ];
-    let shader_cache = ShaderCache::new(device.clone()).expect("ShaderCache");
-    let pipeline = shader_cache
-        .get_pipeline_specialized(&kernel_name, &constants)
+    let constants = gather_constants(k, n_out, top_k).into();
+    let pipeline = baked_pipeline(device, "quantized_qmv", &kernel_name, constants)
         .expect("gather qmv pipeline");
-
-    // The classic path passed `top_k` (as i32) via `setBytes` at buffer
-    // index 6; on MTL4 it becomes a tiny address-bound buffer.
-    let top_k_buf = common::shared_u32(device, top_k);
 
     // grid = (1, n_out/8, num_tokens*top_k); threads_per_tg = (32, 2, 1).
     let bn: u32 = 8;
@@ -115,7 +120,7 @@ fn dispatch_gather_qmv(
     common::dispatch_threadgroups(
         device,
         &pipeline,
-        &[w_buf, s_buf, b_buf, x_buf, idx_buf, y_buf, &top_k_buf],
+        &[w_buf, s_buf, b_buf, x_buf, idx_buf, y_buf],
         threadgroups,
         threads_per_threadgroup,
     )
@@ -1128,20 +1133,14 @@ fn affine_gather_qmv_b8_bf16_qwen3_5_optiq_fast() {
             "affine_gather_qmv"
         };
         let name = format!("{kernel}_bf16_s_bf16_gs_{group_size}_b_{bits}");
-        let constants = [
-            ConstantValue::int(0, k as i32),
-            ConstantValue::int(1, n_out as i32),
-        ];
-        let cache = ShaderCache::new(mdev.device.clone()).expect("ShaderCache");
-        let pipeline = cache
-            .get_pipeline_specialized(&name, &constants)
+        let constants = gather_constants(k as u32, n_out as u32, top_k as u32).into();
+        let pipeline = baked_pipeline(&mdev.device, "quantized_qmv", &name, constants)
             .expect("b8 gather pipeline");
-        let top_k_buf = common::shared_u32(&mdev.device, top_k as u32);
         let bn: u32 = 8;
         if !common::dispatch_threadgroups(
             &mdev.device,
             &pipeline,
-            &[&w_buf, &s_buf, &b_buf, &x_buf, &idx_buf, &y_buf, &top_k_buf],
+            &[&w_buf, &s_buf, &b_buf, &x_buf, &idx_buf, &y_buf],
             MTLSize {
                 width: 1,
                 height: n_out.div_ceil(bn as usize),

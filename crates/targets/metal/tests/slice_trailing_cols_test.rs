@@ -5,11 +5,13 @@
 mod common;
 
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
-use scratchy_target_metal::slice_trailing_cols::SliceTrailingColsKernels;
+use scratchy_target_metal::tape::ids::{NumExperts, TopK};
+use scratchy_target_metal::tape::kernel_constants::MoeTopKConstants;
 
 /// `slice_trailing_cols_u32` binding contract: buffer(0)=src,
-/// buffer(1)=dst, buffer(2)=axis_size (i32), buffer(3)=top_k (i32).
+/// buffer(1)=dst; axis_size and top_k baked (`MoeTopKConstants`).
 /// One thread per (k, n): grid (top_k, rows). `top_k <= 32` for every
 /// MoE-router shape here, so a single threadgroup of `top_k` threads
 /// covers the k axis exactly (no over-dispatch — the kernel has no
@@ -24,14 +26,22 @@ fn run_slice_trailing_cols_mtl4(
     let device = detect_device()
         .expect("Metal 4 GPU present (caller pre-guards)")
         .device;
-    let axis_buf = common::shared_u32(&device, axis);
-    let top_k_buf = common::shared_u32(&device, top_k);
-    let kernels = SliceTrailingColsKernels::new(&device).expect("slice_trailing_cols kernels");
+    let constants = MoeTopKConstants {
+        experts: NumExperts(axis),
+        top_k: TopK(top_k),
+    };
+    let pipeline = baked_pipeline(
+        &device,
+        "slice_trailing_cols",
+        "slice_trailing_cols_u32",
+        constants.into(),
+    )
+    .expect("slice_trailing_cols pipeline");
     let threads_w = top_k.min(32) as usize;
     common::dispatch_threadgroups(
         &device,
-        &kernels.u32_pipeline,
-        &[src, dst, &axis_buf, &top_k_buf],
+        &pipeline,
+        &[src, dst],
         MTLSize {
             width: (top_k as usize).div_ceil(threads_w),
             height: rows as usize,

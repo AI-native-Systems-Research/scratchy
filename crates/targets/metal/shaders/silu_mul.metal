@@ -14,7 +14,7 @@
 // affine_qmm + silu + mul kernel which the
 // `feedback_no_handcoded_fusion` rule forbids.
 //
-// Function constants:
+// Baked constants:
 //   SILU_MUL_N — total output element count (= M * intermediate_size)
 //
 // Dispatch: 1 thread per output element. Float accumulator on the
@@ -22,10 +22,11 @@
 // the negative tail.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint SILU_MUL_N [[function_constant(0)]];
+SCRATCHY_CONSTANT(uint, SILU_MUL_N, 0);
 
 template <typename T>
 [[kernel]] void silu_mul(
@@ -45,13 +46,8 @@ template <typename T>
   out[gid] = static_cast<T>(silu_g * u);
 }
 
-#define INST_SILU_MUL(dtype_tag, mtl_type)                                \
-  template [[host_name("silu_mul_" #dtype_tag)]] [[kernel]] void          \
-  silu_mul<mtl_type>(                                                     \
-      device       mtl_type* out  [[buffer(0)]],                          \
-      const device mtl_type* gate [[buffer(1)]],                          \
-      const device mtl_type* up   [[buffer(2)]],                          \
-      uint gid [[thread_position_in_grid]]);
+#define INST_SILU_MUL(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(silu_mul_##dtype_tag, silu_mul<mtl_type>)
 
 INST_SILU_MUL(f16,  half)
 INST_SILU_MUL(bf16, bfloat)
@@ -88,13 +84,8 @@ template <typename T>
   out[gid] = static_cast<T>(gelu_g * u);
 }
 
-#define INST_GELU_MUL(dtype_tag, mtl_type)                                \
-  template [[host_name("gelu_mul_" #dtype_tag)]] [[kernel]] void          \
-  gelu_mul<mtl_type>(                                                     \
-      device       mtl_type* out  [[buffer(0)]],                          \
-      const device mtl_type* gate [[buffer(1)]],                          \
-      const device mtl_type* up   [[buffer(2)]],                          \
-      uint gid [[thread_position_in_grid]]);
+#define INST_GELU_MUL(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gelu_mul_##dtype_tag, gelu_mul<mtl_type>)
 
 INST_GELU_MUL(f16,  half)
 INST_GELU_MUL(bf16, bfloat)

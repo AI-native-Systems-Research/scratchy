@@ -22,12 +22,12 @@ use std::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::affine_qmv_b4_bf16 as cpu_qmv_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
     DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, qmv_dispatch_shape, qmv_kernel_name,
 };
-use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 
@@ -37,7 +37,7 @@ type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 /// Build the qmv pipeline for `(m, n, k, group_size, scale_dtype)` and
 /// dispatch it on the production MTL4 path. Replicates the bindings of
 /// `MetalAffineQmv::execute_with_kernel` (buffer 0=packed_w, 1=scales,
-/// 2=biases, 3=x, 4=y; K/N ride as function constants 0/1, not buffers)
+/// 2=biases, 3=x, 4=y; K/N are baked constants 0/1, not buffers)
 /// and the `qmv_dispatch_shape` grid. Returns `false` if the host has no
 /// MTL4 queue. bits is fixed at 4 and B at 1 (decode-only), matching the
 /// original test's `execute(.., 1 /* B */, group_size, 4, ..)` call.
@@ -72,10 +72,8 @@ fn dispatch_qmv(
     .into_iter()
     .chain(codes.constant())
     .collect();
-    let shader_cache = ShaderCache::new(device.clone()).expect("ShaderCache");
-    let pipeline = shader_cache
-        .get_pipeline_specialized(&kernel_name, &constants)
-        .expect("qmv pipeline");
+    let pipeline =
+        baked_pipeline(device, "quantized_qmv", &kernel_name, constants).expect("qmv pipeline");
     let (tg, tpg) = qmv_dispatch_shape(kernel, m as u32, n as u32, 1);
     common::dispatch_threadgroups(
         device,

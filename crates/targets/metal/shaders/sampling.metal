@@ -51,7 +51,8 @@
 // Sliced kernels use threadgroups = (nrows * nslices, 1, 1),
 // threadsPerThreadgroup = (SAMPLING_BLOCK_SIZE, 1, 1); row = tg / nslices,
 // slice = tg % nslices, and each threadgroup strides its contiguous slice of
-// the vocab axis. `nslices` is a runtime constant chosen by the host.
+// the vocab axis. `nslices` follows the step's row count (host-chosen); the
+// vocab is the model's, compiled in (`SAMPLER_VOCAB`).
 //
 // SHARED BINDING TABLE (one table serves every kernel; each kernel reads
 // only the slots named in its comment):
@@ -69,7 +70,7 @@
 //   11  counts                     [nrows, nslices, 4] uint
 //   12  staging                    [nrows, nslices, 2*MAX_CANDIDATES] uint
 //   13  output                     [nrows] uint
-//   14  consts                     (vocab, nslices, nrows, max_out, max_prompt)
+//   14  consts                     (nslices, nrows, max_out, max_prompt)
 //   15  telemetry topk_probs       (sampler-telemetry only)
 //   16  telemetry topk_indices
 //   17  telemetry stats_out
@@ -85,7 +86,12 @@
 //   14  pad                 15  pad
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
+
+SCRATCHY_CONSTANT(uint, SAMPLER_VOCAB, 0);
+// The telemetry spill (`sample_softmax_materialize` / `sample_finalize`): slot 1, compiled in.
+#define SAMPLER_TELEMETRY SCRATCHY_CONSTANT_1
 
 #define SAMPLING_BLOCK_SIZE 256
 #define MAX_CANDIDATES 1024
@@ -211,16 +217,16 @@ inline uint2 slice_bounds(uint vocab, uint nslices, uint slice) {
 // ---------------------------------------------------------------------------
 
 template <typename T>
-inline void cast_rows_slice(
-    device float* out,
-    device const T* logits,
-    device const uint* row_indices,
-    constant const uint* consts,
-    uint tgp,
-    uint tid)
+[[kernel]] void cast_rows(
+    device       float* out          [[buffer(0)]],
+    device const T*     logits       [[buffer(1)]],
+    device const uint*  row_indices  [[buffer(2)]],
+    constant     uint*  consts       [[buffer(3)]],
+    uint tgp [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     uint src_row = row_indices[row];
@@ -232,41 +238,12 @@ inline void cast_rows_slice(
     }
 }
 
-kernel void cast_rows_f16_to_f32(
-    device       float* out          [[buffer(0)]],
-    device const half*  logits       [[buffer(1)]],
-    device const uint*  row_indices  [[buffer(2)]],
-    constant     uint*  consts       [[buffer(3)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    cast_rows_slice(out, logits, row_indices, consts, tgp, tid);
-}
-
-kernel void cast_rows_bf16_to_f32(
-    device       float*  out         [[buffer(0)]],
-    device const bfloat* logits      [[buffer(1)]],
-    device const uint*   row_indices [[buffer(2)]],
-    constant     uint*  consts       [[buffer(3)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    cast_rows_slice(out, logits, row_indices, consts, tgp, tid);
-}
-
+SCRATCHY_KERNEL(cast_rows_f16_to_f32, cast_rows<half>)
+SCRATCHY_KERNEL(cast_rows_bf16_to_f32, cast_rows<bfloat>)
 // Identity row-gather for f32 logits — the parity harness's metal side feeds
 // f32 rows directly (the model's own cast is one of the f16/bf16 kernels
 // above; this one exists so the same pipeline can be tested on host data).
-kernel void cast_rows_f32_to_f32(
-    device       float* out          [[buffer(0)]],
-    device const float* logits       [[buffer(1)]],
-    device const uint*  row_indices  [[buffer(2)]],
-    constant     uint*  consts       [[buffer(3)]],
-    uint tgp [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
-{
-    cast_rows_slice(out, logits, row_indices, consts, tgp, tid);
-}
+SCRATCHY_KERNEL(cast_rows_f32_to_f32, cast_rows<float>)
 
 // ---------------------------------------------------------------------------
 // apply_penalties — repetition / frequency / presence, sliced over the vocab
@@ -277,6 +254,7 @@ kernel void cast_rows_f32_to_f32(
 // Token id == vocab_size is padding (never matches a real vocab index).
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(apply_penalties)
 kernel void apply_penalties(
     device       float* logits            [[buffer(0)]],
     device const int*   output_token_ids  [[buffer(1)]],
@@ -288,10 +266,10 @@ kernel void apply_penalties(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
-    uint max_output_len = consts[3];
-    uint max_prompt_len = consts[4];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
+    uint max_output_len = consts[2];
+    uint max_prompt_len = consts[3];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
 
@@ -325,6 +303,7 @@ kernel void apply_penalties(
         }
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_softmax_reduce — per (row, slice): the slice's max(logit/T) and the
@@ -334,6 +313,7 @@ kernel void apply_penalties(
 // exactly this class of few-ULP difference).
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_softmax_reduce)
 kernel void sample_softmax_reduce(
     device       float* logits_all [[buffer(0)]],
     device       uint*  partials   [[buffer(1)]],
@@ -342,8 +322,8 @@ kernel void sample_softmax_reduce(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
@@ -371,6 +351,7 @@ kernel void sample_softmax_reduce(
         p[1] = as_type<uint>(slice_sum);
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_stats_pick — ONE threadgroup per row: merge the slice partials into
@@ -380,6 +361,7 @@ kernel void sample_softmax_reduce(
 // -inf / 0.
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_stats_pick)
 kernel void sample_stats_pick(
     device const uint*  partials  [[buffer(0)]],
     device       uint*  row_state [[buffer(1)]],
@@ -387,8 +369,8 @@ kernel void sample_stats_pick(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint nslices = consts[1];
-    uint nrows = consts[2];
+    uint nslices = consts[0];
+    uint nrows = consts[1];
     uint row = min(tgp, nrows - 1);
     device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
     device const uint* p = partials + (size_t)row * nslices * 3;
@@ -414,6 +396,7 @@ kernel void sample_stats_pick(
         state[13] = 0;  // survivors above the prefix
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_softmax_materialize — per (row, slice): overwrite the f32 scratch
@@ -422,6 +405,7 @@ kernel void sample_stats_pick(
 //   bits(i) = as_uint(exp(v(i) - max) * inv_sum)
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_softmax_materialize)
 kernel void sample_softmax_materialize(
     device       float* logits_all [[buffer(0)]],
     device       uint*  partials   [[buffer(1)]],
@@ -430,8 +414,8 @@ kernel void sample_softmax_materialize(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
@@ -443,7 +427,7 @@ kernel void sample_softmax_materialize(
     float inv_sum_exp = 1.0f / as_type<float>(state[2]);
     device uint* bits = (device uint*)(rowp);
 
-#ifdef SCRATCHY_SAMPLER_TELEMETRY
+#if SAMPLER_TELEMETRY
     // Entropy partial over this slice (merged by sample_finalize).
     float local_ent = 0.0f;
 #endif
@@ -451,13 +435,13 @@ kernel void sample_softmax_materialize(
         float val = rowp[i] * inv_temp;
         float prob = exp(val - max_logit) * inv_sum_exp;
         bits[i] = as_type<uint>(prob);
-#ifdef SCRATCHY_SAMPLER_TELEMETRY
+#if SAMPLER_TELEMETRY
         if (prob > 0.0f) {
             local_ent -= prob * log(prob);
         }
 #endif
     }
-#ifdef SCRATCHY_SAMPLER_TELEMETRY
+#if SAMPLER_TELEMETRY
     threadgroup float s_warp_buf[NUM_WARPS];
     float ent = block_reduce_sum(local_ent, s_warp_buf, tid);
     if (tid == 0) {
@@ -465,6 +449,7 @@ kernel void sample_softmax_materialize(
     }
 #endif
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_histogram_pass — per (row, slice): a 256-bucket histogram of byte
@@ -474,6 +459,7 @@ kernel void sample_softmax_materialize(
 // across the four rounds; only the data does).
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_histogram_pass)
 kernel void sample_histogram_pass(
     device const uint*  prob_bits [[buffer(0)]],
     device       uint*  hist      [[buffer(1)]],
@@ -482,8 +468,8 @@ kernel void sample_histogram_pass(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
@@ -518,6 +504,7 @@ kernel void sample_histogram_pass(
     }
     (void)dst;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_threshold_pick — ONE threadgroup per row, dispatched once per byte
@@ -528,6 +515,7 @@ kernel void sample_histogram_pass(
 // applies the min-p floor over the completed threshold.
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_threshold_pick)
 kernel void sample_threshold_pick(
     device const uint*  hist      [[buffer(0)]],
     device       uint*  row_state [[buffer(1)]],
@@ -535,8 +523,8 @@ kernel void sample_threshold_pick(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint nslices = consts[1];
-    uint nrows = consts[2];
+    uint nslices = consts[0];
+    uint nrows = consts[1];
     uint row = min(tgp, nrows - 1);
     device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
     device const uint* h = hist + (size_t)row * nslices * HIST_BUCKETS;
@@ -593,6 +581,7 @@ kernel void sample_threshold_pick(
         }
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_count_compact — per (row, slice): count this slice's strict
@@ -601,6 +590,7 @@ kernel void sample_threshold_pick(
 // matches the cuda kernel's `pos < cap` drop.
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_count_compact)
 kernel void sample_count_compact(
     device const uint*  prob_bits [[buffer(0)]],
     device       uint*  counts    [[buffer(1)]],
@@ -610,8 +600,8 @@ kernel void sample_count_compact(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
@@ -654,6 +644,7 @@ kernel void sample_count_compact(
                    (uint)MAX_CANDIDATES);  // this slice's staged strict run
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_quota_pick — ONE threadgroup per row: total the slices' strict
@@ -662,6 +653,7 @@ kernel void sample_count_compact(
 // num_candidates.
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_quota_pick)
 kernel void sample_quota_pick(
     device       uint* counts    [[buffer(0)]],
     device       uint* row_state [[buffer(1)]],
@@ -669,8 +661,8 @@ kernel void sample_quota_pick(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint nslices = consts[1];
-    uint nrows = consts[2];
+    uint nslices = consts[0];
+    uint nrows = consts[1];
     uint row = min(tgp, nrows - 1);
     device uint* state = row_state + (size_t)row * ROW_STATE_LEN;
     device const uint* c = counts + (size_t)row * nslices * 4;
@@ -699,12 +691,14 @@ kernel void sample_quota_pick(
         state[12] = strict_kept + tied_avail;
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_compact_tied — per (row, slice): append this slice's tied
 // candidates after its strict run, up to the slice's quota.
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_compact_tied)
 kernel void sample_compact_tied(
     device const uint*  prob_bits [[buffer(0)]],
     device       uint*  counts    [[buffer(1)]],
@@ -714,8 +708,8 @@ kernel void sample_compact_tied(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
     uint row = tgp / nslices;
     uint slice = tgp % nslices;
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
@@ -749,6 +743,7 @@ kernel void sample_compact_tied(
         c[2] = strict_staged + taken;  // the slice's full staging run length
     }
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // sample_finalize — ONE threadgroup per row: gather the slices' staging runs
@@ -762,13 +757,14 @@ kernel void sample_compact_tied(
 // kernel's shape anyway.
 // ---------------------------------------------------------------------------
 
+#if SCRATCHY_COMPILES(sample_finalize)
 kernel void sample_finalize(
     device const uint*  staging   [[buffer(0)]],
     device const uint*  counts    [[buffer(1)]],
     device const uint*  row_state [[buffer(2)]],
     device const uint*  prob_bits [[buffer(3)]],
     device       uint*  output    [[buffer(4)]],
-#ifdef SCRATCHY_SAMPLER_TELEMETRY
+#if SAMPLER_TELEMETRY
     device const uint*  partials     [[buffer(5)]],
     device       float* topk_probs   [[buffer(6)]],
     device       uint*  topk_indices [[buffer(7)]],
@@ -779,9 +775,9 @@ kernel void sample_finalize(
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
-    uint vocab = consts[0];
-    uint nslices = consts[1];
-    uint nrows = consts[2];
+    uint vocab = SAMPLER_VOCAB;
+    uint nslices = consts[0];
+    uint nrows = consts[1];
     uint row = min(tgp, nrows - 1);
     device const uint* state = row_state + (size_t)row * ROW_STATE_LEN;
     device const uint* c = counts + (size_t)row * nslices * 4;
@@ -889,7 +885,7 @@ kernel void sample_finalize(
         }
         output[row] = sampled;
 
-#ifdef SCRATCHY_SAMPLER_TELEMETRY
+#if SAMPLER_TELEMETRY
         uint telem_on = telem_consts[0];
         if (telem_on != 0u) {
             uint telem_k = telem_consts[1];
@@ -911,3 +907,4 @@ kernel void sample_finalize(
 #endif
     }
 }
+#endif

@@ -10,9 +10,9 @@
 mod common;
 
 use objc2_metal::{MTLComputePipelineState, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
-use scratchy_target_metal::shader_cache::ShaderCache;
 
 /// CPU reference: `out[oindex] = scale * nibble + bias` with FMA-style
 /// single-rounding semantics (f32 multiply + add, then one round to the
@@ -174,8 +174,6 @@ fn run_affine_dequant(
     dtype: DequantDtype,
 ) -> Option<common::Buffer> {
     let device = detect_device()?.device;
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
-
     let packed_buf = common::shared_slice(&device, packed);
     let scales_buf = common::shared_slice(&device, scales);
     let biases_buf = common::shared_slice(&device, biases);
@@ -189,7 +187,8 @@ fn run_affine_dequant(
         group_size,
         4,
     );
-    let pipeline = cache.get_pipeline(&kernel_name).expect("dequant pipeline");
+    let pipeline = baked_pipeline(&device, "quantized_dequantize", &kernel_name, Vec::new())
+        .expect("dequant pipeline");
 
     // nthreads = out_n_elements / packs_per_int (packs_per_int = 2 for bits=4).
     let nthreads = n_out / 2;

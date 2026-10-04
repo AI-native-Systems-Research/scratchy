@@ -10,17 +10,23 @@
 // thread per (n, k); dispatch (top_k, N, 1).
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-[[kernel]] void slice_trailing_cols_u32(
-    const device uint* src [[buffer(0)]],
-    device uint*       dst [[buffer(1)]],
-    const constant int& axis_size [[buffer(2)]],
-    const constant int& top_k     [[buffer(3)]],
+// `MoeTopKConstants`, compiled in.
+SCRATCHY_CONSTANT(int, AXIS_SIZE, 0);
+SCRATCHY_CONSTANT(int, TOP_K, 1);
+
+template <typename U>
+[[kernel]] void slice_trailing_cols(
+    const device U* src [[buffer(0)]],
+    device U*       dst [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]]) {
   uint k = gid.x;
   uint n = gid.y;
-  uint src_col = uint(axis_size - top_k) + k;
-  dst[n * uint(top_k) + k] = src[n * uint(axis_size) + src_col];
+  uint src_col = uint(AXIS_SIZE - TOP_K) + k;
+  dst[n * uint(TOP_K) + k] = src[n * uint(AXIS_SIZE) + src_col];
 }
+
+SCRATCHY_KERNEL(slice_trailing_cols_u32, slice_trailing_cols<uint>)

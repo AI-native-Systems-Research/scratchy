@@ -13,201 +13,8 @@
 //! Where θ is position-dependent and pre-computed in cos_sin_cache.
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
-
-// ---------------------------------------------------------------------------
-// NeoX-style RoPE (standard Llama, GPT-NeoX)
-// ---------------------------------------------------------------------------
-
-/// Apply rotary embedding to a single token's query/key vectors.
-/// NeoX style: pairs element i with i + half_dim.
-///
-/// @param query: [num_heads, head_size] - query vector for this token
-/// @param key: [num_kv_heads, head_size] - key vector for this token (nullable)
-/// @param cos_sin_cache: [rot_dim] - concatenated [cos; sin] for this position
-/// @param num_heads: number of query heads
-/// @param num_kv_heads: number of key heads
-/// @param rot_dim: rotary dimension (typically head_size or head_size/2)
-/// @param head_size: size of each head
-kernel void rope_neox_f16(
-    device half* query [[buffer(0)]],
-    device half* key [[buffer(1)]],
-    constant half* cos_sin_cache [[buffer(2)]],
-    constant uint& num_heads [[buffer(3)]],
-    constant uint& num_kv_heads [[buffer(4)]],
-    constant uint& rot_dim [[buffer(5)]],
-    constant uint& head_size [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
-{
-    const uint embed_dim = rot_dim / 2;
-    constant half* cos_ptr = cos_sin_cache;
-    constant half* sin_ptr = cos_sin_cache + embed_dim;
-    
-    // Apply to query heads
-    const uint nq = num_heads * embed_dim;
-    if (tid < nq) {
-        const uint head_idx = tid / embed_dim;
-        const uint rot_offset = tid % embed_dim;
-        
-        const uint x_index = rot_offset;
-        const uint y_index = embed_dim + rot_offset;
-        
-        const half cos_val = cos_ptr[x_index];
-        const half sin_val = sin_ptr[x_index];
-        
-        device half* head_ptr = query + head_idx * head_size;
-        const half x = head_ptr[x_index];
-        const half y = head_ptr[y_index];
-        
-        head_ptr[x_index] = x * cos_val - y * sin_val;
-        head_ptr[y_index] = y * cos_val + x * sin_val;
-    }
-    
-    // Apply to key heads (if present)
-    if (key != nullptr) {
-        const uint nk = num_kv_heads * embed_dim;
-        if (tid < nk) {
-            const uint head_idx = tid / embed_dim;
-            const uint rot_offset = tid % embed_dim;
-            
-            const uint x_index = rot_offset;
-            const uint y_index = embed_dim + rot_offset;
-            
-            const half cos_val = cos_ptr[x_index];
-            const half sin_val = sin_ptr[x_index];
-            
-            device half* head_ptr = key + head_idx * head_size;
-            const half x = head_ptr[x_index];
-            const half y = head_ptr[y_index];
-            
-            head_ptr[x_index] = x * cos_val - y * sin_val;
-            head_ptr[y_index] = y * cos_val + x * sin_val;
-        }
-    }
-}
-
-/// BFloat16 variant of NeoX-style RoPE
-kernel void rope_neox_bf16(
-    device bfloat* query [[buffer(0)]],
-    device bfloat* key [[buffer(1)]],
-    constant bfloat* cos_sin_cache [[buffer(2)]],
-    constant uint& num_heads [[buffer(3)]],
-    constant uint& num_kv_heads [[buffer(4)]],
-    constant uint& rot_dim [[buffer(5)]],
-    constant uint& head_size [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
-{
-    const uint embed_dim = rot_dim / 2;
-    constant bfloat* cos_ptr = cos_sin_cache;
-    constant bfloat* sin_ptr = cos_sin_cache + embed_dim;
-    
-    // Apply to query heads
-    const uint nq = num_heads * embed_dim;
-    if (tid < nq) {
-        const uint head_idx = tid / embed_dim;
-        const uint rot_offset = tid % embed_dim;
-        
-        const uint x_index = rot_offset;
-        const uint y_index = embed_dim + rot_offset;
-        
-        const bfloat cos_val = cos_ptr[x_index];
-        const bfloat sin_val = sin_ptr[x_index];
-        
-        device bfloat* head_ptr = query + head_idx * head_size;
-        const bfloat x = head_ptr[x_index];
-        const bfloat y = head_ptr[y_index];
-        
-        head_ptr[x_index] = x * cos_val - y * sin_val;
-        head_ptr[y_index] = y * cos_val + x * sin_val;
-    }
-    
-    // Apply to key heads (if present)
-    if (key != nullptr) {
-        const uint nk = num_kv_heads * embed_dim;
-        if (tid < nk) {
-            const uint head_idx = tid / embed_dim;
-            const uint rot_offset = tid % embed_dim;
-            
-            const uint x_index = rot_offset;
-            const uint y_index = embed_dim + rot_offset;
-            
-            const bfloat cos_val = cos_ptr[x_index];
-            const bfloat sin_val = sin_ptr[x_index];
-            
-            device bfloat* head_ptr = key + head_idx * head_size;
-            const bfloat x = head_ptr[x_index];
-            const bfloat y = head_ptr[y_index];
-            
-            head_ptr[x_index] = x * cos_val - y * sin_val;
-            head_ptr[y_index] = y * cos_val + x * sin_val;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Interleaved RoPE (GPT-J style, Cohere CommandR)
-// ---------------------------------------------------------------------------
-
-/// Apply rotary embedding with interleaved pairing.
-/// GPT-J style: pairs element 2i with 2i+1.
-///
-/// Used by Cohere's CommandR family.
-kernel void rope_interleaved_f16(
-    device half* query [[buffer(0)]],
-    device half* key [[buffer(1)]],
-    constant half* cos_sin_cache [[buffer(2)]],
-    constant uint& num_heads [[buffer(3)]],
-    constant uint& num_kv_heads [[buffer(4)]],
-    constant uint& rot_dim [[buffer(5)]],
-    constant uint& head_size [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
-{
-    const uint embed_dim = rot_dim / 2;
-    constant half* cos_ptr = cos_sin_cache;
-    constant half* sin_ptr = cos_sin_cache + embed_dim;
-    
-    // Apply to query heads
-    const uint nq = num_heads * embed_dim;
-    if (tid < nq) {
-        const uint head_idx = tid / embed_dim;
-        const uint rot_offset = tid % embed_dim;
-        
-        const uint x_index = 2 * rot_offset;
-        const uint y_index = 2 * rot_offset + 1;
-        
-        const half cos_val = cos_ptr[rot_offset];
-        const half sin_val = sin_ptr[rot_offset];
-        
-        device half* head_ptr = query + head_idx * head_size;
-        const half x = head_ptr[x_index];
-        const half y = head_ptr[y_index];
-        
-        head_ptr[x_index] = x * cos_val - y * sin_val;
-        head_ptr[y_index] = y * cos_val + x * sin_val;
-    }
-    
-    // Apply to key heads (if present)
-    if (key != nullptr) {
-        const uint nk = num_kv_heads * embed_dim;
-        if (tid < nk) {
-            const uint head_idx = tid / embed_dim;
-            const uint rot_offset = tid % embed_dim;
-            
-            const uint x_index = 2 * rot_offset;
-            const uint y_index = 2 * rot_offset + 1;
-            
-            const half cos_val = cos_ptr[rot_offset];
-            const half sin_val = sin_ptr[rot_offset];
-            
-            device half* head_ptr = key + head_idx * head_size;
-            const half x = head_ptr[x_index];
-            const half y = head_ptr[y_index];
-            
-            head_ptr[x_index] = x * cos_val - y * sin_val;
-            head_ptr[y_index] = y * cos_val + x * sin_val;
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Phase 5.G.3: rope_append_f16_specialized — paged-cache RoPE writer
@@ -216,8 +23,7 @@ kernel void rope_interleaved_f16(
 // un-rotated V) into the per-layer KV cache. Mirrors
 // `Instruction::RopeAppend` (CUDA) / `KernelId::RopeAppend` (Metal).
 //
-// Function constants (must match
-// `scratchy-target-metal::interpreter::metal::pipelines::constants_for`):
+// Constants (compiled in; `RopeAppendConstants`):
 //   0 = HEAD_DIM
 //   1 = NUM_Q_HEADS
 //   2 = NUM_KV_HEADS
@@ -255,42 +61,43 @@ kernel void rope_interleaved_f16(
 // thread (sequential dependency).
 // ---------------------------------------------------------------------------
 
-constant uint ROPE_HEAD_DIM     [[function_constant(0)]];
-constant uint ROPE_NUM_Q_HEADS  [[function_constant(1)]];
-constant uint ROPE_NUM_KV_HEADS [[function_constant(2)]];
-constant uint ROPE_ROT_DIM      [[function_constant(3)]];
-constant uint ROPE_BLOCK_SIZE   [[function_constant(4)]];
+SCRATCHY_CONSTANT(uint, ROPE_HEAD_DIM, 0);
+SCRATCHY_CONSTANT(uint, ROPE_NUM_Q_HEADS, 1);
+SCRATCHY_CONSTANT(uint, ROPE_NUM_KV_HEADS, 2);
+SCRATCHY_CONSTANT(uint, ROPE_ROT_DIM, 3);
+SCRATCHY_CONSTANT(uint, ROPE_BLOCK_SIZE, 4);
 // Reactive (chunked) KV pool: buffers 6/7 are per-layer chunk-address
 // TABLES (device uint64 gpuAddresses), not the cache buffers. A
 // physical block id derefs `table[block_id / BLOCKS_PER_CHUNK]` then
 // addresses with `block_id % BLOCKS_PER_CHUNK`. See
 // scratchy-target-metal's `BLOCKS_PER_CHUNK`.
-constant uint ROPE_BLOCKS_PER_CHUNK [[function_constant(5)]];
+SCRATCHY_CONSTANT(uint, ROPE_BLOCKS_PER_CHUNK, 5);
 // Rotation pairing offset: lane d < ROT_DIM/2 rotates the pair
 // (d, d + PAIR_OFF). Standard NeoX (full + HF partial rope) passes
 // ROT_DIM/2; Gemma4 proportional rope passes HEAD_DIM/2 (mlx
 // `ProportionalRoPE` rotates the first ROT_DIM/2 lanes of EACH head
 // half — pairs span the full head, not the rot window).
-constant uint ROPE_PAIR_OFF [[function_constant(6)]];
+SCRATCHY_CONSTANT(uint, ROPE_PAIR_OFF, 6);
 
 // Norm-prologue fn-consts (rope_append_normed_* only; the plain
 // rope_append_* kernels never reference them).
-constant float ROPE_NORM_EPS      [[function_constant(7)]];
-constant float ROPE_NORM_W_OFFSET [[function_constant(8)]];
+SCRATCHY_CONSTANT_OPTIONAL(float, ROPE_NORM_EPS, 7);
+SCRATCHY_CONSTANT_OPTIONAL(float, ROPE_NORM_W_OFFSET, 8);
 
 // Rope-on-read (spans / position-independent KV): when set, K for blocks
 // flagged unrotated is stored WITHOUT rotation (Q still rotates; K-norm
 // preserved) so attention can re-rope it to any reuse position on read.
-// Optional — default-off via is_function_constant_defined so non-spans
+// Optional — default-off via the slot's `_SET` flag so non-spans
 // rope_append is byte-identical (the gate + the flag buffer fold away).
 // The K-rotation skip is the ONLY change; Q-rotation, K rmsnorm, and the
 // V path are untouched. The "stored unrotated" flag rides in
 // slot_mapping bit 31 (set by the worker) — free, since slot_mapping[t]
 // is loaded for the paged write anyway; no separate flag buffer.
-constant uint ROPE_ROPE_ON_READ [[function_constant(9)]];
-constant bool ROPE_ROR_DEFINED = is_function_constant_defined(ROPE_ROPE_ON_READ);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_ROPE_ON_READ, 9);
+constant bool ROPE_ROR_DEFINED = ROPE_ROPE_ON_READ_SET;
 constant uint ROPE_ROR = ROPE_ROR_DEFINED ? ROPE_ROPE_ON_READ : 0u;
 
+#if SCRATCHY_COMPILES(rope_append_f16_specialized)
 kernel void rope_append_f16_specialized(
     device       half* q_inout      [[buffer(0)]],
     device       half* k_inout      [[buffer(1)]],
@@ -398,11 +205,13 @@ kernel void rope_append_f16_specialized(
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
 }
+#endif
 
-/// BF16 specialized variant — same dispatch shape, function constants,
+/// BF16 specialized variant — same dispatch shape, baked constants,
 /// rotation math, and paged-cache layout as the f16 variant. Bindings
 /// switch to `device bfloat*`; the cos_sin cache must be uploaded as
 /// bf16 too (`upload_via_gpuweights` honors the dtype passed in).
+#if SCRATCHY_COMPILES(rope_append_bf16_specialized)
 kernel void rope_append_bf16_specialized(
     device       bfloat* q_inout      [[buffer(0)]],
     device       bfloat* k_inout      [[buffer(1)]],
@@ -497,65 +306,7 @@ kernel void rope_append_bf16_specialized(
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
 }
-
-/// BFloat16 variant of interleaved RoPE
-kernel void rope_interleaved_bf16(
-    device bfloat* query [[buffer(0)]],
-    device bfloat* key [[buffer(1)]],
-    constant bfloat* cos_sin_cache [[buffer(2)]],
-    constant uint& num_heads [[buffer(3)]],
-    constant uint& num_kv_heads [[buffer(4)]],
-    constant uint& rot_dim [[buffer(5)]],
-    constant uint& head_size [[buffer(6)]],
-    uint tid [[thread_position_in_grid]])
-{
-    const uint embed_dim = rot_dim / 2;
-    constant bfloat* cos_ptr = cos_sin_cache;
-    constant bfloat* sin_ptr = cos_sin_cache + embed_dim;
-    
-    // Apply to query heads
-    const uint nq = num_heads * embed_dim;
-    if (tid < nq) {
-        const uint head_idx = tid / embed_dim;
-        const uint rot_offset = tid % embed_dim;
-        
-        const uint x_index = 2 * rot_offset;
-        const uint y_index = 2 * rot_offset + 1;
-        
-        const bfloat cos_val = cos_ptr[rot_offset];
-        const bfloat sin_val = sin_ptr[rot_offset];
-        
-        device bfloat* head_ptr = query + head_idx * head_size;
-        const bfloat x = head_ptr[x_index];
-        const bfloat y = head_ptr[y_index];
-        
-        head_ptr[x_index] = x * cos_val - y * sin_val;
-        head_ptr[y_index] = y * cos_val + x * sin_val;
-    }
-    
-    // Apply to key heads (if present)
-    if (key != nullptr) {
-        const uint nk = num_kv_heads * embed_dim;
-        if (tid < nk) {
-            const uint head_idx = tid / embed_dim;
-            const uint rot_offset = tid % embed_dim;
-            
-            const uint x_index = 2 * rot_offset;
-            const uint y_index = 2 * rot_offset + 1;
-            
-            const bfloat cos_val = cos_ptr[rot_offset];
-            const bfloat sin_val = sin_ptr[rot_offset];
-            
-            device bfloat* head_ptr = key + head_idx * head_size;
-            const bfloat x = head_ptr[x_index];
-            const bfloat y = head_ptr[y_index];
-            
-            head_ptr[x_index] = x * cos_val - y * sin_val;
-            head_ptr[y_index] = y * cos_val + x * sin_val;
-        }
-    }
-}
-
+#endif
 
 // ---------------------------------------------------------------------------
 // rope_append_normed_* — Gemma4 per-head norm prologue + RoPE + paged write
@@ -585,7 +336,7 @@ kernel void rope_interleaved_bf16(
 //     and on global layers k_raw and v_raw are THE SAME buffer
 //     (k_eq_v), so arena writeback would self-conflict.
 //
-// Function constants: ROPE_* 0..6 as rope_append + 7 = ROPE_NORM_EPS,
+// Baked constants: ROPE_* 0..6 as rope_append + 7 = ROPE_NORM_EPS,
 // 8 = ROPE_NORM_W_OFFSET (Gemma4 stores full gains -> 0.0).
 //
 // Bindings (must match `interpreter::metal::lowering` for
@@ -778,11 +529,8 @@ template <typename T_act, typename T_scale>
     v_dst[d] = v_final;
 }
 
-#define INST_ROPE_APPEND_NORMED(act_tag, act_type, scale_tag, scale_type)   \
-  template [[host_name("rope_append_normed_" #act_tag "_s_" #scale_tag     \
-                       "_specialized")]]                                    \
-  [[kernel]] decltype(rope_append_normed_impl<act_type, scale_type>)       \
-      rope_append_normed_impl<act_type, scale_type>;
+#define INST_ROPE_APPEND_NORMED(act_tag, act_type, scale_tag, scale_type) \
+  SCRATCHY_KERNEL(rope_append_normed_##act_tag##_s_##scale_tag##_specialized, rope_append_normed_impl<act_type, scale_type>)
 
 INST_ROPE_APPEND_NORMED(f16,  half,   f16,  half)
 INST_ROPE_APPEND_NORMED(bf16, bfloat, f16,  half)

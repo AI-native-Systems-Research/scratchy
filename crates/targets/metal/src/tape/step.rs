@@ -21,6 +21,8 @@ pub use scratchy_subtile::subtile_ir::{
     AttnMask, ExpertBundle, ExpertProj, GatedAct, KvOperand, RopeFormTag, RotatedRows, RouterBundle,
 };
 
+pub use super::lowered::ActivationWidth;
+
 use super::ids::ArenaSlotIdx as Slot;
 use super::lowered::RuntimeGate;
 
@@ -152,7 +154,8 @@ pub enum CuSeqlens {
 }
 
 /// One command-emitting step. Slot operands are arena colours; `LayerId` is the step's own layer
-/// (a rolled body's rows name iteration 0's). Field order per kind: inputs, outputs, layer, shape.
+/// (a rolled body's rows name iteration 0's); an [`ActivationWidth`] is the width of the rows the
+/// step writes. Field order per kind: inputs, outputs, layer, shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetalStep {
     /// `(out)`: token embedding into the hidden.
@@ -161,19 +164,19 @@ pub enum MetalStep {
     AffineEmbed(Slot, AffineGroupSize, AffineBits),
     /// `(slot)`: projected vision rows spliced into the embedded hidden, in place.
     SpliceMmEmbeds(Slot),
-    /// `(in, out, rows_mult, rows_div, cols)`: a view — no kernel runs; later rows see
-    /// `cols` as the width and `num_tokens / rows_div` rows.
-    Reshape(Slot, Slot, RowsPerToken, RowsDivisor, HiddenSize),
+    /// `(in, out, rows_mult, rows_div)`: a view — no kernel runs; later rows see
+    /// `num_tokens / rows_div` rows.
+    Reshape(Slot, Slot, RowsPerToken, RowsDivisor),
     /// `(in, out, layer, width, rows_per_token)`.
     RmsNorm(Slot, Slot, LayerId, HiddenSize, RowsPerToken),
     /// `(in, out, layer, offset, width, rows_per_token)`: `rmsnorm(x, w + offset)`.
     ScalarOffsetRmsNorm(Slot, Slot, LayerId, GainOffset, HiddenSize, RowsPerToken),
     /// `(in, out, width, rows_per_token)`: unit-gain RMSNorm.
     RmsNormUnit(Slot, Slot, HiddenSize, RowsPerToken),
-    /// `(in, out, layer)`: centred (mean-subtracted) RMSNorm.
-    MeanSubRmsNorm(Slot, Slot, LayerId),
-    /// `(in, out, layer)`: LayerNorm with bias.
-    MeanSubRmsNormBiasAdd(Slot, Slot, LayerId),
+    /// `(in, out, layer, width)`: centred (mean-subtracted) RMSNorm.
+    MeanSubRmsNorm(Slot, Slot, LayerId, ActivationWidth),
+    /// `(in, out, layer, width)`: LayerNorm with bias.
+    MeanSubRmsNormBiasAdd(Slot, Slot, LayerId, ActivationWidth),
     /// `(delta, residual, layer, width, rows_per_token)`: `residual += delta`, then
     /// `delta = rmsnorm(residual)`.
     FusedAddRmsNorm(Slot, Slot, LayerId, HiddenSize, RowsPerToken),
@@ -183,8 +186,8 @@ pub enum MetalStep {
     NormAddScalarMul(Slot, Slot, Slot, LayerId, HiddenSize),
     /// `(in, out, layer)`: multiply by the layer's loaded scalar.
     ScalarWeightMul(Slot, Slot, LayerId),
-    /// `(in, out, scale)`.
-    ScalarMul(Slot, Slot, Scale),
+    /// `(in, out, scale, width)`.
+    ScalarMul(Slot, Slot, Scale, ActivationWidth),
     /// `(in, out, layer, n, k)`: dense GEMM.
     Gemm(Slot, Slot, LayerId, NDim, KDim),
     /// MLX-affine GEMM.
@@ -199,16 +202,16 @@ pub enum MetalStep {
     SiluMul(Slot, Slot, Slot, IntermediateSize),
     /// `(gate, up, out)`: `gelu(gate) * up`.
     GeluMul(Slot, Slot, Slot),
-    /// `(in, out)`: GELU (tanh approximation).
-    Gelu(Slot, Slot),
-    /// `(in, out)`: GELU (erf form).
-    GeluErf(Slot, Slot),
-    /// `(in, out)`: quick GELU.
-    QuickGelu(Slot, Slot),
-    /// `(in, out)`: final logit softcap.
-    TanhSoftCap(Slot, Slot),
-    /// `(delta, residual)`: `residual += delta`.
-    Add(Slot, Slot),
+    /// `(in, out, width)`: GELU (tanh approximation).
+    Gelu(Slot, Slot, ActivationWidth),
+    /// `(in, out, width)`: GELU (erf form).
+    GeluErf(Slot, Slot, ActivationWidth),
+    /// `(in, out, width)`: quick GELU.
+    QuickGelu(Slot, Slot, ActivationWidth),
+    /// `(in, out, width)`: final logit softcap.
+    TanhSoftCap(Slot, Slot, ActivationWidth),
+    /// `(delta, residual, width)`: `residual += delta`.
+    Add(Slot, Slot, ActivationWidth),
     /// `(q, k, v, q_out, k_out, v_out, layer, pairing, class, kv_offsets)`: rope + paged KV write.
     RopeAppend(
         Slot,
@@ -253,8 +256,8 @@ pub enum MetalStep {
     LoadPixels(Slot),
     /// `(out)`: the staged vision position embeddings.
     LoadPosEmbeds(Slot),
-    /// `(in, out, indices)`: row permutation by a runtime index buffer.
-    EmbeddingGather(Slot, Slot, GatherIndices),
+    /// `(in, out, indices, width)`: row permutation by a runtime index buffer.
+    EmbeddingGather(Slot, Slot, GatherIndices, ActivationWidth),
     /// `(qg, q, gate)`: split the doubled q projection into query and gate.
     GateSplit(Slot, Slot, Slot),
     /// `(attn, gate, out)`: `attn * sigmoid(gate)`.
@@ -362,8 +365,8 @@ impl MetalStep {
         match self {
             S::RmsNorm(_, _, l, ..)
             | S::ScalarOffsetRmsNorm(_, _, l, ..)
-            | S::MeanSubRmsNorm(_, _, l)
-            | S::MeanSubRmsNormBiasAdd(_, _, l)
+            | S::MeanSubRmsNorm(_, _, l, _)
+            | S::MeanSubRmsNormBiasAdd(_, _, l, _)
             | S::FusedAddRmsNorm(_, _, l, ..)
             | S::FusedAddRmsNormWithOffset(_, _, l, _)
             | S::ScalarWeightMul(_, _, l)

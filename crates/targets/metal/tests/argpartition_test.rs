@@ -12,8 +12,28 @@ mod common;
 
 use half::{bf16, f16};
 use objc2_metal::MTLSize;
-use scratchy_target_metal::argpartition::{ArgsortDType, ArgsortKernels, pick_pipeline_shape};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
+use scratchy_target_metal::tape::ids::NumExperts;
+use scratchy_target_metal::tape::kernel_constants::ArgsortConstants;
+
+/// The router-prob dtypes `argpartition.metal` is instantiated for.
+#[derive(Debug, Clone, Copy)]
+enum ArgsortDType {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl ArgsortDType {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::F32 => "float32",
+            Self::F16 => "float16",
+            Self::Bf16 => "bfloat16",
+        }
+    }
+}
 
 fn fill_random_f32(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
     let mut state = seed | 1;
@@ -49,14 +69,10 @@ fn cpu_argsort_ascending_f32(input: &[f32], rows: usize, cols: usize) -> Vec<u32
 
 /// Argsort kernel binding contract (matches the production
 /// `ArgPartitionTopK` lowering): `buffer(0)=input`, `buffer(1)=output`
-/// (u32), `buffer(2)=axis` (=axis_size), `buffer(3)=one` (=1),
-/// `buffer(4)=one` (=1), `buffer(5)=stride_in` (=axis_size),
-/// `buffer(6)=stride_out` (=axis_size). The five trailing scalars are
-/// `device const int&` in the kernel; their values are non-negative so
-/// the `shared_u32` bit pattern is identical to the classic path's
-/// `setBytes` of an `i32`. Grid is one threadgroup per row
-/// (`(1, rows, 1)`); the block is `bn` threads wide, where `(bn, tn)`
-/// is the `pick_pipeline_shape` choice for `axis_size`.
+/// (u32); the axis size and the contiguous strides baked
+/// (`ArgsortConstants`). Grid is one threadgroup per row (`(1, rows, 1)`);
+/// the block is `bn` threads wide, `bn * 4` covering `axis_size` (bn=32 up
+/// to 128 experts, bn=64 up to 256 — the lowering's pick).
 fn run_argsort_mtl4(
     dtype: ArgsortDType,
     in_buf: &common::Buffer,
@@ -67,30 +83,18 @@ fn run_argsort_mtl4(
     let device = detect_device()
         .expect("Metal 4 GPU present (caller pre-guards)")
         .device;
-    let (bn, tn) = pick_pipeline_shape(axis_size as usize).expect("pick pipeline shape");
-    let kernels = ArgsortKernels::new(&device).expect("argsort kernels");
-    let pipeline = kernels
-        .pipeline_for(dtype, bn, tn)
+    let bn = if axis_size > 128 { 64 } else { 32 };
+    let symbol = format!("c_arg_block_sort_{}_uint32_bn{bn}_tn4", dtype.tag());
+    let constants = ArgsortConstants {
+        experts: NumExperts(axis_size),
+    };
+    let pipeline = baked_pipeline(&device, "argpartition", &symbol, constants.into())
         .expect("argsort pipeline");
-
-    let axis_buf = common::shared_u32(&device, axis_size);
-    let one_a = common::shared_u32(&device, 1);
-    let one_b = common::shared_u32(&device, 1);
-    let stride_in = common::shared_u32(&device, axis_size);
-    let stride_out = common::shared_u32(&device, axis_size);
 
     common::dispatch_threadgroups(
         &device,
-        pipeline,
-        &[
-            in_buf,
-            out_buf,
-            &axis_buf,
-            &one_a,
-            &one_b,
-            &stride_in,
-            &stride_out,
-        ],
+        &pipeline,
+        &[in_buf, out_buf],
         MTLSize {
             width: 1,
             height: rows as usize,
@@ -153,7 +157,6 @@ fn run_case(dtype: ArgsortDType, rows: usize, cols: usize, top_k: usize, seed: u
             }
             (bytes, cast.iter().map(|v| v.to_f32()).collect())
         }
-        other => unreachable!("router-prob parity cases are float-typed, got {other:?}"),
     };
 
     let in_buf = common::shared_bytes(&device, &in_host_bytes);
@@ -238,7 +241,7 @@ fn argsort_f16_qwen3_moe_topk() {
 #[test]
 fn argsort_f32_qwen3_5_moe_topk_bn64() {
     // E=256, top_k=8 (Qwen3.5-MoE-35B-A3B) — exercises the bn=64
-    // (N_PER_BLOCK=256) instantiation via pick_pipeline_shape.
+    // (N_PER_BLOCK=256) instantiation.
     run_case(
         ArgsortDType::F32,
         /*rows=*/ 9,

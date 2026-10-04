@@ -31,7 +31,6 @@
 //!   - FusedGateUpSiluMul (decode vs prefill branch)
 //!   - GatherLastToken / ScatterFirstToLastRow (same)
 //!   - RopeAppend (dtype-only — left for follow-up)
-//!   - FusedQkvRopeCache (dtype-only — left for follow-up)
 //!   - Synth* (compiler-emitted symbol — never static)
 
 use crate::tape::constants::ConstantValue;
@@ -54,8 +53,7 @@ pub trait MetalKernel {
     /// Per-call binding-set struct (Phase 3).
     type BindingSet: Into<Vec<Binding>>;
 
-    /// `.metallib` file (matches the keys
-    /// `SpecializedPipelineCache::with_standard_shaders` registers).
+    /// The shader library (`shaders/<LIBRARY>.metal`).
     const LIBRARY: &'static str;
 
     /// MSL `kernel void` symbol the pipeline binds.

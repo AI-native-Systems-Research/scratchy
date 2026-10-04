@@ -88,27 +88,27 @@ struct NaxLimits {
 
 constant float NAX_M_LOG2E = 1.44269504088896340736f;
 
-// Function constants (same slot layout as attention_steel_paged).
-constant uint  NAXP_HEAD_DIM           [[function_constant(0)]];  // == BD
-constant uint  NAXP_NUM_Q_HEADS        [[function_constant(1)]];
-constant uint  NAXP_NUM_KV_HEADS       [[function_constant(2)]];
-constant float NAXP_SCALE              [[function_constant(3)]];
-constant uint  NAXP_BLOCK_SIZE         [[function_constant(4)]];  // == BLOCK_SIZE_
-constant uint  NAXP_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
-constant uint  NAXP_BLOCKS_PER_CHUNK   [[function_constant(6)]];
-constant int   NAXP_WINDOW             [[function_constant(7)]];  // 0 = full attn
+// Baked constants (same slot layout as attention_steel_paged).
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_HEAD_DIM, 0);  // == BD
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_NUM_Q_HEADS, 1);
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_NUM_KV_HEADS, 2);
+SCRATCHY_CONSTANT_OPTIONAL(float, NAXP_SCALE, 3);
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_BLOCK_SIZE, 4);  // == BLOCK_SIZE_
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_MAX_BLOCKS_PER_SEQ, 5);
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_BLOCKS_PER_CHUNK, 6);
+SCRATCHY_CONSTANT_OPTIONAL(int, NAXP_WINDOW, 7);  // 0 = full attn
 
 // Rope-on-read (spans): same slots/semantics as ATTN_PAGED_ROT_DIM /
 // ATTN_PAGED_PAIR_OFF / ATTN_PAGED_ROPE_ON_READ in the simdgroup steel
 // kernel. ROPE_ON_READ selects the scratch K-source in attention_nax_paged
 // (the K is pre-roped by rope_once_nax); rot_dim/pair_off are consumed only
-// by the rope_once_nax kernel. The is_function_constant_defined guard folds
+// by the rope_once_nax kernel. The slot's `_SET` flag folds
 // buffer 7 (the scratch) away when unset, so non-spans NAX attention reads K
 // straight from the cache — byte-identical to the prior direct-load kernel.
-constant uint  NAXP_ROT_DIM            [[function_constant(8)]];
-constant uint  NAXP_PAIR_OFF           [[function_constant(9)]];
-constant uint  NAXP_ROPE_ON_READ       [[function_constant(10)]];
-constant bool  NAXP_ROR_DEFINED = is_function_constant_defined(NAXP_ROPE_ON_READ);
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_ROT_DIM, 8);
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_PAIR_OFF, 9);
+SCRATCHY_CONSTANT_OPTIONAL(uint, NAXP_ROPE_ON_READ, 10);
+constant bool  NAXP_ROR_DEFINED = NAXP_ROPE_ON_READ_SET;
 constant uint  NAXP_ROR = NAXP_ROR_DEFINED ? NAXP_ROPE_ON_READ : 0u;
 
 struct NMaxOp {
@@ -436,7 +436,7 @@ void attention_nax_paged(
 
   // Resolve the K base pointer for logical block `lb`. Spans (NAXP_ROR != 0):
   // K comes PRE-ROPED from the dense scratch (rope_once_nax wrote it). Else:
-  // straight from the paged cache. The branch is on the ROR function constant,
+  // straight from the paged cache. The branch is on the baked ROR,
   // so the compiler keeps only one path per pipeline variant.
   auto resolve_k = [&](int lb) -> const device T* {
     if (NAXP_ROR != 0u) {
@@ -644,7 +644,7 @@ void attention_nax_paged(
   // ----- KV loop -----------------------------------------------------------
   // One direct-load loop for both paths. `do_qk_direct`'s K source is the
   // scratch (pre-roped, spans) or the cache (non-spans) via `resolve_k`, which
-  // folds on the ROR function constant — so the spans path runs at the
+  // folds on the baked ROR — so the spans path runs at the
   // non-spans baseline (the rope was done ONCE by rope_once_nax). V is always
   // read from the cache (never roped).
   for (int kb = kb_start; kb < kb_lim; kb++) {

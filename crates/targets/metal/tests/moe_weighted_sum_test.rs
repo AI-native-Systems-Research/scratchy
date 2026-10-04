@@ -8,10 +8,33 @@ mod common;
 
 use half::bf16;
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
-use scratchy_target_metal::moe_weighted_sum::{
-    MOE_WEIGHTED_SUM_TG_WIDTH, MoeSumDType, MoeWeightedSumKernels, moe_weighted_sum_cpu_f32,
-};
+use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
+
+/// Threadgroup width cap for the `(hidden, N)` grid: one thread per
+/// `(n, d)`, threadgroups span `hidden` in chunks of this many lanes.
+const MOE_WEIGHTED_SUM_TG_WIDTH: usize = 64;
+
+/// CPU reference: `out[n, d] = Σ_k expert[n, k, d] * scores[n, k]`.
+fn moe_weighted_sum_cpu_f32(
+    expert: &[f32],
+    scores: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    top_k: usize,
+    hidden: usize,
+) {
+    for n in 0..rows {
+        for d in 0..hidden {
+            let mut acc = 0.0_f32;
+            for k in 0..top_k {
+                acc += expert[n * top_k * hidden + k * hidden + d] * scores[n * top_k + k];
+            }
+            out[n * hidden + d] = acc;
+        }
+    }
+}
 
 fn rand_f32(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed | 1;
@@ -32,7 +55,6 @@ fn run_bf16(rows: usize, top_k: usize, hidden: usize, seed: u64) {
         return;
     };
     let device = __dev.device;
-    let kernels = MoeWeightedSumKernels::new(&device).expect("kernels");
 
     let expert_f32 = rand_f32(rows * top_k * hidden, seed, 2.0);
     // Probability-like scores in (0, 1) summing to ~1 across top_k.
@@ -56,16 +78,24 @@ fn run_bf16(rows: usize, top_k: usize, hidden: usize, seed: u64) {
 
     // Binding contract (matches shaders/moe_weighted_sum.metal):
     //   buffer(0)=expert_out, buffer(1)=scores, buffer(2)=out.
-    // `top_k`/`hidden` are baked as function constants at pipeline
-    // build time, not bound buffers. The classic path used
+    // `top_k`/`hidden` are compiled in (slots 0 / 1), not bound
+    // buffers. The classic path used
     // `dispatchThreads (hidden, rows, 1)`; the MTL4 helper dispatches
     // by threadgroup count, so we tile `hidden` into lanes of
     // `MOE_WEIGHTED_SUM_TG_WIDTH` with one threadgroup row per token.
     // This keeps `[[threads_per_grid]].y == rows` (the kernel's `n`
     // bound) and over-dispatched `d >= hidden` lanes self-guard.
-    let pipeline = kernels
-        .build_pipeline(MoeSumDType::BF16, top_k as u32, hidden as u32)
-        .expect("pipeline");
+    let constants = vec![
+        ConstantValue::int(0, top_k as i32),
+        ConstantValue::int(1, hidden as i32),
+    ];
+    let pipeline = baked_pipeline(
+        &device,
+        "moe_weighted_sum",
+        "moe_weighted_sum_bfloat16",
+        constants,
+    )
+    .expect("pipeline");
     let tg_width = hidden.min(MOE_WEIGHTED_SUM_TG_WIDTH);
     let threadgroups = MTLSize {
         width: hidden.div_ceil(tg_width),

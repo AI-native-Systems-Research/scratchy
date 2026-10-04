@@ -12,6 +12,7 @@
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::quantized::{
@@ -182,9 +183,11 @@ fn run(device: &Device, cache: &SpecializedPipelineCache, g: &Gemm) {
         ConstantValue::int(2, g.bucket_m as i32),
     ];
     let pipeline = |name: &'static str| {
-        cache
-            .get_or_build(&PipelineKey::new("quantized_qmm_nax", name, consts.clone()))
-            .expect("pipeline")
+        baked_build(
+            cache,
+            &PipelineKey::new("quantized_qmm_nax", name, consts.clone()),
+        )
+        .expect("pipeline")
     };
     let size = |width: usize, height: usize| MTLSize {
         width,
@@ -302,8 +305,7 @@ fn with_nax(body: impl FnOnce(&Device, &SpecializedPipelineCache)) {
         eprintln!("skipping: no NAX matrix unit");
         return;
     }
-    let cache =
-        SpecializedPipelineCache::with_standard_shaders(di.device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(di.device.clone(), &[]).expect("shaders");
     body(&di.device, &cache);
 }
 
