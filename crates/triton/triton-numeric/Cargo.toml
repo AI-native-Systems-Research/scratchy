@@ -22,7 +22,7 @@
 name = "triton-numeric"
 description = "the nine Granite configurations, EXECUTED: .py -> ttir -> KTIR -> emulator -> vs torch"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 publish = false
 
