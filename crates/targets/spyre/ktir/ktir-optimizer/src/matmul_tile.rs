@@ -81,13 +81,6 @@ struct Untiled {
     out_view: Ssa,
     /// The activation's row corner — an `scf`-free `index`, carried through unchanged.
     a_row: Ssa,
-    /// ⭐ THE WEIGHT'S ORIENTATION, read off the loaded W tile's shape — the same two
-    /// framings [`whole_function::matmul_b_orientation`] proves from the maps. The
-    /// builder's programs state a `[n, k]` W tile (transpose-B); the Triton ladder's
-    /// canonical single-dot kernel states `[k, n]` (plain-B, the direct-load contract
-    /// `verify_canonical_matmul_kernel` pins). The rewrite emits whichever it found —
-    /// one law, two spellings, no re-laying of bytes.
-    plain_b: bool,
     /// The untiled contraction's `outs` seed. ⛔ REUSED, NOT REBUILT: it is a splat of the BOUND
     /// zero constant at its reserved tid (`KtirFunc::splat_zero`), so minting a fresh immediate in
     /// its place orphans that parameter — the `dce` below then drops its view chain and the emulator
@@ -230,6 +223,8 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
                     let Some(s_dims) = through_scale(other) else {
                         continue;
                     };
+                    // Rank 2, one row, whose width must equal the contraction's n
+                    // (W's first extent — checked where n is bound, below).
                     if s_dims.len() != 2 || s_dims[0] != 1 {
                         continue;
                     }
@@ -260,21 +255,30 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         let (Some(&m), Some(&k)) = (a_dims.first(), a_dims.get(1)) else {
             continue;
         };
-        // ⭐ THE W TILE'S FRAMING DECIDES THE ORIENTATION — and at `k == n` the shapes
-        // cannot tell the two apart, so BOTH readings are admitted and the rewrite
-        // preserves whichever it found (a mismatched rewrite would silently contract
-        // the other way round, which no extent guard catches on a square weight).
-        //   * `[n, k]` (transpose-B): the builder's own spelling — `w_dims == [n, k]`.
-        //   * `[k, n]` (plain-B): the Triton ladder's canonical single-dot kernel —
-        //     `w_dims == [k, n]` with `n != k`.
-        // A square tile `[k, k]` is BOTH framings and either reading contracts the
-        // same bytes; anything else is a K-blocked (already-tiled) A tile or a foreign
-        // form — not ours, left alone.
-        let (n, plain_b) = match (w_dims.first(), w_dims.get(1)) {
-            (Some(&d0), Some(&d1)) if d1 == k => (d0, false),
-            (Some(&d0), Some(&d1)) if d0 == k => (d1, true),
-            _ => continue,
+        // ⭐ THE W TILE IS THE BUILDER'S OWN `[n, k]` FRAMING (transpose-B) — every
+        // producer this pass rewrites (the builder's `KtirFunc::matmul`, the spliced
+        // kernels, whose `.T` `dot_to_linalg` folds into the same transpose-B maps)
+        // loads the weight as its on-disk `[n, k]` region. A `[k, n]` W tile is a
+        // foreign plain-B form — not ours, left alone rather than contracted the
+        // wrong way round.
+        let (Some(&n), Some(&wk)) = (w_dims.first(), w_dims.get(1)) else {
+            continue;
         };
+        debug_assert_eq!(k, wk, "the recognized W tile's k matches A's");
+        // ⛔ THE SCALE ROW'S WIDTH MUST BE THIS n. The surviving mulf broadcasts the
+        // `[1, n]` row against the `[m, n]` result, so a loaded `[1, x]` row with
+        // x != n is a DIFFERENT epilogue — it disqualifies the node rather than
+        // misbroadcasting.
+        if let Some(scale_ssa) = scale {
+            let s_dims = through_scale(scale_ssa);
+            if s_dims
+                .as_deref()
+                .map(|d| d.len() != 2 || d[0] != 1 || d[1] != n)
+                != Some(false)
+            {
+                continue;
+            }
+        }
         let elem = op.result_type.and_then(|t| t.elem()).unwrap_or(DType::F16);
         // ⛔ THE SCALED FORM NEEDS ONE N-BLOCK. The rewrite replaces only the matmul
         // with the K-loop nest and leaves the surviving `arith.mulf(result, scale)`
@@ -296,7 +300,6 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             w_view,
             out_view,
             a_row,
-            plain_b,
             init,
             m,
             n,
@@ -422,18 +425,11 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             la.result_type = Some(tensor(vec![1, kb]));
             body.push(la);
 
-            // B tile = the contiguous row-block of the weight, WINDOWED IN THE ORIENTATION
-            // THE PROGRAM STATED:
-            //   * transpose-B (`[n, k]` view): `[n_off ..+bw, kv ..+kb]`, tile `[bw, kb]`.
-            //   * plain-B (`[k, n]` view, the Triton ladder's canonical single-dot kernel):
-            //     `[kv ..+kb, n_off ..+bw]`, tile `[kb, bw]` — the same bytes, the other axis
-            //     order, contracted where they lie.
+            // B tile = the contiguous row-block of the weight, in the transpose-B
+            // orientation every producer states (`[n, k]` view): `[n_off ..+bw, kv ..+kb]`,
+            // tile `[bw, kb]`.
             let (w_acc, w_val) = (g.mint(), g.mint());
-            let (wt_dims, wt_corner) = if p.plain_b {
-                (vec![kb, bw], vec![kv, noff])
-            } else {
-                (vec![bw, kb], vec![noff, kv])
-            };
+            let (wt_dims, wt_corner) = (vec![bw, kb], vec![noff, kv]);
             let mut tw = Operation::new(
                 a,
                 Some(w_acc),
@@ -453,19 +449,12 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             lw.result_type = Some(tensor(wt_dims));
             body.push(lw);
 
-            // ⭐ THE MAPS SAY WHICH AXIS OF W IS k, AND THEY MATCH THE ORIENTATION FOUND:
-            //   * transpose-B `[[0,2],[1,2],[0,1]]` — W's map ends in the reduction dim,
-            //     the builder's own spelling (W binds verbatim as its on-disk `[n, k]`).
-            //   * plain-B `[[0,2],[2,1],[0,1]]` — MLIR's plain form, W as `[k, n]` read
-            //     where it lies. Stated explicitly so `matmul_b_orientation` proves it
-            //     rather than reading a missing attribute as the default.
+            // ⭐ THE MAPS SAY WHICH AXIS OF W IS k — transpose-B `[[0,2],[1,2],[0,1]]`,
+            // the builder's own spelling (W binds verbatim as its on-disk `[n, k]`),
+            // which is also what `dot_to_linalg` folds the spliced kernels' `.T` into.
             let (part, maps): (Ssa, Vec<AffineMap<'a>>) = {
                 let part = g.mint();
-                let table: &[&[i64]] = if p.plain_b {
-                    &[&[0, 2], &[2, 1], &[0, 1]]
-                } else {
-                    &[&[0, 2], &[1, 2], &[0, 1]]
-                };
+                let table: &[&[i64]] = &[&[0, 2], &[1, 2], &[0, 1]];
                 let maps = table
                     .iter()
                     .map(|mm| AffineMap {
