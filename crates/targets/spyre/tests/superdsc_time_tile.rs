@@ -208,7 +208,13 @@ fn reduce_and_multiop_invariants() {
         .values()
         .find(|c| c["name_"] == "scaling_factor")
         .expect("mean reduce must emit a scaling_factor const (summeanmaxexx2.ddl)");
-    let val = sf["data_"][0].as_u64().unwrap();
+    // ⛔ #197's fold-manager const format: `data_` is the fold-manager object whose own `data_`
+    // keys fold triples and whose word is a DECIMAL STRING, not a flat u64 array. Reading
+    // `sf["data_"][0].as_u64()` was silently `None` the moment the wrapper landed.
+    let val = sf["data_"]["data_"]["[0, 0, 0]"][0]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("scaling_factor's fold-manager const word (decimal string at [0, 0, 0])");
     assert!(
         val <= 0xFFFF,
         "scaling_factor must be a 16-bit fp16 word, got {val:#x}"
