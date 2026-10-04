@@ -424,7 +424,17 @@ pub(crate) fn emit_weight_bindings(
                 ));
             }
         };
-        let is_gemm = gemm_operands.contains(&i);
+        // ⭐ A BUNDLE TENSOR'S GEMM-NESS IS THE TENSOR'S OWN FACT. `gemm_operands` reads
+        // `MatmulTile` operand-1 positions, which an expansion op never occupies — its matmuls are
+        // `ExpertMatmul`/`RouterLogits`, and their weight operands sit at other positions. A gemm
+        // bundle tensor (the router's `[E,hidden]` projection, the experts' `[E·out,in]` codes) is
+        // staged by the SAME on-disk-`[n,k]`-verbatim + device-width contract every other gemm
+        // weight is, so it must carry the flag its own `BundleTensor::is_gemm_operand()` states —
+        // the same fact the JSON manifest emits for the same source, so the two cannot disagree.
+        let is_gemm = match bundle_tensor {
+            Some(t) => t.is_gemm_operand(),
+            None => gemm_operands.contains(&i),
+        };
         let i = proc_macro2::Literal::u32_unsuffixed(i as u32);
         arms.push(quote! {
             out.push(::scratchy_forward_compiler::BoundWeight {
