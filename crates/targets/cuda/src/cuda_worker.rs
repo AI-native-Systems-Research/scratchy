@@ -5379,7 +5379,7 @@ impl CudaWorker {
                     out_req_ids,
                     Box::new(move || unsafe {
                         driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
-                        std::slice::from_raw_parts(buf_addr as *const u32, nr).to_vec()
+                        Ok(std::slice::from_raw_parts(buf_addr as *const u32, nr).to_vec())
                     }),
                 ));
             }
@@ -6294,7 +6294,7 @@ impl CudaWorker {
                     req_ids,
                     Box::new(move || unsafe {
                         driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
-                        std::slice::from_raw_parts(buf_addr as *const u32, num_reqs).to_vec()
+                        Ok(std::slice::from_raw_parts(buf_addr as *const u32, num_reqs).to_vec())
                     }),
                 ));
             }

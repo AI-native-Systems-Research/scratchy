@@ -1970,8 +1970,7 @@ impl AsyncEngine {
                 // 2. Finalize the previously completed step. The GPU is
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
-                if let Some((prev_sched, mut prev_output)) = deferred.take() {
-                    prev_output.resolve();
+                if let Some((prev_sched, prev_output)) = deferred.take() {
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             route_step_outputs(&requests, outputs).await;
@@ -2012,14 +2011,27 @@ impl AsyncEngine {
                     }
                 }
 
-                // 4. Wait for the oldest GPU result.
+                // 4. Wait for the oldest GPU result. A deferred one is waited
+                //    for here — the batch queued behind it keeps the GPU busy —
+                //    and fails its step like an executor error if its device
+                //    work did.
                 if gpu_in_flight > 0 {
-                    match model_rx.recv().await {
-                        Some(ExecutorResult::Model(Ok(model_output), sched)) => {
+                    let received =
+                        model_rx
+                            .recv()
+                            .await
+                            .map(|ExecutorResult::Model(result, sched)| {
+                                let resolved = result
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|mut output| output.resolve().map(|()| output));
+                                (resolved, sched)
+                            });
+                    match received {
+                        Some((Ok(model_output), sched)) => {
                             deferred = Some((sched, model_output));
                             gpu_in_flight -= 1;
                         }
-                        Some(ExecutorResult::Model(Err(e), sched)) => {
+                        Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
                             let err_msg = format!("Executor error: {e}");
                             let req_ids: Vec<String> =
@@ -2128,8 +2140,7 @@ impl AsyncEngine {
             }
 
             // Finalize any remaining deferred output before shutdown.
-            if let Some((prev_sched, mut prev_output)) = deferred.take() {
-                prev_output.resolve();
+            if let Some((prev_sched, prev_output)) = deferred.take() {
                 if let Ok(outputs) = client.finalize_step(&prev_sched, &prev_output) {
                     route_step_outputs(&requests, outputs).await;
                 }

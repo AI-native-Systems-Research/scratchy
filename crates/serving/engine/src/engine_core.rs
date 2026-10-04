@@ -506,7 +506,7 @@ impl EngineCore {
             .map_err(|e| EngineError::Executor(e.to_string()))?;
 
         // Resolve deferred D2H if present (sync path — resolve immediately).
-        model_output.resolve();
+        model_output.resolve().map_err(EngineError::Executor)?;
         let _d_exec = _t_exec.elapsed();
 
         // 3. Finalize: process outputs, aborts, ngram, and stats.

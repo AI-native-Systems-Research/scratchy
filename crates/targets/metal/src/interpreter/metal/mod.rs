@@ -40,7 +40,9 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 /// (the baked chunk-table constant) share one value. See
 /// [`crate::BLOCKS_PER_CHUNK`].
 pub use crate::BLOCKS_PER_CHUNK;
-pub use forward::{ForwardError, ForwardInputs, build_mrope_cos_sin_override};
+pub use forward::{
+    Deferral, DeviceInput, ForwardError, ForwardInputs, InFlight, build_mrope_cos_sin_override,
+};
 pub use pool::{
     MetalBucketSpec, MetalRungs, MetalWorkerPool, PickedRung, PoolBuildError, PooledWorker,
     RuntimeFactory, TqGroup, WorkerGuard, pick_rung,

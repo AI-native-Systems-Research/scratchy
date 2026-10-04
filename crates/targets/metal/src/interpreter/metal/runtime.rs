@@ -194,9 +194,15 @@ impl Padding {
 pub struct WrittenExtents(std::sync::Mutex<std::collections::HashMap<u64, usize>>);
 
 impl WrittenExtents {
-    /// Write `src` at the head of `buffer`, every byte past it the `padding`. `Err`: the bytes
+    /// Record `src` for the head of `buffer`, every byte past it the `padding`. `Err`: the bytes
     /// `src` needs, more than the buffer holds.
-    pub fn write(&self, buffer: &Buffer, src: &[u8], padding: Padding) -> Result<(), usize> {
+    pub fn write(
+        &self,
+        buffer: &Buffer,
+        src: &[u8],
+        padding: Padding,
+        writes: &mut InputWrites,
+    ) -> Result<(), usize> {
         let len = buffer.length();
         if src.len() > len {
             return Err(src.len());
@@ -205,17 +211,56 @@ impl WrittenExtents {
         let stale = written
             .insert(buffer.gpuAddress(), src.len())
             .unwrap_or(len);
-        // SAFETY: a shared-storage buffer's `contents()` is a host pointer to its `len` bytes;
-        // both ranges are inside them, and `src` (host memory) does not overlap the buffer.
-        unsafe {
-            let dst = buffer.contents().as_ptr().cast::<u8>();
-            if stale > src.len() {
-                std::ptr::write_bytes(dst.add(src.len()), padding.byte(), stale - src.len());
-            }
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        if !src.is_empty() {
+            let at = writes.staged.len().next_multiple_of(4);
+            writes.staged.resize(at, 0);
+            writes.staged.extend_from_slice(src);
+            let to = buffer.clone();
+            writes.ops.push(InputWrite::Staged {
+                to,
+                at,
+                len: src.len(),
+            });
+        }
+        if stale > src.len() {
+            let range = src.len()..stale;
+            let byte = padding.byte();
+            writes.ops.push(InputWrite::Fill {
+                to: buffer.clone(),
+                range,
+                byte,
+            });
         }
         Ok(())
     }
+}
+
+/// A forward's runtime-input writes, made by the device at the head of its command buffer: the
+/// forward before it may still be reading those buffers. The host writes only `staged`.
+#[derive(Debug, Default)]
+pub struct InputWrites {
+    pub(super) staged: Vec<u8>,
+    pub(super) ops: Vec<InputWrite>,
+}
+
+/// One of [`InputWrites::ops`], in order.
+#[derive(Debug)]
+pub(super) enum InputWrite {
+    /// `len` bytes of `staged` from `at`, to the head of `to`.
+    Staged { to: Buffer, at: usize, len: usize },
+    /// `range` of `to`, every byte `byte`.
+    Fill {
+        to: Buffer,
+        range: std::ops::Range<usize>,
+        byte: u8,
+    },
+    /// The `u32` `offset` bytes into `src`, which an earlier command buffer wrote, to `to` at `at`.
+    Device {
+        src: Buffer,
+        offset: usize,
+        to: Buffer,
+        at: usize,
+    },
 }
 
 impl RuntimeBindings {

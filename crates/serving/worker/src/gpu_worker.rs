@@ -66,6 +66,10 @@ pub use scratchy_target_cuda::cuda_worker::{CudaWorker, CudaWorkerFactory};
 
 #[cfg(feature = "metal")]
 use scratchy_target_metal::OwnedTensor;
+#[cfg(feature = "metal")]
+use scratchy_target_metal::interpreter::metal::{Deferral, DeviceInput, ForwardError, InFlight};
+#[cfg(feature = "metal")]
+use std::sync::Arc;
 
 // Backend-neutral types used by metal lifecycle bodies. Under cfg(metal),
 // `GpuDevice` resolves to the Apple-silicon arm carrying `device + queue +
@@ -287,11 +291,19 @@ pub struct MetalWorker {
     /// order `execute_model` built. Written by `forward_argmax_blocking` after
     /// the (single) host wait, read + cleared by `execute_model`.
     fused_sampled: Option<Vec<u32>>,
-    /// The greedy argmax's output (one u32 per row) and its `[batch, vocab]`
-    /// constants, reused across forwards and grown only when a forward has
-    /// more rows.
-    argmax_out: Option<scratchy_target_metal::residency::Pinned>,
-    argmax_consts: Option<scratchy_target_metal::residency::Pinned>,
+    /// The greedy argmax's outputs, one per step: a step takes one nothing else
+    /// holds — no step in flight, no output the engine has not resolved — and
+    /// grows it only when the step has more rows.
+    argmax_slots: Vec<Arc<ArgmaxSlot>>,
+    /// This step's [`Deferral`], set by `execute_model` for
+    /// `forward_argmax_blocking` to commit the target forward under; `None`
+    /// for a step the host waits for.
+    deferral: Option<Deferral>,
+    /// The deferred forward `forward_argmax_blocking` committed, back for
+    /// `execute_model`.
+    committed: Option<(InFlight, Arc<ArgmaxSlot>)>,
+    /// Steps committed without waiting for them, oldest first.
+    in_flight: std::collections::VecDeque<InFlightStep>,
     /// Per-request grammar FSM state for constrained / guided decoding
     /// (`guided_grammar` / `response_format`). Keyed by req_id; created
     /// the first time a request with a grammar is scheduled and dropped
@@ -783,8 +795,10 @@ impl MetalWorker {
             sampler_logits: None,
             pending_sampler: None,
             fused_sampled: None,
-            argmax_out: None,
-            argmax_consts: None,
+            argmax_slots: Vec::new(),
+            deferral: None,
+            committed: None,
+            in_flight: std::collections::VecDeque::new(),
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -1138,6 +1152,45 @@ impl MetalWorker {
                     .expect("newCommandQueue for draft_queue returned nil"),
             );
             info!("ScratchyWorker(metal): allocated dedicated draft MTLCommandQueue");
+        }
+        Ok(())
+    }
+
+    /// Whether this step can be committed without waiting for it: its rows
+    /// sample by greedy argmax alone, so nothing on the host needs its tokens
+    /// before the next step is queued. Sampling, grammar, speculative
+    /// decoding, pooling, multimodal input and a draft model all do.
+    fn deferrable(&self, sched: &SchedulerOutput) -> bool {
+        #[cfg(feature = "guided-decoding")]
+        let constrained = |req_id: &String| self.grammar_states.contains_key(req_id);
+        #[cfg(not(feature = "guided-decoding"))]
+        let constrained = |_: &String| false;
+        sched.total_num_scheduled_tokens > 0
+            && self.input_batch.num_active() > 0
+            && sched.scheduled_spec_decode_tokens.is_empty()
+            && !self.config.is_pooling
+            && self.draft_model.is_none()
+            && sched.num_scheduled_tokens.keys().all(|req_id| {
+                self.sampling_params_map
+                    .get(req_id)
+                    .is_none_or(SamplingParams::is_greedy)
+                    && !self.mm_data_buffers.contains_key(req_id)
+                    && !constrained(req_id)
+            })
+    }
+
+    /// Wait for the oldest step still on the device and append the tokens it
+    /// sampled to its requests' histories.
+    fn resolve_oldest(&mut self) -> ExecutorResult<()> {
+        let step = self.in_flight.pop_front().expect("a step in flight");
+        let tokens = sampled(
+            &step.done,
+            &step.argmax,
+            step.rows.iter().map(|&(_, row)| row),
+        )
+        .map_err(|e| ExecutorError::WorkerExecution(format!("deferred forward: {e}")))?;
+        for ((req_id, _), token) in step.rows.iter().zip(tokens) {
+            self.input_batch.resolve(req_id, token);
         }
         Ok(())
     }
@@ -1644,6 +1697,7 @@ fn metal_chain_dispatch(
         gdn_is_fresh: None,
         has_spec_tokens: false,
         last_token_indices: None,
+        deferred: None,
     };
 
     // SAFETY: kernel refs survive the synchronous call below.
@@ -2017,6 +2071,13 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             })
             .collect();
 
+        // A step `execute_model` defers: the target forward is committed
+        // without waiting for it.
+        let mut deferral = if matches!(model, ModelHandle::TARGET) {
+            self.deferral.take()
+        } else {
+            None
+        };
         let ctx = scratchy_target_metal::ForwardCtx {
             input_ids: view_input_ids,
             positions: view_positions,
@@ -2055,6 +2116,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             gdn_is_fresh: view_gdn_is_fresh,
             has_spec_tokens: req.has_spec_tokens,
             last_token_indices: view_last_token_indices,
+            deferred: deferral.as_ref(),
         };
 
         // ── 4. Fused argmax via forward_with_metal_followup. ─────────────
@@ -2063,17 +2125,14 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // one host wait. Pre-6a took the unfused path (separate dispatch
         // + commit + wait + readback) for 5.2a simplicity; this re-folds
         // it. Per call: 2 commit+waits → 1.
-        let grew = reserve_pinned(
-            &mut self.argmax_out,
+        let argmax = free_argmax_slot(
+            &mut self.argmax_slots,
             &mtl_device,
             &residency,
-            req.num_tokens.max(1) * 4,
-        ) | reserve_pinned(&mut self.argmax_consts, &mtl_device, &residency, 4);
-        if grew {
-            residency.commit();
-        }
-        let argmax_out = (**self.argmax_out.as_ref().expect("reserved above")).clone();
-        let consts_buf = (**self.argmax_consts.as_ref().expect("reserved above")).clone();
+            req.num_tokens,
+        );
+        let argmax_out = (*argmax.out).clone();
+        let consts_buf = (*argmax.consts).clone();
         let arg_table = {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
             let desc = MTL4ArgumentTableDescriptor::new();
@@ -2264,6 +2323,13 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             )
         };
         let _ = logits; // argmax_out is what we read
+        if let Some(deferral) = deferral.as_mut() {
+            let in_flight = deferral.take_in_flight().ok_or_else(|| {
+                BackendError::Backend("a deferred forward returned uncommitted".into())
+            })?;
+            self.committed = Some((in_flight, argmax));
+            return Ok(Vec::new());
+        }
 
         // ── 5. Read host-visible argmax buffer + return. ─────────────────
         let argmax_slice: &[u32] = unsafe {
@@ -2541,10 +2607,79 @@ impl Drop for ResidencyPanicGuard {
     }
 }
 
+/// One step's greedy argmax: its output, a token per row, and the row count it reads.
+#[cfg(feature = "metal")]
+struct ArgmaxSlot {
+    out: scratchy_target_metal::residency::Pinned,
+    consts: scratchy_target_metal::residency::Pinned,
+}
+
+// SAFETY: as for `MetalWorker`, the markers objc2's buffers lack. The host reads `out` only once the
+// step that writes it is done (`InFlight::wait`), and writes `consts` only while no step reads it.
+#[cfg(feature = "metal")]
+unsafe impl Send for ArgmaxSlot {}
+#[cfg(feature = "metal")]
+unsafe impl Sync for ArgmaxSlot {}
+
+/// One of `slots` nothing else holds, with room for `rows` tokens — grown, or added, if none has.
+#[cfg(feature = "metal")]
+fn free_argmax_slot(
+    slots: &mut Vec<Arc<ArgmaxSlot>>,
+    device: &scratchy_target_metal::mtl4_dispatch::Device,
+    residency: &scratchy_target_metal::residency::MetalResidencySet,
+    rows: usize,
+) -> Arc<ArgmaxSlot> {
+    let bytes = rows.max(1) * size_of::<u32>();
+    let free = slots.iter().position(|s| Arc::strong_count(s) == 1);
+    if let Some(i) = free.filter(|&i| slots[i].out.length() >= bytes) {
+        return Arc::clone(&slots[i]);
+    }
+    let pin = |bytes| {
+        residency.pin(scratchy_target_metal::mtl4_dispatch::shared_zeroed(
+            device, bytes,
+        ))
+    };
+    let slot = Arc::new(ArgmaxSlot {
+        out: pin(bytes),
+        consts: pin(size_of::<u32>()),
+    });
+    match free {
+        Some(i) => slots[i] = Arc::clone(&slot),
+        None => slots.push(Arc::clone(&slot)),
+    }
+    residency.commit();
+    slot
+}
+
+/// A step committed without waiting for it: the tokens its rows sampled are on the device until it is
+/// resolved.
+#[cfg(feature = "metal")]
+struct InFlightStep {
+    done: Arc<InFlight>,
+    argmax: Arc<ArgmaxSlot>,
+    /// `(request, argmax row)` of each row that samples a token.
+    rows: Vec<(String, usize)>,
+}
+
+/// The tokens at `rows` of a step's argmax, once its command buffer is done.
+#[cfg(feature = "metal")]
+fn sampled(
+    done: &InFlight,
+    argmax: &ArgmaxSlot,
+    rows: impl Iterator<Item = usize>,
+) -> Result<Vec<u32>, ForwardError> {
+    done.wait()?;
+    let out: Vec<u32> = scratchy_target_metal::mtl4_dispatch::read_slice(
+        &argmax.out,
+        argmax.out.length() / size_of::<u32>(),
+    );
+    Ok(rows.map(|row| out[row]).collect())
+}
+
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
 /// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
 /// `residency` needs a commit before the next command buffer.
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", feature = "guided-decoding"))]
 fn reserve_pinned(
     slot: &mut Option<scratchy_target_metal::residency::Pinned>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
@@ -3646,6 +3781,15 @@ impl Worker for MetalWorker {
             }
         }
 
+        // ── 3. Steps still on the device ──────────────────────────
+        // A step that reads the newest one's tokens on the device leaves that
+        // one in flight; any other step — and an idle batch, whose KV may
+        // shrink — needs every token on the host first.
+        let deferrable = self.deferrable(scheduler_output);
+        while self.in_flight.len() > usize::from(deferrable) {
+            self.resolve_oldest()?;
+        }
+
         #[cfg(feature = "metal")]
         if self.input_batch.num_active() == 0 {
             // Reactive KV (2c): batch fully idle → no live blocks. Defer the
@@ -3676,6 +3820,36 @@ impl Worker for MetalWorker {
         // `num_tokens` IS `total_num_scheduled_tokens` — within the budget the
         // engine sized to the largest resident bucket.
         let mut prepared = self.input_batch.prepare_inputs(scheduler_output);
+        // A deferred step reads each token still on the device from the step
+        // that samples it, the newest one in flight.
+        self.deferral = deferrable.then(|| {
+            Deferral::new(
+                prepared
+                    .pending
+                    .iter()
+                    .map(|input| {
+                        let step = self
+                            .in_flight
+                            .back()
+                            .expect("an in-flight token has a step");
+                        let (_, row) = step
+                            .rows
+                            .iter()
+                            .find(|(req_id, _)| *req_id == input.req_id)
+                            .expect("an in-flight token is its request's row in the newest step");
+                        DeviceInput {
+                            src: (*step.argmax.out).clone(),
+                            offset: row * size_of::<u32>(),
+                            flat_index: input.flat_index,
+                        }
+                    })
+                    .collect(),
+            )
+        });
+        assert!(
+            deferrable || prepared.pending.is_empty(),
+            "a step the host waits for has every token on the host"
+        );
         let attn = &prepared.attn_meta;
         let num_tokens = attn.total_tokens;
         let num_reqs = attn.num_reqs;
@@ -4367,6 +4541,7 @@ impl Worker for MetalWorker {
                             gdn_is_fresh: None,
                             has_spec_tokens: false,
                             last_token_indices: None,
+                            deferred: None,
                         };
                         let logits = unsafe {
                             dm.forward(
@@ -4550,6 +4725,35 @@ impl Worker for MetalWorker {
                     })?
             }
         };
+        // A deferred step: its tokens stay on the device until the engine, and
+        // the next step but one, wait for them.
+        if let Some((done, argmax)) = self.committed.take() {
+            self.sampler_logits = None;
+            let mut rows = Vec::with_capacity(num_reqs);
+            for (i, req_id) in req_ids_in_order.iter().enumerate() {
+                if prepared.req_inputs[i].emits_token {
+                    self.input_batch.commit_in_flight(req_id, q_lens[i]);
+                    rows.push((req_id.clone(), sample_indices[i] as usize));
+                } else {
+                    self.input_batch.commit_step(req_id, &[], q_lens[i], false);
+                }
+            }
+            let step = InFlightStep {
+                done: Arc::new(done),
+                argmax,
+                rows,
+            };
+            let (done, argmax) = (Arc::clone(&step.done), Arc::clone(&step.argmax));
+            let rows: Vec<usize> = step.rows.iter().map(|&(_, row)| row).collect();
+            let output = ModelRunnerOutput::deferred(
+                step.rows.iter().map(|(req_id, _)| req_id.clone()).collect(),
+                Box::new(move || {
+                    sampled(&done, &argmax, rows.into_iter()).map_err(|e| e.to_string())
+                }),
+            );
+            self.in_flight.push_back(step);
+            return Ok(output);
+        }
         let total_n = argmax_vec.len() as u32;
         let argmax_slice: &[u32] = &argmax_vec;
 
@@ -4837,6 +5041,13 @@ impl Worker for MetalWorker {
 
     fn shutdown(&mut self) {
         self.is_shutdown = true;
+        // A step committed without waiting for it finishes before what it reads
+        // is released.
+        for step in self.in_flight.drain(..) {
+            if let Err(e) = step.done.wait() {
+                tracing::warn!("deferred forward failed at shutdown: {e}");
+            }
+        }
         // Drain any in-flight aligned-sidecar writer FIRST, while the
         // source buffers it reads are still alive on `self`. The writer
         // is detached, so on a short `scr chat -q` run the process would
@@ -4865,8 +5076,7 @@ impl Worker for MetalWorker {
         self.kv_cache = None; // drops the file-backed store(s) → Drop msyncs their codes
         self.model = None;
         self.argmax_kernels = None;
-        self.argmax_out = None;
-        self.argmax_consts = None;
+        self.argmax_slots.clear();
         #[cfg(feature = "guided-decoding")]
         {
             self.grammar_mask_kernels = None;

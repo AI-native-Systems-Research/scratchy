@@ -341,7 +341,7 @@ impl InprocClient {
         let mut prev_outputs: StepOutputs = HashMap::new();
         let mut had_prev = false;
         if let Some((prev_sched, mut prev_output)) = pipeline.deferred.take() {
-            prev_output.resolve();
+            prev_output.resolve().map_err(EngineError::Executor)?;
             prev_outputs = engine.finalize_step(&prev_sched, &prev_output);
             had_prev = true;
         }

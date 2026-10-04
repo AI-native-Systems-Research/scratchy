@@ -118,6 +118,9 @@ pub struct ForwardCtx<'a> {
     /// `num_seqs < num_tokens` so the lm_head GEMM gathers before the matmul;
     /// `None` at decode or when not built by the worker.
     pub last_token_indices: Option<TensorView<'a>>,
+    /// `Some`: the host does not wait for this forward
+    /// ([`crate::interpreter::metal::Deferral`]).
+    pub deferred: Option<&'a crate::interpreter::metal::Deferral>,
 }
 
 // `EmbedPatch` (the multimodal embed-splice descriptor) is a cfg-free type in

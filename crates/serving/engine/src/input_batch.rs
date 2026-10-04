@@ -96,6 +96,9 @@ per_slot_fields! {
     prompt: Vec<u32>,
     /// Everything sampled since, in order. `prompt ++ generated` is the token history.
     generated: Vec<u32>,
+    /// Tokens sampled by steps still on the device: they follow `prompt ++ generated`, and a step
+    /// that reads one takes it from the device ([`PendingInput`]) until [`InputBatch::resolve`].
+    in_flight: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +141,8 @@ pub struct InputBatch {
     /// every step reads its chunk from, and the samplers their seed position (and metal its penalty
     /// histories) — and [`Self::token_at`] is the one place the boundary arithmetic lives.
     generated: Vec<Vec<u32>>,
+    /// Per slot, the tokens sampled by steps still on the device, which follow `generated`.
+    in_flight: Vec<usize>,
 
     // --- Reusable per-step buffers (cleared + refilled each step) ---
     flat_token_ids: Vec<u32>,
@@ -173,6 +178,7 @@ impl InputBatch {
             sliding_groups: Vec::new(),
             prompt: Vec::new(),
             generated: Vec::new(),
+            in_flight: Vec::new(),
             flat_token_ids: Vec::new(),
             flat_positions: Vec::new(),
             step_rows: Vec::new(),
@@ -260,6 +266,7 @@ impl InputBatch {
             sliding_groups,
             prompt: prompt.to_vec(),
             generated: Vec::new(),
+            in_flight: 0,
         });
     }
 
@@ -443,6 +450,7 @@ impl InputBatch {
         is_prefill_vec.clear();
         let mut batch_req_ids = std::mem::take(&mut self.req_ids_buf);
         batch_req_ids.clear();
+        let mut pending = Vec::new();
 
         let mut offset = 0usize;
 
@@ -456,14 +464,29 @@ impl InputBatch {
             let (prompt, generated) = (&self.prompt[slot], &self.generated[slot]);
             let end = num_computed + num_real;
             let token_start = self.flat_token_ids.len();
-            // `prompt ++ generated` over `num_computed..end`, split at the prompt boundary. An index
-            // past the history panics: that chunk was never this batch's to run.
+            // `prompt ++ generated` over `num_computed..end`, split at the prompt boundary; past the
+            // known history, the in-flight tokens, which the device fills in. An index past those
+            // panics: that chunk was never this batch's to run.
+            let known = prompt.len() + generated.len();
+            assert!(
+                end <= known + self.in_flight[slot],
+                "{req_id}: chunk ends at {end}, past its {known} known and {} in-flight tokens",
+                self.in_flight[slot]
+            );
             let in_prompt = num_computed.min(prompt.len())..end.min(prompt.len());
-            let in_generated =
-                num_computed.max(prompt.len()) - prompt.len()..end.max(prompt.len()) - prompt.len();
+            let in_generated = num_computed.clamp(prompt.len(), known) - prompt.len()
+                ..end.clamp(prompt.len(), known) - prompt.len();
             self.flat_token_ids.extend_from_slice(&prompt[in_prompt]);
             self.flat_token_ids
                 .extend_from_slice(&generated[in_generated]);
+            for position in num_computed.max(known)..end {
+                pending.push(PendingInput {
+                    flat_index: self.flat_token_ids.len(),
+                    req_id: req_id.clone(),
+                    position,
+                });
+                self.flat_token_ids.push(0);
+            }
             self.flat_token_ids.extend_from_slice(drafts);
             self.flat_positions
                 .extend(num_computed as u32..(num_computed + num_scheduled) as u32);
@@ -482,7 +505,7 @@ impl InputBatch {
                 spec_token_ids: drafts.to_vec(),
                 // A chunk that stops short of the end of the history (a prefill chunk, or a resume
                 // re-prefilling what it had generated) samples nothing — Python's discard mask.
-                emits_token: end >= prompt.len() + generated.len(),
+                emits_token: end >= known + self.in_flight[slot],
             });
             self.tokens_in_pool[slot] = num_computed;
             offset += num_scheduled;
@@ -529,6 +552,7 @@ impl InputBatch {
             flat_token_ids: std::mem::take(&mut self.flat_token_ids),
             flat_positions: std::mem::take(&mut self.flat_positions),
             attn_meta,
+            pending,
         }
     }
 
@@ -557,6 +581,29 @@ impl InputBatch {
             input_token_count
         };
         self.generated[slot].extend_from_slice(sampled_tokens);
+    }
+
+    /// Commit a step that emitted one token the host does not have yet: advance the pool cursor past
+    /// its `input_token_count` tokens, and count its token in flight until [`Self::resolve`].
+    pub fn commit_in_flight(&mut self, req_id: &str, input_token_count: usize) {
+        let Some(&slot) = self.req_id_to_slot.get(req_id) else {
+            return;
+        };
+        self.tokens_in_pool[slot] += input_token_count;
+        self.in_flight[slot] += 1;
+    }
+
+    /// The oldest in-flight token of `req_id`, now on the host: append it to the history.
+    pub fn resolve(&mut self, req_id: &str, token: u32) {
+        let Some(&slot) = self.req_id_to_slot.get(req_id) else {
+            return;
+        };
+        assert!(
+            self.in_flight[slot] > 0,
+            "{req_id}: resolved a token it had no step in flight for"
+        );
+        self.in_flight[slot] -= 1;
+        self.generated[slot].push(token);
     }
 
     /// Where this request's prompt ends — the position sampling starts at. DERIVED, never stored.
@@ -642,6 +689,19 @@ pub struct PreparedInputs {
     pub flat_positions: Vec<u32>,
     /// Attention metadata (also owns block_ids and tokens_before).
     pub attn_meta: AttentionMetadata,
+    /// The input tokens still on the device, in flat order: their `flat_token_ids` entries are 0
+    /// until the device writes each from the step that sampled it.
+    pub pending: Vec<PendingInput>,
+}
+
+/// One input token a step reads before the host has it: sampled by a step still on the device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingInput {
+    /// Its index in `flat_token_ids`.
+    pub flat_index: usize,
+    pub req_id: String,
+    /// Its position in the request's `prompt ++ generated`.
+    pub position: usize,
 }
 
 /// Per-request slice info within the flat tensors.
@@ -1154,6 +1214,60 @@ mod tests {
         assert_eq!(prepared.req_inputs[0].token_count, 1);
         assert!(!prepared.attn_meta.is_prefill[0]);
         assert_eq!(prepared.attn_meta.tokens_before[0], 3);
+    }
+
+    /// A decode step whose input token is still on the device packs a placeholder the device fills,
+    /// emits, and leaves the history to the resolve — which appends tokens in the order they came.
+    #[test]
+    fn an_in_flight_token_is_a_pending_input_until_it_resolves() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20], vec![0], 0);
+        let p = batch.prepare_inputs(&step(&[("r1", 0, 2)]));
+        assert!(p.pending.is_empty() && p.req_inputs[0].emits_token);
+        batch.reclaim_buffers(p);
+        batch.commit_in_flight("r1", 2);
+
+        // Position 2 is the prefill's token, still on the device.
+        let p = batch.prepare_inputs(&step(&[("r1", 2, 1)]));
+        let at_2 = PendingInput {
+            flat_index: 0,
+            req_id: "r1".into(),
+            position: 2,
+        };
+        assert_eq!(
+            (p.flat_token_ids.clone(), p.pending.clone()),
+            (vec![0], vec![at_2])
+        );
+        assert!(p.req_inputs[0].emits_token);
+        assert_eq!(p.flat_positions, vec![2]);
+        batch.reclaim_buffers(p);
+        batch.commit_in_flight("r1", 1);
+
+        // Two in flight; the next step reads only the newer one, at position 3.
+        let p = batch.prepare_inputs(&step(&[("r1", 3, 1)]));
+        assert_eq!(
+            p.pending.iter().map(|x| x.position).collect::<Vec<_>>(),
+            vec![3]
+        );
+        batch.reclaim_buffers(p);
+        batch.resolve("r1", 30);
+        batch.resolve("r1", 40);
+        assert_eq!(batch.history("r1"), (&[10u32, 20][..], &[30u32, 40][..]));
+        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+
+        // Resolved, the same step reads its token from the history.
+        let p = batch.prepare_inputs(&step(&[("r1", 3, 1)]));
+        assert_eq!((p.flat_token_ids.clone(), p.pending.len()), (vec![40], 0));
+    }
+
+    /// A chunk past the in-flight tokens too was never this batch's to run.
+    #[test]
+    #[should_panic(expected = "in-flight tokens")]
+    fn a_chunk_past_the_in_flight_tokens_panics() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20], vec![0], 0);
+        batch.commit_in_flight("r1", 2);
+        let _ = batch.prepare_inputs(&step(&[("r1", 3, 1)]));
     }
 
     #[test]
