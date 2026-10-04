@@ -405,6 +405,14 @@ pub struct Output {
 /// (latency tracking is an optional add-on, see `latency.rs`). Cores are driven
 /// by the comm scheduler (`comm_sched`), so cross-core collectives work; cores
 /// with no comm op just run their body to completion against shared HBM.
+///
+/// `optimizer`-gated because the fresh-context drivers that call it
+/// (`program`, `resident`, `segmented`, `resident_runner`) are themselves
+/// `optimizer`-gated (see `lib.rs`); a consumer without the feature (e.g.
+/// `triton-numeric`, `default-features = false`) reaches the interpreter only
+/// through the `pub` entry points below (`execute_function_with_latency`,
+/// `execute_function_in`, ...).
+#[cfg(feature = "optimizer")]
 pub(crate) fn execute_function(
     func: &IRFunction<'static>,
     args: &[(Ssa, Arg)],
@@ -417,6 +425,7 @@ pub(crate) fn execute_function(
 /// weight pointers as args; reading them all back decodes ~hundreds of MB of
 /// unchanged f16 for nothing. Pass just the real outputs (e.g. the result ptr)
 /// to cut that waste.
+#[cfg(feature = "optimizer")]
 pub(crate) fn execute_function_outputs(
     func: &IRFunction<'static>,
     args: &[(Ssa, Arg)],
@@ -426,6 +435,7 @@ pub(crate) fn execute_function_outputs(
     execute_function_filtered(func, args, Some(&wanted))
 }
 
+#[cfg(feature = "optimizer")]
 fn execute_function_filtered(
     func: &IRFunction<'static>,
     args: &[(Ssa, Arg)],
@@ -516,6 +526,7 @@ pub fn execute_function_in(
 /// them directly — so decoding each segment's outputs to host tiles every pass is
 /// pure discarded work (the caller did `let _ =` on the result). Skipping it
 /// removes ~one output-tile decode + alloc + copy per segment per pass.
+#[cfg(feature = "optimizer")]
 pub(crate) fn execute_function_in_exec_only(
     mem: &SpyreMemoryHierarchy,
     ops: &[Operation<'static>],
@@ -761,7 +772,7 @@ fn marshal_inputs(
 /// match the f32/`execute_function` path to f16 tolerance (only the GEMM
 /// accumulation order differs). Kept opt-in for now while the lockstep executor
 /// is young; it is precision-faithful, not a lossy mode.
-#[cfg(metal)]
+#[cfg(all(feature = "optimizer", metal))]
 pub(crate) fn execute_function_gpu(
     func: &IRFunction<'static>,
     args: &[(Ssa, Arg)],
@@ -860,7 +871,7 @@ pub(crate) fn execute_function_gpu(
 /// weight operand B is identical: stack the per-core A panels into one tall
 /// GEMM, run it zero-copy on NAX, and scatter the row-blocks back. Returns
 /// `Ok(true)` if combined, `Ok(false)` to fall back to per-core execution.
-#[cfg(metal)]
+#[cfg(all(feature = "optimizer", metal))]
 fn try_combine_matmul(
     op: &Operation<'static>,
     ctxs: &mut [CoreContext],
