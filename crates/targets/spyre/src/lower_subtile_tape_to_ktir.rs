@@ -408,7 +408,99 @@ fn lower_rmsnorm_unit_node<F: RopeForm>(
     Ok(vec![e])
 }
 
-/// Lower a [`SubOp::TanhSoftCap`] — `out = cap · tanh(x / cap)`, the gemma
+/// Lower a [`SubOp::RouterNorm`] — the router's own pre-norm `rmsnorm(x, router.scale)`.
+///
+/// ⭐ THIS IS `lower_rmsnorm_node`'s COMPUTATION, VERBATIM. The router's gain is a
+/// dense `[1, hidden]` row the host stages like every other norm gain (the loader
+/// took it from `router.scale` and the front end bound it as operand 1), and the
+/// op differs from a layer's post-attention norm in NOTHING the device sees: two
+/// operands (`x`, `gain`), one shape-preserving output, an epsilon. Gemma's router
+/// gain is the SCALE convention (the loader stores `router.scale` verbatim, no
+/// `+1`), which is the one [`Program::RmsNorm`] multiplies by — so the program and
+/// the door arm are that node's own, unmodified.
+fn lower_router_norm_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    eps: f32,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "RouterNorm t{} expects 2 inputs (x, router), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routernorm_s{}", node.id.index()));
+    st.rmsnorm(&node.inputs[0], &node.inputs[1], &node.output, eps);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RmsNorm);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::RouterLogits`] — `x · W_router`, the router's dense `[m, experts]`
+/// projection.
+///
+/// ⭐ THIS IS `lower_matmul_node`'s COMPUTATION, VERBATIM. The router gate is a dense
+/// weight the loader staged `[hidden, experts]` (the FUF `[k, n]` convention, no
+/// transpose), exactly the form every dense `MatmulTile` reads; the op differs from a
+/// layer projection in nothing the device sees. Two operands — the fp16 contraction,
+/// not W8A8: the router weights are staged dense bf16 (they are `[128, 2816]`, ~1% of
+/// an expert bank's footprint, and quantizing them would change the routing decision
+/// every expert downstream consumes).
+fn lower_router_logits_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "RouterLogits t{} expects 2 inputs (x, router), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    // The REFUSAL half of `lower_matmul_node`, same reason: it is the one place a
+    // malformed node is refused before a program is built, and this node's dims are
+    // built from exactly the regions `KtirFunc::matmul` reads itself.
+    crate::subtile_tape_to_tile_ir::node_to_single_tile_op(node).map_err(SuperDscError)?;
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routerlogits_s{}", node.id.index()));
+    st.matmul(&node.inputs[0], &node.inputs[1], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::Matmul);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::RouteScale`] — scores times the softmax temperature, a
+/// shape-preserving constant multiply.
+///
+/// ⭐ THIS IS `lower_scalarmul_node`'s COMPUTATION, VERBATIM — the scale is a
+/// compile-time constant the tape carries (gemma's `hidden^-0.5`), so the program
+/// splats it and multiplies, and the door resolves the `[1,1]` registry slot by the
+/// value the splat states. The scores are `[m, experts]`-wide, far inside the LX
+/// bound, so the whole-region path always runs.
+fn lower_route_scale_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    scale: f32,
+    sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "RouteScale t{} expects 1 input (scores), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    lower_scalarmul_node(node, ir, scale, sym_id_base)
+        .map(|e| vec![e])
+        .map_err(|e| e)
+}
+
 /// final-logit soft cap. One input (the logits), shape-preserving, and the cap
 /// is the model constant `final_logit_softcapping` the tape now carries.
 ///
@@ -1185,8 +1277,120 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::VarlenAttention { .. }
         | SubOp::EncoderAttn { .. }
         | SubOp::GatedDeltaNet
-        | scratchy_subtile::expansion_ops!()
+        // The KV codec and sampled-rows expansions — still the blanket refusal; the
+        // MoE rows above were split out only because the router side is now lowered.
+        | SubOp::KvEncode { .. }
+        | SubOp::KvStage { .. }
+        | SubOp::RotateRows { .. }
+        | SubOp::AttnPackedKv
+        | SubOp::SampleRowsGather
+        | SubOp::SampleRowsScatter
+        | SubOp::AllRowsMatmul
         | SubOp::Mean => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        // ── THE ROUTER SIDE OF A MoE BLOCK, as decompositions of the programs this
+        // emitter already ships. Every op here is a DENSE computation over `[m, ·]`
+        // activation tiles — nothing about the router is expert-conditional — so each
+        // one is exactly the rmsnorm / matmul / scalar-multiply / row-softmax chain
+        // some dense model already lowers, and the producers below say which. The
+        // EXPERT side (Sort/Matmul/GatedAct/Unsort/Combine) stays `Unhandled`: those
+        // ops are pair-row permutations no dense program states, and binding them is
+        // the topk/gather vocabulary the vendor `topk.ddl` ops carry — a separate
+        // worklist item, refused by name until then.
+        SubOp::RouterNorm { eps, .. } => {
+            match lower_router_norm_node(node, ir, *eps, sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
+        SubOp::RouterLogits { .. } => match lower_router_logits_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        SubOp::RouteScale { scale } => match lower_route_scale_node(node, ir, *scale, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        // ⛔⭐ ROUTE-SOFTMAX IS A ROW-SOFTMAX OVER `[m, experts]` — and a softmax is
+        // `exp(x - rowmax) / rowsum(exp(x - rowmax))`, a chain the DENSE vocabulary
+        // already lowered for attention. But the emulated program must match what
+        // runs on card BIT-IDENTICALLY at the parity fixture, and the softmax here
+        // is over the ROUTER scores whose scale and renorm ops run around it — the
+        // fixture's oracle would need the whole router chain. Refused BY NAME
+        // until the router chain is verified end to end on card.
+        SubOp::RouteSoftmax | SubOp::RouteRenorm => Unhandled(format!(
+            "SubOp::RouteSoftmax/RouteRenorm t{} (a row softmax/renorm over the router scores) has \
+             no SuperDSC lowering yet: the chain is exp → row-max → sub → exp → row-sum → div, the \
+             attention-softmax decomposition, but the ROUTER version has never run on card and \
+             refusing it here keeps the parity fixtures honest about what is lowerable. The port \
+             source is the attention softmax's KtirFunc chain plus vendor topk.ddl's \
+             topkindex/topkvalue for the argsort that follows.",
+            node.output.tensor.index() as u32,
+        )),
+        // ── THE REMAINING EXPANSION OPS, each refused BY NAME with its own port
+        // source — the `expansion_ops!()` blanket left this list, so every op the
+        // router-side decompositions above do not cover states what it needs.
+        SubOp::RouteArgsort => Unhandled(format!(
+            "SubOp::RouteArgsort t{} (each row's expert indices sorted by ascending score) has no \
+             SuperDSC lowering yet: it is the vendor `topk.ddl` `topkindex` op (SFP unit, k-dim \
+             worksplit across cores, internal state regs) — a new OpFunc binding plus a typed \
+             emitter, not a decomposition of a dense program.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::RouteTopK { .. } => Unhandled(format!(
+            "SubOp::RouteTopK t{} (the last k sorted indices of each row — its top-k experts) has \
+             no SuperDSC lowering yet: it is a k-wide slice of `topk.ddl`'s `topkindex` output, \
+             which the emitter reads once the argsort above runs on card.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::RouteGatherScores => Unhandled(format!(
+            "SubOp::RouteGatherScores t{} (the scores at the chosen indices, `[m, k]`) has no \
+             SuperDSC lowering yet: it is a row-wise gather by the top-k index tensor — the \
+             `indirectAccessIndexLabeledDs` + linked-index vocabulary of the paged KV gather, \
+             pointed at the score rows instead of a KV plane.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::RouteExpertScale { .. } => Unhandled(format!(
+            "SubOp::RouteExpertScale t{} (each score times its expert's learned scale) has no \
+             SuperDSC lowering yet: it is the RouteGatherScores gather reading `router.\
+             per_expert_scale` instead of the scores, then a pointwise mul — blocked on the same \
+             index-gather binding.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::ExpertSort { .. } => Unhandled(format!(
+            "SubOp::ExpertSort t{} (the (token, expert) pair rows, ordered by expert) has no \
+             SuperDSC lowering yet: it is a data-dependent row permutation — the vendor \
+             `topk.ddl` sort/mask vocabulary over pair rows, plus the pair-row layout `[m, k·w]` \
+             the target must derive from the registered `[m]` row count.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::ExpertMatmul { .. } => Unhandled(format!(
+            "SubOp::ExpertMatmul t{} (one projection of each pair's expert, over the stacked \
+             `[E·out, in]` weight bank) has no SuperDSC lowering yet: the contraction itself is \
+             `KtirFunc::matmul_fp8` over the pair rows, but the weight ROW each pair reads is \
+             selected by its expert index — an indexed operand the dense matmul's fixed region \
+             does not state. Needs the gather-bound weight binding (the paged-KV gather \
+             vocabulary) before the program can be minted.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::ExpertGatedAct { .. } => Unhandled(format!(
+            "SubOp::ExpertGatedAct t{} (`act(gate) · up` over the pair rows) has no SuperDSC \
+             lowering yet: it is `KtirFunc::silu_mul`'s computation with a Gelu act — the gelu \
+             variant of the shipped SiluMul program — over the pair-row layout.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::ExpertUnsort => Unhandled(format!(
+            "SubOp::ExpertUnsort t{} (the pair rows back in token order) has no SuperDSC \
+             lowering yet: it is ExpertSort's inverse permutation — the same vendor sort/mask \
+             vocabulary with the routing read backwards.",
+            node.output.tensor.index() as u32,
+        )),
+        SubOp::ExpertCombine { .. } => Unhandled(format!(
+            "SubOp::ExpertCombine t{} (each token's pair rows summed by its scores, `[m, hidden]`) \
+             has no SuperDSC lowering yet: it is a k-way weighted row sum — a segment reduce over \
+             the pair rows, gated on the same pair-row layout and routing the sort/unsort pair \
+             carries.",
+            node.output.tensor.index() as u32,
+        )),
         SubOp::Reshape { .. } => match lower_reshape_node(node, ir, sym_id_base) {
             Ok(v) => Ops(v),
             Err(e) => Unhandled(e.0),
