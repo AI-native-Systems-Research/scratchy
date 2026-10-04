@@ -456,10 +456,6 @@ pub enum KernelId {
     /// place. Maps to `tq_{rotate,unrotate}_rows_{f16,bf16}` in
     /// `attention.metallib`.
     TqRotateRows,
-    /// TurboQuant: quantize a layer's newly-written KV (in the fp16 scratch)
-    /// into the PACKED store right after that layer's KV writer. Maps to
-    /// `tq_compress_paged[_bf16]` in `turboquant.metallib`.
-    TqQuantizeToPacked,
     /// TurboQuant decode attention: `AttentionViaCache` reading the packed
     /// store directly in the codebook domain (function constant 13), so a
     /// decode step never dequantizes the context. Same symbol as
@@ -564,7 +560,6 @@ impl KernelId {
             | Self::MmEmbedSplice
             | Self::TqStageRotated
             | Self::TqRotateRows
-            | Self::TqQuantizeToPacked
             | Self::AttentionViaCacheTq => SeqScope::AllRows,
         }
     }
@@ -1242,7 +1237,7 @@ pub enum RuntimeBindingKind {
     VisionPositionIds,
     /// TurboQuant per-layer PACKED key/value code store (canonical KV, ~4.7x
     /// smaller than fp16). Source for `TqStageRotated` and
-    /// `AttentionViaCacheTq`, dest for `TqQuantizeToPacked`. Worker resolves
+    /// `AttentionViaCacheTq`, dest for an encoding KV writer. Worker resolves
     /// to `tq_packed_k/v[layer]`.
     TqPackedK {
         layer: LayerId,

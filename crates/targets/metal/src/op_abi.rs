@@ -213,6 +213,12 @@ pub const METAL_GUARD_GATES: GuardGates<Option<RuntimeGate>> = GuardGates {
     unless_codec_decode: Some(RuntimeGate::UnlessDecodeStep),
 };
 
+// `MetalFusion::KvEncoded` folds the codec's encodes into their KV writer, which runs ungated.
+const _: () = assert!(
+    METAL_GUARD_GATES.codec.is_none(),
+    "a gated encode cannot fold into its ungated writer"
+);
+
 // ── The MoE block ───────────────────────────────────────────────────
 
 /// Where a MoE step writes: a scratch region, over its operand's region (in place), or the arena.
@@ -298,6 +304,8 @@ pub enum MetalFusion {
     MoeGateUpAct,
     MoeDownCombine,
     MoeRoute,
+    /// A KV writer that encodes the rows it writes into the codec's packed store too.
+    KvEncoded,
 }
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
@@ -385,6 +393,12 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     kernel: F::MoeRoute,
                 },
             ],
+            // After the rope folds: it extends the writer command they made.
+            &[FoldPattern::Encoded {
+                writer: K::RopeAppend,
+                encode: K::KvEncode,
+                kernel: F::KvEncoded,
+            }],
         ],
     }
 };

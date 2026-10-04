@@ -26,6 +26,16 @@ pub use super::lowered::ActivationWidth;
 use super::ids::ArenaSlotIdx as Slot;
 use super::lowered::RuntimeGate;
 
+/// Where a KV writer puts the step's new K and V rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvWrite {
+    /// The paged pool.
+    Pool,
+    /// The pool, and the KV codec's packed store: the codec's encodes of the rows, folded into the
+    /// writer (`MetalFusion::KvEncoded`).
+    PoolAndPacked,
+}
+
 /// An `f32` field compared by bit pattern: two rows are equal iff they bake the same constant.
 macro_rules! f32_bits {
     ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
@@ -212,7 +222,8 @@ pub enum MetalStep {
     TanhSoftCap(Slot, Slot, ActivationWidth),
     /// `(delta, residual, width)`: `residual += delta`.
     Add(Slot, Slot, ActivationWidth),
-    /// `(q, k, v, q_out, k_out, v_out, layer, pairing, class, kv_offsets)`: rope + paged KV write.
+    /// `(q, k, v, q_out, k_out, v_out, layer, pairing, class, kv_offsets, write)`: rope + paged KV
+    /// write.
     RopeAppend(
         Slot,
         Slot,
@@ -224,9 +235,10 @@ pub enum MetalStep {
         RopeFormTag,
         AttnMask,
         KvOffsets,
+        KvWrite,
     ),
-    /// `(q, k, v, q_out, k_out, v_out, layer, pairing, class)`: [`MetalStep::RopeAppend`] with the
-    /// per-head q/k norms and the v unit norm folded in; in-slots are the raw projections.
+    /// `(q, k, v, q_out, k_out, v_out, layer, pairing, class, write)`: [`MetalStep::RopeAppend`]
+    /// with the per-head q/k norms and the v unit norm folded in; in-slots are the raw projections.
     RopeAppendNormed(
         Slot,
         Slot,
@@ -237,6 +249,7 @@ pub enum MetalStep {
         LayerId,
         RopeFormTag,
         AttnMask,
+        KvWrite,
     ),
     /// `(q, out, layer, pairing)`: decode attention over the paged cache.
     AttentionViaCache(Slot, Slot, LayerId, RopeFormTag),
@@ -268,9 +281,6 @@ pub enum MetalStep {
     GatedDeltaNet(Slot, Slot, Slot, Slot, Slot, LayerId),
     /// One step of a MoE block.
     Moe(MoeBlock, MoeStep),
-    /// `(operand, layer, offsets)`: a KV writer's new `operand` rows encoded into its layer's
-    /// packed store, the writer's `offsets` removed first. Its site is the writer's.
-    KvEncode(KvOperand, LayerId, KvOffsets),
     /// `(operand, layer, class, offsets)`: the layer's `operand` staged out of its packed store for
     /// an attention of `class`, the writer's `offsets` restored. Its site is the writer's.
     KvStage(KvOperand, LayerId, AttnMask, KvOffsets),
@@ -424,7 +434,6 @@ impl MetalStep {
             | S::RopeAppend(_, _, _, _, _, _, l, ..)
             | S::RopeAppendNormed(_, _, _, _, _, _, l, ..)
             | S::GatedDeltaNet(_, _, _, _, _, l)
-            | S::KvEncode(_, l, _)
             | S::KvStage(_, l, ..)
             | S::AttnPackedKv(_, _, l, ..)
             | S::SampleRows(

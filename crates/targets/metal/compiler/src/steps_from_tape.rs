@@ -79,7 +79,7 @@ pub enum Refused {
         rope: LayerId,
     },
     BiasUpstream(&'static str),
-    /// A fold member the folds kept (a Mean, Sub, Silu or query rotation on its own).
+    /// A fold member the folds kept (a Mean, Sub, Silu, query rotation or KV encode on its own).
     Escaped,
     /// A Mul whose activation no gated fold absorbed.
     NoGatedFold,
@@ -684,9 +684,9 @@ impl Recording<'_> {
         };
         let e = self.fused(w, f)?;
         let (layer, pairing, class, offsets) = match e.step {
-            MetalStep::RopeAppend(.., l, p, c, offsets) => (l, p, c, offsets),
+            MetalStep::RopeAppend(.., l, p, c, offsets, _) => (l, p, c, offsets),
             // Normed K/V: a norm adds nothing.
-            MetalStep::RopeAppendNormed(.., l, p, c) => (l, p, c, st::KvOffsets::CENTERED),
+            MetalStep::RopeAppendNormed(.., l, p, c, _) => (l, p, c, st::KvOffsets::CENTERED),
             _ => return Err(no()),
         };
         Ok((layer, pairing, class, offsets, e.sites))
@@ -936,7 +936,9 @@ impl Recording<'_> {
                     });
                 }
                 sites.push(self.rotary(i));
-                let step = MetalStep::RopeAppendNormed(q, k, v, q, k, v, layer, pairing, class);
+                let pool = st::KvWrite::Pool;
+                let step =
+                    MetalStep::RopeAppendNormed(q, k, v, q, k, v, layer, pairing, class, pool);
                 let mut e = em(step, &[q, k, v], &[q, k, v], sites);
                 e.sig.kv_w = Some(layer);
                 Ok(e)
@@ -1096,6 +1098,27 @@ impl Recording<'_> {
                 };
                 self.moe(i, MoeStep::Route(program), &[], &[], weight)
             }
+            // The writer's command — its earlier fold's, else its own — writing the packed store too.
+            (F::KvEncoded, Sh::Encoded { .. }) => {
+                let driven = self.folds.driven(self.steps.slot[i]);
+                let mut e = match driven.len().checked_sub(2).map(|b| &driven[b]) {
+                    Some(base) => self.fused(i, base)?,
+                    None => self
+                        .kept(i)?
+                        .ok_or_else(|| self.no(i, Refused::FusionShape))?,
+                };
+                let packed = st::KvWrite::PoolAndPacked;
+                e.step = match e.step {
+                    MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, p, c, o, _) => {
+                        MetalStep::RopeAppend(q, k, v, qo, ko, vo, l, p, c, o, packed)
+                    }
+                    MetalStep::RopeAppendNormed(q, k, v, qo, ko, vo, l, p, c, _) => {
+                        MetalStep::RopeAppendNormed(q, k, v, qo, ko, vo, l, p, c, packed)
+                    }
+                    _ => return Err(self.no(i, Refused::FusionShape)),
+                };
+                Ok(e)
+            }
             _ => Err(self.no(i, Refused::FusionShape)),
         }
     }
@@ -1121,7 +1144,8 @@ impl Recording<'_> {
         let (k_off, k_linear) = self.kv_offset(i, k_op, layer)?;
         let (v_off, v_linear) = self.kv_offset(i, v_op, layer)?;
         let offsets = st::KvOffsets { k: k_off, v: v_off };
-        let step = MetalStep::RopeAppend(q, k, v, q, k, v, layer, pairing, class, offsets);
+        let pool = st::KvWrite::Pool;
+        let step = MetalStep::RopeAppend(q, k, v, q, k, v, layer, pairing, class, offsets, pool);
         let sites = rope_append_weight_site(self.rotary(i), k_linear, v_linear);
         let mut e = em(step, &[q, k, v], &[q, k, v], sites);
         e.sig.kv_w = Some(layer);
@@ -1361,13 +1385,6 @@ impl Recording<'_> {
                 e
             }
             // The KV codec: each step's operands are its writer's, its site the writer's.
-            L::KvEncode { operand } => {
-                let (layer, _, _, offsets, sites) = self.codec_writer(i, i)?;
-                let mut e = em(S::KvEncode(operand, layer, offsets), &[], &[], sites);
-                // The layer's cache half in, its packed store out.
-                (e.sig.kv_r, e.sig.kv_w) = (Some(layer), Some(layer));
-                e
-            }
             L::KvStage { operand } => {
                 let (layer, _, class, offsets, sites) =
                     self.codec_writer(i, self.step_arg(i, 0)?)?;
@@ -1591,7 +1608,10 @@ impl Recording<'_> {
                     Vec::new(),
                 )
             }
-            L::Mean | L::Elementwise(E::Sub | E::Silu) | L::RopeRotate { .. } => {
+            L::Mean
+            | L::Elementwise(E::Sub | E::Silu)
+            | L::RopeRotate { .. }
+            | L::KvEncode { .. } => {
                 return Err(self.no(i, Refused::Escaped));
             }
             L::SumReduce { .. } | L::RmsNormReduce { .. } | L::RmsNormApply { .. } => {
