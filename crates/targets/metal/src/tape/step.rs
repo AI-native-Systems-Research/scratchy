@@ -208,6 +208,10 @@ pub enum MetalStep {
     FusedGateUpSiluMul(Slot, Slot, LayerId),
     /// `(in, out, layer)`: dense fused gate/up GEMM + `gelu(gate) * up`.
     FusedGateUpGeluMul(Slot, Slot, LayerId),
+    /// `(gate, act)`: one row's MLX-affine gate and up matvecs and `act(gate) * up`, written to
+    /// the gate matmul's output. The up projection has the gate's shape; its weight is the step's
+    /// second linear site.
+    AffineGatedQmv(AffineMatmul, GatedAct),
     /// `(gate, up, out, width)`: `silu(gate) * up`.
     SiluMul(Slot, Slot, Slot, IntermediateSize),
     /// `(gate, up, out)`: `gelu(gate) * up`.
@@ -426,6 +430,7 @@ impl MetalStep {
             | S::MetalBiasAdd(_, _, l, ..)
             | S::FusedGateUpSiluMul(_, _, l)
             | S::FusedGateUpGeluMul(_, _, l)
+            | S::AffineGatedQmv(AffineMatmul { layer: l, .. }, _)
             | S::AttentionViaCache(_, _, l, _)
             | S::SlidingAttentionViaCache(_, _, l, _)
             | S::AttentionPrefillPaged(_, _, l, _)

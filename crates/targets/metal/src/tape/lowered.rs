@@ -163,6 +163,10 @@ pub enum KernelId {
     /// Maps to `affine_qmv_<dtype>_gs_<gs>_b_4_batch_<batched>`.
     /// Faithful port of MLX's `affine_qmv` (`quantized.h:1548`).
     AffineQmv,
+    /// A dense gated MLP of one row: the gate and up matvecs (`AffineQmvFast` / `AffineQmv`'s)
+    /// and `act(gate) * up`, in one command. Maps to
+    /// `affine_qmv_gated[_fast]_<dtype>_s_<sdtype>_gs_<gs>_b_<bits>`.
+    AffineQmvGated,
     /// MLX-affine int4 small-M band matvec (`2 ≤ M < vector_limit`):
     /// each weight group dequantized once, reused across the
     /// threadgroup's `nv` input vectors. Maps to
@@ -510,6 +514,7 @@ impl KernelId {
             | Self::AffineQmvQuad
             | Self::AffineQmvFast
             | Self::AffineQmv
+            | Self::AffineQmvGated
             | Self::AffineQmvWide
             | Self::AffineQmmT
             | Self::AffineGatherQmmT
@@ -1828,6 +1833,9 @@ pub enum LoweringError {
     /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
     /// runs only on a TurboQuant model.
     CodecStepOnDenseModel,
+    /// A gated one-row matvec in a bucket of `bucket_m` rows: its kernel computes one row, and the
+    /// fold that makes it applies to the one-row bucket only.
+    GatedMatvecRows { bucket_m: u32 },
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
     /// offsets its kernels bind: the rung cannot exist for this tape.
     ScratchTooLarge {
@@ -1892,6 +1900,10 @@ impl std::fmt::Display for LoweringError {
             ),
             Self::CodecStepOnDenseModel => f.write_str(
                 "lowering: a KV codec step in the tape of a model whose KV cache is dense",
+            ),
+            Self::GatedMatvecRows { bucket_m } => write!(
+                f,
+                "lowering: a one-row gated matvec in the {bucket_m}-row bucket"
             ),
             Self::TooManyCommands(TooManyCommands { distinct }) => write!(
                 f,

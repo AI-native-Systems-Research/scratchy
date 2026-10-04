@@ -617,13 +617,14 @@ METAL_FUNC void qmv_quad_impl(
 // qmv_fast_impl — quantized.h:749-814
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits>
+template <typename T_act, typename T_scale, int group_size, int bits,
+          typename Y = device T_act*>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
     const device T_scale* scales,
     const device T_scale* biases,
     const device T_act* x,
-    device T_act* y,
+    Y y,
     int in_vec_size,
     int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
@@ -688,13 +689,14 @@ METAL_FUNC void qmv_fast_impl(
 // qmv_impl — quantized.h:816-975
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits>
+template <typename T_act, typename T_scale, int group_size, int bits,
+          typename Y = device T_act*>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
     const device T_scale* scales,
     const device T_scale* biases,
     const device T_act* x,
-    device T_act* y,
+    Y y,
     int in_vec_size,
     int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
@@ -1520,6 +1522,56 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 //                                    the weighted combine of those rows
 // ─────────────────────────────────────────────────────────────────
 
+#ifdef SCRATCHY_CONSTANT_3
+// The gated activation (slot 3): 0 SiLU, 1 GELU (tanh).
+SCRATCHY_CONSTANT(int, GATED_ACT, 3);
+
+// A dense gated MLP's gate and up projections and its activation, one row:
+// `y = act(gate · x) * (up · x)`, as the two matvecs and `silu_mul` / `gelu_mul` compute it.
+//   buffer(0-2) = gate w / scales / biases   buffer(5-7) = up w / scales / biases
+//   buffer(3)   = x  [in_vec]                buffer(4)   = y  [out_vec]
+// Dispatch (1, out_vec / 8, 1), threadgroup (32, 4, 1): simdgroups 0-1 run the gate matvec over
+// the 8-row block tid.y, 2-3 the up matvec's, each row rounded to T_act as the matvec stores it;
+// then lanes 0-7 of simdgroup 0 apply the activation to the block's rows.
+template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
+[[kernel]] void affine_qmv_gated(
+    const device uint32_t* gate_w      [[buffer(0)]],
+    const device T_scale*  gate_scales [[buffer(1)]],
+    const device T_scale*  gate_biases [[buffer(2)]],
+    const device T_act*    x           [[buffer(3)]],
+    device T_act*          y           [[buffer(4)]],
+    const device uint32_t* up_w        [[buffer(5)]],
+    const device T_scale*  up_scales   [[buffer(6)]],
+    const device T_scale*  up_biases   [[buffer(7)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]]) {
+  static_assert(OUT_VEC_SIZE % 8 == 0, "every block holds 8 whole rows");
+  threadgroup T_act rows[2][8];
+  const bool up = simd_gid >= 2;
+  // The block's own rows: the impl then reads rows 0-7 of a matrix that starts at the block.
+  const size_t row0 = size_t(tid.y) * 8;
+  const size_t w_offset = row0 * size_t(IN_VEC_SIZE) * bits / 32;
+  const size_t sb_offset = row0 * size_t(IN_VEC_SIZE / group_size);
+  const device uint32_t* w = (up ? up_w : gate_w) + w_offset;
+  const device T_scale* scales = (up ? up_scales : gate_scales) + sb_offset;
+  const device T_scale* biases = (up ? up_biases : gate_biases) + sb_offset;
+  if (fast) {
+    qmv_fast_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
+        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid);
+  } else {
+    qmv_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
+        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < 8) {
+    float g = float(rows[0][simd_lid]);
+    float u = float(rows[1][simd_lid]);
+    y[row0 + simd_lid] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u) : silu_mul_f(g, u));
+  }
+}
+#endif
+
 #ifdef SCRATCHY_CONSTANT_2
 SCRATCHY_CONSTANT(int, GATHER_PER_ROW, 2);
 
@@ -1583,9 +1635,6 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 }
 
 #ifdef SCRATCHY_CONSTANT_3
-// The gated activation (slot 3): 0 SiLU, 1 GELU (tanh).
-SCRATCHY_CONSTANT(int, GATED_ACT, 3);
-
 // The MoE block's gate and up projections and its gated activation: `gate_y` ends holding
 // `act(gate) * up` for every chosen expert's rows. Each token's row feeds GATHER_PER_ROW
 // (top-k) pairs.
@@ -1681,6 +1730,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 #define INST_GATHER_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs) \
   INST_GATHER_QMV(affine_gather_qmv,         act_tag, act_type, scale_tag, scale_type, gs, 4) \
   INST_GATHER_QMV(affine_gather_qmv_gated,   act_tag, act_type, scale_tag, scale_type, gs, 4) \
+  INST_GATHER_QMV(affine_qmv_gated,          act_tag, act_type, scale_tag, scale_type, gs, 4) \
   INST_GATHER_QMV(affine_gather_qmv_combine, act_tag, act_type, scale_tag, scale_type, gs, 4)
 
 INST_GATHER_QMV_ALL(f16,  half,   f16, half,    32)
@@ -1702,6 +1752,7 @@ INST_GATHER_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 #define INST_GATHER_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs) \
   INST_GATHER_QMV(affine_gather_qmv,         act_tag, act_type, scale_tag, scale_type, gs, 8) \
   INST_GATHER_QMV(affine_gather_qmv_gated,   act_tag, act_type, scale_tag, scale_type, gs, 8) \
+  INST_GATHER_QMV(affine_qmv_gated,          act_tag, act_type, scale_tag, scale_type, gs, 8) \
   INST_GATHER_QMV(affine_gather_qmv_combine, act_tag, act_type, scale_tag, scale_type, gs, 8)
 INST_GATHER_QMV_ALL_B8(f16,  half,   f16, half,    32)
 INST_GATHER_QMV_ALL_B8(f16,  half,   f16, half,    64)
