@@ -145,7 +145,7 @@ pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(
         // THE SIXTH SPLICE — fp8 W8A8, the delivery target (granite 8b fp8). Same
         // `Program::Matmul` classification as dense: the DOOR discriminates fp8 from
         // the weight view's `is_fp8` + arity-3 bindings, never from the program kind,
-        // so both rows reach the same `matmul_proven` door arm.
+        // so both rows reach the same `matmul` door arm.
         SubOp::MatmulTile {
             weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
             ..

@@ -186,7 +186,3 @@ features = [
 [target.'cfg(target_os = "macos")'.dependencies.blas-src]
 workspace = true
 features = ["accelerate"]
-
-[[test]]
-name = "plain_b_matmul_exec"
-path = "tests/plain_b_matmul_exec.rs"
