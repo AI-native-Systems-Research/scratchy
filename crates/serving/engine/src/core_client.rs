@@ -10,8 +10,6 @@
 //!
 //! Port of: `vllm/v1/engine/core_client.py`
 
-use std::collections::HashMap;
-
 use scratchy_core_common::{EngineCoreOutputs, EngineCoreRequest, Request};
 use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 use scratchy_serving_transport::messages::PauseMode;
@@ -143,9 +141,6 @@ pub struct InprocClient {
 struct PipelineState {
     sched_tx: std::sync::mpsc::SyncSender<PipelineMsg>,
     result_rx: std::sync::mpsc::Receiver<PipelineResult>,
-    /// Deferred (sched, model_output) from the previous step, to be finalized
-    /// at the start of the next `get_output()` call.
-    deferred: Option<(SchedulerOutput, ModelRunnerOutput)>,
     /// Number of batches currently in-flight on the executor thread.
     gpu_in_flight: u32,
     _thread: std::thread::JoinHandle<()>,
@@ -265,7 +260,6 @@ impl InprocClient {
             self.pipeline = Some(PipelineState {
                 sched_tx,
                 result_rx,
-                deferred: None,
                 gpu_in_flight: 0,
                 _thread: thread,
             });
@@ -291,7 +285,7 @@ impl InprocClient {
             return true;
         }
         if let Some(ref pipeline) = self.pipeline
-            && (pipeline.gpu_in_flight > 0 || pipeline.deferred.is_some())
+            && pipeline.gpu_in_flight > 0
         {
             return true;
         }
@@ -329,24 +323,15 @@ impl InprocClient {
 
     /// Pipelined get_output matching Python's `step_with_batch_queue`.
     ///
-    /// 1. Finalize the deferred (previous) step's output.
-    /// 2. Pre-schedule: fill pipeline up to 2 in-flight batches.
-    /// 3. Block on the oldest GPU result, store as deferred.
+    /// 1. Pre-schedule: fill the pipeline up to 2 in-flight batches.
+    /// 2. Block on the oldest batch, resolve and finalize it — while the one
+    ///    queued behind it runs — and return its outputs. A finished batch's
+    ///    tokens never wait on a later batch.
     fn get_output_pipelined(
         engine: &mut EngineCore,
         pipeline: &mut PipelineState,
     ) -> EngineResult<StepOutcome<StepOutputs>> {
-        // 1. Finalize previous deferred result. Resolve deferred D2H first
-        //    (syncs the CUDA event and populates token IDs from pinned buffer).
-        let mut prev_outputs: StepOutputs = HashMap::new();
-        let mut had_prev = false;
-        if let Some((prev_sched, mut prev_output)) = pipeline.deferred.take() {
-            prev_output.resolve().map_err(EngineError::Executor)?;
-            prev_outputs = engine.finalize_step(&prev_sched, &prev_output);
-            had_prev = true;
-        }
-
-        // 2. Pre-schedule: fill pipeline up to 2 in-flight batches.
+        // 1. Pre-schedule: fill pipeline up to 2 in-flight batches.
         while pipeline.gpu_in_flight < 2 {
             if let Some(sched) = engine.schedule_next() {
                 if pipeline
@@ -362,28 +347,27 @@ impl InprocClient {
             }
         }
 
-        // 3. Block on oldest GPU result.
+        // 2. Block on the oldest batch. A deferred output resolves here: its
+        //    device work is done, and the batch behind it is already queued.
         if pipeline.gpu_in_flight > 0 {
-            let PipelineResult::Step(sched_box, result) = pipeline
+            let PipelineResult::Step(sched, result) = pipeline
                 .result_rx
                 .recv()
                 .map_err(|_| EngineError::Executor("executor thread exited".into()))?;
-            let sched = *sched_box;
-            let model_output = result?;
-            pipeline.deferred = Some((sched, model_output));
             pipeline.gpu_in_flight -= 1;
+            let mut model_output = result?;
+            model_output.resolve().map_err(EngineError::Executor)?;
+            return Ok(StepOutcome::Progressed {
+                outputs: engine.finalize_step(&sched, &model_output),
+                model_executed: true,
+            });
         }
 
-        // PROGRESS ON THIS PATH IS "the pipeline is turning": a batch was finalized, one is on the
-        // device, or one is waiting to be finalized. None of those ⇒ the pipeline is empty while
-        // requests are outstanding, i.e. `schedule_next` placed nothing — the same stall the
+        // PROGRESS ON THIS PATH IS "the pipeline is turning": a batch was
+        // finalized. None ⇒ the pipeline is empty while requests are
+        // outstanding, i.e. `schedule_next` placed nothing — the same stall the
         // synchronous path names, reached by a different route.
-        if had_prev || pipeline.gpu_in_flight > 0 || pipeline.deferred.is_some() {
-            Ok(StepOutcome::Progressed {
-                outputs: prev_outputs,
-                model_executed: true,
-            })
-        } else if engine.has_unfinished_requests() {
+        if engine.has_unfinished_requests() {
             Ok(StepOutcome::Stalled)
         } else {
             Ok(StepOutcome::Idle)

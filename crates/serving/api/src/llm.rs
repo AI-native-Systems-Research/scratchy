@@ -464,29 +464,11 @@ impl LLM {
             config.enable_prefix_caching = false;
         }
         let mut stack = crate::init::initialize_stack_sync(&config)?;
-        // Start the background executor pipeline for overlapping CPU scheduling with GPU execution
-        // (the server path uses its own pipeline via spawn_step_loop_async instead).
-        //
-        // ONLY when more than one sequence can be in flight. The pipeline overlaps by keeping two
-        // batches queued, but `schedule_next` cannot produce a second batch for a single sequence —
-        // the next token is not known until the current forward returns — so `gpu_in_flight` never
-        // reaches 2 and no overlap ever happens. What it does instead is hand every result back one
-        // forward late: `get_output_pipelined` finalizes the PREVIOUS forward, then schedules the
-        // next batch and BLOCKS on it before returning. Measured on granite via SCRATCHY_TTFT_PHASE
-        // (max_num_seqs=1, 20-token prompt): the prefill completes in 57.13 ms and produces the first
-        // token, but it is not returned until 88.32 ms — the caller waits 31 ms, a whole decode step
-        // for the SECOND token, holding a token that is already finished. The sync path returns it as
-        // soon as it exists, and drops a thread hop per step.
-        //
-        // Token N still lands at the same wall clock either way (the forwards are unchanged and
-        // strictly ordered — decode k needs token k), so this moves latency out of TTFT rather than
-        // removing work. Reported tok/s will FALL, because chat.rs measures it from the first token
-        // onward and that window now starts earlier over the same run; that is the metric moving,
-        // not the run getting slower.
-        // `None` = the backend decides, and every backend's own default is wider than one.
-        if config.max_num_seqs.unwrap_or(usize::MAX) > 1 {
-            stack.client.start_pipeline();
-        }
+        // Start the background executor pipeline (the server path uses its own,
+        // spawn_step_loop_async). It keeps the next batch queued while the host waits for one — for
+        // a single sequence too, whose next step reads the token it is waiting for on the device —
+        // and hands each batch back as soon as it is finalized.
+        stack.client.start_pipeline();
         Ok(Self {
             client: stack.client,
             tokenizer: stack.tokenizer,
@@ -517,9 +499,8 @@ impl LLM {
     }
 
     /// Stop an interrupted generation: abort its requests and step the engine until they are
-    /// retired, then the [`Interrupted`] error it returns. Without the background pipeline a step
-    /// has finished on the GPU when it returns; with it (`max_num_seqs > 1`) up to two are queued,
-    /// and these steps are what finishes them.
+    /// retired, then the [`Interrupted`] error it returns. The background pipeline keeps up to two
+    /// steps queued, and these steps are what finishes them.
     fn stop(&mut self, request_ids: &[String]) -> anyhow::Error {
         if let Err(e) = self.client.abort_requests(request_ids) {
             return anyhow::anyhow!("abort_requests failed: {e}");
