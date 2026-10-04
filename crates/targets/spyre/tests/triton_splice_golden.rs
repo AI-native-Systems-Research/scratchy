@@ -28,7 +28,8 @@ use std::collections::HashSet;
 
 use ktir_superdsc::ktir_node::ActiveCap;
 use scratchy_subtile::subtile_ir::{
-    EwKind, GainConvention, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
+    EwKind, GainConvention, Range, Region, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion,
+    TensorShape,
 };
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_ktir;
@@ -224,6 +225,7 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
 }
 
 
+/// `silu(gate) * up -> out` as a one-node [`SubtileIR`]. t0 = gate source, t1 = up
 /// source, t2 = result. Both operands are activations, but the builder path is
 /// shape-driven and does not read the distinction, so the fixture pins both as sources.
 fn silumul_ir(m: u32, c: u32) -> SubtileIR {
@@ -249,6 +251,47 @@ fn silumul_ir(m: u32, c: u32) -> SubtileIR {
         result: TensorId::from_index(2),
         op_output: Vec::new(),
     }
+}
+
+/// ⛔ THE COLUMN-CHUNKED NODE FALLS THROUGH — the 8b defect's own gate. The front end
+/// tiles a wide pointwise op into column chunks (production `nb = 8192`; granite 8b's
+/// 12800-wide MLP silumul is chunks `0..8192` and `8192..12800`), and the kernels state
+/// ONE whole-tensor tile at corner 0 — a windowed load is not expressible in them. The
+/// splice must fall through so the builder's program states the chunk's corner, and this
+/// pins exactly that: a chunk-shaped node returns `Ok(None)`, while the whole-tensor
+/// node of the same width still splices (the two paths are discriminated by the REGION,
+/// never by the width).
+#[test]
+fn a_column_chunked_silumul_falls_through_to_the_builder() {
+    // The CHUNK-1 shape, measured on the card: 12800-wide intermediate, second block.
+    let ir = silumul_ir(1, 12800);
+    let chunk = Range::new(8192, 12800 - 8192);
+    let window = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: Region { rows: Range::new(0, 1), cols: chunk },
+    };
+    let mut chunked = ir.clone();
+    chunked.nodes[0].inputs = vec![window(0), window(1)];
+    chunked.nodes[0].output = window(2);
+
+    let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
+        .expect("the chunked node either falls through or compiles");
+    assert!(
+        spliced.is_none(),
+        "a column-chunked silumul has no kernel row — the splice must fall through so the \
+         builder's program states the chunk's access-tile corner"
+    );
+
+    // THE CONTROL: the whole-tensor node at the same total width still splices — the
+    // fallthrough is the REGION's, not the width's.
+    let whole_node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(whole_node, &ir, false)
+        .expect("the whole-tensor node compiles");
+    assert!(
+        spliced.is_some(),
+        "a whole-tensor 12800-wide silumul is inside the splice's reach — the registry row \
+         must take it (only its prefill LX-budget rows fall through)"
+    );
 }
 
 /// The elementwise shapes that matter for the delivery scope: granite's hidden 2048
