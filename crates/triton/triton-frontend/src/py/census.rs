@@ -42,8 +42,8 @@
 //! [`check`] walks a parsed module and returns EVERY violation, each naming the construct
 //! and its line and column. A construct outside the census is never lowered partially.
 
-use crate::py::ast::{AssignTarget, Expr, FunctionDef, PyModule, Stmt};
 use crate::Error;
+use crate::py::ast::{AssignTarget, Expr, FunctionDef, PyModule, Stmt};
 
 /// The `tl.*` surface the fixtures reach, by dotted name with the `tl.` prefix stripped.
 pub const TL_FUNCTIONS: &[&str] = &[
@@ -185,11 +185,7 @@ pub fn check(module: &PyModule) -> std::result::Result<(), Vec<Error>> {
     for f in module.jit_functions() {
         check_fn(f, module, &mut errs);
     }
-    if errs.is_empty() {
-        Ok(())
-    } else {
-        Err(errs)
-    }
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
 fn check_fn(f: &FunctionDef, module: &PyModule, errs: &mut Vec<Error>) {

@@ -191,7 +191,7 @@ fn emit_regions(
                         return Err(Error {
                             stage: "b-orientation",
                             message: e.message,
-                        })
+                        });
                     }
                     Ok(b) => match orient {
                         None => orient = Some(b),
@@ -206,7 +206,11 @@ fn emit_regions(
                     message: format!(
                         "{name}: this node states `Program::Matmul` but its function holds {}                          `linalg.matmul` op(s){} — so there is no ONE proven B orientation for the                          single descriptor this door emits. The orientation decides which of the W                          region's two extents is K and cannot be recovered from the extents at                          `k == n`, so it is refused rather than assumed. The whole-function door                          (`emit_whole`) proves it per op.",
                         mms.len(),
-                        if disagree { ", and they do not agree" } else { "" }
+                        if disagree {
+                            ", and they do not agree"
+                        } else {
+                            ""
+                        }
                     ),
                 });
             };
@@ -242,7 +246,7 @@ fn emit_regions(
                      fixture's own tl.constexpr values",
                     node.program
                 ),
-            })
+            });
         }
     };
     out.map_err(|e| Error {

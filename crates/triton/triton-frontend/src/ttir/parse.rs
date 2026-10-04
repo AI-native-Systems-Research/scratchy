@@ -74,27 +74,27 @@ pub fn parse_type(s: &str) -> Option<Type> {
         }
         return parse_type(inner);
     }
-    if let Some(bits) = s.strip_prefix('i') {
-        if let Ok(b) = bits.parse::<u32>() {
-            return Some(Type::Int(
-                b,
-                if b == 1 {
-                    Signedness::Signless
-                } else {
-                    Signedness::Signed
-                },
-            ));
-        }
+    if let Some(bits) = s.strip_prefix('i')
+        && let Ok(b) = bits.parse::<u32>()
+    {
+        return Some(Type::Int(
+            b,
+            if b == 1 {
+                Signedness::Signless
+            } else {
+                Signedness::Signed
+            },
+        ));
     }
     // `si32` / `ui32`: the SIGNED spelling, which MLIR uses inside a `!tt.tensordesc<>` block
     // type and nowhere else in this IR. See `ttir::desc_block_elem` for the measurement.
     // Without these two arms `embedding.ttir_raw.mlir`'s `<64xsi32>` does not parse at all,
     // and a golden that does not parse is a diff that compares nothing.
     for (prefix, sign) in [("si", Signedness::Signed), ("ui", Signedness::Unsigned)] {
-        if let Some(bits) = s.strip_prefix(prefix) {
-            if let Ok(b) = bits.parse::<u32>() {
-                return Some(Type::Int(b, sign));
-            }
+        if let Some(bits) = s.strip_prefix(prefix)
+            && let Ok(b) = bits.parse::<u32>()
+        {
+            return Some(Type::Int(b, sign));
         }
     }
     let fk = match s {
@@ -349,17 +349,15 @@ pub fn parse_module(text: &str) -> Result<Module, ParseError> {
     for _ in 0..2 {
         for (_, line) in p.lines.clone() {
             let t = line.trim();
-            if let Some((lhs, rhs)) = t.split_once(" = ") {
-                if lhs.starts_with("#loc") {
-                    if let Some(body) = rhs
-                        .trim()
-                        .strip_prefix("loc(")
-                        .and_then(|x| x.strip_suffix(')'))
-                    {
-                        let loc = p.parse_loc_body(body);
-                        p.locs.insert(lhs.trim().to_string(), loc);
-                    }
-                }
+            if let Some((lhs, rhs)) = t.split_once(" = ")
+                && lhs.starts_with("#loc")
+                && let Some(body) = rhs
+                    .trim()
+                    .strip_prefix("loc(")
+                    .and_then(|x| x.strip_suffix(')'))
+            {
+                let loc = p.parse_loc_body(body);
+                p.locs.insert(lhs.trim().to_string(), loc);
             }
         }
     }
@@ -773,7 +771,14 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
     // `%1`, `%2` and `%acc` are USES. The generic operand scan below cannot tell them apart
     // and would record all six as operands, so this form is handled on its own.
     if name == "scf.for" {
-        let (lb, ub, step, iter_pairs, iv_name, iv_ty) = match parse_scf_for_head(&work) {
+        let ScfForHead {
+            lb,
+            ub,
+            step,
+            iter_pairs,
+            iv: iv_name,
+            iv_ty,
+        } = match parse_scf_for_head(&work) {
             Some(x) => x,
             None => bail!((no, t), "could not read the scf.for header"),
         };
@@ -916,21 +921,21 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
     Ok(Some(op))
 }
 
+/// An `scf.for` header, pulled apart. All names have the leading `%` stripped.
+struct ScfForHead {
+    lb: String,
+    ub: String,
+    step: String,
+    /// `[(carry_arg, init)]`
+    iter_pairs: Vec<(String, String)>,
+    /// The induction variable.
+    iv: String,
+    /// The induction variable's type, as printed (default `i32`).
+    iv_ty: String,
+}
+
 /// Pull apart an `scf.for` header.
-///
-/// Returns `(lb, ub, step, [(carry_arg, init)], induction_var, induction_type)`, all names
-/// with the leading `%` stripped.
-#[allow(clippy::type_complexity)]
-fn parse_scf_for_head(
-    work: &str,
-) -> Option<(
-    String,
-    String,
-    String,
-    Vec<(String, String)>,
-    String,
-    String,
-)> {
+fn parse_scf_for_head(work: &str) -> Option<ScfForHead> {
     // `%n = %0 to %1 step %2 iter_args(...) -> (...)  : i32`
     let (iv, rest) = work.trim().split_once(" = ")?;
     let (lb, rest) = rest.split_once(" to ")?;
@@ -974,14 +979,14 @@ fn parse_scf_for_head(
         Some((i, skip)) => work[i + skip..].trim().to_string(),
         None => "i32".to_string(),
     };
-    Some((
-        lb.trim().trim_start_matches('%').to_string(),
-        ub.trim().trim_start_matches('%').to_string(),
-        step.trim().trim_start_matches('%').to_string(),
+    Some(ScfForHead {
+        lb: lb.trim().trim_start_matches('%').to_string(),
+        ub: ub.trim().trim_start_matches('%').to_string(),
+        step: step.trim().trim_start_matches('%').to_string(),
         iter_pairs,
-        iv.trim().trim_start_matches('%').to_string(),
+        iv: iv.trim().trim_start_matches('%').to_string(),
         iv_ty,
-    ))
+    })
 }
 
 struct Braced {
@@ -1031,18 +1036,18 @@ fn parse_attr_value(v: &str) -> Attr {
             .collect();
         return Attr::Array(items);
     }
-    if let Some(rest) = v.strip_prefix("dense<") {
-        if let Some((val, ty)) = rest.split_once('>') {
-            let ty = ty.trim().trim_start_matches(':').trim();
-            let ty = parse_type(ty).unwrap_or(Type::i32());
-            let inner = parse_scalar_literal(val, ty.scalar().clone());
-            return Attr::DenseSplat(Box::new(inner), ty);
-        }
+    if let Some(rest) = v.strip_prefix("dense<")
+        && let Some((val, ty)) = rest.split_once('>')
+    {
+        let ty = ty.trim().trim_start_matches(':').trim();
+        let ty = parse_type(ty).unwrap_or(Type::i32());
+        let inner = parse_scalar_literal(val, ty.scalar().clone());
+        return Attr::DenseSplat(Box::new(inner), ty);
     }
-    if let Some((val, ty)) = split_last_colon(v) {
-        if let Some(ty) = parse_type(&ty) {
-            return parse_scalar_literal(&val, ty);
-        }
+    if let Some((val, ty)) = split_last_colon(v)
+        && let Some(ty) = parse_type(&ty)
+    {
+        return parse_scalar_literal(&val, ty);
     }
     Attr::Str(v.to_string())
 }
@@ -1077,18 +1082,18 @@ fn parse_scalar_literal(v: &str, ty: Type) -> Attr {
         // an f16 infinity, `0x7F800000` for an f32 one. Reading those as f64 bits produced
         // 1.5e-319 and 1.05e-314, which then differed from our (correct) infinities and looked
         // like a codegen bug rather than a parser one.
-        if let Some(hex) = v.strip_prefix("0x") {
-            if let Ok(bits) = u64::from_str_radix(hex, 16) {
-                let f = match ty.scalar() {
-                    Type::Float(FloatKind::F16) => f16_bits_to_f64(bits as u16),
-                    Type::Float(FloatKind::BF16) => {
-                        f32::from_bits(((bits as u32) & 0xFFFF) << 16) as f64
-                    }
-                    Type::Float(FloatKind::F32) => f32::from_bits(bits as u32) as f64,
-                    _ => f64::from_bits(bits),
-                };
-                return Attr::Float(F64Bits::new(f), ty);
-            }
+        if let Some(hex) = v.strip_prefix("0x")
+            && let Ok(bits) = u64::from_str_radix(hex, 16)
+        {
+            let f = match ty.scalar() {
+                Type::Float(FloatKind::F16) => f16_bits_to_f64(bits as u16),
+                Type::Float(FloatKind::BF16) => {
+                    f32::from_bits(((bits as u32) & 0xFFFF) << 16) as f64
+                }
+                Type::Float(FloatKind::F32) => f32::from_bits(bits as u32) as f64,
+                _ => f64::from_bits(bits),
+            };
+            return Attr::Float(F64Bits::new(f), ty);
         }
         if let Ok(f) = v.parse::<f64>() {
             return Attr::Float(F64Bits::new(f), ty);

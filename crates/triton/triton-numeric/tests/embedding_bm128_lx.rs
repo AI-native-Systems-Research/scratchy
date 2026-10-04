@@ -46,7 +46,7 @@
 //! `SpyreMemoryHierarchy::new`. An integration test FILE is its own binary, so nothing else in this
 //! crate can observe the variable this test sets; putting it beside the sweep would let the two race.
 
-use triton_numeric::{bounds, data, mutants, Comparison};
+use triton_numeric::{Comparison, bounds, data, mutants};
 
 const CONFIG: &str = "embedding_granite_bm128";
 /// The recorded refusal, minus the `%34`: an SSA number is not a fact about residency, the three
@@ -55,7 +55,10 @@ const RECORDED: &str = "LX capacity exceeded on core 0: 2097152 + 1048576 > 2097
 
 /// Run the configuration with LX set to `mb` MiB per core.
 fn run_at(mb: i64) -> triton_numeric::Result<Vec<f64>> {
-    std::env::set_var("KTIR_LX_CAPACITY_MB", mb.to_string());
+    // Edition 2024 makes `set_var` `unsafe`: this is a test binary's main thread, before any
+    // thread that could observe the variable exists (the file-isolation note above is what
+    // makes the write itself sound).
+    unsafe { std::env::set_var("KTIR_LX_CAPACITY_MB", mb.to_string()) };
     let f = data::Fixture::load(CONFIG).expect("the bm128 metadata");
     let bindings = f.bindings().expect("the bm128 bindings");
     let lowered = triton_numeric::lower(CONFIG)?;
@@ -156,7 +159,7 @@ fn bm128_refuses_on_residency_at_2_mib_and_computes_the_right_function_at_3() {
     // `BLOCK_M` is a TILING knob: 4 items of 64 and 2 of 128 walk the same 256 tokens, so a block
     // offset applied to the wrong axis would show up here as a disagreement even if both somehow sat
     // inside the envelope. Run at 2 MiB, where the 64-high tiles fit.
-    std::env::set_var("KTIR_LX_CAPACITY_MB", "2");
+    unsafe { std::env::set_var("KTIR_LX_CAPACITY_MB", "2") };
     let sib = data::Fixture::load("embedding_granite").expect("the bm64 metadata");
     let l64 = triton_numeric::lower("embedding_granite").expect("bm64 lowers");
     let out64 = triton_numeric::execute(&l64, &sib.bindings().expect("bm64 bindings"))

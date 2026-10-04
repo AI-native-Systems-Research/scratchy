@@ -26,7 +26,7 @@
 //! expanded 384 MiB table. Keeping them here makes the sweep's report readable and lets a reader
 //! run the gather's own controls alone.
 
-use triton_numeric::{bounds, data, mutants, Comparison};
+use triton_numeric::{Comparison, bounds, data, mutants};
 
 /// The configuration whose bytes both controls read. `embedding_granite_bm128` shares them
 /// (`data_dir`), so the bytes are stated once and there is nothing to choose between.

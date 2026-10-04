@@ -273,7 +273,6 @@ impl SpyreSession {
 mod tests {
     use super::*;
     use crate::manifest::attn_mask_fill;
-    use crate::manifest::{alloc_buffers, argmax};
 
     /// Semantics lock for the attention runtime length-mask the emitter emits
     /// (`KtirFunc::attn`): the prefix scores `addf` a shared
@@ -381,9 +380,9 @@ mod tests {
         });
         ops.push(add);
 
-        // The store's own view + window over the output parameter.
+        // The store's own view + window over the output parameter. (`next` stops here: the
+        // two SSAs minted below are the program's last.)
         let (oview, oacc) = (Ssa(next), Ssa(next + 1));
-        next += 2;
         let mut vop = Operation::new(a, Some(oview), OpKind::KtdpConstructMemoryView, &[out_p])
             .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())))
             .with_attr(a, AttrKey::Strides, Attr::IntList(a.ints(vec![4, 1])))

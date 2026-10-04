@@ -160,7 +160,7 @@ fn plan_loop(module: &mut Module, path: &OpPath) -> Result<()> {
             return Err(Refusal::new(
                 PASS,
                 "single_corelet is a RE-PATTERNING of split/partial_combine once the tile's                  stick count is known, not a classification. Reaching it directly means the                  stick count was never derived, and the plan's data_bounds would be                  fabricated.",
-            ))
+            ));
         }
         Pattern::Split | Pattern::PartialCombine => {
             let sticks = recover_tile_sticks(&loopp).ok_or_else(|| {
@@ -503,30 +503,30 @@ fn recover_matmul_shape(module: &Module, loopp: &Op) -> Option<[i64; 3]> {
         }
         let a = full_shape(op.operands[0])?; // [M, K] from A's view
         let b = full_shape(op.operands[1])?; // B's view, in the order the op's maps state
-                                             // ⛔⛔⛔ WHICH AXIS OF B IS `N` IS STATED BY THE OP, NOT DEDUCED FROM WHICH EXTENT FITS.
-                                             //
-                                             // This read was `let (m, k, n) = (a.0, a.1, b.1)` with a `a.1 == b.0` sanity check, i.e. it
-                                             // assumed B's view is `[K, N]` — `linalg.matmul`'s default indexing. That was true until
-                                             // `dot_to_linalg` began spending a transposed dot weight in the `indexing_maps` instead of
-                                             // leaving a `tt.trans` for the access tile: the weight's view is then the `[N, K]` the kernel
-                                             // declares, `a.1 == b.0` is `128 == 256`, and this function fell off the end and returned
-                                             // `None`.
-                                             //
-                                             // ⛔ AND THE CONSEQUENCE WAS SILENT, WHICH IS WHY THE READ IS BEING FIXED RATHER THAN THE
-                                             // CHECK RELAXED. The caller is `if let Some(...) = recover_matmul_shape(...)`, so `None`
-                                             // simply OMITS `work_division` — an attribute this pass's own comment four lines up calls
-                                             // LOAD-BEARING ("the multicore emitter DERIVES its 32-core form from this rather than
-                                             // re-deriving from the memory views"). MEASURED against IBM's C++ goldens: all three
-                                             // `swiglu_mlp_*` configurations lost the attribute entirely, reported by
-                                             // `tests/pure_rust_ktir.rs` as `ktdf.corelet_plan: attributes differs / golden:
-                                             // {pattern=\"independent_subtile\", work_division=array<i64: 64, 256, 128, ...>} / ours:
-                                             // {pattern=\"independent_subtile\"}`. Reading the orientation restores it BYTE-IDENTICALLY on
-                                             // all three — `[64, 256, 128, 64, 4, 8, 32, 16, 8, 1]` for `small` and `tiled_k`,
-                                             // `[64, 12800, 4096, 64, 16, 2, 32, 16, 4, 12]` for `granite` — which is the check that this
-                                             // reads the same `N` the C++ did and not merely a different number that parses.
-                                             //
-                                             // The orientation predicate lives beside the WRITER (`dot_to_linalg::weight_is_n_by_k` over
-                                             // `TRANSPOSED_B_MAPS`) so the maps are spelled once in the tree.
+        // ⛔⛔⛔ WHICH AXIS OF B IS `N` IS STATED BY THE OP, NOT DEDUCED FROM WHICH EXTENT FITS.
+        //
+        // This read was `let (m, k, n) = (a.0, a.1, b.1)` with a `a.1 == b.0` sanity check, i.e. it
+        // assumed B's view is `[K, N]` — `linalg.matmul`'s default indexing. That was true until
+        // `dot_to_linalg` began spending a transposed dot weight in the `indexing_maps` instead of
+        // leaving a `tt.trans` for the access tile: the weight's view is then the `[N, K]` the kernel
+        // declares, `a.1 == b.0` is `128 == 256`, and this function fell off the end and returned
+        // `None`.
+        //
+        // ⛔ AND THE CONSEQUENCE WAS SILENT, WHICH IS WHY THE READ IS BEING FIXED RATHER THAN THE
+        // CHECK RELAXED. The caller is `if let Some(...) = recover_matmul_shape(...)`, so `None`
+        // simply OMITS `work_division` — an attribute this pass's own comment four lines up calls
+        // LOAD-BEARING ("the multicore emitter DERIVES its 32-core form from this rather than
+        // re-deriving from the memory views"). MEASURED against IBM's C++ goldens: all three
+        // `swiglu_mlp_*` configurations lost the attribute entirely, reported by
+        // `tests/pure_rust_ktir.rs` as `ktdf.corelet_plan: attributes differs / golden:
+        // {pattern=\"independent_subtile\", work_division=array<i64: 64, 256, 128, ...>} / ours:
+        // {pattern=\"independent_subtile\"}`. Reading the orientation restores it BYTE-IDENTICALLY on
+        // all three — `[64, 256, 128, 64, 4, 8, 32, 16, 8, 1]` for `small` and `tiled_k`,
+        // `[64, 12800, 4096, 64, 16, 2, 32, 16, 4, 12]` for `granite` — which is the check that this
+        // reads the same `N` the C++ did and not merely a different number that parses.
+        //
+        // The orientation predicate lives beside the WRITER (`dot_to_linalg::weight_is_n_by_k` over
+        // `TRANSPOSED_B_MAPS`) so the maps are spelled once in the tree.
         let (k_of_b, n) = if crate::passes::dot_to_linalg::weight_is_n_by_k(op) {
             (b.1, b.0) // W as (n, k)
         } else {

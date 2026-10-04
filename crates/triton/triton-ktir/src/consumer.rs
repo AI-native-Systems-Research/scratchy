@@ -442,21 +442,21 @@ pub fn check(module: &Module) -> Vec<Incompatibility> {
                 let d: Vec<String> = (0..rank).map(|i| format!("d{i}")).collect();
                 format!("({}) -> ({})", d.join(", "), d.join(", "))
             };
-            if let Some(o) = order {
-                if o != identity {
-                    out.push(Incompatibility {
-                        what: spelling.clone(),
-                        gap: "gap4-transpose-dropped-silently",
-                        detail: format!(
-                            "access_tile_order is `{o}`, a TRANSPOSING read. Their \
+            if let Some(o) = order
+                && o != identity
+            {
+                out.push(Incompatibility {
+                    what: spelling.clone(),
+                    gap: "gap4-transpose-dropped-silently",
+                    detail: format!(
+                        "access_tile_order is `{o}`, a TRANSPOSING read. Their \
                              construct_access_tile (lower.rs:532) takes the extents from \
                              AttrKey::Shape and reads no order attribute -- and their \
                              AttrKey has none -- so this lowers as an UNTRANSPOSED read \
                              with no diagnostic. Their side needs the attribute or a \
                              refusal naming it"
-                        ),
-                    });
-                }
+                    ),
+                });
             }
         }
     }

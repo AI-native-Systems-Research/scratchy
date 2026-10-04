@@ -116,11 +116,11 @@ impl Numbering {
         let mut ids = HashMap::new();
         // Function arguments first, so they are stable across the two modules.
         for op in module.ops_deep() {
-            if op.kind == OpKind::TtFunc {
-                if let Some(r) = op.regions.first() {
-                    for (i, (v, _)) in r.args.iter().enumerate() {
-                        ids.insert(*v, format!("arg{i}"));
-                    }
+            if op.kind == OpKind::TtFunc
+                && let Some(r) = op.regions.first()
+            {
+                for (i, (v, _)) in r.args.iter().enumerate() {
+                    ids.insert(*v, format!("arg{i}"));
                 }
             }
         }

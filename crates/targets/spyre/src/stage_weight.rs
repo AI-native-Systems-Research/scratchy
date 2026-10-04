@@ -314,7 +314,7 @@ mod tests {
         stage_weight_tiled(&host, &mut dev, walk, Element::F16);
         assert_eq!(dev, naive(&host, walk, Element::F16));
         // spot-check the permutation itself: device(t=1, i=2, s=3) = host(i=2, o=1·4+3=7)
-        let lin = ((1 * inn + 2) * stick + 3) as usize;
+        let lin = ((inn + 2) * stick + 3) as usize;
         let hoff = (2 * out + 7) as usize;
         let want = ieee_to_sen(IeeeF16(0x3C00 + hoff as u16)).0;
         assert_eq!(u16::from_le_bytes([dev[lin * 2], dev[lin * 2 + 1]]), want);

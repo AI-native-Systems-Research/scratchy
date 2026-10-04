@@ -100,11 +100,7 @@ pub fn changed_row_fraction(a: &[f64], b: &[f64], row_len: usize) -> f64 {
             worst = frac;
         }
     }
-    if worst.is_finite() {
-        worst
-    } else {
-        0.0
-    }
+    if worst.is_finite() { worst } else { 0.0 }
 }
 
 /// True iff the changed-word fraction clears the predeclared floor — the single shared verdict
@@ -203,7 +199,7 @@ fn sigmoid(z: f64) -> f64 {
 /// SHAPES: `g` and `u` are flat, equal-length, row-major `[M, N]`; every function returns a fresh
 /// `Vec<f64>` of the same length. The extents matter only to [`changed_row_fraction`].
 pub mod swiglu {
-    use super::{sigmoid, Mutant};
+    use super::{Mutant, sigmoid};
 
     /// The controls this module offers, with `half_sigmoid` marked informational.
     ///
@@ -437,10 +433,10 @@ pub mod rmsnorm {
             };
             let mut ssq = 0.0f64;
             for (i, &v) in row.iter().enumerate() {
-                if let Some(k) = drop_k {
-                    if i / lanes == k {
-                        continue; // the omitted stick contributes nothing to the mean
-                    }
+                if let Some(k) = drop_k
+                    && i / lanes == k
+                {
+                    continue; // the omitted stick contributes nothing to the mean
                 }
                 ssq += v * v;
             }

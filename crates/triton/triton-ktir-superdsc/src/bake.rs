@@ -288,7 +288,11 @@ pub fn write_placements(
             p.bank,
             p.offset,
             p.size,
-            if i + 1 == layout.placements.len() { "" } else { "," }
+            if i + 1 == layout.placements.len() {
+                ""
+            } else {
+                ","
+            }
         );
     }
     s.push_str("  ],\n  \"synth\": [\n");

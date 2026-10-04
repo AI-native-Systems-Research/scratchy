@@ -42,9 +42,9 @@
 //! a `LegalizeTypes` bug -- surfaces downstream rather than being silently "fixed"
 //! here.
 
+use crate::Result;
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
-use crate::Result;
 
 pub fn run(module: &mut Module) -> Result<()> {
     // Collect first, rewrite after, so the op list is never mutated mid-walk.

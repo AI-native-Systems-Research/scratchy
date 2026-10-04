@@ -36,10 +36,10 @@ use super::{
 fn fmt_float(bits: F64Bits, ty: &Type) -> String {
     let short = fmt_float_6(bits);
     // Does the short form read back as the same value AT THIS TYPE?
-    if let Ok(back) = short.parse::<f64>() {
-        if F64Bits::rounded(back, ty) == F64Bits::rounded(bits.get(), ty) {
-            return short;
-        }
+    if let Ok(back) = short.parse::<f64>()
+        && F64Bits::rounded(back, ty) == F64Bits::rounded(bits.get(), ty)
+    {
+        return short;
     }
     let v = bits.get();
     match ty.scalar() {

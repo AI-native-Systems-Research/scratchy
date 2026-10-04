@@ -19,8 +19,8 @@
 mod common;
 
 use common::*;
-use triton_ktir::text::parse;
 use triton_ktir::Module;
+use triton_ktir::text::parse;
 
 /// The full `to_ktir::run` pipeline on a golden fixture's ttir.
 fn run_pipeline(config: &str) -> Module {

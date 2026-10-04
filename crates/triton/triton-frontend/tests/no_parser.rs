@@ -183,12 +183,12 @@ fn control_planted_difference_is_caught_without_the_parser_feature() {
     let mut mutated = expected.clone();
     let mut hit = false;
     for op in &mut mutated.funcs[0].body.blocks[0].ops {
-        if op.name == "arith.constant" {
-            if let Some(Attr::Int(v, t)) = op.attrs.get("value").cloned() {
-                op.attrs.insert("value".to_string(), Attr::Int(v + 1, t));
-                hit = true;
-                break;
-            }
+        if op.name == "arith.constant"
+            && let Some(Attr::Int(v, t)) = op.attrs.get("value").cloned()
+        {
+            op.attrs.insert("value".to_string(), Attr::Int(v + 1, t));
+            hit = true;
+            break;
         }
     }
     assert!(hit, "control found no integer constant to mutate");

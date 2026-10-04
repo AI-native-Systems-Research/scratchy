@@ -116,7 +116,7 @@ fn sample() -> Vec<f32> {
         -1.0,
         2.0f32.powi(-6), // smallest normal
         2.0f32.powi(-9), // smallest subnormal
-        0.015380859375,  // the subnormal→normal boundary that clamp(0, 7) rounded the wrong way
+        0.015_380_859,   // the subnormal→normal boundary that clamp(0, 7) rounded the wrong way
         448.0,
         -448.0,
         1.0e9, // saturates

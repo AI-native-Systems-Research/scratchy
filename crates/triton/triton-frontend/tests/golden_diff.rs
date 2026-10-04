@@ -389,14 +389,13 @@ fn control_planted_attribute_is_caught() {
     // Change a constant's value: 64 -> 63. Structurally identical otherwise.
     let mut hit = false;
     for op in first_func_ops(&mut ours) {
-        if op.name == "arith.constant" {
-            if let Some(Attr::Int(v, t)) = op.attrs.get("value").cloned() {
-                if v == 64 {
-                    op.attrs.insert("value".to_string(), Attr::Int(63, t));
-                    hit = true;
-                    break;
-                }
-            }
+        if op.name == "arith.constant"
+            && let Some(Attr::Int(v, t)) = op.attrs.get("value").cloned()
+            && v == 64
+        {
+            op.attrs.insert("value".to_string(), Attr::Int(63, t));
+            hit = true;
+            break;
         }
     }
     assert!(
@@ -418,12 +417,12 @@ fn control_planted_predicate_is_caught() {
     // `arith.cmpi sle` -> `sgt`: the overflow check's bound direction.
     let mut hit = false;
     for op in first_func_ops(&mut ours) {
-        if op.name == "arith.cmpi" {
-            if let Some(Attr::Pred("sle")) = op.attrs.get("predicate") {
-                op.attrs.insert("predicate".to_string(), Attr::Pred("sgt"));
-                hit = true;
-                break;
-            }
+        if op.name == "arith.cmpi"
+            && let Some(Attr::Pred("sle")) = op.attrs.get("predicate")
+        {
+            op.attrs.insert("predicate".to_string(), Attr::Pred("sgt"));
+            hit = true;
+            break;
         }
     }
     assert!(hit, "control could not find an `arith.cmpi sle` to mutate");

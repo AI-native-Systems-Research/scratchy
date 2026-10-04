@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::ttir::{Attr, Loc, Module, Op, Type, ValueId};
+use crate::ttir::{Attr, Module, Type, ValueId};
 
 /// How a value is referred to, independent of its printed name.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -424,7 +424,3 @@ pub fn compare_to_golden_text(golden: &str, actual: &Module) -> Report {
         },
     }
 }
-
-/// Unused-name helper kept out of the public surface.
-#[allow(dead_code)]
-fn _loc_unused(_: &Loc, _: &Op) {}

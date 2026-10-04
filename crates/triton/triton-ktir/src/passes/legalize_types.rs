@@ -131,21 +131,19 @@ fn step_2_collapse_island(module: &mut Module) {
             let op = walk::at_mut(module, &path).expect("path");
             // Fix an arith.constant's value attribute first, so the attr type stays
             // in sync with the result type set below.
-            if op.kind == OpKind::ArithConstant {
-                if let Some(a) = op.attr(&AttrKey::Value).cloned() {
-                    if let Some(f) = a.as_float() {
-                        if f.width == 32 {
-                            let re = f.to_f16();
-                            op.set_attr(
-                                AttrKey::Value,
-                                match a {
-                                    Attr::SplatFloat(_) => Attr::SplatFloat(re),
-                                    _ => Attr::Float(re),
-                                },
-                            );
-                        }
-                    }
-                }
+            if op.kind == OpKind::ArithConstant
+                && let Some(a) = op.attr(&AttrKey::Value).cloned()
+                && let Some(f) = a.as_float()
+                && f.width == 32
+            {
+                let re = f.to_f16();
+                op.set_attr(
+                    AttrKey::Value,
+                    match a {
+                        Attr::SplatFloat(_) => Attr::SplatFloat(re),
+                        _ => Attr::Float(re),
+                    },
+                );
             }
             for t in op.result_types.iter_mut() {
                 if t.is_compute_f32() {
@@ -202,19 +200,18 @@ fn step_2b_island_constants(module: &mut Module) {
     }
     for path in victims {
         let op = walk::at_mut(module, &path).expect("path");
-        if let Some(a) = op.attr(&AttrKey::Value).cloned() {
-            if let Some(f) = a.as_float() {
-                if f.width == 32 {
-                    let re = f.to_f16();
-                    op.set_attr(
-                        AttrKey::Value,
-                        match a {
-                            Attr::SplatFloat(_) => Attr::SplatFloat(re),
-                            _ => Attr::Float(re),
-                        },
-                    );
-                }
-            }
+        if let Some(a) = op.attr(&AttrKey::Value).cloned()
+            && let Some(f) = a.as_float()
+            && f.width == 32
+        {
+            let re = f.to_f16();
+            op.set_attr(
+                AttrKey::Value,
+                match a {
+                    Attr::SplatFloat(_) => Attr::SplatFloat(re),
+                    _ => Attr::Float(re),
+                },
+            );
         }
         for t in op.result_types.iter_mut() {
             if t.is_compute_f32() {

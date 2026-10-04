@@ -98,7 +98,7 @@ fn dtype(d: DType) -> Result<KDType> {
                  Mapping it onto i32 here would turn an index into a 32-bit integer \
                  silently, so it is refused and the caller must have produced \
                  `IrType::Index` instead",
-            ))
+            ));
         }
     })
 }
@@ -124,19 +124,19 @@ fn irtype<'a>(t: &IrType, a: &'a Arena) -> Result<KIrType<'a>> {
             return Err(refuse(
                 "`!tt.ptr` survived to the handoff: to_ktir rewrites pointers to `index` \
                  and their type has no pointer at all",
-            ))
+            ));
         }
         IrType::TensorDesc { .. } => {
             return Err(refuse(
                 "`!tt.tensordesc` survived to the handoff: the descriptor patterns consume \
                  it and their type has no counterpart",
-            ))
+            ));
         }
         IrType::Verbatim(s) => {
             return Err(refuse(format!(
                 "type `{s}` is not modelled, so it cannot be expressed in their `IrType`. \
                  It is refused rather than passed through as text"
-            )))
+            )));
         }
     })
 }
@@ -324,12 +324,12 @@ pub fn affine_set<'a>(text: &str, a: &'a Arena) -> Result<KSet<'a>> {
             )));
         };
 
-        if let KExpr::Dim(i) = expr {
-            if i >= num_dims {
-                return Err(refuse(format!(
-                    "affine set `{text}`: `d{i}` is out of range for {num_dims} dimension(s)"
-                )));
-            }
+        if let KExpr::Dim(i) = expr
+            && i >= num_dims
+        {
+            return Err(refuse(format!(
+                "affine set `{text}`: `d{i}` is out of range for {num_dims} dimension(s)"
+            )));
         }
         out.push(Constraint {
             expr,
@@ -404,7 +404,7 @@ fn attrkey(k: &AttrKey) -> Result<Key> {
                  expressed as `linalg.reduce` carrying `ReduceFn`, not as a \
                  `linalg.generic` carrying an iterator list. This is a shape decision for \
                  to_ktir, not something to rename here",
-            ))
+            ));
         }
         // `tensor.expand_shape`/`collapse_shape`'s reassociation. Their `AttrKey` has no
         // `Reassociation`, and MLIR's form -- a list of index LISTS, `[[0], [1, 2]]` -- has
@@ -477,7 +477,7 @@ fn attrkey(k: &AttrKey) -> Result<Key> {
                 return Err(refuse(format!(
                     "attribute `{s}` has no key in their vocabulary. Refused rather than \
                      dropped: an attribute that silently vanishes is how a tile loses a bound"
-                )))
+                )));
             }
         },
     })
@@ -506,13 +506,13 @@ fn attr<'a>(v: &Attr, a: &'a Arena) -> Result<KAttr<'a>> {
                 "a unit attribute has no counterpart: their `Attr` has no unit variant. \
                  Every unit attribute we attach is one of the function-level flags, which \
                  are handled as `Key::OnFunction`",
-            ))
+            ));
         }
         Attr::Verbatim(s) => {
             return Err(refuse(format!(
                 "attribute value `{s}` was kept as text and cannot be expressed in their \
                  `Attr`. Refused rather than passed through"
-            )))
+            )));
         }
     })
 }
@@ -569,27 +569,27 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
                  no MathExp2, so it must be decomposed to exp(x * ln2) before this point. \
                  It is NOT mapped onto their catch-all `OpKind::Math`: riding a generic \
                  fallback is how a consumer receives a well-formed op it cannot act on",
-            ))
+            ));
         }
         O::Module | O::FuncFunc | O::TtFunc => {
             return Err(refuse(format!(
                 "`{}` is a container, not an operation: it becomes their `IRFunction`. \
                  Reaching here means the walk did not treat it as the function it is",
                 k.spelling()
-            )))
+            )));
         }
         O::KtdfCoreletPlan | O::KtdfCorelet => {
             return Err(refuse(format!(
                 "`{}` should have been DROPPED, not mapped: the corelet plan is discarded \
                  before SuperDSC. Reaching here is a bug in `lower_block`",
                 k.spelling()
-            )))
+            )));
         }
         O::UnrealizedConversionCast => {
             return Err(refuse(
                 "`builtin.unrealized_conversion_cast` survived to the handoff: it is a \
                  type-conversion scaffold and their type has no counterpart",
-            ))
+            ));
         }
         // OUR TYPE'S ESCAPE HATCH IS NOT THEIR GAP.
         //
@@ -627,14 +627,14 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
                     "`{other}` is carried as our `OpKind::Other` and has no arm here. If \
                      their type names it, add the arm; if it is a `tt.*` op then to_ktir \
                      left it behind, which is the one thing that pass exists to prevent"
-                )))
+                )));
             }
         },
         other => {
             return Err(refuse(format!(
                 "`{}` has no variant in their `OpKind`",
                 other.spelling()
-            )))
+            )));
         }
     })
 }
@@ -714,17 +714,19 @@ fn state_shape_and_dtype<'a>(mut o: Operation<'a>, a: &'a Arena) -> Result<Opera
     // A SHAPED result's element type. `IrType::elem` also answers for a bare `Scalar`, which is
     // deliberately NOT stamped: their producer sets the attribute on tiles and views, and the
     // executor reads it only for those.
-    if t.dims().is_some() && o.attr(KAttrKey::Dtype).is_none() {
-        if let Some(elem) = t.elem() {
-            o = o.with_attr(a, KAttrKey::Dtype, KAttr::Dtype(elem));
-        }
+    if t.dims().is_some()
+        && o.attr(KAttrKey::Dtype).is_none()
+        && let Some(elem) = t.elem()
+    {
+        o = o.with_attr(a, KAttrKey::Dtype, KAttr::Dtype(elem));
     }
     // The shape. `sizes_dyn` is the runtime-extent form of the same fact, so an op carrying that
     // states it already and must not be given a second, constant answer.
-    if o.attr(KAttrKey::Shape).is_none() && o.attr(KAttrKey::SizesDyn).is_none() {
-        if let Some(dims) = t.dims() {
-            o = o.with_attr(a, KAttrKey::Shape, KAttr::IntList(a.ints(dims.to_vec())));
-        }
+    if o.attr(KAttrKey::Shape).is_none()
+        && o.attr(KAttrKey::SizesDyn).is_none()
+        && let Some(dims) = t.dims()
+    {
+        o = o.with_attr(a, KAttrKey::Shape, KAttr::IntList(a.ints(dims.to_vec())));
     }
     Ok(o)
 }
@@ -931,10 +933,10 @@ fn generic_as_broadcast<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>>
 
     let mut used = vec![false; result_rank];
     for e in parsed.exprs {
-        if let KExpr::Dim(i) = e {
-            if *i < result_rank {
-                used[*i] = true;
-            }
+        if let KExpr::Dim(i) = e
+            && *i < result_rank
+        {
+            used[*i] = true;
         }
     }
     let dims: Vec<i64> = (0..result_rank)
@@ -1293,7 +1295,7 @@ fn exp2_as_exp<'a>(op: &Op, a: &'a Arena, fresh: &mut Fresh) -> Result<Vec<Opera
             return Err(refuse(format!(
                 "`math.exp2` on an unexpected type; only a tensor or a scalar is \
                  decomposable here, got {other:?}"
-            )))
+            )));
         }
     };
     let x = *op
@@ -1438,7 +1440,7 @@ pub fn lower<'a>(m: &Module, a: &'a Arena) -> Result<IRFunction<'a>> {
                  is a 3-tuple, so a multi-axis grid needs an explicit mapping rather than a \
                  guess",
                 g.len()
-            )))
+            )));
         }
         _ => return Err(refuse("the function has no `grid` attribute")),
     };
