@@ -1,7 +1,5 @@
 //! THE TRANSCENDENTALS' WIDTH GATE, which is the ORACLE'S and was missing here.
 //!
-//! Needs the `ruff` feature: every case starts from Python SOURCE.
-#![cfg(feature = "ruff")]
 //!
 //! `tl.exp`, `tl.math.exp2` and `tl.rsqrt` are each decorated
 //! `@_check_dtype(dtypes=["fp32", "fp64"])` in `python/triton/language/math.py`. On an f16

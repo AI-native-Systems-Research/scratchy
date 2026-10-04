@@ -101,26 +101,11 @@ pub struct KernelSpec {
 
 /// Compile Python source into a TTIR module.
 ///
-/// Needs the `ruff` feature, which is what supplies the Python parser. Without it the rest
-/// of the crate still builds and tests -- see [`compile_ast`], which takes an AST that has
-/// already been built and is how the dependency-free configuration is exercised.
-#[cfg(feature = "ruff")]
+/// The parse step is this crate's own [`crate::py::parser`] -- no feature gate, no
+/// dependency. [`compile_ast`] remains split out so tests can build an AST directly.
 pub fn compile(src: &str, spec: &KernelSpec, target: Target) -> Result<Module> {
-    let module = crate::py::ruff_adapter::parse(src)?;
+    let module = crate::py::parser::parse(src)?;
     compile_ast(&module, spec, target)
-}
-
-/// The dependency-free build has no Python parser, so this says so rather than existing as
-/// a function that cannot work.
-#[cfg(not(feature = "ruff"))]
-pub fn compile(_src: &str, _spec: &KernelSpec, _target: Target) -> Result<Module> {
-    Err(Error::new(
-        "no Python parser is compiled in: build with `--features ruff`. The parser is behind \
-         a Cargo feature because this workspace's other crates are dependency-free and must \
-         build offline on the pod; see the crate docs. `compile_ast` works either way.",
-        0,
-        0,
-    ))
 }
 
 /// Compile an already-parsed module. Split out so tests can build an AST directly.

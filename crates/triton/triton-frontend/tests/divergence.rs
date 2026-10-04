@@ -1,8 +1,7 @@
 //! THE ONE DELIBERATE DIVERGENCE FROM TRITON, exercised directly.
 //!
-//! Needs the `ruff` feature: every case starts from Python SOURCE. `tests/no_parser.rs`
-//! covers what the dependency-free build can still be held to.
-#![cfg(feature = "ruff")]
+//! Every case starts from Python SOURCE. `tests/no_parser.rs` covers the parts that
+//! need no Python source.
 //!
 //! `computation_type_impl` promotes `f16 / f16 -> f32` because "/ and % do not exist
 //! natively in PTX for fp16" (`python/triton/language/semantic.py:88-92`). That is a PTX

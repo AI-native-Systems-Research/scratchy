@@ -1,7 +1,5 @@
 //! THE FUSION EXPERIMENT, machine-checked: does the bridge accept a fused multi-layer kernel?
 //!
-//! Needs the `ruff` feature: every case starts from Python SOURCE.
-#![cfg(feature = "ruff")]
 //!
 //! `tests/golden_diff.rs` already proves both `decoder_block.py` kernels match their raw
 //! goldens field by field. This file records the NUMBERS the experiment was run for, as
