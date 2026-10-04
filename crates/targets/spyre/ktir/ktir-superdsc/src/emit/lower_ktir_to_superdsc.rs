@@ -36,7 +36,7 @@
 use super::{
     EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
     check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec,
-    pointwise_chunk_out_offset, pw2, rb, rbo,
+    pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -2101,6 +2101,117 @@ fn scale_slot(layout: Option<&BundleLayout>, value: f32) -> Option<usize> {
             .iter()
             .position(|s| s.to_bits() == value.to_bits())
     })
+}
+
+/// THE WINDOWED NORM'S GAIN OFFSET — the `(1+w)` convention's `+1`, read off the
+/// program's gamma leg: the ONE `arith.addf` whose non-splat operand is a `ktdp.load`
+/// (the gamma row's rank-1 load), with exactly one constant-splat operand.
+///
+/// The emulator executes this addition (the program states it, `KtirFunc::rmsnorm`'s
+/// gamma leg), but the descriptor chain multiplies by the STORED row — so the door
+/// REFUSES a nonzero offset by name rather than lowering a different formula than the
+/// program runs. `None` when there is no such addf (the `Scale` convention: the whole
+/// gemma-4 per-head family), and `Some(0.0)` never occurs — the producer omits the addf
+/// entirely at offset 0, so a stated zero-offset addf is a producer bug worth seeing.
+fn program_gain_offset(f: &IRFunction<'static>) -> Option<f32> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(kk, v)| match (kk, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    for add in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::ArithAddf)
+    {
+        // The gamma leg's addf: one operand a loaded row, the other the offset splat.
+        let has_load = add.operands.iter().any(|&s| {
+            def_of(s).is_some_and(|d| d.op_type == OpKind::KtdpLoad)
+        });
+        if !has_load {
+            continue;
+        }
+        let mut splats = add.operands.iter().filter_map(|&s| splat_value(s));
+        let v = splats.next()?;
+        if splats.next().is_some() {
+            return None;
+        }
+        return Some(v as f32);
+    }
+    None
+}
+
+/// THE WINDOWED NORM'S EPSILON — every `math.sqrt`/`math.rsqrt` root's feeding `arith.addf`
+/// splat, READ ACROSS ALL ROOTS AND REQUIRED TO AGREE.
+///
+/// [`program_rmsnorm_eps`] demands exactly ONE root, which is the whole-region norm's law
+/// (a second root there means two norms in one program). The fused sandwich is different
+/// BY CONSTRUCTION: one independent chain per head, so `H` roots stating the SAME epsilon —
+/// the same one-or-many-agree shape [`program_scalarmul_scale`] already established for a
+/// program that states one constant once per block. A root with no addf, an addf with no
+/// splat, or two roots disagreeing by a single bit are each "this is not a windowed norm"
+/// and answer `None`.
+///
+/// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry
+/// this value is looked up in, by bits, so it must read the same value rather than restate
+/// the reading.
+pub fn program_windowed_eps(f: &IRFunction<'static>) -> Option<f32> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let splat_value = |s: Ssa| -> Option<f64> {
+        let sp = def_of(s)?;
+        if sp.op_type != OpKind::TensorSplat {
+            return None;
+        }
+        let c = def_of(*sp.operands.first()?)?;
+        if c.op_type != OpKind::ArithConstant {
+            return None;
+        }
+        c.attributes.iter().find_map(|(kk, v)| match (kk, v) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })
+    };
+    let mut roots = f.operations.iter().filter(|o| {
+        matches!(o.op_type, OpKind::MathSqrt | OpKind::MathRsqrt)
+    });
+    let _first = roots.next()?;
+    if roots.next().is_none() {
+        // One root is the whole-region form — `program_rmsnorm_eps`'s own reading, which
+        // this reader must agree with so the two norms resolve the same registry slot.
+        return program_rmsnorm_eps(f);
+    }
+    let mut found: Option<f64> = None;
+    for root in f
+        .operations
+        .iter()
+        .filter(|o| matches!(o.op_type, OpKind::MathSqrt | OpKind::MathRsqrt))
+    {
+        let add = def_of(*root.operands.first()?)?;
+        if add.op_type != OpKind::ArithAddf {
+            return None;
+        }
+        let mut splats = add.operands.iter().filter_map(|&s| splat_value(s));
+        let eps = splats.next()?;
+        if splats.next().is_some() {
+            return None;
+        }
+        match found {
+            None => found = Some(eps),
+            Some(v0) if v0.to_bits() == eps.to_bits() => {}
+            Some(_) => return None,
+        }
+    }
+    found.map(|v| v as f32)
 }
 
 /// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry this
@@ -5078,6 +5189,239 @@ pub fn rmsnorm_unit(
         sym_id_base,
         layout,
     ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::WindowedRmsNorm`] — the
+/// FUSED per-head norm sandwich (`Reshape{Times(H)} → norm → Reshape{Times(1)}`).
+///
+/// `assemble_rmsnorm`'s chain applied per head: for each head `h`, the SAME six ops
+/// over the `[m, D]` window at base offset `h·D·m` of the original `[m, H·D]` tensor —
+/// which the head-window/block-alignment law (see the `Program` variant's docs) places
+/// at exactly the elements the deleted split+flatten computed. The door derives every
+/// extent from the program's own views, the way the attention door derives its geometry:
+/// `m` and `H·D` off the output's view, `D` off the output's FIRST ACCESS TILE (one
+/// head's window — the tile `KtirFunc::windowed_rmsnorm` states), `H = (H·D)/D`.
+///
+/// ⭐ THE SYNTHETICS ARE DECLARED ONCE, AT THE FULL RE-LAID FOOTPRINTS — `Sq16`/`Xn` at
+/// `[H·m, D]`, `Mean`/`Meps`/`Rinv` at `[H·m, stick]` — and addressed per head at
+/// `h·m·D` / `h·m·stick` base offsets: the writer and the reader of each synthetic use
+/// the SAME per-head offset, so the layout they agree on is H consecutive per-head
+/// blocks (the same nesting the un-fused form's one `[H·m, D]` norm used, which is why
+/// the memory plan is comparable rather than larger).
+///
+/// ⭐ THE EPSILON comes from [`program_windowed_eps`] — the read-all-roots-agree form —
+/// because this program states one root per head; the whole-region reader would refuse
+/// it. Resolved to the registry slot by bits, exactly as every other norm constant.
+///
+/// ⛔ THE GAIN CONVENTION IS CARRIED, NOT RE-DERIVED: the sandwich matcher accepted BOTH
+/// conventions and the program's gamma leg applies the `+1` offset itself (the emulator
+/// executes it), but the DESCRIPTOR's gamma multiply reads the stored row — so a program
+/// with a nonzero gain offset cannot lower to this chain (the descriptor would compute
+/// `x̂·w` where the program computed `x̂·(1+w)`), and it is refused BY NAME rather than
+/// lowered wrong. Gemma-4's per-head q/k norms are the `Scale` convention (measured: the
+/// bake's `rmsnorm_s8` states no gain-offset addf), so this refusal costs nothing there;
+/// the (1+w) arches (gemma-3) keep the un-fused sandwich until their chain is ported.
+pub fn windowed_rmsnorm(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    let unit = matches!(
+        k.program,
+        crate::ktir_node::Program::WindowedRmsNorm { unit: true }
+    );
+    // x (+ gamma in the gained form) and the output — the parameters
+    // `KtirFunc::windowed_rmsnorm` mints, in first-use order.
+    let arity = if unit { 1 } else { 2 };
+    let (tensors, out) = split_out(name, r, layout, arity)?;
+    let eps = program_windowed_eps(&k.func).ok_or_else(|| Error {
+        message: format!(
+            "WindowedRmsNorm {name}: the program states no epsilon. `KtirFunc::windowed_rmsnorm` \
+             splats it into the `arith.addf` feeding each head's `math.sqrt` root — one root per \
+             head, all agreeing — and the descriptor's `[1,1]` const is resolved from that value, \
+             so a program without it cannot be lowered."
+        ),
+    })?;
+    let eps_idx = scale_slot(layout, eps).ok_or_else(|| Error {
+        message: format!(
+            "WindowedRmsNorm {name}: epsilon {eps}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor adds it as a bound `[1,1]` const, so \
+             the value the program uses must have a registry slot (registry desync)"
+        ),
+    })?;
+    // The door's own geometry, off the program's views: the output view states `[m, H·D]`
+    // and its first access tile is ONE head's `[m, D]` window.
+    let m = node_rows(name, &out)?;
+    let full = out.v_cols;
+    let d = out.c_len;
+    if d == 0 || full % d != 0 {
+        return err(format!(
+            "{name}: the output t{}'s view states [{m}, {full}] but its first access tile is \
+             [{}, {d}] — a windowed norm's tile is one head's width and must divide the view's",
+            out.tid, out.r_len,
+        ));
+    }
+    let heads = full / d;
+    // ⛔ THE GAIN-OFFSET REFUSAL (see this door's doc): the descriptor's gamma leg reads
+    // the stored row, so a program whose gamma leg adds an offset cannot lower here.
+    if !unit && program_gain_offset(&k.func).is_some_and(|o| o != 0.0) {
+        return err(format!(
+            "{name}: the program's gamma leg states a nonzero gain offset (the (1+w) \
+             convention), and this chain's descriptor multiplies by the STORED row — lowering \
+             it would compute `x̂·w` where the program computes `x̂·(1+w)`. The un-fused \
+             sandwich lowers this correctly; port the offset into the windowed chain before \
+             fusing it."
+        ));
+    }
+    check_pointwise_cols(d, "WindowedRmsNorm", out.tid)?;
+    let stk = crate::superdsc_opspec::Fp16::ELEMS_PER_STICK;
+    let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
+    let x = tensors[0].name();
+    let t = out.tid;
+    let out_id = PlaceId::Act(t);
+    use crate::place::SynthRole as R;
+    let syn = |role: R| crate::placement::syn(layout, out_id.synth(role));
+    // ── THE SYNTHETICS ──
+    //
+    // `Sq16` (and `Xn` in the gained form) are ONE `[m, H·D]` buffer each — the same
+    // footprint the un-fused form's `[H·m, D]` re-laid intermediate had — addressed per
+    // head at the window offset, which the block-alignment law keeps on the stick-major
+    // rank-2 path at prefill (writer and reader of each use the SAME offset).
+    //
+    // ⭐ THE REDUCED SCALARS ARE PER-HEAD BUFFERS AT OFFSET ZERO (`HeadMean`/`HeadMeps`/
+    // `HeadRinv`, the fp8 amax-partial precedent): a reduce's accum must sit at a
+    // whole-block shift of its own slab for rank-2, and a shared `[H·m, stick]` buffer's
+    // `h·m·stick` offsets are not block-aligned at the reduce's `[m, D]` block — the flat
+    // rank-3 fallback would then read the stick-major `sq16` write scrambled. One buffer
+    // per head makes every scalar-chain op offset-free.
+    let sq16 = syn(R::Sq16);
+    let xn = syn(R::Xn);
+    if let Some(l) = layout {
+        l.synth(out_id.synth(R::Sq16), &[m, full]);
+        if !unit {
+            l.synth(out_id.synth(R::Xn), &[m, full]);
+        }
+        for h in 0..heads {
+            l.synth(out_id.synth(R::HeadMean(h)), &[m, stk]);
+            l.synth(out_id.synth(R::HeadMeps(h)), &[m, stk]);
+            l.synth(out_id.synth(R::HeadRinv(h)), &[m, stk]);
+        }
+    }
+    // Handle kinds: `x`/`out`/`sq16`/`xn` are the residual stream's RowBlocked; the
+    // reduced scalars are one-stick-wide. `assemble_rmsnorm`'s comment carries the law.
+    let x_h = rb(&x, m, full);
+    let out_h = rb(&out.name(), m, full);
+    let sq16_h = rb(&sq16, m, full);
+    let xn_h = rb(&xn, m, full);
+    let eps_h = rb(&eps_const, 1, stk);
+    let gamma_h = if unit { None } else { Some(rb(&tensors[1].name(), 1, d)) };
+    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
+    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(d);
+    let s_cols = crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16);
+    let mut ops: Vec<EmittedOp> = Vec::new();
+    for h in 0..heads {
+        // The head window's base offset in the `[m, H·D]` buffers — a whole-block shift of
+        // this op's own `[m, D]` block (the block-alignment law).
+        let win = crate::addr::col_of(m, full, h * d, crate::superdsc_opspec::Df::Fp16);
+        // The per-head reduced scalars — their OWN buffers, addressed at ZERO.
+        let mean_h = rb(&syn(R::HeadMean(h)), m, stk);
+        let meps_h = rb(&syn(R::HeadMeps(h)), m, stk);
+        let rinv_h = rb(&syn(R::HeadRinv(h)), m, stk);
+        let prefix = format!("wh{h}_o{t}");
+        // 1. sq16 = x² over the head window (out at the window — `pw2`'s ZERO would
+        //    make every head overwrite head 0's block).
+        ops.push(assemble_pointwise_broadcast_off(
+            &format!("rmsq_{prefix}"),
+            "mul",
+            t_rows,
+            f_cols,
+            &[In::sliced(&x_h, win).ew(), In::sliced(&x_h, win).ew()],
+            &sq16_h,
+            win,
+            sym_id_base,
+            layout,
+        ));
+        // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
+        //    its own head's buffer at ZERO (the fp8 amax-partial shape).
+        ops.push(assemble_reduce_off(
+            &format!("rmmean_{prefix}"),
+            "mean",
+            t_rows,
+            f_cols,
+            &sq16_h,
+            win,
+            &mean_h,
+            crate::addr::DevOff::ZERO,
+            sym_id_base,
+            layout,
+        ));
+        // 3. mean + eps.
+        ops.push(pw2(
+            &format!("rmeps_{prefix}"),
+            "add",
+            t_rows,
+            s_cols,
+            In::full(&mean_h),
+            In::scalar(&eps_h),
+            &meps_h,
+            sym_id_base,
+            layout,
+        ));
+        // 4. rinv = rsqrt(mean+eps).
+        ops.push(pw1(
+            &format!("rmrsqrt_{prefix}"),
+            "rsqrt",
+            t_rows,
+            s_cols,
+            In::full(&meps_h),
+            &rinv_h,
+            sym_id_base,
+            layout,
+        ));
+        // 5. xn = x·rinv (r per-row of the head's block, out-broadcast over D) — the
+        //    unit form's TERMINAL multiply writes `out` directly here instead.
+        // 6. out = xn·gamma (the `[1, D]` row, mb-broadcast).
+        if let Some(g) = &gamma_h {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rmxn_{prefix}"),
+                "multiply",
+                t_rows,
+                f_cols,
+                &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
+                &xn_h,
+                win,
+                sym_id_base,
+                layout,
+            ));
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rmg_{prefix}"),
+                "multiply",
+                t_rows,
+                f_cols,
+                &[In::sliced(&xn_h, win).ew(), In::mb(g).ew()],
+                &out_h,
+                win,
+                sym_id_base,
+                layout,
+            ));
+        } else {
+            ops.push(assemble_pointwise_broadcast_off(
+                &format!("rmxn_{prefix}"),
+                "multiply",
+                t_rows,
+                f_cols,
+                &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
+                &out_h,
+                win,
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    Ok(ops)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::TanhSoftCap`] —

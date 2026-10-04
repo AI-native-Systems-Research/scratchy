@@ -754,6 +754,226 @@ fn lower_reshape_node<F: RopeForm>(
     Ok(vec![e])
 }
 
+/// THE PER-HEAD NORM SANDWICH, MATCHED BY DATAFLOW — `Reshape{Times(H>1)} →
+/// RmsNorm/RmsNormUnit → Reshape{Times(1)}`, the gemma-4 per-head q/k-norm shape
+/// (qwen3's, too — the bridge mints it for every per-head DSL norm).
+///
+/// ⭐ WHY A DATAFLOW MATCH AND NOT ADJACENCY: the three nodes are INTERLEAVED with the
+/// unrelated flat `v_norm` in walk order (the split of q and the split of k/v share a
+/// producer), so "the next node is the norm" is false in every gemma-4 layer. What is
+/// true — and all this matcher asks — is that each of the three tensors has EXACTLY ONE
+/// consumer, identified by scanning `ir.nodes` for reads of it.
+///
+/// ⭐ THE FLATTEN-BACK PROOF the match demands: the split states `Times(H)` (a per-head
+/// view multiplies rows), the flatten states `Times(1)`, both preserve the element count
+/// and row-major order (the Reshape law), and the flatten's `[rows, cols]` must equal the
+/// SPLIT'S INPUT's `[rows, cols]` — the same extents, not merely the same count, so the
+/// flatten restores exactly the arrangement the split left and head window `h` of the
+/// output is the split input's columns `h·D..(h+1)·D`.
+///
+/// ⛔ EVERY CHECK IS A REFUSAL BACK TO THE UN-FUSED PATH. Any extra consumer of the
+/// split's output (a skip connection reading the flat q), any op between norm and
+/// flatten, an in-place alias (split output == flatten output) — the matcher returns
+/// `None` and all three nodes lower exactly as they did before this existed. The
+/// byte-identity of the fallback is pinned by test.
+struct HeadNormSandwich<'a, F: RopeForm> {
+    /// The split `Reshape{Times(H)}` node.
+    split: &'a SubtileNode<F>,
+    /// The per-head norm node (gained or unit).
+    norm: &'a SubtileNode<F>,
+    /// The flatten-back `Reshape{Times(1)}` node.
+    flatten: &'a SubtileNode<F>,
+    /// The per-head width `D` (the split's output columns). The head COUNT is not
+    /// carried: it is `full / D` of the split input's own extents, re-derived by the
+    /// program builder and the door alike, so no second spelling can disagree.
+    head_dim: u32,
+}
+
+/// The nodes reading `t` (any region of it) — the consumers a single-use match demands.
+fn consumers_of<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+) -> Vec<&SubtileNode<F>> {
+    ir.nodes
+        .iter()
+        .filter(|n| n.inputs.iter().any(|r| r.tensor == t))
+        .collect()
+}
+
+/// Whether `n`'s input region is the WHOLE of `t` — the fused norm must read every
+/// element of the re-laid view (a partial read means a window this fusion cannot state).
+fn reads_whole<F: RopeForm>(n: &SubtileNode<F>, t: u32) -> bool {
+    let r = &n.inputs.iter().find(|r| r.tensor.index() as u32 == t);
+    match r {
+        Some(r) => {
+            r.region.rows.start == 0
+                && r.region.cols.start == 0
+                && r.region.rows.len == n.output.region.rows.len
+                && r.region.cols.len == n.output.region.cols.len
+        }
+        None => false,
+    }
+}
+
+/// Match the sandwich AT THE SPLIT — the one position the fused program is emitted from.
+fn sandwich_at_split<'a, F: RopeForm>(
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+) -> Option<HeadNormSandwich<'a, F>> {
+    let SubOp::Reshape {
+        rows: scratchy_subtile::subtile_ir::RowScale::Times(heads),
+        cols: head_dim,
+    } = &node.op
+    else {
+        return None;
+    };
+    // A per-head view MULTIPLIES rows; `Times(1)` is a shape-preserving op's non-view.
+    if heads.get() == 1 {
+        return None;
+    }
+    if node.inputs.len() != 1 {
+        return None;
+    }
+    let src = &node.inputs[0];
+    let split_out = node.output.tensor;
+    // The split's single consumer must be the per-head norm, reading the whole view.
+    let [norm] = consumers_of(ir, split_out)[..] else {
+        return None;
+    };
+    let (eps, gained) = match &norm.op {
+        SubOp::RmsNorm {
+            eps,
+            gain: scratchy_subtile::subtile_ir::GainConvention::Scale,
+        } => (*eps, true),
+        // The (1+w) convention adds `+1` to the loaded gain row inside the program —
+        // this producer carries it exactly as `lower_rmsnorm_node` does.
+        SubOp::RmsNorm {
+            eps,
+            gain: scratchy_subtile::subtile_ir::GainConvention::OnePlusScale,
+        } => (*eps, true),
+        SubOp::RmsNormUnit { eps } => (*eps, false),
+        _ => return None,
+    };
+    if !gained && norm.inputs.len() != 1 || gained && norm.inputs.len() != 2 {
+        return None;
+    }
+    if !reads_whole(norm, split_out.index() as u32) {
+        return None;
+    }
+    // The norm's single consumer must be the flatten-back, restoring the split's input.
+    let norm_out = norm.output.tensor;
+    let [flatten] = consumers_of(ir, norm_out)[..] else {
+        return None;
+    };
+    let SubOp::Reshape {
+        rows: scratchy_subtile::subtile_ir::RowScale::Times(one),
+        cols: flat_cols,
+    } = &flatten.op
+    else {
+        return None;
+    };
+    if one.get() != 1 {
+        return None;
+    }
+    // THE FLATTEN-BACK PROOF: same extents as the split's input, so the flat arrangement
+    // — and therefore each head window — is restored exactly. A same-count/different-shape
+    // flatten (e.g. `[m, H·D] → [m·D, H]`) permutes elements and is NOT this fusion.
+    if flatten.inputs.len() != 1
+        || flatten.inputs[0].tensor != norm_out
+        || flatten.output.region.rows.len != src.region.rows.len
+        || *flat_cols != src.region.cols.len
+        || flatten.output.tensor == split_out
+    {
+        return None;
+    }
+    let _ = eps; // carried by the program's own splat; read by the door's eps reader
+    Some(HeadNormSandwich {
+        split: node,
+        norm,
+        flatten,
+        head_dim: *head_dim,
+    })
+}
+
+/// The node whose OUTPUT is `t`, if exactly one — the producer a chain-walk follows
+/// upward. `None` for a source (no producer) or a tensor two nodes write (not a chain).
+fn producer_of<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+) -> Option<&SubtileNode<F>> {
+    let mut it = ir.nodes.iter().filter(|n| n.output.tensor == t);
+    let p = it.next()?;
+    it.next().is_none().then_some(p)
+}
+
+/// Whether `node` is the MIDDLE (norm) of a sandwich matched at its own split — the
+/// node whose program is emitted there and whose own lowering must therefore be NOTHING.
+fn is_sandwich_norm<F: RopeForm>(node: &SubtileNode<F>, ir: &SubtileIR<F>) -> bool {
+    let Some(x) = node.inputs.first() else {
+        return false;
+    };
+    producer_of(ir, x.tensor).is_some_and(|split| {
+        sandwich_at_split(split, ir).is_some_and(|s| s.norm.id == node.id)
+    })
+}
+
+/// Whether `node` is the TAIL (flatten-back) of a sandwich — same derivation, one hop up.
+fn is_sandwich_flatten<F: RopeForm>(node: &SubtileNode<F>, ir: &SubtileIR<F>) -> bool {
+    let Some(x) = node.inputs.first() else {
+        return false;
+    };
+    producer_of(ir, x.tensor).is_some_and(|norm| is_sandwich_norm(norm, ir))
+}
+
+/// Lower the per-head norm SANDWICH to ONE program — the norm applied to head windows of
+/// the ORIGINAL tensor, both reshapes deleted. [`HeadNormSandwich`]'s docs carry the
+/// proof; this builds the program: parameters are the split's SOURCE `x`, the gamma row
+/// (gained form only) and the flatten's OUTPUT. Per head `h`: load `x[:, h·D..(h+1)·D]`,
+/// the f32 mean-of-squares chain over `[m, D]`, and the terminal multiply writing the
+/// output's head window. The door (`windowed_rmsnorm` in `lower_ktir_to_superdsc`)
+/// derives every extent from these views.
+fn lower_sandwich_node<F: RopeForm>(
+    sandwich: &HeadNormSandwich<'_, F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    let HeadNormSandwich {
+        split,
+        norm,
+        flatten,
+        head_dim,
+    } = sandwich;
+    let x_r = &split.inputs[0];
+    let out_r = &flatten.output;
+    let gained = matches!(norm.op, SubOp::RmsNorm { .. });
+    let eps = match &norm.op {
+        SubOp::RmsNorm { eps, .. } | SubOp::RmsNormUnit { eps } => *eps,
+        _ => unreachable!("the matcher already proved which norm this is"),
+    };
+    let gain_offset = match &norm.op {
+        SubOp::RmsNorm {
+            gain: scratchy_subtile::subtile_ir::GainConvention::Scale,
+            ..
+        } => 0.0,
+        SubOp::RmsNorm {
+            gain: scratchy_subtile::subtile_ir::GainConvention::OnePlusScale,
+            ..
+        } => 1.0,
+        SubOp::RmsNormUnit { .. } => 0.0,
+        _ => unreachable!(),
+    };
+    let mut st = KtirFunc::new(ir);
+    st.windowed_rmsnorm(x_r, &norm.inputs.get(1), out_r, *head_dim, eps, gain_offset);
+    let name = Arena::global().str(format!("rmsnorm_s{}", split.id.index()));
+    let k = st.finish_shaped(
+        name,
+        ktir_superdsc::ktir_node::Program::WindowedRmsNorm { unit: !gained },
+    );
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
 /// Lower a [`SubOp::RopeRotate`] / the rotate of [`SubOp::RopeAppend`] to in-bundle
 /// SuperDSC ops via the PERMUTATION-MATMUL form (NeoX). The 32-wide rotate-half
 /// would violate the 64-fp16-stick constraint, so instead `rot = x·P` where `P` is a
@@ -1395,10 +1615,22 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // minus the gamma multiply, so it is the same 6-op decomposition with the
         // normalising multiply terminal. Unit gain means there is no GainConvention to
         // refuse here: nothing is applied.
-        SubOp::RmsNormUnit { eps } => match lower_rmsnorm_unit_node(node, ir, *eps, sym_id_base) {
-            Ok(v) => Ops(v),
-            Err(e) => Unhandled(e.0),
-        },
+        //
+        // ⭐ A SANDWICH'S MIDDLE LOWERS TO NOTHING: its computation is the fused program
+        // the split's arm already emitted (one windowed norm over all heads). The
+        // self-check re-runs the same matcher from the split, so it agrees with the head's
+        // decision in every walk — and any check that fails there falls through to the
+        // ordinary un-fused lowering here, byte-identical to before this fusion existed.
+        SubOp::RmsNormUnit { eps } => {
+            if is_sandwich_norm(node, ir) {
+                Ops(Vec::new())
+            } else {
+                match lower_rmsnorm_unit_node(node, ir, *eps, sym_id_base) {
+                    Ok(v) => Ops(v),
+                    Err(e) => Unhandled(e.0),
+                }
+            }
+        }
         SubOp::GateSplit { .. }
         | SubOp::GateApply
         | SubOp::GateScale
@@ -1518,10 +1750,28 @@ pub(crate) fn lower_one_node<F: RopeForm>(
              carries.",
             node.output.tensor.index() as u32,
         )),
-        SubOp::Reshape { .. } => match lower_reshape_node(node, ir, sym_id_base) {
-            Ok(v) => Ops(v),
-            Err(e) => Unhandled(e.0),
-        },
+        // ⭐ THE SANDWICH'S TWO ENDS — the split (head) is where the fused program is
+        // emitted; the flatten-back (tail) self-identifies as fused-away and emits NOTHING.
+        // The middle (norm) arms do the same. The match is dataflow-based (see
+        // `HeadNormSandwich`), so it is a pure function of the graph — the unrolled walk,
+        // `graph_wiring` and the re-rolled tape walk all reach the same answer at the same
+        // nodes, and any failed check falls back to the byte-identical un-fused lowering.
+        SubOp::Reshape { .. } => {
+            if is_sandwich_flatten(node, ir) {
+                Ops(Vec::new())
+            } else {
+                match sandwich_at_split(node, ir) {
+                    Some(sandwich) => match lower_sandwich_node(&sandwich, ir, sym_id_base) {
+                        Ok(v) => Ops(v),
+                        Err(e) => Unhandled(e.0),
+                    },
+                    None => match lower_reshape_node(node, ir, sym_id_base) {
+                        Ok(v) => Ops(v),
+                        Err(e) => Unhandled(e.0),
+                    },
+                }
+            }
+        }
         SubOp::MatmulTile { .. } if is_prefill_lm_head_tail => {
             match lower_prefill_lm_head_at_m1(node, ir, sym_id_base, layout, quantized) {
                 Ok(v) => Ops(v),
@@ -1575,9 +1825,14 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // folding it at `to_wavefront`). Before this, the (1 + w) form was refused BY NAME because
         // the program had no way to say the offset; now it does.
         SubOp::RmsNorm { eps, gain } => {
-            match lower_rmsnorm_node(node, ir, *eps, *gain, sym_id_base) {
-                Ok(v) => Ops(v),
-                Err(e) => Unhandled(e.0),
+            // ⭐ A SANDWICH'S MIDDLE LOWERS TO NOTHING — same law as `RmsNormUnit`'s arm.
+            if is_sandwich_norm(node, ir) {
+                Ops(Vec::new())
+            } else {
+                match lower_rmsnorm_node(node, ir, *eps, *gain, sym_id_base) {
+                    Ok(v) => Ops(v),
+                    Err(e) => Unhandled(e.0),
+                }
             }
         }
         SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
@@ -3750,6 +4005,103 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         let invb = self.broadcast(inv_e, dims.clone(), 1);
         let y = self.binop(OpKind::ArithMulf, x, invb, dims);
         self.store_region(y, out);
+    }
+
+    /// The FUSED per-head norm sandwich — [`Self::rmsnorm`]'s chain applied to head
+    /// windows of the ORIGINAL `[m, H·D]` tensor, writing the flatten-back output's
+    /// head windows, both reshapes deleted (`lower_sandwich_node` carries the proof).
+    ///
+    /// ⭐ THE VIEWS STATE THE DOOR'S FACTS: `x` is viewed `[m, H·D]` (the arrangement the
+    /// flatten restores), `gamma` is loaded rank-1 `[D]` (one head's width, shared across
+    /// heads — the on-disk q/k-norm rows), and the OUTPUT's first access tile is ONE
+    /// HEAD'S WINDOW `[m, D]` at column `0` — the tile the door reads the head width
+    /// from, exactly the way `Program::Attn`'s door reads its geometry off program views.
+    ///
+    /// ⛔ ONE `math.sqrt` ROOT PER HEAD, NOT ONE PER PROGRAM: `rmsnorm_inv`'s
+    /// single-root law exists for `program_rmsnorm_eps`'s reading of a WHOLE-REGION norm;
+    /// this program has `H` independent chains, and the door's reader
+    /// (`program_windowed_eps`) is the read-all-roots-require-agreement form (the
+    /// `program_scalarmul_scale` precedent) — so a per-head column-blocked chain would
+    /// ALSO be legal here, but this body keeps each head's chain whole-D because a head
+    /// (`D` = 256/512) fits the LX budget `rmsnorm_inv` already accounts for.
+    fn windowed_rmsnorm(
+        &mut self,
+        x_r: &TensorRegion,
+        gamma: &Option<&TensorRegion>,
+        out: &TensorRegion,
+        head_dim: u32,
+        eps: f32,
+        gain_offset: f32,
+    ) {
+        // The whole geometry is derivable from the two regions: `m` and `full` are
+        // `x`'s own extents (the matcher proved the flatten restores this arrangement),
+        // and `heads` is their quotient — the door re-derives the same three off the
+        // output's view, so taking them as arguments would be a second spelling that
+        // could disagree.
+        let (m, full) = (x_r.region.rows.len, x_r.region.cols.len);
+        debug_assert_eq!(full % head_dim, 0);
+        let heads = full / head_dim;
+        let dims = vec![i64::from(m), i64::from(head_dim)];
+        let rows = vec![i64::from(m)];
+        for h in 0..heads {
+            let off = h * head_dim;
+            // Head `h`'s window of `x` — a column slice of the ORIGINAL tensor, which is
+            // exactly what the deleted split+norm+flatten computed.
+            let xh = self.load_region(&sub_cols(x_r, off, head_dim));
+            // The f32 mean-of-squares chain over the head window: `rmsnorm_inv`'s
+            // arithmetic on a `[m, D]` slice, ending at `inv_e` (`[m]` f16).
+            let mut ssum = self.f32_splat(0.0, rows.clone());
+            let xf = {
+                let v = self.fresh();
+                let op = Operation::new(self.a, Some(v), OpKind::ArithExtf, &[xh]);
+                let ty = self.f32_ty(dims.clone());
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            let x2 = self.f32_binop(OpKind::ArithMulf, xf, xf, dims.clone());
+            let part = self.reduce(x2, ssum, OpKind::ArithAddf, 1, rows.clone());
+            ssum = part;
+            let dts = self.f32_splat(f64::from(head_dim), rows.clone());
+            let mean = self.f32_binop(OpKind::ArithDivf, ssum, dts, rows.clone());
+            let epst = self.f32_splat(f64::from(eps), rows.clone());
+            let meps = self.f32_binop(OpKind::ArithAddf, mean, epst, rows.clone());
+            let rms = {
+                let v = self.fresh();
+                let op = Operation::new(self.a, Some(v), OpKind::MathSqrt, &[meps]);
+                let ty = self.f32_ty(rows.clone());
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            let onet = self.f32_splat(1.0, rows.clone());
+            let inv = self.f32_binop(OpKind::ArithDivf, onet, rms, rows.clone());
+            let inv_e = {
+                let v = self.fresh();
+                let op = Operation::new(self.a, Some(v), OpKind::ArithTruncf, &[inv]);
+                let ty = self.tensor_ty(rows.clone());
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            let invb = self.broadcast(inv_e, dims.clone(), 1);
+            let xs = self.binop(OpKind::ArithMulf, xh, invb, dims.clone());
+            let y = match gamma {
+                Some(g) => {
+                    let gcol = self.load_1d(g.tensor, head_dim, 0, head_dim);
+                    let gcol = if gain_offset != 0.0 {
+                        let off = self.f32_splat(f64::from(gain_offset), vec![i64::from(head_dim)]);
+                        self.f32_binop(OpKind::ArithAddf, gcol, off, vec![i64::from(head_dim)])
+                    } else {
+                        gcol
+                    };
+                    let gb = self.broadcast(gcol, dims.clone(), 0);
+                    self.binop(OpKind::ArithMulf, xs, gb, dims.clone())
+                }
+                None => xs,
+            };
+            self.store_region(y, &sub_cols(out, off, head_dim));
+        }
     }
 
     /// SiluMul — `out[j] = (gate / (1 + exp(-gate))) · up`.

@@ -237,6 +237,38 @@ pub enum Program {
     /// columns, so the computation is pointwise over whatever layout the sort
     /// produced — no pair structure is read here.
     ExpertGatedAct(GatedAct),
+    /// `Reshape{Times(H>1)} → RmsNorm{eps, gain}/RmsNormUnit{eps} →
+    /// Reshape{Times(1)}` — the per-head q/k norm SANDWICH, fused to per-head
+    /// windows over the ORIGINAL tensor. The flatten-back restores exactly the
+    /// split's source arrangement (same element count, row-major order, the
+    /// split is `Times(H)` and the flatten `Times(1)`), so the sandwich is
+    /// `rmsnorm` applied to head windows: read `t_in[:, h·D..(h+1)·D]`, norm
+    /// over `[m, D]`, write `t_out`'s head window — and BOTH reshapes (true
+    /// re-laying copies, 87% of gemma-4's descriptors) vanish.
+    ///
+    /// THREE tensor parameters in the gained form (the split's source `x`, the
+    /// `gamma` row `[1, D]` shared across heads, the flatten's output `t_out`);
+    /// TWO in the unit form (no gamma). Which form a program is — and the head
+    /// count, width and gain convention — is derived at the door from the
+    /// program's own views, the same way [`Program::Attn`]'s geometry is: `x`
+    /// states `[m, H·D]`, `gamma` states `[1, D]` (or is absent), the output
+    /// states `[m, H·D]` and its first access tile is one head's window
+    /// `[m, D]`.
+    ///
+    /// ⭐ THE HEAD-WINDOW / BLOCK-ALIGNMENT LAW (why the offsets are legal):
+    /// a stick-blocked `[m, H·D]` tensor places element `(r, h·D + c)` at
+    /// `h·D·m + (c/64)·(m·64) + r·64 + c%64` (D is a 64-multiple — every head
+    /// dim this crate serves is), and a `[m, D]` op at base offset `h·D·m`
+    /// places `(r, c)` at exactly the same address — the head window is a
+    /// WHOLE-BLOCK SHIFT of the op's own block, which is the one offset class
+    /// `pointwise.rs`/`reduce.rs` accept for their stick-major rank-2 form.
+    /// The synthetics ([`crate::place::SynthRole`] `Sq16`/`Mean`/`Meps`/`Rinv`,
+    /// plus `Xn` in the gained form) are declared ONCE at the full re-laid
+    /// footprints — `[H·m, D]` for the pointwise ones, `[H·m, stick]` for the
+    /// reduced ones — and addressed per head through the same law, so a
+    /// program's heads share one set of buffers the way the un-fused form's
+    /// one norm did.
+    WindowedRmsNorm { unit: bool },
 }
 
 /// The activation an expert gates its up projection with — this crate's OWN copy of

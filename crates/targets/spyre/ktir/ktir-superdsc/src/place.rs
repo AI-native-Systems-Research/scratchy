@@ -58,6 +58,18 @@ pub enum SynthRole {
     Meps,
     Rinv,
     Xn,
+    /// ⭐ ONE HEAD'S reduced-scalar block of the FUSED per-head norm sandwich
+    /// (`WindowedRmsNorm`) — the `[m, stick]` mean / mean+eps / reciprocal of head `h`
+    /// alone, at offset ZERO of its own buffer. Indexed (like [`Self::FqAmaxP`]) because
+    /// the head count is the sandwich's own, known only at bake; and PER-HEAD rather
+    /// than one `[H·m, stick]` buffer with offsets because a reduce's accum must sit at
+    /// a whole-block shift of its own slab for the stick-major rank-2 path (the fp8
+    /// amax-partial precedent) — a shared buffer's `h·m·stick` offsets are not
+    /// block-aligned at the reduce's `[m, D]` block, and the flat rank-3 fallback would
+    /// then read the stick-major `sq16` write scrambled. Three roles, one law.
+    HeadMean(u32),
+    HeadMeps(u32),
+    HeadRinv(u32),
     // ── tanh softcap scratch ──
     /// `tanh(x/cap)` — the divided half of `cap·tanh(x/cap)`, one `[rows, cols]`
     /// buffer reused as its own tanh's destination.
@@ -135,6 +147,9 @@ impl fmt::Display for SynthRole {
             Self::Meps => f.write_str("meps"),
             Self::Rinv => f.write_str("rinv"),
             Self::Xn => f.write_str("xn"),
+            Self::HeadMean(h) => write!(f, "hmean{h}"),
+            Self::HeadMeps(h) => write!(f, "hmeps{h}"),
+            Self::HeadRinv(h) => write!(f, "hrinv{h}"),
             Self::Tanhc => f.write_str("tanhc"),
             Self::RMax => f.write_str("rmax"),
             Self::RSub => f.write_str("rsub"),

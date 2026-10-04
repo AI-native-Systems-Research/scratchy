@@ -122,6 +122,9 @@ pub fn lower(
         Program::SiluMul => silumul(name, &r, sym_id_base, layout),
         Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
         Program::RmsNormUnit => lk::rmsnorm_unit(name, k, &r, sym_id_base, layout),
+        // The fused per-head norm sandwich — the door derives its geometry off the
+        // program's own views (one head's window is the output's first access tile).
+        Program::WindowedRmsNorm { .. } => lk::windowed_rmsnorm(name, k, &r, sym_id_base, layout),
         Program::TanhSoftCap => lk::tanhsoftcap(name, k, &r, sym_id_base, layout),
         // The router's row softmax/renorm — no geometry door to cross, no registry
         // const to resolve: the whole chain is data-driven and the body is the

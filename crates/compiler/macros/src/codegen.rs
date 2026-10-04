@@ -8566,6 +8566,20 @@ fn synth_role_tokens(
             let j = proc_macro2::Literal::u32_unsuffixed(*j);
             quote! { #b::FqAmaxP(#j) }
         }
+        // The per-head windowed-norm synthetics (the `FqAmaxP` shape: one per head,
+        // all at offset zero).
+        R::HeadMean(h) => {
+            let h = proc_macro2::Literal::u32_unsuffixed(*h);
+            quote! { #b::HeadMean(#h) }
+        }
+        R::HeadMeps(h) => {
+            let h = proc_macro2::Literal::u32_unsuffixed(*h);
+            quote! { #b::HeadMeps(#h) }
+        }
+        R::HeadRinv(h) => {
+            let h = proc_macro2::Literal::u32_unsuffixed(*h);
+            quote! { #b::HeadRinv(#h) }
+        }
         R::Sq16 => quote! { #b::Sq16 },
         R::Mean => quote! { #b::Mean },
         R::Meps => quote! { #b::Meps },
