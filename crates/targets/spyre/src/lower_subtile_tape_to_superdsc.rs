@@ -2498,21 +2498,12 @@ const _: () = {
 /// `run_may_be_chunked == false`) and time-trip fan-out have had their say. A group past this
 /// ceiling is a build error (the oversized-group guard in `ktir_groups_via_superdsc`), not a
 /// multi-hour dxp that looks like a hang.
-pub struct DxGroupCeiling;
-
-impl DxGroupCeiling {
-    /// 4204: the granite-8b fp8 baseline's LARGEST MEASURED GROUP — the accepted 30-minute bake's
-    /// own maximum (bundle `4f460f8b68a6c85a` group_1, an mq=32 gathered fold: 4 windows ×
-    /// (2·32·8·2 legs + 11 ladder) + 64 gather copies = 4204, verified against the plan-only dump
-    /// three ways: file count, `bundle_id.json` (mq=32, attn=4722), and the fan-out formula).
-    /// ⛔ NOT 512/`GroupSize::CEILING`: the ORIGINAL guard doc claimed the baseline "never exceeds
-    /// ~512" and 512 would refuse granite-8b's own accepted bake — a doc comment is not evidence,
-    /// and the dump is. Gemma-4-12b fp8's ladder is lawful under 4204 except ONE group: the
-    /// 8,300-descriptor mq=32 sliding-class fold, which the batch rung skips by its documented
-    /// contract (that batch runs one rung narrower); the next-largest gemma group is 4,183.
-    /// Moving this constant is a MEASURED decision that names the bake, never a silent one.
-    pub const MAX_DESCRIPTORS: usize = 4204;
-}
+///
+/// ⭐ IT LIVES IN THE LEAF (`ktir_superdsc::sdsc_abstract`), beside the emission it bounds, and is
+/// RE-EXPORTED here so this file's own paths keep resolving — the ONE const the bake-side guard and
+/// the emitter's gathered-fold chunk split both read. A second, divergent ceiling would have to be a
+/// new name in a file that already resolves this one; see the const's own doc for its measurement.
+pub use scratchy_subtile::sdsc_abstract::DxGroupCeiling;
 
 /// Medium-grain fusion group size (trips per concrete dxp bundle) — [`GroupSize::PRODUCTION`].
 /// Stays a function so the pure `group_ranges` takes it as an argument and CBMC keeps its bound
@@ -5508,10 +5499,14 @@ fn ktir_groups_via_superdsc(
             "[spyre-superdsc] BUNDLE {fp}: launch group {gi} holds {size} descriptor(s) \
              ('{first}' .. '{last}') — over the {}-descriptor dxp bake ceiling. A group this \
                  large takes a single dxp_standalone HOURS (measured 2.5+ h at 8,300 on \
-                 gemma-4-12b) and is indistinguishable from a hang. The usual cause is a gathered \
-                 PageFold run (uncapped by design, the group-major reps law) fused across a whole \
-                 body's attention ops, times per-op time-trip fan-out. Split the emission so no \
-                 group exceeds the ceiling, or shrink the fan-out. Refusing to bake.",
+                 gemma-4-12b) and is indistinguishable from a hang. A GATHERED PageFold run is \
+                 split into per-window chunks by the emitter (`attn.rs`'s chunk sweep, gated on \
+                 this same ceiling) — each chunk carrying its own gather copies and tagged with \
+                 its chunk index so the trip walk breaks the run — so a gathered fold reaching \
+                 this guard means either the projection under-counts the emission (a new ladder \
+                 or leg shape the closed form does not cover) or the oversize is per-op \
+                 time-trip fan-out, which the split does not address. Fix the projection or \
+                 shrink the fan-out. Refusing to bake.",
                 DxGroupCeiling::MAX_DESCRIPTORS,
             )));
     }

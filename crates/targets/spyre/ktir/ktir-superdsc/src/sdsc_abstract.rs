@@ -5133,6 +5133,37 @@ const _: () = assert!(
      it off the next kv head's plane"
 );
 
+/// ⛔ THE LARGEST SINGLE dxp GROUP A BUNDLE MAY STAGE (descriptors) — the ONE ceiling the emitter's
+/// gathered-fold chunk split and the bake-side oversized-group guard BOTH read.
+///
+/// Lives HERE — in the leaf crate that owns the emission it bounds — so the split decision and the
+/// guard cannot each grow their own constant; the spyre target crate re-exports it under the same
+/// name its own paths already used, which is the whole enforcement of "one const": a second
+/// divergent value would have to be a NEW name in a file that already resolves this one.
+///
+/// Distinct from the spyre crate's `GroupSize::CEILING`: that is the largest value the per-kind cap
+/// may be SET to; this is the largest group the whole partition may produce once the uncapped kinds
+/// (gathered PageFold, `run_may_be_chunked == false`) and time-trip fan-out have had their say. A
+/// group past this ceiling is a build error (the oversized-group guard in
+/// `lower_subtile_tape_to_superdsc::ktir_groups_via_superdsc`), not a multi-hour dxp that looks
+/// like a hang — and the emitter pre-empts it by splitting an over-ceiling gathered fold into
+/// self-contained window chunks (see `attn.rs`'s chunk sweep).
+pub struct DxGroupCeiling;
+
+impl DxGroupCeiling {
+    /// 4204: the granite-8b fp8 baseline's LARGEST MEASURED GROUP — the accepted 30-minute bake's
+    /// own maximum (bundle `4f460f8b68a6c85a` group_1, an mq=32 gathered fold: 4 windows ×
+    /// (2·32·8·2 legs + 11 ladder) + 64 gather copies = 4204, verified against the plan-only dump
+    /// three ways: file count, `bundle_id.json` (mq=32, attn=4722), and the fan-out formula).
+    /// ⛔ NOT 512/`GroupSize::CEILING`: the ORIGINAL guard doc claimed the baseline "never exceeds
+    /// ~512" and 512 would refuse granite-8b's own accepted bake — a doc comment is not evidence,
+    /// and the dump is. Gemma-4-12b fp8's ladder is lawful under 4204 except ONE group: the
+    /// 8,300-descriptor mq=32 class-0 fold, which the window-chunk split cuts into k self-contained
+    /// chunks each at or under this value; the next-largest gemma group is 4,183 and stays unsplit.
+    /// Moving this constant is a MEASURED decision that names the bake, never a silent one.
+    pub const MAX_DESCRIPTORS: usize = 4204;
+}
+
 impl PagedKvPool {
     /// Positions per page.
     ///

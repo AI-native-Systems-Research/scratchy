@@ -1548,6 +1548,67 @@ mod tests {
         );
     }
 
+    /// ⭐⭐⭐⭐⭐ A GATHERED FOLD OP'S `kv_request` TAG IS ADDRESSING-**INERT** — pinned here because the
+    /// emitter now USES that tag as a chunk boundary (the window-chunk split of an oversized gathered
+    /// fold: consecutive chunks get distinct tags so `Trip::fusable_with` breaks the run, keeping each
+    /// dxp launch group under the bake ceiling). Every path the tag could reach for a fold op must be a
+    /// no-op, or the boundary mechanism would move an address:
+    ///
+    /// * `is_paged_fold` short-circuits `nonfold_page_delta` (`fold_delta` owns the fold's KV base, and
+    ///   a GATHERED fold's is zero — the entries are absolute);
+    /// * `op_slot_pos` feeds only slot/slab writes, which a fold op has neither of;
+    /// * `fold_delta`'s intermediate term multiplies the PASS's request (from `fold_pass`), never the
+    ///   op's — and `int_rep_stride_bytes` is 0 for a whole-batch-regime fold, which the gathered fold is.
+    ///
+    /// This is the same argument `nonfold_page_delta`'s own fold test above makes for request 1, but
+    /// stated for the gathered/batched shape the chunk split actually tags, through the COMPOSITE the
+    /// shim calls (`seg_deltas`) rather than the part.
+    #[test]
+    fn a_gathered_fold_ops_request_tag_moves_no_address() {
+        let s = sess();
+        // The gathered fold's own shape: paged, batched requests, gathered, whole-batch rows.
+        let chunk0 = OpKv {
+            page_fold: true,
+            batched_requests: true,
+            gathered: true,
+            page_slots: 256,
+            ..Default::default()
+        };
+        // Chunk 1's ops differ ONLY by the tag — the boundary the emitter draws.
+        let chunk1 = OpKv {
+            request: 1,
+            ..chunk0
+        };
+        let per = UniformPages::of(&s).expect("fixture rows agree");
+        for rep in 0..4 {
+            let d0 = seg_deltas(
+                &chunk0,
+                &s,
+                rep,
+                per,
+                SlotPos::of_launch(100),
+                Bytes(4242),
+            );
+            let d1 = seg_deltas(
+                &chunk1,
+                &s,
+                rep,
+                per,
+                SlotPos::of_launch(100),
+                Bytes(4242),
+            );
+            assert_eq!(d0, d1, "rep {rep}: the tag reached an address");
+            // And the terms are the gathered fold's own: no KV shift (absolute entries), the mask steps
+            // by the rep, and the intermediate is unshifted (whole-batch regime, stride 0).
+            assert_eq!(d0.kv, Bytes(0), "a gathered fold takes no KV segment shift");
+            assert_eq!(
+                d0.intermediate,
+                Bytes(0),
+                "a whole-batch fold rebases no intermediate rows"
+            );
+        }
+    }
+
     #[test]
     fn a_tagged_non_fold_op_resolves_its_own_page_an_untagged_one_keeps_the_callers() {
         let s = sess();

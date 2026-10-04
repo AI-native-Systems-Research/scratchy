@@ -67,8 +67,8 @@ use crate::emit::{
 };
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{
-    BlockCols, FeatIdx, FlatTag, KernelTag, KtTileFeats, KtTileSlots, Lanes, MaskRows, MatK, MatM,
-    MatN, MatY, PerRequestRows, RowCount, RowWindow, SlotWindow, Stk,
+    BlockCols, DxGroupCeiling, FeatIdx, FlatTag, KernelTag, KtTileFeats, KtTileSlots, Lanes, MaskRows,
+    MatK, MatM, MatN, MatY, PerRequestRows, RowCount, RowWindow, SlotWindow, Stk,
 };
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{DataFormat, Df, Fp16};
@@ -109,6 +109,17 @@ pub(crate) const HEAD_WIDE_BUFS: [crate::place::SynthRole; 2] = {
     use crate::place::SynthRole as R;
     [R::RunO, R::OTmp]
 };
+
+/// ⭐ THE ONLINE-SOFTMAX LADDER'S OWN OP COUNT PER FOLD WINDOW — `bmax`, `newm`, `corrsub`, `corre`,
+/// `mset`, `esub`, `ee`, `bsum`, `ocorr`, `lcorr`, `ladd`.
+///
+/// This is the SAME inventory the window-chunk split's projected group size multiplies by `nb`, so
+/// it is stated ONCE here — beside the emission it counts — rather than re-derived at the
+/// projection site, where a second count could drift from the ladder the sweep actually emits.
+/// The seed block (`BlockSeed::SeedsState`) runs a SHORTER ladder (no `newm`/`corrsub`/`corre`/
+/// `mset`/`ocorr`), but it is never a fold window: only the prefix fold trips are chunked, and
+/// every one of them is `FoldsOntoSeed` with the full ladder below.
+pub(crate) const LADDER_OPS_PER_WINDOW: usize = 11;
 
 /// The shared, batched-over-heads online-softmax scratch/state buffer NAMES for one AttnDecode node.
 struct BlockBufs {
@@ -2455,7 +2466,88 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // is ~1.6 MB in the DECODE bundle (the ~150 MB figure is the PREFILL bundle, where mq=96 scales
     // every intermediate, and prefill runs once per request).
     let fold_from = ops.len();
-    // ⭐⭐⭐⭐⭐ THE GATHER ITSELF — TWO KERNEL-LESS COPIES, FIRST IN THE FOLD GROUP.
+    // ⭐⭐⭐⭐⭐ THE WINDOW-CHUNK SPLIT — the gathered fold's own answer to the dxp group ceiling.
+    //
+    // A gathered PageFold run is UNCHUNKABLE by the group walk (`GroupKind::run_may_be_chunked ==
+    // false`): the loop is GROUP-MAJOR (`for op { for rep }`), so cutting the run mid-fold leaves
+    // group B's passes reading the scratch page group A's copy left. Left alone, that exemption
+    // makes one group per fold whose descriptor count grows with `mq · nkvh · nslab · nb` — at
+    // gemma-4-12b's class-0 geometry (mq=32, nkvh=8, nslab=4, nb=4) it is 8,300 descriptors, and a
+    // `dxp_standalone` child of that group was MEASURED at 2.5+ hours of compile against the
+    // 30-minute whole-bake ceiling. The bake-side guard (`oversized_group`) turns that into a build
+    // error naming the group; THIS is the emission-side half that keeps gemma buildable at all.
+    //
+    // ⭐ THE CUT IS PER **WINDOW CHUNK**, AND EACH CHUNK CARRIES ITS OWN GATHER COPIES.
+    //
+    // A chunk `[copies][windows of the chunk]` is SELF-CONTAINED under the group-major law: its
+    // copy runs at the head of its OWN group, so pass `p` of chunk `c` re-fills the scratch with
+    // page `p` before chunk `c`'s legs read it — the same reason the copies sit inside the fold
+    // group at all. The online-softmax state is ACCUMULATE-ONLY across (window, pass), so which
+    // group a window's contribution lands in cannot change the answer — the same argument the
+    // codebase records for the ungathered fold's lawful chunking. What the split must NOT do is
+    // break a pass's recurrence (copies → legs → ladder per page), and it cannot: every op of one
+    // chunk's window run is inside one group, and the chunk boundary is the only cut.
+    //
+    // ⛔ THE BOUNDARY MECHANISM IS THE EXISTING REQUEST TAG, AND IT IS ADDRESSING-INERT HERE.
+    // `Trip::fusable_with` breaks any run where the request changes, so tagging chunk `c`'s fold
+    // ops with `kv_request = c` breaks the groups BETWEEN chunks (and only between them — the tag
+    // is per-op uniform within a chunk). For a gathered fold op the tag reaches no address: the
+    // KV base comes from the fold pass (zero, gathered — absolute entries), the write cursor and
+    // slab shifts are cache-write/restickify concerns a fold op has neither of
+    // (`fold_plan::nonfold_page_delta` short-circuits on `is_paged_fold`), and the intermediate
+    // rebase multiplies the PASS's request under a per-request regime — the gathered fold is
+    // whole-batch, stride 0. Pinned by `fold_plan::tests::a_gathered_fold_ops_request_tag_moves_no_address`.
+    //
+    // ⛔ CHUNK 0 KEEPS REQUEST 0, so every under-ceiling bundle — granite-8b's own 4,204-descriptor
+    // maximum included — emits the SAME trips, the SAME partition and the SAME fingerprint as
+    // before this existed: `k == 1` tags nothing and reorders nothing. The gate is the PROJECTED
+    // size in closed form at the emission site — copies `2 · mq · ops_per_row` (one per plane per
+    // request-run) plus `nb · (2·mq·nkvh·nslab legs + 11 ladder)` per window — against the ONE
+    // ceiling const the bake-side guard reads (`DxGroupCeiling::MAX_DESCRIPTORS`), so the emitter
+    // and the guard cannot disagree about when the split fires.
+    let nslab = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, crate::superdsc_opspec::Df::Fp16).get();
+    let nb = SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)).get();
+    let chunking = gather.map(|(_, scratch)| {
+        // ONE CHUNK'S FIXED COST (its own copies) and PER-WINDOW COST (both legs + the 11-op
+        // ladder), straight off the scratch's own extents — the quantities `copies()` and the two
+        // gathered leg loops below actually emit, so the projection cannot drift from the emission.
+        let per_chunk_fixed = 2usize * scratch.mq() as usize * scratch.ops_per_row() as usize;
+        let per_window = 2usize * scratch.mq() as usize * scratch.nkvh() as usize * nslab as usize
+            + LADDER_OPS_PER_WINDOW;
+        let projected = per_chunk_fixed + nb as usize * per_window;
+        // ⭐ `k = 1` WHENEVER ONE CHUNK FITS — the byte-identity case. The ceil-division only ever
+        // ADDS chunks, and the fixed copies ride every chunk, so `k` is the least count whose every
+        // chunk is at or under the ceiling; a fold that cannot fit even alone (window count 0, or a
+        // single window past the ceiling) stays `k = 1` and lets the bake-side guard refuse it by
+        // name rather than looping forever here.
+        let k = if projected <= DxGroupCeiling::MAX_DESCRIPTORS || nb == 0 {
+            1
+        } else {
+            // Least k with per_chunk_fixed + ceil(nb/k)·per_window ≤ ceiling: the windows are
+            // distributed as evenly as the per-window cost allows, remainder to the LAST chunks
+            // (chunk 0 keeps the floor, so the first group stays the SMALLEST — the one whose
+            // byte-identity matters most is the one least likely to move).
+            let mut k = 1usize;
+            while k < nb as usize {
+                let windows = (nb as usize).div_ceil(k);
+                if per_chunk_fixed + windows * per_window <= DxGroupCeiling::MAX_DESCRIPTORS {
+                    break;
+                }
+                k += 1;
+            }
+            k
+        };
+        (k, per_chunk_fixed, per_window)
+    });
+    // The chunk a window index belongs to: consecutive windows grouped `ceil(nb/k)` per chunk, the
+    // short remainder falling to the last chunk. `k == 1` puts every window in chunk 0, which is
+    // the unsplit sweep.
+    let k_chunks = chunking.map_or(1, |(k, _, _)| k);
+    let windows_per_chunk = (nb as usize).div_ceil(k_chunks);
+    let chunk_of = |w: u32| -> u32 { (w as usize / windows_per_chunk.max(1)) as u32 };
+
+    // ⭐⭐⭐⭐⭐ THE GATHER ITSELF — TWO KERNEL-LESS COPIES, FIRST IN THE FOLD GROUP (FIRST IN **EACH
+    // CHUNK'S** GROUP WHEN THE FOLD SPLITS).
     //
     // ⛔ THEY MUST BE **IN** THE GROUP, WHICH IS WHY THEY SIT AFTER `fold_from`. `reps` is per-group: the
     // runtime relaunches everything from here once per PAGE, and pass `p` needs pass `p`'s blocks in the
@@ -2476,28 +2568,46 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // `addr = idx * skip_addr + base_addr` adds the index to the operand's OWN declared start, so the
     // plane the copy reads is the one `kct`/`vc` name and the entry supplies EVERYTHING inside the page.
     // A per-run source base would be added twice.
-    if let Some((idx, scratch)) = gather {
-        for (name, src, dst) in [
-            (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
-            (format!("attn_gv_o{t}"), vc, gv.as_str()),
-        ] {
-            // ⛔ THE STICK IS IN THE NAME AT EVERY WIDTH, including the single-stick case. Two ops that
-            // differ only in a baked offset and share a name are indistinguishable in every descriptor
-            // diff, every `[fold-block]` trace and every launch table — and the one-stick case is
-            // precisely the shape that is already proven on card, so it is the one whose identity must
-            // stay legible.
-            for cp in scratch.copies() {
-                ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
-                    &format!("{name}_s{}", cp.stick()),
-                    src,
-                    dst,
-                    cp,
-                    idx,
-                    sym_id_base,
-                    layout,
-                ));
+    //
+    // ⭐ THE COPIES ARE EMITTED PER CHUNK, IMMEDIATELY BEFORE THAT CHUNK'S FIRST WINDOW — not all up
+    // front. A chunk's copy must be in THE CHUNK'S OWN GROUP (see the split note above), and the window
+    // sweep is the only thing that knows where a chunk begins, so the emission interleaves
+    // `chunk 0 copies, chunk 0 windows, chunk 1 copies, chunk 1 windows, …`. At `k == 1` this is
+    // exactly the old order — every copy, then every window — because there is one chunk and it
+    // starts at window 0.
+    //
+    // ⛔ CHUNK 0's TAG STAYS 0 — `kv_request` is only stamped on chunks ABOVE the first, so the tag
+    // the group walk sees is 0 everywhere an under-ceiling fold emits. The tag itself is stamped in
+    // the fold-tag loop below, from the chunk each op's window belongs to.
+    // (op index from `fold_from`, chunk) pairs — where each chunk's run of fold ops begins. The
+    // tag loop below stamps `kv_request` from these, so the boundary the group walk sees is
+    // exactly the boundary the emission cut at.
+    let mut chunk_starts: Vec<(usize, u32)> = Vec::new();
+    let mut emitted_chunk_copies: Option<u32> = None;
+    // ⛔ A SWEEP WITH NO WINDOWS STILL EMITS THE COPIES — the shipped emission pushed them
+    // unconditionally, before any window existed to interleave them with, so an `active_cap` under
+    // one window (nb == 0) keeps its (dead but shipped) copies and the bundle does not move.
+    if nb == 0 && gather.is_some() {
+        chunk_starts.push((ops.len() - fold_from, 0));
+        if let Some((idx, scratch)) = gather {
+            for (name, src, dst) in [
+                (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
+                (format!("attn_gv_o{t}"), vc, gv.as_str()),
+            ] {
+                for cp in scratch.copies() {
+                    ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                        &format!("{name}_s{}", cp.stick()),
+                        src,
+                        dst,
+                        cp,
+                        idx,
+                        sym_id_base,
+                        layout,
+                    ));
+                }
             }
         }
+        emitted_chunk_copies = Some(0);
     }
     // ⭐ WHERE THE FOLD'S KV COMES FROM: the gathered scratch when this bundle gathers, the paged pool
     // otherwise. Named once here so the four things that must agree — the operand SPELLING, the declared
@@ -2532,6 +2642,47 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // one-stick column budget — not the lane count it used to be spelled as.
     for w in SlotWindow::sweep(crate::sdsc_abstract::SlotCount::new(active_cap)) {
         let b = w.index();
+        // ⭐ A NEW CHUNK STARTS HERE — its own copies first (the self-containment the group-major
+        // law demands; see the split note above). `emitted_chunk_copies` is `None` before the first
+        // window, so chunk 0's copies land exactly where the single block of copies used to —
+        // before the first `assemble_attn_block` of the sweep — and an unsplit fold (`k == 1`)
+        // emits the old sequence byte for byte.
+        let chunk = chunk_of(b);
+        if emitted_chunk_copies != Some(chunk) && let Some((idx, scratch)) = gather {
+            chunk_starts.push((ops.len() - fold_from, chunk));
+            for (name, src, dst) in [
+                (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
+                (format!("attn_gv_o{t}"), vc, gv.as_str()),
+            ] {
+                // ⛔ THE STICK IS IN THE NAME AT EVERY WIDTH, including the single-stick case. Two ops
+                // that differ only in a baked offset and share a name are indistinguishable in every
+                // descriptor diff, every `[fold-block]` trace and every launch table — and the
+                // one-stick case is precisely the shape that is already proven on card, so it is the
+                // one whose identity must stay legible.
+                //
+                // ⭐ AND THE **CHUNK** IS IN THE NAME OF EVERY CHUNK ABOVE THE FIRST, for the same
+                // reason: a split fold's chunk-1 copies are descriptor-identical to chunk 0's (they
+                // copy the same plane through the same index), so without the segment the two chunks
+                // of a split fold could not be told apart in any dump. Chunk 0 keeps the shipped name.
+                for cp in scratch.copies() {
+                    let op_name = if chunk == 0 {
+                        format!("{name}_s{}", cp.stick())
+                    } else {
+                        format!("{name}_c{chunk}_s{}", cp.stick())
+                    };
+                    ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                        &op_name,
+                        src,
+                        dst,
+                        cp,
+                        idx,
+                        sym_id_base,
+                        layout,
+                    ));
+                }
+            }
+            emitted_chunk_copies = Some(chunk);
+        }
         // PER-BLOCK OFFSETS, PRINTED (`SCRATCHY_SDSC_FOLD_TRACE`). Blocks 0-1 of a 4-block sweep are correct
         // and blocks 2-3 are not, and every candidate cause has been checked correct by reading — so the
         // next step is to make the blocks observable rather than to argue about them. The `[body-choice]`
@@ -2703,8 +2854,18 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         )?;
     }
 
-    for op in ops[fold_from..].iter_mut() {
+    for (i, op) in ops[fold_from..].iter_mut().enumerate() {
         op.kv_page_fold = true;
+        // ⭐⭐⭐⭐⭐ THE CHUNK TAG — the fold's run-break between window chunks, from the chunk_starts
+        // the sweep itself recorded. `kv_request` is the ONE field `Trip::fusable_with` already breaks
+        // any run on, so this is the whole mechanism that turns k chunks into k launch groups; and it
+        // is addressing-inert for a gathered fold op (see the split note above, pinned by
+        // `fold_plan::tests::a_gathered_fold_ops_request_tag_moves_no_address`). Chunk 0's ops and every
+        // op of an unsplit fold keep 0, so the group walk's view of an under-ceiling bundle does not
+        // move.
+        if let Some(&(_, c)) = chunk_starts.iter().rev().find(|(s, _)| *s <= i) {
+            op.kv_request = c;
+        }
         // DECLARED, NOT INFERRED: the runtime cannot see what rows an op was baked for, and claiming a
         // whole-batch pass the kernels do not serve turns `pages × requests` passes into `pages` while
         // every row but one reads the wrong history. It is the SAME `gather` the per-window
