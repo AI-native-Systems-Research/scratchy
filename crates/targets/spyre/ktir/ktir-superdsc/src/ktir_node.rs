@@ -231,6 +231,22 @@ pub enum Program {
     /// `x / rowsum(x, dim=-1)` — mixtral's renormalised top-k scores, the softmax
     /// chain minus the stability subtract and the exp. ONE tensor parameter.
     RouteRenorm,
+    /// `act(gate) · up` over the MoE pair rows — the gated activation of the expert
+    /// MLP, the SiluMul computation with the act the block declares (gemma-4: gelu).
+    /// TWO tensor parameters (gate and up). The pair rows fold into `[m, k·w]`
+    /// columns, so the computation is pointwise over whatever layout the sort
+    /// produced — no pair structure is read here.
+    ExpertGatedAct(GatedAct),
+}
+
+/// The activation an expert gates its up projection with — this crate's OWN copy of
+/// the front end's `GatedAct`, because the leaf crate depends on nothing upstream
+/// (a third-party producer states its act the same way). [`Program::ExpertGatedAct`]
+/// carries it, and the door dispatches on it to pick the device primitive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GatedAct {
+    Silu,
+    Gelu,
 }
 
 /// One buffer of a bundle, as the CALLER numbers it.

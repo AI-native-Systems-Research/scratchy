@@ -128,6 +128,9 @@ pub fn lower(
         // rmsnorm's structure with the softmax's primitives in it.
         Program::RouteSoftmax => route_softmax(name, &r, sym_id_base, layout),
         Program::RouteRenorm => route_renorm(name, &r, sym_id_base, layout),
+        // The expert MLP's gated activation — silumul's body with the act's own
+        // device primitive (`silu`/`gelufwd`), over the pair rows the sort laid out.
+        Program::ExpertGatedAct(act) => lk::gated_act(name, act, &r, sym_id_base, layout),
         Program::ScalarWeightMul => lk::scalarweightmul(name, &r, sym_id_base, layout),
         Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
         Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),

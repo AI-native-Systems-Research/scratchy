@@ -475,9 +475,44 @@ fn lower_router_logits_node<F: RopeForm>(
     Ok(vec![e])
 }
 
+/// Lower a [`SubOp::ExpertGatedAct`] — `act(gate) · up` over the MoE pair rows.
+///
+/// ⭐ SILUMUL'S COMPUTATION, with the act the block declares. The pair rows fold
+/// into `[m, k·w]` columns, so the computation is POINTWISE over whatever layout
+/// the sort produced — no pair structure is read here, which is what makes this
+/// op lowerable before the sort/unsort pair is. The door is [`lk::gated_act`]:
+/// silumul's two-op body with `silu`/`gelufwd` dispatched on the act.
+fn lower_expert_gated_act_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    act: scratchy_subtile::subtile_ir::GatedAct,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "ExpertGatedAct t{} expects 2 inputs (gate, up), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let program_act = match act {
+        scratchy_subtile::subtile_ir::GatedAct::Silu => ktir_superdsc::ktir_node::GatedAct::Silu,
+        scratchy_subtile::subtile_ir::GatedAct::Gelu => ktir_superdsc::ktir_node::GatedAct::Gelu,
+    };
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("gatedact_s{}", node.id.index()));
+    st.gated_act(&node.inputs[0], &node.inputs[1], &node.output, act);
+    let k = st.finish_shaped(
+        name,
+        ktir_superdsc::ktir_node::Program::ExpertGatedAct(program_act),
+    );
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
 /// Lower a [`SubOp::RouteSoftmax`] — `softmax(scores, dim=-1)` over `[m, experts]`,
 /// the router's score softmax.
-///
 /// ⭐ THE RMSNORM'S STRUCTURE, with the softmax's primitives in it. The program
 /// ([`KtirFunc::route_softmax`]) states the stability chain longhand; the door
 /// ([`route_softmax`]) emits [`assemble_row_softmax`]'s five device ops — one
@@ -1420,12 +1455,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
              vocabulary) before the program can be minted.",
             node.output.tensor.index() as u32,
         )),
-        SubOp::ExpertGatedAct { .. } => Unhandled(format!(
-            "SubOp::ExpertGatedAct t{} (`act(gate) · up` over the pair rows) has no SuperDSC \
-             lowering yet: it is `KtirFunc::silu_mul`'s computation with a Gelu act — the gelu \
-             variant of the shipped SiluMul program — over the pair-row layout.",
-            node.output.tensor.index() as u32,
-        )),
+        SubOp::ExpertGatedAct { act } => {
+            match lower_expert_gated_act_node(node, ir, *act, sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
         SubOp::ExpertUnsort => Unhandled(format!(
             "SubOp::ExpertUnsort t{} (the pair rows back in token order) has no SuperDSC \
              lowering yet: it is ExpertSort's inverse permutation — the same vendor sort/mask \
@@ -3763,6 +3798,45 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
     fn reshape(&mut self, x_r: &TensorRegion, out: &TensorRegion) {
         let x = self.load_region(x_r);
         self.store_region(x, out);
+    }
+
+    /// The expert MLP's gated activation — `act(gate) · up` over the pair rows,
+    /// [`Self::silu_mul`]'s computation with the act the block declares: silu
+    /// longhand for [`GatedAct::Silu`], the gelu tanh POLYNOMIAL for
+    /// [`GatedAct::Gelu`] (the function the DDL's `gelufwd` primitive computes,
+    /// the same contract [`Self::gelu`] states for the dense elementwise).
+    fn gated_act(
+        &mut self,
+        gate_r: &TensorRegion,
+        up_r: &TensorRegion,
+        out: &TensorRegion,
+        act: scratchy_subtile::subtile_ir::GatedAct,
+    ) {
+        // Row blocks that fit, the same budget and the same reason as `silu_mul`:
+        // eight tiles live at once here in the worst case (gate, up, the act's
+        // temporaries, the result).
+        let cols = out.region.cols.len;
+        let blk = rows_per_block(cols, 8);
+        let mut off = 0u32;
+        while off < out.region.rows.len {
+            let h = blk.min(out.region.rows.len - off);
+            let dims = vec![i64::from(h), i64::from(cols)];
+            let gate = self.load_region(&sub_rows(gate_r, off, h));
+            let up = self.load_region(&sub_rows(up_r, off, h));
+            let a = match act {
+                scratchy_subtile::subtile_ir::GatedAct::Silu => {
+                    let neg = self.negate(gate, dims.clone());
+                    let e = self.unop(OpKind::MathExp, neg, dims.clone());
+                    let one = self.splat_one(dims.clone());
+                    let denom = self.binop(OpKind::ArithAddf, one, e, dims.clone());
+                    self.binop(OpKind::ArithDivf, gate, denom, dims.clone())
+                }
+                scratchy_subtile::subtile_ir::GatedAct::Gelu => self.gelu(gate, dims.clone()),
+            };
+            let y = self.binop(OpKind::ArithMulf, a, up, dims);
+            self.store_region(y, &sub_rows(out, off, h));
+            off += h;
+        }
     }
 
     fn silu_mul(&mut self, gate_r: &TensorRegion, up_r: &TensorRegion, out: &TensorRegion) {

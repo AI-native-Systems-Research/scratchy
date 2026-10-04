@@ -5131,6 +5131,88 @@ pub fn tanhsoftcap(
     ))
 }
 
+/// The per-`Program` door for [`crate::ktir_node::Program::ExpertGatedAct`] —
+/// `act(gate) · up` over the MoE pair rows, the SiluMul computation with the act
+/// the block declares.
+///
+/// `silumul`'s body verbatim (same handles, same synth, same column-block
+/// offsets), with the act's OWN device primitive in place of `"silu"`: `silu` for
+/// [`GatedAct::Silu`], `gelufwd` for [`GatedAct::Gelu`] — both real DDL
+/// primitives (`elementwise_op_func`), so the two-op form `act(gate) → tmp`,
+/// `multiply(tmp, up) → out` holds for either.
+pub fn gated_act(
+    name: &str,
+    act: crate::ktir_node::GatedAct,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let act_func = match act {
+        crate::ktir_node::GatedAct::Silu => "silu",
+        crate::ktir_node::GatedAct::Gelu => "gelufwd",
+    };
+    let (ins, o) = split_out(name, r, layout, 2)?;
+    let (gate_r, up_r) = (ins[0], ins[1]);
+    check_pointwise_cols(o.c_len, "ExpertGatedAct", o.tid)?;
+    let rows = node_rows(name, &o)?;
+    let cols = o.c_len;
+    let gate = gate_r.name();
+    let up = up_r.name();
+    let out = o.name();
+    let tmp_id = PlaceId::Act(o.tid).synth(SynthRole::Silu);
+    let tmp = syn(layout, tmp_id);
+    // `silumul`'s declaration contract, verbatim: the intermediate is at the OUTPUT
+    // tensor's width, shared by every column chunk.
+    if let Some(l) = layout {
+        l.synth_like(tmp_id, o.tid, &[rows, cols], Df::Fp16);
+    }
+    let act_name = format!("gact_o{}", o.tid);
+    let mul_name = format!("mulgact_o{}", o.tid);
+    let gate_off = pointwise_chunk_out_offset(gate_r.c_start);
+    let up_off = pointwise_chunk_out_offset(up_r.c_start);
+    let out_off = pointwise_chunk_out_offset(o.c_start);
+    let full_cols = o.c_start + o.c_len;
+    let gate = rb(&gate, rows, cols);
+    let up = rb(&up, rows, cols);
+    let tmp = rb(&tmp, rows, cols);
+    let out = rb(&out, rows, cols);
+    Ok(vec![
+        assemble_pointwise_broadcast_off(
+            &act_name,
+            act_func,
+            crate::sdsc_abstract::RowCount::of_token_rows(rows),
+            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            &[In::sliced(
+                &gate,
+                crate::addr::col_of(rows, full_cols, gate_off, Df::Fp16),
+            )
+            .ew()],
+            &tmp,
+            crate::addr::col_of(rows, full_cols, gate_off, Df::Fp16),
+            sym_id_base,
+            layout,
+        ),
+        assemble_pointwise_broadcast_off(
+            &mul_name,
+            "multiply",
+            crate::sdsc_abstract::RowCount::of_token_rows(rows),
+            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+            &[
+                In::sliced(
+                    &tmp,
+                    crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
+                )
+                .ew(),
+                In::sliced(&up, crate::addr::col_of(rows, full_cols, up_off, Df::Fp16)).ew(),
+            ],
+            &out,
+            crate::addr::col_of(rows, full_cols, out_off, Df::Fp16),
+            sym_id_base,
+            layout,
+        ),
+    ])
+}
+
 /// The per-`Program` door for [`crate::ktir_node::Program::RouteSoftmax`] —
 /// `out = softmax(x, dim=-1)` over `[rows, cols]`, the MoE router's score softmax.
 ///
