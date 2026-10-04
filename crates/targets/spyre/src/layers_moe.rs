@@ -388,10 +388,10 @@ impl SwitchGluExpertsOps for SwitchGluExpertsLayer {
         Ok(SwitchGluExpertsLayer {
             expert_gate_w,
             expert_gate_scales,
-            expert_gate_biases: placeholder.clone(),
+            expert_gate_biases: placeholder,
             expert_up_w,
             expert_up_scales,
-            expert_up_biases: placeholder.clone(),
+            expert_up_biases: placeholder,
             expert_down_w,
             expert_down_scales,
             expert_down_biases: placeholder,

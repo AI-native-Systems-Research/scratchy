@@ -584,9 +584,7 @@ fn lower_route_scale_node<F: RopeForm>(
             node.inputs.len()
         )));
     }
-    lower_scalarmul_node(node, ir, scale, sym_id_base)
-        .map(|e| vec![e])
-        .map_err(|e| e)
+    lower_scalarmul_node(node, ir, scale, sym_id_base).map(|e| vec![e])
 }
 
 /// final-logit soft cap. One input (the logits), shape-preserving, and the cap
