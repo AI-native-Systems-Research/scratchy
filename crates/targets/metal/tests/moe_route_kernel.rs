@@ -106,9 +106,23 @@ enum Stage {
 }
 
 impl Routing {
-    fn new(device: &common::Device, program: RouteProgram, e: usize, k: usize, n: usize) -> Self {
+    /// `ties`: logits from a handful of values, -0 and +0 among them, so equal scores straddle
+    /// every top-k boundary.
+    fn new(
+        device: &common::Device,
+        program: RouteProgram,
+        (e, k, n): (usize, usize, usize),
+        ties: bool,
+    ) -> Self {
         let mut rng = Lcg(0x5eed ^ (e * 31 + k) as u64);
-        let logits = rng.bf16s(n * e, -4.0, 4.0);
+        let logits = match ties {
+            false => rng.bf16s(n * e, -4.0, 4.0),
+            true => {
+                let values = [-1.0f32, -0.0, 0.0, 0.5, 1.0, 2.0];
+                let pick = |_| bf16::from_f32(values[(rng.next() * 6.0) as usize % 6]);
+                (0..n * e).map(pick).collect()
+            }
+        };
         let pairs = n * k;
         let (experts, top_k) = (NumExperts(e as u32), TopK(k as u32));
         let bn = if e > 128 { 64 } else { 32 };
@@ -223,11 +237,11 @@ impl Routing {
     }
 
     fn fused(&self) -> Vec<Dispatch<'_>> {
-        let [lg, sorted, inds, scores] = &self.fused;
+        let [lg, _, inds, scores] = &self.fused;
         let bn = if self.experts > 128 { 64 } else { 32 };
-        let mut buffers = vec![(lg, 0), (sorted, 1), (inds, 2), (scores, 3)];
+        let mut buffers = vec![(lg, 0), (inds, 1), (scores, 2)];
         if self.program.expert_scale.is_some() {
-            buffers.push((&self.expert_scale, 4));
+            buffers.push((&self.expert_scale, 3));
         }
         vec![Dispatch {
             pso: &self.route,
@@ -285,14 +299,15 @@ fn the_routing_kernel_matches_the_kernels_it_replaces() {
         ("qwen1.5-moe", SHARED_UNNORMED, 60, 4),
     ];
     for (name, program, e, k) in cases {
-        for tokens in [1, 3] {
-            let r = Routing::new(&device, program, e, k, tokens);
+        for (tokens, ties) in [(1, false), (3, false), (3, true)] {
+            let r = Routing::new(&device, program, (e, k, tokens), ties);
             run(&device, 1, 1, || r.chain());
             run(&device, 1, 1, || r.fused());
             let (split, fused) = (r.outputs(&r.split), r.outputs(&r.fused));
             assert!(split.1.iter().any(|&v| v != 0), "{name}: no scores");
-            assert_eq!(split.0, fused.0, "{name} tokens={tokens}: top-k indices");
-            assert_eq!(split.1, fused.1, "{name} tokens={tokens}: top-k scores");
+            let what = format!("{name} tokens={tokens} ties={ties}");
+            assert_eq!(split.0, fused.0, "{what}: top-k indices");
+            assert_eq!(split.1, fused.1, "{what}: top-k scores");
         }
     }
 }
@@ -302,7 +317,7 @@ fn the_routing_kernel_matches_the_kernels_it_replaces() {
 fn bench_moe_route() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    let r = Routing::new(&device, GEMMA, 128, 8, 1);
+    let r = Routing::new(&device, GEMMA, (128, 8, 1), false);
     let launches = r.chain.len();
     run(&device, 500, 2, || r.chain());
     for round in 0..3 {

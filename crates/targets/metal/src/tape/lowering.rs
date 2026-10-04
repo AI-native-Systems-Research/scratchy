@@ -6182,13 +6182,12 @@ fn lower_moe_step(
             let bn = if e > 128 { 64 } else { 32 };
             let mut bindings = vec![
                 s.at(0, R::RouterLogits),
-                s.at(1, R::SortedExperts),
-                s.at(2, R::TopKIndices),
-                s.at(3, R::TopKScores),
+                s.at(1, R::TopKIndices),
+                s.at(2, R::TopKScores),
             ];
             if let Some(l) = program.expert_scale {
                 let scale = WeightTensor::GemmaPerExpertScale;
-                bindings.push(source(router()?, scale, layer(&l), 4));
+                bindings.push(source(router()?, scale, layer(&l), 3));
             }
             let shape = grid((1, bucket_m, 1), (bn, 1, 1), ms(A::Y));
             let constants = MoeRouteConstants {
