@@ -27,7 +27,10 @@ pub fn preamble() -> proc_macro2::TokenStream {
     quote! {
         #[allow(unused_imports)]
         use ::scratchy_target_spyre::ktir::{
-            affine::{AffineExpr as __KExpr, AffineMap as __KMap},
+            affine::{
+                AffineExpr as __KExpr, AffineMap as __KMap,
+                AffineSet as __KSet, Constraint as __KConstraint,
+            },
             attrkey::AttrKey as __KAttrKey,
             dtypes::DType as __KDTy,
             ir::{Attr as __KAttr, IRFunction as __KFn, Operation as __KOp, Ssa as __KSsa},
@@ -66,6 +69,25 @@ fn opkind(k: ktir_core::opkind::OpKind) -> proc_macro2::TokenStream {
 fn attrkey(k: ktir_core::attrkey::AttrKey) -> proc_macro2::TokenStream {
     let v = variant(format!("{k:?}"));
     quote! { __KAttrKey::#v }
+}
+
+/// ⛔ ±inf AND NaN ARE LEGAL VALUES AND ILLEGAL LITERALS. `Literal::f64_unsuffixed` asserts
+/// `is_finite`, but the router chain's softmax `-inf` row-max init and argsort `+inf` NaN-sanitize
+/// are real program constants — the emulator ran both green in the unit tests, and only the token
+/// bake refused (MEASURED: the gemma-4-26b parity-tiny build panicked at `f.is_finite()` on one).
+/// The non-finite spellings render as the std consts, which are the same f64s in a `const`-legal
+/// form; everything finite stays a literal.
+fn float(f: f64) -> proc_macro2::TokenStream {
+    if f.is_finite() {
+        let l = proc_macro2::Literal::f64_unsuffixed(f);
+        quote! { #l }
+    } else if f.is_nan() {
+        quote! { f64::NAN }
+    } else if f.is_sign_positive() {
+        quote! { f64::INFINITY }
+    } else {
+        quote! { f64::NEG_INFINITY }
+    }
 }
 
 fn ints(v: &[i64]) -> proc_macro2::TokenStream {
@@ -161,6 +183,30 @@ fn affine_map(m: &ktir_core::affine::AffineMap<'_>) -> proc_macro2::TokenStream 
     }
 }
 
+/// An affine set: the enumeration space an indirect tile's variables range over. The MoE router's
+/// gathers state theirs (an UNCONSTRAINED full box — the tile's own shape is the space), so this
+/// renders rather than refusing; a set with real constraints is the same rendering.
+fn affine_set(s: &ktir_core::affine::AffineSet<'_>) -> proc_macro2::TokenStream {
+    use ktir_core::affine::ConstraintKind;
+    let nd = proc_macro2::Literal::usize_unsuffixed(s.num_dims);
+    let ns = proc_macro2::Literal::usize_unsuffixed(s.num_syms);
+    let cs = s.constraints.iter().map(|c| {
+        let e = affine_expr(&c.expr);
+        let k = match c.kind {
+            ConstraintKind::GreaterEq => quote! { __KConstraint::GreaterEq },
+            ConstraintKind::Equal => quote! { __KConstraint::Equal },
+        };
+        quote! { __KConstraint { expr: &#e, kind: #k } }
+    });
+    quote! {
+        __KSet {
+            num_dims: #nd,
+            num_syms: #ns,
+            constraints: &[#(#cs),*],
+        }
+    }
+}
+
 fn attr(a: &ktir_core::ir::Attr<'_>) -> proc_macro2::TokenStream {
     use ktir_core::ir::Attr as A;
     let path = quote! { __KAttr };
@@ -170,7 +216,7 @@ fn attr(a: &ktir_core::ir::Attr<'_>) -> proc_macro2::TokenStream {
             quote! { #path::Int(#i) }
         }
         A::Float(f) => {
-            let f = proc_macro2::Literal::f64_unsuffixed(*f);
+            let f = float(*f);
             quote! { #path::Float(#f) }
         }
         A::IntList(v) => {
@@ -184,7 +230,7 @@ fn attr(a: &ktir_core::ir::Attr<'_>) -> proc_macro2::TokenStream {
         }
         A::Bool(b) => quote! { #path::Bool(#b) },
         A::FloatList(v) => {
-            let it = v.iter().map(|f| proc_macro2::Literal::f64_unsuffixed(*f));
+            let it = v.iter().map(|f| float(*f));
             quote! { #path::FloatList(&[#(#it),*]) }
         }
         A::Dtype(d) => {
@@ -207,10 +253,9 @@ fn attr(a: &ktir_core::ir::Attr<'_>) -> proc_macro2::TokenStream {
             let it = v.iter().map(affine_map);
             quote! { #path::AffineMapList(&[#(#it),*]) }
         }
-        // An affine SET is a constraint system, and nothing this lowering emits carries one: a
-        // tile's coordinate set is the full one, which is what its absence means.
-        A::AffineSet(_) => {
-            panic!("an affine set in a baked program: this lowering emits none")
+        A::AffineSet(s) => {
+            let s = affine_set(s);
+            quote! { #path::AffineSet(#s) }
         }
     }
 }
