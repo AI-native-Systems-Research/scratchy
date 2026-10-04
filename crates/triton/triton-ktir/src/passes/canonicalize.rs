@@ -51,9 +51,9 @@
 
 use std::collections::HashMap;
 
+use crate::Result;
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
-use crate::Result;
 
 pub fn run(module: &mut Module) -> Result<()> {
     // Iterate the whole set to a fixed point: a fold enables a CSE, a CSE enables a

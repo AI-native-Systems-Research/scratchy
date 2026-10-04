@@ -339,7 +339,6 @@ impl Semantic {
     }
 
     /// Emit an op carrying a region, whose blocks come from a popped frame.
-    #[allow(clippy::too_many_arguments)]
     pub fn emit_with_region(
         &mut self,
         name: &str,
@@ -475,7 +474,7 @@ impl Semantic {
                     format!("cannot convert a {} to a tensor", other.kind_name()),
                     0,
                     0,
-                ))
+                ));
             }
         })
     }
@@ -896,7 +895,6 @@ impl Semantic {
     /// scalar operand is turned into a constant by `to_tensor` for the type inspection, and
     /// then `scalar_constant` builds a SECOND constant of the promoted type. The first is
     /// left dead. Reproduced because the oracle contains it.
-    #[allow(clippy::too_many_arguments)]
     pub fn binary_op_type_checking(
         &mut self,
         lhs: &Val,
@@ -1258,7 +1256,7 @@ impl Semantic {
                     format!("tl.program_id axis must be 0, 1 or 2, got {other}"),
                     0,
                     0,
-                ))
+                ));
             }
         };
         Ok(self.emit1(
@@ -1280,7 +1278,7 @@ impl Semantic {
                     format!("tl.num_programs axis must be 0, 1 or 2, got {other}"),
                     0,
                     0,
-                ))
+                ));
             }
         };
         Ok(self.emit1(
@@ -1342,7 +1340,7 @@ impl Semantic {
                     ),
                     0,
                     0,
-                ))
+                ));
             }
         };
         let mut operands = vec![base];
@@ -1367,7 +1365,7 @@ impl Semantic {
                     format!("`.load` needs a tensor descriptor, got {other}"),
                     0,
                     0,
-                ))
+                ));
             }
         };
         if offsets.len() != shape.len() {
@@ -1421,7 +1419,7 @@ impl Semantic {
                     format!("`.gather` needs a tensor descriptor, got {other}"),
                     0,
                     0,
-                ))
+                ));
             }
         };
         if block.len() != 2 {
@@ -1467,7 +1465,7 @@ impl Semantic {
                     format!("`.gather`'s index vector must have dtype int16 or int32, got {other}"),
                     0,
                     0,
-                ))
+                ));
             }
         }
         if xshape[0] < 8 {
@@ -1492,7 +1490,7 @@ impl Semantic {
                     format!("`.gather` on a descriptor of {other} has no defined width"),
                     0,
                     0,
-                ))
+                ));
             }
         };
         let min_cols = i64::from(32 / bits * 8);
@@ -1531,7 +1529,7 @@ impl Semantic {
                     format!("`.store` needs a tensor descriptor, got {other}"),
                     0,
                     0,
-                ))
+                ));
             }
         };
         if offsets.len() != shape.len() {
@@ -1773,7 +1771,7 @@ impl Semantic {
                     ),
                     0,
                     0,
-                ))
+                ));
             }
         }
         Ok(self.emit1(name, &[v], ty, &[]))

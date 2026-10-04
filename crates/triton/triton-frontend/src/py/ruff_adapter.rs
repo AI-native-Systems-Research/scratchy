@@ -75,10 +75,10 @@ pub fn parse(src: &str) -> Result<PyModule> {
             // Module-level `NAME = <literal>`: captured so a kernel that reads one can be
             // refused BY NAME (see `PyModule::globals`).
             ra::Stmt::Assign(a) => {
-                if let (1, Some(ra::Expr::Name(n))) = (a.targets.len(), a.targets.first()) {
-                    if let Some(lit) = literal_of(&a.value) {
-                        out.globals.push((n.id.to_string(), lit));
-                    }
+                if let (1, Some(ra::Expr::Name(n))) = (a.targets.len(), a.targets.first())
+                    && let Some(lit) = literal_of(&a.value)
+                {
+                    out.globals.push((n.id.to_string(), lit));
                 }
             }
             // Imports, docstrings and host functions are not the front end's business.
@@ -208,10 +208,10 @@ fn lower_body(ctx: &Ctx, body: &[ra::Stmt]) -> Result<Vec<Stmt>> {
     for s in body {
         // A bare string expression is a docstring; Triton's walk reaches it as an Expr
         // whose value is a Constant and does nothing with it.
-        if let ra::Stmt::Expr(e) = s {
-            if matches!(&*e.value, ra::Expr::StringLiteral(_)) {
-                continue;
-            }
+        if let ra::Stmt::Expr(e) = s
+            && matches!(&*e.value, ra::Expr::StringLiteral(_))
+        {
+            continue;
         }
         out.push(lower_stmt(ctx, s)?);
     }
@@ -451,7 +451,7 @@ fn lower_expr(ctx: &Ctx, e: &ra::Expr) -> Result<Expr> {
                             "integer literal does not fit in 64 bits",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 },
                 ra::Number::Float(f) => Literal::Float(*f),
@@ -460,7 +460,7 @@ fn lower_expr(ctx: &Ctx, e: &ra::Expr) -> Result<Expr> {
                         "complex literals are not supported",
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             };
             Ok(Expr::Constant { value, pos })
@@ -552,7 +552,7 @@ fn lower_expr(ctx: &Ctx, e: &ra::Expr) -> Result<Expr> {
                         format!("comparison operator `{other:?}` is not supported"),
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             };
             Ok(Expr::Compare {

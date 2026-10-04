@@ -80,7 +80,7 @@ pub fn parse_dtype(s: &str) -> Result<Type> {
                 format!("unknown dtype spelling `{other}` in a kernel signature"),
                 0,
                 0,
-            ))
+            ));
         }
     })
 }
@@ -245,6 +245,17 @@ struct ReturnSite {
     block: usize,
     value: Val,
     loc: Loc,
+}
+
+/// The facts one `tt.func` for `standard.max` / `standard.sum` is built from.
+struct StdReduction<'a> {
+    symbol: &'a str,
+    in_ty: &'a Type,
+    axis: usize,
+    def_line: u32,
+    combiner: &'a str,
+    widen_to: Option<Type>,
+    pos: Pos,
 }
 
 impl<'a> CodeGen<'a> {
@@ -468,7 +479,7 @@ impl<'a> CodeGen<'a> {
                             "augmented assignment to a tuple target is not supported",
                             other.pos().line,
                             other.pos().col,
-                        ))
+                        ));
                     }
                 };
                 let rewritten = Stmt::Assign {
@@ -551,7 +562,7 @@ impl<'a> CodeGen<'a> {
                              resolved at compile time.",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                     other => {
                         return Err(Error::new(
@@ -561,7 +572,7 @@ impl<'a> CodeGen<'a> {
                             ),
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 self.visit_body(if taken { body } else { orelse })
@@ -610,7 +621,7 @@ impl<'a> CodeGen<'a> {
                          step",
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             };
             let mut i = s;
@@ -849,7 +860,7 @@ impl<'a> CodeGen<'a> {
                      `tl.static_range(...)`",
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         let dotted = func.dotted().unwrap_or_default();
@@ -903,7 +914,7 @@ impl<'a> CodeGen<'a> {
                     format!("`{dotted}()` needs at least one bound"),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
             1 => (Val::Int(0), vals[0].clone()),
             _ => (vals[0].clone(), vals[1].clone()),
@@ -1094,10 +1105,10 @@ impl<'a> CodeGen<'a> {
             }
             Expr::Attribute { value, attr, .. } => {
                 // A `tl.*` chain that names a dtype, or a module path.
-                if let Some(dotted) = e.dotted() {
-                    if let Some(v) = self.resolve_tl_attribute(&dotted) {
-                        return Ok(v);
-                    }
+                if let Some(dotted) = e.dotted()
+                    && let Some(v) = self.resolve_tl_attribute(&dotted)
+                {
+                    return Ok(v);
                 }
                 let recv = self.visit_expr(value)?;
                 // Tensor PROPERTIES. These are attribute accesses, not calls, so they are not
@@ -1126,7 +1137,7 @@ impl<'a> CodeGen<'a> {
                             .map_err(|e| Self::located(e, pos));
                     }
                     ("dtype", Val::Ir(id)) => {
-                        return Ok(Val::Dtype(self.sem.ty(*id).scalar().clone()))
+                        return Ok(Val::Dtype(self.sem.ty(*id).scalar().clone()));
                     }
                     ("shape", Val::Ir(id)) => {
                         let s = self.sem.ty(*id).shape().to_vec();
@@ -1205,10 +1216,10 @@ impl<'a> CodeGen<'a> {
     /// `tl.float16` and friends. Returns `None` when the chain is not a dtype.
     fn resolve_tl_attribute(&self, dotted: &str) -> Option<Val> {
         for alias in census::TL_ALIASES {
-            if let Some(rest) = dotted.strip_prefix(&format!("{alias}.")) {
-                if census::TL_DTYPES.contains(&rest) {
-                    return parse_dtype(rest).ok().map(Val::Dtype);
-                }
+            if let Some(rest) = dotted.strip_prefix(&format!("{alias}."))
+                && census::TL_DTYPES.contains(&rest)
+            {
+                return parse_dtype(rest).ok().map(Val::Dtype);
             }
         }
         None
@@ -1217,10 +1228,11 @@ impl<'a> CodeGen<'a> {
     fn binary(&mut self, op: BinOpKind, l: Val, r: Val, pos: Pos) -> Result<Val> {
         // Constant folding: Triton's `constexpr` arithmetic happens in Python, so two
         // compile-time numbers never reach the builder.
-        if l.is_number() && r.is_number() {
-            if let Some(v) = fold_binary(op, &l, &r) {
-                return Ok(v);
-            }
+        if l.is_number()
+            && r.is_number()
+            && let Some(v) = fold_binary(op, &l, &r)
+        {
+            return Ok(v);
         }
         let out = match op {
             BinOpKind::Add => self.sem.add(&l, &r, true),
@@ -1243,7 +1255,7 @@ impl<'a> CodeGen<'a> {
                     ),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         out.map(Val::Ir).map_err(|e| Self::located(e, pos))
@@ -1284,10 +1296,11 @@ impl<'a> CodeGen<'a> {
     }
 
     fn comparison(&mut self, op: CmpKind, l: Val, r: Val, pos: Pos) -> Result<Val> {
-        if l.is_const() && r.is_const() {
-            if let Some(v) = fold_compare(op, &l, &r) {
-                return Ok(v);
-            }
+        if l.is_const()
+            && r.is_const()
+            && let Some(v) = fold_compare(op, &l, &r)
+        {
+            return Ok(v);
         }
         let cop = match op {
             CmpKind::Eq => CmpOp::Eq,
@@ -1338,7 +1351,7 @@ impl<'a> CodeGen<'a> {
                                 ),
                                 pos.line,
                                 pos.col,
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1379,7 +1392,7 @@ impl<'a> CodeGen<'a> {
                         "a method call must have a receiver",
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             };
             let recv = self.visit_expr(recv_expr)?;
@@ -1432,7 +1445,7 @@ impl<'a> CodeGen<'a> {
                     format!("`.{method}` is not defined on a {}", other.kind_name()),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         match method {
@@ -1466,7 +1479,7 @@ impl<'a> CodeGen<'a> {
                             format!("`.store` needs a tensor descriptor, got {other}"),
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 let v = self.sem.cast(v, &elem).map_err(|e| Self::located(e, pos))?;
@@ -1488,7 +1501,7 @@ impl<'a> CodeGen<'a> {
                             "`.gather` needs an index vector and a column offset",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 let y = match args.get(1) {
@@ -1498,7 +1511,7 @@ impl<'a> CodeGen<'a> {
                             "`.gather` needs a column offset (its second argument)",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 self.sem
@@ -1514,7 +1527,7 @@ impl<'a> CodeGen<'a> {
                             "`.to(...)` needs a dtype, e.g. `tl.float32`",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 self.sem
@@ -1547,14 +1560,14 @@ impl<'a> CodeGen<'a> {
                     ),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
             None => {
                 return Err(Error::new(
                     "descriptor offsets are missing",
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         let mut out = Vec::with_capacity(seq.len());
@@ -1577,14 +1590,14 @@ impl<'a> CodeGen<'a> {
                     ),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
             None => {
                 return Err(Error::new(
                     format!("{who} is missing its shape"),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         let mut out = Vec::with_capacity(items.len());
@@ -1596,7 +1609,7 @@ impl<'a> CodeGen<'a> {
                         format!("{who}'s shape entries must be positive, got {n}"),
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
                 None => {
                     return Err(Error::new(
@@ -1606,7 +1619,7 @@ impl<'a> CodeGen<'a> {
                         ),
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             }
         }
@@ -1684,7 +1697,7 @@ impl<'a> CodeGen<'a> {
                         ),
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             }
         }
@@ -1938,7 +1951,7 @@ impl<'a> CodeGen<'a> {
                     ),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         let kwv = |k: &str| kw.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
@@ -2015,7 +2028,7 @@ impl<'a> CodeGen<'a> {
                         format!("tl.{other} is not a supported reduction"),
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             };
 
@@ -2033,9 +2046,15 @@ impl<'a> CodeGen<'a> {
             crate::mangle::mangle_fn(&format!("triton.language.standard.{which}"), &mangles);
 
         if !self.generated.contains(&symbol) {
-            self.generate_std_reduction(
-                &symbol, &in_ty, axis_i, def_line, combiner, widen_to, pos,
-            )?;
+            self.generate_std_reduction(StdReduction {
+                symbol: &symbol,
+                in_ty: &in_ty,
+                axis: axis_i,
+                def_line,
+                combiner,
+                widen_to,
+                pos,
+            })?;
         }
         let ret_types = self.fn_ret_types.get(&symbol).cloned().unwrap_or_default();
         let results = self.sem.call(&symbol, &[input], &ret_types);
@@ -2043,17 +2062,16 @@ impl<'a> CodeGen<'a> {
     }
 
     /// Build the private `tt.func` for `standard.max` / `standard.sum`.
-    #[allow(clippy::too_many_arguments)]
-    fn generate_std_reduction(
-        &mut self,
-        symbol: &str,
-        in_ty: &Type,
-        axis: usize,
-        def_line: u32,
-        combiner: &str,
-        widen_to: Option<Type>,
-        pos: Pos,
-    ) -> Result<()> {
+    fn generate_std_reduction(&mut self, r: StdReduction<'_>) -> Result<()> {
+        let StdReduction {
+            symbol,
+            in_ty,
+            axis,
+            def_line,
+            combiner,
+            widen_to,
+            pos,
+        } = r;
         let std_py: std::rc::Rc<str> = std::rc::Rc::from(STANDARD_PY);
         // ONLY THE `def` LINE IS RECORDED for a generated `standard.*` helper, not each inner
         // statement's position. This crate does not parse `standard.py` -- the helpers are
@@ -2372,7 +2390,7 @@ impl<'a> CodeGen<'a> {
                                 "tl.multiple_of's divisor must be a compile-time integer",
                                 pos.line,
                                 pos.col,
-                            ))
+                            ));
                         }
                     },
                     None => {
@@ -2380,7 +2398,7 @@ impl<'a> CodeGen<'a> {
                             "tl.multiple_of needs a divisor",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 let rank = match &x {
@@ -2416,7 +2434,7 @@ impl<'a> CodeGen<'a> {
                             ),
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 if !truthy {
@@ -2487,7 +2505,7 @@ impl<'a> CodeGen<'a> {
                             ),
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 self.sem
@@ -2527,7 +2545,7 @@ impl<'a> CodeGen<'a> {
                             "tl.full needs a dtype, e.g. `tl.float16`",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 self.full(&shape, &value, dtype, pos).map(Val::Ir)
@@ -2543,7 +2561,7 @@ impl<'a> CodeGen<'a> {
                             "tl.zeros needs a dtype, e.g. `tl.float16`",
                             pos.line,
                             pos.col,
-                        ))
+                        ));
                     }
                 };
                 self.call_std_zeros(&shape, dtype, pos).map(Val::Ir)
@@ -2609,7 +2627,7 @@ impl<'a> CodeGen<'a> {
                     "tl.make_tensor_descriptor needs a pointer as its first argument",
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         let seq = |v: Option<Val>, what: &str| -> Result<Vec<Val>> {
@@ -2671,14 +2689,14 @@ impl<'a> CodeGen<'a> {
                     format!("Tensor descriptor last dim must be 1 but got {other}"),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
             None => {
                 return Err(Error::new(
                     "Tensor descriptor last stride must be the compile-time constant 1",
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         }
         // The last block dimension must be at least 16 bytes (`semantic.py:1863`).
@@ -2692,7 +2710,7 @@ impl<'a> CodeGen<'a> {
                          constants",
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             }
         }
@@ -2706,7 +2724,7 @@ impl<'a> CodeGen<'a> {
                         format!("a descriptor over {other} is not supported"),
                         pos.line,
                         pos.col,
-                    ))
+                    ));
                 }
             },
             other => {
@@ -2714,7 +2732,7 @@ impl<'a> CodeGen<'a> {
                     format!("tl.make_tensor_descriptor needs a pointer, got {other}"),
                     pos.line,
                     pos.col,
-                ))
+                ));
             }
         };
         let elem_size = (elem_bits / 8).max(1) as i64;
@@ -2748,25 +2766,26 @@ impl<'a> CodeGen<'a> {
 /// Compile-time arithmetic on two literals.
 fn fold_binary(op: BinOpKind, l: &Val, r: &Val) -> Option<Val> {
     // Integer-only operators.
-    if let (Some(a), Some(b)) = (l.as_int(), r.as_int()) {
-        if matches!(l, Val::Int(_) | Val::Bool(_)) && matches!(r, Val::Int(_) | Val::Bool(_)) {
-            return match op {
-                BinOpKind::Add => Some(Val::Int(a + b)),
-                BinOpKind::Sub => Some(Val::Int(a - b)),
-                BinOpKind::Mult => Some(Val::Int(a * b)),
-                BinOpKind::FloorDiv if b != 0 => Some(Val::Int(a.div_euclid(b))),
-                BinOpKind::Mod if b != 0 => Some(Val::Int(a.rem_euclid(b))),
-                BinOpKind::BitAnd => Some(Val::Int(a & b)),
-                BinOpKind::BitOr => Some(Val::Int(a | b)),
-                BinOpKind::BitXor => Some(Val::Int(a ^ b)),
-                BinOpKind::LShift => Some(Val::Int(a << b)),
-                BinOpKind::RShift => Some(Val::Int(a >> b)),
-                // Python's `/` on two ints is a float.
-                BinOpKind::Div if b != 0 => Some(Val::Float(a as f64 / b as f64)),
-                BinOpKind::Pow if (0..64).contains(&b) => Some(Val::Int(a.pow(b as u32))),
-                _ => None,
-            };
-        }
+    if let (Some(a), Some(b)) = (l.as_int(), r.as_int())
+        && matches!(l, Val::Int(_) | Val::Bool(_))
+        && matches!(r, Val::Int(_) | Val::Bool(_))
+    {
+        return match op {
+            BinOpKind::Add => Some(Val::Int(a + b)),
+            BinOpKind::Sub => Some(Val::Int(a - b)),
+            BinOpKind::Mult => Some(Val::Int(a * b)),
+            BinOpKind::FloorDiv if b != 0 => Some(Val::Int(a.div_euclid(b))),
+            BinOpKind::Mod if b != 0 => Some(Val::Int(a.rem_euclid(b))),
+            BinOpKind::BitAnd => Some(Val::Int(a & b)),
+            BinOpKind::BitOr => Some(Val::Int(a | b)),
+            BinOpKind::BitXor => Some(Val::Int(a ^ b)),
+            BinOpKind::LShift => Some(Val::Int(a << b)),
+            BinOpKind::RShift => Some(Val::Int(a >> b)),
+            // Python's `/` on two ints is a float.
+            BinOpKind::Div if b != 0 => Some(Val::Float(a as f64 / b as f64)),
+            BinOpKind::Pow if (0..64).contains(&b) => Some(Val::Int(a.pow(b as u32))),
+            _ => None,
+        };
     }
     let (a, b) = (l.as_f64()?, r.as_f64()?);
     match op {

@@ -8,6 +8,11 @@
 //! prints `ok` and proves nothing -- that is the silent green, and this tree has
 //! been bitten by it before (commit e35e626b9, "the golden diff fails closed when
 //! the golden is missing"). So [`golden`] PANICS with the regeneration command.
+//!
+//! Each test binary uses a different subset of these helpers, so an unused here is
+//! per-target, not per-crate; the module-level allow states that scope.
+
+#![allow(dead_code)] // each test binary uses a different subset of these helpers.
 
 use std::path::PathBuf;
 
@@ -36,14 +41,12 @@ pub fn golden(config: &str, stage: &str) -> String {
 
 /// Does this config have this stage? Used only to assert a REFUSAL is recorded, so
 /// it never turns a real comparison into a skip.
-#[allow(dead_code)]
 pub fn has(config: &str, stage: &str) -> bool {
     goldens_dir().join(config).join(stage).exists()
 }
 
 /// The launch grid a config was generated with, read from its own `grid.txt` so the
 /// test cannot drift from the golden.
-#[allow(dead_code)]
 pub fn grid(config: &str) -> Vec<i64> {
     golden(config, "grid.txt")
         .trim()
@@ -57,7 +60,6 @@ pub fn grid(config: &str) -> Vec<i64> {
 }
 
 /// A census as a sorted `name=count` list, for a one-line assertion.
-#[allow(dead_code)]
 pub fn census_line(m: &triton_ktir::Module) -> String {
     m.census()
         .into_iter()

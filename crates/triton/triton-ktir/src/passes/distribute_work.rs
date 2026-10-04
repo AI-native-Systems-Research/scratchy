@@ -328,23 +328,21 @@ fn heuristic_num_blocks(module: &Module, fi: usize, anchor: usize) -> i64 {
     let mut bm = 0i64;
     let terminator = block.len().saturating_sub(1);
     for op in block.iter().take(terminator).skip(anchor + 1) {
-        if op.kind == OpKind::KtdpConstructMemoryView && gm == 0 {
-            if let Some(Attr::IntList(s)) = op.attr(&AttrKey::Shape) {
-                if let Some(first) = s.first() {
-                    if *first > 0 {
-                        gm = *first;
-                    }
-                }
-            }
+        if op.kind == OpKind::KtdpConstructMemoryView
+            && gm == 0
+            && let Some(Attr::IntList(s)) = op.attr(&AttrKey::Shape)
+            && let Some(first) = s.first()
+            && *first > 0
+        {
+            gm = *first;
         }
-        if op.kind == OpKind::KtdpConstructAccessTile && bm == 0 {
-            if let Some(d) = op.result_type().and_then(|t| t.dims()) {
-                if let Some(first) = d.first() {
-                    if *first > 0 {
-                        bm = *first;
-                    }
-                }
-            }
+        if op.kind == OpKind::KtdpConstructAccessTile
+            && bm == 0
+            && let Some(d) = op.result_type().and_then(|t| t.dims())
+            && let Some(first) = d.first()
+            && *first > 0
+        {
+            bm = *first;
         }
     }
     if gm > 0 && bm > 0 && gm > bm && gm % bm == 0 {

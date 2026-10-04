@@ -140,7 +140,7 @@ fn a_one_stick_tile_is_planned_as_single_corelet_and_matches_the_cpp() {
 /// rejects a `split` plan that claims one corelet.
 #[test]
 fn the_two_corelet_rule_still_rejects_the_old_shape() {
-    use triton_ktir::passes::plan_corelets::{verify_plan, Pattern};
+    use triton_ktir::passes::plan_corelets::{Pattern, verify_plan};
     let split_one_stick = triton_ktir::passes::plan_corelets::corelets_for_test(1);
     let e = verify_plan(Pattern::Split, &split_one_stick)
         .expect_err("a `split` plan over one stick is still malformed");

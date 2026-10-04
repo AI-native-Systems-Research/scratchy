@@ -46,13 +46,13 @@
 //! see [`reserved_consts_for`].
 
 use ktir_core::ir::IRFunction;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{regions, Region};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, regions};
 use ktir_superdsc::ktir_node::{KtirNode, Program};
-use ktir_superdsc::place::{act_name, PlaceId};
+use ktir_superdsc::place::{PlaceId, act_name};
 use ktir_superdsc::placement::{
-    align128, synth_footprint_bytes, BundleLayout, SegRole, SynthAlloc, TensorPlacement,
+    BundleLayout, SegRole, SynthAlloc, TensorPlacement, align128, synth_footprint_bytes,
 };
-use ktir_superdsc::reserved_tids::{scalarmul_scale_tid, ROPE_P_TID};
+use ktir_superdsc::reserved_tids::{ROPE_P_TID, scalarmul_scale_tid};
 use ktir_superdsc::superdsc_opspec::Df;
 use ktir_superdsc::wire::SEGMENT_SIZE;
 
@@ -424,12 +424,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // regression pins. `pack`'s own arithmetic already guarantees `segment_bytes[seg]` is a whole
     // 128-B multiple, so one granule of slack past the high-water covers the measured over-read
     // exactly.
-    if let Some(index_tid) = index_tid {
-        if let Some(&p) = placements.get(&index_tid) {
-            if p.offset + align128(p.size).max(GRANULE) == segment_bytes[p.segment] {
-                segment_bytes[p.segment] += GRANULE;
-            }
-        }
+    if let Some(index_tid) = index_tid
+        && let Some(&p) = placements.get(&index_tid)
+        && p.offset + align128(p.size).max(GRANULE) == segment_bytes[p.segment]
+    {
+        segment_bytes[p.segment] += GRANULE;
     }
 
     // ── THE CEILING THAT IS REAL: BYTES, PER SEGMENT ─────────────────────────────────────────────

@@ -364,7 +364,7 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             return Err(format!(
                 "triton splice: {} has a registry row but no arity — the row is incomplete",
                 row.kernel
-            ))
+            ));
         }
     };
     if node.inputs.len() < arity {
@@ -626,7 +626,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
                  incomplete"
-            ))
+            ));
         }
     }
     Ok(KernelSpec {

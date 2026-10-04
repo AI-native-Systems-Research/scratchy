@@ -34,7 +34,7 @@
 //!    only that a test CAN fail; bracketing proves the threshold sits where the derivation puts it.
 //! 3. **A discriminating mutant** where one exists for that kernel's algorithm.
 
-use triton_numeric::{bounds, data, mutants, Comparison};
+use triton_numeric::{Comparison, bounds, data, mutants};
 
 /// Which derived envelope gates a configuration, with the extents read FROM `meta.json` rather than
 /// restated here -- so a tolerance derived for one extent cannot come to gate a comparison at

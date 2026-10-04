@@ -594,10 +594,11 @@ pub fn promote_single_trip_loops(m: &mut Module) -> bool {
 fn int_constants(m: &Module) -> HashMap<ValueId, i128> {
     fn walk(ops: &[Op], out: &mut HashMap<ValueId, i128>) {
         for op in ops {
-            if op.name == "arith.constant" && op.results.len() == 1 {
-                if let Some(Attr::Int(v, _)) = op.attrs.get("value") {
-                    out.insert(op.results[0], *v);
-                }
+            if op.name == "arith.constant"
+                && op.results.len() == 1
+                && let Some(Attr::Int(v, _)) = op.attrs.get("value")
+            {
+                out.insert(op.results[0], *v);
             }
             for r in &op.regions {
                 for b in &r.blocks {
@@ -772,7 +773,7 @@ fn inline_one_round(m: &mut Module) -> Result<bool> {
                  one, so this is a malformed module rather than an unsupported construct",
                 0,
                 0,
-            ))
+            ));
         }
     };
     let callee = match m.funcs.iter().find(|f| f.name == callee_name) {
@@ -786,7 +787,7 @@ fn inline_one_round(m: &mut Module) -> Result<bool> {
                 ),
                 0,
                 0,
-            ))
+            ));
         }
     };
 
@@ -1406,10 +1407,10 @@ pub fn symbol_dce(m: &mut Module) {
 
 fn collect_callees(ops: &[Op], out: &mut std::collections::HashSet<String>) {
     for op in ops {
-        if op.name == "tt.call" {
-            if let Some(Attr::Str(s)) = op.attrs.get("callee") {
-                out.insert(s.clone());
-            }
+        if op.name == "tt.call"
+            && let Some(Attr::Str(s)) = op.attrs.get("callee")
+        {
+            out.insert(s.clone());
         }
         for r in &op.regions {
             for b in &r.blocks {

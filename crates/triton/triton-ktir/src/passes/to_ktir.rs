@@ -409,34 +409,33 @@ fn expand_splat_of_scalar_argument(module: &mut Module) -> Result<()> {
         out: &mut Vec<(Ssa, DType)>,
     ) -> Result<()> {
         for op in ops.iter() {
-            if op.kind == OpKind::TensorSplat {
-                if let Some(operand) = op.operands.first().copied() {
-                    if args.iter().any(|(ssa, _)| *ssa == operand) {
-                        let elem = op
-                            .result_types
-                            .first()
-                            .and_then(|t| t.elem())
-                            .ok_or_else(|| {
-                                refuse(format!(
-                                    "a `tensor.splat` of argument {} states no element type, so the \
+            if op.kind == OpKind::TensorSplat
+                && let Some(operand) = op.operands.first().copied()
+                && args.iter().any(|(ssa, _)| *ssa == operand)
+            {
+                let elem = op
+                    .result_types
+                    .first()
+                    .and_then(|t| t.elem())
+                    .ok_or_else(|| {
+                        refuse(format!(
+                            "a `tensor.splat` of argument {} states no element type, so the \
                                      width of the buffer the launch must bind is unknown",
-                                    operand.0
-                                ))
-                            })?;
-                        match out.iter_mut().find(|(s, _)| s == &operand) {
-                            Some((_, d)) => {
-                                if *d != elem {
-                                    return Err(refuse(format!(
-                                        "argument {} is splatted at two different element types ({:?} \
+                            operand.0
+                        ))
+                    })?;
+                match out.iter_mut().find(|(s, _)| s == &operand) {
+                    Some((_, d)) => {
+                        if *d != elem {
+                            return Err(refuse(format!(
+                                "argument {} is splatted at two different element types ({:?} \
                                          and {:?}); one parameter is one buffer, so its width cannot be \
                                          stated twice",
-                                        operand.0, *d, elem
-                                    )));
-                                }
-                            }
-                            None => out.push((operand, elem)),
+                                operand.0, *d, elem
+                            )));
                         }
                     }
+                    None => out.push((operand, elem)),
                 }
             }
             for r in op.regions.iter() {
@@ -618,7 +617,7 @@ fn convert_trans(module: &mut Module, path: &OpPath) -> Result<()> {
                 "tt.trans has no `order`, so its permutation is unknown. Refused rather \
                  than assumed to be a reversal: a wrong permutation is a silently \
                  transposed tile",
-            ))
+            ));
         }
     };
     if order.len() != src_ty.rank() {
@@ -1363,19 +1362,20 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
         // The body, minus its terminator. `scf.yield`'s operands are the carries, so it is a
         // JOIN between copies rather than an op any copy contains.
         let mut body = loopp.regions[0].ops.clone();
-        let yielded: Vec<Ssa> =
-            match body.last() {
-                Some(o) if o.kind == OpKind::ScfYield => {
-                    let ops = o.operands.clone();
-                    body.pop();
-                    ops
-                }
-                _ if carried.is_empty() => Vec::new(),
-                _ => return Err(refuse(
+        let yielded: Vec<Ssa> = match body.last() {
+            Some(o) if o.kind == OpKind::ScfYield => {
+                let ops = o.operands.clone();
+                body.pop();
+                ops
+            }
+            _ if carried.is_empty() => Vec::new(),
+            _ => {
+                return Err(refuse(
                     "an `scf.for` with iter_args does not end in `scf.yield`, so what each trip \
                      carries to the next is not stated and cannot be inferred",
-                )),
-            };
+                ));
+            }
+        };
         if yielded.len() != carried.len() {
             return Err(refuse(format!(
                 "an `scf.for` carries {} iter_arg(s) but yields {} value(s)",
@@ -1828,20 +1828,19 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     let body: Vec<Op> = kernel.regions[0].ops.clone();
     let mut view_of: HashMap<Ssa, Ssa> = HashMap::new();
     for o in &body {
-        if o.kind == OpKind::KtdpConstructMemoryView {
-            if let (Some(v), Some(ptr)) = (o.result(), o.operands.first()) {
-                view_of.insert(v, *ptr);
-            }
+        if o.kind == OpKind::KtdpConstructMemoryView
+            && let (Some(v), Some(ptr)) = (o.result(), o.operands.first())
+        {
+            view_of.insert(v, *ptr);
         }
     }
     let mut tiles_of: HashMap<Ssa, Vec<usize>> = HashMap::new();
     for (i, o) in body.iter().enumerate() {
-        if o.kind == OpKind::KtdpConstructAccessTile {
-            if let Some(v) = o.operands.first() {
-                if view_of.contains_key(v) {
-                    tiles_of.entry(*v).or_default().push(i);
-                }
-            }
+        if o.kind == OpKind::KtdpConstructAccessTile
+            && let Some(v) = o.operands.first()
+            && view_of.contains_key(v)
+        {
+            tiles_of.entry(*v).or_default().push(i);
         }
     }
     let mut materialize: HashSet<Ssa> = HashSet::new();
@@ -1896,10 +1895,10 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
         let mut view_idx_of: HashMap<Ssa, usize> = HashMap::new();
         let mut views_of: HashMap<Ssa, Vec<usize>> = HashMap::new();
         for (i, o) in body.iter().enumerate() {
-            if o.kind == OpKind::KtdpConstructMemoryView {
-                if let Some(ptr) = o.operands.first() {
-                    views_of.entry(*ptr).or_default().push(i);
-                }
+            if o.kind == OpKind::KtdpConstructMemoryView
+                && let Some(ptr) = o.operands.first()
+            {
+                views_of.entry(*ptr).or_default().push(i);
             }
         }
         for (ptr, idxs) in &views_of {
@@ -1942,11 +1941,13 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             let mut view_op = body[view_idx].clone();
             let clone_view = module.fresh_named(&module.hint(view));
             view_op.results = vec![clone_view];
-            view_op.result_types = vec![body[view_idx]
-                .result_types
-                .first()
-                .cloned()
-                .unwrap_or(IrType::Index)];
+            view_op.result_types = vec![
+                body[view_idx]
+                    .result_types
+                    .first()
+                    .cloned()
+                    .unwrap_or(IrType::Index),
+            ];
             view_op.operands = vec![arg];
             flat.push(view_op);
             // THE REBASED TILE: same SSA result (its loads/stores stand), corner 0.
@@ -2094,7 +2095,7 @@ fn decompose_matmul_accumulators(module: &mut Module) -> Result<()> {
             _ => {
                 return Err(refuse(
                     "a `linalg.matmul` with an accumulator has a non-tensor result type",
-                ))
+                ));
             }
         };
         let idx = path.index();
@@ -2318,10 +2319,10 @@ fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
             }
             OpKind::ArithDivf => {
                 let (Some(a), Some(b)) = (a, b) else { continue };
-                if let (Some(x), Some(y)) = (splat_value(module, a), splat_value(module, b)) {
-                    if y.as_f64() != 0.0 {
-                        folds.push((i, Fold::Const(x.as_f64() / y.as_f64())));
-                    }
+                if let (Some(x), Some(y)) = (splat_value(module, a), splat_value(module, b))
+                    && y.as_f64() != 0.0
+                {
+                    folds.push((i, Fold::Const(x.as_f64() / y.as_f64())));
                 }
             }
             OpKind::ArithMinnumf => {
@@ -2982,10 +2983,11 @@ module {
             ]))
         );
         // And the unit dim was collapsed away first.
-        assert!(m
-            .ops_deep()
-            .iter()
-            .any(|o| o.kind == OpKind::TensorCollapseShape));
+        assert!(
+            m.ops_deep()
+                .iter()
+                .any(|o| o.kind == OpKind::TensorCollapseShape)
+        );
     }
 
     #[test]
@@ -2999,10 +3001,11 @@ module {
             );
         }
         // The corelet plan is DROPPED, not converted -- `ktdf` is a name collision.
-        assert!(!m
-            .ops_deep()
-            .iter()
-            .any(|o| o.kind == OpKind::KtdfCoreletPlan));
+        assert!(
+            !m.ops_deep()
+                .iter()
+                .any(|o| o.kind == OpKind::KtdfCoreletPlan)
+        );
         // And the guard fires on a planted foreign op.
         let mut bad = parse::parse(REDUCE).unwrap();
         bad.ops[0].regions[0]

@@ -18,6 +18,7 @@
 //! ⭐⭐⭐ THE BASIS IS PER **AXIS**, NOT PER OP, and that asymmetry is the whole subtlety:
 //!   * `in` (K) is the fp8 ACTIVATION's stick — 128 lanes. A per-core slice of 960 is 7.5 of them.
 //!   * `out` (N) is the packed fp8 KERNEL's stick — 64 lanes, the same as fp16.
+//!
 //! ⛔ AND GRANITE-8b IS THE WITNESS FOR THE N SIDE, not an argument: its working emission splits
 //! n=12800 into 1600 per core, which is 25 fp16 sticks and only 12.5 fp8 ones. That bundle bakes and
 //! decodes coherently, so charging `out` at 128 would reject a division the card demonstrably runs.

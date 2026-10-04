@@ -687,10 +687,11 @@ fn fold_dead_dot_transposes(m: &mut Module) {
         }
         let w = o.operands[1];
         // `OpKind` is not `Copy` here, so the def is matched by reference.
-        if let Some((k, Some(src))) = defs.get(&w) {
-            if *k == OpKind::TtTrans && uses.get(&w).copied() == Some(1) {
-                fold.insert(w, *src);
-            }
+        if let Some((k, Some(src))) = defs.get(&w)
+            && *k == OpKind::TtTrans
+            && uses.get(&w).copied() == Some(1)
+        {
+            fold.insert(w, *src);
         }
     }
     if fold.is_empty() {
@@ -739,7 +740,7 @@ fn run(case: &Case) -> Outcome {
                 result: Err(format!("bridge one refused: {e}")),
                 census_in: 0,
                 census_out: 0,
-            }
+            };
         }
     };
     if let Err(e) = opt::make_ttir(&mut m) {
@@ -757,7 +758,7 @@ fn run(case: &Case) -> Outcome {
                 result: Err(format!("from_ttir refused: {e}")),
                 census_in,
                 census_out: 0,
-            }
+            };
         }
     };
     let (_, census_out) = from_ttir::census_ktir(&k);
@@ -1133,20 +1134,40 @@ fn the_recorded_divergence_does_not_absorb_a_real_regression() {
         (
             "the maps present on BOTH sides but different -- the golden side is not empty, so this \
              is not `we add maps where the C++ adds none`",
-            d("@f/linalg.matmul[7]", "attributes", &maps_ok, "{indexing_maps=[]}"),
+            d(
+                "@f/linalg.matmul[7]",
+                "attributes",
+                &maps_ok,
+                "{indexing_maps=[]}",
+            ),
         ),
         (
             "an OPERAND REWIRED on the matmul -- the second matmul reading the score tile instead \
              of the probabilities, `golden_ktir.rs`'s own planted case",
-            d("@f/linalg.matmul[7]", "operands", "[\"v1\", \"v2\"]", "[\"v1\", \"v3\"]"),
+            d(
+                "@f/linalg.matmul[7]",
+                "operands",
+                "[\"v1\", \"v2\"]",
+                "[\"v1\", \"v3\"]",
+            ),
         ),
         (
             "the matmul REPLACED by another op",
-            d("@f/linalg.matmul[7]", "op kind", "linalg.matmul", "linalg.reduce"),
+            d(
+                "@f/linalg.matmul[7]",
+                "op kind",
+                "linalg.matmul",
+                "linalg.reduce",
+            ),
         ),
         (
             "an op ADDED or REMOVED",
-            d("@f/region0", "op count", "40 non-constant ops", "39 non-constant ops"),
+            d(
+                "@f/region0",
+                "op count",
+                "40 non-constant ops",
+                "39 non-constant ops",
+            ),
         ),
         (
             "the matmul's RESULT TYPE changed -- f16 to f32 is what LegalizeTypes exists to stop, \
@@ -1175,11 +1196,21 @@ fn the_recorded_divergence_does_not_absorb_a_real_regression() {
         ),
         (
             "a CONSTANT changed -- the qk_scale",
-            d("@f/<constants>", "constant set", "1.275630e-01", "1.375630e-01"),
+            d(
+                "@f/<constants>",
+                "constant set",
+                "1.275630e-01",
+                "1.375630e-01",
+            ),
         ),
         (
             "a STORE's operands -- the output written from the wrong value",
-            d("@f/ktdp.store[40]", "operands", "[\"v9\", \"v8\"]", "[\"v7\", \"v8\"]"),
+            d(
+                "@f/ktdp.store[40]",
+                "operands",
+                "[\"v9\", \"v8\"]",
+                "[\"v7\", \"v8\"]",
+            ),
         ),
     ];
 

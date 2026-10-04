@@ -352,7 +352,7 @@ fn dtype(t: &ttir::Type, in_desc: bool, what: &str) -> Result<DType> {
             return Err(Refusal::new(
                 PASS,
                 format!("{what}: `i{b}` has no `DType`; the modelled widths are 1, 32 and 64"),
-            ))
+            ));
         }
         ttir::Type::Float(FloatKind::F16) => DType::F16,
         ttir::Type::Float(FloatKind::F32) => DType::F32,
@@ -372,13 +372,13 @@ fn dtype(t: &ttir::Type, in_desc: bool, what: &str) -> Result<DType> {
                      f8E4M3FN (E4M3 weights only -- computed values are f16)",
                     k.mlir()
                 ),
-            ))
+            ));
         }
         other => {
             return Err(Refusal::new(
                 PASS,
                 format!("{what}: `{other}` is not an element type"),
-            ))
+            ));
         }
     })
 }
@@ -411,7 +411,7 @@ fn ty(m: &ttir::Module, t: &ttir::Type, what: &str) -> Result<IrType> {
         }
         ttir::Type::Int(..) | ttir::Type::Float(..) => IrType::Scalar(dtype(t, false, what)?),
         ttir::Type::Void => {
-            return Err(Refusal::new(PASS, format!("{what}: `()` has no KTIR type")))
+            return Err(Refusal::new(PASS, format!("{what}: `()` has no KTIR type")));
         }
     })
 }
@@ -458,7 +458,7 @@ fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Res
                         "`{op_name}`'s `{key}` is a dense splat of {other:?}, which has no \
                          KTIR attribute form"
                     ),
-                ))
+                ));
             }
         },
         ttir::Attr::Bool(b) => Attr::Bool(*b),
@@ -476,7 +476,7 @@ fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Res
                 return Err(Refusal::new(
                     PASS,
                     format!("`{op_name}`'s axis is `{other}`; MLIR has x, y and z"),
-                ))
+                ));
             }
         }),
         // `arith.cmpi slt` -- also a bare keyword, also a hand-written reader arm. No
@@ -497,7 +497,7 @@ fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Res
                                  `Attr::IntList` is the only list form, so a non-integer \
                                  element has nowhere to go"
                             ),
-                        ))
+                        ));
                     }
                 }
             }
@@ -510,7 +510,7 @@ fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Res
                     "`{op_name}`'s `{key}` is the type attribute `{t}`; `ir::Attr` has no \
                      type variant"
                 ),
-            ))
+            ));
         }
     })
 }

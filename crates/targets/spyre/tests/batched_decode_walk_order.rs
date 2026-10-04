@@ -21,8 +21,8 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
 };
 use scratchy_subtile::addr::DevOff;
 use scratchy_subtile::sdsc_abstract::{
-    BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, PaddedMq,
-    PerRequestRows, QueryRowCount, RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
+    BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, PerRequestRows,
+    QueryRowCount, RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
 };
 
 const HD: u32 = 64; // the g-form exists only where a head is one stick

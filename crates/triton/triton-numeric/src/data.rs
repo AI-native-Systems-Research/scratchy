@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use ktir_core::dtypes::DType;
 
-use crate::{refuse, Binding, Refusal, Result};
+use crate::{Binding, Result, refuse};
 
 /// `crates/triton` -- this crate sits at `<that>/triton-numeric`.
 pub fn spyre_root() -> PathBuf {
@@ -247,16 +247,16 @@ fn expand_sparse(
         }
         // Ascending and DISTINCT, as the format states. A repeated index would mean one row's
         // bytes silently overwrite another's, and the file would still be the right length.
-        if let Some(prev) = last {
-            if idx <= prev {
-                return Err(refuse(
-                    "data",
-                    format!(
-                        "{}: record {k} names row {idx} after row {prev}; the format states                          ascending, distinct indices",
-                        p.display()
-                    ),
-                ));
-            }
+        if let Some(prev) = last
+            && idx <= prev
+        {
+            return Err(refuse(
+                "data",
+                format!(
+                    "{}: record {k} names row {idx} after row {prev}; the format states                          ascending, distinct indices",
+                    p.display()
+                ),
+            ));
         }
         last = Some(idx);
         out[idx * row_bytes..(idx + 1) * row_bytes]
@@ -614,7 +614,9 @@ impl Fixture {
                 format!(
                     "`{}` is OVERSIZED: its inputs are not in the tree and no staged directory was                      given. Set `{var}` (or `TRITON_NUMERIC_STAGED`) to a directory holding them.                      {}",
                     self.config,
-                    self.staging.as_deref().unwrap_or("No staging note was recorded."),
+                    self.staging
+                        .as_deref()
+                        .unwrap_or("No staging note was recorded."),
                 ),
             )),
         }
@@ -903,9 +905,6 @@ pub fn banner(f: &Fixture) -> String {
         }
     )
 }
-
-#[allow(dead_code)]
-fn _refusal_is_used(_: Refusal) {}
 
 #[cfg(test)]
 mod tests {

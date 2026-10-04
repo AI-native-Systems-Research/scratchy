@@ -120,11 +120,7 @@ fn the_triton_op_conversions_match_the_cpp_census() {
                 .and_then(|f| f.attr(&triton_ktir::ir::AttrKey::Grid))
                 .and_then(|a| a.as_int_list().map(|v| v.iter().product::<i64>()))
                 .unwrap_or(1);
-            if og == 1 && gg > 1 {
-                gg
-            } else {
-                1
-            }
+            if og == 1 && gg > 1 { gg } else { 1 }
         };
         for name in ["func.func", "func.return"] {
             let (gv, ov) = (count(&g, name), count(&o, name));

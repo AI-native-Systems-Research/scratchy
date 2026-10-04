@@ -1052,14 +1052,6 @@ pub fn run_matmul_loop_gpu(
                 eprintln!("  [gemm-check] m={m} k={k} n={n}  {be} vs CPU max diff {d:.4}");
             }
         }
-        if std::env::var_os("KTIR_GEMM_CHECK").is_some() {
-            eprintln!(
-                "  [gemm-check-ran] m={m} k={k} n={n} transpose_b={} b_dtype={:?} out[0..3]={:?}",
-                info.transpose_b,
-                info.b_dtype,
-                &out[..3.min(out.len())]
-            );
-        }
         let _mm_ns = _t_mm.elapsed().as_nanos() as u64;
         GEMM_COMPUTE_NS.fetch_add(_mm_ns, std::sync::atomic::Ordering::Relaxed);
         // Split the same nanoseconds by engine: GPU time is 201 commit+wait round trips,

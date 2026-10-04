@@ -165,10 +165,10 @@ pub fn lower(config: &str) -> Result<Lowered> {
 /// tile. Anything else (a nonzero splat, a live `dot`, an addf the pass did not mint) is left
 /// untouched, so a program that states a genuine materialize-then-add still pays it.
 fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
+    use triton_ktir::Ssa as KSsa;
     use triton_ktir::ir::OpKind;
     use triton_ktir::passes::dot_to_linalg::is_zero_const;
     use triton_ktir::passes::walk;
-    use triton_ktir::Ssa as KSsa;
 
     // The zero `outs` of a decomposed matmul: either the pass's scalar zero constant or its
     // `tensor.splat` of one (the two spellings `decompose_matmul_accumulators` mints).
@@ -261,7 +261,7 @@ fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
             }
         }
         dead.pop(); // `dead` now holds only the provably-dead defs; the last push was not one
-                    // Remove the dead defs from whichever block holds them (they may be in this block).
+        // Remove the dead defs from whichever block holds them (they may be in this block).
         for v in dead {
             for p in walk::paths(m).into_iter().rev() {
                 if walk::at(m, &p).is_some_and(|o| o.results.first() == Some(&v)) {
@@ -482,11 +482,7 @@ impl Comparison {
             let ratio = if !err.is_finite() || !bound.is_finite() {
                 f64::INFINITY
             } else if bound == 0.0 {
-                if err == 0.0 {
-                    0.0
-                } else {
-                    f64::INFINITY
-                }
+                if err == 0.0 { 0.0 } else { f64::INFINITY }
             } else {
                 err / bound
             };

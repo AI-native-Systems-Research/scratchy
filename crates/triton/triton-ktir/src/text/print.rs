@@ -194,11 +194,11 @@ impl Names {
         // Function arguments first, then every definition in program order, then each
         // region's block arguments -- the order MLIR names them in.
         for op in module.ops_deep() {
-            if op.kind == OpKind::TtFunc {
-                if let Some(r) = op.regions.first() {
-                    for (v, _) in &r.args {
-                        assign(*v, &mut printed);
-                    }
+            if op.kind == OpKind::TtFunc
+                && let Some(r) = op.regions.first()
+            {
+                for (v, _) in &r.args {
+                    assign(*v, &mut printed);
                 }
             }
         }

@@ -352,7 +352,7 @@ impl Parser {
                         return Err(err(
                             lineno,
                             format!("tt.get_program_id axis must be x, y or z, got {other:?}"),
-                        ))
+                        ));
                     }
                 };
                 op.set_attr(AttrKey::Axis, Attr::Int(axis));
@@ -452,12 +452,12 @@ impl Parser {
         // 1-D launch extent the scheduler reads -- so skipping the dictionary makes the
         // one attribute this stage exists to set invisible.
         let after_sig = &rest[open..];
-        if let Some(at) = after_sig.find("attributes") {
-            if let Some((inner, _)) = balanced(&after_sig[at..], '{', '}') {
-                let inner = inner.to_string();
-                for (k, v) in self.parse_attr_dict(&inner, lineno)? {
-                    op.set_attr(k, v);
-                }
+        if let Some(at) = after_sig.find("attributes")
+            && let Some((inner, _)) = balanced(&after_sig[at..], '{', '}')
+        {
+            let inner = inner.to_string();
+            for (k, v) in self.parse_attr_dict(&inner, lineno)? {
+                op.set_attr(k, v);
             }
         }
 
@@ -643,10 +643,10 @@ impl Parser {
                 op.set_attr(AttrKey::Pattern, Attr::Str(v[..end].to_string()));
             }
         }
-        if let Some(at) = rest.find("work_division") {
-            if let Some((inner, _)) = balanced(&rest[at..], '[', ']') {
-                op.set_attr(AttrKey::WorkDivision, Attr::IntList(parse_int_list(inner)));
-            }
+        if let Some(at) = rest.find("work_division")
+            && let Some((inner, _)) = balanced(&rest[at..], '[', ']')
+        {
+            op.set_attr(AttrKey::WorkDivision, Attr::IntList(parse_int_list(inner)));
         }
         let _ = lineno;
         Ok(())
@@ -926,10 +926,10 @@ impl Parser {
             ));
         }
         // `1 : i32` -- an integer with its type.
-        if let Some((num, _ty)) = v.split_once(" : ") {
-            if let Some(i) = parse_int(num.trim()) {
-                return Ok(Attr::Int(i));
-            }
+        if let Some((num, _ty)) = v.split_once(" : ")
+            && let Some(i) = parse_int(num.trim())
+        {
+            return Ok(Attr::Int(i));
         }
         if let Some(i) = parse_int(v) {
             return Ok(Attr::Int(i));
@@ -977,18 +977,18 @@ impl Parser {
         // `index` means an access tile (an access tile INDEXES rather than holds, so
         // `index` is the only element type it has), anything else means a tensordesc
         // block type.
-        if let Some(inner) = t.strip_prefix('<') {
-            if let Some((dims, elem)) = parse_shaped(inner) {
-                if elem == "index" {
-                    return Ok(IrType::AccessTile { dims });
-                }
-                if let Some(d) = DType::from_spelling(&elem) {
-                    return Ok(if dims.is_empty() {
-                        IrType::Ptr { elem: d }
-                    } else {
-                        IrType::TensorDesc { dims, elem: d }
-                    });
-                }
+        if let Some(inner) = t.strip_prefix('<')
+            && let Some((dims, elem)) = parse_shaped(inner)
+        {
+            if elem == "index" {
+                return Ok(IrType::AccessTile { dims });
+            }
+            if let Some(d) = DType::from_spelling(&elem) {
+                return Ok(if dims.is_empty() {
+                    IrType::Ptr { elem: d }
+                } else {
+                    IrType::TensorDesc { dims, elem: d }
+                });
             }
         }
         if let Some(inner) = t.strip_prefix("!tt.ptr<") {
