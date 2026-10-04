@@ -1,0 +1,44 @@
+# OUR KTIR -> scratchy's `ktir-superdsc` LOWERING. The adapter, and nothing else.
+#
+# WHY THIS CRATE EXISTS SEPARATELY FROM `triton-superdsc-lower`. That one is OUR OWN
+# ktir->superdsc lowering: it takes whole-kernel KTIR, needs no node classification, and
+# bakes 10 of 12 Granite configurations today. This one drives THEIRS, which is the
+# implementation validated by byte-identity against a bake proven on silicon. Both are kept
+# while the second is brought up, because the first is the only working reference we have
+# for what our KTIR should produce -- deleting it before theirs passes would leave nothing
+# to compare against.
+[package]
+name = "triton-ktir-superdsc"
+description = "adapter: our KTIR value -> ktir-superdsc's KtirNode + per-kind entry points"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+# Our KTIR, and `handoff::lower` which already produces their `IRFunction`.
+triton-ktir = { path = "../triton-ktir" }
+# THEIRS IS NOW OURS. This edge used to be the vendored copy under `../vendor/`; the
+# re-host reverses the arrow: scratchy main owns `ktir-superdsc` (triton-spyre re-vendored
+# from this tree at `ec18ac1da`, local delta zero), so the adapter depends on the crates
+# in their one true home. See crates/triton/PROVENANCE.md.
+ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
+ktir-core = { path = "../../targets/spyre/ktir/ktir-core" }
+# ⭐ BECAUSE SUPERDSC IS A JSON FORMAT, and `dxp_standalone -d <dir>` reads it off disk. What
+# `emit_node` returns is `Vec<EmittedOp>`, whose `op: Option<SdscOp>` is `ktir-superdsc`'s own
+# `#[derive(Serialize)]` wire type — so the descriptors exist as values and the ONLY thing between
+# them and the validation gate is a serializer. `ktir-superdsc` depends on `serde_json` itself and
+# re-exports nothing, so the adapter declares its own edge rather than reaching through theirs.
+#
+# ⚖️ THIS IS THE `triton-superdsc` "NO DEPENDENCIES ANYWHERE IN THIS WORKSPACE" RULE'S SECOND
+# EXCEPTION, and it is stated here rather than quietly taken — see ../vendor/PROVENANCE.md, which
+# records the first (serde/serde_json/half, for the vendored crates) and the four version gaps that
+# make `cargo --offline` fail on the pod today. `serde_json` itself is NOT one of those gaps: the
+# pod's cache holds 1.0.150 and 1.0.151, and our lock is on 1.0.151.
+serde_json = "1"
+# ⭐ THE FIRST LEG, WHICH WAS MISSING. `examples/bake_py` starts from the Triton `.py`
+# fixture rather than a checked-in ttir golden, so the chain is exercised WHOLE:
+# triton -> ttir -> ktir -> superdsc -> dxp_standalone. Every earlier run in this crate
+# began at `<config>.ttir.mlir`, which skips a bridge and then reports the chain as run --
+# exactly how a green result comes to cover a leg nobody drove.
+triton-frontend = { path = "../triton-frontend", features = ["ruff"] }

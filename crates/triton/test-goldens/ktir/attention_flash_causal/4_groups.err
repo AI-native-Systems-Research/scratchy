@@ -1,0 +1,293 @@
+/Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/goldens/ktir/attention_flash_causal//3_sched.mlir:81:13: error: spyre-carried-values-to-memory: this loop carries values through memory, so each step must become its own compute group with compile-time addresses -- but its bounds are not all constant, positive-step integers, so the step count is not known here. A runtime trip count cannot be lowered: the step index would reach dcc as a function argument of the extracted local_schedule, which is addressable neither as an AGEN subscript nor as a memory view's start address
+    %30:5 = scf.for %arg5 = %c0_i32 to %12 step %c64_i32 iter_args(%arg6 = %splat_9, %arg7 = %splat_3, %arg8 = %splat_5, %arg9 = %16, %arg10 = %16) -> (tensor<128x64xf16>, tensor<64xf16>, tensor<64xf16>, i32, i32)  : i32 {
+            ^
+/Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/goldens/ktir/attention_flash_causal//3_sched.mlir:81:13: note: see current operation: 
+%65:5 = "scf.for"(%17, %36, %19, %16, %9, %11, %40, %40) ({
+^bb0(%arg44: i32, %arg45: tensor<128x64xf16>, %arg46: tensor<64xf16>, %arg47: tensor<64xf16>, %arg48: i32, %arg49: i32):
+  %146 = "arith.subi"(%arg44, %17) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
+  %147 = "arith.divsi"(%146, %19) : (i32, i32) -> i32
+  %148 = "arith.constant"() <{value = 64 : i32}> : () -> i32
+  %149 = "arith.muli"(%147, %148) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
+  %150 = "arith.addi"(%40, %149) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
+  %151 = "arith.index_cast"(%150) : (i32) -> index
+  %152 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %153 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %154 = "ktdp.construct_access_tile"(%32, %151, %152, %153) <{access_tile_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, access_tile_set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 >= 0)>, base_map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, operandSegmentSizes = array<i32: 1, 3, 0>}> : (memref<256x128x64xf16>, index, index, index) -> !ktdp.access_tile<64x128x1xindex>
+  %155 = "ktdp.load"(%154) : (!ktdp.access_tile<64x128x1xindex>) -> tensor<64x128x1xf16>
+  %156 = "ktdp.construct_access_tile"(%31, %62, %42) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<1024x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>
+  %157 = "ktdp.load"(%156) : (!ktdp.access_tile<128x64xindex>) -> tensor<128x64xf16>
+  %158 = "tensor.splat"(%13) : (f16) -> tensor<64x64xf16>
+  %159 = "linalg.generic"(%155, %157, %158) <{indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2, 0)>, affine_map<(d0, d1, d2) -> (d2, d1)>, affine_map<(d0, d1, d2) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg91: f16, %arg92: f16, %arg93: f16):
+    %362 = "arith.mulf"(%arg91, %arg92) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    %363 = "arith.addf"(%arg93, %362) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%363) : (f16) -> ()
+  }) : (tensor<64x128x1xf16>, tensor<128x64xf16>, tensor<64x64xf16>) -> tensor<64x64xf16>
+  %160 = "ktdp.construct_memory_view"(%arg8) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %161 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %162 = "ktdp.construct_access_tile"(%160, %161, %161) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  "ktdp.store"(%159, %162) : (tensor<64x64xf16>, !ktdp.access_tile<64x64xindex>) -> ()
+  %163 = "ktdp.construct_memory_view"(%arg8) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %164 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %165 = "ktdp.construct_access_tile"(%163, %164, %164) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  %166 = "ktdp.load"(%165) : (!ktdp.access_tile<64x64xindex>) -> tensor<64x64xf16>
+  %167 = "arith.constant"() <{value = 0xFC00 : f16}> : () -> f16
+  %168 = "tensor.splat"(%167) : (f16) -> tensor<64xf16>
+  %169 = "linalg.generic"(%166, %168) <{indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d1)>], iterator_types = [#linalg.iterator_type<reduction>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 1, 1>}> ({
+  ^bb0(%arg89: f16, %arg90: f16):
+    %361 = "arith.maxnumf"(%arg89, %arg90) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%361) : (f16) -> ()
+  }) : (tensor<64x64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %170 = "ktdp.construct_memory_view"(%arg9) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %171 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %172 = "ktdp.construct_access_tile"(%170, %171) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%169, %172) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %173 = "ktdp.construct_memory_view"(%arg9) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %174 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %175 = "ktdp.construct_access_tile"(%173, %174) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %176 = "ktdp.load"(%175) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %177 = "tensor.splat"(%6) : (f16) -> tensor<64xf16>
+  %178 = "tensor.empty"() : () -> tensor<64xf16>
+  %179 = "linalg.generic"(%176, %177, %178) <{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = [#linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg86: f16, %arg87: f16, %arg88: f16):
+    %360 = "arith.mulf"(%arg86, %arg87) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%360) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %180 = "ktdp.construct_memory_view"(%arg10) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %181 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %182 = "ktdp.construct_access_tile"(%180, %181) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%179, %182) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %183 = "ktdp.construct_memory_view"(%arg7) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %184 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %185 = "ktdp.construct_access_tile"(%183, %184) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %186 = "ktdp.load"(%185) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %187 = "ktdp.construct_memory_view"(%arg10) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %188 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %189 = "ktdp.construct_access_tile"(%187, %188) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %190 = "ktdp.load"(%189) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %191 = "tensor.empty"() : () -> tensor<64xf16>
+  %192 = "linalg.generic"(%186, %190, %191) <{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = [#linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg83: f16, %arg84: f16, %arg85: f16):
+    %359 = "arith.maxnumf"(%arg83, %arg84) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%359) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %193 = "ktdp.construct_memory_view"(%arg11) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %194 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %195 = "ktdp.construct_access_tile"(%193, %194) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%192, %195) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %196 = "ktdp.construct_memory_view"(%arg8) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %197 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %198 = "ktdp.construct_access_tile"(%196, %197, %197) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  %199 = "ktdp.load"(%198) : (!ktdp.access_tile<64x64xindex>) -> tensor<64x64xf16>
+  %200 = "tensor.splat"(%4) : (f16) -> tensor<64x64xf16>
+  %201 = "tensor.empty"() : () -> tensor<64x64xf16>
+  %202 = "linalg.generic"(%199, %200, %201) <{indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg80: f16, %arg81: f16, %arg82: f16):
+    %358 = "arith.mulf"(%arg80, %arg81) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%358) : (f16) -> ()
+  }) : (tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf16>) -> tensor<64x64xf16>
+  %203 = "ktdp.construct_memory_view"(%arg12) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %204 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %205 = "ktdp.construct_access_tile"(%203, %204, %204) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  "ktdp.store"(%202, %205) : (tensor<64x64xf16>, !ktdp.access_tile<64x64xindex>) -> ()
+  %206 = "ktdp.construct_memory_view"(%arg11) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %207 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %208 = "ktdp.construct_access_tile"(%206, %207) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %209 = "ktdp.load"(%208) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %210 = "tensor.empty"() : () -> tensor<64x64xf16>
+  %211 = "linalg.generic"(%209, %210) <{indexing_maps = [affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 1, 1>}> ({
+  ^bb0(%arg78: f16, %arg79: f16):
+    "linalg.yield"(%arg78) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64x64xf16>) -> tensor<64x64xf16>
+  %212 = "ktdp.construct_memory_view"(%arg13) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %213 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %214 = "ktdp.construct_access_tile"(%212, %213, %213) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  "ktdp.store"(%211, %214) : (tensor<64x64xf16>, !ktdp.access_tile<64x64xindex>) -> ()
+  %215 = "ktdp.construct_memory_view"(%arg12) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %216 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %217 = "ktdp.construct_access_tile"(%215, %216, %216) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  %218 = "ktdp.load"(%217) : (!ktdp.access_tile<64x64xindex>) -> tensor<64x64xf16>
+  %219 = "ktdp.construct_memory_view"(%arg13) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %220 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %221 = "ktdp.construct_access_tile"(%219, %220, %220) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  %222 = "ktdp.load"(%221) : (!ktdp.access_tile<64x64xindex>) -> tensor<64x64xf16>
+  %223 = "tensor.empty"() : () -> tensor<64x64xf16>
+  %224 = "linalg.generic"(%218, %222, %223) <{indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg75: f16, %arg76: f16, %arg77: f16):
+    %357 = "arith.subf"(%arg75, %arg76) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%357) : (f16) -> ()
+  }) : (tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf16>) -> tensor<64x64xf16>
+  %225 = "ktdp.construct_memory_view"(%arg14) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %226 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %227 = "ktdp.construct_access_tile"(%225, %226, %226) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  "ktdp.store"(%224, %227) : (tensor<64x64xf16>, !ktdp.access_tile<64x64xindex>) -> ()
+  %228 = "ktdp.construct_memory_view"(%arg14) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %229 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %230 = "ktdp.construct_access_tile"(%228, %229, %229) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  %231 = "ktdp.load"(%230) : (!ktdp.access_tile<64x64xindex>) -> tensor<64x64xf16>
+  %232 = "tensor.empty"() : () -> tensor<64x64xf16>
+  %233 = "linalg.generic"(%231, %232) <{indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 1, 1>}> ({
+  ^bb0(%arg73: f16, %arg74: f16):
+    %356 = "math.exp2"(%arg73) <{fastmath = #arith.fastmath<none>}> : (f16) -> f16
+    "linalg.yield"(%356) : (f16) -> ()
+  }) : (tensor<64x64xf16>, tensor<64x64xf16>) -> tensor<64x64xf16>
+  %234 = "ktdp.construct_memory_view"(%arg15) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %235 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %236 = "ktdp.construct_access_tile"(%234, %235, %235) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  "ktdp.store"(%233, %236) : (tensor<64x64xf16>, !ktdp.access_tile<64x64xindex>) -> ()
+  %237 = "ktdp.construct_memory_view"(%arg7) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %238 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %239 = "ktdp.construct_access_tile"(%237, %238) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %240 = "ktdp.load"(%239) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %241 = "ktdp.construct_memory_view"(%arg11) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %242 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %243 = "ktdp.construct_access_tile"(%241, %242) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %244 = "ktdp.load"(%243) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %245 = "tensor.empty"() : () -> tensor<64xf16>
+  %246 = "linalg.generic"(%240, %244, %245) <{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = [#linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg70: f16, %arg71: f16, %arg72: f16):
+    %355 = "arith.subf"(%arg70, %arg71) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%355) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %247 = "ktdp.construct_memory_view"(%arg16) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %248 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %249 = "ktdp.construct_access_tile"(%247, %248) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%246, %249) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %250 = "ktdp.construct_memory_view"(%arg16) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %251 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %252 = "ktdp.construct_access_tile"(%250, %251) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %253 = "ktdp.load"(%252) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %254 = "tensor.empty"() : () -> tensor<64xf16>
+  %255 = "linalg.generic"(%253, %254) <{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = [#linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 1, 1>}> ({
+  ^bb0(%arg68: f16, %arg69: f16):
+    %354 = "math.exp2"(%arg68) <{fastmath = #arith.fastmath<none>}> : (f16) -> f16
+    "linalg.yield"(%354) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %256 = "ktdp.construct_memory_view"(%arg17) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %257 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %258 = "ktdp.construct_access_tile"(%256, %257) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%255, %258) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %259 = "ktdp.construct_memory_view"(%arg15) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %260 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %261 = "ktdp.construct_access_tile"(%259, %260, %260) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  %262 = "ktdp.load"(%261) : (!ktdp.access_tile<64x64xindex>) -> tensor<64x64xf16>
+  %263 = "arith.constant"() <{value = 0.000000e+00 : f16}> : () -> f16
+  %264 = "tensor.splat"(%263) : (f16) -> tensor<64xf16>
+  %265 = "linalg.generic"(%262, %264) <{indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d1)>], iterator_types = [#linalg.iterator_type<reduction>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 1, 1>}> ({
+  ^bb0(%arg66: f16, %arg67: f16):
+    %353 = "arith.addf"(%arg66, %arg67) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%353) : (f16) -> ()
+  }) : (tensor<64x64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %266 = "ktdp.construct_memory_view"(%arg18) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %267 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %268 = "ktdp.construct_access_tile"(%266, %267) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%265, %268) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %269 = "ktdp.construct_memory_view"(%arg17) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %270 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %271 = "ktdp.construct_access_tile"(%269, %270) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %272 = "ktdp.load"(%271) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %273 = "tensor.empty"() : () -> tensor<128x64xf16>
+  %274 = "linalg.generic"(%272, %273) <{indexing_maps = [affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 1, 1>}> ({
+  ^bb0(%arg64: f16, %arg65: f16):
+    "linalg.yield"(%arg64) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<128x64xf16>) -> tensor<128x64xf16>
+  %275 = "ktdp.construct_memory_view"(%arg19) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 128, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<128x64xf16>
+  %276 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %277 = "ktdp.construct_access_tile"(%275, %276, %276) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<128x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>
+  "ktdp.store"(%274, %277) : (tensor<128x64xf16>, !ktdp.access_tile<128x64xindex>) -> ()
+  %278 = "ktdp.construct_memory_view"(%arg5) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 128, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<128x64xf16>
+  %279 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %280 = "ktdp.construct_access_tile"(%278, %279, %279) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<128x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>
+  %281 = "ktdp.load"(%280) : (!ktdp.access_tile<128x64xindex>) -> tensor<128x64xf16>
+  %282 = "ktdp.construct_memory_view"(%arg19) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 128, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<128x64xf16>
+  %283 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %284 = "ktdp.construct_access_tile"(%282, %283, %283) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<128x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>
+  %285 = "ktdp.load"(%284) : (!ktdp.access_tile<128x64xindex>) -> tensor<128x64xf16>
+  %286 = "tensor.empty"() : () -> tensor<128x64xf16>
+  %287 = "linalg.generic"(%281, %285, %286) <{indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg61: f16, %arg62: f16, %arg63: f16):
+    %352 = "arith.mulf"(%arg61, %arg62) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%352) : (f16) -> ()
+  }) : (tensor<128x64xf16>, tensor<128x64xf16>, tensor<128x64xf16>) -> tensor<128x64xf16>
+  %288 = "ktdp.construct_memory_view"(%arg20) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 128, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<128x64xf16>
+  %289 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %290 = "ktdp.construct_access_tile"(%288, %289, %289) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<128x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>
+  "ktdp.store"(%287, %290) : (tensor<128x64xf16>, !ktdp.access_tile<128x64xindex>) -> ()
+  %291 = "ktdp.construct_memory_view"(%arg6) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %292 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %293 = "ktdp.construct_access_tile"(%291, %292) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %294 = "ktdp.load"(%293) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %295 = "ktdp.construct_memory_view"(%arg17) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %296 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %297 = "ktdp.construct_access_tile"(%295, %296) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %298 = "ktdp.load"(%297) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %299 = "tensor.empty"() : () -> tensor<64xf16>
+  %300 = "linalg.generic"(%294, %298, %299) <{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = [#linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg58: f16, %arg59: f16, %arg60: f16):
+    %351 = "arith.mulf"(%arg58, %arg59) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%351) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %301 = "ktdp.construct_memory_view"(%arg21) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %302 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %303 = "ktdp.construct_access_tile"(%301, %302) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%300, %303) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %304 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %305 = "arith.subi"(%arg44, %17) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
+  %306 = "arith.divsi"(%305, %19) : (i32, i32) -> i32
+  %307 = "arith.constant"() <{value = 64 : i32}> : () -> i32
+  %308 = "arith.muli"(%306, %307) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
+  %309 = "arith.addi"(%40, %308) <{overflowFlags = #arith.overflow<none>}> : (i32, i32) -> i32
+  %310 = "arith.index_cast"(%309) : (i32) -> index
+  %311 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %312 = "ktdp.construct_access_tile"(%33, %304, %310, %311) <{access_tile_order = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, access_tile_set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 >= 0)>, base_map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>, operandSegmentSizes = array<i32: 1, 3, 0>}> : (memref<128x256x64xf16>, index, index, index) -> !ktdp.access_tile<128x64x1xindex>
+  %313 = "ktdp.load"(%312) : (!ktdp.access_tile<128x64x1xindex>) -> tensor<128x64x1xf16>
+  %314 = "ktdp.construct_memory_view"(%arg15) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<64x64xf16>
+  %315 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %316 = "ktdp.construct_access_tile"(%314, %315, %315) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<64x64xf16>, index, index) -> !ktdp.access_tile<64x64xindex>
+  %317 = "ktdp.load"(%316) : (!ktdp.access_tile<64x64xindex>) -> tensor<64x64xf16>
+  %318 = "ktdp.construct_memory_view"(%arg20) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 128, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<128x64xf16>
+  %319 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %320 = "ktdp.construct_access_tile"(%318, %319, %319) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<128x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>
+  %321 = "ktdp.load"(%320) : (!ktdp.access_tile<128x64xindex>) -> tensor<128x64xf16>
+  %322 = "linalg.generic"(%313, %317, %321) <{indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2, 0)>, affine_map<(d0, d1, d2) -> (d2, d1)>, affine_map<(d0, d1, d2) -> (d0, d1)>], iterator_types = [#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg55: f16, %arg56: f16, %arg57: f16):
+    %349 = "arith.mulf"(%arg55, %arg56) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    %350 = "arith.addf"(%arg57, %349) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%350) : (f16) -> ()
+  }) : (tensor<128x64x1xf16>, tensor<64x64xf16>, tensor<128x64xf16>) -> tensor<128x64xf16>
+  %323 = "ktdp.construct_memory_view"(%arg5) <{coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 128, 64>, static_strides = array<i64: 64, 1>}> : (index) -> memref<128x64xf16>
+  %324 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %325 = "ktdp.construct_access_tile"(%323, %324, %324) <{access_tile_order = affine_map<(d0, d1) -> (d0, d1)>, access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>, base_map = affine_map<(d0, d1) -> (d0, d1)>, operandSegmentSizes = array<i32: 1, 2, 0>}> : (memref<128x64xf16>, index, index) -> !ktdp.access_tile<128x64xindex>
+  "ktdp.store"(%322, %325) : (tensor<128x64xf16>, !ktdp.access_tile<128x64xindex>) -> ()
+  %326 = "ktdp.construct_memory_view"(%arg21) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %327 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %328 = "ktdp.construct_access_tile"(%326, %327) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %329 = "ktdp.load"(%328) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %330 = "ktdp.construct_memory_view"(%arg18) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %331 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %332 = "ktdp.construct_access_tile"(%330, %331) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %333 = "ktdp.load"(%332) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %334 = "tensor.empty"() : () -> tensor<64xf16>
+  %335 = "linalg.generic"(%329, %333, %334) <{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = [#linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 2, 1>}> ({
+  ^bb0(%arg52: f16, %arg53: f16, %arg54: f16):
+    %348 = "arith.addf"(%arg52, %arg53) <{fastmath = #arith.fastmath<none>}> : (f16, f16) -> f16
+    "linalg.yield"(%348) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %336 = "ktdp.construct_memory_view"(%arg6) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %337 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %338 = "ktdp.construct_access_tile"(%336, %337) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%335, %338) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+  %339 = "ktdp.construct_memory_view"(%arg11) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %340 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %341 = "ktdp.construct_access_tile"(%339, %340) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  %342 = "ktdp.load"(%341) : (!ktdp.access_tile<64xindex>) -> tensor<64xf16>
+  %343 = "tensor.empty"() : () -> tensor<64xf16>
+  %344 = "linalg.generic"(%342, %343) <{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>], iterator_types = [#linalg.iterator_type<parallel>], operandSegmentSizes = array<i32: 1, 1>}> ({
+  ^bb0(%arg50: f16, %arg51: f16):
+    "linalg.yield"(%arg50) : (f16) -> ()
+  }) : (tensor<64xf16>, tensor<64xf16>) -> tensor<64xf16>
+  %345 = "ktdp.construct_memory_view"(%arg7) <{coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>, operandSegmentSizes = array<i32: 1, 0, 0>, static_sizes = array<i64: 64>, static_strides = array<i64: 1>}> : (index) -> memref<64xf16>
+  %346 = "arith.constant"() <{value = 0 : index}> : () -> index
+  %347 = "ktdp.construct_access_tile"(%345, %346) <{access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>, base_map = affine_map<(d0) -> (d0)>, operandSegmentSizes = array<i32: 1, 1, 0>}> : (memref<64xf16>, index) -> !ktdp.access_tile<64xindex>
+  "ktdp.store"(%344, %347) : (tensor<64xf16>, !ktdp.access_tile<64xindex>) -> ()
+}) : (i32, i32, i32, tensor<128x64xf16>, tensor<64xf16>, tensor<64xf16>, i32, i32) -> (tensor<128x64xf16>, tensor<64xf16>, tensor<64xf16>, i32, i32)

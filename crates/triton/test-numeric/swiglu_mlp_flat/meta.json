@@ -1,0 +1,79 @@
+{
+  "config": "swiglu_mlp_flat",
+  "fixture": "swiglu_mlp",
+  "kernel": "swiglu_mlp_fwd",
+  "inputs_fn": "_swiglu_inputs",
+  "reference_fn": "_swiglu_reference",
+  "seed": 0,
+  "torch": "2.11.0+cpu",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "M": 64,
+    "D_MODEL": 128,
+    "D_FF": 256,
+    "BLOCK_M": 64,
+    "BLOCK_N": 256,
+    "BLOCK_K": 128
+  },
+  "grid": [
+    1
+  ],
+  "inputs": [
+    {
+      "arg": "desc_x",
+      "file": "in_desc_x.bin",
+      "shape": [
+        64,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wg",
+      "file": "in_desc_wg.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wu",
+      "file": "in_desc_wu.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_wd",
+      "file": "in_desc_wd.bin",
+      "shape": [
+        128,
+        256
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_o",
+      "file": "in_desc_o.bin",
+      "shape": [
+        64,
+        128
+      ],
+      "dtype": "f16",
+      "zeroed": true
+    }
+  ],
+  "output": {
+    "arg": "desc_o",
+    "file": "ref_out.bin",
+    "shape": [
+      64,
+      128
+    ],
+    "dtype": "f16"
+  },
+  "reference_note": "AUTHORED HERE, not ported. swiglu_mlp.py ships constexprs() only -- no inputs(), no reference() -- and test/pod's SwiGLU apparatus (swiglu_case.py, swiglu_oracle.py, verify_swiglu.py, gen_swiglu_artifact.py) covers the ELEMENTWISE silu(g)*u ONLY: it hands the device g and u as two HBM activation planes (swiglu-stage=3) and never forms x@Wg, x@Wu or h@Wd, so there is nothing there to port for the three-matmul MLP. WHICH PART IS PORTED AND WHICH IS NEW: ported is the ACTIVATION's form -- swiglu_oracle.py:151 true_swiglu computes (g*sigmoid(g))*u, and _swiglu_reference's `(gate * torch.sigmoid(gate)) * up` matches THAT form term for term (it is also swiglu_mlp.py's delta 8, silu(gate)*up, not upstream's s*(up+1)). NEW here are the three matmuls around it -- x@Wg.T, x@Wu.T, h@Wd.T -- and the stimulus, because nothing in the tree had either. The stimulus follows decoder_block.py:500 layer_weights -- torch.randn * (1/sqrt(d_model)), one seeded generator, drawn x, wg, wu, wd -- and the weights are drawn DIRECTLY in the kernel's own buffer orientation (wg/wu [D_FF, D_MODEL], wd [D_MODEL, D_FF]) so no host transpose can go wrong. Compute is f32 with one .to(f16) at the end, as every reference() in test/fixtures is."
+}

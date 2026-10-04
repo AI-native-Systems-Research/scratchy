@@ -1,0 +1,43 @@
+[package]
+name = "triton-ktir"
+description = "ttir -> KTIR in Rust: the nine KTDP/KTDF passes, ported for behaviour"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+# ONE path dependency, and NO crates.io package: `triton-frontend`'s default feature
+# set is EMPTY and every dependency it has is optional behind `ruff`, so
+# `default-features = false` pulls in nothing. `cargo test --offline` on the pod still
+# resolves, which is the rule this tree keeps (recorded in ../triton-superdsc's
+# workspace Cargo.toml).
+#
+# WHY THE DEPENDENCY EXISTS AT ALL: [`from_ttir`] consumes bridge one's ttir VALUE
+# directly. Bridge one printing its module so this crate could parse it back is the
+# defect the no-text rule exists to prevent, and the only way not to do it is for this
+# crate to name that type.
+triton-frontend = { path = "../triton-frontend", default-features = false }
+
+# THE CONSUMER'S KTIR TYPE, and it is the only definition of KTIR in the pipeline.
+#
+# `src/handoff.rs` constructs `ktir_core` values; nothing else in this crate names this
+# dependency. There is no second KTIR type and no printer/parser pair between them: a
+# disagreement with what their lowering consumes is a COMPILE error.
+#
+# ⭐ RE-HOSTED: this is scratchy's own `ktir-core`, in-tree, where it has always lived —
+# the vendored copy this edge used to point at (triton-spyre's `../vendor/ktir-core`)
+# was re-vendored from THIS tree at `ec18ac1da` with local delta zero.
+ktir-core = { path = "../../targets/spyre/ktir/ktir-core" }
+
+[features]
+# DEFAULT IS DEPENDENCY-FREE, so `cargo test --offline` on the pod is unaffected: the
+# adapter, the passes, the reader and the printer all build with no crates.io package.
+default = []
+# `ruff` forwards to triton-frontend's Python parser, which `tests/pure_rust_ktir.rs`
+# needs because it starts every configuration from PYTHON SOURCE -- the whole point of
+# that test is that no stage is fed a file.
+ruff = ["triton-frontend/ruff"]
+
+# The MLIR text reader and writer in `src/text/` remain in-tree and remain TEST
+# INSTRUMENTS, not pipeline stages.

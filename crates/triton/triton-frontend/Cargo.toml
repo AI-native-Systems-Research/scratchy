@@ -1,0 +1,46 @@
+[package]
+name = "triton-frontend"
+description = "Python -> TTIR, in Rust: bridge one of Triton -> KTIR -> SuperDSC, with no Python at runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Re-hosted from triton-spyre's third_party/spyre/rust/triton-frontend (see
+# crates/triton/PROVENANCE.md). No [workspace] table: this is a member of scratchy's
+# workspace, not its own; the offline-pod constraint is stated in PROVENANCE.md instead.
+
+[features]
+# DEFAULT IS DEPENDENCY-FREE. Everything except the Python *parse* step -- the TTIR value
+# type, the printer, the semantic layer, the AST->TTIR walk -- builds and tests with no
+# dependencies at all, so `cargo test --no-default-features` works offline on the pod.
+default = []
+
+# `ruff` SWAPS IN ruff's Python parser as the front door. THE DECISION, recorded:
+#
+#   WHY GATED. Our other crates are dependency-free and `cargo test --offline` has to
+#   keep working on the pod, which has no crates.io access. `ruff_python_parser` pulls 84
+#   packages (measured: `cargo add ruff_python_parser ruff_python_ast` then `cargo fetch`
+#   -> "Locking 84 packages"). A gate keeps the offline build possible and makes the
+#   dependency an opt-in, not a fact of the tree.
+#
+#   WHY RUFF AT ALL, rather than a parser we own. Python's grammar is not the part of this
+#   job worth owning. `ruff_python_parser` is a maintained, fuzzed, full-grammar CPython
+#   parser; a hand-rolled one is ~1500 lines whose bugs are all ours and all silent. The
+#   scope control that matters is NOT at the parse step -- it is `src/py/census.rs`, which
+#   REFUSES BY NAME any node type or call target outside the measured census
+#   (`../triton-superdsc/tools/ast_census.py`: 33 node types, 33 call targets). Parsing
+#   generously and refusing precisely is strictly better than parsing narrowly and
+#   failing vaguely, because the refusal can name the construct AND its source line.
+#
+#   WHAT IS BEHIND THE GATE. Only `src/py/ruff_adapter.rs`, which lowers ruff's AST into
+#   this crate's own `src/py/ast.rs`. Nothing else in the crate sees a ruff type. Swapping
+#   parsers, or adding a dependency-free one later, is a change to that one file.
+ruff = ["dep:ruff_python_parser", "dep:ruff_python_ast", "dep:ruff_text_size"]
+
+[dependencies]
+ruff_python_parser = { version = "0.0.13", optional = true }
+ruff_python_ast = { version = "0.0.13", optional = true }
+ruff_text_size = { version = "0.0.13", optional = true }
+
+[dev-dependencies]

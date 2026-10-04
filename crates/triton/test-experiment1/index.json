@@ -1,0 +1,1772 @@
+[
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 21,
+      "sdsc_scheduled": 21
+    },
+    "configuration": "Z=1 H=4 N_CTX=256 HEAD_DIM=128 BLOCK_M=64 GQA=2 causal=False",
+    "constexprs": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "GQA": 2,
+      "H": 4,
+      "HEAD_DIM": 128,
+      "N_CTX": 256,
+      "STAGE": 1,
+      "Z": 1,
+      "sm_scale": "1.0"
+    },
+    "fixture": "attention_flash.py",
+    "grid": [
+      4,
+      4
+    ],
+    "grid_point": 0,
+    "kernel": "attn_fwd",
+    "name": "attention_flash_noncausal",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "GQA": "constexpr",
+      "H": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_CTX": "constexpr",
+      "STAGE": "constexpr",
+      "Z": "constexpr",
+      "desc_k": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_o": "*fp16",
+      "desc_q": "*fp16",
+      "desc_v": "*fp16",
+      "sm_scale": "constexpr"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/attention_flash_noncausal.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 8044,
+          "manifest.json": 11465,
+          "sdsc_0.json": 32389,
+          "sdsc_1.json": 22192,
+          "sdsc_10.json": 21671,
+          "sdsc_11.json": 22194,
+          "sdsc_12.json": 31160,
+          "sdsc_13.json": 32989,
+          "sdsc_14.json": 30718,
+          "sdsc_15.json": 30700,
+          "sdsc_16.json": 30700,
+          "sdsc_17.json": 21700,
+          "sdsc_18.json": 21686,
+          "sdsc_19.json": 21686,
+          "sdsc_2.json": 30697,
+          "sdsc_20.json": 31172,
+          "sdsc_3.json": 30711,
+          "sdsc_4.json": 30709,
+          "sdsc_5.json": 31153,
+          "sdsc_6.json": 30709,
+          "sdsc_7.json": 21678,
+          "sdsc_8.json": 30700,
+          "sdsc_9.json": 30700
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_10.json",
+          "sdsc_11.json",
+          "sdsc_12.json",
+          "sdsc_13.json",
+          "sdsc_14.json",
+          "sdsc_15.json",
+          "sdsc_16.json",
+          "sdsc_17.json",
+          "sdsc_18.json",
+          "sdsc_19.json",
+          "sdsc_2.json",
+          "sdsc_20.json",
+          "sdsc_3.json",
+          "sdsc_4.json",
+          "sdsc_5.json",
+          "sdsc_6.json",
+          "sdsc_7.json",
+          "sdsc_8.json",
+          "sdsc_9.json"
+        ],
+        "kernel": "attn_fwd",
+        "notes": [
+          "op 58: `%k_37` is read through a TRANSPOSING access_tile_order. The caller must present this tensor in the layout the DDL demands; this emitter neither moves data nor silently reinterprets a layout. UNVALIDATED against dxp_standalone.",
+          "op 81: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "bundle argument `desc_mask` (kernel_pointer) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: KTIR argument %desc_mask : !tt.ptr<f16>)",
+          "bundle argument `splat_7` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x1 f16 with 1)",
+          "bundle argument `splat_8` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x1 f16 with -inf)",
+          "bundle argument `splat_9` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 0)",
+          "bundle argument `splat_10` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x128 f16 with 0)"
+        ],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 2,
+          "batchmatmul": 2,
+          "exp": 2,
+          "identity": 3,
+          "maximum": 1,
+          "maxnonstick": 1,
+          "mul": 6,
+          "realdiv": 1,
+          "sub": 2,
+          "sumnonstick": 1
+        },
+        "op_funcs": [
+          "batchmatmul",
+          "maxnonstick",
+          "mul",
+          "maximum",
+          "mul",
+          "sub",
+          "mul",
+          "exp",
+          "sub",
+          "mul",
+          "exp",
+          "sumnonstick",
+          "mul",
+          "batchmatmul",
+          "add",
+          "mul",
+          "add",
+          "identity",
+          "identity",
+          "identity",
+          "realdiv"
+        ],
+        "sdsc_count": 21,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 17901,
+        "ktir_lines": 230,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 16745,
+        "ttir_lines": 218
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 192256,
+            "sha256": "564fabfbe7e1050a81c048c82ed9d9b5485cf4a9a00dc84d2401023ec4ae2dc3"
+          },
+          "spyrecode.json": {
+            "bytes": 22499,
+            "sha256": "9bc37de8c884678c3b3ae3a6fcb7ae419a1c40a1994bd2cb4d56840c75ecd59c"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 39930,
+            "sha256": "b4f0308d4f0cd8f2992500c5ee102a362a28b79eb1bf55b283f92b5b766cbc98"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 192256,
+        "ok": true,
+        "sdsc_scheduled": 21,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 41,
+      "sdsc_scheduled": 41
+    },
+    "configuration": "Z=1 H=4 N_CTX=256 HEAD_DIM=128 BLOCK_M=64 GQA=2 causal=True",
+    "constexprs": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "GQA": 2,
+      "H": 4,
+      "HEAD_DIM": 128,
+      "N_CTX": 256,
+      "STAGE": 3,
+      "Z": 1,
+      "sm_scale": "1.0"
+    },
+    "fixture": "attention_flash.py",
+    "grid": [
+      4,
+      4
+    ],
+    "grid_point": 3,
+    "kernel": "attn_fwd",
+    "name": "attention_flash_causal",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "GQA": "constexpr",
+      "H": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_CTX": "constexpr",
+      "STAGE": "constexpr",
+      "Z": "constexpr",
+      "desc_k": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_o": "*fp16",
+      "desc_q": "*fp16",
+      "desc_v": "*fp16",
+      "sm_scale": "constexpr"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/attention_flash_causal.ktir.mlir 3 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 13804,
+          "manifest.json": 15840,
+          "sdsc_0.json": 32389,
+          "sdsc_1.json": 22192,
+          "sdsc_10.json": 21671,
+          "sdsc_11.json": 22194,
+          "sdsc_12.json": 31160,
+          "sdsc_13.json": 32989,
+          "sdsc_14.json": 30718,
+          "sdsc_15.json": 30700,
+          "sdsc_16.json": 30700,
+          "sdsc_17.json": 21700,
+          "sdsc_18.json": 21686,
+          "sdsc_19.json": 21686,
+          "sdsc_2.json": 30697,
+          "sdsc_20.json": 32392,
+          "sdsc_21.json": 30709,
+          "sdsc_22.json": 30709,
+          "sdsc_23.json": 22194,
+          "sdsc_24.json": 30712,
+          "sdsc_25.json": 31153,
+          "sdsc_26.json": 30709,
+          "sdsc_27.json": 21678,
+          "sdsc_28.json": 30700,
+          "sdsc_29.json": 30700,
+          "sdsc_3.json": 30711,
+          "sdsc_30.json": 21671,
+          "sdsc_31.json": 22194,
+          "sdsc_32.json": 31160,
+          "sdsc_33.json": 32989,
+          "sdsc_34.json": 30718,
+          "sdsc_35.json": 30700,
+          "sdsc_36.json": 30701,
+          "sdsc_37.json": 21702,
+          "sdsc_38.json": 21688,
+          "sdsc_39.json": 21688,
+          "sdsc_4.json": 30709,
+          "sdsc_40.json": 31175,
+          "sdsc_5.json": 31153,
+          "sdsc_6.json": 30709,
+          "sdsc_7.json": 21678,
+          "sdsc_8.json": 30700,
+          "sdsc_9.json": 30700
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_10.json",
+          "sdsc_11.json",
+          "sdsc_12.json",
+          "sdsc_13.json",
+          "sdsc_14.json",
+          "sdsc_15.json",
+          "sdsc_16.json",
+          "sdsc_17.json",
+          "sdsc_18.json",
+          "sdsc_19.json",
+          "sdsc_2.json",
+          "sdsc_20.json",
+          "sdsc_21.json",
+          "sdsc_22.json",
+          "sdsc_23.json",
+          "sdsc_24.json",
+          "sdsc_25.json",
+          "sdsc_26.json",
+          "sdsc_27.json",
+          "sdsc_28.json",
+          "sdsc_29.json",
+          "sdsc_3.json",
+          "sdsc_30.json",
+          "sdsc_31.json",
+          "sdsc_32.json",
+          "sdsc_33.json",
+          "sdsc_34.json",
+          "sdsc_35.json",
+          "sdsc_36.json",
+          "sdsc_37.json",
+          "sdsc_38.json",
+          "sdsc_39.json",
+          "sdsc_4.json",
+          "sdsc_40.json",
+          "sdsc_5.json",
+          "sdsc_6.json",
+          "sdsc_7.json",
+          "sdsc_8.json",
+          "sdsc_9.json"
+        ],
+        "kernel": "attn_fwd",
+        "notes": [
+          "op 61: `%k_41` is read through a TRANSPOSING access_tile_order. The caller must present this tensor in the layout the DDL demands; this emitter neither moves data nor silently reinterprets a layout. UNVALIDATED against dxp_standalone.",
+          "op 84: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "op 97: `%k_41` is read through a TRANSPOSING access_tile_order. The caller must present this tensor in the layout the DDL demands; this emitter neither moves data nor silently reinterprets a layout. UNVALIDATED against dxp_standalone.",
+          "op 122: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "bundle argument `splat_7` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x1 f16 with 1)",
+          "bundle argument `splat_8` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x1 f16 with -inf)",
+          "bundle argument `splat_9` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 0)",
+          "bundle argument `splat_10` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x128 f16 with 0)"
+        ],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 5,
+          "batchmatmul": 4,
+          "exp": 4,
+          "identity": 6,
+          "maximum": 2,
+          "maxnonstick": 2,
+          "mul": 11,
+          "realdiv": 1,
+          "sub": 4,
+          "sumnonstick": 2
+        },
+        "op_funcs": [
+          "batchmatmul",
+          "maxnonstick",
+          "mul",
+          "maximum",
+          "mul",
+          "sub",
+          "mul",
+          "exp",
+          "sub",
+          "mul",
+          "exp",
+          "sumnonstick",
+          "mul",
+          "batchmatmul",
+          "add",
+          "mul",
+          "add",
+          "identity",
+          "identity",
+          "identity",
+          "batchmatmul",
+          "mul",
+          "add",
+          "maxnonstick",
+          "maximum",
+          "sub",
+          "mul",
+          "exp",
+          "sub",
+          "mul",
+          "exp",
+          "sumnonstick",
+          "mul",
+          "batchmatmul",
+          "add",
+          "mul",
+          "add",
+          "identity",
+          "identity",
+          "identity",
+          "realdiv"
+        ],
+        "sdsc_count": 41,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 25690,
+        "ktir_lines": 328,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 24367,
+        "ttir_lines": 319
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 192256,
+            "sha256": "7ddd46f03921e62124dab5ccef42f652d306bd48920f8906aa2cd75084be4c7d"
+          },
+          "spyrecode.json": {
+            "bytes": 22756,
+            "sha256": "fc724cb19d085ecf6d05bea01c89f93e04c01b2c0600e016cd2e7bf5ad0bcf89"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 40587,
+            "sha256": "cda9f47a92874bdd630c704396020252e372525641324c4c7a5c6bf547acfd3a"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 192256,
+        "ok": true,
+        "sdsc_scheduled": 41,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 8,
+      "sdsc_scheduled": 8
+    },
+    "configuration": "d_model=128 d_ff=256 BLOCK_K=128",
+    "constexprs": {
+      "BLOCK_K": 128,
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "M": 64
+    },
+    "fixture": "swiglu_mlp.py",
+    "grid": [
+      1
+    ],
+    "grid_point": 0,
+    "kernel": "swiglu_mlp_fwd",
+    "name": "swiglu_mlp_small",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_K": "constexpr",
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/swiglu_mlp_small.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 3833,
+          "manifest.json": 6058,
+          "sdsc_0.json": 32389,
+          "sdsc_1.json": 32389,
+          "sdsc_2.json": 21679,
+          "sdsc_3.json": 30708,
+          "sdsc_4.json": 32989,
+          "sdsc_5.json": 30718,
+          "sdsc_6.json": 21700,
+          "sdsc_7.json": 21700
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_2.json",
+          "sdsc_3.json",
+          "sdsc_4.json",
+          "sdsc_5.json",
+          "sdsc_6.json",
+          "sdsc_7.json"
+        ],
+        "kernel": "swiglu_mlp_fwd",
+        "notes": [
+          "ops 42-45: `arith.negf` + `math.exp` + `arith.addf` + `arith.divf` recognised as SiLU and emitted as ONE templated `silu` SuperDSC (OpFuncs::SILU_FWD -> unary_parallel.ddl:29, no ISA gate). That template's body IS `x * sigmoid(x)` over the six sigmoid constants this repo's SwiGLU reference already validated, so the derived tolerance in test/pod/swiglu_eps_derivation.py applies to it; the unfused four-op form would be a DIFFERENT algorithm and that tolerance would not.",
+          "op 50: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "bundle argument `splat_5` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 0)",
+          "bundle argument `splat_6` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x128 f16 with 0)",
+          "bundle argument `splat_7` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 1)"
+        ],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 1,
+          "batchmatmul": 3,
+          "identity": 2,
+          "mul": 1,
+          "silu": 1
+        },
+        "op_funcs": [
+          "batchmatmul",
+          "batchmatmul",
+          "silu",
+          "mul",
+          "batchmatmul",
+          "add",
+          "identity",
+          "identity"
+        ],
+        "sdsc_count": 8,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 10337,
+        "ktir_lines": 121,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 7668,
+        "ttir_lines": 96
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 139392,
+            "sha256": "d9200695d66231021ccbd9fb1dde758991831803967da2b752dff968fd6c1eca"
+          },
+          "spyrecode.json": {
+            "bytes": 13421,
+            "sha256": "3b498995efe1c9e4e3b11f6b67fc9237156cfdf9e450786b3993c69df0790ed3"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 23147,
+            "sha256": "258e3220fc72db8d5bf2fabaa04cc8182e9c9268d664e18e922c4ef7f70ce4f8"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 139392,
+        "ok": true,
+        "sdsc_scheduled": 8,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 8,
+      "sdsc_scheduled": 8
+    },
+    "configuration": "d_model=4096 d_ff=12800 BLOCK_K=4096 (Granite)",
+    "constexprs": {
+      "BLOCK_K": 4096,
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "D_FF": 12800,
+      "D_MODEL": 4096,
+      "M": 64
+    },
+    "fixture": "swiglu_mlp.py",
+    "grid": [
+      1
+    ],
+    "grid_point": 0,
+    "kernel": "swiglu_mlp_fwd",
+    "name": "swiglu_mlp_granite",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_K": "constexpr",
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/swiglu_mlp_granite.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 3846,
+          "manifest.json": 6070,
+          "sdsc_0.json": 32396,
+          "sdsc_1.json": 32396,
+          "sdsc_2.json": 21679,
+          "sdsc_3.json": 30708,
+          "sdsc_4.json": 32996,
+          "sdsc_5.json": 30727,
+          "sdsc_6.json": 21707,
+          "sdsc_7.json": 21707
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_2.json",
+          "sdsc_3.json",
+          "sdsc_4.json",
+          "sdsc_5.json",
+          "sdsc_6.json",
+          "sdsc_7.json"
+        ],
+        "kernel": "swiglu_mlp_fwd",
+        "notes": [
+          "ops 42-45: `arith.negf` + `math.exp` + `arith.addf` + `arith.divf` recognised as SiLU and emitted as ONE templated `silu` SuperDSC (OpFuncs::SILU_FWD -> unary_parallel.ddl:29, no ISA gate). That template's body IS `x * sigmoid(x)` over the six sigmoid constants this repo's SwiGLU reference already validated, so the derived tolerance in test/pod/swiglu_eps_derivation.py applies to it; the unfused four-op form would be a DIFFERENT algorithm and that tolerance would not.",
+          "op 50: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "bundle argument `splat_5` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 0)",
+          "bundle argument `splat_6` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x4096 f16 with 0)",
+          "bundle argument `splat_7` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 1)"
+        ],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 1,
+          "batchmatmul": 3,
+          "identity": 2,
+          "mul": 1,
+          "silu": 1
+        },
+        "op_funcs": [
+          "batchmatmul",
+          "batchmatmul",
+          "silu",
+          "mul",
+          "batchmatmul",
+          "add",
+          "identity",
+          "identity"
+        ],
+        "sdsc_count": 8,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 10421,
+        "ktir_lines": 121,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 7724,
+        "ttir_lines": 96
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 3942144,
+            "sha256": "ecee0ea6f40174afa31f51f82e279d5a5f9124f9a720aea2f7d5de27fd1b3a6c"
+          },
+          "spyrecode.json": {
+            "bytes": 379909,
+            "sha256": "5a447bb8dde34cddb56505776b24eaf388f3d527019f9b27a6577e69262dd30a"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 822207,
+            "sha256": "fd732f8492c5442d58a88b71e55c06e872a3cebb844ed26f882e0635c62f12fe"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 3942144,
+        "ok": true,
+        "sdsc_scheduled": 8,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 12,
+      "sdsc_scheduled": 12
+    },
+    "configuration": "d_model=128 d_ff=256 BLOCK_K=64 (nested scf.for)",
+    "constexprs": {
+      "BLOCK_K": 64,
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "M": 64
+    },
+    "fixture": "swiglu_mlp.py",
+    "grid": [
+      1
+    ],
+    "grid_point": 0,
+    "kernel": "swiglu_mlp_fwd",
+    "name": "swiglu_mlp_tiled_k",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_K": "constexpr",
+      "BLOCK_M": "constexpr",
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/swiglu_mlp_tiled_k.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 5515,
+          "manifest.json": 7729,
+          "sdsc_0.json": 31785,
+          "sdsc_1.json": 30706,
+          "sdsc_10.json": 21700,
+          "sdsc_11.json": 21700,
+          "sdsc_2.json": 31785,
+          "sdsc_3.json": 30709,
+          "sdsc_4.json": 21693,
+          "sdsc_5.json": 21693,
+          "sdsc_6.json": 21681,
+          "sdsc_7.json": 30709,
+          "sdsc_8.json": 32989,
+          "sdsc_9.json": 30718
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_10.json",
+          "sdsc_11.json",
+          "sdsc_2.json",
+          "sdsc_3.json",
+          "sdsc_4.json",
+          "sdsc_5.json",
+          "sdsc_6.json",
+          "sdsc_7.json",
+          "sdsc_8.json",
+          "sdsc_9.json"
+        ],
+        "kernel": "swiglu_mlp_fwd",
+        "notes": [
+          "op 41: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "op 46: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "ops 48-51: `arith.negf` + `math.exp` + `arith.addf` + `arith.divf` recognised as SiLU and emitted as ONE templated `silu` SuperDSC (OpFuncs::SILU_FWD -> unary_parallel.ddl:29, no ISA gate). That template's body IS `x * sigmoid(x)` over the six sigmoid constants this repo's SwiGLU reference already validated, so the derived tolerance in test/pod/swiglu_eps_derivation.py applies to it; the unfused four-op form would be a DIFFERENT algorithm and that tolerance would not.",
+          "op 56: the contraction's accumulator is materialised as a separate `add` SuperDSC, not as bmm.ddl's `genericpartialreduction` epilogue",
+          "bundle argument `splat_5` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 0)",
+          "bundle argument `splat_6` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x128 f16 with 0)",
+          "bundle argument `splat_7` (constant_splat) is reached by no sdsc_execute, so it is NOT a bundle argument; the caller owes it nothing (was: caller must fill 64x64 f16 with 1)"
+        ],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 3,
+          "batchmatmul": 3,
+          "identity": 4,
+          "mul": 1,
+          "silu": 1
+        },
+        "op_funcs": [
+          "batchmatmul",
+          "add",
+          "batchmatmul",
+          "add",
+          "identity",
+          "identity",
+          "silu",
+          "mul",
+          "batchmatmul",
+          "add",
+          "identity",
+          "identity"
+        ],
+        "sdsc_count": 12,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 11050,
+        "ktir_lines": 131,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 8096,
+        "ttir_lines": 102
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 197888,
+            "sha256": "077cd69ee1accf8752c14159f5ccc7fb07bb0bc708e18b12fb56e5ca2b67f40c"
+          },
+          "spyrecode.json": {
+            "bytes": 32687,
+            "sha256": "3a4f7d37e15f3cfcb12847764edf50bb285e52e6f94656d49afad1216c18d984"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 58293,
+            "sha256": "3e627f377133f67aa9395496092f460daf30eb904c2b886aa2ae6169880ff0ee"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 197888,
+        "ok": true,
+        "sdsc_scheduled": 12,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "configuration": "V=49159 D_MODEL=4096 N_TOK=256 BLOCK_M=64 (Granite)",
+    "constexprs": {
+      "BLOCK_M": 64,
+      "D_MODEL": 4096,
+      "EMB_SCALE": "12.0",
+      "N_TOK": 256,
+      "V": 49159
+    },
+    "fixture": "embedding.py",
+    "grid": [
+      4
+    ],
+    "grid_point": 0,
+    "kernel": "embedding_fwd",
+    "name": "embedding_granite",
+    "outcome": "KTIR ONLY",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "artifacts_produced_now": true,
+        "earlier_stages_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      },
+      "stages_produced_by_this_run": [
+        "ktir"
+      ]
+    },
+    "scope_note": "stage 1 (C++ KTIR) only: the SuperDSC lowering moved out of this effort's scope, so stages 2 and 3 were NOT run for this configuration. Its `ktir/*.mlir` is a full golden; the absence of a bundle here is a scope boundary, not a refusal.",
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "D_MODEL": "constexpr",
+      "EMB_SCALE": "constexpr",
+      "N_TOK": "constexpr",
+      "V": "constexpr",
+      "desc_ids": "*i32",
+      "desc_o": "*fp16",
+      "desc_table": "*fp16"
+    },
+    "stages": {
+      "ktir": {
+        "ktir_bytes": 5302,
+        "ktir_lines": 66,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 3311,
+        "ttir_lines": 43
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 1,
+      "sdsc_scheduled": 1
+    },
+    "configuration": "V=49159 D_MODEL=4096 N_TOK=256 BLOCK_M=128 (CONTROL for the one-stick index tile, not a Granite width)",
+    "constexprs": {
+      "BLOCK_M": 128,
+      "D_MODEL": 4096,
+      "EMB_SCALE": "12.0",
+      "N_TOK": 256,
+      "V": 49159
+    },
+    "fixture": "embedding.py",
+    "grid": [
+      2
+    ],
+    "grid_point": 0,
+    "kernel": "embedding_fwd",
+    "name": "embedding_granite_bm128_control",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "artifacts_produced_now": true,
+        "earlier_stages_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      },
+      "stages_produced_by_this_run": [
+        "ktir"
+      ]
+    },
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "D_MODEL": "constexpr",
+      "EMB_SCALE": "constexpr",
+      "N_TOK": "constexpr",
+      "V": "constexpr",
+      "desc_ids": "*i32",
+      "desc_o": "*fp16",
+      "desc_table": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/embedding_granite_bm128_control.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 1427,
+          "manifest.json": 1897,
+          "sdsc_0.json": 39415
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json"
+        ],
+        "kernel": "embedding_fwd",
+        "notes": [],
+        "ok": true,
+        "op_func_histogram": {
+          "mul": 1
+        },
+        "op_funcs": [
+          "mul"
+        ],
+        "sdsc_count": 1,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 5367,
+        "ktir_lines": 67,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 3324,
+        "ttir_lines": 43
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 76416,
+            "sha256": "ccfe5048bc2f700d63d70c86afa6eeaa9e15adbdf59d857ec36ada9da6f1a2a6"
+          },
+          "spyrecode.json": {
+            "bytes": 11643,
+            "sha256": "16fa5c4e4cff85412da1c988c207c207b01c80a642981ce06a54547e59ca7b65"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 13199,
+            "sha256": "c48ea2ef61f289e14a195be84421b98c030b51ae6339e81da065a45c5155eeb1"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 76416,
+        "ok": true,
+        "sdsc_scheduled": 1,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 7,
+      "sdsc_scheduled": 7
+    },
+    "configuration": "M=64 D_MODEL=4096 EPS=1e-05 (Granite)",
+    "constexprs": {
+      "BLOCK_M": 64,
+      "D_MODEL": 4096,
+      "EPS": "1e-05",
+      "INV_D": "0.000244140625",
+      "M": 64
+    },
+    "fixture": "rmsnorm.py",
+    "grid": [
+      1
+    ],
+    "grid_point": 0,
+    "kernel": "rmsnorm_fwd",
+    "name": "rmsnorm_granite",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "D_MODEL": "constexpr",
+      "EPS": "constexpr",
+      "INV_D": "constexpr",
+      "M": "constexpr",
+      "desc_o": "*fp16",
+      "desc_w": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/rmsnorm_granite.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 3025,
+          "manifest.json": 3381,
+          "sdsc_0.json": 30724,
+          "sdsc_1.json": 22202,
+          "sdsc_2.json": 30697,
+          "sdsc_3.json": 30699,
+          "sdsc_4.json": 21677,
+          "sdsc_5.json": 31167,
+          "sdsc_6.json": 32964
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_2.json",
+          "sdsc_3.json",
+          "sdsc_4.json",
+          "sdsc_5.json",
+          "sdsc_6.json"
+        ],
+        "kernel": "rmsnorm_fwd",
+        "notes": [],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 1,
+          "mul": 4,
+          "rsqrt": 1,
+          "sumnonstick": 1
+        },
+        "op_funcs": [
+          "mul",
+          "sumnonstick",
+          "mul",
+          "add",
+          "rsqrt",
+          "mul",
+          "mul"
+        ],
+        "sdsc_count": 7,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 7200,
+        "ktir_lines": 91,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 5728,
+        "ttir_lines": 75
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 87936,
+            "sha256": "10a8a465c10c188268761692bcdb76433103abc17ba216fdd5afd99aa3d5a20e"
+          },
+          "spyrecode.json": {
+            "bytes": 11795,
+            "sha256": "596c59c6260b41805b97de56744e63ca6a92c1ede2e1fa2935c8fc6897e6202c"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 14254,
+            "sha256": "d0dd0be4f2a3b3c4e4629594624488f8e2d449a4a53a4be0c7dc5e81ce2acd18"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 87936,
+        "ok": true,
+        "sdsc_scheduled": 7,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 24,
+      "sdsc_scheduled": 24
+    },
+    "configuration": "H=32 N_TOK=256 HEAD_DIM=128 HALF=64 BLOCK_M=64",
+    "constexprs": {
+      "BLOCK_M": 64,
+      "H": 32,
+      "HALF": 64,
+      "HEAD_DIM": 128,
+      "N_TOK": 256
+    },
+    "fixture": "rope.py",
+    "grid": [
+      4,
+      32
+    ],
+    "grid_point": 0,
+    "kernel": "rope_fwd",
+    "name": "rope_q32",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "H": "constexpr",
+      "HALF": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_TOK": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/rope_q32.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 7760,
+          "manifest.json": 6268,
+          "sdsc_0.json": 30706,
+          "sdsc_1.json": 30706,
+          "sdsc_10.json": 30709,
+          "sdsc_11.json": 30709,
+          "sdsc_12.json": 30709,
+          "sdsc_13.json": 30709,
+          "sdsc_14.json": 30709,
+          "sdsc_15.json": 30709,
+          "sdsc_16.json": 30709,
+          "sdsc_17.json": 30709,
+          "sdsc_18.json": 30709,
+          "sdsc_19.json": 30709,
+          "sdsc_2.json": 30706,
+          "sdsc_20.json": 30709,
+          "sdsc_21.json": 30709,
+          "sdsc_22.json": 30709,
+          "sdsc_23.json": 30709,
+          "sdsc_3.json": 30709,
+          "sdsc_4.json": 30709,
+          "sdsc_5.json": 30709,
+          "sdsc_6.json": 30709,
+          "sdsc_7.json": 30709,
+          "sdsc_8.json": 30709,
+          "sdsc_9.json": 30709
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_10.json",
+          "sdsc_11.json",
+          "sdsc_12.json",
+          "sdsc_13.json",
+          "sdsc_14.json",
+          "sdsc_15.json",
+          "sdsc_16.json",
+          "sdsc_17.json",
+          "sdsc_18.json",
+          "sdsc_19.json",
+          "sdsc_2.json",
+          "sdsc_20.json",
+          "sdsc_21.json",
+          "sdsc_22.json",
+          "sdsc_23.json",
+          "sdsc_3.json",
+          "sdsc_4.json",
+          "sdsc_5.json",
+          "sdsc_6.json",
+          "sdsc_7.json",
+          "sdsc_8.json",
+          "sdsc_9.json"
+        ],
+        "kernel": "rope_fwd",
+        "notes": [
+          "op 9: `scf.for` carries nothing across 4 trips (lo=0, hi=128, step=32) and is UNROLLED, because the flattened tile id it induces is delinearised with `arith.remui`/`arith.divui` -- not affine, so no rolled address expression exists. The SuperDSC census is 4x the body's."
+        ],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 4,
+          "mul": 16,
+          "sub": 4
+        },
+        "op_funcs": [
+          "mul",
+          "mul",
+          "sub",
+          "mul",
+          "mul",
+          "add",
+          "mul",
+          "mul",
+          "sub",
+          "mul",
+          "mul",
+          "add",
+          "mul",
+          "mul",
+          "sub",
+          "mul",
+          "mul",
+          "add",
+          "mul",
+          "mul",
+          "sub",
+          "mul",
+          "mul",
+          "add"
+        ],
+        "sdsc_count": 24,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 8070,
+        "ktir_lines": 96,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 5689,
+        "ttir_lines": 72
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 102400,
+            "sha256": "1f4fe0dd2f46512943e8d8e2315efd4930c1179f11dae328cba8145f75169460"
+          },
+          "spyrecode.json": {
+            "bytes": 13532,
+            "sha256": "dccd5ac294edb189ceb1397a7e64ef012c720a4cf142e112a4c89686139c7913"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 26230,
+            "sha256": "d52631eae10483f561a2adfc87f32c66f8f86db108cb7f1da2aca4f0ec38345f"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 102400,
+        "ok": true,
+        "sdsc_scheduled": 24,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "census": {
+      "in_equals_out": true,
+      "sdsc_in": 6,
+      "sdsc_scheduled": 6
+    },
+    "configuration": "H=8 N_TOK=256 HEAD_DIM=128 HALF=64 BLOCK_M=64",
+    "constexprs": {
+      "BLOCK_M": 64,
+      "H": 8,
+      "HALF": 64,
+      "HEAD_DIM": 128,
+      "N_TOK": 256
+    },
+    "fixture": "rope.py",
+    "grid": [
+      4,
+      8
+    ],
+    "grid_point": 0,
+    "kernel": "rope_fwd",
+    "name": "rope_kv8",
+    "outcome": "PROGRAM",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_M": "constexpr",
+      "H": "constexpr",
+      "HALF": "constexpr",
+      "HEAD_DIM": "constexpr",
+      "N_TOK": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/rope_kv8.ktir.mlir 0 <out_dir>",
+        "file_bytes": {
+          "bundle.mlir": 2660,
+          "manifest.json": 2746,
+          "sdsc_0.json": 30706,
+          "sdsc_1.json": 30706,
+          "sdsc_2.json": 30706,
+          "sdsc_3.json": 30709,
+          "sdsc_4.json": 30709,
+          "sdsc_5.json": 30709
+        },
+        "files": [
+          "bundle.mlir",
+          "manifest.json",
+          "sdsc_0.json",
+          "sdsc_1.json",
+          "sdsc_2.json",
+          "sdsc_3.json",
+          "sdsc_4.json",
+          "sdsc_5.json"
+        ],
+        "kernel": "rope_fwd",
+        "notes": [],
+        "ok": true,
+        "op_func_histogram": {
+          "add": 1,
+          "mul": 4,
+          "sub": 1
+        },
+        "op_funcs": [
+          "mul",
+          "mul",
+          "sub",
+          "mul",
+          "mul",
+          "add"
+        ],
+        "sdsc_count": 6,
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 7988,
+        "ktir_lines": 95,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 5689,
+        "ttir_lines": 72
+      },
+      "program": {
+        "artifact_files": {
+          "init_binary.bin": {
+            "bytes": 81664,
+            "sha256": "e5620a6c613af2a3f0a60884f2e85d7a6059cb70bee76c01c04d725d2155d217"
+          },
+          "spyrecode.json": {
+            "bytes": 11926,
+            "sha256": "c7be9cc93baa663cb93af11e482f84e213d5f7faaf6a9ef3e0717ee8abe2d764"
+          },
+          "spyrecode_pretty.json": {
+            "bytes": 15294,
+            "sha256": "71553c124171f654c76dbc4745a4f42e76660df7302ae86fd471dd0fcd4582d2"
+          }
+        },
+        "command": "DEEPTOOLS_PATH=/Users/nickm/tmp/dt_src DBO_DEBUG=1 /Users/nickm/tmp/dt_src/build/dxp/dxp_standalone -d <dir> -b sentient",
+        "exit_code": 0,
+        "init_binary_bytes": 81664,
+        "ok": true,
+        "sdsc_scheduled": 6,
+        "stage": "program"
+      }
+    }
+  },
+  {
+    "configuration": "M=64 D_MODEL=128 D_FF=256 BLOCK_N=64 (one layer)",
+    "constexprs": {
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "EPS": "1e-05",
+      "HALF": 64,
+      "INV_D": "0.0078125",
+      "M": 64,
+      "QK_SCALE": "0.011271055",
+      "RM": "0.22"
+    },
+    "fixture": "decoder_block.py",
+    "grid": [
+      1
+    ],
+    "grid_point": 0,
+    "kernel": "decoder_layer_fwd",
+    "name": "decoder_layer_one",
+    "outcome": "REFUSED at triton-superdsc-lower",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "EPS": "constexpr",
+      "HALF": "constexpr",
+      "INV_D": "constexpr",
+      "M": "constexpr",
+      "QK_SCALE": "constexpr",
+      "RM": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_n1": "*fp16",
+      "desc_n2": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_wd": "*fp16",
+      "desc_wg": "*fp16",
+      "desc_wk": "*fp16",
+      "desc_wo": "*fp16",
+      "desc_wq": "*fp16",
+      "desc_wu": "*fp16",
+      "desc_wv": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/decoder_layer_one.ktir.mlir 0 <out_dir>",
+        "diagnostic": [
+          "REFUSED: op 93: KTIR operation `tt.trans` has NO SuperDSC mapping. `tt.trans` is not in `OpFuncs` (deeptools sys-arch-spec/arch_enums.h) and this emitter refuses to write a partial bundle. Add a mapping in triton-superdsc-lower/src/opmap.rs, or lower `tt.trans` away before this stage."
+        ],
+        "emitted_files": [],
+        "refused_at": "triton-superdsc-lower",
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 37201,
+        "ktir_lines": 455,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 33086,
+        "ttir_lines": 434
+      }
+    }
+  },
+  {
+    "configuration": "M=64 D_MODEL=128 D_FF=256 BLOCK_N=64 (two layers, fused)",
+    "constexprs": {
+      "BLOCK_N": 64,
+      "D_FF": 256,
+      "D_MODEL": 128,
+      "EPS": "1e-05",
+      "HALF": 64,
+      "INV_D": "0.0078125",
+      "M": 64,
+      "QK_SCALE": "0.011271055",
+      "RM": "0.22"
+    },
+    "fixture": "decoder_block.py",
+    "grid": [
+      1
+    ],
+    "grid_point": 0,
+    "kernel": "decoder_two_layers_fwd",
+    "name": "decoder_two_layers",
+    "outcome": "REFUSED at triton-superdsc-lower",
+    "provenance": {
+      "git": {
+        "artifacts_produced_at_commit": "3384363e93d40840c15957b7cc44a9de6a9f77ca",
+        "artifacts_produced_now": false,
+        "note": "provenance refreshed without regenerating: `artifacts_produced_at_commit` is the last commit to touch `ktir/` or `bundles/`, NOT this run's HEAD",
+        "recorded_at_commit": "e9363213d25a7f97a3d9af08ed6df1021b8fff83",
+        "tree_dirty_when_recorded": true
+      },
+      "note": "These KTIR goldens are the ORACLE for a Rust front end. `make_ktir` IS the C++ pass list recorded in `pass_lists`, taken from that file's source rather than retyped; nothing in this driver reimplements a pass. A diff against `ktir/<name>.ktir.mlir` is only meaningful against the same pass list.",
+      "pass_lists": {
+        "make_ktir": [
+          "spyre.passes.add_dot_to_linalg(pm)",
+          "spyre.passes.add_ktir_lowering(pm, list(options.grid))",
+          "spyre.passes.add_plan_corelets(pm)"
+        ],
+        "make_ttir": [
+          "passes.common.add_inliner(pm)",
+          "passes.common.add_canonicalizer(pm)",
+          "passes.ttir.add_combine(pm)",
+          "passes.ttir.add_reorder_broadcast(pm)",
+          "passes.common.add_cse(pm)",
+          "passes.common.add_symbol_dce(pm)"
+        ],
+        "source": "third_party/spyre/backend/compiler.py"
+      }
+    },
+    "signature": {
+      "BLOCK_N": "constexpr",
+      "D_FF": "constexpr",
+      "D_MODEL": "constexpr",
+      "EPS": "constexpr",
+      "HALF": "constexpr",
+      "INV_D": "constexpr",
+      "M": "constexpr",
+      "QK_SCALE": "constexpr",
+      "RM": "constexpr",
+      "desc_cos": "*fp16",
+      "desc_mask": "*fp16",
+      "desc_n1a": "*fp16",
+      "desc_n1b": "*fp16",
+      "desc_n2a": "*fp16",
+      "desc_n2b": "*fp16",
+      "desc_o": "*fp16",
+      "desc_sin": "*fp16",
+      "desc_wda": "*fp16",
+      "desc_wdb": "*fp16",
+      "desc_wga": "*fp16",
+      "desc_wgb": "*fp16",
+      "desc_wka": "*fp16",
+      "desc_wkb": "*fp16",
+      "desc_woa": "*fp16",
+      "desc_wob": "*fp16",
+      "desc_wqa": "*fp16",
+      "desc_wqb": "*fp16",
+      "desc_wua": "*fp16",
+      "desc_wub": "*fp16",
+      "desc_wva": "*fp16",
+      "desc_wvb": "*fp16",
+      "desc_x": "*fp16"
+    },
+    "stages": {
+      "bundle": {
+        "command": "cargo run --offline --quiet --example emit_bundles -- /Users/nickm/git/triton-spyre/.claude/worktrees/paged-attn-lowering/third_party/spyre/test/experiment1/ktir/decoder_two_layers.ktir.mlir 0 <out_dir>",
+        "diagnostic": [
+          "REFUSED: op 111: KTIR operation `tt.trans` has NO SuperDSC mapping. `tt.trans` is not in `OpFuncs` (deeptools sys-arch-spec/arch_enums.h) and this emitter refuses to write a partial bundle. Add a mapping in triton-superdsc-lower/src/opmap.rs, or lower `tt.trans` away before this stage."
+        ],
+        "emitted_files": [],
+        "refused_at": "triton-superdsc-lower",
+        "stage": "bundle"
+      },
+      "ktir": {
+        "ktir_bytes": 55929,
+        "ktir_lines": 688,
+        "ok": true,
+        "stage": "ktir",
+        "ttir_bytes": 49092,
+        "ttir_lines": 659
+      }
+    }
+  }
+]
