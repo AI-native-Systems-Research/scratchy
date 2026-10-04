@@ -34,7 +34,11 @@ use crate::shape::{Dim, Shape};
 #[cfg(feature = "cuda")]
 use crate::target::Backend;
 use crate::target::TargetProfile;
-#[cfg(test)]
+// `attention_scale_for`'s only callers in this file are the cuda-gated
+// attention-scalar tests at the bottom of the file — this import was
+// `#[cfg(test)]`, which admitted it under every backend's tests and left
+// it dead under `spyre`/`metal` (clippy's unused-import under -Fspyre).
+#[cfg(all(test, feature = "cuda"))]
 use crate::weight_vocab::attention_scale_for;
 use crate::weight_vocab::{
     OpcodeShape, SlotMap, WeightAccessor, eval_dim_with, eval_shape_with, first_tile_input,

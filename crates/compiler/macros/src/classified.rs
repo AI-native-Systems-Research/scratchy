@@ -323,6 +323,11 @@ pub enum OpKind {
     /// tp=1 no AllReduce fires, and the splice sits directly on the
     /// Embed output — same semantics as the pre-refactor
     /// `Instruction::Embed::eval` inline splice.
+    ///
+    /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which is
+    /// cuda/metal-gated — under `spyre` alone this variant is reached
+    /// (matched, never built) and that is EXPECTED.
+    #[cfg_attr(feature = "spyre", expect(dead_code))]
     MmEmbedSplice,
     /// Broadcast-add of a learned per-feature bias vector across the
     /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.

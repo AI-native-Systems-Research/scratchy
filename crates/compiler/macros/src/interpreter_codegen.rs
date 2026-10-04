@@ -1805,7 +1805,10 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
     }
 }
 
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+#[cfg(any(
+    not(any(feature = "metal", feature = "spyre")),
+    all(test, feature = "spyre")
+))]
 /// Replace the field at position `idx` (interpreted as u32) with
 /// `new_val`. Used by `apply_loop_compression` to set per-row
 /// baselines for the iter-index field. Panics if `idx` is invalid
@@ -2587,14 +2590,15 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+// Test-only everywhere (its sole caller is the test below), so the gate is simply
+// "tests, on any backend that runs them" — cuda and spyre, not metal.
+#[cfg(all(test, not(feature = "metal")))]
 /// One slot per (tile, output_slot). Used when no liveness
 /// information is available; the colored variant
 /// [`colored_slot_map`] is what `lower_bucket` actually picks for
 /// emission.
 ///
 /// Its only caller is this module's own tests — `lower_bucket` takes the coloured map.
-#[cfg(test)]
 pub fn build_slot_map(fuf: &Fuf) -> SlotMap {
     let mut sm = SlotMap::new();
     for node in &fuf.nodes {
@@ -3001,6 +3005,11 @@ pub struct LoweredBucket {
     /// every prior instance in the bucket. Computed at macro time
     /// from the FUF dependency graph + per-`Implementation` KV-
     /// layer-IO declarations — runtime never re-derives.
+    /// Read only by loop compression (ISel) and metal's codegen — under
+    /// `spyre` alone the tape path writes this field but never reads it,
+    /// and that is EXPECTED. (Not under `spyre` tests, where the
+    /// test-inclusive `apply_loop_compression` reads it.)
+    #[cfg_attr(all(feature = "spyre", not(test)), expect(dead_code))]
     pub barriers: Vec<bool>,
 }
 
@@ -3047,7 +3056,10 @@ impl ArchOpcodes {
         out
     }
 
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
+    #[cfg(any(
+        not(any(feature = "metal", feature = "spyre")),
+        all(test, feature = "spyre")
+    ))]
     /// Iterate (variant_name, shape). Used by
     /// `apply_loop_compression` to build the per-variant layer-field
     /// position map.
@@ -3059,7 +3071,12 @@ impl ArchOpcodes {
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+// Test-inclusive arm mirrors `instruction_field_at` (#209): the tests below pin this
+// search's invariants, and a test-only call must not widen the production cfg.
+#[cfg(any(
+    not(any(feature = "metal", feature = "spyre")),
+    all(test, feature = "spyre")
+))]
 /// Find the largest contiguous run of instances that can be
 /// described as N copies of a P-instruction body, optionally
 /// allowing a per-variant ITERATION-INDEX field to step linearly
@@ -3168,7 +3185,12 @@ fn detect_repeating_run(
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+// Test-inclusive arm mirrors `instruction_field_at` (#209) — `detect_repeating_run`'s
+// body (gated the same way just above) calls this, so the tests pull it in transitively.
+#[cfg(any(
+    not(any(feature = "metal", feature = "spyre")),
+    all(test, feature = "spyre")
+))]
 /// Two blocks of pre-hashed (fingerprint, iter_index_value) pairs
 /// match iff the fingerprints are equal pairwise AND the
 /// iter-index values, when present, satisfy `cand = base +
@@ -3197,7 +3219,13 @@ fn blocks_match(
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+// Test-inclusive arm mirrors `instruction_field_at` (#209): the loop-compression tests
+// below exercise the LocalSearch path end-to-end, and a test-only call must not widen
+// the production cfg.
+#[cfg(any(
+    not(any(feature = "metal", feature = "spyre")),
+    all(test, feature = "spyre")
+))]
 /// Apply loop compression to `lowered.instances` in place. When
 /// [`detect_repeating_run`] finds a contiguous run, replace it
 /// with one `Op::Loop` row plus a single iteration's body. The
@@ -3234,6 +3262,12 @@ fn blocks_match(
 /// to the second search — the exact duplication being removed.
 pub enum LoopSource {
     #[cfg(any(feature = "metal", feature = "spyre"))]
+    // Never constructed anywhere today: the enum itself only compiles on the
+    // ISel path (cuda) or in this crate's spyre-gated tests, and `Shared` is
+    // excluded from cuda by its own cfg — read only by the `Shared` arm of
+    // `apply_loop_compression` below. Kept (not deleted) because whether the
+    // tape-shared loop source should flow through here is a semantic call.
+    #[cfg_attr(all(test, feature = "spyre"), expect(dead_code))]
     Shared(Option<(usize, usize, u32)>),
     LocalSearch,
 }
@@ -3241,7 +3275,13 @@ pub enum LoopSource {
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+// Test-inclusive arm mirrors `instruction_field_at` (#209): the loop-compression tests
+// below exercise the LocalSearch path end-to-end, and a test-only call must not widen
+// the production cfg.
+#[cfg(any(
+    not(any(feature = "metal", feature = "spyre")),
+    all(test, feature = "spyre")
+))]
 /// `LoopSource::Shared` carries `(start, period, iters)` in `lowered.instances` positions, from
 /// [`scratchy_subtile::subtile_tape::find_layer_loop`] — the ONE search, run on the shared
 /// `SubtileTape` before any target lowered.
@@ -3445,7 +3485,12 @@ pub fn loop_variant_shape() -> OpcodeShape {
 // ⛔ INSTRUCTION-SELECTION ONLY. A tape-scheduled target reads its loop off the shared
 // tape; this searches the ISel stream for one because that stream has no tape. Gated so
 // metal/spyre do not COMPILE it, rather than compiling it and allowing it to be dead.
-#[cfg(not(any(feature = "metal", feature = "spyre")))]
+// Test-inclusive arm mirrors `instruction_field_at` (#209) — `apply_loop_compression`'s
+// body (gated the same way just below) calls this, so the tests pull it in transitively.
+#[cfg(any(
+    not(any(feature = "metal", feature = "spyre")),
+    all(test, feature = "spyre")
+))]
 /// Construct a `Loop(count, body_len, layer_stride)` instance the layer-template
 /// detection prepends in front of a repeating sub-sequence of the
 /// slice.
@@ -4203,7 +4248,6 @@ mod tests {
     use super::*;
     use crate::fuf::FufNode;
     use crate::shape::Dim;
-    use quote::format_ident;
 
     /// Slot allocation packs (tile, output_slot) pairs in
     /// topological order. Test pins the order so emitted
@@ -4814,7 +4858,13 @@ mod tests {
             barriers: vec![false; 3],
             weight_slots: vec![Vec::new(); 3],
         };
-        apply_loop_compression(&arch_opcodes, &mut lb, "layer");
+        apply_loop_compression(
+            &arch_opcodes,
+            &mut lb,
+            "layer",
+            LoopSource::LocalSearch,
+            "loop_compression_test",
+        );
         assert_eq!(lb.instances.len(), 2, "Loop + 1 body row");
         assert_eq!(instruction_variant_name(&lb.instances[0]), "Loop");
         // Loop fields: count, body_len. body_len = 1.
@@ -4867,7 +4917,13 @@ mod tests {
             barriers: vec![false; 6],
             weight_slots: vec![Vec::new(); 6],
         };
-        apply_loop_compression(&arch_opcodes, &mut lb, "layer");
+        apply_loop_compression(
+            &arch_opcodes,
+            &mut lb,
+            "layer",
+            LoopSource::LocalSearch,
+            "loop_compression_test",
+        );
         assert_eq!(lb.instances.len(), 3, "Loop + 2 body rows");
         assert_eq!(instruction_variant_name(&lb.instances[0]), "Loop");
         assert_eq!(instruction_variant_name(&lb.instances[1]), "RmsNorm");
@@ -4904,7 +4960,13 @@ mod tests {
             barriers: vec![false; original.len()],
             weight_slots: vec![Vec::new(); original.len()],
         };
-        apply_loop_compression(&arch_opcodes, &mut lb, "layer");
+        apply_loop_compression(
+            &arch_opcodes,
+            &mut lb,
+            "layer",
+            LoopSource::LocalSearch,
+            "loop_compression_test",
+        );
         assert_eq!(lb.instances.len(), 1);
         assert_eq!(instruction_variant_name(&lb.instances[0]), "Free");
     }
