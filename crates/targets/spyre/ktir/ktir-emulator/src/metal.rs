@@ -1531,6 +1531,33 @@ fn recognize_reduce_combiner(op: &Operation) -> Option<ReduceCombiner> {
     }
 }
 
+/// The `outs` init of a reduce, read as a per-row seed: `outs(%init)` names a
+/// value the context holds; a `[rows]` tile (a partial sum from a blocked
+/// variance chain) yields its data, a scalar tile broadcasts, and anything
+/// unbound or shape-mismatched yields `None` (the caller seeds the combiner
+/// identity, the only case every pre-existing reduce hit — an identity splat).
+#[cfg(metal)]
+fn init_of(op: &Operation, ctx: &crate::context::CoreContext, rows: usize) -> Option<Vec<f32>> {
+    // The `outs` value is named by the `OutsVar` attr or is operand[1] — the two
+    // spellings the interpreter's `reduce` accepts (`head_rewrite`'s `mk_reduce`
+    // uses the attr; `KtirFunc::reduce` used the operand alone).
+    let outs = match op.attr(AttrKey::OutsVar) {
+        Some(crate::ir::Attr::Ssas(v)) => v.first().copied(),
+        _ => op.operands.get(1).copied(),
+    }?;
+    let tile = match ctx.get_value(outs) {
+        Ok(crate::ir::Value::Tile(t)) => t,
+        _ => return None,
+    };
+    if tile.shape.len() == 1 && tile.shape[0] == rows {
+        Some(tile.as_f32().to_vec())
+    } else if tile.shape.is_empty() {
+        Some(vec![tile.as_f32()[0]; rows])
+    } else {
+        None
+    }
+}
+
 /// Run a `linalg.reduce ins(%x) dimensions=[1]` over the last axis of a 2-D
 /// tensor `[rows, cols]` as a GPU reduction (one threadgroup row → one output
 /// element). Binds the reduced `[rows]` tensor (or a scalar if `rows==1` AND the
@@ -1562,8 +1589,23 @@ pub fn run_reduce_gpu(op: &Operation, ctx: &mut crate::context::CoreContext) -> 
     }
     let dtype = x.dtype;
     let kernel = reduce_kernel(combiner, dtype);
+    // ⭐ THE ACCUMULATOR SEED IS THE OP'S `outs` INIT, NOT THE COMBINER IDENTITY.
+    // `linalg.reduce ins(%x) outs(%init)` seeds each row's fold at `init[row]`;
+    // the interpreter folds it unconditionally (`reduce`'s `test_reduce_folds_outs_init`).
+    // Seeding from the combiner identity instead drops a NON-identity init on the
+    // floor — and `rmsnorm_inv`'s column-blocked variance chains exactly that: a
+    // second reduce seeded with the first block's partial sum. Identity-seeding
+    // made the sum cover only the last block's columns (MEASURED at m=64,
+    // hidden=2816: sum-of-squares ~35× too small). `init` may be a `[rows]` tile
+    // (a partial sum) or an unbound/shape-mismatched value (fall back to the
+    // identity, the old behavior).
+    let identity_seed = vec![combiner.identity; rows];
+    let seed: Vec<f32> = match init_of(op, ctx, rows) {
+        Some(v) => v,
+        None => identity_seed,
+    };
     // One output element per row; the kernel folds `cols` along the row.
-    let out = run_reduce_kernel(&kernel, &x.as_f32(), rows, cols, combiner.identity)?;
+    let out = run_reduce_kernel(&kernel, &x.as_f32(), rows, cols, &seed)?;
     // Result shape = input shape with axis 1 removed -> [rows]. (rows>=1; the
     // interpreter only collapses to a scalar when the remaining shape is empty,
     // which can't happen for a 2-D input.)
@@ -1583,8 +1625,9 @@ pub fn run_reduce_gpu(op: &Operation, ctx: &mut crate::context::CoreContext) -> 
 }
 
 /// MSL for a row reduction: each thread folds one row of `cols` elements with the
-/// combiner (sum or max), seeded from `identity` (passed as a buffer so the same
-/// kernel serves both). `rows` is the dispatch width.
+/// combiner (sum or max), seeded from that row's `init` entry (passed as a buffer
+/// so the same kernel serves identity and partial-sum seeds alike). `rows` is
+/// the dispatch width.
 #[cfg(metal)]
 fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
     let ty = msl_type(dtype);
@@ -1602,10 +1645,10 @@ fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
          \x20   device const {ty}* x [[buffer(0)]],\n\
          \x20   device {ty}* out [[buffer(1)]],\n\
          \x20   constant uint& cols [[buffer(2)]],\n\
-         \x20   constant float& identity [[buffer(3)]],\n\
+         \x20   device const float* init [[buffer(3)]],\n\
          \x20   uint row [[thread_position_in_grid]]\n\
          ) {{\n\
-         \x20   float acc = identity;\n\
+         \x20   float acc = init[row];\n\
          \x20   for (uint c = 0; c < cols; c++) {{ float xv = float(x[row * cols + c]); {acc_fold}; }}\n\
          \x20   out[row] = ({ty})acc;\n\
          }}\n",
@@ -1630,16 +1673,17 @@ fn reduce_kernel(combiner: ReduceCombiner, dtype: DType) -> MslKernel {
     }
 }
 
-/// Dispatch the row-reduce kernel: upload `x` (rows*cols, dtype-encoded), pass
-/// `cols`/`identity` as inline bytes, dispatch `rows` threads, read back `rows`
-/// f32. Uses the shared device/queue/pipeline cache (`cached_dispatch`).
+/// Dispatch the row-reduce kernel: upload `x` (rows*cols, dtype-encoded) and the
+/// per-row `init` seed (f32), pass `cols` as inline bytes, dispatch `rows`
+/// threads, read back `rows` f32. Uses the shared device/queue/pipeline cache
+/// (`cached_dispatch`).
 #[cfg(metal)]
 fn run_reduce_kernel(
     kernel: &MslKernel,
     x: &[f32],
     rows: usize,
     cols: usize,
-    identity: f32,
+    init: &[f32],
 ) -> Result<Vec<f32>, String> {
     use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
     use std::ffi::c_void;
@@ -1667,6 +1711,21 @@ fn run_reduce_kernel(
         .ok_or("metal: reduce output buffer alloc failed")?;
 
     let cols_u = cols as u32;
+    // The per-row seed, uploaded f32 (the kernel reads `init[row]` as float).
+    let init_bytes: Vec<u8> = init
+        .iter()
+        .flat_map(|f| f.to_ne_bytes())
+        .collect();
+    // SAFETY: `init_bytes` outlives the copy inside newBufferWithBytes.
+    let init_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(init_bytes.as_ptr() as *mut c_void).unwrap(),
+                init_bytes.len().max(1),
+                res,
+            )
+            .ok_or("metal: reduce init buffer alloc failed")?
+    };
     let tg = pipeline.maxTotalThreadsPerThreadgroup().min(rows).max(1);
     let (raw, _elapsed) = mtl4::dispatch_readback(
         &device,
@@ -1675,7 +1734,7 @@ fn run_reduce_kernel(
             mtl4::Arg::Buffer(&in_buf),
             mtl4::Arg::Buffer(&out_buf),
             mtl4::Arg::Bytes(&cols_u.to_ne_bytes()),
-            mtl4::Arg::Bytes(&identity.to_ne_bytes()),
+            mtl4::Arg::Buffer(&init_buf),
         ],
         mtl4::Extent::Threads(MTLSize {
             width: rows,
@@ -2224,17 +2283,26 @@ fn emit_map_region_kernel_with(
         .get(&live_out_name)
         .ok_or("metal: map window live-out has no defining op")?;
 
-    // Lower the live-out's defining op into one MSL expression, accumulating the
-    // external live-in buffers (first-seen order).
-    let mut live_ins: Vec<Ssa> = Vec::new();
-    let expr = lower_map_compute(root, defs, &in_window, &mut live_ins, 0)?;
-
     // out shape/dtype from the live-out op's attrs (default f16, the KTIR tile dtype).
+    // ⭐ KNOWN BEFORE THE EXPRESSION IS LOWERED, because a live-in leaf READS IT:
+    // a live-in whose own shape is SMALLER than the window's output (e.g. the
+    // argsort tie-break's `[1, E, E]` iota-compare consumed by a `[m, E, E]`
+    // window) must be read through a BROADCAST index, not `buf[gid]` — `gid`
+    // runs over the OUTPUT extent and would run off the live-in's buffer. The
+    // interpreter's `broadcast_pair` does this NumPy-style for the same op;
+    // the fused kernel must agree or the two paths silently diverge (MEASURED:
+    // the fused-map argsort produced duplicate ranks for every row but the
+    // first — row 0's gids happen to stay in bounds).
     let out_shape: Vec<usize> = shape_attr_vec(Some(root))
         .ok_or("metal: map window live-out has no shape attribute")?
         .into_iter()
         .map(|d| d as usize)
         .collect();
+
+    // Lower the live-out's defining op into one MSL expression, accumulating the
+    // external live-in buffers (first-seen order).
+    let mut live_ins: Vec<Ssa> = Vec::new();
+    let expr = lower_map_compute(root, defs, &in_window, &mut live_ins, &out_shape, 0)?;
     let out_dtype = match root.attr(AttrKey::Dtype) {
         Some(Attr::Dtype(dt)) => *dt,
         _ => DType::F16,
@@ -2315,6 +2383,7 @@ fn lower_map_compute(
     defs: &HashMap<Ssa, &Operation>,
     in_window: &HashSet<Ssa>,
     live_ins: &mut Vec<Ssa>,
+    out_shape: &[usize],
     depth: usize,
 ) -> Result<String, String> {
     compose_compute_expr(op, &mut |i: usize| -> Result<String, String> {
@@ -2322,7 +2391,7 @@ fn lower_map_compute(
             .operands
             .get(i)
             .ok_or_else(|| format!("metal: {:?} missing operand {i}", op.op_type))?;
-        lower_map_value(name, defs, in_window, live_ins, depth)
+        lower_map_value(name, defs, in_window, live_ins, out_shape, depth)
     })
 }
 
@@ -2333,12 +2402,16 @@ fn lower_map_compute(
 ///     broadcast index expr; if its input is an in-window scalar -> recurse,
 ///   * any other in-window compute op -> recurse,
 ///   * anything else (a load, a value from outside the window, the reduce sum)
-///     -> a LIVE-IN buffer leaf, read `buf[0]` if scalar else `buf[gid]`.
+///     -> a LIVE-IN buffer leaf, read `buf[0]` if scalar, `buf[gid]` if the
+///     live-in's shape equals the window's output shape, else `buf[<broadcast
+///     index>]` (a smaller live-in is broadcast NumPy-style, matching the
+///     interpreter's `broadcast_pair` — `buf[gid]` would run off its buffer).
 fn lower_map_value(
     name: Ssa,
     defs: &HashMap<Ssa, &Operation>,
     in_window: &HashSet<Ssa>,
     live_ins: &mut Vec<Ssa>,
+    out_shape: &[usize],
     depth: usize,
 ) -> Result<String, String> {
     if depth > MAX_FUSE_DEPTH {
@@ -2358,7 +2431,7 @@ fn lower_map_value(
                 .ok_or("metal: tensor.splat missing operand")?;
             Ok(format!(
                 "({})",
-                lower_map_value(inner, defs, in_window, live_ins, depth + 1)?
+                lower_map_value(inner, defs, in_window, live_ins, out_shape, depth + 1)?
             ))
         }
         Some(d) if d.op_type == OpKind::LinalgBroadcast => {
@@ -2390,7 +2463,7 @@ fn lower_map_value(
                 if input_scalar {
                     Ok(format!(
                         "({})",
-                        lower_map_value(input, defs, in_window, live_ins, depth + 1)?
+                        lower_map_value(input, defs, in_window, live_ins, out_shape, depth + 1)?
                     ))
                 } else {
                     // A rank-reducing broadcast of an in-window NON-scalar value
@@ -2417,7 +2490,7 @@ fn lower_map_value(
         // the parenthesizing in `lower_value`.
         Some(d) if in_win => Ok(format!(
             "({})",
-            lower_map_compute(d, defs, in_window, live_ins, depth + 1)?
+            lower_map_compute(d, defs, in_window, live_ins, out_shape, depth + 1)?
         )),
         // A scalar constant (directly or via splat) reached as a plain operand
         // folds to its literal — it would be a `Value::Scalar` at runtime, not a
@@ -2437,7 +2510,7 @@ fn lower_map_value(
         )),
         // Any other value (a load result, a value produced outside the window —
         // e.g. a prior region's output or the reduce sum) is an external input.
-        _ => Ok(map_live_in_leaf(name, defs, live_ins)),
+        _ => map_live_in_leaf(name, defs, live_ins, out_shape),
     }
 }
 
@@ -2464,20 +2537,62 @@ fn try_fold_scalar(name: Ssa, defs: &HashMap<Ssa, &Operation>) -> Option<String>
 
 /// Emit a live-in buffer leaf for `name`: register it (dedup, original SSA) and
 /// return `buf[0]` if it's a scalar (shape product == 1, e.g. the reduce sum),
-/// else `buf[gid]`. `buf` is the sanitized identifier the buffer binding uses.
-fn map_live_in_leaf(name: Ssa, defs: &HashMap<Ssa, &Operation>, live_ins: &mut Vec<Ssa>) -> String {
+/// `buf[gid]` if the live-in's shape equals the window's output shape, else
+/// `buf[<broadcast index>]` — a live-in SMALLER than the output (e.g. the
+/// argsort tie-break's `[1, E, E]` compare consumed by an `[m, E, E]` window)
+/// is broadcast NumPy-style, exactly as the interpreter's `broadcast_pair`
+/// does for the same op. `buf` is the sanitized identifier the buffer binding
+/// uses.
+///
+/// ⛔ `buf[gid]` FOR A SMALLER LIVE-IN READS OUT OF BOUNDS. `gid` runs over the
+/// WINDOW's output extent; a live-in with fewer elements than that gets its
+/// buffer over-read from the first output element past the live-in's own
+/// count — MEASURED as the fused-map argsort producing duplicate ranks for
+/// every row but the first (row 0's gids stay in bounds by coincidence).
+fn map_live_in_leaf(
+    name: Ssa,
+    defs: &HashMap<Ssa, &Operation>,
+    live_ins: &mut Vec<Ssa>,
+    out_shape: &[usize],
+) -> Result<String, String> {
     if !live_ins.contains(&name) {
         live_ins.push(name);
     }
     let buf = buf_ident(name);
-    let scalar = shape_attr_vec(defs.get(&name).copied())
+    let in_shape = shape_attr_vec(defs.get(&name).copied());
+    let scalar = in_shape
+        .as_ref()
         .map(|s| s.iter().product::<i64>() == 1)
         .unwrap_or(false);
     if scalar {
-        format!("{buf}[0]")
-    } else {
-        format!("{buf}[gid]")
+        return Ok(format!("{buf}[0]"));
     }
+    let (Some(in_shape), false) = (in_shape, out_shape.is_empty()) else {
+        return Ok(format!("{buf}[gid]"));
+    };
+    if in_shape.iter().map(|&d| d as usize).collect::<Vec<_>>() == out_shape {
+        return Ok(format!("{buf}[gid]"));
+    }
+    // Right-align the live-in's rank under the output's (leading 1s), the same
+    // normalization `broadcast_pair` applies, and read through the broadcast
+    // index expression. An incompatible shape (an axis neither equal nor 1)
+    // refuses the window — the interpreter handles it correctly instead.
+    let mut padded = vec![1i64; out_shape.len().saturating_sub(in_shape.len())];
+    padded.extend_from_slice(&in_shape);
+    for (s, &o) in padded.iter().zip(out_shape) {
+        if *s as usize != o && *s != 1 {
+            return Err(format!(
+                "metal: live-in %{} shape {in_shape:?} not broadcastable to window output \
+                 {out_shape:?} — window stays on interpreter",
+                name.0
+            ));
+        }
+    }
+    let idx = broadcast_index_expr(
+        &out_shape.iter().map(|&d| d as i64).collect::<Vec<_>>(),
+        &padded,
+    );
+    Ok(format!("{buf}[{idx}]"))
 }
 
 /// Lower a `linalg.broadcast` whose input is an external buffer to `buf[idx]`,

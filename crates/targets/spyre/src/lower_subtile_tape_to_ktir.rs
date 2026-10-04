@@ -3938,10 +3938,22 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
     fn reduce(&mut self, x: Ssa, init: Ssa, f: OpKind, dim: i64, out: Vec<i64>) -> Ssa {
         let a = self.a;
         let v = self.fresh();
+        // ⭐ `outs` NAMES THE INIT OPERAND — MLIR's `linalg.reduce ins(...) outs(%init)`
+        // spells the accumulator seed as the `outs` value, and the interpreter folds
+        // `combiner(reduced, outs)` UNCONDITIONALLY when the attr is present
+        // (`linalg.rs`'s `test_reduce_folds_outs_init` pins it: sum with `outs` 100
+        // is 110, not 10). Without the attr the init operand is silently dropped on
+        // every path — harmless while every reduce seeded an identity splat, and
+        // WRONG the moment `rmsnorm_inv`'s column-blocked variance chains a second
+        // reduce seeded with the first block's partial sum: the sum then covered
+        // only the LAST block's columns (MEASURED at m=64, hidden=2816: the
+        // sum-of-squares was ~35× too small, `inv` ~5.9× too large, and every
+        // router logit wrong by that factor).
         let op = Operation::new(a, Some(v), OpKind::LinalgReduce, &[x, init])
             .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![dim])))
             .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(out.clone())))
-            .with_attr(a, AttrKey::ReduceFn, Attr::Op(f));
+            .with_attr(a, AttrKey::ReduceFn, Attr::Op(f))
+            .with_attr(a, AttrKey::OutsVar, Attr::Ssas(a.ssa(vec![init])));
         let ty = self.tensor_ty(out);
         let op = self.typed(op, ty);
         self.push(op);
@@ -4694,28 +4706,57 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         v
     }
 
-    /// The last `k` sorted indices of each row — [`SubOp::RouteTopK`]:
-    /// `out[n, j] = sorted[n, E - k + j]`, exactly metal's
-    /// `slice_trailing_cols` (`src_col = axis_size - top_k + k`).
+    /// The top-k expert indices of each row — [`SubOp::RouteTopK`], metal's
+    /// `sorted[..., -k:]` selection (`slice_trailing_cols`'s experts).
     ///
-    /// `tensor.extract_slice` with static offsets/sizes/strides: the whole
-    /// `[m, E]` source loaded, the trailing `k` columns sliced out. Rank-2 in,
-    /// rank-2 out.
+    /// ⭐ A ONE-HOT SELECTOR SUM OVER THE RANK VECTOR, NOT A COLUMN SLICE. The
+    /// input here is [`Self::route_argsort`]'s RANK vector — `rank[n, h]` is
+    /// expert `h`'s sorted position, a PERMUTATION of `0..E` (the stable
+    /// tie-break makes every rank distinct). Metal's argpartition kernel
+    /// returns the sorted-INDEX permutation, so ITS trailing slice is the top-k
+    /// indices; slicing OUR rank vector's trailing columns would instead read
+    /// "the ranks of the last k columns" — measured picking completely wrong
+    /// experts (`[45,110,48,124,...]` against the golden `[73,59,111,44,...]`).
+    /// The inversion is the selector `indices[n, j] = Σ_h h ·
+    /// 𝟙[rank[n, h] == E − k + j]`: exactly one `h` matches each target rank,
+    /// so the sum IS that `h` — the same expert metal's trailing slice names,
+    /// in the same order (ascending score). Same compare/reduce machinery as
+    /// the argsort itself, no data-dependent memory traffic.
+    ///
+    /// ⛔ THE IOTA IS GENERATED AT THE FULL `[m, E]` SHAPE, not broadcast from
+    /// a `[1, E]` row. The selector needs `h` as a VALUE in the summand;
+    /// `tensor.generate` yields i32 (the meshgrid convention), so one
+    /// `arith.sitofp` widens it and the multiply/reduce stay float like every
+    /// other reduce here. `linalg.broadcast` INSERTS an axis (see
+    /// [`Self::route_softmax`]'s ⛔), so a `[1, E]` iota broadcasts to
+    /// `[1, 1, E]`, not `[m, E]` — the meshgrid at the output's own shape
+    /// avoids the broadcast entirely.
     fn route_topk(&mut self, sorted_r: &TensorRegion, out: &TensorRegion, k: u32) {
         let m = out.region.rows.len;
         let e = sorted_r.region.cols.len;
-        let a = self.a;
-        let x = self.load_region(sorted_r);
-        let v = self.fresh();
-        let dims = vec![i64::from(m), i64::from(k)];
-        let op = Operation::new(a, Some(v), OpKind::TensorExtractSlice, &[x])
-            .with_attr(a, AttrKey::SliceOffsets, Attr::IntList(a.ints(vec![0, i64::from(e - k)])))
-            .with_attr(a, AttrKey::SliceSizes, Attr::IntList(a.ints(dims.clone())))
-            .with_attr(a, AttrKey::SliceStrides, Attr::IntList(a.ints(vec![1, 1])));
-        let ty = self.tensor_ty(dims.clone());
-        let op = self.typed(op, ty);
-        self.push(op);
-        self.store_region(v, out);
+        let rank = self.load_region(sorted_r);
+        let wide = vec![i64::from(m), i64::from(e)];
+        // The iota grid `[m, E]` (expert id per column), widened to float.
+        let iota = self.index_grid(m, e, 1);
+        let iota_f = {
+            let v = self.fresh();
+            let op = Operation::new(self.a, Some(v), OpKind::ArithSitofp, &[iota]);
+            let ty = self.f32_ty(wide.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        for j in 0..k {
+            // The target rank: the `j`-th smallest of the top-k ranks.
+            let target = self.splat(f64::from((e - k + j) as f32), wide.clone());
+            // `𝟙[rank == target] · h`, reduced over the expert axis: exactly one
+            // summand is nonzero, so the sum is the matching expert's index.
+            let is_match = self.cmpf("oeq", rank, target, wide.clone());
+            let sel = self.binop(OpKind::ArithMulf, is_match, iota_f, wide.clone());
+            let zero = self.splat_zero(vec![i64::from(m)]);
+            let idx = self.reduce(sel, zero, OpKind::ArithAddf, 1, vec![i64::from(m)]);
+            self.store_region(idx, &sub_cols(out, j, 1));
+        }
     }
 
     /// The scores at the chosen indices — [`SubOp::RouteGatherScores`]:
