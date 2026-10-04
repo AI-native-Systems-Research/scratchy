@@ -4401,11 +4401,16 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
             self.push(op);
             v
         };
-        // 2. x − rowmax, broadcast along the column axis: every column of a row
-        //    shares that row's max.
-        let xb = self.broadcast(x, dims.clone(), 1);
+        // 2. x − rowmax. ⛔ `x` IS ALREADY `[m, c]` — ONLY the `[m]` rowmax needs
+        //    the broadcast (axis 1 sprays each row's scalar back over its columns);
+        //    broadcasting `x` too inserts an axis on a FULL-RANK tile, and the
+        //    emulator's `broadcast_to` refuses `[m, 1, c] → [m, c]`. MEASURED as
+        //    `LinalgBroadcast: cannot broadcast [2, 1, 8] to [2, 8]` the first time
+        //    the whole router chain ran fused — RouteSoftmax had no single-op test,
+        //    and the (also untested) `route_renorm` below had the same latent
+        //    shape error in its `xb` broadcast, which this fix removes too.
         let maxb = self.broadcast(xmax, dims.clone(), 1);
-        let shifted = self.f32_binop(OpKind::ArithSubf, xb, maxb, dims.clone());
+        let shifted = self.f32_binop(OpKind::ArithSubf, x, maxb, dims.clone());
         // 3. exp(shifted).
         let e = self.unop(OpKind::MathExp, shifted, dims.clone());
         // 4. rowsum(exp) — the denominator, `[m]` f32.
@@ -4447,9 +4452,8 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
             self.push(op);
             v
         };
-        let xb = self.broadcast(x, dims.clone(), 1);
         let sumb = self.broadcast(sum, dims.clone(), 1);
-        let y = self.f32_binop(OpKind::ArithDivf, xb, sumb, dims);
+        let y = self.f32_binop(OpKind::ArithDivf, x, sumb, dims);
         self.store_region(y, out);
     }
 
