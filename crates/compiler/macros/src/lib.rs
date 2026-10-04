@@ -765,6 +765,29 @@ pub fn compile_carrier(
     if quantizations_path.exists() {
         tracked_paths.insert(quantizations_path);
     }
+    // ⭐ THE TRITON SPLICE'S KERNELS. `scratchy-triton-splice` reads
+    // `crates/targets/spyre/kernels/*.py` with `std::fs` inside this
+    // expansion, and rustc does not see that read — so without this,
+    // editing a kernel leaves the caller's baked tape stale with no
+    // error (review finding on the splice PR). Same include_str!
+    // mechanism as the JSONs above: the path becomes a declared source
+    // input and cargo rebuilds. Gated on `spyre-triton` (this crate's
+    // own feature that forwards to the splice), so a build without the
+    // splice neither names foreign paths nor depends on the kernels
+    // existing. The registry itself decides which kernels exist; if the
+    // directory is absent or empty this adds nothing.
+    #[cfg(feature = "spyre-triton")]
+    {
+        let kernels_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../targets/spyre/kernels");
+        if let Ok(entries) = std::fs::read_dir(&kernels_dir) {
+            for e in entries.flatten() {
+                if e.path().extension().is_some_and(|x| x == "py") {
+                    tracked_paths.insert(e.path());
+                }
+            }
+        }
+    }
     // De-dupe before emitting; multiple variants share preset /
     // override paths. Target profile is no longer a separate file —
     // it's compiled into scratchy-target-cuda, so cargo's normal

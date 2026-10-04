@@ -7924,6 +7924,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 /// - GEOMETRY was re-read from `config.json` behind `unwrap_or` defaults — a
 ///   second source of truth against the bounds the tape was lowered at. It is
 ///   taken from those same bounds here, so the two cannot disagree.
+///
 /// ⭐⭐⭐ THE DIFFERENTIAL — the wiring must say EXACTLY what the manifest said.
 ///
 /// `wiring_to_parsed` replaced `parse_bundle`: the worker used to `serde_json` the manifest and
@@ -7958,7 +7959,8 @@ fn refuse_if_wiring_disagrees_with_manifest(
     };
 
     // ── the OLD extraction, exactly as `parse_bundle` performed it ──
-    let (mut pk, mut pv): (Vec<(u64, usize)>, Vec<(u64, usize)>) = (Vec::new(), Vec::new());
+    type LayerIds = Vec<(u64, usize)>;
+    let (mut pk, mut pv): (LayerIds, LayerIds) = (Vec::new(), Vec::new());
     let (mut embed, mut cos, mut sin) = (None, Vec::new(), Vec::new());
     for s in &m.sources {
         match s.role.as_str() {
