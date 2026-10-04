@@ -81,11 +81,19 @@ struct Untiled {
     out_view: Ssa,
     /// The activation's row corner — an `scf`-free `index`, carried through unchanged.
     a_row: Ssa,
-    /// The untiled contraction's `outs` seed. ⛔ REUSED, NOT REBUILT: it is a splat of the BOUND
-    /// zero constant at its reserved tid (`KtirFunc::splat_zero`), so minting a fresh immediate in
-    /// its place orphans that parameter — the `dce` below then drops its view chain and the emulator
-    /// refuses with `no shape derivable for tensor t4294967275` (`u32::MAX - 20`, registry slot 0).
-    init: Ssa,
+    /// The untiled contraction's `outs` seed — a `tensor.splat` of the zero scalar. ⛔ THE SCALAR
+    /// IS REUSED, NOT THE SPLAT: the loop body's seeds must be shaped `[1, bw]` (one output row
+    /// of one N-block), while the untiled splat spans the whole `[m, n]` product. Reusing the
+    /// SPLAT itself — as this pass originally did, reading "reused, not rebuilt" one level too
+    /// far — is only shape-correct at `m == 1` with one N-block, i.e. decode. On the CPU
+    /// interpreter the per-iteration `linalg.matmul` then refuses with `outs shape [31, 512] !=
+    /// product shape [1, 512]` (the Metal/NAX offload never runs the body, so macOS never saw
+    /// it — the Linux CI gate did). The splat's SCALAR operand, however, is what must be kept
+    /// alive: `KtirFunc::splat_zero` splats an immediate scalar (`scalar(0.0)`), and minting a
+    /// fresh constant in place of the operand would orphan the original splat's parameter —
+    /// the `dce` below then drops its view chain and the emulator refuses with `no shape
+    /// derivable for tensor t4294967275` (`u32::MAX - 20`, registry slot 0).
+    init_scalar: Ssa,
     m: i64,
     n: i64,
     k: i64,
@@ -179,6 +187,15 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         else {
             continue;
         };
+        // The `outs` seed must be a `tensor.splat` over a scalar — the form
+        // `KtirFunc::splat_zero` emits. The SCALAR is what the rewrite reuses;
+        // the splat itself is `[m, n]`-shaped and gets rebuilt per N-block.
+        let Some(&init_scalar) = def.get(&init).and_then(|(_, o)| o.operands.first()) else {
+            continue;
+        };
+        if def.get(&init).map(|(_, o)| o.op_type) != Some(OpKind::TensorSplat) {
+            continue;
+        }
         let (Some((a_view, a_row, a_dims)), Some((w_view, _, w_dims))) =
             (through_load(av), through_load(wv))
         else {
@@ -300,7 +317,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             w_view,
             out_view,
             a_row,
-            init,
+            init_scalar,
             m,
             n,
             k,
@@ -395,11 +412,24 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             pre.push(const_index(a, step, kb));
             pre.push(const_index(a, zero, 0));
 
-            // ⭐ THE SEED IS THE ONE THE UNTILED FORM CARRIED — a splat of the bound zero at its
-            // reserved tid. Reused for the loop's `iter_args` init AND the per-iteration matmul seed,
-            // so the parameter keeps a consumer and its shape stays derivable.
-            let azero = p.init;
-            let cinit = p.init;
+            // ⭐ THE SEEDS ARE PER-N-BLOCK, `tensor<1x{bw}>` — the shape the pre-move
+            // construction emitted (`dense<0.0> : tensor<1x{bw}>` in the old textual
+            // builder). Both the loop's `iter_args` init and the per-iteration matmul
+            // `outs` seed are splats of the UNTILED FORM'S OWN SCALAR operand — the
+            // one `KtirFunc::splat_zero` bound — so the parameter keeps its consumer
+            // (and its derivable shape) while the splats themselves carry this block's
+            // `[1, bw]` shape. Reusing the untiled `[m, n]` splat wholesale is only
+            // shape-correct at m=1 and one block (decode); see `Untiled::init_scalar`.
+            let splat = |res: Ssa, dims: Vec<i64>| {
+                let mut op = Operation::new(a, Some(res), OpKind::TensorSplat, &[p.init_scalar])
+                    .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())))
+                    .with_attr(a, AttrKey::Dtype, Attr::Dtype(elem));
+                op.result_type = Some(tensor(dims));
+                op
+            };
+            let (azero, cinit) = (g.mint(), g.mint());
+            pre.push(splat(azero, acc_dims.clone()));
+            pre.push(splat(cinit, acc_dims.clone()));
 
             // ── the loop body ──
             let (accit, result, kv) = (g.mint(), g.mint(), g.mint());
