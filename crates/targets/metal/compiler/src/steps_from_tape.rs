@@ -333,6 +333,16 @@ struct Emission {
     lm_head: bool,
 }
 
+/// An expert projection's record parts: its step, its step at its op's uniform width when the
+/// quantization declares the layer's widths (see [`MoeBits`]), the arena slots its rows read, and
+/// its weight.
+struct ExpertRecord {
+    step: st::ExpertMatmul,
+    raw: Option<st::ExpertMatmul>,
+    reads: Vec<Slot>,
+    weight: (WeightKind, usize),
+}
+
 fn em(step: MetalStep, reads: &[Slot], writes: &[Slot], sites: Vec<WeightSlot>) -> Emission {
     let sig = HazardSig {
         reads: reads.to_vec(),
@@ -708,6 +718,69 @@ impl Recording<'_> {
         }
     }
 
+    /// Expert projection op `j`'s record parts.
+    fn expert_matmul(&self, j: usize) -> Result<ExpertRecord, StepRefusal> {
+        let SubOp::ExpertMatmul {
+            proj,
+            quant,
+            bundle,
+            ..
+        } = *self.op(j)
+        else {
+            return Err(self.no(j, Refused::FusionShape));
+        };
+        let ((rows, reads), e) = (self.moe_rows(j, 0)?, self.source_arg(j, 2)?);
+        let (layer, group_size) = (self.layer(e), Gs(quant.group().get()));
+        let op_bits = Bits(quant.bits().get());
+        let at = |width| st::ExpertMatmul {
+            rows,
+            layer,
+            proj,
+            group_size,
+            width,
+        };
+        let raw = at(st::ExpertWidth::OpUniform(op_bits));
+        // A Qwen-MoE projection's own width, as the quantization declares it per layer.
+        let declared = match bundle {
+            ExpertBundle::SharedFused => self.facts.moe_expert_bits,
+            ExpertBundle::SwitchGlu | ExpertBundle::Fused => None,
+        };
+        let step = declared.map_or(raw, |w| {
+            let widths = w(layer);
+            let own = match proj {
+                ExpertProj::Gate => widths[0],
+                ExpertProj::Up => widths[1],
+                ExpertProj::Down => widths[2],
+            };
+            at(st::ExpertWidth::Declared(own.unwrap_or(op_bits)))
+        });
+        Ok(ExpertRecord {
+            step,
+            raw: declared.map(|_| raw),
+            reads,
+            weight: (bundle.weight_kind(), e),
+        })
+    }
+
+    /// Single-owner rule: a DSL-declared `<base>.shared_expert` subtree owns the shared expert of
+    /// combine op `i`'s block; metal has no fused tail for one it does not.
+    fn shared_expert_owned(&self, i: usize) -> Result<(), StepRefusal> {
+        let SubOp::ExpertCombine { shared, .. } = *self.op(i) else {
+            return Err(self.no(i, Refused::FusionShape));
+        };
+        if shared.0.is_some() {
+            let bank = self
+                .group(i)
+                .find(|j| matches!(self.op(*j), SubOp::ExpertMatmul { .. }));
+            let bank = bank.ok_or_else(|| self.no(i, Refused::IncompleteMoeBlock))?;
+            let base = self.base(bank, self.source_arg(bank, 2)?)?;
+            if !self.facts.dsl_shared_expert_bases.contains(&base) {
+                return Err(self.no(i, Refused::UndeclaredSharedExpert { base }));
+            }
+        }
+        Ok(())
+    }
+
     /// A MoE step's record: the block's step, its arena reads and writes, and its weight.
     fn moe(
         &self,
@@ -947,6 +1020,81 @@ impl Recording<'_> {
                 let norm = |e| self.site(i, WeightKind::RmsNorm, e);
                 let sites = [norm(gain)?, norm(scale)?].concat();
                 Ok(em(step, &[delta, res], &[res, out], sites))
+            }
+            // The gate and up projections and `act(gate) * up`: the up reads the gate's rows and
+            // layer, at the gate's group size.
+            (F::MoeGateUpAct, Sh::ExpertGated { gate, up }) => {
+                let SubOp::ExpertGatedAct { act } = *self.op(i) else {
+                    return Err(self.no(i, Refused::FusionShape));
+                };
+                let g = self.expert_matmul(self.op_at(i, gate)?)?;
+                let u = self.expert_matmul(self.op_at(i, up)?)?;
+                let shared = |x: &st::ExpertMatmul| (x.rows, x.layer, x.group_size);
+                if shared(&g.step) != shared(&u.step) {
+                    return Err(self.no(i, Refused::FusionShape));
+                }
+                let step = MoeStep::GateUpAct(g.step, u.step.width, act);
+                let mut e = self.moe(i, step, &g.reads, &[], Some(g.weight))?;
+                if g.raw.is_some() || u.raw.is_some() {
+                    let (gr, ur) = (g.raw.unwrap_or(g.step), u.raw.unwrap_or(u.step));
+                    let raw = MoeStep::GateUpAct(gr, ur.width, act);
+                    e.raw = Some(MetalStep::Moe(self.block(i)?, raw));
+                }
+                Ok(e)
+            }
+            // The down projection, its unsort and the combine into the combine's buffer. The
+            // command writes the down rows into the op scratch before it combines them.
+            (F::MoeDownCombine, Sh::ExpertCombined { down, .. }) => {
+                self.shared_expert_owned(i)?;
+                let d = self.expert_matmul(self.op_at(i, down)?)?;
+                let out = self.colour(i)?;
+                let step = MoeStep::DownCombine(d.step, out);
+                let mut e = self.moe(i, step, &d.reads, &[out], Some(d.weight))?;
+                e.sig.op_scratch = Access::Write;
+                if let Some(raw) = d.raw {
+                    let raw = MoeStep::DownCombine(raw, out);
+                    e.raw = Some(MetalStep::Moe(self.block(i)?, raw));
+                }
+                Ok(e)
+            }
+            // The routing, as the program its folded steps spell.
+            (
+                F::MoeRoute,
+                Sh::Route {
+                    pre,
+                    tail: [scale, post, expert_scale],
+                    ..
+                },
+            ) => {
+                let op = |s| -> Result<(usize, &SubOp), StepRefusal> {
+                    let j = self.op_at(i, s)?;
+                    Ok((j, self.op(j)))
+                };
+                let scale = match scale.map(op).transpose()? {
+                    None => None,
+                    Some((_, &SubOp::RouteScale { scale })) => Some(st::Scale(scale)),
+                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
+                };
+                let post = match post.map(op).transpose()? {
+                    None => st::RoutePost::None,
+                    Some((_, SubOp::RouteSoftmax)) => st::RoutePost::Softmax,
+                    Some((_, SubOp::RouteRenorm)) => st::RoutePost::Renorm,
+                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
+                };
+                let weight = match expert_scale.map(op).transpose()? {
+                    None => None,
+                    Some((j, &SubOp::RouteExpertScale { router })) => {
+                        Some((router.weight_kind(), self.source_arg(j, 2)?))
+                    }
+                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
+                };
+                let program = st::RouteProgram {
+                    pre_softmax: pre.is_some(),
+                    scale,
+                    post,
+                    expert_scale: weight.as_ref().map(|&(_, e)| self.layer(e)),
+                };
+                self.moe(i, MoeStep::Route(program), &[], &[], weight)
             }
             _ => Err(self.no(i, Refused::FusionShape)),
         }
@@ -1409,53 +1557,19 @@ impl Recording<'_> {
                 let x = self.read(i, 0)?;
                 self.moe(i, MoeStep::Sort(x), &[x], &[], None)?
             }
-            L::ExpertMatmul {
-                proj,
-                quant,
-                bundle,
-                ..
-            } => {
-                let ((rows, reads), e) = (self.moe_rows(i, 0)?, self.source_arg(i, 2)?);
-                let (layer, gs) = (self.layer(e), Gs(quant.group().get()));
-                let op_bits = Bits(quant.bits().get());
-                let at = |width| MoeStep::ExpertMatmul(rows, layer, proj, gs, width);
-                let raw = at(st::ExpertWidth::OpUniform(op_bits));
-                // A Qwen-MoE projection's own width, as the quantization declares it per layer.
-                let declared = match bundle {
-                    ExpertBundle::SharedFused => self.facts.moe_expert_bits,
-                    ExpertBundle::SwitchGlu | ExpertBundle::Fused => None,
-                };
-                let step = declared.map_or(raw, |w| {
-                    let widths = w(layer);
-                    let own = match proj {
-                        ExpertProj::Gate => widths[0],
-                        ExpertProj::Up => widths[1],
-                        ExpertProj::Down => widths[2],
-                    };
-                    at(st::ExpertWidth::Declared(own.unwrap_or(op_bits)))
-                });
-                let weight = Some((bundle.weight_kind(), e));
-                let mut em = self.moe(i, step, &reads, &[], weight)?;
-                if declared.is_some() {
-                    em.raw = Some(MetalStep::Moe(self.block(i)?, raw));
+            L::ExpertMatmul { .. } => {
+                let x = self.expert_matmul(i)?;
+                let step = MoeStep::ExpertMatmul(x.step);
+                let mut em = self.moe(i, step, &x.reads, &[], Some(x.weight))?;
+                if let Some(raw) = x.raw {
+                    em.raw = Some(MetalStep::Moe(self.block(i)?, MoeStep::ExpertMatmul(raw)));
                 }
                 em
             }
             L::ExpertGatedAct { act } => self.moe(i, MoeStep::GatedAct(act), &[], &[], None)?,
             L::ExpertUnsort => self.moe(i, MoeStep::Unsort, &[], &[], None)?,
-            L::ExpertCombine { shared, .. } => {
-                // Single-owner rule: a DSL-declared `<base>.shared_expert` subtree owns the
-                // shared expert; metal has no fused tail for one it does not.
-                if shared.0.is_some() {
-                    let bank = self
-                        .group(i)
-                        .find(|j| matches!(self.op(*j), L::ExpertMatmul { .. }));
-                    let bank = bank.ok_or_else(|| self.no(i, Refused::IncompleteMoeBlock))?;
-                    let base = self.base(bank, self.source_arg(bank, 2)?)?;
-                    if !self.facts.dsl_shared_expert_bases.contains(&base) {
-                        return Err(self.no(i, Refused::UndeclaredSharedExpert { base }));
-                    }
-                }
+            L::ExpertCombine { .. } => {
+                self.shared_expert_owned(i)?;
                 let out = out()?;
                 self.moe(i, MoeStep::Combine(out), &[], &[out], None)?
             }

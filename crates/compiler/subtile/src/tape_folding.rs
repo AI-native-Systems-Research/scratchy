@@ -111,7 +111,39 @@ pub enum FoldPattern<K: 'static> {
         norm: SubOpKind,
         kernel: K,
     },
+    /// `act(gate, up)` over expert rows: the gate and up `matmul`s (the activation's operands 0
+    /// and 1), each read by the activation alone, fold into it.
+    ExpertGated {
+        act: SubOpKind,
+        matmul: SubOpKind,
+        kernel: K,
+    },
+    /// `combine(unsort(matmul(..)), scores)`: the unsort (the combine's operand 0) and the
+    /// `matmul` whose rows it unsorts (its operand 0), each read by the next alone, fold into the
+    /// combine.
+    ExpertCombined {
+        combine: SubOpKind,
+        unsort: SubOpKind,
+        matmul: SubOpKind,
+        kernel: K,
+    },
+    /// A router's routing, driven at its `top_k` step. The `sort` it reads folds into it, and so
+    /// does the `pre` step the sort reads when the sort and the `gather` are its only readers.
+    /// The `gather` of the top-k scores (operand 0 the sort's logits, operand 1 the top-k) and
+    /// the steps the scores then pass through, each the sole reader of the last, are its
+    /// epilogues: at most one per `tail` stage, the stages in order.
+    Route {
+        top_k: SubOpKind,
+        sort: SubOpKind,
+        pre: SubOpKind,
+        gather: SubOpKind,
+        tail: &'static [&'static [SubOpKind]; ROUTE_TAIL_STAGES],
+        kernel: K,
+    },
 }
+
+/// The stages a routing fold's scores may pass through after the gather.
+pub const ROUTE_TAIL_STAGES: usize = 3;
 
 impl<K> FoldPattern<K> {
     /// The kind of step the pattern is matched at.
@@ -122,6 +154,9 @@ impl<K> FoldPattern<K> {
             Self::Gated { mul, .. } => *mul,
             Self::NormedRope { rope, .. } => *rope,
             Self::NormAddScale { scale, .. } => *scale,
+            Self::ExpertGated { act, .. } => *act,
+            Self::ExpertCombined { combine, .. } => *combine,
+            Self::Route { top_k, .. } => *top_k,
         }
     }
 }
@@ -177,6 +212,21 @@ pub enum FusedShape {
         residual: StepOperand,
         gain: StepOperand,
         scale: StepOperand,
+    },
+    ExpertGated {
+        gate: SlotId,
+        up: SlotId,
+    },
+    ExpertCombined {
+        unsort: SlotId,
+        down: SlotId,
+    },
+    /// `tail[s]` is the step of tail stage `s`, if the scores pass through one.
+    Route {
+        sort: SlotId,
+        pre: Option<SlotId>,
+        gather: SlotId,
+        tail: [Option<SlotId>; ROUTE_TAIL_STAGES],
     },
 }
 
@@ -530,7 +580,121 @@ impl<K: Copy> Folder<'_, K> {
             FoldPattern::NormAddScale {
                 add, norm, kernel, ..
             } => self.norm_add_scale(i, add, norm, kernel),
+            FoldPattern::ExpertGated { matmul, kernel, .. } => {
+                let gate = self.sole_producer(i, 0, matmul)?;
+                let up = self.sole_producer(i, 1, matmul)?;
+                if let (Some(g), Some(u)) = (gate, up) {
+                    let (gate, up) = (self.ops.slot[g], self.ops.slot[u]);
+                    self.absorb(i, &[g, u], kernel, FusedShape::ExpertGated { gate, up });
+                }
+                Ok(())
+            }
+            FoldPattern::ExpertCombined {
+                unsort,
+                matmul,
+                kernel,
+                ..
+            } => {
+                let Some(un) = self.sole_producer(i, 0, unsort)? else {
+                    return Ok(());
+                };
+                if let Some(d) = self.sole_producer(un, 0, matmul)? {
+                    let (unsort, down) = (self.ops.slot[un], self.ops.slot[d]);
+                    self.absorb(
+                        i,
+                        &[un, d],
+                        kernel,
+                        FusedShape::ExpertCombined { unsort, down },
+                    );
+                }
+                Ok(())
+            }
+            FoldPattern::Route {
+                sort,
+                pre,
+                gather,
+                tail,
+                kernel,
+                ..
+            } => self.route(i, [sort, pre, gather], tail, kernel),
         }
+    }
+
+    fn route(
+        &mut self,
+        i: usize,
+        [sort, pre, gather]: [SubOpKind; 3],
+        tail: &[&[SubOpKind]; ROUTE_TAIL_STAGES],
+        kernel: K,
+    ) -> Result<(), FoldError> {
+        let Some(s) = self.sole_producer(i, 0, sort)? else {
+            return Ok(());
+        };
+        let ops = &self.ops;
+        let logits = ops.in_op(s, 0)?;
+        let free = |j: usize| self.absorbed[j].is_none() && self.epilogue[j].is_none();
+        let reads_route = |g: usize| -> Result<bool, FoldError> {
+            Ok(ops.kind(g) == gather && free(g) && ops.in_op(g, 1)? == Some(i))
+        };
+        let mut g = None;
+        for j in 0..ops.slot.len() {
+            if reads_route(j)? && ops.in_op(j, 0)? == logits && logits.is_some() {
+                g = Some(j);
+                break;
+            }
+        }
+        let Some(g) = g else {
+            return Ok(());
+        };
+        let pre = logits.filter(|&l| ops.kind(l) == pre && self.consumers[l] == 2 && free(l));
+        let mut stages = [None; ROUTE_TAIL_STAGES];
+        let (mut cur, mut next) = (g, 0);
+        while self.consumers[cur] == 1 {
+            let Some(c) = (0..ops.slot.len()).find(|&c| ops.first_op(c) == Some(cur)) else {
+                break;
+            };
+            let Some(st) = (next..ROUTE_TAIL_STAGES).find(|&st| tail[st].contains(&ops.kind(c)))
+            else {
+                break;
+            };
+            if !free(c) {
+                break;
+            }
+            (stages[st], next, cur) = (Some(c), st + 1, c);
+        }
+        let slot = |j: usize| self.ops.slot[j];
+        let shape = FusedShape::Route {
+            sort: slot(s),
+            pre: pre.map(slot),
+            gather: slot(g),
+            tail: stages.map(|t| t.map(slot)),
+        };
+        for e in std::iter::once(g).chain(stages.into_iter().flatten()) {
+            self.epilogue[e] = Some(i);
+        }
+        self.absorb(
+            i,
+            &[s].into_iter().chain(pre).collect::<Vec<_>>(),
+            kernel,
+            shape,
+        );
+        Ok(())
+    }
+
+    /// The `kind` step producing `j`'s operand `k`, when nothing else reads it and no fold took it.
+    fn sole_producer(&self, j: usize, k: u8, kind: SubOpKind) -> Result<Option<usize>, FoldError> {
+        let p = self.ops.in_op(j, k)?;
+        Ok(p.filter(|&p| {
+            self.ops.kind(p) == kind && self.consumers[p] == 1 && self.absorbed[p].is_none()
+        }))
+    }
+
+    /// `i` drives `kernel`, computing `ops` inside it.
+    fn absorb(&mut self, i: usize, ops: &[usize], kernel: K, shape: FusedShape) {
+        for &j in ops {
+            self.absorbed[j] = Some(i);
+        }
+        self.record(i, kernel, shape);
     }
 
     fn record(&mut self, i: usize, kernel: K, shape: FusedShape) {
@@ -799,6 +963,9 @@ mod tests {
         GeluFused,
         NormedRope,
         NormAddScale,
+        ExpertGated,
+        ExpertCombined,
+        Route,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -844,6 +1011,29 @@ mod tests {
                     add: K::Add,
                     norm: K::RmsNorm,
                     kernel: Kern::NormAddScale,
+                },
+                FoldPattern::ExpertGated {
+                    act: K::ExpertGatedAct,
+                    matmul: K::ExpertMatmul,
+                    kernel: Kern::ExpertGated,
+                },
+                FoldPattern::ExpertCombined {
+                    combine: K::ExpertCombine,
+                    unsort: K::ExpertUnsort,
+                    matmul: K::ExpertMatmul,
+                    kernel: Kern::ExpertCombined,
+                },
+                FoldPattern::Route {
+                    top_k: K::RouteTopK,
+                    sort: K::RouteArgsort,
+                    pre: K::RouteSoftmax,
+                    gather: K::RouteGatherScores,
+                    tail: &[
+                        &[K::RouteScale],
+                        &[K::RouteSoftmax, K::RouteRenorm],
+                        &[K::RouteExpertScale],
+                    ],
+                    kernel: Kern::Route,
                 },
             ],
         ]
@@ -952,6 +1142,145 @@ mod tests {
             shape: FusedShape::ResidualNorm { add: s[2] },
         };
         assert_eq!(f.role(s[4]), StepRole::Drives(&residual));
+    }
+
+    #[test]
+    fn a_routing_folds_into_its_top_k_with_its_scores_as_epilogues() {
+        use crate::subtile_ir::{NumExperts, RouterBundle, TopK};
+        use std::num::NonZeroU32;
+        let experts = NumExperts::new(NonZeroU32::new(16).expect("16 experts"));
+        let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
+        let logits = |router| SubOp::RouterLogits { experts, router };
+        let top_k = SubOp::RouteTopK { k };
+        let src = [(1, 64), (16, 64)];
+        // Gemma: sort, top-k, gather, scale, softmax, per-expert scale.
+        let gemma = RouterBundle::Gemma;
+        let ops = vec![
+            op(logits(gemma), 1, vec![Ext(0), Ext(1)]),
+            op(SubOp::RouteArgsort, 1, vec![Op(0)]),
+            op(top_k, 1, vec![Op(1)]),
+            op(SubOp::RouteGatherScores, 1, vec![Op(0), Op(2)]),
+            op(SubOp::RouteScale { scale: 0.125 }, 1, vec![Op(3)]),
+            op(SubOp::RouteSoftmax, 1, vec![Op(4)]),
+            op(
+                SubOp::RouteExpertScale { router: gemma },
+                1,
+                vec![Op(5), Op(2), Ext(1)],
+            ),
+            op(ADD, 1, vec![Op(6), Op(2)]),
+        ];
+        let (s, f) = fold(&src, weights(2), ops, &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[1]), StepRole::Absorbed { into: s[2] });
+        for e in [3, 4, 5, 6] {
+            assert_eq!(f.role(s[e]), StepRole::Epilogue { of: s[2] }, "step {e}");
+        }
+        let route = Fusion {
+            kernel: Kern::Route,
+            shape: FusedShape::Route {
+                sort: s[1],
+                pre: None,
+                gather: s[3],
+                tail: [Some(s[4]), Some(s[5]), Some(s[6])],
+            },
+        };
+        assert_eq!(f.role(s[2]), StepRole::Drives(&route));
+        // Qwen's shared-expert router: a softmax over every expert first, which the sort and the
+        // gather alone read; the scores then renormalize.
+        let shared = RouterBundle::SharedFused;
+        let ops = vec![
+            op(logits(shared), 1, vec![Ext(0), Ext(1)]),
+            op(SubOp::RouteSoftmax, 1, vec![Op(0)]),
+            op(SubOp::RouteArgsort, 1, vec![Op(1)]),
+            op(top_k, 1, vec![Op(2)]),
+            op(SubOp::RouteGatherScores, 1, vec![Op(1), Op(3)]),
+            op(SubOp::RouteRenorm, 1, vec![Op(4)]),
+            op(ADD, 1, vec![Op(5), Op(3)]),
+        ];
+        let (s, f) = fold(&src, weights(2), ops, &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[1]), StepRole::Absorbed { into: s[3] });
+        assert_eq!(f.role(s[2]), StepRole::Absorbed { into: s[3] });
+        let route = Fusion {
+            kernel: Kern::Route,
+            shape: FusedShape::Route {
+                sort: s[2],
+                pre: Some(s[1]),
+                gather: s[4],
+                tail: [None, Some(s[5]), None],
+            },
+        };
+        assert_eq!(f.role(s[3]), StepRole::Drives(&route));
+    }
+
+    #[test]
+    fn expert_projections_fold_into_their_activation_and_combine_only_when_read_once() {
+        use crate::lower::ExpertQuant;
+        use crate::subtile_ir::{ExpertBundle, ExpertProj, GatedAct, SharedExpertBound, TopK};
+        let matmul = |proj, n, inputs| {
+            let k = TopK::new(std::num::NonZeroU32::new(2).expect("two experts"));
+            let quant = ExpertQuant::declared(64, 4);
+            let bundle = ExpertBundle::SwitchGlu;
+            op(
+                SubOp::ExpertMatmul {
+                    proj,
+                    n,
+                    k,
+                    quant,
+                    bundle,
+                },
+                1,
+                inputs,
+            )
+        };
+        let ops = |gate_read_again: bool| {
+            let (gate, up, down) = (ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down);
+            let act = SubOp::ExpertGatedAct {
+                act: GatedAct::Gelu,
+            };
+            let combine = SubOp::ExpertCombine {
+                hidden: 64,
+                shared: SharedExpertBound(None),
+            };
+            let mut v = vec![
+                matmul(gate, 32, vec![Ext(0), Ext(1), Ext(2)]),
+                matmul(up, 32, vec![Ext(0), Ext(1), Ext(3)]),
+                op(act, 1, vec![Op(0), Op(1)]),
+                matmul(down, 64, vec![Op(2), Ext(1), Ext(4)]),
+                op(SubOp::ExpertUnsort, 1, vec![Op(3), Ext(1)]),
+                op(combine, 1, vec![Op(4), Ext(5)]),
+            ];
+            if gate_read_again {
+                v.push(op(ADD, 1, vec![Op(5), Op(0)]));
+            }
+            v
+        };
+        let src = [(1, 64), (1, 2), (32, 64), (32, 64), (64, 32), (1, 2)];
+        let (s, f) = fold(&src, weights(6), ops(false), &[], &TABLE, SPLIT);
+        assert_eq!(
+            f.absorbed().collect::<Vec<_>>(),
+            [(s[0], s[2]), (s[1], s[2]), (s[3], s[5]), (s[4], s[5])]
+        );
+        let gated = Fusion {
+            kernel: Kern::ExpertGated,
+            shape: FusedShape::ExpertGated {
+                gate: s[0],
+                up: s[1],
+            },
+        };
+        let combined = Fusion {
+            kernel: Kern::ExpertCombined,
+            shape: FusedShape::ExpertCombined {
+                unsort: s[4],
+                down: s[3],
+            },
+        };
+        assert_eq!(f.role(s[2]), StepRole::Drives(&gated));
+        assert_eq!(f.role(s[5]), StepRole::Drives(&combined));
+        // A gate another step reads stays its own step, and so does the up it pairs with.
+        let (s, f) = fold(&src, weights(6), ops(true), &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+        assert_eq!(f.role(s[1]), StepRole::Kept);
+        assert_eq!(f.role(s[2]), StepRole::Kept);
+        assert_eq!(f.role(s[5]), StepRole::Drives(&combined));
     }
 
     #[test]

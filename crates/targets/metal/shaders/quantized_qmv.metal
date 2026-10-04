@@ -29,6 +29,7 @@
 #include <metal_simdgroup>
 #include <metal_stdlib>
 #include "baked.h"
+#include "gated_act.h"
 
 using namespace metal;
 
@@ -1311,13 +1312,57 @@ INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 // `tid.x * out_vec_size` from y, so pinning tid.x=0 and pre-
 // offsetting both pointers is identical to a single-batch matvec.
 //
+// The MoE block's fused kernels run the same per-pair matvec:
+//   affine_gather_qmv_gated{_fast}   gate and up of one output block, then act(gate) * up
+//   affine_gather_qmv_combine{_fast} down of one 4-row group for every chosen expert, then
+//                                    the weighted combine of those rows
 // ─────────────────────────────────────────────────────────────────
 
 #ifdef SCRATCHY_CONSTANT_2
 SCRATCHY_CONSTANT(int, GATHER_PER_ROW, 2);
 
-template <typename T_act, typename T_scale, int group_size, int bits>
-[[kernel]] void affine_gather_qmv_fast(
+// Pair `nk`'s matvec over its expert's weights: output block `block` (8 rows, 4 per simdgroup)
+// of `y`'s row `nk`, reading `x`'s row `x_row`.
+template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
+METAL_FUNC void gather_qmv_pair(
+    const device uint32_t* w,
+    const device T_scale*  scales,
+    const device T_scale*  biases,
+    const device T_act*    x,
+    const device uint32_t* rhs_indices,
+    device T_act*          y,
+    uint nk,
+    uint x_row,
+    uint block,
+    uint simd_gid,
+    uint simd_lid) {
+  uint expert_idx = rhs_indices[nk];
+
+  // Per-expert weight slab strides: w is packed int4 with
+  // `in_vec/8 * out_vec` uint32 per expert; scales/biases hold
+  // `in_vec/gs * out_vec` per expert.
+  size_t expert_stride_w = size_t(IN_VEC_SIZE / (32 / bits)) * size_t(OUT_VEC_SIZE);
+  size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
+  const device uint32_t* w_e = w + expert_idx * expert_stride_w;
+  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
+  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;
+  const device T_act*    x_e = x + size_t(x_row) * size_t(IN_VEC_SIZE);
+  device T_act*          y_e = y + size_t(nk) * size_t(OUT_VEC_SIZE);
+
+  uint3 inner_tid = uint3(0, block, 0);
+  if (fast) {
+    qmv_fast_impl<T_act, T_scale, group_size, bits>(
+        w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
+        inner_tid, simd_gid, simd_lid);
+  } else {
+    qmv_impl<T_act, T_scale, group_size, bits>(
+        w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
+        inner_tid, simd_gid, simd_lid);
+  }
+}
+
+template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
+[[kernel]] void affine_gather_qmv(
     const device uint32_t* w           [[buffer(0)]],
     const device T_scale*  scales      [[buffer(1)]],
     const device T_scale*  biases      [[buffer(2)]],
@@ -1330,63 +1375,111 @@ template <typename T_act, typename T_scale, int group_size, int bits>
   // `tid.z` flattens the (token, top_k_slot) axis. tid.x is fixed
   // to 0 — the M-axis broadcast is folded into z.
   uint nk = tid.z;
-  uint token_n = nk / uint(GATHER_PER_ROW);
-  uint expert_idx = rhs_indices[nk];
-
-  // Per-expert weight slab strides: w is packed int4 with
-  // `in_vec/8 * out_vec` uint32 per expert; scales/biases hold
-  // `in_vec/gs * out_vec` per expert.
-  size_t expert_stride_w = size_t(IN_VEC_SIZE / (32 / bits)) * size_t(OUT_VEC_SIZE);
-  size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
-  const device uint32_t* w_e = w + expert_idx * expert_stride_w;
-  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
-  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;
-  const device T_act*    x_e = x + size_t(token_n) * size_t(IN_VEC_SIZE);
-  device T_act*          y_e = y + size_t(nk) * size_t(OUT_VEC_SIZE);
-
-  uint3 inner_tid = uint3(0, tid.y, 0);
-  qmv_fast_impl<T_act, T_scale, group_size, bits>(
-      w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
-      inner_tid, simd_gid, simd_lid);
+  gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
+      w, scales, biases, x, rhs_indices, y, nk, nk / uint(GATHER_PER_ROW), tid.y,
+      simd_gid, simd_lid);
 }
 
-template <typename T_act, typename T_scale, int group_size, int bits>
-[[kernel]] void affine_gather_qmv(
+#ifdef SCRATCHY_CONSTANT_3
+// The gated activation (slot 3): 0 SiLU, 1 GELU (tanh).
+SCRATCHY_CONSTANT(int, GATED_ACT, 3);
+
+// The MoE block's gate and up projections and its gated activation: `gate_y` ends holding
+// `act(gate) * up` for every chosen expert's rows. Each token's row feeds GATHER_PER_ROW
+// (top-k) pairs.
+//   buffer(0-2) = gate w / scales / biases   buffer(6-8) = up w / scales / biases
+//   buffer(3)   = x                          buffer(9)   = up y  [N, top_k, out_vec]
+//   buffer(4)   = rhs_indices
+//   buffer(5)   = gate y                     [N, top_k, out_vec]
+// Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
+// gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
+// activation to the block's rows. Every gate row is written raw only by the threadgroup that
+// then activates it: an out_vec with a 1-3 row tail block would have qmv_impl redo the previous
+// block's last rows there, raw, so this kernel takes an out_vec that is a multiple of 4.
+template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
+[[kernel]] void affine_gather_qmv_gated(
+    const device uint32_t* gate_w      [[buffer(0)]],
+    const device T_scale*  gate_scales [[buffer(1)]],
+    const device T_scale*  gate_biases [[buffer(2)]],
+    const device T_act*    x           [[buffer(3)]],
+    const device uint32_t* rhs_indices [[buffer(4)]],
+    device T_act*          gate_y      [[buffer(5)]],
+    const device uint32_t* up_w        [[buffer(6)]],
+    const device T_scale*  up_scales   [[buffer(7)]],
+    const device T_scale*  up_biases   [[buffer(8)]],
+    device T_act*          up_y        [[buffer(9)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]]) {
+  static_assert(OUT_VEC_SIZE % 4 == 0, "a 1-3 row tail block would race the activation");
+  uint nk = tid.z;
+  bool up = simd_gid >= 2;
+  gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
+      up ? up_w : gate_w, up ? up_scales : gate_scales, up ? up_biases : gate_biases, x,
+      rhs_indices, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
+      simd_lid);
+  threadgroup_barrier(mem_flags::mem_device);
+  uint row = tid.y * 8 + simd_lid;
+  if (simd_gid == 0 && simd_lid < 8 && row < uint(OUT_VEC_SIZE)) {
+    size_t at = size_t(nk) * size_t(OUT_VEC_SIZE) + row;
+    float g = float(gate_y[at]);
+    float u = float(up_y[at]);
+    gate_y[at] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u) : silu_mul_f(g, u));
+  }
+}
+#endif
+
+// The MoE block's down projection and its weighted combine:
+// `out[n, d] = Σ_k down[n, k, d] · scores[n, k]`, summed in slot order (as `moe_weighted_sum`).
+// Each pair's x row is its own (the gated activation's rows); GATHER_PER_ROW is the top-k.
+//   buffer(0-2) = w / scales / biases   buffer(5) = y      [N, top_k, out_vec]
+//   buffer(3)   = x  [N, top_k, in_vec] buffer(6) = scores [N, top_k]
+//   buffer(4)   = rhs_indices           buffer(7) = out    [N, out_vec]
+// Dispatch (1, ceil(out_vec / 4), N), threadgroup (32, top_k, 1): simdgroup k runs pair
+// (n, k)'s matvec over the 4-row group tid.y, then lanes 0-3 of simdgroup 0 combine the group's
+// rows. A pair row another threadgroup also writes (qmv_impl redoing a tail) gets the same bits.
+template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
+[[kernel]] void affine_gather_qmv_combine(
     const device uint32_t* w           [[buffer(0)]],
     const device T_scale*  scales      [[buffer(1)]],
     const device T_scale*  biases      [[buffer(2)]],
     const device T_act*    x           [[buffer(3)]],
     const device uint32_t* rhs_indices [[buffer(4)]],
     device T_act*          y           [[buffer(5)]],
+    const device T_act*    scores      [[buffer(6)]],
+    device T_act*          out         [[buffer(7)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
-  uint nk = tid.z;
-  uint token_n = nk / uint(GATHER_PER_ROW);
-  uint expert_idx = rhs_indices[nk];
-
-  size_t expert_stride_w = size_t(IN_VEC_SIZE / (32 / bits)) * size_t(OUT_VEC_SIZE);
-  size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
-  const device uint32_t* w_e = w + expert_idx * expert_stride_w;
-  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
-  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;
-  const device T_act*    x_e = x + size_t(token_n) * size_t(IN_VEC_SIZE);
-  device T_act*          y_e = y + size_t(nk) * size_t(OUT_VEC_SIZE);
-
-  uint3 inner_tid = uint3(0, tid.y, 0);
-  qmv_impl<T_act, T_scale, group_size, bits>(
-      w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
-      inner_tid, simd_gid, simd_lid);
+  uint n = tid.z;
+  uint nk = n * uint(GATHER_PER_ROW) + simd_gid;
+  gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
+      w, scales, biases, x, rhs_indices, y, nk, nk, tid.y / 2, tid.y % 2, simd_lid);
+  threadgroup_barrier(mem_flags::mem_device);
+  uint row = tid.y * 4 + simd_lid;
+  if (simd_gid == 0 && simd_lid < 4 && row < uint(OUT_VEC_SIZE)) {
+    const device T_act* rows = y + size_t(n) * uint(GATHER_PER_ROW) * size_t(OUT_VEC_SIZE);
+    float acc = 0.0f;
+    for (int k = 0; k < GATHER_PER_ROW; ++k) {
+      acc = fma(float(rows[size_t(k) * size_t(OUT_VEC_SIZE) + row]),
+                float(scores[n * uint(GATHER_PER_ROW) + uint(k)]),
+                acc);
+    }
+    out[size_t(n) * size_t(OUT_VEC_SIZE) + row] = T_act(acc);
+  }
 }
 #endif
 
 #define INST_GATHER_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits)               \
+  SCRATCHY_KERNEL(name##_fast_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits,                   \
+                  name<act_type, scale_type, gs, bits, true>)                                   \
   SCRATCHY_KERNEL(name##_##act_tag##_s_##scale_tag##_gs_##gs##_b_##bits,                        \
-                  name<act_type, scale_type, gs, bits>)
+                  name<act_type, scale_type, gs, bits, false>)
 
 #define INST_GATHER_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs) \
-  INST_GATHER_QMV(affine_gather_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4) \
-  INST_GATHER_QMV(affine_gather_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4)
+  INST_GATHER_QMV(affine_gather_qmv,         act_tag, act_type, scale_tag, scale_type, gs, 4) \
+  INST_GATHER_QMV(affine_gather_qmv_gated,   act_tag, act_type, scale_tag, scale_type, gs, 4) \
+  INST_GATHER_QMV(affine_gather_qmv_combine, act_tag, act_type, scale_tag, scale_type, gs, 4)
 
 INST_GATHER_QMV_ALL(f16,  half,   f16, half,    32)
 INST_GATHER_QMV_ALL(f16,  half,   f16, half,    64)
@@ -1405,8 +1498,9 @@ INST_GATHER_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 // 8-bit gather-qmv (MoE decode) for MLX-native mixed/dynamic quant
 // (OptiQ), whose sensitive edge layers ship 8-bit switch_glu experts.
 #define INST_GATHER_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs) \
-  INST_GATHER_QMV(affine_gather_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 8) \
-  INST_GATHER_QMV(affine_gather_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 8)
+  INST_GATHER_QMV(affine_gather_qmv,         act_tag, act_type, scale_tag, scale_type, gs, 8) \
+  INST_GATHER_QMV(affine_gather_qmv_gated,   act_tag, act_type, scale_tag, scale_type, gs, 8) \
+  INST_GATHER_QMV(affine_gather_qmv_combine, act_tag, act_type, scale_tag, scale_type, gs, 8)
 INST_GATHER_QMV_ALL_B8(f16,  half,   f16, half,    32)
 INST_GATHER_QMV_ALL_B8(f16,  half,   f16, half,    64)
 INST_GATHER_QMV_ALL_B8(f16,  half,   f16, half,   128)
