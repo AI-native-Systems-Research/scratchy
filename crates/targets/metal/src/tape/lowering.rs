@@ -23,8 +23,8 @@ use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
     ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
-    KvOperand, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores, MoeStep,
-    NDim, QmvBatchLimit, RopeFormTag, RotaryTables, RotatedRows, RouterInput, RowSource,
+    KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores,
+    MoeStep, NDim, QmvBatchLimit, RopeFormTag, RotaryTables, RotatedRows, RouterInput, RowSource,
     RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
 use scratchy_ir::{KvCodec, TqBits};
@@ -161,12 +161,24 @@ pub fn lower_subtile_tape_to_metal(
             )
         })
     };
+    // A KV writer encodes when it binds the packed store.
+    let encodes = |c: &GatedCommand| {
+        matches!(
+            c.command.kernel,
+            KernelId::RopeAppend | KernelId::RopeAppendNormed
+        ) && c.command.bindings.iter().any(|b| {
+            matches!(
+                b,
+                Binding::Runtime {
+                    kind: RuntimeBindingKind::TqPackedK { .. },
+                    ..
+                }
+            )
+        })
+    };
     if p.kv_codec.is_turboquant()
         && bb.commands.iter().any(binds_kv_cache)
-        && !bb
-            .commands
-            .iter()
-            .any(|c| c.command.kernel == KernelId::TqQuantizeToPacked)
+        && !bb.commands.iter().any(encodes)
     {
         return Err(LoweringError::TurboQuantCompressesNothing);
     }
@@ -591,92 +603,47 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
         .collect()
 }
 
-/// TurboQuant: build the per-layer quantize command (new tokens in the fp16
-/// scratch → packed[L]), run right after the layer's KV writer, removing the
-/// operand's offset first (bindings 18..=20: bias, rotary table, positions;
-/// [`TqOffset`](super::kernel_constants::TqOffset) the bias, rotated to the
-/// key's position for K). New-token count == num_tokens, so the grid
-/// scales like RopeAppend (m_scaling on X). The TurboQuant layers are the
-/// GLOBAL class (every layer on uniform arches, where GLOBAL_* == base).
-fn tq_quantize_command<const IS_K: bool>(
+/// A KV writer's folded-in TurboQuant encode ([`KvWrite::PoolAndPacked`]): the codebook, the
+/// layer's packed stores and each operand's offset, as the writer's constants and the bindings it
+/// adds from 16 (`rope.metal`'s `ROPE_TQ_BUFFERS`). `None` for a writer that writes the pool alone.
+/// The coded layers are the GLOBAL class (every layer on uniform arches).
+fn kv_writer_codec(
     p: &MetalModelConsts,
-    layer: u32,
-    operand: TqOperand<IS_K>,
-    bucket_m: u32,
-    bits: TqBits,
-) -> LoweredCommand {
-    use super::kernel_constants::{TqOffset, TqWriteback};
+    write: KvWrite,
+    offsets: KvOffsets,
+    layer: LayerId,
+    layer_offset: u32,
+    w: RowSources<'_>,
+) -> Result<Option<(super::kernel_constants::RopeTqConstants, Vec<Binding>)>, LoweringError> {
+    use super::kernel_constants::{RopeTqConstants, TqOffset};
     use RuntimeBindingKind as RB;
-    let (hd, nkv, bs) = (
-        p.global_head_dim,
-        p.num_global_kv_heads,
-        p.global_block_size,
-    );
-    let li = super::ids::LayerId(layer);
-    let (cache, packed, norms) = if IS_K {
-        (
-            RB::KvCacheK { layer: li },
+    if write == KvWrite::Pool {
+        return Ok(None);
+    }
+    let bits = tq_bits(p)?;
+    let ops = TqOperands::of(p, offsets, layer, w)?;
+    let li = super::ids::LayerId(layer.get() + layer_offset);
+    let mut bindings = runtime_at(
+        16,
+        [
+            RB::TqSigns,
+            RB::TqBoundaries,
             RB::TqPackedK { layer: li },
             RB::TqNormsK { layer: li },
-        )
-    } else {
-        (
-            RB::KvCacheV { layer: li },
             RB::TqPackedV { layer: li },
             RB::TqNormsV { layer: li },
-        )
-    };
-    let slots = RB::SlotMapping { layer: li };
-    let runtime = [cache, slots, RB::TqSigns, RB::TqBoundaries, RB::TqCentroids];
-    let mut bindings = runtime_at(0, runtime.into_iter().chain([packed, norms]));
-    bindings.extend(runtime_at(16, [slots]));
-    if let Some(b) = operand.0 {
-        bindings.push(b.bias_binding(18));
-        if IS_K {
-            bindings.push(b.rotary.binding(b.layer, 19));
-            bindings.extend(runtime_at(20, [RB::Positions]));
-        }
+        ],
+    );
+    if let Some(k) = ops.k.0 {
+        bindings.extend([k.bias_binding(22), k.rotary.binding(k.layer, 24)]);
     }
-    let (rot_dim, pair_off, ..) = rope_on_read_params(p, true);
-    let offset = match (operand.0, IS_K) {
-        (None, _) => TqOffset::None,
-        (Some(_), false) => TqOffset::Bias,
-        (Some(_), true) => TqOffset::RotatedBias,
-    };
-    let constants = super::kernel_constants::TqCompressConstants {
-        head_dim: super::ids::HeadDim(hd),
+    bindings.extend(ops.v.0.map(|v| v.bias_binding(23)));
+    let constants = RopeTqConstants {
         bits: super::ids::TqCodeBits(bits.get()),
-        num_kv_heads: super::ids::NumKvHeads(nkv),
-        block_size: super::ids::BlockSize(bs),
-        blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
-        // The quantize runs before attention, which reads the step's new keys raw (decode) or
-        // rotates them itself (prefill staging).
-        writeback: TqWriteback::Raw,
-        offset,
-        rot_dim: rot_dim.unwrap_or(super::ids::RotDim(0)),
-        pair_off: pair_off.unwrap_or(super::ids::RopePairOff(0)),
+        k_offset: ops.k.0.map_or(TqOffset::None, |_| TqOffset::RotatedBias),
+        v_offset: ops.v.0.map_or(TqOffset::None, |_| TqOffset::Bias),
     };
-    LoweredCommand {
-        kernel: KernelId::TqQuantizeToPacked,
-        library: "turboquant",
-        function: pick_specialized_symbol(
-            "tq_compress_paged",
-            "tq_compress_paged_bf16",
-            p.metal_dtype,
-        ),
-        constants: constants.into_baked(),
-        dispatch: DispatchShape {
-            threadgroups: (bucket_m, nkv, 1),
-            threads_per_threadgroup: (hd, 1, 1),
-            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                seq_axis: None,
-                axis: crate::tape::lowered::MScaleAxis::X,
-                bucket_m: super::ids::BucketM(bucket_m),
-            }),
-        },
-        bindings: baked(bindings),
-        gemm_dims: None,
-    }
+    Ok(Some((constants, bindings)))
 }
 
 /// TurboQuant decode: the `AttentionViaCacheTq` twin of a decode
@@ -2604,8 +2571,10 @@ fn lower_one(
             LayerId(layer),
             _pairing,
             class,
-            _kv_offsets,
+            kv_offsets,
+            write,
         ) => {
+            let codec = kv_writer_codec(p, *write, *kv_offsets, LayerId(*layer), layer_offset, w)?;
             // 2D dispatch: (M, num_heads) — one threadgroup per
             // (token, head) pair rotates the head's `head_dim` slice
             // and writes K/V to the layer's paged cache page.
@@ -2658,6 +2627,7 @@ fn lower_one(
                     // Spans: store relocatable K unrotated (skip K-rotation
                     // for flagged blocks). None → byte-identical when off.
                     rope_on_read: if p.rope_on_read { Some(1) } else { None },
+                    tq: codec.as_ref().map(|(c, _)| *c),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -2669,14 +2639,18 @@ fn lower_one(
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
                 },
-                bindings: super::kernel_bindings::RopeAppendBindingSet {
-                    q_out: super::ids::ArenaSlotIdx(*q_out_slot),
-                    k_out: super::ids::ArenaSlotIdx(*k_out_slot),
-                    v_out: super::ids::ArenaSlotIdx(*v_out_slot),
-                    cos_sin: w.cos_sin(p)?,
-                    layer: super::ids::LayerId(*layer + layer_offset),
-                }
-                .into_baked(),
+                bindings: baked(
+                    Vec::from(super::kernel_bindings::RopeAppendBindingSet {
+                        q_out: super::ids::ArenaSlotIdx(*q_out_slot),
+                        k_out: super::ids::ArenaSlotIdx(*k_out_slot),
+                        v_out: super::ids::ArenaSlotIdx(*v_out_slot),
+                        cos_sin: w.cos_sin(p)?,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                    })
+                    .into_iter()
+                    .chain(codec.into_iter().flat_map(|(_, b)| b))
+                    .collect(),
+                ),
                 gemm_dims: None,
             }
         }
@@ -2693,7 +2667,11 @@ fn lower_one(
             LayerId(layer),
             pairing,
             class,
+            write,
         ) => {
+            // A normed K/V carries no offset.
+            let centred = KvOffsets::CENTERED;
+            let codec = kv_writer_codec(p, *write, centred, LayerId(*layer), layer_offset, w)?;
             assert!(
                 *pairing == RopeFormTag::NeoX,
                 "metal lowering: RopeAppendNormed is NeoX-only (the matcher \
@@ -2738,6 +2716,7 @@ fn lower_one(
                     weight_offset: p.norm_weight_offset,
                     // Spans: store relocatable K NORMED-but-unrotated.
                     rope_on_read: if p.rope_on_read { Some(1) } else { None },
+                    tq: codec.as_ref().map(|(c, _)| *c),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -2752,16 +2731,20 @@ fn lower_one(
                 // q_out aliases the raw q storage (in-place norm+rotate,
                 // staged through TG memory); k/v bind their RAW slots
                 // read-only — the kernel writes K/V to the cache only.
-                bindings: super::kernel_bindings::RopeAppendNormedBindingSet {
-                    q_out: super::ids::ArenaSlotIdx(*q_out_slot),
-                    k_in: super::ids::ArenaSlotIdx(*k_slot),
-                    v_in: super::ids::ArenaSlotIdx(*v_slot),
-                    cos_sin: w.cos_sin(p)?,
-                    q_gains: w.of(WeightKind::RmsNorm, 0)?,
-                    k_gains: w.of(WeightKind::RmsNorm, 1)?,
-                    layer: super::ids::LayerId(*layer + layer_offset),
-                }
-                .into_baked(),
+                bindings: baked(
+                    Vec::from(super::kernel_bindings::RopeAppendNormedBindingSet {
+                        q_out: super::ids::ArenaSlotIdx(*q_out_slot),
+                        k_in: super::ids::ArenaSlotIdx(*k_slot),
+                        v_in: super::ids::ArenaSlotIdx(*v_slot),
+                        cos_sin: w.cos_sin(p)?,
+                        q_gains: w.of(WeightKind::RmsNorm, 0)?,
+                        k_gains: w.of(WeightKind::RmsNorm, 1)?,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                    })
+                    .into_iter()
+                    .chain(codec.into_iter().flat_map(|(_, b)| b))
+                    .collect(),
+                ),
                 gemm_dims: None,
             }
         }
@@ -4050,15 +4033,6 @@ fn lower_one(
         }
 
         // ── The KV codec (TurboQuant): its row's guard gates every command ──
-        I::KvEncode(operand, layer, offsets) => {
-            let bits = tq_bits(p)?;
-            let ops = TqOperands::of(p, *offsets, *layer, w)?;
-            let layer = layer.get() + layer_offset;
-            return Ok(vec![match operand {
-                KvOperand::K => tq_quantize_command(p, layer, ops.k, bucket_m, bits),
-                KvOperand::V => tq_quantize_command(p, layer, ops.v, bucket_m, bits),
-            }]);
-        }
         I::KvStage(operand, layer, class, offsets) => {
             let bits = tq_bits(p)?;
             let ops = TqOperands::of(p, *offsets, *layer, w)?;
@@ -6684,6 +6658,7 @@ mod tests {
             NeoX,
             class,
             offsets,
+            KvWrite::Pool,
         )
     }
 
@@ -6776,13 +6751,14 @@ mod tests {
     }
 
     /// A TurboQuant-coded layer's rows — `writer`, then `attention` — as the codec steps expand
-    /// them from `op_abi::METAL_KV_CODEC`, each gated by its guard's `METAL_GUARD_GATES` gate: the
-    /// writer's encodes after it, then the attention's decode or prefill form around it. Every
-    /// codec row carries the writer's offsets, as the step records give it them.
+    /// them from `op_abi::METAL_KV_CODEC` and the folds leave them, each gated by its guard's
+    /// `METAL_GUARD_GATES` gate: the writer encoding its rows (its encodes folded in), then the
+    /// attention's decode or prefill form around it. Every codec row carries the writer's offsets,
+    /// as the step records give it them.
     fn coded(writer: MetalStep, attention: MetalStep) -> Vec<StepRow> {
         use crate::op_abi::{METAL_GUARD_GATES, METAL_KV_CODEC};
         use scratchy_subtile::kv_codec::{After, Before};
-        let MetalStep::RopeAppend(.., wl, _, _, offsets) = writer else {
+        let MetalStep::RopeAppend(q0, k0, v0, q1, k1, v1, wl, wp, wc, offsets, _) = writer else {
             panic!("a coded writer: {writer:?}");
         };
         use MetalStep as S;
@@ -6795,10 +6771,11 @@ mod tests {
         };
         let gated = |step, guard| StepRow::Step(step, METAL_GUARD_GATES.gate(guard));
         let codec = METAL_KV_CODEC;
-        let mut rows = plain(&[writer]);
-        for g in codec.after_writer {
-            rows.push(gated(S::KvEncode(g.step, wl, offsets), g.guard));
-        }
+        assert_eq!(codec.after_writer.len(), 2, "the writer's K and V encodes");
+        let packed = KvWrite::PoolAndPacked;
+        let mut rows = plain(&[S::RopeAppend(
+            q0, k0, v0, q1, k1, v1, wl, wp, wc, offsets, packed,
+        )]);
         let around = if decode { codec.decode } else { codec.prefill };
         for g in around.before {
             let step = match g.step {
@@ -6852,8 +6829,7 @@ mod tests {
             assert!(
                 tape.commands.iter().all(|c| !matches!(
                     c.command.kernel,
-                    KernelId::TqQuantizeToPacked
-                        | KernelId::TqStageRotated
+                    KernelId::TqStageRotated
                         | KernelId::TqRotateRows
                         | KernelId::AttentionViaCacheTq
                 )),
@@ -6924,13 +6900,11 @@ mod tests {
             steps,
             [
                 (KernelId::RopeAppend, None),
-                (KernelId::TqQuantizeToPacked, None),
-                (KernelId::TqQuantizeToPacked, None),
                 (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
                 (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (fp16, tq) = (&tape.commands[3].command, &tape.commands[4].command);
+        let (fp16, tq) = (&tape.commands[1].command, &tape.commands[2].command);
         assert_eq!(
             (fp16.library, fp16.function, fp16.dispatch),
             (tq.library, tq.function, tq.dispatch)
@@ -7085,8 +7059,8 @@ mod tests {
     /// Hybrid arches (gemma-4) compress only the GLOBAL layers — the codec pass
     /// expands the declared class only (`kv_codec`'s
     /// `a_hybrid_arch_codes_its_declared_class_only`): the global layer's rows lower
-    /// to its writer's quantize and the TurboQuant commands around its attention,
-    /// while the sliding layer's rows stay plain fp16.
+    /// to its writer, encoding its rows, and the TurboQuant commands around its
+    /// attention, while the sliding layer's rows stay plain fp16.
     #[test]
     fn hybrid_turboquant_compresses_global_layers_only() {
         use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
@@ -7100,10 +7074,6 @@ mod tests {
         };
         let global_writer = tq_writer(0, Causal, LLAMA_KV);
         let sliding_writer = tq_writer(1, SlidingWindow, LLAMA_KV);
-        let quantize = [
-            (KernelId::TqQuantizeToPacked, None),
-            (KernelId::TqQuantizeToPacked, None),
-        ];
         let global = attention(MetalStep::AttentionViaCache, 0, Interleaved);
         let sliding = attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved);
         let rows = [
@@ -7111,14 +7081,13 @@ mod tests {
             plain(&[sliding_writer, sliding]),
         ];
         let decode = lower_tq(&p, rows.concat(), 1);
-        let mut want = vec![(KernelId::RopeAppend, None)];
-        want.extend(quantize);
-        want.extend([
+        let want = [
+            (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
             (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
             (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, None),
-        ]);
+        ];
         assert_eq!(gated_steps(&decode), want);
 
         let global_attention = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
@@ -7143,7 +7112,6 @@ mod tests {
             64,
         );
         let mut want = vec![(KernelId::RopeAppend, None)];
-        want.extend(quantize);
         want.extend(tq_attention_steps(&own(global_attention)));
         want.push((KernelId::RopeAppend, None));
         want.extend(fp16(sliding_attention));
@@ -7492,11 +7460,7 @@ mod tests {
     fn prefill_turboquant_attends_in_the_rotated_domain() {
         let prefill = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
         let tape = lower_tq_layer(prefill, 64);
-        let mut want = vec![
-            (KernelId::RopeAppend, None),
-            (KernelId::TqQuantizeToPacked, None),
-            (KernelId::TqQuantizeToPacked, None),
-        ];
+        let mut want = vec![(KernelId::RopeAppend, None)];
         let own = own_attention_steps(&tape);
         assert!(!own.is_empty(), "the attention's own commands");
         want.extend(tq_attention_steps(&own));
@@ -7739,11 +7703,12 @@ mod tests {
     }
 
     /// A Qwen2 writer's projection biases reach every codec command: the
-    /// quantize removes them (K's rotated by the writer's rotary table at each
-    /// token's position — mode 2 — V's as-is, mode 1), and the prefill staging
-    /// and decode twin restore them, all bound at the writer's weight site in
-    /// `op_abi::rope_append_bias_slots` order. The same layer with a centered
-    /// writer binds none of it and runs mode 0: the offset is the difference.
+    /// writer's encode removes them (K's rotated by the writer's rotary table at
+    /// each token's position — mode 2 — V's as-is, mode 1), and the prefill
+    /// staging and decode twin restore them, all bound at the writer's weight
+    /// site in `op_abi::rope_append_bias_slots` order. The same layer with a
+    /// centered writer binds none of it and runs mode 0: the offset is the
+    /// difference.
     #[test]
     fn turboquant_restores_a_biased_writers_offsets() {
         use scratchy_ir::{BiasStorage, KvOffset, KvOffsets};
@@ -7758,16 +7723,8 @@ mod tests {
         let layer = crate::tape::ids::LayerId(0);
         let linear = |slot| src(WeightKind::Linear, slot);
         let bias = |slot, bi| source(linear(slot), WeightTensor::AffineLinearBias, layer, bi);
-        let cos_sin = source(src(WeightKind::CosSin, 0), WeightTensor::Weight, layer, 19);
-        let positions = Binding::Runtime {
-            kind: RuntimeBindingKind::Positions,
-            binding_index: 20,
-        };
-        let mode = |mode| {
-            [(10, mode), (11, p.rot_dim), (12, p.rot_dim / 2)]
-                .map(|(slot, value)| ConstantValue::uint(slot, value))
-                .to_vec()
-        };
+        let cos_sin = source(src(WeightKind::CosSin, 0), WeightTensor::Weight, layer, 24);
+        let modes = |k, v| vec![ConstantValue::uint(13, k), ConstantValue::uint(14, v)];
         // Each codec command's offset bindings and offset constants, in tape order.
         let offsets = |offsets, attention, bucket_m| {
             let rows = coded(tq_writer(0, Causal, offsets), attention);
@@ -7777,7 +7734,7 @@ mod tests {
                 .filter_map(|c| {
                     let c = &c.command;
                     let (from, slots): (u8, &[u16]) = match c.kernel {
-                        KernelId::TqQuantizeToPacked => (18, &[10, 11, 12]),
+                        KernelId::RopeAppend => (22, &[13, 14]),
                         KernelId::TqStageRotated => (10, &[14, 15]),
                         KernelId::AttentionViaCacheTq => (14, &[14, 15]),
                         _ => return None,
@@ -7792,8 +7749,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let (q, stage, twin) = (
-            KernelId::TqQuantizeToPacked,
+        let (writer, stage, twin) = (
+            KernelId::RopeAppend,
             KernelId::TqStageRotated,
             KernelId::AttentionViaCacheTq,
         );
@@ -7801,15 +7758,11 @@ mod tests {
         let decode = attention(MetalStep::AttentionViaCache, 0, Interleaved);
         let prefill = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
 
-        let quantize = [
-            (q, vec![bias(0, 18), cos_sin, positions], mode(2)),
-            (q, vec![bias(1, 18)], mode(1)),
-        ];
-        let mut want = quantize.to_vec();
-        want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
-        assert_eq!(offsets(qwen2, decode, 1), want);
+        let encode = (writer, vec![bias(0, 22), cos_sin, bias(1, 23)], modes(2, 1));
+        let twin_restores = (twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]);
+        assert_eq!(offsets(qwen2, decode, 1), [encode.clone(), twin_restores]);
 
-        let mut want = quantize.to_vec();
+        let mut want = vec![encode];
         // Each operand staged twice: its new rows, then its cached ones.
         want.extend(std::iter::repeat_n(
             (stage, vec![bias(0, 10)], vec![k_bias]),
@@ -7822,18 +7775,17 @@ mod tests {
         want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
         assert_eq!(offsets(qwen2, prefill, 64), want);
 
-        let centered = |kernel| (kernel, vec![], mode(0));
-        let mut want = vec![centered(q), centered(q)];
+        let mut want = vec![(writer, vec![], modes(0, 0))];
         want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));
         want.push((twin, vec![], vec![]));
         assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
     }
 
-    /// The quantize binds exactly the ABI `turboquant.metal` declares, in order, and carries its
-    /// constants slot by slot — written out here, independently of the builder, for a centered
-    /// layer (the offset tail is pinned above).
+    /// The writer's encode binds exactly the ABI `rope.metal`'s `ROPE_TQ_BUFFERS` declares, in
+    /// order, and carries its constants slot by slot — written out here, independently of the
+    /// builder, for a centered layer (the offset tail is pinned above).
     #[test]
-    fn turboquant_quantize_binds_the_kernel_abi() {
+    fn turboquant_writer_encode_binds_the_kernel_abi() {
         use RuntimeBindingKind as RB;
         let p = tq_consts();
         let layer = crate::tape::ids::LayerId(0);
@@ -7844,45 +7796,39 @@ mod tests {
         let k = ConstantValue::uint;
         let bits = TQ_BITS.get();
         let (hd, vpw) = (p.head_dim, 32 / bits);
-        let scale = 1.0f32 / (hd as f32).sqrt();
         let tape = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
-        let quantize_v = tape.commands[2].command;
+        let writer = tape.commands[0].command;
+        assert_eq!(writer.kernel, KernelId::RopeAppend);
         assert_eq!(
-            quantize_v.bindings,
+            bound_from(&writer, 16),
             [
-                rt(0, RB::KvCacheV { layer }),
-                rt(1, RB::SlotMapping { layer }),
-                rt(2, RB::TqSigns),
-                rt(3, RB::TqBoundaries),
-                rt(4, RB::TqCentroids),
-                rt(5, RB::TqPackedV { layer }),
-                rt(6, RB::TqNormsV { layer }),
-                rt(16, RB::SlotMapping { layer }),
+                rt(16, RB::TqSigns),
+                rt(17, RB::TqBoundaries),
+                rt(18, RB::TqPackedK { layer }),
+                rt(19, RB::TqNormsK { layer }),
+                rt(20, RB::TqPackedV { layer }),
+                rt(21, RB::TqNormsV { layer }),
             ]
         );
+        let encode: Vec<ConstantValue> = (writer.constants.iter())
+            .filter(|c| c.index >= 10)
+            .copied()
+            .collect();
         assert_eq!(
-            quantize_v.constants,
+            encode,
             [
-                k(0, hd),
-                k(1, bits),
-                k(2, vpw),
-                k(3, hd.div_ceil(vpw)),
-                k(4, 1 << bits),
-                ConstantValue::float(5, scale),
-                k(6, p.num_kv_heads),
-                k(7, p.block_size),
-                k(8, crate::BLOCKS_PER_CHUNK),
-                k(9, 0),
-                k(10, 0),
-                k(11, 0),
-                k(12, 0),
+                k(10, bits),
+                k(11, vpw),
+                k(12, hd.div_ceil(vpw)),
+                k(13, 0),
+                k(14, 0)
             ]
         );
     }
 
     /// A codec command with nothing to take its operands' offsets from does not
     /// lower: a K bias with no rotary table bound to rotate it to each key — the
-    /// first codec row, the writer's K encode (row 1), is refused. (An attention
+    /// first codec row, the writer encoding its rows (row 0), is refused. (An attention
     /// with no KV writer before it has no offsets to carry and never becomes a
     /// codec row: the codec pass refuses it, `kv_codec`'s
     /// `an_attention_without_its_writer_does_not_expand`.)
@@ -7901,7 +7847,7 @@ mod tests {
                 coded(tq_writer(0, Causal, k_biased), decode),
                 1
             ),
-            Err(LoweringError::TurboQuantOffsetUnbound { index: 1 })
+            Err(LoweringError::TurboQuantOffsetUnbound { index: 0 })
         ));
     }
 

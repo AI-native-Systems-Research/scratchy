@@ -993,8 +993,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::BiasAdd
         | K::Reshape
         | K::TqStageRotated
-        | K::TqRotateRows
-        | K::TqQuantizeToPacked => KernelKind::Elementwise,
+        | K::TqRotateRows => KernelKind::Elementwise,
     }
 }
 

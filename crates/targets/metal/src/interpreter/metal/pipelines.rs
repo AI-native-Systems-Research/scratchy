@@ -318,10 +318,6 @@ mod tests {
             ),
             (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
             (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
-            (KernelId::TqQuantizeToPacked, MetalDtype::F16) => ("turboquant", "tq_compress_paged"),
-            (KernelId::TqQuantizeToPacked, MetalDtype::Bf16) => {
-                ("turboquant", "tq_compress_paged_bf16")
-            }
             (KernelId::AttentionViaCache, MetalDtype::F16) => {
                 ("attention", "attention_via_cache_v2_f16_specialized")
             }
@@ -406,7 +402,6 @@ mod tests {
             | KernelId::RopeAppendNormed
             | KernelId::TqStageRotated
             | KernelId::TqRotateRows
-            | KernelId::TqQuantizeToPacked
             | KernelId::TanhSoftCap
             | KernelId::GatherLastToken
             | KernelId::ScatterFirstToLastRow
@@ -569,7 +564,6 @@ mod tests {
             | KernelId::RopeAppendNormed
             | KernelId::TqStageRotated
             | KernelId::TqRotateRows
-            | KernelId::TqQuantizeToPacked
             | KernelId::TanhSoftCap
             | KernelId::GatherLastToken
             | KernelId::ScatterFirstToLastRow

@@ -11,15 +11,17 @@
 // crates/serving/worker/src/gpu_worker.rs (`slot |= 0x8000_0000`). Enforced by
 // crates/targets/metal/tests/kv_index_bit31_mask_test.rs.
 //
-//! TurboQuant paged-KV kernels bound by the tape's TurboQuant ops; the codebook
-//! math (norm, signs, WHT butterfly, nearest-centroid, bit packing) is a port of
-//! arozanov's `turboquant_mlx/metal.py`. `dim` threads per threadgroup (dim <=
-//! 512, power of two). Each kernel is one template over the cache element type
-//! `T`, instantiated as `<name>` (half) and `<name>_bf16` (bfloat).
+//! TurboQuant's standalone paged-KV encode. The encode itself is
+//! `turboquant_encode.h`'s, which the tape's KV writers run as they write
+//! (rope.metal, `MetalFusion::KvEncoded`). `dim` threads per threadgroup (dim <=
+//! 512, power of two), one template over the cache element type `T`,
+//! instantiated as `<name>` (half) and `<name>_bf16` (bfloat).
 //!
-//! `tq_compress_paged[_bf16]`: one threadgroup per (new KV slot, kv_head) —
+//! `tq_compress_paged[_bf16]`: one threadgroup per (KV slot, kv_head) —
 //! quantize the pool vector into packed uint32 codes + an f32 norm in the
-//! packed store, optionally writing the lossy dequant back into the pool.
+//! packed store, optionally writing the lossy dequant back into the pool. No
+//! tape binds it: the kernel tests fill packed stores with it, and hold the
+//! writers' encode to it bit for bit.
 //!
 //! Attention reads the packed store itself (attention.metal): decode through
 //! `attention_via_cache_v2`'s TurboQuant mode, prefill through the rotated-
@@ -30,6 +32,7 @@
 
 #include <metal_stdlib>
 #include "baked.h"
+#include "turboquant_encode.h"
 #include "turboquant_offset.h"
 using namespace metal;
 
@@ -49,25 +52,12 @@ SCRATCHY_CONSTANT(uint,  TQ_OFFSET_MODE,      10);
 SCRATCHY_CONSTANT(uint,  TQ_ROT_DIM,          11);
 SCRATCHY_CONSTANT(uint,  TQ_PAIR_OFF,         12);
 
-// Unnormalized Walsh-Hadamard transform of the `dim` floats in `shared`, one
-// element per thread. Threadgroup-uniform (every thread runs every barrier).
-inline void tq_wht_tg(threadgroup float* shared, uint dim, uint elem) {
-    for (uint h = 1; h < dim; h *= 2) {
-        uint blk = elem / (2 * h), off = elem % (2 * h);
-        if (off < h) { uint j = blk * 2 * h + off; float a = shared[j], b = shared[j + h]; shared[j] = a + b; shared[j + h] = a - b; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
-
-// tq_compress_paged: the production wiring kernel. For each (new KV slot,
-// kv_head), read the vector IN PLACE from the paged pool (chunk-table
-// addressing, identical to the attention kernels), remove its offset, quantize
-// it to packed codes + f32 norm written to the PACKED STORE (the canonical
-// ~4.6x-smaller cache), then dequant, restore the offset and write the lossy
-// vector back into the pool so the existing attention reads TurboQuant'd KV
-// (dequant-to-buffer; the pool IS the buffer). One threadgroup per
-// (slot, kv_head); dim threads. Dispatched post-forward over the new slots of
-// one layer's K (and again for V).
+// tq_compress_paged: for each (KV slot, kv_head), read the vector IN PLACE from
+// the paged pool (chunk-table addressing, identical to the attention kernels),
+// remove its offset, quantize it to packed codes + f32 norm written to the
+// PACKED STORE (the canonical ~4.6x-smaller cache), then (TQ_WRITEBACK) dequant,
+// restore the offset and write the lossy vector back into the pool. One
+// threadgroup per (slot, kv_head); dim threads.
 template <typename T>
 [[kernel]] void tq_compress_paged(
     device const uint64_t* chunk_table [[buffer(0)]],  // per-(tensor) chunk-addr table
@@ -109,48 +99,23 @@ template <typename T>
                                    (slot_raw & 0x80000000u) != 0u, elem);
 
     // ── quantize the in-place vector, offset removed ──
-    threadgroup float shared[512];
-    shared[elem] = (float)vec[elem] - off;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup float ns[512];
-    ns[elem] = shared[elem] * shared[elem];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = TQ_DIM / 2; stride > 0; stride >>= 1) {
-        if (elem < stride) ns[elem] += ns[elem + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float vec_norm = sqrt(ns[0]);
-    float safe_norm = max(vec_norm, 1e-8f);
-    shared[elem] = (shared[elem] / safe_norm) * signs[elem];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    tq_wht_tg(shared, TQ_DIM, elem);
-    float scaled = shared[elem];
-    uint idx = 0;
-    for (uint b = 0; b < TQ_CENTROIDS - 1; b++) if (scaled > boundaries[b]) idx++;
-
-    // ── pack codes + norm into the packed store ──
-    threadgroup uint idx_shared[512];
-    idx_shared[elem] = idx;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     // Index the persistent store by the PHYSICAL slot (token cache position),
     // so codes persist per token across steps — not by the dispatch index.
-    uint store_base = (logical_slot * TQ_NUM_KV_HEADS + kv_head) * TQ_PACKED_DIM;
-    uint word_idx = elem / TQ_VALS_PER_WORD, pos_in_word = elem % TQ_VALS_PER_WORD;
-    if (pos_in_word == 0 && word_idx < TQ_PACKED_DIM) {
-        uint word = 0;
-        for (uint i = 0; i < TQ_VALS_PER_WORD && (word_idx * TQ_VALS_PER_WORD + i) < TQ_DIM; i++)
-            word |= (idx_shared[word_idx * TQ_VALS_PER_WORD + i] & ((1u << TQ_BITS) - 1u)) << (i * TQ_BITS);
-        packed_store[store_base + word_idx] = word;
-    }
-    if (elem == 0) norms_store[logical_slot * TQ_NUM_KV_HEADS + kv_head] = vec_norm;
+    threadgroup float scratch[tq_encode_floats(1, TQ_DIM)];
+    threadgroup uint codes[TQ_DIM];
+    const uint store = logical_slot * TQ_NUM_KV_HEADS + kv_head;
+    const TqEncoded e = tq_encode<1>({(float)vec[elem] - off}, elem, TQ_DIM, TQ_BITS, TQ_VALS_PER_WORD,
+                                     TQ_PACKED_DIM, TQ_CENTROIDS, signs, boundaries,
+                                     {packed_store + store * TQ_PACKED_DIM}, {norms_store + store},
+                                     scratch, codes)[0];
 
     // ── dequant the codes back into the pool, offset restored ──
     if (TQ_WRITEBACK != 0u) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        shared[elem] = centroids[idx] * TQ_SCALE;
+        scratch[elem] = centroids[e.code] * TQ_SCALE;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        tq_wht_tg(shared, TQ_DIM, elem);
-        vec[elem] = (T)(shared[elem] * TQ_SCALE * signs[elem] * vec_norm + off);
+        tq_wht_tg(scratch, TQ_DIM, elem);
+        vec[elem] = (T)(scratch[elem] * TQ_SCALE * signs[elem] * e.norm + off);
     }
 }
 

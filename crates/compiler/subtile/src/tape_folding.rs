@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use crate::handoff::{LoweredDecode, SourceBinding};
 use crate::ops::SubOpKind;
-use crate::subtile_ir::{SubOp, SubtileIR, TensorId};
+use crate::subtile_ir::{KvOperand, SubOp, SubtileIR, TensorId};
 use crate::subtile_tape::{SlotId, SubtileTape};
 use crate::tape_colouring::FoldFacts;
 use crate::tape_steps::{Operand, OperandIx, StepPos, TapeReadError, read_steps};
@@ -140,6 +140,14 @@ pub enum FoldPattern<K: 'static> {
         tail: &'static [&'static [SubOpKind]; ROUTE_TAIL_STAGES],
         kernel: K,
     },
+    /// A KV `writer`'s codec encodes — the K and V `encode` steps the codec expanded it into, each
+    /// reading back rows the writer just wrote — fold into the writer, which encodes the rows it
+    /// holds. Apply it after the writer's own folds: it extends whatever command they made.
+    Encoded {
+        writer: SubOpKind,
+        encode: SubOpKind,
+        kernel: K,
+    },
 }
 
 /// The stages a routing fold's scores may pass through after the gather.
@@ -157,6 +165,7 @@ impl<K> FoldPattern<K> {
             Self::ExpertGated { act, .. } => *act,
             Self::ExpertCombined { combine, .. } => *combine,
             Self::Route { top_k, .. } => *top_k,
+            Self::Encoded { writer, .. } => *writer,
         }
     }
 }
@@ -228,6 +237,11 @@ pub enum FusedShape {
         gather: SlotId,
         tail: [Option<SlotId>; ROUTE_TAIL_STAGES],
     },
+    /// The writer's K and V encodes; the command is the writer's earlier fold's, extended.
+    Encoded {
+        k: SlotId,
+        v: SlotId,
+    },
 }
 
 /// A fold a step drives: the fused command it becomes, and what that command computes.
@@ -274,6 +288,11 @@ impl<K> TapeFolds<K> {
             Some(f) => StepRole::Drives(f),
             None => StepRole::Kept,
         }
+    }
+
+    /// Every fold `driver` drives, in the order they were applied.
+    pub fn driven(&self, driver: SlotId) -> &[Fusion<K>] {
+        self.fusions.get(&driver).map_or(&[], Vec::as_slice)
     }
 
     /// Every absorbed step, with the step whose fused command computes it.
@@ -617,6 +636,30 @@ impl<K: Copy> Folder<'_, K> {
                 kernel,
                 ..
             } => self.route(i, [sort, pre, gather], tail, kernel),
+            FoldPattern::Encoded { encode, kernel, .. } => {
+                self.encoded(i, encode, kernel);
+                Ok(())
+            }
+        }
+    }
+
+    /// `i`'s K and V `encode` steps — in the construct it was expanded into, not yet taken.
+    fn encoded(&mut self, i: usize, encode: SubOpKind, kernel: K) {
+        let expansion = &self.ops.lowered.op_expansion;
+        let Some(id) = expansion[i].map(|x| x.id) else {
+            return;
+        };
+        let of = |operand: KvOperand| {
+            (0..self.ops.slot.len()).find(|&j| {
+                self.ops.kind(j) == encode
+                    && expansion[j].map(|x| x.id) == Some(id)
+                    && matches!(self.ops.op(j), SubOp::KvEncode { operand: o } if *o == operand)
+                    && self.absorbed[j].is_none()
+            })
+        };
+        if let (Some(k), Some(v)) = (of(KvOperand::K), of(KvOperand::V)) {
+            let (ks, vs) = (self.ops.slot[k], self.ops.slot[v]);
+            self.absorb(i, &[k, v], kernel, FusedShape::Encoded { k: ks, v: vs });
         }
     }
 
@@ -943,6 +986,9 @@ impl<K: Copy> Folder<'_, K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{TURBOQUANT_SHAPED_CODEC, front_end_lowered, one_layer_input_shaped};
+    use crate::handoff::{Expansion, ExpansionId};
+    use crate::kv_codec::expand_kv_codec;
     use crate::lower::{ArchOp, GemmWeight, InputRef, LoweringInput, OpDesc};
     use crate::subtile_ir::{
         AttnMask, EwKind, GainConvention, RopeFormTag, RowScale, SourceShape, ValidatedGraph,
@@ -966,6 +1012,7 @@ mod tests {
         ExpertGated,
         ExpertCombined,
         Route,
+        Encoded,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -1036,6 +1083,11 @@ mod tests {
                     kernel: Kern::Route,
                 },
             ],
+            &[FoldPattern::Encoded {
+                writer: K::RopeAppend,
+                encode: K::KvEncode,
+                kernel: Kern::Encoded,
+            }],
         ]
     };
 
@@ -1102,6 +1154,15 @@ mod tests {
             norm_gain_add_tiles: Default::default(),
             op_expansion,
         };
+        fold_lowered(&lowered, table, model)
+    }
+
+    /// Fold `lowered`; returns the slot each op's step writes, and the folds.
+    fn fold_lowered(
+        lowered: &LoweredDecode,
+        table: &FusionTable<Kern>,
+        model: ModelFoldFacts,
+    ) -> (Vec<SlotId>, TapeFolds<Kern>) {
         let graph = lower_region(&lowered.input, std::num::NonZeroU32::MAX);
         let tape = lower_dag_to_tape(&ValidatedGraph::new(&graph).expect("a valid fixture"));
         let slots = tape
@@ -1112,7 +1173,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let folds = fold_tape(&graph, &tape, &lowered, table, model).expect("the fixture folds");
+        let folds = fold_tape(&graph, &tape, lowered, table, model).expect("the fixture folds");
         (slots, folds)
     }
 
@@ -1463,6 +1524,45 @@ mod tests {
         };
         let (s, f) = rope_fold(true, &V_NOT_READ);
         assert_eq!(f.role(s[10]), StepRole::Absorbed { into: s[11] });
+    }
+
+    /// A coded KV writer folds the codec's K and V encodes after it into the command its own
+    /// fold made — and only encodes of its own expansion.
+    #[test]
+    fn a_kv_writer_folds_its_own_codec_encodes_into_its_command() {
+        let mut input = one_layer_input_shaped(256, 64, 512, 64);
+        input.ops.iter_mut().for_each(|od| od.m = 1);
+        let lowered = front_end_lowered(input);
+        let mut l = expand_kv_codec(&lowered, &TURBOQUANT_SHAPED_CODEC).expect("expands");
+        let at = |name| l.input.ops.iter().position(|od| od.op.name() == name);
+        let (rotate, writer) = (at("RopeRotate").unwrap(), at("RopeAppend").unwrap());
+        let (k, v) = (writer + 1, writer + 2);
+        let (s, f) = fold_lowered(&l, &TABLE, SPLIT);
+        let paired = Fusion {
+            kernel: Kern::Rope,
+            shape: FusedShape::Sibling { sibling: s[rotate] },
+        };
+        let encoded = Fusion {
+            kernel: Kern::Encoded,
+            shape: FusedShape::Encoded { k: s[k], v: s[v] },
+        };
+        assert_eq!(f.driven(s[writer]), [paired, encoded]);
+        assert_eq!(f.role(s[writer]), StepRole::Drives(&encoded));
+        for e in [k, v] {
+            assert_eq!(f.role(s[e]), StepRole::Absorbed { into: s[writer] });
+        }
+
+        // A V encode some other construct expanded is not the writer's: neither encode folds.
+        let elsewhere = ExpansionId(u32::MAX);
+        l.op_expansion[v] = Some(Expansion {
+            id: elsewhere,
+            guard: None,
+        });
+        let (s, f) = fold_lowered(&l, &TABLE, SPLIT);
+        assert_eq!(f.driven(s[writer]), [paired]);
+        for e in [k, v] {
+            assert_eq!(f.role(s[e]), StepRole::Kept);
+        }
     }
 
     #[test]

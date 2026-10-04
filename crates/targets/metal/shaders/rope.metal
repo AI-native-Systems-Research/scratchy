@@ -14,6 +14,8 @@
 
 #include <metal_stdlib>
 #include "baked.h"
+#include "turboquant_encode.h"
+#include "turboquant_offset.h"
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -97,6 +99,56 @@ SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_ROPE_ON_READ, 9);
 constant bool ROPE_ROR_DEFINED = ROPE_ROPE_ON_READ_SET;
 constant uint ROPE_ROR = ROPE_ROR_DEFINED ? ROPE_ROPE_ON_READ : 0u;
 
+// TurboQuant, folded in (`MetalFusion::KvEncoded`): the threadgroup that writes a K/V row to the
+// pool also encodes it into the codec's packed store. Set: the codebook's bits; the packing and
+// each operand's offset (`TqOffset`) as the compress kernel takes them. Unset, the writers are
+// unchanged and hold no scratch for it.
+SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_BITS, 10);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_VALS_PER_WORD, 11);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_PACKED_DIM, 12);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_K_OFFSET, 13);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ROPE_TQ_V_OFFSET, 14);
+constant constexpr uint ROPE_TQ_FLOATS = ROPE_TQ_BITS_SET ? tq_encode_floats(2, ROPE_HEAD_DIM) : 1u;
+constant constexpr uint ROPE_TQ_CODES = ROPE_TQ_BITS_SET ? 2u * ROPE_HEAD_DIM : 1u;
+
+// The packed store a folded-in encode writes, by binding: the codebook (16, 17), K's codes and
+// norms (18, 19), V's (20, 21), and each operand's offset bias (22, 23) with the rotary table a
+// rotated K bias uses (24).
+#define ROPE_TQ_BUFFERS(T)                                                       \
+    device const float* tq_signs      [[buffer(16)]],                            \
+    device const float* tq_boundaries [[buffer(17)]],                            \
+    device       uint*  tq_packed_k   [[buffer(18)]],                            \
+    device       float* tq_norms_k    [[buffer(19)]],                            \
+    device       uint*  tq_packed_v   [[buffer(20)]],                            \
+    device       float* tq_norms_v    [[buffer(21)]],                            \
+    device const T*     tq_k_bias     [[buffer(22)]],                            \
+    device const T*     tq_v_bias     [[buffer(23)]],                            \
+    device const T*     tq_cos_sin    [[buffer(24)]],
+
+// Encode the row pair this owning threadgroup just wrote to the pool — element `d` of K and of V —
+// into the packed store at the token's slot, each operand's offset removed first: the same codes
+// `tq_compress_paged` makes of them read back from the pool, K's and V's encodes sharing every
+// barrier. Threadgroup-uniform.
+template <typename T>
+inline void rope_tq_encode(float k, float v, uint d, uint kv_head, uint slot_raw, uint pos,
+                           device const float* signs, device const float* boundaries,
+                           device uint* packed_k, device float* norms_k, device uint* packed_v,
+                           device float* norms_v, device const T* k_bias, device const T* v_bias,
+                           device const T* cos_sin, threadgroup float* scratch,
+                           threadgroup uint* codes) {
+    const uint dim = ROPE_HEAD_DIM;
+    const uint store = (slot_raw & 0x7FFFFFFFu) * ROPE_NUM_KV_HEADS + kv_head;
+    const bool unrotated = (slot_raw & 0x80000000u) != 0u;
+    const float k_off = tq_offset<T>(ROPE_TQ_K_OFFSET, k_bias + kv_head * dim, cos_sin, ROPE_ROT_DIM,
+                                     ROPE_PAIR_OFF, pos, unrotated, d);
+    const float v_off = tq_offset<T>(ROPE_TQ_V_OFFSET, v_bias + kv_head * dim, cos_sin, ROPE_ROT_DIM,
+                                     ROPE_PAIR_OFF, pos, unrotated, d);
+    tq_encode<2>({k - k_off, v - v_off}, d, dim, ROPE_TQ_BITS, ROPE_TQ_VALS_PER_WORD,
+                 ROPE_TQ_PACKED_DIM, 1u << ROPE_TQ_BITS, signs, boundaries,
+                 {packed_k + store * ROPE_TQ_PACKED_DIM, packed_v + store * ROPE_TQ_PACKED_DIM},
+                 {norms_k + store, norms_v + store}, scratch, codes);
+}
+
 #if SCRATCHY_COMPILES(rope_append_f16_specialized)
 kernel void rope_append_f16_specialized(
     device       half* q_inout      [[buffer(0)]],
@@ -107,6 +159,7 @@ kernel void rope_append_f16_specialized(
     device const uint* slot_mapping [[buffer(5)]],
     device const uint64_t* kv_cache_k [[buffer(6)]],
     device const uint64_t* kv_cache_v [[buffer(7)]],
+    ROPE_TQ_BUFFERS(half)
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -122,6 +175,8 @@ kernel void rope_append_f16_specialized(
     const uint group_r  = num_q / num_kv;
 
     if (q_head >= num_q || d >= head_dim) return;
+    threadgroup float tq_scratch[ROPE_TQ_FLOATS];
+    threadgroup uint  tq_codes[ROPE_TQ_CODES];
 
     // Spans: store this block's K UNROTATED so attention can re-rope it to
     // any reuse position. Uniform per TG (slot/block shared across d).
@@ -204,6 +259,11 @@ kernel void rope_append_f16_specialized(
     // through unchanged.
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
+    if (ROPE_TQ_BITS_SET) {
+        rope_tq_encode<half>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+                              tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
+                              tq_scratch, tq_codes);
+    }
 }
 #endif
 
@@ -221,6 +281,7 @@ kernel void rope_append_bf16_specialized(
     device const uint*   slot_mapping [[buffer(5)]],
     device const uint64_t* kv_cache_k [[buffer(6)]],
     device const uint64_t* kv_cache_v [[buffer(7)]],
+    ROPE_TQ_BUFFERS(bfloat)
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -236,6 +297,8 @@ kernel void rope_append_bf16_specialized(
     const uint group_r  = num_q / num_kv;
 
     if (q_head >= num_q || d >= head_dim) return;
+    threadgroup float tq_scratch[ROPE_TQ_FLOATS];
+    threadgroup uint  tq_codes[ROPE_TQ_CODES];
 
     // Spans: store this block's K UNROTATED (see the f16 sibling).
     // Spans: slot_mapping bit 31 = this slot's block is stored unrotated
@@ -305,6 +368,11 @@ kernel void rope_append_bf16_specialized(
 
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
+    if (ROPE_TQ_BITS_SET) {
+        rope_tq_encode<bfloat>(float(k_row[d]), float(v_row[d]), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+                              tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
+                              tq_scratch, tq_codes);
+    }
 }
 #endif
 
@@ -405,6 +473,7 @@ template <typename T_act, typename T_scale>
     device const uint64_t* kv_cache_v [[buffer(7)]],
     device const T_scale* q_gains    [[buffer(8)]],
     device const T_scale* k_gains    [[buffer(9)]],
+    ROPE_TQ_BUFFERS(T_act)
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -436,6 +505,8 @@ template <typename T_act, typename T_scale>
     threadgroup float scratch[256];
     threadgroup T_act q_tg[512];
     threadgroup T_act k_tg[512];
+    threadgroup float tq_scratch[ROPE_TQ_FLOATS];
+    threadgroup uint  tq_codes[ROPE_TQ_CODES];
 
     const uint pos = positions[t];
     device const T_act* cos_row = cos_sin + pos * rot_dim;
@@ -527,6 +598,11 @@ template <typename T_act, typename T_scale>
 
     k_dst[d] = k_tg[d];
     v_dst[d] = v_final;
+    if (ROPE_TQ_BITS_SET) {
+        rope_tq_encode<T_act>(float(k_tg[d]), float(v_final), d, kv_head, slot, pos, tq_signs, tq_boundaries, tq_packed_k,
+                              tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias, tq_v_bias, tq_cos_sin,
+                              tq_scratch, tq_codes);
+    }
 }
 
 #define INST_ROPE_APPEND_NORMED(act_tag, act_type, scale_tag, scale_type) \

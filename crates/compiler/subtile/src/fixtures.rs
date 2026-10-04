@@ -5,8 +5,15 @@
 //! These are test/dev fixtures only — production wiring derives
 //! `LoweringInput` directly from a solved decode FUF via the proc-macro.
 
+use std::collections::HashMap;
+
+use crate::handoff::{LoweredDecode, SourceBinding};
+use crate::kv_codec::CodecGuard::{Codec, CodecDecode, CodecNotDecode, UnlessCodecDecode};
+use crate::kv_codec::{After, Before, CodecAround, CodecHeadDims, Guarded, KvCodecFacts};
 use crate::lower::{InputRef, LoweringInput, OpDesc};
-use crate::subtile_ir::{AttnMask, EwKind, GainConvention, RopeFormTag, SourceShape, SubOp};
+use crate::subtile_ir::{
+    AttnMask, EwKind, GainConvention, KvOperand, RopeFormTag, SourceShape, SubOp,
+};
 use ktir_superdsc::head_counts::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
@@ -547,6 +554,71 @@ pub fn gemm_m1_only_input() -> LoweringInput {
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
         }],
         result: 0,
+    }
+}
+
+/// A codec shaped like metal's TurboQuant.
+pub const TURBOQUANT_SHAPED_CODEC: KvCodecFacts = KvCodecFacts {
+    head_dims: CodecHeadDims::PowerOfTwoAtMost(512),
+    hybrid_class: AttnMask::Causal,
+    after_writer: &[
+        Guarded {
+            step: KvOperand::K,
+            guard: Codec,
+        },
+        Guarded {
+            step: KvOperand::V,
+            guard: Codec,
+        },
+    ],
+    decode: CodecAround {
+        before: &[],
+        anchor: UnlessCodecDecode,
+        after: &[Guarded {
+            step: After::PackedTwin,
+            guard: CodecDecode,
+        }],
+    },
+    prefill: CodecAround {
+        before: &[
+            Guarded {
+                step: Before::Stage(KvOperand::K),
+                guard: CodecNotDecode,
+            },
+            Guarded {
+                step: Before::Stage(KvOperand::V),
+                guard: CodecNotDecode,
+            },
+            Guarded {
+                step: Before::RotateQuery,
+                guard: CodecNotDecode,
+            },
+        ],
+        anchor: UnlessCodecDecode,
+        after: &[
+            Guarded {
+                step: After::RotateOutput,
+                guard: CodecNotDecode,
+            },
+            Guarded {
+                step: After::PackedTwin,
+                guard: CodecDecode,
+            },
+        ],
+    },
+};
+
+/// `input` as the front end hands it over: op `i` realizes tile `i`, nothing expanded.
+pub fn front_end_lowered(input: LoweringInput) -> LoweredDecode {
+    let n = input.ops.len();
+    LoweredDecode {
+        bindings: (0..input.sources.len() as u32)
+            .map(|id| SourceBinding::Weight { id, index: None })
+            .collect(),
+        op_tiles: (0..n as u32).map(|t| Some((t, 0))).collect(),
+        norm_gain_add_tiles: HashMap::from([(0, 100)]),
+        op_expansion: vec![None; n],
+        input,
     }
 }
 

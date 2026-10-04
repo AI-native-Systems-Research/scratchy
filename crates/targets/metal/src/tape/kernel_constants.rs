@@ -186,6 +186,34 @@ pub struct RopeAppendNormedConstants {
     /// for blocks flagged unrotated (store normed-but-unrotated). `None`
     /// → byte-identical emitted Vec (rope.metal folds the gate away).
     pub rope_on_read: Option<u32>,
+    /// The TurboQuant encode folded in (slots 10..=14), if the writer writes the packed store.
+    pub tq: Option<RopeTqConstants>,
+}
+
+/// A KV writer's folded-in TurboQuant encode (`rope.metal`'s `ROPE_TQ_*`): the codebook's bits,
+/// the packing from them as [`TqCompressConstants`] takes it, and each operand's offset.
+#[derive(Clone, Copy)]
+pub struct RopeTqConstants {
+    pub bits: TqCodeBits,
+    pub k_offset: TqOffset,
+    pub v_offset: TqOffset,
+}
+
+impl RopeTqConstants {
+    fn push(tq: Option<Self>, head_dim: HeadDim, v: &mut Vec<ConstantValue>) {
+        use scratchy_layers::turboquant::{packed_dim, vals_per_word};
+        let Some(t) = tq else {
+            return;
+        };
+        let (dim, bits) = (head_dim.get() as usize, t.bits.get());
+        v.extend([
+            ConstantValue::uint(ConstSlot(10), bits),
+            ConstantValue::uint(ConstSlot(11), vals_per_word(bits) as u32),
+            ConstantValue::uint(ConstSlot(12), packed_dim(dim, bits) as u32),
+            ConstantValue::uint(ConstSlot(13), t.k_offset as u32),
+            ConstantValue::uint(ConstSlot(14), t.v_offset as u32),
+        ]);
+    }
 }
 
 impl From<RopeAppendNormedConstants> for Vec<ConstantValue> {
@@ -204,6 +232,7 @@ impl From<RopeAppendNormedConstants> for Vec<ConstantValue> {
         if let Some(ror) = c.rope_on_read {
             v.push(ConstantValue::uint(ConstSlot(9), ror));
         }
+        RopeTqConstants::push(c.tq, c.head_dim, &mut v);
         v
     }
 }
@@ -223,6 +252,8 @@ pub struct RopeAppendConstants {
     pub pair_off: RopePairOff,
     /// Spans rope-on-read (slot 9): see [`RopeAppendNormedConstants`].
     pub rope_on_read: Option<u32>,
+    /// The TurboQuant encode folded in: see [`RopeAppendNormedConstants`].
+    pub tq: Option<RopeTqConstants>,
 }
 
 impl From<RopeAppendConstants> for Vec<ConstantValue> {
@@ -239,6 +270,7 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
         if let Some(ror) = c.rope_on_read {
             v.push(ConstantValue::uint(ConstSlot(9), ror));
         }
+        RopeTqConstants::push(c.tq, c.head_dim, &mut v);
         v
     }
 }
@@ -371,9 +403,9 @@ impl From<TqStageConstants> for Vec<ConstantValue> {
     }
 }
 
-/// `KernelId::TqQuantizeToPacked` (`tq_compress_paged[_bf16]`, turboquant.metal): the KV
-/// geometry of the layer it quantizes, the codebook width (and from it the packing), and the
-/// offset it removes first.
+/// `tq_compress_paged[_bf16]` (turboquant.metal), the standalone encode the kernel tests fill
+/// packed stores with: the KV geometry of the layer it quantizes, the codebook width (and from it
+/// the packing), and the offset it removes first.
 pub struct TqCompressConstants {
     pub head_dim: HeadDim,
     pub bits: TqCodeBits,
