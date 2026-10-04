@@ -111,6 +111,22 @@ pub enum FoldPattern<K: 'static> {
         norm: SubOpKind,
         kernel: K,
     },
+    /// `act(gate, up)` over expert rows: the gate and up `matmul`s (the activation's operands 0
+    /// and 1), each read by the activation alone, fold into it.
+    ExpertGated {
+        act: SubOpKind,
+        matmul: SubOpKind,
+        kernel: K,
+    },
+    /// `combine(unsort(matmul(..)), scores)`: the unsort (the combine's operand 0) and the
+    /// `matmul` whose rows it unsorts (its operand 0), each read by the next alone, fold into the
+    /// combine.
+    ExpertCombined {
+        combine: SubOpKind,
+        unsort: SubOpKind,
+        matmul: SubOpKind,
+        kernel: K,
+    },
 }
 
 impl<K> FoldPattern<K> {
@@ -122,6 +138,8 @@ impl<K> FoldPattern<K> {
             Self::Gated { mul, .. } => *mul,
             Self::NormedRope { rope, .. } => *rope,
             Self::NormAddScale { scale, .. } => *scale,
+            Self::ExpertGated { act, .. } => *act,
+            Self::ExpertCombined { combine, .. } => *combine,
         }
     }
 }
@@ -177,6 +195,14 @@ pub enum FusedShape {
         residual: StepOperand,
         gain: StepOperand,
         scale: StepOperand,
+    },
+    ExpertGated {
+        gate: SlotId,
+        up: SlotId,
+    },
+    ExpertCombined {
+        unsort: SlotId,
+        down: SlotId,
     },
 }
 
@@ -530,7 +556,52 @@ impl<K: Copy> Folder<'_, K> {
             FoldPattern::NormAddScale {
                 add, norm, kernel, ..
             } => self.norm_add_scale(i, add, norm, kernel),
+            FoldPattern::ExpertGated { matmul, kernel, .. } => {
+                let gate = self.sole_producer(i, 0, matmul)?;
+                let up = self.sole_producer(i, 1, matmul)?;
+                if let (Some(g), Some(u)) = (gate, up) {
+                    let (gate, up) = (self.ops.slot[g], self.ops.slot[u]);
+                    self.absorb(i, &[g, u], kernel, FusedShape::ExpertGated { gate, up });
+                }
+                Ok(())
+            }
+            FoldPattern::ExpertCombined {
+                unsort,
+                matmul,
+                kernel,
+                ..
+            } => {
+                let Some(un) = self.sole_producer(i, 0, unsort)? else {
+                    return Ok(());
+                };
+                if let Some(d) = self.sole_producer(un, 0, matmul)? {
+                    let (unsort, down) = (self.ops.slot[un], self.ops.slot[d]);
+                    self.absorb(
+                        i,
+                        &[un, d],
+                        kernel,
+                        FusedShape::ExpertCombined { unsort, down },
+                    );
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// The `kind` step producing `j`'s operand `k`, when nothing else reads it and no fold took it.
+    fn sole_producer(&self, j: usize, k: u8, kind: SubOpKind) -> Result<Option<usize>, FoldError> {
+        let p = self.ops.in_op(j, k)?;
+        Ok(p.filter(|&p| {
+            self.ops.kind(p) == kind && self.consumers[p] == 1 && self.absorbed[p].is_none()
+        }))
+    }
+
+    /// `i` drives `kernel`, computing `ops` inside it.
+    fn absorb(&mut self, i: usize, ops: &[usize], kernel: K, shape: FusedShape) {
+        for &j in ops {
+            self.absorbed[j] = Some(i);
+        }
+        self.record(i, kernel, shape);
     }
 
     fn record(&mut self, i: usize, kernel: K, shape: FusedShape) {
@@ -799,6 +870,8 @@ mod tests {
         GeluFused,
         NormedRope,
         NormAddScale,
+        ExpertGated,
+        ExpertCombined,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -844,6 +917,17 @@ mod tests {
                     add: K::Add,
                     norm: K::RmsNorm,
                     kernel: Kern::NormAddScale,
+                },
+                FoldPattern::ExpertGated {
+                    act: K::ExpertGatedAct,
+                    matmul: K::ExpertMatmul,
+                    kernel: Kern::ExpertGated,
+                },
+                FoldPattern::ExpertCombined {
+                    combine: K::ExpertCombine,
+                    unsort: K::ExpertUnsort,
+                    matmul: K::ExpertMatmul,
+                    kernel: Kern::ExpertCombined,
                 },
             ],
         ]
@@ -952,6 +1036,78 @@ mod tests {
             shape: FusedShape::ResidualNorm { add: s[2] },
         };
         assert_eq!(f.role(s[4]), StepRole::Drives(&residual));
+    }
+
+    #[test]
+    fn expert_projections_fold_into_their_activation_and_combine_only_when_read_once() {
+        use crate::lower::ExpertQuant;
+        use crate::subtile_ir::{ExpertBundle, ExpertProj, GatedAct, SharedExpertBound, TopK};
+        let matmul = |proj, n, inputs| {
+            let k = TopK::new(std::num::NonZeroU32::new(2).expect("two experts"));
+            let quant = ExpertQuant::declared(64, 4);
+            let bundle = ExpertBundle::SwitchGlu;
+            op(
+                SubOp::ExpertMatmul {
+                    proj,
+                    n,
+                    k,
+                    quant,
+                    bundle,
+                },
+                1,
+                inputs,
+            )
+        };
+        let ops = |gate_read_again: bool| {
+            let (gate, up, down) = (ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down);
+            let act = SubOp::ExpertGatedAct {
+                act: GatedAct::Gelu,
+            };
+            let combine = SubOp::ExpertCombine {
+                hidden: 64,
+                shared: SharedExpertBound(None),
+            };
+            let mut v = vec![
+                matmul(gate, 32, vec![Ext(0), Ext(1), Ext(2)]),
+                matmul(up, 32, vec![Ext(0), Ext(1), Ext(3)]),
+                op(act, 1, vec![Op(0), Op(1)]),
+                matmul(down, 64, vec![Op(2), Ext(1), Ext(4)]),
+                op(SubOp::ExpertUnsort, 1, vec![Op(3), Ext(1)]),
+                op(combine, 1, vec![Op(4), Ext(5)]),
+            ];
+            if gate_read_again {
+                v.push(op(ADD, 1, vec![Op(5), Op(0)]));
+            }
+            v
+        };
+        let src = [(1, 64), (1, 2), (32, 64), (32, 64), (64, 32), (1, 2)];
+        let (s, f) = fold(&src, weights(6), ops(false), &[], &TABLE, SPLIT);
+        assert_eq!(
+            f.absorbed().collect::<Vec<_>>(),
+            [(s[0], s[2]), (s[1], s[2]), (s[3], s[5]), (s[4], s[5])]
+        );
+        let gated = Fusion {
+            kernel: Kern::ExpertGated,
+            shape: FusedShape::ExpertGated {
+                gate: s[0],
+                up: s[1],
+            },
+        };
+        let combined = Fusion {
+            kernel: Kern::ExpertCombined,
+            shape: FusedShape::ExpertCombined {
+                unsort: s[4],
+                down: s[3],
+            },
+        };
+        assert_eq!(f.role(s[2]), StepRole::Drives(&gated));
+        assert_eq!(f.role(s[5]), StepRole::Drives(&combined));
+        // A gate another step reads stays its own step, and so does the up it pairs with.
+        let (s, f) = fold(&src, weights(6), ops(true), &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+        assert_eq!(f.role(s[1]), StepRole::Kept);
+        assert_eq!(f.role(s[2]), StepRole::Kept);
+        assert_eq!(f.role(s[5]), StepRole::Drives(&combined));
     }
 
     #[test]

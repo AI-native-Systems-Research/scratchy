@@ -341,6 +341,17 @@ pub enum KernelId {
     /// bindings + dispatch as [`KernelId::AffineGatherQmvFast`].
     /// Symbol: `affine_gather_qmv_<dtype>_s_<sdtype>_gs_<gs>_b_4`.
     AffineGatherQmv,
+    /// A gathered MoE bake's gate and up expert matvecs and `act(gate) * up`, in one command.
+    /// Bindings: gate `(w @ 0, scales @ 1, biases @ 2)`, `x @ 3`, `rhs_indices @ 4`, gate rows
+    /// `@ 5` (left holding the activation), up `(w @ 6, scales @ 7, biases @ 8)`, up rows `@ 9`
+    /// (`AffineGatedQmvConstants`). Dispatch `(1, N/8, num_tokens*top_k)` × `(32, 4, 1)`. Symbol:
+    /// `affine_gather_qmv_gated[_fast]_<dtype>_s_<sdtype>_gs_<gs>_b_<bits>`.
+    MoeGateUpAct,
+    /// A gathered MoE bake's down expert matvecs and the weighted combine, in one command.
+    /// Bindings: `(w @ 0, scales @ 1, biases @ 2, x @ 3, rhs_indices @ 4)`, pair rows `@ 5`,
+    /// `scores @ 6`, `out @ 7` (`AffineCombineQmvConstants`). Dispatch `(1, N/4, num_tokens)` ×
+    /// `(32, top_k, 1)`. Symbol: `affine_gather_qmv_combine[_fast]_<dtype>_s_<sdtype>_gs_<gs>_b_<bits>`.
+    MoeDownCombine,
     /// `out[n, d] = Σ_k expert[n, k, d] * scores[n, k]` — the final
     /// MoE reduction. Function-constant specialization on top_k
     /// (constant 0) and hidden (constant 1). Bindings:
@@ -521,6 +532,8 @@ impl KernelId {
             | Self::SliceTrailingColsU32
             | Self::AffineGatherQmvFast
             | Self::AffineGatherQmv
+            | Self::MoeGateUpAct
+            | Self::MoeDownCombine
             | Self::MoeWeightedSum
             | Self::MoeGroupOffsets
             | Self::MoeGroupInit

@@ -415,6 +415,8 @@ mod tests {
             | KernelId::SliceTrailingColsU32
             | KernelId::AffineGatherQmvFast
             | KernelId::AffineGatherQmv
+            | KernelId::MoeGateUpAct
+            | KernelId::MoeDownCombine
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets
@@ -574,6 +576,8 @@ mod tests {
             | KernelId::SliceTrailingColsU32
             | KernelId::AffineGatherQmvFast
             | KernelId::AffineGatherQmv
+            | KernelId::MoeGateUpAct
+            | KernelId::MoeDownCombine
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets

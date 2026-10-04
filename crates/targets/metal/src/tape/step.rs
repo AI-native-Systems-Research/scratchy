@@ -335,14 +335,30 @@ pub enum MoeStep {
     ExpertScale(LayerId),
     /// `(x)`: the pair rows sorted by expert — no command when the bake gathers.
     Sort(Slot),
-    /// `(rows, layer, projection, group_size, width)`: one expert projection.
-    ExpertMatmul(MoeRows, LayerId, ExpertProj, AffineGroupSize, ExpertWidth),
+    /// One expert projection.
+    ExpertMatmul(ExpertMatmul),
     /// `act(gate) * up`, in place on the gate rows.
     GatedAct(GatedAct),
     /// The pair rows back in token order — no command when the bake gathers.
     Unsort,
     /// `(out)`: each token's pair rows summed by its scores.
     Combine(Slot),
+    /// `(gate, up width, act)`: the gate and up projections and `act(gate) * up` — the up reads
+    /// the gate's rows, layer and group size.
+    GateUpAct(ExpertMatmul, ExpertWidth, GatedAct),
+    /// `(down, out)`: the down projection, the unsort and the combine into `out`.
+    DownCombine(ExpertMatmul, Slot),
+}
+
+/// One expert projection: its `rows` times the layer's `proj` experts, packed `width` wide in
+/// groups of `group_size`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertMatmul {
+    pub rows: MoeRows,
+    pub layer: LayerId,
+    pub proj: ExpertProj,
+    pub group_size: AffineGroupSize,
+    pub width: ExpertWidth,
 }
 
 impl MetalStep {
@@ -395,7 +411,9 @@ impl MetalStep {
                 MoeStep::RouterNorm(_, l, _)
                 | MoeStep::RouterLogits(_, l)
                 | MoeStep::ExpertScale(l)
-                | MoeStep::ExpertMatmul(_, l, ..),
+                | MoeStep::ExpertMatmul(ExpertMatmul { layer: l, .. })
+                | MoeStep::GateUpAct(ExpertMatmul { layer: l, .. }, ..)
+                | MoeStep::DownCombine(ExpertMatmul { layer: l, .. }, _),
             ) => Some(l),
             S::Embed(..)
             | S::AffineEmbed(..)

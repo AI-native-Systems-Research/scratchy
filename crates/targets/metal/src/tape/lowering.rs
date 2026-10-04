@@ -21,11 +21,11 @@ use crate::tape::ids::SourceIx;
 use crate::tape::kernel_bindings::{CosSinTable, source};
 use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
-    AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertProj,
-    GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets, KvOperand,
-    LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores, MoeStep, NDim,
-    QmvBatchLimit, RopeFormTag, RotaryTables, RotatedRows, RouterInput, RowSource, RowsDivisor,
-    RowsPerToken, SampleRowsStep, Scale, StepRow,
+    AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
+    ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
+    KvOperand, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores, MoeStep,
+    NDim, QmvBatchLimit, RopeFormTag, RotaryTables, RotatedRows, RouterInput, RowSource,
+    RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
@@ -5704,34 +5704,45 @@ fn scale_infix(s: ScaleDtype) -> &'static str {
     }
 }
 
-fn affine_gather_qmv_symbol(
+/// The gather-matvec kernels of `quantized_qmv.metal`, by what each computes past its matvecs.
+#[derive(Clone, Copy)]
+enum GatherQmv {
+    Plain,
+    GateUpAct,
+    DownCombine,
+}
+
+fn affine_gather_qmv_kernel(
+    kernel: GatherQmv,
     n_out: u32,
     k_in: u32,
     dtype: DequantDtype,
     scale_dtype: ScaleDtype,
     group_size: u32,
     bits: u32,
-) -> &'static str {
+) -> (KernelId, &'static str) {
     assert!(
         matches!(group_size, 32 | 64 | 128),
-        "affine_gather_qmv_symbol: unsupported group_size={group_size} — only 32/64/128 instantiated"
+        "affine_gather_qmv_kernel: unsupported group_size={group_size} — only 32/64/128 instantiated"
     );
     assert!(
         matches!(bits, 4 | 8),
-        "affine_gather_qmv_symbol: unsupported bits={bits} — only 4/8 instantiated"
+        "affine_gather_qmv_kernel: unsupported bits={bits} — only 4/8 instantiated"
     );
     // MLX-native mixed/dynamic quant (OptiQ) ships 8-bit experts on the
     // sensitive edge layers; the `_b_{bits}` suffix selects the matching
     // gather-qmv monomorphization.
-    let fast = if n_out.is_multiple_of(8) && k_in.is_multiple_of(512) {
-        "_fast"
-    } else {
-        ""
+    let fast = n_out.is_multiple_of(8) && k_in.is_multiple_of(512);
+    let (id, name) = match kernel {
+        GatherQmv::Plain if fast => (KernelId::AffineGatherQmvFast, "affine_gather_qmv"),
+        GatherQmv::Plain => (KernelId::AffineGatherQmv, "affine_gather_qmv"),
+        GatherQmv::GateUpAct => (KernelId::MoeGateUpAct, "affine_gather_qmv_gated"),
+        GatherQmv::DownCombine => (KernelId::MoeDownCombine, "affine_gather_qmv_combine"),
     };
+    let fast = if fast { "_fast" } else { "" };
     let (d, s) = (dequant_infix(dtype), scale_infix(scale_dtype));
-    leak_symbol(format!(
-        "affine_gather_qmv{fast}_{d}_s_{s}_gs_{group_size}_b_{bits}"
-    ))
+    let symbol = format!("{name}{fast}_{d}_s_{s}_gs_{group_size}_b_{bits}");
+    (id, leak_symbol(symbol))
 }
 
 /// Symbol for the MoE grouped expert GEMM (`affine_gather_qmm_t_kernel`,
@@ -5925,8 +5936,9 @@ fn lower_moe_step(
     moe_scratch_bytes: &mut u32,
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
     use super::kernel_constants::{
-        AffineGatherQmvConstants, AffineQmvConstants, ArgsortConstants, GatherRows,
-        MoeTopKConstants, ScoresRow, SoftmaxConstants,
+        AffineCombineQmvConstants, AffineGatedQmvConstants, AffineGatherQmvConstants,
+        AffineQmvConstants, ArgsortConstants, GatherRows, MoeTopKConstants, ScoresRow,
+        SoftmaxConstants,
     };
     use crate::tape::lowered::{MScaleAxis as A, MScaling};
     use ConstantValue as C;
@@ -5975,6 +5987,34 @@ fn lower_moe_step(
         top_k: b.top_k,
     };
     let router = || w.of(b.router.weight_kind(), 0);
+    // An expert projection's `[weight, scales, biases]`, bound at `first..first + 3`.
+    let expert_weights = |proj, l: LayerId, first: u8| -> Result<[Binding; 3], LoweringError> {
+        let (ix, lw) = (w.of(b.bundle.weight_kind(), 0)?, layer(&l));
+        let [tw, ts, tb] = crate::op_abi::expert_tensors(proj);
+        let at = |t, i| source(ix, t, lw, first + i);
+        Ok([at(tw, 0), at(ts, 1), at(tb, 2)])
+    };
+    let qmv = |n_out: u32, k_in: u32, codes| AffineQmvConstants {
+        k: super::ids::KDimI32(k_in as i32),
+        n: super::ids::NDimI32(n_out as i32),
+        codes,
+    };
+    // Token rows are read once per chosen expert; pair rows once.
+    let rows_read = |rows| match rows {
+        MoeRows::Tokens(_) => GatherRows::Tokens(b.top_k),
+        MoeRows::Scratch(_) => GatherRows::Pairs,
+    };
+    let gather_kernel = |kernel, n_out, k_in, gs, bits| {
+        affine_gather_qmv_kernel(kernel, n_out, k_in, dtype, scale_dtype, gs, bits)
+    };
+    // The commands of each of `steps`, in order.
+    let each_step = |steps: &[MoeStep], bytes: &mut u32| {
+        let mut commands = Vec::new();
+        for &step in steps {
+            commands.extend(lower_moe_step(p, b, step, w, at, bytes)?);
+        }
+        Ok::<_, LoweringError>(commands)
+    };
     Ok(match step {
         // Plain RMSNorm by the router gain: Gemma's `(1 + w)` offset does not apply to it.
         S::RouterNorm(Slot(x), l, eps) => vec![LoweredCommand {
@@ -6215,7 +6255,13 @@ fn lower_moe_step(
                 .collect()
         }
         S::Sort(_) => vec![],
-        S::ExpertMatmul(rows, l, proj, AffineGroupSize(gs), width) => {
+        S::ExpertMatmul(ExpertMatmul {
+            rows,
+            layer: l,
+            proj,
+            group_size: AffineGroupSize(gs),
+            width,
+        }) => {
             let (n_out, k_in) = match proj {
                 ExpertProj::Down => (hidden, inter),
                 ExpertProj::Gate | ExpertProj::Up => (inter, hidden),
@@ -6225,14 +6271,7 @@ fn lower_moe_step(
                 ExpertProj::Up => R::ExpertUp,
                 ExpertProj::Down => R::ExpertDown,
             };
-            let ix = w.of(b.bundle.weight_kind(), 0)?;
-            let [tw, ts, tb] = crate::op_abi::expert_tensors(proj);
-            let lw = layer(&l);
-            let weights = [
-                source(ix, tw, lw, 0),
-                source(ix, ts, lw, 1),
-                source(ix, tb, lw, 2),
-            ];
+            let weights = expert_weights(proj, l, 0)?;
             let bits = width.bits().0;
             let codes = at.codes.for_bits(bits);
             let dims: Vec<ConstantValue> = [C::int(0, k_in as i32), C::int(1, n_out as i32)]
@@ -6325,31 +6364,84 @@ fn lower_moe_step(
                     bindings,
                 )]
             } else {
-                // Token rows are read once per chosen expert; pair rows once.
-                let rows_read = match rows {
-                    MoeRows::Tokens(_) => GatherRows::Tokens(b.top_k),
-                    MoeRows::Scratch(_) => GatherRows::Pairs,
-                };
-                let symbol = affine_gather_qmv_symbol(n_out, k_in, dtype, scale_dtype, gs, bits);
-                let kernel = match symbol.contains("_fast_") {
-                    true => KernelId::AffineGatherQmvFast,
-                    false => KernelId::AffineGatherQmv,
-                };
+                let (kernel, symbol) = gather_kernel(GatherQmv::Plain, n_out, k_in, gs, bits);
                 let mut bindings = weights.to_vec();
                 let (x, indices) = (rows_of(&s, 3, rows), s.at(4, R::TopKIndices));
                 bindings.extend([x, indices, s.at(5, out)]);
                 let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), ms(A::Z));
                 let qmv = AffineGatherQmvConstants {
-                    qmv: AffineQmvConstants {
-                        k: super::ids::KDimI32(k_in as i32),
-                        n: super::ids::NDimI32(n_out as i32),
-                        codes,
-                    },
-                    rows: rows_read,
+                    qmv: qmv(n_out, k_in, codes),
+                    rows: rows_read(rows),
                 }
                 .into();
                 vec![cmd(kernel, "quantized_qmv", symbol, qmv, shape, bindings)]
             }
+        }
+        // Gathered: one command runs the gate and up matvecs of every pair and then
+        // `act(gate) * up` over the rows each threadgroup wrote. A width with a 1-3 row tail would
+        // have a threadgroup rewrite rows another one activates, and two widths need two kernels:
+        // those, and a grouped bake, run each step's own commands.
+        S::GateUpAct(gate, up_width, act)
+            if s.grouped || up_width != gate.width || !inter.is_multiple_of(4) =>
+        {
+            let up = ExpertMatmul {
+                proj: ExpertProj::Up,
+                width: up_width,
+                ..gate
+            };
+            let steps = [S::ExpertMatmul(gate), S::ExpertMatmul(up), S::GatedAct(act)];
+            each_step(&steps, moe_scratch_bytes)?
+        }
+        S::GateUpAct(gate, _, act) => {
+            let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
+            let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
+            let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
+            let (x, indices) = (rows_of(&s, 3, gate.rows), s.at(4, R::TopKIndices));
+            bindings.extend([x, indices, s.at(5, R::ExpertGate)]);
+            bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
+            bindings.push(s.at(9, R::ExpertUp));
+            let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), ms(A::Z));
+            let gather = AffineGatherQmvConstants {
+                qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
+                rows: rows_read(gate.rows),
+            };
+            let constants = AffineGatedQmvConstants { gather, act }.into();
+            vec![cmd(
+                kernel,
+                "quantized_qmv",
+                symbol,
+                constants,
+                shape,
+                bindings,
+            )]
+        }
+        // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
+        // and combines those rows. A grouped bake runs each step's own commands.
+        S::DownCombine(down, out) if s.grouped || matches!(down.rows, MoeRows::Tokens(_)) => {
+            let steps = [S::ExpertMatmul(down), S::Unsort, S::Combine(out)];
+            each_step(&steps, moe_scratch_bytes)?
+        }
+        S::DownCombine(down, Slot(out)) => {
+            let (AffineGroupSize(gs), bits) = (down.group_size, down.width.bits().0);
+            let (kernel, symbol) = gather_kernel(GatherQmv::DownCombine, hidden, inter, gs, bits);
+            let mut bindings = expert_weights(ExpertProj::Down, down.layer, 0)?.to_vec();
+            let (x, indices) = (rows_of(&s, 3, down.rows), s.at(4, R::TopKIndices));
+            bindings.extend([x, indices, s.at(5, R::ExpertDown)]);
+            bindings.extend([s.at(6, R::TopKScores), arena_at(7, out)]);
+            let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
+            let constants = AffineCombineQmvConstants {
+                qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
+                top_k: b.top_k,
+            }
+            .into();
+            vec![cmd(
+                kernel,
+                "quantized_qmv",
+                symbol,
+                constants,
+                shape,
+                bindings,
+            )]
         }
         // `out = act(gate) * up`, written over the gate rows; the grouped bake runs every
         // padded row.

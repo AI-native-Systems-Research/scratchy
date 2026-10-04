@@ -23,6 +23,7 @@
 
 #include <metal_stdlib>
 #include "baked.h"
+#include "gated_act.h"
 
 using namespace metal;
 
@@ -38,12 +39,7 @@ template <typename T>
   if (gid >= SILU_MUL_N) {
     return;
   }
-  // SiLU(x) = x / (1 + exp(-x)) — kept in float so the denormalized
-  // tail of the half/bfloat exp() stays representable.
-  float g = float(gate[gid]);
-  float u = float(up[gid]);
-  float silu_g = g / (1.0f + exp(-g));
-  out[gid] = static_cast<T>(silu_g * u);
+  out[gid] = static_cast<T>(silu_mul_f(float(gate[gid]), float(up[gid])));
 }
 
 #define INST_SILU_MUL(dtype_tag, mtl_type) \
@@ -55,10 +51,7 @@ INST_SILU_MUL(bf16, bfloat)
 // GELU (tanh approximation) sibling for the decomposed GeGLU q-MLP
 // path (Gemma2/3/4: `gelu_pytorch_tanh(gate) * up`). Same three
 // instructions as the SwiGLU decomposition, with `GeluMul` as the
-// elementwise tail. Formula matches `gelu_approx` in
-// `fused_gate_up_silu_mul.metal` and mlx `nn.gelu_approx`:
-//   GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 x³)))
-// Float accumulator throughout (the tanh argument overflows half).
+// elementwise tail.
 template <typename T>
 [[kernel]] void gelu_mul(
     device       T* out  [[buffer(0)]],
@@ -69,19 +62,7 @@ template <typename T>
   if (gid >= SILU_MUL_N) {
     return;
   }
-  float g = float(gate[gid]);
-  float u = float(up[gid]);
-  const float sqrt_2_over_pi = 0.7978845608f;
-  const float coeff = 0.044715f;
-  // Clamp the tanh argument: Metal's fast-math tanh computes
-  // (exp(2x)-1)/(exp(2x)+1), which is inf/inf = NaN once 2x
-  // overflows exp (|x| ≳ 44 — i.e. ANY gate ≥ ~10.06; Gemma4 layer-0
-  // gates reach 57.5). tanh(15) rounds to exactly 1.0f, so the clamp
-  // is bit-exact vs a saturating tanh. Same fix as activation.metal.
-  float inner = clamp(
-      sqrt_2_over_pi * (g + coeff * g * g * g), -15.0f, 15.0f);
-  float gelu_g = 0.5f * g * (1.0f + tanh(inner));
-  out[gid] = static_cast<T>(gelu_g * u);
+  out[gid] = static_cast<T>(gelu_mul_f(float(gate[gid]), float(up[gid])));
 }
 
 #define INST_GELU_MUL(dtype_tag, mtl_type) \

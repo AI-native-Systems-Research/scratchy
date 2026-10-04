@@ -643,6 +643,42 @@ impl From<AffineGatherQmvConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::MoeGateUpAct` (`affine_gather_qmv_gated[_fast]_*`): the gate projection's
+/// [`AffineGatherQmvConstants`] (the up's are the same) and the activation (slot 3: 0 SiLU,
+/// 1 GELU).
+pub struct AffineGatedQmvConstants {
+    pub gather: AffineGatherQmvConstants,
+    pub act: crate::tape::step::GatedAct,
+}
+
+impl From<AffineGatedQmvConstants> for Vec<ConstantValue> {
+    fn from(c: AffineGatedQmvConstants) -> Self {
+        use crate::tape::step::GatedAct;
+        let act = match c.act {
+            GatedAct::Silu => 0,
+            GatedAct::Gelu => 1,
+        };
+        let mut v: Vec<ConstantValue> = c.gather.into();
+        v.push(ConstantValue::int(ConstSlot(3), act));
+        v
+    }
+}
+
+/// `KernelId::MoeDownCombine` (`affine_gather_qmv_combine[_fast]_*`): the down projection's
+/// [`AffineQmvConstants`] and the experts each token chose (slot 2), whose rows it combines.
+pub struct AffineCombineQmvConstants {
+    pub qmv: AffineQmvConstants,
+    pub top_k: TopK,
+}
+
+impl From<AffineCombineQmvConstants> for Vec<ConstantValue> {
+    fn from(c: AffineCombineQmvConstants) -> Self {
+        let mut v: Vec<ConstantValue> = c.qmv.into();
+        v.push(ConstantValue::int(ConstSlot(2), c.top_k.get() as i32));
+        v
+    }
+}
+
 // ── MoE routing ───────────────────────────────────────────────────
 
 /// `KernelId::Softmax` (`block_softmax_precise_<T>`, `topk_renorm_<T>`, `softmax.metal`): the
