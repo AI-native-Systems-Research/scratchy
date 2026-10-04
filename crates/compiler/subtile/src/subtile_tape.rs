@@ -1955,6 +1955,28 @@ pub fn reroll_subtile_tape<F: crate::subtile_ir::RopeForm>(
     let start = det_start + best_phi;
     let iters = ((det_start + run_len - start) / period) as u32;
     let span_end = start + period * iters as usize;
+    // ⛔ A RUN WITH NO LAYER IN IT IS NOT THE LAYER LOOP. `detect_repeating_run_subtile` is
+    // content-blind: it finds the largest span of fingerprint-identical instrs ANYWHERE on the tape,
+    // and a model whose every attention class appears once (parity fixtures: 1 sliding + 1 global
+    // layer) has no layer run to find — yet the two classes' bodies still hold IDENTICAL op
+    // subsequences at matching relative positions (both start `RmsNorm; Elementwise; …`), and the
+    // largest such repeat is a mid-body slice that contains no RopeAppend at all. Rolling it
+    // collapses two DIFFERENT programs onto one body and mis-names every launch — the mis-roll the
+    // class fingerprints exist to prevent, arriving by the back door. Refuse HERE: when the tape HAS
+    // layers ("a layer is named by its KV writer" — some RopeAppend exists anywhere), the run must
+    // contain one, or it is not a roll of layers and the tape goes back UNROLLED. A tape with NO
+    // RopeAppend at all (a synthetic chain, an embedding-only program) has no layers to mis-name,
+    // and the run is the whole program's structure — roll it, as ever.
+    let is_rope = |i: &Instr| {
+        matches!(
+            i,
+            Instr::Compute { node, .. }
+                if matches!(graph.nodes[node.index()].op, crate::subtile_ir::SubOp::RopeAppend { .. })
+        )
+    };
+    if instrs.iter().any(is_rope) && !instrs[start..span_end].iter().any(is_rope) {
+        return tape.clone();
+    }
 
     // ── Loop-carried slot analysis ──────────────────────────────────
     // Δ = slot ids allocated per period (the per-copy slot stride).
@@ -2303,7 +2325,9 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
     };
     let mut first_compute_of_layer: Vec<usize> = vec![usize::MAX; ls.layers.len()];
     for (i, l) in compute_layer.iter().enumerate() {
-        if let Some(l) = l && first_compute_of_layer[*l] == usize::MAX {
+        if let Some(l) = l
+            && first_compute_of_layer[*l] == usize::MAX
+        {
             first_compute_of_layer[*l] = i;
         }
     }
@@ -2359,7 +2383,10 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
     // already covers the Compute/Alloc/Free discriminant sequence, so a disagreement here means
     // the phase/slice derivation misaligned — refuse rather than gather across a boundary.
     for (_, ls_idx) in &classes {
-        let lens: HashSet<usize> = ls_idx.iter().map(|&i| instr_end[i] - instr_start[i]).collect();
+        let lens: HashSet<usize> = ls_idx
+            .iter()
+            .map(|&i| instr_end[i] - instr_start[i])
+            .collect();
         if lens.len() != 1 {
             return None;
         }
@@ -2406,7 +2433,11 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
     // prefix → layer 0
     let w0 = sorted_writes(0..instr_start[0]);
     let l0_reads = reads_of(instr_start[0]..instr_end[0]);
-    let mut c0: Vec<u32> = w0.iter().copied().filter(|s| l0_reads.contains(s)).collect();
+    let mut c0: Vec<u32> = w0
+        .iter()
+        .copied()
+        .filter(|s| l0_reads.contains(s))
+        .collect();
     c0.sort_unstable();
     boundaries.push(c0);
     for l in 0..n_layers {
@@ -2476,28 +2507,27 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
                 })
                 .collect()
         };
-        let gather_ext =
-            |bi_idx: usize, pos: usize| -> Vec<crate::subtile_ir::TensorId> {
-                layers
-                    .iter()
-                    .map(|&l| {
-                        let abs = instr_start[l] + bi_idx;
-                        match &instrs[abs] {
-                            Instr::Compute { inputs, .. } => match inputs.iter().nth(pos) {
-                                Some(ComputeInput::External { tensor, .. }) => *tensor,
-                                other => panic!(
-                                    "reroll_layer_classes: copy at layer {l} input[{pos}] is not \
-                                     External (got {other:?})"
-                                ),
-                            },
+        let gather_ext = |bi_idx: usize, pos: usize| -> Vec<crate::subtile_ir::TensorId> {
+            layers
+                .iter()
+                .map(|&l| {
+                    let abs = instr_start[l] + bi_idx;
+                    match &instrs[abs] {
+                        Instr::Compute { inputs, .. } => match inputs.iter().nth(pos) {
+                            Some(ComputeInput::External { tensor, .. }) => *tensor,
                             other => panic!(
-                                "reroll_layer_classes: copy at layer {l} body idx {bi_idx} is not \
-                                 a Compute (got {other:?})"
+                                "reroll_layer_classes: copy at layer {l} input[{pos}] is not \
+                                     External (got {other:?})"
                             ),
-                        }
-                    })
-                    .collect()
-            };
+                        },
+                        other => panic!(
+                            "reroll_layer_classes: copy at layer {l} body idx {bi_idx} is not \
+                                 a Compute (got {other:?})"
+                        ),
+                    }
+                })
+                .collect()
+        };
         let rep = layers[0];
         let body_range = instr_start[rep]..instr_end[rep];
         let (mut bi, _var) = b.open_loop(LoopBound::Const(iters));
@@ -2528,11 +2558,9 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
                         .iter()
                         .enumerate()
                         .filter_map(|(pos, ci)| match ci {
-                            ComputeInput::Computed(slots) if slots.len() == 1 => {
-                                carried_to
-                                    .get(&slots[0].index())
-                                    .map(|&(seed, _)| (pos, bi.carried_in(slot_id(seed))))
-                            }
+                            ComputeInput::Computed(slots) if slots.len() == 1 => carried_to
+                                .get(&slots[0].index())
+                                .map(|&(seed, _)| (pos, bi.carried_in(slot_id(seed)))),
                             _ => None,
                         })
                         .collect();
@@ -2541,7 +2569,8 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
                         .enumerate()
                         .map(|(pos, ci)| match ci {
                             ComputeInput::Computed(slots) => {
-                                if let Some((_, tok)) = carried_tokens.iter().find(|(p, _)| *p == pos)
+                                if let Some((_, tok)) =
+                                    carried_tokens.iter().find(|(p, _)| *p == pos)
                                 {
                                     Some(ComputeInputBuild::Computed(vec![tok]))
                                 } else {
@@ -2554,15 +2583,13 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
                                         .map(|w| ComputeInputBuild::Computed(vec![w]))
                                 }
                             }
-                            ComputeInput::External {
-                                tensor,
-                                region,
-                                ..
-                            } => Some(ComputeInputBuild::External {
-                                tensor: *tensor,
-                                region: *region,
-                                per_layer: gather_ext(bi_idx, pos),
-                            }),
+                            ComputeInput::External { tensor, region, .. } => {
+                                Some(ComputeInputBuild::External {
+                                    tensor: *tensor,
+                                    region: *region,
+                                    per_layer: gather_ext(bi_idx, pos),
+                                })
+                            }
                         })
                         .collect();
                     let built = built?;
@@ -2609,7 +2636,6 @@ pub fn reroll_layer_classes<F: crate::subtile_ir::RopeForm>(
     drop(carried_to);
     Some(b.finish())
 }
-
 
 fn slot_id(idx: u32) -> SlotId {
     SlotId {
@@ -3561,7 +3587,13 @@ pub(crate) mod tests {
             });
         }
         // suffix: y = silu(r_6).
-        nodes.push(silu_node(13, r_out(5), Range::new(0, 4), y, Range::new(0, 4)));
+        nodes.push(silu_node(
+            13,
+            r_out(5),
+            Range::new(0, 4),
+            y,
+            Range::new(0, 4),
+        ));
         SubtileIR {
             tensors,
             num_sources: 21,
@@ -3651,12 +3683,9 @@ pub(crate) mod tests {
                         per_layer_out,
                         ..
                     } => match &g.nodes[node.0 as usize].op {
-                        SubOp::RopeAppend { .. } => Some(
-                            per_layer_out
-                                .iter()
-                                .map(|n| n.0)
-                                .collect::<Vec<u32>>(),
-                        ),
+                        SubOp::RopeAppend { .. } => {
+                            Some(per_layer_out.iter().map(|n| n.0).collect::<Vec<u32>>())
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -3669,7 +3698,10 @@ pub(crate) mod tests {
         let mut all: Vec<u32> = t0.iter().chain(t1.iter()).copied().collect();
         all.sort_unstable();
         let want: Vec<u32> = (1..=12u32).step_by(2).collect(); // rope node ids are 1,3,5,7,9,11
-        assert_eq!(all, want, "the two tables together cover every layer exactly once");
+        assert_eq!(
+            all, want,
+            "the two tables together cover every layer exactly once"
+        );
         // And each table's layers are same-class: their rope head dims agree.
         let hd = |n: u32| match &g.nodes[n as usize].op {
             SubOp::RopeAppend { head_dim, .. } => head_dim.get(),
@@ -3688,7 +3720,10 @@ pub(crate) mod tests {
             body.iter()
                 .find_map(|instr| match instr {
                     Instr::Compute { node, inputs, .. } => {
-                        if matches!(&g.nodes[node.0 as usize].op, SubOp::Elementwise(EwKind::Mul)) {
+                        if matches!(
+                            &g.nodes[node.0 as usize].op,
+                            SubOp::Elementwise(EwKind::Mul)
+                        ) {
                             inputs.iter().find_map(|ci| match ci {
                                 ComputeInput::External { per_layer, .. } => {
                                     Some(per_layer.iter().map(|t| t.0).collect::<Vec<u32>>())
@@ -3707,7 +3742,11 @@ pub(crate) mod tests {
         let w1 = weight_table(&bodies[1]);
         let mut ws: Vec<u32> = w0.iter().chain(w1.iter()).copied().collect();
         ws.sort_unstable();
-        assert_eq!(ws, vec![1, 2, 3, 4, 5, 6], "all six weights gathered, each once");
+        assert_eq!(
+            ws,
+            vec![1, 2, 3, 4, 5, 6],
+            "all six weights gathered, each once"
+        );
     }
 
     /// A SINGLE-class tape must NOT take the class split (the welded/`reroll_subtile_tape` path
