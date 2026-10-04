@@ -192,6 +192,11 @@ pub struct ResidentExecutor {
     /// The model dtype the per-node oracle threads (F16). All sticks are sized and
     /// read back at this dtype.
     dtype: DType,
+    /// Tensor ids whose SOURCE bytes were staged as PACKED e4m3 — the fp8 weights of a
+    /// W8A8 model. A pointer to such a tensor binds in FP8 ELEMENTS (RFC #110's
+    /// `elem = stick·STICK_BYTES / bpe` needs bpe=1 so the fp8 view's `byte_address`
+    /// lands on the stick base); every other tensor keeps the model-dtype binding.
+    fp8_tensors: std::collections::HashSet<u64>,
     /// Per-segment plan-cache key (`comm_sched::plan_key`), memoized by the ops
     /// slice address. The deep ops-tree hash that keys the scheduler's Metal/
     /// liveness plan caches is otherwise recomputed every forward pass (~7% of a
@@ -410,6 +415,7 @@ impl ResidentExecutor {
             sources,
             forward_written,
             dtype,
+            fp8_tensors: std::collections::HashSet::new(),
             seg_keys: std::cell::RefCell::new(HashMap::new()),
             last_token_only: false,
             last_token_segs: std::cell::RefCell::new(HashMap::new()),
@@ -565,8 +571,16 @@ impl ResidentExecutor {
         let s = *self.stick.get(&tensor).ok_or_else(|| {
             format!("set_source_bytes: t{tensor} is not a tensor this program uses")
         })?;
-        if dtype == self.dtype {
-            // Verbatim: typed bytes already match the stick layout.
+        if dtype == self.dtype || dtype == DType::Fp8E4m3 {
+            // Verbatim: typed bytes already match the stick layout. fp8 is verbatim too:
+            // the stick is a raw byte region and the fp8 VIEW over this pointer reads the
+            // codes 1 byte each (`decode_gather`'s Fp8E4m3 arm) — the model-dtype check
+            // alone would push the 1-byte codes through the f32 decode/encode crossing and
+            // DESTROY them. The tensor's fp8 payload (n bytes) fits its stick allocation
+            // (numel·2 bytes), so no allocation change is needed.
+            if dtype == DType::Fp8E4m3 {
+                self.fp8_tensors.insert(tensor);
+            }
             self.mem
                 .hbm
                 .borrow_mut()
@@ -597,7 +611,12 @@ impl ResidentExecutor {
         let s = *self.stick.get(&tensor).ok_or_else(|| {
             format!("set_source_bytes_owned: t{tensor} is not a tensor this program uses")
         })?;
-        if dtype == self.dtype {
+        if dtype == self.dtype || dtype == DType::Fp8E4m3 {
+            // Verbatim, fp8 included — see `set_source_bytes` for why a 1-byte dtype
+            // must never cross the f32 decode/re-encode path.
+            if dtype == DType::Fp8E4m3 {
+                self.fp8_tensors.insert(tensor);
+            }
             self.mem
                 .hbm
                 .borrow_mut()
@@ -697,6 +716,24 @@ impl ResidentExecutor {
         Ok(())
     }
 
+    /// The pointer VALUE for tensor `tid`'s stick: an ELEMENT index in the tensor's
+    /// OWN staging dtype (RFC #110), so any view over it — the model-dtype ones AND the
+    /// fp8 weight view of a W8A8 model — computes `byte_address = elem·bpe(view)` at the
+    /// stick base. An fp8-staged tensor binds in fp8 elements (bpe=1); everything else
+    /// in the model dtype's.
+    fn ptr_for(&self, tid: u64) -> Result<i64, String> {
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("resident: t{tid} has no resident stick"))?;
+        let bpe = if self.fp8_tensors.contains(&tid) {
+            DType::Fp8E4m3.bytes_per_elem()
+        } else {
+            self.dtype.bytes_per_elem()
+        };
+        Ok(s * STICK_BYTES / bpe as i64)
+    }
+
     /// Every resident tensor's HBM byte ADDRESS -> its id. The GPU weight cache is keyed by the
     /// address a weight was read from, so this is what tells it which cached buffers a mutated
     /// tensor invalidates. A tensor's sticks are allocated once for the session, so the address is
@@ -781,8 +818,7 @@ impl ResidentExecutor {
                             fs.outputs.iter().map(|t| format!("t{t}")).collect();
                         eprintln!(
                             "PROBE8 seg{si} FUSED {} grid={:?} args={args:?} outputs={outs:?}",
-                            fs.func.name,
-                            fs.func.grid
+                            fs.func.name, fs.func.grid
                         );
                     }
                     Segment::Native(n) => {
@@ -862,11 +898,11 @@ impl ResidentExecutor {
                     .filter_map(|&(tid, _)| {
                         let s = *self.stick.get(&tid)?;
                         let n = *self.numel.get(&tid)?;
-                        let bytes =
-                            self.mem
-                                .hbm
-                                .borrow()
-                                .read_bytes(s * STICK_BYTES, n * self.dtype.bytes_per_elem());
+                        let bytes = self
+                            .mem
+                            .hbm
+                            .borrow()
+                            .read_bytes(s * STICK_BYTES, n * self.dtype.bytes_per_elem());
                         let d = crate::codec::decode(&bytes, n, self.dtype);
                         Some((
                             tid,
@@ -900,14 +936,10 @@ impl ResidentExecutor {
                     // segment; it used to be parsed out of the argument's name.
                     let mut input_ptrs: Vec<(Ssa, Value)> = Vec::with_capacity(fs.args.len());
                     for &(arg, tid) in &fs.args {
-                        let s = *self
-                            .stick
-                            .get(&tid)
-                            .ok_or_else(|| format!("fused arg t{tid} has no resident stick"))?;
-                        // base_ptr is an ELEMENT index (RFC #110): the view's
-                        // byte_address = base_ptr*bpe must land on the resident
-                        // stick (byte s*STICK_BYTES), so bind elem = s*STICK_BYTES/bpe.
-                        let elem = s * STICK_BYTES / self.dtype.bytes_per_elem() as i64;
+                        // base_ptr is an ELEMENT index (RFC #110) in the tensor's OWN
+                        // staging dtype, so the view's byte_address lands on the resident
+                        // stick — fp8 weights bind in fp8 elements (`ptr_for`).
+                        let elem = self.ptr_for(tid)?;
                         input_ptrs.push((arg, Value::Index(elem)));
                     }
                     // Run against the persistent HBM, NO per-segment read-back: the
@@ -962,12 +994,9 @@ impl ResidentExecutor {
                         let mut input_ptrs: Vec<(Ssa, Value)> =
                             Vec::with_capacity(node.bindings.len());
                         for b in &node.bindings {
-                            let s = *self.stick.get(&b.tensor).ok_or_else(|| {
-                                format!("native attn arg t{} has no resident stick", b.tensor)
-                            })?;
-                            // base_ptr is an ELEMENT index (RFC #110): bind
-                            // elem = s*STICK_BYTES/bpe so byte_address lands on stick s.
-                            let elem = s * STICK_BYTES / self.dtype.bytes_per_elem() as i64;
+                            // base_ptr is an ELEMENT index (RFC #110) in the tensor's own
+                            // staging dtype (`ptr_for`), so byte_address lands on stick s.
+                            let elem = self.ptr_for(b.tensor)?;
                             input_ptrs.push((b.arg, Value::Index(elem)));
                         }
                         // No per-segment read-back (outputs flow via HBM; see the
@@ -1016,19 +1045,28 @@ impl ResidentExecutor {
             }
             // TEMP-PROBE-6 (remove before commit): dump requested-output sticks after this segment.
             if probe6 {
-                for (i, &(tid, _)) in outputs.iter().enumerate().take(10) {
-                    let Some(&s) = self.stick.get(&tid) else { continue };
-                    let Some(&n) = self.numel.get(&tid) else { continue };
+                let mut seg_outs: Vec<u64> = match seg {
+                    Segment::Fused(fs) => fs.outputs.iter().copied().collect(),
+                    Segment::Native(_) => Vec::new(),
+                };
+                seg_outs.extend(outputs.iter().map(|&(t, _)| t));
+                seg_outs.sort_unstable();
+                seg_outs.dedup();
+                for tid in seg_outs {
+                    let Some(&s) = self.stick.get(&tid) else {
+                        continue;
+                    };
+                    let Some(&n) = self.numel.get(&tid) else {
+                        continue;
+                    };
                     let bytes = self
                         .mem
                         .hbm
                         .borrow()
                         .read_bytes(s * STICK_BYTES, n.min(2048) * self.dtype.bytes_per_elem());
                     let d = crate::codec::decode(&bytes, n.min(2048), self.dtype);
-                    let (pre_sum, pre_nan) = probe6_pre
-                        .get(i)
-                        .map(|&(t, s, nn)| (s, nn))
-                        .unwrap_or((0.0, 0));
+                    let pre = probe6_pre.iter().find(|&&(t, _, _)| t == tid);
+                    let (pre_sum, pre_nan) = pre.map(|&(_, s, nn)| (s, nn)).unwrap_or((0.0, 0));
                     let sum: f64 = d.iter().fold(0.0, |a, x| a + x.abs() as f64);
                     let nan = d.iter().filter(|x| x.is_nan()).count();
                     if (sum - pre_sum).abs() > 1e-6 || nan != pre_nan {
@@ -1335,12 +1373,9 @@ impl ResidentExecutor {
         }
         let mut input_ptrs: Vec<(Ssa, Value)> = Vec::with_capacity(node.bindings.len());
         for b in &node.bindings {
-            let s = *self
-                .stick
-                .get(&b.tensor)
-                .ok_or_else(|| format!("tile-dataflow: t{} has no resident stick", b.tensor))?;
-            // base_ptr is an ELEMENT index (RFC #110): bind elem = s*STICK_BYTES/bpe.
-            let elem = s * STICK_BYTES / self.dtype.bytes_per_elem() as i64;
+            // base_ptr is an ELEMENT index (RFC #110) in the tensor's own staging
+            // dtype (`ptr_for`).
+            let elem = self.ptr_for(b.tensor)?;
             input_ptrs.push((b.arg, Value::Index(elem)));
         }
         self.mem.get_lx(tile).borrow_mut().clear();

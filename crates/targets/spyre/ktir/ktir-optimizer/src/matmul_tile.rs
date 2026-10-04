@@ -81,6 +81,11 @@ struct Untiled {
     out_view: Ssa,
     /// The activation's row corner — an `scf`-free `index`, carried through unchanged.
     a_row: Ssa,
+    /// The fp8 dequant form's per-output-column scale VIEW (`[1, n]`), when the store drains an
+    /// `arith.mulf` of the matmul result by that row instead of the result itself —
+    /// [`KtirFunc::matmul_fp8`]'s shape. `None` for the plain bf16 form, whose recognized set and
+    /// emitted IR are byte-identical to before this field existed.
+    scale_view: Option<Ssa>,
     /// The untiled contraction's `outs` seed. ⛔ REUSED, NOT REBUILT: it is a splat of the BOUND
     /// zero constant at its reserved tid (`KtirFunc::splat_zero`), so minting a fresh immediate in
     /// its place orphans that parameter — the `dce` below then drops its view chain and the emulator
@@ -144,21 +149,6 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             continue;
         };
         let Some(res) = op.result else { continue };
-        // The store that drains it, and the view it writes.
-        let Some((store_at, st)) = func
-            .operations
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&res))
-        else {
-            continue;
-        };
-        let Some((_, out_acc)) = st.operands.get(1).and_then(|t| def.get(t)) else {
-            continue;
-        };
-        let Some(&out_view) = out_acc.operands.first() else {
-            continue;
-        };
         let (Some(&m), Some(&k)) = (a_dims.first(), a_dims.get(1)) else {
             continue;
         };
@@ -167,6 +157,71 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
         if w_dims.get(1) != Some(&k) {
             continue;
         }
+        // The store that drains the contraction, and the view it writes. Two forms:
+        // * bf16: `ktdp.store(matmul_res, …)` — the direct drain.
+        // * fp8: `arith.mulf(matmul_res, scale_row)` then a store of THAT — `KtirFunc::matmul_fp8`'s
+        //   dequant, whose `[1, n]` scale view must be carried so each N-block can scale its own
+        //   slice. ⛔ THE MULF MUST BE THE MATMUL RESULT'S ONLY OTHER CONSUMER: the splice below
+        //   removes the matmul, so a second consumer would dangle; and the scale row it reads must
+        //   be exactly `[1, n]`, the per-output-column row the checkpoint ships.
+        let mut scale_view = None;
+        let mut store_at = None;
+        let mut st = None;
+        if let Some((j, o)) = func
+            .operations
+            .iter()
+            .enumerate()
+            .find(|(_, o)| o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&res))
+        {
+            store_at = Some(j);
+            st = Some(o);
+        } else if let Some((_, o)) = func.operations.iter().enumerate().find(|(_, o)| {
+            o.op_type == OpKind::ArithMulf
+                && o.operands.first() == Some(&res)
+                && func
+                    .operations
+                    .iter()
+                    .filter(|c| c.operands.contains(&res))
+                    .count()
+                    == 1
+        }) {
+            let Some(scaled) = o.result else { continue };
+            let Some((js, sst)) = func.operations.iter().enumerate().find(|(_, so)| {
+                so.op_type == OpKind::KtdpStore && so.operands.first() == Some(&scaled)
+            }) else {
+                continue;
+            };
+            let scale_ok = (|| {
+                let (_, sld) = def.get(o.operands.get(1)?)?;
+                if sld.op_type != OpKind::KtdpLoad {
+                    return None;
+                }
+                let (_, sacc) = def.get(sld.operands.first()?)?;
+                if sacc.op_type != OpKind::KtdpConstructAccessTile {
+                    return None;
+                }
+                let s_view = *sacc.operands.first()?;
+                let s_shape = shape_of(sacc)?;
+                if s_shape.first() != Some(&1) || s_shape.get(1) != Some(&n) {
+                    return None;
+                }
+                Some(s_view)
+            })();
+            if let Some(s_view) = scale_ok {
+                store_at = Some(js);
+                st = Some(sst);
+                scale_view = Some(s_view);
+            }
+        }
+        let (Some(store_at), Some(st)) = (store_at, st) else {
+            continue;
+        };
+        let Some((_, out_acc)) = st.operands.get(1).and_then(|t| def.get(t)) else {
+            continue;
+        };
+        let Some(&out_view) = out_acc.operands.first() else {
+            continue;
+        };
         let elem = op.result_type.and_then(|t| t.elem()).unwrap_or(DType::F16);
         out.push(Untiled {
             at: i,
@@ -180,6 +235,7 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             n,
             k,
             elem,
+            scale_view,
         });
     }
     out
@@ -363,11 +419,47 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
                 dims: a.ints(acc_dims.clone()),
             });
             pre.push(ts);
+            // ⭐ FP8 DEQUANT: the block's accumulator is scaled by ITS OWN slice of the checkpoint's
+            // `[1, n]` per-output-column row — columns `[n_off, n_off+bw)` — before the store. This
+            // mirrors what `KtirFunc::matmul_fp8` did untiled (mulf by the whole row), and is
+            // arithmetic the contraction owes, not a tiling decision, so the N-blocking does not get
+            // to change it. The slice load is outside the loop: it is loop-invariant, and hoisting
+            // it keeps the loop body exactly the bf16 one (the GEMM offload's `recognize_matmul_loop`
+            // requires exactly one matmul and an `addf`-only yield chain).
+            let stored = if let Some(scale_view) = p.scale_view {
+                let (s_acc, s_val) = (g.mint(), g.mint());
+                let mut tsc = Operation::new(
+                    a,
+                    Some(s_acc),
+                    OpKind::KtdpConstructAccessTile,
+                    &[scale_view, zero, noff],
+                )
+                .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![1, bw])));
+                tsc.result_type = Some(IrType::AccessTile {
+                    dims: a.ints(vec![1, bw]),
+                });
+                pre.push(tsc);
+                let mut lsc = Operation::new(a, Some(s_val), OpKind::KtdpLoad, &[s_acc]).with_attr(
+                    a,
+                    AttrKey::Shape,
+                    Attr::IntList(a.ints(vec![1, bw])),
+                );
+                lsc.result_type = Some(tensor(vec![1, bw]));
+                pre.push(lsc);
+                let scaled = g.mint();
+                let mut mul = Operation::new(a, Some(scaled), OpKind::ArithMulf, &[result, s_val])
+                    .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(acc_dims.clone())));
+                mul.result_type = Some(tensor(acc_dims.clone()));
+                pre.push(mul);
+                scaled
+            } else {
+                result
+            };
             pre.push(Operation::new(
                 a,
                 None,
                 OpKind::KtdpStore,
-                &[result, st_acc],
+                &[stored, st_acc],
             ));
 
             n_off += bw;
@@ -446,4 +538,202 @@ pub fn apply_matmul_tiling<'a>(a: &'a Arena, module: &mut IRModule<'a>) -> usize
         }
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir_builder::Ops;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::dtypes::DType;
+    use ktir_core::ir::Attr;
+    use ktir_core::irtype::IrType;
+
+    /// One untiled contraction exactly as [`KtirFunc::matmul`] / [`KtirFunc::matmul_fp8`] emit it.
+    /// `m`, `n`, `k` fix the geometry; `dequant` inserts the fp8 form's `arith.mulf` by a loaded
+    /// `[1, scale_cols]` scale row between the matmul and the store (`scale_cols` lets a test ship
+    /// a row of the WRONG width, which the recognizer must refuse).
+    fn contraction(m: i64, n: i64, k: i64, dequant: bool, scale_cols: i64) -> IRFunction<'static> {
+        let mut ops = Ops::new();
+        let a = ops.arena();
+        let c0 = ops.op(Some("%c0"), OpKind::ArithConstant, &[]);
+        let c0 = ops.attr(c0, AttrKey::Value, Attr::Int(0));
+        let mk_view =
+            |ops: &mut Ops, res: &'static str, arg: &'static str, dims: Vec<i64>, elem: DType| {
+                let o = ops.op(Some(res), OpKind::KtdpConstructMemoryView, &[arg]);
+                let o = ops.attr(o, AttrKey::Shape, ops.int_list(dims.clone()));
+                let o = ops.attr(o, AttrKey::Strides, ops.int_list(vec![dims[1], 1]));
+                let o = ops.attr(o, AttrKey::MemorySpace, Attr::Str("HBM"));
+                ops.attr(o, AttrKey::Dtype, Attr::Dtype(elem))
+            };
+        let mk_tile = |ops: &mut Ops, res: &'static str, view: &'static str, dims: Vec<i64>| {
+            let o = ops.op(
+                Some(res),
+                OpKind::KtdpConstructAccessTile,
+                &[view, "%c0", "%c0"],
+            );
+            ops.attr(o, AttrKey::Shape, ops.int_list(dims))
+        };
+        let f16_tensor = |dims: Vec<i64>| IrType::Tensor {
+            dims: a.ints(dims),
+            elem: DType::F16,
+        };
+
+        let mut body = vec![c0];
+        body.push(mk_view(&mut ops, "%va", "%a_ptr", vec![m, k], DType::F16));
+        body.push(mk_view(
+            &mut ops,
+            "%vw",
+            "%w_ptr",
+            vec![n, k],
+            DType::Fp8E4m3,
+        ));
+        body.push(mk_view(
+            &mut ops,
+            "%vs",
+            "%s_ptr",
+            vec![1, scale_cols],
+            DType::F16,
+        ));
+        body.push(mk_view(
+            &mut ops,
+            "%vout",
+            "%out_ptr",
+            vec![m, n],
+            DType::F16,
+        ));
+        body.push(mk_tile(&mut ops, "%ta", "%va", vec![m, k]));
+        let la = ops.op(Some("%a_val"), OpKind::KtdpLoad, &["%ta"]);
+        let la = ops.attr(la, AttrKey::Shape, ops.int_list(vec![m, k]));
+        body.push(ops.ty(la, f16_tensor(vec![m, k])));
+        body.push(mk_tile(&mut ops, "%tw", "%vw", vec![n, k]));
+        let lw = ops.op(Some("%w_val"), OpKind::KtdpLoad, &["%tw"]);
+        let lw = ops.attr(lw, AttrKey::Shape, ops.int_list(vec![n, k]));
+        body.push(ops.ty(lw, f16_tensor(vec![n, k])));
+        let zc = ops.op(Some("%zc"), OpKind::ArithConstant, &[]);
+        let zc = ops.attr(zc, AttrKey::Value, Attr::Float(0.0));
+        body.push(ops.ty(zc, IrType::Scalar(DType::F16)));
+        let init = ops.op(Some("%init"), OpKind::TensorSplat, &["%zc"]);
+        let init = ops.attr(init, AttrKey::Shape, ops.int_list(vec![m, n]));
+        let init = ops.attr(init, AttrKey::Dtype, Attr::Dtype(DType::F16));
+        body.push(ops.ty(init, f16_tensor(vec![m, n])));
+        let mm = ops.op(
+            Some("%part"),
+            OpKind::LinalgMatmul,
+            &["%a_val", "%w_val", "%init"],
+        );
+        let mm = ops.attr(mm, AttrKey::Shape, ops.int_list(vec![m, n]));
+        body.push(ops.ty(mm, f16_tensor(vec![m, n])));
+        let stored: &'static str = if dequant {
+            body.push(mk_tile(&mut ops, "%ts", "%vs", vec![1, scale_cols]));
+            let ls = ops.op(Some("%s_val"), OpKind::KtdpLoad, &["%ts"]);
+            let ls = ops.attr(ls, AttrKey::Shape, ops.int_list(vec![1, scale_cols]));
+            body.push(ops.ty(ls, f16_tensor(vec![1, scale_cols])));
+            let mul = ops.op(Some("%scaled"), OpKind::ArithMulf, &["%part", "%s_val"]);
+            let mul = ops.attr(mul, AttrKey::Shape, ops.int_list(vec![m, n]));
+            body.push(ops.ty(mul, f16_tensor(vec![m, n])));
+            "%scaled"
+        } else {
+            "%part"
+        };
+        body.push(mk_tile(&mut ops, "%tout", "%vout", vec![m, n]));
+        body.push(ops.op(None, OpKind::KtdpStore, &[stored, "%tout"]));
+        ops.func(
+            "contraction",
+            &[
+                ("%a_ptr", IrType::Index),
+                ("%w_ptr", IrType::Index),
+                ("%s_ptr", IrType::Index),
+                ("%out_ptr", IrType::Index),
+            ],
+            body,
+            (1, 1, 1),
+        )
+    }
+
+    /// The fp8 dequant form IS recognized, with the scale view carried — the gemma-4-12b fp8 emu
+    /// gate. Before this recognition the pass reported "0 of 1 contraction(s) recognised" for every
+    /// `matmul_fp8` node, leaving a whole `[n, k]` fp8 weight tile in LX (q_proj `[4096, 3840]` =
+    /// 15.7 MB against 2 MB).
+    #[test]
+    fn the_fp8_dequant_form_is_recognised_with_its_scale_view() {
+        let f = contraction(
+            1, 96, 128, /* dequant: */ true, /* scale_cols: */ 96,
+        );
+        let found = recognize(&f);
+        assert_eq!(
+            found.len(),
+            1,
+            "the fp8 dequant contraction must be recognized"
+        );
+        assert!(
+            found[0].scale_view.is_some(),
+            "the scale view must be carried"
+        );
+        assert_eq!(found[0].n, 96);
+        assert_eq!(found[0].k, 128);
+    }
+
+    /// The plain bf16 form keeps its DIRECT store drain and carries no scale view.
+    #[test]
+    fn the_plain_form_still_recognises_without_a_scale() {
+        let f = contraction(1, 96, 128, false, 96);
+        let found = recognize(&f);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].scale_view.is_none());
+    }
+
+    /// A scale row of the WRONG width is not this contraction's dequant — the recognizer must
+    /// refuse rather than scale N-blocks by an off-width slice.
+    #[test]
+    fn an_off_width_scale_row_is_refused() {
+        let f = contraction(1, 96, 128, true, /* scale_cols: */ 64);
+        assert!(recognize(&f).is_empty());
+    }
+
+    /// After tiling, the fp8 form stores an `arith.mulf` of the loop result by a `[1, bw]` scale
+    /// slice — one mulf and one scale load per N-block, outside the K-loop body.
+    #[test]
+    fn tiling_scales_each_n_block_by_its_own_scale_slice() {
+        let mut f = contraction(1, 96, 128, true, 96);
+        let done = tile_func(Arena::global(), &mut f);
+        assert_eq!(done, 1);
+        let mul_count = f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::ArithMulf)
+            .count();
+        let scale_loads = f
+            .operations
+            .iter()
+            .filter(|o| {
+                o.op_type == OpKind::KtdpLoad
+                    && o.operands
+                        .first()
+                        .and_then(|acc| f.operations.iter().find(|d| d.result == Some(*acc)))
+                        .is_some_and(|acc| {
+                            acc.attr(AttrKey::Shape)
+                                == Some(&Attr::IntList(Arena::global().ints(vec![1, 96])))
+                        })
+            })
+            .count();
+        assert!(mul_count >= 1, "the dequant mulf must survive tiling");
+        assert!(
+            scale_loads >= 1,
+            "the scale slice load must survive tiling (whole-n block here)"
+        );
+        // Every store drains an mulf, not a bare loop result.
+        for o in f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::KtdpStore)
+        {
+            let val = o.operands[0];
+            let def = f.operations.iter().find(|d| d.result == Some(val));
+            assert!(
+                def.is_some_and(|d| d.op_type == OpKind::ArithMulf),
+                "the fp8 store must drain the scaled value"
+            );
+        }
+    }
 }

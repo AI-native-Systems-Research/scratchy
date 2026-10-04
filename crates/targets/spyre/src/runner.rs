@@ -103,6 +103,17 @@ fn weight_arg(data: Vec<u8>, dt: SDType, shape: Vec<usize>) -> Arg {
             shape,
             dtype: DType::F16,
         },
+        // ⛔ PACKED e4m3 STAYS 1-BYTE with its OWN dtype. The `_` arm's F32 claim made the
+        // resident executor `codec::decode(bytes, n, F32)` the fp8 codes — 4 bytes per 1-byte
+        // element, garbage f32s, re-encoded to f16 sticks — MEASURED as every fp8 matmul
+        // writing NaN from the first gemma-4-12b-FP8 layer (seg1-3 of the emu trace). The
+        // fp8 view reads the codes 1-byte each (`decode_gather`'s Fp8E4m3 arm), so the bytes
+        // must land in HBM verbatim under the dtype that says so.
+        SDType::Fp8E4m3 => Arg::TensorBytes {
+            data,
+            shape,
+            dtype: DType::Fp8E4m3,
+        },
         _ => Arg::TensorBytes {
             data,
             shape,
