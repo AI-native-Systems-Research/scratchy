@@ -12869,6 +12869,7 @@ pub fn emit_model(
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
+                deferred: ctx.deferred,
             };
 
             // ── Run forward + copy logits out ─────────────────────
@@ -13188,6 +13189,7 @@ pub fn emit_model(
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
+                deferred: ::core::option::Option::None,
             };
 
             // Pre-pick the bucket from iter-0 num_tokens. The chain

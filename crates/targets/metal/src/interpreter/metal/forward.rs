@@ -144,6 +144,79 @@ pub struct ForwardInputs<'a> {
     /// reads it in place of the static cos/sin cache, with identity
     /// positions). `None` for 1D-rope arches.
     pub mrope_cos_sin: Option<&'a [u8]>,
+    /// `Some`: the host does not wait for this forward ([`Deferral`]).
+    pub deferred: Option<&'a Deferral>,
+}
+
+/// A forward the host commits without waiting for it, so the next one is queued while it runs. Its
+/// runtime-input writes are made on the device at the head of its command buffer — the forward
+/// before it may still be reading those buffers — and it starts once that forward is done.
+#[derive(Default)]
+pub struct Deferral {
+    /// Input tokens an earlier forward wrote on the device, copied into `input_ids` before this one
+    /// reads them.
+    pub device_inputs: Vec<DeviceInput>,
+    in_flight: std::sync::OnceLock<InFlight>,
+}
+
+impl Deferral {
+    /// A deferred forward that reads `device_inputs`.
+    pub fn new(device_inputs: Vec<DeviceInput>) -> Self {
+        Self {
+            device_inputs,
+            in_flight: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Record the command buffer this forward was committed in.
+    pub(super) fn committed(&self, in_flight: InFlight) {
+        assert!(
+            self.in_flight.set(in_flight).is_ok(),
+            "a deferred forward is committed once"
+        );
+    }
+
+    /// The command buffer this forward was committed in; `None` if it never was.
+    pub fn take_in_flight(&mut self) -> Option<InFlight> {
+        self.in_flight.take()
+    }
+}
+
+/// One input token an earlier forward wrote on the device: the `u32` `offset` bytes into `src`,
+/// for `input_ids[flat_index]`.
+pub struct DeviceInput {
+    pub src: super::__re::Buffer,
+    pub offset: usize,
+    pub flat_index: usize,
+}
+
+/// A committed command buffer the host has not waited for.
+pub struct InFlight {
+    pub(super) event: super::__re::SharedEvent,
+    pub(super) value: u64,
+    /// Its GPU execution error, recorded by its own commit feedback handler.
+    pub(super) error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The commit options carrying that handler, kept until the command buffer is done.
+    pub(super) _feedback: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
+}
+
+// SAFETY: like the pool's (`MetalWorkerPool`), the markers objc2's objects lack: a shared event is
+// made to be waited on from any thread, the error slot is a mutex, and the commit options are only
+// held, never used, once committed.
+unsafe impl Send for InFlight {}
+unsafe impl Sync for InFlight {}
+
+impl InFlight {
+    /// Block until the GPU is done with it. `Err`: the execution error its commit feedback reported
+    /// — a failed command buffer otherwise yields all-zero outputs silently.
+    pub fn wait(&self) -> Result<(), ForwardError> {
+        crate::mtl4_dispatch::wait_drained(&self.event, self.value);
+        if let Some(msg) = &*self.error.lock().expect("commit error mutex") {
+            eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
+            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        }
+        Ok(())
+    }
 }
 
 /// Build the per-token MRoPE cos/sin override table for the text decoder

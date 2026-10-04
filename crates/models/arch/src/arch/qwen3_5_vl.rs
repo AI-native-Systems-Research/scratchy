@@ -279,6 +279,7 @@ mod green_gate {
             gdn_is_fresh: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            deferred: None,
         };
 
         // ── RUN the metal vision tower (forward_m_256 workload bucket) ──

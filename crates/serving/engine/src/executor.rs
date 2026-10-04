@@ -106,13 +106,17 @@ pub struct ModelRunnerOutput {
 
     /// Deferred D2H resolver. When present, `sampled_token_ids` contains
     /// placeholders. Call `resolve()` to synchronize the D2H transfer and
-    /// populate the real token IDs.
+    /// populate the real token IDs — or learn the step failed on the device.
     ///
     /// Matches Python's `AsyncOutput` pattern: the GPU enqueues a D2H copy
     /// on a transfer stream and returns immediately. The closure syncs the
     /// CUDA event and reads from a pinned host buffer.
-    pub d2h_resolver: Option<Box<dyn FnOnce() -> Vec<u32> + Send>>,
+    pub d2h_resolver: Option<D2hResolver>,
 }
+
+/// A deferred step's tokens, one per request in `req_ids` order, once its device work is done; `Err`
+/// if that work failed.
+pub type D2hResolver = Box<dyn FnOnce() -> Result<Vec<u32>, String> + Send>;
 
 impl std::fmt::Debug for ModelRunnerOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -150,12 +154,14 @@ impl ModelRunnerOutput {
     /// Resolve the deferred D2H transfer, populating `sampled_token_ids`.
     ///
     /// Synchronizes the CUDA D2H event and reads token IDs from the pinned
-    /// host buffer. No-op if the output is already resolved.
-    pub fn resolve(&mut self) {
+    /// host buffer. No-op if the output is already resolved. `Err`: the step
+    /// failed on the device, and its tokens are not to be used.
+    pub fn resolve(&mut self) -> Result<(), String> {
         if let Some(resolver) = self.d2h_resolver.take() {
-            let token_ids = resolver();
+            let token_ids = resolver()?;
             self.sampled_token_ids = token_ids.into_iter().map(|t| vec![t]).collect();
         }
+        Ok(())
     }
 
     /// Get the sampled token IDs for a specific request.
@@ -237,7 +243,7 @@ impl ModelRunnerOutput {
     /// The `resolver` closure is called by `resolve()` to synchronize the
     /// D2H CUDA event and read token IDs from a pinned host buffer.
     /// Until resolved, `sampled_token_ids` is empty.
-    pub fn deferred(req_ids: Vec<String>, resolver: Box<dyn FnOnce() -> Vec<u32> + Send>) -> Self {
+    pub fn deferred(req_ids: Vec<String>, resolver: D2hResolver) -> Self {
         let req_id_to_index: HashMap<String, usize> = req_ids
             .iter()
             .enumerate()

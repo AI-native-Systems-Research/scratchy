@@ -365,6 +365,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             // The vision tape is text-/GDN-free, so the decoder-specific slots
             // are inert.
             has_spec_tokens: false,
+            deferred: None,
         };
 
         let projected = unsafe { self.weights.vision_forward(&ctx, device, total_l as u64) };

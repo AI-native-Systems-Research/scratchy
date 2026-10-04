@@ -19,17 +19,17 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBufferStatus};
+use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer};
 use objc2_metal::{
     MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTLDevice,
 };
 
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
-use super::forward::{ForwardError, ForwardInputs};
+use super::forward::{Deferral, ForwardError, ForwardInputs, InFlight};
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
-use super::runtime::{Padding, RuntimeBindings};
+use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
@@ -304,24 +304,36 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     cv: Condvar,
 }
 
-/// Pool-owned MTL4 surface. The allocator is reset between forwards;
-/// the command buffer is re-created per forward (cheap — Metal pools
-/// internally). The shared event is monotonically signaled and
-/// host-waited on each commit.
+/// Pool-owned MTL4 surface. The command buffer is re-created per forward
+/// (cheap — Metal pools internally). The shared event is monotonically
+/// signaled after each commit.
 struct Mtl4Pool {
     queue: crate::interpreter::metal::__re::Mtl4Queue,
-    allocator: crate::interpreter::metal::__re::Mtl4Allocator,
+    /// Command allocators, each with the staging a deferred forward's input writes ride in, taken
+    /// in turn: one is reset only once its last command buffer is done, so a forward is encoded
+    /// while the ones before it run — the one in flight, the one queued, and this one.
+    ring: [RingSlot; 3],
+    /// The ring slot the next command buffer takes.
+    next: usize,
     shared_event: crate::interpreter::metal::__re::SharedEvent,
     signal_counter: u64,
-    /// Commit options carrying the feedback handler that records GPU
-    /// execution errors (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory).
-    /// Reused across commits; access is serialized by the `mtl4` Mutex.
-    commit_options: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
-    /// Last GPU execution error reported via commit feedback. Checked
-    /// after every event wait — a silently-failed command buffer
-    /// otherwise produces all-zero outputs and degenerate logits
-    /// (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode).
-    commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// One of [`Mtl4Pool::ring`]'s command allocators.
+struct RingSlot {
+    allocator: crate::interpreter::metal::__re::Mtl4Allocator,
+    /// What a deferred forward's recorded input writes are copied from.
+    staging: Option<crate::residency::Pinned>,
+    /// The shared-event value its last command buffer signals.
+    signal: u64,
+}
+
+/// A command buffer [`MetalWorkerPool::commit`] committed, and how long encoding and committing it
+/// took.
+struct Committed {
+    in_flight: InFlight,
+    encode: std::time::Duration,
+    commit: std::time::Duration,
 }
 
 /// Where one [`MetalWorkerPool::submit`] spent its time, for `SCRATCHY_METAL_TRACE`.
@@ -842,69 +854,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             "device.newMTL4CommandQueue() returned nil \
              — host does not support MTL4 (requires macOS 15+ on Apple Family 7+)",
         );
-        let allocator = self
-            .device
-            .newCommandAllocator()
-            .expect("device.newCommandAllocator() returned nil");
+        let ring = std::array::from_fn(|_| RingSlot {
+            allocator: self
+                .device
+                .newCommandAllocator()
+                .expect("device.newCommandAllocator() returned nil"),
+            staging: None,
+            signal: 0,
+        });
         let shared_event = self
             .device
             .newSharedEvent()
             .expect("device.newSharedEvent() returned nil");
-        let commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let commit_options = objc2_metal::MTL4CommitOptions::new();
-        {
-            let err_slot = std::sync::Arc::clone(&commit_error);
-            let block = block2::RcBlock::new(
-                move |feedback: std::ptr::NonNull<
-                    objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
-                >| {
-                    use objc2_metal::MTL4CommitFeedback as _;
-                    let fb = unsafe { feedback.as_ref() };
-                    if let Some(e) = fb.error() {
-                        let msg = format!("{e}");
-                        eprintln!("[scratchy-target-metal] GPU COMMIT ERROR: {msg}");
-                        // Dump the FULL NSError — code/domain/userInfo. MTL
-                        // folds the faulting-encoder label + GPU fault info
-                        // into userInfo (MTLCommandBufferEncoderInfoErrorKey),
-                        // which the bare Display ("...error 1.") drops. This
-                        // is the only signal that names WHICH dispatch faulted.
-                        eprintln!(
-                            "[scratchy-target-metal] GPU COMMIT ERROR code={} domain={}",
-                            e.code(),
-                            e.domain(),
-                        );
-                        // userInfo carries NSUnderlyingError /
-                        // NSMultipleUnderlyingErrorsKey whose NESTED NSError
-                        // userInfo holds the real per-encoder fault reason.
-                        // Debug prints only pointers; NSObject `description`
-                        // recurses and renders the whole tree.
-                        {
-                            use objc2::runtime::AnyObject;
-                            let ui = e.userInfo();
-                            let ui_obj: &AnyObject = &ui;
-                            let desc: objc2::rc::Retained<objc2_foundation::NSString> =
-                                unsafe { objc2::msg_send![ui_obj, description] };
-                            eprintln!("[scratchy-target-metal] GPU COMMIT ERROR userInfo: {desc}");
-                        }
-                        *err_slot.lock().expect("commit_error mutex") = Some(msg);
-                    }
-                },
-            );
-            unsafe { commit_options.addFeedbackHandler(block2::RcBlock::as_ptr(&block) as _) };
-            // The options object retains the handler block per Apple's
-            // contract ("references your commit feedback handler after
-            // you add it"); leak our RcBlock so the pointer stays valid
-            // for the pool's lifetime regardless.
-            std::mem::forget(block);
-        }
         *slot = Some(Mtl4Pool {
             queue,
-            allocator,
+            ring,
+            next: 0,
             shared_event,
             signal_counter: 0,
-            commit_options,
-            commit_error,
         });
     }
 
@@ -915,7 +882,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// `f(&encoder)` so the caller can append additional dispatches
     /// (e.g. argmax) onto the same compute encoder. Forward + tail
     /// share one CB, one commit, and one host wait — no separate
-    /// queue or shared event needed.
+    /// queue or shared event needed. A `deferred` forward is not waited for:
+    /// its command buffer is recorded on the [`Deferral`].
     fn run_bucket_mtl4_with_tail<F>(
         &self,
         worker: &MetalWorker<W>,
@@ -924,6 +892,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         num_seqs: u32,
         has_spec_tokens: bool,
         tail: Option<F>,
+        writes: &InputWrites,
+        deferred: Option<&Deferral>,
     ) -> Result<(), ForwardError>
     where
         F: FnOnce(
@@ -951,6 +921,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let needs_serialized = worker.bucket_has_avg_pool_2d(bucket_idx);
         if needs_serialized {
             assert!(
+                deferred.is_none(),
+                "a serialized forward waits for each of its command buffers"
+            );
+            assert!(
                 tail.is_none(),
                 "serialized chunked forward does not support a tail hook \
                  (vision towers have no argmax tail)",
@@ -967,13 +941,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     num_seqs,
                     has_spec_tokens,
                     start..end,
+                    (start == 0).then_some(writes),
                 )?;
                 start = end;
             }
             return Ok(());
         }
         let trace = std::env::var_os("SCRATCHY_METAL_TRACE").is_some();
-        let ((), took) = self.submit(|enc| {
+        let encode = |enc: &::objc2::runtime::ProtocolObject<
+            dyn ::objc2_metal::MTL4ComputeCommandEncoder,
+        >| {
             worker
                 .run_bucket_mtl4(
                     bucket_idx,
@@ -990,7 +967,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 t(enc, worker, bucket_idx)?;
             }
             Ok(())
-        })?;
+        };
+        if let Some(deferral) = deferred {
+            let ((), committed) = self.commit(Some(writes), encode)?;
+            deferral.committed(committed.in_flight);
+            return Ok(());
+        }
+        let ((), took) = self.submit(Some(writes), encode)?;
         if trace {
             let dispatches = worker.count_dispatches(bucket_idx);
             eprintln!(
@@ -1000,32 +983,83 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(())
     }
 
-    /// ONE command buffer on the pool's MTL4 queue. `encode` records onto
-    /// its compute encoder, the pool's residency sets declared on it; if it
-    /// fails, its error returns with the command buffer ended and nothing
-    /// committed. Otherwise the command buffer is committed and this returns
-    /// once the GPU is done with it ([`wait_drained`]) — completed, or failed
-    /// with the error the commit feedback reports — so nothing it reads is
-    /// still in use when the caller gets control back.
+    /// ONE command buffer on the pool's MTL4 queue, returned once the GPU is done with it
+    /// ([`wait_drained`]) — completed, or failed with the error the commit feedback reports — so
+    /// nothing it reads is still in use when the caller gets control back. See [`Self::commit`].
     ///
     /// [`wait_drained`]: crate::mtl4_dispatch::wait_drained
     fn submit<R>(
         &self,
+        writes: Option<&InputWrites>,
         encode: impl FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         ) -> Result<R, ForwardError>,
     ) -> Result<(R, Submitted), ForwardError> {
+        let t_pre = std::time::Instant::now();
+        let (encoded, committed) = self.commit(writes, encode)?;
+        committed.in_flight.wait()?;
+        Ok((
+            encoded,
+            Submitted {
+                encode: committed.encode,
+                commit: committed.commit,
+                wait: t_pre.elapsed() - committed.encode - committed.commit,
+            },
+        ))
+    }
+
+    /// ONE command buffer on the pool's MTL4 queue, committed without waiting for it. `encode`
+    /// records onto its compute encoder, the pool's residency sets declared on it, after the
+    /// forward's input `writes`; if it fails, its error returns with the command buffer ended and
+    /// nothing committed. It starts once every command buffer committed before it is done.
+    fn commit<R>(
+        &self,
+        writes: Option<&InputWrites>,
+        encode: impl FnOnce(
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        ) -> Result<R, ForwardError>,
+    ) -> Result<(R, Committed), ForwardError> {
         use objc2::runtime::AnyObject;
+        use objc2_metal::{
+            MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLSharedEvent, MTLStages,
+        };
         use std::ptr::NonNull;
         let t_pre = std::time::Instant::now();
         let cb = self
             .device
             .newCommandBuffer()
             .expect("newCommandBuffer returned nil");
-        let (encoded, signal_value, queue, event, commit_opts, commit_err) = {
+        let (encoded, t_encoded, in_flight) = {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");
             let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
-            cb.beginCommandBufferWithAllocator(&mtl4.allocator);
+            let taken = mtl4.next;
+            mtl4.next = (taken + 1) % mtl4.ring.len();
+            let ring = &mut mtl4.ring[taken];
+            // Its allocator and staging are reused only once its last command buffer is done.
+            if mtl4.shared_event.signaledValue() < ring.signal {
+                crate::mtl4_dispatch::wait_drained(&mtl4.shared_event, ring.signal);
+            }
+            ring.allocator.reset();
+            cb.beginCommandBufferWithAllocator(&ring.allocator);
+            let staged = writes.map_or(&[][..], |w| &w.staged[..]);
+            if !staged.is_empty() {
+                if ring
+                    .staging
+                    .as_ref()
+                    .is_none_or(|b| b.length() < staged.len())
+                {
+                    let buffer = crate::mtl4_dispatch::shared_zeroed(&self.device, staged.len());
+                    ring.staging = Some(self.allocator.residency().pin(buffer));
+                    self.allocator.residency().commit();
+                }
+                let staging = ring.staging.as_ref().expect("sized above");
+                // SAFETY: `staging` is shared storage of at least `staged.len()` bytes, and no
+                // command buffer reads it: the last one that did is done.
+                unsafe {
+                    let dst = staging.contents().as_ptr().cast::<u8>();
+                    std::ptr::copy_nonoverlapping(staged.as_ptr(), dst, staged.len());
+                }
+            }
             // Residency: MTL4 cmdbufs declare per-cmdbuf.
             // Reuse the same set as the pool (weights + arenas + KV cache).
             let cb_ptr: *mut AnyObject =
@@ -1045,6 +1079,52 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let enc = cb
                 .computeCommandEncoder()
                 .expect("MTL4 computeCommandEncoder returned nil");
+            let ops = writes.map_or(&[][..], |w| &w.ops[..]);
+            let barrier = |before| {
+                enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                    MTLStages::Blit,
+                    before,
+                    MTL4VisibilityOptions::Device,
+                )
+            };
+            let mut earlier_writes = true;
+            for op in ops {
+                // SAFETY: every range is inside its buffers, checked when it was recorded.
+                unsafe {
+                    match op {
+                        InputWrite::Staged { to, at, len } => {
+                            let staging = ring.staging.as_ref().expect("filled above");
+                            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                                staging, *at, to, 0, *len,
+                            );
+                        }
+                        InputWrite::Fill { to, range, byte } => {
+                            enc.fillBuffer_range_value(to, (*range).clone().into(), *byte);
+                        }
+                        InputWrite::Device {
+                            src,
+                            offset,
+                            to,
+                            at,
+                        } => {
+                            // It overwrites the placeholder a staged write put there.
+                            if std::mem::take(&mut earlier_writes) {
+                                barrier(MTLStages::Blit);
+                            }
+                            enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                                src,
+                                *offset,
+                                to,
+                                *at,
+                                size_of::<u32>(),
+                            );
+                        }
+                    }
+                }
+            }
+            if !ops.is_empty() {
+                barrier(MTLStages::Dispatch);
+            }
             let encoded = encode(&enc);
             enc.endEncoding();
             cb.endCommandBuffer();
@@ -1053,55 +1133,43 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             // any half-encoded work to the GPU.
             let encoded = encoded?;
             mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
-            // Drop the lock before the host-side wait so a concurrent
-            // pool consumer can probe `ensure_mtl4` while we wait.
+            mtl4.ring[taken].signal = mtl4.signal_counter;
+            let t_encoded = t_pre.elapsed();
+            // MTL4 does not order command buffers on a queue: one still running when this is
+            // committed holds it back (KV it appends, the token it samples, the inputs it reads).
+            // Committed under the lock, so command buffers reach the queue in signal order.
+            let (queue, event) = (&mtl4.queue, &mtl4.shared_event);
+            let before = mtl4.signal_counter - 1;
+            if event.signaledValue() < before {
+                queue.waitForEvent_value(ProtocolObject::from_ref(&**event), before);
+            }
+            let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let feedback = commit_options(&error);
+            let cb_protocol: &ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> = &cb;
+            let mut cb_array = [NonNull::from(cb_protocol)];
+            unsafe {
+                queue.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &feedback);
+            }
+            // Signal AFTER the cmdbuf so the wait fires only once GPU work
+            // is fully drained.
+            queue.signalEvent_value(ProtocolObject::from_ref(&**event), mtl4.signal_counter);
             (
                 encoded,
-                mtl4.signal_counter,
-                mtl4.queue.clone(),
-                mtl4.shared_event.clone(),
-                mtl4.commit_options.clone(),
-                std::sync::Arc::clone(&mtl4.commit_error),
+                t_encoded,
+                InFlight {
+                    event: event.clone(),
+                    value: mtl4.signal_counter,
+                    error,
+                    _feedback: feedback,
+                },
             )
         };
-        let t_encoded = t_pre.elapsed();
-        let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
-            &cb;
-        let mut cb_array = [NonNull::from(cb_protocol)];
-        unsafe {
-            queue.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
-        }
-        // Signal AFTER the cmdbuf so the wait fires only once GPU work
-        // is fully drained.
-        queue.signalEvent_value(
-            ::objc2::runtime::ProtocolObject::from_ref(&*event),
-            signal_value,
-        );
-        let t_committed = t_pre.elapsed();
-        crate::mtl4_dispatch::wait_drained(&event, signal_value);
-        // GPU execution errors (e.g. command-buffer OOM) arrive via the
-        // commit feedback handler and DO NOT fail the event wait — a
-        // failed CB otherwise yields all-zero outputs and degenerate
-        // logits silently (macOS 26.5.1 / Qwen3.5-MoE "!!!!").
-        if let Some(msg) = commit_err.lock().expect("commit_error mutex").take() {
-            eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
-        }
-        // Reset the allocator now that the GPU is done. Holds the
-        // mutex briefly.
-        {
-            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
-            if let Some(mtl4) = slot.as_mut() {
-                mtl4.allocator.reset();
-            }
-        }
-        let t_waited = t_pre.elapsed();
         Ok((
             encoded,
-            Submitted {
+            Committed {
+                in_flight,
                 encode: t_encoded,
-                commit: t_committed - t_encoded,
-                wait: t_waited - t_committed,
+                commit: t_pre.elapsed() - t_encoded,
             },
         ))
     }
@@ -1117,8 +1185,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         num_seqs: u32,
         has_spec_tokens: bool,
         range: std::ops::Range<usize>,
+        writes: Option<&InputWrites>,
     ) -> Result<(), ForwardError> {
-        self.submit(|enc| {
+        self.submit(writes, |enc| {
             worker
                 .run_bucket_mtl4_range(
                     bucket_idx,
@@ -1182,10 +1251,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
 
         let guard = self.checkout()?;
-        begin_step(&guard, inputs, self.block_table_stride)?;
+        let writes = begin_step(&guard, inputs, self.block_table_stride)?;
 
         // Caller's body encodes the entire chain onto the encoder.
-        let (body_result, took) = self.submit(|enc| body(&guard.worker, &guard.runtime, enc))?;
+        let (body_result, took) = self.submit(Some(&writes), |enc| {
+            body(&guard.worker, &guard.runtime, enc)
+        })?;
         if trace {
             eprintln!("[chain encoder mtl4] {took}");
         }
@@ -1278,7 +1349,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
 
         let guard = self.checkout()?;
-        begin_step(&guard, inputs, self.block_table_stride)?;
+        let writes = begin_step(&guard, inputs, self.block_table_stride)?;
 
         // All execution goes through the MTL4 path. (The opt-in MTL3
         // dispatch path was removed — it only ever ran the all-dispatch
@@ -1299,6 +1370,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             num_seqs,
             has_spec_tokens,
             tail,
+            &writes,
+            inputs.deferred,
         )?;
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
@@ -1372,6 +1445,58 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     }
 }
 
+/// Commit options for ONE command buffer, whose feedback handler records that command buffer's GPU
+/// execution error (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory) in `error`. It is checked after
+/// the wait — a silently-failed command buffer otherwise produces all-zero outputs and degenerate
+/// logits (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode) — and a slot of its own means a later
+/// command buffer's error can neither be taken for it nor consumed by it.
+fn commit_options(
+    error: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) -> objc2::rc::Retained<objc2_metal::MTL4CommitOptions> {
+    let options = objc2_metal::MTL4CommitOptions::new();
+    let err_slot = std::sync::Arc::clone(error);
+    let block = block2::RcBlock::new(
+        move |feedback: std::ptr::NonNull<
+            objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
+        >| {
+            use objc2_metal::MTL4CommitFeedback as _;
+            let fb = unsafe { feedback.as_ref() };
+            if let Some(e) = fb.error() {
+                let msg = format!("{e}");
+                eprintln!("[scratchy-target-metal] GPU COMMIT ERROR: {msg}");
+                // Dump the FULL NSError — code/domain/userInfo. MTL
+                // folds the faulting-encoder label + GPU fault info
+                // into userInfo (MTLCommandBufferEncoderInfoErrorKey),
+                // which the bare Display ("...error 1.") drops. This
+                // is the only signal that names WHICH dispatch faulted.
+                eprintln!(
+                    "[scratchy-target-metal] GPU COMMIT ERROR code={} domain={}",
+                    e.code(),
+                    e.domain(),
+                );
+                // userInfo carries NSUnderlyingError /
+                // NSMultipleUnderlyingErrorsKey whose NESTED NSError
+                // userInfo holds the real per-encoder fault reason.
+                // Debug prints only pointers; NSObject `description`
+                // recurses and renders the whole tree.
+                {
+                    use objc2::runtime::AnyObject;
+                    let ui = e.userInfo();
+                    let ui_obj: &AnyObject = &ui;
+                    let desc: objc2::rc::Retained<objc2_foundation::NSString> =
+                        unsafe { objc2::msg_send![ui_obj, description] };
+                    eprintln!("[scratchy-target-metal] GPU COMMIT ERROR userInfo: {desc}");
+                }
+                *err_slot.lock().expect("commit_error mutex") = Some(msg);
+            }
+        },
+    );
+    // The options object retains the handler block ("references your commit feedback handler
+    // after you add it"); the in-flight command buffer keeps the options until it is done.
+    unsafe { options.addFeedbackHandler(block2::RcBlock::as_ptr(&block) as _) };
+    options
+}
+
 /// TurboQuant full-context dequant grid width = the host block-table ROW
 /// STRIDE for this forward. The serving worker flattens the block table to
 /// `[num_reqs * max_blocks_eff]` (gpu_worker.rs), with
@@ -1382,15 +1507,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 /// `W::MAX_BLOCKS_PER_SEQ` truncated it at 2048 tokens for uniform arches.
 /// Returns 0 when there is no block table (decode-via-cache buckets etc.) — the
 /// dispatch then falls back to the baked const.
-/// Upload the step's inputs into the worker's runtime buffers and set the
-/// per-step values its dispatch reads.
+/// Record the step's writes into the worker's runtime buffers — its inputs, then the tokens an
+/// earlier forward wrote on the device — and set the per-step values its dispatch reads.
 fn begin_step<W: CanonicalParams>(
     worker: &PooledWorker<W>,
     inputs: &ForwardInputs<'_>,
     block_table_stride: MaxBlocksPerSeq,
-) -> Result<(), ForwardError> {
+) -> Result<InputWrites, ForwardError> {
     use std::sync::atomic::Ordering::Relaxed;
-    write_runtime_inputs(&worker.runtime, inputs, block_table_stride)?;
+    let mut writes = InputWrites::default();
+    write_runtime_inputs(&worker.runtime, inputs, block_table_stride, &mut writes)?;
+    for input in inputs.deferred.iter().flat_map(|d| &d.device_inputs) {
+        writes.ops.push(InputWrite::Device {
+            src: input.src.clone(),
+            offset: input.offset,
+            to: worker.runtime.input_ids.clone(),
+            at: input.flat_index * size_of::<u32>(),
+        });
+    }
     worker
         .worker
         .tq_dequant_max_blocks
@@ -1399,7 +1533,7 @@ fn begin_step<W: CanonicalParams>(
         step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
         Relaxed,
     );
-    Ok(())
+    Ok(writes)
 }
 
 /// Whether some sequence of the step has an unrotated (bit-31, span) block
@@ -1435,28 +1569,33 @@ fn tq_dequant_block_width(inputs: &ForwardInputs<'_>) -> u32 {
         .unwrap_or(0)
 }
 
-/// Copy each present input slice into the matching runtime buffer's
-/// host-visible `contents()`. Validates length first; on overflow
-/// returns [`ForwardError::BufferTooSmall`] without touching any
-/// buffer.
-///
-/// The runtime buffers are `MTLResourceOptions::StorageModeShared`
-/// (per `RuntimeFactory` callers), so `contents()` is a host pointer
-/// directly into GPU-visible memory — no staging copy needed.
+/// Record each present input slice's write into the matching runtime
+/// buffer ([`InputWrites`]). Validates length first; on overflow returns
+/// [`ForwardError::BufferTooSmall`].
 fn write_runtime_inputs(
     runtime: &RuntimeBindings,
     inputs: &ForwardInputs<'_>,
     block_table_stride: MaxBlocksPerSeq,
+    writes: &mut InputWrites,
 ) -> Result<(), ForwardError> {
-    write_input(
-        runtime,
+    // `src` at the head of runtime input `buffer`, every byte past it `padding`
+    // ([`WrittenExtents::write`]: only what the last forward wrote past it is re-padded).
+    let mut write = |kind: &'static str, buffer: &Buffer, src: &[u8], padding: Padding| {
+        (runtime.written)
+            .write(buffer, src, padding, writes)
+            .map_err(|bytes_needed| ForwardError::BufferTooSmall {
+                kind,
+                bytes_needed,
+                bytes_available: buffer.length(),
+            })
+    };
+    write(
         "input_ids",
         &runtime.input_ids,
         bytes_of(inputs.input_ids),
         Padding::Zero,
     )?;
-    write_input(
-        runtime,
+    write(
         "positions",
         &runtime.positions,
         bytes_of(inputs.positions),
@@ -1470,8 +1609,7 @@ fn write_runtime_inputs(
     // so they all write K_proj(token 0) to slot 0, racing with — and winning
     // against — the real position-0 write).
     for (g, s) in inputs.slot_mappings.iter().enumerate() {
-        write_input(
-            runtime,
+        write(
             "slot_mapping",
             &runtime.slot_mappings[g],
             bytes_of(s),
@@ -1479,8 +1617,7 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(s) = inputs.cu_seqlens_q {
-        write_input(
-            runtime,
+        write(
             "cu_seqlens_q",
             &runtime.cu_seqlens_q,
             bytes_of(s),
@@ -1488,8 +1625,7 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(s) = inputs.seq_used_k {
-        write_input(
-            runtime,
+        write(
             "seq_used_k",
             &runtime.seq_used_k,
             bytes_of(s),
@@ -1502,8 +1638,7 @@ fn write_runtime_inputs(
     // labels left from a prior forward would make a query's q_span mismatch every key →
     // fully-masked rows → NaN/crash. Label 0 = attends-all = mask inert.
     let spans = inputs.span_ids.unwrap_or(&[]);
-    write_input(
-        runtime,
+    write(
         "span_ids",
         &runtime.span_ids,
         bytes_of(spans),
@@ -1535,8 +1670,7 @@ fn write_runtime_inputs(
                 rung: block_table_stride,
             });
         }
-        write_input(
-            runtime,
+        write(
             "block_table",
             &runtime.block_tables[g],
             bytes_of(s),
@@ -1546,10 +1680,12 @@ fn write_runtime_inputs(
     // Tell the gather kernel (used right before lm_head) what the
     // actual num_tokens of this forward is so it can pick the
     // last-token source row.
-    unsafe {
-        let ptr = runtime.num_tokens_u32.contents().as_ptr() as *mut u32;
-        std::ptr::write(ptr, inputs.num_tokens);
-    }
+    write(
+        "num_tokens",
+        &runtime.num_tokens_u32,
+        bytes_of(&[inputs.num_tokens]),
+        Padding::Zero,
+    )?;
     // Plumb the lm_head sample-row index list. When the caller
     // supplies `last_token_indices` (the common case: every forward
     // that produces a sampled token) the slice trio uses these as
@@ -1559,13 +1695,14 @@ fn write_runtime_inputs(
         .last_token_indices
         .map(|s| s.len() as u32)
         .unwrap_or(0);
-    unsafe {
-        let ptr = runtime.num_sample_rows_u32.contents().as_ptr() as *mut u32;
-        std::ptr::write(ptr, num_sample_rows);
-    }
+    write(
+        "num_sample_rows",
+        &runtime.num_sample_rows_u32,
+        bytes_of(&[num_sample_rows]),
+        Padding::Zero,
+    )?;
     if let Some(s) = inputs.last_token_indices {
-        write_input(
-            runtime,
+        write(
             "last_token_indices",
             &runtime.sample_indices,
             bytes_of(s),
@@ -1577,8 +1714,7 @@ fn write_runtime_inputs(
     if let Some(idx) = inputs.gdn_state_indices {
         // i32 and u32 share the 4-byte layout the kernels read as int.
         let as_u32 = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u32, idx.len()) };
-        write_input(
-            runtime,
+        write(
             "gdn_state_indices",
             &runtime.gdn_state_indices,
             bytes_of(as_u32),
@@ -1586,8 +1722,7 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(fresh) = inputs.gdn_is_fresh {
-        write_input(
-            runtime,
+        write(
             "gdn_is_fresh",
             &runtime.gdn_is_fresh,
             bytes_of(fresh),
@@ -1598,8 +1733,7 @@ fn write_runtime_inputs(
     // bytes — `freqs` is f32, `pixels` is the model dtype (bf16); the
     // runtime buffers are untyped and the kernels reinterpret.
     if let Some(b) = inputs.vision_rope_freqs {
-        write_input(
-            runtime,
+        write(
             "vision_rope_freqs",
             &runtime.vision_rope_freqs,
             b,
@@ -1607,21 +1741,14 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(b) = inputs.pixels {
-        write_input(runtime, "pixels", &runtime.pixels, b, Padding::Zero)?;
+        write("pixels", &runtime.pixels, b, Padding::Zero)?;
     }
     if let Some(b) = inputs.pos_embeds {
-        write_input(
-            runtime,
-            "pos_embeds",
-            &runtime.vision_pos_embeds,
-            b,
-            Padding::Zero,
-        )?;
+        write("pos_embeds", &runtime.vision_pos_embeds, b, Padding::Zero)?;
     }
     // Qwen2.5-VL windowed-attention externs (i32/u32 bytes, verbatim).
     if let Some(b) = inputs.vision_cu_seqlens_full {
-        write_input(
-            runtime,
+        write(
             "vision_cu_seqlens_full",
             &runtime.vision_cu_seqlens_full,
             b,
@@ -1629,8 +1756,7 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(b) = inputs.vision_cu_seqlens_window {
-        write_input(
-            runtime,
+        write(
             "vision_cu_seqlens_window",
             &runtime.vision_cu_seqlens_window,
             b,
@@ -1638,8 +1764,7 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(b) = inputs.vision_window_index {
-        write_input(
-            runtime,
+        write(
             "vision_window_index",
             &runtime.vision_window_index,
             b,
@@ -1647,8 +1772,7 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(b) = inputs.vision_reverse_indices {
-        write_input(
-            runtime,
+        write(
             "vision_reverse_indices",
             &runtime.vision_reverse_indices,
             b,
@@ -1656,8 +1780,7 @@ fn write_runtime_inputs(
         )?;
     }
     if let Some(b) = inputs.vision_position_ids {
-        write_input(
-            runtime,
+        write(
             "vision_position_ids",
             &runtime.vision_position_ids,
             b,
@@ -1667,11 +1790,10 @@ fn write_runtime_inputs(
     // Multimodal splice (MM-bearing batches only). mm_embeds = the
     // projected vision output (bytes); mm_dst_rows = per-row dst (u32).
     if let Some(b) = inputs.mm_embeds {
-        write_input(runtime, "mm_embeds", &runtime.mm_embeds, b, Padding::Zero)?;
+        write("mm_embeds", &runtime.mm_embeds, b, Padding::Zero)?;
     }
     if let Some(d) = inputs.mm_dst_rows {
-        write_input(
-            runtime,
+        write(
             "mm_dst_rows",
             &runtime.mm_dst_rows,
             bytes_of(d),
@@ -1681,33 +1803,9 @@ fn write_runtime_inputs(
     // MRoPE cos/sin override (MRoPE text decoders only). Bytes in the
     // rope kernel's element dtype; the worker binds it at the cos/sin slot.
     if let Some(b) = inputs.mrope_cos_sin {
-        write_input(
-            runtime,
-            "mrope_cos_sin",
-            &runtime.mrope_cos_sin,
-            b,
-            Padding::Zero,
-        )?;
+        write("mrope_cos_sin", &runtime.mrope_cos_sin, b, Padding::Zero)?;
     }
     Ok(())
-}
-
-/// Write `src` at the head of runtime input `buffer`, every byte past it `padding`
-/// ([`WrittenExtents::write`]: only what the last forward wrote past it is re-padded).
-fn write_input(
-    runtime: &RuntimeBindings,
-    kind: &'static str,
-    buffer: &Buffer,
-    src: &[u8],
-    padding: Padding,
-) -> Result<(), ForwardError> {
-    (runtime.written)
-        .write(buffer, src, padding)
-        .map_err(|bytes_needed| ForwardError::BufferTooSmall {
-            kind,
-            bytes_needed,
-            bytes_available: buffer.length(),
-        })
 }
 
 /// `src`'s bytes.
@@ -2259,6 +2357,7 @@ mod tests {
                 mm_embeds: None,
                 mm_dst_rows: None,
                 mrope_cos_sin: None,
+                deferred: None,
             };
             step_has_unrotated_blocks(&inputs, 16)
         };
@@ -2299,6 +2398,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            deferred: None,
         };
         // Closure runs *while* the worker is checked out — assertion
         // is that we got it (not on numerical correctness; that's
@@ -2314,6 +2414,105 @@ mod tests {
             .expect("forward succeeds");
         assert_eq!(saw, 42);
         assert_eq!(pool.available(), 1, "worker returned to pool after forward");
+    }
+
+    /// Two failed command buffers in flight each report their own failure, to every wait: the
+    /// engine's resolver and the worker both wait on a deferred step, and a wait does not consume
+    /// the error a later wait — or another command buffer's — needs.
+    #[test]
+    fn every_wait_on_a_failed_command_buffer_reports_it() {
+        use objc2_metal::MTLSharedEvent;
+        let Some(pool) = build_multi_bucket_pool(&[1], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let event = pool.device.newSharedEvent().expect("shared event");
+        event.setSignaledValue(2);
+        let failed = |value| {
+            let error = Arc::new(Mutex::new(Some(format!("command buffer {value} failed"))));
+            InFlight {
+                event: event.clone(),
+                value,
+                _feedback: commit_options(&error),
+                error,
+            }
+        };
+        let (first, second) = (failed(1), failed(2));
+        for step in [&first, &first, &second, &second] {
+            assert!(
+                matches!(step.wait(), Err(ForwardError::ExecutionFailed(_))),
+                "a failed command buffer waited on reports its failure"
+            );
+        }
+    }
+
+    /// A forward's input writes are made on the device, not the host: the staged ones, re-padding
+    /// what the forward before wrote, then each device input over its placeholder — a token the
+    /// host never had.
+    #[test]
+    fn recorded_input_writes_land_on_the_device() {
+        let Some(pool) = build_multi_bucket_pool(&[4], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        pool.ensure_mtl4();
+        let sampled = pool
+            .allocator
+            .residency()
+            .pin(crate::mtl4_dispatch::shared_bytes(
+                &pool.device,
+                bytes_of(&[7, 42]),
+            ));
+        pool.allocator.residency().commit();
+        let guard = pool.checkout().expect("a worker");
+        let input_ids = || crate::mtl4_dispatch::read_slice::<u32>(&guard.runtime.input_ids, 4);
+        let run = |ids: &[u32], device_inputs| {
+            let positions: Vec<u32> = (0..ids.len() as u32).collect();
+            let deferral = Deferral::new(device_inputs);
+            let inputs = ForwardInputs {
+                span_ids: None,
+                num_tokens: ids.len() as u32,
+                input_ids: ids,
+                positions: &positions,
+                slot_mappings: Vec::new(),
+                cu_seqlens_q: None,
+                seq_used_k: None,
+                block_tables: Vec::new(),
+                has_spec_tokens: false,
+                last_token_indices: None,
+                gdn_state_indices: None,
+                gdn_is_fresh: None,
+                vision_rope_freqs: None,
+                vision_cu_seqlens_full: None,
+                vision_cu_seqlens_window: None,
+                vision_window_index: None,
+                vision_reverse_indices: None,
+                vision_position_ids: None,
+                pixels: None,
+                pos_embeds: None,
+                mm_embeds: None,
+                mm_dst_rows: None,
+                mrope_cos_sin: None,
+                deferred: Some(&deferral),
+            };
+            let before = input_ids();
+            let writes = begin_step(&guard, &inputs, pool.block_table_stride).expect("inputs fit");
+            assert_eq!(
+                input_ids(),
+                before,
+                "a recorded write leaves the host copy alone"
+            );
+            let ((), committed) = pool.commit(Some(&writes), |_| Ok(())).expect("commits");
+            committed.in_flight.wait().expect("runs");
+            input_ids()
+        };
+        let device_input = crate::interpreter::metal::DeviceInput {
+            src: (*sampled).clone(),
+            offset: size_of::<u32>(),
+            flat_index: 1,
+        };
+        assert_eq!(run(&[5, 0, 9], vec![device_input]), [5, 42, 9, 0]);
+        assert_eq!(run(&[8], Vec::new()), [8, 0, 0, 0]);
     }
 
     #[test]
@@ -2346,6 +2545,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            deferred: None,
         };
         let err = pool
             .forward(&inputs, |_, _| ())
@@ -2386,6 +2586,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            deferred: None,
         };
         match pool.forward(&inputs, |_, _| ()) {
             Err(ForwardError::NoBucketFits {
@@ -2436,6 +2637,7 @@ mod tests {
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
+            deferred: None,
         };
         let err = pool
             .forward(&inputs, |_, _| ())
