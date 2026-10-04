@@ -9368,6 +9368,25 @@ fn dump_wavefront_mega(
                                     // unrolled bundle stays ONE bundle: `unroll_layers` already
                                     // walks the launch sequence across classes.
                                     let mut body_fps: Vec<String> = Vec::new();
+                                    // ⛔ A FAILED BODY CLASS IS A BUILD ERROR, NOT A SKIP — EXCEPT
+                                    // ON THE BATCH LADDER, WHERE THE RUNG CONTRACT IS THE SKIP. An
+                                    // empty fp here rides into `RerollMeta::bodies` as a sibling
+                                    // nobody emitted: the worker's body selector finds no bundle and
+                                    // the first signal is a launch-time refusal with none of this
+                                    // context. This is the site the oversized-dxp-group guard
+                                    // (`DxGroupCeiling`) reaches on a PRIMARY body bundle — a body
+                                    // class is not a ladder rung, there is no narrower rung to fall
+                                    // back to, and log-and-skip here is exactly the swallow that
+                                    // would have turned the guard into an eprintln. A decode BATCH
+                                    // rung (`decode_rows > 1`) is the documented exception: "a rung
+                                    // that fails to lower is logged and SKIPPED; that batch runs on
+                                    // a narrower rung, in more than one forward, which is slower and
+                                    // never wrong" — the mq=32 gemma-4 rung is exactly that case
+                                    // (its gathered fold is 8,300 descriptors, over the ceiling;
+                                    // mq=16's 4,172 is not).
+                                    // `None` = errors are fatal (primary bodies); on a batch rung
+                                    // (`decode_rows > 1`) they are skipped per the rung contract.
+                                    let mut body_err: Option<std::io::Error> = None;
                                     for (ci, b) in rolled.bodies.iter().enumerate() {
                                         let r = superdsc::emit_bundle(
                                             if card { &b.ops } else { &unrolled },
@@ -9382,12 +9401,17 @@ fn dump_wavefront_mega(
                                                     "[spyre-superdsc] {base}: body class {ci} emit \
                                                      failed: {e}"
                                                 );
-                                                body_fps.push(String::new());
+                                                if decode_rows <= 1 {
+                                                    body_err = body_err.or(Some(e));
+                                                }
                                             }
                                         }
                                     }
-                                    let bod: Result<String, std::io::Error> =
-                                        Ok(body_fps.first().cloned().unwrap_or_default());
+                                    let bod: Result<String, std::io::Error> = body_err
+                                        .map(Err)
+                                        .unwrap_or_else(|| {
+                                            Ok(body_fps.first().cloned().unwrap_or_default())
+                                        });
                                     // The SAME body, with the per-page fold fused back into the
                                     // surrounding work instead of standing alone. Splitting the fold
                                     // costs one extra launch per layer (measured: 5 groups vs the
@@ -9773,7 +9797,20 @@ fn dump_wavefront_mega(
                                         } else {
                                             {
                                                 let mut r = superdsc_decode_rungs.borrow_mut();
-                                                if !r.iter().any(|(n, _, _)| *n == decode_rows) {
+                                                // ⛔ AN EMPTY fp IS A SKIPPED RUNG, NOT A REGISTERED
+                                                // ONE: the batch-ladder contract is that a rung whose
+                                                // emit failed simply does not appear, so the worker
+                                                // falls to the next narrower rung. Registering it
+                                                // with `""` would hand the selector a bundle nobody
+                                                // emitted.
+                                                if bfp.is_empty() {
+                                                    eprintln!(
+                                                        "[spyre-superdsc] {base}: decode batch rung \
+                                                         seqs={decode_rows} NOT BAKED (emit failed \
+                                                         above) — SKIPPED; that batch runs on a \
+                                                         narrower rung, in more than one forward"
+                                                    );
+                                                } else if !r.iter().any(|(n, _, _)| *n == decode_rows) {
                                                     // `cap` IS this body's swept extent: `bfp` is the
                                                     // CEILING rung (the interior sweep rungs go to
                                                     // `sk_bucket_rungs`), and `ActiveCap::FULL` resolves
