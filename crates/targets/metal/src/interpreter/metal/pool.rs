@@ -317,15 +317,6 @@ struct Mtl4Pool {
     next: usize,
     shared_event: crate::interpreter::metal::__re::SharedEvent,
     signal_counter: u64,
-    /// Commit options carrying the feedback handler that records GPU
-    /// execution errors (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory).
-    /// Reused across commits; access is serialized by the `mtl4` Mutex.
-    commit_options: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
-    /// Last GPU execution error reported via commit feedback. Checked
-    /// after every event wait — a silently-failed command buffer
-    /// otherwise produces all-zero outputs and degenerate logits
-    /// (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode).
-    commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// One of [`Mtl4Pool::ring`]'s command allocators.
@@ -875,62 +866,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .device
             .newSharedEvent()
             .expect("device.newSharedEvent() returned nil");
-        let commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let commit_options = objc2_metal::MTL4CommitOptions::new();
-        {
-            let err_slot = std::sync::Arc::clone(&commit_error);
-            let block = block2::RcBlock::new(
-                move |feedback: std::ptr::NonNull<
-                    objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
-                >| {
-                    use objc2_metal::MTL4CommitFeedback as _;
-                    let fb = unsafe { feedback.as_ref() };
-                    if let Some(e) = fb.error() {
-                        let msg = format!("{e}");
-                        eprintln!("[scratchy-target-metal] GPU COMMIT ERROR: {msg}");
-                        // Dump the FULL NSError — code/domain/userInfo. MTL
-                        // folds the faulting-encoder label + GPU fault info
-                        // into userInfo (MTLCommandBufferEncoderInfoErrorKey),
-                        // which the bare Display ("...error 1.") drops. This
-                        // is the only signal that names WHICH dispatch faulted.
-                        eprintln!(
-                            "[scratchy-target-metal] GPU COMMIT ERROR code={} domain={}",
-                            e.code(),
-                            e.domain(),
-                        );
-                        // userInfo carries NSUnderlyingError /
-                        // NSMultipleUnderlyingErrorsKey whose NESTED NSError
-                        // userInfo holds the real per-encoder fault reason.
-                        // Debug prints only pointers; NSObject `description`
-                        // recurses and renders the whole tree.
-                        {
-                            use objc2::runtime::AnyObject;
-                            let ui = e.userInfo();
-                            let ui_obj: &AnyObject = &ui;
-                            let desc: objc2::rc::Retained<objc2_foundation::NSString> =
-                                unsafe { objc2::msg_send![ui_obj, description] };
-                            eprintln!("[scratchy-target-metal] GPU COMMIT ERROR userInfo: {desc}");
-                        }
-                        *err_slot.lock().expect("commit_error mutex") = Some(msg);
-                    }
-                },
-            );
-            unsafe { commit_options.addFeedbackHandler(block2::RcBlock::as_ptr(&block) as _) };
-            // The options object retains the handler block per Apple's
-            // contract ("references your commit feedback handler after
-            // you add it"); leak our RcBlock so the pointer stays valid
-            // for the pool's lifetime regardless.
-            std::mem::forget(block);
-        }
         *slot = Some(Mtl4Pool {
             queue,
             ring,
             next: 0,
             shared_event,
             signal_counter: 0,
-            commit_options,
-            commit_error,
         });
     }
 
@@ -1202,14 +1143,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if event.signaledValue() < before {
                 queue.waitForEvent_value(ProtocolObject::from_ref(&**event), before);
             }
+            let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let feedback = commit_options(&error);
             let cb_protocol: &ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> = &cb;
             let mut cb_array = [NonNull::from(cb_protocol)];
             unsafe {
-                queue.commit_count_options(
-                    NonNull::from(&mut cb_array[0]),
-                    1,
-                    &mtl4.commit_options,
-                );
+                queue.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &feedback);
             }
             // Signal AFTER the cmdbuf so the wait fires only once GPU work
             // is fully drained.
@@ -1220,8 +1159,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 InFlight {
                     event: event.clone(),
                     value: mtl4.signal_counter,
-                    error: std::sync::Arc::clone(&mtl4.commit_error),
-                    outcome: std::sync::OnceLock::new(),
+                    error,
+                    _feedback: feedback,
                 },
             )
         };
@@ -1504,6 +1443,58 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // this worker, the others stay blocked.
         self.cv.notify_one();
     }
+}
+
+/// Commit options for ONE command buffer, whose feedback handler records that command buffer's GPU
+/// execution error (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory) in `error`. It is checked after
+/// the wait — a silently-failed command buffer otherwise produces all-zero outputs and degenerate
+/// logits (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode) — and a slot of its own means a later
+/// command buffer's error can neither be taken for it nor consumed by it.
+fn commit_options(
+    error: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) -> objc2::rc::Retained<objc2_metal::MTL4CommitOptions> {
+    let options = objc2_metal::MTL4CommitOptions::new();
+    let err_slot = std::sync::Arc::clone(error);
+    let block = block2::RcBlock::new(
+        move |feedback: std::ptr::NonNull<
+            objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
+        >| {
+            use objc2_metal::MTL4CommitFeedback as _;
+            let fb = unsafe { feedback.as_ref() };
+            if let Some(e) = fb.error() {
+                let msg = format!("{e}");
+                eprintln!("[scratchy-target-metal] GPU COMMIT ERROR: {msg}");
+                // Dump the FULL NSError — code/domain/userInfo. MTL
+                // folds the faulting-encoder label + GPU fault info
+                // into userInfo (MTLCommandBufferEncoderInfoErrorKey),
+                // which the bare Display ("...error 1.") drops. This
+                // is the only signal that names WHICH dispatch faulted.
+                eprintln!(
+                    "[scratchy-target-metal] GPU COMMIT ERROR code={} domain={}",
+                    e.code(),
+                    e.domain(),
+                );
+                // userInfo carries NSUnderlyingError /
+                // NSMultipleUnderlyingErrorsKey whose NESTED NSError
+                // userInfo holds the real per-encoder fault reason.
+                // Debug prints only pointers; NSObject `description`
+                // recurses and renders the whole tree.
+                {
+                    use objc2::runtime::AnyObject;
+                    let ui = e.userInfo();
+                    let ui_obj: &AnyObject = &ui;
+                    let desc: objc2::rc::Retained<objc2_foundation::NSString> =
+                        unsafe { objc2::msg_send![ui_obj, description] };
+                    eprintln!("[scratchy-target-metal] GPU COMMIT ERROR userInfo: {desc}");
+                }
+                *err_slot.lock().expect("commit_error mutex") = Some(msg);
+            }
+        },
+    );
+    // The options object retains the handler block ("references your commit feedback handler
+    // after you add it"); the in-flight command buffer keeps the options until it is done.
+    unsafe { options.addFeedbackHandler(block2::RcBlock::as_ptr(&block) as _) };
+    options
 }
 
 /// TurboQuant full-context dequant grid width = the host block-table ROW
@@ -2423,6 +2414,36 @@ mod tests {
             .expect("forward succeeds");
         assert_eq!(saw, 42);
         assert_eq!(pool.available(), 1, "worker returned to pool after forward");
+    }
+
+    /// Two failed command buffers in flight each report their own failure, to every wait: the
+    /// engine's resolver and the worker both wait on a deferred step, and a wait does not consume
+    /// the error a later wait — or another command buffer's — needs.
+    #[test]
+    fn every_wait_on_a_failed_command_buffer_reports_it() {
+        use objc2_metal::MTLSharedEvent;
+        let Some(pool) = build_multi_bucket_pool(&[1], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let event = pool.device.newSharedEvent().expect("shared event");
+        event.setSignaledValue(2);
+        let failed = |value| {
+            let error = Arc::new(Mutex::new(Some(format!("command buffer {value} failed"))));
+            InFlight {
+                event: event.clone(),
+                value,
+                _feedback: commit_options(&error),
+                error,
+            }
+        };
+        let (first, second) = (failed(1), failed(2));
+        for step in [&first, &first, &second, &second] {
+            assert!(
+                matches!(step.wait(), Err(ForwardError::ExecutionFailed(_))),
+                "a failed command buffer waited on reports its failure"
+            );
+        }
     }
 
     /// A forward's input writes are made on the device, not the host: the staged ones, re-padding

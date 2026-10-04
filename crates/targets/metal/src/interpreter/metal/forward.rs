@@ -194,13 +194,15 @@ pub struct DeviceInput {
 pub struct InFlight {
     pub(super) event: super::__re::SharedEvent,
     pub(super) value: u64,
+    /// Its GPU execution error, recorded by its own commit feedback handler.
     pub(super) error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    /// The execution error the first [`Self::wait`] found, for every later one.
-    pub(super) outcome: std::sync::OnceLock<Option<String>>,
+    /// The commit options carrying that handler, kept until the command buffer is done.
+    pub(super) _feedback: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
 }
 
-// SAFETY: like the pool's (`MetalWorkerPool`), the markers objc2's protocol objects lack: a shared
-// event is made to be waited on from any thread, and the error slot is a mutex.
+// SAFETY: like the pool's (`MetalWorkerPool`), the markers objc2's objects lack: a shared event is
+// made to be waited on from any thread, the error slot is a mutex, and the commit options are only
+// held, never used, once committed.
 unsafe impl Send for InFlight {}
 unsafe impl Sync for InFlight {}
 
@@ -209,9 +211,7 @@ impl InFlight {
     /// — a failed command buffer otherwise yields all-zero outputs silently.
     pub fn wait(&self) -> Result<(), ForwardError> {
         crate::mtl4_dispatch::wait_drained(&self.event, self.value);
-        let failed =
-            (self.outcome).get_or_init(|| self.error.lock().expect("commit_error mutex").take());
-        if let Some(msg) = failed {
+        if let Some(msg) = &*self.error.lock().expect("commit error mutex") {
             eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
             return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
