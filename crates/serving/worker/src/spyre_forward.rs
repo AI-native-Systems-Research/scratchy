@@ -1633,15 +1633,6 @@ pub(crate) fn forward_chunk(
             .iter()
             .map(|id| (*id as u64, wanted.get(&(*id as u64)).copied().unwrap_or(0)))
             .collect();
-        // TEMP-PROBE-2 (remove before commit): snapshot the staged cos tables.
-        let mut cos_snap: Vec<(usize, u64, String, Vec<f32>)> = Vec::new();
-        for (ci, &(cid, w, kind)) in b.cos_srcs.iter().enumerate() {
-            if let Some((_, data, _)) = dynamic.iter().find(|(t, _, _)| *t == cid as u64) {
-                cos_snap.push((ci, cid as u64, format!("{kind:?}"), data[..w.min(24) as usize].to_vec()));
-            }
-        }
-        let dyn_len = dynamic.len();
-        // END TEMP-PROBE-2
         let out = session
             .run_step(b.prog, dynamic, &outputs)
             .map_err(|e| werr(format!("run_step: {e}")))?;
@@ -1652,38 +1643,6 @@ pub(crate) fn forward_chunk(
             req.kv_v[li].extend_from_slice(&out[&(lw.new_v_id as u64)][..n * kvw]);
         }
         let res = &out[&(b.result_id as u64)];
-        // TEMP-PROBE (remove before commit)
-        {
-            let nnan = res[..vocab].iter().filter(|v| v.is_nan()).count();
-            let ninf = res[..vocab].iter().filter(|v| v.is_infinite()).count();
-            let mx = res[..vocab].iter().fold(0.0f32, |a, v| a.max(v.abs()));
-            eprintln!(
-                "PROBE result: len={} nan={} inf={} maxabs={}",
-                res.len(),
-                nnan,
-                ninf,
-                mx
-            );
-            for (li, lw) in b.layers.iter().enumerate().take(6) {
-                let k = &out[&(lw.new_k_id as u64)];
-                let v = &out[&(lw.new_v_id as u64)];
-                eprintln!(
-                    "PROBE layer {li} (kvw={}): k nan={} maxabs={:.3} | v nan={} maxabs={:.3}",
-                    lw.kv_width,
-                    k.iter().filter(|x| x.is_nan()).count(),
-                    k.iter().fold(0.0f32, |a, x| a.max(x.abs())),
-                    v.iter().filter(|x| x.is_nan()).count(),
-                    v.iter().fold(0.0f32, |a, x| a.max(x.abs())),
-                );
-            }
-        }
-        // END TEMP-PROBE
-        // TEMP-PROBE-2 print (remove before commit)
-        eprintln!("PROBE2 dyn sources = {dyn_len}");
-        for (ci, cid, kind, row) in &cos_snap {
-            eprintln!("PROBE2 cos[{ci}] t{cid} {kind}: first-row = {row:?}");
-        }
-        // END TEMP-PROBE-2
         // ⭐⭐⭐ ONE LOGITS ROW, AT ROW 0 — because that is what the bundle COMPUTES.
         //
         // A prefill bundle does not run its vocab-wide lm_head at `mq`. `lower_one_node`'s

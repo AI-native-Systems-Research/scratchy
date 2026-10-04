@@ -818,16 +818,6 @@ fn lower_rope_node<F: RopeForm, const HD: u32>(
     }
     let mut st = KtirFunc::new(ir);
     let name = Arena::global().str(format!("rope_s{}", node.id.index()));
-    // TEMP-PROBE-5 (remove before commit)
-    eprintln!(
-        "PROBE5 rope_s{}: HD={HD} total={total} rows={} in0={:?} in1={:?} out={:?}",
-        node.id.index(),
-        node.output.region.rows.len,
-        node.inputs[0].region,
-        node.inputs[1].region,
-        node.output.region,
-    );
-    // END TEMP-PROBE-5
     st.rope(
         RopeTensors {
             x_t: node.inputs[0].tensor,
@@ -1309,16 +1299,6 @@ struct LowerRope<'a, F: RopeForm> {
 impl<F: RopeForm> scratchy_subtile::model_geometry::OnHeadDim for LowerRope<'_, F> {
     type Out = Result<Vec<EmittedOp>, SuperDscError>;
     fn on_head_dim<const HD: u32>(self) -> Self::Out {
-        // TEMP-PROBE-5 (remove before commit)
-        eprintln!(
-            "PROBE5 rope HD={HD} node id={} rows={:?} out={:?} in0={:?} in1={:?}",
-            self.node.id.index(),
-            self.node.output.region.rows,
-            self.node.output.region,
-            self.node.inputs[0].region,
-            self.node.inputs[1].region,
-        );
-        // END TEMP-PROBE-5
         lower_rope_node::<F, HD>(
             self.node,
             self.ir,

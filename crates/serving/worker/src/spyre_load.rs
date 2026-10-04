@@ -195,30 +195,6 @@ pub(crate) fn wiring_to_parsed(
     if layers.is_empty() {
         return Err(werr("wiring carries no per-layer AttnDecode wiring"));
     }
-    // TEMP-PROBE-4 (remove before commit): dump shapes of the tensors the layer wiring names.
-    {
-        let n = w.tensor_shapes.len();
-        eprintln!("PROBE4 wiring has {n} tensor shapes");
-        for (li, l) in w.layers.iter().enumerate().take(6) {
-            let get = |id: u32| w.tensor_shapes.get(id as usize).copied();
-            eprintln!(
-                "PROBE4 layer {li}: pk t{} {:?} nk t{} {:?} nv t{} {:?}",
-                l.prefix_k,
-                get(l.prefix_k),
-                l.new_k,
-                get(l.new_k),
-                l.new_v,
-                get(l.new_v),
-            );
-        }
-        for &(cid, wd, _) in w.cos_srcs.iter() {
-            eprintln!(
-                "PROBE4 cos t{cid} w={wd} shape={:?}",
-                w.tensor_shapes.get(cid as usize).copied()
-            );
-        }
-    }
-    // END TEMP-PROBE-4
     let triples = |v: &'static [(u32, u32, scratchy_target_spyre::wiring::RotaryKind)]| -> Vec<
         (usize, usize, scratchy_target_spyre::wiring::RotaryKind),
     > {

@@ -30,7 +30,6 @@
 use crate::classified::{Program, UnrollIndex, WeightId};
 use crate::to_wavefront::{LoweredDecode, SourceBinding};
 use crate::weight_vocab::{WeightAccessor, WeightKind};
-use scratchy_subtile::handoff::BundleTensor;
 use scratchy_subtile::lower::{GemmWeight, InputRef};
 use scratchy_subtile::subtile_ir::{EwKind, SubOp};
 
@@ -280,6 +279,9 @@ pub(crate) fn emit_weight_bindings(
     tw: &TapeWeights,
 ) -> Result<proc_macro2::TokenStream, String> {
     use quote::quote;
+    // Function-scoped because every user is in this spyre-gated body: a
+    // module-level import would be dead under `-Fmetal` (b76516bab).
+    use scratchy_subtile::handoff::BundleTensor;
     // Accessor name → how to reach that field on `w`. The three group shapes
     // are the struct emitter's own (`Unindexed` ⇒ `w.base`,
     // `LayeredContiguous` ⇒ `w.base[L]`, `LayeredSparse` ⇒ `w.base_L`), keyed
