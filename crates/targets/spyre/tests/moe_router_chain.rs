@@ -172,24 +172,23 @@ fn route_argsort_matches_the_stable_ascending_rank() {
     }
 }
 
-/// The top-k is the TRAILING k columns of the sorted row — the highest ranks,
-/// i.e. the LARGEST scores — matching metal's `slice_trailing_cols`.
+/// The top-k selects, from the argsort's RANK vector, the indices of the k
+/// highest-scoring experts — exactly metal's `sorted[..., -k:]` selection
+/// (`slice_trailing_cols`'s experts), in the same ascending-score order.
+///
+/// ⛔ THE INPUT IS THE RANK VECTOR, NOT THE SORTED-INDEX PERMUTATION. This
+/// lowering's argsort emits ranks (`rank[n,h]` = expert h's sorted position),
+/// and top-k INVERTS that permutation (a one-hot selector sum over the rank
+/// row); metal's kernel emits the permutation and slices it. The two compose
+/// to the same experts — this pins that equivalence, on the same fixture rows
+/// (distinct values, duplicates, a NaN) the argsort test uses.
 #[test]
-fn route_topk_takes_the_trailing_k_sorted_columns() {
+fn route_topk_inverts_the_rank_vector_to_the_topk_experts() {
     let (m, e, k) = (ARGSORT_M, ARGSORT_E, 2u32);
     let scores = argsort_scores();
-    // The sorted rows of the fixture, from the golden rank above.
-    let sorted: Vec<f32> = (0..m as usize)
-        .flat_map(|r| {
-            let row = &scores[r * e as usize..(r + 1) * e as usize];
-            let mut idx: Vec<usize> = (0..row.len()).collect();
-            idx.sort_by(|&a, &b| {
-                row[a]
-                    .partial_cmp(&row[b])
-                    .unwrap_or(std::cmp::Ordering::Greater)
-            });
-            idx.iter().map(|&i| i as f32).collect::<Vec<_>>()
-        })
+    // The rank rows, exactly what RouteArgsort's program writes.
+    let ranks: Vec<f32> = (0..m as usize)
+        .flat_map(|r| argsort_rank(&scores[r * e as usize..(r + 1) * e as usize]))
         .collect();
     let ir = one_node_ir(
         vec![
@@ -204,10 +203,25 @@ fn route_topk_takes_the_trailing_k_sorted_columns() {
         },
         &[0],
     );
-    let got = run_one_node(&ir, vec![(0, sorted.clone())]);
-    // Golden: the last k columns of each sorted row.
+    let got = run_one_node(&ir, vec![(0, ranks.clone())]);
+    // Golden: the k highest-scoring experts' indices, ascending by score —
+    // the trailing slice of metal's ascending sorted-index permutation. NaN
+    // counts as greatest (the argsort's own sanitization; a bare
+    // `partial_cmp().unwrap_or(Greater)` is NOT a total order on NaNs).
     let golden: Vec<f32> = (0..m as usize)
-        .flat_map(|r| sorted[r * e as usize + (e - k) as usize..(r + 1) * e as usize].to_vec())
+        .flat_map(|r| {
+            let row = &scores[r * e as usize..(r + 1) * e as usize];
+            let san: Vec<f32> = row
+                .iter()
+                .map(|&v| if v.is_nan() { f32::INFINITY } else { v })
+                .collect();
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            idx.sort_by(|&a, &b| san[a].total_cmp(&san[b]));
+            idx[e as usize - k as usize..]
+                .iter()
+                .map(|&i| i as f32)
+                .collect::<Vec<_>>()
+        })
         .collect();
     assert_eq!(got.len(), golden.len(), "topk width");
     for (i, (g, w)) in golden.iter().zip(&got).enumerate() {
