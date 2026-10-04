@@ -305,6 +305,35 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             return Ok(None);
         }
     }
+    // ⛔⛔⛔ A COLUMN-CHUNKED NODE IS NOT A SPLICE TARGET — the whole pointwise family
+    // (silumul and elementwise alike). The front end tiles a wide op into COLUMN CHUNKS
+    // of `nb` (subtile_ir.rs's `n_blocks(out_cols, nb)`; production `nb = 8192`), and the
+    // builder's program states each chunk's ACCESS-TILE CORNER (`load_region` honors
+    // `region.cols.start`), which the door turns into the operand's column offset
+    // (`pointwise_chunk_out_offset` → the 16384 B stick-group step at column 8192). The
+    // kernels here state ONE whole-tensor tile at corner 0 — they cannot name a window.
+    // MEASURED, granite-3.1-8b fp8 on card: the 12800-wide MLP intermediate is TWO chunks
+    // (0..8192, 8192..12800), and without this guard the second chunk's silu/mulsilu read
+    // and wrote the FIRST chunk's columns (the decode bundle's two differing descriptors
+    // were exactly the second chunk's gate binding, 16384 B low) — fluent garbage out, on
+    // a divergence the whole-region golden could not see because every fixture is
+    // whole-region. 2b passed only because its intermediate is 8192 = exactly one block.
+    // A windowed kernel is a follow-on row; until then a node whose regions are not the
+    // whole tensors falls through to the builder, which states the corner itself.
+    if matches!(node.op, SubOp::SiluMul | SubOp::Elementwise(_)) {
+        let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion,
+                     ir: &SubtileIR<F>| {
+            let s = &ir.tensors[tr.tensor.index()];
+            tr.region.rows.start == 0
+                && tr.region.rows.len == s.rows
+                && tr.region.cols.start == 0
+                && tr.region.cols.len == s.cols
+        };
+        if !whole(&node.output, ir) || node.inputs.iter().any(|tr| !whole(tr, ir)) {
+            return Ok(None);
+        }
+    }
+
     // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind so the splice and
     // the builder cannot disagree about it. The builder arm's own check is identical.
     // ⭐ ROPE'S ARITY IS 3, NOT THE NODE'S INPUT COUNT: `lower_rope_node` reads only
