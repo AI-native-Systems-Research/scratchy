@@ -91,10 +91,10 @@ fn lower_matmul_node<F: RopeForm>(
 /// Lower a shape-preserving [`SubOp::Elementwise`] node (Add/Mul binary, Silu
 /// unary) to ONE pointwise [`SdscOp`]. All operands are `[rows, cols]` (the
 /// output shape); `op_func` + arity per the [`EwKind`].
-/// f16 ELEMENT budget for one shape-preserving elementwise node's whole-region live set — the same
-/// number, and the same reasoning, as [`ktir_n_block`]'s `BLOCK_MN_BUDGET`: a few `[rows, cols]`
-/// tiles resident together inside a core's 2 MB LX.
-const EW_LX_ELEMS: u32 = 1024 * 1024;
+/// f16 ELEMENT budget for one shape-preserving elementwise node's whole-region live set —
+/// shared with the Triton splice's fallthrough guards through `ktir_superdsc` (one fact,
+/// both sides read), so the two paths can never disagree about which of them takes a node.
+const EW_LX_ELEMS: u32 = ktir_superdsc::superdsc_opspec::EW_LX_ELEMS as u32;
 
 /// How many `[rows, cols]` tiles of one lowering are LIVE AT ONCE — what the budget is divided by.
 ///
@@ -104,8 +104,8 @@ const EW_LX_ELEMS: u32 = 1024 * 1024;
 /// (`x`, `neg`, `exp`, the splat `1.0`, the denominator, the result); a binary op holds three.
 fn ew_live_tiles(kind: EwKind) -> u32 {
     match kind {
-        EwKind::Silu => 6,
-        _ => 3,
+        EwKind::Silu => ktir_superdsc::superdsc_opspec::EW_SILU_LIVE_TILES,
+        _ => ktir_superdsc::superdsc_opspec::EW_BINARY_LIVE_TILES,
     }
 }
 
@@ -2949,7 +2949,7 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         // are live here (gate, up, neg, exp, the splat, denom, silu, y), so the block height is what
         // keeps those inside the LX — the same accounting `lower_elementwise_node` uses.
         let cols = out.region.cols.len;
-        let blk = rows_per_block(cols, 8);
+        let blk = rows_per_block(cols, ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES);
         let mut off = 0u32;
         while off < out.region.rows.len {
             let h = blk.min(out.region.rows.len - off);

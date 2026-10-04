@@ -258,52 +258,65 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
     // ⛔ AN ELEMENTWISE NODE THE BUILDER WOULD ROW-BLOCK IS NOT A SPLICE TARGET. The
     // builder's own arm (`lower_elementwise_node`) blocks a whole-region lowering whose
-    // live set — `rows × cols × live_tiles`, the same `EW_LX_ELEMS = 1M`-element budget
-    // — does not fit a core's 2 MB LX, emitting MULTIPLE row blocks inside ONE program.
-    // A one-tile kernel cannot spell that shape, so the splice mirrors the builder's
-    // own guard and falls through: the two paths never disagree about which of them
-    // takes the node. (`m == 1` is never blocked, so every decode node splices.)
+    // live set — `rows × cols × live_tiles`, the shared `EW_LX_ELEMS`-element budget
+    // from `ktir_superdsc::superdsc_opspec` — does not fit a core's 2 MB LX, emitting
+    // MULTIPLE row blocks inside ONE program. A one-tile kernel cannot spell that shape,
+    // so the splice mirrors the builder's own guard and falls through: the two paths
+    // never disagree about which of them takes the node. The budget is ONE FACT both
+    // sides read — a literal here would be a second copy that can drift.
     if let SubOp::Elementwise(kind) = &node.op {
         let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
         let live: u32 = match kind {
-            EwKind::Silu => 6,
-            _ => 3,
+            EwKind::Silu => ktir_superdsc::superdsc_opspec::EW_SILU_LIVE_TILES,
+            _ => ktir_superdsc::superdsc_opspec::EW_BINARY_LIVE_TILES,
         };
-        if u64::from(rows) * u64::from(cols) * u64::from(live) > 1024 * 1024 {
+        if rows > 1
+            && u64::from(rows) * u64::from(cols) * u64::from(live)
+                > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
+        {
             return Ok(None);
         }
     }
-    // ⛔ AND SILU-MUL IS THE SAME LAW AT EIGHT LIVE TILES. The builder's
-    // `KtirFunc::silu_mul` row-blocks a whole `[mq, intermediate]` region that does not
-    // fit (gate, up, neg, exp, the splat, denom, silu, y — EIGHT tiles, the widest live
-    // set in the model; granite 8b's `[31, 12800]` prefill silu-mul is exactly the
-    // region that overflows). MEASURED: without this guard the spliced one-tile program
-    // declares a whole-region view the emulator's allocation bounds-check refuses
-    // (`view [31, 12800] ... spans 793600 bytes but the tensor ... holds only 507904`),
-    // while the builder's blocked program runs. The splice mirrors the builder's own
-    // budget and falls through.
+    // ⛔ AND SILU-MUL IS THE SAME LAW AT EIGHT LIVE TILES (`SILU_MUL_LIVE_TILES`).
+    // The builder's `KtirFunc::silu_mul` row-blocks a whole `[mq, intermediate]` region
+    // that does not fit (gate, up, neg, exp, the splat, denom, silu, y — EIGHT tiles,
+    // the widest live set in the model; granite 8b's `[31, 12800]` prefill silu-mul is
+    // exactly the region that overflows). MEASURED: without this guard the spliced
+    // one-tile program declares a whole-region view the emulator's allocation
+    // bounds-check refuses (`view [31, 12800] ... spans 793600 bytes but the tensor
+    // ... holds only 507904`), while the builder's blocked program runs. The splice
+    // mirrors the builder's own budget — `rows > 1`, exactly as the builder's own
+    // row-block condition reads — and falls through.
     if matches!(node.op, SubOp::SiluMul) {
         let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
-        if u64::from(rows) * u64::from(cols) * 8 > 1024 * 1024 {
+        if rows > 1
+            && u64::from(rows)
+                * u64::from(cols)
+                * u64::from(ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES)
+                > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
+        {
             return Ok(None);
         }
     }
-    // ⛔⛔⛔ A COLUMN-CHUNKED NODE IS NOT A SPLICE TARGET — the whole pointwise family
-    // (silumul and elementwise alike). The front end tiles a wide op into COLUMN CHUNKS
-    // of `nb` (subtile_ir.rs's `n_blocks(out_cols, nb)`; production `nb = 8192`), and the
-    // builder's program states each chunk's ACCESS-TILE CORNER (`load_region` honors
-    // `region.cols.start`), which the door turns into the operand's column offset
-    // (`pointwise_chunk_out_offset` → the 16384 B stick-group step at column 8192). The
-    // kernels here state ONE whole-tensor tile at corner 0 — they cannot name a window.
-    // MEASURED, granite-3.1-8b fp8 on card: the 12800-wide MLP intermediate is TWO chunks
-    // (0..8192, 8192..12800), and without this guard the second chunk's silu/mulsilu read
-    // and wrote the FIRST chunk's columns (the decode bundle's two differing descriptors
-    // were exactly the second chunk's gate binding, 16384 B low) — fluent garbage out, on
-    // a divergence the whole-region golden could not see because every fixture is
-    // whole-region. 2b passed only because its intermediate is 8192 = exactly one block.
-    // A windowed kernel is a follow-on row; until then a node whose regions are not the
-    // whole tensors falls through to the builder, which states the corner itself.
-    if matches!(node.op, SubOp::SiluMul | SubOp::Elementwise(_)) {
+    // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS NOT A SPLICE TARGET — EVERY
+    // row, not just the pointwise family the measured defect came from. Every kernel in
+    // the registry states ONE whole-tensor tile at corner 0; it cannot name a window.
+    // The measured instance was the front end's COLUMN CHUNKING of a wide pointwise op
+    // (`n_blocks(out_cols, nb)`; production `nb = 8192`): the builder's program states
+    // each chunk's ACCESS-TILE CORNER (`load_region` honors `region.cols.start`), which
+    // the door turns into the operand's column offset (`pointwise_chunk_out_offset` →
+    // the 16384 B stick-group step at column 8192). MEASURED, granite-3.1-8b fp8 on
+    // card: the 12800-wide MLP intermediate is TWO chunks (0..8192, 8192..12800), and
+    // without this guard the second chunk's silu/mulsilu read and wrote the FIRST
+    // chunk's columns — fluent garbage out, on a divergence the whole-region golden
+    // could not see because every fixture is whole-region. 2b passed only because its
+    // intermediate is 8192 = exactly one block. Matmul and rope regions are whole in
+    // production today (`lower_region` N-blocks pointwise only), but this guard reads
+    // the REGION, not the op kind, so a front-end change that windows any other op's
+    // regions reproduces the same defect with no splice row to catch it — a windowed
+    // kernel is a follow-on row; until then any windowed node falls through to the
+    // builder, which states the corner itself.
+    {
         let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion, ir: &SubtileIR<F>| {
             let s = &ir.tensors[tr.tensor.index()];
             tr.region.rows.start == 0
