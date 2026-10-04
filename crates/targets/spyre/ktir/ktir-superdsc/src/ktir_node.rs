@@ -269,6 +269,48 @@ pub enum Program {
     /// program's heads share one set of buffers the way the un-fused form's
     /// one norm did.
     WindowedRmsNorm { unit: bool },
+    // ── THE MoE ROUTING + EXPERT OPS, in program order ──────────────────
+    // Each names what it computes so the card track can REFUSE IT BY NAME: the
+    // routing permutation and the gathered expert weights need the vendor
+    // `topk.ddl` / gather vocabulary, a separate worklist item, and a silent
+    // nearest-primitive substitution would run a different function.
+    /// Each row's expert indices sorted by ascending score, as the RANK VECTOR
+    /// `rank[i,j] = |{h : x[i,h] < x[i,j]}| + |{h : x[i,h] == x[i,j] ∧ h < j}|`
+    /// — a compare/reduce form of the sort, no permutation emitted. ONE tensor
+    /// parameter (the scores `[m, E]`); the output holds f16 indices.
+    RouteArgsort,
+    /// The last `k` sorted indices of each row — its top-k experts. ONE tensor
+    /// parameter (the sorted indices `[m, E]`); output `[m, k]`.
+    RouteTopK,
+    /// The scores at the chosen indices, `[m, k]` — a row gather by the top-k
+    /// index tensor. TWO tensor parameters (scores `[m, E]`, indices `[m, k]`).
+    RouteGatherScores,
+    /// Each score times its expert's learned scale (`per_expert_scale[idx]`).
+    /// THREE tensor parameters (scores `[m, k]`, indices `[m, k]`, the router
+    /// bundle's per-expert scale row `[E]`).
+    RouteExpertScale,
+    /// The (token, expert) pair rows the expert projections read. GATHERED
+    /// (decode) semantics: a blockwise copy `[m, w] → [m, k·w]` whose output
+    /// column block `j` is the input row — exactly the `[N, top_k, out]` layout
+    /// metal's gathered kernels write, numerically identical, no data-dependent
+    /// permutation. TWO tensor parameters (x, indices — the copy itself is
+    /// data-independent; the indices ride along because every projection reads
+    /// them through the routing).
+    ExpertSort,
+    /// The pair rows back in token order — the identity copy in the same
+    /// (token, slot) layout the sort wrote. TWO tensor parameters.
+    ExpertUnsort,
+    /// Each token's pair rows summed by its scores: `out[n, d] =
+    /// Σ_k rows[n, k, d] · scores[n, k]`. TWO tensor parameters (rows
+    /// `[m·k, hidden]`, scores `[m, k]`).
+    ExpertCombine,
+    /// One projection of each pair's expert over the stacked `[E·out, in]`
+    /// weight bank — the gathered form of `Program::Matmul`'s W8A8 body: the
+    /// weight row each pair reads is selected by its expert index (an
+    /// `indirect` access-tile dim), and the fp8 dequant scale multiply is the
+    /// dense path's own. FOUR tensor parameters at fp8 (rows, routing,
+    /// weights, scales).
+    ExpertMatmul,
 }
 
 /// The activation an expert gates its up projection with — this crate's OWN copy of

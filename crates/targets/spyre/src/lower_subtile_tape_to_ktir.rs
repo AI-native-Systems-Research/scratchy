@@ -16,6 +16,7 @@
 //! [`EmittedOp`]: crate::lower_subtile_tape_to_superdsc::EmittedOp
 
 use crate::lower_subtile_tape_to_superdsc::*;
+use ktir_core::affine::{AffineExpr, AffineMap, AffineSet};
 // ⭐ THE REQUEST TYPE NOW LIVES IN `ktir-superdsc`, and is NAMED here rather than re-exported. `KtirNode`
 // is what this producer BUILDS and the lowering consumes, so it belongs to the leaf crate that defines
 // the contract.
@@ -627,6 +628,107 @@ fn lower_route_scale_node<F: RopeForm>(
         )));
     }
     lower_scalarmul_node(node, ir, scale, sym_id_base).map(|e| vec![e])
+}
+
+/// Lower a [`SubOp::RouteArgsort`] — each row's expert indices sorted by
+/// ascending score, as the RANK VECTOR [`KtirFunc::route_argsort`] computes.
+///
+/// ⭐ NUMERICALLY IDENTICAL TO METAL'S `argpartition.metal` (MLX `block_sort`
+/// ascending, NaN-as-greater, ties by index) — the count form
+/// `rank[i,j] = |{h : x[i,h] < x[i,j]}| + |{h : x[i,h] == x[i,j] ∧ h < j}|` is
+/// exactly that ordering, which is what makes the trailing top-k slice below
+/// pick the same experts metal picks. The card's refusal arm stands: this is
+/// the emulator's compare/reduce form, not the vendor `topkindex` op.
+fn lower_route_argsort_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "RouteArgsort t{} expects 1 input (scores), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routeargsort_s{}", node.id.index()));
+    st.route_argsort(&node.inputs[0], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RouteArgsort);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::RouteTopK`] — the last `k` sorted indices of each row,
+/// metal's `slice_trailing_cols` (`src_col = axis_size - top_k + j`).
+fn lower_route_topk_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    k: u32,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "RouteTopK t{} expects 1 input (sorted), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routetopk_s{}", node.id.index()));
+    st.route_topk(&node.inputs[0], &node.output, k);
+    let k_node = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RouteTopK);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k_node);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::RouteGatherScores`] — the scores at the chosen indices,
+/// `out[n, j] = scores[n, idx[n, j]]`: metal's `take_along_axis` at axis -1.
+fn lower_route_gather_scores_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "RouteGatherScores t{} expects 2 inputs (scores, indices), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routegatherscores_s{}", node.id.index()));
+    st.route_gather_scores(&node.inputs[0], &node.inputs[1], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RouteGatherScores);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::RouteExpertScale`] — each score times its expert's learned
+/// scale: `out[m, j] = scores[m, j] · per_expert_scale[idx[m, j]]`, the f32
+/// multiply metal's `moe_per_expert_scale` computes.
+fn lower_route_expert_scale_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 3 {
+        return Err(SuperDscError(format!(
+            "RouteExpertScale t{} expects 3 inputs (scores, indices, router), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routeexpertscale_s{}", node.id.index()));
+    st.route_expert_scale(&node.inputs[0], &node.inputs[1], &node.inputs[2], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RouteExpertScale);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
 }
 
 /// final-logit soft cap. One input (the logits), shape-preserving, and the cap
@@ -1685,36 +1787,31 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             Ok(v) => Ops(v),
             Err(e) => Unhandled(e.0),
         },
-        // ── THE REMAINING EXPANSION OPS, each refused BY NAME with its own port
-        // source — the `expansion_ops!()` blanket left this list, so every op the
-        // router-side decompositions above do not cover states what it needs.
-        SubOp::RouteArgsort => Unhandled(format!(
-            "SubOp::RouteArgsort t{} (each row's expert indices sorted by ascending score) has no \
-             SuperDSC lowering yet: it is the vendor `topk.ddl` `topkindex` op (SFP unit, k-dim \
-             worksplit across cores, internal state regs) — a new OpFunc binding plus a typed \
-             emitter, not a decomposition of a dense program.",
-            node.output.tensor.index() as u32,
-        )),
-        SubOp::RouteTopK { .. } => Unhandled(format!(
-            "SubOp::RouteTopK t{} (the last k sorted indices of each row — its top-k experts) has \
-             no SuperDSC lowering yet: it is a k-wide slice of `topk.ddl`'s `topkindex` output, \
-             which the emitter reads once the argsort above runs on card.",
-            node.output.tensor.index() as u32,
-        )),
-        SubOp::RouteGatherScores => Unhandled(format!(
-            "SubOp::RouteGatherScores t{} (the scores at the chosen indices, `[m, k]`) has no \
-             SuperDSC lowering yet: it is a row-wise gather by the top-k index tensor — the \
-             `indirectAccessIndexLabeledDs` + linked-index vocabulary of the paged KV gather, \
-             pointed at the score rows instead of a KV plane.",
-            node.output.tensor.index() as u32,
-        )),
-        SubOp::RouteExpertScale { .. } => Unhandled(format!(
-            "SubOp::RouteExpertScale t{} (each score times its expert's learned scale) has no \
-             SuperDSC lowering yet: it is the RouteGatherScores gather reading `router.\
-             per_expert_scale` instead of the scores, then a pointwise mul — blocked on the same \
-             index-gather binding.",
-            node.output.tensor.index() as u32,
-        )),
+        // ── THE ROUTER'S INDEX CHAIN — argsort/topk/gather/scale, the compare/
+        // reduce/gather programs above. Each is numerically identical to its
+        // metal counterpart (see the `lower_route_*` docs); the CARD track still
+        // refuses them by name in `ktir_superdsc_door` until the vendor `topk.ddl`
+        // vocabulary is bound, which is that track's work, not this one's.
+        SubOp::RouteArgsort => match lower_route_argsort_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        SubOp::RouteTopK { k } => match lower_route_topk_node(node, ir, k.get(), sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        SubOp::RouteGatherScores => {
+            match lower_route_gather_scores_node(node, ir, sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
+        SubOp::RouteExpertScale { .. } => {
+            match lower_route_expert_scale_node(node, ir, sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
         SubOp::ExpertSort { .. } => Unhandled(format!(
             "SubOp::ExpertSort t{} (the (token, expert) pair rows, ordered by expert) has no \
              SuperDSC lowering yet: it is a data-dependent row permutation — the vendor \
@@ -4208,6 +4305,397 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         let sumb = self.broadcast(sum, dims.clone(), 1);
         let y = self.f32_binop(OpKind::ArithDivf, xb, sumb, dims);
         self.store_region(y, out);
+    }
+
+    /// ⭐ ARGMAX-STYLE ROW GATHER — `out[i, j] = src[i, idx[i, j]]`, the shape both
+    /// [`Self::route_gather_scores`] and [`Self::route_expert_scale`] share.
+    ///
+    /// The gather is an `ktdp.construct_indirect_access_tile` over the parent
+    /// `[m, W]` view with a DIRECT row dim and an INDIRECT column dim read
+    /// through the indices view `[m, k]` (flattened, so enumeration point
+    /// `(d0, d1)` addresses index element `d0·k + d1` — the `dim_subs` subscript
+    /// `Dim(0)·k + Dim(1)`, dotted with the view's rank-1 stride). The loaded
+    /// index is the PARENT COLUMN for that output element, exactly
+    /// `take_along_axis`'s `out[n, k] = src[n, indices[n, k]]`.
+    ///
+    /// `W` is the parent's width (`E` for the scores, `E` for the per-expert
+    /// scale row); `idx_cols` is the gather's width (`k`).
+    fn gather_rows(&mut self, parent: &TensorRegion, idx_r: &TensorRegion, out: &TensorRegion) {
+        let m = out.region.rows.len;
+        let idx_cols = out.region.cols.len;
+        let a = self.a;
+        // The parent view, whole — the gather's coords name absolute rows/cols.
+        let parent_view = self.view(parent.tensor);
+        // The indices as ONE FLAT rank-1 view: element (n, j) sits at `n·k + j`,
+        // which is the subscript the indirect dim's `dim_subs` entry states.
+        let idx_ptr = self.arg_for(idx_r.tensor);
+        let idx_view = self.view_of(
+            idx_ptr,
+            vec![i64::from(m) * i64::from(idx_cols)],
+            vec![1],
+        );
+        // THE INDIRECT TILE: dim 0 direct (the row), dim 1 indirect (the column,
+        // read from the indices view at this output element's flat position).
+        let iat = self.fresh();
+        // `Dim(0)·k + Dim(1)` — the enumeration point's flat index into the
+        // indices view. One expression per INDEX-VIEW AXIS (rank 1 here), so the
+        // map's single result is that flat subscript.
+        let sub = a.expr(AffineExpr::Add(
+            a.expr(AffineExpr::Mul(
+                a.expr(AffineExpr::Const(i64::from(idx_cols))),
+                a.expr(AffineExpr::Dim(0)),
+            )),
+            a.expr(AffineExpr::Dim(1)),
+        ));
+        // The enumeration space is the full output box `[m, k]` — an
+        // UNCONSTRAINED set (no constraints) enumerates exactly that.
+        let vss = AffineSet {
+            num_dims: 2,
+            num_syms: 0,
+            constraints: a.constraints(vec![]),
+        };
+        let dims = vec![i64::from(m), i64::from(idx_cols)];
+        let op = Operation::new(
+            a,
+            Some(iat),
+            OpKind::KtdpConstructIndirectAccessTile,
+            &[parent_view, idx_view],
+        )
+        .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())))
+        .with_attr(
+            a,
+            AttrKey::DimKinds,
+            Attr::StrList(a.names(vec!["direct", "indirect"])),
+        )
+        .with_attr(a, AttrKey::DimData, Attr::IntList(a.ints(vec![0, 0])))
+        .with_attr(a, AttrKey::IntermediateVars, Attr::Ssas(a.ssa(vec![])))
+        .with_attr(
+            a,
+            AttrKey::DimSubs,
+            // One map per output dim: dim 0 is direct (its map is unused but
+            // must be present — `parse_dim_subscripts` refuses a short list),
+            // dim 1's single expr is the flat index subscript above.
+            Attr::AffineMapList(a.maps(vec![
+                AffineMap {
+                    num_dims: 2,
+                    num_syms: 0,
+                    exprs: a.exprs(vec![AffineExpr::Dim(0)]),
+                },
+                AffineMap {
+                    num_dims: 2,
+                    num_syms: 0,
+                    exprs: std::slice::from_ref(sub),
+                },
+            ])),
+        )
+        .with_attr(a, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let op = self.typed(
+            op,
+            IrType::AccessTile {
+                dims: a.ints(dims.clone()),
+            },
+        );
+        self.push(op);
+        let v = self.fresh();
+        let op = Operation::new(a, Some(v), OpKind::KtdpLoad, &[iat])
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())));
+        let ty = self.tensor_ty(dims);
+        let op = self.typed(op, ty);
+        self.push(op);
+        self.store_region(v, out);
+    }
+
+    /// ARGUMENT SORT by ascending row value — the MoE router's
+    /// [`SubOp::RouteArgsort`], as the RANK VECTOR:
+    /// `rank[i, j] = |{h : x[i,h] < x[i,j]}| + |{h : x[i,h] == x[i,j] ∧ h < j}|`.
+    ///
+    /// ⭐ A COMPARE/REDUCE, NOT A PERMUTATION. The count form computes each
+    /// element's sorted position directly — a stable ascending argsort's rank —
+    /// with no data-dependent memory traffic, which is what the emulator's
+    /// fixed-shape tiles express. It is exactly MLX `block_sort`'s ordering
+    /// (metal's `argpartition.metal`, LessThan with NaN-as-greater: ties by
+    /// index), so the top-k slice downstream matches metal's bit for bit.
+    ///
+    /// ⛔ NaN LANDS AT THE END BECAUSE IT IS SANITIZED TO +INF FIRST, not
+    /// because the raw compares would put it there — they would NOT: an
+    /// unsanitized NaN wins neither `olt` nor `oeq` and its rank is 0, the
+    /// FRONT of the sorted row, stealing a top-k slot from a real expert. The
+    /// `cmpf uno`/`select` sanitize below maps NaN to +inf, and +inf then sorts
+    /// greater than every finite exactly as MLX's NaN-as-greater convention
+    /// demands.
+    ///
+    /// ⛔ ROW-BLOCKED IN `E²` PER ROW, NOT `E`. Every intermediate here is
+    /// `[h, E, E]` — one full row-pair outer product per block row — and the
+    /// peak live set is two Bool compares plus two f32 sums (~6 f16-tile
+    /// equivalents of `E²` per row), so the block height that keeps that inside
+    /// the LX is `EW_LX_ELEMS / (E² · 8)`, not `rows_per_block`'s own division.
+    fn route_argsort(&mut self, x_r: &TensorRegion, out: &TensorRegion) {
+        let e = out.region.cols.len;
+        debug_assert_eq!(e, x_r.region.cols.len, "RouteArgsort is shape-preserving");
+        let blk = (EW_LX_ELEMS / (e.max(1) * e.max(1)) / 8).max(1);
+        // The tie-break's `h' < j` compare: two broadcasts of ONE `[1, E]` iota
+        // row (a `tensor.generate` yielding its column index), giving `[1, 1, E]`
+        // (the h' values) against `[1, E, 1]` (the j values) — the pair compares
+        // `h' < j` at every `(j, h')`, block-invariant, so it is built ONCE.
+        // `iota[h']` varies along AXIS 2 and `iota[j]` along AXIS 1 — the same
+        // (j, h') placement the value compares use — so `cmpf olt` at (·, j, h')
+        // reads `h' < j`, the stable-order tie-break's direction.
+        let iota = self.index_grid(1, e, 1);
+        let h_vec = self.broadcast(iota, vec![1, 1, i64::from(e)], 1);
+        let j_vec = self.broadcast(iota, vec![1, i64::from(e), 1], 2);
+        let h_lt_j = self.cmpf("olt", h_vec, j_vec, vec![1, i64::from(e), i64::from(e)]);
+        let mut off = 0u32;
+        while off < out.region.rows.len {
+            let h = blk.min(out.region.rows.len - off);
+            let x = self.load_region(&sub_rows(x_r, off, h));
+            let dims = vec![i64::from(h), i64::from(e)];
+            // ⛔ NaN → +inf FIRST, so the plain ordered compares below compute
+            // MLX's NaN-as-greater total order exactly. WITHOUT this, a NaN
+            // target wins neither `olt` nor `oeq` and its rank is 0 — it would
+            // land at the FRONT of the sorted row and, worse, the +inf the
+            // router's own softmax can never produce but a corrupted logits
+            // row can, would steal a top-k slot from a real expert. The
+            // sanitize is `cmpf uno (x, x)` (true exactly at NaN) selecting
+            // +inf over the value; f16 holds +inf.
+            let is_nan = self.cmpf("uno", x, x, dims.clone());
+            let inf = self.splat(f64::INFINITY, dims.clone());
+            let x = self.select(is_nan, inf, x, dims.clone());
+            let wide = vec![i64::from(h), i64::from(e), i64::from(e)];
+            // `x[i, j]` as a column vector `[h, E, 1]` and `x[i, h']` as a row
+            // vector `[h, 1, E]` — the pair the compares broadcast to `[h, E, E]`.
+            let col_vec = self.broadcast(x, vec![i64::from(h), i64::from(e), 1], 2);
+            let row_vec = self.broadcast(x, vec![i64::from(h), 1, i64::from(e)], 1);
+            // 1. strictly-less: `x[i, h'] < x[i, j]` contributes 1 to rank[i, j].
+            let lt = self.cmpf("olt", row_vec, col_vec, wide.clone());
+            // 2. tie-break: `x[i, h'] == x[i, j]` AND `h' < j` — the AND of two
+            //    0/1 tiles is their product (`[h, E, E]` × `[1, E, E]` broadcasts).
+            let eq = self.cmpf("oeq", row_vec, col_vec, wide.clone());
+            let tie = self.binop(OpKind::ArithMulf, eq, h_lt_j, wide.clone());
+            // 3. rank = Σ_h' (lt + tie), reduced over dim 2 (the h' axis), the
+            //    init a zero of the RESULT shape (`[h, E]`) — the reduce folds
+            //    `combiner(reduced, outs)` unconditionally, so a non-identity
+            //    init would add itself to every row.
+            let sum = self.binop(OpKind::ArithAddf, lt, tie, wide);
+            let zero = self.splat_zero(dims.clone());
+            let rank = self.reduce(sum, zero, OpKind::ArithAddf, 2, dims.clone());
+            self.store_region(rank, &sub_rows(out, off, h));
+            off += h;
+        }
+    }
+
+    /// `tensor.generate {^bb0(%i, %j): yield %axis}` — one INDEX GRID over
+    /// `[r, c]`, yielding axis `axis`'s index (i32) at each position: the iota
+    /// the argsort tie-break compares. Three ops (bb0 args, yield, generate),
+    /// the shape the `generate` handler's vectorized meshgrid execution runs.
+    fn index_grid(&mut self, r: u32, c: u32, axis: usize) -> Ssa {
+        let a = self.a;
+        let (i, j, t) = (self.fresh(), self.fresh(), self.fresh());
+        // `^bb0(%i, %j)` — the block arguments, named in the bb0 marker op.
+        let bb0 = Operation::new(a, None, OpKind::RegionBb0Args, &[])
+            .with_attr(a, AttrKey::Names, Attr::Ssas(a.ssa(vec![i, j])));
+        // `tensor.yield %axis` — the body is a single yield of the wanted arg.
+        let yielded = if axis == 0 { i } else { j };
+        let y = Operation::new(a, None, OpKind::TensorYield, &[yielded]);
+        // The generate op itself: rank-2 shape, i32 elements (meshgrid grids are
+        // i32 tiles), the region = [bb0, yield].
+        let shape = vec![i64::from(r), i64::from(c)];
+        let mut generate = Operation::new(a, Some(t), OpKind::TensorGenerate, &[])
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(shape.clone())))
+            .with_attr(
+                a,
+                AttrKey::Dtype,
+                Attr::Dtype(ktir_core::dtypes::DType::I32),
+            );
+        generate.regions = a.regions(vec![a.ops(vec![bb0, y])]);
+        let ty = IrType::Tensor {
+            dims: a.ints(shape),
+            elem: ktir_core::dtypes::DType::I32,
+        };
+        let generate = self.typed(generate, ty);
+        self.push(generate);
+        t
+    }
+
+    /// `arith.cmpf` with predicate `pred` over two same-shape tiles — Bool 0/1
+    /// result. A dedicated entry because [`Self::binop]` states only float
+    /// kinds; the compare's operands and result all carry the shape attribute
+    /// the map-window planner reads.
+    fn cmpf(&mut self, pred: &'static str, l: Ssa, r: Ssa, dims: Vec<i64>) -> Ssa {
+        let a = self.a;
+        let v = self.fresh();
+        let op = Operation::new(a, Some(v), OpKind::ArithCmpf, &[l, r])
+            .with_attr(a, AttrKey::Predicate, Attr::Str(pred))
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())));
+        let ty = self.tensor_ty(dims);
+        let op = self.typed(op, ty);
+        self.push(op);
+        v
+    }
+
+    /// `arith.select` — element-wise `cond ? t : f` over tiles of one shape.
+    fn select(&mut self, cond: Ssa, t: Ssa, f: Ssa, dims: Vec<i64>) -> Ssa {
+        let a = self.a;
+        let v = self.fresh();
+        let op = Operation::new(a, Some(v), OpKind::ArithSelect, &[cond, t, f])
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())));
+        let ty = self.tensor_ty(dims);
+        let op = self.typed(op, ty);
+        self.push(op);
+        v
+    }
+
+    /// The last `k` sorted indices of each row — [`SubOp::RouteTopK`]:
+    /// `out[n, j] = sorted[n, E - k + j]`, exactly metal's
+    /// `slice_trailing_cols` (`src_col = axis_size - top_k + k`).
+    ///
+    /// `tensor.extract_slice` with static offsets/sizes/strides: the whole
+    /// `[m, E]` source loaded, the trailing `k` columns sliced out. Rank-2 in,
+    /// rank-2 out.
+    fn route_topk(&mut self, sorted_r: &TensorRegion, out: &TensorRegion, k: u32) {
+        let m = out.region.rows.len;
+        let e = sorted_r.region.cols.len;
+        let a = self.a;
+        let x = self.load_region(sorted_r);
+        let v = self.fresh();
+        let dims = vec![i64::from(m), i64::from(k)];
+        let op = Operation::new(a, Some(v), OpKind::TensorExtractSlice, &[x])
+            .with_attr(a, AttrKey::SliceOffsets, Attr::IntList(a.ints(vec![0, i64::from(e - k)])))
+            .with_attr(a, AttrKey::SliceSizes, Attr::IntList(a.ints(dims.clone())))
+            .with_attr(a, AttrKey::SliceStrides, Attr::IntList(a.ints(vec![1, 1])));
+        let ty = self.tensor_ty(dims.clone());
+        let op = self.typed(op, ty);
+        self.push(op);
+        self.store_region(v, out);
+    }
+
+    /// The scores at the chosen indices — [`SubOp::RouteGatherScores`]:
+    /// `out[n, j] = logits[n, idx[n, j]]`, `take_along_axis` at axis -1.
+    /// [`Self::gather_rows`] with the logits as the parent.
+    fn route_gather_scores(&mut self, scores_r: &TensorRegion, idx_r: &TensorRegion, out: &TensorRegion) {
+        self.gather_rows(scores_r, idx_r, out);
+    }
+
+    /// Each score times its expert's learned scale — [`SubOp::RouteExpertScale`]:
+    /// `out[m, j] = scores[m, j] · per_expert_scale[idx[m, j]]`, with the
+    /// multiply in f32 (metal's `moe_per_expert_scale` computes a float
+    /// intermediate so the f16 result has ONE rounding, matching the host
+    /// reference).
+    ///
+    /// The per-expert scale is a `[1, E]` row the loader stages; it is loaded
+    /// RANK-1 (`load_1d`, `[E]`) so the gather's parent view is `[1, E]` —
+    /// every row gathers from the same one-row parent, which the direct dim 0
+    /// (the enumeration row) would misaddress. ⛔ SO THE GATHER IS RANK-1: the
+    /// enumeration point is the FLAT `(n, j)` pair and the indirect dim reads
+    /// `per_expert_scale[idx[n, j]]` — a one-dim gather whose parent is the `[E]`
+    /// row and whose index view is the flattened `[m·k]` indices, with the
+    /// OUTPUT reshaped `[m, k]` by the store's own region.
+    fn route_expert_scale(
+        &mut self,
+        scores_r: &TensorRegion,
+        idx_r: &TensorRegion,
+        scale_r: &TensorRegion,
+        out: &TensorRegion,
+    ) {
+        let m = out.region.rows.len;
+        let k = out.region.cols.len;
+        let a = self.a;
+        // The scale row, rank-1 `[E]` — `load_1d`'s form.
+        let e = scale_r.region.cols.len;
+        let scale_ptr = self.arg_for(scale_r.tensor);
+        let scale_view = self.view_of(scale_ptr, vec![i64::from(e)], vec![1]);
+        // The indices, flattened rank-1 `[m·k]`.
+        let idx_ptr = self.arg_for(idx_r.tensor);
+        let idx_view = self.view_of(idx_ptr, vec![i64::from(m) * i64::from(k)], vec![1]);
+        // The rank-1 gather: ONE indirect dim whose subscript reads
+        // `idx[d0·k + d1]`... but a rank-1 enumeration point is just `d0`, so
+        // the subscript is `Dim(0)` over the `[m·k]` indices view and the
+        // output shape is `[m·k]` — flattened, with the multiply and the store
+        // giving it back its `[m, k]` shape.
+        let flat = m * k;
+        let iat = self.fresh();
+        let sub = a.expr(AffineExpr::Dim(0));
+        let vss = AffineSet {
+            num_dims: 1,
+            num_syms: 0,
+            constraints: a.constraints(vec![]),
+        };
+        let dims1 = vec![i64::from(flat)];
+        let op = Operation::new(
+            a,
+            Some(iat),
+            OpKind::KtdpConstructIndirectAccessTile,
+            &[scale_view, idx_view],
+        )
+        .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims1.clone())))
+        .with_attr(
+            a,
+            AttrKey::DimKinds,
+            Attr::StrList(a.names(vec!["indirect"])),
+        )
+        .with_attr(a, AttrKey::DimData, Attr::IntList(a.ints(vec![0])))
+        .with_attr(a, AttrKey::IntermediateVars, Attr::Ssas(a.ssa(vec![])))
+        .with_attr(
+            a,
+            AttrKey::DimSubs,
+            Attr::AffineMapList(a.maps(vec![AffineMap {
+                num_dims: 1,
+                num_syms: 0,
+                exprs: std::slice::from_ref(sub),
+            }])),
+        )
+        .with_attr(a, AttrKey::VariablesSpaceSet, Attr::AffineSet(vss));
+        let op = self.typed(
+            op,
+            IrType::AccessTile {
+                dims: a.ints(dims1.clone()),
+            },
+        );
+        self.push(op);
+        let gathered = self.fresh();
+        let op = Operation::new(a, Some(gathered), OpKind::KtdpLoad, &[iat])
+            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims1.clone())));
+        let ty = self.tensor_ty(dims1.clone());
+        let op = self.typed(op, ty);
+        self.push(op);
+        // The scores, flattened the same way, multiplied in f32.
+        let scores = self.load_region(scores_r);
+        let scores_flat = {
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::TensorReshape, &[scores])
+                .with_attr(a, AttrKey::TargetShape, Attr::IntList(a.ints(dims1.clone())));
+            let ty = self.tensor_ty(dims1.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let g_f32 = {
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::ArithExtf, &[gathered]);
+            let ty = self.f32_ty(dims1.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let s_f32 = {
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::ArithExtf, &[scores_flat]);
+            let ty = self.f32_ty(dims1.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let prod = self.f32_binop(OpKind::ArithMulf, s_f32, g_f32, dims1.clone());
+        let narrowed = {
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::ArithTruncf, &[prod]);
+            let ty = self.tensor_ty(dims1.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        // Store through the output's own `[m, k]` region — the flat product
+        // re-lays out by the store, the same identity `reshape` states.
+        self.store_region(narrowed, out);
     }
 
     /// A reshape — the WHOLE source region loaded through its own view, stored through the

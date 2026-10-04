@@ -145,6 +145,71 @@ pub fn lower(
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
         // above, whose head geometry has to become const generics on this side.
         Program::Transpose => lk::transpose(name, &r, sym_id_base, layout),
+        // ── THE MoE ROUTING + EXPERT OPS, refused BY NAME — the `topk.ddl`
+        // sort/mask vocabulary and the gather-bound weight binding are a
+        // separate card-track worklist item, and a nearest-primitive
+        // substitution would compute a different function. The EMULATOR runs
+        // these programs' ops directly (`ktir_groups` ignores the Program
+        // field off-card), so this refusal only fires under `-Fspyre-hw`.
+        Program::RouteArgsort => Err(Error {
+            message: format!(
+                "{name}: RouteArgsort (each row's expert indices sorted by ascending score) has \
+                 no SuperDSC lowering yet: on card it is the vendor `topk.ddl` `topkindex` op \
+                 (SFP unit, k-dim worksplit across cores, internal state regs) — the rank-vector \
+                 compare/reduce form the program states is the emulator's"
+            ),
+        }),
+        Program::RouteTopK => Err(Error {
+            message: format!(
+                "{name}: RouteTopK (the last k sorted indices of each row) has no SuperDSC \
+                 lowering yet: on card it is a k-wide slice of `topk.ddl`'s `topkindex` output"
+            ),
+        }),
+        Program::RouteGatherScores => Err(Error {
+            message: format!(
+                "{name}: RouteGatherScores (the scores at the chosen indices) has no SuperDSC \
+                 lowering yet: a row-wise gather by the top-k index tensor — the \
+                 `indirectAccessIndexLabeledDs` + linked-index vocabulary of the paged KV gather, \
+                 pointed at the score rows"
+            ),
+        }),
+        Program::RouteExpertScale => Err(Error {
+            message: format!(
+                "{name}: RouteExpertScale (each score times its expert's learned scale) has no \
+                 SuperDSC lowering yet: the RouteGatherScores gather reading \
+                 `router.per_expert_scale` instead of the scores, then a pointwise mul"
+            ),
+        }),
+        Program::ExpertSort => Err(Error {
+            message: format!(
+                "{name}: ExpertSort (the (token, expert) pair rows) has no SuperDSC lowering \
+                 yet: on card it is the vendor `topk.ddl` sort/mask vocabulary over pair rows, \
+                 plus the pair-row layout `[m, k·w]` the target must derive from the registered \
+                 `[m]` row count"
+            ),
+        }),
+        Program::ExpertUnsort => Err(Error {
+            message: format!(
+                "{name}: ExpertUnsort (the pair rows back in token order) has no SuperDSC \
+                 lowering yet: ExpertSort's inverse permutation — the same sort/mask vocabulary \
+                 with the routing read backwards"
+            ),
+        }),
+        Program::ExpertCombine => Err(Error {
+            message: format!(
+                "{name}: ExpertCombine (each token's pair rows summed by its scores) has no \
+                 SuperDSC lowering yet: a k-way weighted row sum — a segment reduce over the \
+                 pair rows, gated on the same pair-row layout the sort/unsort pair carries"
+            ),
+        }),
+        Program::ExpertMatmul => Err(Error {
+            message: format!(
+                "{name}: ExpertMatmul (one projection of each pair's expert, over the stacked \
+                 `[E·out, in]` weight bank) has no SuperDSC lowering yet: the contraction itself \
+                 is the dense W8A8 body's, but the weight ROW each pair reads is selected by its \
+                 expert index — an indexed operand the dense matmul's fixed region does not state"
+            ),
+        }),
     }
 }
 
