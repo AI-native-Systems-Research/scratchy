@@ -36,9 +36,9 @@ use scratchy_target_spyre::lower_subtile_tape_to_ktir::lower_graph_to_ktir;
 
 /// The rmsnorm shapes that matter for the delivery scope: granite 3.2/3.3 at 2b and 8b
 /// both normalize at hidden 2048 (2b) and 4096 (8b), decode rows 1 and a prefill rung's
-/// width. (M, D_MODEL). ⛔ WIDTHS > 2048 ARE BUILDER-ONLY: the kernel's f16 sum overflows
-/// at D_MODEL = 4096 on the emulator (the row's width guard, measured on granite 8b), so
-/// those shapes pin the FALLTHROUGH, not a comparison.
+/// width. (M, D_MODEL). The kernel widens the squares to f32 before its reduce (the
+/// accumulator's own precision, matching the builder's program), so every width is
+/// splicable and byte-compared.
 const SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096)];
 
 #[test]
@@ -61,21 +61,15 @@ fn spliced_rmsnorm_is_byte_identical_to_the_builder() {
             .as_ref()
             .expect("builder op carries its program");
 
-        // 2. The splice — the row compiles the kernel for this node. A width > 2048 is a
-        // BUILDER-ONLY node (the f16-sum overflow the width guard documents), and the
-        // splice's own guard falls through — pinned here exactly as the elementwise
-        // LX-budget fallthrough is.
+        // 2. The splice — the row compiles the kernel for this node. Every width is
+        // splicable (the kernel's f32 accumulator), so a fallthrough here is a missing
+        // registry row, not a guard.
         let node = &ir.nodes[0];
         let spliced = scratchy_triton_splice::lower(node, &ir, false)
             .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
-        let Some(spliced) = spliced else {
-            assert!(
-                c > 2048,
-                "m={m} c={c}: the splice fell through but the width is splicable — the \
-                 registry row is missing or the width guard is wrong"
-            );
-            continue;
-        };
+        let spliced = spliced.unwrap_or_else(|| {
+            panic!("m={m} c={c}: the splice fell through — the registry row is missing")
+        });
 
         // ⛔ THE NAME LAW IS PART OF THE GATE. The builder names its program
         // `rmsnorm_s{id}`; the splice reuses the law so the op_name and the emulator's
