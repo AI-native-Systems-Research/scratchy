@@ -12,8 +12,10 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 
 * PARAMETERS, IN ORDER: `desc_a`, `desc_w`, `desc_o` — the node's operand order
   (activation, weight) then the output. The registry does not permute. ⛔ This row is
-  DENSE-ONLY (arity 2): fp8's arity-3 W8A8 form is a deliberate non-splice (the
-  activation-quantize dedup is a bundle-level fact), and the registry has no row for it.
+  DENSE-ONLY (arity 2): the fp8 arity-3 W8A8 form is its OWN row over
+  `matmul_fp8.py` (the activation-quantize dedup the old note here called a
+  bundle-level blocker lives in the DOOR, downstream of both producers — see
+  the splice module header).
 * CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N` — stated by the splice from
   the node's own regions (`A is [M, K]`, `out is [M, N]`, all blocks the whole extents —
   ONE tile, the same whole-region law `KtirFunc::matmul` states).

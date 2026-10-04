@@ -103,6 +103,18 @@ fn weight_arg(data: Vec<u8>, dt: SDType, shape: Vec<usize>) -> Arg {
             shape,
             dtype: DType::F16,
         },
+        // ⭐ fp8 STAYS 1-BYTE-PACKED, exactly as `spyre_load.rs` stages it (the
+        // "do NOT narrow" law): an fp8 weight VIEW widens on read (`ktdp.load`
+        // over an `Fp8E4m3` memref decodes each byte through `e4m3_to_f32`), so
+        // the bytes must land in HBM verbatim and the VIEW's dtype — carried by
+        // the program, mirrored here — is what makes the executor read them as
+        // one element per byte. Routing this through the `other` arm's F32 would
+        // mislabel the bytes (4× the elements, decoded as garbage).
+        SDType::Fp8E4m3 => Arg::TensorBytes {
+            data,
+            shape,
+            dtype: DType::Fp8E4m3,
+        },
         _ => Arg::TensorBytes {
             data,
             shape,
