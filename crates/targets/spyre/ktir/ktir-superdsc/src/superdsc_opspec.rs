@@ -88,6 +88,26 @@ pub const USABLE_LX_BYTES: u64 = 1_677_721;
 /// this alias documents the residency-byte arithmetic in [`WorkPlan::time_tile_for_lx`].
 pub const FP16_BYTES: u64 = 2;
 
+/// f16 ELEMENT budget for one whole-region pointwise live set — the pointwise row-block
+/// guards read this (the builder's elementwise/silumul arms and the Triton splice's
+/// fallthroughs, which must agree about which of them takes a node). `EW_LX_ELEMS` f16
+/// elements ≈ 2 MB = `LX_CAPACITY_BYTES`; the SAME reasoning as a per-core tile fit,
+/// applied to the tiles a pointwise program holds resident together.
+pub const EW_LX_ELEMS: u64 = 1024 * 1024;
+
+/// How many `[rows, cols]` tiles of one elementwise lowering are LIVE AT ONCE — what
+/// `EW_LX_ELEMS` is divided by. Silu's decomposition is the worst case (`x`, `neg`,
+/// `exp`, the splat `1.0`, the denominator, the result); a binary op holds three.
+/// ⛔ THE BUDGET IS THE LIVE SET, NOT ONE TILE: sizing a block so a single tile fits is
+/// what produced `ArithMulf: LX capacity exceeded` on a `[64, 8192]` block (each tile
+/// 1 MB, three resident).
+pub const EW_SILU_LIVE_TILES: u32 = 6;
+/// The binary-op live set (two operands and the result).
+pub const EW_BINARY_LIVE_TILES: u32 = 3;
+/// The silu-mul live set: gate, up, neg, exp, the splat, denom, silu, y — EIGHT tiles,
+/// the widest live set in the model.
+pub const SILU_MUL_LIVE_TILES: u32 = 8;
+
 // ───────────────────────────────────────────────────────────────────────────
 // (a) DataFormat + StickExtent — the fp16-stick / multiple-of-stick witness.
 // ───────────────────────────────────────────────────────────────────────────
