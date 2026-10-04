@@ -70,22 +70,21 @@ THE DELTA, and the justification for each item
 
 4. M AND D_MODEL ARE constexpr (SPYRE-SPECIFIC), for `attention_flash.py`'s delta 7 reason.
 
-5. NOT DONE, AND RECORDED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT: THE f16 SUM OF D_MODEL
-   SQUARES CAN OVERFLOW AT GRANITE WIDTH, AND THIS KERNEL DOES NOTHING ABOUT IT. f16's
-   maximum is 65504; 4096 squares whose RMS is 4 already sum to ~65500. The accumulator is
-   f16 because the device is (delta 2 of `attention_flash.py`), so the headroom is real and
-   the failure mode is an `inf` in the reduce, which `rsqrt` then turns into 0 and the whole
-   row to 0 -- a WRONG ANSWER, not a NaN, so it would not announce itself.
+5. THE SUM OF D_MODEL SQUARES ACCUMULATES IN f32, AND THE ISLAND IS LOAD-BEARING — it was
+   an f16 reduce when this fixture landed, which the splice review correctly rejected as a
+   correctness bug, not a headroom footnote: f16's maximum is 65504, so 4096 squares whose
+   RMS is 4 already sum to ~65500, and ONE element ≥ 256 overflows `x * x` on its own at
+   any width. Residual-stream outliers make both reachable in a real model. The shipped
+   kernel (`crates/targets/spyre/kernels/rmsnorm.py`, the splice's row) widens the squares
+   before the reduce (`(x * x).to(tl.float32)`), matching the accumulator precision the
+   builder's own program states; this fixture records the same shape so the ladder's
+   TTIR contract and the splice's kernel agree. The transcendental stays an f16-in/f16-out
+   island around `tl.rsqrt` (delta 1) — that one is `@_check_dtype`'s requirement, not a
+   range decision.
 
-   Two mitigations exist and NEITHER IS MEASURED, so neither is applied here:
-     * fold the reciprocal INTO the reduce (`tl.sum(x * (x * INV_D), 1)`), which keeps the
-       partial sums at the scale of the mean instead of D_MODEL times it;
-     * scale the whole tile once before squaring and correct after the `rsqrt`.
-   Both change the op sequence the emitter sees, so both are a decision for whoever derives
-   this kernel's tolerance -- with a number in hand. Until then the honest statement is that
-   this fixture is structurally correct and its f16 dynamic range at D_MODEL = 4096 is
-   UNTESTED. `reference()` below computes in f32, so the comparison that eventually runs
-   will show it.
+   The two mitigations recorded when the sum was f16 (reciprocal folded into the reduce;
+   tile pre-scale) are both SUPERSEDED by the f32 accumulator — the range question they
+   answered no longer exists.
 """
 
 import torch
@@ -115,8 +114,9 @@ def rmsnorm_fwd(desc_x, desc_w, desc_o,  #
     offs_m = start_m * BLOCK_M
     x = x_desc.load([offs_m, 0])
     # EXX2_ZEROMEAN: the mean of squares, with NO mean subtracted. One reduce along the
-    # hidden axis, one multiply by the constexpr reciprocal (delta 2).
-    ms = tl.sum(x * x, 1) * INV_D
+    # hidden axis, in the f32 accumulator (delta 5), one multiply by the constexpr
+    # reciprocal (delta 2).
+    ms = tl.sum((x * x).to(tl.float32), 1) * INV_D
     # RSQRT, inside the f32 island `tl.rsqrt`'s own dtype check forces (delta 1).
     r = tl.rsqrt((ms + EPS).to(tl.float32)).to(tl.float16)
     w = w_desc.load([0])

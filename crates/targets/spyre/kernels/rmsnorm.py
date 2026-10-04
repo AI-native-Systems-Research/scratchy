@@ -23,16 +23,17 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   width, `EPS =` the tape's epsilon, `INV_D = 1/D_MODEL` folded on the host).
 * GRID: `[1]`.
 
-⛔ THE f16 SUM IS THE DEVICE'S OWN PRECISION, AND THE EMULATOR PAYS IT. Post-
-`LegalizeTypes` this program sums D_MODEL f16 squares in f16 (the island collapse is
-the point of that pass; the builder's hand-written program kept an f32 reduce because
-an emulator immediate is free). The fixture's delta-5 note records the dynamic-range
-headroom honestly: at D_MODEL = 4096 an RMS above ~4 overflows the f16 accumulator.
-The CARD is unaffected — it runs the descriptors, and the descriptor's EXX2_ZEROMEAN
-reduce is the device's own precision either way — but the EMULATOR's numeric oracle
-compares this program's f16 sum against the builder's f32 one, so the flip gate
-(PR 3) must compare descriptors byte-for-byte and validate on card, not expect
-emulator bit-parity on wide models.
+⛔ THE SUM IS f32, MATCHING THE BUILDER'S OWN PROGRAM, AND THE DIFFERENCE IS
+NUMERICALLY REAL ON BOTH HALVES. The card's `EXX2_ZEROMEAN` reduce and the builder's
+hand-written KTIR both accumulate the mean of squares in f32; a Triton `tl.sum` over
+an f16 block accumulates in f16, whose 65504 ceiling an RMS above ~4 at D_MODEL=4096
+(or one element ≥256, at any width) blows through — an activation outlier in the
+residual stream is enough. The kernel therefore widens the squares to f32 before the
+reduce (`(x * x).to(tl.float32)`), which is also what the emulator's numeric oracle
+compares against. The CARD is unaffected either way — it runs the descriptors, and
+the descriptor's EXX2_ZEROMEAN reduce is the device's own precision — but the
+spliced KTIR program must not state a DIFFERENT computation from the builder's, or
+the emulator stops emulating the card for this op.
 """
 
 import triton
@@ -60,8 +61,9 @@ def rmsnorm_fwd(desc_x, desc_w, desc_o,  #
     offs_m = start_m * BLOCK_M
     x = x_desc.load([offs_m, 0])
     # EXX2_ZEROMEAN: the mean of squares, with NO mean subtracted. One reduce along the
-    # hidden axis, one multiply by the constexpr reciprocal (delta 2).
-    ms = tl.sum(x * x, 1) * INV_D
+    # hidden axis in f32 (the accumulator's own precision — see the module doc), one
+    # multiply by the constexpr reciprocal (delta 2).
+    ms = tl.sum((x * x).to(tl.float32), 1) * INV_D
     # RSQRT, inside the f32 island `tl.rsqrt`'s own dtype check forces (delta 1).
     r = tl.rsqrt((ms + EPS).to(tl.float32)).to(tl.float16)
     w = w_desc.load([0])
