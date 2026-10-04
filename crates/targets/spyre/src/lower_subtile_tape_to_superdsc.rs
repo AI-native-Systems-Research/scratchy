@@ -409,6 +409,43 @@ fn audit_layout_addresses(
 /// All sizes are f16 bytes (`rows*cols*2`), 128 B aligned. A build-time disjointness
 /// guard ([`bundle_layout_aliases`]) asserts no two SIMULTANEOUSLY-LIVE tensors in a
 /// segment overlap — a silent on-card aliasing write is a `cargo build` Err.
+/// The DISTINCT config-derived scalar constants a graph's programs read off reserved tids —
+/// the model's own multipliers, in the order the node walk registers them. Placement-free BY
+/// CONSTRUCTION: the registry is a pure function of `ir.nodes`, so every consumer that needs
+/// only the constants (not the segment budget) computes it without packing a single tensor.
+///
+/// ⛔ THE ORDER IS THE DEVICE TID. Index `i` ↔ `scalarmul_scale_tid(i)`, so two derivations
+/// of this list that disagree about ORDER disagree about ADDRESSES. This extraction is the
+/// SAME walk [`compute_bundle_layout`] runs, moved out verbatim — the match arms, the
+/// `to_bits` dedup, and the "nothing is seeded" law all live here now.
+pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
+    let mut scalarmul_scales: Vec<f32> = Vec::new();
+    let push_scale = |scale: f32, scalarmul_scales: &mut Vec<f32>| {
+        if !scalarmul_scales
+            .iter()
+            .any(|s| s.to_bits() == scale.to_bits())
+        {
+            scalarmul_scales.push(scale);
+        }
+    };
+    for node in &ir.nodes {
+        match &node.op {
+            SubOp::ScalarMul { scale } => push_scale(*scale, &mut scalarmul_scales),
+            SubOp::AttnDecode { scale, .. } => {
+                push_scale(*scale, &mut scalarmul_scales);
+                push_scale(scale.sqrt(), &mut scalarmul_scales);
+            }
+            SubOp::RmsNorm { eps, .. } => push_scale(*eps, &mut scalarmul_scales),
+            SubOp::RmsNormUnit { eps } => push_scale(*eps, &mut scalarmul_scales),
+            SubOp::TanhSoftCap { cap } => push_scale(*cap, &mut scalarmul_scales),
+            SubOp::RouterNorm { eps, .. } => push_scale(*eps, &mut scalarmul_scales),
+            SubOp::RouteScale { scale } => push_scale(*scale, &mut scalarmul_scales),
+            _ => {}
+        }
+    }
+    scalarmul_scales
+}
+
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -1394,7 +1431,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    (ACTIVATION, exactly like ATTN_SCALE). `lower_scalarmul_node` reads the index here → the const TID
     //    the pointwise `mul` multiplies by; the worker binds each `t{tid}=[scale]`. NO weight-fold, NO
     //    host-route — a real on-device pointwise multiply (the ATTN_SCALE mechanism).
-    let mut scalarmul_scales: Vec<f32> = Vec::new();
+    let mut scalarmul_scales = scalar_registry(ir);
     let push_scale = |scale: f32, scalarmul_scales: &mut Vec<f32>| {
         if !scalarmul_scales
             .iter()

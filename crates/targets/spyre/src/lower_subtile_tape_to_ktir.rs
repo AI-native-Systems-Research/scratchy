@@ -2345,9 +2345,18 @@ pub fn graph_wiring<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
 ) -> Result<BundleWiring, SuperDscError> {
-    // ⛔ NO LAYER CLASSES, for the same reason [`lower_graph_to_superdsc`] passes none: this walks
-    // the UNROLLED graph, which has no layer loop and so no boundary a weight BANK may fall on.
-    let layout = compute_bundle_layout(ir, weight_ids, false, &[])?;
+    // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE thing off the layout: the scalar
+    // registry [`lower_attn_node`]'s desync check resolves its constants through. The placement
+    // pass [`compute_bundle_layout`] computes here would be a THROWAWAY (the shipped layout is
+    // the re-rolled bake's), and it is the CARD's budget pass: it refuses a weight segment past
+    // one 16 GiB region with no layer classes to bank on — MEASURED, the 26b MoE under the fp8
+    // preset wired fine through the banked re-rolled bake and then panicked HERE on a layout
+    // nobody reads. The registry is a pure function of `ir.nodes`, so that is what this builds.
+    let _ = weight_ids;
+    let layout = BundleLayout {
+        scalarmul_scales: scalar_registry(ir),
+        ..Default::default()
+    };
     let mut sym_id_base: i64 = 0;
     let mut quantized = std::collections::HashSet::new();
     let mut nodes = Vec::with_capacity(ir.nodes.len());
