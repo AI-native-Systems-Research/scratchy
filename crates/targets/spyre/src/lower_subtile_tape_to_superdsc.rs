@@ -1430,6 +1430,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // resolves its `[1,1]` const by value through `scale_slot`, for the divide
             // and the multiply alike.
             SubOp::TanhSoftCap { cap } => push_scale(*cap, &mut scalarmul_scales),
+            // The MoE router's two config-derived scalars, which the router-side
+            // decompositions resolve by value through the same `scale_slot`:
+            // `RouterNorm` lowers AS `Program::RmsNorm` (its epsilon is that arm's
+            // epsilon), and `RouteScale` lowers AS `Program::ScalarMul` (gemma's
+            // `hidden^-0.5` softmax temperature is that arm's multiplier).
+            SubOp::RouterNorm { eps, .. } => push_scale(*eps, &mut scalarmul_scales),
+            SubOp::RouteScale { scale } => push_scale(*scale, &mut scalarmul_scales),
             _ => {}
         }
     }
