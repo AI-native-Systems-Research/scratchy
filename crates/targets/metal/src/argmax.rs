@@ -116,11 +116,11 @@ fn encode_argmax_into_mtl4_inner(
     //
     // `Device` visibility (cache-coherent): the forward's last
     // store may live in L2 only; argmax loads from `device` address
-    // space and needs the store visible. Mirrors the
-    // `SCRATCHY_METAL_BARRIER_DEVICE` path the worker exposes for
-    // diagnosis — but argmax always needs Device because it crosses
-    // the implicit producer/consumer boundary the worker's
-    // intra-tape `barrier_before` flags don't model.
+    // space and needs the store visible. Unlike the worker's
+    // intra-tape barriers (execution-only `None` wins there), argmax
+    // always needs Device because it crosses the implicit
+    // producer/consumer boundary the worker's intra-tape
+    // `barrier_before` flags don't model.
     encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
         MTLStages::Dispatch,
         MTLStages::Dispatch,
