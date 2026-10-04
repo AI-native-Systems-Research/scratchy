@@ -2147,9 +2147,9 @@ pub fn lower_region(
         // Under-stating them (registering everything at `m`) made the Reshape count law
         // fire on every per-head view AND reserved the re-laid buffer at a fraction of
         // its size.
-        let out_rows: u32 = desc
-            .op
-            .out_rows(m, |k| resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).1);
+        let out_rows: u32 = desc.op.out_rows(m, |k| {
+            resolve(desc.inputs[k], &op_tensor, &op_cols, &tensors).1
+        });
         let out_t = TensorId(tensors.len() as u32);
         tensors.push(TensorShape {
             rows: out_rows,
@@ -2963,18 +2963,12 @@ mod tests {
         let (heads, hd) = (2u32, 64u32);
         let input = crate::lower::LoweringInput {
             sources: vec![
-                SourceShape {
-                    rows: 1,
-                    cols: 128,
-                },
+                SourceShape { rows: 1, cols: 128 },
                 SourceShape {
                     rows: 128,
                     cols: 128,
                 },
-                SourceShape {
-                    rows: 1,
-                    cols: 64,
-                },
+                SourceShape { rows: 1, cols: 64 },
             ],
             ops: vec![
                 OpDesc {
@@ -3017,11 +3011,18 @@ mod tests {
         assert_eq!(shape(3), (1, 128), "the projection is [m, heads·hd]");
         assert_eq!(shape(4), (heads, hd), "the view is [m·heads, hd]");
         assert_eq!(shape(5), (heads, hd), "the norm inherits the view's rows");
-        assert_eq!(shape(6), (1, heads * hd), "the flatten-back restores the flat row");
+        assert_eq!(
+            shape(6),
+            (1, heads * hd),
+            "the flatten-back restores the flat row"
+        );
         // And the node regions state the same extents — the regions are what every target's
         // lowering reads.
         let rows_of = |n: usize| g.nodes[n].output.region.rows.len;
-        assert_eq!((rows_of(0), rows_of(1), rows_of(2), rows_of(3)), (1, heads, heads, 1));
+        assert_eq!(
+            (rows_of(0), rows_of(1), rows_of(2), rows_of(3)),
+            (1, heads, heads, 1)
+        );
     }
 
     /// The OTHER direction of the row law: the vision patch merger's `Over` view divides the
@@ -3030,12 +3031,7 @@ mod tests {
     fn a_merger_view_registers_its_divided_rows() {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let input = crate::lower::LoweringInput {
-            sources: vec![
-                SourceShape {
-                    rows: 4,
-                    cols: 64,
-                },
-            ],
+            sources: vec![SourceShape { rows: 4, cols: 64 }],
             ops: vec![
                 OpDesc {
                     op: SubOp::Reshape {

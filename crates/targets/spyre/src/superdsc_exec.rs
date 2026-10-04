@@ -948,10 +948,7 @@ impl Executor {
         // proven against the placements. 0 on an UNROLLED bundle (no reroll meta) is the same value
         // the old `iters × kv_stride` formula produced there (0 × 0), and the geometry latch below
         // runs identically — an unrolled paged bundle keeps its pre-split behavior whole.
-        let page_stride_bytes = self
-            .rolled
-            .as_ref()
-            .map_or(0, |r| r.kv_page_stride);
+        let page_stride_bytes = self.rolled.as_ref().map_or(0, |r| r.kv_page_stride);
         self.kv = KvGeometry {
             paged: true,
             page_slots: PageSlots(page_slots),

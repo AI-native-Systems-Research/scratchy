@@ -114,13 +114,13 @@ fn emit_config_geometry() {
             let g_kv = bounds
                 .get("num_global_key_value_heads")
                 .or_else(|| bounds.get("num_key_value_heads"));
-            let g_hd = bounds.get("global_head_dim").or_else(|| bounds.get("head_dim"));
+            let g_hd = bounds
+                .get("global_head_dim")
+                .or_else(|| bounds.get("head_dim"));
             #[expect(clippy::collapsible_if)]
-            if let (Some(&nqh), Some(&gkvh), Some(&ghd)) = (
-                bounds.get("num_attention_heads"),
-                g_kv,
-                g_hd,
-            ) {
+            if let (Some(&nqh), Some(&gkvh), Some(&ghd)) =
+                (bounds.get("num_attention_heads"), g_kv, g_hd)
+            {
                 if nqh > 0 && gkvh > 0 && ghd > 0 && nqh % gkvh == 0 {
                     geometries.push((nqh, gkvh, ghd));
                     used = true;

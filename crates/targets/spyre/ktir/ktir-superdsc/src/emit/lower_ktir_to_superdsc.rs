@@ -2180,7 +2180,11 @@ pub fn program_tanhsoftcap_cap(f: &IRFunction<'static>) -> Option<f32> {
         })
     };
     let mut cap: Option<f64> = None;
-    for tanh in f.operations.iter().filter(|o| o.op_type == OpKind::MathTanh) {
+    for tanh in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::MathTanh)
+    {
         let div = def_of(*tanh.operands.first()?)?;
         if div.op_type != OpKind::ArithDivf {
             return None;
@@ -5106,7 +5110,7 @@ pub fn tanhsoftcap(
              `BundleLayout::scalarmul_scales` — the descriptor divides and multiplies by a \
              bound `[1,1]` const, so the value the program uses must have a registry slot \
              (registry desync)"
-        )
+        ),
     })?;
     check_pointwise_cols(out.c_len, "TanhSoftCap", out.tid)?;
     let rows = node_rows(name, &out)?;

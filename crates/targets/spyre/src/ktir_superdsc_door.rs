@@ -198,23 +198,24 @@ fn attn(
         // between `out` and the segments — `attn_operands` filters it by `k.mask`, and so does this
         // reading, or the mask's capacity would be read as a kv stream's width.
         let mask_tid = k.mask.map(|b| b.get());
-        r.iter()
-            .skip(2)
-            .find_map(|x| (x.tid != q.tid && Some(x.tid) != mask_tid && !x.is_out).then_some(x.v_cols))
+        r.iter().skip(2).find_map(|x| {
+            (x.tid != q.tid && Some(x.tid) != mask_tid && !x.is_out).then_some(x.v_cols)
+        })
     };
     let (Some(q_cols), Some(kv_cols), Some((_, hd))) = (
         Some(q.v_cols),
         kv_cols,
         lk::param_first_tile(&k.func, &k.func.arguments[0].0),
-    )
-    else {
+    ) else {
         return Err(Error {
             message: format!(
                 "{name}: the program does not state a complete geometry — `q`'s view is \
                  `[{}, ·]`, a kv stream is {} wide, and `q`'s first access tile is {} — one of the \
                  three is absent, so the head counts this door needs cannot be read off it",
                 q.v_rows,
-                kv_cols.map(|c| c.to_string()).unwrap_or_else(|| "missing".into()),
+                kv_cols
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "missing".into()),
                 lk::param_first_tile(&k.func, &k.func.arguments[0].0)
                     .map(|(_, c)| c.to_string())
                     .unwrap_or_else(|| "absent".into()),

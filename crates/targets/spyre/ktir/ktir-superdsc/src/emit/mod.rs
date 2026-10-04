@@ -2068,9 +2068,7 @@ fn rewrite_op_for_time_tile(
             && v.layout
                 .iter()
                 .position(|&d| d == tiled_dim)
-                .is_some_and(|si| {
-                    v.scale.get(si).is_none_or(|s| matches!(s, Scale::Active))
-                });
+                .is_some_and(|si| v.scale.get(si).is_none_or(|s| matches!(s, Scale::Active)));
         if !tiled {
             continue;
         }
@@ -5659,10 +5657,7 @@ mod time_tiled_broadcast_operand_is_address_stable {
     /// The first start address of operand `lds` in trip `t`, as `concrete_trips` expanded it.
     fn trip_start(e: &EmittedOp, t: usize, lds: u32) -> u64 {
         let trips = e.concrete_trips();
-        let node = trips
-            .get(t)
-            .expect("a trip per time")
-            .dscs_[0]
+        let node = trips.get(t).expect("a trip per time").dscs_[0]
             .values()
             .next()
             .expect("one dsc")
