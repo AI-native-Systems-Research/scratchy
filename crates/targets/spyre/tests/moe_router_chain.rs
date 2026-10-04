@@ -277,3 +277,125 @@ fn route_expert_scale_multiplies_the_per_expert_scale() {
         assert!((g - w).abs() < 2e-2, "expert-scale[{i}] golden={g} got={w}");
     }
 }
+
+// ── THE EXPERT LAYOUT CHAIN (gathered/decode semantics) ─────────────────────────
+
+/// The sort materializes the pair rows: output column block `j` is the input
+/// row, i.e. the `[m, k, w]` (token, slot, width) layout metal's gathered
+/// kernels read. Every element moves once, no arithmetic.
+#[test]
+fn expert_sort_copies_the_row_into_each_slot_block() {
+    let (m, w, k) = (3u32, 4u32, 2u32);
+    let x: Vec<f32> = (0..m * w).map(|i| (i as f32) * 0.5 - 3.0).collect();
+    let idx: Vec<f32> = vec![1.0, 0.0, 3.0, 2.0, 0.0, 1.0];
+    let ir = one_node_ir(
+        vec![
+            TensorShape { rows: m, cols: w }, // x (source)
+            TensorShape { rows: m, cols: k }, // indices (source, rides along)
+            TensorShape {
+                rows: m,
+                cols: w * k,
+            }, // pair rows out
+        ],
+        2,
+        SubOp::ExpertSort {
+            experts: scratchy_subtile::subtile_ir::NumExperts::new(
+                std::num::NonZeroU32::new(4).unwrap(),
+            ),
+            k: scratchy_subtile::subtile_ir::TopK::new(std::num::NonZeroU32::new(k).unwrap()),
+            bundle: scratchy_subtile::subtile_ir::ExpertBundle::SwitchGlu,
+        },
+        &[0, 1],
+    );
+    let got = run_one_node(&ir, vec![(0, x.clone()), (1, idx)]);
+    // Golden: each output column block j is the input row verbatim.
+    let golden: Vec<f32> = (0..m as usize)
+        .flat_map(|r| {
+            let row = &x[r * w as usize..(r + 1) * w as usize];
+            row.iter().copied().chain(row.iter().copied()).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(got.len(), golden.len(), "sort width");
+    for (i, (g, v)) in golden.iter().zip(&got).enumerate() {
+        assert!((g - v).abs() < 1e-3, "sort[{i}] golden={g} got={v}");
+    }
+}
+
+/// The unsort is the identity copy in the (token, slot) layout.
+#[test]
+fn expert_unsort_is_the_identity_copy() {
+    let (m, w, k) = (2u32, 5u32, 3u32);
+    let rows: Vec<f32> = (0..m * w * k).map(|i| (i as f32) * 0.25 - 2.0).collect();
+    let routing: Vec<f32> = vec![0.0; (m * k) as usize];
+    let ir = one_node_ir(
+        vec![
+            TensorShape {
+                rows: m,
+                cols: w * k,
+            }, // pair rows (source)
+            TensorShape { rows: m, cols: k }, // routing (source, rides along)
+            TensorShape {
+                rows: m,
+                cols: w * k,
+            }, // out
+        ],
+        2,
+        SubOp::ExpertUnsort,
+        &[0, 1],
+    );
+    let got = run_one_node(&ir, vec![(0, rows.clone()), (1, routing)]);
+    assert_eq!(got.len(), rows.len(), "unsort width");
+    for (i, (g, v)) in rows.iter().zip(&got).enumerate() {
+        assert!((g - v).abs() < 1e-3, "unsort[{i}] golden={g} got={v}");
+    }
+}
+
+/// The combine: `out[n, d] = Σ_k rows[n, k·w + d] · scores[n, k]`, the f32
+/// fma chain with ONE f16 narrowing — `moe_weighted_sum`'s arithmetic.
+#[test]
+fn expert_combine_weighted_sums_the_pair_rows() {
+    let (m, w, k) = (2u32, 6u32, 3u32);
+    let rows: Vec<f32> = (0..m * w * k)
+        .map(|i| (((i * 37) % 23) as f32 / 23.0 - 0.5) * 4.0)
+        .collect();
+    let scores: Vec<f32> = vec![0.5, 0.3, 0.2, 0.1, 0.6, 0.3];
+    let ir = one_node_ir(
+        vec![
+            TensorShape {
+                rows: m,
+                cols: w * k,
+            }, // pair rows (source)
+            TensorShape { rows: m, cols: k }, // scores (source)
+            TensorShape { rows: m, cols: w }, // out
+        ],
+        2,
+        SubOp::ExpertCombine {
+            hidden: w,
+            shared: scratchy_subtile::subtile_ir::SharedExpertBound(None),
+        },
+        &[0, 1],
+    );
+    let got = run_one_node(&ir, vec![(0, rows.clone()), (1, scores.clone())]);
+    // Golden: the f32 fma chain, one f16 rounding at the end (metal's kernel).
+    let golden: Vec<f32> = (0..m as usize)
+        .flat_map(|n| {
+            (0..w as usize)
+                .map(|d| {
+                    let mut acc = 0f32;
+                    for kk in 0..k as usize {
+                        acc += rows[(n * k as usize + kk) * w as usize + d]
+                            * scores[n * k as usize + kk];
+                    }
+                    acc
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(got.len(), golden.len(), "combine width");
+    for (i, (g, v)) in golden.iter().zip(&got).enumerate() {
+        assert!(
+            (g - v).abs() <= 2e-2 * g.abs().max(1.0),
+            "combine[{i}] golden={g} got={v}"
+        );
+    }
+}

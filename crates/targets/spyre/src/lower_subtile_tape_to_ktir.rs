@@ -731,6 +731,80 @@ fn lower_route_expert_scale_node<F: RopeForm>(
     Ok(vec![e])
 }
 
+/// Lower a [`SubOp::ExpertSort`] — the (token, expert) pair rows the expert
+/// projections read, in the GATHERED (decode) semantics: the blockwise copy
+/// `[m, w] → [m, k·w]` of [`KtirFunc::expert_sort`], numerically identical to
+/// metal's gathered bake (which emits nothing and reads token rows `k` times).
+fn lower_expert_sort_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    k: u32,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "ExpertSort t{} expects 2 inputs (x, indices), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("expertsort_s{}", node.id.index()));
+    st.expert_sort(&node.inputs[0], &node.output, k);
+    let k_node = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::ExpertSort);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k_node);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::ExpertUnsort`] — the pair rows back in token order: the
+/// identity copy of [`KtirFunc::expert_unsort`] in the (token, slot) layout.
+fn lower_expert_unsort_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "ExpertUnsort t{} expects 2 inputs (rows, routing), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("expertunsort_s{}", node.id.index()));
+    st.expert_unsort(&node.inputs[0], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::ExpertUnsort);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::ExpertCombine`] — each token's pair rows summed by its
+/// scores, the f32 fma chain of [`KtirFunc::expert_combine`]: metal's
+/// `moe_weighted_sum` arithmetic exactly (`fma` accumulate in f32, one f16
+/// narrowing at the end).
+fn lower_expert_combine_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 2 {
+        return Err(SuperDscError(format!(
+            "ExpertCombine t{} expects 2 inputs (rows, scores), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("expertcombine_s{}", node.id.index()));
+    st.expert_combine(&node.inputs[0], &node.inputs[1], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::ExpertCombine);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
 /// final-logit soft cap. One input (the logits), shape-preserving, and the cap
 /// is the model constant `final_logit_softcapping` the tape now carries.
 ///
@@ -1812,13 +1886,17 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(e) => Unhandled(e.0),
             }
         }
-        SubOp::ExpertSort { .. } => Unhandled(format!(
-            "SubOp::ExpertSort t{} (the (token, expert) pair rows, ordered by expert) has no \
-             SuperDSC lowering yet: it is a data-dependent row permutation — the vendor \
-             `topk.ddl` sort/mask vocabulary over pair rows, plus the pair-row layout `[m, k·w]` \
-             the target must derive from the registered `[m]` row count.",
-            node.output.tensor.index() as u32,
-        )),
+        // ── THE EXPERT LAYOUT CHAIN (gathered/decode semantics) — the sort's
+        // materialized copy, the unsort's identity, the combine's f32 fma sum.
+        // Numerically identical to metal's GATHERED bake (which emits nothing
+        // for sort/unsort and `moe_weighted_sum` for combine); the card track
+        // refuses them by name until the vendor sort/mask vocabulary is bound.
+        SubOp::ExpertSort { k, .. } => {
+            match lower_expert_sort_node(node, ir, k.get(), sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
         SubOp::ExpertMatmul { .. } => Unhandled(format!(
             "SubOp::ExpertMatmul t{} (one projection of each pair's expert, over the stacked \
              `[E·out, in]` weight bank) has no SuperDSC lowering yet: the contraction itself is \
@@ -1834,19 +1912,16 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(e) => Unhandled(e.0),
             }
         }
-        SubOp::ExpertUnsort => Unhandled(format!(
-            "SubOp::ExpertUnsort t{} (the pair rows back in token order) has no SuperDSC \
-             lowering yet: it is ExpertSort's inverse permutation — the same vendor sort/mask \
-             vocabulary with the routing read backwards.",
-            node.output.tensor.index() as u32,
-        )),
-        SubOp::ExpertCombine { .. } => Unhandled(format!(
-            "SubOp::ExpertCombine t{} (each token's pair rows summed by its scores, `[m, hidden]`) \
-             has no SuperDSC lowering yet: it is a k-way weighted row sum — a segment reduce over \
-             the pair rows, gated on the same pair-row layout and routing the sort/unsort pair \
-             carries.",
-            node.output.tensor.index() as u32,
-        )),
+        SubOp::ExpertUnsort => match lower_expert_unsort_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        SubOp::ExpertCombine { .. } => {
+            match lower_expert_combine_node(node, ir, sym_id_base) {
+                Ok(v) => Ops(v),
+                Err(e) => Unhandled(e.0),
+            }
+        }
         // ⭐ THE SANDWICH'S TWO ENDS — the split (head) is where the fused program is
         // emitted; the flatten-back (tail) self-identifies as fused-away and emits NOTHING.
         // The middle (norm) arms do the same. The match is dataflow-based (see
@@ -4695,6 +4770,172 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         };
         // Store through the output's own `[m, k]` region — the flat product
         // re-lays out by the store, the same identity `reshape` states.
+        self.store_region(narrowed, out);
+    }
+
+    /// EXPERT SORT (the GATHERED/decode semantics) — [`SubOp::ExpertSort`] as
+    /// a BLOCKWISE COPY `[m, w] → [m, k·w]`: output column block `j` is the
+    /// input row again, i.e. the `[m, k, w]` (token, slot, width) layout.
+    ///
+    /// ⭐ METAL'S GATHERED BAKE EMITS NOTHING HERE (`S::Sort(_) => vec![]`):
+    /// the gathered `affine_gather_qmv` reads the TOKEN rows directly, `k`
+    /// pairs per row (`per_row = k`). The pair rows ARE the token rows, read
+    /// `k` times — the sort's permutation is a no-op in this regime, and this
+    /// copy is its materialized form: numerically identical (every element
+    /// moved once, no arithmetic), no data-dependent permutation. The indices
+    /// ride along because every expert projection reads them through this
+    /// node's output routing.
+    ///
+    /// The `shared` bound is REFUSED by arity elsewhere; gemma-4 declares no
+    /// shared expert, and a bundle that does is the fused-MoE loader's
+    /// worklist, not this lowering's.
+    fn expert_sort(&mut self, x_r: &TensorRegion, out: &TensorRegion, k: u32) {
+        let w = x_r.region.cols.len;
+        debug_assert_eq!(
+            out.region.cols.len,
+            w * k,
+            "ExpertSort output is the [m, k·w] pair layout"
+        );
+        let x = self.load_region(x_r);
+        // Column blocks: slot `j`'s block is the same `[m, w]` tile again. The
+        // LX holds `w` elements per block row and the copy is pointwise, so
+        // the whole `[m, w]` tile loads once and stores `k` times — the
+        // natural blocking for a copy whose source is one tile.
+        for j in 0..k {
+            self.store_region(x, &sub_cols(out, j * w, w));
+        }
+    }
+
+    /// EXPERT UNSORT — [`SubOp::ExpertUnsort`] in the same (token, slot)
+    /// layout: the identity copy. Metal's gathered bake emits nothing here
+    /// either (`S::Unsort => vec![]`) — the combine reads the pair rows where
+    /// they lie — so this materializes the same non-move: all `m·k·w`
+    /// elements moved once, no arithmetic, no permutation.
+    fn expert_unsort(&mut self, rows_r: &TensorRegion, out: &TensorRegion) {
+        let x = self.load_region(rows_r);
+        self.store_region(x, out);
+    }
+
+    /// EXPERT COMBINE — [`SubOp::ExpertCombine`]:
+    /// `out[n, d] = Σ_k rows[n, k·w + d] · scores[n, k]`, the f32-accumulated
+    /// weighted sum metal's `moe_weighted_sum` computes (`acc = fma(row,
+    /// score, acc)` in f32, one narrowing at the end).
+    ///
+    /// ⭐ THE SLOT SCORE BROADCAST, NOT A PER-SLOT SPLAT. Each slot `k`'s
+    /// score is ONE `[m, 1]` column of the `[m, k]` scores tile; slicing it
+    /// out (`tensor.extract_slice`) and broadcasting it across the `[m, w]`
+    /// block multiplies the whole block by its slot's score in one op, which
+    /// is what the kernel's inner loop does per (n, d) pair.
+    ///
+    /// ⛔ THE ACCUMULATOR IS f32, LIKE THE KERNEL'S `float acc`. A shared
+    /// expert's contribution would be an extra `fma` term on the same
+    /// accumulator; gemma-4 declares none (`shared = None`), and a bundle that
+    /// declares one is refused at the loader, before a program is minted.
+    fn expert_combine(
+        &mut self,
+        rows_r: &TensorRegion,
+        scores_r: &TensorRegion,
+        out: &TensorRegion,
+    ) {
+        let m = out.region.rows.len;
+        let w = out.region.cols.len;
+        let k = scores_r.region.cols.len;
+        debug_assert_eq!(
+            rows_r.region.cols.len,
+            w * k,
+            "ExpertCombine reads the [m, k·hidden] pair rows"
+        );
+        let a = self.a;
+        let scores = self.load_region(scores_r);
+        let mut acc: Option<Ssa> = None;
+        for j in 0..k {
+            // Slot `j`'s `[m, w]` block of the pair rows, widened to f32.
+            let block = self.load_region(&sub_cols(rows_r, j * w, w));
+            let block_f32 = {
+                let v = self.fresh();
+                let op = Operation::new(a, Some(v), OpKind::ArithExtf, &[block]);
+                let ty = self.f32_ty(vec![i64::from(m), i64::from(w)]);
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            // Slot `j`'s score column `[m, 1]`, sliced out of `[m, k]` and
+            // broadcast across the block's width.
+            let col = {
+                let v = self.fresh();
+                let dims = vec![i64::from(m), 1];
+                let op = Operation::new(a, Some(v), OpKind::TensorExtractSlice, &[scores])
+                    .with_attr(
+                        a,
+                        AttrKey::SliceOffsets,
+                        Attr::IntList(a.ints(vec![0, i64::from(j)])),
+                    )
+                    .with_attr(a, AttrKey::SliceSizes, Attr::IntList(a.ints(dims.clone())))
+                    .with_attr(a, AttrKey::SliceStrides, Attr::IntList(a.ints(vec![1, 1])));
+                let ty = self.tensor_ty(dims);
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            // Broadcast the `[m, 1]` column across the block's width — an
+            // EXPANSION of its existing size-1 axis, not an insertion, so the
+            // `Dimensions` list is EMPTY (`linalg.broadcast`'s other form; the
+            // handler defaults an absent list to exactly this).
+            let col_b = {
+                let v = self.fresh();
+                let dims = vec![i64::from(m), i64::from(w)];
+                let init = self.fresh();
+                let empty = Operation::new(a, Some(init), OpKind::TensorEmpty, &[])
+                    .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())))
+                    .with_attr(a, AttrKey::Dtype, Attr::Dtype(KTIR_ELEM));
+                let ty = self.tensor_ty(dims.clone());
+                let empty = self.typed(empty, ty);
+                self.push(empty);
+                let op = Operation::new(a, Some(v), OpKind::LinalgBroadcast, &[col, init])
+                    .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())));
+                let ty = self.tensor_ty(dims);
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            let col_f32 = {
+                let v = self.fresh();
+                let op = Operation::new(a, Some(v), OpKind::ArithExtf, &[col_b]);
+                let ty = self.f32_ty(vec![i64::from(m), i64::from(w)]);
+                let op = self.typed(op, ty);
+                self.push(op);
+                v
+            };
+            // `acc = fma(block, score, acc)` in f32 — the kernel's exact chain,
+            // one narrowing at the very end.
+            acc = Some(match acc {
+                None => self.f32_binop(
+                    OpKind::ArithMulf,
+                    block_f32,
+                    col_f32,
+                    vec![i64::from(m), i64::from(w)],
+                ),
+                Some(prev) => {
+                    let v = self.fresh();
+                    let dims = vec![i64::from(m), i64::from(w)];
+                    let op = Operation::new(a, Some(v), OpKind::MathFma, &[block_f32, col_f32, prev])
+                        .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(dims.clone())));
+                    let ty = self.f32_ty(dims);
+                    let op = self.typed(op, ty);
+                    self.push(op);
+                    v
+                }
+            });
+        }
+        let acc = acc.expect("ExpertCombine has at least one slot (k ≥ 1)");
+        let narrowed = {
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::ArithTruncf, &[acc]);
+            let ty = self.tensor_ty(vec![i64::from(m), i64::from(w)]);
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
         self.store_region(narrowed, out);
     }
 
