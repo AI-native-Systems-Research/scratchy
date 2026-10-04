@@ -829,7 +829,6 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 eps.to_bits().hash(h);
                 std::mem::discriminant(gain).hash(h);
             }
-            SubOp::TanhSoftCap { cap } => cap.to_bits().hash(h),
             SubOp::RmsNormReduce { eps, .. } | SubOp::RmsNormUnit { eps } => eps.to_bits().hash(h),
             SubOp::RmsNormApply { gain, .. } => std::mem::discriminant(gain).hash(h),
             SubOp::RopeRotate { head_dim, .. } => head_dim.get().hash(h),

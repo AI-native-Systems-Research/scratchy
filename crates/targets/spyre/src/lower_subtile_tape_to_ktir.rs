@@ -1133,64 +1133,6 @@ fn lower_scalarmul_node<F: RopeForm>(
     Ok(e)
 }
 
-/// `SubOp::TanhSoftCap { cap }` — `cap · tanh(x / cap)`, Gemma's logit soft cap, as one KTIR program
-
-/// The arity refusal helper the pointwise arms below share — one spelling of "this op takes exactly
-/// `n` operands", naming the op the way every other refusal here does.
-fn arity_error<F: RopeForm>(node: &SubtileNode<F>, n: usize) -> SuperDscError {
-    SuperDscError(format!(
-        "{:?} t{} expects {} input(s), found {}",
-        node.op,
-        node.output.tensor.index() as u32,
-        n,
-        node.inputs.len()
-    ))
-}
-
-/// `SubOp::ScalarWeightMul` — multiply by a loaded `[1]`-shaped weight (Gemma4 `layer_scalar[layer]`),
-/// NOT a compile-time constant like [`ScalarMul`]. The weight is a rank-1 load broadcast along the
-/// column axis, the same shape the rmsnorm gain takes, so the broadcast produces `[rows, cols]` from
-/// a one-element source without a rank change.
-fn lower_scalarweightmul_node<F: RopeForm>(
-    node: &SubtileNode<F>,
-    ir: &SubtileIR<F>,
-    _sym_id_base: &mut i64,
-) -> Result<EmittedOp, SuperDscError> {
-    if node.inputs.len() != 2 {
-        return Err(arity_error(node, 2));
-    }
-    let w = &node.inputs[1];
-    if w.region.rows.len != 1 || w.region.cols.len != 1 {
-        return Err(SuperDscError(format!(
-            "ScalarWeightMul t{}: the weight operand t{} is `[{}, {}]` — the op multiplies by a \
-             loaded `[1]`-shaped scalar (gemma4 `layer_scalar[layer]`), so any other shape is not a \
-             scalar and not this op",
-            node.output.tensor.index() as u32,
-            w.tensor.index() as u32,
-            w.region.rows.len,
-            w.region.cols.len
-        )));
-    }
-    let mut st = KtirFunc::new(ir);
-    let name = Arena::global().str(format!("scalarwmul_s{}", node.id.index()));
-    let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
-    let dims = vec![i64::from(rows), i64::from(cols)];
-    let x = st.load_region(&node.inputs[0]);
-    // Rank-1 one-element load → broadcast along columns: every column of a row shares the weight.
-    let wv = st.load_1d(w.tensor, 1, 0, 1);
-    let wb = st.broadcast(wv, dims.clone(), 0);
-    let y = st.binop(OpKind::ArithMulf, x, wb, dims);
-    st.store_region(y, &node.output);
-    let k = st.finish_shaped(
-        name,
-        ktir_superdsc::ktir_node::Program::Elementwise(ktir_superdsc::ktir_node::Elementwise::Mul),
-    );
-    let mut e = EmittedOp::bare(name.to_string());
-    e.ktir = Some(k);
-    Ok(e)
-}
-
-
 ///
 /// ONLY `inputs[0]` is contracted. A matmul's `inputs[1]` is the WEIGHT `[k, n]`, whose `rows` is the
 /// REDUCTION extent K, not the query count — narrowing it to one row claims K=1 and fails
@@ -3781,7 +3723,7 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
                 v
             };
             let x2 = self.f32_binop(OpKind::ArithMulf, xbf, xbf, blk_dims);
-            let part = self.reduce(x2, ssum.clone(), OpKind::ArithAddf, 1, rows.clone());
+            let part = self.reduce(x2, ssum, OpKind::ArithAddf, 1, rows.clone());
             ssum = part;
             off += h;
         }
