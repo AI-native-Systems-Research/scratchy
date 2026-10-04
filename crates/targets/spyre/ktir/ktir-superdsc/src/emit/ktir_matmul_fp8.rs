@@ -13,8 +13,12 @@
 //! 8 MB. fp8 W8A8 runs on hardware today through this code, so the card keeps using it — reached
 //! through the KTIR, from facts the KTIR itself states.
 
-use super::{EmittedOp, In, assemble_convert, bmm_site, emit_sdsc_tiled, pw1, pw2, rb, rbo};
-use crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_seeded;
+use super::{
+    EmittedOp, In, assemble_convert, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb, rbo,
+};
+use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
+    assemble_reduce_off, assemble_reduce_seeded, reduce_opspec,
+};
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
@@ -165,17 +169,107 @@ pub(crate) fn matmul_fp8_descriptors(
             // premise (fixing K-cache inf) is already fixed elsewhere is unjustified risk with no
             // upside. Reverted to the simple, single unblocked reduce — decode already proves this form
             // works (m=1 always takes this path); prefill (m>1) now takes it too.
+            //
+            // ⛔⭐⭐⭐ EXCEPT WHERE THE REDUCE'S OWN TILER TIME-TILES IT — the gemma-4-12b fp8 prefill
+            // blocker. A time-tiled MAX reduce is silently WRONG, not merely refused: the vendor DDL
+            // (`summeanmaxexx2.ddl`) seeds LRF to -inf and writes the final value ONCE per invocation
+            // (OVERWRITE semantics), while `rewrite_op_for_time_tile`'s tiled predicate exempts the
+            // `[Active, RedStick]` accum from per-trip strides — every trip writes the SAME `[m,64]`
+            // bytes, so trip t destroys trip t-1's partial and the surviving amax is the LAST slice's
+            // max, not the global max. The bake's `tiled_trips_alias` guard correctly refuses it
+            // (12 refusals on ktir_prefill_gemma_4_12b_it_fp8). So ASK THE TILER FIRST — the SAME
+            // `reduce_opspec` the emission below builds, never a second LX formula — and when it would
+            // time-tile, emit the remedy `reduce.rs`'s own doc names: PARTIALS + COMBINE, "tile the
+            // reduction to one stick-width slice and combine the partials", one reduce per
+            // k/time-slice into a DISJOINT `[m,64]` slot, then fold them with `maximum` into `amax`.
             let amax_h = rb(&amax, m, stk);
-            ops.push(assemble_reduce_seeded(
-                &opn("fq_amax_op"),
-                "max",
-                m,
-                k,
-                &absx_h,
-                &amax_h,
-                sym_id_base,
-                layout,
-            ));
+            // The TILER'S OWN ANSWER, not a second LX formula: build the SAME OpSpec the single
+            // reduce below would emit and read its `time`. `head_major=false` is the fact
+            // `assemble_reduce_seeded` derives from `absx_h`'s `Stk<RowBlockedTag>` kind.
+            let single = reduce_opspec(op_func_from_str("max"), m, k, &absx, &amax, false)
+                .map_err(|e| SuperDscError(format!("fq_amax_op: {e}")))?;
+            let amax_time = single.time();
+            if amax_time == 1 || single.iter.split_of("out") > 1 {
+                // Non-tiled (every existing model: decode m=1, granite fp8 prefill) — the single
+                // unblocked reduce, byte-identical to the pre-partials emission. (A reduction-core
+                // split is left to the existing path too: the partials+combine remedy below is
+                // derived for the pure time-tiling case, and this arm is unreachable at any geometry
+                // the fp8 models actually bake.)
+                ops.push(assemble_reduce_seeded(
+                    &opn("fq_amax_op"),
+                    "max",
+                    m,
+                    k,
+                    &absx_h,
+                    &amax_h,
+                    sym_id_base,
+                    layout,
+                ));
+            } else {
+                // PARTIALS: `time` single-shot reduces, each over a `[m, k/time]` column slice of the
+                // RowBlocked `absx`. Slice j starts at column `j·k/time` — a stick boundary by the
+                // TimeTile invariant (`k/time` is a whole 64-stick) — whose device element offset is
+                // `j·m·(k/time)`: the RowBlocked law `(c/64)·(m·64)` puts stick-group g of EVERY row
+                // at `g·m·64`, so a whole-slice shift is exactly `j` blocks of the reduce's own
+                // `[m, k/time]` slab (block-aligned, which is what keeps `reduce_opspec_off` on the
+                // stick-major rank-2 path — a flat rank-3 read of a RowBlocked buffer scrambles at
+                // rows>1 && cols>64). Partial 0 seeds `amax` itself (attn's bmax→run_m precedent: no
+                // copy op for the only-ever-first slot); partials 1..time each land in their OWN
+                // `[m, 64]` synth, so no two reduces share an output byte — the aliasing the bake
+                // guard refuses is unrepresentable here, not merely avoided. Each partial is itself
+                // single-shot BY CONSTRUCTION: its residency is exactly the per-trip residency the
+                // tiler validated when it chose `time`.
+                let k_part = k / amax_time;
+                let partials: Vec<String> = (1..amax_time)
+                    .map(|j| syn(layout, a_id.synth(R::FqAmaxP(j))))
+                    .collect();
+                if let Some(l) = layout {
+                    for j in 1..amax_time {
+                        l.synth(a_id.synth(R::FqAmaxP(j)), &[m, stk]);
+                    }
+                }
+                for j in 0..amax_time {
+                    let accum_h = if j == 0 {
+                        rb(&amax, m, stk)
+                    } else {
+                        rb(&partials[(j - 1) as usize], m, stk)
+                    };
+                    let op_name = if j == 0 {
+                        opn("fq_amax_op")
+                    } else {
+                        opn(&format!("fq_amax_p{j}_op"))
+                    };
+                    ops.push(assemble_reduce_off(
+                        &op_name,
+                        "max",
+                        m_rows,
+                        crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
+                        &absx_h,
+                        crate::addr::col_of(m, k, j * k_part, Df::Fp16),
+                        &accum_h,
+                        crate::addr::DevOff::ZERO,
+                        sym_id_base,
+                        layout,
+                    ));
+                }
+                // COMBINE: amax = maximum(amax, partial_j) — running, in place on `amax` (the
+                // tanhsoftcap `tscth` in-place precedent). Lands in the SAME `amax` name every
+                // downstream op (`fq_amaxfl_op` on) already reads, so nothing below changes.
+                for (i, p) in partials.iter().enumerate() {
+                    let p_h = rb(p, m, stk);
+                    ops.push(pw2(
+                        &opn(&format!("fq_amax_c{}_op", i + 1)),
+                        "maximum",
+                        m_rows,
+                        scale_cols,
+                        In::full(&amax_h),
+                        In::full(&p_h),
+                        &amax_h,
+                        sym_id_base,
+                        layout,
+                    ));
+                }
+            }
             // floor: amax = max(amax, 1/448) — a zero-amax (all-zero padded query row) would make
             // invs=recip(0)=inf → 0·inf=NaN downstream; every real (non-padded) row's amax is always >>
             // 1/448, so this leaves them byte-identical. A scratchy padding guard, not part of torch-spyre's
@@ -344,5 +438,224 @@ pub(crate) fn matmul_fp8_descriptors(
             layout,
         ));
         Ok(ops)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::place::act_name;
+    use crate::placement::{SegRole, TensorPlacement};
+
+    /// A layout that places every tensor the fp8 chain names — the activation, the weight, the
+    /// per-channel w_scale, the output, and the three worker-bound E4M3 consts — the same facts
+    /// `lower_graph_to_superdsc`'s layout carries, stated here directly so the descriptors can be
+    /// asked for in-crate. Ids are MINTED (`ids` map), because `resolve_seg_base` recovers a
+    /// tensor's identity by lookup, never by parsing its spelling.
+    fn fp8_layout(m: u32, k: u32, n: u32) -> BundleLayout {
+        let mut l = BundleLayout::default();
+        let mut place = |tid: u32, rows: u32, cols: u32, role: SegRole, l: &mut BundleLayout| {
+            l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+            let seg = role.segment();
+            let off = l.segment_bytes[seg];
+            let size = crate::placement::synth_footprint_bytes(&[rows, cols], Df::Fp16);
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role,
+                    segment: seg,
+                    bank: 0,
+                    offset: off,
+                    size,
+                },
+            );
+            l.segment_bytes[seg] = crate::placement::align128(off + size);
+        };
+        place(7, m, k, SegRole::Activation, &mut l); // a_tid: the activation
+        place(8, n, k, SegRole::Weight, &mut l); // the fp8 weight (fp16-sized reservation is fine)
+        place(9, 1, n, SegRole::Activation, &mut l); // w_scale
+        place(10, m, n, SegRole::Activation, &mut l); // out_tid
+        for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
+            place(tid, 1, Fp16::ELEMS_PER_STICK, SegRole::Activation, &mut l);
+        }
+        l
+    }
+
+    fn facts() -> Fp8Facts {
+        Fp8Facts {
+            a_tid: 7,
+            a_name: act_name(7),
+            w_name: act_name(8),
+            ws_name: act_name(9),
+            out_tid: 10,
+        }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE AMAX CHAIN AT AN LX-OVERFLOWING GEOMETRY EMITS NO TIME-TILED OP.
+    ///
+    /// This is the gemma-4-12b fp8 prefill blocker's own shape class: `m=1024, k=16384` puts the
+    /// two-operand reduce at `2·(1024/32)·16384·2 = 2,097,152 B` of per-core LX — past the
+    /// 1,677,721-B budget — so the single reduce WOULD time-tile (`time=2`), which the bake's
+    /// `tiled_trips_alias` guard refuses (every trip writes the same `[m,64]` accum bytes — and
+    /// with the vendor DDL's overwrite semantics the surviving amax would be the LAST slice's max,
+    /// not the global max). The partials+combine path must replace it with single-shot ops only.
+    #[test]
+    fn the_amax_at_an_lx_overflowing_geometry_emits_no_time_tiled_op() {
+        let (m, k, n) = (1024u32, 16384, 128);
+        let l = fp8_layout(m, k, n);
+        let mut quantized = std::collections::HashSet::new();
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the wide-geometry fp8 chain emits");
+        // The AMAX family must be single-shot. (The wide POINTWISE ops around it — absx/sc/chi/cl
+        // over the same `[m,k]` — legitimately time-tile here; a pointwise output is `Active` over
+        // `out` so `rewrite_op_for_time_tile` strides it per trip and the bake accepts it. A REDUCE
+        // accum is `RedStick` — exempt from the stride — which is exactly the defect, so it is the
+        // reduce family this pins.)
+        let tiled: Vec<&str> = ops
+            .iter()
+            .filter(|o| o.time > 1 && o.op_name.contains("fq_amax"))
+            .map(|o| o.op_name.as_str())
+            .collect();
+        assert!(
+            tiled.is_empty(),
+            "every op of the amax family must be single-shot (time=1); time-tiled: {tiled:?}"
+        );
+        // The partials actually fired: one seed reduce into `amax`, `time-1` slot reduces, and the
+        // same number of combines. (A silent fall-back to the single reduce would leave this count
+        // wrong AND the bake refusing.)
+        let seed = ops.iter().filter(|o| o.op_name.ends_with("fq_amax_op")).count();
+        let slots = ops
+            .iter()
+            .filter(|o| o.op_name.contains("fq_amax_p"))
+            .count();
+        let combines = ops
+            .iter()
+            .filter(|o| o.op_name.contains("fq_amax_c"))
+            .count();
+        assert_eq!((seed, slots, combines), (1, 1, 1), "at m=1024/k=16384 the tiler mints time=2 (resident 2,097,152 B > 1,677,721 B; at k/2 it is 1,048,576 B), so the chain is ONE seed reduce + ONE partial + ONE combine");
+        // The combine is the LAST amax-family op before the floor — the downstream `fq_amaxfl_op`
+        // still reads the same `amax` name, so the chain's tail is untouched.
+        let amaxfl = ops
+            .iter()
+            .position(|o| o.op_name.ends_with("fq_amaxfl_op"))
+            .expect("the floor op survives");
+        let last_combine = ops
+            .iter()
+            .rposition(|o| o.op_name.contains("fq_amax_c"))
+            .expect("a combine exists");
+        assert!(
+            last_combine < amaxfl,
+            "the combines must fold into `amax` BEFORE the floor op reads it"
+        );
+    }
+
+    /// ⛔ THE PARTIAL SLOTS ARE DISJOINT — each reduce's accum footprint is its own `[m,64]`
+    /// reservation, never a shared byte. With one synth per slot this is a placement-level fact:
+    /// distinct names at distinct offsets with non-overlapping [offset, offset+size) ranges, and
+    /// the emitted AllocNode start addresses of the two reduces' outputs differ. That is exactly
+    /// the property `tiled_trips_alias` refuses to see violated — here it cannot arise, and this
+    /// pins it.
+    #[test]
+    fn the_amax_partial_slots_are_disjoint() {
+        let (m, k, n) = (1024u32, 16384, 128);
+        let l = fp8_layout(m, k, n);
+        let mut quantized = std::collections::HashSet::new();
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the wide-geometry fp8 chain emits");
+        let s = l.synth.borrow();
+        let a_id = PlaceId::Act(7);
+        let amax_name = a_id.synth(SynthRole::FqAmax).to_string();
+        let p1_name = a_id.synth(SynthRole::FqAmaxP(1)).to_string();
+        let amax_off = *s.map.get(&amax_name).expect("amax is placed");
+        let p1_off = *s.map.get(&p1_name).expect("partial 1 is placed");
+        let amax_sz = s.sizes[&amax_name];
+        let p1_sz = s.sizes[&p1_name];
+        // Footprint sanity: both are the true `[m, 64]` fp16 extent.
+        assert_eq!(amax_sz, m as u64 * 64 * 2, "amax owns [m, 64]");
+        assert_eq!(p1_sz, m as u64 * 64 * 2, "the partial slot owns [m, 64]");
+        // Disjoint byte ranges — the aliasing the bake refuses is unrepresentable here.
+        let overlap = amax_off < p1_off + p1_sz && p1_off < amax_off + amax_sz;
+        assert!(
+            !overlap,
+            "amax [{amax_off},{}) and its partial slot [{p1_off},{}) must not share a byte",
+            amax_off + amax_sz,
+            p1_off + p1_sz
+        );
+        // And the EMITTED output nodes agree: the two reduces' accum AllocNodes carry different
+        // start addresses (the bake guard reads these same nodes; asserting them here keeps the
+        // test honest against a future change that places slots apart but addresses them together).
+        let start_of_output = |op: &EmittedOp| -> u64 {
+            let dsc = op.dsc();
+            for dsc_map in dsc.dscs_.iter() {
+                for dsc in dsc_map.values() {
+                    for node in dsc.scheduleTree_.iter() {
+                        let binding = &op.arg_bindings[node.ldsIdx_ as usize];
+                        if !binding.is_input
+                            && binding.buffer.contains("fq_amax")
+                        {
+                            let v = node
+                                .startAddressCoreCorelet_
+                                .data_
+                                .values()
+                                .next()
+                                .expect("a start address");
+                            return v.parse().expect("addresses are numeric");
+                        }
+                    }
+                }
+            }
+            panic!("{}: no output AllocNode", op.op_name);
+        };
+        let seed = ops
+            .iter()
+            .find(|o| o.op_name.ends_with("fq_amax_op"))
+            .expect("the seed reduce");
+        let slot = ops
+            .iter()
+            .find(|o| o.op_name.contains("fq_amax_p"))
+            .expect("the partial reduce");
+        let (seed_start, slot_start) = (start_of_output(seed), start_of_output(slot));
+        assert_ne!(
+            seed_start, slot_start,
+            "the seed (amax) and the partial slot must start at different addresses"
+        );
+        assert!(
+            (seed_start.max(slot_start) - seed_start.min(slot_start)) >= m as u64 * 64 * 2,
+            "the two reduces' outputs are a whole [m,64] buffer apart, not interleaved"
+        );
+    }
+
+    /// ⭐ THE NON-TILED CASE IS BYTE-IDENTICAL: at a geometry the tiler passes (decode m=1, and
+    /// every granite fp8 prefill), the amax is ONE op named `fq_amax_op` and NO partial/combine op
+    /// exists. Pins that the new path cannot fire where the old one was correct.
+    #[test]
+    fn the_amax_at_a_fitting_geometry_stays_one_single_shot_reduce() {
+        let (m, k, n) = (32u32, 2048, 128);
+        let l = fp8_layout(m, k, n);
+        let mut quantized = std::collections::HashSet::new();
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the fitting-geometry fp8 chain emits");
+        assert!(
+            ops.iter().all(|o| o.time == 1),
+            "a fitting geometry has no time-tiled op at all"
+        );
+        assert_eq!(
+            ops.iter().filter(|o| o.op_name.ends_with("fq_amax_op")).count(),
+            1,
+            "exactly one amax reduce"
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| o.op_name.contains("fq_amax_p") || o.op_name.contains("fq_amax_c")),
+            "no partial or combine op may exist at a fitting geometry"
+        );
+        assert!(
+            !l.synth
+                .borrow()
+                .map
+                .contains_key(&PlaceId::Act(7).synth(SynthRole::FqAmaxP(1)).to_string()),
+            "no partial synth may be declared at a fitting geometry"
+        );
     }
 }

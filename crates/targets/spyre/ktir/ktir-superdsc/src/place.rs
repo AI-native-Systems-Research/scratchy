@@ -48,6 +48,10 @@ pub enum SynthRole {
     FqDqA,
     FqMm,
     FqRaw,
+    /// ⭐ ONE amax PARTIAL SLOT — the `[m, 64]` max a SINGLE time-slice of the wide reduce produced,
+    /// before the `maximum` combine folds them into [`FqAmax`]. Indexed (like `Blk`) because the number
+    /// of partials is the reduce's own time-tile count, known only at bake.
+    FqAmaxP(u32),
     // ── rmsnorm scratch ──
     Sq16,
     Mean,
@@ -125,6 +129,7 @@ impl fmt::Display for SynthRole {
             Self::FqDqA => f.write_str("fq_dqa"),
             Self::FqMm => f.write_str("fq_mm"),
             Self::FqRaw => f.write_str("fq_raw"),
+            Self::FqAmaxP(j) => write!(f, "fq_amaxp{j}"),
             Self::Sq16 => f.write_str("sq16"),
             Self::Mean => f.write_str("mean"),
             Self::Meps => f.write_str("meps"),

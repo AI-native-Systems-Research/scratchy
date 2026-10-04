@@ -943,6 +943,7 @@ mod place_id_tests {
             FqDqA,
             FqMm,
             FqRaw,
+            FqAmaxP(0),
             Sq16,
             Mean,
             Meps,

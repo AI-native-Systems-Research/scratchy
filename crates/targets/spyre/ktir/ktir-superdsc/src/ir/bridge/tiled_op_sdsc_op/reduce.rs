@@ -399,13 +399,28 @@ pub fn reduce_opspec_off(
     let device_dims = plan.iter_syms(["mb", "out", "y"]);
     // ── STICK-MAJOR RESIDUAL ── flip ONLY the DATA input to rank-2
     // stick-major to match a stick-major producer (see `reduce_opspec`); a per-head OFFSET slice
-    // (data_off/accum_off ≠ 0) is head-structured and stays rank-3. head_major forces rank-3 too.
+    // (non-block-aligned data_off/accum_off) is head-structured and stays rank-3. head_major forces
+    // rank-3 too.
     // `cols > 64` matches `reduce_opspec`'s identical fix: rank-2 drops `y` from `layoutDimOrder_`
     // entirely, which only needs to happen for the wide (`cols>64`) case this optimization exists
     // for — a real pod crash confirmed a `cols<=64` per-head reduce (attn_dp/attn_dn) breaks
     // otherwise.
-    let stickmajor =
-        !head_major && rows > 1 && cols > Fp16::ELEMS_PER_STICK && data_off == 0 && accum_off == 0;
+    //
+    // ⛔ OFFSETS: only a WHOLE-BLOCK shift of this op's own `[rows, cols]` slab keeps rank-2 — the
+    // SAME rule `pointwise.rs` documents for its `out_offset`. A RowBlocked stick-group is
+    // `rows·64` elements, so a sub-block read at element base `k·(rows·cols)` (a whole number of
+    // the op's own blocks, each block a whole number of stick-groups since `cols` is a stick
+    // multiple) addresses through the identical law: the full tensor's `(r, k·cols + c)` sits at
+    // exactly `k·rows·cols + ((c/64)·rows·64 + r·64 + c%64)`. A NON-block-aligned offset (a flat
+    // column slice, a per-head head offset) is NOT a whole-block shift — a column slice of a
+    // stick-major tensor is NOT contiguous — so it stays rank-3 flat, exactly as before. Zero is
+    // block-aligned, so every existing caller (attn_dp/attn_dn at `DevOff::ZERO`) is byte-identical.
+    let block = rows.saturating_mul(cols).max(1);
+    let stickmajor = !head_major
+        && rows > 1
+        && cols > Fp16::ELEMS_PER_STICK
+        && data_off.is_multiple_of(block)
+        && accum_off.is_multiple_of(block);
     let device_dims_r2 = plan.iter_syms(["mb", "out"]);
     let data = if stickmajor {
         AnyTensorArg::R2(

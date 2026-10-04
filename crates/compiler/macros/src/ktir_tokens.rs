@@ -379,6 +379,12 @@ fn synth_role_tokens(
             let i = proc_macro2::Literal::u32_unsuffixed(i);
             quote! { #path::LAcc(#i) }
         }
+        // The amax partial slot — indexed like the four above; the catch-all below would render
+        // `FqAmaxP(2)` from Debug, which is not an ident.
+        R::FqAmaxP(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(j);
+            quote! { #path::FqAmaxP(#j) }
+        }
         other => {
             let v = variant(format!("{other:?}"));
             quote! { #path::#v }

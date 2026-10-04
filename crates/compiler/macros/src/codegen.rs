@@ -8560,6 +8560,10 @@ fn synth_role_tokens(
         R::FqDqA => quote! { #b::FqDqA },
         R::FqMm => quote! { #b::FqMm },
         R::FqRaw => quote! { #b::FqRaw },
+        R::FqAmaxP(j) => {
+            let j = proc_macro2::Literal::u32_unsuffixed(*j);
+            quote! { #b::FqAmaxP(#j) }
+        }
         R::Sq16 => quote! { #b::Sq16 },
         R::Mean => quote! { #b::Mean },
         R::Meps => quote! { #b::Meps },
