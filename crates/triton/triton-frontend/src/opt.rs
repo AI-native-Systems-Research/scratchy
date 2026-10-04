@@ -251,11 +251,7 @@ pub fn fold_identity_casts(m: &mut Module) -> bool {
     true
 }
 
-fn collect_identity_casts(
-    ops: &[Op],
-    tys: &[Type],
-    subst: &mut HashMap<ValueId, ValueId>,
-) {
+fn collect_identity_casts(ops: &[Op], tys: &[Type], subst: &mut HashMap<ValueId, ValueId>) {
     for op in ops {
         let identity = matches!(
             op.name.as_str(),
@@ -340,11 +336,7 @@ fn float_constants(m: &Module) -> HashMap<ValueId, (f64, bool)> {
     out
 }
 
-fn fold_arith_ops(
-    ops: &mut [Op],
-    consts: &HashMap<ValueId, (f64, bool)>,
-    tys: &[Type],
-) -> bool {
+fn fold_arith_ops(ops: &mut [Op], consts: &HashMap<ValueId, (f64, bool)>, tys: &[Type]) -> bool {
     let mut changed = false;
     for op in ops.iter_mut() {
         for r in &mut op.regions {
@@ -445,8 +437,10 @@ fn fold_splats(
         op.name = "arith.constant".to_string();
         op.operands.clear();
         op.attrs.clear();
-        op.attrs
-            .insert("value".to_string(), Attr::DenseSplat(Box::new(inner), res_ty));
+        op.attrs.insert(
+            "value".to_string(),
+            Attr::DenseSplat(Box::new(inner), res_ty),
+        );
         changed = true;
     }
     changed
@@ -500,7 +494,12 @@ fn sort_ops(ops: &mut [Op], consts: &std::collections::HashSet<ValueId>) -> bool
         if !COMMUTATIVE.contains(&op.name.as_str()) || op.operands.len() < 2 {
             continue;
         }
-        let mut sorted: Vec<ValueId> = op.operands.iter().copied().filter(|v| !consts.contains(v)).collect();
+        let mut sorted: Vec<ValueId> = op
+            .operands
+            .iter()
+            .copied()
+            .filter(|v| !consts.contains(v))
+            .collect();
         sorted.extend(op.operands.iter().copied().filter(|v| consts.contains(v)));
         if sorted != op.operands {
             op.operands = sorted;
@@ -570,7 +569,11 @@ pub fn promote_single_trip_loops(m: &mut Module) -> bool {
         let body_ops = body.ops.clone();
         for op in &body_ops {
             if op.name == "scf.yield" {
-                yielded = op.operands.iter().map(|v| *map.get(v).unwrap_or(v)).collect();
+                yielded = op
+                    .operands
+                    .iter()
+                    .map(|v| *map.get(v).unwrap_or(v))
+                    .collect();
                 continue;
             }
             cloned.push(clone_op(m, op, &mut map));
@@ -661,7 +664,11 @@ fn find_for_in(
         if trips == 1 {
             let body = op.regions[0].blocks.first()?;
             if body.args.len() == op.operands.len() - 2 {
-                return Some(Site { func, path: path.clone(), index: i });
+                return Some(Site {
+                    func,
+                    path: path.clone(),
+                    index: i,
+                });
             }
         }
     }
@@ -784,9 +791,11 @@ fn inline_one_round(m: &mut Module) -> Result<bool> {
     };
 
     // ---- build the substitution: callee value -> caller value -------------------
-    let entry = callee.body.blocks.first().ok_or_else(|| {
-        Error::new(format!("`@{callee_name}` has an empty body"), 0, 0)
-    })?;
+    let entry = callee
+        .body
+        .blocks
+        .first()
+        .ok_or_else(|| Error::new(format!("`@{callee_name}` has an empty body"), 0, 0))?;
     if entry.args.len() != call.operands.len() {
         return Err(Error::new(
             format!(
@@ -874,7 +883,11 @@ fn find_call(m: &Module) -> Option<Site> {
 fn find_call_in(ops: &[Op], func: usize, path: &mut Vec<(usize, usize)>) -> Option<Site> {
     for (i, op) in ops.iter().enumerate() {
         if op.name == "tt.call" {
-            return Some(Site { func, path: path.clone(), index: i });
+            return Some(Site {
+                func,
+                path: path.clone(),
+                index: i,
+            });
         }
         for (ri, r) in op.regions.iter().enumerate() {
             if let Some(b) = r.blocks.first() {
@@ -910,7 +923,11 @@ fn op_at<'m>(m: &'m Module, s: &Site) -> &'m Op {
 fn clone_op(m: &mut Module, op: &Op, map: &mut HashMap<ValueId, ValueId>) -> Op {
     let mut out = Op::new(op.name.clone(), op.loc.clone());
     out.attrs = op.attrs.clone();
-    out.operands = op.operands.iter().map(|v| *map.get(v).unwrap_or(v)).collect();
+    out.operands = op
+        .operands
+        .iter()
+        .map(|v| *map.get(v).unwrap_or(v))
+        .collect();
     for r in &op.results {
         let info = m.values[r.0 as usize].clone();
         let fresh = ValueId(m.values.len() as u32);
@@ -1138,7 +1155,11 @@ fn cse_ops(
         }
         if effect(&op) == Eff::Other {
             // A writer: nothing read before it may be reused after it.
-            scopes.last_mut().expect("a scope is always open").read.clear();
+            scopes
+                .last_mut()
+                .expect("a scope is always open")
+                .read
+                .clear();
         }
         if !op.regions.is_empty() {
             scopes.push(Scope::default());
@@ -1176,7 +1197,11 @@ fn cse_ops(
             }
             None => {
                 let last = scopes.last_mut().expect("a scope is always open");
-                let slot = if read_only { &mut last.read } else { &mut last.pure };
+                let slot = if read_only {
+                    &mut last.read
+                } else {
+                    &mut last.pure
+                };
                 slot.insert(key, op.results.clone());
                 keep.push(op);
             }
@@ -1317,7 +1342,9 @@ fn dce_ops(ops: &mut Vec<Op>, used: &std::collections::HashSet<ValueId>) -> bool
 /// `triton_ktir::text::diff` falls back on at the next stage.
 pub fn hoist_constants(m: &mut Module) {
     for f in &mut m.funcs {
-        let Some(entry) = f.body.blocks.first_mut() else { continue };
+        let Some(entry) = f.body.blocks.first_mut() else {
+            continue;
+        };
         // The run of constants ALREADY at the front keeps its order and stays behind the
         // moved ones.
         let leading = entry
@@ -1369,9 +1396,8 @@ pub fn symbol_dce(m: &mut Module) {
             }
         }
         let before = m.funcs.len();
-        m.funcs.retain(|f| {
-            f.visibility == Visibility::Public || called.contains(&f.name)
-        });
+        m.funcs
+            .retain(|f| f.visibility == Visibility::Public || called.contains(&f.name));
         if m.funcs.len() == before {
             return;
         }

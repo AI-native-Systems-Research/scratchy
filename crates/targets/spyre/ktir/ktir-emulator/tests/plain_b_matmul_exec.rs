@@ -15,12 +15,12 @@
 //! entry the resident serving path takes, with `apply_attention_rewrites` (and its
 //! matmul tiling) applied — and checks the numbers against a plain host reference.
 
-use ktir_emulator::ktir_optimizer::fusion::{Binding, NodeSpec, ProgramSpec};
 use ktir_emulator::interpreter::Arg;
+use ktir_emulator::ktir_optimizer::fusion::{Binding, NodeSpec, ProgramSpec};
 use ktir_emulator::program::execute;
 use ktir_emulator::{
-    arena::Arena, attrkey::AttrKey, codec, dtypes::DType, ir::Attr, ir::IRFunction,
-    ir::Operation, ir::Ssa, irtype::IrType, opkind::OpKind,
+    arena::Arena, attrkey::AttrKey, codec, dtypes::DType, ir::Attr, ir::IRFunction, ir::Operation,
+    ir::Ssa, irtype::IrType, opkind::OpKind,
 };
 
 /// Build the plain-B single-dot form the splice mints: A `[m, k]`, W `[k, n]`, out
@@ -32,8 +32,16 @@ fn plain_b_func(m: usize, k: usize, n: usize) -> IRFunction<'static> {
     let mut ops: Vec<Operation<'static>> = Vec::new();
     let view = |ops: &mut Vec<Operation<'static>>, res: Ssa, ptr: Ssa, r: usize, c: usize| {
         let op = Operation::new(a, Some(res), OpKind::KtdpConstructMemoryView, &[ptr])
-            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r as i64, c as i64])))
-            .with_attr(a, AttrKey::Strides, Attr::IntList(a.ints(vec![c as i64, 1])))
+            .with_attr(
+                a,
+                AttrKey::Shape,
+                Attr::IntList(a.ints(vec![r as i64, c as i64])),
+            )
+            .with_attr(
+                a,
+                AttrKey::Strides,
+                Attr::IntList(a.ints(vec![c as i64, 1])),
+            )
             .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
             .with_attr(a, AttrKey::MemorySpace, Attr::Str(hbm));
         ops.push(op);
@@ -46,8 +54,11 @@ fn plain_b_func(m: usize, k: usize, n: usize) -> IRFunction<'static> {
     let zc = Ssa(13);
     ops.push(Operation {
         result_type: Some(IrType::Scalar(DType::F16)),
-        ..Operation::new(a, Some(zc), OpKind::ArithConstant, &[])
-            .with_attr(a, AttrKey::Value, Attr::Float(0.0))
+        ..Operation::new(a, Some(zc), OpKind::ArithConstant, &[]).with_attr(
+            a,
+            AttrKey::Value,
+            Attr::Float(0.0),
+        )
     });
     let zero = Ssa(14);
     ops.push(Operation {
@@ -56,22 +67,41 @@ fn plain_b_func(m: usize, k: usize, n: usize) -> IRFunction<'static> {
             elem: DType::F16,
         }),
         ..Operation::new(a, Some(zero), OpKind::TensorSplat, &[zc])
-            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![m as i64, n as i64])))
+            .with_attr(
+                a,
+                AttrKey::Shape,
+                Attr::IntList(a.ints(vec![m as i64, n as i64])),
+            )
             .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
     });
     // The index-typed zero every access-tile corner reads.
     let idx0 = Ssa(15);
     ops.push(Operation {
         result_type: Some(IrType::Index),
-        ..Operation::new(a, Some(idx0), OpKind::ArithConstant, &[])
-            .with_attr(a, AttrKey::Value, Attr::Int(0))
+        ..Operation::new(a, Some(idx0), OpKind::ArithConstant, &[]).with_attr(
+            a,
+            AttrKey::Value,
+            Attr::Int(0),
+        )
     });
     let load = |ops: &mut Vec<Operation<'static>>, res: Ssa, view_: Ssa, r: usize, c: usize| {
-        let acc = Operation::new(a, Some(res), OpKind::KtdpConstructAccessTile, &[view_, idx0])
-            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r as i64, c as i64])));
+        let acc = Operation::new(
+            a,
+            Some(res),
+            OpKind::KtdpConstructAccessTile,
+            &[view_, idx0],
+        )
+        .with_attr(
+            a,
+            AttrKey::Shape,
+            Attr::IntList(a.ints(vec![r as i64, c as i64])),
+        );
         ops.push(acc);
-        let ld = Operation::new(a, Some(res), OpKind::KtdpLoad, &[res])
-            .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r as i64, c as i64])));
+        let ld = Operation::new(a, Some(res), OpKind::KtdpLoad, &[res]).with_attr(
+            a,
+            AttrKey::Shape,
+            Attr::IntList(a.ints(vec![r as i64, c as i64])),
+        );
         ops.push(ld);
     };
     // ⛔ SAME SSA FOR THE ACCESS TILE AND THE LOAD, exactly the bug class this test
@@ -80,12 +110,30 @@ fn plain_b_func(m: usize, k: usize, n: usize) -> IRFunction<'static> {
     load(&mut ops, Ssa(20), Ssa(10), m, k);
     load(&mut ops, Ssa(21), Ssa(11), k, n);
     let res = Ssa(22);
-    let mm = Operation::new(a, Some(res), OpKind::LinalgMatmul, &[Ssa(20), Ssa(21), zero])
-        .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![m as i64, n as i64])));
+    let mm = Operation::new(
+        a,
+        Some(res),
+        OpKind::LinalgMatmul,
+        &[Ssa(20), Ssa(21), zero],
+    )
+    .with_attr(
+        a,
+        AttrKey::Shape,
+        Attr::IntList(a.ints(vec![m as i64, n as i64])),
+    );
     ops.push(mm);
     // The output store: the drain the recognizer requires.
-    let oat = Operation::new(a, Some(Ssa(23)), OpKind::KtdpConstructAccessTile, &[Ssa(12), idx0])
-        .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![m as i64, n as i64])));
+    let oat = Operation::new(
+        a,
+        Some(Ssa(23)),
+        OpKind::KtdpConstructAccessTile,
+        &[Ssa(12), idx0],
+    )
+    .with_attr(
+        a,
+        AttrKey::Shape,
+        Attr::IntList(a.ints(vec![m as i64, n as i64])),
+    );
     ops.push(oat);
     let st = Operation::new(a, None, OpKind::KtdpStore, &[res, Ssa(23)]);
     ops.push(st);
@@ -111,16 +159,30 @@ fn plain_b_matmul_executes_through_the_tiled_segmented_path() {
         nodes: vec![NodeSpec {
             func: "plain_b_mm".to_string(),
             bindings: vec![
-                Binding { arg: Ssa(0), tensor: 0, is_output: false },
-                Binding { arg: Ssa(1), tensor: 1, is_output: false },
-                Binding { arg: Ssa(2), tensor: 2, is_output: true },
+                Binding {
+                    arg: Ssa(0),
+                    tensor: 0,
+                    is_output: false,
+                },
+                Binding {
+                    arg: Ssa(1),
+                    tensor: 1,
+                    is_output: false,
+                },
+                Binding {
+                    arg: Ssa(2),
+                    tensor: 2,
+                    is_output: true,
+                },
             ],
         }],
         sources: [0u64, 1u64].into_iter().collect(),
         results: [2u64].into_iter().collect(),
     };
     let host: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01 - 1.0).collect();
-    let weight: Vec<f32> = (0..k * n).map(|i| ((i % 17) as f32) * 0.02 - 0.16).collect();
+    let weight: Vec<f32> = (0..k * n)
+        .map(|i| ((i % 17) as f32) * 0.02 - 0.16)
+        .collect();
     // The host reference: out[m, n] = Σ_k host[m, k] · weight[k, n] (PLAIN B).
     let mut want = vec![0.0f32; m * n];
     for mi in 0..m {

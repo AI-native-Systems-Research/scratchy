@@ -45,7 +45,10 @@ use std::path::PathBuf;
 fn ttir(config: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .map(|p| p.join("test-experiment1/ktir").join(format!("{config}.ttir.mlir")))
+        .map(|p| {
+            p.join("test-experiment1/ktir")
+                .join(format!("{config}.ttir.mlir"))
+        })
         .expect("the crate sits one level under crates/triton");
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("MISSING TTIR {}: {e}", path.display()))
@@ -102,12 +105,7 @@ fn windows_under_work_loop(f: &IRFunction<'_>) -> usize {
         .filter(|o| o.op_type == OpKind::KtdpGetComputeTileId)
         .filter_map(|o| o.result)
         .collect();
-    fn count(
-        ops: &[ktir_core::ir::Operation<'_>],
-        landmark: &[Ssa],
-        inside: bool,
-        n: &mut usize,
-    ) {
+    fn count(ops: &[ktir_core::ir::Operation<'_>], landmark: &[Ssa], inside: bool, n: &mut usize) {
         for o in ops {
             if inside && o.op_type == OpKind::KtdpConstructAccessTile {
                 *n += 1;
@@ -199,8 +197,16 @@ fn the_trip_count_does_not_change_which_buffers_state_a_width() {
     // q32, 8*256 = 2048 at kv8. cos/sin are shared across heads, so [256, 64] at both.
     type Widths = &'static [i64];
     let cases: &[(&str, &[i64], &[Widths])] = &[
-        ("rope_kv8", &[4, 8], &[&[2048, 128], &[256, 64], &[256, 64], &[2048, 128]]),
-        ("rope_q32", &[4, 32], &[&[8192, 128], &[256, 64], &[256, 64], &[8192, 128]]),
+        (
+            "rope_kv8",
+            &[4, 8],
+            &[&[2048, 128], &[256, 64], &[256, 64], &[2048, 128]],
+        ),
+        (
+            "rope_q32",
+            &[4, 32],
+            &[&[8192, 128], &[256, 64], &[256, 64], &[8192, 128]],
+        ),
     ];
     for (config, grid, want) in cases {
         let m = converted(config, grid);
@@ -258,7 +264,8 @@ fn the_multi_trip_work_loop_is_unrolled_not_folded() {
     // A launch contract is recorded ONLY for the fold, which invents a trip for an
     // out-of-range tile. An even unroll invents nothing, so there is nothing to promise.
     assert!(
-        func.attr(&triton_ktir::ir::AttrKey::FoldedGridLoop).is_none(),
+        func.attr(&triton_ktir::ir::AttrKey::FoldedGridLoop)
+            .is_none(),
         "an evenly unrolled loop has no zero-trip tile, so it must not record the fold's \
          launch obligation"
     );
@@ -306,7 +313,10 @@ fn a_view_pushed_into_a_region_is_refused_as_nested_not_as_absent() {
         li + 1,
         triton_ktir::ir::Op::new(triton_ktir::ir::OpKind::ScfFor)
             .with_operands([core_id, core_id, core_id])
-            .with_region(triton_ktir::ir::Region { args: vec![], ops: body }),
+            .with_region(triton_ktir::ir::Region {
+                args: vec![],
+                ops: body,
+            }),
     );
 
     let e = triton_ktir::passes::to_ktir_emit::lower(&m, a)
@@ -472,7 +482,8 @@ fn the_multi_trip_work_loop_is_unrolled_and_every_trip_states_its_own_windows() 
             .filter(|o| o.op_type == OpKind::KtdpConstructAccessTile)
             .count();
         assert_eq!(
-            n, want,
+            n,
+            want,
             "{config} at grid {grid:?} must state {want} top-level windows -- one set per trip. \
              {} says a trip's windows were dropped rather than emitted.",
             if n < want { "fewer" } else { "more" }
@@ -516,7 +527,11 @@ fn the_unrolled_trips_address_four_distinct_work_items() {
         .filter(|o| o.op_type == OpKind::KtdpGetComputeTileId)
         .filter_map(|o| o.result)
         .collect();
-    assert_eq!(landmark.len(), 1, "one work-distribution landmark, shared by every trip");
+    assert_eq!(
+        landmark.len(),
+        1,
+        "one work-distribution landmark, shared by every trip"
+    );
     let mut offsets: Vec<i64> = f
         .operations
         .iter()
@@ -558,7 +573,12 @@ fn a_parameter_nothing_addresses_is_refused_naming_it_and_the_grid() {
     // `grid [16]` was the pre-unroll spelling; the grid-position unroll collapses the
     // launch to one tile, so the refusal now names the collapsed grid. Both spellings
     // name the same kernel and the same unaddressed parameter.
-    for needle in ["parameter 4", "desc_mask", "grid [1]", "construct_memory_view"] {
+    for needle in [
+        "parameter 4",
+        "desc_mask",
+        "grid [1]",
+        "construct_memory_view",
+    ] {
         assert!(
             msg.contains(needle),
             "the refusal must name {needle:?} -- got {msg:?}"
@@ -621,8 +641,7 @@ fn exactly_one_of_the_twelve_is_multi_trip_and_none_hands_over_a_loop() {
     for (config, grid) in ALL_TWELVE {
         let m = converted(config, grid);
         let func = m.kernel().expect("one kernel");
-        if func
-            .regions[0]
+        if func.regions[0]
             .ops
             .iter()
             .any(|o| triton_ktir::passes::distribute_work::is_per_core_work_loop(&m, o))
@@ -740,7 +759,9 @@ fn every_shaped_result_states_its_dtype_and_shape_as_attributes() {
         let mut checked_dtype = 0usize;
         let mut checked_shape = 0usize;
         walk_ops(f.operations, &mut |op| {
-            let Some(t) = op.result_type.as_ref() else { return };
+            let Some(t) = op.result_type.as_ref() else {
+                return;
+            };
             // The element dtype, where the type has one.
             let want_elem = match t {
                 KIrType::Tensor { elem, .. } | KIrType::MemRef { elem, .. } => Some(*elem),
@@ -835,7 +856,10 @@ fn the_dtype_attribute_is_derived_and_not_stamped_on_everything() {
             Some(KIrType::Index) | Some(KIrType::AccessTile { .. }) => {
                 index_typed += 1;
                 assert!(
-                    !matches!(op.attr(ktir_core::attrkey::AttrKey::Dtype), Some(Attr::Dtype(_))),
+                    !matches!(
+                        op.attr(ktir_core::attrkey::AttrKey::Dtype),
+                        Some(Attr::Dtype(_))
+                    ),
                     "`{:?}` has no element type and must carry no `Dtype` attribute: an attribute \
                      stamped on every op is provenance that means nothing",
                     op.op_type
@@ -844,7 +868,10 @@ fn the_dtype_attribute_is_derived_and_not_stamped_on_everything() {
             None => {
                 untyped += 1;
                 assert!(
-                    !matches!(op.attr(ktir_core::attrkey::AttrKey::Dtype), Some(Attr::Dtype(_))),
+                    !matches!(
+                        op.attr(ktir_core::attrkey::AttrKey::Dtype),
+                        Some(Attr::Dtype(_))
+                    ),
                     "`{:?}` has no result type at all and must carry no `Dtype` attribute",
                     op.op_type
                 );

@@ -64,7 +64,9 @@ fn no_fixture_leaks_triton_after_the_conversion() {
         // And the `ktdf` plan is gone -- it is a NAME COLLISION downstream, not a
         // shared dialect.
         assert!(
-            !m.ops_deep().iter().any(|o| o.kind.spelling().starts_with("ktdf.")),
+            !m.ops_deep()
+                .iter()
+                .any(|o| o.kind.spelling().starts_with("ktdf.")),
             "{config}: the corelet plan must be dropped, not converted"
         );
     }
@@ -80,7 +82,11 @@ fn the_triton_op_conversions_match_the_cpp_census() {
         let g = parse::parse(&golden(config, "3_sched.mlir"))
             .unwrap_or_else(|e| panic!("{config}: the stage-3 golden must parse: {e}"));
         let count = |m: &triton_ktir::Module, name: &str| {
-            m.census().into_iter().find(|(k, _)| k == name).map(|(_, v)| v).unwrap_or(0)
+            m.census()
+                .into_iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v)
+                .unwrap_or(0)
         };
         // The ops THIS pass owns, compared exactly -- with TWO RECORDED SCALINGS, both
         // measured and both stated where they are checked:
@@ -114,7 +120,11 @@ fn the_triton_op_conversions_match_the_cpp_census() {
                 .and_then(|f| f.attr(&triton_ktir::ir::AttrKey::Grid))
                 .and_then(|a| a.as_int_list().map(|v| v.iter().product::<i64>()))
                 .unwrap_or(1);
-            if og == 1 && gg > 1 { gg } else { 1 }
+            if og == 1 && gg > 1 {
+                gg
+            } else {
+                1
+            }
         };
         for name in ["func.func", "func.return"] {
             let (gv, ov) = (count(&g, name), count(&o, name));
@@ -172,12 +182,26 @@ fn the_triton_op_conversions_match_the_cpp_census() {
             ));
         }
         // And zero of everything Triton, on both sides.
-        for name in ["tt.func", "tt.return", "tt.reduce", "tt.broadcast", "tt.expand_dims"] {
-            assert_eq!(count(&g, name), 0, "{config}: the golden should have no {name}");
+        for name in [
+            "tt.func",
+            "tt.return",
+            "tt.reduce",
+            "tt.broadcast",
+            "tt.expand_dims",
+        ] {
+            assert_eq!(
+                count(&g, name),
+                0,
+                "{config}: the golden should have no {name}"
+            );
             assert_eq!(count(&o, name), 0, "{config}: we should have no {name}");
         }
     }
-    assert!(failures.is_empty(), "stage-3 op counts differ:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "stage-3 op counts differ:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// THE REDUCTION'S SHAPE, on both sides -- but STRUCTURALLY, not axis-for-axis.
@@ -205,7 +229,9 @@ fn every_reduction_generic_is_well_formed_on_both_sides() {
             if op.kind != OpKind::LinalgGeneric {
                 continue;
             }
-            let Some(Attr::StrList(iters)) = op.attr(&AttrKey::IteratorTypes) else { continue };
+            let Some(Attr::StrList(iters)) = op.attr(&AttrKey::IteratorTypes) else {
+                continue;
+            };
             let red: Vec<usize> = iters
                 .iter()
                 .enumerate()
@@ -215,7 +241,9 @@ fn every_reduction_generic_is_well_formed_on_both_sides() {
             if red.len() != 1 {
                 continue; // not a single-axis reduction (a contraction has its own shape)
             }
-            let Some(Attr::AffineMapList(maps)) = op.attr(&AttrKey::IndexingMaps) else { continue };
+            let Some(Attr::AffineMapList(maps)) = op.attr(&AttrKey::IndexingMaps) else {
+                continue;
+            };
             if maps.len() != 2 {
                 continue;
             }
@@ -243,8 +271,10 @@ fn every_reduction_generic_is_well_formed_on_both_sides() {
                      source rank"
                 );
                 // `outs` must name every dim except the reduced one, in order.
-                let kept: Vec<String> =
-                    (0..*rank).filter(|i| i != axis).map(|i| format!("d{i}")).collect();
+                let kept: Vec<String> = (0..*rank)
+                    .filter(|i| i != axis)
+                    .map(|i| format!("d{i}"))
+                    .collect();
                 let want = format!("({}) -> ({})", d.join(", "), kept.join(", "));
                 assert_eq!(
                     outs, &want,
@@ -283,7 +313,9 @@ fn no_side_emits_the_named_linalg_broadcast() {
         let g = parse::parse(&golden(config, "3_sched.mlir")).unwrap();
         for (who, m) in [("golden", &g), ("ours", &o)] {
             assert!(
-                !m.ops_deep().iter().any(|x| x.kind.spelling() == "linalg.broadcast"),
+                !m.ops_deep()
+                    .iter()
+                    .any(|x| x.kind.spelling() == "linalg.broadcast"),
                 "{config}/{who}: the named linalg.broadcast is rejected downstream (p07)"
             );
         }
@@ -327,7 +359,10 @@ fn the_grid_attribute_matches_the_golden() {
             // The unroll fired: ours is the collapsed single-tile grid, the golden's
             // extent is the position count.
             let n: i64 = ge.iter().flatten().product();
-            assert!(n > 1, "{config}: the golden's extent is the unrolled position count");
+            assert!(
+                n > 1,
+                "{config}: the golden's extent is the unrolled position count"
+            );
         } else {
             assert_eq!(
                 ge, oe,
@@ -351,7 +386,11 @@ fn planted_stage_three_differences_are_each_caught_by_name() {
     let plants: &[(&str, &str, &str)] = &[
         // THE ITERATOR that makes a reduction a reduction. Flip it and the online
         // softmax's max becomes an elementwise copy.
-        ("attributes", "\"reduction\", \"parallel\"", "\"parallel\", \"parallel\""),
+        (
+            "attributes",
+            "\"reduction\", \"parallel\"",
+            "\"parallel\", \"parallel\"",
+        ),
         // THE CONTAINER: the whole point of the pass.
         ("op kind", "func.func @attn_fwd", "tt.func @attn_fwd"),
         // THE GRID the scheduler reads.
@@ -363,7 +402,9 @@ fn planted_stage_three_differences_are_each_caught_by_name() {
     for (field, from, to) in plants {
         let mutated = text.replace(from, to);
         if mutated == text {
-            missed.push(format!("  the plant `{from}` no longer applies to the golden"));
+            missed.push(format!(
+                "  the plant `{from}` no longer applies to the golden"
+            ));
             continue;
         }
         let Ok(m) = parse::parse(&mutated) else {
@@ -378,7 +419,11 @@ fn planted_stage_three_differences_are_each_caught_by_name() {
             ));
         }
     }
-    assert!(missed.is_empty(), "THE STAGE-3 DIFF IS NOT MEASURING:\n{}", missed.join("\n"));
+    assert!(
+        missed.is_empty(),
+        "THE STAGE-3 DIFF IS NOT MEASURING:\n{}",
+        missed.join("\n")
+    );
 }
 
 #[test]
@@ -386,7 +431,10 @@ fn the_stage_three_golden_agrees_with_itself() {
     for config in SCHED_CONFIGS {
         let t = golden(config, "3_sched.mlir");
         let (a, b) = (parse::parse(&t).unwrap(), parse::parse(&t).unwrap());
-        assert!(diff::diff(&a, &b).is_empty(), "{config}: the golden disagrees with itself");
+        assert!(
+            diff::diff(&a, &b).is_empty(),
+            "{config}: the golden disagrees with itself"
+        );
     }
 }
 

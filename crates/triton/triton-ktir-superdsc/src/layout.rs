@@ -46,13 +46,13 @@
 //! see [`reserved_consts_for`].
 
 use ktir_core::ir::IRFunction;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, regions};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{regions, Region};
 use ktir_superdsc::ktir_node::{KtirNode, Program};
-use ktir_superdsc::place::{PlaceId, act_name};
+use ktir_superdsc::place::{act_name, PlaceId};
 use ktir_superdsc::placement::{
-    BundleLayout, SegRole, SynthAlloc, TensorPlacement, align128, synth_footprint_bytes,
+    align128, synth_footprint_bytes, BundleLayout, SegRole, SynthAlloc, TensorPlacement,
 };
-use ktir_superdsc::reserved_tids::{ROPE_P_TID, scalarmul_scale_tid};
+use ktir_superdsc::reserved_tids::{scalarmul_scale_tid, ROPE_P_TID};
 use ktir_superdsc::superdsc_opspec::Df;
 use ktir_superdsc::wire::SEGMENT_SIZE;
 
@@ -107,7 +107,8 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // The predicate is [`scales_for_program_shape`]'s own, shared rather than restated: that
     // function already decides per-`Program`-versus-whole-function this way, and two statements of
     // which door a node goes through is how the two come to disagree.
-    if let Some(need) = reserved_consts_for(node.program).filter(|_| is_per_program_node(&node.func))
+    if let Some(need) =
+        reserved_consts_for(node.program).filter(|_| is_per_program_node(&node.func))
     {
         return Err(Error {
             stage: "layout",
@@ -131,10 +132,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // (`gathers_of`) accepts an unrolled sweep's per-trip tiles — every one over the SAME index/value
     // pair, which is all the placement needs: the index buffer is ONE buffer however many trips read
     // it. Different pairs are refused by `gathers_of` itself, by name.
-    let gathers = ktir_superdsc::emit::lower_ktir_to_superdsc::gathers_of(node).map_err(|e| Error {
-        stage: "layout",
-        message: format!("{e:?}"),
-    })?;
+    let gathers =
+        ktir_superdsc::emit::lower_ktir_to_superdsc::gathers_of(node).map_err(|e| Error {
+            stage: "layout",
+            message: format!("{e:?}"),
+        })?;
     // ⛔ AND THE ELEMENT TYPE IS CHECKED, NOT ASSUMED — for EVERY tile's index, since a sweep's
     // tiles share one parameter and one check would be a no-op for the rest only by coincidence.
     // dbo's `GatherIndexConversion.cpp:133` DT_CHECKs a 4-byte SENUINT32 index, and the
@@ -283,8 +285,19 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // within_2pct 0.0193 at 64 rows and 0.0200 at 32, byte-identical to the `Activation`
         // placement, with the ramp still reading `stick == row` at 0.7854. So the per-core mapping of
         // the segment is NOT what distinguishes us from granite, and this arm stays as it was.
-        let role = if reg.is_out { SegRole::Logits } else { SegRole::Activation };
-        pack(name, reg.tid, role, size, &mut placements, &mut segment_bytes)?;
+        let role = if reg.is_out {
+            SegRole::Logits
+        } else {
+            SegRole::Activation
+        };
+        pack(
+            name,
+            reg.tid,
+            role,
+            size,
+            &mut placements,
+            &mut segment_bytes,
+        )?;
     }
 
     // ── THE SCALE REGISTRY ───────────────────────────────────────────────────────────────────────
@@ -299,7 +312,14 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // own build guard asserts for a reserved const ("a WEIGHT-segment reserved tid is never
         // bound ⇒ stays ZERO ⇒ silent wrong numerics").
         let tid = scalarmul_scale_tid(i);
-        pack(name, tid, SegRole::Activation, SCALE_BYTES, &mut placements, &mut segment_bytes)?;
+        pack(
+            name,
+            tid,
+            SegRole::Activation,
+            SCALE_BYTES,
+            &mut placements,
+            &mut segment_bytes,
+        )?;
     }
 
     // ── THE ROTATE MATRIX P ──────────────────────────────────────────────────────────────────────
@@ -342,7 +362,14 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             });
         }
         let size = synth_footprint_bytes(&[hd, hd], Df::Fp16);
-        pack(name, ROPE_P_TID, SegRole::Activation, size, &mut placements, &mut segment_bytes)?;
+        pack(
+            name,
+            ROPE_P_TID,
+            SegRole::Activation,
+            size,
+            &mut placements,
+            &mut segment_bytes,
+        )?;
     }
 
     // ── THE fp8 W8A8 CLAMP CONSTS ─────────────────────────────────────────────────────────────────
@@ -368,7 +395,14 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             ktir_superdsc::reserved_tids::FP8_INV448_TID,
         ] {
             let size = synth_footprint_bytes(&[1, 64], Df::Fp16);
-            pack(name, tid, SegRole::Activation, size, &mut placements, &mut segment_bytes)?;
+            pack(
+                name,
+                tid,
+                SegRole::Activation,
+                size,
+                &mut placements,
+                &mut segment_bytes,
+            )?;
         }
     }
 
@@ -404,7 +438,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // does not merely overflow a region — its address DECOMPOSES INTO THE NEXT SEGMENT, which is
     // precisely the aliasing every line above exists to prevent, and [`overlaps_none`] would not see
     // it because the two tensors' `(segment, offset)` pairs still differ. Refused by name.
-    if let Some((seg, bytes)) = segment_bytes.iter().enumerate().find(|(_, &b)| b > SEGMENT_SIZE) {
+    if let Some((seg, bytes)) = segment_bytes
+        .iter()
+        .enumerate()
+        .find(|(_, &b)| b > SEGMENT_SIZE)
+    {
         return Err(Error {
             stage: "layout",
             message: format!(
@@ -586,7 +624,14 @@ fn pack(
     let offset = segment_bytes[segment];
     if let Some(prev) = placements.insert(
         tid,
-        TensorPlacement { tid, role, segment, bank: 0, offset, size },
+        TensorPlacement {
+            tid,
+            role,
+            segment,
+            bank: 0,
+            offset,
+            size,
+        },
     ) {
         // A repeated tid means one buffer reached this walk twice — two parameters bound to it, or a
         // reserved const colliding with a parameter. Their `bindings` are ours (parameter position),
@@ -679,10 +724,7 @@ fn overlaps_none(
 /// That is the whole reason the chain has to be recognised before the registry can be filled, and it
 /// is why this function calls THE SAME recogniser the emitter dispatches on — agreement is not
 /// something to maintain, it is the same call.
-fn scales_for_program_shape(
-    p: Program,
-    f: &IRFunction<'static>,
-) -> Result<Vec<f32>, crate::Error> {
+fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f32>, crate::Error> {
     use ktir_superdsc::emit::whole_function as W;
 
     if is_per_program_node(f) {
@@ -705,8 +747,10 @@ fn scales_for_program_shape(
     }
     // (2) the splat multipliers that survive the fusions. A chain-interior multiply is not a scalar
     // multiply at all — the fused body owns its constants — so its value must not take a slot.
-    let interior: Vec<ktir_core::ir::Ssa> =
-        chains.iter().flat_map(|c| c.consumed.iter().copied()).collect();
+    let interior: Vec<ktir_core::ir::Ssa> = chains
+        .iter()
+        .flat_map(|c| c.consumed.iter().copied())
+        .collect();
     for op in f.operations.iter() {
         if op.op_type != ktir_core::opkind::OpKind::ArithMulf {
             continue;

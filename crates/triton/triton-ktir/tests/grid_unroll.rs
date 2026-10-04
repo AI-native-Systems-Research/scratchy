@@ -79,8 +79,10 @@ fn a_corner_carrying_grid_unrolls_to_one_copy_per_position() {
         }
         let tile = body
             .iter()
-            .find(|d| d.kind == triton_ktir::ir::OpKind::KtdpConstructAccessTile
-                && d.results.contains(&o.operands[0]))
+            .find(|d| {
+                d.kind == triton_ktir::ir::OpKind::KtdpConstructAccessTile
+                    && d.results.contains(&o.operands[0])
+            })
             .expect("a load's tile");
         for c in &tile.operands[1..3] {
             assert!(

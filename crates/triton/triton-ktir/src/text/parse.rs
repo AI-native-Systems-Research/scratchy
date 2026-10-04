@@ -135,7 +135,10 @@ pub fn parse(text: &str) -> Result<Module> {
     if let Some(open) = stack.last() {
         return Err(Refusal::new(
             PASS,
-            format!("input ended with an unclosed region opened by `{}`", open.kind.spelling()),
+            format!(
+                "input ended with an unclosed region opened by `{}`",
+                open.kind.spelling()
+            ),
         ));
     }
 
@@ -182,7 +185,8 @@ impl Parser {
                 continue;
             }
             if let Some((k, v)) = t.split_once(" = ") {
-                self.aliases.insert(k.trim().to_string(), v.trim().to_string());
+                self.aliases
+                    .insert(k.trim().to_string(), v.trim().to_string());
             }
         }
     }
@@ -204,7 +208,10 @@ impl Parser {
             }
         }
         let v = self.module.fresh_named(&key);
-        self.scopes.last_mut().expect("there is always a scope").insert(key, v);
+        self.scopes
+            .last_mut()
+            .expect("there is always a scope")
+            .insert(key, v);
         v
     }
 
@@ -222,7 +229,9 @@ impl Parser {
     fn parse_block_args(&mut self, rest: &str, lineno: usize) -> Result<BlockArgs> {
         // `bb0(%a: f16, %b: f16):`
         let open = rest.find('(');
-        let Some(open) = open else { return Ok(Vec::new()) };
+        let Some(open) = open else {
+            return Ok(Vec::new());
+        };
         let close = rest
             .rfind(')')
             .ok_or_else(|| err(lineno, "block label has no closing ')'"))?;
@@ -298,7 +307,10 @@ impl Parser {
             (&rhs[..end], rhs[end..].trim())
         };
         if name.is_empty() {
-            return Err(err(lineno, format!("cannot read an operation from: {line}")));
+            return Err(err(
+                lineno,
+                format!("cannot read an operation from: {line}"),
+            ));
         }
         let kind = OpKind::from_spelling(name);
         let mut op = Op::new(kind.clone());
@@ -452,7 +464,10 @@ impl Parser {
         // The body region is created HERE, carrying the signature as its block
         // arguments; `parse` tops up to the brace count rather than pushing a
         // second, argument-less one.
-        op.regions.push(Region { args, ops: Vec::new() });
+        op.regions.push(Region {
+            args,
+            ops: Vec::new(),
+        });
         Ok(())
     }
 
@@ -477,7 +492,10 @@ impl Parser {
         let st = self.ssa(tail[..step_end].trim());
         op.operands = vec![lb, ub, st];
 
-        let mut region = Region { args: vec![(iv, IrType::Verbatim("index".into()))], ops: vec![] };
+        let mut region = Region {
+            args: vec![(iv, IrType::Verbatim("index".into()))],
+            ops: vec![],
+        };
 
         if let Some(ia) = tail.find("iter_args") {
             let (inner, _) = balanced(&tail[ia..], '(', ')')
@@ -604,7 +622,8 @@ impl Parser {
             }
         }
         if let Some(colon) = rest.rfind(" : ") {
-            op.result_types.push(self.parse_type(rest[colon + 3..].trim(), lineno)?);
+            op.result_types
+                .push(self.parse_type(rest[colon + 3..].trim(), lineno)?);
         }
         Ok(())
     }
@@ -660,12 +679,7 @@ impl Parser {
     /// empty so [`Parser::apply_closer`] takes it off the `-> T` after the region's brace.
     /// The attribute dictionary is also on the closing line, which `apply_closer` already
     /// handles.
-    fn parse_indirect_access_tile(
-        &mut self,
-        op: &mut Op,
-        rest: &str,
-        lineno: usize,
-    ) -> Result<()> {
+    fn parse_indirect_access_tile(&mut self, op: &mut Op, rest: &str, lineno: usize) -> Result<()> {
         for tok in ssa_tokens(rest) {
             let v = self.ssa(&tok);
             op.operands.push(v);
@@ -750,7 +764,9 @@ impl Parser {
             Some(body[a + 2..].trim().to_string())
         } else if let Some(t) = trimmed.strip_prefix(':') {
             Some(t.trim().to_string())
-        } else { body.rfind(" : ").map(|c| body[c + 3..].trim().to_string()) };
+        } else {
+            body.rfind(" : ").map(|c| body[c + 3..].trim().to_string())
+        };
         if let Some(t) = type_tail {
             let mut t = t.trim_end_matches('{').trim().to_string();
             // `arith.extf %x : tensor<..xf16> to tensor<..xf32>` states the OPERAND
@@ -838,10 +854,16 @@ impl Parser {
             return Ok(Attr::Str(s.trim_end_matches('"').to_string()));
         }
         if v.starts_with("#map") || v.starts_with("affine_map<") {
-            return Ok(Attr::AffineMap(strip_wrapper(&self.resolve_alias(v), "affine_map<")));
+            return Ok(Attr::AffineMap(strip_wrapper(
+                &self.resolve_alias(v),
+                "affine_map<",
+            )));
         }
         if v.starts_with("#set") || v.starts_with("affine_set<") {
-            return Ok(Attr::AffineSet(strip_wrapper(&self.resolve_alias(v), "affine_set<")));
+            return Ok(Attr::AffineSet(strip_wrapper(
+                &self.resolve_alias(v),
+                "affine_set<",
+            )));
         }
         // `array<i32: 1, 0>` / `array<i64: 0, 32>`
         if let Some(inner) = v.strip_prefix("array<") {
@@ -854,8 +876,7 @@ impl Parser {
                     continue;
                 }
                 out.push(
-                    parse_int(t)
-                        .ok_or_else(|| err(lineno, format!("bad array element `{t}`")))?,
+                    parse_int(t).ok_or_else(|| err(lineno, format!("bad array element `{t}`")))?,
                 );
             }
             return Ok(Attr::IntList(out));
@@ -868,7 +889,10 @@ impl Parser {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            if parts.iter().all(|p| p.starts_with("#map") || p.starts_with("affine_map<")) {
+            if parts
+                .iter()
+                .all(|p| p.starts_with("#map") || p.starts_with("affine_map<"))
+            {
                 return Ok(Attr::AffineMapList(
                     parts
                         .iter()
@@ -877,11 +901,16 @@ impl Parser {
                 ));
             }
             if parts.iter().all(|p| parse_int(p).is_some()) {
-                return Ok(Attr::IntList(parts.iter().filter_map(|p| parse_int(p)).collect()));
+                return Ok(Attr::IntList(
+                    parts.iter().filter_map(|p| parse_int(p)).collect(),
+                ));
             }
             // `[8 : index]` -- a typed integer list, which is how `grid` prints.
-            if parts.iter().all(|p| p.split_once(" : ").and_then(|(n, _)| parse_int(n)).is_some())
-            {
+            if parts.iter().all(|p| {
+                p.split_once(" : ")
+                    .and_then(|(n, _)| parse_int(n))
+                    .is_some()
+            }) {
                 return Ok(Attr::IntList(
                     parts
                         .iter()
@@ -917,7 +946,11 @@ impl Parser {
     fn parse_type(&mut self, t: &str, lineno: usize) -> Result<IrType> {
         let t = t.trim();
         if let Some(d) = DType::from_spelling(t) {
-            return Ok(if t == "index" { IrType::Index } else { IrType::Scalar(d) });
+            return Ok(if t == "index" {
+                IrType::Index
+            } else {
+                IrType::Scalar(d)
+            });
         }
         if let Some(inner) = t.strip_prefix("tensor<") {
             let (dims, elem) = parse_shaped(inner)
@@ -1014,7 +1047,8 @@ fn find_call(s: &str, name: &str) -> Option<(usize, usize)> {
     let mut i = 0;
     while i + n <= b.len() {
         if &b[i..i + n] == name.as_bytes()
-            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.'))
+            && (i == 0
+                || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.'))
         {
             let mut depth = 0usize;
             let mut j = i + n - 1;
@@ -1156,7 +1190,11 @@ fn split_top(s: &str, sep: char) -> Vec<&str> {
 /// Split a type list, respecting nesting. `(A, B)` should be unwrapped first.
 fn split_type_list(s: &str) -> Vec<String> {
     let s = s.trim();
-    let s = if s.starts_with('(') && s.ends_with(')') { &s[1..s.len() - 1] } else { s };
+    let s = if s.starts_with('(') && s.ends_with(')') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
     split_top(s, ',')
         .into_iter()
         .map(|t| t.trim().to_string())
@@ -1219,11 +1257,18 @@ pub fn parse_shaped(body: &str) -> Option<(Vec<i64>, String)> {
     let mut dims = Vec::new();
     let mut rest = inner;
     loop {
-        let run: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '?').collect();
+        let run: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '?')
+            .collect();
         if run.is_empty() || !rest[run.len()..].starts_with('x') {
             break;
         }
-        dims.push(if run == "?" { crate::ir::DYNAMIC } else { run.parse::<i64>().ok()? });
+        dims.push(if run == "?" {
+            crate::ir::DYNAMIC
+        } else {
+            run.parse::<i64>().ok()?
+        });
         rest = &rest[run.len() + 1..];
     }
     Some((dims, rest.to_string()))
@@ -1255,7 +1300,10 @@ fn strip_wrapper(s: &str, prefix: &str) -> String {
 
 /// `[512, 128]`'s contents.
 fn parse_int_list(inner: &str) -> Vec<i64> {
-    inner.split(',').filter_map(|t| parse_int(t.trim())).collect()
+    inner
+        .split(',')
+        .filter_map(|t| parse_int(t.trim()))
+        .collect()
 }
 
 fn parse_int(s: &str) -> Option<i64> {
@@ -1274,8 +1322,8 @@ fn parse_float(s: &str, elem: DType, lineno: usize) -> Result<FloatBits> {
         _ => 32,
     };
     if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        let bits = u64::from_str_radix(h, 16)
-            .map_err(|_| err(lineno, format!("bad hex float `{s}`")))?;
+        let bits =
+            u64::from_str_radix(h, 16).map_err(|_| err(lineno, format!("bad hex float `{s}`")))?;
         return Ok(FloatBits { bits, width });
     }
     let v: f32 = s
@@ -1363,9 +1411,15 @@ module {
 
     #[test]
     fn an_element_type_containing_x_survives() {
-        assert_eq!(parse_shaped("64x512xindex>"), Some((vec![64, 512], "index".into())));
+        assert_eq!(
+            parse_shaped("64x512xindex>"),
+            Some((vec![64, 512], "index".into()))
+        );
         assert_eq!(parse_shaped("f16>"), Some((vec![], "f16".into())));
-        assert_eq!(parse_shaped("?x64xf16>"), Some((vec![DYNAMIC, 64], "f16".into())));
+        assert_eq!(
+            parse_shaped("?x64xf16>"),
+            Some((vec![DYNAMIC, 64], "f16".into()))
+        );
     }
 
     #[test]
@@ -1384,7 +1438,11 @@ module {
 ";
         let m = parse(src).unwrap();
         let f = m.kernel().unwrap();
-        let forr = f.regions[0].ops.iter().find(|o| o.kind == OpKind::ScfFor).unwrap();
+        let forr = f.regions[0]
+            .ops
+            .iter()
+            .find(|o| o.kind == OpKind::ScfFor)
+            .unwrap();
         assert_eq!(forr.results.len(), 2, "five iter_args means five results");
         assert_eq!(forr.result_types.len(), 2);
         // lb, ub, step, then the two inits.
@@ -1400,8 +1458,14 @@ module {
         )
         .unwrap();
         let ops = &m.kernel().unwrap().regions[0].ops;
-        assert!(matches!(ops[0].attr(&AttrKey::Value), Some(Attr::SplatFloat(_))));
-        assert!(matches!(ops[1].attr(&AttrKey::Value), Some(Attr::Verbatim(_))));
+        assert!(matches!(
+            ops[0].attr(&AttrKey::Value),
+            Some(Attr::SplatFloat(_))
+        ));
+        assert!(matches!(
+            ops[1].attr(&AttrKey::Value),
+            Some(Attr::Verbatim(_))
+        ));
     }
 
     #[test]
@@ -1430,16 +1494,24 @@ module {
         assert_eq!(red.regions[0].ops.len(), 2, "maxnumf + reduce.return");
         assert_eq!(
             red.result_types,
-            vec![IrType::Tensor { dims: vec![64], elem: DType::F16 }]
+            vec![IrType::Tensor {
+                dims: vec![64],
+                elem: DType::F16
+            }]
         );
     }
 
     #[test]
     fn an_unmodelled_op_keeps_its_spelling_so_a_refusal_can_name_it() {
-        let m = parse("module {\n  tt.func @k() {\n    %x = tt.histogram %y : i32\n    tt.return\n  }\n}\n")
-            .unwrap();
-        let names: Vec<String> =
-            m.ops_deep().iter().map(|o| o.kind.spelling().to_string()).collect();
+        let m = parse(
+            "module {\n  tt.func @k() {\n    %x = tt.histogram %y : i32\n    tt.return\n  }\n}\n",
+        )
+        .unwrap();
+        let names: Vec<String> = m
+            .ops_deep()
+            .iter()
+            .map(|o| o.kind.spelling().to_string())
+            .collect();
         assert!(names.contains(&"tt.histogram".to_string()), "got {names:?}");
     }
 

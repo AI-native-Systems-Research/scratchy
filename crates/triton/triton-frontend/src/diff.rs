@@ -137,7 +137,11 @@ impl<'a> Flattener<'a> {
                     path: path.to_string(),
                     depth,
                     name: op.name.clone(),
-                    result_types: op.results.iter().map(|r| self.m.ty(*r).to_string()).collect(),
+                    result_types: op
+                        .results
+                        .iter()
+                        .map(|r| self.m.ty(*r).to_string())
+                        .collect(),
                     operands: op
                         .operands
                         .iter()
@@ -252,12 +256,16 @@ pub fn compare(expected: &Module, actual: &Module) -> Report {
     act_fns.sort();
     for name in &exp_fns {
         if !act_fns.contains(name) {
-            findings.push(format!("function `{name}`: present in golden, MISSING in ours"));
+            findings.push(format!(
+                "function `{name}`: present in golden, MISSING in ours"
+            ));
         }
     }
     for name in &act_fns {
         if !exp_fns.contains(name) {
-            findings.push(format!("function `{name}`: EXTRA in ours, absent from golden"));
+            findings.push(format!(
+                "function `{name}`: EXTRA in ours, absent from golden"
+            ));
         }
     }
 
@@ -322,7 +330,10 @@ pub fn compare(expected: &Module, actual: &Module) -> Report {
             let at_ = format!("`{name}` op[{i}]");
             let mut op_ok = true;
             if e.name != a.name {
-                findings.push(format!("{at_}.name: golden `{}`, ours `{}`", e.name, a.name));
+                findings.push(format!(
+                    "{at_}.name: golden `{}`, ours `{}`",
+                    e.name, a.name
+                ));
                 // A name mismatch desynchronizes the walk; everything after is noise.
                 findings.push(format!(
                     "{at_}: op sequence diverged here -- later findings suppressed"

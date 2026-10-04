@@ -170,7 +170,10 @@ fn every_fixture_has_the_expected_status() {
                 }
             }
             (Expect::MatchesAt(_), Err(e)) => {
-                failures.push(format!("{}: expected to MATCH but was refused: {e}", case.name));
+                failures.push(format!(
+                    "{}: expected to MATCH but was refused: {e}",
+                    case.name
+                ));
             }
             (Expect::MatchesStaleGolden(t, want), Ok(m)) => {
                 let g = match &golden {
@@ -300,8 +303,8 @@ def bad_kernel(a_ptr, BLOCK: tl.constexpr):
         pass
 "#;
     let spec = common::simple_spec("bad_kernel", &[("a_ptr", "*fp16"), ("BLOCK", "constexpr")]);
-    let err = codegen::compile(src, &spec, Target::spyre())
-        .expect_err("a `while` loop must not compile");
+    let err =
+        codegen::compile(src, &spec, Target::spyre()).expect_err("a `while` loop must not compile");
     let msg = err.to_string();
     assert!(
         msg.contains("While"),

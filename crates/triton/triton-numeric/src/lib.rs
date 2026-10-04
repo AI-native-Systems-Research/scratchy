@@ -93,7 +93,10 @@ impl std::fmt::Display for Refusal {
 }
 
 fn refuse(stage: &'static str, message: impl Into<String>) -> Refusal {
-    Refusal { stage, message: message.into() }
+    Refusal {
+        stage,
+        message: message.into(),
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Refusal>;
@@ -112,8 +115,12 @@ pub struct Lowered {
 
 /// `.py` SOURCE to their `IRFunction`. Every leg is a value; nothing reads a golden.
 pub fn lower(config: &str) -> Result<Lowered> {
-    let (spec, grid, _program) = cases::case(config)
-        .ok_or_else(|| refuse("case", format!("`{config}` is not one of: {}", cases::ALL.join(" "))))?;
+    let (spec, grid, _program) = cases::case(config).ok_or_else(|| {
+        refuse(
+            "case",
+            format!("`{config}` is not one of: {}", cases::ALL.join(" ")),
+        )
+    })?;
 
     // LEG 1 -- Triton `.py` -> raw ttir -> the six `make_ttir` passes.
     let src = std::fs::read_to_string(&spec.file)
@@ -123,8 +130,8 @@ pub fn lower(config: &str) -> Result<Lowered> {
     opt::make_ttir(&mut tt).map_err(|e| refuse("make_ttir", e.to_string()))?;
 
     // LEG 2 -- ttir value -> our KTIR value. No text in between.
-    let mut m = triton_ktir::from_ttir::convert(&tt)
-        .map_err(|e| refuse("from_ttir", e.to_string()))?;
+    let mut m =
+        triton_ktir::from_ttir::convert(&tt).map_err(|e| refuse("from_ttir", e.to_string()))?;
     triton_ktir::make_ktir(&mut m, &grid).map_err(|e| refuse("make_ktir", e.to_string()))?;
     triton_ktir::passes::to_ktir::run(&mut m, &grid)
         .map_err(|e| refuse("to_ktir", e.to_string()))?;
@@ -178,7 +185,9 @@ fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
     for path in triton_ktir::passes::walk::paths(m).into_iter().rev() {
         // `walk::block_mut` on the MATMUL's path addresses the block holding all three ops (they
         // are spliced into one block by the decompose); index arithmetic is on that block.
-        let Some(mm) = triton_ktir::passes::walk::at(m, &path).cloned() else { continue };
+        let Some(mm) = triton_ktir::passes::walk::at(m, &path).cloned() else {
+            continue;
+        };
         if mm.kind != OpKind::LinalgMatmul || mm.operands.len() != 3 {
             continue;
         }
@@ -186,7 +195,9 @@ fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
         if !is_pass_zero(m, zero_t) {
             continue;
         }
-        let Some(dot) = mm.results.first().copied() else { continue };
+        let Some(dot) = mm.results.first().copied() else {
+            continue;
+        };
         let block = match triton_ktir::passes::walk::block_mut(m, &path) {
             Some(blk) => blk,
             None => continue,
@@ -237,9 +248,9 @@ fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
         let mut dead: Vec<KSsa> = vec![zero_t];
         while let Some(&v) = dead.last() {
             let Some(def) = m.def_of(v) else { break };
-            let still_read = walk::paths(m).into_iter().any(|p| {
-                walk::at(m, &p).is_some_and(|o| o.operands.contains(&v))
-            });
+            let still_read = walk::paths(m)
+                .into_iter()
+                .any(|p| walk::at(m, &p).is_some_and(|o| o.operands.contains(&v)));
             if still_read {
                 break;
             }
@@ -250,7 +261,7 @@ fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
             }
         }
         dead.pop(); // `dead` now holds only the provably-dead defs; the last push was not one
-        // Remove the dead defs from whichever block holds them (they may be in this block).
+                    // Remove the dead defs from whichever block holds them (they may be in this block).
         for v in dead {
             for p in walk::paths(m).into_iter().rev() {
                 if walk::at(m, &p).is_some_and(|o| o.results.first() == Some(&v)) {
@@ -301,7 +312,10 @@ impl Run {
         let o = self.outputs.get(arg).ok_or_else(|| {
             let mut have: Vec<&str> = self.outputs.keys().map(|s| s.as_str()).collect();
             have.sort();
-            refuse("readback", format!("no output for `{arg}`; the run returned {have:?}"))
+            refuse(
+                "readback",
+                format!("no output for `{arg}`; the run returned {have:?}"),
+            )
         })?;
         Ok(o.data.iter().map(|&v| v as f64).collect())
     }
@@ -348,7 +362,11 @@ pub fn execute(l: &Lowered, bindings: &[Binding]) -> Result<Run> {
         }
         args.push((
             *ssa,
-            Arg::TensorBytes { data: b.bytes.clone(), shape: b.shape.clone(), dtype: b.dtype },
+            Arg::TensorBytes {
+                data: b.bytes.clone(),
+                shape: b.shape.clone(),
+                dtype: b.dtype,
+            },
         ));
     }
 
@@ -409,7 +427,12 @@ pub struct Comparison {
 
 impl Comparison {
     /// Compare `got` against `reference` under a per-element sign-aware envelope.
-    pub fn new(config: &str, got: &[f64], reference: &[f64], env: &bounds::Envelope) -> Result<Self> {
+    pub fn new(
+        config: &str,
+        got: &[f64],
+        reference: &[f64],
+        env: &bounds::Envelope,
+    ) -> Result<Self> {
         if got.len() != reference.len() {
             return Err(refuse(
                 "compare",
@@ -422,7 +445,10 @@ impl Comparison {
             ));
         }
         if reference.is_empty() {
-            return Err(refuse("compare", "an empty reference: a comparison over nothing passes"));
+            return Err(refuse(
+                "compare",
+                "an empty reference: a comparison over nothing passes",
+            ));
         }
         let mut c = Comparison {
             config: config.to_string(),
@@ -456,7 +482,11 @@ impl Comparison {
             let ratio = if !err.is_finite() || !bound.is_finite() {
                 f64::INFINITY
             } else if bound == 0.0 {
-                if err == 0.0 { 0.0 } else { f64::INFINITY }
+                if err == 0.0 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
             } else {
                 err / bound
             };

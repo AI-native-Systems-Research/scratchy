@@ -101,7 +101,10 @@ pub enum CallTarget {
     TlFunction(String),
     /// A method on a value: the receiver expression's dotted spelling (if any) and the
     /// method name from [`VALUE_METHODS`].
-    Method { receiver: Option<String>, method: String },
+    Method {
+        receiver: Option<String>,
+        method: String,
+    },
     Builtin(String),
     /// A `@triton.jit` function defined in the same module.
     UserJit(String),

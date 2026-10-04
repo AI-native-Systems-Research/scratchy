@@ -86,8 +86,11 @@ fn step_1_remove_extf(module: &mut Module) {
         if op.kind != OpKind::ArithExtf {
             return false;
         }
-        let in_elem =
-            op.operands.first().and_then(|v| module.type_of(*v)).and_then(|t| t.elem());
+        let in_elem = op
+            .operands
+            .first()
+            .and_then(|v| module.type_of(*v))
+            .and_then(|t| t.elem());
         let out_elem = op.result_type().and_then(|t| t.elem());
         in_elem == Some(DType::F16) && out_elem == Some(DType::F32)
     }) {
@@ -230,7 +233,11 @@ fn step_3_remove_truncf(module: &mut Module) {
         if op.kind != OpKind::ArithTruncf {
             return false;
         }
-        let in_elem = op.operands.first().and_then(|v| module.type_of(*v)).and_then(|t| t.elem());
+        let in_elem = op
+            .operands
+            .first()
+            .and_then(|v| module.type_of(*v))
+            .and_then(|t| t.elem());
         let out_elem = op.result_type().and_then(|t| t.elem());
         in_elem == Some(DType::F16) && out_elem == Some(DType::F16)
     }) {
@@ -300,12 +307,20 @@ module {
         let c = m.census();
         let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
         assert_eq!(get("arith.extf"), 0, "step 1 removes every widening cast");
-        assert_eq!(get("arith.truncf"), 0, "step 3 removes every narrowing cast");
+        assert_eq!(
+            get("arith.truncf"),
+            0,
+            "step 3 removes every narrowing cast"
+        );
 
         // Every remaining compute type is f16, and the reduce's combiner too.
         for op in m.ops_deep() {
             for t in &op.result_types {
-                assert!(!t.is_compute_f32(), "{} kept an f32 result", op.kind.spelling());
+                assert!(
+                    !t.is_compute_f32(),
+                    "{} kept an f32 result",
+                    op.kind.spelling()
+                );
             }
             for r in &op.regions {
                 for (_, t) in &r.args {
@@ -319,8 +334,12 @@ module {
             .into_iter()
             .find(|o| {
                 o.kind == OpKind::ArithConstant
-                    && o.result_type().map(|t| t.dims() == Some(&[64][..])).unwrap_or(false)
-                    && o.attr(&AttrKey::Value).and_then(|a| a.as_float()).map(|f| !f.is_zero())
+                    && o.result_type()
+                        .map(|t| t.dims() == Some(&[64][..]))
+                        .unwrap_or(false)
+                    && o.attr(&AttrKey::Value)
+                        .and_then(|a| a.as_float())
+                        .map(|f| !f.is_zero())
                         == Some(true)
             })
             .expect("the scale constant survives");

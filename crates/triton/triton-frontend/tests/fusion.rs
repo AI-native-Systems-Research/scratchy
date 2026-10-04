@@ -89,8 +89,16 @@ fn the_fused_two_layer_kernel_compiles_with_the_measured_counts() {
     let two = compile(&common::decoder_two_layers());
     assert_eq!(total_ops(&one), 287, "one layer's raw op count");
     assert_eq!(total_ops(&two), 329, "two fused layers' raw op count");
-    assert_eq!(one.funcs[0].arg_types.len(), 14, "one layer's kernel arguments");
-    assert_eq!(two.funcs[0].arg_types.len(), 23, "two layers' kernel arguments");
+    assert_eq!(
+        one.funcs[0].arg_types.len(),
+        14,
+        "one layer's kernel arguments"
+    );
+    assert_eq!(
+        two.funcs[0].arg_types.len(),
+        23,
+        "two layers' kernel arguments"
+    );
     // ⭐ THE +42 IS NOW ASSERTED, not only stated. It is the whole point of the table above, and
     // it is the one number that stays put when the layer BODY changes -- as it just did, by nine
     // `tt.trans` -- because both sides gain the same ops. A future body change that moved this
@@ -130,11 +138,7 @@ fn the_two_layers_share_one_emitted_layer_function() {
         1,
         "the layer body should be emitted ONCE; got {bodies:?}"
     );
-    assert_eq!(
-        calls_to(&two, "_decoder_layer__"),
-        2,
-        "and called TWICE"
-    );
+    assert_eq!(calls_to(&two, "_decoder_layer__"), 2, "and called TWICE");
     // The flattened boundary: x plus twelve descriptors -- ten of rank 2 (1 + 2*2 each) and
     // two of rank 1 (1 + 2*1 each) -- is 1 + 50 + 6 = 57.
     let layer = two

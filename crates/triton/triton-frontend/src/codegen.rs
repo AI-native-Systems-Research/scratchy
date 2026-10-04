@@ -317,17 +317,13 @@ impl<'a> CodeGen<'a> {
                     // is the `def` line. That is `visit_FunctionDef`'s
                     // `_maybe_set_loc_to_name(arg_value, arg_name)` applied to a block
                     // argument whose own loc is the function's.
-                    let id = self
-                        .sem
-                        .new_block_arg(ty.clone(), func_loc.named(&p.name));
+                    let id = self.sem.new_block_arg(ty.clone(), func_loc.named(&p.name));
                     self.scope.insert(&p.name, Val::Ir(id));
                     arg_types.push(ty);
                     block_args.push(id);
                 }
                 ArgSpec::Scalar(t) => {
-                    let id = self
-                        .sem
-                        .new_block_arg(t.clone(), func_loc.named(&p.name));
+                    let id = self.sem.new_block_arg(t.clone(), func_loc.named(&p.name));
                     self.scope.insert(&p.name, Val::Ir(id));
                     arg_types.push(t.clone());
                     block_args.push(id);
@@ -643,9 +639,18 @@ impl<'a> CodeGen<'a> {
             ));
         }
 
-        let lb = self.sem.to_tensor(&start).map_err(|e| Self::located(e, pos))?;
-        let ub = self.sem.to_tensor(&end).map_err(|e| Self::located(e, pos))?;
-        let st = self.sem.to_tensor(&step).map_err(|e| Self::located(e, pos))?;
+        let lb = self
+            .sem
+            .to_tensor(&start)
+            .map_err(|e| Self::located(e, pos))?;
+        let ub = self
+            .sem
+            .to_tensor(&end)
+            .map_err(|e| Self::located(e, pos))?;
+        let st = self
+            .sem
+            .to_tensor(&step)
+            .map_err(|e| Self::located(e, pos))?;
         for (v, what) in [(lb, "lower bound"), (ub, "upper bound"), (st, "step")] {
             let ty = self.sem.ty(v);
             if !ty.is_int() {
@@ -812,14 +817,9 @@ impl<'a> CodeGen<'a> {
 
         let mut operands = vec![lb, ub, st];
         operands.extend_from_slice(&init);
-        let results = self.sem.emit_with_region(
-            "scf.for",
-            &operands,
-            &carry_types,
-            &[],
-            blocks,
-            for_loc,
-        );
+        let results =
+            self.sem
+                .emit_with_region("scf.for", &operands, &carry_types, &[], blocks, for_loc);
 
         // Bind results, and name each in turn. `_maybe_set_loc_to_name` NESTS, and setting a
         // result's location sets the OP's, so a two-carry loop's `scf.for` ends up located
@@ -1647,7 +1647,11 @@ impl<'a> CodeGen<'a> {
             .py
             .function(fn_name)
             .ok_or_else(|| {
-                Error::new(format!("no function `{fn_name}` in this module"), pos.line, pos.col)
+                Error::new(
+                    format!("no function `{fn_name}` in this module"),
+                    pos.line,
+                    pos.col,
+                )
             })?
             .clone();
 
@@ -1709,19 +1713,13 @@ impl<'a> CodeGen<'a> {
             })?;
             mangles.push(m);
         }
-        let symbol = crate::mangle::mangle_fn(
-            &format!("{}.{}", self.module_name(), fn_name),
-            &mangles,
-        );
+        let symbol =
+            crate::mangle::mangle_fn(&format!("{}.{}", self.module_name(), fn_name), &mangles);
 
         if !self.generated.contains(&symbol) {
             self.generate_user_jit(&symbol, &callee, &bound, pos)?;
         }
-        let ret_types = self
-            .fn_ret_types
-            .get(&symbol)
-            .cloned()
-            .unwrap_or_default();
+        let ret_types = self.fn_ret_types.get(&symbol).cloned().unwrap_or_default();
 
         let operands: Vec<crate::ttir::ValueId> =
             bound.iter().flat_map(|v| v.ir_handles()).collect();
@@ -1772,9 +1770,7 @@ impl<'a> CodeGen<'a> {
             match v {
                 Val::Ir(id) => {
                     let ty = self.sem.ty(*id);
-                    let a = self
-                        .sem
-                        .new_block_arg(ty.clone(), func_loc.named(&p.name));
+                    let a = self.sem.new_block_arg(ty.clone(), func_loc.named(&p.name));
                     self.scope.insert(&p.name, Val::Ir(a));
                     arg_types.push(ty);
                     block_args.push(a);
@@ -1785,9 +1781,7 @@ impl<'a> CodeGen<'a> {
                     strides,
                 } => {
                     let hty = self.sem.ty(*handle);
-                    let h = self
-                        .sem
-                        .new_block_arg(hty.clone(), func_loc.named(&p.name));
+                    let h = self.sem.new_block_arg(hty.clone(), func_loc.named(&p.name));
                     arg_types.push(hty);
                     block_args.push(h);
                     let mut new_shape = Vec::with_capacity(shape.len());
@@ -1893,12 +1887,10 @@ impl<'a> CodeGen<'a> {
     ) -> Result<crate::ttir::ValueId> {
         let shape_val = Val::Seq(shape.iter().map(|d| Val::Int(*d as i128)).collect());
         let arg_mangles = vec![
-            crate::mangle::mangle_arg(&shape_val, &|_| None).ok_or_else(|| {
-                Error::new("tl.zeros shape is not manglable", pos.line, pos.col)
-            })?,
-            crate::mangle::mangle_arg(&Val::Dtype(dtype.clone()), &|_| None).ok_or_else(|| {
-                Error::new("tl.zeros dtype is not manglable", pos.line, pos.col)
-            })?,
+            crate::mangle::mangle_arg(&shape_val, &|_| None)
+                .ok_or_else(|| Error::new("tl.zeros shape is not manglable", pos.line, pos.col))?,
+            crate::mangle::mangle_arg(&Val::Dtype(dtype.clone()), &|_| None)
+                .ok_or_else(|| Error::new("tl.zeros dtype is not manglable", pos.line, pos.col))?,
         ];
         let symbol = crate::mangle::mangle_fn("triton.language.standard.zeros", &arg_mangles);
         let ret_ty = Type::Tensor(shape.to_vec(), std::rc::Rc::new(dtype.clone()));
@@ -2029,20 +2021,16 @@ impl<'a> CodeGen<'a> {
 
         let mut mangles = vec![crate::mangle::mangle_type(&in_ty)];
         for a in &mangle_args {
-            mangles.push(
-                crate::mangle::mangle_arg(a, &|_| None).ok_or_else(|| {
-                    Error::new(
-                        format!("tl.{which} has an argument with no mangled spelling"),
-                        pos.line,
-                        pos.col,
-                    )
-                })?,
-            );
+            mangles.push(crate::mangle::mangle_arg(a, &|_| None).ok_or_else(|| {
+                Error::new(
+                    format!("tl.{which} has an argument with no mangled spelling"),
+                    pos.line,
+                    pos.col,
+                )
+            })?);
         }
-        let symbol = crate::mangle::mangle_fn(
-            &format!("triton.language.standard.{which}"),
-            &mangles,
-        );
+        let symbol =
+            crate::mangle::mangle_fn(&format!("triton.language.standard.{which}"), &mangles);
 
         if !self.generated.contains(&symbol) {
             self.generate_std_reduction(
@@ -2172,7 +2160,11 @@ impl<'a> CodeGen<'a> {
         if self.generated.contains(&symbol) {
             return Ok(symbol);
         }
-        let def_line = if which == "_elementwise_max" { 169 } else { 262 };
+        let def_line = if which == "_elementwise_max" {
+            169
+        } else {
+            262
+        };
         let std_py: std::rc::Rc<str> = std::rc::Rc::from(STANDARD_PY);
         let func_loc = Loc::File {
             file: std_py,
@@ -2330,7 +2322,10 @@ impl<'a> CodeGen<'a> {
                 }
                 Some(v) => v.as_f64().map(Val::Float).ok_or_else(|| {
                     Error::new(
-                        format!("float() needs a number or a string, got a {}", v.kind_name()),
+                        format!(
+                            "float() needs a number or a string, got a {}",
+                            v.kind_name()
+                        ),
                         pos.line,
                         pos.col,
                     )
@@ -2345,13 +2340,7 @@ impl<'a> CodeGen<'a> {
         }
     }
 
-    fn call_tl(
-        &mut self,
-        name: &str,
-        args: &[Val],
-        kw: &[(String, Val)],
-        pos: Pos,
-    ) -> Result<Val> {
+    fn call_tl(&mut self, name: &str, args: &[Val], kw: &[(String, Val)], pos: Pos) -> Result<Val> {
         let get = |i: usize, key: &str| -> Option<Val> {
             kw.iter()
                 .find(|(k, _)| k == key)
@@ -2372,9 +2361,8 @@ impl<'a> CodeGen<'a> {
             // `tl.multiple_of(x, n)` emits NO OP: it stamps `tt.divisibility` on the op that
             // defined `x` and returns `x` unchanged. See `Semantic::set_divisibility`.
             "multiple_of" => {
-                let x = get(0, "input").ok_or_else(|| {
-                    Error::new("tl.multiple_of needs a value", pos.line, pos.col)
-                })?;
+                let x = get(0, "input")
+                    .ok_or_else(|| Error::new("tl.multiple_of needs a value", pos.line, pos.col))?;
                 let values: Vec<i128> = match get(1, "values") {
                     Some(Val::Seq(items)) => items.iter().filter_map(|v| v.as_int()).collect(),
                     Some(v) => match v.as_int() {
@@ -2445,12 +2433,10 @@ impl<'a> CodeGen<'a> {
                 Ok(Val::None)
             }
             "fdiv" => {
-                let a = get(0, "x").ok_or_else(|| {
-                    Error::new("tl.fdiv needs two arguments", pos.line, pos.col)
-                })?;
-                let b = get(1, "y").ok_or_else(|| {
-                    Error::new("tl.fdiv needs two arguments", pos.line, pos.col)
-                })?;
+                let a = get(0, "x")
+                    .ok_or_else(|| Error::new("tl.fdiv needs two arguments", pos.line, pos.col))?;
+                let b = get(1, "y")
+                    .ok_or_else(|| Error::new("tl.fdiv needs two arguments", pos.line, pos.col))?;
                 self.sem
                     .fdiv(&a, &b)
                     .map(Val::Ir)
@@ -2488,9 +2474,7 @@ impl<'a> CodeGen<'a> {
                 let b = self.ir_arg(&get(1, "other"), "tl.dot", pos)?;
                 let acc = match get(2, "acc") {
                     None | Some(Val::None) => None,
-                    Some(v) => Some(
-                        self.sem.to_tensor(&v).map_err(|e| Self::located(e, pos))?,
-                    ),
+                    Some(v) => Some(self.sem.to_tensor(&v).map_err(|e| Self::located(e, pos))?),
                 };
                 let out_dtype = match get(6, "out_dtype") {
                     Some(Val::Dtype(t)) => Some(t),
@@ -2534,9 +2518,8 @@ impl<'a> CodeGen<'a> {
             // variable's name, with no `tt.call` anywhere near them.
             "full" => {
                 let shape = self.const_shape(&get(0, "shape"), "tl.full", pos)?;
-                let value = get(1, "value").ok_or_else(|| {
-                    Error::new("tl.full needs a fill value", pos.line, pos.col)
-                })?;
+                let value = get(1, "value")
+                    .ok_or_else(|| Error::new("tl.full needs a fill value", pos.line, pos.col))?;
                 let dtype = match get(2, "dtype") {
                     Some(Val::Dtype(t)) => t,
                     _ => {
@@ -2571,7 +2554,8 @@ impl<'a> CodeGen<'a> {
             "max" | "sum" => {
                 let input = self.ir_arg(&get(0, "input"), &format!("tl.{name}"), pos)?;
                 let axis = get(1, "axis");
-                self.call_std_reduction(name, input, axis, kw, pos).map(Val::Ir)
+                self.call_std_reduction(name, input, axis, kw, pos)
+                    .map(Val::Ir)
             }
             "range" => Err(Error::new(
                 "`tl.range(...)` is only supported as the iterable of a `for` statement, \
@@ -2727,9 +2711,7 @@ impl<'a> CodeGen<'a> {
             },
             other => {
                 return Err(Error::new(
-                    format!(
-                        "tl.make_tensor_descriptor needs a pointer, got {other}"
-                    ),
+                    format!("tl.make_tensor_descriptor needs a pointer, got {other}"),
                     pos.line,
                     pos.col,
                 ))

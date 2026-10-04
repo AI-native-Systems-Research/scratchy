@@ -87,7 +87,10 @@ pub fn spec(fixture: &str, kernel: &str, ptrs: &[(&str, &str)], ces: &[(&str, Va
     }
     let mut constexprs = HashMap::new();
     for (k, v) in ces {
-        signature.insert((*k).to_string(), ArgSpec::parse("constexpr").expect("constexpr"));
+        signature.insert(
+            (*k).to_string(),
+            ArgSpec::parse("constexpr").expect("constexpr"),
+        );
         constexprs.insert((*k).to_string(), v.clone());
     }
     KernelSpec {
@@ -112,7 +115,11 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             spec(
                 "rmsnorm",
                 "rmsnorm_fwd",
-                &[("desc_x", "*fp16"), ("desc_w", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("desc_x", "*fp16"),
+                    ("desc_w", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
                 &[
                     ("M", Val::Int(64)),
                     ("D_MODEL", Val::Int(4096)),
@@ -138,7 +145,11 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             spec(
                 "rmsnorm",
                 "rmsnorm_fwd",
-                &[("desc_x", "*fp16"), ("desc_w", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("desc_x", "*fp16"),
+                    ("desc_w", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
                 &[
                     ("M", Val::Int(32)),
                     ("D_MODEL", Val::Int(4096)),
@@ -162,12 +173,22 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // is straight-line. It is a MEASUREMENT, not a proposed fixture: if the refusal moves,
         // the loops were the whole of that blocker; if it does not, they were not.
         "swiglu_mlp_small" => (
-            spec("swiglu_mlp", "swiglu_mlp_fwd", SWIGLU, &swiglu_ce(128, 256, 64, 128)),
+            spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                SWIGLU,
+                &swiglu_ce(128, 256, 64, 128),
+            ),
             vec![1],
             Program::Matmul,
         ),
         "swiglu_mlp_flat" => (
-            spec("swiglu_mlp", "swiglu_mlp_fwd", SWIGLU, &swiglu_ce(128, 256, 256, 128)),
+            spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                SWIGLU,
+                &swiglu_ce(128, 256, 256, 128),
+            ),
             vec![1],
             Program::Matmul,
         ),
@@ -178,19 +199,34 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // division of labour their own types describe. This measures whether that actually happens
         // or whether the extent is refused.
         "swiglu_mlp_granite_flat" => (
-            spec("swiglu_mlp", "swiglu_mlp_fwd", SWIGLU, &swiglu_ce(4096, 12800, 12800, 4096)),
+            spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                SWIGLU,
+                &swiglu_ce(4096, 12800, 12800, 4096),
+            ),
             vec![1],
             Program::Matmul,
         ),
         // SWIGLU AS `pure_rust_ktir.rs` STATES IT -- the BLOCKED forms, kept beside the flat ones
         // so "does un-blocking clear this?" is a question one binary answers twice.
         "swiglu_mlp_tiled_k" => (
-            spec("swiglu_mlp", "swiglu_mlp_fwd", SWIGLU, &swiglu_ce_m(16, 128, 256, 128, 64)),
+            spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                SWIGLU,
+                &swiglu_ce_m(16, 128, 256, 128, 64),
+            ),
             vec![1],
             Program::Matmul,
         ),
         "swiglu_mlp_granite" => (
-            spec("swiglu_mlp", "swiglu_mlp_fwd", SWIGLU, &swiglu_ce(4096, 12800, 64, 4096)),
+            spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                SWIGLU,
+                &swiglu_ce(4096, 12800, 64, 4096),
+            ),
             vec![1],
             Program::Matmul,
         ),
@@ -253,7 +289,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // FUNCTION `swiglu_mlp.py` computes is right at Granite width, which is a property of the
         // `.py` and not of a blocking -- and that is exactly the claim `_flat` could not make.
         "swiglu_mlp_granite_tiled_k" => (
-            spec("swiglu_mlp", "swiglu_mlp_fwd", SWIGLU, &swiglu_ce(4096, 12800, 64, 2048)),
+            spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                SWIGLU,
+                &swiglu_ce(4096, 12800, 64, 2048),
+            ),
             vec![1],
             Program::Matmul,
         ),
@@ -271,8 +312,16 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         //
         // `H` still separates the two configurations, but now only through the plane width
         // (`H * HEAD_DIM`), which is exactly what `drive_rope` cross-checks against the output view.
-        "rope_q32" => (spec("rope", "rope_fwd", ROPE, &rope_ce(32)), vec![256], Program::Rope),
-        "rope_kv8" => (spec("rope", "rope_fwd", ROPE, &rope_ce(8)), vec![256], Program::Rope),
+        "rope_q32" => (
+            spec("rope", "rope_fwd", ROPE, &rope_ce(32)),
+            vec![256],
+            Program::Rope,
+        ),
+        "rope_kv8" => (
+            spec("rope", "rope_fwd", ROPE, &rope_ce(8)),
+            vec![256],
+            Program::Rope,
+        ),
         // EMBEDDING. `Program::ScalarMul` is the kind of the one COMPUTE op (`rows * EMB_SCALE`);
         // the gather itself is addressing, and whether this crate has a door for an INDIRECT access
         // tile is what these three measure. BLOCK_M 64 is the Granite launch; the 128 case is the
@@ -301,12 +350,22 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // whole `[256, 4096]` at 0.130597 ~= 32/256, with the right rms because a vocabulary's rows are
         // independent `randn` draws. It baked clean, dxp exited 0 and the launch returned rc=0.
         "embedding_granite" => (
-            spec("embedding", "embedding_fwd", EMBEDDING, &embedding_ce(256, 64)),
+            spec(
+                "embedding",
+                "embedding_fwd",
+                EMBEDDING,
+                &embedding_ce(256, 64),
+            ),
             vec![4],
             Program::ScalarMul,
         ),
         "embedding_granite_bm128" => (
-            spec("embedding", "embedding_fwd", EMBEDDING, &embedding_ce(256, 128)),
+            spec(
+                "embedding",
+                "embedding_fwd",
+                EMBEDDING,
+                &embedding_ce(256, 128),
+            ),
             vec![2],
             Program::ScalarMul,
         ),
@@ -320,7 +379,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // not the block's: a `[32, 4096]` node at BLOCK_M 16 would state 16 entries on its indirect
         // tile and still emit a 32-entry index, so moving BLOCK_M here would measure nothing.
         "embedding_granite_m32" => (
-            spec("embedding", "embedding_fwd", EMBEDDING, &embedding_ce(32, 32)),
+            spec(
+                "embedding",
+                "embedding_fwd",
+                EMBEDDING,
+                &embedding_ce(32, 32),
+            ),
             vec![1],
             Program::ScalarMul,
         ),
@@ -331,22 +395,42 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // `_flat` sets BLOCK_N = D_FF so the MLP's `for n in tl.range(0, D_FF, BLOCK_N)` is
         // single-trip and `canonicalize` deletes it -- the same measurement `swiglu_mlp_flat` is.
         "decoder_layer_one" => (
-            spec("decoder_block", "decoder_layer_fwd", &dec_ptrs_one(), &dec_ce(64)),
+            spec(
+                "decoder_block",
+                "decoder_layer_fwd",
+                &dec_ptrs_one(),
+                &dec_ce(64),
+            ),
             vec![1],
             Program::Matmul,
         ),
         "decoder_layer_one_flat" => (
-            spec("decoder_block", "decoder_layer_fwd", &dec_ptrs_one(), &dec_ce(256)),
+            spec(
+                "decoder_block",
+                "decoder_layer_fwd",
+                &dec_ptrs_one(),
+                &dec_ce(256),
+            ),
             vec![1],
             Program::Matmul,
         ),
         "decoder_two_layers" => (
-            spec("decoder_block", "decoder_two_layers_fwd", &dec_ptrs_two(), &dec_ce(64)),
+            spec(
+                "decoder_block",
+                "decoder_two_layers_fwd",
+                &dec_ptrs_two(),
+                &dec_ce(64),
+            ),
             vec![1],
             Program::Matmul,
         ),
         "decoder_two_layers_flat" => (
-            spec("decoder_block", "decoder_two_layers_fwd", &dec_ptrs_two(), &dec_ce(256)),
+            spec(
+                "decoder_block",
+                "decoder_two_layers_fwd",
+                &dec_ptrs_two(),
+                &dec_ce(256),
+            ),
             vec![1],
             Program::Matmul,
         ),
@@ -365,7 +449,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // fixture's FOUR-pointer entry point (delta 11): a `@triton.jit` wrapper that `make_ttir`'s
         // `inline_calls` inlines, so the ops that reach the emitter are `attn_fwd`'s own.
         "attention_flash_noncausal" => (
-            spec("attention_flash", "attn_fwd_noncausal", ATTN_NONCAUSAL, &attn_ce(1)),
+            spec(
+                "attention_flash",
+                "attn_fwd_noncausal",
+                ATTN_NONCAUSAL,
+                &attn_ce(1),
+            ),
             vec![4, 4],
             Program::Attn,
         ),
@@ -383,7 +472,12 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // everything ELSE attention needs is proven first: it bakes what the 16-tile launch cannot,
         // and the 16-tile launch is one `vec![4,4]` edit away once the corner wall falls.
         "attention_flash_noncausal_1tile" => (
-            spec("attention_flash", "attn_fwd_noncausal", ATTN_NONCAUSAL, &attn_ce(1)),
+            spec(
+                "attention_flash",
+                "attn_fwd_noncausal",
+                ATTN_NONCAUSAL,
+                &attn_ce(1),
+            ),
             vec![1, 1],
             Program::Attn,
         ),
@@ -465,10 +559,19 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             spec(
                 "paged_score",
                 "paged_vmatmul_fwd",
-                &[("desc_p", "*fp16"), ("desc_v", "*fp16"), ("desc_ids", "*i32"),
-                  ("desc_o", "*fp16")],
-                &[("M", Val::Int(8)), ("K", Val::Int(64)), ("V", Val::Int(128)),
-                  ("BLOCK_M", Val::Int(8)), ("HEAD_DIM", Val::Int(64))],
+                &[
+                    ("desc_p", "*fp16"),
+                    ("desc_v", "*fp16"),
+                    ("desc_ids", "*i32"),
+                    ("desc_o", "*fp16"),
+                ],
+                &[
+                    ("M", Val::Int(8)),
+                    ("K", Val::Int(64)),
+                    ("V", Val::Int(128)),
+                    ("BLOCK_M", Val::Int(8)),
+                    ("HEAD_DIM", Val::Int(64)),
+                ],
             ),
             vec![1],
             Program::Matmul,
@@ -492,10 +595,19 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             spec(
                 "paged_attention",
                 "paged_attn_fwd",
-                &[("desc_q", "*fp16"), ("desc_kt", "*fp16"), ("desc_v", "*fp16"),
-                  ("desc_ids", "*i32"), ("desc_o", "*fp16")],
-                &[("N_CTX", Val::Int(64)), ("HEAD_DIM", Val::Int(64)),
-                  ("V", Val::Int(1024)), ("BLOCK_M", Val::Int(64))],
+                &[
+                    ("desc_q", "*fp16"),
+                    ("desc_kt", "*fp16"),
+                    ("desc_v", "*fp16"),
+                    ("desc_ids", "*i32"),
+                    ("desc_o", "*fp16"),
+                ],
+                &[
+                    ("N_CTX", Val::Int(64)),
+                    ("HEAD_DIM", Val::Int(64)),
+                    ("V", Val::Int(1024)),
+                    ("BLOCK_M", Val::Int(64)),
+                ],
             ),
             vec![1],
             Program::Matmul,
@@ -516,11 +628,20 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             spec(
                 "paged_attention_multiblock",
                 "paged_attn_multiblock_fwd",
-                &[("desc_q", "*fp16"), ("desc_kt", "*fp16"), ("desc_v", "*fp16"),
-                  ("desc_table", "*i32"), ("desc_o", "*fp16")],
-                &[("NUM_BLOCKS", Val::Int(2)), ("BLOCK_N", Val::Int(64)),
-                  ("HEAD_DIM", Val::Int(64)), ("V", Val::Int(1024)),
-                  ("BLOCK_M", Val::Int(64))],
+                &[
+                    ("desc_q", "*fp16"),
+                    ("desc_kt", "*fp16"),
+                    ("desc_v", "*fp16"),
+                    ("desc_table", "*i32"),
+                    ("desc_o", "*fp16"),
+                ],
+                &[
+                    ("NUM_BLOCKS", Val::Int(2)),
+                    ("BLOCK_N", Val::Int(64)),
+                    ("HEAD_DIM", Val::Int(64)),
+                    ("V", Val::Int(1024)),
+                    ("BLOCK_M", Val::Int(64)),
+                ],
             ),
             vec![1],
             Program::Matmul,
@@ -620,8 +741,11 @@ fn rope_ce(h: i128) -> Vec<(&'static str, Val)> {
     ]
 }
 
-const EMBEDDING: &[(&str, &str)] =
-    &[("desc_ids", "*i32"), ("desc_table", "*fp16"), ("desc_o", "*fp16")];
+const EMBEDDING: &[(&str, &str)] = &[
+    ("desc_ids", "*i32"),
+    ("desc_table", "*fp16"),
+    ("desc_o", "*fp16"),
+];
 
 /// The embedding's constexprs at token count `n_tok` and block height `block_m`. Granite's own
 /// vocabulary extent (49159, NOT a multiple of 64 -- embedding.py delta 3) and hidden size, from
@@ -663,17 +787,48 @@ fn dec_ptrs(names: &[&'static str]) -> Vec<(&'static str, &'static str)> {
 /// One decoder layer's pointer list, in `decoder_layer_fwd`'s own parameter order.
 fn dec_ptrs_one() -> Vec<(&'static str, &'static str)> {
     dec_ptrs(&[
-        "desc_x", "desc_o", "desc_n1", "desc_wq", "desc_wk", "desc_wv", "desc_wo", "desc_mask",
-        "desc_cos", "desc_sin", "desc_n2", "desc_wg", "desc_wu", "desc_wd",
+        "desc_x",
+        "desc_o",
+        "desc_n1",
+        "desc_wq",
+        "desc_wk",
+        "desc_wv",
+        "desc_wo",
+        "desc_mask",
+        "desc_cos",
+        "desc_sin",
+        "desc_n2",
+        "desc_wg",
+        "desc_wu",
+        "desc_wd",
     ])
 }
 
 /// Two layers' pointer list, in `decoder_two_layers_fwd`'s own parameter order.
 fn dec_ptrs_two() -> Vec<(&'static str, &'static str)> {
     dec_ptrs(&[
-        "desc_x", "desc_o", "desc_n1a", "desc_wqa", "desc_wka", "desc_wva", "desc_woa", "desc_n2a",
-        "desc_wga", "desc_wua", "desc_wda", "desc_n1b", "desc_wqb", "desc_wkb", "desc_wvb",
-        "desc_wob", "desc_n2b", "desc_wgb", "desc_wub", "desc_wdb", "desc_mask", "desc_cos",
+        "desc_x",
+        "desc_o",
+        "desc_n1a",
+        "desc_wqa",
+        "desc_wka",
+        "desc_wva",
+        "desc_woa",
+        "desc_n2a",
+        "desc_wga",
+        "desc_wua",
+        "desc_wda",
+        "desc_n1b",
+        "desc_wqb",
+        "desc_wkb",
+        "desc_wvb",
+        "desc_wob",
+        "desc_n2b",
+        "desc_wgb",
+        "desc_wub",
+        "desc_wdb",
+        "desc_mask",
+        "desc_cos",
         "desc_sin",
     ])
 }
@@ -687,7 +842,10 @@ mod tests {
     #[test]
     fn every_name_in_all_resolves() {
         for name in super::ALL {
-            assert!(super::case(name).is_some(), "`{name}` is in ALL but `case` has no arm");
+            assert!(
+                super::case(name).is_some(),
+                "`{name}` is in ALL but `case` has no arm"
+            );
         }
         assert_eq!(
             super::ALL.len(),
@@ -719,7 +877,10 @@ mod tests {
                 spec.file
             );
             assert!(!grid.is_empty(), "`{name}` has an empty grid");
-            assert!(grid.iter().all(|&e| e > 0), "`{name}` has a non-positive grid extent");
+            assert!(
+                grid.iter().all(|&e| e > 0),
+                "`{name}` has a non-positive grid extent"
+            );
         }
     }
 }

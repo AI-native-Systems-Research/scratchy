@@ -527,12 +527,8 @@ pub fn rmsnorm(d_model: usize) -> Envelope {
     let r_ref = 1u32; // the reference's own single f16 cast
 
     let half = 0.5 * d_mean as f64;
-    let up = (1.0 + eps_rsqrt + eps_const)
-        * (1.0 - u).powf(-half)
-        * band_up(r_post + r_ref);
-    let down = (1.0 - eps_rsqrt - eps_const)
-        * (1.0 + u).powf(-half)
-        * band_down(r_post + r_ref);
+    let up = (1.0 + eps_rsqrt + eps_const) * (1.0 - u).powf(-half) * band_up(r_post + r_ref);
+    let down = (1.0 - eps_rsqrt - eps_const) * (1.0 + u).powf(-half) * band_down(r_post + r_ref);
 
     // Floor: pure underflow. Every term above is proportional to |y|, and the reduce has no
     // cancellation, so there is nothing else to cover.
@@ -694,7 +690,10 @@ pub fn swiglu_activation() -> Envelope {
 /// upstream reaches the output through a contraction and is therefore an ABSOLUTE allowance,
 /// ceiled per element by [`GAUSS_TAIL`].
 pub fn swiglu(d_model: usize, d_ff: usize, block_n: usize, block_k: usize) -> Envelope {
-    assert!(block_n >= 1 && block_k >= 1, "swiglu: a blocking of zero has no trips");
+    assert!(
+        block_n >= 1 && block_k >= 1,
+        "swiglu: a blocking of zero has no trips"
+    );
     let u = U_F16;
     let g_down = (d_ff as f64 / d_model as f64).sqrt();
     // The trip counts the kernel's two `tl.range`s actually run.
@@ -709,18 +708,21 @@ pub fn swiglu(d_model: usize, d_ff: usize, block_n: usize, block_k: usize) -> En
 
     // The K-trip chain: the last trip's two rounds linearly, the earlier trips' in RSS against
     // each partial's own RMS. Zero extra at T_k = 1.
-    let e_g = 2.0 * u * sigma_g + u * sigma_g * (t_k - 1.0).sqrt()
-        + f32_accum_rel(d_model) * sigma_g;
+    let e_g =
+        2.0 * u * sigma_g + u * sigma_g * (t_k - 1.0).sqrt() + f32_accum_rel(d_model) * sigma_g;
     let e_u = e_g; // the up projection is the same computation on the same operand
     let e_s = SILU_REL_GAIN * e_g + 3.0 * u * sigma_s;
     let e_h = sigma_u * e_s + sigma_s * e_u + u * sigma_h;
     // The N-trip chain, same shape, against the OUTPUT's RMS. Zero extra at T_n = 1.
-    let e_o_absolute = g_down * e_h
-        + f32_accum_rel(d_ff) * sigma_o
-        + u * sigma_o * (t_n - 1.0).sqrt();
+    let e_o_absolute =
+        g_down * e_h + f32_accum_rel(d_ff) * sigma_o + u * sigma_o * (t_n - 1.0).sqrt();
 
     let rounds = 2 + 1; // the last n-trip's product + accumulate, then the reference's cast
-    compose(band_up(rounds), band_down(rounds), GAUSS_TAIL * e_o_absolute)
+    compose(
+        band_up(rounds),
+        band_down(rounds),
+        GAUSS_TAIL * e_o_absolute,
+    )
 }
 
 /// The Granite decoder block — `test/fixtures/decoder_block.py:237-318`, configs
@@ -821,7 +823,11 @@ pub fn decoder(d_model: usize, d_ff: usize, layers: usize) -> Envelope {
     }
 
     let rounds = 2 + 1; // the final residual's mul + add, then the reference's f16 cast
-    compose(band_up(rounds), band_down(rounds), GAUSS_TAIL * r_in * sigma_x)
+    compose(
+        band_up(rounds),
+        band_down(rounds),
+        GAUSS_TAIL * r_in * sigma_x,
+    )
 }
 
 // ===========================================================================================
@@ -923,7 +929,10 @@ mod tests {
             let up = band_up(d);
             let down = band_down(d);
             assert!(up > prev_up, "band_up must grow with depth at d={d}");
-            assert!(down < prev_down, "band_down must shrink with depth at d={d}");
+            assert!(
+                down < prev_down,
+                "band_down must shrink with depth at d={d}"
+            );
             assert!(up > 1.0 && down < 1.0);
             prev_up = up;
             prev_down = down;
@@ -966,7 +975,10 @@ mod tests {
         const { assert!(1e-5 < F16_MIN_NORMAL) };
         assert!(!f16_exact(1e-5));
         let e = const_rel_error(1e-5);
-        assert!(e > 1e-4 && e < 2e-3, "eps rel error {e} out of expected decade");
+        assert!(
+            e > 1e-4 && e < 2e-3,
+            "eps rel error {e} out of expected decade"
+        );
         // A non-representable scale must widen the embedding envelope.
         let exact = embedding(12.0);
         let inexact = embedding(1e-5);
@@ -1047,7 +1059,10 @@ mod tests {
         // and the worst-case Cauchy-Schwarz alternative is NOT negligible — the reason it is
         // documented as rejected rather than silently omitted.
         let cs_worst = 2.0 * gamma_f32(12800) * (12800f64).sqrt();
-        assert!(cs_worst > 0.1, "cs worst-case {cs_worst} unexpectedly small");
+        assert!(
+            cs_worst > 0.1,
+            "cs worst-case {cs_worst} unexpectedly small"
+        );
     }
 
     #[test]
@@ -1105,7 +1120,10 @@ mod tests {
     #[test]
     fn granite_tiled_k_floor_tracks_the_trip_count_algebra() {
         let (d_model, d_ff, block_n, block_k) = (4096usize, 12800usize, 64usize, 2048usize);
-        let (t_k, t_n) = (d_model.div_ceil(block_k) as f64, d_ff.div_ceil(block_n) as f64);
+        let (t_k, t_n) = (
+            d_model.div_ceil(block_k) as f64,
+            d_ff.div_ceil(block_n) as f64,
+        );
         assert_eq!((t_k, t_n), (2.0, 200.0), "the blocking's trip counts");
         let u = U_F16;
         let g_down = (d_ff as f64 / d_model as f64).sqrt();
@@ -1143,7 +1161,11 @@ mod tests {
         // The floor must be the stimulus-bounded |x1 c| + |x2 s| term; a pure-underflow floor
         // would be ~1e-8 and would make the envelope unsound for an output near a rotation zero.
         let e = rope();
-        assert!(e.floor > 1e-3, "rope floor {} is too small to cover a rotation zero", e.floor);
+        assert!(
+            e.floor > 1e-3,
+            "rope floor {} is too small to cover a rotation zero",
+            e.floor
+        );
         let want = ceil_to(U_F16 * (1.0 + U_F16) * GAUSS_TAIL * 2f64.sqrt(), 1e-9);
         assert_eq!(e.floor, want);
     }

@@ -96,12 +96,18 @@ pub fn run(module: &mut Module) -> Result<()> {
     // attribute into the input. Strip any pre-existing tag -- module and every op
     // -- BEFORE anything else, so the only tags that reach the emitter are ones
     // set below on matmuls actually verified this run.
-    module.attrs.retain(|(k, _)| *k != AttrKey::CanonicalVerified);
+    module
+        .attrs
+        .retain(|(k, _)| *k != AttrKey::CanonicalVerified);
     walk::for_each_mut(module, |op| op.remove_attr(&AttrKey::CanonicalVerified));
 
     let dots: Vec<OpPath> = walk::paths(module)
         .into_iter()
-        .filter(|p| walk::at(module, p).map(|o| o.kind == OpKind::TtDot).unwrap_or(false))
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| o.kind == OpKind::TtDot)
+                .unwrap_or(false)
+        })
         .collect();
     if dots.is_empty() {
         return Ok(());
@@ -160,9 +166,10 @@ pub fn run(module: &mut Module) -> Result<()> {
             let mut v = dot.operands[1];
             let mut peeled = 0;
             loop {
-                match module.def_of(v).filter(|o| {
-                    o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans
-                }) {
+                match module
+                    .def_of(v)
+                    .filter(|o| o.kind == OpKind::ArithExtf || o.kind == OpKind::TtTrans)
+                {
                     Some(o) if peeled < 2 => {
                         v = o.operands[0];
                         peeled += 1;
@@ -291,7 +298,9 @@ pub fn run(module: &mut Module) -> Result<()> {
             .filter(|o| o.kind == OpKind::TtTrans)
             .and_then(|o| o.operands.first().copied())
             .filter(|src| {
-                module.def_of(*src).is_some_and(|d| d.kind == OpKind::TtDescriptorLoad)
+                module
+                    .def_of(*src)
+                    .is_some_and(|d| d.kind == OpKind::TtDescriptorLoad)
             })
             .or(fp8_peeled);
 
@@ -354,7 +363,9 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     let a = dot.operands[0];
     let b = dot.operands[1];
     let c = dot.operands[2];
-    let d = dot.result().ok_or_else(|| refuse("the dot defines no result"))?;
+    let d = dot
+        .result()
+        .ok_or_else(|| refuse("the dot defines no result"))?;
 
     // A and B must be DIRECT descriptor loads: no prologue or reshape on the
     // operands. This is the guard the swiglu fixture's docstring quotes -- the
@@ -373,8 +384,14 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
         Some(t) => t.operands.first().copied(),
         None => Some(b),
     };
-    let a_ld = module.def_of(a).filter(|o| o.kind == OpKind::TtDescriptorLoad);
-    let b_ld = b_load_val.and_then(|v| module.def_of(v).filter(|o| o.kind == OpKind::TtDescriptorLoad));
+    let a_ld = module
+        .def_of(a)
+        .filter(|o| o.kind == OpKind::TtDescriptorLoad);
+    let b_ld = b_load_val.and_then(|v| {
+        module
+            .def_of(v)
+            .filter(|o| o.kind == OpKind::TtDescriptorLoad)
+    });
     let (Some(a_ld), Some(b_ld)) = (a_ld, b_ld) else {
         return Err(refuse("A and B must be direct tt.descriptor_load results"));
     };
@@ -403,7 +420,9 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
             )));
         }
         None => {
-            return Err(refuse("A/B descriptor M/N/K are not compile-time constants"));
+            return Err(refuse(
+                "A/B descriptor M/N/K are not compile-time constants",
+            ));
         }
     };
 
@@ -466,10 +485,17 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
         .iter()
         .find(|o| o.kind == OpKind::TtGetProgramId)
         .expect("counted one");
-    if pid_op.attr(&AttrKey::Axis).and_then(|a| a.as_int()).unwrap_or(0) != 0 {
+    if pid_op
+        .attr(&AttrKey::Axis)
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        != 0
+    {
         return Err(refuse("tt.get_program_id is not axis x (0)"));
     }
-    let pid = pid_op.result().ok_or_else(|| refuse("program id defines no value"))?;
+    let pid = pid_op
+        .result()
+        .ok_or_else(|| refuse("program id defines no value"))?;
 
     // Descriptor shapes/strides/blocks: contiguous row-major, canonical layout. B is
     // framed by the orientation: plain `[k, ns]` blocking `[bk, bn]`, or the `.T`
@@ -492,7 +518,9 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     // also makes them pairwise distinct.
     let args: Vec<Ssa> = func.regions[0].args.iter().map(|(v, _)| *v).collect();
     if args.len() < 3 {
-        return Err(refuse("kernel has fewer than 3 arguments (need distinct A/B/C buffers)"));
+        return Err(refuse(
+            "kernel has fewer than 3 arguments (need distinct A/B/C buffers)",
+        ));
     }
     let base = |d: &Op| d.operands.first().copied();
     if base(a_desc) != Some(args[0])
@@ -513,14 +541,12 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
             let forr = walk::at(module, &for_path).expect("path");
             // iter_args start at operand 3 (lb, ub, step first); the region args are
             // [iv, ...iter_args].
-            let iter_args: Vec<Ssa> =
-                forr.regions[0].args[1..].iter().map(|(v, _)| *v).collect();
+            let iter_args: Vec<Ssa> = forr.regions[0].args[1..].iter().map(|(v, _)| *v).collect();
             let idx = iter_args
                 .iter()
                 .position(|v| *v == c)
                 .ok_or_else(|| refuse("accumulator is not the enclosing scf.for iter-arg"))?;
-            let yieldd = forr
-                .regions[0]
+            let yieldd = forr.regions[0]
                 .ops
                 .last()
                 .filter(|o| o.kind == OpKind::ScfYield)
@@ -584,7 +610,9 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
     // selected by pid, k in place) and the trans produces the `[bk, bn]` operand.
     if b_trans.is_some() {
         if b_idx.len() != 2 || b_idx[0] != pid || !is_k_idx(b_idx[1]) {
-            return Err(refuse("B load offset is not the canonical transposed [pid, k]"));
+            return Err(refuse(
+                "B load offset is not the canonical transposed [pid, k]",
+            ));
         }
     } else if b_idx.len() != 2 || !is_k_idx(b_idx[0]) || b_idx[1] != pid {
         return Err(refuse("B load offset is not the canonical [k, pid]"));
@@ -663,18 +691,26 @@ fn verify_canonical_fp8_matmul_kernel(
     let dot = walk::at(module, dot_path).expect("path");
     let a = dot.operands[0];
     let c = dot.operands[2];
-    let d = dot.result().ok_or_else(|| refuse("the dot defines no result"))?;
+    let d = dot
+        .result()
+        .ok_or_else(|| refuse("the dot defines no result"))?;
 
     // A is a DIRECT f16 load, as in the f16 contract.
-    let a_ld = module.def_of(a).filter(|o| o.kind == OpKind::TtDescriptorLoad);
+    let a_ld = module
+        .def_of(a)
+        .filter(|o| o.kind == OpKind::TtDescriptorLoad);
     let Some(a_ld) = a_ld else {
-        return Err(refuse("A must be a direct tt.descriptor_load result (fp8 affects W only)"));
+        return Err(refuse(
+            "A must be a direct tt.descriptor_load result (fp8 affects W only)",
+        ));
     };
     // B IS THE fp8 LOAD -- `run` peeled it and hands it in (`b_load`), because this runs
     // BEFORE the rewire and the dot's second operand is still the extf/trans chain. Its
     // VALUE type is f16 (the spelled `.to(tl.float16)`); its DESCRIPTOR's elem is what
     // says fp8, and the peel in `run` checked exactly that.
-    let b_ld = module.def_of(b_load).filter(|o| o.kind == OpKind::TtDescriptorLoad);
+    let b_ld = module
+        .def_of(b_load)
+        .filter(|o| o.kind == OpKind::TtDescriptorLoad);
     let Some(b_ld) = b_ld else {
         return Err(refuse(
             "the fp8 weight must reach the dot as a direct tt.descriptor_load (the widening \
@@ -711,8 +747,10 @@ fn verify_canonical_fp8_matmul_kernel(
         )));
     }
     if bm != m || bn != w_r {
-        return Err(refuse("multi-block fp8 matmul is not supported (the emitter emits one \
-             M x N program and discards the block size)"));
+        return Err(refuse(
+            "multi-block fp8 matmul is not supported (the emitter emits one \
+             M x N program and discards the block size)",
+        ));
     }
     if bk != k {
         return Err(refuse(format!(
@@ -790,10 +828,17 @@ fn verify_canonical_fp8_matmul_kernel(
         .iter()
         .find(|o| o.kind == OpKind::TtGetProgramId)
         .expect("counted one");
-    if pid_op.attr(&AttrKey::Axis).and_then(|a| a.as_int()).unwrap_or(0) != 0 {
+    if pid_op
+        .attr(&AttrKey::Axis)
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        != 0
+    {
         return Err(refuse("tt.get_program_id is not axis x (0)"));
     }
-    let pid = pid_op.result().ok_or_else(|| refuse("program id defines no value"))?;
+    let pid = pid_op
+        .result()
+        .ok_or_else(|| refuse("program id defines no value"))?;
 
     // No loops at all: this contract is the single-tile form (a K-loop is the f16 arm's
     // follow-on too).
@@ -891,7 +936,9 @@ fn verify_canonical_fp8_matmul_kernel(
     };
     let a_idx = &a_ld.operands[1..];
     if a_idx.len() != 2 || !is_row_idx(a_idx[0]) || !is_zero_idx(a_idx[1]) {
-        return Err(refuse("A load offset is not the canonical [pid*BLOCK_M, 0]"));
+        return Err(refuse(
+            "A load offset is not the canonical [pid*BLOCK_M, 0]",
+        ));
     }
     let b_idx = &b_ld.operands[1..];
     if b_idx.len() != 2 || !is_zero_idx(b_idx[0]) || !is_zero_idx(b_idx[1]) {
@@ -904,7 +951,9 @@ fn verify_canonical_fp8_matmul_kernel(
     // The store's operands are [desc, indices..., src]: skip the desc, drop the src.
     let s_idx = &store.operands[1..store.operands.len().saturating_sub(1)];
     if s_idx.len() != 2 || !is_row_idx(s_idx[0]) || !is_zero_idx(s_idx[1]) {
-        return Err(refuse("C store offset is not the canonical [pid*BLOCK_M, 0]"));
+        return Err(refuse(
+            "C store offset is not the canonical [pid*BLOCK_M, 0]",
+        ));
     }
 
     // ⭐⭐⭐ THE mulf CHAIN: `mulf(dot_or_bcast(dot), bcast_or_load(ws))` -- either operand
@@ -915,7 +964,9 @@ fn verify_canonical_fp8_matmul_kernel(
         .iter()
         .find(|o| o.kind == OpKind::ArithMulf)
         .expect("counted one");
-    let mulf_res = mulf.result().ok_or_else(|| refuse("the scale mulf defines no result"))?;
+    let mulf_res = mulf
+        .result()
+        .ok_or_else(|| refuse("the scale mulf defines no result"))?;
     // Trace one value back through at most one tt.broadcast.
     let through_bcast = |v: Ssa| -> Ssa {
         match module.def_of(v).filter(|o| o.kind == OpKind::TtBroadcast) {
@@ -1016,10 +1067,14 @@ fn verify_canonical_paged_matmul_kernel(
     let dot = walk::at(module, dot_path).expect("path");
     let a = dot.operands[0];
     let c = dot.operands[2];
-    let d = dot.result().ok_or_else(|| refuse("the dot defines no result"))?;
+    let d = dot
+        .result()
+        .ok_or_else(|| refuse("the dot defines no result"))?;
 
     // A is a DIRECT f16 load, exactly as in the f16 contract.
-    let a_ld = module.def_of(a).filter(|o| o.kind == OpKind::TtDescriptorLoad);
+    let a_ld = module
+        .def_of(a)
+        .filter(|o| o.kind == OpKind::TtDescriptorLoad);
     let Some(a_ld) = a_ld else {
         return Err(refuse(
             "paged matmul: A must be a direct tt.descriptor_load result (the gather is B's)",
@@ -1221,8 +1276,11 @@ fn verify_canonical_paged_matmul_kernel(
         .result_type()
         .ok_or_else(|| refuse("the ids load defines no type"))?;
     if ids_ty.elem() != Some(DType::I32) {
-        return Err(refuse("paged matmul: the ids load's element is not i32 (the indirect tile indexes \
-             by a 32-bit row number)".to_string()));
+        return Err(refuse(
+            "paged matmul: the ids load's element is not i32 (the indirect tile indexes \
+             by a 32-bit row number)"
+                .to_string(),
+        ));
     }
     let ids_dims = ids_ty
         .dims()
@@ -1240,20 +1298,28 @@ fn verify_canonical_paged_matmul_kernel(
     let is_zero_idx = |v: Ssa| const_int(module, v) == Some(0);
     let a_idx = &a_ld.operands[1..];
     if a_idx.len() != 2 || !is_zero_idx(a_idx[0]) || !is_zero_idx(a_idx[1]) {
-        return Err(refuse("paged matmul: A load offset is not the canonical [0, 0]"));
+        return Err(refuse(
+            "paged matmul: A load offset is not the canonical [0, 0]",
+        ));
     }
     let ids_idx = &ids_ld.operands[1..];
     if ids_idx.len() != 1 || !is_zero_idx(ids_idx[0]) {
-        return Err(refuse("paged matmul: ids load offset is not the canonical [0]"));
+        return Err(refuse(
+            "paged matmul: ids load offset is not the canonical [0]",
+        ));
     }
     // The gather's own y_offset is operand 2 (desc, x_offsets, y_offset).
     if gather.operands.len() != 3 || !is_zero_idx(gather.operands[2]) {
-        return Err(refuse("paged matmul: the gather's y_offset is not the constant 0"));
+        return Err(refuse(
+            "paged matmul: the gather's y_offset is not the constant 0",
+        ));
     }
     // The store's operands are [desc, indices..., src]; drop the desc and the src.
     let s_idx = &store.operands[1..store.operands.len().saturating_sub(1)];
     if s_idx.len() != 2 || !is_zero_idx(s_idx[0]) || !is_zero_idx(s_idx[1]) {
-        return Err(refuse("paged matmul: C store offset is not the canonical [0, 0]"));
+        return Err(refuse(
+            "paged matmul: C store offset is not the canonical [0, 0]",
+        ));
     }
 
     // The store must sit at the function top level and its source must BE the dot's
@@ -1293,15 +1359,7 @@ fn verify_canonical_paged_matmul_kernel(
 /// A contiguous row-major 2-D `tt.make_tensor_descriptor` of the given full shape
 /// and block. The emitter derives the layout from the shape ALONE and assumes
 /// contiguous row-major, so a non-standard stride would be silently ignored.
-fn check_desc(
-    module: &Module,
-    d: &Op,
-    nm: &str,
-    d0: i64,
-    d1: i64,
-    b0: i64,
-    b1: i64,
-) -> Result<()> {
+fn check_desc(module: &Module, d: &Op, nm: &str, d0: i64, d1: i64, b0: i64, b1: i64) -> Result<()> {
     let (s0, s1) = desc_shape2(module, d)
         .ok_or_else(|| refuse(format!("{nm} has non-constant shape/strides")))?;
     if s0 != d0 || s1 != d1 {
@@ -1403,7 +1461,10 @@ pub fn is_zero_const(module: &Module, v: Ssa) -> bool {
 fn enclosing_scf_for(module: &Module, path: &OpPath) -> Option<OpPath> {
     let mut p = path.parent();
     while let Some(cur) = p {
-        if walk::at(module, &cur).map(|o| o.kind == OpKind::ScfFor).unwrap_or(false) {
+        if walk::at(module, &cur)
+            .map(|o| o.kind == OpKind::ScfFor)
+            .unwrap_or(false)
+        {
             return Some(cur);
         }
         p = cur.parent();
@@ -1465,9 +1526,15 @@ module {
         let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
         assert_eq!(get("linalg.matmul"), 1, "the dot lowered");
         assert_eq!(get("tt.dot"), 0, "no dot survives");
-        assert_eq!(get("tt.trans"), 0, "no trans -- the V leg is contracted where it lies");
+        assert_eq!(
+            get("tt.trans"),
+            0,
+            "no trans -- the V leg is contracted where it lies"
+        );
         assert!(
-            m.attrs.iter().any(|(k, _)| *k == AttrKey::CanonicalVerified),
+            m.attrs
+                .iter()
+                .any(|(k, _)| *k == AttrKey::CanonicalVerified),
             "the module carries the trust tag"
         );
         for op in m.ops_deep() {
@@ -1517,7 +1584,8 @@ module {
         let mut m = parse::parse(&src).unwrap();
         let e = run(&mut m).unwrap_err();
         assert!(
-            e.message.contains("the gather's x_offsets is not the ids load's result"),
+            e.message
+                .contains("the gather's x_offsets is not the ids load's result"),
             "the offsets refusal must fire -- got {e}"
         );
     }
@@ -1576,7 +1644,8 @@ module {
         let mut m = parse::parse(&src).unwrap();
         let e = run(&mut m).unwrap_err();
         assert!(
-            e.message.contains("A/V/ids/O descriptors do not read the function's four arguments"),
+            e.message
+                .contains("A/V/ids/O descriptors do not read the function's four arguments"),
             "the positional refusal must fire -- got {e}"
         );
     }
@@ -1604,7 +1673,9 @@ module {
         assert_eq!(get("linalg.matmul"), 2, "both dots lowered");
         assert_eq!(get("tt.dot"), 0, "no dot survives");
         assert!(
-            !m.attrs.iter().any(|(k, _)| *k == AttrKey::CanonicalVerified),
+            !m.attrs
+                .iter()
+                .any(|(k, _)| *k == AttrKey::CanonicalVerified),
             "a multi-dot kernel is NOT tagged -- the emitter refuses it there"
         );
         for op in m.ops_deep() {
@@ -1656,7 +1727,10 @@ module {
 ";
         let mut m = parse::parse(src).unwrap();
         let e = run(&mut m).unwrap_err();
-        assert!(e.message.contains("only f16 tt.dot is supported"), "got {e}");
+        assert!(
+            e.message.contains("only f16 tt.dot is supported"),
+            "got {e}"
+        );
     }
 
     #[test]
@@ -1676,7 +1750,8 @@ module {
         let mut m = parse::parse(src).unwrap();
         let e = run(&mut m).unwrap_err();
         assert!(
-            e.message.contains("A and B must be direct tt.descriptor_load results"),
+            e.message
+                .contains("A and B must be direct tt.descriptor_load results"),
             "got {e}"
         );
     }

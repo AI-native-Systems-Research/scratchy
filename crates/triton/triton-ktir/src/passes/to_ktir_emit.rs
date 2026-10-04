@@ -39,7 +39,9 @@
 //!   their `regions: &[&[Operation]]` cannot express a second block even in principle.
 //! * **An affine form outside the subset we emit.** See [`affine_map`] / [`affine_set`].
 
-use ktir_core::affine::{AffineExpr as KExpr, AffineMap as KMap, AffineSet as KSet, Constraint, ConstraintKind};
+use ktir_core::affine::{
+    AffineExpr as KExpr, AffineMap as KMap, AffineSet as KSet, Constraint, ConstraintKind,
+};
 use ktir_core::arena::Arena;
 use ktir_core::attrkey::AttrKey as KAttrKey;
 use ktir_core::dtypes::DType as KDType;
@@ -103,13 +105,17 @@ fn dtype(d: DType) -> Result<KDType> {
 
 fn irtype<'a>(t: &IrType, a: &'a Arena) -> Result<KIrType<'a>> {
     Ok(match t {
-        IrType::Tensor { dims, elem } => {
-            KIrType::Tensor { dims: a.ints(dims.clone()), elem: dtype(*elem)? }
-        }
-        IrType::MemRef { dims, elem } => {
-            KIrType::MemRef { dims: a.ints(dims.clone()), elem: dtype(*elem)? }
-        }
-        IrType::AccessTile { dims } => KIrType::AccessTile { dims: a.ints(dims.clone()) },
+        IrType::Tensor { dims, elem } => KIrType::Tensor {
+            dims: a.ints(dims.clone()),
+            elem: dtype(*elem)?,
+        },
+        IrType::MemRef { dims, elem } => KIrType::MemRef {
+            dims: a.ints(dims.clone()),
+            elem: dtype(*elem)?,
+        },
+        IrType::AccessTile { dims } => KIrType::AccessTile {
+            dims: a.ints(dims.clone()),
+        },
         IrType::Index => KIrType::Index,
         IrType::Scalar(d) => KIrType::Scalar(dtype(*d)?),
         // These three are ttir-only or an escape hatch. Reaching here means `to_ktir`
@@ -159,19 +165,32 @@ pub fn affine_map<'a>(text: &str, a: &'a Arena) -> Result<KMap<'a>> {
         .split_once("->")
         .ok_or_else(|| refuse(format!("affine map `{text}` has no `->`")))?;
 
-    let num_dims = dims.trim().trim_start_matches('(').trim_end_matches(')').split(',')
+    let num_dims = dims
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
         .filter(|s| !s.trim().is_empty())
         .count();
 
     let mut exprs = Vec::new();
-    for r in results.trim().trim_start_matches('(').trim_end_matches(')').split(',') {
+    for r in results
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+    {
         let r = r.trim();
         if r.is_empty() {
             continue;
         }
         exprs.push(affine_result(r, text, num_dims, a)?);
     }
-    Ok(KMap { num_dims, num_syms: 0, exprs: a.exprs(exprs) })
+    Ok(KMap {
+        num_dims,
+        num_syms: 0,
+        exprs: a.exprs(exprs),
+    })
 }
 
 /// One affine map result term.
@@ -183,14 +202,11 @@ pub fn affine_map<'a>(text: &str, a: &'a Arena) -> Result<KMap<'a>> {
 /// symbol -- is refused with the text, because a partial reimplementation of their
 /// 1,378-line `affine.rs` that silently mishandles one operator is the worst option
 /// available.
-fn affine_result<'a>(
-    term: &str,
-    whole: &str,
-    num_dims: usize,
-    a: &'a Arena,
-) -> Result<KExpr<'a>> {
+fn affine_result<'a>(term: &str, whole: &str, num_dims: usize, a: &'a Arena) -> Result<KExpr<'a>> {
     let dim = |s: &str| -> Option<usize> {
-        s.trim().strip_prefix('d').and_then(|n| n.parse::<usize>().ok())
+        s.trim()
+            .strip_prefix('d')
+            .and_then(|n| n.parse::<usize>().ok())
     };
     let check = |i: usize| -> Result<usize> {
         if i >= num_dims {
@@ -205,9 +221,8 @@ fn affine_result<'a>(
         return Ok(KExpr::Dim(check(i)?));
     }
     if let Some((l, r)) = term.split_once('+') {
-        let li = dim(l).ok_or_else(|| {
-            refuse(format!("affine map `{whole}`: `{l}` is not a dimension"))
-        })?;
+        let li = dim(l)
+            .ok_or_else(|| refuse(format!("affine map `{whole}`: `{l}` is not a dimension")))?;
         let lhs = KExpr::Dim(check(li)?);
         let rhs = if let Some(ri) = dim(r) {
             KExpr::Dim(check(ri)?)
@@ -247,12 +262,21 @@ pub fn affine_set<'a>(text: &str, a: &'a Arena) -> Result<KSet<'a>> {
         .split_once(':')
         .ok_or_else(|| refuse(format!("affine set `{text}` has no `:`")))?;
 
-    let num_dims = dims.trim().trim_start_matches('(').trim_end_matches(')').split(',')
+    let num_dims = dims
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
         .filter(|s| !s.trim().is_empty())
         .count();
 
     let mut out = Vec::new();
-    for c in clauses.trim().trim_start_matches('(').trim_end_matches(')').split(',') {
+    for c in clauses
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+    {
         let c = c.trim();
         if c.is_empty() {
             continue;
@@ -267,9 +291,10 @@ pub fn affine_set<'a>(text: &str, a: &'a Arena) -> Result<KSet<'a>> {
 
         let expr = if let Some(n) = lhs.strip_prefix('d') {
             // `dN` -- the lower bound.
-            let idx: usize = n.trim().parse().map_err(|_| {
-                refuse(format!("affine set `{text}`: `{lhs}` is not a dimension"))
-            })?;
+            let idx: usize = n
+                .trim()
+                .parse()
+                .map_err(|_| refuse(format!("affine set `{text}`: `{lhs}` is not a dimension")))?;
             KExpr::Dim(idx)
         } else if let Some(rest) = lhs.strip_prefix("-d") {
             // `-dN + K` -- the upper bound.
@@ -280,10 +305,14 @@ pub fn affine_set<'a>(text: &str, a: &'a Arena) -> Result<KSet<'a>> {
                 ))
             })?;
             let idx: usize = n.trim().parse().map_err(|_| {
-                refuse(format!("affine set `{text}`: `{lhs}` has no dimension index"))
+                refuse(format!(
+                    "affine set `{text}`: `{lhs}` has no dimension index"
+                ))
             })?;
             let bound: i64 = k.trim().parse().map_err(|_| {
-                refuse(format!("affine set `{text}`: `{lhs}` has a non-integer bound"))
+                refuse(format!(
+                    "affine set `{text}`: `{lhs}` has a non-integer bound"
+                ))
             })?;
             KExpr::Add(
                 a.expr(KExpr::Neg(a.expr(KExpr::Dim(idx)))),
@@ -302,9 +331,16 @@ pub fn affine_set<'a>(text: &str, a: &'a Arena) -> Result<KSet<'a>> {
                 )));
             }
         }
-        out.push(Constraint { expr, kind: ConstraintKind::GreaterEq });
+        out.push(Constraint {
+            expr,
+            kind: ConstraintKind::GreaterEq,
+        });
     }
-    Ok(KSet { num_dims, num_syms: 0, constraints: a.constraints(out) })
+    Ok(KSet {
+        num_dims,
+        num_syms: 0,
+        constraints: a.constraints(out),
+    })
 }
 
 //===----------------------------------------------------------------------===//
@@ -356,8 +392,8 @@ fn attrkey(k: &AttrKey) -> Result<Key> {
         SymName | Grid | Noinline | FoldedGridLoop => Key::OnFunction,
 
         // Ours. See the note above.
-        Pattern | WorkDivision | Index | DataBounds | OutputPartition | PtRows
-        | XrfCapacity | Role | RingSend | RingRecv | CanonicalVerified => Key::Drop,
+        Pattern | WorkDivision | Index | DataBounds | OutputPartition | PtRows | XrfCapacity
+        | Role | RingSend | RingRecv | CanonicalVerified => Key::Drop,
 
         // `linalg.generic`'s iterator list. Their walker reads a reduction's combiner from
         // `ReduceFn` on a `linalg.reduce` instead, and there is no `IteratorTypes` in their
@@ -461,8 +497,7 @@ fn attr<'a>(v: &Attr, a: &'a Arena) -> Result<KAttr<'a>> {
         Attr::SplatFloat(f) => KAttr::Float(f.as_f64()),
         Attr::AffineMap(t) => KAttr::AffineMap(affine_map(t, a)?),
         Attr::AffineMapList(l) => {
-            let maps: Vec<KMap<'a>> =
-                l.iter().map(|t| affine_map(t, a)).collect::<Result<_>>()?;
+            let maps: Vec<KMap<'a>> = l.iter().map(|t| affine_map(t, a)).collect::<Result<_>>()?;
             KAttr::AffineMapList(a.maps(maps))
         }
         Attr::AffineSet(t) => KAttr::AffineSet(affine_set(t, a)?),
@@ -626,13 +661,12 @@ impl Fresh {
 /// consumer.
 /// One of our ops as theirs, with the facts their consumer reads off an ATTRIBUTE derived from the
 /// result type -- see [`state_shape_and_dtype`], which every returned operation goes through.
-fn lower_op<'a>(
-    op: &Op,
-    a: &'a Arena,
-    fresh: &mut Fresh,
-) -> Result<Vec<Operation<'a>>> {
+fn lower_op<'a>(op: &Op, a: &'a Arena, fresh: &mut Fresh) -> Result<Vec<Operation<'a>>> {
     let built = lower_op_kind(op, a, fresh)?;
-    built.into_iter().map(|o| state_shape_and_dtype(o, a)).collect()
+    built
+        .into_iter()
+        .map(|o| state_shape_and_dtype(o, a))
+        .collect()
 }
 
 /// ⛔⛔⛔ THE ELEMENT DTYPE AND THE SHAPE ARE **ATTRIBUTES** IN THEIR CONVENTION, NOT ONLY RESULT
@@ -695,12 +729,7 @@ fn state_shape_and_dtype<'a>(mut o: Operation<'a>, a: &'a Arena) -> Result<Opera
     Ok(o)
 }
 
-fn lower_op_kind<'a>(
-    op: &Op,
-    a: &'a Arena,
-    fresh: &mut Fresh,
-) -> Result<Vec<Operation<'a>>> {
-
+fn lower_op_kind<'a>(op: &Op, a: &'a Arena, fresh: &mut Fresh) -> Result<Vec<Operation<'a>>> {
     // MULTI-RESULT OPS. Their `Operation.result` is a single `Option<Ssa>`, but the type
     // is not therefore single-result: `AttrKey::ResultNames` and `AttrKey::NumResults`
     // exist for exactly this, and an `scf.for` has one result per loop-carried value (five
@@ -744,7 +773,10 @@ fn lower_op_kind<'a>(
     // A reshape's target shape, standing in for the reassociation their `Attr` cannot nest.
     // Emitted from the RESULT TYPE rather than from our attribute, so it cannot disagree
     // with the type the op actually produces.
-    if matches!(op.kind, OpKind::TensorExpandShape | OpKind::TensorCollapseShape) {
+    if matches!(
+        op.kind,
+        OpKind::TensorExpandShape | OpKind::TensorCollapseShape
+    ) {
         let dims = op
             .result_types
             .first()
@@ -756,7 +788,11 @@ fn lower_op_kind<'a>(
                     op.kind.spelling()
                 ))
             })?;
-        built = built.with_attr(a, KAttrKey::TargetShape, KAttr::IntList(a.ints(dims.to_vec())));
+        built = built.with_attr(
+            a,
+            KAttrKey::TargetShape,
+            KAttr::IntList(a.ints(dims.to_vec())),
+        );
     }
 
     if op.results.len() > 1 {
@@ -779,12 +815,10 @@ fn lower_op_kind<'a>(
 /// `scf.for`'s induction variable and carried values are REGION ARGUMENTS in our IR and
 /// ATTRIBUTES in theirs (`ir.rs:173`: a region is a bare op list, with no block
 /// arguments). This lifts them, which is the whole of that structural difference.
-fn lift_region_args<'a>(
-    op: &Op,
-    mut built: Operation<'a>,
-    a: &'a Arena,
-) -> Result<Operation<'a>> {
-    let Some(region) = op.regions.first() else { return Ok(built) };
+fn lift_region_args<'a>(op: &Op, mut built: Operation<'a>, a: &'a Arena) -> Result<Operation<'a>> {
+    let Some(region) = op.regions.first() else {
+        return Ok(built);
+    };
     if region.args.is_empty() {
         return Ok(built);
     }
@@ -816,11 +850,7 @@ fn lower_regions<'a>(
 }
 
 /// A flat op list, with the corelet plan dropped.
-fn lower_block<'a>(
-    ops: &[Op],
-    a: &'a Arena,
-    fresh: &mut Fresh,
-) -> Result<&'a [Operation<'a>]> {
+fn lower_block<'a>(ops: &[Op], a: &'a Arena, fresh: &mut Fresh) -> Result<&'a [Operation<'a>]> {
     let mut out: Vec<Operation<'a>> = Vec::new();
     for op in ops {
         if matches!(op.kind, OpKind::KtdfCoreletPlan | OpKind::KtdfCorelet) {
@@ -835,7 +865,9 @@ fn lower_block<'a>(
 /// none -- which is what distinguishes a reduction from a broadcast or an elementwise map,
 /// both of which are all-`parallel`.
 fn reduced_axes(op: &Op) -> Option<Vec<i64>> {
-    let Some(Attr::StrList(iters)) = op.attr(&AttrKey::IteratorTypes) else { return None };
+    let Some(Attr::StrList(iters)) = op.attr(&AttrKey::IteratorTypes) else {
+        return None;
+    };
     let axes: Vec<i64> = iters
         .iter()
         .enumerate()
@@ -892,9 +924,9 @@ fn generic_as_broadcast<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>>
              read off the input's map, and there is nothing else to read them from",
         ));
     };
-    let input_map = maps.first().ok_or_else(|| {
-        refuse("a broadcast linalg.generic whose `indexing_maps` list is empty")
-    })?;
+    let input_map = maps
+        .first()
+        .ok_or_else(|| refuse("a broadcast linalg.generic whose `indexing_maps` list is empty"))?;
     let parsed = affine_map(input_map, a)?;
 
     let mut used = vec![false; result_rank];
@@ -905,7 +937,10 @@ fn generic_as_broadcast<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>>
             }
         }
     }
-    let dims: Vec<i64> = (0..result_rank).filter(|i| !used[*i]).map(|i| i as i64).collect();
+    let dims: Vec<i64> = (0..result_rank)
+        .filter(|i| !used[*i])
+        .map(|i| i as i64)
+        .collect();
     if dims.is_empty() {
         return Err(refuse(format!(
             "a yield-only linalg.generic whose input map `{input_map}` already indexes every \
@@ -924,7 +959,11 @@ fn generic_as_broadcast<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>>
     if let Some(t) = op.result_types.first() {
         built.result_type = Some(irtype(t, a)?);
     }
-    Ok(vec![built.with_attr(a, KAttrKey::Dimensions, KAttr::IntList(a.ints(dims)))])
+    Ok(vec![built.with_attr(
+        a,
+        KAttrKey::Dimensions,
+        KAttr::IntList(a.ints(dims)),
+    )])
 }
 
 /// ⭐ THE GATHER: `ktdp.construct_indirect_access_tile`, RESTATED IN THE CONSUMER'S VOCABULARY.
@@ -1029,7 +1068,11 @@ fn indirect_access_tile<'a>(op: &Op, a: &'a Arena) -> Result<Operation<'a>> {
         // and as the enumeration position (`pt[var_index]`), which conflates the two whenever a
         // direct dim carries an offset -- and every direct dim this pass emits does (`c_y + d_K`).
         // `direct_sub` states the sum instead, so the offset cannot be lost.
-        k_kinds.push(if is_indirect(kind) { "indirect" } else { "direct_sub" });
+        k_kinds.push(if is_indirect(kind) {
+            "indirect"
+        } else {
+            "direct_sub"
+        });
         // The view index for the indirect dim; ignored for `direct_sub`, and 0 rather than absent
         // because `dim_data` is read as a list parallel to `dim_kinds`.
         k_data.push(0);
@@ -1095,7 +1138,9 @@ fn rebase_subscript<'a>(
         .and_then(|s| s.strip_suffix('>'))
         .unwrap_or(text.trim());
     let (dims, results) = body.split_once("->").ok_or_else(|| {
-        refuse(format!("the indirect tile's subscript map for dim {d}, `{text}`, has no `->`"))
+        refuse(format!(
+            "the indirect tile's subscript map for dim {d}, `{text}`, has no `->`"
+        ))
     })?;
     let num_dims = dims
         .trim()
@@ -1119,7 +1164,12 @@ fn rebase_subscript<'a>(
     }
 
     let mut exprs = Vec::new();
-    for term in results.trim().trim_start_matches('(').trim_end_matches(')').split(',') {
+    for term in results
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+    {
         let term = term.trim();
         if term.is_empty() {
             continue;
@@ -1154,7 +1204,11 @@ fn rebase_subscript<'a>(
             "the indirect tile's subscript map for dim {d}, `{text}`, states no subscript at all"
         )));
     }
-    Ok(KMap { num_dims: rank, num_syms: n_cap, exprs: a.exprs(exprs) })
+    Ok(KMap {
+        num_dims: rank,
+        num_syms: n_cap,
+        exprs: a.exprs(exprs),
+    })
 }
 
 /// A reduction-shaped `linalg.generic` as their `linalg.reduce`.
@@ -1182,7 +1236,11 @@ fn generic_as_reduce<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>> {
     let region = op.regions.first().ok_or_else(|| {
         refuse("a reduction linalg.generic with no body cannot name its combiner")
     })?;
-    let body: Vec<&Op> = region.ops.iter().filter(|o| o.kind != OpKind::LinalgYield).collect();
+    let body: Vec<&Op> = region
+        .ops
+        .iter()
+        .filter(|o| o.kind != OpKind::LinalgYield)
+        .collect();
     if body.len() != 1 {
         return Err(refuse(format!(
             "a reduction linalg.generic's body must be exactly one combining op for \
@@ -1218,11 +1276,7 @@ fn generic_as_reduce<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>> {
 /// `ln2` constant, a splat of it when `x` is a tensor, the multiply, then `exp`. Their
 /// `TensorSplat` is the constant-splat form their own walker mints a caller-filled buffer
 /// for, so this is the shape it expects rather than a novel one.
-fn exp2_as_exp<'a>(
-    op: &Op,
-    a: &'a Arena,
-    fresh: &mut Fresh,
-) -> Result<Vec<Operation<'a>>> {
+fn exp2_as_exp<'a>(op: &Op, a: &'a Arena, fresh: &mut Fresh) -> Result<Vec<Operation<'a>>> {
     let result = op
         .results
         .first()
@@ -1318,9 +1372,11 @@ fn views_ptr_somewhere(ops: &[Op], ptr: Ssa) -> bool {
 /// parameter whose width nothing states is a REFUSAL.
 fn every_parameter_states_its_width(m: &Module, region: &Region, grid: usize) -> Result<()> {
     for (i, (ptr, _)) in region.args.iter().enumerate() {
-        if region.ops.iter().any(|o| {
-            o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr)
-        }) {
+        if region
+            .ops
+            .iter()
+            .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))
+        {
             continue;
         }
         // `Module::hints` is diagnostic-only and no pass may branch on it; this is a

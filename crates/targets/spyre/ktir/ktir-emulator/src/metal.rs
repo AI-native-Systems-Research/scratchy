@@ -956,7 +956,16 @@ pub fn run_matmul_loop_gpu(
         //     N-tile (rows [n_off, n_off+n) — a contiguous block, not a gather).
         //   * plain: the [k,n] weight (contiguous) or a strided column slice.
         let ub = if info.transpose_b {
-            resolve_gemm_bt_operand(info.b_root, n, k, info.n_off, info.b_dtype, ctx, engine, want_b_f16)?
+            resolve_gemm_bt_operand(
+                info.b_root,
+                n,
+                k,
+                info.n_off,
+                info.b_dtype,
+                ctx,
+                engine,
+                want_b_f16,
+            )?
         } else if info.n_off == 0 && info.b_stride == info.n {
             resolve_gemm_operand_unified(info.b_root, k, n, ctx, engine, want_b_f16)?
         } else {

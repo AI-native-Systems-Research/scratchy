@@ -48,7 +48,11 @@ use crate::ttir::{FloatKind, Signedness, Type};
 pub fn mangle_type(t: &Type) -> String {
     match t {
         Type::Int(bits, sign) => {
-            let prefix = if *sign == Signedness::Unsigned { 'u' } else { 'i' };
+            let prefix = if *sign == Signedness::Unsigned {
+                'u'
+            } else {
+                'i'
+            };
             format!("{prefix}{bits}")
         }
         // `str(dtype)` for a float is Triton's dtype NAME (`fp16`), not MLIR's (`f16`).
@@ -203,10 +207,7 @@ mod tests {
         assert_eq!(mangle_type(&Type::f16()), "fp16");
         assert_eq!(mangle_type(&Type::f32()), "fp32");
         assert_eq!(mangle_type(&Type::i32()), "i32");
-        assert_eq!(
-            mangle_type(&Type::Int(8, Signedness::Unsigned)),
-            "u8"
-        );
+        assert_eq!(mangle_type(&Type::Int(8, Signedness::Unsigned)), "u8");
         assert_eq!(mangle_type(&Type::ptr(Type::f16())), "Pfp16");
         assert_eq!(
             mangle_type(&Type::Tensor(vec![64, 64], Rc::new(Type::f16()))),
@@ -221,15 +222,14 @@ mod tests {
         let zeros_128 = mangle_fn(
             "triton.language.standard.zeros",
             &[
-                mangle_arg(
-                    &Val::Seq(vec![Val::Int(64), Val::Int(128)]),
-                    &no_types,
-                )
-                .unwrap(),
+                mangle_arg(&Val::Seq(vec![Val::Int(64), Val::Int(128)]), &no_types).unwrap(),
                 mangle_arg(&Val::Dtype(Type::f16()), &no_types).unwrap(),
             ],
         );
-        assert_eq!(zeros_128, "triton.language.standard.zeros__Tc64_c128T_cfp16");
+        assert_eq!(
+            zeros_128,
+            "triton.language.standard.zeros__Tc64_c128T_cfp16"
+        );
 
         let zeros_64 = mangle_fn(
             "triton.language.standard.zeros",
@@ -260,10 +260,7 @@ mod tests {
             "triton.language.standard._elementwise_max",
             &[mangle_type(&Type::f32()), mangle_type(&Type::f32())],
         );
-        assert_eq!(
-            emax,
-            "triton.language.standard._elementwise_max__fp32_fp32"
-        );
+        assert_eq!(emax, "triton.language.standard._elementwise_max__fp32_fp32");
     }
 
     #[test]

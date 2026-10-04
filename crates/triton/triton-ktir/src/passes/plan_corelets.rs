@@ -110,7 +110,11 @@ pub fn run(module: &mut Module) -> Result<()> {
 /// skip them so a second run does not insert a duplicate plan.
 fn already_planned(module: &Module, path: &OpPath) -> bool {
     walk::at(module, path)
-        .map(|l| l.ops_deep().iter().any(|o| o.kind == OpKind::KtdfCoreletPlan))
+        .map(|l| {
+            l.ops_deep()
+                .iter()
+                .any(|o| o.kind == OpKind::KtdfCoreletPlan)
+        })
         .unwrap_or(false)
 }
 
@@ -243,7 +247,10 @@ fn plan_loop(module: &mut Module, path: &OpPath) -> Result<()> {
     if let Some(wd) = work_division {
         plan.set_attr(AttrKey::WorkDivision, Attr::IntList(wd));
     }
-    plan.regions.push(Region { args: vec![], ops: corelets });
+    plan.regions.push(Region {
+        args: vec![],
+        ops: corelets,
+    });
 
     // Insert the plan at the TOP of the loop body so it precedes the compute it
     // describes.
@@ -396,7 +403,9 @@ fn recover_tile_sticks(loopp: &Op) -> Option<i64> {
         if op.kind != OpKind::KtdpConstructAccessTile {
             continue;
         }
-        let Some(dims) = op.result_type().and_then(|t| t.dims()) else { continue };
+        let Some(dims) = op.result_type().and_then(|t| t.dims()) else {
+            continue;
+        };
         if dims.is_empty() || dims.contains(&DYNAMIC) {
             continue;
         }
@@ -420,7 +429,9 @@ fn recover_matmul_n(loopp: &Op) -> Option<i64> {
         if op.kind != OpKind::LinalgMatmul || op.results.len() != 1 {
             continue;
         }
-        let Some(dims) = op.result_type().and_then(|t| t.dims()) else { continue };
+        let Some(dims) = op.result_type().and_then(|t| t.dims()) else {
+            continue;
+        };
         if dims.is_empty() || dims.contains(&DYNAMIC) {
             continue;
         }
@@ -492,30 +503,30 @@ fn recover_matmul_shape(module: &Module, loopp: &Op) -> Option<[i64; 3]> {
         }
         let a = full_shape(op.operands[0])?; // [M, K] from A's view
         let b = full_shape(op.operands[1])?; // B's view, in the order the op's maps state
-        // ⛔⛔⛔ WHICH AXIS OF B IS `N` IS STATED BY THE OP, NOT DEDUCED FROM WHICH EXTENT FITS.
-        //
-        // This read was `let (m, k, n) = (a.0, a.1, b.1)` with a `a.1 == b.0` sanity check, i.e. it
-        // assumed B's view is `[K, N]` — `linalg.matmul`'s default indexing. That was true until
-        // `dot_to_linalg` began spending a transposed dot weight in the `indexing_maps` instead of
-        // leaving a `tt.trans` for the access tile: the weight's view is then the `[N, K]` the kernel
-        // declares, `a.1 == b.0` is `128 == 256`, and this function fell off the end and returned
-        // `None`.
-        //
-        // ⛔ AND THE CONSEQUENCE WAS SILENT, WHICH IS WHY THE READ IS BEING FIXED RATHER THAN THE
-        // CHECK RELAXED. The caller is `if let Some(...) = recover_matmul_shape(...)`, so `None`
-        // simply OMITS `work_division` — an attribute this pass's own comment four lines up calls
-        // LOAD-BEARING ("the multicore emitter DERIVES its 32-core form from this rather than
-        // re-deriving from the memory views"). MEASURED against IBM's C++ goldens: all three
-        // `swiglu_mlp_*` configurations lost the attribute entirely, reported by
-        // `tests/pure_rust_ktir.rs` as `ktdf.corelet_plan: attributes differs / golden:
-        // {pattern=\"independent_subtile\", work_division=array<i64: 64, 256, 128, ...>} / ours:
-        // {pattern=\"independent_subtile\"}`. Reading the orientation restores it BYTE-IDENTICALLY on
-        // all three — `[64, 256, 128, 64, 4, 8, 32, 16, 8, 1]` for `small` and `tiled_k`,
-        // `[64, 12800, 4096, 64, 16, 2, 32, 16, 4, 12]` for `granite` — which is the check that this
-        // reads the same `N` the C++ did and not merely a different number that parses.
-        //
-        // The orientation predicate lives beside the WRITER (`dot_to_linalg::weight_is_n_by_k` over
-        // `TRANSPOSED_B_MAPS`) so the maps are spelled once in the tree.
+                                             // ⛔⛔⛔ WHICH AXIS OF B IS `N` IS STATED BY THE OP, NOT DEDUCED FROM WHICH EXTENT FITS.
+                                             //
+                                             // This read was `let (m, k, n) = (a.0, a.1, b.1)` with a `a.1 == b.0` sanity check, i.e. it
+                                             // assumed B's view is `[K, N]` — `linalg.matmul`'s default indexing. That was true until
+                                             // `dot_to_linalg` began spending a transposed dot weight in the `indexing_maps` instead of
+                                             // leaving a `tt.trans` for the access tile: the weight's view is then the `[N, K]` the kernel
+                                             // declares, `a.1 == b.0` is `128 == 256`, and this function fell off the end and returned
+                                             // `None`.
+                                             //
+                                             // ⛔ AND THE CONSEQUENCE WAS SILENT, WHICH IS WHY THE READ IS BEING FIXED RATHER THAN THE
+                                             // CHECK RELAXED. The caller is `if let Some(...) = recover_matmul_shape(...)`, so `None`
+                                             // simply OMITS `work_division` — an attribute this pass's own comment four lines up calls
+                                             // LOAD-BEARING ("the multicore emitter DERIVES its 32-core form from this rather than
+                                             // re-deriving from the memory views"). MEASURED against IBM's C++ goldens: all three
+                                             // `swiglu_mlp_*` configurations lost the attribute entirely, reported by
+                                             // `tests/pure_rust_ktir.rs` as `ktdf.corelet_plan: attributes differs / golden:
+                                             // {pattern=\"independent_subtile\", work_division=array<i64: 64, 256, 128, ...>} / ours:
+                                             // {pattern=\"independent_subtile\"}`. Reading the orientation restores it BYTE-IDENTICALLY on
+                                             // all three — `[64, 256, 128, 64, 4, 8, 32, 16, 8, 1]` for `small` and `tiled_k`,
+                                             // `[64, 12800, 4096, 64, 16, 2, 32, 16, 4, 12]` for `granite` — which is the check that this
+                                             // reads the same `N` the C++ did and not merely a different number that parses.
+                                             //
+                                             // The orientation predicate lives beside the WRITER (`dot_to_linalg::weight_is_n_by_k` over
+                                             // `TRANSPOSED_B_MAPS`) so the maps are spelled once in the tree.
         let (k_of_b, n) = if crate::passes::dot_to_linalg::weight_is_n_by_k(op) {
             (b.1, b.0) // W as (n, k)
         } else {
@@ -540,7 +551,11 @@ fn recover_matmul_shape(module: &Module, loopp: &Op) -> Option<[i64; 3]> {
 fn matmul_work_division(m: i64, n: i64, k: i64) -> [i64; 10] {
     const S: i64 = 64; // f16 stick width
     const ARRAY_N_LANE_WIDTH: i64 = 32 * S; // = 2048
-    let (n_blocks, eff_n) = if n > ARRAY_N_LANE_WIDTH { (n / 1024, 1024) } else { (1, n) };
+    let (n_blocks, eff_n) = if n > ARRAY_N_LANE_WIDTH {
+        (n / 1024, 1024)
+    } else {
+        (1, n)
+    };
     let out = eff_n / S;
     let inn = ARRAY_N_LANE_WIDTH / eff_n;
     let num_cores = out * inn;
@@ -679,7 +694,10 @@ pub fn verify_plan(pattern: Pattern, corelets: &[Op]) -> Result<()> {
     if corelets.len() != NUM_CORELETS as usize {
         return Err(Refusal::new(
             "ktdf.corelet_plan",
-            format!("op expects exactly {NUM_CORELETS} ktdf.corelet ops, got {}", corelets.len()),
+            format!(
+                "op expects exactly {NUM_CORELETS} ktdf.corelet ops, got {}",
+                corelets.len()
+            ),
         ));
     }
     let bounds_key = match pattern {
@@ -687,18 +705,26 @@ pub fn verify_plan(pattern: Pattern, corelets: &[Op]) -> Result<()> {
         _ => AttrKey::DataBounds,
     };
     let get = |c: &Op| -> Option<Vec<i64>> {
-        c.attr(&bounds_key).and_then(|a| a.as_int_list()).map(|s| s.to_vec())
+        c.attr(&bounds_key)
+            .and_then(|a| a.as_int_list())
+            .map(|s| s.to_vec())
     };
     let (Some(a), Some(b)) = (get(&corelets[0]), get(&corelets[1])) else {
         return Err(Refusal::new(
             "ktdf.corelet_plan",
-            format!("op each ktdf.corelet must carry a 2-element {}", bounds_key.spelling()),
+            format!(
+                "op each ktdf.corelet must carry a 2-element {}",
+                bounds_key.spelling()
+            ),
         ));
     };
     if a.len() != 2 || b.len() != 2 {
         return Err(Refusal::new(
             "ktdf.corelet_plan",
-            format!("op each {} must have exactly 2 elements", bounds_key.spelling()),
+            format!(
+                "op each {} must have exactly 2 elements",
+                bounds_key.spelling()
+            ),
         ));
     }
     // Disjoint, contiguous and NON-EMPTY: each lo < hi, and one's hi == the other's
@@ -720,7 +746,9 @@ pub fn verify_plan(pattern: Pattern, corelets: &[Op]) -> Result<()> {
     }
     if pattern == Pattern::PartialCombine {
         fn role(c: &Op) -> &str {
-            c.attr(&AttrKey::Role).and_then(|x| x.as_str()).unwrap_or("")
+            c.attr(&AttrKey::Role)
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
         }
         if !(role(&corelets[0]) == ROLE_PARTIAL && role(&corelets[1]) == ROLE_COMBINE) {
             return Err(Refusal::new(
@@ -749,7 +777,10 @@ mod tests {
              (each lo < hi, one's hi == the other's lo), but got [0, 0] and [0, 1]",
             "this is the C++ verifier's message, verbatim"
         );
-        assert_eq!(e.pass, "ktdf.corelet_plan", "the VERIFIER refuses it, not the pass");
+        assert_eq!(
+            e.pass, "ktdf.corelet_plan",
+            "the VERIFIER refuses it, not the pass"
+        );
     }
 
     #[test]
@@ -797,10 +828,20 @@ module {
         // Rows = 64 from the reduce operand's leading dim -> [0,32] and [32,64].
         let cs = &plan.regions[0].ops;
         assert_eq!(cs.len(), 2);
-        assert_eq!(cs[0].attr(&AttrKey::DataBounds), Some(&Attr::IntList(vec![0, 32])));
-        assert_eq!(cs[1].attr(&AttrKey::DataBounds), Some(&Attr::IntList(vec![32, 64])));
+        assert_eq!(
+            cs[0].attr(&AttrKey::DataBounds),
+            Some(&Attr::IntList(vec![0, 32]))
+        );
+        assert_eq!(
+            cs[1].attr(&AttrKey::DataBounds),
+            Some(&Attr::IntList(vec![32, 64]))
+        );
         // And the plan is the FIRST op in the loop body.
-        let forr = m.ops_deep().into_iter().find(|o| o.kind == OpKind::ScfFor).unwrap();
+        let forr = m
+            .ops_deep()
+            .into_iter()
+            .find(|o| o.kind == OpKind::ScfFor)
+            .unwrap();
         assert_eq!(forr.regions[0].ops[0].kind, OpKind::KtdfCoreletPlan);
     }
 
@@ -861,7 +902,10 @@ module {
     #[test]
     fn the_work_division_matches_the_emitters_derivation() {
         // M7's shape, and the two branches of the N-block rule.
-        assert_eq!(matmul_work_division(64, 128, 128), [64, 128, 128, 64, 2, 16, 32, 16, 8, 1]);
+        assert_eq!(
+            matmul_work_division(64, 128, 128),
+            [64, 128, 128, 64, 2, 16, 32, 16, 8, 1]
+        );
         // N = 4096 > 2048 -> nBlocks = 4, effN = 1024, OUT = 16, IN = 2.
         assert_eq!(
             matmul_work_division(64, 4096, 128),
@@ -889,7 +933,11 @@ module {
         let mut m = parse::parse(src).unwrap();
         run(&mut m).unwrap();
         run(&mut m).unwrap();
-        let plans = m.ops_deep().iter().filter(|o| o.kind == OpKind::KtdfCoreletPlan).count();
+        let plans = m
+            .ops_deep()
+            .iter()
+            .filter(|o| o.kind == OpKind::KtdfCoreletPlan)
+            .count();
         assert_eq!(plans, 1, "a second run must not insert a duplicate plan");
     }
 }

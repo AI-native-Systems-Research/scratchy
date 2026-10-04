@@ -92,8 +92,14 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
             continue;
         }
         pid_positions.push(i);
-        let axis = op.attr(&AttrKey::Axis).and_then(|a| a.as_int()).unwrap_or(0);
-        by_axis.entry(axis).or_default().extend(op.results.iter().copied());
+        let axis = op
+            .attr(&AttrKey::Axis)
+            .and_then(|a| a.as_int())
+            .unwrap_or(0);
+        by_axis
+            .entry(axis)
+            .or_default()
+            .extend(op.results.iter().copied());
         max_axis = max_axis.max(axis);
     }
 
@@ -295,7 +301,10 @@ fn distribute_in_function(module: &mut Module, fi: usize, grid: &[i64]) -> Resul
 
     let loopp = Op::new(OpKind::ScfFor)
         .with_operands([core_id, num_blocks, num_cores])
-        .with_region(Region { args: vec![(iv, IrType::Index)], ops: loop_body });
+        .with_region(Region {
+            args: vec![(iv, IrType::Index)],
+            ops: loop_body,
+        });
 
     // The landmark and the two bounds go at the anchor, then the loop.
     keep.insert(anchor, landmark);
@@ -365,7 +374,9 @@ pub fn work_loops(module: &Module) -> Vec<OpPath> {
     walk::paths(module)
         .into_iter()
         .filter(|p| {
-            walk::at(module, p).map(|o| is_per_core_work_loop(module, o)).unwrap_or(false)
+            walk::at(module, p)
+                .map(|o| is_per_core_work_loop(module, o))
+                .unwrap_or(false)
         })
         .collect()
 }
@@ -397,31 +408,41 @@ module {
         assert_eq!(
             top,
             vec![
-                "arith.constant",            // %c4, defined before the anchor: stays out
-                "ktdp.get_compute_tile_id",  // the landmark
-                "arith.constant",            // num_cores = 32
-                "arith.constant",            // num_blocks = 2*4 = 8
+                "arith.constant",           // %c4, defined before the anchor: stays out
+                "ktdp.get_compute_tile_id", // the landmark
+                "arith.constant",           // num_cores = 32
+                "arith.constant",           // num_blocks = 2*4 = 8
                 "scf.for",
                 "tt.return",
             ]
         );
         // ub = 8 (the product), step = 32.
         let forr = &f.regions[0].ops[4];
-        assert_eq!(super::super::dot_to_linalg::const_int(&m, forr.operands[1]), Some(8));
-        assert_eq!(super::super::dot_to_linalg::const_int(&m, forr.operands[2]), Some(32));
+        assert_eq!(
+            super::super::dot_to_linalg::const_int(&m, forr.operands[1]),
+            Some(8)
+        );
+        assert_eq!(
+            super::super::dot_to_linalg::const_int(&m, forr.operands[2]),
+            Some(32)
+        );
 
         // Axis 0 (stride 1, not the highest) -> remui then index_cast.
         // Axis 1 (stride 2, IS the highest) -> divui then index_cast, NO remui.
-        let body: Vec<&str> = forr.regions[0].ops.iter().map(|o| o.kind.spelling()).collect();
+        let body: Vec<&str> = forr.regions[0]
+            .ops
+            .iter()
+            .map(|o| o.kind.spelling())
+            .collect();
         assert_eq!(
             body,
             vec![
-                "arith.constant",     // extent 2 for the axis-0 modulo
+                "arith.constant", // extent 2 for the axis-0 modulo
                 "arith.remui",
                 "arith.index_cast",
-                "arith.constant",     // stride 2 for the axis-1 divide
+                "arith.constant", // stride 2 for the axis-1 divide
                 "arith.divui",
-                "arith.index_cast",   // and NO remui on the highest axis
+                "arith.index_cast", // and NO remui on the highest axis
                 "arith.divsi",
                 "arith.muli",
             ]
@@ -449,7 +470,10 @@ module {
     fn a_multi_axis_kernel_without_a_grid_is_refused_by_name() {
         let mut m = parse::parse(TWO_AXIS).unwrap();
         let e = run(&mut m, &[]).unwrap_err();
-        assert!(e.message.contains("cannot be inferred from the IR"), "got {e}");
+        assert!(
+            e.message.contains("cannot be inferred from the IR"),
+            "got {e}"
+        );
         assert!(e.message.contains("Refusing to guess"), "got {e}");
     }
 
@@ -457,7 +481,10 @@ module {
     fn a_grid_too_short_for_the_axes_read_is_refused_by_name() {
         let mut m = parse::parse(TWO_AXIS).unwrap();
         let e = run(&mut m, &[2]).unwrap_err();
-        assert!(e.message.contains("supply an extent for every axis used"), "got {e}");
+        assert!(
+            e.message.contains("supply an extent for every axis used"),
+            "got {e}"
+        );
     }
 
     #[test]
@@ -474,8 +501,16 @@ module {
 ";
         let mut m = parse::parse(src).unwrap();
         run(&mut m, &[16]).unwrap();
-        let forr = m.ops_deep().into_iter().find(|o| o.kind == OpKind::ScfFor).unwrap();
-        let body: Vec<&str> = forr.regions[0].ops.iter().map(|o| o.kind.spelling()).collect();
+        let forr = m
+            .ops_deep()
+            .into_iter()
+            .find(|o| o.kind == OpKind::ScfFor)
+            .unwrap();
+        let body: Vec<&str> = forr.regions[0]
+            .ops
+            .iter()
+            .map(|o| o.kind.spelling())
+            .collect();
         assert_eq!(
             body,
             vec!["arith.index_cast", "arith.muli"],

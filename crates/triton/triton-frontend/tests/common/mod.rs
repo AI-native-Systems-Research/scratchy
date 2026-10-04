@@ -109,7 +109,13 @@ pub fn vector_add() -> Case {
 }
 
 pub fn mul() -> Case {
-    build("mul", "mul", "mul_kernel", ELEMENTWISE, &[("BLOCK", Val::Int(64))])
+    build(
+        "mul",
+        "mul",
+        "mul_kernel",
+        ELEMENTWISE,
+        &[("BLOCK", Val::Int(64))],
+    )
 }
 
 pub fn bias_add_f32() -> Case {
@@ -281,8 +287,20 @@ pub fn decoder_layer() -> Case {
         "decoder_layer",
         "decoder_layer_fwd",
         &[
-            "desc_x", "desc_o", "desc_n1", "desc_wq", "desc_wk", "desc_wv", "desc_wo",
-            "desc_mask", "desc_cos", "desc_sin", "desc_n2", "desc_wg", "desc_wu", "desc_wd",
+            "desc_x",
+            "desc_o",
+            "desc_n1",
+            "desc_wq",
+            "desc_wk",
+            "desc_wv",
+            "desc_wo",
+            "desc_mask",
+            "desc_cos",
+            "desc_sin",
+            "desc_n2",
+            "desc_wg",
+            "desc_wu",
+            "desc_wd",
         ],
     )
 }
@@ -294,10 +312,29 @@ pub fn decoder_two_layers() -> Case {
         "decoder_two_layers",
         "decoder_two_layers_fwd",
         &[
-            "desc_x", "desc_o", "desc_n1a", "desc_wqa", "desc_wka", "desc_wva", "desc_woa",
-            "desc_n2a", "desc_wga", "desc_wua", "desc_wda", "desc_n1b", "desc_wqb",
-            "desc_wkb", "desc_wvb", "desc_wob", "desc_n2b", "desc_wgb", "desc_wub",
-            "desc_wdb", "desc_mask", "desc_cos", "desc_sin",
+            "desc_x",
+            "desc_o",
+            "desc_n1a",
+            "desc_wqa",
+            "desc_wka",
+            "desc_wva",
+            "desc_woa",
+            "desc_n2a",
+            "desc_wga",
+            "desc_wua",
+            "desc_wda",
+            "desc_n1b",
+            "desc_wqb",
+            "desc_wkb",
+            "desc_wvb",
+            "desc_wob",
+            "desc_n2b",
+            "desc_wgb",
+            "desc_wub",
+            "desc_wdb",
+            "desc_mask",
+            "desc_cos",
+            "desc_sin",
         ],
     )
 }

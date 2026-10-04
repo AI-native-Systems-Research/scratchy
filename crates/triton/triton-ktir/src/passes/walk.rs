@@ -219,7 +219,10 @@ mod tests {
         let a = m.fresh();
         let b = m.fresh();
         let inner = Op::new(OpKind::ArithAddf).with_result(b, IrType::Scalar(DType::F16));
-        let forr = Op::new(OpKind::ScfFor).with_region(Region { args: vec![], ops: vec![inner] });
+        let forr = Op::new(OpKind::ScfFor).with_region(Region {
+            args: vec![],
+            ops: vec![inner],
+        });
         let func = Op::new(OpKind::TtFunc).with_region(Region {
             args: vec![],
             ops: vec![
@@ -236,10 +239,19 @@ mod tests {
     fn paths_reach_into_nested_regions_and_resolve_back() {
         let m = nested();
         let ps = paths(&m);
-        let kinds: Vec<&str> = ps.iter().map(|p| at(&m, p).unwrap().kind.spelling()).collect();
+        let kinds: Vec<&str> = ps
+            .iter()
+            .map(|p| at(&m, p).unwrap().kind.spelling())
+            .collect();
         assert_eq!(
             kinds,
-            vec!["tt.func", "arith.constant", "scf.for", "arith.addf", "tt.return"],
+            vec![
+                "tt.func",
+                "arith.constant",
+                "scf.for",
+                "arith.addf",
+                "tt.return"
+            ],
             "program order, regions included"
         );
     }
@@ -263,7 +275,10 @@ mod tests {
         let mut m = Module::new();
         let outer = m.fresh();
         let inner = Op::new(OpKind::ArithAddf).with_operands([outer]);
-        let forr = Op::new(OpKind::ScfFor).with_region(Region { args: vec![], ops: vec![inner] });
+        let forr = Op::new(OpKind::ScfFor).with_region(Region {
+            args: vec![],
+            ops: vec![inner],
+        });
         m.ops.push(Op::new(OpKind::TtFunc).with_region(Region {
             args: vec![],
             ops: vec![

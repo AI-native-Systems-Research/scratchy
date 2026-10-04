@@ -74,21 +74,57 @@ fn the_gap_counts_per_fixture_are_what_they_are() {
     let expected: &[(&str, &str, usize)] = &[
         ("attention_flash_noncausal", "gap1-grid-loop-not-folded", 1),
         ("attention_flash_noncausal", "gap1-not-walked", 13),
-        ("attention_flash_noncausal", "gap1-regions-have-no-block-arguments", 4),
+        (
+            "attention_flash_noncausal",
+            "gap1-regions-have-no-block-arguments",
+            4,
+        ),
         ("attention_flash_noncausal", "gap1-tt-not-in-vocabulary", 12),
-        ("attention_flash_noncausal", "gap2-reduce-combiner-in-a-region", 2),
+        (
+            "attention_flash_noncausal",
+            "gap2-reduce-combiner-in-a-region",
+            2,
+        ),
         ("attention_flash_noncausal", "gap3-loop-carried-count", 1),
-        ("attention_flash_noncausal_unitscale", "gap1-grid-loop-not-folded", 1),
+        (
+            "attention_flash_noncausal_unitscale",
+            "gap1-grid-loop-not-folded",
+            1,
+        ),
         ("attention_flash_noncausal_unitscale", "gap1-not-walked", 13),
-        ("attention_flash_noncausal_unitscale", "gap1-regions-have-no-block-arguments", 4),
-        ("attention_flash_noncausal_unitscale", "gap1-tt-not-in-vocabulary", 12),
-        ("attention_flash_noncausal_unitscale", "gap2-reduce-combiner-in-a-region", 2),
-        ("attention_flash_noncausal_unitscale", "gap3-loop-carried-count", 1),
+        (
+            "attention_flash_noncausal_unitscale",
+            "gap1-regions-have-no-block-arguments",
+            4,
+        ),
+        (
+            "attention_flash_noncausal_unitscale",
+            "gap1-tt-not-in-vocabulary",
+            12,
+        ),
+        (
+            "attention_flash_noncausal_unitscale",
+            "gap2-reduce-combiner-in-a-region",
+            2,
+        ),
+        (
+            "attention_flash_noncausal_unitscale",
+            "gap3-loop-carried-count",
+            1,
+        ),
         ("attention_flash_causal", "gap1-grid-loop-not-folded", 1),
         ("attention_flash_causal", "gap1-not-walked", 16),
-        ("attention_flash_causal", "gap1-regions-have-no-block-arguments", 7),
+        (
+            "attention_flash_causal",
+            "gap1-regions-have-no-block-arguments",
+            7,
+        ),
         ("attention_flash_causal", "gap1-tt-not-in-vocabulary", 20),
-        ("attention_flash_causal", "gap2-reduce-combiner-in-a-region", 4),
+        (
+            "attention_flash_causal",
+            "gap2-reduce-combiner-in-a-region",
+            4,
+        ),
         ("attention_flash_causal", "gap3-loop-carried-count", 2),
         // THE POSITION-DEPENDENT TRIP COUNT, and the C++ refuses the same loop.
         ("attention_flash_causal", "gap3-non-constant-bound", 3),
@@ -120,8 +156,10 @@ fn the_gap_counts_per_fixture_are_what_they_are() {
         }
     }
     if !wrong.is_empty() {
-        let all: Vec<String> =
-            actual.iter().map(|(c, g, n)| format!("        (\"{c}\", \"{g}\", {n}),")).collect();
+        let all: Vec<String> = actual
+            .iter()
+            .map(|(c, g, n)| format!("        (\"{c}\", \"{g}\", {n}),"))
+            .collect();
         panic!(
             "the consumer gaps changed. If a pass closed one, that is PROGRESS -- paste \
              the new table in with the commit:\n{}\n\n    THE ACTUAL TABLE:\n{}",
@@ -174,8 +212,10 @@ fn swiglu_clears_the_reduce_loop_and_transpose_gaps_outright() {
 fn the_causal_off_band_trip_count_is_refused_by_the_cpp_too() {
     let m = ours("attention_flash_causal");
     let found = consumer::check(&m);
-    let nonconst: Vec<&consumer::Incompatibility> =
-        found.iter().filter(|i| i.gap == "gap3-non-constant-bound").collect();
+    let nonconst: Vec<&consumer::Incompatibility> = found
+        .iter()
+        .filter(|i| i.gap == "gap3-non-constant-bound")
+        .collect();
     assert!(
         !nonconst.is_empty(),
         "the position-dependent trip count must be reported"
@@ -208,7 +248,10 @@ fn after_the_conversion_gap_one_closes_and_gap_six_is_the_blocker() {
 
         let gaps = consumer::summary(&m);
         let get = |name: &str| {
-            gaps.iter().find(|(x, _)| x == name).map(|(_, n)| *n).unwrap_or(0)
+            gaps.iter()
+                .find(|(x, _)| x == name)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
         };
         // GAP 1 IS CLOSED: nothing Triton, and no region block arguments outside the
         // function (their regions are bare op lists).
@@ -217,7 +260,11 @@ fn after_the_conversion_gap_one_closes_and_gap_six_is_the_blocker() {
             0,
             "{config}: ToSchedulerKTIR must leave nothing unrepresentable: {gaps:?}"
         );
-        assert_eq!(get("gap1-grid-loop-not-folded"), 0, "{config}: the grid loop is folded");
+        assert_eq!(
+            get("gap1-grid-loop-not-folded"),
+            0,
+            "{config}: the grid loop is folded"
+        );
         // AND GAP 6 IS WHAT IS LEFT -- for the fixtures that HAVE a reduction or a
         // broadcast, which is the three attention configurations. swiglu has neither, so
         // it emits no `linalg.generic` at all and clears gap 6 outright: after this pass

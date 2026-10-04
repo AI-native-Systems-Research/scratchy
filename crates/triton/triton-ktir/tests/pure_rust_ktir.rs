@@ -47,8 +47,8 @@ use triton_ktir::ir::{Attr, AttrKey, DType, IrType, Module, Op, OpKind, Ssa};
 // THE SAME LITERAL THE WRITER USES. `dot_to_linalg` sets these maps and this test recognises them;
 // spelling them twice is how a reader and a writer drift apart silently.
 use triton_ktir::passes::dot_to_linalg::TRANSPOSED_B_MAPS;
-use triton_ktir::text::diff::Difference;
 use triton_ktir::text;
+use triton_ktir::text::diff::Difference;
 
 fn root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -332,7 +332,12 @@ fn cases() -> Vec<Case> {
         Case {
             name: "swiglu_mlp_small",
             fixture: "swiglu_mlp",
-            spec: spec("swiglu_mlp", "swiglu_mlp_fwd", swiglu, &swiglu_ce(128, 256, 128)),
+            spec: spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                swiglu,
+                &swiglu_ce(128, 256, 128),
+            ),
             grid: vec![1],
             target: Target::spyre(),
             // ⛔ THE TWO PROJECTION WEIGHTS ARE TRANSPOSED DOT OPERANDS. Same one decision as
@@ -359,7 +364,12 @@ fn cases() -> Vec<Case> {
         Case {
             name: "swiglu_mlp_tiled_k",
             fixture: "swiglu_mlp",
-            spec: spec("swiglu_mlp", "swiglu_mlp_fwd", swiglu, &swiglu_ce(128, 256, 64)),
+            spec: spec(
+                "swiglu_mlp",
+                "swiglu_mlp_fwd",
+                swiglu,
+                &swiglu_ce(128, 256, 64),
+            ),
             grid: vec![1],
             target: Target::spyre(),
             // ⛔ As `swiglu_mlp_small`, except that the K-tiled inner loop states the weight
@@ -373,7 +383,11 @@ fn cases() -> Vec<Case> {
             spec: spec(
                 "embedding",
                 "embedding_fwd",
-                &[("desc_ids", "*i32"), ("desc_table", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("desc_ids", "*i32"),
+                    ("desc_table", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
                 &[
                     ("N_TOK", Val::Int(256)),
                     ("V", Val::Int(49159)),
@@ -396,7 +410,11 @@ fn cases() -> Vec<Case> {
             spec: spec(
                 "embedding",
                 "embedding_fwd",
-                &[("desc_ids", "*i32"), ("desc_table", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("desc_ids", "*i32"),
+                    ("desc_table", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
                 &[
                     ("N_TOK", Val::Int(256)),
                     ("V", Val::Int(49159)),
@@ -415,7 +433,11 @@ fn cases() -> Vec<Case> {
             spec: spec(
                 "rmsnorm",
                 "rmsnorm_fwd",
-                &[("desc_x", "*fp16"), ("desc_w", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("desc_x", "*fp16"),
+                    ("desc_w", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
                 &[
                     ("M", Val::Int(64)),
                     ("D_MODEL", Val::Int(4096)),
@@ -481,8 +503,19 @@ fn cases() -> Vec<Case> {
                 "decoder_block",
                 "decoder_layer_fwd",
                 &dec_ptrs(&[
-                    "desc_x", "desc_o", "desc_n1", "desc_wq", "desc_wk", "desc_wv", "desc_wo",
-                    "desc_mask", "desc_cos", "desc_sin", "desc_n2", "desc_wg", "desc_wu",
+                    "desc_x",
+                    "desc_o",
+                    "desc_n1",
+                    "desc_wq",
+                    "desc_wk",
+                    "desc_wv",
+                    "desc_wo",
+                    "desc_mask",
+                    "desc_cos",
+                    "desc_sin",
+                    "desc_n2",
+                    "desc_wg",
+                    "desc_wu",
                     "desc_wd",
                 ]),
                 &dec_ce(),
@@ -505,10 +538,29 @@ fn cases() -> Vec<Case> {
                 "decoder_block",
                 "decoder_two_layers_fwd",
                 &dec_ptrs(&[
-                    "desc_x", "desc_o", "desc_n1a", "desc_wqa", "desc_wka", "desc_wva",
-                    "desc_woa", "desc_n2a", "desc_wga", "desc_wua", "desc_wda", "desc_n1b",
-                    "desc_wqb", "desc_wkb", "desc_wvb", "desc_wob", "desc_n2b", "desc_wgb",
-                    "desc_wub", "desc_wdb", "desc_mask", "desc_cos", "desc_sin",
+                    "desc_x",
+                    "desc_o",
+                    "desc_n1a",
+                    "desc_wqa",
+                    "desc_wka",
+                    "desc_wva",
+                    "desc_woa",
+                    "desc_n2a",
+                    "desc_wga",
+                    "desc_wua",
+                    "desc_wda",
+                    "desc_n1b",
+                    "desc_wqb",
+                    "desc_wkb",
+                    "desc_wvb",
+                    "desc_wob",
+                    "desc_n2b",
+                    "desc_wgb",
+                    "desc_wub",
+                    "desc_wdb",
+                    "desc_mask",
+                    "desc_cos",
+                    "desc_sin",
                 ]),
                 &dec_ce(),
             ),
@@ -645,7 +697,11 @@ fn fold_dead_dot_transposes(m: &mut Module) {
         return;
     }
     let dead: HashSet<Ssa> = fold.keys().copied().collect();
-    fn walk(ops: &mut Vec<Op>, fold: &std::collections::HashMap<Ssa, Ssa>, dead: &std::collections::HashSet<Ssa>) {
+    fn walk(
+        ops: &mut Vec<Op>,
+        fold: &std::collections::HashMap<Ssa, Ssa>,
+        dead: &std::collections::HashSet<Ssa>,
+    ) {
         for o in ops.iter_mut() {
             for v in o.operands.iter_mut() {
                 if let Some(src) = fold.get(v) {
@@ -712,7 +768,11 @@ fn run(case: &Case) -> Outcome {
             census_out,
         };
     }
-    Outcome { result: Ok(k), census_in, census_out }
+    Outcome {
+        result: Ok(k),
+        census_in,
+        census_out,
+    }
 }
 
 /// THE HEADLINE: our KTIR against the C++ chain's, per configuration.
@@ -839,7 +899,11 @@ fn every_configuration_matches_the_cpp_ktir_golden() {
                          account for -- a SECOND divergence is hiding behind the recorded one:{}",
                         case.name,
                         residue.len(),
-                        residue.iter().map(|f| format!("\n    {f}")).collect::<Vec<_>>().join("")
+                        residue
+                            .iter()
+                            .map(|f| format!("\n    {f}"))
+                            .collect::<Vec<_>>()
+                            .join("")
                     ));
                 }
             }
@@ -941,11 +1005,22 @@ fn every_presented_dot_weight_states_the_transpose_b_maps() {
         let defs: std::collections::HashMap<Ssa, OpKind> = k
             .ops_deep()
             .iter()
-            .flat_map(|o| o.results.iter().map(|r| (*r, o.kind.clone())).collect::<Vec<_>>())
+            .flat_map(|o| {
+                o.results
+                    .iter()
+                    .map(|r| (*r, o.kind.clone()))
+                    .collect::<Vec<_>>()
+            })
             .collect();
-        let mms: Vec<&Op> =
-            k.ops_deep().into_iter().filter(|o| o.kind == OpKind::LinalgMatmul).collect();
-        assert!(!mms.is_empty(), "{name}: no `linalg.matmul` at all, so this asserts nothing");
+        let mms: Vec<&Op> = k
+            .ops_deep()
+            .into_iter()
+            .filter(|o| o.kind == OpKind::LinalgMatmul)
+            .collect();
+        assert!(
+            !mms.is_empty(),
+            "{name}: no `linalg.matmul` at all, so this asserts nothing"
+        );
         let (mut mapped, mut plain, mut relayout) = (0usize, 0usize, 0usize);
         for o in &mms {
             let b_def = o.operands.get(1).and_then(|v| defs.get(v));
@@ -1003,8 +1078,16 @@ fn every_presented_dot_weight_states_the_transpose_b_maps() {
         }
         checked += 1;
     }
-    assert!(wrong.is_empty(), "THE WEIGHT ORIENTATION HAS MOVED:\n{}", wrong.join("\n"));
-    assert_eq!(checked, expected.len(), "not every configuration was reached");
+    assert!(
+        wrong.is_empty(),
+        "THE WEIGHT ORIENTATION HAS MOVED:\n{}",
+        wrong.join("\n")
+    );
+    assert_eq!(
+        checked,
+        expected.len(),
+        "not every configuration was reached"
+    );
 }
 
 /// THE CONTROL FOR [`is_transposed_dot_weight`], and without it that predicate is a blanket skip
@@ -1137,8 +1220,18 @@ fn the_recorded_divergence_does_not_absorb_a_real_regression() {
             "[\"v13\", \"const(0:index)\", \"v25\"]",
             "[\"v13\", \"v25\", \"const(0:index)\"]",
         ),
-        d("@f/ktdp.load[5]", "result types", "[\"tensor<128x64xf16>\"]", "[\"tensor<64x128xf16>\"]"),
-        d("@f/scf.for[0]/arith.index_cast[4]", "operands", "[\"v22r0a0\"]", "[\"v21r0a0\"]"),
+        d(
+            "@f/ktdp.load[5]",
+            "result types",
+            "[\"tensor<128x64xf16>\"]",
+            "[\"tensor<64x128xf16>\"]",
+        ),
+        d(
+            "@f/scf.for[0]/arith.index_cast[4]",
+            "operands",
+            "[\"v22r0a0\"]",
+            "[\"v21r0a0\"]",
+        ),
     ];
     let missed: Vec<String> = must_pass
         .iter()
@@ -1162,7 +1255,10 @@ fn the_recorded_divergence_does_not_absorb_a_real_regression() {
 #[test]
 fn the_transpose_fold_only_folds_a_dead_dot_weight() {
     let ssa = Ssa;
-    let ty = || IrType::Tensor { dims: vec![64, 64], elem: DType::F16 };
+    let ty = || IrType::Tensor {
+        dims: vec![64, 64],
+        elem: DType::F16,
+    };
     // `tt.trans %1 -> %2`, then a consumer.
     let build = |consumer: Op| -> Module {
         let trans = Op::new(OpKind::TtTrans)
@@ -1173,7 +1269,10 @@ fn the_transpose_fold_only_folds_a_dead_dot_weight() {
         m
     };
     let n_trans = |m: &Module| {
-        m.ops_deep().iter().filter(|o| o.kind == OpKind::TtTrans).count()
+        m.ops_deep()
+            .iter()
+            .filter(|o| o.kind == OpKind::TtTrans)
+            .count()
     };
 
     // POSITIVE: the trans feeds operand 1 of a matmul and nothing else.
@@ -1198,7 +1297,11 @@ fn the_transpose_fold_only_folds_a_dead_dot_weight() {
             .with_operands(vec![ssa(2), ssa(0)]),
     );
     fold_dead_dot_transposes(&mut m);
-    assert_eq!(n_trans(&m), 1, "a transposed ACTIVATION must not be folded away");
+    assert_eq!(
+        n_trans(&m),
+        1,
+        "a transposed ACTIVATION must not be folded away"
+    );
 
     // NEGATIVE 2: the trans is read TWICE, so erasing it would drop a value something still needs.
     let mut m = build(
@@ -1207,7 +1310,11 @@ fn the_transpose_fold_only_folds_a_dead_dot_weight() {
             .with_operands(vec![ssa(2), ssa(2)]),
     );
     fold_dead_dot_transposes(&mut m);
-    assert_eq!(n_trans(&m), 1, "a transpose with two uses must not be folded away");
+    assert_eq!(
+        n_trans(&m),
+        1,
+        "a transpose with two uses must not be folded away"
+    );
 
     // NEGATIVE 3: the consumer is not a matmul at all.
     let mut m = build(
@@ -1216,7 +1323,11 @@ fn the_transpose_fold_only_folds_a_dead_dot_weight() {
             .with_operands(vec![ssa(0), ssa(2)]),
     );
     fold_dead_dot_transposes(&mut m);
-    assert_eq!(n_trans(&m), 1, "a transpose feeding a pointwise op must not be folded away");
+    assert_eq!(
+        n_trans(&m),
+        1,
+        "a transpose feeding a pointwise op must not be folded away"
+    );
 }
 
 /// A small module the controls mutate: `rmsnorm_granite`, which has a `tt.reduce` region, a
@@ -1274,7 +1385,6 @@ fn the_control_agrees_with_itself() {
          {findings:?}"
     );
 }
-
 
 /// Apply `f` to the FIRST op anywhere in the module (regions included) that `f` accepts,
 /// returning whether one was found.
@@ -1502,7 +1612,10 @@ fn the_gather_is_lowered_like_the_cpp() {
     let golden_m = text::parse::parse(&g).expect("the golden parses");
 
     let count = |m: &Module, spelling: &str| {
-        m.ops_deep().iter().filter(|o| o.kind.spelling() == spelling).count()
+        m.ops_deep()
+            .iter()
+            .filter(|o| o.kind.spelling() == spelling)
+            .count()
     };
     assert_eq!(
         count(&ours, "tt.descriptor_gather"),

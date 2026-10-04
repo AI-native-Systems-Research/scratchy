@@ -54,14 +54,20 @@ pub fn run(module: &mut Module) -> Result<()> {
             let op = walk::at(module, p).expect("path");
             op.kind == OpKind::ArithConstant
                 && matches!(op.attr(&AttrKey::Value), Some(Attr::SplatFloat(_)))
-                && op.result_type().map(|t| t.dims().is_some()).unwrap_or(false)
+                && op
+                    .result_type()
+                    .map(|t| t.dims().is_some())
+                    .unwrap_or(false)
         })
         .collect();
 
     // Descending, so an insertion never shifts a path still to be visited.
     for path in splats.into_iter().rev() {
         let op = walk::at(module, &path).expect("path").clone();
-        let tensor_ty = op.result_type().cloned().expect("filtered on a shaped result");
+        let tensor_ty = op
+            .result_type()
+            .cloned()
+            .expect("filtered on a shaped result");
         let elem = tensor_ty.elem().expect("a shaped type has an element type");
         let value = match op.attr(&AttrKey::Value) {
             Some(Attr::SplatFloat(f)) => *f,
@@ -111,11 +117,17 @@ module {
         run(&mut m).unwrap();
         let ops = &m.kernel().unwrap().regions[0].ops;
         let kinds: Vec<&str> = ops.iter().map(|o| o.kind.spelling()).collect();
-        assert_eq!(kinds, vec!["arith.constant", "tensor.splat", "arith.addf", "tt.return"]);
+        assert_eq!(
+            kinds,
+            vec!["arith.constant", "tensor.splat", "arith.addf", "tt.return"]
+        );
         // The scalar constant is f16 -- the element type is PRESERVED, not retyped.
         assert_eq!(ops[0].result_type(), Some(&IrType::Scalar(DType::F16)));
         assert_eq!(
-            ops[0].attr(&AttrKey::Value).and_then(|a| a.as_float()).map(|f| f.bits),
+            ops[0]
+                .attr(&AttrKey::Value)
+                .and_then(|a| a.as_float())
+                .map(|f| f.bits),
             Some(0x3c00)
         );
         // The addf still reads the SPLAT's value, so no use had to be rewired.
@@ -134,9 +146,16 @@ module {
 ";
         let mut m = parse::parse(src).unwrap();
         run(&mut m).unwrap();
-        let kinds: Vec<&str> =
-            m.kernel().unwrap().regions[0].ops.iter().map(|o| o.kind.spelling()).collect();
-        assert_eq!(kinds, vec!["arith.constant", "tt.return"], "OUT of scope, untouched");
+        let kinds: Vec<&str> = m.kernel().unwrap().regions[0]
+            .ops
+            .iter()
+            .map(|o| o.kind.spelling())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["arith.constant", "tt.return"],
+            "OUT of scope, untouched"
+        );
     }
 
     #[test]

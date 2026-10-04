@@ -64,9 +64,15 @@ fn cases() -> Vec<(Case, Target)> {
             common::swiglu("swiglu_mlp_granite", 4096, 12800, 4096),
             Target::spyre(),
         ),
-        (common::swiglu("swiglu_mlp_tiledk", 128, 256, 64), Target::spyre()),
+        (
+            common::swiglu("swiglu_mlp_tiledk", 128, 256, 64),
+            Target::spyre(),
+        ),
         (common::embedding("embedding", 512, 128), Target::spyre()),
-        (common::embedding("embedding_granite", 49159, 4096), Target::spyre()),
+        (
+            common::embedding("embedding_granite", 49159, 4096),
+            Target::spyre(),
+        ),
         (common::rmsnorm("rmsnorm", 128), Target::spyre()),
         (common::rmsnorm("rmsnorm_granite", 4096), Target::spyre()),
         (common::rope("rope", 4), Target::spyre()),
@@ -120,7 +126,11 @@ fn canonical_constant_order(m: &mut ttir::Module) {
                 .take_while(|o| o.name == "arith.constant" && o.regions.is_empty())
                 .count();
             b.ops[..n].sort_by_key(|o| {
-                let v = o.attrs.get("value").map(|a| format!("{a:?}")).unwrap_or_default();
+                let v = o
+                    .attrs
+                    .get("value")
+                    .map(|a| format!("{a:?}"))
+                    .unwrap_or_default();
                 let t = o
                     .results
                     .first()
@@ -312,7 +322,8 @@ fn planted_attribute_change_is_caught() {
     let mut hit = false;
     for op in &mut ours.funcs[0].body.blocks[0].ops {
         if op.name == "tt.expand_dims" {
-            op.attrs.insert("axis".to_string(), Attr::Int(7, Type::i32()));
+            op.attrs
+                .insert("axis".to_string(), Attr::Int(7, Type::i32()));
             hit = true;
             break;
         }
@@ -380,7 +391,9 @@ fn a_planted_location_only_difference_lands_in_the_counted_bucket() {
         if op.name == "tt.descriptor_load" {
             op.loc = op.loc.named("a_name_the_golden_does_not_have");
             for r in &op.results {
-                let l = ours.values[r.0 as usize].loc.named("also_not_in_the_golden");
+                let l = ours.values[r.0 as usize]
+                    .loc
+                    .named("also_not_in_the_golden");
                 ours.values[r.0 as usize].loc = l;
             }
             hit = true;

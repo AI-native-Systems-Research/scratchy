@@ -80,10 +80,19 @@ pub enum Encoding {
     /// `SPRSTBL1`: a 32-byte header (magic, rows u64, cols u64, itemsize u32, n_present u32) then
     /// `n_present` records of `(row_index u32, cols * itemsize bytes)`, ascending by row index,
     /// little-endian. Absent rows are ZERO.
-    Sparse { rows: usize, cols: usize, itemsize: usize, n_present: usize },
+    Sparse {
+        rows: usize,
+        cols: usize,
+        itemsize: usize,
+        n_present: usize,
+    },
     /// One block of `block` rows, expanded by `full[i * factor + j] = stored[i]` -- torch's
     /// `repeat_interleave` along axis 0, NOT `repeat`/tiling.
-    Replicate { factor: usize, block: usize, axis: usize },
+    Replicate {
+        factor: usize,
+        block: usize,
+        axis: usize,
+    },
 }
 
 /// One tensor's record in `meta.json`.
@@ -110,7 +119,11 @@ impl Tensor {
     ///
     /// `shas` is the configuration's own recorded `sha256` map, when it has one; every file read
     /// here is checked against it. See [`verify_sha`].
-    fn bytes(&self, dir: &Path, shas: Option<&serde_json::Map<String, serde_json::Value>>) -> Result<Vec<u8>> {
+    fn bytes(
+        &self,
+        dir: &Path,
+        shas: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Vec<u8>> {
         let p = dir.join(&self.file);
         let want = self.elements() * self.dtype.bytes_per_elem();
         match &self.encoding {
@@ -119,13 +132,22 @@ impl Tensor {
                 verify_sha(&p, &self.file, &raw, shas)?;
                 Ok(raw)
             }
-            Encoding::Sparse { rows, cols, itemsize, n_present } => {
+            Encoding::Sparse {
+                rows,
+                cols,
+                itemsize,
+                n_present,
+            } => {
                 let raw = std::fs::read(&p)
                     .map_err(|e| refuse("data", format!("cannot read {}: {e}", p.display())))?;
                 verify_sha(&p, &self.file, &raw, shas)?;
                 expand_sparse(&raw, *rows, *cols, *itemsize, *n_present, want, &p)
             }
-            Encoding::Replicate { factor, block, axis } => {
+            Encoding::Replicate {
+                factor,
+                block,
+                axis,
+            } => {
                 if *axis != 0 {
                     return Err(refuse(
                         "data",
@@ -135,8 +157,8 @@ impl Tensor {
                         ),
                     ));
                 }
-                let row_bytes = self.shape[1..].iter().product::<usize>()
-                    * self.dtype.bytes_per_elem();
+                let row_bytes =
+                    self.shape[1..].iter().product::<usize>() * self.dtype.bytes_per_elem();
                 let stored = read_bin(&p, block * row_bytes)?;
                 verify_sha(&p, &self.file, &stored, shas)?;
                 let mut out = Vec::with_capacity(want);
@@ -184,12 +206,8 @@ fn expand_sparse(
             format!("{}: not a SPRSTBL1 sparse table", p.display()),
         ));
     }
-    let u64_at = |o: usize| {
-        u64::from_le_bytes(raw[o..o + 8].try_into().expect("8 bytes")) as usize
-    };
-    let u32_at = |o: usize| {
-        u32::from_le_bytes(raw[o..o + 4].try_into().expect("4 bytes")) as usize
-    };
+    let u64_at = |o: usize| u64::from_le_bytes(raw[o..o + 8].try_into().expect("8 bytes")) as usize;
+    let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().expect("4 bytes")) as usize;
     // ⭐ THE HEADER IS CROSS-CHECKED AGAINST `meta.json`, both ways. Two statements of the same
     // fact are only safe while something compares them; unchecked they are how a regenerated file
     // comes to be read under the old metadata.
@@ -374,7 +392,10 @@ fn encoding(v: &serde_json::Value, at: &str) -> Result<Encoding> {
             }
             // ⭐ THE FILLER IS PART OF THE CONTRACT, SO IT IS CHECKED RATHER THAN ASSUMED. Only
             // "zero" keeps sparsification unable to mask a wrong gather.
-            let absent = s.get("absent_rows").and_then(|f| f.as_str()).unwrap_or_default();
+            let absent = s
+                .get("absent_rows")
+                .and_then(|f| f.as_str())
+                .unwrap_or_default();
             if absent != "zero" {
                 return Err(refuse(
                     "meta",
@@ -460,7 +481,9 @@ impl Fixture {
         let v: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| refuse("meta", format!("{} is not JSON: {e}", p.display())))?;
 
-        let got_config = field(&v, "config", "meta.json")?.as_str().unwrap_or_default();
+        let got_config = field(&v, "config", "meta.json")?
+            .as_str()
+            .unwrap_or_default();
         if got_config != config {
             return Err(refuse(
                 "meta",
@@ -483,10 +506,19 @@ impl Fixture {
 
         Ok(Fixture {
             config: config.to_string(),
-            fixture: field(&v, "fixture", "meta.json")?.as_str().unwrap_or_default().to_string(),
-            kernel: field(&v, "kernel", "meta.json")?.as_str().unwrap_or_default().to_string(),
+            fixture: field(&v, "fixture", "meta.json")?
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            kernel: field(&v, "kernel", "meta.json")?
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             seed: v.get("seed").and_then(|s| s.as_i64()).unwrap_or(-1),
-            torch: field(&v, "torch", "meta.json")?.as_str().unwrap_or_default().to_string(),
+            torch: field(&v, "torch", "meta.json")?
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             constexprs: field(&v, "constexprs", "meta.json")?
                 .as_object()
                 .cloned()
@@ -497,10 +529,19 @@ impl Fixture {
                 .get("reference_note")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string()),
-            data_dir: v.get("data_dir").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            data_dir: v
+                .get("data_dir")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
             sha256: v.get("sha256").and_then(|m| m.as_object()).cloned(),
-            oversized: v.get("oversized").and_then(|b| b.as_bool()).unwrap_or(false),
-            staging: v.get("staging").and_then(|s| s.as_str()).map(|s| s.to_string()),
+            oversized: v
+                .get("oversized")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+            staging: v
+                .get("staging")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
         })
     }
 
@@ -527,7 +568,10 @@ impl Fixture {
             .get(key)
             .and_then(|v| v.as_f64())
             .ok_or_else(|| {
-                refuse("meta", format!("`{key}` is not a numeric constexpr of `{}`", self.config))
+                refuse(
+                    "meta",
+                    format!("`{key}` is not a numeric constexpr of `{}`", self.config),
+                )
             })
     }
 
@@ -821,7 +865,9 @@ pub fn decode_f64(bytes: &[u8], n: usize, dtype: DType) -> Result<Vec<f64>> {
             Ok(f32s.into_iter().map(|v| v as f64).collect())
         }
         DType::I32 => Ok(bytes
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
             .collect()),
         other => Err(refuse(
@@ -888,7 +934,12 @@ mod tests {
                 "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
             ),
         ] {
-            assert_eq!(sha256_hex(input.as_bytes()), want, "input of {} bytes", input.len());
+            assert_eq!(
+                sha256_hex(input.as_bytes()),
+                want,
+                "input of {} bytes",
+                input.len()
+            );
         }
         // THE THREE PADDING BOUNDARIES, from `hashlib.sha256(bytes(n))`: 55 bytes is the last
         // length whose padding fits in one block, 56 is the first that needs a second, and 64 is an
@@ -896,9 +947,18 @@ mod tests {
         // `% 64 != 56` loop or in the joined-tail split would live, and none of the four published
         // vectors above touches all three.
         for (n, want) in [
-            (55usize, "02779466cdec163811d078815c633f21901413081449002f24aa3e80f0b88ef7"),
-            (56, "d4817aa5497628e7c77e6b606107042bbba3130888c5f47a375e6179be789fbb"),
-            (64, "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"),
+            (
+                55usize,
+                "02779466cdec163811d078815c633f21901413081449002f24aa3e80f0b88ef7",
+            ),
+            (
+                56,
+                "d4817aa5497628e7c77e6b606107042bbba3130888c5f47a375e6179be789fbb",
+            ),
+            (
+                64,
+                "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b",
+            ),
         ] {
             assert_eq!(sha256_hex(&vec![0u8; n]), want, "{n} zero bytes");
         }
@@ -926,7 +986,10 @@ mod tests {
             verify_sha(p, "in_desc_ids.bin", &raw, Some(&m)).is_ok(),
             "the recorded hash IS this file's hash and it was refused"
         );
-        m.insert("in_desc_ids.bin".into(), serde_json::Value::String("00".repeat(32)));
+        m.insert(
+            "in_desc_ids.bin".into(),
+            serde_json::Value::String("00".repeat(32)),
+        );
         let e = verify_sha(p, "in_desc_ids.bin", &raw, Some(&m))
             .expect_err("a hash that does not match MUST refuse, or the check is decoration");
         assert!(
@@ -943,7 +1006,10 @@ mod tests {
     #[test]
     fn the_recorded_sha_of_a_checked_in_file_reproduces() {
         let f = Fixture::load("embedding_granite_bm128").expect("the bm128 metadata");
-        let shas = f.sha256.as_ref().expect("bm128 records its sha256 map, it shares its bytes");
+        let shas = f
+            .sha256
+            .as_ref()
+            .expect("bm128 records its sha256 map, it shares its bytes");
         let file = "in_desc_ids.bin";
         let want = shas.get(file).and_then(|v| v.as_str()).expect(file);
         let raw = std::fs::read(f.data_dir().join(file)).expect("the ids");

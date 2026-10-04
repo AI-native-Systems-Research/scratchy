@@ -131,7 +131,8 @@ fn drive_src(
         constexprs: ces.clone(),
         file: "matmul_fp8.py".into(),
     };
-    let mut tt = codegen::compile(src, &kspec, Target::spyre()).map_err(|e| format!("codegen: {e}"))?;
+    let mut tt =
+        codegen::compile(src, &kspec, Target::spyre()).map_err(|e| format!("codegen: {e}"))?;
     opt::make_ttir(&mut tt).map_err(|e| format!("make_ttir: {e}"))?;
     let mut m = triton_ktir::from_ttir::convert(&tt).map_err(|e| format!("from_ttir: {e}"))?;
     triton_ktir::make_ktir(&mut m, grid).map_err(|e| format!("make_ktir: {e}"))?;

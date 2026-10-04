@@ -121,7 +121,11 @@ pub fn dxp_input(ops: &[EmittedOp]) -> Result<Vec<(String, String)>, Error> {
                 "TRIPS   {:24} time={} tiled={}",
                 e.op_name,
                 e.time,
-                if axes.is_empty() { "-".to_string() } else { axes.join(" ") }
+                if axes.is_empty() {
+                    "-".to_string()
+                } else {
+                    axes.join(" ")
+                }
             );
         }
     }
@@ -149,9 +153,10 @@ pub fn dxp_input(ops: &[EmittedOp]) -> Result<Vec<(String, String)>, Error> {
     if names.is_empty() {
         return Err(Error {
             stage: "bake",
-            message: "no descriptors to bake — a bundle with no `sdsc_execute` has nothing for the \
+            message:
+                "no descriptors to bake — a bundle with no `sdsc_execute` has nothing for the \
                       scheduler to read, and an empty directory would look like a pass"
-                .to_string(),
+                    .to_string(),
         });
     }
     files.push(("bundle.mlir".to_string(), bundle_mlir(&names)));
@@ -343,9 +348,7 @@ pub fn write_placements(
         .placements
         .contains_key(&ktir_superdsc::reserved_tids::FP8_INV448_TID)
     {
-        use ktir_superdsc::reserved_tids::{
-            FP8_NEG448_TID, FP8_POS448_TID, FP8_INV448_TID,
-        };
+        use ktir_superdsc::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
         // Rewrite the closing brace to append the block, keeping the JSON valid.
         s.truncate(s.len() - "  ]\n}\n".len());
         s.push_str("  ],\n  \"fp8_consts\": [\n");

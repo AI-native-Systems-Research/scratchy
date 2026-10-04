@@ -545,11 +545,17 @@ pub struct FloatBits {
 
 impl FloatBits {
     pub fn f32(v: f32) -> FloatBits {
-        FloatBits { bits: v.to_bits() as u64, width: 32 }
+        FloatBits {
+            bits: v.to_bits() as u64,
+            width: 32,
+        }
     }
 
     pub fn f16_from_f32(v: f32) -> FloatBits {
-        FloatBits { bits: f32_to_f16_bits(v) as u64, width: 16 }
+        FloatBits {
+            bits: f32_to_f16_bits(v) as u64,
+            width: 16,
+        }
     }
 
     pub fn as_f64(self) -> f64 {
@@ -732,17 +738,30 @@ pub const DYNAMIC: i64 = i64::MIN;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum IrType {
     /// `tensor<D0xD1x...xE>`
-    Tensor { dims: Vec<i64>, elem: DType },
+    Tensor {
+        dims: Vec<i64>,
+        elem: DType,
+    },
     /// `memref<D0xD1x...xE>`
-    MemRef { dims: Vec<i64>, elem: DType },
+    MemRef {
+        dims: Vec<i64>,
+        elem: DType,
+    },
     /// `!ktdp.access_tile<D0x...xindex>`
-    AccessTile { dims: Vec<i64> },
+    AccessTile {
+        dims: Vec<i64>,
+    },
     /// `!tt.ptr<E>`
-    Ptr { elem: DType },
+    Ptr {
+        elem: DType,
+    },
     /// `!tt.tensordesc<D0x...xE>` -- the BLOCK shape, which is what the
     /// descriptor patterns read (never the load's result type; a rank-reduced
     /// load would otherwise build a tile that mismatches the view).
-    TensorDesc { dims: Vec<i64>, elem: DType },
+    TensorDesc {
+        dims: Vec<i64>,
+        elem: DType,
+    },
     Index,
     Scalar(DType),
     /// A type this crate does not model, kept verbatim so it round-trips.
@@ -780,11 +799,18 @@ impl IrType {
     /// retypes an f32 result to f16 without touching the shape.
     pub fn with_elem(&self, e: DType) -> IrType {
         match self {
-            IrType::Tensor { dims, .. } => IrType::Tensor { dims: dims.clone(), elem: e },
-            IrType::MemRef { dims, .. } => IrType::MemRef { dims: dims.clone(), elem: e },
-            IrType::TensorDesc { dims, .. } => {
-                IrType::TensorDesc { dims: dims.clone(), elem: e }
-            }
+            IrType::Tensor { dims, .. } => IrType::Tensor {
+                dims: dims.clone(),
+                elem: e,
+            },
+            IrType::MemRef { dims, .. } => IrType::MemRef {
+                dims: dims.clone(),
+                elem: e,
+            },
+            IrType::TensorDesc { dims, .. } => IrType::TensorDesc {
+                dims: dims.clone(),
+                elem: e,
+            },
             IrType::Scalar(_) => IrType::Scalar(e),
             other => other.clone(),
         }
@@ -792,10 +818,19 @@ impl IrType {
 
     pub fn with_dims(&self, d: Vec<i64>) -> IrType {
         match self {
-            IrType::Tensor { elem, .. } => IrType::Tensor { dims: d, elem: *elem },
-            IrType::MemRef { elem, .. } => IrType::MemRef { dims: d, elem: *elem },
+            IrType::Tensor { elem, .. } => IrType::Tensor {
+                dims: d,
+                elem: *elem,
+            },
+            IrType::MemRef { elem, .. } => IrType::MemRef {
+                dims: d,
+                elem: *elem,
+            },
             IrType::AccessTile { .. } => IrType::AccessTile { dims: d },
-            IrType::TensorDesc { elem, .. } => IrType::TensorDesc { dims: d, elem: *elem },
+            IrType::TensorDesc { elem, .. } => IrType::TensorDesc {
+                dims: d,
+                elem: *elem,
+            },
             other => other.clone(),
         }
     }
@@ -815,7 +850,14 @@ impl IrType {
     /// Is this a COMPUTE-DOMAIN f32 -- an f32 scalar or an f32-elemented tensor?
     /// `LegalizeTypes::isComputeF32`.
     pub fn is_compute_f32(&self) -> bool {
-        matches!(self, IrType::Scalar(DType::F32) | IrType::Tensor { elem: DType::F32, .. })
+        matches!(
+            self,
+            IrType::Scalar(DType::F32)
+                | IrType::Tensor {
+                    elem: DType::F32,
+                    ..
+                }
+        )
     }
 
     /// Does this carry f32 but sit OUT OF SCOPE for `LegalizeTypes` -- a ptr,
@@ -1003,7 +1045,10 @@ impl Module {
             .collect();
         match funcs.len() {
             1 => Ok(funcs[0]),
-            0 => Err(crate::Refusal::new("ktir", "no tt.func/func.func in this module")),
+            0 => Err(crate::Refusal::new(
+                "ktir",
+                "no tt.func/func.func in this module",
+            )),
             n => Err(crate::Refusal::new(
                 "ktir",
                 format!(
@@ -1188,7 +1233,10 @@ mod tests {
     #[test]
     fn f16_specials_survive() {
         // -inf is the flash kernel's m_i init, printed `0xFC00`.
-        let ninf = FloatBits { bits: 0xFC00, width: 16 };
+        let ninf = FloatBits {
+            bits: 0xFC00,
+            width: 16,
+        };
         assert!(ninf.as_f64().is_infinite() && ninf.as_f64() < 0.0);
         assert_eq!(FloatBits::f16_from_f32(1.0).bits, 0x3c00);
         assert_eq!(FloatBits::f16_from_f32(0.0).bits, 0x0000);
@@ -1211,9 +1259,15 @@ mod tests {
     fn out_of_scope_f32_is_not_compute_f32() {
         // The distinction LegalizeTypes' island gate turns on: a memref<f32> must
         // never be retyped, or its bytes are reinterpreted as f16.
-        let t = IrType::Tensor { dims: vec![64], elem: DType::F32 };
+        let t = IrType::Tensor {
+            dims: vec![64],
+            elem: DType::F32,
+        };
         assert!(t.is_compute_f32() && !t.is_out_of_scope_f32());
-        let m = IrType::MemRef { dims: vec![64], elem: DType::F32 };
+        let m = IrType::MemRef {
+            dims: vec![64],
+            elem: DType::F32,
+        };
         assert!(!m.is_compute_f32() && m.is_out_of_scope_f32());
         let p = IrType::Ptr { elem: DType::F32 };
         assert!(!p.is_compute_f32() && p.is_out_of_scope_f32());

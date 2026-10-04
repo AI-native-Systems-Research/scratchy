@@ -181,7 +181,10 @@ pub struct Refusal {
 
 impl Refusal {
     pub fn new(pass: &'static str, message: impl Into<String>) -> Refusal {
-        Refusal { pass, message: message.into() }
+        Refusal {
+            pass,
+            message: message.into(),
+        }
     }
 }
 

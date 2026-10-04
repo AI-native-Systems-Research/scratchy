@@ -16,8 +16,6 @@
 //! its own, against a kernel written for the purpose. Both directions are asserted, since a
 //! test that only checks the Spyre setting would pass with the switch hard-wired.
 
-
-
 use std::collections::HashMap;
 
 use triton_frontend::codegen::{self, ArgSpec, KernelSpec};
@@ -195,10 +193,9 @@ fn the_attention_epilogue_divide_is_the_whole_divergence() {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src = std::fs::read_to_string(dir.join("../test-fixtures/attention_flash.py"))
         .expect("attention_flash.py");
-    let golden = std::fs::read_to_string(
-        dir.join("tests/goldens/attention_flash_noncausal.ttir_raw.mlir"),
-    )
-    .expect("golden");
+    let golden =
+        std::fs::read_to_string(dir.join("tests/goldens/attention_flash_noncausal.ttir_raw.mlir"))
+            .expect("golden");
 
     let mut signature = HashMap::new();
     for (k, v) in [

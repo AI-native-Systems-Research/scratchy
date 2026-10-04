@@ -84,12 +84,14 @@ fn a_bounded_slice_is_refused_by_name() {
         "y = x[:, 0:HALF]",
     ] {
         let src = kernel(body);
-        let err = codegen::compile(&src, &spec(), Target::spyre()).err().unwrap_or_else(|| {
-            panic!(
+        let err = codegen::compile(&src, &spec(), Target::spyre())
+            .err()
+            .unwrap_or_else(|| {
+                panic!(
                 "`{body}` COMPILED. Triton refuses it (`unsupported tensor index`), and here it \
                  silently yields the FULL tile -- a wrong answer with no diagnostic."
             )
-        });
+            });
         let msg = err.to_string();
         assert!(
             msg.contains("BOUNDED tensor slice"),

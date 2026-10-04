@@ -73,7 +73,11 @@ fn main() {
     let grid: Vec<i64> = args[1]
         .split(',')
         .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().parse().expect("grid is a comma-separated integer list"))
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("grid is a comma-separated integer list")
+        })
         .collect();
     let Some(program) = program_from(program_s) else {
         eprintln!("unknown program `{program_s}`");
@@ -85,7 +89,10 @@ fn main() {
     // look like a bake that wrote nothing yet succeeded.
     macro_rules! refused {
         ($stage:expr, $err:expr) => {{
-            println!("REFUSED  {config:32} {program_s:10} {:<12} {}", $stage, $err);
+            println!(
+                "REFUSED  {config:32} {program_s:10} {:<12} {}",
+                $stage, $err
+            );
             std::process::exit(1);
         }};
     }

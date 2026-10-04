@@ -214,14 +214,15 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
                     let Some(mulf) = func
                         .operations
                         .iter()
-                        .find(|o| {
-                            o.op_type == OpKind::ArithMulf
-                                && o.operands.contains(&res)
-                        })
+                        .find(|o| o.op_type == OpKind::ArithMulf && o.operands.contains(&res))
                     else {
                         continue;
                     };
-                    let other = if mulf.operands[0] == res { mulf.operands[1] } else { mulf.operands[0] };
+                    let other = if mulf.operands[0] == res {
+                        mulf.operands[1]
+                    } else {
+                        mulf.operands[0]
+                    };
                     // The scale side must be a loaded `[1, n]` row — the load chain
                     // every fp8 producer's wscale read states (`KtirFunc::matmul_fp8`'s
                     // `tile(scale_view, 0, 0, 1, n)`; the ladder's ws descriptor `[1, N]`),
@@ -232,15 +233,12 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
                     if s_dims.len() != 2 || s_dims[0] != 1 {
                         continue;
                     }
-                    let Some(mulf_res) = mulf.result else { continue };
-                    if !func
-                        .operations
-                        .iter()
-                        .any(|o| {
-                            o.op_type == OpKind::KtdpStore
-                                && o.operands.first() == Some(&mulf_res)
-                        })
-                    {
+                    let Some(mulf_res) = mulf.result else {
+                        continue;
+                    };
+                    if !func.operations.iter().any(|o| {
+                        o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&mulf_res)
+                    }) {
                         continue;
                     }
                     (mulf_res, Some(other))
@@ -248,12 +246,9 @@ fn recognize(func: &IRFunction<'_>) -> Vec<Untiled> {
             }
         };
         // The store that drains it, and the view it writes.
-        let Some((store_at, st)) = func
-            .operations
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&store_val))
-        else {
+        let Some((store_at, st)) = func.operations.iter().enumerate().find(|(_, o)| {
+            o.op_type == OpKind::KtdpStore && o.operands.first() == Some(&store_val)
+        }) else {
             continue;
         };
         let Some((_, out_acc)) = st.operands.get(1).and_then(|t| def.get(t)) else {
@@ -476,9 +471,7 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
                     .map(|mm| AffineMap {
                         num_dims: 3,
                         num_syms: 0,
-                        exprs: a.exprs(
-                            mm.iter().map(|d| AffineExpr::Dim(*d as usize)).collect(),
-                        ),
+                        exprs: a.exprs(mm.iter().map(|d| AffineExpr::Dim(*d as usize)).collect()),
                     })
                     .collect();
                 (part, maps)
@@ -520,7 +513,11 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
                     OpKind::KtdpConstructAccessTile,
                     &[p.out_view, row_idx, noff],
                 )
-                .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(acc_dims.clone())));
+                .with_attr(
+                    a,
+                    AttrKey::Shape,
+                    Attr::IntList(a.ints(acc_dims.clone())),
+                );
                 ts.result_type = Some(IrType::AccessTile {
                     dims: a.ints(acc_dims.clone()),
                 });
@@ -554,9 +551,7 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             let nest_result = nest_result.expect("the scaled form takes one N-block");
             let mulf_at = ops
                 .iter()
-                .position(|o| {
-                    o.op_type == OpKind::ArithMulf && o.operands.contains(&matmul_res)
-                })
+                .position(|o| o.op_type == OpKind::ArithMulf && o.operands.contains(&matmul_res))
                 .expect("recognize found the mulf draining the matmul");
             let pos = ops[mulf_at]
                 .operands

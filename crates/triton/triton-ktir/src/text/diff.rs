@@ -132,7 +132,9 @@ impl Numbering {
                     op.attr(&AttrKey::Value)
                         .map(super::print::print_attr)
                         .unwrap_or_else(|| "?".into()),
-                    op.result_type().map(super::print::print_type).unwrap_or_else(|| "?".into())
+                    op.result_type()
+                        .map(super::print::print_type)
+                        .unwrap_or_else(|| "?".into())
                 );
                 for r in &op.results {
                     ids.insert(*r, key.clone());
@@ -155,7 +157,10 @@ impl Numbering {
     }
 
     fn id(&self, v: Ssa) -> String {
-        self.ids.get(&v).cloned().unwrap_or_else(|| "<undef>".to_string())
+        self.ids
+            .get(&v)
+            .cloned()
+            .unwrap_or_else(|| "<undef>".to_string())
     }
 }
 
@@ -211,7 +216,14 @@ fn diff_block(
         });
     }
     for (i, (ga, oa)) in gr.iter().zip(or_.iter()).enumerate() {
-        diff_op(g, o, ga, oa, &format!("{path}/{}[{i}]", ga.kind.spelling()), out);
+        diff_op(
+            g,
+            o,
+            ga,
+            oa,
+            &format!("{path}/{}[{i}]", ga.kind.spelling()),
+            out,
+        );
     }
 }
 
@@ -243,8 +255,16 @@ fn diff_op(
             actual: format!("{oops:?}"),
         });
     }
-    let gt: Vec<String> = golden.result_types.iter().map(super::print::print_type).collect();
-    let ot: Vec<String> = ours.result_types.iter().map(super::print::print_type).collect();
+    let gt: Vec<String> = golden
+        .result_types
+        .iter()
+        .map(super::print::print_type)
+        .collect();
+    let ot: Vec<String> = ours
+        .result_types
+        .iter()
+        .map(super::print::print_type)
+        .collect();
     if gt != ot {
         out.push(Difference {
             where_: path.into(),
@@ -275,8 +295,16 @@ fn diff_op(
     for (ri, (grr, orr)) in golden.regions.iter().zip(&ours.regions).enumerate() {
         // Block argument TYPES are load-bearing: LegalizeTypes retypes a combiner's
         // pair, and a port that misses that leaves an f32 combiner.
-        let gargs: Vec<String> = grr.args.iter().map(|(_, t)| super::print::print_type(t)).collect();
-        let oargs: Vec<String> = orr.args.iter().map(|(_, t)| super::print::print_type(t)).collect();
+        let gargs: Vec<String> = grr
+            .args
+            .iter()
+            .map(|(_, t)| super::print::print_type(t))
+            .collect();
+        let oargs: Vec<String> = orr
+            .args
+            .iter()
+            .map(|(_, t)| super::print::print_type(t))
+            .collect();
         if gargs != oargs {
             out.push(Difference {
                 where_: format!("{path}/region{ri}"),
@@ -308,7 +336,11 @@ pub fn fingerprint(n: &Numbering, op: &Op) -> String {
     format!(
         "{}({})->{}{}",
         op.kind.spelling(),
-        op.operands.iter().map(|v| n.id(*v)).collect::<Vec<_>>().join(","),
+        op.operands
+            .iter()
+            .map(|v| n.id(*v))
+            .collect::<Vec<_>>()
+            .join(","),
         op.result_types
             .iter()
             .map(super::print::print_type)
@@ -419,7 +451,10 @@ module {
         let golden = parse::parse(BASE).unwrap();
         for (field, from, to) in cases {
             let mutated = BASE.replace(from, to);
-            assert_ne!(mutated, BASE, "the planted change for `{field}` did not apply");
+            assert_ne!(
+                mutated, BASE,
+                "the planted change for `{field}` did not apply"
+            );
             let ours = parse::parse(&mutated).unwrap();
             let d = diff(&golden, &ours);
             assert!(
@@ -457,8 +492,8 @@ module {
 }
 ";
         let golden = parse::parse(src).unwrap();
-        let ours = parse::parse(&src.replace("^bb0(%a: f16, %b: f16)", "^bb0(%a: f32, %b: f32)"))
-            .unwrap();
+        let ours =
+            parse::parse(&src.replace("^bb0(%a: f16, %b: f16)", "^bb0(%a: f32, %b: f32)")).unwrap();
         let d = diff(&golden, &ours);
         assert!(
             d.iter().any(|x| x.field == "block argument types"),
@@ -475,6 +510,9 @@ module {
         ))
         .unwrap();
         let d = census_diff(&golden, &ours);
-        assert!(d.iter().any(|x| x.where_ == "census/arith.mulf"), "got {d:?}");
+        assert!(
+            d.iter().any(|x| x.where_ == "census/arith.mulf"),
+            "got {d:?}"
+        );
     }
 }
