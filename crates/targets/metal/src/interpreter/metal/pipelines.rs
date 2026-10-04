@@ -62,6 +62,7 @@ use crate::stream::MetalStreamError;
 use scratchy_ir::CanonicalParams;
 
 use super::lowered::{DispatchShape, GemmDims, KernelId, LoweredCommand, MetalDtype};
+use crate::tape::constants::{TapeVariant, UnboundConstant};
 
 /// Outputs one threadgroup of the dense GEMV computes (MLX's `blockM`): the fewest a GEMV
 /// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
@@ -91,14 +92,19 @@ pub const GEMV_ROWS: u32 = 4;
 /// and hands a clone to every worker.
 pub struct SpecializedPipelines {
     cache: Arc<SpecializedPipelineCache>,
+    /// The tape variant the pool picked: the values its commands' variant-bound constants take.
+    variant: TapeVariant,
 }
 
 impl SpecializedPipelines {
-    /// Wrap an already-constructed cache. The cache should have been
-    /// built with [`SpecializedPipelineCache::with_standard_shaders`]
-    /// so every library this glue references is compiled.
-    pub fn new(cache: Arc<SpecializedPipelineCache>) -> Self {
-        Self { cache }
+    /// Wrap an already-constructed cache, every baked kernel `variant`'s tapes name registered.
+    pub fn new(cache: Arc<SpecializedPipelineCache>, variant: TapeVariant) -> Self {
+        Self { cache, variant }
+    }
+
+    /// The tape variant the pool picked.
+    pub fn variant(&self) -> TapeVariant {
+        self.variant
     }
 
     /// Return the specialized pipeline a [`LoweredCommand`] names
@@ -123,55 +129,23 @@ impl SpecializedPipelines {
         if matches!(cmd.kernel, KernelId::Gemm) {
             return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
         }
-        let key = PipelineKey::new(cmd.library, cmd.function, cmd.constants.to_vec());
+        let constants = (cmd.constants.iter())
+            .map(|c| c.resolve(self.variant))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PipelineLookupError::Unbound)?;
+        let key = PipelineKey::new(cmd.library, cmd.function, constants);
         self.cache
             .get_or_build(&key)
             .map_err(PipelineLookupError::Build)
     }
 
-    /// A dense GEMM's pipeline at `dtype` and its dispatch, keyed on its `(M, N, K)` (function
-    /// constants 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). One row of at
-    /// least [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV
-    /// (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per [`GEMV_ROWS`] outputs.
-    /// Otherwise the 8×8-tile GEMM (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one
-    /// simdgroup per tile. Bindings for both: output 0, input 1, weight 2.
+    /// A dense GEMM's pipeline at `dtype` and its dispatch ([`gemm_pipeline`]).
     pub fn pipeline_for_gemm(
         &self,
         dtype: MetalDtype,
         dims: GemmDims,
     ) -> Result<(ComputePipelineState, DispatchShape), PipelineLookupError> {
-        let GemmDims { m, n, k } = dims;
-        let gemv = m == 1 && n >= GEMV_ROWS;
-        let function = match (dtype, gemv) {
-            (MetalDtype::F16, false) => "gemm_f16_specialized",
-            (MetalDtype::Bf16, false) => "gemm_bf16_specialized",
-            (MetalDtype::F16, true) => "gemv_f16_specialized",
-            (MetalDtype::Bf16, true) => "gemv_bf16_specialized",
-            (MetalDtype::Int4, _) => {
-                return Err(PipelineLookupError::DtypeNotYetWired(
-                    KernelId::Gemm,
-                    MetalDtype::Int4,
-                ));
-            }
-        };
-        let dispatch = match gemv {
-            true => DispatchShape {
-                threadgroups: (n.div_ceil(GEMV_ROWS), 1, 1),
-                threads_per_threadgroup: (256, 1, 1),
-                m_scaling: None,
-            },
-            false => DispatchShape {
-                threadgroups: (n.div_ceil(8), m.div_ceil(8), 1),
-                threads_per_threadgroup: (32, 1, 1),
-                m_scaling: None,
-            },
-        };
-        let constants = vec![
-            ConstantValue::uint(0, m),
-            ConstantValue::uint(1, n),
-            ConstantValue::uint(2, k),
-        ];
-        let key = PipelineKey::new("gemm", function, constants);
+        let (key, dispatch) = gemm_pipeline(dtype, dims)?;
         let pipeline = self
             .cache
             .get_or_build(&key)
@@ -184,6 +158,50 @@ impl SpecializedPipelines {
     pub fn cached_count(&self) -> usize {
         self.cache.len()
     }
+}
+
+/// A dense GEMM's pipeline key at `dtype` and its dispatch, keyed on its `(M, N, K)` (constants
+/// 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). One row of at least
+/// [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV (`gemv_{f16,bf16}_specialized`),
+/// a threadgroup of 256 threads per [`GEMV_ROWS`] outputs. Otherwise the 8×8-tile GEMM
+/// (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one simdgroup per tile. Bindings for
+/// both: output 0, input 1, weight 2.
+pub fn gemm_pipeline(
+    dtype: MetalDtype,
+    dims: GemmDims,
+) -> Result<(PipelineKey, DispatchShape), PipelineLookupError> {
+    let GemmDims { m, n, k } = dims;
+    let gemv = m == 1 && n >= GEMV_ROWS;
+    let function = match (dtype, gemv) {
+        (MetalDtype::F16, false) => "gemm_f16_specialized",
+        (MetalDtype::Bf16, false) => "gemm_bf16_specialized",
+        (MetalDtype::F16, true) => "gemv_f16_specialized",
+        (MetalDtype::Bf16, true) => "gemv_bf16_specialized",
+        (MetalDtype::Int4, _) => {
+            return Err(PipelineLookupError::DtypeNotYetWired(
+                KernelId::Gemm,
+                MetalDtype::Int4,
+            ));
+        }
+    };
+    let dispatch = match gemv {
+        true => DispatchShape {
+            threadgroups: (n.div_ceil(GEMV_ROWS), 1, 1),
+            threads_per_threadgroup: (256, 1, 1),
+            m_scaling: None,
+        },
+        false => DispatchShape {
+            threadgroups: (n.div_ceil(8), m.div_ceil(8), 1),
+            threads_per_threadgroup: (32, 1, 1),
+            m_scaling: None,
+        },
+    };
+    let constants = vec![
+        ConstantValue::uint(0, m),
+        ConstantValue::uint(1, n),
+        ConstantValue::uint(2, k),
+    ];
+    Ok((PipelineKey::new("gemm", function, constants), dispatch))
 }
 
 #[derive(Debug)]
@@ -203,6 +221,8 @@ pub enum PipelineLookupError {
     /// pipeline state construction). The wrapped variant carries the
     /// underlying message verbatim.
     Build(MetalStreamError),
+    /// A command's constant is bound to a value the picked tape variant does not carry.
+    Unbound(UnboundConstant),
 }
 
 impl std::fmt::Display for PipelineLookupError {
@@ -221,6 +241,7 @@ impl std::fmt::Display for PipelineLookupError {
                 "specialized pipeline lookup: kernel {k:?} dtype {d:?} not yet wired"
             ),
             Self::Build(e) => write!(f, "specialized pipeline build: {e}"),
+            Self::Unbound(e) => write!(f, "specialized pipeline lookup: {e}"),
         }
     }
 }
@@ -231,6 +252,12 @@ impl std::error::Error for PipelineLookupError {}
 mod tests {
     use super::*;
     use scratchy_ir::CanonicalParams;
+
+    /// The probes' tape variant: their `MAX_BLOCKS_PER_SEQ`, no TurboQuant decode attention.
+    const PROBE_VARIANT: TapeVariant = TapeVariant {
+        cap: crate::tape::ids::MaxBlocksPerSeq(128),
+        tq_heads: None,
+    };
 
     // ── Test-only kernel→symbol/constants mapping ─────────────────
     //
@@ -295,14 +322,6 @@ mod tests {
             (KernelId::TqQuantizeToPacked, MetalDtype::Bf16) => {
                 ("turboquant", "tq_compress_paged_bf16")
             }
-            (KernelId::FusedQkvRopeCache, MetalDtype::F16) => (
-                "fused_qkv_rope_cache",
-                "fused_qkv_rope_cache_f16_specialized",
-            ),
-            (KernelId::FusedQkvRopeCache, MetalDtype::Bf16) => (
-                "fused_qkv_rope_cache",
-                "fused_qkv_rope_cache_bf16_specialized",
-            ),
             (KernelId::AttentionViaCache, MetalDtype::F16) => {
                 ("attention", "attention_via_cache_v2_f16_specialized")
             }
@@ -380,10 +399,6 @@ mod tests {
                 | KernelId::GateScale
                 | KernelId::GatedDeltaNet
                 | KernelId::SplitKReduceSum
-                | KernelId::FusedAffineQkvRopeCache
-                | KernelId::SynthPreAttn
-            | KernelId::SynthMlpPreDown
-            | KernelId::SynthGateUpSiluMul
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
@@ -499,15 +514,6 @@ mod tests {
                 ConstantValue::uint(5, crate::BLOCKS_PER_CHUNK),
                 ConstantValue::uint(6, W::ROT_DIM / 2),
             ],
-            KernelId::FusedQkvRopeCache => vec![
-                ConstantValue::uint(0, W::Q_SIZE as u32),
-                ConstantValue::uint(1, W::NUM_Q_HEADS),
-                ConstantValue::uint(2, W::NUM_KV_HEADS),
-                ConstantValue::uint(3, W::HEAD_DIM),
-                ConstantValue::uint(4, W::ROT_DIM),
-                ConstantValue::uint(5, W::BLOCK_SIZE),
-                ConstantValue::uint(6, bucket_m),
-            ],
             KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged => vec![
                 ConstantValue::uint(0, W::HEAD_DIM),
                 ConstantValue::uint(1, W::NUM_Q_HEADS),
@@ -552,10 +558,6 @@ mod tests {
             | KernelId::RopeOnceNax
             | KernelId::RopeOnceSteel
             | KernelId::RopeOnceGqaShared
-            | KernelId::FusedAffineQkvRopeCache
-            | KernelId::SynthPreAttn
-            | KernelId::SynthMlpPreDown
-            | KernelId::SynthGateUpSiluMul
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
@@ -629,10 +631,29 @@ mod tests {
             let (library, function) = kernel_msl_names(kernel, bucket_m, dtype)?;
             let constants = constants_for::<W>(kernel, bucket_m)?;
             let key = PipelineKey::new(library, function, constants);
-            self.cache
-                .get_or_build(&key)
-                .map_err(PipelineLookupError::Build)
+            crate::aot::baked_build(&self.cache, &key).map_err(PipelineLookupError::Build)
         }
+    }
+
+    /// The standard shaders plus [`TinyLlamaProbe`]'s baked norm kernels, at every bucket and
+    /// dtype the tests below build them for.
+    fn probe_pipelines(device: &crate::specialized_pipeline_cache::Device) -> SpecializedPipelines {
+        let mut keys = Vec::new();
+        for kernel in [KernelId::RmsNorm, KernelId::FusedAddRmsNorm] {
+            for (m, dtype) in [1, 4, 8, 64]
+                .into_iter()
+                .flat_map(|m| [MetalDtype::F16, MetalDtype::Bf16].map(|dtype| (m, dtype)))
+            {
+                let (library, function) = kernel_msl_names(kernel, m, dtype).expect("norm");
+                let constants = constants_for::<TinyLlamaProbe>(kernel, m).expect("norm");
+                keys.push(PipelineKey::new(library, function, constants));
+            }
+        }
+        let cache =
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        cache.register_baked(&crate::aot::baked_kernels(&keys));
+        SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT)
     }
 
     /// Pure-CPU stub of `CanonicalParams` modelled on TinyLlama-1.1B.
@@ -789,12 +810,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let pipelines = probe_pipelines(&device.device);
 
         // RmsNorm at bucket=1 (decode) and bucket=8 (small prefill).
         // `RMS_NORM_EPS` baked from `TinyLlamaProbe::RMS_NORM_EPS`
@@ -842,12 +858,12 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let cache = crate::specialized_pipeline_cache::SpecializedPipelineCache::new(
+            device.device.clone(),
+            &[],
+        )
+        .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         // AttentionViaCache: bucket=1 (decode). block_size=16,
         // max_blocks_per_seq=128 baked from
@@ -879,12 +895,12 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let cache = crate::specialized_pipeline_cache::SpecializedPipelineCache::new(
+            device.device.clone(),
+            &[],
+        )
+        .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         // BLOCK_SIZE baked from `TinyLlamaProbe::BLOCK_SIZE` (default 16).
         let _r1 = pipelines
@@ -926,11 +942,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         // Shape: TinyLlama-1.1B params, bucket_m = 2 (small for test),
         // BLOCK_SIZE = 16. The kernel is bucket-axis-independent.
@@ -1155,11 +1169,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let bucket_m: usize = 2;
         let head_dim = Llama32Probe::HEAD_DIM as usize;
@@ -1398,11 +1410,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let batch: usize = 1;
         let head_dim = Llama32_1BProbe::HEAD_DIM as usize;
@@ -1595,11 +1605,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let bucket_m: usize = 1;
         let head_dim = Llama32_1BProbe::HEAD_DIM as usize;
@@ -1836,11 +1844,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         // TinyLlamaProbe params: HEAD_DIM=64, NUM_Q_HEADS=32,
         // NUM_KV_HEADS=4, ATTN_SCALE=0.125, BLOCK_SIZE=16,
@@ -2057,11 +2063,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let batch: usize = 2;
         let head_dim = Llama32Probe::HEAD_DIM as usize;
@@ -2263,11 +2267,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         // Llama-3.2-1B decode shape — batch=1 (single decode step).
         let batch: usize = 1;
@@ -2471,11 +2473,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let head_dim = Llama32Probe::HEAD_DIM as usize;
         let num_q = Llama32Probe::NUM_Q_HEADS as usize;
@@ -2699,11 +2699,9 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let head_dim = Llama32Probe::HEAD_DIM as usize;
         let num_q = Llama32Probe::NUM_Q_HEADS as usize;
@@ -2912,12 +2910,7 @@ mod tests {
         };
         let device = device_info.device.clone();
 
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let pipelines = probe_pipelines(&device);
 
         let m: usize = 4;
         let hidden = TinyLlamaProbe::Q_SIZE;
@@ -3049,12 +3042,7 @@ mod tests {
         };
         let device = device_info.device.clone();
 
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let pipelines = probe_pipelines(&device);
 
         let m: usize = 64;
         let hidden = TinyLlamaProbe::Q_SIZE;
@@ -3221,12 +3209,7 @@ mod tests {
         };
         let device = device_info.device.clone();
 
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let pipelines = probe_pipelines(&device);
 
         let m: usize = 64;
         let hidden = TinyLlamaProbe::Q_SIZE;
@@ -3369,12 +3352,7 @@ mod tests {
         };
         let device = device_info.device.clone();
 
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let pipelines = probe_pipelines(&device);
 
         let m: usize = 64;
         let hidden = TinyLlamaProbe::Q_SIZE;
@@ -3510,12 +3488,7 @@ mod tests {
         };
         let device = device_info.device.clone();
 
-        let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+        let pipelines = probe_pipelines(&device);
 
         let hidden = TinyLlamaProbe::Q_SIZE;
         let pipeline = pipelines
@@ -3643,11 +3616,9 @@ mod tests {
         };
         let device = device_info.device.clone();
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let m: usize = 1;
         let n: usize = TinyLlamaProbe::INTERMEDIATE_SIZE; // 5632
@@ -3786,11 +3757,9 @@ mod tests {
         };
         let device = device_info.device.clone();
         let cache =
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders");
-        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache), PROBE_VARIANT);
 
         let m: usize = 1;
         let n: usize = Llama32Probe::INTERMEDIATE_SIZE; // 8192
@@ -3948,10 +3917,8 @@ mod tests {
         let device = device_info.device.clone();
 
         let cache = std::sync::Arc::new(
-            crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
-                device.clone(),
-            )
-            .expect("compile standard shaders"),
+            crate::specialized_pipeline_cache::SpecializedPipelineCache::new(device.clone(), &[])
+                .expect("compile standard shaders"),
         );
 
         let n: usize = TinyLlamaProbe::INTERMEDIATE_SIZE;
@@ -3981,9 +3948,8 @@ mod tests {
                 ConstantValue::boolean(10, false),
             ],
         );
-        let pipeline = cache
-            .get_or_build(&key)
-            .expect("fused_mlp steel pipeline build");
+        let pipeline =
+            crate::aot::baked_build(&cache, &key).expect("fused_mlp steel pipeline build");
 
         // Synthetic deterministic input + packed [gate; up] weight.
         let input_data: Vec<f32> = (0..m * k)

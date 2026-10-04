@@ -24,21 +24,22 @@
 // State layout (cuda-symmetric): ssm_state[num_slots, HV, head_v, head_k],
 //   row = ((slot*HV + i_hv)*head_v + i_v)*head_k. is_fresh → S starts at 0.
 //
-// Function constants:
+// Baked constants:
 //   GDN_SCAN_NUM_K_HEADS (H), GDN_SCAN_NUM_V_HEADS (HV),
 //   GDN_SCAN_HEAD_K (K), GDN_SCAN_HEAD_V (head_v), GDN_SCAN_SCALE (1/sqrt(K)).
 //
 // Dispatch: grid (ceil(head_v/tg), HV, num_seqs); thread = (value-dim, head, seq).
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint  GDN_SCAN_NUM_K_HEADS [[function_constant(0)]];
-constant uint  GDN_SCAN_NUM_V_HEADS [[function_constant(1)]];
-constant uint  GDN_SCAN_HEAD_K      [[function_constant(2)]];
-constant uint  GDN_SCAN_HEAD_V      [[function_constant(3)]];
-constant float GDN_SCAN_SCALE       [[function_constant(4)]];
+SCRATCHY_CONSTANT(uint, GDN_SCAN_NUM_K_HEADS, 0);
+SCRATCHY_CONSTANT(uint, GDN_SCAN_NUM_V_HEADS, 1);
+SCRATCHY_CONSTANT(uint, GDN_SCAN_HEAD_K, 2);
+SCRATCHY_CONSTANT(uint, GDN_SCAN_HEAD_V, 3);
+SCRATCHY_CONSTANT(float, GDN_SCAN_SCALE, 4);
 
 // Matches CUDA `MAX_HEAD_K_DIM` (gdn_recurrent_kernels.cu): register state row.
 constant constexpr uint GDN_SCAN_KMAX = 128;
@@ -136,19 +137,8 @@ template <typename T>
   }
 }
 
-#define INST_GDN_SCAN_VARLEN(dtype_tag, mtl_type)                            \
-  template [[host_name("gdn_scan_varlen_" #dtype_tag)]] [[kernel]] void      \
-  gdn_scan_varlen<mtl_type>(                                                 \
-      device       float*    o             [[buffer(0)]],                    \
-      const device mtl_type* conv_out      [[buffer(1)]],                    \
-      const device float*    g             [[buffer(2)]],                    \
-      const device float*    beta          [[buffer(3)]],                    \
-      device       float*    ssm_state     [[buffer(4)]],                    \
-      const device int*      cu_seqlens    [[buffer(5)]],                    \
-      const device int*      state_indices [[buffer(6)]],                    \
-      const device uint*     is_fresh      [[buffer(7)]],                    \
-      uint3 tgid [[threadgroup_position_in_grid]],                           \
-      uint3 tpig [[thread_position_in_grid]]);
+#define INST_GDN_SCAN_VARLEN(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gdn_scan_varlen_##dtype_tag, gdn_scan_varlen<mtl_type>)
 
 INST_GDN_SCAN_VARLEN(f16,  half)
 INST_GDN_SCAN_VARLEN(bf16, bfloat)

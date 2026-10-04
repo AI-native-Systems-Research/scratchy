@@ -10,7 +10,7 @@
 // Output query:[M, num_heads * head_dim]   (= qg[:, h, 0:head_dim])
 // Output gate: [M, num_heads * head_dim]   (= qg[:, h, head_dim:2*head_dim])
 //
-// Function constants:
+// Baked constants:
 //   GATE_SPLIT_N         — per-output element count (= M * num_heads * head_dim)
 //   GATE_SPLIT_HEAD_DIM  — head_dim
 //   GATE_SPLIT_NUM_HEADS — num_heads
@@ -19,12 +19,13 @@
 // the matching gate elem from the interleaved source row.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint GATE_SPLIT_N         [[function_constant(0)]];
-constant uint GATE_SPLIT_HEAD_DIM  [[function_constant(1)]];
-constant uint GATE_SPLIT_NUM_HEADS [[function_constant(2)]];
+SCRATCHY_CONSTANT(uint, GATE_SPLIT_N, 0);
+SCRATCHY_CONSTANT(uint, GATE_SPLIT_HEAD_DIM, 1);
+SCRATCHY_CONSTANT(uint, GATE_SPLIT_NUM_HEADS, 2);
 
 template <typename T>
 [[kernel]] void gate_split(
@@ -48,13 +49,8 @@ template <typename T>
   gate_out[gid] = qg[base + hd];
 }
 
-#define INST_GATE_SPLIT(dtype_tag, mtl_type)                              \
-  template [[host_name("gate_split_" #dtype_tag)]] [[kernel]] void        \
-  gate_split<mtl_type>(                                                   \
-      device       mtl_type* q_out    [[buffer(0)]],                      \
-      device       mtl_type* gate_out [[buffer(1)]],                      \
-      const device mtl_type* qg       [[buffer(2)]],                      \
-      uint gid [[thread_position_in_grid]]);
+#define INST_GATE_SPLIT(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gate_split_##dtype_tag, gate_split<mtl_type>)
 
 INST_GATE_SPLIT(f16,  half)
 INST_GATE_SPLIT(bf16, bfloat)

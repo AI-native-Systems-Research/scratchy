@@ -40,8 +40,8 @@
 // approaches ~1.0×. This mirrors `steel_attention_nax_paged_kernel.h`'s
 // `rope_once_nax` for the simdgroup (head_dim 64/96/128/256) steel path.
 //
-// When ROPE_ON_READ is unset no scratch is bound (the is_function_constant_
-// defined guard folds buffer 8 away), the rope-once kernel is not dispatched,
+// When ROPE_ON_READ is unset no scratch is bound (the slot's `_SET` flag
+// folds buffer 8 away), the rope-once kernel is not dispatched,
 // and the attention reads K directly from the cache exactly as before
 // (non-spans path byte-identical). V is never roped (no RoPE on V).
 
@@ -57,8 +57,8 @@ using namespace mlx::steel;
 // GEMM kernels
 ///////////////////////////////////////////////////////////////////////////////
 
-// Model-level params come in as function constants — pipeline
-// specialization makes them compile-time literals inside the
+// Model-level params come in as baked constants — the bake
+// makes them compile-time literals inside the
 // kernel. Slot numbers mirror `attention_prefill_sdpa_v2_paged`
 // (`attention.metal`) so dispatcher code can share them.
 //
@@ -67,25 +67,25 @@ using namespace mlx::steel;
 // unused in this body — both values are already baked as template
 // parameters (`BD` and `BLOCK_SIZE_`) at metallib-compile time,
 // which is strictly stronger constant folding.
-constant uint  ATTN_PAGED_HEAD_DIM           [[function_constant(0)]];  // unused; ==BD
-constant uint  ATTN_PAGED_NUM_Q_HEADS        [[function_constant(1)]];
-constant uint  ATTN_PAGED_NUM_KV_HEADS       [[function_constant(2)]];
-constant float ATTN_PAGED_SCALE              [[function_constant(3)]];
-constant uint  ATTN_PAGED_BLOCK_SIZE         [[function_constant(4)]];  // unused; ==BLOCK_SIZE_
-constant uint  ATTN_PAGED_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_HEAD_DIM, 0);  // unused; ==BD
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_NUM_Q_HEADS, 1);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_NUM_KV_HEADS, 2);
+SCRATCHY_CONSTANT_OPTIONAL(float, ATTN_PAGED_SCALE, 3);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_BLOCK_SIZE, 4);  // unused; ==BLOCK_SIZE_
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_MAX_BLOCKS_PER_SEQ, 5);
 // Reactive (chunked) KV pool: k_cache/v_cache (buffers 5/6) are
 // per-layer chunk-address TABLES (device uint64 gpuAddresses), not the
 // cache buffers. `PagedBlockLoaderT` derefs
 // `chunk_table[physical / BLOCKS_PER_CHUNK]` per block. See
 // scratchy-target-metal's `BLOCKS_PER_CHUNK`.
-constant uint  ATTN_PAGED_BLOCKS_PER_CHUNK   [[function_constant(6)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_BLOCKS_PER_CHUNK, 6);
 // Sliding-window width (Gemma2/3/4 local layers): a query at absolute
 // position q attends keys k with 0 <= q - k < window. 0 disables the
 // window; the compiler folds every window branch away for
 // full-attention pipelines (the dispatcher always sets slot 7 — 0 for
 // full attention, W::SLIDING_WINDOW for the sliding prefill arm).
 // Same slot/semantics as `ATTN_WINDOW` in attention.metal.
-constant int   ATTN_PAGED_WINDOW             [[function_constant(7)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, ATTN_PAGED_WINDOW, 7);
 
 // Debug toggle. When `ATTN_PAGED_DEBUG_MODE != 0`, the kernel replaces
 // its normal store path with a per-lane marker write so the bench can
@@ -95,19 +95,19 @@ constant int   ATTN_PAGED_WINDOW             [[function_constant(7)]];
 //       — per-lane single-element write, no Otile involvement.
 //   2 = same as 1 but EVERY thread writes regardless of position —
 //       proves the kernel reached this point at all.
-constant uint  ATTN_PAGED_DEBUG_MODE         [[function_constant(99)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_DEBUG_MODE, 99);
 
 // Rope-on-read (spans): same slots/semantics as ATTN_ROT_DIM /
 // ATTN_PAIR_OFF / ATTN_ROPE_ON_READ in attention.metal. Optional — the
-// is_function_constant_defined guard folds the scratch K-source (and
+// slot's `_SET` flag folds the scratch K-source (and
 // buffer 7, the pre-roped K scratch) away when unset, so non-spans steel
 // pipelines are byte-identical. ROPE_ON_READ selects the scratch K-source
 // in `attention_paged` (the K is pre-roped by `rope_once_steel`); rot_dim/
 // pair_off are consumed only by the `rope_once_steel` kernel.
-constant uint  ATTN_PAGED_ROT_DIM            [[function_constant(8)]];
-constant uint  ATTN_PAGED_PAIR_OFF           [[function_constant(9)]];
-constant uint  ATTN_PAGED_ROPE_ON_READ       [[function_constant(10)]];
-constant bool  ATTN_PAGED_ROR_DEFINED = is_function_constant_defined(ATTN_PAGED_ROPE_ON_READ);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_ROT_DIM, 8);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_PAIR_OFF, 9);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_ROPE_ON_READ, 10);
+constant bool  ATTN_PAGED_ROR_DEFINED = ATTN_PAGED_ROPE_ON_READ_SET;
 constant uint  ATTN_PAGED_ROR = ATTN_PAGED_ROR_DEFINED ? ATTN_PAGED_ROPE_ON_READ : 0u;
 
 // Self-only span masking DECOUPLED from rope-on-read. The sliding spans path
@@ -117,8 +117,8 @@ constant uint  ATTN_PAGED_ROR = ATTN_PAGED_ROR_DEFINED ? ATTN_PAGED_ROPE_ON_READ
 // span bytes the spans design requires for content-addressed reuse. This
 // constant gates the seek independently of the K-source. Undefined/0 ⇒
 // byte-identical. Requires span_ids bound (per-token labels).
-constant uint  ATTN_PAGED_SELFONLY_RAW       [[function_constant(14)]];
-constant bool  ATTN_PAGED_SELFONLY_DEF = is_function_constant_defined(ATTN_PAGED_SELFONLY_RAW);
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_PAGED_SELFONLY_RAW, 14);
+constant bool  ATTN_PAGED_SELFONLY_DEF = ATTN_PAGED_SELFONLY_RAW_SET;
 constant uint  ATTN_PAGED_SELFONLY = ATTN_PAGED_SELFONLY_DEF ? ATTN_PAGED_SELFONLY_RAW : 0u;
 
 // ── rope-once kernel (spans rope-on-read, simdgroup steel prefill) ──────────
@@ -292,7 +292,7 @@ void attention_paged(
     // Rope-on-read (spans, rope-once-to-scratch): PRE-ROPED K scratch (dtype
     // T), dense by logical block, written by `rope_once_steel`. Only read when
     // ATTN_PAGED_ROPE_ON_READ; K then comes from here (no per-tile rotation)
-    // instead of the cache. The is_function_constant_defined guard folds this
+    // instead of the cache. The slot's `_SET` flag folds this
     // away when ROR is unset, so the non-spans ABI is the 7-binding form.
     const device T*     k_scratch             [[buffer(7)]],
     // Block-diagonal span attention: per-logical-block span label (slot 8).

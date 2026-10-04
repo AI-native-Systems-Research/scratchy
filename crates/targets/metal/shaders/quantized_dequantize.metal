@@ -18,6 +18,7 @@
 // 1D dispatches still work — set `grid_dim.y == 1`, `index.y == 0`.
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
 
 // `T_act` is the activation / output dtype (f16 or bf16). `T_scale` is the
@@ -49,17 +50,21 @@ inline void affine_dequantize_b4_kernel(
     out[oindex + 1] = scale * T_act((val >> 4) & 0x0f) + bias;
 }
 
-#define DEFINE_AFFINE_DEQUANTIZE_B4(act_tag, act_type, scale_tag, scale_type, gs)        \
-    kernel void affine_dequantize_##act_tag##_s_##scale_tag##_gs_##gs##_b_4(             \
-        const device uint8_t* w           [[buffer(0)]],                                 \
-        const device scale_type* scales   [[buffer(1)]],                                 \
-        const device scale_type* biases   [[buffer(2)]],                                 \
-        device act_type* out              [[buffer(3)]],                                 \
-        uint2 index    [[thread_position_in_grid]],                                      \
-        uint2 grid_dim [[threads_per_grid]]) {                                           \
-        affine_dequantize_b4_kernel<act_type, scale_type, gs>(                           \
-            w, scales, biases, out, index, grid_dim);                                    \
-    }
+template <typename T_act, typename T_scale, const int group_size>
+[[kernel]] void affine_dequantize_b4(
+    const device uint8_t* w        [[buffer(0)]],
+    const device T_scale* scales   [[buffer(1)]],
+    const device T_scale* biases   [[buffer(2)]],
+    device T_act* out              [[buffer(3)]],
+    uint2 index    [[thread_position_in_grid]],
+    uint2 grid_dim [[threads_per_grid]]) {
+    affine_dequantize_b4_kernel<T_act, T_scale, group_size>(
+        w, scales, biases, out, index, grid_dim);
+}
+
+#define DEFINE_AFFINE_DEQUANTIZE_B4(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_dequantize_##act_tag##_s_##scale_tag##_gs_##gs##_b_4,    \
+                  affine_dequantize_b4<act_type, scale_type, gs>)
 
 // Coverage: T_scale=half always (every sampled mlx-community 4bit ships
 // F16 scales/biases — verified `INT4_PARITY_PROBES.md:73,287`). T_act in
@@ -99,9 +104,9 @@ DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half, 128)
 //   buffer(2) biases   : [vocab_size, hidden_size / group_size] T
 //   buffer(3) indices  : [num_tokens] uint32_t
 //   buffer(4) out      : [num_tokens, hidden_size] T
-//   function_constant(0) AFFINE_EMBED_HIDDEN_SIZE : uint = hidden_size
+//   slot 0 AFFINE_EMBED_HIDDEN_SIZE : uint = hidden_size (baked)
 //
-// `hidden_size` rides as a function constant rather than a kernel arg
+// `hidden_size` rides as a baked constant rather than a kernel arg
 // so the bucket-specialized pipeline bakes it in (mirroring
 // `embed_bf16_specialized` in `embed.metal`).
 //
@@ -110,12 +115,11 @@ DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half, 128)
 // checkpoint (`INT4_PARITY_PROBES.md` §2). Add other widths if a model
 // surfaces.
 
-constant uint AFFINE_EMBED_HIDDEN_SIZE [[function_constant(0)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, AFFINE_EMBED_HIDDEN_SIZE, 0);
 // 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8`, matrix-unit
 // tapes); XOR-ing each loaded byte restores them. Unset: as written.
-constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
-constant uint AFFINE_CODES_XOR =
-    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8 ? 0x88u : 0u;
+SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
+constant constexpr uint AFFINE_CODES_XOR = AFFINE_CODES_OFFSET8 ? 0x88u : 0u;
 
 template <typename T_act, typename T_scale, const int group_size>
 inline void affine_embed_b4_kernel(
@@ -151,17 +155,21 @@ inline void affine_embed_b4_kernel(
     out[out_offset + 1] = scale * T_act((val >> 4) & 0x0f) + bias;
 }
 
-#define DEFINE_AFFINE_EMBED_B4(act_tag, act_type, scale_tag, scale_type, gs)             \
-    kernel void affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_4(                  \
-        const device uint8_t* w           [[buffer(0)]],                                 \
-        const device scale_type* scales   [[buffer(1)]],                                 \
-        const device scale_type* biases   [[buffer(2)]],                                 \
-        const device uint*       indices  [[buffer(3)]],                                 \
-        device act_type* out              [[buffer(4)]],                                 \
-        uint2 index    [[thread_position_in_grid]]) {                                    \
-        affine_embed_b4_kernel<act_type, scale_type, gs>(                                \
-            w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);           \
-    }
+template <typename T_act, typename T_scale, const int group_size>
+[[kernel]] void affine_embed_b4(
+    const device uint8_t* w        [[buffer(0)]],
+    const device T_scale* scales   [[buffer(1)]],
+    const device T_scale* biases   [[buffer(2)]],
+    const device uint*    indices  [[buffer(3)]],
+    device T_act* out              [[buffer(4)]],
+    uint2 index    [[thread_position_in_grid]]) {
+    affine_embed_b4_kernel<T_act, T_scale, group_size>(
+        w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);
+}
+
+#define DEFINE_AFFINE_EMBED_B4(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_4,    \
+                  affine_embed_b4<act_type, scale_type, gs>)
 
 DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,    32)
 DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,    64)
@@ -201,17 +209,21 @@ inline void affine_embed_b8_kernel(
     out[out_offset] = scale * T_act(val) + bias;
 }
 
-#define DEFINE_AFFINE_EMBED_B8(act_tag, act_type, scale_tag, scale_type, gs)             \
-    kernel void affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_8(                  \
-        const device uint8_t* w           [[buffer(0)]],                                 \
-        const device scale_type* scales   [[buffer(1)]],                                 \
-        const device scale_type* biases   [[buffer(2)]],                                 \
-        const device uint*       indices  [[buffer(3)]],                                 \
-        device act_type* out              [[buffer(4)]],                                 \
-        uint2 index    [[thread_position_in_grid]]) {                                    \
-        affine_embed_b8_kernel<act_type, scale_type, gs>(                                \
-            w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);           \
-    }
+template <typename T_act, typename T_scale, const int group_size>
+[[kernel]] void affine_embed_b8(
+    const device uint8_t* w        [[buffer(0)]],
+    const device T_scale* scales   [[buffer(1)]],
+    const device T_scale* biases   [[buffer(2)]],
+    const device uint*    indices  [[buffer(3)]],
+    device T_act* out              [[buffer(4)]],
+    uint2 index    [[thread_position_in_grid]]) {
+    affine_embed_b8_kernel<T_act, T_scale, group_size>(
+        w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);
+}
+
+#define DEFINE_AFFINE_EMBED_B8(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_8,    \
+                  affine_embed_b8<act_type, scale_type, gs>)
 
 DEFINE_AFFINE_EMBED_B8(f16,  half,   f16, half,    32)
 DEFINE_AFFINE_EMBED_B8(f16,  half,   f16, half,    64)

@@ -12,7 +12,6 @@ pub mod kernel_bindings;
 pub mod kernel_constants;
 pub mod kernel_identity;
 pub mod lowered;
-pub mod lowering;
 pub mod pipelines;
 
 pub mod forward;
@@ -38,13 +37,13 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 
 /// Reactive (chunked) KV pool granularity — re-exported single source
 /// of truth so the worker (chunk-pool sizing) and the lowering
-/// (chunk-table `[[function_constant]]`) share the exact value the
-/// macro-generated `SynthPreAttn` bakes. See
+/// (the baked chunk-table constant) share one value. See
 /// [`crate::BLOCKS_PER_CHUNK`].
 pub use crate::BLOCKS_PER_CHUNK;
 pub use forward::{ForwardError, ForwardInputs, build_mrope_cos_sin_override};
 pub use pool::{
-    MetalBucketSpec, MetalWorkerPool, PoolBuildError, PooledWorker, RuntimeFactory, WorkerGuard,
+    MetalBucketSpec, MetalRungs, MetalWorkerPool, PickedRung, PoolBuildError, PooledWorker,
+    RuntimeFactory, TqGroup, WorkerGuard, pick_rung,
 };
 pub use runtime::RuntimeBindings;
 pub use worker::{
@@ -64,9 +63,8 @@ pub mod __re {
     use ::objc2::runtime::ProtocolObject;
     pub use ::objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-        MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState,
-        MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstantValues, MTLLibrary,
-        MTLPipelineOption, MTLResourceOptions, MTLSize,
+        MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice,
+        MTLFunction, MTLLibrary, MTLPipelineOption, MTLResourceOptions, MTLSize,
     };
     // MTL4 surfaces re-exported for the side-by-side path.
     // All four are optional

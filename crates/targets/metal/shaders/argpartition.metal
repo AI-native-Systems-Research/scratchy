@@ -22,17 +22,23 @@
 //   c_arg_block_sort_bfloat16_uint32_bn32_tn4
 //   c_arg_block_sort_float16_uint32_bn32_tn4
 //   c_arg_block_sort_float32_uint32_bn32_tn4
-//   c_arg_block_sort_uint32_uint32_bn32_tn4   (used by _gather_sort
-//                                              expert-token reorder)
 //
 // bn=32 tn=4 ⇒ N_PER_BLOCK=128 covers Mixtral (E=8), Qwen2-MoE
-// (E=60), Qwen3-MoE (E=128). Larger MoE configs would need a
-// bn=64 tn=4 instantiation.
+// (E=60), Qwen3-MoE (E=128); bn=64 tn=4 covers E=256.
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
+
+// `ArgsortConstants`, compiled in: the sorted axis's size and the strides
+// MLX's `block_sort` takes (contiguous rows).
+SCRATCHY_CONSTANT(int, SORT_SIZE, 0);
+SCRATCHY_CONSTANT(int, SORT_IN_STRIDE, 1);
+SCRATCHY_CONSTANT(int, SORT_OUT_STRIDE, 2);
+SCRATCHY_CONSTANT(int, SORT_IN_SEGMENT_STRIDE, 3);
+SCRATCHY_CONSTANT(int, SORT_OUT_SEGMENT_STRIDE, 4);
 
 #define MLX_MTL_CONST static constant constexpr const
 #define MLX_MTL_LOOP_UNROLL _Pragma("clang loop unroll(full)")
@@ -323,11 +329,6 @@ template <
 block_sort(
     const device T* inp [[buffer(0)]],
     device U* out [[buffer(1)]],
-    const constant int& size_sorted_axis [[buffer(2)]],
-    const constant int& in_stride_sorted_axis [[buffer(3)]],
-    const constant int& out_stride_sorted_axis [[buffer(4)]],
-    const constant int& in_stride_segment_axis [[buffer(5)]],
-    const constant int& out_stride_segment_axis [[buffer(6)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]) {
   using sort_kernel =
@@ -341,11 +342,11 @@ block_sort(
     sort_kernel::block_sort_impl(
         inp,
         out,
-        size_sorted_axis,
-        in_stride_sorted_axis,
-        out_stride_sorted_axis,
-        in_stride_segment_axis,
-        out_stride_segment_axis,
+        SORT_SIZE,
+        SORT_IN_STRIDE,
+        SORT_OUT_STRIDE,
+        SORT_IN_SEGMENT_STRIDE,
+        SORT_OUT_SEGMENT_STRIDE,
         tgp_vals,
         tgp_idxs,
         tid,
@@ -354,11 +355,11 @@ block_sort(
     sort_kernel::block_sort_impl(
         inp,
         out,
-        size_sorted_axis,
-        in_stride_sorted_axis,
-        out_stride_sorted_axis,
-        in_stride_segment_axis,
-        out_stride_segment_axis,
+        SORT_SIZE,
+        SORT_IN_STRIDE,
+        SORT_OUT_STRIDE,
+        SORT_IN_SEGMENT_STRIDE,
+        SORT_OUT_SEGMENT_STRIDE,
         tgp_vals,
         nullptr,
         tid,
@@ -366,39 +367,20 @@ block_sort(
   }
 }
 
-// `uint32` keys lack simd comparisons in MSL but the LessThan
-// branch above only uses simple `<` so the integer variant works
-// untouched. It's needed by `_gather_sort` (switch_layers.py:12) —
-// the prefill path argsorts the flattened expert-id list to bring
-// every token's experts into contiguous-by-expert order for the
-// per-expert GEMM batch.
-//
 // `bfloat` lacks numeric_limits<>::quiet_NaN() / lowest() under the
 // current Metal toolchain. Cast to bf16's u16 bit pattern is the
 // MLX dance (bf16.h:Limits): for now this kernel handles bf16 by
 // upcasting load → float, sort as float, store back as bf16 — done
 // by an outer wrapper layer in the lowering arm.
 
-#define INSTANTIATE_ARG_SORT(itname, itype, bn, tn)                    \
-  template [[host_name("c_arg_block_sort_" #itname "_uint32_bn" #bn    \
-                       "_tn" #tn)]] [[kernel]] void                    \
-  block_sort<itype, uint, true, bn, tn>(                               \
-      const device itype* inp [[buffer(0)]],                           \
-      device uint* out [[buffer(1)]],                                  \
-      const constant int& size_sorted_axis [[buffer(2)]],              \
-      const constant int& in_stride_sorted_axis [[buffer(3)]],         \
-      const constant int& out_stride_sorted_axis [[buffer(4)]],        \
-      const constant int& in_stride_segment_axis [[buffer(5)]],        \
-      const constant int& out_stride_segment_axis [[buffer(6)]],       \
-      uint3 tid [[threadgroup_position_in_grid]],                      \
-      uint3 lid [[thread_position_in_threadgroup]]);
+#define INSTANTIATE_ARG_SORT(itname, itype, bn, tn)                 \
+  SCRATCHY_KERNEL(c_arg_block_sort_##itname##_uint32_bn##bn##_tn##tn, \
+                  block_sort<itype, uint, true, bn, tn>)
 
 INSTANTIATE_ARG_SORT(float32, float, 32, 4)
 INSTANTIATE_ARG_SORT(float16, half, 32, 4)
 INSTANTIATE_ARG_SORT(bfloat16, bfloat, 32, 4)
-INSTANTIATE_ARG_SORT(uint32, uint, 32, 4)
 INSTANTIATE_ARG_SORT(float32, float, 64, 4)
-INSTANTIATE_ARG_SORT(uint32, uint, 64, 4)
 // bn=64 tn=4 ⇒ N_PER_BLOCK=256: Qwen3.5-MoE router (E=256). The bn=32
 // variants above cap at 128 experts.
 INSTANTIATE_ARG_SORT(float16, half, 64, 4)

@@ -4,7 +4,7 @@
 //!
 //! Both compute C = A @ B^T. The dynamic dim (N for QKᵀ, K for PV) is read from
 //! `seq_used[0]`. CRUCIALLY the PV case exercises a **weight row stride
-//! (`w_ld` = GEMM_K = max_kv) LARGER than the contraction (`K` = kv_len)** with
+//! (`w_ld` = GEMM_PV_W_LD = max_kv) LARGER than the contraction (`K` = kv_len)** with
 //! the tail columns zeroed — the exact shape of the V^T dense buffer in the
 //! model (gathered at static stride max_kv, contracted over only kv_len). This
 //! guards the latent bug where the GEMM strode the weight by `kv_len` instead of
@@ -17,12 +17,10 @@ use std::ptr::NonNull;
 
 use half::bf16;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
-use objc2_metal::{
-    MTLBuffer, MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions,
-    MTLSize,
-};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 fn shared(
     device: &ProtocolObject<dyn MTLDevice>,
@@ -43,27 +41,12 @@ fn as_bytes<T: Copy>(s: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
-fn set_u32(fc: &MTLFunctionConstantValues, val: u32, idx: usize) {
-    unsafe {
-        fc.setConstantValue_type_atIndex(
-            NonNull::new(&val as *const u32 as *mut c_void).unwrap(),
-            MTLDataType::UInt,
-            idx,
-        );
-    }
-}
-
 fn run_and_check(qk: bool) {
     let Some(device) = detect_device() else {
         eprintln!("skipping: no Metal 4 GPU");
         return;
     };
     let dev = &device.device;
-    let src = include_str!("../shaders/gemm.metal");
-    let opts = objc2_metal::MTLCompileOptions::new();
-    let lib = dev
-        .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
-        .expect("compile gemm.metal");
 
     let m = 12u32; // Lq
     // (contraction kc, output N live, output N grid-max, weight row stride w_ld)
@@ -97,25 +80,23 @@ fn run_and_check(qk: bool) {
     let seq_used = [if qk { n_live } else { kc }]; // QKᵀ→N, PV→K
     let seq_buf = shared(dev, as_bytes(&seq_used));
 
-    let fc = MTLFunctionConstantValues::new();
-    set_u32(&fc, m, 0); // GEMM_M
-    if qk {
-        set_u32(&fc, w_ld, 2); // GEMM_K = hd (== w_ld, contiguous kdense)
-    } else {
-        set_u32(&fc, n_live, 1); // GEMM_N = hd
-        set_u32(&fc, w_ld, 2); // GEMM_K = max_kv (V^T row stride)
-    }
+    let constants = match qk {
+        // GEMM_M; GEMM_K = hd (== w_ld, contiguous kdense).
+        true => vec![ConstantValue::uint(0, m), ConstantValue::uint(2, w_ld)],
+        // GEMM_M; GEMM_N = hd; GEMM_PV_W_LD = max_kv (V^T row stride, set at load).
+        false => vec![
+            ConstantValue::uint(0, m),
+            ConstantValue::uint(1, n_live),
+            ConstantValue::uint(4, w_ld),
+        ],
+    };
     let fn_name = if qk { "gemm_bf16_qk" } else { "gemm_bf16_pv" };
-    let func = lib
-        .newFunctionWithName_constantValues_error(&NSString::from_str(fn_name), &fc)
+    let pipeline = baked_pipeline(dev, "gemm", fn_name, constants)
         .unwrap_or_else(|e| panic!("{fn_name}: {e:?}"));
-    let pipeline = dev
-        .newComputePipelineStateWithFunction_error(&func)
-        .expect("pipeline");
 
     // Production MTL4 dispatch: buffers bound at argument-table indices
     // matching the kernel's buffer(0..3) — out(0), A(1), B(2), seq(3).
-    // Scalars (GEMM_M/N/K) are baked as function constants, so there are
+    // Scalars (GEMM_M/N/K, the PV stride) are constants, so there are
     // no setBytes operands. dispatchThreads' exact extent becomes
     // ceil-divided threadgroups; the kernel bounds-checks so it is
     // bit-identical to the classic path.

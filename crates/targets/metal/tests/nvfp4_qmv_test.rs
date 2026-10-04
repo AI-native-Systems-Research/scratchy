@@ -15,11 +15,11 @@
 mod common;
 
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
     QmmTKernel, QmvKernel, qmm_t_dispatch_shape, qmv_dispatch_shape,
 };
-use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 const KE2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
@@ -115,7 +115,6 @@ fn run_nvfp4_qmv(
     k: usize,
 ) -> Option<Vec<half::bf16>> {
     let device = detect_device()?.device;
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
 
     // nvfp4 5-buffer layout (matches affine): w[0], scales[1],
     // biases[2]=scales (dummy, unused for nvfp4), x[3], y[4].
@@ -124,13 +123,17 @@ fn run_nvfp4_qmv(
     let x_buf = common::shared_slice(&device, x);
     let y_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<half::bf16>());
 
-    let constants = [
+    let constants = vec![
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),
     ];
-    let pipeline = cache
-        .get_pipeline_specialized("nvfp4_qmv_bf16_s_f16_gs_16_b_4_batch_0", &constants)
-        .expect("nvfp4_qmv pipeline");
+    let pipeline = baked_pipeline(
+        &device,
+        "quantized_qmv",
+        "nvfp4_qmv_bf16_s_f16_gs_16_b_4_batch_0",
+        constants,
+    )
+    .expect("nvfp4_qmv pipeline");
 
     let (tg, tpg) = qmv_dispatch_shape(QmvKernel::Generic, m as u32, n as u32, 1);
     if !common::dispatch_threadgroups(
@@ -157,7 +160,6 @@ fn run_nvfp4_qmm_t(
     aligned_n: bool,
 ) -> Option<Vec<half::bf16>> {
     let device = detect_device()?.device;
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
 
     // 5-buffer layout (matches affine): w,scales,biases=scales,x,y.
     let w_buf = common::shared_slice(&device, weight);
@@ -165,8 +167,8 @@ fn run_nvfp4_qmm_t(
     let x_buf = common::shared_slice(&device, x);
     let y_buf = common::shared_zeroed(&device, m * n * std::mem::size_of::<half::bf16>());
 
-    // qmm_t function constants: QMM_K(0), QMM_N(1), QMM_M(2).
-    let constants = [
+    // qmm_t constants: QMM_K(0), QMM_N(1), QMM_M(2).
+    let constants = vec![
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),
         ConstantValue::int(2, m as i32),
@@ -176,9 +178,8 @@ fn run_nvfp4_qmm_t(
     } else {
         "nvfp4_qmm_t_bf16_s_f16_gs_16_b_4_alN_false_batch_0"
     };
-    let pipeline = cache
-        .get_pipeline_specialized(fname, &constants)
-        .expect("nvfp4_qmm_t pipeline");
+    let pipeline =
+        baked_pipeline(&device, "quantized_qmm", fname, constants).expect("nvfp4_qmm_t pipeline");
 
     let (tg, tpg) = qmm_t_dispatch_shape(QmmTKernel::Standard, m as u32, n as u32, 1);
     if !common::dispatch_threadgroups(

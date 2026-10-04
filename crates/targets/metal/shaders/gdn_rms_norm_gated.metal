@@ -16,7 +16,7 @@
 // `weight` (`linear_attn.norm.weight`) is **float32 on disk** (kept un-cast
 // by the loader), so it is bound as `float*` regardless of `T`.
 //
-// Function constants:
+// Baked constants:
 //   GDN_RMS_D    — head_v_dim (the per-row reduction width)
 //   GDN_RMS_ROWS — total_rows (= num_tokens * num_v_heads)
 //   GDN_RMS_EPS  — rms_norm_eps
@@ -24,12 +24,13 @@
 // Dispatch: one threadgroup per row; threadgroup reduction over d.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint  GDN_RMS_D    [[function_constant(0)]];
-constant uint  GDN_RMS_ROWS [[function_constant(1)]];
-constant float GDN_RMS_EPS  [[function_constant(2)]];
+SCRATCHY_CONSTANT(uint, GDN_RMS_D, 0);
+SCRATCHY_CONSTANT(uint, GDN_RMS_ROWS, 1);
+SCRATCHY_CONSTANT(float, GDN_RMS_EPS, 2);
 
 template <typename T>
 [[kernel]] void gdn_rms_norm_gated(
@@ -72,16 +73,8 @@ template <typename T>
   }
 }
 
-#define INST_GDN_RMS_NORM_GATED(dtype_tag, mtl_type)                      \
-  template [[host_name("gdn_rms_norm_gated_" #dtype_tag)]] [[kernel]] void\
-  gdn_rms_norm_gated<mtl_type>(                                          \
-      device       mtl_type* out    [[buffer(0)]],                        \
-      const device float*    x      [[buffer(1)]],                        \
-      const device mtl_type* z      [[buffer(2)]],                        \
-      const device float*    weight [[buffer(3)]],                        \
-      uint gid     [[threadgroup_position_in_grid]],                      \
-      uint tid     [[thread_position_in_threadgroup]],                    \
-      uint tg_size [[threads_per_threadgroup]]);
+#define INST_GDN_RMS_NORM_GATED(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gdn_rms_norm_gated_##dtype_tag, gdn_rms_norm_gated<mtl_type>)
 
 INST_GDN_RMS_NORM_GATED(f16,  half)
 INST_GDN_RMS_NORM_GATED(bf16, bfloat)

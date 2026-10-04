@@ -319,16 +319,23 @@ pub trait ScratchyWeights: Send + Sync {
         &[]
     }
 
-    /// Per-canonical metal dtype. The macro emits an override
-    /// returning `<Self as CanonicalParams>::METAL_DTYPE` so the
-    /// worker can route argmax / weight-loader / etc. between
-    /// the f16 and bf16 paths without monomorphizing on `W`.
-    /// Default `Bf16` matches the trait-level default and the
-    /// modern HF checkpoint dtype.
+    /// The kernels this model runs on its logits outside its tape (argmax,
+    /// grammar mask, sampler), baked at expansion with its logits width and
+    /// dtype: a `scratchy_target_metal::off_tape::OffTapeKernels`, typed `Any`
+    /// because this crate cannot name the metal crate (as [`Self::ktir_bundle`]).
     #[cfg(feature = "metal")]
-    fn metal_dtype(&self) -> scratchy_tensors::MetalDtype {
-        scratchy_tensors::MetalDtype::Bf16
-    }
+    fn metal_off_tape(&self) -> &'static (dyn core::any::Any + Send + Sync);
+
+    /// The model's baked tape rungs, a `scratchy_target_metal::interpreter::metal::MetalRungs`
+    /// typed `Any` (as [`Self::metal_off_tape`]): the worker picks the rung its pool will run on
+    /// from them before the pool exists — the KV pool's block-table width, the memory budget.
+    #[cfg(feature = "metal")]
+    fn metal_rungs(&self) -> &'static (dyn core::any::Any + Send + Sync);
+
+    /// The model's `CanonicalParams::METAL_DTYPE`, so the worker can size
+    /// its KV cache without monomorphizing on `W`.
+    #[cfg(feature = "metal")]
+    fn metal_dtype(&self) -> scratchy_tensors::MetalDtype;
 
     /// Metal forward + caller-supplied follow-on hook chained on
     /// the forward CB's shared event. Used by the executor to

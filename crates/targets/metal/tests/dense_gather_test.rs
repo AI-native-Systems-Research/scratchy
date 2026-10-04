@@ -13,12 +13,10 @@ use std::ptr::NonNull;
 
 use half::f16;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
-use objc2_metal::{
-    MTLBuffer, MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions,
-    MTLSize,
-};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 // Small, all-f16-exact shapes (values <= 191 are exact in f16).
 const HEAD_DIM: u32 = 8;
@@ -55,40 +53,21 @@ fn dense_gather_kvmajor_copy_matches_reference() {
     };
     let dev = &device.device;
 
-    // Compile the kernel from source (bfloat in-file needs default opts).
-    let src = include_str!("../shaders/attention_dense_gather.metal");
-    let opts = objc2_metal::MTLCompileOptions::new();
-    let library = dev
-        .newLibraryWithSource_options_error(&NSString::from_str(src), Some(&opts))
-        .expect("compile attention_dense_gather.metal");
-
-    // Function constants used by the COPY kernel: 0=head_dim,1=num_kv,2=block_size,3=blocks_per_chunk.
-    let constants = MTLFunctionConstantValues::new();
+    // Constants of the COPY kernel: 0=head_dim,1=num_kv,2=block_size,3=blocks_per_chunk, and
+    // the load-time 6=GDK_MAX_KV stride (== kv_len for this test's packed dst).
     let blocks_per_chunk: u32 = 0; // single chunk
-    unsafe {
-        for (val, idx) in [
-            (HEAD_DIM, 0u32),
-            (NUM_KV, 1),
-            (BLOCK_SIZE, 2),
-            (blocks_per_chunk, 3),
-            (KV_LEN, 6), // GDK_MAX_KV stride == kv_len for this test's packed dst
-        ] {
-            constants.setConstantValue_type_atIndex(
-                NonNull::new(&val as *const u32 as *mut c_void).unwrap(),
-                MTLDataType::UInt,
-                idx as usize,
-            );
-        }
-    }
-    let func = library
-        .newFunctionWithName_constantValues_error(
-            &NSString::from_str("gather_dense_kvmajor_copy_f16"),
-            &constants,
-        )
-        .expect("specialize gather_dense_kvmajor_copy_f16");
-    let pipeline = dev
-        .newComputePipelineStateWithFunction_error(&func)
-        .expect("pipeline");
+    let constants = [HEAD_DIM, NUM_KV, BLOCK_SIZE, blocks_per_chunk, KV_LEN]
+        .into_iter()
+        .zip([0u16, 1, 2, 3, 6])
+        .map(|(val, slot)| ConstantValue::uint(slot, val))
+        .collect();
+    let pipeline = baked_pipeline(
+        dev,
+        "attention_dense_gather",
+        "gather_dense_kvmajor_copy_f16",
+        constants,
+    )
+    .expect("gather_dense_kvmajor_copy_f16");
 
     // Paged K buffer: [phys_block, kv_head, tib, dim], block-major.
     let kv_blk_stride = (NUM_KV * BLOCK_SIZE * HEAD_DIM) as usize;

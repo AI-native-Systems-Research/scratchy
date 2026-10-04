@@ -32,6 +32,10 @@ use super::pipelines::SpecializedPipelines;
 use super::runtime::{Padding, RuntimeBindings};
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
+use crate::tape::constants::TapeVariant;
+use crate::tape::ids::{HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads};
+use crate::tape::lowered::{ClassedTape, KvAddressing};
+use objc2::runtime::ProtocolObject;
 use scratchy_ir::{CanonicalParams, Instruction};
 
 /// One bucket's compile-time data, ready to be lowered + handed to a
@@ -83,12 +87,14 @@ pub struct MetalBucketSpec {
     /// lower_bucket` for the analysis.
     pub backbone_barriers: &'static [bool],
     pub lm_head_barriers: &'static [bool],
-    /// The macro-baked tape variants for this bucket — one per
-    /// (generation class × chunked-addressing) pair. The pool selects
-    /// the matching variant at load and materializes it with the
-    /// runtime block-table capacity. Empty only in cuda-macro builds,
-    /// where the metal statics are cfg'd out anyway.
+    /// The macro-baked tape rungs for this bucket — one per (generation
+    /// class × chunked addressing × KV cap × TurboQuant decode heads). The
+    /// pool picks one at load. Empty in cuda-macro builds, where the metal
+    /// statics are cfg'd out anyway, and for a canonical the front end refused.
     pub tapes: &'static [crate::tape::lowered::ClassedTape],
+    /// Every kernel of a baked library ([`crate::aot::baked_library`]) the model's tapes name,
+    /// compiled with its constants: the model's one table, which each of its buckets names.
+    pub kernels: &'static [crate::tape::lowered::BakedKernel],
 }
 
 impl Clone for MetalBucketSpec {
@@ -102,23 +108,26 @@ impl Copy for MetalBucketSpec {}
 /// Errors surfaced by [`MetalWorkerPool::for_buckets`] before the pool
 /// reaches its first eager-spawn `WorkerError` path.
 ///
-/// Covers (a) the `with_standard_shaders` shader-compile call —
+/// Covers (a) the pipeline cache's library loads —
 /// distinct from per-worker `WorkerError::PipelineLookup` because the
-/// failure is one-shot and pre-pool; (b) per-bucket `lower()` failures
-/// — the macro should make these structurally impossible, but
-/// surfacing them with `bucket_m` context beats panicking when a
-/// future variant slips through; (c) any `WorkerError` from the
+/// failure is one-shot and pre-pool; (b) a bucket with no baked rung for
+/// the device and KV capacity; (c) any `WorkerError` from the
 /// inner [`MetalWorkerPool::new`] call.
 #[derive(Debug)]
 pub enum PoolBuildError {
-    /// `SpecializedPipelineCache::with_standard_shaders` failed —
-    /// usually a missing or malformed MSL source. Message is the
+    /// A baked or synthesized library failed to load. Message is the
     /// underlying [`MetalStreamError`](crate::stream::MetalStreamError).
     PipelineCacheBuild(String),
-    /// One bucket's [`lower`] failed. `bucket_m` identifies the row
-    /// for the model author; `error` is the `Display` of the
-    /// underlying [`LoweringError`].
-    BucketLower { bucket_m: u32, error: String },
+    /// Bucket `bucket_m` has no baked rung for this device whose KV cap holds `need` blocks per
+    /// sequence (none at all for a canonical the front end refused).
+    NoRung {
+        bucket_m: u32,
+        need: MaxBlocksPerSeq,
+    },
+    /// The device's name names no chip generation a tape is baked for.
+    UnknownDevice(String),
+    /// `ScratchyWeights::metal_rungs` handed out something other than [`MetalRungs`].
+    NotMetalRungs,
     /// The eager-spawn first worker (or any structural pool prereq)
     /// reported a [`WorkerError`].
     Worker(WorkerError),
@@ -138,9 +147,19 @@ impl std::fmt::Display for PoolBuildError {
                 f,
                 "MetalWorkerPool::for_buckets: pipeline cache build failed: {s}"
             ),
-            Self::BucketLower { bucket_m, error } => write!(
+            Self::NoRung { bucket_m, need } => write!(
                 f,
-                "MetalWorkerPool::for_buckets: lowering bucket M={bucket_m} failed: {error}"
+                "MetalWorkerPool::for_buckets: bucket M={bucket_m} has no baked tape rung for \
+                 this device that holds {} KV blocks per sequence",
+                need.get()
+            ),
+            Self::NotMetalRungs => f.write_str(
+                "MetalWorkerPool: the model's `metal_rungs` is not a `MetalRungs` (stale build)",
+            ),
+            Self::UnknownDevice(name) => write!(
+                f,
+                "MetalWorkerPool::for_buckets: device `{name}` is no chip generation a tape is \
+                 baked for"
             ),
             Self::Worker(e) => write!(f, "MetalWorkerPool::for_buckets: {e}"),
             Self::NoBuckets => write!(f, "MetalWorkerPool::for_buckets: bucket_specs is empty"),
@@ -261,6 +280,9 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape]>,
+    /// The KV cap rung the tapes are baked for: the row stride each step's block tables are laid
+    /// out at.
+    block_table_stride: MaxBlocksPerSeq,
     /// Every model tensor the tapes bind, resolved once in [`Self::new`].
     sources: ResolvedSources,
     arena_layout: Arc<ArenaLayout>,
@@ -352,6 +374,149 @@ fn probe_mtl4_availability(device: &Device) {
     tracing::info!(target: "scratchy-target-metal", available, "mtl4 capability probe");
 }
 
+/// The TurboQuant decode group whose query heads per threadgroup the device picks
+/// ([`TqDecodeHeads::for_group`]).
+#[derive(Clone, Copy)]
+pub struct TqGroup {
+    pub head_dim: HeadDim,
+    pub q_heads: NumQHeads,
+    pub kv_heads: NumKvHeads,
+}
+
+/// A model's baked tape rungs: what a caller picks the rung its pool runs on from
+/// ([`pick_rung`]) — before the pool exists (the KV pool's block-table width, the memory budget)
+/// as the pool itself does.
+#[derive(Clone, Copy)]
+pub struct MetalRungs {
+    pub buckets: &'static [MetalBucketSpec],
+    pub tq: TqGroup,
+}
+
+/// The rung a pool runs on: its KV cap, which is the row width of every step's block tables, and
+/// the tape each kept bucket runs.
+pub struct PickedRung<'a> {
+    pub cap: MaxBlocksPerSeq,
+    /// The query heads one TurboQuant decode threadgroup serves on this device.
+    pub tq_heads: TqDecodeHeads,
+    pub tapes: Vec<(&'a MetalBucketSpec, &'a ClassedTape)>,
+}
+
+impl PickedRung<'_> {
+    /// The values the picked tapes' variant-bound constants take.
+    pub fn variant(&self) -> TapeVariant {
+        TapeVariant {
+            cap: self.cap,
+            tq_heads: Some(self.tq_heads),
+        }
+    }
+}
+
+impl PickedRung<'_> {
+    /// The bytes of the scratch buffers a worker allocates for these tapes: each buffer the
+    /// largest any tape needs.
+    pub fn scratch_bytes(&self) -> u64 {
+        let tapes = || self.tapes.iter().map(|(_, rung)| rung.tape.scratch_bytes());
+        (0..4)
+            .map(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
+            .sum()
+    }
+}
+
+/// Pick the macro-baked rung a pool on `device` runs: the device's generation class and
+/// TurboQuant decode heads, the workload's `addressing`, and the smallest KV cap rung that holds
+/// `block_cap` blocks per sequence. Selection only; every fact of each tape was baked at macro
+/// expansion.
+///
+/// The buckets are those up to `max_bucket_m`, the cap the worker derived from the memory budget
+/// (at least the smallest, so decode and minimal prefill still run on a memory-starved device),
+/// less any whose tape cannot exist at the rung (its scratch outgrows the 32-bit offsets its
+/// kernels bind: no such rung was baked). Longer prompts chunk to the largest kept bucket via
+/// `pick_bucket`.
+pub fn pick_rung<'a>(
+    device: &ProtocolObject<dyn MTLDevice>,
+    bucket_specs: &'a [MetalBucketSpec],
+    tq: TqGroup,
+    max_bucket_m: Option<u32>,
+    block_cap: usize,
+    addressing: KvAddressing,
+) -> Result<PickedRung<'a>, PoolBuildError> {
+    let smallest = bucket_specs
+        .iter()
+        .min_by_key(|s| s.bucket_m)
+        .ok_or(PoolBuildError::NoBuckets)?;
+    let affords = |s: &&MetalBucketSpec| max_bucket_m.is_none_or(|cap| s.bucket_m <= cap);
+    let mut buckets: Vec<&MetalBucketSpec> = bucket_specs.iter().filter(affords).collect();
+    if buckets.is_empty() {
+        buckets.push(smallest);
+    }
+    let profile = crate::device::known_profile(device)
+        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
+    let gen_class = crate::tape::lowered::GenClass::of(profile.generation);
+    let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
+    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
+    let tq_heads = TqDecodeHeads::for_group(tq.head_dim, tq.q_heads, tq.kv_heads, gpu_cores);
+    let serves = |t: &&ClassedTape| {
+        t.gen_class == gen_class
+            && t.addressing == addressing
+            && t.tq_heads.is_none_or(|h| h == tq_heads)
+    };
+    let no_rung = |s: &MetalBucketSpec| PoolBuildError::NoRung {
+        bucket_m: s.bucket_m,
+        need,
+    };
+    // A bucket that baked no tape for the device is a canonical the front end refused.
+    if let Some(s) = buckets.iter().find(|s| !s.tapes.iter().any(|t| serves(&t))) {
+        return Err(no_rung(s));
+    }
+    let caps = buckets.iter().flat_map(|s| s.tapes.iter().filter(serves));
+    let cap =
+        (caps.map(|t| t.cap).filter(|&c| c >= need).min()).ok_or_else(|| no_rung(buckets[0]))?;
+    let tapes: Vec<_> = (buckets.iter())
+        .filter_map(|s| Some((*s, s.tapes.iter().filter(serves).find(|t| t.cap == cap)?)))
+        .collect();
+    tracing::info!(
+        target: "scratchy-target-metal",
+        gpu_cores = gpu_cores.get(),
+        tq_decode_heads = tq_heads.get(),
+        kv_cap_rung = cap.get(),
+        buckets = tapes.len(),
+        "baked tape rung"
+    );
+    Ok(PickedRung {
+        cap,
+        tq_heads,
+        tapes,
+    })
+}
+
+impl MetalRungs {
+    /// The rungs `ScratchyWeights::metal_rungs` hands out (typed there as `Any`: the trait cannot
+    /// name this crate).
+    pub fn of(
+        baked: &'static (dyn std::any::Any + Send + Sync),
+    ) -> Result<&'static Self, PoolBuildError> {
+        baked.downcast_ref().ok_or(PoolBuildError::NotMetalRungs)
+    }
+
+    /// [`pick_rung`] over this model's buckets.
+    pub fn pick(
+        &self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        max_bucket_m: Option<u32>,
+        block_cap: usize,
+        addressing: KvAddressing,
+    ) -> Result<PickedRung<'static>, PoolBuildError> {
+        pick_rung(
+            device,
+            self.buckets,
+            self.tq,
+            max_bucket_m,
+            block_cap,
+            addressing,
+        )
+    }
+}
+
 impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// Build the pool and eagerly create the first worker.
     ///
@@ -365,6 +530,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         allocator: Arc<MetalAllocator>,
         pipelines: Arc<SpecializedPipelines>,
         bucket_tapes: Arc<[LoweredMetalTape]>,
+        block_table_stride: MaxBlocksPerSeq,
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
@@ -394,6 +560,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
+            block_table_stride,
             sources,
             arena_layout: Arc::new(arena_layout),
             runtime_factory,
@@ -435,40 +602,29 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         max_workers: usize,
         max_bucket_m: Option<u32>,
         // Runtime per-sequence block-table capacity
-        // (`KvCachePool::max_blocks_per_seq`). Replaces the compile-time
-        // `W::MAX_BLOCKS_PER_SEQ` for the kernel's `MaxBlocksPerSeq` function
-        // constant + the rope-once `roped_k_scratch` size, so long context
-        // isn't truncated and the host block-table stride matches.
+        // (`KvCachePool::max_blocks_per_seq`), a KV cap rung itself (see
+        // [`pick_rung`]): every step's block tables are rows of this width.
         block_cap: usize,
+        addressing: KvAddressing,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
     {
-        if bucket_specs.is_empty() {
-            return Err(PoolBuildError::NoBuckets);
-        }
-
-        // Target-reactive pruning: keep only buckets the device can afford
-        // (`bucket_m <= max_bucket_m`, the cap the worker derived from the
-        // memory budget). The arena below is colored over the KEPT specs, so
-        // pruning the top buckets is exactly what shrinks the resident arena to
-        // fit the KV budget. Always keep at least the smallest bucket so decode
-        // + minimal prefill still run on a memory-starved device; longer
-        // prompts then chunk to the largest kept bucket via `pick_bucket`.
-        let kept: Vec<&MetalBucketSpec> = match max_bucket_m {
-            Some(cap) => {
-                let mut v: Vec<&MetalBucketSpec> =
-                    bucket_specs.iter().filter(|s| s.bucket_m <= cap).collect();
-                if v.is_empty()
-                    && let Some(smallest) = bucket_specs.iter().min_by_key(|s| s.bucket_m)
-                {
-                    v.push(smallest);
-                }
-                v
-            }
-            None => bucket_specs.iter().collect(),
+        let tq = TqGroup {
+            head_dim: HeadDim(W::GLOBAL_HEAD_DIM),
+            q_heads: NumQHeads(W::NUM_Q_HEADS),
+            kv_heads: NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
         };
-        let bucket_specs: &[&MetalBucketSpec] = &kept;
+        let rung = pick_rung(
+            &device,
+            bucket_specs,
+            tq,
+            max_bucket_m,
+            block_cap,
+            addressing,
+        )?;
+        let variant = rung.variant();
+        let picked = rung.tapes;
 
         // Worker arena is sized for the largest activation across every
         // bucket, AND for the largest colored slot count across buckets.
@@ -482,13 +638,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // serves every bucket; smaller buckets simply leave the tail
         // slots resident and idle. `arena_bytes` is elementwise-maxed
         // over whatever slots each spec defines.
-        let num_slots = bucket_specs
-            .iter()
-            .map(|s| s.num_arena_slots as usize)
+        let num_slots = (picked.iter())
+            .map(|(s, _)| s.num_arena_slots as usize)
             .max()
             .unwrap_or(0);
         let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
-        for spec in bucket_specs {
+        for (spec, _) in &picked {
             for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
                 if bytes > arena_layout[slot] {
                     arena_layout[slot] = bytes;
@@ -496,62 +651,18 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
 
-        let mut cache = SpecializedPipelineCache::with_standard_shaders((*device).clone())
+        let cache = SpecializedPipelineCache::new((*device).clone(), &[])
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
-        // Compiler-driven synthesis: each Metal arch exposes its macro-generated synthesized
-        // kernel metallibs via `W::synthesized_kernel_metallibs()`,
-        // loaded via `newLibraryWithData`.
-        for (name, bytes) in W::synthesized_kernel_metallibs() {
-            cache.register_metallib_library(name, bytes).map_err(|e| {
-                PoolBuildError::PipelineCacheBuild(format!("synthesized kernel `{name}`: {e:?}"))
-            })?;
+        let mut tables: Vec<&[crate::tape::lowered::BakedKernel]> = Vec::new();
+        for (spec, _) in &picked {
+            if !tables.iter().any(|t| std::ptr::eq(*t, spec.kernels)) {
+                tables.push(spec.kernels);
+                cache.register_baked(spec.kernels);
+            }
         }
-        let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache)));
-
-        // Select each bucket's macro-baked tape variant: generation
-        // class from the detected device, chunked addressing from the
-        // spec-decode flag — then substitute the runtime block-table
-        // capacity. Selection + substitution only; the lowering ran at
-        // macro expansion.
-        let gen_class = crate::tape::lowered::GenClass::of(
-            crate::detect_device()
-                .map(|d| d.profile.generation)
-                .unwrap_or(crate::tape::targets::AppleSiliconGen::M1),
-        );
-        let chunked = crate::tape::lowering::chunked_attention_addressing_forced();
-        // Runtime block-table capacity as u32 (function constants +
-        // scratch sizing are u32). Floor at 1 so a degenerate cap
-        // (e.g. the empty-for-vision pool) never zero-sizes scratch.
-        let block_cap_u32: u32 = block_cap.clamp(1, u32::MAX as usize) as u32;
-        use crate::tape::ids::{HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
-        let gpu_cores = crate::device::gpu_cores(&device).ok_or(PoolBuildError::UnknownGpuCores)?;
-        let tq_heads = TqDecodeHeads::for_group(
-            HeadDim(W::GLOBAL_HEAD_DIM),
-            NumQHeads(W::NUM_Q_HEADS),
-            NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
-            gpu_cores,
-        );
-        tracing::info!(
-            target: "scratchy-target-metal",
-            gpu_cores = gpu_cores.get(),
-            tq_decode_heads = tq_heads.get(),
-            "query heads per TurboQuant decode threadgroup"
-        );
-        let mut tapes: Vec<LoweredMetalTape> = Vec::with_capacity(bucket_specs.len());
-        for spec in bucket_specs {
-            let variant = spec
-                .tapes
-                .iter()
-                .find(|t| t.gen_class == gen_class && t.chunked == chunked)
-                .ok_or_else(|| PoolBuildError::BucketLower {
-                    bucket_m: spec.bucket_m,
-                    error: format!(
-                        "no baked tape variant for gen_class={gen_class:?} chunked={chunked}"
-                    ),
-                })?;
-            tapes.push(variant.materialize(block_cap_u32, tq_heads));
-        }
+        let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
+        let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
 
         Self::new(
             device,
@@ -559,6 +670,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
+            variant.cap,
             arena_layout,
             runtime_factory,
             max_workers,
@@ -1064,7 +1176,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
 
         let guard = self.checkout()?;
-        begin_step(&guard, inputs)?;
+        begin_step(&guard, inputs, self.block_table_stride)?;
 
         // Caller's body encodes the entire chain onto the encoder.
         let (body_result, took) = self.submit(|enc| body(&guard.worker, &guard.runtime, enc))?;
@@ -1160,7 +1272,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
 
         let guard = self.checkout()?;
-        begin_step(&guard, inputs)?;
+        begin_step(&guard, inputs, self.block_table_stride)?;
 
         // All execution goes through the MTL4 path. (The opt-in MTL3
         // dispatch path was removed — it only ever ran the all-dispatch
@@ -1269,9 +1381,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 fn begin_step<W: CanonicalParams>(
     worker: &PooledWorker<W>,
     inputs: &ForwardInputs<'_>,
+    block_table_stride: MaxBlocksPerSeq,
 ) -> Result<(), ForwardError> {
     use std::sync::atomic::Ordering::Relaxed;
-    write_runtime_inputs(&worker.runtime, inputs)?;
+    write_runtime_inputs(&worker.runtime, inputs, block_table_stride)?;
     worker
         .worker
         .tq_dequant_max_blocks
@@ -1327,6 +1440,7 @@ fn tq_dequant_block_width(inputs: &ForwardInputs<'_>) -> u32 {
 fn write_runtime_inputs(
     runtime: &RuntimeBindings,
     inputs: &ForwardInputs<'_>,
+    block_table_stride: MaxBlocksPerSeq,
 ) -> Result<(), ForwardError> {
     write_input(
         runtime,
@@ -1404,8 +1518,17 @@ fn write_runtime_inputs(
             &inputs.positions[..inputs.positions.len().min(8)],
         );
     }
-    // Per-KV-cache-group block tables (group 0 = full, then sliding).
+    // Per-KV-cache-group block tables (group 0 = full, then sliding): one row per sequence, each
+    // the KV cap rung's width, the stride the tapes read them at.
+    let num_seqs = (inputs.cu_seqlens_q).map_or(1, |cu| cu.len().saturating_sub(1).max(1));
     for (g, s) in inputs.block_tables.iter().enumerate() {
+        if !s.is_empty() && s.len() != num_seqs * block_table_stride.get() as usize {
+            return Err(ForwardError::BlockTableWidth {
+                len: s.len(),
+                num_seqs,
+                rung: block_table_stride,
+            });
+        }
         write_input(
             runtime,
             "block_table",
@@ -1594,12 +1717,17 @@ mod tests {
     use crate::interpreter::metal::lowered::{
         Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, SourceRef, WeightTensor,
     };
-    use crate::specialized_pipeline_cache::SpecializedPipelineCache;
     use crate::tape::ids::{LayerId, SourceIx};
     use scratchy_layers::RmsNorm;
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
+    const TEST_VARIANT: TapeVariant = TapeVariant {
+        cap: MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
+        tq_heads: None,
+    };
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
     /// its one model source resolves to. Pool tests only exercise
@@ -1705,21 +1833,22 @@ mod tests {
     /// verify the worker bakes; the kernel itself isn't fired in
     /// 5.D tests (5.E hooks `run_bucket` to a real cmdbuf).
     fn synthetic_tape(bucket_m: u32) -> LoweredMetalTape {
+        use crate::tape::lowered::IntoBaked;
         let cmd = LoweredCommand {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
             function: "rmsnorm_f16_s_f16_specialized",
-            constants: crate::interpreter::metal::lowered::baked(vec![
-                crate::specialized_pipeline_cache::ConstantValue::uint(0, bucket_m),
-                crate::specialized_pipeline_cache::ConstantValue::uint(
-                    1,
+            constants: crate::tape::kernel_constants::RmsNormConstants {
+                bucket_m: crate::tape::ids::BucketM(bucket_m),
+                q_size: crate::tape::ids::QSize(
                     <TestWeights as scratchy_ir::CanonicalParams>::Q_SIZE as u32,
                 ),
-                crate::specialized_pipeline_cache::ConstantValue::float(
-                    2,
+                rms_norm_eps: crate::tape::ids::RmsNormEps(
                     <TestWeights as scratchy_ir::CanonicalParams>::RMS_NORM_EPS,
                 ),
-            ]),
+                weight_offset: 0.0,
+            }
+            .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -1746,7 +1875,8 @@ mod tests {
         LoweredMetalTape {
             bucket_m,
             num_arena_slots: 2,
-            commands: crate::interpreter::metal::lowered::baked(vec![cmd.into()]),
+            commands: crate::interpreter::metal::lowered::baked_commands(vec![cmd.into()])
+                .expect("commands"),
             splitk_scratch_bytes: 0,
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
@@ -1764,15 +1894,14 @@ mod tests {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
 
-        let cache = Arc::new(
-            SpecializedPipelineCache::with_standard_shaders((*device).clone())
-                .expect("compile standard shaders"),
+        let tapes: Arc<[_]> = Arc::from(vec![synthetic_tape(1)]);
+        let pipelines = Arc::new(
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines"),
         );
-        let pipelines = Arc::new(SpecializedPipelines::new(cache));
 
         let (weights, allocator) = build_test_weights(&device);
 
-        let tapes: Arc<[_]> = Arc::from(vec![synthetic_tape(1)]);
         let arena_layout: ArenaLayout = vec![4096, 4096];
         let runtime_factory: RuntimeFactory = RuntimeFactory::new(|d| empty_runtime(d, 1));
 
@@ -1782,6 +1911,7 @@ mod tests {
             allocator,
             pipelines,
             tapes,
+            MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
             max,
@@ -1963,11 +2093,6 @@ mod tests {
     ) -> Option<MetalWorkerPool<TestWeights>> {
         let device = crate::detect_device().filter(|_| crate::metal4_available())?;
         let device = Arc::new(device.device.clone());
-        let cache = Arc::new(
-            SpecializedPipelineCache::with_standard_shaders((*device).clone())
-                .expect("compile standard shaders"),
-        );
-        let pipelines = Arc::new(SpecializedPipelines::new(cache));
         let (weights, allocator) = build_test_weights(&device);
         let tapes: Arc<[_]> = bucket_ms
             .iter()
@@ -1975,6 +2100,10 @@ mod tests {
             .map(synthetic_tape)
             .collect::<Vec<_>>()
             .into();
+        let pipelines = Arc::new(
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines"),
+        );
         // Arena slot for the synthetic RmsNorm: M × hidden_size f16 =
         // M × Q_SIZE × 2 bytes. Sized for the worst-case bucket.
         let max_m = bucket_ms.iter().copied().max().unwrap_or(1) as u64;
@@ -2021,6 +2150,7 @@ mod tests {
             allocator,
             pipelines,
             tapes,
+            MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
             max_workers,
@@ -2332,9 +2462,9 @@ mod tests {
     /// stands one worker up eagerly.
     const EMPTY_BACKBONE: &[Instruction] = &[];
 
-    /// Baked tape variants for an empty test bucket — what the macro
+    /// Baked tape rungs for an empty test bucket — what the macro
     /// would emit for `(empty, empty)` instruction streams: an
-    /// empty-command tape per (gen class × chunked) pair, no patches.
+    /// empty-command tape per (gen class × chunked) pair at KV cap 128.
     fn test_empty_tapes(
         bucket_m: u32,
         num_arena_slots: u32,
@@ -2343,7 +2473,7 @@ mod tests {
         let tape = LoweredMetalTape {
             bucket_m,
             num_arena_slots,
-            commands: &[],
+            commands: crate::tape::lowered::TapeCommands::EMPTY,
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2354,13 +2484,13 @@ mod tests {
         };
         let mut v = Vec::new();
         for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5] {
-            for chunked in [false, true] {
+            for addressing in [KvAddressing::Direct, KvAddressing::Chunked] {
                 v.push(ClassedTape {
                     gen_class,
-                    chunked,
+                    addressing,
+                    cap: MaxBlocksPerSeq(128),
+                    tq_heads: None,
                     tape,
-                    const_patches: &[],
-                    scratch_patches: &[],
                 });
             }
         }
@@ -2389,6 +2519,7 @@ mod tests {
             max_workers,
             None,
             128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
+            KvAddressing::Direct,
         ))
     }
 
@@ -2418,6 +2549,7 @@ mod tests {
             1,
             None,
             128, // block_cap (unused — NoBuckets fires first)
+            KvAddressing::Direct,
         );
         match res {
             Err(PoolBuildError::NoBuckets) => {}
@@ -2443,6 +2575,7 @@ mod tests {
             backbone_barriers: EMPTY_BARRIERS,
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: test_empty_tapes(1, 2),
+            kernels: &[],
         }];
         let Some(res) = build_via_for_buckets(&specs, 2) else {
             eprintln!("skipping: no Metal device");
@@ -2454,9 +2587,9 @@ mod tests {
         assert_eq!(pool.available(), 1);
     }
 
-    /// A bucket spec with NO baked tape variants (what the macro emits
+    /// A bucket spec with NO baked tape rungs (what the macro emits
     /// for a canonical the front end refused — dense MoE on metal) must
-    /// refuse pool construction with `BucketLower`, NOT build a pool
+    /// refuse pool construction with `NoRung`, NOT build a pool
     /// whose forward runs a no-op dispatch and whose tail then panics on
     /// `arena[terminal_slot]` index-OOB. Pins the documented refusal
     /// contract: "the POOL refuses at load".
@@ -2472,18 +2605,19 @@ mod tests {
             backbone_barriers: EMPTY_BARRIERS,
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: &[],
+            kernels: &[],
         }];
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
             return;
         };
         match res {
-            Err(PoolBuildError::BucketLower { bucket_m, .. }) => {
+            Err(PoolBuildError::NoRung { bucket_m, .. }) => {
                 assert_eq!(bucket_m, 1, "refusal names the offending bucket");
             }
-            Err(other) => panic!("expected BucketLower, got Err({other})"),
+            Err(other) => panic!("expected NoRung, got Err({other})"),
             Ok(_) => panic!(
-                "expected BucketLower, got Ok(_) — a variant-less bucket built a pool; \
+                "expected NoRung, got Ok(_) — a rung-less bucket built a pool; \
                  its forward would no-op and its tail would panic on arena index-OOB"
             ),
         }
@@ -2505,6 +2639,7 @@ mod tests {
                 backbone_barriers: EMPTY_BARRIERS,
                 lm_head_barriers: EMPTY_BARRIERS,
                 tapes: test_empty_tapes(1, 2),
+                kernels: &[],
             },
             MetalBucketSpec {
                 bucket_m: 8,
@@ -2516,6 +2651,7 @@ mod tests {
                 backbone_barriers: EMPTY_BARRIERS,
                 lm_head_barriers: EMPTY_BARRIERS,
                 tapes: test_empty_tapes(8, 2),
+                kernels: &[],
             },
         ];
         let Some(res) = build_via_for_buckets(&specs, 1) else {

@@ -12,14 +12,14 @@
 mod common;
 
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::cpu_reference::{affine_qmm_t_b8_bf16_s_bf16, affine_qmm_t_b8_f16};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::quantized::{
     DequantDtype, QmmTKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel, qmm_t_dispatch_shape,
     qmm_t_kernel_name, qmv_dispatch_shape, qmv_kernel_name,
 };
-use scratchy_target_metal::shader_cache::ShaderCache;
-use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
+use scratchy_target_metal::specialized_pipeline_cache::{ComputePipelineState, ConstantValue};
 
 /// `(w, h, d)` triple from a dispatch-shape helper → `MTLSize`.
 fn mtl_size(t: (u32, u32, u32)) -> MTLSize {
@@ -133,11 +133,12 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
 
     // Resolve the exact pipeline + dispatch grid the production
     // `execute*` helpers would pick (same kernel-name builder, same
-    // function-constants, same dispatch-shape), then dispatch on the
+    // constants, same dispatch-shape), then dispatch on the
     // MTL4 path. Buffer-index contract (both qmv and qmm_t): buffer(0)=
-    // packed weight, (1)=scales, (2)=biases, (3)=x, (4)=y; K/N(/M) ride
-    // as function constants 0/1(/2), not buffers.
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
+    // packed weight, (1)=scales, (2)=biases, (3)=x, (4)=y; K/N(/M) are
+    // constants 0/1(/2) (baked for qmv), not buffers.
+    // Holds the baked pipeline's cache until the dispatch below.
+    let mut baked = None;
     let bits = 8u32;
     let (pipeline, tg, tpg) = match op {
         Op::Qmv => {
@@ -150,15 +151,16 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
                 bits,
                 false,
             );
-            let constants = [
+            let constants = vec![
                 ConstantValue::int(0, k as i32),
                 ConstantValue::int(1, n as i32),
             ];
-            let p = cache
-                .get_pipeline_specialized(&name, &constants)
-                .expect("qmv b8 pipeline");
+            let p = baked.insert(
+                baked_pipeline(&device, "quantized_qmv", &name, constants)
+                    .expect("qmv b8 pipeline"),
+            );
             let (tg, tpg) = qmv_dispatch_shape(kernel, m as u32, n as u32, 1);
-            (p, tg, tpg)
+            (ComputePipelineState::clone(p), tg, tpg)
         }
         Op::QmmT => {
             // `MetalAffineQmmT::execute` routes b8 SplitK → Standard.
@@ -191,11 +193,12 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
                 ConstantValue::int(1, n as i32),
                 ConstantValue::int(2, m as i32),
             ];
-            let p = cache
-                .get_pipeline_specialized(&name, &constants)
-                .expect("qmm_t b8 pipeline");
+            let p = baked.insert(
+                baked_pipeline(&device, "quantized_qmm", &name, constants.to_vec())
+                    .expect("qmm_t b8 pipeline"),
+            );
             let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
-            (p, tg, tpg)
+            (ComputePipelineState::clone(p), tg, tpg)
         }
         Op::QmmTNax => {
             let kernel = QmmTKernel::Nax;
@@ -213,11 +216,12 @@ fn run_case_bf16(op: Op, m: usize, n: usize, k: usize, group_size: usize, seed: 
                 ConstantValue::int(1, n as i32),
                 ConstantValue::int(2, m as i32),
             ];
-            let p = cache
-                .get_pipeline_specialized(&name, &constants)
-                .expect("qmm_t nax b8 pipeline");
+            let p = baked.insert(
+                baked_pipeline(&device, "quantized_qmm_nax", &name, constants.to_vec())
+                    .expect("qmm_t nax b8 pipeline"),
+            );
             let (tg, tpg) = qmm_t_dispatch_shape(kernel, m as u32, n as u32, 1);
-            (p, tg, tpg)
+            (ComputePipelineState::clone(p), tg, tpg)
         }
     };
 
@@ -339,7 +343,6 @@ fn qmv_b8_f16_matches_cpu() {
     let x_buf = buffer_from_bytes(&device, as_bytes(&x));
     let y_buf = zeroed_buffer(&device, m * n * 2);
 
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
     let bits = 8u32;
     let kernel = pick_qmv_kernel(n as u32, k as u32, bits);
     let name = qmv_kernel_name(
@@ -350,13 +353,12 @@ fn qmv_b8_f16_matches_cpu() {
         bits,
         false,
     );
-    let constants = [
+    let constants = vec![
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),
     ];
-    let pipeline = cache
-        .get_pipeline_specialized(&name, &constants)
-        .expect("qmv b8 f16 pipeline");
+    let pipeline =
+        baked_pipeline(&device, "quantized_qmv", &name, constants).expect("qmv b8 f16 pipeline");
     let (tg, tpg) = qmv_dispatch_shape(kernel, m as u32, n as u32, 1);
     if !common::dispatch_threadgroups(
         &device,

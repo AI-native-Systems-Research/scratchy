@@ -15,9 +15,9 @@
 mod common;
 
 use objc2_metal::{MTLComputePipelineState, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{DequantDtype, ScaleDtype};
-use scratchy_target_metal::shader_cache::ShaderCache;
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 use scratchy_target_metal::tape::kernel_constants::AffineCodes;
 
@@ -273,20 +273,18 @@ fn dispatch_affine_embed(
     let elem_size = dtype.elem_size();
     let out_buf = common::shared_zeroed(&device, n_out * elem_size);
 
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
     let kernel_name = format!(
         "affine_embed_{}_s_{}_gs_{}_b_4",
         dtype.symbol_infix(),
         ScaleDtype::F16.symbol_infix(),
         group_size
     );
-    // `hidden_size` rides as function_constant(0) — see
-    // `AFFINE_EMBED_HIDDEN_SIZE` in `quantized_dequantize.metal`.
+    // `hidden_size` is constant slot 0 — see `AFFINE_EMBED_HIDDEN_SIZE`
+    // in `quantized_dequantize.metal`.
     let constants: Vec<ConstantValue> = std::iter::once(ConstantValue::uint(0u16, hidden_size))
         .chain(codes.constant())
         .collect();
-    let pipeline = cache
-        .get_pipeline_specialized(&kernel_name, &constants)
+    let pipeline = baked_pipeline(&device, "quantized_dequantize", &kernel_name, constants)
         .expect("affine_embed pipeline");
 
     // Replicates `MetalAffineEmbed::execute`'s 2D grid exactly.

@@ -112,7 +112,7 @@ struct PagedBlockLoaderT {
   // indirection. The scratch mirrors the cache's per-block strides, so
   // `scratch_base + lb*kv_blk_stride + row_col_offset` reuses the exact same
   // per-thread offset math. The `scratch_base` is only ever non-null when the
-  // kernel sets it from `ATTN_PAGED_ROR != 0` (a compile-time function-constant
+  // kernel sets it from `ATTN_PAGED_ROR != 0` (a baked-constant
   // fold), so the non-spans path keeps the byte-identical chunk_table resolve.
   const device T* scratch_base;
 

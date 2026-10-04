@@ -67,6 +67,7 @@
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
+#include "baked.h"
 
 // MLX steel/gemm vendor — pulls in `BlockMMA<T, U, BM, BN, BK, WM, WN, ...>`.
 // Used by qmm_t_impl_inline below to drive the inner MMA loop with the
@@ -95,10 +96,9 @@ using namespace metal;
 MLX_MTL_CONST int SIMD_SIZE = 32;
 
 // ─────────────────────────────────────────────────────────────────
-// Function constants — baked at pipeline build time by
-// `MetalAffineQmmT::execute` (and the lower_one path once
-// `Instruction::AffineQmm` lands). MLX passes K / N / M (and the
-// splitk wrapper passes k_partition_size + split_k_partition_stride)
+// Baked constants — the bake compiles one kernel per command's
+// constant set (`tape/kernel_constants.rs`). MLX passes K / N / M (and
+// the splitk wrapper passes k_partition_size + split_k_partition_stride)
 // as setBytes runtime args; scratchy specializes per-shape so each
 // (K, N, M[, k_partition_size]) tuple gets its own pipeline. This is
 // the same trade `fused_gate_up_silu_mul` already takes — and is
@@ -113,20 +113,18 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 // keep them stable.
 // ─────────────────────────────────────────────────────────────────
 
-constant int QMM_K                [[function_constant(0)]];
-constant int QMM_N                [[function_constant(1)]];
-constant int QMM_M                [[function_constant(2)]];
-constant int QMM_K_PARTITION_SIZE [[function_constant(3)]];
+SCRATCHY_CONSTANT(int, QMM_K, 0);
+SCRATCHY_CONSTANT(int, QMM_N, 1);
+SCRATCHY_CONSTANT(int, QMM_M, 2);
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_K_PARTITION_SIZE, 3);
 // MoE grouped GEMM only: the number of valid experts. Padded output
 // tiles whose expert index == QMM_NUM_EXPERTS are sentinels (trailing
 // unused rows) and skip — lets the host pad to a static row bound.
-constant int QMM_NUM_EXPERTS      [[function_constant(4)]];
+SCRATCHY_CONSTANT_OPTIONAL(int, QMM_NUM_EXPERTS, 4);
 // 5: the 4-bit codes are stored XOR 0x88 (`AffineCodes::Offset8`, matrix-unit
 // tapes); XOR-ing each loaded byte restores them. Unset: as written.
 // Kernel entries branch on it once, into a loader instantiated for it.
-constant bool AFFINE_CODES_OFFSET8 [[function_constant(5)]];
-constant bool AFFINE_CODES_ARE_OFFSET8 =
-    is_function_constant_defined(AFFINE_CODES_OFFSET8) && AFFINE_CODES_OFFSET8;
+SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26 (same constants as
@@ -568,7 +566,7 @@ template <typename T_act, typename T_compute, typename T_scale,
     const device T_act*     x        [[buffer(3)]],
     device T_act*           y        [[buffer(4)]],
     // buffer(5) / buffer(6) / buffer(7) (K / N / M) replaced by file-
-    // scope function constants QMM_K / QMM_N / QMM_M so this kernel is
+    // scope baked constants QMM_K / QMM_N / QMM_M so this kernel is
     // recordable into an MTLIndirectComputeCommand (no setKernelBytes).
     uint  simd_group_id [[simdgroup_index_in_threadgroup]],
     uint  simd_lane_id  [[thread_index_in_simdgroup]],
@@ -579,7 +577,7 @@ template <typename T_act, typename T_compute, typename T_scale,
   threadgroup T_compute Xs[BM * BK_padded];
   threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
-  if (bits == 4 && AFFINE_CODES_ARE_OFFSET8) {
+  if (bits == 4 && AFFINE_CODES_OFFSET8) {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
       w, scales, biases, x, y,
       Xs, Ws, out_scratch,
@@ -646,7 +644,7 @@ template <typename T_act, typename T_compute, typename T_scale,
   threadgroup T_compute Xs[BM * BK_padded];
   threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
-  if (bits == 4 && AFFINE_CODES_ARE_OFFSET8) {
+  if (bits == 4 && AFFINE_CODES_OFFSET8) {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
       w_e, s_e, b_e, x, y,
       Xs, Ws, out_scratch,
@@ -680,7 +678,7 @@ template <typename T_act, typename T_compute, typename T_scale,
     const device T_scale*   biases                   [[buffer(2)]],
     const device T_act*     x                        [[buffer(3)]],
     device T_act*           y                        [[buffer(4)]],
-    // buffer(5)..buffer(9) replaced by file-scope function constants
+    // buffer(5)..buffer(9) replaced by file-scope baked constants
     // QMM_K / QMM_N / QMM_M / QMM_K_PARTITION_SIZE; the
     // split_k_partition_stride that MLX passes at buffer(9) is
     // computed inline as QMM_M * QMM_N (see `quantized.cpp:808`).
@@ -706,7 +704,7 @@ template <typename T_act, typename T_compute, typename T_scale,
   threadgroup T_compute Xs[BM * BK_padded];
   threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
-  if (bits == 4 && AFFINE_CODES_ARE_OFFSET8) {
+  if (bits == 4 && AFFINE_CODES_OFFSET8) {
   qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N, false, true>(
       (const device uint32_t*)wl,
       scales_shift,
@@ -1085,7 +1083,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
     const device T_scale*   biases   [[buffer(2)]],
     const device T_act*     x        [[buffer(3)]],
     device T_act*           y        [[buffer(4)]],
-    // K / N / M ride as file-scope function constants
+    // K / N / M ride as file-scope baked constants
     // QMM_K / QMM_N / QMM_M (same as qmm_t for ICB recording).
     uint  simd_group_id [[simdgroup_index_in_threadgroup]],
     uint  simd_lane_id  [[thread_index_in_simdgroup]],
@@ -1117,93 +1115,26 @@ template <typename T_act, typename T_scale, int group_size, int bits>
 // suffix parsing keeps working. Existing INST_QMM_T (below) is a thin
 // wrapper that fixes T_compute = T_act, preserving every legacy symbol.
 #define INST_QMM_T_C(act_tag, act_type, ctag, ctype, scale_tag, scale_type, gs, aln_tag, aln_val) \
-  template [[host_name(                                                                            \
-      "affine_qmm_t_" #act_tag "_c_" #ctag "_s_" #scale_tag "_gs_" #gs                             \
-      "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                           \
-  affine_qmm_t_kernel<act_type, ctype, scale_type, gs, 4, aln_val>(                                \
-      const device uint32_t*   w        [[buffer(0)]],                                             \
-      const device scale_type* scales   [[buffer(1)]],                                             \
-      const device scale_type* biases   [[buffer(2)]],                                             \
-      const device act_type*   x        [[buffer(3)]],                                             \
-      device act_type*         y        [[buffer(4)]],                                             \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                                      \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                           \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_qmm_t_##act_tag##_c_##ctag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag##_batch_0, affine_qmm_t_kernel<act_type, ctype, scale_type, gs, 4, aln_val>)
 
 #define INST_QMM_T_SPLITK_C(act_tag, act_type, ctag, ctype, scale_tag, scale_type, gs, aln_tag, aln_val) \
-  template [[host_name(                                                                                   \
-      "affine_qmm_t_splitk_" #act_tag "_c_" #ctag "_s_" #scale_tag "_gs_" #gs                            \
-      "_b_4_alN_" #aln_tag)]] [[kernel]] void                                                            \
-  affine_qmm_t_splitk_kernel<act_type, ctype, scale_type, gs, 4, aln_val>(                               \
-      const device uint32_t*   w                        [[buffer(0)]],                                   \
-      const device scale_type* scales                   [[buffer(1)]],                                   \
-      const device scale_type* biases                   [[buffer(2)]],                                   \
-      const device act_type*   x                        [[buffer(3)]],                                   \
-      device act_type*         y                        [[buffer(4)]],                                   \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                                            \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                                 \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_qmm_t_splitk_##act_tag##_c_##ctag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag, affine_qmm_t_splitk_kernel<act_type, ctype, scale_type, gs, 4, aln_val>)
 
 // Legacy INST_QMM_T: T_compute = T_act. Emits the old symbol name
 // (no `_c_` segment) so existing pipeline-cache lookups keep hitting.
-#define INST_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val)   \
-  template [[host_name(                                                               \
-      "affine_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                            \
-      "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                              \
-  affine_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>(                \
-      const device uint32_t*   w        [[buffer(0)]],                                \
-      const device scale_type* scales   [[buffer(1)]],                                \
-      const device scale_type* biases   [[buffer(2)]],                                \
-      const device act_type*   x        [[buffer(3)]],                                \
-      device act_type*         y        [[buffer(4)]],                                \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                         \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                              \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+#define INST_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  SCRATCHY_KERNEL(affine_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag##_batch_0, affine_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>)
 
 // MoE grouped expert GEMM (T_compute = T_act). Extra buffer(5) = the
 // padded, expert-sorted per-row expert index.
 #define INST_GATHER_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
-  template [[host_name(                                                                    \
-      "affine_gather_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                          \
-      "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                   \
-  affine_gather_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>(              \
-      const device uint32_t*   w        [[buffer(0)]],                                     \
-      const device scale_type* scales   [[buffer(1)]],                                     \
-      const device scale_type* biases   [[buffer(2)]],                                     \
-      const device act_type*   x        [[buffer(3)]],                                     \
-      device act_type*         y        [[buffer(4)]],                                     \
-      const device uint32_t*   indices  [[buffer(5)]],                                     \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                              \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                   \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_gather_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag##_batch_0, affine_gather_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>)
 
 #define INST_QMM_T_SPLITK(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
-  template [[host_name(                                                                   \
-      "affine_qmm_t_splitk_" #act_tag "_s_" #scale_tag "_gs_" #gs                         \
-      "_b_4_alN_" #aln_tag)]] [[kernel]] void                                             \
-  affine_qmm_t_splitk_kernel<act_type, act_type, scale_type, gs, 4, aln_val>(             \
-      const device uint32_t*   w                        [[buffer(0)]],                    \
-      const device scale_type* scales                   [[buffer(1)]],                    \
-      const device scale_type* biases                   [[buffer(2)]],                    \
-      const device act_type*   x                        [[buffer(3)]],                    \
-      device act_type*         y                        [[buffer(4)]],                    \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                             \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                  \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_qmm_t_splitk_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag, affine_qmm_t_splitk_kernel<act_type, act_type, scale_type, gs, 4, aln_val>)
 
-#define INST_QMM_N(act_tag, act_type, scale_tag, scale_type, gs)               \
-  template [[host_name(                                                        \
-      "affine_qmm_n_" #act_tag "_s_" #scale_tag "_gs_" #gs                     \
-      "_b_4_batch_0")]] [[kernel]] void                                        \
-  affine_qmm_n_kernel<act_type, scale_type, gs, 4>(                            \
-      const device uint32_t*   w        [[buffer(0)]],                         \
-      const device scale_type* scales   [[buffer(1)]],                         \
-      const device scale_type* biases   [[buffer(2)]],                         \
-      const device act_type*   x        [[buffer(3)]],                         \
-      device act_type*         y        [[buffer(4)]],                         \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                  \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                       \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+#define INST_QMM_N(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_qmm_n_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, affine_qmm_n_kernel<act_type, scale_type, gs, 4>)
 
 #define INST_QMM_ALL(act_tag, act_type, scale_tag, scale_type, gs)             \
   INST_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, true,  true)        \
@@ -1245,18 +1176,7 @@ INST_QMM_ALL(f16,  half,   bf16, bfloat, 128)
 // lowering). Same-compute only: the mixed-compute inline W loader is
 // nibble-specialized.
 #define INST_QMM_T_B8(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
-  template [[host_name(                                                               \
-      "affine_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                            \
-      "_b_8_alN_" #aln_tag "_batch_0")]] [[kernel]] void                              \
-  affine_qmm_t_kernel<act_type, act_type, scale_type, gs, 8, aln_val>(                \
-      const device uint32_t*   w        [[buffer(0)]],                                \
-      const device scale_type* scales   [[buffer(1)]],                                \
-      const device scale_type* biases   [[buffer(2)]],                                \
-      const device act_type*   x        [[buffer(3)]],                                \
-      device act_type*         y        [[buffer(4)]],                                \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                         \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                              \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_alN_##aln_tag##_batch_0, affine_qmm_t_kernel<act_type, act_type, scale_type, gs, 8, aln_val>)
 
 INST_QMM_T_B8(bf16, bfloat, bf16, bfloat, 64, true,  true)
 INST_QMM_T_B8(bf16, bfloat, bf16, bfloat, 64, false, false)
@@ -1271,19 +1191,7 @@ INST_QMM_T_B8(f16,  half,   f16,  half,   64, false, false)
 // qmm_t_impl_inline<...,bits,...>, same as the dense b8 above); only the
 // instantiation was missing. gs=64 (OptiQ experts are group_size 64).
 #define INST_GATHER_QMM_T_B8(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
-  template [[host_name(                                                                       \
-      "affine_gather_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                            \
-      "_b_8_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                     \
-  affine_gather_qmm_t_kernel<act_type, act_type, scale_type, gs, 8, aln_val>(                \
-      const device uint32_t*   w        [[buffer(0)]],                                       \
-      const device scale_type* scales   [[buffer(1)]],                                       \
-      const device scale_type* biases   [[buffer(2)]],                                       \
-      const device act_type*   x        [[buffer(3)]],                                       \
-      device act_type*         y        [[buffer(4)]],                                       \
-      const device uint32_t*   indices  [[buffer(5)]],                                       \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                                \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                     \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(affine_gather_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_8_alN_##aln_tag##_batch_0, affine_gather_qmm_t_kernel<act_type, act_type, scale_type, gs, 8, aln_val>)
 
 INST_GATHER_QMM_T_B8(bf16, bfloat, bf16, bfloat, 64, true,  true)
 INST_GATHER_QMM_T_B8(bf16, bfloat, bf16, bfloat, 64, false, false)
@@ -1356,18 +1264,7 @@ template <typename T_act, typename T_compute, typename T_scale,
 }
 
 #define INST_NVFP4_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
-  template [[host_name(                                                                  \
-      "nvfp4_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                                 \
-      "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                  \
-  nvfp4_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>(                      \
-      const device uint32_t*   w       [[buffer(0)]],                                     \
-      const device scale_type* scales  [[buffer(1)]],                                     \
-      const device scale_type* biases  [[buffer(2)]],                                     \
-      const device act_type*   x       [[buffer(3)]],                                     \
-      device act_type*         y       [[buffer(4)]],                                     \
-      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                             \
-      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                  \
-      uint3 tgid          [[threadgroup_position_in_grid]]);
+  SCRATCHY_KERNEL(nvfp4_qmm_t_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_alN_##aln_tag##_batch_0, nvfp4_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>)
 
 // group_size always 16 for NVFP4; T_scale always half (folded F16).
 INST_NVFP4_QMM_T(f16, half, f16, half, 16, true, true)

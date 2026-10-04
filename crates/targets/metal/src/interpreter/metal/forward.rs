@@ -19,6 +19,7 @@
 use crate::interpreter::metal::__re::MTLCommandBufferStatus;
 
 use super::worker::WorkerError;
+use crate::tape::ids::MaxBlocksPerSeq;
 
 /// One forward step's runtime inputs.
 ///
@@ -256,6 +257,13 @@ pub enum ForwardError {
     /// A caller-supplied followup hook (e.g. argmax encode + wait
     /// chained on the forward CB's shared event) failed.
     Followup(String),
+    /// A step's block table of `len` entries is not `num_seqs` rows of the KV cap rung's width,
+    /// the stride the pool's tapes read it at.
+    BlockTableWidth {
+        len: usize,
+        num_seqs: usize,
+        rung: MaxBlocksPerSeq,
+    },
 }
 
 impl std::fmt::Display for ForwardError {
@@ -287,6 +295,16 @@ impl std::fmt::Display for ForwardError {
             Self::Followup(msg) => {
                 write!(f, "MetalWorkerPool::forward: followup hook failed: {msg}")
             }
+            Self::BlockTableWidth {
+                len,
+                num_seqs,
+                rung,
+            } => write!(
+                f,
+                "MetalWorkerPool::forward: a block table of {len} entries is not {num_seqs} \
+                 rows of the KV cap rung's {} blocks",
+                rung.get()
+            ),
         }
     }
 }

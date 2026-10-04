@@ -18,17 +18,18 @@
 //     gated on the block_table bit-31 "stored unrotated" flag (spans).
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
 
-constant uint  GDK_HEAD_DIM          [[function_constant(0)]];
-constant uint  GDK_NUM_KV            [[function_constant(1)]];
-constant uint  GDK_BLOCK_SIZE        [[function_constant(2)]];
-constant uint  GDK_BLOCKS_PER_CHUNK  [[function_constant(3)]];
-constant uint  GDK_ROT_DIM           [[function_constant(4)]];
-constant uint  GDK_PAIR_OFF          [[function_constant(5)]];
+SCRATCHY_CONSTANT(uint, GDK_HEAD_DIM, 0);
+SCRATCHY_CONSTANT(uint, GDK_NUM_KV, 1);
+SCRATCHY_CONSTANT(uint, GDK_BLOCK_SIZE, 2);
+SCRATCHY_CONSTANT(uint, GDK_BLOCKS_PER_CHUNK, 3);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDK_ROT_DIM, 4);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GDK_PAIR_OFF, 5);
 // STATIC dest row stride (= block_cap*block_size) so per-head GEMM weight
 // offsets are bakeable into the tape. Only positions [0,kv_len) are written.
-constant uint  GDK_MAX_KV            [[function_constant(6)]];
+SCRATCHY_CONSTANT(uint, GDK_MAX_KV, 6);
 
 // One thread per (pos, kv_head). gid.x = pos (key position), gid.y = kv_head.
 // SrcT = paged-cache dtype (gemma4: bfloat); DstT = MPS-GEMM compute dtype (half).
@@ -113,6 +114,7 @@ inline void gather_dense_kvmajor_body(
 }
 
 // Same-dtype f16 (used by the correctness test).
+#if SCRATCHY_COMPILES(gather_dense_kvmajor_copy_f16)
 kernel void gather_dense_kvmajor_copy_f16(
     device half*           dst         [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -122,8 +124,10 @@ kernel void gather_dense_kvmajor_copy_f16(
 {
     gather_dense_kvmajor_body<half, half, false>(dst, block_table, cache, seq_used, nullptr, gid);
 }
+#endif
 
 // gemma4 production: paged cache is bfloat, MPS GEMM compute is half → convert on gather.
+#if SCRATCHY_COMPILES(gather_dense_kvmajor_copy_bf16_to_f16)
 kernel void gather_dense_kvmajor_copy_bf16_to_f16(
     device half*           dst         [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -133,7 +137,9 @@ kernel void gather_dense_kvmajor_copy_bf16_to_f16(
 {
     gather_dense_kvmajor_body<bfloat, half, false>(dst, block_table, cache, seq_used, nullptr, gid);
 }
+#endif
 
+#if SCRATCHY_COMPILES(gather_dense_kvmajor_rope_bf16_to_f16)
 kernel void gather_dense_kvmajor_rope_bf16_to_f16(
     device half*           dst         [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -144,8 +150,10 @@ kernel void gather_dense_kvmajor_rope_bf16_to_f16(
 {
     gather_dense_kvmajor_body<bfloat, half, true>(dst, block_table, cache, seq_used, cos_sin, gid);
 }
+#endif
 
 // Same-dtype f16 rope (parity / non-bf16 arches).
+#if SCRATCHY_COMPILES(gather_dense_kvmajor_rope_f16)
 kernel void gather_dense_kvmajor_rope_f16(
     device half*           dst         [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -156,8 +164,10 @@ kernel void gather_dense_kvmajor_rope_f16(
 {
     gather_dense_kvmajor_body<half, half, true>(dst, block_table, cache, seq_used, cos_sin, gid);
 }
+#endif
 
 // ── bf16->bf16 variants for the production (bf16) hd512 unfused path ──
+#if SCRATCHY_COMPILES(gather_dense_kvmajor_copy_bf16)
 kernel void gather_dense_kvmajor_copy_bf16(
     device bfloat*         dst         [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -167,7 +177,9 @@ kernel void gather_dense_kvmajor_copy_bf16(
 {
     gather_dense_kvmajor_body<bfloat, bfloat, false>(dst, block_table, cache, seq_used, nullptr, gid);
 }
+#endif
 
+#if SCRATCHY_COMPILES(gather_dense_kvmajor_rope_bf16)
 kernel void gather_dense_kvmajor_rope_bf16(
     device bfloat*         dst         [[buffer(0)]],
     const device uint*     block_table [[buffer(1)]],
@@ -178,9 +190,11 @@ kernel void gather_dense_kvmajor_rope_bf16(
 {
     gather_dense_kvmajor_body<bfloat, bfloat, true>(dst, block_table, cache, seq_used, cos_sin, gid);
 }
+#endif
 
 // Transposed copy for V: dst is [kv_head, head_dim, kv_len] (head-dim major)
 // so the PV GEMM (C=A@B^T) gets B = V^T directly. dst[kv,d,pos] = paged V[..,d].
+#if SCRATCHY_COMPILES(gather_dense_kvmajor_copyT_bf16)
 kernel void gather_dense_kvmajor_copyT_bf16(
     device bfloat*         dst         [[buffer(0)]],   // [num_kv, head_dim, kv_len]
     const device uint*     block_table [[buffer(1)]],
@@ -219,3 +233,4 @@ kernel void gather_dense_kvmajor_copyT_bf16(
         d[i * GDK_MAX_KV] = src[i];
     }
 }
+#endif

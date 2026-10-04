@@ -2,59 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
+
+// Constant slots are file-scoped: each kernel family below is defined only in
+// a bake that carries its slots (its command's typed constants).
 
 // ============================================================================
 // CopyRows: out[i] = in[i]  (flat element-wise copy, bounds-guarded)
 //
 // Materializes the vision `pixels` runtime extern into an arena tile
-// (`Instruction::LoadPixels`). out @ buffer(0), in @ buffer(1), the
-// element count `n` @ buffer(2) as a runtime `constant uint&` (NOT a
-// function constant — bound via `setBytes` inline, like `gelu_tanh`),
-// so the m_scaling tail and any bucket-padding rows are no-ops.
+// (`Instruction::LoadPixels`). out @ buffer(0), in @ buffer(1); the
+// element count is `CopyRowsConstants` (slot 4), so the m_scaling tail and
+// any bucket-padding rows are no-ops.
 // ============================================================================
 
-kernel void copy_rows_f16(
-    device half* out [[buffer(0)]],
-    device const half* in [[buffer(1)]],
-    constant uint& n [[buffer(2)]],
+#ifdef SCRATCHY_CONSTANT_4
+SCRATCHY_CONSTANT(uint, COPY_ROWS_N, 4);
+
+template <typename T>
+[[kernel]] void copy_rows(
+    device T* out [[buffer(0)]],
+    device const T* in [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= n) return;
+    if (gid >= COPY_ROWS_N) return;
     out[gid] = in[gid];
 }
+#endif
 
-kernel void copy_rows_bf16(
-    device bfloat* out [[buffer(0)]],
-    device const bfloat* in [[buffer(1)]],
-    constant uint& n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= n) return;
-    out[gid] = in[gid];
-}
-
-// ============================================================================
-// Add: out = a + b
-// ============================================================================
-
-kernel void add_f16(
-    device const half* a [[buffer(0)]],
-    device const half* b [[buffer(1)]],
-    device half* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = a[gid] + b[gid];
-}
-
-kernel void add_bf16(
-    device const bfloat* a [[buffer(0)]],
-    device const bfloat* b [[buffer(1)]],
-    device bfloat* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = a[gid] + b[gid];
-}
+SCRATCHY_KERNEL(copy_rows_f16, copy_rows<half>)
+SCRATCHY_KERNEL(copy_rows_bf16, copy_rows<bfloat>)
 
 // ── In-place residual add: residual += delta ────────────────────────────────
 //
@@ -62,26 +40,20 @@ kernel void add_bf16(
 // lowering.rs) binds buffer(0) = residual (in/out) + buffer(1) = delta and
 // dispatches token-parallel over `eff_m * width` exact threads (no bounds
 // guard needed — same dispatchThreads convention as `bias_add_*_specialized`).
-// The `_specialized` suffix matches the elementwise naming family the
-// lowering's `pick_specialized_symbol` helper expects; this variant carries
-// no function constants. First exercised by the Qwen3.5-VL vision tower —
-// the text path fuses its residual into `FusedAddRmsNorm`, so the standalone
-// add never reached metal before.
-kernel void residual_add_f16_specialized(
-    device half* residual [[buffer(0)]],
-    device const half* delta [[buffer(1)]],
+// No constants. First exercised by the Qwen3.5-VL vision tower — the text
+// path fuses its residual into `FusedAddRmsNorm`, so the standalone add never
+// reached metal before.
+template <typename T>
+[[kernel]] void residual_add(
+    device T* residual [[buffer(0)]],
+    device const T* delta [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
     residual[gid] = residual[gid] + delta[gid];
 }
 
-kernel void residual_add_bf16_specialized(
-    device bfloat* residual [[buffer(0)]],
-    device const bfloat* delta [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    residual[gid] = residual[gid] + delta[gid];
-}
+SCRATCHY_KERNEL(residual_add_f16_specialized, residual_add<half>)
+SCRATCHY_KERNEL(residual_add_bf16_specialized, residual_add<bfloat>)
 
 // ── Multimodal embed splice: scatter vision embeddings into the text
 // embedding stream ───────────────────────────────────────────────────
@@ -93,255 +65,107 @@ kernel void residual_add_bf16_specialized(
 // One thread per element; `embed` is in/out (buffer 0). Dispatched over
 // `num_tokens * hidden` (m_scaling shrinks from the baked `bucket_m *
 // hidden` to the live num_tokens), so `s < num_tokens` always indexes
-// `dst_rows`.
-kernel void mm_embed_splice_f16(
-    device half* embed [[buffer(0)]],
-    device const half* mm [[buffer(1)]],
+// `dst_rows`. The row width is `MmEmbedSpliceConstants` (slot 5).
+#ifdef SCRATCHY_CONSTANT_5
+SCRATCHY_CONSTANT(uint, MM_EMBED_HIDDEN, 5);
+
+template <typename T>
+[[kernel]] void mm_embed_splice(
+    device T* embed [[buffer(0)]],
+    device const T* mm [[buffer(1)]],
     device const uint* dst_rows [[buffer(2)]],
-    constant uint& hidden [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint s = gid / hidden;
-    uint c = gid % hidden;
+    uint s = gid / MM_EMBED_HIDDEN;
+    uint c = gid % MM_EMBED_HIDDEN;
     uint dst = dst_rows[s];
     if (dst == 0xFFFFFFFFu) return;
-    embed[dst * hidden + c] = mm[s * hidden + c];
+    embed[dst * MM_EMBED_HIDDEN + c] = mm[s * MM_EMBED_HIDDEN + c];
 }
+#endif
 
-kernel void mm_embed_splice_bf16(
-    device bfloat* embed [[buffer(0)]],
-    device const bfloat* mm [[buffer(1)]],
-    device const uint* dst_rows [[buffer(2)]],
-    constant uint& hidden [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint s = gid / hidden;
-    uint c = gid % hidden;
-    uint dst = dst_rows[s];
-    if (dst == 0xFFFFFFFFu) return;
-    embed[dst * hidden + c] = mm[s * hidden + c];
-}
+SCRATCHY_KERNEL(mm_embed_splice_f16, mm_embed_splice<half>)
+SCRATCHY_KERNEL(mm_embed_splice_bf16, mm_embed_splice<bfloat>)
 
-// ============================================================================
-// Mul: out = a * b
-// ============================================================================
-
-kernel void mul_f16(
-    device const half* a [[buffer(0)]],
-    device const half* b [[buffer(1)]],
-    device half* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = a[gid] * b[gid];
-}
-
-kernel void mul_bf16(
-    device const bfloat* a [[buffer(0)]],
-    device const bfloat* b [[buffer(1)]],
-    device bfloat* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = a[gid] * b[gid];
-}
-
-// ============================================================================
-// Sub: out = a - b
-// ============================================================================
-
-kernel void sub_f16(
-    device const half* a [[buffer(0)]],
-    device const half* b [[buffer(1)]],
-    device half* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = a[gid] - b[gid];
-}
-
-kernel void sub_bf16(
-    device const bfloat* a [[buffer(0)]],
-    device const bfloat* b [[buffer(1)]],
-    device bfloat* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = a[gid] - b[gid];
-}
-
-// ============================================================================
-// ScalarMul: out = scalar * input
-// ============================================================================
-
-kernel void scalar_mul_f16(
-    device const half* input [[buffer(0)]],
-    device half* out [[buffer(1)]],
-    constant float& scalar [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = half(scalar) * input[gid];
-}
-
-kernel void scalar_mul_bf16(
-    device const bfloat* input [[buffer(0)]],
-    device bfloat* out [[buffer(1)]],
-    constant float& scalar [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = bfloat(scalar) * input[gid];
-}
-
-// ============================================================================
-// BiasAdd: out = input + bias (broadcast bias across last dimension)
-// ============================================================================
-
-kernel void bias_add_f16(
-    device const half* input [[buffer(0)]],
-    device const half* bias [[buffer(1)]],
-    device half* out [[buffer(2)]],
-    constant uint& num_cols [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint col = gid % num_cols;
-    out[gid] = input[gid] + bias[col];
-}
-
-kernel void bias_add_bf16(
-    device const bfloat* input [[buffer(0)]],
-    device const bfloat* bias [[buffer(1)]],
-    device bfloat* out [[buffer(2)]],
-    constant uint& num_cols [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    uint col = gid % num_cols;
-    out[gid] = input[gid] + bias[col];
-}
-
-// ── Specialized BiasAdd (function-constant num_cols) ────────────────────────
+// ── Specialized BiasAdd (compiled-in num_cols) ──────────────────────────────
 //
-// Pipeline-time num_cols binding so the Metal driver can constant-fold the
-// modulus on dispatches of fixed projection width (Q/K/V each ship a separate
-// specialized pipeline at lowering time — `function_constant(0)` is the only
-// axis). Bound by `Instruction::MetalBiasAdd` via the
-// `KernelId::BiasAdd` lowering arm.
-constant uint BIAS_ADD_NUM_COLS [[function_constant(0)]];
+// The projection width is a compiled-in constant so the compiler folds the
+// modulus (Q/K/V each bake their own kernel). Slot 0. Bound by
+// `Instruction::MetalBiasAdd` via the `KernelId::BiasAdd` lowering arm.
+#ifdef SCRATCHY_CONSTANT_0
+SCRATCHY_CONSTANT(uint, BIAS_ADD_NUM_COLS, 0);
 
-kernel void bias_add_f16_specialized(
-    device const half* input [[buffer(0)]],
-    device const half* bias [[buffer(1)]],
-    device half* out [[buffer(2)]],
+template <typename T>
+[[kernel]] void bias_add(
+    device const T* input [[buffer(0)]],
+    device const T* bias [[buffer(1)]],
+    device T* out [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
     out[gid] = input[gid] + bias[gid % BIAS_ADD_NUM_COLS];
 }
+#endif
 
-kernel void bias_add_bf16_specialized(
-    device const bfloat* input [[buffer(0)]],
-    device const bfloat* bias [[buffer(1)]],
-    device bfloat* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = input[gid] + bias[gid % BIAS_ADD_NUM_COLS];
-}
+SCRATCHY_KERNEL(bias_add_f16_specialized, bias_add<half>)
+SCRATCHY_KERNEL(bias_add_bf16_specialized, bias_add<bfloat>)
 
-// ============================================================================
-// TanhSoftCap: out = cap * tanh(input / cap)
-// Used in Gemma2 for attention logit capping
-// ============================================================================
-
-kernel void tanh_soft_cap_f16(
-    device const half* input [[buffer(0)]],
-    device half* out [[buffer(1)]],
-    constant float& cap [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    float x = float(input[gid]);
-    float result = cap * tanh(x / cap);
-    out[gid] = half(result);
-}
-
-kernel void tanh_soft_cap_bf16(
-    device const bfloat* input [[buffer(0)]],
-    device bfloat* out [[buffer(1)]],
-    constant float& cap [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    float x = float(input[gid]);
-    float result = cap * tanh(x / cap);
-    out[gid] = bfloat(result);
-}
-
-// Specialized ScalarMul: out = in * SCALE with the compile-time
-// constant baked as function constant 2 (slots 0/1 belong to
-// BIAS_ADD_NUM_COLS / TANH_SOFTCAP_CAP — fn-const indices are
-// file-scoped). Used by the `Instruction::ScalarMul` lowering arm
-// (Gemma-family embed scaling `embed(...) * sqrt(hidden_size)`).
-// First exercised by Gemma4-on-metal — the arm previously referenced
-// these symbols without any .metal definition (latent dead arm).
-constant float SCALAR_MUL_SCALE [[function_constant(2)]];
+// Specialized ScalarMul: out = in * SCALE, the scale and the element count
+// compiled in (`ScalarMulConstants`, slots 2 / 3). Used by the
+// `Instruction::ScalarMul` lowering arm (Gemma-family embed scaling
+// `embed(...) * sqrt(hidden_size)`).
+#ifdef SCRATCHY_CONSTANT_2
+SCRATCHY_CONSTANT(float, SCALAR_MUL_SCALE, 2);
 // The elements the buffer holds: the dispatch rounds up to whole threadgroups.
-constant uint SCALAR_MUL_N [[function_constant(3)]];
+SCRATCHY_CONSTANT(uint, SCALAR_MUL_N, 3);
 
-kernel void scalar_mul_f16_specialized(
-    device       half* out    [[buffer(0)]],
-    device const half* input  [[buffer(1)]],
+template <typename T>
+[[kernel]] void scalar_mul(
+    device       T* out    [[buffer(0)]],
+    device const T* input  [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= SCALAR_MUL_N) return;
-    out[gid] = half(float(input[gid]) * SCALAR_MUL_SCALE);
+    out[gid] = T(float(input[gid]) * SCALAR_MUL_SCALE);
 }
+#endif
 
-kernel void scalar_mul_bf16_specialized(
-    device       bfloat* out    [[buffer(0)]],
-    device const bfloat* input  [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= SCALAR_MUL_N) return;
-    out[gid] = bfloat(float(input[gid]) * SCALAR_MUL_SCALE);
-}
+SCRATCHY_KERNEL(scalar_mul_f16_specialized, scalar_mul<half>)
+SCRATCHY_KERNEL(scalar_mul_bf16_specialized, scalar_mul<bfloat>)
 
 // ScalarWeightMul: out = in * w[0] — multiply by a loaded [1]-shaped
 // weight (Gemma4 `layer_scalar`, applied to the hidden state at the
 // end of every decoder layer). Exact-thread dispatch like
-// `residual_add_*_specialized`; no function constants.
-kernel void scalar_weight_mul_f16_specialized(
-    device       half* out    [[buffer(0)]],
-    device const half* input  [[buffer(1)]],
-    device const half* weight [[buffer(2)]],
+// `residual_add_*_specialized`; no constants.
+template <typename T>
+[[kernel]] void scalar_weight_mul(
+    device       T* out    [[buffer(0)]],
+    device const T* input  [[buffer(1)]],
+    device const T* weight [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    out[gid] = half(float(input[gid]) * float(weight[0]));
+    out[gid] = T(float(input[gid]) * float(weight[0]));
 }
 
-kernel void scalar_weight_mul_bf16_specialized(
-    device       bfloat* out    [[buffer(0)]],
-    device const bfloat* input  [[buffer(1)]],
-    device const bfloat* weight [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    out[gid] = bfloat(float(input[gid]) * float(weight[0]));
-}
+SCRATCHY_KERNEL(scalar_weight_mul_f16_specialized, scalar_weight_mul<half>)
+SCRATCHY_KERNEL(scalar_weight_mul_bf16_specialized, scalar_weight_mul<bfloat>)
 
-// Specialized variants: the cap is a per-model compile-time constant
-// (`W::FINAL_LOGIT_SOFTCAPPING`), so it bakes into the pipeline as a
-// function constant instead of a runtime scalar buffer — same Phase
-// 5.B pattern as `bias_add_*_specialized`. Used by the metal
-// `Instruction::TanhSoftCap` lowering arm (Gemma2/4 final logit
-// softcapping: `out = cap * tanh(x / cap)`). Slot 1: function-constant
-// indices are file-scoped and slot 0 belongs to BIAS_ADD_NUM_COLS.
-constant float TANH_SOFTCAP_CAP [[function_constant(1)]];
+// TanhSoftCap: out = cap * tanh(input / cap). The cap is a per-model
+// constant (`W::FINAL_LOGIT_SOFTCAPPING`), compiled in at slot 1. Used by
+// the metal `Instruction::TanhSoftCap` lowering arm (Gemma2/4 final logit
+// softcapping).
+#ifdef SCRATCHY_CONSTANT_1
+SCRATCHY_CONSTANT(float, TANH_SOFTCAP_CAP, 1);
 
-kernel void tanh_soft_cap_f16_specialized(
-    device const half* input [[buffer(0)]],
-    device half* out [[buffer(1)]],
+template <typename T>
+[[kernel]] void tanh_soft_cap(
+    device const T* input [[buffer(0)]],
+    device T* out [[buffer(1)]],
     uint gid [[thread_position_in_grid]]
 ) {
     float x = float(input[gid]);
-    out[gid] = half(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
+    out[gid] = T(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
 }
+#endif
 
-kernel void tanh_soft_cap_bf16_specialized(
-    device const bfloat* input [[buffer(0)]],
-    device bfloat* out [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    float x = float(input[gid]);
-    out[gid] = bfloat(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
-}
+SCRATCHY_KERNEL(tanh_soft_cap_f16_specialized, tanh_soft_cap<half>)
+SCRATCHY_KERNEL(tanh_soft_cap_bf16_specialized, tanh_soft_cap<bfloat>)

@@ -9,8 +9,42 @@ mod common;
 
 use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLSize};
+use scratchy_target_metal::aot::baked_pipeline;
 use scratchy_target_metal::device::detect_device;
-use scratchy_target_metal::gate_scale::{GateScaleDType, GateScaleKernels, gate_scale_cpu_f32};
+use scratchy_target_metal::tape::ids::HiddenSize;
+use scratchy_target_metal::tape::kernel_constants::GateScaleConstants;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateScaleDType {
+    F16,
+    BF16,
+}
+
+impl GateScaleDType {
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::F16 => "gate_scale_f16",
+            Self::BF16 => "gate_scale_bf16",
+        }
+    }
+}
+
+/// CPU reference: `out[r, c] = routed[r, c] + shared_y[r, c] * sigmoid(g[r])`.
+fn gate_scale_cpu_f32(
+    routed: &[f32],
+    shared_y: &[f32],
+    gate: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    for r in 0..rows {
+        let sig = 1.0_f32 / (1.0 + (-gate[r]).exp());
+        for c in 0..cols {
+            out[r * cols + c] = routed[r * cols + c] + shared_y[r * cols + c] * sig;
+        }
+    }
+}
 
 fn rand_f32(n: usize, seed: u64, scale: f32) -> Vec<f32> {
     let mut s = seed | 1;
@@ -31,7 +65,6 @@ fn run(rows: usize, cols: usize, seed: u64, dtype: GateScaleDType) {
         return;
     };
     let device = __dev.device;
-    let kernels = GateScaleKernels::new(&device).expect("gate_scale kernels");
 
     let routed_f32 = rand_f32(rows * cols, seed, 4.0);
     let shared_f32 = rand_f32(rows * cols, seed.wrapping_mul(7919), 4.0);
@@ -84,13 +117,15 @@ fn run(rows: usize, cols: usize, seed: u64, dtype: GateScaleDType) {
 
     // gate_scale binding contract: buffer(0)=out, buffer(1)=routed,
     // buffer(2)=shared_y, buffer(3)=gate. `N` (= rows*cols) and `cols`
-    // are baked as function constants into the pipeline (the classic
-    // path did the same — neither was ever a `setBytes` scalar), so no
-    // scalar buffers are bound. One thread per output element; the
-    // kernel guards `gid >= N`, so the threadgroup over-launch is safe.
+    // are compiled into the kernel (`GateScaleConstants`), so no scalar
+    // buffers are bound. One thread per output element; the kernel
+    // guards `gid >= N`, so the threadgroup over-launch is safe.
     let n = (rows * cols) as u32;
-    let pipeline = kernels
-        .build_pipeline(dtype, n, cols as u32)
+    let constants = GateScaleConstants {
+        n: HiddenSize(n),
+        cols: cols as u32,
+    };
+    let pipeline = baked_pipeline(&device, "gate_scale", dtype.symbol(), constants.into())
         .expect("gate_scale pipeline");
     let tg_width = (n as usize).min(256);
     if !common::dispatch_threadgroups(

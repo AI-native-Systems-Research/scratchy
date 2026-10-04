@@ -15,13 +15,10 @@ use std::time::Instant;
 use half::bf16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
-use objc2_metal::{
-    MTLBuffer, MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions,
-    MTLSize,
-};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::shader_cache::load_library_from_bytes;
+use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 type Buf = Retained<ProtocolObject<dyn MTLBuffer>>;
 
@@ -40,28 +37,18 @@ fn as_bytes<T: Copy>(s: &[T]) -> &[u8] {
 }
 
 fn pipeline(
-    dev: &ProtocolObject<dyn MTLDevice>,
-    lib: &ProtocolObject<dyn MTLLibrary>,
+    dev: &Retained<ProtocolObject<dyn MTLDevice>>,
     m: i32,
     n: i32,
     k: i32,
-) -> Retained<ProtocolObject<dyn objc2_metal::MTLComputePipelineState>> {
-    let fc = MTLFunctionConstantValues::new();
-    // QMM_K=0, QMM_N=1, QMM_M=2  (int function constants)
-    unsafe {
-        for (val, idx) in [(k, 0usize), (n, 1), (m, 2)] {
-            fc.setConstantValue_type_atIndex(
-                NonNull::new(&val as *const i32 as *mut c_void).unwrap(),
-                MTLDataType::Int,
-                idx,
-            );
-        }
-    }
-    let func = lib
-        .newFunctionWithName_constantValues_error(&NSString::from_str("gemm_nax_bf16"), &fc)
-        .expect("specialize gemm_nax_bf16");
-    dev.newComputePipelineStateWithFunction_error(&func)
-        .expect("pipeline")
+) -> BakedPipeline {
+    // QMM_K=0, QMM_N=1, QMM_M=2 (int constants), compiled in.
+    let constants = vec![
+        ConstantValue::int(0, k),
+        ConstantValue::int(1, n),
+        ConstantValue::int(2, m),
+    ];
+    baked_pipeline(dev, "quantized_qmm_nax", "gemm_nax_bf16", constants).expect("pipeline")
 }
 
 fn run_gemm(
@@ -74,7 +61,7 @@ fn run_gemm(
     n: u32,
 ) {
     // Production MTL4 dispatch: kernel buffer-index order x(0), w(1), y(2);
-    // M/N/K are baked into `pipe` as function constants, not buffer bindings.
+    // M/N/K are compiled into `pipe`, not buffer bindings.
     common::dispatch_threadgroups(
         dev,
         pipe,
@@ -100,11 +87,6 @@ fn gemm_nax_bf16_correct_and_fast() {
         return;
     };
     let dev = &device.device;
-    let lib = load_library_from_bytes(
-        dev,
-        scratchy_target_metal::embedded_metallib!("quantized_qmm_nax"),
-    )
-    .expect("load NAX lib");
 
     // ---- Correctness: M=128, N=96 (unaligned), K=128 vs CPU A@B^T ----
     {
@@ -122,7 +104,7 @@ fn gemm_nax_bf16_correct_and_fast() {
         let xbuf = buf(dev, as_bytes(&xb));
         let wbuf = buf(dev, as_bytes(&wb));
         let ybuf = buf(dev, &vec![0u8; (m * n * 2) as usize]);
-        let pipe = pipeline(dev, &lib, m as i32, n as i32, k as i32);
+        let pipe = pipeline(dev, m as i32, n as i32, k as i32);
         run_gemm(dev, &pipe, &xbuf, &wbuf, &ybuf, m, n);
         let yo: &[u16] = unsafe {
             std::slice::from_raw_parts(ybuf.contents().as_ptr() as *const u16, (m * n) as usize)
@@ -150,7 +132,7 @@ fn gemm_nax_bf16_correct_and_fast() {
         let xbuf = buf(dev, &vec![0u8; (m as u64 * k as u64 * 2) as usize]);
         let wbuf = buf(dev, &vec![0u8; (n as u64 * k as u64 * 2) as usize]);
         let ybuf = buf(dev, &vec![0u8; (m as u64 * n as u64 * 2) as usize]);
-        let pipe = pipeline(dev, &lib, m as i32, n as i32, k as i32);
+        let pipe = pipeline(dev, m as i32, n as i32, k as i32);
         for _ in 0..2 {
             run_gemm(dev, &pipe, &xbuf, &wbuf, &ybuf, m, n);
         }

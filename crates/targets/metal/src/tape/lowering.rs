@@ -16,8 +16,6 @@
 //! The match over [`MetalStep`] is exhaustive: a new step kind fails to
 //! compile here (E0004) until its arm exists.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::SourceIx;
 use crate::tape::kernel_bindings::{CosSinTable, source};
@@ -32,36 +30,13 @@ use crate::tape::step::{
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
 
-/// Set by the worker when a draft model is loaded. The
-/// `attention_via_cache_v2_*` kernel's BPC=0 fast path has an unresolved
-/// interaction with the draft K-step chain on 3B-class+ models (symptom:
-/// out-of-vocab token IDs from the draft proposer). Forcing the chunked
-/// addressing path keeps spec-decode correct; non-spec-decode workloads
-/// keep the fast path. One-shot at worker init; the lowering pass picks
-/// up the value at first forward.
-static FORCE_CHUNKED_ADDRESSING: AtomicBool = AtomicBool::new(false);
-
-/// Disable the BPC=0 attention reader fast path for the lifetime of this
-/// process. The worker calls this when a draft model is loaded.
-pub fn force_chunked_attention_addressing() {
-    FORCE_CHUNKED_ADDRESSING.store(true, Ordering::Relaxed);
-}
-
-/// Whether chunked addressing is currently forced (spec-decode). The
-/// pool reads this at build time to select the matching baked tape
-/// variant.
-pub fn chunked_attention_addressing_forced() -> bool {
-    FORCE_CHUNKED_ADDRESSING.load(Ordering::Relaxed)
-}
-
 /// Value passed as `ATTN_BLOCKS_PER_CHUNK` to the attention reader's
 /// pipeline. `0` selects the direct-addressing fast path: the kernel
 /// treats `k_cache[0]` as the layer base and computes
 /// `physical_block * kv_blk_stride` directly (no per-block chunk-table
 /// load, no modulo). Safe because the worker installs one MTLBuffer per
-/// `(layer, K/V)` with `chunk_table[0]` filled to the layer base. Falls
-/// back to the chunked addressing path when
-/// [`force_chunked_attention_addressing`] has been called.
+/// `(layer, K/V)` with `chunk_table[0]` filled to the layer base. The chunked
+/// addressing rung ([`super::lowered::KvAddressing::Chunked`]) resolves every block.
 fn attention_blocks_per_chunk(chunked: bool) -> u32 {
     if chunked { crate::BLOCKS_PER_CHUNK } else { 0 }
 }
@@ -77,6 +52,7 @@ use crate::specialized_pipeline_cache::ConstantValue;
 use crate::tape::lowered::{
     Binding, DispatchShape, GatedCommand, GemmDims, IntoBaked, KernelId, LoweredCommand,
     LoweredMetalTape, LoweringError, MetalDtype, RuntimeBindingKind, WeightTensor, baked,
+    baked_commands,
 };
 
 /// Where one bucket's tape is baked: the bucket, its two halves' tape
@@ -92,9 +68,11 @@ pub struct BakePoint<'a> {
     /// The rotary table each attention class re-ropes cached K with (rope-on-read); `None`
     /// when the model has no rotary.
     pub rotary: Option<RotaryTables>,
-    /// Runtime per-sequence block-table capacity (`KvCachePool::max_blocks_per_seq`).
-    /// Replaces the compile-time `p.max_blocks_per_seq` at the `MaxBlocksPerSeq`
-    /// function-constant sites + the rope-once `roped_k_scratch` sizing.
+    /// The KV cap rung: per-sequence block-table capacity, sizing the rope-once
+    /// `roped_k_scratch` and the hd512 unfused attention. The commands that read the block table
+    /// take the rung's cap as a variant-bound constant ([`ConstantType::KvCap`]).
+    ///
+    /// [`ConstantType::KvCap`]: super::constants::ConstantType::KvCap
     pub block_cap: u32,
     pub profile: Option<&'a crate::targets::MetalTargetProfile>,
 }
@@ -192,10 +170,11 @@ pub fn lower_subtile_tape_to_metal(
     {
         return Err(LoweringError::TurboQuantCompressesNothing);
     }
+    let commands = (bb.commands.iter().chain(lh.commands.iter())).copied();
     Ok(LoweredMetalTape {
         bucket_m: at.bucket_m,
         num_arena_slots: at.num_arena_slots,
-        commands: baked([bb.commands, lh.commands].concat()),
+        commands: baked_commands(commands.collect()).map_err(LoweringError::TooManyCommands)?,
         barrier_before: baked([bb.barrier_before, lh.barrier_before].concat()),
         // The backbone's commands lead this concatenation, so its loop's `start`/`period`
         // still address the same rows. The lm_head tail is appended after and has no loop.
@@ -469,7 +448,6 @@ fn tq_stage_command<const IS_K: bool>(
     is_global: bool,
     table: Option<SourceIx>,
     bucket_m: u32,
-    block_cap: u32,
     pass: super::kernel_constants::TqStagePass,
     bits: TqBits,
 ) -> LoweredCommand {
@@ -496,7 +474,6 @@ fn tq_stage_command<const IS_K: bool>(
             head_dim: super::ids::HeadDim(p.global_head_dim),
             num_kv_heads: super::ids::NumKvHeads(p.num_global_kv_heads),
             block_size: super::ids::BlockSize(p.global_block_size),
-            max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
             blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
             bits: super::ids::TqCodeBits(bits.get()),
             rot_dim: ror_rd,
@@ -568,22 +545,11 @@ fn runtime_at(first: u8, kinds: impl IntoIterator<Item = RuntimeBindingKind>) ->
         .collect()
 }
 
-/// `Binding::Inline`s for `values`, bound from index `first`.
-fn inline_at(first: u8, values: impl IntoIterator<Item = u32>) -> Vec<Binding> {
-    (first..)
-        .zip(values)
-        .map(|(binding_index, value)| Binding::Inline {
-            binding_index,
-            value,
-        })
-        .collect()
-}
-
 /// TurboQuant: build the per-layer quantize command (new tokens in the fp16
 /// scratch → packed[L]), run right after the layer's KV writer, removing the
-/// operand's offset first (bindings 18..=23: bias, rotary table, positions,
-/// then `offset_mode` — 0 none, 1 the bias, 2 the bias rotated to the key's
-/// position — `rot_dim`, `pair_off`). New-token count == num_tokens, so the grid
+/// operand's offset first (bindings 18..=20: bias, rotary table, positions;
+/// [`TqOffset`](super::kernel_constants::TqOffset) the bias, rotated to the
+/// key's position for K). New-token count == num_tokens, so the grid
 /// scales like RopeAppend (m_scaling on X). The TurboQuant layers are the
 /// GLOBAL class (every layer on uniform arches, where GLOBAL_* == base).
 fn tq_quantize_command<const IS_K: bool>(
@@ -593,15 +559,13 @@ fn tq_quantize_command<const IS_K: bool>(
     bucket_m: u32,
     bits: TqBits,
 ) -> LoweredCommand {
+    use super::kernel_constants::{TqOffset, TqWriteback};
     use RuntimeBindingKind as RB;
     let (hd, nkv, bs) = (
         p.global_head_dim,
         p.num_global_kv_heads,
         p.global_block_size,
     );
-    let bits = bits.get();
-    let vpw = 32 / bits;
-    let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
     let li = super::ids::LayerId(layer);
     let (cache, packed, norms) = if IS_K {
         (
@@ -619,15 +583,7 @@ fn tq_quantize_command<const IS_K: bool>(
     let slots = RB::SlotMapping { layer: li };
     let runtime = [cache, slots, RB::TqSigns, RB::TqBoundaries, RB::TqCentroids];
     let mut bindings = runtime_at(0, runtime.into_iter().chain([packed, norms]));
-    let codec = [hd, bits, vpw, hd.div_ceil(vpw), 1 << bits, scale, nkv, bs];
-    bindings.extend(inline_at(
-        7,
-        codec.into_iter().chain([crate::BLOCKS_PER_CHUNK]),
-    ));
     bindings.extend(runtime_at(16, [slots]));
-    // do_writeback 0: the quantize runs before attention, which reads the
-    // step's new keys raw (decode) or rotates them itself (prefill staging).
-    bindings.extend(inline_at(17, [0]));
     if let Some(b) = operand.0 {
         bindings.push(b.bias_binding(18));
         if IS_K {
@@ -636,12 +592,24 @@ fn tq_quantize_command<const IS_K: bool>(
         }
     }
     let (rot_dim, pair_off, ..) = rope_on_read_params(p, true);
-    let mode = operand.0.map_or(0, |_| 1 + u32::from(IS_K));
-    let pairing = [
-        rot_dim.map_or(0, |r| r.get()),
-        pair_off.map_or(0, |po| po.get()),
-    ];
-    bindings.extend(inline_at(21, [mode, pairing[0], pairing[1]]));
+    let offset = match (operand.0, IS_K) {
+        (None, _) => TqOffset::None,
+        (Some(_), false) => TqOffset::Bias,
+        (Some(_), true) => TqOffset::RotatedBias,
+    };
+    let constants = super::kernel_constants::TqCompressConstants {
+        head_dim: super::ids::HeadDim(hd),
+        bits: super::ids::TqCodeBits(bits.get()),
+        num_kv_heads: super::ids::NumKvHeads(nkv),
+        block_size: super::ids::BlockSize(bs),
+        blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
+        // The quantize runs before attention, which reads the step's new keys raw (decode) or
+        // rotates them itself (prefill staging).
+        writeback: TqWriteback::Raw,
+        offset,
+        rot_dim: rot_dim.unwrap_or(super::ids::RotDim(0)),
+        pair_off: pair_off.unwrap_or(super::ids::RopePairOff(0)),
+    };
     LoweredCommand {
         kernel: KernelId::TqQuantizeToPacked,
         library: "turboquant",
@@ -650,7 +618,7 @@ fn tq_quantize_command<const IS_K: bool>(
             "tq_compress_paged_bf16",
             p.metal_dtype,
         ),
-        constants: baked(vec![]),
+        constants: constants.into_baked(),
         dispatch: DispatchShape {
             threadgroups: (bucket_m, nkv, 1),
             threads_per_threadgroup: (hd, 1, 1),
@@ -670,8 +638,11 @@ fn tq_quantize_command<const IS_K: bool>(
 /// `ATTN_TQ_BITS` and the packed-store bindings, so it reads every key but the
 /// one this step appended straight from the packed store, restoring each
 /// operand's offset (a rotated K bias by the rope-on-read table and pairing).
-/// One query head per threadgroup until [`serve_tq_decode_heads`] sets the
-/// device's count at load.
+/// Its threadgroups count query heads; one serves the tape variant's
+/// [`ConstantType::TqHeads`] of them, which divides them where the worker
+/// builds the dispatch.
+///
+/// [`ConstantType::TqHeads`]: super::constants::ConstantType::TqHeads
 fn tq_attention_command(
     attn: &LoweredCommand,
     layer: u32,
@@ -684,7 +655,6 @@ fn tq_attention_command(
             bits: super::ids::TqCodeBits(bits.get()),
             k_bias: ops.k.0.is_some(),
             v_bias: ops.v.0.is_some(),
-            heads: super::ids::TqDecodeHeads(1),
         },
     ));
     let mut bindings = attn.bindings.to_vec();
@@ -701,35 +671,23 @@ fn tq_attention_command(
     }
 }
 
+/// The rope-once scratch's bytes, `dims` multiplied wide: refused at the KV cap rung `block_cap`
+/// when they exceed the 32-bit sizes its kernels bind.
+fn roped_k_bytes(dims: [u32; 5], block_cap: u32) -> Result<u32, LoweringError> {
+    let bytes = dims.iter().try_fold(1u64, |b, &d| b.checked_mul(d.into()));
+    let bytes = bytes.and_then(|b| u32::try_from(b).ok());
+    bytes.ok_or(LoweringError::ScratchTooLarge {
+        scratch: super::lowered::ScratchKind::RopedK,
+        block_cap: super::ids::MaxBlocksPerSeq(block_cap),
+    })
+}
+
 /// The model's TurboQuant code width: a codec step lowers only on a model built with the codec.
 fn tq_bits(p: &MetalModelConsts) -> Result<TqBits, LoweringError> {
     match p.kv_codec {
         KvCodec::TurboQuant(bits) => Ok(bits),
         KvCodec::Dense => Err(LoweringError::CodecStepOnDenseModel),
     }
-}
-
-/// Have a TurboQuant decode command serve `heads` query heads per
-/// threadgroup: the pool's pick for the device it loads on, since it turns on
-/// the GPU's core count and every tape is baked for a whole chip generation.
-/// Every other command is left as it is.
-pub(crate) fn serve_tq_decode_heads(
-    command: &mut LoweredCommand,
-    heads: super::ids::TqDecodeHeads,
-) {
-    if command.kernel != KernelId::AttentionViaCacheTq {
-        return;
-    }
-    let slot = super::kernel_constants::AttentionViaCacheTqConstants::HEADS;
-    let constants = command.constants.iter().map(|c| {
-        if c.index == slot.get() {
-            ConstantValue::uint(slot, heads.get())
-        } else {
-            *c
-        }
-    });
-    command.constants = baked(constants.collect());
-    command.dispatch.threadgroups.1 /= heads.get();
 }
 
 /// A command that computes batch row 0 only ([`SeqScope::RowZero`]: the
@@ -893,8 +851,8 @@ struct OpenSpan {
 /// Close every span that ends at `at`, recording its `TapeLoop`.
 ///
 /// ⛔ THE SHAPE STATE STILL ADVANCES FOR EVERY ITERATION. The commands are emitted once, but
-/// `update_shape_state` threads the activation width along the tape — so the rows AFTER a loop
-/// must see the width all of its iterations produce, not one. The body was already walked once
+/// `update_shape_state` threads the row divisor along the tape — so the rows AFTER a loop
+/// must see the divisor all of its iterations produce, not one. The body was already walked once
 /// (that walk is what emitted it), so the replay is the remaining `iters - 1`.
 fn close_spans(
     open: &mut Vec<OpenSpan>,
@@ -902,7 +860,6 @@ fn close_spans(
     loops: &mut Vec<super::lowered::TapeLoop>,
     commands: &[GatedCommand],
     rows: &[StepRow],
-    cur_width: &mut crate::tape::lowered::ActivationWidth,
     m_divisor: &mut u32,
 ) {
     while open.last().is_some_and(|s| s.body.end == at) {
@@ -913,33 +870,23 @@ fn close_spans(
             iters: s.iters,
             layer_stride: s.layer_stride,
         });
-        advance_shape(
-            &rows[s.body.clone()],
-            s.iters.saturating_sub(1),
-            cur_width,
-            m_divisor,
-        );
+        advance_shape(&rows[s.body.clone()], s.iters.saturating_sub(1), m_divisor);
     }
 }
 
 /// Replay `update_shape_state` over `rows` `times` times, expanding any nested loops.
-fn advance_shape(
-    rows: &[StepRow],
-    times: u32,
-    cur_width: &mut crate::tape::lowered::ActivationWidth,
-    m_divisor: &mut u32,
-) {
+fn advance_shape(rows: &[StepRow], times: u32, m_divisor: &mut u32) {
     for _ in 0..times {
         let mut k = 0usize;
         while k < rows.len() {
             match &rows[k] {
                 StepRow::Loop { iters, body, .. } => {
                     let body = k + 1..k + 1 + body.get() as usize;
-                    advance_shape(&rows[body.clone()], iters.get(), cur_width, m_divisor);
+                    advance_shape(&rows[body.clone()], iters.get(), m_divisor);
                     k = body.end;
                 }
                 StepRow::Step(step, _) => {
-                    update_shape_state(step, cur_width, m_divisor);
+                    update_shape_state(step, m_divisor);
                     k += 1;
                 }
             }
@@ -984,23 +931,12 @@ fn lower(
     let mut moe_scratch_bytes: u32 = 0;
     let mut roped_k_scratch_bytes: u32 = 0;
     let mut attn_unfused_scratch_bytes: u32 = 0;
-    // Shape state for the dimensionless vision arms (`Gelu`,
-    // `MeanSubRmsNormBiasAdd`, vision `Add`) and the merger's row
-    // reduction. `cur_width` tracks the activation row-width (set by
-    // each `Gemm`'s output-N and the merger `Reshape`'s static col dim);
-    // `m_divisor` tracks the row-count divisor in force (1 normally,
-    // `vision_merge_factor` after the merger reshape). Updated by
-    // `update_shape_state` after each step is lowered, so each
-    // arm sees the state in force AT its position. Text arches never set
-    // a non-1 divisor (their reshapes carry `rows_div = 1`), so this is
-    // inert outside vision towers.
-    // Activation row-width in force at each step (see `lower_one`).
-    // Seeded to the residual-stream width (HIDDEN_SIZE) so the embed-time
-    // scalar multiply (granite `* embedding_multiplier`), which precedes
-    // the first Gemm that would publish a width, broadcasts over the full
-    // residual row rather than a stale 0. Typed as `ActivationWidth` so an
-    // elementwise broadcast can never be handed head geometry (Q_SIZE).
-    let mut cur_width = crate::tape::lowered::ActivationWidth::residual_stream(p);
+    // The merger's row reduction: `m_divisor` tracks the row-count divisor
+    // in force (1 normally, `vision_merge_factor` after the merger
+    // reshape). Updated by `update_shape_state` after each step is
+    // lowered, so each arm sees the divisor in force AT its position. Text
+    // arches never set a non-1 divisor (their reshapes carry
+    // `rows_div = 1`), so this is inert outside vision towers.
     let mut m_divisor: u32 = 1;
     let mut i = 0usize;
     // One barrier flag per row, rolled: the loop body's flags serve every
@@ -1018,7 +954,6 @@ fn lower(
             &mut loops,
             &commands,
             rows,
-            &mut cur_width,
             &mut m_divisor,
         );
         match &rows[i] {
@@ -1071,7 +1006,6 @@ fn lower(
                     &mut attn_unfused_scratch_bytes,
                     block_cap,
                     profile,
-                    cur_width,
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
@@ -1079,7 +1013,7 @@ fn lower(
                 let cmds = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 let cmds = row_gate(cmds, *gate, i)?;
                 let cmds = route_by_sequence_count(i, cmds)?;
-                update_shape_state(step, &mut cur_width, &mut m_divisor);
+                update_shape_state(step, &mut m_divisor);
                 let n_cmds = cmds.len();
                 // The hazard flags track arena slots, not the shared scratch: a command that
                 // writes it (a W4A8 pre-pass, a split-K partial) must wait for the previous reader.
@@ -1105,7 +1039,6 @@ fn lower(
         &mut loops,
         &commands,
         rows,
-        &mut cur_width,
         &mut m_divisor,
     );
     // ⛔ OUTERMOST FIRST. Spans close innermost-first, but the expander resolves a nest by
@@ -1116,7 +1049,7 @@ fn lower(
     Ok(LoweredMetalTape {
         bucket_m,
         num_arena_slots,
-        commands: baked(commands),
+        commands: baked_commands(commands).map_err(LoweringError::TooManyCommands)?,
         barrier_before: baked(barrier_before),
         loops: baked(loops),
         splitk_scratch_bytes,
@@ -1126,61 +1059,20 @@ fn lower(
     })
 }
 
-/// Abstract-interpret the activation shape across the step
-/// stream so the dimensionless vision arms can recover the width / row
-/// count the macro already solved — the info is read from the steps,
-/// not re-derived.
+/// Abstract-interpret the row count across the step stream so the
+/// merger's post-reshape arms recover the row divisor the macro already
+/// solved — read from the steps, not re-derived.
 ///
-/// - `cur_width` (row-width): set by each `Gemm`'s output-N and by the
-///   merger `Reshape`'s static (num_tokens-independent) col dim. The
-///   `MeanSubRmsNormBiasAdd` (LayerNorm HIDDEN) and `Gelu` (cols) arms
-///   read it; the vision `Add` arm reads it as the residual width.
-/// - `m_divisor` (row divisor): the merger `Reshape`
-///   `[num_tokens / vision_merge_factor, vision_merge_hidden]` carries
-///   `rows_div = vision_merge_factor`; every op after it
-///   operates on `bucket_m / vision_merge_factor` rows. Text reshapes
-///   carry `rows_div = 1`, so this never fires outside vision towers.
-fn update_shape_state(
-    step: &MetalStep,
-    cur_width: &mut crate::tape::lowered::ActivationWidth,
-    m_divisor: &mut u32,
-) {
-    use crate::tape::lowered::ActivationWidth;
-    use MetalStep as I;
-    match step {
-        // A dense GEMM publishes a `[*, n]` activation.
-        I::Gemm(_, _, _, NDim(n), _) => {
-            *cur_width = ActivationWidth::from_gemm_n(*n);
-        }
-        // Quantized matmuls publish `[*, n]` exactly like dense GEMMs.
-        // Without this arm, `cur_width` after an AffineQmm lm_head is
-        // whatever the last Gemm/Reshape left (Gemma4: the global-attn
-        // head reshape's 8192) — the trailing `TanhSoftCap` then caps
-        // only the first `eff_m * 8192` logits, and a PARTIAL cap is
-        // not argmax-invariant (uncapped raw values past the boundary
-        // outrun capped ones; flipped Gemma4 greedy decode at margins
-        // up to ~2).
-        I::AffineQmm(AffineMatmul { n: NDim(n), .. })
-        | I::SampleRows(
-            AffineMatmul { n: NDim(n), .. },
-            SampleRowsStep::Matmul | SampleRowsStep::AllRows,
-        ) => {
-            *cur_width = ActivationWidth::from_gemm_n(*n);
-        }
-        // The merger reshape `[num_tokens / div, width]`: the
-        // num_tokens-scaling row axis carries the row divisor; the
-        // static column axis is the new width.
-        // The divisor is SET unconditionally (including back to 1):
-        // Qwen2.5-VL reshapes `[L/S², S²·E]` for the window gather and
-        // then BACK to `[L, E]` before the encoder blocks — a sticky
-        // divisor would shrink every downstream op's `eff_m` by S².
-        // (Qwen3.5-VL's single trailing merger reshape never exposed
-        // this.)
-        I::Reshape(_, _, _, RowsDivisor(rows_div), HiddenSize(cols)) => {
-            *m_divisor = (*rows_div).max(1);
-            *cur_width = ActivationWidth::from_reshape_width(*cols);
-        }
-        _ => {}
+/// The merger `Reshape` `[num_tokens / vision_merge_factor, vision_merge_hidden]`
+/// carries `rows_div = vision_merge_factor`; every op after it operates on
+/// `bucket_m / vision_merge_factor` rows. The divisor is SET
+/// unconditionally (including back to 1): Qwen2.5-VL reshapes `[L/S², S²·E]`
+/// for the window gather and then BACK to `[L, E]` before the encoder blocks —
+/// a sticky divisor would shrink every downstream op's `eff_m` by S². Text
+/// reshapes carry `rows_div = 1`, so this never fires outside vision towers.
+fn update_shape_state(step: &MetalStep, m_divisor: &mut u32) {
+    if let MetalStep::Reshape(_, _, _, RowsDivisor(rows_div)) = step {
+        *m_divisor = (*rows_div).max(1);
     }
 }
 
@@ -1277,9 +1169,8 @@ fn steel_paged_dispatch(p: &MetalModelConsts, bucket_m: u32, bq: u32) -> Dispatc
 /// element `d` with `d + head_dim/2`, and the in-lane kernel skips first-side
 /// indices outside the `rot_dim/2` rotary window. The single requirement is
 /// `pair_off == head_dim/2` (so the lane's co-resident `+head_dim/2` partner
-/// IS the rope pair). `SPANS_CORESIDENT=0` forces `None` (the old contiguous
-/// shuffle path) for same-binary A/B. `None` whenever rope-on-read is off,
-/// which is byte-identical to non-spans.
+/// IS the rope pair). `None` whenever rope-on-read is off, which is
+/// byte-identical to non-spans.
 fn pair_coresident_param(
     _rot_dim: Option<super::ids::RotDim>,
     pair_off: Option<super::ids::RopePairOff>,
@@ -1308,9 +1199,6 @@ fn pair_coresident_param(
     // of 64 (64/128/256/512 → 2/4/8/16), so this excludes nothing
     // that currently runs.
     if !(head_dim / 32).is_multiple_of(2) {
-        return None;
-    }
-    if std::env::var("SPANS_CORESIDENT").as_deref() == Ok("0") {
         return None;
     }
     Some(1)
@@ -1350,14 +1238,9 @@ fn lower_one(
     // `roped_k_scratch` `num_pages` so long context isn't truncated.
     block_cap: u32,
     profile: Option<&crate::targets::MetalTargetProfile>,
-    // Shape state threaded by `lower()` (see [`ShapeState`]). `cur_width`
-    // is the current activation row-width (← each `Gemm`'s output-N, or
-    // the merger `Reshape`'s static col dim) — the dimensionless vision
-    // `Gelu` / LayerNorm arms read it. `m_divisor` is the row-count
-    // divisor in force (1 normally; `vision_merge_factor` after the
-    // merger reshape) so post-merge ops dispatch over `bucket_m /
-    // m_divisor` rows.
-    cur_width: crate::tape::lowered::ActivationWidth,
+    // The row-count divisor in force, threaded by `lower()` (1 normally;
+    // `vision_merge_factor` after the merger reshape) so post-merge ops
+    // dispatch over `bucket_m / m_divisor` rows.
     m_divisor: u32,
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
     // `eff_m` = the live row count this op operates on at the bucket
@@ -2870,7 +2753,6 @@ fn lower_one(
                     // class UP to the sliding page (Gemma4: 32 vs sliding 16).
                     // Defaults to BLOCK_SIZE on uniform arches.
                     block_size: super::ids::BlockSize(p.global_block_size),
-                    max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                     blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
                         chunked,
                     )),
@@ -2981,18 +2863,33 @@ fn lower_one(
                 let hd = p.global_head_dim;
                 let bs = p.global_block_size;
                 let lq = bucket_m;
-                let max_kv = block_cap * bs;
+                let too_large = || LoweringError::ScratchTooLarge {
+                    scratch: super::lowered::ScratchKind::AttnUnfused,
+                    block_cap: super::ids::MaxBlocksPerSeq(block_cap),
+                };
+                let max_kv = block_cap.checked_mul(bs).ok_or_else(too_large)?;
                 let lid = super::ids::LayerId(*layer + layer_offset);
                 let rot = rd.map(|r| r.get()).unwrap_or(hd);
                 let pair = po.map(|p| p.get()).unwrap_or(0);
                 let e: u32 = 2; // bf16
-                let al = |x: u32| (x + 255) & !255u32;
-                let q_head_off = 0u32;
-                let kdense_off = al(q_head_off + nh * lq * hd * e);
-                let vdense_off = al(kdense_off + nkv * max_kv * hd * e);
-                let scores_off = al(vdense_off + nkv * hd * max_kv * e);
-                let out_head_off = al(scores_off + lq * max_kv * e);
-                let total = al(out_head_off + nh * lq * hd * e);
+                // Each region at the scratch's end, 256-aligned; sized wide, and the whole
+                // scratch must fit the 32-bit offsets its kernels bind.
+                let mut end = 0u64;
+                let mut region = |dims: [u32; 3]| {
+                    let at = u32::try_from(end).map_err(|_| too_large())?;
+                    let bytes =
+                        (dims.iter()).try_fold(u64::from(e), |b, &d| b.checked_mul(d.into()));
+                    let next =
+                        bytes.and_then(|b| b.checked_add(end)?.checked_next_multiple_of(256));
+                    end = next.ok_or_else(too_large)?;
+                    Ok::<u32, LoweringError>(at)
+                };
+                let q_head_off = region([nh, lq, hd])?;
+                let kdense_off = region([nkv, max_kv, hd])?;
+                let vdense_off = region([nkv, hd, max_kv])?;
+                let scores_off = region([lq, max_kv, 1])?;
+                let out_head_off = region([nh, lq, hd])?;
+                let total = u32::try_from(end).map_err(|_| too_large())?;
                 *attn_unfused_scratch_bytes = (*attn_unfused_scratch_bytes).max(total);
 
                 let scr = |off: u32, bi: u8| Binding::AttnUnfusedScratch {
@@ -3095,9 +2992,8 @@ fn lower_one(
                             "quantized_qmm_nax",
                             "gemm_nax_bf16_qk",
                             vec![
-                                CV::int(0, hd as i32),     // QMM_K = hd
-                                CV::int(1, max_kv as i32), // QMM_N grid max (live N from seq_used)
-                                CV::int(2, lq as i32),     // QMM_M = Lq
+                                CV::int(0, hd as i32), // QMM_K = hd; N is live (seq_used)
+                                CV::int(2, lq as i32), // QMM_M = Lq
                                 // QK_SPAN_BLOCK_NAX = span_ids block size (== the
                                 // gather's `bs` = p.global_block_size), drives the
                                 // block-diagonal bound. MUST match span_ids layout.
@@ -3165,9 +3061,9 @@ fn lower_one(
                             "quantized_qmm_nax",
                             "gemm_nax_bf16_pv",
                             vec![
-                                CV::int(0, max_kv as i32), // QMM_K unused (live K from seq_used)
-                                CV::int(1, hd as i32),     // QMM_N = hd
+                                CV::int(1, hd as i32),     // QMM_N = hd; K is live (seq_used)
                                 CV::int(2, lq as i32),     // QMM_M = Lq
+                                CV::int(6, max_kv as i32), // NAX_PV_W_LD: V^T row stride
                                 // QK_SPAN_BLOCK_NAX: bounds the PV contraction to
                                 // the query-tile's span (== gather's `bs`).
                                 CV::uint(3, bs),
@@ -3178,9 +3074,9 @@ fn lower_one(
                         (
                             "gemm",
                             "gemm_bf16_pv",
-                            // GEMM_M=Lq, GEMM_N=hd, GEMM_K=max_kv (V^T row stride;
+                            // GEMM_M=Lq, GEMM_N=hd, GEMM_PV_W_LD=max_kv (V^T row stride;
                             // contraction kv_len read from seq_used).
-                            vec![CV::uint(0, lq), CV::uint(1, hd), CV::uint(2, max_kv)],
+                            vec![CV::uint(0, lq), CV::uint(1, hd), CV::uint(4, max_kv)],
                             tg_gemm_steel(hd, lq),
                         )
                     };
@@ -3344,7 +3240,6 @@ fn lower_one(
                 attn_scale: super::ids::AttnScale(p.attn_scale),
                 // GLOBAL class block size (page-unified; Gemma4: 32).
                 block_size: super::ids::BlockSize(p.global_block_size),
-                max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                 // Prefill kernels (steel + sdpa paged) stay at the standard
                 // BPC; the steel loader (paged_loader.h) has its own chunk
                 // arithmetic that hasn't been adapted to the BPC=0 fast
@@ -3505,20 +3400,26 @@ fn lower_one(
                         crate::tape::lowered::MetalDtype::Bf16 => 2u32,
                         _ => 2u32,
                     };
-                    // Size the rope-once scratch + grid to the PER-SEQUENCE block
-                    // capacity (block_cap), not one prefill bucket: a
-                    // chunked-prefill continuation attends the whole sequence, so
-                    // the scratch must hold every logical block the attention reads.
-                    // The worker caps the live grid.y to this value.
-                    let num_pages = block_cap.max(bucket_m.div_ceil(p.global_block_size));
-                    let scratch_bytes = num_pages
-                        .saturating_mul(p.num_global_kv_heads)
-                        .saturating_mul(p.global_block_size)
-                        .saturating_mul(p.global_head_dim)
-                        .saturating_mul(elem_bytes);
+                    // Size the rope-once scratch to the PER-SEQUENCE block capacity
+                    // (the rung's cap), not one prefill bucket: a chunked-prefill
+                    // continuation attends the whole sequence, so the scratch must
+                    // hold every logical block the attention reads. The grid's y is
+                    // the step's block-table width, which the worker sets per step.
+                    let bucket_pages = bucket_m.div_ceil(p.global_block_size);
+                    let num_pages = block_cap.max(bucket_pages);
+                    let scratch_bytes = roped_k_bytes(
+                        [
+                            num_pages,
+                            p.num_global_kv_heads,
+                            p.global_block_size,
+                            p.global_head_dim,
+                            elem_bytes,
+                        ],
+                        block_cap,
+                    )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
                     // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
-                    // y = num_pages (one logical block per row).
+                    // y = one logical block per row (the bucket's, until the worker sets the step's).
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
                     let rope_threads = p.num_global_kv_heads * p.global_block_size * rot_half;
                     let rope_cmd = LoweredCommand {
@@ -3527,14 +3428,10 @@ fn lower_one(
                         function: rope_sym,
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
-                            threadgroups: (rope_threads.div_ceil(64), num_pages, 1),
+                            threadgroups: (rope_threads.div_ceil(64), bucket_pages, 1),
                             threads_per_threadgroup: (64, 1, 1),
-                            // num_pages scales with the live num_tokens.
-                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                seq_axis: None,
-                                axis: crate::tape::lowered::MScaleAxis::Y,
-                                bucket_m: super::ids::BucketM(num_pages),
-                            }),
+                            // The worker sets y to the step's block-table width.
+                            m_scaling: None,
                         },
                         bindings: super::kernel_bindings::RopeOnceNaxBindingSet {
                             kv_layer: super::ids::LayerId(*layer + layer_offset),
@@ -3594,21 +3491,27 @@ fn lower_one(
                         .expect("rope_once_gqa_shared_symbol is Some for f16/bf16");
                     // f16 and bf16 are both 2 B/elem.
                     let elem_bytes = 2u32;
-                    // Size the rope-once scratch + grid to the PER-SEQUENCE block
-                    // capacity (block_cap), not one prefill bucket: a
-                    // chunked-prefill continuation attends the whole sequence, so
-                    // the scratch must hold every logical block the attention reads.
-                    // The worker caps the live grid.y to this value.
-                    let num_pages = block_cap.max(bucket_m.div_ceil(p.global_block_size));
-                    let scratch_bytes = num_pages
-                        .saturating_mul(p.num_global_kv_heads)
-                        .saturating_mul(p.global_block_size)
-                        .saturating_mul(p.global_head_dim)
-                        .saturating_mul(elem_bytes);
+                    // Size the rope-once scratch to the PER-SEQUENCE block capacity
+                    // (the rung's cap), not one prefill bucket: a chunked-prefill
+                    // continuation attends the whole sequence, so the scratch must
+                    // hold every logical block the attention reads. The grid's y is
+                    // the step's block-table width, which the worker sets per step.
+                    let bucket_pages = bucket_m.div_ceil(p.global_block_size);
+                    let num_pages = block_cap.max(bucket_pages);
+                    let scratch_bytes = roped_k_bytes(
+                        [
+                            num_pages,
+                            p.num_global_kv_heads,
+                            p.global_block_size,
+                            p.global_head_dim,
+                            elem_bytes,
+                        ],
+                        block_cap,
+                    )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
                     // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
-                    // y = num_pages (one logical block per row). Same decode as
-                    // the rope_once_gqa_shared kernel's gid.x.
+                    // y = one logical block per row (the bucket's, until the worker sets the step's).
+                    // Same decode as the rope_once_gqa_shared kernel's gid.x.
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
                     let rope_threads = p.num_global_kv_heads * p.global_block_size * rot_half;
                     let rope_cmd = LoweredCommand {
@@ -3617,13 +3520,10 @@ fn lower_one(
                         function: rope_sym,
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
-                            threadgroups: (rope_threads.div_ceil(64), num_pages, 1),
+                            threadgroups: (rope_threads.div_ceil(64), bucket_pages, 1),
                             threads_per_threadgroup: (64, 1, 1),
-                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                seq_axis: None,
-                                axis: crate::tape::lowered::MScaleAxis::Y,
-                                bucket_m: super::ids::BucketM(num_pages),
-                            }),
+                            // The worker sets y to the step's block-table width.
+                            m_scaling: None,
                         },
                         // Same 5 bindings as RopeOnceNax (scratch out, block
                         // table, k_cache, seq_used_k, class-resolved cos_sin).
@@ -3677,7 +3577,6 @@ fn lower_one(
                     num_kv_heads: super::ids::NumKvHeads(p.num_kv_heads),
                     attn_scale: super::ids::AttnScale(p.attn_scale),
                     block_size: super::ids::BlockSize(p.block_size),
-                    max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                     blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk(
                         chunked,
                     )),
@@ -3754,7 +3653,6 @@ fn lower_one(
                 num_kv_heads: super::ids::NumKvHeads(p.num_kv_heads),
                 attn_scale: super::ids::AttnScale(p.attn_scale),
                 block_size: super::ids::BlockSize(p.block_size),
-                max_blocks: super::ids::MaxBlocksPerSeq(block_cap),
                 blocks_per_chunk: super::ids::BlocksPerChunk(crate::BLOCKS_PER_CHUNK),
                 window: super::ids::AttnWindow(p.sliding_window),
                 // Steel reads slot 99 (the b3ddb3b46 lesson);
@@ -3828,15 +3726,21 @@ fn lower_one(
                     // f16 and bf16 are both 2 B/elem.
                     let elem_bytes = 2u32;
                     // Per-sequence block capacity (see the GLOBAL site above).
-                    let num_pages = block_cap.max(bucket_m.div_ceil(p.block_size));
-                    let scratch_bytes = num_pages
-                        .saturating_mul(p.num_kv_heads)
-                        .saturating_mul(p.block_size)
-                        .saturating_mul(p.head_dim)
-                        .saturating_mul(elem_bytes);
+                    let bucket_pages = bucket_m.div_ceil(p.block_size);
+                    let num_pages = block_cap.max(bucket_pages);
+                    let scratch_bytes = roped_k_bytes(
+                        [
+                            num_pages,
+                            p.num_kv_heads,
+                            p.block_size,
+                            p.head_dim,
+                            elem_bytes,
+                        ],
+                        block_cap,
+                    )?;
                     *roped_k_scratch_bytes = (*roped_k_scratch_bytes).max(scratch_bytes);
                     // Grid: x = num_kv_heads * BLOCK_SIZE * (rot_dim/2),
-                    // y = num_pages (one logical block per row).
+                    // y = one logical block per row (the bucket's, until the worker sets the step's).
                     let rot_half = ror_rd.map(|r| r.get() / 2).unwrap_or(0).max(1);
                     let rope_threads = p.num_kv_heads * p.block_size * rot_half;
                     let rope_cmd = LoweredCommand {
@@ -3845,13 +3749,10 @@ fn lower_one(
                         function: rope_sym,
                         constants: constants.into_baked(),
                         dispatch: DispatchShape {
-                            threadgroups: (rope_threads.div_ceil(64), num_pages, 1),
+                            threadgroups: (rope_threads.div_ceil(64), bucket_pages, 1),
                             threads_per_threadgroup: (64, 1, 1),
-                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                                seq_axis: None,
-                                axis: crate::tape::lowered::MScaleAxis::Y,
-                                bucket_m: super::ids::BucketM(num_pages),
-                            }),
+                            // The worker sets y to the step's block-table width.
+                            m_scaling: None,
                         },
                         // SLIDING-class cos_sin (is_global: false).
                         bindings: super::kernel_bindings::RopeOnceNaxBindingSet {
@@ -3896,7 +3797,7 @@ fn lower_one(
         }
 
         // ── Plain residual add ─────────────────────────────────────
-        I::Add(Slot(delta_slot), Slot(residual_slot)) => LoweredCommand {
+        I::Add(Slot(delta_slot), Slot(residual_slot), width) => LoweredCommand {
             kernel: KernelId::Add,
             library: "elementwise",
             function: pick_specialized_symbol(
@@ -3908,20 +3809,11 @@ fn lower_one(
             // shape; no function constants.
             constants: &[],
             // Token-parallel; reduction is per-element so the dispatch
-            // covers `M * width` elements. Width is `p.q_size` on the
-            // text path (the residual stream); on vision towers
-            // (`VISION_Q_SIZE > 0`) the text `Q_SIZE` is garbage (the
-            // config lacks text fields), so use the shape-tracked
-            // `cur_width` (the residual width = vision_embed_dim at every
-            // residual add). `eff_m` is bucket_m for these block-residual
-            // adds (they precede the merger reshape).
+            // covers `M * width` elements, `width` the step's own (the
+            // residual stream's). `eff_m` is bucket_m for these
+            // block-residual adds (they precede the merger reshape).
             dispatch: {
-                let add_width: u32 = if p.vision_q_size > 0 {
-                    cur_width.get()
-                } else {
-                    p.q_size as u32
-                };
-                let mut d = DispatchShape::dispatch_1d(eff_m * add_width, THREADS_PER_GROUP);
+                let mut d = DispatchShape::dispatch_1d(eff_m * width.get(), THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -3943,7 +3835,7 @@ fn lower_one(
         },
 
         // ── Scalar-multiply broadcast ──────────────────────────────
-        I::ScalarMul(Slot(in_slot), Slot(out_slot), Scale(scale)) => LoweredCommand {
+        I::ScalarMul(Slot(in_slot), Slot(out_slot), Scale(scale), width) => LoweredCommand {
             kernel: KernelId::ScalarMul,
             library: "elementwise",
             function: pick_specialized_symbol(
@@ -3953,17 +3845,14 @@ fn lower_one(
             ),
             constants: super::kernel_constants::ScalarMulConstants {
                 scale: *scale,
-                elements: super::ids::ElementCount(eff_m * cur_width.get()),
+                elements: super::ids::ElementCount(eff_m * width.get()),
             }
             .into_baked(),
             // A scalar-multiply must cover the FULL activation row.
-            // `cur_width` is the shape-tracked activation width: vocab
-            // after the lm_head Gemm for granite's
+            // `width` is the step's own: vocab for granite's
             // `logits * 1/logits_scaling`; HIDDEN on the residual-stream
             // `embed * embedding_multiplier` and `branch *
-            // residual_multiplier` muls (the embed multiply precedes the
-            // first Gemm, so `cur_width` is seeded to the residual-stream
-            // width — see `lower()`).
+            // residual_multiplier` muls.
             //
             // The previous `bucket_m * p.q_size` scaled only the first
             // `Q_SIZE` columns of each row. For granite that is 4096 of
@@ -3978,7 +3867,7 @@ fn lower_one(
             // guarded at runtime.
             dispatch: DispatchShape::activation_broadcast(
                 eff_m,
-                cur_width,
+                *width,
                 super::ids::BucketM(bucket_m),
             ),
             bindings: baked(vec![
@@ -4000,13 +3889,13 @@ fn lower_one(
         // ── Final logit softcapping (Gemma2/Gemma4) ────────────────
         //
         // `out = cap * tanh(x / cap)` with cap =
-        // `p.final_logit_softcapping` baked as function constant 0.
-        // Runs on the logits (`cur_width` = vocab after the lm_head
-        // GEMM); token-parallel exact-thread dispatch like `Add`.
+        // `p.final_logit_softcapping` baked as constant 1.
+        // Runs on the logits (`width` = vocab); token-parallel
+        // exact-thread dispatch like `Add`.
         // Always full-M: a softcapped lm_head's result is this cap, not
         // the GEMM, so the GEMM stays in the backbone and the lm_head
         // narrow path (`lower_subtile_tape_to_metal`) never sees it.
-        I::TanhSoftCap(Slot(in_slot), Slot(out_slot)) => {
+        I::TanhSoftCap(Slot(in_slot), Slot(out_slot), width) => {
             debug_assert!(
                 p.final_logit_softcapping > 0.0,
                 "TanhSoftCap lowered with FINAL_LOGIT_SOFTCAPPING <= 0"
@@ -4022,13 +3911,12 @@ fn lower_one(
                 // Slot 1: elementwise.metal's fn-const indices are
                 // file-scoped (slot 0 = BIAS_ADD_NUM_COLS).
                 constants: baked(vec![ConstantValue::float(1, p.final_logit_softcapping)]),
-                // Final logit softcap runs over the logits row (`cur_width`
-                // = vocab after the lm_head Gemm). Same typed broadcast as
-                // the granite ScalarMul: passing head geometry is a compile
-                // error.
+                // Final logit softcap runs over the logits row (`width` =
+                // vocab). Same typed broadcast as the granite ScalarMul:
+                // passing head geometry is a compile error.
                 dispatch: DispatchShape::activation_broadcast(
                     eff_m,
-                    cur_width,
+                    *width,
                     super::ids::BucketM(bucket_m),
                 ),
                 bindings: baked(vec![
@@ -4126,17 +4014,17 @@ fn lower_one(
             let global = *class == AttnMask::Causal;
             // Span blocks of K re-rope with the attention class's table.
             let table = w.rotary(p.rope_on_read.then_some(global))?;
-            let (layer, cap) = (layer.get() + layer_offset, block_cap);
+            let layer = layer.get() + layer_offset;
             // A row new for one sequence can be a prefix hit for another in the same step: the
             // step's new rows stage first, the cached rows after.
             use super::kernel_constants::TqStagePass;
             return Ok([TqStagePass::New, TqStagePass::Cached]
                 .map(|pass| match operand {
                     KvOperand::K => {
-                        tq_stage_command(p, layer, ops.k, global, table, bucket_m, cap, pass, bits)
+                        tq_stage_command(p, layer, ops.k, global, table, bucket_m, pass, bits)
                     }
                     KvOperand::V => {
-                        tq_stage_command(p, layer, ops.v, global, table, bucket_m, cap, pass, bits)
+                        tq_stage_command(p, layer, ops.v, global, table, bucket_m, pass, bits)
                     }
                 })
                 .to_vec());
@@ -4166,7 +4054,6 @@ fn lower_one(
                 attn_unfused_scratch_bytes,
                 block_cap,
                 profile,
-                cur_width,
                 m_divisor,
             )?;
             let layer = layer.get() + layer_offset;
@@ -4418,7 +4305,7 @@ fn lower_one(
         // and binding index 3 points at the WEIGHT buffer so the
         // argument is a valid allocation the kernel never dereferences
         // (Metal requires the binding to exist even when unread).
-        I::MeanSubRmsNorm(Slot(in_slot), Slot(out_slot), LayerId(layer)) => {
+        I::MeanSubRmsNorm(Slot(in_slot), Slot(out_slot), LayerId(layer), width) => {
             let layer_id = super::ids::LayerId(*layer + layer_offset);
             let ix = w.of(WeightKind::RmsNorm, 0)?;
             LoweredCommand {
@@ -4430,7 +4317,7 @@ fn lower_one(
                 ),
                 constants: baked(vec![
                     ConstantValue::uint(0, eff_m),
-                    ConstantValue::uint(1, cur_width.get()),
+                    ConstantValue::uint(1, width.get()),
                     ConstantValue::float(2, p.rms_norm_eps),
                     ConstantValue::uint(3, 0),
                 ]),
@@ -4462,12 +4349,12 @@ fn lower_one(
         // Faithful to the cuda `Instruction::MeanSubRmsNormBiasAdd` eval
         // (`instr.rs`): one fused `(x-mean)*rsqrt(var+eps)*weight + bias`
         // pass over the row-width. The `vision_layernorm` kernel does one
-        // threadgroup per row; `LN_HIDDEN` is the shape-tracked residual
-        // width (`cur_width` = vision_embed_dim at every norm site) and
+        // threadgroup per row; `LN_HIDDEN` is the step's own residual
+        // width (= vision_embed_dim at every norm site) and
         // `LN_M` / the grid are `eff_m` (= bucket_m here — all three
         // norms precede the merger reshape). Weight + bias resolve from
         // one `LayerNorm` source, mirroring the multi-tensor `GatedDeltaNet` binding pattern.
-        I::MeanSubRmsNormBiasAdd(Slot(in_slot), Slot(out_slot), LayerId(layer)) => {
+        I::MeanSubRmsNormBiasAdd(Slot(in_slot), Slot(out_slot), LayerId(layer), width) => {
             let layer_id = super::ids::LayerId(*layer + layer_offset);
             let ix = w.of(WeightKind::LayerNorm, 0)?;
             LoweredCommand {
@@ -4479,7 +4366,7 @@ fn lower_one(
                 ),
                 constants: baked(vec![
                     ConstantValue::uint(0, eff_m),
-                    ConstantValue::uint(1, cur_width.get()),
+                    ConstantValue::uint(1, width.get()),
                     ConstantValue::float(2, p.rms_norm_eps),
                     ConstantValue::uint(3, 1),
                 ]),
@@ -4512,20 +4399,19 @@ fn lower_one(
         //
         // Faithful to the cuda `Instruction::Gelu` eval
         // (`kernels::gelu_tanh_inplace`). Flat token-parallel; `n` =
-        // bucket-level element count `eff_m * cur_width`, so the merger's
+        // bucket-level element count `eff_m * width`, so the merger's
         // post-reshape gelu (`eff_m = bucket_m / vision_merge_factor`,
-        // `cur_width = vision_merge_hidden`) shrinks rows by the merge
+        // `width = vision_merge_hidden`) shrinks rows by the merge
         // factor for free. The `gelu_tanh` kernel guards `gid >= n`, so
-        // the m_scaling tail and any padding rows are no-ops. `n` is the
-        // kernel's runtime `constant uint& n` at buffer(2) — bound as a
-        // `setBytes` inline value (NOT a function constant).
-        I::Gelu(Slot(in_slot), Slot(out_slot)) => {
-            let n_elems = eff_m * cur_width.get();
+        // the m_scaling tail and any padding rows are no-ops. `n` is
+        // baked (`GeluConstants`).
+        I::Gelu(Slot(in_slot), Slot(out_slot), width) => {
+            let n_elems = eff_m * width.get();
             LoweredCommand {
                 kernel: KernelId::VisionGelu,
                 library: "activation",
                 function: gelu_tanh_static_name(p.metal_dtype),
-                constants: &[],
+                constants: gelu_constants(n_elems),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
@@ -4543,10 +4429,6 @@ fn lower_one(
                     Binding::ArenaSlot {
                         slot: *in_slot,
                         binding_index: 1,
-                    },
-                    Binding::Inline {
-                        binding_index: 2,
-                        value: n_elems,
                     },
                 ]),
                 gemm_dims: None,
@@ -4559,13 +4441,13 @@ fn lower_one(
         // differs (`gelu_erf` = exact erf, NOT the tanh approximation —
         // the two flavors coexist in one model: MoonViT block MLPs use
         // tanh, the multimodal projector uses erf).
-        I::GeluErf(Slot(in_slot), Slot(out_slot)) => {
-            let n_elems = eff_m * cur_width.get();
+        I::GeluErf(Slot(in_slot), Slot(out_slot), width) => {
+            let n_elems = eff_m * width.get();
             LoweredCommand {
                 kernel: KernelId::VisionGelu,
                 library: "activation",
                 function: gelu_erf_static_name(p.metal_dtype),
-                constants: &[],
+                constants: gelu_constants(n_elems),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
@@ -4583,10 +4465,6 @@ fn lower_one(
                     Binding::ArenaSlot {
                         slot: *in_slot,
                         binding_index: 1,
-                    },
-                    Binding::Inline {
-                        binding_index: 2,
-                        value: n_elems,
                     },
                 ]),
                 gemm_dims: None,
@@ -4596,13 +4474,13 @@ fn lower_one(
         // Same dispatch shape again; QuickGELU = x·sigmoid(1.702x)
         // (Qwen2-VL tower blocks — its merger uses `gelu_erf`, so both
         // flavors appear in one tape).
-        I::QuickGelu(Slot(in_slot), Slot(out_slot)) => {
-            let n_elems = eff_m * cur_width.get();
+        I::QuickGelu(Slot(in_slot), Slot(out_slot), width) => {
+            let n_elems = eff_m * width.get();
             LoweredCommand {
                 kernel: KernelId::VisionGelu,
                 library: "activation",
                 function: quick_gelu_static_name(p.metal_dtype),
-                constants: &[],
+                constants: gelu_constants(n_elems),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
@@ -4620,10 +4498,6 @@ fn lower_one(
                     Binding::ArenaSlot {
                         slot: *in_slot,
                         binding_index: 1,
-                    },
-                    Binding::Inline {
-                        binding_index: 2,
-                        value: n_elems,
                     },
                 ]),
                 gemm_dims: None,
@@ -4646,7 +4520,10 @@ fn lower_one(
                 kernel: KernelId::VisionLoadPixels,
                 library: "elementwise",
                 function: copy_rows_static_name(p.metal_dtype),
-                constants: &[],
+                constants: super::kernel_constants::CopyRowsConstants {
+                    elements: super::ids::ElementCount(n_elems),
+                }
+                .into_baked(),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
@@ -4664,10 +4541,6 @@ fn lower_one(
                     Binding::Runtime {
                         kind: RuntimeBindingKind::Pixels,
                         binding_index: 1,
-                    },
-                    Binding::Inline {
-                        binding_index: 2,
-                        value: n_elems,
                     },
                 ]),
                 gemm_dims: None,
@@ -4691,7 +4564,10 @@ fn lower_one(
                 kernel: KernelId::VisionLoadPixels,
                 library: "elementwise",
                 function: copy_rows_static_name(p.metal_dtype),
-                constants: &[],
+                constants: super::kernel_constants::CopyRowsConstants {
+                    elements: super::ids::ElementCount(n_elems),
+                }
+                .into_baked(),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
@@ -4709,10 +4585,6 @@ fn lower_one(
                     Binding::Runtime {
                         kind: RuntimeBindingKind::VisionPosEmbeds,
                         binding_index: 1,
-                    },
-                    Binding::Inline {
-                        binding_index: 2,
-                        value: n_elems,
                     },
                 ]),
                 gemm_dims: None,
@@ -4933,17 +4805,21 @@ fn lower_one(
         // output. Mirrors the cuda `kernels::embedding_gather` row
         // semantics; indices come from the `vision_window_index` /
         // `vision_reverse_indices` runtime externs.
-        I::EmbeddingGather(Slot(in_slot), Slot(out_slot), indices) => {
+        I::EmbeddingGather(Slot(in_slot), Slot(out_slot), indices, width) => {
             let idx_binding = match indices {
                 GatherIndices::WindowIndex => RuntimeBindingKind::VisionWindowIndex,
                 GatherIndices::ReverseIndices => RuntimeBindingKind::VisionReverseIndices,
             };
-            let n_elems = eff_m * cur_width.get();
+            let n_elems = eff_m * width.get();
             LoweredCommand {
                 kernel: KernelId::EmbeddingGather,
                 library: "embedding_gather",
                 function: embedding_gather_static_name(p.metal_dtype),
-                constants: &[],
+                constants: super::kernel_constants::EmbeddingGatherConstants {
+                    elements: super::ids::ElementCount(n_elems),
+                    width: *width,
+                }
+                .into_baked(),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
@@ -4965,14 +4841,6 @@ fn lower_one(
                     Binding::Runtime {
                         kind: idx_binding,
                         binding_index: 2,
-                    },
-                    Binding::Inline {
-                        binding_index: 3,
-                        value: n_elems,
-                    },
-                    Binding::Inline {
-                        binding_index: 4,
-                        value: cur_width.get(),
                     },
                 ]),
                 gemm_dims: None,
@@ -5008,7 +4876,10 @@ fn lower_one(
                 kernel: KernelId::MmEmbedSplice,
                 library: "elementwise",
                 function: mm_embed_splice_static_name(p.metal_dtype),
-                constants: &[],
+                constants: super::kernel_constants::MmEmbedSpliceConstants {
+                    hidden: HiddenSize(hidden),
+                }
+                .into_baked(),
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
@@ -5030,10 +4901,6 @@ fn lower_one(
                     Binding::Runtime {
                         kind: RuntimeBindingKind::MmDstRows,
                         binding_index: 2,
-                    },
-                    Binding::Inline {
-                        binding_index: 3,
-                        value: hidden,
                     },
                 ]),
                 gemm_dims: None,
@@ -5201,6 +5068,12 @@ fn vision_layernorm_static_name(dtype: MetalDtype, scale: ScaleDtype) -> &'stati
             panic!("vision_layernorm: Int4 unsupported (vision tower is unquantized bf16/f16)")
         }
     }
+}
+
+/// `activation.metal`'s constants for `n` elements.
+fn gelu_constants(n: u32) -> &'static [ConstantValue] {
+    let elements = super::ids::ElementCount(n);
+    super::kernel_constants::GeluConstants { elements }.into_baked()
 }
 
 /// `activation.metal` `gelu_tanh` (tanh-approx GELU) host-name picker.
@@ -6051,6 +5924,10 @@ fn lower_moe_step(
     at: MoeBake,
     moe_scratch_bytes: &mut u32,
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
+    use super::kernel_constants::{
+        AffineGatherQmvConstants, AffineQmvConstants, ArgsortConstants, GatherRows,
+        MoeTopKConstants, ScoresRow, SoftmaxConstants,
+    };
     use crate::tape::lowered::{MScaleAxis as A, MScaling};
     use ConstantValue as C;
     use MoeRegion as R;
@@ -6093,6 +5970,10 @@ fn lower_moe_step(
     let s = MoeScratch::of(b, bucket_m, p, moe_scratch_bytes);
     let (e, k, inter, hidden) = (b.experts.0, b.top_k.0, b.inter.0, b.hidden.0);
     let pairs = bucket_m * k;
+    let top_k_constants = || MoeTopKConstants {
+        experts: b.experts,
+        top_k: b.top_k,
+    };
     let router = || w.of(b.router.weight_kind(), 0);
     Ok(match step {
         // Plain RMSNorm by the router gain: Gemma's `(1 + w)` offset does not apply to it.
@@ -6137,17 +6018,17 @@ fn lower_moe_step(
             }]
         }
         S::Softmax(scores) => {
-            let (region, width) = match scores {
-                MoeScores::Router => (R::RouterLogits, e),
-                MoeScores::TopK => (R::TopKScores, k),
+            let (region, row) = match scores {
+                MoeScores::Router => (R::RouterLogits, ScoresRow::Experts(b.experts)),
+                MoeScores::TopK => (R::TopKScores, ScoresRow::TopK(b.top_k)),
             };
-            let bindings = vec![s.at(0, region), s.at(1, region), inline_at(2, [width])[0]];
+            let bindings = vec![s.at(0, region), s.at(1, region)];
             let shape = grid((bucket_m, 1, 1), (256, 1, 1), ms(A::X));
             vec![cmd(
                 KernelId::Softmax,
                 "softmax",
                 softmax_precise_symbol(p),
-                vec![],
+                SoftmaxConstants { row }.into(),
                 shape,
                 bindings,
             )]
@@ -6155,43 +6036,40 @@ fn lower_moe_step(
         // A full per-row sort; bn*tn = 128 covers E ≤ 128, E = 256 takes bn = 64.
         S::Argsort => {
             let bn = if e > 128 { 64 } else { 32 };
-            let mut bindings = vec![s.at(0, R::RouterLogits), s.at(1, R::SortedExperts)];
-            bindings.extend(inline_at(2, [e, 1, 1, e, e]));
+            let bindings = vec![s.at(0, R::RouterLogits), s.at(1, R::SortedExperts)];
             let shape = grid((1, bucket_m, 1), (bn, 1, 1), ms(A::Y));
             let symbol = argpartition_symbol(p, e);
             vec![cmd(
                 KernelId::ArgPartitionTopK,
                 "argpartition",
                 symbol,
-                vec![],
+                ArgsortConstants { experts: b.experts }.into(),
                 shape,
                 bindings,
             )]
         }
         S::TopK => {
-            let mut bindings = vec![s.at(0, R::SortedExperts), s.at(1, R::TopKIndices)];
-            bindings.extend(inline_at(2, [e, k]));
+            let bindings = vec![s.at(0, R::SortedExperts), s.at(1, R::TopKIndices)];
             let (kernel, library) = (KernelId::SliceTrailingColsU32, "slice_trailing_cols");
             vec![cmd(
                 kernel,
                 library,
                 "slice_trailing_cols_u32",
-                vec![],
+                top_k_constants().into(),
                 per_k(k),
                 bindings,
             )]
         }
         S::GatherScores => {
             let (from, at_inds) = (s.at(0, R::RouterLogits), s.at(1, R::TopKIndices));
-            let mut bindings = vec![from, at_inds, s.at(2, R::TopKScores)];
-            bindings.extend(inline_at(3, [e, k]));
+            let bindings = vec![from, at_inds, s.at(2, R::TopKScores)];
             let symbol = take_along_axis_symbol(p);
             let kernel = KernelId::TakeAlongAxis;
             vec![cmd(
                 kernel,
                 "take_along_axis",
                 symbol,
-                vec![],
+                top_k_constants().into(),
                 per_k(k),
                 bindings,
             )]
@@ -6221,14 +6099,14 @@ fn lower_moe_step(
                 MetalDtype::Bf16 => "topk_renorm_bfloat16",
                 MetalDtype::Int4 => panic!("topk_renorm: int4 unreachable"),
             };
-            let (scores, width) = (R::TopKScores, inline_at(2, [k])[0]);
-            let bindings = vec![s.at(0, scores), s.at(1, scores), width];
+            let bindings = vec![s.at(0, R::TopKScores), s.at(1, R::TopKScores)];
             let shape = grid((bucket_m, 1, 1), (256, 1, 1), ms(A::X));
+            let row = ScoresRow::TopK(b.top_k);
             vec![cmd(
                 KernelId::Softmax,
                 "softmax",
                 symbol,
-                vec![],
+                SoftmaxConstants { row }.into(),
                 shape,
                 bindings,
             )]
@@ -6447,10 +6325,10 @@ fn lower_moe_step(
                     bindings,
                 )]
             } else {
-                // Token rows are read once per chosen expert (`k` pairs a row); pair rows once.
-                let per_row = match rows {
-                    MoeRows::Tokens(_) => k,
-                    MoeRows::Scratch(_) => 1,
+                // Token rows are read once per chosen expert; pair rows once.
+                let rows_read = match rows {
+                    MoeRows::Tokens(_) => GatherRows::Tokens(b.top_k),
+                    MoeRows::Scratch(_) => GatherRows::Pairs,
                 };
                 let symbol = affine_gather_qmv_symbol(n_out, k_in, dtype, scale_dtype, gs, bits);
                 let kernel = match symbol.contains("_fast_") {
@@ -6459,9 +6337,18 @@ fn lower_moe_step(
                 };
                 let mut bindings = weights.to_vec();
                 let (x, indices) = (rows_of(&s, 3, rows), s.at(4, R::TopKIndices));
-                bindings.extend([x, indices, s.at(5, out), inline_at(6, [per_row])[0]]);
+                bindings.extend([x, indices, s.at(5, out)]);
                 let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), ms(A::Z));
-                vec![cmd(kernel, "quantized_qmv", symbol, dims, shape, bindings)]
+                let qmv = AffineGatherQmvConstants {
+                    qmv: AffineQmvConstants {
+                        k: super::ids::KDimI32(k_in as i32),
+                        n: super::ids::NDimI32(n_out as i32),
+                        codes,
+                    },
+                    rows: rows_read,
+                }
+                .into();
+                vec![cmd(kernel, "quantized_qmv", symbol, qmv, shape, bindings)]
             }
         }
         // `out = act(gate) * up`, written over the gate rows; the grouped bake runs every
@@ -6869,7 +6756,7 @@ mod tests {
         assert_eq!(tq.constants[..fp16.constants.len()], *fp16.constants);
         assert_eq!(
             tq.constants[fp16.constants.len()..],
-            [ConstantValue::uint(13, bits), ConstantValue::uint(16, 1)]
+            [ConstantValue::uint(13, bits), ConstantValue::tq_heads(16)]
         );
         assert_eq!(tq.bindings[..fp16.bindings.len()], *fp16.bindings);
         let layer = crate::tape::ids::LayerId(0);
@@ -6938,7 +6825,14 @@ mod tests {
         let (x, y, z) = fp16.dispatch.threadgroups;
         assert_eq!(y, p.num_q_heads);
         assert_eq!(tq.dispatch.threadgroups, (x, y, z));
-        assert_eq!(tq.constants.last(), Some(&ConstantValue::uint(16, 1)));
+        assert_eq!(tq.constants.last(), Some(&ConstantValue::tq_heads(16)));
+        let bound_heads = |c: &LoweredCommand| {
+            (c.constants.iter()).any(|k| k.ty == super::super::constants::ConstantType::TqHeads)
+        };
+        assert!(
+            !bound_heads(&fp16),
+            "only the TurboQuant decode command takes the heads"
+        );
         for (cores, heads) in [(8, 4), (16, 2), (32, 1)] {
             let served_heads = TqDecodeHeads::for_group(
                 HeadDim(p.global_head_dim),
@@ -6947,18 +6841,15 @@ mod tests {
                 GpuCores(cores),
             );
             assert_eq!(served_heads, TqDecodeHeads(heads), "{cores} cores");
-            let (mut served, mut other) = (tq, fp16);
-            serve_tq_decode_heads(&mut served, served_heads);
-            serve_tq_decode_heads(&mut other, served_heads);
-            assert_eq!(served.dispatch.threadgroups, (x, y / heads, z));
-            assert_eq!(
-                served.constants.last(),
-                Some(&ConstantValue::uint(16, heads))
-            );
-            assert!(
-                other == fp16,
-                "only the TurboQuant decode command is served"
-            );
+            let variant = super::super::constants::TapeVariant {
+                cap: crate::tape::ids::MaxBlocksPerSeq(128),
+                tq_heads: Some(served_heads),
+            };
+            let served = (tq.constants.iter())
+                .map(|k| k.resolve(variant))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("the variant binds the heads");
+            assert_eq!(served.last(), Some(&ConstantValue::uint(16, heads)));
         }
     }
 
@@ -7650,7 +7541,6 @@ mod tests {
     fn bound_from(cmd: &LoweredCommand, index: u8) -> Vec<Binding> {
         let at = |b: &Binding| match *b {
             Binding::Runtime { binding_index, .. }
-            | Binding::Inline { binding_index, .. }
             | Binding::Source { binding_index, .. }
             | Binding::ArenaSlot { binding_index, .. } => binding_index,
             other => panic!("TurboQuant command binding {other:?}"),
@@ -7688,15 +7578,11 @@ mod tests {
             binding_index: 20,
         };
         let mode = |mode| {
-            [(21, mode), (22, p.rot_dim), (23, p.rot_dim / 2)].map(|(binding_index, value)| {
-                Binding::Inline {
-                    binding_index,
-                    value,
-                }
-            })
+            [(10, mode), (11, p.rot_dim), (12, p.rot_dim / 2)]
+                .map(|(slot, value)| ConstantValue::uint(slot, value))
+                .to_vec()
         };
-        let cat = |a: &[Binding], b: [Binding; 3]| [a, &b].concat();
-        // Each codec command's offset bindings and bias constants, in tape order.
+        // Each codec command's offset bindings and offset constants, in tape order.
         let offsets = |offsets, attention, bucket_m| {
             let rows = coded(tq_writer(0, Causal, offsets), attention);
             let tape = lower_tq(&p, rows, bucket_m);
@@ -7704,19 +7590,19 @@ mod tests {
                 .iter()
                 .filter_map(|c| {
                     let c = &c.command;
-                    let from = match c.kernel {
-                        KernelId::TqQuantizeToPacked => 18,
-                        KernelId::TqStageRotated => 10,
-                        KernelId::AttentionViaCacheTq => 14,
+                    let (from, slots): (u8, &[u16]) = match c.kernel {
+                        KernelId::TqQuantizeToPacked => (18, &[10, 11, 12]),
+                        KernelId::TqStageRotated => (10, &[14, 15]),
+                        KernelId::AttentionViaCacheTq => (14, &[14, 15]),
                         _ => return None,
                     };
-                    let bias_consts: Vec<_> = c
+                    let offset_consts: Vec<_> = c
                         .constants
                         .iter()
-                        .filter(|k| matches!(k.index, 14 | 15))
+                        .filter(|k| slots.contains(&k.index))
                         .copied()
                         .collect();
-                    Some((c.kernel, bound_from(c, from), bias_consts))
+                    Some((c.kernel, bound_from(c, from), offset_consts))
                 })
                 .collect::<Vec<_>>()
         };
@@ -7730,8 +7616,8 @@ mod tests {
         let prefill = attention(MetalStep::AttentionPrefillPaged, 0, NeoX);
 
         let quantize = [
-            (q, cat(&[bias(0, 18), cos_sin, positions], mode(2)), vec![]),
-            (q, cat(&[bias(1, 18)], mode(1)), vec![]),
+            (q, vec![bias(0, 18), cos_sin, positions], mode(2)),
+            (q, vec![bias(1, 18)], mode(1)),
         ];
         let mut want = quantize.to_vec();
         want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
@@ -7750,16 +7636,16 @@ mod tests {
         want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
         assert_eq!(offsets(qwen2, prefill, 64), want);
 
-        let centered = |kernel| (kernel, mode(0).to_vec(), vec![]);
+        let centered = |kernel| (kernel, vec![], mode(0));
         let mut want = vec![centered(q), centered(q)];
         want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));
         want.push((twin, vec![], vec![]));
         assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
     }
 
-    /// The quantize binds exactly the ABI `turboquant.metal` declares, in order
-    /// — written out here, independently of the builder, for a centered layer
-    /// (the offset tail is pinned above).
+    /// The quantize binds exactly the ABI `turboquant.metal` declares, in order, and carries its
+    /// constants slot by slot — written out here, independently of the builder, for a centered
+    /// layer (the offset tail is pinned above).
     #[test]
     fn turboquant_quantize_binds_the_kernel_abi() {
         use RuntimeBindingKind as RB;
@@ -7769,16 +7655,14 @@ mod tests {
             kind,
             binding_index,
         };
-        let il = |binding_index, value| Binding::Inline {
-            binding_index,
-            value,
-        };
+        let k = ConstantValue::uint;
         let bits = TQ_BITS.get();
         let (hd, vpw) = (p.head_dim, 32 / bits);
-        let scale = (1.0f32 / (hd as f32).sqrt()).to_bits();
+        let scale = 1.0f32 / (hd as f32).sqrt();
         let tape = lower_tq_layer(attention(MetalStep::AttentionViaCache, 0, Interleaved), 1);
+        let quantize_v = tape.commands[2].command;
         assert_eq!(
-            tape.commands[2].command.bindings, // the quantize of V
+            quantize_v.bindings,
             [
                 rt(0, RB::KvCacheV { layer }),
                 rt(1, RB::SlotMapping { layer }),
@@ -7787,20 +7671,25 @@ mod tests {
                 rt(4, RB::TqCentroids),
                 rt(5, RB::TqPackedV { layer }),
                 rt(6, RB::TqNormsV { layer }),
-                il(7, hd),
-                il(8, bits),
-                il(9, vpw),
-                il(10, hd.div_ceil(vpw)),
-                il(11, 1 << bits),
-                il(12, scale),
-                il(13, p.num_kv_heads),
-                il(14, p.block_size),
-                il(15, crate::BLOCKS_PER_CHUNK),
                 rt(16, RB::SlotMapping { layer }),
-                il(17, 0),
-                il(21, 0),
-                il(22, 0),
-                il(23, 0),
+            ]
+        );
+        assert_eq!(
+            quantize_v.constants,
+            [
+                k(0, hd),
+                k(1, bits),
+                k(2, vpw),
+                k(3, hd.div_ceil(vpw)),
+                k(4, 1 << bits),
+                ConstantValue::float(5, scale),
+                k(6, p.num_kv_heads),
+                k(7, p.block_size),
+                k(8, crate::BLOCKS_PER_CHUNK),
+                k(9, 0),
+                k(10, 0),
+                k(11, 0),
+                k(12, 0),
             ]
         );
     }
@@ -7832,12 +7721,12 @@ mod tests {
 
     /// granite regression: the terminal `logits *= recip(logits_scaling)`
     /// ScalarMul must broadcast over the FULL logits row (vocab), not the
-    /// head-projection width `Q_SIZE`. A `Gemm(n=vocab)` publishes the
-    /// activation width the following ScalarMul covers; covering only
-    /// `Q_SIZE` leaves each row's tail unscaled — a non-argmax-invariant
-    /// partial multiply (granite gibberish). The fix is type-enforced via
-    /// `ActivationWidth` (a `p.q_size` cannot reach `activation_broadcast`
-    /// at all); this pins the resulting dispatch. Pure-CPU lowering check.
+    /// head-projection width `Q_SIZE`: the step carries the width of the
+    /// rows it writes; covering only `Q_SIZE` leaves each row's tail
+    /// unscaled — a non-argmax-invariant partial multiply (granite
+    /// gibberish). The fix is type-enforced via `ActivationWidth` (a
+    /// `p.q_size` cannot reach `activation_broadcast` at all); this pins
+    /// the resulting dispatch. Pure-CPU lowering check.
     #[test]
     fn scalar_mul_after_lm_head_gemm_broadcasts_over_vocab_not_qsize() {
         use crate::tape::lowered::ActivationWidth;
@@ -7849,19 +7738,8 @@ mod tests {
             "fixture needs vocab != Q_SIZE"
         );
 
-        // Abstract-interpret the width the lm_head Gemm publishes, exactly
-        // as `update_shape_state` does, then feed it to the ScalarMul.
-        let mut width = ActivationWidth::residual_stream(&tp());
-        let mut m_divisor = 1u32;
-        let gemm = MetalStep::Gemm(Slot(0), Slot(1), LayerId(2), NDim(VOCAB), KDim(0));
-        update_shape_state(&gemm, &mut width, &mut m_divisor);
-        assert_eq!(
-            width.get(),
-            VOCAB,
-            "Gemm output-N becomes the activation width"
-        );
-
-        let scalar_mul = MetalStep::ScalarMul(Slot(2), Slot(3), Scale(0.0625));
+        let width = ActivationWidth::of_cols(VOCAB);
+        let scalar_mul = MetalStep::ScalarMul(Slot(2), Slot(3), Scale(0.0625), width);
         let mut scratch = 0u32;
         let mut moe_scratch = 0u32;
         let mut roped_k = 0u32;
@@ -7879,8 +7757,7 @@ mod tests {
             &mut attn_unfused,
             128,
             None,
-            width,
-            m_divisor,
+            1,
         )
         .expect("lower scalar_mul");
         assert_eq!(cmds.len(), 1);
@@ -7929,8 +7806,6 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
-            /*cur_width=*/
-            crate::interpreter::metal::lowered::ActivationWidth::residual_stream(&tp()),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -8022,8 +7897,6 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
-            /*cur_width=*/
-            crate::interpreter::metal::lowered::ActivationWidth::residual_stream(&tp()),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -8077,8 +7950,6 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
-            /*cur_width=*/
-            crate::interpreter::metal::lowered::ActivationWidth::residual_stream(&tp()),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -8165,8 +8036,6 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
-            /*cur_width=*/
-            crate::interpreter::metal::lowered::ActivationWidth::residual_stream(&tp()),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -8242,8 +8111,6 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
-            /*cur_width=*/
-            crate::interpreter::metal::lowered::ActivationWidth::residual_stream(&tp()),
             /*m_divisor=*/ 1,
         )
         .expect("lower");
@@ -8286,8 +8153,6 @@ mod tests {
             &mut attn_unfused,
             /*block_cap=*/ 128,
             /*profile=*/ None,
-            /*cur_width=*/
-            crate::interpreter::metal::lowered::ActivationWidth::residual_stream(&tp()),
             /*m_divisor=*/ 1,
         )
         .expect("lower");

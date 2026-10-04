@@ -13,26 +13,29 @@
 /// Error types for Metal command/execution operations.
 #[derive(Debug, Clone)]
 pub enum MetalStreamError {
-    /// Command buffer creation failed
-    CommandBufferCreationFailed,
     /// Command buffer execution failed
     ExecutionFailed(String),
-    /// Device lost or unavailable
-    DeviceLost,
-    /// Timeout waiting for completion
-    Timeout,
     /// Shader compilation failed
     ShaderCompilationFailed(String),
+    /// The device's IO-registry entry has no GPU core count
+    /// ([`crate::device::gpu_cores`]).
+    UnknownGpuCores,
+    /// `ScratchyWeights::metal_off_tape` handed out something other than
+    /// [`crate::off_tape::OffTapeKernels`].
+    NotOffTapeKernels,
 }
 
 impl std::fmt::Display for MetalStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CommandBufferCreationFailed => write!(f, "Failed to create command buffer"),
             Self::ExecutionFailed(msg) => write!(f, "Command buffer execution failed: {}", msg),
-            Self::DeviceLost => write!(f, "Metal device lost or unavailable"),
-            Self::Timeout => write!(f, "Timeout waiting for command buffer completion"),
             Self::ShaderCompilationFailed(msg) => write!(f, "Shader compilation failed: {}", msg),
+            Self::UnknownGpuCores => {
+                write!(f, "the device's IO-registry entry has no gpu-core-count")
+            }
+            Self::NotOffTapeKernels => {
+                write!(f, "the model's off-tape kernels are not OffTapeKernels")
+            }
         }
     }
 }

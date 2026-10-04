@@ -114,7 +114,6 @@ pub mod steel_paged {
 
 pub mod allocator;
 pub mod argmax;
-pub mod argpartition;
 pub mod chain_advance;
 pub mod cpu_reference;
 pub mod device;
@@ -134,8 +133,6 @@ pub mod op_abi;
 // allocator — distinct from `allocator::PooledBufferAllocator` (legacy
 // kernel-buffer pool).
 pub mod device_metal;
-pub mod fused_kernels;
-pub mod gate_scale;
 pub mod layers;
 pub mod layers_moe;
 pub mod layers_quant;
@@ -148,19 +145,16 @@ pub mod weights_metal;
 pub use weights_metal::MetalWeightsExt;
 pub mod metal_allocator;
 pub mod metal_mem;
-pub mod moe_weighted_sum;
 pub mod mtl4_dispatch;
+pub mod off_tape;
 pub mod owned_metal;
 pub mod quantized;
 pub mod residency;
 pub mod sampling;
 pub mod shader_cache;
 pub mod single_buffer_kv;
-pub mod slice_trailing_cols;
-pub mod softmax;
 pub mod specialized_pipeline_cache;
 pub mod stream;
-pub mod take_along_axis;
 /// The pure tape-construction layer (no objc) — shared with the
 /// `#[forward]` macro, which constructs these values at expansion.
 pub mod tape;
@@ -168,13 +162,8 @@ pub mod tape;
 pub mod targets;
 pub mod turboquant;
 
-// Atom-driven metal megakernel synthesis (atom IR + fuse passes + AoT
-// metallib compile). Consumed by the compiler's metal codegen and the
-// metal cost-sweep.
+// The bake: AoT metallib compiles.
 pub mod aot;
-pub mod atom;
-pub mod atom_lib;
-pub mod fuse_pass;
 
 // Metal interpreter (lowering pass + worker pool) relocated out of the
 // compiler — a `cfg(feature = "metal")` there was a cfg-elimination

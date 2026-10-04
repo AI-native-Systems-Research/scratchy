@@ -20,10 +20,11 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
-    HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32,
-    MaxBlocksPerSeq, NDim, NDimI32, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim,
-    SplitK, TqCodeBits, TqDecodeHeads,
+    HeadDim, HiddenSize, IntermediateSize, KDimI32, KPartitionSizeI32, MDimI32, NDim, NDimI32,
+    NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TopK,
+    TqCodeBits,
 };
+use crate::tape::lowered::ActivationWidth;
 
 /// Append the spans rope-on-read function constants (slot 8 = rotary
 /// dim, slot 9 = NeoX pairing offset, slot 10 = 0/1 master switch) when
@@ -114,6 +115,58 @@ impl From<ScalarMulConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::VisionLoadPixels` (`copy_rows_<T>`, `elementwise.metal` slot 4): the elements the
+/// staged buffer holds.
+pub struct CopyRowsConstants {
+    pub elements: ElementCount,
+}
+
+impl From<CopyRowsConstants> for Vec<ConstantValue> {
+    fn from(c: CopyRowsConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(4), c.elements.get())]
+    }
+}
+
+/// `KernelId::MmEmbedSplice` (`mm_embed_splice_<T>`, `elementwise.metal` slot 5): the width of
+/// the embedding rows it scatters.
+pub struct MmEmbedSpliceConstants {
+    pub hidden: HiddenSize,
+}
+
+impl From<MmEmbedSpliceConstants> for Vec<ConstantValue> {
+    fn from(c: MmEmbedSpliceConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(5), c.hidden.get())]
+    }
+}
+
+/// `KernelId::VisionGelu` (`gelu_tanh_<T>` / `gelu_erf_<T>` / `quick_gelu_<T>`,
+/// `activation.metal`): the elements the buffer holds.
+pub struct GeluConstants {
+    pub elements: ElementCount,
+}
+
+impl From<GeluConstants> for Vec<ConstantValue> {
+    fn from(c: GeluConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(0), c.elements.get())]
+    }
+}
+
+/// `KernelId::EmbeddingGather` (`embedding_gather_rows_<T>`): the elements the output holds and
+/// the width of the rows it permutes.
+pub struct EmbeddingGatherConstants {
+    pub elements: ElementCount,
+    pub width: ActivationWidth,
+}
+
+impl From<EmbeddingGatherConstants> for Vec<ConstantValue> {
+    fn from(c: EmbeddingGatherConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.elements.get()),
+            ConstantValue::uint(ConstSlot(1), c.width.get()),
+        ]
+    }
+}
+
 // ── RopeAppendNormed ───────────────────────────────────────────────
 
 /// `KernelId::RopeAppendNormed` (`rope_append_normed_<act>_s_<scale>_
@@ -190,44 +243,6 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
     }
 }
 
-// ── FusedQkvRopeCache (dense BF16/F16) ─────────────────────────────
-
-/// `KernelId::FusedQkvRopeCache`
-/// (`fused_qkv_rope_cache_<dtype>_specialized`).
-pub struct FusedQkvRopeCacheConstants {
-    pub q_size: QSize,
-    pub num_q_heads: NumQHeads,
-    pub num_kv_heads: NumKvHeads,
-    pub head_dim: HeadDim,
-    pub rot_dim: RotDim,
-    pub block_size: BlockSize,
-    pub bucket_m: BucketM,
-    pub blocks_per_chunk: BlocksPerChunk,
-    /// Spans rope-on-read: `Some(1)` sets FQRC_ROPE_ON_READ (slot 8) so the
-    /// fused kernel stores K unrotated for slot_mapping-bit-31 blocks. `None`
-    /// omits the const → default-off (byte-identical non-spans).
-    pub rope_on_read: Option<u32>,
-}
-
-impl From<FusedQkvRopeCacheConstants> for Vec<ConstantValue> {
-    fn from(c: FusedQkvRopeCacheConstants) -> Self {
-        let mut v = vec![
-            ConstantValue::uint(ConstSlot(0), c.q_size.get()),
-            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
-            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
-            ConstantValue::uint(ConstSlot(3), c.head_dim.get()),
-            ConstantValue::uint(ConstSlot(4), c.rot_dim.get()),
-            ConstantValue::uint(ConstSlot(5), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(6), c.bucket_m.get()),
-            ConstantValue::uint(ConstSlot(7), c.blocks_per_chunk.get()),
-        ];
-        if let Some(ror) = c.rope_on_read {
-            v.push(ConstantValue::uint(ConstSlot(8), ror));
-        }
-        v
-    }
-}
-
 // ── AttentionViaCache (decode) ─────────────────────────────────────
 
 /// `KernelId::AttentionViaCache`
@@ -238,7 +253,6 @@ pub struct AttentionViaCacheConstants {
     pub num_kv_heads: NumKvHeads,
     pub attn_scale: AttnScale,
     pub block_size: BlockSize,
-    pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
     /// Sliding-window width (`ATTN_WINDOW`, slot 7). `0` = disabled
     /// (full attention); the sliding lowering arm passes
@@ -256,10 +270,9 @@ pub struct AttentionViaCacheConstants {
     /// (slot 12, `ATTN_PAIR_CORESIDENT`). When `Some(1)` each lane owns its
     /// NeoX pairs `{d, d+half_dim}` so the on-read rope is in-lane (no
     /// `simd_shuffle`, no `k_pair[]` staging array). Only valid for full
-    /// NeoX rope (`rot_dim == head_dim`); the lowering sets it only then,
-    /// and the env knob `SPANS_CORESIDENT=0` forces it off for A/B. `None`
-    /// (every non-spans dispatch, and the A/B-off case) → byte-identical
-    /// emitted Vec and the shader keeps the contiguous-slice + shuffle path.
+    /// NeoX rope (`rot_dim == head_dim`); the lowering sets it only then.
+    /// `None` (every non-spans dispatch) → byte-identical emitted Vec and the
+    /// shader keeps the contiguous-slice + shuffle path.
     pub pair_coresident: Option<u32>,
 }
 
@@ -271,7 +284,7 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
             ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
             ConstantValue::int(ConstSlot(7), c.window.get()),
         ];
@@ -292,11 +305,10 @@ pub struct AttentionViaCacheTqConstants {
     pub bits: TqCodeBits,
     pub k_bias: bool,
     pub v_bias: bool,
-    pub heads: TqDecodeHeads,
 }
 
 impl AttentionViaCacheTqConstants {
-    /// `ATTN_TQ_HEADS`, the slot of [`Self::heads`].
+    /// `ATTN_TQ_HEADS`: the query heads one threadgroup serves, the tape variant's.
     pub const HEADS: ConstSlot = ConstSlot(16);
 }
 
@@ -305,10 +317,7 @@ impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
         let mut v = vec![ConstantValue::uint(ConstSlot(13), c.bits.get())];
         v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
-        v.push(ConstantValue::uint(
-            AttentionViaCacheTqConstants::HEADS,
-            c.heads.get(),
-        ));
+        v.push(ConstantValue::tq_heads(AttentionViaCacheTqConstants::HEADS));
         v
     }
 }
@@ -320,7 +329,6 @@ pub struct TqStageConstants {
     pub head_dim: HeadDim,
     pub num_kv_heads: NumKvHeads,
     pub block_size: BlockSize,
-    pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
     pub bits: TqCodeBits,
     pub rot_dim: Option<RotDim>,
@@ -351,7 +359,7 @@ impl From<TqStageConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
         ];
         push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
@@ -360,6 +368,62 @@ impl From<TqStageConstants> for Vec<ConstantValue> {
         v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
         v.push(ConstantValue::uint(ConstSlot(17), c.pass as u32));
         v
+    }
+}
+
+/// `KernelId::TqQuantizeToPacked` (`tq_compress_paged[_bf16]`, turboquant.metal): the KV
+/// geometry of the layer it quantizes, the codebook width (and from it the packing), and the
+/// offset it removes first.
+pub struct TqCompressConstants {
+    pub head_dim: HeadDim,
+    pub bits: TqCodeBits,
+    pub num_kv_heads: NumKvHeads,
+    pub block_size: BlockSize,
+    pub blocks_per_chunk: BlocksPerChunk,
+    pub writeback: TqWriteback,
+    pub offset: TqOffset,
+    /// The rotated offset's rope geometry ([`TqOffset::RotatedBias`]); zero otherwise.
+    pub rot_dim: RotDim,
+    pub pair_off: RopePairOff,
+}
+
+/// Whether `tq_compress_paged` writes its lossy dequant back into the pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TqWriteback {
+    /// The pool keeps the raw vector.
+    Raw = 0,
+    Dequantized = 1,
+}
+
+/// The offset `tq_compress_paged` removes before quantizing (`turboquant_offset.h`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TqOffset {
+    None = 0,
+    /// The operand's projection bias.
+    Bias = 1,
+    /// The bias rotated to the key's position.
+    RotatedBias = 2,
+}
+
+impl From<TqCompressConstants> for Vec<ConstantValue> {
+    fn from(c: TqCompressConstants) -> Self {
+        use scratchy_layers::turboquant::{packed_dim, vals_per_word};
+        let (dim, bits) = (c.head_dim.get(), c.bits.get());
+        vec![
+            ConstantValue::uint(ConstSlot(0), dim),
+            ConstantValue::uint(ConstSlot(1), bits),
+            ConstantValue::uint(ConstSlot(2), vals_per_word(bits) as u32),
+            ConstantValue::uint(ConstSlot(3), packed_dim(dim as usize, bits) as u32),
+            ConstantValue::uint(ConstSlot(4), 1 << bits),
+            ConstantValue::float(ConstSlot(5), 1.0 / (dim as f32).sqrt()),
+            ConstantValue::uint(ConstSlot(6), c.num_kv_heads.get()),
+            ConstantValue::uint(ConstSlot(7), c.block_size.get()),
+            ConstantValue::uint(ConstSlot(8), c.blocks_per_chunk.get()),
+            ConstantValue::uint(ConstSlot(9), c.writeback as u32),
+            ConstantValue::uint(ConstSlot(10), c.offset as u32),
+            ConstantValue::uint(ConstSlot(11), c.rot_dim.get()),
+            ConstantValue::uint(ConstSlot(12), c.pair_off.get()),
+        ]
     }
 }
 
@@ -397,7 +461,6 @@ pub struct AttentionPrefillPagedConstants {
     pub num_kv_heads: NumKvHeads,
     pub attn_scale: AttnScale,
     pub block_size: BlockSize,
-    pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
     /// Sliding-window width (`ATTN_WINDOW` / `ATTN_PAGED_WINDOW`,
     /// slot 7). `0` = disabled. Read by BOTH the sdpa_vector paged
@@ -446,7 +509,7 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
             ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
-            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::kv_cap(ConstSlot(5)),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
             ConstantValue::int(ConstSlot(7), c.window.get()),
         ];
@@ -548,6 +611,95 @@ impl From<AffineQmvConstants> for Vec<ConstantValue> {
         ];
         v.extend(c.codes.constant());
         v
+    }
+}
+
+/// `KernelId::AffineGatherQmvFast` / `AffineGatherQmv` (`affine_gather_qmv[_fast]_*`): the
+/// expert matvec's [`AffineQmvConstants`] and which rows it reads (slot 2: the output rows one
+/// input row feeds).
+pub struct AffineGatherQmvConstants {
+    pub qmv: AffineQmvConstants,
+    pub rows: GatherRows,
+}
+
+/// The rows a MoE gather matvec reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatherRows {
+    /// Each token's row, once per chosen expert.
+    Tokens(TopK),
+    /// Each (token, expert) pair's own row.
+    Pairs,
+}
+
+impl From<AffineGatherQmvConstants> for Vec<ConstantValue> {
+    fn from(c: AffineGatherQmvConstants) -> Self {
+        let per_row = match c.rows {
+            GatherRows::Tokens(k) => k.get(),
+            GatherRows::Pairs => 1,
+        };
+        let mut v: Vec<ConstantValue> = c.qmv.into();
+        v.push(ConstantValue::int(ConstSlot(2), per_row as i32));
+        v
+    }
+}
+
+// ── MoE routing ───────────────────────────────────────────────────
+
+/// `KernelId::Softmax` (`block_softmax_precise_<T>`, `topk_renorm_<T>`, `softmax.metal`): the
+/// scores a row holds.
+pub struct SoftmaxConstants {
+    pub row: ScoresRow,
+}
+
+/// A MoE score row: every expert's, or the chosen top-k's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoresRow {
+    Experts(NumExperts),
+    TopK(TopK),
+}
+
+impl From<SoftmaxConstants> for Vec<ConstantValue> {
+    fn from(c: SoftmaxConstants) -> Self {
+        let width = match c.row {
+            ScoresRow::Experts(e) => e.get(),
+            ScoresRow::TopK(k) => k.get(),
+        };
+        vec![ConstantValue::int(ConstSlot(0), width as i32)]
+    }
+}
+
+/// `KernelId::ArgPartitionTopK` (`c_arg_block_sort_*`): MLX `block_sort` over contiguous rows of
+/// the router's experts — slot 0 the sorted axis's size, 1 / 2 its in / out stride, 3 / 4 the row
+/// strides.
+pub struct ArgsortConstants {
+    pub experts: NumExperts,
+}
+
+impl From<ArgsortConstants> for Vec<ConstantValue> {
+    fn from(c: ArgsortConstants) -> Self {
+        let e = c.experts.get() as i32;
+        [e, 1, 1, e, e]
+            .into_iter()
+            .zip(0..)
+            .map(|(v, slot)| ConstantValue::int(ConstSlot(slot), v))
+            .collect()
+    }
+}
+
+/// `KernelId::SliceTrailingColsU32` (`slice_trailing_cols_u32`) and `KernelId::TakeAlongAxis`
+/// (`take_along_axis_2d_contig_<T>`): the router's experts (slot 0) and the top-k it keeps of
+/// them (slot 1).
+pub struct MoeTopKConstants {
+    pub experts: NumExperts,
+    pub top_k: TopK,
+}
+
+impl From<MoeTopKConstants> for Vec<ConstantValue> {
+    fn from(c: MoeTopKConstants) -> Self {
+        vec![
+            ConstantValue::int(ConstSlot(0), c.experts.get() as i32),
+            ConstantValue::int(ConstSlot(1), c.top_k.get() as i32),
+        ]
     }
 }
 
@@ -760,29 +912,56 @@ impl From<FusedGateUpSiluMulPrefillConstants> for Vec<ConstantValue> {
     }
 }
 
-// ── Synth-* (compiler-emitted megakernels) ────────────────────────
+// ── Off-tape logits kernels ────────────────────────────────────────
 
-/// `KernelId::SynthPreAttn` / `KernelId::SynthMlpPreDown` /
-/// `KernelId::SynthGateUpSiluMul` — the macro-emitted megakernels.
-///
-/// All three bake every dim into MSL `constant constexpr` literals at
-/// synth time. Only the per-bucket `M` stays a function constant
-/// (slot 0).
-pub struct SynthMegakernelConstants {
-    pub bucket_m: BucketM,
+/// `argmax.metal` slot 0: the logits per row.
+pub struct ArgmaxConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
 }
 
-impl From<SynthMegakernelConstants> for Vec<ConstantValue> {
-    fn from(c: SynthMegakernelConstants) -> Self {
-        vec![ConstantValue::uint(ConstSlot(0), c.bucket_m.get())]
+impl From<ArgmaxConstants> for Vec<ConstantValue> {
+    fn from(c: ArgmaxConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(0), c.vocab.get())]
     }
 }
 
-// Keep `KDim` / `NDim` re-exported even though the int32 siblings
-// (`KDimI32`/`NDimI32`) cover the qmv/qmm_t shaders today. SplitK
-// reduce and the synth-* family need the unsigned form.
-#[allow(dead_code)]
-const _: fn() = || {
-    let _ = std::marker::PhantomData::<KDim>;
-    let _ = std::marker::PhantomData::<NDim>;
-};
+/// `grammar_mask.metal`: slot 0 the logits per row, slot 1 the allow-bitset row stride.
+pub struct GrammarMaskConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
+    pub words_per_row: crate::tape::ids::BitsetWords,
+}
+
+impl From<GrammarMaskConstants> for Vec<ConstantValue> {
+    fn from(c: GrammarMaskConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.vocab.get()),
+            ConstantValue::uint(ConstSlot(1), c.words_per_row.get()),
+        ]
+    }
+}
+
+/// `sampling.metal`: slot 0 the logits per row, slot 1 whether the telemetry spill is compiled
+/// in (`sample_softmax_materialize` / `sample_finalize` only).
+pub struct SamplerConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
+    pub telemetry: Option<bool>,
+}
+
+impl From<SamplerConstants> for Vec<ConstantValue> {
+    fn from(c: SamplerConstants) -> Self {
+        let vocab = ConstantValue::uint(ConstSlot(0), c.vocab.get());
+        let telemetry = c.telemetry.map(|t| ConstantValue::boolean(ConstSlot(1), t));
+        std::iter::once(vocab).chain(telemetry).collect()
+    }
+}
+
+/// `chain_advance.metal` slot 0: the model's KV block size.
+pub struct ChainAdvanceConstants {
+    pub block_size: BlockSize,
+}
+
+impl From<ChainAdvanceConstants> for Vec<ConstantValue> {
+    fn from(c: ChainAdvanceConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(0), c.block_size.get())]
+    }
+}

@@ -40,8 +40,6 @@ use syn::Ident;
 mod alias_rules;
 mod arch_spec;
 mod ast;
-#[cfg(feature = "metal")]
-use scratchy_target_metal::atom;
 mod cfg;
 mod classified;
 mod classify;
@@ -53,8 +51,6 @@ mod config;
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
 pub use config::{total_models_emitted, unmatched_build_filter_tags};
-#[cfg(feature = "metal")]
-use scratchy_target_metal::fuse_pass;
 mod assignment;
 #[cfg(feature = "cuda")]
 mod cost;
@@ -77,6 +73,10 @@ mod render;
 /// The build script's other half: `compile_carrier` makes the tokens,
 /// `render_tokens` turns them into the text rustc reads.
 pub use render::render_tokens;
+/// The build script's last step: the crate-root `__metal_bake` module every emitted model's baked
+/// kernels resolve in, baked once the models are emitted.
+#[cfg(feature = "metal")]
+pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
 mod schedule;
 mod shape;
 #[cfg(feature = "cuda")]
@@ -2187,6 +2187,44 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant `CanonicalParams::METAL_DTYPE` reads.
+    let metal_dtype_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => <#model_ident::Weights as
+                    ::scratchy_forward_compiler::CanonicalParams>::METAL_DTYPE,
+            }
+        })
+        .collect();
+
+    // Per-variant `METAL_OFF_TAPE` reads: each model's baked argmax / grammar
+    // mask / sampler kernels.
+    let metal_off_tape_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => &#model_ident::METAL_OFF_TAPE,
+            }
+        })
+        .collect();
+
+    // Per-variant `METAL_RUNGS` reads: each model's baked tape rungs.
+    let metal_rungs_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => &#model_ident::METAL_RUNGS,
+            }
+        })
+        .collect();
+
     // Per-variant `METAL_BUCKET_ARENA_COSTS` reads — the `(bucket_m, bytes)`
     // table the worker feeds to `select_prefill_bucket` for target-reactive
     // bucket pruning. Mirrors `metal_arena_peak_arms`.
@@ -2808,6 +2846,31 @@ fn emit_arch_dispatcher(
             fn metal_bucket_arena_costs(&self) -> &'static [(u32, u64)] {
                 match self {
                     #(#metal_bucket_costs_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_dtype(&self) -> ::scratchy_target_metal::interpreter::metal::MetalDtype {
+                match self {
+                    #(#metal_dtype_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_off_tape(
+                &self,
+            ) -> &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync) {
+                match self {
+                    #(#metal_off_tape_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_rungs(
+                &self,
+            ) -> &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync) {
+                match self {
+                    #(#metal_rungs_arms)*
                 }
             }
 

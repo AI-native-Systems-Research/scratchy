@@ -14,17 +14,18 @@
 // u32 top-k index buffer (the same `topk_inds` the affine_gather_qmv steps
 // read). The softmax already wrote `topk_scores` in place; this scales it.
 //
-// Function constants:
+// Baked constants:
 //   MPES_N — total element count = M * top_k.
 //
 // Dispatch: 1 thread per (m, j). Float intermediate so the bf16/f16
 // multiply matches the host reference's single rounding.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint MPES_N [[function_constant(0)]];
+SCRATCHY_CONSTANT(uint, MPES_N, 0);
 
 template <typename T>
 [[kernel]] void moe_per_expert_scale(
@@ -42,13 +43,8 @@ template <typename T>
   topk_scores[gid] = static_cast<T>(w * s);
 }
 
-#define INST_MPES(dtype_tag, mtl_type)                                    \
-  template [[host_name("moe_per_expert_scale_" #dtype_tag)]] [[kernel]]   \
-  void moe_per_expert_scale<mtl_type>(                                    \
-      device       mtl_type* topk_scores      [[buffer(0)]],             \
-      const device uint*     topk_inds        [[buffer(1)]],             \
-      const device mtl_type* per_expert_scale [[buffer(2)]],             \
-      uint gid [[thread_position_in_grid]]);
+#define INST_MPES(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(moe_per_expert_scale_##dtype_tag, moe_per_expert_scale<mtl_type>)
 
 INST_MPES(float16,  half)
 INST_MPES(bfloat16, bfloat)

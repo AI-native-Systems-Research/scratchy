@@ -17,12 +17,12 @@ use std::ptr::NonNull;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::cpu_reference::affine_qmm_n_b4_bf16 as cpu_qmm_n_bf16;
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::quantized::{
     DequantDtype, ScaleDtype, qmm_n_dispatch_shape, qmm_n_kernel_name,
 };
-use scratchy_target_metal::shader_cache::{ComputePipelineState, ShaderCache};
 use scratchy_target_metal::specialized_pipeline_cache::ConstantValue;
 
 mod common;
@@ -41,17 +41,14 @@ fn qmm_n_pipeline(
     n: u32,
     k: u32,
     group_size: u32,
-) -> ComputePipelineState {
-    let cache = ShaderCache::new(device.clone()).expect("ShaderCache");
+) -> BakedPipeline {
     let name = qmm_n_kernel_name(dtype, scale_dtype, group_size, 4);
-    let constants = [
+    let constants = vec![
         ConstantValue::int(0, k as i32),
         ConstantValue::int(1, n as i32),
         ConstantValue::int(2, m as i32),
     ];
-    cache
-        .get_pipeline_specialized(&name, &constants)
-        .expect("qmm_n pipeline")
+    baked_pipeline(device, "quantized_qmm", &name, constants).expect("qmm_n pipeline")
 }
 
 /// `(threadgroups, threads_per_threadgroup)` for qmm_n at B=1, from

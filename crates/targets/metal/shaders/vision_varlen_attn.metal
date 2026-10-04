@@ -4,7 +4,7 @@
 //
 // Cacheless, NON-causal, per-segment SDPA over `cu_seqlens` — the vision
 // analogue of the text decoder's attention, but with NO paged KV-cache, NO
-// causal mask, NO GQA, and an arbitrary head_dim (function-constant). This is
+// causal mask, NO GQA, and an arbitrary head_dim (baked). This is
 // net-new: every wired metal attention kernel is paged-cache + causal, and
 // head_dim 72 (Qwen3.5-VL) / 80 (Qwen2.5-VL) are absent from the steel head-dim
 // instantiations and fail `attention_via_cache_v2`'s head_dim%32==0.
@@ -21,7 +21,7 @@
 //   element (token t, head h, dim d) at ((t*H + h)*D + d).
 // `cu_seqlens` is int [NUM_SEGS+1], segment s spans tokens [cu[s], cu[s+1]).
 //
-// Function constants:
+// Baked constants:
 //   VA_HEAD_DIM (D), VA_NUM_HEADS (H), VA_NUM_SEGS, VA_N_TOKENS (L, guard),
 //   VA_SCALE (head_dim**-0.5).
 //
@@ -29,14 +29,15 @@
 // MVP (not FA2): online-softmax single pass, head_dim in registers.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint  VA_HEAD_DIM  [[function_constant(0)]];
-constant uint  VA_NUM_HEADS [[function_constant(1)]];
-constant uint  VA_NUM_SEGS  [[function_constant(2)]];
-constant uint  VA_N_TOKENS  [[function_constant(3)]];
-constant float VA_SCALE     [[function_constant(4)]];
+SCRATCHY_CONSTANT(uint, VA_HEAD_DIM, 0);
+SCRATCHY_CONSTANT(uint, VA_NUM_HEADS, 1);
+SCRATCHY_CONSTANT(uint, VA_NUM_SEGS, 2);
+SCRATCHY_CONSTANT(uint, VA_N_TOKENS, 3);
+SCRATCHY_CONSTANT(float, VA_SCALE, 4);
 
 // Register accumulator bound (head_dim <= 128, matches the gdn scan).
 constant constexpr uint VA_DMAX = 128;
@@ -110,15 +111,8 @@ template <typename T>
   }
 }
 
-#define INST_VISION_VARLEN_ATTN(dtype_tag, mtl_type)                          \
-  template [[host_name("vision_varlen_attn_" #dtype_tag)]] [[kernel]] void    \
-  vision_varlen_attn<mtl_type>(                                               \
-      device       mtl_type* out        [[buffer(0)]],                       \
-      const device mtl_type* q          [[buffer(1)]],                       \
-      const device mtl_type* k          [[buffer(2)]],                       \
-      const device mtl_type* v          [[buffer(3)]],                       \
-      const device int*      cu_seqlens [[buffer(4)]],                       \
-      uint gid [[thread_position_in_grid]]);
+#define INST_VISION_VARLEN_ATTN(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(vision_varlen_attn_##dtype_tag, vision_varlen_attn<mtl_type>)
 
 INST_VISION_VARLEN_ATTN(f16,  half)
 INST_VISION_VARLEN_ATTN(bf16, bfloat)

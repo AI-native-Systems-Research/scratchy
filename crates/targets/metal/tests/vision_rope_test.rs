@@ -12,6 +12,7 @@
 mod common;
 
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -71,8 +72,8 @@ fn vision_rope_2d_matches_neox_reference() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     // Small config exercising the d%half tiling + the rotate_half split.
     let (l, h, d) = (3usize, 2usize, 8usize);
@@ -92,7 +93,7 @@ fn vision_rope_2d_matches_neox_reference() {
             ConstantValue::uint(2, n as u32),
         ],
     );
-    let pipeline = cache.get_or_build(&key).expect("vision_rope_2d pipeline");
+    let pipeline = baked_build(&cache, &key).expect("vision_rope_2d pipeline");
 
     let x_buf = common::shared_slice(&device, &x);
     let fr_buf = common::shared_slice(&device, &freqs);
@@ -137,8 +138,8 @@ fn vision_rope_2d_interleaved_matches_reference() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     // Small config exercising the adjacent-pair rotation + per-pair angle
     // indexing (freqs row stride = half, one angle per pair).
@@ -159,9 +160,7 @@ fn vision_rope_2d_interleaved_matches_reference() {
             ConstantValue::uint(2, n as u32),
         ],
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("vision_rope_2d_interleaved pipeline");
+    let pipeline = baked_build(&cache, &key).expect("vision_rope_2d_interleaved pipeline");
 
     let x_buf = common::shared_slice(&device, &x);
     let fr_buf = common::shared_slice(&device, &freqs);

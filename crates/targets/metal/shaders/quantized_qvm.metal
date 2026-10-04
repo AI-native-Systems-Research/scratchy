@@ -33,6 +33,7 @@
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
@@ -45,8 +46,8 @@ using namespace metal;
 MLX_MTL_CONST int SIMD_SIZE = 32;
 
 // ─────────────────────────────────────────────────────────────────
-// Function constants — baked at pipeline build time by
-// `MetalAffineQvm::execute`. K and N ride as constants so the
+// Baked constants — the bake compiles one kernel per
+// command's constant set. K and N ride as constants so the
 // kernel is ICB-recordable (no setBytes for shape metadata).
 // For the splitk variant, QVM_K_PARTITION_SIZE and
 // QVM_FINAL_BLOCK_SIZE hold the per-partition K-extent (= split_D
@@ -60,12 +61,12 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 // keep them stable, ICB-recorded commands key on the constant bag.
 // ─────────────────────────────────────────────────────────────────
 
-constant int QVM_K                  [[function_constant(0)]];
-constant int QVM_N                  [[function_constant(1)]];
-constant int QVM_M                  [[function_constant(2)]];
-constant int QVM_K_PARTITION_SIZE   [[function_constant(3)]];
-constant int QVM_FINAL_BLOCK_SIZE   [[function_constant(4)]];
-constant int QVM_SPLIT_K            [[function_constant(5)]];
+SCRATCHY_CONSTANT(int, QVM_K, 0);
+SCRATCHY_CONSTANT(int, QVM_N, 1);
+SCRATCHY_CONSTANT(int, QVM_M, 2);
+SCRATCHY_CONSTANT_OPTIONAL(int, QVM_K_PARTITION_SIZE, 3);
+SCRATCHY_CONSTANT_OPTIONAL(int, QVM_FINAL_BLOCK_SIZE, 4);
+SCRATCHY_CONSTANT_OPTIONAL(int, QVM_SPLIT_K, 5);
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26 (same constants as
@@ -340,7 +341,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
     const device T_act*     x        [[buffer(3)]],
     device T_act*           y        [[buffer(4)]],
     // K (in_vec_size) and N (out_vec_size) ride as file-scope
-    // function constants QVM_K / QVM_N. MLX passes them as
+    // baked constants QVM_K / QVM_N. MLX passes them as
     // buffer(5)/buffer(6) setBytes; scratchy specializes per-shape.
     uint3 tid           [[threadgroup_position_in_grid]],
     uint  simd_gid      [[simdgroup_index_in_threadgroup]],
@@ -435,33 +436,11 @@ template <typename T_act, typename T_scale, int group_size, int bits>
 // template-arg approach but functionally identical.
 // ─────────────────────────────────────────────────────────────────
 
-#define INST_QVM(act_tag, act_type, scale_tag, scale_type, gs)                 \
-  template [[host_name(                                                        \
-      "affine_qvm_" #act_tag "_s_" #scale_tag "_gs_" #gs                       \
-      "_b_4_batch_0")]] [[kernel]] void                                        \
-  affine_qvm_kernel<act_type, scale_type, gs, 4>(                              \
-      const device uint32_t*   w        [[buffer(0)]],                         \
-      const device scale_type* scales   [[buffer(1)]],                         \
-      const device scale_type* biases   [[buffer(2)]],                         \
-      const device act_type*   x        [[buffer(3)]],                         \
-      device act_type*         y        [[buffer(4)]],                         \
-      uint3 tid           [[threadgroup_position_in_grid]],                    \
-      uint  simd_gid      [[simdgroup_index_in_threadgroup]],                  \
-      uint  simd_lid      [[thread_index_in_simdgroup]]);
+#define INST_QVM(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_qvm_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0, affine_qvm_kernel<act_type, scale_type, gs, 4>)
 
-#define INST_QVM_SPLIT_K(act_tag, act_type, scale_tag, scale_type, gs)         \
-  template [[host_name(                                                        \
-      "affine_qvm_split_k_" #act_tag "_s_" #scale_tag "_gs_" #gs               \
-      "_b_4")]] [[kernel]] void                                                \
-  affine_qvm_split_k_kernel<act_type, scale_type, gs, 4>(                      \
-      const device uint32_t*   w        [[buffer(0)]],                         \
-      const device scale_type* scales   [[buffer(1)]],                         \
-      const device scale_type* biases   [[buffer(2)]],                         \
-      const device act_type*   x        [[buffer(3)]],                         \
-      device act_type*         y        [[buffer(4)]],                         \
-      uint3 tid           [[threadgroup_position_in_grid]],                    \
-      uint  simd_gid      [[simdgroup_index_in_threadgroup]],                  \
-      uint  simd_lid      [[thread_index_in_simdgroup]]);
+#define INST_QVM_SPLIT_K(act_tag, act_type, scale_tag, scale_type, gs) \
+  SCRATCHY_KERNEL(affine_qvm_split_k_##act_tag##_s_##scale_tag##_gs_##gs##_b_4, affine_qvm_split_k_kernel<act_type, scale_type, gs, 4>)
 
 #define INST_QVM_ALL(act_tag, act_type, scale_tag, scale_type, gs)  \
   INST_QVM(act_tag, act_type, scale_tag, scale_type, gs)            \

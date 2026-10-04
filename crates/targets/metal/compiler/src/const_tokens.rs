@@ -50,8 +50,7 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         "KernelId" | "Binding" | "DispatchShape" | "MScaling" | "MScaleAxis" | "RuntimeGate"
         | "LoweredCommand" | "GatedCommand" | "GemmDims" | "WeightTensor"
         | "RuntimeBindingKind" | "ActivationWidth" | "LoweredMetalTape" | "ClassedTape"
-        | "CapPatch" | "ScratchPatch" | "ScratchField" | "GenClass" | "PatchTarget"
-        | "TapeLoop" => {
+        | "GenClass" | "KvAddressing" | "TapeLoop" | "TapeCommands" => {
             quote!(__tl)
         }
         "ConstantValue" | "ConstantType" | "ConstSlot" => {
@@ -60,9 +59,10 @@ fn module_of(ty: &str) -> Result<TokenStream, Error> {
         "BucketM" | "LayerId" | "SourceIx" | "ArenaSlotIdx" | "PhysicalBlockIdx"
         | "LogicalBlockIdx" | "SlotInBlock" | "SeqIdx" | "QTokenIdx" | "NumTokens"
         | "BindingIdx" | "HeadDim" | "NumQHeads" | "NumKvHeads" | "RotDim" | "RopePairOff"
-        | "BlockSize" | "BlocksPerChunk" | "MaxBlocksPerSeq" | "QSize" | "IntermediateSize"
-        | "HiddenSize" | "KDim" | "NDim" | "SplitK" | "AttnDebugMode" | "AttnWindow"
-        | "KDimI32" | "NDimI32" | "MDimI32" | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
+        | "BlockSize" | "BlocksPerChunk" | "MaxBlocksPerSeq" | "TqDecodeHeads" | "CommandIx"
+        | "QSize" | "IntermediateSize" | "HiddenSize" | "KDim" | "NDim" | "SplitK"
+        | "AttnDebugMode" | "AttnWindow" | "KDimI32" | "NDimI32" | "MDimI32"
+        | "KPartitionSizeI32" | "AttnScale" | "RmsNormEps" => {
             quote!(__ti)
         }
         other => return Err(Error(format!("const_tokens: unmapped type `{other}`"))),

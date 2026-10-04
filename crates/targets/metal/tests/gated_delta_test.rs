@@ -15,6 +15,7 @@
 mod common;
 
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -200,7 +201,7 @@ fn dispatch_scan(
             ConstantValue::float(4, scale),
         ],
     );
-    let pipeline = cache.get_or_build(&key).expect("gdn_scan_varlen pipeline");
+    let pipeline = baked_build(cache, &key).expect("gdn_scan_varlen pipeline");
 
     let o_buf = buf_zero_f32(device, num_tokens * value_dim);
     let conv_buf = buf_f32(device, conv_out);
@@ -268,8 +269,8 @@ fn gdn_gating_matches_reference() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let (nv, t) = (4usize, 6usize);
     let n = t * nv;
@@ -298,7 +299,7 @@ fn gdn_gating_matches_reference() {
             ConstantValue::uint(1, nv as u32),
         ],
     );
-    let pipeline = cache.get_or_build(&key).expect("gdn_gating pipeline");
+    let pipeline = baked_build(&cache, &key).expect("gdn_gating pipeline");
 
     let a_buf = buf_f32(&device, &a);
     let b_buf = buf_f32(&device, &b);
@@ -354,8 +355,8 @@ fn gdn_rms_norm_gated_matches_reference() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let (d, total_rows) = (4usize, 24usize);
     let eps = 1e-6f32;
@@ -385,9 +386,7 @@ fn gdn_rms_norm_gated_matches_reference() {
             ConstantValue::float(2, eps),
         ],
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("gdn_rms_norm_gated pipeline");
+    let pipeline = baked_build(&cache, &key).expect("gdn_rms_norm_gated pipeline");
 
     let out_buf = buf_zero_f32(&device, total_rows * d);
     let x_buf = buf_f32(&device, &x);
@@ -434,8 +433,8 @@ fn gdn_conv1d_varlen_matches_reference() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let (conv_dim, kernel, t) = (32usize, 4usize, 6usize);
     let state_len = kernel - 1;
@@ -451,9 +450,7 @@ fn gdn_conv1d_varlen_matches_reference() {
             ConstantValue::uint(1, kernel as u32),
         ],
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("gdn_conv1d_varlen pipeline");
+    let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
 
     let out_buf = buf_zero_f32(&device, t * conv_dim);
     let x_buf = buf_f32(&device, &x);
@@ -505,8 +502,8 @@ fn gdn_conv1d_varlen_continuity() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let (conv_dim, kernel) = (32usize, 4usize);
     let state_len = kernel - 1;
@@ -523,9 +520,7 @@ fn gdn_conv1d_varlen_continuity() {
             ConstantValue::uint(1, kernel as u32),
         ],
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("gdn_conv1d_varlen pipeline");
+    let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
 
     let w_buf = buf_f32(&device, &w);
     let state_buf = buf_zero_f32(&device, conv_dim * state_len); // shared across runs
@@ -587,8 +582,8 @@ fn gdn_scan_varlen_matches_reference() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let (nk, nv, hk, hv, t) = (2usize, 4usize, 4usize, 4usize, 6usize);
     let key_dim = nk * hk;
@@ -641,8 +636,8 @@ fn gdn_scan_varlen_production_head_dim() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let (nk, nv, hk, hv, t) = (2usize, 2usize, 128usize, 128usize, 3usize);
     let key_dim = nk * hk;
@@ -695,8 +690,8 @@ fn gdn_scan_varlen_continuity() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let (nk, nv, hk, hv) = (2usize, 4usize, 4usize, 4usize);
     let key_dim = nk * hk;

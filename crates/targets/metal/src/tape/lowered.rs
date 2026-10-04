@@ -15,7 +15,7 @@
 //! the per-bucket dispatch is fully baked).
 
 use crate::tape::constants::ConstantValue;
-use crate::tape::ids::{BucketM, LayerId, SourceIx};
+use crate::tape::ids::{BucketM, CommandIx, LayerId, MaxBlocksPerSeq, SourceIx, TqDecodeHeads};
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
 ///
@@ -60,23 +60,6 @@ pub enum KernelId {
     /// paged KV cache at the per-request slot. Output: rotated Q
     /// only (K/V are sunk into cache).
     RopeAppend,
-    /// Fused QKV matmul + NeoX-style RoPE + paged KV-cache write in
-    /// one kernel. Replaces the four-dispatch
-    /// `Q_proj + K_proj + V_proj + RopeAppend` chain on the dense
-    /// (BF16 / F16) path. Affine-int4 / prefill variants land
-    /// separately. Maps to
-    /// `fused_qkv_rope_cache_<dtype>_specialized` in
-    /// `fused_qkv_rope_cache.metallib`.
-    FusedQkvRopeCache,
-    /// Affine-int4 sibling of [`KernelId::FusedQkvRopeCache`]. Reads
-    /// packed `u32` weights + per-group F16 scales/biases (mlx-community
-    /// 4bit layout) for Q/K/V concatenated along the output axis, fuses
-    /// the dequant→matmul→RoPE→paged-cache-write chain in a single
-    /// launch. Maps to
-    /// `fused_affine_qkv_rope_cache_<dtype>_s_<scale_dtype>_b_4_specialized`
-    /// in `fused_affine_qkv_rope_cache.metallib`. Group size rides on
-    /// function constant 7.
-    FusedAffineQkvRopeCache,
     /// Decode-bucket attention reading from the paged KV cache.
     /// Single-query-token-per-sequence path.
     AttentionViaCache,
@@ -286,24 +269,6 @@ pub enum KernelId {
     /// `nn.QuantizedEmbedding.__call__`
     /// (`python/mlx/nn/layers/quantized.py:144`).
     AffineEmbed,
-    /// Compiler-synthesized pre-attention megakernel. Symbol resolves
-    /// against a per-arch source-compiled library registered at worker
-    /// init via `SpecializedPipelineCache::register_source_library`.
-    /// Kernel body is generated at macro-expansion time by
-    /// `scratchy-forward-compiler-macro::fuse_pass`.
-    SynthPreAttn,
-    /// Compiler-synthesized MLP pre-down megakernel. Symbol resolves
-    /// against a per-arch source-compiled library registered at worker
-    /// init via `SpecializedPipelineCache::register_source_library`.
-    /// Kernel body is generated at macro-expansion time by
-    /// `scratchy-forward-compiler-macro::fuse_pass::synthesize_mlp_pre_down_chunk`.
-    /// Fuses `FusedAddRmsNorm + gate AffineQmv + up AffineQmv + SiluMul`
-    /// into one dispatch; the standalone `AffineQmm` down_proj
-    /// instruction follows immediately and consumes the device-buffer
-    /// `silu_mul` output.
-    SynthMlpPreDown,
-    /// Fused gate+up GEMM + SiluMul large-M prefill kernel.
-    SynthGateUpSiluMul,
     /// Slice the last-token row of a `[num_tokens, hidden]` activation
     /// to row 0 of the same buffer, in place. Inserted by the lowering
     /// pass before the lm_head GEMM so the GEMM runs at M=1 instead of
@@ -328,48 +293,46 @@ pub enum KernelId {
     /// Row-wise precise softmax (MoE router prerequisite). Faithful
     /// port of MLX `softmax_single_row` from
     /// `mlx/backend/metal/kernels/softmax.h:10-98`. Bindings:
-    /// `(in @ 0, out @ 1, axis_size_i32 inline @ 2)`. Dispatch shape:
-    /// `(rows, 1, 1)` threadgroups × `(256, 1, 1)` threads. Maps to
-    /// `block_softmax_precise_{float16,bfloat16}` in `softmax.metallib`.
+    /// `(in @ 0, out @ 1)`, the row width baked (`SoftmaxConstants`). Dispatch
+    /// shape: `(rows, 1, 1)` threadgroups × `(256, 1, 1)` threads. Maps to
+    /// `block_softmax_precise_{float16,bfloat16}` in `softmax.metal`.
     Softmax,
     /// Row-wise full ascending argsort. Used as the "argpartition+
     /// trailing-k slice" equivalent in the MoE router lowering for
-    /// the small router widths (E ≤ 128) we target. Bindings:
-    /// `(in @ 0, out_u32 @ 1, axis @ 2, one @ 3, one @ 4, stride_in @ 5,
-    /// stride_out @ 6)`. Dispatch: `(1, rows, 1)` threadgroups ×
-    /// `(bn, 1, 1)` threads where `bn ∈ {32,64}` per
-    /// `argpartition::pick_pipeline_shape`. Symbol:
+    /// the small router widths (E ≤ 256) we target. Bindings:
+    /// `(in @ 0, out_u32 @ 1)`, the axis and strides baked
+    /// (`ArgsortConstants`). Dispatch: `(1, rows, 1)` threadgroups ×
+    /// `(bn, 1, 1)` threads where `bn ∈ {32,64}` covers the experts. Symbol:
     /// `c_arg_block_sort_<dtype>_uint32_bn<bn>_tn4` in
-    /// `argpartition.metallib`. Lowering pairs this with
+    /// `argpartition.metal`. Lowering pairs this with
     /// `SliceTrailingColsU32` to recover top-k indices.
     ArgPartitionTopK,
     /// 2-D contiguous take-along-axis gather: pulls the `[top_k]`
     /// scores per row from the `[num_experts]` softmax output via
     /// the `[num_tokens, top_k]` top-k index buffer. Faithful port
     /// of MLX `take_along_axis_2d_contig` (gather_axis.h). Bindings:
-    /// `(src @ 0, idx_u32 @ 1, out @ 2, src_axis_i32 @ 3,
-    /// idx_axis_i32 @ 4)`. Dispatch (converted to threadgroup form):
+    /// `(src @ 0, idx_u32 @ 1, out @ 2)`, both axes baked
+    /// (`MoeTopKConstants`). Dispatch (converted to threadgroup form):
     /// `(ceil(idx_axis/tg_x), rows, 1)` × `(min(32, idx_axis), 1, 1)`.
     /// Symbol: `take_along_axis_2d_contig_{float16,bfloat16}` in
-    /// `take_along_axis.metallib`.
+    /// `take_along_axis.metal`.
     TakeAlongAxis,
     /// Per-row "drop everything but the trailing `top_k` columns"
     /// u32 slicer. Sits between [`KernelId::ArgPartitionTopK`] and
     /// [`KernelId::TakeAlongAxis`] to convert the full sorted-ascending
     /// `[rows, num_experts]` index tensor into `[rows, top_k]`.
-    /// Bindings: `(src_u32 @ 0, dst_u32 @ 1, axis_size_i32 @ 2,
-    /// top_k_i32 @ 3)`. Dispatch (threads-form converted to tg):
+    /// Bindings: `(src_u32 @ 0, dst_u32 @ 1)`, both axes baked
+    /// (`MoeTopKConstants`). Dispatch (threads-form converted to tg):
     /// `(ceil(top_k/tg_x), rows, 1)` × `(min(32, top_k), 1, 1)`.
-    /// Symbol: `slice_trailing_cols_u32` in
-    /// `slice_trailing_cols.metallib`.
+    /// Symbol: `slice_trailing_cols_u32` in `slice_trailing_cols.metal`.
     SliceTrailingColsU32,
     /// MoE per-expert gather-matvec, fast variant
     /// (`N % 8 == 0 && K % 512 == 0`). Faithful port of MLX
     /// `affine_gather_qmv_fast` (`quantized.h:1899`). Used for the
     /// 3× SwitchGLU gate/up/down projections inside one MoE block.
     /// Bindings: `(packed_w @ 0, scales @ 1, biases @ 2, x @ 3,
-    /// rhs_indices @ 4, y @ 5, top_k_i32 inline @ 6)`. Function
-    /// constants 0/1 carry K/N respectively. Dispatch:
+    /// rhs_indices @ 4, y @ 5)`. Baked constants 0/1/2 carry K/N and the
+    /// output rows one x row feeds (`AffineGatherQmvConstants`). Dispatch:
     /// `(1, N/8, num_tokens*top_k)` threadgroups × `(32, 2, 1)` threads.
     /// Symbol: `affine_gather_qmv_fast_<dtype>_s_<sdtype>_gs_<gs>_b_4`
     /// in `quantized_qmv.metallib`.
@@ -417,8 +380,8 @@ pub enum KernelId {
     /// Gemma-4 per-expert score scale (the `gemma_moe` op): in place,
     /// `topk_scores[m, j] *= per_expert_scale[topk_inds[m, j]]` over the
     /// `[M, top_k]` gathered top-k scores. Bindings: `(topk_scores @ 0
-    /// in/out f16/bf16, topk_inds @ 1 u32, per_expert_scale @ 2 f16/bf16,
-    /// top_k inline @ 3)`. Dispatch one thread per `(m, j)`. Symbol:
+    /// in/out f16/bf16, topk_inds @ 1 u32, per_expert_scale @ 2 f16/bf16)`;
+    /// function constant `MPES_N` (0). Dispatch one thread per `(m, j)`. Symbol:
     /// `moe_per_expert_scale_{float16,bfloat16}` in
     /// `moe_per_expert_scale.metallib`.
     MoePerExpertScale,
@@ -445,8 +408,8 @@ pub enum KernelId {
     /// Gemma3-MM SigLIP→text projector's k×k spatial collapse.
     AvgPool2d,
     /// Standalone tanh-approx GELU (Qwen3.5-VL ViT MLP / merger MLP).
-    /// Maps to `gelu_tanh_{f16,bf16}` in `activation.metallib`. Bindings:
-    /// `(out @ 0, in @ 1, n inline @ 2)`.
+    /// Maps to `gelu_tanh_{f16,bf16}` (and the erf / quick flavours) in
+    /// `activation.metal`. Bindings: `(out @ 0, in @ 1)`, `GeluConstants` baked.
     VisionGelu,
     /// Copy the vision `pixels` runtime extern into an arena slot
     /// (materialized by `vision_lowering::materialize_pixels`). Maps to
@@ -455,8 +418,8 @@ pub enum KernelId {
     /// Multimodal embed splice — scatter the projected vision embeddings
     /// (`MmEmbeds`) into the text embedding stream at the placeholder
     /// rows (`MmDstRows`). Maps to `mm_embed_splice_{f16,bf16}` in
-    /// `elementwise.metallib`. Bindings: `(embed @ 0 in/out, mm @ 1,
-    /// dst_rows @ 2, hidden inline @ 3)`.
+    /// `elementwise.metal`. Bindings: `(embed @ 0 in/out, mm @ 1,
+    /// dst_rows @ 2)`, `MmEmbedSpliceConstants` baked.
     MmEmbedSplice,
     /// TurboQuant prefill: write a layer's K (or V) for the step's sequences
     /// into the reused fp16 scratch in the codebook's ROTATED domain (R·k),
@@ -517,8 +480,6 @@ impl KernelId {
             | Self::Gemm
             | Self::FusedGateUpSiluMul
             | Self::RopeAppend
-            | Self::FusedQkvRopeCache
-            | Self::FusedAffineQkvRopeCache
             | Self::AttentionViaCache
             | Self::AttentionPrefillSdpaPaged
             | Self::AttnQConvert
@@ -552,9 +513,6 @@ impl KernelId {
             | Self::GatedDeltaNet
             | Self::SplitKReduceSum
             | Self::AffineEmbed
-            | Self::SynthPreAttn
-            | Self::SynthMlpPreDown
-            | Self::SynthGateUpSiluMul
             | Self::GatherLastToken
             | Self::ScatterFirstToLastRow
             | Self::Softmax
@@ -598,7 +556,7 @@ pub use scratchy_tensors::MetalDtype;
 /// tile dims)`. Kept as `(u32, u32, u32)` rather than Metal's `MTLSize`
 /// so this type stays available without the `metal` crate (lowering is
 /// pure CPU code).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct DispatchShape {
     /// (x, y, z) threadgroup count — baseline computed against
     /// `bucket_m` at lowering time.
@@ -648,7 +606,7 @@ pub enum MScaleAxis {
     Z,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct MScaling {
     pub axis: MScaleAxis,
     pub bucket_m: BucketM,
@@ -754,11 +712,9 @@ impl DispatchShape {
     /// `m_scaling` (full `bucket_m`) the runtime uses to rescale to the
     /// live `num_tokens`.
     ///
-    /// `width` is an [`ActivationWidth`] — a value that can ONLY be
-    /// produced by a real activation source (a Gemm/AffineQmm output-N, a
-    /// reshape width, or the residual-stream `HIDDEN_SIZE`). It is a
-    /// COMPILE error to pass a head-geometry constant such as `W::Q_SIZE`
-    /// here. That confusion is exactly the granite logits-corruption bug:
+    /// `width` is an [`ActivationWidth`] — the step's own output width,
+    /// as the tape records it. It is a COMPILE error to pass a
+    /// head-geometry constant such as `W::Q_SIZE` here. That confusion is exactly the granite logits-corruption bug:
     /// a partial `eff_m * Q_SIZE` multiply over a `[tokens, vocab]` buffer
     /// leaves each row's tail unscaled and is NOT argmax-invariant. The
     /// type makes that unrepresentable rather than caught at runtime.
@@ -776,50 +732,23 @@ impl DispatchShape {
     }
 }
 
-/// Width (in elements) of one activation row at a point in the
-/// instruction stream — the per-token row stride an elementwise/broadcast
-/// kernel must cover.
+/// Width (in elements) of the activation rows a step writes — the per-token
+/// row stride an elementwise/broadcast kernel must cover, read off the
+/// columns of the step's output tensor.
 ///
-/// The inner field is PRIVATE and the only constructors are legitimate
-/// activation producers:
-///   * [`ActivationWidth::residual_stream`] = `HIDDEN_SIZE` (the width in
-///     force before the first Gemm publishes one — e.g. granite's embed
-///     `* embedding_multiplier`),
-///   * [`ActivationWidth::from_gemm_n`] = a dense `Gemm` / quantized
-///     `AffineQmm` output-N (vocab after lm_head, intermediate after the
-///     MLP, hidden after o_proj, …),
-///   * [`ActivationWidth::from_reshape_width`] = a reshape's static
-///     (num_tokens-independent) column dim (the vision merger).
-///
-/// There is deliberately NO constructor from `W::Q_SIZE` / head geometry,
-/// so [`DispatchShape::activation_broadcast`] can never be handed the
-/// head-projection width by mistake. That confusion was the granite
+/// The inner field is PRIVATE and the only constructor takes a tensor's
+/// columns: there is deliberately NO constructor from `W::Q_SIZE` / head
+/// geometry, so [`DispatchShape::activation_broadcast`] can never be handed
+/// the head-projection width by mistake. That confusion was the granite
 /// `ScalarMul` corruption bug — now a compile error instead of corrupted
 /// argmax at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct ActivationWidth(u32);
 
 impl ActivationWidth {
-    /// The residual-stream width (`HIDDEN_SIZE`). The initial width before
-    /// the first Gemm publishes one — i.e. the embed-time scalar multiply
-    /// (granite's `* embedding_multiplier`), which precedes the first
-    /// Gemm. Distinct from `Q_SIZE` (`num_q_heads * head_dim`), which it
-    /// differs from whenever `head_dim != hidden/num_heads` (Qwen3.5
-    /// head_dim=256).
-    pub fn residual_stream(p: &crate::tape::model_consts::MetalModelConsts) -> Self {
-        Self(p.hidden_size as u32)
-    }
-
-    /// A dense `Gemm` / quantized `AffineQmm` output-N: the `[*, n]`
-    /// activation that op publishes (vocab after lm_head, etc.).
-    pub fn from_gemm_n(n: u32) -> Self {
-        Self(n)
-    }
-
-    /// A reshape's static (num_tokens-independent) column dim — the new
-    /// activation width after the vision merger reshape.
-    pub fn from_reshape_width(width: u32) -> Self {
-        Self(width)
+    /// The width of a `[rows, cols]` output tensor.
+    pub fn of_cols(cols: u32) -> Self {
+        Self(cols)
     }
 
     /// The width in elements.
@@ -835,7 +764,7 @@ impl ActivationWidth {
 /// manifest, resolved ONCE at load through the macro-generated
 /// [`ModelSources`] impl. No fn pointers live here, so `Binding` is fully
 /// backend-neutral.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Binding {
     /// `MetalWorker.arena[slot]` — the worker's private tile-arena
     /// buffer for this slot. The arena is sized for the colored
@@ -891,13 +820,6 @@ pub enum Binding {
     /// Kdense / Vdense_T / scores / out_head regions at baked byte `offset`s
     /// (one buffer, serial commands per layer; overwritten each layer).
     AttnUnfusedScratch { offset: u32, binding_index: u8 },
-    /// `setBytes_length_atIndex` of a `u32` immediate at the argument
-    /// table slot `binding_index`. Used by the MoE lowering arms to
-    /// pass scalar shape parameters (axis_size, top_k, etc.) that
-    /// match each kernel's `constant int& [[buffer(N)]]` declaration.
-    /// The worker writes the 4 bytes onto the encoder; no device
-    /// buffer is allocated.
-    Inline { binding_index: u8, value: u32 },
     /// A bound sub-region of the worker's shared MoE scratch buffer
     /// (`MetalWorker.moe_scratch`, sized to
     /// `LoweredMetalTape::moe_scratch_bytes`). Each lowered MoE
@@ -1320,6 +1242,91 @@ pub fn baked<T>(v: Vec<T>) -> &'static [T] {
     Box::leak(v.into_boxed_slice())
 }
 
+/// A tape's commands: positions in a command table. The tapes a model bakes share one table
+/// (each distinct command once), so a command every rung runs is stored once and each rung pays
+/// two bytes for it. Compared and hashed by the commands it lists, whatever table holds them.
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct TapeCommands {
+    pub table: &'static [GatedCommand],
+    pub ixs: &'static [CommandIx],
+}
+
+impl TapeCommands {
+    /// No commands.
+    pub const EMPTY: Self = Self {
+        table: &[],
+        ixs: &[],
+    };
+
+    pub fn len(&self) -> usize {
+        self.ixs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ixs.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'static GatedCommand> + Clone + use<> {
+        let table = self.table;
+        self.ixs.iter().map(move |ix| &table[ix.get()])
+    }
+
+    pub fn first(&self) -> Option<&'static GatedCommand> {
+        self.iter().next()
+    }
+
+    pub fn last(&self) -> Option<&'static GatedCommand> {
+        self.iter().last()
+    }
+}
+
+impl std::ops::Index<usize> for TapeCommands {
+    type Output = GatedCommand;
+    fn index(&self, position: usize) -> &GatedCommand {
+        &self.table[self.ixs[position].get()]
+    }
+}
+
+impl PartialEq for TapeCommands {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for TapeCommands {}
+
+impl std::hash::Hash for TapeCommands {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.len().hash(state);
+        self.iter().for_each(|c| c.hash(state));
+    }
+}
+
+/// A tape's command list, more than a [`CommandIx`] can index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooManyCommands {
+    pub distinct: usize,
+}
+
+/// `v` as a tape holds it: each distinct command once in the table, the list as positions in it.
+pub fn baked_commands(v: Vec<GatedCommand>) -> Result<TapeCommands, TooManyCommands> {
+    let mut table: Vec<GatedCommand> = Vec::new();
+    let mut at = std::collections::HashMap::new();
+    let ixs = (v.iter()).map(|c| {
+        let next = table.len();
+        let position = *at.entry(*c).or_insert_with(|| {
+            table.push(*c);
+            next
+        });
+        CommandIx::of(position).ok_or(TooManyCommands { distinct: next + 1 })
+    });
+    let ixs = baked(ixs.collect::<Result<_, _>>()?);
+    Ok(TapeCommands {
+        table: baked(table),
+        ixs,
+    })
+}
+
 /// `X.into_baked()` = `baked(Vec::<ConstantValue>::from(X))` — the
 /// constants-struct construction sites read the same as before with one
 /// suffix swap.
@@ -1332,15 +1339,12 @@ impl<E, T: Into<Vec<E>>> IntoBaked<E> for T {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct LoweredCommand {
     pub kernel: KernelId,
-    /// Compiled-metallib name the kernel symbol lives in (matches the
-    /// `&'static str` keys [`SpecializedPipelineCache::with_standard_shaders`]
-    /// registers). Empty for `KernelId::Gemm` (no entry; routed
+    /// The shader library the kernel symbol lives in (`shaders/<library>.metal`; a baked one,
+    /// [`crate::aot::baked_library`], compiles per command). Empty for `KernelId::Gemm` (routed
     /// out-of-band).
-    ///
-    /// [`SpecializedPipelineCache::with_standard_shaders`]: crate::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders
     pub library: &'static str,
     /// MSL `kernel void` symbol the pipeline binds. Empty for
     /// `KernelId::Gemm`.
@@ -1410,7 +1414,7 @@ impl LoweredCommand {
 /// *unrepresentable*: there is no separate gate array to drop, re-initialize,
 /// or let drift out of sync with the commands. `gate == None` (the common
 /// case) means "always dispatch."
-#[derive(Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct GatedCommand {
     pub command: LoweredCommand,
     pub gate: Option<RuntimeGate>,
@@ -1461,7 +1465,7 @@ impl From<LoweredCommand> for GatedCommand {
 /// `out = in @ weight^T` for the canonical row-major Linear layer:
 /// `in: [m, k]`, `weight: [n, k]`, `out: [m, n]`. Future quantized
 /// or transposed variants get sibling structs once they land.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct GemmDims {
     /// Rows of the activation / output (= bucket_m).
     pub m: u32,
@@ -1573,7 +1577,6 @@ impl Binding {
             | Self::Scratch { .. }
             | Self::RopedKScratch { .. }
             | Self::AttnUnfusedScratch { .. }
-            | Self::Inline { .. }
             | Self::MoeScratch { .. } => self,
         }
     }
@@ -1586,7 +1589,6 @@ impl Binding {
             | Self::Source { .. }
             | Self::Runtime { .. }
             | Self::Scratch { .. }
-            | Self::Inline { .. }
             | Self::MoeScratch { .. } => SeqScope::AllRows,
         }
     }
@@ -1604,7 +1606,7 @@ impl Binding {
 /// 14.3M lines of `const` struct literals, 328k of them `LayerId`s, and rustc's single-threaded
 /// front end spent ~46s on the file. The loop was already found — `apply_loop_compression`
 /// hands the lowering an `Instruction::Loop` — and the lowering then expanded it right back out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct TapeLoop {
     /// First command of the body, in `commands`.
     pub start: u32,
@@ -1633,6 +1635,16 @@ impl LoweredMetalTape {
     /// Exact because the only per-iteration input to the lowering is `layer_offset`, consumed
     /// in exactly one pattern (`LayerId(literal + layer_offset)`); a weight's source family
     /// does not vary.
+    /// The bytes of each scratch buffer the tape binds: split-K, MoE, roped K, hd512 unfused.
+    pub fn scratch_bytes(&self) -> [u32; 4] {
+        [
+            self.splitk_scratch_bytes,
+            self.moe_scratch_bytes,
+            self.roped_k_scratch_bytes,
+            self.attn_unfused_scratch_bytes,
+        ]
+    }
+
     pub fn commands_expanded(&self) -> Vec<GatedCommand> {
         let mut out = Vec::with_capacity(self.commands.len());
         let cmds = self.commands;
@@ -1687,7 +1699,7 @@ impl LoweredMetalTape {
 
 /// One bucket's lowered tape — the input the `MetalWorker` walks at
 /// init time to record its per-bucket dispatch.
-#[derive(Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct LoweredMetalTape {
     /// Bucket M (number of tokens this tape was specialized for).
     /// Used by the worker to pick the right specialized pipeline
@@ -1697,7 +1709,9 @@ pub struct LoweredMetalTape {
     /// count). The worker allocates exactly this many arena buffers
     /// per shape class.
     pub num_arena_slots: u32,
-    pub commands: &'static [GatedCommand],
+    /// The tape's commands, positions in a command table ([`baked_commands`]; a baked model's tapes
+    /// share one).
+    pub commands: TapeCommands,
     /// MTL4 encoder barrier-before flag per command, mirroring
     /// `commands.len()`. Sourced from the macro-emitted
     /// `MetalBucketSpec::{backbone,lm_head}_barriers` slice (one
@@ -1793,6 +1807,23 @@ pub enum LoweringError {
     /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
     /// runs only on a TurboQuant model.
     CodecStepOnDenseModel,
+    /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
+    /// offsets its kernels bind: the rung cannot exist for this tape.
+    ScratchTooLarge {
+        scratch: ScratchKind,
+        block_cap: MaxBlocksPerSeq,
+    },
+    /// The tape lists more distinct commands than a [`CommandIx`] can index.
+    TooManyCommands(TooManyCommands),
+}
+
+/// A scratch buffer whose size scales with the KV cap rung.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchKind {
+    /// The rope-once pre-roped K.
+    RopedK,
+    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
+    AttnUnfused,
 }
 
 impl std::fmt::Display for LoweringError {
@@ -1841,6 +1872,17 @@ impl std::fmt::Display for LoweringError {
             Self::CodecStepOnDenseModel => f.write_str(
                 "lowering: a KV codec step in the tape of a model whose KV cache is dense",
             ),
+            Self::TooManyCommands(TooManyCommands { distinct }) => write!(
+                f,
+                "lowering: the tape lists {distinct} distinct commands, more than a command \
+                 index addresses"
+            ),
+            Self::ScratchTooLarge { scratch, block_cap } => write!(
+                f,
+                "lowering: the {scratch:?} scratch at KV cap rung {} exceeds the 32-bit sizes \
+                 its kernels bind",
+                block_cap.get()
+            ),
         }
     }
 }
@@ -1884,164 +1926,72 @@ impl GenClass {
     }
 }
 
-/// Which scalar of a command a [`CapPatch`] rewrites at load.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
-pub enum PatchTarget {
-    /// `constants[i].bits`.
-    Constant(u32),
-    /// `dispatch.threadgroups.{0,1,2}`.
-    Threadgroups(u8),
-    /// `dispatch.threads_per_threadgroup.{0,1,2}`.
-    ThreadsPerThreadgroup(u8),
-    /// `dispatch.m_scaling.bucket_m` (the rescale base — e.g. the
-    /// rope-once `num_pages`).
-    MScalingBucketM,
-    /// `bindings[i]`'s `AttnUnfusedScratch { offset }` — the hd512
-    /// unfused-attention scratch regions pack at byte offsets that
-    /// scale with the KV capacity.
-    AttnScratchOffset(u32),
+/// How a tape's KV readers address the paged cache: a workload fact the caller names when it
+/// picks a rung.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub enum KvAddressing {
+    /// The readers treat each layer's chunk table entry 0 as the layer base (one buffer per
+    /// layer).
+    #[default]
+    Direct,
+    /// The readers resolve every block through the chunk table: spec-decode runs these (the
+    /// direct path has an unresolved interaction with the draft's K-step chain).
+    Chunked,
 }
 
-/// One baked command scalar's dependence on the runtime block-table
-/// capacity: `value(cap) = max(floor, base + (num·cap)/den)` (floor or
-/// ceiling division per `round_up`). Derived at expansion by probing
-/// the lowering at three capacities and verified at a fourth — a shape
-/// the model can't fit refuses the bake.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
-pub struct CapPatch {
-    /// Index into `LoweredMetalTape::commands`.
-    pub cmd_idx: u32,
-    pub target: PatchTarget,
-    pub floor: u32,
-    pub base: i64,
-    pub num: i64,
-    pub den: u32,
-    pub round_up: bool,
-}
-
-/// Which scratch-size field of [`LoweredMetalTape`] a [`ScratchPatch`]
-/// re-derives at load.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
-pub enum ScratchField {
-    SplitK,
-    Moe,
-    RopedK,
-    AttnUnfused,
-}
-
-/// A scratch-size field's dependence on the runtime block-table
-/// capacity — same rational model as [`CapPatch`].
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
-pub struct ScratchPatch {
-    pub field: ScratchField,
-    pub floor: u32,
-    pub base: i64,
-    pub num: i64,
-    pub den: u32,
-    pub round_up: bool,
-}
-
-/// One baked tape variant: the full [`LoweredMetalTape`] lowered at
-/// expansion for a `(generation class, chunked addressing)` pair, with
-/// block-capacity dependence expressed as patches. The pool picks the
-/// matching variant at load and [`Self::materialize`]s it with the
-/// runtime capacity and the device's TurboQuant decode heads — selection
-/// and substitution only, no analysis.
+/// One baked tape rung: the full [`LoweredMetalTape`] lowered at expansion for a
+/// `(generation class, KV addressing, KV cap, TurboQuant decode heads)` point, every fact of
+/// it a constant. The pool picks the rung for its device, workload and KV capacity at load —
+/// selection only, no analysis, no substitution.
 #[derive(Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ClassedTape {
     pub gen_class: GenClass,
-    /// `true` = the chunked-addressing attention variant (spec-decode
-    /// forces it via `force_chunked_attention_addressing`).
-    pub chunked: bool,
-    /// Baked at capacity 0, so every patched location holds its floor.
+    pub addressing: KvAddressing,
+    /// The KV cap rung: the blocks per sequence the tape's block-table stride, scratch sizes and
+    /// dispatches are baked for. It serves every capacity up to it.
+    pub cap: MaxBlocksPerSeq,
+    /// The query heads each TurboQuant decode threadgroup serves, baked into the tape; `None` when
+    /// the tape has no TurboQuant decode attention (it serves every device alike).
+    pub tq_heads: Option<TqDecodeHeads>,
     pub tape: LoweredMetalTape,
-    pub const_patches: &'static [CapPatch],
-    pub scratch_patches: &'static [ScratchPatch],
-}
-
-fn patched(floor: u32, base: i64, num: i64, den: u32, round_up: bool, cap: u32) -> u32 {
-    let prod = num * cap as i64;
-    let den = den.max(1) as i64;
-    let q = if round_up {
-        prod.div_euclid(den) + if prod.rem_euclid(den) != 0 { 1 } else { 0 }
-    } else {
-        prod.div_euclid(den)
-    };
-    (floor as i64).max(base + q).try_into().unwrap_or(u32::MAX)
 }
 
 impl ClassedTape {
-    /// Substitute the runtime block-table capacity, and the query heads
-    /// each TurboQuant decode threadgroup serves on this device
-    /// ([`crate::tape::lowering::serve_tq_decode_heads`]), into the baked
-    /// tape. The ONE permitted load-time `baked` site: the commands are
-    /// copied once per model load.
-    pub fn materialize(
-        &self,
-        cap: u32,
-        tq_heads: crate::tape::ids::TqDecodeHeads,
-    ) -> LoweredMetalTape {
-        let mut tape = self.tape;
-        let mut commands: Vec<GatedCommand> = self.tape.commands.to_vec();
-        for p in self.const_patches {
-            let cmd = &mut commands[p.cmd_idx as usize];
-            let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
-            match p.target {
-                PatchTarget::Constant(i) => {
-                    let mut consts = cmd.command.constants.to_vec();
-                    consts[i as usize].bits = v;
-                    cmd.command.constants = baked(consts);
-                }
-                PatchTarget::Threadgroups(ax) => {
-                    let tg = &mut cmd.command.dispatch.threadgroups;
-                    match ax {
-                        0 => tg.0 = v,
-                        1 => tg.1 = v,
-                        _ => tg.2 = v,
-                    }
-                }
-                PatchTarget::ThreadsPerThreadgroup(ax) => {
-                    let t = &mut cmd.command.dispatch.threads_per_threadgroup;
-                    match ax {
-                        0 => t.0 = v,
-                        1 => t.1 = v,
-                        _ => t.2 = v,
-                    }
-                }
-                PatchTarget::MScalingBucketM => {
-                    let ms = cmd
-                        .command
-                        .dispatch
-                        .m_scaling
-                        .as_mut()
-                        .expect("MScalingBucketM patch on a command without m_scaling");
-                    ms.bucket_m = crate::tape::ids::BucketM(v);
-                }
-                PatchTarget::AttnScratchOffset(bi) => {
-                    let mut binds = cmd.command.bindings.to_vec();
-                    match &mut binds[bi as usize] {
-                        Binding::AttnUnfusedScratch { offset, .. } => *offset = v,
-                        other => {
-                            panic!("AttnScratchOffset patch on non-scratch binding {other:?}")
-                        }
-                    }
-                    cmd.command.bindings = baked(binds);
-                }
-            }
+    /// The rung `(gen_class, addressing, cap, tq_heads)` of `body`, the tape its rungs share, with
+    /// the roped-K and unfused-attention scratch bytes its cap sizes.
+    pub const fn rung(
+        body: LoweredMetalTape,
+        gen_class: GenClass,
+        addressing: KvAddressing,
+        cap: MaxBlocksPerSeq,
+        tq_heads: Option<TqDecodeHeads>,
+        [roped_k_scratch_bytes, attn_unfused_scratch_bytes]: [u32; 2],
+    ) -> Self {
+        let tape = LoweredMetalTape {
+            roped_k_scratch_bytes,
+            attn_unfused_scratch_bytes,
+            ..body
+        };
+        Self {
+            gen_class,
+            addressing,
+            cap,
+            tq_heads,
+            tape,
         }
-        for cmd in &mut commands {
-            crate::tape::lowering::serve_tq_decode_heads(&mut cmd.command, tq_heads);
-        }
-        tape.commands = baked(commands);
-        for p in self.scratch_patches {
-            let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
-            match p.field {
-                ScratchField::SplitK => tape.splitk_scratch_bytes = v,
-                ScratchField::Moe => tape.moe_scratch_bytes = v,
-                ScratchField::RopedK => tape.roped_k_scratch_bytes = v,
-                ScratchField::AttnUnfused => tape.attn_unfused_scratch_bytes = v,
-            }
-        }
-        tape
     }
+}
+
+/// A kernel compiled at expansion with a command's constants as `constexpr`s
+/// ([`crate::aot::bake`]): the library the pipeline for `(library, function, constants)` is
+/// built from, with no function constants.
+#[derive(Clone, Copy, PartialEq, serde::Serialize)]
+pub struct BakedKernel {
+    pub library: &'static str,
+    pub function: &'static str,
+    pub constants: &'static [ConstantValue],
+    /// The metallib of the bake compile that holds the kernel, with the rest of its batch.
+    pub metallib: &'static [u8],
+    /// The kernel's function in `metallib`.
+    pub entry: &'static str,
 }

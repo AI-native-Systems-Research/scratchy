@@ -11,7 +11,7 @@
 // `Qwen3NextSparseMoeBlock`: `y + mx.sigmoid(shared_expert_gate(x)) *
 // shared_y`).
 //
-// Function constants:
+// Baked constants:
 //   GATE_SCALE_N    — total output element count (= M * hidden_size)
 //   GATE_SCALE_COLS — hidden_size (the gate's row stride)
 //
@@ -19,11 +19,12 @@
 // Sigmoid kept in float so the half/bfloat exp() tail stays representable.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint GATE_SCALE_N [[function_constant(0)]];
-constant uint GATE_SCALE_COLS [[function_constant(1)]];
+SCRATCHY_CONSTANT(uint, GATE_SCALE_N, 0);
+SCRATCHY_CONSTANT(uint, GATE_SCALE_COLS, 1);
 
 template <typename T>
 [[kernel]] void gate_scale(
@@ -44,14 +45,8 @@ template <typename T>
   out[gid] = static_cast<T>(r + s * sig_g);
 }
 
-#define INST_GATE_SCALE(dtype_tag, mtl_type)                              \
-  template [[host_name("gate_scale_" #dtype_tag)]] [[kernel]] void        \
-  gate_scale<mtl_type>(                                                   \
-      device       mtl_type* out      [[buffer(0)]],                      \
-      const device mtl_type* routed   [[buffer(1)]],                      \
-      const device mtl_type* shared_y [[buffer(2)]],                      \
-      const device mtl_type* g        [[buffer(3)]],                      \
-      uint gid [[thread_position_in_grid]]);
+#define INST_GATE_SCALE(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gate_scale_##dtype_tag, gate_scale<mtl_type>)
 
 INST_GATE_SCALE(f16,  half)
 INST_GATE_SCALE(bf16, bfloat)

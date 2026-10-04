@@ -17,6 +17,7 @@
 mod common;
 
 use objc2_metal::MTLSize;
+use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -74,8 +75,8 @@ fn vision_varlen_attn_matches_sdpa_reference() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     // 2 segments (3 + 4 tokens) → exercises cross-segment isolation.
     let cu = [0i32, 3, 7];
@@ -106,9 +107,7 @@ fn vision_varlen_attn_matches_sdpa_reference() {
             ConstantValue::float(4, scale),
         ],
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("vision_varlen_attn pipeline");
+    let pipeline = baked_build(&cache, &key).expect("vision_varlen_attn pipeline");
 
     let q_buf = common::shared_slice(&device, &q);
     let k_buf = common::shared_slice(&device, &k);
@@ -159,8 +158,8 @@ fn vision_varlen_attn_head_dim_72() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-        .expect("compile standard shaders");
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
 
     let cu = [0i32, 5, 12];
     let (h, d) = (16usize, 72usize);
@@ -186,9 +185,7 @@ fn vision_varlen_attn_head_dim_72() {
             ConstantValue::float(4, scale),
         ],
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("vision_varlen_attn pipeline");
+    let pipeline = baked_build(&cache, &key).expect("vision_varlen_attn pipeline");
 
     let q_buf = common::shared_slice(&device, &q);
     let k_buf = common::shared_slice(&device, &k);

@@ -15,7 +15,7 @@
 // broader reduce surface this kernel can grow into it; until then,
 // scope-limited keeps the surface honest.
 //
-// Function constants:
+// Baked constants:
 //   REDUCE_M       — output row count (= qmm_t_splitk's M)
 //   REDUCE_N       — output column count (= qmm_t_splitk's N)
 //   REDUCE_SPLIT_K — partition count along axis 0
@@ -28,12 +28,13 @@
 // noise floor for greedy decode).
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint REDUCE_M       [[function_constant(0)]];
-constant uint REDUCE_N       [[function_constant(1)]];
-constant uint REDUCE_SPLIT_K [[function_constant(2)]];
+SCRATCHY_CONSTANT(uint, REDUCE_M, 0);
+SCRATCHY_CONSTANT(uint, REDUCE_N, 1);
+SCRATCHY_CONSTANT(uint, REDUCE_SPLIT_K, 2);
 
 template <typename T>
 [[kernel]] void splitk_reduce_sum(
@@ -55,12 +56,8 @@ template <typename T>
   out[gid] = static_cast<T>(acc);
 }
 
-#define INST_REDUCE(dtype_tag, mtl_type)                                         \
-  template [[host_name("splitk_reduce_sum_" #dtype_tag)]] [[kernel]] void        \
-  splitk_reduce_sum<mtl_type>(                                                   \
-      device       mtl_type* out [[buffer(0)]],                                  \
-      const device mtl_type* in  [[buffer(1)]],                                  \
-      uint gid [[thread_position_in_grid]]);
+#define INST_REDUCE(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(splitk_reduce_sum_##dtype_tag, splitk_reduce_sum<mtl_type>)
 
 INST_REDUCE(f16,  half)
 INST_REDUCE(bf16, bfloat)

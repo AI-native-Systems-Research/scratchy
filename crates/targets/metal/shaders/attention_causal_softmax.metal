@@ -20,6 +20,7 @@
 // (gemma4 = 1.0; passed explicitly so other arches reuse the kernel).
 
 #include <metal_stdlib>
+#include "baked.h"
 using namespace metal;
 
 template <typename T>
@@ -79,20 +80,19 @@ kernel void causal_softmax_bf16(
     causal_softmax_body<bfloat>(scores, params, scale, gid);
 }
 
-// ── Production variant: scale as function constant; the ACTUAL query count
+// ── Production variant: scale compiled in; the ACTUAL query count
 // (num new tokens this forward) comes from cu_seqlens_q (NOT the baked
 // bucket_m — using bucket_m underflows `kv_len - lq` when bucket_m > kv_len).
 // scores rows are one head [bucket_m, kv_len]; only rows [0, lq_actual) are real
 // queries (the rest are padding from the over-sized bucket and are skipped).
-constant float SOFT_SCALE [[function_constant(1)]];
+#if SCRATCHY_COMPILES(causal_softmax_prod_bf16)
+SCRATCHY_CONSTANT(float, SOFT_SCALE, 1);
 
 // Block-diagonal span attention: lower-bound each query's valid key range at its
 // own span's first block (mirrors the QKᵀ gemm bound, so the skipped band is
-// never read). Granularity == metal KV block size; undefined → 0 (disabled →
+// never read). Granularity == metal KV block size; unset → 0 (disabled →
 // full causal range, byte-identical).
-constant uint SOFT_SPAN_BLOCK_RAW [[function_constant(3)]];
-constant uint SOFT_SPAN_BLOCK =
-    is_function_constant_defined(SOFT_SPAN_BLOCK_RAW) ? SOFT_SPAN_BLOCK_RAW : 0u;
+SCRATCHY_CONSTANT_OPTIONAL(uint, SOFT_SPAN_BLOCK, 3);
 
 template <typename T>
 inline void causal_softmax_prod_body(
@@ -142,3 +142,4 @@ kernel void causal_softmax_prod_bf16(
 {
     causal_softmax_prod_body<bfloat>(scores, seq_used, cu_seqlens_q, span_ids, gid);
 }
+#endif

@@ -16,18 +16,19 @@
 // regardless of `T_act`, NOT the model dtype. All values f32-accumulate.
 // Outputs g/beta are f32 (consumed by the f32 recurrent-scan kernel).
 //
-// Function constants:
+// Baked constants:
 //   GDN_GATING_N         — total element count (= T * num_heads)
 //   GDN_GATING_NUM_HEADS — num_v_heads (to recover h = gid % num_heads)
 //
 // Dispatch: 1 thread per (t, h) element.
 
 #include <metal_stdlib>
+#include "baked.h"
 
 using namespace metal;
 
-constant uint GDN_GATING_N         [[function_constant(0)]];
-constant uint GDN_GATING_NUM_HEADS [[function_constant(1)]];
+SCRATCHY_CONSTANT(uint, GDN_GATING_N, 0);
+SCRATCHY_CONSTANT(uint, GDN_GATING_NUM_HEADS, 1);
 
 template <typename T>
 [[kernel]] void gdn_gating(
@@ -52,16 +53,8 @@ template <typename T>
   beta_out[gid] = 1.0f / (1.0f + exp(-bv));
 }
 
-#define INST_GDN_GATING(dtype_tag, mtl_type)                              \
-  template [[host_name("gdn_gating_" #dtype_tag)]] [[kernel]] void        \
-  gdn_gating<mtl_type>(                                                   \
-      device       float*   g_out    [[buffer(0)]],                       \
-      device       float*   beta_out [[buffer(1)]],                       \
-      const device mtl_type* a       [[buffer(2)]],                       \
-      const device mtl_type* b       [[buffer(3)]],                       \
-      const device float*    a_log   [[buffer(4)]],                       \
-      const device mtl_type* dt_bias [[buffer(5)]],                       \
-      uint gid [[thread_position_in_grid]]);
+#define INST_GDN_GATING(dtype_tag, mtl_type) \
+  SCRATCHY_KERNEL(gdn_gating_##dtype_tag, gdn_gating<mtl_type>)
 
 INST_GDN_GATING(f16,  half)
 INST_GDN_GATING(bf16, bfloat)

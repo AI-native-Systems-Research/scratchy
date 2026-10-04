@@ -20,7 +20,7 @@ use crate::interpreter::metal::lowered::IntoBaked;
 use std::sync::Arc;
 
 use crate::interpreter::metal::__re::{
-    Buffer, ComputePipelineState, Device, MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize,
+    Buffer, ComputePipelineState, Device, MTLDevice, MTLResourceOptions, MTLSize,
 };
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
@@ -30,6 +30,7 @@ use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape, Weight
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
+use crate::tape::constants::TapeVariant;
 use crate::tape::ids::SourceIx;
 use crate::tape::lowered::ModelSources;
 #[cfg(feature = "forward-telemetry")]
@@ -105,17 +106,6 @@ pub struct BucketBaking {
     /// a kernel exceeds the 31-binding argument-table cap (such buckets
     /// have no MTL4 execution path).
     pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
-    /// Per-bucket inline-constants buffer. Backs every
-    /// `Binding::Inline { value }` in this bucket's commands by packing
-    /// all u32 values into one shared-storage MTLBuffer at consecutive
-    /// 4-byte offsets, in command-then-binding order. `None` if the
-    /// bucket has no Inline bindings. Lives on the baking (not the
-    /// worker) because the values are baked at record-time from the
-    /// command-specific literals in the lowered tape — different
-    /// buckets fed by the same model have different axis_sizes /
-    /// top_k stamps. dispatch-bound commands access this via
-    /// `setBuffer_offset_atIndex` like any other device buffer.
-    pub moe_inline_buf: Option<Buffer>,
 }
 
 #[derive(Debug)]
@@ -172,6 +162,8 @@ pub enum WorkerError {
         bucket_index: usize,
         command_index: usize,
     },
+    /// The device could not allocate the worker's `what` buffer of `bytes`.
+    BufferAlloc { what: &'static str, bytes: u64 },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -234,6 +226,12 @@ impl std::fmt::Display for WorkerError {
                  Binding::Scratch with no splitk scratch buffer allocated \
                  (lowering / tape accounting bug)"
             ),
+            Self::BufferAlloc { what, bytes } => {
+                write!(
+                    f,
+                    "MetalWorker: the device cannot allocate the {what} ({bytes} bytes)"
+                )
+            }
         }
     }
 }
@@ -372,57 +370,59 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let mut pins: Vec<crate::residency::Pinned> = Vec::new();
         let mut pin = |b: &Buffer| pins.extend(residency.map(|r| r.pin(b.clone())));
 
-        let arena: Vec<Buffer> = arena_layout
-            .iter()
-            .map(|&size| {
-                // Shared storage so test code can seed/inspect arena
-                // contents without staging copies. dispatch-bound buffers
-                // are fine in shared on Apple silicon — the existing
-                // `MetalAllocator` uses the same mode.
-                let buf = device
-                    .newBufferWithLength_options(
-                        size as usize,
-                        MTLResourceOptions::StorageModeShared,
-                    )
-                    .expect("newBufferWithLength_options returned nil");
-                pin(&buf);
-                buf
-            })
-            .collect();
-
-        // A Private scratch buffer (the host never reads scratch back) sized to
-        // the max across bucket tapes and pinned, since dispatches bind it by
-        // baked address; `None` when no tape needs it.
-        let mut scratch = |bytes: fn(&LoweredMetalTape) -> u32, what: &str| {
-            let max = bucket_tapes.iter().map(bytes).max().unwrap_or(0);
-            (max > 0).then(|| {
-                let buf = device
-                    .newBufferWithLength_options(
-                        max as usize,
-                        MTLResourceOptions::StorageModePrivate,
-                    )
-                    .unwrap_or_else(|| panic!("newBufferWithLength_options returned nil ({what})"));
-                pin(&buf);
-                buf
-            })
+        // A buffer the device cannot allocate is a typed refusal, never a panic.
+        let alloc = |bytes: u64, mode: MTLResourceOptions, what: &'static str| {
+            let buf = usize::try_from(bytes)
+                .ok()
+                .and_then(|len| device.newBufferWithLength_options(len, mode));
+            buf.ok_or(WorkerError::BufferAlloc { what, bytes })
         };
-        // SplitK: one buffer suffices because successive `affine_qmm_t_splitk`
-        // / `splitk_reduce_sum` pairs run serially inside a single encoder.
-        let splitk_scratch = scratch(|t| t.splitk_scratch_bytes, "splitk scratch");
-        // `Binding::MoeScratch`: MoE blocks within one bucket execute serially
-        // through the dispatch; cross-bucket reuse is fine because only one
-        // bucket runs per forward.
-        let moe_scratch = scratch(|t| t.moe_scratch_bytes, "moe scratch");
-        // `Binding::RopedKScratch` (spans rope-on-read, rope-once-to-scratch —
-        // NAX matrix-accel AND the simdgroup steel prefill): the
-        // RopeOnce{Nax,Steel} command and its following attention run serially
-        // per layer through the dispatch, and the scratch is overwritten each
-        // layer (the cache, not the scratch, is the persistent artifact).
-        let roped_k_scratch = scratch(|t| t.roped_k_scratch_bytes, "roped-K scratch");
-        // hd512-unfused attention (q_head/Kdense/Vdense_T/scores/out_head
-        // packed at baked offsets). One buffer, overwritten per layer.
-        let attn_unfused_scratch =
-            scratch(|t| t.attn_unfused_scratch_bytes, "attn-unfused scratch");
+        // Shared storage so test code can seed/inspect arena contents without staging copies.
+        // dispatch-bound buffers are fine in shared on Apple silicon — the existing
+        // `MetalAllocator` uses the same mode.
+        let arena: Vec<Buffer> = (arena_layout.iter())
+            .map(|&size| alloc(size, MTLResourceOptions::StorageModeShared, "arena slot"))
+            .collect::<Result<_, _>>()?;
+        arena.iter().for_each(&mut pin);
+
+        // A Private scratch buffer (the host never reads scratch back) per scratch the tapes bind
+        // (`LoweredMetalTape::scratch_bytes`: split-K, MoE, roped K, hd512 unfused), sized to the
+        // max across bucket tapes and pinned, since dispatches bind it by baked address; `None`
+        // when no tape needs it.
+        // - SplitK: successive `affine_qmm_t_splitk` / `splitk_reduce_sum` pairs run serially
+        //   inside a single encoder.
+        // - MoE: MoE blocks within one bucket execute serially through the dispatch; cross-bucket
+        //   reuse is fine because only one bucket runs per forward.
+        // - Roped K (spans rope-on-read, rope-once-to-scratch — NAX matrix-accel AND the
+        //   simdgroup steel prefill): the RopeOnce{Nax,Steel} command and its following attention
+        //   run serially per layer, and the scratch is overwritten each layer (the cache, not the
+        //   scratch, is the persistent artifact).
+        // - hd512-unfused attention (q_head/Kdense/Vdense_T/scores/out_head packed at baked
+        //   offsets): one buffer, overwritten per layer.
+        let scratch = |i: usize, what| {
+            let max = bucket_tapes
+                .iter()
+                .map(|t| t.scratch_bytes()[i])
+                .max()
+                .unwrap_or(0);
+            let private = MTLResourceOptions::StorageModePrivate;
+            (max > 0)
+                .then(|| alloc(max.into(), private, what))
+                .transpose()
+        };
+        let splitk_scratch = scratch(0, "splitk scratch")?;
+        let moe_scratch = scratch(1, "moe scratch")?;
+        let roped_k_scratch = scratch(2, "roped-K scratch")?;
+        let attn_unfused_scratch = scratch(3, "attn-unfused scratch")?;
+        [
+            &splitk_scratch,
+            &moe_scratch,
+            &roped_k_scratch,
+            &attn_unfused_scratch,
+        ]
+        .into_iter()
+        .flatten()
+        .for_each(&mut pin);
 
         // Runtime metadata buffers (`input_ids`, `positions`,
         // `slot_mapping`, `cu_seqlens_q`, `seq_used_k`, `block_table`)
@@ -588,13 +588,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 runtime,
                 device.clone(),
             )?;
-            // Insert the per-bucket inline-constants buffer into the
-            // residency set so the dispatch exec dispatch sees its
-            // residency entry (the dispatch never `setBuffer`s these
-            // explicitly — bindings are pre-recorded in the dispatch).
-            if let Some(b) = baking.moe_inline_buf.as_ref() {
-                pin(b);
-            }
             bucket_bakings.push(baking);
         }
         // Every codes operand is now stored the way its readers read it.
@@ -798,13 +791,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // need cache-coherent reads of. The final cmdbuf
                     // commit point flushes everything before the next
                     // encoder runs.
-                    if std::env::var_os("SCRATCHY_METAL_NO_BARRIERS").is_none() {
-                        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                            MTLStages::Dispatch,
-                            MTLStages::Dispatch,
-                            MTL4VisibilityOptions::None,
-                        );
-                    }
+                    enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                        MTLStages::Dispatch,
+                        MTLStages::Dispatch,
+                        MTL4VisibilityOptions::None,
+                    );
                 }
                 let tg_scaled = scale_tg_for_num_tokens(
                     *tg,
@@ -845,16 +836,14 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 } else {
                     tg_scaled
                 };
-                // RopeOnce{Steel,Nax,GqaShared}: the pre-roped-K scratch is sized to
-                // MAX_BLOCKS_PER_SEQ logical blocks (lowering), and the steel/gqa
-                // attention reads the WHOLE sequence's roped K (computed prefix +
-                // new). The baked grid M-scales by num_tokens (the NEW tokens only)
-                // — too few for a chunked-prefill CONTINUATION, leaving the prefix
-                // blocks past one bucket un-roped → garbage K → `!!!!` past 4096
-                // tokens. Override grid.y to the live block-table width
-                // (`tq_dequant_max_blocks`, == kv_len/block_size), capped at the
-                // baked num_pages (the scratch's block capacity). Mirrors the
-                // TqStageRotated grid override above.
+                // RopeOnce{Steel,Nax,GqaShared}: the pre-roped-K scratch holds the KV cap rung's
+                // logical blocks (lowering), and the steel/gqa attention reads the WHOLE
+                // sequence's roped K (computed prefix + new). The baked grid M-scales by
+                // num_tokens (the NEW tokens only) — too few for a chunked-prefill CONTINUATION,
+                // leaving the prefix blocks past one bucket un-roped → garbage K → `!!!!` past
+                // 4096 tokens. Override grid.y to the step's block-table width
+                // (`tq_dequant_max_blocks`), which is the rung's cap: the scratch holds it.
+                // Mirrors the TqStageRotated grid override above.
                 let tg_scaled = if matches!(
                     step.kernel,
                     super::lowered::KernelId::RopeOnceSteel
@@ -865,11 +854,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         .tq_dequant_max_blocks
                         .load(std::sync::atomic::Ordering::Relaxed)
                         as usize;
-                    let cap = tg.height; // baked num_pages = MAX_BLOCKS_PER_SEQ
                     let cover = if runtime_mb == 0 {
-                        cap
+                        tg.height
                     } else {
-                        runtime_mb.min(cap)
+                        runtime_mb
                     };
                     MTLSize {
                         width: tg_scaled.width,
@@ -912,11 +900,8 @@ fn is_fused(id: KernelId) -> bool {
         id,
         K::FusedAddRmsNorm
             | K::FusedGateUpSiluMul
-            | K::FusedQkvRopeCache
-            | K::FusedAffineQkvRopeCache
             | K::RopeAppendNormed
             | K::NormAddScalarMul
-            | K::SynthGateUpSiluMul
             | K::AttentionViaCacheTq
     )
 }
@@ -932,8 +917,6 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         K::RmsNorm | K::RmsNormUnit | K::FusedAddRmsNorm | K::NormAddScalarMul => KernelKind::Norm,
         K::RopeAppendNormed
         | K::RopeAppend
-        | K::FusedQkvRopeCache
-        | K::FusedAffineQkvRopeCache
         | K::RopeOnceNax
         | K::RopeOnceSteel
         | K::RopeOnceGqaShared => KernelKind::Rope,
@@ -946,8 +929,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AttnOConvert
         | K::AttnCausalSoftmax
         | K::AttnGemmQk
-        | K::AttnGemmPv
-        | K::SynthPreAttn => KernelKind::Attention,
+        | K::AttnGemmPv => KernelKind::Attention,
         K::GatedDeltaNet => KernelKind::GatedDeltaNet,
         K::Gemm
         | K::AffineQmvQuad
@@ -981,11 +963,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::GateSplit
         | K::ArgPartitionTopK
         | K::TakeAlongAxis => KernelKind::Moe,
-        K::FusedGateUpSiluMul
-        | K::SiluMul
-        | K::GeluMul
-        | K::SynthGateUpSiluMul
-        | K::SynthMlpPreDown => KernelKind::Mlp,
+        K::FusedGateUpSiluMul | K::SiluMul | K::GeluMul => KernelKind::Mlp,
         K::GatherLastToken | K::ScatterFirstToLastRow | K::Softmax | K::SliceTrailingColsU32 => {
             KernelKind::Sample
         }
@@ -1033,54 +1011,12 @@ fn bake_bucket<W: CanonicalParams>(
         });
     }
 
-    // Pre-pass: harvest every `Binding::Inline { value }` in
-    // command-then-binding order, allocate one shared-storage MTLBuffer
-    // sized to hold them all at 4-byte stride, write the values, and
     // ⭐ THE LAYER LOOP IS PLAYED OUT HERE, ONCE, AT LOAD. The baked tape carries ONE copy of
     // the body plus its iteration count; unrolling it at BAKE time is what made the emitted
     // `const` an order of magnitude larger. Everything below sees the same flat command list it
     // always did.
     let expanded_commands = tape.commands_expanded();
     let expanded_barriers = tape.barriers_expanded();
-
-    // produce a flat offset list the main resolve loop walks via a
-    // cursor. The cursor's invariant: at command `cmd_idx`, before
-    // resolving any of its bindings, `inline_cursor` equals the number
-    // of Inline bindings seen in commands `0..cmd_idx`. Each Inline
-    // binding resolved consumes one slot (cursor += 1) and returns
-    // `(moe_inline_buf, cursor_pre * 4, binding_index)`.
-    // ⛔ SIZED FROM THE EXPANDED COMMANDS, because the cursor below walks them. The baked tape
-    // holds ONE copy of the layer body, so staging from `tape.commands` would size this buffer
-    // for a single iteration while the walk consumed one slot per Inline binding per LAYER —
-    // every iteration after the first reading past the end.
-    let inline_values: Vec<u32> = expanded_commands
-        .iter()
-        .flat_map(|c| {
-            c.command.bindings.iter().filter_map(|b| match b {
-                Binding::Inline { value, .. } => Some(*value),
-                _ => None,
-            })
-        })
-        .collect();
-    let moe_inline_buf: Option<Buffer> = if inline_values.is_empty() {
-        None
-    } else {
-        let n_bytes = inline_values.len() * std::mem::size_of::<u32>();
-        let buf = device
-            .newBufferWithLength_options(n_bytes, MTLResourceOptions::StorageModeShared)
-            .expect("newBufferWithLength_options returned nil (moe inline)");
-        // SAFETY: `contents()` returns a host-visible pointer for a
-        // shared-storage buffer; we wrote `n_bytes` bytes through it
-        // before any GPU command touches the buffer. dispatch recording
-        // happens later in the same `bake_bucket`; the dispatch exec runs
-        // strictly after this `new` returns to the caller.
-        unsafe {
-            let dst = buf.contents().as_ptr().cast::<u32>();
-            std::ptr::copy_nonoverlapping(inline_values.as_ptr(), dst, inline_values.len());
-        }
-        Some(buf)
-    };
-    let mut inline_cursor: u32 = 0;
 
     let mut steps: Vec<BucketStep> = Vec::new();
 
@@ -1097,8 +1033,6 @@ fn bake_bucket<W: CanonicalParams>(
                 cmd,
                 arena,
                 moe_scratch,
-                moe_inline_buf.as_ref(),
-                &mut inline_cursor,
                 sources,
                 runtime,
             )?;
@@ -1177,14 +1111,12 @@ fn bake_bucket<W: CanonicalParams>(
             moe_scratch,
             roped_k_scratch,
             attn_unfused_scratch,
-            moe_inline_buf.as_ref(),
-            &mut inline_cursor,
             sources,
             runtime,
         )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
-        let (tg, tpt) = mtl_size_pair(cmd);
+        let (tg, tpt) = mtl_size_pair(cmd, pipelines.variant());
 
         // Coalesce with the previous step iff (a) it's an dispatch step
         // (a Gemm step forces an encoder boundary) and (b) its
@@ -1253,7 +1185,6 @@ fn bake_bucket<W: CanonicalParams>(
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         mtl4_steps,
-        moe_inline_buf,
     })
 }
 
@@ -1263,15 +1194,12 @@ fn bake_bucket<W: CanonicalParams>(
 /// arena slot, index 1 → input arena slot, index 2 → LinearLayer
 /// weight thunk. Anything else is a contract violation surfaced as
 /// [`WorkerError::GemmBindingsMalformed`].
-#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_buffers(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand,
     arena: &[Buffer],
     moe_scratch: Option<&Buffer>,
-    moe_inline_buf: Option<&Buffer>,
-    inline_cursor: &mut u32,
     sources: &ResolvedSources,
     runtime: &RuntimeBindings,
 ) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
@@ -1290,8 +1218,6 @@ fn resolve_gemm_buffers(
         moe_scratch,
         /*roped_k_scratch=*/ None,
         /*attn_unfused_scratch=*/ None,
-        moe_inline_buf,
-        inline_cursor,
         sources,
         runtime,
     )?;
@@ -1411,8 +1337,6 @@ fn resolve_bindings(
     moe_scratch: Option<&Buffer>,
     roped_k_scratch: Option<&Buffer>,
     attn_unfused_scratch: Option<&Buffer>,
-    moe_inline_buf: Option<&Buffer>,
-    inline_cursor: &mut u32,
     sources: &ResolvedSources,
     runtime: &RuntimeBindings,
 ) -> Result<Vec<(Buffer, u64, u64)>, WorkerError> {
@@ -1476,19 +1400,6 @@ fn resolve_bindings(
                     command_index,
                 })?;
                 (scratch.clone(), *offset as u64, *binding_index as u64)
-            }
-            Binding::Inline {
-                binding_index,
-                value: _,
-            } => {
-                let buf = moe_inline_buf.ok_or(WorkerError::WeightLookupFailed {
-                    reason: "Binding::Inline reached resolve_bindings but the bucket's \
-                             `moe_inline_buf` is None — bake_bucket's pre-pass should have \
-                             allocated it from the tape's Inline bindings",
-                })?;
-                let off = (*inline_cursor as u64) * 4;
-                *inline_cursor += 1;
-                (buf.clone(), off, *binding_index as u64)
             }
             Binding::MoeScratch {
                 binding_index,
@@ -1622,10 +1533,16 @@ fn scale_tg_for_num_tokens(
     tg
 }
 
-fn mtl_size_pair(cmd: &LoweredCommand) -> (MTLSize, MTLSize) {
+fn mtl_size_pair(cmd: &LoweredCommand, variant: TapeVariant) -> (MTLSize, MTLSize) {
+    // A TurboQuant decode threadgroup serves the variant's query heads (`ConstantType::TqHeads`):
+    // its threadgroups count heads. Its pipeline lookup refuses a variant without them.
+    let heads = match (cmd.kernel, variant.tq_heads) {
+        (KernelId::AttentionViaCacheTq, Some(h)) => h.get(),
+        _ => 1,
+    };
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as usize,
-        height: cmd.dispatch.threadgroups.1 as usize,
+        height: (cmd.dispatch.threadgroups.1 / heads) as usize,
         depth: cmd.dispatch.threadgroups.2 as usize,
     };
     let tpt = MTLSize {
@@ -1658,6 +1575,46 @@ mod tests {
     use scratchy_layers::{Linear, LinearLayer, RmsNorm};
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::Arc;
+
+    /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
+    const TEST_VARIANT: TapeVariant = TapeVariant {
+        cap: crate::tape::ids::MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
+        tq_heads: None,
+    };
+
+    /// A TurboQuant decode attention's threadgroups count query heads: one serves the picked
+    /// variant's heads, so the variant divides them. Every other command dispatches as baked.
+    #[test]
+    fn tq_decode_threadgroups_serve_the_variants_heads() {
+        use crate::tape::ids::{MaxBlocksPerSeq, TqDecodeHeads};
+        let command = |kernel| LoweredCommand {
+            kernel,
+            library: "attention",
+            function: "attention_via_cache_v2_f16_specialized",
+            constants: crate::interpreter::metal::lowered::baked(Vec::new()),
+            dispatch: DispatchShape {
+                threadgroups: (1, 32, 2),
+                threads_per_threadgroup: (64, 1, 1),
+                m_scaling: None,
+            },
+            bindings: crate::interpreter::metal::lowered::baked(Vec::new()),
+            gemm_dims: None,
+        };
+        let (tq, fp16) = (
+            command(KernelId::AttentionViaCacheTq),
+            command(KernelId::AttentionViaCache),
+        );
+        for heads in [1, 2, 4, 8] {
+            let variant = TapeVariant {
+                cap: MaxBlocksPerSeq(128),
+                tq_heads: Some(TqDecodeHeads(heads)),
+            };
+            let (tg, _) = mtl_size_pair(&tq, variant);
+            assert_eq!((tg.width, tg.height, tg.depth), (1, 32 / heads as usize, 2));
+            let (tg, _) = mtl_size_pair(&fp16, variant);
+            assert_eq!((tg.width, tg.height, tg.depth), (1, 32, 2));
+        }
+    }
 
     /// The decode-step gates follow whether every sequence contributes one
     /// token; the sequence gates follow the step's sequence count, not its
@@ -1718,8 +1675,8 @@ mod tests {
             return;
         };
         let device = device.device.clone();
-        let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
-            .expect("compile standard shaders");
+        let cache =
+            SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
         let p = crate::tape::model_consts::MetalModelConsts {
             metal_dtype: MetalDtype::F16,
             ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
@@ -1750,14 +1707,13 @@ mod tests {
                     width,
                 )
             };
-            let pso = cache
-                .get_or_build(&crate::specialized_pipeline_cache::PipelineKey::new(
-                    cmd.library,
-                    cmd.function,
-                    cmd.constants.to_vec(),
-                ))
-                .expect("pipeline");
-            let (grid, threads) = mtl_size_pair(&cmd);
+            let key = crate::specialized_pipeline_cache::PipelineKey::new(
+                cmd.library,
+                cmd.function,
+                cmd.constants.to_vec(),
+            );
+            let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
+            let (grid, threads) = mtl_size_pair(&cmd, TEST_VARIANT);
             let grid = scale_tg_for_num_tokens(
                 grid,
                 cmd.dispatch.m_scaling,
@@ -1944,6 +1900,18 @@ mod tests {
         }
     }
 
+    /// The test weights' RMSNorm constants at `bucket_m` rows.
+    fn rmsnorm_constants(bucket_m: u32) -> &'static [ConstantValue] {
+        use crate::tape::ids::{BucketM, QSize, RmsNormEps};
+        crate::tape::kernel_constants::RmsNormConstants {
+            bucket_m: BucketM(bucket_m),
+            q_size: QSize(<TestWeights as CanonicalParams>::Q_SIZE as u32),
+            rms_norm_eps: RmsNormEps(<TestWeights as CanonicalParams>::RMS_NORM_EPS),
+            weight_offset: 0.0,
+        }
+        .into_baked()
+    }
+
     /// Build a synthetic 2-bucket lowered tape: each bucket runs the
     /// same `[RmsNorm, FusedAddRmsNorm]` shape twice. Verifies:
     /// arena allocation, dispatch recording per command, segment
@@ -1953,11 +1921,7 @@ mod tests {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
             function: "rmsnorm_f16_s_f16_specialized",
-            constants: crate::interpreter::metal::lowered::baked(vec![
-                ConstantValue::uint(0, bucket_m),
-                ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
-                ConstantValue::float(2, <TestWeights as CanonicalParams>::RMS_NORM_EPS),
-            ]),
+            constants: rmsnorm_constants(bucket_m),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -1985,11 +1949,7 @@ mod tests {
             kernel: KernelId::FusedAddRmsNorm,
             library: "fused_add_rmsnorm",
             function: "fused_add_rmsnorm_f16_s_f16_specialized",
-            constants: crate::interpreter::metal::lowered::baked(vec![
-                ConstantValue::uint(0, bucket_m),
-                ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
-                ConstantValue::float(2, <TestWeights as CanonicalParams>::RMS_NORM_EPS),
-            ]),
+            constants: rmsnorm_constants(bucket_m),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -2020,12 +1980,13 @@ mod tests {
         LoweredMetalTape {
             bucket_m,
             num_arena_slots: 2,
-            commands: crate::interpreter::metal::lowered::baked(vec![
+            commands: crate::interpreter::metal::lowered::baked_commands(vec![
                 rmsnorm.into(),
                 rmsnorm.into(),
                 fused_add_rmsnorm.into(),
                 fused_add_rmsnorm.into(),
-            ]),
+            ])
+            .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
             roped_k_scratch_bytes: 0,
@@ -2058,17 +2019,14 @@ mod tests {
         };
         let device = Arc::new(device.device.clone());
 
-        let cache = Arc::new(
-            SpecializedPipelineCache::with_standard_shaders((*device).clone())
-                .expect("compile standard shaders"),
-        );
-        let pipelines = SpecializedPipelines::new(cache);
-
         let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         // Two buckets: M=1 (decode) and M=8 (small prefill).
         let tapes = vec![build_synthetic_tape(1), build_synthetic_tape(8)];
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
         let arena_layout: ArenaLayout = vec![4 * 1024, 4 * 1024];
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2116,15 +2074,13 @@ mod tests {
         };
         let device = Arc::new(device.device.clone());
 
-        let cache = Arc::new(
-            SpecializedPipelineCache::with_standard_shaders((*device).clone())
-                .expect("compile standard shaders"),
-        );
-        let pipelines = SpecializedPipelines::new(cache);
         let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         let tapes = vec![build_synthetic_tape(1)]; // num_arena_slots = 2
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         // Layout has only 1 slot — should error.
         let bad_layout: ArenaLayout = vec![4 * 1024];
@@ -2160,13 +2116,6 @@ mod tests {
             return;
         };
         let device = Arc::new(device.device.clone());
-
-        let cache = Arc::new(
-            SpecializedPipelineCache::with_standard_shaders((*device).clone())
-                .expect("compile standard shaders"),
-        );
-        let pipelines = SpecializedPipelines::new(cache);
-
         let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
@@ -2226,7 +2175,8 @@ mod tests {
         let tape = LoweredMetalTape {
             bucket_m: 1,
             num_arena_slots: 2,
-            commands: crate::interpreter::metal::lowered::baked(vec![attn.into()]),
+            commands: crate::interpreter::metal::lowered::baked_commands(vec![attn.into()])
+                .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
             roped_k_scratch_bytes: 0,
@@ -2235,6 +2185,9 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,
@@ -2304,21 +2257,16 @@ mod tests {
             return;
         };
         let device = Arc::new(device.device.clone());
-
-        let cache = Arc::new(
-            SpecializedPipelineCache::with_standard_shaders((*device).clone())
-                .expect("compile standard shaders"),
-        );
-        let pipelines = SpecializedPipelines::new(cache);
         let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         let tape = LoweredMetalTape {
             bucket_m: 1,
             num_arena_slots: 2,
-            commands: crate::interpreter::metal::lowered::baked(vec![
+            commands: crate::interpreter::metal::lowered::baked_commands(vec![
                 build_gemm_command(1, 2048, 2048).into(),
-            ]),
+            ])
+            .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
             roped_k_scratch_bytes: 0,
@@ -2327,6 +2275,9 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,
@@ -2365,11 +2316,6 @@ mod tests {
         };
         let device = Arc::new(device.device.clone());
 
-        let cache = Arc::new(
-            SpecializedPipelineCache::with_standard_shaders((*device).clone())
-                .expect("compile standard shaders"),
-        );
-        let pipelines = SpecializedPipelines::new(cache);
         let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
@@ -2377,11 +2323,7 @@ mod tests {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
             function: "rmsnorm_f16_s_f16_specialized",
-            constants: crate::interpreter::metal::lowered::baked(vec![
-                ConstantValue::uint(0, 1),
-                ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
-                ConstantValue::float(2, <TestWeights as CanonicalParams>::RMS_NORM_EPS),
-            ]),
+            constants: rmsnorm_constants(1),
             dispatch: DispatchShape {
                 threadgroups: (1, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -2443,11 +2385,12 @@ mod tests {
         let tape = LoweredMetalTape {
             bucket_m: 1,
             num_arena_slots: 2,
-            commands: crate::interpreter::metal::lowered::baked(vec![
+            commands: crate::interpreter::metal::lowered::baked_commands(vec![
                 rmsnorm_pre.into(),
                 build_gemm_command(1, 2048, 2048).into(),
                 rmsnorm_post.into(),
-            ]),
+            ])
+            .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
             roped_k_scratch_bytes: 0,
@@ -2456,6 +2399,9 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
         };
+        let pipelines =
+            crate::aot::tape_pipelines(&device, &[tape], TestWeights::METAL_DTYPE, TEST_VARIANT)
+                .expect("pipelines");
 
         let worker = MetalWorker::<TestWeights>::new(
             device,

@@ -3,6 +3,7 @@
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
+#include "baked.h"
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -17,7 +18,7 @@ using namespace metal;
 // Mistral GEMM in the metal backend: `transpose_a = false`,
 // `transpose_b = true`, `alpha = 1.0`, `beta = 0.0`. The runtime never
 // invokes the more general MPS surface, so baking these in lets the
-// shader stay short and the function-constant bag stay at three
+// shader stay short and the baked constants stay at three
 // dimensions.
 //
 // Why a custom kernel: `MPSMatrixMultiplication` only accepts
@@ -36,7 +37,7 @@ using namespace metal;
 //   buffer(1) = input   [M, K]
 //   buffer(2) = weight  [N, K]
 //
-// Function constants:
+// Baked constants:
 //   0 = M
 //   1 = N
 //   2 = K
@@ -46,17 +47,18 @@ using namespace metal;
 // output tile.
 // ---------------------------------------------------------------------------
 
-constant uint GEMM_M [[function_constant(0)]];
-constant uint GEMM_N [[function_constant(1)]];
-constant uint GEMM_K [[function_constant(2)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_M, 0);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_N, 1);
+SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_K, 2);
 
 // Block-diagonal span attention for the hd512 unfused QKᵀ: granularity of the
 // per-position span-label buffer (== metal KV block size). The bound only fires
 // where span_ids is non-zero, so non-span tiles keep the full causal range and
-// the dense path stays byte-identical. Undefined → 0 (disabled).
-constant uint QK_SPAN_BLOCK_RAW [[function_constant(3)]];
-constant uint QK_SPAN_BLOCK =
-    is_function_constant_defined(QK_SPAN_BLOCK_RAW) ? QK_SPAN_BLOCK_RAW : 0u;
+// the dense path stays byte-identical. Unset → 0 (disabled).
+SCRATCHY_CONSTANT_OPTIONAL(uint, QK_SPAN_BLOCK, 3);
+
+// The PV's V^T row stride: the STATIC max_kv, sized from the block capacity at load.
+SCRATCHY_CONSTANT_OPTIONAL(uint, GEMM_PV_W_LD, 4);
 
 // Shared C = A @ B^T body (A:[M,K], B:[N,K], C:[M,N]) with M/N/K passed
 // explicitly. The dense kernel passes the baked GEMM_M/N/K; the hd512 unfused
@@ -149,6 +151,7 @@ inline void gemm_t_bf16_body(
     }
 }
 
+#if SCRATCHY_COMPILES(gemm_bf16_specialized)
 kernel void gemm_bf16_specialized(
     device       bfloat* output [[buffer(0)]],
     device const bfloat* input  [[buffer(1)]],
@@ -164,6 +167,7 @@ kernel void gemm_bf16_specialized(
     gemm_t_bf16_body(output, input, weight, GEMM_M, GEMM_N, GEMM_K, GEMM_K,
                      a_pad, b_pad, c_scratch, tgid, tid3.x);
 }
+#endif
 
 // f16 counterpart of `gemm_t_bf16_body` — identical tiling and dispatch
 // convention, with `half` inputs and `simdgroup_half8x8` MMA (float
@@ -250,6 +254,7 @@ inline void gemm_t_f16_body(
     }
 }
 
+#if SCRATCHY_COMPILES(gemm_f16_specialized)
 kernel void gemm_f16_specialized(
     device       half* output [[buffer(0)]],
     device const half* input  [[buffer(1)]],
@@ -265,6 +270,7 @@ kernel void gemm_f16_specialized(
     gemm_t_f16_body(output, input, weight, GEMM_M, GEMM_N, GEMM_K, GEMM_K,
                     a_pad, b_pad, c_scratch, tgid, tid3.x);
 }
+#endif
 
 // ── Blocked simdgroup GEMM for the hd512 unfused attention (pre-M5) ──────────
 // C = A[M,K] @ B[N,K]^T. 32×32 output tile, 4 simdgroups (WM=WN=2), BK=16,
@@ -374,6 +380,7 @@ inline void gemm_t_bf16_blocked(
 
 // hd512 unfused attention (non-NAX / pre-M5) QKᵀ: N = kv_len from seq_used,
 // M = GEMM_M (Lq), K = GEMM_K (hd). Output scores [Lq, kv_len].
+#if SCRATCHY_COMPILES(gemm_bf16_qk)
 kernel void gemm_bf16_qk(
     device       bfloat* output   [[buffer(0)]],   // scores [M=Lq, N=kv_len]
     device const bfloat* input    [[buffer(1)]],   // Q head [M=Lq, K=hd]
@@ -421,10 +428,12 @@ kernel void gemm_bf16_qk(
     gemm_t_bf16_blocked(output, input, weight, M, N, GEMM_K, GEMM_K,
                         As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
 }
+#endif
 
 // hd512 unfused attention (non-NAX / pre-M5) PV: K = kv_len from seq_used,
 // M = GEMM_M (Lq), N = GEMM_N (hd), and the V^T dense weight is strided by the
-// STATIC max_kv passed in GEMM_K (decoupled from the kv_len contraction).
+// STATIC max_kv, GEMM_PV_W_LD (decoupled from the kv_len contraction).
+#if SCRATCHY_COMPILES(gemm_bf16_pv)
 kernel void gemm_bf16_pv(
     device       bfloat* output   [[buffer(0)]],   // out head [M=Lq, N=hd]
     device const bfloat* input    [[buffer(1)]],   // probs [M=Lq, K=kv_len]
@@ -437,9 +446,10 @@ kernel void gemm_bf16_pv(
     threadgroup bfloat As[ATTN_BM * ATTN_LD];
     threadgroup bfloat Bs[ATTN_BN * ATTN_LD];
     threadgroup float  c_scratch[ATTN_BM * ATTN_BN];
-    gemm_t_bf16_blocked(output, input, weight, GEMM_M, GEMM_N, seq_used[0], GEMM_K,
+    gemm_t_bf16_blocked(output, input, weight, GEMM_M, GEMM_N, seq_used[0], GEMM_PV_W_LD,
                         As, Bs, c_scratch, simd_group_id, simd_lane_id, tgid);
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // gemv_{f16,bf16}_specialized
@@ -569,12 +579,8 @@ template <typename T>
     }
 }
 
-#define INST_GEMV(tag, T)                                                                     \
-    template [[host_name("gemv_" #tag "_specialized")]] [[kernel]] void gemv_specialized<T>(  \
-        device T* output [[buffer(0)]], device const T* input [[buffer(1)]],                  \
-        device const T* weight [[buffer(2)]], uint3 tid [[threadgroup_position_in_grid]],    \
-        uint simd_gid [[simdgroup_index_in_threadgroup]],                                     \
-        uint simd_lid [[thread_index_in_simdgroup]]);
+#define INST_GEMV(tag, T) \
+  SCRATCHY_KERNEL(gemv_##tag##_specialized, gemv_specialized<T>)
 
 INST_GEMV(f16, half)
 INST_GEMV(bf16, bfloat)

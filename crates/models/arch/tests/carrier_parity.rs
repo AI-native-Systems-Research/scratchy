@@ -218,7 +218,7 @@ mod imp {
         // MoE kernels require affine-quantized expert storage
         // (`to_wavefront.rs`: "MoE without affine expert storage has no
         // metal realization"), so a dense-MoE checkpoint refuses at pool
-        // construction with `BucketLower`. The same refusal fires for the
+        // construction with `NoRung`. The same refusal fires for the
         // oracle's synthetic checkpoint. Comparing torch vs metal here
         // would compare an execution against a refusal: not parity, a
         // mechanism gap. Named loudly, not silently passed — the unlock is

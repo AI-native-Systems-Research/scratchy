@@ -13,10 +13,13 @@ mod common;
 
 use half::f16;
 use objc2_metal::{MTLBuffer, MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize};
+use scratchy_target_metal::aot::{baked_build, baked_pipeline};
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
+use scratchy_target_metal::tape::ids::{BucketM, ElementCount, QSize, RmsNormEps};
+use scratchy_target_metal::tape::kernel_constants::{RmsNormConstants, ScalarMulConstants};
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -145,7 +148,7 @@ fn gelu_mul_f16_matches_cpu() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let n = 4096usize;
     let gate = pseudo(7, n, 4.0);
@@ -156,7 +159,7 @@ fn gelu_mul_f16_matches_cpu() {
         "gelu_mul_f16",
         vec![ConstantValue::uint(0, n as u32)],
     );
-    let pipeline = cache.get_or_build(&key).expect("gelu_mul pipeline");
+    let pipeline = baked_build(&cache, &key).expect("gelu_mul pipeline");
 
     let gate_buf = buf_f16(&device, &gate);
     let up_buf = buf_f16(&device, &up);
@@ -182,19 +185,19 @@ fn tanh_soft_cap_f16_specialized_matches_cpu() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
 
     let n = 2048usize;
     let cap = 30.0f32;
     let x = pseudo(13, n, 80.0); // exercises the saturating tail
 
-    let key = PipelineKey::new(
+    let pipeline = baked_pipeline(
+        &device,
         "elementwise",
         "tanh_soft_cap_f16_specialized",
         // slot 1: slot 0 is BIAS_ADD_NUM_COLS (file-scoped indices).
         vec![ConstantValue::float(1, cap)],
-    );
-    let pipeline = cache.get_or_build(&key).expect("tanh_soft_cap pipeline");
+    )
+    .expect("tanh_soft_cap pipeline");
 
     let in_buf = buf_f16(&device, &x);
     let out_buf = buf_zero(&device, n * 2);
@@ -312,7 +315,7 @@ fn run_window_case(case: AttnCase) {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let block_size = 16usize;
     let num_blocks = case.kv_len.div_ceil(block_size);
@@ -347,7 +350,7 @@ fn run_window_case(case: AttnCase) {
             "attention_via_cache_v2_f16_specialized",
             attn_constants(&case, block_size, num_blocks),
         );
-        let pipeline = cache.get_or_build(&key).expect("decode pipeline");
+        let pipeline = baked_build(&cache, &key).expect("decode pipeline");
 
         // K/V are reached via raw gpuAddress through the chunk table, so
         // they must be resident even though the kernel never binds them at
@@ -410,7 +413,7 @@ fn run_window_case(case: AttnCase) {
             "attention_prefill_sdpa_v2_paged_f16_specialized",
             attn_constants(&case, block_size, num_blocks),
         );
-        let pipeline = cache.get_or_build(&key).expect("prefill pipeline");
+        let pipeline = baked_build(&cache, &key).expect("prefill pipeline");
 
         if !common::dispatch_threadgroups(
             &device,
@@ -465,7 +468,7 @@ fn steel_paged_bk32_bd128_matches_ref() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let case = AttnCase {
         num_q_heads: 8,
@@ -510,7 +513,7 @@ fn steel_paged_bk32_bd128_matches_ref() {
         "attention_steel_paged_f16_bq32_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = cache.get_or_build(&key).expect("steel paged pipeline");
+    let pipeline = baked_build(&cache, &key).expect("steel paged pipeline");
 
     let nq_blocks = total_q.div_ceil(32);
     if !common::dispatch_threadgroups(
@@ -575,7 +578,7 @@ fn steel_nax_paged_bd128_matches_ref() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let case = AttnCase {
         num_q_heads: 8,
@@ -619,7 +622,7 @@ fn steel_nax_paged_bd128_matches_ref() {
         "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = cache.get_or_build(&key).expect("steel_nax_paged pipeline");
+    let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
     let nq_blocks = total_q.div_ceil(64);
     if !common::dispatch_threadgroups(
@@ -685,7 +688,7 @@ fn steel_nax_paged_limiter_bench() {
         return;
     };
     let device = detected.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("cache");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("cache");
 
     let case = AttnCase {
         num_q_heads: 24,
@@ -720,7 +723,7 @@ fn steel_nax_paged_limiter_bench() {
         "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = cache.get_or_build(&key).expect("steel_nax_paged pipeline");
+    let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     let tew = pipeline.threadExecutionWidth();
@@ -812,7 +815,7 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let NaxRopeCase {
         name,
@@ -875,19 +878,21 @@ fn run_rope_on_read_nax_case(case: NaxRopeCase) {
     ];
     // Rope-once kernel reads constants 1,2,5,6,8,9 + the cache; instantiated
     // per (dtype, head_dim) like the attention kernel.
-    let rope_pipe = cache
-        .get_or_build(&PipelineKey::new(
+    let rope_pipe = baked_build(
+        &cache,
+        &PipelineKey::new(
             "attention_steel_nax_paged",
             "rope_once_nax_f16_bd128_bs16",
             consts.clone(),
-        ))
-        .expect("rope_once_nax pipeline");
+        ),
+    )
+    .expect("rope_once_nax pipeline");
     let key = PipelineKey::new(
         "attention_steel_nax_paged",
         "attention_steel_nax_paged_f16_bq64_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = cache.get_or_build(&key).expect("steel_nax_paged pipeline");
+    let pipeline = baked_build(&cache, &key).expect("steel_nax_paged pipeline");
 
     // ── Pass 1: rope K ONCE into the scratch (k_buf read via k_tab). ──
     // Grid: x = num_kv_heads * block_size * (rot_dim/2), y = num_blocks.
@@ -1030,7 +1035,7 @@ fn steel_paged_limiter_bench() {
         return;
     };
     let device = detected.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("cache");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("cache");
 
     let case = AttnCase {
         num_q_heads: 24,
@@ -1065,7 +1070,7 @@ fn steel_paged_limiter_bench() {
         "attention_steel_paged_f16_bq32_bk32_bd128_wm4_wn1_bs16",
         consts,
     );
-    let pipeline = cache.get_or_build(&key).expect("pipeline");
+    let pipeline = baked_build(&cache, &key).expect("pipeline");
 
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     let tew = pipeline.threadExecutionWidth();
@@ -1151,7 +1156,7 @@ fn steel_prefill_rope_on_read_fold_bench() {
         return;
     };
     let device = detected.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("cache");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("cache");
 
     let head_dim = 64usize;
     let num_q_heads = 9usize;
@@ -1202,31 +1207,37 @@ fn steel_prefill_rope_on_read_fold_bench() {
         c.push(ConstantValue::uint(10, 1));
         c
     };
-    let off_pipe = cache
-        .get_or_build(&PipelineKey::new(
+    let off_pipe = baked_build(
+        &cache,
+        &PipelineKey::new(
             "attention_steel_paged",
             "attention_steel_paged_f16_bq32_bk16_bd64_wm4_wn1_bs16",
             base_consts(),
-        ))
-        .expect("off pipe");
-    let on_unfolded_pipe = cache
-        .get_or_build(&PipelineKey::new(
+        ),
+    )
+    .expect("off pipe");
+    let on_unfolded_pipe = baked_build(
+        &cache,
+        &PipelineKey::new(
             "attention_steel_paged",
             "attention_steel_paged_f16_bq32_bk16_bd64_wm4_wn1_bs16",
             ror_consts(),
-        ))
-        .expect("on unfolded pipe");
+        ),
+    )
+    .expect("on unfolded pipe");
     // GQA-folded variant is a separate, not-yet-built kernel; building a
     // missing symbol aborts inside Metal, so this is opt-in.
     let on_folded_pipe = if std::env::var("STEEL_BENCH_FOLD").is_ok() {
         Some(
-            cache
-                .get_or_build(&PipelineKey::new(
+            baked_build(
+                &cache,
+                &PipelineKey::new(
                     "attention_steel_paged",
                     "attention_steel_paged_ror_fold_f16_bq32_bk16_bd64_wm4_wn1_bs16",
                     ror_consts(),
-                ))
-                .expect("on folded pipe"),
+                ),
+            )
+            .expect("on folded pipe"),
         )
     } else {
         None
@@ -1347,23 +1358,25 @@ fn rmsnorm_unit_f16_matches_cpu() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
 
     // Gemma4 v_norm shapes: rows = T*kv_heads, width = head_dim.
     let (rows, width) = (24usize, 256usize);
     let eps = 1e-6f32;
     let x = pseudo(31, rows * width, 2.0);
 
-    let key = PipelineKey::new(
+    let constants = RmsNormConstants {
+        bucket_m: BucketM(rows as u32),
+        q_size: QSize(width as u32),
+        rms_norm_eps: RmsNormEps(eps),
+        weight_offset: 0.0,
+    };
+    let pipeline = baked_pipeline(
+        &device,
         "rmsnorm",
         "rmsnorm_unit_f16_specialized",
-        vec![
-            ConstantValue::uint(0, rows as u32),
-            ConstantValue::uint(1, width as u32),
-            ConstantValue::float(2, eps),
-        ],
-    );
-    let pipeline = cache.get_or_build(&key).expect("rmsnorm_unit pipeline");
+        constants.into(),
+    )
+    .expect("rmsnorm_unit pipeline");
     let in_buf = buf_f16(&device, &x);
     let out_buf = buf_zero(&device, rows * width * 2);
 
@@ -1408,19 +1421,17 @@ fn scalar_weight_mul_f16_matches_cpu() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
 
     let n = 3840usize;
     let scalar = 0.937f32; // a plausible layer_scalar value
     let x = pseudo(37, n, 3.0);
-    let key = PipelineKey::new(
+    let pipeline = baked_pipeline(
+        &device,
         "elementwise",
         "scalar_weight_mul_f16_specialized",
         Vec::new(),
-    );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("scalar_weight_mul pipeline");
+    )
+    .expect("scalar_weight_mul pipeline");
     let in_buf = buf_f16(&device, &x);
     let w_buf = buf_f16(&device, &[scalar]);
     let out_buf = buf_zero(&device, n * 2);
@@ -1434,6 +1445,80 @@ fn scalar_weight_mul_f16_matches_cpu() {
         max_err = max_err.max((got[i] - want).abs());
     }
     assert!(max_err < 5e-3, "scalar_weight_mul max_err {max_err}");
+}
+
+/// The rest of `elementwise.metal`'s f16 kernels (the O2 models run them bf16): the in-place
+/// residual add, the projection bias, and the scalar multiply, which writes nothing past the
+/// elements it bakes.
+#[test]
+fn elementwise_f16_kernels_match_cpu() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let half = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| f16::from_f32(x).to_f32()).collect() };
+    let check = |what: &str, got: &[f32], want: &[f32]| {
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 2e-3 * w.abs().max(1.0),
+                "{what}[{i}]: {g} vs {w}"
+            );
+        }
+    };
+    let (n, cols) = (3072usize, 768usize);
+    let (x, y) = (pseudo(41, n, 4.0), pseudo(43, n, 4.0));
+
+    let add = baked_pipeline(
+        &device,
+        "elementwise",
+        "residual_add_f16_specialized",
+        Vec::new(),
+    )
+    .expect("residual_add pipeline");
+    let (res, delta) = (buf_f16(&device, &x), buf_f16(&device, &y));
+    dispatch_1d(&device, &add, &[&res, &delta], n);
+    let want: Vec<f32> = half(&x).iter().zip(half(&y)).map(|(a, b)| a + b).collect();
+    check("residual_add", &read_f16(&res, n), &half(&want));
+
+    let bias_add = baked_pipeline(
+        &device,
+        "elementwise",
+        "bias_add_f16_specialized",
+        vec![ConstantValue::uint(0, cols as u32)],
+    )
+    .expect("bias_add pipeline");
+    let (input, bias, out) = (
+        buf_f16(&device, &x),
+        buf_f16(&device, &y[..cols]),
+        buf_zero(&device, n * 2),
+    );
+    dispatch_1d(&device, &bias_add, &[&input, &bias, &out], n);
+    let (hx, hb) = (half(&x), half(&y[..cols]));
+    let want: Vec<f32> = (0..n).map(|i| hx[i] + hb[i % cols]).collect();
+    check("bias_add", &read_f16(&out, n), &half(&want));
+
+    let (elements, scale) = (1000usize, 0.0625f32);
+    let constants = ScalarMulConstants {
+        scale,
+        elements: ElementCount(elements as u32),
+    };
+    let scalar_mul = baked_pipeline(
+        &device,
+        "elementwise",
+        "scalar_mul_f16_specialized",
+        constants.into(),
+    )
+    .expect("scalar_mul pipeline");
+    let (input, out) = (buf_f16(&device, &x), buf_f16(&device, &vec![9.0; 1024]));
+    dispatch_1d(&device, &scalar_mul, &[&out, &input], elements);
+    let got = read_f16(&out, 1024);
+    let want: Vec<f32> = half(&x[..elements]).iter().map(|v| v * scale).collect();
+    check("scalar_mul", &got[..elements], &half(&want));
+    assert!(
+        got[elements..].iter().all(|&g| g == 9.0),
+        "scalar_mul wrote past its elements"
+    );
 }
 
 // ── Rope-on-read (spans / position-independent KV) parity ────────────
@@ -1500,7 +1585,7 @@ fn run_rope_on_read_case(case: RopeCase) {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let RopeCase {
         name,
@@ -1553,9 +1638,7 @@ fn run_rope_on_read_case(case: RopeCase) {
         "attention_via_cache_v2_f16_specialized",
         consts,
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("decode rope-on-read pipeline");
+    let pipeline = baked_build(&cache, &key).expect("decode rope-on-read pipeline");
 
     // Decode: one query at q_abs = kv_len-1.
     let q_host = pseudo(107, num_heads * head_dim, 1.0);
@@ -1664,9 +1747,7 @@ fn run_rope_on_read_case(case: RopeCase) {
             "attention_prefill_sdpa_v2_paged_f16_specialized",
             pf_consts,
         );
-        let pf_pipeline = cache
-            .get_or_build(&pf_key)
-            .expect("prefill rope-on-read pipeline");
+        let pf_pipeline = baked_build(&cache, &pf_key).expect("prefill rope-on-read pipeline");
 
         let q_pf = pseudo(109, total_q * num_heads * head_dim, 1.0);
         let q_pf_buf = buf_f16(&device, &q_pf);
@@ -1786,7 +1867,7 @@ fn run_rope_on_read_gqa_shared_case(case: GqaRopeCase) {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let GqaRopeCase {
         name,
@@ -1847,9 +1928,7 @@ fn run_rope_on_read_gqa_shared_case(case: GqaRopeCase) {
         "attention_prefill_sdpa_gqa_shared_f16_specialized",
         consts,
     );
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("gqa_shared rope-on-read pipeline");
+    let pipeline = baked_build(&cache, &key).expect("gqa_shared rope-on-read pipeline");
 
     if !common::dispatch_threadgroups(
         &device,
@@ -1972,7 +2051,7 @@ fn run_rope_once_gqa_shared_case(case: GqaScratchRopeCase) {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let GqaScratchRopeCase {
         name,
@@ -2043,10 +2122,8 @@ fn run_rope_once_gqa_shared_case(case: GqaScratchRopeCase) {
         "attention_prefill_sdpa_gqa_shared_f16_specialized",
         consts,
     );
-    let rope_pipe = cache.get_or_build(&rope_key).expect("rope_once_gqa_shared");
-    let attn_pipe = cache
-        .get_or_build(&attn_key)
-        .expect("gqa_shared scratch attn");
+    let rope_pipe = baked_build(&cache, &rope_key).expect("rope_once_gqa_shared");
+    let attn_pipe = baked_build(&cache, &attn_key).expect("gqa_shared scratch attn");
 
     // ── Pass 1: rope K ONCE into the scratch (k_buf read via k_tab). ──
     // Grid: x = num_kv_heads * block_size * (rot_dim/2), y = num_blocks.
@@ -2199,7 +2276,7 @@ fn run_rope_on_read_steel_case(case: SteelRopeCase) {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let SteelRopeCase {
         name,
@@ -2274,17 +2351,13 @@ fn run_rope_on_read_steel_case(case: SteelRopeCase) {
         256 => "rope_once_steel_f16_bd256_bs16",
         _ => panic!("no rope_once_steel instantiation for hd={head_dim}"),
     };
-    let rope_pipe = cache
-        .get_or_build(&PipelineKey::new(
-            "attention_steel_paged",
-            rope_sym,
-            consts.clone(),
-        ))
-        .expect("rope_once_steel pipeline");
+    let rope_pipe = baked_build(
+        &cache,
+        &PipelineKey::new("attention_steel_paged", rope_sym, consts.clone()),
+    )
+    .expect("rope_once_steel pipeline");
     let key = PipelineKey::new("attention_steel_paged", symbol, consts);
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("steel rope-on-read pipeline");
+    let pipeline = baked_build(&cache, &key).expect("steel rope-on-read pipeline");
 
     // ── Pass 1: rope K ONCE into the scratch (k_buf read via k_tab). ──
     // Grid: x = num_heads * block_size * (rot_dim/2), y = num_blocks.
@@ -2453,7 +2526,7 @@ fn run_rope_on_read_steel_gqa_case(case: SteelGqaRopeCase) {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let SteelGqaRopeCase {
         name,
@@ -2530,17 +2603,13 @@ fn run_rope_on_read_steel_gqa_case(case: SteelGqaRopeCase) {
         256 => "rope_once_steel_f16_bd256_bs16",
         _ => panic!("no rope_once_steel instantiation for hd={head_dim}"),
     };
-    let rope_pipe = cache
-        .get_or_build(&PipelineKey::new(
-            "attention_steel_paged",
-            rope_sym,
-            consts.clone(),
-        ))
-        .expect("rope_once_steel pipeline");
+    let rope_pipe = baked_build(
+        &cache,
+        &PipelineKey::new("attention_steel_paged", rope_sym, consts.clone()),
+    )
+    .expect("rope_once_steel pipeline");
     let key = PipelineKey::new("attention_steel_paged", symbol, consts);
-    let pipeline = cache
-        .get_or_build(&key)
-        .expect("steel gqa rope-on-read pipeline");
+    let pipeline = baked_build(&cache, &key).expect("steel gqa rope-on-read pipeline");
 
     // ── Pass 1: rope K ONCE into the scratch (per kv-head; k_buf via k_tab). ──
     if !common::dispatch_threadgroups(
@@ -2689,7 +2758,7 @@ fn rope_append_store_unrotated_then_read_roundtrip() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let head_dim = 128usize;
     let rot_dim = 128usize;
@@ -2747,7 +2816,7 @@ fn rope_append_store_unrotated_then_read_roundtrip() {
             consts.push(ConstantValue::uint(9, v)); // ROPE_ROPE_ON_READ
         }
         let key = PipelineKey::new("rope", "rope_append_f16_specialized", consts);
-        let pipeline = cache.get_or_build(&key).expect("rope_append pipeline");
+        let pipeline = baked_build(&cache, &key).expect("rope_append pipeline");
 
         // kv_k/kv_v are WRITTEN via raw gpuAddress through the chunk tables,
         // so they ride in the dispatch slice to be made resident.
@@ -2849,7 +2918,7 @@ fn rope_append_store_unrotated_then_read_roundtrip() {
             ConstantValue::uint(9, 1),
         ];
         let key = PipelineKey::new("rope", "rope_append_f16_specialized", consts);
-        let pipeline = cache.get_or_build(&key).expect("rope_append pipeline");
+        let pipeline = baked_build(&cache, &key).expect("rope_append pipeline");
         if !common::dispatch_threadgroups(
             &device,
             &pipeline,
@@ -2909,7 +2978,7 @@ fn rope_append_store_unrotated_then_read_roundtrip() {
         "attention_via_cache_v2_f16_specialized",
         consts,
     );
-    let pipeline = cache.get_or_build(&key).expect("decode pipeline");
+    let pipeline = baked_build(&cache, &key).expect("decode pipeline");
     // attention BPC=0 expects k_cache[0] = layer base; bind the cache buffer
     // directly via a 1-entry chunk table whose entry is the buffer base.
     // kv_k/kv_v are read via raw gpuAddress through the chunk tables → ride
@@ -3002,7 +3071,7 @@ fn rope_on_read_decode_parity_bench() {
         return;
     };
     let device = di.device.clone();
-    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shaders");
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
 
     let head_dim = 128usize; // Llama/Qwen-class (general, not gemma4-specific)
     let num_heads = 32usize;
@@ -3046,24 +3115,28 @@ fn rope_on_read_decode_parity_bench() {
             ConstantValue::int(7, 0),
         ]
     };
-    let off_pipe = cache
-        .get_or_build(&PipelineKey::new(
+    let off_pipe = baked_build(
+        &cache,
+        &PipelineKey::new(
             "attention",
             "attention_via_cache_v2_f16_specialized",
             base_consts(),
-        ))
-        .expect("ROR-off pipeline");
+        ),
+    )
+    .expect("ROR-off pipeline");
     let mut on_consts = base_consts();
     on_consts.push(ConstantValue::uint(8, rot_dim as u32));
     on_consts.push(ConstantValue::uint(9, pair_off as u32));
     on_consts.push(ConstantValue::uint(10, 1));
-    let on_pipe = cache
-        .get_or_build(&PipelineKey::new(
+    let on_pipe = baked_build(
+        &cache,
+        &PipelineKey::new(
             "attention",
             "attention_via_cache_v2_f16_specialized",
             on_consts,
-        ))
-        .expect("ROR-on pipeline");
+        ),
+    )
+    .expect("ROR-on pipeline");
 
     let run = |pipeline: &common::Pipeline, ror: bool, bt: &Buffer, iters: usize| -> bool {
         // ROR-on binds cos_sin at slot 6 (the flag rides in block_table bit

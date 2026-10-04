@@ -26,6 +26,13 @@ pub fn compiled_hf_registry() -> &'static [&'static str] {
     COMPILED_HF_REGISTRY
 }
 
+// Every baked metal kernel the arches below name (`crate::__metal_bake::K_<key>`), each once,
+// beside the metallibs holding them — baked by the build script after it emits every arch.
+#[cfg(feature = "metal")]
+mod __metal_bake {
+    include!(concat!(env!("OUT_DIR"), "/metal_bake.rs"));
+}
+
 #[cfg(all(feature = "arch-commandr", any(feature = "cuda", feature = "metal")))]
 #[path = "arch/commandr.rs"]
 pub mod commandr;

@@ -17,6 +17,8 @@ use scratchy_quantizations::{
 };
 use scratchy_tensors::{DType, GpuTensor, WeightSource};
 
+use crate::weights::GpuWeights;
+
 // ---------------------------------------------------------------------------
 // MLX-affine int4 dequantize-at-load helper (WeightSource-generic, Metal-only)
 // ---------------------------------------------------------------------------
@@ -191,8 +193,8 @@ fn affine_dequant_b4_concat<W: WeightSource + ?Sized>(
 /// Load extension trait on the neutral [`AffineQuantLinear`]. Defined +
 /// impl'd here (orphan rule) since the type lives in `scratchy-layers`.
 pub trait MetalAffineQuantOps {
-    fn load<W: WeightSource + ?Sized>(
-        weights: &mut W,
+    fn load(
+        weights: &mut GpuWeights,
         prefix: &str,
         group_size: u32,
         bits: u32,
@@ -200,6 +202,57 @@ pub trait MetalAffineQuantOps {
     ) -> Result<Self>
     where
         Self: Sized;
+}
+
+/// Affine `scales` / `biases` the model's quantized kernels cannot read as stored: they read
+/// them as the model's `SCALE_DTYPE`, which the generated loader pins
+/// (`GpuWeights::set_rmsnorm_scale_dtype`), and bind them uncast.
+#[derive(Debug)]
+pub enum AffineScaleError {
+    Unpinned {
+        tensor: String,
+    },
+    Mismatch {
+        tensor: String,
+        on_disk: DType,
+        compiled: DType,
+    },
+}
+
+impl std::fmt::Display for AffineScaleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unpinned { tensor } => write!(f, "`{tensor}`: no scale dtype pinned"),
+            Self::Mismatch {
+                tensor,
+                on_disk,
+                compiled,
+            } => write!(
+                f,
+                "`{tensor}` is {on_disk:?} on disk; this build's quantized kernels read {compiled:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AffineScaleError {}
+
+/// `name` as stored, refused unless it is the pinned scale dtype ([`AffineScaleError`]).
+fn take_affine_scales(weights: &mut GpuWeights, name: String) -> Result<GpuTensor> {
+    let Some(compiled) = weights.rmsnorm_scale_dtype() else {
+        return Err(AffineScaleError::Unpinned { tensor: name }.into());
+    };
+    let t = weights.take_keep_dtype(&name)?;
+    if t.dtype() != compiled {
+        let on_disk = t.dtype();
+        return Err(AffineScaleError::Mismatch {
+            tensor: name,
+            on_disk,
+            compiled,
+        }
+        .into());
+    }
+    Ok(t)
 }
 
 impl MetalAffineQuantOps for AffineQuantLinear {
@@ -215,24 +268,18 @@ impl MetalAffineQuantOps for AffineQuantLinear {
     /// from the arch manifest) so a checkpoint quantized at different
     /// bits/group_size than this build's preset is rejected rather than
     /// silently mis-shaped.
-    fn load<W: WeightSource + ?Sized>(
-        weights: &mut W,
+    fn load(
+        weights: &mut GpuWeights,
         prefix: &str,
         group_size: u32,
         bits: u32,
         expected_in_features: u32,
     ) -> Result<Self> {
         let weight = weights.take(&format!("{prefix}.weight"))?;
-        // Scales / biases ship F16 on every mlx-community 4bit repo
-        // sampled in P0; scratchy-target-metal's qmv / qmm_t / qvm / qmm_n
-        // kernels now read them as `T_scale = half` regardless of the
-        // activation dtype and cast to `T_act` in-register.
-        // Use `take_keep_dtype` to skip the loader-side F16→BF16 cast
-        // that P1-P6 silently inherited from `set_target_dtype(BF16)`
-        // — that path truncated 3 mantissa bits per scale (10→7) and
-        // was the P10 late-token drift contributor this repair fixes.
-        let scales = weights.take_keep_dtype(&format!("{prefix}.scales"))?;
-        let affine_biases = weights.take_keep_dtype(&format!("{prefix}.biases"))?;
+        // The qmv / qmm_t / qvm / qmm_n kernels read scales and biases as
+        // the model's `SCALE_DTYPE` and cast to `T_act` in-register.
+        let scales = take_affine_scales(weights, format!("{prefix}.scales"))?;
+        let affine_biases = take_affine_scales(weights, format!("{prefix}.biases"))?;
         let bias_name = format!("{prefix}.bias");
         let linear_bias = if weights.contains(&bias_name) {
             Some(weights.take(&bias_name)?)
@@ -486,12 +533,7 @@ impl MetalNvfp4Ops for Nvfp4Linear {
 
 /// Load extension trait on the neutral [`AffineQuantEmbedding`].
 pub trait MetalAffineEmbedOps {
-    fn load<W: WeightSource + ?Sized>(
-        weights: &mut W,
-        prefix: &str,
-        group_size: u32,
-        bits: u32,
-    ) -> Result<Self>
+    fn load(weights: &mut GpuWeights, prefix: &str, group_size: u32, bits: u32) -> Result<Self>
     where
         Self: Sized;
 }
@@ -506,21 +548,12 @@ impl MetalAffineEmbedOps for AffineQuantEmbedding {
     /// `quantization_config` (parsed at compile time by the macro);
     /// `vocab_size` / `hidden_size` are derived from the weight
     /// tensor's shape.
-    fn load<W: WeightSource + ?Sized>(
-        weights: &mut W,
-        prefix: &str,
-        group_size: u32,
-        bits: u32,
-    ) -> Result<Self> {
+    fn load(weights: &mut GpuWeights, prefix: &str, group_size: u32, bits: u32) -> Result<Self> {
         let weight = weights.take(&format!("{prefix}.weight"))?;
-        // Scales / biases ship F16 on every mlx-community 4bit repo
-        // sampled in P0; scratchy-target-metal's affine_embed kernel reads
-        // them as `T_scale = half` and casts to T_act in-register.
-        // `take_keep_dtype` skips the
-        // loader-side F16→BF16 cast — see `AffineQuantLinear::load`
-        // for the full reasoning.
-        let scales = weights.take_keep_dtype(&format!("{prefix}.scales"))?;
-        let affine_biases = weights.take_keep_dtype(&format!("{prefix}.biases"))?;
+        // The affine_embed kernel reads scales and biases as the model's
+        // `SCALE_DTYPE` and casts to `T_act` in-register.
+        let scales = take_affine_scales(weights, format!("{prefix}.scales"))?;
+        let affine_biases = take_affine_scales(weights, format!("{prefix}.biases"))?;
         let pack_factor = (32 / bits) as usize;
         let vocab_size = weight.dim(0);
         let hidden_size = weight.dim(1) * pack_factor;
@@ -552,8 +585,8 @@ impl MetalAffineEmbedOps for AffineQuantEmbedding {
 /// calls (in model crates, which depend on targets/cuda but not on
 /// targets/metal directly) resolve.
 pub trait MetalLinearLayerOps {
-    fn load_affine_quant<W: WeightSource + ?Sized>(
-        weights: &mut W,
+    fn load_affine_quant(
+        weights: &mut GpuWeights,
         prefix: &str,
         group_size: u32,
         bits: u32,
@@ -605,8 +638,8 @@ impl MetalLinearLayerOps for LinearLayer {
     /// `AffineQuantLinear::load`. Forward-time qmv dispatch consumer
     /// (P3+) — the macro currently emits `load_affine_dequant_as_dense`
     /// instead, which dequantizes at load time and returns `Dense`.
-    fn load_affine_quant<W: WeightSource + ?Sized>(
-        weights: &mut W,
+    fn load_affine_quant(
+        weights: &mut GpuWeights,
         prefix: &str,
         group_size: u32,
         bits: u32,

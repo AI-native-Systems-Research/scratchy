@@ -4,173 +4,13 @@
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
+#include "baked.h"
 using namespace metal;
 
 // MLX's pragma helpers from `mlx/backend/metal/kernels/utils.h`.
 #ifndef MLX_MTL_PRAGMA_UNROLL
 #define MLX_MTL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
 #endif
-
-/// Fused Gate-Up-SiLU-Mul kernel for SwiGLU activation
-///
-/// Pattern: silu(gate_proj(x)) * up_proj(x)
-/// Where: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
-///
-/// This fusion eliminates memory round-trips by computing the activation
-/// in a single pass. Critical for memory-bound MLP layers on Apple Silicon.
-///
-/// Two variants:
-/// 1. Separate GEMMs: Takes gate_out and up_out as inputs
-/// 2. Fused GEMM: Takes concatenated gate_up output [B, 2*I] as input
-///
-/// Grid: (M, 1, 1) where M = batch_size
-/// Threadgroup: (min(N, 1024), 1, 1) where N = intermediate_size
-
-/// SiLU activation: x * sigmoid(x)
-inline float silu(float x) {
-    return x / (1.0f + exp(-x));
-}
-
-/// Variant 1: Separate gate and up outputs
-/// Input: gate_out [M, N], up_out [M, N]
-/// Output: silu(gate_out) * up_out [M, N]
-kernel void fused_gate_up_silu_mul_f16(
-    device const half* gate_out [[buffer(0)]],
-    device const half* up_out [[buffer(1)]],
-    device half* output [[buffer(2)]],
-    constant uint& M [[buffer(3)]],
-    constant uint& N [[buffer(4)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= M) return;
-    
-    for (uint i = tid; i < N; i += tg_size) {
-        float gate = float(gate_out[gid * N + i]);
-        float up = float(up_out[gid * N + i]);
-        output[gid * N + i] = half(silu(gate) * up);
-    }
-}
-
-/// Variant 2: Fused gate_up output (concatenated in column dimension)
-/// Input: gate_up [M, 2*N] where first N columns are gate, next N are up
-/// Output: silu(gate) * up [M, N]
-kernel void fused_gate_up_silu_mul_concat_f16(
-    device const half* gate_up [[buffer(0)]],
-    device half* output [[buffer(1)]],
-    constant uint& M [[buffer(2)]],
-    constant uint& N [[buffer(3)]],  // intermediate_size (not 2*N)
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= M) return;
-    
-    for (uint i = tid; i < N; i += tg_size) {
-        float gate = float(gate_up[gid * (2 * N) + i]);
-        float up = float(gate_up[gid * (2 * N) + N + i]);
-        output[gid * N + i] = half(silu(gate) * up);
-    }
-}
-
-/// BF16 variant - separate outputs
-kernel void fused_gate_up_silu_mul_bf16(
-    device const float* gate_out [[buffer(0)]],
-    device const float* up_out [[buffer(1)]],
-    device float* output [[buffer(2)]],
-    constant uint& M [[buffer(3)]],
-    constant uint& N [[buffer(4)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= M) return;
-    
-    for (uint i = tid; i < N; i += tg_size) {
-        float gate = gate_out[gid * N + i];
-        float up = up_out[gid * N + i];
-        output[gid * N + i] = silu(gate) * up;
-    }
-}
-
-/// BF16 variant - concatenated input
-kernel void fused_gate_up_silu_mul_concat_bf16(
-    device const float* gate_up [[buffer(0)]],
-    device float* output [[buffer(1)]],
-    constant uint& M [[buffer(2)]],
-    constant uint& N [[buffer(3)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= M) return;
-    
-    for (uint i = tid; i < N; i += tg_size) {
-        float gate = gate_up[gid * (2 * N) + i];
-        float up = gate_up[gid * (2 * N) + N + i];
-        output[gid * N + i] = silu(gate) * up;
-    }
-}
-
-/// Vectorized variant (half4) for better memory bandwidth
-/// Requires N to be multiple of 4
-kernel void fused_gate_up_silu_mul_f16_vec4(
-    device const half4* gate_out [[buffer(0)]],
-    device const half4* up_out [[buffer(1)]],
-    device half4* output [[buffer(2)]],
-    constant uint& M [[buffer(3)]],
-    constant uint& N_div4 [[buffer(4)]],  // N / 4
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= M) return;
-    
-    for (uint i = tid; i < N_div4; i += tg_size) {
-        half4 gate = gate_out[gid * N_div4 + i];
-        half4 up = up_out[gid * N_div4 + i];
-        
-        // Apply SiLU element-wise
-        float4 gate_f = float4(gate);
-        float4 up_f = float4(up);
-        float4 result;
-        result.x = silu(gate_f.x) * up_f.x;
-        result.y = silu(gate_f.y) * up_f.y;
-        result.z = silu(gate_f.z) * up_f.z;
-        result.w = silu(gate_f.w) * up_f.w;
-        
-        output[gid * N_div4 + i] = half4(result);
-    }
-}
-
-/// Vectorized concatenated variant
-kernel void fused_gate_up_silu_mul_concat_f16_vec4(
-    device const half4* gate_up [[buffer(0)]],
-    device half4* output [[buffer(1)]],
-    constant uint& M [[buffer(2)]],
-    constant uint& N_div4 [[buffer(3)]],  // N / 4
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= M) return;
-    
-    for (uint i = tid; i < N_div4; i += tg_size) {
-        half4 gate = gate_up[gid * (2 * N_div4) + i];
-        half4 up = gate_up[gid * (2 * N_div4) + N_div4 + i];
-        
-        float4 gate_f = float4(gate);
-        float4 up_f = float4(up);
-        float4 result;
-        result.x = silu(gate_f.x) * up_f.x;
-        result.y = silu(gate_f.y) * up_f.y;
-        result.z = silu(gate_f.z) * up_f.z;
-        result.w = silu(gate_f.w) * up_f.w;
-        
-        output[gid * N_div4 + i] = half4(result);
-    }
-}
 
 /// GELU variant for Gemma2/3 models
 /// GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
@@ -184,29 +24,6 @@ inline float gelu_approx(float x) {
     float inner = clamp(sqrt_2_over_pi * (x + coeff * x3), -15.0f, 15.0f);
     return 0.5f * x * (1.0f + tanh(inner));
 }
-
-/// Fused Gate-Up-GELU-Mul for Gemma models
-kernel void fused_gate_up_gelu_mul_f16(
-    device const half* gate_out [[buffer(0)]],
-    device const half* up_out [[buffer(1)]],
-    device half* output [[buffer(2)]],
-    constant uint& M [[buffer(3)]],
-    constant uint& N [[buffer(4)]],
-    uint gid [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= M) return;
-    
-    for (uint i = tid; i < N; i += tg_size) {
-        float gate = float(gate_out[gid * N + i]);
-        float up = float(up_out[gid * N + i]);
-        output[gid * N + i] = half(gelu_approx(gate) * up);
-    }
-}
-
-// Note: Metal does not have erf() function, so exact GELU is not available
-// Use approximate GELU instead (gelu_approx above)
 
 // ============================================================================
 // fused_gate_up_silu_mul_decode_f16_specialized
@@ -234,7 +51,7 @@ kernel void fused_gate_up_gelu_mul_f16(
 //   buffer(1) = input  [1, K]
 //   buffer(2) = weight [2*N, K]   packed [gate; up]
 //
-// Function constants:
+// Constants (compiled in):
 //   3 = M (uint) — must be 1 for this kernel; defensive early-out.
 //   4 = N (uint) — INTERMEDIATE_SIZE.
 //   5 = K (uint) — Q_SIZE / hidden_size.
@@ -247,16 +64,17 @@ kernel void fused_gate_up_gelu_mul_f16(
 //
 // Empirically validated against the MLX reference; copy faithful to
 // the upstream kernel except for the fusion epilogue (silu(gate)*up
-// instead of writing both rows separately) and the function-constant
+// instead of writing both rows separately) and the baked
 // shape arguments instead of MLX's runtime constants.
 
-constant uint FUSED_MLP_DECODE_M [[function_constant(3)]];
-constant uint FUSED_MLP_DECODE_N [[function_constant(4)]];
-constant uint FUSED_MLP_DECODE_K [[function_constant(5)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, FUSED_MLP_DECODE_M, 3);
+SCRATCHY_CONSTANT_OPTIONAL(uint, FUSED_MLP_DECODE_N, 4);
+SCRATCHY_CONSTANT_OPTIONAL(uint, FUSED_MLP_DECODE_K, 5);
 // GELU (Gemma GeGLU) vs SiLU (SwiGLU) activation selector. Default
 // false (SiLU) so existing FusedGateUpSiluMul stays bit-identical.
-constant bool FUSED_MLP_DECODE_IS_GELU [[function_constant(9)]];
+SCRATCHY_CONSTANT_OPTIONAL(bool, FUSED_MLP_DECODE_IS_GELU, 9);
 
+#if SCRATCHY_COMPILES(fused_gate_up_silu_mul_decode_f16_specialized)
 kernel void fused_gate_up_silu_mul_decode_f16_specialized(
     device       half* output  [[buffer(0)]],   // [1, N]
     device const half* input   [[buffer(1)]],   // [1, K]
@@ -422,11 +240,13 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
         }
     }
 }
+#endif
 
 /// BF16 specialized variant of the M=1 decode fused MLP. Direct
 /// translation of `..._decode_f16_specialized` with `bfloat` device
 /// pointers and `bfloat` thread-local buffers; accumulators stay
 /// f32 (matching the f16 variant's accumulation semantics).
+#if SCRATCHY_COMPILES(fused_gate_up_silu_mul_decode_bf16_specialized)
 kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
     device       bfloat* output  [[buffer(0)]],
     device const bfloat* input   [[buffer(1)]],
@@ -576,6 +396,7 @@ kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
         }
     }
 }
+#endif
 
 // ============================================================================
 // fused_gate_up_silu_mul_gemm_steel_{f16,bf16}_specialized
@@ -598,7 +419,7 @@ kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
 //   buffer(1) = input   [M, K]            post-rmsnorm hidden
 //   buffer(2) = weight  [2*N, K]          packed [gate; up]
 //
-// Function constants (distinct from the 8x8 variant's 0/1/2 + the
+// Baked constants (distinct from the 8x8 variant's 0/1/2 + the
 // decode variant's 3/4/5 so the same library can host all three
 // kernels without colliding):
 //   6 = M     (uint) — bucket_m
@@ -631,10 +452,10 @@ kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
 //   …, 8192} are all multiples of 16). If a future model breaks
 //   that, add a K-tail load_safe equivalent à la steel/gemm.h.
 
-constant uint FUSED_MLP_STEEL_M [[function_constant(6)]];
-constant uint FUSED_MLP_STEEL_N [[function_constant(7)]];
-constant uint FUSED_MLP_STEEL_K [[function_constant(8)]];
-constant bool FUSED_MLP_STEEL_IS_GELU [[function_constant(10)]];
+SCRATCHY_CONSTANT_OPTIONAL(uint, FUSED_MLP_STEEL_M, 6);
+SCRATCHY_CONSTANT_OPTIONAL(uint, FUSED_MLP_STEEL_N, 7);
+SCRATCHY_CONSTANT_OPTIONAL(uint, FUSED_MLP_STEEL_K, 8);
+SCRATCHY_CONSTANT_OPTIONAL(bool, FUSED_MLP_STEEL_IS_GELU, 10);
 
 #define STEEL_BM   32
 #define STEEL_BN   32
@@ -653,6 +474,7 @@ inline float silu_steel(float x) {
     return x / (1.0f + exp(-x));
 }
 
+#if SCRATCHY_COMPILES(fused_gate_up_silu_mul_gemm_steel_f16_specialized)
 kernel void fused_gate_up_silu_mul_gemm_steel_f16_specialized(
     device       half* output  [[buffer(0)]],   // [M, N]
     device const half* input   [[buffer(1)]],   // [M, K]
@@ -832,11 +654,13 @@ kernel void fused_gate_up_silu_mul_gemm_steel_f16_specialized(
         }
     }
 }
+#endif
 
 /// BF16 mirror of `fused_gate_up_silu_mul_gemm_steel_f16_specialized`.
 /// `simdgroup_bfloat8x8` MMA tiles (Metal 3.1+, native on M3+).
 /// Accumulators stay `simdgroup_float8x8` — bf16→f32 accumulation is
 /// the standard pattern for matmul kernels and matches CUDA's bf16 GEMM.
+#if SCRATCHY_COMPILES(fused_gate_up_silu_mul_gemm_steel_bf16_specialized)
 kernel void fused_gate_up_silu_mul_gemm_steel_bf16_specialized(
     device       bfloat* output  [[buffer(0)]],
     device const bfloat* input   [[buffer(1)]],
@@ -1003,4 +827,5 @@ kernel void fused_gate_up_silu_mul_gemm_steel_bf16_specialized(
         }
     }
 }
+#endif
 

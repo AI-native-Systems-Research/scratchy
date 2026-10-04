@@ -20,6 +20,40 @@ pub enum ConstantType {
     /// function constants are `align_Q` / `align_K` / `has_mask` /
     /// `do_causal` / `has_sinks` (the steel_attention family).
     Bool,
+    /// A `uint` the tape variant supplies ([`TapeVariant::cap`]): its KV cap rung, the block
+    /// table's row stride.
+    KvCap,
+    /// A `uint` the tape variant supplies ([`TapeVariant::tq_heads`]): the query heads one
+    /// TurboQuant decode threadgroup serves.
+    TqHeads,
+}
+
+/// The values a tape variant binds ([`ConstantType::KvCap`], [`ConstantType::TqHeads`]). One tape
+/// body serves every variant of its bucket; each variant's kernels are baked with its own values,
+/// and the device picks the variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TapeVariant {
+    pub cap: super::ids::MaxBlocksPerSeq,
+    /// `None`: the tape has no TurboQuant decode attention.
+    pub tq_heads: Option<super::ids::TqDecodeHeads>,
+}
+
+/// A constant bound to a value its tape variant does not carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnboundConstant {
+    pub slot: ConstSlot,
+    pub ty: ConstantType,
+}
+
+impl std::fmt::Display for UnboundConstant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { slot, ty } = self;
+        write!(
+            f,
+            "constant slot {} is {ty:?}, which its tape variant does not bind",
+            slot.0
+        )
+    }
 }
 
 /// `[[function_constant(N)]]` slot index newtype.
@@ -88,6 +122,41 @@ impl ConstantValue {
             index: index.into().0,
             bits: u32::from(value),
             ty: ConstantType::Bool,
+        }
+    }
+
+    /// The tape variant's KV cap ([`ConstantType::KvCap`]).
+    pub fn kv_cap(index: impl Into<ConstSlot>) -> Self {
+        Self {
+            index: index.into().0,
+            bits: 0,
+            ty: ConstantType::KvCap,
+        }
+    }
+
+    /// The tape variant's TurboQuant decode heads ([`ConstantType::TqHeads`]).
+    pub fn tq_heads(index: impl Into<ConstSlot>) -> Self {
+        Self {
+            index: index.into().0,
+            bits: 0,
+            ty: ConstantType::TqHeads,
+        }
+    }
+
+    /// `self` with a variant-bound value replaced by `variant`'s; every other constant as it is.
+    pub fn resolve(self, variant: TapeVariant) -> Result<Self, UnboundConstant> {
+        let unbound = UnboundConstant {
+            slot: ConstSlot(self.index),
+            ty: self.ty,
+        };
+        match self.ty {
+            ConstantType::KvCap => Ok(Self::uint(self.index, variant.cap.get())),
+            ConstantType::TqHeads => (variant.tq_heads)
+                .map(|h| Self::uint(self.index, h.get()))
+                .ok_or(unbound),
+            ConstantType::UInt | ConstantType::Int | ConstantType::Float | ConstantType::Bool => {
+                Ok(self)
+            }
         }
     }
 }
