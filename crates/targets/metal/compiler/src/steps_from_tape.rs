@@ -1162,6 +1162,34 @@ impl Recording<'_> {
         let out = self.colour(i)?;
         let (gate_slot, up_slot) = (self.colour(gate)?, self.colour(up)?);
         match kernel {
+            F::FusedGateUpSiluMul | F::FusedGateUpGeluMul
+                if matches!(self.matmul(gate, None)?.step, MetalStep::AffineQmm(_)) =>
+            {
+                // The gate matvec's command, writing the activation's rows; the up's weight after
+                // the gate's.
+                let (mut g, mut u) = (self.matmul(gate, None)?, self.matmul(up, None)?);
+                let (MetalStep::AffineQmm(mut mm), MetalStep::AffineQmm(um)) = (g.step, u.step)
+                else {
+                    return Err(self.no(i, Refused::FusionShape));
+                };
+                if (mm.input, mm.n, mm.k, mm.group_size, mm.bits)
+                    != (um.input, um.n, um.k, um.group_size, um.bits)
+                {
+                    return Err(self.no(i, Refused::FusionShape));
+                }
+                mm.output = out;
+                let act = match kernel {
+                    F::FusedGateUpGeluMul => st::GatedAct::Gelu,
+                    _ => st::GatedAct::Silu,
+                };
+                g.sites.append(&mut u.sites);
+                Ok(em(
+                    MetalStep::AffineGatedQmv(mm, act),
+                    &[mm.input],
+                    &[out],
+                    g.sites,
+                ))
+            }
             F::FusedGateUpSiluMul | F::FusedGateUpGeluMul => {
                 // The gate projection's input and weight layer carry the fused command.
                 let input = self.read(gate, 0)?;

@@ -376,6 +376,7 @@ mod tests {
                 KernelId::AffineQmvQuad
                 | KernelId::AffineQmvFast
                 | KernelId::AffineQmv
+                | KernelId::AffineQmvGated
                 | KernelId::AffineQmvWide
                 | KernelId::AffineQmmT
                 | KernelId::AffineQmmTSplitK
@@ -535,6 +536,7 @@ mod tests {
             KernelId::AffineQmvQuad
             | KernelId::AffineQmvFast
             | KernelId::AffineQmv
+            | KernelId::AffineQmvGated
             | KernelId::AffineQmvWide
             | KernelId::AffineQmmT
             | KernelId::AffineQmmTSplitK

@@ -2543,6 +2543,67 @@ fn lower_one(
                 layer_offset,
             )
         }
+        I::AffineGatedQmv(g, act) => {
+            if bucket_m != 1 {
+                return Err(LoweringError::GatedMatvecRows { bucket_m });
+            }
+            let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
+            let codes = super::kernel_constants::AffineCodes::of(profile, bits);
+            let constants = super::kernel_constants::AffineGatedQmvConstants {
+                qmv: super::kernel_constants::AffineQmvConstants {
+                    k: super::ids::KDimI32(k as i32),
+                    n: super::ids::NDimI32(n as i32),
+                    codes,
+                },
+                act: *act,
+            };
+            // `affine_qmv_fast`'s shape rule (`pick_qmv_kernel`), for both matvecs.
+            let fast = if n.is_multiple_of(8) && k.is_multiple_of(512) {
+                "_fast"
+            } else {
+                ""
+            };
+            let (d, s) = (
+                dequant_infix(dequant_dtype_for(p)),
+                scale_infix(scale_dtype_for(p)),
+            );
+            let symbol = format!("affine_qmv_gated{fast}_{d}_s_{s}_gs_{gs}_b_{bits}");
+            let layer = super::ids::LayerId(g.layer.get() + layer_offset);
+            let mut bindings = affine_qmm_bindings(
+                g.input.get(),
+                g.output.get(),
+                layer,
+                w.of(WeightKind::Linear, 0)?,
+            );
+            let up = affine_weight_bindings(w.of(WeightKind::Linear, 1)?, layer);
+            bindings.extend(up.map(|b| match b {
+                Binding::Source {
+                    ix,
+                    which,
+                    layer,
+                    binding_index,
+                } => Binding::Source {
+                    ix,
+                    which,
+                    layer,
+                    binding_index: binding_index + 5,
+                },
+                other => other,
+            }));
+            LoweredCommand {
+                kernel: KernelId::AffineQmvGated,
+                library: "quantized_qmv",
+                function: leak_symbol(symbol),
+                constants: Vec::<ConstantValue>::from(constants).into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (1, n / 8, 1),
+                    threads_per_threadgroup: (32, 4, 1),
+                    m_scaling: None,
+                },
+                bindings: baked(bindings),
+                gemm_dims: None,
+            }
+        }
         // Dense GeGLU (Gemma3 text MLP) — same fused gate/up GEMM +
         // activation-mul kernel as SiLU; the `IS_GELU` fn-const flips
         // the epilogue to gelu_approx (tanh). The quant GeGLU path
@@ -6607,7 +6668,7 @@ fn lower_moe_step(
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
-            let constants = AffineGatedQmvConstants { gather, act }.into();
+            let constants = AffineGatedQmvConstants { qmv: gather, act }.into();
             vec![cmd(
                 kernel,
                 "quantized_qmv",

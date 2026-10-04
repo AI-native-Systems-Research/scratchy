@@ -912,6 +912,7 @@ fn is_fused(id: KernelId) -> bool {
         id,
         K::FusedAddRmsNorm
             | K::FusedGateUpSiluMul
+            | K::AffineQmvGated
             | K::RopeAppendNormed
             | K::NormAddScalarMul
             | K::AttentionViaCacheTq
@@ -948,6 +949,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineQmvFast
         | K::AffineQmvWide
         | K::AffineQmv
+        | K::AffineQmvGated
         | K::AffineQmmT
         | K::AffineGatherQmmT
         | K::AffineGatherQmmTNax

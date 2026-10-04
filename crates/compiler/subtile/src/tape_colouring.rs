@@ -17,6 +17,7 @@
 //! - free colours return to a pool keyed by the output's `(rows, cols)` and are handed out
 //!   smallest first;
 //! - the inputs of a step that reads ACROSS its input stay live through that step;
+//! - a step a fold absorbed reads its operands where its driver's fused command runs;
 //! - the result's colour is never reused;
 //! - a two-output step's second buffer gets its own colour, never reused;
 //! - the finished colouring is checked: two non-aliased holders of one colour must be live at
@@ -436,9 +437,11 @@ pub fn colour_tape(
         }
     }
 
-    // Last use per OWNER, at step granularity; a read of an off-arena value reads what it carries.
+    // Last use per OWNER, at step granularity; a read of an off-arena value reads what it carries,
+    // and an absorbed step reads where its driver runs.
     let mut last_use: Vec<usize> = (0..n).collect();
     for (r, s) in steps.iter().enumerate() {
+        let r = absorbed_into[r].map_or(r, |w| w.max(r));
         for operand in &s.operands {
             if let Operand::Step(q) = operand {
                 let own = BTreeSet::from([owner[*q]]);
@@ -787,6 +790,31 @@ mod tests {
         assert_eq!(c, [1, 2, 3, 1]);
         assert_eq!(colouring.count().get(), 4);
         assert_eq!(colouring.result().index(), 1);
+    }
+
+    /// A fused command reads its absorbed steps' operands where it runs: a step between them may
+    /// not take an operand's colour, though no unfused step reads it any more.
+    #[test]
+    fn an_absorbed_steps_operand_stays_live_to_its_driver() {
+        let ops = || {
+            vec![
+                gemm(64, vec![Ext(0), Ext(1)]),
+                gemm(64, vec![Op(0), Ext(1)]),
+                gemm(64, vec![Ext(0), Ext(1)]),
+                op(MUL, 1, vec![Op(1), Op(2)]),
+            ]
+        };
+        let src = [(1, 64), (64, 64)];
+        // Unfused, op 0's last reader is op 1, so op 2 takes its colour.
+        let (c, _) = colour(&src, weights(2), ops(), no_folds).unwrap();
+        assert_eq!(c[2], c[0]);
+        // Op 1 inside op 3's command reads op 0 at op 3.
+        let absorbed = |s: &[SlotId]| FoldFacts {
+            absorbed: [(s[1], s[3])].into(),
+            ..FoldFacts::default()
+        };
+        let (c, _) = colour(&src, weights(2), ops(), absorbed).unwrap();
+        assert_ne!(c[2], c[0]);
     }
 
     #[test]

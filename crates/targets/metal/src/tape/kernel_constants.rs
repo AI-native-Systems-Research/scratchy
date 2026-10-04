@@ -681,22 +681,23 @@ impl From<AffineGatherQmvConstants> for Vec<ConstantValue> {
     }
 }
 
-/// `KernelId::MoeGateUpAct` (`affine_gather_qmv_gated[_fast]_*`): the gate projection's
-/// [`AffineGatherQmvConstants`] (the up's are the same) and the activation (slot 3: 0 SiLU,
-/// 1 GELU).
-pub struct AffineGatedQmvConstants {
-    pub gather: AffineGatherQmvConstants,
+/// `KernelId::MoeGateUpAct` (`affine_gather_qmv_gated[_fast]_*`, `Q` =
+/// [`AffineGatherQmvConstants`]) and `KernelId::AffineQmvGated` (`affine_qmv_gated[_fast]_*`,
+/// `Q` = [`AffineQmvConstants`]): the gate projection's matvec constants (the up's are the same)
+/// and the activation (slot 3: 0 SiLU, 1 GELU).
+pub struct AffineGatedQmvConstants<Q> {
+    pub qmv: Q,
     pub act: crate::tape::step::GatedAct,
 }
 
-impl From<AffineGatedQmvConstants> for Vec<ConstantValue> {
-    fn from(c: AffineGatedQmvConstants) -> Self {
+impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<ConstantValue> {
+    fn from(c: AffineGatedQmvConstants<Q>) -> Self {
         use crate::tape::step::GatedAct;
         let act = match c.act {
             GatedAct::Silu => 0,
             GatedAct::Gelu => 1,
         };
-        let mut v: Vec<ConstantValue> = c.gather.into();
+        let mut v: Vec<ConstantValue> = c.qmv.into();
         v.push(ConstantValue::int(ConstSlot(3), act));
         v
     }
