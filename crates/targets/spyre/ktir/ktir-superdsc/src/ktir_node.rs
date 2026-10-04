@@ -221,6 +221,16 @@ pub enum Program {
     /// REFUSES that shape by name rather than emitting it; the shipped attention's answer — pad the
     /// row count to a stick multiple and loop whole 64×64 tiles — is named in the refusal.
     Transpose,
+    /// A ROW SOFTMAX over `[rows, cols]` — `exp(x − rowmax(x)) / rowsum(exp(x − rowmax(x)))`,
+    /// written longhand as max-reduce → broadcast-sub → exp → sum-reduce → broadcast-div.
+    /// The MoE router's `RouteSoftmax` (gemma: softmax over the scaled top-k scores)
+    /// and `RouteRenorm` (mixtral: scores / rowsum(scores), the same chain minus the
+    /// exp) lower to it. ONE tensor parameter (the scores); the row-max and row-sum
+    /// live in one-stick synthetics, exactly as rmsnorm's mean does.
+    RouteSoftmax,
+    /// `x / rowsum(x, dim=-1)` — mixtral's renormalised top-k scores, the softmax
+    /// chain minus the stability subtract and the exp. ONE tensor parameter.
+    RouteRenorm,
 }
 
 /// One buffer of a bundle, as the CALLER numbers it.

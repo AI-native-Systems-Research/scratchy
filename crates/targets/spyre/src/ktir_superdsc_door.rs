@@ -33,8 +33,8 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
-    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at, scalarmul,
-    silumul, split_out,
+    Error, Region, attn_at, elementwise, err, lmlast, matmul, regions, rmsnorm, rope_at,
+    route_renorm, route_softmax, scalarmul, silumul, split_out,
 };
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
@@ -123,6 +123,11 @@ pub fn lower(
         Program::RmsNorm => rmsnorm(name, k, &r, sym_id_base, layout),
         Program::RmsNormUnit => lk::rmsnorm_unit(name, k, &r, sym_id_base, layout),
         Program::TanhSoftCap => lk::tanhsoftcap(name, k, &r, sym_id_base, layout),
+        // The router's row softmax/renorm — no geometry door to cross, no registry
+        // const to resolve: the whole chain is data-driven and the body is the
+        // rmsnorm's structure with the softmax's primitives in it.
+        Program::RouteSoftmax => route_softmax(name, &r, sym_id_base, layout),
+        Program::RouteRenorm => route_renorm(name, &r, sym_id_base, layout),
         Program::ScalarWeightMul => lk::scalarweightmul(name, &r, sym_id_base, layout),
         Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
         Program::ScalarMul => scalarmul(name, k, &r, sym_id_base, layout),

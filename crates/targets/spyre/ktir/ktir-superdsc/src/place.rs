@@ -58,6 +58,13 @@ pub enum SynthRole {
     /// `tanh(x/cap)` — the divided half of `cap·tanh(x/cap)`, one `[rows, cols]`
     /// buffer reused as its own tanh's destination.
     Tanhc,
+    // ── row-softmax scratch (the MoE router's RouteSoftmax / RouteRenorm) ──
+    /// `rowmax(x)` — one `[rows, stick]` reduce, the softmax's stability subtractend.
+    RMax,
+    /// `x − rowmax(x)` — the shifted scores, one `[rows, cols]` buffer.
+    RSub,
+    /// `rowsum(exp(x − rowmax(x)))` — one `[rows, stick]` reduce, the softmax's denominator.
+    RDen,
     // ── the HARDWARE GATHER's contiguous destinations ──
     //
     // ⭐⭐⭐ THE TWO SCRATCHES THAT GIVE THE FOLD A REQUEST AXIS. A fold pass reads the paged KV pool,
@@ -124,6 +131,9 @@ impl fmt::Display for SynthRole {
             Self::Rinv => f.write_str("rinv"),
             Self::Xn => f.write_str("xn"),
             Self::Tanhc => f.write_str("tanhc"),
+            Self::RMax => f.write_str("rmax"),
+            Self::RSub => f.write_str("rsub"),
+            Self::RDen => f.write_str("rden"),
             Self::GatherKt => f.write_str("gkt"),
             Self::GatherV => f.write_str("gv"),
             Self::NewKt => f.write_str("newkt"),

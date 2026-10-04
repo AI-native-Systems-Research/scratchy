@@ -31,6 +31,7 @@ pub mod matmul;
 pub mod pointwise;
 pub mod reduce;
 pub mod rmsnorm;
+pub mod softmax;
 
 pub use attn::assemble_attn;
 pub use matmul::{
@@ -50,3 +51,4 @@ pub use reduce::{
     reduce_opspec, reduce_opspec_df, reduce_opspec_off,
 };
 pub use rmsnorm::{assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};
+pub use softmax::{assemble_row_renorm, assemble_row_softmax};

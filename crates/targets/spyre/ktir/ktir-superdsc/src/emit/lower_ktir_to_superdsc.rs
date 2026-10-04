@@ -43,7 +43,8 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
-    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap,
+    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_row_renorm, assemble_row_softmax,
+    assemble_tanhsoftcap,
 };
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
@@ -5125,6 +5126,62 @@ pub fn tanhsoftcap(
         &x,
         PlaceId::Act(t),
         &cap_const,
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::RouteSoftmax`] —
+/// `out = softmax(x, dim=-1)` over `[rows, cols]`, the MoE router's score softmax.
+///
+/// ONE tensor parameter (the scores), no registry const — the whole chain is
+/// data-driven — and the body is [`assemble_row_softmax`]: the rmsnorm structure
+/// with `max`/`exp`/`sum`/`realdiv` in place of `mean`/`rsqrt`/`multiply`.
+pub fn route_softmax(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // x and the output — the parameters `KtirFunc::route_softmax` mints.
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    check_pointwise_cols(out.c_len, "RouteSoftmax", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let x = tensors[0].name();
+    let t = out.tid;
+    Ok(assemble_row_softmax(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        PlaceId::Act(t),
+        sym_id_base,
+        layout,
+    ))
+}
+
+/// The per-`Program` door for the renorm form — `out = x / rowsum(x, dim=-1)`,
+/// mixtral's `RouteRenorm`. The softmax's chain minus the stability subtract
+/// and the exp, over the same one-stick reduce/broadcast structure.
+pub fn route_renorm(
+    name: &str,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let (tensors, out) = split_out(name, r, layout, 1)?;
+    check_pointwise_cols(out.c_len, "RouteRenorm", out.tid)?;
+    let rows = node_rows(name, &out)?;
+    let cols = out.c_len;
+    let x = tensors[0].name();
+    let t = out.tid;
+    Ok(assemble_row_renorm(
+        &format!("o{t}"),
+        rows,
+        cols,
+        &x,
+        PlaceId::Act(t),
         sym_id_base,
         layout,
     ))

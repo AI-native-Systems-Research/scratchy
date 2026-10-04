@@ -475,6 +475,59 @@ fn lower_router_logits_node<F: RopeForm>(
     Ok(vec![e])
 }
 
+/// Lower a [`SubOp::RouteSoftmax`] — `softmax(scores, dim=-1)` over `[m, experts]`,
+/// the router's score softmax.
+///
+/// ⭐ THE RMSNORM'S STRUCTURE, with the softmax's primitives in it. The program
+/// ([`KtirFunc::route_softmax`]) states the stability chain longhand; the door
+/// ([`route_softmax`]) emits [`assemble_row_softmax`]'s five device ops — one
+/// native `max` reduce, the broadcast `sub`, `exp`, one native `sum` reduce, the
+/// broadcast `realdiv`. No registry const: the whole chain is data-driven.
+fn lower_route_softmax_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "RouteSoftmax t{} expects 1 input (scores), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routesoftmax_s{}", node.id.index()));
+    st.route_softmax(&node.inputs[0], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RouteSoftmax);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
+/// Lower a [`SubOp::RouteRenorm`] — `scores / rowsum(scores)`, mixtral's
+/// renormalised top-k. The softmax chain minus the stability subtract and the
+/// exp; the same one-stick reduce/broadcast structure.
+fn lower_route_renorm_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    _sym_id_base: &mut i64,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    if node.inputs.len() != 1 {
+        return Err(SuperDscError(format!(
+            "RouteRenorm t{} expects 1 input (scores), found {}",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        )));
+    }
+    let mut st = KtirFunc::new(ir);
+    let name = Arena::global().str(format!("routerenorm_s{}", node.id.index()));
+    st.route_renorm(&node.inputs[0], &node.output);
+    let k = st.finish_shaped(name, ktir_superdsc::ktir_node::Program::RouteRenorm);
+    let mut e = EmittedOp::bare(name.to_string());
+    e.ktir = Some(k);
+    Ok(vec![e])
+}
+
 /// Lower a [`SubOp::RouteScale`] — scores times the softmax temperature, a
 /// shape-preserving constant multiply.
 ///
@@ -1310,22 +1363,17 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             Ok(v) => Ops(v),
             Err(e) => Unhandled(e.0),
         },
-        // ⛔⭐ ROUTE-SOFTMAX IS A ROW-SOFTMAX OVER `[m, experts]` — and a softmax is
-        // `exp(x - rowmax) / rowsum(exp(x - rowmax))`, a chain the DENSE vocabulary
-        // already lowered for attention. But the emulated program must match what
-        // runs on card BIT-IDENTICALLY at the parity fixture, and the softmax here
-        // is over the ROUTER scores whose scale and renorm ops run around it — the
-        // fixture's oracle would need the whole router chain. Refused BY NAME
-        // until the router chain is verified end to end on card.
-        SubOp::RouteSoftmax | SubOp::RouteRenorm => Unhandled(format!(
-            "SubOp::RouteSoftmax/RouteRenorm t{} (a row softmax/renorm over the router scores) has \
-             no SuperDSC lowering yet: the chain is exp → row-max → sub → exp → row-sum → div, the \
-             attention-softmax decomposition, but the ROUTER version has never run on card and \
-             refusing it here keeps the parity fixtures honest about what is lowerable. The port \
-             source is the attention softmax's KtirFunc chain plus vendor topk.ddl's \
-             topkindex/topkvalue for the argsort that follows.",
-            node.output.tensor.index() as u32,
-        )),
+        // The router's row softmax/renorm — the rmsnorm's reduce/broadcast structure
+        // with the softmax's primitives in it (`max`/`exp`/`sum`/`realdiv`), all of
+        // them DDL primitives already live on card.
+        SubOp::RouteSoftmax => match lower_route_softmax_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
+        SubOp::RouteRenorm => match lower_route_renorm_node(node, ir, sym_id_base) {
+            Ok(v) => Ops(v),
+            Err(e) => Unhandled(e.0),
+        },
         // ── THE REMAINING EXPANSION OPS, each refused BY NAME with its own port
         // source — the `expansion_ops!()` blanket left this list, so every op the
         // router-side decompositions above do not cover states what it needs.
@@ -3618,6 +3666,87 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
         let w = self.load_1d(w_r.tensor, 1, 0, 1);
         let wb = self.broadcast(w, dims.clone(), 0);
         let y = self.binop(OpKind::ArithMulf, x, wb, dims);
+        self.store_region(y, out);
+    }
+
+    /// A ROW SOFTMAX over `[m, c]` — the MoE router's `RouteSoftmax`, written
+    /// longhand as the stability chain `exp(x − rowmax) / rowsum(exp(x − rowmax))`.
+    ///
+    /// The structure is [`Self::rmsnorm_unit`]'s — a per-row reduce, a broadcast
+    /// back over the row, a terminal divide — with `max`/`exp`/`sum`/`divf` in
+    /// place of the norm's primitives, because a row softmax and a row rms are
+    /// the same shape of computation: one scalar per row, sprayed back over it.
+    /// All in the EMULATOR's f32 (`f32_splat`/`f32_binop`), the same arithmetic
+    /// the rmsnorm chain uses; the descriptor side is
+    /// [`assemble_row_softmax`]'s f16 primitives.
+    fn route_softmax(&mut self, x_r: &TensorRegion, out: &TensorRegion) {
+        let c = out.region.cols.len;
+        let m = out.region.rows.len;
+        let x = self.load_region(x_r);
+        let dims = vec![i64::from(m), i64::from(c)];
+        let rows = vec![i64::from(m)];
+        // 1. rowmax(x) — the stability subtractend, `[m]` f32.
+        let minit = self.f32_splat(f64::from(f32::NEG_INFINITY), rows.clone());
+        let xmax = {
+            let a = self.a;
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::LinalgReduce, &[x, minit])
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![1])))
+                .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf));
+            let ty = self.f32_ty(rows.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        // 2. x − rowmax, broadcast along the column axis: every column of a row
+        //    shares that row's max.
+        let xb = self.broadcast(x, dims.clone(), 1);
+        let maxb = self.broadcast(xmax, dims.clone(), 1);
+        let shifted = self.f32_binop(OpKind::ArithSubf, xb, maxb, dims.clone());
+        // 3. exp(shifted).
+        let e = self.unop(OpKind::MathExp, shifted, dims.clone());
+        // 4. rowsum(exp) — the denominator, `[m]` f32.
+        let sinit = self.f32_splat(0.0, rows.clone());
+        let sum = {
+            let a = self.a;
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::LinalgReduce, &[e, sinit])
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![1])))
+                .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+            let ty = self.f32_ty(rows.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        // 5. exp / rowsum, the denominator broadcast back over the row.
+        let sumb = self.broadcast(sum, dims.clone(), 1);
+        let y = self.f32_binop(OpKind::ArithDivf, e, sumb, dims);
+        self.store_region(y, out);
+    }
+
+    /// A ROW RENORM over `[m, c]` — mixtral's `RouteRenorm`, `x / rowsum(x)`:
+    /// the softmax chain minus the stability subtract and the exp.
+    fn route_renorm(&mut self, x_r: &TensorRegion, out: &TensorRegion) {
+        let c = out.region.cols.len;
+        let m = out.region.rows.len;
+        let x = self.load_region(x_r);
+        let dims = vec![i64::from(m), i64::from(c)];
+        let rows = vec![i64::from(m)];
+        let sinit = self.f32_splat(0.0, rows.clone());
+        let sum = {
+            let a = self.a;
+            let v = self.fresh();
+            let op = Operation::new(a, Some(v), OpKind::LinalgReduce, &[x, sinit])
+                .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![1])))
+                .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf));
+            let ty = self.f32_ty(rows.clone());
+            let op = self.typed(op, ty);
+            self.push(op);
+            v
+        };
+        let xb = self.broadcast(x, dims.clone(), 1);
+        let sumb = self.broadcast(sum, dims.clone(), 1);
+        let y = self.f32_binop(OpKind::ArithDivf, xb, sumb, dims);
         self.store_region(y, out);
     }
 
