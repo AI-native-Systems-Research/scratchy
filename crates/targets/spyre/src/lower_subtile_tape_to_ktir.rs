@@ -2937,27 +2937,39 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // "spyre-hw")`).
     let attn_params = attn_bundle_params(ir, rows_are_requests)?;
     let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
-    for ops in std::iter::once(&prefix)
-        .chain(body_op_lists.iter().copied())
-        .chain(std::iter::once(&suffix))
-    {
-        let mut declare_syms: i64 = 0;
-        let mut declare_fp8: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for e in ops.iter() {
-            let Some(k) = e.ktir.as_ref() else { continue };
-            crate::ktir_superdsc_door::lower(
-                k,
-                &mut declare_syms,
-                Some(&bundle_layout),
-                &mut declare_fp8,
-                attn_params,
-            )
-            .map_err(|err| {
-                SuperDscError(format!(
-                    "{}: declaring the shared plan's synthetics: {}",
-                    e.op_name, err.message
-                ))
-            })?;
+    // ⛔ AND THE GATE IS THE DEVICE, NOT A CONVENTION. A program the door
+    // refuses BY NAME (the MoE expansion ops, whose SuperDSC bodies are the
+    // card track's later work) is legal KTIR the emulator runs fine — an
+    // unconditional declare pass would demand a SuperDSC body for every
+    // program kind before `-Fspyre-emu` could run ANY bundle containing one,
+    // which is the card's admission predicate applied to a device that has
+    // no descriptors. MEASURED: the gemma-4-26b parity-tiny build panicked
+    // here at `routeargsort_s24` under `-Fspyre-emu` while the same program
+    // passed its emulator unit test one crate away.
+    if cfg!(feature = "spyre-hw") {
+        for ops in std::iter::once(&prefix)
+            .chain(body_op_lists.iter().copied())
+            .chain(std::iter::once(&suffix))
+        {
+            let mut declare_syms: i64 = 0;
+            let mut declare_fp8: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for e in ops.iter() {
+                let Some(k) = e.ktir.as_ref() else { continue };
+                crate::ktir_superdsc_door::lower(
+                    k,
+                    &mut declare_syms,
+                    Some(&bundle_layout),
+                    &mut declare_fp8,
+                    attn_params,
+                )
+                .map_err(|err| {
+                    SuperDscError(format!(
+                        "{}: declaring the shared plan's synthetics: {}",
+                        e.op_name, err.message
+                    ))
+                })?;
+            }
         }
     }
     // Device re-tile manifest: each matmul kernel weight (layer 0) + its per-layer
