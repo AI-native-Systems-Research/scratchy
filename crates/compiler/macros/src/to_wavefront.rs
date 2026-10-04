@@ -943,10 +943,6 @@ pub fn lower_decode_to_wavefront(
             // the serializer maps attention onto the runtime paged cache, so
             // the new K/V are NOT a separate cache round-trip.
             OpKind::RopeAppend | OpKind::RopeAppendInterleaved => {
-                let head_dim = bx
-                    .geom
-                    .ok_or(BridgeError::MissingBound { key: "head_dim" })?
-                    .hd();
                 let q = bx.input_at(tile, 0)?;
                 let k = bx.input_at(tile, 1)?;
                 // slot 2 (v) is the third input's producer, aliased.
@@ -975,6 +971,22 @@ pub fn lower_decode_to_wavefront(
                         }
                     )
                 });
+                // ⭐ THE HEAD DIM IS THE ROTARY CLASS'S OWN, NOT THE MODEL'S. A hybrid-attention
+                // arch (gemma-4) binds TWO rotary externs: `rotary_local` names the BASE class
+                // (`bx.geom`) and plain `rotary` names the GLOBAL one (`bx.geom_global`, head_dim
+                // 512 where the base is 256). Stamping `bx.geom.hd()` on every rope node rotates
+                // a global layer's 512-wide head as two 256-wide heads with a 256-half pairing —
+                // a rotation the consumer's own geometry contradicts. The class selection mirrors
+                // the attention arm's (`AttnMask::Causal ⇒ geom_global`): the base class never
+                // has a global twin (its geometry IS the model's), and a global twin exists
+                // exactly when the two classes differ.
+                let head_dim = if local_rope {
+                    bx.geom
+                } else {
+                    bx.geom_global.or(bx.geom)
+                }
+                .ok_or(BridgeError::MissingBound { key: "head_dim" })?
+                .hd();
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
                 // E.12 — RopeAppend writes rotated K and V into the
