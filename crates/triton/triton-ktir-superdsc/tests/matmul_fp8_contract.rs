@@ -195,13 +195,17 @@ fn the_canonical_fp8_kernel_bakes_and_emits_the_w8a8_chain() {
 
 /// AN f16 WEIGHT WITH A w_scale PARAMETER. The intended backstop is the vendored
 /// arity/is_fp8 agreement guard (`lower_ktir_to_superdsc.rs:3673`), but OUR verifier
-/// refuses first and for the right reason, MEASURED: with an f16 descriptor the peel
-/// does not fire, so the spelled `.to(tl.float16)` is a stray `arith.extf` on B and the
-/// direct-load guard red-stops it. An f16 kernel that casts its weight is not the
-/// canonical f16 form (and one that dropped the cast would be refused by the f16 arm's
-/// own counts — three loads, not two). Either way the kernel never reaches a door that
-/// could misbind it; this pins the FIRST refusal so a future reorder of the guards
-/// fails this test rather than silently routing to the next one.
+/// refuses first, MEASURED: with an f16 descriptor the spelled `.to(tl.float16)` is an
+/// IDENTITY cast, and the frontend's `cast()` elides a same-dtype cast outright
+/// (`semantic.rs`, `src == dst_sca → Ok(v)`) -- so no stray `arith.extf` ever reaches
+/// B, which arrives as a clean `trans(load)`: the direct-load guard's PERMITTED
+/// wrapper. The first refusal is therefore the f16 template's structural check: the
+/// scale multiply (`arith.mulf`) is not in that template's op list, and an f16 W with
+/// a third pointer is not the canonical f16 form either way -- the f16 arm's own
+/// counts would refuse it too (three loads, not two; a `.to`-free spelling would
+/// leave the mulf). The kernel never reaches a door that could misbind it; this pins
+/// the FIRST refusal so a future reorder of the guards fails this test rather than
+/// silently routing to the next one.
 #[test]
 fn an_f16_weight_with_a_scale_parameter_is_refused_before_the_door() {
     let err = match drive(&sig_with_w("*fp16"), &ces(), &[1]) {
@@ -212,11 +216,15 @@ fn an_f16_weight_with_a_scale_parameter_is_refused_before_the_door() {
         ),
         Err(msg) => msg,
     };
+    // The structural refusal names the whole-kernel contract, not the mulf by name --
+    // so pin BOTH the structural message and, as the routed-through guard, the f16
+    // counts refusal it fronts for. Either being the first refusal is correct; any
+    // other message (or a bake) is a reroute that must fail here.
     assert!(
-        err.contains("A and B must be direct tt.descriptor_load results")
-            || err.contains("expects 2 inputs (A, W) or 3"),
-        "expected the f16-W refusal (our direct-load guard, or the vendored arity \
-         guard), got: {err:?}"
+        err.contains("the matmul template does not model")
+            || err.contains("is not exactly {1 tt.dot, 2 tt.descriptor_load"),
+        "expected the f16-W refusal (the f16 template's structural check or its \
+         counts), got: {err:?}"
     );
 }
 

@@ -1,7 +1,6 @@
 //! BRIDGE ONE's per-fixture status, MACHINE-CHECKED rather than written down.
 //!
-//! Needs the `ruff` feature: every case starts from Python SOURCE.
-#![cfg(feature = "ruff")]
+//! Every case starts from Python SOURCE (the parser is owned and unconditional).
 //!
 //! Every fixture configuration the existing toolchain knows about is listed here with the
 //! outcome this crate is expected to produce. Two kinds of expectation, and both are
@@ -14,7 +13,7 @@
 //!     starts compiling will fail this test and force the status to be updated with a
 //!     golden diff, which is the point.
 //!
-//! `cargo test --features ruff --test fixture_status -- --nocapture` prints the mismatches.
+//! `cargo test --test fixture_status -- --nocapture` prints the mismatches.
 
 mod common;
 
@@ -252,7 +251,7 @@ fn every_fixture_has_the_expected_status() {
 ///
 /// The two refusal layers are deliberately ordered and this test only exercises the second:
 ///
-///   1. `py::ruff_adapter` refuses Python that has no place in our AST at all (a `while`, a
+///   1. `py::parser` refuses Python that has no place in our AST at all (a `while`, a
 ///      `lambda`, a comprehension). It returns on the first one, because there is nothing to
 ///      build.
 ///   2. `py::census::check` then walks the built AST and reports ALL remaining violations --

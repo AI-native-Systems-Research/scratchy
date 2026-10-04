@@ -1,7 +1,5 @@
 //! THE INDIRECT ADDRESS: `tt.descriptor_gather`, and the four things it refuses.
 //!
-//! Needs the `ruff` feature: every case starts from Python SOURCE.
-#![cfg(feature = "ruff")]
 //!
 //! `tests/golden_diff.rs::embedding_matches_golden` already proves the accepting case field
 //! by field against the raw golden. This file is the OTHER half, and it is the half that a

@@ -4,17 +4,15 @@ Takes the text of a `@triton.jit` kernel plus its signature and constexpr bindin
 produces an in-memory `ttir::Module`. **No Python runs. Nothing is shelled out to.**
 
 ```
-cargo test --features ruff          # 59 tests: golden diff, controls, divergence, status,
-                                    #           gather, transcendental width, slicing, fusion
-cargo test --no-default-features    # 6 tests: zero dependencies, no Python parser
+cargo test                          # 59 tests: golden diff, controls, divergence, status,
+                                    #         gather, transcendental width, slicing, fusion
 ```
 
-The dependency-free run is not a stub. It holds the crate to: every raw golden parsing
-(all sixteen, including the 647-line causal-attention one and the `si32` descriptor in
-`embedding`), print -> parse being structurally idempotent, type spellings round-tripping,
-the two target presets actually differing, and two planted-difference controls of its own.
-Only the step that turns Python TEXT into an AST needs `ruff`, so the tests that start from
-source are `#![cfg(feature = "ruff")]`.
+The whole crate is dependency-free, parser included: `src/py/parser.rs` is a hand-rolled
+lexer and recursive-descent parser for the Python subset the census bounds, so every build
+(including the offline pod) parses real `.py` source — `tests/no_parser.rs` keeps the
+parser-independent half (golden reader, printer, structural diff, target policy) separately
+honest.
 
 ## Status, per fixture configuration
 
@@ -278,28 +276,24 @@ switch directly against a kernel written for the purpose, asserting **both** dir
 (Spyre keeps f16; upstream widens both operands and yields f32) plus that the switch does not
 leak into multiplication.
 
-## Why `ruff_python_parser`, and why behind a feature
+## Why the parser is owned
 
-Gated because this workspace's other crates are dependency-free so `cargo test --offline`
-works on the pod, which has no crates.io access: `ruff_python_parser` pulls 84 packages
-(measured — `cargo add ruff_python_parser ruff_python_ast` then `cargo fetch` reports
-"Locking 84 packages"). `--no-default-features` builds and tests clean with zero
-dependencies — `tests/no_parser.rs` is what it runs.
+Python's grammar is not the part of this job worth *depending on someone else for*: the
+census bounds the subset the kernels actually use, so a hand-rolled lexer and
+recursive-descent parser for exactly that subset is ~2000 owned lines with no third-party
+code and no lockfile growth — and it runs everywhere the pod runs, offline. (A vendored
+third-party parser crate was the first answer; it pulled 84 packages for a parse step the
+census had already bounded, and the review verdict was to own it.)
 
-Used at all because Python's grammar is not the part of this job worth owning. This reverses
-a stalled earlier skeleton's decision to hand-roll a ~1500-line parser. The scope control
-that matters is not at the parse step — it is `src/py/census.rs`, which refuses out-of-census
-constructs **by name at their source line**. Parsing generously and refusing precisely beats
-parsing narrowly and failing vaguely, because the refusal can name the construct *and* say
-where it is.
-
-Only `src/py/ruff_adapter.rs` ever sees a ruff type.
+The scope control that matters is not at the parse step — it is `src/py/census.rs`, which
+refuses out-of-census constructs **by name at their source line**. Parsing generously and
+refusing precisely beats parsing narrowly and failing vaguely, because the refusal can name
+the construct *and* say where it is.
 
 ### Two refusal layers, deliberately ordered
 
-1. `py::ruff_adapter` refuses Python with no place in our AST (`while`, `lambda`, a
-   comprehension), naming the CPython node type. It returns on the first one — there is
-   nothing to build.
+1. the parser refuses Python with no place in our AST (`while`, `lambda`, a comprehension),
+   naming the CPython node type. It returns on the first one — there is nothing to build.
 2. `py::census::check` then walks the built AST and reports **all** remaining violations at
    once, so one run names all the work.
 

@@ -34,13 +34,14 @@
 //! [`py`] (the Python AST) never mentions a TTIR type, and [`ttir`] never mentions a
 //! Python one. The two meet only inside [`codegen`].
 //!
-//! ## THE PYTHON PARSER IS BEHIND A CARGO FEATURE.
+//! ## THE PYTHON PARSER IS OWNED.
 //!
-//! Our other crates are dependency-free so `cargo test --offline` works on the pod, which
-//! has no crates.io access. `ruff_python_parser` pulls 84 packages, so it lives behind the
-//! `ruff` feature and only [`py::ruff_adapter`] ever sees a ruff type. Everything else --
-//! the TTIR value type, the printer, the golden reader, the semantic layer, the AST walk
-//! and the diff -- builds and tests with no dependencies at all.
+//! [`py::parser`] is a hand-rolled lexer and recursive-descent parser for the Python
+//! subset the census bounds -- no dependencies, so `cargo test --offline` works on the
+//! pod, which has no crates.io access. It replaced the previously-vendored parser crate,
+//! which pulled 44
+//! lockfile versions for a parse step whose grammar the census bounds anyway; see
+//! [`py::parser`]'s own docs for the decision.
 //!
 //! ## SCOPE IS MEASURED, AND OUTSIDE IT IS A NAMED ERROR.
 //!

@@ -27,12 +27,13 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# LEG 1 -- `.py` source to ttir. `ruff` is not optional here: every configuration starts from
-# PYTHON SOURCE, which is the point. A test fed a checked-in ttir golden cannot see a fixture change,
-# and reading one cost this tree an afternoon (`bake_py.rs`'s KTIR_DUMP note).
-triton-frontend = { path = "../triton-frontend", features = ["ruff"] }
+# LEG 1 -- `.py` source to ttir. Every configuration starts from PYTHON SOURCE, which is
+# the point. A test fed a checked-in ttir golden cannot see a fixture change, and reading
+# one cost this tree an afternoon (`bake_py.rs`'s KTIR_DUMP note). The parser is owned
+# and unconditional (`triton-frontend/src/py/parser.rs`).
+triton-frontend = { path = "../triton-frontend" }
 # LEG 2 -- ttir value to our KTIR value, then `passes::to_ktir_emit::lower` to THEIR `IRFunction`.
-triton-ktir = { path = "../triton-ktir", features = ["ruff"] }
+triton-ktir = { path = "../triton-ktir" }
 # THE FOURTEEN CONFIGURATIONS, stated once. `cases::case(name)` is the same table `examples/bake_py`
 # drives, so "what is `rope_q32`?" has one answer in this repo and not two.
 triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }

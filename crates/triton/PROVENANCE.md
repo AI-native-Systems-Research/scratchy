@@ -4,7 +4,7 @@
 
 | crate | what it is |
 |---|---|
-| `triton-frontend` | Triton `.py` → TTIR, in Rust. The ruff Python parser is behind the `ruff` feature, gated by `src/py/census.rs` (refuses out-of-census constructs by name at their source line). |
+| `triton-frontend` | Triton `.py` → TTIR, in Rust. Python is parsed by an owned hand-rolled parser (`src/py/parser.rs`, no dependencies), with `src/py/census.rs` as the scope boundary (refuses out-of-census constructs by name at their source line). |
 | `triton-ktir` | TTIR value → KTIR value: the nine KTDP/KTDF passes, ported for behaviour. |
 | `triton-numeric` | The numeric verification harness: `.py` → TTIR → KTIR → `ktir-emulator`, scored against checked-in torch reference data in `test-numeric/`. |
 | `triton-ktir-superdsc` | The adapter: our KTIR value → `ktir-superdsc`'s `KtirNode` + per-kind entry points, plus the case table (`cases.rs`) and the `bake_py` example that drives the whole chain. |
@@ -43,10 +43,10 @@ effort lives under `third_party/spyre/rust/`.
    the same change.
 2. **No `[workspace]` tables**: these are members of scratchy's workspace.
    The offline-pod concern that made each crate its own workspace in
-   triton-spyre is handled by feature discipline: everything except the
-   Python parse step is dependency-free (`cargo test -p triton-frontend
-   --no-default-features` still works); `ruff` is opt-in and pulls 84
-   packages, so nothing offline-critical depends on it.
+   triton-spyre is handled by the owned parser: the whole ladder is
+   dependency-free (`cargo test -p triton-frontend` works offline; the
+   parser replaced the previously-vendored parser crate, which pulled 44
+   lockfile packages).
 3. **Path roots**: every crate resolves test data via one `.parent()` from
    `CARGO_MANIFEST_DIR` to `crates/triton/` — the `test-*` directories are
    siblings of the crates, not inside any of them.

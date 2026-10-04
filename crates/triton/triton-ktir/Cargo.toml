@@ -7,17 +7,16 @@ license = "MIT"
 publish = false
 
 [dependencies]
-# ONE path dependency, and NO crates.io package: `triton-frontend`'s default feature
-# set is EMPTY and every dependency it has is optional behind `ruff`, so
-# `default-features = false` pulls in nothing. `cargo test --offline` on the pod still
-# resolves, which is the rule this tree keeps (recorded in ../triton-superdsc's
-# workspace Cargo.toml).
+# ONE path dependency, and NO crates.io package: `triton-frontend` is dependency-free
+# (its parser is owned, `src/py/parser.rs`), so this edge pulls in nothing.
+# `cargo test --offline` on the pod still resolves, which is the rule this tree keeps
+# (recorded in ../triton-superdsc's workspace Cargo.toml).
 #
 # WHY THE DEPENDENCY EXISTS AT ALL: [`from_ttir`] consumes bridge one's ttir VALUE
 # directly. Bridge one printing its module so this crate could parse it back is the
 # defect the no-text rule exists to prevent, and the only way not to do it is for this
 # crate to name that type.
-triton-frontend = { path = "../triton-frontend", default-features = false }
+triton-frontend = { path = "../triton-frontend" }
 
 # THE CONSUMER'S KTIR TYPE, and it is the only definition of KTIR in the pipeline.
 #
@@ -34,10 +33,6 @@ ktir-core = { path = "../../targets/spyre/ktir/ktir-core" }
 # DEFAULT IS DEPENDENCY-FREE, so `cargo test --offline` on the pod is unaffected: the
 # adapter, the passes, the reader and the printer all build with no crates.io package.
 default = []
-# `ruff` forwards to triton-frontend's Python parser, which `tests/pure_rust_ktir.rs`
-# needs because it starts every configuration from PYTHON SOURCE -- the whole point of
-# that test is that no stage is fed a file.
-ruff = ["triton-frontend/ruff"]
 
 # The MLIR text reader and writer in `src/text/` remain in-tree and remain TEST
 # INSTRUMENTS, not pipeline stages.

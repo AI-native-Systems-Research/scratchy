@@ -1,8 +1,8 @@
 //! THE WHOLE RUST PATH, PYTHON SOURCE TO KTIR, against the C++ chain's own KTIR.
 //!
-//! Needs the `ruff` feature, because every configuration starts from PYTHON SOURCE. That
-//! is the point: no stage in here is handed a file.
-#![cfg(feature = "ruff")]
+//! Every configuration starts from PYTHON SOURCE. That is the point: no stage in here
+//! is handed a file. (The parse step is owned and unconditional, so there is no
+//! feature gate to enable.)
 //!
 //! ```text
 //!   triton_frontend::codegen::compile   .py source -> RAW ttir       value

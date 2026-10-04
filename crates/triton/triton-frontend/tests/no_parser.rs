@@ -1,11 +1,9 @@
 //! What the DEPENDENCY-FREE build is held to.
 //!
-//! This file has no `#![cfg(feature = "ruff")]`, so it runs in both configurations. It
-//! exercises the parts of the crate that must keep working with zero dependencies on the
-//! offline pod: the TTIR value type, the golden reader, the printer, the structural diff, and
-//! the target policy. Only the step that turns Python TEXT into an AST needs ruff.
-//!
-//! `cargo test --no-default-features` runs exactly these.
+//! It exercises the parts of the crate that need no Python source: the TTIR value
+//! type, the golden reader, the printer, the structural diff, and the target policy.
+//! (With the parser now owned and unconditional, "no parser" is a historical name --
+//! but the split stays: this file never reads a `.py`.)
 
 use triton_frontend::diff;
 use triton_frontend::target::Target;

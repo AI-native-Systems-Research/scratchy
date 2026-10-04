@@ -1,8 +1,6 @@
 //! THE PARTIAL SLICE: refused by the LANGUAGE, and until `rope.py` was written this front end
 //! compiled it into a WRONG ANSWER.
 //!
-//! Needs the `ruff` feature: every case starts from Python SOURCE.
-#![cfg(feature = "ruff")]
 //!
 //! Hugging Face's `rotate_half` is `cat(-x[..., d//2:], x[..., :d//2])`, so the obvious
 //! transcription of Granite's RoPE is a bounded slice. It does not exist in Triton.

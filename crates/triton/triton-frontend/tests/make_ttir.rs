@@ -1,9 +1,8 @@
 //! `make_ttir` IN RUST, against the C++ pipeline's own output, per configuration.
 //!
-//! Needs the `ruff` feature: every case starts from Python SOURCE, so this exercises the
-//! WHOLE value path -- `codegen::compile` then `opt::make_ttir`, with nothing printed and
-//! nothing parsed in between.
-#![cfg(feature = "ruff")]
+//! Every case starts from Python SOURCE (the parser is owned and unconditional), so this
+//! exercises the WHOLE value path -- `codegen::compile` then `opt::make_ttir`, with
+//! nothing printed and nothing parsed in between.
 //!
 //! # THE ORACLE, AND WHY IT IS THE SECOND GOLDEN
 //!
