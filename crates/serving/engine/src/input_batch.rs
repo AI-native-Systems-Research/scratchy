@@ -630,6 +630,13 @@ impl InputBatch {
         })
     }
 
+    /// How many tokens this request has generated, those still on the device included.
+    pub fn num_generated(&self, req_id: &str) -> usize {
+        self.req_id_to_slot
+            .get(req_id)
+            .map_or(0, |&slot| self.generated[slot].len() + self.in_flight[slot])
+    }
+
     /// One token by ABSOLUTE position in `prompt ++ generated`.
     ///
     /// The two vecs are one sequence; which of them a position falls in is arithmetic done here rather
@@ -1250,8 +1257,11 @@ mod tests {
             vec![3]
         );
         batch.reclaim_buffers(p);
+        // An unseeded sampler seeds from this count: in flight or resolved, the same.
+        assert_eq!(batch.num_generated("r1"), 2);
         batch.resolve("r1", 30);
         batch.resolve("r1", 40);
+        assert_eq!(batch.num_generated("r1"), 2);
         assert_eq!(batch.history("r1"), (&[10u32, 20][..], &[30u32, 40][..]));
         assert_eq!(batch.tokens_in_pool_for("r1"), 3);
 

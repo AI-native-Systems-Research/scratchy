@@ -217,8 +217,9 @@ pub fn encode_sampler_stage_into_mtl4(
 /// The per-request SEED is the one thing that must NOT differ between backends,
 /// so it comes from the shared [`fnv_seed`] / [`seed_to_uniform`]: a seeded
 /// request draws from its `StdRng`, an unseeded one hashes
-/// `(req_id, generated-token-count)`. `cuda_worker` derives its seed the same
-/// way, so an unseeded request gets the identical uniform on either backend.
+/// `(req_id, generated-token-count)` — `generated`, which counts the tokens
+/// still on the device too. `cuda_worker` derives its seed the same way, so an
+/// unseeded request gets the identical uniform on either backend.
 ///
 /// [`GpuSampleParams`]: scratchy_core_common::GpuSampleParams
 /// [`fnv_seed`]: scratchy_core_common::fnv_seed
@@ -229,6 +230,7 @@ pub fn gather_gpu_sample_params<'h>(
     sampling_params_map: &std::collections::HashMap<String, scratchy_core_common::SamplingParams>,
     seeded_rngs: &mut std::collections::HashMap<String, rand::rngs::StdRng>,
     history: impl Fn(&str) -> (&'h [u32], &'h [u32]),
+    generated: impl Fn(&str) -> usize,
     vocab: u32,
 ) -> scratchy_core_common::GpuSampleParams {
     use rand::Rng;
@@ -279,7 +281,7 @@ pub fn gather_gpu_sample_params<'h>(
         } else {
             // Generated-token count = the request's decode position; advances
             // each step so the seed varies. Shared with cuda_worker.
-            let position = history(req_id).1.len() as u32;
+            let position = generated(req_id) as u32;
             scratchy_core_common::fnv_seed(req_id, position)
         };
         params
@@ -412,6 +414,8 @@ pub struct PendingSampler {
     arena: std::sync::Arc<SamplerArena>,
     njobs: u32,
     nslices: u32,
+    /// Each job's logits row.
+    rows: Vec<u32>,
 }
 
 /// Threadgroups the sliced passes aim to occupy: two per GPU core, at least 8.
@@ -702,6 +706,7 @@ impl SamplerArena {
         self: &std::sync::Arc<Self>,
         params: &scratchy_core_common::GpuSampleParams,
         njobs: u32,
+        mut record: Option<&mut Vec<(Buffer, Vec<u8>)>>,
     ) -> PendingSampler {
         assert!(
             njobs <= self.max_rows,
@@ -716,12 +721,17 @@ impl SamplerArena {
             self.sliced_max
         );
 
-        // Shared-storage contents are plain host memory: fill via memcpy.
-        let write = |buf: &Buffer, bytes: &[u8]| {
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, bytes.len())
-            };
-            dst.copy_from_slice(bytes);
+        // Shared-storage contents are plain host memory: fill via memcpy — or,
+        // while an earlier command buffer may still be sampling from them,
+        // `record` the writes for the device to make at the head of this step's.
+        let mut write = |buf: &Buffer, bytes: &[u8]| match record.as_deref_mut() {
+            Some(record) => record.push((buf.clone(), bytes.to_vec())),
+            None => {
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(buf.contents().as_ptr() as *mut u8, bytes.len())
+                };
+                dst.copy_from_slice(bytes);
+            }
         };
         let u32s = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
@@ -810,6 +820,7 @@ impl SamplerArena {
             arena: self.clone(),
             njobs,
             nslices,
+            rows: params.row_indices.clone(),
         }
     }
 }
@@ -871,10 +882,39 @@ impl PendingSampler {
         stage(SamplerStage::Finalize, &a.finalize_at, rows);
     }
 
-    /// The sampled-token output buffer + row count, for reading back after the
-    /// forward's single host wait (the sampler rode the forward CB).
-    pub fn output(&self) -> (Buffer, u32) {
-        (self.arena.out_buf.clone(), self.njobs)
+    /// Copy each job's sampled token over `tokens[its logits row]` — the step's
+    /// per-row argmax output — once the sampler is done: the next step reads the
+    /// token from there, and the arena's own output is the next step's to write.
+    pub fn copy_tokens_into(
+        &self,
+        enc: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+        tokens: &Buffer,
+    ) {
+        use objc2_metal::{
+            MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4VisibilityOptions, MTLStages,
+        };
+        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+            MTLStages::Dispatch,
+            MTLStages::Blit,
+            MTL4VisibilityOptions::Device,
+        );
+        let at = |i: usize| i * size_of::<u32>();
+        for (job, &row) in self.rows.iter().enumerate() {
+            unsafe {
+                enc.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &self.arena.out_buf,
+                    at(job),
+                    tokens,
+                    at(row as usize),
+                    size_of::<u32>(),
+                );
+            }
+        }
+    }
+
+    /// Each job's logits row.
+    pub fn rows(&self) -> &[u32] {
+        &self.rows
     }
 
     /// Telemetry spill buffers `(topk_probs, topk_indices, stats, njobs, k)`
@@ -956,24 +996,34 @@ mod tests {
         // the logits into it too (the batch's commit attaches exactly that
         // set; the arena's pins keep its buffers in it for as long as both
         // live — the logits pin lives to the end of this scope).
-        let (pending, logits_pin) = {
+        // The step's token buffer, one slot per logits row: the sampled tokens land at their rows.
+        let rows = params
+            .row_indices
+            .iter()
+            .max()
+            .map_or(1, |&r| r as usize + 1);
+        let tokens = shared_slice(device, &vec![u32::MAX; rows]);
+        let (pending, pins) = {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
             let arena = SamplerArena::new(device, res, njobs, kernels, max_hist);
-            let pending = arena.prepare_step(params, njobs);
-            (pending, res.pin(logits_buf.clone()))
+            let pending = arena.prepare_step(params, njobs, None);
+            (
+                pending,
+                [res.pin(logits_buf.clone()), res.pin(tokens.clone())],
+            )
         };
         use objc2_metal::MTLBuffer as _;
         let logits_addr = logits_buf.gpuAddress();
         let enc = batch.encoder();
         pending.encode_into(enc, logits_addr, kernels);
+        pending.copy_tokens_into(enc, &tokens);
         let t0 = std::time::Instant::now();
         batch.commit(true);
         let wait = t0.elapsed();
-        drop(logits_pin);
-        let (out, n) = pending.output();
-        assert_eq!(n, njobs);
-        Some((read_slice::<u32>(&out, 1)[0], wait))
+        drop(pins);
+        let row = params.row_indices[0] as usize;
+        Some((read_slice::<u32>(&tokens, rows)[row], wait))
     }
 
     /// Dispatch `sample` on a synthetic f32 logits row with a near-zero
@@ -1428,7 +1478,7 @@ mod tests {
             let res = batch.residency();
             let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
             let arena = SamplerArena::new(device, res, njobs, &kernels, max_hist);
-            let pending = arena.prepare_step(params, njobs);
+            let pending = arena.prepare_step(params, njobs, None);
             (pending, arena, res.pin(logits_buf.clone()))
         };
         let enc = batch.encoder();

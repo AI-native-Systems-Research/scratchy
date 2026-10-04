@@ -287,10 +287,6 @@ pub struct MetalWorker {
     /// `Mtl4DispatchBatch`. `Some` only between `execute_model`'s pre-forward
     /// setup and the followup that consumes it; `None` for greedy-only steps.
     pending_sampler: Option<scratchy_target_metal::sampling::PendingSampler>,
-    /// Tokens the fused sampler produced this step, aligned to the `sample_jobs`
-    /// order `execute_model` built. Written by `forward_argmax_blocking` after
-    /// the (single) host wait, read + cleared by `execute_model`.
-    fused_sampled: Option<Vec<u32>>,
     /// The greedy argmax's outputs, one per step: a step takes one nothing else
     /// holds — no step in flight, no output the engine has not resolved — and
     /// grows it only when the step has more rows.
@@ -794,7 +790,6 @@ impl MetalWorker {
             sampler_arena: None,
             sampler_logits: None,
             pending_sampler: None,
-            fused_sampled: None,
             argmax_slots: Vec::new(),
             deferral: None,
             committed: None,
@@ -1157,23 +1152,31 @@ impl MetalWorker {
     }
 
     /// Whether this step can be committed without waiting for it: its rows
-    /// sample by greedy argmax alone, so nothing on the host needs its tokens
-    /// before the next step is queued. Sampling, grammar, speculative
-    /// decoding, pooling, multimodal input and a draft model all do.
+    /// pick their tokens on the GPU from the logits alone, so nothing on the
+    /// host needs its tokens before the next step is queued. Penalties (the
+    /// token history), grammar, speculative decoding, pooling, multimodal
+    /// input, a draft model and live sampler telemetry all do.
     fn deferrable(&self, sched: &SchedulerOutput) -> bool {
         #[cfg(feature = "guided-decoding")]
         let constrained = |req_id: &String| self.grammar_states.contains_key(req_id);
         #[cfg(not(feature = "guided-decoding"))]
         let constrained = |_: &String| false;
-        sched.total_num_scheduled_tokens > 0
+        #[cfg(feature = "sampler-telemetry")]
+        let telemetry =
+            scratchy_core_common::sampler_telemetry::SamplerTelemetry::global().is_enabled();
+        #[cfg(not(feature = "sampler-telemetry"))]
+        let telemetry = false;
+        !telemetry
+            && sched.total_num_scheduled_tokens > 0
             && self.input_batch.num_active() > 0
             && sched.scheduled_spec_decode_tokens.is_empty()
             && !self.config.is_pooling
             && self.draft_model.is_none()
             && sched.num_scheduled_tokens.keys().all(|req_id| {
-                self.sampling_params_map
+                !self
+                    .sampling_params_map
                     .get(req_id)
-                    .is_none_or(SamplingParams::is_greedy)
+                    .is_some_and(SamplingParams::reads_history)
                     && !self.mm_data_buffers.contains_key(req_id)
                     && !constrained(req_id)
             })
@@ -1513,9 +1516,11 @@ impl MetalWorker {
             &self.sampling_params_map,
             &mut self.seeded_rngs,
             |id| self.input_batch.history(id),
+            |id| self.input_batch.num_generated(id),
             vocab,
         );
-        Ok(arena.prepare_step(&params, jobs.len() as u32))
+        let record = self.deferral.as_mut().map(|d| &mut d.host_writes);
+        Ok(arena.prepare_step(&params, jobs.len() as u32, record))
     }
 }
 
@@ -2228,7 +2233,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // while it lives, so it outlives the forward and its host wait below.
         let pending_sampler = self.pending_sampler.take();
         let sampler = pending_sampler.as_ref();
-        let sampler_readback = sampler.map(|p| p.output());
         #[cfg(feature = "sampler-telemetry")]
         let sampler_telem = sampler.and_then(|p| p.telemetry_output());
         let sampler_kernels_addr = self
@@ -2310,6 +2314,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                         &*(addr as *const scratchy_target_metal::sampling::SamplerKernels)
                     };
                     ps.encode_into(enc, logits_addr, kernels_ref);
+                    ps.copy_tokens_into(enc, &argmax_out_for_closure);
                 }
                 Ok(())
             },
@@ -2342,15 +2347,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // Hand the captured logits slot to `execute_model`'s sample block. Only
         // the TARGET forward's logits are used for sampling; a draft/verify
         // forward's capture is harmless (never read for a sampling request).
-        // Fused sampler: it rode this forward's CB, so its output is ready after
-        // the single host wait above. Read it back for `execute_model` (aligned
-        // to the `sample_jobs` order it built).
-        if let Some((out_buf, njobs)) = sampler_readback {
-            self.fused_sampled = Some(scratchy_target_metal::mtl4_dispatch::read_slice::<u32>(
-                &out_buf,
-                njobs as usize,
-            ));
-        }
         // Live "soul" telemetry: read the tiny spill buffers (row 0 only — the
         // max_num_seqs=1 live assumption) and publish the distribution for this
         // token. Rides the same host wait; only present when telemetry was on at
@@ -2376,10 +2372,9 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                     prob,
                 });
             }
-            let sampled_token_id = self
-                .fused_sampled
-                .as_ref()
-                .and_then(|v| v.first().copied())
+            let sampled_token_id = sampler
+                .and_then(|p| p.rows().first())
+                .map(|&row| out[row as usize])
                 .unwrap_or_else(|| top_k.first().map(|c| c.token_id).unwrap_or(0));
             SamplerTelemetry::global().publish(SamplerRecord {
                 sampled_token_id,
@@ -4294,7 +4289,6 @@ impl Worker for MetalWorker {
         // `forward_argmax_blocking`'s followup, after argmax) instead of a second
         // command buffer + host wait. Greedy-only / spec / still-prefilling steps
         // prepare nothing → the argmax fast path stands unchanged.
-        self.fused_sampled = None;
         self.pending_sampler = None;
         let mut fused_sample_jobs: Vec<(usize, u32)> = Vec::new();
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
@@ -4849,7 +4843,7 @@ impl Worker for MetalWorker {
             std::collections::HashMap::with_capacity(num_reqs);
         // Non-greedy rows were computed + prepared (`fused_sample_jobs` /
         // `self.pending_sampler`) BEFORE the forward and sampled ON the forward
-        // CB; their tokens land in `self.fused_sampled`, applied after this loop.
+        // CB, which copied their tokens over the argmax at their rows.
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let req_slice = &prepared.req_inputs[i];
             req_id_to_index.insert(req_id.clone(), i);
@@ -4878,9 +4872,8 @@ impl Worker for MetalWorker {
             if req_slice.spec_token_ids.is_empty() {
                 let row = sample_indices[i] as usize;
                 debug_assert!(row < total_n as usize);
-                // Push the GPU argmax as the token; for a non-greedy request it
-                // is the fallback if the fused sampler was skipped. Non-greedy
-                // rows get overwritten from `self.fused_sampled` after this loop.
+                // The row's token: its sampled token for a non-greedy request,
+                // the GPU argmax otherwise (or if the fused sampler was skipped).
                 sampled_token_ids.push(vec![argmax_slice[row]]);
                 was_spec_decode.push(false);
             } else {
@@ -4897,19 +4890,6 @@ impl Worker for MetalWorker {
             }
         }
 
-        // ── 6.62. Apply the fused on-GPU sampler's tokens ──
-        // Non-greedy rows were sampled ON the forward's command buffer (prepared
-        // pre-forward as `fused_sample_jobs` / `self.pending_sampler`, encoded in
-        // the forward followup after argmax). Overwrite their argmax fallback
-        // with the sampled token here — BEFORE the grammar advance below, so a
-        // grammar-constrained sampling request advances its FSM on the sampled
-        // (grammar-masked) token. Greedy-only batches produced nothing → argmax
-        // fast path unchanged.
-        if let Some(sampled) = self.fused_sampled.take() {
-            for (&(slot, _), &tok) in fused_sample_jobs.iter().zip(sampled.iter()) {
-                sampled_token_ids[slot] = vec![tok];
-            }
-        }
         // The captured logits slot is consumed; drop the retained clone so it
         // can't be mistaken for a later step's logits.
         self.sampler_logits = None;
