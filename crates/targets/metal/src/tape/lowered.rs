@@ -353,8 +353,8 @@ pub enum KernelId {
     /// `(32, top_k, 1)`. Symbol: `affine_gather_qmv_combine[_fast]_<dtype>_s_<sdtype>_gs_<gs>_b_<bits>`.
     MoeDownCombine,
     /// A MoE block's routing, from the router logits to each token's top-k indices and scores,
-    /// in one command (`MoeRouteConstants`). Bindings: `(logits @ 0, sorted @ 1, indices @ 2,
-    /// scores @ 3, per-expert scales @ 4)`. Dispatch `(1, num_tokens, 1)` × `(bn, 1, 1)`. Symbol:
+    /// in one command (`MoeRouteConstants`). Bindings: `(logits @ 0, indices @ 1, scores @ 2,
+    /// per-expert scales @ 3)`. Dispatch `(1, num_tokens, 1)` × `(bn, 1, 1)`. Symbol:
     /// `moe_route_<dtype>_bn<bn>`.
     MoeRoute,
     /// `out[n, d] = Σ_k expert[n, k, d] * scores[n, k]` — the final
