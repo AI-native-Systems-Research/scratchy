@@ -81,7 +81,12 @@ ktir-core = { path = "ktir/ktir-core" }
 # path OTHER than a `scratchy-subtile` re-export, this crate must name it directly. Feature-free and
 # unconditional, like `ktir-core`: the lowering is not a device.
 ktir-superdsc = { path = "ktir/ktir-superdsc" }
-ktir-emulator = { path = "ktir/ktir-emulator", optional = true, features = ["metal"] }
+# No `metal` feature forced here: the emulator's build.rs enables its Metal/NAX
+# backend automatically on macOS (`cfg(metal)` from `CARGO_CFG_TARGET_OS`), so the
+# feature would only ever force `objc2` (Apple-only) onto a Linux build — which
+# cannot compile it. macOS keeps the backend; Linux falls back to the naive
+# sgemm parity oracle in the emulator's `blas.rs`.
+ktir-emulator = { path = "ktir/ktir-emulator", optional = true }
 # The sdsc session laws (`sdsc_abstract`): `PrefixMaskShape` / `FoldPages` /
 # `MaskBlocks` / `FoldRowRegime` — the only mints for the values the card's
 # session setters accept. Optional: only the `spyre-hw` run path binds a session.
