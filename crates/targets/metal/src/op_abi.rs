@@ -270,6 +270,18 @@ pub const METAL_GROUPED_EXPERTS: &[ExpertBundle] = &[
 /// gathers each row by its picks.
 pub const METAL_SORTED_PAIRS: u32 = 64;
 
+/// The pairs per expert from which a bake runs the batched per-expert GEMM (each expert's run
+/// padded to its 64-row tile): mlx's own gate for its batched `gather_qmm_rhs`
+/// (`rows / experts >= 4`). Under it the padding outweighs the rows.
+pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
+
+/// The pairs per expert at which a bake sorts the per-pair matvecs' rows by expert, so an expert
+/// two rows pick is read once: where it was measured to win (#232: Gemma-4's 128 experts at
+/// bucket 8, the full conc-8 decode step). The sorted matvecs run the bucket's every pair, so
+/// thicker, they lose to the gathered ones on a short prompt (Qwen3.6, 2 per expert: 161 ms vs
+/// 98 ms).
+pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
+
 /// The steps whose commands a bake may drop: a gathered block's sort and unsort, and an unsliced
 /// bake's sampled rows around its matmul.
 pub const METAL_ELIDABLE: &[SubOpKind] = &[
