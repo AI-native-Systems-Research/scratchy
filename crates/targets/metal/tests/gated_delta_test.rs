@@ -17,7 +17,7 @@ mod common;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::{CheckpointRows, GdnStart, GdnStep, RecordArea, StateEntry};
+use scratchy_target_metal::gdn_state::{CheckpointRows, GdnStart, GdnStep, RecordArea};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -1286,7 +1286,7 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     let (conv_dim, kernel) = (32usize, 4usize);
     let entry_len = conv_dim * (kernel - 1);
     let rows = CheckpointRows(3);
-    let slot_entries = rows.entries_per_slot();
+    let slot_entries = rows.conv_entries_per_slot();
     let t_full = 6usize;
     let x_full = fill(t_full * conv_dim);
     let w = fill(conv_dim * kernel);
@@ -1313,13 +1313,13 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
         let out_buf = buf_zero_f32(&device, x.len());
         let x_buf = buf_f32(&device, x);
         let cu = buf_i32(&device, &[0, num_tokens as i32]);
-        let si = buf_i32(&device, &[slot_entries as i32]);
+        let si = buf_i32(&device, &[1]);
         let step = buf_u32(
             &device,
             &[GdnStep {
                 start,
                 checkpoint_rows,
-                tip: StateEntry::First,
+                pool_rows: rows,
                 records: RecordArea::First,
             }
             .encode()],
@@ -1372,6 +1372,94 @@ fn gdn_conv1d_varlen_resumes_from_checkpoint() {
     );
 }
 
+/// A verify step whose drafts are all kept: the slot holds the state it started from, so the next
+/// step replays all its rows (`Checkpoint(drafts)`) — bit for bit the rows run without drafts.
+#[test]
+fn gdn_scan_varlen_replays_a_fully_kept_verify_step() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+    let (nk, nv, hk, hv) = (2usize, 4usize, 16usize, 16usize);
+    let conv_dim = 2 * nk * hk + nv * hv;
+    let entry_len = nv * hv * hk;
+    let rows = CheckpointRows(3);
+    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
+    // Rows 0..3 the prompt, 3..7 the verify step (its token and three kept drafts), 7 the next.
+    let t_full = 8usize;
+    let (conv, g, beta) = (
+        fill(t_full * conv_dim),
+        fill(t_full * nv),
+        fill(t_full * nv),
+    );
+    let at = |x: &[f32], w: usize, r: std::ops::Range<usize>| x[r.start * w..r.end * w].to_vec();
+    let entry = [1];
+    let code = |start, checkpoint_rows, records| {
+        [GdnStep {
+            start,
+            checkpoint_rows,
+            pool_rows: rows,
+            records,
+        }
+        .encode()]
+    };
+    let run = |state: &Buffer, r: std::ops::Range<usize>, step: [u32; 1]| {
+        let n = r.len();
+        dispatch_scan(
+            &device,
+            &cache,
+            &at(&conv, conv_dim, r.clone()),
+            &at(&g, nv, r.clone()),
+            &at(&beta, nv, r),
+            state,
+            &[0, n as i32],
+            &entry,
+            &step,
+            nk,
+            nv,
+            hk,
+            hv,
+            n,
+        )
+    };
+    let none = CheckpointRows::NONE;
+    let (r0, r1) = (RecordArea::First, RecordArea::Second);
+    let state = buf_zero_f32(&device, 2 * slot_len);
+    let (Some(_), Some(_), Some(o_next)) = (
+        run(&state, 0..3, code(GdnStart::Fresh, none, r0)),
+        run(&state, 3..7, code(GdnStart::Slot, rows, r0)),
+        run(&state, 7..8, code(GdnStart::Checkpoint(3), none, r1)),
+    ) else {
+        return;
+    };
+    let plain = buf_zero_f32(&device, 2 * slot_len);
+    let (Some(_), Some(_), Some(o_plain)) = (
+        run(&plain, 0..3, code(GdnStart::Fresh, none, r0)),
+        run(&plain, 3..7, code(GdnStart::Slot, none, r0)),
+        run(&plain, 7..8, code(GdnStart::Slot, none, r0)),
+    ) else {
+        return;
+    };
+    let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&o_next),
+        bits(&o_plain),
+        "the replayed rows' state differs"
+    );
+    // Not the replay: the slot as it stands is the verify step's start state.
+    let Some(o_slot) = run(&state, 7..8, code(GdnStart::Slot, none, r1)) else {
+        return;
+    };
+    assert_ne!(
+        bits(&o_slot),
+        bits(&o_plain),
+        "the verify step wrote its last row's state"
+    );
+}
+
 /// [`gdn_conv1d_varlen_resumes_from_checkpoint`] for the recurrent (ssm) state, whose verify
 /// step records its draft rows and whose next step replays the kept ones from its base entry
 /// (`gdn_state` module docs): the resumed row is bit for bit the one a step that never saw the
@@ -1394,7 +1482,7 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
     let scale = (hk as f32).powf(-0.5);
     let entry_len = nv * hv * hk;
     let rows = CheckpointRows(3);
-    let slot_entries = rows.entries_per_slot();
+    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
     let t_full = 6usize;
 
     let conv_full = fill(t_full * conv_dim);
@@ -1410,15 +1498,15 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
     };
 
     // Slot 1 of a two-slot pool; its steps' codes chained as the allocator chains them.
-    let entry = [slot_entries as i32];
-    let pool = || buf_zero_f32(&device, 2 * slot_entries * entry_len);
-    let slot = std::cell::Cell::new((StateEntry::First, RecordArea::First));
+    let entry = [1];
+    let pool = || buf_zero_f32(&device, 2 * slot_len);
+    let slot = std::cell::Cell::new(RecordArea::First);
     let step = |start, checkpoint_rows| {
-        let (tip, records) = slot.get();
+        let records = slot.get();
         let step = GdnStep {
             start,
             checkpoint_rows,
-            tip,
+            pool_rows: rows,
             records,
         };
         slot.set(step.after());
@@ -1487,7 +1575,7 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         return;
     };
     assert_close(&o_next, &o_full[5 * value_dim..], "resumed row");
-    let slot0 = read_f32(&state, slot_entries * entry_len);
+    let slot0 = read_f32(&state, slot_len);
     assert!(
         slot0.iter().all(|&v| v == 0.0),
         "slot 0's entries were written"
@@ -1498,7 +1586,7 @@ fn gdn_scan_varlen_resumes_from_checkpoint() {
         [GdnStep {
             start,
             checkpoint_rows: CheckpointRows::NONE,
-            tip: StateEntry::First,
+            pool_rows: rows,
             records: RecordArea::First,
         }
         .encode()]
@@ -1554,7 +1642,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
     let entry_len = nv * hv * hk;
     let scale = (hk as f32).powf(-0.5);
     let rows = CheckpointRows(3);
-    let slot_entries = rows.entries_per_slot();
+    let slot_len = entry_len + 2 * (usize::from(rows.0) + 1) * (conv_dim + 2 * nv);
     let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
     let (a_log, dt_bias) = (fill(nv), shifted(nv, 5));
     // Rows 0..3 the prompt, 3..5 the kept ones, 5 the next; a verify step's rejected drafts follow
@@ -1582,7 +1670,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
     .expect("gdn_scan_simd_f32");
     let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
     // Slot 1 of a two-slot pool.
-    let entry = [slot_entries as i32];
+    let entry = [1];
     let entry_buf = buf_i32(&device, &entry);
     // `gdn_gating`'s g and beta, for the serial scan.
     let gating = |a: &[f32], b: &[f32]| {
@@ -1634,7 +1722,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
             }
         }
     };
-    let pool = || buf_zero_f32(&device, 2 * slot_entries * entry_len);
+    let pool = || buf_zero_f32(&device, 2 * slot_len);
     let prompt = |scan, state: &Buffer, code| {
         run(
             scan,
@@ -1659,7 +1747,7 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
         [GdnStep {
             start,
             checkpoint_rows: CheckpointRows::NONE,
-            tip: StateEntry::First,
+            pool_rows: rows,
             records: RecordArea::First,
         }
         .encode()]
@@ -1692,13 +1780,13 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
     // Prompt and a verify step on `verifier`, then the next row on `resumer` from `start`, the
     // slot's steps' codes chained as the allocator chains them.
     let resume = |verifier, resumer, start| {
-        let slot = std::cell::Cell::new((StateEntry::First, RecordArea::First));
+        let slot = std::cell::Cell::new(RecordArea::First);
         let step = |start, checkpoint_rows| {
-            let (tip, records) = slot.get();
+            let records = slot.get();
             let step = GdnStep {
                 start,
                 checkpoint_rows,
-                tip,
+                pool_rows: rows,
                 records,
             };
             slot.set(step.after());
@@ -1722,8 +1810,8 @@ fn gdn_scan_simd_resumes_from_checkpoint() {
         Some((o_verify[..2 * value_dim].to_vec(), o_next))
     };
 
-    // Not the replay: resuming from the verify step's last state — its rejected drafts' — is not
-    // the row run without drafts.
+    // Not the replay: resuming from the slot as it stands — the state the verify step started
+    // from, without its kept rows — is not the row run without drafts.
     let Some((_, o_tip)) = resume(Scan::Simd, Scan::Simd, GdnStart::Slot) else {
         return;
     };

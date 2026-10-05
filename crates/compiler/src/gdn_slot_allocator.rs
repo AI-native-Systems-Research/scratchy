@@ -25,13 +25,13 @@
 //! ## Speculative decoding
 //!
 //! A verify step runs a sequence's drafts through its recurrent state, so a rejected draft would
-//! stay in it. The verify step saves the state after each draft row to the slot's checkpoints
+//! stay in it. The verify step leaves the state it started from in the slot and records its rows
 //! ([`scratchy_layers::gdn_state`]); [`GdnSlotAllocator::verified`] records how many drafts were
-//! kept, and the request's next step starts from that checkpoint.
+//! kept, and the request's next step replays its rows up to the last kept one.
 
 use std::collections::HashMap;
 
-use scratchy_layers::gdn_state::{CheckpointRows, GdnStart, GdnStep, RecordArea, StateEntry};
+use scratchy_layers::gdn_state::{CheckpointRows, GdnStart, GdnStep, RecordArea};
 
 /// Why a step's GDN inputs could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,7 @@ impl std::fmt::Display for GdnStepError {
 #[derive(Debug)]
 pub struct GdnSlotAllocator {
     num_slots: usize,
-    /// The state pool's checkpoints per slot: slot `s`'s state is entry `s · (1 + rows)`.
+    /// The state pool's: the most drafts a slot keeps (its layout).
     checkpoint_rows: CheckpointRows,
     /// Free slot ids (LIFO stack).
     free: Vec<u32>,
@@ -77,11 +77,10 @@ pub struct GdnSlotAllocator {
     assigned: HashMap<u64, (u32, SlotState)>,
 }
 
-/// Where a slot's next step starts, and which of its ssm entries and record areas are current.
+/// Where a slot's next step starts, and which of its record areas is current.
 #[derive(Clone, Copy, Debug)]
 struct SlotState {
     start: GdnStart,
-    tip: StateEntry,
     records: RecordArea,
 }
 
@@ -100,7 +99,7 @@ impl GdnSlotAllocator {
     }
 
     /// One step's GDN inputs, for its sequences in `cu_seqlens` order as `(request_id, drafts)`:
-    /// each sequence's state entry (`state_indices`) and its [`GdnStep`] code. A verify step
+    /// each sequence's state slot (`state_indices`) and its [`GdnStep`] code. A verify step
     /// (`drafts > 0`) keeps what a rejected draft needs undone (`gdn_state` module docs).
     pub fn step(
         &mut self,
@@ -119,29 +118,26 @@ impl GdnSlotAllocator {
                 })?;
             let (slot, state) =
                 (self.slot_for(request_id)).ok_or(GdnStepError::Exhausted { capacity })?;
-            let entry = slot as usize * slot_rows.entries_per_slot();
-            entries.push(i32::try_from(entry).expect("GDN state entry fits the kernels' i32"));
+            entries.push(i32::try_from(slot).expect("GDN state slot fits the kernels' i32"));
             let step = GdnStep {
                 start: std::mem::replace(&mut state.start, GdnStart::Slot),
                 checkpoint_rows,
-                tip: state.tip,
+                pool_rows: slot_rows,
                 records: state.records,
             };
-            (state.tip, state.records) = step.after();
+            state.records = step.after();
             steps.push(step.encode());
         }
         Ok((entries, steps))
     }
 
-    /// A verify step kept `accepted` of `request_id`'s `drafts`. Unless it kept them all, the
-    /// slot's state includes rejected drafts, so the next step starts from the checkpoint after
-    /// the last kept row.
+    /// A verify step kept `accepted` of `request_id`'s `drafts`. The slot still holds the state
+    /// the step started from, so the next step replays its rows through the last kept one —
+    /// row `accepted` (row 0 is the sequence's own token), every draft kept or not.
     pub fn verified(&mut self, request_id: u64, accepted: usize, drafts: usize) {
-        if accepted >= drafts {
-            return;
-        }
+        debug_assert!(accepted <= drafts, "{accepted} of {drafts} drafts kept");
         if let Some((_, state)) = self.assigned.get_mut(&request_id) {
-            let row = u8::try_from(accepted).expect("accepted < drafts ≤ CheckpointRows (u8)");
+            let row = u8::try_from(accepted).expect("accepted ≤ drafts ≤ CheckpointRows (u8)");
             state.start = GdnStart::Checkpoint(row);
         }
     }
@@ -152,8 +148,7 @@ impl GdnSlotAllocator {
     ///   prior, now-released owner left there.
     /// * [`GdnStart::Slot`] → a continuing forward (decode step / later prefill chunk); read and
     ///   update the slot's existing state.
-    /// * [`GdnStart::Checkpoint`] → the step after a verify step that rejected drafts
-    ///   ([`Self::verified`]).
+    /// * [`GdnStart::Checkpoint`] → the step after a verify step ([`Self::verified`]).
     ///
     /// Returns `None` when the pool is exhausted — the scheduler must never
     /// admit more GDN sequences than `num_slots`.
@@ -162,7 +157,6 @@ impl GdnSlotAllocator {
             let slot = self.free.pop()?;
             let fresh = SlotState {
                 start: GdnStart::Fresh,
-                tip: StateEntry::First,
                 records: RecordArea::First,
             };
             self.assigned.insert(request_id, (slot, fresh));
@@ -293,41 +287,40 @@ mod tests {
         assert_eq!(a.free.len(), cap);
     }
 
-    /// A verify step that rejects drafts makes the request's next step — and only that one —
-    /// start from the base entry and replay the kept rows; keeping every draft leaves the newest
-    /// state, which already ends at the last row. A verify step moves the newest state to the
-    /// other entry and its records to the other area; a step resuming in place moves neither.
+    /// A verify step makes the request's next step — and only that one — replay its rows through
+    /// the last kept one, whether it kept every draft or none: the slot holds the state the verify
+    /// step started from. A verify step moves the records to the other area; a step that verifies
+    /// nothing leaves them. Slots, not entries, index the state.
     #[test]
     fn test_verify_resumes_from_the_kept_row() {
         use RecordArea::{First as R0, Second as R1};
-        use StateEntry::{First as E0, Second as E1};
         let rows = CheckpointRows(3);
         let mut a = GdnSlotAllocator::new(2, rows);
-        let code = |start, checkpoint_rows, tip, records| {
+        let code = |start, checkpoint_rows, records| {
             GdnStep {
                 start,
                 checkpoint_rows,
-                tip,
+                pool_rows: rows,
                 records,
             }
             .encode()
         };
         let none = CheckpointRows::NONE;
-        let fresh = code(GdnStart::Fresh, none, E0, R0);
-        assert_eq!(a.step([(5, 0), (6, 0)]), Ok((vec![0, 4], vec![fresh; 2])));
-        // Verify from the newest state (E0): rows' state to E1, records to R1.
-        let ok = |start, tip, records| Ok((vec![0], vec![code(start, rows, tip, records)]));
-        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Slot, E0, R0));
+        let fresh = code(GdnStart::Fresh, none, R0);
+        assert_eq!(a.step([(5, 0), (6, 0)]), Ok((vec![0, 1], vec![fresh; 2])));
+        let ok = |start, records| Ok((vec![0], vec![code(start, rows, records)]));
+        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Slot, R0));
         a.verified(5, 1, 3);
-        // Resume from the base (E0) replaying R1: its start state stays in E0, rows' to E1.
-        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Checkpoint(1), E1, R1));
+        // Replay R1's rows 0..=1, record to R0.
+        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Checkpoint(1), R1));
         a.verified(5, 3, 3);
-        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Slot, E1, R0));
+        // Every draft kept: still a replay, of all four rows.
+        assert_eq!(a.step([(5, 3)]), ok(GdnStart::Checkpoint(3), R0));
         a.verified(5, 0, 3);
-        // A decode resuming from the base (E1, replaying R1) updates it in place: newest in E1.
-        let decode = code(GdnStart::Checkpoint(0), none, E0, R1);
+        // A decode after a verify step replays and updates the slot in place.
+        let decode = code(GdnStart::Checkpoint(0), none, R1);
         assert_eq!(a.step([(5, 0)]), Ok((vec![0], vec![decode])));
-        let slot = code(GdnStart::Slot, none, E1, R1);
+        let slot = code(GdnStart::Slot, none, R1);
         assert_eq!(a.step([(5, 0)]), Ok((vec![0], vec![slot])));
 
         assert_eq!(
