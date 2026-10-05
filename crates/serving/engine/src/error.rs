@@ -43,10 +43,20 @@ pub enum ExecutorError {
     #[error("worker initialization failed: {0}")]
     WorkerInit(String),
 
-    /// The worker backend has no implementation for this model architecture.
-    /// Surfaced when `try_load` returns `ArchLoad::ArchNotCompiled` — no
-    /// `#[forward]` registration claims the HF arch at this tp size.
-    #[error("architecture `{0}` not supported by this backend")]
+    /// No compiled model claims this architecture. Surfaced when `try_load`
+    /// returns `ArchLoad::ArchNotCompiled` — no `#[forward]` registration owns
+    /// the HF arch at this tp size.
+    ///
+    /// "Not supported" alone reads as a missing backend, but by far the commoner
+    /// cause is BUILD SCOPE: `scratchy-models` has no default model scope, so an
+    /// arch is absent simply because no `model/<stem>` feature named it. Say
+    /// both, since the reader cannot tell them apart from the outside.
+    #[error(
+        "architecture `{0}` is not compiled into this build. Either no model of that \
+         architecture was named at build time — `scratchy-models` has no default model scope, \
+         so name one with `model/<stem>` (or `model/<arch>` / `model/all` to widen) — or this \
+         backend has no implementation for it."
+    )]
     ArchNotSupported(String),
 
     /// The architecture IS compiled, but no compiled model variant's

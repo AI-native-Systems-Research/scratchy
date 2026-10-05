@@ -2485,7 +2485,11 @@ fn affine_pattern_matches(pattern: &str, name: &str) -> bool {
 /// variant rejects 3.6's 8-bit gate (`512 * 8 != 32 * 64`) exactly as the 8-bit
 /// one rejects 3.5's (`256 * 4 != 32 * 64`).
 ///
-/// Rank-agnostic: `last()` also covers 3-D stacked-expert tensors.
+/// Rank-agnostic: keying off `last()` means a 3-D stacked-expert tensor would
+/// validate by the same arithmetic. Note that no row the macro emits currently
+/// names one — see `affine_tensors_of`, which cannot source those widths — so
+/// today that generality is exercised only by this module's own tests, not by
+/// any generated fingerprint.
 ///
 /// **Permissive by design.** A listed weight that is absent, has no `.scales`
 /// sibling, or whose shapes are empty yields no opinion — and a tensor NOT
@@ -2629,8 +2633,13 @@ mod affine_width_tests {
         );
     }
 
-    /// Stacked routed experts are 3-D (`[num_experts, out, in/pack]`); the check
-    /// keys off the LAST dim so the same arithmetic covers them.
+    /// Stacked routed experts are 3-D (`[num_experts, out, in/pack]`); keying
+    /// off the LAST dim means the same arithmetic covers them.
+    ///
+    /// FORWARD-LOOKING, not current coverage: `affine_tensors_of` emits no row
+    /// naming an expert stack (those leaf names live in the backend loaders —
+    /// see its doc for the accepted residual risk), so this asserts the
+    /// arithmetic is ready for such a row rather than that one exists.
     #[test]
     fn stacked_expert_tensors_are_checked_on_their_last_dim() {
         let widths: &[(&str, u32, u32)] = &[(

@@ -31,7 +31,9 @@ use std::sync::Arc;
 
 use scratchy_core_config::{LayerKvGeometry, compute_hybrid_kv_layout};
 use scratchy_core_model::weight::HfModelConfig;
-use scratchy_forward_compiler::{HfFingerprint, ScratchyWeights, hash_json_value, try_load};
+use scratchy_forward_compiler::{
+    ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
+};
 use scratchy_target_metal::gdn_state::GdnStatePool;
 use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
 use scratchy_target_metal::kv_cache::KvCachePool;
@@ -175,19 +177,30 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     .iter()
     .filter_map(|p| weights.tensor_shape_any(p).map(|s| format!("{p}={s:?}")))
     .collect();
-    let model = try_load(&mut weights, (), &arch, 1, 0, max_model_len, fingerprint)
+    let model = match try_load(&mut weights, (), &arch, 1, 0, max_model_len, fingerprint)
         .expect("try_load")
-        .unwrap_or_else(|| {
+    {
+        ArchLoad::Loaded(m) => m,
+        // Both misses are a failure for a case that named this checkpoint, but
+        // they say different things about WHY — whether the gate build's feature
+        // scope missed the arch, or the arch is in scope and no compiled
+        // (stem, preset) pair describes this checkpoint.
+        miss => {
             let linked: Vec<&str> = scratchy_forward_compiler::inventory::iter::<
                 scratchy_forward_compiler::ScratchyArchRegistration,
             >()
             .map(|r| r.arch_name)
             .collect();
+            let why = match miss {
+                ArchLoad::ArchNotCompiled => "this build compiles no variant of that arch",
+                _ => "the arch is compiled, but no variant's fingerprint accepted this checkpoint",
+            };
             panic!(
-                "{repo} ({arch}): no compiled variant claims this checkpoint \
+                "{repo} ({arch}): no compiled variant claims this checkpoint — {why} \
                  ({fingerprint:?}; {probed:?}); linked arch registrations: {linked:?}"
             )
-        });
+        }
+    };
 
     let head_dim = model.head_dim() as usize;
     let kv_heads = model.num_key_value_heads() as usize;
@@ -621,7 +634,7 @@ o2_cases! {
     "qwen2.5-0.5b" => o2_qwen2_5_0_5b("Qwen/Qwen2.5-0.5B-Instruct", Sampled);
     "qwen3-0.6b" => o2_qwen3_0_6b("Qwen/Qwen3-0.6B", Sampled);
     "modernbert-base" => o2_modernbert_base("answerdotai/ModernBERT-base", All);
-    // mlx-affine-b4-g64 (+ gate8-qembed, the only preset qwen3-5-moe declares).
+    // mlx-affine-b4-g64.
     "llama-3.2-3b" => o2_llama_3_2_3b_mlx("mlx-community/Llama-3.2-3B-Instruct-4bit", Sampled);
     "llama-3.2-3b" => o2_llama_3_2_3b_mlx_long("mlx-community/Llama-3.2-3B-Instruct-4bit", Sampled, LONG_PROMPTS @ LONG_BUCKET_CAP);
     "llama-3.2-1b" => o2_llama_3_2_1b_mlx("mlx-community/Llama-3.2-1B-Instruct-4bit", Sampled);
@@ -632,8 +645,17 @@ o2_cases! {
     "qwen2.5-3b" => o2_qwen2_5_3b_mlx("mlx-community/Qwen2.5-3B-Instruct-4bit", Sampled);
     "qwen3-0.6b" => o2_qwen3_0_6b_mlx("mlx-community/Qwen3-0.6B-4bit", Sampled);
     "qwen3.5-0.8b" => o2_qwen3_5_0_8b_mlx("mlx-community/Qwen3.5-0.8B-4bit", Sampled);
-    "qwen3.5-35b-a3b" => o2_qwen3_5_35b_a3b_mlx("mlx-community/Qwen3.6-35B-A3B-4bit", Sampled);
     // mlx-affine-b4-g64-qembed (untied, quantized embedding) and mlx-affine-b4-g32.
+    // qwen3-5-moe is here, not above: its preset is `-qembed` (both checkpoints
+    // pack `embed_tokens` AND `lm_head`). Each stem runs ITS OWN checkpoint —
+    // they differ only in the router gates' width (4-bit on 3.5, 8-bit on 3.6,
+    // the latter declared in `qwen3.6-35b-a3b-mlx-affine-b4-g64-qembed
+    // .overrides.json`), and the per-role affine width gate in
+    // `fingerprint_matches` is what keeps the two variants apart (#202). Before
+    // that, one arch-wide 8-bit-gate preset described 3.6 only, so the 3.5 stem
+    // was the only one compiled and it claimed the 3.6 checkpoint.
+    "qwen3.5-35b-a3b" => o2_qwen3_5_35b_a3b_mlx("mlx-community/Qwen3.5-35B-A3B-4bit", Sampled);
+    "qwen3.6-35b-a3b" => o2_qwen3_6_35b_a3b_mlx("mlx-community/Qwen3.6-35B-A3B-4bit", Sampled);
     "qwen2.5-7b" => o2_qwen2_5_7b_mlx_qembed("mlx-community/Qwen2.5-7B-Instruct-4bit", Sampled);
     "qwen2-vl-2b-mlx-text-only" => o2_qwen2_vl_2b_text_mlx_qembed("mlx-community/Qwen2-VL-2B-Instruct-4bit", Sampled);
     "granite-4.1-3b" => o2_granite_4_1_3b_mlx_g32("mlx-community/granite-4.1-3b-4bit", Sampled);

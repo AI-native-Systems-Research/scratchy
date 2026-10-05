@@ -481,10 +481,22 @@ enum FieldLoad {
 /// runtime does equality, never suffix matching: `mlp.gate_proj` can never
 /// collide with `switch_mlp.gate_proj`.
 ///
-/// Only tensors whose width this function can state are listed. Stacked routed
-/// experts (`switch_mlp.*`, `GemmaSwitchGlu`) are deliberately absent: their
-/// sub-leaf names live in the backend loaders, and the fingerprint must claim
-/// nothing it cannot source from here. Unlisted tensors are simply not checked.
+/// Only tensors whose width this function can state are listed. Unlisted
+/// tensors are simply not checked.
+///
+/// ⚠️ ACCEPTED RESIDUAL RISK: the routed-expert stacks are NOT listed.
+/// `switch_mlp.{gate,up,down}_proj`, Mixtral's `w1/w2/w3` and
+/// `GemmaSwitchGlu`'s sub-leaves are named inside the backend loaders, not
+/// here, so this function cannot state their on-disk paths without duplicating
+/// that naming — which is the duplication the whole design exists to remove.
+/// The consequence is explicit: the expert-bit axis has NO fingerprint
+/// coverage, so a #202-class divergence in EXPERT widths (rather than the
+/// router gates') would still mis-select and surface down in the dequant path,
+/// and `load_stacked_experts`' pre-stacked `take()` validates no width against
+/// expected geometry either. No in-tree checkpoint diverges that way today —
+/// the two qwen3.5/3.6 checkpoints agree on expert bits and differ only in the
+/// gates. Closing it means teaching the macro those per-arch leaf names (or
+/// having the loaders report them), which is a design call of its own.
 fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
     let one = |p: &str, bits: u32, gs: u32| vec![(format!("{p}.weight"), bits, gs)];
     match fl {

@@ -41,7 +41,7 @@ mod imp {
 
     use half::bf16;
     use objc2_metal::MTLCreateSystemDefaultDevice;
-    use scratchy_forward_compiler::{HfFingerprint, hash_json_value, try_load};
+    use scratchy_forward_compiler::{ArchLoad, HfFingerprint, hash_json_value, try_load};
     use scratchy_target_metal::device::Device;
     use scratchy_target_metal::kv_cache::KvCachePool;
     use scratchy_target_metal::{
@@ -242,8 +242,8 @@ mod imp {
         gw.set_target_dtype(DType::BF16);
         let model =
             match try_load(&mut gw, (), &arch_hint, 1, 0, max_model_len, hf).expect("try_load") {
-                Some(m) => m,
-                None => {
+                ArchLoad::Loaded(m) => m,
+                ArchLoad::ArchNotCompiled => {
                     // No compiled variant claims this arch string — the build's
                     // feature scope names other arches. A skip, not a failure:
                     // the same goldens dir runs green in a build that scopes
@@ -254,6 +254,16 @@ mod imp {
                     );
                     return;
                 }
+                // The arch IS compiled and every variant still declined, which a
+                // feature scope cannot explain — the synthetic checkpoint and the
+                // compiled variant disagree about shapes or quantization layout.
+                // That is a real failure, not a scope skip.
+                ArchLoad::NoVariantMatched => panic!(
+                    "{}/{}: {arch_hint} is compiled, but no compiled variant matches this \
+                     checkpoint — its shapes or quantization layout differ from every \
+                     (stem, preset) pair in this build",
+                    case.arch, case.stem,
+                ),
             };
 
         // ── pools, sized from the loaded model (no per-arch constants) ──
