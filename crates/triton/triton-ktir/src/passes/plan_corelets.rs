@@ -219,21 +219,40 @@ fn plan_loop(module: &mut Module, path: &OpPath) -> Result<()> {
             corelets = fill_independent_rows(rows);
         }
         Pattern::IndependentSubtile => {
-            let n = recover_matmul_n(&loopp).ok_or_else(|| {
+            // ⭐ AN ODD N IS A SINGLE-CORELET PLAN, NOT A REFUSAL — the same
+            // re-patterning the C++ itself made for `split` at one stick
+            // (`PlanCorelets.cpp:456-479`, mirrored above): the N/2 partition must
+            // tile N exactly, and an odd N has no such split, but a stick is the
+            // transfer and compute granule and N=49155 IS a whole number of sticks —
+            // assigning the whole output to ONE corelet is the correct plan. The
+            // SPYRE PRODUCER NEEDS THIS: granite's lm_head is vocab 49155, and the
+            // builder path has emitted exactly this matmul for the whole life of
+            // this repo (it never runs PlanCorelets — only the Triton ladder does),
+            // so the device runs it. This port previously reproduced the C++'s OLD
+            // refusal, which reproduced a bug the field has since fixed.
+            //
+            // WHAT IS **NOT** RELAXED: `verify_plan`'s single-corelet arm still
+            // demands exactly one corelet with a two-element non-empty `data_bounds`
+            // starting at 0 — a new plan SHAPE, never a weaker verifier.
+            let n = recover_any_matmul_n(&loopp).ok_or_else(|| {
                 Refusal::new(
                     PASS,
-                    "independent_subtile pattern cannot read a static, even output N from \
-                     the region's linalg.matmul output (the N/2 partition must tile N with \
-                     no overlap). Reading N from the lowered KTIR is required; hardcoding \
-                     the fixture's literal N is not (ping @rganti).",
+                    "independent_subtile pattern cannot read a static, positive output N from \
+                     the region's linalg.matmul output (reading N from the lowered KTIR is \
+                     required; hardcoding the fixture's literal N is not (ping @rganti)).",
                 )
             })?;
-            corelets = fill_independent_subtile(n);
-            // P2.4: the whole-matmul WorkDivision makes the plan LOAD-BEARING -- the
-            // multicore emitter DERIVES its 32-core form from this rather than
-            // re-deriving from the memory views.
-            if let Some([m, n_full, k]) = recover_matmul_shape(module, &loopp) {
-                work_division = Some(matmul_work_division(m, n_full, k).to_vec());
+            if n % NUM_CORELETS == 0 {
+                corelets = fill_independent_subtile(n);
+                // P2.4: the whole-matmul WorkDivision makes the plan LOAD-BEARING -- the
+                // multicore emitter DERIVES its 32-core form from this rather than
+                // re-deriving from the memory views.
+                if let Some([m, n_full, k]) = recover_matmul_shape(module, &loopp) {
+                    work_division = Some(matmul_work_division(m, n_full, k).to_vec());
+                }
+            } else {
+                pattern = Pattern::SingleCorelet;
+                corelets = fill_single_corelet(n);
             }
         }
     }
@@ -422,9 +441,12 @@ fn recover_tile_sticks(loopp: &Op) -> Option<i64> {
     None
 }
 
-/// The matmul output's static N (last) dim. A non-static or ODD N is a RED-stop:
-/// the N/2 partition must tile N exactly.
-fn recover_matmul_n(loopp: &Op) -> Option<i64> {
+/// The matmul output's static N (last) dim, even or odd. Even Ns take the
+/// `independent_subtile` N/2 partition; an ODD N is re-patterned to
+/// `single_corelet` (see the `IndependentSubtile` arm) — the whole output on one
+/// corelet, which is a whole number of sticks for any positive N. A non-static or
+/// non-positive N is still a RED-stop.
+fn recover_any_matmul_n(loopp: &Op) -> Option<i64> {
     for op in loopp.ops_deep() {
         if op.kind != OpKind::LinalgMatmul || op.results.len() != 1 {
             continue;
@@ -436,7 +458,7 @@ fn recover_matmul_n(loopp: &Op) -> Option<i64> {
             continue;
         }
         let n = *dims.last().unwrap();
-        if n > 0 && n % NUM_CORELETS == 0 {
+        if n > 0 {
             return Some(n);
         }
     }

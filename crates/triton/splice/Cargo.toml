@@ -6,11 +6,11 @@ license = "Apache-2.0"
 publish = false
 
 # The splice: a SubtileTape node whose KTIR comes from a Triton kernel
-# (crates/triton/PROVENANCE.md), compiled at `#[forward]` expansion time, instead
-# of the Rust builder in scratchy-target-spyre. A LEAF between the two ladders:
-# scratchy-subtile (the tape types) below, the re-hosted Triton front end above.
-# scratchy-target-spyre hooks it in behind its `spyre-triton` feature — the target
-# crate gains a hook, not a second copy of the lowering.
+# (crates/triton/PROVENANCE.md), compiled at `#[forward]` expansion time. A LEAF
+# between the two ladders: scratchy-subtile (the tape types) below, the re-hosted
+# Triton front end above. scratchy-target-spyre routes every spliced op kind
+# through it unconditionally — the target crate gains a hook, not a second copy of
+# the lowering.
 
 [dependencies]
 scratchy-subtile = { path = "../../compiler/subtile", features = ["spyre"] }
@@ -18,9 +18,8 @@ ktir-core = { path = "../../targets/spyre/ktir/ktir-core" }
 ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 # ⭐ THE RUST LADDER, from this workspace's own re-host. `codegen::compile` parses `.py`
 # kernels with the OWNED parser (`triton-frontend/src/py/parser.rs`), which the splice
-# does at expansion time. The pod-offline constraint is recorded in
-# crates/triton/PROVENANCE.md: a pod build never turns on `spyre-triton`, and the ladder
-# pulls no crates.io package regardless.
+# does at expansion time. The ladder is dependency-free offline
+# (crates/triton/PROVENANCE.md, copy rule 2) — no crates.io package regardless.
 triton-frontend = { path = "../triton-frontend" }
 triton-ktir = { path = "../triton-ktir" }
 triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }

@@ -57,8 +57,9 @@ pub use scratchy_spyre_bundle as bundle;
 // codegen: `superdsc::graph_wiring`, `superdsc::unroll_layers`) keep resolving through this module's
 // path after the SubtileIR → KTIR construction moved to its own file.
 pub use crate::lower_subtile_tape_to_ktir::{
-    BundleWiring, NodeArgs, graph_wiring, lower_graph_to_ktir, lower_graph_to_superdsc,
-    lower_subtile_tape_to_ktir,
+    BundleWiring, NodeArgs, graph_wiring, lower_elementwise_node, lower_graph_to_ktir,
+    lower_graph_to_superdsc, lower_matmul_node, lower_rmsnorm_node, lower_scalarmul_node,
+    lower_silumul_node, lower_subtile_tape_to_ktir,
 };
 // ⭐⭐⭐ THE REQUEST TYPE LIVES IN `ktir_superdsc::ktir_node` — `KtirNode` and the decode ladder rung
 // `ActiveCap`. Not a device fact and not the caller's own plan: what a KTIR producer hands in.

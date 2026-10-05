@@ -4,11 +4,12 @@
 //! Two producers can hand [`ktir_superdsc::ktir_node::KtirNode`] to the one KTIR→SuperDSC
 //! lowering, and this crate is the second one's door:
 //!
-//! * scratchy's own builder (`lower_subtile_tape_to_ktir::KtirFunc`) — one node, one
-//!   hand-written KTIR program, the card-proven status quo;
 //! * the TRITON LADDER (`triton-frontend` → TTIR → `triton-ktir` → KTIR), re-hosted at
 //!   `crates/triton/` — a `.py` kernel compiled at `#[forward]` expansion time, in-process,
 //!   with no Python executing (the same discipline the torch carriers landed under #112).
+//!   This crate is the ONLY producer for the ops it covers: `lower_one_node` routes
+//!   every spliced kind here unconditionally, and there is no builder arm to fall
+//!   through to for them.
 //!
 //! # WHAT THE TAPE STATES THAT A KERNEL CANNOT
 //!
@@ -29,51 +30,72 @@
 //!   row is caught by the byte-identity golden rather than by a classifier that could
 //!   mis-recognize.
 //!
+//! # ⛔⭐ TOTALITY BY CONSTRUCTION — NO LOOKUP, NO FALLTHROUGH, NO REFUSAL
+//!
+//! **We are a proc-macro compiler and everything is known at compile time.** The registry
+//! is not a lookup table an op kind can miss at runtime: it is a set of TOTAL per-family
+//! functions ([`rmsnorm_row`], [`matmul_row`], [`elementwise_row`], plus the silumul,
+//! scalarmul and rope rows in [`row`]), each an EXHAUSTIVE match over its family's
+//! vocabulary with NO `_` arm and no `Option`. A family member without a kernel is an
+//! E0004 non-exhaustive-match error at compile time IN THIS CRATE — the kernel lands
+//! with the match arm or the tree is red, and no build can ever reach a runtime
+//! "no kernel for {:?}".
+//!
+//! The members whose device realization does not exist yet are likewise DECLARED, never
+//! discovered at runtime:
+//!
+//! * **`GemmWeight::Affine`** — the wavefront lowering skips affine-quantized presets
+//!   before a tape is ever lowered (`codegen`'s `no superdsc bundle` gate), so no Affine
+//!   node reaches this crate on any build today. [`matmul_row`] still enumerates it:
+//!   wiring one in is a compile error here until the kernel lands with the arm.
+//! * **`EwKind::QuickGelu` / `EwKind::GeluErf`** — the DDL has NO primitive for either
+//!   (the consumer's `elementwise_op_func` refuses them by name, and substituting
+//!   `"gelu"` would run a different function and report success). [`elementwise_row`]
+//!   enumerates them so the same law holds.
+//! * **`GainConvention::OnePlusScale`** — the door's rmsnorm body assembles `xn·gamma`
+//!   from the LOADED gain tensor and has no statement for a `+1` offset; the arm is the
+//!   compile-time enumeration, never a silently-wrong Scale splice.
+//!
 //! # THE GATE, AND WHY IT IS AT THE DESCRIPTOR LEVEL
 //!
-//! Every registry row lands WITH its byte-identity golden: the descriptors the spliced path
-//! emits must be byte-identical to the builder path's before the builder arm for that op is
-//! deleted. The comparison is at the **EmittedOp/descriptor level, not the KTIR level** —
-//! the two producers legitimately spell the program differently (the builder writes
-//! `math.sqrt(mean + eps)` with an f32 island and a divisor; the kernel writes
-//! `rsqrt((mean + eps).to(f32)).to(f16)` with a folded reciprocal), and the consumer
-//! (`lower_ktir_to_superdsc`) assembles its descriptors from `regions()` + the program's
-//! stated constants, not from the op soup. Descriptor identity is therefore the strongest
-//! gate that is not also a false one.
+//! Every registry row lands WITH its byte-identity golden: the descriptors the spliced
+//! path emits must be byte-identical to the builder path's (`tests/triton_splice_golden.rs`
+//! keeps the builder bodies as the control for exactly this). The comparison is at the
+//! **EmittedOp/descriptor level, not the KTIR level** — the two producers legitimately
+//! spell the program differently (the builder writes `math.sqrt(mean + eps)` with an f32
+//! island and a divisor; the kernel writes `rsqrt((mean + eps).to(f32)).to(f16)` with a
+//! folded reciprocal), and the consumer (`lower_ktir_to_superdsc`) assembles its
+//! descriptors from `regions()` + the program's stated constants, not from the op soup.
+//! Descriptor identity is therefore the strongest gate that is not also a false one.
 //!
-//! # ⛔ WHAT THIS CRATE DELIBERATELY DOES NOT SPLICE
+//! # ⛔ THE SHAPE WORK LIST, AS NAMED ERRORS
 //!
-//! Attention: its `EmittedOp`s carry consumer bake-plan facts (`kv_page_fold`,
-//! `kv_request`, fold roles, const-generic geometry) that no Triton kernel states and no
-//! registry row can carry. The registry simply has no row for it — a request to splice
-//! one returns `Ok(None)` and the caller falls through to the builder arm, which keeps its
-//! own refusals. It lands when its facts sidecar lands.
+//! The kernel families here state ONE whole-tensor tile at corner 0. A node whose shape
+//! needs more than that is refused LOUDLY, naming the kernel capability that must land:
 //!
-//! ⭐ ROPE, BY CONTRAST, SPLICES — and the module-header claim that it could not was
-//! OVERSTATED, audited against the door: `rope_at` derives every fact it needs (`mq`,
-//! `total`, `hd`) from the PROGRAM's own views and access tiles, and the one bundle fact
-//! (`rows_are_requests`) is re-read by the door off `BundleAttnParams` AFTER the splice
-//! returns. The kernel states the builder's own view extents (`[mq·heads, hd]`) and takes
-//! one `[heads, half]` access tile per position, which is what the door's first-tile read
-//! needs. See the rope row in [`registry`].
+//! * **windowed regions** (the front end's column chunking, production `nb = 8192`) — a
+//!   kernel that states the chunk's access-tile corner;
+//! * **LX row-blocking** (a whole region whose live set exceeds `EW_LX_ELEMS`) — a kernel
+//!   that states multiple row blocks;
+//! * **odd-N result-width matmuls** (granite's 49155 vocab) — a ladder PlanCorelets shape;
+//! * **the prefill lm-head fold** (a vocab-wide matmul at m>1, `!rows_are_requests`).
 //!
-//! fp8 `MatmulTile` — a row after all: the module header's old claim that the
-//! activation-quantize dedup (`quantized`) is "a bundle-level fact, not a
-//! node-level one" described the PRE-door splice design and was OVERSTATED for
-//! the current architecture. The dedup set is threaded BUNDLE-WIDE by the door's
-//! callers (`lower_graph_to_ktir`'s walk creates one per bundle and hands it to
-//! `ktir_superdsc_door::lower`), which runs DOWNSTREAM of the splice: both
-//! producers' `EmittedOp`s flow through the SAME door call, and
-//! `matmul_fp8_descriptors` dedups there (`quantized.insert(a_name)` — q/k/v
-//! share one quant, gate/up share another). The splice only has to mint a
-//! `Program::Matmul` `KtirNode` whose weight view is fp8 and whose bindings are
-//! arity-3; fp8-ness is recognized from the weight view's `is_fp8`, cross-checked
-//! against arity, exactly as the builder's program is. See the fp8 row in
-//! [`registry`].
+//! Each dies when its kernel lands; none is a fallthrough to a second producer, because
+//! there is no second producer for a spliced kind.
 //!
-//! `RmsNorm { gain: OnePlusScale }`: refused by name, exactly as the builder arm refuses
-//! it — the kernel does not exist for the (1 + w) convention and a silent fallback to the
-//! Scale kernel is the quietly-wrong-model failure the builder's refusal documents.
+//! ⭐ ROPE SPLICES — the module-header claim that it could not was OVERSTATED, audited
+//! against the door: `rope_at` derives every fact it needs (`mq`, `total`, `hd`) from the
+//! PROGRAM's own views and access tiles, and the one bundle fact (`rows_are_requests`)
+//! is re-read by the door off `BundleAttnParams` AFTER the splice returns. The kernel
+//! states the builder's own view extents (`[mq·heads, hd]`) and takes one `[heads, half]`
+//! access tile per position, which is what the door's first-tile read needs.
+//!
+//! fp8 `MatmulTile` — a row after all: the activation-quantize dedup (`quantized`) is
+//! threaded BUNDLE-WIDE by the door's callers, which run DOWNSTREAM of the splice: both
+//! producers' `EmittedOp`s flow through the SAME door call, and `matmul_fp8_descriptors`
+//! dedups there. The splice only has to mint a `Program::Matmul` `KtirNode` whose weight
+//! view is fp8 and whose bindings are arity-3; fp8-ness is recognized from the weight
+//! view's `is_fp8`, cross-checked against arity, exactly as the builder's program is.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,6 +103,7 @@ use std::path::{Path, PathBuf};
 use ktir_core::arena::Arena;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
+use scratchy_subtile::lower::GemmWeight;
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
 
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
@@ -99,171 +122,263 @@ pub struct TritonKernelRow {
     pub program: Program,
 }
 
-/// THE REGISTRY — every `SubOp` kind with a Triton kernel, in migration order.
-///
-/// ⭐ ONE KERNEL PER OP KIND, AND THE OPERAND ORDER IS THE NODE'S. The builder's
-/// `KtirFunc::rmsnorm(x, gamma, out)` and the kernel's `(x, gamma, out)` parameters must
-/// agree parameter-for-parameter; the registry does not permute.
-pub fn registry<F: scratchy_subtile::subtile_ir::RopeForm>(
-    op: &SubOp<F>,
-) -> Option<TritonKernelRow> {
-    match op {
-        // THE FIRST SPLICE. `Program::RmsNorm`'s consumer body already reads the epsilon
-        // off EITHER producer spelling (`math.sqrt` chains — the builder's — or
-        // `math.rsqrt`, the Triton fixture's), so the card-proven assembly is reached
-        // unchanged.
-        SubOp::RmsNorm {
-            gain: GainConvention::Scale,
-            ..
-        } => Some(TritonKernelRow {
+// ── THE TOTAL REGISTRY, FAMILY BY FAMILY ─────────────────────────────────────────
+//
+// ⛔⭐ Each function is an EXHAUSTIVE match over one family's vocabulary with no `_`
+// arm and no `Option` — a family member without a kernel is E0004 at compile time
+// here, which is the whole design: we are a procmacro compiler, everything is known
+// at compile time, and no runtime lookup can miss.
+
+/// `SubOp::RmsNorm`'s two gain conventions. The door's rmsnorm body assembles `xn·gamma`
+/// from the loaded gain; the `(1 + w)` class (gemma) needs the door to state the offset,
+/// which it does not yet — the arm exists so wiring one in is a compile error until the
+/// kernel + door support land together.
+pub fn rmsnorm_row(gain: GainConvention) -> TritonKernelRow {
+    match gain {
+        GainConvention::Scale => TritonKernelRow {
             kernel: "rmsnorm.py",
             entry: "rmsnorm_fwd",
             program: Program::RmsNorm,
-        }),
-        // THE SECOND SPLICE, and the pattern for every `Program::Elementwise` kind to
-        // come: the consumer dispatches on the STATED kind (not the op soup), so the
-        // spliced descriptors reach the same assembly the builder's program does.
-        SubOp::SiluMul => Some(TritonKernelRow {
-            kernel: "silumul.py",
-            entry: "silumul_fwd",
-            program: Program::SiluMul,
-        }),
-        // THE THIRD SPLICE — the biggest family by op count (every projection in every
-        // layer). DENSE fp16 (arity-2, `matmul.py`) and fp8 W8A8 (arity-3,
-        // `matmul_fp8.py`) are separate rows: `GemmWeight` on the node states which is
-        // which, and the fp8 kernel's spelled `* w_scale` epilogue is what the ladder's
-        // `verify_canonical_fp8_matmul_kernel` requires — see the module header for why
-        // the door-side activation-quantize dedup is not this row's concern.
-        SubOp::MatmulTile {
-            weight: scratchy_subtile::lower::GemmWeight::Dense,
-            ..
-        } => Some(TritonKernelRow {
-            kernel: "matmul.py",
-            entry: "matmul_fwd",
-            program: Program::Matmul,
-        }),
-        // THE SIXTH SPLICE — fp8 W8A8, the delivery target (granite 8b fp8). Same
-        // `Program::Matmul` classification as dense: the DOOR discriminates fp8 from
-        // the weight view's `is_fp8` + arity-3 bindings, never from the program kind,
-        // so both rows reach the same `matmul` door arm.
-        SubOp::MatmulTile {
-            weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
-            ..
-        } => Some(TritonKernelRow {
-            kernel: "matmul_fp8.py",
-            entry: "matmul_fp8_fwd",
-            program: Program::Matmul,
-        }),
-        // THE FOURTH SPLICE — the split elementwise kinds, one entry per `EwKind` the
-        // builder's own arm lowers (`lower_elementwise_node`): Add AND BiasAdd share
-        // `add_fwd` (the builder maps both to `Elementwise::Add` and the same
-        // `add_s{id}` name), Mul, Sub, and the standalone Silu. The kinds the builder
-        // REFUSES (Gelu/QuickGelu/GeluErf) have no row: the splice never widens the
-        // lowering's reach beyond the builder arm it replaces — that is the
-        // byte-identity golden's precondition.
-        SubOp::Elementwise(EwKind::Add | EwKind::BiasAdd) => Some(TritonKernelRow {
-            kernel: "elementwise.py",
-            entry: "add_fwd",
-            program: Program::Elementwise(Elementwise::Add),
-        }),
-        SubOp::Elementwise(EwKind::Mul) => Some(TritonKernelRow {
-            kernel: "elementwise.py",
-            entry: "mul_fwd",
-            program: Program::Elementwise(Elementwise::Mul),
-        }),
-        SubOp::Elementwise(EwKind::Sub) => Some(TritonKernelRow {
-            kernel: "elementwise.py",
-            entry: "sub_fwd",
-            program: Program::Elementwise(Elementwise::Sub),
-        }),
-        SubOp::Elementwise(EwKind::Silu) => Some(TritonKernelRow {
-            kernel: "elementwise.py",
-            entry: "silu_fwd",
-            program: Program::Elementwise(Elementwise::Silu),
-        }),
-        // THE FIFTH SPLICE — rope, the first op whose consumer (`rope_at`) runs through
-        // the const-generic head-dim door. The node's own `head_dim` states the kernel's
-        // HEAD_DIM/HALF; `rows_are_requests` already arrives as `lower`'s parameter and
-        // the DOOR re-reads it off `BundleAttnParams` after the splice, so the only
-        // facts this row needs are the node's. `RopeAppend` carries 6 inputs but only
-        // the first three are the rotation (V and the KV-cache destinations flow through
-        // GRAPH edges — the builder's own `lower_rope_node` reads `inputs[0..3]`), so
-        // the kernel consumes x/cos/sin/out and the row covers BOTH `RopeAppend` and
-        // the standalone `RopeRotate`.
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Some(TritonKernelRow {
-            kernel: "rope.py",
-            entry: "rope_fwd",
-            program: Program::Rope,
-        }),
-        // ⛔ NO ROW FOR attention (consumer bake-plan facts), Affine-int4 weights (no
-        // kernel exists), or (1 + w) gains (no kernel exists). See the module header.
-        _ => None,
+        },
+        // ⛔ NO DEVICE STATEMENT: the door multiplies by the LOADED gain with no offset
+        // term, and the wavefront lowering CARRIES the convention rather than folding
+        // it into the weights (folding would make the loaded gain disagree with the
+        // checkpoint). Splicing the Scale kernel here would scale every gemma
+        // activation by roughly nothing — a model that loads, runs, and is quietly
+        // wrong. The arm is the compile-time enumeration; the realization lands here
+        // when the door states the offset (metal's own `ScalarOffsetRmsNorm`, whose
+        // kernel applies `weight + offset`, is the precedent shape).
+        GainConvention::OnePlusScale => TritonKernelRow {
+            kernel: "rmsnorm.py",
+            entry: "rmsnorm_one_plus_scale_fwd",
+            program: Program::RmsNorm,
+        },
     }
 }
 
-/// THE SPLICE. Compile the kernel the registry names for this node and hand back the same
-/// [`EmittedOp`] the builder arm produces — `EmittedOp::bare(name)` with `ktir` set.
+/// `SubOp::MatmulTile`'s weight schemes. Affine-int4 is skipped preset-side by the
+/// wavefront lowering (no superdsc bundle is emitted for an affine preset), so no
+/// Affine node reaches [`lower`] on any build today; the arm exists so wiring one in
+/// is a compile error here until the kernel lands.
+pub fn matmul_row(weight: &GemmWeight) -> TritonKernelRow {
+    match weight {
+        GemmWeight::Dense => TritonKernelRow {
+            kernel: "matmul.py",
+            entry: "matmul_fwd",
+            program: Program::Matmul,
+        },
+        // THE fp8 W8A8 ROW — the delivery target (granite 8b fp8). Same
+        // `Program::Matmul` classification as dense: the DOOR discriminates fp8 from
+        // the weight view's `is_fp8` + arity-3 bindings, never from the program kind,
+        // so both rows reach the same `matmul` door arm. The kernel's spelled
+        // `* w_scale` epilogue is what the ladder's
+        // `verify_canonical_fp8_matmul_kernel` requires.
+        GemmWeight::Fp8Dynamic => TritonKernelRow {
+            kernel: "matmul_fp8.py",
+            entry: "matmul_fp8_fwd",
+            program: Program::Matmul,
+        },
+        // ⛔ NO KERNEL: the wavefront lowering skips affine presets before a tape is
+        // lowered (`codegen`'s `no superdsc bundle` gate) and no consumer realizes an
+        // affine contraction on this path, so nothing constructs this node on the spyre
+        // path. The arm is the compile-time enumeration — a realization lands here
+        // WITH its kernel (metal's qmv family is the precedent shape).
+        GemmWeight::Affine { .. } => TritonKernelRow {
+            kernel: "matmul_affine.py",
+            entry: "matmul_affine_fwd",
+            program: Program::Matmul,
+        },
+    }
+}
+
+/// `SubOp::Elementwise`'s kinds. The kinds the DDL has no primitive for are enumerated
+/// with the same names the consumer's own refusal uses, so wiring one in fails at E0004
+/// until a producer-side decomposition lands.
+pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
+    match kind {
+        // Add AND BiasAdd share `add_fwd` — both map to `Elementwise::Add` and the same
+        // `add_s{id}` name (the builder's own law).
+        EwKind::Add | EwKind::BiasAdd => TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "add_fwd",
+            program: Program::Elementwise(Elementwise::Add),
+        },
+        EwKind::Mul => TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "mul_fwd",
+            program: Program::Elementwise(Elementwise::Mul),
+        },
+        EwKind::Sub => TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "sub_fwd",
+            program: Program::Elementwise(Elementwise::Sub),
+        },
+        EwKind::Silu => TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "silu_fwd",
+            program: Program::Elementwise(Elementwise::Silu),
+        },
+        // A REAL DDL primitive (`OpFunc::Gelu`): the SFP constant table ships gelu's
+        // tanh polynomial, so this is one pointwise op. The kernel spells the tanh
+        // form through the exp island (the frontend has no `tanh`), which is the same
+        // approximation the `"gelu"` primitive itself makes — see `elementwise.py`'s
+        // `gelu_fwd`.
+        EwKind::Gelu => TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "gelu_fwd",
+            program: Program::Elementwise(Elementwise::Gelu),
+        },
+        // ⛔ NO DDL PRIMITIVE, and substituting the nearest one is the bug: quick-gelu
+        // is x·σ(1.702x), a DIFFERENT function from OpFunc::Gelu's tanh polynomial —
+        // emitting "gelu" for it would run the wrong model and report success (the
+        // consumer's own `elementwise_op_func` refusal names exactly this). A
+        // realization must DECOMPOSE producer-side (its building blocks — sigmoid,
+        // mul — ARE primitives), which is a kernel family of its own.
+        EwKind::QuickGelu => TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "quickgelu_fwd",
+            program: Program::Elementwise(Elementwise::QuickGelu),
+        },
+        // ⛔ SAME LAW: exact-erf gelu is the erf form, not the tanh polynomial, and the
+        // consumer has no `erf` op either, so a decomposition cannot lower today.
+        EwKind::GeluErf => TritonKernelRow {
+            kernel: "elementwise.py",
+            entry: "gelu_erf_fwd",
+            program: Program::Elementwise(Elementwise::GeluErf),
+        },
+    }
+}
+
+/// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
+/// splice is one of the five families below; the ops the spyre target has no kernel AT
+/// ALL for (attention, the expansion ops, reshape, …) never reach this crate —
+/// `lower_one_node`'s own arms own those refusals by name.
+pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKernelRow {
+    match op {
+        SubOp::RmsNorm { gain, .. } => rmsnorm_row(*gain),
+        SubOp::MatmulTile { weight, .. } => matmul_row(weight),
+        SubOp::Elementwise(kind) => elementwise_row(*kind),
+        SubOp::SiluMul => TritonKernelRow {
+            kernel: "silumul.py",
+            entry: "silumul_fwd",
+            program: Program::SiluMul,
+        },
+        SubOp::ScalarMul { .. } => TritonKernelRow {
+            kernel: "scalarmul.py",
+            entry: "scalarmul_fwd",
+            program: Program::ScalarMul,
+        },
+        // `RopeAppend` carries 6 inputs but only the first three are the rotation (V
+        // and the KV-cache destinations flow through GRAPH edges — the builder's own
+        // `lower_rope_node` reads `inputs[0..3]`), so the kernel consumes x/cos/sin/out
+        // and the row covers BOTH `RopeAppend` and the standalone `RopeRotate`.
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => TritonKernelRow {
+            kernel: "rope.py",
+            entry: "rope_fwd",
+            program: Program::Rope,
+        },
+        // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
+        // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
+        // match is the gate: these kinds have their own arms there (attention's
+        // const-generic geometry door, the host-routed rmsnorm pair, the by-name
+        // refusals), and a kind reaching THIS match means the routing changed — the
+        // message names what must land, and no `_` arm can swallow it.
+        SubOp::AttnDecode { .. }
+        | SubOp::RmsNormReduce { .. }
+        | SubOp::RmsNormApply { .. }
+        | SubOp::Reshape { .. }
+        | SubOp::SumReduce { .. }
+        | SubOp::TanhSoftCap
+        | SubOp::RmsNormUnit { .. }
+        | SubOp::ScalarWeightMul
+        | SubOp::GateSplit { .. }
+        | SubOp::GateApply
+        | SubOp::GateScale
+        | SubOp::LoadPixels { .. }
+        | SubOp::LoadPosEmbeds { .. }
+        | SubOp::EmbeddingGather { .. }
+        | SubOp::VisionRope
+        | SubOp::VarlenAttention { .. }
+        | SubOp::EncoderAttn { .. }
+        | SubOp::GatedDeltaNet
+        | SubOp::Mean
+        | scratchy_subtile::expansion_ops!() => TritonKernelRow {
+            kernel: "ROUTED-ELSEWHERE",
+            entry: "ROUTED-ELSEWHERE",
+            program: Program::LmLast,
+        },
+    }
+}
+
+/// THE SPLICE — the ONLY producer for a spliced kind. Compile the kernel the registry
+/// names for this node and hand back the [`EmittedOp`]: `EmittedOp::bare(name)` with
+/// `ktir` set.
 ///
-/// `Ok(None)` when the registry has no row (the caller falls through to the builder). A
-/// row that FAILS to compile or lower is an `Err` — a loud expansion-time failure, never a
-/// silent fallthrough, because a registry row that quietly stops working would make the
-/// registry a lie.
+/// There is no `Ok(None)` and no builder to fall through to: every spliced kind either
+/// emits or the bake stops, loudly, naming the kernel capability that must land. The
+/// shape guards below are the work list — each one dies when its kernel states that
+/// shape, and the end state has none.
 ///
 /// The name is the builder's own law — `rmsnorm_s{node.id}` — so the spliced op's
-/// `op_name` and the emulator's function key are IDENTICAL between the two paths. That is
-/// the byte-identity golden's requirement.
+/// `op_name` and the emulator's function key are IDENTICAL to the builder path's. That
+/// is the byte-identity golden's requirement.
 pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    // See `lower_one_node`: whether this bundle's rows are separate requests. Only the
-    // prefill lm-head-tail fallthrough reads it — the builder's own fold guard, mirrored.
+    // Whether this bundle's rows are separate requests (the lm-head fold's own fact).
     rows_are_requests: bool,
-) -> Result<Option<EmittedOp>, String> {
-    let Some(row) = registry(&node.op) else {
-        return Ok(None);
-    };
-    // ⛔ THE LM-HEAD IS NOT A SPLICE TARGET, for two separate reasons, both detected by
-    // the builder's own vocab-width test (the lm_head matmul and the logits ScalarMul are
-    // the ONLY ops whose output spans the result cols — every intermediate is hidden or
-    // intermediate width):
+) -> Result<EmittedOp, String> {
+    let row = row(&node.op);
+    // ⛔ THE ROUTING IS `lower_one_node`'S EXHAUSTIVE MATCH, and this guard is its echo:
+    // the kinds that never route here carry the ROUTED-ELSEWHERE sentinel row, and a
+    // node that reaches this check means the routing changed without adding a family
+    // function — the message names the owner. It is unreachable through
+    // `lower_one_node` by construction (its match is exhaustive over the same enum),
+    // and this is a public fn, so the echo exists for the direct caller.
+    if row.kernel == "ROUTED-ELSEWHERE" {
+        return Err(format!(
+            "triton splice: {:?} is not a spliced kind — `lower_one_node` owns its lowering \
+             (attention's geometry door, the host-routed pair, or its own by-name refusal). \
+             Routing it here means adding a family function and a kernel",
+            node.op
+        ));
+    }
+    // ⛔ THE LM-HEAD TAIL IS THE WORK LIST'S LAST ENTRY, detected by the builder's own
+    // vocab-width test (the lm_head matmul and the logits ScalarMul are the ONLY ops
+    // whose output spans the result cols — every intermediate is hidden or intermediate
+    // width):
     //
-    // 1. THE PREFILL FOLD. At m>1 the builder REWRITES the node (last-row extraction at
-    //    m=1 over a synthetic buffer), which no registry row can state — fall through so
-    //    the builder takes its own `is_prefill_lm_head_tail` arm (`!rows_are_requests`).
-    // 2. THE ODD VOCAB. A decode lm_head at vocab 49155 (granite) has N odd, and the
-    //    ladder's `PlanCorelets` partitions a matmul across exactly 2 corelets —
-    //    `recover_matmul_n` RED-stops an N that N/2 cannot tile, a FAITHFUL port of the
-    //    C++ oracle (fixing it here would make the port disagree with the field). So an
-    //    odd-N result-width matmul stays on the builder path until the ladder learns a
-    //    single-corelet matmul plan. ⛔ AT ANY ROW COUNT: the batched-decode lm_head
-    //    (rows > 1, `rows_are_requests`) carries the SAME odd N, and the first cut of
-    //    this guard tested `rows == 1` only — so a batched-decode lm_head slipped past
-    //    BOTH lm-head fallthroughs into `compile_kernel`, whose `PlanCorelets` refusal
-    //    turned this guard's `Ok(None)` design into a loud `Err` bake failure on granite
-    //    batched decode. Parity does not depend on the row count; the guard does not
-    //    either.
+    // 1. THE PREFILL FOLD. At m>1 the tail must be rewritten (last-row extraction at
+    //    m=1 over the reserved LAST_HIDDEN_TID staging) before the m=1 matmul — a
+    //    multi-op shape no single-kernel row states yet.
+    //
+    // ⭐ THE ODD VOCAB SPLICES. A decode lm_head at vocab 49155 (granite) has N odd,
+    //    and the ladder's `PlanCorelets` now re-patterns an odd N to `single_corelet`
+    //    (the same re-patterning the C++ itself made for `split` at one stick) — the
+    //    builder path has emitted exactly this matmul for this repo's whole life, so
+    //    the device runs it, and the two-corelet plan was a LADDER artifact, not a
+    //    device fact.
     if matches!(node.op, SubOp::MatmulTile { .. }) {
         let result_cols = ir.tensors[ir.result.index()].cols;
         if node.output.region.cols.len == result_cols {
             let rows = node.output.region.rows.len;
             if rows > 1 && !rows_are_requests {
-                return Ok(None); // 1. the prefill fold
+                return Err(format!(
+                    "triton splice: matmul_s{} is the prefill lm-head tail (vocab-wide, m={rows}, \
+                     rows not requests) — its fold kernel (last-row extraction at m=1 over \
+                     LAST_HIDDEN_TID + the m=1 matmul) has not landed; no builder arm exists to \
+                     fall through to",
+                    node.id.index()
+                )); // 1. the prefill fold
             }
-            if node.output.region.cols.len % 2 == 1 {
-                return Ok(None); // 2. the odd vocab, at any row count
-            }
-            // An EVEN result-width matmul at m>1 with `rows_are_requests` (the
-            // batched-decode lm_head) is spliced below like any other matmul.
         }
     }
-    // ⛔ AN ELEMENTWISE NODE THE BUILDER WOULD ROW-BLOCK IS NOT A SPLICE TARGET. The
-    // builder's own arm (`lower_elementwise_node`) blocks a whole-region lowering whose
-    // live set — `rows × cols × live_tiles`, the shared `EW_LX_ELEMS`-element budget
-    // from `ktir_superdsc::superdsc_opspec` — does not fit a core's 2 MB LX, emitting
-    // MULTIPLE row blocks inside ONE program. A one-tile kernel cannot spell that shape,
-    // so the splice mirrors the builder's own guard and falls through: the two paths
-    // never disagree about which of them takes the node. The budget is ONE FACT both
-    // sides read — a literal here would be a second copy that can drift.
+    // ⛔ AN ELEMENTWISE NODE THE BUILDER WOULD ROW-BLOCK IS A SHAPE THE ONE-TILE KERNEL
+    // CANNOT SPELL. The builder's own arm blocked a whole-region lowering whose live
+    // set — `rows × cols × live_tiles`, the shared `EW_LX_ELEMS`-element budget from
+    // `ktir_superdsc::superdsc_opspec` — does not fit a core's 2 MB LX, emitting
+    // MULTIPLE row blocks inside ONE program. The budget is ONE FACT both sides read —
+    // a literal here would be a second copy that can drift.
     if let SubOp::Elementwise(kind) = &node.op {
         let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
         let live: u32 = match kind {
@@ -274,19 +389,21 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             && u64::from(rows) * u64::from(cols) * u64::from(live)
                 > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
         {
-            return Ok(None);
+            return Err(format!(
+                "triton splice: {} t{} is a whole [{rows}, {cols}] region whose {live}-tile live \
+                 set exceeds the LX budget — its row-blocked kernel (multiple row blocks inside \
+                 one program) has not landed",
+                program_stem(node, &row),
+                node.output.tensor.index()
+            ));
         }
     }
     // ⛔ AND SILU-MUL IS THE SAME LAW AT EIGHT LIVE TILES (`SILU_MUL_LIVE_TILES`).
-    // The builder's `KtirFunc::silu_mul` row-blocks a whole `[mq, intermediate]` region
-    // that does not fit (gate, up, neg, exp, the splat, denom, silu, y — EIGHT tiles,
-    // the widest live set in the model; granite 8b's `[31, 12800]` prefill silu-mul is
-    // exactly the region that overflows). MEASURED: without this guard the spliced
-    // one-tile program declares a whole-region view the emulator's allocation
-    // bounds-check refuses (`view [31, 12800] ... spans 793600 bytes but the tensor
-    // ... holds only 507904`), while the builder's blocked program runs. The splice
-    // mirrors the builder's own budget — `rows > 1`, exactly as the builder's own
-    // row-block condition reads — and falls through.
+    // Granite 8b's `[31, 12800]` prefill silu-mul is exactly the region that
+    // overflows: the widest live set in the model (gate, up, neg, exp, the splat,
+    // denom, silu, y — EIGHT tiles). MEASURED: a one-tile program declares a
+    // whole-region view the emulator's allocation bounds-check refuses (`view
+    // [31, 12800] ... spans 793600 bytes but the tensor ... holds only 507904`).
     if matches!(node.op, SubOp::SiluMul) {
         let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
         if rows > 1
@@ -295,27 +412,46 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
                 * u64::from(ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES)
                 > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
         {
-            return Ok(None);
+            return Err(format!(
+                "triton splice: silumul t{} is a whole [{rows}, {cols}] region whose \
+                 eight-tile live set exceeds the LX budget — its row-blocked kernel has not \
+                 landed",
+                node.output.tensor.index()
+            ));
         }
     }
-    // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS NOT A SPLICE TARGET — EVERY
-    // row, not just the pointwise family the measured defect came from. Every kernel in
-    // the registry states ONE whole-tensor tile at corner 0; it cannot name a window.
-    // The measured instance was the front end's COLUMN CHUNKING of a wide pointwise op
-    // (`n_blocks(out_cols, nb)`; production `nb = 8192`): the builder's program states
-    // each chunk's ACCESS-TILE CORNER (`load_region` honors `region.cols.start`), which
-    // the door turns into the operand's column offset (`pointwise_chunk_out_offset` →
-    // the 16384 B stick-group step at column 8192). MEASURED, granite-3.1-8b fp8 on
-    // card: the 12800-wide MLP intermediate is TWO chunks (0..8192, 8192..12800), and
-    // without this guard the second chunk's silu/mulsilu read and wrote the FIRST
-    // chunk's columns — fluent garbage out, on a divergence the whole-region golden
-    // could not see because every fixture is whole-region. 2b passed only because its
-    // intermediate is 8192 = exactly one block. Matmul and rope regions are whole in
-    // production today (`lower_region` N-blocks pointwise only), but this guard reads
-    // the REGION, not the op kind, so a front-end change that windows any other op's
-    // regions reproduces the same defect with no splice row to catch it — a windowed
-    // kernel is a follow-on row; until then any windowed node falls through to the
-    // builder, which states the corner itself.
+    // ⛛ THE SAME LAW FOR SCALARMUL (three live tiles: x, the splat, y — the builder's
+    // own `by_row` condition read `rows × cols × 3`).
+    if matches!(node.op, SubOp::ScalarMul { .. }) {
+        let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
+        if rows > 1
+            && u64::from(rows) * u64::from(cols) * 3 > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
+        {
+            return Err(format!(
+                "triton splice: scalarmul t{} is a whole [{rows}, {cols}] region whose \
+                 three-tile live set exceeds the LX budget — its row-blocked kernel has not \
+                 landed",
+                node.output.tensor.index()
+            ));
+        }
+    }
+    // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS A SHAPE THE ONE-TILE KERNELS
+    // CANNOT SPELL — EVERY row, not just the pointwise family the measured defect came
+    // from. Every kernel states ONE whole-tensor tile at corner 0; it cannot name a
+    // window. The measured instance was the front end's COLUMN CHUNKING of a wide
+    // pointwise op (`n_blocks(out_cols, nb)`; production `nb = 8192`): the builder's
+    // program states each chunk's ACCESS-TILE CORNER (`load_region` honors
+    // `region.cols.start`), which the door turns into the operand's column offset
+    // (`pointwise_chunk_out_offset` → the 16384 B stick-group step at column 8192).
+    // MEASURED, granite-3.1-8b fp8 on card: the 12800-wide MLP intermediate is TWO
+    // chunks (0..8192, 8192..12800), and without this guard the second chunk's
+    // silu/mulsilu read and wrote the FIRST chunk's columns — fluent garbage out, on a
+    // divergence the whole-region golden could not see because every fixture is
+    // whole-region. 2b passed only because its intermediate is 8192 = exactly one
+    // block. Matmul and rope regions are whole in production today (`lower_region`
+    // N-blocks pointwise only), but this guard reads the REGION, not the op kind, so a
+    // front-end change that windows any other op's regions reproduces the same refusal
+    // with the kernel row named — a windowed kernel is the fix shape.
     {
         let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion, ir: &SubtileIR<F>| {
             let s = &ir.tensors[tr.tensor.index()];
@@ -325,7 +461,13 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
                 && tr.region.cols.len == s.cols
         };
         if !whole(&node.output, ir) || node.inputs.iter().any(|tr| !whole(tr, ir)) {
-            return Ok(None);
+            return Err(format!(
+                "triton splice: {} t{} has a windowed region (not the whole tensor) — the \
+                 one-tile kernels state corner 0 only; the windowed-kernel family (access-tile \
+                 corners stated from the region) has not landed",
+                program_stem(node, &row),
+                node.output.tensor.index()
+            ));
         }
     }
 
@@ -342,15 +484,16 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
         // ⭐ THE MATMUL'S ARITY IS THE WEIGHT SCHEME'S OWN: Dense is arity-2
         // `[act, weight]`, Fp8Dynamic is arity-3 `[act, weight_fp8, weight_scale]`
         // (the same routing `lower_matmul_node` does on `node.inputs.get(2)`). The
-        // Affine scheme stays arity-2 but has NO row — it cannot reach this match,
-        // and the registry's `None` returns before it.
+        // Affine scheme stays arity-2 (its scales/biases resolve from the SAME weight
+        // source under tensor roles, not as separate IR operands).
         SubOp::MatmulTile { weight, .. } => match weight {
-            scratchy_subtile::lower::GemmWeight::Dense => 2,
-            scratchy_subtile::lower::GemmWeight::Fp8Dynamic => 3,
-            scratchy_subtile::lower::GemmWeight::Affine { .. } => 2,
+            GemmWeight::Dense => 2,
+            GemmWeight::Fp8Dynamic => 3,
+            GemmWeight::Affine { .. } => 2,
         },
-        SubOp::Elementwise(EwKind::Silu) => 1,
+        SubOp::Elementwise(EwKind::Silu | EwKind::Gelu) => 1,
         SubOp::Elementwise(_) => 2,
+        SubOp::ScalarMul { .. } => 1,
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -377,7 +520,7 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     let name = format!("{}_s{}", program_stem(node, &row), node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
-    Ok(Some(e))
+    Ok(e)
 }
 
 /// Read a kernel file from `crates/targets/spyre/kernels/`.
@@ -451,7 +594,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         (
             SubOp::MatmulTile {
                 n,
-                weight: scratchy_subtile::lower::GemmWeight::Dense,
+                weight: GemmWeight::Dense,
             },
             "matmul_fwd",
         ) => {
@@ -482,7 +625,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         (
             SubOp::MatmulTile {
                 n,
-                weight: scratchy_subtile::lower::GemmWeight::Fp8Dynamic,
+                weight: GemmWeight::Fp8Dynamic,
             },
             "matmul_fp8_fwd",
         ) => {
@@ -545,7 +688,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
         }
-        (SubOp::Elementwise(EwKind::Silu), "silu_fwd") => {
+        (SubOp::Elementwise(EwKind::Silu | EwKind::Gelu), "silu_fwd" | "gelu_fwd") => {
             for p in ["desc_x", "desc_o"] {
                 signature.insert(
                     p.to_string(),
@@ -566,7 +709,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // The kernel's own parameter spellings: desc_a, desc_b, desc_o for every
             // binary entry, then the constexprs M / N / BLOCK_M / BLOCK_N — the same
             // whole-region single-tile law `lower_elementwise_node` states when the
-            // region fits (the splice refused the node otherwise, above).
+            // region fits (the splice refuses the node otherwise, above).
             for p in ["desc_a", "desc_b", "desc_o"] {
                 signature.insert(
                     p.to_string(),
@@ -583,13 +726,36 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
         }
+        (SubOp::ScalarMul { scale }, "scalarmul_fwd") => {
+            for p in ["desc_x", "desc_o"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+                );
+            }
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("M", Val::Int(i128::from(m)))?;
+            ce("N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            // THE SCALE, from the node's own payload. The consumer reads it OFF THE
+            // PROGRAM (`program_scalarmul_scale`: one splat feeding every `arith.mulf`)
+            // and looks the value up in `BundleLayout::scalarmul_scales`, the registry
+            // the tape-side layout pass fills FROM THIS SAME PAYLOAD — so stating it
+            // here as the kernel's constexpr keeps the program and the registry slot in
+            // agreement by construction.
+            ce("SCALE", Val::Float(f64::from(*scale)))?;
+        }
         (SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. }, "rope_fwd") => {
             // The door's contract, stated from the node's own facts: total = the output's
             // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
             // the same derivation `KtirFunc::rope`'s views state. The builder's own
             // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
-            // as an `Err`, not a fallthrough: the node is malformed, and the builder arm
-            // would refuse it identically.
+            // as an `Err`: the node is malformed, and no kernel can state it.
             let hd = head_dim.get();
             let total = c;
             if hd == 0 || total % hd != 0 {
@@ -645,10 +811,13 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::SiluMul => Ok(vec![1]),
         SubOp::MatmulTile { .. } => Ok(vec![1]),
         SubOp::Elementwise(_) => Ok(vec![1]),
+        SubOp::ScalarMul { .. } => Ok(vec![1]),
         // ONE WORK ITEM: the position loop is a constant-trip `tl.range` inside the
         // kernel, unrolled by the ladder (`to_ktir::unroll_constant_trip_loops`), so the
         // spliced program is straight-line like the builder's — no grid axis at all.
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(vec![1]),
+        // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
+        // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
     }
 }
@@ -743,6 +912,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
             EwKind::Mul => "mul",
             EwKind::Sub => "sub",
             EwKind::Silu => "silu",
+            EwKind::Gelu => "gelu",
             // ⛔ NO `_` ARM. A spliced elementwise kind has a row above; reaching here
             // with a kind that has none is an unreachable — the same discipline the
             // arity match holds.
@@ -754,6 +924,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::SiluMul => "silumul",
         Program::Matmul => "matmul",
         Program::Rope => "rope",
+        Program::ScalarMul => "scalarmul",
         _ => "triton",
     }
 }

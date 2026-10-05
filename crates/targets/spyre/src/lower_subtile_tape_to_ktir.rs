@@ -29,12 +29,18 @@ use ktir_core::irtype::IrType;
 use ktir_core::opkind::OpKind;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{ActiveCap, KtirNode};
-use scratchy_subtile::model_geometry::{with_config_attn_geometry, with_config_head_dim};
+use scratchy_subtile::model_geometry::with_config_attn_geometry;
 use scratchy_subtile::subtile_ir::{EwKind, RopeForm, SubOp, SubtileIR, SubtileNode};
 use scratchy_subtile::subtile_ir::{TensorId, TensorRegion};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout, Df, ItDim};
 
-fn lower_matmul_node<F: RopeForm>(
+/// THE BUILDER CONTROL for the splice's byte-identity golden: the card-proven
+/// hand-written program for one `MatmulTile` node. Production routes this kind through
+/// the Triton splice unconditionally; this body (and its siblings below) survive as the
+/// golden's CONTROL side — the descriptors the splice emits must be byte-identical to
+/// these before the row is trusted — and as the reference the windowed/row-blocked
+/// kernel families land against.
+pub fn lower_matmul_node<F: RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     // `(tensor_id, rows, cols)` for an activation that is a SYNTHETIC beyond `ir.tensors` — the
@@ -230,7 +236,9 @@ fn lower_elementwise_node_rows<F: RopeForm>(
     Ok(e)
 }
 
-fn lower_elementwise_node<F: RopeForm>(
+/// THE BUILDER CONTROL for the splice's elementwise golden — see
+/// [`lower_matmul_node`]'s doc for the role.
+pub fn lower_elementwise_node<F: RopeForm>(
     node: &SubtileNode<F>,
     // The graph the node belongs to — the shapes its program's views state.
     ir: &SubtileIR<F>,
@@ -310,7 +318,9 @@ fn lower_elementwise_node<F: RopeForm>(
     Ok(e)
 }
 
-fn lower_silumul_node<F: RopeForm>(
+/// THE BUILDER CONTROL for the splice's silumul golden — see [`lower_matmul_node`]'s
+/// doc for the role.
+pub fn lower_silumul_node<F: RopeForm>(
     node: &SubtileNode<F>,
     // The graph the node belongs to — the shapes its program's views state.
     ir: &SubtileIR<F>,
@@ -342,7 +352,9 @@ fn lower_silumul_node<F: RopeForm>(
 /// broadcast over rows (`mb`=-1); `eps` is a `[1,1]` scalar INPUT (its value is a
 /// runtime const, provisioned like a weight — #51). Synthetic intermediates are
 /// allocated by the coloring pass (like `lower_silumul_node`'s `<out>_silu`).
-fn lower_rmsnorm_node<F: RopeForm>(
+/// THE BUILDER CONTROL for the splice's rmsnorm golden — see [`lower_matmul_node`]'s
+/// doc for the role.
+pub fn lower_rmsnorm_node<F: RopeForm>(
     node: &SubtileNode<F>,
     // The graph the node belongs to — the shapes its program's views state.
     ir: &SubtileIR<F>,
@@ -397,7 +409,10 @@ fn lower_rmsnorm_node<F: RopeForm>(
 /// What it buys immediately: the collapsed RoPE form and the slab RoPE form become TWO INSTANTIATIONS
 /// rather than two arms of one function, so "a head_dim-128 bundle takes the slab path" is a fact the
 /// compiler knows.
-fn lower_rope_node<F: RopeForm, const HD: u32>(
+/// THE BUILDER CONTROL for the splice's rope golden — see [`lower_matmul_node`]'s doc
+/// for the role. Const-generic over the head dim (`with_config_head_dim`'s dispatch
+/// target) exactly as production had it.
+pub fn lower_rope_node<F: RopeForm, const HD: u32>(
     node: &SubtileNode<F>,
     // The graph the node belongs to — the shapes its program's views state.
     ir: &SubtileIR<F>,
@@ -690,7 +705,9 @@ fn host_glue_kind<F: RopeForm>(op: &SubOp<F>) -> &'static str {
 /// (a bound scalar × tensor, proven on-card). The split/address/fold are the standard pointwise structure
 /// (Kani-proven via CoreSplit/dev_off/OpDims); the scale VALUE is the shared SEN169 leaf the worker binds.
 /// NO weight-fold, NO host-route.
-fn lower_scalarmul_node<F: RopeForm>(
+/// THE BUILDER CONTROL for the splice's scalarmul golden — see [`lower_matmul_node`]'s
+/// doc for the role.
+pub fn lower_scalarmul_node<F: RopeForm>(
     node: &SubtileNode<F>,
     // The graph the node belongs to — the shapes its program's views state.
     ir: &SubtileIR<F>,
@@ -800,7 +817,9 @@ fn node_at_one_row<F: RopeForm>(node: &SubtileNode<F>) -> SubtileNode<F> {
 /// the N-column blocking a vocab-wide output needs and (for an arity-3 weight) the whole per-token
 /// fp8 activation-quantize chain, which a hand emit would silently skip and feed the fp8 kernel raw
 /// fp16.
-fn lower_prefill_lm_head_at_m1<F: RopeForm>(
+/// THE BUILDER CONTROL for the splice's prefill-fold worklist item — see
+/// [`lower_matmul_node`]'s doc for the role.
+pub fn lower_prefill_lm_head_at_m1<F: RopeForm>(
     node: &SubtileNode<F>,
     // The graph the node belongs to — the shapes its program's views state.
     ir: &SubtileIR<F>,
@@ -929,7 +948,9 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
 /// [`with_config_head_dim`]. It exists so the arms of that door can be GENERATED: a callback trait
 /// takes one impl and any number of arms, where a `match` written here would need one line per
 /// head dim, written by a human, and therefore a list of head dims in a source file.
-struct LowerRope<'a, F: RopeForm> {
+/// PUB as the rope CONTROL's dispatch door (a golden's runtime head_dim reaches
+/// [`lower_rope_node`]'s const generic through this callback).
+pub struct LowerRope<'a, F: RopeForm> {
     node: &'a SubtileNode<F>,
     /// The graph the node belongs to — the shapes its program's views state.
     ir: &'a SubtileIR<F>,
@@ -991,8 +1012,6 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     rows_are_requests: bool,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    // Threaded to `lower_matmul_node` so fp8 activation quantization is shared across matmuls (see there).
-    quantized: &mut std::collections::HashSet<String>,
 ) -> NodeLowering {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ── PREFILL (m>1) LM-HEAD TAIL, FOLDED TO m=1 — the prefill bundle produces the FIRST generated
@@ -1010,33 +1029,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     // (vocab); every intermediate is hidden/intermediate width. So BOTH re-lower at m=1.
     // The mq=1 DECODE bundle is UNAFFECTED (out_rows==1 ⇒ not the prefill tail ⇒ lowered as before).
     let result_cols = ir.tensors[ir.result.index() as u32 as usize].cols;
-    // NOT WHEN THE ROWS ARE REQUESTS. The fold is sound only because a prompt's rows are one
-    // sequence, so all but the last row's logits are dead. In a batched-decode bundle each row is a
-    // DIFFERENT request and every row's logits are sampled — folding to the last row would hand the
-    // whole batch request B-1's token. The tail then time-tiles at m=B, which is now addressable:
-    // the per-trip advance comes from `StickLayout::dev_off` (`time_tile_sticklayout_stride_tiles_disjoint`),
-    // not the flat row-major form that aliased above one row.
-    let is_prefill_lm_head_tail = node.output.region.cols.len == result_cols
-        && node.output.region.rows.len > 1
-        && !rows_are_requests;
-    // ── THE TRITON SPLICE, CONSULTED FIRST ── a registered op kind compiles its
-    // Triton kernel (`crates/targets/spyre/kernels/`) at expansion time and hands
-    // back the same `EmittedOp` the builder arm in the match below produces.
-    // `Ok(None)` = no registry row, and the fallthrough to the builder is the migration
-    // mechanism itself: a row lands WITH its byte-identity golden
-    // (`tests/triton_splice_golden.rs`), the builder arm is deleted only when every
-    // shape in scope passes, and until then both paths coexist. A row that FAILS to
-    // compile or lower is an `Unhandled` (a loud bake error), never a silent
-    // fallthrough — a registry row that quietly stops working would make the
-    // registry a lie.
-    #[cfg(feature = "spyre-triton")]
-    {
-        match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
-            Ok(Some(e)) => return Ops(vec![e]),
-            Ok(None) => {}
-            Err(reason) => return Unhandled(format!("triton splice refused: {reason}")),
-        }
-    }
+    let _ = result_cols; // retained: the lm-head tail shapes are now the splice's to state
     match &node.op {
         // The rest of the arch vocabulary. It reaches this emitter because the SHARED
         // front end expresses every op instead of asserting the unsupported ones away
@@ -1069,18 +1062,10 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                  an alias gives the two views two names."
                 .to_string(),
         ),
-        SubOp::MatmulTile { .. } if is_prefill_lm_head_tail => {
-            match lower_prefill_lm_head_at_m1(node, ir, sym_id_base, layout, quantized) {
-                Ok(v) => Ops(v),
-                Err(e) => Unhandled(e.0),
-            }
-        }
-        SubOp::MatmulTile { .. } => {
-            match lower_matmul_node(node, ir, None, sym_id_base, layout, quantized) {
-                Ok(v) => Ops(v),
-                Err(e) => Unhandled(e.0),
-            }
-        }
+        SubOp::MatmulTile { .. } => match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+            Ok(e) => Ops(vec![e]),
+            Err(reason) => Unhandled(reason),
+        },
         // ⛔ NO BODY, AND THAT IS THE HONEST STATE. This arm used to lower a `SubtileNode` STRAIGHT
         // TO SuperDSC descriptors — the same violation as the five `*_sdsc` bypasses that were
         // deleted, and the last one left: it was the only producer arm handing the bake an
@@ -1104,16 +1089,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
              `[rows, cols]`. Port it through `KtirFunc` — never straight to a descriptor.",
             node.output.tensor.index() as u32,
         )),
-        SubOp::Elementwise(kind) => {
-            match lower_elementwise_node(node, ir, *kind, sym_id_base, layout) {
-                Ok(o) => Ops(vec![o]),
-                Err(e) => Unhandled(e.0),
+        SubOp::Elementwise(_) | SubOp::SiluMul => {
+            match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+                Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
             }
         }
-        SubOp::SiluMul => match lower_silumul_node(node, ir, sym_id_base, layout) {
-            Ok(v) => Ops(v),
-            Err(e) => Unhandled(e.0),
-        },
         // ⛔ SPYRE'S RMSNORM MULTIPLIES BY THE STORED GAIN. The gemma-class (1 + w)
         // convention needs a different kernel, and running the Scale one over a
         // zero-centred gain scales every normalized activation by roughly nothing — a
@@ -1123,13 +1104,6 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // convention instead of asserting it away in `lower_region`. That is the trade:
         // the IR carries the fact, and the target says whether it has a kernel for it.
         SubOp::RmsNorm {
-            eps,
-            gain: scratchy_subtile::subtile_ir::GainConvention::Scale,
-        } => match lower_rmsnorm_node(node, ir, *eps, sym_id_base) {
-            Ok(v) => Ops(v),
-            Err(e) => Unhandled(e.0),
-        },
-        SubOp::RmsNorm {
             gain: scratchy_subtile::subtile_ir::GainConvention::OnePlusScale,
             ..
         } => Unhandled(format!(
@@ -1137,33 +1111,14 @@ pub(crate) fn lower_one_node<F: RopeForm>(
              no kernel — its rmsnorm multiplies by the stored gain",
             node.output.tensor.index() as u32,
         )),
-        SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-            // ⭐⭐ THE ONE PLACE THE HEAD DIM STOPS BEING A VALUE. Every head_dim-dependent decision
-            // downstream is a branch on a CONST, which is reviewable and guardable; a branch on a
-            // value is neither. The door's arms are every head dim the workspace's model configs
-            // declare, generated by the build script — a head dim with no arm is a loud bake error,
-            // and it is answered by a `config.json`, never by an edit here.
-            match with_config_head_dim(
-                *head_dim,
-                LowerRope {
-                    node,
-                    ir,
-                    sym_id_base,
-                    layout,
-                    rows_are_requests,
-                },
-            ) {
-                Some(Ok(v)) => Ops(v),
-                Some(Err(e)) => Unhandled(e.0),
-                None => Unhandled(format!(
-                    "RopeRotate/RopeAppend head_dim {} has no const-generic instantiation. The head \
-                     dim parameterises the device layout (slabs = head_dim/lanes, and the head-major \
-                     collapse is valid only at head_dim == lanes), so it must be a const, not a \
-                     value. The instantiations are read from the model configs in scope ({}); this \
-                     head dim belongs to none of them.",
-                    head_dim.get(),
-                    scratchy_subtile::model_geometry::geometry_sources(),
-                )),
+        SubOp::RmsNorm { .. } => match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+            Ok(e) => Ops(vec![e]),
+            Err(reason) => Unhandled(reason),
+        },
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } | SubOp::ScalarMul { .. } => {
+            match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
+                Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
             }
         }
         SubOp::AttnDecode {
@@ -1204,21 +1159,6 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         SubOp::RmsNormReduce { .. } | SubOp::RmsNormApply { .. } => {
             HostRouted(host_glue_kind(&node.op))
         }
-        // ScalarMul (granite embedding/residual/attn/logits multipliers): on-device pointwise `mul` by a
-        // bound `[1,1]` scale const (the ATTN_SCALE mechanism) — NOT folded into weights, NOT host-routed.
-        // The vocab-wide LOGITS ScalarMul is the second half of the lm_head tail, so in the m>1 prefill
-        // bundle it re-lowers at m=1 over the single logits row the matmul above wrote (same reason, same
-        // reshape — see is_prefill_lm_head_tail above).
-        SubOp::ScalarMul { scale } if is_prefill_lm_head_tail => {
-            match lower_scalarmul_node(&node_at_one_row(node), ir, *scale, sym_id_base) {
-                Ok(o) => Ops(vec![o]),
-                Err(e) => Unhandled(e.0),
-            }
-        }
-        SubOp::ScalarMul { scale } => match lower_scalarmul_node(node, ir, *scale, sym_id_base) {
-            Ok(o) => Ops(vec![o]),
-            Err(e) => Unhandled(e.0),
-        },
     }
 }
 /// The PRODUCER half over a whole UNROLLED graph: one KTIR program per node, plus the bundle layout
@@ -1270,9 +1210,6 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // RE-ROLLED tape-driven path reuses the SAME helper, walking only the loop body
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
-    // fp8 activation-quantize dedup, bundle-scoped: keyed on the activation `t{id}`, so q/k/v (same rms₁
-    // output) share ONE quant, while a different layer's activation (distinct tid) never false-shares.
-    let mut fp8_quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node in &ir.nodes {
         match lower_one_node(
             node,
@@ -1281,7 +1218,6 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
             rows_are_requests,
             &mut sym_id_base,
             layout,
-            &mut fp8_quantized,
         ) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
@@ -1430,7 +1366,6 @@ pub fn graph_wiring<F: RopeForm>(
     // the UNROLLED graph, which has no layer loop and so no boundary a weight BANK may fall on.
     let layout = compute_bundle_layout(ir, weight_ids, false, &Default::default())?;
     let mut sym_id_base: i64 = 0;
-    let mut quantized = std::collections::HashSet::new();
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
     for node in &ir.nodes {
@@ -1441,7 +1376,6 @@ pub fn graph_wiring<F: RopeForm>(
             false,
             &mut sym_id_base,
             Some(&layout),
-            &mut quantized,
         );
         let ops = match lowered {
             NodeLowering::Ops(v) => v,
@@ -1609,10 +1543,6 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         (Vec::new(), Vec::new(), Vec::new());
     let mut iters: u32 = 0;
     let mut seg: u8 = 0; // 0 = prefix, 1 = body (inside the layer loop), 2 = suffix
-    // fp8 activation-quantize dedup (see `lower_matmul_node`): keyed on the activation `t{id}`. Within the
-    // once-walked body, q/k/v (same rms₁ tid) share ONE quant; distinct-tid activations never false-share,
-    // and the reusing matmul lands in the SAME segment as the quant it reuses (shared tid ⇒ same segment).
-    let mut fp8_quantized: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut unhandled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // ⭐ SEEDED FROM THE PRE-PASS RATHER THAN REBUILT. `per_layer_external_tids` already read every
     // per-layer WEIGHT/KV class off this same tape — it had to, because `compute_bundle_layout` needs
@@ -1774,7 +1704,6 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                     rows_are_requests,
                     &mut sym_id_base,
                     layout,
-                    &mut fp8_quantized,
                 ) {
                     NodeLowering::Ops(v) => match seg {
                         0 => prefix.extend(v),

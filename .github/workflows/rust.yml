@@ -432,19 +432,15 @@ jobs:
       - name: Test (openblas-system)
         run: cargo test -p ktir-emulator --no-default-features --features optimizer,openblas-system --lib --tests
 
-  # ⭐ THE TRITON SPLICE'S OWN GATE. The splice hooks production at `lower_one_node`
-  # behind `spyre-triton`, which no other job enables — so without this job neither
-  # the hook nor the splice crate's surface it names compiles in CI. Covers:
-  #   - clippy `-D warnings` with the feature ON: the hook's types must stay in sync
-  #     with the splice crate (`Ops`/`Unhandled`, `lower`'s signature) and the test
-  #     crate's own code (the golden) must stay lint-clean;
-  #   - `cargo test -p scratchy-target-spyre --lib --tests`: the splice's
-  #     byte-identity golden (`tests/triton_splice_golden.rs`), which lowers every
-  #     registered op both ways through the same door and asserts descriptor
-  #     identity, plus the spyre-emu-gated execution tests (`spyre-emu,spyre-triton`).
-  #     `--lib --tests`, not bare `cargo test`: the crate's two `examples/` need
-  #     `spyre-hw` (a card host), same exclusion the macOS job documents for
-  #     ktir-emulator.
+  # ⭐ THE TRITON SPLICE'S OWN GATE. The splice is now the ONLY producer for the
+  # spliced op kinds (unconditional in `lower_one_node`), so every job that builds
+  # the spyre target compiles it — this job remains the one that runs the splice's
+  # OWN tests at `-D warnings`: the byte-identity golden
+  # (`tests/triton_splice_golden.rs`), which lowers every registered op both ways
+  # through the same door and asserts descriptor identity, plus the spyre-emu-gated
+  # execution tests. `--lib --tests`, not bare `cargo test`: the crate's two
+  # `examples/` need `spyre-hw` (a card host), same exclusion the macOS job
+  # documents for ktir-emulator.
   # Ubuntu (not macOS): `spyre-emu` pulls openblas, which the distro provides; the
   # macOS build would collide with Accelerate in the same way the linux-spyre-emu
   # job documents.
@@ -462,10 +458,10 @@ jobs:
         with:
           key: linux-spyre-triton
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Clippy (spyre-triton)
-        run: cargo clippy -p scratchy-target-spyre --features spyre-emu,spyre-triton --all-targets -- -D warnings
-      - name: Test (spyre-triton golden + emu execution)
-        run: cargo test -p scratchy-target-spyre --features spyre-emu,spyre-triton --lib --tests
+      - name: Clippy (spyre triton)
+        run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
+      - name: Test (spyre triton golden + emu execution)
+        run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
 
   fmt:
     name: Format

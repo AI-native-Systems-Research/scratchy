@@ -771,12 +771,9 @@ pub fn compile_carrier(
     // editing a kernel leaves the caller's baked tape stale with no
     // error (review finding on the splice PR). Same include_str!
     // mechanism as the JSONs above: the path becomes a declared source
-    // input and cargo rebuilds. Gated on `spyre-triton` (this crate's
-    // own feature that forwards to the splice), so a build without the
-    // splice neither names foreign paths nor depends on the kernels
-    // existing. The registry itself decides which kernels exist; if the
-    // directory is absent or empty this adds nothing.
-    #[cfg(feature = "spyre-triton")]
+    // input and cargo rebuilds. UNCONDITIONAL, because the splice is
+    // the only producer: the registry itself decides which kernels
+    // exist; if the directory is absent or empty this adds nothing.
     {
         let kernels_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../targets/spyre/kernels");
