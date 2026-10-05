@@ -5528,17 +5528,6 @@ fn align_256(n: u32) -> u32 {
     (n + 255) & !255
 }
 
-/// The gemma4 MoE grouped expert GEMM (sort tokens by expert → batched
-/// per-expert GEMM) is the prefill-speed path — mlx/vLLM both use it for
-/// prefill. Enabled for prefill buckets (`bucket_m*top_k >= 64`,
-/// mlx-lm's SwitchGLU `_gather_sort` threshold — below it the
-/// per-(token,expert) matvec is fine, so decode keeps the matvec).
-/// Validated on gemma-4-26b-a4b (correct output + 1.9-3.3x faster
-/// prefill).
-fn moe_grouped_enabled(bucket_m: u32, top_k: u32) -> bool {
-    bucket_m * top_k >= 64
-}
-
 /// Per-bucket Gated-DeltaNet scratch layout. The four GDN sub-commands
 /// pass f32 intermediates between each other through the bucket's
 /// shared `moe_scratch` buffer (reused as generic op-scratch — a GDN
@@ -5586,7 +5575,7 @@ impl MoeScratchLayout {
         moe_inter: u32,
         hidden: u32,
         elem_size: u32,
-        grouped: bool,
+        pad: Option<u32>,
     ) -> Self {
         let mut off = 0u32;
         let router_logits = off;
@@ -5603,16 +5592,16 @@ impl MoeScratchLayout {
         off = align_256(off + bucket_m * top_k * moe_inter * elem_size);
         let down_out = off;
         off = align_256(off + bucket_m * top_k * hidden * elem_size);
-        // Grouped-GEMM prefill regions (only when enabled). Pad to BM=64
-        // (the NAX m-tile; also a multiple of the steel BM=32).
-        const BM: u32 = 64;
-        let mpad_max = if grouped {
-            bucket_m * top_k + (BM - 1) * num_experts
-        } else {
-            0
+        // Sorted regions (only when the bake sorts). `pad` rounds each
+        // expert's run up: 64 = the NAX m-tile of the grouped GEMMs (also
+        // a multiple of the steel BM=32); 1 = no padding, the layout the
+        // gathered matvecs read sorted.
+        let mpad_max = match pad {
+            Some(pad) => bucket_m * top_k + (pad - 1) * num_experts,
+            None => 0,
         };
         let mut grp = [0u32; 10];
-        if grouped {
+        if pad.is_some() {
             let sizes = [
                 num_experts * 4,                  // count
                 num_experts * 4,                  // offset
@@ -5886,7 +5875,7 @@ struct MoeBake {
 /// every step of the block agrees.
 fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
     let (hidden, inter) = (b.hidden.0, b.inter.0);
-    s.grouped
+    s.grouping == MoeGrouping::Grouped
         && at.is_nax
         && at.codes.for_bits(b.quant.bits.0) == super::kernel_constants::AffineCodes::Offset8
         && matches!(b.quant.group_size.0, 64 | 128)
@@ -5897,22 +5886,71 @@ fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
         && s.l.mpad_max.is_multiple_of(W4A8_TILE_ROWS)
 }
 
-/// A MoE block's scratch at one bake: the layout, the router pre-norm's region past it, and
-/// whether the experts group (sort tokens by expert, batched per-expert GEMM) — the declared
-/// `op_abi::METAL_GROUPED_EXPERTS` at a bucket `moe_grouped_enabled` admits.
+/// How a MoE block's bake lays its expert-GEMM rows out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MoeGrouping {
+    /// Pure gathered: pair rows in token order, no sort — the projections read the token rows.
+    Gathered,
+    /// Sorted gathered: the `moe_group` sort at padding 1 — same-expert pairs adjacent, so the
+    /// gathered matvecs' repeat slab reads hit cache; `mpad_max` = pairs.
+    Sorted,
+    /// Grouped: the sort at padding 64 — each 64-row output tile is one expert's, for the
+    /// batched per-expert GEMMs.
+    Grouped,
+}
+
+impl MoeGrouping {
+    /// The multiple each expert's sorted run is padded to: 1 (none) when the gathered matvecs
+    /// read the rows, 64 = the NAX m-tile of the grouped GEMMs.
+    fn pad(self) -> Option<u32> {
+        match self {
+            Self::Gathered => None,
+            Self::Sorted => Some(1),
+            Self::Grouped => Some(64),
+        }
+    }
+
+    /// What the sort's init fills the dead rows of `indices_pad` with: the grouped GEMMs skip a
+    /// tile whose expert is out of range; the gathered matvecs have no such guard, so a sorted
+    /// bake points them at expert 0 — garbage compute on rows nothing reads back.
+    fn sentinel(self, experts: u32) -> u32 {
+        match self {
+            Self::Gathered => 0,
+            Self::Sorted => 0,
+            Self::Grouped => experts,
+        }
+    }
+}
+
+/// A MoE block's scratch at one bake: the layout, the router pre-norm's region past it, and how
+/// the experts group (see [`MoeGrouping`]) — the declared `op_abi::METAL_GROUPED_EXPERTS` at a
+/// bucket the grouping's pair thresholds admit.
 struct MoeScratch {
     l: MoeScratchLayout,
     router_normed: u32,
-    grouped: bool,
+    grouping: MoeGrouping,
 }
 
 impl MoeScratch {
     fn of(b: &MoeBlock, bucket_m: u32, p: &MetalModelConsts, moe_scratch_bytes: &mut u32) -> Self {
         let elem = elem_size_bytes(dequant_dtype_for(p));
         let groups = crate::op_abi::METAL_GROUPED_EXPERTS.contains(&b.bundle);
-        let grouped = groups && moe_grouped_enabled(bucket_m, b.top_k.0);
+        // `bucket_m*top_k` counts token–expert pairs. ≥ 128 (grouped): spread over the experts,
+        // the batched per-expert GEMM's 64-row tiles are full enough to win — the prefill-speed
+        // path, mlx/vLLM both use it for prefill. 64–127 (sorted): still thin over the experts,
+        // so the per-(token,expert) matvec stays — but sorted by expert, so an expert picked by
+        // two tokens is read once from DRAM, not once per pair (at bucket 8 × top-8, ~52 distinct
+        // experts hold 64 pairs — a quarter of the slab reads are repeats; measured on base M5,
+        // where those repeats cost 17% of the conc-8 step). < 64 (gathered): the repeats are few
+        // enough that the sort's four dispatches cost more than they save — unmeasured, but the
+        // repeat count halves with each bucket step down (bucket 4 × top-8: 32 pairs, ~8 repeats).
+        let grouping = match (groups, bucket_m * b.top_k.0) {
+            (true, pairs) if pairs >= 128 => MoeGrouping::Grouped,
+            (true, pairs) if pairs >= 64 => MoeGrouping::Sorted,
+            _ => MoeGrouping::Gathered,
+        };
         let (e, k, i, h) = (b.experts.0, b.top_k.0, b.inter.0, b.hidden.0);
-        let l = MoeScratchLayout::compute(bucket_m, e, k, i, h, elem, grouped);
+        let l = MoeScratchLayout::compute(bucket_m, e, k, i, h, elem, grouping.pad());
         let router_normed = align_256(l.total);
         let total = match b.input {
             RouterInput::PreNormed => align_256(router_normed + bucket_m * h * elem),
@@ -5922,15 +5960,18 @@ impl MoeScratch {
         Self {
             l,
             router_normed,
-            grouped,
+            grouping,
         }
     }
 
     /// `region` as a scratch binding at `binding_index`.
     fn at(&self, binding_index: u8, region: MoeRegion) -> Binding {
         use MoeRegion as R;
-        let (l, grouped) = (&self.l, self.grouped);
-        let pair = |gathered: u32, sorted: u32| if grouped { sorted } else { gathered };
+        let (l, grouping) = (&self.l, self.grouping);
+        let sorted = |gathered: u32, sorted: u32| match grouping {
+            MoeGrouping::Gathered => gathered,
+            MoeGrouping::Sorted | MoeGrouping::Grouped => sorted,
+        };
         let byte_offset = match region {
             R::RouterNormed => self.router_normed,
             R::RouterLogits => l.router_logits,
@@ -5938,9 +5979,9 @@ impl MoeScratch {
             R::TopKIndices => l.topk_inds,
             R::TopKScores => l.topk_scores,
             R::SortedRows => l.grp_x_pad,
-            R::ExpertGate => pair(l.gate_out, l.grp_gate_pad),
-            R::ExpertUp => pair(l.up_out, l.grp_up_pad),
-            R::ExpertDown => pair(l.down_out, l.grp_down_pad),
+            R::ExpertGate => sorted(l.gate_out, l.grp_gate_pad),
+            R::ExpertUp => sorted(l.up_out, l.grp_up_pad),
+            R::ExpertDown => sorted(l.down_out, l.grp_down_pad),
             R::TokenRows => l.down_out,
         };
         scratch_at(binding_index, byte_offset)
@@ -6011,8 +6052,16 @@ fn lower_moe_step(
         )
     };
     let rows_of = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
+        // A sorted bake reads every row through the sort's own copy, in sorted order.
+        MoeRows::Tokens(_) if s.grouping == MoeGrouping::Sorted => s.at(i, R::SortedRows),
         MoeRows::Tokens(Slot(slot)) => arena_at(i, slot),
         MoeRows::Scratch(r) => s.at(i, r),
+    };
+    // The expert-index buffer a gathered matvec pairs rows with: the sort's per-row copy when
+    // the bake sorted, the router's top-k indices in token order otherwise.
+    let gather_indices = |s: &MoeScratch, i: u8| match s.grouping {
+        MoeGrouping::Gathered => s.at(i, R::TopKIndices),
+        MoeGrouping::Sorted | MoeGrouping::Grouped => scratch_at(i, s.l.grp_indices_pad),
     };
     let cmd = make_moe_command;
     let s = MoeScratch::of(b, bucket_m, p, moe_scratch_bytes);
@@ -6035,10 +6084,12 @@ fn lower_moe_step(
         n: super::ids::NDimI32(n_out as i32),
         codes,
     };
-    // Token rows are read once per chosen expert; pair rows once.
-    let rows_read = |rows| match rows {
-        MoeRows::Tokens(_) => GatherRows::Tokens(b.top_k),
-        MoeRows::Scratch(_) => GatherRows::Pairs,
+    // Token rows are read once per chosen expert; pair rows once. A sorted bake reads the
+    // scattered pair rows — every row is its own pair's.
+    let rows_read = |s: &MoeScratch, rows| match (s.grouping, rows) {
+        (MoeGrouping::Sorted, _) => GatherRows::Pairs,
+        (_, MoeRows::Tokens(_)) => GatherRows::Tokens(b.top_k),
+        (_, MoeRows::Scratch(_)) => GatherRows::Pairs,
     };
     let gather_kernel = |kernel, n_out, k_in, gs, bits| {
         affine_gather_qmv_kernel(kernel, n_out, k_in, dtype, scale_dtype, gs, bits)
@@ -6231,12 +6282,19 @@ fn lower_moe_step(
                 bindings,
             )]
         }
-        // Grouped: histogram + padded-offset scan, sentinel fill, scatter each (token, expert)
-        // row to its padded slot. Gathered: nothing — the projections read the token rows.
-        S::Sort(Slot(x)) if s.grouped => {
+        // Sorted or grouped: histogram + padded-offset scan, sentinel fill, scatter each
+        // (token, expert) row to its padded slot — at padding 1 (sorted) or 64 (grouped).
+        // Gathered: nothing — the projections read the token rows.
+        S::Sort(Slot(x)) if s.grouping != MoeGrouping::Gathered => {
             let (mpad, one) = (s.l.mpad_max as i32, (1, 1, 1));
-            let offsets = vec![C::int(0, pairs as i32), C::int(1, e as i32)];
-            let init = vec![C::int(1, e as i32), C::int(2, mpad)];
+            let pad = s.grouping.pad().expect("a sorted bake pads");
+            let sentinel = s.grouping.sentinel(e) as i32;
+            let offsets = vec![
+                C::int(0, pairs as i32),
+                C::int(1, e as i32),
+                C::int(6, pad as i32),
+            ];
+            let init = vec![C::int(1, e as i32), C::int(2, mpad), C::int(7, sentinel)];
             let scatter = [0, 1, 2, 3, 4]
                 .into_iter()
                 .zip([pairs, e, s.l.mpad_max, k, hidden]);
@@ -6393,7 +6451,7 @@ fn lower_moe_step(
                 );
                 return Ok(quant.into_iter().chain([gemm]).collect());
             }
-            if s.grouped {
+            if s.grouping == MoeGrouping::Grouped {
                 // y[Mpad, n_out] = gather_qmm(x_pad, W, indices_pad); the host padded to BM = 64.
                 let use_nax = at.is_nax && n_out.is_multiple_of(64) && matches!(gs, 64 | 128);
                 let (kernel, library, symbol, tile) = if use_nax {
@@ -6431,23 +6489,32 @@ fn lower_moe_step(
             } else {
                 let (kernel, symbol) = gather_kernel(GatherQmv::Plain, n_out, k_in, gs, bits);
                 let mut bindings = weights.to_vec();
-                let (x, indices) = (rows_of(&s, 3, rows), s.at(4, R::TopKIndices));
+                let (x, indices) = (rows_of(&s, 3, rows), gather_indices(&s, 4));
                 bindings.extend([x, indices, s.at(5, out)]);
-                let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), ms(A::Z));
+                // A sorted bake runs the full static grid: a short step's live pairs sit past
+                // the m-scaled edge, on rows the init sentinel-filled.
+                let scaling = match s.grouping {
+                    MoeGrouping::Gathered => ms(A::Z),
+                    MoeGrouping::Sorted | MoeGrouping::Grouped => None,
+                };
+                let shape = grid((1, n_out.div_ceil(8), pairs), (32, 2, 1), scaling);
                 let qmv = AffineGatherQmvConstants {
                     qmv: qmv(n_out, k_in, codes),
-                    rows: rows_read(rows),
+                    rows: rows_read(&s, rows),
                 }
                 .into();
                 vec![cmd(kernel, "quantized_qmv", symbol, qmv, shape, bindings)]
             }
         }
-        // Gathered: one command runs the gate and up matvecs of every pair and then
-        // `act(gate) * up` over the rows each threadgroup wrote. A width with a 1-3 row tail would
-        // have a threadgroup rewrite rows another one activates, and two widths need two kernels:
-        // those, and a grouped bake, run each step's own commands.
+        // Gathered or sorted: one command runs the gate and up matvecs of every pair and then
+        // `act(gate) * up` over the rows each threadgroup wrote — per-pair, so the sorted rows
+        // work unchanged. A width with a 1-3 row tail would have a threadgroup rewrite rows
+        // another one activates, and two widths need two kernels: those, and a grouped bake,
+        // run each step's own commands.
         S::GateUpAct(gate, up_width, act)
-            if s.grouped || up_width != gate.width || !inter.is_multiple_of(4) =>
+            if s.grouping == MoeGrouping::Grouped
+                || up_width != gate.width
+                || !inter.is_multiple_of(4) =>
         {
             let up = ExpertMatmul {
                 proj: ExpertProj::Up,
@@ -6461,14 +6528,20 @@ fn lower_moe_step(
             let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
-            let (x, indices) = (rows_of(&s, 3, gate.rows), s.at(4, R::TopKIndices));
+            let (x, indices) = (rows_of(&s, 3, gate.rows), gather_indices(&s, 4));
             bindings.extend([x, indices, s.at(5, R::ExpertGate)]);
             bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
             bindings.push(s.at(9, R::ExpertUp));
-            let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), ms(A::Z));
+            // Full static grid when sorted — a short step's live pairs sit past the m-scaled
+            // edge, on rows the init sentinel-filled.
+            let scaling = match s.grouping {
+                MoeGrouping::Gathered => ms(A::Z),
+                MoeGrouping::Sorted | MoeGrouping::Grouped => None,
+            };
+            let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
             let gather = AffineGatherQmvConstants {
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
-                rows: rows_read(gate.rows),
+                rows: rows_read(&s, gate.rows),
             };
             let constants = AffineGatedQmvConstants { gather, act }.into();
             vec![cmd(
@@ -6481,8 +6554,12 @@ fn lower_moe_step(
             )]
         }
         // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
-        // and combines those rows. A grouped bake runs each step's own commands.
-        S::DownCombine(down, out) if s.grouped || matches!(down.rows, MoeRows::Tokens(_)) => {
+        // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
+        // grid-adjacency (simdgroup k = pair k), which the sort permutes apart — so a sorted or
+        // grouped bake runs each step's own commands.
+        S::DownCombine(down, out)
+            if s.grouping != MoeGrouping::Gathered || matches!(down.rows, MoeRows::Tokens(_)) =>
+        {
             let steps = [S::ExpertMatmul(down), S::Unsort, S::Combine(out)];
             each_step(&steps, moe_scratch_bytes)?
         }
@@ -6508,16 +6585,16 @@ fn lower_moe_step(
                 bindings,
             )]
         }
-        // `out = act(gate) * up`, written over the gate rows; the grouped bake runs every
-        // padded row.
+        // `out = act(gate) * up`, written over the gate rows; a bake that sorted runs every
+        // padded row (the sort's static grid covered them).
         S::GatedAct(act) => {
             let (kernel, symbol) = match act {
                 GatedAct::Silu => (KernelId::SiluMul, silu_mul_static_name(dtype)),
                 GatedAct::Gelu => (KernelId::GeluMul, gelu_mul_static_name(dtype)),
             };
-            let (rows, m_scaling) = match s.grouped {
-                true => (s.l.mpad_max, None),
-                false => (pairs, ms(A::X)),
+            let (rows, m_scaling) = match s.grouping {
+                MoeGrouping::Gathered => (pairs, ms(A::X)),
+                MoeGrouping::Sorted | MoeGrouping::Grouped => (s.l.mpad_max, None),
             };
             let n = rows * inter;
             let shape = grid((n.div_ceil(256), 1, 1), (256, 1, 1), m_scaling);
@@ -6532,7 +6609,7 @@ fn lower_moe_step(
                 bindings,
             )]
         }
-        S::Unsort if s.grouped => {
+        S::Unsort if s.grouping != MoeGrouping::Gathered => {
             let symbol = moe_group_gather_symbol(p.metal_dtype);
             let (from, pos) = (s.at(0, R::ExpertDown), scratch_at(1, s.l.grp_pos));
             let bindings = vec![from, pos, s.at(2, R::TokenRows)];
