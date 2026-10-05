@@ -3797,6 +3797,11 @@ impl Worker for MetalWorker {
         }
 
         // ── 3. Steps still on the device ──────────────────────────
+        // Opened before anything below can fail: a step that fails leaves its requests open, so a
+        // step the engine queued behind it fails here instead of building on tokens never produced.
+        self.input_batch
+            .open_step(scheduler_output)
+            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
         // A step that reads the newest one's tokens on the device leaves that
         // one in flight; any other step — and an idle batch, whose KV may
         // shrink — needs every token on the host first.

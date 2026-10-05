@@ -63,11 +63,17 @@ struct Experts {
 }
 
 impl Experts {
-    fn new(device: &common::Device, rng: &mut Lcg, n_out: usize, k_in: usize) -> Self {
-        let codes: Vec<u8> = (0..EXPERTS * n_out * k_in / 2)
+    fn new(
+        device: &common::Device,
+        rng: &mut Lcg,
+        experts: usize,
+        n_out: usize,
+        k_in: usize,
+    ) -> Self {
+        let codes: Vec<u8> = (0..experts * n_out * k_in / 2)
             .map(|_| (rng.next() * 256.0) as u8)
             .collect();
-        let groups = EXPERTS * n_out * k_in / GS;
+        let groups = experts * n_out * k_in / GS;
         Self {
             w: common::shared_slice(device, &codes),
             s: common::shared_slice(device, &rng.bf16s(groups, 0.002, 0.02)),
@@ -167,18 +173,18 @@ struct Block {
 }
 
 impl Block {
-    /// `gelu` picks GELU (tanh) over SiLU as the gated activation.
-    fn new(device: &common::Device, tokens: usize, gelu: bool) -> Self {
+    /// `gelu` picks GELU (tanh) over SiLU as the gated activation; `experts` is the bank size.
+    fn new(device: &common::Device, tokens: usize, gelu: bool, experts: usize) -> Self {
         let mut rng = Lcg(0x5eed);
-        let gate = Experts::new(device, &mut rng, INTER, HIDDEN);
-        let up = Experts::new(device, &mut rng, INTER, HIDDEN);
-        let down = Experts::new(device, &mut rng, HIDDEN, INTER);
+        let gate = Experts::new(device, &mut rng, experts, INTER, HIDDEN);
+        let up = Experts::new(device, &mut rng, experts, INTER, HIDDEN);
+        let down = Experts::new(device, &mut rng, experts, HIDDEN, INTER);
         let pairs = tokens * TOP_K;
-        // Set s, token t, slot j: expert (s + 16 * (j + t)) % 128 — distinct within a token.
+        // Set s, token t, slot j: expert (s + 16 * (j + t)) % experts — distinct within a token.
         let indices = (0..16u32)
             .map(|s| {
                 let set: Vec<u32> = (0..pairs as u32)
-                    .map(|p| (s + 16 * (p % TOP_K as u32 + p / TOP_K as u32)) % EXPERTS as u32)
+                    .map(|p| (s + 16 * (p % TOP_K as u32 + p / TOP_K as u32)) % experts as u32)
                     .collect();
                 common::shared_slice(device, &set)
             })
@@ -317,7 +323,7 @@ fn fused_moe_kernels_match_the_unfused_chain() {
     let device = d.device;
     for gelu in [true, false] {
         for tokens in [1, 3] {
-            let block = Block::new(&device, tokens, gelu);
+            let block = Block::new(&device, tokens, gelu, EXPERTS);
             run(&device, 1, 1, |_| block.unfused(0));
             run(&device, 1, 1, |_| block.fused(0));
             let pairs = tokens * TOP_K;
@@ -348,189 +354,196 @@ fn fused_moe_kernels_match_the_unfused_chain() {
 fn sorted_gathered_moe_matches_the_token_order_chain() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    for gelu in [true, false] {
-        for tokens in [8usize] {
-            let block = Block::new(&device, tokens, gelu);
-            run(&device, 1, 1, |_| block.fused(0));
-            let reference_act = bits(&block.fused_gate_y, tokens * TOP_K * INTER);
-            let reference_out = bits(&block.fused_out, tokens * HIDDEN);
-            assert!(reference_act.iter().any(|&v| v != 0));
+    // Gemma-4's 128 experts and Qwen3.5/3.6-MoE's 256; the bucket full, and a short step's 5 live
+    // rows in the bucket of 8 — the sort's offsets count every static row, the scatter, unsort
+    // and sum run the live ones, the matvecs the full grid over stale rows.
+    let tokens = 8usize;
+    for (gelu, experts, live) in [true, false]
+        .into_iter()
+        .flat_map(|g| [EXPERTS, 256].map(|e| (g, e)))
+        .flat_map(|(g, e)| [tokens, 5].map(|l| (g, e, l)))
+    {
+        let block = Block::new(&device, tokens, gelu, experts);
+        run(&device, 1, 1, |_| block.fused(0));
+        let live_pairs = live * TOP_K;
+        let reference_act = bits(&block.fused_gate_y, tokens * TOP_K * INTER);
+        let reference_out = bits(&block.fused_out, tokens * HIDDEN);
+        assert!(reference_act.iter().any(|&v| v != 0));
 
-            let pairs = tokens * TOP_K;
-            // The sort's own buffers: count/offset/total/fill, pos, indices_pad, x_pad. The u32
-            // index buffers and the bf16 row buffers are sized in bytes (`shared_zeroed`).
-            let u32_buf = |n: usize| common::shared_zeroed(&device, n * 4);
-            let e_buf = |n: usize| common::shared_zeroed(&device, n * 2);
-            let (count, offset, total) = (u32_buf(EXPERTS), u32_buf(EXPERTS), u32_buf(1));
-            let (fill, pos) = (u32_buf(EXPERTS), u32_buf(pairs));
-            let indices_pad = u32_buf(pairs);
-            let x_pad = common::shared_zeroed(&device, pairs * HIDDEN * 2);
-            // The unsorted row buffer the down output gathers back into.
-            let sorted_down_y = e_buf(pairs * HIDDEN);
-            let token_rows = e_buf(pairs * HIDDEN);
+        let pairs = tokens * TOP_K;
+        // The sort's own buffers: count/offset/total/fill, pos, indices_pad, x_pad. The u32
+        // index buffers are sized in bytes (`shared_zeroed`); the bf16 row buffers start
+        // all-NaN, the scratch a previous step left behind.
+        let u32_buf = |n: usize| common::shared_zeroed(&device, n * 4);
+        let e_buf = |n: usize| common::shared_slice(&device, &vec![0xffffu16; n]);
+        let (count, offset, total) = (u32_buf(experts), u32_buf(experts), u32_buf(1));
+        let (fill, pos) = (u32_buf(experts), u32_buf(pairs));
+        let indices_pad = u32_buf(pairs);
+        let x_pad = e_buf(pairs * HIDDEN);
+        // The unsorted row buffer the down output gathers back into.
+        let sorted_down_y = e_buf(pairs * HIDDEN);
+        let token_rows = e_buf(pairs * HIDDEN);
 
-            let int = |slot: u16, v: i32| ConstantValue::int(ConstSlot(slot), v);
-            let offsets_pso = baked_pipeline(
-                &device,
-                "moe_group",
-                "moe_group_offsets",
-                vec![
-                    int(0, pairs as i32),
-                    int(1, EXPERTS as i32),
-                    int(6, 1), // MG_BM = 1: no padding — a sorted bake.
-                ],
-            )
-            .expect("offsets");
-            let init_pso = baked_pipeline(
-                &device,
-                "moe_group",
-                "moe_group_init",
-                vec![
-                    int(1, EXPERTS as i32),
-                    int(2, pairs as i32), // MG_BM=1 ⇒ mpad_max = MG_M.
-                    int(7, 0),            // MG_SENTINEL = 0: the gather matvecs have no skip guard.
-                ],
-            )
-            .expect("init");
-            let scatter_pso = baked_pipeline(
-                &device,
-                "moe_group",
-                "moe_group_scatter_bfloat16",
-                vec![
-                    int(0, pairs as i32),
-                    int(1, EXPERTS as i32),
-                    int(2, pairs as i32),
-                    int(3, TOP_K as i32),
-                    int(4, HIDDEN as i32),
-                ],
-            )
-            .expect("scatter");
-            let gather_pso = baked_pipeline(
-                &device,
-                "moe_group",
-                "moe_group_gather_bfloat16",
-                vec![int(5, HIDDEN as i32)],
-            )
-            .expect("gather");
+        let int = |slot: u16, v: i32| ConstantValue::int(ConstSlot(slot), v);
+        let offsets_pso = baked_pipeline(
+            &device,
+            "moe_group",
+            "moe_group_offsets",
+            vec![
+                int(0, pairs as i32),
+                int(1, experts as i32),
+                int(6, 1), // MG_BM = 1: no padding — a sorted bake.
+            ],
+        )
+        .expect("offsets");
+        let init_pso = baked_pipeline(
+            &device,
+            "moe_group",
+            "moe_group_init",
+            vec![
+                int(1, experts as i32),
+                int(2, pairs as i32), // MG_BM=1 ⇒ mpad_max = MG_M.
+                int(7, 0),            // MG_SENTINEL = 0: the gather matvecs have no skip guard.
+            ],
+        )
+        .expect("init");
+        let scatter_pso = baked_pipeline(
+            &device,
+            "moe_group",
+            "moe_group_scatter_bfloat16",
+            vec![
+                int(0, pairs as i32),
+                int(1, experts as i32),
+                int(2, pairs as i32),
+                int(3, TOP_K as i32),
+                int(4, HIDDEN as i32),
+            ],
+        )
+        .expect("scatter");
+        let gather_pso = baked_pipeline(
+            &device,
+            "moe_group",
+            "moe_group_gather_bfloat16",
+            vec![int(5, HIDDEN as i32)],
+        )
+        .expect("gather");
 
-            // The sorted chain: gated over the sorted rows (its own output buffers), then the
-            // plain down gather-qmv (GatherRows::Pairs) over the sorted act rows, then the
-            // unsort and the weighted sum over the token-order rows.
-            let rows = GatherRows::Pairs;
-            let act_code = int(3, i32::from(gelu));
-            let mut gated_constants = block.gate.constants(rows);
-            gated_constants.push(act_code);
-            let gated_pso =
-                block
-                    .gate
-                    .pipeline(&device, "affine_gather_qmv_gated", gated_constants);
-            let down_pso =
-                block
-                    .down
-                    .pipeline(&device, "affine_gather_qmv", block.down.constants(rows));
-            let sorted_gate_y = e_buf(pairs * INTER);
-            let sorted_up_y = e_buf(pairs * INTER);
-            let sorted_out = e_buf(tokens * HIDDEN);
+        // The sorted chain: gated over the sorted rows (its own output buffers), then the
+        // plain down gather-qmv (GatherRows::Pairs) over the sorted act rows, then the
+        // unsort and the weighted sum over the token-order rows.
+        let rows = GatherRows::Pairs;
+        let act_code = int(3, i32::from(gelu));
+        let mut gated_constants = block.gate.constants(rows);
+        gated_constants.push(act_code);
+        let gated_pso = block
+            .gate
+            .pipeline(&device, "affine_gather_qmv_gated", gated_constants);
+        let down_pso =
+            block
+                .down
+                .pipeline(&device, "affine_gather_qmv", block.down.constants(rows));
+        let sorted_gate_y = e_buf(pairs * INTER);
+        let sorted_up_y = e_buf(pairs * INTER);
+        let sorted_out = e_buf(tokens * HIDDEN);
 
-            run(&device, 1, 1, |_| {
-                vec![
-                    Dispatch {
-                        pso: &offsets_pso,
-                        buffers: vec![
-                            (&block.indices[0], 0),
-                            (&count, 1),
-                            (&offset, 2),
-                            (&total, 3),
-                        ],
-                        groups: size(1, 1, 1),
-                        threads: size(256, 1, 1),
-                    },
-                    Dispatch {
-                        pso: &init_pso,
-                        buffers: vec![(&indices_pad, 0), (&fill, 1)],
-                        groups: size(pairs.div_ceil(256), 1, 1),
-                        threads: size(256, 1, 1),
-                    },
-                    Dispatch {
-                        pso: &scatter_pso,
-                        buffers: vec![
-                            (&block.indices[0], 0),
-                            (&offset, 1),
-                            (&block.x, 2),
-                            (&fill, 3),
-                            (&pos, 4),
-                            (&indices_pad, 5),
-                            (&x_pad, 6),
-                        ],
-                        groups: size(1, pairs, 1),
-                        threads: size(HIDDEN.min(256), 1, 1),
-                    },
-                    Dispatch {
-                        pso: &gated_pso,
-                        buffers: vec![
-                            (&block.gate.w, 0),
-                            (&block.gate.s, 1),
-                            (&block.gate.b, 2),
-                            (&x_pad, 3),
-                            (&indices_pad, 4),
-                            (&sorted_gate_y, 5),
-                            (&block.up.w, 6),
-                            (&block.up.s, 7),
-                            (&block.up.b, 8),
-                            (&sorted_up_y, 9),
-                        ],
-                        groups: size(1, INTER.div_ceil(8), pairs),
-                        threads: size(32, 4, 1),
-                    },
-                    Dispatch {
-                        pso: &down_pso,
-                        buffers: vec![
-                            (&block.down.w, 0),
-                            (&block.down.s, 1),
-                            (&block.down.b, 2),
-                            (&sorted_gate_y, 3),
-                            (&indices_pad, 4),
-                            (&sorted_down_y, 5),
-                        ],
-                        groups: size(1, HIDDEN.div_ceil(8), pairs),
-                        threads: size(32, 2, 1),
-                    },
-                    Dispatch {
-                        pso: &gather_pso,
-                        buffers: vec![(&sorted_down_y, 0), (&pos, 1), (&token_rows, 2)],
-                        groups: size(1, pairs, 1),
-                        threads: size(HIDDEN.min(256), 1, 1),
-                    },
-                    Dispatch {
-                        pso: &block.weighted_sum,
-                        buffers: vec![(&token_rows, 0), (&block.scores, 1), (&sorted_out, 2)],
-                        groups: size(HIDDEN.div_ceil(64), tokens, 1),
-                        threads: size(64, 1, 1),
-                    },
-                ]
-            });
-            let what = format!("sorted gelu={gelu} tokens={tokens}");
-            // The unsort restores token order, so the act rows compare after applying pos, and
-            // the combined output compares directly.
-            let pos_v = common::read_slice::<u32>(&pos, pairs);
-            let act_ref = bits(&block.fused_gate_y, pairs * INTER);
-            let act_sorted = bits(&sorted_gate_y, pairs * INTER);
-            for (p, &sorted_p) in pos_v.iter().enumerate() {
-                for c in 0..INTER {
-                    let at = |rows: &[u16], r: usize| rows[r * INTER + c];
-                    assert_eq!(
-                        at(&act_ref, p),
-                        at(&act_sorted, sorted_p as usize),
-                        "{what}: act row {p} (sorted row {sorted_p})"
-                    );
-                }
+        run(&device, 1, 1, |_| {
+            vec![
+                Dispatch {
+                    pso: &offsets_pso,
+                    buffers: vec![
+                        (&block.indices[0], 0),
+                        (&count, 1),
+                        (&offset, 2),
+                        (&total, 3),
+                    ],
+                    groups: size(1, 1, 1),
+                    threads: size(256, 1, 1),
+                },
+                Dispatch {
+                    pso: &init_pso,
+                    buffers: vec![(&indices_pad, 0), (&fill, 1)],
+                    groups: size(pairs.div_ceil(256), 1, 1),
+                    threads: size(256, 1, 1),
+                },
+                Dispatch {
+                    pso: &scatter_pso,
+                    buffers: vec![
+                        (&block.indices[0], 0),
+                        (&offset, 1),
+                        (&block.x, 2),
+                        (&fill, 3),
+                        (&pos, 4),
+                        (&indices_pad, 5),
+                        (&x_pad, 6),
+                    ],
+                    groups: size(1, live_pairs, 1),
+                    threads: size(HIDDEN.min(256), 1, 1),
+                },
+                Dispatch {
+                    pso: &gated_pso,
+                    buffers: vec![
+                        (&block.gate.w, 0),
+                        (&block.gate.s, 1),
+                        (&block.gate.b, 2),
+                        (&x_pad, 3),
+                        (&indices_pad, 4),
+                        (&sorted_gate_y, 5),
+                        (&block.up.w, 6),
+                        (&block.up.s, 7),
+                        (&block.up.b, 8),
+                        (&sorted_up_y, 9),
+                    ],
+                    groups: size(1, INTER.div_ceil(8), pairs),
+                    threads: size(32, 4, 1),
+                },
+                Dispatch {
+                    pso: &down_pso,
+                    buffers: vec![
+                        (&block.down.w, 0),
+                        (&block.down.s, 1),
+                        (&block.down.b, 2),
+                        (&sorted_gate_y, 3),
+                        (&indices_pad, 4),
+                        (&sorted_down_y, 5),
+                    ],
+                    groups: size(1, HIDDEN.div_ceil(8), pairs),
+                    threads: size(32, 2, 1),
+                },
+                Dispatch {
+                    pso: &gather_pso,
+                    buffers: vec![(&sorted_down_y, 0), (&pos, 1), (&token_rows, 2)],
+                    groups: size(1, live_pairs, 1),
+                    threads: size(HIDDEN.min(256), 1, 1),
+                },
+                Dispatch {
+                    pso: &block.weighted_sum,
+                    buffers: vec![(&token_rows, 0), (&block.scores, 1), (&sorted_out, 2)],
+                    groups: size(HIDDEN.div_ceil(64), live, 1),
+                    threads: size(64, 1, 1),
+                },
+            ]
+        });
+        let what = format!("sorted gelu={gelu} experts={experts} live={live}/{tokens}");
+        // The unsort restores token order, so the act rows compare after applying pos, and
+        // the combined output compares directly.
+        let pos_v = common::read_slice::<u32>(&pos, live_pairs);
+        let act_ref = bits(&block.fused_gate_y, pairs * INTER);
+        let act_sorted = bits(&sorted_gate_y, pairs * INTER);
+        for (p, &sorted_p) in pos_v.iter().enumerate() {
+            for c in 0..INTER {
+                let at = |rows: &[u16], r: usize| rows[r * INTER + c];
+                assert_eq!(
+                    at(&act_ref, p),
+                    at(&act_sorted, sorted_p as usize),
+                    "{what}: act row {p} (sorted row {sorted_p})"
+                );
             }
-            assert_eq!(
-                reference_out,
-                bits(&sorted_out, tokens * HIDDEN),
-                "{what}: combined rows"
-            );
         }
+        assert_eq!(
+            reference_out[..live * HIDDEN],
+            bits(&sorted_out, live * HIDDEN),
+            "{what}: combined rows"
+        );
     }
 }
 
@@ -670,7 +683,7 @@ fn routed_matches_the_routing_command(
 fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    let block = Block::new(&device, 1, true);
+    let block = Block::new(&device, 1, true, EXPERTS);
     // Gemma-4's program, and the shared-expert router's (a softmax over every expert first).
     let gemma = RouteProgram {
         pre_softmax: false,
@@ -688,6 +701,65 @@ fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
         routed_matches_the_routing_command(&device, &block, program, false)
             .unwrap_or_else(|e| panic!("{what}: {e}"));
     }
+}
+
+/// The sort's histogram + padded scan at Qwen3.5/3.6-MoE's 256 experts — twice Gemma-4's — with
+/// pairs routed to every expert, the ones past 128 included: each expert's count and padded
+/// offset, and the padded total, must match the host's. Dispatched as a grouped bake does it
+/// (`MG_BM = 64`, one threadgroup of 256 threads, a 4096-token bucket at top 8).
+#[test]
+fn moe_group_offsets_count_every_expert_at_256() {
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    const QWEN_EXPERTS: usize = 256;
+    const BM: usize = 64;
+    let pairs = 4096 * TOP_K;
+    // Skewed: expert e takes a share growing with e, so the high experts carry the most rows.
+    let mut rng = Lcg(7);
+    let inds: Vec<u32> = (0..pairs)
+        .map(|_| (rng.next().sqrt() * QWEN_EXPERTS as f32) as u32)
+        .collect();
+    let mut want_count = vec![0u32; QWEN_EXPERTS];
+    for &e in &inds {
+        want_count[e as usize] += 1;
+    }
+    assert!(want_count[QWEN_EXPERTS / 2..].iter().all(|&c| c > 0));
+    let mut want_offset = Vec::with_capacity(QWEN_EXPERTS);
+    let mut acc = 0u32;
+    for &c in &want_count {
+        want_offset.push(acc);
+        acc += c.div_ceil(BM as u32) * BM as u32;
+    }
+
+    let u32_buf = |n: usize| common::shared_zeroed(&device, n * 4);
+    let (count, offset, total) = (u32_buf(QWEN_EXPERTS), u32_buf(QWEN_EXPERTS), u32_buf(1));
+    let topk_inds = common::shared_slice(&device, &inds);
+    let int = |slot: u16, v: i32| ConstantValue::int(ConstSlot(slot), v);
+    let offsets_pso = baked_pipeline(
+        &device,
+        "moe_group",
+        "moe_group_offsets",
+        vec![
+            int(0, pairs as i32),
+            int(1, QWEN_EXPERTS as i32),
+            int(6, BM as i32),
+        ],
+    )
+    .expect("offsets");
+    run(&device, 1, 1, |_| {
+        vec![Dispatch {
+            pso: &offsets_pso,
+            buffers: vec![(&topk_inds, 0), (&count, 1), (&offset, 2), (&total, 3)],
+            groups: size(1, 1, 1),
+            threads: size(256, 1, 1),
+        }]
+    });
+    assert_eq!(common::read_slice::<u32>(&count, QWEN_EXPERTS), want_count);
+    assert_eq!(
+        common::read_slice::<u32>(&offset, QWEN_EXPERTS),
+        want_offset
+    );
+    assert_eq!(common::read_slice::<u32>(&total, 1), vec![acc]);
 }
 
 /// `n_out` rows over `k_in` of a plain (dense, not gathered) 4-bit matvec, read from DRAM:
@@ -734,7 +806,7 @@ fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {
 fn bench_moe_fused() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    let block = Block::new(&device, 1, true);
+    let block = Block::new(&device, 1, true, EXPERTS);
     let sets = block.indices.len();
     let pct = |new: f64, old: f64| (new / old - 1.0) * 100.0;
     run(&device, 200, 2, |i| block.unfused(i % sets));

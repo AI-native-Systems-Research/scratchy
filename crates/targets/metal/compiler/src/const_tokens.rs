@@ -389,10 +389,10 @@ mod tests {
         // Must parse as a Rust expression…
         let expr: syn::Expr = syn::parse2(toks.clone()).expect("parse");
         let s = quote!(#expr).to_string();
-        // …naming the runtime's own types at absolute paths, with widths
+        // …naming the runtime's own types through the tape's module aliases, with widths
         // and bit-exact floats.
         for needle in [
-            ":: scratchy_target_metal :: tape :: lowered :: KernelId :: Embed",
+            "kernel : __tl :: KernelId :: Embed",
             "Binding :: ArenaSlot { slot : 2u32 , binding_index : 0u8 }",
             "Binding :: Source { ix : __ti :: SourceIx (7u32) , which : __tl :: WeightTensor :: \
              AffineScales , layer : __ti :: LayerId (3u32) , binding_index : 1u8 }",

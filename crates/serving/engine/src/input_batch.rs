@@ -99,6 +99,29 @@ per_slot_fields! {
     /// Tokens sampled by steps still on the device: they follow `prompt ++ generated`, and a step
     /// that reads one takes it from the device ([`PendingInput`]) until [`InputBatch::resolve`].
     in_flight: usize,
+    /// Whether this request's latest step opened ([`InputBatch::open_step`]) and has yet to commit.
+    step: StepState,
+}
+
+/// Where a request's latest step stands. A step opens before the worker runs it and closes when it
+/// commits; one still open when the next opens never committed — it failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepState {
+    Committed,
+    Open,
+}
+
+/// A step scheduled behind one that failed: the engine queued it on tokens the failed step never
+/// produced, so it cannot run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedPredecessor {
+    pub req_id: String,
+}
+
+impl std::fmt::Display for FailedPredecessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: the step this one was scheduled behind failed", self.req_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +166,8 @@ pub struct InputBatch {
     generated: Vec<Vec<u32>>,
     /// Per slot, the tokens sampled by steps still on the device, which follow `generated`.
     in_flight: Vec<usize>,
+    /// Per slot, whether the latest step opened and has yet to commit.
+    step: Vec<StepState>,
 
     // --- Reusable per-step buffers (cleared + refilled each step) ---
     flat_token_ids: Vec<u32>,
@@ -179,6 +204,7 @@ impl InputBatch {
             prompt: Vec::new(),
             generated: Vec::new(),
             in_flight: Vec::new(),
+            step: Vec::new(),
             flat_token_ids: Vec::new(),
             flat_positions: Vec::new(),
             step_rows: Vec::new(),
@@ -267,7 +293,26 @@ impl InputBatch {
             prompt: prompt.to_vec(),
             generated: Vec::new(),
             in_flight: 0,
+            step: StepState::Committed,
         });
+    }
+
+    /// Open a step for every request `sched` runs tokens for — before the worker runs any of it. A
+    /// request whose last step opened and never committed was scheduled behind a step that failed:
+    /// refused, naming it, with no slot changed.
+    pub fn open_step(&mut self, sched: &SchedulerOutput) -> Result<(), FailedPredecessor> {
+        let slots: Vec<usize> = (sched.num_scheduled_tokens.iter())
+            .filter(|&(_, &n)| n > 0)
+            .filter_map(|(req_id, _)| self.req_id_to_slot.get(req_id).copied())
+            .collect();
+        if let Some(&slot) = slots.iter().find(|&&s| self.step[s] == StepState::Open) {
+            let req_id = self.req_ids[slot].clone();
+            return Err(FailedPredecessor { req_id });
+        }
+        for slot in slots {
+            self.step[slot] = StepState::Open;
+        }
+        Ok(())
     }
 
     /// Remove a finished request (swap-remove to keep dense packing).
@@ -581,6 +626,7 @@ impl InputBatch {
             input_token_count
         };
         self.generated[slot].extend_from_slice(sampled_tokens);
+        self.step[slot] = StepState::Committed;
     }
 
     /// Commit a step that emitted one token the host does not have yet: advance the pool cursor past
@@ -591,6 +637,7 @@ impl InputBatch {
         };
         self.tokens_in_pool[slot] += input_token_count;
         self.in_flight[slot] += 1;
+        self.step[slot] = StepState::Committed;
     }
 
     /// The oldest in-flight token of `req_id`, now on the host: append it to the history.
@@ -1278,6 +1325,44 @@ mod tests {
         batch.add_request("r1".into(), &[10, 20], vec![0], 0);
         batch.commit_in_flight("r1", 2);
         let _ = batch.prepare_inputs(&step(&[("r1", 3, 1)]));
+    }
+
+    /// The pipelined engine queues a request's decode behind its last prefill chunk, on the
+    /// chunk's token. When that chunk fails before it commits (here: a device out-of-memory
+    /// surfacing as the step resolves the one before it), the decode is refused at open — the
+    /// request named, nothing changed — instead of reaching `prepare_inputs` past every token the
+    /// batch will ever have, the panic above. A request whose steps commit opens every time.
+    #[test]
+    fn a_step_queued_behind_a_failed_one_is_refused_at_open() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0], 0);
+        batch.add_request("r2".into(), &[40], vec![1], 0);
+
+        // First chunk: opens, runs, commits.
+        let first = step(&[("r1", 0, 2)]);
+        assert_eq!(batch.open_step(&first), Ok(()));
+        let p = batch.prepare_inputs(&first);
+        batch.reclaim_buffers(p);
+        batch.commit_step("r1", &[], 2, false);
+
+        // Last chunk: opens, then fails before it prepares or commits.
+        assert_eq!(batch.open_step(&step(&[("r1", 2, 1)])), Ok(()));
+
+        // The decode the engine queued behind it, on the token it never sampled.
+        let decode = step(&[("r1", 3, 1), ("r2", 0, 1)]);
+        let refused = FailedPredecessor {
+            req_id: "r1".into(),
+        };
+        assert_eq!(batch.open_step(&decode), Err(refused));
+        assert_eq!(batch.tokens_in_pool_for("r1"), 2);
+
+        // The other request, alone, still runs.
+        let other = step(&[("r2", 0, 1)]);
+        assert_eq!(batch.open_step(&other), Ok(()));
+        let p = batch.prepare_inputs(&other);
+        batch.reclaim_buffers(p);
+        batch.commit_in_flight("r2", 1);
+        assert_eq!(batch.open_step(&step(&[("r2", 1, 1)])), Ok(()));
     }
 
     #[test]

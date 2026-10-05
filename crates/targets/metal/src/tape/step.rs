@@ -111,16 +111,32 @@ pub struct MoeBlock {
     pub router: RouterBundle,
     pub bundle: ExpertBundle,
     pub input: RouterInput,
-    /// The experts' packed storage, as the block's gate projection op declares it: what decides
+    /// The experts' packed storage, as the block's projection steps lower it: what decides
     /// whether a grouped bake's expert GEMMs run W4A8 (every step of the block must agree).
     pub quant: ExpertQuant,
 }
 
-/// An expert bank's MLX-affine group size and code width.
+/// An expert bank's MLX-affine group size and each projection's code width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpertQuant {
     pub group_size: AffineGroupSize,
-    pub bits: AffineBits,
+    pub widths: ExpertWidths,
+}
+
+/// The code width each expert projection lowers at — apart when the quantization declares the
+/// roles apart (a mixed-width bank).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertWidths {
+    pub gate: AffineBits,
+    pub up: AffineBits,
+    pub down: AffineBits,
+}
+
+impl ExpertWidths {
+    /// The one width all three projections share, if they do.
+    pub fn uniform(self) -> Option<AffineBits> {
+        (self.gate == self.up && self.up == self.down).then_some(self.gate)
+    }
 }
 
 /// An expert projection's packed width: the MoE op's own (one width for all three
