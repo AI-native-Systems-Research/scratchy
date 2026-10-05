@@ -84,6 +84,11 @@ pub struct RmsNormConstants {
     pub weight_offset: f32,
 }
 
+/// The threads of an RMSNorm row's threadgroup: every norm command dispatches this many, and its
+/// kernel takes it compiled in (slot 4), so each thread's share of the row is a count the compiler
+/// knows.
+pub const NORM_THREADS: u32 = 1024;
+
 impl From<RmsNormConstants> for Vec<ConstantValue> {
     fn from(c: RmsNormConstants) -> Self {
         vec![
@@ -91,6 +96,7 @@ impl From<RmsNormConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(1), c.q_size.get()),
             ConstantValue::float(ConstSlot(2), c.rms_norm_eps.get()),
             ConstantValue::float(ConstSlot(3), c.weight_offset),
+            ConstantValue::uint(ConstSlot(4), NORM_THREADS),
         ]
     }
 }

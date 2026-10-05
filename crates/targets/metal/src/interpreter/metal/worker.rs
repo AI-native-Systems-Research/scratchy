@@ -1936,7 +1936,7 @@ mod tests {
             constants: rmsnorm_constants(bucket_m),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (256, 1, 1),
+                threads_per_threadgroup: (crate::tape::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: None,
             },
             bindings: crate::interpreter::metal::lowered::baked(vec![
@@ -1964,7 +1964,7 @@ mod tests {
             constants: rmsnorm_constants(bucket_m),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (256, 1, 1),
+                threads_per_threadgroup: (crate::tape::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: None,
             },
             bindings: crate::interpreter::metal::lowered::baked(vec![
@@ -2338,7 +2338,7 @@ mod tests {
             constants: rmsnorm_constants(1),
             dispatch: DispatchShape {
                 threadgroups: (1, 1, 1),
-                threads_per_threadgroup: (256, 1, 1),
+                threads_per_threadgroup: (crate::tape::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: None,
             },
             bindings: crate::interpreter::metal::lowered::baked(vec![

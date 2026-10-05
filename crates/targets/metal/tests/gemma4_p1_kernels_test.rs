@@ -1390,7 +1390,7 @@ fn rmsnorm_unit_f16_matches_cpu() {
             depth: 1,
         },
         MTLSize {
-            width: 256,
+            width: scratchy_target_metal::tape::kernel_constants::NORM_THREADS as usize,
             height: 1,
             depth: 1,
         },

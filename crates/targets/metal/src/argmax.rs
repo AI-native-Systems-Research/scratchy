@@ -15,7 +15,7 @@ use crate::stream::MetalStreamError;
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
-pub const ARGMAX_DEFAULT_TG_SIZE: usize = 256;
+pub const ARGMAX_DEFAULT_TG_SIZE: usize = 1024;
 
 pub struct ArgmaxKernels {
     pub argmax: OffTapePipeline,

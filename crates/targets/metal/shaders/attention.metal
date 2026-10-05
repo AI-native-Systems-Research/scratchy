@@ -290,6 +290,16 @@ constant uint ATTN_TQ_HEADS = ATTN_TQ_HEADS_FC_SET ? ATTN_TQ_HEADS_FC : 1u;
 //      place, so the two writes must be ordered, not concurrent.
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_TQ_STAGE_PASS, 17);
 
+// 18  ATTN_SPLITS — threadgroups per decode query-head group. The key loop's 32 simdgroups (simdgroup
+//     `g` takes keys g, g + 32, ...) spread over ATTN_SPLITS threadgroups of 32 / ATTN_SPLITS each,
+//     which store their partials for `attention_via_cache_v2_combine` to merge. Unset: one
+//     threadgroup runs all 32 and merges them itself.
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_SPLITS_FC, 18);
+constant uint ATTN_SPLITS = ATTN_SPLITS_FC_SET ? ATTN_SPLITS_FC : 1u;
+// The decode merge's output slices per barrier round (`attn_decode_merge`): its scratch holds
+// this many 32 x 32 transposes.
+constant constexpr uint ATTN_MERGE_SLICES = 4u;
+
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
 // ownership). Under both the contiguous and the co-resident layout the bits of
@@ -554,6 +564,104 @@ kernel void tq_rotate_rows(
 INSTANTIATE_TQ_PREFILL(f16, half)
 INSTANTIATE_TQ_PREFILL(bf16, bfloat)
 
+// Merge a decode threadgroup's 32 simdgroup partials — each simdgroup's per-head running max,
+// sum of exponentials and output accumulator — and write the heads' output rows. Run by the one-pass
+// kernel on its own simdgroups' partials and by the combine pass on the split threadgroups' stored
+// ones, so both merge the same values the same way.
+template <typename T>
+inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
+                              thread float* sum_exp_score, uint heads, uint simd_gid,
+                              uint simd_lid, threadgroup float* tg_outputs,
+                              threadgroup float* tg_max, threadgroup float* tg_sum,
+                              device T* o_row, device const float* tq_signs,
+                              device const T* vb)
+{
+    constexpr int BN = 32; // simdgroups per threadgroup
+    constexpr int BD = 32; // lanes per simdgroup
+    typedef float U;
+    const uint head_dim = ATTN_HEAD_DIM;
+    const uint qk_per_thread = head_dim / uint(BD);
+    const uint tq_e = simd_lid * qk_per_thread;
+    // ── Combine per-simdgroup partials ───────────────────────────
+    //
+    // Each simdgroup's lane 0 publishes its max + sum_exp per head; all
+    // simdgroups then read all values via lane id and reduce.
+    if (simd_lid == 0) {
+        for (uint h = 0; h < heads; ++h) {
+            tg_max[h * BN + simd_gid] = max_score[h];
+            tg_sum[h * BN + simd_gid] = sum_exp_score[h];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint h = 0; h < heads; ++h) {
+        // Each lane (within simdgroup_id 0..BN-1) reads tg_max[simd_lid]
+        // / tg_sum[simd_lid]; simd_max + simd_sum produce the global max
+        // and (factor-rescaled) global sum_exp.
+        U other_max = tg_max[h * BN + simd_lid];
+        U global_max = simd_max(other_max);
+        U factor = metal::fast::exp(other_max - global_max);
+        U global_sum = simd_sum(tg_sum[h * BN + simd_lid] * factor);
+
+        // Combine output partials. Each simdgroup wrote o_reg[j] for
+        // its slice; we need to weight each simdgroup's contribution by
+        // its `factor` (the rescaling for the global max), then sum
+        // across simdgroups, then divide by global_sum. ATTN_MERGE_SLICES
+        // of the slices share each pair of barriers.
+        for (uint j0 = 0; j0 < qk_per_thread; j0 += ATTN_MERGE_SLICES) {
+            const uint nj = min(ATTN_MERGE_SLICES, qk_per_thread - j0);
+            for (uint jj = 0; jj < nj; ++jj) {
+                tg_outputs[(jj * BD + simd_lid) * BD + simd_gid] = o_reg[h * qk_per_thread + j0 + jj];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint jj = 0; jj < nj; ++jj) {
+                // Each simdgroup reads its column from tg_outputs and sums
+                // across the BD partials, weighted by per-simdgroup factor.
+                U val = tg_outputs[(jj * BD + simd_gid) * BD + simd_lid] * factor;
+                U combined = simd_sum(val);
+                if (global_sum != 0) {
+                    combined = combined / global_sum;
+                }
+                o_reg[h * qk_per_thread + j0 + jj] = combined;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // The combine transposes lane<->simdgroup, so simdgroup `simd_gid`
+    // now owns the element set that lane `simd_gid` owned during the K
+    // loop.
+    if (ATTN_TQ != 0u) {
+        // Codebook-domain output: gather it back into lane slices and
+        // rotate once, o = s²·D·H·a — simdgroup `h` for head `h`.
+        if (simd_lid == 0) {
+            for (uint h = 0; h < heads; ++h) {
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    tg_outputs[h * head_dim + simd_gid * qk_per_thread + j] =
+                        o_reg[h * qk_per_thread + j];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_gid < heads) {
+            U o_loc[16];
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_loc[j] = tg_outputs[simd_gid * head_dim + tq_e + j];
+            }
+            tq_wht(o_loc, qk_per_thread, simd_lid);
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                const U o = o_loc[j] * tq_signs[tq_e + j] / U(head_dim);
+                o_row[simd_gid * head_dim + tq_e + j] = T(ATTN_TQ_VB ? o + U(vb[tq_e + j]) : o);
+            }
+        }
+    } else if (simd_lid == 0) {
+        // Lane 0 of each simdgroup writes its qk_per_thread output slice.
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_row[attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] = T(o_reg[j]);
+        }
+    }
+}
+
 // ============================================================================
 // attention_via_cache_v2_{f16,bf16}_specialized — paged-cache decode attention
 // ============================================================================
@@ -632,6 +740,7 @@ template <typename T>
     device const uint*  slot_mapping [[buffer(13)]],
     device const T*     tq_k_bias    [[buffer(14)]],
     device const T*     tq_v_bias    [[buffer(15)]],
+    device       float* attn_partials [[buffer(16)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
@@ -671,7 +780,7 @@ template <typename T>
     thread U o_reg[32];                 // [h * qk_per_thread + j], <= 32 (ATTN_TQ_HEADS)
 
     // Threadgroup scratch for per-simdgroup max + sum_exp combine.
-    threadgroup U tg_outputs[BN * BD];
+    threadgroup U tg_outputs[ATTN_MERGE_SLICES * BN * BD];
     threadgroup U tg_max[BN * 8];       // [head][simdgroup], heads <= 8
     threadgroup U tg_sum[BN * 8];
 
@@ -780,10 +889,12 @@ template <typename T>
     // reused span block's slot is the write-skip sentinel: nothing was
     // written, and that key lives only in the packed store.
     const bool tail_in_cache = (ATTN_TQ == 0u) || (slot_mapping[seq_idx] != 0xFFFFFFFFu);
-    // For each key, simdgroup `simd_gid` handles tokens at indices
-    // simd_gid, simd_gid+BN, simd_gid+2*BN, ... The simdgroup that
-    // overshoots `kv_len` skips its iteration and contributes 0.
-    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+    // For each key, simdgroup `vsg` of the 32 handles tokens at indices
+    // vsg, vsg+BN, vsg+2*BN, ... The simdgroup that overshoots `kv_len`
+    // skips its iteration and contributes 0. Split, this threadgroup runs
+    // the 32 / ATTN_SPLITS of them its z position picks.
+    const uint vsg = tg_pos.z * (uint(BN) / ATTN_SPLITS) + simd_gid;
+    for (uint i = vsg; i < kv_len; i += uint(BN)) {
         // Sliding window: decode Q sits at absolute position kv_len-1;
         // skip keys older than the window. Branch is simdgroup-uniform
         // (i derives from simd_gid) and folds away when ATTN_WINDOW=0.
@@ -966,82 +1077,73 @@ template <typename T>
         }
     }
 
-    // ── Combine per-simdgroup partials ───────────────────────────
-    //
-    // Each simdgroup's lane 0 publishes its max + sum_exp per head; all
-    // simdgroups then read all values via lane id and reduce.
-    if (simd_lid == 0) {
+    // ── Split: this threadgroup's simdgroups store their partials for the combine pass ──
+    if (ATTN_SPLITS > 1u) {
         for (uint h = 0; h < heads; ++h) {
-            tg_max[h * BN + simd_gid] = max_score[h];
-            tg_sum[h * BN + simd_gid] = sum_exp_score[h];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint h = 0; h < heads; ++h) {
-        // Each lane (within simdgroup_id 0..BN-1) reads tg_max[simd_lid]
-        // / tg_sum[simd_lid]; simd_max + simd_sum produce the global max
-        // and (factor-rescaled) global sum_exp.
-        U other_max = tg_max[h * BN + simd_lid];
-        U global_max = simd_max(other_max);
-        U factor = metal::fast::exp(other_max - global_max);
-        U global_sum = simd_sum(tg_sum[h * BN + simd_lid] * factor);
-
-        // Combine output partials. Each simdgroup wrote o_reg[j] for
-        // its slice; we need to weight each simdgroup's contribution by
-        // its `factor` (the rescaling for the global max), then sum
-        // across simdgroups, then divide by global_sum.
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            tg_outputs[simd_lid * BD + simd_gid] = o_reg[h * qk_per_thread + j];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            // Each simdgroup reads its column from tg_outputs and sums
-            // across the BD partials, weighted by per-simdgroup factor.
-            U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
-            U combined = simd_sum(val);
-            if (global_sum != 0) {
-                combined = combined / global_sum;
+            device float* p =
+                attn_partials + ((seq_idx * num_q + q_head_idx + h) * uint(BN) + vsg) * (head_dim + 2u);
+            if (simd_lid == 0) {
+                p[0] = max_score[h];
+                p[1] = sum_exp_score[h];
             }
-            o_reg[h * qk_per_thread + j] = combined;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
-
-    // The combine transposes lane<->simdgroup, so simdgroup `simd_gid`
-    // now owns the element set that lane `simd_gid` owned during the K
-    // loop.
-    if (ATTN_TQ != 0u) {
-        // Codebook-domain output: gather it back into lane slices and
-        // rotate once, o = s²·D·H·a — simdgroup `h` for head `h`.
-        if (simd_lid == 0) {
-            for (uint h = 0; h < heads; ++h) {
-                for (uint j = 0; j < qk_per_thread; ++j) {
-                    tg_outputs[h * head_dim + simd_gid * qk_per_thread + j] =
-                        o_reg[h * qk_per_thread + j];
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_gid < heads) {
-            U o_loc[16];
             for (uint j = 0; j < qk_per_thread; ++j) {
-                o_loc[j] = tg_outputs[simd_gid * head_dim + tq_e + j];
-            }
-            tq_wht(o_loc, qk_per_thread, simd_lid);
-            for (uint j = 0; j < qk_per_thread; ++j) {
-                const U o = o_loc[j] * tq_signs[tq_e + j] / U(head_dim);
-                o_row[simd_gid * head_dim + tq_e + j] = T(ATTN_TQ_VB ? o + U(vb[tq_e + j]) : o);
+                p[2u + simd_lid * qk_per_thread + j] = o_reg[h * qk_per_thread + j];
             }
         }
-    } else if (simd_lid == 0) {
-        // Lane 0 of each simdgroup writes its qk_per_thread output slice.
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_row[attn_elem_off(simd_gid, j, qk_per_thread, head_dim)] = T(o_reg[j]);
-        }
+        return;
     }
+    attn_decode_merge<T>(o_reg, max_score, sum_exp_score, heads, simd_gid, simd_lid, tg_outputs,
+                         tg_max, tg_sum, o_row, tq_signs, vb);
 }
 
 SCRATCHY_KERNEL(attention_via_cache_v2_f16_specialized, attention_via_cache_v2<half>)
 SCRATCHY_KERNEL(attention_via_cache_v2_bf16_specialized, attention_via_cache_v2<bfloat>)
+
+// attention_via_cache_v2_combine_{f16,bf16}_specialized — the split decode's second pass: one
+// threadgroup per query-head group loads the 32 simdgroup partials the ATTN_SPLITS threadgroups
+// stored (buffer 16, `[batch, num_q_heads, 32, 2 + head_dim]`: max, sum, output accumulator) and
+// merges them as the one-pass kernel does. Dispatch as the one-pass kernel: threadgroups
+// (batch, num_q_heads / heads, 1), threads (1024, 1, 1).
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(1024)]] void attention_via_cache_v2_combine(
+    device       T*     output        [[buffer(0)]],
+    device const float* tq_signs      [[buffer(11)]],
+    device const T*     tq_v_bias     [[buffer(15)]],
+    device const float* attn_partials [[buffer(16)]],
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 32;
+    const uint head_dim = ATTN_HEAD_DIM;
+    const uint num_q = ATTN_NUM_Q_HEADS;
+    const uint qk_per_thread = head_dim / 32u;
+    const uint heads = (ATTN_TQ != 0u) ? ATTN_TQ_HEADS : 1u;
+    const uint seq_idx = tg_pos.x;
+    const uint q_head_idx = tg_pos.y * heads;
+    const uint kv_head_idx = q_head_idx / (num_q / ATTN_NUM_KV_HEADS);
+    float o_reg[32];
+    float max_score[8];
+    float sum_exp_score[8];
+    for (uint h = 0; h < heads; ++h) {
+        device const float* p =
+            attn_partials + ((seq_idx * num_q + q_head_idx + h) * uint(BN) + simd_gid) * (head_dim + 2u);
+        max_score[h] = p[0];
+        sum_exp_score[h] = p[1];
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_reg[h * qk_per_thread + j] = p[2u + simd_lid * qk_per_thread + j];
+        }
+    }
+    threadgroup float tg_outputs[ATTN_MERGE_SLICES * BN * 32];
+    threadgroup float tg_max[BN * 8];
+    threadgroup float tg_sum[BN * 8];
+    attn_decode_merge<T>(o_reg, max_score, sum_exp_score, heads, simd_gid, simd_lid, tg_outputs,
+                         tg_max, tg_sum, output + (seq_idx * num_q + q_head_idx) * head_dim,
+                         tq_signs, tq_v_bias + kv_head_idx * head_dim);
+}
+
+SCRATCHY_KERNEL(attention_via_cache_v2_combine_f16_specialized, attention_via_cache_v2_combine<half>)
+SCRATCHY_KERNEL(attention_via_cache_v2_combine_bf16_specialized, attention_via_cache_v2_combine<bfloat>)
 
 // ─────────────────────────────────────────────────────────────────────
 // attention_prefill_sdpa_v2_paged — paged-cache variant of the prefill

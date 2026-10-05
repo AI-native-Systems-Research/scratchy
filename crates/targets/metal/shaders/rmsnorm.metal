@@ -3,6 +3,7 @@
 
 #include <metal_stdlib>
 #include "baked.h"
+#include "row_sum.h"
 using namespace metal;
 
 /// `RmsNormConstants`, compiled in: 0 = M (uint), 1 = N/HIDDEN_SIZE (uint), 2 = EPS (float).
@@ -12,6 +13,10 @@ SCRATCHY_CONSTANT(float, RMSNORM_EPS,           2);
 // Zero-centered (Gemma / Qwen3.5) RMSNorm: effective gain = weight + offset.
 // `offset` = 1.0 for `(1 + weight)` arches, 0.0 for plain RMSNorm.
 SCRATCHY_CONSTANT(float, RMSNORM_WEIGHT_OFFSET, 3);
+// The threads of a row's threadgroup (`NORM_THREADS`): a constant, so a thread's elements — every
+// RMSNORM_THREADS-th from its index — are a count the compiler knows, and load together.
+SCRATCHY_CONSTANT(uint,  RMSNORM_THREADS,       4);
+constant constexpr uint RMSNORM_PER_THREAD = (RMSNORM_HIDDEN_SIZE + RMSNORM_THREADS - 1) / RMSNORM_THREADS;
 
 // Template form (`<T_act, T_scale>`): same in-register cast pattern as
 // the affine quant kernels (`shaders/quantized_*.metal`). The kernel
@@ -33,34 +38,31 @@ template <typename T_act, typename T_scale>
     device const T_act*   input  [[buffer(1)]],
     device const T_scale* weight [[buffer(2)]],
     uint gid     [[threadgroup_position_in_grid]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint tid     [[thread_position_in_threadgroup]]
 ) {
     if (gid >= RMSNORM_M) return;
 
-    threadgroup float shared_sum[1024];
+    threadgroup float shared_sum[RMSNORM_THREADS];
 
+    float vals[RMSNORM_PER_THREAD];
     float local_sum = 0.0f;
-    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
-        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
-        local_sum += val * val;
-    }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
+    for (uint k = 0; k < RMSNORM_PER_THREAD; ++k) {
+        const uint i = tid + k * RMSNORM_THREADS;
+        if (i < RMSNORM_HIDDEN_SIZE) {
+            vals[k] = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+            local_sum += vals[k] * vals[k];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    const float sum_sq = row_sum(local_sum, tid, RMSNORM_THREADS, shared_sum);
 
-    float rms = sqrt(shared_sum[0] / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
+    float rms = sqrt(sum_sq / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
 
-    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
-        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
-        float w   = float(weight[i]) + RMSNORM_WEIGHT_OFFSET;
-        output[gid * RMSNORM_HIDDEN_SIZE + i] = T_act((val / rms) * w);
+    for (uint k = 0; k < RMSNORM_PER_THREAD; ++k) {
+        const uint i = tid + k * RMSNORM_THREADS;
+        if (i < RMSNORM_HIDDEN_SIZE) {
+            float w = float(weight[i]) + RMSNORM_WEIGHT_OFFSET;
+            output[gid * RMSNORM_HIDDEN_SIZE + i] = T_act((vals[k] / rms) * w);
+        }
     }
 }
 
@@ -87,34 +89,31 @@ template <typename T_act>
     device       T_act* output [[buffer(0)]],
     device const T_act* input  [[buffer(1)]],
     uint gid     [[threadgroup_position_in_grid]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint tid     [[thread_position_in_threadgroup]])
 {
     if (gid >= RMSNORM_M) return;
 
-    // Same tree reduction as `rmsnorm_specialized_impl` — identical
+    // The same row sum as `rmsnorm_specialized_impl` — identical
     // accumulation order keeps the two norms bit-consistent.
-    threadgroup float shared_sum[1024];
+    threadgroup float shared_sum[RMSNORM_THREADS];
 
+    float vals[RMSNORM_PER_THREAD];
     float local_sum = 0.0f;
-    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
-        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
-        local_sum += val * val;
-    }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
+    for (uint k = 0; k < RMSNORM_PER_THREAD; ++k) {
+        const uint i = tid + k * RMSNORM_THREADS;
+        if (i < RMSNORM_HIDDEN_SIZE) {
+            vals[k] = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+            local_sum += vals[k] * vals[k];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    const float sum_sq = row_sum(local_sum, tid, RMSNORM_THREADS, shared_sum);
 
-    float rms = sqrt(shared_sum[0] / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
-    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
-        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
-        output[gid * RMSNORM_HIDDEN_SIZE + i] = T_act(val / rms);
+    float rms = sqrt(sum_sq / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
+    for (uint k = 0; k < RMSNORM_PER_THREAD; ++k) {
+        const uint i = tid + k * RMSNORM_THREADS;
+        if (i < RMSNORM_HIDDEN_SIZE) {
+            output[gid * RMSNORM_HIDDEN_SIZE + i] = T_act(vals[k] / rms);
+        }
     }
 }
 

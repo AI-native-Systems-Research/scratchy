@@ -1366,7 +1366,7 @@ fn lower_one(
             // m_mult` — exactly the per-head row count we need.
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1418,7 +1418,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1474,7 +1474,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1561,7 +1561,7 @@ fn lower_one(
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -1614,7 +1614,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1663,7 +1663,7 @@ fn lower_one(
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -6175,7 +6175,11 @@ fn lower_moe_step(
                 weight_offset: 0.0,
             }
             .into_baked(),
-            dispatch: grid((bucket_m, 1, 1), (THREADS_PER_GROUP, 1, 1), ms(A::X)),
+            dispatch: grid(
+                (bucket_m, 1, 1),
+                (super::kernel_constants::NORM_THREADS, 1, 1),
+                ms(A::X),
+            ),
             bindings: baked(vec![
                 s.at(0, R::RouterNormed),
                 arena_at(1, x),

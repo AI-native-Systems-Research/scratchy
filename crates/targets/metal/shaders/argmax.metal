@@ -12,11 +12,11 @@ using namespace metal;
 // Output: token  [batch]                (uint)
 //
 // Dispatch: threadgroups (batch, 1, 1), threads_per_threadgroup
-// (TG_SIZE, 1, 1) where TG_SIZE is a power of 2 ≤ 1024. One
+// (TG_SIZE, 1, 1) where TG_SIZE is a multiple of 32, at most 1024. One
 // threadgroup per batch row; threads in a group cooperate over the
 // vocab axis. Each thread keeps a (max_val, max_idx) running pair
-// over its strided slice; a power-of-two reduction in threadgroup
-// memory yields the per-row argmax.
+// over its 4-wide strided chunks; simdgroup shuffles and one
+// threadgroup round reduce the pairs to the per-row argmax.
 //
 // Tie-break: on equal-max values the smaller index wins, matching
 // the numpy / torch `argmax` convention. Keeps results
@@ -24,8 +24,7 @@ using namespace metal;
 // threadgroup sizes for the same input).
 //
 // Vocab can exceed `TG_SIZE` (50K-150K is typical for LLMs); each
-// thread may walk many elements. Reduction overhead is bounded by
-// `log2(TG_SIZE)` barriers.
+// thread may walk many elements. The reduction takes one barrier.
 //
 // Bindings:
 //   buffer(0) = logits  [batch, ARGMAX_VOCAB]
@@ -36,7 +35,10 @@ using namespace metal;
 
 SCRATCHY_CONSTANT(uint, ARGMAX_VOCAB, 0);
 
-// The argmax of row `gid`, in thread 0.
+// The argmax of row `gid`, in thread 0: the largest value, the smallest index among equal ones,
+// NaN never chosen. Each thread scans 4 adjacent elements a step; simdgroups then reduce with
+// shuffles and their leaders through `shared_*` — one barrier, any associative order, since the
+// comparison picks the same element whatever the order.
 template <typename T>
 inline uint argmax_row(
     device const T* logits,
@@ -46,44 +48,41 @@ inline uint argmax_row(
     threadgroup float* shared_max,
     threadgroup uint* shared_idx)
 {
-    // Per-thread reduction over a strided slice of the vocab axis.
-    float local_max = -INFINITY;
-    uint  local_idx = 0;
-
+    float best = -INFINITY;
+    uint  best_i = 0;
+    auto take = [&](float v, uint i) {
+        if (v > best || (v == best && i < best_i)) {
+            best = v;
+            best_i = i;
+        }
+    };
     device const T* row = logits + uint(gid) * ARGMAX_VOCAB;
-    for (uint i = tid; i < ARGMAX_VOCAB; i += tg) {
-        float v = float(row[i]);
-        // Tie-break on smaller index — needed to make per-thread
-        // intermediate state agree with the final reduction's
-        // tie-break before any cross-thread compare happens.
-        if (v > local_max || (v == local_max && i < local_idx)) {
-            local_max = v;
-            local_idx = i;
+    for (uint base = tid * 4u; base < ARGMAX_VOCAB; base += tg * 4u) {
+        for (uint j = 0; j < 4u && base + j < ARGMAX_VOCAB; j++) {
+            take(float(row[base + j]), base + j);
         }
     }
-
-    shared_max[tid] = local_max;
-    shared_idx[tid] = local_idx;
-
+    for (ushort off = 16; off > 0; off >>= 1) {
+        take(simd_shuffle_down(best, off), simd_shuffle_down(best_i, off));
+    }
+    const uint lane = tid % 32u, simd = tid / 32u, simds = (tg + 31u) / 32u;
+    if (lane == 0) {
+        shared_max[simd] = best;
+        shared_idx[simd] = best_i;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Tree reduction. Pairwise compare; on tie, keep the smaller
-    // index. `tg` is power-of-two by contract (caller picks 256 /
-    // 512 / 1024 as appropriate).
-    for (uint stride = tg / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            float a  = shared_max[tid];
-            float b  = shared_max[tid + stride];
-            uint  ai = shared_idx[tid];
-            uint  bi = shared_idx[tid + stride];
-            if (b > a || (b == a && bi < ai)) {
-                shared_max[tid] = b;
-                shared_idx[tid] = bi;
-            }
+    if (simd == 0) {
+        best = -INFINITY;
+        best_i = 0;
+        if (lane < simds) {
+            best = shared_max[lane];
+            best_i = shared_idx[lane];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (ushort off = 16; off > 0; off >>= 1) {
+            take(simd_shuffle_down(best, off), simd_shuffle_down(best_i, off));
+        }
     }
-    return shared_idx[0];
+    return best_i;
 }
 
 template <typename T>
