@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import build_archs
+import build_leaderboard
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -148,6 +149,7 @@ PAGE_TEMPLATE = """\
 # itself. `active` is the href of the page being built, if it is in the nav.
 NAV = [
     ("architectures.html", "Models"),
+    ("leaderboard.html", "Leaderboard"),
     ("book/index.html", "Docs"),
 ]
 
@@ -262,6 +264,33 @@ def check_markdown_links():
     return broken
 
 
+def check_nav_parity():
+    """index.html's hand-written header must agree with NAV, both ways.
+
+    The top nav exists twice: here, feeding every generated page, and inlined in
+    the hand-written landing page. Nothing connected them, so they drifted and had
+    to be fixed by hand (commit 5b26f981 removed one entry from both). This turns
+    that class of bug into a build failure.
+    """
+    src = (HERE / "index.html").read_text()
+    item_re = re.compile(
+        r'<cds-header-nav-item\s+href="([^"]+)"[^>]*>(.*?)</cds-header-nav-item>',
+        re.S,
+    )
+    found = [(h, label.strip()) for h, label in item_re.findall(src)]
+    expected = list(NAV)
+    broken = False
+    for item in expected:
+        if item not in found:
+            print(f"nav parity: index.html is missing {item}", file=sys.stderr)
+            broken = True
+    for item in found:
+        if item not in expected:
+            print(f"nav parity: index.html has {item}, absent from NAV", file=sys.stderr)
+            broken = True
+    return broken
+
+
 def main():
     shutil.rmtree(SITE, ignore_errors=True)
     BOOK.mkdir(parents=True)
@@ -273,9 +302,13 @@ def main():
         build_chapter(title, src_rel, slug)
 
     build_archs.build(SITE / "architectures.html", header_html("", active="architectures.html"))
+    build_leaderboard.build(SITE / "leaderboard.html", header_html("", active="leaderboard.html"))
 
-    if check_markdown_links():
-        print("link check failed", file=sys.stderr)
+    # Both run, and neither short-circuits the other: one build should report
+    # every problem it can see, not just the first kind.
+    failures = [check_markdown_links(), check_nav_parity()]
+    if any(failures):
+        print("site checks failed", file=sys.stderr)
         sys.exit(1)
 
     print(f"site assembled at {SITE}")

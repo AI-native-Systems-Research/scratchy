@@ -17,6 +17,36 @@
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --wide: 1080px;
+
+  /* Categorical series colours for the leaderboard's charts. --accent and
+   * --accent-2 resolve to the same Carbon token, so the site had exactly one
+   * brand colour and no categorical palette; these are the second literal-hex
+   * block in this file, after the syntax accents below.
+   *
+   * Carbon steps purple-60 / teal-50 / orange-70, validated as a set against
+   * this site's four real chart surfaces (light #ffffff and #f4f4f4, dark
+   * #161616 and #262626), all pairs, both modes:
+   *
+   *   2 slots  CVD dE 20.3 deutan (tritan 14.7) · normal-vision dE 30.5
+   *   3 slots  CVD dE 15.9 deutan (tritan 14.7) · normal-vision dE 26.4
+   *   lightness band, chroma floor and >= 3:1 contrast: pass in both modes
+   *
+   * They are mode-INVARIANT — the same hex clears both bands — which is why
+   * this file still carries no light/dark branching of its own. Candidates
+   * rejected, so nobody re-tries them: #33b1ff fails the dark lightness band
+   * (L 0.729 > 0.67); #a56eff with #1192e8 fails CVD (dE 3.4); #1192e8 beside
+   * teal-50 fails the normal-vision floor (dE 13.3).
+   *
+   * One layout consequence: purple-60 measures 2.31:1 on dark --cds-layer-02
+   * (#393939), so a chart sits on --bg or --bg-soft and never on --panel. */
+  --lb-s1: #8a3ffc;
+  --lb-s2: #009d9a;
+  --lb-s3: #ba4e00;
+  /* Signed deltas are polarity, so they get a diverging pair and a neutral
+   * zero rule — all three from existing theme-tracking tokens, no new hex. */
+  --lb-pole-fast: var(--accent);
+  --lb-pole-slow: var(--cds-support-error);
+  --lb-zero: var(--line);
 }
 
 * { box-sizing: border-box; }
@@ -500,4 +530,465 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 
 @media (max-width: 900px) {
   .archbar cds-select { min-width: 100%; }
+}
+
+/* ---------- Launch Claude Leaderboard (site/build_leaderboard.py) ---------- */
+
+/* Same reasoning as .archpage: sit inside .docs-content to inherit the side-nav
+ * rail reservation and the page gutter, and add only this page's vertical
+ * rhythm. */
+.lbpage {
+  padding: var(--cds-spacing-08, 2.5rem) 0 var(--cds-spacing-10, 4rem);
+}
+
+.lbsection {
+  margin: var(--cds-spacing-10, 4rem) 0 0;
+}
+
+.lbsection h2 {
+  margin: 0 0 var(--cds-spacing-05, 1rem);
+  font-size: var(--cds-heading-03-font-size, 1.25rem);
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.lbsection h3 {
+  margin: var(--cds-spacing-07, 2rem) 0 var(--cds-spacing-03, 0.5rem);
+  font-size: var(--cds-heading-02-font-size, 1rem);
+  font-weight: 600;
+}
+
+.lbsection p { max-width: 46rem; }
+
+.lb-fineprint,
+.lb-controlnote,
+.lb-groupnote,
+.lb-src {
+  color: var(--muted);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+  line-height: 1.5;
+}
+
+.lb-count {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+}
+
+/* The example-data banner. Not dismissable: the page is not claiming anything
+ * yet, and that has to be the first thing read. */
+.lbbanner {
+  margin: var(--cds-spacing-07, 2rem) 0 0;
+  padding: var(--cds-spacing-05, 1rem);
+  border-left: 3px solid var(--cds-support-warning);
+  background: var(--bg-soft);
+  font-size: var(--cds-body-01-font-size, 0.875rem);
+  line-height: 1.6;
+}
+
+.lb-disclosures,
+.lb-notes {
+  max-width: 46rem;
+  padding-left: 1.2rem;
+  font-size: var(--cds-body-01-font-size, 0.875rem);
+  line-height: 1.6;
+}
+
+.lb-disclosures li,
+.lb-notes li { margin-bottom: var(--cds-spacing-05, 1rem); }
+
+/* ---------- stat tiles ---------- */
+
+.lbkpis {
+  display: grid;
+  gap: var(--cds-spacing-05, 1rem);
+  grid-template-columns: 1fr;
+}
+
+.lbkpi {
+  padding: var(--cds-spacing-05, 1rem);
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
+}
+
+.lbkpi-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+}
+
+.lbkpi-value {
+  margin: var(--cds-spacing-03, 0.5rem) 0 0;
+  font-size: 2rem;
+  font-weight: 300;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+/* Exactly one hero figure per view; the rest are ordinary tiles. */
+.lbkpi-value.lb-hero { font-size: 3rem; }
+
+.lbkpi-sub {
+  margin: var(--cds-spacing-03, 0.5rem) 0 0;
+  font-size: var(--cds-body-01-font-size, 0.875rem);
+}
+
+.lbkpi-detail {
+  margin: var(--cds-spacing-02, 0.25rem) 0 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+}
+
+/* ---------- the board ---------- */
+
+.lbgroup { margin: var(--cds-spacing-08, 2.5rem) 0 0; }
+
+.lb-groupmeta {
+  margin-left: var(--cds-spacing-05, 1rem);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+  font-weight: 400;
+}
+
+/* Every wide table scrolls inside its own box. Without this the table sets the
+ * document width and the whole page scrolls sideways on a phone — the board has
+ * up to six metric columns, the applicability grid one per model, and a table
+ * view one per turn. */
+.lbboard,
+.lbstatus,
+.lbplain,
+.lb-tableview {
+  margin: var(--cds-spacing-05, 1rem) 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.lb-datatable {
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+.lb-datatable caption {
+  padding: 0 0 var(--cds-spacing-03, 0.5rem);
+  color: var(--muted);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+  line-height: 1.5;
+  text-align: left;
+}
+
+.lb-datatable td,
+.lb-datatable th { vertical-align: top; }
+
+/* Bold is the only win marker, and only where the spreads do not overlap. */
+.lb-cell.win { font-weight: 600; }
+
+.lb-cell.empty { color: var(--muted); }
+
+/* A latency number from an engine that malformed a tool call is not a win,
+ * whatever the clock said. */
+.lb-cell.suspect {
+  opacity: 0.55;
+  text-decoration: underline dotted var(--cds-support-warning);
+  text-underline-offset: 3px;
+}
+
+.lb-spread,
+.lb-reps {
+  color: var(--muted);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+}
+
+.lb-unit {
+  display: block;
+  color: var(--muted);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+  font-weight: 400;
+}
+
+.lb-na { margin-right: 0.4rem; }
+
+.lb-state,
+.lb-suspect-tag {
+  margin-left: 0.3rem;
+  font-size: 0.6875rem;
+}
+
+/* The turn-class control switches which cell is shown in CSS alone, so the
+ * default view is correct before any script runs and stays correct if none
+ * does. */
+.lbfacet { display: none; }
+body[data-turnclass="all"] .lbfacet[data-facet="all"],
+body[data-turnclass="tool-call"] .lbfacet[data-facet="tool-call"],
+body[data-turnclass="file-write"] .lbfacet[data-facet="file-write"] {
+  display: inline;
+}
+
+.lbcontrols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--cds-spacing-05, 1rem);
+  align-items: flex-end;
+  margin: var(--cds-spacing-05, 1rem) 0;
+}
+
+.lbcontrols cds-select { min-width: 12rem; }
+.lbcontrols .lb-controlnote { max-width: 30rem; margin: 0; }
+
+/* ---------- applicability grid ---------- */
+
+/* State is carried by an icon and a word as well as a colour — a status colour
+ * never travels alone. */
+.lb-state-cell { min-width: 11rem; }
+
+.lb-state-icon { margin-right: 0.35rem; }
+
+.lb-state-word {
+  font-weight: 600;
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+}
+
+.lb-state-why {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.6875rem;
+  line-height: 1.45;
+}
+
+.lb-state-cell[data-state="live"] .lb-state-icon { color: var(--cds-support-success); }
+.lb-state-cell[data-state="deferred"] .lb-state-icon { color: var(--cds-support-warning); }
+.lb-state-cell[data-state="blocked"] .lb-state-icon { color: var(--cds-support-error); }
+.lb-state-cell[data-state="inert"] .lb-state-icon,
+.lb-state-cell[data-state="off-by-design"] .lb-state-icon,
+.lb-state-cell[data-state="not-run"] .lb-state-icon { color: var(--muted); }
+
+.lb-switch {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  font-weight: 400;
+}
+
+/* ---------- figures ---------- */
+
+/* auto-fit rather than a fixed count, so a facet never gets narrow enough to
+ * clip its x-axis band; it drops to one column instead. */
+.lbfacets {
+  display: grid;
+  gap: var(--cds-spacing-05, 1rem);
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+}
+
+.lbfig {
+  margin: 0;
+  padding: var(--cds-spacing-05, 1rem);
+  border: 1px solid var(--line);
+  /* Charts sit on --bg or --bg-soft, never --panel: on dark, --cds-layer-02
+   * drops --lb-s1 to 2.31:1. */
+  background: var(--bg-soft);
+}
+
+.lbfig figcaption {
+  margin-bottom: var(--cds-spacing-03, 0.5rem);
+  font-weight: 600;
+  font-size: var(--cds-body-01-font-size, 0.875rem);
+}
+
+.lb-figmeta {
+  display: block;
+  color: var(--muted);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+  font-weight: 400;
+}
+
+.lbfig-empty { border-style: dashed; }
+
+.lb-emptynote {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--cds-body-01-font-size, 0.875rem);
+}
+
+.lb-svg,
+.lb-spark {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.lb-spark {
+  width: 6rem;
+  margin-top: var(--cds-spacing-03, 0.5rem);
+}
+
+.lb-svg:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- marks ---------- */
+
+/* Recessive and solid: a dashed gridline would compete with a dashed series
+ * line for the same meaning. */
+.lb-grid { stroke: var(--line); stroke-width: 1; }
+.lb-axis { stroke: var(--line); stroke-width: 1; }
+
+.lb-tick {
+  fill: var(--muted);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.lb-line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* Series colour binds to marks only, never to a bare .lb-sN, so label text
+ * keeps wearing ink. */
+.lb-line.lb-s1, .lb-whisker.lb-s1 { stroke: var(--lb-s1); }
+.lb-line.lb-s2, .lb-whisker.lb-s2 { stroke: var(--lb-s2); }
+.lb-line.lb-s3, .lb-whisker.lb-s3 { stroke: var(--lb-s3); }
+
+.lb-dot { stroke: var(--bg-soft); stroke-width: 2; }
+.lb-dot.lb-s1 { fill: var(--lb-s1); }
+.lb-dot.lb-s2 { fill: var(--lb-s2); }
+.lb-dot.lb-s3 { fill: var(--lb-s3); }
+
+.lb-whisker { stroke-width: 2; stroke-linecap: round; opacity: 0.55; }
+
+.lb-endlabel,
+.lb-rowlabel,
+.lb-barvalue {
+  fill: var(--fg);
+  font-family: var(--sans);
+  font-size: 11px;
+}
+
+.lb-barvalue { font-variant-numeric: tabular-nums; }
+.lb-rowlabel { fill: var(--muted); }
+.lb-rowlabel-main { fill: var(--fg); }
+.lb-rowlabel-sub { font-size: 10px; }
+
+.lb-bar.lb-pole-fast { fill: var(--lb-pole-fast); }
+.lb-bar.lb-pole-slow { fill: var(--lb-pole-slow); }
+.lb-bar-hatch { stroke: none; }
+.lb-ci { stroke: var(--fg); stroke-width: 1; opacity: 0.45; }
+.lb-zero { stroke: var(--lb-zero); stroke-width: 2; }
+.lb-cross { stroke: var(--fg); stroke-width: 1; opacity: 0.35; pointer-events: none; }
+
+/* ---------- example-data marking ---------- */
+
+/* Dashed strokes plus the in-viewBox watermark, so a cropped screenshot of one
+ * chart still says it is not a measurement. */
+.lb-example .lb-line,
+.lb-example .lb-whisker { stroke-dasharray: 5 3; }
+
+.lb-hatch { stroke: var(--bg-soft); stroke-width: 2; }
+
+.lb-watermark {
+  fill: var(--fg);
+  opacity: 0.1;
+  font-family: var(--sans);
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  pointer-events: none;
+}
+
+/* ---------- legend, table view, tooltip ---------- */
+
+.lb-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--cds-spacing-05, 1rem);
+  margin: var(--cds-spacing-03, 0.5rem) 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+}
+
+.lb-legend-item { display: inline-flex; align-items: center; gap: 0.4rem; }
+
+.lb-key { display: inline-block; flex: none; }
+.lb-key-line { width: 14px; height: 2px; }
+.lb-key-rect { width: 12px; height: 12px; }
+.lb-key-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+.lb-key.lb-s1 { background: var(--lb-s1); }
+.lb-key.lb-s2 { background: var(--lb-s2); }
+.lb-key.lb-s3 { background: var(--lb-s3); }
+.lb-key.lb-pole-fast { background: var(--lb-pole-fast); }
+.lb-key.lb-pole-slow { background: var(--lb-pole-slow); }
+
+.lb-datatable th .lb-key { margin-right: 0.4rem; }
+
+/* Every figure carries this, so a value is never reachable only by hovering. */
+.lb-tableview {
+  margin-top: var(--cds-spacing-05, 1rem);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+}
+
+.lb-tableview summary { cursor: pointer; color: var(--accent); }
+.lb-tableview .lb-datatable { margin-top: var(--cds-spacing-03, 0.5rem); }
+
+.lbtip {
+  position: absolute;
+  z-index: 10;
+  max-width: 18rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--fg);
+  font-size: var(--cds-label-01-font-size, 0.75rem);
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+.lbtip-head { color: var(--muted); }
+
+.lbtip-k {
+  display: inline-block;
+  width: 10px;
+  height: 2px;
+  margin-right: 0.35rem;
+  vertical-align: middle;
+}
+
+.lbtip-k.lb-s1 { background: var(--lb-s1); }
+.lbtip-k.lb-s2 { background: var(--lb-s2); }
+.lbtip-k.lb-s3 { background: var(--lb-s3); }
+
+/* ---------- responsive and accessibility ---------- */
+
+@media (min-width: 66rem) {
+  .lbkpis { grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }
+}
+
+@media (min-width: 82rem) {
+  .lbfig-wide { padding: var(--cds-spacing-06, 1.5rem); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lb-svg, .lbtip { transition: none; }
+}
+
+/* With colours replaced by the system palette, the dash on series 2 is the
+ * remaining identity channel. */
+@media (forced-colors: active) {
+  .lb-line.lb-s2 { stroke-dasharray: 6 3; }
+  .lb-line.lb-s3 { stroke-dasharray: 2 2; }
+  .lb-watermark { opacity: 0.35; }
+}
+
+@media (max-width: 900px) {
+  .lbcontrols cds-select { min-width: 100%; }
+  .lbkpi-value.lb-hero { font-size: 2.25rem; }
 }

@@ -1,0 +1,761 @@
+{
+  "schema": 1,
+  "run_id": "example-laneA",
+  "lane": "A",
+  "status": "example",
+  "provenance": {
+    "machine": "m5max-64",
+    "rung": "R1",
+    "scratchy_sha": "0000000",
+    "claude_version": "2.1.285",
+    "ollama_version": "0.34.2",
+    "context_length_tokens": 262144,
+    "kv_cache_dtype": {
+      "scratchy": "turboquant-3bit",
+      "ollama": "f16"
+    },
+    "quantization": {
+      "scratchy": "mlx-affine-b4-g64",
+      "ollama": "Q4_K_M"
+    },
+    "checkpoint_revision": {
+      "scratchy": "mlx-community/<model>-4bit@0000000",
+      "ollama": "<tag>@sha256:0000000"
+    },
+    "sampling": {
+      "temperature": 0.0
+    },
+    "trace_corpus": {
+      "id": "example",
+      "turns": 8,
+      "claude_version": "2.1.285"
+    },
+    "engine_order": [
+      "ollama",
+      "scratchy",
+      "ollama",
+      "scratchy"
+    ],
+    "thermal_state_start": "nominal",
+    "artifacts": [],
+    "disclosed": [
+      "kv-dtype-unmatched",
+      "quantizer-differs",
+      "daemon-vs-spawn"
+    ]
+  },
+  "measurements": [
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "n": 12,
+      "stat": {
+        "median": 120,
+        "p10": 110,
+        "p90": 140
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            800
+          ],
+          [
+            2,
+            125
+          ],
+          [
+            3,
+            120
+          ],
+          [
+            4,
+            118
+          ],
+          [
+            5,
+            120
+          ],
+          [
+            6,
+            122
+          ],
+          [
+            7,
+            120
+          ],
+          [
+            8,
+            119
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "n": 12,
+      "stat": {
+        "median": 9,
+        "p10": 8.5,
+        "p90": 10
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "n": 12,
+      "stat": {
+        "median": 0.05,
+        "p10": 0.04,
+        "p90": 0.07
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "facet": {
+        "turn_class": "tool-call"
+      },
+      "n": 12,
+      "stat": {
+        "median": 102.0,
+        "p10": 93.5,
+        "p90": 119.0
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-12b-it",
+      "facet": {
+        "turn_class": "file-write"
+      },
+      "n": 12,
+      "stat": {
+        "median": 162.0,
+        "p10": 148.5,
+        "p90": 189.0
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "n": 12,
+      "stat": {
+        "median": 300,
+        "p10": 280,
+        "p90": 330
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            850
+          ],
+          [
+            2,
+            310
+          ],
+          [
+            3,
+            300
+          ],
+          [
+            4,
+            305
+          ],
+          [
+            5,
+            300
+          ],
+          [
+            6,
+            298
+          ],
+          [
+            7,
+            302
+          ],
+          [
+            8,
+            300
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "n": 12,
+      "stat": {
+        "median": 12,
+        "p10": 11,
+        "p90": 13
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "n": 12,
+      "stat": {
+        "median": 0.4,
+        "p10": 0.35,
+        "p90": 0.45
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "facet": {
+        "turn_class": "tool-call"
+      },
+      "n": 12,
+      "stat": {
+        "median": 255.0,
+        "p10": 238.0,
+        "p90": 280.5
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-12b-it",
+      "facet": {
+        "turn_class": "file-write"
+      },
+      "n": 12,
+      "stat": {
+        "median": 405.0,
+        "p10": 378.0,
+        "p90": 445.5
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 12,
+      "stat": {
+        "median": 200,
+        "p10": 185,
+        "p90": 230
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            1800
+          ],
+          [
+            2,
+            210
+          ],
+          [
+            3,
+            205
+          ],
+          [
+            4,
+            200
+          ],
+          [
+            5,
+            198
+          ],
+          [
+            6,
+            202
+          ],
+          [
+            7,
+            200
+          ],
+          [
+            8,
+            199
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 12,
+      "stat": {
+        "median": 14,
+        "p10": 13,
+        "p90": 16
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 12,
+      "stat": {
+        "median": 0.05,
+        "p10": 0.04,
+        "p90": 0.07
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "facet": {
+        "turn_class": "tool-call"
+      },
+      "n": 12,
+      "stat": {
+        "median": 170.0,
+        "p10": 157.2,
+        "p90": 195.5
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "gemma-4-26b-a4b-it",
+      "facet": {
+        "turn_class": "file-write"
+      },
+      "n": 12,
+      "stat": {
+        "median": 270.0,
+        "p10": 249.8,
+        "p90": 310.5
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 12,
+      "stat": {
+        "median": 500,
+        "p10": 470,
+        "p90": 540
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            1900
+          ],
+          [
+            2,
+            520
+          ],
+          [
+            3,
+            510
+          ],
+          [
+            4,
+            505
+          ],
+          [
+            5,
+            500
+          ],
+          [
+            6,
+            498
+          ],
+          [
+            7,
+            502
+          ],
+          [
+            8,
+            500
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 12,
+      "stat": {
+        "median": 19,
+        "p10": 18,
+        "p90": 21
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "n": 12,
+      "stat": {
+        "median": 0.4,
+        "p10": 0.35,
+        "p90": 0.45
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "facet": {
+        "turn_class": "tool-call"
+      },
+      "n": 12,
+      "stat": {
+        "median": 425.0,
+        "p10": 399.5,
+        "p90": 459.0
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "gemma-4-26b-a4b-it",
+      "facet": {
+        "turn_class": "file-write"
+      },
+      "n": 12,
+      "stat": {
+        "median": 675.0,
+        "p10": 634.5,
+        "p90": 729.0
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "n": 12,
+      "stat": {
+        "median": 1100,
+        "p10": 900,
+        "p90": 1300
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            900
+          ],
+          [
+            2,
+            950
+          ],
+          [
+            3,
+            1000
+          ],
+          [
+            4,
+            1050
+          ],
+          [
+            5,
+            1100
+          ],
+          [
+            6,
+            1150
+          ],
+          [
+            7,
+            1200
+          ],
+          [
+            8,
+            1250
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "n": 12,
+      "stat": {
+        "median": 11,
+        "p10": 10,
+        "p90": 12
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "n": 12,
+      "stat": {
+        "median": 1.0,
+        "p10": 1.0,
+        "p90": 1.0
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "facet": {
+        "turn_class": "tool-call"
+      },
+      "n": 12,
+      "stat": {
+        "median": 935.0,
+        "p10": 765.0,
+        "p90": 1105.0
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "scratchy",
+      "model": "qwen3.6-35b-a3b",
+      "facet": {
+        "turn_class": "file-write"
+      },
+      "n": 12,
+      "stat": {
+        "median": 1485.0,
+        "p10": 1215.0,
+        "p90": 1755.0
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "n": 12,
+      "stat": {
+        "median": 600,
+        "p10": 570,
+        "p90": 650
+      },
+      "series": {
+        "x": "turn_index",
+        "points": [
+          [
+            1,
+            900
+          ],
+          [
+            2,
+            620
+          ],
+          [
+            3,
+            610
+          ],
+          [
+            4,
+            600
+          ],
+          [
+            5,
+            605
+          ],
+          [
+            6,
+            600
+          ],
+          [
+            7,
+            598
+          ],
+          [
+            8,
+            602
+          ]
+        ]
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "tpot_ms",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "n": 12,
+      "stat": {
+        "median": 13,
+        "p10": 12,
+        "p90": 15
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "reprefill_ratio",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "n": 12,
+      "stat": {
+        "median": 0.35,
+        "p10": 0.3,
+        "p90": 0.4
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "facet": {
+        "turn_class": "tool-call"
+      },
+      "n": 12,
+      "stat": {
+        "median": 510.0,
+        "p10": 484.5,
+        "p90": 552.5
+      }
+    },
+    {
+      "lane": "A",
+      "metric": "ttft_ms",
+      "engine": "ollama",
+      "model": "qwen3.6-35b-a3b",
+      "facet": {
+        "turn_class": "file-write"
+      },
+      "n": 12,
+      "stat": {
+        "median": 810.0,
+        "p10": 769.5,
+        "p90": 877.5
+      }
+    }
+  ],
+  "gaps": [],
+  "ablations": [
+    {
+      "optimization": "prefix-cache",
+      "model": "gemma-4-12b-it",
+      "metric": "ttft_ms",
+      "delta_pct": -60.0,
+      "ci_pct": [
+        -64.0,
+        -56.0
+      ],
+      "n": 12,
+      "attribution": "optimization",
+      "quality_check": "example run: no parity gate was executed"
+    },
+    {
+      "optimization": "prefix-cache",
+      "model": "gemma-4-26b-a4b-it",
+      "metric": "ttft_ms",
+      "delta_pct": -62.0,
+      "ci_pct": [
+        -66.0,
+        -58.0
+      ],
+      "n": 12,
+      "attribution": "optimization",
+      "quality_check": "example run: no parity gate was executed"
+    },
+    {
+      "optimization": "tool-spans",
+      "model": "gemma-4-12b-it",
+      "metric": "ttft_ms",
+      "delta_pct": -6.0,
+      "ci_pct": [
+        -9.0,
+        -3.0
+      ],
+      "n": 12,
+      "attribution": "optimization",
+      "quality_check": "example run: no parity gate was executed"
+    },
+    {
+      "optimization": "tool-spans",
+      "model": "gemma-4-26b-a4b-it",
+      "metric": "ttft_ms",
+      "delta_pct": -8.0,
+      "ci_pct": [
+        -11.0,
+        -5.0
+      ],
+      "n": 12,
+      "attribution": "optimization",
+      "quality_check": "example run: no parity gate was executed"
+    },
+    {
+      "optimization": "ngram-spec",
+      "model": "gemma-4-12b-it",
+      "metric": "ttft_ms",
+      "delta_pct": -20.0,
+      "ci_pct": [
+        -24.0,
+        -16.0
+      ],
+      "n": 12,
+      "attribution": "optimization",
+      "quality_check": "example run: no parity gate was executed"
+    },
+    {
+      "optimization": "ngram-spec",
+      "model": "gemma-4-26b-a4b-it",
+      "metric": "ttft_ms",
+      "delta_pct": -22.0,
+      "ci_pct": [
+        -26.0,
+        -18.0
+      ],
+      "n": 12,
+      "attribution": "optimization",
+      "quality_check": "example run: no parity gate was executed"
+    },
+    {
+      "optimization": "ngram-spec",
+      "model": "qwen3.6-35b-a3b",
+      "metric": "ttft_ms",
+      "delta_pct": -18.0,
+      "ci_pct": [
+        -22.0,
+        -14.0
+      ],
+      "n": 12,
+      "attribution": "optimization",
+      "quality_check": "example run: no parity gate was executed"
+    }
+  ]
+}
