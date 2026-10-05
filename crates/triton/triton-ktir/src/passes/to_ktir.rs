@@ -257,16 +257,23 @@ fn drop_corelet_plans(module: &mut Module) {
 /// After the arguments are `index`, every surviving `unrealized_conversion_cast` must
 /// be the no-op pointer-to-index bridge. Anything else has no lowering downstream.
 fn fold_pointer_casts(module: &mut Module) -> Result<()> {
-    loop {
-        let Some(path) = walk::paths(module).into_iter().find(|p| {
+    // COLLECTED FIRST, walked DESCENDING (`walk::erase`'s own order): the `while
+    // find` this grew from re-walked the module per cast. `replace_all_uses`
+    // touches only operands and the check reads the cast itself (cloned), so a
+    // descending walk needs no re-scan -- every unvisited path survives the
+    // erase unchanged.
+    let victims: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
             walk::at(module, p)
                 .map(|o| o.kind == OpKind::UnrealizedConversionCast)
                 .unwrap_or(false)
-        }) else {
-            return Ok(());
-        };
+        })
+        .collect();
+    let index = module.def_index();
+    for path in victims.into_iter().rev() {
         let op = walk::at(module, &path).expect("path").clone();
-        let in_ty = op.operands.first().and_then(|v| module.type_of(*v));
+        let in_ty = op.operands.first().and_then(|v| index.type_of(*v));
         let out_ty = op.result_type().cloned();
         if op.operands.len() != 1 || op.results.len() != 1 || in_ty != out_ty {
             return Err(refuse(
@@ -278,6 +285,7 @@ fn fold_pointer_casts(module: &mut Module) -> Result<()> {
         walk::replace_all_uses(module, from, to);
         walk::erase(module, &[path]);
     }
+    Ok(())
 }
 
 //===----------------------------------------------------------------------===//
@@ -311,7 +319,7 @@ fn convert_body(module: &mut Module) -> Result<()> {
 /// rather than rewritten, because the rewrite asserts the splatted value is a launch
 /// binding, and an interior SSA value would make that a lie. The door's scale registry is
 /// the consumer of the arg case; no other case has a contract.
-fn convert_splat_of_argument(module: &mut Module, path: &OpPath) -> Result<()> {
+fn convert_splat_of_argument(module: &mut Module, _index: &DefIndex, path: &OpPath) -> Result<()> {
     let op = walk::at(module, path).expect("path").clone();
     let Some(&operand) = op.operands.first() else {
         return Err(refuse(
@@ -599,9 +607,9 @@ fn repoint_deep(ops: &mut [Op], from: &Ssa, to: Ssa, n: &mut usize) {
 /// transposed (have the kernel write K^T, so the permutation is absorbed by the WRITE the way
 /// the fold absorbs it into a read), and that is a kernel-shape change rather than a compiler
 /// one. Recorded here so the cost is visible at the place that pays it.
-fn convert_trans(module: &mut Module, path: &OpPath) -> Result<()> {
+fn convert_trans(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result<()> {
     let op = walk::at(module, path).expect("path").clone();
-    let src_ty = module
+    let src_ty = index
         .type_of(op.operands[0])
         .ok_or_else(|| refuse("tt.trans operand has no type"))?;
     let res_ty = op
@@ -648,17 +656,42 @@ fn convert_trans(module: &mut Module, path: &OpPath) -> Result<()> {
 fn convert_all(
     module: &mut Module,
     kind: OpKind,
-    f: impl Fn(&mut Module, &OpPath) -> Result<()>,
+    f: impl Fn(&mut Module, &DefIndex, &OpPath) -> Result<()>,
 ) -> Result<()> {
-    loop {
-        let Some(path) = walk::paths(module)
+    // COLLECTED FIRST, walked DESCENDING. The `while find` this grew from
+    // re-walked the whole module per converted op -- quadratic at kernel scale.
+    // The converters rewrite an op IN PLACE (with insertions before it in the
+    // same block), so every LATER same-block index shifts; descending means only
+    // already-visited paths shift. If a converter ever DELETES an op, the same
+    // order keeps it safe (`walk::erase`'s own law).
+    let mut paths: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| walk::at(module, p).map(|o| o.kind == kind).unwrap_or(false))
+        .collect();
+    paths.sort();
+    paths.reverse();
+    // ONE definition snapshot per batch, rebuilt each outer trip of a fixed-point
+    // caller (see `unroll_constant_trip_loops`): the converters INSERT ops, so a
+    // snapshot from before this batch is stale by the end -- but every converter
+    // reads only PRE-EXISTING definitions (its own op's operands), which the
+    // snapshot has. Rebuilding per op (the first fix's shape) paid a whole-module
+    // index per broadcast -- measured, that rebuild was the pass's whole cost.
+    while !paths.is_empty() {
+        let index = module.def_index();
+        for path in paths.drain(..) {
+            f(module, &index, &path)?;
+        }
+        // A converter that mints a NEW op of the SAME kind needs another trip; the
+        // current converters never do, so this re-scan is the fixed point's guard,
+        // not its engine.
+        paths = walk::paths(module)
             .into_iter()
-            .find(|p| walk::at(module, p).map(|o| o.kind == kind).unwrap_or(false))
-        else {
-            return Ok(());
-        };
-        f(module, &path)?;
+            .filter(|p| walk::at(module, p).map(|o| o.kind == kind).unwrap_or(false))
+            .collect();
+        paths.sort();
+        paths.reverse();
     }
+    Ok(())
 }
 
 /// The identity element of a combiner -- the value the DPS init must hold for
@@ -729,7 +762,7 @@ fn projected_map(rank: usize, keep: &[usize]) -> String {
 
 /// `tt.reduce` over one axis -> a `linalg.generic` with a reduction iterator, the
 /// combiner inlined, and the combiner's identity as the DPS init.
-fn convert_reduce(module: &mut Module, path: &OpPath) -> Result<()> {
+fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result<()> {
     let op = walk::at(module, path).expect("path").clone();
     if op.operands.len() != 1 || op.results.len() != 1 {
         return Err(refuse(format!(
@@ -739,7 +772,7 @@ fn convert_reduce(module: &mut Module, path: &OpPath) -> Result<()> {
             op.results.len()
         )));
     }
-    let src_ty = module
+    let src_ty = index
         .type_of(op.operands[0])
         .ok_or_else(|| refuse("tt.reduce's operand has no type"))?;
     let res_ty = op
@@ -873,9 +906,10 @@ fn convert_reduce(module: &mut Module, path: &OpPath) -> Result<()> {
 /// away, then a `linalg.generic` whose ins map is the projected permutation onto the
 /// kept dims and whose body is a BARE YIELD. See the module docs on why the named
 /// `linalg.broadcast` is wrong here.
-fn convert_broadcast(module: &mut Module, path: &OpPath) -> Result<()> {
+fn convert_broadcast(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result<()> {
     let op = walk::at(module, path).expect("path").clone();
-    let src_ty = module
+    // The definition snapshot is `convert_all`'s own, one per batch -- see there.
+    let src_ty = index
         .type_of(op.operands[0])
         .ok_or_else(|| refuse("tt.broadcast's operand has no type"))?;
     let res_ty = op
@@ -969,9 +1003,9 @@ fn convert_broadcast(module: &mut Module, path: &OpPath) -> Result<()> {
 }
 
 /// `tt.expand_dims` -> `tensor.expand_shape`.
-fn convert_expand_dims(module: &mut Module, path: &OpPath) -> Result<()> {
+fn convert_expand_dims(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result<()> {
     let op = walk::at(module, path).expect("path").clone();
-    let src_ty = module
+    let src_ty = index
         .type_of(op.operands[0])
         .ok_or_else(|| refuse("tt.expand_dims' operand has no type"))?;
     let res_ty = op
@@ -1037,10 +1071,13 @@ fn convert_expand_dims(module: &mut Module, path: &OpPath) -> Result<()> {
 /// exact.
 fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
     let loops: Vec<OpPath> = crate::passes::distribute_work::work_loops(module);
+    // ONE definition snapshot: the loop-bound reads below were whole-module
+    // scans paid per loop -- quadratic at kernel scale.
+    let index = module.def_index();
     for path in loops.into_iter().rev() {
         let loopp = walk::at(module, &path).expect("path").clone();
-        let work_items = crate::passes::dot_to_linalg::const_int(module, loopp.operands[1]);
-        let num_cores = crate::passes::dot_to_linalg::const_int(module, loopp.operands[2]);
+        let work_items = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[1]);
+        let num_cores = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[2]);
         let (Some(work_items), Some(num_cores)) = (work_items, num_cores) else {
             return Err(refuse(
                 "the grid work loop's bounds are not compile-time constants, so whether \
@@ -1314,11 +1351,14 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
                 .unwrap_or(false)
         })
         .collect();
+    // ONE definition snapshot: the loop-bound reads below were whole-module
+    // scans paid per loop -- quadratic at kernel scale.
+    let index = module.def_index();
     for path in paths.into_iter().rev() {
         let loopp = walk::at(module, &path).expect("path").clone();
-        let lb = crate::passes::dot_to_linalg::const_int(module, loopp.operands[0]);
-        let ub = crate::passes::dot_to_linalg::const_int(module, loopp.operands[1]);
-        let step = crate::passes::dot_to_linalg::const_int(module, loopp.operands[2]);
+        let lb = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[0]);
+        let ub = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[1]);
+        let step = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[2]);
         // NOT DECIDABLE HERE IS NOT AN ERROR HERE -- see the doc comment. The downstream window
         // guard is the one that reports it, and it reports it better.
         let (Some(lb), Some(ub), Some(step)) = (lb, ub, step) else {
@@ -1508,6 +1548,9 @@ fn fold_unit_grid_tile_id(module: &mut Module) {
             replacements.push((path.clone(), *r, 0));
         }
     }
+    // ONE rewrite walk for every landmark, not one per result -- the batched
+    // form of the constant folder's own law.
+    let mut map: HashMap<Ssa, Ssa> = HashMap::new();
     for (path, res, val) in replacements {
         let ty = walk::at(module, &path)
             .and_then(|o| o.result_types.first().cloned())
@@ -1522,8 +1565,9 @@ fn fold_unit_grid_tile_id(module: &mut Module) {
                 .with_result(c, ty)
                 .with_attr(AttrKey::Value, Attr::Int(val)),
         );
-        walk::replace_all_uses(module, res, c);
+        map.insert(res, c);
     }
+    walk::replace_all_uses_many(module, &map);
     // CONSTANT INDEX ARITHMETIC FOLDS, so `0 * 64` and friends do not survive as a dead shell the
     // window readers still cannot read. `arith.index_cast` of a constant folds to the constant too.
     //
@@ -1545,6 +1589,16 @@ fn fold_unit_grid_tile_id(module: &mut Module) {
 fn fold_index_arithmetic(module: &mut Module) {
     loop {
         let mut folded = false;
+        // ONE definition snapshot per outer trip: the per-op `const_int` reads
+        // were whole-module scans, twice per candidate -- quadratic at kernel
+        // scale. A constant THIS trip mints is visible to the next trip's
+        // snapshot, so the fixed point is unchanged (an op folds at most once;
+        // the outer loop terminates on a trip that folds nothing).
+        let index = module.def_index();
+        // ONE rewrite walk per trip: each fold rewires one result to its fresh
+        // constant, and a per-fold `replace_all_uses` walked the whole module
+        // per candidate -- the same quadratic `dedup_constants` had.
+        let mut map: HashMap<Ssa, Ssa> = HashMap::new();
         for path in walk::paths(module) {
             let Some(o) = walk::at(module, &path) else {
                 continue;
@@ -1560,28 +1614,28 @@ fn fold_index_arithmetic(module: &mut Module) {
                 _ => continue,
             };
             let val = match o.kind {
-                OpKind::ArithMuli => crate::passes::dot_to_linalg::const_int(module, a)
-                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                OpKind::ArithMuli => crate::passes::dot_to_linalg::const_int_index(&index, a)
+                    .zip(crate::passes::dot_to_linalg::const_int_index(&index, b))
                     .map(|(x, y)| x * y),
-                OpKind::ArithAddi => crate::passes::dot_to_linalg::const_int(module, a)
-                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                OpKind::ArithAddi => crate::passes::dot_to_linalg::const_int_index(&index, a)
+                    .zip(crate::passes::dot_to_linalg::const_int_index(&index, b))
                     .map(|(x, y)| x + y),
                 // Truncating division, the C semantics the op has; division by zero is left standing
                 // rather than turned into a build error in a fold.
-                OpKind::ArithDivsi => crate::passes::dot_to_linalg::const_int(module, a)
-                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                OpKind::ArithDivsi => crate::passes::dot_to_linalg::const_int_index(&index, a)
+                    .zip(crate::passes::dot_to_linalg::const_int_index(&index, b))
                     .and_then(|(x, y)| if y == 0 { None } else { Some(x / y) }),
                 // Unsigned remainder/division: the semantics `remui`/`divui` name. `remsi` is
                 // signed, but on the non-negative constants a grid chain produces the two agree;
                 // a negative operand is left standing rather than guessed at.
-                OpKind::ArithRemui => crate::passes::dot_to_linalg::const_int(module, a)
-                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                OpKind::ArithRemui => crate::passes::dot_to_linalg::const_int_index(&index, a)
+                    .zip(crate::passes::dot_to_linalg::const_int_index(&index, b))
                     .and_then(|(x, y)| if y == 0 || x < 0 { None } else { Some(x % y) }),
-                OpKind::ArithDivui => crate::passes::dot_to_linalg::const_int(module, a)
-                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                OpKind::ArithDivui => crate::passes::dot_to_linalg::const_int_index(&index, a)
+                    .zip(crate::passes::dot_to_linalg::const_int_index(&index, b))
                     .and_then(|(x, y)| if y == 0 || x < 0 { None } else { Some(x / y) }),
-                OpKind::ArithRemsi => crate::passes::dot_to_linalg::const_int(module, a)
-                    .zip(crate::passes::dot_to_linalg::const_int(module, b))
+                OpKind::ArithRemsi => crate::passes::dot_to_linalg::const_int_index(&index, a)
+                    .zip(crate::passes::dot_to_linalg::const_int_index(&index, b))
                     .and_then(|(x, y)| {
                         if y == 0 {
                             None
@@ -1589,7 +1643,7 @@ fn fold_index_arithmetic(module: &mut Module) {
                             Some(x.wrapping_rem(y))
                         }
                     }),
-                OpKind::ArithIndexCast => crate::passes::dot_to_linalg::const_int(module, a),
+                OpKind::ArithIndexCast => crate::passes::dot_to_linalg::const_int_index(&index, a),
                 _ => continue,
             };
             let Some(val) = val else { continue };
@@ -1607,8 +1661,11 @@ fn fold_index_arithmetic(module: &mut Module) {
                     .with_result(c, ty)
                     .with_attr(AttrKey::Value, Attr::Int(val)),
             );
-            walk::replace_all_uses(module, res, c);
+            map.insert(res, c);
             folded = true;
+        }
+        if !map.is_empty() {
+            walk::replace_all_uses_many(module, &map);
         }
         if !folded {
             break;
@@ -1693,6 +1750,9 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     // corner on the A operand (MEASURED: attention at [4,4], the refusal this pass
     // exists to resolve). The gate fires on exactly the latter, so the whole-node
     // bodies keep their pinned emission.
+    // ONE definition snapshot: the corner reads below were whole-module scans
+    // paid per load candidate.
+    let index = module.def_index();
     let fires = body.iter().any(|o| {
         if o.kind != OpKind::KtdpLoad {
             return false;
@@ -1711,7 +1771,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             .get(1..3)
             .map(|cs| {
                 cs.iter()
-                    .any(|c| crate::passes::dot_to_linalg::const_int(module, *c).is_none())
+                    .any(|c| crate::passes::dot_to_linalg::const_int_index(&index, *c).is_none())
             })
             .unwrap_or(false);
         if !computed {
@@ -1844,6 +1904,9 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
         }
     }
     let mut materialize: HashSet<Ssa> = HashSet::new();
+    // ONE definition snapshot: the corner reads below were whole-module scans
+    // paid per view.
+    let index = module.def_index();
     for (view, ptr) in &view_of {
         let Some(idxs) = tiles_of.get(view) else {
             continue;
@@ -1857,7 +1920,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
                 body[i]
                     .operands
                     .get(1)
-                    .and_then(|s| crate::passes::dot_to_linalg::const_int(module, *s))
+                    .and_then(|s| crate::passes::dot_to_linalg::const_int_index(&index, *s))
             })
             .collect();
         if corners.iter().any(|c| c.is_none()) {
@@ -1916,7 +1979,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             let corner = if is_part_tile {
                 o.operands
                     .get(1)
-                    .and_then(|s| crate::passes::dot_to_linalg::const_int(module, *s))
+                    .and_then(|s| crate::passes::dot_to_linalg::const_int_index(&index, *s))
             } else {
                 None
             };
@@ -2064,17 +2127,20 @@ fn decompose_matmul_accumulators(module: &mut Module) -> Result<()> {
                 .unwrap_or(false)
         })
         .collect();
+    // ONE definition snapshot: the zero-init trace below read `def_of`/
+    // `is_zero_const` (whole-module scans) per matmul.
+    let index = module.def_index();
     for path in paths.into_iter().rev() {
         let mm = walk::at(module, &path).expect("collected path").clone();
         let acc = mm.operands[2];
         // A zero splat (or a zero scalar constant) is the `tl.dot` default init: the matmul
         // stands alone and the door's two-input reading is already the whole computation.
-        if crate::passes::dot_to_linalg::is_zero_const(module, acc)
-            || module.def_of(acc).is_some_and(|d| {
+        if crate::passes::dot_to_linalg::is_zero_const_index(&index, acc)
+            || index.def_of(acc).is_some_and(|d| {
                 d.kind == OpKind::TensorSplat
-                    && d.operands
-                        .first()
-                        .is_some_and(|s| crate::passes::dot_to_linalg::is_zero_const(module, *s))
+                    && d.operands.first().is_some_and(|s| {
+                        crate::passes::dot_to_linalg::is_zero_const_index(&index, *s)
+                    })
             })
         {
             continue;
@@ -2211,6 +2277,11 @@ fn fold_splat_seeds(module: &mut Module) {
         // which shifts are safe.
         'blocks: loop {
             let paths = walk::paths(module);
+            // One definition snapshot per re-walk, alongside the paths snapshot:
+            // `apply_splat_folds` mutates, so both go stale together and are
+            // rebuilt together. The `splat_value` reads it makes were whole-module
+            // scans before -- twice per candidate op per re-walk.
+            let index = module.def_index();
             // A block is identified by its FIRST op's path prefix; a block with no
             // foldable op is skipped by the collect below returning empty.
             let mut seen: HashSet<Vec<(usize, usize)>> = HashSet::new();
@@ -2221,7 +2292,7 @@ fn fold_splat_seeds(module: &mut Module) {
                 }
                 // COLLECT against the immutable module -- every `def_of`/`type_of` query
                 // happens here, before any borrow of a block.
-                let folds = collect_splat_folds(module, path);
+                let folds = collect_splat_folds(module, &index, path);
                 if folds.is_empty() {
                     continue;
                 }
@@ -2238,10 +2309,13 @@ fn fold_splat_seeds(module: &mut Module) {
 }
 
 /// The float value of `v` iff it is `tensor.splat` of an `arith.constant` float.
-fn splat_value(module: &Module, v: Ssa) -> Option<FloatBits> {
-    let splat = module.def_of(v).filter(|o| o.kind == OpKind::TensorSplat)?;
+/// Resolves through a snapshot index: the splat-seed fold re-walks the module per
+/// applied fold, and this read sat at the heart of that loop -- `def_of` is a
+/// whole-module scan, twice per candidate op.
+fn splat_value(index: &DefIndex, v: Ssa) -> Option<FloatBits> {
+    let splat = index.def_of(v).filter(|o| o.kind == OpKind::TensorSplat)?;
     let scalar = splat.operands.first().copied()?;
-    let konst = module
+    let konst = index
         .def_of(scalar)
         .filter(|o| o.kind == OpKind::ArithConstant)?;
     konst.attr(&AttrKey::Value).and_then(|a| a.as_float())
@@ -2258,7 +2332,7 @@ enum Fold {
 }
 
 /// The folds for the block holding `path`'s op, computed against the unmutated module.
-fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
+fn collect_splat_folds(module: &Module, index: &DefIndex, path: &OpPath) -> Vec<(usize, Fold)> {
     let block = match walk::block_ref(module, path) {
         Some(b) => b,
         None => return Vec::new(),
@@ -2275,51 +2349,50 @@ fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
             //    position is checked first and the right position is the same rule.
             OpKind::ArithMaxnumf => {
                 let (Some(a), Some(b)) = (a, b) else { continue };
-                if splat_value(module, a).is_some_and(|f| f.as_f64() == f64::NEG_INFINITY) {
+                if splat_value(index, a).is_some_and(|f| f.as_f64() == f64::NEG_INFINITY) {
                     folds.push((i, Fold::Forward(b)));
-                } else if splat_value(module, b).is_some_and(|f| f.as_f64() == f64::NEG_INFINITY) {
+                } else if splat_value(index, b).is_some_and(|f| f.as_f64() == f64::NEG_INFINITY) {
                     folds.push((i, Fold::Forward(a)));
                 }
             }
             OpKind::ArithAddf => {
                 let (Some(a), Some(b)) = (a, b) else { continue };
-                if splat_value(module, a).is_some_and(|f| f.as_f64() == 0.0) {
+                if splat_value(index, a).is_some_and(|f| f.as_f64() == 0.0) {
                     folds.push((i, Fold::Forward(b)));
-                } else if splat_value(module, b).is_some_and(|f| f.as_f64() == 0.0) {
+                } else if splat_value(index, b).is_some_and(|f| f.as_f64() == 0.0) {
                     folds.push((i, Fold::Forward(a)));
                 }
             }
             OpKind::ArithSubf => {
                 let (Some(a), Some(b)) = (a, b) else { continue };
-                if splat_value(module, b).is_some_and(|f| f.as_f64() == 0.0) {
+                if splat_value(index, b).is_some_and(|f| f.as_f64() == 0.0) {
                     folds.push((i, Fold::Forward(a)));
                 }
                 // ⛔ THE ALPHA SEED, guarded -- see the pass doc. `-inf - m` folds to
                 // `-inf` ONLY inside `exp2`, i.e. only when every use is a multiply by a
                 // positive splat whose own result feeds only `math.exp`. Outside that
                 // chain `-inf - -inf` = NaN and the fold would be a silent wrong answer.
-                else if splat_value(module, a).is_some_and(|f| f.as_f64() == f64::NEG_INFINITY)
-                    && sub_feeds_only_exp2(module, res)
+                else if splat_value(index, a).is_some_and(|f| f.as_f64() == f64::NEG_INFINITY)
+                    && sub_feeds_only_exp2(module, index, res)
                 {
                     folds.push((i, Fold::ToSplat(a)));
                 }
             }
             OpKind::ArithMulf => {
                 let (Some(a), Some(b)) = (a, b) else { continue };
-                if splat_value(module, a).is_some_and(|f| f.as_f64() == 1.0) {
+                if splat_value(index, a).is_some_and(|f| f.as_f64() == 1.0) {
                     folds.push((i, Fold::Forward(b)));
-                } else if splat_value(module, b).is_some_and(|f| f.as_f64() == 1.0) {
+                } else if splat_value(index, b).is_some_and(|f| f.as_f64() == 1.0) {
                     folds.push((i, Fold::Forward(a)));
                 }
                 // ── splat × splat: fold in f64, re-round to the element type.
-                else if let (Some(x), Some(y)) = (splat_value(module, a), splat_value(module, b))
-                {
+                else if let (Some(x), Some(y)) = (splat_value(index, a), splat_value(index, b)) {
                     folds.push((i, Fold::Const(x.as_f64() * y.as_f64())));
                 }
             }
             OpKind::ArithDivf => {
                 let (Some(a), Some(b)) = (a, b) else { continue };
-                if let (Some(x), Some(y)) = (splat_value(module, a), splat_value(module, b))
+                if let (Some(x), Some(y)) = (splat_value(index, a), splat_value(index, b))
                     && y.as_f64() != 0.0
                 {
                     folds.push((i, Fold::Const(x.as_f64() / y.as_f64())));
@@ -2327,14 +2400,14 @@ fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
             }
             OpKind::ArithMinnumf => {
                 let (Some(a), Some(b)) = (a, b) else { continue };
-                if let (Some(x), Some(y)) = (splat_value(module, a), splat_value(module, b)) {
+                if let (Some(x), Some(y)) = (splat_value(index, a), splat_value(index, b)) {
                     folds.push((i, Fold::Const(x.as_f64().min(y.as_f64()))));
                 }
             }
             // ── `exp`/`exp2` of a splat: exact only for the non-finite and zero anchors.
             OpKind::MathExp | OpKind::MathExp2 => {
                 let Some(a) = a else { continue };
-                if let Some(x) = splat_value(module, a) {
+                if let Some(x) = splat_value(index, a) {
                     let v = x.as_f64();
                     let folded = if v == f64::NEG_INFINITY {
                         Some(0.0)
@@ -2359,7 +2432,7 @@ fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
             //    yield-only `linalg.generic` over the collapsed source.
             OpKind::TensorExpandShape | OpKind::TensorCollapseShape => {
                 let Some(a) = a else { continue };
-                if splat_value(module, a).is_some() {
+                if splat_value(index, a).is_some() {
                     folds.push((i, Fold::ToSplat(a)));
                 }
             }
@@ -2374,7 +2447,7 @@ fn collect_splat_folds(module: &Module, path: &OpPath) -> Vec<(usize, Fold)> {
                     && op.regions[0].ops[0].kind == OpKind::LinalgYield
                     && op.regions[0].ops[0].operands.len() == 1
                     && op.regions[0].ops[0].operands[0] == op.regions[0].args[0].0;
-                if is_bare_broadcast && splat_value(module, a).is_some() {
+                if is_bare_broadcast && splat_value(index, a).is_some() {
                     folds.push((i, Fold::ToSplat(a)));
                 }
             }
@@ -2405,6 +2478,9 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
         }
         v
     };
+    // The value reads happen BEFORE the first splice (planning is read-only), so
+    // one snapshot covers them.
+    let index = module.def_index();
     // EVERY query and every fresh name is minted BEFORE the block borrow -- `def_of`,
     // `type_of` and `fresh_named` all take `&Module`/`&mut Module` and the block is a
     // projection of the same module.
@@ -2461,7 +2537,7 @@ fn apply_splat_folds(module: &mut Module, path: &OpPath, folds: Vec<(usize, Fold
                 action: Plan::Drop { to: resolve(to) },
             }),
             Fold::ToSplat(src) => {
-                let val = splat_value(module, src).expect("collected while immutable");
+                let val = splat_value(&index, src).expect("collected while immutable");
                 let konst = module.fresh_named(&hint);
                 planned.push(Planned {
                     i,
@@ -2533,7 +2609,7 @@ fn res_at(module: &Module, path: &OpPath, i: usize) -> Ssa {
 /// later) or a multiply by a positive splat whose own result feeds only `math.exp`.
 /// That is the one context in which `-inf - m` is provably `-inf` (and `exp2(-inf)`=0,
 /// exact for any implementation).
-fn sub_feeds_only_exp2(module: &Module, sub: Ssa) -> bool {
+fn sub_feeds_only_exp2(module: &Module, index: &DefIndex, sub: Ssa) -> bool {
     let uses: Vec<&Op> = module
         .ops_deep()
         .into_iter()
@@ -2555,7 +2631,7 @@ fn sub_feeds_only_exp2(module: &Module, sub: Ssa) -> bool {
         } else {
             u.operands[0]
         };
-        let Some(s) = splat_value(module, other) else {
+        let Some(s) = splat_value(index, other) else {
             return false;
         };
         // `<=` rather than `!(> )`: the splat could be NaN, and a NaN is not a positive

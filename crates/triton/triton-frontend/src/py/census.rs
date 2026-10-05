@@ -62,6 +62,7 @@ pub const TL_FUNCTIONS: &[&str] = &[
     "rsqrt",
     "math.rsqrt",
     "static_assert",
+    "static_range",
     "sum",
     "zeros",
 ];

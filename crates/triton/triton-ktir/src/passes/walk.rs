@@ -28,6 +28,7 @@
 //! and structural edits go through [`OpPath`], collected first.
 
 use crate::ir::*;
+use std::collections::HashMap;
 
 /// WHERE AN OP IS, as a path from the module root: `[i]` is `module.ops[i]`,
 /// `[i, r, j]` is region `r` of that op, op `j`, and so on.
@@ -66,6 +67,14 @@ impl OpPath {
 
 /// Every op in the module, in program order, with its path.
 pub fn paths(module: &Module) -> Vec<OpPath> {
+    fn count(ops: &[Op], out: &mut usize) {
+        *out += ops.len();
+        for o in ops {
+            for r in &o.regions {
+                count(&r.ops, out);
+            }
+        }
+    }
     fn walk_region(ops: &[Op], parent: &OpPath, region: usize, out: &mut Vec<OpPath>) {
         for (i, op) in ops.iter().enumerate() {
             let p = parent.child(region, i);
@@ -75,7 +84,14 @@ pub fn paths(module: &Module) -> Vec<OpPath> {
             }
         }
     }
-    let mut out = Vec::new();
+    // ONE exact allocation, not amortized growth: the fixed-point passes call this
+    // once per rewrite (their `while find` shape), so every mid-walk realloc was
+    // paid O(times) over the same module -- at kernel scale (~160k ops) the realloc
+    // traffic alone dominated the pass (measured: `RawVec::grow_one` + `realloc`
+    // ~60% of a sample).
+    let mut n = 0usize;
+    count(&module.ops, &mut n);
+    let mut out = Vec::with_capacity(n);
     for (i, op) in module.ops.iter().enumerate() {
         let p = OpPath::root(i);
         out.push(p.clone());
@@ -134,6 +150,75 @@ pub fn block_ref<'m>(module: &'m Module, path: &OpPath) -> Option<&'m Vec<Op>> {
     Some(&op.regions.get(r)?.ops)
 }
 
+/// Replace MANY ops in place, each with a run of zero or more ops, in ONE
+/// rebuilding pass per block.
+///
+/// A batched rewrite that splices per op (`Vec::remove` + `Vec::insert`) moves
+/// the whole tail of the block per rewrite -- quadratic at kernel scale, where a
+/// single function body holds six figures of ops (measured: `memmove` was the
+/// whole remaining cost of the descriptor walks). This rebuilds each touched
+/// block once, by draining it and re-emitting ops in index order with the
+/// replacements expanded.
+///
+/// `edits` are `(the path of an op being replaced, its replacement run)`. Every
+/// edit's path must point at a DISTINCT op; edits to the same block may arrive
+/// in any order. The replacement for an op may be EMPTY (an erase).
+/// A block's identity: the path prefix of the op holding it, plus its region index.
+type BlockKey = (Vec<(usize, usize)>, usize);
+
+pub fn splice_many(module: &mut Module, edits: Vec<(OpPath, Vec<Op>)>) {
+    // Group by block: the parent prefix, PLUS the region index the final pair's
+    // region names (the last pair is `(region, index)` and the region belongs to
+    // the op the prefix points at -- dropping it would merge sibling regions).
+    let mut by_block: HashMap<BlockKey, Vec<(usize, Vec<Op>)>> = HashMap::new();
+    for (path, ops) in edits {
+        let (prefix, last) = path.0.split_at(path.0.len() - 1);
+        let (region, i) = last[0];
+        by_block
+            .entry((prefix.to_vec(), region))
+            .or_default()
+            .push((i, ops));
+    }
+    // A representative path per block (prefix + the region, index 0), so
+    // `block_mut` can find it.
+    let mut blocks: Vec<BlockKey> = by_block.keys().cloned().collect();
+    // DEEPEST BLOCKS FIRST. Splicing a block only invalidates paths that point
+    // INTO it -- but a splice at prefix P also changes P's block's op COUNT,
+    // which shifts every SIBLING index after it, and deeper blocks' prefixes are
+    // named by those indices. Processing deepest-first means every block whose
+    // prefix passes through P's block is already done when P's splice shifts it:
+    // the pre-order sort puts a parent before its descendants, so this reverse
+    // visits descendants first (the same law `unroll_constant_trip_loops` and
+    // `walk::erase` state for their own rewrites).
+    blocks.sort();
+    blocks.reverse();
+    for (prefix, region) in blocks {
+        let mut probe = prefix.clone();
+        probe.push((region, 0));
+        let Some(mut edits) = by_block.remove(&(prefix, region)) else {
+            continue;
+        };
+        edits.sort_by_key(|(i, _)| *i);
+        let block = match block_mut(module, &OpPath(probe)) {
+            Some(b) => b,
+            None => continue,
+        };
+        let old = std::mem::take(block);
+        let mut it = edits.into_iter().peekable();
+        block.reserve(old.len());
+        for (i, op) in old.into_iter().enumerate() {
+            if it.peek().is_some_and(|(ei, _)| *ei == i) {
+                let (_, replacement) = it.next().expect("peeked");
+                block.extend(replacement);
+            } else {
+                block.push(op);
+            }
+        }
+        // Edits past the end (should not happen for collected paths) are dropped;
+        // a collected path's index is always inside its block.
+    }
+}
+
 /// Visit every op, mutably, in program order. Structure must not change.
 pub fn for_each_mut(module: &mut Module, mut f: impl FnMut(&mut Op)) {
     fn go(ops: &mut [Op], f: &mut impl FnMut(&mut Op)) {
@@ -176,6 +261,32 @@ pub fn replace_all_uses(module: &mut Module, from: Ssa, to: Ssa) {
         for o in op.operands.iter_mut() {
             if *o == from {
                 *o = to;
+            }
+        }
+    });
+}
+
+/// Replace MANY values at once, in ONE walk -- the batched [`replace_all_uses`].
+///
+/// A pass that rewires N values by calling [`replace_all_uses`] N times walks the
+/// whole module N times -- quadratic at kernel scale, where one function body
+/// holds six figures of ops and a CSE pass rewires four figures of constants
+/// (measured: `dedup_constants`' per-rewire walks dominated a multi-minute
+/// expansion). This walks once, resolving every operand through the map.
+///
+/// Chains resolve transitively and in the order given: `(a→b, b→c)` rewrites an
+/// `a` use to `c` when the entries are processed as a map lookup per operand --
+/// they are NOT. Each operand gets ONE lookup, so a chain must be flattened by
+/// the CALLER (follow `to` through the map until it is absent) if that is the
+/// intended meaning. Callers today always pass disjoint pairs.
+pub fn replace_all_uses_many(module: &mut Module, map: &HashMap<Ssa, Ssa>) {
+    if map.is_empty() {
+        return;
+    }
+    for_each_mut(module, |op| {
+        for o in op.operands.iter_mut() {
+            if let Some(to) = map.get(o) {
+                *o = *to;
             }
         }
     });

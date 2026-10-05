@@ -43,6 +43,7 @@
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
 use crate::{Refusal, Result};
+use std::collections::HashMap;
 
 const PASS: &str = "ConvertTTIRToKTDP";
 
@@ -68,21 +69,45 @@ pub fn run(module: &mut Module) -> Result<()> {
 /// wrapped in an `unrealized_conversion_cast` so the `!tt.tensordesc`-typed uses
 /// keep verifying. The access-op patterns pick the memref up through that cast.
 fn walk_1_descriptors(module: &mut Module) -> Result<()> {
-    while let Some(path) = walk::paths(module).into_iter().find(|p| {
-        walk::at(module, p)
-            .map(|o| o.kind == OpKind::TtMakeTensorDescriptor)
-            .unwrap_or(false)
-    }) {
+    // COLLECTED FIRST, one pass. The `while find` this grew from re-walked the
+    // whole module AND re-collected the whole use set PER DESCRIPTOR -- quadratic
+    // twice over, and ~100% of this pass's time at kernel scale (measured on the
+    // unrolled attention kernel: `walk::paths` realloc traffic + `used_values`,
+    // then the per-op splice's memmove). All edits land in ONE rebuild per block
+    // (`walk::splice_many`); a dead descriptor is an EMPTY replacement.
+    let paths: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| o.kind == OpKind::TtMakeTensorDescriptor)
+                .unwrap_or(false)
+        })
+        .collect();
+    // Built once for the whole walk: the shape/stride `const_int` reads resolve
+    // PRE-EXISTING values only (SSA -- a use follows its definition, and the
+    // splice mints fresh ones), so a snapshot taken before the first rewrite sees
+    // exactly what the old per-call scan saw.
+    let index = module.def_index();
+    let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
+    let mut pending_rewires: Vec<(Ssa, Ssa)> = Vec::new();
+    for path in paths {
         let desc = walk::at(module, &path).expect("path").clone();
+        if desc.kind != OpKind::TtMakeTensorDescriptor {
+            continue; // the splice cannot remove a descriptor, but stay honest anyway
+        }
         let result = desc
             .result()
             .ok_or_else(|| Refusal::new(PASS, "tt.make_tensor_descriptor defines no descriptor"))?;
 
         // A descriptor nothing uses is simply erased -- `attention_flash`'s
-        // `desc_mask` in the non-causal configuration is exactly this.
+        // `desc_mask` in the non-causal configuration is exactly this. ONE use
+        // set for the whole walk: `replace_all_uses` below rewires the erased
+        // descriptor's result to the cast, so a later descriptor's uses are
+        // unchanged (nothing reads a descriptor EXCEPT an access op, and those
+        // were collected before the first splice).
         let used = walk::used_values(module);
         if !used.contains(&result) {
-            walk::erase(module, &[path]);
+            edits.push((path, Vec::new()));
             continue;
         }
 
@@ -90,22 +115,19 @@ fn walk_1_descriptors(module: &mut Module) -> Result<()> {
             .result_type()
             .and_then(|t| t.elem())
             .ok_or_else(|| Refusal::new(PASS, "descriptor has no element type"))?;
-        let built = build_base_memory_view(module, &desc, elem)?;
+        let mut built = build_base_memory_view(module, &index, &desc, elem)?;
         let cast_result = built
             .last()
             .and_then(|o| o.result())
             .expect("the descriptor cast defines a value");
 
-        // Splice the three ops in where the descriptor was, then rewire its uses.
-        let idx = path.index();
-        {
-            let block = walk::block_mut(module, &path).expect("path");
-            block.remove(idx);
-            for (k, nop) in built.into_iter().enumerate() {
-                block.insert(idx + k, nop);
-            }
-        }
-        walk::replace_all_uses(module, result, cast_result);
+        // Collect the splice, then rewire the descriptor's uses to the cast.
+        edits.push((path, std::mem::take(&mut built)));
+        pending_rewires.push((result, cast_result));
+    }
+    walk::splice_many(module, edits);
+    for (from, to) in pending_rewires {
+        walk::replace_all_uses(module, from, to);
     }
     Ok(())
 }
@@ -113,7 +135,12 @@ fn walk_1_descriptors(module: &mut Module) -> Result<()> {
 /// `buildBaseMemoryView`. Shape/strides come off the descriptor's SSA values as
 /// compile-time constants when available, `kDynamic` otherwise (with an
 /// `index_cast` of the runtime value). Memory space is HBM.
-fn build_base_memory_view(module: &mut Module, desc: &Op, elem: DType) -> Result<Vec<Op>> {
+fn build_base_memory_view(
+    module: &mut Module,
+    index: &DefIndex,
+    desc: &Op,
+    elem: DType,
+) -> Result<Vec<Op>> {
     let rank = desc.result_type().map(|t| t.rank()).unwrap_or(0);
     let base = desc
         .operands
@@ -128,12 +155,13 @@ fn build_base_memory_view(module: &mut Module, desc: &Op, elem: DType) -> Result
     if have {
         for i in 0..rank {
             shape.push(
-                super::dot_to_linalg::const_int(module, desc.operands[1 + i]).unwrap_or(DYNAMIC),
+                super::dot_to_linalg::const_int_index(index, desc.operands[1 + i])
+                    .unwrap_or(DYNAMIC),
             );
         }
         for i in 0..rank {
             strides.push(
-                super::dot_to_linalg::const_int(module, desc.operands[1 + rank + i])
+                super::dot_to_linalg::const_int_index(index, desc.operands[1 + rank + i])
                     .unwrap_or(DYNAMIC),
             );
         }
@@ -177,7 +205,7 @@ fn build_base_memory_view(module: &mut Module, desc: &Op, elem: DType) -> Result
                 continue;
             }
             let src = desc.operands[1 + i];
-            match module.type_of(src) {
+            match index.type_of(src) {
                 Some(IrType::Index) => dyn_sizes.push(src),
                 _ => {
                     let v = module.fresh_named(&base_hint);
@@ -299,6 +327,9 @@ fn order_map(rank: usize, order: &[i64]) -> String {
 /// produced by walk 1. The remaining failure mode is a descriptor sourced from a
 /// function argument, whose shape/stride info there is no way to recover.
 fn precondition_check(module: &Module) -> Result<()> {
+    // ONE definition snapshot: `def_of`/`type_of` below were whole-module scans
+    // paid per access op -- quadratic at kernel scale.
+    let index = module.def_index();
     for op in module.ops_deep() {
         let is_access = matches!(
             op.kind,
@@ -312,12 +343,12 @@ fn precondition_check(module: &Module) -> Result<()> {
         }
         let desc = op.operands.first().copied();
         let ok = desc
-            .and_then(|v| module.def_of(v))
+            .and_then(|v| index.def_of(v))
             .map(|d| {
                 d.kind == OpKind::UnrealizedConversionCast
                     && d.operands
                         .first()
-                        .and_then(|v| module.type_of(*v))
+                        .and_then(|v| index.type_of(*v))
                         .map(|t| matches!(t, IrType::MemRef { .. }))
                         .unwrap_or(false)
             })
@@ -334,20 +365,37 @@ fn precondition_check(module: &Module) -> Result<()> {
 }
 
 /// The memref behind an access op's `desc` operand.
-fn descriptor_mem_view(module: &Module, access: &Op) -> Option<Ssa> {
+fn descriptor_mem_view(index: &DefIndex, access: &Op) -> Option<Ssa> {
     let desc = access.operands.first().copied()?;
-    let cast = module.def_of(desc)?;
+    let cast = index.def_of(desc)?;
     cast.operands.first().copied()
 }
 
 fn convert_access_ops(module: &mut Module) -> Result<()> {
-    while let Some(path) = walk::paths(module).into_iter().find(|p| {
-        walk::at(module, p)
-            .map(|o| matches!(o.kind, OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore))
-            .unwrap_or(false)
-    }) {
+    // COLLECTED FIRST. Same law as `walk_1_descriptors`: a `while find` per access
+    // op re-walked the module, and the per-op `def_of`/`type_of` reads were
+    // whole-module scans -- quadratic at kernel scale. All edits are applied in
+    // ONE rebuild per block (`walk::splice_many`), so no path is ever shifted
+    // under another.
+    let paths: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| matches!(o.kind, OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore))
+                .unwrap_or(false)
+        })
+        .collect();
+    let index = module.def_index();
+    let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
+    for path in paths {
         let op = walk::at(module, &path).expect("path").clone();
-        let view = descriptor_mem_view(module, &op)
+        if !matches!(
+            op.kind,
+            OpKind::TtDescriptorLoad | OpKind::TtDescriptorStore
+        ) {
+            continue;
+        }
+        let view = descriptor_mem_view(&index, &op)
             .ok_or_else(|| Refusal::new(PASS, "descriptor operand was not lowered by walk 1"))?;
 
         // BLOCK SHAPE COMES FROM THE DESCRIPTOR'S TYPE, not the result tensor. A
@@ -356,7 +404,7 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
         let desc_ty = op
             .operands
             .first()
-            .and_then(|v| module.type_of(*v))
+            .and_then(|v| index.type_of(*v))
             .ok_or_else(|| Refusal::new(PASS, "descriptor operand has no type"))?;
         let block_shape = desc_ty.dims().map(|d| d.to_vec()).unwrap_or_default();
 
@@ -379,7 +427,7 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
             .map(|r| module.hint(r))
             .unwrap_or_else(|| "0".into());
         let (casts, tile_op) =
-            build_direct_access_tile(module, view, &block_shape, &indices, &[], &hint);
+            build_direct_access_tile(module, &index, view, &block_shape, &indices, &[], &hint);
         let tile = tile_op.result().expect("the tile defines a value");
 
         let mut replacement: Vec<Op> = casts;
@@ -401,14 +449,9 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
                     .with_operands([src.expect("a store has a source"), tile]),
             );
         }
-
-        let idx = path.index();
-        let block = walk::block_mut(module, &path).expect("path");
-        block.remove(idx);
-        for (k, nop) in replacement.into_iter().enumerate() {
-            block.insert(idx + k, nop);
-        }
+        edits.push((path, replacement));
     }
+    walk::splice_many(module, edits);
     Ok(())
 }
 
@@ -421,6 +464,7 @@ fn convert_access_ops(module: &mut Module) -> Result<()> {
 /// and hence the tile's logical shape -- changes for a transposed read.
 fn build_direct_access_tile(
     module: &mut Module,
+    index: &DefIndex,
     view: Ssa,
     block_shape: &[i64],
     indices: &[Ssa],
@@ -439,7 +483,7 @@ fn build_direct_access_tile(
     let mut casts = Vec::new();
     let mut index_operands = Vec::new();
     for idx in indices {
-        let ty = module.type_of(*idx);
+        let ty = index.type_of(*idx);
         if matches!(ty, Some(IrType::Index)) {
             index_operands.push(*idx);
             continue;
@@ -483,9 +527,23 @@ fn build_direct_access_tile(
 /// read in the IR beside the transposed one, which is both wasted traffic and a
 /// confusing artifact. Safe because both are checked for a single use.
 fn fold_trans_into_access_tile_order(module: &mut Module) {
+    // ONE snapshot of defs, uses, and the trans paths, re-derived per round: the
+    // `loop { for path in walk::paths }` shape re-collected every path and ran
+    // `def_of`/`count_uses` (whole-module scans) per trans -- quadratic at kernel
+    // scale. Each round folds AT MOST ONE trans (the `break` below is the C++'s
+    // own conservative one-fold-then-restart law: every fold erases an op, so
+    // every collected path is stale after it), so the snapshot cost is paid once
+    // per round instead of once per candidate.
     loop {
+        let index = module.def_index();
+        let mut use_counts: HashMap<Ssa, usize> = HashMap::new();
+        for op in module.ops_deep() {
+            for o in &op.operands {
+                *use_counts.entry(*o).or_insert(0) += 1;
+            }
+        }
         let mut folded = false;
-        for path in walk::paths(module) {
+        'outer: for path in walk::paths(module) {
             let Some(op) = walk::at(module, &path) else {
                 continue;
             };
@@ -496,7 +554,7 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
             let Some(src) = trans.operands.first().copied() else {
                 continue;
             };
-            let Some(load) = module
+            let Some(load) = index
                 .def_of(src)
                 .filter(|o| o.kind == OpKind::KtdpLoad)
                 .cloned()
@@ -504,20 +562,20 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
                 continue;
             };
             // Single use of the load's result.
-            if count_uses(module, src) != 1 {
+            if use_counts.get(&src).copied().unwrap_or(0) != 1 {
                 continue;
             }
             let Some(tile_v) = load.operands.first().copied() else {
                 continue;
             };
-            let Some(tile) = module
+            let Some(tile) = index
                 .def_of(tile_v)
                 .filter(|o| o.kind == OpKind::KtdpConstructAccessTile)
                 .cloned()
             else {
                 continue;
             };
-            if count_uses(module, tile_v) != 1 {
+            if use_counts.get(&tile_v).copied().unwrap_or(0) != 1 {
                 continue;
             }
             let Some(Attr::IntList(order)) = trans.attr(&AttrKey::Order).cloned() else {
@@ -570,20 +628,12 @@ fn fold_trans_into_access_tile_order(module: &mut Module) {
             }
             walk::erase(module, &[tile_path]);
             folded = true;
-            break;
+            break 'outer;
         }
         if !folded {
             break;
         }
     }
-}
-
-fn count_uses(module: &Module, v: Ssa) -> usize {
-    module
-        .ops_deep()
-        .iter()
-        .map(|o| o.operands.iter().filter(|x| **x == v).count())
-        .sum()
 }
 
 fn find_path_of_result(module: &Module, v: Ssa) -> Option<OpPath> {
@@ -601,6 +651,8 @@ fn find_path_of_result(module: &Module, v: Ssa) -> Option<OpPath> {
 /// Scoped to TILE access -- a load/store whose value is a TENSOR. A raw SCALAR
 /// pointer read is legitimate and needs no access tile.
 fn refuse_raw_tile_access(module: &Module) -> Result<()> {
+    // ONE definition snapshot: `type_of` below was a whole-module scan per store.
+    let index = module.def_index();
     for op in module.ops_deep() {
         let shaped = match op.kind {
             OpKind::TtLoad => op
@@ -610,7 +662,7 @@ fn refuse_raw_tile_access(module: &Module) -> Result<()> {
             OpKind::TtStore => op
                 .operands
                 .last()
-                .and_then(|v| module.type_of(*v))
+                .and_then(|v| index.type_of(*v))
                 .map(|t| t.dims().is_some())
                 .unwrap_or(false),
             _ => false,
@@ -776,15 +828,23 @@ fn trace_index_view(module: &Module, x_offsets: Ssa) -> Result<(Ssa, Vec<Ssa>)> 
 /// descriptor op is refused by name by [`refuse_raw_tile_access`]'s sibling checks, so the
 /// omission fails closed rather than passing something through.
 fn convert_gathers(module: &mut Module) -> Result<()> {
-    loop {
-        let Some(path) = walk::paths(module).into_iter().find(|p| {
+    // COLLECTED FIRST, the same law as the other walks: the `while find` here
+    // re-walked the module per gather. All edits land in ONE rebuild per block.
+    let paths: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
             walk::at(module, p)
                 .map(|o| o.kind == OpKind::TtDescriptorGather)
                 .unwrap_or(false)
-        }) else {
-            return Ok(());
-        };
+        })
+        .collect();
+    let index = module.def_index();
+    let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
+    for path in paths {
         let op = walk::at(module, &path).expect("path").clone();
+        if op.kind != OpKind::TtDescriptorGather {
+            continue;
+        }
         // `tt.descriptor_gather %desc[%x_offsets, %y_offset]`.
         if op.operands.len() != 3 {
             return Err(Refusal::new(
@@ -796,7 +856,7 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
                 ),
             ));
         }
-        let view = descriptor_mem_view(module, &op).ok_or_else(|| {
+        let view = descriptor_mem_view(&index, &op).ok_or_else(|| {
             Refusal::new(PASS, "the gather's descriptor was not lowered by walk 1")
         })?;
         let (index_view, anchors) = trace_index_view(module, op.operands[1])?;
@@ -817,7 +877,7 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
         // why the golden shows a bare `%c0 : index`.
         let y = op.operands[2];
         let mut casts = Vec::new();
-        let y_index = match module.type_of(y) {
+        let y_index = match index.type_of(y) {
             Some(IrType::Index) => y,
             _ => {
                 let v = module.fresh_named(&hint);
@@ -875,14 +935,10 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
         let mut replacement = casts;
         replacement.push(tile);
         replacement.push(load);
-
-        let idx = path.index();
-        let block = walk::block_mut(module, &path).expect("path");
-        block.remove(idx);
-        for (k, nop) in replacement.into_iter().enumerate() {
-            block.insert(idx + k, nop);
-        }
+        edits.push((path, replacement));
     }
+    walk::splice_many(module, edits);
+    Ok(())
 }
 
 #[cfg(test)]

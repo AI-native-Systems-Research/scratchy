@@ -86,22 +86,27 @@ pub fn run(module: &mut Module) -> Result<()> {
 /// and the op census is wrong by one per index.
 fn fold_index_casts(module: &mut Module) -> bool {
     let mut changed = false;
-    loop {
-        let target = walk::paths(module).into_iter().find_map(|p| {
+    // COLLECTED FIRST, one index snapshot: the `while find_map` this grew from
+    // re-walked the module AND re-scanned for the operand's constant PER CAST --
+    // quadratic at kernel scale. The rewrite is IN PLACE (same index, same
+    // results), so no collected path is ever invalidated by another's fold.
+    let index = module.def_index();
+    let targets: Vec<(OpPath, Option<i64>)> = walk::paths(module)
+        .into_iter()
+        .filter_map(|p| {
             let op = walk::at(module, &p)?;
             if op.kind != OpKind::ArithIndexCast || !matches!(op.result_type(), Some(IrType::Index))
             {
                 return None;
             }
             let src = op.operands.first().copied()?;
-            let k = super::dot_to_linalg::const_int(module, src)?;
-            Some((p, op.results[0], k))
-        });
-        let Some((path, result, k)) = target else {
-            break;
-        };
+            Some((p, super::dot_to_linalg::const_int_index(&index, src)))
+        })
+        .collect();
+    for (path, k) in targets {
         // Rewrite the cast in place as the index constant, keeping its result name so
         // every use is already wired.
+        let Some(k) = k else { continue };
         {
             let op = walk::at_mut(module, &path).expect("path");
             op.kind = OpKind::ArithConstant;
@@ -109,7 +114,6 @@ fn fold_index_casts(module: &mut Module) -> bool {
             op.set_attr(AttrKey::Value, Attr::Int(k));
             op.result_types = vec![IrType::Index];
         }
-        let _ = result;
         changed = true;
     }
     changed
@@ -177,8 +181,14 @@ fn dedup_constants(module: &mut Module) -> bool {
                 }
             }
         }
-        for (from, to) in rewires {
-            walk::replace_all_uses(module, from, to);
+        // ONE rewrite walk per block, not one per duplicate: a `static_range`
+        // unroll mints four figures of duplicate constants in one block, and a
+        // per-rewire `replace_all_uses` walked the whole module per constant --
+        // quadratic at kernel scale (measured: this loop was the whole cost of
+        // the attention expansion).
+        if !rewires.is_empty() {
+            let map: HashMap<Ssa, Ssa> = rewires.into_iter().collect();
+            walk::replace_all_uses_many(module, &map);
             changed = true;
         }
         walk::erase(module, &victims);

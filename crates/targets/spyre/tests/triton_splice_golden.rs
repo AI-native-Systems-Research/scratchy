@@ -39,8 +39,8 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::{
-    lower_elementwise_node, lower_matmul_node, lower_prefill_lm_head_at_m1, lower_rmsnorm_node,
-    lower_scalarmul_node, lower_silumul_node, LowerRope,
+    LowerRope, lower_elementwise_node, lower_matmul_node, lower_prefill_lm_head_at_m1,
+    lower_rmsnorm_node, lower_scalarmul_node, lower_silumul_node,
 };
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 
@@ -842,9 +842,7 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
     };
 
     let n = (m * c) as usize;
-    let a: Vec<f32> = (0..n)
-        .map(|i| ((i % 23) as f32) * 0.02 - 0.22)
-        .collect();
+    let a: Vec<f32> = (0..n).map(|i| ((i % 23) as f32) * 0.02 - 0.22).collect();
     // The tanh form over the same values, in f32 — the reference the kernel's sigmoid
     // identity must reproduce to f16 scale.
     let want: Vec<f32> = a
@@ -998,7 +996,9 @@ fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
 
         // The builder over the same chunk-shaped node — the control.
         let builder = lower_scalarmul_node(&chunked.nodes[0], &chunked, scale, &mut builder_sym)
-            .unwrap_or_else(|e| panic!("builder lowered chunk {chunk_idx} (c_start {c_start}): {e}"));
+            .unwrap_or_else(|e| {
+                panic!("builder lowered chunk {chunk_idx} (c_start {c_start}): {e}")
+            });
         let builder_ktir = builder
             .ktir
             .as_ref()
@@ -1006,16 +1006,23 @@ fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
 
         // The splice — every chunk compiles (`C_START` states the corner).
         let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
-            .unwrap_or_else(|e| panic!("splice compiled chunk {chunk_idx} (c_start {c_start}): {e}"));
+            .unwrap_or_else(|e| {
+                panic!("splice compiled chunk {chunk_idx} (c_start {c_start}): {e}")
+            });
         assert_eq!(
             spliced.op_name, builder.op_name,
             "op_name (chunk {chunk_idx}, c_start {c_start})"
         );
 
         let mut quantized = HashSet::new();
-        let builder_emitted =
-            door_lower(builder_ktir, &mut builder_sym, Some(&layout), &mut quantized, None)
-                .unwrap_or_else(|e| panic!("builder program lowered (chunk {chunk_idx}): {}", e.message));
+        let builder_emitted = door_lower(
+            builder_ktir,
+            &mut builder_sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("builder program lowered (chunk {chunk_idx}): {}", e.message));
         let spliced_emitted = door_lower(
             spliced
                 .ktir
@@ -1047,7 +1054,10 @@ fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
         chunk_idx += 1;
         c_start += len;
     }
-    assert_eq!(chunk_idx, 7, "granite's logits 49155 = 6 × 8192 + 3 is SEVEN chunks");
+    assert_eq!(
+        chunk_idx, 7,
+        "granite's logits 49155 = 6 × 8192 + 3 is SEVEN chunks"
+    );
 }
 
 /// `x * scale -> out` as a one-node [`SubtileIR`]. t0 = x source, t1 = result.
@@ -1259,10 +1269,8 @@ fn batched_decode_odd_vocab_lm_head_splices_byte_identically() {
     // Byte-identity through the same door under the same layout.
     let mut sym = 0i64;
     let mut quantized = HashSet::new();
-    let builder_emitted =
-        door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None).unwrap_or_else(
-            |e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message),
-        );
+    let builder_emitted = door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
+        .unwrap_or_else(|e| panic!("builder program lowered (m={m} k={k} n={n}): {}", e.message));
     let mut sym = 0i64;
     let spliced_emitted = door_lower(
         spliced
@@ -1320,14 +1328,9 @@ fn spliced_prefill_lm_head_fold_is_byte_identical_to_the_builder() {
         // 1. The builder control — main's fold, both halves, called directly.
         let mut sym = 0i64;
         let mut quantized = HashSet::new();
-        let builder_ops = lower_prefill_lm_head_at_m1(
-            &ir.nodes[0],
-            &ir,
-            &mut sym,
-            Some(&layout),
-            &mut quantized,
-        )
-        .unwrap_or_else(|e| panic!("builder folded mq={mq} k={k} n={n}: {e}"));
+        let builder_ops =
+            lower_prefill_lm_head_at_m1(&ir.nodes[0], &ir, &mut sym, Some(&layout), &mut quantized)
+                .unwrap_or_else(|e| panic!("builder folded mq={mq} k={k} n={n}: {e}"));
         assert_eq!(
             builder_ops.len(),
             2,
@@ -1355,18 +1358,25 @@ fn spliced_prefill_lm_head_fold_is_byte_identical_to_the_builder() {
                 .ktir
                 .as_ref()
                 .unwrap_or_else(|| panic!("builder op carries its program (mq={mq} n={n})"));
-            let s_ktir = s_op
-                .ktir
-                .as_ref()
-                .expect("spliced op carries its program");
+            let s_ktir = s_op.ktir.as_ref().expect("spliced op carries its program");
             let builder_emitted =
                 door_lower(b_ktir, &mut b_sym, Some(&layout), &mut quantized, None).unwrap_or_else(
-                    |e| panic!("builder program lowered (mq={mq} k={k} n={n}): {}", e.message),
+                    |e| {
+                        panic!(
+                            "builder program lowered (mq={mq} k={k} n={n}): {}",
+                            e.message
+                        )
+                    },
                 );
-            let spliced_emitted = door_lower(s_ktir, &mut s_sym, Some(&layout), &mut quantized, None)
-                .unwrap_or_else(|e| {
-                    panic!("spliced program lowered (mq={mq} k={k} n={n}): {}", e.message)
-                });
+            let spliced_emitted =
+                door_lower(s_ktir, &mut s_sym, Some(&layout), &mut quantized, None).unwrap_or_else(
+                    |e| {
+                        panic!(
+                            "spliced program lowered (mq={mq} k={k} n={n}): {}",
+                            e.message
+                        )
+                    },
+                );
 
             assert_eq!(
                 builder_emitted.len(),
@@ -1380,7 +1390,10 @@ fn spliced_prefill_lm_head_fold_is_byte_identical_to_the_builder() {
                     bj, sj,
                     "descriptor bytes (mq={mq} k={k} n={n}): builder vs splice diverged"
                 );
-                assert_eq!(b.op_name, s.op_name, "emitted op_name (mq={mq} k={k} n={n})");
+                assert_eq!(
+                    b.op_name, s.op_name,
+                    "emitted op_name (mq={mq} k={k} n={n})"
+                );
             }
         }
     }
@@ -1782,12 +1795,15 @@ fn spliced_rope_is_byte_identical_to_the_builder() {
 
             // 1. The builder path — the control, called directly through the
             // head-dim value→const door (`LowerRope`), exactly as the walk does.
-            let layout = compute_bundle_layout(&ir, &weight_ids, rows_are_requests, &Default::default())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}"
-                    )
-                });
+            let layout = compute_bundle_layout(
+                &ir,
+                &weight_ids,
+                rows_are_requests,
+                &Default::default(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
+            });
             let mut sym = 0i64;
             let builder_ops = scratchy_subtile::model_geometry::with_config_head_dim(
                 ktir_superdsc::head_counts::HeadDim::new(hd),
@@ -1823,9 +1839,7 @@ fn spliced_rope_is_byte_identical_to_the_builder() {
             // mirrored as an Err, not a fallthrough), so an Err here is a broken row.
             let node = &ir.nodes[0];
             let spliced = scratchy_triton_splice::lower(node, &ir, rows_are_requests)
-                .unwrap_or_else(|e| {
-                    panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}")
-                });
+                .unwrap_or_else(|e| panic!("splice compiled mq={mq} heads={heads} hd={hd}: {e}"));
 
             // ⛔ THE NAME LAW IS PART OF THE GATE — `rope_s{id}` on both paths.
             assert_eq!(
@@ -1949,5 +1963,423 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
         nodes: vec![node],
         result: TensorId::from_index(3),
         op_output: Vec::new(),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE ATTENTION GOLDEN
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// One attention shape the golden compares: everything the builder's `KtirFunc::attn` and the
+/// spliced `attn.py` derive their program from, so a shape here is one (arm × geometry × rung ×
+/// producer) cell of the delivery scope.
+#[derive(Clone, Copy)]
+struct AttnShape {
+    /// (nqh, nkvh, hd) — granite 2b is 32/8/64, 8b is 32/8/128.
+    geom: (u32, u32, u32),
+    /// Query rows: 1 = decode; >1 = a prefill chunk.
+    mq: u32,
+    /// The resident cache TENSOR's row extent (`cap`).
+    cap: u32,
+    /// The swept rung the bundle was baked for (`ActiveCap`, raw — 0 = FULL, u32::MAX = NONE).
+    rung: u32,
+    /// The cache's producer: `true` = `SameForwardRopeAppend` (the masked prefix law — read
+    /// from row 0 to `swept.min(cache tensor rows)`, runtime length mask), `false` =
+    /// `PrePopulatedExt` (read at the region's own rows and corner).
+    rope_appended: bool,
+}
+
+impl AttnShape {
+    fn active_cap(self) -> ktir_superdsc::ktir_node::ActiveCap {
+        ktir_superdsc::ktir_node::ActiveCap::new(self.rung)
+    }
+}
+
+/// The attention shapes that matter for the delivery scope — granite 2b/8b, every arm of
+/// `KtirFunc::attn`'s own split, both cache producers, and the rungs the bake iterates.
+///
+/// ⛔ THE CAP IS THE RESIDENT CACHE'S, WHICH PRODUCTION CAPS AT ONE PAGE. The bake's prefix
+/// capacity is `min(max_position_embeddings, 256)` (`codegen.rs`'s `prefix_cap_default`), and the
+/// door's mask-block law refuses any sweep past `PAGE_MASK_COLS = 256` — one fold pass is one
+/// page, so a pass that swept further would read the NEXT page's validity rows. Every shape here
+/// keeps `swept <= cap <= 256`, exactly what every production bake satisfies by construction:
+///
+/// * decode (`mq == 1`, rope-appended — the MASKED prefix): `ActiveCap::FULL` (sweep the whole
+///   cache tensor = one page) and the interior ladder rungs `decode_ladder(256)` bakes — 64, 128;
+/// * decode, PRE-POPULATED producer (the emulator's host-threaded cache): the prefix is read at
+///   its own region rows — a different tile shape and no runtime mask;
+/// * prefill ONE-PASS (`ActiveCap::NONE`, `mq > 1`, new block == the whole chunk): the dead
+///   prefix's injected views + the additive `[mq, mq]` causal triangle — 2b at the m=31 rung and
+///   8b at the m=96 rung (the rung the card bakes);
+/// * prefill CONTINUATION (`swept > 0`, `mq > 1`): per-row causal `qi+1` tiles over the new
+///   block beside the swept prefix, at `ActiveCap::FULL` — the prefix-capable bundle's own bake.
+const ATTN_SHAPES: &[AttnShape] = &[
+    // 2b decode, rope-appended, FULL sweep (the whole one-page resident cache).
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    // 2b decode, rope-appended, the interior ladder rungs `decode_ladder(256)` bakes.
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 1,
+        cap: 256,
+        rung: 64,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 1,
+        cap: 256,
+        rung: 128,
+        rope_appended: true,
+    },
+    // 2b decode, PRE-POPULATED cache (the emulator path).
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: false,
+    },
+    // 8b decode (hd 128), rope-appended, FULL + one interior rung.
+    AttnShape {
+        geom: (32, 8, 128),
+        mq: 1,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    AttnShape {
+        geom: (32, 8, 128),
+        mq: 1,
+        cap: 256,
+        rung: 128,
+        rope_appended: true,
+    },
+    // 2b prefill ONE-PASS: first chunk, no prefix, m=31 rung.
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    // 8b prefill ONE-PASS at the card's own m=96 rung.
+    AttnShape {
+        geom: (32, 8, 128),
+        mq: 96,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    // 2b prefill CONTINUATION: the full one-page swept prefix + causal new block — the
+    // prefix-capable bundle's own bake (`ActiveCap::FULL`, the widest rung).
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 31,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+    // 8b prefill CONTINUATION.
+    AttnShape {
+        geom: (32, 8, 128),
+        mq: 96,
+        cap: 256,
+        rung: 0,
+        rope_appended: true,
+    },
+];
+
+/// The attention fixture's decode-position model: how many positions the mask says are valid
+/// this step (`= decode_position + 1`). For a rope-appended cache the prefix segment is
+/// `valid_len - 1` rows (the new row arrives through the separate new-k/new-v segments); for a
+/// pre-populated cache the whole region is valid. 33 keeps the rope-appended prefix region
+/// non-degenerate (`lower_region` slices it to 32 rows).
+const ATTN_VALID_LEN: u32 = 33;
+
+/// One attention node (plus its RopeAppend producer when the shape wants one) as a
+/// `lower_region`-bound `SubtileIR` — the ONLY construction that can mint the Tiled stage's
+/// `KvCacheLayout`/`KvCacheProducer`/`SoftmaxStateId` witnesses, because their constructors are
+/// `pub(crate)`.
+///
+/// The graph mirrors `to_wavefront`'s production binding exactly (`fixtures.rs`'s decode layer):
+/// `[q, Ext(pk), Ext(pv), k, v]` for the attention, and — when `rope_appended` — a `RopeAppend`
+/// op before it writing the SAME cache sources, which is what makes `lower_region` bind
+/// `KvCacheProducer::SameForwardRopeAppend` (its `k_cache_producer_node` map). `valid_len`
+/// rides the op (`SubOp::attn_decode`'s own field) at the value production threads.
+fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
+    let (nqh, nkvh, hd) = s.geom;
+    let q_width = nqh * hd;
+    let kv_width = nkvh * hd;
+    let mq = s.mq;
+    // The pre-populated prefix's own region rows (the emulator-threaded extent the builder
+    // reads directly); the rope-appended one is sliced by `lower_region` below.
+    const PREPOP_ROWS: u32 = 32;
+    let valid_len = ATTN_VALID_LEN;
+    // The new block's rows: at decode the one new row; at prefill the chunk's own `mq` rows
+    // (the one-pass condition `seq_len == mq`).
+    let new_len = if mq > 1 { mq } else { 1 };
+    // Sources: q, the two caches (TENSOR rows = `cache_rows` — the capacity the door reads back
+    // off the view), new_k, new_v, cos, sin.
+    let sources = |cache_rows: u32| {
+        vec![
+            scratchy_subtile::subtile_ir::SourceShape {
+                rows: mq,
+                cols: q_width,
+            }, // 0: q
+            scratchy_subtile::subtile_ir::SourceShape {
+                rows: cache_rows,
+                cols: kv_width,
+            }, // 1: prefix_k
+            scratchy_subtile::subtile_ir::SourceShape {
+                rows: cache_rows,
+                cols: kv_width,
+            }, // 2: prefix_v
+            scratchy_subtile::subtile_ir::SourceShape {
+                rows: new_len,
+                cols: kv_width,
+            }, // 3: new_k
+            scratchy_subtile::subtile_ir::SourceShape {
+                rows: new_len,
+                cols: kv_width,
+            }, // 4: new_v
+            scratchy_subtile::subtile_ir::SourceShape {
+                rows: mq,
+                cols: q_width,
+            }, // 5: cos
+            scratchy_subtile::subtile_ir::SourceShape {
+                rows: mq,
+                cols: q_width,
+            }, // 6: sin
+        ]
+    };
+    // The attention op desc. The prefix region binding comes from `lower_region`'s own slice
+    // law; `valid_len` is threaded as production threads it.
+    let attn_op = scratchy_subtile::lower::OpDesc {
+        op: scratchy_subtile::subtile_ir::SubOp::attn_decode(
+            attn_geometry(s.geom).expect("granite's geometry mints"),
+            scale,
+            valid_len,
+            scratchy_subtile::subtile_ir::AttnMask::Causal,
+        ),
+        m: mq,
+        inputs: vec![
+            scratchy_subtile::lower::InputRef::Ext(0),
+            scratchy_subtile::lower::InputRef::Ext(1),
+            scratchy_subtile::lower::InputRef::Ext(2),
+            scratchy_subtile::lower::InputRef::Ext(3),
+            scratchy_subtile::lower::InputRef::Ext(4),
+        ],
+    };
+    let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
+    if s.rope_appended {
+        // The rope-appended cache: the K-side rope_append — rotate new_k and write it (with
+        // new_v) into the cache sources 1/2. THIS op is what binds SameForwardRopeAppend for
+        // the attention below (`k_cache_producer_node`). The cache SOURCES are declared at the
+        // full `cap` rows — the capacity the door reads — while `lower_region` slices the
+        // attention's prefix REGION to `valid_len - 1` (the builder's masked-segment read is
+        // `swept.min(tensor rows)`; the region's rows never bound it).
+        let input = scratchy_subtile::lower::LoweringInput {
+            sources: sources(s.cap),
+            ops: vec![
+                // 0: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
+                scratchy_subtile::lower::OpDesc {
+                    op: scratchy_subtile::subtile_ir::SubOp::rope_append(
+                        ktir_superdsc::head_counts::HeadDim::new(hd),
+                        0,
+                        scratchy_subtile::subtile_ir::AttnMask::Causal,
+                        scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
+                    ),
+                    m: new_len,
+                    inputs: vec![
+                        scratchy_subtile::lower::InputRef::Ext(3),
+                        scratchy_subtile::lower::InputRef::Ext(5),
+                        scratchy_subtile::lower::InputRef::Ext(6),
+                        scratchy_subtile::lower::InputRef::Ext(4),
+                        scratchy_subtile::lower::InputRef::Ext(1),
+                        scratchy_subtile::lower::InputRef::Ext(2),
+                    ],
+                },
+                // 1: attn = AttnDecode(q, prefix_k, prefix_v, new_k, new_v)
+                attn_op,
+            ],
+            result: 1,
+        };
+        scratchy_subtile::subtile_ir::lower_region(&input, nb)
+    } else {
+        // The pre-populated shape: no rope op in scope (the map stays empty and `lower_region`
+        // binds PrePopulatedExt), the caches declared at the emulator's threaded extent.
+        let input = scratchy_subtile::lower::LoweringInput {
+            sources: sources(PREPOP_ROWS),
+            ops: vec![attn_op],
+            result: 0,
+        };
+        scratchy_subtile::subtile_ir::lower_region(&input, nb)
+    }
+}
+
+/// granite's geometry, through the same mint the config path uses.
+fn attn_geometry(geom: (u32, u32, u32)) -> Option<ktir_superdsc::head_counts::ModelAttnGeometry> {
+    ktir_superdsc::head_counts::ModelAttnGeometry::mint(
+        ktir_superdsc::head_counts::QueryHeads::new(geom.0),
+        ktir_superdsc::head_counts::KvHeads::new(geom.1),
+        ktir_superdsc::head_counts::HeadDim::new(geom.2),
+    )
+}
+
+#[test]
+fn spliced_attn_is_byte_identical_to_the_builder() {
+    for &s in ATTN_SHAPES {
+        // ⛔ ROWS-ARE-REQUESTS IS A DECODE-BUNDLE FACT: the builder's own emit states the row
+        // kind is the caller's, and the bake states it per bundle — a decode batch's rows are
+        // requests, a prefill chunk's rows are positions of one sequence. The golden states it
+        // the way the bake does: decode (mq == 1) tries BOTH kinds (the door's GQA-replicate
+        // and kv_block_index arms differ), prefill only `false`.
+        let row_kinds: &[bool] = if s.mq == 1 { &[false, true] } else { &[false] };
+        for &rows_are_requests in row_kinds {
+            // granite's attention_multiplier, the config value (NOT a recomputed 1/sqrt(hd)):
+            // 2b (hd 64) 0.015625, 8b (hd 128) 0.0078125 — the f16-exact ones. ⛔ The 8b's
+            // SQRT is NOT f16-exact; `attn_at`'s bit-exact registry check is the flagged risk
+            // this gate exists to catch.
+            let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
+            let ir = attn_ir(s, scale);
+            // The weight-id census is EMPTY: every source this fixture declares is an
+            // activation or a KV cache (the layout walk re-places the caches into seg2 itself).
+            let weight_ids: HashSet<u32> = HashSet::new();
+
+            // 1. The builder path — the control, called directly through the geometry
+            // value→const door (`LowerAttn`), exactly as `lower_one_node` did before the
+            // splice landed.
+            let layout = compute_bundle_layout(
+                &ir,
+                &weight_ids,
+                rows_are_requests,
+                &Default::default(),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "layout minted geom={:?} mq={} cap={} rung={} r_ar={rows_are_requests}: {e}",
+                    s.geom, s.mq, s.cap, s.rung
+                )
+            });
+            let node = ir.nodes.last().unwrap();
+            let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
+            let mut sym = 0i64;
+            let builder_ops = scratchy_subtile::model_geometry::with_config_attn_geometry(
+                attn_geometry(s.geom).expect("granite's geometry mints"),
+                scratchy_target_spyre::lower_subtile_tape_to_ktir::LowerAttn::new(
+                    node,
+                    &ir,
+                    cap,
+                    s.active_cap(),
+                    rows_are_requests,
+                    &mut sym,
+                    Some(&layout),
+                ),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "no geometry arm for {:?} — the configs in scope must declare it",
+                    s.geom
+                )
+            })
+            .unwrap_or_else(|e| {
+                panic!(
+                    "builder lowered geom={:?} mq={} rung={} r_ar={rows_are_requests}: {}",
+                    s.geom, s.mq, s.rung, e.0
+                )
+            });
+            let [builder] = &builder_ops[..] else {
+                panic!(
+                    "one attention node lowers to one op, got {}",
+                    builder_ops.len()
+                )
+            };
+            let builder_ktir = builder
+                .ktir
+                .as_ref()
+                .expect("builder op carries its program");
+
+            // 2. The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
+            let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
+                        s.geom, s.mq, s.rung
+                    )
+                });
+
+            // ⛔ THE NAME LAW IS PART OF THE GATE — `attn_s{id}` on both paths.
+            assert_eq!(
+                spliced.op_name, builder.op_name,
+                "op_name (geom={:?} mq={} rung={})",
+                s.geom, s.mq, s.rung
+            );
+
+            // 3. Both programs go through the SAME door under the SAME layout, with the
+            // bundle facts stated exactly as the tape walk states them.
+            let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
+                geom: attn_geometry(s.geom).expect("granite's geometry mints"),
+                rows_are_requests,
+            };
+            let mut sym = 0i64;
+            let mut quantized = HashSet::new();
+            let builder_emitted = door_lower(
+                builder_ktir,
+                &mut sym,
+                Some(&layout),
+                &mut quantized,
+                Some(attn_params),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "builder program lowered (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
+                    s.geom, s.mq, s.rung, e.message
+                )
+            });
+            let mut sym = 0i64;
+            let spliced_emitted = door_lower(
+                spliced.ktir.as_ref().expect("spliced op carries its program"),
+                &mut sym,
+                Some(&layout),
+                &mut quantized,
+                Some(attn_params),
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "spliced program lowered (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
+                    s.geom, s.mq, s.rung, e.message
+                )
+            });
+
+            assert_eq!(
+                builder_emitted.len(),
+                spliced_emitted.len(),
+                "op count (geom={:?} mq={} rung={} r_ar={rows_are_requests})",
+                s.geom,
+                s.mq,
+                s.rung
+            );
+            for (b, sp) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+                let bj = serde_json::to_string(b.dsc()).unwrap();
+                let sj = serde_json::to_string(sp.dsc()).unwrap();
+                assert_eq!(
+                    bj, sj,
+                    "descriptor bytes (geom={:?} mq={} rung={} r_ar={rows_are_requests}): \
+                     builder vs splice diverged",
+                    s.geom, s.mq, s.rung
+                );
+                assert_eq!(
+                    b.op_name, sp.op_name,
+                    "emitted op_name (geom={:?} mq={} rung={})",
+                    s.geom, s.mq, s.rung
+                );
+            }
+        }
     }
 }

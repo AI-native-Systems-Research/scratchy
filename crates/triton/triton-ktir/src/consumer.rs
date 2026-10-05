@@ -308,6 +308,9 @@ impl std::fmt::Display for Incompatibility {
 /// running past its view) are theirs to report.
 pub fn check(module: &Module) -> Vec<Incompatibility> {
     let mut out = Vec::new();
+    // ONE definition snapshot: the bound-resolution reads below were
+    // whole-module scans paid per loop operand.
+    let index = module.def_index();
 
     for op in module.ops_deep() {
         let spelling = op.kind.spelling().to_string();
@@ -412,8 +415,8 @@ pub fn check(module: &Module) -> Vec<Incompatibility> {
                 // (lower.rs:471), so a bound that traces to the landmark IS constant on
                 // their path. Counting it as non-constant was my own error, and it
                 // pointed at the wrong pass.
-                let resolves = crate::passes::dot_to_linalg::const_int(module, v).is_some()
-                    || module
+                let resolves = crate::passes::dot_to_linalg::const_int_index(&index, v).is_some()
+                    || index
                         .def_of(v)
                         .map(|d| d.kind == OpKind::KtdpGetComputeTileId)
                         .unwrap_or(false);

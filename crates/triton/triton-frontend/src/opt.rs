@@ -100,6 +100,7 @@ pub fn make_ttir(m: &mut Module) -> Result<()> {
         changed |= fold_identity_casts(m);
         changed |= fold_constant_arith(m);
         changed |= fold_int_identities(m);
+        changed |= fold_constant_int_casts(m);
         changed |= fold_splat_of_constant(m);
         changed |= sort_commutative_operands(m);
         changed |= promote_single_trip_loops(m);
@@ -249,6 +250,62 @@ pub fn fold_identity_casts(m: &mut Module) -> bool {
     substitute(m, &subst);
     // The casts are now unused; `dce` in the same fixed point removes them.
     true
+}
+
+/// `arith.extsi` / `arith.extui` / `arith.trunci` of an integer CONSTANT -> the constant
+/// re-typed to the cast's result type.
+///
+/// MEASURED, not invented: MLIR's `IntCastOpInterface`'s folder does exactly this
+/// (`CastOp::fold` -- `satisfiesIntegerConstant` re-attributes the value), so upstream
+/// `make_ir` output never carries a cast of a constant. It shows up here when a kernel
+/// computes a descriptor's STRIDE as a constexpr product (`q_width = NQH * HD` folds to an
+/// i32 constant) while `tt.make_tensor_descriptor` takes i64 strides: the frontend's
+/// `cast` emits `arith.extsi %q_width : i32 to i64`, and nothing folded it because the
+/// sixteen goldens never stated a computed stride.
+pub fn fold_constant_int_casts(m: &mut Module) -> bool {
+    let ints = int_constants(m);
+    if ints.is_empty() {
+        return false;
+    }
+    let tys: Vec<Type> = m.values.iter().map(|v| v.ty.clone()).collect();
+    let mut changed = false;
+    fn walk(ops: &mut [Op], ints: &HashMap<ValueId, i128>, tys: &[Type], changed: &mut bool) {
+        for op in ops.iter_mut() {
+            for r in &mut op.regions {
+                for b in &mut r.blocks {
+                    walk(&mut b.ops, ints, tys, changed);
+                }
+            }
+            if op.results.len() != 1
+                || op.operands.len() != 1
+                || !matches!(
+                    op.name.as_str(),
+                    "arith.extsi" | "arith.extui" | "arith.trunci"
+                )
+            {
+                continue;
+            }
+            let src = op.operands[0];
+            let Some(v) = ints.get(&src).copied() else {
+                continue;
+            };
+            let ty = tys[op.results[0].0 as usize].clone();
+            if !ty.is_int() || ty.is_tensor() {
+                continue;
+            }
+            op.name = "arith.constant".to_string();
+            op.operands.clear();
+            op.attrs.clear();
+            op.attrs.insert("value".to_string(), Attr::Int(v, ty));
+            *changed = true;
+        }
+    }
+    for f in &mut m.funcs {
+        for b in &mut f.body.blocks {
+            walk(&mut b.ops, &ints, &tys, &mut changed);
+        }
+    }
+    changed
 }
 
 fn collect_identity_casts(ops: &[Op], tys: &[Type], subst: &mut HashMap<ValueId, ValueId>) {
@@ -739,32 +796,200 @@ fn drop_in_region(r: &mut Region) -> Result<()> {
 /// not share values between the two expansions. The callee's arguments are mapped onto
 /// the call's operands, and the call's results are rewritten module-wide to whatever the
 /// callee's `tt.return` yielded.
+///
+/// ⛔ ONE ROUND INLINES EVERY CALL SITE, not one site. The one-site-per-call law this
+/// grew from was invisible at fixture scale (every golden's kernel has a handful of
+/// sites) and quadratic at kernel scale: `attn_fwd` at the m=96 prefill rung unrolls to
+/// ~12,000 `tl.max`/`tl.sum` sites, and a per-site round is a full-module `find_call`
+/// scan plus a full-module `substitute` sweep each — minutes of CPU for work one pass
+/// does. Batched, a round is ONE scan and ONE sweep, and the rounds that remain count
+/// CALL DEPTH (a callee whose own body calls something), which is single digits. The
+/// same sites are inlined either way, so the fixed point — and the programs it produces —
+/// are identical; only the trajectory changed.
 pub fn inline_calls(m: &mut Module) -> Result<()> {
-    // A call inside an inlined body is a second round; `attention_flash`'s `tl.max`
-    // reaches `_elementwise_max` that way. Bounded, so a recursive @triton.jit is a
-    // refusal rather than a hang.
-    for _ in 0..64 {
-        if !inline_one_round(m)? {
-            return Ok(());
+    // Each round strictly shrinks the call graph's edge set (an inlined site is replaced
+    // by the callee's body, whose own calls are one level shallower), so the rounds
+    // converge unless a cycle can regrow a site: a callee that (transitively) calls
+    // itself. That is checked precisely, on the static call graph, rather than by
+    // counting rounds.
+    while inline_one_round(m)? {
+        if calls_cycle(m) {
+            return Err(Error::new(
+                "make_ttir's inliner cannot reach a fixed point: a @triton.jit function \
+                 that (indirectly) calls itself cannot be inlined, and Triton's own \
+                 inliner would not terminate on it either",
+                0,
+                0,
+            ));
         }
     }
-    Err(Error::new(
-        "make_ttir's inliner did not reach a fixed point in 64 rounds -- a @triton.jit \
-         function that (indirectly) calls itself cannot be inlined, and Triton's own \
-         inliner would not terminate on it either",
-        0,
-        0,
-    ))
+    Ok(())
 }
 
-/// One call site, inlined. `Ok(false)` means there were none left.
-fn inline_one_round(m: &mut Module) -> Result<bool> {
-    // Find one call: which function, which block path, which op index.
-    let Some(site) = find_call(m) else {
-        return Ok(false);
-    };
+/// Whether the module's static call graph has a cycle reachable from any call site —
+/// the one shape for which call-site inlining has no fixed point.
+fn calls_cycle(m: &Module) -> bool {
+    use std::collections::{HashMap, HashSet};
+    // name -> the callees it names in `tt.call`s (symbol-dce's own collector, nested
+    // regions included).
+    let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in &m.funcs {
+        let mut callees = HashSet::new();
+        for b in &f.body.blocks {
+            collect_callees(&b.ops, &mut callees);
+        }
+        graph.insert(f.name.clone(), callees);
+    }
+    // Three-colour DFS over the named nodes.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut on_stack: HashSet<String> = HashSet::new();
+    fn walk(
+        name: &str,
+        graph: &HashMap<String, HashSet<String>>,
+        seen: &mut HashSet<String>,
+        on_stack: &mut HashSet<String>,
+    ) -> bool {
+        if !seen.insert(name.to_string()) {
+            // Already fully explored, or currently on the stack.
+            return on_stack.contains(name);
+        }
+        on_stack.insert(name.to_string());
+        if let Some(callees) = graph.get(name) {
+            for c in callees {
+                if walk(c, graph, seen, on_stack) {
+                    return true;
+                }
+            }
+        }
+        on_stack.remove(name);
+        false
+    }
+    for name in graph.keys().cloned().collect::<Vec<_>>() {
+        if walk(&name, &graph, &mut seen, &mut on_stack) {
+            return true;
+        }
+    }
+    false
+}
 
-    let call = op_at(m, &site).clone();
+/// One round: EVERY call site at the current depth, inlined. `Ok(false)` means there were
+/// none left.
+///
+/// The walk is INDEX-STABLE BY DIRECTION: each block's ops are visited from the END
+/// backwards, so splicing a callee body in at index `i` only shifts indices ABOVE `i` --
+/// already-visited territory -- and a nested region's sites are visited before their
+/// parent op's own index is reached, so a parent splice cannot invalidate an unvisited
+/// site's path either. A callee body's own calls (minted by the splice) sit above `i`, so
+/// they are skipped this round and picked up by the next -- that is the depth counting.
+/// The callee is looked up and cloned BEFORE the ops borrow is taken (`clone_op` mints its
+/// fresh values in the ARENA, which is a separate field from `funcs`).
+fn inline_one_round(m: &mut Module) -> Result<bool> {
+    let mut inlined_any = false;
+    // ONE result-rewrite sweep for the whole round: per-site `substitute` calls are what
+    // made this pass quadratic at kernel scale (every sweep is the whole module). The
+    // chain-chasing `substitute` resolves same-round sequences, and the backwards walk
+    // guarantees a site's operands are already final (SSA: a use follows its definition).
+    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
+    let n_funcs = m.funcs.len();
+    for fi in 0..n_funcs {
+        let n_blocks = m.funcs[fi].body.blocks.len();
+        for bi in 0..n_blocks {
+            let n_ops = m.funcs[fi].body.blocks[bi].ops.len();
+            let mut i = n_ops;
+            while i > 0 {
+                i -= 1;
+                // Recurse into THIS op's regions first: a region's sites sit below the
+                // parent in the splice order, so the parent's own splice (which shifts
+                // only indices above it) leaves any unvisited region path intact.
+                inline_in_regions(m, fi, bi, &[i], &mut inlined_any, &mut subst)?;
+                if m.funcs[fi].body.blocks[bi].ops[i].name != "tt.call" {
+                    continue;
+                }
+                let call = m.funcs[fi].body.blocks[bi].ops[i].clone();
+                let (cloned, returned) = expand_call(m, &call)?;
+                for (r, v) in call.results.iter().zip(returned.iter()) {
+                    subst.insert(*r, *v);
+                }
+                let ops = &mut m.funcs[fi].body.blocks[bi].ops;
+                ops.splice(i..i + 1, cloned);
+                inlined_any = true;
+            }
+        }
+    }
+    substitute(m, &subst);
+    Ok(inlined_any)
+}
+
+/// The `tt.call` sites inside the regions of the op `path` points at (and, nested
+/// further, inside THEIR regions) -- the same backwards law, applied depth-first so a
+/// parent's splice cannot invalidate an unvisited path. Every access re-borrows through
+/// the index chain, so no borrow outlives a splice.
+fn inline_in_regions(
+    m: &mut Module,
+    fi: usize,
+    bi: usize,
+    path: &[usize],
+    inlined_any: &mut bool,
+    subst: &mut HashMap<ValueId, ValueId>,
+) -> Result<()> {
+    let n_regions = op_at_path(m, fi, bi, path).regions.len();
+    for ri in 0..n_regions {
+        let n_blocks = op_at_path(m, fi, bi, path).regions[ri].blocks.len();
+        for bl in 0..n_blocks {
+            let n_ops = op_at_path(m, fi, bi, path).regions[ri].blocks[bl].ops.len();
+            let mut i = n_ops;
+            while i > 0 {
+                i -= 1;
+                // Regions of the op at THIS index: recurse with the extended path first.
+                let mut deeper = path.to_vec();
+                deeper.push(i);
+                inline_in_regions(m, fi, bi, &deeper, inlined_any, subst)?;
+                if op_at_path(m, fi, bi, path).regions[ri].blocks[bl].ops[i].name != "tt.call" {
+                    continue;
+                }
+                let call = op_at_path(m, fi, bi, path).regions[ri].blocks[bl].ops[i].clone();
+                let (cloned, returned) = expand_call(m, &call)?;
+                for (r, v) in call.results.iter().zip(returned.iter()) {
+                    subst.insert(*r, *v);
+                }
+                let ops = &mut op_at_path_mut(m, fi, bi, path).regions[ri].blocks[bl].ops;
+                ops.splice(i..i + 1, cloned);
+                *inlined_any = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The op a `path` of indices points at: `path[0]` into the block's ops, then each later
+/// index into the previous op's first region's first block's ops (the frontend's regions
+/// hold one block each, so this is a chain, not a search).
+fn op_at_path<'m>(m: &'m Module, fi: usize, bi: usize, path: &[usize]) -> &'m Op {
+    let mut ops: &'m [Op] = &m.funcs[fi].body.blocks[bi].ops;
+    for (n, &i) in path.iter().enumerate() {
+        if n + 1 == path.len() {
+            return &ops[i];
+        }
+        ops = &ops[i].regions[0].blocks[0].ops;
+    }
+    unreachable!("a path is never empty at the call sites")
+}
+
+fn op_at_path_mut<'m>(m: &'m mut Module, fi: usize, bi: usize, path: &[usize]) -> &'m mut Op {
+    let mut ops: &'m mut [Op] = &mut m.funcs[fi].body.blocks[bi].ops;
+    for (n, &i) in path.iter().enumerate() {
+        if n + 1 == path.len() {
+            return &mut ops[i];
+        }
+        ops = &mut ops[i].regions[0].blocks[0].ops;
+    }
+    unreachable!("a path is never empty at the call sites")
+}
+
+/// Clone the callee's body under the call's operands, returning the ops to splice and the
+/// values the call's results become. The callee is resolved and cloned HERE so no caller
+/// holds an ops borrow across the lookup.
+fn expand_call(m: &mut Module, call: &Op) -> Result<(Vec<Op>, Vec<ValueId>)> {
     let callee_name = match call.attrs.get("callee") {
         Some(Attr::Str(s)) => s.clone(),
         _ => {
@@ -790,8 +1015,6 @@ fn inline_one_round(m: &mut Module) -> Result<bool> {
             ));
         }
     };
-
-    // ---- build the substitution: callee value -> caller value -------------------
     let entry = callee
         .body
         .blocks
@@ -812,13 +1035,10 @@ fn inline_one_round(m: &mut Module) -> Result<bool> {
     for (a, o) in entry.args.iter().zip(call.operands.iter()) {
         map.insert(*a, *o);
     }
-
-    // Clone the body, minting a fresh arena slot per callee-defined value.
     let mut cloned: Vec<Op> = Vec::new();
     let mut returned: Option<Vec<ValueId>> = None;
     for op in &entry.ops {
         if op.name == "tt.return" {
-            // The reachable terminator. Its operands are the call's results.
             returned = Some(
                 op.operands
                     .iter()
@@ -847,18 +1067,7 @@ fn inline_one_round(m: &mut Module) -> Result<bool> {
             0,
         ));
     }
-
-    // ---- splice, then rewrite the call's results away --------------------------
-    let n = cloned.len();
-    let ops = ops_at_mut(m, &site);
-    ops.splice(site.index..site.index + 1, cloned);
-    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
-    for (r, v) in call.results.iter().zip(returned.iter()) {
-        subst.insert(*r, *v);
-    }
-    substitute(m, &subst);
-    let _ = n;
-    Ok(true)
+    Ok((cloned, returned))
 }
 
 /// Where a `tt.call` is: the function, the chain of (op index, region index) to get
@@ -869,38 +1078,6 @@ struct Site {
     /// `(op index, region index)` for each level of nesting, outermost first.
     path: Vec<(usize, usize)>,
     index: usize,
-}
-
-fn find_call(m: &Module) -> Option<Site> {
-    for (fi, f) in m.funcs.iter().enumerate() {
-        let b = f.body.blocks.first()?;
-        if let Some(s) = find_call_in(&b.ops, fi, &mut Vec::new()) {
-            return Some(s);
-        }
-    }
-    None
-}
-
-fn find_call_in(ops: &[Op], func: usize, path: &mut Vec<(usize, usize)>) -> Option<Site> {
-    for (i, op) in ops.iter().enumerate() {
-        if op.name == "tt.call" {
-            return Some(Site {
-                func,
-                path: path.clone(),
-                index: i,
-            });
-        }
-        for (ri, r) in op.regions.iter().enumerate() {
-            if let Some(b) = r.blocks.first() {
-                path.push((i, ri));
-                if let Some(s) = find_call_in(&b.ops, func, path) {
-                    return Some(s);
-                }
-                path.pop();
-            }
-        }
-    }
-    None
 }
 
 fn ops_at_mut<'m>(m: &'m mut Module, s: &Site) -> &'m mut Vec<Op> {

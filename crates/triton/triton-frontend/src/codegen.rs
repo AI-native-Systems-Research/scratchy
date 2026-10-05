@@ -2560,9 +2560,10 @@ impl<'a> CodeGen<'a> {
                 self.call_std_reduction(name, input, axis, kw, pos)
                     .map(Val::Ir)
             }
-            "range" => Err(Error::new(
-                "`tl.range(...)` is only supported as the iterable of a `for` statement, \
-                 which is the only way the fixtures use it; as a value it has no lowering."
+            "range" | "static_range" => Err(Error::new(
+                "`tl.range(...)` / `tl.static_range(...)` is only supported as the iterable of \
+                 a `for` statement, which is the only way the kernels use it; as a value it \
+                 has no lowering."
                     .to_string(),
                 pos.line,
                 pos.col,

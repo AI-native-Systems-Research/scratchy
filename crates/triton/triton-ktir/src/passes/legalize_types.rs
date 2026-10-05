@@ -77,23 +77,30 @@ fn is_descriptor_or_ktdp_op(op: &Op) -> bool {
 
 /// --- Step 1: remove `arith.extf` (f16 -> f32).
 fn step_1_remove_extf(module: &mut Module) {
-    // ONE `find` with the WHOLE predicate. Finding on `kind` and then filtering
-    // the Option stops at the first extf that is not f16->f32 and leaves every
-    // later one in place -- a partial collapse, which is the silent-wrong-answer
-    // shape this pass exists to avoid.
-    while let Some(path) = walk::paths(module).into_iter().find(|p| {
-        let op = walk::at(module, p).expect("path");
-        if op.kind != OpKind::ArithExtf {
-            return false;
-        }
-        let in_elem = op
-            .operands
-            .first()
-            .and_then(|v| module.type_of(*v))
-            .and_then(|t| t.elem());
-        let out_elem = op.result_type().and_then(|t| t.elem());
-        in_elem == Some(DType::F16) && out_elem == Some(DType::F32)
-    }) {
+    // ONE `find` with the WHOLE predicate -- collected for EVERY extf, not one per
+    // loop trip: the `while find` shape re-walked the whole module (and re-ran the
+    // whole-module `type_of`) per cast, which is quadratic at kernel scale. The
+    // victims are erased DEEPEST-AND-LAST FIRST (`walk::erase`'s own order), so
+    // every surviving path stays valid and each rewrite sees the same module the
+    // per-trip scan did: `replace_all_uses` only touches operands, never paths.
+    let index = module.def_index();
+    let victims: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            let op = walk::at(module, p).expect("path");
+            if op.kind != OpKind::ArithExtf {
+                return false;
+            }
+            let in_elem = op
+                .operands
+                .first()
+                .and_then(|v| index.type_of(*v))
+                .and_then(|t| t.elem());
+            let out_elem = op.result_type().and_then(|t| t.elem());
+            in_elem == Some(DType::F16) && out_elem == Some(DType::F32)
+        })
+        .collect();
+    for path in victims.into_iter().rev() {
         let op = walk::at(module, &path).expect("path").clone();
         let (from, to) = (op.results[0], op.operands[0]);
         walk::replace_all_uses(module, from, to);
@@ -106,7 +113,13 @@ fn step_2_collapse_island(module: &mut Module) {
     loop {
         let mut changed = false;
         // Collect the retypes first, then apply, so the walk is not mutated
-        // underneath itself.
+        // underneath itself. The operand-type reads go through a ONE-SHOT
+        // definition index: `type_of` is a whole-module scan, and this loop calls
+        // it per operand over per op -- quadratic at kernel scale (measured: the
+        // scan was ~100% of this pass's time on the unrolled attention kernel).
+        // Types only change in the APPLY phase below, so a snapshot taken at the
+        // top of each round sees exactly what the old per-call scan saw.
+        let index = module.def_index();
         let mut retype: Vec<OpPath> = Vec::new();
         for path in walk::paths(module) {
             let op = walk::at(module, &path).expect("path");
@@ -120,7 +133,7 @@ fn step_2_collapse_island(module: &mut Module) {
             let operand_is_f16 = op
                 .operands
                 .iter()
-                .any(|v| module.type_of(*v).and_then(|t| t.elem()) == Some(DType::F16));
+                .any(|v| index.type_of(*v).and_then(|t| t.elem()) == Some(DType::F16));
             let has_compute_f32 = op.result_types.iter().any(|t| t.is_compute_f32());
             if !operand_is_f16 || !has_compute_f32 {
                 continue;
@@ -177,6 +190,7 @@ fn step_2_collapse_island(module: &mut Module) {
 /// alone.
 fn step_2b_island_constants(module: &mut Module) {
     let mut victims: Vec<OpPath> = Vec::new();
+    let index = module.def_index();
     for path in walk::paths(module) {
         let op = walk::at(module, &path).expect("path");
         if op.kind != OpKind::ArithConstant {
@@ -186,13 +200,16 @@ fn step_2b_island_constants(module: &mut Module) {
             continue;
         }
         let Some(res) = op.result() else { continue };
+        // ONE snapshot for the whole scan: the per-constant `ops_deep().any()`
+        // plus per-operand `type_of` were whole-module scans -- quadratic at
+        // kernel scale. Read-only phase, so the snapshot cannot go stale.
         let feeds_island = module.ops_deep().into_iter().any(|user| {
             user.operands.contains(&res)
                 && !is_descriptor_or_ktdp_op(user)
                 && user
                     .operands
                     .iter()
-                    .any(|v| module.type_of(*v).and_then(|t| t.elem()) == Some(DType::F16))
+                    .any(|v| index.type_of(*v).and_then(|t| t.elem()) == Some(DType::F16))
         });
         if feeds_island {
             victims.push(path);
@@ -225,19 +242,26 @@ fn step_2b_island_constants(module: &mut Module) {
 
 /// --- Step 3: remove the now-redundant `arith.truncf` (f16 -> f16).
 fn step_3_remove_truncf(module: &mut Module) {
-    while let Some(path) = walk::paths(module).into_iter().find(|p| {
-        let op = walk::at(module, p).expect("path");
-        if op.kind != OpKind::ArithTruncf {
-            return false;
-        }
-        let in_elem = op
-            .operands
-            .first()
-            .and_then(|v| module.type_of(*v))
-            .and_then(|t| t.elem());
-        let out_elem = op.result_type().and_then(|t| t.elem());
-        in_elem == Some(DType::F16) && out_elem == Some(DType::F16)
-    }) {
+    // Collected-then-erased, the same shape as step 1: a `while find` here
+    // re-walked the module per cast.
+    let index = module.def_index();
+    let victims: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            let op = walk::at(module, p).expect("path");
+            if op.kind != OpKind::ArithTruncf {
+                return false;
+            }
+            let in_elem = op
+                .operands
+                .first()
+                .and_then(|v| index.type_of(*v))
+                .and_then(|t| t.elem());
+            let out_elem = op.result_type().and_then(|t| t.elem());
+            in_elem == Some(DType::F16) && out_elem == Some(DType::F16)
+        })
+        .collect();
+    for path in victims.into_iter().rev() {
         let op = walk::at(module, &path).expect("path").clone();
         let (from, to) = (op.results[0], op.operands[0]);
         walk::replace_all_uses(module, from, to);

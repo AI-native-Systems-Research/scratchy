@@ -4805,10 +4805,15 @@ mod tests {
         // the tail's own output tid (`lmlast{j}_o2`), then the m=1 matmul `matmul_o2`.
         let mq = 8u32;
         let names = lower(mq).expect("the m>1 lm-head tail folds to m=1");
-        assert_eq!(names.len() as u32, h / 64 + 1, "the fold is the per-stick copies plus the m=1 matmul: {names:?}");
+        assert_eq!(
+            names.len() as u32,
+            h / 64 + 1,
+            "the fold is the per-stick copies plus the m=1 matmul: {names:?}"
+        );
         for (j, name) in names.iter().take(h as usize / 64).enumerate() {
             assert_eq!(
-                name, &format!("lmlast{j}_o2"),
+                name,
+                &format!("lmlast{j}_o2"),
                 "copy {j} is named after the tail's own output tid"
             );
         }
@@ -4836,7 +4841,11 @@ mod tests {
         let mut sym = 0i64;
         let mut fp8q = std::collections::HashSet::new();
         let mut programs = crate::lower_subtile_tape_to_ktir::lower_prefill_lm_head_at_m1(
-            &node, &ir, &mut sym, Some(&layout), &mut fp8q,
+            &node,
+            &ir,
+            &mut sym,
+            Some(&layout),
+            &mut fp8q,
         )
         .expect("the builder control mints the tail");
         let extract = programs

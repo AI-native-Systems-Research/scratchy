@@ -29,7 +29,6 @@ use ktir_core::irtype::IrType;
 use ktir_core::opkind::OpKind;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{ActiveCap, KtirNode};
-use scratchy_subtile::model_geometry::with_config_attn_geometry;
 use scratchy_subtile::subtile_ir::{EwKind, RopeForm, SubOp, SubtileIR, SubtileNode};
 use scratchy_subtile::subtile_ir::{TensorId, TensorRegion};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout, Df, ItDim};
@@ -468,21 +467,11 @@ pub fn lower_rope_node<F: RopeForm, const HD: u32>(
     Ok(vec![e])
 }
 
-/// Lower a [`SubOp::AttnDecode`] to ONE KTIR program stating the whole node — the single statement
-/// BOTH consumers read: `-Fspyre-emu` interprets it, `-Fspyre-hw` lowers it to SuperDSC through
-/// `ktir_to_superdsc`. There is no second attention emitter; the `*_sdsc` sibling this doc used to
-/// point at was a side path to SuperDSC and is deleted.
-///
-/// Batched over q-heads (BatchMatmul, batch=`num_q_heads`), reading the resident transposed-K +
-/// replicated K/V cache (seg2, worker-filled) over the full `cap` masked by `t{ATTN_MASK_TID}`.
-/// Decode (mq=1): per head `scores[1,cap] = Q·Kᵀ·scale + mask`, softmax, `out=probs·V`.
-/// Viewed as `[nqh, cap]` for the ew/softmax ops (mb=nqh, out=cap; `[nqh,1,cap]`≡
-/// `[nqh,cap]` bytes). Softmax reduce-outputs are one stick (like rmsnorm's mean).
-///
-/// ⭐⭐ `HD` IS A CONST GENERIC — same reason as [`lower_rope_node`]. The head dim parameterises the device
-/// layout (slabs = head_dim/lanes; the head-major collapse is byte-identical ONLY at head_dim == lanes),
-/// so every decision it drives must be a branch on a const, not on a value. The value becomes a const at
-/// ONE dispatch in `lower_one_node`.
+/// THE BUILDER CONTROL for the splice's attention golden — see [`lower_matmul_node`]'s
+/// doc for the role. The card-proven body production used before the splice landed,
+/// called directly by the golden through [`LowerAttn::new`] +
+/// `with_config_attn_geometry`; the walk itself routes `AttnDecode` through the splice
+/// unconditionally. Const-generic over the head geometry, exactly as production had it.
 fn lower_attn_node<F: RopeForm, const NQH: u32, const NKVH: u32, const HD: u32>(
     attn: LowerAttn<'_, F>,
     // The geometry witness the door minted, carrying the GQA divisibility proof. Every head count
@@ -988,9 +977,11 @@ impl<F: RopeForm> scratchy_subtile::model_geometry::OnHeadDim for LowerRope<'_, 
     }
 }
 
-/// The attention lowering, waiting for its head geometry to become consts — the consumer side of
-/// [`with_config_attn_geometry`], and the same reason as [`LowerRope`].
-struct LowerAttn<'a, F: RopeForm> {
+/// THE BUILDER CONTROL for the splice's attention golden — see [`lower_matmul_node`]'s
+/// doc for the role. Const-generic over the head geometry (`with_config_attn_geometry`'s
+/// dispatch target) exactly as production had it before the splice landed; the body
+/// survives as the control this gate needs, never called by the walk.
+pub struct LowerAttn<'a, F: RopeForm> {
     node: &'a SubtileNode<F>,
     /// The graph the node belongs to — the shapes its program's views state.
     ir: &'a SubtileIR<F>,
@@ -999,6 +990,30 @@ struct LowerAttn<'a, F: RopeForm> {
     rows_are_requests: bool,
     sym_id_base: &'a mut i64,
     layout: Option<&'a BundleLayout>,
+}
+
+impl<'a, F: RopeForm> LowerAttn<'a, F> {
+    /// THE GOLDEN CONTROL'S DOOR into the const-generic body — the same facts the walk
+    /// threaded, stated by a caller that has no `lower_one_node` around it.
+    pub fn new(
+        node: &'a SubtileNode<F>,
+        ir: &'a SubtileIR<F>,
+        cap: u32,
+        active_cap: ActiveCap,
+        rows_are_requests: bool,
+        sym_id_base: &'a mut i64,
+        layout: Option<&'a BundleLayout>,
+    ) -> Self {
+        Self {
+            node,
+            ir,
+            cap,
+            active_cap,
+            rows_are_requests,
+            sym_id_base,
+            layout,
+        }
+    }
 }
 
 impl<F: RopeForm> scratchy_subtile::model_geometry::OnAttnGeometry for LowerAttn<'_, F> {
@@ -1026,8 +1041,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     active_cap: ActiveCap,
     // See `lower_attn_node`: whether this bundle's rows are separate requests.
     rows_are_requests: bool,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
+    // The negative-symbol-id counter and the bundle layout are the CONSUMER's facts now:
+    // every spliced kind hands the door a program, and `ktir_superdsc`'s own walk mints
+    // both. They remain parameters because the re-rolled walk's other consumers thread
+    // them; the spliced arms state them through the splice's own mint instead.
+    _sym_id_base: &mut i64,
+    _layout: Option<&BundleLayout>,
 ) -> NodeLowering {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ── PREFILL (m>1) LM-HEAD TAIL, FOLDED TO m=1 — the prefill bundle produces the FIRST generated
@@ -1078,14 +1097,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                  an alias gives the two views two names."
                 .to_string(),
         ),
-        SubOp::MatmulTile { .. } => match scratchy_triton_splice::lower_all(
-            node,
-            ir,
-            rows_are_requests,
-        ) {
-            Ok(ops) => Ops(ops),
-            Err(reason) => Unhandled(reason),
-        },
+        SubOp::MatmulTile { .. } => {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+                Ok(ops) => Ops(ops),
+                Err(reason) => Unhandled(reason),
+            }
+        }
         // ⛔ NO BODY, AND THAT IS THE HONEST STATE. This arm used to lower a `SubtileNode` STRAIGHT
         // TO SuperDSC descriptors — the same violation as the five `*_sdsc` bypasses that were
         // deleted, and the last one left: it was the only producer arm handing the bake an
@@ -1141,39 +1158,17 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(reason) => Unhandled(reason),
             }
         }
-        SubOp::AttnDecode {
-            layout: kv, geom, ..
-        } => {
+        SubOp::AttnDecode { layout: kv, .. } => {
+            // ⭐ THE CACHE CAPACITY IS THE ONE GRAPH FACT THE SPLICE NEEDS STATED — the
+            // same read the builder control makes (`ir.tensors[kv.cache_tensor()].rows`),
+            // and the swept rung rides the walk's own `active_cap`. Everything else the
+            // builder's `lower_attn_node` threaded is either read off the program by the
+            // door (`attn_at`: the swept extent, the scale, the span guard, the row laws)
+            // or is a constexpr the kernel states from the node's own payload.
             let cap = ir.tensors[kv.cache_tensor().index() as u32 as usize].rows;
-            // ⭐⭐ THE ONE PLACE THE MODEL'S HEAD GEOMETRY STOPS BEING VALUES for the attention path.
-            // The `#[forward]` macro parsed these numbers out of the model config and minted them
-            // onto the tape node; the lowering runs INSIDE that macro's expansion, so this door is
-            // where they meet the type system — one instantiation of the whole attention lowering
-            // per geometry the workspace's configs declare, and the arms come from the build
-            // script's read of those same files. A geometry with no arm is a loud bake error; a
-            // geometry whose kv-head count does not divide its query-head count has no arm at all,
-            // because `AttnGeometry` cannot be named at it.
-            match with_config_attn_geometry(
-                *geom,
-                LowerAttn {
-                    node,
-                    ir,
-                    cap,
-                    active_cap,
-                    rows_are_requests,
-                    sym_id_base,
-                    layout,
-                },
-            ) {
-                Some(Ok(v)) => Ops(v),
-                Some(Err(e)) => Unhandled(e.0),
-                None => Unhandled(format!(
-                    "AttnDecode geometry ({geom}) has no const-generic instantiation. The head \
-                     counts and the head dim parameterise the device layout (GQA grouping, slabs, \
-                     head strides), so they must be consts, not values. The instantiations are read \
-                     from the model configs in scope ({}); this geometry belongs to none of them.",
-                    scratchy_subtile::model_geometry::geometry_sources(),
-                )),
+            match scratchy_triton_splice::lower_attn(node, ir, cap, active_cap) {
+                Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
             }
         }
         SubOp::RmsNormReduce { .. } | SubOp::RmsNormApply { .. } => {

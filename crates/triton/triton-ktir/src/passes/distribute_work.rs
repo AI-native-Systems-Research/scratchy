@@ -369,11 +369,21 @@ pub fn is_per_core_work_loop(module: &Module, loopp: &Op) -> bool {
 
 /// Every per-core work loop's path.
 pub fn work_loops(module: &Module) -> Vec<OpPath> {
+    // ONE definition snapshot: `is_per_core_work_loop`'s `def_of` was a
+    // whole-module scan paid per `scf.for` -- quadratic at kernel scale.
+    let index = module.def_index();
     walk::paths(module)
         .into_iter()
         .filter(|p| {
             walk::at(module, p)
-                .map(|o| is_per_core_work_loop(module, o))
+                .map(|o| {
+                    o.kind == OpKind::ScfFor
+                        && o.operands
+                            .first()
+                            .and_then(|v| index.def_of(*v))
+                            .map(|d| d.kind == OpKind::KtdpGetComputeTileId)
+                            .unwrap_or(false)
+                })
                 .unwrap_or(false)
         })
         .collect()

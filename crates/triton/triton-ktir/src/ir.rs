@@ -1132,6 +1132,75 @@ impl Module {
         }
         None
     }
+
+    /// A ONE-SHOT definition/type index over the module AS IT STANDS.
+    ///
+    /// `def_of`/`type_of` are whole-module scans, and the passes call them per
+    /// operand from per-op loops -- quadratic at kernel scale (~160k ops). This
+    /// snapshot turns that into hash lookups for the duration of one pass phase:
+    /// build it, resolve through it, drop it. It carries no invariant the module
+    /// must maintain (it is NOT stored on the module), so a pass that MUTATES
+    /// mid-phase builds a new one -- the same law as `walk::paths`' collect-first
+    /// shape, and the reason it is returned rather than cached.
+    pub fn def_index(&self) -> DefIndex {
+        let mut defs: HashMap<Ssa, usize> = HashMap::with_capacity(self.next_ssa as usize);
+        let mut tys = HashMap::with_capacity(self.next_ssa as usize);
+        fn walk(
+            ops: &[Op],
+            defs: &mut HashMap<Ssa, usize>,
+            tys: &mut HashMap<Ssa, IrType>,
+            offset: &mut usize,
+        ) {
+            for o in ops {
+                let here = *offset;
+                *offset += 1;
+                for (r, t) in o.results.iter().zip(o.result_types.iter()) {
+                    defs.insert(*r, here);
+                    tys.insert(*r, t.clone());
+                }
+                for reg in &o.regions {
+                    for (a, t) in reg.args.iter() {
+                        tys.insert(*a, t.clone());
+                    }
+                    walk(&reg.ops, defs, tys, offset);
+                }
+            }
+        }
+        let mut offset = 0usize;
+        walk(&self.ops, &mut defs, &mut tys, &mut offset);
+        // Owning copies, not borrows: a pass phase holds this index ACROSS the
+        // mutations it applies (the descriptor walk splices while reading shape
+        // constants), so a borrowing index would fight the borrow checker for no
+        // semantic gain -- the ops it points at are identified by PATH, resolved
+        // through `walk::at`, never held.
+        let ops: Vec<Op> = self.ops_deep().into_iter().cloned().collect();
+        DefIndex {
+            defs,
+            tys,
+            ops: Some(ops),
+        }
+    }
+}
+
+/// The resolved-by-hash twin of [`Module::def_of`] / [`Module::type_of`] over one
+/// module snapshot. Definitions shadow exactly as the depth-first scan does --
+/// the LAST walk visit wins in both, since a module's SSA names are unique by
+/// construction (`Module::fresh`).
+pub struct DefIndex {
+    defs: HashMap<Ssa, usize>,
+    tys: HashMap<Ssa, IrType>,
+    ops: Option<Vec<Op>>,
+}
+
+impl DefIndex {
+    pub fn def_of(&self, v: Ssa) -> Option<&Op> {
+        let i = self.defs.get(&v).copied()?;
+        self.ops.as_ref()?.get(i)
+    }
+
+    pub fn type_of(&self, v: Ssa) -> Option<IrType> {
+        self.tys.get(&v).cloned()
+    }
 }
 
 //===----------------------------------------------------------------------===//

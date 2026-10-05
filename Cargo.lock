@@ -4938,6 +4938,9 @@ dependencies = [
 [[package]]
 name = "triton-frontend"
 version = "0.1.0"
+dependencies = [
+ "triton-ktir",
+]
 
 [[package]]
 name = "triton-ktir"

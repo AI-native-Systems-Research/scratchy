@@ -23,4 +23,9 @@ publish = false
 # structurally, not parsed, exactly as the ruff adapter ignored it.
 default = []
 
+# THROWAWAY PROBE (zz_attn_probe.rs) — remove with the probe. triton-ktir depends on
+# THIS crate, so the reverse edge lives in dev-dependencies where it cannot cycle.
+[dev-dependencies]
+triton-ktir = { path = "../triton-ktir" }
+
 [dependencies]

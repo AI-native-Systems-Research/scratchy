@@ -1381,8 +1381,8 @@ fn check_desc(module: &Module, d: &Op, nm: &str, d0: i64, d1: i64, b0: i64, b1: 
 /// Everything else about C is the strict form: contiguous row-major, the full `n`,
 /// the `[m, n]` block.
 fn check_desc_c(module: &Module, d: &Op, m: i64, ns: i64, bm: i64, bn: i64) -> Result<()> {
-    let (s0, s1) = desc_shape2(module, d)
-        .ok_or_else(|| refuse("C has non-constant shape/strides"))?;
+    let (s0, s1) =
+        desc_shape2(module, d).ok_or_else(|| refuse("C has non-constant shape/strides"))?;
     if s0 < m || s1 != ns {
         return Err(refuse(format!(
             "C shape [{s0},{s1}] does not hold the stored [{m},{ns}] tile — the output \
@@ -1469,10 +1469,36 @@ pub fn const_int(module: &Module, v: Ssa) -> Option<i64> {
         .and_then(|a| a.as_int())
 }
 
+/// [`const_int`] over a [`DefIndex`] snapshot -- the same read, O(1) instead of a
+/// whole-module scan. For callers inside per-op loops (the unroll and constant
+/// folders, which read constants per operand per op).
+pub fn const_int_index(index: &DefIndex, v: Ssa) -> Option<i64> {
+    index
+        .def_of(v)
+        .filter(|o| o.kind == OpKind::ArithConstant)
+        .and_then(|o| o.attr(&AttrKey::Value))
+        .and_then(|a| a.as_int())
+}
+
 /// True iff `v` is a compile-time zero (splat dense-fp or scalar float 0.0).
 /// `isZeroConst`.
 pub fn is_zero_const(module: &Module, v: Ssa) -> bool {
     module
+        .def_of(v)
+        .filter(|o| o.kind == OpKind::ArithConstant)
+        .and_then(|o| o.attr(&AttrKey::Value))
+        .map(|a| match a {
+            Attr::SplatFloat(f) | Attr::Float(f) => f.is_zero(),
+            Attr::Int(i) => *i == 0,
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+/// [`is_zero_const`] over a [`DefIndex`] snapshot -- O(1) per read, for callers
+/// inside per-op loops.
+pub fn is_zero_const_index(index: &DefIndex, v: Ssa) -> bool {
+    index
         .def_of(v)
         .filter(|o| o.kind == OpKind::ArithConstant)
         .and_then(|o| o.attr(&AttrKey::Value))

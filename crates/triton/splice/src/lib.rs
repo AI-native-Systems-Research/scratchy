@@ -261,6 +261,17 @@ pub fn lmlast_row() -> TritonKernelRow {
     }
 }
 
+/// THE ATTENTION FAMILY — one row, one kernel, every shape: `attn.py`'s own three
+/// constexpr-selected arms (the causal one-pass, decode, prefill continuation) are the
+/// builder's own three arms restated, so the row does not branch on shape at all.
+pub fn attn_row() -> TritonKernelRow {
+    TritonKernelRow {
+        kernel: "attn.py",
+        entry: "attn_fwd",
+        program: Program::Attn,
+    }
+}
+
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice is one of the five families below; the ops the spyre target has no kernel AT
 /// ALL for (attention, the expansion ops, reshape, …) never reach this crate —
@@ -289,14 +300,20 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "rope_fwd",
             program: Program::Rope,
         },
+        // ATTENTION SPLICES. The builder's `KtirFunc::attn` is the golden's control; the
+        // kernel states the same three arms as constexpr-selected cases, and the door
+        // (`attn_operands`) reads every fact — the q/out views, the swept rung, the scale
+        // — off the program itself. `lower_all_attn` is the entry (the attention needs
+        // door-order bindings, the mask binding, and the dead-prefix view injection that
+        // no pure-Triton program can state).
+        SubOp::AttnDecode { .. } => attn_row(),
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
         // match is the gate: these kinds have their own arms there (attention's
         // const-generic geometry door, the host-routed rmsnorm pair, the by-name
         // refusals), and a kind reaching THIS match means the routing changed — the
         // message names what must land, and no `_` arm can swallow it.
-        SubOp::AttnDecode { .. }
-        | SubOp::RmsNormReduce { .. }
+        SubOp::RmsNormReduce { .. }
         | SubOp::RmsNormApply { .. }
         | SubOp::Reshape { .. }
         | SubOp::SumReduce { .. }
@@ -373,7 +390,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> Result<EmittedOp, String> {
-    let row = row(&node.op);    // ⛔ THE ROUTING IS `lower_one_node`'S EXHAUSTIVE MATCH, and this guard is its echo:
+    let row = row(&node.op); // ⛔ THE ROUTING IS `lower_one_node`'S EXHAUSTIVE MATCH, and this guard is its echo:
     // the kinds that never route here carry the ROUTED-ELSEWHERE sentinel row, and a
     // node that reaches this check means the routing changed without adding a family
     // function — the message names the owner. It is unreachable through
@@ -475,9 +492,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
             // spell (the prefill lm-head fold's row extraction is exactly that, and
             // it is the fold worklist item). Production chunking never moves the row
             // corner (`lower_region` tiles columns only), so this is the loud edge.
-            let row0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
-                tr.region.rows.start == 0
-            };
+            let row0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| tr.region.rows.start == 0;
             if !row0(&node.output) || node.inputs.iter().any(|tr| !row0(tr)) {
                 return Err(format!(
                     "triton splice: {} t{} has a nonzero ROW corner — the pointwise kernels \
@@ -613,9 +628,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
         op: node.op,
         inputs: vec![*a],
         output: scratchy_subtile::subtile_ir::TensorRegion {
-            tensor: scratchy_subtile::subtile_ir::TensorId::from_index(
-                last_hidden as usize,
-            ),
+            tensor: scratchy_subtile::subtile_ir::TensorId::from_index(last_hidden as usize),
             region: SubRegion {
                 rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
                 cols: scratchy_subtile::subtile_ir::Range::new(0, hidden),
@@ -664,6 +677,434 @@ fn read_kernel(kernel: &str) -> Result<String, String> {
     let path = kernels_dir().join(kernel);
     std::fs::read_to_string(&path)
         .map_err(|e| format!("triton splice: cannot read {}: {e}", path.display()))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  ATTENTION — the one spliced kind whose program is NOT a straight parameter-for-tensor
+//  substitution, which is why it gets its own entry rather than riding `lower_one`:
+//
+//  * the DOOR's parameter order is q, out, then kc, new_k, vc, new_v, then the mask — the
+//    output is SECOND, not last, because `attn_operands` reads `r[0]`/`r[1]` as q/out and
+//    the next four as the segment pairs (`KtirFunc::attn`'s own `arg_for` order);
+//  * the MASK is a bound synthetic tensor beyond the graph (`k.mask`, not a binding slot
+//    the positional mint could name);
+//  * the DEAD PREFIX is a SPLICE-INJECTED VIEW: at `SWEPT == 0` the kernel's `if SWEPT > 0`
+//    guards leave the resident cache parameters addressed nowhere, the ladder DCEs an
+//    unconsumed descriptor, and no Triton program can state "a parameter with a view and no
+//    access tile" — so this entry injects the two `ktdp.construct_memory_view` ops into the
+//    compiled module post-hoc, the same law as `lmlast`'s `node_out_tid` (a stated tape
+//    fact, not an inferred one).
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// THE ATTENTION SPLICE — compile `attn.py` for this node's geometry and swept rung, and
+/// mint the `Program::Attn` `KtirNode` with the door's own parameter order.
+///
+/// `cap` is the resident cache tensor's row extent (`lower_attn_node`'s own read), and
+/// `active_cap` is the swept rung the bundle was baked for — THE one bundle fact that must
+/// meet the program here, because `attn_at` reads the swept extent back off the program
+/// (`param_read_rows`) and the two must agree by the door's own hard error.
+pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    cap: u32,
+    active_cap: ktir_superdsc::ktir_node::ActiveCap,
+) -> Result<EmittedOp, String> {
+    let row = attn_row();
+    let SubOp::AttnDecode { geom, scale, .. } = &node.op else {
+        return Err(
+            "triton splice: lower_attn called on a node that is not an AttnDecode — the \
+             entry is AttnDecode's"
+                .to_string(),
+        );
+    };
+    if node.inputs.len() < 5 {
+        return Err(format!(
+            "triton splice: AttnDecode t{} expects 5 inputs [q, prefix_k, prefix_v, new_k, \
+             new_v], found {}",
+            node.output.tensor.index(),
+            node.inputs.len()
+        ));
+    }
+    let (nqh, nkvh, hd) = (geom.nqh().get(), geom.nkvh().get(), geom.hd().get());
+    let stick = ktir_superdsc::sdsc_abstract::POOL_STICK; // 64 — the rung alignment law
+    let swept = active_cap.resolve(cap, stick);
+    let mq = node.output.region.rows.len;
+    let gqa = geom.gqa().get();
+    // ⛔ THE PREFIX SEGMENT'S OWN LAW, `KtirSeg`'s and not the rung's: a MASKED prefix
+    // (this forward's own rope-append) is read from row 0 to the SWEPT extent — the
+    // rung, bounded by the cache TENSOR's own rows (`graph.shape(kr.tensor).rows`,
+    // NOT the region's: `lower_region` slices a rope-append prefix's region to
+    // `valid_len - 1` rows while the builder's tile sweeps the rung and lets the
+    // runtime length mask bound it); a PRE-POPULATED one (the emulator's host-threaded
+    // cache) is read at its own region rows and corner. The door reads this extent
+    // back off the program (`param_read_rows`), so the spliced tile must state exactly
+    // the builder's.
+    let mask_prefix = matches!(
+        &node.op,
+        SubOp::AttnDecode {
+            producer: scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+            ..
+        }
+    );
+    // The cache tensor's own row count — the builder's bound (`swept.min` of exactly
+    // this), and the same reading `lower_one_node`'s walk used for `cap`.
+    let cache_rows = ir.tensors[node.inputs[1].tensor.index()].rows;
+    let (prefix_len, kc_row) = if mask_prefix {
+        (swept.min(cache_rows), 0)
+    } else {
+        (
+            node.inputs[1].region.rows.len,
+            node.inputs[1].region.rows.start,
+        )
+    };
+    // `KtirFunc::attn`'s zero-length segment law: a dead prefix (prefix_len == 0) keeps
+    // its VIEW (injected below) and drops its compute, AND CLEARS `mask_prefix` — with no
+    // prefix segment there is nothing the runtime length mask could bound. That clearing
+    // is what makes a no-prefix prompt chunk take the causal ONE-PASS arm.
+    let mask_eff = mask_prefix && prefix_len > 0;
+    let new_len = node.inputs[3].region.rows.len;
+    // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
+    // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
+    // block spanning the whole chunk (`seq_len == mq`) — the additive `[mq, mq]` causal
+    // triangle can then replace the per-row slice.
+    let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1;
+    // THE MASK IS BOUND WHEN A SEGMENT CONSUMES IT — the runtime length mask (decode,
+    // `[1, prefix_len]`) or the causal triangle (the one-pass, `[mq, mq]`). The builder
+    // mints the mask tile in exactly these two arms and no other.
+    let has_mask = mask_eff || one_pass;
+    // The scale, stated as the kernel's own constexpr so the program's `qk * SCALE` mulf
+    // carries exactly the value `program_score_scale` reads back — the door resolves the
+    // registry slot FROM that value, so the program and `scalarmul_scales` cannot disagree.
+    let src = read_kernel(row.kernel)?;
+    let spec = attn_kernel_spec(
+        node,
+        &AttnFacts {
+            nqh,
+            nkvh,
+            hd,
+            gqa,
+            mq,
+            cap,
+            prefix_len,
+            kc_row,
+            new_len,
+            scale: *scale,
+            has_mask,
+            one_pass,
+        },
+    )?;
+    let mut module = compile_kernel(&src, &spec, &[1])?;
+    // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
+    // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
+    // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
+    // identity and capacity off those views, and the card keeps the cache RESIDENT through
+    // them. The builder keeps the view by construction (`KtirFunc::attn`'s zero-length
+    // segment); the splice states the same fact post-compile, as one
+    // `ktdp.construct_memory_view` per cache parameter over the SAME shape the live
+    // segment's view states (the full `[cap, nkvh·hd]` capacity).
+    if prefix_len == 0 {
+        inject_dead_cache_views(&mut module, cap, nkvh * hd)?;
+    }
+    // ⛔ THE MASKLESS SHAPE TRUNCATES THE MASK PARAMETER. The kernel's parameter list is
+    // static Python, so `desc_mask` is declared in every arm; a maskless shape (a
+    // pre-populated cache at decode, a continuation chunk) traces no view over it, and the
+    // handoff refuses an unaddressed parameter rather than inventing a width. The builder's
+    // own maskless arm mints NO mask parameter (`KtirFunc::attn` registers the mask tile
+    // only under `mask_prefix` / the one-pass arm), so the byte-identity requirement is the
+    // same one: the parameter must not survive. `desc_mask` is the LAST parameter — the
+    // consumer numbers its buffers by parameter position, so removing the tail renumbers
+    // nothing (the handoff's own law).
+    if !has_mask {
+        truncate_unused_mask_param(&mut module)?;
+    }
+    let k = mint_attn(node, ir, module, &row, has_mask)?;
+    let name = format!("attn_s{}", node.id.index());
+    let mut e = EmittedOp::bare(name);
+    e.ktir = Some(k);
+    Ok(e)
+}
+
+/// THE ATTENTION KERNEL'S LAUNCH CONTRACT — the door's own parameter order (q, out, the
+/// four segment buffers in `attn_operands`'s positional order — resident K, new K,
+/// resident V, new V — then the mask), plus every extent as a constexpr: the geometry
+/// (`NQH/NKVH/HD/GQA`), the widths (`MQ/CAP/SWEPT/NEW_LEN`), the segment corners
+/// (`KC_*/KD_*`, the region row/col starts), the scale, and the two arm selectors
+/// (`HAS_MASK`, `ONE_PASS`).
+///
+/// ⭐ THE MASK PARAMETER IS STATED ONLY WHEN A SEGMENT CONSUMES IT — the kernel builds its
+/// mask descriptor under the same `HAS_MASK` guard, so an always-declared parameter would
+/// be a binding slot nothing addresses (the ladder DCEs the unconsumed descriptor and the
+/// handoff refuses "addressed NOWHERE"). `HAS_MASK` is the builder's own `mask_prefix`,
+/// and `ONE_PASS` the builder's own one-pass arm condition (`live.len() == 1 && mq > 1 &&
+/// !mask_prefix && seq_len == mq`).
+///
+/// The facts arrive as ONE struct — the group is the shape's own frame (geometry, widths,
+/// segment extents, arm selectors), minted by `lower_attn` beside the laws that derive
+/// each member, so this mint holds no derivation of its own.
+struct AttnFacts {
+    nqh: u32,
+    nkvh: u32,
+    hd: u32,
+    gqa: u32,
+    mq: u32,
+    cap: u32,
+    prefix_len: u32,
+    kc_row: u32,
+    new_len: u32,
+    scale: f32,
+    has_mask: bool,
+    one_pass: bool,
+}
+
+fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    f: &AttnFacts,
+) -> Result<KernelSpec, String> {
+    let AttnFacts {
+        nqh,
+        nkvh,
+        hd,
+        gqa,
+        mq,
+        cap,
+        prefix_len,
+        kc_row,
+        new_len,
+        scale,
+        has_mask,
+        one_pass,
+    } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    // The door's positional order: q, out, kc, kd, vc, vd — the cache's K before the new
+    // block's K, then the same for V — then the mask when a segment reads it.
+    let mut params: Vec<&str> = vec![
+        "desc_q", "desc_o", "desc_kc", "desc_kd", "desc_vc", "desc_vd",
+    ];
+    // ⛔ THE MASK PARAMETER IS ALWAYS IN THE SIGNATURE: the kernel's parameter list is static
+    // Python, so a shape without a mask still declares `desc_mask` — and the trace (every
+    // descriptor and load under `if HAS_MASK:` / `if SWEPT > 0`) never references it, so the
+    // pipeline DCEs the unaddressed parameter and the compiled program carries exactly the
+    // arguments the builder's own arm states (six, for a maskless shape). Same law as the dead
+    // prefix's cache views: the program's parameter set is decided by what the trace addresses.
+    params.push("desc_mask");
+    for p in params {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    // The segment corners, from the node's own regions — the row/col starts the builder's
+    // `KtirSeg` states (`kr.region.rows.start`, `kr.region.cols.start`). The MASKED prefix's
+    // row corner is 0 by the builder's own law (`row_start = 0` at `mask_prefix && i == 0`),
+    // which is why `kc_row` arrives as its own parameter and is not read off the region.
+    let (kc_c, kd_r, kd_c) = (
+        node.inputs[1].region.cols.start,
+        node.inputs[3].region.rows.start,
+        node.inputs[3].region.cols.start,
+    );
+    ce("NQH", Val::Int(i128::from(nqh)))?;
+    ce("NKVH", Val::Int(i128::from(nkvh)))?;
+    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("GQA", Val::Int(i128::from(gqa)))?;
+    ce("MQ", Val::Int(i128::from(mq)))?;
+    ce("CAP", Val::Int(i128::from(cap)))?;
+    ce("SWEPT", Val::Int(i128::from(prefix_len)))?;
+    ce("NEW_LEN", Val::Int(i128::from(new_len)))?;
+    ce("KC_ROW", Val::Int(i128::from(kc_row)))?;
+    ce("KC_COL", Val::Int(i128::from(kc_c)))?;
+    ce("KD_ROW", Val::Int(i128::from(kd_r)))?;
+    ce("KD_COL", Val::Int(i128::from(kd_c)))?;
+    ce("SCALE", Val::Float(f64::from(scale)))?;
+    ce("HAS_MASK", Val::Bool(has_mask))?;
+    ce("ONE_PASS", Val::Bool(one_pass))?;
+    Ok(KernelSpec {
+        kernel: "attn_fwd".to_string(),
+        signature,
+        constexprs,
+        file: kernels_dir().join("attn.py").to_string_lossy().into_owned(),
+    })
+}
+
+/// THE DEAD PREFIX'S VIEWS — one `ktdp.construct_memory_view` per resident-cache
+/// parameter, spliced at the top of the compiled kernel's body.
+///
+/// ⛔ THE PARAMETER POSITIONS ARE THE DOOR'S, and the injection must find its own
+/// parameter: the kernel's pointer parameters are `desc_q` (0), `desc_o` (1), `desc_kc`
+/// (2), `desc_kd` (3), `desc_vc` (4), `desc_vd` (5), so the cache parameters are 2 and 4.
+/// The view shape is the segment's own `[cap, kv_width]` — the capacity
+/// `attn_operands` reads as `cap = kc.v_rows`, exactly what a live segment's view states
+/// and what the builder's dead segment keeps.
+fn inject_dead_cache_views(
+    module: &mut triton_ktir::ir::Module,
+    cap: u32,
+    kv_width: u32,
+) -> Result<(), String> {
+    use triton_ktir::ir::{Attr, AttrKey, IrType, Op, OpKind};
+    // Mint the view names BEFORE the body borrow: `fresh_named` needs `&mut module` and
+    // the splice needs `&mut` the body, so the two phases cannot interleave (the rung-3
+    // rewrite's own law).
+    let view_names = [module.fresh_named("kc_dead"), module.fresh_named("vc_dead")];
+    let kernel = module
+        .kernel_mut()
+        .map_err(|e| format!("triton splice: attn dead-view injection: {e}"))?;
+    let region = kernel.regions.first_mut().ok_or_else(|| {
+        "triton splice: attn dead-view injection: the kernel has no body".to_string()
+    })?;
+    // The dead segment's view shape, as the ladder's own `build_base_memory_view` spells
+    // it: `Shape`/`Strides` as element counts, `CoordinateSet` from the range-set law, HBM.
+    let dims = vec![i64::from(cap), i64::from(kv_width)];
+    let range_set = format!(
+        "(d0, d1) : (d0 >= 0, -d0 + {r} >= 0, d1 >= 0, -d1 + {c} >= 0)",
+        r = cap - 1,
+        c = kv_width - 1,
+    );
+    // Positions 2 and 4: the resident K and V cache parameters (`desc_kc`, `desc_vc`).
+    for (n, (view, param_idx)) in view_names.iter().zip([2usize, 4usize]).enumerate() {
+        let Some(&(ptr, _)) = region.args.get(param_idx) else {
+            return Err(format!(
+                "triton splice: attn dead-view injection: the kernel states fewer than {} \
+                 parameters — the door's order is q, out, kc, kd, vc, vd",
+                param_idx + 1
+            ));
+        };
+        // The parameter must be addressed nowhere — that is the dead prefix's own shape,
+        // and a view that already exists means the kernel's guards diverged from SWEPT==0.
+        if region
+            .ops
+            .iter()
+            .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
+        {
+            return Err(format!(
+                "triton splice: attn dead-view injection: parameter {param_idx} already states \
+                 a view — the kernel's SWEPT==0 guards left the cache descriptors live, and \
+                 injecting a second view over one pointer would give the door two extents to \
+                 read where it takes the first"
+            ));
+        }
+        let view_op = Op::new(OpKind::KtdpConstructMemoryView)
+            .with_result(
+                *view,
+                IrType::MemRef {
+                    dims: dims.clone(),
+                    elem: triton_ktir::ir::DType::F16,
+                },
+            )
+            .with_operands([ptr])
+            .with_attr(AttrKey::Shape, Attr::IntList(dims.clone()))
+            .with_attr(
+                AttrKey::Strides,
+                Attr::IntList(vec![i64::from(kv_width), 1]),
+            )
+            .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(range_set.clone()))
+            .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into()));
+        // Splice at the TOP of the body, in parameter order: a view is loop-invariant by
+        // construction (its one operand is the base address), and `regions()` finds it by
+        // a non-recursive search of the function's top-level ops.
+        region.ops.insert(n, view_op);
+    }
+    Ok(())
+}
+
+/// THE MASKLESS SHAPE'S PARAMETER TRUNCATION — drop the tail `desc_mask` parameter the
+/// kernel declares but no arm traced a view over.
+///
+/// ⛔ THE PARAMETER MUST BE UNUSED **AND LAST**. The consumer numbers its buffers by
+/// parameter position, so only removing the tail renumbers nothing — anything but the last
+/// slot would silently re-index every later buffer. And the parameter must be addressed
+/// NOWHERE (the same `every_parameter_states_its_width` precondition the handoff enforces):
+/// a body that still holds a view over it means `HAS_MASK` and the trace's own guards
+/// disagreed, which is a kernel bug this refuses rather than papers over.
+fn truncate_unused_mask_param(module: &mut triton_ktir::ir::Module) -> Result<(), String> {
+    use triton_ktir::ir::OpKind;
+    let kernel = module
+        .kernel_mut()
+        .map_err(|e| format!("triton splice: attn mask truncation: {e}"))?;
+    let region = kernel
+        .regions
+        .first_mut()
+        .ok_or_else(|| "triton splice: attn mask truncation: the kernel has no body".to_string())?;
+    let Some(&(ptr, _)) = region.args.last() else {
+        return Err(
+            "triton splice: attn mask truncation: the kernel states no parameters".to_string(),
+        );
+    };
+    if region
+        .ops
+        .iter()
+        .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
+    {
+        return Err(
+            "triton splice: attn mask truncation: the last parameter is addressed by a view — \
+             HAS_MASK is false for this shape, so the kernel's mask guards left the mask \
+             descriptor live; the maskless arm must not reference `desc_mask` at all"
+                .to_string(),
+        );
+    }
+    region.args.pop();
+    Ok(())
+}
+
+/// THE ATTENTION MINT — the adapter's `node_for` compilation, then the attention's own
+/// re-state: the bindings in the DOOR's parameter order (q, out, then the segment pairs,
+/// with the output SECOND, not last), the mask as a bound synthetic tensor id (the
+/// graph's next free one — the builder's own `graph.tensors.len()` law for the mask id),
+/// and the builder's `attn_s{id}` name.
+fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    module: triton_ktir::ir::Module,
+    row: &TritonKernelRow,
+    mask_bound: bool,
+) -> Result<KtirNode, String> {
+    let positional = triton_ktir_superdsc::node_for(&module, row.program)
+        .map_err(|e| format!("triton splice: node_for: {e}"))?;
+    // ⛔ THE DOOR'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
+    // kc (inputs[1]), kd (inputs[3]), vc (inputs[2]), vd (inputs[4]) — the order
+    // `KtirFunc::attn`'s `arg_for` mints and `attn_operands` reads back. `regions()` zips
+    // `bindings[i]` against `arguments[i]`, so a swapped binding is a descriptor over the
+    // wrong tensor, and the door's `is_out` check is what catches a transposed q/out.
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    let mut bindings = vec![
+        t(&node.inputs[0]),
+        t(&node.output),
+        t(&node.inputs[1]),
+        t(&node.inputs[3]),
+        t(&node.inputs[2]),
+        t(&node.inputs[4]),
+    ];
+    // ⭐ THE MASK'S BINDING SLOT — the synthetic tensor BEYOND the graph, numbered the way
+    // the builder numbers it (`self.graph.tensors.len()`): the door skips the parameter
+    // by this very tid (`k.mask`), so beyond-the-graph is the only requirement, and the
+    // builder's own law is the graph's extent.
+    let mask_tid = mask_bound.then(|| BufferId::new(ir.tensors.len() as u32));
+    if let Some(m) = mask_tid {
+        bindings.push(m);
+    }
+    let name = Arena::global().str(format!("attn_s{}", node.id.index()));
+    let KtirNode { func, program, .. } = positional;
+    if func.arguments.len() != bindings.len() {
+        return Err(format!(
+            "triton splice: {} compiled to {} parameters but the door's order states {} \
+             bindings — the kernel's parameter list diverged from the row's contract",
+            func.name,
+            func.arguments.len(),
+            bindings.len()
+        ));
+    }
+    Ok(KtirNode {
+        func: ktir_core::ir::IRFunction { name, ..func },
+        program,
+        bindings,
+        mask: mask_tid,
+        node_out_tid: None,
+    })
 }
 
 /// `crates/targets/spyre/kernels/` — resolved from THIS crate's manifest dir.
@@ -950,8 +1391,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // actually holds.
             let c_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(c).get();
             let (block_m, n_blocks, tail_h) = blocks_of(m, c_dev, 3);
-            let n_total_dev =
-                ktir_superdsc::work::DeviceWidth::for_pointwise(n_total).get();
+            let n_total_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(n_total).get();
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c_dev)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;

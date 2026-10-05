@@ -308,6 +308,9 @@ fn is_elementwise_compute(op: &Op) -> bool {
 /// Read from the IR, never assumed. A reduction whose axis cannot be determined
 /// counts as NOT last-axis, so an unrecognised form fails closed.
 fn all_reductions_are_along_last_axis(module: &Module, loopp: &Op) -> bool {
+    // ONE definition snapshot: `type_of` below was a whole-module scan paid per
+    // reduction op in the body.
+    let index = module.def_index();
     let mut all_last = true;
     for op in loopp.ops_deep() {
         match op.kind {
@@ -316,7 +319,7 @@ fn all_reductions_are_along_last_axis(module: &Module, loopp: &Op) -> bool {
                 let rank = op
                     .operands
                     .first()
-                    .and_then(|v| module.type_of(*v))
+                    .and_then(|v| index.type_of(*v))
                     .map(|t| t.rank() as i64);
                 match (axis, rank) {
                     (Some(a), Some(r)) if r >= 1 && a == r - 1 => {}
@@ -328,7 +331,7 @@ fn all_reductions_are_along_last_axis(module: &Module, loopp: &Op) -> bool {
                 let rank = op
                     .operands
                     .first()
-                    .and_then(|v| module.type_of(*v))
+                    .and_then(|v| index.type_of(*v))
                     .map(|t| t.rank() as i64);
                 match (dims, rank) {
                     (Some(d), Some(r)) if d.len() == 1 && r >= 1 && d[0] == r - 1 => {}
@@ -473,10 +476,13 @@ fn recover_any_matmul_n(loopp: &Op) -> Option<i64> {
 /// must tile the rows with no overlap, and an odd or dynamic count is a spec delta
 /// rather than something to round.
 fn recover_row_count(module: &Module, loopp: &Op) -> Option<i64> {
+    // ONE definition snapshot: `type_of` below was a whole-module scan paid per
+    // reduction op.
+    let index = module.def_index();
     for op in loopp.ops_deep() {
         let in_ty = match op.kind {
             OpKind::TtReduce | OpKind::LinalgReduce => {
-                op.operands.first().and_then(|v| module.type_of(*v))
+                op.operands.first().and_then(|v| index.type_of(*v))
             }
             _ => None,
         };
@@ -505,12 +511,15 @@ fn recover_row_count(module: &Module, loopp: &Op) -> Option<i64> {
 ///                         -> construct_memory_view.sizes
 /// ```
 fn recover_matmul_shape(module: &Module, loopp: &Op) -> Option<[i64; 3]> {
+    // ONE definition snapshot: the three definition hops below were whole-module
+    // scans paid per matmul operand.
+    let index = module.def_index();
     let full_shape = |v: Ssa| -> Option<(i64, i64)> {
-        let load = module.def_of(v).filter(|o| o.kind == OpKind::KtdpLoad)?;
-        let at = module
+        let load = index.def_of(v).filter(|o| o.kind == OpKind::KtdpLoad)?;
+        let at = index
             .def_of(load.operands.first().copied()?)
             .filter(|o| o.kind == OpKind::KtdpConstructAccessTile)?;
-        let mv = module
+        let mv = index
             .def_of(at.operands.first().copied()?)
             .filter(|o| o.kind == OpKind::KtdpConstructMemoryView)?;
         let s = mv.attr(&AttrKey::Shape)?.as_int_list()?;
