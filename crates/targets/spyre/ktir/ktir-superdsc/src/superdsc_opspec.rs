@@ -108,6 +108,21 @@ pub const EW_BINARY_LIVE_TILES: u32 = 3;
 /// the widest live set in the model.
 pub const SILU_MUL_LIVE_TILES: u32 = 8;
 
+/// How many ROWS of a `cols`-wide region keep `live` tiles inside [`EW_LX_ELEMS`] —
+/// ONE LAW, shared by the builder's row-block arms (`lower_elementwise_node_rows`,
+/// `lower_scalarmul_node`'s `by_row`, `KtirFunc::silu_mul`) and the Triton splice's
+/// pointwise constexprs, so the two paths cannot disagree about a block height and
+/// emit windows that overlap or leave a gap.
+///
+/// ⛔ NOT ONE ROW. A row at a time is correct and fits trivially, but it emits `m`
+/// copies of every op, and a forward's cost is dominated by PER-OP work: at the m=96
+/// prefill rung that put 3.7 s of a 5.6 s forward outside the GEMMs entirely. Blocking
+/// at the widest height that still fits is what keeps both the LX bound and the op
+/// count.
+pub fn rows_per_block(cols: u32, live: u32) -> u32 {
+    ((EW_LX_ELEMS / live.max(1) as u64 / cols.max(1) as u64) as u32).max(1)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // (a) DataFormat + StickExtent — the fp16-stick / multiple-of-stick witness.
 // ───────────────────────────────────────────────────────────────────────────

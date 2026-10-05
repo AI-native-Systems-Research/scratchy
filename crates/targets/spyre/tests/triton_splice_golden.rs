@@ -155,8 +155,10 @@ fn rmsnorm_ir(m: u32, c: u32) -> SubtileIR {
 
 /// The silu-mul shapes that matter for the delivery scope: granite's d_ff (2b: 0, 8b:
 /// 12800) at decode rows and a prefill rung's width. (M, N). ⛔ THE `[64, 12800]` AND
-/// `[96, 4096]` RUNGS ARE BUILDER-ONLY (the eight-live-tile LX budget the splice's
-/// guard mirrors), so they pin the GUARD's loud Err, not a comparison.
+/// `[96, 4096]` RUNGS EXERCISE THE ROW-BLOCKED KERNEL (the eight-live-tile LX budget:
+/// `rows_per_block` splits the region into `[10, 12800]` / `[32, 4096]` blocks plus a
+/// tail), so they compare the blocked spliced program against the builder's blocked
+/// program — one descriptor on each side, spanning the same windows.
 const SILUMUL_SHAPES: &[(u32, u32)] = &[(1, 4096), (1, 12800), (31, 4096), (64, 12800), (96, 4096)];
 
 #[test]
@@ -182,24 +184,13 @@ fn spliced_silumul_is_byte_identical_to_the_builder() {
             .as_ref()
             .expect("builder op carries its program");
 
-        // 2. The splice — the row compiles the kernel for this node. A region whose
-        // eight-tile live set exceeds the LX budget is a BUILDER-ONLY node (the guard
-        // the granite-8b `[31, 12800]` overflow measured): the splice's loud Err names
-        // the missing row-blocked kernel, pinned here so the Err cannot silently
-        // become a wrong whole-region program.
+        // 2. The splice — the row compiles the kernel for this node, at EVERY rung: a
+        // region whose eight-tile live set exceeds the LX budget is ROW-BLOCKED inside
+        // the kernel (the same `rows_per_block` the builder's `KtirFunc::silu_mul`
+        // reads), so an Err here is a broken row or a broken block law.
         let node = &ir.nodes[0];
-        let spliced = scratchy_triton_splice::lower(node, &ir, false);
-        let spliced = match spliced {
-            Ok(s) => s,
-            Err(reason) => {
-                assert!(
-                    m > 1 && u64::from(m) * u64::from(c) * 8 > 1024 * 1024,
-                    "m={m} c={c}: the splice refused but the region FITS the eight-tile \
-                     LX budget — the registry row is missing or the guard is wrong ({reason})"
-                );
-                continue;
-            }
-        };
+        let spliced = scratchy_triton_splice::lower(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
 
         // ⛔ THE NAME LAW IS PART OF THE GATE — `silumul_s{id}` on both paths.
         assert_eq!(spliced.op_name, builder.op_name, "op_name (m={m} c={c})");
@@ -365,9 +356,10 @@ fn a_column_chunked_silumul_splices_byte_identically() {
 }
 
 /// The elementwise shapes that matter for the delivery scope: granite's hidden 2048
-/// (the residual adds' width) at decode rows and a prefill rung's width, all inside
-/// the splice's LX budget (a blocked region is a builder-only node by the splice's own
-/// guard, so it has no splice side to compare). (M, N).
+/// (the residual adds' width) at decode rows and a prefill rung's width. The
+/// `[96, 4096]` rung exceeds the binary live-tile budget and exercises the
+/// ROW-BLOCKED kernel (`rows_per_block(4096, 3)` = 85 → one block + an 11-row tail).
+/// (M, N).
 const EW_SHAPES: &[(u32, u32)] = &[(1, 2048), (1, 4096), (31, 2048), (64, 4096), (96, 4096)];
 
 /// Every `EwKind` the splice has a row for. The kinds the builder REFUSES
@@ -399,27 +391,14 @@ fn spliced_elementwise_is_byte_identical_to_the_builder() {
                 .as_ref()
                 .expect("builder op carries its program");
 
-            // 2. The splice — the row compiles the kernel for this node. A region whose
-            // live set exceeds the LX budget is a BUILDER-ONLY node (the builder
-            // row-blocks it inside one program; a one-tile kernel cannot spell that),
-            // and the splice's own loud Err names the missing row-blocked kernel —
-            // pinned here, because a splice that took such a node would emit a program
-            // the descriptor-level golden cannot compare and the emulator could not run.
+            // 2. The splice — the row compiles the kernel for this node at every
+            // rung: a region whose live set exceeds the LX budget is ROW-BLOCKED
+            // inside the kernel (the same `rows_per_block` the builder's
+            // `lower_elementwise_node_rows` reads), so an Err here is a broken row
+            // or a broken block law.
             let node = &ir.nodes[0];
-            let spliced = scratchy_triton_splice::lower(node, &ir, false);
-            let spliced = match spliced {
-                Ok(s) => s,
-                Err(reason) => {
-                    let live: u32 = if matches!(kind, EwKind::Silu) { 6 } else { 3 };
-                    assert!(
-                        m > 1 && u64::from(m) * u64::from(c) * u64::from(live) > 1024 * 1024,
-                        "{kind:?} m={m} c={c}: the splice refused but the region FITS the \
-                         builder's LX budget — the registry row is missing or the guard is \
-                         wrong ({reason})"
-                    );
-                    continue;
-                }
-            };
+            let spliced = scratchy_triton_splice::lower(node, &ir, false)
+                .unwrap_or_else(|e| panic!("splice compiled {kind:?} m={m} c={c}: {e}"));
 
             // ⛔ THE NAME LAW IS PART OF THE GATE — the BUILDER's `ew_kind_stem`
             // (`add_s{id}`, `mul_s{id}`, `sub_s{id}`, `silu_s{id}`; BiasAdd is `add`),
@@ -720,14 +699,14 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
 fn spliced_elementwise_executes_the_real_program() {
     for &kind in EW_KINDS {
         for (m, c) in [(1u32, 2048u32), (31u32, 2048u32)] {
-            // Skip the builder-only combinations (the LX-budget refusal, pinned by
-            // the golden above).
-            let live: u32 = if matches!(kind, EwKind::Silu) { 6 } else { 3 };
-            if m > 1 && u64::from(m) * u64::from(c) * u64::from(live) > 1024 * 1024 {
-                continue;
-            }
             execute_one_spliced_elementwise(m, c, kind);
         }
+        // ⭐ THE ROW-BLOCKED RUNG: `[350, 2048]` exceeds every family's live-tile
+        // budget — binary blk = `rows_per_block(2048, 3)` = 170 (2 blocks + a 10-row
+        // tail), silu blk = 85 (4 blocks + a 10-row tail) — so the emulator runs the
+        // BLOCKED spliced program and the host reference checks every row the tiles
+        // span, tail included.
+        execute_one_spliced_elementwise(350, 2048, kind);
     }
 }
 

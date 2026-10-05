@@ -115,15 +115,11 @@ fn ew_live_tiles(kind: EwKind) -> u32 {
     }
 }
 
-/// How many ROWS of a `cols`-wide region keep `live` tiles inside the LX.
-///
-/// ⛔ NOT ONE ROW. A row at a time is correct and fits trivially, but it emits `m` copies of every
-/// op, and a forward's cost is dominated by PER-OP work: at the m=96 prefill rung that put 3.7 s of
-/// a 5.6 s forward outside the GEMMs entirely. Blocking at the widest height that still fits is what
-/// keeps both the LX bound and the op count.
-fn rows_per_block(cols: u32, live: u32) -> u32 {
-    (EW_LX_ELEMS / live.max(1) / cols.max(1)).max(1)
-}
+/// How many ROWS of a `cols`-wide region keep `live` tiles inside the LX — the SHARED
+/// law, stated once in `ktir-superdsc::superdsc_opspec` beside the budget it divides
+/// (the Triton splice's pointwise constexprs read the same function, so the builder's
+/// programs and the spliced ones cannot disagree about a block height).
+pub(crate) use ktir_superdsc::superdsc_opspec::rows_per_block;
 
 /// `tr` narrowed to `h` rows starting `off` rows into its own region.
 fn sub_rows(tr: &TensorRegion, off: u32, h: u32) -> TensorRegion {

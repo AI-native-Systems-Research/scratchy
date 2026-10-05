@@ -373,68 +373,6 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             }
         }
     }
-    // ⛔ AN ELEMENTWISE NODE THE BUILDER WOULD ROW-BLOCK IS A SHAPE THE ONE-TILE KERNEL
-    // CANNOT SPELL. The builder's own arm blocked a whole-region lowering whose live
-    // set — `rows × cols × live_tiles`, the shared `EW_LX_ELEMS`-element budget from
-    // `ktir_superdsc::superdsc_opspec` — does not fit a core's 2 MB LX, emitting
-    // MULTIPLE row blocks inside ONE program. The budget is ONE FACT both sides read —
-    // a literal here would be a second copy that can drift.
-    if let SubOp::Elementwise(kind) = &node.op {
-        let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
-        let live: u32 = match kind {
-            EwKind::Silu => ktir_superdsc::superdsc_opspec::EW_SILU_LIVE_TILES,
-            _ => ktir_superdsc::superdsc_opspec::EW_BINARY_LIVE_TILES,
-        };
-        if rows > 1
-            && u64::from(rows) * u64::from(cols) * u64::from(live)
-                > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
-        {
-            return Err(format!(
-                "triton splice: {} t{} is a whole [{rows}, {cols}] region whose {live}-tile live \
-                 set exceeds the LX budget — its row-blocked kernel (multiple row blocks inside \
-                 one program) has not landed",
-                program_stem(node, &row),
-                node.output.tensor.index()
-            ));
-        }
-    }
-    // ⛔ AND SILU-MUL IS THE SAME LAW AT EIGHT LIVE TILES (`SILU_MUL_LIVE_TILES`).
-    // Granite 8b's `[31, 12800]` prefill silu-mul is exactly the region that
-    // overflows: the widest live set in the model (gate, up, neg, exp, the splat,
-    // denom, silu, y — EIGHT tiles). MEASURED: a one-tile program declares a
-    // whole-region view the emulator's allocation bounds-check refuses (`view
-    // [31, 12800] ... spans 793600 bytes but the tensor ... holds only 507904`).
-    if matches!(node.op, SubOp::SiluMul) {
-        let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
-        if rows > 1
-            && u64::from(rows)
-                * u64::from(cols)
-                * u64::from(ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES)
-                > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
-        {
-            return Err(format!(
-                "triton splice: silumul t{} is a whole [{rows}, {cols}] region whose \
-                 eight-tile live set exceeds the LX budget — its row-blocked kernel has not \
-                 landed",
-                node.output.tensor.index()
-            ));
-        }
-    }
-    // ⛛ THE SAME LAW FOR SCALARMUL (three live tiles: x, the splat, y — the builder's
-    // own `by_row` condition read `rows × cols × 3`).
-    if matches!(node.op, SubOp::ScalarMul { .. }) {
-        let (rows, cols) = (node.output.region.rows.len, node.output.region.cols.len);
-        if rows > 1
-            && u64::from(rows) * u64::from(cols) * 3 > ktir_superdsc::superdsc_opspec::EW_LX_ELEMS
-        {
-            return Err(format!(
-                "triton splice: scalarmul t{} is a whole [{rows}, {cols}] region whose \
-                 three-tile live set exceeds the LX budget — its row-blocked kernel has not \
-                 landed",
-                node.output.tensor.index()
-            ));
-        }
-    }
     // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS A SHAPE ONLY A KERNEL THAT
     // STATES ITS CORNER CAN SPELL. The measured instance was the front end's COLUMN
     // CHUNKING of a wide pointwise op (`n_blocks(out_cols, nb)`; production `nb =
@@ -724,12 +662,16 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // builder's `load_region`/`store_region` state it. A whole-region node
             // states `N_TOTAL = N`, `C_START = 0`.
             let (n_total, c_start) = window_of(node, ir)?;
+            let (block_m, n_blocks, tail_h) =
+                blocks_of(m, c, ktir_superdsc::superdsc_opspec::SILU_MUL_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
-            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
             ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
             ce("C_START", Val::Int(i128::from(c_start)))?;
+            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
+            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
         }
         (SubOp::Elementwise(EwKind::Silu | EwKind::Gelu), "silu_fwd" | "gelu_fwd") => {
             for p in ["desc_x", "desc_o"] {
@@ -744,12 +686,16 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             let (n_total, c_start) = window_of(node, ir)?;
+            let (block_m, n_blocks, tail_h) =
+                blocks_of(m, c, ktir_superdsc::superdsc_opspec::EW_SILU_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
-            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
             ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
             ce("C_START", Val::Int(i128::from(c_start)))?;
+            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
+            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
         }
         (SubOp::Elementwise(_), "add_fwd" | "mul_fwd" | "sub_fwd") => {
             // The kernel's own parameter spellings: desc_a, desc_b, desc_o for every
@@ -769,12 +715,16 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             let (n_total, c_start) = window_of(node, ir)?;
+            let (block_m, n_blocks, tail_h) =
+                blocks_of(m, c, ktir_superdsc::superdsc_opspec::EW_BINARY_LIVE_TILES);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
-            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
             ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
             ce("C_START", Val::Int(i128::from(c_start)))?;
+            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
+            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
         }
         (SubOp::ScalarMul { scale }, "scalarmul_fwd") => {
             for p in ["desc_x", "desc_o"] {
@@ -806,12 +756,15 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // the LOGICAL width because their door arms do — `check_pointwise_cols`
             // refuses a non-stick width rather than padding it.
             let c_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(c).get();
+            let (block_m, n_blocks, tail_h) = blocks_of(m, c_dev, 3);
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c_dev)))?;
-            ce("BLOCK_M", Val::Int(i128::from(m)))?;
+            ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c_dev)))?;
             ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
             ce("C_START", Val::Int(i128::from(c_start)))?;
+            ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
+            ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
             // THE SCALE, from the node's own payload. The consumer reads it OFF THE
             // PROGRAM (`program_scalarmul_scale`: one splat feeding every `arith.mulf`)
             // and looks the value up in `BundleLayout::scalarmul_scales`, the registry
@@ -907,6 +860,35 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
     }
     Ok((n_total, c_start))
+}
+
+/// THE ROW-BLOCK CONSTANTS the pointwise kernels take — the builder's own blocking
+/// law, stated from the node's own region: `BLOCK_M` is the SHARED `rows_per_block`
+/// (`EW_LX_ELEMS / live / cols` — one function both paths read, so the builder's
+/// programs and the spliced ones cannot disagree about a block height and emit
+/// windows that overlap or leave a gap), `N_BLOCKS` full blocks follow, and `TAIL_H`
+/// is the shorter last tile when the region does not divide evenly (the builder's
+/// `h = blk.min(rows - off)`).
+///
+/// A region that FITS the budget answers `(rows, 1, 0)` — ONE whole-region tile, the
+/// constants the one-tile form always implied, so nothing changes for decode (m=1)
+/// or any prefill rung inside the LX.
+///
+/// ⛔ THE `live` COUNT IS THE FAMILY'S OWN — `EW_SILU_LIVE_TILES` /
+/// `EW_BINARY_LIVE_TILES` / `SILU_MUL_LIVE_TILES` / 3 for scalarmul — read by the
+/// CALLER, because it is the same fact the builder's own `by_row` condition reads and
+/// a wrong count here would block at a different height than the builder and diverge
+/// the door's windows.
+fn blocks_of(rows: u32, cols: u32, live: u32) -> (u32, u32, u32) {
+    let blk = ktir_superdsc::superdsc_opspec::rows_per_block(cols, live);
+    if blk >= rows {
+        // The region FITS: one whole-region tile, the constants the one-tile form
+        // always stated (and the builder's un-blocked arm still states).
+        return (rows, 1, 0);
+    }
+    let n_blocks = rows / blk;
+    let tail = rows % blk;
+    (blk, n_blocks, tail)
 }
 
 /// The launch grid. The builder's programs are `(gx, gy) = (1, 1)` for every pointwise
