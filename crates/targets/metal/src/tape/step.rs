@@ -326,12 +326,36 @@ pub struct RowProgram {
 /// A row program's instruction; registers, inputs, outputs, gains and scalars by index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowInstr {
-    Load { dst: u8, input: u8 },
-    Add { dst: u8, a: u8, b: u8 },
-    Norm { dst: u8, a: u8, gain: u8, eps: Eps, offset: GainOffset },
-    ScaleWeight { dst: u8, a: u8, scalar: u8 },
-    Scale { dst: u8, a: u8, scale: Scale },
-    Store { output: u8, a: u8 },
+    Load {
+        dst: u8,
+        input: u8,
+    },
+    Add {
+        dst: u8,
+        a: u8,
+        b: u8,
+    },
+    Norm {
+        dst: u8,
+        a: u8,
+        gain: u8,
+        eps: Eps,
+        offset: GainOffset,
+    },
+    ScaleWeight {
+        dst: u8,
+        a: u8,
+        scalar: u8,
+    },
+    Scale {
+        dst: u8,
+        a: u8,
+        scale: Scale,
+    },
+    Store {
+        output: u8,
+        a: u8,
+    },
 }
 
 /// An MLX-affine matmul: `input · W` into `output`, `W` the layer's `n × k` weight packed `bits`

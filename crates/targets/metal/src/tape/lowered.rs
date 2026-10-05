@@ -1914,9 +1914,9 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: a one-row matvec fold in the {bucket_m}-row bucket"
             ),
-            Self::RowProgramWeight => {
-                f.write_str("lowering: a row program instruction reads a weight it has no layer for")
-            }
+            Self::RowProgramWeight => f.write_str(
+                "lowering: a row program instruction reads a weight it has no layer for",
+            ),
             Self::TooManyCommands(TooManyCommands { distinct }) => write!(
                 f,
                 "lowering: the tape lists {distinct} distinct commands, more than a command \

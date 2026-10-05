@@ -168,7 +168,16 @@ fn program(c: &Case) -> RowProgram {
         instrs,
         inputs: [slot(0), slot(1), slot(2), None],
         outputs: [slot(3), slot(4), slot(5)],
-        gains: [Some(LayerId(0)), Some(LayerId(0)), Some(LayerId(0)), None, None, None, None, None],
+        gains: [
+            Some(LayerId(0)),
+            Some(LayerId(0)),
+            Some(LayerId(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
         scalars: [Some(LayerId(0)), None],
         width: HiddenSize(c.width as u32),
     }
@@ -246,7 +255,11 @@ struct Inputs {
 
 fn inputs(c: &Case, rng: &mut Lcg) -> Inputs {
     let n = c.rows * c.width;
-    let mut row = |amp: f32| (0..n).map(|_| c.act.bits(amp * rng.unit())).collect::<Vec<_>>();
+    let mut row = |amp: f32| {
+        (0..n)
+            .map(|_| c.act.bits(amp * rng.unit()))
+            .collect::<Vec<_>>()
+    };
     let x = [row(3.0), row(40.0), row(8.0)];
     let mut gain = || {
         (0..c.width)
@@ -295,11 +308,26 @@ fn run(r: &Rig, c: &Case, i: &Inputs, fused: bool) -> [Vec<u16>; 3] {
         };
         let (each, per) = (size((n / 256, 1, 1)), size((256, 1, 1)));
         step(&r.norm, &[(&sum, 0), (&x[0], 1), (&g[0], 2)], rows, threads);
-        step(&r.norm, &[(&normed, 0), (&x[1], 1), (&g[1], 2)], rows, threads);
+        step(
+            &r.norm,
+            &[(&normed, 0), (&x[1], 1), (&g[1], 2)],
+            rows,
+            threads,
+        );
         step(&r.add, &[(&sum, 0), (&normed, 1)], each, per);
-        step(&r.norm, &[(&normed, 0), (&sum, 1), (&g[2], 2)], rows, threads);
+        step(
+            &r.norm,
+            &[(&normed, 0), (&sum, 1), (&g[2], 2)],
+            rows,
+            threads,
+        );
         step(&r.add, &[(&res, 0), (&normed, 1)], each, per);
-        step(&r.scale_weight, &[(&weighted, 0), (&res, 1), (&s, 2)], each, per);
+        step(
+            &r.scale_weight,
+            &[(&weighted, 0), (&res, 1), (&s, 2)],
+            each,
+            per,
+        );
         step(&r.scale, &[(&y, 0), (&weighted, 1)], each, per);
         [y, res, sum]
     };
@@ -353,7 +381,10 @@ fn exact(c: &Case, i: &Inputs, gains: [usize; 3]) -> Exact {
     let rms = |v: &[f64]| (v.iter().map(|e| e * e).sum::<f64>() / w as f64 + f64::from(EPS)).sqrt();
     let norm = |v: &[f64], g: &[f64]| {
         let r = rms(v);
-        v.iter().zip(g).map(|(e, g)| e / r * (g + o)).collect::<Vec<_>>()
+        v.iter()
+            .zip(g)
+            .map(|(e, g)| e / r * (g + o))
+            .collect::<Vec<_>>()
     };
     let mut rows: Exact = Default::default();
     for row in 0..c.rows {

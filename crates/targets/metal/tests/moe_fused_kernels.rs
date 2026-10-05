@@ -571,8 +571,13 @@ fn routed_matches_the_routing_command(
     let rows = GatherRows::Tokens(top_k);
     let mut gated_c = block.gate.constants(rows);
     gated_c.push(ConstantValue::int(ConstSlot(3), 1));
-    gated_c.extend(Vec::<ConstantValue>::from(RoutedConstants { experts, program }));
-    let gated = block.gate.pipeline(device, "affine_gather_qmv_gated", gated_c);
+    gated_c.extend(Vec::<ConstantValue>::from(RoutedConstants {
+        experts,
+        program,
+    }));
+    let gated = block
+        .gate
+        .pipeline(device, "affine_gather_qmv_gated", gated_c);
     let zeroed = |n: usize| common::shared_zeroed(device, n * 2);
     let (gate_y, up_y, down_y, out) = (
         zeroed(TOP_K * INTER),
@@ -596,7 +601,12 @@ fn routed_matches_the_routing_command(
         };
         let mut g = block.gate.bindings().to_vec();
         g.extend([(&block.x, 3), (i, 4), (gy, 5)]);
-        g.extend([(&block.up.w, 6), (&block.up.s, 7), (&block.up.b, 8), (uy, 9)]);
+        g.extend([
+            (&block.up.w, 6),
+            (&block.up.s, 7),
+            (&block.up.b, 8),
+            (uy, 9),
+        ]);
         let mut c = block.down.bindings().to_vec();
         c.extend([(gy, 3), (i, 4), (dy, 5), (sc, 6), (o, 7)]);
         let mut chain = Vec::new();
@@ -648,7 +658,12 @@ fn routed_matches_the_routing_command(
         return Err("the combined rows differ".into());
     }
     // Timed after the checks: the routing command's softmax runs in place.
-    Ok(time.then(|| (run(device, 300, 4, |_| chain(false)), run(device, 300, 4, |_| chain(true)))))
+    Ok(time.then(|| {
+        (
+            run(device, 300, 4, |_| chain(false)),
+            run(device, 300, 4, |_| chain(true)),
+        )
+    }))
 }
 
 #[test]

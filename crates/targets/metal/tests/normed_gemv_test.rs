@@ -139,7 +139,11 @@ fn rig(c: &Case) -> Option<Rig> {
         k: KDim(c.k as u32),
         eps: Eps(EPS),
     };
-    let normed = build("gemm", leak(format!("gemv_normed_{act}_s_{gain}")), normed.into());
+    let normed = build(
+        "gemm",
+        leak(format!("gemv_normed_{act}_s_{gain}")),
+        normed.into(),
+    );
     let dims = vec![
         ConstantValue::uint(0, 1),
         ConstantValue::uint(1, c.n as u32),
@@ -174,9 +178,13 @@ struct Inputs {
 }
 
 fn inputs(c: &Case, rng: &mut Lcg) -> Inputs {
-    let w = (0..c.n * c.k).map(|_| c.act.bits(0.05 * rng.unit())).collect();
+    let w = (0..c.n * c.k)
+        .map(|_| c.act.bits(0.05 * rng.unit()))
+        .collect();
     let x = (0..c.k).map(|_| c.act.bits(6.0 * rng.unit())).collect();
-    let gain = (0..c.k).map(|_| c.gain.bits(0.5 + rng.unit().abs())).collect();
+    let gain = (0..c.k)
+        .map(|_| c.gain.bits(0.5 + rng.unit().abs()))
+        .collect();
     Inputs { w, x, gain }
 }
 

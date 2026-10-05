@@ -1235,26 +1235,31 @@ impl Recording<'_> {
         let (mut gains, mut scalars) = (0usize, 0usize);
         for &m in &members {
             // Operand `k` of `m` in a register: a member's, else its row loaded once.
-            let mut operand = |k: u8, instrs: &mut Vec<R>, next: &mut u8| -> Result<u8, StepRefusal> {
-                if let InputRef::Op(a) = self.arg(m, k)?
-                    && let Some(&r) = reg_of.get(&a)
-                {
-                    return Ok(r);
-                }
-                let slot = self.read(m, k)?;
-                if let Some(&(_, r)) = loaded.iter().find(|(s, _)| *s == slot) {
-                    return Ok(r);
-                }
-                let input = u8::try_from(loaded.len()).map_err(|_| no())?;
-                *prog.inputs.get_mut(usize::from(input)).ok_or_else(no)? = Some(slot);
-                instrs.push(R::Load { dst: *next, input });
-                loaded.push((slot, *next));
-                *next += 1;
-                Ok(*next - 1)
-            };
+            let mut operand =
+                |k: u8, instrs: &mut Vec<R>, next: &mut u8| -> Result<u8, StepRefusal> {
+                    if let InputRef::Op(a) = self.arg(m, k)?
+                        && let Some(&r) = reg_of.get(&a)
+                    {
+                        return Ok(r);
+                    }
+                    let slot = self.read(m, k)?;
+                    if let Some(&(_, r)) = loaded.iter().find(|(s, _)| *s == slot) {
+                        return Ok(r);
+                    }
+                    let input = u8::try_from(loaded.len()).map_err(|_| no())?;
+                    *prog.inputs.get_mut(usize::from(input)).ok_or_else(no)? = Some(slot);
+                    instrs.push(R::Load { dst: *next, input });
+                    loaded.push((slot, *next));
+                    *next += 1;
+                    Ok(*next - 1)
+                };
             let a = operand(0, &mut instrs, &mut next)?;
             let add = matches!(self.op(m), SubOp::Elementwise(EwKind::Add));
-            let b = if add { operand(1, &mut instrs, &mut next)? } else { a };
+            let b = if add {
+                operand(1, &mut instrs, &mut next)?
+            } else {
+                a
+            };
             let dst = next;
             let instr = match *self.op(m) {
                 SubOp::Elementwise(EwKind::Add) => R::Add { dst, a, b },
@@ -1296,7 +1301,10 @@ impl Recording<'_> {
         let mut writes = Vec::new();
         for &m in &members {
             let written = m == i
-                || matches!(self.folds.role(self.steps.slot[m]), StepRole::Epilogue { .. });
+                || matches!(
+                    self.folds.role(self.steps.slot[m]),
+                    StepRole::Epilogue { .. }
+                );
             if !written {
                 continue;
             }
@@ -1316,7 +1324,12 @@ impl Recording<'_> {
             prog.instrs[k] = Some(instr);
         }
         let reads: Vec<Slot> = loaded.iter().map(|(s, _)| *s).collect();
-        Ok(em(MetalStep::RowProgram(Box::new(prog)), &reads, &writes, sites))
+        Ok(em(
+            MetalStep::RowProgram(Box::new(prog)),
+            &reads,
+            &writes,
+            sites,
+        ))
     }
 
     fn rope_fields(&self, i: usize) -> Result<(LayerId, RopeFormTag, AttnMask), StepRefusal> {

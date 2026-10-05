@@ -20,9 +20,9 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
-    HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, NDim, NDimI32,
-    NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TopK,
-    TqCodeBits,
+    HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, NDim,
+    NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK,
+    TopK, TqCodeBits,
 };
 use crate::tape::lowered::ActivationWidth;
 

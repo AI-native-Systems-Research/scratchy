@@ -798,8 +798,14 @@ impl<K: Copy> Folder<'_, K> {
     /// Every free row-wise step into row programs, from the tape's end ([`RowFold`]).
     fn row_programs(&mut self, rows: &RowFold<K>) {
         let n = self.ops.slot.len();
-        let reads = |c: usize, p: usize| self.ops.args[c].iter().any(|a| matches!(a, Arg::Op(q) if *q == p));
-        let readers: Vec<Vec<usize>> = (0..n).map(|p| (0..n).filter(|&c| reads(c, p)).collect()).collect();
+        let reads = |c: usize, p: usize| {
+            self.ops.args[c]
+                .iter()
+                .any(|a| matches!(a, Arg::Op(q) if *q == p))
+        };
+        let readers: Vec<Vec<usize>> = (0..n)
+            .map(|p| (0..n).filter(|&c| reads(c, p)).collect())
+            .collect();
         let result = self.ops.lowered.input.result;
         // A step reading a graph source that is not a weight (the embedded rows) stays on its
         // own: a target places that source's buffer itself.
@@ -861,7 +867,9 @@ impl<K: Copy> Folder<'_, K> {
                         && free(self, p)
                         && self.ops.cols[p] == self.ops.cols[d]
                         && self.ops.rows[p] == self.ops.rows[d]
-                        && readers[p].iter().all(|&c| group.contains(&c) || read_at[c] > at);
+                        && readers[p]
+                            .iter()
+                            .all(|&c| group.contains(&c) || read_at[c] > at);
                     if joins && group.len() < max {
                         group.push(p);
                         grew = true;
@@ -1045,7 +1053,11 @@ impl<K: Copy> Folder<'_, K> {
             return;
         }
         let n = ops.slot.len();
-        let reads = |c: usize, p: usize| ops.args[c].iter().any(|a| matches!(a, Arg::Op(q) if *q == p));
+        let reads = |c: usize, p: usize| {
+            ops.args[c]
+                .iter()
+                .any(|a| matches!(a, Arg::Op(q) if *q == p))
+        };
         // The routing's steps: `i`, the steps it absorbed, and its epilogues.
         let own = |j: usize| j == i || self.absorbed[j] == Some(i) || self.epilogue[j] == Some(i);
         let mut drivers = Vec::new();
@@ -1731,8 +1743,16 @@ mod tests {
         let router = RouterBundle::Gemma;
         let src = [(1, 64), (1, 64), (16, 64)];
         let ops = vec![
-            op(SubOp::RouterNorm { eps: 1e-6, router }, 1, vec![Ext(0), Ext(1)]),
-            op(SubOp::RouterLogits { experts, router }, 1, vec![Op(0), Ext(2)]),
+            op(
+                SubOp::RouterNorm { eps: 1e-6, router },
+                1,
+                vec![Ext(0), Ext(1)],
+            ),
+            op(
+                SubOp::RouterLogits { experts, router },
+                1,
+                vec![Op(0), Ext(2)],
+            ),
             op(SubOp::RouteArgsort, 1, vec![Op(1)]),
         ];
         let (s, f) = fold(&src, weights(3), ops.clone(), &[], &TABLE, ENDS);
@@ -1777,7 +1797,11 @@ mod tests {
         // Gemma's block: logits, the routing, then the experts reading its picks and scores.
         let ops = |scores_read_again: bool| {
             let mut v = vec![
-                op(SubOp::RouterLogits { experts, router }, 1, vec![Ext(0), Ext(1)]),
+                op(
+                    SubOp::RouterLogits { experts, router },
+                    1,
+                    vec![Ext(0), Ext(1)],
+                ),
                 op(SubOp::RouteArgsort, 1, vec![Op(0)]),
                 op(SubOp::RouteTopK { k }, 1, vec![Op(1)]),
                 op(SubOp::RouteGatherScores, 1, vec![Op(0), Op(2)]),
@@ -1785,7 +1809,13 @@ mod tests {
                 op(sort, 1, vec![Ext(0), Op(2)]),
                 matmul(gate, 32, vec![Op(5), Op(5), Ext(2)]),
                 matmul(up, 32, vec![Op(5), Op(5), Ext(2)]),
-                op(SubOp::ExpertGatedAct { act: GatedAct::Gelu }, 1, vec![Op(6), Op(7)]),
+                op(
+                    SubOp::ExpertGatedAct {
+                        act: GatedAct::Gelu,
+                    },
+                    1,
+                    vec![Op(6), Op(7)],
+                ),
                 matmul(down, 64, vec![Op(8), Op(5), Ext(2)]),
                 op(SubOp::ExpertUnsort, 1, vec![Op(9), Op(5)]),
                 op(combine, 1, vec![Op(10), Op(4)]),
@@ -1808,13 +1838,22 @@ mod tests {
         assert_eq!(f.role(s[8]), StepRole::Drives(&routed));
         assert!(matches!(
             f.role(s[11]),
-            StepRole::Drives(Fusion { kernel: Kern::ExpertCombined, .. })
+            StepRole::Drives(Fusion {
+                kernel: Kern::ExpertCombined,
+                ..
+            })
         ));
         assert_eq!(f.role(s[5]), StepRole::Kept);
         // Its scores read by a step no command took, or a model whose matvecs do not take their
         // ends: the routing is its own command.
         let route = |f: &TapeFolds<Kern>, s: &[SlotId]| {
-            matches!(f.role(s[2]), StepRole::Drives(Fusion { kernel: Kern::Route, .. }))
+            matches!(
+                f.role(s[2]),
+                StepRole::Drives(Fusion {
+                    kernel: Kern::Route,
+                    ..
+                })
+            )
         };
         let (s, f) = fold(&src, weights(3), ops(true), &[], &TABLE, ENDS);
         assert!(route(&f, &s));
@@ -1882,7 +1921,13 @@ mod tests {
         ];
         let (s, f) = fold(&src, weights(4), ops, &[], &ROWS, ROW_FACTS);
         assert_eq!(f.role(s[2]), StepRole::Absorbed { into: s[3] });
-        assert!(matches!(f.role(s[3]), StepRole::Drives(Fusion { kernel: Kern::Rows, .. })));
+        assert!(matches!(
+            f.role(s[3]),
+            StepRole::Drives(Fusion {
+                kernel: Kern::Rows,
+                ..
+            })
+        ));
         assert_eq!(f.role(s[5]), StepRole::Kept);
     }
 

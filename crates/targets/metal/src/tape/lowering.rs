@@ -5699,7 +5699,9 @@ fn normed_gemv_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype)
         (MetalDtype::Bf16, S::F16) => "gemv_normed_bf16_s_f16",
         (MetalDtype::F16, S::Bf16) => "gemv_normed_f16_s_bf16",
         (MetalDtype::Bf16, S::Bf16) => "gemv_normed_bf16_s_bf16",
-        (dt, sdt) => unreachable!("gemv_normed: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated"),
+        (dt, sdt) => {
+            unreachable!("gemv_normed: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated")
+        }
     }
 }
 
@@ -5710,7 +5712,9 @@ fn row_program_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype)
         (MetalDtype::Bf16, S::F16) => "row_program_bf16_s_f16",
         (MetalDtype::F16, S::Bf16) => "row_program_f16_s_bf16",
         (MetalDtype::Bf16, S::Bf16) => "row_program_bf16_s_bf16",
-        (dt, sdt) => unreachable!("row_program: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated"),
+        (dt, sdt) => {
+            unreachable!("row_program: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated")
+        }
     }
 }
 
@@ -6441,7 +6445,12 @@ fn lower_moe_step(
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
                     rows_of(&s, 1, rows),
-                    source(router()?, crate::op_abi::router_gate(b.router), layer(&l), 2),
+                    source(
+                        router()?,
+                        crate::op_abi::router_gate(b.router),
+                        layer(&l),
+                        2,
+                    ),
                     source(router()?, WeightTensor::GemmaRouterScale, layer(&l), 3),
                 ]),
                 gemm_dims: None,
@@ -6872,14 +6881,18 @@ fn lower_moe_step(
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
-            let mut constants: Vec<ConstantValue> = AffineGatedQmvConstants { qmv: gather, act }.into();
+            let mut constants: Vec<ConstantValue> =
+                AffineGatedQmvConstants { qmv: gather, act }.into();
             if let Some(program) = routed {
                 bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
                 if let Some(l) = program.expert_scale {
                     let scale = WeightTensor::GemmaPerExpertScale;
                     bindings.push(source(router()?, scale, layer(&l), 12));
                 }
-                constants.extend(Vec::from(RoutedConstants { experts: b.experts, program }));
+                constants.extend(Vec::from(RoutedConstants {
+                    experts: b.experts,
+                    program,
+                }));
             }
             commands.push(cmd(
                 kernel,
@@ -7147,7 +7160,10 @@ mod tests {
 
     /// `steps` as rows that always run.
     fn plain(steps: &[MetalStep]) -> Vec<StepRow> {
-        steps.iter().map(|s| StepRow::Step(s.clone(), None)).collect()
+        steps
+            .iter()
+            .map(|s| StepRow::Step(s.clone(), None))
+            .collect()
     }
 
     /// The tests' bake point: 8 arena slots, the test rotary tables, block capacity 128.
@@ -7516,7 +7532,8 @@ mod tests {
         let fp16 = |i: MetalStep| gated_steps(&lower_tq(&dense, plain(&[i]), 64));
         // A TurboQuant'd attention compresses its layer's writer's operands, so
         // its own commands are read off a tape that has the writer.
-        let own = |i: MetalStep| own_attention_steps(&lower_tq(&p, coded(global_writer.clone(), i), 64));
+        let own =
+            |i: MetalStep| own_attention_steps(&lower_tq(&p, coded(global_writer.clone(), i), 64));
         let prefill = lower_tq(
             &p,
             [
@@ -7969,7 +7986,11 @@ mod tests {
             attention(MetalStep::AttentionPrefillPaged, 0, NeoX),
             attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX),
         ] {
-            let tape = lower_tq(&p, coded(tq_writer(0, Causal, LLAMA_KV), attention.clone()), 64);
+            let tape = lower_tq(
+                &p,
+                coded(tq_writer(0, Causal, LLAMA_KV), attention.clone()),
+                64,
+            );
             let own: Vec<&GatedCommand> = tape
                 .commands
                 .iter()
