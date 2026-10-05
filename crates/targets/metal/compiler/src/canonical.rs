@@ -249,7 +249,7 @@ pub fn lower_canonical(
     // The one-row bucket's affine matvecs normalize their input and add into the residual.
     let model = ModelFoldFacts {
         fold_projections,
-        normed_matvecs: m == 1,
+        matvec_ends: m == 1,
     };
     let folds =
         fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model).map_err(CanonicalRefusal::Fold)?;

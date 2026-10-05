@@ -59,6 +59,12 @@ SCRATCHY_CONSTANT_OPTIONAL(bool, QMV_RESIDUAL, 10);
 constant constexpr bool QMV_NORMED = QMV_NORM_EPS_SET;
 constant constexpr float QMV_GAIN_OFFSET = QMV_NORM_W_OFFSET_SET ? QMV_NORM_W_OFFSET : 0.0f;
 constant constexpr bool QMV_ADDS = QMV_RESIDUAL_SET && QMV_RESIDUAL;
+// 11 / 12: the row's bias (buffer 16, added to the dot) and a scale (multiplying it after), before
+// any residual add.
+SCRATCHY_CONSTANT_OPTIONAL(bool, QMV_BIASED_FC, 11);
+SCRATCHY_CONSTANT_OPTIONAL(float, QMV_SCALE, 12);
+constant constexpr bool QMV_BIASED = QMV_BIASED_FC_SET && QMV_BIASED_FC;
+constant constexpr bool QMV_SCALED = QMV_SCALE_SET;
 
 // A lane's `count` input values as a normalizing matvec dots them: x ⊙ (gain + offset) into `xg`,
 // the squares of the first `valid` into `sum_sq`.
@@ -84,10 +90,12 @@ inline float qmv_row_scale(float total_sq, int count) {
   return QMV_NORMED ? 1.0f / sqrt(total_sq / float(count) + QMV_NORM_EPS) : 1.0f;
 }
 
-// Store a row's dot `r` at `*y` in the activation type — under QMV_ADDS added into the residual
-// already there first, so the sum takes the one rounding.
+// Store row `n`'s dot `r` at `*y` in the activation type, its bias added and its scale applied
+// first, then — under QMV_ADDS — added into the residual already there: the row takes one rounding.
 template <typename T_act, typename Y>
-inline void qmv_store(Y y, float r) {
+inline void qmv_store(Y y, float r, const device T_act* bias, int n) {
+  r = QMV_BIASED ? r + float(bias[n]) : r;
+  r = QMV_SCALED ? r * QMV_SCALE : r;
   *y = static_cast<T_act>(QMV_ADDS ? float(*y) + r : r);
 }
 
@@ -607,7 +615,8 @@ METAL_FUNC void qmv_quad_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
     uint quad_lid [[thread_index_in_quadgroup]],
-    const device T_scale* gain = nullptr) {
+    const device T_scale* gain = nullptr,
+    const device T_act* bias = nullptr) {
   constexpr int quads_per_simd = SIMD_SIZE / QUAD_SIZE;
   constexpr int pack_factor = 32 / bits;
   constexpr int values_per_thread = D / QUAD_SIZE;
@@ -659,7 +668,7 @@ METAL_FUNC void qmv_quad_impl(
   for (int row = 0; row < results_per_quadgroup; row++) {
     result[row] = quad_sum(result[row]) * scale;
     if (quad_lid == 0 && row * quads_per_simd + out_row < out_vec_size) {
-      qmv_store<T_act>(y + row * quads_per_simd, result[row]);
+      qmv_store<T_act>(y + row * quads_per_simd, result[row], bias, out_row + row * quads_per_simd);
     }
   }
 }
@@ -681,7 +690,8 @@ METAL_FUNC void qmv_fast_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
-    const device T_scale* gain = nullptr) {
+    const device T_scale* gain = nullptr,
+    const device T_act* bias = nullptr) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
@@ -743,7 +753,7 @@ METAL_FUNC void qmv_fast_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]) * scale;
     if (simd_lid == 0) {
-      qmv_store<T_act>(y + row, result[row]);
+      qmv_store<T_act>(y + row, result[row], bias, out_row + row);
     }
   }
 }
@@ -765,7 +775,8 @@ METAL_FUNC void qmv_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
-    const device T_scale* gain = nullptr) {
+    const device T_scale* gain = nullptr,
+    const device T_act* bias = nullptr) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int packs_per_thread = 1;
@@ -870,7 +881,7 @@ METAL_FUNC void qmv_impl(
          row++) {
       result[row] = simd_sum(result[row]) * scale;
       if (simd_lid == 0) {
-        qmv_store<T_act>(y + row, result[row]);
+        qmv_store<T_act>(y + row, result[row], bias, out_row + row);
       }
     }
   }
@@ -941,7 +952,7 @@ METAL_FUNC void qmv_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       result[row] = simd_sum(result[row]) * scale;
       if (simd_lid == 0 && (!QMV_ADDS || used_out_row + row >= out_row)) {
-        qmv_store<T_act>(y + row, result[row]);
+        qmv_store<T_act>(y + row, result[row], bias, used_out_row + row);
       }
     }
   }
@@ -971,6 +982,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
     const device T_scale* gain [[buffer(15)]],
+    const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
     uint quad_lid [[thread_index_in_quadgroup]]) {
@@ -1004,7 +1016,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
       tid,
       quad_gid,
       quad_lid,
-      gain);
+      gain,
+      bias);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1029,6 +1042,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
     const device T_scale* gain [[buffer(15)]],
+    const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1062,7 +1076,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
       tid,
       simd_gid,
       simd_lid,
-      gain);
+      gain,
+      bias);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1087,6 +1102,7 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
     const device T_scale* gain [[buffer(15)]],
+    const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1120,7 +1136,8 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
       tid,
       simd_gid,
       simd_lid,
-      gain);
+      gain,
+      bias);
 }
 
 // ─────────────────────────────────────────────────────────────────

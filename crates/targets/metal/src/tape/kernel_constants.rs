@@ -653,7 +653,8 @@ impl From<AffineQmvConstants> for Vec<ConstantValue> {
 }
 
 /// A one-row matvec's [`QmvEnds`](crate::tape::step::QmvEnds), compiled in: its norm's epsilon
-/// (slot 8) and gain offset (9), and whether its rows add into the residual (10).
+/// (slot 8) and gain offset (9), whether its rows add into the residual (10), take a bias (11), and
+/// their scale (12).
 impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
     fn from(e: crate::tape::step::QmvEnds) -> Self {
         let norm = e.norm.into_iter().flat_map(|n| {
@@ -662,8 +663,12 @@ impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
                 ConstantValue::float(ConstSlot(9), n.offset.0),
             ]
         });
-        let residual = e.residual.then(|| ConstantValue::boolean(ConstSlot(10), true));
-        norm.chain(residual).collect()
+        let residual = e
+            .residual
+            .then(|| ConstantValue::boolean(ConstSlot(10), true));
+        let bias = e.bias.map(|_| ConstantValue::boolean(ConstSlot(11), true));
+        let scale = e.scale.map(|s| ConstantValue::float(ConstSlot(12), s.0));
+        norm.chain(residual).chain(bias).chain(scale).collect()
     }
 }
 

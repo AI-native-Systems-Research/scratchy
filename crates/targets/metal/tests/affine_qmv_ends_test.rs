@@ -7,8 +7,9 @@
 //!   normed row's rounding: its output must be as close to the exact `W · rmsnorm(x)` as the
 //!   unfused `rmsnorm` then matvec is — and the plain matvec of the raw `x`, which the same bound
 //!   must reject, shows the bound sees a missing norm.
-//! - Adding into the residual must be the plain matvec's row added to the residual, to within the
-//!   row's own rounding: the sum takes one rounding where the unfused add's took the row's too.
+//! - The epilogue — the projection's bias, a scale, the residual add — must be the plain matvec's
+//!   row biased, scaled and added, to within the row's own rounding: the result takes one rounding
+//!   where the unfused steps each took one.
 //!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
@@ -28,7 +29,9 @@ use scratchy_target_metal::tape::quantized::{
     DequantDtype, QmvKernel, ScaleDtype, pick_qmv_kernel, qmv_dispatch_shape,
     qmv_kernel_static_name,
 };
-use scratchy_target_metal::tape::step::{Eps, GainOffset, GatedAct, QmvEnds, RowNorm};
+use scratchy_target_metal::tape::step::{
+    BiasStorage, Eps, GainOffset, GatedAct, QmvEnds, RowNorm, Scale,
+};
 
 type Device = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLDevice>>;
 type Buffer = objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>;
@@ -187,19 +190,34 @@ struct Rig {
     _cache: SpecializedPipelineCache,
     plain: scratchy_target_metal::specialized_pipeline_cache::ComputePipelineState,
     normed: scratchy_target_metal::specialized_pipeline_cache::ComputePipelineState,
-    adding: scratchy_target_metal::specialized_pipeline_cache::ComputePipelineState,
+    biased: scratchy_target_metal::specialized_pipeline_cache::ComputePipelineState,
+    ending: scratchy_target_metal::specialized_pipeline_cache::ComputePipelineState,
     norm: scratchy_target_metal::specialized_pipeline_cache::ComputePipelineState,
 }
 
 const EPS: f32 = 1e-5;
+const SCALE: f32 = 0.375;
 
-fn ends(c: &Case, norm: bool, residual: bool) -> QmvEnds {
-    let norm = norm.then_some(RowNorm {
+fn normed(c: &Case) -> QmvEnds {
+    let norm = Some(RowNorm {
         layer: LayerId(0),
         eps: Eps(EPS),
         offset: GainOffset(c.offset),
     });
-    QmvEnds { norm, residual }
+    QmvEnds {
+        norm,
+        ..QmvEnds::default()
+    }
+}
+
+/// The epilogue: the bias, and with `all` the scale and the residual add too.
+fn ending(all: bool) -> QmvEnds {
+    QmvEnds {
+        bias: Some(BiasStorage::Affine),
+        scale: all.then_some(Scale(SCALE)),
+        residual: all,
+        ..QmvEnds::default()
+    }
 }
 
 fn rig(c: &Case) -> Option<Rig> {
@@ -222,10 +240,11 @@ fn rig(c: &Case) -> Option<Rig> {
         v.extend(Vec::<ConstantValue>::from(e));
         baked_build(&cache, &PipelineKey::new("quantized_qmv", name, v)).expect(name)
     };
-    let (plain, normed, adding) = (
+    let (plain, normed, biased, ending) = (
         qmv(QmvEnds::default()),
-        qmv(ends(c, true, false)),
-        qmv(ends(c, false, true)),
+        qmv(normed(c)),
+        qmv(ending(false)),
+        qmv(ending(true)),
     );
     let tag = c.dtype.tag();
     let norm_name: &'static str =
@@ -246,7 +265,8 @@ fn rig(c: &Case) -> Option<Rig> {
         _cache: cache,
         plain,
         normed,
-        adding,
+        biased,
+        ending,
         norm,
     })
 }
@@ -271,17 +291,18 @@ fn exact(c: &Case, w: &Weights, x: &[u16], gain: &[u16]) -> Vec<(f64, f64)> {
     (0..c.n).map(|r| w.dot(c.k, r, &xn)).collect()
 }
 
-/// The matvec of case `c` over `x`: `pso` with the gain bound at 15 into a fresh row, or (`norm`)
-/// the RMSNorm first and the plain matvec over its row; `y0` is the output row's initial bits.
-fn matvec(
-    r: &Rig,
-    c: &Case,
-    w: &Weights,
-    x: &Buffer,
-    gain: &Buffer,
-    y0: &[u16],
-    how: How,
-) -> Vec<u16> {
+/// What a matvec reads besides its weights: the input row, the norm's gain (bound at 15) and the
+/// projection's bias (at 16).
+struct Rows<'a> {
+    x: &'a Buffer,
+    gain: &'a Buffer,
+    bias: &'a Buffer,
+}
+
+/// The matvec of case `c` over `rows`, or the RMSNorm first and the plain matvec over its row;
+/// `y0` is the output row's initial bits.
+fn matvec(r: &Rig, c: &Case, w: &Weights, rows: &Rows<'_>, y0: &[u16], how: How) -> Vec<u16> {
+    let Rows { x, gain, bias } = *rows;
     let y = shared(&r.device, y0);
     let normed_row = shared(&r.device, &vec![0u16; c.k]);
     let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
@@ -294,13 +315,15 @@ fn matvec(
             (input, 3),
             (&y, 4),
             (gain, 15),
+            (bias, 16),
         ];
         batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
     };
     match how {
         How::Plain => qmv(&mut batch, &r.plain, x),
         How::Normed => qmv(&mut batch, &r.normed, x),
-        How::Adding => qmv(&mut batch, &r.adding, x),
+        How::Biased => qmv(&mut batch, &r.biased, x),
+        How::Ending => qmv(&mut batch, &r.ending, x),
         How::NormThenPlain => {
             let binds = [(&normed_row, 0), (x, 1), (gain, 2)];
             let one = (1, 1, 1);
@@ -325,7 +348,8 @@ fn matvec(
 enum How {
     Plain,
     Normed,
-    Adding,
+    Biased,
+    Ending,
     NormThenPlain,
 }
 
@@ -388,7 +412,12 @@ fn a_normalizing_matvec_is_as_close_to_the_exact_normed_product_as_the_norm_then
         let want = exact(&c, &w, &x, &gain);
         let (xb, gb) = (shared(&r.device, &x), shared(&r.device, &gain));
         let zero = vec![0u16; c.n];
-        let run = |how| matvec(&r, &c, &w, &xb, &gb, &zero, how);
+        let rows = Rows {
+            x: &xb,
+            gain: &gb,
+            bias: &gb,
+        };
+        let run = |how| matvec(&r, &c, &w, &rows, &zero, how);
         within(&c, &run(How::NormThenPlain), &want)
             .unwrap_or_else(|e| panic!("{c:?}: the unfused norm then matvec: {e}"));
         within(&c, &run(How::Normed), &want)
@@ -401,30 +430,57 @@ fn a_normalizing_matvec_is_as_close_to_the_exact_normed_product_as_the_norm_then
 }
 
 #[test]
-fn an_adding_matvec_is_the_plain_matvec_added_into_the_residual() {
+fn an_ending_matvec_is_the_plain_matvec_biased_scaled_and_added() {
     for c in cases() {
         let Some(r) = rig(&c) else { return };
         let mut rng = Lcg(c.k as u64 * 13 + c.n as u64);
         let w = Weights::new(&r.device, &c, &mut rng);
         let (x, gain) = inputs(&c, &mut rng);
-        let residual: Vec<u16> = (0..c.n).map(|_| c.dtype.bits(8.0 * rng.unit())).collect();
-        let (xb, gb) = (shared(&r.device, &x), shared(&r.device, &gain));
-        let plain = matvec(&r, &c, &w, &xb, &gb, &vec![0u16; c.n], How::Plain);
-        let added = matvec(&r, &c, &w, &xb, &gb, &residual, How::Adding);
+        let bits = |n: usize, scale: f32, rng: &mut Lcg| -> Vec<u16> {
+            (0..n).map(|_| c.dtype.bits(scale * rng.unit())).collect()
+        };
+        let (residual, bias) = (bits(c.n, 8.0, &mut rng), bits(c.n, 0.5, &mut rng));
+        let (xb, gb, bb) = (
+            shared(&r.device, &x),
+            shared(&r.device, &gain),
+            shared(&r.device, &bias),
+        );
+        let rows = Rows {
+            x: &xb,
+            gain: &gb,
+            bias: &bb,
+        };
+        let run = |y0: &[u16], how| matvec(&r, &c, &w, &rows, y0, how);
+        let plain = run(&vec![0u16; c.n], How::Plain);
         let ulp = match c.dtype {
             Dtype::Bf16 => 2f32.powi(-8),
             Dtype::F16 => 2f32.powi(-11),
         };
-        for (i, ((&p, &res), &got)) in plain.iter().zip(&residual).zip(&added).enumerate() {
-            let (p, got) = (c.dtype.value(p), c.dtype.value(got));
-            let want = c.dtype.value(res) + p;
+        let value = |v: &[u16]| -> Vec<f32> { v.iter().map(|&b| c.dtype.value(b)).collect() };
+        let (p, res, b) = (value(&plain), value(&residual), value(&bias));
+        // Bias alone (a q/k/v projection's), then bias, scale and residual add (granite's o/down).
+        let biased = value(&run(&vec![0u16; c.n], How::Biased));
+        let ended = value(&run(&residual, How::Ending));
+        for i in 0..c.n {
+            let (want_b, scaled) = (p[i] + b[i], (p[i] + b[i]) * SCALE);
+            let want_e = res[i] + scaled;
+            let near = |got: f32, want: f32, row: f32| {
+                (got - want).abs() <= ulp * (row.abs() + want.abs())
+            };
             assert!(
-                (got - want).abs() <= ulp * (p.abs() + want.abs()),
-                "{c:?} row {i}: {got} vs {want}"
+                near(biased[i], want_b, p[i]),
+                "{c:?} biased row {i}: {} vs {want_b}",
+                biased[i]
+            );
+            assert!(
+                near(ended[i], want_e, scaled),
+                "{c:?} ended row {i}: {} vs {want_e}",
+                ended[i]
             );
         }
-        // The rows that cancel least keep the residual's scale: a missing add misses them all.
-        assert_ne!(plain, added, "{c:?}: the adding matvec did not add");
+        // Each end moves rows: a missing bias, scale or add would leave them where the plain are.
+        assert_ne!(value(&plain), biased, "{c:?}: the bias did not add");
+        assert_ne!(biased, ended, "{c:?}: the scale and add did not apply");
     }
 }
 
@@ -454,7 +510,7 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
         )
         .expect("gated")
     };
-    let (plain, normed) = (gated(QmvEnds::default()), gated(ends(&c, true, false)));
+    let (plain, normed) = (gated(QmvEnds::default()), gated(normed(&c)));
     let mut rng = Lcg(99);
     let (gate, up) = (
         Weights::new(&r.device, &c, &mut rng),

@@ -308,8 +308,9 @@ pub enum MetalFusion {
     KvEncoded,
     /// A one-row MLX-affine matvec that normalizes its input as it loads it.
     NormedQmv,
-    /// A one-row MLX-affine matvec whose rows add into the residual stream.
-    ResidualQmv,
+    /// A one-row MLX-affine matvec that adds its bias, scales its rows and adds them into the
+    /// residual stream as it stores them.
+    QmvEpilogue,
     /// `residual + rmsnorm(delta)`.
     NormAdd,
 }
@@ -339,13 +340,20 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     kernel: F::MeanSubRmsNorm,
                     biased: F::MeanSubRmsNormBiasAdd,
                 },
-                FoldPattern::NormedMatvecs {
-                    norm: K::RmsNorm,
-                    add: K::Add,
+                FoldPattern::MatvecEpilogue {
                     matmul: K::MatmulTile,
                     weights: GemmWeightKind::Affine,
-                    normed: F::NormedQmv,
-                    residual: F::ResidualQmv,
+                    bias: K::BiasAdd,
+                    scale: K::ScalarMul,
+                    add: K::Add,
+                    gated: &[K::Silu, K::Gelu, K::Mul],
+                    kernel: F::QmvEpilogue,
+                },
+                FoldPattern::NormedMatvecs {
+                    norm: K::RmsNorm,
+                    matmul: K::MatmulTile,
+                    weights: GemmWeightKind::Affine,
+                    kernel: F::NormedQmv,
                 },
                 FoldPattern::ResidualNorm {
                     norm: K::RmsNorm,

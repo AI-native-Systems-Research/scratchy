@@ -232,7 +232,15 @@ fn sample_rows(
             let ix = w.of(WeightKind::Linear, 0)?;
             let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
             sampled(affine_qmv_command(
-                p, &g, 1, x, g.layer, ix, codes, /*wide_ok=*/ false, None,
+                p,
+                &g,
+                1,
+                x,
+                g.layer,
+                ix,
+                codes,
+                /*wide_ok=*/ false,
+                Vec::new(),
             ))
         }
         (true, R::Scatter) => sampled(scatter_first_to_last_row_command(p, g.output, g.n.get())),
@@ -271,7 +279,7 @@ fn affine_qmv_command(
     ix: SourceIx,
     codes: super::kernel_constants::AffineCodes,
     wide_ok: bool,
-    gain: Option<Binding>,
+    end_weights: Vec<Binding>,
 ) -> LoweredCommand {
     let (n, k, bits) = (g.n.get(), g.k.get(), g.bits.get());
     // The small-M band (MLX `qmv_wide`, gen-15+): weight groups are
@@ -330,7 +338,7 @@ fn affine_qmv_command(
     let (dtype, scale_dtype) = (dequant_dtype_for(p), scale_dtype_for(p));
     let (x, y) = (g.input.get(), g.output.get());
     let mut bindings = affine_qmm_bindings(x, y, layer, ix);
-    bindings.extend(gain);
+    bindings.extend(end_weights);
     // The wide kernel's grid is exact for the bucket (nv covers rows)
     // and over-dispatch is safe — the kernel clamps every row index
     // against the baked M — so it takes no m_scaling. The others take
@@ -359,19 +367,28 @@ fn affine_qmv_command(
     }
 }
 
-/// A matvec's folded norm's gain ([`QmvEnds::norm`]), bound at 15: its site's `RmsNorm` weight at
-/// the norm's own layer.
-fn norm_gain(
+/// The weights a matvec's ends read ([`QmvEnds`]): its folded norm's gain at 15 — its site's
+/// `RmsNorm` weight at the norm's own layer — and its projection's bias at 16.
+fn qmv_end_weights(
     g: &AffineMatmul,
     w: RowSources<'_>,
     layer_offset: u32,
-) -> Result<Option<Binding>, LoweringError> {
-    let Some(norm) = g.ends.norm else {
-        return Ok(None);
-    };
-    let layer = super::ids::LayerId(norm.layer.get() + layer_offset);
-    let ix = w.of(WeightKind::RmsNorm, 0)?;
-    Ok(Some(source(ix, WeightTensor::Weight, layer, 15)))
+) -> Result<Vec<Binding>, LoweringError> {
+    let mut v = Vec::new();
+    if let Some(norm) = g.ends.norm {
+        let layer = super::ids::LayerId(norm.layer.get() + layer_offset);
+        let ix = w.of(WeightKind::RmsNorm, 0)?;
+        v.push(source(ix, WeightTensor::Weight, layer, 15));
+    }
+    if let Some(storage) = g.ends.bias {
+        let which = match storage {
+            BiasStorage::Affine => WeightTensor::AffineLinearBias,
+            BiasStorage::Dense => WeightTensor::Bias,
+        };
+        let layer = super::ids::LayerId(g.layer.get() + layer_offset);
+        v.push(source(w.of(WeightKind::Linear, 0)?, which, layer, 16));
+    }
+    Ok(v)
 }
 
 /// The sampled rows' gather and scatter kernels, each with its f16 and bf16 symbols.
@@ -1897,7 +1914,7 @@ fn lower_one(
                     w.of(WeightKind::Linear, 0)?,
                     codes,
                     wide_ok,
-                    norm_gain(g, w, layer_offset)?,
+                    qmv_end_weights(g, w, layer_offset)?,
                 )
             } else if g.ends != QmvEnds::default() {
                 return Err(LoweringError::GatedMatvecRows { bucket_m });
@@ -2649,7 +2666,7 @@ fn lower_one(
                 layer,
                 w.of(WeightKind::Linear, 0)?,
             );
-            bindings.extend(norm_gain(g, w, layer_offset)?);
+            bindings.extend(qmv_end_weights(g, w, layer_offset)?);
             let up = affine_weight_bindings(w.of(WeightKind::Linear, 1)?, layer);
             bindings.extend(up.map(|b| match b {
                 Binding::Source {

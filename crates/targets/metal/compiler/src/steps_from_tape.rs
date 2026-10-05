@@ -1128,7 +1128,7 @@ impl Recording<'_> {
                 self.moe(i, MoeStep::Route(program), &[], &[], weight)
             }
             (F::NormedQmv, Sh::NormedMatvec { .. })
-            | (F::ResidualQmv, Sh::ResidualMatvec { .. }) => {
+            | (F::QmvEpilogue, Sh::MatvecEpilogue { .. }) => {
                 let kept = self.kept(i)?;
                 kept.ok_or_else(|| self.no(i, Refused::FusionShape))
             }
@@ -1317,11 +1317,25 @@ impl Recording<'_> {
                     ends.norm = Some(st::RowNorm { layer, eps, offset });
                     site.extend(self.site(nrm, WeightKind::RmsNorm, self.weight_of(nrm)?)?);
                 }
-                FusedShape::ResidualMatvec { add } => {
-                    let a = self.op_at(mm, add)?;
-                    out = self.colour(a)?;
-                    reads.push(self.read(a, 1)?);
-                    ends.residual = true;
+                FusedShape::MatvecEpilogue { bias, scale, add } => {
+                    ends.bias = bias.map(|_| match weight {
+                        GemmWeight::Affine { .. } => st::BiasStorage::Affine,
+                        GemmWeight::Dense | GemmWeight::Fp8Dynamic => st::BiasStorage::Dense,
+                    });
+                    if let Some(sc) = scale {
+                        let SubOp::ScalarMul { scale } = *self.op(self.op_at(mm, sc)?) else {
+                            return Err(self.no(mm, Refused::FusionShape));
+                        };
+                        ends.scale = Some(st::Scale(scale));
+                    }
+                    // The command writes the chain's last buffer: the add's, over the residual.
+                    let last = add.map(|(a, _)| a).or(scale).or(bias);
+                    let last = last.ok_or_else(|| self.no(mm, Refused::FusionShape))?;
+                    out = self.colour(self.op_at(mm, last)?)?;
+                    if let Some((_, residual)) = add {
+                        reads.push(self.read_operand(mm, residual)?);
+                        ends.residual = true;
+                    }
                 }
                 _ => {}
             }

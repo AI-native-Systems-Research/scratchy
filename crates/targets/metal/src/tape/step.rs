@@ -318,11 +318,14 @@ pub struct AffineMatmul {
 }
 
 /// What a one-row MLX-affine matvec does around its dot: normalize its input as it loads it
-/// (`MetalFusion::NormedQmv` — the input is the norm's, the gain its site's `RmsNorm`), and add
-/// its rows into the residual stream its output holds (`MetalFusion::ResidualQmv`).
+/// (`MetalFusion::NormedQmv` — the input is the norm's, the gain its site's `RmsNorm`); then
+/// (`MetalFusion::QmvEpilogue`) add its projection's bias, scale the row, and add it into the
+/// residual stream its output holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QmvEnds {
     pub norm: Option<RowNorm>,
+    pub bias: Option<BiasStorage>,
+    pub scale: Option<Scale>,
     pub residual: bool,
 }
 

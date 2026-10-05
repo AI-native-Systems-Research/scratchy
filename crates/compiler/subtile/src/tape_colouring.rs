@@ -18,6 +18,8 @@
 //!   smallest first;
 //! - the inputs of a step that reads ACROSS its input stay live through that step;
 //! - a step a fold absorbed reads its operands where its driver's fused command runs;
+//! - a step a fold computes in an EARLIER step's command — its epilogue, or absorbed into it — is
+//!   written there: its colour is taken at that step, free of everything live then;
 //! - the result's colour is never reused;
 //! - a two-output step's second buffer gets its own colour, never reused;
 //! - the finished colouring is checked: two non-aliased holders of one colour must be live at
@@ -199,6 +201,8 @@ pub struct ColourFacts {
 pub struct FoldFacts {
     /// `absorbed[a] = w`: step `a` is computed inside step `w`'s fused command.
     pub absorbed: BTreeMap<SlotId, SlotId>,
+    /// `epilogue[e] = w`: step `e`'s buffer is written by step `w`'s fused command.
+    pub epilogue: BTreeMap<SlotId, SlotId>,
     /// Steps leading a normed-rope fold; with every step absorbed into them, one group each.
     pub normed_rope: BTreeSet<SlotId>,
 }
@@ -484,13 +488,30 @@ pub fn colour_tape(
         });
     }
 
+    // Where each step's buffer is first written: its own position, or the earlier command a fold
+    // computes it in.
+    let mut def_at: Vec<usize> = (0..n).collect();
+    for (e, w) in &folds.epilogue {
+        let (e, w) = (at(e)?, at(w)?);
+        def_at[e] = def_at[e].min(w);
+    }
+    for (p, w) in absorbed_into.iter().enumerate() {
+        if let Some(w) = *w {
+            def_at[p] = def_at[p].min(w);
+        }
+    }
+    let mut defined_at: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for p in (0..n).filter(|p| !off(*p)) {
+        defined_at[def_at[p]].push(p);
+    }
+
     // Linear scan.
     let mut active: Vec<(usize, Colour, usize)> = Vec::new(); // (last use, colour, owner)
     let mut free_by_shape: HashMap<(u32, u32), BTreeSet<Colour>> = HashMap::new();
     let mut colour_shape: HashMap<Colour, (u32, u32)> = HashMap::new();
     let mut colour: Vec<Option<Colour>> = vec![None; n];
     let mut next = Colour::ZERO.0 + 1;
-    for p in (0..n).filter(|p| !off(*p)) {
+    for p in 0..n {
         let held: HashSet<usize> = match steps[p].rule.reads {
             Reads::Across => steps[p]
                 .operands
@@ -511,29 +532,31 @@ pub fn colour_tape(
             }
         });
 
-        if pinned[owner[p]] || pinned[p] {
-            colour[p] = Some(Colour::ZERO);
-            continue;
-        }
-        if alias_of[p].is_some() {
-            colour[p] = Some(colour[owner[p]].ok_or(ColourError::AliasUncoloured {
-                step: pos(p),
-                op: name(p),
-            })?);
-            continue;
-        }
-        let shape = steps[p].shape;
-        let c = match free_by_shape.entry(shape).or_default().pop_first() {
-            Some(c) => c,
-            None => {
-                let c = Colour(next);
-                next += 1;
-                colour_shape.insert(c, shape);
-                c
+        for &q in &defined_at[p] {
+            if pinned[owner[q]] || pinned[q] {
+                colour[q] = Some(Colour::ZERO);
+                continue;
             }
-        };
-        colour[p] = Some(c);
-        active.push((last_use[p], c, p));
+            if alias_of[q].is_some() {
+                colour[q] = Some(colour[owner[q]].ok_or(ColourError::AliasUncoloured {
+                    step: pos(q),
+                    op: name(q),
+                })?);
+                continue;
+            }
+            let shape = steps[q].shape;
+            let c = match free_by_shape.entry(shape).or_default().pop_first() {
+                Some(c) => c,
+                None => {
+                    let c = Colour(next);
+                    next += 1;
+                    colour_shape.insert(c, shape);
+                    c
+                }
+            };
+            colour[q] = Some(c);
+            active.push((last_use[q], c, q));
+        }
     }
 
     // The invariant the arena rests on, checked on the FINISHED colouring: two values may share a
@@ -547,7 +570,10 @@ pub fn colour_tape(
         if let Some(c) = colour[p]
             && c != Colour::ZERO
         {
-            by_colour.entry(c).or_default().push((p, last_use[p]));
+            by_colour
+                .entry(c)
+                .or_default()
+                .push((def_at[p], last_use[p]));
         }
     }
     if let Some((c, (a, a_last), (b, b_last))) = first_overlap(by_colour) {
@@ -834,6 +860,30 @@ mod tests {
             ..FoldFacts::default()
         };
         let (c, _) = colour(&src, weights(2), ops(), absorbed).unwrap();
+        assert_ne!(c[2], c[0]);
+    }
+
+    /// An epilogue is written by its driver's command, so its colour is taken there: never the
+    /// colour of a value the driver still reads, though the epilogue's own step comes after it.
+    #[test]
+    fn an_epilogue_takes_its_colour_where_its_driver_writes_it() {
+        let ops = || {
+            vec![
+                gemm(64, vec![Ext(0), Ext(1)]),
+                gemm(64, vec![Op(0), Ext(1)]),
+                op(SubOp::Elementwise(EwKind::BiasAdd), 1, vec![Op(1), Ext(2)]),
+            ]
+        };
+        let src = [(1, 64), (64, 64), (1, 64)];
+        // Unfused, op 0's last reader is op 1, so op 2 takes its colour.
+        let (c, _) = colour(&src, weights(3), ops(), no_folds).unwrap();
+        assert_eq!(c[2], c[0]);
+        // Op 1's command writes op 2's buffer while it reads op 0.
+        let epilogue = |s: &[SlotId]| FoldFacts {
+            epilogue: [(s[2], s[1])].into(),
+            ..FoldFacts::default()
+        };
+        let (c, _) = colour(&src, weights(3), ops(), epilogue).unwrap();
         assert_ne!(c[2], c[0]);
     }
 
