@@ -134,6 +134,10 @@ pub struct RuntimeBindings {
     /// overwritten per forward. 16-byte placeholder on non-vision arches
     /// and on towers without a learned positional embedding.
     pub vision_pos_embeds: Buffer,
+    /// `[num_tokens, hidden]` model-dtype — a target model's final hidden states, what an MTP
+    /// head reads. Shared storage; overwritten per forward. 16-byte placeholder on every arch
+    /// but an MTP head.
+    pub target_hidden: Buffer,
     /// `[max_m, hidden]` model-dtype — projected vision embeddings for
     /// the multimodal splice. Shared storage; overwritten per forward
     /// (text-only batches leave it untouched). 16-byte placeholder on
@@ -325,6 +329,7 @@ impl RuntimeBindings {
             RuntimeBindingKind::VisionRopeFreqs => &self.vision_rope_freqs,
             RuntimeBindingKind::Pixels => &self.pixels,
             RuntimeBindingKind::VisionPosEmbeds => &self.vision_pos_embeds,
+            RuntimeBindingKind::TargetHidden => &self.target_hidden,
             RuntimeBindingKind::MmEmbeds => &self.mm_embeds,
             RuntimeBindingKind::MmDstRows => &self.mm_dst_rows,
             RuntimeBindingKind::MropeCosSin => &self.mrope_cos_sin,

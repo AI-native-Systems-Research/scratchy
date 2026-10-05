@@ -19,6 +19,7 @@
 use crate::tape::ids::ArenaSlotIdx as Slot;
 use crate::tape::ids::SourceIx;
 use crate::tape::kernel_bindings::{CosSinTable, source};
+use crate::tape::kernel_constants::QueryRows;
 use crate::tape::model_consts::MetalModelConsts;
 use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
@@ -249,7 +250,12 @@ fn sample_rows(
                 Vec::new(),
             ))
         }
-        (true, R::Scatter) => sampled(scatter_first_to_last_row_command(p, g.output, g.n.get())),
+        // The logits onto the sampled rows, and the gathered activation put back.
+        (true, R::Scatter) => [(g.output, g.n.get()), (g.input, g.k.get())]
+            .map(|(slot, width)| scatter_first_to_last_row_command(p, slot, width))
+            .into_iter()
+            .flat_map(sampled)
+            .collect(),
         (true, R::AllRows) => plain
             .into_iter()
             .map(|c| GatedCommand::gated(c.command, OnlyIfSpec))
@@ -413,7 +419,7 @@ const SCATTER: (KernelId, [&str; 2]) = (
     ],
 );
 
-/// The lm_head slice's input: each sequence's last row of `slot` moved to row `i`, in place.
+/// The lm_head slice's input: each sequence's last row of `slot` swapped into row `i`, in place.
 pub(crate) fn gather_last_token_command(
     p: &MetalModelConsts,
     slot: Slot,
@@ -422,7 +428,7 @@ pub(crate) fn gather_last_token_command(
     sample_slice_command(p, slot, hidden_size, GATHER)
 }
 
-/// The lm_head slice's output: row `i` of `slot` moved back to sequence `i`'s last row, in place.
+/// The gather undone over `slot`, in place: row `i` swapped back to sequence `i`'s last row.
 pub(crate) fn scatter_first_to_last_row_command(
     p: &MetalModelConsts,
     slot: Slot,
@@ -1584,6 +1590,38 @@ fn lower_one(
     // offsets; the read keeps it from reading as unused here.
     let _ = &moe_scratch_bytes;
     use MetalStep as I;
+
+    // A verify-sized bucket's paged attention is the decode kernel's, one query row per token: its
+    // few rows each read the whole context, which the paged prefill kernel walks with a handful of
+    // threadgroups where the decode kernel splits the keys.
+    if bucket_m <= crate::op_abi::METAL_VERIFY_ROWS {
+        let decode = match inst {
+            I::AttentionPrefillPaged(q, out, layer, pairing) => {
+                Some(I::AttentionViaCache(*q, *out, *layer, *pairing))
+            }
+            I::SlidingAttentionPrefillPaged(q, out, layer, pairing) => {
+                Some(I::SlidingAttentionViaCache(*q, *out, *layer, *pairing))
+            }
+            _ => None,
+        };
+        if let Some(decode) = decode {
+            return lower_one(
+                p,
+                chunked,
+                &decode,
+                w,
+                bucket_m,
+                layer_offset,
+                splitk_scratch_bytes,
+                moe_scratch_bytes,
+                roped_k_scratch_bytes,
+                attn_unfused_scratch_bytes,
+                block_cap,
+                profile,
+                m_divisor,
+            );
+        }
+    }
 
     let cmd = match inst {
         // ── A one-row decode attention running its KV writer ──
@@ -3312,6 +3350,7 @@ fn lower_one(
                         ror_on,
                         p.global_head_dim,
                     ),
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -3331,6 +3370,7 @@ fn lower_one(
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 gemm_dims: None,
@@ -4130,6 +4170,7 @@ fn lower_one(
                     pair_off: ror_po,
                     rope_on_read: ror_on,
                     pair_coresident: pair_coresident_param(ror_rd, ror_po, ror_on, p.head_dim),
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 dispatch: DispatchShape {
@@ -4146,6 +4187,7 @@ fn lower_one(
                     q: super::ids::ArenaSlotIdx(*q_slot),
                     kv_layer: super::ids::LayerId(*layer + layer_offset),
                     rope_on_read: w.rotary(ror_bind)?,
+                    query_rows: QueryRows::for_bucket(bucket_m),
                 }
                 .into_baked(),
                 gemm_dims: None,
@@ -5157,24 +5199,20 @@ fn lower_one(
             }
         }
 
-        // ── Vision pixels materialization (Qwen3.5-VL ViT prelude) ──
+        // ── Row concatenation: out[t] = a[t] ++ b[t] ───────────────
         //
-        // Faithful to the cuda `Instruction::LoadPixels` eval (a D2D
-        // copy of `ForwardCtx::pixels` into a fresh tile). Here the
-        // pixels live in the `Pixels` runtime extern (overwritten per
-        // forward); `copy_rows` blits them into the arena `out_slot` the
-        // patch_embed GEMM reads. `n` = bucket-level pixel count
-        // `eff_m * VISION_IN_FEATURES` (LoadPixels is the prelude op, so
-        // eff_m == bucket_m); m_scaling shrinks the grid to live
-        // num_tokens and the kernel's `gid >= n` guard caps the tail.
-        I::LoadPixels(Slot(out_slot)) => {
-            let n_elems = eff_m * p.vision_in_features as u32;
+        // An MTP head's input fusion. One thread per output element over `eff_m * 2 * width`;
+        // m_scaling shrinks the grid to live num_tokens and the kernel's `gid >= n` guard caps
+        // the tail.
+        I::Concat(Slot(a_slot), Slot(b_slot), Slot(out_slot), width) => {
+            let n_elems = eff_m * 2 * width.get();
             LoweredCommand {
-                kernel: KernelId::VisionLoadPixels,
+                kernel: KernelId::ConcatRows,
                 library: "elementwise",
-                function: copy_rows_static_name(p.metal_dtype),
-                constants: super::kernel_constants::CopyRowsConstants {
+                function: concat_rows_static_name(p.metal_dtype),
+                constants: super::kernel_constants::ConcatRowsConstants {
                     elements: super::ids::ElementCount(n_elems),
+                    width: *width,
                 }
                 .into_baked(),
                 dispatch: {
@@ -5191,30 +5229,39 @@ fn lower_one(
                         slot: *out_slot,
                         binding_index: 0,
                     },
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::Pixels,
+                    Binding::ArenaSlot {
+                        slot: *a_slot,
                         binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *b_slot,
+                        binding_index: 2,
                     },
                 ]),
                 gemm_dims: None,
             }
         }
 
-        // ── Vision pos_embeds materialization (Qwen3.5-VL ViT) ──────
+        // ── Host-staged rows materialization ──────────────────────
         //
-        // The exact sibling of the `LoadPixels` arm above: `copy_rows`
-        // blits the host-interpolated learned positional embedding from
-        // the `VisionPosEmbeds` runtime extern into the arena `out_slot`
-        // that the downstream `add(pos_embeds, hidden_states)` consumes.
-        // `n` = `eff_m * VISION_Q_SIZE` — VISION_Q_SIZE (=
-        // vision_num_heads * vision_head_dim) is the residual-stream
-        // width (= vision_embed_dim), matching the patch_embed output
-        // pos_embeds is added to. m_scaling shrinks the grid to live
-        // num_tokens; the kernel's `gid >= n` guard caps the tail.
-        I::LoadPosEmbeds(Slot(out_slot)) => {
-            let n_elems = eff_m * p.vision_q_size as u32;
+        // Faithful to the cuda `Instruction::LoadRows` eval (a D2D copy of the source's
+        // `ForwardCtx` view into a fresh tile). Here the rows live in the source's runtime
+        // extern (overwritten per forward); `copy_rows` blits them into the arena `out_slot`
+        // the first consumer reads. `n` = `eff_m * width` (LoadRows is a prelude op, so
+        // eff_m == bucket_m); m_scaling shrinks the grid to live num_tokens and the kernel's
+        // `gid >= n` guard caps the tail.
+        I::LoadRows(Slot(out_slot), source) => {
+            use scratchy_ir::RowsExtern;
+            let (width, kind) = match source {
+                RowsExtern::Pixels => (p.vision_in_features, RuntimeBindingKind::Pixels),
+                // VISION_Q_SIZE (= vision_num_heads * vision_head_dim) is the residual-stream
+                // width the interpolated positional embedding is added to.
+                RowsExtern::PosEmbeds => (p.vision_q_size, RuntimeBindingKind::VisionPosEmbeds),
+                RowsExtern::TargetHidden => (p.hidden_size, RuntimeBindingKind::TargetHidden),
+            };
+            let n_elems = eff_m * width as u32;
             LoweredCommand {
-                kernel: KernelId::VisionLoadPixels,
+                kernel: KernelId::LoadRows,
                 library: "elementwise",
                 function: copy_rows_static_name(p.metal_dtype),
                 constants: super::kernel_constants::CopyRowsConstants {
@@ -5236,7 +5283,7 @@ fn lower_one(
                         binding_index: 0,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::VisionPosEmbeds,
+                        kind,
                         binding_index: 1,
                     },
                 ]),
@@ -5930,12 +5977,21 @@ fn vision_varlen_attn_static_name(dtype: MetalDtype) -> &'static str {
     }
 }
 
-/// `elementwise.metal` `copy_rows` host-name picker (LoadPixels blit).
+/// `elementwise.metal` `copy_rows` host-name picker (LoadRows blit).
 fn copy_rows_static_name(dtype: MetalDtype) -> &'static str {
     match dtype {
         MetalDtype::F16 => "copy_rows_f16",
         MetalDtype::Bf16 => "copy_rows_bf16",
         MetalDtype::Int4 => panic!("copy_rows: Int4 unsupported (pixels are bf16/f16)"),
+    }
+}
+
+/// `elementwise.metal` `concat_rows` host-name picker (row concatenation).
+fn concat_rows_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "concat_rows_f16",
+        MetalDtype::Bf16 => "concat_rows_bf16",
+        MetalDtype::Int4 => panic!("concat_rows: Int4 unsupported (activations are bf16/f16)"),
     }
 }
 
@@ -6701,8 +6757,9 @@ fn lower_moe_step(
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
     use super::kernel_constants::{
         AffineCombineQmvConstants, AffineGatedQmvConstants, AffineGatherQmvConstants,
-        AffineQmvConstants, ArgsortConstants, GatherRows, MoeRouteConstants, MoeTopKConstants,
-        RoutedConstants, ScoresRow, SoftmaxConstants,
+        AffineQmvConstants, ArgsortConstants, GatedGatherQmvConstants, GatherRows,
+        MoeRouteConstants, MoeTopKConstants, RoutedConstants, ScoresRow, SharedExperts,
+        SoftmaxConstants,
     };
     use crate::tape::lowered::{MScaleAxis as A, MScaling};
     use ConstantValue as C;
@@ -7300,19 +7357,27 @@ fn lower_moe_step(
             bindings.extend(expert_weights(ExpertProj::Up, gate.layer, 6)?);
             bindings.push(s.at(9, R::ExpertUp));
             bindings.extend(gain);
-            // Full static grid when sorted — a short step's live pairs sit past the m-scaled
-            // edge, on rows the init sentinel-filled.
+            // Pairs along X. Gathered: the live pairs exactly — a verify bucket runs an expert's
+            // pairs in its first pair's threadgroup, scanning the live ones. Sorted: the full
+            // static grid — a short step's live pairs sit past the m-scaled edge, on rows the init
+            // sentinel-filled.
             let scaling = match s.grouping {
-                MoeGrouping::Gathered => ms(A::Z),
+                MoeGrouping::Gathered => ms(A::X),
                 MoeGrouping::Sorted | MoeGrouping::Grouped => None,
             };
-            let shape = grid((1, inter.div_ceil(8), pairs), (32, 4, 1), scaling);
+            let shape = grid((pairs, inter.div_ceil(8), 1), (32, 4, 1), scaling);
             let gather = AffineGatherQmvConstants {
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
-            let mut constants: Vec<ConstantValue> =
-                AffineGatedQmvConstants { qmv: gather, act }.into();
+            // A sorted bake's same-expert pairs are adjacent already, their repeat reads cache hits.
+            // A routed command's pairs know their own token's picks only, not the pairs before.
+            let shared = match (s.grouping, routed.is_some()) {
+                (MoeGrouping::Gathered, false) => SharedExperts::for_bucket(bucket_m),
+                _ => SharedExperts::Apart,
+            };
+            let qmv = GatedGatherQmvConstants { gather, shared };
+            let mut constants: Vec<ConstantValue> = AffineGatedQmvConstants { qmv, act }.into();
             constants.extend(norm);
             if let Some(program) = routed {
                 bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
@@ -7359,7 +7424,8 @@ fn lower_moe_step(
             if let Some((Slot(shared), Slot(gate))) = ends.gate_scale {
                 bindings.extend([arena_at(8, shared), arena_at(9, gate)]);
             }
-            let shape = grid((1, hidden.div_ceil(4), bucket_m), (32, k, 1), ms(A::Z));
+            // Tokens fastest, as the gate/up's pairs.
+            let shape = grid((bucket_m, hidden.div_ceil(4), 1), (32, k, 1), ms(A::X));
             let constants = AffineCombineQmvConstants {
                 qmv: qmv(hidden, inter, at.codes.for_bits(bits)),
                 top_k: b.top_k,
@@ -7640,7 +7706,12 @@ mod tests {
             S::SlidingAttentionPrefillPaged(q, o, l, p) => (false, q, o, l, p, SlidingWindow),
             other => panic!("a coded attention: {other:?}"),
         };
-        let gated = |step, guard| StepRow::Step(step, METAL_GUARD_GATES.gate(guard));
+        let gated = |step, guard| match METAL_GUARD_GATES.gate(guard) {
+            crate::op_abi::GuardRun::Gated(gate) => StepRow::Step(step, gate),
+            crate::op_abi::GuardRun::Dropped => {
+                panic!("{guard:?}: the default guards drop nothing")
+            }
+        };
         let codec = METAL_KV_CODEC;
         assert_eq!(codec.after_writer.len(), 2, "the writer's K and V encodes");
         let packed = KvWrite::PoolAndPacked;
@@ -8408,9 +8479,10 @@ mod tests {
     }
 
     /// Where the matmul lowers to one qmm_t command (bucket 512: Standard), the rows slice: the
-    /// gather, the matmul's qmv at the sampled rows and the scatter run on a step with rows to
-    /// drop and no speculative tokens; the plain matmul over every row on a speculative step.
-    /// Each row's flag rides its command.
+    /// gather, the matmul's qmv at the sampled rows and the scatter — of the logits, then of the
+    /// gathered activation back — run on a step with rows to drop and no speculative tokens; the
+    /// plain matmul over every row on a speculative step. Each row's flag rides its first
+    /// command.
     #[test]
     fn sampled_rows_slice_where_the_matmul_is_one_qmm_t() {
         use crate::tape::lowered::MScaleAxis;
@@ -8424,17 +8496,19 @@ mod tests {
                 (KernelId::GatherLastToken, Some(OnlyIfNoSpec)),
                 (KernelId::AffineQmvFast, Some(OnlyIfNoSpec)),
                 (KernelId::ScatterFirstToLastRow, Some(OnlyIfNoSpec)),
+                (KernelId::ScatterFirstToLastRow, Some(OnlyIfNoSpec)),
                 (KernelId::AffineQmmT, Some(OnlyIfSpec)),
             ]
         );
-        assert_eq!(tape.barrier_before, [true, false, true, false]);
+        assert_eq!(tape.barrier_before, [true, false, true, true, false]);
         // The all-rows command IS the plain matmul's.
         let plain = plain_q_proj(at);
-        assert!(plain.commands.len() == 1 && tape.commands[3].command == plain.commands[0].command);
-        // The gather over the matmul's input, `k` wide; the scatter over its output, `n` wide; one
-        // thread per column, walking the sequences in order (the rows move in place).
-        let [gather, qmv, scatter] = [0, 1, 2].map(|i| tape.commands[i].command);
-        for (c, slot, width) in [(gather, 7, 2048), (scatter, 11, 2048)] {
+        assert!(plain.commands.len() == 1 && tape.commands[4].command == plain.commands[0].command);
+        // The gather over the matmul's input, `k` wide; the scatter over its output, `n` wide, and
+        // back over its input; one thread per column, walking the sequences in order (the rows
+        // swap in place).
+        let [gather, qmv, scatter, restore] = [0, 1, 2, 3].map(|i| tape.commands[i].command);
+        for (c, slot, width) in [(gather, 7, 2048), (scatter, 11, 2048), (restore, 7, 2048)] {
             assert!(
                 matches!(c.bindings[0], Binding::ArenaSlot { slot: s, binding_index: 0 } if s == slot)
             );
@@ -8937,12 +9011,22 @@ mod tests {
             (stage, vec![bias(1, 10)], vec![v_bias]),
             2,
         ));
-        want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
+        // A multi-row bucket's twin reads each row's sequence from `cu_seqlens_q` (one query row
+        // per token), bound before the codec's operands.
+        let rows = Binding::Runtime {
+            kind: RuntimeBindingKind::CuSeqlensQ,
+            binding_index: 23,
+        };
+        want.push((
+            twin,
+            vec![rows, bias(0, 14), bias(1, 15)],
+            vec![k_bias, v_bias],
+        ));
         assert_eq!(offsets(qwen2, prefill.clone(), 64), want);
 
         let mut want = vec![(writer, vec![], modes(0, 0))];
         want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));
-        want.push((twin, vec![], vec![]));
+        want.push((twin, vec![rows], vec![]));
         assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
     }
 

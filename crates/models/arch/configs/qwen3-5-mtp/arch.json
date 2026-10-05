@@ -1,0 +1,13 @@
+{
+  "_comment": "Qwen3.5/3.6 multi-token-prediction head. It ships inside its target's HF checkpoint, so its configs are the target's verbatim HF config (which declares `mtp_num_hidden_layers`) and it registers under the identity `qwen3_5_mtp` — the `model_type` MLX gives the head's separate drafter repo (named from the target's: `org/X-4bit` → `org/X-MTP-4bit`, `drafter_repo_infix`), whose tensors are stored bare (`fc.*`, `layers.0.*`, `norm.*`, `pre_fc_norm_*`; hence the empty decoder prefix). It has no embed_tokens / lm_head of its own: the loader lends it the target's. Its decoder layers are the MTP layers, so `num_hidden_layers` REPLACES the backbone's count with `mtp_num_hidden_layers`. Norms as the Qwen3.5 family (zero-centered on HF checkpoints; MLX-affine ones store the full gain, which the norm offset rule reads as-is); the routed experts renormalize top-k as the target's. It DRAFTS OVER A VOCABULARY PREFIX: its logits are the target lm_head's first 65536 rows (`vocab_size`; token ids in BPE merge order, the most frequent first), so a draft costs a quarter of the 248k-row lm_head read; it embeds every token (`embed_vocab_size`). Every emitted token is still the target's choice (a draft is only a proposal it verifies); what the prefix costs is the drafts it cannot make: on the MLX oracle (k=3, code/story/repeat prompts) 2.85 tokens per verify step against 2.94 at the full vocabulary.",
+  "hf_architectures": ["qwen3_5_mtp"],
+  "drafter_repo_infix": "-MTP",
+  "scale_dtype": "bf16",
+  "bound_defaults": { "rms_norm_zero_centered": 1, "norm_topk_prob": 1 },
+  "decoder_safetensors_prefix": "",
+  "params": [
+    { "name": "num_hidden_layers", "from": "mtp_num_hidden_layers", "replaces": true },
+    { "name": "embed_vocab_size", "from": "vocab_size" },
+    { "name": "vocab_size", "value": 65536, "replaces": true }
+  ]
+}

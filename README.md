@@ -86,6 +86,9 @@ Note the convention for selecting models and quants:
   (`model/<arch>` for every config in an arch, `model/all` for everything).
 - `quant/<preset>` — compiles that quantization instead of dense/bf16
   (e.g. `quant/mlx` for every MLX affine int4 preset at once).
+- `spec/mtp` — also compiles the multi-token-prediction head of every
+  selected model that has one (Qwen3.6-35B-A3B); serving the model then
+  drafts with it.
 - `hf-completions` — shell tab completion over the real HuggingFace ids this
   build can actually run (`scr completions zsh --install`). **On by default**;
   it resolves that list against huggingface.co at build time, so an air-gapped

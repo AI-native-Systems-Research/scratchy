@@ -68,6 +68,10 @@ use crate::tape::constants::{TapeVariant, UnboundConstant};
 /// dispatch covers, its last threadgroup moving back to the last `GEMV_ROWS` rows.
 pub const GEMV_ROWS: u32 = 4;
 
+/// The most input rows the GEMV takes (`MAX_ROWS` in `gemm.metal`): a speculative verify step's
+/// rows, each weight slice loaded once for all of them. More rows run the tiled GEMM.
+pub const GEMV_MAX_ROWS: u32 = 8;
+
 // `KernelExtras` and friends used to live here. Every field has been
 // promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
 // `BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`, `PREFILL_TILE_Q`, `ROT_DIM`)
@@ -161,9 +165,10 @@ impl SpecializedPipelines {
 }
 
 /// A dense GEMM's pipeline key at `dtype` and its dispatch, keyed on its `(M, N, K)` (constants
-/// 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). One row of at least
-/// [`GEMV_ROWS`] outputs is a matrix-vector product: MLX's GEMV (`gemv_{f16,bf16}_specialized`),
-/// a threadgroup of 256 threads per [`GEMV_ROWS`] outputs. Otherwise the 8×8-tile GEMM
+/// 0 / 1 / 2; the lowering has them on `LoweredCommand.gemm_dims`). Up to [`GEMV_MAX_ROWS`] rows
+/// of at least [`GEMV_ROWS`] outputs are matrix-vector products: MLX's GEMV per row
+/// (`gemv_{f16,bf16}_specialized`), a threadgroup of 256 threads per [`GEMV_ROWS`] outputs of
+/// every row. Otherwise the 8×8-tile GEMM
 /// (`gemm_{f16,bf16}_specialized`, `simdgroup_*8x8` MMA), one simdgroup per tile. Bindings for
 /// both: output 0, input 1, weight 2.
 pub fn gemm_pipeline(
@@ -171,7 +176,7 @@ pub fn gemm_pipeline(
     dims: GemmDims,
 ) -> Result<(PipelineKey, DispatchShape), PipelineLookupError> {
     let GemmDims { m, n, k } = dims;
-    let gemv = m == 1 && n >= GEMV_ROWS;
+    let gemv = m <= GEMV_MAX_ROWS && n >= GEMV_ROWS;
     let function = match (dtype, gemv) {
         (MetalDtype::F16, false) => "gemm_f16_specialized",
         (MetalDtype::Bf16, false) => "gemm_bf16_specialized",
@@ -432,7 +437,8 @@ mod tests {
             | KernelId::EmbeddingGather
             | KernelId::AvgPool2d
             | KernelId::VisionGelu
-            | KernelId::VisionLoadPixels
+            | KernelId::LoadRows
+            | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
             // hd512 unfused attention kernels carry their library/function +
             // constants explicitly on the LoweredCommand (NAX vs steel chosen by
@@ -596,7 +602,8 @@ mod tests {
             | KernelId::EmbeddingGather
             | KernelId::AvgPool2d
             | KernelId::VisionGelu
-            | KernelId::VisionLoadPixels
+            | KernelId::LoadRows
+            | KernelId::ConcatRows
             | KernelId::MmEmbedSplice
             | KernelId::AttnGatherKRope
             | KernelId::AttnGatherVCopyT

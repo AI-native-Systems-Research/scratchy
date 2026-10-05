@@ -1779,6 +1779,10 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 }
 
 #ifdef SCRATCHY_CONSTANT_3
+// Where the pairs that share an expert run (slot 4, `SharedExperts`): 0 each in its own
+// threadgroup, 1 one after another in the threadgroup of the expert's first pair.
+SCRATCHY_CONSTANT(int, GATHER_SHARED_EXPERTS, 4);
+
 // The MoE block's gate and up projections and its gated activation: `gate_y` ends holding
 // `act(gate) * up` for every chosen expert's rows. Each token's row feeds GATHER_PER_ROW
 // (top-k) pairs.
@@ -1788,9 +1792,13 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 //   buffer(5)   = gate y                     buffer(11)  = scores [N, top_k], routed
 //                 [N, top_k, out_vec]        buffer(12)  = per-expert scales, routed and scaled
 //                                            buffer(15)  = the norm's gain, normed
-// Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
-// gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
-// activation to the block's rows. Every gate row is written raw only by the threadgroup that
+// Dispatch (N * top_k, ceil(out_vec / 8), 1), threadgroup (32, 4, 1): pair tid.x; simdgroups
+// 0-1 run the gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0
+// apply the activation to the block's rows. In a verify bucket (GATHER_SHARED_EXPERTS) the pairs
+// that share an expert run in the threadgroup of the expert's first pair, one after another: the
+// expert's block is read from memory once and then from cache, each pair's matvec the same as
+// alone; the expert's other threadgroups exit. A pair scans the pairs before it, so a bucket of
+// many pairs runs each in its own threadgroup. Every gate row is written raw only by the threadgroup that
 // then activates it: an out_vec with a 1-3 row tail block would have qmv_impl redo the previous
 // block's last rows there, raw, so this kernel takes an out_vec that is a multiple of 4. Routed,
 // the threadgroup picks its token's experts first (E <= 512: its 128 threads cover E / 4), and
@@ -1812,18 +1820,21 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device T_act*    expert_scale [[buffer(12)]],
     const device T_scale*  gain        [[buffer(15)]],
     uint3 tid       [[threadgroup_position_in_grid]],
+    uint3 grid      [[threadgroups_per_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
   static_assert(OUT_VEC_SIZE % 4 == 0, "a 1-3 row tail block would race the activation");
   static_assert(!ROUTED || ROUTED_E <= 4 * 128, "a routed softmax row's threads cover E / 4");
-  uint nk = tid.z;
+  static_assert(!ROUTED || GATHER_SHARED_EXPERTS == 0, "a routed pair knows its own token's picks only");
   bool up = simd_gid >= 2;
   threadgroup uint routed[GATHER_PER_ROW];
   threadgroup T_act soft[ROUTED_SOFT ? ROUTED_E : 1];
   threadgroup float local_a[32];
   threadgroup float local_b[32];
   uint expert;
+  uint end = tid.x + 1;
   if (ROUTED) {
+    const uint nk = tid.x;
     const uint n = nk / uint(GATHER_PER_ROW), lid = simd_gid * 32 + simd_lid;
     const device T_act* row = logits + size_t(n) * ROUTED_E;
     route_top_k<T_act, ROUTED_E, GATHER_PER_ROW, ROUTED_SOFT>(
@@ -1839,19 +1850,34 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
       }
     }
   } else {
-    expert = rhs_indices[nk];
+    expert = rhs_indices[tid.x];
+    if (GATHER_SHARED_EXPERTS == 1) {
+      for (uint q = 0; q < tid.x; q++) {
+        if (rhs_indices[q] == expert) {
+          return;
+        }
+      }
+      end = grid.x;
+    }
   }
-  gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
-      up ? up_w : gate_w, up ? up_scales : gate_scales, up ? up_biases : gate_biases, x,
-      expert, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
-      simd_lid, gain);
-  threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 8 + simd_lid;
-  if (simd_gid == 0 && simd_lid < 8 && row < uint(OUT_VEC_SIZE)) {
-    size_t at = size_t(nk) * size_t(OUT_VEC_SIZE) + row;
-    float g = float(gate_y[at]);
-    float u = float(up_y[at]);
-    gate_y[at] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u) : silu_mul_f(g, u));
+  // The threadgroup's own pair, then (shared) the later pairs of its expert. A routed pair's
+  // index is its own pick: the token's first threadgroup may still be storing rhs_indices.
+  for (uint nk = tid.x; nk < end; nk++) {
+    if (nk != tid.x && rhs_indices[nk] != expert) {
+      continue;
+    }
+    gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
+        up ? up_w : gate_w, up ? up_scales : gate_scales, up ? up_biases : gate_biases, x,
+        expert, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
+        simd_lid, gain);
+    threadgroup_barrier(mem_flags::mem_device);
+    if (simd_gid == 0 && simd_lid < 8 && row < uint(OUT_VEC_SIZE)) {
+      size_t at = size_t(nk) * size_t(OUT_VEC_SIZE) + row;
+      float g = float(gate_y[at]);
+      float u = float(up_y[at]);
+      gate_y[at] = static_cast<T_act>(GATED_ACT == 1 ? gelu_mul_f(g, u) : silu_mul_f(g, u));
+    }
   }
 }
 #endif
@@ -1870,8 +1896,8 @@ constant constexpr bool COMBINE_RESIDUAL = COMBINE_RESIDUAL_FC_SET && COMBINE_RE
 //   buffer(0-2) = w / scales / biases   buffer(5) = y      [N, top_k, out_vec]
 //   buffer(3)   = x  [N, top_k, in_vec] buffer(6) = scores [N, top_k]
 //   buffer(4)   = rhs_indices           buffer(7) = out    [N, out_vec]
-// Dispatch (1, ceil(out_vec / 4), N), threadgroup (32, top_k, 1): simdgroup k runs pair
-// (n, k)'s matvec over the 4-row group tid.y, then lanes 0-3 of simdgroup 0 combine the group's
+// Dispatch (N, ceil(out_vec / 4), 1), threadgroup (32, top_k, 1): token n = tid.x (fastest, as
+// the gated kernel's pairs); simdgroup k runs pair (n, k)'s matvec over the 4-row group tid.y, then lanes 0-3 of simdgroup 0 combine the group's
 // rows. A pair row another threadgroup also writes (qmv_impl redoing a tail) gets the same bits.
 template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 [[kernel]] void affine_gather_qmv_combine(
@@ -1888,7 +1914,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
-  uint n = tid.z;
+  uint n = tid.x;
   uint nk = n * uint(GATHER_PER_ROW) + simd_gid;
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
       w, scales, biases, x, rhs_indices[nk], y, nk, nk, tid.y / 2, tid.y % 2, simd_lid,

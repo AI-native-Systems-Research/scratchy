@@ -23,7 +23,8 @@
 //   4. take_along_axis(pos) unsorts the down output back to token order.
 //
 // All index buffers are u32. `MG_M` = number of (token,expert) pairs
-// (= bucket_m * top_k).
+// (= bucket_m * top_k). `MG_NUM_EXPERTS`: the model's experts (gemma4 128,
+// Qwen3.5/3.6 256), compiled in — it sizes the histogram.
 
 #include <metal_stdlib>
 #include "baked.h"

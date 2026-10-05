@@ -28,9 +28,11 @@ All model architectures compile into ONE crate, **`scratchy-models`**
 (`crates/models/arch/`); quant presets live on a separate crate,
 **`scratchy-quantizations`** (`crates/models/quantization/`) — two crates
 because Cargo won't alias one crate under two names, and `scratchy-cli`
-needs both `model` and `quant` as short CLI aliases. Neither has a default
-scope: naming zero models is a **build-time panic**, not a silent empty
-binary. Every checked-in `configs/<arch>/<stem>.json` gets its own `<stem>`
+needs both `model` and `quant` as short CLI aliases. Speculative-decoding
+drafters are a third alias on a third crate, **`scratchy-spec`**
+(`crates/models/spec/`): `spec/mtp` also compiles the MTP head of every
+selected model that has one. None has a default scope: naming zero models is
+a **build-time panic**, not a silent empty binary. Every checked-in `configs/<arch>/<stem>.json` gets its own `<stem>`
 feature (`model/<stem>` from the CLI, `model/<arch>`/`model/all` to widen);
 every quant preset gets its own `<preset>` feature (`quant/<preset>`,
 `quant/mlx` for every MLX affine preset at once) — a selected preset

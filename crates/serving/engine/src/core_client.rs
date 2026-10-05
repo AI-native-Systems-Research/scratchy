@@ -246,7 +246,10 @@ impl InprocClient {
     /// Does nothing if the pipeline is already started or the executor has
     /// been taken by the server path.
     pub fn start_pipeline(&mut self) {
-        if self.pipeline.is_some() {
+        // A step queued before its predecessor finalizes is scheduled without that step's drafts,
+        // and the proposer would find no executor: speculative decoding (no async scheduling)
+        // steps synchronously.
+        if self.pipeline.is_some() || !self.engine.async_scheduling() {
             return;
         }
         if let Some(executor) = self.engine.take_executor() {

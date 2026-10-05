@@ -370,13 +370,10 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let a = lit_u32(a);
             quote! { PosEmbed(#a) }
         }
-        I::LoadPixels(a) => {
+        I::LoadRows(a, source) => {
             let a = lit_u32(a);
-            quote! { LoadPixels(#a) }
-        }
-        I::LoadPosEmbeds(a) => {
-            let a = lit_u32(a);
-            quote! { LoadPosEmbeds(#a) }
+            let source = rows_extern_tokens(source);
+            quote! { LoadRows(#a, #source) }
         }
         I::GeluErf(a, b) => {
             let a = lit_u32(a);
@@ -482,6 +479,12 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let b = lit_u32(b);
             let c = lit_u32(c);
             quote! { GateApply(#a, #b, #c) }
+        }
+        I::Concat(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Concat(#a, #b, #c) }
         }
         I::GateScale(a, b, c, d) => {
             let a = lit_u32(a);
@@ -900,6 +903,18 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
     }
 }
 
+/// A [`RowsExtern`](scratchy_forward_compiler::RowsExtern) as a const expression.
+fn rows_extern_tokens(source: scratchy_forward_compiler::RowsExtern) -> TokenStream {
+    use scratchy_forward_compiler::RowsExtern;
+    match source {
+        RowsExtern::Pixels => quote! { ::scratchy_forward_compiler::RowsExtern::Pixels },
+        RowsExtern::PosEmbeds => quote! { ::scratchy_forward_compiler::RowsExtern::PosEmbeds },
+        RowsExtern::TargetHidden => {
+            quote! { ::scratchy_forward_compiler::RowsExtern::TargetHidden }
+        }
+    }
+}
+
 /// A [`KvOffsets`](scratchy_forward_compiler::KvOffsets) as a const expression.
 fn kv_offsets_tokens(o: scratchy_forward_compiler::KvOffsets) -> TokenStream {
     use scratchy_forward_compiler::{BiasStorage, KvOffset};
@@ -965,8 +980,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::QuickGelu(..) => "QuickGelu",
         I::Gelu(..) => "Gelu",
         I::PosEmbed(..) => "PosEmbed",
-        I::LoadPixels(..) => "LoadPixels",
-        I::LoadPosEmbeds(..) => "LoadPosEmbeds",
+        I::LoadRows(..) => "LoadRows",
         I::GeluErf(..) => "GeluErf",
         I::EmbeddingGather(..) => "EmbeddingGather",
         I::AvgPool2d(..) => "AvgPool2d",
@@ -982,6 +996,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::GatedDeltaNet(..) => "GatedDeltaNet",
         I::GateSplit(..) => "GateSplit",
         I::GateApply(..) => "GateApply",
+        I::Concat(..) => "Concat",
         I::GateScale(..) => "GateScale",
         I::DeepSeekMoe(..) => "DeepSeekMoe",
         I::DeepSeekMoeFp8Block(..) => "DeepSeekMoeFp8Block",
@@ -1308,11 +1323,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             0 => u(a),
             _ => None,
         },
-        I::LoadPixels(a) => match idx {
-            0 => u(a),
-            _ => None,
-        },
-        I::LoadPosEmbeds(a) => match idx {
+        I::LoadRows(a, _) => match idx {
             0 => u(a),
             _ => None,
         },
@@ -1404,7 +1415,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             5 => u(f),
             _ => None,
         },
-        I::GateSplit(a, b, c) | I::GateApply(a, b, c) => match idx {
+        I::GateSplit(a, b, c) | I::GateApply(a, b, c) | I::Concat(a, b, c) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -2069,13 +2080,9 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             0 => I::PosEmbed(n),
             _ => panic!("PosEmbed: bad idx {idx}"),
         },
-        I::LoadPixels(_a) => match idx {
-            0 => I::LoadPixels(n),
-            _ => panic!("LoadPixels: bad idx {idx}"),
-        },
-        I::LoadPosEmbeds(_a) => match idx {
-            0 => I::LoadPosEmbeds(n),
-            _ => panic!("LoadPosEmbeds: bad idx {idx}"),
+        I::LoadRows(_a, source) => match idx {
+            0 => I::LoadRows(n, source),
+            _ => panic!("LoadRows: bad idx {idx}"),
         },
         I::GeluErf(a, b) => match idx {
             0 => I::GeluErf(n, b),
@@ -2175,6 +2182,12 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             1 => I::GateApply(a, n, c),
             2 => I::GateApply(a, b, n),
             _ => panic!("GateApply: bad idx {idx}"),
+        },
+        I::Concat(a, b, c) => match idx {
+            0 => I::Concat(n, b, c),
+            1 => I::Concat(a, n, c),
+            2 => I::Concat(a, b, n),
+            _ => panic!("Concat: bad idx {idx}"),
         },
         I::GateScale(a, b, c, d) => match idx {
             0 => I::GateScale(n, b, c, d),

@@ -207,10 +207,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::ScalarWeightMul
             | O::GateSplit { .. }
             | O::GateApply
+            | O::Concat { .. }
             | O::GateScale
-            | O::LoadPixels { .. }
+            | O::LoadRows { .. }
             | O::EmbeddingGather { .. }
-            | O::LoadPosEmbeds { .. }
             | O::VisionRope
             | O::VarlenAttention { .. }
             | O::EncoderAttn { .. }

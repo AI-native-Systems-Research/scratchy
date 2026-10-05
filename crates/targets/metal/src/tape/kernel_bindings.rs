@@ -191,6 +191,8 @@ pub struct AttentionViaCacheBindingSet {
     /// table (slot 6); `None` (every non-spans dispatch) → the 6-binding
     /// ABI, exactly as before.
     pub rope_on_read: Option<SourceIx>,
+    /// Per-token rows read their sequences from `cu_seqlens_q` (slot 23).
+    pub query_rows: super::kernel_constants::QueryRows,
 }
 
 impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
@@ -224,6 +226,12 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
         ];
         if let Some(table) = s.rope_on_read {
             push_rope_on_read_bindings(&mut v, s.kv_layer, table, 6);
+        }
+        if s.query_rows == super::kernel_constants::QueryRows::PerToken {
+            v.push(Binding::Runtime {
+                kind: RuntimeBindingKind::CuSeqlensQ,
+                binding_index: 23,
+            });
         }
         v
     }

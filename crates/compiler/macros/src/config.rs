@@ -64,6 +64,13 @@ pub struct ModelParams {
     /// `scratchy_target_cuda::ScratchyArchRegistration` registration,
     /// driving the runtime `try_load(..., arch_hint)` dispatch.
     pub architectures: Vec<String>,
+    /// The checkpoint architectures of the model this arch is a part of — its config's own
+    /// `architectures` when the arch declares its identity (`hf_architectures`: a
+    /// multi-token-prediction head, whose config is its target's); empty otherwise.
+    pub drafts_for: Vec<String>,
+    /// How the repo of a head published apart from its target is named from the target's
+    /// (`drafter_repo_infix`, arch.json).
+    pub drafter_repo_infix: Option<String>,
     /// Extra JSON files that contributed to this variant's final
     /// config — the quantization preset and per-size override
     /// files that the loader deep-merged onto the dense base.
@@ -466,7 +473,7 @@ fn load_dir_mode(
     let feature_env_var = |feature: &str| -> String {
         format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"))
     };
-    let model_feature_enabled = |stem: &str| -> bool {
+    let model_feature_enabled = |arch_name: &str, stem: &str| -> bool {
         if let Some((_, vision_arch)) = VISION_ARCH_FOR_STEM.iter().find(|(s, _)| *s == stem) {
             let candidate = if arch_name == *vision_arch {
                 stem.to_string()
@@ -477,6 +484,41 @@ fn load_dir_mode(
         }
         std::env::var(feature_env_var(stem)).is_ok()
             || std::env::var(feature_env_var(&format!("{arch_name}-{stem}"))).is_ok()
+    };
+    // A head that ships inside its target's checkpoint (`hf_architectures`: an MTP head) also
+    // compiles for every selected target under `spec/mtp` (scratchy-models' `mtp` feature). Its
+    // configs are its targets' checkpoint configs verbatim, so a head config is selected when a
+    // selected config of another arch is the same file.
+    let drafts_with_target =
+        !spec.hf_architectures.is_empty() && std::env::var(feature_env_var("mtp")).is_ok();
+    let target_selected = |head_path: &Path| -> Result<bool, ConfigError> {
+        let io = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| ConfigError::Io { path, source }
+        };
+        let head = fs::read(head_path).map_err(io(head_path))?;
+        let configs = dir
+            .parent()
+            .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
+        for arch_dir in fs::read_dir(configs).map_err(io(configs))? {
+            let arch_dir = arch_dir.map_err(io(configs))?.path();
+            let Some(arch) = arch_dir.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if arch == arch_name || !arch_dir.is_dir() {
+                continue;
+            }
+            for config in fs::read_dir(&arch_dir).map_err(io(&arch_dir))? {
+                let config = config.map_err(io(&arch_dir))?.path();
+                let selected = config.extension().is_some_and(|e| e == "json")
+                    && (config.file_stem().and_then(|s| s.to_str()))
+                        .is_some_and(|stem| model_feature_enabled(arch, stem));
+                if selected && fs::read(&config).map_err(io(&config))? == head {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     };
 
     // Quant scoping. `SCRATCHY_QUANTS=preset1,preset2,...` restricts the
@@ -642,12 +684,14 @@ fn load_dir_mode(
     for p in &base_paths {
         let stem = stem_of(p)?;
         // Per-model gate: skip entirely — never even `read_json_file` —
-        // when this base's `<stem>` (or `<arch>-<stem>`) feature isn't enabled.
+        // when this base's `<stem>` (or `<arch>-<stem>`) feature isn't enabled
+        // and it isn't the head of a selected target (`target_selected`).
         // Every quant variant synthesized from this base below shares its
         // raw JSON via `base_raw`, so skipping here (instead of after
         // parsing) also means an unselected base contributes no quant
         // variants, not just no dense emission.
-        if !model_feature_enabled(&stem) {
+        if !model_feature_enabled(arch_name, &stem) && !(drafts_with_target && target_selected(p)?)
+        {
             continue;
         }
         let (raw, mut json) = read_json_file(p)?;
@@ -1399,7 +1443,12 @@ fn model_params_from_json(
     let tie_word_embeddings = parse_tie_word_embeddings(json)
         .or(spec.tie_default)
         .unwrap_or(false);
-    let architectures = parse_architectures(json);
+    // An arch that is a part of another model's checkpoint (an MTP head) registers under the
+    // identity it declares, not the architecture its (the whole checkpoint's) config names.
+    let (architectures, drafts_for) = match spec.hf_architectures.is_empty() {
+        true => (parse_architectures(json), Vec::new()),
+        false => (spec.hf_architectures.clone(), parse_architectures(json)),
+    };
     let rope_scaling = extract_rope_scaling(json);
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
     let mrope_section = extract_mrope_section(json);
@@ -1417,6 +1466,8 @@ fn model_params_from_json(
         quantization,
         tie_word_embeddings,
         architectures,
+        drafts_for,
+        drafter_repo_infix: spec.drafter_repo_infix.clone(),
         extra_tracked_paths,
         rope_scaling,
         rope_scaling_hash,
@@ -1543,6 +1594,8 @@ fn vision_params_from_json(
         quantization,
         tie_word_embeddings,
         architectures,
+        drafts_for: Vec::new(),
+        drafter_repo_infix: None,
         extra_tracked_paths,
         rope_scaling: None,
         rope_scaling_hash: None,
@@ -1637,6 +1690,16 @@ pub fn load_arch_json(dir: &Path) -> Result<crate::arch_spec::DeclaredArchSpec, 
     let as_str = |k: &str| json.get(k).and_then(|v| v.as_str()).map(str::to_string);
     spec.pos_embed_key = as_str("vision_pos_embed_key");
     spec.decoder_prefix = as_str("decoder_safetensors_prefix");
+    spec.drafter_repo_infix = as_str("drafter_repo_infix");
+    if let Some(v) = json.get("hf_architectures") {
+        spec.hf_architectures = v
+            .as_array()
+            .and_then(|a| a.iter().map(|s| s.as_str().map(str::to_string)).collect())
+            .ok_or_else(|| ConfigError::ArchJson {
+                path: path.clone(),
+                reason: "`hf_architectures` must be an array of strings".to_string(),
+            })?;
+    }
     spec.vision_norm_eps = json.get("vision_norm_eps").and_then(|v| v.as_f64());
     spec.tie_default = json.get("tie_default").and_then(|v| v.as_bool());
 
@@ -1684,6 +1747,8 @@ const ARCH_JSON_KEYS: &[&str] = &[
     "vision_pos_emb_interp",
     "vision_norm_eps",
     "decoder_safetensors_prefix",
+    "hf_architectures",
+    "drafter_repo_infix",
     "scale_dtype",
     "tie_default",
     "bound_defaults",
@@ -1830,6 +1895,12 @@ fn parse_params_json(
             .and_then(|v| v.as_str())
             .ok_or_else(|| bad(format!("`params[{i}]` has no string `name`")))?
             .to_string();
+        let replaces = match obj.get("replaces") {
+            None => false,
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| bad(format!("`params[{i}].replaces` must be a bool")))?,
+        };
         let source = match (obj.get("from"), obj.get("expr"), obj.get("value")) {
             (Some(p), None, None) => {
                 let path_str = p
@@ -1863,7 +1934,11 @@ fn parse_params_json(
                 )));
             }
         };
-        out.push(ParamField { name, source });
+        out.push(ParamField {
+            name,
+            source,
+            replaces,
+        });
     }
     Ok(out)
 }

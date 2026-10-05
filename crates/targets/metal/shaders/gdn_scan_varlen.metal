@@ -21,8 +21,19 @@
 // math). GVA: the key head is `i_hv / (HV/H)`.
 //
 // `conv_out` is model dtype (`T`); `g`/`beta`/`ssm_state`/`o` are f32.
-// State layout (cuda-symmetric): ssm_state[num_slots, HV, head_v, head_k],
-//   row = ((slot*HV + i_hv)*head_v + i_v)*head_k. is_fresh → S starts at 0.
+// State layout (cuda-symmetric): ssm_state[entries, HV, head_v, head_k], row =
+//   ((entry*HV + i_hv)*head_v + i_v)*head_k. A slot's entries (`scratchy_layers::gdn_state`):
+//   two states — bit 16 of `gdn_step[seq]` names the newest — then, with drafts, the record
+//   entry: two areas (half an entry each) of draft rows, each its `conv_out` row (`T`, padded to
+//   4 bytes) then its `g` and `beta` (f32 [HV] each). `gdn_step[seq]` is
+//   `scratchy_layers::gdn_state::GdnStep::encode`; the entries a step reads and writes follow
+//   `GdnStep::{base, after}`:
+//   - it starts from its base entry — the newest state, or (start = checkpoint r) the state the
+//     previous verify step started from, then replays that step's rows 0..=r from the record
+//     area of bit 17, through the same loop body that first computed them (no output);
+//   - a verify step (drafts) leaves its start state in its base entry, records its draft rows
+//     in the other area and writes its last row's state to the other entry; any other step
+//     writes its base entry in place.
 //
 // Baked constants:
 //   GDN_SCAN_NUM_K_HEADS (H), GDN_SCAN_NUM_V_HEADS (HV),
@@ -53,7 +64,7 @@ template <typename T>
     device       float* ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device int*   state_indices [[buffer(6)]],
-    const device uint*  is_fresh      [[buffer(7)]],
+    const device uint*  gdn_step      [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpig [[thread_position_in_grid]])
 {
@@ -81,24 +92,52 @@ template <typename T>
   if (seq_len <= 0) {
     return;
   }
-  int slot = state_indices[i_n];
-  if (slot < 0) {
+  int entry = state_indices[i_n];
+  if (entry < 0) {
     return;
   }
-  bool fresh = is_fresh[i_n] != 0u;
+  uint code = gdn_step[i_n];
+  uint start = code & 0xffu;
+  uint drafts = (code >> 8) & 0xffu;
+  uint tip = (code >> 16) & 1u;
+  uint area = (code >> 17) & 1u;
+  uint entry_len = HV * Vd * K;
 
-  device float* state_row =
-      ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K;
+  device float* slot = ssm_state + uint(entry) * entry_len;
+  uint head_row = (i_hv * Vd + i_v) * K;
+  uint base = start >= 2u ? 1u - tip : tip;
+  device float* base_row = slot + base * entry_len + head_row;
+
+  // Draft records: a row's `conv_out` row, then its decay and beta.
+  uint rec_conv = (conv_dim * uint(sizeof(T)) + 3u) & ~3u;
+  uint rec_bytes = rec_conv + 8u * HV;
+  device uchar* records = (device uchar*)(slot + 2u * entry_len);
+  device uchar* kept = records + area * (entry_len * 2u);
+  device uchar* draft_rows = records + (1u - area) * (entry_len * 2u);
+  int replayed = start >= 2u ? int(start - 1u) : 0;
+
   float b_h[GDN_SCAN_KMAX];
   for (uint ki = 0; ki < K; ki++) {
-    b_h[ki] = fresh ? 0.0f : state_row[ki];
+    b_h[ki] = start == 1u ? 0.0f : base_row[ki];
   }
 
-  for (int i_t = 0; i_t < seq_len; i_t++) {
+  // The previous verify step's kept rows (replayed: no output), then this step's.
+  for (int i_t = -replayed; i_t < seq_len; i_t++) {
+    if (i_t == 0 && drafts > 0u && start != 0u) {
+      // A verify step keeps its start state in its base entry (a slot start's is already there).
+      for (uint ki = 0; ki < K; ki++) {
+        base_row[ki] = b_h[ki];
+      }
+    }
     uint t = uint(bos + i_t);
+    device const uchar* rec = kept + uint(i_t + replayed) * rec_bytes;
+    const device T* row = i_t < 0 ? (const device T*)rec : conv_out + t * conv_dim;
+    const device float* rec_gb = (const device float*)(rec + rec_conv);
+    float g_t = i_t < 0 ? rec_gb[i_hv] : g[t * HV + i_hv];
+    float beta_t = i_t < 0 ? rec_gb[HV + i_hv] : beta[t * HV + i_hv];
     // q from key-head i_h; k from key-head i_h (offset key_dim); v from value-head i_hv.
-    const device T* q_ptr = conv_out + t * conv_dim + i_h * K;
-    const device T* k_ptr = conv_out + t * conv_dim + key_dim + i_h * K;
+    const device T* q_ptr = row + i_h * K;
+    const device T* k_ptr = row + key_dim + i_h * K;
 
     float q_sq = 0.0f, k_sq = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
@@ -110,17 +149,17 @@ template <typename T>
     float q_inv = rsqrt(q_sq + 1e-6f);
     float k_inv = rsqrt(k_sq + 1e-6f);
 
-    float decay = exp(g[t * HV + i_hv]);
+    float decay = exp(g_t);
     for (uint ki = 0; ki < K; ki++) {
       b_h[ki] *= decay;
     }
 
-    float b_v = float(conv_out[t * conv_dim + 2u * key_dim + i_hv * Vd + i_v]);
+    float b_v = float(row[2u * key_dim + i_hv * Vd + i_v]);
     float dot_hk = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
       dot_hk += b_h[ki] * (float(k_ptr[ki]) * k_inv);
     }
-    b_v = (b_v - dot_hk) * beta[t * HV + i_hv];
+    b_v = (b_v - dot_hk) * beta_t;
 
     float b_o = 0.0f;
     for (uint ki = 0; ki < K; ki++) {
@@ -129,11 +168,31 @@ template <typename T>
       b_h[ki] += b_v * kn;
       b_o += b_h[ki] * qn;
     }
+    if (i_t < 0) {
+      continue;
+    }
     o[t * value_dim + i_hv * Vd + i_v] = b_o;
+
+    // A draft row, for the replay that keeps it: its conv row split over the sequence's
+    // threads, its decay and beta by value-dim 0.
+    if (uint(i_t) < drafts) {
+      device uchar* dst = draft_rows + uint(i_t) * rec_bytes;
+      device T* dst_row = (device T*)dst;
+      for (uint j = i_hv * Vd + i_v; j < conv_dim; j += value_dim) {
+        dst_row[j] = conv_out[t * conv_dim + j];
+      }
+      if (i_v == 0u) {
+        device float* gb = (device float*)(dst + rec_conv);
+        gb[i_hv] = g_t;
+        gb[HV + i_hv] = beta_t;
+      }
+    }
   }
 
+  // The last row's state: a verify step's to the other entry, any other step's in place.
+  device float* out_row = slot + (drafts > 0u ? 1u - base : base) * entry_len + head_row;
   for (uint ki = 0; ki < K; ki++) {
-    state_row[ki] = b_h[ki];
+    out_row[ki] = b_h[ki];
   }
 }
 
@@ -144,6 +203,9 @@ template <typename T>
 // 0): each lane holds head_k / 32 state elements, and every dot over head_k is a simd_sum — four
 // per token (q's and k's L2 norms, S·k, S·q) instead of the per-thread serial loops above. Every
 // lane computes its head's g and beta as `gdn_gating` does. `o` (f32) feeds `gdn_rms_norm_gated`.
+// Its state entries, draft records and replay are `gdn_scan_varlen`'s (the file header), records
+// as `gdn_scan_varlen_f32` lays them out (the lowering's instantiation: f32 conv rows), so either
+// kernel replays the other's records.
 //
 // Baked constants: the scan's 0-4.
 // Dispatch: grid (1, HV * head_v / 4, num_seqs), threads (32, 4, 1): simdgroup s of threadgroup y
@@ -159,7 +221,7 @@ template <typename T>
     device       float* ssm_state     [[buffer(4)]],
     const device int*   cu_seqlens    [[buffer(5)]],
     const device int*   state_indices [[buffer(6)]],
-    const device uint*  is_fresh      [[buffer(7)]],
+    const device uint*  gdn_step      [[buffer(7)]],
     const device float* a_log         [[buffer(8)]],
     const device T*     dt_bias       [[buffer(9)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
@@ -184,29 +246,63 @@ template <typename T>
 
   const int bos = cu_seqlens[i_n];
   const int seq_len = cu_seqlens[i_n + 1] - bos;
-  const int slot = state_indices[i_n];
-  if (seq_len <= 0 || slot < 0 || i_v >= Vd) {
+  const int entry = state_indices[i_n];
+  if (seq_len <= 0 || entry < 0 || i_v >= Vd) {
     return;
   }
-  const bool fresh = is_fresh[i_n] != 0u;
+  const uint code = gdn_step[i_n];
+  const uint start = code & 0xffu;
+  const uint drafts = (code >> 8) & 0xffu;
+  const uint tip = (code >> 16) & 1u;
+  const uint area = (code >> 17) & 1u;
+  const uint entry_len = HV * Vd * K;
 
-  device float* state_row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K + lane * NPT;
+  device float* slot = ssm_state + uint(entry) * entry_len;
+  const uint head_row = (i_hv * Vd + i_v) * K + lane * NPT;
+  const uint base = start >= 2u ? 1u - tip : tip;
+  device float* base_row = slot + base * entry_len + head_row;
+
+  // Draft records: a row's f32 `conv_out` row, then its decay and beta.
+  const uint rec_conv = conv_dim * 4u;
+  const uint rec_bytes = rec_conv + 8u * HV;
+  device uchar* records = (device uchar*)(slot + 2u * entry_len);
+  device uchar* kept = records + area * (entry_len * 2u);
+  device uchar* draft_rows = records + (1u - area) * (entry_len * 2u);
+  const int replayed = start >= 2u ? int(start - 1u) : 0;
+
   float st[NPT];
   for (uint i = 0; i < NPT; i++) {
-    st[i] = fresh ? 0.0f : state_row[i];
+    st[i] = start == 1u ? 0.0f : base_row[i];
   }
   const float neg_a = -exp(float(a_log[i_hv]));
 
-  for (int i_t = 0; i_t < seq_len; i_t++) {
+  // The previous verify step's kept rows (replayed: no output), then this step's.
+  for (int i_t = -replayed; i_t < seq_len; i_t++) {
+    if (i_t == 0 && drafts > 0u && start != 0u) {
+      // A verify step keeps its start state in its base entry (a slot start's is already there).
+      for (uint i = 0; i < NPT; i++) {
+        base_row[i] = st[i];
+      }
+    }
     const uint t = uint(bos + i_t);
-    // gdn_gating
-    const float av = float(a[t * HV + i_hv]) + float(dt_bias[i_hv]);
-    const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
-    const float decay = exp(neg_a * sp);
-    const float beta = 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
+    device const uchar* rec = kept + uint(i_t + replayed) * rec_bytes;
+    const device float* row = i_t < 0 ? (const device float*)rec : conv_out + t * conv_dim;
+    const device float* rec_gb = (const device float*)(rec + rec_conv);
+    // gdn_gating, or the recorded row's.
+    float g_t, beta;
+    if (i_t < 0) {
+      g_t = rec_gb[i_hv];
+      beta = rec_gb[HV + i_hv];
+    } else {
+      const float av = float(a[t * HV + i_hv]) + float(dt_bias[i_hv]);
+      const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+      g_t = neg_a * sp;
+      beta = 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
+    }
+    const float decay = exp(g_t);
 
-    const device float* q_ptr = conv_out + t * conv_dim + i_h * K + lane * NPT;
-    const device float* k_ptr = conv_out + t * conv_dim + key_dim + i_h * K + lane * NPT;
+    const device float* q_ptr = row + i_h * K + lane * NPT;
+    const device float* k_ptr = row + key_dim + i_h * K + lane * NPT;
     float q[NPT], k[NPT];
     float q_sq = 0.0f, k_sq = 0.0f;
     for (uint i = 0; i < NPT; i++) {
@@ -224,7 +320,7 @@ template <typename T>
       kv += st[i] * (k[i] * k_inv);
     }
     kv = simd_sum(kv);
-    const float v = conv_out[t * conv_dim + 2u * key_dim + i_hv * Vd + i_v];
+    const float v = row[2u * key_dim + i_hv * Vd + i_v];
     const float delta = (v - kv) * beta;
     float out = 0.0f;
     for (uint i = 0; i < NPT; i++) {
@@ -232,13 +328,33 @@ template <typename T>
       out += st[i] * (q[i] * q_inv);
     }
     out = simd_sum(out);
+    if (i_t < 0) {
+      continue;
+    }
     if (lane == 0u) {
       o[t * value_dim + i_hv * Vd + i_v] = out;
     }
+
+    // A draft row, for the replay that keeps it: its conv row split over the sequence's lanes,
+    // its decay and beta by value-dim 0's lane 0.
+    if (uint(i_t) < drafts) {
+      device uchar* dst = draft_rows + uint(i_t) * rec_bytes;
+      device float* dst_row = (device float*)dst;
+      for (uint j = (i_hv * Vd + i_v) * 32u + lane; j < conv_dim; j += value_dim * 32u) {
+        dst_row[j] = conv_out[t * conv_dim + j];
+      }
+      if (i_v == 0u && lane == 0u) {
+        device float* gb = (device float*)(dst + rec_conv);
+        gb[i_hv] = g_t;
+        gb[HV + i_hv] = beta;
+      }
+    }
   }
 
+  // The last row's state: a verify step's to the other entry, any other step's in place.
+  device float* out_row = slot + (drafts > 0u ? 1u - base : base) * entry_len + head_row;
   for (uint i = 0; i < NPT; i++) {
-    state_row[i] = st[i];
+    out_row[i] = st[i];
   }
 }
 

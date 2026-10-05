@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Dense GEMM goldens on the production MTL4 dispatch path, the kernel and dispatch the worker
-//! picks (`pipeline_for_gemm`: one row runs MLX's GEMV, `gemv_{f16,bf16}_specialized`; more rows
-//! the MMA GEMM, `gemm_{f16,bf16}_specialized`) vs the CPU reference across Llama
-//! Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to 8192) and Gemma-4's MoE
-//! router. M/N/K are compiled into the kernel, so the only bindings are
+//! picks (`pipeline_for_gemm`: up to 8 rows run MLX's GEMV per row, `gemv_{f16,bf16}_specialized`;
+//! more rows the MMA GEMM, `gemm_{f16,bf16}_specialized`) vs the CPU reference across Llama
+//! Q/K/V/O/down/lm_head shapes (M=1 decode and M=64 prefill, K up to 8192) and the Gemma-4 and
+//! Qwen3.6 MoE routers at decode and speculative-verify row counts. M/N/K are compiled into the kernel, so the only bindings are
 //! output(0), input(1), weight(2).
 
 mod common;
@@ -33,6 +33,10 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (1, 2048, 2048),   // Llama-3.2-1B Q/O decode
     (1, 8192, 2048),   // Llama-3.2-1B gate/up decode
     (1, 128, 2816),    // Gemma-4-26B-A4B MoE router decode
+    (3, 128, 2816),    // Gemma-4-26B-A4B MoE router, 3 rows
+    (2, 256, 2048),    // Qwen3.6-35B-A3B MoE router, verify buckets (2 / 4 / 8 rows)
+    (4, 256, 2048),
+    (8, 256, 2048),
 ];
 
 /// The pipeline the worker plays a dense GEMM of `(m, n, k)` with, and its dispatch as MTL sizes.

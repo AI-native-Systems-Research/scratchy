@@ -226,6 +226,13 @@ impl LLMBuilder {
         self
     }
 
+    /// Set the drafts a speculative step proposes: with the target's compiled
+    /// multi-token-prediction head, `0` turns it off.
+    pub fn num_speculative_tokens(mut self, k: usize) -> Self {
+        self.config.num_speculative_tokens = k;
+        self
+    }
+
     /// Set the weight dtype ("auto", "float16", "bfloat16", "float32").
     pub fn dtype(mut self, dtype: impl Into<String>) -> Self {
         self.config.dtype = dtype.into();

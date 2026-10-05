@@ -25,7 +25,7 @@ use scratchy_target_metal::op_abi::{
     METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS, METAL_WAVE_ORDER_ROWS,
     metal_colour_rule,
 };
-use scratchy_target_metal::tape::ids::SourceIx;
+use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
 use scratchy_target_metal::tape::step::{
     AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, LayerId, MetalStepTape,
@@ -194,6 +194,8 @@ pub struct MetalCanonical {
     pub colours: ColourCount,
     /// The colour holding the forward's result.
     pub result: Colour,
+    /// The colour holding every row's final hidden state after the forward ran.
+    pub hidden: ArenaSlotIdx,
     /// `(tile, output)` → colour, what the arena statics are sized from.
     pub arena: SlotMap,
     pub roll: RollOutcome,
@@ -320,6 +322,7 @@ pub fn lower_canonical(
         facts,
         hidden: HiddenSize(consts.hidden_size as u32),
         intermediate: IntermediateSize(consts.intermediate_size as u32),
+        bucket_m: m as u32,
     }
     .records()
     .map_err(Steps)?;
@@ -402,6 +405,7 @@ pub fn lower_canonical(
         ),
     }
     let (colour_count, result) = (colours.count(), colours.result());
+    let hidden = colours.hidden(l).map_err(Steps)?;
     eprintln!(
         "[m2-flip] {stem} m={m}: TAPE-SCHEDULED stream ACTIVE ({} instr, slots={} final={}, \
          {} barriers a decode step)",
@@ -421,6 +425,7 @@ pub fn lower_canonical(
         },
         colours: colour_count,
         result,
+        hidden,
         arena: colours.arena().clone(),
         roll,
     })

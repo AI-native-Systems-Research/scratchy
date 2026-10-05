@@ -79,6 +79,19 @@ impl BoundWeight {
     }
 }
 
+/// A weight a multi-token-prediction head does not carry and borrows from its target model: the
+/// token embedding it embeds its input tokens with, and the lm_head it drafts through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LentWeight {
+    EmbedTokens,
+    LmHead,
+}
+
+impl LentWeight {
+    /// Every lent weight.
+    pub const ALL: [Self; 2] = [Self::EmbedTokens, Self::LmHead];
+}
+
 /// Arch-agnostic handle for a loaded model. Every
 /// `#[forward] fn <arch>()` emits an `impl ScratchyWeights` for
 /// its per-arch `Weights` type; callers hold
@@ -181,6 +194,20 @@ pub trait ScratchyWeights: Send + Sync {
     /// op; the default (non-hybrid arches) returns `None`, so no GDN state
     /// pool is allocated and the `gdn_state` ForwardCtx field stays `None`.
     fn gdn_runtime_config(&self) -> Option<crate::gdn_state_layout::GdnRuntimeConfig> {
+        None
+    }
+
+    /// Whether this model's forward reads `target_hidden`: a multi-token-prediction head, which
+    /// drafts from its target model's final hidden states. The macro emits `true` for such
+    /// forwards; the default is `false`.
+    fn reads_target_hidden(&self) -> bool {
+        false
+    }
+
+    /// The on-disk prefix (no `.weight` / `.scales` / `.biases`) this model loads `w` from — a
+    /// tied lm_head's is its embedding's — so a head can be lent its target's tensors under its
+    /// own names. `None` when the model has no such weight. Emitted by the macro.
+    fn lent_weight_prefix(&self, _w: LentWeight) -> Option<&'static str> {
         None
     }
 
@@ -331,6 +358,13 @@ pub trait ScratchyWeights: Send + Sync {
     /// from them before the pool exists — the KV pool's block-table width, the memory budget.
     #[cfg(feature = "metal")]
     fn metal_rungs(&self) -> &'static (dyn core::any::Any + Send + Sync);
+
+    /// The arena slots and scratch of the model's resident pool, a
+    /// `scratchy_target_metal::interpreter::metal::LentActivation` typed `Any` (as
+    /// [`Self::metal_rungs`]): what a model whose forwards never overlap this one's places its own
+    /// in. `None` until this model's first forward builds the pool.
+    #[cfg(feature = "metal")]
+    fn metal_lend_activation(&self) -> Option<Box<dyn core::any::Any>>;
 
     /// The model's `CanonicalParams::METAL_DTYPE`, so the worker can size
     /// its KV cache without monomorphizing on `W`.

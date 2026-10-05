@@ -312,6 +312,16 @@ pub struct HfModelConfig {
 }
 
 impl HfModelConfig {
+    /// The name the checkpoint's model registers under: its first `architectures` entry, or its
+    /// `model_type` when it lists none (an MLX multi-token-prediction drafter carries only
+    /// `model_type: "qwen3_5_mtp"`).
+    pub fn arch_hint(&self) -> Option<&str> {
+        self.architectures
+            .first()
+            .map(String::as_str)
+            .or(self.model_type.as_deref())
+    }
+
     /// Load from a `config.json` file.
     pub fn from_file(path: impl AsRef<Path>) -> ModelResult<Self> {
         let data = std::fs::read_to_string(path)?;
