@@ -306,6 +306,13 @@ pub enum MetalFusion {
     MoeRoute,
     /// A KV writer that encodes the rows it writes into the codec's packed store too.
     KvEncoded,
+    /// A one-row MLX-affine matvec that normalizes its input as it loads it.
+    NormedQmv,
+    /// A one-row MLX-affine matvec that adds its bias, scales its rows and adds them into the
+    /// residual stream as it stores them.
+    QmvEpilogue,
+    /// `residual + rmsnorm(delta)`.
+    NormAdd,
 }
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
@@ -332,6 +339,21 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     bias: K::BiasAdd,
                     kernel: F::MeanSubRmsNorm,
                     biased: F::MeanSubRmsNormBiasAdd,
+                },
+                FoldPattern::MatvecEpilogue {
+                    matmul: K::MatmulTile,
+                    weights: GemmWeightKind::Affine,
+                    bias: K::BiasAdd,
+                    scale: K::ScalarMul,
+                    add: K::Add,
+                    gated: &[K::Silu, K::Gelu, K::Mul],
+                    kernel: F::QmvEpilogue,
+                },
+                FoldPattern::NormedMatvecs {
+                    norm: K::RmsNorm,
+                    matmul: K::MatmulTile,
+                    weights: GemmWeightKind::Affine,
+                    kernel: F::NormedQmv,
                 },
                 FoldPattern::ResidualNorm {
                     norm: K::RmsNorm,
@@ -393,12 +415,20 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     kernel: F::MoeRoute,
                 },
             ],
-            // After the rope folds: it extends the writer command they made.
-            &[FoldPattern::Encoded {
-                writer: K::RopeAppend,
-                encode: K::KvEncode,
-                kernel: F::KvEncoded,
-            }],
+            // After the rope folds: it extends the writer command they made. A norm folds into the
+            // add it feeds only when no fold took either with more.
+            &[
+                FoldPattern::Encoded {
+                    writer: K::RopeAppend,
+                    encode: K::KvEncode,
+                    kernel: F::KvEncoded,
+                },
+                FoldPattern::NormAdd {
+                    add: K::Add,
+                    norm: K::RmsNorm,
+                    kernel: F::NormAdd,
+                },
+            ],
         ],
     }
 };

@@ -24,8 +24,8 @@ use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
     ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
     KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores,
-    MoeStep, NDim, QmvBatchLimit, RopeFormTag, RotaryTables, RotatedRows, RouterInput, RowSource,
-    RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
+    MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables, RotatedRows, RouterInput,
+    RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
@@ -232,7 +232,15 @@ fn sample_rows(
             let ix = w.of(WeightKind::Linear, 0)?;
             let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
             sampled(affine_qmv_command(
-                p, &g, 1, x, g.layer, ix, codes, /*wide_ok=*/ false,
+                p,
+                &g,
+                1,
+                x,
+                g.layer,
+                ix,
+                codes,
+                /*wide_ok=*/ false,
+                Vec::new(),
             ))
         }
         (true, R::Scatter) => sampled(scatter_first_to_last_row_command(p, g.output, g.n.get())),
@@ -271,6 +279,7 @@ fn affine_qmv_command(
     ix: SourceIx,
     codes: super::kernel_constants::AffineCodes,
     wide_ok: bool,
+    end_weights: Vec<Binding>,
 ) -> LoweredCommand {
     let (n, k, bits) = (g.n.get(), g.k.get(), g.bits.get());
     // The small-M band (MLX `qmv_wide`, gen-15+): weight groups are
@@ -319,8 +328,17 @@ fn affine_qmv_command(
             .into_baked(),
         ),
     };
+    let constants = baked(
+        constants
+            .iter()
+            .copied()
+            .chain(Vec::from(g.ends))
+            .collect::<Vec<ConstantValue>>(),
+    );
     let (dtype, scale_dtype) = (dequant_dtype_for(p), scale_dtype_for(p));
     let (x, y) = (g.input.get(), g.output.get());
+    let mut bindings = affine_qmm_bindings(x, y, layer, ix);
+    bindings.extend(end_weights);
     // The wide kernel's grid is exact for the bucket (nv covers rows)
     // and over-dispatch is safe — the kernel clamps every row index
     // against the baked M — so it takes no m_scaling. The others take
@@ -344,9 +362,33 @@ fn affine_qmv_command(
             threads_per_threadgroup: tpg,
             m_scaling,
         },
-        bindings: baked(affine_qmm_bindings(x, y, layer, ix)),
+        bindings: baked(bindings),
         gemm_dims: None,
     }
+}
+
+/// The weights a matvec's ends read ([`QmvEnds`]): its folded norm's gain at 15 — its site's
+/// `RmsNorm` weight at the norm's own layer — and its projection's bias at 16.
+fn qmv_end_weights(
+    g: &AffineMatmul,
+    w: RowSources<'_>,
+    layer_offset: u32,
+) -> Result<Vec<Binding>, LoweringError> {
+    let mut v = Vec::new();
+    if let Some(norm) = g.ends.norm {
+        let layer = super::ids::LayerId(norm.layer.get() + layer_offset);
+        let ix = w.of(WeightKind::RmsNorm, 0)?;
+        v.push(source(ix, WeightTensor::Weight, layer, 15));
+    }
+    if let Some(storage) = g.ends.bias {
+        let which = match storage {
+            BiasStorage::Affine => WeightTensor::AffineLinearBias,
+            BiasStorage::Dense => WeightTensor::Bias,
+        };
+        let layer = super::ids::LayerId(g.layer.get() + layer_offset);
+        v.push(source(w.of(WeightKind::Linear, 0)?, which, layer, 16));
+    }
+    Ok(v)
 }
 
 /// The sampled rows' gather and scatter kernels, each with its f16 and bf16 symbols.
@@ -1366,7 +1408,7 @@ fn lower_one(
             // m_mult` — exactly the per-head row count we need.
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1418,7 +1460,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1474,7 +1516,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1561,7 +1603,7 @@ fn lower_one(
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -1614,7 +1656,7 @@ fn lower_one(
             .into_baked(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: crate::tape::lowered::MScaleAxis::X,
@@ -1641,6 +1683,48 @@ fn lower_one(
         },
 
         // ── Gemma4 post-FFN tail: rmsnorm → add → scalar_weight_mul ─
+        I::NormAdd(Slot(delta), Slot(residual), Slot(out), norm, HiddenSize(hidden)) => {
+            let rows = super::kernel_constants::RmsNormConstants {
+                bucket_m: super::ids::BucketM(bucket_m),
+                q_size: super::ids::QSize(*hidden),
+                rms_norm_eps: super::ids::RmsNormEps(norm.eps.0),
+                weight_offset: norm.offset.0,
+            };
+            let mut constants: Vec<ConstantValue> = rows.into();
+            constants.push(ConstantValue::boolean(super::constants::ConstSlot(5), true));
+            let layer = super::ids::LayerId(norm.layer.get() + layer_offset);
+            let arena = |slot: &u32, binding_index| Binding::ArenaSlot {
+                slot: *slot,
+                binding_index,
+            };
+            LoweredCommand {
+                kernel: KernelId::NormAddScalarMul,
+                library: "fused_add_rmsnorm",
+                function: norm_add_scalar_mul_kernel_static_name(p, scale_dtype_for(p)),
+                constants: constants.into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, 1, 1),
+                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(vec![
+                    arena(delta, 0),
+                    arena(residual, 1),
+                    arena(out, 2),
+                    source(
+                        w.of(WeightKind::RmsNorm, 0)?,
+                        WeightTensor::Weight,
+                        layer,
+                        3,
+                    ),
+                ]),
+                gemm_dims: None,
+            }
+        }
         I::NormAddScalarMul(
             Slot(delta_slot),
             Slot(residual_slot),
@@ -1663,7 +1747,7 @@ fn lower_one(
                 .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: crate::tape::lowered::MScaleAxis::X,
@@ -1795,6 +1879,7 @@ fn lower_one(
                 group_size: AffineGroupSize(group_size),
                 bits: AffineBits(bits),
                 vector_limit: QmvBatchLimit(vector_limit),
+                ends: _,
             } = g;
             let dtype = dequant_dtype_for(p);
             let scale_dtype = scale_dtype_for(p);
@@ -1817,6 +1902,9 @@ fn lower_one(
                 // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
                 let wide_ok =
                     profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
+                if g.ends != QmvEnds::default() && bucket_m != 1 {
+                    return Err(LoweringError::GatedMatvecRows { bucket_m });
+                }
                 affine_qmv_command(
                     p,
                     g,
@@ -1826,7 +1914,10 @@ fn lower_one(
                     w.of(WeightKind::Linear, 0)?,
                     codes,
                     wide_ok,
+                    qmv_end_weights(g, w, layer_offset)?,
                 )
+            } else if g.ends != QmvEnds::default() {
+                return Err(LoweringError::GatedMatvecRows { bucket_m });
             } else {
                 // Matmul branch (prefill-shape). `pick_qmm_t_kernel`
                 // mirrors MLX `quantized.cpp:1411-1424 + :788-805`:
@@ -2542,6 +2633,71 @@ fn lower_one(
                 w.of(WeightKind::Linear, 0)?,
                 layer_offset,
             )
+        }
+        I::AffineGatedQmv(g, act) => {
+            if bucket_m != 1 {
+                return Err(LoweringError::GatedMatvecRows { bucket_m });
+            }
+            let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
+            let codes = super::kernel_constants::AffineCodes::of(profile, bits);
+            let constants = super::kernel_constants::AffineGatedQmvConstants {
+                qmv: super::kernel_constants::AffineQmvConstants {
+                    k: super::ids::KDimI32(k as i32),
+                    n: super::ids::NDimI32(n as i32),
+                    codes,
+                },
+                act: *act,
+            };
+            // `affine_qmv_fast`'s shape rule (`pick_qmv_kernel`), for both matvecs.
+            let fast = if n.is_multiple_of(8) && k.is_multiple_of(512) {
+                "_fast"
+            } else {
+                ""
+            };
+            let (d, s) = (
+                dequant_infix(dequant_dtype_for(p)),
+                scale_infix(scale_dtype_for(p)),
+            );
+            let symbol = format!("affine_qmv_gated{fast}_{d}_s_{s}_gs_{gs}_b_{bits}");
+            let layer = super::ids::LayerId(g.layer.get() + layer_offset);
+            let mut bindings = affine_qmm_bindings(
+                g.input.get(),
+                g.output.get(),
+                layer,
+                w.of(WeightKind::Linear, 0)?,
+            );
+            bindings.extend(qmv_end_weights(g, w, layer_offset)?);
+            let up = affine_weight_bindings(w.of(WeightKind::Linear, 1)?, layer);
+            bindings.extend(up.map(|b| match b {
+                Binding::Source {
+                    ix,
+                    which,
+                    layer,
+                    binding_index,
+                } => Binding::Source {
+                    ix,
+                    which,
+                    layer,
+                    binding_index: binding_index + 5,
+                },
+                other => other,
+            }));
+            LoweredCommand {
+                kernel: KernelId::AffineQmvGated,
+                library: "quantized_qmv",
+                function: leak_symbol(symbol),
+                constants: (Vec::<ConstantValue>::from(constants).into_iter())
+                    .chain(Vec::from(g.ends))
+                    .collect::<Vec<_>>()
+                    .into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (1, n / 8, 1),
+                    threads_per_threadgroup: (32, 4, 1),
+                    m_scaling: None,
+                },
+                bindings: baked(bindings),
+                gemm_dims: None,
+            }
         }
         // Dense GeGLU (Gemma3 text MLP) — same fused gate/up GEMM +
         // activation-mul kernel as SiLU; the `IS_GELU` fn-const flips
@@ -6175,7 +6331,11 @@ fn lower_moe_step(
                 weight_offset: 0.0,
             }
             .into_baked(),
-            dispatch: grid((bucket_m, 1, 1), (THREADS_PER_GROUP, 1, 1), ms(A::X)),
+            dispatch: grid(
+                (bucket_m, 1, 1),
+                (super::kernel_constants::NORM_THREADS, 1, 1),
+                ms(A::X),
+            ),
             bindings: baked(vec![
                 s.at(0, R::RouterNormed),
                 arena_at(1, x),
@@ -6603,7 +6763,7 @@ fn lower_moe_step(
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
-            let constants = AffineGatedQmvConstants { gather, act }.into();
+            let constants = AffineGatedQmvConstants { qmv: gather, act }.into();
             vec![cmd(
                 kernel,
                 "quantized_qmv",
@@ -7369,6 +7529,7 @@ mod tests {
             group_size: AffineGroupSize(64),
             bits: AffineBits(4),
             vector_limit: QmvBatchLimit(18),
+            ends: QmvEnds::default(),
         }
     }
 
@@ -7492,6 +7653,7 @@ mod tests {
             group_size: AffineGroupSize(gs),
             bits: AffineBits(bits),
             vector_limit: QmvBatchLimit(10),
+            ends: QmvEnds::default(),
         };
         let lower_at = |rows: MetalStepTape, profile| {
             lower_subtile_tape_to_metal(&rows, &tp(), bake_point(512, profile)).expect("lowers")

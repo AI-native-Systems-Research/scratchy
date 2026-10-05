@@ -244,9 +244,13 @@ pub fn lower_canonical(
     let l = &expand_sample_rows(l, &METAL_SAMPLE_ROWS).map_err(CanonicalRefusal::SampleRows)?;
     let tp = crate::tape_program::tape_program(l, stem, m);
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
-    // projection kernel.
-    let fold_projections = facts.mlp == MlpForm::Packed;
-    let model = ModelFoldFacts { fold_projections };
+    // projection kernel, and an affine one the fused one-row matvec, for its one-row bucket.
+    let fold_projections = facts.mlp == MlpForm::Packed || m == 1;
+    // The one-row bucket's affine matvecs normalize their input and add into the residual.
+    let model = ModelFoldFacts {
+        fold_projections,
+        matvec_ends: m == 1,
+    };
     let folds =
         fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model).map_err(CanonicalRefusal::Fold)?;
     let colouring = colour_tape(

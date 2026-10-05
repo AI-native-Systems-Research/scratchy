@@ -1023,6 +1023,35 @@ impl Recording<'_> {
                 let sites = [norm(gain)?, norm(scale)?].concat();
                 Ok(em(step, &[delta, res], &[res, out], sites))
             }
+            // `out = rmsnorm(delta) + residual`, the norm's own epsilon and gain convention.
+            (
+                F::NormAdd,
+                Sh::NormAdd {
+                    norm,
+                    delta,
+                    residual,
+                    gain,
+                },
+            ) => {
+                let nrm = self.op_at(i, norm)?;
+                let SubOp::RmsNorm { eps, gain: g } = *self.op(nrm) else {
+                    return Err(self.no(i, Refused::FusionShape));
+                };
+                let (out, x, res) = (
+                    self.colour(i)?,
+                    self.read_operand(i, delta)?,
+                    self.read_operand(i, residual)?,
+                );
+                let e = self.source_operand(i, gain)?;
+                let rows = st::RowNorm {
+                    layer: self.layer(e),
+                    eps: st::Eps(eps),
+                    offset: offset(g),
+                };
+                let step = MetalStep::NormAdd(x, res, out, rows, self.hidden);
+                let site = self.site(i, WeightKind::RmsNorm, e)?;
+                Ok(em(step, &[x, res], &[out], site))
+            }
             // The gate and up projections and `act(gate) * up`: the up reads the gate's rows and
             // layer, at the gate's group size.
             (F::MoeGateUpAct, Sh::ExpertGated { gate, up }) => {
@@ -1098,6 +1127,11 @@ impl Recording<'_> {
                 };
                 self.moe(i, MoeStep::Route(program), &[], &[], weight)
             }
+            (F::NormedQmv, Sh::NormedMatvec { .. })
+            | (F::QmvEpilogue, Sh::MatvecEpilogue { .. }) => {
+                let kept = self.kept(i)?;
+                kept.ok_or_else(|| self.no(i, Refused::FusionShape))
+            }
             // The writer's command — its earlier fold's, else its own — writing the packed store too.
             (F::KvEncoded, Sh::Encoded { .. }) => {
                 let driven = self.folds.driven(self.steps.slot[i]);
@@ -1162,6 +1196,34 @@ impl Recording<'_> {
         let out = self.colour(i)?;
         let (gate_slot, up_slot) = (self.colour(gate)?, self.colour(up)?);
         match kernel {
+            F::FusedGateUpSiluMul | F::FusedGateUpGeluMul
+                if matches!(self.matmul(gate, None)?.step, MetalStep::AffineQmm(_)) =>
+            {
+                // The gate matvec's command, writing the activation's rows; the up's weight after
+                // the gate's.
+                let (mut g, mut u) = (self.matmul(gate, None)?, self.matmul(up, None)?);
+                let (MetalStep::AffineQmm(mut mm), MetalStep::AffineQmm(um)) = (g.step, u.step)
+                else {
+                    return Err(self.no(i, Refused::FusionShape));
+                };
+                if (mm.input, mm.n, mm.k, mm.group_size, mm.bits)
+                    != (um.input, um.n, um.k, um.group_size, um.bits)
+                {
+                    return Err(self.no(i, Refused::FusionShape));
+                }
+                mm.output = out;
+                let act = match kernel {
+                    F::FusedGateUpGeluMul => st::GatedAct::Gelu,
+                    _ => st::GatedAct::Silu,
+                };
+                g.sites.append(&mut u.sites);
+                Ok(em(
+                    MetalStep::AffineGatedQmv(mm, act),
+                    &[mm.input],
+                    &[out],
+                    g.sites,
+                ))
+            }
             F::FusedGateUpSiluMul | F::FusedGateUpGeluMul => {
                 // The gate projection's input and weight layer carry the fused command.
                 let input = self.read(gate, 0)?;
@@ -1233,12 +1295,57 @@ impl Recording<'_> {
         let SubOp::MatmulTile { n, weight } = *self.op(mm) else {
             return Err(self.no(i, Refused::FusionShape));
         };
-        let (out, input, e) = (self.colour(mm)?, self.read(mm, 0)?, self.weight_of(mm)?);
+        let (mut out, mut input, e) = (self.colour(mm)?, self.read(mm, 0)?, self.weight_of(mm)?);
         let layer = self.layer_with_path(e);
         let k = self.graph.tensors[e].rows;
         let (nd, kd) = (st::NDim(n), st::KDim(k));
+        let mut site = self.site(mm, WeightKind::Linear, e)?;
+        // What the matmul's folds put around its dot: the norm its input passes through (it reads
+        // the norm's input and gain), and the residual add its rows feed (it writes the add's
+        // buffer, which holds the residual).
+        let (mut ends, mut reads) = (st::QmvEnds::default(), Vec::new());
+        for f in self.folds.driven(self.steps.slot[mm]) {
+            match f.shape {
+                FusedShape::NormedMatvec { norm } => {
+                    let nrm = self.op_at(mm, norm)?;
+                    let SubOp::RmsNorm { eps, gain } = *self.op(nrm) else {
+                        return Err(self.no(mm, Refused::FusionShape));
+                    };
+                    input = self.read(nrm, 0)?;
+                    let layer = self.weight_layer(nrm);
+                    let (eps, offset) = (st::Eps(eps), offset(gain));
+                    ends.norm = Some(st::RowNorm { layer, eps, offset });
+                    site.extend(self.site(nrm, WeightKind::RmsNorm, self.weight_of(nrm)?)?);
+                }
+                FusedShape::MatvecEpilogue { bias, scale, add } => {
+                    ends.bias = bias.map(|_| match weight {
+                        GemmWeight::Affine { .. } => st::BiasStorage::Affine,
+                        GemmWeight::Dense | GemmWeight::Fp8Dynamic => st::BiasStorage::Dense,
+                    });
+                    if let Some(sc) = scale {
+                        let SubOp::ScalarMul { scale } = *self.op(self.op_at(mm, sc)?) else {
+                            return Err(self.no(mm, Refused::FusionShape));
+                        };
+                        ends.scale = Some(st::Scale(scale));
+                    }
+                    // The command writes the chain's last buffer: the add's, over the residual.
+                    let last = add.map(|(a, _)| a).or(scale).or(bias);
+                    let last = last.ok_or_else(|| self.no(mm, Refused::FusionShape))?;
+                    out = self.colour(self.op_at(mm, last)?)?;
+                    if let Some((_, residual)) = add {
+                        reads.push(self.read_operand(mm, residual)?);
+                        ends.residual = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        reads.insert(0, input);
         let plain = match weight {
-            GemmWeight::Dense => MetalStep::Gemm(input, out, layer, nd, kd),
+            GemmWeight::Dense if ends == st::QmvEnds::default() => {
+                MetalStep::Gemm(input, out, layer, nd, kd)
+            }
+            GemmWeight::Dense => return Err(self.no(mm, Refused::FusionShape)),
             GemmWeight::Fp8Dynamic => return Err(self.no(mm, Refused::Fp8Gemm)),
             GemmWeight::Affine { affine } => MetalStep::AffineQmm(st::AffineMatmul {
                 input,
@@ -1249,12 +1356,12 @@ impl Recording<'_> {
                 group_size: Gs(affine.group().get()),
                 bits: Bits(affine.bits().get()),
                 vector_limit: st::QmvBatchLimit(affine_qmm_vector_limit(k, n)),
+                ends,
             }),
         };
-        let site = self.site(mm, WeightKind::Linear, e)?;
         let (Some(step), MetalStep::AffineQmm(g)) = (step, plain) else {
             return match step {
-                None => Ok(em(plain, &[input], &[out], site)),
+                None => Ok(em(plain, &reads, &[out], site)),
                 Some(_) => Err(self.no(i, Refused::SampledNotAffine)),
             };
         };

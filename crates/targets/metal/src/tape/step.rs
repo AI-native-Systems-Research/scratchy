@@ -194,6 +194,8 @@ pub enum MetalStep {
     FusedAddRmsNormWithOffset(Slot, Slot, LayerId, GainOffset),
     /// `(delta, residual, out, layer, width)`: `out = (rmsnorm(delta) + residual) * layer_scalar`.
     NormAddScalarMul(Slot, Slot, Slot, LayerId, HiddenSize),
+    /// `(delta, residual, out, norm, width)`: `out = rmsnorm(delta) + residual`.
+    NormAdd(Slot, Slot, Slot, RowNorm, HiddenSize),
     /// `(in, out, layer)`: multiply by the layer's loaded scalar.
     ScalarWeightMul(Slot, Slot, LayerId),
     /// `(in, out, scale, width)`.
@@ -208,6 +210,10 @@ pub enum MetalStep {
     FusedGateUpSiluMul(Slot, Slot, LayerId),
     /// `(in, out, layer)`: dense fused gate/up GEMM + `gelu(gate) * up`.
     FusedGateUpGeluMul(Slot, Slot, LayerId),
+    /// `(gate, act)`: one row's MLX-affine gate and up matvecs and `act(gate) * up`, written to
+    /// the gate matmul's output. The up projection has the gate's shape; its weight is the step's
+    /// second linear site.
+    AffineGatedQmv(AffineMatmul, GatedAct),
     /// `(gate, up, out, width)`: `silu(gate) * up`.
     SiluMul(Slot, Slot, Slot, IntermediateSize),
     /// `(gate, up, out)`: `gelu(gate) * up`.
@@ -296,7 +302,8 @@ pub enum MetalStep {
 }
 
 /// An MLX-affine matmul: `input · W` into `output`, `W` the layer's `n × k` weight packed `bits`
-/// wide in groups of `group_size`; `vector_limit` rows or more take the matrix kernel.
+/// wide in groups of `group_size`; `vector_limit` rows or more take the matrix kernel. `ends`:
+/// what its one-row matvec does around the dot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AffineMatmul {
     pub input: Slot,
@@ -307,6 +314,28 @@ pub struct AffineMatmul {
     pub group_size: AffineGroupSize,
     pub bits: AffineBits,
     pub vector_limit: QmvBatchLimit,
+    pub ends: QmvEnds,
+}
+
+/// What a one-row MLX-affine matvec does around its dot: normalize its input as it loads it
+/// (`MetalFusion::NormedQmv` — the input is the norm's, the gain its site's `RmsNorm`); then
+/// (`MetalFusion::QmvEpilogue`) add its projection's bias, scale the row, and add it into the
+/// residual stream its output holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QmvEnds {
+    pub norm: Option<RowNorm>,
+    pub bias: Option<BiasStorage>,
+    pub scale: Option<Scale>,
+    pub residual: bool,
+}
+
+/// The RMSNorm a matvec applies to its input: the norm's layer (its gain's), epsilon and gain
+/// offset (`rmsnorm(x, w + offset)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowNorm {
+    pub layer: LayerId,
+    pub eps: Eps,
+    pub offset: GainOffset,
 }
 
 /// The steps of a result matmul's sampled rows, in tape order.
@@ -408,6 +437,12 @@ impl MetalStep {
         if let Some(layer) = self.layer_mut() {
             layer.0 += by;
         }
+        // A matvec's folded norm reads its own layer's gain.
+        if let MetalStep::AffineQmm(g) | MetalStep::AffineGatedQmv(g, _) = &mut self
+            && let Some(norm) = &mut g.ends.norm
+        {
+            norm.layer.0 += by;
+        }
         self
     }
 
@@ -426,11 +461,13 @@ impl MetalStep {
             | S::MetalBiasAdd(_, _, l, ..)
             | S::FusedGateUpSiluMul(_, _, l)
             | S::FusedGateUpGeluMul(_, _, l)
+            | S::AffineGatedQmv(AffineMatmul { layer: l, .. }, _)
             | S::AttentionViaCache(_, _, l, _)
             | S::SlidingAttentionViaCache(_, _, l, _)
             | S::AttentionPrefillPaged(_, _, l, _)
             | S::SlidingAttentionPrefillPaged(_, _, l, _)
             | S::NormAddScalarMul(_, _, _, l, _)
+            | S::NormAdd(_, _, _, RowNorm { layer: l, .. }, _)
             | S::RopeAppend(_, _, _, _, _, _, l, ..)
             | S::RopeAppendNormed(_, _, _, _, _, _, l, ..)
             | S::GatedDeltaNet(_, _, _, _, _, l)

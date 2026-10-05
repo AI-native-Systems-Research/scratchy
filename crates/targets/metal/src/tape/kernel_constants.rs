@@ -84,6 +84,11 @@ pub struct RmsNormConstants {
     pub weight_offset: f32,
 }
 
+/// The threads of an RMSNorm row's threadgroup: every norm command dispatches this many, and its
+/// kernel takes it compiled in (slot 4), so each thread's share of the row is a count the compiler
+/// knows.
+pub const NORM_THREADS: u32 = 1024;
+
 impl From<RmsNormConstants> for Vec<ConstantValue> {
     fn from(c: RmsNormConstants) -> Self {
         vec![
@@ -91,6 +96,7 @@ impl From<RmsNormConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(1), c.q_size.get()),
             ConstantValue::float(ConstSlot(2), c.rms_norm_eps.get()),
             ConstantValue::float(ConstSlot(3), c.weight_offset),
+            ConstantValue::uint(ConstSlot(4), NORM_THREADS),
         ]
     }
 }
@@ -646,6 +652,26 @@ impl From<AffineQmvConstants> for Vec<ConstantValue> {
     }
 }
 
+/// A one-row matvec's [`QmvEnds`](crate::tape::step::QmvEnds), compiled in: its norm's epsilon
+/// (slot 8) and gain offset (9), whether its rows add into the residual (10), take a bias (11), and
+/// their scale (12).
+impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
+    fn from(e: crate::tape::step::QmvEnds) -> Self {
+        let norm = e.norm.into_iter().flat_map(|n| {
+            [
+                ConstantValue::float(ConstSlot(8), n.eps.0),
+                ConstantValue::float(ConstSlot(9), n.offset.0),
+            ]
+        });
+        let residual = e
+            .residual
+            .then(|| ConstantValue::boolean(ConstSlot(10), true));
+        let bias = e.bias.map(|_| ConstantValue::boolean(ConstSlot(11), true));
+        let scale = e.scale.map(|s| ConstantValue::float(ConstSlot(12), s.0));
+        norm.chain(residual).chain(bias).chain(scale).collect()
+    }
+}
+
 /// `KernelId::AffineGatherQmvFast` / `AffineGatherQmv` (`affine_gather_qmv[_fast]_*`): the
 /// expert matvec's [`AffineQmvConstants`] and which rows it reads (slot 2: the output rows one
 /// input row feeds).
@@ -675,22 +701,23 @@ impl From<AffineGatherQmvConstants> for Vec<ConstantValue> {
     }
 }
 
-/// `KernelId::MoeGateUpAct` (`affine_gather_qmv_gated[_fast]_*`): the gate projection's
-/// [`AffineGatherQmvConstants`] (the up's are the same) and the activation (slot 3: 0 SiLU,
-/// 1 GELU).
-pub struct AffineGatedQmvConstants {
-    pub gather: AffineGatherQmvConstants,
+/// `KernelId::MoeGateUpAct` (`affine_gather_qmv_gated[_fast]_*`, `Q` =
+/// [`AffineGatherQmvConstants`]) and `KernelId::AffineQmvGated` (`affine_qmv_gated[_fast]_*`,
+/// `Q` = [`AffineQmvConstants`]): the gate projection's matvec constants (the up's are the same)
+/// and the activation (slot 3: 0 SiLU, 1 GELU).
+pub struct AffineGatedQmvConstants<Q> {
+    pub qmv: Q,
     pub act: crate::tape::step::GatedAct,
 }
 
-impl From<AffineGatedQmvConstants> for Vec<ConstantValue> {
-    fn from(c: AffineGatedQmvConstants) -> Self {
+impl<Q: Into<Vec<ConstantValue>>> From<AffineGatedQmvConstants<Q>> for Vec<ConstantValue> {
+    fn from(c: AffineGatedQmvConstants<Q>) -> Self {
         use crate::tape::step::GatedAct;
         let act = match c.act {
             GatedAct::Silu => 0,
             GatedAct::Gelu => 1,
         };
-        let mut v: Vec<ConstantValue> = c.gather.into();
+        let mut v: Vec<ConstantValue> = c.qmv.into();
         v.push(ConstantValue::int(ConstSlot(3), act));
         v
     }

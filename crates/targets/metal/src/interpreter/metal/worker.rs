@@ -912,6 +912,7 @@ fn is_fused(id: KernelId) -> bool {
         id,
         K::FusedAddRmsNorm
             | K::FusedGateUpSiluMul
+            | K::AffineQmvGated
             | K::RopeAppendNormed
             | K::NormAddScalarMul
             | K::AttentionViaCacheTq
@@ -948,6 +949,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineQmvFast
         | K::AffineQmvWide
         | K::AffineQmv
+        | K::AffineQmvGated
         | K::AffineQmmT
         | K::AffineGatherQmmT
         | K::AffineGatherQmmTNax
@@ -1936,7 +1938,7 @@ mod tests {
             constants: rmsnorm_constants(bucket_m),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (256, 1, 1),
+                threads_per_threadgroup: (crate::tape::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: None,
             },
             bindings: crate::interpreter::metal::lowered::baked(vec![
@@ -1964,7 +1966,7 @@ mod tests {
             constants: rmsnorm_constants(bucket_m),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
-                threads_per_threadgroup: (256, 1, 1),
+                threads_per_threadgroup: (crate::tape::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: None,
             },
             bindings: crate::interpreter::metal::lowered::baked(vec![
@@ -2338,7 +2340,7 @@ mod tests {
             constants: rmsnorm_constants(1),
             dispatch: DispatchShape {
                 threadgroups: (1, 1, 1),
-                threads_per_threadgroup: (256, 1, 1),
+                threads_per_threadgroup: (crate::tape::kernel_constants::NORM_THREADS, 1, 1),
                 m_scaling: None,
             },
             bindings: crate::interpreter::metal::lowered::baked(vec![

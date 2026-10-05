@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 
 use crate::handoff::{LoweredDecode, SourceBinding};
+use crate::lower::GemmWeightKind;
 use crate::ops::SubOpKind;
 use crate::subtile_ir::{KvOperand, SubOp, SubtileIR, TensorId};
 use crate::subtile_tape::{SlotId, SubtileTape};
@@ -111,6 +112,13 @@ pub enum FoldPattern<K: 'static> {
         norm: SubOpKind,
         kernel: K,
     },
+    /// `add(norm(delta, gain), residual)`, the norm either operand and read by the add alone: the
+    /// norm folds into the add. Apply it after the folds that take the add or the norm with more.
+    NormAdd {
+        add: SubOpKind,
+        norm: SubOpKind,
+        kernel: K,
+    },
     /// `act(gate, up)` over expert rows: the gate and up `matmul`s (the activation's operands 0
     /// and 1), each read by the activation alone, fold into it.
     ExpertGated {
@@ -148,6 +156,31 @@ pub enum FoldPattern<K: 'static> {
         encode: SubOpKind,
         kernel: K,
     },
+    /// A `norm` that only `matmul`s read, each as its operand 0 and of `weights`, folds into every
+    /// one of them: each normalizes the norm's input as it loads it. Only on a model whose matvecs
+    /// take their ends ([`ModelFoldFacts::matvec_ends`]); apply it before the folds that take a
+    /// norm whole.
+    NormedMatvecs {
+        norm: SubOpKind,
+        matmul: SubOpKind,
+        weights: GemmWeightKind,
+        kernel: K,
+    },
+    /// A `matmul` of `weights` read by one step alone, down a chain of such steps: at most a
+    /// `bias`, then a `scale`, then a residual `add` reading the chain as either operand. The
+    /// chain folds into the matmul, which computes it as it stores its rows: the steps before the
+    /// last are absorbed, the last is its epilogue. A chain without an add ends before a step of
+    /// `gated` kinds (the gated folds take the matmul whole). Only on a model whose matvecs take
+    /// their ends ([`ModelFoldFacts::matvec_ends`]).
+    MatvecEpilogue {
+        matmul: SubOpKind,
+        weights: GemmWeightKind,
+        bias: SubOpKind,
+        scale: SubOpKind,
+        add: SubOpKind,
+        gated: &'static [SubOpKind],
+        kernel: K,
+    },
 }
 
 /// The stages a routing fold's scores may pass through after the gather.
@@ -162,10 +195,13 @@ impl<K> FoldPattern<K> {
             Self::Gated { mul, .. } => *mul,
             Self::NormedRope { rope, .. } => *rope,
             Self::NormAddScale { scale, .. } => *scale,
+            Self::NormAdd { add, .. } => *add,
             Self::ExpertGated { act, .. } => *act,
             Self::ExpertCombined { combine, .. } => *combine,
             Self::Route { top_k, .. } => *top_k,
             Self::Encoded { writer, .. } => *writer,
+            Self::NormedMatvecs { norm, .. } => *norm,
+            Self::MatvecEpilogue { matmul, .. } => *matmul,
         }
     }
 }
@@ -183,6 +219,9 @@ pub struct FusionTable<K: 'static> {
 pub struct ModelFoldFacts {
     /// A gated activation's gate and up projections fold into its command.
     pub fold_projections: bool,
+    /// The one-row matvecs take their ends: their input's norm ([`FoldPattern::NormedMatvecs`])
+    /// and their rows' bias, scale and residual add ([`FoldPattern::MatvecEpilogue`]).
+    pub matvec_ends: bool,
 }
 
 /// What a fused command computes beyond its driver step.
@@ -213,6 +252,13 @@ pub enum FusedShape {
         q_gain: Option<StepOperand>,
         k_gain: Option<StepOperand>,
     },
+    /// The norm's input and gain, and the add's other operand.
+    NormAdd {
+        norm: SlotId,
+        delta: StepOperand,
+        residual: StepOperand,
+        gain: StepOperand,
+    },
     /// `residual` is the add's other operand.
     NormAddScale {
         add: SlotId,
@@ -241,6 +287,17 @@ pub enum FusedShape {
     Encoded {
         k: SlotId,
         v: SlotId,
+    },
+    /// The norm this matmul's input passes through: the command reads the norm's input and gain.
+    NormedMatvec {
+        norm: SlotId,
+    },
+    /// The chain this matmul's rows pass through, each step there: its bias, its scale, and the
+    /// residual add (with the add's other operand). The command writes the chain's last buffer.
+    MatvecEpilogue {
+        bias: Option<SlotId>,
+        scale: Option<SlotId>,
+        add: Option<(SlotId, StepOperand)>,
     },
 }
 
@@ -311,6 +368,7 @@ impl<K> TapeFolds<K> {
     pub fn fold_facts(&self) -> FoldFacts {
         FoldFacts {
             absorbed: self.absorbed.clone(),
+            epilogue: self.epilogue.clone(),
             normed_rope: self
                 .fusions()
                 .filter(|(_, f)| matches!(f.shape, FusedShape::NormedRope { .. }))
@@ -599,6 +657,7 @@ impl<K: Copy> Folder<'_, K> {
             FoldPattern::NormAddScale {
                 add, norm, kernel, ..
             } => self.norm_add_scale(i, add, norm, kernel),
+            FoldPattern::NormAdd { norm, kernel, .. } => self.norm_add(i, norm, kernel),
             FoldPattern::ExpertGated { matmul, kernel, .. } => {
                 let gate = self.sole_producer(i, 0, matmul)?;
                 let up = self.sole_producer(i, 1, matmul)?;
@@ -640,7 +699,149 @@ impl<K: Copy> Folder<'_, K> {
                 self.encoded(i, encode, kernel);
                 Ok(())
             }
+            FoldPattern::NormedMatvecs {
+                matmul,
+                weights,
+                kernel,
+                ..
+            } => self.normed_matvecs(i, (matmul, weights), kernel),
+            FoldPattern::MatvecEpilogue {
+                weights,
+                bias,
+                scale,
+                add,
+                gated,
+                kernel,
+                ..
+            } => self.matvec_epilogue(i, weights, [bias, scale, add], gated, kernel),
         }
+    }
+
+    /// Whether `j` is a one-row matmul over `weights`.
+    fn is_matvec(&self, j: usize, weights: GemmWeightKind) -> bool {
+        matches!(self.ops.op(j), SubOp::MatmulTile { weight, .. } if weight.kind() == weights)
+    }
+
+    /// The one step reading `j`, when one step reads it once and nothing else does.
+    fn sole_reader(&self, j: usize) -> Option<usize> {
+        if self.consumers[j] != 1 {
+            return None;
+        }
+        let ops = &self.ops;
+        (0..ops.slot.len()).find(|&c| {
+            ops.args[c]
+                .iter()
+                .any(|a| matches!(a, Arg::Op(q) if *q == j))
+        })
+    }
+
+    /// Matmul `i`'s bias, scale and residual add, in that order, each read by the last alone.
+    fn matvec_epilogue(
+        &mut self,
+        i: usize,
+        weights: GemmWeightKind,
+        [bias, scale, add]: [SubOpKind; 3],
+        gated: &[SubOpKind],
+        kernel: K,
+    ) -> Result<(), FoldError> {
+        if !self.model.matvec_ends || !self.is_matvec(i, weights) || self.absorbed[i].is_some() {
+            return Ok(());
+        }
+        let free = |f: &Self, j: usize| {
+            f.absorbed[j].is_none() && f.epilogue[j].is_none() && f.fusions[j].is_empty()
+        };
+        let (mut chain, mut cur) = (Vec::new(), i);
+        let mut taken = [None; 2];
+        for (stage, kind) in [bias, scale].into_iter().enumerate() {
+            let Some(c) = self.sole_reader(cur) else {
+                break;
+            };
+            if self.ops.kind(c) != kind || !free(self, c) || self.ops.first_op(c) != Some(cur) {
+                continue;
+            }
+            (taken[stage], cur) = (Some(c), c);
+            chain.push(c);
+        }
+        let mut residual = None;
+        if let Some(c) = self.sole_reader(cur)
+            && self.ops.kind(c) == add
+            && free(self, c)
+        {
+            let at = (0..2u8).find(|&k| self.ops.in_op(c, k).ok().flatten() == Some(cur));
+            if let Some(k) = at {
+                self.ops.arg(c, 1 - k)?;
+                residual = Some((c, self.ops.operand(c, 1 - k)));
+                chain.push(c);
+            }
+        }
+        let Some(&last) = chain.last() else {
+            return Ok(());
+        };
+        if residual.is_none() {
+            let ops = &self.ops;
+            let gates = (0..ops.slot.len()).any(|c| {
+                gated.contains(&ops.kind(c))
+                    && ops.args[c]
+                        .iter()
+                        .any(|a| matches!(a, Arg::Op(q) if *q == last))
+            });
+            if gates {
+                return Ok(());
+            }
+        }
+        for &c in &chain[..chain.len() - 1] {
+            self.absorbed[c] = Some(i);
+        }
+        self.epilogue[last] = Some(i);
+        let slot = |j: usize| self.ops.slot[j];
+        let shape = FusedShape::MatvecEpilogue {
+            bias: taken[0].map(slot),
+            scale: taken[1].map(slot),
+            add: residual.map(|(c, r)| (slot(c), r)),
+        };
+        self.record(i, kernel, shape);
+        Ok(())
+    }
+
+    /// Norm `i` into every matmul reading it. The norm is absorbed into its last reader in tape
+    /// order, where its input is last read.
+    fn normed_matvecs(
+        &mut self,
+        i: usize,
+        (matmul, weights): (SubOpKind, GemmWeightKind),
+        kernel: K,
+    ) -> Result<(), FoldError> {
+        if !self.model.matvec_ends || self.absorbed[i].is_some() || !self.fusions[i].is_empty() {
+            return Ok(());
+        }
+        let ops = &self.ops;
+        let is_matvec = |j: usize| ops.kind(j) == matmul && self.is_matvec(j, weights);
+        let reads = |j: usize| {
+            ops.args[j]
+                .iter()
+                .filter(|a| matches!(a, Arg::Op(q) if *q == i))
+        };
+        let readers: Vec<usize> = (0..ops.slot.len())
+            .filter(|&j| reads(j).count() > 0)
+            .collect();
+        let normalizes = |j: usize| {
+            is_matvec(j)
+                && self.absorbed[j].is_none()
+                && ops.first_op(j) == Some(i)
+                && reads(j).count() == 1
+        };
+        if readers.len() != self.consumers[i] || !readers.iter().all(|&j| normalizes(j)) {
+            return Ok(());
+        }
+        let Some(&last) = readers.iter().max_by_key(|&&j| ops.pos[j]) else {
+            return Ok(());
+        };
+        self.absorbed[i] = Some(last);
+        let norm = self.ops.slot[i];
+        for j in readers {
+            self.record(j, kernel, FusedShape::NormedMatvec { norm });
+        }
+        Ok(())
     }
 
     /// `i`'s K and V `encode` steps — in the construct it was expanded into, not yet taken.
@@ -806,7 +1007,7 @@ impl<K: Copy> Folder<'_, K> {
                 ops.kind(j) == norm && ops.first_op(j) == Some(a) && self.absorbed[j].is_none()
             })
             .min_by_key(|&j| ops.canonical_rank(j));
-        if winner == Some(i) && self.absorbed[a].is_none() {
+        if winner == Some(i) && self.absorbed[a].is_none() && self.epilogue[a].is_none() {
             self.absorbed[a] = Some(i);
             let add = ops.slot[a];
             self.record(i, kernel, FusedShape::ResidualNorm { add });
@@ -920,6 +1121,37 @@ impl<K: Copy> Folder<'_, K> {
         Ok(())
     }
 
+    /// Add `i` with a norm only it reads as either operand: the norm folds into it.
+    fn norm_add(&mut self, i: usize, norm: SubOpKind, kernel: K) -> Result<(), FoldError> {
+        if self.absorbed[i].is_some() || self.epilogue[i].is_some() || !self.fusions[i].is_empty() {
+            return Ok(());
+        }
+        let ops = &self.ops;
+        for k in 0..2u8 {
+            let Some(nrm) = ops.in_op(i, k)? else {
+                continue;
+            };
+            let free = self.absorbed[nrm].is_none() && self.fusions[nrm].is_empty();
+            if ops.kind(nrm) != norm || !free || self.consumers[nrm] != 1 {
+                continue;
+            }
+            let Some(gain) = ops.weight_operand(nrm) else {
+                continue;
+            };
+            ops.arg(i, 1 - k)?;
+            let shape = FusedShape::NormAdd {
+                norm: ops.slot[nrm],
+                delta: ops.operand(nrm, 0),
+                residual: ops.operand(i, 1 - k),
+                gain,
+            };
+            self.absorbed[nrm] = Some(i);
+            self.record(i, kernel, shape);
+            return Ok(());
+        }
+        Ok(())
+    }
+
     fn norm_add_scale(
         &mut self,
         i: usize,
@@ -931,7 +1163,7 @@ impl<K: Copy> Folder<'_, K> {
         let Some(a) = ops.in_op(i, 0)? else {
             return Ok(());
         };
-        if ops.kind(a) != add || self.absorbed[a].is_some() {
+        if ops.kind(a) != add || self.absorbed[a].is_some() || self.epilogue[a].is_some() {
             return Ok(());
         }
         let Some(nrm) = ops.in_op(a, 0)? else {
@@ -1013,6 +1245,8 @@ mod tests {
         ExpertCombined,
         Route,
         Encoded,
+        Normed,
+        Epilogue,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -1031,6 +1265,21 @@ mod tests {
                     bias: K::BiasAdd,
                     kernel: Kern::Centred,
                     biased: Kern::CentredBiased,
+                },
+                FoldPattern::MatvecEpilogue {
+                    matmul: K::MatmulTile,
+                    weights: GemmWeightKind::Dense,
+                    bias: K::BiasAdd,
+                    scale: K::ScalarMul,
+                    add: K::Add,
+                    gated: &[K::Gelu, K::Mul],
+                    kernel: Kern::Epilogue,
+                },
+                FoldPattern::NormedMatvecs {
+                    norm: K::RmsNorm,
+                    matmul: K::MatmulTile,
+                    weights: GemmWeightKind::Dense,
+                    kernel: Kern::Normed,
                 },
                 FoldPattern::ResidualNorm {
                     norm: K::RmsNorm,
@@ -1098,6 +1347,7 @@ mod tests {
 
     const SPLIT: ModelFoldFacts = ModelFoldFacts {
         fold_projections: false,
+        matvec_ends: false,
     };
 
     const ADD: ArchOp = SubOp::Elementwise(EwKind::Add);
@@ -1175,6 +1425,110 @@ mod tests {
             .collect();
         let folds = fold_tape(&graph, &tape, lowered, table, model).expect("the fixture folds");
         (slots, folds)
+    }
+
+    const ENDS: ModelFoldFacts = ModelFoldFacts {
+        fold_projections: false,
+        matvec_ends: true,
+    };
+
+    #[test]
+    fn a_norm_only_matvecs_read_folds_into_each() {
+        let ops = |reader: OpDesc| {
+            vec![
+                norm(vec![Ext(0), Ext(1)]),
+                gemm(64, vec![Op(0), Ext(2)]),
+                reader,
+                op(MUL, 1, vec![Op(1), Op(2)]),
+            ]
+        };
+        let matvec = || gemm(64, vec![Op(0), Ext(3)]);
+        let src = [(1, 64), (1, 64), (64, 64), (64, 64)];
+        let (s, f) = fold(&src, weights(4), ops(matvec()), &[], &TABLE, ENDS);
+        // Absorbed into its last reader, where the input it reads is last read.
+        assert_eq!(f.role(s[0]), StepRole::Absorbed { into: s[2] });
+        let reads = Fusion {
+            kernel: Kern::Normed,
+            shape: FusedShape::NormedMatvec { norm: s[0] },
+        };
+        assert_eq!(f.driven(s[1]), [reads]);
+        assert_eq!(f.driven(s[2]), [reads]);
+        // A model whose matvecs do not take their ends, or a norm another kind of step reads too.
+        let (s, f) = fold(&src, weights(4), ops(matvec()), &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+        let (s, f) = fold(
+            &src,
+            weights(4),
+            ops(op(ADD, 1, vec![Op(0), Op(1)])),
+            &[],
+            &TABLE,
+            ENDS,
+        );
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+    }
+
+    #[test]
+    fn a_matvecs_bias_scale_and_residual_add_fold_into_it() {
+        let bias = || SubOp::Elementwise(EwKind::BiasAdd);
+        let scale = || SubOp::ScalarMul { scale: 0.25 };
+        let src = [(1, 64), (64, 64), (1, 64)];
+        // gemm → bias → scale → add(residual, ·) → norm: every step after the gemm is its chain.
+        let ops = vec![
+            gemm(64, vec![Ext(0), Ext(1)]),
+            op(bias(), 1, vec![Op(0), Ext(1)]),
+            op(scale(), 1, vec![Op(1)]),
+            op(ADD, 1, vec![Ext(0), Op(2)]),
+            norm(vec![Op(3), Ext(2)]),
+        ];
+        let (s, f) = fold(&src, weights(3), ops.clone(), &[], &TABLE, ENDS);
+        assert_eq!(f.role(s[1]), StepRole::Absorbed { into: s[0] });
+        assert_eq!(f.role(s[2]), StepRole::Absorbed { into: s[0] });
+        assert_eq!(f.role(s[3]), StepRole::Epilogue { of: s[0] });
+        let chain = Fusion {
+            kernel: Kern::Epilogue,
+            shape: FusedShape::MatvecEpilogue {
+                bias: Some(s[1]),
+                scale: Some(s[2]),
+                add: Some((
+                    s[3],
+                    StepOperand {
+                        step: s[3],
+                        operand: OperandIx(0),
+                    },
+                )),
+            },
+        };
+        assert_eq!(f.role(s[0]), StepRole::Drives(&chain));
+        // The norm reading the add does not take it whole.
+        assert_eq!(f.role(s[4]), StepRole::Kept);
+        // Off: the add folds into the norm.
+        let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[3]), StepRole::Absorbed { into: s[4] });
+        assert!(f.driven(s[0]).is_empty());
+
+        // A bias alone, read by a step no gated fold takes: its epilogue. Read by a gated
+        // activation, it stays: the gated folds take the matmul whole.
+        let read_by = |reader: ArchOp| {
+            vec![
+                gemm(64, vec![Ext(0), Ext(1)]),
+                op(bias(), 1, vec![Op(0), Ext(1)]),
+                op(reader, 1, vec![Op(1)]),
+            ]
+        };
+        let (s, f) = fold(&src, weights(3), read_by(scale()), &[], &TABLE, ENDS);
+        let (shape, role) = (f.driven(s[0]), f.role(s[1]));
+        assert_eq!(role, StepRole::Absorbed { into: s[0] });
+        assert!(matches!(
+            shape,
+            [Fusion {
+                shape: FusedShape::MatvecEpilogue { add: None, .. },
+                ..
+            }]
+        ));
+        let gelu = SubOp::Elementwise(EwKind::Gelu);
+        let (s, f) = fold(&src, weights(3), read_by(gelu), &[], &TABLE, ENDS);
+        assert_eq!(f.role(s[1]), StepRole::Kept);
+        assert!(f.driven(s[0]).is_empty());
     }
 
     #[test]
@@ -1359,6 +1713,7 @@ mod tests {
         let (s, split) = fold(&src, weights(4), ops(), &[], &TABLE, SPLIT);
         let fused = ModelFoldFacts {
             fold_projections: true,
+            matvec_ends: false,
         };
         let (_, joined) = fold(&src, weights(4), ops(), &[], &TABLE, fused);
         assert_eq!(split.absorbed().collect::<Vec<_>>(), [(s[2], s[3])]);
