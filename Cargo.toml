@@ -36,6 +36,7 @@ members = [
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/subtile",
+    "crates/compiler/serving/chat-template/survey",
     "crates/targets/cuda/cost-sweep",
     "crates/targets/metal",
     "crates/targets/metal/compiler",
