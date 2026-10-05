@@ -16,9 +16,10 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   `matmul_fp8.py` (the activation-quantize dedup the old note here called a
   bundle-level blocker lives in the DOOR, downstream of both producers — see
   the splice module header).
-* CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N` — stated by the splice from
-  the node's own regions (`A is [M, K]`, `out is [M, N]`, all blocks the whole extents —
-  ONE tile, the same whole-region law `KtirFunc::matmul` states).
+* CONSTEXPRS: `M`, `K`, `N`, `BLOCK_M`, `BLOCK_K`, `BLOCK_N`, `M_TOTAL` — stated by
+  the splice from the node's own regions (`A is [M, K]`, the out tile is `[M, N]`,
+  all blocks the whole extents — ONE tile, the same whole-region law
+  `KtirFunc::matmul` states).
 * GRID: `[1]`.
 
 THE ORIENTATION: the weight descriptor is the PRESENTED weight's own on-disk `[n, k]`
@@ -30,6 +31,26 @@ own `KtirFunc::matmul` states (it views the weight `view_shaped(w, n, k)` and ca
 the transposition in the maps). The two paths therefore not only emit byte-identical
 descriptors but also contract the same bytes the same way on EVERY executor, with no
 orientation seam between the door and the program.
+
+⛔⛔ `N` IS THE **DEVICE** WIDTH, NOT THE LOGICAL ONE — the door's own padding law
+(`DeviceWidth::for_matmul`: a FLOP-heavy matmul's output stick count is bumped to
+≥8-splittable, so granite's 49155-wide lm_head is 49664 on device), and the splice
+states it as exactly that. Three facts make the device width the honest spelling:
+
+1. THE CARD WRITES IT. The emitted kernel MAC's over `[k, n_dev]` — the padded
+   columns are the door's own contract (`out_width_the_weight_holds`: the worker
+   zero-pads the staged weight to the same rule, so the pad is real).
+2. THE LAYOUT RESERVES IT. The logits placement is the device width (the door's
+   `pointwise_width_the_output_holds` case-(b) proof depends on exactly that), so a
+   view stating the logical width understates the buffer every consumer addresses.
+3. THE EMISSION IS PAD-IDEMPOTENT. `for_matmul(m, n_dev, k)` reproduces `n_dev`
+   (a bumped stick count is already ≥8-splittable), and the weight-holds drop is
+   applied by the door to BOTH paths — so a spliced tile at `n_dev` and a builder
+   tile at the logical `n` reach the SAME `assemble_matmul_*` call, byte-identical.
+
+The weight descriptor's shape is `[N, K]` at the same device width — the zero-padded
+staging the worker binds (the checkpoint's leading `n_logical` rows, then zero pad
+rows feeding only the output's don't-care pad columns).
 """
 
 import triton
@@ -46,16 +67,17 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
                ):
     start_m = tl.program_id(0)
     # Descriptors, not pointer blocks (swiglu delta 3). The W descriptor is the
-    # presented weight's own `[N, K]` on-disk region; the `.T` below is the transposed
-    # canonical form (`tt.trans` directly over the load), which `dot_to_linalg` folds
-    # into the transpose-B indexing maps — the same maps `KtirFunc::matmul` states over
-    # the same bytes.
+    # presented weight's own `[N, K]` on-disk region at the DEVICE width (the
+    # zero-padded staging); the `.T` below is the transposed canonical form
+    # (`tt.trans` directly over the load), which `dot_to_linalg` folds into the
+    # transpose-B indexing maps — the same maps `KtirFunc::matmul` states over the
+    # same bytes.
     # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — the out
-    # descriptor's shape is the OUTPUT TENSOR's `[M_TOTAL, N]` (the storage the layout
-    # reserved), while the store takes the `[M, N]` tile at row 0: the prefill lm-head
-    # fold re-lowers the tail at m=1 over the LAST_HIDDEN staging, and its output is
-    # row 0 of the `[mq, vocab]` logits storage. A whole-region node states
-    # `M_TOTAL = M`, so nothing changes for it.
+    # descriptor's shape is the OUTPUT TENSOR's `[M_TOTAL, N]` (the storage the
+    # layout reserved, N the device width), while the store takes the `[M, N]`
+    # tile at row 0: the prefill lm-head fold re-lowers the tail at m=1 over the
+    # LAST_HIDDEN staging, and its output is row 0 of the `[mq, vocab]` logits
+    # storage. A whole-region node states `M_TOTAL = M`, so nothing changes for it.
     a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_M, BLOCK_K])

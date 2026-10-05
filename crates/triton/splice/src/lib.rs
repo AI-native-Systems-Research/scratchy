@@ -754,13 +754,25 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // extent (the storage the descriptor addresses) while the store takes the
             // `[M, N]` tile at row 0 — the prefill lm-head fold's m=1 tail, whose
             // output is row 0 of the `[mq, vocab]` logits storage.
+            // ⛔ `N` IS THE DEVICE WIDTH — the door's own padding law, stated here so
+            // the view/tile name the storage every consumer addresses: the card writes
+            // `n_dev` columns (`out_width_the_weight_holds`'s staged-weight contract),
+            // the layout reserves `n_dev` (`pointwise_width_the_output_holds`'s
+            // case-(b) proof), and a pointwise consumer on the same buffer (granite's
+            // logits scalarmul, whose chunk-6 window is `for_pointwise`-padded) needs
+            // the VIEW to hold the tile. `for_matmul` is IDEMPOTENT at a padded width
+            // and the weight-holds drop is the door's, applied to both paths — so this
+            // spelling and the builder's logical one reach the same emit,
+            // byte-identical. The fp8 arm stays LOGICAL: its door arm returns early
+            // through `matmul_fp8_descriptors(m, k, n)` and is not pad-idempotent.
             let (m_total, _a_total) = matmul_window_of(node, ir)?;
+            let n_dev = ktir_superdsc::work::DeviceWidth::for_matmul(m, *n, k, false).get();
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
-            ce("N", Val::Int(i128::from(*n)))?;
+            ce("N", Val::Int(i128::from(n_dev)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_K", Val::Int(i128::from(k)))?;
-            ce("BLOCK_N", Val::Int(i128::from(*n)))?;
+            ce("BLOCK_N", Val::Int(i128::from(n_dev)))?;
             ce("M_TOTAL", Val::Int(i128::from(m_total)))?;
         }
         (
@@ -926,13 +938,25 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // both paths. The other pointwise families (elementwise, silumul) state
             // the LOGICAL width because their door arms do — `check_pointwise_cols`
             // refuses a non-stick width rather than padding it.
+            // ⛔ AND SO IS `N_TOTAL` — the STORAGE is the device width too: the
+            // producer matmul wrote `for_matmul`-padded columns and the layout
+            // reserved exactly that (the weight-holds / output-holds proofs both rely
+            // on the pad being real), so a view at the logical width understates the
+            // buffer and a device-width TILE at the chunk corner leaves it — granite's
+            // chunk 6 (`[31, 512]` at 49152 of a 49159-wide view) is exactly that
+            // refusal. `for_pointwise` of the logical storage IS the producer's
+            // `for_output` width (the documented equality, for any matmul above the
+            // util floor), so the widened view names the storage the placement
+            // actually holds.
             let c_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(c).get();
             let (block_m, n_blocks, tail_h) = blocks_of(m, c_dev, 3);
+            let n_total_dev =
+                ktir_superdsc::work::DeviceWidth::for_pointwise(n_total).get();
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c_dev)))?;
             ce("BLOCK_M", Val::Int(i128::from(block_m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c_dev)))?;
-            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total_dev)))?;
             ce("C_START", Val::Int(i128::from(c_start)))?;
             ce("N_BLOCKS", Val::Int(i128::from(n_blocks)))?;
             ce("TAIL_H", Val::Int(i128::from(tail_h)))?;
