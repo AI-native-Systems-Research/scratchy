@@ -4184,75 +4184,33 @@ fn lower_one(
                 gemm_dims: None,
             });
 
-            // 2. Input-dependent gating → g, beta (f32 scratch).
-            //    1D over [num_tokens · nv]; scales X with num_tokens.
-            cmds.push(LoweredCommand {
-                kernel: KernelId::GatedDeltaNet,
-                library: "gdn_gating",
-                function: gdn_gating_static_name(dtype),
-                constants: baked(vec![
-                    ConstantValue::uint(0, bucket_m * nv),
-                    ConstantValue::uint(1, nv),
-                ]),
-                dispatch: {
-                    let mut d = DispatchShape::dispatch_1d(bucket_m * nv, THREADS_PER_GROUP);
-                    d.m_scaling = Some(MScaling {
-                        axis: MScaleAxis::X,
-                        bucket_m: BucketM(bucket_m),
-                        seq_axis: None,
-                    });
-                    d
-                },
-                bindings: baked(vec![
-                    Binding::MoeScratch {
-                        binding_index: 0,
-                        byte_offset: layout.g,
-                    },
-                    Binding::MoeScratch {
-                        binding_index: 1,
-                        byte_offset: layout.beta,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *a_slot,
-                        binding_index: 2,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *b_slot,
-                        binding_index: 3,
-                    },
-                    weight(WeightTensor::GdnALog, 4),
-                    weight(WeightTensor::GdnDtBias, 5),
-                ]),
-                gemm_dims: None,
-            });
-
-            // 3. Recurrent gated delta-rule scan → o (f32 scratch).
-            //    grid (ceil(hv/tgx), nv, num_seqs[set via seq_axis=Z]).
-            //    Always the _f32 instantiation (all I/O is f32 scratch).
-            cmds.push(LoweredCommand {
-                kernel: KernelId::GatedDeltaNet,
-                library: "gdn_scan_varlen",
-                function: "gdn_scan_varlen_f32",
-                constants: baked(vec![
+            // A decode-sized bucket with head_k a multiple of 32: the gating and the scan run as one
+            // command, mlx-lm's simdgroup-per-value-dim mapping (`gdn_scan_simd`); then the norm.
+            let simd_scan =
+                bucket_m <= GDN_SIMD_SCAN_ROWS && hk.is_multiple_of(32) && hv.is_multiple_of(4);
+            let scan_constants = || {
+                baked(vec![
                     ConstantValue::uint(0, nk),
                     ConstantValue::uint(1, nv),
                     ConstantValue::uint(2, hk),
                     ConstantValue::uint(3, hv),
                     ConstantValue::float(4, scale),
-                ]),
-                dispatch: {
-                    let tgx = hv.clamp(1, THREADS_PER_GROUP);
-                    DispatchShape {
-                        threadgroups: (hv.div_ceil(tgx), nv, 1),
-                        threads_per_threadgroup: (tgx, 1, 1),
-                        m_scaling: Some(MScaling {
-                            axis: MScaleAxis::Z,
-                            bucket_m: BucketM(1),
-                            seq_axis: Some(MScaleAxis::Z),
-                        }),
-                    }
-                },
-                bindings: baked(vec![
+                ])
+            };
+            let scan_state = |first: u8| {
+                [
+                    runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, first),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, first + 1),
+                    runtime(RuntimeBindingKind::GdnStateIndices, first + 2),
+                    runtime(RuntimeBindingKind::GdnIsFresh, first + 3),
+                ]
+            };
+            if simd_scan {
+                let arena = |slot: &u32, binding_index| Binding::ArenaSlot {
+                    slot: *slot,
+                    binding_index,
+                };
+                let mut bindings = vec![
                     Binding::MoeScratch {
                         binding_index: 0,
                         byte_offset: layout.o,
@@ -4261,21 +4219,112 @@ fn lower_one(
                         binding_index: 1,
                         byte_offset: layout.conv_out,
                     },
-                    Binding::MoeScratch {
-                        binding_index: 2,
-                        byte_offset: layout.g,
+                    arena(a_slot, 2),
+                    arena(b_slot, 3),
+                ];
+                bindings.extend(scan_state(4));
+                bindings.extend([
+                    weight(WeightTensor::GdnALog, 8),
+                    weight(WeightTensor::GdnDtBias, 9),
+                ]);
+                cmds.push(LoweredCommand {
+                    kernel: KernelId::GatedDeltaNet,
+                    library: "gdn_scan_varlen",
+                    function: gdn_scan_simd_static_name(dtype),
+                    constants: scan_constants(),
+                    dispatch: DispatchShape {
+                        threadgroups: (1, nv * hv / 4, 1),
+                        threads_per_threadgroup: (32, 4, 1),
+                        m_scaling: Some(MScaling {
+                            axis: MScaleAxis::Z,
+                            bucket_m: BucketM(1),
+                            seq_axis: Some(MScaleAxis::Z),
+                        }),
                     },
-                    Binding::MoeScratch {
-                        binding_index: 3,
-                        byte_offset: layout.beta,
+                    bindings: baked(bindings),
+                    gemm_dims: None,
+                });
+            } else {
+                // 2. Input-dependent gating → g, beta (f32 scratch).
+                //    1D over [num_tokens · nv]; scales X with num_tokens.
+                cmds.push(LoweredCommand {
+                    kernel: KernelId::GatedDeltaNet,
+                    library: "gdn_gating",
+                    function: gdn_gating_static_name(dtype),
+                    constants: baked(vec![
+                        ConstantValue::uint(0, bucket_m * nv),
+                        ConstantValue::uint(1, nv),
+                    ]),
+                    dispatch: {
+                        let mut d = DispatchShape::dispatch_1d(bucket_m * nv, THREADS_PER_GROUP);
+                        d.m_scaling = Some(MScaling {
+                            axis: MScaleAxis::X,
+                            bucket_m: BucketM(bucket_m),
+                            seq_axis: None,
+                        });
+                        d
                     },
-                    runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, 4),
-                    runtime(RuntimeBindingKind::CuSeqlensQ, 5),
-                    runtime(RuntimeBindingKind::GdnStateIndices, 6),
-                    runtime(RuntimeBindingKind::GdnIsFresh, 7),
-                ]),
-                gemm_dims: None,
-            });
+                    bindings: baked(vec![
+                        Binding::MoeScratch {
+                            binding_index: 0,
+                            byte_offset: layout.g,
+                        },
+                        Binding::MoeScratch {
+                            binding_index: 1,
+                            byte_offset: layout.beta,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *a_slot,
+                            binding_index: 2,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *b_slot,
+                            binding_index: 3,
+                        },
+                        weight(WeightTensor::GdnALog, 4),
+                        weight(WeightTensor::GdnDtBias, 5),
+                    ]),
+                    gemm_dims: None,
+                });
+
+                // 3. Recurrent gated delta-rule scan → o (f32 scratch).
+                //    grid (ceil(hv/tgx), nv, num_seqs[set via seq_axis=Z]).
+                //    Always the _f32 instantiation (all I/O is f32 scratch).
+                cmds.push(LoweredCommand {
+                    kernel: KernelId::GatedDeltaNet,
+                    library: "gdn_scan_varlen",
+                    function: "gdn_scan_varlen_f32",
+                    constants: scan_constants(),
+                    dispatch: {
+                        let tgx = hv.clamp(1, THREADS_PER_GROUP);
+                        DispatchShape {
+                            threadgroups: (hv.div_ceil(tgx), nv, 1),
+                            threads_per_threadgroup: (tgx, 1, 1),
+                            m_scaling: Some(MScaling {
+                                axis: MScaleAxis::Z,
+                                bucket_m: BucketM(1),
+                                seq_axis: Some(MScaleAxis::Z),
+                            }),
+                        }
+                    },
+                    bindings: baked(
+                        [
+                            (0, layout.o),
+                            (1, layout.conv_out),
+                            (2, layout.g),
+                            (3, layout.beta),
+                        ]
+                        .map(|(binding_index, byte_offset)| Binding::MoeScratch {
+                            binding_index,
+                            byte_offset,
+                        })
+                        .into_iter()
+                        .chain(scan_state(4))
+                        .collect(),
+                    ),
+                    gemm_dims: None,
+                });
+            }
 
             // 4. Gated RMSNorm → core (model-dtype arena out_slot).
             //    One threadgroup per row [num_tokens · nv]; scales X.
@@ -5042,6 +5091,17 @@ fn gdn_gating_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gdn_gating_f16",
         DequantDtype::Bf16 => "gdn_gating_bf16",
+    }
+}
+
+/// The buckets whose Gated-DeltaNet scan runs simdgroup-per-value-dim (`gdn_scan_simd`): a step
+/// this small holds a token per sequence, or a few, and is latency-bound on the per-thread scan.
+const GDN_SIMD_SCAN_ROWS: u32 = 8;
+
+fn gdn_scan_simd_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_scan_simd_f16",
+        DequantDtype::Bf16 => "gdn_scan_simd_bf16",
     }
 }
 
