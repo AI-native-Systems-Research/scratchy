@@ -59,18 +59,31 @@ def load(data_dir):
         except json.JSONDecodeError as e:
             errors.append(f"{f.name}: not valid JSON ({e})")
             continue
+        if not isinstance(run, dict):
+            errors.append(f"{f.name}: not a run object")
+            continue
+        before = len(errors)
         for block, keys in REQUIRED.items():
-            obj = run if not block else run.get(block) or {}
+            obj = run if not block else run.get(block)
+            if not isinstance(obj, dict):
+                errors.append(f"{f.name}: missing {block}")
+                continue
             for k in keys:
                 if obj.get(k) in (None, ""):
                     errors.append(f"{f.name}: missing {block + '.' if block else ''}{k}")
         if run.get("schema") not in (None, 2):
             errors.append(f"{f.name}: schema {run.get('schema')!r}, this page reads schema 2")
-        for i, m in enumerate(run.get("models") or []):
-            for k in MODEL_REQUIRED:
-                if k not in m:
-                    errors.append(f"{f.name}: models[{i}] missing {k}")
-        want = f"{slug(run.get('machine', {}).get('chip', ''))}-{run.get('generated_utc', '')[:10]}-{str(run.get('repo', {}).get('sha', ''))[:8]}.json"
+        models = run.get("models")
+        if not isinstance(models, list):
+            errors.append(f"{f.name}: models is not a list")
+        else:
+            for i, m in enumerate(models):
+                missing = [k for k in MODEL_REQUIRED if not isinstance(m, dict) or k not in m]
+                if missing:
+                    errors.append(f"{f.name}: models[{i}] missing {', '.join(missing)}")
+        if len(errors) > before:          # the name check needs the fields above
+            continue
+        want = f"{slug(run['machine']['chip'])}-{run['generated_utc'][:10]}-{str(run['repo']['sha'])[:8]}.json"
         if f.name != want:
             errors.append(f"{f.name}: name it {want} (<machine>-<date>-<sha8>.json)")
         run["_file"] = f
@@ -82,8 +95,8 @@ def load(data_dir):
     return runs
 
 
-def slug(chip):
-    return re.sub(r"[^a-z0-9]+", "-", chip.lower()).strip("-")
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
 
 
 # ------------------------------------------------------------------ numbers
@@ -111,7 +124,7 @@ def lfmt(ladder, scenario, field, nd=0, scale=1):
 
 def served(m):
     """Whether scratchy produced any number for this model."""
-    return m.get("built") and (m.get("cache_ladder") or m.get("warm_serving") or m.get("scaling"))
+    return bool(m.get("built") and (m.get("cache_ladder") or m.get("warm_serving") or m.get("scaling")))
 
 
 def fmt(v, nd=0, scale=1):
@@ -137,12 +150,31 @@ def timing(c, metric):
     return c.get(metric)
 
 
+def untimed(c):
+    """Requests in a cell that arrived in one piece and so were left out of its
+    TTFT/TPOT (bench serve's `unstreamed_requests`; absent, so 0, in runs
+    made before it existed)."""
+    return (c or {}).get("unstreamed_requests") or 0
+
+
+PARTIAL = "†"
+
+
+def partial(c, metric):
+    """Whether a timing is real but taken from only some of the cell's requests."""
+    return metric in TIMINGS and streamed(c) and untimed(c) > 0
+
+
+def untimed_note(c):
+    return f"{untimed(c)} of {c.get('completed', '?')} untimed"
+
+
 def cfmt(c, metric, nd=0):
     """A cell's value as text: says "no stream" rather than show a timing the
-    engine never produced."""
+    engine never produced, and marks one taken from only some requests."""
     if c and metric in TIMINGS and not streamed(c):
         return NO_STREAM
-    return fmt(timing(c, metric), nd)
+    return fmt(timing(c, metric), nd) + (PARTIAL if partial(c, metric) else "")
 
 
 def nice_max(v):
@@ -164,7 +196,40 @@ def tip(rows):
     return esc(json.dumps(rows, separators=(",", ":")))
 
 
-def summary_table(m, run):
+# Run-to-run spread on one machine at one commit: Nick's two M1 Max runs of
+# af009bf1 agreed within about 2%, so a smaller change is noise, not a result.
+NOISE = 0.03
+
+
+def delta(new, old, higher_better):
+    """A change badge against the previous run: arrow plus percent, the arrow
+    coloured by better/worse so colour is never the only signal; "≈" inside
+    the noise band; nothing when either side is missing."""
+    if new is None or old is None or old == 0:
+        return ""
+    ch = (new - old) / old
+    if abs(ch) < NOISE:
+        return '<span class="delta" title="within 3% of the previous run">≈</span>'
+    better = (ch > 0) == higher_better
+    word = "better" if better else "worse"
+    return (f'<span class="delta" title="{word} than the previous run">'
+            f'<i class="{word}">{"▲" if ch > 0 else "▼"}</i>{abs(ch) * 100:.0f}%</span>')
+
+
+def summary_raw(m, lk, sk):
+    """The summary row's numbers, unformatted, for comparing two runs."""
+    ladder, one = m.get(lk), cell(m.get(sk), "conc", 1)
+    return [med(ladder, "frozen", "t_ready_s"), med(ladder, "cold", "t_ready_s"),
+            med(ladder, "cold", "ttft_from_send_s"), med(ladder, "warm", "ttft_from_send_s"),
+            timing(one, "median_ttft_ms"), timing(one, "median_tpot_ms"),
+            timing(one, "output_throughput"), med(ladder, "cold", "peak_rss_mib")]
+
+
+# Only tok/s is better higher; every time and memory column is better lower.
+SUMMARY_HIGHER_BETTER = [False, False, False, False, False, False, True, False]
+
+
+def summary_table(m, run, prev=None):
     base = (run["config"].get("scaling") or {}).get("base") or {}
     shape = f"{base.get('input', '?')} in / {base.get('output', '?')} out" if base else ""
     rows = []
@@ -175,10 +240,8 @@ def summary_table(m, run):
             rows.append(f'<tr><th scope="row"><span class="key {cls}"></span>{label}</th>'
                         f'<td colspan="8" class="gap">No numbers: {why}. See the run\'s raw logs.</td></tr>')
             continue
-        if key == "mlx-lm" and not (ladder or m.get(sk)):
-            continue
-        if key == "ollama" and not (ladder or m.get(sk)):
-            continue
+        if key != "scratchy" and not (ladder or m.get(sk)):
+            continue                      # that engine was not part of this run
         name = label
         if key == "ollama" and m.get("ollama"):
             o = m["ollama"]
@@ -190,14 +253,22 @@ def summary_table(m, run):
             lfmt(ladder, "warm", "ttft_from_send_s", 0, 1000),
             cfmt(one, "median_ttft_ms"),
             cfmt(one, "median_tpot_ms", 1),
-            fmt(one and one.get("output_throughput"), 1),
+            fmt(timing(one, "output_throughput"), 1),
             fmt(med(ladder, "cold", "peak_rss_mib")),
         ]
+        badges = [""] * len(vals)
+        if key == "scratchy" and prev is not None:
+            badges = [delta(n, o, hb) for n, o, hb in
+                      zip(summary_raw(m, lk, sk), summary_raw(prev[1], lk, sk), SUMMARY_HIGHER_BETTER)]
         rows.append(f'<tr><th scope="row"><span class="key {cls}"></span>{name}</th>'
-                    + "".join(f"<td>{v}</td>" for v in vals) + "</tr>")
+                    + "".join(f"<td>{v}{b}</td>" for v, b in zip(vals, badges)) + "</tr>")
+    vs = ""
+    if prev is not None:
+        vs = (f' Under scratchy: change since its previous run here ({esc(prev[0]["generated_utc"][:10])}, '
+              f'<code>{esc(str(prev[0]["repo"]["sha"])[:8])}</code>); ≈ is within 3%.')
     return f"""<div class="mpart">
   <h4>Startup and single-user speed</h4>
-  <p class="msub">One row per engine. Startup in seconds (warm in ms); one user at {shape or 'the base shape'}.</p>
+  <p class="msub">One row per engine. Startup in seconds (warm in ms); one user at {shape or 'the base shape'}.{vs}</p>
 <div class="mtable"><table>
   <thead>
     <tr><th rowspan="2" scope="col" class="first">engine</th>
@@ -216,15 +287,19 @@ def summary_table(m, run):
 </div>"""
 
 
-def line_svg(series, xs, cid, ylabel, nd, title, head):
+def line_svg(series, xs, cid, ylabel, nd, title, head, notes=None):
     """One line chart: offered users on x, one line per engine. A point that
-    was not measured (None) leaves a gap in its line rather than a bridge."""
+    was not measured (None) leaves a gap in its line rather than a bridge.
+    `notes` maps (engine label, x) to a suffix for that point's tooltip."""
+    notes = notes or {}
     W, H, L, R, T, B = 400, 230, 46, 72, 12, 38
     pw, ph = W - L - R, H - T - B
     vals = [v for _, _, pts in series for _, v in pts if v is not None]
     ymax = nice_max(max(vals))
     xpos = {x: L + (pw * i / (len(xs) - 1) if len(xs) > 1 else pw / 2) for i, x in enumerate(xs)}
-    ypos = lambda v: T + ph - ph * v / ymax
+
+    def ypos(v):
+        return T + ph - ph * v / ymax
 
     out = [f'<svg viewBox="0 0 {W} {H}" class="mchart" role="img" '
            f'aria-labelledby="{cid}-t"><title id="{cid}-t">{esc(title)}</title>']
@@ -268,11 +343,16 @@ def line_svg(series, xs, cid, ylabel, nd, title, head):
         out.append(f'<text class="endlbl" x="{x + 14:.1f}" y="{ly + 4:.1f}">{esc(label)}</text>')
     # One hit band per x, wider than any mark: the crosshair finds the x and
     # the tooltip lists every engine there.
+    by_x = [(label, cls, dict(pts)) for label, cls, pts in series]
     for i, x in enumerate(xs):
         left = (xpos[xs[i - 1]] + xpos[x]) / 2 if i else L
         right = (xpos[x] + xpos[xs[i + 1]]) / 2 if i + 1 < len(xs) else L + pw
-        rows = [[NO_STREAM if dict(pts).get(x, 0) is None else fmt(dict(pts).get(x), nd), label, cls]
-                for label, cls, pts in series]
+        rows = []
+        for label, cls, at in by_x:
+            # A point present but None was not measured (no stream); absent is "—".
+            value = NO_STREAM if x in at and at[x] is None else fmt(at.get(x), nd)
+            note = notes.get((label, x))
+            rows.append([value + (PARTIAL if note else ""), label + (f" ({note})" if note else ""), cls])
         out.append(f'<rect class="hit" x="{left:.1f}" y="{T}" width="{right - left:.1f}" height="{ph}" '
                    f'tabindex="0" data-x="{xpos[x]:.1f}" data-head="{x} offered users · {esc(head)}" '
                    f'data-tip="{tip(rows)}"><title>{x} users</title></rect>')
@@ -280,7 +360,7 @@ def line_svg(series, xs, cid, ylabel, nd, title, head):
     return "".join(out)
 
 
-def conc_chart(m, mid):
+def conc_chart(m, mid, base, prev=None):
     """Throughput and time per output token against offered users, side by
     side: two measures, so two charts on one x axis rather than two y axes."""
     cells = {key: {c["rung"]: c for c in m.get(sk) or [] if c.get("axis") == "conc"}
@@ -289,8 +369,14 @@ def conc_chart(m, mid):
     if not xs:
         return ""
 
+    # The previous run's scratchy line, drawn first so it sits behind.
+    pcs = {c["rung"]: c for c in (prev[1].get("scaling") if prev else None) or [] if c.get("axis") == "conc"}
+    plabel = f"previous ({prev[0]['generated_utc'][5:10]})" if prev else ""
+
     def series(metric):
         out = []
+        if pcs:
+            out.append((plabel, "prev", [(x, timing(pcs[x], metric)) for x in xs if x in pcs]))
         for key, label, _lk, _sk, cls in ENGINES:
             cs = cells[key]
             if cs:
@@ -306,13 +392,20 @@ def conc_chart(m, mid):
     if tpot:
         # An engine that never streamed has no TPOT; say so rather than let
         # its line silently vanish from this chart.
-        gone = [label for label, _, _ in tput if label not in {l for l, _, _ in tpot}]
+        plotted = {label for label, _, _ in tpot}
+        gone = [label for label, cls, _ in tput if cls != "prev" and label not in plotted]
         note = f'<p class="msub">{esc(", ".join(gone))}: {NO_STREAM}, not plotted.</p>' if gone else ""
+        marks = {(label, x): untimed_note(cells[key][x])
+                 for key, label, _lk, _sk, _c in ENGINES for x in cells[key]
+                 if partial(cells[key][x], "median_tpot_ms")}
         charts.append(("Time per output token", "ms, lower is better",
                        line_svg(tpot, xs, f"{mid}-tpot", "ms", 1,
-                                "Median time per output token against offered concurrent users, per engine", "TPOT ms"), note))
+                                "Median time per output token against offered concurrent users, per engine", "TPOT ms",
+                                marks), note))
     shown = {label for label, _, _ in tput + tpot}
     engines = [(label, cls) for _k, label, _lk, _sk, cls in ENGINES if label in shown]
+    if plabel in shown:
+        engines.append((f"scratchy, {plabel}", "prev"))
     # One engine needs no legend: its end label and the caption already name it.
     legend = "".join(f'<span><span class="lkey {cls}"></span>{esc(label)}</span>'
                      for label, cls in engines) if len(engines) > 1 else ""
@@ -330,17 +423,13 @@ def conc_chart(m, mid):
                     for t, u, svg, note in charts)
     return f"""<figure class="mfig">
   <figcaption><h4>As users are added</h4>
-    <p class="msub">Throughput and time per output token with 1, 4 and 16 users at once; {esc(_base(m, 'input'))}-token prompts, {esc(_base(m, 'output'))}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine.</p></figcaption>
+    <p class="msub">Throughput and time per output token with {esc(", ".join(map(str, xs[:-1])) + " and " + str(xs[-1]) if len(xs) > 1 else xs[0])} users at once; {esc(base.get("input", "?"))}-token prompts, {esc(base.get("output", "?"))}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine.</p></figcaption>
   <div class="legend">{legend}</div>
   <div class="chartrow">{panes}</div>
   <details><summary>Table view</summary><div class="mtable"><table>
     <thead><tr><th scope="col">offered users</th>{head}</tr></thead><tbody>{''.join(trs)}</tbody>
   </table></div></details>
 </figure>"""
-
-
-def _base(m, k):
-    return m.get("_base", {}).get(k, "?")
 
 
 def ratio_tint(r):
@@ -367,27 +456,34 @@ def grid_maps(m, run):
     rival = present[0] if present else None
     other = present[1] if len(present) > 1 else None
 
+    def why(c, name):
+        return f"{name}: {NO_STREAM}" if c else f"no {name}"
+
     def one(metric, title, faster):
+        def mark(*cells):
+            return PARTIAL if any(partial(c, metric) for c in cells) else ""
+
         rows = []
         for i in ins:
             tds = []
             for o in outs:
                 rung = f"{i}x{o}"
-                get = lambda k: have[k].get(rung) if k else None
-                cs, cr, co = get("scratchy"), get(rival), get(other)
+                cs = have["scratchy"].get(rung)
+                cr = have[rival].get(rung) if rival else None
+                co = have[other].get(rung) if other else None
                 s, vr, vo = timing(cs, metric), timing(cr, metric), timing(co, metric)
                 r_r, r_o = faster(s, vr), faster(s, vo)
                 nd = 1 if metric == "output_throughput" else 0
-                tiprows = [[cfmt(have[k].get(rung), metric, nd), k, cls]
+                tiprows = [[cfmt(have[k].get(rung), metric, nd),
+                            k + (f" ({untimed_note(have[k][rung])})" if partial(have[k].get(rung), metric) else ""), cls]
                            for k, _l, _lk, _sk, cls in ENGINES if have[k]]
-                why = lambda c, name: f"{name}: {NO_STREAM}" if c else f"no {name}"
                 unit = "tok/s" if metric == "output_throughput" else "ms"
                 if rival is None:                 # nothing to compare against
                     big, small = cfmt(cs, metric, nd), unit if s is not None else ""
                 else:
-                    big = (f"×{r_r:.2f}" if r_r is not None
+                    big = (f"×{r_r:.2f}{mark(cs, cr)}" if r_r is not None
                            else why(cs, "scratchy") if s is None else why(cr, rival))
-                    small = (f"vs {other} ×{r_o:.2f}" if r_o is not None
+                    small = (f"vs {other} ×{r_o:.2f}{mark(cs, co)}" if r_o is not None
                              else "" if s is None or not other else why(co, other))
                 tds.append(f'<td{ratio_tint(r_r)} tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
                            f'data-tip="{tip(tiprows)}"><b>{big}</b><span>{small}</span></td>')
@@ -399,8 +495,11 @@ def grid_maps(m, run):
     <tbody>{''.join(rows)}</tbody></table>
   </div>"""
 
-    tput = lambda s, o: s / o if s and o else None    # higher is better
-    ttft = lambda s, o: o / s if s and o else None    # lower is better
+    def tput(s, o):                       # higher is better
+        return s / o if s and o else None
+
+    def ttft(s, o):                       # lower is better
+        return o / s if s and o else None
     if rival is None:
         note = "scratchy's own values; this run has no mlx-lm or ollama to compare against"
         scale = ""
@@ -430,20 +529,24 @@ def history(entries):
     for run, m in reversed(entries):
         sha = str(run["repo"]["sha"])[:8]
         ladder, one = m.get("cache_ladder"), cell(m.get("scaling"), "conc", 1)
+        top = max((c["rung"] for c in m.get("scaling") or [] if c.get("axis") == "conc"), default=None)
+        many = cell(m.get("scaling"), "conc", top) if top else None
         if served(m):
             vals = [fmt(med(ladder, "cold", "t_ready_s"), 2), fmt(med(ladder, "cold", "ttft_from_send_s"), 2),
                     fmt(med(ladder, "warm", "ttft_from_send_s"), 0, 1000),
-                    fmt(one and one.get("output_throughput"), 1)]
+                    fmt(timing(one, "output_throughput"), 1),
+                    fmt(timing(many, "output_throughput"), 1), cfmt(many, "median_tpot_ms", 1)]
             tds = "".join(f"<td>{v}</td>" for v in vals)
         else:
-            tds = '<td colspan="4" class="gap">no numbers</td>'
+            tds = '<td colspan="6" class="gap">no numbers</td>'
         rows.append(f'<tr><th scope="row">{run["generated_utc"][:10]}</th>'
                     f'<td><a href="{REPO}/commit/{esc(run["repo"]["sha"])}"><code>{sha}</code></a>'
                     '</td>'
                     f'<td>{esc(m.get("quant") or "")}</td>{tds}</tr>')
-    return f"""<details class="hist"><summary>Earlier runs of this model ({len(entries) - 1})</summary><div class="mtable"><table>
+    return f"""<details class="hist"><summary>Runs of this model ({len(entries)})</summary><div class="mtable"><table>
   <thead><tr><th scope="col">run</th><th scope="col">scratchy</th><th scope="col">quant</th>
-  <th scope="col">cold s</th><th scope="col">1st req s</th><th scope="col">warm ms</th><th scope="col">tok/s, 1 user</th></tr></thead>
+  <th scope="col">cold s</th><th scope="col">1st req s</th><th scope="col">warm ms</th><th scope="col">tok/s, 1 user</th>
+  <th scope="col">tok/s, most users</th><th scope="col">TPOT ms, most users</th></tr></thead>
   <tbody>{''.join(rows)}</tbody></table></div></details>"""
 
 
@@ -457,7 +560,7 @@ def runs_table(runs):
             f'<td><a href="{REPO}/commit/{esc(r["sha"])}"><code>{esc(str(r["sha"])[:8])}</code></a>'
             '</td>'
             f'<td>{esc(", ".join(c.get("scenarios") or []))}</td>'
-            f'<td>{prime if prime is not None else "not recorded"}</td>'
+            f'<td>{esc(prime) if prime is not None else "not recorded"}</td>'
             f'<td>{esc(c.get("kv_cache_dtype") or "")}</td>'
             f'<td><a href="data/metal/{esc(run["_file"].name)}">json</a></td></tr>')
     return f"""<details class="hist"><summary>Runs on this machine ({len(runs)})</summary><div class="mtable"><table>
@@ -482,19 +585,23 @@ def machine_section(chip, runs):
   <p class="mmeta">{cores} · {esc(mc["memory_gb"])} GB unified memory · macOS {esc(mc["macos"])}</p>
   {runs_table(runs)}"""]
     for stem, (run, m) in latest.items():
-        m = dict(m, _base=(run["config"].get("scaling") or {}).get("base") or {})
+        # Before/after: the newest earlier run of this model, here, that scratchy served.
+        prev = next(((r, pm) for r, pm in reversed(seen[stem][:-1]) if served(pm)), None)
         mid = f"{mslug}-{slug(stem)}"
         f = m.get("footprint") or {}
         build = ""
         if f.get("build_seconds") is not None:
-            build = f' · scratchy build {f["build_seconds"]} s, {round(f["binary_bytes"] / 1048576)} MiB binary'
+            build = f' · scratchy build {esc(f["build_seconds"])} s'
+            if f.get("binary_bytes"):
+                build += f', {round(f["binary_bytes"] / 1048576)} MiB binary'
+        base = (run["config"].get("scaling") or {}).get("base") or {}
         parts.append(f"""  <article class="mmodel" id="{mid}">
     <h3>{esc(stem)} <span class="onmachine">on {esc(chip)}</span></h3>
     <p class="mmeta"><a href="https://huggingface.co/{esc(m["model_id"])}">{esc(m["model_id"])}</a>
       · {esc(m.get("quant") or "default")}{build}
       · run {esc(run["generated_utc"][:10])}, <code>{esc(str(run["repo"]["sha"])[:8])}</code></p>
-    {summary_table(m, run)}
-    {conc_chart(m, mid)}
+    {summary_table(m, run, prev)}
+    {conc_chart(m, mid, base, prev)}
     {grid_maps(m, run)}
     {history(seen[stem])}
   </article>""")
@@ -516,16 +623,10 @@ def page(header, data_dir):
     nav = "\n".join(
         f'      <cds-side-nav-link href="#{slug(chip)}">{esc(chip)}</cds-side-nav-link>'
         for chip in sorted(machines))
-    out = PAGE
-    for key, val in {
-        "{header}": header,
-        "{nav}": nav,
-        "{body}": body,
-        "{count}": str(len(runs)),
-        "{machines}": str(len(machines)),
-        "{repo}": REPO,
-    }.items():
-        out = out.replace(key, val)
+    fill = {"header": header, "nav": nav, "body": body, "count": str(len(runs)),
+            "machines": str(len(machines)), "repo": REPO}
+    # One pass, so text a placeholder inserts is never itself rewritten.
+    out = re.sub(r"\{(" + "|".join(fill) + r")\}", lambda mo: fill[mo.group(1)], PAGE)
     return out, runs, len(machines)
 
 
@@ -620,6 +721,9 @@ PAGE = r"""<!doctype html>
       fairly.</dd>
       <dt>no stream</dt>
       <dd>The answer arrived in one piece, so TTFT and TPOT could not be timed.</dd>
+      <dt>†</dt>
+      <dd>Some of that cell's answers arrived in one piece; its TTFT and TPOT come from the
+      rest. Hover for how many.</dd>
       <dt>Build · RSS</dt>
       <dd>scratchy's build time is shown per model, never in startup. Peak RSS is the server
       process (<code>ollama serve</code> only, for ollama).</dd>

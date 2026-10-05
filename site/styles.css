@@ -559,6 +559,14 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .key.s1, .lkey.s1 { background: var(--s1); }
 .key.s2, .lkey.s2 { background: var(--s2); }
 .key.s3, .lkey.s3 { background: var(--s3); }
+.lkey.prev { background: var(--muted); opacity: 0.7; }
+
+/* Before/after badge under a scratchy number: the arrow carries better/worse
+ * in Carbon's support colours; the figure itself stays in text ink. */
+.delta { display: block; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); font-weight: 600; }
+.delta i { font-style: normal; margin-right: 0.15rem; }
+.delta i.better { color: var(--cds-support-success); }
+.delta i.worse { color: var(--cds-support-error); }
 
 .mfig { margin: 2rem 0; }
 .mfig figcaption { margin-bottom: 0.5rem; }
@@ -575,6 +583,9 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .mchart .ln.s1 { stroke: var(--s1); } .mchart .dot.s1 { fill: var(--s1); }
 .mchart .ln.s2 { stroke: var(--s2); } .mchart .dot.s2 { fill: var(--s2); }
 .mchart .ln.s3 { stroke: var(--s3); } .mchart .dot.s3 { fill: var(--s3); }
+/* The previous run: de-emphasis grey, thinner, hollow dots, behind the rest. */
+.mchart .ln.prev { stroke: var(--muted); stroke-width: 1.5; opacity: 0.7; }
+.mchart .dot.prev { fill: var(--bg); stroke: var(--muted); stroke-width: 1.5; opacity: 0.8; }
 .mchart .endlbl { fill: var(--fg); font-size: 12px; }
 .mchart .leader, .mchart .xhair { stroke: var(--muted); stroke-width: 1; }
 .mchart .hit { fill: transparent; outline: none; }
