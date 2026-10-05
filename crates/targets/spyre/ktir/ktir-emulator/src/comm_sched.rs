@@ -1430,6 +1430,25 @@ impl CoreRunner {
             if op.op_type == OpKind::ScfFor
                 && let Some(info) = op.result.and_then(|r| matmul_sched.get(&r))
             {
+                // ⭐ FREE THE LOOP'S INIT SEED BEFORE THE OFFLOAD CHARGES ITS OUTPUT. The
+                // offload never READS the seed — it reconstructs the GEMM from `a_root`/
+                // `b_root` and accumulates in its own f32 buffers — but it does CHARGE the
+                // full-M `[m, n]` result beside it, and a recognized loop's seed is an
+                // `[m, n]` splat too. For an f32 fp8 pre-scale code-dot (matmul_fp8's
+                // f32 seed) that pair is 2× the output alone: MEASURED at the gemma-4-12b
+                // fp8 prefill, `1904640 + 1904640 > 2097152 charging %16 (GEMM out
+                // [31, 15360])` — the f16 pair fit exactly, the f32 one needs the seed
+                // freed first. The dies_at reclaim below frees it right AFTER the offload;
+                // hoisting it to before is LX-equivalent for every consumer (the seed's
+                // only readers are the skipped loop bodies of this and sibling offloaded
+                // loops). m>1 only: at m==1 the offload may fall through to the
+                // interpreter's `scf.for`, whose body DOES read the seed (the matmul's
+                // `outs`) — and an m==1 charge is `n` elements, never the problem.
+                if info.m > 1 {
+                    if let Some(&seed) = op.operands.get(3) {
+                        self.ctx.forget(seed);
+                    }
+                }
                 match crate::metal::run_matmul_loop_gpu(info, &mut self.ctx) {
                     Ok(()) => {
                         if let Some(dead) = self.dies_at.get(this_idx) {

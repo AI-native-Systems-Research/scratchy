@@ -1079,7 +1079,15 @@ pub fn run_matmul_loop_gpu(
         DType::F16
     };
     let tile = crate::tile::Tile::compute(c, out_dtype, vec![m, n]);
-    let bytes = tile.size_bytes() as i64;
+    // ⛔ LX RESIDENCY STAYS THE DEVICE'S fp16 FOOTPRINT. The F32 widen above is a
+    // NUMERICS convention (the wider accumulate), not a device layout: the card's
+    // `matmulfp8` output IS the DDL's fp16 `%ptsum_fp` (`bmm.ddl`), so what lives in
+    // LX on the device is `m*n*2` bytes whatever the emulator computes in. Charging
+    // the f32 tile's size instead made gemma-4-12b-fp8's prefill refuse here — two
+    // live `[31, 15360]` outs are 1.9 MB + 1.9 MB > the 2 MB core, while the device
+    // fits the same two at 952 KB each (granite's `[31, 8192]` happened to squeak
+    // under even at f32, which is why only gemma tripped it).
+    let bytes = (m * n * DType::F16.bytes_per_elem()) as i64;
     ctx.set_value(info.out_ssa, crate::ir::Value::Tile(tile));
     // Name the GEMM in an LX refusal: the charge is `m*n*2`, so the shape IS the diagnosis.
     ctx.track_lx(info.out_ssa, bytes).map_err(|e| {

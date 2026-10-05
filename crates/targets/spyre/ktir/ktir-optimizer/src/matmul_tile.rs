@@ -57,15 +57,26 @@ fn k_block(k: i64, n: i64) -> i64 {
 ///
 /// The GEMM offload holds the `[m, bw]` accumulator (plus its K-loop siblings and the cross-block
 /// residue) resident in the 2 MB LX, so the constraint is on `m · bw`, NOT `n` alone.
-fn n_block(n: i64, m: i64) -> i64 {
+///
+/// ⛔ THE BUDGET IS A BYTE BUDGET. An F32 accumulator — the fp8 pre-scale code-dot
+/// `lower_subtile_tape_to_ktir`'s `matmul_fp8` keeps in f32 (the un-scaled dot overflows f16
+/// long before the scale `mulf` brings it home) — is 2× the bytes of the f16 one at the same
+/// `[m, bw]`, so the element budget it may spend is `BLOCK_MN_BYTES / bytes_per_elem`:
+/// MEASURED at the gemma-4-12b fp8 prefill (m=31, n=15360), an f32 `[31, 15360]` GEMM out is
+/// 1_904_640 B and the init splat beside it another 1_904_640 B — 3.8 MB against the 2 MB LX,
+/// where the f16 pair (952_320 + 952_320) fit exactly. The f16 element budget (1 MB / 2 B =
+/// 512K elements) is the historical value verbatim; the f32 one halves to 256K, which blocks
+/// the f32 form at half the width so the interpreter reclaims per block.
+fn n_block(n: i64, m: i64, elem: DType) -> i64 {
     const WHOLE_N_FITS_M1: i64 = 90_000;
     const BLOCK_N: i64 = 16_384;
-    const BLOCK_MN_BUDGET: i64 = 512 * 1024;
+    const BLOCK_MN_BYTES: i64 = 1024 * 1024;
     let m = m.max(1);
     if m.saturating_mul(n) <= WHOLE_N_FITS_M1 {
         n
     } else {
-        BLOCK_N.min(BLOCK_MN_BUDGET / m).max(1)
+        let budget = BLOCK_MN_BYTES / elem.bytes_per_elem() as i64;
+        BLOCK_N.min(budget / m).max(1)
     }
 }
 
@@ -305,7 +316,7 @@ fn tile_func<'a>(a: &'a Arena, func: &mut IRFunction<'a>) -> usize {
             p.a_row
         };
 
-        let nblk = n_block(p.n, p.m);
+        let nblk = n_block(p.n, p.m, elem);
         let mut n_off = 0i64;
         while n_off < p.n {
             let bw = nblk.min(p.n - n_off);
@@ -735,5 +746,28 @@ mod tests {
                 "the fp8 store must drain the scaled value"
             );
         }
+    }
+
+    /// ⛔ The N-block budget is a BYTE budget. The gemma-4-12b fp8 prefill (m=31, n=15360)
+    /// keeps the pre-scale code-dot in f32, so its `[31, 15360]` GEMM out is 1_904_640 B —
+    /// beside the equally-sized f32 init splat that is 3.8 MB against the 2 MB LX, where the
+    /// f16 pair (952_320 + 952_320) fit exactly. An F32 accumulator must therefore block at
+    /// HALF the f16 element budget, while the f16 form keeps its exact old width.
+    #[test]
+    fn the_n_block_budget_is_bytes_not_elements() {
+        // f16 (the historical budget): 512K elements / m=31 = 16912, capped at 16384.
+        assert_eq!(n_block(200_000, 31, DType::F16), 16_384);
+        // f32: half the elements — 256K / 31 = 8456 — so a wide f32 out blocks below 1 MB.
+        assert_eq!(n_block(200_000, 31, DType::F32), 8_456);
+        // The MEASURED failure geometry: f32 [31, 15360] must NOT stay one whole-n block.
+        // m·n = 476_160 > 90_000, and with the f16 budget min(16384, 16912) = 16384 >= n
+        // would keep it whole (the 3.8 MB pair); the byte budget splits it.
+        assert!(
+            n_block(15_360, 31, DType::F32) < 15_360,
+            "the f32 12b prefill out must block, not stay whole-n"
+        );
+        // Whole-n small outputs are unchanged by dtype (decode's [1, n] is tiny either way).
+        assert_eq!(n_block(90_000, 1, DType::F32), 90_000);
+        assert_eq!(n_block(90_000, 1, DType::F16), 90_000);
     }
 }
