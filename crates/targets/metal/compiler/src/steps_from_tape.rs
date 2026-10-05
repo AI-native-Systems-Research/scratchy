@@ -636,7 +636,7 @@ impl Recording<'_> {
     fn block(&self, i: usize) -> Result<st::MoeBlock, StepRefusal> {
         let (mut experts, mut k, mut inter, mut hidden) = (None, None, None, None);
         let (mut router, mut bundle, mut input) = (None, None, st::RouterInput::Raw);
-        let mut quant = None;
+        let (mut group_size, mut gate, mut up, mut down) = (None, None, None, None);
         for j in self.group(i) {
             match *self.op(j) {
                 SubOp::RouterNorm { .. } => input = st::RouterInput::PreNormed,
@@ -646,17 +646,21 @@ impl Recording<'_> {
                 } => (experts, router) = (Some(st::NumExperts(e.get())), Some(r)),
                 SubOp::RouteTopK { k: t } => k = Some(st::TopK(t.get())),
                 SubOp::ExpertMatmul {
-                    proj: ExpertProj::Gate,
+                    proj,
                     n,
                     quant: q,
                     bundle: b,
                     ..
                 } => {
-                    (inter, bundle) = (Some(Inter(n)), Some(b));
-                    quant = Some(st::ExpertQuant {
-                        group_size: Gs(q.group().get()),
-                        bits: Bits(q.bits().get()),
-                    });
+                    let width = Some(self.expert_matmul(j)?.step.width.bits());
+                    match proj {
+                        ExpertProj::Gate => {
+                            (inter, bundle) = (Some(Inter(n)), Some(b));
+                            (group_size, gate) = (Some(Gs(q.group().get())), width);
+                        }
+                        ExpertProj::Up => up = width,
+                        ExpertProj::Down => down = width,
+                    }
                 }
                 SubOp::ExpertCombine { hidden: h, .. } => hidden = Some(W(h)),
                 _ => {}
@@ -671,7 +675,14 @@ impl Recording<'_> {
             router: router.ok_or_else(no)?,
             bundle: bundle.ok_or_else(no)?,
             input,
-            quant: quant.ok_or_else(no)?,
+            quant: st::ExpertQuant {
+                group_size: group_size.ok_or_else(no)?,
+                widths: st::ExpertWidths {
+                    gate: gate.ok_or_else(no)?,
+                    up: up.ok_or_else(no)?,
+                    down: down.ok_or_else(no)?,
+                },
+            },
         })
     }
 

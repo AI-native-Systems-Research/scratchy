@@ -260,7 +260,11 @@ pub fn moe_write(op: &SubOp) -> Option<MoeWrite> {
 }
 
 /// The expert bundles metal has a grouped (sorted-by-expert) GEMM for; the others always gather.
-pub const METAL_GROUPED_EXPERTS: &[ExpertBundle] = &[ExpertBundle::SwitchGlu];
+pub const METAL_GROUPED_EXPERTS: &[ExpertBundle] = &[
+    ExpertBundle::SwitchGlu,
+    ExpertBundle::Fused,
+    ExpertBundle::SharedFused,
+];
 
 /// The (row, pick) pairs from which a bake sorts a grouped bundle's pairs by expert; under them it
 /// gathers each row by its picks.

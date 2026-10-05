@@ -6168,7 +6168,9 @@ fn moe_w4a8(b: &MoeBlock, at: MoeBake, s: &MoeScratch) -> bool {
     let (hidden, inter) = (b.hidden.0, b.inter.0);
     s.grouping == MoeGrouping::Grouped
         && at.is_nax
-        && at.codes.for_bits(b.quant.bits.0) == super::kernel_constants::AffineCodes::Offset8
+        && b.quant.widths.uniform().is_some_and(|w| {
+            at.codes.for_bits(w.0) == super::kernel_constants::AffineCodes::Offset8
+        })
         && matches!(b.quant.group_size.0, 64 | 128)
         && hidden.is_multiple_of(64)
         && inter.is_multiple_of(64)
@@ -6342,11 +6344,16 @@ fn lower_moe_step(
             ms(A::Y),
         )
     };
-    let rows_of = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
-        // A sorted bake reads every row through the sort's own copy, in sorted order.
-        MoeRows::Tokens(_) if s.grouping == MoeGrouping::Sorted => s.at(i, R::SortedRows),
+    // Rows where the step that wrote them left them: the router's input, read before any sort.
+    let rows_at = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
         MoeRows::Tokens(Slot(slot)) => arena_at(i, slot),
         MoeRows::Scratch(r) => s.at(i, r),
+    };
+    // An expert projection's rows: a sorted bake reads the token rows through the sort's own
+    // copy, in sorted order.
+    let rows_of = |s: &MoeScratch, i: u8, rows: MoeRows| match rows {
+        MoeRows::Tokens(_) if s.grouping == MoeGrouping::Sorted => s.at(i, R::SortedRows),
+        rows => rows_at(s, i, rows),
     };
     // The expert-index buffer a gathered matvec pairs rows with: the sort's per-row copy when
     // the bake sorted, the router's top-k indices in token order otherwise.
@@ -6444,7 +6451,7 @@ fn lower_moe_step(
                 dispatch: grid((e.div_ceil(4), 1, 1), (256, 1, 1), None),
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
-                    rows_of(&s, 1, rows),
+                    rows_at(&s, 1, rows),
                     source(
                         router()?,
                         crate::op_abi::router_gate(b.router),
@@ -6467,7 +6474,7 @@ fn lower_moe_step(
                 dispatch: grid(tiles, (GEMM_TILE_M, GEMM_TILE_N, 1), ms(A::X)),
                 bindings: baked(vec![
                     s.at(0, R::RouterLogits),
-                    rows_of(&s, 1, rows),
+                    rows_at(&s, 1, rows),
                     source(router()?, gate, layer(&l), 2),
                 ]),
                 gemm_dims: Some(GemmDims {
@@ -8798,5 +8805,85 @@ mod tests {
             _ => panic!("bindings[4]: expected out_slot ArenaSlot"),
         }
         assert!(cmd.gemm_dims.is_none());
+    }
+
+    /// The router reads the token rows it routes in every bake: a sorted bake's sort runs after
+    /// it, so the sort's copy holds the previous layer's rows. Its expert projections read that
+    /// copy. Qwen3.6-35B-A3B's block (256 experts, top 8, raw router input), at buckets 1, 8 and
+    /// 64: 8, 64 and 512 pairs — gathered, sorted and grouped.
+    #[test]
+    fn the_router_reads_token_rows_in_every_grouping() {
+        use crate::tape::ids::{
+            AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, NumExperts, TopK,
+        };
+        use crate::tape::step::{
+            ExpertMatmul, ExpertQuant, ExpertWidth, ExpertWidths, MoeBlock, MoeRows, MoeStep,
+            RouterInput,
+        };
+        use scratchy_subtile::subtile_ir::{ExpertBundle, ExpertProj, RouterBundle};
+        let four = AffineBits(4);
+        let block = MoeBlock {
+            experts: NumExperts(256),
+            top_k: TopK(8),
+            inter: IntermediateSize(512),
+            hidden: HiddenSize(2048),
+            router: RouterBundle::SharedFused,
+            bundle: ExpertBundle::SharedFused,
+            input: RouterInput::Raw,
+            quant: ExpertQuant {
+                group_size: AffineGroupSize(64),
+                widths: ExpertWidths {
+                    gate: four,
+                    up: four,
+                    down: four,
+                },
+            },
+        };
+        let tokens = MoeRows::Tokens(Slot(1));
+        let p = tp();
+        let sorted_rows = |bucket_m| {
+            let mut bytes = 0;
+            let s = MoeScratch::of(&block, bucket_m, &p, &mut bytes);
+            (s.grouping, s.at(3, MoeRegion::SortedRows))
+        };
+        for bucket_m in [1, 8, 64] {
+            let at = MoeBake {
+                bucket_m,
+                layer_offset: 0,
+                is_nax: false,
+                codes: super::super::kernel_constants::AffineCodesTarget::of(None),
+            };
+            let lower = |step| {
+                lower_moe_step(&p, &block, step, row(), at, &mut 0).expect("a MoE step lowers")
+            };
+            let router = lower(MoeStep::RouterLogits(tokens, LayerId(0), None));
+            assert_eq!(
+                router[0].bindings[1],
+                Binding::ArenaSlot {
+                    slot: 1,
+                    binding_index: 1
+                },
+                "bucket {bucket_m}: the router's input rows"
+            );
+            let gate = ExpertMatmul {
+                rows: tokens,
+                layer: LayerId(0),
+                proj: ExpertProj::Gate,
+                group_size: AffineGroupSize(64),
+                width: ExpertWidth::OpUniform(four),
+            };
+            let (grouping, copy) = sorted_rows(bucket_m);
+            if grouping == MoeGrouping::Sorted {
+                let gate = lower(MoeStep::ExpertMatmul(gate));
+                assert_eq!(
+                    gate[0].bindings[3], copy,
+                    "the sorted gate reads the sort's copy"
+                );
+            }
+        }
+        assert!(
+            sorted_rows(8).0 == MoeGrouping::Sorted,
+            "bucket 8 is the sorted bake"
+        );
     }
 }

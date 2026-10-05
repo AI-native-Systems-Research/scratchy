@@ -23,7 +23,7 @@
 //   4. take_along_axis(pos) unsorts the down output back to token order.
 //
 // All index buffers are u32. `MG_M` = number of (token,expert) pairs
-// (= bucket_m * top_k). `MG_NUM_EXPERTS` ≤ 128 (gemma4 = 128).
+// (= bucket_m * top_k).
 
 #include <metal_stdlib>
 #include "baked.h"
@@ -51,7 +51,6 @@ SCRATCHY_CONSTANT_OPTIONAL(int, MG_BM, 6);
 // gathered matvecs have no such guard, so their bake fills 0 (a real
 // expert's slab — garbage compute on rows nothing reads).
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_SENTINEL, 7);
-constant int MG_MAX_EXPERTS = 128;
 
 #if SCRATCHY_COMPILES(moe_group_offsets)
 kernel void moe_group_offsets(
@@ -61,7 +60,8 @@ kernel void moe_group_offsets(
     device uint*       total     [[buffer(3)]],
     uint tid     [[thread_position_in_threadgroup]],
     uint tgsize  [[threads_per_threadgroup]]) {
-  threadgroup atomic_uint local[MG_MAX_EXPERTS];
+  // One bin per expert: the bake compiles this kernel at its block's expert count.
+  threadgroup atomic_uint local[MG_NUM_EXPERTS];
   const uint E = uint(MG_NUM_EXPERTS);
   for (uint i = tid; i < E; i += tgsize) {
     atomic_store_explicit(&local[i], 0u, memory_order_relaxed);
