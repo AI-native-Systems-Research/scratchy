@@ -201,6 +201,11 @@ These favour one side or the other and must travel with any published number.
   it is not a like-for-like measurement of model loading alone.
 - **Weight download is out of scope.** The checkpoint is on disk in all three
   scenarios.
+- **An agentic workload adds asymmetries of its own**, and resolves the
+  quantization rungs to concrete per-engine artifacts: see
+  [`CLAUDE_CODE_BENCH.md`](CLAUDE_CODE_BENCH.md), which carries the Claude Code
+  comparison's pins, disclosures and blocked cells. Its method is promoted into
+  this file as a §7 once that epic's phase 5 lands.
 
 ## 5. Running it
 
