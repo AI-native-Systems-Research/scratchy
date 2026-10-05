@@ -959,6 +959,26 @@ pub struct LowerRope<'a, F: RopeForm> {
     rows_are_requests: bool,
 }
 
+impl<'a, F: RopeForm> LowerRope<'a, F> {
+    /// THE GOLDEN CONTROL'S DOOR into the const-generic body — the same facts the
+    /// walk threads, stated by a caller that has no `lower_one_node` around it.
+    pub fn new(
+        node: &'a SubtileNode<F>,
+        ir: &'a SubtileIR<F>,
+        sym_id_base: &'a mut i64,
+        layout: Option<&'a BundleLayout>,
+        rows_are_requests: bool,
+    ) -> Self {
+        Self {
+            node,
+            ir,
+            sym_id_base,
+            layout,
+            rows_are_requests,
+        }
+    }
+}
+
 impl<F: RopeForm> scratchy_subtile::model_geometry::OnHeadDim for LowerRope<'_, F> {
     type Out = Result<Vec<EmittedOp>, SuperDscError>;
     fn on_head_dim<const HD: u32>(self) -> Self::Out {

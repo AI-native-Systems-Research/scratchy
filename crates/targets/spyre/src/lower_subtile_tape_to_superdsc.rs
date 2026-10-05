@@ -4738,16 +4738,18 @@ mod tests {
     fn prefill_m_gt_1_lm_head_folds_to_m1_decode_unchanged() {
         // The mq>1 (prefill) bundle CANNOT run the vocab-wide lm_head at m>1 (it time-tiles, and
         // per-row time-tiling is design-risk-4). It runs it at m=1 over the LAST prompt row instead,
-        // which is what lets prefill produce the first generated token's logits itself. This guards
-        // both halves of the fold: the per-stick extraction copies, and the m=1 re-lowering. The m=1
-        // DECODE bundle must stay a single bare matmul — no copies, no extra ops.
+        // which is what lets prefill produce the first generated token's logits itself.
         //
-        // ⛔ THROUGH THE WHOLE LOWERING, BECAUSE THE COPIES ARE DESCRIPTORS. The counted ops are
-        // SuperDSC descriptors — `hidden/64` `lmlast{j}_o2` copies + `matmul_o2`, main's own names —
-        // and after the SubtileIR → KTIR → SuperDSC split the producer emits ONE `lmlast_s0`
-        // PROGRAM whose consumer arm (`lower_ktir_to_superdsc::lmlast`) materializes those copies.
-        // Asking `lower_one_node` alone (which is what this used to do) counts programs, so a
-        // one-program-two-copies fold reads as "one op short" while the emission is exactly main's.
+        // ⛔ THE PRODUCER HALF IS THE SPLICE'S NOW, AND IT HAS NOT LANDED. The walk's fold rewrite is
+        // deleted (the splice hook fires before any builder arm, and a fallthrough after it would be
+        // the second producer this crate just finished removing), so an m>1 lm-head tail is a LOUD
+        // splice Err naming the missing fold kernel — the worklist's prefill-fold item. Until that
+        // lands, this test pins three things that must hold regardless: (1) the m>1 tail REFUSES BY
+        // NAME (never silently mis-lowers a vocab-wide matmul at m>1); (2) the m=1 DECODE bundle stays
+        // a single bare matmul — the fold never fires at m=1; (3) the CONSUMER half of the fold
+        // (`lower_ktir_to_superdsc::lmlast`, main's copy loop verbatim) still refuses a nameless
+        // extraction — pinned through the pub builder control `lower_prefill_lm_head_at_m1`, which is
+        // the card-proven body the splice's fold kernel must reproduce.
         use scratchy_subtile::subtile_ir::{
             SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
         };
@@ -4795,44 +4797,44 @@ mod tests {
             // t1 is the lm_head weight; t0 is the activation source.
             let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
             lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
-                .unwrap_or_else(|e| panic!("lm_head at m={m} unexpectedly refused: {}", e.0))
-                .0
-                .into_iter()
-                .map(|e| e.op_name)
-                .collect::<Vec<_>>()
+                .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
-        // m>1 (prefill): H/64 extraction copies, THEN the matmul re-lowered at m=1.
+        // m>1 (prefill): the tail REFUSES BY NAME — the splice's fold kernel (last-row extraction
+        // at m=1 over LAST_HIDDEN_TID + the m=1 matmul) has not landed, and a silent m>1 lowering
+        // is the wrong-token defect the fold exists to prevent.
         let mq = 8u32;
-        let names = lower(mq);
-        let copies = (h / Fp16::ELEMS_PER_STICK) as usize;
-        assert_eq!(
-            names.len(),
-            copies + 1,
-            "prefill (m>1) lm_head must fold to {copies} extraction copies + 1 matmul, got {names:?}"
-        );
-        for (j, name) in names.iter().take(copies).enumerate() {
-            assert_eq!(
-                name,
-                &format!("lmlast{j}_o2"),
-                "copy {j} misnamed in {names:?}"
-            );
-        }
-        assert_eq!(
-            names[copies], "matmul_o2",
-            "the folded tail must end in the lm_head matmul"
+        let why = match lower(mq) {
+            Err(e) => e.0,
+            Ok(names) => panic!(
+                "an m>1 lm-head tail must refuse loudly, not lower (got {names:?})"
+            ),
+        };
+        assert!(
+            why.contains("prefill lm-head tail"),
+            "the m>1 lm-head refusal must name the fold cause, got {why:?}"
         );
         // m==1 (decode): the SAME node lowers to exactly one bare matmul — the fold never fires, so
         // the decode bundle is byte-identical to the pre-fold emitter.
-        assert_eq!(lower(1), vec!["matmul_o2".to_string()]);
+        assert_eq!(
+            lower(1).expect("the m=1 decode lm_head lowers"),
+            vec!["matmul_o2".to_string()]
+        );
 
-        // ⛔ NEGATIVE CONTROL FOR THE NAME'S OWN FACT. `lmlast` names its copies from
-        // `KtirNode::node_out_tid`, and a MISSING one must REFUSE — not fall back to the program's own
-        // output, which is the reserved `LAST_HIDDEN_TID` and is exactly the wrong name this test
-        // pins. Strip the fact off the extraction program and the lowering must Err naming it.
-        let (_, ir) = build(mq);
+        // ⛔ NEGATIVE CONTROL FOR THE NAME'S OWN FACT, through the pub builder control.
+        // `lmlast` names its copies from `KtirNode::node_out_tid`, and a MISSING one must
+        // REFUSE — not fall back to the program's own output, which is the reserved
+        // `LAST_HIDDEN_TID` and is exactly the wrong name this test pins. Strip the fact off
+        // the extraction program and the door must Err naming it.
+        let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let (mut programs, layout) = lower_graph_to_ktir(&ir, &weight_ids, ActiveCap::FULL, false)
-            .expect("KTIR for the tail");
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+            .expect("the tail's layout mints");
+        let mut sym = 0i64;
+        let mut fp8q = std::collections::HashSet::new();
+        let mut programs = crate::lower_subtile_tape_to_ktir::lower_prefill_lm_head_at_m1(
+            &node, &ir, &mut sym, Some(&layout), &mut fp8q,
+        )
+        .expect("the builder control mints the tail");
         let extract = programs
             .iter_mut()
             .find(|e| e.op_name.starts_with("lmlast"))
@@ -4847,10 +4849,10 @@ mod tests {
             &mut fp8q,
             None,
         );
-        let why = stripped
-            .err()
-            .expect("a nameless extraction must refuse")
-            .message;
+        let why = match stripped {
+            Err(e) => e.message,
+            Ok(_) => panic!("a nameless extraction must refuse"),
+        };
         assert!(
             why.contains("node_out_tid"),
             "the refusal must name the missing fact, got {why:?}"
