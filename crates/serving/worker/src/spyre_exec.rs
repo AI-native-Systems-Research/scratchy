@@ -217,6 +217,40 @@ impl Worker for SpyreWorker {
         Some(PagedKvPool::MAX_PAGES_PER_ROW as usize * PagedKvPool::PAGE_SLOTS)
     }
 
+    /// 🛑 THE DECODE READS ONE BLOCK TABLE, SO HYBRID SWA KV MUST STAY OFF — the trait's own
+    /// contract (`worker.rs`: "a worker whose decode reads a single block table ... must run on
+    /// the uniform single-pool layout"). CUDA overrides this for the same reason.
+    ///
+    /// ⛔⭐⭐ THE GEMMA-4-12B fp8 GARBAGE-OUTPUT DEFECT, FOUND (2026-10-05). `SpyreWorker`
+    /// inherited the trait default `true`, so the engine handed gemma-4 the HYBRID scheduler
+    /// config (card log: "Hybrid SWA KV enabled: 84 shared blocks, 6 groups (5 sliding)") while
+    /// this backend bakes exactly ONE KV group — `spyre_exec.rs`'s own install path reads only
+    /// group 0's table (`.and_then(|groups| groups.first())`) and its comment admits "A hybrid
+    /// model would need a group per attention class, which this backend does not bake".
+    ///
+    /// The corruption is structural, not subtle:
+    /// * Page-size unification (`compute_hybrid_kv_layout`) scales the FULL group's block size
+    ///   4× (1024 tokens/block for gemma-4-12b: sliding 8×256 vs global 1×512) while the spyre
+    ///   pool's page is `PagedKvPool::PAGE_SLOTS` = 256 slots and the worker maps each block id
+    ///   to ONE page — so from token 256 on, a request's full-attention KV lands on pages its
+    ///   truncated table never names, and it attends another request's (or stale) keys: fluent
+    ///   multilingual gibberish at full speed, exactly the observed 8.3 tok/s symptom.
+    /// * The 5 SLIDING groups' tables are DISCARDED outright — the sliding-window layers
+    ///   attend through the full group's block ids, which the allocator freed out-of-window
+    ///   (null-padded) blocks for.
+    /// * Every non-hybrid model (granite) is unaffected — the same binary serves it coherently.
+    /// * The emulator is unaffected — the paged install is `spyre-hw`-gated, so emu runs never
+    ///   read a scheduler block table at all.
+    ///
+    /// Returning `false` keeps the scheduler on the UNIFORM single-group pool, where one block
+    /// table per request, 256 slots per block, IS the layout this backend bakes. The cost is the
+    /// documented uniform-pool tradeoff (sliding layers keep full-context KV rather than
+    /// window-evicting) — memory, not correctness, and the pool's byte-budget sizing already
+    /// accounts for it.
+    fn supports_hybrid_swa_kv(&self) -> bool {
+        false
+    }
+
     fn init_device(&mut self) -> ExecutorResult<()> {
         Ok(())
     }
