@@ -30,6 +30,7 @@
 #include <metal_stdlib>
 #include "baked.h"
 #include "gated_act.h"
+#include "moe_route.h"
 
 using namespace metal;
 
@@ -1695,22 +1696,35 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 #ifdef SCRATCHY_CONSTANT_2
 SCRATCHY_CONSTANT(int, GATHER_PER_ROW, 2);
 
-// Pair `nk`'s matvec over its expert's weights: output block `block` (8 rows, 4 per simdgroup)
-// of `y`'s row `nk`, reading `x`'s row `x_row`.
+// 13-17 (`MetalFusion::MoeRouted`): the gated kernel routes its token itself, from the router
+// logits, by `moe_route.h`'s program — the experts (13), a softmax over them first (14), the
+// scores' scale (15), their last step (16: 1 softmax, 2 renorm) and the per-expert scale (17) —
+// and stores the picks and scores the later kernels read. Unset: they are the routing command's.
+SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_EXPERTS, 13);
+SCRATCHY_CONSTANT_OPTIONAL(bool, ROUTED_PRE, 14);
+SCRATCHY_CONSTANT_OPTIONAL(float, ROUTED_SCALE, 15);
+SCRATCHY_CONSTANT_OPTIONAL(int, ROUTED_POST, 16);
+SCRATCHY_CONSTANT_OPTIONAL(bool, ROUTED_EXPERT_SCALE, 17);
+constant constexpr bool ROUTED = ROUTED_EXPERTS_SET;
+// The experts a routed kernel's top-k reads (a valid shape when unrouted).
+constant constexpr int ROUTED_E = ROUTED ? ROUTED_EXPERTS : 32;
+constant constexpr bool ROUTED_SOFT = ROUTED && ROUTED_PRE;
+
+// Pair `nk`'s matvec over expert `expert_idx`'s weights: output block `block` (8 rows, 4 per
+// simdgroup) of `y`'s row `nk`, reading `x`'s row `x_row`.
 template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 METAL_FUNC void gather_qmv_pair(
     const device uint32_t* w,
     const device T_scale*  scales,
     const device T_scale*  biases,
     const device T_act*    x,
-    const device uint32_t* rhs_indices,
+    uint expert_idx,
     device T_act*          y,
     uint nk,
     uint x_row,
     uint block,
     uint simd_gid,
     uint simd_lid) {
-  uint expert_idx = rhs_indices[nk];
 
   // Per-expert weight slab strides: w is packed int4 with
   // `in_vec/8 * out_vec` uint32 per expert; scales/biases hold
@@ -1750,7 +1764,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   // to 0 — the M-axis broadcast is folded into z.
   uint nk = tid.z;
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
-      w, scales, biases, x, rhs_indices, y, nk, nk / uint(GATHER_PER_ROW), tid.y,
+      w, scales, biases, x, rhs_indices[nk], y, nk, nk / uint(GATHER_PER_ROW), tid.y,
       simd_gid, simd_lid);
 }
 
@@ -1760,34 +1774,64 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 // (top-k) pairs.
 //   buffer(0-2) = gate w / scales / biases   buffer(6-8) = up w / scales / biases
 //   buffer(3)   = x                          buffer(9)   = up y  [N, top_k, out_vec]
-//   buffer(4)   = rhs_indices
-//   buffer(5)   = gate y                     [N, top_k, out_vec]
+//   buffer(4)   = rhs_indices                buffer(10)  = router logits, routed
+//   buffer(5)   = gate y                     buffer(11)  = scores [N, top_k], routed
+//                 [N, top_k, out_vec]        buffer(12)  = per-expert scales, routed and scaled
 // Dispatch (1, ceil(out_vec / 8), N * top_k), threadgroup (32, 4, 1): simdgroups 0-1 run the
 // gate matvec's 8-row block tid.y, 2-3 the up matvec's, then lanes 0-7 of simdgroup 0 apply the
 // activation to the block's rows. Every gate row is written raw only by the threadgroup that
 // then activates it: an out_vec with a 1-3 row tail block would have qmv_impl redo the previous
-// block's last rows there, raw, so this kernel takes an out_vec that is a multiple of 4.
+// block's last rows there, raw, so this kernel takes an out_vec that is a multiple of 4. Routed,
+// the threadgroup picks its token's experts first (E <= 512: its 128 threads cover E / 4), and
+// the token's first threadgroup stores the picks into rhs_indices and their scores.
 template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
 [[kernel]] void affine_gather_qmv_gated(
     const device uint32_t* gate_w      [[buffer(0)]],
     const device T_scale*  gate_scales [[buffer(1)]],
     const device T_scale*  gate_biases [[buffer(2)]],
     const device T_act*    x           [[buffer(3)]],
-    const device uint32_t* rhs_indices [[buffer(4)]],
+    device uint32_t*       rhs_indices [[buffer(4)]],
     device T_act*          gate_y      [[buffer(5)]],
     const device uint32_t* up_w        [[buffer(6)]],
     const device T_scale*  up_scales   [[buffer(7)]],
     const device T_scale*  up_biases   [[buffer(8)]],
     device T_act*          up_y        [[buffer(9)]],
+    const device T_act*    logits      [[buffer(10)]],
+    device T_act*          scores      [[buffer(11)]],
+    const device T_act*    expert_scale [[buffer(12)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
   static_assert(OUT_VEC_SIZE % 4 == 0, "a 1-3 row tail block would race the activation");
+  static_assert(!ROUTED || ROUTED_E <= 4 * 128, "a routed softmax row's threads cover E / 4");
   uint nk = tid.z;
   bool up = simd_gid >= 2;
+  threadgroup uint routed[GATHER_PER_ROW];
+  threadgroup T_act soft[ROUTED_SOFT ? ROUTED_E : 1];
+  threadgroup float local_a[32];
+  threadgroup float local_b[32];
+  uint expert;
+  if (ROUTED) {
+    const uint n = nk / uint(GATHER_PER_ROW), lid = simd_gid * 32 + simd_lid;
+    const device T_act* row = logits + size_t(n) * ROUTED_E;
+    route_top_k<T_act, ROUTED_E, GATHER_PER_ROW, ROUTED_SOFT>(
+        row, soft, routed, lid, simd_lid, simd_gid, local_a, local_b);
+    expert = routed[nk % uint(GATHER_PER_ROW)];
+    if (tid.y == 0 && nk % uint(GATHER_PER_ROW) == 0) {
+      device T_act* row_scores = scores + size_t(n) * GATHER_PER_ROW;
+      route_scores<T_act, GATHER_PER_ROW, ROUTED_SOFT, ROUTED_SCALE_SET, ROUTED_POST,
+                   ROUTED_EXPERT_SCALE>(row, soft, routed, row_scores, expert_scale,
+                                        ROUTED_SCALE, lid, simd_lid, simd_gid, local_a, local_b);
+      if (lid < uint(GATHER_PER_ROW)) {
+        rhs_indices[size_t(n) * GATHER_PER_ROW + lid] = routed[lid];
+      }
+    }
+  } else {
+    expert = rhs_indices[nk];
+  }
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
       up ? up_w : gate_w, up ? up_scales : gate_scales, up ? up_biases : gate_biases, x,
-      rhs_indices, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
+      expert, up ? up_y : gate_y, nk, nk / uint(GATHER_PER_ROW), tid.y, simd_gid % 2,
       simd_lid);
   threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 8 + simd_lid;
@@ -1825,7 +1869,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   uint n = tid.z;
   uint nk = n * uint(GATHER_PER_ROW) + simd_gid;
   gather_qmv_pair<T_act, T_scale, group_size, bits, fast>(
-      w, scales, biases, x, rhs_indices, y, nk, nk, tid.y / 2, tid.y % 2, simd_lid);
+      w, scales, biases, x, rhs_indices[nk], y, nk, nk, tid.y / 2, tid.y % 2, simd_lid);
   threadgroup_barrier(mem_flags::mem_device);
   uint row = tid.y * 4 + simd_lid;
   if (simd_gid == 0 && simd_lid < 4 && row < uint(OUT_VEC_SIZE)) {

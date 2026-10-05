@@ -914,6 +914,37 @@ impl From<MoeRouteConstants> for Vec<ConstantValue> {
     }
 }
 
+/// A routed expert kernel's routing (`MetalFusion::MoeRouted`, `quantized_qmv.metal` slots
+/// 13-17): the experts, and the [`MoeRouteConstants`] program — a softmax over the experts
+/// first, the scores' scale, their last step, the per-expert scale.
+pub struct RoutedConstants {
+    pub experts: NumExperts,
+    pub program: crate::tape::step::RouteProgram,
+}
+
+impl From<RoutedConstants> for Vec<ConstantValue> {
+    fn from(c: RoutedConstants) -> Self {
+        use crate::tape::step::RoutePost;
+        let p = c.program;
+        let post = match p.post {
+            RoutePost::None => 0,
+            RoutePost::Softmax => 1,
+            RoutePost::Renorm => 2,
+        };
+        let mut v = vec![
+            ConstantValue::int(ConstSlot(13), c.experts.get() as i32),
+            ConstantValue::boolean(ConstSlot(14), p.pre_softmax),
+        ];
+        v.extend(p.scale.map(|s| ConstantValue::float(ConstSlot(15), s.0)));
+        v.push(ConstantValue::int(ConstSlot(16), post));
+        v.push(ConstantValue::boolean(
+            ConstSlot(17),
+            p.expert_scale.is_some(),
+        ));
+        v
+    }
+}
+
 // ── MLX-affine QMM_T (prefill matmul) ─────────────────────────────
 
 /// `KernelId::AffineQmmT` / `AffineQmmTNax`

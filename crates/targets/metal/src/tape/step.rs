@@ -416,9 +416,10 @@ pub enum MoeStep {
     Unsort,
     /// `(out)`: each token's pair rows summed by its scores.
     Combine(Slot),
-    /// `(gate, up width, act)`: the gate and up projections and `act(gate) * up` — the up reads
-    /// the gate's rows, layer and group size.
-    GateUpAct(ExpertMatmul, ExpertWidth, GatedAct),
+    /// `(gate, up width, act, routing)`: the gate and up projections and `act(gate) * up` — the
+    /// up reads the gate's rows, layer and group size — routing the block's token first with
+    /// `routing` and storing its picks and scores (`MetalFusion::MoeRouted`).
+    GateUpAct(ExpertMatmul, ExpertWidth, GatedAct, Option<RouteProgram>),
     /// `(down, out)`: the down projection, the unsort and the combine into `out`.
     DownCombine(ExpertMatmul, Slot),
     /// The routing from the router logits to the top-k indices and scores.

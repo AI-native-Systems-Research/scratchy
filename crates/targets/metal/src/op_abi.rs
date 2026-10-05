@@ -262,6 +262,10 @@ pub fn moe_write(op: &SubOp) -> Option<MoeWrite> {
 /// The expert bundles metal has a grouped (sorted-by-expert) GEMM for; the others always gather.
 pub const METAL_GROUPED_EXPERTS: &[ExpertBundle] = &[ExpertBundle::SwitchGlu];
 
+/// The (row, pick) pairs from which a bake sorts a grouped bundle's pairs by expert; under them it
+/// gathers each row by its picks.
+pub const METAL_SORTED_PAIRS: u32 = 64;
+
 /// The steps whose commands a bake may drop: a gathered block's sort and unsort, and an unsliced
 /// bake's sampled rows around its matmul.
 pub const METAL_ELIDABLE: &[SubOpKind] = &[
@@ -315,6 +319,9 @@ pub enum MetalFusion {
     QmvEpilogue,
     /// A one-row router's logits that normalize its input as they load it.
     NormedRouter,
+    /// A one-row MoE block's gated expert command that routes its token itself, from the logits,
+    /// and stores the picks and scores the later ones read.
+    MoeRouted,
     /// `residual + rmsnorm(delta)`.
     NormAdd,
     /// A group of row-wise steps over one width.
@@ -429,7 +436,9 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                 },
             ],
             // After the rope folds: it extends the writer command they made. A norm folds into the
-            // add it feeds only when no fold took either with more.
+            // add it feeds only when no fold took either with more. After the expert and routing
+            // folds, the routing into the expert commands: under the grouped bake's pairs, they
+            // read each token's row by its picks.
             &[
                 FoldPattern::Encoded {
                     writer: K::RopeAppend,
@@ -440,6 +449,12 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     add: K::Add,
                     norm: K::RmsNorm,
                     kernel: F::NormAdd,
+                },
+                FoldPattern::RoutedExperts {
+                    top_k: K::RouteTopK,
+                    sort: K::ExpertSort,
+                    gathered_below: METAL_SORTED_PAIRS,
+                    kernel: F::MoeRouted,
                 },
             ],
         ],

@@ -4,7 +4,7 @@
 // and one row's renormalization to sum one, run by one threadgroup over `axis_size` scores.
 // Shared by the softmax kernels (`softmax.metal`) and the MoE routing kernel (`moe_route.metal`).
 //
-// `in` / `out` point at the row. `local_a` / `local_b` are the caller's threadgroup scratch, 32
+// `in` / `out` point at the row, in any address space. `local_a` / `local_b` are the caller's threadgroup scratch, 32
 // entries each (a kernel declares threadgroup memory; a function cannot). A thread past the row
 // reads the reduction's identity, so a threadgroup of any size covering `axis_size / N_READS`
 // threads gives the same bits.
@@ -32,10 +32,10 @@ inline T softmax_exp(T x) {
   return fast::exp(x);
 }
 
-template <typename T, typename AccT, int N_READS>
+template <typename T, typename AccT, int N_READS, typename PI, typename PO>
 METAL_FUNC void softmax_row(
-    const device T* in,
-    device T* out,
+    PI in,
+    PO out,
     int axis_size,
     int lid,
     uint simd_lane_id,
@@ -113,10 +113,10 @@ METAL_FUNC void softmax_row(
   }
 }
 
-template <typename T, typename AccT, int N_READS>
+template <typename T, typename AccT, int N_READS, typename PI, typename PO>
 METAL_FUNC void renorm_row(
-    const device T* in,
-    device T* out,
+    PI in,
+    PO out,
     int axis_size,
     int lid,
     uint simd_lane_id,

@@ -166,6 +166,19 @@ pub enum FoldPattern<K: 'static> {
         weights: Option<GemmWeightKind>,
         kernel: K,
     },
+    /// A routing — its `top_k` step's [`Route`](Self::Route) fold — whose picks only the `sort`
+    /// reads, for steps other folds took into commands, and whose scores only such commands read,
+    /// folds into the first of those commands: it routes its rows itself, from the logits, and
+    /// stores the picks and scores the later ones read. Apply it after those folds and the
+    /// routing's. Only on a model whose matvecs take their ends, at fewer than `gathered_below`
+    /// (row, pick) pairs: where the target's expert steps read each row by its picks, with no
+    /// sorted copy of the rows the routing would have to make first.
+    RoutedExperts {
+        top_k: SubOpKind,
+        sort: SubOpKind,
+        gathered_below: u32,
+        kernel: K,
+    },
     /// A `matmul` of `weights` read by one step alone, down a chain of such steps: at most a
     /// `bias`, then a `scale`, then a residual `add` reading the chain as either operand. The
     /// chain folds into the matmul, which computes it as it stores its rows: the steps before the
@@ -201,6 +214,7 @@ impl<K> FoldPattern<K> {
             Self::Route { top_k, .. } => *top_k,
             Self::Encoded { writer, .. } => *writer,
             Self::NormedMatvecs { norm, .. } => *norm,
+            Self::RoutedExperts { top_k, .. } => *top_k,
             Self::MatvecEpilogue { matmul, .. } => *matmul,
         }
     }
@@ -318,6 +332,11 @@ pub enum FusedShape {
     /// The norm this matmul's input passes through: the command reads the norm's input and gain.
     NormedMatvec {
         norm: SlotId,
+    },
+    /// The routing the command computes itself, storing its picks and scores: the `top_k` step's
+    /// [`FusedShape::Route`] fold.
+    Routed {
+        top_k: SlotId,
     },
     /// A row program's steps, in tape order, the driver last.
     RowProgram {
@@ -755,6 +774,15 @@ impl<K: Copy> Folder<'_, K> {
                 kernel,
                 ..
             } => self.normed_matvecs(i, (matmul, weights), kernel),
+            FoldPattern::RoutedExperts {
+                sort,
+                gathered_below,
+                kernel,
+                ..
+            } => {
+                self.routed_experts(i, sort, gathered_below, kernel);
+                Ok(())
+            }
             FoldPattern::MatvecEpilogue {
                 weights,
                 bias,
@@ -999,6 +1027,53 @@ impl<K: Copy> Folder<'_, K> {
             self.record(j, kernel, FusedShape::NormedMatvec { norm });
         }
         Ok(())
+    }
+
+    /// Routing `i` into the first command reading it ([`FoldPattern::RoutedExperts`]): `i` and
+    /// the steps its routing took are absorbed into it.
+    fn routed_experts(&mut self, i: usize, sort: SubOpKind, gathered_below: u32, kernel: K) {
+        let ops = &self.ops;
+        let SubOp::RouteTopK { k } = *ops.op(i) else {
+            return;
+        };
+        let routes = |f: &Fusion<K>| matches!(f.shape, FusedShape::Route { .. });
+        if !self.model.matvec_ends
+            || self.absorbed[i].is_some()
+            || !self.fusions[i].iter().any(routes)
+            || ops.rows[i].saturating_mul(k.get()) >= gathered_below
+        {
+            return;
+        }
+        let n = ops.slot.len();
+        let reads = |c: usize, p: usize| ops.args[c].iter().any(|a| matches!(a, Arg::Op(q) if *q == p));
+        // The routing's steps: `i`, the steps it absorbed, and its epilogues.
+        let own = |j: usize| j == i || self.absorbed[j] == Some(i) || self.epilogue[j] == Some(i);
+        let mut drivers = Vec::new();
+        for c in (0..n).filter(|&c| !own(c) && (0..n).any(|p| own(p) && reads(c, p))) {
+            if ops.kind(c) == sort {
+                // The picks' reader: every step reading its rows was taken into a command.
+                for r in (0..n).filter(|&r| reads(r, c)) {
+                    match self.absorbed[r] {
+                        Some(d) if !self.fusions[d].is_empty() => drivers.push(d),
+                        _ => return,
+                    }
+                }
+            } else if self.absorbed[c].is_none() && !self.fusions[c].is_empty() {
+                drivers.push(c);
+            } else {
+                return;
+            }
+        }
+        let Some(first) = drivers.into_iter().min_by_key(|&d| ops.pos[d]) else {
+            return;
+        };
+        let taken: Vec<usize> = (0..n).filter(|&j| own(j)).collect();
+        let top_k = ops.slot[i];
+        for j in taken {
+            self.absorbed[j] = Some(first);
+            self.epilogue[j] = None;
+        }
+        self.record(first, kernel, FusedShape::Routed { top_k });
     }
 
     /// `i`'s K and V `encode` steps — in the construct it was expanded into, not yet taken.
@@ -1410,6 +1485,7 @@ mod tests {
         Normed,
         Epilogue,
         Rows,
+        Routed,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -1501,11 +1577,19 @@ mod tests {
                     kernel: Kern::Route,
                 },
             ],
-            &[FoldPattern::Encoded {
-                writer: K::RopeAppend,
-                encode: K::KvEncode,
-                kernel: Kern::Encoded,
-            }],
+            &[
+                FoldPattern::Encoded {
+                    writer: K::RopeAppend,
+                    encode: K::KvEncode,
+                    kernel: Kern::Encoded,
+                },
+                FoldPattern::RoutedExperts {
+                    top_k: K::RouteTopK,
+                    sort: K::ExpertSort,
+                    gathered_below: 64,
+                    kernel: Kern::Routed,
+                },
+            ],
         ]
     };
 
@@ -1661,6 +1745,81 @@ mod tests {
         // A model whose matvecs do not take their ends.
         let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, SPLIT);
         assert_eq!(f.role(s[0]), StepRole::Kept);
+    }
+
+    #[test]
+    fn a_routing_only_expert_commands_read_folds_into_each_of_them() {
+        use crate::lower::ExpertQuant;
+        use crate::subtile_ir::{
+            ExpertBundle, ExpertProj, GatedAct, NumExperts, RouterBundle, SharedExpertBound, TopK,
+        };
+        use std::num::NonZeroU32;
+        let experts = NumExperts::new(NonZeroU32::new(16).expect("16 experts"));
+        let k = TopK::new(NonZeroU32::new(2).expect("top 2"));
+        let (router, bundle) = (RouterBundle::Gemma, ExpertBundle::SwitchGlu);
+        let matmul = |proj, n, inputs| {
+            let quant = ExpertQuant::declared(64, 4);
+            let m = SubOp::ExpertMatmul {
+                proj,
+                n,
+                k,
+                quant,
+                bundle,
+            };
+            op(m, 1, inputs)
+        };
+        let sort = SubOp::ExpertSort { experts, k, bundle };
+        let combine = SubOp::ExpertCombine {
+            hidden: 64,
+            shared: SharedExpertBound(None),
+        };
+        let (gate, up, down) = (ExpertProj::Gate, ExpertProj::Up, ExpertProj::Down);
+        // Gemma's block: logits, the routing, then the experts reading its picks and scores.
+        let ops = |scores_read_again: bool| {
+            let mut v = vec![
+                op(SubOp::RouterLogits { experts, router }, 1, vec![Ext(0), Ext(1)]),
+                op(SubOp::RouteArgsort, 1, vec![Op(0)]),
+                op(SubOp::RouteTopK { k }, 1, vec![Op(1)]),
+                op(SubOp::RouteGatherScores, 1, vec![Op(0), Op(2)]),
+                op(SubOp::RouteSoftmax, 1, vec![Op(3)]),
+                op(sort, 1, vec![Ext(0), Op(2)]),
+                matmul(gate, 32, vec![Op(5), Op(5), Ext(2)]),
+                matmul(up, 32, vec![Op(5), Op(5), Ext(2)]),
+                op(SubOp::ExpertGatedAct { act: GatedAct::Gelu }, 1, vec![Op(6), Op(7)]),
+                matmul(down, 64, vec![Op(8), Op(5), Ext(2)]),
+                op(SubOp::ExpertUnsort, 1, vec![Op(9), Op(5)]),
+                op(combine, 1, vec![Op(10), Op(4)]),
+            ];
+            if scores_read_again {
+                v.push(op(SubOp::ScalarMul { scale: 2.0 }, 1, vec![Op(4)]));
+            }
+            v
+        };
+        let src = [(1, 64), (16, 64), (32, 64)];
+        let (s, f) = fold(&src, weights(3), ops(false), &[], &TABLE, ENDS);
+        // The routing's steps run in the gated activation's command, the first reading them.
+        for j in [1, 2, 3, 4] {
+            assert_eq!(f.role(s[j]), StepRole::Absorbed { into: s[8] }, "step {j}");
+        }
+        let routed = Fusion {
+            kernel: Kern::Routed,
+            shape: FusedShape::Routed { top_k: s[2] },
+        };
+        assert_eq!(f.role(s[8]), StepRole::Drives(&routed));
+        assert!(matches!(
+            f.role(s[11]),
+            StepRole::Drives(Fusion { kernel: Kern::ExpertCombined, .. })
+        ));
+        assert_eq!(f.role(s[5]), StepRole::Kept);
+        // Its scores read by a step no command took, or a model whose matvecs do not take their
+        // ends: the routing is its own command.
+        let route = |f: &TapeFolds<Kern>, s: &[SlotId]| {
+            matches!(f.role(s[2]), StepRole::Drives(Fusion { kernel: Kern::Route, .. }))
+        };
+        let (s, f) = fold(&src, weights(3), ops(true), &[], &TABLE, ENDS);
+        assert!(route(&f, &s));
+        let (s, f) = fold(&src, weights(3), ops(false), &[], &TABLE, SPLIT);
+        assert!(route(&f, &s));
     }
 
     const ROWS: FusionTable<Kern> = FusionTable {

@@ -1066,11 +1066,13 @@ impl Recording<'_> {
                 if shared(&g.step) != shared(&u.step) {
                     return Err(self.no(i, Refused::FusionShape));
                 }
-                let step = MoeStep::GateUpAct(g.step, u.step.width, act);
+                let (routing, router) = self.routing(i)?;
+                let step = MoeStep::GateUpAct(g.step, u.step.width, act, routing);
                 let mut e = self.moe(i, step, &g.reads, &[], Some(g.weight))?;
+                e.sites.extend(router);
                 if g.raw.is_some() || u.raw.is_some() {
                     let (gr, ur) = (g.raw.unwrap_or(g.step), u.raw.unwrap_or(u.step));
-                    let raw = MoeStep::GateUpAct(gr, ur.width, act);
+                    let raw = MoeStep::GateUpAct(gr, ur.width, act, routing);
                     e.raw = Some(MetalStep::Moe(self.block(i)?, raw));
                 }
                 Ok(e)
@@ -1090,43 +1092,15 @@ impl Recording<'_> {
                 }
                 Ok(e)
             }
+            // A gated command routing its token itself: the expert fold it extends.
+            (F::MoeRouted, Sh::Routed { .. }) => {
+                let driven = self.folds.driven(self.steps.slot[i]);
+                let expert = driven.iter().rev().find(|f| f.kernel != F::MoeRouted);
+                self.fused(i, expert.ok_or_else(|| self.no(i, Refused::FusionShape))?)
+            }
             // The routing, as the program its folded steps spell.
-            (
-                F::MoeRoute,
-                Sh::Route {
-                    pre,
-                    tail: [scale, post, expert_scale],
-                    ..
-                },
-            ) => {
-                let op = |s| -> Result<(usize, &SubOp), StepRefusal> {
-                    let j = self.op_at(i, s)?;
-                    Ok((j, self.op(j)))
-                };
-                let scale = match scale.map(op).transpose()? {
-                    None => None,
-                    Some((_, &SubOp::RouteScale { scale })) => Some(st::Scale(scale)),
-                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
-                };
-                let post = match post.map(op).transpose()? {
-                    None => st::RoutePost::None,
-                    Some((_, SubOp::RouteSoftmax)) => st::RoutePost::Softmax,
-                    Some((_, SubOp::RouteRenorm)) => st::RoutePost::Renorm,
-                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
-                };
-                let weight = match expert_scale.map(op).transpose()? {
-                    None => None,
-                    Some((j, &SubOp::RouteExpertScale { router })) => {
-                        Some((router.weight_kind(), self.source_arg(j, 2)?))
-                    }
-                    Some(_) => return Err(self.no(i, Refused::FusionShape)),
-                };
-                let program = st::RouteProgram {
-                    pre_softmax: pre.is_some(),
-                    scale,
-                    post,
-                    expert_scale: weight.as_ref().map(|&(_, e)| self.layer(e)),
-                };
+            (F::MoeRoute, Sh::Route { .. }) => {
+                let (program, weight) = self.route_program(i, f.shape)?;
                 self.moe(i, MoeStep::Route(program), &[], &[], weight)
             }
             (F::NormedQmv | F::NormedRouter, Sh::NormedMatvec { .. })
@@ -1158,6 +1132,79 @@ impl Recording<'_> {
             }
             _ => Err(self.no(i, Refused::FusionShape)),
         }
+    }
+
+    /// The routing program top-k step `i`'s route fold `route` spells, with the router weight
+    /// its per-expert scale reads.
+    fn route_program(
+        &self,
+        i: usize,
+        route: FusedShape,
+    ) -> Result<(st::RouteProgram, Option<(WeightKind, usize)>), StepRefusal> {
+        let FusedShape::Route {
+            pre,
+            tail: [scale, post, expert_scale],
+            ..
+        } = route
+        else {
+            return Err(self.no(i, Refused::FusionShape));
+        };
+        let op = |s| -> Result<(usize, &SubOp), StepRefusal> {
+            let j = self.op_at(i, s)?;
+            Ok((j, self.op(j)))
+        };
+        let scale = match scale.map(op).transpose()? {
+            None => None,
+            Some((_, &SubOp::RouteScale { scale })) => Some(st::Scale(scale)),
+            Some(_) => return Err(self.no(i, Refused::FusionShape)),
+        };
+        let post = match post.map(op).transpose()? {
+            None => st::RoutePost::None,
+            Some((_, SubOp::RouteSoftmax)) => st::RoutePost::Softmax,
+            Some((_, SubOp::RouteRenorm)) => st::RoutePost::Renorm,
+            Some(_) => return Err(self.no(i, Refused::FusionShape)),
+        };
+        let weight = match expert_scale.map(op).transpose()? {
+            None => None,
+            Some((j, &SubOp::RouteExpertScale { router })) => {
+                Some((router.weight_kind(), self.source_arg(j, 2)?))
+            }
+            Some(_) => return Err(self.no(i, Refused::FusionShape)),
+        };
+        let program = st::RouteProgram {
+            pre_softmax: pre.is_some(),
+            scale,
+            post,
+            expert_scale: weight.as_ref().map(|&(_, e)| self.layer(e)),
+        };
+        Ok((program, weight))
+    }
+
+    /// The routing expert command `i` computes itself (`MetalFusion::MoeRouted`), if it does, with
+    /// the site of the router weight it reads.
+    fn routing(
+        &self,
+        i: usize,
+    ) -> Result<(Option<st::RouteProgram>, Vec<WeightSlot>), StepRefusal> {
+        let driven = self.folds.driven(self.steps.slot[i]);
+        let Some(top_k) = driven.iter().find_map(|f| match f.shape {
+            FusedShape::Routed { top_k } => Some(top_k),
+            _ => None,
+        }) else {
+            return Ok((None, Vec::new()));
+        };
+        let t = self.op_at(i, top_k)?;
+        let route = self.folds.driven(top_k).iter().find_map(|f| match f.shape {
+            FusedShape::Route { .. } => Some(f.shape),
+            _ => None,
+        });
+        let route = route.ok_or_else(|| self.no(i, Refused::FusionShape))?;
+        let (program, weight) = self.route_program(t, route)?;
+        let site = match weight {
+            Some((kind, e)) => self.site(t, kind, e)?,
+            None => Vec::new(),
+        };
+        Ok((Some(program), site))
     }
 
     /// A row program over its `steps` (tape order, the driver `i` last): each external row loaded

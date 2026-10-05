@@ -2,6 +2,7 @@
 // decode shapes (128 experts, top 8, hidden 2816, expert width 704, 4-bit g64, bf16):
 //   affine_gather_qmv_gated   = gate gather-qmv, up gather-qmv, gelu_mul / silu_mul
 //   affine_gather_qmv_combine = down gather-qmv, moe_weighted_sum
+// and each routing its token itself (`MetalFusion::MoeRouted`) = the routing command, then it.
 // Each must give the same bits. `bench_moe_fused` times both chains (`BENCH` lines).
 mod common;
 
@@ -12,10 +13,12 @@ use objc2_metal::MTLSize;
 use scratchy_target_metal::aot::{BakedPipeline, baked_pipeline};
 use scratchy_target_metal::device::detect_device;
 use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
-use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, TopK};
+use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, NumExperts, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
-    AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows,
+    AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows, MoeRouteConstants,
+    RoutedConstants,
 };
+use scratchy_target_metal::tape::step::{LayerId, RoutePost, RouteProgram, Scale};
 
 const EXPERTS: usize = 128;
 const TOP_K: usize = 8;
@@ -531,6 +534,147 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
     }
 }
 
+/// The routing of one token's `logits` by `program`: the routing command's picks and scores, then
+/// the fused kernels over them, against the gated kernel routing the token itself and storing the
+/// picks and scores the combine then reads. `time`: the chains' best times per run, in µs.
+fn routed_matches_the_routing_command(
+    device: &common::Device,
+    block: &Block,
+    program: RouteProgram,
+    time: bool,
+) -> Result<Option<(f64, f64)>, String> {
+    let mut rng = Lcg(0xfeed);
+    let logits = rng.bf16s(EXPERTS, -3.0, 3.0);
+    let expert_scale = common::shared_slice(device, &rng.bf16s(EXPERTS, 0.5, 1.5));
+    let experts = NumExperts(EXPERTS as u32);
+    let top_k = TopK(TOP_K as u32);
+    let route = MoeRouteConstants {
+        experts,
+        top_k,
+        program,
+    };
+    let route = baked_pipeline(device, "moe_route", "moe_route_bfloat16_bn32", route.into())
+        .expect("route");
+    // The command softmaxes its logits in place: the routed kernel reads its own copy.
+    let (in_place, read) = (
+        common::shared_slice(device, &logits),
+        common::shared_slice(device, &logits),
+    );
+    // Each chain's picks and scores; the routed chain's start zero, its gated kernel's to store.
+    let picks = || {
+        (
+            common::shared_zeroed(device, TOP_K * 4),
+            common::shared_zeroed(device, TOP_K * 2),
+        )
+    };
+    let ((inds, scores), (routed_inds, routed_scores)) = (picks(), picks());
+    let rows = GatherRows::Tokens(top_k);
+    let mut gated_c = block.gate.constants(rows);
+    gated_c.push(ConstantValue::int(ConstSlot(3), 1));
+    gated_c.extend(Vec::<ConstantValue>::from(RoutedConstants { experts, program }));
+    let gated = block.gate.pipeline(device, "affine_gather_qmv_gated", gated_c);
+    let zeroed = |n: usize| common::shared_zeroed(device, n * 2);
+    let (gate_y, up_y, down_y, out) = (
+        zeroed(TOP_K * INTER),
+        zeroed(TOP_K * INTER),
+        zeroed(TOP_K * HIDDEN),
+        zeroed(HIDDEN),
+    );
+    let chain = |routed: bool| {
+        let (gy, uy, dy, o) = match routed {
+            false => (
+                &block.fused_gate_y,
+                &block.fused_up_y,
+                &block.fused_down_y,
+                &block.fused_out,
+            ),
+            true => (&gate_y, &up_y, &down_y, &out),
+        };
+        let (i, sc) = match routed {
+            false => (&inds, &scores),
+            true => (&routed_inds, &routed_scores),
+        };
+        let mut g = block.gate.bindings().to_vec();
+        g.extend([(&block.x, 3), (i, 4), (gy, 5)]);
+        g.extend([(&block.up.w, 6), (&block.up.s, 7), (&block.up.b, 8), (uy, 9)]);
+        let mut c = block.down.bindings().to_vec();
+        c.extend([(gy, 3), (i, 4), (dy, 5), (sc, 6), (o, 7)]);
+        let mut chain = Vec::new();
+        match routed {
+            false => chain.push(Dispatch {
+                pso: &route,
+                buffers: vec![(&in_place, 0), (&inds, 1), (&scores, 2), (&expert_scale, 3)],
+                groups: size(1, 1, 1),
+                threads: size(32, 1, 1),
+            }),
+            true => g.extend([(&read, 10), (sc, 11), (&expert_scale, 12)]),
+        }
+        let gated = if routed { &gated } else { &block.gated };
+        chain.push(Dispatch {
+            pso: gated,
+            buffers: g,
+            groups: size(1, INTER.div_ceil(8), TOP_K),
+            threads: size(32, 4, 1),
+        });
+        chain.push(Dispatch {
+            pso: &block.combine,
+            buffers: c,
+            groups: size(1, HIDDEN.div_ceil(4), 1),
+            threads: size(32, TOP_K, 1),
+        });
+        chain
+    };
+    run(device, 1, 1, |_| chain(false));
+    run(device, 1, 1, |_| chain(true));
+    let picked = common::read_slice::<u32>(&inds, TOP_K);
+    let mut distinct = picked.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() != TOP_K || picked.iter().any(|&e| e as usize >= EXPERTS) {
+        return Err(format!("the routing command's picks {picked:?}"));
+    }
+    if picked != common::read_slice::<u32>(&routed_inds, TOP_K) {
+        return Err("the stored picks differ".into());
+    }
+    if bits(&scores, TOP_K) != bits(&routed_scores, TOP_K) {
+        return Err("the stored scores differ".into());
+    }
+    let act = bits(&block.fused_gate_y, TOP_K * INTER);
+    if act != bits(&gate_y, TOP_K * INTER) {
+        return Err("act(gate) * up differs".into());
+    }
+    let combined = bits(&block.fused_out, HIDDEN);
+    if combined.iter().all(|&v| v == 0) || combined != bits(&out, HIDDEN) {
+        return Err("the combined rows differ".into());
+    }
+    // Timed after the checks: the routing command's softmax runs in place.
+    Ok(time.then(|| (run(device, 300, 4, |_| chain(false)), run(device, 300, 4, |_| chain(true)))))
+}
+
+#[test]
+fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
+    let Some(d) = detect_device() else { return };
+    let device = d.device;
+    let block = Block::new(&device, 1, true);
+    // Gemma-4's program, and the shared-expert router's (a softmax over every expert first).
+    let gemma = RouteProgram {
+        pre_softmax: false,
+        scale: Some(Scale(0.018_844_6)),
+        post: RoutePost::Softmax,
+        expert_scale: Some(LayerId(0)),
+    };
+    let shared = RouteProgram {
+        pre_softmax: true,
+        scale: None,
+        post: RoutePost::Renorm,
+        expert_scale: None,
+    };
+    for (what, program) in [("gemma", gemma), ("shared", shared)] {
+        routed_matches_the_routing_command(&device, &block, program, false)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    }
+}
+
 /// `n_out` rows over `k_in` of a plain (dense, not gathered) 4-bit matvec, read from DRAM:
 /// 16 distinct weight matrices, cycled, so no dispatch finds its weights in cache.
 fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {
@@ -608,6 +752,22 @@ fn bench_moe_fused() {
             "BENCH moe round {round}: down+combine: today 2 launches {combine_2:.1} us, \
              fused 1 launch {combine_1:.1} us ({:+.1}%)",
             pct(combine_1, combine_2)
+        );
+    }
+    // The routing as its own command, then the fused kernels; the gated kernel routing itself.
+    let gemma = RouteProgram {
+        pre_softmax: false,
+        scale: Some(Scale(0.018_844_6)),
+        post: RoutePost::Softmax,
+        expert_scale: Some(LayerId(0)),
+    };
+    for round in 0..3 {
+        let timed = routed_matches_the_routing_command(&device, &block, gemma, true);
+        let (command, routed) = timed.expect("routed").expect("timed");
+        println!(
+            "BENCH moe round {round}: routing command + 2 launches {command:.1} us, \
+             routed in the gated launch {routed:.1} us ({:+.1}%)",
+            pct(routed, command)
         );
     }
     // One gathered projection alone (today's kernel), then the same bytes as one expert

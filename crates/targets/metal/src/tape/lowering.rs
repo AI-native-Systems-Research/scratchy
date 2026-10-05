@@ -6233,7 +6233,7 @@ impl MoeScratch {
         // repeat count halves with each bucket step down (bucket 4 × top-8: 32 pairs, ~8 repeats).
         let grouping = match (groups, bucket_m * b.top_k.0) {
             (true, pairs) if pairs >= 128 => MoeGrouping::Grouped,
-            (true, pairs) if pairs >= 64 => MoeGrouping::Sorted,
+            (true, pairs) if pairs >= crate::op_abi::METAL_SORTED_PAIRS => MoeGrouping::Sorted,
             _ => MoeGrouping::Gathered,
         };
         let (e, k, i, h) = (b.experts.0, b.top_k.0, b.inter.0, b.hidden.0);
@@ -6302,7 +6302,7 @@ fn lower_moe_step(
     use super::kernel_constants::{
         AffineCombineQmvConstants, AffineGatedQmvConstants, AffineGatherQmvConstants,
         AffineQmvConstants, ArgsortConstants, GatherRows, MoeRouteConstants, MoeTopKConstants,
-        ScoresRow, SoftmaxConstants,
+        RoutedConstants, ScoresRow, SoftmaxConstants,
     };
     use crate::tape::lowered::{MScaleAxis as A, MScaling};
     use ConstantValue as C;
@@ -6359,6 +6359,14 @@ fn lower_moe_step(
         top_k: b.top_k,
     };
     let router = || w.of(b.router.weight_kind(), 0);
+    // A routed gated command's routing: its kernel's own when it reads the token rows by their
+    // picks and its `threads` cover the softmax over the experts (`moe_route.h`: E / 4), else the
+    // routing command's, run first.
+    let gathered = s.grouping == MoeGrouping::Gathered;
+    let routed_here = |routing: Option<super::step::RouteProgram>, threads: u32| match routing {
+        Some(program) if gathered && e <= threads => (Some(program), None),
+        routing => (None, routing.map(S::Route)),
+    };
     // An expert projection's `[weight, scales, biases]`, bound at `first..first + 3`.
     let expert_weights = |proj, l: LayerId, first: u8| -> Result<[Binding; 3], LoweringError> {
         let (ix, lw) = (w.of(b.bundle.weight_kind(), 0)?, layer(&l));
@@ -6826,8 +6834,10 @@ fn lower_moe_step(
         // `act(gate) * up` over the rows each threadgroup wrote — per-pair, so the sorted rows
         // work unchanged. A width with a 1-3 row tail would have a threadgroup rewrite rows
         // another one activates, and two widths need two kernels: those, and a grouped bake,
-        // run each step's own commands.
-        S::GateUpAct(gate, up_width, act)
+        // run each step's own commands. A routed step its kernel cannot route (steps of their
+        // own, sorted rows, or more experts than its threads' softmax covers) runs the routing
+        // command first.
+        S::GateUpAct(gate, up_width, act, routing)
             if s.grouping == MoeGrouping::Grouped
                 || up_width != gate.width
                 || !inter.is_multiple_of(4) =>
@@ -6838,9 +6848,12 @@ fn lower_moe_step(
                 ..gate
             };
             let steps = [S::ExpertMatmul(gate), S::ExpertMatmul(up), S::GatedAct(act)];
-            each_step(&steps, moe_scratch_bytes)?
+            let route = routing.map(S::Route);
+            each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes)?
         }
-        S::GateUpAct(gate, _, act) => {
+        S::GateUpAct(gate, _, act, routing) => {
+            let (routed, route) = routed_here(routing, 4 * 128);
+            let mut commands = each_step(route.as_slice(), moe_scratch_bytes)?;
             let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
@@ -6859,15 +6872,24 @@ fn lower_moe_step(
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
-            let constants = AffineGatedQmvConstants { qmv: gather, act }.into();
-            vec![cmd(
+            let mut constants: Vec<ConstantValue> = AffineGatedQmvConstants { qmv: gather, act }.into();
+            if let Some(program) = routed {
+                bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
+                if let Some(l) = program.expert_scale {
+                    let scale = WeightTensor::GemmaPerExpertScale;
+                    bindings.push(source(router()?, scale, layer(&l), 12));
+                }
+                constants.extend(Vec::from(RoutedConstants { experts: b.experts, program }));
+            }
+            commands.push(cmd(
                 kernel,
                 "quantized_qmv",
                 symbol,
                 constants,
                 shape,
                 bindings,
-            )]
+            ));
+            commands
         }
         // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
         // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
