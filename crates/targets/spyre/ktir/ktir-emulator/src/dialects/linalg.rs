@@ -442,7 +442,14 @@ fn batch_matmul(
     Ok(Some(Value::Tile(result)))
 }
 
-/// 2-D matmul `A @ B` keeping A's dtype. A is [M, K], B is [K, N].
+/// 2-D matmul `A @ B` keeping A's dtype, EXCEPT over an fp8 weight tile: the
+/// result of a contraction against RAW e4m3 codes is the UN-scaled code-dot
+/// (the scale `mulf` follows the matmul in the dequant form), and a
+/// checkpoint's codes are large precisely because its scales are small — the
+/// dot overflows f16 long before the scale brings it home. The fp8 result
+/// tile is F32, the hardware `matmulfp8`'s own wider-accumulate convention.
+/// MEASURED on gemma-4-26b prefill: q_proj's code-dots reach ~1e5 = inf in
+/// f16, NaN-ing the layer one norm later.
 fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
     if a.shape.len() != 2 || b.shape.len() != 2 {
         return Err(format!(
@@ -459,7 +466,12 @@ fn matmul2d(a: &Tile, b: &Tile) -> Result<Tile, String> {
     }
     let n = b.shape[1];
     let data = gemm(m, k, n, &a.as_f32(), &b.as_f32());
-    Ok(Tile::compute(data, a.dtype, vec![m, n]))
+    let out_dtype = if b.dtype == DType::Fp8E4m3 {
+        DType::F32
+    } else {
+        a.dtype
+    };
+    Ok(Tile::compute(data, out_dtype, vec![m, n]))
 }
 
 /// Apply the optional `outs` accumulator (operands[2]) of a matmul-family op:
@@ -520,7 +532,13 @@ fn matmul2d_bt(a: &Tile, b: &Tile, op_name: &str) -> Result<Tile, String> {
     } else {
         crate::blas::sgemm_rowmajor_bt(m, k, n, &a.as_f32(), &b.as_f32())
     };
-    Ok(Tile::compute(data, a.dtype, vec![m, n]))
+    // fp8 weight tile ⇒ F32 result (the un-scaled code-dot): see `matmul2d`.
+    let out_dtype = if b.dtype == DType::Fp8E4m3 {
+        DType::F32
+    } else {
+        a.dtype
+    };
+    Ok(Tile::compute(data, out_dtype, vec![m, n]))
 }
 
 // ===========================================================================
@@ -1536,6 +1554,39 @@ mod tests {
         .unwrap();
         let t = get_tile(&ctx, r);
         assert_eq!(t.as_f32().to_vec(), vec![20.0, 23.0, 44.0, 51.0]);
+    }
+
+    #[test]
+    fn matmul_over_fp8_weights_keeps_the_prescale_dot_in_f32() {
+        // The dequant form is `scale ⊙ (A · codes)`; the contraction output is
+        // the UN-scaled code-dot, and a real checkpoint's codes are large
+        // exactly because its per-channel scales are small (gemma-4-26b
+        // q_proj: codes rms 84, scales ~2.6e-4, dots ~1e5). Rounding that dot
+        // to the activation's f16 overflows to inf and NaNs the layer one norm
+        // later — MEASURED on the 26b's first prefill. Pin both facts: the
+        // result tile is F32, and a code-dot far past f16's 65504 comes back
+        // finite.
+        let mut ops = Ops::new();
+        let mut ctx = single_core_context();
+        // A [1, 8] of 300s against codes [8, 2] of 300s: the e4m3 grid rounds
+        // 300 to 288 (binade [256, 512), ulp 32), so the dot is 8·300·288 =
+        // 691200 — an order of magnitude past f16's 65504.
+        ctx.set_value(
+            ops.ssa("%a"),
+            Value::Tile(Tile::compute(vec![300.0; 8], DType::F16, vec![1, 8])),
+        );
+        let codes = Tile::compute(vec![300.0; 16], DType::Fp8E4m3, vec![8, 2]);
+        ctx.set_value(ops.ssa("%b"), Value::Tile(codes));
+        let r = ops.ssa("%r");
+        run(
+            &[ops.op(Some("%r"), OpKind::LinalgMatmul, &["%a", "%b"])],
+            &mut ctx,
+        )
+        .unwrap();
+        let t = get_tile(&ctx, r);
+        assert_eq!(t.dtype, DType::F32, "fp8 contraction result must be F32");
+        assert_eq!(t.shape, vec![1, 2]);
+        assert_eq!(t.as_f32().to_vec(), vec![691_200.0; 2]);
     }
 
     #[test]

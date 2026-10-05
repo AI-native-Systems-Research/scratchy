@@ -5209,7 +5209,10 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
                 // on-disk `[out, in]` read in place, the same maps the
                 // dense [`Self::matmul_fp8`] states.
                 let dims = vec![1i64, i64::from(bw)];
-                let init = self.splat_zero(dims.clone());
+                // F32 seed, for the reason [`Self::matmul_fp8`]'s init states:
+                // `accumulate_outs` rounds to the SEED's dtype, and an f16 seed
+                // rounds the UN-scaled code-dot to f16 (inf).
+                let init = self.f32_splat(0.0, dims.clone());
                 let maps: Vec<AffineMap<'static>> = [[0i64, 2], [1, 2], [0, 1]]
                     .iter()
                     .map(|mm| AffineMap {
@@ -5891,8 +5894,24 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
             self.load_tile(acc, n, kdim)
         };
 
+        // ⛔ THE PRE-SCALE CODE-DOT IS COMPUTED IN f32, NOT f16. The contraction
+        // runs on the RAW e4m3 codes (the hardware `matmulfp8` in-fold applies
+        // the scale INSIDE the accumulate); the emulator lane spells it as a
+        // plain matmul followed by the scale `mulf`, so the matmul's output is
+        // the UN-scaled code-dot. A checkpoint's codes are large precisely
+        // because its per-channel scales are small (gemma-4-26b q_proj: codes
+        // rms 84, scales ~2.6e-4) — a code-dot of a 2816-deep row against a
+        // normed activation reaches ~1e5, which is INF in f16 (max 65504), and
+        // MEASURED at the 26b's first prefill: t1053 (q_proj out) went inf at
+        // seg1, NaN by the first rmsnorm after it, and the forward died in
+        // `argmax`'s NaN compare. The interpreter's `matmul2d` keys the result
+        // tile's dtype on the ACTIVATION's, so the pre-scale chain stays F32
+        // only if the outs seed here is F32 too — `accumulate_outs` rounds the
+        // sum to the seed's dtype, and an f16 seed would round the code-dot
+        // right back to f16 (inf). The scale `mulf` then computes in f32 and
+        // rounds the SCALED value once, which the region's f16 holds.
         let dims = vec![i64::from(m), i64::from(n)];
-        let init = self.splat_zero(dims.clone());
+        let init = self.f32_splat(0.0, dims.clone());
         let arena = self.a;
         let maps: Vec<ktir_core::affine::AffineMap<'static>> = [[0i64, 2], [1, 2], [0, 1]]
             .iter()
@@ -5923,13 +5942,15 @@ impl<'g, F: RopeForm> KtirFunc<'g, F> {
             AttrKey::IndexingMaps,
             Attr::AffineMapList(arena.maps(maps)),
         );
-        let ty = self.tensor_ty(dims.clone());
+        let ty = self.f32_ty(dims.clone());
         let op = self.typed(op, ty);
         self.push(op);
 
         // ⭐ DEQUANT IS A COLUMN-WISE MULTIPLY — arithmetic the contraction owes, not a tiling
         // decision, so it stays here. `wscale` is the checkpoint's `[1, n]` per-output-column row and
-        // scales every column this contraction computed.
+        // scales every column this contraction computed. The product computes in f32 and rounds
+        // once to f16 — the SCALED value, which the region's f16 holds (the overflow was only ever
+        // the pre-scale code-dot above).
         let s_val = {
             let acc = self.tile(scale_view, zero, zero, 1, n);
             self.load_tile(acc, 1, n)

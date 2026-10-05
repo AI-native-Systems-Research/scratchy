@@ -1066,7 +1066,19 @@ pub fn run_matmul_loop_gpu(
     // The K-loop's result tensor is f16 (matmul outs dtype); this f16 rounding at
     // write-back is what keeps NAX and AMX golden-equivalent (both quantize the
     // f32 result identically), matching the interpreter's matmul precision.
-    let tile = crate::tile::Tile::compute(c, DType::F16, vec![m, n]);
+    // EXCEPT over an fp8 weight: that result is the UN-scaled code-dot (the
+    // dequant scale `mulf` follows the loop), and real checkpoints carry LARGE
+    // codes with SMALL scales (gemma-4-26b q_proj: codes rms 84, scales ~2.6e-4,
+    // dots ~1e5) — f16 write-back made every QKV projection inf on the first
+    // prefill and NaN'd the layer one norm later. F32 is the hardware
+    // `matmulfp8`'s own wider-accumulate convention (see `matmul2d` in
+    // linalg.rs, the interpreter-side twin of this fix).
+    let out_dtype = if info.b_dtype == DType::Fp8E4m3 {
+        DType::F32
+    } else {
+        DType::F16
+    };
+    let tile = crate::tile::Tile::compute(c, out_dtype, vec![m, n]);
     let bytes = tile.size_bytes() as i64;
     ctx.set_value(info.out_ssa, crate::ir::Value::Tile(tile));
     // Name the GEMM in an LX refusal: the charge is `m*n*2`, so the shape IS the diagnosis.
