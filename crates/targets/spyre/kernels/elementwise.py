@@ -17,9 +17,13 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about these kern
 * PARAMETERS, IN ORDER: the node's operand order then the output. Binary:
   `desc_a`, `desc_b`, `desc_o`; unary: `desc_x`, `desc_o`. The registry does not
   permute.
-* CONSTEXPRS: `M`, `N`, `BLOCK_M`, `BLOCK_N` — stated by the splice from the node's
-  own region (`M = BLOCK_M =` rows, `N = BLOCK_N =` cols), the same whole-region
-  single-tile law the builder states when the region fits a core's LX.
+* CONSTEXPRS: `M`, `N`, `BLOCK_M`, `BLOCK_N`, `N_TOTAL`, `C_START` — stated by the
+  splice from the node's own region (`M = BLOCK_M =` rows, `N = BLOCK_N =` the
+  region's width), the same whole-region single-tile law the builder states when the
+  region fits a core's LX, PLUS the STORAGE the region windows (`N_TOTAL =` the
+  tensor's full width, `C_START =` the region's column corner). A whole-region node
+  states `N_TOTAL = N`, `C_START = 0`. See `scalarmul.py`'s window law: the
+  descriptor names the storage, the load names the window.
 * GRID: `[1]`.
 
 ⛔ NO ROW BLOCKING, and the SPLICE refuses the node loudly (a named Err naming the
@@ -39,18 +43,20 @@ def add_fwd(desc_a, desc_b, desc_o,  #
             M: tl.constexpr, N: tl.constexpr,  #
             BLOCK_M: tl.constexpr,  #
             BLOCK_N: tl.constexpr,  #
+            N_TOTAL: tl.constexpr,  #
+            C_START: tl.constexpr,  #
             ):
     start_m = tl.program_id(0)
-    a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, N], strides=[N, 1],
+    a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    b_desc = tl.make_tensor_descriptor(desc_b, shape=[M, N], strides=[N, 1],
+    b_desc = tl.make_tensor_descriptor(desc_b, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
     offs_m = start_m * BLOCK_M
-    a = a_desc.load([offs_m, 0])
-    b = b_desc.load([offs_m, 0])
-    o_desc.store([offs_m, 0], a + b)
+    a = a_desc.load([offs_m, C_START])
+    b = b_desc.load([offs_m, C_START])
+    o_desc.store([offs_m, C_START], a + b)
 
 
 @triton.jit
@@ -58,18 +64,20 @@ def mul_fwd(desc_a, desc_b, desc_o,  #
             M: tl.constexpr, N: tl.constexpr,  #
             BLOCK_M: tl.constexpr,  #
             BLOCK_N: tl.constexpr,  #
+            N_TOTAL: tl.constexpr,  #
+            C_START: tl.constexpr,  #
             ):
     start_m = tl.program_id(0)
-    a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, N], strides=[N, 1],
+    a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    b_desc = tl.make_tensor_descriptor(desc_b, shape=[M, N], strides=[N, 1],
+    b_desc = tl.make_tensor_descriptor(desc_b, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
     offs_m = start_m * BLOCK_M
-    a = a_desc.load([offs_m, 0])
-    b = b_desc.load([offs_m, 0])
-    o_desc.store([offs_m, 0], a * b)
+    a = a_desc.load([offs_m, C_START])
+    b = b_desc.load([offs_m, C_START])
+    o_desc.store([offs_m, C_START], a * b)
 
 
 @triton.jit
@@ -77,18 +85,20 @@ def sub_fwd(desc_a, desc_b, desc_o,  #
             M: tl.constexpr, N: tl.constexpr,  #
             BLOCK_M: tl.constexpr,  #
             BLOCK_N: tl.constexpr,  #
+            N_TOTAL: tl.constexpr,  #
+            C_START: tl.constexpr,  #
             ):
     start_m = tl.program_id(0)
-    a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, N], strides=[N, 1],
+    a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    b_desc = tl.make_tensor_descriptor(desc_b, shape=[M, N], strides=[N, 1],
+    b_desc = tl.make_tensor_descriptor(desc_b, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
     offs_m = start_m * BLOCK_M
-    a = a_desc.load([offs_m, 0])
-    b = b_desc.load([offs_m, 0])
-    o_desc.store([offs_m, 0], a - b)
+    a = a_desc.load([offs_m, C_START])
+    b = b_desc.load([offs_m, C_START])
+    o_desc.store([offs_m, C_START], a - b)
 
 
 @triton.jit
@@ -96,14 +106,16 @@ def silu_fwd(desc_x, desc_o,  #
              M: tl.constexpr, N: tl.constexpr,  #
              BLOCK_M: tl.constexpr,  #
              BLOCK_N: tl.constexpr,  #
+             N_TOTAL: tl.constexpr,  #
+             C_START: tl.constexpr,  #
              ):
     start_m = tl.program_id(0)
-    x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, N], strides=[N, 1],
+    x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
     offs_m = start_m * BLOCK_M
-    x = x_desc.load([offs_m, 0])
+    x = x_desc.load([offs_m, C_START])
     # silu(x) = x / (1 + exp(-x)) — the same chain the builder's own arm writes
     # (`negate → math.exp → splat 1 → addf → divf`) and `silumul.py` spells for the
     # fused form: f16 in and out, the f32 island only around `exp` (the ladder's
@@ -111,7 +123,7 @@ def silu_fwd(desc_x, desc_o,  #
     # f16→f32).
     e = tl.exp((-x).to(tl.float32)).to(tl.float16)
     s = tl.fdiv(x, 1.0 + e)
-    o_desc.store([offs_m, 0], s)
+    o_desc.store([offs_m, C_START], s)
 
 
 @triton.jit
@@ -119,14 +131,16 @@ def gelu_fwd(desc_x, desc_o,  #
              M: tl.constexpr, N: tl.constexpr,  #
              BLOCK_M: tl.constexpr,  #
              BLOCK_N: tl.constexpr,  #
+             N_TOTAL: tl.constexpr,  #
+             C_START: tl.constexpr,  #
              ):
     start_m = tl.program_id(0)
-    x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, N], strides=[N, 1],
+    x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
     offs_m = start_m * BLOCK_M
-    x = x_desc.load([offs_m, 0])
+    x = x_desc.load([offs_m, C_START])
     # The TANH approximation, the reference the device's `gelu` DDL primitive
     # approximates (`eval_dag`'s own comment): 0.5x(1 + tanh(v)),
     # v = sqrt(2/pi)(x + 0.044715 x^3). The frontend has no `tanh` (its tl.math
@@ -139,4 +153,4 @@ def gelu_fwd(desc_x, desc_o,  #
     v = 1.5957691216057308 * (x32 + 0.044715 * x32 * x32 * x32)  # 2*sqrt(2/pi)*(...)
     e = tl.exp(-v).to(tl.float16)
     g = tl.fdiv(x, 1.0 + e)
-    o_desc.store([offs_m, 0], g)
+    o_desc.store([offs_m, C_START], g)

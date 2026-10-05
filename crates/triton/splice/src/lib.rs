@@ -435,39 +435,74 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             ));
         }
     }
-    // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS A SHAPE THE ONE-TILE KERNELS
-    // CANNOT SPELL — EVERY row, not just the pointwise family the measured defect came
-    // from. Every kernel states ONE whole-tensor tile at corner 0; it cannot name a
-    // window. The measured instance was the front end's COLUMN CHUNKING of a wide
-    // pointwise op (`n_blocks(out_cols, nb)`; production `nb = 8192`): the builder's
-    // program states each chunk's ACCESS-TILE CORNER (`load_region` honors
-    // `region.cols.start`), which the door turns into the operand's column offset
-    // (`pointwise_chunk_out_offset` → the 16384 B stick-group step at column 8192).
-    // MEASURED, granite-3.1-8b fp8 on card: the 12800-wide MLP intermediate is TWO
-    // chunks (0..8192, 8192..12800), and without this guard the second chunk's
-    // silu/mulsilu read and wrote the FIRST chunk's columns — fluent garbage out, on a
+    // ⛔⛔⛔ A NODE WHOSE REGIONS ARE NOT WHOLE TENSORS IS A SHAPE ONLY A KERNEL THAT
+    // STATES ITS CORNER CAN SPELL. The measured instance was the front end's COLUMN
+    // CHUNKING of a wide pointwise op (`n_blocks(out_cols, nb)`; production `nb =
+    // 8192`): the builder's program states each chunk's access-tile corner
+    // (`load_region` honors `region.cols.start`), which the door turns into the
+    // operand's column offset. MEASURED, granite-3.1-8b fp8 on card: the 12800-wide
+    // MLP intermediate is TWO chunks (0..8192, 8192..12800), and a kernel stating
+    // corner 0 read and wrote the FIRST chunk's columns — fluent garbage out, on a
     // divergence the whole-region golden could not see because every fixture is
     // whole-region. 2b passed only because its intermediate is 8192 = exactly one
-    // block. Matmul and rope regions are whole in production today (`lower_region`
-    // N-blocks pointwise only), but this guard reads the REGION, not the op kind, so a
-    // front-end change that windows any other op's regions reproduces the same refusal
-    // with the kernel row named — a windowed kernel is the fix shape.
+    // block.
+    //
+    // ⭐ THE POINTWISE FAMILY NOW SPELLS IT: `elementwise.py` / `silumul.py` /
+    // `scalarmul.py` state `N_TOTAL` (the tensor's storage width, named by the
+    // descriptor's shape/strides) and `C_START` (the region's column corner, named
+    // by the load/store offsets) — the same facts the builder's `load_region` /
+    // `store_region` state, so the door reads the SAME region off the spliced
+    // program. Every OTHER row states ONE whole-tensor tile at corner 0 and cannot
+    // name a window, so the refusal stands for it: matmul and rope regions are whole
+    // in production today (`lower_region` N-blocks pointwise only), and this guard
+    // reads the REGION, not the op kind, so a front-end change that windows any
+    // other op's regions reproduces the same refusal with the kernel row named — a
+    // windowed kernel is the fix shape.
     {
-        let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion, ir: &SubtileIR<F>| {
-            let s = &ir.tensors[tr.tensor.index()];
-            tr.region.rows.start == 0
-                && tr.region.rows.len == s.rows
-                && tr.region.cols.start == 0
-                && tr.region.cols.len == s.cols
-        };
-        if !whole(&node.output, ir) || node.inputs.iter().any(|tr| !whole(tr, ir)) {
-            return Err(format!(
-                "triton splice: {} t{} has a windowed region (not the whole tensor) — the \
-                 one-tile kernels state corner 0 only; the windowed-kernel family (access-tile \
-                 corners stated from the region) has not landed",
-                program_stem(node, &row),
-                node.output.tensor.index()
-            ));
+        let states_the_corner = matches!(
+            &node.op,
+            SubOp::SiluMul
+                | SubOp::ScalarMul { .. }
+                | SubOp::Elementwise(
+                    EwKind::Silu | EwKind::Gelu | EwKind::Add | EwKind::Mul | EwKind::Sub,
+                )
+        );
+        if !states_the_corner {
+            let whole = |tr: &scratchy_subtile::subtile_ir::TensorRegion, ir: &SubtileIR<F>| {
+                let s = &ir.tensors[tr.tensor.index()];
+                tr.region.rows.start == 0
+                    && tr.region.rows.len == s.rows
+                    && tr.region.cols.start == 0
+                    && tr.region.cols.len == s.cols
+            };
+            if !whole(&node.output, ir) || node.inputs.iter().any(|tr| !whole(tr, ir)) {
+                return Err(format!(
+                    "triton splice: {} t{} has a windowed region (not the whole tensor) — the \
+                     one-tile kernels state corner 0 only; the windowed-kernel family (access-tile \
+                     corners stated from the region) has not landed",
+                    program_stem(node, &row),
+                    node.output.tensor.index()
+                ));
+            }
+        } else {
+            // ⛔ THE COLUMN CORNER IS STATED; THE ROW CORNER IS NOT. The pointwise
+            // kernels load at `start_m * BLOCK_M` with a `[1]` grid — row 0 — so a
+            // region whose ROW corner is nonzero is still a shape this family cannot
+            // spell (the prefill lm-head fold's row extraction is exactly that, and
+            // it is the fold worklist item). Production chunking never moves the row
+            // corner (`lower_region` tiles columns only), so this is the loud edge.
+            let row0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+                tr.region.rows.start == 0
+            };
+            if !row0(&node.output) || node.inputs.iter().any(|tr| !row0(tr)) {
+                return Err(format!(
+                    "triton splice: {} t{} has a nonzero ROW corner — the pointwise kernels \
+                     load row 0 (`start_m * BLOCK_M` at a [1] grid); a row-windowed kernel is the \
+                     prefill-fold worklist item",
+                    program_stem(node, &row),
+                    node.output.tensor.index()
+                ));
+            }
         }
     }
 
@@ -546,7 +581,7 @@ fn kernels_dir() -> PathBuf {
 /// (`cases::spec`).
 fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
-    _ir: &SubtileIR<F>,
+    ir: &SubtileIR<F>,
     row: &TritonKernelRow,
 ) -> Result<KernelSpec, String> {
     let out = &node.output;
@@ -669,7 +704,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
         (SubOp::SiluMul, "silumul_fwd") => {
             // The kernel's own parameter spellings: desc_g, desc_u, desc_o, then the
-            // constexprs M / N / BLOCK_M / BLOCK_N.
+            // constexprs M / N / BLOCK_M / BLOCK_N / N_TOTAL / C_START.
             for p in ["desc_g", "desc_u", "desc_o"] {
                 signature.insert(
                     p.to_string(),
@@ -682,11 +717,19 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             // The whole region, one tile: `BLOCK_M = M` rows and `BLOCK_N = N` columns,
-            // the same no-row-blocking law `KtirFunc::silu_mul` states for itself.
+            // the same no-row-blocking law `KtirFunc::silu_mul` states for itself —
+            // PLUS the STORAGE the region windows: the descriptor names the TENSOR
+            // (`[M, N_TOTAL]`, strides `[N_TOTAL, 1]` — `KtirFunc::view`'s own shape
+            // read) and the load/store names the CORNER (`C_START`), exactly as the
+            // builder's `load_region`/`store_region` state it. A whole-region node
+            // states `N_TOTAL = N`, `C_START = 0`.
+            let (n_total, c_start) = window_of(node, ir)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
         }
         (SubOp::Elementwise(EwKind::Silu | EwKind::Gelu), "silu_fwd" | "gelu_fwd") => {
             for p in ["desc_x", "desc_o"] {
@@ -700,16 +743,20 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 constexprs.insert(k.to_string(), v);
                 Ok(())
             };
+            let (n_total, c_start) = window_of(node, ir)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
         }
         (SubOp::Elementwise(_), "add_fwd" | "mul_fwd" | "sub_fwd") => {
             // The kernel's own parameter spellings: desc_a, desc_b, desc_o for every
-            // binary entry, then the constexprs M / N / BLOCK_M / BLOCK_N — the same
-            // whole-region single-tile law `lower_elementwise_node` states when the
-            // region fits (the splice refuses the node otherwise, above).
+            // binary entry, then the constexprs M / N / BLOCK_M / BLOCK_N / N_TOTAL /
+            // C_START — the same whole-region single-tile law `lower_elementwise_node`
+            // states when the region fits, PLUS the storage-window facts (see
+            // `window_of`).
             for p in ["desc_a", "desc_b", "desc_o"] {
                 signature.insert(
                     p.to_string(),
@@ -721,10 +768,13 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 constexprs.insert(k.to_string(), v);
                 Ok(())
             };
+            let (n_total, c_start) = window_of(node, ir)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("N", Val::Int(i128::from(c)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
         }
         (SubOp::ScalarMul { scale }, "scalarmul_fwd") => {
             for p in ["desc_x", "desc_o"] {
@@ -738,10 +788,30 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 constexprs.insert(k.to_string(), v);
                 Ok(())
             };
+            let (n_total, c_start) = window_of(node, ir)?;
+            // ⛔ THE WINDOW IS THE DEVICE WIDTH, NOT THE LOGICAL ONE — the door's own
+            // law for this family. `scalarmul_scaled` pads the window through
+            // `DeviceWidth::for_pointwise` (a ScalarMul on the padded logits must use
+            // the width its producer matmul emitted), and the Triton front end refuses
+            // a block whose last dim is under 16 bytes (`semantic.py:1863`), so
+            // granite's 3-wide logits tail chunk is not spellable at its logical
+            // width. Stating the DEVICE width clears that floor AND states the window
+            // the descriptor actually computes. `for_pointwise` is IDEMPOTENT (every
+            // branch of `bump_sticks_to_splittable` reproduces its input: a
+            // full-occupancy pad is 32-divisible and stays; an 8-stick pad is
+            // core-split ≥8 and stays), so the door re-derives the SAME width from
+            // this program as from the builder's logical one — including through the
+            // `pointwise_width_the_output_holds` cap, which sees identical `cols` on
+            // both paths. The other pointwise families (elementwise, silumul) state
+            // the LOGICAL width because their door arms do — `check_pointwise_cols`
+            // refuses a non-stick width rather than padding it.
+            let c_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(c).get();
             ce("M", Val::Int(i128::from(m)))?;
-            ce("N", Val::Int(i128::from(c)))?;
+            ce("N", Val::Int(i128::from(c_dev)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
-            ce("BLOCK_N", Val::Int(i128::from(c)))?;
+            ce("BLOCK_N", Val::Int(i128::from(c_dev)))?;
+            ce("N_TOTAL", Val::Int(i128::from(n_total)))?;
+            ce("C_START", Val::Int(i128::from(c_start)))?;
             // THE SCALE, from the node's own payload. The consumer reads it OFF THE
             // PROGRAM (`program_scalarmul_scale`: one splat feeding every `arith.mulf`)
             // and looks the value up in `BundleLayout::scalarmul_scales`, the registry
@@ -798,6 +868,45 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             .to_string_lossy()
             .into_owned(),
     })
+}
+
+/// The STORAGE-WINDOW FACTS a pointwise kernel states: the tensor's full column
+/// extent (`N_TOTAL` — the descriptor's own shape/strides name the STORAGE, exactly
+/// as `KtirFunc::view` reads it from the graph) and the region's column corner
+/// (`C_START` — the load/store offsets name the WINDOW, exactly as the builder's
+/// `load_region`/`store_region` state it from `region.cols.start`).
+///
+/// ⛔ READ OFF THE OUTPUT'S TENSOR. The front end's chunking gives every operand of a
+/// chunked node the SAME column window (`lower_region` tiles all of a node's regions
+/// by the output's block), so any operand would answer the same — but the OUTPUT is
+/// the tensor the descriptor's store addresses, and a node whose operands DISAGREE
+/// about the window is malformed in a way no kernel can spell: it is refused by name
+/// here rather than silently strided wrong. A whole-region node answers
+/// `(cols, 0)`, the constants the one-tile form always implied.
+fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<(u32, u32), String> {
+    let out = &node.output;
+    let n_total = ir.tensors[out.tensor.index()].cols;
+    let (r, c_start) = (out.region.rows.start, out.region.cols.start);
+    // The operands must window the SAME slice of the SAME storage — the builder's
+    // own law (`load_region` per operand, one chunk per node).
+    for tr in &node.inputs {
+        let in_total = ir.tensors[tr.tensor.index()].cols;
+        if tr.region.rows.start != r || tr.region.cols.start != c_start || in_total != n_total {
+            return Err(format!(
+                "triton splice: t{}'s operands disagree about the window (output [{r}, \
+                 {c_start}] of a {n_total}-wide tensor, input [{}, {}] of a {in_total}-wide one) \
+                 — a chunked node windows ALL its regions by the output's block \
+                 (`lower_region`), so a disagreement is a malformed node no kernel can spell",
+                out.tensor.index(),
+                tr.region.rows.start,
+                tr.region.cols.start,
+            ));
+        }
+    }
+    Ok((n_total, c_start))
 }
 
 /// The launch grid. The builder's programs are `(gx, gy) = (1, 1)` for every pointwise

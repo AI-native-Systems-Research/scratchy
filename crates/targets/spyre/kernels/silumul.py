@@ -12,8 +12,14 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 
 * PARAMETERS, IN ORDER: `desc_g`, `desc_u`, `desc_o` — the node's operand order
   (gate, up) then the output. The registry does not permute.
-* CONSTEXPRS: `M`, `N`, `BLOCK_M`, `BLOCK_N` — stated by the splice from the node's
-  own region (`M = BLOCK_M =` the region's row count, `N = BLOCK_N =` its width).
+* CONSTEXPRS: `M`, `N`, `BLOCK_M`, `BLOCK_N`, `N_TOTAL`, `C_START` — stated by the
+  splice from the node's own region (`M = BLOCK_M =` the region's row count,
+  `N = BLOCK_N =` its width) PLUS the STORAGE the region windows (`N_TOTAL =` the
+  tensor's full width, `C_START =` the region's column corner). A whole-region node
+  states `N_TOTAL = N`, `C_START = 0`. See `scalarmul.py`'s window law: the
+  descriptor names the storage, the load names the window — granite-8b's 12800-wide
+  intermediate is TWO chunks sharing one tensor, and chunk 1 must read and write
+  columns 8192.. of that tensor, not its base.
 * GRID: `[1]`.
 
 ⛔ NO ROW BLOCKING, deliberately — the same law `KtirFunc::silu_mul`'s own comment
@@ -32,18 +38,20 @@ def silumul_fwd(desc_g, desc_u, desc_o,  #
                 M: tl.constexpr, N: tl.constexpr,  #
                 BLOCK_M: tl.constexpr,  #
                 BLOCK_N: tl.constexpr,  #
+                N_TOTAL: tl.constexpr,  #
+                C_START: tl.constexpr,  #
                 ):
     start_m = tl.program_id(0)
-    g_desc = tl.make_tensor_descriptor(desc_g, shape=[M, N], strides=[N, 1],
+    g_desc = tl.make_tensor_descriptor(desc_g, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    u_desc = tl.make_tensor_descriptor(desc_u, shape=[M, N], strides=[N, 1],
+    u_desc = tl.make_tensor_descriptor(desc_u, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N], strides=[N, 1],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N_TOTAL], strides=[N_TOTAL, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
 
     offs_m = start_m * BLOCK_M
-    g = g_desc.load([offs_m, 0])
-    u = u_desc.load([offs_m, 0])
+    g = g_desc.load([offs_m, C_START])
+    u = u_desc.load([offs_m, C_START])
     # silu(g) = g / (1 + exp(-g)) — the same chain `KtirFunc::silu_mul` writes.
     # `tl.sigmoid` refuses an f16 tensor outright (swiglu delta 5, `math.exp` is
     # @_check_dtype(["fp32","fp64"])), and the ladder's LegalizeTypes collapses the
@@ -51,4 +59,4 @@ def silumul_fwd(desc_g, desc_u, desc_o,  #
     # an f16 tile with no extf/truncf — the exact four ops the builder emits.
     e = tl.exp((-g).to(tl.float32)).to(tl.float16)
     s = tl.fdiv(g, 1.0 + e)  # tl.fdiv, not `/`: `/` upcasts f16→f32 (swiglu delta 6)
-    o_desc.store([offs_m, 0], s * u)
+    o_desc.store([offs_m, C_START], s * u)

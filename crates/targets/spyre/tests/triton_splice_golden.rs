@@ -268,19 +268,17 @@ fn silumul_ir(m: u32, c: u32) -> SubtileIR {
     }
 }
 
-/// ⛔ THE COLUMN-CHUNKED NODE IS A LOUD ERR — the 8b defect's own gate. The front end
-/// tiles a wide pointwise op into column chunks (production `nb = 8192`; granite 8b's
-/// 12800-wide MLP silumul is chunks `0..8192` and `8192..12800`), and the one-tile
-/// kernels state ONE whole-tensor tile at corner 0 — a windowed load is not expressible
-/// in them. The splice must REFUSE BY NAME (never fall through and never mis-address),
-/// and this pins exactly that: a chunk-shaped node returns the whole-region Err, while
-/// the whole-tensor node of the same width still splices (the two paths are
-/// discriminated by the REGION, never by the width).
-///
-/// The windowed-kernel family (access-tile corners stated from the region) replaces
-/// this Err; when it lands, this test becomes the chunked identity test.
+/// ⛔ THE COLUMN-CHUNKED NODE IS THE WINDOWED-KERNEL FAMILY'S OWN GATE — the 8b
+/// defect's, now pinned as BYTE IDENTITY. The front end tiles a wide pointwise op
+/// into column chunks (production `nb = 8192`; granite 8b's 12800-wide MLP silumul is
+/// chunks `0..8192` and `8192..12800`), and the kernels state the window the builder
+/// states: `N_TOTAL` names the STORAGE (the descriptor's shape/strides) and `C_START`
+/// names the WINDOW (the load/store offsets), the same access-tile corner
+/// `KtirFunc::load_region`/`store_region` write. Both programs go through the SAME
+/// door under the SAME layout, and the descriptors must be byte-identical — the
+/// whole-tensor control at the same width pins that the identity is not vacuous.
 #[test]
-fn a_column_chunked_silumul_is_a_loud_refusal() {
+fn a_column_chunked_silumul_splices_byte_identically() {
     // The CHUNK-1 shape, measured on the card: 12800-wide intermediate, second block.
     let ir = silumul_ir(1, 12800);
     let chunk = Range::new(8192, 12800 - 8192);
@@ -295,17 +293,66 @@ fn a_column_chunked_silumul_is_a_loud_refusal() {
     chunked.nodes[0].inputs = vec![window(0), window(1)];
     chunked.nodes[0].output = window(2);
 
-    let err = match scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false) {
-        Err(reason) => reason,
-        Ok(_) => panic!("a column-chunked silumul must refuse loudly, not compile"),
+    // The builder path over the SAME chunk-shaped node — the control.
+    let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+    let layout = compute_bundle_layout(&chunked, &weight_ids, false, &Default::default())
+        .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
+    let mut sym = 0i64;
+    let builder_ops = lower_silumul_node(&chunked.nodes[0], &chunked, &mut sym, Some(&layout))
+        .unwrap_or_else(|e| panic!("builder lowered the chunked node: {e}"));
+    let [builder] = &builder_ops[..] else {
+        panic!(
+            "one chunked silumul lowers to one op, got {}",
+            builder_ops.len()
+        )
     };
-    assert!(
-        err.contains("windowed region"),
-        "the chunked refusal must name the windowed-region cause: {err}"
+    let builder_ktir = builder
+        .ktir
+        .as_ref()
+        .expect("builder op carries its program");
+
+    // The splice — the chunked node compiles now (the kernels state `C_START`).
+    let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
+        .unwrap_or_else(|e| panic!("splice compiled the chunked node: {e}"));
+    assert_eq!(
+        spliced.op_name, builder.op_name,
+        "op_name — the splice and the builder name the same op"
     );
 
+    // BOTH through the SAME door: the regions the door reads must agree, or the
+    // descriptors diverge here rather than mis-address on the card.
+    let mut sym = 0i64;
+    let mut quantized = HashSet::new();
+    let builder_emitted = door_lower(builder_ktir, &mut sym, Some(&layout), &mut quantized, None)
+        .unwrap_or_else(|e| panic!("builder program lowered: {}", e.message));
+    let mut sym = 0i64;
+    let spliced_emitted = door_lower(
+        spliced
+            .ktir
+            .as_ref()
+            .expect("spliced op carries its program"),
+        &mut sym,
+        Some(&layout),
+        &mut quantized,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("spliced program lowered: {}", e.message));
+    assert_eq!(
+        builder_emitted.len(),
+        spliced_emitted.len(),
+        "op count — the chunked silumul lowers to one op on both paths"
+    );
+    for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+        let bj = serde_json::to_string(b.dsc()).unwrap();
+        let sj = serde_json::to_string(s.dsc()).unwrap();
+        assert_eq!(
+            bj, sj,
+            "chunked descriptor bytes: builder vs splice diverged (the 8b defect's shape)"
+        );
+    }
+
     // THE CONTROL: the whole-tensor node at the same total width still splices — the
-    // refusal is the REGION's, not the width's.
+    // discrimination is by REGION, never by width.
     let whole_node = &ir.nodes[0];
     let spliced = scratchy_triton_splice::lower(whole_node, &ir, false)
         .expect("the whole-tensor node compiles");
@@ -851,10 +898,9 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
 /// The scalarmul row's byte-identity gate — the same law as every other row: the
 /// builder's `lower_scalarmul_node` program vs the spliced `scalarmul.py` through the
 /// SAME door under the SAME layout, at granite's own multipliers (the logits scale's
-/// `1/√hidden` at 2b/8b widths) and a decode + prefill-rung shape. ⛔ THE CHUNKED
-/// FORM IS NOT HERE: a windowed region is a loud splice Err (pinned by the silumul
-/// chunk test above), and the whole-tensor shapes at these widths fit the
-/// three-live-tile budget.
+/// `1/√hidden` at 2b/8b widths) and a decode + prefill-rung shape. The chunked form
+/// has its own gate below (`spliced_column_chunked_scalarmul_is_byte_identical_per_chunk`);
+/// the whole-tensor shapes at these widths fit the three-live-tile budget.
 #[test]
 fn spliced_scalarmul_is_byte_identical_to_the_builder() {
     // (M, C, SCALE) — 2b's and 8b's logits scale at the hidden each normalizes to.
@@ -927,6 +973,96 @@ fn spliced_scalarmul_is_byte_identical_to_the_builder() {
             assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} c={c})");
         }
     }
+}
+
+/// The scalarmul row's CHUNKED byte-identity gate — granite's own 7-chunk logits,
+/// the shape the 8b defect was convicted on. The logits tensor is `[1, 49155]`
+/// (49155 = 6 × 8192 + 3), and `lower_region` tiles it into SEVEN scalarmul chunks
+/// that share one output TensorId; the splice now compiles every chunk with
+/// `C_START` naming its column corner and the descriptors must stay byte-identical
+/// to the builder's per chunk — through the same door, under one layout threaded
+/// over ALL SEVEN (the one `bundle_sym` counter the production bake threads).
+#[test]
+fn spliced_column_chunked_scalarmul_is_byte_identical_per_chunk() {
+    const LOGITS_COLS: u32 = 49_155;
+    const NB: u32 = 8_192;
+    let scale = 0.022_097_087f32;
+    let ir = scalarmul_ir(1, LOGITS_COLS, scale);
+    let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
+    let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+        .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
+
+    // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
+    // descriptor names depend on the chunks before it.
+    let mut builder_sym = 0i64;
+    let mut splice_sym = 0i64;
+    let mut chunk_idx = 0usize;
+    let mut c_start = 0u32;
+    while c_start < LOGITS_COLS {
+        let len = NB.min(LOGITS_COLS - c_start);
+        let window = |t: usize| TensorRegion {
+            tensor: TensorId::from_index(t),
+            region: Region {
+                rows: Range::new(0, 1),
+                cols: Range::new(c_start, len),
+            },
+        };
+        let mut chunked = ir.clone();
+        chunked.nodes[0].inputs = vec![window(0)];
+        chunked.nodes[0].output = window(1);
+
+        // The builder over the same chunk-shaped node — the control.
+        let builder = lower_scalarmul_node(&chunked.nodes[0], &chunked, scale, &mut builder_sym)
+            .unwrap_or_else(|e| panic!("builder lowered chunk {chunk_idx} (c_start {c_start}): {e}"));
+        let builder_ktir = builder
+            .ktir
+            .as_ref()
+            .expect("builder op carries its program");
+
+        // The splice — every chunk compiles (`C_START` states the corner).
+        let spliced = scratchy_triton_splice::lower(&chunked.nodes[0], &chunked, false)
+            .unwrap_or_else(|e| panic!("splice compiled chunk {chunk_idx} (c_start {c_start}): {e}"));
+        assert_eq!(
+            spliced.op_name, builder.op_name,
+            "op_name (chunk {chunk_idx}, c_start {c_start})"
+        );
+
+        let mut quantized = HashSet::new();
+        let builder_emitted =
+            door_lower(builder_ktir, &mut builder_sym, Some(&layout), &mut quantized, None)
+                .unwrap_or_else(|e| panic!("builder program lowered (chunk {chunk_idx}): {}", e.message));
+        let spliced_emitted = door_lower(
+            spliced
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program"),
+            &mut splice_sym,
+            Some(&layout),
+            &mut quantized,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("spliced program lowered (chunk {chunk_idx}): {}", e.message));
+
+        assert_eq!(
+            builder_emitted.len(),
+            spliced_emitted.len(),
+            "op count (chunk {chunk_idx})"
+        );
+        for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+            let bj = serde_json::to_string(b.dsc()).unwrap();
+            let sj = serde_json::to_string(s.dsc()).unwrap();
+            assert_eq!(
+                bj, sj,
+                "descriptor bytes (chunk {chunk_idx}, c_start {c_start}): builder vs splice \
+                 diverged — the 8b defect's own shape"
+            );
+            assert_eq!(b.op_name, s.op_name, "emitted op_name (chunk {chunk_idx})");
+        }
+
+        chunk_idx += 1;
+        c_start += len;
+    }
+    assert_eq!(chunk_idx, 7, "granite's logits 49155 = 6 × 8192 + 3 is SEVEN chunks");
 }
 
 /// `x * scale -> out` as a one-node [`SubtileIR`]. t0 = x source, t1 = result.
