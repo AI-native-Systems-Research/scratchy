@@ -25,8 +25,7 @@ use crate::tape::step::{
     ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
     KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores,
     MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables, RotatedRows, RouterInput,
-    RowSource,
-    RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
+    RowSource, RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
 use scratchy_ir::{KvCodec, TqBits};
 use scratchy_subtile::handoff::WeightKind;
@@ -1667,6 +1666,48 @@ fn lower_one(
         },
 
         // ── Gemma4 post-FFN tail: rmsnorm → add → scalar_weight_mul ─
+        I::NormAdd(Slot(delta), Slot(residual), Slot(out), norm, HiddenSize(hidden)) => {
+            let rows = super::kernel_constants::RmsNormConstants {
+                bucket_m: super::ids::BucketM(bucket_m),
+                q_size: super::ids::QSize(*hidden),
+                rms_norm_eps: super::ids::RmsNormEps(norm.eps.0),
+                weight_offset: norm.offset.0,
+            };
+            let mut constants: Vec<ConstantValue> = rows.into();
+            constants.push(ConstantValue::boolean(super::constants::ConstSlot(5), true));
+            let layer = super::ids::LayerId(norm.layer.get() + layer_offset);
+            let arena = |slot: &u32, binding_index| Binding::ArenaSlot {
+                slot: *slot,
+                binding_index,
+            };
+            LoweredCommand {
+                kernel: KernelId::NormAddScalarMul,
+                library: "fused_add_rmsnorm",
+                function: norm_add_scalar_mul_kernel_static_name(p, scale_dtype_for(p)),
+                constants: constants.into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, 1, 1),
+                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(vec![
+                    arena(delta, 0),
+                    arena(residual, 1),
+                    arena(out, 2),
+                    source(
+                        w.of(WeightKind::RmsNorm, 0)?,
+                        WeightTensor::Weight,
+                        layer,
+                        3,
+                    ),
+                ]),
+                gemm_dims: None,
+            }
+        }
         I::NormAddScalarMul(
             Slot(delta_slot),
             Slot(residual_slot),

@@ -194,6 +194,8 @@ pub enum MetalStep {
     FusedAddRmsNormWithOffset(Slot, Slot, LayerId, GainOffset),
     /// `(delta, residual, out, layer, width)`: `out = (rmsnorm(delta) + residual) * layer_scalar`.
     NormAddScalarMul(Slot, Slot, Slot, LayerId, HiddenSize),
+    /// `(delta, residual, out, norm, width)`: `out = rmsnorm(delta) + residual`.
+    NormAdd(Slot, Slot, Slot, RowNorm, HiddenSize),
     /// `(in, out, layer)`: multiply by the layer's loaded scalar.
     ScalarWeightMul(Slot, Slot, LayerId),
     /// `(in, out, scale, width)`.
@@ -462,6 +464,7 @@ impl MetalStep {
             | S::AttentionPrefillPaged(_, _, l, _)
             | S::SlidingAttentionPrefillPaged(_, _, l, _)
             | S::NormAddScalarMul(_, _, _, l, _)
+            | S::NormAdd(_, _, _, RowNorm { layer: l, .. }, _)
             | S::RopeAppend(_, _, _, _, _, _, l, ..)
             | S::RopeAppendNormed(_, _, _, _, _, _, l, ..)
             | S::GatedDeltaNet(_, _, _, _, _, l)

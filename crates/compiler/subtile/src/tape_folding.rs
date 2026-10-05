@@ -112,6 +112,13 @@ pub enum FoldPattern<K: 'static> {
         norm: SubOpKind,
         kernel: K,
     },
+    /// `add(norm(delta, gain), residual)`, the norm either operand and read by the add alone: the
+    /// norm folds into the add. Apply it after the folds that take the add or the norm with more.
+    NormAdd {
+        add: SubOpKind,
+        norm: SubOpKind,
+        kernel: K,
+    },
     /// `act(gate, up)` over expert rows: the gate and up `matmul`s (the activation's operands 0
     /// and 1), each read by the activation alone, fold into it.
     ExpertGated {
@@ -177,6 +184,7 @@ impl<K> FoldPattern<K> {
             Self::Gated { mul, .. } => *mul,
             Self::NormedRope { rope, .. } => *rope,
             Self::NormAddScale { scale, .. } => *scale,
+            Self::NormAdd { add, .. } => *add,
             Self::ExpertGated { act, .. } => *act,
             Self::ExpertCombined { combine, .. } => *combine,
             Self::Route { top_k, .. } => *top_k,
@@ -230,6 +238,13 @@ pub enum FusedShape {
         v: SlotId,
         q_gain: Option<StepOperand>,
         k_gain: Option<StepOperand>,
+    },
+    /// The norm's input and gain, and the add's other operand.
+    NormAdd {
+        norm: SlotId,
+        delta: StepOperand,
+        residual: StepOperand,
+        gain: StepOperand,
     },
     /// `residual` is the add's other operand.
     NormAddScale {
@@ -625,6 +640,7 @@ impl<K: Copy> Folder<'_, K> {
             FoldPattern::NormAddScale {
                 add, norm, kernel, ..
             } => self.norm_add_scale(i, add, norm, kernel),
+            FoldPattern::NormAdd { norm, kernel, .. } => self.norm_add(i, norm, kernel),
             FoldPattern::ExpertGated { matmul, kernel, .. } => {
                 let gate = self.sole_producer(i, 0, matmul)?;
                 let up = self.sole_producer(i, 1, matmul)?;
@@ -687,8 +703,7 @@ impl<K: Copy> Folder<'_, K> {
         normed: K,
         residual: K,
     ) -> Result<(), FoldError> {
-        if !self.model.normed_matvecs || self.absorbed[i].is_some() || !self.fusions[i].is_empty()
-        {
+        if !self.model.normed_matvecs || self.absorbed[i].is_some() || !self.fusions[i].is_empty() {
             return Ok(());
         }
         let ops = &self.ops;
@@ -696,8 +711,14 @@ impl<K: Copy> Folder<'_, K> {
             ops.kind(j) == matmul
                 && matches!(ops.op(j), SubOp::MatmulTile { weight, .. } if weight.kind() == weights)
         };
-        let reads = |j: usize| ops.args[j].iter().filter(|a| matches!(a, Arg::Op(q) if *q == i));
-        let readers: Vec<usize> = (0..ops.slot.len()).filter(|&j| reads(j).count() > 0).collect();
+        let reads = |j: usize| {
+            ops.args[j]
+                .iter()
+                .filter(|a| matches!(a, Arg::Op(q) if *q == i))
+        };
+        let readers: Vec<usize> = (0..ops.slot.len())
+            .filter(|&j| reads(j).count() > 0)
+            .collect();
         let normalizes = |j: usize| {
             is_matvec(j)
                 && self.absorbed[j].is_none()
@@ -1004,6 +1025,37 @@ impl<K: Copy> Folder<'_, K> {
             self.absorbed[*f] = Some(i);
         }
         self.record(i, kernel, shape);
+        Ok(())
+    }
+
+    /// Add `i` with a norm only it reads as either operand: the norm folds into it.
+    fn norm_add(&mut self, i: usize, norm: SubOpKind, kernel: K) -> Result<(), FoldError> {
+        if self.absorbed[i].is_some() || !self.fusions[i].is_empty() {
+            return Ok(());
+        }
+        let ops = &self.ops;
+        for k in 0..2u8 {
+            let Some(nrm) = ops.in_op(i, k)? else {
+                continue;
+            };
+            let free = self.absorbed[nrm].is_none() && self.fusions[nrm].is_empty();
+            if ops.kind(nrm) != norm || !free || self.consumers[nrm] != 1 {
+                continue;
+            }
+            let Some(gain) = ops.weight_operand(nrm) else {
+                continue;
+            };
+            ops.arg(i, 1 - k)?;
+            let shape = FusedShape::NormAdd {
+                norm: ops.slot[nrm],
+                delta: ops.operand(nrm, 0),
+                residual: ops.operand(i, 1 - k),
+                gain,
+            };
+            self.absorbed[nrm] = Some(i);
+            self.record(i, kernel, shape);
+            return Ok(());
+        }
         Ok(())
     }
 

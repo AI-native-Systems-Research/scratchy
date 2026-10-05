@@ -17,6 +17,9 @@ SCRATCHY_CONSTANT(float, FUSED_ARN_WEIGHT_OFFSET, 3);
 SCRATCHY_CONSTANT(uint,  FUSED_ARN_THREADS,       4);
 constant constexpr uint FUSED_ARN_PER_THREAD =
     (FUSED_ARN_HIDDEN_SIZE + FUSED_ARN_THREADS - 1) / FUSED_ARN_THREADS;
+// 5 (norm_add_scalar_mul only): no layer scalar — `out = rmsnorm(delta) + residual`, buffer 4 unread.
+SCRATCHY_CONSTANT_OPTIONAL(bool, NORM_ADD_UNSCALED, 5);
+constant constexpr bool NORM_ADD_SCALED = !(NORM_ADD_UNSCALED_SET && NORM_ADD_UNSCALED);
 
 /// Specialized fused add+rmsnorm matching the CUDA `fused_add_rms_norm_inplace`
 /// semantics (`scratchy-target-cuda::kernels::fused_add_rms_norm_inplace`):
@@ -140,7 +143,7 @@ template <typename T_act, typename T_scale>
     const float sum_sq = row_sum(local_sum, tid, FUSED_ARN_THREADS, shared_sum);
 
     float rms = sqrt(sum_sq / float(FUSED_ARN_HIDDEN_SIZE) + FUSED_ARN_EPS);
-    float s = float(layer_scalar[0]);
+    float s = NORM_ADD_SCALED ? float(layer_scalar[0]) : 1.0f;
 
     // Pass 2: out = (normed + residual) * layer_scalar. Round to T_act
     // at EVERY op boundary the unfused chain rounds at (RmsNorm store,

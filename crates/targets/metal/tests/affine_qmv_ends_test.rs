@@ -205,7 +205,13 @@ fn ends(c: &Case, norm: bool, residual: bool) -> QmvEnds {
 fn rig(c: &Case) -> Option<Rig> {
     let device = detect_device()?.device.clone();
     let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
-    let name = qmv_kernel_static_name(c.kernel(), c.dtype.dequant(), c.dtype.scale(), 4, c.group_size as u32);
+    let name = qmv_kernel_static_name(
+        c.kernel(),
+        c.dtype.dequant(),
+        c.dtype.scale(),
+        4,
+        c.group_size as u32,
+    );
     let qmv = |e: QmvEnds| {
         let mut v: Vec<ConstantValue> = AffineQmvConstants {
             k: KDimI32(c.k as i32),
@@ -222,14 +228,19 @@ fn rig(c: &Case) -> Option<Rig> {
         qmv(ends(c, false, true)),
     );
     let tag = c.dtype.tag();
-    let norm_name: &'static str = Box::leak(format!("rmsnorm_{tag}_s_{tag}_specialized").into_boxed_str());
+    let norm_name: &'static str =
+        Box::leak(format!("rmsnorm_{tag}_s_{tag}_specialized").into_boxed_str());
     let constants = RmsNormConstants {
         bucket_m: BucketM(1),
         q_size: QSize(c.k as u32),
         rms_norm_eps: RmsNormEps(EPS),
         weight_offset: c.offset,
     };
-    let norm = baked_build(&cache, &PipelineKey::new("rmsnorm", norm_name, constants.into())).expect(norm_name);
+    let norm = baked_build(
+        &cache,
+        &PipelineKey::new("rmsnorm", norm_name, constants.into()),
+    )
+    .expect(norm_name);
     Some(Rig {
         device,
         _cache: cache,
@@ -262,13 +273,28 @@ fn exact(c: &Case, w: &Weights, x: &[u16], gain: &[u16]) -> Vec<(f64, f64)> {
 
 /// The matvec of case `c` over `x`: `pso` with the gain bound at 15 into a fresh row, or (`norm`)
 /// the RMSNorm first and the plain matvec over its row; `y0` is the output row's initial bits.
-fn matvec(r: &Rig, c: &Case, w: &Weights, x: &Buffer, gain: &Buffer, y0: &[u16], how: How) -> Vec<u16> {
+fn matvec(
+    r: &Rig,
+    c: &Case,
+    w: &Weights,
+    x: &Buffer,
+    gain: &Buffer,
+    y0: &[u16],
+    how: How,
+) -> Vec<u16> {
     let y = shared(&r.device, y0);
     let normed_row = shared(&r.device, &vec![0u16; c.k]);
     let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
     let (grid, threads) = qmv_dispatch_shape(c.kernel(), 1, c.n as u32, 1);
     let qmv = |batch: &mut Mtl4DispatchBatch, pso, input: &Buffer| {
-        let binds = [(&w.w, 0), (&w.scales, 1), (&w.biases, 2), (input, 3), (&y, 4), (gain, 15)];
+        let binds = [
+            (&w.w, 0),
+            (&w.scales, 1),
+            (&w.biases, 2),
+            (input, 3),
+            (&y, 4),
+            (gain, 15),
+        ];
         batch.encode(pso, &binds, &[], &[], &[], size(grid), size(threads));
     };
     match how {
@@ -278,7 +304,15 @@ fn matvec(r: &Rig, c: &Case, w: &Weights, x: &Buffer, gain: &Buffer, y0: &[u16],
         How::NormThenPlain => {
             let binds = [(&normed_row, 0), (x, 1), (gain, 2)];
             let one = (1, 1, 1);
-            batch.encode(&r.norm, &binds, &[], &[], &[], size(one), size((NORM_THREADS, 1, 1)));
+            batch.encode(
+                &r.norm,
+                &binds,
+                &[],
+                &[],
+                &[],
+                size(one),
+                size((NORM_THREADS, 1, 1)),
+            );
             batch.barrier();
             qmv(&mut batch, &r.plain, &normed_row);
         }
@@ -323,10 +357,24 @@ fn cases() -> Vec<Case> {
     };
     vec![
         base,
-        Case { offset: 1.0, ..base },
-        Case { dtype: Dtype::F16, ..base },
-        Case { k: 896, n: 136, ..base },
-        Case { k: 128, n: 256, ..base },
+        Case {
+            offset: 1.0,
+            ..base
+        },
+        Case {
+            dtype: Dtype::F16,
+            ..base
+        },
+        Case {
+            k: 896,
+            n: 136,
+            ..base
+        },
+        Case {
+            k: 128,
+            n: 256,
+            ..base
+        },
     ]
 }
 
@@ -396,12 +444,22 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
         }
         .into();
         v.extend(Vec::<ConstantValue>::from(e));
-        baked_build(&cache, &PipelineKey::new("quantized_qmv", "affine_qmv_gated_fast_bf16_s_bf16_gs_64_b_4", v))
-            .expect("gated")
+        baked_build(
+            &cache,
+            &PipelineKey::new(
+                "quantized_qmv",
+                "affine_qmv_gated_fast_bf16_s_bf16_gs_64_b_4",
+                v,
+            ),
+        )
+        .expect("gated")
     };
     let (plain, normed) = (gated(QmvEnds::default()), gated(ends(&c, true, false)));
     let mut rng = Lcg(99);
-    let (gate, up) = (Weights::new(&r.device, &c, &mut rng), Weights::new(&r.device, &c, &mut rng));
+    let (gate, up) = (
+        Weights::new(&r.device, &c, &mut rng),
+        Weights::new(&r.device, &c, &mut rng),
+    );
     let (x, gain) = inputs(&c, &mut rng);
     let (g, u) = (exact(&c, &gate, &x, &gain), exact(&c, &up, &x, &gain));
     // `silu(g) · u`, its error scale carried through: |∂/∂g| ≤ 1.1·|u|, |∂/∂u| = |silu(g)|.
@@ -419,7 +477,15 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
         let input = if fused { &xb } else { &normed_row };
         if !fused {
             let binds = [(&normed_row, 0), (&xb, 1), (&gb, 2)];
-            batch.encode(&r.norm, &binds, &[], &[], &[], size((1, 1, 1)), size((NORM_THREADS, 1, 1)));
+            batch.encode(
+                &r.norm,
+                &binds,
+                &[],
+                &[],
+                &[],
+                size((1, 1, 1)),
+                size((NORM_THREADS, 1, 1)),
+            );
             batch.barrier();
         }
         let binds = [
@@ -433,7 +499,15 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
             (&up.biases, 7),
             (&gb, 15),
         ];
-        batch.encode(pso, &binds, &[], &[], &[], size((1, c.n as u32 / 8, 1)), size((32, 4, 1)));
+        batch.encode(
+            pso,
+            &binds,
+            &[],
+            &[],
+            &[],
+            size((1, c.n as u32 / 8, 1)),
+            size((32, 4, 1)),
+        );
         batch.commit(true);
         read_u16(&y, c.n)
     };

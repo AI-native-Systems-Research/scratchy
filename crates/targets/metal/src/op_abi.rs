@@ -310,6 +310,8 @@ pub enum MetalFusion {
     NormedQmv,
     /// A one-row MLX-affine matvec whose rows add into the residual stream.
     ResidualQmv,
+    /// `residual + rmsnorm(delta)`.
+    NormAdd,
 }
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
@@ -405,12 +407,20 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     kernel: F::MoeRoute,
                 },
             ],
-            // After the rope folds: it extends the writer command they made.
-            &[FoldPattern::Encoded {
-                writer: K::RopeAppend,
-                encode: K::KvEncode,
-                kernel: F::KvEncoded,
-            }],
+            // After the rope folds: it extends the writer command they made. A norm folds into the
+            // add it feeds only when no fold took either with more.
+            &[
+                FoldPattern::Encoded {
+                    writer: K::RopeAppend,
+                    encode: K::KvEncode,
+                    kernel: F::KvEncoded,
+                },
+                FoldPattern::NormAdd {
+                    add: K::Add,
+                    norm: K::RmsNorm,
+                    kernel: F::NormAdd,
+                },
+            ],
         ],
     }
 };
