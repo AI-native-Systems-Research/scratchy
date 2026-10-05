@@ -156,6 +156,10 @@ pub struct ForwardArgmaxRequest<'a> {
     /// signals "no sampled tokens this step" (chunked-prefill
     /// intermediate chunks) — backends fall back to the full GEMM.
     pub last_token_indices: Option<&'a [u32]>,
+    /// `[num_tokens, hidden]` row-major, model dtype: the final (post-norm) hidden state each row
+    /// of a multi-token-prediction head reads — its target's, or its own from the pass before.
+    /// `None` for every other model.
+    pub target_hidden: Option<&'a [u8]>,
 }
 
 /// Primitive the backend exposes for spec decode.
@@ -178,6 +182,21 @@ pub trait SpecDecodeBackend {
         kv_pool: KvPoolHandle,
         req: &ForwardArgmaxRequest<'_>,
     ) -> Result<Vec<u32>, BackendError>;
+
+    /// [`Self::forward_argmax_blocking`], also returning the forward's final (post-norm) hidden
+    /// states at `hidden_rows`, row-major in the model dtype: what a multi-token-prediction head
+    /// reads at its next depth. Default impl returns `NotImplemented`.
+    fn forward_argmax_hidden_blocking(
+        &mut self,
+        _model: ModelHandle,
+        _kv_pool: KvPoolHandle,
+        _req: &ForwardArgmaxRequest<'_>,
+        _hidden_rows: &[u32],
+    ) -> Result<(Vec<u32>, Vec<u8>), BackendError> {
+        Err(BackendError::NotImplemented(
+            "forward_argmax_hidden_blocking",
+        ))
+    }
 
     /// Submit the same forward + argmax non-blocking. Default impl returns
     /// `NotImplemented`. Phase 8 overrides this on each backend for

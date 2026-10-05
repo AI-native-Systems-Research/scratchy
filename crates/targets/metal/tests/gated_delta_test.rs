@@ -17,6 +17,7 @@ mod common;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
+use scratchy_target_metal::gdn_state::{CheckpointRows, GdnStart, GdnStep, RecordArea, StateEntry};
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -1252,5 +1253,508 @@ fn gdn_decode_is_the_conv_scan_norm() {
             read_f32(&out, t * value_dim).iter().all(|v| *v != 0.0),
             "{geometry}"
         );
+    }
+}
+
+/// Compares a kernel's rows against the reference's.
+fn assert_close(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: row count");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() < 1e-4, "{what}[{i}] metal={g} ref={w}");
+    }
+}
+
+/// Inputs for a verify step's rejected drafts: unlike anything `fill` produces.
+fn rejected(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i as f32 * 0.37).cos() * 0.5).collect()
+}
+
+/// A verify step's checkpoints, conv ring: 3 tokens, then a verify step of the next token, a kept
+/// draft and two rejected drafts, then one token resuming from the kept row's checkpoint — equals
+/// the sequence that never saw the rejected drafts. In slot 1 of a 2-slot pool keeping 3
+/// checkpoints, so the entries are offset and slot 0's must stay untouched.
+#[test]
+fn gdn_conv1d_varlen_resumes_from_checkpoint() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    let (conv_dim, kernel) = (32usize, 4usize);
+    let entry_len = conv_dim * (kernel - 1);
+    let rows = CheckpointRows(3);
+    let slot_entries = rows.entries_per_slot();
+    let t_full = 6usize;
+    let x_full = fill(t_full * conv_dim);
+    let w = fill(conv_dim * kernel);
+    let out_full = conv1d_ref(&x_full, &w, conv_dim, kernel, t_full);
+    let x_verify = [
+        &x_full[3 * conv_dim..5 * conv_dim],
+        &rejected(2 * conv_dim)[..],
+    ]
+    .concat();
+
+    let key = PipelineKey::new(
+        "gdn_conv1d_varlen",
+        "gdn_conv1d_varlen_f32",
+        vec![
+            ConstantValue::uint(0, conv_dim as u32),
+            ConstantValue::uint(1, kernel as u32),
+        ],
+    );
+    let pipeline = baked_build(&cache, &key).expect("gdn_conv1d_varlen pipeline");
+    let w_buf = buf_f32(&device, &w);
+    let state_buf = buf_zero_f32(&device, 2 * slot_entries * entry_len);
+    let run = |x: &[f32], start: GdnStart, checkpoint_rows: CheckpointRows| -> Option<Vec<f32>> {
+        let num_tokens = x.len() / conv_dim;
+        let out_buf = buf_zero_f32(&device, x.len());
+        let x_buf = buf_f32(&device, x);
+        let cu = buf_i32(&device, &[0, num_tokens as i32]);
+        let si = buf_i32(&device, &[slot_entries as i32]);
+        let step = buf_u32(
+            &device,
+            &[GdnStep {
+                start,
+                checkpoint_rows,
+                tip: StateEntry::First,
+                records: RecordArea::First,
+            }
+            .encode()],
+        );
+        common::dispatch_threadgroups(
+            &device,
+            &pipeline,
+            &[&out_buf, &x_buf, &w_buf, &state_buf, &cu, &si, &step],
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: conv_dim,
+                depth: 1,
+            },
+        )
+        .then(|| read_f32(&out_buf, x.len()))
+    };
+
+    let Some(_) = run(
+        &x_full[..3 * conv_dim],
+        GdnStart::Fresh,
+        CheckpointRows::NONE,
+    ) else {
+        return;
+    };
+    let Some(verify) = run(&x_verify, GdnStart::Slot, rows) else {
+        return;
+    };
+    assert_close(
+        &verify[..2 * conv_dim],
+        &out_full[3 * conv_dim..5 * conv_dim],
+        "verify kept rows",
+    );
+    let Some(next) = run(
+        &x_full[5 * conv_dim..],
+        GdnStart::Checkpoint(1),
+        CheckpointRows::NONE,
+    ) else {
+        return;
+    };
+    assert_close(&next, &out_full[5 * conv_dim..], "resumed row");
+    let slot0 = read_f32(&state_buf, slot_entries * entry_len);
+    assert!(
+        slot0.iter().all(|&v| v == 0.0),
+        "slot 0's entries were written"
+    );
+}
+
+/// [`gdn_conv1d_varlen_resumes_from_checkpoint`] for the recurrent (ssm) state, whose verify
+/// step records its draft rows and whose next step replays the kept ones from its base entry
+/// (`gdn_state` module docs): the resumed row is bit for bit the one a step that never saw the
+/// rejected drafts computes. Each step's code carries the slot's entry and record area as the
+/// slot allocator tracks them ([`GdnStep::after`]).
+#[test]
+fn gdn_scan_varlen_resumes_from_checkpoint() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    let (nk, nv, hk, hv) = (2usize, 4usize, 16usize, 16usize);
+    let key_dim = nk * hk;
+    let value_dim = nv * hv;
+    let conv_dim = 2 * key_dim + value_dim;
+    let scale = (hk as f32).powf(-0.5);
+    let entry_len = nv * hv * hk;
+    let rows = CheckpointRows(3);
+    let slot_entries = rows.entries_per_slot();
+    let t_full = 6usize;
+
+    let conv_full = fill(t_full * conv_dim);
+    let g_full = fill(t_full * nv);
+    let beta_full = fill(t_full * nv);
+    let (q, k, v) = split_conv(&conv_full, nk, nv, hk, hv, t_full);
+    let o_full = recurrent_ref(
+        &q, &k, &v, &g_full, &beta_full, nk, nv, hk, hv, t_full, scale,
+    );
+    // Rows `3..5` of the kept sequence, then two rejected drafts.
+    let verify = |full: &[f32], width: usize| {
+        [&full[3 * width..5 * width], &rejected(2 * width)[..]].concat()
+    };
+
+    // Slot 1 of a two-slot pool; its steps' codes chained as the allocator chains them.
+    let entry = [slot_entries as i32];
+    let pool = || buf_zero_f32(&device, 2 * slot_entries * entry_len);
+    let slot = std::cell::Cell::new((StateEntry::First, RecordArea::First));
+    let step = |start, checkpoint_rows| {
+        let (tip, records) = slot.get();
+        let step = GdnStep {
+            start,
+            checkpoint_rows,
+            tip,
+            records,
+        };
+        slot.set(step.after());
+        [step.encode()]
+    };
+    let run = |state: &Buffer, conv: &[f32], g: &[f32], beta: &[f32], step: [u32; 1]| {
+        let num_tokens = g.len() / nv;
+        dispatch_scan(
+            &device,
+            &cache,
+            conv,
+            g,
+            beta,
+            state,
+            &[0, num_tokens as i32],
+            &entry,
+            &step,
+            nk,
+            nv,
+            hk,
+            hv,
+            num_tokens,
+        )
+    };
+
+    let state = pool();
+    let rows_of = |full: &[f32], width: usize, r: std::ops::Range<usize>| {
+        full[r.start * width..r.end * width].to_vec()
+    };
+    let prompt = |state: &Buffer, fresh| {
+        run(
+            state,
+            &rows_of(&conv_full, conv_dim, 0..3),
+            &rows_of(&g_full, nv, 0..3),
+            &rows_of(&beta_full, nv, 0..3),
+            fresh,
+        )
+    };
+    let Some(_) = prompt(&state, step(GdnStart::Fresh, CheckpointRows::NONE)) else {
+        return;
+    };
+    let Some(o_verify) = run(
+        &state,
+        &verify(&conv_full, conv_dim),
+        &verify(&g_full, nv),
+        &verify(&beta_full, nv),
+        step(GdnStart::Slot, rows),
+    ) else {
+        return;
+    };
+    assert_close(
+        &o_verify[..2 * value_dim],
+        &o_full[3 * value_dim..5 * value_dim],
+        "verify kept rows",
+    );
+    let next = |state: &Buffer, code| {
+        run(
+            state,
+            &conv_full[5 * conv_dim..],
+            &g_full[5 * nv..],
+            &beta_full[5 * nv..],
+            code,
+        )
+    };
+    let Some(o_next) = next(&state, step(GdnStart::Checkpoint(1), CheckpointRows::NONE)) else {
+        return;
+    };
+    assert_close(&o_next, &o_full[5 * value_dim..], "resumed row");
+    let slot0 = read_f32(&state, slot_entries * entry_len);
+    assert!(
+        slot0.iter().all(|&v| v == 0.0),
+        "slot 0's entries were written"
+    );
+
+    // The same rows without drafts: prompt, the kept rows, the next row.
+    let plain_code = |start| {
+        [GdnStep {
+            start,
+            checkpoint_rows: CheckpointRows::NONE,
+            tip: StateEntry::First,
+            records: RecordArea::First,
+        }
+        .encode()]
+    };
+    let plain = pool();
+    let kept = |state: &Buffer| {
+        run(
+            state,
+            &rows_of(&conv_full, conv_dim, 3..5),
+            &rows_of(&g_full, nv, 3..5),
+            &rows_of(&beta_full, nv, 3..5),
+            plain_code(GdnStart::Slot),
+        )
+    };
+    let (Some(_), Some(_), Some(o_plain)) = (
+        prompt(&plain, plain_code(GdnStart::Fresh)),
+        kept(&plain),
+        next(&plain, plain_code(GdnStart::Slot)),
+    ) else {
+        return;
+    };
+    let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&o_next),
+        bits(&o_plain),
+        "the replayed rows' state differs from the rows run without drafts"
+    );
+}
+
+/// [`gdn_scan_varlen_resumes_from_checkpoint`] for `gdn_scan_simd`, whose gating is its own: its
+/// verify step's records replay bit for bit as its rows run without drafts. A slot's steps switch
+/// scans (a bucket of at most 8 rows runs this one, a bigger one `gdn_scan_varlen`), so each scan
+/// replays the other's records: a verify step on either, the next step on the other, agree with
+/// the rows run without drafts to the two scans' rounding.
+#[test]
+fn gdn_scan_simd_resumes_from_checkpoint() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Scan {
+        Simd,
+        Serial,
+    }
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let cache =
+        SpecializedPipelineCache::new(device.clone(), &[]).expect("compile standard shaders");
+
+    let (nk, nv, hk, hv) = (2usize, 4usize, 32usize, 8usize);
+    let conv_dim = 2 * nk * hk + nv * hv;
+    let value_dim = nv * hv;
+    let entry_len = nv * hv * hk;
+    let scale = (hk as f32).powf(-0.5);
+    let rows = CheckpointRows(3);
+    let slot_entries = rows.entries_per_slot();
+    let shifted = |n: usize, by: usize| fill(n + by)[by..].to_vec();
+    let (a_log, dt_bias) = (fill(nv), shifted(nv, 5));
+    // Rows 0..3 the prompt, 3..5 the kept ones, 5 the next; a verify step's rejected drafts follow
+    // its kept rows.
+    let (conv, a, b) = (fill(6 * conv_dim), shifted(6 * nv, 3), shifted(6 * nv, 7));
+    let at = |x: &[f32], width: usize, r: std::ops::Range<usize>| {
+        x[r.start * width..r.end * width].to_vec()
+    };
+    let verify = |x: &[f32], width: usize| [at(x, width, 3..5), rejected(2 * width)].concat();
+
+    let simd = baked_build(
+        &cache,
+        &PipelineKey::new(
+            "gdn_scan_varlen",
+            "gdn_scan_simd_f32",
+            vec![
+                ConstantValue::uint(0, nk as u32),
+                ConstantValue::uint(1, nv as u32),
+                ConstantValue::uint(2, hk as u32),
+                ConstantValue::uint(3, hv as u32),
+                ConstantValue::float(4, scale),
+            ],
+        ),
+    )
+    .expect("gdn_scan_simd_f32");
+    let (alog_buf, dt_buf) = (buf_f32(&device, &a_log), buf_f32(&device, &dt_bias));
+    // Slot 1 of a two-slot pool.
+    let entry = [slot_entries as i32];
+    let entry_buf = buf_i32(&device, &entry);
+    // `gdn_gating`'s g and beta, for the serial scan.
+    let gating = |a: &[f32], b: &[f32]| {
+        let g: Vec<f32> = (a.iter().enumerate())
+            .map(|(i, &a)| {
+                let x = a + dt_bias[i % nv];
+                let sp = if x <= 20.0 { (1.0 + x.exp()).ln() } else { x };
+                -a_log[i % nv].exp() * sp
+            })
+            .collect();
+        let beta: Vec<f32> = b.iter().map(|&b| 1.0 / (1.0 + (-b).exp())).collect();
+        (g, beta)
+    };
+    let run = |scan: Scan, state: &Buffer, conv: &[f32], a: &[f32], b: &[f32], code: [u32; 1]| {
+        let t = a.len() / nv;
+        match scan {
+            Scan::Serial => {
+                let (g, beta) = gating(a, b);
+                let cu = [0, t as i32];
+                dispatch_scan(
+                    &device, &cache, conv, &g, &beta, state, &cu, &entry, &code, nk, nv, hk, hv, t,
+                )
+            }
+            Scan::Simd => {
+                let o = buf_zero_f32(&device, t * value_dim);
+                let (conv_buf, a_buf, b_buf) = (
+                    buf_f32(&device, conv),
+                    buf_f32(&device, a),
+                    buf_f32(&device, b),
+                );
+                let (cu_buf, code_buf) =
+                    (buf_i32(&device, &[0, t as i32]), buf_u32(&device, &code));
+                let bufs = [
+                    &o, &conv_buf, &a_buf, &b_buf, state, &cu_buf, &entry_buf, &code_buf,
+                    &alog_buf, &dt_buf,
+                ];
+                let grid = MTLSize {
+                    width: 1,
+                    height: value_dim / 4,
+                    depth: 1,
+                };
+                let threads = MTLSize {
+                    width: 32,
+                    height: 4,
+                    depth: 1,
+                };
+                common::dispatch_threadgroups(&device, &simd, &bufs, grid, threads)
+                    .then(|| read_f32(&o, t * value_dim))
+            }
+        }
+    };
+    let pool = || buf_zero_f32(&device, 2 * slot_entries * entry_len);
+    let prompt = |scan, state: &Buffer, code| {
+        run(
+            scan,
+            state,
+            &at(&conv, conv_dim, 0..3),
+            &at(&a, nv, 0..3),
+            &at(&b, nv, 0..3),
+            code,
+        )
+    };
+    let next = |scan, state: &Buffer, code| {
+        run(
+            scan,
+            state,
+            &at(&conv, conv_dim, 5..6),
+            &at(&a, nv, 5..6),
+            &at(&b, nv, 5..6),
+            code,
+        )
+    };
+    let plain_code = |start| {
+        [GdnStep {
+            start,
+            checkpoint_rows: CheckpointRows::NONE,
+            tip: StateEntry::First,
+            records: RecordArea::First,
+        }
+        .encode()]
+    };
+
+    // The simd scan's rows without drafts: prompt, the kept rows, the next row.
+    let plain = pool();
+    let (Some(_), Some(o_kept), Some(o_plain)) = (
+        prompt(Scan::Simd, &plain, plain_code(GdnStart::Fresh)),
+        run(
+            Scan::Simd,
+            &plain,
+            &at(&conv, conv_dim, 3..5),
+            &at(&a, nv, 3..5),
+            &at(&b, nv, 3..5),
+            plain_code(GdnStart::Slot),
+        ),
+        next(Scan::Simd, &plain, plain_code(GdnStart::Slot)),
+    ) else {
+        return;
+    };
+    let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let close = |what: &str, got: &[f32], want: &[f32]| {
+        let scale = want.iter().fold(0f32, |m, w| m.max(w.abs()));
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() <= 1e-4 * scale, "{what}[{i}]: {g} vs {w}");
+        }
+    };
+
+    // Prompt and a verify step on `verifier`, then the next row on `resumer` from `start`, the
+    // slot's steps' codes chained as the allocator chains them.
+    let resume = |verifier, resumer, start| {
+        let slot = std::cell::Cell::new((StateEntry::First, RecordArea::First));
+        let step = |start, checkpoint_rows| {
+            let (tip, records) = slot.get();
+            let step = GdnStep {
+                start,
+                checkpoint_rows,
+                tip,
+                records,
+            };
+            slot.set(step.after());
+            [step.encode()]
+        };
+        let state = pool();
+        prompt(
+            verifier,
+            &state,
+            step(GdnStart::Fresh, CheckpointRows::NONE),
+        )?;
+        let o_verify = run(
+            verifier,
+            &state,
+            &verify(&conv, conv_dim),
+            &verify(&a, nv),
+            &verify(&b, nv),
+            step(GdnStart::Slot, rows),
+        )?;
+        let o_next = next(resumer, &state, step(start, CheckpointRows::NONE))?;
+        Some((o_verify[..2 * value_dim].to_vec(), o_next))
+    };
+
+    // Not the replay: resuming from the verify step's last state — its rejected drafts' — is not
+    // the row run without drafts.
+    let Some((_, o_tip)) = resume(Scan::Simd, Scan::Simd, GdnStart::Slot) else {
+        return;
+    };
+    assert_ne!(
+        bits(&o_tip),
+        bits(&o_plain),
+        "the rejected drafts left the state unchanged"
+    );
+
+    for (verifier, resumer) in [
+        (Scan::Simd, Scan::Simd),
+        (Scan::Simd, Scan::Serial),
+        (Scan::Serial, Scan::Simd),
+    ] {
+        let what = format!("verify {verifier:?}, resume {resumer:?}");
+        let Some((kept, o_next)) = resume(verifier, resumer, GdnStart::Checkpoint(1)) else {
+            return;
+        };
+        match (verifier, resumer) {
+            (Scan::Simd, Scan::Simd) => {
+                assert_eq!(bits(&kept), bits(&o_kept), "{what}: kept rows");
+                assert_eq!(
+                    bits(&o_next),
+                    bits(&o_plain),
+                    "{what}: the replayed rows' state differs from the rows run without drafts"
+                );
+            }
+            _ => {
+                close(&format!("{what}: kept rows"), &kept, &o_kept);
+                close(&format!("{what}: resumed row"), &o_next, &o_plain);
+            }
+        }
     }
 }

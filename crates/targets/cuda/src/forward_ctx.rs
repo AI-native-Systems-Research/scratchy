@@ -113,18 +113,18 @@ pub struct ForwardCtx<'a> {
     /// into this rank-2 layout (one row per patch, channels-times-
     /// patch-area columns), uploads it, and sets the field before
     /// invoking the vision interpreter. `None` for text-side
-    /// forward calls — `Instruction::LoadPixels` panics on
+    /// forward calls — `Instruction::LoadRows(Pixels)` panics on
     /// `expect` if reached without it set, mirroring the
     /// [`Self::vision_rope_cos`] contract.
     ///
-    /// Synthesized by `vision_lowering::materialize_pixels` after
+    /// Synthesized by `rows_lowering::materialize_rows` after
     /// `fuf::unroll`: every vision-prelude `pixels` extern in the
     /// DSL classifies into a `FufInput::Extern` and is rewritten
     /// to a `FufInput::Tile` whose producer is a single
-    /// `OpKind::LoadPixels` node; that node's runtime
+    /// `OpKind::LoadRows(Pixels)` node; that node's runtime
     /// counterpart copies this view into a tile-table OwnedTensor
     /// the rest of the encoder consumes. See
-    /// `Instruction::LoadPixels` for the eval body.
+    /// `Instruction::LoadRows` for the eval body.
     #[cfg(feature = "cuda")]
     pub pixels: Option<TensorView<'a>>,
     /// Qwen3.5-VL learned positional embedding, already interpolated
@@ -134,12 +134,17 @@ pub struct ForwardCtx<'a> {
     /// before invoking the interpreter; the DSL adds it to the
     /// patch-embed output (`add(pos_embeds, hidden_states)`). `None`
     /// for text-side calls and towers without a learned positional
-    /// embedding — `Instruction::LoadPosEmbeds` panics on `expect` if
+    /// embedding — `Instruction::LoadRows(PosEmbeds)` panics if
     /// reached without it set, mirroring [`Self::pixels`]. Synthesized
-    /// into a tile by `vision_lowering::materialize_pos_embeds`; see
-    /// `Instruction::LoadPosEmbeds` for the eval body.
+    /// into a tile by `rows_lowering::materialize_rows`; see
+    /// `Instruction::LoadRows` for the eval body.
     #[cfg(feature = "cuda")]
     pub pos_embeds: Option<TensorView<'a>>,
+    /// A target model's final hidden states, `[num_tokens, hidden_size]` — what an MTP head
+    /// fuses with the next token's embedding. `None` for every forward but an MTP head's;
+    /// `Instruction::LoadRows(TargetHidden)` panics if reached without it set.
+    #[cfg(feature = "cuda")]
+    pub target_hidden: Option<TensorView<'a>>,
     /// Qwen2.5-VL: cu_seqlens for the per-image **full-frame**
     /// segmentation. Populated by the vision wrapper for arches
     /// whose body calls `varlen_attention(..., cu_seqlens_full,

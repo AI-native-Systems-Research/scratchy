@@ -30,6 +30,9 @@ ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc" }
 # `spyre` for the same reason every other Spyre-only piece here is: a cuda/metal build compiles
 # none of it.
 scratchy-spyre-bundle = { path = "../../targets/spyre/bundle", optional = true }
+# `RowsExtern` — which host-staged buffer a `LoadRows` reads — is one type across every IR: the
+# cuda `Instruction`, this crate's `SubOp`, the metal step. scratchy-ir never reaches back here.
+scratchy-ir = { path = "../ir" }
 
 [build-dependencies]
 # The build script reads every model `config.json` in the workspace and writes the head geometries

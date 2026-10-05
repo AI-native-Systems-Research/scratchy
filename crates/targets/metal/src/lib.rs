@@ -345,7 +345,7 @@ pub mod weights {
     /// `scratchy_target_cuda::weights::GpuWeights` path under metal.
     pub type GpuWeights<A = crate::MetalAllocator> = scratchy_layers::weights::GpuWeights<A>;
     pub use crate::weights_metal::MetalWeightsExt;
-    pub use scratchy_layers::weights::UploadSrc;
+    pub use scratchy_layers::weights::{TensorRefs, UploadSrc};
 }
 pub use weights::GpuWeights;
 
@@ -366,7 +366,7 @@ pub mod forward_ctx;
 pub mod mm_dispatch;
 #[cfg(feature = "vision")]
 pub mod vision_arch;
-pub use forward_ctx::{EmbedPatch, ForwardCtx};
+pub use forward_ctx::{EmbedPatch, ForwardCtx, HiddenRowsOut};
 #[cfg(feature = "vision")]
 pub use mm_dispatch::{MultimodalForward, PixelInput};
 #[cfg(feature = "vision")]

@@ -57,12 +57,21 @@ pub struct DeclaredArchSpec {
     /// `decoder_safetensors_prefix`: a namespace WRAPPING the standard
     /// `model.<...>` decoder tree (Gemma3-MM / mlx-vlm `language_model`
     /// → `language_model.model.<...>`); a value that itself starts with
-    /// `model` names the root it replaces (`model.language_model.<...>`).
+    /// `model` names the root it replaces (`model.language_model.<...>`);
+    /// the empty value keys the tree at the file's top level (an MLX
+    /// multi-token-prediction drafter's bare `fc.*`, `layers.0.*`).
     pub decoder_prefix: Option<String>,
     /// `decoder_safetensors_root`: the decoder tree's root under ANOTHER
     /// name, replacing `model` outright (Nemotron-H `backbone.<...>`).
     /// Exclusive with `decoder_prefix` — enforced where both tiers merge.
     pub decoder_root: Option<String>,
+    /// The identity the arch registers under, replacing its config's `architectures`: an arch
+    /// that is one part of another model's checkpoint (a multi-token-prediction head ships inside
+    /// its target's, whose config names the target) declares its own. Empty: the config's.
+    pub hf_architectures: Vec<String>,
+    /// How a head published apart from its target names its repo: the target's repo id with this
+    /// inserted before its last `-`-delimited token (MLX: `org/X-4bit` → `org/X-MTP-4bit`).
+    pub drafter_repo_infix: Option<String>,
     pub tie_default: Option<bool>,
     pub bound_defaults: Vec<(String, u64)>,
     /// Float-valued analogue of `bound_defaults` for arch-constant
@@ -85,6 +94,10 @@ pub struct DeclaredArchSpec {
 pub struct ParamField {
     pub name: String,
     pub source: ParamSource,
+    /// Overwrite the harvested bound of the same name instead of filling it only when absent:
+    /// an MTP head's config carries its target's `num_hidden_layers` beside its own
+    /// `mtp_num_hidden_layers`, and the head's model has the latter.
+    pub replaces: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -129,7 +142,7 @@ impl DeclaredArchSpec {
             (Some(root), None) => root.trim_end_matches('.').to_string(),
             (None, Some(prefix)) => {
                 let prefix = prefix.trim_end_matches('.');
-                if prefix.starts_with("model") {
+                if prefix.is_empty() || prefix.starts_with("model") {
                     prefix.to_string()
                 } else {
                     format!("{prefix}.model")
@@ -150,7 +163,7 @@ impl DeclaredArchSpec {
         bounds: &mut std::collections::BTreeMap<String, u64>,
     ) -> Result<(), String> {
         for f in &self.params {
-            if bounds.contains_key(&f.name) {
+            if bounds.contains_key(&f.name) && !f.replaces {
                 continue;
             }
             let v = match &f.source {
@@ -294,7 +307,8 @@ mod tests {
 
     /// The ONE decoder-root resolution every safetensors key builder reads:
     /// the HF default, a wrapper around `model`, a `model.*` prefix naming
-    /// the root it replaces, and a renamed root (Nemotron-H `backbone`).
+    /// the root it replaces, the file's top level, and a renamed root
+    /// (Nemotron-H `backbone`).
     #[test]
     fn decoder_root_resolves_every_declaration() {
         let root = |prefix: Option<&str>, root: Option<&str>| {
@@ -312,6 +326,7 @@ mod tests {
             root(Some("model.language_model"), None),
             "model.language_model"
         );
+        assert_eq!(root(Some(""), None), "");
         assert_eq!(root(None, Some("backbone")), "backbone");
         assert_eq!(root(None, Some("backbone.")), "backbone");
     }

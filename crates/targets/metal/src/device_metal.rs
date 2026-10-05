@@ -34,6 +34,9 @@ pub struct GpuDevice {
     /// partials are reserved for (`LoweredMetalTape::scratch_bytes`). `None`: a bucket's every
     /// row.
     pub max_decode_rows: Option<crate::tape::ids::DecodeRows>,
+    /// Buffers of a model whose forwards never overlap this device's, which the lazy
+    /// `MetalWorkerPool::for_buckets` places its worker's own in (an MTP head's, its target's).
+    pub lent: crate::interpreter::metal::LentActivation,
 }
 
 impl GpuDevice {
@@ -48,6 +51,7 @@ impl GpuDevice {
             metal_bucket_max_m: None,
             kv_addressing: Default::default(),
             max_decode_rows: None,
+            lent: Default::default(),
         }
     }
 

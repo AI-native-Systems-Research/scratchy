@@ -36,7 +36,7 @@ use tracing::{debug, error, info};
 use crate::error::{EngineError, EngineResult};
 use crate::executor::{Executor, ModelRunnerOutput};
 use crate::spec_decode::{
-    DraftModelProposer, NgramProposer, Proposer, ProposerConfig, ProposerStepCtx,
+    DraftModelProposer, MtpProposer, NgramProposer, Proposer, ProposerConfig, ProposerStepCtx,
 };
 
 // ---------------------------------------------------------------------------
@@ -308,6 +308,21 @@ impl EngineCore {
                             async_scheduling = false;
                         }
                         Box::new(DraftModelProposer::new(cfg))
+                    }
+                    ProposerConfig::Mtp(cfg) => {
+                        info!(
+                            "MTP speculative decoding enabled ({}, k={}): the head drafts from the \
+                             target's final hidden states after each step.",
+                            cfg.model, cfg.num_speculative_tokens,
+                        );
+                        // Pass 1 reads the step's own hidden states and the tokens it produced,
+                        // so the drafts are for the step right after it: async scheduling's
+                        // one-step lookahead would verify them a step late.
+                        if async_scheduling {
+                            info!("MTP spec decode forces sync scheduling.");
+                            async_scheduling = false;
+                        }
+                        Box::new(MtpProposer::new(cfg))
                     }
                 }
             });
@@ -613,6 +628,10 @@ impl EngineCore {
                     }
                 })
             };
+            let takes_drafts = |req_id: &str| {
+                (scheduler_ref.get_request(req_id))
+                    .is_some_and(|r| !r.sampling_params.reads_history())
+            };
             let backend = self.executor.as_mut().and_then(|e| e.spec_decode_backend());
             let mut ctx = ProposerStepCtx {
                 scheduled_req_ids: &scheduled_req_ids,
@@ -621,17 +640,20 @@ impl EngineCore {
                 backend,
                 draft_seed: model_output.draft_seed_inputs.as_ref(),
                 sampled_token_ids: Some(&model_output.sampled_token_ids),
+                takes_drafts: &takes_drafts,
             };
             let drafts_map = proposer.propose_for_step(&mut ctx);
             for (req_id, drafts) in drafts_map {
                 if drafts.is_empty() {
                     continue;
                 }
-                let still_running = self
-                    .scheduler
-                    .get_request(&req_id)
-                    .is_some_and(|r| !r.status.is_finished() && !r.all_token_ids.is_empty());
-                if !still_running {
+                // Still running, and drafting (`takes_drafts`).
+                let keeps_drafts = self.scheduler.get_request(&req_id).is_some_and(|r| {
+                    !r.status.is_finished()
+                        && !r.all_token_ids.is_empty()
+                        && !r.sampling_params.reads_history()
+                });
+                if !keeps_drafts {
                     continue;
                 }
                 self.scheduler.set_spec_token_ids(&req_id, drafts);
@@ -785,13 +807,7 @@ impl EngineCore {
             }
 
             // Generation request: normal token-based processing.
-            let new_token_ids_slice: &[u32] = model_output.get_tokens(req_id).unwrap_or_default();
-
-            // Append new tokens to the request's state in the scheduler.
-            if !new_token_ids_slice.is_empty() {
-                self.scheduler
-                    .append_output_tokens(req_id, new_token_ids_slice);
-            }
+            let generated: &[u32] = model_output.get_tokens(req_id).unwrap_or_default();
 
             // Rewind num_computed_tokens for rejected spec decode drafts.
             // The scheduler already advanced num_computed_tokens by num_scheduled_tokens
@@ -803,10 +819,10 @@ impl EngineCore {
                 .scheduled_spec_decode_tokens
                 .get(req_id)
                 .filter(|ids| !ids.is_empty())
-                && !new_token_ids_slice.is_empty()
+                && !generated.is_empty()
             {
                 let num_draft_tokens = scheduled_spec_ids.len();
-                let num_accepted = new_token_ids_slice.len().saturating_sub(1);
+                let num_accepted = generated.len().saturating_sub(1);
                 let num_rejected = num_draft_tokens.saturating_sub(num_accepted);
                 if num_rejected > 0 {
                     self.scheduler
@@ -814,9 +830,25 @@ impl EngineCore {
                 }
             }
 
-            // Check stop criteria against the updated request state.
-            let (finish_reason, stop_reason) =
-                self.check_stop_criteria(req_id, new_token_ids_slice);
+            // Append the new tokens one at a time, checking the stop criteria after each: a verify
+            // step can accept tokens past the one that ends the request, and those are dropped.
+            // Matches Python: scheduler._update_request_with_output().
+            let mut kept = generated.len();
+            let (mut finish_reason, mut stop_reason) = if generated.is_empty() {
+                self.check_stop_criteria(req_id, generated)
+            } else {
+                (None, None)
+            };
+            for (n, token) in generated.iter().enumerate() {
+                let token = std::slice::from_ref(token);
+                self.scheduler.append_output_tokens(req_id, token);
+                (finish_reason, stop_reason) = self.check_stop_criteria(req_id, token);
+                if finish_reason.is_some() {
+                    kept = n + 1;
+                    break;
+                }
+            }
+            let new_token_ids_slice = &generated[..kept];
 
             if let Some(reason) = finish_reason {
                 let status = match reason {
@@ -1478,6 +1510,46 @@ mod tests {
         assert!(req_out.new_token_ids.contains(&1000));
         assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
         assert_eq!(req_out.stop_reason, Some(StopReason::Token(1000)));
+    }
+
+    /// A verify step can accept tokens past the one that ends the request — an n-gram proposer
+    /// drafts the chat template's `<|im_end|>\n<|im_start|>` straight out of the prompt. They are
+    /// dropped, as vLLM's `_update_request_with_output` drops them.
+    #[test]
+    fn test_tokens_after_the_stop_are_dropped() {
+        for (eos, max_tokens, reason) in [
+            (vec![1000], 100, FinishReason::Stop),
+            (vec![], 2, FinishReason::Length),
+        ] {
+            let mut config = make_test_config();
+            config.eos_token_ids = eos;
+            let mut engine = EngineCore::new(config, Box::new(NoopExecutor::new(1024)));
+            let params = SamplingParams {
+                max_tokens: Some(max_tokens),
+                ..Default::default()
+            };
+            let req = Request::new("req-1".to_string(), vec![10, 20], params, 0.0, 0, 0, None);
+            engine.add_request(req);
+            let scheduler_output = engine.scheduler.schedule();
+            let model_output = ModelRunnerOutput {
+                req_ids: vec!["req-1".to_string()],
+                req_id_to_index: [("req-1".to_string(), 0)].into_iter().collect(),
+                sampled_token_ids: vec![vec![42, 1000, 43, 44]],
+                logprobs: None,
+                prompt_logprobs_dict: std::collections::HashMap::new(),
+                draft_token_ids: None,
+                pooler_output: None,
+                d2h_resolver: None,
+                draft_seed_inputs: None,
+                kv_extent: std::collections::HashMap::new(),
+                kv_pool_reach: None,
+            };
+
+            let outputs = engine.update_from_output(&scheduler_output, &model_output);
+            let req_out = &outputs[&0].outputs[0];
+            assert_eq!(req_out.new_token_ids, [42, 1000], "{reason:?}");
+            assert_eq!(req_out.finish_reason, Some(reason));
+        }
     }
 
     #[test]

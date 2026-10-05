@@ -103,9 +103,9 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::ScalarWeightMul
         | SubOp::GateSplit { .. }
         | SubOp::GateApply
+        | SubOp::Concat { .. }
         | SubOp::GateScale
-        | SubOp::LoadPixels { .. }
-        | SubOp::LoadPosEmbeds { .. }
+        | SubOp::LoadRows { .. }
         | SubOp::EmbeddingGather { .. }
         | SubOp::VisionRope
         | SubOp::VarlenAttention { .. }

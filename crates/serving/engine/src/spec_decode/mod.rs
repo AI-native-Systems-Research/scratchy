@@ -17,6 +17,7 @@
 //! draft-model spec decode works on any backend without per-backend wiring.
 
 pub mod backend;
+pub mod mtp;
 pub mod ngram;
 pub mod proposer;
 pub mod verify;
@@ -24,6 +25,7 @@ pub mod verify;
 pub use backend::{
     BackendError, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle, SpecDecodeBackend,
 };
+pub use mtp::{MtpProposer, MtpProposerConfig};
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};
 pub use verify::{RejectionResult, greedy_rejection_sample};
@@ -56,6 +58,9 @@ pub enum ProposerConfig {
     /// Draft-model proposer: a second model runs K autoregressive decode
     /// steps after each target step to produce drafts.
     DraftModel(DraftModelProposerConfig),
+    /// Multi-token-prediction head: drafts from the target's final hidden states with a head
+    /// that ships beside it, lending it the target's embedding and lm_head ([`mtp`]).
+    Mtp(MtpProposerConfig),
 }
 
 impl ProposerConfig {
@@ -65,6 +70,7 @@ impl ProposerConfig {
         match self {
             Self::Ngram(c) => c.num_speculative_tokens,
             Self::DraftModel(c) => c.num_speculative_tokens,
+            Self::Mtp(c) => c.num_speculative_tokens,
         }
     }
 }

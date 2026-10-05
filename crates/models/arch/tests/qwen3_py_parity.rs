@@ -248,6 +248,8 @@ fn qwen3_py_carrier_parity() {
         vision_rope_freqs: None,
         pixels: None,
         pos_embeds: None,
+        target_hidden: None,
+        hidden_out: None,
         vision_cu_seqlens_full: None,
         vision_cu_seqlens_window: None,
         vision_max_seqlen_full: None,

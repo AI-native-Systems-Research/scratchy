@@ -273,7 +273,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
         // loader doesn't expose it as a runtime weight); when present we
         // interpolate it per forward in spatial-merge token order and
         // upload as bf16. `None` for towers without a learned pos-embed
-        // (the DSL then never emits `LoadPosEmbeds`). Validated bit-close
+        // (the DSL then never emits `LoadRows(PosEmbeds)`). Validated bit-close
         // to the mlx-vlm golden in the vl crate's green-gate test.
         let pos_embeds_buf: Option<GpuTensor> = self.pos_embed_table.as_ref().map(|(table, ng)| {
             let embed_dim = cfg.embed_dim as usize;
@@ -381,8 +381,9 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             // Qwen3.5-VL host-interpolated learned positional embedding.
             // Computed + uploaded just below for towers that carry a
             // `pos_embed` table; `None` for towers without one (the DSL
-            // then never emits `LoadPosEmbeds`).
+            // then never emits `LoadRows(PosEmbeds)`).
             pos_embeds: pos_embeds_view,
+            target_hidden: None,
             // Qwen2.5-VL: `cu_seqlens_full` is the same per-image
             // segmentation as `cu_seqlens_q` above (the window
             // permutation preserves per-image boundaries since

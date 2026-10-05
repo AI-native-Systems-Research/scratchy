@@ -44,7 +44,7 @@ pub use info::{
 // codegen time without any backend feature. Moved to the cfg-free
 // `scratchy-ir` crate; re-exported here so the macro path
 // `::scratchy_forward_compiler::Instruction` keeps resolving.
-pub use scratchy_ir::{BiasStorage, Instruction, KvOffset, KvOffsets};
+pub use scratchy_ir::{BiasStorage, Instruction, KvOffset, KvOffsets, RowsExtern};
 // Routed-expert per-projection bit packing for `MetalSharedFusedMoe`
 // (OptiQ mixed 4/8-bit). Re-exported so the macro codegen can pack and
 // the metal lowering can unpack via the same convention.
@@ -287,7 +287,7 @@ pub use dispatcher::{ChainStepHandle, MetalChainBody, MetalForwardFollowup};
 // and the pure-config `HfFingerprint` carry no cuda/metal coupling, so they're
 // re-exported unconditionally; a third target (Spyre) names them without a
 // backend feature.
-pub use dispatcher::{BoundWeight, HfFingerprint, ScratchyWeights};
+pub use dispatcher::{BoundWeight, HfFingerprint, LentWeight, ScratchyWeights};
 
 // Device-runtime multimodal forward surface (`PixelInput` / `EmbedPatch` /
 // `MultimodalForward`). The trait takes the neutral `ForwardDeviceHandle`
@@ -323,6 +323,8 @@ pub mod arch_registry;
 // SAME registry (with `GpuWeights<SpyreAllocator>`).
 #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
 pub use arch_registry::{ArchLoad, ArchTryLoadFn, ScratchyArchRegistration, try_load};
+pub mod heads;
+pub use heads::{HeadRegistration, draft_head, head_of};
 // Read-only KTIR bundle resolver — spyre fetches its forward bundle without
 // consuming `GpuWeights` (so the worker keeps the live tensors for the runner).
 #[cfg(feature = "spyre")]

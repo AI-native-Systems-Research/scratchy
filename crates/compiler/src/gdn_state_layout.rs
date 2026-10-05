@@ -68,6 +68,17 @@ impl GdnRuntimeConfig {
     pub fn num_linear_layers(&self) -> usize {
         self.linear_layers.iter().filter(|&&b| b).count()
     }
+
+    /// The state geometry the GDN state pool allocates each linear layer.
+    pub fn state_dims(&self) -> scratchy_layers::gdn_state::GdnStateDims {
+        scratchy_layers::gdn_state::GdnStateDims {
+            conv_dim: self.conv_dim as usize,
+            conv_kernel: self.conv_kernel as usize,
+            num_v_heads: self.num_v_heads as usize,
+            head_v_dim: self.head_v_dim as usize,
+            head_k_dim: self.head_k_dim as usize,
+        }
+    }
 }
 
 impl GdnStateLayout {

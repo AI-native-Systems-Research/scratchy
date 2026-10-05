@@ -30,7 +30,7 @@ use super::forward::{Deferral, ForwardError, ForwardInputs, InFlight};
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
-use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
+use super::worker::{ArenaLayout, LentActivation, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::{
@@ -71,6 +71,10 @@ pub struct MetalBucketSpec {
     /// `forward()` callback reads `worker.arena[terminal_slot]` to
     /// expose logits to the engine.
     pub terminal_slot: u32,
+    /// Index in the colored arena of the lm_head's input — the final (post-norm) hidden states,
+    /// `[num_tokens, hidden]`. Kept live through the lm_head, so it is readable after the
+    /// forward (an MTP head's next input). Equal to `terminal_slot` for encoder layouts.
+    pub backbone_slot: u32,
     /// Per-arena-slot byte sizes derived from the FUF tile shapes
     /// at macro-expansion time (post-coloring, with bucket-specific
     /// `num_tokens` baked in). `len() == num_arena_slots`. The
@@ -429,13 +433,42 @@ impl PickedRung<'_> {
 }
 
 impl PickedRung<'_> {
-    /// The bytes of the scratch buffers a worker allocates for these tapes: each buffer the
-    /// largest any tape needs, the decode split's partials for at most `decode_rows` rows.
-    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> u64 {
+    /// The bytes of each scratch buffer a worker allocates for these tapes (split-K, MoE, roped K,
+    /// hd512 unfused): the largest any tape needs, the decode split's partials for at most
+    /// `decode_rows` rows.
+    pub fn scratch_sizes(&self, decode_rows: Option<DecodeRows>) -> [u64; 4] {
         let tapes = || (self.tapes.iter()).map(|(_, rung)| rung.tape.scratch_bytes(decode_rows));
-        (0..4)
-            .map(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
-            .sum()
+        std::array::from_fn(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
+    }
+
+    /// The bytes of the scratch buffers a worker allocates for these tapes.
+    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> u64 {
+        self.scratch_sizes(decode_rows).iter().sum()
+    }
+
+    /// The worker's arena: sized for the largest activation across every bucket, AND for the
+    /// largest colored slot count across buckets. Slot counts can differ per bucket: a bucket
+    /// whose solver picked a fusion that needs extra scratch — e.g. the synth pre-attn /
+    /// mlp-pre-down kernels, which write the updated residual to a distinct `residual_out` slot
+    /// instead of in place to avoid a cross-threadgroup race — carries more colored slots than a
+    /// bucket that didn't. A bucket's tape only ever references slots in `0..its own
+    /// num_arena_slots`, so an arena sized to the max serves every bucket; smaller buckets simply
+    /// leave the tail slots resident and idle. `arena_bytes` is elementwise-maxed over whatever
+    /// slots each spec defines.
+    pub fn arena_layout(&self) -> ArenaLayout {
+        let num_slots = (self.tapes.iter())
+            .map(|(s, _)| s.num_arena_slots as usize)
+            .max()
+            .unwrap_or(0);
+        let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
+        for (spec, _) in &self.tapes {
+            for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
+                if bytes > arena_layout[slot] {
+                    arena_layout[slot] = bytes;
+                }
+            }
+        }
+        arena_layout
     }
 }
 
@@ -539,7 +572,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     ///
     /// Eager creation surfaces allocation/recording/pipeline-lookup
     /// failures at construction time and warms the first-forward
-    /// path (no creation cost on the first checkout).
+    /// path (no creation cost on the first checkout). The first worker places its
+    /// buffers in `lent` ([`LentActivation`]); any later one allocates its own.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
@@ -552,6 +586,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         runtime_factory: RuntimeFactory,
         max_workers: usize,
         decode_rows: Option<DecodeRows>,
+        lent: LentActivation,
     ) -> Result<Self, WorkerError>
     where
         W: ModelSources,
@@ -592,7 +627,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }),
             cv: Condvar::new(),
         };
-        let first = pool.spawn_worker()?;
+        let first = pool.spawn_worker(&lent)?;
         {
             let mut inner = pool.inner.lock().unwrap();
             inner.total_created = 1;
@@ -627,6 +662,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         addressing: KvAddressing,
         // The most rows a decode-only step brings (`GpuDevice::max_decode_rows`).
         decode_rows: Option<DecodeRows>,
+        // Buffers of a pool whose forwards never overlap this one's, for the first worker to place
+        // its own in ([`LentActivation`]).
+        lent: LentActivation,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
@@ -645,32 +683,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             addressing,
         )?;
         let variant = rung.variant();
+        let arena_layout = rung.arena_layout();
         let picked = rung.tapes;
-
-        // Worker arena is sized for the largest activation across every
-        // bucket, AND for the largest colored slot count across buckets.
-        // Slot counts can differ per bucket: a bucket whose solver picked
-        // a fusion that needs extra scratch — e.g. the synth pre-attn /
-        // mlp-pre-down kernels, which write the updated residual to a
-        // distinct `residual_out` slot instead of in place to avoid a
-        // cross-threadgroup race — carries more colored slots than a
-        // bucket that didn't. A bucket's tape only ever references slots
-        // in `0..its own num_arena_slots`, so an arena sized to the max
-        // serves every bucket; smaller buckets simply leave the tail
-        // slots resident and idle. `arena_bytes` is elementwise-maxed
-        // over whatever slots each spec defines.
-        let num_slots = (picked.iter())
-            .map(|(s, _)| s.num_arena_slots as usize)
-            .max()
-            .unwrap_or(0);
-        let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
-        for (spec, _) in &picked {
-            for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
-                if bytes > arena_layout[slot] {
-                    arena_layout[slot] = bytes;
-                }
-            }
-        }
 
         let cache = SpecializedPipelineCache::new((*device).clone(), &[])
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
@@ -696,6 +710,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             runtime_factory,
             max_workers,
             decode_rows,
+            lent,
         )
         .map_err(PoolBuildError::Worker)
     }
@@ -747,7 +762,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if inner.total_created < self.max_workers {
                 inner.total_created += 1;
                 drop(inner);
-                match self.spawn_worker() {
+                match self.spawn_worker(&LentActivation::default()) {
                     Ok(pooled) => {
                         return Ok(WorkerGuard {
                             pool: self,
@@ -787,7 +802,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if inner.total_created < self.max_workers {
             inner.total_created += 1;
             drop(inner);
-            match self.spawn_worker() {
+            match self.spawn_worker(&LentActivation::default()) {
                 Ok(pooled) => Some(Ok(WorkerGuard {
                     pool: self,
                     inner: Some(pooled),
@@ -1432,7 +1447,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(with_output(&guard.worker, bucket_idx))
     }
 
-    fn spawn_worker(&self) -> Result<PooledWorker<W>, WorkerError> {
+    fn spawn_worker(&self, lent: &LentActivation) -> Result<PooledWorker<W>, WorkerError> {
         let runtime = self.runtime_factory.build(&self.device);
         let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
@@ -1443,8 +1458,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &runtime,
             Some(self.allocator.residency()),
             self.decode_rows,
+            lent,
         )?;
         Ok(PooledWorker { worker, runtime })
+    }
+
+    /// An idle worker's arena slots and scratch, to lend a pool whose forwards never overlap this
+    /// one's ([`LentActivation`]); none while every worker is out.
+    pub fn lend_activation(&self) -> LentActivation {
+        let inner = self.inner.lock().unwrap();
+        (inner.available.first()).map_or_else(LentActivation::default, |p| p.worker.activation())
     }
 
     fn checkin(&self, pooled: PooledWorker<W>) {
@@ -1777,6 +1800,9 @@ fn write_runtime_inputs(
     if let Some(b) = inputs.pos_embeds {
         write("pos_embeds", &runtime.vision_pos_embeds, b, Padding::Zero)?;
     }
+    if let Some(b) = inputs.target_hidden {
+        write("target_hidden", &runtime.target_hidden, b, Padding::Zero)?;
+    }
     // Qwen2.5-VL windowed-attention externs (i32/u32 bytes, verbatim).
     if let Some(b) = inputs.vision_cu_seqlens_full {
         write(
@@ -1952,6 +1978,7 @@ mod tests {
             vision_rope_freqs: alloc(device, 16),
             pixels: alloc(device, 16),
             vision_pos_embeds: alloc(device, 16),
+            target_hidden: alloc(device, 16),
             mm_embeds: alloc(device, 16),
             mm_dst_rows: alloc(device, 16),
             mrope_cos_sin: alloc(device, 16),
@@ -2052,6 +2079,7 @@ mod tests {
             runtime_factory,
             max,
             None,
+            LentActivation::default(),
         )
         .expect("pool builds");
         Some(pool)
@@ -2271,6 +2299,7 @@ mod tests {
             vision_rope_freqs: alloc(d, 16),
             pixels: alloc(d, 16),
             vision_pos_embeds: alloc(d, 16),
+            target_hidden: alloc(d, 16),
             mm_embeds: alloc(d, 16),
             mm_dst_rows: alloc(d, 16),
             mrope_cos_sin: alloc(d, 16),
@@ -2292,6 +2321,7 @@ mod tests {
             runtime_factory,
             max_workers,
             None,
+            LentActivation::default(),
         )
         .expect("pool builds");
         Some(pool)
@@ -2381,6 +2411,7 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
@@ -2442,6 +2473,7 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
@@ -2540,6 +2572,7 @@ mod tests {
                 mm_embeds: None,
                 mm_dst_rows: None,
                 mrope_cos_sin: None,
+                target_hidden: None,
                 deferred: Some(&deferral),
             };
             let before = input_ids();
@@ -2589,6 +2622,7 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
@@ -2630,6 +2664,7 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
@@ -2681,6 +2716,7 @@ mod tests {
             vision_position_ids: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: None,
             mm_embeds: None,
             mm_dst_rows: None,
             mrope_cos_sin: None,
@@ -2777,6 +2813,7 @@ mod tests {
             128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
             KvAddressing::Direct,
             None,
+            LentActivation::default(),
         ))
     }
 
@@ -2808,6 +2845,7 @@ mod tests {
             128, // block_cap (unused — NoBuckets fires first)
             KvAddressing::Direct,
             None,
+            LentActivation::default(),
         );
         match res {
             Err(PoolBuildError::NoBuckets) => {}
@@ -2827,6 +2865,7 @@ mod tests {
             bucket_m: 1,
             num_arena_slots: 2,
             terminal_slot: 1,
+            backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
@@ -2857,6 +2896,7 @@ mod tests {
             bucket_m: 1,
             num_arena_slots: 2,
             terminal_slot: 1,
+            backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
@@ -2891,6 +2931,7 @@ mod tests {
                 bucket_m: 1,
                 num_arena_slots: 2,
                 terminal_slot: 1,
+                backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,
@@ -2903,6 +2944,7 @@ mod tests {
                 bucket_m: 8,
                 num_arena_slots: 2,
                 terminal_slot: 1,
+                backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,

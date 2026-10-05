@@ -28,7 +28,7 @@ use scratchy_serving_engine::core_client::InprocClient;
 use scratchy_serving_engine::engine_core::{EngineCoreConfig, HybridKvConfig};
 use scratchy_serving_engine::gpu_budget::{MaxNumSeqsFacts, resolve_default_max_num_seqs};
 use scratchy_serving_engine::spec_decode::{
-    DraftModelProposerConfig, NgramProposerConfig, ProposerConfig,
+    DraftModelProposerConfig, MtpProposerConfig, NgramProposerConfig, ProposerConfig,
 };
 use scratchy_serving_worker::uniproc::UniProcExecutor;
 use scratchy_serving_worker::worker::Worker;
@@ -491,6 +491,7 @@ fn create_worker(
         max_model_len: config.max_model_len,
         draft_model_path: spec_decode_draft_model_path(config),
         draft_model_dtype: config.draft_model_dtype.clone(),
+        num_speculative_tokens: spec_decode_max_drafts(config),
     };
 
     // Progress closure (the former cuda-arm body). For now it just observes
@@ -668,6 +669,15 @@ fn spec_decode_draft_model_path(config: &VllmConfig) -> Option<String> {
     }
 }
 
+/// The most drafts one verify step carries: `--num-speculative-tokens` when speculative decoding
+/// is on, else 0. Threaded into each `WorkerCreateConfig`.
+fn spec_decode_max_drafts(config: &VllmConfig) -> usize {
+    config
+        .speculative_model
+        .as_ref()
+        .map_or(0, |_| config.num_speculative_tokens)
+}
+
 /// Build the speculative-decoding proposer config from a `VllmConfig`.
 ///
 /// Three outcomes:
@@ -696,16 +706,99 @@ fn build_proposer_config(
             max_model_len,
         })));
     }
-    // Non-"ngram" value: treat as a draft-model path / HF repo. The
-    // engine logs the registration and proceeds as baseline until phase 4
-    // wires the real proposer (`EngineCore::new` handles this variant by
-    // leaving the proposer as `None`).
+    // Non-"ngram" value: a draft checkpoint (path / HF repo) — a multi-token-prediction head
+    // drafts with the MTP proposer; anything else is a standalone draft model.
+    if draft_is_head(config, spec)? {
+        return Ok(Some(ProposerConfig::Mtp(MtpProposerConfig {
+            model: spec.to_string(),
+            num_speculative_tokens: config.num_speculative_tokens,
+            max_model_len,
+        })));
+    }
     Ok(Some(ProposerConfig::DraftModel(DraftModelProposerConfig {
         model: spec.to_string(),
         num_speculative_tokens: config.num_speculative_tokens,
         dtype: config.draft_model_dtype.clone(),
         max_model_len,
     })))
+}
+
+/// Whether the `--speculative-model` checkpoint is a multi-token-prediction head: its arch, as
+/// compiled into this build, reads the target's hidden states.
+fn draft_is_head(config: &VllmConfig, spec: &str) -> Result<bool> {
+    let draft_dir = scratchy_serving_worker::worker_factory::resolve_model_path(
+        spec,
+        config.hf_token.as_deref(),
+        None,
+        None,
+    )
+    .with_context(|| format!("resolving draft model path {spec:?}"))?;
+    let draft_cfg = HfModelConfig::from_dir(&draft_dir)
+        .with_context(|| format!("reading draft config.json at {draft_dir:?}"))?;
+    Ok(draft_cfg
+        .arch_hint()
+        .and_then(scratchy_forward_compiler::draft_head)
+        .is_some())
+}
+
+/// The speculative decoding a run does, validated ([`validate_speculative_decoding`]). A build that
+/// compiled the target's multi-token-prediction head drafts with it unless told otherwise — no
+/// `--speculative-model`, and `--num-speculative-tokens` above 0 (0 turns it off): the head is a
+/// fact of the compiled model, its repo the target's as the head's registration names it.
+fn resolve_speculative_decoding(config: &VllmConfig) -> Result<std::borrow::Cow<'_, VllmConfig>> {
+    let head = match config.speculative_model {
+        Some(_) => None,
+        None if config.num_speculative_tokens == 0 || !cfg!(feature = "metal") => None,
+        None => target_head(config)?,
+    };
+    let config = match head {
+        None => std::borrow::Cow::Borrowed(config),
+        Some(repo) => {
+            info!(
+                "spec-decode: {} drafts with its multi-token-prediction head {repo} (k={}); \
+                 --num-speculative-tokens 0 turns it off.",
+                config.model, config.num_speculative_tokens,
+            );
+            std::borrow::Cow::Owned(VllmConfig {
+                speculative_model: Some(repo),
+                ..config.clone()
+            })
+        }
+    };
+    validate_speculative_decoding(&config)?;
+    Ok(config)
+}
+
+/// The repo of the target's multi-token-prediction head, when this build compiled one for the
+/// target's checkpoint architecture and the target's config declares MTP layers.
+fn target_head(config: &VllmConfig) -> Result<Option<String>> {
+    let target_dir = scratchy_serving_worker::worker_factory::resolve_model_path(
+        &config.model,
+        config.hf_token.as_deref(),
+        None,
+        None,
+    )
+    .with_context(|| format!("resolving model path {:?}", config.model))?;
+    let target = HfModelConfig::from_dir(&target_dir)
+        .with_context(|| format!("reading config.json at {target_dir:?}"))?;
+    // A multimodal checkpoint nests its language model's fields under `text_config`.
+    let text = target.extra.get("text_config");
+    let mtp_layers = (target.extra.get("mtp_num_hidden_layers"))
+        .or_else(|| text?.get("mtp_num_hidden_layers"))
+        .and_then(|v| v.as_u64());
+    let Some(head) = (target.arch_hint())
+        .and_then(scratchy_forward_compiler::head_of)
+        .filter(|_| mtp_layers.is_some_and(|n| n > 0))
+    else {
+        return Ok(None);
+    };
+    head.repo_of(&config.model).map(Some).with_context(|| {
+        format!(
+            "this build compiled {:?}'s multi-token-prediction head, but its repo cannot be named \
+             from the target's; pass --speculative-model <head> or --num-speculative-tokens 0",
+            config.model
+        )
+    })
 }
 
 /// Validate `--speculative-model` against the phase guards before any
@@ -727,6 +820,12 @@ fn validate_speculative_decoding(config: &VllmConfig) -> Result<()> {
         return Ok(());
     };
     if spec == "ngram" {
+        return Ok(());
+    }
+    // A head embeds and decodes through the target's own embedding and lm_head (the worker lends
+    // them), so its token IDs are the target's by construction; its repo's tokenizer is unused.
+    if draft_is_head(config, spec)? {
+        info!("spec-decode: {spec:?} is a multi-token-prediction head of the target.");
         return Ok(());
     }
     validate_target_draft_pair(config, spec)?;
@@ -1520,6 +1619,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 max_model_len: config.max_model_len,
                 draft_model_path: spec_decode_draft_model_path(config),
                 draft_model_dtype: config.draft_model_dtype.clone(),
+                num_speculative_tokens: spec_decode_max_drafts(config),
             })
             .collect();
 
@@ -1781,7 +1881,8 @@ fn load_generation_defaults(
 }
 
 pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack> {
-    validate_speculative_decoding(config)?;
+    let resolved = resolve_speculative_decoding(config)?;
+    let config = &*resolved;
     let init_start = Instant::now();
 
     // Create progress bar if logging is below INFO level
@@ -1874,7 +1975,8 @@ pub fn initialize_stack(
     config: &VllmConfig,
     progress: Option<Arc<crate::progress::StartupProgress>>,
 ) -> Result<InitializedStack> {
-    validate_speculative_decoding(config)?;
+    let resolved = resolve_speculative_decoding(config)?;
+    let config = &*resolved;
     let init_start = Instant::now();
 
     // Create progress bar if not provided and logging is below INFO level
@@ -2092,6 +2194,7 @@ fn initialize_stack_multinode(
             max_model_len: config.max_model_len,
             draft_model_path: spec_decode_draft_model_path(config),
             draft_model_dtype: config.draft_model_dtype.clone(),
+            num_speculative_tokens: spec_decode_max_drafts(config),
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -2409,6 +2512,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         max_model_len: config.max_model_len,
         draft_model_path: spec_decode_draft_model_path(config),
         draft_model_dtype: config.draft_model_dtype.clone(),
+        num_speculative_tokens: spec_decode_max_drafts(config),
     };
 
     let mut worker = CudaWorker::new(cuda_config);
@@ -2603,6 +2707,7 @@ fn initialize_stack_tp_pp(
                         max_model_len: config.max_model_len,
                         draft_model_path: spec_decode_draft_model_path(config),
                         draft_model_dtype: config.draft_model_dtype.clone(),
+                        num_speculative_tokens: spec_decode_max_drafts(config),
                     }
                 })
                 .collect();
@@ -3000,6 +3105,7 @@ fn initialize_stack_tp(
                 max_model_len: config.max_model_len,
                 draft_model_path: spec_decode_draft_model_path(config),
                 draft_model_dtype: config.draft_model_dtype.clone(),
+                num_speculative_tokens: spec_decode_max_drafts(config),
             })
             .collect();
 
@@ -3453,6 +3559,7 @@ fn initialize_stack_external(
             max_model_len: config.max_model_len,
             draft_model_path: spec_decode_draft_model_path(config),
             draft_model_dtype: config.draft_model_dtype.clone(),
+            num_speculative_tokens: spec_decode_max_drafts(config),
         };
 
         let mut worker = CudaWorker::new(cuda_config);

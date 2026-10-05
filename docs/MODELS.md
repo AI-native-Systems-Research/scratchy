@@ -158,6 +158,44 @@ feature (no `quant-` prefix; plus a `preset!(v, "<preset>")` line in
 `crates/models/quantization/Cargo.toml`/`src/lib.rs` — without that feature,
 the preset is defined but never selectable.
 
+## Multi-token-prediction heads
+
+A multi-token-prediction (MTP) head drafts tokens for speculative decoding
+from its target model's final hidden states. It is an arch of its own —
+`qwen3-5-mtp` (`dsl/qwen3-5-mtp.py`) for Qwen3.5/3.6 — whose forward reads
+the `target_hidden` extern; that alone makes it a head (the macro registers
+it as one, and the serving stack drafts with the MTP proposer instead of a
+draft model). What its `arch.json` declares:
+
+- **`hf_architectures`** — the identity it registers under: an MLX drafter
+  repo carries only `model_type: "qwen3_5_mtp"`. Its config's own
+  `architectures` (its target's) name the targets it drafts for.
+- **`drafter_repo_infix: "-MTP"`** — an MLX conversion strips the head's
+  tensors from the target and publishes them apart, as the target's repo with
+  this before its last `-` token (`mlx-community/Qwen3.6-35B-A3B-4bit` →
+  `mlx-community/Qwen3.6-35B-A3B-MTP-4bit`).
+- **`decoder_safetensors_prefix: ""`** — the drafter stores its tensors bare
+  (`fc.*`, `layers.0.*`, `norm.*`, `pre_fc_norm_*`).
+- **`params`** — its configs are the target's verbatim HF config, so
+  `num_hidden_layers` *replaces* the target's with `mtp_num_hidden_layers`;
+  `vocab_size` replaces the target's with the head's draft vocabulary (a
+  prefix of the target's token ids, 65536 for Qwen3.6), while
+  `embed_vocab_size` keeps every token for the embedding table.
+
+The head carries no `embed_tokens` / `lm_head`: the worker lends it the
+target's (the same mmap, nothing uploaded twice), the lm_head cut to the
+head's `vocab_size` rows. `spec/mtp` compiles the head of every selected
+model whose checkpoint carries one (a head config is selected when it is the
+same file as a selected target's), and a build that compiles the head drafts
+with it whenever it serves the target — `--num-speculative-tokens` drafts per
+step (2), `0` turns it off:
+
+```bash
+cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,\
+spec/mtp,quant/mlx-affine-b4-g64-qembed
+scr serve mlx-community/Qwen3.6-35B-A3B-4bit
+```
+
 ## Recipe for a new model architecture
 
 All arches share the one `scratchy-models` crate (`crates/models/arch/`) —

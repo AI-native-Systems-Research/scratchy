@@ -351,6 +351,8 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             vision_rope_freqs: freqs_view,
             pixels: Some(pixels_view),
             pos_embeds: pos_embeds_view,
+            target_hidden: None,
+            hidden_out: None,
             // Qwen2.5-VL: `cu_seqlens_full` is the same per-image segmentation
             // as `cu_seqlens_q` above (the window permutation preserves
             // per-image boundaries). Reuse the same GpuTensor view.

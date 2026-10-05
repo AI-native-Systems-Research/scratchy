@@ -92,6 +92,11 @@ pub struct DraftSeedInputs {
     /// speculative chain (CUDA, the in-proposer pre-Phase-9 path).
     pub speculative_seeds: Vec<u32>,
     pub speculative_chain_drafts: Vec<Vec<u32>>,
+
+    /// The target's final (post-norm) hidden states for every row of the step, `[num_tokens,
+    /// hidden]` row-major in the model dtype, when the draft is a multi-token-prediction head
+    /// (which reads them, [`super::mtp`]). Empty for a draft model.
+    pub target_hidden: Vec<u8>,
 }
 
 /// Per-step context handed to [`Proposer::propose_for_step`]. Carries
@@ -127,6 +132,11 @@ pub struct ProposerStepCtx<'a> {
     /// with `draft_seed.req_ids`). The K-step chain seeds each req
     /// from this req's last accepted token.
     pub sampled_token_ids: Option<&'a [Vec<u32>]>,
+    /// Whether a request takes drafts. A verify step keeps a draft while the target's token at its
+    /// row — argmax, or sampled for a sampled request — equals it: rejection sampling of one-token
+    /// drafts. A request whose sampling reads its token history (penalties) runs undrafted: a
+    /// verify row's history would need the drafts before it.
+    pub takes_drafts: &'a dyn Fn(&str) -> bool,
 }
 
 /// Single-step speculative-decoding proposer interface.
@@ -240,6 +250,7 @@ impl DraftModelProposer {
                 num_tokens: seed.num_tokens,
                 has_spec_tokens: false,
                 last_token_indices: None,
+                target_hidden: None,
             };
             if backend
                 .forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &prefill_req)
@@ -384,6 +395,7 @@ impl DraftModelProposer {
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
                 last_token_indices: None,
+                target_hidden: None,
             };
             match backend.forward_chain_k(DRAFT_MODEL, DRAFT_KV, &iter0_req, seed.block_size, k) {
                 Ok(per_iter) => {
@@ -450,6 +462,7 @@ impl DraftModelProposer {
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
                 last_token_indices: None,
+                target_hidden: None,
             };
             let step_argmax =
                 match backend.forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &step_req) {

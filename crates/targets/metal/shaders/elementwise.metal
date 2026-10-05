@@ -11,8 +11,9 @@ using namespace metal;
 // ============================================================================
 // CopyRows: out[i] = in[i]  (flat element-wise copy, bounds-guarded)
 //
-// Materializes the vision `pixels` runtime extern into an arena tile
-// (`Instruction::LoadPixels`). out @ buffer(0), in @ buffer(1); the
+// Materializes a host-staged rows runtime extern (vision pixels, position
+// embeddings, a target's hidden states) into an arena tile (`LoadRows`).
+// out @ buffer(0), in @ buffer(1); the
 // element count is `CopyRowsConstants` (slot 4), so the m_scaling tail and
 // any bucket-padding rows are no-ops.
 // ============================================================================
@@ -33,6 +34,35 @@ template <typename T>
 
 SCRATCHY_KERNEL(copy_rows_f16, copy_rows<half>)
 SCRATCHY_KERNEL(copy_rows_bf16, copy_rows<bfloat>)
+
+// ── Row concatenation: out[t] = a[t] ++ b[t] ────────────────────────────────
+//
+// `KernelId::ConcatRows`: two same-width activations side by side — an MTP head's
+// input fusion (`fc(concat(norm(embed), norm(hidden)))`). out @ buffer(0), a @ 1,
+// b @ 2; one thread per output element. `CONCAT_ROWS_N` (slot 6) is the output
+// element count (the m_scaling tail is a no-op), `CONCAT_ROWS_WIDTH` (slot 7) each
+// operand's row width.
+#if defined(SCRATCHY_CONSTANT_6) && defined(SCRATCHY_CONSTANT_7)
+SCRATCHY_CONSTANT(uint, CONCAT_ROWS_N, 6);
+SCRATCHY_CONSTANT(uint, CONCAT_ROWS_WIDTH, 7);
+
+template <typename T>
+[[kernel]] void concat_rows(
+    device T* out [[buffer(0)]],
+    device const T* a [[buffer(1)]],
+    device const T* b [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= CONCAT_ROWS_N) return;
+    uint row = gid / (2u * CONCAT_ROWS_WIDTH);
+    uint col = gid % (2u * CONCAT_ROWS_WIDTH);
+    out[gid] = col < CONCAT_ROWS_WIDTH ? a[row * CONCAT_ROWS_WIDTH + col]
+                                       : b[row * CONCAT_ROWS_WIDTH + col - CONCAT_ROWS_WIDTH];
+}
+#endif
+
+SCRATCHY_KERNEL(concat_rows_f16, concat_rows<half>)
+SCRATCHY_KERNEL(concat_rows_bf16, concat_rows<bfloat>)
 
 // ── In-place residual add: residual += delta ────────────────────────────────
 //

@@ -113,7 +113,8 @@ rag = ["scratchy-serving-api?/rag"]
 # (`model/granite` is shorthand for "all granite models"). Quant presets are
 # a SEPARATE crate, scratchy-quantizations, aliased `quant` below (Cargo
 # forbids aliasing one crate under two names, so `model`/`quant` can't both
-# point at scratchy-models). scratchy-models has no default model scope
+# point at scratchy-models); speculative-decoding drafters likewise live on
+# scratchy-spec, aliased `spec`. scratchy-models has no default model scope
 # (`default-features = false` below) — naming zero is a build-time panic,
 # not a silently empty binary.
 
@@ -133,6 +134,11 @@ scratchy-serving-api = { workspace = true, optional = true }
 scratchy-core-model = { workspace = true }
 scratchy-forward-compiler = { path = "../../compiler", optional = true }
 model = { package = "scratchy-models", path = "../../models/arch", optional = true, default-features = false }
+# Purely for CLI feature-reachability, like `quant` below: `--features spec/mtp`
+# compiles the MTP head of every selected model that has one. scratchy-spec's
+# features forward to scratchy-models (this same `model` instance), so this is
+# a regular-dependency edge, not a build-dependency one.
+spec = { package = "scratchy-spec", path = "../../models/spec", optional = true }
 scratchy-bench = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
