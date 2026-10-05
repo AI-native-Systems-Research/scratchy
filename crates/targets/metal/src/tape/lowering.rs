@@ -6228,18 +6228,22 @@ impl MoeScratch {
     fn of(b: &MoeBlock, bucket_m: u32, p: &MetalModelConsts, moe_scratch_bytes: &mut u32) -> Self {
         let elem = elem_size_bytes(dequant_dtype_for(p));
         let groups = crate::op_abi::METAL_GROUPED_EXPERTS.contains(&b.bundle);
-        // `bucket_m*top_k` counts token–expert pairs. ≥ 128 (grouped): spread over the experts,
-        // the batched per-expert GEMM's 64-row tiles are full enough to win — the prefill-speed
-        // path, mlx/vLLM both use it for prefill. 64–127 (sorted): still thin over the experts,
-        // so the per-(token,expert) matvec stays — but sorted by expert, so an expert picked by
-        // two tokens is read once from DRAM, not once per pair (at bucket 8 × top-8, ~52 distinct
-        // experts hold 64 pairs — a quarter of the slab reads are repeats; measured on base M5,
-        // where those repeats cost 17% of the conc-8 step). < 64 (gathered): the repeats are few
-        // enough that the sort's four dispatches cost more than they save — unmeasured, but the
-        // repeat count halves with each bucket step down (bucket 4 × top-8: 32 pairs, ~8 repeats).
-        let grouping = match (groups, bucket_m * b.top_k.0) {
-            (true, pairs) if pairs >= 128 => MoeGrouping::Grouped,
-            (true, pairs) if pairs >= crate::op_abi::METAL_SORTED_PAIRS => MoeGrouping::Sorted,
+        // `bucket_m*top_k` counts token–expert pairs; under 64 nothing sorts (mlx-lm's floor).
+        // Grouped from 4 per expert (mlx's gate): the batched per-expert GEMM's 64-row tiles are
+        // full enough to win — the prefill-speed path; thinner, each expert's padding outweighs its
+        // rows (Qwen3.6's 256 experts at bucket 64, 2 per expert: a short prompt 7.5% slower).
+        // Sorted at 0.5–1 per expert: the per-pair matvecs stay, sorted by expert so an expert two
+        // rows pick is read once from DRAM (Gemma-4 at bucket 8 × top-8: ~52 distinct experts hold
+        // 64 pairs, a quarter of the slab reads repeats — 17% of the base-M5 conc-8 step). Anything
+        // else gathers: the sorted matvecs run the bucket's every pair, the gathered ones its live.
+        use crate::op_abi::{
+            METAL_GROUPED_PAIRS_PER_EXPERT, METAL_SORTED_PAIRS, METAL_SORTED_PAIRS_PER_EXPERT,
+        };
+        let pairs = bucket_m * b.top_k.0;
+        let per_expert = pairs as f32 / b.experts.0 as f32;
+        let grouping = match groups && pairs >= METAL_SORTED_PAIRS {
+            true if per_expert >= METAL_GROUPED_PAIRS_PER_EXPERT => MoeGrouping::Grouped,
+            true if METAL_SORTED_PAIRS_PER_EXPERT.contains(&per_expert) => MoeGrouping::Sorted,
             _ => MoeGrouping::Gathered,
         };
         let (e, k, i, h) = (b.experts.0, b.top_k.0, b.inter.0, b.hidden.0);
@@ -8809,21 +8813,18 @@ mod tests {
 
     /// The router reads the token rows it routes in every bake: a sorted bake's sort runs after
     /// it, so the sort's copy holds the previous layer's rows. Its expert projections read that
-    /// copy. Qwen3.6-35B-A3B's block (256 experts, top 8, raw router input), at buckets 1, 8 and
-    /// 64: 8, 64 and 512 pairs — gathered, sorted and grouped.
-    #[test]
-    fn the_router_reads_token_rows_in_every_grouping() {
+    /// copy. Qwen3.6-35B-A3B's block (top 8, raw router input) at 128 experts, at buckets 1, 8
+    /// and 64: 8, 64 and 512 pairs — gathered, sorted and grouped.
+    /// Qwen3.6-35B-A3B's MoE block (top 8, raw router input, 4-bit g64 experts) at `experts`.
+    fn qwen_moe_block(experts: u32) -> crate::tape::step::MoeBlock {
         use crate::tape::ids::{
             AffineBits, AffineGroupSize, HiddenSize, IntermediateSize, NumExperts, TopK,
         };
-        use crate::tape::step::{
-            ExpertMatmul, ExpertQuant, ExpertWidth, ExpertWidths, MoeBlock, MoeRows, MoeStep,
-            RouterInput,
-        };
-        use scratchy_subtile::subtile_ir::{ExpertBundle, ExpertProj, RouterBundle};
+        use crate::tape::step::{ExpertQuant, ExpertWidths, MoeBlock, RouterInput};
+        use scratchy_subtile::subtile_ir::{ExpertBundle, RouterBundle};
         let four = AffineBits(4);
-        let block = MoeBlock {
-            experts: NumExperts(256),
+        MoeBlock {
+            experts: NumExperts(experts),
             top_k: TopK(8),
             inter: IntermediateSize(512),
             hidden: HiddenSize(2048),
@@ -8838,7 +8839,43 @@ mod tests {
                     down: four,
                 },
             },
+        }
+    }
+
+    /// A bake groups its experts from 4 pairs per expert (mlx's gate) and sorts them at 0.5–1
+    /// (where #232 measured the sort winning); anything else gathers. On the bucket ladder at top
+    /// 8: Gemma-4's 128 experts keep the choices they were measured at (sorted at 8, grouped from
+    /// 64). Qwen3.6's 256 gather below 512, as they did before they could group: at bucket 64 (2
+    /// per expert) a short prompt prefilled in 98 ms gathered, 105 ms grouped, 161 ms sorted.
+    #[test]
+    fn a_bake_groups_and_sorts_where_measured_to_win() {
+        let p = tp();
+        let grouping = |experts, bucket_m| {
+            MoeScratch::of(&qwen_moe_block(experts), bucket_m, &p, &mut 0).grouping
         };
+        use MoeGrouping::{Gathered, Grouped, Sorted};
+        for (experts, want) in [
+            (
+                128,
+                [Gathered, Gathered, Gathered, Sorted, Grouped, Grouped],
+            ),
+            (
+                256,
+                [Gathered, Gathered, Gathered, Gathered, Gathered, Grouped],
+            ),
+        ] {
+            let got = [1, 2, 4, 8, 64, 512].map(|bucket_m| grouping(experts, bucket_m));
+            assert!(got == want, "{experts} experts: {:?}", got.map(|g| g.pad()));
+        }
+    }
+
+    #[test]
+    fn the_router_reads_token_rows_in_every_grouping() {
+        use crate::tape::ids::{AffineBits, AffineGroupSize};
+        use crate::tape::step::{ExpertMatmul, ExpertWidth, MoeRows, MoeStep};
+        use scratchy_subtile::subtile_ir::ExpertProj;
+        let four = AffineBits(4);
+        let block = qwen_moe_block(128);
         let tokens = MoeRows::Tokens(Slot(1));
         let p = tp();
         let sorted_rows = |bucket_m| {
