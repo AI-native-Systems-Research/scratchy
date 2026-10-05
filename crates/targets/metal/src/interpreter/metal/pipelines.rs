@@ -468,18 +468,15 @@ mod tests {
         bucket_m: u32,
     ) -> Result<Vec<ConstantValue>, PipelineLookupError> {
         let cv = match kernel {
-            KernelId::RmsNorm | KernelId::FusedAddRmsNorm => vec![
-                ConstantValue::uint(0, bucket_m),
-                ConstantValue::uint(1, W::Q_SIZE as u32),
-                ConstantValue::float(2, W::RMS_NORM_EPS),
-                // Slot 3 = `*_WEIGHT_OFFSET` (gain = weight + offset). The
-                // specialized kernels reference it unconditionally, so the
-                // MTL4 specialized-function build needs it set or the
-                // pipeline bakes indeterminate constants (→ all-zero output).
-                // Mirrors `RmsNormConstants`/`FusedAddRmsNormConstants` in
-                // `kernel_constants.rs`.
-                ConstantValue::float(3, W::NORM_WEIGHT_OFFSET),
-            ],
+            KernelId::RmsNorm | KernelId::FusedAddRmsNorm => {
+                crate::tape::kernel_constants::RmsNormConstants {
+                    bucket_m: crate::tape::ids::BucketM(bucket_m),
+                    q_size: crate::tape::ids::QSize(W::Q_SIZE as u32),
+                    rms_norm_eps: crate::tape::ids::RmsNormEps(W::RMS_NORM_EPS),
+                    weight_offset: W::NORM_WEIGHT_OFFSET,
+                }
+                .into()
+            }
             KernelId::FusedGateUpSiluMul if bucket_m == 1 => vec![
                 ConstantValue::uint(3, bucket_m),
                 ConstantValue::uint(4, W::INTERMEDIATE_SIZE as u32),
@@ -745,11 +742,13 @@ mod tests {
     fn rmsnorm_constants_are_well_formed() {
         // `RMS_NORM_EPS` defaults to 1e-5 on `CanonicalParams`.
         let bag = constants_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8).expect("rmsnorm bag");
-        assert_eq!(bag.len(), 4);
+        assert_eq!(bag.len(), 5);
         assert_eq!(bag[0], ConstantValue::uint(0, 8));
         assert_eq!(bag[1], ConstantValue::uint(1, 2048));
         assert_eq!(bag[2], ConstantValue::float(2, 1e-5));
         assert_eq!(bag[3], ConstantValue::float(3, 0.0));
+        let threads = crate::tape::kernel_constants::NORM_THREADS;
+        assert_eq!(bag[4], ConstantValue::uint(4, threads));
     }
 
     #[test]
@@ -2978,7 +2977,7 @@ mod tests {
                 depth: 1_usize,
             },
             MTLSize {
-                width: 256_usize,
+                width: crate::tape::kernel_constants::NORM_THREADS as usize,
                 height: 1_usize,
                 depth: 1_usize,
             },
@@ -3132,7 +3131,7 @@ mod tests {
                 depth: 1_usize,
             },
             MTLSize {
-                width: 256_usize,
+                width: crate::tape::kernel_constants::NORM_THREADS as usize,
                 height: 1_usize,
                 depth: 1_usize,
             },
@@ -3279,7 +3278,7 @@ mod tests {
                 depth: 1_usize,
             },
             MTLSize {
-                width: 256_usize,
+                width: crate::tape::kernel_constants::NORM_THREADS as usize,
                 height: 1_usize,
                 depth: 1_usize,
             },
@@ -3409,7 +3408,7 @@ mod tests {
                 depth: 1_usize,
             },
             MTLSize {
-                width: 256_usize,
+                width: crate::tape::kernel_constants::NORM_THREADS as usize,
                 height: 1_usize,
                 depth: 1_usize,
             },
@@ -3545,7 +3544,7 @@ mod tests {
                 depth: 1_usize,
             },
             MTLSize {
-                width: 256_usize,
+                width: crate::tape::kernel_constants::NORM_THREADS as usize,
                 height: 1_usize,
                 depth: 1_usize,
             },

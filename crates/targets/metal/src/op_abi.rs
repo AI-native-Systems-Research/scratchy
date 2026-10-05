@@ -306,6 +306,10 @@ pub enum MetalFusion {
     MoeRoute,
     /// A KV writer that encodes the rows it writes into the codec's packed store too.
     KvEncoded,
+    /// A one-row MLX-affine matvec that normalizes its input as it loads it.
+    NormedQmv,
+    /// A one-row MLX-affine matvec whose rows add into the residual stream.
+    ResidualQmv,
 }
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
@@ -332,6 +336,14 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     bias: K::BiasAdd,
                     kernel: F::MeanSubRmsNorm,
                     biased: F::MeanSubRmsNormBiasAdd,
+                },
+                FoldPattern::NormedMatvecs {
+                    norm: K::RmsNorm,
+                    add: K::Add,
+                    matmul: K::MatmulTile,
+                    weights: GemmWeightKind::Affine,
+                    normed: F::NormedQmv,
+                    residual: F::ResidualQmv,
                 },
                 FoldPattern::ResidualNorm {
                     norm: K::RmsNorm,

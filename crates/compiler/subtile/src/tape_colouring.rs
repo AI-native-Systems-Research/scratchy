@@ -253,6 +253,8 @@ pub enum ColourError {
     PeelRunaway { step: StepPos, op: &'static str },
     /// Alias chains close on themselves.
     AliasCycle { step: StepPos, op: &'static str },
+    /// Absorbed steps whose drivers absorb each other round.
+    AbsorbCycle { step: StepPos, op: &'static str },
     /// An alias's owner comes later on the tape, so it had no colour yet.
     AliasUncoloured { step: StepPos, op: &'static str },
     /// No step writes the graph's result.
@@ -280,6 +282,7 @@ impl std::fmt::Display for ColourError {
             }
             Self::PeelRunaway { step, op } => write!(f, "{step} ({op}): rope alias peel runaway"),
             Self::AliasCycle { step, op } => write!(f, "{step} ({op}): alias cycle"),
+            Self::AbsorbCycle { step, op } => write!(f, "{step} ({op}): absorb cycle"),
             Self::AliasUncoloured { step, op } => {
                 write!(f, "{step} ({op}): alias target uncolored")
             }
@@ -437,11 +440,28 @@ pub fn colour_tape(
         }
     }
 
+    // Where each step's reads happen: an absorbed step's where the command computing it runs — its
+    // driver's, or, when a later fold absorbed that driver too, the last driver's down the chain.
+    let mut runs_at: Vec<usize> = (0..n).collect();
+    for (p, at) in runs_at.iter_mut().enumerate() {
+        let mut hops = 0;
+        while let Some(w) = absorbed_into[*at] {
+            *at = w;
+            hops += 1;
+            if hops > n {
+                return Err(ColourError::AbsorbCycle {
+                    step: pos(p),
+                    op: name(p),
+                });
+            }
+        }
+    }
+
     // Last use per OWNER, at step granularity; a read of an off-arena value reads what it carries,
-    // and an absorbed step reads where its driver runs.
+    // and an absorbed step reads where its command runs.
     let mut last_use: Vec<usize> = (0..n).collect();
     for (r, s) in steps.iter().enumerate() {
-        let r = absorbed_into[r].map_or(r, |w| w.max(r));
+        let r = runs_at[r].max(r);
         for operand in &s.operands {
             if let Operand::Step(q) = operand {
                 let own = BTreeSet::from([owner[*q]]);
@@ -815,6 +835,34 @@ mod tests {
         };
         let (c, _) = colour(&src, weights(2), ops(), absorbed).unwrap();
         assert_ne!(c[2], c[0]);
+    }
+
+    /// A step absorbed into a driver that a later fold absorbed in turn reads its operands where
+    /// the last driver's command runs.
+    #[test]
+    fn an_absorbed_steps_operand_stays_live_to_the_last_driver_down_its_chain() {
+        let ops = || {
+            vec![
+                gemm(64, vec![Ext(0), Ext(1)]),
+                gemm(64, vec![Op(0), Ext(1)]),
+                gemm(32, vec![Ext(0), Ext(2)]),
+                gemm(64, vec![Ext(0), Ext(1)]),
+                op(MUL, 1, vec![Op(1), Op(3)]),
+            ]
+        };
+        let src = [(1, 64), (64, 64), (64, 32)];
+        let folds = |chain: &'static [(usize, usize)]| {
+            move |s: &[SlotId]| FoldFacts {
+                absorbed: chain.iter().map(|&(a, w)| (s[a], s[w])).collect(),
+                ..FoldFacts::default()
+            }
+        };
+        // Op 1 inside op 2's command: op 0 is read at op 2, and op 3 takes its colour after.
+        let (c, _) = colour(&src, weights(3), ops(), folds(&[(1, 2)])).unwrap();
+        assert_eq!(c[3], c[0]);
+        // Op 2 inside op 4's in turn: op 0 is read at op 4, so op 3 may not write over it.
+        let (c, _) = colour(&src, weights(3), ops(), folds(&[(1, 2), (2, 4)])).unwrap();
+        assert_ne!(c[3], c[0]);
     }
 
     #[test]

@@ -652,6 +652,21 @@ impl From<AffineQmvConstants> for Vec<ConstantValue> {
     }
 }
 
+/// A one-row matvec's [`QmvEnds`](crate::tape::step::QmvEnds), compiled in: its norm's epsilon
+/// (slot 8) and gain offset (9), and whether its rows add into the residual (10).
+impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
+    fn from(e: crate::tape::step::QmvEnds) -> Self {
+        let norm = e.norm.into_iter().flat_map(|n| {
+            [
+                ConstantValue::float(ConstSlot(8), n.eps.0),
+                ConstantValue::float(ConstSlot(9), n.offset.0),
+            ]
+        });
+        let residual = e.residual.then(|| ConstantValue::boolean(ConstSlot(10), true));
+        norm.chain(residual).collect()
+    }
+}
+
 /// `KernelId::AffineGatherQmvFast` / `AffineGatherQmv` (`affine_gather_qmv[_fast]_*`): the
 /// expert matvec's [`AffineQmvConstants`] and which rows it reads (slot 2: the output rows one
 /// input row feeds).

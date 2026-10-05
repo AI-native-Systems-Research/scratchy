@@ -300,7 +300,8 @@ pub enum MetalStep {
 }
 
 /// An MLX-affine matmul: `input · W` into `output`, `W` the layer's `n × k` weight packed `bits`
-/// wide in groups of `group_size`; `vector_limit` rows or more take the matrix kernel.
+/// wide in groups of `group_size`; `vector_limit` rows or more take the matrix kernel. `ends`:
+/// what its one-row matvec does around the dot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AffineMatmul {
     pub input: Slot,
@@ -311,6 +312,25 @@ pub struct AffineMatmul {
     pub group_size: AffineGroupSize,
     pub bits: AffineBits,
     pub vector_limit: QmvBatchLimit,
+    pub ends: QmvEnds,
+}
+
+/// What a one-row MLX-affine matvec does around its dot: normalize its input as it loads it
+/// (`MetalFusion::NormedQmv` — the input is the norm's, the gain its site's `RmsNorm`), and add
+/// its rows into the residual stream its output holds (`MetalFusion::ResidualQmv`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QmvEnds {
+    pub norm: Option<RowNorm>,
+    pub residual: bool,
+}
+
+/// The RMSNorm a matvec applies to its input: the norm's layer (its gain's), epsilon and gain
+/// offset (`rmsnorm(x, w + offset)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowNorm {
+    pub layer: LayerId,
+    pub eps: Eps,
+    pub offset: GainOffset,
 }
 
 /// The steps of a result matmul's sampled rows, in tape order.
@@ -411,6 +431,12 @@ impl MetalStep {
     pub fn advanced(mut self, by: u32) -> Self {
         if let Some(layer) = self.layer_mut() {
             layer.0 += by;
+        }
+        // A matvec's folded norm reads its own layer's gain.
+        if let MetalStep::AffineQmm(g) | MetalStep::AffineGatedQmv(g, _) = &mut self
+            && let Some(norm) = &mut g.ends.norm
+        {
+            norm.layer.0 += by;
         }
         self
     }

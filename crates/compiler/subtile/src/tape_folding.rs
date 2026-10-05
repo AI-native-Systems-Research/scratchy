@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 
 use crate::handoff::{LoweredDecode, SourceBinding};
+use crate::lower::GemmWeightKind;
 use crate::ops::SubOpKind;
 use crate::subtile_ir::{KvOperand, SubOp, SubtileIR, TensorId};
 use crate::subtile_tape::{SlotId, SubtileTape};
@@ -148,6 +149,20 @@ pub enum FoldPattern<K: 'static> {
         encode: SubOpKind,
         kernel: K,
     },
+    /// A `norm` that only `matmul`s read, each as its operand 0 and of `weights`, folds into every
+    /// one of them: each normalizes the norm's input as it loads it (`normed`). A residual `add`
+    /// the norm reads, whose delta (operand 0) only a `matmul` of `weights` reads, becomes that
+    /// matmul's epilogue: its rows add into the residual (`residual`). Only on a model whose
+    /// matvecs normalize ([`ModelFoldFacts::normed_matvecs`]); apply it before the folds that take
+    /// a norm whole.
+    NormedMatvecs {
+        norm: SubOpKind,
+        add: SubOpKind,
+        matmul: SubOpKind,
+        weights: GemmWeightKind,
+        normed: K,
+        residual: K,
+    },
 }
 
 /// The stages a routing fold's scores may pass through after the gather.
@@ -166,6 +181,7 @@ impl<K> FoldPattern<K> {
             Self::ExpertCombined { combine, .. } => *combine,
             Self::Route { top_k, .. } => *top_k,
             Self::Encoded { writer, .. } => *writer,
+            Self::NormedMatvecs { norm, .. } => *norm,
         }
     }
 }
@@ -183,6 +199,8 @@ pub struct FusionTable<K: 'static> {
 pub struct ModelFoldFacts {
     /// A gated activation's gate and up projections fold into its command.
     pub fold_projections: bool,
+    /// The matvecs normalize their input and add into a residual ([`FoldPattern::NormedMatvecs`]).
+    pub normed_matvecs: bool,
 }
 
 /// What a fused command computes beyond its driver step.
@@ -241,6 +259,14 @@ pub enum FusedShape {
     Encoded {
         k: SlotId,
         v: SlotId,
+    },
+    /// The norm this matmul's input passes through: the command reads the norm's input and gain.
+    NormedMatvec {
+        norm: SlotId,
+    },
+    /// The residual add this matmul's rows feed: the command writes the add's buffer.
+    ResidualMatvec {
+        add: SlotId,
     },
 }
 
@@ -640,7 +666,68 @@ impl<K: Copy> Folder<'_, K> {
                 self.encoded(i, encode, kernel);
                 Ok(())
             }
+            FoldPattern::NormedMatvecs {
+                add,
+                matmul,
+                weights,
+                normed,
+                residual,
+                ..
+            } => self.normed_matvecs(i, add, (matmul, weights), normed, residual),
         }
+    }
+
+    /// Norm `i` into every matmul reading it, and the residual add it reads into the add's delta
+    /// matmul. The norm is absorbed into its last reader in tape order, where its input is last read.
+    fn normed_matvecs(
+        &mut self,
+        i: usize,
+        add: SubOpKind,
+        (matmul, weights): (SubOpKind, GemmWeightKind),
+        normed: K,
+        residual: K,
+    ) -> Result<(), FoldError> {
+        if !self.model.normed_matvecs || self.absorbed[i].is_some() || !self.fusions[i].is_empty()
+        {
+            return Ok(());
+        }
+        let ops = &self.ops;
+        let is_matvec = |j: usize| {
+            ops.kind(j) == matmul
+                && matches!(ops.op(j), SubOp::MatmulTile { weight, .. } if weight.kind() == weights)
+        };
+        let reads = |j: usize| ops.args[j].iter().filter(|a| matches!(a, Arg::Op(q) if *q == i));
+        let readers: Vec<usize> = (0..ops.slot.len()).filter(|&j| reads(j).count() > 0).collect();
+        let normalizes = |j: usize| {
+            is_matvec(j)
+                && self.absorbed[j].is_none()
+                && ops.first_op(j) == Some(i)
+                && reads(j).count() == 1
+        };
+        if readers.len() != self.consumers[i] || !readers.iter().all(|&j| normalizes(j)) {
+            return Ok(());
+        }
+        let Some(&last) = readers.iter().max_by_key(|&&j| ops.pos[j]) else {
+            return Ok(());
+        };
+        let delta = match ops.first_op(i) {
+            Some(a) if ops.kind(a) == add && self.absorbed[a].is_none() => self
+                .sole_producer(a, 0, matmul)?
+                .filter(|&d| is_matvec(d))
+                .map(|d| (a, d)),
+            _ => None,
+        };
+        if let Some((a, d)) = delta {
+            self.epilogue[a] = Some(d);
+            let add = self.ops.slot[a];
+            self.record(d, residual, FusedShape::ResidualMatvec { add });
+        }
+        self.absorbed[i] = Some(last);
+        let norm = self.ops.slot[i];
+        for j in readers {
+            self.record(j, normed, FusedShape::NormedMatvec { norm });
+        }
+        Ok(())
     }
 
     /// `i`'s K and V `encode` steps — in the construct it was expanded into, not yet taken.
@@ -1013,6 +1100,8 @@ mod tests {
         ExpertCombined,
         Route,
         Encoded,
+        Normed,
+        ResidualMatvec,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -1031,6 +1120,14 @@ mod tests {
                     bias: K::BiasAdd,
                     kernel: Kern::Centred,
                     biased: Kern::CentredBiased,
+                },
+                FoldPattern::NormedMatvecs {
+                    norm: K::RmsNorm,
+                    add: K::Add,
+                    matmul: K::MatmulTile,
+                    weights: GemmWeightKind::Dense,
+                    normed: Kern::Normed,
+                    residual: Kern::ResidualMatvec,
                 },
                 FoldPattern::ResidualNorm {
                     norm: K::RmsNorm,
@@ -1098,6 +1195,7 @@ mod tests {
 
     const SPLIT: ModelFoldFacts = ModelFoldFacts {
         fold_projections: false,
+        normed_matvecs: false,
     };
 
     const ADD: ArchOp = SubOp::Elementwise(EwKind::Add);
@@ -1175,6 +1273,52 @@ mod tests {
             .collect();
         let folds = fold_tape(&graph, &tape, lowered, table, model).expect("the fixture folds");
         (slots, folds)
+    }
+
+    #[test]
+    fn a_norm_only_matvecs_read_folds_into_each_and_its_add_into_the_delta_matvec() {
+        let ops = |reader: OpDesc| {
+            vec![
+                gemm(64, vec![Ext(0), Ext(1)]),
+                op(ADD, 1, vec![Op(0), Ext(0)]),
+                norm(vec![Op(1), Ext(2)]),
+                gemm(64, vec![Op(2), Ext(3)]),
+                reader,
+                op(MUL, 1, vec![Op(3), Op(4)]),
+            ]
+        };
+        let matvec = || gemm(64, vec![Op(2), Ext(4)]);
+        let src = [(1, 64), (64, 64), (1, 64), (64, 64), (64, 64)];
+        let normed = ModelFoldFacts {
+            fold_projections: false,
+            normed_matvecs: true,
+        };
+        let (s, f) = fold(&src, weights(5), ops(matvec()), &[], &TABLE, normed);
+        // Absorbed into its last reader, where the input it reads is last read.
+        assert_eq!(f.role(s[2]), StepRole::Absorbed { into: s[4] });
+        assert_eq!(f.role(s[1]), StepRole::Epilogue { of: s[0] });
+        let residual = Fusion {
+            kernel: Kern::ResidualMatvec,
+            shape: FusedShape::ResidualMatvec { add: s[1] },
+        };
+        assert_eq!(f.role(s[0]), StepRole::Drives(&residual));
+        let reads = Fusion {
+            kernel: Kern::Normed,
+            shape: FusedShape::NormedMatvec { norm: s[2] },
+        };
+        assert_eq!(f.driven(s[3]), [reads]);
+        assert_eq!(f.driven(s[4]), [reads]);
+        // A model whose matvecs do not normalize, or a norm another kind of step reads: the add
+        // folds into the norm instead.
+        let residual_norm = |f: &TapeFolds<Kern>, s: &[SlotId]| {
+            assert_eq!(f.role(s[1]), StepRole::Absorbed { into: s[2] });
+            assert!(f.driven(s[0]).is_empty() && f.driven(s[3]).is_empty());
+        };
+        let (s, f) = fold(&src, weights(5), ops(matvec()), &[], &TABLE, SPLIT);
+        residual_norm(&f, &s);
+        let other = op(ADD, 1, vec![Op(2), Op(3)]);
+        let (s, f) = fold(&src, weights(5), ops(other), &[], &TABLE, normed);
+        residual_norm(&f, &s);
     }
 
     #[test]
@@ -1359,6 +1503,7 @@ mod tests {
         let (s, split) = fold(&src, weights(4), ops(), &[], &TABLE, SPLIT);
         let fused = ModelFoldFacts {
             fold_projections: true,
+            normed_matvecs: false,
         };
         let (_, joined) = fold(&src, weights(4), ops(), &[], &TABLE, fused);
         assert_eq!(split.absorbed().collect::<Vec<_>>(), [(s[2], s[3])]);

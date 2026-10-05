@@ -1098,6 +1098,10 @@ impl Recording<'_> {
                 };
                 self.moe(i, MoeStep::Route(program), &[], &[], weight)
             }
+            (F::NormedQmv, Sh::NormedMatvec { .. }) | (F::ResidualQmv, Sh::ResidualMatvec { .. }) => {
+                let kept = self.kept(i)?;
+                kept.ok_or_else(|| self.no(i, Refused::FusionShape))
+            }
             // The writer's command — its earlier fold's, else its own — writing the packed store too.
             (F::KvEncoded, Sh::Encoded { .. }) => {
                 let driven = self.folds.driven(self.steps.slot[i]);
@@ -1261,12 +1265,45 @@ impl Recording<'_> {
         let SubOp::MatmulTile { n, weight } = *self.op(mm) else {
             return Err(self.no(i, Refused::FusionShape));
         };
-        let (out, input, e) = (self.colour(mm)?, self.read(mm, 0)?, self.weight_of(mm)?);
+        let (mut out, mut input, e) = (self.colour(mm)?, self.read(mm, 0)?, self.weight_of(mm)?);
         let layer = self.layer_with_path(e);
         let k = self.graph.tensors[e].rows;
         let (nd, kd) = (st::NDim(n), st::KDim(k));
+        let mut site = self.site(mm, WeightKind::Linear, e)?;
+        // What the matmul's folds put around its dot: the norm its input passes through (it reads
+        // the norm's input and gain), and the residual add its rows feed (it writes the add's
+        // buffer, which holds the residual).
+        let (mut ends, mut reads, mut writes) = (st::QmvEnds::default(), Vec::new(), Vec::new());
+        for f in self.folds.driven(self.steps.slot[mm]) {
+            match f.shape {
+                FusedShape::NormedMatvec { norm } => {
+                    let nrm = self.op_at(mm, norm)?;
+                    let SubOp::RmsNorm { eps, gain } = *self.op(nrm) else {
+                        return Err(self.no(mm, Refused::FusionShape));
+                    };
+                    input = self.read(nrm, 0)?;
+                    let layer = self.weight_layer(nrm);
+                    let (eps, offset) = (st::Eps(eps), offset(gain));
+                    ends.norm = Some(st::RowNorm { layer, eps, offset });
+                    site.extend(self.site(nrm, WeightKind::RmsNorm, self.weight_of(nrm)?)?);
+                    writes.extend(self.gain_add(nrm)?);
+                }
+                FusedShape::ResidualMatvec { add } => {
+                    let a = self.op_at(mm, add)?;
+                    out = self.colour(a)?;
+                    reads.push(self.read(a, 1)?);
+                    ends.residual = true;
+                }
+                _ => {}
+            }
+        }
+        reads.insert(0, input);
+        writes.insert(0, out);
         let plain = match weight {
-            GemmWeight::Dense => MetalStep::Gemm(input, out, layer, nd, kd),
+            GemmWeight::Dense if ends == st::QmvEnds::default() => {
+                MetalStep::Gemm(input, out, layer, nd, kd)
+            }
+            GemmWeight::Dense => return Err(self.no(mm, Refused::FusionShape)),
             GemmWeight::Fp8Dynamic => return Err(self.no(mm, Refused::Fp8Gemm)),
             GemmWeight::Affine { affine } => MetalStep::AffineQmm(st::AffineMatmul {
                 input,
@@ -1277,12 +1314,12 @@ impl Recording<'_> {
                 group_size: Gs(affine.group().get()),
                 bits: Bits(affine.bits().get()),
                 vector_limit: st::QmvBatchLimit(affine_qmm_vector_limit(k, n)),
+                ends,
             }),
         };
-        let site = self.site(mm, WeightKind::Linear, e)?;
         let (Some(step), MetalStep::AffineQmm(g)) = (step, plain) else {
             return match step {
-                None => Ok(em(plain, &[input], &[out], site)),
+                None => Ok(em(plain, &reads, &writes, site)),
                 Some(_) => Err(self.no(i, Refused::SampledNotAffine)),
             };
         };

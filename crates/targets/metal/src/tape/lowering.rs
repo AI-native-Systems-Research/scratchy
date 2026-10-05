@@ -24,7 +24,8 @@ use crate::tape::step::{
     AffineBits, AffineGroupSize, AffineMatmul, AttnMask, BiasStorage, CuSeqlens, ExpertMatmul,
     ExpertProj, GainOffset, GatedAct, GatherIndices, HiddenSize, IntermediateSize, KDim, KvOffsets,
     KvOperand, KvWrite, LayerId, MetalStep, MetalStepTape, MoeBlock, MoeRegion, MoeRows, MoeScores,
-    MoeStep, NDim, QmvBatchLimit, RopeFormTag, RotaryTables, RotatedRows, RouterInput, RowSource,
+    MoeStep, NDim, QmvBatchLimit, QmvEnds, RopeFormTag, RotaryTables, RotatedRows, RouterInput,
+    RowSource,
     RowsDivisor, RowsPerToken, SampleRowsStep, Scale, StepRow,
 };
 use scratchy_ir::{KvCodec, TqBits};
@@ -232,7 +233,7 @@ fn sample_rows(
             let ix = w.of(WeightKind::Linear, 0)?;
             let codes = super::kernel_constants::AffineCodes::of(profile, g.bits.get());
             sampled(affine_qmv_command(
-                p, &g, 1, x, g.layer, ix, codes, /*wide_ok=*/ false,
+                p, &g, 1, x, g.layer, ix, codes, /*wide_ok=*/ false, None,
             ))
         }
         (true, R::Scatter) => sampled(scatter_first_to_last_row_command(p, g.output, g.n.get())),
@@ -271,6 +272,7 @@ fn affine_qmv_command(
     ix: SourceIx,
     codes: super::kernel_constants::AffineCodes,
     wide_ok: bool,
+    gain: Option<Binding>,
 ) -> LoweredCommand {
     let (n, k, bits) = (g.n.get(), g.k.get(), g.bits.get());
     // The small-M band (MLX `qmv_wide`, gen-15+): weight groups are
@@ -319,8 +321,17 @@ fn affine_qmv_command(
             .into_baked(),
         ),
     };
+    let constants = baked(
+        constants
+            .iter()
+            .copied()
+            .chain(Vec::from(g.ends))
+            .collect::<Vec<ConstantValue>>(),
+    );
     let (dtype, scale_dtype) = (dequant_dtype_for(p), scale_dtype_for(p));
     let (x, y) = (g.input.get(), g.output.get());
+    let mut bindings = affine_qmm_bindings(x, y, layer, ix);
+    bindings.extend(gain);
     // The wide kernel's grid is exact for the bucket (nv covers rows)
     // and over-dispatch is safe — the kernel clamps every row index
     // against the baked M — so it takes no m_scaling. The others take
@@ -344,9 +355,24 @@ fn affine_qmv_command(
             threads_per_threadgroup: tpg,
             m_scaling,
         },
-        bindings: baked(affine_qmm_bindings(x, y, layer, ix)),
+        bindings: baked(bindings),
         gemm_dims: None,
     }
+}
+
+/// A matvec's folded norm's gain ([`QmvEnds::norm`]), bound at 15: its site's `RmsNorm` weight at
+/// the norm's own layer.
+fn norm_gain(
+    g: &AffineMatmul,
+    w: RowSources<'_>,
+    layer_offset: u32,
+) -> Result<Option<Binding>, LoweringError> {
+    let Some(norm) = g.ends.norm else {
+        return Ok(None);
+    };
+    let layer = super::ids::LayerId(norm.layer.get() + layer_offset);
+    let ix = w.of(WeightKind::RmsNorm, 0)?;
+    Ok(Some(source(ix, WeightTensor::Weight, layer, 15)))
 }
 
 /// The sampled rows' gather and scatter kernels, each with its f16 and bf16 symbols.
@@ -1795,6 +1821,7 @@ fn lower_one(
                 group_size: AffineGroupSize(group_size),
                 bits: AffineBits(bits),
                 vector_limit: QmvBatchLimit(vector_limit),
+                ends: _,
             } = g;
             let dtype = dequant_dtype_for(p);
             let scale_dtype = scale_dtype_for(p);
@@ -1817,6 +1844,9 @@ fn lower_one(
                 // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
                 let wide_ok =
                     profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
+                if g.ends != QmvEnds::default() && bucket_m != 1 {
+                    return Err(LoweringError::GatedMatvecRows { bucket_m });
+                }
                 affine_qmv_command(
                     p,
                     g,
@@ -1826,7 +1856,10 @@ fn lower_one(
                     w.of(WeightKind::Linear, 0)?,
                     codes,
                     wide_ok,
+                    norm_gain(g, w, layer_offset)?,
                 )
+            } else if g.ends != QmvEnds::default() {
+                return Err(LoweringError::GatedMatvecRows { bucket_m });
             } else {
                 // Matmul branch (prefill-shape). `pick_qmm_t_kernel`
                 // mirrors MLX `quantized.cpp:1411-1424 + :788-805`:
@@ -2575,6 +2608,7 @@ fn lower_one(
                 layer,
                 w.of(WeightKind::Linear, 0)?,
             );
+            bindings.extend(norm_gain(g, w, layer_offset)?);
             let up = affine_weight_bindings(w.of(WeightKind::Linear, 1)?, layer);
             bindings.extend(up.map(|b| match b {
                 Binding::Source {
@@ -2594,7 +2628,10 @@ fn lower_one(
                 kernel: KernelId::AffineQmvGated,
                 library: "quantized_qmv",
                 function: leak_symbol(symbol),
-                constants: Vec::<ConstantValue>::from(constants).into_baked(),
+                constants: (Vec::<ConstantValue>::from(constants).into_iter())
+                    .chain(Vec::from(g.ends))
+                    .collect::<Vec<_>>()
+                    .into_baked(),
                 dispatch: DispatchShape {
                     threadgroups: (1, n / 8, 1),
                     threads_per_threadgroup: (32, 4, 1),
@@ -7434,6 +7471,7 @@ mod tests {
             group_size: AffineGroupSize(64),
             bits: AffineBits(4),
             vector_limit: QmvBatchLimit(18),
+            ends: QmvEnds::default(),
         }
     }
 
@@ -7557,6 +7595,7 @@ mod tests {
             group_size: AffineGroupSize(gs),
             bits: AffineBits(bits),
             vector_limit: QmvBatchLimit(10),
+            ends: QmvEnds::default(),
         };
         let lower_at = |rows: MetalStepTape, profile| {
             lower_subtile_tape_to_metal(&rows, &tp(), bake_point(512, profile)).expect("lowers")

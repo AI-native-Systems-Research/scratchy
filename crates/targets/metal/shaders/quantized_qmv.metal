@@ -50,6 +50,46 @@ SCRATCHY_CONSTANT(int, OUT_VEC_SIZE, 1);
 // XOR-ing each loaded word restores the unsigned codes. Unset: as written.
 SCRATCHY_CONSTANT_OPTIONAL(bool, AFFINE_CODES_OFFSET8, 5);
 constant constexpr uint16_t AFFINE_CODES_XOR = AFFINE_CODES_OFFSET8 ? 0x8888 : 0;
+// 8 / 9: x is an RMSNorm's input (`qmv_fast_impl`'s gain, its eps and weight offset): each lane
+// dots x ⊙ gain, and the row's sum of squares scales the dot once at the end. 10: the row adds
+// into y, a residual stream, rounded as the matvec stores it and as the add stores the sum.
+SCRATCHY_CONSTANT_OPTIONAL(float, QMV_NORM_EPS, 8);
+SCRATCHY_CONSTANT_OPTIONAL(float, QMV_NORM_W_OFFSET, 9);
+SCRATCHY_CONSTANT_OPTIONAL(bool, QMV_RESIDUAL, 10);
+constant constexpr bool QMV_NORMED = QMV_NORM_EPS_SET;
+constant constexpr float QMV_GAIN_OFFSET = QMV_NORM_W_OFFSET_SET ? QMV_NORM_W_OFFSET : 0.0f;
+constant constexpr bool QMV_ADDS = QMV_RESIDUAL_SET && QMV_RESIDUAL;
+
+// A lane's `count` input values as a normalizing matvec dots them: x ⊙ (gain + offset) into `xg`,
+// the squares of the first `valid` into `sum_sq`.
+template <typename U, int count, typename T_act, typename T_scale>
+inline void qmv_normalize(
+    const device T_act* x,
+    const device T_scale* gain,
+    thread U* xg,
+    thread U& sum_sq,
+    int valid) {
+  for (int i = 0; i < count; i++) {
+    if (i < valid) {
+      const U v = x[i];
+      sum_sq += v * v;
+      xg[i] = v * (U(gain[i]) + QMV_GAIN_OFFSET);
+    }
+  }
+}
+
+// What a row's dot is scaled by: the norm's 1 / rms over the `count` values whose squares sum to
+// `total_sq` under QMV_NORMED, else 1.
+inline float qmv_row_scale(float total_sq, int count) {
+  return QMV_NORMED ? 1.0f / sqrt(total_sq / float(count) + QMV_NORM_EPS) : 1.0f;
+}
+
+// Store a row's dot `r` at `*y` in the activation type — under QMV_ADDS added into the residual
+// already there first, so the sum takes the one rounding.
+template <typename T_act, typename Y>
+inline void qmv_store(Y y, float r) {
+  *y = static_cast<T_act>(QMV_ADDS ? float(*y) + r : r);
+}
 
 // ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26
@@ -96,8 +136,8 @@ inline float nvfp4_decode(uint code) {
 // load_vector / load_vector_safe — quantized.h:28-189
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T, typename U, int values_per_thread, int bits>
-inline U load_vector(const device T* x, thread U* x_thread) {
+template <typename T, typename U, int values_per_thread, int bits, typename P = const device T*>
+inline U load_vector(P x, thread U* x_thread) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -175,8 +215,8 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   return sum;
 }
 
-template <typename T, typename U, int values_per_thread, int bits>
-inline U load_vector_safe(const device T* x, thread U* x_thread, int N) {
+template <typename T, typename U, int values_per_thread, int bits, typename P = const device T*>
+inline U load_vector_safe(P x, thread U* x_thread, int N) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -566,7 +606,8 @@ METAL_FUNC void qmv_quad_impl(
     int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
-    uint quad_lid [[thread_index_in_quadgroup]]) {
+    uint quad_lid [[thread_index_in_quadgroup]],
+    const device T_scale* gain = nullptr) {
   constexpr int quads_per_simd = SIMD_SIZE / QUAD_SIZE;
   constexpr int pack_factor = 32 / bits;
   constexpr int values_per_thread = D / QUAD_SIZE;
@@ -590,7 +631,16 @@ METAL_FUNC void qmv_quad_impl(
   x += tid.x * in_vec_size + quad_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
 
-  U sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+  U sum;
+  U sum_sq = 0;
+  if (QMV_NORMED) {
+    thread U xg[values_per_thread];
+    qmv_normalize<U, values_per_thread>(
+        x, gain + quad_lid * values_per_thread, xg, sum_sq, values_per_thread);
+    sum = load_vector<T_act, U, values_per_thread, bits>(xg, x_thread);
+  } else {
+    sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+  }
 
   for (int row = 0; row < results_per_quadgroup; row++) {
     auto wl = (const device uint8_t*)(w + row * in_vec_size_w * quads_per_simd);
@@ -605,10 +655,11 @@ METAL_FUNC void qmv_quad_impl(
     }
   }
 
+  const U scale = qmv_row_scale(QMV_NORMED ? quad_sum(sum_sq) : 0, in_vec_size);
   for (int row = 0; row < results_per_quadgroup; row++) {
-    result[row] = quad_sum(result[row]);
+    result[row] = quad_sum(result[row]) * scale;
     if (quad_lid == 0 && row * quads_per_simd + out_row < out_vec_size) {
-      y[row * quads_per_simd] = static_cast<T_act>(result[row]);
+      qmv_store<T_act>(y + row * quads_per_simd, result[row]);
     }
   }
 }
@@ -629,7 +680,8 @@ METAL_FUNC void qmv_fast_impl(
     int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const device T_scale* gain = nullptr) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
@@ -657,9 +709,19 @@ METAL_FUNC void qmv_fast_impl(
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + out_row;
+  gain += simd_lid * values_per_thread;
+  U sum_sq = 0;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    U sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+    U sum;
+    if (QMV_NORMED) {
+      thread U xg[values_per_thread];
+      qmv_normalize<U, values_per_thread>(x, gain, xg, sum_sq, values_per_thread);
+      sum = load_vector<T_act, U, values_per_thread, bits>(xg, x_thread);
+      gain += block_size;
+    } else {
+      sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+    }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -677,10 +739,11 @@ METAL_FUNC void qmv_fast_impl(
     x += block_size;
   }
 
+  const U scale = qmv_row_scale(QMV_NORMED ? simd_sum(sum_sq) : 0, in_vec_size);
   for (int row = 0; row < results_per_simdgroup; row++) {
-    result[row] = simd_sum(result[row]);
+    result[row] = simd_sum(result[row]) * scale;
     if (simd_lid == 0) {
-      y[row] = static_cast<T_act>(result[row]);
+      qmv_store<T_act>(y + row, result[row]);
     }
   }
 }
@@ -701,7 +764,8 @@ METAL_FUNC void qmv_impl(
     int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const device T_scale* gain = nullptr) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int packs_per_thread = 1;
@@ -729,6 +793,8 @@ METAL_FUNC void qmv_impl(
   if (out_row >= out_vec_size) {
     return;
   }
+  gain += simd_lid * values_per_thread;
+  U sum_sq = 0;
 
   // In this case we need to properly guard all our reads because there isn't
   // even 1 tile in the matrix
@@ -742,7 +808,15 @@ METAL_FUNC void qmv_impl(
 
     int k = 0;
     for (; k < in_vec_size - block_size; k += block_size) {
-      U sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+      U sum;
+      if (QMV_NORMED) {
+        thread U xg[values_per_thread];
+        qmv_normalize<U, values_per_thread>(x, gain, xg, sum_sq, values_per_thread);
+        sum = load_vector<T_act, U, values_per_thread, bits>(xg, x_thread);
+        gain += block_size;
+      } else {
+        sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+      }
 
       for (int row = 0;
            row < results_per_simdgroup && out_row + row < out_vec_size;
@@ -767,8 +841,14 @@ METAL_FUNC void qmv_impl(
         0,
         values_per_thread);
     if (remaining > 0) {
-      U sum = load_vector_safe<T_act, U, values_per_thread, bits>(
-          x, x_thread, remaining);
+      U sum;
+      if (QMV_NORMED) {
+        thread U xg[values_per_thread];
+        qmv_normalize<U, values_per_thread>(x, gain, xg, sum_sq, remaining);
+        sum = load_vector_safe<T_act, U, values_per_thread, bits>(xg, x_thread, remaining);
+      } else {
+        sum = load_vector_safe<T_act, U, values_per_thread, bits>(x, x_thread, remaining);
+      }
 
       for (int row = 0;
            row < results_per_simdgroup && out_row + row < out_vec_size;
@@ -784,12 +864,13 @@ METAL_FUNC void qmv_impl(
       }
     }
 
+    const U scale = qmv_row_scale(QMV_NORMED ? simd_sum(sum_sq) : 0, in_vec_size);
     for (int row = 0;
          row < results_per_simdgroup && out_row + row < out_vec_size;
          row++) {
-      result[row] = simd_sum(result[row]);
+      result[row] = simd_sum(result[row]) * scale;
       if (simd_lid == 0) {
-        y[row] = static_cast<T_act>(result[row]);
+        qmv_store<T_act>(y + row, result[row]);
       }
     }
   }
@@ -805,7 +886,15 @@ METAL_FUNC void qmv_impl(
 
     int k = 0;
     for (; k < in_vec_size - block_size; k += block_size) {
-      U sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+      U sum;
+      if (QMV_NORMED) {
+        thread U xg[values_per_thread];
+        qmv_normalize<U, values_per_thread>(x, gain, xg, sum_sq, values_per_thread);
+        sum = load_vector<T_act, U, values_per_thread, bits>(xg, x_thread);
+        gain += block_size;
+      } else {
+        sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+      }
 
       for (int row = 0; row < results_per_simdgroup; row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -828,8 +917,14 @@ METAL_FUNC void qmv_impl(
         0,
         values_per_thread);
     if (remaining > 0) {
-      U sum = load_vector_safe<T_act, U, values_per_thread, bits>(
-          x, x_thread, remaining);
+      U sum;
+      if (QMV_NORMED) {
+        thread U xg[values_per_thread];
+        qmv_normalize<U, values_per_thread>(x, gain, xg, sum_sq, remaining);
+        sum = load_vector_safe<T_act, U, values_per_thread, bits>(xg, x_thread, remaining);
+      } else {
+        sum = load_vector_safe<T_act, U, values_per_thread, bits>(x, x_thread, remaining);
+      }
 
       for (int row = 0; row < results_per_simdgroup; row++) {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
@@ -842,10 +937,11 @@ METAL_FUNC void qmv_impl(
             wl, x_thread, s, b, sum, remaining);
       }
     }
+    const U scale = qmv_row_scale(QMV_NORMED ? simd_sum(sum_sq) : 0, in_vec_size);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result[row] = simd_sum(result[row]);
-      if (simd_lid == 0) {
-        y[row] = static_cast<T_act>(result[row]);
+      result[row] = simd_sum(result[row]) * scale;
+      if (simd_lid == 0 && (!QMV_ADDS || used_out_row + row >= out_row)) {
+        qmv_store<T_act>(y + row, result[row]);
       }
     }
   }
@@ -874,6 +970,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
     const constant int64_t* w_strides [[buffer(12)]],
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
+    const device T_scale* gain [[buffer(15)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
     uint quad_lid [[thread_index_in_quadgroup]]) {
@@ -906,7 +1003,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
       OUT_VEC_SIZE,
       tid,
       quad_gid,
-      quad_lid);
+      quad_lid,
+      gain);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -930,6 +1028,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
     const constant int64_t* w_strides [[buffer(12)]],
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
+    const device T_scale* gain [[buffer(15)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -962,7 +1061,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
       OUT_VEC_SIZE,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      gain);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -986,6 +1086,7 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
     const constant int64_t* w_strides [[buffer(12)]],
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
+    const device T_scale* gain [[buffer(15)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1018,7 +1119,8 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
       OUT_VEC_SIZE,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      gain);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1543,6 +1645,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
     const device uint32_t* up_w        [[buffer(5)]],
     const device T_scale*  up_scales   [[buffer(6)]],
     const device T_scale*  up_biases   [[buffer(7)]],
+    const device T_scale*  gain        [[buffer(15)]],
     uint3 tid       [[threadgroup_position_in_grid]],
     uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  simd_lid  [[thread_index_in_simdgroup]]) {
@@ -1558,10 +1661,10 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool fast>
   const device T_scale* biases = (up ? up_biases : gate_biases) + sb_offset;
   if (fast) {
     qmv_fast_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
-        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid);
+        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid, gain);
   } else {
     qmv_impl<T_act, T_scale, group_size, bits, threadgroup T_act*>(
-        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid);
+        w, scales, biases, x, rows[up], IN_VEC_SIZE, 8, uint3(0), simd_gid % 2, simd_lid, gain);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid == 0 && simd_lid < 8) {
