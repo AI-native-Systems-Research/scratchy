@@ -1599,6 +1599,67 @@ fn node_at_one_row<F: RopeForm>(node: &SubtileNode<F>) -> SubtileNode<F> {
     }
 }
 
+/// The ROW-LOCAL op set: ops whose output row `r` depends only on input row `r` (plus weights and
+/// per-row tables). The prefill lm-head fold is sound only inside this set — see
+/// [`tensor_feeds_result_through_row_local_ops`].
+fn row_local_tail_op<F: RopeForm>(op: &SubOp<F>) -> bool {
+    use SubOp::*;
+    matches!(
+        op,
+        MatmulTile { .. }
+            | SumReduce { .. }
+            | Elementwise(_)
+            | SiluMul
+            | ScalarMul { .. }
+            | RmsNorm { .. }
+            | RmsNormReduce { .. }
+            | RmsNormApply { .. }
+            | RmsNormUnit { .. }
+            | TanhSoftCap { .. }
+            | ScalarWeightMul
+    )
+}
+
+/// Does tensor `t` feed `ir.result` through ROW-LOCAL consumers only (or is it the result)?
+///
+/// The prefill lm-head fold must fire ONLY on the result's own tail. The width test alone
+/// (`cols == result_cols`) was falsified by the gemma-4 parity fixture (vocab 512): its
+/// GLOBAL-layer q projection is also 512 cols (4 heads × hd 128), so the fold fired there too —
+/// the q matmul ran at m=1, only row 0 of the roped Q was ever real (the last prompt token's,
+/// rotated at position 0 = identity), attention saw 30 zero rows, and the first sampled token was
+/// garbage while every width-128 tensor stayed fp16-clean. A width COLLISION is not an identity.
+///
+/// What separates the real tail: its rows die at the result (the host reads row 0 only), and
+/// everything between it and the result is ROW-LOCAL — so computing one row and placing it at
+/// row 0 loses nothing. The q projection fails that: its output passes through a norm, a rope,
+/// and an ATTENTION (row-mixing — output row `i` reads K/V rows `0..=i`), so every one of its
+/// rows is live and folding to one row corrupts the layer. Rope is excluded from the row-local
+/// set deliberately: `RopeAppend` also writes the paged KV cache, a consumer the prefill graph
+/// cannot see.
+fn tensor_feeds_result_through_row_local_ops<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    t: scratchy_subtile::subtile_ir::TensorId,
+) -> bool {
+    if t == ir.result {
+        return true;
+    }
+    // Every consumer of `t` must be a row-local op whose own output keeps the property — one
+    // row-mixing reader anywhere in the chain makes `t`'s other rows live and the fold unsound.
+    let mut any_reader = false;
+    for n in &ir.nodes {
+        if !n.inputs.iter().any(|i| i.tensor == t) {
+            continue;
+        }
+        any_reader = true;
+        if !row_local_tail_op(&n.op)
+            || !tensor_feeds_result_through_row_local_ops(ir, n.output.tensor)
+        {
+            return false;
+        }
+    }
+    any_reader
+}
+
 /// Lower the m>1 PREFILL lm-head matmul as the m=1 tail it really is: the SAME node, re-lowered
 /// with its activation sliced to the LAST prompt row. Only that row's logits are ever read, so
 /// running the vocab-wide matmul over all `mq` rows is `mq`× the work for one row of answer.
@@ -1815,6 +1876,13 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     // observed miss: the lm_head matmul t1129 kept time-tiling because ir.result was the ScalarMul t1130).
     // The lm_head matmul AND the logits ScalarMul are the ONLY ops whose output spans the result cols
     // (vocab); every intermediate is hidden/intermediate width. So BOTH re-lower at m=1.
+    //
+    // ⛔ AND BY DATAFLOW: the node must be an ANCESTOR of `ir.result`. The width test alone was
+    // falsified by the gemma-4 parity fixture (vocab 512), whose GLOBAL-layer q projection is ALSO
+    // 512 cols (4 heads × hd 128) — the fold fired on every global layer's Q (extracted the last
+    // row, ran it at m=1, roped at position 0), and the model's first sampled token was garbage
+    // while every width-128 tensor stayed fp16-clean. A width COLLISION is not an identity: only
+    // the tail's own row is dead, and only the result's ancestors are the tail.
     // The mq=1 DECODE bundle is UNAFFECTED (out_rows==1 ⇒ not the prefill tail ⇒ lowered as before).
     let result_cols = ir.tensors[ir.result.index() as u32 as usize].cols;
     // NOT WHEN THE ROWS ARE REQUESTS. The fold is sound only because a prompt's rows are one
@@ -1825,7 +1893,8 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     // not the flat row-major form that aliased above one row.
     let is_prefill_lm_head_tail = node.output.region.cols.len == result_cols
         && node.output.region.rows.len > 1
-        && !rows_are_requests;
+        && !rows_are_requests
+        && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor);
     match &node.op {
         // The rest of the arch vocabulary. It reaches this emitter because the SHARED
         // front end expresses every op instead of asserting the unsupported ones away

@@ -1077,6 +1077,48 @@ impl ResidentExecutor {
                 }
             }
             // END TEMP-PROBE-6
+            // ⭐ DEBUG-ONLY TENSOR DUMP (`SCRATCHY_EMU_TENSORDUMP=<dir>`): every NON-SOURCE
+            // tensor's f32 values after this segment, one file per (program, segment, tensor)
+            // — `<dir>/prog<i>_seg<j>_t<tid>.bin` (LE f32, `n` elements, shapes derivable from
+            // the wiring). Print-only diagnostics env gate, the same class as
+            // `SCRATCHY_SEG_TRACE` above: it changes nothing the emulator computes. Written
+            // only when the segment actually wrote the tensor (value sum moved) so the FIRST
+            // writer names itself, matching the PROBE6 change-detection law.
+            if let Some(dir) = std::env::var_os("SCRATCHY_EMU_TENSORDUMP") {
+                let dir = std::path::Path::new(&dir);
+                let _ = std::fs::create_dir_all(dir);
+                let mut written: Vec<u64> = match seg {
+                    Segment::Fused(fs) => fs.outputs.iter().copied().collect(),
+                    Segment::Native(_) => Vec::new(),
+                };
+                written.extend(outputs.iter().map(|&(t, _)| t));
+                written.sort_unstable();
+                written.dedup();
+                for tid in written {
+                    let (Some(&s), Some(&n)) =
+                        (self.stick.get(&tid), self.numel.get(&tid))
+                    else {
+                        continue;
+                    };
+                    let bytes = self
+                        .mem
+                        .hbm
+                        .borrow()
+                        .read_bytes(s * STICK_BYTES, n * self.dtype.bytes_per_elem());
+                    let d = crate::codec::decode(&bytes, n, self.dtype);
+                    let raw: Vec<u8> = d.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    let _ = std::fs::write(
+                        dir.join(format!("prog{idx}_seg{seg_i}_t{tid}.bin")),
+                        raw,
+                    );
+                    // `order.json`-lite: the shape rides the filename's tid only, so also drop
+                    // a one-line manifest per dump for convenience.
+                    let _ = std::fs::write(
+                        dir.join(format!("prog{idx}_seg{seg_i}_t{tid}.n")),
+                        format!("{n}\n"),
+                    );
+                }
+            }
         }
         if diag {
             eprintln!(
