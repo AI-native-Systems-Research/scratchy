@@ -30,7 +30,7 @@ use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape, Weight
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::MetalAllocator;
-use crate::tape::constants::TapeVariant;
+use crate::tape::constants::{ConstantType, TapeVariant};
 use crate::tape::ids::SourceIx;
 use crate::tape::lowered::ModelSources;
 #[cfg(feature = "forward-telemetry")]
@@ -1569,10 +1569,11 @@ fn mtl_size_pair(cmd: &LoweredCommand, variant: TapeVariant) -> (MTLSize, MTLSiz
         (K::AttentionViaCacheTq | K::AttentionDecodeCombineTq, Some(h)) => h.get(),
         _ => 1,
     };
-    // A decode attention spreads each query-head group over the variant's splits, the key loop's
-    // 32 simdgroups dealt out among them (`ConstantType::AttnSplits`).
+    // A decode attention that takes the variant's splits (`ConstantType::AttnSplits`) spreads each
+    // query-head group over them, the key loop's 32 simdgroups dealt out among them.
+    let split = (cmd.constants.iter()).any(|c| c.ty == ConstantType::AttnSplits);
     let splits = match cmd.kernel {
-        K::AttentionViaCache | K::AttentionViaCacheTq => variant.attn_splits.get(),
+        K::AttentionViaCache | K::AttentionViaCacheTq if split => variant.attn_splits.get(),
         _ => 1,
     };
     let tg = MTLSize {
@@ -1651,6 +1652,38 @@ mod tests {
             let (tg, _) = mtl_size_pair(&fp16, variant);
             assert_eq!((tg.width, tg.height, tg.depth), (1, 32, 2));
         }
+    }
+
+    /// A decode attention spreads over the variant's splits only when it takes them: a
+    /// multi-row bucket's, which has no split, dispatches as baked under any variant.
+    #[test]
+    fn only_a_split_decode_attention_spreads_over_the_variants_splits() {
+        use crate::tape::ids::{AttnSplits, MaxBlocksPerSeq};
+        let command = |constants: Vec<ConstantValue>| LoweredCommand {
+            kernel: KernelId::AttentionViaCache,
+            library: "attention",
+            function: "attention_via_cache_v2_f16_specialized",
+            constants: crate::interpreter::metal::lowered::baked(constants),
+            dispatch: DispatchShape {
+                threadgroups: (1, 32, 1),
+                threads_per_threadgroup: (1024, 1, 1),
+                m_scaling: None,
+            },
+            bindings: crate::interpreter::metal::lowered::baked(Vec::new()),
+            gemm_dims: None,
+        };
+        let (split, unsplit) = (
+            command(vec![ConstantValue::attn_splits(18)]),
+            command(Vec::new()),
+        );
+        let variant = TapeVariant {
+            cap: MaxBlocksPerSeq(128),
+            tq_heads: None,
+            attn_splits: AttnSplits(2),
+        };
+        let shape = |(tg, tpt): (MTLSize, MTLSize)| (tg.height, tg.depth, tpt.width);
+        assert_eq!(shape(mtl_size_pair(&split, variant)), (32, 2, 512));
+        assert_eq!(shape(mtl_size_pair(&unsplit, variant)), (32, 1, 1024));
     }
 
     /// The decode-step gates follow whether every sequence contributes one

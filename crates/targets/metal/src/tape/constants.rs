@@ -157,21 +157,26 @@ impl ConstantValue {
         }
     }
 
-    /// `self` with a variant-bound value replaced by `variant`'s; every other constant as it is.
-    pub fn resolve(self, variant: TapeVariant) -> Result<Self, UnboundConstant> {
-        let unbound = UnboundConstant {
-            slot: ConstSlot(self.index),
-            ty: self.ty,
-        };
-        match self.ty {
-            ConstantType::KvCap => Ok(Self::uint(self.index, variant.cap.get())),
-            ConstantType::TqHeads => (variant.tq_heads)
-                .map(|h| Self::uint(self.index, h.get()))
-                .ok_or(unbound),
-            ConstantType::AttnSplits => Ok(Self::uint(self.index, variant.attn_splits.get())),
-            ConstantType::UInt | ConstantType::Int | ConstantType::Float | ConstantType::Bool => {
-                Ok(self)
-            }
-        }
+    /// `constants` with each variant-bound value replaced by `variant`'s and every other constant
+    /// as it is — but splits at one, which a kernel reads as its unset default: left unset, a
+    /// one-split variant's kernel is the unsplit one.
+    pub fn resolve(constants: &[Self], variant: TapeVariant) -> Result<Vec<Self>, UnboundConstant> {
+        let one = |c: &&Self| c.ty == ConstantType::AttnSplits && variant.attn_splits.get() == 1;
+        (constants.iter().filter(|c| !one(c)))
+            .map(|&c| match c.ty {
+                ConstantType::KvCap => Ok(Self::uint(c.index, variant.cap.get())),
+                ConstantType::TqHeads => (variant.tq_heads)
+                    .map(|h| Self::uint(c.index, h.get()))
+                    .ok_or(UnboundConstant {
+                        slot: ConstSlot(c.index),
+                        ty: c.ty,
+                    }),
+                ConstantType::AttnSplits => Ok(Self::uint(c.index, variant.attn_splits.get())),
+                ConstantType::UInt
+                | ConstantType::Int
+                | ConstantType::Float
+                | ConstantType::Bool => Ok(c),
+            })
+            .collect()
     }
 }

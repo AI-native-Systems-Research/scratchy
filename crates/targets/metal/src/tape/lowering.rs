@@ -7515,10 +7515,8 @@ mod tests {
                 tq_heads: Some(served_heads),
                 attn_splits: crate::tape::ids::AttnSplits(1),
             };
-            let served = (tq.constants.iter())
-                .map(|k| k.resolve(variant))
-                .collect::<Result<Vec<_>, _>>()
-                .expect("the variant binds the heads");
+            let served =
+                ConstantValue::resolve(tq.constants, variant).expect("the variant binds the heads");
             assert_eq!(served.last(), Some(&ConstantValue::uint(16, heads)));
         }
     }

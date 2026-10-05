@@ -129,9 +129,7 @@ impl SpecializedPipelines {
         if matches!(cmd.kernel, KernelId::Gemm) {
             return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
         }
-        let constants = (cmd.constants.iter())
-            .map(|c| c.resolve(self.variant))
-            .collect::<Result<Vec<_>, _>>()
+        let constants = ConstantValue::resolve(cmd.constants, self.variant)
             .map_err(PipelineLookupError::Unbound)?;
         let key = PipelineKey::new(cmd.library, cmd.function, constants);
         self.cache

@@ -146,8 +146,7 @@ pub fn bake_key(
             Err(_) => return Ok(None),
         },
         _ => {
-            let constants = cmd.constants.iter().map(|c| c.resolve(variant));
-            let constants = constants.collect::<Result<Vec<_>, _>>()?;
+            let constants = ConstantValue::resolve(cmd.constants, variant)?;
             PipelineKey::new(cmd.library, cmd.function, constants)
         }
     };
