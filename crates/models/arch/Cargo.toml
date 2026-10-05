@@ -47,6 +47,7 @@ arch-qwen2-vl = ["arch-qwen2", "vision", "dep:scratchy-vision", "dep:half", "scr
 arch-qwen3 = []
 arch-qwen3-5 = []
 arch-qwen3-5-moe = []
+arch-qwen3-5-mtp = []
 arch-qwen3-5-vl = ["arch-qwen3-5", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-qwen3-moe = []
 
@@ -81,6 +82,7 @@ all-arches = [
     "arch-qwen3",
     "arch-qwen3-5",
     "arch-qwen3-5-moe",
+    "arch-qwen3-5-mtp",
     "arch-qwen3-5-vl",
     "arch-qwen3-moe",
 ]
@@ -294,6 +296,8 @@ all-arches = [
 "qwen3.5-35b-a3b" = ["arch-qwen3-5-moe"]
 "qwen3.5-35b-a3b-parity-tiny" = ["arch-qwen3-5-moe"]
 "qwen3.6-35b-a3b" = ["arch-qwen3-5-moe"]
+# qwen3-5-mtp (1 config)
+"qwen3.6-35b-a3b-mtp" = ["arch-qwen3-5-mtp"]
 
 # qwen3-5-vl (2 configs)
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
@@ -492,6 +496,9 @@ all-arches = [
     "qwen3.5-35b-a3b-parity-tiny",
     "qwen3.6-35b-a3b",
 ]
+"qwen3-5-mtp" = [
+    "qwen3.6-35b-a3b-mtp",
+]
 "qwen3-5-vl" = [
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
@@ -638,6 +645,7 @@ all = [
     "qwen3.5-35b-a3b",
     "qwen3.5-35b-a3b-parity-tiny",
     "qwen3.6-35b-a3b",
+    "qwen3.6-35b-a3b-mtp",
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
@@ -656,6 +664,14 @@ all = [
 # edge below — to compute SCRATCHY_QUANTS, intersected per-arch against that
 # arch's own quantizations.json (an arch that doesn't declare a preset just
 # ignores it).
+
+# Speculative-decoding drafters. `mtp`: every selected model whose checkpoint
+# carries a multi-token-prediction head compiles that head too (config.rs
+# selects a head config when a selected config of another arch is the same
+# file — a head's config is its target's). Reached as `spec/mtp` from
+# scratchy-cli through scratchy-spec (crates/models/spec), which forwards
+# here: like quant scope, it needs its own crate for its own CLI alias.
+mtp = ["arch-qwen3-5-mtp"]
 
 # Backends — ONE definition each (this is what kills the per-arch duplication).
 # The build-dep pipeline lib gets the backend so its emit matches; the runtime

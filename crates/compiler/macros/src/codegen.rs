@@ -127,41 +127,63 @@ fn safetensors_prefix(
     // every text-decoder key (lm_head, model.layers.*, model.<...>).
     // Text-only and Qwen-style VL leave it `None` → byte-equivalent
     // `model.<...>` / `lm_head` keys.
-    let key = match (index, joined.as_str()) {
+    // `lm_head` is always at the safetensors top level — VL repos (Qwen3.5, Gemma3-MM, ...)
+    // don't nest it under the decoder prefix because it sits beside the `model` namespace, not
+    // inside it. Both checkpoint orderings (the official `model.language_model.*` and the
+    // mlx-community `language_model.model.*`) keep `lm_head.weight` at the root.
+    let root = decoder_root(decoder_safetensors_prefix);
+    match (index, joined.as_str()) {
         (_, "lm_head") => "lm_head".to_string(),
-        (Some(l), _) => format!("model.layers.{l}.{joined}"),
-        (None, _) => format!("model.{joined}"),
-    };
-    match decoder_safetensors_prefix {
-        None => key,
-        Some(prefix) => {
-            // Tolerate a trailing dot in the config value.
-            let prefix = prefix.trim_end_matches('.');
-            // `lm_head` is always at the safetensors top level — VL repos
-            // (Qwen3.5, Gemma3-MM, ...) don't nest it under the decoder
-            // prefix because it sits beside the `model` namespace, not
-            // inside it. Both checkpoint orderings (the official
-            // `model.language_model.*` and the mlx-community
-            // `language_model.model.*`) keep `lm_head.weight` at the root.
-            if key == "lm_head" {
-                return key;
-            }
-            match key.strip_prefix("model") {
-                // Replace-the-`model`-root form: the prefix already names
-                // the `model` root (e.g. Qwen3.5-VL `model.language_model`),
-                // so the decoder's keys sit DIRECTLY under it —
-                // `model.language_model.embed_tokens`,
-                // `model.language_model.layers.N.*`, `model.language_model.norm`
-                // — NOT nested as `<prefix>.model.<key>`. Splice the prefix
-                // in for the leading `model` segment.
-                Some(rest) if prefix.starts_with("model") => format!("{prefix}{rest}"),
-                // Namespace-wrapper form (Gemma3-MM `language_model`): the
-                // whole standard `model.<key>` / `lm_head` namespace nests
-                // under the prefix → `language_model.model.<key>`.
-                _ => format!("{prefix}.{key}"),
-            }
-        }
+        (Some(l), _) => under_root(&root, &format!("layers.{l}.{joined}")),
+        (None, _) => under_root(&root, &joined),
     }
+}
+
+/// The root of a decoder's on-disk keys for its `decoder_safetensors_prefix`: `model` by
+/// default; the prefix itself when it replaces the `model` root (Qwen3.5-VL
+/// `model.language_model` → `model.language_model.layers.N.*`); `<prefix>.model` when it wraps
+/// the whole namespace (Gemma3-MM `language_model` → `language_model.model.*`); empty — keys at
+/// the top level — for the rootless form `""` (an MLX MTP drafter's bare `fc.*`, `layers.0.*`).
+/// THE one derivation every key builder reads (loader keys, layered loader, fingerprint).
+pub(crate) fn decoder_root(decoder_safetensors_prefix: Option<&str>) -> String {
+    // Tolerate a trailing dot in the config value.
+    match decoder_safetensors_prefix.map(|p| p.trim_end_matches('.')) {
+        None => "model".to_string(),
+        Some("") => String::new(),
+        Some(prefix) if prefix.starts_with("model") => prefix.to_string(),
+        Some(prefix) => format!("{prefix}.model"),
+    }
+}
+
+/// `rest` under `root` (`<root>.<rest>`), or `rest` itself for the empty (top-level) root.
+pub(crate) fn under_root(root: &str, rest: &str) -> String {
+    match root {
+        "" => rest.to_string(),
+        root => format!("{root}.{rest}"),
+    }
+}
+
+/// The on-disk prefix `model` loads the lent weight `w` from: what a multi-token-prediction head
+/// borrows from its target is found under the target's prefix and placed under the head's.
+/// A tied lm_head loads from the embedding table. `None` when the program has no such weight.
+pub(crate) fn lent_weight_prefix(
+    program: &Program,
+    model: &crate::config::ModelParams,
+    w: scratchy_forward_compiler::LentWeight,
+) -> Option<String> {
+    use scratchy_forward_compiler::LentWeight;
+    let name = match w {
+        LentWeight::LmHead if !model.tie_word_embeddings => "lm_head",
+        LentWeight::EmbedTokens | LentWeight::LmHead => "embed_tokens",
+    };
+    let id = program.weights.find(&[name])?;
+    Some(safetensors_prefix(
+        program,
+        model.arch.decoder_prefix.as_deref(),
+        model.arch.safetensors.as_ref(),
+        id,
+        None,
+    ))
 }
 
 /// Translate trailing `_<digits>` in a DSL path segment back to
@@ -2169,6 +2191,14 @@ fn emit_fingerprint_check(
         .bounds
         .get("vocab_size")
         .unwrap_or_else(|| panic!("model `{}` missing `vocab_size`", model.source_stem));
+    // The embedding table's rows: `vocab_size`, unless the model declares a wider table than its
+    // logits (`embed_vocab_size`: a draft head that drafts over a prefix of its target's
+    // vocabulary embeds every token).
+    let embed_rows = model
+        .bounds
+        .get("embed_vocab_size")
+        .copied()
+        .unwrap_or(vocab_size);
 
     // Pick the on-disk tensor suffix per compiled variant's
     // `quantization_config`. AutoGPTQ + AWQ both ship `.qweight`;
@@ -2210,27 +2240,10 @@ fn emit_fingerprint_check(
     };
 
     let last_layer = num_hidden_layers.saturating_sub(1);
-    // Per-arch decoder root for fingerprint-tensor names. MUST agree
-    // with [`safetensors_prefix`]'s prefix handling (replace-vs-prepend)
-    // — the fingerprint looks up `{dec_root}.embed_tokens.weight` /
-    // `{dec_root}.layers.N.q_proj.weight`, and if that name doesn't
-    // match what the loader actually reads, every variant rejects and
-    // `try_load` returns `Ok(None)` → `ArchNotSupported`.
-    let dec_root: String = match model.arch.decoder_prefix.as_deref() {
-        None => "model".to_string(),
-        Some(prefix) => {
-            let prefix = prefix.trim_end_matches('.');
-            if prefix.starts_with("model") {
-                // Replace-the-`model`-root form (Qwen3.5-VL
-                // `model.language_model`): decoder root IS the prefix.
-                prefix.to_string()
-            } else {
-                // Namespace-wrapper form (Gemma3-MM `language_model`):
-                // `language_model.model`.
-                format!("{prefix}.model")
-            }
-        }
-    };
+    // Fingerprint-tensor names under the decoder root the loader reads ([`decoder_root`]): a
+    // name the loader does not read makes every variant reject, and `try_load` returns
+    // `Ok(None)` → `ArchNotSupported`.
+    let dec_root = decoder_root(model.arch.decoder_prefix.as_deref());
     // Pick a layered tensor that ACTUALLY EXISTS ON DISK to use as the
     // fingerprint sniff. Packed parents come first (Phi-3 ships
     // `self_attn.qkv_proj.weight` on disk; ModernBERT ships
@@ -2262,7 +2275,10 @@ fn emit_fingerprint_check(
         "self_attn.q_proj".to_string()
     };
     let fp_leaf: &str = fp_leaf_owned.as_str();
-    let last_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.{suffix}");
+    let last_tensor = under_root(
+        &dec_root,
+        &format!("layers.{last_layer}.{fp_leaf}.{suffix}"),
+    );
     // MLX-affine `.scales` sibling of `last_tensor`. The affine group-size
     // gate must probe a layer that ACTUALLY HAS `fp_leaf` (= `self_attn.q_proj`).
     // It MUST NOT hardcode `layers.0`: hybrid arches (Qwen3.5 Gated-DeltaNet,
@@ -2271,9 +2287,13 @@ fn emit_fingerprint_check(
     // reject every variant → `ArchNotSupported`. `last_layer` is the same layer
     // the present-check (`last_tensor`) already requires, so its `.scales`
     // sibling is guaranteed present for the affine checkpoint.
-    let last_scales_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.scales");
-    let one_past_tensor = format!("{dec_root}.layers.{num_hidden_layers}.{fp_leaf}.{suffix}");
-    let opposite_tensor = format!("{dec_root}.layers.0.{fp_leaf}.{opposite_suffix}");
+    let last_scales_tensor =
+        under_root(&dec_root, &format!("layers.{last_layer}.{fp_leaf}.scales"));
+    let one_past_tensor = under_root(
+        &dec_root,
+        &format!("layers.{num_hidden_layers}.{fp_leaf}.{suffix}"),
+    );
+    let opposite_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.{opposite_suffix}"));
     // BNB4 checkpoints ship the U8-packed nibbles at `.weight`
     // (same suffix as dense bf16 weights) with a sibling
     // `.weight.absmax` that's unique to bitsandbytes. Dense + AWQ
@@ -2284,7 +2304,7 @@ fn emit_fingerprint_check(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Bnb4 { .. })
     );
-    let bnb4_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight.absmax");
+    let bnb4_marker_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.weight.absmax"));
     let bnb4_marker_tensor = bnb4_marker_tensor.as_str();
     // FP8 checkpoints ship `.weight` (FP8E4M3 bytes — same suffix
     // as dense bf16) alongside a sibling `.weight_scale`. Dense /
@@ -2309,7 +2329,7 @@ fn emit_fingerprint_check(
                 ..
             })
     );
-    let fp8_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
+    let fp8_marker_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.weight_scale"));
     let fp8_marker_tensor = fp8_marker_tensor.as_str();
     // MLX-affine marker exclusion. `mlx_lm.convert` ships every
     // quantized linear as a `.{weight,scales,biases}` triple. The
@@ -2329,7 +2349,7 @@ fn emit_fingerprint_check(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Affine { .. })
     );
-    let mlx_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.scales");
+    let mlx_marker_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.scales"));
     let mlx_marker_tensor = mlx_marker_tensor.as_str();
 
     // Each marker exclusion is a compile-time bool, so fold it in HERE rather
@@ -2363,9 +2383,9 @@ fn emit_fingerprint_check(
     // `fingerprint_matches` runs), so their vocab literal stays whole.
     let vocab_for_fp = match model.quantization.as_ref().map(|qc| &qc.method) {
         Some(crate::quantization::QuantMethod::Ggml) if tp_world_size > 1 => {
-            vocab_size / (tp_world_size as u64)
+            embed_rows / (tp_world_size as u64)
         }
-        _ => vocab_size,
+        _ => embed_rows,
     };
     let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_for_fp as usize);
 
@@ -2683,7 +2703,7 @@ fn emit_fingerprint_check(
             layout: crate::quantization::GptqLayout::Qweight,
             ..
         }) => {
-            let g_idx_tensor_owned = format!("{dec_root}.layers.0.self_attn.q_proj.g_idx");
+            let g_idx_tensor_owned = under_root(&dec_root, "layers.0.self_attn.q_proj.g_idx");
             let g_idx_tensor = g_idx_tensor_owned.as_str();
             if *desc_act {
                 quote! {
@@ -2721,7 +2741,7 @@ fn emit_fingerprint_check(
                 block_size: None,
             }) => {
                 let input_scale_tensor_owned =
-                    format!("{dec_root}.layers.0.self_attn.q_proj.input_scale");
+                    under_root(&dec_root, "layers.0.self_attn.q_proj.input_scale");
                 let input_scale_tensor = input_scale_tensor_owned.as_str();
                 quote! {
                     if !gw.contains(#input_scale_tensor) {
@@ -2734,7 +2754,7 @@ fn emit_fingerprint_check(
                 block_size: None,
             }) => {
                 let input_scale_tensor_owned =
-                    format!("{dec_root}.layers.0.self_attn.q_proj.input_scale");
+                    under_root(&dec_root, "layers.0.self_attn.q_proj.input_scale");
                 let input_scale_tensor = input_scale_tensor_owned.as_str();
                 quote! {
                     if gw.contains(#input_scale_tensor) {
@@ -2765,8 +2785,8 @@ fn emit_fingerprint_check(
             // MLA archs ship `q_a_proj` instead of `q_proj` — match
             // the leaf the fingerprint already chose above so V3 / K2
             // FP8-block fixtures aren't silently rejected.
-            let inv_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale_inv");
-            let scale_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.weight_scale_inv"));
+            let scale_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.weight_scale"));
             let inv_tensor = inv_tensor.as_str();
             let scale_tensor = scale_tensor.as_str();
             quote! {
@@ -2787,8 +2807,8 @@ fn emit_fingerprint_check(
         Some(crate::quantization::QuantMethod::Fp8 {
             block_size: None, ..
         }) => {
-            let inv_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale_inv");
-            let scale_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.weight_scale_inv"));
+            let scale_tensor = under_root(&dec_root, &format!("layers.0.{fp_leaf}.weight_scale"));
             let inv_tensor = inv_tensor.as_str();
             let scale_tensor = scale_tensor.as_str();
             quote! {
@@ -2810,7 +2830,7 @@ fn emit_fingerprint_check(
     // The embedding tensor's on-disk path varies per arch — llama uses
     // `model.embed_tokens.weight`, ModernBERT uses
     // `model.embeddings.tok_embeddings.weight`. The manifest entry whose
-    // shape is `[vocab_size, hidden_size]` is the embedding table; use
+    // shape is `[vocab_size | embed_vocab_size, hidden_size]` is the embedding table; use
     // its key (with `model.` prefix + `.weight` suffix) as the
     // fingerprint sniff. Fall back to the llama-style path when no
     // entry matches, preserving the previous behavior for any arch
@@ -2820,11 +2840,12 @@ fn emit_fingerprint_check(
         .iter()
         .find(|(_, shape)| {
             shape.len() == 2
-                && matches!(&shape[0], crate::shape::Dim::Bound(s) if s == "vocab_size")
+                && matches!(&shape[0], crate::shape::Dim::Bound(s)
+                    if s == "vocab_size" || s == "embed_vocab_size")
                 && matches!(&shape[1], crate::shape::Dim::Bound(s) if s == "hidden_size")
         })
-        .map(|(k, _)| format!("{dec_root}.{k}.weight"))
-        .unwrap_or_else(|| format!("{dec_root}.embed_tokens.weight"));
+        .map(|(k, _)| under_root(&dec_root, &format!("{k}.weight")))
+        .unwrap_or_else(|| under_root(&dec_root, "embed_tokens.weight"));
     let embed_path_lit = proc_macro2::Literal::string(embed_path.as_str());
 
     // Hidden-size shape gate for the embedding fingerprint sniff.
@@ -3250,15 +3271,11 @@ fn emit_weights_struct(
     let affine_rows = compress_affine_rows(plans.iter().flat_map(affine_tensors_of).collect());
     let fingerprint_rows =
         effective_fingerprint_rows(&mode, &affine_rows, canonical_affine_rows).to_vec();
-    // Per-arch decoder root for embed_tokens probes etc. `model` for
-    // text-only and Qwen-style VL, `<prefix>.model` for arches whose
-    // variant config sets `decoder_safetensors_prefix` (Gemma3-MM nests
-    // text decoder weights under `language_model.<...>`).
-    let dec_root_for_emit: String = match model.arch.decoder_prefix.as_deref() {
-        Some(prefix) => format!("{prefix}.model"),
-        None => "model".to_string(),
-    };
-    let embed_tokens_weight_path: String = format!("{dec_root_for_emit}.embed_tokens.weight");
+    // The embed_tokens probe, under the decoder root the loader reads ([`decoder_root`]).
+    let embed_tokens_weight_path = under_root(
+        &decoder_root(model.arch.decoder_prefix.as_deref()),
+        "embed_tokens.weight",
+    );
     let any_marlin = plans
         .iter()
         .any(|p| matches!(p, FieldLoad::MarlinLinear { .. }));
@@ -5636,26 +5653,12 @@ fn emit_group_let(
             } else {
                 None
             };
-            // Decoder-side layered root: `model.layers` (text-only) or a
-            // `decoder_safetensors_prefix`-derived root. MUST agree with
-            // [`safetensors_prefix`]'s prefix handling (replace-vs-prepend),
-            // or the L=0 key the loader looks up won't match this root and
-            // the `layered_suffix` invariant fires.
-            let decoder_root_owned: String = match model.arch.decoder_prefix.as_deref() {
-                None => "model.layers".to_string(),
-                Some(prefix) => {
-                    let prefix = prefix.trim_end_matches('.');
-                    if prefix.starts_with("model") {
-                        // Replace-the-`model`-root form (Qwen3.5-VL
-                        // `model.language_model`): `model.language_model.layers`.
-                        format!("{prefix}.layers")
-                    } else {
-                        // Namespace-wrapper form (Gemma3-MM `language_model`):
-                        // `language_model.model.layers`.
-                        format!("{prefix}.model.layers")
-                    }
-                }
-            };
+            // Decoder-side layered root, under the decoder root the loader reads
+            // ([`decoder_root`]), so the L=0 key the loader looks up matches it.
+            let decoder_root_owned = under_root(
+                &decoder_root(model.arch.decoder_prefix.as_deref()),
+                "layers",
+            );
             let call = emit_layered_load_body(
                 plan,
                 n_layers,
@@ -7143,10 +7146,12 @@ struct CanonicalLowered {
 /// - `OpKind::MmEmbedSplice` — `tp_lowering::insert_mm_splices`
 ///   pushes one per image-bearing batch; semantically adjacent to
 ///   the Embed, lives at array tail for `push`-based insertion.
-/// - `OpKind::LoadPixels` — `vision_lowering::materialize_pixels`
-///   pushes one to materialize the `pixels` extern as a tile;
-///   semantically the FIRST op (everything reads from it), but
-///   lives at array tail for the same `push`-based reason.
+/// - `OpKind::LoadRows` — `rows_lowering::materialize_rows`
+///   pushes one per row extern the body reads (`pixels`, `pos_embeds`,
+///   `target_hidden`) to materialize it as a tile; semantically the FIRST
+///   ops (everything reads from them), but they live at array tail for
+///   the same `push`-based reason. Mistaking one for the terminal would
+///   return its tile instead of the body's output.
 ///
 /// The "last node" for backbone-output / terminal-subgraph
 /// identification must be the body's actual terminal — the lm_head
@@ -7156,14 +7161,7 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
     fuf.nodes.iter().rev().find(|n| {
         !matches!(
             n.op,
-            crate::classified::OpKind::MmEmbedSplice
-                | crate::classified::OpKind::LoadPixels
-                // `materialize_pos_embeds` appends LoadPosEmbeds at the
-                // FUF tail (after LoadPixels), so it must be skipped too
-                // — otherwise it would be mistaken for the encoder's
-                // terminal and the forward would return the pos_embeds
-                // tile instead of the merger output.
-                | crate::classified::OpKind::LoadPosEmbeds
+            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadRows(_)
         )
     })
 }
@@ -7192,8 +7190,8 @@ enum BackboneLayout {
 /// Classify the FUF's terminal as decoder vs encoder. A decoder
 /// terminal is `gemm(<tile>, <lm_head_weight>)`, optionally followed
 /// by an `AllGather` (inserted by tp>1 lowering on the vocab-parallel
-/// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadPixels` /
-/// `LoadPosEmbeds` nodes via [`last_non_splice_node`] — those are
+/// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadRows`
+/// nodes via [`last_non_splice_node`] — those are
 /// appended by lowering passes but aren't the body's actual terminal.
 /// The model's `METAL_OFF_TAPE` static: its argmax, grammar mask and sampler kernels baked for its
 /// logits `width` and `dtype` (`scratchy_target_metal::off_tape`).
@@ -8071,6 +8069,29 @@ fn emit_canonical_params_impl(
     }
 }
 
+/// The layers of a Gated-DeltaNet hybrid that its GDN blocks occupy (`true`: linear attention,
+/// no KV cache); `None` for a model with none.
+fn gdn_linear_layers(fuf: &Fuf, model: &ModelParams) -> Option<Vec<bool>> {
+    let num_hidden_layers = *model.bounds.get("num_hidden_layers")? as usize;
+    let mut linear = vec![false; num_hidden_layers];
+    let gdn = fuf
+        .nodes
+        .iter()
+        .filter(|node| node.op == OpKind::GatedDeltaNet);
+    let mut is_hybrid = false;
+    for node in gdn {
+        is_hybrid = true;
+        for inp in &node.inputs {
+            if let FufInput::Weight { index: Some(l), .. } = inp
+                && let Some(slot) = linear.get_mut(l.0 as usize)
+            {
+                *slot = true;
+            }
+        }
+    }
+    is_hybrid.then_some(linear)
+}
+
 /// Emit a per-variant arm body — the `GdnRuntimeConfig` literal for one
 /// specialization. Returns `None` if the variant has no
 /// `OpKind::GatedDeltaNet` (non-hybrid) — caller emits a `None` arm.
@@ -8078,29 +8099,7 @@ pub fn emit_gdn_runtime_config_arm_body(
     fuf: &Fuf,
     model: &ModelParams,
 ) -> Option<proc_macro2::TokenStream> {
-    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
-        Some(&n) => n as usize,
-        None => return None,
-    };
-    let mut linear = vec![false; num_hidden_layers];
-    let mut is_hybrid = false;
-    for node in &fuf.nodes {
-        if node.op != OpKind::GatedDeltaNet {
-            continue;
-        }
-        is_hybrid = true;
-        for inp in &node.inputs {
-            if let FufInput::Weight { index: Some(l), .. } = inp {
-                let l = l.0 as usize;
-                if l < num_hidden_layers {
-                    linear[l] = true;
-                }
-            }
-        }
-    }
-    if !is_hybrid {
-        return None;
-    }
+    let linear = gdn_linear_layers(fuf, model)?;
     let conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as u32;
     let conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
     let num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
@@ -12264,7 +12263,7 @@ pub fn emit_model(
         let lowered = mc3::lower_canonical(&l, &facts, mc, at, &mut metal_sources)
             .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
         *ns_field = lowered.colours.get();
-        *bb_slot_field = lowered.result.index();
+        *bb_slot_field = lowered.hidden.0;
         *term_field = lowered.result.index();
         // Arena sizing evaluates a FUF shape per colour, so colour 0 (the embedded hidden) is
         // keyed by the FUF Embed tile.
@@ -12524,10 +12523,12 @@ pub fn emit_model(
         let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
         let bb_barriers_static = bucket_static_ident("BACKBONE_BARRIERS_M", canonical);
         let lh_barriers_static = bucket_static_ident("LM_HEAD_BARRIERS_M", canonical);
-        let (_, num_slots_b, _, terminal_slot_b, slots_b) = &canonical_lowered[&canonical];
+        let (_, num_slots_b, backbone_slot_b, terminal_slot_b, slots_b) =
+            &canonical_lowered[&canonical];
         let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
         let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
+        let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_b);
 
         // Per-tape_index arena_bytes: register-coloring tells us which
         // (tile, output_slot) pairs share an arena slot; for THIS
@@ -12643,6 +12644,7 @@ pub fn emit_model(
                 bucket_m: #bucket_m_lit,
                 num_arena_slots: #num_slots_lit,
                 terminal_slot: #terminal_slot_lit,
+                backbone_slot: #backbone_slot_lit,
                 arena_bytes: #arena_static_ident,
                 backbone: #bb_static,
                 lm_head: #lm_static,
@@ -12674,6 +12676,7 @@ pub fn emit_model(
         vision_freqs_bytes_lit,
         vision_pixels_bytes_lit,
         vision_posemb_bytes_lit,
+        target_hidden_bytes_lit,
         mm_embeds_bytes_lit,
         mm_dst_rows_bytes_lit,
         mrope_cos_sin_bytes_lit,
@@ -12688,6 +12691,17 @@ pub fn emit_model(
         // pos_embeds: model-dtype (bf16) `[num_tokens, vision_embed_dim]`,
         // host-interpolated and added to the patch-embed output.
         let posemb_bytes = max_m * vis_embed_dim * 2;
+        // target_hidden (MTP heads): model-dtype `[num_tokens, hidden]`, the target's final
+        // hidden rows. Zero unless the body reads the extern.
+        let reads_target_hidden = fuf.nodes.iter().any(|n| {
+            n.op == crate::classified::OpKind::LoadRows(
+                scratchy_forward_compiler::RowsExtern::TargetHidden,
+            )
+        });
+        let target_hidden_bytes = match reads_target_hidden {
+            true => max_m * hidden_size * 2,
+            false => 0,
+        };
         // mm splice (text decoder): mm_embeds = bf16 `[max_m, hidden]`;
         // mm_dst_rows = u32 `[max_m]`. Zero on non-MM arches.
         let mm_embeds_bytes = max_m * hidden_size * 2;
@@ -12715,6 +12729,7 @@ pub fn emit_model(
             proc_macro2::Literal::u64_unsuffixed(freqs_bytes),
             proc_macro2::Literal::u64_unsuffixed(pixels_bytes),
             proc_macro2::Literal::u64_unsuffixed(posemb_bytes),
+            proc_macro2::Literal::u64_unsuffixed(target_hidden_bytes),
             proc_macro2::Literal::u64_unsuffixed(mm_embeds_bytes),
             proc_macro2::Literal::u64_unsuffixed(mm_dst_rows_bytes),
             proc_macro2::Literal::u64_unsuffixed(mrope_cos_sin_bytes),
@@ -12862,6 +12877,8 @@ pub fn emit_model(
         metal_arena_bytes_statics.push(metal_tq_codebook_tokens(mc.kv_codec, mc.global_head_dim));
         metal_arena_bytes_statics.push(metal_off_tape_tokens(logits_width, mc));
     }
+    // Its Gated-DeltaNet layers, which hold no KV (empty for a model with none).
+    let linear_layer_bits = gdn_linear_layers(fuf, model).unwrap_or_default();
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
 
@@ -12918,6 +12935,11 @@ pub fn emit_model(
         /// arches and on towers without a learned positional embedding.
         #[cfg(feature = "metal")]
         pub const METAL_VISION_POSEMB_BYTES: u64 = #vision_posemb_bytes_lit;
+
+        /// Byte size of the `target_hidden` runtime buffer (model dtype
+        /// `[max_bucket_m, hidden]`). 0 on every arch but an MTP head.
+        #[cfg(feature = "metal")]
+        pub const METAL_TARGET_HIDDEN_BYTES: u64 = #target_hidden_bytes_lit;
 
         /// Byte size of the `mm_embeds` splice buffer (bf16
         /// `[max_bucket_m, hidden]`) and the `mm_dst_rows` buffer (u32
@@ -13008,6 +13030,7 @@ pub fn emit_model(
                 None,
                 block_cap,
                 addressing,
+                ::core::default::Default::default(),
             )
         }
 
@@ -13099,11 +13122,14 @@ pub fn emit_model(
                 // full-context group (see `compute_hybrid_kv_layout`); uniform →
                 // all-zero map → all-true.
                 let __tq_nb = ctx.kv_cache.num_blocks;
+                // A Gated-DeltaNet layer holds no KV: it gets the placeholder store.
+                const __LINEAR_LAYERS: &[bool] = &[#(#linear_layer_bits),*];
                 let __tq_is_global: ::std::vec::Vec<bool> = ctx
                     .kv_cache
                     .layer_to_group_u32()
                     .iter()
-                    .map(|&g| g == 0)
+                    .enumerate()
+                    .map(|(l, &g)| g == 0 && !__LINEAR_LAYERS.get(l).copied().unwrap_or(false))
                     .collect();
                 let factory: ::scratchy_target_metal::interpreter::metal::RuntimeFactory =
                     ::scratchy_target_metal::interpreter::metal::RuntimeFactory::new(move |dev| {
@@ -13232,6 +13258,7 @@ pub fn emit_model(
                             vision_rope_freqs: alloc(METAL_VISION_FREQS_BYTES),
                             pixels: alloc(METAL_VISION_PIXELS_BYTES),
                             vision_pos_embeds: alloc(METAL_VISION_POSEMB_BYTES),
+                            target_hidden: alloc(METAL_TARGET_HIDDEN_BYTES),
                             mm_embeds: alloc(METAL_MM_EMBEDS_BYTES),
                             mm_dst_rows: alloc(METAL_MM_DST_ROWS_BYTES),
                             mrope_cos_sin: alloc(METAL_MROPE_COS_SIN_BYTES),
@@ -13271,6 +13298,9 @@ pub fn emit_model(
                     // pool: it picks the KV cap rung.
                     ctx.kv_cache.max_blocks_per_seq,
                     device.kv_addressing,
+                    // The buffers of a model whose forwards never overlap this one's, which the
+                    // worker places its own in (an MTP head, its target's).
+                    device.lent.clone(),
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
             })
@@ -13447,6 +13477,12 @@ pub fn emit_model(
                     tv.as_raw().size_bytes(),
                 )
             });
+            let target_hidden = ctx.target_hidden.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
             // Qwen2.5-VL windowed-attention externs (i32/u32 byte
             // views; `None` on non-windowed towers and text bodies).
             let vision_cu_seqlens_full = ctx.vision_cu_seqlens_full.map(|tv| {
@@ -13540,6 +13576,7 @@ pub fn emit_model(
                 vision_rope_freqs,
                 pixels,
                 pos_embeds,
+                target_hidden,
                 vision_cu_seqlens_full,
                 vision_cu_seqlens_window,
                 vision_window_index,
@@ -13593,6 +13630,27 @@ pub fn emit_model(
                 &inputs,
                 |worker, bucket_idx| {
                     let spec = &METAL_BUCKETS[bucket_idx];
+                    use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
+                    // The caller's rows of the final hidden states (an MTP head's next input),
+                    // before the worker goes back to the pool and its arena is reused.
+                    if let Some(h) = ctx.hidden_out {
+                        let row_bytes =
+                            <Weights as ::scratchy_forward_compiler::CanonicalParams>::HIDDEN_SIZE * 2;
+                        let hidden = worker.arena[spec.backbone_slot as usize].contents();
+                        let mut out = h.out.borrow_mut();
+                        out.clear();
+                        for &row in h.rows {
+                            assert!((row as usize) < n, "hidden row {row} past the forward's {n} rows");
+                            // SAFETY: the backbone slot holds `[n, HIDDEN_SIZE]` 2-byte rows (the
+                            // bucket's arena is sized for at least `n`), and `row < n`.
+                            out.extend_from_slice(unsafe {
+                                ::std::slice::from_raw_parts(
+                                    (hidden.as_ptr() as *const u8).add(row as usize * row_bytes),
+                                    row_bytes,
+                                )
+                            });
+                        }
+                    }
                     let buf = worker.arena[spec.terminal_slot as usize].clone();
                     let vocab = METAL_VOCAB_SIZE as usize;
                     let shape = [n, vocab];
@@ -13605,7 +13663,6 @@ pub fn emit_model(
                         ::scratchy_target_metal::interpreter::metal::MetalDtype::Int4 =>
                             ::core::unreachable!("Int4 has no logits dtype"),
                     };
-                    use ::scratchy_target_metal::interpreter::metal::__re::MTLBuffer as _;
                     let inner = crate::__gpu::tensor::GpuTensor::new(
                         buf.contents().as_ptr() as *mut u8,
                         &shape,
@@ -13767,6 +13824,12 @@ pub fn emit_model(
                     tv.as_raw().size_bytes(),
                 )
             });
+            let target_hidden = ctx.target_hidden.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
             // Qwen2.5-VL windowed-attention externs (i32/u32 byte
             // views; `None` on non-windowed towers and text bodies).
             let vision_cu_seqlens_full = ctx.vision_cu_seqlens_full.map(|tv| {
@@ -13860,6 +13923,7 @@ pub fn emit_model(
                 vision_rope_freqs,
                 pixels,
                 pos_embeds,
+                target_hidden,
                 vision_cu_seqlens_full,
                 vision_cu_seqlens_window,
                 vision_window_index,
@@ -14231,6 +14295,8 @@ mod tests {
             quantization: None,
             tie_word_embeddings: false,
             architectures: Vec::new(),
+            drafts_for: Vec::new(),
+            drafter_repo_infix: None,
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,

@@ -1785,3 +1785,207 @@ fn per_row_nax_reads_roped_keys() {
         PerRow::Nax,
     );
 }
+
+// ── verify rows ────────────────────────────────────────────────────────
+
+/// A few-row step's queries — a speculative verify step's last token and drafts — through the
+/// decode kernel, one query row per token (`ATTN_ROW_QUERIES`, `cu_seqlens_q` at buffer 23): each
+/// row's output is, bit for bit, the one decoding it alone gives, a step of one row per sequence
+/// with that row's keys (its sequence's up to its own position) and slot. On TurboQuant every key
+/// but a row's own comes from the packed store, so the store holds every key here — the step's
+/// earlier rows' too, as the step's quantize leaves it; on an fp16 cache every key is in the cache.
+#[test]
+fn verify_rows_attend_as_each_would_decoding() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping verify rows: no Metal 4 GPU");
+        return;
+    };
+    let device = di.device.clone();
+    let c = Case {
+        seqs: vec![(1000, 4), (300, 3)],
+        ..llama_3b("verify rows llama-3b bf16")
+    };
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders");
+    let compress: [PipelineKey; 2] = [false, true].map(|_| {
+        let (rot_dim, pair_off) = c.rope.map_or((0, 0), |r| (r.rot_dim, r.pair_off));
+        let constants = TqCompressConstants {
+            head_dim: HeadDim(c.head_dim as u32),
+            bits: TqCodeBits(c.bits),
+            num_kv_heads: NumKvHeads(c.num_kv_heads as u32),
+            block_size: BlockSize(c.block_size as u32),
+            blocks_per_chunk: BlocksPerChunk(c.blocks_per_chunk as u32),
+            writeback: TqWriteback::Raw,
+            offset: TqOffset::None,
+            rot_dim: RotDim(rot_dim as u32),
+            pair_off: RopePairOff(pair_off as u32),
+        };
+        PipelineKey::new("turboquant", c.dtype.compress(), constants.into())
+    });
+    cache.register_baked(&baked_kernels(&compress));
+    let pso = |consts: Vec<ConstantValue>| {
+        let name = format!("attention_via_cache_v2_{}_specialized", c.dtype.tag());
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        baked_build(&cache, &PipelineKey::new("attention", name, consts)).expect("pipeline")
+    };
+    let f = &Fixture::new(&c);
+    let (hd, nkv) = (c.head_dim, c.num_kv_heads);
+    let n_q = *f.cu_seqlens.last().unwrap() as usize;
+    let quant = PolarQuantizer::new(hd, c.bits, SEED);
+    let boundaries: Vec<f32> = (quant.centroids().windows(2))
+        .map(|w| (w[0] + w[1]) / 2.0)
+        .collect();
+    let n_slots = f.n_blocks * c.block_size;
+    let pdim = packed_dim(hd, c.bits);
+    let (signs, centroids, bounds) = (
+        shared(&device, quant.signs()),
+        shared(&device, quant.centroids()),
+        shared(&device, &boundaries),
+    );
+    let cos_sin = shared(&device, &f.cos_sin);
+    let q = shared(
+        &device,
+        &f.q.iter().map(|&x| c.dtype.bits(x)).collect::<Vec<_>>(),
+    );
+    // Every key quantized, the step's too.
+    let (slots, pos): (Vec<u32>, Vec<u32>) = (0..c.seqs.len())
+        .flat_map(|s| {
+            (0..c.seqs[s].0).map(move |t| {
+                let span = if f.span(s, t) { SPAN_BIT } else { 0 };
+                (f.slot[s][t] as u32 | span, t as u32)
+            })
+        })
+        .unzip();
+    let (slots_buf, pos_buf) = (shared(&device, &slots), shared(&device, &pos));
+    let codes = || shared(&device, &vec![0u32; n_slots * nkv * pdim]);
+    let (packed_k, packed_v) = (codes(), codes());
+    let norms = || shared(&device, &vec![0f32; n_slots * nkv]);
+    let (norms_k, norms_v) = (norms(), norms());
+    let no_bias = shared(&device, &vec![0u16; nkv * hd]);
+    let all = |_: usize, _: usize| true;
+    let (src_k, src_v) = (f.pool(&device, &f.k, 0, all), f.pool(&device, &f.v, 0, all));
+    let mut batch = Mtl4DispatchBatch::begin(&device).expect("batch");
+    for (src, packed, nrm, key) in [
+        (&src_k, &packed_k, &norms_k, &compress[0]),
+        (&src_v, &packed_v, &norms_v, &compress[1]),
+    ] {
+        batch.encode(
+            &baked_build(&cache, key).expect("tq_compress_paged"),
+            &[
+                (&src.table, 0),
+                (&slots_buf, 1),
+                (&signs, 2),
+                (&bounds, 3),
+                (&centroids, 4),
+                (packed, 5),
+                (nrm, 6),
+                (&slots_buf, 16),
+                (&no_bias, 18),
+                (&cos_sin, 19),
+                (&pos_buf, 20),
+            ],
+            &[],
+            &[],
+            &[&src.data],
+            tg(slots.len(), nkv, 1),
+            tg(hd, 1, 1),
+        );
+    }
+    batch.commit(true);
+
+    // Each row alone: its sequence's block-table row, its keys, its slot.
+    let row_seq: Vec<usize> = (0..c.seqs.len())
+        .flat_map(|s| std::iter::repeat_n(s, c.seqs[s].1))
+        .collect();
+    let row_keys: Vec<u32> = (0..c.seqs.len())
+        .flat_map(|s| (f.prefix(s)..c.seqs[s].0).map(|t| t as u32 + 1))
+        .collect();
+    let alone_table: Vec<u32> = (row_seq.iter())
+        .flat_map(|&s| f.block_table[s * f.max_blocks..][..f.max_blocks].to_vec())
+        .collect();
+    let seq_keys: Vec<u32> = c.seqs.iter().map(|&(l, _)| l as u32).collect();
+    let (seq_used, alone_used) = (shared(&device, &seq_keys), shared(&device, &row_keys));
+    let (block_table, alone_table) = (
+        shared(&device, &f.block_table),
+        shared(&device, &alone_table),
+    );
+    let cu_seqlens = shared(&device, &f.cu_seqlens);
+    let slot_mapping = shared(&device, &f.slot_mapping());
+    let heads = c.decode_heads;
+    for coded in [true, false] {
+        // TurboQuant reads a row's own key from the cache its writer filled (NaN elsewhere); an
+        // fp16 cache holds every key.
+        let nan = c.dtype.bits(f32::NAN);
+        let written = |s: usize, t: usize| !coded || f.written(s, t);
+        let scratch_k = f.pool(&device, &f.k, nan, written);
+        let scratch_v = f.pool(&device, &f.v, nan, written);
+        let run = |per_token: bool| -> Vec<u16> {
+            let mut consts = Vec::new();
+            if coded {
+                consts.extend([
+                    ConstantValue::uint(13, c.bits),
+                    ConstantValue::uint(16, heads),
+                ]);
+            }
+            if c.rope.is_some_and(|r| r.coresident) {
+                consts.push(ConstantValue::uint(12, 1));
+            }
+            if per_token {
+                consts.push(ConstantValue::uint(22, 1));
+            }
+            let (used, table) = match per_token {
+                true => (&seq_used, &block_table),
+                false => (&alone_used, &alone_table),
+            };
+            let out = shared(&device, &vec![0u16; n_q * c.num_q_heads * hd]);
+            let mut binds = vec![
+                (&out, 0),
+                (&q, 1),
+                (used, 2),
+                (table, 3),
+                (&scratch_k.table, 4),
+                (&scratch_v.table, 5),
+                (&cos_sin, 6),
+            ];
+            if coded {
+                binds.extend([
+                    (&packed_k, 7),
+                    (&packed_v, 8),
+                    (&norms_k, 9),
+                    (&norms_v, 10),
+                    (&signs, 11),
+                    (&centroids, 12),
+                    (&slot_mapping, 13),
+                ]);
+            }
+            if per_token {
+                binds.push((&cu_seqlens, 23));
+            }
+            let groups = match coded {
+                true => c.num_q_heads / heads as usize,
+                false => c.num_q_heads,
+            };
+            let mut batch = Mtl4DispatchBatch::begin(&device).expect("batch");
+            batch.encode(
+                &pso(f.attn_constants(&consts)),
+                &binds,
+                &[],
+                &[],
+                &[&scratch_k.data, &scratch_v.data],
+                tg(n_q, groups, 1),
+                tg(1024, 1, 1),
+            );
+            batch.commit(true);
+            read::<u16>(&out, n_q * c.num_q_heads * hd)
+        };
+        let (rows, alone) = (run(true), run(false));
+        let what = if coded { "TurboQuant" } else { "fp16" };
+        assert!(
+            rows.iter().all(|&b| c.dtype.value(b).is_finite()),
+            "{what}: a row read a key it does not see"
+        );
+        assert_eq!(
+            rows, alone,
+            "{what}: per-token rows differ from each row decoded alone"
+        );
+    }
+}

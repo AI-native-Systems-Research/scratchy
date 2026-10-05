@@ -55,6 +55,13 @@ pub struct DeclaredArchSpec {
     /// `scale_dtype` drift key.
     pub scale_dtype: Option<String>,
     pub decoder_prefix: Option<String>,
+    /// The identity the arch registers under, replacing its config's `architectures`: an arch
+    /// that is one part of another model's checkpoint (a multi-token-prediction head ships inside
+    /// its target's, whose config names the target) declares its own. Empty: the config's.
+    pub hf_architectures: Vec<String>,
+    /// How a head published apart from its target names its repo: the target's repo id with this
+    /// inserted before its last `-`-delimited token (MLX: `org/X-4bit` → `org/X-MTP-4bit`).
+    pub drafter_repo_infix: Option<String>,
     pub tie_default: Option<bool>,
     pub bound_defaults: Vec<(String, u64)>,
     /// Float-valued analogue of `bound_defaults` for arch-constant
@@ -77,6 +84,10 @@ pub struct DeclaredArchSpec {
 pub struct ParamField {
     pub name: String,
     pub source: ParamSource,
+    /// Overwrite the harvested bound of the same name instead of filling it only when absent:
+    /// an MTP head's config carries its target's `num_hidden_layers` beside its own
+    /// `mtp_num_hidden_layers`, and the head's model has the latter.
+    pub replaces: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +131,7 @@ impl DeclaredArchSpec {
         bounds: &mut std::collections::BTreeMap<String, u64>,
     ) -> Result<(), String> {
         for f in &self.params {
-            if bounds.contains_key(&f.name) {
+            if bounds.contains_key(&f.name) && !f.replaces {
                 continue;
             }
             let v = match &f.source {

@@ -117,17 +117,21 @@ pub struct ForwardInputs<'a> {
     pub vision_position_ids: Option<&'a [u8]>,
     /// Vision patch pixel rows (`[num_tokens, vision_in_features]`,
     /// model dtype) as raw bytes. `None` for non-vision arches;
-    /// required for any bucket that runs `Instruction::LoadPixels`.
+    /// required for any bucket that runs `LoadRows(Pixels)`.
     pub pixels: Option<&'a [u8]>,
     /// Qwen3.5-VL host-interpolated learned positional embedding
     /// (`[num_tokens, vision_embed_dim]`, model dtype) as raw bytes.
     /// `None` for non-vision arches and towers without a learned
     /// positional embedding; required for any bucket that runs
-    /// `Instruction::LoadPosEmbeds`. (Field name matches the macro's
+    /// `LoadRows(PosEmbeds)`. (Field name matches the macro's
     /// emitted `ForwardInputs { .., pos_embeds }` shorthand, which reads
     /// `ctx.pos_embeds`; the worker copies it into
     /// `RuntimeBindings::vision_pos_embeds`.)
     pub pos_embeds: Option<&'a [u8]>,
+    /// A target model's final hidden states (`[num_tokens, hidden_size]`, model dtype) as raw
+    /// bytes. `None` for every forward but an MTP head's; required for any bucket that runs
+    /// `LoadRows(TargetHidden)`.
+    pub target_hidden: Option<&'a [u8]>,
     /// Projected vision embeddings (`[total_mm, hidden]`, model dtype) as
     /// raw bytes, for the multimodal splice. `None` for text-only
     /// forwards / non-MM arches.

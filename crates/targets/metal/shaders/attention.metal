@@ -325,6 +325,14 @@ constant constexpr uint ATTN_FOLD_DIM = ATTN_FOLD ? ATTN_HEAD_DIM : 1u;
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_SINKS, 21);
 constant bool ATTN_SINKS_ON = ATTN_SINKS_SET;
 
+// 22  ATTN_ROW_QUERIES — the decode kernel's threadgroup rows. Unset/0: one
+//     per sequence (a decode step). 1: one per token of a few-row step (a
+//     speculative verify step's last token and drafts, a short chunk) — the
+//     row's sequence from `cu_seqlens_q` (buffer 23), its keys its
+//     sequence's up to its own position: each row attends as it would
+//     decoding. A decode step's rows are its sequences, so it reads the same.
+SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_ROW_QUERIES, 22);
+
 // Unnormalized Walsh-Hadamard transform (H·x) of the head_dim vector a
 // simdgroup holds as `qk_per_thread` elements per lane (`attn_elem_off`
 // ownership). Under both the contiguous and the co-resident layout the bits of
@@ -732,8 +740,9 @@ inline void attn_decode_merge(thread float* o_reg, thread float* max_score,
 //                (14/15) and the fold buffers (17..22) so a TurboQuant
 //                dispatch carrying sinks can't collide with the TQ slots
 //                7..=13.
+//   buffer(23)   (ATTN_ROW_QUERIES only) = cu_seqlens_q [num_seqs + 1].
 //
-// Dispatch: threadgroups (batch, num_q_heads, 1), threads (1024, 1, 1)
+// Dispatch: threadgroups (batch — ATTN_ROW_QUERIES: tokens — , num_q_heads, 1), threads (1024, 1, 1)
 // = 32 simdgroups × 32 lanes. HEAD_DIM must be a multiple of 32.
 //
 // max_total_threads_per_threadgroup(1024) = BN*BD (32*32) — REQUIRED. Without
@@ -780,6 +789,7 @@ template <typename T>
     device const float* tq_boundaries [[buffer(20)]],
     device const T*     fold_cos_sin  [[buffer(21)]],
     device const T*     tq_bias_cos_sin [[buffer(22)]],
+    device const uint*  cu_seqlens_q  [[buffer(23)]],
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
@@ -805,11 +815,19 @@ template <typename T>
     // `[h * qk_per_thread + j]`.
     const uint heads = (ATTN_TQ != 0u) ? ATTN_TQ_HEADS : 1u;
 
-    const uint seq_idx     = tg_pos.x;            // batch index
+    const uint row         = tg_pos.x;            // query row (ATTN_ROW_QUERIES: a token)
     const uint q_head_idx  = tg_pos.y * heads;    // first of `heads` query heads
     const uint group_ratio = num_q / num_kv;
     const uint kv_head_idx = q_head_idx / group_ratio;
-    const uint kv_len      = seq_used_k[seq_idx];
+    uint seq_idx = row;
+    uint kv_len  = seq_used_k[row];
+    if (ATTN_ROW_QUERIES != 0u) {
+        seq_idx = 0;
+        while (cu_seqlens_q[seq_idx + 1] <= row) {
+            ++seq_idx;
+        }
+        kv_len = seq_used_k[seq_idx] - (cu_seqlens_q[seq_idx + 1] - 1u - row);
+    }
 
     const uint kv_blk_stride  = num_kv * block_size * head_dim;
     const uint kv_head_stride = block_size * head_dim;
@@ -827,8 +845,8 @@ template <typename T>
     threadgroup U tg_max[BN * 8];       // [head][simdgroup], heads <= 8
     threadgroup U tg_sum[BN * 8];
 
-    device const T*    q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       T*    o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
+    device const T*    q_row = q + (row * num_q + q_head_idx) * head_dim;
+    device       T*    o_row = output + (row * num_q + q_head_idx) * head_dim;
     device const uint* row_block_table = block_table + seq_idx * max_blocks;
 
     // Fold: the step's KV writer, run here (`ATTN_FOLD`). The threadgroup ropes its query heads in
@@ -1001,7 +1019,7 @@ template <typename T>
     // cache its writer just filled, exactly as the dequant path read it. A
     // reused span block's slot is the write-skip sentinel: nothing was
     // written, and that key lives only in the packed store.
-    const bool tail_in_cache = (ATTN_TQ == 0u) || (slot_mapping[seq_idx] != 0xFFFFFFFFu);
+    const bool tail_in_cache = (ATTN_TQ == 0u) || (slot_mapping[row] != 0xFFFFFFFFu);
     // For each key, simdgroup `vsg` of the 32 handles tokens at indices
     // vsg, vsg+BN, vsg+2*BN, ... The simdgroup that overshoots `kv_len`
     // skips its iteration and contributes 0. A sliding window (decode Q at

@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "metal")]
 use scratchy_core_common::SamplingParams;
+#[cfg(feature = "metal")]
+use scratchy_core_common::lend::unlent_bytes;
 // Read only by the metal embeddings path below (it walks a
 // StorageModeShared arena slot via `buf.contents()`), so the import follows
 // that gate rather than being carried on every backend.
@@ -355,6 +357,10 @@ pub struct MetalWorker {
     draft_queue: Option<
         ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>>,
     >,
+    /// The target's weight-store refs, snapshot before the target's load consumed them, when a
+    /// draft is configured: a multi-token-prediction head is lent the target's token embedding
+    /// and lm_head from them (same mmap, so nothing is uploaded twice).
+    target_tensor_refs: Option<scratchy_target_metal::weights::TensorRefs>,
     /// One placement-sparse MTLBuffer per (layer, K/V) for the target KV pool
     /// — `layer * 2 + kv_idx` indexing. The pool's logical chunks are byte
     /// offsets within these buffers, whose pages are mapped in only as the
@@ -629,21 +635,44 @@ fn kv_per_block_bytes(
     ))
 }
 
-/// `kv_bytes_per_token` at `model`'s pool geometry: every layer, its KV heads
-/// and head_dim, `dense_elem_bytes` wide when `codec` is dense.
+/// `kv_bytes_per_token` at `model`'s pool geometry: every layer that holds KV
+/// ([`kv_layer_tensors`]), its KV heads and head_dim, `dense_elem_bytes` wide
+/// when `codec` is dense.
 #[cfg(feature = "metal")]
 fn pool_bytes_per_token(
     model: &dyn scratchy_forward_compiler::ScratchyWeights,
     codec: scratchy_forward_compiler::KvCodec,
     dense_elem_bytes: usize,
 ) -> usize {
+    let layers = kv_layer_tensors(model).map_or(model.num_hidden_layers() as usize, |m| {
+        m.iter().copied().max().map_or(0, |t| t + 1)
+    });
     scratchy_target_metal::turboquant::kv_bytes_per_token(
         codec,
-        model.num_hidden_layers() as usize,
+        layers,
         model.num_key_value_heads() as usize,
         model.head_dim() as usize,
         dense_elem_bytes,
     )
+}
+
+/// A Gated-DeltaNet hybrid's KV pool: one physical tensor per attention layer,
+/// in layer order; a linear-attention layer holds no KV, and maps to tensor 0,
+/// which its forward never binds. `None` for a model whose every layer holds KV.
+#[cfg(feature = "metal")]
+fn kv_layer_tensors(model: &dyn scratchy_forward_compiler::ScratchyWeights) -> Option<Vec<usize>> {
+    let linear = model.gdn_runtime_config()?.linear_layers;
+    let mut next = 0;
+    let map = (linear.iter())
+        .map(|&linear| match linear {
+            true => 0,
+            false => {
+                next += 1;
+                next - 1
+            }
+        })
+        .collect();
+    Some(map)
 }
 
 /// vLLM group-shared hybrid KV layout (gemma4): infer the per-layer sliding
@@ -851,6 +880,7 @@ impl MetalWorker {
             chain_advance_kernel: None,
             draft_chain_advance_kernel: None,
             draft_queue: None,
+            target_tensor_refs: None,
             target_kv_layers: Vec::new(),
             kv_mapper: None,
             kv_full_block_size: 0,
@@ -985,15 +1015,13 @@ impl MetalWorker {
                 // arithmetic names, gathered here so the resolver stays
                 // backend-neutral arithmetic (no near-copy can grow in any
                 // target crate).
+                let checkpoint_rows = self.gdn_checkpoint_rows()?;
                 let gdn_per_slot = model.gdn_runtime_config().map(|cfg| {
                     GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                         cfg.num_linear_layers(),
                         1,
-                        cfg.conv_dim as usize,
-                        cfg.conv_kernel as usize,
-                        cfg.num_v_heads as usize,
-                        cfg.head_v_dim as usize,
-                        cfg.head_k_dim as usize,
+                        checkpoint_rows,
+                        cfg.state_dims(),
                     )
                 });
                 let (budget, allocated) = self
@@ -1017,8 +1045,12 @@ impl MetalWorker {
                 // and rung-summed; the resolver and the OOM guard share it.
                 // The target is still a local here, not `self.model` (see
                 // the helper's parameter doc).
-                let peak =
-                    self.metal_peak_activation_estimate(Some(model), Some(gpu_device), None)?;
+                let peak = self.metal_peak_activation_estimate(
+                    Some(model),
+                    Some(gpu_device),
+                    None,
+                    self.kv_block_cap(usize::MAX),
+                )?;
                 // The sampler arena allocated right AFTER this resolves is
                 // sized by the width itself: n·(vocab + 2·max_hist)·4 plus
                 // the sliced buffers' terms — count its per-row cost so the
@@ -1045,7 +1077,8 @@ impl MetalWorker {
                     allocated_bytes: allocated,
                     peak_activation_bytes: peak,
                     gdn_per_slot_bytes: gdn_per_slot,
-                    sampler_bytes_per_row: sampler_row,
+                    // A verify step samples each sequence's every row: its token and its drafts.
+                    sampler_bytes_per_row: sampler_row * (1 + self.config.num_speculative_tokens),
                 };
                 resolve_default_max_num_seqs(&facts, false)
             }
@@ -1066,10 +1099,12 @@ impl MetalWorker {
     /// The peak-activation estimate BOTH the unset-`--max-num-seqs` resolver
     /// (at the end of `load_model`) and the OOM guard
     /// (`determine_available_memory`) budget against — ONE record of the
-    /// fact: the prefill-bucket arena the budget can afford (the full-ladder
-    /// peak when the model emits no cost table; doubled when a draft model
-    /// rides along), plus the KV cap rung's scratch for EVERY loaded model
-    /// (target + draft), and the 64 MiB runtime/staging pad.
+    /// fact: the prefill-bucket arena the budget can afford, every arena that
+    /// runs at it priced in ([`Self::metal_bucket_costs`]; the full-ladder
+    /// peak when the model emits no cost table, doubled when a draft model
+    /// rides along), plus the KV cap rungs' scratch at `block_cap` blocks a
+    /// sequence ([`Self::metal_rung_scratch`]), and the 64 MiB
+    /// runtime/staging pad.
     fn metal_peak_activation_estimate(
         &self,
         // `load_model` runs this BEFORE `self.model`/`self.gpu_device` take
@@ -1086,10 +1121,14 @@ impl MetalWorker {
         // its ladder will actually run (and the KV split subtracts exactly
         // that arena, not a stale collapsed one).
         budget: Option<usize>,
+        block_cap: usize,
     ) -> ExecutorResult<usize> {
         let model = model
             .or(self.model.as_deref())
             .ok_or_else(|| ExecutorError::WorkerInit("peak estimate: model not loaded".into()))?;
+        let dev = gpu_device.or(self.gpu_device.as_ref()).ok_or_else(|| {
+            ExecutorError::WorkerInit("peak estimate: gpu_device not initialized".into())
+        })?;
         let total = budget.unwrap_or_else(|| {
             self.metal_device
                 .as_ref()
@@ -1104,7 +1143,7 @@ impl MetalWorker {
             .as_ref()
             .map(|dev| dev.device.currentAllocatedSize())
             .unwrap_or(0);
-        let bucket_costs = model.metal_bucket_arena_costs();
+        let bucket_costs = self.metal_bucket_costs(model, dev)?;
         let arena_peak = if bucket_costs.is_empty() {
             model.metal_arena_peak_bytes() as usize
         } else {
@@ -1115,36 +1154,75 @@ impl MetalWorker {
             let pad = (64 + 150) * 1024 * 1024usize;
             let fixed = weights_and_overhead.saturating_add(pad);
             let sel =
-                select_prefill_bucket(total as u64, fixed as u64, bucket_costs, ARENA_FRACTION);
+                select_prefill_bucket(total as u64, fixed as u64, &bucket_costs, ARENA_FRACTION);
             sel.arena_bytes as usize
         };
-        // When a draft model is loaded we also need an activation arena for
-        // it: the target's prefill (M >> 1) arena is the worst case across
-        // the pair — use it for both as a safe upper bound.
-        let arena_peak_pair = if self.draft_model.is_some() {
-            arena_peak.saturating_mul(2)
-        } else {
-            arena_peak
+        // A selected bucket's price already counts the draft's arena. Without cost tables, the
+        // target's full-ladder peak stands for the draft's too, a safe upper bound.
+        let arena_peak_pair = match (bucket_costs.is_empty(), self.draft_model.is_some()) {
+            (true, true) => arena_peak.saturating_mul(2),
+            _ => arena_peak,
         };
-        // The KV cap rung's scratch for EVERY loaded model (target + draft),
-        // at the largest capacity a sequence can reach.
-        let full_cap = self.kv_block_cap(usize::MAX);
-        // `model` (the caller's or the field's) IS the target here — the
-        // field variant would be `None` mid-`load_model`.
-        let models = [Some(model), self.draft_model.as_deref()];
-        // in mid-`load_model`. Late callers (guard, draft KV) reach the
-        // field themselves; the Option here is only for the load path.
-        let dev = gpu_device.or(self.gpu_device.as_ref()).ok_or_else(|| {
-            ExecutorError::WorkerInit("peak estimate: gpu_device not initialized".into())
-        })?;
-        let rung_scratch = (models.into_iter().flatten())
-            .map(|m| {
-                self.metal_rung(m, full_cap, dev)
-                    .map(|(_, scratch)| scratch)
-            })
-            .sum::<ExecutorResult<u64>>()?;
+        let rung_scratch = self.metal_rung_scratch(model, dev, block_cap)?;
         Ok((arena_peak_pair.saturating_add(64 * 1024 * 1024))
             .saturating_add(usize::try_from(rung_scratch).unwrap_or(usize::MAX)))
+    }
+
+    /// Each prefill bucket's arena price: the target's, and every arena that runs at it. A draft
+    /// forward (an MTP head's pass 1, a draft model's lockstep prefill) runs the target's rows, so
+    /// it needs the same bucket. A draft model's arena is its own, at the smallest of its buckets
+    /// that holds them; a head places its arena in the target's (`draft_device`), so it adds what
+    /// that does not hold. Empty when the target emits no cost table.
+    fn metal_bucket_costs(
+        &self,
+        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        dev: &scratchy_target_metal::GpuDevice,
+    ) -> ExecutorResult<Vec<(u32, u64)>> {
+        let draft = self.draft_model.as_deref();
+        let draft_costs = draft.map_or(&[][..], |m| m.metal_bucket_arena_costs());
+        let head = draft.filter(|m| m.reads_target_hidden());
+        (target.metal_bucket_arena_costs().iter())
+            .map(|&(bucket_m, bytes)| {
+                let draft = match head {
+                    Some(head) => {
+                        let layout = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+                            let rung = Self::metal_pick(m, dev, Some(bucket_m), 1)?;
+                            ExecutorResult::Ok(rung.arena_layout())
+                        };
+                        unlent_bytes(&layout(head)?, &layout(target)?)
+                    }
+                    None => (draft_costs.iter())
+                        .find(|&&(m, _)| m >= bucket_m)
+                        .or(draft_costs.last())
+                        .map_or(0, |&(_, bytes)| bytes),
+                };
+                Ok((bucket_m, bytes + draft))
+            })
+            .collect()
+    }
+
+    /// The scratch of the KV cap rung each pool runs on at `block_cap` blocks a sequence: the
+    /// target's, and a draft's — a head's only what the target's scratch does not hold, as its
+    /// arena.
+    fn metal_rung_scratch(
+        &self,
+        target: &dyn scratchy_forward_compiler::ScratchyWeights,
+        dev: &scratchy_target_metal::GpuDevice,
+        block_cap: usize,
+    ) -> ExecutorResult<u64> {
+        let pick = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+            Self::metal_pick(m, dev, dev.metal_bucket_max_m, block_cap)
+        };
+        let target_rung = pick(target)?;
+        let draft = self.draft_model.as_deref();
+        let draft_bytes = match draft {
+            Some(head) if head.reads_target_hidden() => {
+                unlent_bytes(&pick(head)?.scratch_sizes(), &target_rung.scratch_sizes())
+            }
+            Some(draft) => pick(draft)?.scratch_bytes(),
+            None => 0,
+        };
+        Ok(target_rung.scratch_bytes() + draft_bytes)
     }
 
     /// The resolved width, floored at 1. Every consumer of the width calls
@@ -1163,15 +1241,24 @@ impl MetalWorker {
         block_cap: usize,
         dev: &scratchy_target_metal::GpuDevice,
     ) -> ExecutorResult<(usize, u64)> {
-        let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(model.metal_rungs());
-        let (max_m, addressing) = (dev.metal_bucket_max_m, dev.kv_addressing);
-        let pick = |r: &scratchy_target_metal::interpreter::metal::MetalRungs| {
-            r.pick(&dev.device, max_m, block_cap, addressing)
-        };
-        let rung = rungs
-            .and_then(pick)
-            .map_err(|e| ExecutorError::WorkerInit(format!("KV cap rung: {e}")))?;
+        let rung = Self::metal_pick(model, dev, dev.metal_bucket_max_m, block_cap)?;
         Ok((rung.cap.get() as usize, rung.scratch_bytes()))
+    }
+
+    /// [`Self::metal_rung`]'s pick on `dev`, its buckets those up to `max_m`.
+    fn metal_pick(
+        model: &dyn scratchy_forward_compiler::ScratchyWeights,
+        dev: &scratchy_target_metal::GpuDevice,
+        max_m: Option<u32>,
+        block_cap: usize,
+    ) -> ExecutorResult<scratchy_target_metal::interpreter::metal::PickedRung<'static>> {
+        let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(model.metal_rungs());
+        let pick = |r: &scratchy_target_metal::interpreter::metal::MetalRungs| {
+            r.pick(&dev.device, max_m, block_cap, dev.kv_addressing)
+        };
+        rungs
+            .and_then(pick)
+            .map_err(|e| ExecutorError::WorkerInit(format!("KV cap rung: {e}")))
     }
 
     /// Bytes per element for the model's KV cache dtype. Metal forces
@@ -1195,6 +1282,54 @@ impl MetalWorker {
     /// would corrupt the physical block id.
     fn rope_on_read_active(&self) -> bool {
         self.model.as_ref().is_some_and(|m| m.rope_on_read())
+    }
+
+    /// Whether the loaded draft is a multi-token-prediction head: it reads the target's hidden
+    /// states, so it runs after the target, never beside it.
+    fn draft_is_head(&self) -> bool {
+        (self.draft_model.as_ref()).is_some_and(|m| m.reads_target_hidden())
+    }
+
+    /// The device a draft forward runs on: the target's device and allocator, on the draft queue
+    /// when there is one (a draft model runs beside the target). A head runs after the target, on
+    /// its queue, each forward waited on, so it places its pool's buffers in the target's.
+    fn draft_device(
+        &self,
+    ) -> Result<GpuDevice, ::scratchy_serving_engine::spec_decode::BackendError> {
+        use ::scratchy_serving_engine::spec_decode::BackendError;
+        let main = (self.gpu_device.as_ref())
+            .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
+        let lent = match self.model.as_deref() {
+            Some(target) if self.draft_is_head() => target.metal_lend_activation(),
+            _ => None,
+        };
+        let lent =
+            lent.map(|l| l.downcast::<scratchy_target_metal::interpreter::metal::LentActivation>());
+        let lent = (lent.transpose())
+            .map_err(|_| BackendError::Backend("target lent no LentActivation".into()))?;
+        Ok(GpuDevice {
+            device: main.device.clone(),
+            queue: (self.draft_queue.clone()).unwrap_or_else(|| main.queue.clone()),
+            allocator: main.allocator.clone(),
+            metal_bucket_max_m: main.metal_bucket_max_m,
+            kv_addressing: main.kv_addressing,
+            lent: lent.map(|l| *l).unwrap_or_default(),
+        })
+    }
+
+    /// Checkpoints each GDN state slot keeps: one per draft of a verify step, so a rejected draft
+    /// can be dropped. Sizes both the pool and its memory reservation.
+    fn gdn_checkpoint_rows(
+        &self,
+    ) -> ExecutorResult<scratchy_target_metal::gdn_state::CheckpointRows> {
+        let drafts = self.config.num_speculative_tokens;
+        u8::try_from(drafts)
+            .map(scratchy_target_metal::gdn_state::CheckpointRows)
+            .map_err(|_| {
+                ExecutorError::WorkerInit(format!(
+                    "GdnStatePool: {drafts} speculative tokens exceed a slot's u8 checkpoints"
+                ))
+            })
     }
 
     /// Run the vision tower for every MM-bearing request at its first
@@ -1292,11 +1427,7 @@ impl MetalWorker {
 
         let draft_hf_config = HfModelConfig::from_path(&draft_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("draft config parse failed: {e}")))?;
-        let draft_arch = draft_hf_config
-            .architectures
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        let draft_arch = draft_hf_config.arch_hint().unwrap_or_default().to_string();
 
         // Reuse the target's gpu_device — its allocator owns the
         // residency set the target weights live in, and the draft must
@@ -1320,6 +1451,31 @@ impl MetalWorker {
             draft_weights.len()
         );
         draft_weights.set_target_dtype(GpuDType::BF16);
+        // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
+        // from the target store's refs (same mmap → no second upload).
+        if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
+            let (Some(target), Some(refs)) =
+                (self.model.as_deref(), self.target_tensor_refs.as_ref())
+            else {
+                return Err(ExecutorError::WorkerInit(
+                    "MTP head: the target must load first (its weight refs lend the head)".into(),
+                ));
+            };
+            for w in scratchy_forward_compiler::LentWeight::ALL {
+                let from = target.lent_weight_prefix(w).ok_or_else(|| {
+                    ExecutorError::WorkerInit(format!("MTP head: the target has no {w:?} to lend"))
+                })?;
+                let lent = draft_weights
+                    .lend(refs, from, head.prefix(w), head.rows(w))
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("MTP head: lending {w:?}: {e}"))
+                    })?;
+                info!(
+                    "ScratchyWorker(metal): MTP head lent the target's {w:?} ({lent} tensors, {from} → {})",
+                    head.prefix(w)
+                );
+            }
+        }
 
         let hf_fp = scratchy_forward_compiler::HfFingerprint {
             rope_scaling_type: draft_hf_config
@@ -1396,8 +1552,10 @@ impl MetalWorker {
         // Phase 8 foundation: dedicated MTLCommandQueue for the draft
         // chain. Two queues on the same device run concurrently on
         // Apple Silicon; this enables lockstep prefill to overlap
-        // with target verify (separate KV pools → no contention).
-        if self.draft_queue.is_none() {
+        // with target verify (separate KV pools → no contention). A
+        // multi-token-prediction head reads the target's output, so
+        // nothing of it can overlap the target: it runs on the main queue.
+        if self.draft_queue.is_none() && !self.draft_is_head() {
             let device = self
                 .gpu_device
                 .as_ref()
@@ -1958,6 +2116,8 @@ fn metal_chain_dispatch(
         vision_rope_freqs: None,
         pixels: None,
         pos_embeds: None,
+        target_hidden: None,
+        hidden_out: None,
         vision_cu_seqlens_full: None,
         vision_cu_seqlens_window: None,
         vision_max_seqlen_full: None,
@@ -2082,6 +2242,19 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
         req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
     ) -> Result<Vec<u32>, ::scratchy_serving_engine::spec_decode::BackendError> {
+        self.forward_argmax_hidden_blocking(model, kv_pool, req, &[])
+            .map(|(argmax, _)| argmax)
+    }
+
+    /// The forward behind [`Self::forward_argmax_blocking`]; `hidden_rows` empty copies no
+    /// hidden rows out.
+    fn forward_argmax_hidden_blocking(
+        &mut self,
+        model: ::scratchy_serving_engine::spec_decode::ModelHandle,
+        kv_pool: ::scratchy_serving_engine::spec_decode::KvPoolHandle,
+        req: &::scratchy_serving_engine::spec_decode::ForwardArgmaxRequest<'_>,
+        hidden_rows: &[u32],
+    ) -> Result<(Vec<u32>, Vec<u8>), ::scratchy_serving_engine::spec_decode::BackendError> {
         use ::scratchy_serving_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
 
         // Resolve handles. 0 → target, 1 → draft; everything else is
@@ -2235,30 +2408,17 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // are immutable references into `self`; `device_mut` is a
         // mutable borrow of `self.gpu_device`. NLL accepts the split.
         //
-        // Phase 8 routing: when the call is for the draft model
-        // (ModelHandle(1)) and a dedicated `draft_queue` exists, we
-        // build a shadow `GpuDevice` wrapping the same `MTLDevice` +
-        // allocator but the draft queue, so the draft model's pool
-        // attaches its residency set to that queue (instead of the
-        // main queue). This lets target verify and draft work execute
-        // concurrently on Apple Silicon. The shadow device is local
-        // to this call; the worker's `gpu_device.queue` is untouched.
-        let use_draft_queue = matches!(model, ModelHandle(1)) && self.draft_queue.is_some();
-        let mut shadow_draft_device: Option<GpuDevice> = if use_draft_queue {
-            let main_dev = self
-                .gpu_device
-                .as_ref()
-                .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
-            let draft_q = self.draft_queue.as_ref().unwrap().clone();
-            Some(GpuDevice {
-                device: main_dev.device.clone(),
-                queue: draft_q,
-                allocator: main_dev.allocator.clone(),
-                metal_bucket_max_m: main_dev.metal_bucket_max_m,
-                kv_addressing: main_dev.kv_addressing,
-            })
-        } else {
-            None
+        // Phase 8 routing: a draft forward (ModelHandle(1)) runs on a
+        // shadow `GpuDevice` (`draft_device`): the same `MTLDevice` +
+        // allocator, on the draft queue when one exists — so a draft
+        // model's pool attaches its residency set to that queue and its
+        // work runs concurrently with the target's — and, for an MTP
+        // head, the target's buffers to place its pool's in. The shadow
+        // device is local to this call; the worker's `gpu_device` is
+        // untouched.
+        let mut shadow_draft_device: Option<GpuDevice> = match model {
+            ModelHandle(1) => Some(self.draft_device()?),
+            _ => None,
         };
         let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
             shadow
@@ -2351,6 +2511,16 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         } else {
             None
         };
+        // An MTP head's input hidden rows (host bytes; the forward copies them into its runtime
+        // buffer) and the rows of this forward's own final hidden states the caller wants back.
+        let view_target_hidden = req.target_hidden.map(|bytes| unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                bytes.as_ptr() as *mut u8,
+                &[bytes.len()],
+                scratchy_target_metal::dtype::DType::U8,
+            ))
+        });
+        let hidden_capture = std::cell::RefCell::new(Vec::new());
         let ctx = scratchy_target_metal::ForwardCtx {
             input_ids: view_input_ids,
             positions: view_positions,
@@ -2377,6 +2547,11 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             vision_rope_freqs: None,
             pixels: None,
             pos_embeds: None,
+            target_hidden: view_target_hidden,
+            hidden_out: (!hidden_rows.is_empty()).then_some(scratchy_target_metal::HiddenRowsOut {
+                rows: hidden_rows,
+                out: &hidden_capture,
+            }),
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
             vision_max_seqlen_full: None,
@@ -2601,7 +2776,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 BackendError::Backend("a deferred forward returned uncommitted".into())
             })?;
             self.committed = Some((in_flight, argmax));
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         // ── 5. Read host-visible argmax buffer + return. ─────────────────
@@ -2653,7 +2828,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             });
         }
         self.sampler_logits = logits_capture.borrow_mut().take();
-        Ok(out)
+        Ok((out, hidden_capture.into_inner()))
     }
 
     /// Phase 6: K-step draft chain in ONE MTL4 command buffer. Forward,
@@ -2718,23 +2893,12 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         .as_ref()
         .ok_or_else(|| BackendError::Backend("chain_advance_kernel not built".into()))?;
 
-        // Phase 8 routing: when the call is for the draft model AND a
-        // dedicated `draft_queue` exists, route through a shadow
-        // GpuDevice on the draft queue so target verify and draft
-        // chain stay disjoint.
-        let use_draft_queue = matches!(model, ModelHandle(1)) && self.draft_queue.is_some();
-        let mut shadow_draft_device: Option<GpuDevice> = if use_draft_queue {
-            let main_dev = self.gpu_device.as_ref().expect("checked above");
-            let draft_q = self.draft_queue.as_ref().unwrap().clone();
-            Some(GpuDevice {
-                device: main_dev.device.clone(),
-                queue: draft_q,
-                allocator: main_dev.allocator.clone(),
-                metal_bucket_max_m: main_dev.metal_bucket_max_m,
-                kv_addressing: main_dev.kv_addressing,
-            })
-        } else {
-            None
+        // Phase 8 routing: a draft chain runs on the draft's shadow
+        // device (`draft_device`), so target verify and draft chain stay
+        // disjoint when there is a draft queue.
+        let mut shadow_draft_device: Option<GpuDevice> = match model {
+            ModelHandle(1) => Some(self.draft_device()?),
+            _ => None,
         };
         let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
             shadow
@@ -3017,9 +3181,12 @@ impl Worker for MetalWorker {
         // model's are group-shared pages plus its TurboQuant global store — not
         // the dense rows the engine would derive. The same cost the draft split
         // in `determine_available_memory` divides by.
+        // A Gated-DeltaNet hybrid's dense pool holds its attention layers alone, which the
+        // engine's every-layer row would overcount.
         let model = self.model.as_deref()?;
         (uniform_turboquant(model, block_size)
-            || hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_some())
+            || hybrid_kv_layout(model, block_size, METAL_KV_ELEM_BYTES).is_some()
+            || kv_layer_tensors(model).is_some())
         .then(|| target_block_bytes(model, block_size))
     }
 
@@ -3119,6 +3286,13 @@ impl Worker for MetalWorker {
         // Under cfg(metal), `CUstream = ()`; the per-canonical
         // `Weights::load` body ignores the stream parameter (uploads go
         // through the allocator inside `GpuWeights`).
+        // A configured draft may be a multi-token-prediction head, lent the target's embedding and
+        // lm_head: snapshot the refs before the target's load consumes them.
+        self.target_tensor_refs = self
+            .config
+            .draft_model_path
+            .is_some()
+            .then(|| weights.tensor_refs());
         let t_try_load = std::time::Instant::now();
         let model = scratchy_forward_compiler::try_load(
             &mut weights,
@@ -3274,7 +3448,8 @@ impl Worker for MetalWorker {
         let sampler_arena = scratchy_target_metal::sampling::SamplerArena::new(
             &gpu_device.device,
             gpu_device.allocator.residency(),
-            self.resolved_max_num_seqs.unwrap_or(1).max(1) as u32,
+            // A verify step samples each sequence's every row: its token and its drafts.
+            (self.max_num_seqs_resolved() * (1 + self.config.num_speculative_tokens)) as u32,
             &sampler,
             max_model_len.max(1) as u32,
         );
@@ -3460,9 +3635,16 @@ impl Worker for MetalWorker {
         let hybrid_layout = hybrid_kv_layout(model.as_ref(), self.config.block_size, elem_bytes);
         // One physical tensor per group POSITION (gemma4: group_size=5) on the
         // hybrid path; one per layer otherwise.
+        // A Gated-DeltaNet hybrid's attention layers alone hold KV: one tensor each.
+        let layer_tensors = (hybrid_layout.as_ref().map(|l| l.layer_to_tensor.clone()))
+            .or_else(|| kv_layer_tensors(model.as_ref()));
         let num_tensors_for_pool = hybrid_layout
             .as_ref()
             .map(|l| l.group_size)
+            .or_else(|| {
+                let tensors = layer_tensors.as_ref()?;
+                Some(tensors.iter().copied().max().map_or(0, |t| t + 1))
+            })
             .unwrap_or(num_layers_for_pool);
         // The full group's page-unified block size (Gemma4: 32) — the worker
         // encodes the full slot_mapping with this. `config.block_size` (uniform).
@@ -3548,8 +3730,9 @@ impl Worker for MetalWorker {
                 } else {
                     per_layer_block_elems.clone()
                 },
-                // vLLM group-shared mapping: layer → physical tensor (position).
-                hybrid_layout.as_ref().map(|l| l.layer_to_tensor.clone()),
+                // vLLM group-shared mapping, or a GDN hybrid's attention layers:
+                // layer → physical tensor (position).
+                layer_tensors,
                 cache_dtype,
                 blocks_per_chunk,
                 // Reactive: 1 chunk up front; the rest grow on demand via
@@ -3634,17 +3817,15 @@ impl Worker for MetalWorker {
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
             let num_slots = self.max_num_seqs_resolved();
             let num_layers = model.num_hidden_layers() as usize;
+            let checkpoint_rows = self.gdn_checkpoint_rows()?;
             let t_gdn = std::time::Instant::now();
             let gdn_pool = unsafe {
                 scratchy_target_metal::gdn_state::GdnStatePool::new(
                     num_layers,
                     &gdn_cfg.linear_layers,
                     num_slots,
-                    gdn_cfg.conv_dim as usize,
-                    gdn_cfg.conv_kernel as usize,
-                    gdn_cfg.num_v_heads as usize,
-                    gdn_cfg.head_v_dim as usize,
-                    gdn_cfg.head_k_dim as usize,
+                    checkpoint_rows,
+                    gdn_cfg.state_dims(),
                     // f32 conv/ssm state. Every per-layer conv/ssm pointer
                     // derives from the CPU base of this StorageModeShared
                     // buffer (a Private one gave the Qwen3.5-MoE-35B pool wild
@@ -3662,7 +3843,7 @@ impl Worker for MetalWorker {
                 t_gdn.elapsed(),
             );
             self.gdn_state = Some(gdn_pool);
-            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots));
+            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots, checkpoint_rows));
         }
 
         // Allocate the draft model's
@@ -3733,8 +3914,9 @@ impl Worker for MetalWorker {
         // NOT yet in `currentAllocatedSize`; fold it into the non-KV
         // overhead here so the engine doesn't hand back KV blocks that
         // leave no room for it. Persistent f32 state, one slot per
-        // resident seq — sized identically to the pool built later. Zero
-        // for non-hybrid arches.
+        // resident seq (and its checkpoints) — sized identically to the pool
+        // built later. Zero for non-hybrid arches.
+        let checkpoint_rows = self.gdn_checkpoint_rows()?;
         let gdn_reserve = self
             .model
             .as_ref()
@@ -3743,11 +3925,8 @@ impl Worker for MetalWorker {
                 scratchy_target_metal::gdn_state::GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                     cfg.num_linear_layers(),
                     self.max_num_seqs_resolved(),
-                    cfg.conv_dim as usize,
-                    cfg.conv_kernel as usize,
-                    cfg.num_v_heads as usize,
-                    cfg.head_v_dim as usize,
-                    cfg.head_k_dim as usize,
+                    checkpoint_rows,
+                    cfg.state_dims(),
                 )
             })
             .unwrap_or(0);
@@ -3782,8 +3961,11 @@ impl Worker for MetalWorker {
         // the floor does not bind (the normal case: `util × working_set`
         // already covers resident + KV floor), costing exactly the one
         // estimate this function always ran.
+        // The fixed point prices the KV cap rung a sequence can reach at max_model_len — the
+        // largest, so the floor it settles on covers every rung below.
+        let full_cap = self.kv_block_cap(usize::MAX);
         let mut peak_activation_estimate =
-            self.metal_peak_activation_estimate(None, None, Some(total))?;
+            self.metal_peak_activation_estimate(None, None, Some(total), full_cap)?;
         for _ in 0..8 {
             let floored = utilization_budget
                 .max(
@@ -3797,7 +3979,7 @@ impl Worker for MetalWorker {
             }
             total = floored;
             peak_activation_estimate =
-                self.metal_peak_activation_estimate(None, None, Some(total))?;
+                self.metal_peak_activation_estimate(None, None, Some(total), full_cap)?;
         }
         // ── Target-reactive prefill-bucket selection ─────────────────────
         // The forward macro now compiles a full bucket ladder for every arch
@@ -3811,11 +3993,10 @@ impl Worker for MetalWorker {
         // cost table (older arches that never emitted it) falls back to the
         // prior "reserve the full-ladder arena peak" behavior.
         const ARENA_FRACTION: f64 = 0.6;
-        let bucket_costs: &'static [(u32, u64)] = self
-            .model
-            .as_ref()
-            .map(|m| m.metal_bucket_arena_costs())
-            .unwrap_or(&[]);
+        let bucket_costs = match (self.model.as_deref(), self.gpu_device.as_ref()) {
+            (Some(target), Some(dev)) => self.metal_bucket_costs(target, dev)?,
+            _ => Vec::new(),
+        };
         let selection = if bucket_costs.is_empty() {
             None
         } else {
@@ -3829,7 +4010,7 @@ impl Worker for MetalWorker {
             // budget twice.
             let budget = total as u64;
             let fixed = (weights_and_overhead as u64).saturating_add(pad);
-            let sel = select_prefill_bucket(budget, fixed, bucket_costs, ARENA_FRACTION);
+            let sel = select_prefill_bucket(budget, fixed, &bucket_costs, ARENA_FRACTION);
             tracing::info!(
                 "ScratchyWorker(metal): target-reactive prefill bucket = {} \
                  (arena {:.1} MiB, KV ~{:.1} MiB; candidate ladder {:?} pruned \
@@ -3858,44 +4039,12 @@ impl Worker for MetalWorker {
                 .map(|m| m.metal_arena_peak_bytes() as usize)
                 .unwrap_or(512 * 1024 * 1024),
         };
-        // When a draft model is loaded we also need an activation arena for
-        // it. Decode-only forwards on a 1B model peak well below the target,
-        // but the target's prefill (M >> 1) arena is the worst case across
-        // the pair — use it for both as a safe upper bound.
-        let arena_peak_pair = if self.draft_model.is_some() {
-            arena_peak.saturating_mul(2)
-        } else {
-            arena_peak
+        // The selected bucket's price already counts the draft's arena. Without cost tables, take
+        // the target's full-ladder peak for the draft too, as a safe upper bound.
+        let arena_peak_pair = match (selection.is_some(), self.draft_model.is_some()) {
+            (false, true) => arena_peak.saturating_mul(2),
+            _ => arena_peak,
         };
-        // The scratch buffers of the KV cap rung each pool runs on, at the largest capacity a
-        // sequence can reach (max_model_len): counted before the KV pool takes the rest, so a
-        // rung whose scratch does not fit is refused here (the guard below), not at allocation.
-        let full_cap = self.kv_block_cap(usize::MAX);
-        let models = [self.model.as_deref(), self.draft_model.as_deref()];
-        let guard_dev = self
-            .gpu_device
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
-        let rung_scratch = (models.into_iter().flatten())
-            .map(|m| {
-                self.metal_rung(m, full_cap, guard_dev)
-                    .map(|(_, scratch)| scratch)
-            })
-            .sum::<ExecutorResult<u64>>()?;
-        // ONE record of the peak-activation estimate:
-        // `metal_peak_activation_estimate` — the same helper the unset-
-        // `--max-num-seqs` resolver budgets against at load. (The
-        // arena/rung intermediates above stay only to feed the log line.)
-        // The estimate itself is the fixed point's last pass above,
-        // computed under the same floored `total` the ladder selection
-        // just ran — so the arena the KV split subtracts below is exactly
-        // the bucket the ladder stashed, never a stale collapsed one.
-        // `total` already folds in `gpu_memory_utilization` (and the KV
-        // floor above), so pass util=1.0 below — applying it again would
-        // shrink the KV budget a second time below the headroom the
-        // bucket selector just split.
-        let available =
-            compute_available_kv_bytes(total, weights_and_overhead, peak_activation_estimate, 1.0);
         // A uniform TurboQuant pool still reserves one fp16 chunk per layer
         // (`initialize_cache`), whatever its block count.
         let tq_seed = self
@@ -3906,7 +4055,37 @@ impl Worker for MetalWorker {
                 scratchy_target_metal::interpreter::metal::BLOCKS_PER_CHUNK as usize
                     * kv_per_block_bytes(m, self.config.block_size)
             });
-        let available = available.saturating_sub(tq_seed);
+        // `total` already folds in `gpu_memory_utilization` (and the KV floor's fixed point
+        // above), so pass util=1.0 here — applying it again would shrink the KV budget a second
+        // time below the headroom the bucket selector just split.
+        let kv_left = |peak: usize| {
+            compute_available_kv_bytes(total, weights_and_overhead, peak, 1.0)
+                .saturating_sub(tq_seed)
+        };
+        // ONE record of the peak-activation estimate (`metal_peak_activation_estimate`), at the
+        // most blocks a sequence can reach: max_model_len, and no more blocks than the pool holds —
+        // those the KV budget buys beside every pool's scratch at its smallest rung (a larger
+        // rung's scratch only shrinks it), a block of each pool apiece. A hybrid-geometry pool,
+        // which the engine sizes by its own layout, takes the max_model_len bound.
+        let bs = self.config.block_size;
+        let reach = match self.model.as_deref() {
+            Some(target) if target.per_layer_kv_token_elems().is_none() => {
+                let draft = self.draft_model.as_deref();
+                let pair =
+                    target_block_bytes(target, bs) + draft.map_or(0, |d| draft_block_bytes(d, bs));
+                kv_left(self.metal_peak_activation_estimate(None, None, Some(total), 1)?)
+                    / pair.max(1)
+            }
+            _ => usize::MAX,
+        };
+        let reach_cap = self.kv_block_cap(reach);
+        let peak_activation_estimate =
+            self.metal_peak_activation_estimate(None, None, Some(total), reach_cap)?;
+        let rung_scratch = match (self.model.as_deref(), self.gpu_device.as_ref()) {
+            (Some(target), Some(dev)) => self.metal_rung_scratch(target, dev, reach_cap)?,
+            _ => 0,
+        };
+        let available = kv_left(peak_activation_estimate);
         // Per-pair split: when a draft model is loaded, every target KV
         // block has a 1:1 mirror in the draft pool, so the engine should
         // think it has only `target / (target + draft)` of the budget.
@@ -4535,37 +4714,25 @@ impl Worker for MetalWorker {
             }
         }
 
-        // GDN per-step state-slot indices (hybrid arches only). One i32
-        // slot id + u32 fresh flag per batched sequence, in the SAME
-        // order as `cu_seqlens_q` / `req_ids_in_order`. The metal
-        // `forward_argmax_blocking` uploads these into
-        // `ForwardCtx::{gdn_state_indices, gdn_is_fresh}`. `slot_for`
-        // returns `is_fresh=true` on a request's FIRST forward (including
-        // a recycled slot's new owner) so the GDN conv1d/scan kernels
-        // zero-init the slot's conv/ssm state instead of continuing from
-        // a finished sequence's stale data (the degeneration guard).
-        self.gdn_pending = if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
-            let mut indices = Vec::with_capacity(req_ids_in_order.len());
-            let mut fresh = Vec::with_capacity(req_ids_in_order.len());
-            for req_id in &req_ids_in_order {
-                match alloc.slot_for(gdn_slot_key(req_id)) {
-                    Some((slot, is_fresh)) => {
-                        indices.push(slot as i32);
-                        fresh.push(u32::from(is_fresh));
-                    }
-                    None => {
-                        return Err(ExecutorError::WorkerExecution(format!(
-                            "GDN state-slot pool exhausted (capacity {}): scheduler \
-                             admitted more concurrent sequences than max_num_seqs",
-                            alloc.capacity(),
-                        )));
-                    }
-                }
-            }
-            Some((indices, fresh))
-        } else {
-            None
-        };
+        // GDN per-step state entries + step codes (hybrid arches only), one per batched
+        // sequence in the SAME order as `cu_seqlens_q` / `req_ids_in_order`. The metal
+        // `forward_argmax_blocking` uploads these into `ForwardCtx::{gdn_state_indices,
+        // gdn_is_fresh}`. A request's FIRST forward (including a recycled slot's new owner)
+        // starts from zero instead of a finished sequence's stale data (the degeneration
+        // guard); a verify step checkpoints its drafts.
+        self.gdn_pending = self
+            .gdn_slot_allocator
+            .as_mut()
+            .map(|alloc| {
+                alloc.step(
+                    req_ids_in_order
+                        .iter()
+                        .zip(&prepared.req_inputs)
+                        .map(|(req_id, input)| (gdn_slot_key(req_id), input.spec_token_ids.len())),
+                )
+            })
+            .transpose()
+            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
         // ── 5b. Vision encoder for any MM-bearing req at its first
         // prefill step. Output [n_img_tokens, hidden] + per-image patch
@@ -4667,7 +4834,16 @@ impl Worker for MetalWorker {
         // target-KV, lockstep writes draft-KV — separate KV pools, no
         // contention. Saves ~15-20 ms / step on the draft chain
         // critical path.
+        // A multi-token-prediction head drafts from this step's hidden rows, so it runs after the
+        // target (in the proposer) — it has no lockstep prefill to overlap.
+        let draft_is_head = self.draft_is_head();
+        let target_hidden_rows: Vec<u32> = match draft_is_head {
+            true => (0..num_tokens as u32).collect(),
+            false => Vec::new(),
+        };
+        let mut target_hidden: Vec<u8> = Vec::new();
         let phase8_parallel_lockstep = self.draft_model.is_some()
+            && !draft_is_head
             && self.draft_kv_cache.is_some()
             && self.draft_queue.is_some();
         let mut async_lockstep_done = false;
@@ -4687,9 +4863,6 @@ impl Worker for MetalWorker {
         let mut fused_sample_jobs: Vec<(usize, u32)> = Vec::new();
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let req_slice = &prepared.req_inputs[i];
-            if !req_slice.spec_token_ids.is_empty() {
-                continue; // spec-verify rows use greedy rejection, not the sampler
-            }
             if !req_slice.emits_token {
                 continue; // still-prefilling chunk emits no token
             }
@@ -4697,8 +4870,18 @@ impl Worker for MetalWorker {
                 .sampling_params_map
                 .get(req_id)
                 .is_none_or(SamplingParams::is_greedy);
-            if !greedy {
-                fused_sample_jobs.push((i, sample_indices[i]));
+            if greedy {
+                continue;
+            }
+            // A sampled request's verify step samples every row from the target, and the
+            // rejection below keeps its drafts while the sampled tokens equal them: rejection
+            // sampling of one-token (greedy) drafts, whose tokens are the target's distribution.
+            match req_slice.spec_token_ids.is_empty() {
+                true => fused_sample_jobs.push((i, sample_indices[i])),
+                false => {
+                    let rows = req_slice.token_start..req_slice.token_start + req_slice.token_count;
+                    fused_sample_jobs.extend(rows.map(|row| (i, row as u32)));
+                }
             }
         }
         if !fused_sample_jobs.is_empty()
@@ -4735,6 +4918,7 @@ impl Worker for MetalWorker {
                 } else {
                     Some(&sample_indices)
                 },
+                target_hidden: None,
             };
             // Phase 9: the worker-side speculative K-step chain (runs
             // in the lockstep thread, overlapped with target verify).
@@ -4851,6 +5035,8 @@ impl Worker for MetalWorker {
                             // The draft chain runs under spec-decode: chunked addressing.
                             kv_addressing:
                                 scratchy_target_metal::tape::lowered::KvAddressing::Chunked,
+                            // It runs beside the target: nothing of the target's is lent.
+                            lent: Default::default(),
                         };
                         // Upload host slices into fresh shared
                         // MTLBuffers (thread-local, dropped at thread
@@ -4917,6 +5103,8 @@ impl Worker for MetalWorker {
                             vision_rope_freqs: None,
                             pixels: None,
                             pos_embeds: None,
+                            target_hidden: None,
+                            hidden_out: None,
                             vision_cu_seqlens_full: None,
                             vision_cu_seqlens_window: None,
                             vision_max_seqlen_full: None,
@@ -5047,6 +5235,7 @@ impl Worker for MetalWorker {
                                     num_tokens: 1,
                                     has_spec_tokens: false,
                                     last_token_indices: None,
+                                    target_hidden: None,
                                 };
                             metal_chain_dispatch(
                                 dm,
@@ -5107,10 +5296,18 @@ impl Worker for MetalWorker {
                 spec9_drafts_final = spec9_drafts_out;
                 v
             } else {
-                self.forward_argmax_blocking(ModelHandle::TARGET, KvPoolHandle::TARGET, &req)
+                let (argmax, hidden) = self
+                    .forward_argmax_hidden_blocking(
+                        ModelHandle::TARGET,
+                        KvPoolHandle::TARGET,
+                        &req,
+                        &target_hidden_rows,
+                    )
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
-                    })?
+                    })?;
+                target_hidden = hidden;
+                argmax
             }
         };
         // A deferred step: its tokens stay on the device until the engine, and
@@ -5279,6 +5476,13 @@ impl Worker for MetalWorker {
                     target_ids,
                     &req_slice.spec_token_ids,
                 );
+                if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
+                    alloc.verified(
+                        gdn_slot_key(req_id),
+                        rejection.num_accepted_drafts,
+                        req_slice.spec_token_ids.len(),
+                    );
+                }
                 sampled_token_ids.push(rejection.accepted_tokens);
                 was_spec_decode.push(true);
             }
@@ -5354,6 +5558,7 @@ impl Worker for MetalWorker {
                     async_lockstep_done,
                     speculative_seeds: spec9_seeds_final.clone(),
                     speculative_chain_drafts: spec9_drafts_final.clone(),
+                    target_hidden,
                 })
             } else {
                 None

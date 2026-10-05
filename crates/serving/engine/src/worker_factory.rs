@@ -95,6 +95,9 @@ pub struct WorkerCreateConfig {
     /// Currently passed through but the metal path always coerces to
     /// bf16 to match the target — accepted for CLI parity with Python.
     pub draft_model_dtype: Option<String>,
+    /// Most drafts one verify step carries (`--num-speculative-tokens`); 0 without speculative
+    /// decoding. Sizes the Gated-DeltaNet state pool's per-slot checkpoints.
+    pub num_speculative_tokens: usize,
 }
 
 /// Result of worker creation: the worker plus metadata needed for init.

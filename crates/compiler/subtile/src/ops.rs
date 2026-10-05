@@ -74,10 +74,10 @@ macro_rules! for_each_subop {
             ScalarWeightMul [SubOp::ScalarWeightMul] arity = (|n| n == 2), cols = [in0];
             GateSplit [SubOp::GateSplit { .. }] arity = (|n| n == 1), cols = [field half_cols];
             GateApply [SubOp::GateApply] arity = (|n| n == 2), cols = [in0];
+            Concat [SubOp::Concat { .. }] arity = (|n| n == 2), cols = [field cols];
             GateScale [SubOp::GateScale] arity = (|n| n == 3), cols = [in0];
             // Host-staged: the buffer is delivered by the runtime, not by an operand.
-            LoadPixels [SubOp::LoadPixels { .. }] arity = (|n| n == 0), cols = [field in_features];
-            LoadPosEmbeds [SubOp::LoadPosEmbeds { .. }] arity = (|n| n == 0), cols = [field width];
+            LoadRows [SubOp::LoadRows { .. }] arity = (|n| n == 0), cols = [field width];
             // The index table is a runtime input, not an operand — hence ONE.
             EmbeddingGather [SubOp::EmbeddingGather { .. }] arity = (|n| n == 1), cols = [in0];
             VisionRope [SubOp::VisionRope] arity = (|n| n == 2), cols = [in0];

@@ -49,8 +49,8 @@ pub use pool::{
 };
 pub use runtime::RuntimeBindings;
 pub use worker::{
-    ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker, ResolvedSources, SourceMiss,
-    WorkerError,
+    ArenaLayout, BoundBuffer, BucketBaking, BucketStep, LentActivation, MetalWorker,
+    ResolvedSources, SourceMiss, WorkerError,
 };
 
 // Centralized type aliases for the objc2-metal `Retained` wrapper

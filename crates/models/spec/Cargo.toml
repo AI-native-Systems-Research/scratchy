@@ -1,0 +1,21 @@
+[package]
+name = "scratchy-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Speculative-decoding build scope: which drafters compile alongside the selected models (`spec/<drafter>` from scratchy-cli)."
+
+[features]
+# A crate of its own for the same reason as scratchy-quantizations: Cargo
+# forbids aliasing one crate under two names in one Cargo.toml, and
+# `crates/cli/scr/Cargo.toml` already aliases scratchy-models `model` and
+# scratchy-quantizations `quant`. Its features forward to scratchy-models,
+# whose build script compiles the drafters.
+#
+# `mtp`: every selected model whose checkpoint carries a multi-token-prediction
+# head compiles that head too, and serving the model drafts with it —
+# `--features metal,model/qwen3.6-35b-a3b,spec/mtp`.
+mtp = ["scratchy-models/mtp"]
+
+[dependencies]
+scratchy-models = { path = "../arch", default-features = false }

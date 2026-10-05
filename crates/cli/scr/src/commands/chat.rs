@@ -176,6 +176,9 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     // 15.7 GiB at the default, which is the difference between the 35B
     // fitting on a 32 GiB box or failing the budget guard).
     builder = builder.max_num_seqs(1);
+    if let Some(k) = args.num_speculative_tokens {
+        builder = builder.num_speculative_tokens(k);
+    }
     if let Some(ref token) = args.hf_token {
         builder = builder.hf_token(token);
     }

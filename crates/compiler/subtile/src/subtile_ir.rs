@@ -859,8 +859,11 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 std::mem::discriminant(mask).hash(h);
             }
             SubOp::GateSplit { half_cols } => half_cols.hash(h),
-            SubOp::LoadPixels { in_features } => in_features.hash(h),
-            SubOp::LoadPosEmbeds { width } => width.hash(h),
+            SubOp::Concat { cols } => cols.hash(h),
+            SubOp::LoadRows { source, width } => {
+                source.hash(h);
+                width.hash(h);
+            }
             SubOp::EmbeddingGather { indices_kind } => indices_kind.hash(h),
             SubOp::VarlenAttention { cu_kind } => cu_kind.hash(h),
             SubOp::EncoderAttn { geom, scale } => {
@@ -1102,15 +1105,19 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     GateSplit { half_cols: u32 },
     /// Qwen3.5 attention output gate: `out = attn · σ(gate)`. `inputs` = `[attn, gate]`.
     GateApply,
+    /// Row concatenation of two same-width operands: `out[t] = a[t] ++ b[t]`, output `cols`
+    /// wide (each operand `cols / 2`). `inputs` = `[a, b]`.
+    Concat { cols: u32 },
     /// Qwen3.5-MoE shared-expert combine: `out = routed + shared · σ(g)`, `g` a `[m, 1]`
     /// row-broadcast. `inputs` = `[routed, shared, g]`.
     GateScale,
-    /// Vision pixel load: the host-staged patchified pixel buffer lands in this op's slot.
-    /// NO inputs; output `[T, in_features]`.
-    LoadPixels { in_features: u32 },
-    /// Vision position embeddings: the host-staged, per-image-grid interpolated table lands in
-    /// this op's slot. NO inputs; output `[T, width]`.
-    LoadPosEmbeds { width: u32 },
+    /// Host-staged rows: the runtime buffer `source` names (patchified pixels, interpolated
+    /// position embeddings, a target model's hidden states) lands in this op's slot. NO
+    /// inputs; output `[T, width]`.
+    LoadRows {
+        source: scratchy_ir::RowsExtern,
+        width: u32,
+    },
     /// Row permutation by a host-staged index table — Qwen2.5-VL window attention gathers into
     /// window order on encoder entry (`indices_kind` 0) and back after the merger (1). The table
     /// is a runtime input, not an operand, so this takes ONE input.
@@ -1628,6 +1635,18 @@ pub fn eval_node<F: RopeForm>(
                 .map(|(&a, &g)| a / (1.0 + (-g).exp()))
                 .collect()
         }
+        SubOp::Concat { cols } => {
+            let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
+            let (b, br, bc) = gather(&node.inputs[1], graph, bufs);
+            debug_assert_eq!((ar, ac + bc), (out_rows, out_cols), "concat shape");
+            debug_assert_eq!((br, bc), (ar, ac), "concat operands share a shape");
+            debug_assert_eq!(ac + bc, cols, "concat width");
+            let w = ac as usize;
+            a.chunks(w)
+                .zip(b.chunks(w))
+                .flat_map(|(ra, rb)| ra.iter().chain(rb).copied())
+                .collect()
+        }
         SubOp::GateScale => {
             // `g` is `[m, 1]`, broadcast across the row.
             let (routed, rr, rc) = gather(&node.inputs[0], graph, bufs);
@@ -1702,10 +1721,10 @@ pub fn eval_node<F: RopeForm>(
              and eval_node returns the buffer for ONE region, so the gate half would \
              be silently dropped"
         ),
-        SubOp::LoadPixels { .. } | SubOp::LoadPosEmbeds { .. } => panic!(
-            "SubOp::LoadPixels / LoadPosEmbeds have no host reference: the buffer is \
-             STAGED BY THE HOST at runtime (patchified pixels, per-image-grid \
-             interpolated position embeddings) and is not computed from operands"
+        SubOp::LoadRows { .. } => panic!(
+            "SubOp::LoadRows has no host reference: the buffer is STAGED BY THE HOST at \
+             runtime (patchified pixels, interpolated position embeddings, a target's \
+             hidden states) and is not computed from operands"
         ),
         SubOp::EmbeddingGather { .. } => panic!(
             "SubOp::EmbeddingGather has no host reference: the permutation is a \
@@ -2138,8 +2157,7 @@ pub fn lower_region(
 
     for desc in &input.ops {
         let m = desc.m;
-        // ⛔ OPERAND 0 IS OPTIONAL. The host-staged vision loads (`LoadPixels`,
-        // `LoadPosEmbeds`) take NO operands — their buffer is delivered by the
+        // ⛔ OPERAND 0 IS OPTIONAL. The host-staged loads (`LoadRows`) take NO operands — their buffer is delivered by the
         // runtime — so resolving `inputs[0]` eagerly indexed an empty vec and
         // panicked before reaching the arm that handles them. The arms that read
         // these bindings all have an operand by their arity row, which is why
@@ -2285,9 +2303,9 @@ pub fn lower_region(
             SubOp::ScalarWeightMul => SubOp::ScalarWeightMul,
             SubOp::GateSplit { half_cols } => SubOp::GateSplit { half_cols },
             SubOp::GateApply => SubOp::GateApply,
+            SubOp::Concat { cols } => SubOp::Concat { cols },
             SubOp::GateScale => SubOp::GateScale,
-            SubOp::LoadPixels { in_features } => SubOp::LoadPixels { in_features },
-            SubOp::LoadPosEmbeds { width } => SubOp::LoadPosEmbeds { width },
+            SubOp::LoadRows { source, width } => SubOp::LoadRows { source, width },
             SubOp::EmbeddingGather { indices_kind } => SubOp::EmbeddingGather { indices_kind },
             SubOp::VisionRope => SubOp::VisionRope,
             SubOp::VarlenAttention { cu_kind } => SubOp::VarlenAttention { cu_kind },

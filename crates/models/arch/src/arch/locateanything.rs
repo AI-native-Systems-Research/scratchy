@@ -290,6 +290,8 @@ mod green_gate {
             vision_rope_freqs: Some(freqs_view),
             pixels: Some(pixels_view),
             pos_embeds: Some(pos_view),
+            target_hidden: None,
+            hidden_out: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
             vision_max_seqlen_full: None,

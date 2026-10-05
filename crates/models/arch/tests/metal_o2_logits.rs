@@ -367,11 +367,8 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
                 layers,
                 &cfg.linear_layers,
                 1,
-                cfg.conv_dim as usize,
-                cfg.conv_kernel as usize,
-                cfg.num_v_heads as usize,
-                cfg.head_v_dim as usize,
-                cfg.head_k_dim as usize,
+                scratchy_target_metal::gdn_state::CheckpointRows::NONE,
+                cfg.state_dims(),
                 |bytes| Ok(MetalMem::new_pinned(&device, &residency, bytes)),
             )
         }
@@ -497,6 +494,8 @@ fn run_step(l: &mut Loaded, path: ExecPath, s: &StepInputs) -> (Vec<u8>, usize) 
         vision_rope_freqs: None,
         pixels: None,
         pos_embeds: None,
+        target_hidden: None,
+        hidden_out: None,
         vision_cu_seqlens_full: None,
         vision_cu_seqlens_window: None,
         vision_max_seqlen_full: None,

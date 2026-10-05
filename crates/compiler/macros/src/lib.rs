@@ -77,6 +77,7 @@ pub use render::render_tokens;
 /// kernels resolve in, baked once the models are emitted.
 #[cfg(feature = "metal")]
 pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
+mod rows_lowering;
 mod schedule;
 mod shape;
 #[cfg(feature = "cuda")]
@@ -84,7 +85,6 @@ mod solver;
 mod target;
 mod to_wavefront;
 mod tp_lowering;
-mod vision_lowering;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target.
 //
 // It used to be gated `all(feature = "spyre", not(feature = "metal"))` because metal derived
@@ -1056,20 +1056,11 @@ pub fn compile_carrier(
             if mode.apply_mm_splice {
                 tp_lowering::insert_mm_splices(&mut model_fuf, &model_prog);
             }
-            // Vision-prelude `pixels` extern → tile materialization
-            // (G.5.e.1). Synthesizes a single `OpKind::LoadPixels`
-            // node and rewrites every downstream `FufInput::Extern`
-            // referencing pixels to read its slot 0. No-op when the
-            // body has no pixels reference. Vision-only — decoder
-            // bodies have no `Pixels` extern (the prelude split
-            // makes the two extern sets disjoint).
-            if mode.prelude == classified::Prelude::Vision {
-                vision_lowering::materialize_pixels(&mut model_fuf);
-                // Qwen3.5-VL `pos_embeds` extern → tile (sibling of the
-                // pixels materialization above). No-op for towers without
-                // a learned positional embedding.
-                vision_lowering::materialize_pos_embeds(&mut model_fuf);
-            }
+            // Host-staged rows extern → tile materialization: one `OpKind::LoadRows` per row
+            // extern the body reads (a vision tower's `pixels` / `pos_embeds`, an MTP head's
+            // `target_hidden`), every downstream `FufInput::Extern` referencing it rewired to
+            // read its slot 0. No-op for a body that reads none.
+            rows_lowering::materialize_rows(&mut model_fuf);
 
             // At tp>1, the runtime weight tensors are per-rank shards
             // (column-parallel q/k/v/gate/up halve dim 0; row-parallel
@@ -1249,6 +1240,8 @@ pub fn compile_carrier(
                 "gate_split_ref",
                 "gate_apply_ref",
                 "gate_scale_ref",
+                // An MTP head's input fusion: two pitched copies, no matmul.
+                "concat_ref",
                 // Metal MoE Impls. Same "host-callback dispatch
                 // wrapper, internal compute steps already classified
                 // (Gemm via metal_gemm_, gather_qmv via
@@ -1338,14 +1331,10 @@ pub fn compile_carrier(
                 "metal_tanh_softcap_f16",
                 #[cfg(feature = "metal")]
                 "metal_tanh_softcap_bf16",
-                // Vision-prelude pixels materialization (G.5.e.1).
-                // Synthesized by `vision_lowering::materialize_pixels`;
-                // emits a single D2D copy that wraps `ctx.fwd.pixels`
-                // into a tile-table OwnedTensor. Not a compute kernel.
-                "load_pixels",
-                // Qwen3.5-VL pos_embeds materialization (sibling of
-                // load_pixels) — wraps `ctx.fwd.pos_embeds` into a tile.
-                "load_pos_embeds",
+                // Host-staged rows materialization. Synthesized by
+                // `rows_lowering::materialize_rows`; emits a single D2D copy that wraps the
+                // source's `ForwardCtx` view into a tile-table OwnedTensor. Not a compute kernel.
+                "load_rows",
                 // Vision-side varlen attention + vision rope.
                 // Shape-preserving non-gemm primitives.
                 "varlen_attention",
@@ -1856,11 +1845,122 @@ pub fn compile_carrier(
                 }
             }
         };
+        // A multi-token-prediction head's facts, per variant: whether its forward reads
+        // `target_hidden`, the on-disk prefixes of the weights a target lends it (every arch
+        // reports its own, so a TARGET's can be read off the loaded model) and its logits' width
+        // (the lent lm_head's rows it reads). The registry carries the arch-wide head facts, so a
+        // loader can place a target's tensors under the head's names before the head loads —
+        // every head variant must agree on them.
+        // The target architectures it drafts for, and how its repo is named from the target's.
+        type HeadFacts = (bool, [Option<String>; 2], u64, Vec<String>, Option<String>);
+        let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
+            .iter()
+            .map(|sm| {
+                let reads = sm.fuf.nodes.iter().any(|n| {
+                    n.op == classified::OpKind::LoadRows(
+                        scratchy_forward_compiler::RowsExtern::TargetHidden,
+                    )
+                });
+                let lent = scratchy_forward_compiler::LentWeight::ALL
+                    .map(|w| codegen::lent_weight_prefix(&sm.prog, sm.model, w));
+                let vocab = sm.model.bounds.get("vocab_size").copied().unwrap_or(0);
+                let (drafts_for, infix) = (&sm.model.drafts_for, &sm.model.drafter_repo_infix);
+                (
+                    sm.mod_name.clone(),
+                    (reads, lent, vocab, drafts_for.clone(), infix.clone()),
+                )
+            })
+            .collect();
+        let head_tokens = {
+            let fact = |a: &DispatchArm| &head_facts[&a.model_ident.to_string()];
+            let reads_arms = arch_dispatch_arms.iter().map(|a| {
+                let variant_ident = pascal_case(&a.model_ident);
+                let reads = fact(a).0;
+                quote! { Weights::#variant_ident(_) => #reads, }
+            });
+            let lent_arms = arch_dispatch_arms.iter().flat_map(|a| {
+                let variant_ident = pascal_case(&a.model_ident);
+                let lent = &fact(a).1;
+                scratchy_forward_compiler::LentWeight::ALL
+                    .into_iter()
+                    .zip(lent)
+                    .map(move |(w, prefix)| {
+                        let w = lent_weight_tokens(w);
+                        let prefix = match prefix {
+                            Some(p) => quote! { ::core::option::Option::Some(#p) },
+                            None => quote! { ::core::option::Option::None },
+                        };
+                        quote! { (Weights::#variant_ident(_), #w) => #prefix, }
+                    })
+            });
+            quote! {
+                fn reads_target_hidden(&self) -> bool {
+                    match self {
+                        #(#reads_arms)*
+                    }
+                }
+
+                fn lent_weight_prefix(
+                    &self,
+                    w: ::scratchy_forward_compiler::LentWeight,
+                ) -> ::core::option::Option<&'static str> {
+                    match (self, w) {
+                        #(#lent_arms)*
+                    }
+                }
+            }
+        };
+        let head_registration = {
+            type Head<'a> = (
+                &'a [Option<String>; 2],
+                u64,
+                &'a [String],
+                &'a Option<String>,
+            );
+            let heads: Vec<Head<'_>> = head_facts
+                .values()
+                .filter(|(reads, ..)| *reads)
+                .map(|(_, lent, vocab, drafts_for, infix)| (lent, *vocab, &drafts_for[..], infix))
+                .collect();
+            match heads.first() {
+                None => quote! { ::core::option::Option::None },
+                Some(first) => {
+                    assert!(
+                        heads.iter().all(|head| head == first),
+                        "{arch_ident}: its head variants disagree on where they load lent weights, \
+                         how many lm_head rows they read, or whose head they are ({heads:?}); a \
+                         loader must know them before the head loads"
+                    );
+                    let ([Some(embed_tokens), Some(lm_head)], vocab, drafts_for, infix) = first
+                    else {
+                        panic!(
+                            "{arch_ident}: a head reading `target_hidden` must name embed_tokens \
+                             and lm_head (it has {first:?})"
+                        );
+                    };
+                    let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*vocab as u32);
+                    let infix = match infix {
+                        Some(infix) => quote! { ::core::option::Option::Some(#infix) },
+                        None => quote! { ::core::option::Option::None },
+                    };
+                    quote! {
+                        ::core::option::Option::Some(::scratchy_forward_compiler::HeadRegistration {
+                            embed_tokens: #embed_tokens,
+                            lm_head: #lm_head,
+                            lm_head_rows: #lm_head_rows,
+                            drafts_for: &[#(#drafts_for),*],
+                            repo_infix: #infix,
+                        })
+                    }
+                }
+            }
+        };
         let gdn_runtime_config_tokens = quote! {
             #gdn_runtime_config_tokens
             #per_layer_kv_elems_tokens
             #max_blocks_per_seq_tokens
             #rope_on_read_tokens
+            #head_tokens
         };
 
         emit_arch_dispatcher(
@@ -1870,6 +1970,7 @@ pub fn compile_carrier(
             models_dir,
             name_span,
             gdn_runtime_config_tokens,
+            head_registration,
         )?
     } else {
         proc_macro2::TokenStream::new()
@@ -1973,6 +2074,15 @@ fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
         .collect()
 }
 
+/// A [`LentWeight`](scratchy_forward_compiler::LentWeight) as a const expression.
+fn lent_weight_tokens(w: scratchy_forward_compiler::LentWeight) -> proc_macro2::TokenStream {
+    use scratchy_forward_compiler::LentWeight;
+    match w {
+        LentWeight::EmbedTokens => quote! { ::scratchy_forward_compiler::LentWeight::EmbedTokens },
+        LentWeight::LmHead => quote! { ::scratchy_forward_compiler::LentWeight::LmHead },
+    }
+}
+
 /// Arch-level dispatcher: an enum over every compiled variant plus
 /// a `load` that auto-detects the right variant by walking each
 /// variant's compile-emitted `fingerprint_matches(gw)` until one
@@ -1994,6 +2104,7 @@ fn emit_arch_dispatcher(
     models_dir: &Path,
     error_span: Span,
     gdn_runtime_config_tokens: proc_macro2::TokenStream,
+    head_registration: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if arms.is_empty() {
         return Ok(quote! {});
@@ -2245,6 +2356,20 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant lending of each model's resident pool's activation buffers.
+    let metal_lend_activation_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            quote! {
+                Weights::#variant_ident(w) => w.metal_pool.get().map(|p| {
+                    ::std::boxed::Box::new(p.lend_activation())
+                        as ::std::boxed::Box<dyn ::core::any::Any>
+                }),
+            }
+        })
+        .collect();
+
     // Per-variant `METAL_RUNGS` reads: each model's baked tape rungs.
     let metal_rungs_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
@@ -2489,6 +2614,7 @@ fn emit_arch_dispatcher(
                         },
                         #ktir_bundle_field
                         #sengraph_bundle_field
+                        head: #head_registration,
                     }
                 }
             }
@@ -2903,6 +3029,13 @@ fn emit_arch_dispatcher(
             ) -> &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync) {
                 match self {
                     #(#metal_rungs_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_lend_activation(&self) -> ::core::option::Option<::std::boxed::Box<dyn ::core::any::Any>> {
+                match self {
+                    #(#metal_lend_activation_arms)*
                 }
             }
 

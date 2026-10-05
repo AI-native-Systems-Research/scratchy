@@ -29,6 +29,9 @@ pub struct GpuDevice {
     /// The KV addressing the workload's tapes run (spec-decode: chunked), which the lazy
     /// `MetalWorkerPool::for_buckets` picks its rung by.
     pub kv_addressing: crate::tape::lowered::KvAddressing,
+    /// Buffers of a model whose forwards never overlap this device's, which the lazy
+    /// `MetalWorkerPool::for_buckets` places its worker's own in (an MTP head's, its target's).
+    pub lent: crate::interpreter::metal::LentActivation,
 }
 
 impl GpuDevice {
@@ -42,6 +45,7 @@ impl GpuDevice {
             allocator,
             metal_bucket_max_m: None,
             kv_addressing: Default::default(),
+            lent: Default::default(),
         }
     }
 

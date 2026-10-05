@@ -288,16 +288,17 @@ pub enum MetalStep {
     VarlenAttention(Slot, Slot, Slot, Slot, CuSeqlens),
     /// `(q, k, q_out, k_out)`: vision 2-D rope.
     VisionRope(Slot, Slot, Slot, Slot),
-    /// `(out)`: the staged vision pixels.
-    LoadPixels(Slot),
-    /// `(out)`: the staged vision position embeddings.
-    LoadPosEmbeds(Slot),
+    /// `(out, source)`: the host-staged rows of `source` (vision pixels, vision position
+    /// embeddings, a target model's hidden states).
+    LoadRows(Slot, scratchy_ir::RowsExtern),
     /// `(in, out, indices, width)`: row permutation by a runtime index buffer.
     EmbeddingGather(Slot, Slot, GatherIndices, ActivationWidth),
     /// `(qg, q, gate)`: split the doubled q projection into query and gate.
     GateSplit(Slot, Slot, Slot),
     /// `(attn, gate, out)`: `attn * sigmoid(gate)`.
     GateApply(Slot, Slot, Slot),
+    /// `(a, b, out, width)`: `out[t] = a[t] ++ b[t]`, each operand `width` wide.
+    Concat(Slot, Slot, Slot, ActivationWidth),
     /// `(routed, shared, gate, out)`: `routed + shared * sigmoid(gate)`.
     GateScale(Slot, Slot, Slot, Slot),
     /// `(qkv, z, a, b, out, layer)`: Gated-DeltaNet linear attention.
@@ -672,11 +673,11 @@ impl MetalStep {
             | S::EncoderAttention(..)
             | S::VarlenAttention(..)
             | S::VisionRope(..)
-            | S::LoadPixels(..)
-            | S::LoadPosEmbeds(..)
+            | S::LoadRows(..)
             | S::EmbeddingGather(..)
             | S::GateSplit(..)
             | S::GateApply(..)
+            | S::Concat(..)
             | S::GateScale(..)
             | S::RotateRows(..)
             | S::SampleRows(..)

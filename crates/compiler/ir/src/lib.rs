@@ -528,35 +528,17 @@ pub enum Instruction {
     /// `OpKind::PosEmbed` shape sig anchors on the vision bound names
     /// so the macro emits a `Weights` field of the right type.
     PosEmbed(u32),
-    /// Materialize the vision-prelude `pixels` extern as a tile:
-    /// `(out_slot)`. Reads `ctx.fwd.pixels` (the rank-2
-    /// `[num_tokens, vision_in_features]` view the
-    /// `vision_forward` host wrapper writes onto `ForwardCtx`
-    /// before invoking the vision interpreter), allocates a fresh
-    /// `OwnedTensor` of the same shape/dtype, D2D-copies the
-    /// pixels view into it, and publishes the result at `out_slot`.
+    /// Materialize a [`RowsExtern`] as a tile: `(out_slot, source)`. Reads the source's
+    /// rank-2 `[num_tokens, width]` view off `ForwardCtx` (written by the host before the
+    /// forward runs), D2D-copies it into a fresh `OwnedTensor`, and publishes it at
+    /// `out_slot`.
     ///
-    /// The copy is what lets the consume-pattern vision Impls
-    /// (`QuickGelu` / `GeluErf` / `VisionRope`) downstream of
-    /// `pixels` read it as a tile-table `Owned` entry — `take_owned`
-    /// requires `Owned`, and a borrowed `External` wrapper around
-    /// `ctx.fwd.pixels` would panic on the first such consumer.
-    /// In G.5.f's real encoder body the first op on pixels is a
-    /// non-consuming `gemm` (`patch_embed`), so the copy is paid
-    /// once per encoder invocation regardless. Synthesized
-    /// exclusively by `vision_lowering::materialize_pixels` —
-    /// never appears in any DSL.
-    LoadPixels(u32),
-    /// Materialize the Qwen3.5-VL `pos_embeds` extern as a tile:
-    /// `(out_slot)`. The exact sibling of [`Self::LoadPixels`] — reads
-    /// `ctx.fwd.pos_embeds` (the rank-2 `[num_tokens, vision_embed_dim]`
-    /// host-interpolated learned positional embedding the
-    /// `vision_forward` wrapper writes onto `ForwardCtx`), D2D-copies it
-    /// into a fresh `OwnedTensor`, and publishes it at `out_slot` so the
-    /// downstream `add(pos_embeds, hidden_states)` reads it as an `Owned`
-    /// tile. Synthesized exclusively by
-    /// `vision_lowering::materialize_pos_embeds` — never appears in any DSL.
-    LoadPosEmbeds(u32),
+    /// The copy is what lets consume-pattern Impls downstream of the extern (`QuickGelu` /
+    /// `GeluErf` / `VisionRope` on pixels) read it as a tile-table `Owned` entry —
+    /// `take_owned` requires `Owned`, and a borrowed `External` wrapper around the view would
+    /// panic on the first such consumer. Synthesized exclusively by
+    /// `rows_lowering::materialize_rows` — never appears in any DSL.
+    LoadRows(u32, RowsExtern),
     /// Erf-form GELU activation: same shape as `QuickGelu`. Distinct
     /// numerics (`0.5 * x * (1 + erf(x / sqrt(2)))`).
     GeluErf(u32, u32),
@@ -625,6 +607,9 @@ pub enum Instruction {
     /// Qwen3.5 attention output gate. Args `(attn_slot, gate_slot, out_slot)`.
     /// `out = attn * sigmoid(gate)`.
     GateApply(u32, u32, u32),
+    /// Two same-width row tiles side by side. Args `(a_slot, b_slot, out_slot)`;
+    /// `out[t] = a[t] ++ b[t]`, `[T, W] ++ [T, W] → [T, 2W]`.
+    Concat(u32, u32, u32),
     /// Qwen3.5-MoE shared-expert combine. Args `(routed_slot, shared_slot,
     /// gate_slot, out_slot)`. `out = routed + shared_y * sigmoid(g)`; `g` is
     /// `[T, 1]`, row-broadcast across the hidden axis.
@@ -907,6 +892,25 @@ impl Clone for Instruction {
     }
 }
 
+/// A runtime tensor of `[num_tokens, width]` rows a forward reads as an input, delivered by the
+/// host before the forward runs — what [`Instruction::LoadRows`] copies into a tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowsExtern {
+    /// Vision patches, `[num_tokens, vision_in_features]`.
+    Pixels,
+    /// Qwen3.5-VL's learned positional embedding, interpolated on the host,
+    /// `[num_tokens, vision_embed_dim]`.
+    PosEmbeds,
+    /// Another forward's final hidden states, `[num_tokens, hidden_size]` — what a
+    /// multi-token-prediction head reads from its target model.
+    TargetHidden,
+}
+
+impl RowsExtern {
+    /// Every source, in the order a forward materializes the ones it reads.
+    pub const ALL: [Self; 3] = [Self::Pixels, Self::PosEmbeds, Self::TargetHidden];
+}
+
 /// How a projection's learned bias is stored — which accessor reads it: a
 /// dense `LinearLayer`'s `.bias`, or an MLX-affine layer's `linear_bias`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1026,7 +1030,7 @@ pub trait CanonicalParams: WeightAccessors {
     const VISION_Q_SIZE: usize = 0;
     /// Vision patch-embed input width = `in_chans * temporal_patch_size
     /// * patch_size²` (Qwen3.5-VL: 3·2·16² = 1536). The rank-2 last-dim
-    /// of the `pixels` extern; the metal `LoadPixels` arm uses it to
+    /// of the `pixels` extern; the metal `LoadRows(Pixels)` arm uses it to
     /// size the copy-into-arena dispatch. Same defaults / set-by rule as
     /// [`Self::VISION_NUM_HEADS`] (0 on non-vision arches).
     const VISION_IN_FEATURES: usize = 0;

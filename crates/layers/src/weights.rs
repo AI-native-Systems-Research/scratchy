@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use scratchy_tensors::{DType, DeviceAllocator, GpuTensor, PrecastEntry, PrecastPipeline};
 
@@ -106,7 +106,8 @@ fn write_from_f32(data: &[f32], dtype: DType) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// A CPU-side reference to tensor data — either mmap'd (read-only) or owned
-/// (e.g. after LoRA merging).
+/// (e.g. after LoRA merging). Cloning shares the backing (an Arc), never the bytes.
+#[derive(Clone)]
 struct CpuTensorRef {
     /// The mmap that backs this tensor (None for owned data).
     mmap: Option<Arc<memmap2::Mmap>>,
@@ -132,6 +133,29 @@ impl CpuTensorRef {
                 .expect("CpuTensorRef: no mmap or owned data");
             &mmap[self.data_offset..self.data_offset + self.size_bytes]
         }
+    }
+
+    /// Its first `rows` rows (its outermost dim), sharing an mmap backing: a row-major tensor's
+    /// leading rows are its leading bytes.
+    fn leading_rows(&self, rows: usize) -> Result<Self> {
+        let all = *self
+            .shape
+            .first()
+            .context("leading_rows: a scalar has no rows")?;
+        anyhow::ensure!(
+            rows <= all,
+            "leading_rows: {rows} rows of a {all}-row tensor"
+        );
+        let size_bytes = self.data().len() / all * rows;
+        let mut shape = self.shape.clone();
+        shape[0] = rows;
+        let owned = (self.owned.as_ref()).map(|b| Arc::new(b[..size_bytes].to_vec()));
+        Ok(Self {
+            size_bytes,
+            shape,
+            owned,
+            ..self.clone()
+        })
     }
 }
 
@@ -242,17 +266,7 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
             if tensors.contains_key(&alt) {
                 return None;
             }
-            Some((
-                alt,
-                CpuTensorRef {
-                    mmap: t.mmap.clone(),
-                    data_offset: t.data_offset,
-                    size_bytes: t.size_bytes,
-                    shape: t.shape.clone(),
-                    dtype: t.dtype,
-                    owned: t.owned.clone(),
-                },
-            ))
+            Some((alt, t.clone()))
         })
         .collect();
     for (alt, t) in alias_pairs {
@@ -442,7 +456,53 @@ impl<A: DeviceAllocator> scratchy_tensors::WeightSource for GpuWeights<A> {
     }
 }
 
+/// A snapshot of a weight store's tensor refs — mmap-backed views, no tensor bytes — kept to lend
+/// tensors after the store's own loader has consumed them (`take` removes what it uploads).
+pub struct TensorRefs(HashMap<String, CpuTensorRef>);
+
 impl<A: DeviceAllocator> GpuWeights<A> {
+    /// Snapshot this store's tensor refs ([`TensorRefs`]).
+    pub fn tensor_refs(&self) -> TensorRefs {
+        TensorRefs(self.tensors.clone())
+    }
+
+    /// Lend `from`'s tensors under `from_prefix` to this store under `as_prefix`: every
+    /// `<from_prefix>.<suffix>` is placed as `<as_prefix>.<suffix>` — its leading `rows` rows when
+    /// given (a draft head reading a prefix of its target's lm_head). How a multi-token-prediction
+    /// head borrows its target's token embedding and lm_head: the refs share the source's mmap,
+    /// so an allocator that maps registered mmaps zero-copy (metal) uploads nothing new. Errors
+    /// when `from` holds nothing under the prefix, or this store already holds a lent name.
+    pub fn lend(
+        &mut self,
+        from: &TensorRefs,
+        from_prefix: &str,
+        as_prefix: &str,
+        rows: Option<usize>,
+    ) -> Result<usize> {
+        let mut lent = 0;
+        for (name, t) in &from.0 {
+            let Some(suffix) = name
+                .strip_prefix(from_prefix)
+                .and_then(|rest| rest.strip_prefix('.'))
+            else {
+                continue;
+            };
+            let as_name = format!("{as_prefix}.{suffix}");
+            anyhow::ensure!(
+                !self.tensors.contains_key(&as_name),
+                "lend: this store already holds `{as_name}`"
+            );
+            let t = match rows {
+                Some(rows) => t.leading_rows(rows)?,
+                None => t.clone(),
+            };
+            self.tensors.insert(as_name, t);
+            lent += 1;
+        }
+        anyhow::ensure!(lent > 0, "lend: no tensor under `{from_prefix}`");
+        Ok(lent)
+    }
+
     /// Construct an empty `GpuWeights` — used by the GGUF loader in
     /// `scratchy-target-cuda`, which then populates `quantized` and
     /// `gguf_dense` directly via `quantized_map_mut` /
@@ -2820,5 +2880,29 @@ mod affine_width_tests {
             "b4 variant REJECTS b3 — the b4 loader would derive K=384*8 and \
              silently dequantize with the wrong width"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tensor's leading rows are its leading bytes, under its own shape; asking for more rows
+    /// than it has is an error.
+    #[test]
+    fn leading_rows_are_the_leading_bytes() {
+        let t = CpuTensorRef {
+            mmap: None,
+            data_offset: 0,
+            size_bytes: 24,
+            shape: vec![3, 2],
+            dtype: DType::F32,
+            owned: Some(Arc::new((0u8..24).collect())),
+        };
+        let two = t.leading_rows(2).expect("2 of 3 rows");
+        assert_eq!(two.shape, [2, 2]);
+        assert_eq!(two.size_bytes, 16);
+        assert_eq!(two.data(), (0u8..16).collect::<Vec<_>>());
+        assert!(t.leading_rows(4).is_err());
     }
 }

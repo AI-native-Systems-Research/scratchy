@@ -16,6 +16,7 @@ pub mod engine_io;
 #[cfg(feature = "forward-telemetry")]
 pub mod forward_telemetry;
 pub mod kv;
+pub mod lend;
 pub mod multimodal;
 pub mod request;
 #[cfg(feature = "sampler-telemetry")]

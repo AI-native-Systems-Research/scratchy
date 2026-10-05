@@ -64,6 +64,8 @@ pub enum NormalizedField {
     ConstBool(bool),
     /// The additive offset a KV writer's K and V carry.
     KvOffsets(crate::KvOffsets),
+    /// The runtime rows a `LoadRows` copies into its tile.
+    RowsExtern(crate::RowsExtern),
     /// Fixed-length integer array, truncated to its valid prefix
     /// (`Reshape::dims_lit[..ndim]`).
     ConstU32Array(Vec<u32>),
@@ -569,8 +571,9 @@ impl InstructionInfo for Instruction {
                 "PosEmbed",
                 vec![F::Slot(out_slot), F::LayerKind("Embedding")],
             ),
-            Instruction::LoadPixels(out_slot) => ("LoadPixels", vec![F::Slot(out_slot)]),
-            Instruction::LoadPosEmbeds(out_slot) => ("LoadPosEmbeds", vec![F::Slot(out_slot)]),
+            Instruction::LoadRows(out_slot, source) => {
+                ("LoadRows", vec![F::Slot(out_slot), F::RowsExtern(source)])
+            }
             Instruction::EmbeddingGather(in_slot, out_slot, indices_kind) => (
                 "EmbeddingGather",
                 vec![
@@ -696,6 +699,10 @@ impl InstructionInfo for Instruction {
             Instruction::GateApply(attn_slot, gate_slot, out_slot) => (
                 "GateApply",
                 vec![F::Slot(attn_slot), F::Slot(gate_slot), F::Slot(out_slot)],
+            ),
+            Instruction::Concat(a_slot, b_slot, out_slot) => (
+                "Concat",
+                vec![F::Slot(a_slot), F::Slot(b_slot), F::Slot(out_slot)],
             ),
             Instruction::GateScale(routed_slot, shared_slot, gate_slot, out_slot) => (
                 "GateScale",

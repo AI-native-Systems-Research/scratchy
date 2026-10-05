@@ -30,8 +30,8 @@ use scratchy_subtile::tape_folding::{
 };
 use scratchy_target_metal::from_tape::{StepInput, TapeItem};
 use scratchy_target_metal::op_abi::{
-    METAL_ELIDABLE, METAL_GUARD_GATES, MetalFusion, MoeWrite, metal_colour_rule, moe_write,
-    rope_append_weight_site,
+    GuardRun, METAL_ELIDABLE, MetalFusion, MoeWrite, metal_colour_rule, metal_guard_gates,
+    moe_write, rope_append_weight_site,
 };
 use scratchy_target_metal::tape::lowered::{Fence, RuntimeGate};
 use scratchy_target_metal::tape::step::{
@@ -283,6 +283,22 @@ impl OpColours {
     pub fn result(&self) -> Colour {
         self.result
     }
+
+    /// Every row's final hidden state: the vocabulary projection's activation (its sampled rows
+    /// put it back), or the result of a forward that ends without one.
+    pub fn hidden(&self, l: &LoweredDecode) -> Result<Slot, StepRefusal> {
+        let od = &l.input.ops[l.input.result];
+        match (od.op, od.inputs.first()) {
+            (SubOp::MatmulTile { .. } | SubOp::AllRowsMatmul, Some(&InputRef::Op(j))) => {
+                let why = |why| StepRefusal {
+                    op: Some((j, l.input.ops[j].op.name())),
+                    why,
+                };
+                self.of(l, j).map_err(why)
+            }
+            _ => Ok(Slot(self.result.index())),
+        }
+    }
 }
 
 /// A KV codec step's writer: its layer, pairing, class, offsets and weight site.
@@ -408,6 +424,8 @@ pub struct Recording<'a> {
     pub facts: &'a MetalStepFacts<'a>,
     pub hidden: W,
     pub intermediate: Inter,
+    /// The canonical's rows: its codec guards' realization.
+    pub bucket_m: u32,
 }
 
 impl Recording<'_> {
@@ -988,7 +1006,11 @@ impl Recording<'_> {
             e.lm_head = self.lm_head(i);
             if let Some(x) = self.l.op_expansion[i] {
                 e.sig.group = Some(x.id);
-                e.gate = x.guard.and_then(|g| METAL_GUARD_GATES.gate(g));
+                match x.guard.map(|g| metal_guard_gates(self.bucket_m).gate(g)) {
+                    None => {}
+                    Some(GuardRun::Gated(gate)) => e.gate = gate,
+                    Some(GuardRun::Dropped) => return Ok(None),
+                }
             }
         }
         Ok(e)
@@ -1721,13 +1743,14 @@ impl Recording<'_> {
                 Some(_) => Err(self.no(i, Refused::SampledNotAffine)),
             };
         };
-        let (reads, writes): (&[Slot], _) = match step {
-            R::Gather => (&[input], [input]),
-            R::Matmul => (&[input], [out]),
-            R::Scatter => (&[out], [out]),
-            R::AllRows => (&[input, out], [out]),
+        // The scatter also puts the gathered activation back.
+        let (reads, writes): (&[Slot], &[Slot]) = match step {
+            R::Gather => (&[input], &[input]),
+            R::Matmul => (&[input], &[out]),
+            R::Scatter => (&[input, out], &[input, out]),
+            R::AllRows => (&[input, out], &[out]),
         };
-        Ok(em(MetalStep::SampleRows(*g, step), reads, &writes, site))
+        Ok(em(MetalStep::SampleRows(*g, step), reads, writes, site))
     }
 
     /// A step no fold touches, lowered on its own.
@@ -1782,8 +1805,14 @@ impl Recording<'_> {
                     Vec::new(),
                 )
             }
-            L::LoadPixels { .. } => em(S::LoadPixels(out()?), &[], &[out()?], Vec::new()),
-            L::LoadPosEmbeds { .. } => em(S::LoadPosEmbeds(out()?), &[], &[out()?], Vec::new()),
+            L::Concat { cols } => {
+                let (a, b, out) = (self.read(i, 0)?, self.read(i, 1)?, out()?);
+                let width = st::ActivationWidth::of_cols(cols / 2);
+                em(S::Concat(a, b, out, width), &[a, b], &[out], Vec::new())
+            }
+            L::LoadRows { source, .. } => {
+                em(S::LoadRows(out()?, source), &[], &[out()?], Vec::new())
+            }
             L::Elementwise(E::Gelu) => unary(&S::Gelu)?,
             L::Elementwise(E::QuickGelu) => unary(&S::QuickGelu)?,
             L::Elementwise(E::GeluErf) => unary(&S::GeluErf)?,

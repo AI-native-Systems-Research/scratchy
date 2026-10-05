@@ -1777,13 +1777,19 @@ impl InstructionEval for Instruction {
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
-            Instruction::LoadPixels(out_slot) => unsafe {
-                let view = ctx.fwd.pixels.expect(
-                    "Instruction::LoadPixels invoked without ForwardCtx::pixels — \
-                     caller (vision_forward host wrapper) must populate this view \
-                     before driving the vision interpreter, mirroring the \
-                     vision_rope_cos / vision_rope_sin contract",
-                );
+            Instruction::LoadRows(out_slot, source) => unsafe {
+                use scratchy_forward_compiler::RowsExtern;
+                // The host writer populates the source's view before driving the interpreter
+                // (the vision wrapper for pixels / pos_embeds, the MTP proposer for a target's
+                // hidden rows).
+                let view = match source {
+                    RowsExtern::Pixels => ctx.fwd.pixels,
+                    RowsExtern::PosEmbeds => ctx.fwd.pos_embeds,
+                    RowsExtern::TargetHidden => ctx.fwd.target_hidden,
+                }
+                .unwrap_or_else(|| {
+                    panic!("Instruction::LoadRows({source:?}) invoked without its ForwardCtx view")
+                });
                 let raw = view.as_raw();
                 let shape: Vec<usize> = raw.shape().iter().map(|&d| d as usize).collect();
                 let owned = ctx.device.caching.alloc_tensor(&shape, raw.dtype());
@@ -1794,27 +1800,7 @@ impl InstructionEval for Instruction {
                     bytes,
                     ctx.device.compute_stream,
                 )
-                .expect("LoadPixels D2D copy");
-                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
-            },
-            Instruction::LoadPosEmbeds(out_slot) => unsafe {
-                let view = ctx.fwd.pos_embeds.expect(
-                    "Instruction::LoadPosEmbeds invoked without ForwardCtx::pos_embeds — \
-                     caller (vision_forward host wrapper) must populate this view \
-                     (host-interpolated learned positional embedding) before driving \
-                     the vision interpreter, mirroring the pixels contract",
-                );
-                let raw = view.as_raw();
-                let shape: Vec<usize> = raw.shape().iter().map(|&d| d as usize).collect();
-                let owned = ctx.device.caching.alloc_tensor(&shape, raw.dtype());
-                let bytes = raw.size_bytes();
-                crate::driver::memcpy_dtod_async(
-                    (*owned).raw_ptr(),
-                    raw.raw_ptr(),
-                    bytes,
-                    ctx.device.compute_stream,
-                )
-                .expect("LoadPosEmbeds D2D copy");
+                .expect("LoadRows D2D copy");
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             },
             Instruction::FlashInferAttentionDecode(
@@ -2156,6 +2142,31 @@ impl InstructionEval for Instruction {
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::Concat(a_slot, b_slot, out_slot) => unsafe {
+                // out[t] = a[t] ++ b[t]: each operand lands as one half of every output row.
+                let a_tv = tile_ref(ctx.tiles, a_slot).as_view(ctx.tiles);
+                let b_tv = tile_ref(ctx.tiles, b_slot).as_view(ctx.tiles);
+                let (nt, ncols, dt) = ((*a_tv).dim(0), (*a_tv).dim(1), (*a_tv).dtype());
+                let out = ctx.device.caching.alloc_tensor(&[nt, 2 * ncols], dt);
+                let row_bytes = ncols * dt.size_bytes();
+                let dst = (*out.view()).raw_ptr();
+                for (src, offset) in [(*a_tv).as_ptr::<u8>(), (*b_tv).as_ptr::<u8>()]
+                    .into_iter()
+                    .zip([0, row_bytes])
+                {
+                    crate::driver::memcpy_2d_dtod_async(
+                        dst.add(offset),
+                        2 * row_bytes,
+                        src,
+                        row_bytes,
+                        row_bytes,
+                        nt,
+                        ctx.device.compute_stream,
+                    )
+                    .expect("Concat: pitched copy");
+                }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::GateScale(routed_slot, shared_slot, gate_slot, out_slot) => unsafe {

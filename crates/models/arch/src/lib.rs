@@ -142,6 +142,10 @@ pub mod qwen3_5;
 #[path = "arch/qwen3_5_moe.rs"]
 pub mod qwen3_5_moe;
 
+#[cfg(all(feature = "arch-qwen3-5-mtp", any(feature = "cuda", feature = "metal")))]
+#[path = "arch/qwen3_5_mtp.rs"]
+pub mod qwen3_5_mtp;
+
 #[cfg(all(feature = "arch-qwen3-5-vl", any(feature = "cuda", feature = "metal")))]
 #[path = "arch/qwen3_5_vl.rs"]
 pub mod qwen3_5_vl;

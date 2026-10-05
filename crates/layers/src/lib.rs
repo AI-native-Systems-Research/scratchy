@@ -32,4 +32,4 @@ pub use layers::{
     GatedDeltaNetLayer, GgmlLinear, LayerNorm, LayerNormBias, Linear, LinearLayer, MarlinLinear,
     RmsNorm,
 };
-pub use weights::{GpuWeights, UploadSrc};
+pub use weights::{GpuWeights, TensorRefs, UploadSrc};

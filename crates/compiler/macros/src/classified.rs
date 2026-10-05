@@ -141,9 +141,12 @@ pub enum ExternKind {
     /// so unlike Gemma3's `PositionIds`→`pos_embed` row-gather, this
     /// arch ships the *result* as an extern and the DSL just
     /// `add(pos_embeds, hidden_states)` after patch_embed. Materialized
-    /// into a tile by `vision_lowering::materialize_pos_embeds`
-    /// (mirrors [`Pixels`]).
+    /// into a tile by `rows_lowering::materialize_rows` (as [`Pixels`]).
     PosEmbeds,
+    /// A target model's final (post-norm) hidden states, `[num_tokens, hidden_size]` — what a
+    /// multi-token-prediction head fuses with the next token's embedding. Written by the host
+    /// from the target's forward; materialized into a tile by `rows_lowering::materialize_rows`.
+    TargetHidden,
 }
 
 /// Which DSL prelude (extern + op name set) is in scope when a
@@ -182,6 +185,7 @@ impl ExternKind {
             (Prelude::Decoder, "rotary_local") => Some(Self::RotaryLocal),
             (Prelude::Decoder, "block_table") => Some(Self::BlockTable),
             (Prelude::Decoder, "kv_cache") => Some(Self::KvCache),
+            (Prelude::Decoder, "target_hidden") => Some(Self::TargetHidden),
             (Prelude::Vision, "pixels") => Some(Self::Pixels),
             (Prelude::Vision, "cu_seqlens") => Some(Self::CuSeqlens),
             (Prelude::Vision, "cos") => Some(Self::Cos),
@@ -197,6 +201,16 @@ impl ExternKind {
             (Prelude::Vision, "position_ids") => Some(Self::PositionIds),
             (Prelude::Vision, "pos_embeds") => Some(Self::PosEmbeds),
             _ => None,
+        }
+    }
+
+    /// The extern a body names a host-staged row source by.
+    pub fn of_rows(source: scratchy_forward_compiler::RowsExtern) -> Self {
+        use scratchy_forward_compiler::RowsExtern;
+        match source {
+            RowsExtern::Pixels => Self::Pixels,
+            RowsExtern::PosEmbeds => Self::PosEmbeds,
+            RowsExtern::TargetHidden => Self::TargetHidden,
         }
     }
 }
@@ -450,39 +464,32 @@ pub enum OpKind {
     /// Shape-preserving 2-input elementwise. A fused op because bare `*` and
     /// `sigmoid` are not DSL-callable (`Silu`/`Mul` are synthesis-only).
     GateApply,
+    /// Row concatenation of two same-width tiles: `concat(a, b)` is `[T, W] ++ [T, W] →
+    /// [T, 2W]`, `out[t] = a[t] ++ b[t]`. The input fusion of an MTP head
+    /// (`fc(concat(norm(embed(tok)), norm(target_hidden)))`); equal widths keep the output
+    /// width a product (`2·W`), which every such head has.
+    Concat,
     /// Qwen3.5-MoE shared-expert combine: `out = routed + shared_y *
     /// sigmoid(g)` with `g` `[T, 1]` broadcast across the hidden axis.
     /// 3-input elementwise-with-row-broadcast; a fused op because bare
     /// `*`/`sigmoid` aren't DSL-callable and `Mul`'s shape sig unifies
     /// dims, so `[T, 1] × [T, H]` cannot be expressed with `mul`.
     GateScale,
-    /// Vision-prelude pixels materialization. Synthesized by
-    /// `vision_lowering::materialize_pixels` between `fuf::unroll`
-    /// and the solver: takes zero FUF inputs and produces a single
-    /// rank-2 output `[num_tokens, vision_in_features]` whose runtime
-    /// value is `ctx.fwd.pixels` wrapped into a tile.
+    /// Host-staged rows → tile materialization. Synthesized by
+    /// `rows_lowering::materialize_rows` between `fuf::unroll` and the solver, one per row
+    /// extern the body reads: takes zero FUF inputs and produces a single rank-2 output
+    /// `[num_tokens, width]` whose runtime value is the source's `ForwardCtx` view
+    /// (`ctx.fwd.pixels`, the interpolated `pos_embeds`, a target's hidden rows).
     ///
-    /// Mirrors the role `EmbedRefImpl` plays for `input_ids` on the
-    /// decoder side: every downstream vision Impl
-    /// (`VarlenAttention` / `VisionRope` / `QuickGelu` / `GeluErf`)
-    /// reads its first input as `FufInput::Tile { id, slot }`, so the
-    /// extern → tile transition has to happen exactly once,
-    /// up-front, rather than being hand-unrolled into every per-Impl
-    /// `fan_out`.
+    /// Mirrors the role `EmbedRefImpl` plays for `input_ids`: every downstream Impl reads its
+    /// inputs as `FufInput::Tile { id, slot }`, so the extern → tile transition has to happen
+    /// exactly once, up-front, rather than being hand-unrolled into every per-Impl `fan_out`.
     ///
     /// No DSL surface — `from_name` deliberately omits it. The
     /// lowering pass writes `outputs[0]` directly (same pattern as
     /// `AllGather` and `MmEmbedSplice`), so `apply_signature` rejects
     /// this OpKind.
-    LoadPixels,
-    /// Vision-prelude `pos_embeds` extern → tile materialization
-    /// (Qwen3.5-VL). The exact sibling of [`Self::LoadPixels`]:
-    /// synthesized by `vision_lowering::materialize_pos_embeds`, takes
-    /// zero FUF inputs, produces a single rank-2 output
-    /// `[num_tokens, vision_embed_dim]` whose runtime value is the
-    /// host-interpolated `ctx.fwd.pos_embeds` view. No DSL surface;
-    /// `apply_signature` rejects it (output shape written directly).
-    LoadPosEmbeds,
+    LoadRows(scratchy_forward_compiler::RowsExtern),
     /// Row-permutation gather: `out = embedding_gather(x, indices)`.
     /// `x` is a rank-2 tile `[L, N]` (any inner-dim factorization);
     /// `indices` is a vision-prelude extern of `[`[`ExternKind::WindowIndex`]`
@@ -578,6 +585,7 @@ impl OpKind {
             "gated_delta_net" => Some(Self::GatedDeltaNet),
             "gate_split" => Some(Self::GateSplit),
             "gate_apply" => Some(Self::GateApply),
+            "concat" => Some(Self::Concat),
             "gate_scale" => Some(Self::GateScale),
             "embedding_gather" => Some(Self::EmbeddingGather),
             "avg_pool_2d" => Some(Self::AvgPool2d),
@@ -621,6 +629,7 @@ impl OpKind {
             Self::GatedDeltaNet => "gated_delta_net",
             Self::GateSplit => "gate_split",
             Self::GateApply => "gate_apply",
+            Self::Concat => "concat",
             Self::GateScale => "gate_scale",
             // No DSL surface — produced only by the post-FUF lowering
             // pass at tp>1. `from_name` deliberately omits it so a
@@ -633,10 +642,8 @@ impl OpKind {
             // Lowering-pass-only op kind — see `OpKind::MmEmbedSplice`
             // doc-comment. No DSL surface.
             Self::MmEmbedSplice => "mm_embed_splice",
-            // Vision lowering-pass-only op kind — see
-            // `OpKind::LoadPixels` doc-comment. No DSL surface.
-            Self::LoadPixels => "load_pixels",
-            Self::LoadPosEmbeds => "load_pos_embeds",
+            // Lowering-pass-only op kind — see `OpKind::LoadRows` doc-comment. No DSL surface.
+            Self::LoadRows(_) => "load_rows",
             Self::EmbeddingGather => "embedding_gather",
             Self::AvgPool2d => "avg_pool_2d",
             Self::StripCls => "strip_cls",
@@ -800,9 +807,8 @@ impl WeightTable {
         self.entries.len()
     }
 
-    /// Test helper: find a weight id by its path segments as strings.
-    #[cfg(test)]
-    pub fn path_for_test(&self, segments: &[&str]) -> Option<WeightId> {
+    /// The weight whose path is exactly `segments`, if the program has one.
+    pub fn find(&self, segments: &[&str]) -> Option<WeightId> {
         self.entries.iter().enumerate().find_map(|(i, p)| {
             if p.len() == segments.len() && p.iter().zip(segments).all(|(s, t)| s == t) {
                 Some(WeightId(i as u32))

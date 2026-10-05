@@ -16,7 +16,7 @@ use scratchy_target_metal::tape::constants::{ConstSlot, ConstantValue};
 use scratchy_target_metal::tape::ids::{KDimI32, NDimI32, NumExperts, TopK};
 use scratchy_target_metal::tape::kernel_constants::{
     AffineCodes, AffineGatherQmvConstants, AffineQmvConstants, GatherRows, MoeRouteConstants,
-    RoutedConstants,
+    RoutedConstants, SharedExperts,
 };
 use scratchy_target_metal::tape::step::{LayerId, RoutePost, RoutePre, RouteProgram, Scale};
 
@@ -177,7 +177,14 @@ struct Block {
 
 impl Block {
     /// `gelu` picks GELU (tanh) over SiLU as the gated activation; `experts` is the bank size.
-    fn new(device: &common::Device, tokens: usize, gelu: bool, experts: usize) -> Self {
+    /// `shared` is where its pairs that share an expert run.
+    fn new(
+        device: &common::Device,
+        tokens: usize,
+        gelu: bool,
+        experts: usize,
+        shared: SharedExperts,
+    ) -> Self {
         let mut rng = Lcg(0x5eed);
         let gate = Experts::new(device, &mut rng, experts, INTER, HIDDEN);
         let up = Experts::new(device, &mut rng, experts, INTER, HIDDEN);
@@ -195,7 +202,7 @@ impl Block {
         let rows = GatherRows::Tokens(TopK(TOP_K as u32));
         let act_code = ConstantValue::int(ConstSlot(3), i32::from(gelu));
         let mut gated_constants = gate.constants(rows);
-        gated_constants.push(act_code);
+        gated_constants.extend([act_code, shared.constant()]);
         let act_symbol = if gelu {
             "gelu_mul_bf16"
         } else {
@@ -303,13 +310,13 @@ impl Block {
             Dispatch {
                 pso: &self.gated,
                 buffers: gated,
-                groups: size(1, INTER.div_ceil(8), self.tokens * TOP_K),
+                groups: size(self.tokens * TOP_K, INTER.div_ceil(8), 1),
                 threads: size(32, 4, 1),
             },
             Dispatch {
                 pso: &self.combine,
                 buffers: combine,
-                groups: size(1, HIDDEN.div_ceil(4), self.tokens),
+                groups: size(self.tokens, HIDDEN.div_ceil(4), 1),
                 threads: size(32, TOP_K, 1),
             },
         ]
@@ -324,16 +331,20 @@ fn bits(buf: &common::Buffer, n: usize) -> Vec<u16> {
 fn fused_moe_kernels_match_the_unfused_chain() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    for gelu in [true, false] {
-        for tokens in [1, 3] {
-            let block = Block::new(&device, tokens, gelu, EXPERTS);
+    let modes = [SharedExperts::Apart, SharedExperts::InFirstPair];
+    for (gelu, shared) in [true, false]
+        .into_iter()
+        .flat_map(|g| modes.map(|s| (g, s)))
+    {
+        for tokens in [1, 3, 4] {
+            let block = Block::new(&device, tokens, gelu, EXPERTS, shared);
             run(&device, 1, 1, |_| block.unfused(0));
             run(&device, 1, 1, |_| block.fused(0));
             let pairs = tokens * TOP_K;
             let act = bits(&block.gate_y, pairs * INTER);
             let out = bits(&block.out, tokens * HIDDEN);
             assert!(act.iter().any(|&v| v != 0) && out.iter().any(|&v| v != 0));
-            let what = format!("gelu={gelu} tokens={tokens}");
+            let what = format!("gelu={gelu} {shared:?} tokens={tokens}");
             assert_eq!(
                 act,
                 bits(&block.fused_gate_y, pairs * INTER),
@@ -366,7 +377,8 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
         .flat_map(|g| [EXPERTS, 256].map(|e| (g, e)))
         .flat_map(|(g, e)| [tokens, 5].map(|l| (g, e, l)))
     {
-        let block = Block::new(&device, tokens, gelu, experts);
+        // A sorted bake runs each pair in its own threadgroup.
+        let block = Block::new(&device, tokens, gelu, experts, SharedExperts::Apart);
         run(&device, 1, 1, |_| block.fused(0));
         let live_pairs = live * TOP_K;
         let reference_act = bits(&block.fused_gate_y, tokens * TOP_K * INTER);
@@ -440,7 +452,7 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
         let rows = GatherRows::Pairs;
         let act_code = int(3, i32::from(gelu));
         let mut gated_constants = block.gate.constants(rows);
-        gated_constants.push(act_code);
+        gated_constants.extend([act_code, SharedExperts::Apart.constant()]);
         let gated_pso = block
             .gate
             .pipeline(&device, "affine_gather_qmv_gated", gated_constants);
@@ -499,7 +511,8 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                         (&block.up.b, 8),
                         (&sorted_up_y, 9),
                     ],
-                    groups: size(1, INTER.div_ceil(8), pairs),
+                    // Pairs along X, as the fused path.
+                    groups: size(pairs, INTER.div_ceil(8), 1),
                     threads: size(32, 4, 1),
                 },
                 Dispatch {
@@ -588,7 +601,11 @@ fn routed_matches_the_routing_command(
     let ((inds, scores), (routed_inds, routed_scores)) = (picks(), picks());
     let rows = GatherRows::Tokens(top_k);
     let mut gated_c = block.gate.constants(rows);
-    gated_c.push(ConstantValue::int(ConstSlot(3), 1));
+    // A routed command's pairs run apart: each knows its own token's picks only.
+    gated_c.extend([
+        ConstantValue::int(ConstSlot(3), 1),
+        SharedExperts::Apart.constant(),
+    ]);
     gated_c.extend(Vec::<ConstantValue>::from(RoutedConstants {
         experts,
         program,
@@ -641,7 +658,8 @@ fn routed_matches_the_routing_command(
         chain.push(Dispatch {
             pso: gated,
             buffers: g,
-            groups: size(1, INTER.div_ceil(8), TOP_K),
+            // Pairs along X, as the fused path.
+            groups: size(TOP_K, INTER.div_ceil(8), 1),
             threads: size(32, 4, 1),
         });
         chain.push(Dispatch {
@@ -688,7 +706,7 @@ fn routed_matches_the_routing_command(
 fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    let block = Block::new(&device, 1, true, EXPERTS);
+    let block = Block::new(&device, 1, true, EXPERTS, SharedExperts::Apart);
     // Gemma-4's program, and the shared-expert router's (a softmax over every expert first).
     let gemma = RouteProgram {
         pre: RoutePre::None,
@@ -886,7 +904,7 @@ fn plain_qmv_us(device: &common::Device, n_out: usize, k_in: usize) -> f64 {
 fn bench_moe_fused() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    let block = Block::new(&device, 1, true, EXPERTS);
+    let block = Block::new(&device, 1, true, EXPERTS, SharedExperts::Apart);
     let sets = block.indices.len();
     let pct = |new: f64, old: f64| (new / old - 1.0) * 100.0;
     run(&device, 200, 2, |i| block.unfused(i % sets));

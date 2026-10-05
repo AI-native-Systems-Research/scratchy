@@ -473,6 +473,7 @@ pub fn apply_signature_with_geometry(
         OpKind::GatedDeltaNet => sig_gated_delta_net(solver, inputs),
         OpKind::GateSplit => sig_gate_split(solver, inputs),
         OpKind::GateApply => sig_gate_apply(solver, inputs),
+        OpKind::Concat => sig_concat(solver, inputs),
         OpKind::GateScale => sig_gate_scale(solver, inputs),
         // MmEmbedSplice: identity-shape one-input in-place. Same
         // signature as AllReduce — the splice mutates the embed
@@ -482,27 +483,16 @@ pub fn apply_signature_with_geometry(
         // this arm via `apply_signature` is fine: sig_unary_elementwise
         // re-unifies and agrees.
         OpKind::MmEmbedSplice => sig_unary_elementwise(solver, inputs, op),
-        // LoadPixels has no FUF inputs (the runtime tile is built
-        // from `ctx.fwd.pixels`). The materialize_pixels pass writes
-        // `outputs[0] = extern_shape(ExternKind::Pixels)` directly
-        // when inserting the node; the FUF-level shape unifier never
-        // re-derives it. Reaching this arm is a compiler bug — same
-        // story as `AllGather` and `Reshape`.
-        OpKind::LoadPixels => Err(ShapeError::BadArgs {
-            op: OpKind::LoadPixels,
-            reason: "apply_signature should not be called on LoadPixels; \
-                     the vision_lowering::materialize_pixels pass sets \
-                     FufNode.outputs[0] to extern_shape(Pixels) directly \
-                     when inserting the node post-FUF-build"
-                .into(),
-        }),
-        // Same story as LoadPixels: synthesized post-FUF-build with its
-        // output shape written directly by materialize_pos_embeds.
-        OpKind::LoadPosEmbeds => Err(ShapeError::BadArgs {
-            op: OpKind::LoadPosEmbeds,
-            reason: "apply_signature should not be called on LoadPosEmbeds; \
-                     the vision_lowering::materialize_pos_embeds pass sets \
-                     FufNode.outputs[0] to extern_shape(PosEmbeds) directly \
+        // LoadRows has no FUF inputs (the runtime tile is built from the source's
+        // `ForwardCtx` view). The materialize_rows pass writes `outputs[0] =
+        // extern_shape(<the source's extern>)` directly when inserting the node; the FUF-level
+        // shape unifier never re-derives it. Reaching this arm is a compiler bug — same story
+        // as `AllGather` and `Reshape`.
+        OpKind::LoadRows(_) => Err(ShapeError::BadArgs {
+            op,
+            reason: "apply_signature should not be called on LoadRows; \
+                     the rows_lowering::materialize_rows pass sets \
+                     FufNode.outputs[0] to the source's extern_shape directly \
                      when inserting the node post-FUF-build"
                 .into(),
         }),
@@ -525,20 +515,19 @@ pub fn apply_signature_with_geometry(
     }
 }
 
-/// `embed(ids: [..ids.shape], table: [vocab_size, hidden_size])`
-/// → `[..ids.shape, hidden_size]`.
+/// `embed(ids: [..ids.shape], table: [rows, hidden_size])` → `[..ids.shape, hidden_size]`. The
+/// table's rows are its own — `vocab_size`, or a draft head's `embed_vocab_size` (it embeds every
+/// token of a vocabulary its logits only cover a prefix of): no output dim reads them.
 fn sig_embed(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
     expect_args(OpKind::Embed, inputs, 2)?;
     let ids = &inputs[0];
     let table = &inputs[1];
-    // table: [vocab_size, hidden_size]
     if table.len() != 2 {
         return Err(ShapeError::BadArgs {
             op: OpKind::Embed,
             reason: format!("embed weight must have rank 2, got {}", table.len()),
         });
     }
-    solver.unify(&table[0], &Dim::Bound("vocab_size".into()))?;
     solver.unify(&table[1], &Dim::Bound("hidden_size".into()))?;
     let mut output = ids.clone();
     output.push(Dim::Bound("hidden_size".into()));
@@ -941,6 +930,28 @@ fn sig_gate_apply(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shape
     })
 }
 
+/// `concat(a, b)` → `[T, 2·W]` for `a`, `b` both `[T, W]`: the rows side by side. The widths
+/// must agree, which keeps the output width a product rather than a sum.
+fn sig_concat(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::Concat, inputs, 2)?;
+    let (a, b) = (&inputs[0], &inputs[1]);
+    if a.len() != 2 || b.len() != 2 {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::Concat,
+            reason: format!(
+                "concat takes two rank-2 row tiles, got ranks {} and {}",
+                a.len(),
+                b.len()
+            ),
+        });
+    }
+    solver.unify(&a[0], &b[0])?;
+    solver.unify(&a[1], &b[1])?;
+    Ok(OpSig {
+        output: vec![a[0].clone(), Dim::Mul(vec![Dim::Lit(2), a[1].clone()])],
+    })
+}
+
 /// `gate_scale(routed, shared_y, g)` → `[T, H]` (= routed shape).
 /// `out = routed + shared_y * sigmoid(g)` — the Qwen3.5-MoE shared-expert
 /// combine. `g` is `[T, 1]`, row-broadcast across the hidden axis, so it
@@ -1140,15 +1151,13 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // GateSplit/GateApply/GateScale take only activation inputs; no tensor weight args.
         OpKind::GateSplit => &[],
         OpKind::GateApply => &[],
+        OpKind::Concat => &[],
         OpKind::GateScale => &[],
         // MmEmbedSplice takes one activation input, no tensor weight.
         OpKind::MmEmbedSplice => &[],
-        // LoadPixels has zero FUF inputs (the tile is materialized
-        // from `ctx.fwd.pixels` at runtime), so no weight-arg ranks.
-        OpKind::LoadPixels => &[],
-        // LoadPosEmbeds: same as LoadPixels — zero FUF inputs (tile
-        // materialized from `ctx.fwd.pos_embeds` at runtime).
-        OpKind::LoadPosEmbeds => &[],
+        // LoadRows has zero FUF inputs (the tile is materialized from the source's
+        // `ForwardCtx` view at runtime), so no weight-arg ranks.
+        OpKind::LoadRows(_) => &[],
         // EmbeddingGather: arg 0 is a tile, arg 1 is a vision extern
         // (no rank assertion via this table — extern_shape arms carry
         // empty Shape for the indices externs).
@@ -1236,6 +1245,11 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
         ExternKind::PosEmbeds => vec![
             Dim::Bound("num_tokens".into()),
             Dim::Bound("vision_embed_dim".into()),
+        ],
+        // A target model's final hidden states: one residual-width row per token.
+        ExternKind::TargetHidden => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("hidden_size".into()),
         ],
     }
 }
@@ -2462,7 +2476,7 @@ mod tests {
         // Find q_proj's weight id via its path.
         let q_proj_id = p
             .weights
-            .path_for_test(&["self_attn", "q_proj"])
+            .find(&["self_attn", "q_proj"])
             .expect("q_proj present");
         let q_proj_shape = inf.weights.get(&q_proj_id).expect("q_proj inferred");
         assert_eq!(
@@ -2474,7 +2488,7 @@ mod tests {
         // k_proj and v_proj use num_key_value_heads instead.
         let k_proj_id = p
             .weights
-            .path_for_test(&["self_attn", "k_proj"])
+            .find(&["self_attn", "k_proj"])
             .expect("k_proj present");
         let k_proj_shape = inf.weights.get(&k_proj_id).unwrap();
         assert_eq!(
@@ -2490,7 +2504,7 @@ mod tests {
         // hidden_states' last dim.
         let o_proj_id = p
             .weights
-            .path_for_test(&["self_attn", "o_proj"])
+            .find(&["self_attn", "o_proj"])
             .expect("o_proj present");
         let o_proj_shape = inf.weights.get(&o_proj_id).unwrap();
         assert_eq!(
@@ -2502,7 +2516,7 @@ mod tests {
         // input_layernorm is 1-D of hidden_size.
         let ln_id = p
             .weights
-            .path_for_test(&["input_layernorm"])
+            .find(&["input_layernorm"])
             .expect("input_layernorm present");
         let ln_shape = inf.weights.get(&ln_id).unwrap();
         assert_eq!(ln_shape, &vec![bound("hidden_size")]);
@@ -2536,7 +2550,7 @@ mod tests {
         // q_proj still resolves to [hidden_size, num_attention_heads*head_dim].
         let q_proj_id = p
             .weights
-            .path_for_test(&["self_attn", "q_proj"])
+            .find(&["self_attn", "q_proj"])
             .expect("q_proj present");
         let q_proj_shape = inf.weights.get(&q_proj_id).expect("q_proj inferred");
         assert_eq!(
@@ -2600,13 +2614,13 @@ mod tests {
         )
         .expect("infer");
 
-        let gate_id = p.weights.path_for_test(&["mlp", "gate_proj"]).unwrap();
+        let gate_id = p.weights.find(&["mlp", "gate_proj"]).unwrap();
         assert_eq!(
             inf.weights.get(&gate_id).unwrap(),
             &vec![bound("hidden_size"), bound("intermediate_size")],
         );
 
-        let down_id = p.weights.path_for_test(&["mlp", "down_proj"]).unwrap();
+        let down_id = p.weights.find(&["mlp", "down_proj"]).unwrap();
         assert_eq!(
             inf.weights.get(&down_id).unwrap(),
             &vec![bound("intermediate_size"), bound("hidden_size")],
@@ -3014,34 +3028,34 @@ mod tests {
     }
 
     #[test]
-    fn load_pixels_is_lowering_only_op_kind() {
-        // G.5.e.1 contract: `LoadPixels` is produced exclusively by
-        // the `vision_lowering::materialize_pixels` pass between
-        // `fuf::unroll` and the solver. It must NOT be reachable via
-        // `from_name` (no parse-then-reject — a user that wrote
-        // `load_pixels(...)` in a `#[vision_forward]` body classifies
-        // as an unknown op rather than an OpKind that any consumer is
-        // unprepared for), and `apply_signature` must error out on it
-        // (mirrors `AllGather` / `Reshape` — the materialize pass
-        // writes `outputs[0]` directly when constructing the node).
-        assert_eq!(OpKind::LoadPixels.as_str(), "load_pixels");
-        assert_eq!(OpKind::from_name("load_pixels"), None);
-        assert_eq!(weight_arg_ranks(OpKind::LoadPixels), &[]);
+    fn load_rows_is_lowering_only_op_kind() {
+        // Contract: `LoadRows` is produced exclusively by the
+        // `rows_lowering::materialize_rows` pass between `fuf::unroll` and the solver. It must
+        // NOT be reachable via `from_name` (no parse-then-reject — a user that wrote
+        // `load_rows(...)` in a body classifies as an unknown op rather than an OpKind that any
+        // consumer is unprepared for), and `apply_signature` must error out on it (mirrors
+        // `AllGather` / `Reshape` — the materialize pass writes `outputs[0]` directly when
+        // constructing the node).
+        for source in scratchy_forward_compiler::RowsExtern::ALL {
+            let load = OpKind::LoadRows(source);
+            assert_eq!(load.as_str(), "load_rows");
+            assert_eq!(OpKind::from_name("load_rows"), None);
+            assert_eq!(weight_arg_ranks(load), &[]);
 
-        let mut solver = Solver::new();
-        let err = apply_signature(&mut solver, OpKind::LoadPixels, &[]);
-        match err {
-            Err(ShapeError::BadArgs { op, reason }) => {
-                assert_eq!(op, OpKind::LoadPixels);
-                assert!(
-                    reason.contains("materialize_pixels"),
-                    "reason must point at the lowering pass, got: {reason}",
-                );
+            let mut solver = Solver::new();
+            match apply_signature(&mut solver, load, &[]) {
+                Err(ShapeError::BadArgs { op, reason }) => {
+                    assert_eq!(op, load);
+                    assert!(
+                        reason.contains("materialize_rows"),
+                        "reason must point at the lowering pass, got: {reason}",
+                    );
+                }
+                Err(other) => {
+                    panic!("{load:?} apply_signature must return BadArgs, got error: {other:?}")
+                }
+                Ok(_) => panic!("{load:?} apply_signature must error, not succeed"),
             }
-            Err(other) => {
-                panic!("LoadPixels apply_signature must return BadArgs, got error: {other:?}")
-            }
-            Ok(_) => panic!("LoadPixels apply_signature must error, not succeed"),
         }
     }
 }
