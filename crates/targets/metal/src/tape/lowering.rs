@@ -1313,6 +1313,54 @@ fn lower_one(
     use MetalStep as I;
 
     let cmd = match inst {
+        // ── A row program: row-wise steps over one width as one command ──
+        I::RowProgram(r) => {
+            use crate::tape::step::RowInstr as R;
+            let arena = |slot: Option<Slot>, binding_index| {
+                slot.map(|Slot(slot)| Binding::ArenaSlot {
+                    slot,
+                    binding_index,
+                })
+            };
+            let mut bindings: Vec<Binding> = (0u8..)
+                .zip(&r.inputs)
+                .filter_map(|(k, s)| arena(*s, k))
+                .chain((4u8..).zip(&r.outputs).filter_map(|(k, s)| arena(*s, k)))
+                .collect();
+            // Its site lists the weights in instruction order: a gain binds at 7 + its index, a
+            // scalar weight at 15 + its.
+            let mut site = 0u32;
+            for instr in r.instrs.iter().flatten() {
+                let (layer, binding_index) = match *instr {
+                    R::Norm { gain, .. } => (r.gains[usize::from(gain)], 7 + gain),
+                    R::ScaleWeight { scalar, .. } => (r.scalars[usize::from(scalar)], 15 + scalar),
+                    _ => continue,
+                };
+                let layer = layer.ok_or(LoweringError::RowProgramWeight)?;
+                let layer = super::ids::LayerId(layer.get() + layer_offset);
+                let ix = w.of(WeightKind::RmsNorm, site)?;
+                bindings.push(source(ix, WeightTensor::Weight, layer, binding_index));
+                site += 1;
+            }
+            LoweredCommand {
+                kernel: KernelId::RowProgram,
+                library: "row_program",
+                function: row_program_kernel_static_name(p, scale_dtype_for(p)),
+                constants: Vec::<ConstantValue>::from(&**r).into_baked(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, 1, 1),
+                    threads_per_threadgroup: (super::kernel_constants::NORM_THREADS, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: crate::tape::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: baked(bindings),
+                gemm_dims: None,
+            }
+        }
+
         // ── Token embedding ────────────────────────────────────────
         I::Embed(Slot(out_slot)) => LoweredCommand {
             kernel: KernelId::Embed,
@@ -1903,7 +1951,7 @@ fn lower_one(
                 let wide_ok =
                     profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
                 if g.ends != QmvEnds::default() && bucket_m != 1 {
-                    return Err(LoweringError::GatedMatvecRows { bucket_m });
+                    return Err(LoweringError::OneRowFold { bucket_m });
                 }
                 affine_qmv_command(
                     p,
@@ -1917,7 +1965,7 @@ fn lower_one(
                     qmv_end_weights(g, w, layer_offset)?,
                 )
             } else if g.ends != QmvEnds::default() {
-                return Err(LoweringError::GatedMatvecRows { bucket_m });
+                return Err(LoweringError::OneRowFold { bucket_m });
             } else {
                 // Matmul branch (prefill-shape). `pick_qmm_t_kernel`
                 // mirrors MLX `quantized.cpp:1411-1424 + :788-805`:
@@ -2636,7 +2684,7 @@ fn lower_one(
         }
         I::AffineGatedQmv(g, act) => {
             if bucket_m != 1 {
-                return Err(LoweringError::GatedMatvecRows { bucket_m });
+                return Err(LoweringError::OneRowFold { bucket_m });
             }
             let (n, k, gs, bits) = (g.n.get(), g.k.get(), g.group_size.get(), g.bits.get());
             let codes = super::kernel_constants::AffineCodes::of(profile, bits);
@@ -5643,6 +5691,33 @@ fn fused_add_rmsnorm_kernel_static_name(
     }
 }
 
+/// `MetalStep::RowProgram` symbol: the activation dtype and the norms' gain dtype.
+fn normed_gemv_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype) -> &'static str {
+    use ScaleDtype as S;
+    match (p.metal_dtype, scale_dtype) {
+        (MetalDtype::F16, S::F16) => "gemv_normed_f16_s_f16",
+        (MetalDtype::Bf16, S::F16) => "gemv_normed_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16) => "gemv_normed_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16) => "gemv_normed_bf16_s_bf16",
+        (dt, sdt) => {
+            unreachable!("gemv_normed: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated")
+        }
+    }
+}
+
+fn row_program_kernel_static_name(p: &MetalModelConsts, scale_dtype: ScaleDtype) -> &'static str {
+    use ScaleDtype as S;
+    match (p.metal_dtype, scale_dtype) {
+        (MetalDtype::F16, S::F16) => "row_program_f16_s_f16",
+        (MetalDtype::Bf16, S::F16) => "row_program_bf16_s_f16",
+        (MetalDtype::F16, S::Bf16) => "row_program_f16_s_bf16",
+        (MetalDtype::Bf16, S::Bf16) => "row_program_bf16_s_bf16",
+        (dt, sdt) => {
+            unreachable!("row_program: (dtype={dt:?}, scale_dtype={sdt:?}) not instantiated")
+        }
+    }
+}
+
 /// `MetalStep::NormAddScalarMul` symbol — the norm-THEN-add mirror
 /// of `fused_add_rmsnorm_kernel_static_name`; same dtype enumeration,
 /// same `fused_add_rmsnorm` library.
@@ -6162,7 +6237,7 @@ impl MoeScratch {
         // repeat count halves with each bucket step down (bucket 4 × top-8: 32 pairs, ~8 repeats).
         let grouping = match (groups, bucket_m * b.top_k.0) {
             (true, pairs) if pairs >= 128 => MoeGrouping::Grouped,
-            (true, pairs) if pairs >= 64 => MoeGrouping::Sorted,
+            (true, pairs) if pairs >= crate::op_abi::METAL_SORTED_PAIRS => MoeGrouping::Sorted,
             _ => MoeGrouping::Gathered,
         };
         let (e, k, i, h) = (b.experts.0, b.top_k.0, b.inter.0, b.hidden.0);
@@ -6231,7 +6306,7 @@ fn lower_moe_step(
     use super::kernel_constants::{
         AffineCombineQmvConstants, AffineGatedQmvConstants, AffineGatherQmvConstants,
         AffineQmvConstants, ArgsortConstants, GatherRows, MoeRouteConstants, MoeTopKConstants,
-        ScoresRow, SoftmaxConstants,
+        RoutedConstants, ScoresRow, SoftmaxConstants,
     };
     use crate::tape::lowered::{MScaleAxis as A, MScaling};
     use ConstantValue as C;
@@ -6288,6 +6363,14 @@ fn lower_moe_step(
         top_k: b.top_k,
     };
     let router = || w.of(b.router.weight_kind(), 0);
+    // A routed gated command's routing: its kernel's own when it reads the token rows by their
+    // picks and its `threads` cover the softmax over the experts (`moe_route.h`: E / 4), else the
+    // routing command's, run first.
+    let gathered = s.grouping == MoeGrouping::Gathered;
+    let routed_here = |routing: Option<super::step::RouteProgram>, threads: u32| match routing {
+        Some(program) if gathered && e <= threads => (Some(program), None),
+        routing => (None, routing.map(S::Route)),
+    };
     // An expert projection's `[weight, scales, biases]`, bound at `first..first + 3`.
     let expert_weights = |proj, l: LayerId, first: u8| -> Result<[Binding; 3], LoweringError> {
         let (ix, lw) = (w.of(b.bundle.weight_kind(), 0)?, layer(&l));
@@ -6343,7 +6426,37 @@ fn lower_moe_step(
             ]),
             gemm_dims: None,
         }],
-        S::RouterLogits(rows, l) => {
+        // One row, its pre-norm folded in: the router scale binds as the norm's gain.
+        S::RouterLogits(rows, l, Some(eps)) => {
+            if bucket_m != 1 {
+                return Err(LoweringError::OneRowFold { bucket_m });
+            }
+            vec![LoweredCommand {
+                kernel: KernelId::NormedGemv,
+                library: "gemm",
+                function: normed_gemv_kernel_static_name(p, scale_dtype),
+                constants: super::kernel_constants::NormedGemvConstants {
+                    n: super::ids::NDim(e),
+                    k: super::ids::KDim(hidden),
+                    eps,
+                }
+                .into_baked(),
+                dispatch: grid((e.div_ceil(4), 1, 1), (256, 1, 1), None),
+                bindings: baked(vec![
+                    s.at(0, R::RouterLogits),
+                    rows_of(&s, 1, rows),
+                    source(
+                        router()?,
+                        crate::op_abi::router_gate(b.router),
+                        layer(&l),
+                        2,
+                    ),
+                    source(router()?, WeightTensor::GemmaRouterScale, layer(&l), 3),
+                ]),
+                gemm_dims: None,
+            }]
+        }
+        S::RouterLogits(rows, l, None) => {
             let tiles = (bucket_m.div_ceil(GEMM_TILE_M), e.div_ceil(GEMM_TILE_N), 1);
             let gate = crate::op_abi::router_gate(b.router);
             vec![LoweredCommand {
@@ -6730,8 +6843,10 @@ fn lower_moe_step(
         // `act(gate) * up` over the rows each threadgroup wrote — per-pair, so the sorted rows
         // work unchanged. A width with a 1-3 row tail would have a threadgroup rewrite rows
         // another one activates, and two widths need two kernels: those, and a grouped bake,
-        // run each step's own commands.
-        S::GateUpAct(gate, up_width, act)
+        // run each step's own commands. A routed step its kernel cannot route (steps of their
+        // own, sorted rows, or more experts than its threads' softmax covers) runs the routing
+        // command first.
+        S::GateUpAct(gate, up_width, act, routing)
             if s.grouping == MoeGrouping::Grouped
                 || up_width != gate.width
                 || !inter.is_multiple_of(4) =>
@@ -6742,9 +6857,12 @@ fn lower_moe_step(
                 ..gate
             };
             let steps = [S::ExpertMatmul(gate), S::ExpertMatmul(up), S::GatedAct(act)];
-            each_step(&steps, moe_scratch_bytes)?
+            let route = routing.map(S::Route);
+            each_step(&[route.as_slice(), &steps].concat(), moe_scratch_bytes)?
         }
-        S::GateUpAct(gate, _, act) => {
+        S::GateUpAct(gate, _, act, routing) => {
+            let (routed, route) = routed_here(routing, 4 * 128);
+            let mut commands = each_step(route.as_slice(), moe_scratch_bytes)?;
             let (AffineGroupSize(gs), bits) = (gate.group_size, gate.width.bits().0);
             let (kernel, symbol) = gather_kernel(GatherQmv::GateUpAct, inter, hidden, gs, bits);
             let mut bindings = expert_weights(ExpertProj::Gate, gate.layer, 0)?.to_vec();
@@ -6763,15 +6881,28 @@ fn lower_moe_step(
                 qmv: qmv(inter, hidden, at.codes.for_bits(bits)),
                 rows: rows_read(&s, gate.rows),
             };
-            let constants = AffineGatedQmvConstants { qmv: gather, act }.into();
-            vec![cmd(
+            let mut constants: Vec<ConstantValue> =
+                AffineGatedQmvConstants { qmv: gather, act }.into();
+            if let Some(program) = routed {
+                bindings.extend([s.at(10, R::RouterLogits), s.at(11, R::TopKScores)]);
+                if let Some(l) = program.expert_scale {
+                    let scale = WeightTensor::GemmaPerExpertScale;
+                    bindings.push(source(router()?, scale, layer(&l), 12));
+                }
+                constants.extend(Vec::from(RoutedConstants {
+                    experts: b.experts,
+                    program,
+                }));
+            }
+            commands.push(cmd(
                 kernel,
                 "quantized_qmv",
                 symbol,
                 constants,
                 shape,
                 bindings,
-            )]
+            ));
+            commands
         }
         // Gathered: one command runs the down matvec of each token's pairs, 4 rows at a time,
         // and combines those rows. A sorted bake cannot: the kernel pairs each token's rows by
@@ -7029,7 +7160,10 @@ mod tests {
 
     /// `steps` as rows that always run.
     fn plain(steps: &[MetalStep]) -> Vec<StepRow> {
-        steps.iter().map(|s| StepRow::Step(*s, None)).collect()
+        steps
+            .iter()
+            .map(|s| StepRow::Step(s.clone(), None))
+            .collect()
     }
 
     /// The tests' bake point: 8 arena slots, the test rotary tables, block capacity 128.
@@ -7121,7 +7255,7 @@ mod tests {
             (attention(MetalStep::AttentionViaCache, 0, Interleaved), 1),
             (attention(MetalStep::AttentionPrefillPaged, 0, NeoX), 64),
         ] {
-            let rows = plain(&[tq_writer(0, Causal, LLAMA_KV), attention]);
+            let rows = plain(&[tq_writer(0, Causal, LLAMA_KV), attention.clone()]);
             let tape = lower_tq(&tp(), rows, bucket_m);
             assert!(
                 tape.commands.iter().all(|c| !matches!(
@@ -7374,8 +7508,8 @@ mod tests {
         let global = attention(MetalStep::AttentionViaCache, 0, Interleaved);
         let sliding = attention(MetalStep::SlidingAttentionViaCache, 1, Interleaved);
         let rows = [
-            coded(global_writer, global),
-            plain(&[sliding_writer, sliding]),
+            coded(global_writer.clone(), global),
+            plain(&[sliding_writer.clone(), sliding]),
         ];
         let decode = lower_tq(&p, rows.concat(), 1);
         let want = [
@@ -7398,12 +7532,13 @@ mod tests {
         let fp16 = |i: MetalStep| gated_steps(&lower_tq(&dense, plain(&[i]), 64));
         // A TurboQuant'd attention compresses its layer's writer's operands, so
         // its own commands are read off a tape that has the writer.
-        let own = |i: MetalStep| own_attention_steps(&lower_tq(&p, coded(global_writer, i), 64));
+        let own =
+            |i: MetalStep| own_attention_steps(&lower_tq(&p, coded(global_writer.clone(), i), 64));
         let prefill = lower_tq(
             &p,
             [
-                coded(global_writer, global_attention),
-                plain(&[sliding_writer, sliding_attention]),
+                coded(global_writer.clone(), global_attention.clone()),
+                plain(&[sliding_writer, sliding_attention.clone()]),
             ]
             .concat(),
             64,
@@ -7851,7 +7986,11 @@ mod tests {
             attention(MetalStep::AttentionPrefillPaged, 0, NeoX),
             attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX),
         ] {
-            let tape = lower_tq(&p, coded(tq_writer(0, Causal, LLAMA_KV), attention), 64);
+            let tape = lower_tq(
+                &p,
+                coded(tq_writer(0, Causal, LLAMA_KV), attention.clone()),
+                64,
+            );
             let own: Vec<&GatedCommand> = tape
                 .commands
                 .iter()
@@ -8072,7 +8211,7 @@ mod tests {
             2,
         ));
         want.push((twin, vec![bias(0, 14), bias(1, 15)], vec![k_bias, v_bias]));
-        assert_eq!(offsets(qwen2, prefill, 64), want);
+        assert_eq!(offsets(qwen2, prefill.clone(), 64), want);
 
         let mut want = vec![(writer, vec![], modes(0, 0))];
         want.extend(std::iter::repeat_n((stage, vec![], vec![]), 4));

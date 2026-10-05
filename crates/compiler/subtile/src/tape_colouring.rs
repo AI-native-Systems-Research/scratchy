@@ -460,6 +460,11 @@ pub fn colour_tape(
             }
         }
     }
+    // An epilogue reads where its driver's command runs too — later, when the driver comes after.
+    for (e, w) in &folds.epilogue {
+        let (e, w) = (at(e)?, at(w)?);
+        runs_at[e] = runs_at[e].max(runs_at[w]);
+    }
 
     // Last use per OWNER, at step granularity; a read of an off-arena value reads what it carries,
     // and an absorbed step reads where its command runs.

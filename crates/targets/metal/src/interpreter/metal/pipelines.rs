@@ -400,6 +400,8 @@ mod tests {
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
+            | KernelId::RowProgram
+            | KernelId::NormedGemv
             | KernelId::RopeAppendNormed
             | KernelId::TqStageRotated
             | KernelId::TqRotateRows
@@ -560,6 +562,8 @@ mod tests {
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
+            | KernelId::RowProgram
+            | KernelId::NormedGemv
             | KernelId::RopeAppendNormed
             | KernelId::TqStageRotated
             | KernelId::TqRotateRows
