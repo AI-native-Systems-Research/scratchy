@@ -20,7 +20,7 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
-    HeadDim, HiddenSize, IntermediateSize, KDimI32, KPartitionSizeI32, MDimI32, NDim, NDimI32,
+    HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, NDim, NDimI32,
     NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TopK,
     TqCodeBits,
 };
@@ -652,6 +652,47 @@ impl From<AffineQmvConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::RowProgram` (`row_program.metal`): the width (slot 0), its threads (1), the
+/// instruction count (2), and instruction k's word (3 + 3k: op, dst, a, b, weight in 4-bit fields)
+/// and floats (4 + 3k an epsilon or a scale, 5 + 3k a gain offset).
+impl From<&crate::tape::step::RowProgram> for Vec<ConstantValue> {
+    fn from(r: &crate::tape::step::RowProgram) -> Self {
+        use crate::tape::step::RowInstr as R;
+        let word = |op: u32, dst: u8, a: u8, b: u8, w: u8| {
+            op | u32::from(dst) << 4 | u32::from(a) << 8 | u32::from(b) << 12 | u32::from(w) << 16
+        };
+        let mut v = vec![
+            ConstantValue::uint(ConstSlot(0), r.width.get()),
+            ConstantValue::uint(ConstSlot(1), NORM_THREADS),
+        ];
+        let instrs: Vec<R> = r.instrs.iter().flatten().copied().collect();
+        v.push(ConstantValue::uint(ConstSlot(2), instrs.len() as u32));
+        for (k, instr) in instrs.iter().enumerate() {
+            let (w, f, g) = match *instr {
+                R::Load { dst, input } => (word(0, dst, input, 0, 0), 0.0, 0.0),
+                R::Add { dst, a, b } => (word(1, dst, a, b, 0), 0.0, 0.0),
+                R::Norm {
+                    dst,
+                    a,
+                    gain,
+                    eps,
+                    offset,
+                } => (word(2, dst, a, 0, gain), eps.0, offset.0),
+                R::ScaleWeight { dst, a, scalar } => (word(3, dst, a, 0, scalar), 0.0, 0.0),
+                R::Scale { dst, a, scale } => (word(4, dst, a, 0, 0), scale.0, 0.0),
+                R::Store { output, a } => (word(5, output, a, 0, 0), 0.0, 0.0),
+            };
+            let slot = 3 + 3 * k as u16;
+            v.extend([
+                ConstantValue::uint(ConstSlot(slot), w),
+                ConstantValue::float(ConstSlot(slot + 1), f),
+                ConstantValue::float(ConstSlot(slot + 2), g),
+            ]);
+        }
+        v
+    }
+}
+
 /// A one-row matvec's [`QmvEnds`](crate::tape::step::QmvEnds), compiled in: its norm's epsilon
 /// (slot 8) and gain offset (9), whether its rows add into the residual (10), take a bias (11), and
 /// their scale (12).
@@ -669,6 +710,25 @@ impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
         let bias = e.bias.map(|_| ConstantValue::boolean(ConstSlot(11), true));
         let scale = e.scale.map(|s| ConstantValue::float(ConstSlot(12), s.0));
         norm.chain(residual).chain(bias).chain(scale).collect()
+    }
+}
+
+/// `KernelId::NormedGemv` (`gemv_normed_<T>_s_<G>`, `gemm.metal`): the GEMM's one row (slots 0 /
+/// 1 / 2: M, N, K) and its folded norm's epsilon (5).
+pub struct NormedGemvConstants {
+    pub n: NDim,
+    pub k: KDim,
+    pub eps: crate::tape::step::Eps,
+}
+
+impl From<NormedGemvConstants> for Vec<ConstantValue> {
+    fn from(c: NormedGemvConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), 1),
+            ConstantValue::uint(ConstSlot(1), c.n.get()),
+            ConstantValue::uint(ConstSlot(2), c.k.get()),
+            ConstantValue::float(ConstSlot(5), c.eps.0),
+        ]
     }
 }
 

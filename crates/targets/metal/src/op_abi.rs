@@ -30,7 +30,9 @@ use scratchy_subtile::subtile_ir::{
 use crate::tape::lowered::{RuntimeGate, WeightTensor};
 use crate::tape::step::MoeRegion;
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
-use scratchy_subtile::tape_folding::{CountedOperands, FoldPattern, FusionTable, GatedKernel};
+use scratchy_subtile::tape_folding::{
+    CountedOperands, FoldPattern, FusionTable, GatedKernel, RowFold,
+};
 use scratchy_subtile::tape_steps::OperandIx;
 
 // ── The KV writer's weight site ─────────────────────────────────────
@@ -311,8 +313,12 @@ pub enum MetalFusion {
     /// A one-row MLX-affine matvec that adds its bias, scales its rows and adds them into the
     /// residual stream as it stores them.
     QmvEpilogue,
+    /// A one-row router's logits that normalize its input as they load it.
+    NormedRouter,
     /// `residual + rmsnorm(delta)`.
     NormAdd,
+    /// A group of row-wise steps over one width.
+    RowProgram,
 }
 
 /// Metal's fusions, in the order the shared fold pass applies them. An attention reads its new K/V
@@ -352,13 +358,14 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                 FoldPattern::NormedMatvecs {
                     norm: K::RmsNorm,
                     matmul: K::MatmulTile,
-                    weights: GemmWeightKind::Affine,
+                    weights: Some(GemmWeightKind::Affine),
                     kernel: F::NormedQmv,
                 },
-                FoldPattern::ResidualNorm {
-                    norm: K::RmsNorm,
-                    add: K::Add,
-                    kernel: F::FusedAddRmsNorm,
+                FoldPattern::NormedMatvecs {
+                    norm: K::RouterNorm,
+                    matmul: K::RouterLogits,
+                    weights: None,
+                    kernel: F::NormedRouter,
                 },
                 FoldPattern::Gated {
                     mul: K::Mul,
@@ -376,7 +383,13 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                     ],
                 },
             ],
+            // After the row programs: what they left of the residual adds and their norms.
             &[
+                FoldPattern::ResidualNorm {
+                    norm: K::RmsNorm,
+                    add: K::Add,
+                    kernel: F::FusedAddRmsNorm,
+                },
                 FoldPattern::NormedRope {
                     rope: K::RopeAppend,
                     gain_norm: K::RmsNorm,
@@ -430,5 +443,15 @@ pub const METAL_FUSIONS: FusionTable<MetalFusion> = {
                 },
             ],
         ],
+        // `row_program.metal`'s limits: 16 instructions hold 8 steps with their loads and stores.
+        // After the matvecs took their ends.
+        rows: Some(RowFold {
+            after_sweep: 1,
+            kinds: &[K::RmsNorm, K::Add, K::ScalarWeightMul, K::ScalarMul],
+            steps: 8,
+            inputs: 4,
+            outputs: 3,
+            kernel: F::RowProgram,
+        }),
     }
 };

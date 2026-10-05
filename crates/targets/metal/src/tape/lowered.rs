@@ -44,6 +44,8 @@ pub enum KernelId {
     /// in `elementwise.metallib`.
     ScalarWeightMul,
     NormAddScalarMul,
+    /// A group of row-wise steps over one width (`row_program.metal`).
+    RowProgram,
     RopeAppendNormed,
     /// Fused residual-add + RMSNorm: writes `residual += delta` and
     /// publishes `weight * residual / sqrt(mean(residual²) + eps)`.
@@ -52,6 +54,9 @@ pub enum KernelId {
     /// Shaders' `matmul2d` (or a hand-rolled tile shader once the
     /// fused kernels land).
     Gemm,
+    /// A one-row GEMM that RMS-normalizes its input as it loads it (`gemv_normed_*`): a router's
+    /// logits with its pre-norm folded in.
+    NormedGemv,
     /// Fused gate-up SwiGLU MLP: `silu(gate) * up` after a single GEMM
     /// produces the stacked `[gate; up]` activation. TinyLlama-1.1B's
     /// MLP path.
@@ -500,6 +505,7 @@ impl KernelId {
             | Self::RopeAppendNormed
             | Self::FusedAddRmsNorm
             | Self::Gemm
+            | Self::NormedGemv
             | Self::FusedGateUpSiluMul
             | Self::RopeAppend
             | Self::AttentionViaCache
@@ -565,6 +571,7 @@ impl KernelId {
             | Self::MmEmbedSplice
             | Self::TqStageRotated
             | Self::TqRotateRows
+            | Self::RowProgram
             | Self::AttentionViaCacheTq => SeqScope::AllRows,
         }
     }
@@ -1833,9 +1840,11 @@ pub enum LoweringError {
     /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
     /// runs only on a TurboQuant model.
     CodecStepOnDenseModel,
-    /// A gated one-row matvec in a bucket of `bucket_m` rows: its kernel computes one row, and the
-    /// fold that makes it applies to the one-row bucket only.
-    GatedMatvecRows { bucket_m: u32 },
+    /// A one-row matvec fold — a gated matvec, a matvec's ends, a router's pre-norm — in a bucket
+    /// of `bucket_m` rows: its kernel computes one row, and the fold applies to that bucket only.
+    OneRowFold { bucket_m: u32 },
+    /// A row program's instruction names a weight it holds no layer for.
+    RowProgramWeight,
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
     /// offsets its kernels bind: the rung cannot exist for this tape.
     ScratchTooLarge {
@@ -1901,10 +1910,13 @@ impl std::fmt::Display for LoweringError {
             Self::CodecStepOnDenseModel => f.write_str(
                 "lowering: a KV codec step in the tape of a model whose KV cache is dense",
             ),
-            Self::GatedMatvecRows { bucket_m } => write!(
+            Self::OneRowFold { bucket_m } => write!(
                 f,
-                "lowering: a one-row gated matvec in the {bucket_m}-row bucket"
+                "lowering: a one-row matvec fold in the {bucket_m}-row bucket"
             ),
+            Self::RowProgramWeight => {
+                f.write_str("lowering: a row program instruction reads a weight it has no layer for")
+            }
             Self::TooManyCommands(TooManyCommands { distinct }) => write!(
                 f,
                 "lowering: the tape lists {distinct} distinct commands, more than a command \

@@ -250,6 +250,7 @@ pub fn lower_canonical(
     let model = ModelFoldFacts {
         fold_projections,
         matvec_ends: m == 1,
+        row_programs: m == 1,
     };
     let folds =
         fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model).map_err(CanonicalRefusal::Fold)?;

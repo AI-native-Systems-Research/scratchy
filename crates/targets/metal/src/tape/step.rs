@@ -166,7 +166,7 @@ pub enum CuSeqlens {
 /// One command-emitting step. Slot operands are arena colours; `LayerId` is the step's own layer
 /// (a rolled body's rows name iteration 0's); an [`ActivationWidth`] is the width of the rows the
 /// step writes. Field order per kind: inputs, outputs, layer, shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetalStep {
     /// `(out)`: token embedding into the hidden.
     Embed(Slot),
@@ -299,6 +299,39 @@ pub enum MetalStep {
     /// One step of the result matmul's sampled rows: each lowers from how its matmul does (its
     /// site is the matmul's).
     SampleRows(AffineMatmul, SampleRowsStep),
+    /// A group of row-wise steps over one width as one command (`MetalFusion::RowProgram`).
+    RowProgram(Box<RowProgram>),
+}
+
+/// The instructions a row program holds, at most.
+pub const ROW_PROGRAM_INSTRS: usize = 16;
+
+/// The registers a row program holds (`row_program.metal`'s `RP_REGS`): one per row it loads and
+/// per step.
+pub const ROW_PROGRAM_REGISTERS: usize = 12;
+
+/// A row program (`row_program.metal`): its instructions over registers, the activation rows it
+/// loads, the buffers it stores, and the layer of each weight it reads — `gains` its norms', in
+/// order, then `scalars` its scalar weights'; its site lists the weights in instruction order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowProgram {
+    pub instrs: [Option<RowInstr>; ROW_PROGRAM_INSTRS],
+    pub inputs: [Option<Slot>; 4],
+    pub outputs: [Option<Slot>; 3],
+    pub gains: [Option<LayerId>; 8],
+    pub scalars: [Option<LayerId>; 2],
+    pub width: HiddenSize,
+}
+
+/// A row program's instruction; registers, inputs, outputs, gains and scalars by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowInstr {
+    Load { dst: u8, input: u8 },
+    Add { dst: u8, a: u8, b: u8 },
+    Norm { dst: u8, a: u8, gain: u8, eps: Eps, offset: GainOffset },
+    ScaleWeight { dst: u8, a: u8, scalar: u8 },
+    Scale { dst: u8, a: u8, scale: Scale },
+    Store { output: u8, a: u8 },
 }
 
 /// An MLX-affine matmul: `input · W` into `output`, `W` the layer's `n × k` weight packed `bits`
@@ -356,8 +389,9 @@ pub enum SampleRowsStep {
 pub enum MoeStep {
     /// `(x, layer, eps)`: the router's pre-norm of `x`.
     RouterNorm(Slot, LayerId, Eps),
-    /// `(rows, layer)`: router logits.
-    RouterLogits(MoeRows, LayerId),
+    /// `(rows, layer, norm)`: router logits — of the rows RMS-normalized by the epsilon and the
+    /// router's scale as they load, with `norm` (`MetalFusion::NormedRouter`, one row only).
+    RouterLogits(MoeRows, LayerId, Option<Eps>),
     /// Row softmax, in place.
     Softmax(MoeScores),
     /// The logits' argsort.
@@ -428,7 +462,7 @@ pub struct ExpertMatmul {
 impl MetalStep {
     /// The step's layer, for the kinds that carry one.
     pub fn layer(&self) -> Option<LayerId> {
-        let mut step = *self;
+        let mut step = self.clone();
         step.layer_mut().copied()
     }
 
@@ -437,11 +471,16 @@ impl MetalStep {
         if let Some(layer) = self.layer_mut() {
             layer.0 += by;
         }
-        // A matvec's folded norm reads its own layer's gain.
+        // A matvec's folded norm reads its own layer's gain, a row program each weight its own.
         if let MetalStep::AffineQmm(g) | MetalStep::AffineGatedQmv(g, _) = &mut self
             && let Some(norm) = &mut g.ends.norm
         {
             norm.layer.0 += by;
+        }
+        if let MetalStep::RowProgram(r) = &mut self {
+            for l in r.gains.iter_mut().chain(r.scalars.iter_mut()).flatten() {
+                l.0 += by;
+            }
         }
         self
     }
@@ -480,7 +519,7 @@ impl MetalStep {
             | S::Moe(
                 _,
                 MoeStep::RouterNorm(_, l, _)
-                | MoeStep::RouterLogits(_, l)
+                | MoeStep::RouterLogits(_, l, _)
                 | MoeStep::ExpertScale(l)
                 | MoeStep::ExpertMatmul(ExpertMatmul { layer: l, .. })
                 | MoeStep::GateUpAct(ExpertMatmul { layer: l, .. }, ..)
@@ -514,7 +553,8 @@ impl MetalStep {
             | S::GateScale(..)
             | S::RotateRows(..)
             | S::SampleRows(..)
-            | S::Moe(..) => None,
+            | S::Moe(..)
+            | S::RowProgram(..) => None,
         }
     }
 }
@@ -522,7 +562,7 @@ impl MetalStep {
 /// One row of a metal step tape: a step and the runtime gate every command of it runs under
 /// (`None`: always), or a rolled loop over the `body` rows after it (iteration `i` is the body
 /// with every layer `i * stride` on).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StepRow {
     Step(MetalStep, Option<RuntimeGate>),
     Loop {

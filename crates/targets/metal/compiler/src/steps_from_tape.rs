@@ -25,7 +25,9 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_subtile::subtile_tape::SlotId;
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, Residency, TapeColouring};
-use scratchy_subtile::tape_folding::{FusedShape, Fusion, StepOperand, StepRole, TapeFolds};
+use scratchy_subtile::tape_folding::{
+    FusedShape, Fusion, ROW_PROGRAM_STEPS, StepOperand, StepRole, TapeFolds,
+};
 use scratchy_target_metal::from_tape::{StepInput, TapeItem};
 use scratchy_target_metal::op_abi::{
     METAL_ELIDABLE, METAL_GUARD_GATES, MetalFusion, MoeWrite, metal_colour_rule, moe_write,
@@ -1127,11 +1129,12 @@ impl Recording<'_> {
                 };
                 self.moe(i, MoeStep::Route(program), &[], &[], weight)
             }
-            (F::NormedQmv, Sh::NormedMatvec { .. })
+            (F::NormedQmv | F::NormedRouter, Sh::NormedMatvec { .. })
             | (F::QmvEpilogue, Sh::MatvecEpilogue { .. }) => {
                 let kept = self.kept(i)?;
                 kept.ok_or_else(|| self.no(i, Refused::FusionShape))
             }
+            (F::RowProgram, Sh::RowProgram { steps }) => self.row_program(i, &steps),
             // The writer's command — its earlier fold's, else its own — writing the packed store too.
             (F::KvEncoded, Sh::Encoded { .. }) => {
                 let driven = self.folds.driven(self.steps.slot[i]);
@@ -1155,6 +1158,118 @@ impl Recording<'_> {
             }
             _ => Err(self.no(i, Refused::FusionShape)),
         }
+    }
+
+    /// A row program over its `steps` (tape order, the driver `i` last): each external row loaded
+    /// once, a register per step, and a store of every step read outside the program — the driver,
+    /// and the members the fold made its epilogues.
+    fn row_program(
+        &self,
+        i: usize,
+        steps: &[Option<SlotId>; ROW_PROGRAM_STEPS],
+    ) -> Result<Emission, StepRefusal> {
+        use st::RowInstr as R;
+        let members = steps.iter().flatten().map(|s| self.op_at(i, *s));
+        let members = members.collect::<Result<Vec<usize>, _>>()?;
+        let no = || self.no(i, Refused::FusionShape);
+        let width = W(self.graph.shape(self.graph.op_output[i]).cols);
+        let mut prog = st::RowProgram {
+            instrs: [None; st::ROW_PROGRAM_INSTRS],
+            inputs: [None; 4],
+            outputs: [None; 3],
+            gains: [None; 8],
+            scalars: [None; 2],
+            width,
+        };
+        let mut instrs: Vec<R> = Vec::new();
+        let mut reg_of: HashMap<usize, u8> = HashMap::new();
+        let mut loaded: Vec<(Slot, u8)> = Vec::new();
+        let (mut next, mut sites) = (0u8, Vec::new());
+        let (mut gains, mut scalars) = (0usize, 0usize);
+        for &m in &members {
+            // Operand `k` of `m` in a register: a member's, else its row loaded once.
+            let mut operand = |k: u8, instrs: &mut Vec<R>, next: &mut u8| -> Result<u8, StepRefusal> {
+                if let InputRef::Op(a) = self.arg(m, k)?
+                    && let Some(&r) = reg_of.get(&a)
+                {
+                    return Ok(r);
+                }
+                let slot = self.read(m, k)?;
+                if let Some(&(_, r)) = loaded.iter().find(|(s, _)| *s == slot) {
+                    return Ok(r);
+                }
+                let input = u8::try_from(loaded.len()).map_err(|_| no())?;
+                *prog.inputs.get_mut(usize::from(input)).ok_or_else(no)? = Some(slot);
+                instrs.push(R::Load { dst: *next, input });
+                loaded.push((slot, *next));
+                *next += 1;
+                Ok(*next - 1)
+            };
+            let a = operand(0, &mut instrs, &mut next)?;
+            let add = matches!(self.op(m), SubOp::Elementwise(EwKind::Add));
+            let b = if add { operand(1, &mut instrs, &mut next)? } else { a };
+            let dst = next;
+            let instr = match *self.op(m) {
+                SubOp::Elementwise(EwKind::Add) => R::Add { dst, a, b },
+                SubOp::RmsNorm { eps, gain } => {
+                    let e = self.weight_of(m)?;
+                    *prog.gains.get_mut(gains).ok_or_else(no)? = Some(self.layer(e));
+                    sites.extend(self.site(m, WeightKind::RmsNorm, e)?);
+                    gains += 1;
+                    R::Norm {
+                        dst,
+                        a,
+                        gain: (gains - 1) as u8,
+                        eps: st::Eps(eps),
+                        offset: offset(gain),
+                    }
+                }
+                SubOp::ScalarWeightMul => {
+                    let e = self.weight_of(m)?;
+                    *prog.scalars.get_mut(scalars).ok_or_else(no)? = Some(self.layer(e));
+                    sites.extend(self.site(m, WeightKind::RmsNorm, e)?);
+                    scalars += 1;
+                    R::ScaleWeight {
+                        dst,
+                        a,
+                        scalar: (scalars - 1) as u8,
+                    }
+                }
+                SubOp::ScalarMul { scale } => R::Scale {
+                    dst,
+                    a,
+                    scale: st::Scale(scale),
+                },
+                _ => return Err(no()),
+            };
+            instrs.push(instr);
+            reg_of.insert(m, dst);
+            next += 1;
+        }
+        let mut writes = Vec::new();
+        for &m in &members {
+            let written = m == i
+                || matches!(self.folds.role(self.steps.slot[m]), StepRole::Epilogue { .. });
+            if !written {
+                continue;
+            }
+            let output = u8::try_from(writes.len()).map_err(|_| no())?;
+            let slot = self.colour(m)?;
+            *prog.outputs.get_mut(usize::from(output)).ok_or_else(no)? = Some(slot);
+            instrs.push(R::Store {
+                output,
+                a: reg_of[&m],
+            });
+            writes.push(slot);
+        }
+        if instrs.len() > st::ROW_PROGRAM_INSTRS || usize::from(next) > st::ROW_PROGRAM_REGISTERS {
+            return Err(no());
+        }
+        for (k, instr) in instrs.into_iter().enumerate() {
+            prog.instrs[k] = Some(instr);
+        }
+        let reads: Vec<Slot> = loaded.iter().map(|(s, _)| *s).collect();
+        Ok(em(MetalStep::RowProgram(Box::new(prog)), &reads, &writes, sites))
     }
 
     fn rope_fields(&self, i: usize) -> Result<(LayerId, RopeFormTag, AttnMask), StepRefusal> {
@@ -1359,7 +1474,7 @@ impl Recording<'_> {
                 ends,
             }),
         };
-        let (Some(step), MetalStep::AffineQmm(g)) = (step, plain) else {
+        let (Some(step), MetalStep::AffineQmm(g)) = (step, &plain) else {
             return match step {
                 None => Ok(em(plain, &reads, &[out], site)),
                 Some(_) => Err(self.no(i, Refused::SampledNotAffine)),
@@ -1371,7 +1486,7 @@ impl Recording<'_> {
             R::Scatter => (&[out], [out]),
             R::AllRows => (&[input, out], [out]),
         };
-        Ok(em(MetalStep::SampleRows(g, step), reads, &writes, site))
+        Ok(em(MetalStep::SampleRows(*g, step), reads, &writes, site))
     }
 
     /// A step no fold touches, lowered on its own.
@@ -1653,8 +1768,20 @@ impl Recording<'_> {
                 self.moe(i, step, &[x], &[], Some((router.weight_kind(), e)))?
             }
             L::RouterLogits { router, .. } => {
-                let ((rows, reads), e) = (self.moe_rows(i, 0)?, self.source_arg(i, 1)?);
-                let step = MoeStep::RouterLogits(rows, self.layer(e));
+                let ((mut rows, mut reads), e) = (self.moe_rows(i, 0)?, self.source_arg(i, 1)?);
+                // Its folded pre-norm: it reads the norm's rows, normalizing them as it loads.
+                let mut norm = None;
+                for f in self.folds.driven(self.steps.slot[i]) {
+                    let FusedShape::NormedMatvec { norm: n } = f.shape else {
+                        return Err(self.no(i, Refused::FusionShape));
+                    };
+                    let SubOp::RouterNorm { eps, .. } = *self.op(self.op_at(i, n)?) else {
+                        return Err(self.no(i, Refused::FusionShape));
+                    };
+                    (rows, reads) = self.moe_rows(self.op_at(i, n)?, 0)?;
+                    norm = Some(st::Eps(eps));
+                }
+                let step = MoeStep::RouterLogits(rows, self.layer(e), norm);
                 self.moe(i, step, &reads, &[], Some((router.weight_kind(), e)))?
             }
             L::RouteSoftmax => {
@@ -1786,9 +1913,9 @@ pub fn assemble(
         lm_sigs: Vec::new(),
         lm_sites: Vec::new(),
     };
-    let row = |e: &Emission| match (moe, e.raw) {
-        (MoeBits::Raw, Some(raw)) => StepRow::Step(raw, e.gate),
-        _ => StepRow::Step(e.step, e.gate),
+    let row = |e: &Emission| match (moe, &e.raw) {
+        (MoeBits::Raw, Some(raw)) => StepRow::Step(raw.clone(), e.gate),
+        _ => StepRow::Step(e.step.clone(), e.gate),
     };
     for e in &records.head {
         out.rows.push(row(e));
@@ -1923,8 +2050,8 @@ pub fn proves(
     fn expand(rows: &[StepRow], at: usize, base: u32, out: &mut Vec<(StepRow, usize)>) {
         let mut k = 0;
         while k < rows.len() {
-            match rows[k] {
-                StepRow::Loop {
+            match &rows[k] {
+                &StepRow::Loop {
                     iters,
                     body,
                     stride,
@@ -1936,7 +2063,7 @@ pub fn proves(
                     k = b.end;
                 }
                 StepRow::Step(s, gate) => {
-                    out.push((StepRow::Step(s.advanced(base), gate), at + k));
+                    out.push((StepRow::Step(s.clone().advanced(base), *gate), at + k));
                     k += 1;
                 }
             }

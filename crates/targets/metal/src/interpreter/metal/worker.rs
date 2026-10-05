@@ -927,7 +927,11 @@ fn kernel_kind(id: KernelId) -> KernelKind {
     use KernelId as K;
     match id {
         K::Embed | K::AffineEmbed | K::EmbeddingGather | K::MmEmbedSplice => KernelKind::Embed,
-        K::RmsNorm | K::RmsNormUnit | K::FusedAddRmsNorm | K::NormAddScalarMul => KernelKind::Norm,
+        K::RmsNorm
+        | K::RmsNormUnit
+        | K::FusedAddRmsNorm
+        | K::NormAddScalarMul
+        | K::RowProgram => KernelKind::Norm,
         K::RopeAppendNormed
         | K::RopeAppend
         | K::RopeOnceNax
@@ -945,6 +949,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AttnGemmPv => KernelKind::Attention,
         K::GatedDeltaNet => KernelKind::GatedDeltaNet,
         K::Gemm
+        | K::NormedGemv
         | K::AffineQmvQuad
         | K::AffineQmvFast
         | K::AffineQmvWide

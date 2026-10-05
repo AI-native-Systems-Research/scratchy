@@ -156,14 +156,14 @@ pub enum FoldPattern<K: 'static> {
         encode: SubOpKind,
         kernel: K,
     },
-    /// A `norm` that only `matmul`s read, each as its operand 0 and of `weights`, folds into every
-    /// one of them: each normalizes the norm's input as it loads it. Only on a model whose matvecs
-    /// take their ends ([`ModelFoldFacts::matvec_ends`]); apply it before the folds that take a
-    /// norm whole.
+    /// A `norm` that only `matmul`s read, each as its operand 0 and of `weights` (`None`: a kind
+    /// that carries none, a router's logits), folds into every one of them: each normalizes the
+    /// norm's input as it loads it. Only on a model whose matvecs take their ends
+    /// ([`ModelFoldFacts::matvec_ends`]); apply it before the folds that take a norm whole.
     NormedMatvecs {
         norm: SubOpKind,
         matmul: SubOpKind,
-        weights: GemmWeightKind,
+        weights: Option<GemmWeightKind>,
         kernel: K,
     },
     /// A `matmul` of `weights` read by one step alone, down a chain of such steps: at most a
@@ -212,6 +212,31 @@ pub struct FusionTable<K: 'static> {
     pub counted: &'static [CountedOperands],
     /// The patterns, sweep by sweep; within a sweep, in the order they are tried at a step.
     pub sweeps: &'static [&'static [FoldPattern<K>]],
+    /// What is left of the row-wise steps after the sweeps, grouped into programs.
+    pub rows: Option<RowFold<K>>,
+}
+
+/// The steps in one row program, at most.
+pub const ROW_PROGRAM_STEPS: usize = 8;
+
+/// Row programs: a group of row-wise steps over one width, connected by their dataflow, that a
+/// target runs as one command — every step the sweeps left free. Groups grow back from the last
+/// free step on the tape: a producer joins when every step reading it is in the group or comes
+/// after the group's last step (its buffer is then one the command writes). The last step drives
+/// the command; a member others read outside the group is its epilogue, every other member is
+/// absorbed.
+#[derive(Clone, Copy, Debug)]
+pub struct RowFold<K: 'static> {
+    /// The sweeps that run before it; only on a model whose rows are grouped
+    /// ([`ModelFoldFacts::row_programs`]).
+    pub after_sweep: usize,
+    pub kinds: &'static [SubOpKind],
+    /// At most this many steps (up to [`ROW_PROGRAM_STEPS`]), activation rows read from outside,
+    /// and buffers written.
+    pub steps: usize,
+    pub inputs: usize,
+    pub outputs: usize,
+    pub kernel: K,
 }
 
 /// Facts about one model the patterns read — data the caller derives, never code in the pass.
@@ -222,6 +247,8 @@ pub struct ModelFoldFacts {
     /// The one-row matvecs take their ends: their input's norm ([`FoldPattern::NormedMatvecs`])
     /// and their rows' bias, scale and residual add ([`FoldPattern::MatvecEpilogue`]).
     pub matvec_ends: bool,
+    /// The free row-wise steps group into row programs ([`RowFold`]).
+    pub row_programs: bool,
 }
 
 /// What a fused command computes beyond its driver step.
@@ -291,6 +318,10 @@ pub enum FusedShape {
     /// The norm this matmul's input passes through: the command reads the norm's input and gain.
     NormedMatvec {
         norm: SlotId,
+    },
+    /// A row program's steps, in tape order, the driver last.
+    RowProgram {
+        steps: [Option<SlotId>; ROW_PROGRAM_STEPS],
     },
     /// The chain this matmul's rows pass through, each step there: its bias, its scale, and the
     /// residual add (with the add's other operand). The command writes the chain's last buffer.
@@ -463,13 +494,25 @@ pub fn fold_tape<K: Copy>(
         epilogue: vec![None; n],
         fusions: (0..n).map(|_| Vec::new()).collect(),
     };
-    for sweep in table.sweeps {
+    for (k, sweep) in table.sweeps.iter().enumerate() {
+        if let Some(rows) = &table.rows
+            && rows.after_sweep == k
+            && model.row_programs
+        {
+            folder.row_programs(rows);
+        }
         for i in 0..n {
             let kind = folder.ops.kind(i);
             for pattern in sweep.iter().filter(|p| p.driver() == kind) {
                 folder.apply(pattern, i)?;
             }
         }
+    }
+    if let Some(rows) = &table.rows
+        && rows.after_sweep >= table.sweeps.len()
+        && model.row_programs
+    {
+        folder.row_programs(rows);
     }
     Ok(folder.finish())
 }
@@ -489,6 +532,9 @@ struct Ops<'a> {
     pos: Vec<StepPos>,
     slot: Vec<SlotId>,
     args: Vec<Vec<Arg>>,
+    /// Each source op's output width, and the rows it runs over.
+    cols: Vec<u32>,
+    rows: Vec<u32>,
 }
 
 impl<'a> Ops<'a> {
@@ -537,6 +583,10 @@ impl<'a> Ops<'a> {
             pos: at.iter().map(|&p| StepPos(p as u32)).collect(),
             slot: at.iter().map(|&p| steps[p].writes).collect(),
             args,
+            cols: (0..at.len())
+                .map(|j| graph.shape(graph.op_output[j]).cols)
+                .collect(),
+            rows: lowered.input.ops.iter().map(|o| o.m).collect(),
         })
     }
 
@@ -717,6 +767,112 @@ impl<K: Copy> Folder<'_, K> {
         }
     }
 
+    /// Every free row-wise step into row programs, from the tape's end ([`RowFold`]).
+    fn row_programs(&mut self, rows: &RowFold<K>) {
+        let n = self.ops.slot.len();
+        let reads = |c: usize, p: usize| self.ops.args[c].iter().any(|a| matches!(a, Arg::Op(q) if *q == p));
+        let readers: Vec<Vec<usize>> = (0..n).map(|p| (0..n).filter(|&c| reads(c, p)).collect()).collect();
+        let result = self.ops.lowered.input.result;
+        // A step reading a graph source that is not a weight (the embedded rows) stays on its
+        // own: a target places that source's buffer itself.
+        let weight = |t: &TensorId| {
+            matches!(
+                self.ops.lowered.bindings.get(t.index()),
+                Some(SourceBinding::Weight { .. } | SourceBinding::WeightScale { .. })
+            )
+        };
+        let free = |f: &Self, j: usize| {
+            rows.kinds.contains(&f.ops.kind(j))
+                && f.absorbed[j].is_none()
+                && f.epilogue[j].is_none()
+                && f.fusions[j].is_empty()
+                && f.ops.args[j].iter().all(|a| match a {
+                    Arg::Op(_) => true,
+                    Arg::Source(t) => weight(t),
+                })
+        };
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&j| std::cmp::Reverse(self.ops.pos[j]));
+        // Where a step's reads happen: where the command computing it runs — its own position, or
+        // its driver's down a chain of absorptions.
+        let read_at: Vec<StepPos> = (0..n)
+            .map(|c| {
+                let mut at = c;
+                for _ in 0..n {
+                    match self.absorbed[at].or(self.epilogue[at]) {
+                        Some(w) if w != at => at = w,
+                        _ => break,
+                    }
+                }
+                self.ops.pos[at].max(self.ops.pos[c])
+            })
+            .collect();
+        let mut taken = vec![false; n];
+        let max = rows.steps.min(ROW_PROGRAM_STEPS);
+        for &d in &order {
+            if taken[d] || !free(self, d) {
+                continue;
+            }
+            let at = self.ops.pos[d];
+            let mut group = vec![d];
+            let mut grew = true;
+            while grew && group.len() < max {
+                grew = false;
+                let producers: Vec<usize> = group
+                    .iter()
+                    .flat_map(|&m| self.ops.args[m].iter())
+                    .filter_map(|a| match a {
+                        Arg::Op(q) => Some(*q),
+                        Arg::Source(_) => None,
+                    })
+                    .collect();
+                for p in producers {
+                    let joins = !group.contains(&p)
+                        && !taken[p]
+                        && p != result
+                        && free(self, p)
+                        && self.ops.cols[p] == self.ops.cols[d]
+                        && self.ops.rows[p] == self.ops.rows[d]
+                        && readers[p].iter().all(|&c| group.contains(&c) || read_at[c] > at);
+                    if joins && group.len() < max {
+                        group.push(p);
+                        grew = true;
+                    }
+                }
+            }
+            group.sort_by_key(|&m| self.ops.pos[m]);
+            // A member read outside the group (or the result) is a buffer the command writes.
+            let written: Vec<bool> = group
+                .iter()
+                .map(|&m| m == result || readers[m].iter().any(|c| !group.contains(c)))
+                .collect();
+            // The activation rows it reads from outside: other steps'.
+            let inputs: std::collections::BTreeSet<usize> = group
+                .iter()
+                .flat_map(|&m| self.ops.args[m].iter())
+                .filter_map(|a| match a {
+                    Arg::Op(q) if !group.contains(q) => Some(*q),
+                    _ => None,
+                })
+                .collect();
+            let outputs = written.iter().filter(|&&w| w).count();
+            if group.len() < 2 || inputs.len() > rows.inputs || outputs > rows.outputs {
+                continue;
+            }
+            let mut steps = [None; ROW_PROGRAM_STEPS];
+            for (k, (&m, &w)) in group.iter().zip(&written).enumerate() {
+                taken[m] = true;
+                steps[k] = Some(self.ops.slot[m]);
+                match (m == d, w) {
+                    (true, _) => {}
+                    (false, true) => self.epilogue[m] = Some(d),
+                    (false, false) => self.absorbed[m] = Some(d),
+                }
+            }
+            self.record(d, rows.kernel, FusedShape::RowProgram { steps });
+        }
+    }
+
     /// Whether `j` is a one-row matmul over `weights`.
     fn is_matvec(&self, j: usize, weights: GemmWeightKind) -> bool {
         matches!(self.ops.op(j), SubOp::MatmulTile { weight, .. } if weight.kind() == weights)
@@ -808,14 +964,15 @@ impl<K: Copy> Folder<'_, K> {
     fn normed_matvecs(
         &mut self,
         i: usize,
-        (matmul, weights): (SubOpKind, GemmWeightKind),
+        (matmul, weights): (SubOpKind, Option<GemmWeightKind>),
         kernel: K,
     ) -> Result<(), FoldError> {
         if !self.model.matvec_ends || self.absorbed[i].is_some() || !self.fusions[i].is_empty() {
             return Ok(());
         }
         let ops = &self.ops;
-        let is_matvec = |j: usize| ops.kind(j) == matmul && self.is_matvec(j, weights);
+        let is_matvec =
+            |j: usize| ops.kind(j) == matmul && weights.is_none_or(|w| self.is_matvec(j, w));
         let reads = |j: usize| {
             ops.args[j]
                 .iter()
@@ -1007,7 +1164,8 @@ impl<K: Copy> Folder<'_, K> {
                 ops.kind(j) == norm && ops.first_op(j) == Some(a) && self.absorbed[j].is_none()
             })
             .min_by_key(|&j| ops.canonical_rank(j));
-        if winner == Some(i) && self.absorbed[a].is_none() && self.epilogue[a].is_none() {
+        let free = self.absorbed[a].is_none() && self.epilogue[a].is_none();
+        if winner == Some(i) && free && self.fusions[a].is_empty() && self.fusions[i].is_empty() {
             self.absorbed[a] = Some(i);
             let add = ops.slot[a];
             self.record(i, kernel, FusedShape::ResidualNorm { add });
@@ -1160,16 +1318,20 @@ impl<K: Copy> Folder<'_, K> {
         kernel: K,
     ) -> Result<(), FoldError> {
         let ops = &self.ops;
+        // Every step of the chain free: no other fold took it whole or in part.
+        let free = |j: usize| {
+            self.absorbed[j].is_none() && self.epilogue[j].is_none() && self.fusions[j].is_empty()
+        };
         let Some(a) = ops.in_op(i, 0)? else {
             return Ok(());
         };
-        if ops.kind(a) != add || self.absorbed[a].is_some() || self.epilogue[a].is_some() {
+        if !free(i) || ops.kind(a) != add || !free(a) {
             return Ok(());
         }
         let Some(nrm) = ops.in_op(a, 0)? else {
             return Ok(());
         };
-        if ops.kind(nrm) != norm || self.absorbed[nrm].is_some() {
+        if ops.kind(nrm) != norm || !free(nrm) {
             return Ok(());
         }
         let Some(delta) = ops.in_op(nrm, 0)? else {
@@ -1247,6 +1409,7 @@ mod tests {
         Encoded,
         Normed,
         Epilogue,
+        Rows,
     }
 
     const SWEEPS: &[&[FoldPattern<Kern>]] = {
@@ -1278,7 +1441,13 @@ mod tests {
                 FoldPattern::NormedMatvecs {
                     norm: K::RmsNorm,
                     matmul: K::MatmulTile,
-                    weights: GemmWeightKind::Dense,
+                    weights: Some(GemmWeightKind::Dense),
+                    kernel: Kern::Normed,
+                },
+                FoldPattern::NormedMatvecs {
+                    norm: K::RouterNorm,
+                    matmul: K::RouterLogits,
+                    weights: None,
                     kernel: Kern::Normed,
                 },
                 FoldPattern::ResidualNorm {
@@ -1343,11 +1512,13 @@ mod tests {
     const TABLE: FusionTable<Kern> = FusionTable {
         counted: &[],
         sweeps: SWEEPS,
+        rows: None,
     };
 
     const SPLIT: ModelFoldFacts = ModelFoldFacts {
         fold_projections: false,
         matvec_ends: false,
+        row_programs: false,
     };
 
     const ADD: ArchOp = SubOp::Elementwise(EwKind::Add);
@@ -1430,6 +1601,7 @@ mod tests {
     const ENDS: ModelFoldFacts = ModelFoldFacts {
         fold_projections: false,
         matvec_ends: true,
+        row_programs: false,
     };
 
     #[test]
@@ -1465,6 +1637,94 @@ mod tests {
             ENDS,
         );
         assert_eq!(f.role(s[0]), StepRole::Kept);
+    }
+
+    #[test]
+    fn a_router_norm_only_its_logits_read_folds_into_them() {
+        use crate::subtile_ir::{NumExperts, RouterBundle};
+        use std::num::NonZeroU32;
+        let experts = NumExperts::new(NonZeroU32::new(16).expect("16 experts"));
+        let router = RouterBundle::Gemma;
+        let src = [(1, 64), (1, 64), (16, 64)];
+        let ops = vec![
+            op(SubOp::RouterNorm { eps: 1e-6, router }, 1, vec![Ext(0), Ext(1)]),
+            op(SubOp::RouterLogits { experts, router }, 1, vec![Op(0), Ext(2)]),
+            op(SubOp::RouteArgsort, 1, vec![Op(1)]),
+        ];
+        let (s, f) = fold(&src, weights(3), ops.clone(), &[], &TABLE, ENDS);
+        assert_eq!(f.role(s[0]), StepRole::Absorbed { into: s[1] });
+        let reads = Fusion {
+            kernel: Kern::Normed,
+            shape: FusedShape::NormedMatvec { norm: s[0] },
+        };
+        assert_eq!(f.driven(s[1]), [reads]);
+        // A model whose matvecs do not take their ends.
+        let (s, f) = fold(&src, weights(3), ops, &[], &TABLE, SPLIT);
+        assert_eq!(f.role(s[0]), StepRole::Kept);
+    }
+
+    const ROWS: FusionTable<Kern> = FusionTable {
+        counted: &[],
+        sweeps: SWEEPS,
+        rows: Some(RowFold {
+            // Before the sweeps: the residual norm fold would take the add first.
+            after_sweep: 0,
+            kinds: &[SubOpKind::RmsNorm, SubOpKind::Add, SubOpKind::ScalarMul],
+            steps: 8,
+            inputs: 4,
+            outputs: 3,
+            kernel: Kern::Rows,
+        }),
+    };
+
+    const ROW_FACTS: ModelFoldFacts = ModelFoldFacts {
+        fold_projections: false,
+        matvec_ends: false,
+        row_programs: true,
+    };
+
+    #[test]
+    fn row_steps_group_back_from_the_last_while_their_readers_come_after() {
+        let src = [(1, 64), (64, 64), (1, 64), (1, 64)];
+        // norm(x) + r, then norm of that: one program, the add read on after it.
+        let ops = vec![
+            gemm(64, vec![Ext(0), Ext(1)]),
+            gemm(64, vec![Ext(0), Ext(1)]),
+            norm(vec![Op(0), Ext(2)]),
+            op(ADD, 1, vec![Op(2), Op(1)]),
+            norm(vec![Op(3), Ext(3)]),
+            gemm(64, vec![Op(4), Ext(1)]),
+            op(MUL, 1, vec![Op(5), Op(3)]),
+        ];
+        let (s, f) = fold(&src, weights(4), ops.clone(), &[], &ROWS, ROW_FACTS);
+        assert_eq!(f.role(s[2]), StepRole::Absorbed { into: s[4] });
+        assert_eq!(f.role(s[3]), StepRole::Epilogue { of: s[4] });
+        let mut steps = [None; ROW_PROGRAM_STEPS];
+        steps[..3].copy_from_slice(&[Some(s[2]), Some(s[3]), Some(s[4])]);
+        let program = Fusion {
+            kernel: Kern::Rows,
+            shape: FusedShape::RowProgram { steps },
+        };
+        assert_eq!(f.role(s[4]), StepRole::Drives(&program));
+        // Off: the add folds into the norm, as without a row fold.
+        let (s, f) = fold(&src, weights(4), ops, &[], &ROWS, SPLIT);
+        assert_eq!(f.role(s[3]), StepRole::Absorbed { into: s[4] });
+
+        // A step reading the add BEFORE the last norm: the add cannot wait for it, so the program
+        // ends at the add, and the last norm stays on its own.
+        let ops = vec![
+            gemm(64, vec![Ext(0), Ext(1)]),
+            gemm(64, vec![Ext(0), Ext(1)]),
+            norm(vec![Op(0), Ext(2)]),
+            op(ADD, 1, vec![Op(2), Op(1)]),
+            gemm(64, vec![Op(3), Ext(1)]),
+            norm(vec![Op(3), Ext(3)]),
+            op(MUL, 1, vec![Op(4), Op(5)]),
+        ];
+        let (s, f) = fold(&src, weights(4), ops, &[], &ROWS, ROW_FACTS);
+        assert_eq!(f.role(s[2]), StepRole::Absorbed { into: s[3] });
+        assert!(matches!(f.role(s[3]), StepRole::Drives(Fusion { kernel: Kern::Rows, .. })));
+        assert_eq!(f.role(s[5]), StepRole::Kept);
     }
 
     #[test]
@@ -1714,6 +1974,7 @@ mod tests {
         let fused = ModelFoldFacts {
             fold_projections: true,
             matvec_ends: false,
+            row_programs: false,
         };
         let (_, joined) = fold(&src, weights(4), ops(), &[], &TABLE, fused);
         assert_eq!(split.absorbed().collect::<Vec<_>>(), [(s[2], s[3])]);
@@ -1876,6 +2137,7 @@ mod tests {
                 before: OperandIx(1),
             }],
             sweeps: SWEEPS,
+            rows: None,
         };
         let (s, f) = rope_fold(true, &V_NOT_READ);
         assert_eq!(f.role(s[10]), StepRole::Absorbed { into: s[11] });

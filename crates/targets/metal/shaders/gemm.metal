@@ -464,6 +464,10 @@ kernel void gemm_bf16_pv(
 // Bindings and constants are the GEMM's: buffer(0) = output [1, N], buffer(1) = input [1, K],
 // buffer(2) = weight [N, K]; 0 / 1 / 2 = M / N / K (M must be 1).
 //
+// `gemv_normed_*` (`MetalFusion::NormedRouter`): a router's pre-norm folded in. Constant 5 is its
+// epsilon, buffer(3) its gain: each thread dots the weights with `x ⊙ gain` and sums `x²` as it
+// loads `x`, and the rows are scaled by `1 / rms(x)` when they store.
+//
 // Dispatch: threadgroups (ceil(N/4), 1, 1), threads (256, 1, 1). Needs N >= 4: the last
 // threadgroup moves back to the last 4 rows.
 // ---------------------------------------------------------------------------
@@ -472,11 +476,15 @@ kernel void gemm_bf16_pv(
 #define MLX_MTL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
 #endif
 
-template <typename T>
+SCRATCHY_CONSTANT_OPTIONAL(float, GEMV_NORM_EPS, 5);
+constant constexpr bool GEMV_NORMED = GEMV_NORM_EPS_SET;
+
+template <typename T, typename G>
 [[kernel]] void gemv_specialized(
     device       T* output [[buffer(0)]],
     device const T* input  [[buffer(1)]],
     device const T* weight [[buffer(2)]],
+    device const G* gain   [[buffer(3)]],
     uint3 tid      [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]])
@@ -494,8 +502,9 @@ template <typename T>
     const int K = int(GEMM_K);
 
     thread float result[TM] = {0};
-    thread T in_buf[TN];
+    thread float in_buf[TN];
     thread T w_buf[TN];
+    float sum_sq = 0.0f;
 
     const int sgN = int(simd_gid) % BN;
     int bn = (SN * sgN + int(simd_lid)) * TN;
@@ -511,7 +520,9 @@ template <typename T>
     for (int i = 0; i < n_iter; ++i) {
         MLX_MTL_PRAGMA_UNROLL
         for (int tn = 0; tn < TN; tn++) {
-            in_buf[tn] = input[bn + tn];
+            const float x = float(input[bn + tn]);
+            sum_sq += GEMV_NORMED ? x * x : 0.0f;
+            in_buf[tn] = GEMV_NORMED ? x * float(gain[bn + tn]) : x;
         }
         int mat_offset = 0;
         MLX_MTL_PRAGMA_UNROLL
@@ -532,7 +543,9 @@ template <typename T>
     if (leftover > 0) {
         MLX_MTL_PRAGMA_UNROLL
         for (int tn = 0; tn < TN; tn++) {
-            in_buf[tn] = (bn + tn < K) ? input[bn + tn] : T(0);
+            const float x = (bn + tn < K) ? float(input[bn + tn]) : 0.0f;
+            sum_sq += GEMV_NORMED ? x * x : 0.0f;
+            in_buf[tn] = GEMV_NORMED && bn + tn < K ? x * float(gain[bn + tn]) : x;
         }
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
@@ -555,12 +568,15 @@ template <typename T>
         }
     }
 
+    // A simdgroup's sum of squares rides in its slot's spare word.
+    sum_sq = GEMV_NORMED ? simd_sum(sum_sq) : 0.0f;
     threadgroup float tgp[BN * (blockM + TM)];
     if (simd_lid == 0) {
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
             tgp[sgN * (blockM + TM) + tm] = result[tm];
         }
+        tgp[sgN * (blockM + TM) + TM] = sum_sq;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -571,16 +587,26 @@ template <typename T>
             for (int tm = 0; tm < TM; tm++) {
                 result[tm] += tgp[sgn * (blockM + TM) + tm];
             }
+            sum_sq += tgp[sgn * (blockM + TM) + TM];
         }
+        const float scale = GEMV_NORMED ? 1.0f / sqrt(sum_sq / float(K) + GEMV_NORM_EPS) : 1.0f;
         MLX_MTL_PRAGMA_UNROLL
         for (int tm = 0; tm < TM; tm++) {
-            output[out_row + tm] = T(result[tm]);
+            output[out_row + tm] = T(GEMV_NORMED ? result[tm] * scale : result[tm]);
         }
     }
 }
 
 #define INST_GEMV(tag, T) \
-  SCRATCHY_KERNEL(gemv_##tag##_specialized, gemv_specialized<T>)
+  SCRATCHY_KERNEL(gemv_##tag##_specialized, gemv_specialized<T, T>)
 
 INST_GEMV(f16, half)
 INST_GEMV(bf16, bfloat)
+
+#define INST_GEMV_NORMED(act_tag, T, gain_tag, G) \
+  SCRATCHY_KERNEL(gemv_normed_##act_tag##_s_##gain_tag, gemv_specialized<T, G>)
+
+INST_GEMV_NORMED(f16, half, f16, half)
+INST_GEMV_NORMED(bf16, bfloat, f16, half)
+INST_GEMV_NORMED(bf16, bfloat, bf16, bfloat)
+INST_GEMV_NORMED(f16, half, bf16, bfloat)
