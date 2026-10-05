@@ -43,10 +43,36 @@ pub enum ExecutorError {
     #[error("worker initialization failed: {0}")]
     WorkerInit(String),
 
-    /// The worker backend has no implementation for this model architecture.
-    /// Surfaced when `scratchy_target_cuda::try_load` returns `Ok(None)`.
-    #[error("architecture `{0}` not supported by this backend")]
+    /// No compiled model claims this architecture. Surfaced when `try_load`
+    /// returns `ArchLoad::ArchNotCompiled` — no `#[forward]` registration owns
+    /// the HF arch at this tp size.
+    ///
+    /// "Not supported" alone reads as a missing backend, but by far the commoner
+    /// cause is BUILD SCOPE: `scratchy-models` has no default model scope, so an
+    /// arch is absent simply because no `model/<stem>` feature named it. Say
+    /// both, since the reader cannot tell them apart from the outside.
+    #[error(
+        "architecture `{0}` is not compiled into this build. Either no model of that \
+         architecture was named at build time — `scratchy-models` has no default model scope, \
+         so name one with `model/<stem>` (or `model/<arch>` / `model/all` to widen) — or this \
+         backend has no implementation for it."
+    )]
     ArchNotSupported(String),
+
+    /// The architecture IS compiled, but no compiled model variant's
+    /// fingerprint accepted this checkpoint — `ArchLoad::NoVariantMatched`.
+    /// Distinct from [`ExecutorError::ArchNotSupported`] because the fix is the
+    /// build's model/quant scope, not a missing backend: the checkpoint's shapes
+    /// or quantization layout differ from every `(model stem, quant preset)`
+    /// pair this binary compiled.
+    #[error(
+        "architecture `{0}` is compiled, but no compiled model variant matches this checkpoint: \
+         its shapes or quantization layout differ from every (model stem, quant preset) pair in \
+         this build. Check that the build names this checkpoint's stem (`model/<stem>`) and, for \
+         a quantized repo, a quant preset describing its actual on-disk widths (`quant/<preset>`, \
+         declared in crates/models/arch/configs/<arch>/quantizations.json)."
+    )]
+    NoVariantMatched(String),
 
     /// Worker execution failed.
     #[error("worker execution failed: {0}")]

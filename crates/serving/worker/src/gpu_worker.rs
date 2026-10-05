@@ -1095,8 +1095,16 @@ impl MetalWorker {
             max_model_len,
             hf_fp,
         )
-        .map_err(|e| ExecutorError::WorkerInit(format!("draft try_load: {e}")))?
-        .ok_or_else(|| ExecutorError::ArchNotSupported(draft_arch.clone()))?;
+        .map_err(|e| ExecutorError::WorkerInit(format!("draft try_load: {e}")))?;
+        let draft_model = match draft_model {
+            scratchy_forward_compiler::ArchLoad::Loaded(m) => m,
+            scratchy_forward_compiler::ArchLoad::NoVariantMatched => {
+                return Err(ExecutorError::NoVariantMatched(draft_arch.clone()));
+            }
+            scratchy_forward_compiler::ArchLoad::ArchNotCompiled => {
+                return Err(ExecutorError::ArchNotSupported(draft_arch.clone()));
+            }
+        };
 
         info!(
             "ScratchyWorker(metal): draft try_load in {:?} ({} via scratchy-forward-compiler, {})",
@@ -2832,8 +2840,20 @@ impl Worker for MetalWorker {
             max_model_len,
             hf_fp,
         )
-        .map_err(|e| ExecutorError::WorkerInit(format!("scratchy-forward-compiler load: {e}")))?
-        .ok_or_else(|| ExecutorError::ArchNotSupported(arch.clone()))?;
+        .map_err(|e| ExecutorError::WorkerInit(format!("scratchy-forward-compiler load: {e}")))?;
+        // "No compiled variant matches this checkpoint" is a different problem
+        // from "this backend has no such arch", and pointed at a different fix
+        // (build scope vs a missing backend) — see `ArchLoad`. #202 was the
+        // second reported as the first.
+        let model = match model {
+            scratchy_forward_compiler::ArchLoad::Loaded(m) => m,
+            scratchy_forward_compiler::ArchLoad::NoVariantMatched => {
+                return Err(ExecutorError::NoVariantMatched(arch.clone()));
+            }
+            scratchy_forward_compiler::ArchLoad::ArchNotCompiled => {
+                return Err(ExecutorError::ArchNotSupported(arch.clone()));
+            }
+        };
 
         info!(
             "ScratchyWorker(metal): try_load in {:?} ({} via scratchy-forward-compiler, {})",

@@ -131,7 +131,7 @@ pub mod loaders;
 pub mod arch_registry;
 #[cfg(feature = "cuda")]
 pub use arch_registry::{
-    ArchTryLoadFn, MmTryLoadFn, ScratchyArchRegistration, ScratchyMmRegistration,
+    ArchLoad, ArchTryLoadFn, MmTryLoadFn, ScratchyArchRegistration, ScratchyMmRegistration,
     resolve_mm_metadata, try_load, try_load_mm,
 };
 // Layered-load helpers re-exported at the crate root (the macro emits

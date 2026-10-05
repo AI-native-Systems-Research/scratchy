@@ -270,6 +270,51 @@ jobs:
       - name: KTIR optimizer tests
         run: cargo test -p ktir-optimizer
 
+      # Variant-selection gates (#202). These decide WHICH compiled model
+      # variant claims a checkpoint, and both halves fail OPEN — a broken
+      # pattern matcher or a dropped per-layer row rejects nothing, so the
+      # symptom is a silent mis-load, not a red test. Nothing else in CI
+      # reaches them: the workspace clippy has no `--all-targets`, and a
+      # dependency's tests do not run transitively (see the `cargo test -p
+      # scratchy-models` note above). scratchy-layers holds the runtime half
+      # (`affine_pattern_matches`, `affine_widths_agree_in`) and needs no
+      # features.
+      - name: Variant-selection gate tests (scratchy-layers)
+        run: cargo test -p scratchy-layers --lib
+
+      # The compile-time half: the per-(stem, preset) width resolution and the
+      # row collection/compression feeding it, plus the quant-config parser
+      # under it. Filtered to those two suites rather than the whole lib —
+      # 15 tests in `classify`/`config`/`shape`/`parse_python`/`codegen::tests`
+      # and the `fp8_block_disambiguation` trio are PRE-EXISTING failures
+      # (`load_dir` filters every stem through `CARGO_FEATURE_<STEM>`, which a
+      # proc-macro crate cannot set, so those tests select zero configs — the
+      # `config_of` doc comment in codegen.rs spells this out). Same class of
+      # rot as the KTIR suites above; fixing them is its own change. Widen this
+      # filter as they are fixed.
+      - name: Variant-selection gate tests (forward-compiler macro)
+        run: cargo test -p scratchy-forward-compiler-macro --features metal --lib
+          -- quantization::tests codegen::fingerprint_tests
+          --skip fp8_block_disambiguation
+
+      # Type-check scratchy-models' INTEGRATION tests (`tests/*.rs`). Nothing
+      # else does: every clippy step is `--lib`-shaped and the `cargo test`
+      # steps above are `--lib` too, so these files only ever compile on a
+      # developer's machine. They call `try_load` / the metal allocator
+      # directly, so they rot the moment either surface changes — this PR had
+      # to repair two of them after `try_load` gained a typed result, and CI
+      # would not have noticed.
+      #
+      # Deliberately a NARROW model scope, not `all`: at `all,turboquant` two
+      # of these files are already rotted against APIs that moved out from
+      # under them (`MetalMem::from_buffer`, `MetalResidencySet::insert`, and
+      # `ForwardCtx`'s turboquant sliding-window fields). Pre-existing, same
+      # class as the KTIR rot above, and its own change to fix. Two stems is
+      # enough to compile all three files.
+      - name: Model-crate integration tests type-check
+        run: cargo clippy -p scratchy-models --tests
+          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b -- -D warnings
+
       # Serving-layer unit tests: tool-call parsers (Hermes / Llama / Kimi /
       # Mistral / Jamba / Granite / Gemma-4), chat-template rendering, the
       # Anthropic `/v1/messages` translation. Pure logic, no GPU and no real

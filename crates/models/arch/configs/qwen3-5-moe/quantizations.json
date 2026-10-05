@@ -1,5 +1,6 @@
 {
+  "_comment": "UNIFORM 4-bit/g64 arch-wide, with the 3.6 checkpoint's wider router gates declared as per-(stem, preset) drift in `qwen3.6-35b-a3b-mlx-affine-b4-g64-qembed.overrides.json`. This arch has two checkpoints differing ONLY in those two roles — 3.5 is 4-bit everywhere (`embed_tokens` and `lm_head` both packed, hence `-qembed`), 3.6 ships `mlp.gate` + `mlp.shared_expert_gate` at 8-bit — so neither describes the arch. Declaring `mlx-affine-b4-g64-gate8-qembed` here described 3.6 only and made 3.5 unloadable (#202). The two resulting variants are byte-identical on every other fingerprint axis; what keeps them apart at load time is the per-role affine bit map in `fingerprint_matches`.",
   "quantizations": [
-    "mlx-affine-b4-g64-gate8-qembed"
+    "mlx-affine-b4-g64-qembed"
   ]
 }

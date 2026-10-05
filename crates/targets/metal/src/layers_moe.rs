@@ -444,6 +444,7 @@ pub trait Gemma4RouterOps {
         num_experts: usize,
         hidden_size: usize,
         group_size: u32,
+        bits: u32,
     ) -> anyhow::Result<Self>
     where
         Self: Sized;
@@ -451,7 +452,8 @@ pub trait Gemma4RouterOps {
 
 impl Gemma4RouterOps for GemmaRouterLayer {
     /// Load the Gemma-4 router bundle from `{prefix}` (= `...layers.N.router`):
-    /// * `{prefix}.proj` → dequantized **8-bit** affine `[E, hidden]` dense gate.
+    /// * `{prefix}.proj` → dequantized affine `[E, hidden]` dense gate, at the
+    ///   `bits` the caller resolved (8 for every checkpoint shipped so far).
     /// * `{prefix}.per_expert_scale` → `[E]` bf16, kept verbatim.
     /// * `{prefix}.scale` → `[hidden]` bf16 RMSNorm gain, kept verbatim.
     fn load(
@@ -460,6 +462,7 @@ impl Gemma4RouterOps for GemmaRouterLayer {
         num_experts: usize,
         hidden_size: usize,
         group_size: u32,
+        bits: u32,
     ) -> anyhow::Result<Self> {
         use crate::dtype::DType;
 
@@ -468,10 +471,14 @@ impl Gemma4RouterOps for GemmaRouterLayer {
             matches!(router_dtype, DType::BF16 | DType::F16),
             "GemmaRouterLayer: router dequant target must be BF16 or F16, got {router_dtype}"
         );
-        // router.proj is 8-bit MLX-affine on disk (NOT 4-bit) — dequant at
-        // load so the routing GEMM stays on the dense path.
+        // router.proj is MLX-affine on disk at its OWN width — 8-bit on every
+        // Gemma-4-MoE checkpoint so far, while the rest of the model is 4-bit.
+        // The width arrives from the macro (resolved through `affine_role_bits`
+        // from the arch's declared `bits_overrides`) rather than being baked
+        // here, so the fingerprint's bit map and this call cannot disagree (#202).
+        // Dequant at load so the routing GEMM stays on the dense path.
         let gate =
-            gw.take_affine_dequant_b4(&format!("{prefix}.proj"), group_size, 8, router_dtype)?;
+            gw.take_affine_dequant_b4(&format!("{prefix}.proj"), group_size, bits, router_dtype)?;
         let per_expert_scale = gw.take_keep_dtype(&format!("{prefix}.per_expert_scale"))?;
         let scale = gw.take_keep_dtype(&format!("{prefix}.scale"))?;
         Ok(GemmaRouterLayer {

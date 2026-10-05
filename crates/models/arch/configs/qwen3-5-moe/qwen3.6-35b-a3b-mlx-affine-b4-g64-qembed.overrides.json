@@ -1,0 +1,9 @@
+{
+  "_comment": "Per-(stem, preset) drift: `mlx-community/Qwen3.6-35B-A3B-4bit` is 4-bit/g64 like its 3.5 sibling EXCEPT for the two router gates, which it ships 8-bit (U32 `[256, 512]` and `[1, 512]`, against 3.5's `[256, 256]`/`[1, 256]`). The checkpoint states this itself, as 80 per-module `quantization` entries — 40 layers x 2 roles — which the in-tree dense base does not carry, so the width has to be declared here. This cannot live in the arch-wide preset: it is exactly what made the 3.5 checkpoint unloadable (#202). The two variants are kept apart at load time by the per-role affine bit map in `fingerprint_matches`.",
+  "quantization_config": {
+    "bits_overrides": {
+      "mlp.gate": 8,
+      "mlp.shared_expert_gate": 8
+    }
+  }
+}
