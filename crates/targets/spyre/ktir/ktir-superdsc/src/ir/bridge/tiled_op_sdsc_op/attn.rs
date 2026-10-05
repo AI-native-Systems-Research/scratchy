@@ -2498,13 +2498,14 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // rebase multiplies the PASS's request under a per-request regime — the gathered fold is
     // whole-batch, stride 0. Pinned by `fold_plan::tests::a_gathered_fold_ops_request_tag_moves_no_address`.
     //
-    // ⛔ CHUNK 0 KEEPS REQUEST 0, so every under-ceiling bundle — granite-8b's own 4,204-descriptor
-    // maximum included — emits the SAME trips, the SAME partition and the SAME fingerprint as
-    // before this existed: `k == 1` tags nothing and reorders nothing. The gate is the PROJECTED
-    // size in closed form at the emission site — copies `2 · mq · ops_per_row` (one per plane per
-    // request-run) plus `nb · (2·mq·nkvh·nslab legs + 11 ladder)` per window — against the ONE
-    // ceiling const the bake-side guard reads (`DxGroupCeiling::MAX_DESCRIPTORS`), so the emitter
-    // and the guard cannot disagree about when the split fires.
+    // ⛔ CHUNK 0 KEEPS REQUEST 0, so every under-target bundle — granite-8b's own bake included —
+    // emits the SAME trips, the SAME partition and the SAME fingerprint as before this existed:
+    // `k == 1` tags nothing and reorders nothing. The gate is the PROJECTED size in closed form
+    // at the emission site — copies `2 · mq · ops_per_row` (one per plane per request-run) plus
+    // `nb · (2·mq·nkvh·nslab legs + 11 ladder)` per window — against `DxGroupCeiling::SPLIT_TARGET`
+    // (the compile-cost target, ≤ the bake-side guard's `MAX_DESCRIPTORS` ceiling, so a split that
+    // fires here always lands under what the guard would refuse): the emitter aims BELOW what the
+    // guard forbids, and the two consts cannot disagree about legality.
     let nslab = crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, crate::superdsc_opspec::Df::Fp16).get();
     let nb = SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)).get();
     let chunking = gather.map(|(_, scratch)| {
@@ -2520,17 +2521,17 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // chunk is at or under the ceiling; a fold that cannot fit even alone (window count 0, or a
         // single window past the ceiling) stays `k = 1` and lets the bake-side guard refuse it by
         // name rather than looping forever here.
-        let k = if projected <= DxGroupCeiling::MAX_DESCRIPTORS || nb == 0 {
+        let k = if projected <= DxGroupCeiling::SPLIT_TARGET || nb == 0 {
             1
         } else {
-            // Least k with per_chunk_fixed + ceil(nb/k)·per_window ≤ ceiling: the windows are
+            // Least k with per_chunk_fixed + ceil(nb/k)·per_window ≤ target: the windows are
             // distributed as evenly as the per-window cost allows, remainder to the LAST chunks
             // (chunk 0 keeps the floor, so the first group stays the SMALLEST — the one whose
             // byte-identity matters most is the one least likely to move).
             let mut k = 1usize;
             while k < nb as usize {
                 let windows = (nb as usize).div_ceil(k);
-                if per_chunk_fixed + windows * per_window <= DxGroupCeiling::MAX_DESCRIPTORS {
+                if per_chunk_fixed + windows * per_window <= DxGroupCeiling::SPLIT_TARGET {
                     break;
                 }
                 k += 1;

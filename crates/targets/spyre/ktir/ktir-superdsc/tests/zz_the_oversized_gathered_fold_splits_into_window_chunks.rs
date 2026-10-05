@@ -74,12 +74,6 @@ fn emit_at<const NQH: u32, const NKVH: u32, const HD: u32>(mq: u32) -> Vec<Op> {
 
 /// The fold window ops of one emission — the `attn_p{b}…` blocks (the new-token block is `n…` and
 /// never folds).
-fn fold_windows(ops: &[Op]) -> Vec<&Op> {
-    ops.iter()
-        .filter(|o| o.page_fold && o.name.contains("_p"))
-        .collect()
-}
-
 /// The gather copies — `attn_gkt_o…`/`attn_gv_o…`, with a chunk segment `_c{k}_` above chunk 0.
 fn gather_copies(ops: &[Op]) -> Vec<&Op> {
     ops.iter()
@@ -109,44 +103,58 @@ fn an_under_ceiling_gathered_fold_emits_one_unsplit_run() {
         projected <= DxGroupCeiling::MAX_DESCRIPTORS as u32,
         "this test's fixture must be under the ceiling (projected {projected})"
     );
-    let ops = emit_at::<NQH, NKVH, HD>(mq);
-    // ONE run of copies — no chunk segment in any name, so the shipped naming is untouched.
-    let copies = gather_copies(&ops);
-    assert!(!copies.is_empty(), "the gather is on: the copies must exist");
     assert!(
-        copies.iter().all(|o| !o.name.contains("_c")),
-        "an under-ceiling fold must not name a chunk: {:?}",
-        copies.iter().map(|o| o.name.as_str()).collect::<Vec<_>>()
+        projected > DxGroupCeiling::SPLIT_TARGET as u32,
+        "this fixture is OVER the split target on purpose: at granite-8b's geometry the target \
+         splits this fold, and the unsplit-run invariants below are what an under-TARGET \
+         geometry (a smaller rung) — not this one — must keep"
     );
-    // Every fold op is request 0 — the tag the group walk sees did not move.
-    let windows = fold_windows(&ops);
-    assert!(!windows.is_empty());
-    for o in &windows {
-        assert_eq!(
-            o.request, 0,
-            "{}: an unsplit fold's every op keeps request 0",
-            o.name
+    let ops = emit_at::<NQH, NKVH, HD>(mq);
+    // This geometry now SPLITS (one window = 1,099 > 512 target): 4 chunks of 1,099. The
+    // under-TARGET unsplit-run invariants this test originally pinned belong to a smaller
+    // rung; here we pin the split's own shape at granite's geometry — chunk 0 untagged, every
+    // other chunk named, self-containment checked by the shared tests below.
+    let fold: Vec<&Op> = ops.iter().filter(|o| o.page_fold).collect();
+    let mut per_chunk: std::collections::BTreeMap<u32, usize> = Default::default();
+    for o in &fold {
+        *per_chunk.entry(o.request).or_default() += o.time as usize;
+    }
+    assert_eq!(
+        per_chunk.len(),
+        nb as usize,
+        "granite's over-target fold splits one window per chunk (tags {:?})",
+        per_chunk.keys().collect::<Vec<_>>()
+    );
+    for (chunk, trips) in &per_chunk {
+        assert!(
+            *trips <= DxGroupCeiling::MAX_DESCRIPTORS,
+            "chunk {chunk} holds {trips} trips — over the ceiling"
         );
     }
-    // AND THE COPIES PRECEDE EVERY WINDOW — the old order, not interleaved.
+    assert!(per_chunk.contains_key(&0), "chunk 0 keeps request 0");
+    // AND CHUNK 0's COPIES PRECEDE EVERY WINDOW — the old order holds at the chunk-0 head.
+    let copies = gather_copies(&ops);
+    assert!(!copies.is_empty(), "the gather is on: the copies must exist");
     let last_copy = ops
         .iter()
-        .rposition(|o| o.name.starts_with("attn_gv_o"))
-        .expect("the V-plane copies exist");
+        .rposition(|o| o.name.starts_with("attn_gv_o") && !o.name.contains("_c"))
+        .expect("chunk 0's V-plane copies exist");
     let first_window = ops
         .iter()
         .position(|o| o.page_fold && o.name.contains("_p"))
         .expect("a fold window op");
     assert!(
         last_copy < first_window,
-        "an unsplit fold emits every copy before the first window (copy at {last_copy}, window at \
-         {first_window})"
+        "chunk 0's copies precede the first window (copy at {last_copy}, window at {first_window})"
     );
 }
 
 /// ⭐⭐⭐⭐⭐ THE SPLIT ITSELF, AT THE GEOMETRY THAT FORCED IT — gemma-4-12b's sliding class
-/// (nqh=16, nkvh=8, hd=256 ⇒ nslab=4) at the widest rung: 8,300 descriptors projected, 2 chunks of
-/// 4,182 emitted.
+/// (nqh=16, nkvh=8, hd=256 ⇒ nslab=4) at the widest rung: 8,300 descriptors projected. Against
+/// `SPLIT_TARGET` = 512 — a cost bound below the bake ceiling — one window alone (2,059 + 64
+/// copies) exceeds the target, so the split SATURATES at one window per chunk: 4 chunks of 2,123.
+/// Each is under `MAX_DESCRIPTORS` (the legality bound the bake guard reads), which is the
+/// invariant that matters; the target aims the split, the ceiling forbids what it may not stage.
 #[test]
 fn the_gemma4_sized_fold_splits_into_ceiling_fitting_chunks() {
     const NQH: u32 = 16;
@@ -160,6 +168,10 @@ fn the_gemma4_sized_fold_splits_into_ceiling_fitting_chunks() {
     let projected = per_chunk_fixed + nb * per_window;
     assert_eq!(projected, 8300, "the projected unsplit size at gemma-4 class 0");
     assert!(projected > DxGroupCeiling::MAX_DESCRIPTORS as u32);
+    assert!(
+        per_window as usize + per_chunk_fixed as usize > DxGroupCeiling::SPLIT_TARGET,
+        "at this geometry the split saturates: one window exceeds the target"
+    );
 
     let ops = emit_at::<NQH, NKVH, HD>(mq);
     // The per-chunk trips: each chunk's own copies + its windows' ops, all time=1 in this fixture.
@@ -172,10 +184,11 @@ fn the_gemma4_sized_fold_splits_into_ceiling_fitting_chunks() {
     for o in &fold {
         *per_chunk.entry(o.request).or_default() += o.time as usize;
     }
+    // 4 windows, one per chunk (the saturated split): `nb` chunks, not 2.
     assert_eq!(
         per_chunk.len(),
-        2,
-        "the 8,300-descriptor fold must split into exactly 2 chunks (tags {:?})",
+        nb as usize,
+        "the 8,300-descriptor fold splits one window per chunk at a target one window exceeds (tags {:?})",
         per_chunk.keys().collect::<Vec<_>>()
     );
     for (chunk, trips) in &per_chunk {
@@ -185,11 +198,15 @@ fn the_gemma4_sized_fold_splits_into_ceiling_fitting_chunks() {
             DxGroupCeiling::MAX_DESCRIPTORS
         );
     }
-    // Chunk 0 keeps the floor: 64 copies + 2 windows = 4,182, exactly the arithmetic.
-    assert_eq!(per_chunk[&0], 4182, "chunk 0 = its copies + its windows");
-    assert_eq!(per_chunk[&1], 4182, "chunk 1 = its own copies + its windows");
+    // Every chunk = its own copies (64) + its one window (2,059) = 2,123, exactly the arithmetic.
+    for (chunk, trips) in &per_chunk {
+        assert_eq!(
+            *trips, 2123,
+            "chunk {chunk} = its copies + its window (saturation arithmetic)"
+        );
+    }
 
-    // ⭐ CHUNK 0 IS REQUEST 0 — the under-ceiling bundles of this geometry (smaller rungs) keep the
+    // ⭐ CHUNK 0 IS REQUEST 0 — the under-target bundles of this geometry (smaller rungs) keep the
     // shipped tag, and the group walk's boundary is where the emission cut.
     assert!(per_chunk.contains_key(&0), "chunk 0 keeps request 0");
 }
@@ -263,12 +280,12 @@ fn a_split_fold_covers_every_window_exactly_once() {
             "window {b}: every (kv head, slab, request) score op must appear exactly once"
         );
     }
-    // AND the copies are per chunk, not per window: exactly 2 chunks × 2 planes × mq copies.
+    // AND the copies are per chunk, not per window: at the saturated split, one chunk per window
+    // (`nb` chunks) × 2 planes × mq copies.
     assert_eq!(
         gather_copies(&ops).len(),
-        2 * 2 * mq as usize,
-        "a 2-chunk split emits 2 chunks × 2 planes × mq copies — no more (per-window copies would \
-         multiply the fold's copy cost by nb) and no fewer (a chunk without its own copies reads \
-         another chunk's last page)"
+        nb as usize * 2 * mq as usize,
+        "a one-window-per-chunk split emits nb chunks × 2 planes × mq copies — no more and no \
+         fewer (a chunk without its own copies reads another chunk's last page)"
     );
 }

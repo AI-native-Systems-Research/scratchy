@@ -36,7 +36,7 @@
 //! bundle actually contains.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{AttnGeometry, DxGroupCeiling, attn_bundle_rows};
 
 /// granite-3.1-2b: 32 query heads, 8 kv heads, head dim 64 — the model every card number above is from.
 const NQH: u32 = 32;
@@ -781,10 +781,29 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
          — the per-core share IS the whole op there. (It is NOT that the chunk is sized before work \
          division; see `PagePlaneExtent::lx_entries_per_op` for the vendor line that settles it.)"
     );
+    // ⛔ THE COUNT IS CHUNK-AWARE. This fixture's fold projects at 16 + 4·139 = 572 descriptors —
+    // over `SPLIT_TARGET` (512) but under the legality ceiling — so the window-chunk split cuts it
+    // into 2 self-contained chunks, and EVERY chunk carries its own copies (the group-major reps
+    // law: a chunk without its own copies reads another chunk's last page). The expected count is
+    // therefore `k · 2 · per_leg`, with `k` derived from the same projection the emitter runs —
+    // not written down — so this pin moves with the target, not against it.
+    let nslab = (HD / 64) as usize;
+    let nb = (CAP / 64) as usize;
+    let per_window = 2 * 8 * NKVH as usize * nslab + 11;
+    let fixed = 2 * 8; // ops_per_row = 1 at nkvh=8
+    let mut k = 1usize;
+    while k < nb {
+        let windows = nb.div_ceil(k);
+        if fixed + windows * per_window <= DxGroupCeiling::SPLIT_TARGET {
+            break;
+        }
+        k += 1;
+    }
+    let expected = k * 2 * per_leg;
     assert_eq!(
-        gathered.len(),
-        2 * per_leg,
-        "expected {per_leg} Kᵗ copies and {per_leg} V copies, each naming ONE entry — got {gathered:?}",
+        gathered.len() as usize,
+        expected,
+        "expected {k} chunk(s) × 2 planes × {per_leg} copies, each naming ONE entry — got {gathered:?}",
     );
     // ⛔ AND THE ENTRY COUNT IS THE THING THAT USED TO WRAP. `rows()` is the live entry count per pass;
     // above `CopyDims::ENTRIES_PER_OP` the IBR is read modulo one stick and the cores past the wrap use
@@ -802,9 +821,10 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
     );
     assert_eq!(
         (kt, v),
-        (per_leg, per_leg),
-        "each leg must be covered by exactly its own runs — a leg short of one run leaves those rows \
-         holding whatever the allocator handed out, which is a valid block number. Got {gathered:?}"
+        (k * per_leg, k * per_leg),
+        "each leg must be covered by exactly its own runs in EVERY chunk — a leg short of one run \
+         leaves those rows holding whatever the allocator handed out, which is a valid block \
+         number. Got {gathered:?}"
     );
     // ⛔ AND THE RUNS MUST BE DISTINCT OPS, not the same name emitted twice: the cut is expressed as a
     // baked base, so two identically-named ops would be two gathers of run 0 and the rows of every other

@@ -32,7 +32,9 @@
 //!    emission does not move.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, POOL_STICK, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, DxGroupCeiling, POOL_STICK, PagedKvPool, attn_bundle_rows,
+};
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
@@ -283,11 +285,24 @@ fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
                 2 * nb * NKVH * mq * nslab,
                 "hd={hd} mq={mq}: the two gathered legs are nb*nkvh*mq*nslab ops each"
             );
-            // TWO PLANES, one copy op per (request, entry cut) each — `ops_per_row` is 1 here.
+            // TWO PLANES, one copy op per (request, entry cut) each — `ops_per_row` is 1 here —
+            // TIMES THE CHUNK COUNT: a fold over `SPLIT_TARGET` carries its copies in EVERY
+            // self-contained chunk (the group-major reps law), so the count is `k · 2 · mq`
+            // with `k` derived from the same projection the emitter runs at this geometry.
+            let per_window = 2 * mq * NKVH * nslab + 11;
+            let fixed = 2 * mq;
+            let mut k = 1u32;
+            while k < nb {
+                let windows = nb.div_ceil(k);
+                if fixed + windows * per_window <= DxGroupCeiling::SPLIT_TARGET as u32 {
+                    break;
+                }
+                k += 1;
+            }
             assert_eq!(
                 copies,
-                2 * mq,
-                "hd={hd} mq={mq}: one Kᵗ and one V copy per request"
+                k * 2 * mq,
+                "hd={hd} mq={mq}: {k} chunk(s) × one Kᵗ and one V copy per request"
             );
             println!(
                 "hd={hd} mq={mq} nslab={nslab}: legs={legs} copies={copies} total_attn_ops={}",

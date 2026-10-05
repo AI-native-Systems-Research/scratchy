@@ -5162,6 +5162,32 @@ impl DxGroupCeiling {
     /// chunks each at or under this value; the next-largest gemma group is 4,183 and stays unsplit.
     /// Moving this constant is a MEASURED decision that names the bake, never a silent one.
     pub const MAX_DESCRIPTORS: usize = 4204;
+
+    /// The TARGET the window-chunk split aims each gathered-fold chunk at. Distinct from
+    /// `MAX_DESCRIPTORS` on purpose: the ceiling (4204) is the largest group a bake may STAGE —
+    /// a correctness/legal bound, informed by granite-8b's own measured maximum — while this is
+    /// the largest chunk the split should LEAVE in place, a COMPILE-TIME-COST bound.
+    ///
+    /// MEASURED on the gemma-4-12b fp8 bake's own dump (2026-10-05, 3490 groups / 202,189
+    /// descriptor files): dxp bakes groups in PARALLEL, so the bake SPAN is set by the LARGEST
+    /// group, and group cost is superlinear in size (8,300 descriptors ≈ 2.5 h, 4,183 ≈ 57 min ⇒
+    /// exponent ≈ 1.4). The 12b's critical path is its ~4,183-descriptor gathered folds; one
+    /// WINDOW of that fold is 2,059 descriptors + 64 copies, so window chunking SATURATES at
+    /// 2,123-per-chunk at this geometry — any target ≤ 2,123 yields the same split. The dump's
+    /// largest non-fold groups (2,157) then set the new floor: modeled span ~57 → ~23 min.
+    ///
+    /// ⛔ THIS SPLITS GRANITE TOO. Granite-8b's own 4,204-descriptor fold is over any useful
+    /// target, so its bake changes — LAWFULLY (each chunk carries its own gather copies, the
+    /// online softmax is accumulate-only, `k == 1` whenever one chunk fits) but NOT
+    /// byte-identically: granite's card output must be re-verified coherent on the binary that
+    /// lands with a move of this constant. Byte-identity holds only for folds projecting at or
+    /// under the target. Groups the split cannot touch (non-fold kinds at 2,100–4,200) are
+    /// unchanged — this is a cheaper arrangement of the same computation, not a smaller one.
+    ///
+    /// Moving THIS constant is a bake-cost decision validated against a measured span, never a
+    /// numerics one: the 12b's greedy output must be identical across the move (same garbage in,
+    /// same garbage out — the numerics are untouched), verified on the rebuild that lands with it.
+    pub const SPLIT_TARGET: usize = 512;
 }
 
 impl PagedKvPool {
