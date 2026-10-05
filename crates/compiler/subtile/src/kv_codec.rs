@@ -636,7 +636,9 @@ mod tests {
             if let SubOp::RopeAppend { attn, .. } | SubOp::AttnDecode { mask: attn, .. } =
                 &mut od.op
             {
-                *attn = AttnMask::SlidingWindow;
+                *attn = AttnMask::SlidingWindow {
+                    window: std::num::NonZeroU32::new(1024).expect("1024 is nonzero"),
+                };
             }
         }
         l.input.sources.extend(second.sources);

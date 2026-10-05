@@ -583,9 +583,26 @@ pub enum AttnMask {
     /// Every position up to and including the query's own.
     Causal,
     /// The gemma class's local layers: causal, further restricted to the last `window`
-    /// positions. The WINDOW SIZE is not here — like the tanh soft cap it is a model constant
-    /// resolved at emission and has never ridden the tape.
-    SlidingWindow,
+    /// positions. The window size RIDES the tape — it is a model constant, but one the
+    /// numeric oracle needs (`eval_dag`'s host reference attends to the last `window`
+    /// positions, exactly what a sliding kernel does); without it on the tape a hybrid
+    /// model had NO golden bisection, only a panic. Set from the bridge
+    /// (`model.bounds["sliding_window"]`) at the one place every attention is minted.
+    SlidingWindow {
+        /// How many of the most recent positions (including the query's own) stay
+        /// attendable. A model constant, identical for every sliding layer.
+        window: std::num::NonZeroU32,
+    },
+}
+
+impl AttnMask {
+    /// The sliding window size, for every consumer that only needs the number.
+    pub fn window(self) -> Option<std::num::NonZeroU32> {
+        match self {
+            AttnMask::Causal => None,
+            AttnMask::SlidingWindow { window } => Some(window),
+        }
+    }
 }
 
 // ── The mixture-of-experts vocabulary ──────────────────────────────
@@ -844,7 +861,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 pairing.hash(h);
             }
             // `layout`, `producer`'s node index and `softmax_state` are per-layer identity;
-            // `mask` is the class (sliding-window vs full) and is exactly what gemma-3 needs.
+            // `mask` is the class (sliding-window vs full) and is exactly what gemma-3 needs —
+            // and the WINDOW is a model constant, so it hashes with the class rather than
+            // splitting one model's layers across hash buckets.
             SubOp::AttnDecode {
                 geom,
                 scale,
@@ -860,6 +879,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 valid_len.hash(h);
                 std::mem::discriminant(producer).hash(h);
                 std::mem::discriminant(mask).hash(h);
+                if let Some(w) = mask.window() {
+                    w.get().hash(h);
+                }
             }
             SubOp::GateSplit { half_cols } => half_cols.hash(h),
             SubOp::LoadPixels { in_features } => in_features.hash(h),
@@ -1740,16 +1762,13 @@ pub fn eval_node<F: RopeForm>(
         SubOp::AttnDecode {
             geom, scale, mask, ..
         } => {
-            // ⛔ THE WINDOW SIZE IS NOT ON THE TAPE, so a sliding-window layer has no
-            // host reference — evaluating it with the causal bound would silently
-            // attend across the whole prefix and report agreement with a kernel that
-            // does not do that.
-            assert!(
-                matches!(mask, AttnMask::Causal),
-                "SubOp::AttnDecode has no host reference under AttnMask::SlidingWindow: \
-                 the window size is a model constant resolved at emission and has never \
-                 been carried on the tape"
-            );
+            // ⭐ THE WINDOW IS ON THE TAPE, so a sliding-window layer HAS a host
+            // reference: the window bound is `window` positions back from the
+            // query's own, the same left-edge every sliding kernel reads. Without
+            // it (a bare causal bound) the reference would silently attend across
+            // the whole prefix and report agreement with a kernel that does not
+            // do that — which is why this used to refuse.
+            let window = mask.window().map(|w| w.get() as usize);
             // Head-block aware: this node computes a contiguous q-head range,
             // derived from the OUTPUT region (its column slice), and reads the
             // matching kv-head range — derived from the K input region. The
@@ -1800,10 +1819,18 @@ pub fn eval_node<F: RopeForm>(
                     // of the concatenated sequence, so query row qi sits at absolute
                     // position `seq_len - mq + qi` and may attend to keys 0..=that.
                     // For mq==1 this is `seq_len-1` (all keys) ⇒ decode is unchanged.
-                    let causal_bound = seq_len - mq + qi;
+                    // A sliding layer additionally drops everything more than
+                    // `window` positions behind its own — the left edge
+                    // `own_pos + 1 - window`, the same bound every sliding kernel
+                    // reads (`kv_len-1 - k >= window` masked out).
+                    let own_pos = seq_len - mq + qi;
+                    let left = match window {
+                        Some(w) => own_pos + 1 - w.min(own_pos + 1),
+                        None => 0,
+                    };
                     let mut scores = vec![0f32; seq_len];
                     for (s, score) in scores.iter_mut().enumerate() {
-                        if s > causal_bound {
+                        if s > own_pos || s < left {
                             *score = f32::NEG_INFINITY;
                             continue;
                         }

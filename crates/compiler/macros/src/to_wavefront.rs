@@ -1066,8 +1066,32 @@ pub fn lower_decode_to_wavefront(
                 // row arrives via the separate k/v segments). The GPU mask
                 // binds the real length from the runtime DecodePosition arg.
                 let valid_len = bx.prefix_len;
+                // ⭐ THE WINDOW SIZE, from the model's own bounds — the one source
+                // every target already trusts (`model.bounds["sliding_window"]`). A
+                // `sliding_attention` tile on a model with no such bound is a config
+                // error, named here so it cannot become a default window that
+                // silently attends the wrong span.
+                let window = if matches!(node.op, OpKind::SlidingAttention) {
+                    std::num::NonZeroU32::new(
+                        bx.model
+                            .bounds
+                            .get("sliding_window")
+                            .copied()
+                            .ok_or_else(|| BridgeError::MalformedOp {
+                                tile,
+                                op: OpKind::SlidingAttention,
+                                detail: "sliding_attention tile, but the model config carries no \
+                                         `sliding_window` bound",
+                            })? as u32,
+                    )
+                    .expect("`sliding_window` = 0 is not a window; NonZeroU32::new returns None \
+                             only for 0, and a config with 0 is malformed")
+                } else {
+                    // Causal: unused below; a placeholder value that never escapes.
+                    std::num::NonZeroU32::new(1).expect("1 is nonzero")
+                };
                 let mask = match node.op {
-                    OpKind::SlidingAttention => AttnMask::SlidingWindow,
+                    OpKind::SlidingAttention => AttnMask::SlidingWindow { window },
                     _ => AttnMask::Causal,
                 };
                 let base_geom = bx
@@ -1075,19 +1099,19 @@ pub fn lower_decode_to_wavefront(
                     .ok_or(BridgeError::MissingBound { key: "head_dim" })?;
                 let geom = match mask {
                     AttnMask::Causal => bx.geom_global.unwrap_or(base_geom),
-                    AttnMask::SlidingWindow => base_geom,
+                    AttnMask::SlidingWindow { .. } => base_geom,
                 };
                 // The prefix cache at THIS layer's class width — a hybrid model's
                 // sliding and global layers have different kv widths, and the cache
                 // this attention reads is the one its own class's RopeAppend wrote.
                 let (pk, pv) = bx.prefix_for(layer, geom.kv_width());
-                if mask == AttnMask::SlidingWindow {
+                if let AttnMask::SlidingWindow { window } = mask {
                     // The k-rope for a sliding layer targets the LOCAL
                     // geometry class.
                     if let InputRef::Op(ri) = k
                         && let SubOp::RopeAppend { attn, .. } = &mut bx.ops[ri].op
                     {
-                        *attn = AttnMask::SlidingWindow;
+                        *attn = AttnMask::SlidingWindow { window };
                     }
                 }
                 let idx = bx.push_op(

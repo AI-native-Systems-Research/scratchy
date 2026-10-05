@@ -1341,12 +1341,14 @@ impl Recording<'_> {
                     }]
                 };
                 use AttnMask::{Causal, SlidingWindow as Sliding};
+                // `Sliding` matches ANY window size — this dispatch cares only
+                // about the CLASS (which kernel lowers), never the span.
                 let (step, sites) = match (self.l.input.ops[i].m > 1, mask) {
-                    (true, Sliding) => {
+                    (true, Sliding { .. }) => {
                         (S::SlidingAttentionPrefillPaged(q, out, layer, neox), vec![])
                     }
                     (true, Causal) => (S::AttentionPrefillPaged(q, out, layer, neox), vec![]),
-                    (false, Sliding) => (
+                    (false, Sliding { .. }) => (
                         S::SlidingAttentionViaCache(q, out, layer, pairing),
                         rotary(),
                     ),
