@@ -33,7 +33,9 @@ use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{ArenaLayout, MetalWorker, ResolvedSources, WorkerError};
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
-use crate::tape::ids::{HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads};
+use crate::tape::ids::{
+    AttnSplits, HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
+};
 use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
 use scratchy_ir::{CanonicalParams, Instruction};
@@ -410,6 +412,8 @@ pub struct PickedRung<'a> {
     pub cap: MaxBlocksPerSeq,
     /// The query heads one TurboQuant decode threadgroup serves on this device.
     pub tq_heads: TqDecodeHeads,
+    /// The threadgroups each decode query-head group's key loop spreads over on this device.
+    pub attn_splits: AttnSplits,
     pub tapes: Vec<(&'a MetalBucketSpec, &'a ClassedTape)>,
 }
 
@@ -419,6 +423,7 @@ impl PickedRung<'_> {
         TapeVariant {
             cap: self.cap,
             tq_heads: Some(self.tq_heads),
+            attn_splits: self.attn_splits,
         }
     }
 }
@@ -467,10 +472,17 @@ pub fn pick_rung<'a>(
     let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
     let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
     let tq_heads = TqDecodeHeads::for_group(tq.head_dim, tq.q_heads, tq.kv_heads, gpu_cores);
+    // A decode attention's threadgroups: one per query-head group — `tq_heads` heads each under
+    // TurboQuant, one each otherwise.
+    let splits = |t: &ClassedTape| {
+        let heads = t.tq_heads.map_or(1, |_| tq_heads.get());
+        AttnSplits::for_threadgroups(tq.q_heads.get() / heads, gpu_cores)
+    };
     let serves = |t: &&ClassedTape| {
         t.gen_class == gen_class
             && t.addressing == addressing
             && t.tq_heads.is_none_or(|h| h == tq_heads)
+            && t.attn_splits.is_none_or(|s| s == splits(t))
     };
     let no_rung = |s: &MetalBucketSpec| PoolBuildError::NoRung {
         bucket_m: s.bucket_m,
@@ -486,10 +498,12 @@ pub fn pick_rung<'a>(
     let tapes: Vec<_> = (buckets.iter())
         .filter_map(|s| Some((*s, s.tapes.iter().filter(serves).find(|t| t.cap == cap)?)))
         .collect();
+    let attn_splits = (tapes.iter().find_map(|(_, t)| t.attn_splits)).unwrap_or(AttnSplits(1));
     tracing::info!(
         target: "scratchy-target-metal",
         gpu_cores = gpu_cores.get(),
         tq_decode_heads = tq_heads.get(),
+        attn_splits = attn_splits.get(),
         kv_cap_rung = cap.get(),
         buckets = tapes.len(),
         "baked tape rung"
@@ -497,6 +511,7 @@ pub fn pick_rung<'a>(
     Ok(PickedRung {
         cap,
         tq_heads,
+        attn_splits,
         tapes,
     })
 }
@@ -1835,6 +1850,7 @@ mod tests {
     const TEST_VARIANT: TapeVariant = TapeVariant {
         cap: MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
         tq_heads: None,
+        attn_splits: crate::tape::ids::AttnSplits(1),
     };
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
@@ -2702,6 +2718,7 @@ mod tests {
                     addressing,
                     cap: MaxBlocksPerSeq(128),
                     tq_heads: None,
+                    attn_splits: None,
                     tape,
                 });
             }

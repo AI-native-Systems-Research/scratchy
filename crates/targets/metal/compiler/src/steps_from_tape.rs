@@ -1668,8 +1668,16 @@ impl Recording<'_> {
                     .into_iter()
                     .flatten()
                     .collect();
+                let decode = matches!(
+                    step,
+                    S::AttentionViaCache(..) | S::SlidingAttentionViaCache(..)
+                );
                 let mut e = em(step, &reads, &[out], sites);
                 e.sig.kv_r = Some(layer);
+                // A decode attention's split passes its partials through the op scratch.
+                if decode {
+                    e.sig.op_scratch = Access::Write;
+                }
                 // A coded attention reads its K/V staged, off decode steps.
                 let staged = |j: usize| matches!(self.op(j), L::KvStage { .. });
                 if self.group(i).any(staged) {
@@ -1699,6 +1707,7 @@ impl Recording<'_> {
                 let step = S::AttnPackedKv(q, out, layer, pairing, class, offsets);
                 let mut e = em(step, &[q, out], &[out], sites);
                 e.sig.kv_r = Some(layer);
+                e.sig.op_scratch = Access::Write;
                 e
             }
             L::Elementwise(E::Mul) => return Err(self.no(i, Refused::NoGatedFold)),

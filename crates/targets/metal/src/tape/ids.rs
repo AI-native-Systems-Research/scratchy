@@ -309,6 +309,9 @@ u32_newtype!(
     /// Query heads one TurboQuant decode threadgroup covers
     /// (`attention.metal` `ATTN_TQ_HEADS`, slot 16) — see [`TqDecodeHeads::for_group`].
     TqDecodeHeads,
+    /// Threadgroups one decode query-head group's key loop spreads over (`attention.metal`
+    /// `ATTN_SPLITS`, slot 18) — see [`AttnSplits::for_threadgroups`].
+    AttnSplits,
     /// The GPU cores of the device a tape runs on, read at load
     /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
@@ -353,6 +356,27 @@ impl TqDecodeHeads {
             .filter(|h| num_q_heads.get() / h.get() >= min_threadgroups)
             .last()
             .unwrap_or(Self(1))
+    }
+}
+
+impl AttnSplits {
+    /// Every split count a tape bakes a variant for: the key loop's 32 simdgroups over 1 or 2
+    /// threadgroups. Each count is a copy of every decode attention kernel in the binary, and on
+    /// the measured geometries 2 already takes nearly all of what 4 and 8 do (Llama 3.2 3B, one
+    /// query head per threadgroup, base M5: 35.3 → 32.2 µs at 400 keys, 4 splits 31.7; 141 → 116
+    /// at 2048, 4 splits 115).
+    pub const CANDIDATES: [Self; 2] = [Self(1), Self(2)];
+
+    /// The fewest splits that give a decode attention of `threadgroups` (one per query-head group)
+    /// `4/5` of the GPU's cores — [`TqDecodeHeads::for_group`]'s occupancy — or the most there are.
+    /// A split adds a combine pass, so a device the unsplit attention already fills takes 1.
+    pub fn for_threadgroups(threadgroups: u32, gpu_cores: GpuCores) -> Self {
+        let want = gpu_cores.get() * 4 / 5;
+        let fills = |s: &Self| threadgroups * s.get() >= want;
+        Self::CANDIDATES
+            .into_iter()
+            .find(fills)
+            .unwrap_or(Self::CANDIDATES[1])
     }
 }
 

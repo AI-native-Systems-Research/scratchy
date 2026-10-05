@@ -937,6 +937,8 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::RopeOnceGqaShared => KernelKind::Rope,
         K::AttentionViaCache
         | K::AttentionViaCacheTq
+        | K::AttentionDecodeCombine
+        | K::AttentionDecodeCombineTq
         | K::AttentionPrefillSdpaPaged
         | K::AttnGatherKRope
         | K::AttnGatherVCopyT
@@ -1107,6 +1109,15 @@ fn bake_bucket<W: CanonicalParams>(
                     });
                 }
             }
+            continue;
+        }
+
+        // A variant at one split merges each decode attention in place: no combine to run.
+        let combine = matches!(
+            cmd.kernel,
+            KernelId::AttentionDecodeCombine | KernelId::AttentionDecodeCombineTq
+        );
+        if combine && pipelines.variant().attn_splits.get() == 1 {
             continue;
         }
 
@@ -1551,19 +1562,26 @@ fn scale_tg_for_num_tokens(
 }
 
 fn mtl_size_pair(cmd: &LoweredCommand, variant: TapeVariant) -> (MTLSize, MTLSize) {
+    use KernelId as K;
     // A TurboQuant decode threadgroup serves the variant's query heads (`ConstantType::TqHeads`):
     // its threadgroups count heads. Its pipeline lookup refuses a variant without them.
     let heads = match (cmd.kernel, variant.tq_heads) {
-        (KernelId::AttentionViaCacheTq, Some(h)) => h.get(),
+        (K::AttentionViaCacheTq | K::AttentionDecodeCombineTq, Some(h)) => h.get(),
+        _ => 1,
+    };
+    // A decode attention spreads each query-head group over the variant's splits, the key loop's
+    // 32 simdgroups dealt out among them (`ConstantType::AttnSplits`).
+    let splits = match cmd.kernel {
+        K::AttentionViaCache | K::AttentionViaCacheTq => variant.attn_splits.get(),
         _ => 1,
     };
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as usize,
         height: (cmd.dispatch.threadgroups.1 / heads) as usize,
-        depth: cmd.dispatch.threadgroups.2 as usize,
+        depth: (cmd.dispatch.threadgroups.2 * splits) as usize,
     };
     let tpt = MTLSize {
-        width: cmd.dispatch.threads_per_threadgroup.0 as usize,
+        width: (cmd.dispatch.threads_per_threadgroup.0 / splits) as usize,
         height: cmd.dispatch.threads_per_threadgroup.1 as usize,
         depth: cmd.dispatch.threads_per_threadgroup.2 as usize,
     };
@@ -1597,6 +1615,7 @@ mod tests {
     const TEST_VARIANT: TapeVariant = TapeVariant {
         cap: crate::tape::ids::MaxBlocksPerSeq(TestWeights::MAX_BLOCKS_PER_SEQ),
         tq_heads: None,
+        attn_splits: crate::tape::ids::AttnSplits(1),
     };
 
     /// A TurboQuant decode attention's threadgroups count query heads: one serves the picked
@@ -1625,6 +1644,7 @@ mod tests {
             let variant = TapeVariant {
                 cap: MaxBlocksPerSeq(128),
                 tq_heads: Some(TqDecodeHeads(heads)),
+                attn_splits: crate::tape::ids::AttnSplits(1),
             };
             let (tg, _) = mtl_size_pair(&tq, variant);
             assert_eq!((tg.width, tg.height, tg.depth), (1, 32 / heads as usize, 2));

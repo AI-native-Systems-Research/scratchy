@@ -78,6 +78,7 @@ fn make_pipelines() -> Option<(common::Device, SpecializedPipelines)> {
     let variant = scratchy_target_metal::tape::constants::TapeVariant {
         cap: scratchy_target_metal::tape::ids::MaxBlocksPerSeq(128),
         tq_heads: None,
+        attn_splits: scratchy_target_metal::tape::ids::AttnSplits(1),
     };
     Some((
         device,

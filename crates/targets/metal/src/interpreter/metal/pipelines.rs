@@ -257,6 +257,7 @@ mod tests {
     const PROBE_VARIANT: TapeVariant = TapeVariant {
         cap: crate::tape::ids::MaxBlocksPerSeq(128),
         tq_heads: None,
+        attn_splits: crate::tape::ids::AttnSplits(1),
     };
 
     // ── Test-only kernel→symbol/constants mapping ─────────────────
@@ -401,6 +402,8 @@ mod tests {
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
             | KernelId::RowProgram
+            | KernelId::AttentionDecodeCombine
+            | KernelId::AttentionDecodeCombineTq
             | KernelId::NormedGemv
             | KernelId::RopeAppendNormed
             | KernelId::TqStageRotated
@@ -563,6 +566,8 @@ mod tests {
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
             | KernelId::RowProgram
+            | KernelId::AttentionDecodeCombine
+            | KernelId::AttentionDecodeCombineTq
             | KernelId::NormedGemv
             | KernelId::RopeAppendNormed
             | KernelId::TqStageRotated

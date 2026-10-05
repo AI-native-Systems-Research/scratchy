@@ -718,12 +718,64 @@ fn tq_attention_command(
     }));
     bindings.extend(ops.k.0.map(|b| b.bias_binding(14)));
     bindings.extend(ops.v.0.map(|b| b.bias_binding(15)));
+    let kernel = match attn.kernel {
+        KernelId::AttentionDecodeCombine => KernelId::AttentionDecodeCombineTq,
+        _ => KernelId::AttentionViaCacheTq,
+    };
     LoweredCommand {
-        kernel: KernelId::AttentionViaCacheTq,
+        kernel,
         constants: baked(constants),
         bindings: baked(bindings),
         ..*attn
     }
+}
+
+/// A decode attention `attn` (head dim `head_dim`) with its split's combine pass: the attention
+/// takes the tape variant's splits (`ATTN_SPLITS`, slot 18) and binds the partials scratch — the
+/// op scratch's front, `[batch, num_q_heads, 32, 2 + head_dim]` floats — and the combine merges
+/// the partials into the attention's output. A variant at one split runs the attention alone,
+/// merging in place (the worker drops the combine).
+fn split_decode_attention(
+    p: &MetalModelConsts,
+    attn: LoweredCommand,
+    head_dim: super::ids::HeadDim,
+    bucket_m: u32,
+    moe_scratch_bytes: &mut u32,
+) -> Vec<LoweredCommand> {
+    let partials = bucket_m * p.num_q_heads * 32 * (2 + head_dim.get()) * 4;
+    *moe_scratch_bytes = (*moe_scratch_bytes).max(partials);
+    let mut constants = attn.constants.to_vec();
+    constants.push(ConstantValue::attn_splits(18));
+    let output = attn.bindings.iter().copied().find(|b| {
+        matches!(
+            b,
+            Binding::ArenaSlot {
+                binding_index: 0,
+                ..
+            }
+        )
+    });
+    let mut bindings = attn.bindings.to_vec();
+    bindings.push(scratch_at(16, 0));
+    let attn = LoweredCommand {
+        constants: baked(constants.clone()),
+        bindings: baked(bindings),
+        ..attn
+    };
+    let combine = LoweredCommand {
+        kernel: KernelId::AttentionDecodeCombine,
+        library: "attention",
+        function: pick_specialized_symbol(
+            "attention_via_cache_v2_combine_f16_specialized",
+            "attention_via_cache_v2_combine_bf16_specialized",
+            p.metal_dtype,
+        ),
+        constants: baked(constants),
+        dispatch: attn.dispatch,
+        bindings: baked(output.into_iter().chain([scratch_at(16, 0)]).collect()),
+        gemm_dims: None,
+    };
+    vec![attn, combine]
 }
 
 /// The rope-once scratch's bytes, `dims` multiplied wide: refused at the KV cap rung `block_cap`
@@ -2970,7 +3022,7 @@ fn lower_one(
             // error per layer on Llama-3.2 decode and produced
             // degenerate output after the first decode token).
             let n_q_heads = p.num_q_heads;
-            LoweredCommand {
+            let attn = LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
                 library: "attention",
                 function: pick_specialized_symbol(
@@ -3027,7 +3079,15 @@ fn lower_one(
                 }
                 .into_baked(),
                 gemm_dims: None,
-            }
+            };
+            let head_dim = super::ids::HeadDim(p.global_head_dim);
+            return Ok(split_decode_attention(
+                p,
+                attn,
+                head_dim,
+                bucket_m,
+                moe_scratch_bytes,
+            ));
         }
 
         // ── Prefill-bucket attention reading from the paged KV cache ─
@@ -3801,7 +3861,7 @@ fn lower_one(
             // Spans rope-on-read (SLIDING class). All-None when !ROPE_ON_READ.
             let (ror_rd, ror_po, ror_on, ror_bind) = rope_on_read_params(p, false);
             let n_q_heads = p.num_q_heads;
-            LoweredCommand {
+            let attn = LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
                 library: "attention",
                 function: pick_specialized_symbol(
@@ -3842,7 +3902,15 @@ fn lower_one(
                 }
                 .into_baked(),
                 gemm_dims: None,
-            }
+            };
+            let head_dim = super::ids::HeadDim(p.head_dim);
+            return Ok(split_decode_attention(
+                p,
+                attn,
+                head_dim,
+                bucket_m,
+                moe_scratch_bytes,
+            ));
         }
 
         // ── Sliding-window paged prefill (Gemma2/3/4 local layers) ──
@@ -4287,7 +4355,7 @@ fn lower_one(
             )?;
             let layer = layer.get() + layer_offset;
             let twin = |c: &LoweredCommand| tq_attention_command(c, layer, ops, bits);
-            return Ok(via_cache.first().map(twin).into_iter().collect());
+            return Ok(via_cache.iter().map(twin).collect());
         }
         I::Moe(block, step) => {
             let is_nax = profile.is_some_and(|p| crate::targets::is_nax_capable(p.generation));
@@ -7339,10 +7407,12 @@ mod tests {
             [
                 (KernelId::RopeAppend, None),
                 (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
+                (KernelId::AttentionDecodeCombine, Some(UnlessDecodeStep)),
                 (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeCombineTq, Some(OnlyIfDecodeStep)),
             ]
         );
-        let (fp16, tq) = (&tape.commands[1].command, &tape.commands[2].command);
+        let (fp16, tq) = (&tape.commands[1].command, &tape.commands[3].command);
         assert_eq!(
             (fp16.library, fp16.function, fp16.dispatch),
             (tq.library, tq.function, tq.dispatch)
@@ -7439,6 +7509,7 @@ mod tests {
             let variant = super::super::constants::TapeVariant {
                 cap: crate::tape::ids::MaxBlocksPerSeq(128),
                 tq_heads: Some(served_heads),
+                attn_splits: crate::tape::ids::AttnSplits(1),
             };
             let served = (tq.constants.iter())
                 .map(|k| k.resolve(variant))
@@ -7472,6 +7543,7 @@ mod tests {
         );
         steps.push((KernelId::TqRotateRows, Some(UnlessDecodeStep)));
         steps.push((KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)));
+        steps.push((KernelId::AttentionDecodeCombineTq, Some(OnlyIfDecodeStep)));
         steps
     }
 
@@ -7522,9 +7594,12 @@ mod tests {
         let want = [
             (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
+            (KernelId::AttentionDecodeCombine, Some(UnlessDecodeStep)),
             (KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)),
+            (KernelId::AttentionDecodeCombineTq, Some(OnlyIfDecodeStep)),
             (KernelId::RopeAppend, None),
             (KernelId::AttentionViaCache, None),
+            (KernelId::AttentionDecodeCombine, None),
         ];
         assert_eq!(gated_steps(&decode), want);
 
@@ -8132,17 +8207,21 @@ mod tests {
         assert!(route_by_sequence_count(7, vec![rope_once, scratch, reroping]).is_ok());
     }
 
-    /// Every binding of `cmd` bound at `index` or later, in order.
+    /// Every binding of `cmd` bound at `index` or later, in order — but a decode attention's split
+    /// partials (the op scratch at 16), which carry no offset.
     fn bound_from(cmd: &LoweredCommand, index: u8) -> Vec<Binding> {
         let at = |b: &Binding| match *b {
             Binding::Runtime { binding_index, .. }
             | Binding::Source { binding_index, .. }
-            | Binding::ArenaSlot { binding_index, .. } => binding_index,
+            | Binding::ArenaSlot { binding_index, .. } => Some(binding_index),
+            Binding::MoeScratch {
+                binding_index: 16, ..
+            } => None,
             other => panic!("TurboQuant command binding {other:?}"),
         };
         cmd.bindings
             .iter()
-            .filter(|b| at(b) >= index)
+            .filter(|b| at(b).is_some_and(|i| i >= index))
             .copied()
             .collect()
     }

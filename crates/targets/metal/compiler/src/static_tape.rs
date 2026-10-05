@@ -17,8 +17,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_target_metal::tape::constants::ConstantValue;
 use scratchy_target_metal::tape::ids::{
-    BlockSize, CommandIx, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads, NumQHeads,
-    TqDecodeHeads,
+    AttnSplits, BlockSize, CommandIx, HeadDim, MaxBlocksPerSeq, MaxPositions, NumKvHeads,
+    NumQHeads, TqDecodeHeads,
 };
 use scratchy_target_metal::tape::lowered::{
     Binding, DispatchShape, GatedCommand, GenClass, KernelId, KvAddressing, LoweredCommand,
@@ -506,23 +506,35 @@ pub fn bake_bucket_tapes(
             }
         };
         let ident = quote::format_ident!("__TAPE_BODY_{uniq}_{body_ix}");
-        let serves_tq =
-            (tape.commands.iter()).any(|c| c.command.kernel == KernelId::AttentionViaCacheTq);
-        let heads: Vec<Option<TqDecodeHeads>> = match serves_tq {
+        let has = |k: KernelId| tape.commands.iter().any(|c| c.command.kernel == k);
+        let heads: Vec<Option<TqDecodeHeads>> = match has(KernelId::AttentionViaCacheTq) {
             true => candidates.iter().copied().map(Some).collect(),
             false => vec![None],
         };
-        for tq_heads in heads {
-            let variant = TapeVariant { cap, tq_heads };
+        // A decode attention spreads over the splits the device picks among.
+        let splits: Vec<Option<AttnSplits>> = match has(KernelId::AttentionDecodeCombine) {
+            true => AttnSplits::CANDIDATES.map(Some).to_vec(),
+            false => vec![None],
+        };
+        for (tq_heads, attn_splits) in
+            (heads.iter()).flat_map(|&h| splits.iter().map(move |&s| (h, s)))
+        {
+            let one = AttnSplits(1);
+            let variant = TapeVariant {
+                cap,
+                tq_heads,
+                attn_splits: attn_splits.unwrap_or(one),
+            };
             pool.name_kernels(tape.commands, mc.metal_dtype, variant)?;
             let class_toks = tok("class", crate::const_tokens::const_tokens(&class))?;
             let addressing_toks =
                 tok("addressing", crate::const_tokens::const_tokens(&addressing))?;
             let cap_toks = tok("cap", crate::const_tokens::const_tokens(&cap))?;
             let tq_toks = tok("tq heads", crate::const_tokens::const_tokens(&tq_heads))?;
+            let splits_toks = tok("splits", crate::const_tokens::const_tokens(&attn_splits))?;
             entries.push(quote! {
                 __tl::ClassedTape::rung(
-                    #ident, #class_toks, #addressing_toks, #cap_toks, #tq_toks,
+                    #ident, #class_toks, #addressing_toks, #cap_toks, #tq_toks, #splits_toks,
                     [#roped_k, #attn_unfused],
                 ),
             });

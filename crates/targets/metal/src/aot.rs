@@ -450,7 +450,7 @@ fn msl_literal(c: &ConstantValue) -> String {
             format!("({f:e}f)")
         }
         ConstantType::Bool => (c.bits != 0).to_string(),
-        ConstantType::KvCap | ConstantType::TqHeads => panic!(
+        ConstantType::KvCap | ConstantType::TqHeads | ConstantType::AttnSplits => panic!(
             "bake: constant slot {} is bound to its tape variant; `bake_key` resolves it",
             c.index
         ),

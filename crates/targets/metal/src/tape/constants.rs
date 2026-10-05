@@ -26,16 +26,21 @@ pub enum ConstantType {
     /// A `uint` the tape variant supplies ([`TapeVariant::tq_heads`]): the query heads one
     /// TurboQuant decode threadgroup serves.
     TqHeads,
+    /// A `uint` the tape variant supplies ([`TapeVariant::attn_splits`]): the threadgroups one
+    /// decode query-head group's key loop spreads over.
+    AttnSplits,
 }
 
-/// The values a tape variant binds ([`ConstantType::KvCap`], [`ConstantType::TqHeads`]). One tape
-/// body serves every variant of its bucket; each variant's kernels are baked with its own values,
-/// and the device picks the variant.
+/// The values a tape variant binds ([`ConstantType::KvCap`], [`ConstantType::TqHeads`],
+/// [`ConstantType::AttnSplits`]). One tape body serves every variant of its bucket; each variant's
+/// kernels are baked with its own values, and the device picks the variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TapeVariant {
     pub cap: super::ids::MaxBlocksPerSeq,
     /// `None`: the tape has no TurboQuant decode attention.
     pub tq_heads: Option<super::ids::TqDecodeHeads>,
+    /// The decode attention's splits: 1 on a tape without one.
+    pub attn_splits: super::ids::AttnSplits,
 }
 
 /// A constant bound to a value its tape variant does not carry.
@@ -143,6 +148,15 @@ impl ConstantValue {
         }
     }
 
+    /// The tape variant's decode attention splits ([`ConstantType::AttnSplits`]).
+    pub fn attn_splits(index: impl Into<ConstSlot>) -> Self {
+        Self {
+            index: index.into().0,
+            bits: 0,
+            ty: ConstantType::AttnSplits,
+        }
+    }
+
     /// `self` with a variant-bound value replaced by `variant`'s; every other constant as it is.
     pub fn resolve(self, variant: TapeVariant) -> Result<Self, UnboundConstant> {
         let unbound = UnboundConstant {
@@ -154,6 +168,7 @@ impl ConstantValue {
             ConstantType::TqHeads => (variant.tq_heads)
                 .map(|h| Self::uint(self.index, h.get()))
                 .ok_or(unbound),
+            ConstantType::AttnSplits => Ok(Self::uint(self.index, variant.attn_splits.get())),
             ConstantType::UInt | ConstantType::Int | ConstantType::Float | ConstantType::Bool => {
                 Ok(self)
             }

@@ -46,6 +46,12 @@ pub enum KernelId {
     NormAddScalarMul,
     /// A group of row-wise steps over one width (`row_program.metal`).
     RowProgram,
+    /// The split decode attention's second pass (`attention_via_cache_v2_combine_*`): merges the
+    /// partials its tape variant's `ATTN_SPLITS` threadgroups per query-head group stored.
+    AttentionDecodeCombine,
+    /// [`Self::AttentionDecodeCombine`] of a TurboQuant decode attention: its threadgroups count
+    /// query-head groups of the variant's TurboQuant heads.
+    AttentionDecodeCombineTq,
     RopeAppendNormed,
     /// Fused residual-add + RMSNorm: writes `residual += delta` and
     /// publishes `weight * residual / sqrt(mean(residual²) + eps)`.
@@ -572,6 +578,8 @@ impl KernelId {
             | Self::TqStageRotated
             | Self::TqRotateRows
             | Self::RowProgram
+            | Self::AttentionDecodeCombine
+            | Self::AttentionDecodeCombineTq
             | Self::AttentionViaCacheTq => SeqScope::AllRows,
         }
     }
@@ -1998,18 +2006,22 @@ pub struct ClassedTape {
     /// The query heads each TurboQuant decode threadgroup serves, baked into the tape; `None` when
     /// the tape has no TurboQuant decode attention (it serves every device alike).
     pub tq_heads: Option<TqDecodeHeads>,
+    /// The threadgroups each decode query-head group's key loop spreads over; `None` when the tape
+    /// has no decode attention.
+    pub attn_splits: Option<super::ids::AttnSplits>,
     pub tape: LoweredMetalTape,
 }
 
 impl ClassedTape {
-    /// The rung `(gen_class, addressing, cap, tq_heads)` of `body`, the tape its rungs share, with
-    /// the roped-K and unfused-attention scratch bytes its cap sizes.
+    /// The rung `(gen_class, addressing, cap, tq_heads, attn_splits)` of `body`, the tape its rungs
+    /// share, with the roped-K and unfused-attention scratch bytes its cap sizes.
     pub const fn rung(
         body: LoweredMetalTape,
         gen_class: GenClass,
         addressing: KvAddressing,
         cap: MaxBlocksPerSeq,
         tq_heads: Option<TqDecodeHeads>,
+        attn_splits: Option<super::ids::AttnSplits>,
         [roped_k_scratch_bytes, attn_unfused_scratch_bytes]: [u32; 2],
     ) -> Self {
         let tape = LoweredMetalTape {
@@ -2022,6 +2034,7 @@ impl ClassedTape {
             addressing,
             cap,
             tq_heads,
+            attn_splits,
             tape,
         }
     }
