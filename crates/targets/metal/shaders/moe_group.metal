@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// MoE grouped-GEMM prefill support: sort the (token,expert) rows by
-// expert and lay them out PADDED (each expert's run rounded up to a
-// multiple of BM=32) so the grouped expert GEMM
-// (`affine_gather_qmm_t_kernel`) maps each 32-row output tile to exactly
-// one expert. This is the host half of mlx's grouped MoE path
+// MoE grouped-GEMM support: sort the (token,expert) rows by expert and
+// lay them out PADDED (each expert's run rounded up to a multiple of
+// MG_BM — 64 for the grouped GEMMs, 1 for the sorted gathered matvec
+// path) so the grouped expert GEMM maps each 64-row output tile to
+// exactly one expert. This is the host half of mlx's grouped MoE path
 // (mlx-lm SwitchGLU `_gather_sort`; mlx `gather_qmm` with sorted indices)
 // — implemented as a counting sort (experts are 0..num_experts-1, so a
 // histogram + prefix-sum + scatter is the natural sort), since the
 // expert ids form a tiny key space.
 //
-// Pipeline (per MoE layer, prefill only):
+// Pipeline (per MoE layer — grouped prefill and sorted decode both):
 //   1. moe_group_offsets : histogram counts + padded exclusive-scan
 //                          offsets (1 threadgroup; tiny key space).
 //   2. moe_group_init    : sentinel-fill indices_pad + zero the fill
@@ -18,7 +18,8 @@
 //   3. moe_group_scatter : place each real (token,expert) row at
 //                          offset[e]+running, recording pos[i],
 //                          indices_pad[pos], and the gathered x_pad row.
-//   ... grouped GEMM (gate/up/down) over the padded layout ...
+//   ... the grouped GEMMs (gate/up/down) over the padded layout, or the
+//       gathered matvecs over the sorted rows ...
 //   4. take_along_axis(pos) unsorts the down output back to token order.
 //
 // All index buffers are u32. `MG_M` = number of (token,expert) pairs
@@ -39,10 +40,17 @@ using namespace metal;
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_M, 0);
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_NUM_EXPERTS, 1);
 
-// Pad each expert's run to a multiple of 64 = the NAX grouped GEMM's
-// m-tile (BM=64). 64 is also a multiple of the steel grouped GEMM's
-// BM=32, so the same padded layout drives either kernel.
-constant int MG_BM = 64;
+// Pad each expert's run to a multiple of MG_BM: 64 = the NAX grouped GEMM's
+// m-tile (also a multiple of the steel grouped GEMM's BM=32, so the same
+// padded layout drives either kernel); 1 = no padding, the layout the
+// gathered matvec path reads sorted (same-expert pairs adjacent, so their
+// repeat slab reads hit cache). Slot 6/7 — 5 is MG_W's (moe_group_gather).
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_BM, 6);
+// What `moe_group_init` sentinel-fills the dead rows of `indices_pad` with:
+// the grouped GEMMs skip a tile whose expert is `MG_NUM_EXPERTS`; the
+// gathered matvecs have no such guard, so their bake fills 0 (a real
+// expert's slab — garbage compute on rows nothing reads).
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_SENTINEL, 7);
 constant int MG_MAX_EXPERTS = 128;
 
 #if SCRATCHY_COMPILES(moe_group_offsets)
@@ -95,7 +103,7 @@ kernel void moe_group_init(
     device uint* fill        [[buffer(1)]],
     uint gid [[thread_position_in_grid]]) {
   if (gid < uint(MG_MPAD_MAX)) {
-    indices_pad[gid] = uint(MG_NUM_EXPERTS);  // sentinel
+    indices_pad[gid] = uint(MG_SENTINEL);
   }
   if (gid < uint(MG_NUM_EXPERTS)) {
     fill[gid] = 0u;
