@@ -89,4 +89,4 @@ def scalarmul_fwd(desc_x, desc_o,  #
                                         block_shape=[TAIL_H, BLOCK_N])
         offs_m = N_BLOCKS * BLOCK_M
         x = t_x.load([offs_m, C_START])
-        o_desc.store([offs_m, C_START], x * SCALE)
+        t_o.store([offs_m, C_START], x * SCALE)

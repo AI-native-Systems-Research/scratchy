@@ -1078,8 +1078,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                  an alias gives the two views two names."
                 .to_string(),
         ),
-        SubOp::MatmulTile { .. } => match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
-            Ok(e) => Ops(vec![e]),
+        SubOp::MatmulTile { .. } => match scratchy_triton_splice::lower_all(
+            node,
+            ir,
+            rows_are_requests,
+        ) {
+            Ok(ops) => Ops(ops),
             Err(reason) => Unhandled(reason),
         },
         // ⛔ NO BODY, AND THAT IS THE HONEST STATE. This arm used to lower a `SubtileNode` STRAIGHT

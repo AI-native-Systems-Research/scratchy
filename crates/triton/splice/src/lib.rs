@@ -249,6 +249,18 @@ pub fn elementwise_row(kind: EwKind) -> TritonKernelRow {
     }
 }
 
+/// The prefill lm-head fold's extraction row. The fold is TWO ops from ONE
+/// `MatmulTile` node (see [`lower_all`]), and the extraction half is its own kernel
+/// family — the row is declared here so the registry's own law holds ("adding a
+/// kernel is a row; nothing else in this crate changes").
+pub fn lmlast_row() -> TritonKernelRow {
+    TritonKernelRow {
+        kernel: "lmlast.py",
+        entry: "lmlast_fwd",
+        program: Program::LmLast,
+    }
+}
+
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice is one of the five families below; the ops the spyre target has no kernel AT
 /// ALL for (attention, the expansion ops, reshape, …) never reach this crate —
@@ -322,14 +334,46 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
 /// The name is the builder's own law — `rmsnorm_s{node.id}` — so the spliced op's
 /// `op_name` and the emulator's function key are IDENTICAL to the builder path's. That
 /// is the byte-identity golden's requirement.
+///
+/// ⭐ ONE NODE MAY LOWER TO MORE THAN ONE OP, and only the splice knows which kinds:
+/// [`lower_all`] is the entry the walk calls, and it routes every one-op kind here.
 pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     // Whether this bundle's rows are separate requests (the lm-head fold's own fact).
     rows_are_requests: bool,
 ) -> Result<EmittedOp, String> {
-    let row = row(&node.op);
-    // ⛔ THE ROUTING IS `lower_one_node`'S EXHAUSTIVE MATCH, and this guard is its echo:
+    lower_one(node, ir, rows_are_requests)
+}
+
+/// EVERY OP THE SPLICE EMITS FOR ONE NODE. Every kind is one op except the prefill
+/// lm-head tail, whose fold is TWO — the last-row extraction (its own program, the
+/// reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul — exactly the
+/// shape of main's `lower_prefill_lm_head_at_m1`, which the fold kernel must
+/// reproduce.
+pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+) -> Result<Vec<EmittedOp>, String> {
+    if let SubOp::MatmulTile { .. } = &node.op {
+        let result_cols = ir.tensors[ir.result.index()].cols;
+        if node.output.region.cols.len == result_cols && !rows_are_requests {
+            let rows = node.output.region.rows.len;
+            if rows > 1 {
+                return lower_prefill_lm_head_fold(node, ir);
+            }
+        }
+    }
+    lower_one(node, ir, rows_are_requests).map(|e| vec![e])
+}
+
+fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+) -> Result<EmittedOp, String> {
+    let row = row(&node.op);    // ⛔ THE ROUTING IS `lower_one_node`'S EXHAUSTIVE MATCH, and this guard is its echo:
     // the kinds that never route here carry the ROUTED-ELSEWHERE sentinel row, and a
     // node that reaches this check means the routing changed without adding a family
     // function — the message names the owner. It is unreachable through
@@ -343,14 +387,13 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             node.op
         ));
     }
-    // ⛔ THE LM-HEAD TAIL IS THE WORK LIST'S LAST ENTRY, detected by the builder's own
-    // vocab-width test (the lm_head matmul and the logits ScalarMul are the ONLY ops
-    // whose output spans the result cols — every intermediate is hidden or intermediate
-    // width):
-    //
-    // 1. THE PREFILL FOLD. At m>1 the tail must be rewritten (last-row extraction at
-    //    m=1 over the reserved LAST_HIDDEN_TID staging) before the m=1 matmul — a
-    //    multi-op shape no single-kernel row states yet.
+    // ⛔ THE LM-HEAD TAIL'S FOLD IS `lower_all`'s now — the vocab-wide m>1 matmul is
+    // rewritten THERE (last-row extraction + the re-lowered m=1 matmul), so a
+    // MatmulTile reaching THIS one-op body with m>1 over the result cols means the
+    // one-op `lower` was called where the walk's `lower_all` belongs. The vocab-width
+    // test is the builder's own (the lm_head matmul and the logits ScalarMul are the
+    // ONLY ops whose output spans the result cols — every intermediate is hidden or
+    // intermediate width).
     //
     // ⭐ THE ODD VOCAB SPLICES. A decode lm_head at vocab 49155 (granite) has N odd,
     //    and the ladder's `PlanCorelets` now re-patterns an odd N to `single_corelet`
@@ -365,11 +408,10 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
             if rows > 1 && !rows_are_requests {
                 return Err(format!(
                     "triton splice: matmul_s{} is the prefill lm-head tail (vocab-wide, m={rows}, \
-                     rows not requests) — its fold kernel (last-row extraction at m=1 over \
-                     LAST_HIDDEN_TID + the m=1 matmul) has not landed; no builder arm exists to \
-                     fall through to",
+                     rows not requests) — the fold is `lower_all`'s; call it, not the one-op \
+                     `lower`",
                     node.id.index()
-                )); // 1. the prefill fold
+                ));
             }
         }
     }
@@ -390,17 +432,21 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     // descriptor's shape/strides) and `C_START` (the region's column corner, named
     // by the load/store offsets) — the same facts the builder's `load_region` /
     // `store_region` state, so the door reads the SAME region off the spliced
-    // program. Every OTHER row states ONE whole-tensor tile at corner 0 and cannot
-    // name a window, so the refusal stands for it: matmul and rope regions are whole
-    // in production today (`lower_region` N-blocks pointwise only), and this guard
-    // reads the REGION, not the op kind, so a front-end change that windows any
-    // other op's regions reproduces the same refusal with the kernel row named — a
-    // windowed kernel is the fix shape.
+    // program. AND THE MATMUL FAMILY SPELLS ITS OWN ROW-0 WINDOW: `matmul.py` /
+    // `matmul_fp8.py` state `M_TOTAL` (the output tensor's row extent) with the
+    // `[M, N]` tile at row 0 — the prefill lm-head fold's m=1 tail, whose activation
+    // is the LAST_HIDDEN synthetic and whose output is row 0 of the `[mq, vocab]`
+    // logits storage. Every OTHER row states ONE whole-tensor tile at corner 0 and
+    // cannot name a window, so the refusal stands for it (rope regions are whole in
+    // production today), and this guard reads the REGION, not the op kind, so a
+    // front-end change that windows any other op's regions reproduces the same
+    // refusal with the kernel row named — a windowed kernel is the fix shape.
     {
         let states_the_corner = matches!(
             &node.op,
             SubOp::SiluMul
                 | SubOp::ScalarMul { .. }
+                | SubOp::MatmulTile { .. }
                 | SubOp::Elementwise(
                     EwKind::Silu | EwKind::Gelu | EwKind::Add | EwKind::Mul | EwKind::Sub,
                 )
@@ -496,6 +542,123 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(e)
 }
 
+/// ⭐ THE PREFILL LM-HEAD FOLD — main's `lower_prefill_lm_head_at_m1` shape, with the
+/// Triton `lmlast.py` kernel as the extraction's body. The vocab-wide lm_head cannot
+/// run at m>1 (it time-tiles; per-row time-tiling is unimplemented), and only the LAST
+/// prompt token's logits are ever read, so the tail is TWO ops:
+///
+/// 1. THE EXTRACTION — `lmlast_fwd` copies row `selector_lastrow_col(mq) = mq - 1` of
+///    the `[mq, hidden]` activation into the reserved `[1, hidden]` `LAST_HIDDEN_TID`
+///    staging, one single-stick tile per stick-group (the only representable form: the
+///    source buffer is stick-major, so a wider window over the row is not expressible).
+///    Its KtirNode carries `node_out_tid` = the tail's OWN output tid — the door's
+///    `lmlast` arm names its copies `lmlast{j}_o{tid}` after it, the same suffix the
+///    m=1 matmul's `matmul_o{tid}` uses, so the whole tail reads as one node's.
+/// 2. THE MATMUL — the SAME node at m=1, reading the staging at row 0, through the
+///    ordinary matmul row (`lower_one`). At m=1 the tail is exactly the shape the
+///    PROVEN decode path lowers, fp8 chain included.
+///
+/// ⛔ THE ROW IS `selector_lastrow_col(mq)`, THE SSOT THE KANI PROOF PINS — not
+/// `rows.start + mq - 1`: the extraction addresses the buffer the tape takes to be
+/// exactly `[mq, hidden]` at row 0, which is the only shape that reaches the fold (a
+/// non-whole activation region is refused by the whole-region guard before this).
+fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<Vec<EmittedOp>, String> {
+    use scratchy_subtile::subtile_ir::Region as SubRegion;
+
+    let a = &node.inputs[0];
+    let (mq, hidden) = (a.region.rows.len, a.region.cols.len);
+    let stk = 64u32; // Fp16::ELEMS_PER_STICK — the stick the door's lmlast arm checks
+    if hidden % stk != 0 {
+        return Err(format!(
+            "triton splice: matmul_s{} (prefill lm-head tail): hidden={hidden} is not a whole \
+             {stk}-fp16 stick, so the last prompt row is not a run of whole stick-groups — the \
+             per-stick extraction cannot address it",
+            node.id.index()
+        ));
+    }
+    let row = scratchy_subtile::sdsc_abstract::selector_lastrow_col(mq as usize) as u32;
+    let last_hidden = ktir_superdsc::reserved_tids::LAST_HIDDEN_TID;
+
+    // ── Half 1: the extraction, through the lmlast kernel. ──
+    let src = read_kernel("lmlast.py")?;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for p in ["desc_src", "desc_dst"] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("MQ", Val::Int(i128::from(mq)))?;
+    ce("HIDDEN", Val::Int(i128::from(hidden)))?;
+    ce("ROW", Val::Int(i128::from(row)))?;
+    ce("N_STICKS", Val::Int(i128::from(hidden / stk)))?;
+    let spec = KernelSpec {
+        file: "lmlast.py".to_string(),
+        kernel: "lmlast_fwd".to_string(),
+        signature: signature.clone(),
+        constexprs: constexprs.clone(),
+    };
+    let module = compile_kernel(&src, &spec, &[1])?;
+    let extraction_node = SubtileNode {
+        id: node.id,
+        op: node.op,
+        inputs: vec![*a],
+        output: scratchy_subtile::subtile_ir::TensorRegion {
+            tensor: scratchy_subtile::subtile_ir::TensorId::from_index(
+                last_hidden as usize,
+            ),
+            region: SubRegion {
+                rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                cols: scratchy_subtile::subtile_ir::Range::new(0, hidden),
+            },
+        },
+    };
+    let mut k = mint(&extraction_node, module, &lmlast_row())?;
+    // The KtirNode's own fields: `node_out_tid` names the TAIL'S output (the door
+    // names its copies `lmlast{j}_o{tid}` after it), and the name is the builder's
+    // `lmlast_s{id}` law.
+    k.node_out_tid = Some(BufferId::new(node.output.tensor.index() as u32));
+    let xname = format!("lmlast_s{}", node.id.index());
+    k.func.name = Arena::global().str(xname.clone());
+    let mut extract = EmittedOp::bare(xname);
+    extract.ktir = Some(k);
+
+    // ── Half 2: the SAME node at m=1, reading the staging at row 0. ──
+    let mut at_m1 = node.clone();
+    let one_row = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+        scratchy_subtile::subtile_ir::TensorRegion {
+            tensor: tr.tensor,
+            region: SubRegion {
+                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, 1),
+                cols: tr.region.cols,
+            },
+        }
+    };
+    at_m1.inputs[0] = scratchy_subtile::subtile_ir::TensorRegion {
+        tensor: scratchy_subtile::subtile_ir::TensorId::from_index(last_hidden as usize),
+        region: SubRegion {
+            rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+            cols: scratchy_subtile::subtile_ir::Range::new(0, hidden),
+        },
+    };
+    if let Some(w) = at_m1.inputs.get_mut(1) {
+        *w = one_row(w);
+    }
+    at_m1.output = one_row(&at_m1.output);
+    let matmul = lower_one(&at_m1, ir, false)?;
+
+    Ok(vec![extract, matmul])
+}
+
 /// Read a kernel file from `crates/targets/spyre/kernels/`.
 fn read_kernel(kernel: &str) -> Result<String, String> {
     let path = kernels_dir().join(kernel);
@@ -587,13 +750,18 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 Ok(())
             };
             // ONE tile, the whole region — `KtirFunc::matmul`'s own whole-region law
-            // (one linalg.matmul, no K loop).
+            // (one linalg.matmul, no K loop). `M_TOTAL` names the OUTPUT TENSOR's row
+            // extent (the storage the descriptor addresses) while the store takes the
+            // `[M, N]` tile at row 0 — the prefill lm-head fold's m=1 tail, whose
+            // output is row 0 of the `[mq, vocab]` logits storage.
+            let (m_total, _a_total) = matmul_window_of(node, ir)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(*n)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_K", Val::Int(i128::from(k)))?;
             ce("BLOCK_N", Val::Int(i128::from(*n)))?;
+            ce("M_TOTAL", Val::Int(i128::from(m_total)))?;
         }
         (
             SubOp::MatmulTile {
@@ -633,12 +801,15 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // ONE tile, the whole region — and the fp8 contract REFUSES anything else
             // (`verify_canonical_fp8_matmul_kernel`: `BLOCK_K < K` and `BLOCK_N < N`
             // are refused by name; a K-looped fp8 form is a follow-on, not this row).
+            // `M_TOTAL` is the dense arm's window law (see there).
+            let (m_total, _) = matmul_window_of(node, ir)?;
             ce("M", Val::Int(i128::from(m)))?;
             ce("K", Val::Int(i128::from(k)))?;
             ce("N", Val::Int(i128::from(*n)))?;
             ce("BLOCK_M", Val::Int(i128::from(m)))?;
             ce("BLOCK_K", Val::Int(i128::from(k)))?;
             ce("BLOCK_N", Val::Int(i128::from(*n)))?;
+            ce("M_TOTAL", Val::Int(i128::from(m_total)))?;
         }
         (SubOp::SiluMul, "silumul_fwd") => {
             // The kernel's own parameter spellings: desc_g, desc_u, desc_o, then the
@@ -860,6 +1031,52 @@ fn window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
     }
     Ok((n_total, c_start))
+}
+
+/// THE MATMUL'S WINDOW FACTS — the row-0 window form the prefill lm-head fold's m=1
+/// tail states: the out descriptor names the OUTPUT TENSOR's row extent (`M_TOTAL`,
+/// the storage the layout reserved) while the store takes the `[M, N]` tile at row 0,
+/// and the activation names its own `[M, K]` window. A whole-region node answers
+/// `(out_rows, a_rows)` with `M_TOTAL = M`.
+///
+/// ⛔ THE ROW CORNER MUST BE 0 — the door's `base_addressed` refuses a nonzero row
+/// corner on both the activation and the output, and no matmul kernel in this family
+/// spells one. The fold's m=1 tail is row 0 of the `[mq, vocab]` logits storage, so
+/// it passes; any other row-windowed matmul is a shape to spell with a kernel, not to
+/// silently mis-address.
+fn matmul_window_of<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<(u32, u32), String> {
+    let out = &node.output;
+    let a = &node.inputs[0];
+    let out_total = ir.tensors[out.tensor.index()].rows;
+    let a_total = ir.tensors.get(a.tensor.index()).map(|s| s.rows);
+    if out.region.rows.start != 0 || a.region.rows.start != 0 {
+        return Err(format!(
+            "triton splice: matmul t{} has a nonzero ROW corner (output row {}, activation \
+             row {}) — the door's `base_addressed` refuses a nonzero row corner on a matmul \
+             operand, and the kernels state row 0; the prefill lm-head fold is the row-0 \
+             window form",
+            out.tensor.index(),
+            out.region.rows.start,
+            a.region.rows.start,
+        ));
+    }
+    if let Some(a_rows) = a_total
+        && a.region.rows.len != a_rows
+    {
+        return Err(format!(
+            "triton splice: matmul t{}: the activation region is [1, {}] of a [{}, {}] tensor — \
+             only the lm-head fold's LAST_HIDDEN synthetic (beyond the graph) windows a matmul's \
+             activation; a graph activation must be read whole",
+            out.tensor.index(),
+            a.region.cols.len,
+            a_rows,
+            ir.tensors[a.tensor.index()].cols,
+        ));
+    }
+    Ok((out_total, a_total.unwrap_or(a.region.rows.len)))
 }
 
 /// THE ROW-BLOCK CONSTANTS the pointwise kernels take — the builder's own blocking

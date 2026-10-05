@@ -39,8 +39,8 @@ use scratchy_subtile::subtile_ir::{
 };
 use scratchy_target_spyre::ktir_superdsc_door::lower as door_lower;
 use scratchy_target_spyre::lower_subtile_tape_to_ktir::{
-    lower_elementwise_node, lower_matmul_node, lower_rmsnorm_node, lower_scalarmul_node,
-    lower_silumul_node, LowerRope,
+    lower_elementwise_node, lower_matmul_node, lower_prefill_lm_head_at_m1, lower_rmsnorm_node,
+    lower_scalarmul_node, lower_silumul_node, LowerRope,
 };
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::compute_bundle_layout;
 
@@ -883,10 +883,16 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
 #[test]
 fn spliced_scalarmul_is_byte_identical_to_the_builder() {
     // (M, C, SCALE) — 2b's and 8b's logits scale at the hidden each normalizes to.
+    // The m=96 row is the ROW-BLOCK TAIL rung at the bake's own defect shape:
+    // `rows_per_block(8192, 3)` = 42, so 96 rows = 2 full blocks + a 12-row tail —
+    // the tail descriptor is its own `[TAIL_H, N]` block and must be byte-compared
+    // too (the bake caught a tail that stored through the full-block descriptor; no
+    // golden shape reached a tail).
     for (m, c, scale) in [
         (1u32, 2048u32, 0.022_097_087f32),
         (1u32, 4096u32, 0.015_625f32),
         (31u32, 2048u32, 0.022_097_087f32),
+        (96u32, 8192u32, 0.022_097_087f32),
     ] {
         let ir = scalarmul_ir(m, c, scale);
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
@@ -1283,6 +1289,100 @@ fn batched_decode_odd_vocab_lm_head_splices_byte_identically() {
             "descriptor bytes (m={m} k={k} n={n}): builder vs splice diverged"
         );
         assert_eq!(b.op_name, s.op_name, "emitted op_name (m={m} k={k} n={n})");
+    }
+}
+
+/// The PREFILL lm-head FOLD's byte-identity gate: `scratchy_triton_splice::lower_all` —
+/// which routes an m>1 vocab-wide MatmulTile through the Triton `lmlast.py` extraction
+/// plus the re-lowered m=1 matmul — vs the pub builder control
+/// `lower_prefill_lm_head_at_m1` (main's fold verbatim, both halves), each program
+/// through the SAME door under the SAME layout. `compute_bundle_layout` sees only the
+/// ORIGINAL graph (the reserved `LAST_HIDDEN_TID` staging is beyond `ir.tensors`, so
+/// the layout cannot know about it), and that is the production condition: the bake
+/// mints the layout once for the graph, then the walk's m>1 tail folds underneath it.
+///
+/// The fold's second half re-enters the ordinary matmul row — this gate therefore
+/// covers the WINDOWED matmul form too (`matmul.py`'s `M_TOTAL`, the out descriptor
+/// naming the `[mq, vocab]` storage while the store tile stays `[1, vocab]` at row 0),
+/// which no other golden reaches: every other matmul golden is decode-shaped.
+#[test]
+fn spliced_prefill_lm_head_fold_is_byte_identical_to_the_builder() {
+    // hidden[mq, k] @ W_lmhead[k, n] -> logits[mq, n], rows_are_requests FALSE (the
+    // prefill walk). The 2b's own tail shape at a prefill rung: k=2048, granite's odd
+    // vocab 49155 (the odd width the ladder's re-patterning exists for), mq=31 (the
+    // rung the walk actually rolls) and a mid rung 8.
+    for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
+        let ir = matmul_ir(mq, k, n);
+        let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &Default::default())
+            .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
+
+        // 1. The builder control — main's fold, both halves, called directly.
+        let mut sym = 0i64;
+        let mut quantized = HashSet::new();
+        let builder_ops = lower_prefill_lm_head_at_m1(
+            &ir.nodes[0],
+            &ir,
+            &mut sym,
+            Some(&layout),
+            &mut quantized,
+        )
+        .unwrap_or_else(|e| panic!("builder folded mq={mq} k={k} n={n}: {e}"));
+        assert_eq!(
+            builder_ops.len(),
+            2,
+            "the fold is the extraction plus the m=1 matmul (mq={mq} k={k} n={n}): {} ops",
+            builder_ops.len()
+        );
+
+        // 2. The splice — `lower_all` takes the fold route for this shape.
+        let node = &ir.nodes[0];
+        let spliced_ops = scratchy_triton_splice::lower_all(node, &ir, false)
+            .unwrap_or_else(|e| panic!("splice folded mq={mq} k={k} n={n}: {e}"));
+        assert_eq!(
+            spliced_ops.len(),
+            2,
+            "the splice's fold is two programs (mq={mq} k={k} n={n}): {} ops",
+            spliced_ops.len()
+        );
+
+        // 3. Each program through the SAME door under the SAME layout, symbol
+        // counters threaded in bundle order (the door's names are per-bundle).
+        let mut b_sym = 0i64;
+        let mut s_sym = 0i64;
+        for (b_op, s_op) in builder_ops.iter().zip(spliced_ops.iter()) {
+            let b_ktir = b_op
+                .ktir
+                .as_ref()
+                .unwrap_or_else(|| panic!("builder op carries its program (mq={mq} n={n})"));
+            let s_ktir = s_op
+                .ktir
+                .as_ref()
+                .expect("spliced op carries its program");
+            let builder_emitted =
+                door_lower(b_ktir, &mut b_sym, Some(&layout), &mut quantized, None).unwrap_or_else(
+                    |e| panic!("builder program lowered (mq={mq} k={k} n={n}): {}", e.message),
+                );
+            let spliced_emitted = door_lower(s_ktir, &mut s_sym, Some(&layout), &mut quantized, None)
+                .unwrap_or_else(|e| {
+                    panic!("spliced program lowered (mq={mq} k={k} n={n}): {}", e.message)
+                });
+
+            assert_eq!(
+                builder_emitted.len(),
+                spliced_emitted.len(),
+                "op count (mq={mq} k={k} n={n})"
+            );
+            for (b, s) in builder_emitted.iter().zip(spliced_emitted.iter()) {
+                let bj = serde_json::to_string(b.dsc()).unwrap();
+                let sj = serde_json::to_string(s.dsc()).unwrap();
+                assert_eq!(
+                    bj, sj,
+                    "descriptor bytes (mq={mq} k={k} n={n}): builder vs splice diverged"
+                );
+                assert_eq!(b.op_name, s.op_name, "emitted op_name (mq={mq} k={k} n={n})");
+            }
+        }
     }
 }
 

@@ -46,10 +46,15 @@ import triton.language as tl
 @triton.jit
 def matmul_fp8_fwd(desc_x, desc_w, desc_ws, desc_o,  #
                    M: tl.constexpr, K: tl.constexpr, N: tl.constexpr,  #
-                   BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr):
+                   BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr,
+                   M_TOTAL: tl.constexpr):
     start_m = tl.program_id(0)
     # Descriptors, not pointer blocks (swiglu delta 3). The weight's descriptor
     # elem is fp8e4nv (delta 1); its shape is the checkpoint's `[out, in]`.
+    # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — see
+    # `matmul.py`'s `M_TOTAL` law: the out descriptor's shape is the output
+    # TENSOR's `[M_TOTAL, N]`, while the store takes the `[M, N]` tile at row 0
+    # (the prefill lm-head fold's m=1 tail over the LAST_HIDDEN staging).
     x_desc = tl.make_tensor_descriptor(desc_x, shape=[M, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_M, BLOCK_K])
@@ -59,7 +64,7 @@ def matmul_fp8_fwd(desc_x, desc_w, desc_ws, desc_o,  #
     ws_desc = tl.make_tensor_descriptor(desc_ws, shape=[1, N],
                                         strides=[N, 1],
                                         block_shape=[1, BLOCK_N])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M_TOTAL, N],
                                        strides=[N, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
 

@@ -511,7 +511,7 @@ fn verify_canonical_matmul_kernel(module: &Module, dot_path: &OpPath) -> Result<
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
     let c_desc = descriptor_of(module, store)?;
-    check_desc(module, c_desc, "C", m, ns, bm, bn)?;
+    check_desc_c(module, c_desc, m, ns, bm, bn)?;
 
     // Base-pointer provenance: the emitted DFIR has NO pointer arguments -- buffers
     // are bound POSITIONALLY -- so A/B/C MUST read args 0/1/2 IN THAT ORDER. That
@@ -858,7 +858,7 @@ fn verify_canonical_fp8_matmul_kernel(
         .find(|o| o.kind == OpKind::TtDescriptorStore)
         .expect("counted one");
     let c_desc = descriptor_of(module, store)?;
-    check_desc(module, c_desc, "C", m, bn, bm, bn)?;
+    check_desc_c(module, c_desc, m, bn, bm, bn)?;
 
     // ⭐⭐⭐ POSITIONAL BINDING: A=arg0, W=arg1, ws=arg2, C=arg3. The emitted DFIR binds
     // buffers positionally, and the fp8 door reads the THIRD input as the scale -- so a
@@ -1367,6 +1367,33 @@ fn check_desc(module: &Module, d: &Op, nm: &str, d0: i64, d1: i64, b0: i64, b1: 
             "{nm} shape [{s0},{s1}] != expected [{d0},{d1}]"
         )));
     }
+    check_desc_common(module, d, nm, d1, b0, b1)
+}
+
+/// ⭐ C's OWN ADMISSION — the STORED-WINDOW form. The C descriptor may name the
+/// OUTPUT TENSOR'S STORAGE `[m_total, n]` while the store takes the `[m, n]` tile at
+/// row `pid`: the prefill lm-head fold re-lowers the vocab-wide tail at m=1 over the
+/// LAST_HIDDEN staging, and its output is row 0 of the `[mq, vocab]` logits storage
+/// the layout reserved. The store's canonical `[pid, pid]` corner (checked in the
+/// verifier body) keeps the window at row 0 of the storage at grid [1], and `s0 > d0`
+/// is exactly the window: the descriptor names the storage, the store names the
+/// window (`s0 < d0` would be a store that runs past its buffer, and is refused).
+/// Everything else about C is the strict form: contiguous row-major, the full `n`,
+/// the `[m, n]` block.
+fn check_desc_c(module: &Module, d: &Op, m: i64, ns: i64, bm: i64, bn: i64) -> Result<()> {
+    let (s0, s1) = desc_shape2(module, d)
+        .ok_or_else(|| refuse("C has non-constant shape/strides"))?;
+    if s0 < m || s1 != ns {
+        return Err(refuse(format!(
+            "C shape [{s0},{s1}] does not hold the stored [{m},{ns}] tile — the output \
+             descriptor must name either the tile or the storage that holds it"
+        )));
+    }
+    check_desc_common(module, d, "C", ns, bm, bn)
+}
+
+/// The strides/block half of [`check_desc`], shared by the strict and windowed forms.
+fn check_desc_common(module: &Module, d: &Op, nm: &str, d1: i64, b0: i64, b1: i64) -> Result<()> {
     let (t0, t1) = desc_strides2(module, d)
         .ok_or_else(|| refuse(format!("{nm} has non-constant shape/strides")))?;
     if t0 != d1 || t1 != 1 {

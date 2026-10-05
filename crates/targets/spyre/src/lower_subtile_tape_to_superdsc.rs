@@ -4740,16 +4740,15 @@ mod tests {
         // per-row time-tiling is design-risk-4). It runs it at m=1 over the LAST prompt row instead,
         // which is what lets prefill produce the first generated token's logits itself.
         //
-        // ⛔ THE PRODUCER HALF IS THE SPLICE'S NOW, AND IT HAS NOT LANDED. The walk's fold rewrite is
-        // deleted (the splice hook fires before any builder arm, and a fallthrough after it would be
-        // the second producer this crate just finished removing), so an m>1 lm-head tail is a LOUD
-        // splice Err naming the missing fold kernel — the worklist's prefill-fold item. Until that
-        // lands, this test pins three things that must hold regardless: (1) the m>1 tail REFUSES BY
-        // NAME (never silently mis-lowers a vocab-wide matmul at m>1); (2) the m=1 DECODE bundle stays
-        // a single bare matmul — the fold never fires at m=1; (3) the CONSUMER half of the fold
+        // ⭐ THE PRODUCER HALF IS THE SPLICE'S, AND IT HAS LANDED: `lower_all` routes an m>1
+        // vocab-wide MatmulTile through the Triton `lmlast.py` extraction + the re-lowered m=1
+        // matmul. This test pins three things: (1) the m>1 tail LOWERS to the fold's two programs
+        // (an extraction named `lmlast_s{id}` and the m=1 matmul after it — never a silent m>1
+        // lowering of a vocab-wide matmul); (2) the m=1 DECODE bundle stays a single bare matmul —
+        // the fold never fires at m=1; (3) the CONSUMER half of the fold
         // (`lower_ktir_to_superdsc::lmlast`, main's copy loop verbatim) still refuses a nameless
-        // extraction — pinned through the pub builder control `lower_prefill_lm_head_at_m1`, which is
-        // the card-proven body the splice's fold kernel must reproduce.
+        // extraction — pinned through the pub builder control `lower_prefill_lm_head_at_m1`, the
+        // card-proven body the splice's fold kernel reproduces.
         use scratchy_subtile::subtile_ir::{
             SubOp, SubtileIR, SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
         };
@@ -4799,19 +4798,24 @@ mod tests {
             lower_graph_to_superdsc(&ir, &weight_ids, ActiveCap::FULL, false)
                 .map(|(ops, _)| ops.into_iter().map(|e| e.op_name).collect::<Vec<_>>())
         };
-        // m>1 (prefill): the tail REFUSES BY NAME — the splice's fold kernel (last-row extraction
-        // at m=1 over LAST_HIDDEN_TID + the m=1 matmul) has not landed, and a silent m>1 lowering
-        // is the wrong-token defect the fold exists to prevent.
+        // m>1 (prefill): the tail FOLDS — the splice's `lmlast.py` extraction (its own program,
+        // over the reserved `LAST_HIDDEN_TID` staging) plus the re-lowered m=1 matmul, never a
+        // silent m>1 lowering of a vocab-wide matmul (the wrong-token defect the fold exists to
+        // prevent). Through the door the extraction is `hidden/64` per-stick copies named after
+        // the tail's own output tid (`lmlast{j}_o2`), then the m=1 matmul `matmul_o2`.
         let mq = 8u32;
-        let why = match lower(mq) {
-            Err(e) => e.0,
-            Ok(names) => panic!(
-                "an m>1 lm-head tail must refuse loudly, not lower (got {names:?})"
-            ),
-        };
-        assert!(
-            why.contains("prefill lm-head tail"),
-            "the m>1 lm-head refusal must name the fold cause, got {why:?}"
+        let names = lower(mq).expect("the m>1 lm-head tail folds to m=1");
+        assert_eq!(names.len() as u32, h / 64 + 1, "the fold is the per-stick copies plus the m=1 matmul: {names:?}");
+        for (j, name) in names.iter().take(h as usize / 64).enumerate() {
+            assert_eq!(
+                name, &format!("lmlast{j}_o2"),
+                "copy {j} is named after the tail's own output tid"
+            );
+        }
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("matmul_o2"),
+            "the fold's last program is the m=1 matmul"
         );
         // m==1 (decode): the SAME node lowers to exactly one bare matmul — the fold never fires, so
         // the decode bundle is byte-identical to the pre-fold emitter.

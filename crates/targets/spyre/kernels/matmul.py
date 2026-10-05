@@ -42,6 +42,7 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
                BLOCK_M: tl.constexpr,  #
                BLOCK_K: tl.constexpr,  #
                BLOCK_N: tl.constexpr,  #
+               M_TOTAL: tl.constexpr,  #
                ):
     start_m = tl.program_id(0)
     # Descriptors, not pointer blocks (swiglu delta 3). The W descriptor is the
@@ -49,13 +50,19 @@ def matmul_fwd(desc_a, desc_w, desc_o,  #
     # canonical form (`tt.trans` directly over the load), which `dot_to_linalg` folds
     # into the transpose-B indexing maps — the same maps `KtirFunc::matmul` states over
     # the same bytes.
+    # ⛔ THE DESCRIPTOR NAMES THE STORAGE, THE STORE NAMES THE WINDOW — the out
+    # descriptor's shape is the OUTPUT TENSOR's `[M_TOTAL, N]` (the storage the layout
+    # reserved), while the store takes the `[M, N]` tile at row 0: the prefill lm-head
+    # fold re-lowers the tail at m=1 over the LAST_HIDDEN staging, and its output is
+    # row 0 of the `[mq, vocab]` logits storage. A whole-region node states
+    # `M_TOTAL = M`, so nothing changes for it.
     a_desc = tl.make_tensor_descriptor(desc_a, shape=[M, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_M, BLOCK_K])
     w_desc = tl.make_tensor_descriptor(desc_w, shape=[N, K],
                                        strides=[K, 1],
                                        block_shape=[BLOCK_N, BLOCK_K])
-    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, N],
+    o_desc = tl.make_tensor_descriptor(desc_o, shape=[M_TOTAL, N],
                                        strides=[N, 1],
                                        block_shape=[BLOCK_M, BLOCK_N])
 
