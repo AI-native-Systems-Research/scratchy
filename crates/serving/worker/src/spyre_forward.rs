@@ -11,6 +11,10 @@
 // The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
 #[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::{PoolPartition, SlotCount};
+// The KTIR-emulator twin below (mask/rope pad-row clamping) — the card's twin shares the laws
+// through `ChunkRows` already.
+#[cfg(not(feature = "spyre-hw"))]
+use std::num::NonZeroU32;
 use scratchy_target_spyre::manifest::argmax;
 // The runner type is cfg-selected: the KTIR emulator's session on the host, the sendnn one on
 // silicon. Everything around it (weight load, dynamic sources, KV loop, sampling) is shared.
@@ -1485,13 +1489,14 @@ pub(crate) fn forward_chunk(
         )));
     }
     // The number of activation ROWS the bound buffers carry: the baked `m_cap`. Each forward fills
-    // n <= m_cap real rows and leaves the rest zero — padding, causally after every real row.
+    // n <= m_cap real rows; the remaining pad rows REPLICATE the last real token (see the staging
+    // loop below — the lm-head tail reads the last BAKED row, which must carry the last real token).
     let rows = b.m_cap;
 
     // Build this pass's DYNAMIC sources (the static weights stay resident in the
     // session — no per-forward weight marshal). Embedding gather + per-position
-    // RoPE tables for the n real rows; the remaining rows-n stay zero (padding,
-    // causally after every real row).
+    // RoPE tables, every row (real rows their own token/position, pad rows the
+    // last real token's — see the staging loop).
     let mut emb = vec![0.0f32; rows * h];
     // ⭐ PER-CLASS rotary rows, computed once per position per CLASS. A hybrid-
     // attention arch (gemma-4) gives sliding and global layers DIFFERENT tables
@@ -1506,22 +1511,37 @@ pub(crate) fn forward_chunk(
         .chain(b.sin_srcs.iter().map(|&(_, _, k)| k))
         .collect();
     // Per-class, per-position `[class_head_dim]` rows.
-    let mut cos_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(toks.len()); classes.len()];
-    let mut sin_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(toks.len()); classes.len()];
-    for (i, &t) in toks.iter().enumerate() {
+    //
+    // ⭐ THE STAGING LOOP COVERS ALL `rows` (NOT JUST `toks.len()`), AND A PAD ROW
+    // (i >= n) REPLICATES THE LAST REAL TOKEN — the same law the card path's
+    // `ChunkRows::row_logical_pos` pins (Kani: `prefill_pad_row_holds_last_real_token`).
+    // The emitter folds the vocab-wide lm-head tail to m=1 over the LAST BAKED row
+    // (`selector_lastrow_col(m_cap)`), which is a PAD row whenever `n < m_cap`; if that
+    // row is not numerically the last real token's forward, the first sampled token is
+    // whatever the lm_head computes over a row the model never fed. The card path has
+    // replicated since its own pad-row law landed; the emulator left pad rows ZERO.
+    // MEASURED on gemma-4-26b-a4b-it fp8 (23-token prompt on the m=31 rung): first
+    // sampled token EOS (id 106), `LAST_HIDDEN` ≈ final-norm row 0, pad-row logits 0.
+    let mut cos_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(rows); classes.len()];
+    let mut sin_tab: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(rows); classes.len()];
+    for i in 0..rows {
+        // A pad row's TOKEN and ROTARY POSITION are the last real token's —
+        // `min(i, n-1)` over tokens, `start + min(i, n-1)` over positions.
+        let r = i.min(n - 1);
+        let t = toks[r];
         if t >= sh.vocab {
             return Err(werr(format!("token {t} >= vocab {}", sh.vocab)));
         }
         emb[i * h..(i + 1) * h].copy_from_slice(&sh.embed_tokens[t * h..(t + 1) * h]);
         for (ci, &k) in classes.iter().enumerate() {
-            let (c, s) = scratchy_target_spyre::manifest::rope_cos_sin_kind((start + i) as u32, k);
+            let (c, s) = scratchy_target_spyre::manifest::rope_cos_sin_kind((start + r) as u32, k);
             cos_tab[ci].push(c);
             sin_tab[ci].push(s);
         }
     }
     // Tile a class's head_dim-wide rotary rows across heads to fill a
-    // `[rows, width]` source. Padding rows (>= toks.len()) stay zero (causally
-    // after every real row). `width` is a multiple of the class's own head dim.
+    // `[rows, width]` source. Every row carries its staged position (pad rows the
+    // last real token's clamped one). `width` is a multiple of the class's own head dim.
     let tile =
         |rrows: &[Vec<f32>], width: usize, kind: scratchy_target_spyre::wiring::RotaryKind| {
             let chd = kind.head_dim() as usize;
@@ -1542,7 +1562,7 @@ pub(crate) fn forward_chunk(
         let mut dynamic =
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
         // The embedding is this chunk's rows of the hidden state.
-        dynamic.push((b.embed_src as u64, emb, vec![n, sh.hidden]));
+        dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
         // ⭐ THE COMPILE-TIME SCALARS, AT THEIR RESERVED TIDS. `KtirFunc::splat_scale` reads each
         // model constant (a ScalarMul multiplier, an RMSNorm epsilon or divisor) and the algebraic
         // identities `0`/`1` from a bound `[1,1]` tile rather than a KTIR immediate, so that ONE
@@ -1562,14 +1582,14 @@ pub(crate) fn forward_chunk(
             dynamic.push((
                 cid as u64,
                 tile(&cos_tab[ci], w as usize, kind),
-                vec![n, w as usize],
+                vec![rows, w as usize],
             ));
         }
         for (ci, &(sid, w, kind)) in b.sin_srcs.iter().enumerate() {
             dynamic.push((
                 sid as u64,
                 tile(&sin_tab[n_cos + ci], w as usize, kind),
-                vec![n, w as usize],
+                vec![rows, w as usize],
             ));
         }
         dynamic
@@ -1599,11 +1619,44 @@ pub(crate) fn forward_chunk(
             // chunk (`m_cap > 1`) has no resident prefix — its bundle is baked `ActiveCap::NONE` —
             // and instead needs the `[mq, mq]` CAUSAL triangle over its own keys, which is what
             // lets the attention run all `mq` rows in one pass instead of unrolling them.
+            //
+            // ⭐ AND THE TRIANGLE IS TAKEN AT EACH ROW'S **CLAMPED** POSITION, NOT
+            // THE PLAIN `attn_causal_mask_fill(mq)`. The emitter folds the
+            // vocab-wide lm-head tail to m=1 over row `selector_lastrow_col(mq)` —
+            // the LAST BAKED row, which is a PAD row whenever `n < m_cap`. A pad
+            // row's forward must therefore be numerically IDENTICAL to the last
+            // real token's (same token id, see the embed staging above; same rotary
+            // position; same causal extent), or the first sampled token comes from
+            // a row the model never fed. The card path has had this law since
+            // `ChunkRows::row_logical_pos` (Kani-pinned
+            // `prefill_pad_row_holds_last_real_token`); the emulator bound the RAW
+            // triangle, whose pad rows attend at their PAD position's extent — a
+            // row that is not any token's forward. MEASURED on gemma-4-26b-a4b-it
+            // fp8 (23-token prompt on the m=31 rung): first sampled token was EOS
+            // (id 106), `LAST_HIDDEN` ≈ final-norm ROW 0, pad-row logits 0.
+            //
+            // ⛔ NOT `ChunkRows::new_block_mask`: that returns the CARD's
+            // `[mq, mq_pad]` stick-padded layout (`mq_pad = mq.div_ceil(64)*64`),
+            // and this view is `[mq, mq]` — a 31-row chunk would bind row stride
+            // 64 into a 31-stride view and misalign every row past the first.
+            // The clamp (`row_logical_pos`) is the law; the fill here composes it
+            // with the same `prefill_causal_col_valid` SSOT at THIS bundle's own
+            // width.
             let (fill, shape) = if b.m_cap > 1 {
-                (
-                    scratchy_target_spyre::manifest::attn_causal_mask_fill(b.m_cap),
-                    vec![b.m_cap, b.m_cap],
-                )
+                let mq = b.m_cap;
+                let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
+                    NonZeroU32::new(mq as u32).expect("m_cap > 1"),
+                );
+                let mut m = vec![0.0f32; mq * mq];
+                for r in 0..mq {
+                    let pos = chunk.row_logical_pos(r, n);
+                    for c in 0..mq {
+                        if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
+                            m[r * mq + c] = -1.0e38;
+                        }
+                    }
+                }
+                (m, vec![mq, mq])
             } else {
                 (
                     scratchy_target_spyre::manifest::attn_mask_fill(cap, start),
