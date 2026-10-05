@@ -137,8 +137,114 @@ template <typename T>
   }
 }
 
+// ---------------------------------------------------------------------------
+// gdn_scan_simd — the gating and the scan of a decode step, mlx-lm's `gated_delta_step` mapping.
+//
+// A simdgroup per (sequence, value head, value dim), its 32 lanes splitting head_k (head_k % 32 ==
+// 0): each lane holds head_k / 32 state elements, and every dot over head_k is a simd_sum — four
+// per token (q's and k's L2 norms, S·k, S·q) instead of the per-thread serial loops above. Every
+// lane computes its head's g and beta as `gdn_gating` does. `o` (f32) feeds `gdn_rms_norm_gated`.
+//
+// Baked constants: the scan's 0-4.
+// Dispatch: grid (1, HV * head_v / 4, num_seqs), threads (32, 4, 1): simdgroup s of threadgroup y
+// takes value head y / (head_v / 4), value dim (y % (head_v / 4)) * 4 + s.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+[[kernel]] void gdn_scan_simd(
+    device       float* o             [[buffer(0)]],
+    const device float* conv_out      [[buffer(1)]],
+    const device T*     a             [[buffer(2)]],
+    const device T*     b             [[buffer(3)]],
+    device       float* ssm_state     [[buffer(4)]],
+    const device int*   cu_seqlens    [[buffer(5)]],
+    const device int*   state_indices [[buffer(6)]],
+    const device uint*  is_fresh      [[buffer(7)]],
+    const device float* a_log         [[buffer(8)]],
+    const device T*     dt_bias       [[buffer(9)]],
+    uint3 tgid     [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  lane     [[thread_index_in_simdgroup]])
+{
+  const uint H = GDN_SCAN_NUM_K_HEADS;
+  const uint HV = GDN_SCAN_NUM_V_HEADS;
+  const uint K = GDN_SCAN_HEAD_K;
+  const uint Vd = GDN_SCAN_HEAD_V;
+  const uint key_dim = H * K;
+  const uint value_dim = HV * Vd;
+  const uint conv_dim = 2u * key_dim + value_dim;
+  // At least one: the batch bake compiles every kernel of the file at every head_k the others take.
+  constexpr uint NPT = GDN_SCAN_HEAD_K >= 32u ? GDN_SCAN_HEAD_K / 32u : 1u;
+
+  const uint groups = Vd / 4u;
+  const uint i_hv = tgid.y / groups;
+  const uint i_v = (tgid.y % groups) * 4u + simd_gid;
+  const uint i_n = tgid.z;
+  const uint i_h = i_hv / (HV / H);
+
+  const int bos = cu_seqlens[i_n];
+  const int seq_len = cu_seqlens[i_n + 1] - bos;
+  const int slot = state_indices[i_n];
+  if (seq_len <= 0 || slot < 0 || i_v >= Vd) {
+    return;
+  }
+  const bool fresh = is_fresh[i_n] != 0u;
+
+  device float* state_row = ssm_state + ((uint(slot) * HV + i_hv) * Vd + i_v) * K + lane * NPT;
+  float st[NPT];
+  for (uint i = 0; i < NPT; i++) {
+    st[i] = fresh ? 0.0f : state_row[i];
+  }
+  const float neg_a = -exp(float(a_log[i_hv]));
+
+  for (int i_t = 0; i_t < seq_len; i_t++) {
+    const uint t = uint(bos + i_t);
+    // gdn_gating
+    const float av = float(a[t * HV + i_hv]) + float(dt_bias[i_hv]);
+    const float sp = av <= 20.0f ? log(1.0f + exp(av)) : av;
+    const float decay = exp(neg_a * sp);
+    const float beta = 1.0f / (1.0f + exp(-float(b[t * HV + i_hv])));
+
+    const device float* q_ptr = conv_out + t * conv_dim + i_h * K + lane * NPT;
+    const device float* k_ptr = conv_out + t * conv_dim + key_dim + i_h * K + lane * NPT;
+    float q[NPT], k[NPT];
+    float q_sq = 0.0f, k_sq = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      q[i] = q_ptr[i];
+      k[i] = k_ptr[i];
+      q_sq += q[i] * q[i];
+      k_sq += k[i] * k[i];
+    }
+    const float q_inv = rsqrt(simd_sum(q_sq) + 1e-6f) * GDN_SCAN_SCALE;
+    const float k_inv = rsqrt(simd_sum(k_sq) + 1e-6f);
+
+    float kv = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      st[i] *= decay;
+      kv += st[i] * (k[i] * k_inv);
+    }
+    kv = simd_sum(kv);
+    const float v = conv_out[t * conv_dim + 2u * key_dim + i_hv * Vd + i_v];
+    const float delta = (v - kv) * beta;
+    float out = 0.0f;
+    for (uint i = 0; i < NPT; i++) {
+      st[i] += (k[i] * k_inv) * delta;
+      out += st[i] * (q[i] * q_inv);
+    }
+    out = simd_sum(out);
+    if (lane == 0u) {
+      o[t * value_dim + i_hv * Vd + i_v] = out;
+    }
+  }
+
+  for (uint i = 0; i < NPT; i++) {
+    state_row[i] = st[i];
+  }
+}
+
 #define INST_GDN_SCAN_VARLEN(dtype_tag, mtl_type) \
-  SCRATCHY_KERNEL(gdn_scan_varlen_##dtype_tag, gdn_scan_varlen<mtl_type>)
+  SCRATCHY_KERNEL(gdn_scan_varlen_##dtype_tag, gdn_scan_varlen<mtl_type>) \
+  SCRATCHY_KERNEL(gdn_scan_simd_##dtype_tag, gdn_scan_simd<mtl_type>)
 
 INST_GDN_SCAN_VARLEN(f16,  half)
 INST_GDN_SCAN_VARLEN(bf16, bfloat)
