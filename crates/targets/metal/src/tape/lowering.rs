@@ -730,11 +730,12 @@ fn tq_attention_command(
     }
 }
 
-/// A decode attention `attn` (head dim `head_dim`) with its split's combine pass: the attention
-/// takes the tape variant's splits (`ATTN_SPLITS`, slot 18) and binds the partials scratch — the
-/// op scratch's front, `[batch, num_q_heads, 32, 2 + head_dim]` floats — and the combine merges
-/// the partials into the attention's output. A variant at one split runs the attention alone,
-/// merging in place (the worker drops the combine).
+/// A one-row bucket's decode attention `attn` (head dim `head_dim`) with its split's combine
+/// pass: the attention takes the tape variant's splits (`ATTN_SPLITS`, slot 18) and binds the
+/// partials scratch — the op scratch's front, `[num_q_heads, 32, 2 + head_dim]` floats — and the
+/// combine merges the partials into the attention's output. A variant at one split runs the
+/// attention alone, merging in place (the worker drops the combine). A bucket of more rows
+/// already dispatches a threadgroup per row and head group, so it runs `attn` unsplit.
 fn split_decode_attention(
     p: &MetalModelConsts,
     attn: LoweredCommand,
@@ -742,7 +743,10 @@ fn split_decode_attention(
     bucket_m: u32,
     moe_scratch_bytes: &mut u32,
 ) -> Vec<LoweredCommand> {
-    let partials = bucket_m * p.num_q_heads * 32 * (2 + head_dim.get()) * 4;
+    if bucket_m > 1 {
+        return vec![attn];
+    }
+    let partials = p.num_q_heads * 32 * (2 + head_dim.get()) * 4;
     *moe_scratch_bytes = (*moe_scratch_bytes).max(partials);
     let mut constants = attn.constants.to_vec();
     constants.push(ConstantValue::attn_splits(18));
@@ -7543,7 +7547,6 @@ mod tests {
         );
         steps.push((KernelId::TqRotateRows, Some(UnlessDecodeStep)));
         steps.push((KernelId::AttentionViaCacheTq, Some(OnlyIfDecodeStep)));
-        steps.push((KernelId::AttentionDecodeCombineTq, Some(OnlyIfDecodeStep)));
         steps
     }
 
