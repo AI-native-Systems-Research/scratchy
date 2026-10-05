@@ -120,7 +120,11 @@ pub struct FailedPredecessor {
 
 impl std::fmt::Display for FailedPredecessor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: the step this one was scheduled behind failed", self.req_id)
+        write!(
+            f,
+            "{}: the step this one was scheduled behind failed",
+            self.req_id
+        )
     }
 }
 
