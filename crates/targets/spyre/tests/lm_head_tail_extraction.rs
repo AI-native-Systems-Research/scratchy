@@ -340,3 +340,152 @@ fn the_tail_at_m1_still_matches_the_reference() {
         );
     }
 }
+
+/// The gemma-4 parity fixture's collision, minimized: a q-projection matmul
+/// whose output width EQUALS the result's (vocab 512 == 4 heads × hd 128 there;
+/// 64 == 1 head × hd 64 here), feeding the result through RoPE.
+///
+/// ⛔ THIS WAS A REAL CORRUPTION, not a hypothetical: the width-only predicate
+/// folded every global layer's Q to m=1 — `lmlast` extracted the last prompt
+/// row, the matmul ran at one row, rope rotated at position 0 (identity), and
+/// attention saw `m-1` zero rows. The first sampled token was garbage while
+/// every width-128 tensor stayed fp16-clean against the oracle. RoPE is
+/// deliberately NOT row-local (`RopeAppend` also writes the paged KV cache, a
+/// consumer the prefill graph cannot see), so the fold must refuse this chain.
+#[test]
+fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
+    // m=7 rows, hidden=128, q width == result width == 64 (1 head × hd 64).
+    let (m, hidden, qw) = (7u32, 128u32, 64u32);
+    let hd = 64u32;
+
+    // t0 x [m, hidden]; t1 Wq [hidden, qw]; t2 cos [m, qw]; t3 sin [m, qw];
+    // t4 q [m, qw]; t5 roped q [m, qw] (the RESULT — same width as q).
+    // Sources FIRST (eval_dag's contract: tensors[0..num_sources] are leaves).
+    // The cos/sin tables are PER-POSITION `[m, qw]` rows — the rope program views
+    // them as `[rows*tbl_cols]` and reads position `ri`'s row at `ri*tbl_cols`.
+    let tensors = vec![
+        TensorShape { rows: m, cols: hidden },  // t0 x (source)
+        TensorShape { rows: hidden, cols: qw }, // t1 Wq (source)
+        TensorShape { rows: m, cols: qw },      // t2 cos (source)
+        TensorShape { rows: m, cols: qw },      // t3 sin (source)
+        TensorShape { rows: m, cols: qw },      // t4 q
+        TensorShape { rows: m, cols: qw },      // t5 roped (result)
+    ];
+    let num_sources = 4u32; // x, Wq, cos, sin
+    let whole = |t: usize| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: tensors[t].whole(),
+    };
+    // Row `ri` of tensor `t` — the PER-ROW rope node form the real front end's
+    // `head_tile_rope` decomposition produces (each node ONE row's [1, qw]
+    // slice; the cos/sin input region is that row's table slice, so eval_dag's
+    // flat `cos[d]` read and the KTIR's per-position read agree).
+    let row = |t: usize, ri: u32| TensorRegion {
+        tensor: TensorId::from_index(t),
+        region: scratchy_subtile::subtile_ir::Region {
+            rows: scratchy_subtile::subtile_ir::Range::new(ri, 1),
+            cols: scratchy_subtile::subtile_ir::Range::new(0, qw),
+        },
+    };
+    let mk = |id: usize, op: SubOp, inputs: Vec<TensorRegion>, output: TensorRegion| SubtileNode {
+        id: SubtileId::from_index(id),
+        op,
+        inputs,
+        output,
+    };
+    // The q matmul (whole [m, qw]), then ONE PER-ROW rope node per position.
+    let mut nodes = vec![mk(
+        0,
+        SubOp::MatmulTile {
+            n: qw,
+            weight: scratchy_subtile::lower::GemmWeight::Dense,
+        },
+        vec![whole(0), whole(1)],
+        whole(4),
+    )];
+    for ri in 0..m {
+        nodes.push(mk(
+            1 + ri as usize,
+            SubOp::RopeRotate {
+                head_dim: ktir_superdsc::head_counts::HeadDim::new(hd),
+                _form: std::marker::PhantomData,
+            },
+            vec![row(4, ri), row(2, ri), row(3, ri)],
+            row(5, ri),
+        ));
+    }
+    let ir = SubtileIR {
+        tensors,
+        num_sources,
+        nodes,
+        result: TensorId::from_index(5),
+        op_output: Vec::new(),
+    };
+
+    // The fold must NOT fire: the q matmul's width collides with the result's,
+    // but its chain to the result passes through RoPE.
+    let weight_ids = std::collections::HashSet::new();
+    let (ops, _layout) = superdsc::lower_graph_to_ktir(
+        &ir,
+        &weight_ids,
+        superdsc::ActiveCap::FULL,
+        false,
+    )
+    .unwrap_or_else(|e| panic!("lower the collision graph: {e:?}"));
+    let lmlast: Vec<&str> = ops
+        .iter()
+        .filter_map(|e| e.ktir.as_ref().map(|k| k.func.name))
+        .filter(|n| n.starts_with("lmlast_s"))
+        .collect();
+    assert!(
+        lmlast.is_empty(),
+        "a width collision whose chain passes through RoPE must NOT fold to the m=1 tail: \
+         {lmlast:?} — this is the gemma-4 global-q corruption"
+    );
+
+    // ⭐ AND THE MATMUL MUST KEEP EVERY ROW — the fold's whole damage was that
+    // the q matmul's program viewed its activation as ONE row. Pin the emitted
+    // programs' own view dims directly: the matmul's activation view is
+    // `[m, hidden]` (7 rows), not `[1, hidden]`, and the per-row rope programs
+    // exist for EVERY position (7 of them). This is the exact observable the
+    // corruption had (the bundle's q matmul program viewed x as [1, hidden] and
+    // only row 0 of the roped q was ever real).
+    let mut matmul_rows = Vec::new();
+    let mut rope_count = 0usize;
+    for e in &ops {
+        let Some(k) = e.ktir.as_ref() else { continue };
+        for op in k.func.operations {
+            if op.op_type != ktir_core::opkind::OpKind::KtdpConstructMemoryView {
+                continue;
+            }
+            let Some(ktir_core::ir::Attr::IntList(dims)) =
+                op.attr(ktir_core::attrkey::AttrKey::Shape)
+            else {
+                continue;
+            };
+            if dims.len() == 2 && dims[1] == hidden as i64 {
+                matmul_rows.push(dims[0]);
+            }
+        }
+        if k.func.name.starts_with("rope_s") {
+            rope_count += 1;
+        }
+    }
+    // The activation view is the `[rows, hidden]` one whose row count is the
+    // prompt's; the weight's transposed view `[qw, hidden]` also matches
+    // `dims[1] == hidden`, so assert on the FOLD SIGNATURE directly: an
+    // `[1, hidden]` activation view (and no `[m, hidden]` one) is the m=1
+    // fold; here BOTH must be absent/1-free.
+    assert!(
+        matmul_rows.contains(&(m as i64)),
+        "the collision matmul must view its activation at all {m} rows, saw {matmul_rows:?}"
+    );
+    assert!(
+        !matmul_rows.contains(&1),
+        "the collision matmul must not fold to a [1, hidden] activation view, saw {matmul_rows:?}"
+    );
+    assert_eq!(
+        rope_count, m as usize,
+        "one per-row rope program per position ({m})"
+    );
+}
