@@ -2734,9 +2734,15 @@ impl Executor {
                 Ok(got) => {
                     let host = &self.seg_host[i][..got.min(self.seg_host[i].len())];
                     let (mut nz, mut mx) = (0usize, 0.0f32);
+                    let mut n_inf = 0usize;
+                    // First NON-FINITE element offsets (element index in the segment), so a divergence
+                    // probe can say WHICH tensor went inf rather than only that the segment holds one.
+                    // `SCRATCHY_SDSC_OPTRACE_INF=1` opts in: printing offsets costs a scan this line
+                    // already pays, but the extra string only matters when it fires.
+                    let mut inf_at: Vec<usize> = Vec::new();
                     // `as_chunks` over `chunks_exact`: a CONSTANT chunk width yields `&[u8; 2]`, so the
                     // pair cannot be short (clippy::chunks_exact_to_as_chunks).
-                    for c in host.as_chunks::<2>().0 {
+                    for (ei, c) in host.as_chunks::<2>().0.iter().enumerate() {
                         let bits = u16::from_le_bytes(*c);
                         if bits != 0 {
                             nz += 1;
@@ -2744,9 +2750,19 @@ impl Executor {
                             if v > mx {
                                 mx = v;
                             }
+                            if !v.is_finite() {
+                                n_inf += 1;
+                                if inf_at.len() < 4 {
+                                    inf_at.push(ei);
+                                }
+                            }
                         }
                     }
-                    format!("nz={nz} max={mx:.3}")
+                    if n_inf > 0 && std::env::var_os("SCRATCHY_SDSC_OPTRACE_INF").is_some() {
+                        format!("nz={nz} max={mx:.3} INF={n_inf} at {inf_at:?}")
+                    } else {
+                        format!("nz={nz} max={mx:.3}")
+                    }
                 }
                 Err(_) => "unreadable".to_string(),
             };
