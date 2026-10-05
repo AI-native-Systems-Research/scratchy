@@ -23,8 +23,10 @@
 // left-padded from the per-sequence `conv_state` ring (or zero when fresh).
 //
 // State layout (cuda-symmetric): conv_state[entries, conv_dim, state_len], state_len =
-//   kernel-1, base = (entry*conv_dim + d)*state_len, oldest-first; a slot's entry is followed
-//   by its checkpoints. `gdn_step[seq]` is `scratchy_layers::gdn_state::GdnStep::encode`.
+//   kernel-1, base = (entry*conv_dim + d)*state_len, oldest-first. `state_indices[seq]` is the
+//   sequence's slot, `gdn_step[seq]` `scratchy_layers::gdn_state::GdnStep::encode`: a slot's
+//   entry is followed by its checkpoints, one after each of a verify step's rows (the pool's
+//   drafts + 1), so slot `s` is entry `s` without drafts and `s * (pool + 2)` with.
 //
 // `x`/`w` are model dtype (`T`), f32-accumulated; `conv_out` + `conv_state`
 // are f32. Per-channel (depthwise) so GVA / head grouping does not apply here.
@@ -74,9 +76,14 @@ template <typename T>
   if (seqlen <= 0) {
     return;
   }
-  int entry = state_indices[seq];
-  uint start = gdn_step[seq] & 0xffu;
-  uint checkpoint_rows = (gdn_step[seq] >> 8) & 0xffu;
+  int slot = state_indices[seq];
+  uint code = gdn_step[seq];
+  uint start = code & 0xffu;
+  uint drafts = (code >> 8) & 0xffu;
+  uint pool = (code >> 16) & 0xffu;
+  uint entry = uint(slot) * (pool == 0u ? 1u : pool + 2u);
+  // A verify step checkpoints the window after each of its rows.
+  uint checkpoint_rows = drafts == 0u ? 0u : drafts + 1u;
   uint entry_len = conv_dim * state_len;
 
   // Load conv weights for this channel.
@@ -86,7 +93,7 @@ template <typename T>
   }
 
   // Seed the causal window from the start entry (zero when fresh).
-  device float* state_ptr = conv_state + (uint(entry) * conv_dim + d) * state_len;
+  device float* state_ptr = conv_state + (entry * conv_dim + d) * state_len;
   const device float* start_ptr = state_ptr + (start >= 2u ? (start - 1u) * entry_len : 0u);
   float window[GDN_CONV_KMAX];
   for (uint ki = 0; ki < state_len; ki++) {
