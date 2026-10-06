@@ -1108,6 +1108,9 @@ pub trait CanonicalParams: WeightAccessors {
     const GDN_HEAD_V_DIM: u32 = 0;
     const GDN_CONV_KERNEL: u32 = 0;
     const GDN_CONV_DIM: usize = 0;
+    /// The drafts each sequence of a speculative verify step carries: an MTP head's (its
+    /// arch.json), and the target's whose head this build compiles. 0 without one.
+    const SPEC_DRAFTS: u32 = 0;
 
     /// Block-table row stride (in u32s), equal to
     /// `ceil(MAX_SEQ_LEN / BLOCK_SIZE)`. Baked into

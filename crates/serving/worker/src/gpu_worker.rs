@@ -1015,12 +1015,11 @@ impl MetalWorker {
                 // arithmetic names, gathered here so the resolver stays
                 // backend-neutral arithmetic (no near-copy can grow in any
                 // target crate).
-                let checkpoint_rows = self.gdn_checkpoint_rows()?;
                 let gdn_per_slot = model.gdn_runtime_config().map(|cfg| {
                     GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                         cfg.num_linear_layers(),
                         1,
-                        checkpoint_rows,
+                        cfg.checkpoint_rows(),
                         cfg.state_dims(),
                     )
                 });
@@ -1078,7 +1077,7 @@ impl MetalWorker {
                     peak_activation_bytes: peak,
                     gdn_per_slot_bytes: gdn_per_slot,
                     // A verify step samples each sequence's every row: its token and its drafts.
-                    sampler_bytes_per_row: sampler_row * (1 + self.config.num_speculative_tokens),
+                    sampler_bytes_per_row: sampler_row * (1 + model.spec_drafts() as usize),
                 };
                 resolve_default_max_num_seqs(&facts, false)
             }
@@ -1315,21 +1314,6 @@ impl MetalWorker {
             kv_addressing: main.kv_addressing,
             lent: lent.map(|l| *l).unwrap_or_default(),
         })
-    }
-
-    /// Checkpoints each GDN state slot keeps: one per draft of a verify step, so a rejected draft
-    /// can be dropped. Sizes both the pool and its memory reservation.
-    fn gdn_checkpoint_rows(
-        &self,
-    ) -> ExecutorResult<scratchy_target_metal::gdn_state::CheckpointRows> {
-        let drafts = self.config.num_speculative_tokens;
-        u8::try_from(drafts)
-            .map(scratchy_target_metal::gdn_state::CheckpointRows)
-            .map_err(|_| {
-                ExecutorError::WorkerInit(format!(
-                    "GdnStatePool: {drafts} speculative tokens exceed a slot's u8 checkpoints"
-                ))
-            })
     }
 
     /// Run the vision tower for every MM-bearing request at its first
@@ -3449,7 +3433,7 @@ impl Worker for MetalWorker {
             &gpu_device.device,
             gpu_device.allocator.residency(),
             // A verify step samples each sequence's every row: its token and its drafts.
-            (self.max_num_seqs_resolved() * (1 + self.config.num_speculative_tokens)) as u32,
+            (self.max_num_seqs_resolved() * (1 + model.spec_drafts() as usize)) as u32,
             &sampler,
             max_model_len.max(1) as u32,
         );
@@ -3817,7 +3801,7 @@ impl Worker for MetalWorker {
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
             let num_slots = self.max_num_seqs_resolved();
             let num_layers = model.num_hidden_layers() as usize;
-            let checkpoint_rows = self.gdn_checkpoint_rows()?;
+            let checkpoint_rows = gdn_cfg.checkpoint_rows();
             let t_gdn = std::time::Instant::now();
             let gdn_pool = unsafe {
                 scratchy_target_metal::gdn_state::GdnStatePool::new(
@@ -3916,7 +3900,6 @@ impl Worker for MetalWorker {
         // leave no room for it. Persistent f32 state, one slot per
         // resident seq (and its checkpoints) — sized identically to the pool
         // built later. Zero for non-hybrid arches.
-        let checkpoint_rows = self.gdn_checkpoint_rows()?;
         let gdn_reserve = self
             .model
             .as_ref()
@@ -3925,7 +3908,7 @@ impl Worker for MetalWorker {
                 scratchy_target_metal::gdn_state::GdnStatePool::<scratchy_target_metal::PoolMem>::reserve_bytes(
                     cfg.num_linear_layers(),
                     self.max_num_seqs_resolved(),
-                    checkpoint_rows,
+                    cfg.checkpoint_rows(),
                     cfg.state_dims(),
                 )
             })

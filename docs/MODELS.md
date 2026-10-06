@@ -187,8 +187,10 @@ target's (the same mmap, nothing uploaded twice), the lm_head cut to the
 head's `vocab_size` rows. `spec/mtp` compiles the head of every selected
 model whose checkpoint carries one (a head config is selected when it is the
 same file as a selected target's), and a build that compiles the head drafts
-with it whenever it serves the target — `--num-speculative-tokens` drafts per
-step (2), `0` turns it off:
+with it whenever it serves the target. How many tokens it drafts a step is a
+compile-time constant (`spec_drafts` in the head's `arch.json`, 2): the
+target's verify steps carry exactly that many rows per sequence, and both
+models' kernels bake it. To serve without it, build without `spec/mtp`:
 
 ```bash
 cargo build --release -p scratchy-cli --features metal,serve,model/qwen3.6-35b-a3b,\

@@ -248,6 +248,13 @@ pub trait ScratchyWeights: Send + Sync {
         128
     }
 
+    /// The drafts each sequence of a speculative verify step carries (`CanonicalParams::
+    /// SPEC_DRAFTS`): an MTP head's, and its target's when this build compiles the head. 0 for a
+    /// model without one.
+    fn spec_drafts(&self) -> u32 {
+        0
+    }
+
     /// # Safety
     /// All tensors in `ctx` must be valid GPU memory; `device`
     /// must be the live CUDA device. Same invariants as each

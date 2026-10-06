@@ -308,6 +308,18 @@ pub struct LoweringInput {
     pub result: usize,
 }
 
+impl LoweringInput {
+    /// The op whose output is every row's final hidden state: the one the result's vocabulary
+    /// projection reads, when the forward ends with one.
+    pub fn hidden(&self) -> Option<usize> {
+        let od = &self.ops[self.result];
+        match (od.op, od.inputs.first()) {
+            (SubOp::MatmulTile { .. } | SubOp::AllRowsMatmul, Some(&InputRef::Op(j))) => Some(j),
+            _ => None,
+        }
+    }
+}
+
 // ── Silu + Mul → SiluMul fusion ─────────────────────────────────────
 
 /// Fuse each adjacent `Silu` → `Mul(silu, up)` into one

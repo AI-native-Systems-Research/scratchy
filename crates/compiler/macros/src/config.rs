@@ -487,19 +487,21 @@ fn load_dir_mode(
     };
     // A head that ships inside its target's checkpoint (`hf_architectures`: an MTP head) also
     // compiles for every selected target under `spec/mtp` (scratchy-models' `mtp` feature). Its
-    // configs are its targets' checkpoint configs verbatim, so a head config is selected when a
-    // selected config of another arch is the same file.
-    let drafts_with_target =
-        !spec.hf_architectures.is_empty() && std::env::var(feature_env_var("mtp")).is_ok();
-    let target_selected = |head_path: &Path| -> Result<bool, ConfigError> {
+    // configs are its targets' checkpoint configs verbatim, so a head and its target are the arches
+    // whose configs are the same file: the head's config is selected when its target's is, and the
+    // target's verify steps carry the head's drafts (`spec_drafts`, the head's arch.json).
+    let mtp = std::env::var(feature_env_var("mtp")).is_ok();
+    let drafts_with_target = !spec.hf_architectures.is_empty() && mtp;
+    let same_file_elsewhere = |path: &Path| -> Result<Vec<(String, PathBuf)>, ConfigError> {
         let io = |path: &Path| {
             let path = path.to_path_buf();
             move |source| ConfigError::Io { path, source }
         };
-        let head = fs::read(head_path).map_err(io(head_path))?;
+        let this = fs::read(path).map_err(io(path))?;
         let configs = dir
             .parent()
             .ok_or_else(|| ConfigError::NotADirectory(dir.to_path_buf()))?;
+        let mut same = Vec::new();
         for arch_dir in fs::read_dir(configs).map_err(io(configs))? {
             let arch_dir = arch_dir.map_err(io(configs))?.path();
             let Some(arch) = arch_dir.file_name().and_then(|s| s.to_str()) else {
@@ -510,15 +512,34 @@ fn load_dir_mode(
             }
             for config in fs::read_dir(&arch_dir).map_err(io(&arch_dir))? {
                 let config = config.map_err(io(&arch_dir))?.path();
-                let selected = config.extension().is_some_and(|e| e == "json")
-                    && (config.file_stem().and_then(|s| s.to_str()))
-                        .is_some_and(|stem| model_feature_enabled(arch, stem));
-                if selected && fs::read(&config).map_err(io(&config))? == head {
-                    return Ok(true);
+                let json = config.extension().is_some_and(|e| e == "json");
+                if json && fs::read(&config).map_err(io(&config))? == this {
+                    same.push((arch.to_string(), config));
                 }
             }
         }
-        Ok(false)
+        Ok(same)
+    };
+    let target_selected = |head_path: &Path| -> Result<bool, ConfigError> {
+        Ok(same_file_elsewhere(head_path)?
+            .iter()
+            .any(|(arch, config)| {
+                (config.file_stem().and_then(|s| s.to_str()))
+                    .is_some_and(|stem| model_feature_enabled(arch, stem))
+            }))
+    };
+    let head_drafts = |target_path: &Path| -> Result<Option<u64>, ConfigError> {
+        if !mtp || !spec.hf_architectures.is_empty() {
+            return Ok(None);
+        }
+        for (_, config) in same_file_elsewhere(target_path)? {
+            let head = load_arch_json(config.parent().expect("a config lies in its arch's dir"))?;
+            let drafts = (head.bound_defaults.iter()).find(|(k, _)| k == "spec_drafts");
+            if let (false, Some(&(_, drafts))) = (head.hf_architectures.is_empty(), drafts) {
+                return Ok(Some(drafts));
+            }
+        }
+        Ok(None)
     };
 
     // Quant scoping. `SCRATCHY_QUANTS=preset1,preset2,...` restricts the
@@ -695,6 +716,9 @@ fn load_dir_mode(
             continue;
         }
         let (raw, mut json) = read_json_file(p)?;
+        if let (Some(drafts), Some(obj)) = (head_drafts(p)?, json.as_object_mut()) {
+            obj.insert("spec_drafts".to_string(), drafts.into());
+        }
         // Dense-base drift surface: `<stem>.overrides.json` deep-merges
         // onto the verbatim checkpoint config (same mechanism the
         // synthesized quant variants already get). Tracked so cargo

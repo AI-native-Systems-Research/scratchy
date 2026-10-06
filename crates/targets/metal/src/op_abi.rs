@@ -211,11 +211,12 @@ pub const METAL_KV_CODEC: KvCodecFacts = {
     }
 };
 
-/// The most rows a verify-sized bucket holds: a speculative verify step's (a sequence's last
-/// token and up to 7 drafts). Such a bucket's steps are decode-shaped — a few query rows over a
-/// whole context — and run decode-shaped kernels: its paged attention is the decode kernel's,
-/// one query row per token; its MoE experts' shared pairs run once.
-pub const METAL_VERIFY_ROWS: u32 = 8;
+/// The most rows a verify-sized bucket holds: a speculative verify step's, each sequence's last
+/// token and its drafts. Such a bucket's steps are decode-shaped — a few query rows over a whole
+/// context — and run decode-shaped kernels: its paged attention is the decode kernel's, one query
+/// row per token; a gathered MoE block runs the pairs that share an expert once
+/// ([`METAL_SHARED_EXPERTS_FROM`]).
+pub const METAL_VERIFY_ROWS: u32 = 32;
 
 /// Whether a guarded codec step runs at a bake, and under which runtime gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

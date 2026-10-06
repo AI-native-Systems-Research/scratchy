@@ -148,9 +148,9 @@ pub struct LaunchClaudeArgs {
     #[arg(long)]
     pub speculative_model: Option<String>,
 
-    /// Speculative tokens proposed per step. Unset leaves `serve`'s own default
-    /// (2). Used with --speculative-model, or with the target's compiled
-    /// multi-token-prediction head (0 turns that off).
+    /// Speculative tokens proposed per step by --speculative-model (n-gram or a
+    /// draft model). Unset leaves `serve`'s own default (2). A compiled
+    /// multi-token-prediction head drafts the count it was compiled to.
     #[arg(long)]
     pub num_speculative_tokens: Option<usize>,
 
@@ -448,10 +448,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub speculative_model: Option<String>,
 
-    /// Number of speculative tokens to propose per step (default: 2).
-    /// Used with --speculative-model, or with the target's own
-    /// multi-token-prediction head when this build compiled it (0 turns
-    /// that off).
+    /// Number of speculative tokens to propose per step (default: 2), with
+    /// --speculative-model (n-gram or a draft model). A multi-token-prediction
+    /// head drafts the count it was compiled to (its arch.json `spec_drafts`,
+    /// which its target's kernels bake); a build without `spec/mtp` serves
+    /// without one.
     ///
     /// K=2 is the empirical sweet spot for the realistic draft-model
     /// regime (target much larger than draft, e.g. Llama-3.1-8B
@@ -677,11 +678,6 @@ pub struct ChatArgs {
     /// Sampling temperature (0.0 = greedy, 1.0 = default).
     #[arg(long)]
     pub temperature: Option<f64>,
-
-    /// Drafts per step with the model's compiled multi-token-prediction
-    /// head (default 2); 0 turns it off.
-    #[arg(long)]
-    pub num_speculative_tokens: Option<usize>,
 
     /// Number of GPUs for tensor parallelism (default: 1).
     #[arg(long, default_value_t = 1)]

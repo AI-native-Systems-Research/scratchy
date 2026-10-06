@@ -22,19 +22,20 @@
 //
 // `conv_out` is model dtype (`T`); `g`/`beta`/`ssm_state`/`o` are f32.
 // State layout (cuda-symmetric): `state_indices[seq]` is the sequence's slot; a slot is its state
-//   entry ssm[HV, head_v, head_k] (row ((i_hv*head_v + i_v)*head_k)), then — when the pool keeps
+//   entry ssm[HV, head_v, head_k] (row ((i_hv*head_v + i_v)*head_k)), then — when the model
 //   drafts (`scratchy_layers::gdn_state::GdnStateDims::ssm_slot_len`) — two record areas of
-//   `pool + 1` rows, each row its f32 conv row, then its decay and beta (f32 [HV] each).
+//   `GDN_SCAN_DRAFTS + 1` rows, each row its f32 conv row, then its decay and beta (f32 [HV] each).
 //   `gdn_step[seq]` is `scratchy_layers::gdn_state::GdnStep::encode`:
 //   - a step starts from the slot's state, zero (fresh), or (start = checkpoint r) the slot's state
-//     replayed through the previous verify step's rows 0..=r from the record area its bit 24
+//     replayed through the previous verify step's rows 0..=r from the record area its bit 16
 //     names, through the same loop body that first computed them (no output);
 //   - a verify step (drafts) leaves the state it starts from in the slot and records each of its
 //     rows in the other area; any other step writes its last row's state to the slot.
 //
 // Baked constants:
 //   GDN_SCAN_NUM_K_HEADS (H), GDN_SCAN_NUM_V_HEADS (HV),
-//   GDN_SCAN_HEAD_K (K), GDN_SCAN_HEAD_V (head_v), GDN_SCAN_SCALE (1/sqrt(K)).
+//   GDN_SCAN_HEAD_K (K), GDN_SCAN_HEAD_V (head_v), GDN_SCAN_SCALE (1/sqrt(K)),
+//   GDN_SCAN_DRAFTS (the drafts each sequence of a verify step carries: `SPEC_DRAFTS`).
 //
 // Dispatch: grid (ceil(head_v/tg), HV, num_seqs); thread = (value-dim, head, seq).
 
@@ -48,6 +49,7 @@ SCRATCHY_CONSTANT(uint, GDN_SCAN_NUM_V_HEADS, 1);
 SCRATCHY_CONSTANT(uint, GDN_SCAN_HEAD_K, 2);
 SCRATCHY_CONSTANT(uint, GDN_SCAN_HEAD_V, 3);
 SCRATCHY_CONSTANT(float, GDN_SCAN_SCALE, 4);
+SCRATCHY_CONSTANT(uint, GDN_SCAN_DRAFTS, 5);
 
 // Matches CUDA `MAX_HEAD_K_DIM` (gdn_recurrent_kernels.cu): register state row.
 constant constexpr uint GDN_SCAN_KMAX = 128;
@@ -96,15 +98,15 @@ template <typename T>
   uint code = gdn_step[i_n];
   uint start = code & 0xffu;
   uint drafts = (code >> 8) & 0xffu;
-  uint pool = (code >> 16) & 0xffu;
-  uint area = (code >> 24) & 1u;
+  uint area = (code >> 16) & 1u;
 
-  // The slot: its state entry, then (with drafts) two record areas of `pool + 1` rows, each row
-  // its f32 conv row, then its decay and beta.
+  // The slot: its state entry, then (with drafts) two record areas of `GDN_SCAN_DRAFTS + 1` rows,
+  // each row its f32 conv row, then its decay and beta.
   uint entry_len = HV * Vd * K;
   uint rec_len = conv_dim + 2u * HV;
-  uint area_len = (pool + 1u) * rec_len;
-  device float* slot = ssm_state + uint(slot_ix) * (entry_len + (pool == 0u ? 0u : 2u * area_len));
+  uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
+  uint slot_len = entry_len + (GDN_SCAN_DRAFTS == 0u ? 0u : 2u * area_len);
+  device float* slot = ssm_state + uint(slot_ix) * slot_len;
   device float* state_row = slot + (i_hv * Vd + i_v) * K;
   const device float* kept = slot + entry_len + area * area_len;
   device float* recorded = slot + entry_len + (1u - area) * area_len;
@@ -247,15 +249,14 @@ template <typename T>
   const uint code = gdn_step[i_n];
   const uint start = code & 0xffu;
   const uint drafts = (code >> 8) & 0xffu;
-  const uint pool = (code >> 16) & 0xffu;
-  const uint area = (code >> 24) & 1u;
+  const uint area = (code >> 16) & 1u;
 
   // The slot, as `gdn_scan_varlen` lays it out.
   const uint entry_len = HV * Vd * K;
   const uint rec_len = conv_dim + 2u * HV;
-  const uint area_len = (pool + 1u) * rec_len;
+  const uint area_len = (GDN_SCAN_DRAFTS + 1u) * rec_len;
   device float* slot =
-      ssm_state + uint(slot_ix) * (entry_len + (pool == 0u ? 0u : 2u * area_len));
+      ssm_state + uint(slot_ix) * (entry_len + (GDN_SCAN_DRAFTS == 0u ? 0u : 2u * area_len));
   device float* state_row = slot + (i_hv * Vd + i_v) * K + lane * NPT;
   const device float* kept = slot + entry_len + area * area_len;
   device float* recorded = slot + entry_len + (1u - area) * area_len;
