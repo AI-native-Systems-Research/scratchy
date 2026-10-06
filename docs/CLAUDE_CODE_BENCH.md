@@ -18,7 +18,7 @@ is a defect: a later reader cannot tell silence from a tested claim.
 | [Method and metrics](#method-and-metrics) | owned by the agreed method, not restated here |
 | [Exact commands](#exact-commands) | scratchy side recorded; ollama side **T0.4** |
 | [Results](#results) | empty — phase 4 |
-| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5**; R2 re-scoped to mlx-lm and pinned — **T0.6** |
+| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5**; R2's pair audited, pinned and scoped — **T0.6** |
 | [Blocked](#blocked) | recorded |
 | [Artifacts](#artifacts) | empty — phase 4 |
 
@@ -108,12 +108,10 @@ environment that must accompany them (`OLLAMA_CONTEXT_LENGTH`,
 `ollama launch claude` puts in Claude Code's environment) is T0.4's one-page note
 and is not guessed here.
 
-**mlx-lm — R2's comparator.** It serves the *same* checkpoint files scratchy
-loads, so there is nothing to pin on the weights beyond the revisions already in
-the [scratchy table](#the-scratchy-side-pinned--the-same-on-both-rungs). Its own
-version, sampling flags and the `--parity-cmd` form are `docs/BENCHMARKING.md`
-§4's, reused rather than redefined here; the pinned version is listed as open
-under [Blocked](#blocked).
+**Both rungs are ollama**, so there is no third engine to pin. R2 swaps only
+the weights each side loads — see
+[R2 as it will run](#r2-as-it-will-run--the-concrete-pair) for its two artifacts
+and the one extra scratchy build (no quant preset) that rung needs.
 
 ## Results
 
@@ -135,30 +133,38 @@ Both engines are asked to run "the same model". But the file each one loads was
 output. One comparison therefore cannot separate the engine from the quantizer,
 so the comparison runs two rungs:
 
-| rung | the question it answers | engines | what differs | lane / endpoint |
+| rung | the question it answers | engines | what differs | scope |
 |---|---|---|---|---|
-| **R1** "what a user gets" | the real-world one — install either engine, pull what its own users pull | scratchy vs **ollama** | engine **and** quantizer | A **and** B, `/v1/messages` |
-| **R2** "matched weights" | is scratchy's engine competitive when the weights are identical? | scratchy vs **mlx-lm** | engine only — the *same files*, at 4 bits | **A only**, `/v1/chat/completions` — mlx-lm has no Anthropic surface ([why](#r2-as-it-will-run--the-concrete-pair)) |
+| **R1** "what a user gets" | the real-world one — install either engine, pull what its own users pull | scratchy vs ollama | engine **and** quantizer | all three models, Lane A **and** B |
+| **R2** "matched weights" | how much of R1 was the engine | scratchy vs ollama | engine only — byte-identical weights, **at bf16** | `gemma-4-12b-it` only, and **prefill-side metrics only** ([why](#r2-is-a-prefill-side-control-not-a-decode-one)) |
 
 R1 is the headline. R2 keeps it from being dismissed as a quantizer comparison.
 
-**R2 runs against mlx-lm, not ollama, and T0.6 is why.** The original design put
-ollama on both rungs, assuming its `-mlx` tags carried the same mlx-community
-checkpoint scratchy loads. [The audit below](#r2--matched-weights) found they do
-not: they are ollama's own NVFP4/MXFP8 requantization. The only artifact ollama
-publishes that *is* byte-identical to a checkpoint scratchy can load is bf16, and
-a bf16 rung would answer a different question than the one R2 asks — see
-[Why R2 is not ollama at bf16](#why-r2-is-not-ollama-at-bf16). mlx-lm loads the
-**exact same files** scratchy loads, at 4 bits, and is already this project's
-parity comparator (`docs/BENCHMARKING.md` §4, which gates runs with
-`--parity-cmd "python -m mlx_lm.generate …"`).
+**Both rungs are ollama, and both are on `/v1/messages`.** The comparator set is
+deliberately limited to servers exposing the Anthropic Messages API (@starpit's
+call), because that is the only endpoint Claude Code speaks: a server that cannot
+answer it cannot be measured on this workload at all. That rules out **mlx-lm**,
+which was considered as R2's comparator precisely because it loads the *same*
+mlx-community 4-bit files scratchy does — its `do_POST` registers
+`/v1/completions`, `/v1/chat/completions` and `/chat/completions` only, and
+`/v1/messages` 404s. Recorded because it is the road not taken for a structural
+reason, not an oversight:
 
-**What this costs, stated plainly.** R2-against-mlx-lm *bounds scratchy's engine
-quality at matched weights*. It does **not** decompose R1's scratchy-vs-ollama gap
-into "engine" and "quantizer" parts — nothing available can, because ollama does
-not publish a 4-bit artifact matching scratchy's. So an R1 row is never quoted as
-an engine-only result, and the decomposition is listed as unavailable rather than
-estimated.
+| candidate for R2 | matched weights? | serves `/v1/messages`? | verdict |
+|---|---|---|---|
+| ollama `-mlx` tags, 4-bit | **no** — ollama's own NVFP4/MXFP8 ([audit](#r2--matched-weights)) | yes | ruled out: not the same checkpoint |
+| **ollama `gemma4:12b-mlx-bf16`** | **yes, byte-verified** | **yes** | **R2**, at bf16, caveated |
+| mlx-lm on the 4-bit checkpoint | yes — literally the same files | **no** | ruled out: cannot serve this workload |
+
+**What R2 costs, stated plainly.** bf16 is the only width at which ollama and
+scratchy can be given identical weights, so R2 pays for its weight match in
+*regime*: it moves 23.920 GB per token against 6.741 GB at 4 bits. That is a real
+limitation, not a formality, and it is written out under
+[R2 is a prefill-side control](#r2-is-a-prefill-side-control-not-a-decode-one)
+and repeated on every R2 row. R2 also reaches **one model of three**, so the two
+MoE models' R1 rows inherit their quantizer control by analogy from the dense
+sibling rather than directly — see
+[What R2 does not cover](#what-r2-does-not-cover).
 
 #### The scratchy side, pinned — the same on both rungs
 
@@ -231,7 +237,7 @@ rows, not just R2's.
 #### R2 — "matched weights"
 
 **Audited — T0.6, 2026-10-06. The `-mlx` tags are not mlx-community's
-checkpoint, which is why R2 runs against mlx-lm rather than ollama.** The tags
+checkpoint, which is why R2 runs at bf16 rather than at 4 bits.** The tags
 are ollama's *own* requantization of the same base models into
 **microscaling float** formats — NVFP4 and MXFP8 — not MLX affine int4. Read from
 each tag's registry manifest and its per-tensor safetensors `__metadata__`
@@ -273,75 +279,21 @@ describing the *base* model rather than the artifact. Only the per-tensor
 
 ##### R2 as it will run — the concrete pair
 
-**All three models, at 4 bits, on the files already pinned above.** mlx-lm reads
-the mlx-community repos directly, so "matched weights" is not an approximation
-here: both sides open the *same* `.safetensors`, at the revision the
-[scratchy table](#the-scratchy-side-pinned--the-same-on-both-rungs) pins.
+**One model, `gemma-4-12b-it`, bf16 on both sides, on `/v1/messages`.** This is
+the only pairing in which ollama and scratchy can be handed identical weights
+while both still serve the endpoint Claude Code speaks.
 
-| side | artifact | invocation |
+| side | artifact | build / invocation |
 |---|---|---|
-| scratchy | the three checkpoints and presets pinned above, unchanged | the `scr` builds in [Exact commands](#exact-commands) |
-| mlx-lm | **the identical repo @ identical revision** | `python -m mlx_lm.server --model <repo> --adapter-path ""`, pinned per `docs/BENCHMARKING.md` §4 |
+| scratchy | `mlx-community/gemma-4-12B-it-bf16` @ `afb7b215e9fe3b3eaef462b27d5c9d9b1ba0565b`, 23.920 GB of safetensors | **no quant preset named** — the dense/bf16 emission a preset would otherwise replace ([`BUILD.md`](BUILD.md)): `-F metal,serve,model/gemma-4-12b-it`, run with `-m mlx-community/gemma-4-12B-it-bf16` |
+| ollama | `gemma4:12b-mlx-bf16`, manifest `sha256:ae28af21156f7155ac3608617f0516c7a8acd8c9553f4192df9c2b5105770179`, pushed 2026-08-14, `requires 0.31.0` | `ollama run gemma4:12b-mlx-bf16` |
 
-Because the artifact is shared rather than merely equivalent, R2 needs no
-byte-equality proof — there is one file. That also lifts the restriction the
-bf16 fallback carried: **R2 covers the whole model set, not just the 12b**, since
-nothing here is 4× its quantized footprint.
+Because both sides answer `/v1/messages`, R2 keeps what the discarded mlx-lm
+option would have cost: it runs on **both lanes**, one client drives both engines
+with no per-engine adapter, and per-tool spans remain measurable at matched
+weights rather than being structurally out of reach.
 
-Three disclosures ride with this rung, and the third is a hard scope limit:
-
-1. **KV-cache dtype is still unmatched, and now it is the only *weights-adjacent*
-   axis that is.** `metal` implies `turboquant` while mlx-lm uses an uncompressed
-   cache — exactly the disclosure `docs/BENCHMARKING.md` §4 already carries, and
-   the same match-or-disclose resolution as
-   [item 1 below](#what-a-rung-does-not-pin).
-2. **Process shape differs** — scratchy is one static binary, mlx-lm is CPython
-   plus MLX (`docs/BENCHMARKING.md:199`). It bears on startup and RSS, not on
-   steady-state decode, and a published row says which.
-3. **R2 cannot run on `/v1/messages`, so it is Lane A only and spans-blind.**
-   `mlx_lm.server` serves `/v1/completions`, `/v1/chat/completions`,
-   `/chat/completions`, `/v1/models` and `/health`; **`/v1/messages` 404s** —
-   there is no Anthropic surface and no `anthropic-version` handling
-   (`mlx_lm/server.py`, `do_POST`'s `request_factories`). Three consequences,
-   none of which a weight match removes:
-   - **R2 is Lane A only.** Claude Code speaks the Anthropic API exclusively, so
-     the live driver cannot point at mlx-lm at all. Every R2 number is a replay
-     number; no R2 row may carry an outcome claim.
-   - **R2 must be driven on `/v1/chat/completions` on *both* sides**, scratchy
-     included, so the rung stays internally consistent. scratchy serves that
-     endpoint too (`crates/e2e/src/client.rs:92-188`), so this costs an adapter
-     in the replay client, not a second build.
-   - **R1 and R2 numbers are not cross-comparable**, because they are taken on
-     different endpoints with different request translation. R2 answers "is
-     scratchy's engine competitive at matched weights"; it cannot be subtracted
-     from an R1 row.
-
-   **And per-tool relocatable spans are unmeasurable on R2.** The spans path
-   exists only on `/v1/messages` (`crates/serving/api/src/anthropic.rs:431-436`),
-   so the one *specifically* Claude Code optimization in the tree is inert on the
-   matched-weights rung by construction. It is R1-only evidence, which is a
-   sharper constraint than the epic's "inert while prefix caching is off" note for
-   qwen — that one is architectural, this one is endpoint-structural.
-
-   This revises the epic's stated foundation. #158 says both engines expose
-   `/v1/messages`, "so one client measures both with no per-engine adapter — that
-   is the fact the whole method rests on." It holds for **R1**, where both
-   engines do; it does not hold for R2's comparator, and the replay client needs
-   an OpenAI-compatible target it was not specified to have (a knock-on for
-   #164's T2.1).
-
-###### Why R2 is not ollama at bf16
-
-The audit *did* find one ollama artifact byte-identical to a checkpoint scratchy
-can load, and it is recorded here because identifying it is what ruled it out —
-not because a number will be quoted from it.
-
-| side | artifact |
-|---|---|
-| scratchy | `mlx-community/gemma-4-12B-it-bf16` @ `afb7b215e9fe3b3eaef462b27d5c9d9b1ba0565b`, 23.920 GB, **no quant preset named** ([`BUILD.md`](BUILD.md)) |
-| ollama | `gemma4:12b-mlx-bf16`, manifest `sha256:ae28af21156f7155ac3608617f0516c7a8acd8c9553f4192df9c2b5105770179`, pushed 2026-08-14, `requires 0.31.0` |
-
-The match is real and verified by bytes, not by size. Summing the tag's non-`draft`
+**The pair is verified by bytes, not by size.** Summing the tag's non-`draft`
 tensor blobs gives 23,919,548,728 B against the HF repo's 23,919,548,177 B — 551 B
 apart on 23.92 GB, which is safetensors header overhead (ollama stores one
 single-tensor file per tensor, HF five sharded headers). Byte-equality was then
@@ -349,39 +301,66 @@ confirmed on three tensors drawn from three *different* HF shards, by range-read
 each shard at its header's `data_offsets` and SHA-256'ing that payload against the
 corresponding ollama blob's. Names differ by scheme — ollama keeps upstream's
 `model.language_model.…`, mlx-community remaps to `language_model.model.…` — so
-both are given:
+both are given, since re-verification needs them:
 
 | tensor (ollama name / mlx-community name) | dtype / shape | SHA-256 (both sides) |
 |---|---|---|
 | `model.language_model.layers.0.self_attn.k_proj.weight` / `language_model.model.layers.0.self_attn.k_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `079b15ff2455b027198ec39c…` |
 | `model.language_model.layers.30.self_attn.v_proj.weight` / `language_model.model.layers.30.self_attn.v_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `1b7fa0c2b32c86752fed90b2…` |
-| **final** norm — `model.language_model.norm.weight` / `language_model.model.norm.weight` (*not* a per-layer `norm.weight`) | `BF16 [3840]`, 7,680 B | `d059a0bcfebeba413a5fd8d6…` |
+| **final** norm — `model.language_model.norm.weight` / `language_model.model.norm.weight` (*not* one of the per-layer `norm.weight` tensors) | `BF16 [3840]`, 7,680 B | `d059a0bcfebeba413a5fd8d6…` |
 
-**Why it is not the rung.** Decode on Metal is bandwidth-bound — a dense model
-reads every weight once per token — and this pair moves **23.920 GB per token
-against 6.741 GB at 4 bits, a 3.55× increase in traffic** (both figures measured,
-from the table above and the 4-bit repo). Two engines pinned against the memory
-wall converge, so the row would largely report the weight format rather than the
-engine, which is the one thing R2 exists to isolate. It is also a configuration no
-scratchy user runs. The honest reading is narrower than "engine only": at bf16,
-*decode* is uninformative. Prefill is compute-bound, so it degrades less — and
-this epic's workload is prefill-heavy — but that is an argument for a targeted
-prefill experiment, not for a rung.
+###### R2 is a prefill-side control, not a decode one
 
-Two further reasons it could not have been the rung as written: it reaches **one
-model of three** (`gemma4:26b-mlx-bf16` is 52.52 GB and
-`qwen3.6:35b-a3b-mlx-bf16` is 71.92 GB, the latter past this host's 64 GB before
-any KV cache), and it still changes ollama's **engine** as well as its weights —
-R1's tags are `gguf`/llama.cpp, every `-mlx` tag is `safetensors` with
-`requires ≥ 0.31.0`. So a delta across it would mix engine with format.
+**This caveat travels on every R2 row.** bf16 is the only width at which the two
+engines can be given identical weights, and that match is paid for in regime: the
+pair moves **23.920 GB per token against 6.741 GB at 4 bits, a 3.55× increase in
+weight traffic** (both measured — the table above and the 4-bit repo).
 
-**If it is ever run,** it is labelled a bf16 bandwidth-bound control, never "R2",
-and it carries the two paragraphs above. Its footprint is 24.83 GB for the tag
-against 23.95 GB for scratchy's side — the difference is the draft model plus two
-32 MB tokenizers.
+Decode reads every weight of a dense model once per token, so on Metal it is
+bandwidth-bound. Two engines pinned against the memory wall converge, and an R2
+decode number would largely report the weight format rather than the engine —
+which is the one thing R2 exists to isolate. **Prefill is compute-bound**, so it
+does not collapse the same way, and this workload is overwhelmingly prefill: the
+epic's premise is a 10k+ token prompt re-sent in full every turn. So the split is
+not a hedge, it is where the rung is and is not readable:
 
-Speculative decoding is a disclosure on **both** rungs and on this control; it is
-written out once below.
+| R2 metric | readable? |
+|---|---|
+| TTFT, re-prefill cost by turn index, prefix-cache hit effect, spans effect | **yes** — prefill is compute-bound |
+| TPOT, ITL, steady-state tok/s | **no** — quote R1 for these; at bf16 both engines are bandwidth-saturated |
+| outcome / task completion (Lane B) | yes, but see the spec-decode disclosure below |
+
+A published R2 row carries this table's verdict for the metric it reports. bf16 is
+also a configuration no scratchy user runs, so no R2 figure is ever presented as
+"what a user gets" — that is R1's job, and R1 is the headline.
+
+###### What R2 does not cover
+
+**One model of three.** The bf16 artifacts for the other two are
+`gemma4:26b-mlx-bf16` at 52.52 GB and `qwen3.6:35b-a3b-mlx-bf16` at 71.92 GB —
+the latter past this host's 64 GiB outright, before any KV cache. So R2 lands on
+the dense 12b, and **the two MoE models' R1 rows inherit their quantizer control
+by analogy rather than directly.** If an R1 result on the 26b or qwen is
+challenged as a quantizer artifact, the strict rebuttal covers the 12b only and
+the MoE case rests on the quantizer effect measured on a dense sibling carrying
+over. That is weaker than silence would imply, so it is stated here rather than
+left to a reader to notice.
+
+**It changes ollama's engine as well as its weights.** R1's tags are
+`model_format: gguf` / `file_type: Q4_K_M` (llama.cpp); every `-mlx` and
+`-mlx-bf16` tag is `model_format: safetensors` with `requires ≥ 0.31.0` (ollama's
+MLX engine). An R1→R2 delta on ollama's side therefore mixes a format change with
+an engine change, and both are named on the row.
+
+**KV-cache dtype stays unmatched.** `metal` implies `turboquant` and the codec is
+fixed at build time; matching it would mean a second build, not a flag. Same
+match-or-disclose resolution as [item 1 below](#what-a-rung-does-not-pin).
+
+**Footprint.** 24.83 GB on disk for the tag against 23.95 GB for scratchy's side —
+the difference is the bundled draft model plus two 32 MB tokenizers.
+
+Speculative decoding is a disclosure on **both** rungs; it is written out once
+below.
 
 ##### Speculative decoding on the ollama side
 
@@ -443,8 +422,8 @@ are not in the file. Any qwen MTP comparison needs a checkpoint that retains the
 that is a checkpoint problem before it is a scratchy feature request.
 
 **What it would take to put *ollama* on a matched-weights rung, recorded so it is
-not re-derived.** Not required for R2, which runs against mlx-lm — this is the
-cost of the decomposition R1 cannot give. scratchy already has an `nvfp4` preset
+not re-derived.** This is what it would take to move R2 off bf16 and onto the
+4-bit regime users actually run. scratchy already has an `nvfp4` preset
 at `group_size 16`, matching ollama's, but only the `llama` arch declares it, and
 there is no MXFP8 support in the tree at all
 (`crates/models/quantization/presets/nvfp4.json`,
@@ -550,11 +529,9 @@ an estimate.
 | cell | blocked on | resolved by |
 |---|---|---|
 | ~~R1, ollama side — tag digest and the quantization each default tag carries~~ | — | **resolved, T0.6**: all three are `gguf`/`Q4_K_M`; digests and sizes recorded in [R1](#r1--what-a-user-gets) and [R2](#how-this-was-established-and-how-to-re-verify-it) |
-| ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — ollama's own NVFP4/MXFP8 requantization, so ollama cannot supply matched 4-bit weights. R2 re-scoped to **scratchy vs mlx-lm** on the shared mlx-community checkpoint, all three models |
-| whether mlx-lm loads the three pinned checkpoints, and its pinned version | phase 4 setup | `mlx_lm.server` against each repo; T0.6 identified artifacts, it served nothing |
-| an OpenAI-compatible target in the replay client, for R2 | **#164 T2.1** | mlx-lm has no `/v1/messages`, so R2 needs `/v1/chat/completions` on both sides — the client was specified for the Anthropic path only |
-| R1-vs-R2 comparability | **not resolvable** | different endpoints and different request translation; each rung is read on its own, and no R2 figure is subtracted from an R1 row |
-| a matched-weights measurement of **per-tool spans** | **not resolvable** | spans exist only on `/v1/messages`, which R2's comparator does not serve — spans are R1-only evidence |
+| ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — ollama's own NVFP4/MXFP8 requantization. R2 therefore runs at **bf16** on `gemma-4-12b-it`, the one pairing with byte-identical weights on both sides that still serves `/v1/messages`; prefill-side metrics only |
+| whether either engine loads R2's pair | phase 4 setup | pulling `gemma4:12b-mlx-bf16` and building scratchy's no-preset bf16 `gemma-4-12b-it`; T0.6 identified the artifacts, it served nothing |
+| a matched-weights control for the **two MoE models** | **not resolvable on this host** | their bf16 artifacts are 52.52 GB and 71.92 GB; the MoE R1 rows inherit the 12b's quantizer control by analogy, disclosed per row |
 | does `ollama create` preserve an mlx-community affine-int4 checkpoint? | open — cheap to test | if it does, ollama rejoins a matched-weights rung at 4 bits; if it requantizes, the path is closed. Read the resulting manifest's per-tensor `__metadata__` |
 | does ollama's MLX engine draft when `draft_num_predict` is **unset**? | **T0.4** | every `-mlx` tag ships draft weights with the knob unset; unset is not off. Measure it — a manifest cannot answer it |
 | ollama spec decode — disabled, or measured and disclosed, on **R1**? | **T0.4** + phase 4's spec-decode ablation | all three default tags set `draft_num_predict` 2–3; prefer overriding it on the default tag over switching to the older non-MTP builds |
