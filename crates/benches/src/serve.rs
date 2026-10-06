@@ -147,6 +147,7 @@ fn send_request(
     let mut buf = String::new();
     let mut usage_completion_tokens: Option<usize> = None;
     let mut chunks = 0usize;
+    let mut last_choices_time: Option<Instant> = None;
 
     loop {
         let n = match reader.read(&mut chunk) {
@@ -169,14 +170,17 @@ fn send_request(
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
                 {
-                    // Match Python's TTFT/ITL logic exactly:
-                    // - First chunk with `choices` → TTFT
-                    // - Every subsequent chunk with `choices` → ITL
-                    // - `most_recent_timestamp` updated on every choices chunk
-                    if parsed
-                        .get("choices")
-                        .is_some_and(|c| c.as_array().is_some_and(|a| !a.is_empty()))
-                    {
+                    // Python's TTFT/ITL logic, counting only chunks that carry text:
+                    // - First chunk with text → TTFT
+                    // - Every subsequent chunk with text → ITL
+                    // - `most_recent_timestamp` updated on every chunk with text
+                    // An empty chunk is not a token: oMLX streams empty keepalive
+                    // chunks while it prefills, and llama.cpp closes with one, so
+                    // timing any chunk put TTFT before the prefill was done.
+                    if has_choices(&parsed) {
+                        last_choices_time = Some(Instant::now());
+                    }
+                    if chunk_has_text(&parsed) {
                         let now = Instant::now();
                         chunks += 1;
                         if first_token_time.is_none() {
@@ -185,12 +189,26 @@ fn send_request(
                             itl.push(now.duration_since(last_token_time).as_secs_f64());
                         }
                         last_token_time = now;
-                    } else if let Some(ct) = parsed["usage"]["completion_tokens"].as_u64() {
+                    }
+                    // Usage can ride on any chunk: llama.cpp sends it on its
+                    // last one, which also has `choices`.
+                    if let Some(ct) = parsed["usage"]["completion_tokens"].as_u64() {
                         usage_completion_tokens = Some(ct as usize);
                     }
                 }
             }
         }
+    }
+
+    // No chunk carried text, but the server did answer: mlx_lm.server holds
+    // back undecodable bytes and flushes one empty final chunk. Time that one
+    // chunk, as before, so the request reads as unstreamed, not failed.
+    if first_token_time.is_none()
+        && let Some(t) = last_choices_time
+    {
+        first_token_time = Some(t);
+        last_token_time = t;
+        chunks = 1;
     }
 
     // Prefer server-reported token count.
@@ -213,6 +231,23 @@ fn send_request(
         start_time,
         success: first_token_time.is_some(),
     }
+}
+
+fn has_choices(chunk: &serde_json::Value) -> bool {
+    chunk
+        .get("choices")
+        .is_some_and(|c| c.as_array().is_some_and(|a| !a.is_empty()))
+}
+
+/// Whether a streamed chunk carries generated text: `text` on the completions
+/// API, `delta.content` on chat. Keepalive and closing chunks carry none.
+fn chunk_has_text(chunk: &serde_json::Value) -> bool {
+    let Some(first) = chunk["choices"].as_array().and_then(|a| a.first()) else {
+        return false;
+    };
+    [&first["text"], &first["delta"]["content"]]
+        .iter()
+        .any(|t| t.as_str().is_some_and(|s| !s.is_empty()))
 }
 
 /// A request whose whole multi-token output arrived in one `choices` chunk
@@ -874,6 +909,28 @@ fn compute_peak_concurrent(results: &[&RequestResult]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_chunks_with_text_are_tokens() {
+        let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // oMLX's keepalive while it prefills, and llama.cpp's closing chunk.
+        assert!(!chunk_has_text(&c(
+            r#"{"model":"keepalive","choices":[{"index":0,"text":""}]}"#
+        )));
+        assert!(!chunk_has_text(&c(
+            r#"{"choices":[{"text":"","finish_reason":"length"}],"usage":{"completion_tokens":5}}"#
+        )));
+        assert!(!chunk_has_text(&c(
+            r#"{"choices":[],"usage":{"completion_tokens":4}}"#
+        )));
+        assert!(chunk_has_text(&c(
+            r#"{"choices":[{"index":0,"text":" four"}]}"#
+        )));
+        assert!(chunk_has_text(&c(
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#
+        )));
+        assert!(has_choices(&c(r#"{"choices":[{"text":""}]}"#)));
+    }
 
     fn req(output_tokens: usize, chunks: usize, ttft: f64, e2el: f64) -> RequestResult {
         RequestResult {
