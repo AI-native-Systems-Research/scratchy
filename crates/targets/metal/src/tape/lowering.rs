@@ -4388,10 +4388,17 @@ fn lower_one(
                 gemm_dims: None,
             });
 
-            // A decode-sized bucket with head_k a multiple of 32: the gating and the scan run as one
-            // command, mlx-lm's simdgroup-per-value-dim mapping (`gdn_scan_simd`); then the norm.
-            let simd_scan =
-                bucket_m <= GDN_SIMD_SCAN_ROWS && hk.is_multiple_of(32) && hv.is_multiple_of(4);
+            // head_k a multiple of 32: the gating and the scan run as one
+            // command, mlx-lm's simdgroup-per-value-dim mapping
+            // (`gdn_scan_simd`); then the norm. Used at EVERY bucket size,
+            // prefill included: the mapping is sequence-serial either way, but
+            // a simdgroup's 32 lanes split head_k (4 state elements per lane,
+            // dots via `simd_sum`) where `gdn_scan_varlen`'s CUDA-faithful
+            // mapping runs SIX serial head_k loops per token in ONE thread —
+            // measured 505 ms of a 788 ms Qwen3.6-35B 2048-token prefill
+            // forward (64%, ~8 µs/token/layer) on the per-thread kernel.
+            // Non-divisible geometries fall back to the varlen kernel.
+            let simd_scan = hk.is_multiple_of(32) && hv.is_multiple_of(4);
             let scan_constants = || {
                 baked(vec![
                     ConstantValue::uint(0, nk),
@@ -5297,10 +5304,6 @@ fn gdn_gating_static_name(dtype: DequantDtype) -> &'static str {
         DequantDtype::Bf16 => "gdn_gating_bf16",
     }
 }
-
-/// The buckets whose Gated-DeltaNet scan runs simdgroup-per-value-dim (`gdn_scan_simd`): a step
-/// this small holds a token per sequence, or a few, and is latency-bound on the per-thread scan.
-const GDN_SIMD_SCAN_ROWS: u32 = 8;
 
 fn gdn_scan_simd_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
