@@ -183,9 +183,9 @@ preset supplies only the global default.** The precedence chain is
 
 | model | scratchy | ollama | tag carries (read 2026-10-06, **T0.6**) |
 |---|---|---|---|
-| `gemma-4-12b-it` | as pinned above | `gemma4:12b` | `gguf` / `Q4_K_M`, 8.02 GB, **+ a GGUF draft model** |
-| `gemma-4-26b-a4b-it` | as pinned above | `gemma4:26b` | `gguf` / `Q4_K_M`, 18.73 GB, **+ a 462 MB GGUF draft model** + a 1.19 GB vision projector |
-| `qwen3.6-35b-a3b` | as pinned above | `qwen3.6:35b` | `gguf` / `Q4_K_M`, 22.62 GB, no draft model |
+| `gemma-4-12b-it` | as pinned above | `gemma4:12b` | `gguf` / `Q4_K_M`, 8.02 GB, + a 0.47 GB GGUF draft model, **`draft_num_predict 3`** |
+| `gemma-4-26b-a4b-it` | as pinned above | `gemma4:26b` | `gguf` / `Q4_K_M`, 18.73 GB, + a 0.46 GB GGUF draft model and a 1.19 GB vision projector, **`draft_num_predict 3`** |
+| `qwen3.6-35b-a3b` | as pinned above | `qwen3.6:35b` | `gguf` / `Q4_K_M`, 22.62 GB, native MTP head inside the GGUF, **`draft_num_predict 2`** |
 
 Digests for all three are in
 [R2's table below](#how-this-was-established-and-how-to-re-verify-it). **T0.4**
@@ -195,9 +195,12 @@ pinned engine version, and the no-truncation proof).
 The two sides load checkpoints produced by **different quantizers**
 (mlx-community affine 4-bit against ollama's default GGUF `Q4_K_M`). That is
 disclosed on every R1 row rather than normalised away: R1 answers "what does a
-user get", and only R2 isolates the engine. Two of the three default tags also
-ship a trained draft model that scratchy has no equivalent of — see R2's
-disclosure 1, which applies to R1 identically.
+user get", and only R2 isolates the engine. **All three default tags are also
+speculative-decoding builds with the feature switched on**, which scratchy's side
+has no equivalent of — see
+[Speculative decoding on the ollama side](#speculative-decoding-on-the-ollama-side).
+It is the largest single fairness item this audit found, and it bears on R1's
+rows, not just R2's.
 
 #### R2 — "matched weights"
 
@@ -270,20 +273,12 @@ payload against the corresponding ollama blob's payload:
 
 Three disclosures ride with this pair, none of which the weight match removes:
 
-1. **ollama's tag carries a draft model; scratchy's build has no equivalent.**
-   0.846 GB of bf16 under the `draft.` prefix, architecture
-   `Gemma4AssistantForCausalLM`, wired as `draft` in the tag's config blob — so
-   **speculative decoding is on by default on ollama's side**, with a *trained*
-   draft model rather than scratchy's n-gram. This is true on **both** rungs: the
-   R1 GGUF tags `gemma4:12b` and `gemma4:26b` ship a `image.draft` layer too
-   (462 MB on the 26b). It must be disabled or disclosed on every row, and it is
-   what phase 4's spec-decode ablation is actually measured against.
-   The qwen tags carry no `draft` entry, but `qwen3.6:35b-mlx` ships a **1.690 GB
-   bf16 `mtp` multi-token-prediction head** — the same capability by another
-   mechanism, and ollama publishes separate `qwen3.6:35b-a3b-mtp-*` GGUF tags,
-   which implies the plain `qwen3.6:35b` does not carry one. Whether the engine
-   actually *uses* either is a runtime question for **T0.4**, not a manifest one;
-   what T0.6 establishes is that the capability is in the artifact.
+1. **ollama ships speculative decoding, and on R1 it is explicitly switched on.**
+   See [Speculative decoding on the ollama side](#speculative-decoding-on-the-ollama-side)
+   below — it is a disclosure for R2 and a **correction to R1**, so it is written
+   out once rather than squeezed into this list. The short form: every default tag
+   sets `draft_num_predict` 2–3 in its `params` blob, and scratchy has no
+   equivalent enabled.
 2. **R2 changes ollama's engine, not only its weights.** R1's tags are
    `model_format: gguf` / `file_type: Q4_K_M` (llama.cpp); every `-mlx` and
    `-mlx-bf16` tag is `model_format: safetensors` with `requires ≥ 0.31.0`
@@ -293,6 +288,57 @@ Three disclosures ride with this pair, none of which the weight match removes:
 3. **Footprint.** 24.83 GB on disk for the tag against 23.95 GB for scratchy's
    side (the difference is the draft model plus two 32 MB tokenizers), at 2 bytes
    per parameter rather than 4 bits.
+
+##### Speculative decoding on the ollama side
+
+This belongs to T0.6 because it is a property of the *artifacts*, and it lands on
+**R1 as much as R2**. **Every default tag in this comparison is a
+speculative-decoding build with the feature switched on**, by two different
+mechanisms, and scratchy's side has no equivalent enabled.
+
+The switch is `draft_num_predict` in each tag's `params` blob; the machinery is
+either a bundled draft model or the model's own multi-token-prediction head:
+
+| ollama tag | rung | machinery the artifact carries | `draft_num_predict` |
+|---|---|---|---|
+| `gemma4:12b` | R1 | GGUF draft model, 0.47 GB | **3** |
+| `gemma4:26b` | R1 | GGUF draft model, 0.46 GB (`Gemma4AssistantForCausalLM`) | **3** |
+| `qwen3.6:35b` | R1 | native **MTP** head, inside the GGUF | **2** |
+| `gemma4:12b-mlx` | — | bf16 draft model, 0.85 GB | unset |
+| `gemma4:26b-mlx` | — | bf16 draft model, 0.84 GB | unset |
+| `qwen3.6:35b-mlx` | — | native **MTP** head, 1.69 GB bf16 | unset |
+| **`gemma4:12b-mlx-bf16`** | **R2** | bf16 draft model, 0.85 GB | **unset** |
+
+Two things follow, and they differ by rung:
+
+- **On R1 it is on, explicitly.** `draft_num_predict` is set on all three default
+  tags. A phase-4 row that compares scratchy with n-gram spec decode *off*
+  against these tags is comparing against an engine drafting 2–3 tokens a step
+  with a trained drafter. That inverts the sign of the spec-decode ablation.
+- **On R2 the weights ship but the knob is unset** on every `-mlx` tag, R2's pair
+  included. Unset is not the same as off — it may fall through to an engine
+  default — so **this is a runtime question T0.4 must answer by measuring, not by
+  reading the manifest.** T0.6's claim stops at what the artifact contains.
+
+**`-mtp-` is a tag-naming convention, not a separate option, and the defaults
+resolve to it.** `qwen3.6:35b` and `qwen3.6:35b-a3b-mtp-q4_K_M` share config
+digest `sha256:99afa5bbf1e7…` with byte-identical layers; `gemma4:26b` and
+`gemma4:26b-a4b-it-mtp-q4_K_M` share `sha256:cd16db7156ed…`. **The default tag
+*is* the MTP build in both cases.** Non-spec-decode builds do exist —
+`gemma4:26b-a4b-it-q4_K_M` (`draft: null`, no draft layer) and
+`qwen3.6:35b-a3b-q4_K_M` — but they are *different and older* builds
+(`model_type` 25.8B vs 25.2B, `requires 0.20.0` vs `0.30.9`), so swapping to them
+changes more than the one variable. Prefer setting `draft_num_predict` on the
+default tag to switching tags.
+
+**scratchy cannot match qwen's MTP on the checkpoint it loads, and not because of
+the engine.** Upstream `Qwen/Qwen3.6-35B-A3B` ships the head — 19 tensors under
+`mtp.{fc,layers,norm,pre_fc_norm_embedding,pre_fc_norm_hidden}` — and ollama's
+`-mlx` tag preserves all of it. **mlx-community's conversions drop it: 0 of 19 in
+both `Qwen3.6-35B-A3B-4bit` and `-bf16`**, while the `config.json` they ship still
+declares `mtp_num_hidden_layers: 1`. So the config advertises a head whose weights
+are not in the file. Any qwen MTP comparison needs a checkpoint that retains them;
+that is a checkpoint problem before it is a scratchy feature request.
 
 **The pair cannot extend to the other two models, and now there are numbers for
 why.** `gemma4:26b-mlx-bf16` is 52.52 GB and `qwen3.6:35b-a3b-mlx-bf16` is
@@ -406,7 +452,8 @@ an estimate.
 | ~~R1, ollama side — tag digest and the quantization each default tag carries~~ | — | **resolved, T0.6**: all three are `gguf`/`Q4_K_M`; digests and sizes recorded in [R1](#r1--what-a-user-gets) and [R2](#how-this-was-established-and-how-to-re-verify-it) |
 | ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — they are ollama's own NVFP4/MXFP8 requantization, so 4-bit R2 does not exist. The fallback took effect and R2 now names a pinned, byte-verified pair on `gemma-4-12b-it` |
 | whether either engine actually loads R2's pair | phase 4 setup | pulling `gemma4:12b-mlx-bf16` and building scratchy's no-preset bf16 `gemma-4-12b-it`; T0.6 identified the artifacts, it did not serve them |
-| ollama's draft model — disabled, or measured and disclosed? | **T0.4** + phase 4's spec-decode ablation | R2 disclosure 1: two of three default tags and every `gemma4` `-mlx` tag ship a trained draft model |
+| does ollama's MLX engine draft when `draft_num_predict` is **unset**? | **T0.4** | R2's pair ships draft weights with the knob unset; unset is not off. Measure it — a manifest cannot answer it |
+| ollama spec decode — disabled, or measured and disclosed, on **R1**? | **T0.4** + phase 4's spec-decode ablation | all three default tags set `draft_num_predict` 2–3; prefer overriding it on the default tag over switching to the older non-MTP builds |
 | ollama context length, parallelism, keep-alive, pinned version | **T0.4** | the one-page "ollama configuration as tested" note |
 | no-truncation proof on both sides | **T0.4** + the phase 2 harness | per-turn token accounting in the replay client and the live driver |
 | KV-quant deferral and its layer-coverage evidence | **T0.8** | the [Scope and deferrals](#scope-and-deferrals) section above |
