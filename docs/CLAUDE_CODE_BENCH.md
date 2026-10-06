@@ -18,7 +18,7 @@ is a defect: a later reader cannot tell silence from a tested claim.
 | [Method and metrics](#method-and-metrics) | owned by the agreed method, not restated here |
 | [Exact commands](#exact-commands) | scratchy side recorded; ollama side **T0.4** |
 | [Results](#results) | empty — phase 4 |
-| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5**; R2's pair audited and pinned — **T0.6** |
+| [Quantization rungs](#quantization-rungs--r1-and-r2) | **recorded — T0.5**; R2 re-scoped to mlx-lm and pinned — **T0.6** |
 | [Blocked](#blocked) | recorded |
 | [Artifacts](#artifacts) | empty — phase 4 |
 
@@ -75,8 +75,9 @@ file carries only what is specific to a run.
 
 ### Exact commands
 
-**scratchy — identical on both rungs**, because a rung changes only what ollama
-loads. `serve_argv` (`crates/cli/scr/src/commands/launch.rs:226-295`) is what
+**scratchy — identical on both rungs**, because a rung changes the *comparator*
+and the weights it loads, never scratchy's side.
+`serve_argv` (`crates/cli/scr/src/commands/launch.rs:226-295`) is what
 turns these into the spawned server's argv, so what is written here is what the
 server gets:
 
@@ -101,10 +102,18 @@ One model per binary on purpose: naming `model/all` forward-expands every config
 in scope ([`BUILD.md`](BUILD.md)), which is minutes-to-hours and an OOM risk on a
 laptop.
 
-**ollama — T0.4.** The tags are named per rung below; the environment that must
-accompany them (`OLLAMA_CONTEXT_LENGTH`, `OLLAMA_NUM_PARALLEL`,
-`OLLAMA_KEEP_ALIVE`, the pinned version, and what `ollama launch claude` puts in
-Claude Code's environment) is T0.4's one-page note and is not guessed here.
+**ollama — R1's comparator, T0.4.** The tags are named per rung below; the
+environment that must accompany them (`OLLAMA_CONTEXT_LENGTH`,
+`OLLAMA_NUM_PARALLEL`, `OLLAMA_KEEP_ALIVE`, the pinned version, and what
+`ollama launch claude` puts in Claude Code's environment) is T0.4's one-page note
+and is not guessed here.
+
+**mlx-lm — R2's comparator.** It serves the *same* checkpoint files scratchy
+loads, so there is nothing to pin on the weights beyond the revisions already in
+the [scratchy table](#the-scratchy-side-pinned--the-same-on-both-rungs). Its own
+version, sampling flags and the `--parity-cmd` form are `docs/BENCHMARKING.md`
+§4's, reused rather than redefined here; the pinned version is listed as open
+under [Blocked](#blocked).
 
 ## Results
 
@@ -126,13 +135,30 @@ Both engines are asked to run "the same model". But the file each one loads was
 output. One comparison therefore cannot separate the engine from the quantizer,
 so the comparison runs two rungs:
 
-| rung | the question it answers | what differs between the engines |
-|---|---|---|
-| **R1** "what a user gets" | the real-world one — install either engine, pull what its own users pull | engine **and** quantizer |
-| **R2** "matched weights" | how much of R1 was the engine | engine only: the same mlx 4-bit weights on both sides |
+| rung | the question it answers | engines | what differs |
+|---|---|---|---|
+| **R1** "what a user gets" | the real-world one — install either engine, pull what its own users pull | scratchy vs **ollama** | engine **and** quantizer |
+| **R2** "matched weights" | is scratchy's engine competitive when the weights are identical? | scratchy vs **mlx-lm** | engine only — the *same files*, at 4 bits |
 
-R1 is the headline. R2 is what stops every R1 number from being dismissed as a
-quantizer comparison.
+R1 is the headline. R2 keeps it from being dismissed as a quantizer comparison.
+
+**R2 runs against mlx-lm, not ollama, and T0.6 is why.** The original design put
+ollama on both rungs, assuming its `-mlx` tags carried the same mlx-community
+checkpoint scratchy loads. [The audit below](#r2--matched-weights) found they do
+not: they are ollama's own NVFP4/MXFP8 requantization. The only artifact ollama
+publishes that *is* byte-identical to a checkpoint scratchy can load is bf16, and
+a bf16 rung would answer a different question than the one R2 asks — see
+[Why R2 is not ollama at bf16](#why-r2-is-not-ollama-at-bf16). mlx-lm loads the
+**exact same files** scratchy loads, at 4 bits, and is already this project's
+parity comparator (`docs/BENCHMARKING.md` §4, which gates runs with
+`--parity-cmd "python -m mlx_lm.generate …"`).
+
+**What this costs, stated plainly.** R2-against-mlx-lm *bounds scratchy's engine
+quality at matched weights*. It does **not** decompose R1's scratchy-vs-ollama gap
+into "engine" and "quantizer" parts — nothing available can, because ollama does
+not publish a 4-bit artifact matching scratchy's. So an R1 row is never quoted as
+an engine-only result, and the decomposition is listed as unavailable rather than
+estimated.
 
 #### The scratchy side, pinned — the same on both rungs
 
@@ -205,8 +231,8 @@ rows, not just R2's.
 #### R2 — "matched weights"
 
 **Audited — T0.6, 2026-10-06. The `-mlx` tags are not mlx-community's
-checkpoint, so R2 at 4 bits does not exist and the pre-declared fallback takes
-effect.** The tags are ollama's *own* requantization of the same base models into
+checkpoint, which is why R2 runs against mlx-lm rather than ollama.** The tags
+are ollama's *own* requantization of the same base models into
 **microscaling float** formats — NVFP4 and MXFP8 — not MLX affine int4. Read from
 each tag's registry manifest and its per-tensor safetensors `__metadata__`
 (method below; no full pull required):
@@ -247,47 +273,83 @@ describing the *base* model rather than the artifact. Only the per-tensor
 
 ##### R2 as it will run — the concrete pair
 
-The pre-declared fallback, now pinned to artifacts. **One model, `gemma-4-12b-it`,
-bf16 on both sides** — and better than the fallback anticipated: not "bf16 against
-f16-GGUF" but bf16 against bf16, in the same MLX-native safetensors, with no GGUF
-quantizer anywhere in the comparison.
+**All three models, at 4 bits, on the files already pinned above.** mlx-lm reads
+the mlx-community repos directly, so "matched weights" is not an approximation
+here: both sides open the *same* `.safetensors`, at the revision the
+[scratchy table](#the-scratchy-side-pinned--the-same-on-both-rungs) pins.
 
-| side | artifact | build / invocation |
+| side | artifact | invocation |
 |---|---|---|
-| scratchy | `mlx-community/gemma-4-12B-it-bf16` @ `afb7b215e9fe3b3eaef462b27d5c9d9b1ba0565b`, 23.920 GB of safetensors | **no quant preset named** — the dense/bf16 emission a preset would otherwise replace ([`BUILD.md`](BUILD.md)): `-F metal,serve,model/gemma-4-12b-it` |
-| ollama | `gemma4:12b-mlx-bf16`, manifest `sha256:ae28af21156f7155ac3608617f0516c7a8acd8c9553f4192df9c2b5105770179`, pushed 2026-08-14, `requires 0.31.0` | `ollama run gemma4:12b-mlx-bf16` |
+| scratchy | the three checkpoints and presets pinned above, unchanged | the `scr` builds in [Exact commands](#exact-commands) |
+| mlx-lm | **the identical repo @ identical revision** | `python -m mlx_lm.server --model <repo> --adapter-path ""`, pinned per `docs/BENCHMARKING.md` §4 |
 
-**This pair is verified by bytes, not by size.** Summing the tag's non-`draft`
+Because the artifact is shared rather than merely equivalent, R2 needs no
+byte-equality proof — there is one file. That also lifts the restriction the
+bf16 fallback carried: **R2 covers the whole model set, not just the 12b**, since
+nothing here is 4× its quantized footprint.
+
+Two disclosures ride with this rung:
+
+1. **KV-cache dtype is still unmatched, and now it is the only axis that is.**
+   `metal` implies `turboquant` while mlx-lm uses an uncompressed cache — exactly
+   the disclosure `docs/BENCHMARKING.md` §4 already carries, and the same
+   match-or-disclose resolution as [item 1 below](#what-a-rung-does-not-pin).
+2. **Process shape differs** — scratchy is one static binary, mlx-lm is CPython
+   plus MLX (`docs/BENCHMARKING.md:199`). It bears on startup and RSS, not on
+   steady-state decode, and a published row says which.
+
+###### Why R2 is not ollama at bf16
+
+The audit *did* find one ollama artifact byte-identical to a checkpoint scratchy
+can load, and it is recorded here because identifying it is what ruled it out —
+not because a number will be quoted from it.
+
+| side | artifact |
+|---|---|
+| scratchy | `mlx-community/gemma-4-12B-it-bf16` @ `afb7b215e9fe3b3eaef462b27d5c9d9b1ba0565b`, 23.920 GB, **no quant preset named** ([`BUILD.md`](BUILD.md)) |
+| ollama | `gemma4:12b-mlx-bf16`, manifest `sha256:ae28af21156f7155ac3608617f0516c7a8acd8c9553f4192df9c2b5105770179`, pushed 2026-08-14, `requires 0.31.0` |
+
+The match is real and verified by bytes, not by size. Summing the tag's non-`draft`
 tensor blobs gives 23,919,548,728 B against the HF repo's 23,919,548,177 B — 551 B
 apart on 23.92 GB, which is safetensors header overhead (ollama stores one
 single-tensor file per tensor, HF five sharded headers). Byte-equality was then
-confirmed directly on three tensors drawn from three different HF shards, by
-range-reading each shard at its header's `data_offsets` and SHA-256'ing the
-payload against the corresponding ollama blob's payload:
+confirmed on three tensors drawn from three *different* HF shards, by range-reading
+each shard at its header's `data_offsets` and SHA-256'ing that payload against the
+corresponding ollama blob's. Names differ by scheme — ollama keeps upstream's
+`model.language_model.…`, mlx-community remaps to `language_model.model.…` — so
+both are given:
 
-| tensor | dtype / shape | SHA-256 (both sides) |
+| tensor (ollama name / mlx-community name) | dtype / shape | SHA-256 (both sides) |
 |---|---|---|
-| `…layers.0.self_attn.k_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `079b15ff2455b027198ec39c…` |
-| `…layers.30.self_attn.v_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `1b7fa0c2b32c86752fed90b2…` |
-| `…norm.weight` | `BF16 [3840]`, 7,680 B | `d059a0bcfebeba413a5fd8d6…` |
+| `model.language_model.layers.0.self_attn.k_proj.weight` / `language_model.model.layers.0.self_attn.k_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `079b15ff2455b027198ec39c…` |
+| `model.language_model.layers.30.self_attn.v_proj.weight` / `language_model.model.layers.30.self_attn.v_proj.weight` | `BF16 [2048, 3840]`, 15,728,640 B | `1b7fa0c2b32c86752fed90b2…` |
+| **final** norm — `model.language_model.norm.weight` / `language_model.model.norm.weight` (*not* a per-layer `norm.weight`) | `BF16 [3840]`, 7,680 B | `d059a0bcfebeba413a5fd8d6…` |
 
-Three disclosures ride with this pair, none of which the weight match removes:
+**Why it is not the rung.** Decode on Metal is bandwidth-bound — a dense model
+reads every weight once per token — and this pair moves **23.920 GB per token
+against 6.741 GB at 4 bits, a 3.55× increase in traffic** (both figures measured,
+from the table above and the 4-bit repo). Two engines pinned against the memory
+wall converge, so the row would largely report the weight format rather than the
+engine, which is the one thing R2 exists to isolate. It is also a configuration no
+scratchy user runs. The honest reading is narrower than "engine only": at bf16,
+*decode* is uninformative. Prefill is compute-bound, so it degrades less — and
+this epic's workload is prefill-heavy — but that is an argument for a targeted
+prefill experiment, not for a rung.
 
-1. **ollama ships speculative decoding, and on R1 it is explicitly switched on.**
-   See [Speculative decoding on the ollama side](#speculative-decoding-on-the-ollama-side)
-   below — it is a disclosure for R2 and a **correction to R1**, so it is written
-   out once rather than squeezed into this list. The short form: every default tag
-   sets `draft_num_predict` 2–3 in its `params` blob, and scratchy has no
-   equivalent enabled.
-2. **R2 changes ollama's engine, not only its weights.** R1's tags are
-   `model_format: gguf` / `file_type: Q4_K_M` (llama.cpp); every `-mlx` and
-   `-mlx-bf16` tag is `model_format: safetensors` with `requires ≥ 0.31.0`
-   (ollama's MLX engine). R2 therefore isolates "scratchy against ollama-on-MLX at
-   matched weights", and an R1→R2 delta on ollama's side mixes a quantizer change
-   with an engine change. Both must be named on the row.
-3. **Footprint.** 24.83 GB on disk for the tag against 23.95 GB for scratchy's
-   side (the difference is the draft model plus two 32 MB tokenizers), at 2 bytes
-   per parameter rather than 4 bits.
+Two further reasons it could not have been the rung as written: it reaches **one
+model of three** (`gemma4:26b-mlx-bf16` is 52.52 GB and
+`qwen3.6:35b-a3b-mlx-bf16` is 71.92 GB, the latter past this host's 64 GB before
+any KV cache), and it still changes ollama's **engine** as well as its weights —
+R1's tags are `gguf`/llama.cpp, every `-mlx` tag is `safetensors` with
+`requires ≥ 0.31.0`. So a delta across it would mix engine with format.
+
+**If it is ever run,** it is labelled a bf16 bandwidth-bound control, never "R2",
+and it carries the two paragraphs above. Its footprint is 24.83 GB for the tag
+against 23.95 GB for scratchy's side — the difference is the draft model plus two
+32 MB tokenizers.
+
+Speculative decoding is a disclosure on **both** rungs and on this control; it is
+written out once below.
 
 ##### Speculative decoding on the ollama side
 
@@ -299,15 +361,23 @@ mechanisms, and scratchy's side has no equivalent enabled.
 The switch is `draft_num_predict` in each tag's `params` blob; the machinery is
 either a bundled draft model or the model's own multi-token-prediction head:
 
-| ollama tag | rung | machinery the artifact carries | `draft_num_predict` |
-|---|---|---|---|
-| `gemma4:12b` | R1 | GGUF draft model, 0.47 GB | **3** |
-| `gemma4:26b` | R1 | GGUF draft model, 0.46 GB (`Gemma4AssistantForCausalLM`) | **3** |
-| `qwen3.6:35b` | R1 | native **MTP** head, inside the GGUF | **2** |
-| `gemma4:12b-mlx` | — | bf16 draft model, 0.85 GB | unset |
-| `gemma4:26b-mlx` | — | bf16 draft model, 0.84 GB | unset |
-| `qwen3.6:35b-mlx` | — | native **MTP** head, 1.69 GB bf16 | unset |
-| **`gemma4:12b-mlx-bf16`** | **R2** | bf16 draft model, 0.85 GB | **unset** |
+| ollama tag | rung | machinery the artifact carries | drafter architecture | `draft_num_predict` |
+|---|---|---|---|---|
+| `gemma4:12b` | R1 | GGUF draft model, 0.47 GB | `gemma4-assistant` | **3** |
+| `gemma4:26b` | R1 | GGUF draft model, 0.46 GB | `gemma4-assistant` | **3** |
+| `qwen3.6:35b` | R1 | native **MTP** head, inside the GGUF | — (in-model) | **2** |
+| `gemma4:12b-mlx` | — | bf16 draft model, 0.85 GB | `Gemma4UnifiedAssistantForCausalLM` | unset |
+| `gemma4:26b-mlx` | — | bf16 draft model, 0.84 GB | `Gemma4AssistantForCausalLM` | unset |
+| `qwen3.6:35b-mlx` | — | native **MTP** head, 1.69 GB bf16 | — (in-model) | unset |
+| `gemma4:12b-mlx-bf16` | bf16 control | bf16 draft model, 0.85 GB | `Gemma4UnifiedAssistantForCausalLM` | unset |
+
+**The drafter is not one architecture across tags.** Both GGUF tags declare
+`gemma4-assistant`, but on the MLX side the 12b ships
+`Gemma4UnifiedAssistantForCausalLM` (`model_type: gemma4_unified_assistant`) and
+the 26b ships `Gemma4AssistantForCausalLM` (`model_type: gemma4_assistant`) —
+read from each tag's config blob and confirmed against its bundled
+`draft/config.json`. A row that names "ollama's draft model" generically is
+describing three different things, so each is named per tag above.
 
 Two things follow, and they differ by rung:
 
@@ -315,8 +385,8 @@ Two things follow, and they differ by rung:
   tags. A phase-4 row that compares scratchy with n-gram spec decode *off*
   against these tags is comparing against an engine drafting 2–3 tokens a step
   with a trained drafter. That inverts the sign of the spec-decode ablation.
-- **On R2 the weights ship but the knob is unset** on every `-mlx` tag, R2's pair
-  included. Unset is not the same as off — it may fall through to an engine
+- **On the `-mlx` tags the weights ship but the knob is unset** — the bf16
+  control included. Unset is not the same as off — it may fall through to an engine
   default — so **this is a runtime question T0.4 must answer by measuring, not by
   reading the manifest.** T0.6's claim stops at what the artifact contains.
 
@@ -340,20 +410,18 @@ declares `mtp_num_hidden_layers: 1`. So the config advertises a head whose weigh
 are not in the file. Any qwen MTP comparison needs a checkpoint that retains them;
 that is a checkpoint problem before it is a scratchy feature request.
 
-**The pair cannot extend to the other two models, and now there are numbers for
-why.** `gemma4:26b-mlx-bf16` is 52.52 GB and `qwen3.6:35b-a3b-mlx-bf16` is
-71.92 GB — the latter exceeds the machine's 64 GB outright, before any KV cache.
-That is what scopes R2 to the 12b; the 12b is also the dense control, so R2
-lands on the model whose R1 row it is most useful beside.
-
-**What would restore a 4-bit R2, recorded so it is not re-derived.** scratchy
-already has an `nvfp4` preset at `group_size 16` — matching ollama's — but only
-the `llama` arch declares it, and there is no MXFP8 support in the tree at all
+**What it would take to put *ollama* on a matched-weights rung, recorded so it is
+not re-derived.** Not required for R2, which runs against mlx-lm — this is the
+cost of the decomposition R1 cannot give. scratchy already has an `nvfp4` preset
+at `group_size 16`, matching ollama's, but only the `llama` arch declares it, and
+there is no MXFP8 support in the tree at all
 (`crates/models/quantization/presets/nvfp4.json`,
-`crates/layers/src/layers.rs:237-240`). Matching `-mlx` at 4 bits would need
-NVFP4 declared on `gemma4`/`gemma4-moe`/`qwen3-5-moe`, MXFP8 added for the 26b,
-**and** a way to feed scratchy ollama's per-tensor blob store, since these weights
-are published nowhere else. That is an epic, not a phase-0 task.
+`crates/layers/src/layers.rs:237-240`). It would need NVFP4 declared on
+`gemma4`/`gemma4-moe`/`qwen3-5-moe`, MXFP8 added for the 26b, **and** a way to
+feed scratchy ollama's per-tensor blob store, since these weights are published
+nowhere else. The converse — importing mlx-community's checkpoint into ollama via
+`ollama create` — is cheaper to test and
+[listed as open](#blocked). Either is an epic, not a phase-0 task.
 
 ##### How this was established, and how to re-verify it
 
@@ -395,8 +463,8 @@ fixed name. Digests for every tag named in this document, as of 2026-10-06:
 | `qwen3.6:35b-mlx` | 2026-08-27 18:23 | `sha256:e92a3e94bbca90a85491dc34e9257bfee2318cedaa16360828c4d8edf14295b9` |
 
 A load is still the acceptance test, the same bar T0.1 sets: these digests say
-what the artifacts *are*, not that either engine opens them. R2's pair is pulled
-and served before any R2 number is quoted.
+what the artifacts *are*, not that any engine opens them. Every artifact a rung
+names is loaded and served before a number is quoted from it.
 
 #### What a rung does not pin
 
@@ -450,9 +518,10 @@ an estimate.
 | cell | blocked on | resolved by |
 |---|---|---|
 | ~~R1, ollama side — tag digest and the quantization each default tag carries~~ | — | **resolved, T0.6**: all three are `gguf`/`Q4_K_M`; digests and sizes recorded in [R1](#r1--what-a-user-gets) and [R2](#how-this-was-established-and-how-to-re-verify-it) |
-| ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — they are ollama's own NVFP4/MXFP8 requantization, so 4-bit R2 does not exist. The fallback took effect and R2 now names a pinned, byte-verified pair on `gemma-4-12b-it` |
-| whether either engine actually loads R2's pair | phase 4 setup | pulling `gemma4:12b-mlx-bf16` and building scratchy's no-preset bf16 `gemma-4-12b-it`; T0.6 identified the artifacts, it did not serve them |
-| does ollama's MLX engine draft when `draft_num_predict` is **unset**? | **T0.4** | R2's pair ships draft weights with the knob unset; unset is not off. Measure it — a manifest cannot answer it |
+| ~~R2, both sides — are the `-mlx` tags the same checkpoint as mlx-community's 4-bit?~~ | — | **resolved, T0.6**: **no** — ollama's own NVFP4/MXFP8 requantization, so ollama cannot supply matched 4-bit weights. R2 re-scoped to **scratchy vs mlx-lm** on the shared mlx-community checkpoint, all three models |
+| whether mlx-lm loads the three pinned checkpoints, and its pinned version | phase 4 setup | `mlx_lm.server` against each repo; T0.6 identified artifacts, it served nothing |
+| does `ollama create` preserve an mlx-community affine-int4 checkpoint? | open — cheap to test | if it does, ollama rejoins a matched-weights rung at 4 bits; if it requantizes, the path is closed. Read the resulting manifest's per-tensor `__metadata__` |
+| does ollama's MLX engine draft when `draft_num_predict` is **unset**? | **T0.4** | every `-mlx` tag ships draft weights with the knob unset; unset is not off. Measure it — a manifest cannot answer it |
 | ollama spec decode — disabled, or measured and disclosed, on **R1**? | **T0.4** + phase 4's spec-decode ablation | all three default tags set `draft_num_predict` 2–3; prefer overriding it on the default tag over switching to the older non-MTP builds |
 | ollama context length, parallelism, keep-alive, pinned version | **T0.4** | the one-page "ollama configuration as tested" note |
 | no-truncation proof on both sides | **T0.4** + the phase 2 harness | per-turn token accounting in the replay client and the live driver |
