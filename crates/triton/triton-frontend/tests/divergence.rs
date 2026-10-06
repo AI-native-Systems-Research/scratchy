@@ -177,17 +177,14 @@ fn fdiv_is_unaffected_by_the_switch_in_either_direction() {
 /// "NOTE FOR THE ATTENTION FIXTURE: its epilogue `acc = acc / l_i[:, None]` has the SAME
 /// latent promotion, so its divide is an f32 island where a `realdiv` would do."
 ///
-/// ⛔ `#[ignore]` AT RE-HOST (2026-10-02), because this test is RED AT THE SOURCE: the
-/// identical failure (11 findings — `_attn_fwd_inner`'s fourth descriptor mangled `TDfp16`
-/// in the golden vs `Pfp16` here, op_count 168 vs 163, a constant 64 vs 1024) reproduces
-/// at triton-spyre's clean tip `5c51a1d7a`, before any re-host change. The golden was
-/// evidently generated from a Triton whose descriptor flattening differed. The re-host is
-/// FAITHFUL — it reproduces the source's failure exactly. Un-ignore when the golden is
-/// regenerated or the front end's descriptor mangling is reconciled, on the triton-spyre
-/// side; do not "fix" it here, because a green here would mean the re-host DIVERGED from
-/// its source of truth.
+/// The golden this diffed against was regenerated 2026-10-06 from triton-spyre tip
+/// (`77cba2d96`, the real Triton toolchain via `tools/gen_ttir_goldens.py`). It replaced
+/// a golden cut from a Triton whose descriptor flattening differed — 11 findings, red
+/// at triton-spyre's then-tip `5c51a1d7a` too, which is why this test sat `#[ignore]`d
+/// at re-host rather than "fixed" here (a green against the stale golden would have
+/// meant the re-host DIVERGED from its source of truth). Against the regenerated
+/// golden the upstream diff is exact, so the ignore is lifted.
 #[test]
-#[ignore = "red at triton-spyre tip 5c51a1d7a; see the comment above — golden regeneration, not a re-host defect"]
 fn the_attention_epilogue_divide_is_the_whole_divergence() {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let src = std::fs::read_to_string(dir.join("../test-fixtures/attention_flash.py"))

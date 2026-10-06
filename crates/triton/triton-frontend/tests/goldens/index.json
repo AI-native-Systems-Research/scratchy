@@ -429,7 +429,7 @@
     "kernel": "attn_fwd",
     "name": "attention_flash_noncausal",
     "post_lines": 218,
-    "raw_lines": 482,
+    "raw_lines": 471,
     "signature": {
       "BLOCK_M": "constexpr",
       "BLOCK_N": "constexpr",

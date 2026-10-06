@@ -32,15 +32,6 @@ enum Expect {
     /// so its golden is reproduced with `upstream_gpu` and the Spyre difference is asserted
     /// separately in `tests/divergence.rs`.
     MatchesAt(Target),
-    /// Compiles, and the golden is KNOWN STALE: the diff must yield exactly the given count
-    /// of findings. Red at triton-spyre tip `5c51a1d7a` (re-hosted verbatim), where the
-    /// `attention_flash` goldens disagree with the current front end's descriptor mangling
-    /// (`TDfp16` vs `Pfp16` on `_attn_fwd_inner`'s fourth descriptor, 11 findings). This
-    /// PINS the staleness instead of hiding it: if the golden is regenerated to match
-    /// (0 findings) or drifts further, this expectation FAILS and forces the entry back to
-    /// [`Expect::MatchesAt`]. A stale golden must not be able to fail silently OR pass
-    /// silently.
-    MatchesStaleGolden(Target, usize),
     /// Refused, and there is deliberately NO golden either -- the Python toolchain cannot
     /// produce one. (A refused-with-golden expectation existed in the source tree but no
     /// fixture used it; resurrect it with its two match arms when one lands.)
@@ -118,9 +109,14 @@ fn status() -> Vec<(Case, Expect)> {
         ),
         // Both attention configurations, against the UPSTREAM target: their epilogue is the
         // one bare f16 divide in any fixture, so the golden carries Triton's promotion.
+        // The noncausal golden was regenerated from triton-spyre tip (77cba2d96) after the
+        // old one went stale — it was cut from a Triton whose descriptor flattening
+        // differed (11 findings at re-host, red at triton-spyre's then-tip 5c51a1d7a too).
+        // The regenerated golden matches this front end exactly, so it is a plain
+        // `MatchesAt` again — and `tests/divergence.rs`'s ignore is lifted with it.
         (
             common::attention("attention_flash_noncausal", 1),
-            Expect::MatchesStaleGolden(Target::upstream_gpu(), 11),
+            Expect::MatchesAt(Target::upstream_gpu()),
         ),
         (
             common::attention("attention_flash_causal", 3),
@@ -137,7 +133,6 @@ fn every_fixture_has_the_expected_status() {
         let golden = common::golden(&case.name);
         let target = match &expect {
             Expect::MatchesAt(t) => *t,
-            Expect::MatchesStaleGolden(t, _) => *t,
             _ => Target::spyre(),
         };
         let result = codegen::compile(&src, &case.spec, target);
@@ -171,44 +166,6 @@ fn every_fixture_has_the_expected_status() {
             (Expect::MatchesAt(_), Err(e)) => {
                 failures.push(format!(
                     "{}: expected to MATCH but was refused: {e}",
-                    case.name
-                ));
-            }
-            (Expect::MatchesStaleGolden(t, want), Ok(m)) => {
-                let g = match &golden {
-                    Some(g) => g,
-                    None => {
-                        failures.push(format!(
-                            "{}: expected a STALE MATCH but there is no golden",
-                            case.name
-                        ));
-                        continue;
-                    }
-                };
-                let r = diff::compare_to_golden_text(g, m);
-                let _ = t; // the target is already baked into the compiled module `m`
-                let got = r.findings.len();
-                if got != *want {
-                    failures.push(format!(
-                        "{}: the stale-golden PIN moved: {} finding(s) recorded at re-host, \
-                         {} now. Either the golden was regenerated (flip back to \
-                         Expect::MatchesAt and make the diff pass) or the front end drifted \
-                         further (re-record the pin AND file why):\n{}",
-                        case.name,
-                        want,
-                        got,
-                        r.render()
-                    ));
-                } else if r.matched_ops == 0 {
-                    failures.push(format!(
-                        "{}: reported no findings but matched ZERO ops -- comparing nothing",
-                        case.name
-                    ));
-                }
-            }
-            (Expect::MatchesStaleGolden(_, _), Err(e)) => {
-                failures.push(format!(
-                    "{}: expected to compile against a STALE golden but was refused: {e}",
                     case.name
                 ));
             }

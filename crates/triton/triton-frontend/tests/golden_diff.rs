@@ -81,33 +81,6 @@ fn check_case(case: &common::Case) {
     check_case_on(case, Target::spyre());
 }
 
-/// [`check_case_on`] for a golden that is KNOWN STALE: the diff must yield exactly
-/// `pinned_findings` findings, so the staleness is asserted rather than hidden. 0 findings
-/// or a larger count both fail, forcing the entry back to [`check_case_on`] or a
-/// re-recorded pin with a reason.
-fn check_case_stale_on(case: &common::Case, target: Target, pinned_findings: usize) {
-    let name = &case.name;
-    let src = common::fixture_src(&case.fixture);
-    let golden = common::golden(name).unwrap_or_else(|| {
-        panic!("no golden for `{name}`: expected tests/goldens/{name}.ttir_raw.mlir")
-    });
-    let ours = codegen::compile(&src, &case.spec, target)
-        .unwrap_or_else(|e| panic!("`{name}` did not compile: {e}"));
-    let report = diff::compare_to_golden_text(&golden, &ours);
-    let got = report.findings.len();
-    assert!(
-        report.matched_ops > 0,
-        "`{name}`: the diff matched ZERO ops -- that is a diff comparing nothing"
-    );
-    assert_eq!(
-        got,
-        pinned_findings,
-        "`{name}`: the stale-golden pin moved ({pinned_findings} recorded, {got} now): \
-         regenerate the golden and use check_case_on, or re-record the pin AND file why.\n{}",
-        report.render()
-    );
-}
-
 /// The configurations that never reach a bare f16 divide, and so are target-independent.
 fn target_independent_cases() -> Vec<common::Case> {
     vec![
@@ -229,17 +202,15 @@ fn decoder_two_layers_matches_golden() {
 ///
 /// Diffed against the UPSTREAM target -- see `check_case_on` for why.
 ///
-/// STALE GOLDEN, pinned: 11 findings at triton-spyre tip `5c51a1d7a` (re-hosted verbatim) --
-/// the descriptor mangling and constant placement the diff names. If this moves to 0, the
-/// golden was regenerated: switch back to `check_case_on`. If it grows, the front end
-/// drifted: re-record AND file why. See `tests/fixture_status.rs`'s
-/// `Expect::MatchesStaleGolden` for the same pin at the status-table level.
+/// The golden was regenerated 2026-10-06 from triton-spyre tip (`77cba2d96`), replacing
+/// one cut from a Triton whose descriptor flattening differed (11 findings then, red at
+/// triton-spyre's own then-tip `5c51a1d7a` too). It matches exactly now, so this is a
+/// plain `check_case_on` again.
 #[test]
 fn attention_flash_noncausal_matches_golden() {
-    check_case_stale_on(
+    check_case_on(
         &common::attention("attention_flash_noncausal", 1),
         Target::upstream_gpu(),
-        11,
     );
 }
 
