@@ -373,16 +373,56 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> Result<Vec<EmittedOp>, String> {
+    let result_cols = ir.tensors[ir.result.index()].cols;
+    let is_prefill_lm_head_tail = node.output.region.cols.len == result_cols
+        && node.output.region.rows.len > 1
+        && !rows_are_requests;
     if let SubOp::MatmulTile { .. } = &node.op {
-        let result_cols = ir.tensors[ir.result.index()].cols;
-        if node.output.region.cols.len == result_cols && !rows_are_requests {
-            let rows = node.output.region.rows.len;
-            if rows > 1 {
-                return lower_prefill_lm_head_fold(node, ir);
-            }
+        if is_prefill_lm_head_tail {
+            return lower_prefill_lm_head_fold(node, ir);
+        }
+    }
+    // ⭐ THE LOGITS SCALARMUL IS THE TAIL'S SECOND HALF — main's own law
+    // (`lower_scalarmul_node(&node_at_one_row(node), …)` under the same
+    // `is_prefill_lm_head_tail`): the m>1 matmul above it is folded to the m=1
+    // tail that writes ONE logits row, so the scale must run over that one row
+    // too. Left un-folded it scales mq × vocab logits of which mq−1 rows were
+    // never written — row 0 is still right (which is why text A/Bs pass), but
+    // the device pays mq−1 rows of reads of unwritten logits for nothing.
+    if let SubOp::ScalarMul { .. } = &node.op {
+        if is_prefill_lm_head_tail {
+            let at_m1 = node_at_one_row(node);
+            return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
         }
     }
     lower_one(node, ir, rows_are_requests).map(|e| vec![e])
+}
+
+/// Main's own `node_at_one_row`, verbatim law: slice the FIRST row (the region's
+/// own `rows.start`, length 1) of the input and the output — the m=1 tail's
+/// addressing, which the folded matmul's output row 0 matches.
+fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+) -> SubtileNode<F> {
+    let one_row = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+        scratchy_subtile::subtile_ir::TensorRegion {
+            tensor: tr.tensor,
+            region: scratchy_subtile::subtile_ir::Region {
+                rows: scratchy_subtile::subtile_ir::Range::new(tr.region.rows.start, 1),
+                cols: tr.region.cols,
+            },
+        }
+    };
+    let mut inputs = node.inputs.clone();
+    if let Some(a) = inputs.first_mut() {
+        *a = one_row(a);
+    }
+    SubtileNode {
+        id: node.id,
+        op: node.op.clone(),
+        inputs,
+        output: one_row(&node.output),
+    }
 }
 
 fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(

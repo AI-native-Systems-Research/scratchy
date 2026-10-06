@@ -223,9 +223,19 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             Ok(e) => Ops(vec![e]),
             Err(reason) => Unhandled(reason),
         },
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } | SubOp::ScalarMul { .. } => {
+        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => {
             match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
+            }
+        }
+        // ⭐ THE LOGITS SCALARMUL RIDES `lower_all` WITH THE MATMUL — the vocab-wide
+        // tail folds BOTH halves to m=1 (main's `is_prefill_lm_head_tail` covers this
+        // arm too), and the fold is the splice's `lower_all` now. Every other
+        // ScalarMul is the ordinary one-op pointwise.
+        SubOp::ScalarMul { .. } => {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+                Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
