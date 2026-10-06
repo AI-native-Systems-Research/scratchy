@@ -274,6 +274,9 @@ pub struct MetalWorker {
     argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
     /// The argmax baked for the draft model's logits (its forwards and chain).
     draft_argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
+    /// The passes of a multi-token-prediction head (a `draft_model` that reads the target's
+    /// hidden states), run at the end of a step the engine planned drafts for.
+    mtp_drafter: Option<::scratchy_serving_engine::spec_decode::MtpDrafter>,
     /// Compiled on-GPU token sampler (temperature / top-k / top-p / min-p +
     /// penalties). Cached once at load_model alongside `argmax_kernels`; used
     /// only for non-greedy requests (greedy decode stays on the argmax path).
@@ -857,6 +860,7 @@ impl MetalWorker {
             draft_kv_cache: None,
             argmax_kernels: None,
             draft_argmax_kernels: None,
+            mtp_drafter: None,
             sampler_kernels: None,
             sampler_arena: None,
             sampler_logits: None,
@@ -957,19 +961,22 @@ impl MetalWorker {
     /// agree. `max_model_len` resolves the same way as `load_model`:
     /// CLI override → HF `max_position_embeddings` → 4096.
     fn kv_block_cap(&self, num_blocks: usize) -> usize {
-        let max_model_len = self
-            .config
+        self.max_model_len()
+            .div_ceil(self.config.block_size.max(1))
+            .min(num_blocks)
+            .max(1)
+    }
+
+    /// The longest context: `--max-model-len`, else the checkpoint's, else 4096.
+    fn max_model_len(&self) -> usize {
+        self.config
             .max_model_len
             .or_else(|| {
                 self.hf_config
                     .as_ref()
                     .and_then(|c| c.max_position_embeddings())
             })
-            .unwrap_or(4096);
-        max_model_len
-            .div_ceil(self.config.block_size.max(1))
-            .min(num_blocks)
-            .max(1)
+            .unwrap_or(4096)
     }
 
     /// ⭐⭐⭐ THE UNSET `--max-num-seqs` ANSWER — called at the END of `load_model`,
@@ -1438,6 +1445,10 @@ impl MetalWorker {
         // A multi-token-prediction head carries no embedding or lm_head: lend it the target's,
         // from the target store's refs (same mmap → no second upload).
         if let Some(head) = scratchy_forward_compiler::draft_head(&draft_arch) {
+            self.mtp_drafter = Some(::scratchy_serving_engine::spec_decode::MtpDrafter {
+                drafts: usize::from(head.drafts),
+                max_model_len: self.max_model_len(),
+            });
             let (Some(target), Some(refs)) =
                 (self.model.as_deref(), self.target_tensor_refs.as_ref())
             else {
@@ -1575,7 +1586,11 @@ impl MetalWorker {
             && self.input_batch.num_active() > 0
             && sched.scheduled_spec_decode_tokens.is_empty()
             && !self.config.is_pooling
-            && self.draft_model.is_none()
+            // A head runs after the steps it drafts from, so every other step defers.
+            && match self.mtp_drafter {
+                Some(_) => sched.draft_req_ids.is_empty(),
+                None => self.draft_model.is_none(),
+            }
             && sched.num_scheduled_tokens.keys().all(|req_id| {
                 !self
                     .sampling_params_map
@@ -4820,10 +4835,11 @@ impl Worker for MetalWorker {
         // A multi-token-prediction head drafts from this step's hidden rows, so it runs after the
         // target (in the proposer) — it has no lockstep prefill to overlap.
         let draft_is_head = self.draft_is_head();
-        let target_hidden_rows: Vec<u32> = match draft_is_head {
-            true => (0..num_tokens as u32).collect(),
-            false => Vec::new(),
-        };
+        let target_hidden_rows: Vec<u32> =
+            match draft_is_head && !scheduler_output.draft_req_ids.is_empty() {
+                true => (0..num_tokens as u32).collect(),
+                false => Vec::new(),
+            };
         let mut target_hidden: Vec<u8> = Vec::new();
         let phase8_parallel_lockstep = self.draft_model.is_some()
             && !draft_is_head
@@ -5558,16 +5574,39 @@ impl Worker for MetalWorker {
                 .commit_step(req_id, &sampled_token_ids[i], q_len, was_spec_decode[i]);
         }
 
+        // ── 8. The head's drafts ────────────────────────────────
+        // For the requests the engine planned, from this step's rows and the tokens just
+        // committed; the engine schedules them into the next step.
+        let plan = &scheduler_output.draft_req_ids;
+        let draft_token_ids = match (self.mtp_drafter, draft_seed_inputs.as_ref()) {
+            (Some(drafter), Some(seed)) if !plan.is_empty() => {
+                let history: std::collections::HashMap<String, Vec<u32>> = plan
+                    .iter()
+                    .map(|r| {
+                        let (prompt, generated) = self.input_batch.history(r);
+                        (r.clone(), [prompt, generated].concat())
+                    })
+                    .collect();
+                let history = |r: &str| history.get(r).cloned();
+                let drafts = drafter
+                    .draft(seed, &sampled_token_ids, &history, self, plan)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("MTP drafts: {e}")))?;
+                Some(drafts)
+            }
+            _ => None,
+        };
+        // A head's seed went to its drafts; a draft model's proposer reads it.
+        let draft_seed_inputs = draft_seed_inputs.filter(|_| self.mtp_drafter.is_none());
+
         Ok(ModelRunnerOutput {
             req_ids: req_ids_in_order,
             req_id_to_index,
             sampled_token_ids,
             logprobs: None,
             prompt_logprobs_dict: std::collections::HashMap::new(),
-            // K-step draft chain runs host-side now; the proposer fills
-            // `set_spec_token_ids` directly. `draft_token_ids` stays
-            // `None` from the worker.
-            draft_token_ids: None,
+            // A head's drafts; a draft model's K-step chain runs host-side, its proposer filling
+            // `set_spec_token_ids` directly.
+            draft_token_ids,
             draft_seed_inputs,
             pooler_output,
             // ⛔ EMPTY, AND THE EMPTINESS IS THE STATEMENT. `kv_extent` reports a KV span that has run

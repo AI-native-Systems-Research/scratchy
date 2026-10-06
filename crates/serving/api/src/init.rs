@@ -842,10 +842,14 @@ fn validate_speculative_decoding(config: &VllmConfig) -> Result<()> {
 /// scheduling for non-EAGLE spec-decode methods. Both ngram and draft-model
 /// paths seed K-step drafts from step N's output for step N+1's verify;
 /// async's 1-step lookahead skews that to N+2 and acceptance collapses to
-/// ~0. EAGLE/MTP methods (not yet ported) re-use hidden states directly
-/// and are compatible with async.
+/// ~0. A multi-token-prediction head drafts in the worker, at the end of the
+/// step it drafts from, and the async loop waits only on a step that drafts
+/// or verifies, so it is compatible with async.
 fn spec_decode_requires_sync(config: &VllmConfig) -> bool {
-    config.speculative_model.is_some()
+    match config.speculative_model.as_deref() {
+        None => false,
+        Some(spec) => !matches!(draft_head(config, spec), Ok(Some(_))),
+    }
 }
 
 /// Phase-2 guards: vocab/tokenizer match + memory budget for the

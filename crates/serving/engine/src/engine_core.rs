@@ -215,6 +215,14 @@ impl<T> StepOutcome<T> {
     }
 }
 
+/// Whether `req_id` takes speculative drafts: it is running, and its sampling does not read its
+/// history (a verify row's would need the drafts before it).
+fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
+    scheduler
+        .get_request(req_id)
+        .is_some_and(|r| !r.status.is_finished() && !r.sampling_params.reads_history())
+}
+
 impl EngineCore {
     /// Create a new EngineCore.
     pub fn new(config: EngineCoreConfig, executor: Box<dyn Executor>) -> Self {
@@ -311,17 +319,11 @@ impl EngineCore {
                     }
                     ProposerConfig::Mtp(cfg) => {
                         info!(
-                            "MTP speculative decoding enabled ({}, k={}): the head drafts from the \
-                             target's final hidden states after each step.",
-                            cfg.model, cfg.num_speculative_tokens,
+                            "MTP speculative decoding enabled ({}, k={}, up to {} sequences): the \
+                             worker's head drafts from the target's final hidden states at the end \
+                             of each step it drafts from.",
+                            cfg.model, cfg.num_speculative_tokens, cfg.max_seqs,
                         );
-                        // Pass 1 reads the step's own hidden states and the tokens it produced,
-                        // so the drafts are for the step right after it: async scheduling's
-                        // one-step lookahead would verify them a step late.
-                        if async_scheduling {
-                            info!("MTP spec decode forces sync scheduling.");
-                            async_scheduling = false;
-                        }
                         Box::new(MtpProposer::new(cfg))
                     }
                 }
@@ -484,10 +486,11 @@ impl EngineCore {
     ///
     /// Requires the executor to be present (not taken for async scheduling).
     pub fn step(&mut self) -> EngineResult<StepOutcome<StepOutputs>> {
-        let executor = self
-            .executor
-            .as_mut()
-            .ok_or_else(|| EngineError::Executor("executor taken for async scheduling".into()))?;
+        if self.executor.is_none() {
+            return Err(EngineError::Executor(
+                "executor taken for async scheduling".into(),
+            ));
+        }
 
         if !self.scheduler.has_requests() {
             return Ok(StepOutcome::Idle);
@@ -502,7 +505,8 @@ impl EngineCore {
         let _t_sched = std::time::Instant::now();
 
         // 1. Schedule.
-        let scheduler_output = self.scheduler.schedule();
+        let mut scheduler_output = self.scheduler.schedule();
+        self.plan_drafts(&mut scheduler_output);
         let model_executed = scheduler_output.total_num_scheduled_tokens > 0;
         let _d_sched = _t_sched.elapsed();
 
@@ -516,6 +520,7 @@ impl EngineCore {
         // 2. Execute model (also handles cleanup of finished requests even
         //    when no tokens are scheduled).
         let _t_exec = std::time::Instant::now();
+        let executor = self.executor.as_mut().expect("checked above");
         let mut model_output = executor
             .execute_model(&scheduler_output)
             .map_err(|e| EngineError::Executor(e.to_string()))?;
@@ -563,7 +568,8 @@ impl EngineCore {
         if !self.scheduler.has_requests() {
             return None;
         }
-        let sched = self.scheduler.schedule();
+        let mut sched = self.scheduler.schedule();
+        self.plan_drafts(&mut sched);
         // Still return the output if there are finished request IDs to clean up,
         // even when no tokens are scheduled. The executor needs to see these IDs
         // to release per-request resources (KV cache buffers, token buffers, etc.).
@@ -571,6 +577,16 @@ impl EngineCore {
             return None;
         }
         Some(sched)
+    }
+
+    /// The requests the worker-side draft head runs for in the step `sched` scheduled
+    /// ([`Proposer::plan`]).
+    fn plan_drafts(&mut self, sched: &mut SchedulerOutput) {
+        let Some(proposer) = self.proposer.as_mut() else {
+            return;
+        };
+        let scheduler = &self.scheduler;
+        sched.draft_req_ids = proposer.plan(sched, &|req_id| takes_drafts(scheduler, req_id));
     }
 
     /// Post-execution processing: update state from model output, process
@@ -628,10 +644,7 @@ impl EngineCore {
                     }
                 })
             };
-            let takes_drafts = |req_id: &str| {
-                (scheduler_ref.get_request(req_id))
-                    .is_some_and(|r| !r.sampling_params.reads_history())
-            };
+            let takes_drafts = |req_id: &str| takes_drafts(scheduler_ref, req_id);
             let backend = self.executor.as_mut().and_then(|e| e.spec_decode_backend());
             let mut ctx = ProposerStepCtx {
                 scheduled_req_ids: &scheduled_req_ids,
