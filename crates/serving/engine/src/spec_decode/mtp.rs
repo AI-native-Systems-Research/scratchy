@@ -79,8 +79,17 @@
 //!   memory-bandwidth floor for the experts 24 rows pick (uniform routing), so the rest must fit in
 //!   about 27 ms; it takes about 44 (dense projections 25 ms against about 13 at 8 rows; the
 //!   Gated-DeltaNet scan 10-12 ms, each sequence's rows and the kept rows it replays one after
-//!   another; attention 3; the rest about 6) plus the head's about 5. The dense projections at
-//!   17-32 rows are a kernel choice for those buckets; the scan's serial rows are its recurrence.
+//!   another; attention 3; the rest about 6) plus the head's about 5, measured with 16- and
+//!   32-row verify-sized rungs. Those rungs cost short prompts their first token, and the gate of
+//!   1 keeps verify steps at 3 rows, so they are gone (`METAL_VERIFY_ROWS`, 8): past 2 sequences
+//!   a verify step runs the 64-row prefill-shaped tape until the rungs derive from the gate.
+//! - TODO: a build with a head pays its Gated-DeltaNet scan's replay at prefill. The scan's
+//!   per-token loop also replays a verify step's kept rows, one loop body so the replay is
+//!   bit-exact (`gdn_scan_simd_resumes_from_checkpoint`), which costs every prompt token: 0.207 ms
+//!   against 0.167 ms a token across the 30 scans (base M5, 1024- and 2048-row prompt chunks).
+//!   Without a head the replay compiles out (`GDN_SCAN_DRAFTS` 0). Two loops calling one inlined
+//!   row lost the bit-exactness (the varlen scan's replay 1 ULP off): the compiler contracts each
+//!   copy apart.
 //! - TODO: time to first token pays the head's pass over the prompt (about 0.19 s on a 5.4k-token
 //!   prompt, base M5): the worker returns a step's tokens with its drafts, so the first token waits
 //!   for pass 1 over every prompt row. The next step needs the drafts, the client does not: return
@@ -101,7 +110,9 @@
 //!   its default) are the measurement.
 //! - TODO: on a 32 GB Mac Qwen3.6 does not start at the default 128 sequences, with or without a
 //!   head (the Gated-DeltaNet state pool alone is 8 GiB; main too), so base-M5 numbers here are
-//!   development runs at `--max-num-seqs 8`. Sizing the state pool is its own fix.
+//!   development runs at `--max-num-seqs 8`. Sizing the state pool is its own fix. There, the
+//!   head's memory (weights+overhead 19.8 -> 20.4 GiB) also prunes the prefill bucket 2048 ->
+//!   1024: a 5.6k-token prompt's first token 5.1 -> 6.1 s.
 //! - TODO: `--num-speculative-tokens` given with a head is ignored (the head drafts its compiled
 //!   count), and `serve`'s flag defaults to 2, so it cannot tell a given value from none. Make it
 //!   optional, and refuse a value that differs from the head's.
