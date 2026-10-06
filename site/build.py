@@ -13,6 +13,7 @@ gone; the browser renders the .md file at request time.
 
 Usage: site/build.py
 """
+import html
 import re
 import shutil
 import sys
@@ -156,6 +157,34 @@ NAV = [
 
 REPO_URL = "https://github.com/AI-native-Systems-Research/scratchy"
 
+# Pages under the Performance tab, in left-nav order. Each one builds its own
+# page and calls perf_side_nav, so a new page (the Launch Claude leaderboard)
+# joins the left nav by adding one row here, without touching the others.
+PERFORMANCE = [
+    ("metal.html", "Metal"),
+]
+
+
+def perf_side_nav(active: str, sections) -> str:
+    """The Performance left nav: the page being built expands to its own
+    in-page sections, given as (anchor, label); every other page is a link."""
+    lines = []
+    for href, label in PERFORMANCE:
+        if href == active:
+            items = "\n".join(
+                f'      <cds-side-nav-menu-item href="#{html.escape(anchor)}">{html.escape(text)}</cds-side-nav-menu-item>'
+                for anchor, text in sections
+            )
+            lines.append(f'    <cds-side-nav-menu title="{html.escape(label)}" expanded>\n{items}\n    </cds-side-nav-menu>')
+        else:
+            lines.append(f'    <cds-side-nav-link href="{href}">{html.escape(label)}</cds-side-nav-link>')
+    body = "\n".join(lines)
+    return f"""<cds-side-nav aria-label="Performance" class="docs-side-nav">
+  <cds-side-nav-items>
+{body}
+  </cds-side-nav-items>
+</cds-side-nav>"""
+
 # The GitHub octicon "mark-github", inlined so the global action needs no
 # extra request. cds-header-global-action *is* CDSButton (it extends it
 # directly, just defaulting kind=ghost/size=lg/tooltip-position=bottom for
@@ -276,7 +305,7 @@ def main():
         build_chapter(title, src_rel, slug)
 
     build_archs.build(SITE / "architectures.html", header_html("", active="architectures.html"))
-    build_metal.build(SITE / "metal.html", header_html("", active="metal.html"))
+    build_metal.build(SITE / "metal.html", header_html("", active="metal.html"), perf_side_nav)
 
     if check_markdown_links():
         print("link check failed", file=sys.stderr)

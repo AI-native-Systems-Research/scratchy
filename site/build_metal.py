@@ -196,6 +196,25 @@ def tip(rows):
     return esc(json.dumps(rows, separators=(",", ":")))
 
 
+def info(body, label="", align="bottom"):
+    """A Carbon toggletip: an (i) button opening a short note, so explanations
+    sit where the question comes up instead of pushing the numbers down.
+    Carbon fixes its width at 18rem, so keep `body` to a few sentences. The
+    body is a <span>, not a <p>: toggletips sit inside paragraphs, and a <p>
+    in a <p> makes the parser close the outer one and spill the text out.
+    No `autoalign`: Carbon then calls scrollIntoView on the button every time
+    it renders, page load included, so a page of toggletips jumps to the last
+    one (Firefox lands at the bottom). A fixed alignment never scrolls."""
+    return (f'<cds-toggletip class="minfo" alignment="{align}" button-label="{esc(label or "What this means")}">'
+            f'{esc(label)}<span slot="body-text" class="minfo-body">{body}</span></cds-toggletip>')
+
+
+def fold(title, body):
+    """A collapsed Carbon accordion item, for detail most readers skip."""
+    return (f'<cds-accordion class="mfold"><cds-accordion-item title="{esc(title)}">'
+            f'{body}</cds-accordion-item></cds-accordion>')
+
+
 # Run-to-run spread on one machine at one commit: Nick's two M1 Max runs of
 # af009bf1 agreed within about 2%, so a smaller change is noise, not a result.
 NOISE = 0.03
@@ -227,6 +246,25 @@ def summary_raw(m, lk, sk):
 
 # Only tok/s is better higher; every time and memory column is better lower.
 SUMMARY_HIGHER_BETTER = [False, False, False, False, False, False, True, False]
+
+
+STARTUP_INFO = info(
+    "<b>frozen</b>: first launch after memory and scratchy's weights cache are cleared. "
+    "<b>cold</b>: a normal relaunch. Both run until the server is ready, no request "
+    "included. <b>1st req</b>: the cold server's first request, send to first token. "
+    "<b>warm</b>: the median over many requests once it is running. ollama reports ready "
+    "before loading the model, so its load time lands in 1st req.")
+TIMING_INFO = info(
+    "<b>no stream</b>: the answer arrived in one piece, so TTFT and TPOT could not be "
+    "timed. <b>†</b>: some answers did; the timing comes from the rest (hover for how "
+    "many). mlx-lm and ollama can stop answers early, which flatters tok/s.")
+RSS_INFO = info("The server process at its peak. For ollama, <code>ollama serve</code> "
+                "only; its runner process is not counted.")
+USERS_INFO = info("Requests in flight at once. An engine may batch fewer than it is offered.")
+
+
+# These sit in the section's subtitle, not in the table headings: the table
+# scrolls sideways inside its own box, which would clip a popover opened from it.
 
 
 def summary_table(m, run, prev=None):
@@ -268,7 +306,8 @@ def summary_table(m, run, prev=None):
               f'<code>{esc(str(prev[0]["repo"]["sha"])[:8])}</code>); ≈ is within 3%.')
     return f"""<div class="mpart">
   <h4>Startup and single-user speed</h4>
-  <p class="msub">One row per engine. Startup in seconds (warm in ms); one user at {shape or 'the base shape'}.{vs}</p>
+  <p class="msub">One row per engine. Startup in seconds (warm in ms); one user at {shape or 'the base shape'}.{vs}
+  What the columns mean: startup {STARTUP_INFO} one user {TIMING_INFO} peak RSS {RSS_INFO}</p>
 <div class="mtable"><table>
   <thead>
     <tr><th rowspan="2" scope="col" class="first">engine</th>
@@ -423,12 +462,10 @@ def conc_chart(m, mid, base, prev=None):
                     for t, u, svg, note in charts)
     return f"""<figure class="mfig">
   <figcaption><h4>As users are added</h4>
-    <p class="msub">Throughput and time per output token with {esc(", ".join(map(str, xs[:-1])) + " and " + str(xs[-1]) if len(xs) > 1 else xs[0])} users at once; {esc(base.get("input", "?"))}-token prompts, {esc(base.get("output", "?"))}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine.</p></figcaption>
+    <p class="msub">Throughput and time per output token with {esc(", ".join(map(str, xs[:-1])) + " and " + str(xs[-1]) if len(xs) > 1 else xs[0])} users at once {USERS_INFO}; {esc(base.get("input", "?"))}-token prompts, {esc(base.get("output", "?"))}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine.</p></figcaption>
   <div class="legend">{legend}</div>
   <div class="chartrow">{panes}</div>
-  <details><summary>Table view</summary><div class="mtable"><table>
-    <thead><tr><th scope="col">offered users</th>{head}</tr></thead><tbody>{''.join(trs)}</tbody>
-  </table></div></details>
+  {fold("Table view", f'<div class="mtable"><table><thead><tr><th scope="col">offered users</th>{head}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>')}
 </figure>"""
 
 
@@ -439,22 +476,42 @@ def ratio_tint(r):
         return ""
     k = min(abs(math.log2(r)) / 2, 1) * 50
     pole = "var(--div-pos)" if r >= 1 else "var(--div-neg)"
-    return f' style="background: color-mix(in oklab, {pole} {k:.0f}%, var(--bg-soft))"'
+    return f' style="background: color-mix(in oklab, {pole} {k:.0f}%, var(--heat-mid))"'
 
 
-def grid_maps(m, run):
+def faster_tput(s, o):
+    """How many times faster scratchy's throughput is (higher is better)."""
+    return s / o if s and o else None
+
+
+def faster_ttft(s, o):
+    """How many times faster scratchy's time to first token is (lower is better)."""
+    return o / s if s and o else None
+
+
+GRID_METRICS = [("output_throughput", "throughput", faster_tput),
+                ("median_ttft_ms", "time to first token", faster_ttft)]
+
+
+def grid_setup(m, run):
+    """A model's prompt-by-answer grid: (inputs, outputs, cells per engine,
+    rival, other), or None when scratchy has no grid. The rival is mlx-lm,
+    which runs the same MLX checkpoint; failing that ollama; None with neither."""
     sc = run["config"].get("scaling") or {}
     ins, outs = sc.get("grid_input") or [], sc.get("grid_output") or []
     have = {e[0]: {c["rung"]: c for c in m.get(e[3]) or [] if c.get("axis") == "grid"} for e in ENGINES}
     if not have["scratchy"] or not ins or not outs:
-        return ""
-    conc = (sc.get("base") or {}).get("conc", "?")
-    # Colour against mlx-lm, which runs the same MLX checkpoint; failing that,
-    # against ollama; with neither, show scratchy's own values uncoloured rather
-    # than a grid of blanks. The caption and scale say which.
+        return None
     present = [k for k in ("mlx-lm", "ollama") if have[k]]
-    rival = present[0] if present else None
-    other = present[1] if len(present) > 1 else None
+    return ins, outs, have, (present[0] if present else None), (present[1] if len(present) > 1 else None)
+
+
+def grid_maps(m, run):
+    setup = grid_setup(m, run)
+    if setup is None:
+        return ""
+    ins, outs, have, rival, other = setup
+    conc = ((run["config"].get("scaling") or {}).get("base") or {}).get("conc", "?")
 
     def why(c, name):
         return f"{name}: {NO_STREAM}" if c else f"no {name}"
@@ -489,34 +546,33 @@ def grid_maps(m, run):
                            f'data-tip="{tip(tiprows)}"><b>{big}</b><span>{small}</span></td>')
             rows.append(f'<tr><th scope="row">{i}</th>{"".join(tds)}</tr>')
         head = "".join(f'<th scope="col">{o}</th>' for o in outs)
+        versus = f" · scratchy vs {rival}" if rival else " · scratchy"
         return f"""<div class="heat">
-    <div class="heatttl">{esc(title)}</div>
-    <table><thead><tr><th scope="col"><span class="dim">in ↓ / out →</span></th>{head}</tr></thead>
-    <tbody>{''.join(rows)}</tbody></table>
+    <div class="heatttl"><b>{esc(title)}</b>{esc(versus)}</div>
+    <div class="mtable"><table><thead><tr><th scope="col"><span class="dim">prompt ↓ / answer →</span></th>{head}</tr></thead>
+    <tbody>{''.join(rows)}</tbody></table></div>
   </div>"""
 
-    def tput(s, o):                       # higher is better
-        return s / o if s and o else None
-
-    def ttft(s, o):                       # lower is better
-        return o / s if s and o else None
     if rival is None:
         note = "scratchy's own values; this run has no mlx-lm or ollama to compare against"
         scale = ""
     else:
         missing = [k for k in ("mlx-lm", "ollama") if not have[k]]
-        note = (f"how many times faster scratchy is than {rival}"
-                + (f", since this run has no {missing[0]}" if missing else "")
-                + "; hover for every engine's value")
-        scale = (f'<div class="scale"><span><i class="sw neg"></i>{rival} faster</span>'
+        note = (f"prompt size down the side, answer size across the top. Each large number "
+                f"is how many times faster scratchy is than {rival}"
+                + (f" (this run has no {missing[0]})" if missing else "")
+                + ": ×1.20 is 20% faster, below ×1 is slower"
+                + (f"; the small line is the same against {other}" if other else "")
+                + ". Hover for every engine's value")
+        scale = (f'<div class="scale"><span class="scalekey">Colour and large number, scratchy vs {esc(rival)}:</span>'
+                 f'<span><i class="sw neg"></i>{esc(rival)} faster</span>'
                  '<span><i class="sw mid"></i>about the same</span>'
                  '<span><i class="sw pos"></i>scratchy faster</span></div>')
     return f"""<figure class="mfig">
   <figcaption><h4>Prompt size × answer size</h4>
-    <p class="msub">{esc(conc)} users at once. {note[0].upper() + note[1:]}.</p></figcaption>
+    <p class="msub">{esc(conc)} users at once; {esc(note)}.</p></figcaption>
   <div class="heatrow">
-  {one("output_throughput", "throughput", tput)}
-  {one("median_ttft_ms", "time to first token", ttft)}
+  {"".join(one(metric, title, faster) for metric, title, faster in GRID_METRICS)}
   </div>
   {scale}
 </figure>"""
@@ -543,11 +599,11 @@ def history(entries):
                     f'<td><a href="{REPO}/commit/{esc(run["repo"]["sha"])}"><code>{sha}</code></a>'
                     '</td>'
                     f'<td>{esc(m.get("quant") or "")}</td>{tds}</tr>')
-    return f"""<details class="hist"><summary>Runs of this model ({len(entries)})</summary><div class="mtable"><table>
+    return fold(f"Runs of this model ({len(entries)})", f"""<div class="mtable"><table>
   <thead><tr><th scope="col">run</th><th scope="col">scratchy</th><th scope="col">quant</th>
   <th scope="col">cold s</th><th scope="col">1st req s</th><th scope="col">warm ms</th><th scope="col">tok/s, 1 user</th>
   <th scope="col">tok/s, most users</th><th scope="col">TPOT ms, most users</th></tr></thead>
-  <tbody>{''.join(rows)}</tbody></table></div></details>"""
+  <tbody>{''.join(rows)}</tbody></table></div>""")
 
 
 def runs_table(runs):
@@ -563,19 +619,88 @@ def runs_table(runs):
             f'<td>{esc(prime) if prime is not None else "not recorded"}</td>'
             f'<td>{esc(c.get("kv_cache_dtype") or "")}</td>'
             f'<td><a href="data/metal/{esc(run["_file"].name)}">json</a></td></tr>')
-    return f"""<details class="hist"><summary>Runs on this machine ({len(runs)})</summary><div class="mtable"><table>
+    return fold(f"Runs on this machine ({len(runs)})", f"""<div class="mtable"><table>
   <thead><tr><th scope="col">when</th><th scope="col">scratchy</th><th scope="col">steps</th>
   <th scope="col">cold priming launches</th><th scope="col">scratchy KV cache</th><th scope="col">data</th></tr></thead>
-  <tbody>{''.join(rows)}</tbody></table></div></details>"""
+  <tbody>{''.join(rows)}</tbody></table></div>""")
 
 
-def machine_section(chip, runs):
-    mslug = slug(chip)
-    latest, seen = {}, {}
-    for run in runs:                       # oldest first, so newer runs win
+def index(runs):
+    """Per machine, oldest run first: (runs, newest entry per model, every
+    entry per model). Newer runs win, so a model shows its newest numbers."""
+    machines = {}
+    for run in sorted(runs, key=lambda r: r["generated_utc"]):
+        rs, latest, seen = machines.setdefault(run["machine"]["chip"], ([], {}, {}))
+        rs.append(run)
         for m in run["models"]:
             latest[m["stem"]] = (run, m)
             seen.setdefault(m["stem"], []).append((run, m))
+    return dict(sorted(machines.items()))
+
+
+def glance(machines):
+    """Every model's prompt-by-answer grid on every machine as one small
+    multiple per metric: the same colours as the full grids, no numbers in the
+    squares, each linking to its model's full section."""
+    stems = []
+    for _rs, latest, _seen in machines.values():
+        stems += [stem for stem in latest if stem not in stems]
+    if not stems:
+        return ""
+
+    def mini(chip, stem, metric, faster):
+        entry = machines[chip][1].get(stem)
+        if entry is None:
+            return '<td class="gnone">not run</td>'
+        run, m = entry
+        setup = grid_setup(m, run)
+        if setup is None:
+            return '<td class="gnone">no grid</td>'
+        ins, outs, have, rival, _other = setup
+        if rival is None:
+            return '<td class="gnone">nothing to compare</td>'
+        squares, ratios = [], []
+        for i in ins:
+            for o in outs:
+                rung = f"{i}x{o}"
+                cs, cr = have["scratchy"].get(rung), have[rival].get(rung)
+                r = faster(timing(cs, metric), timing(cr, metric))
+                mark = PARTIAL if partial(cs, metric) or partial(cr, metric) else ""
+                if r is not None:
+                    ratios.append(r)
+                value = f"×{r:.2f}{mark}" if r is not None else "no comparison"
+                # A square with nothing to compare is hollow, so it never reads
+                # as "about the same".
+                squares.append(f'<span class="gsq{"" if r is not None else " gnil"}"{ratio_tint(r)} data-head="{esc(chip)} · {esc(stem)} · {i} in × {o} out" '
+                               f'data-tip="{tip([[value, "vs " + rival, "s1"]])}"></span>')
+        span = f"×{min(ratios):.2f} to ×{max(ratios):.2f}" if ratios else "no ratios"
+        return (f'<td><a class="gmini" href="#{slug(chip)}-{slug(stem)}" '
+                f'aria-label="{esc(stem)} on {esc(chip)}: scratchy {span} against {rival}; open the full grid" '
+                f'style="grid-template-columns: repeat({len(outs)}, 1fr)">{"".join(squares)}</a>'
+                f'<span class="grange">{span} vs {esc(rival)}</span></td>')
+
+    tables = []
+    for metric, title, faster in GRID_METRICS:
+        head = "".join(f'<th scope="col">{esc(stem)}</th>' for stem in stems)
+        rows = "".join(f'<tr><th scope="row">{esc(chip)}</th>'
+                       + "".join(mini(chip, stem, metric, faster) for stem in stems) + "</tr>"
+                       for chip in machines)
+        tables.append(f'<div class="heat"><div class="heatttl">{esc(title)}</div>'
+                      f'<div class="mtable"><table class="gtable"><thead><tr><th scope="col"></th>{head}</tr></thead>'
+                      f'<tbody>{rows}</tbody></table></div></div>')
+    return f"""<section class="msection" id="glance">
+  <h2>At a glance</h2>
+  <p class="msub">Every model's prompt size × answer size grid on every machine. Each square is
+  one cell of the full grid (rows: prompt, short to long; columns: answer, short to long),
+  coloured by how many times faster scratchy is than mlx-lm (ollama where a run has no mlx-lm).
+  Hover a square for its ratio; click a grid for its model.</p>
+  <div class="heatrow">{''.join(tables)}</div>
+  <div class="scale"><span><i class="sw neg"></i>scratchy slower</span><span><i class="sw mid"></i>about the same</span><span><i class="sw pos"></i>scratchy faster</span><span><i class="sw nil"></i>no comparison</span></div>
+</section>"""
+
+
+def machine_section(chip, runs, latest, seen):
+    mslug = slug(chip)
     mc = runs[-1]["machine"]
     cores = f'{mc["cores_total"]} cores'
     if mc.get("cores_performance"):
@@ -595,7 +720,7 @@ def machine_section(chip, runs):
             if f.get("binary_bytes"):
                 build += f', {round(f["binary_bytes"] / 1048576)} MiB binary'
         base = (run["config"].get("scaling") or {}).get("base") or {}
-        parts.append(f"""  <article class="mmodel" id="{mid}">
+        parts.append(f"""  <article class="mmodel cds--tile" id="{mid}">
     <h3>{esc(stem)} <span class="onmachine">on {esc(chip)}</span></h3>
     <p class="mmeta"><a href="https://huggingface.co/{esc(m["model_id"])}">{esc(m["model_id"])}</a>
       · {esc(m.get("quant") or "default")}{build}
@@ -609,29 +734,27 @@ def machine_section(chip, runs):
     return "\n".join(parts)
 
 
-def page(header, data_dir):
+def page(header, side_nav, data_dir):
     runs = load(data_dir)
-    machines = {}
-    for run in sorted(runs, key=lambda r: r["generated_utc"]):
-        machines.setdefault(run["machine"]["chip"], []).append(run)
-
+    machines = index(runs)
     if machines:
-        body = "\n".join(machine_section(chip, rs) for chip, rs in sorted(machines.items()))
+        body = glance(machines) + "\n" + "\n".join(
+            machine_section(chip, *entry) for chip, entry in machines.items())
+        sections = [("glance", "At a glance")] + [(slug(chip), chip) for chip in machines]
     else:
         body = ('<p class="empty">No runs published yet. Run <code>scripts/bench_metal_matrix.sh</code> '
                 'and copy its JSON into <code>site/data/metal/</code>.</p>')
-    nav = "\n".join(
-        f'      <cds-side-nav-link href="#{slug(chip)}">{esc(chip)}</cds-side-nav-link>'
-        for chip in sorted(machines))
-    fill = {"header": header, "nav": nav, "body": body, "count": str(len(runs)),
-            "machines": str(len(machines)), "repo": REPO}
+        sections = []
+    fill = {"header": header, "sidenav": side_nav("metal.html", sections), "body": body,
+            "count": str(len(runs)), "machines": str(len(machines)), "repo": REPO,
+            "about": ABOUT}
     # One pass, so text a placeholder inserts is never itself rewritten.
     out = re.sub(r"\{(" + "|".join(fill) + r")\}", lambda mo: fill[mo.group(1)], PAGE)
     return out, runs, len(machines)
 
 
-def build(out_path, header, data_dir=DATA):
-    out, runs, n = page(header, data_dir)
+def build(out_path, header, side_nav, data_dir=DATA):
+    out, runs, n = page(header, side_nav, data_dir)
     out_path = Path(out_path)
     out_path.write_text(out)
     dest = out_path.parent / "data" / "metal"
@@ -643,12 +766,19 @@ def build(out_path, header, data_dir=DATA):
 
 def main():
     sys.path.insert(0, str(HERE))
-    from build import header_html  # the one definition of the site chrome
+    from build import header_html, perf_side_nav  # the one definition of the site chrome
 
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "_site/metal.html"
     data = Path(sys.argv[2]) if len(sys.argv) > 2 else DATA
-    build(out, header_html("", active="metal.html"), data)
+    build(out, header_html("", active="metal.html"), perf_side_nav, data)
 
+
+ABOUT = info(
+    "Prompts are made up, a fixed size, and unique per request so no cache can answer "
+    "them, with greedy decoding (temperature 0) on every engine. mlx-lm runs the same MLX "
+    "checkpoint as scratchy; ollama runs its own GGUF quantization, named on its row. "
+    "scratchy's build time is shown per model and is never part of startup. The (i) "
+    "buttons next to a column explain it.", "About these numbers")
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -661,6 +791,8 @@ PAGE = r"""<!doctype html>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@carbon/styles@1/css/styles.min.css">
 <link rel="stylesheet" href="styles.css">
 <script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/ui-shell.min.js"></script>
+<script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/toggle-tip.min.js"></script>
+<script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/accordion.min.js"></script>
 <script>
 (function () {
   var mq = window.matchMedia('(prefers-color-scheme: dark)');
@@ -677,14 +809,7 @@ PAGE = r"""<!doctype html>
 
 {header}
 
-<cds-side-nav aria-label="Performance" class="docs-side-nav">
-  <cds-side-nav-items>
-    <cds-side-nav-menu title="Metal" expanded>
-      <cds-side-nav-link href="#about">About these numbers</cds-side-nav-link>
-{nav}
-    </cds-side-nav-menu>
-  </cds-side-nav-items>
-</cds-side-nav>
+{sidenav}
 
 <div class="docs-layout">
 <main class="docs-content metalpage">
@@ -694,41 +819,9 @@ PAGE = r"""<!doctype html>
     to start, how fast it answers one user, and how it holds up as prompts, answers and users
     grow. {count} runs on {machines} machines, every number measured by
     <a href="{repo}/blob/main/scripts/bench_metal_matrix.sh"><code>scripts/bench_metal_matrix.sh</code></a>.</p>
+    <div class="mabout">{about}</div>
   </div>
 
-  <section class="msection" id="about">
-    <h2>About these numbers</h2>
-    <dl class="defs">
-      <dt>Prompts</dt>
-      <dd>Made up, a fixed size, and unique per request so no cache can answer them. Greedy
-      decoding (<code>temperature 0</code>) on every engine.</dd>
-      <dt>frozen · cold</dt>
-      <dd>Launch until the server is ready, no request included. <i>frozen</i>: memory and
-      scratchy's weights cache cleared first. <i>cold</i>: a normal relaunch.</dd>
-      <dt>1st req · warm</dt>
-      <dd>Send to first token: the cold server's first request, then the median over many
-      requests once it is running.</dd>
-      <dt>Users</dt>
-      <dd>Requests in flight at once. An engine may batch fewer.</dd>
-      <dt>Weights</dt>
-      <dd>mlx-lm runs the same MLX checkpoint as scratchy; ollama runs its own GGUF
-      quantization, named on its row.</dd>
-      <dt>ollama startup</dt>
-      <dd>It reports ready before loading the model, so its load time lands in
-      <i>1st req</i>.</dd>
-      <dt>tok/s</dt>
-      <dd>mlx-lm and ollama can stop early, which flatters tok/s; TTFT and TPOT compare
-      fairly.</dd>
-      <dt>no stream</dt>
-      <dd>The answer arrived in one piece, so TTFT and TPOT could not be timed.</dd>
-      <dt>†</dt>
-      <dd>Some of that cell's answers arrived in one piece; its TTFT and TPOT come from the
-      rest. Hover for how many.</dd>
-      <dt>Build · RSS</dt>
-      <dd>scratchy's build time is shown per model, never in startup. Peak RSS is the server
-      process (<code>ollama serve</code> only, for ollama).</dd>
-    </dl>
-  </section>
 
 {body}
 </main>
