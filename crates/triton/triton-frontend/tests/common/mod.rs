@@ -1,5 +1,11 @@
 //! Shared fixture plumbing for the golden diff and the status table.
-#![allow(dead_code)] // each test binary uses a different subset of these helpers.
+//!
+//! Each test binary (golden_diff, divergence, fusion, gather, make_ttir,
+//! math_width, slicing, fixture_status) uses a different subset of these
+//! helpers — the same per-target-unused scope every `tests/common` module in
+//! this workspace carries (see ktir-emulator and scratchy-target-metal's
+//! twins); the module-level allow states that scope.
+#![allow(dead_code)] // per-target, not per-crate — see the doc above.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

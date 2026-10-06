@@ -941,44 +941,29 @@ pub fn run_matmul_loop_gpu(
         // runners) the engine has no f16 pipeline, so stay f32 — never produce an
         // f16 buffer the kernel can't consume (that was the metal.rs unwrap panic).
         let want_b_f16 = use_nax && f16_weights_enabled() && engine.has_f16_b_pipelines();
-        let _t_res = std::time::Instant::now();
-        let ua = resolve_gemm_operand_unified_off(
-            info.a_root,
-            m,
-            k,
-            info.m_row_off as usize,
+        let gemm = GemmResolveCtx {
             ctx,
             engine,
-            false, // A (activation) is always f32 in
-        )?;
+            want_b_f16,
+        };
+        let gemm_a = GemmResolveCtx {
+            ctx,
+            engine,
+            want_b_f16: false, // A (activation) is always f32 in
+        };
+        let _t_res = std::time::Instant::now();
+        let ua =
+            resolve_gemm_operand_unified_off(info.a_root, m, k, info.m_row_off as usize, &gemm_a)?;
         // B operand, resolved VERBATIM (no transpose, no gather):
         //   * transpose-B: the [n,k] weight, or its CONTIGUOUS row-slice for an
         //     N-tile (rows [n_off, n_off+n) — a contiguous block, not a gather).
         //   * plain: the [k,n] weight (contiguous) or a strided column slice.
         let ub = if info.transpose_b {
-            resolve_gemm_bt_operand(
-                info.b_root,
-                n,
-                k,
-                info.n_off,
-                info.b_dtype,
-                ctx,
-                engine,
-                want_b_f16,
-            )?
+            resolve_gemm_bt_operand(info.b_root, n, k, info.n_off, info.b_dtype, &gemm)?
         } else if info.n_off == 0 && info.b_stride == info.n {
-            resolve_gemm_operand_unified(info.b_root, k, n, ctx, engine, want_b_f16)?
+            resolve_gemm_operand_unified(info.b_root, k, n, &gemm)?
         } else {
-            resolve_gemm_weight_slice(
-                info.b_root,
-                k,
-                n,
-                info.n_off,
-                info.b_stride,
-                ctx,
-                engine,
-                want_b_f16,
-            )?
+            resolve_gemm_weight_slice(info.b_root, k, n, info.n_off, info.b_stride, &gemm)?
         };
         GEMM_RESOLVE_NS.fetch_add(
             _t_res.elapsed().as_nanos() as u64,
@@ -1083,6 +1068,18 @@ pub fn run_matmul_loop_gpu(
     Ok(())
 }
 
+/// The GEMM weight resolvers' shared facts — the bundle that keeps every
+/// `resolve_gemm_*` signature under the arity lint (a resolver states its OWN
+/// shape facts, and everything ambient rides here).
+#[cfg(metal)]
+pub(crate) struct GemmResolveCtx<'a> {
+    pub ctx: &'a crate::context::CoreContext,
+    pub engine: &'a NaxGemm,
+    /// f16 B only on the NAX GPU path (the flag AND f16 pipelines); every other
+    /// path keeps f32 B — see the `want_b_f16` derivation at the call site.
+    pub want_b_f16: bool,
+}
+
 /// Resolve a GEMM operand to a resident [`UnifiedBuffer`].
 ///
 ///   * A resident `Tile` (a forwarded activation) is uploaded to a FRESH buffer
@@ -1097,11 +1094,9 @@ fn resolve_gemm_operand_unified(
     root: Ssa,
     rows: usize,
     cols: usize,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    want_f16: bool,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
-    resolve_gemm_operand_unified_off(root, rows, cols, 0, ctx, engine, want_f16)
+    resolve_gemm_operand_unified_off(root, rows, cols, 0, gemm)
 }
 
 /// [`resolve_gemm_operand_unified`] with a leading ROW offset: read the `rows×cols`
@@ -1114,12 +1109,13 @@ fn resolve_gemm_operand_unified_off(
     rows: usize,
     cols: usize,
     row_off: usize,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    // f16 applies only to a WEIGHT (HBM pointer); a forwarded activation TILE is
-    // always f32 (it is the A operand, kept f32 in).
-    want_f16: bool,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let GemmResolveCtx {
+        ctx,
+        engine,
+        want_b_f16,
+    } = *gemm;
     let n = rows * cols;
     let elem_off = row_off * cols;
     match ctx.get_value(root)? {
@@ -1149,10 +1145,10 @@ fn resolve_gemm_operand_unified_off(
             // is elem*bytes_per_elem (f16 weight), NOT elem*STICK_BYTES.
             let addr = (elem + elem_off as i64) * DType::F16.bytes_per_elem() as i64;
             // Build the resident weight buffer: f16 (raw HBM bytes, no f32 expansion,
-            // half the streamed bytes) when `want_f16`, else f32 (decoded).
+            // half the streamed bytes) when `want_b_f16`, else f32 (decoded).
             let build = || -> Result<UnifiedBuffer, String> {
                 let hbm = ctx.hbm.borrow();
-                if want_f16 {
+                if want_b_f16 {
                     let raw = hbm.read_bytes(addr, n * DType::F16.bytes_per_elem());
                     engine.unified_f16_from_raw(&raw)
                 } else {
@@ -1173,7 +1169,7 @@ fn resolve_gemm_operand_unified_off(
                 len: n,
                 fingerprint,
                 col_off: 0,
-                f16: want_f16,
+                f16: want_b_f16,
             };
             // Fast path: a hit returns the cached buffer with no further HBM work.
             if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
@@ -1213,17 +1209,19 @@ fn resolve_gemm_operand_unified_off(
 /// elements at `col_off`) and cached by [`WeightKey`] including `col_off`, so the 8
 /// tiles of one weight cache independently and are decoded+uploaded at most once.
 #[cfg(metal)]
-#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_weight_slice(
     root: Ssa,
     k: usize,
     n: usize,
     col_off: i64,
     b_stride: i64,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    want_f16: bool,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let GemmResolveCtx {
+        ctx,
+        engine,
+        want_b_f16,
+    } = *gemm;
     let elem = match ctx.get_value(root)? {
         crate::ir::Value::Index(s) => *s,
         other => {
@@ -1240,7 +1238,7 @@ fn resolve_gemm_weight_slice(
     // f32 expansion). f32: decode each strided row to f32.
     let build = || -> Result<UnifiedBuffer, String> {
         let hbm = ctx.hbm.borrow();
-        if want_f16 {
+        if want_b_f16 {
             let mut raw = Vec::with_capacity(k * n * bpe as usize);
             for r in 0..k as i64 {
                 let row_addr = base + (r * b_stride + col_off) * bpe;
@@ -1269,7 +1267,7 @@ fn resolve_gemm_weight_slice(
         len: k * n,
         fingerprint,
         col_off,
-        f16: want_f16,
+        f16: want_b_f16,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1294,17 +1292,19 @@ fn resolve_gemm_weight_slice(
 /// CONTIGUOUS block (`n*k` elements at `n_off*k`) — so this is a plain contiguous
 /// read either way. Cached once per process (keyed by `col_off = n_off`).
 #[cfg(metal)]
-#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_bt_operand(
     root: Ssa,
     n: usize,
     k: usize,
     n_off: i64,
     b_dtype: DType,
-    ctx: &crate::context::CoreContext,
-    engine: &NaxGemm,
-    want_f16: bool,
+    gemm: &GemmResolveCtx<'_>,
 ) -> Result<std::rc::Rc<UnifiedBuffer>, String> {
+    let GemmResolveCtx {
+        ctx,
+        engine,
+        want_b_f16,
+    } = *gemm;
     let elem = match ctx.get_value(root)? {
         crate::ir::Value::Index(s) => *s,
         other => {
@@ -1324,7 +1324,7 @@ fn resolve_gemm_bt_operand(
     // at the view's own element type — an fp8 weight decodes one BYTE per element.
     let build = || -> Result<UnifiedBuffer, String> {
         let hbm = ctx.hbm.borrow();
-        if want_f16 && b_dtype == DType::F16 {
+        if want_b_f16 && b_dtype == DType::F16 {
             let raw = hbm.read_bytes(addr, count * bpe as usize);
             engine.unified_f16_from_raw(&raw)
         } else {
@@ -1346,7 +1346,7 @@ fn resolve_gemm_bt_operand(
         len: count,
         fingerprint,
         col_off: n_off,
-        f16: want_f16,
+        f16: want_b_f16,
     };
     if let Some(buf) = WEIGHT_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         WEIGHT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
