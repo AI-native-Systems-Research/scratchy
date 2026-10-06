@@ -1872,7 +1872,7 @@ fn spliced_attn_lowers_through_the_door() {
                     .ktir
                     .as_ref()
                     .expect("spliced op carries its program");
-                let one_pass_mask = matches!(ktir.mask, Some(_));
+                let one_pass_mask = ktir.mask.is_some();
                 let want_one_pass = s.mq >= 8;
                 assert_eq!(
                     one_pass_mask, want_one_pass,
