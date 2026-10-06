@@ -608,14 +608,15 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .heat th { color: var(--muted); font-weight: 600; padding: 0.25rem 0.5rem; text-align: right; }
 .heat td { background: var(--heat-mid); color: var(--fg); padding: 0.4rem 0.6rem; min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums; border-radius: 2px; }
 .heat td b { display: block; font-size: 1rem; }
-.heat td span { display: block; color: var(--muted); font-size: var(--cds-label-01-font-size, 0.75rem); }
+/* Text ink, not muted grey: on a strong tint grey loses its contrast. */
+.heat td span { display: block; color: var(--fg); font-size: var(--cds-label-01-font-size, 0.75rem); }
 .heat td:hover, .heat td:focus-visible { outline: 1px solid var(--fg); outline-offset: -1px; }
 .scale { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--muted); margin-top: 0.5rem; }
 .scale .scalekey { color: var(--fg); }
 .scale .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 0.35rem; }
-.scale .sw.neg { background: color-mix(in oklab, var(--div-neg) 50%, var(--heat-mid)); }
+.scale .sw.neg { background: color-mix(in oklab, var(--div-neg) 70%, var(--heat-mid)); }
 .scale .sw.mid { background: var(--heat-mid); border: 1px solid var(--line); }
-.scale .sw.pos { background: color-mix(in oklab, var(--div-pos) 50%, var(--heat-mid)); }
+.scale .sw.pos { background: color-mix(in oklab, var(--div-pos) 70%, var(--heat-mid)); }
 
 /* At a glance: one small grid per machine and model, colour only. */
 .heat .gtable td { background: none; min-width: 0; padding: 0.4rem 0.75rem 0.6rem 0; text-align: left; }

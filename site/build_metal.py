@@ -470,11 +470,14 @@ def conc_chart(m, mid, base, prev=None):
 
 
 def ratio_tint(r):
-    """Diverging tint for a 'how many times faster is scratchy' ratio: blue
-    above 1, red below, neutral at 1, saturating at 4x either way."""
-    if r is None:
+    """Diverging tint for a "how many times faster is scratchy" ratio: blue
+    above 1, red below, plain grey inside the run-to-run noise band. Starts
+    clearly visible (25%) and reaches its strongest at 2x either way, where
+    this page's differences actually sit. Capped at 70%: past that, text in
+    the dark theme drops under 4.5:1 on the red end."""
+    if r is None or abs(r - 1) < NOISE:
         return ""
-    k = min(abs(math.log2(r)) / 2, 1) * 50
+    k = 25 + 45 * min(abs(math.log2(r)), 1)
     pole = "var(--div-pos)" if r >= 1 else "var(--div-neg)"
     return f' style="background: color-mix(in oklab, {pole} {k:.0f}%, var(--heat-mid))"'
 
