@@ -1556,7 +1556,10 @@ impl AttnShape {
 ///   its own region rows — a different tile shape and no runtime mask;
 /// * prefill ONE-PASS (`ActiveCap::NONE`, `mq > 1`, new block == the whole chunk): the dead
 ///   prefix's injected views + the additive `[mq, mq]` causal triangle — 2b at the m=31 rung and
-///   8b at the m=96 rung (the rung the card bakes);
+///   8b at the m=96 rung (the rung the card bakes), plus the ladder's own bottom rung m=7 and
+///   the descriptor-law boundary m=8: below 8 the triangle is unstated through any descriptor
+///   (a 7-wide f16 block is 14 bytes, under Triton's 16-byte floor) and the shape takes the
+///   per-row arm; at 8 it stays one-pass;
 /// * prefill CONTINUATION (`swept > 0`, `mq > 1`): per-row causal `qi+1` tiles over the new
 ///   block beside the swept prefix, at `ActiveCap::FULL` — the prefix-capable bundle's own bake.
 const ATTN_SHAPES: &[AttnShape] = &[
@@ -1610,6 +1613,30 @@ const ATTN_SHAPES: &[AttnShape] = &[
     AttnShape {
         geom: (32, 8, 64),
         mq: 31,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    // 2b prefill, the ladder's OWN BOTTOM RUNG: m=7. The one-pass arm's causal
+    // triangle is a `[7, 7]` f16 ADD, and Triton's descriptor law demands 16 bytes in
+    // the last block dim (7 * 2 = 14 < 16) — so this shape MUST take the per-row
+    // continuation arm, which states causality by `qi + 1` slice and binds NO mask.
+    // The card bake's first rung is exactly this shape; a regression to the one-pass
+    // arm here is the build-time refusal the ladder law below exists to make a test
+    // failure instead.
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 7,
+        cap: 256,
+        rung: u32::MAX,
+        rope_appended: true,
+    },
+    // The descriptor law's own boundary: MQ=8 (8 * 2 = 16 bytes) is the FLOOR the
+    // one-pass arm accepts, and must stay on it — not fall through to the per-row
+    // arm — so the boundary is pinned from both sides.
+    AttnShape {
+        geom: (32, 8, 64),
+        mq: 8,
         cap: 256,
         rung: u32::MAX,
         rope_appended: true,
@@ -1830,6 +1857,30 @@ fn spliced_attn_lowers_through_the_door() {
                 s.mq,
                 s.rung
             );
+
+            // ⛔ THE ARM THE SHAPE TOOK, PINNED BY THE MASK SLOT — at `rung == NONE`
+            // (a first-chunk prefill, no runtime length mask) the one observable
+            // difference between the one-pass and the per-row arm: the one-pass binds
+            // the `[mq, mq]` causal triangle (a mask parameter), the per-row arm
+            // states causality by slice and binds none. MQ=7 must take the per-row
+            // arm (the descriptor law: a 7-wide f16 mask block is 14 bytes, under
+            // Triton's 16-byte floor); MQ=8 is the law's own boundary and must STAY
+            // one-pass. Decode and continuation shapes bind the runtime length mask
+            // instead, so they are outside this pin.
+            if s.rung == u32::MAX {
+                let ktir = spliced
+                    .ktir
+                    .as_ref()
+                    .expect("spliced op carries its program");
+                let one_pass_mask = matches!(ktir.mask, Some(_));
+                let want_one_pass = s.mq >= 8;
+                assert_eq!(
+                    one_pass_mask, want_one_pass,
+                    "the arm the causal one-pass condition picked (geom={:?} mq={}): \
+                     the mask slot is bound exactly when the one-pass arm runs",
+                    s.geom, s.mq
+                );
+            }
 
             // The program lowers through the production door under the walk's own
             // layout, with the bundle facts stated exactly as the tape walk states
