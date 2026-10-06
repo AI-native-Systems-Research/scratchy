@@ -51,6 +51,7 @@ impl CodecGuard {
 
 /// A target's realization of each guard, one field per guard: a new guard is a missing field in
 /// every target's table, not a silent default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuardGates<G> {
     pub codec: G,
     pub codec_decode: G,
