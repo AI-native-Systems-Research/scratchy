@@ -20,7 +20,7 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
   tid (`KtirNode.mask`); the builder's own `arg_for` order is the same.
 * VIEWS: q and out are `[MQ, NQH*HD]`; the cache params are `[CAP, NKVH*HD]`; the new
   params are `[NEW_LEN, NKVH*HD]`; the mask is `[1, SWEPT]` (decode) or `[MQ, MQ]`
-  (the causal one-pass, `MQ >= 8` only). Every extent is a constexpr — one kernel per
+  (the causal one-pass). Every extent is a constexpr — one kernel per
   shape, the fixture's delta-7 law.
 * GRID: `[1]` — the head and row loops are trace-time `tl.static_range`, unrolled
   with constant corners (rope.py's law). ⛔ NOT a head-parallel grid: the ladder's
@@ -38,13 +38,12 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 2. PREFILL ONE-PASS (`ONE_PASS`): the first prompt chunk — no resident prefix
    (`SWEPT == 0`, the bundle baked `ActiveCap::NONE`) attends only its own `MQ`
    tokens causally: whole-chunk scores `[MQ, MQ]` plus the additive triangle mask,
-   ONE row-wise softmax. The builder's own one-pass arm — taken at `MQ >= 8` only
-   (the descriptor law: an f16 mask tile needs a 16-byte last block dim, and the
-   block IS the tile); a smaller chunk falls through to arm 3, whose per-row
-   `qi + 1` slices state the same causality with no mask at all.
+   ONE row-wise softmax. The builder's own one-pass arm, at every `MQ > 1` — the
+   front end's TMA 16-byte floor (a GPU law) is gone, so the ladder's bottom rung
+   (MQ=7) takes this arm exactly as the builder's did.
 3. PREFILL CONTINUATION (`MQ > 1`, `SWEPT > 0`): per row, per head, the 3-pass
    loop over both segments with the new segment's causal extent `qi + 1` — and,
-   at `SWEPT == 0` (the small-MQ first chunk), over the new segment alone, the
+   at `SWEPT == 0`, over the new segment alone, the
    prefix guards keeping the swept descriptors unaddressed exactly as the decode
    arm's do.
 
@@ -113,12 +112,10 @@ def attn_fwd(desc_q, desc_o,  #
                                         block_shape=[NEW_LEN, HD])
     # The runtime length mask: `[1, SWEPT]` bounding the resident prefix to the rows
     # valid this step (decode), or the `[MQ, MQ]` additive causal triangle (the
-    # one-pass — whose `MQ >= 8` floor is the descriptor law stated at the arm below,
-    # so this branch never traces below it). Built only when a segment consumes it —
-    # an unguarded descriptor no load reads leaves its parameter unaddressed
-    # (delta 11). Nested constexpr ifs, not `and`: the parser refuses Python `BoolOp`
-    # inside a @triton.jit kernel, and both selectors are constexpr so each `if`
-    # resolves at trace time anyway.
+    # one-pass). Built only when a segment consumes it — an unguarded descriptor no
+    # load reads leaves its parameter unaddressed (delta 11). Nested constexpr ifs,
+    # not `and`: the parser refuses Python `BoolOp` inside a @triton.jit kernel, and
+    # both selectors are constexpr so each `if` resolves at trace time anyway.
     if HAS_MASK:
         if ONE_PASS:
             mask_desc = tl.make_tensor_descriptor(desc_mask, shape=[MQ, MQ],
@@ -133,47 +130,34 @@ def attn_fwd(desc_q, desc_o,  #
     # whole chunk in one pass, per head. The whole-chunk `[MQ, HD]` output stores
     # through a `[MQ, HD]`-block descriptor over the same out pointer — rope.py's
     # second-descriptor law (the base `o_desc` stays `[1, HD]`-blocked for the other
-    # arms' single-row stores).
-    #
-    # ⛔ MQ >= 8 ONLY — THE DESCRIPTOR LAW. The causal triangle enters the scores by
-    # ADDING a `[MQ, MQ]` tile, and the only way this front end states a `[MQ, MQ]`
-    # tile is a descriptor whose block IS `[MQ, MQ]` (the block shape is the tile
-    # shape — `convert_ttir_to_ktdp`'s `build_direct_access_tile`). Triton's
-    # descriptor law demands 16 bytes in the last block dim (`codegen.rs`, the port
-    # of `semantic.py:1863`), so an f16 mask needs `MQ >= 8` — a `[7, 7]` tile is
-    # UNSTATABLE through any descriptor, and no padding trick can produce one (the
-    # block is the tile). The ladder's own bottom rung is 7, so the small chunk
-    # falls to the CASE 3 per-row arm below, which states causality by SLICE
-    # (`slen = qi + 1`) instead of by mask — the builder's own row loop, the path
-    # every shape it did not special-case takes. MQ == 8 is the boundary and stays
-    # here: 8 * 2 = 16 bytes, the law's own floor. Nested constexpr ifs, not `and` —
-    # the parser refuses Python `BoolOp` inside a @triton.jit kernel, and both
-    # selectors are constexpr so each `if` resolves at trace time anyway.
+    # arms' single-row stores). The `[MQ, MQ]` mask descriptor above has NO
+    # minimum width: the front end's TMA 16-byte floor was a GPU law this target
+    # does not have, and it is gone — the ladder's bottom rung (MQ=7) takes this
+    # arm exactly as the builder's did.
     if ONE_PASS:
-        if MQ >= 8:
-            o_wide = tl.make_tensor_descriptor(desc_o, shape=[MQ, q_width],
-                                               strides=[q_width, 1],
-                                               block_shape=[MQ, HD])
-            q_wide = tl.make_tensor_descriptor(desc_q, shape=[MQ, q_width],
-                                               strides=[q_width, 1],
-                                               block_shape=[MQ, HD])
-            for h in tl.static_range(0, NQH, 1):
-                kvh = h // GQA
-                q = q_wide.load([0, h * HD])  # [MQ, HD]
-                k = kd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
-                kt = k.T  # [HD, MQ]
-                qk = tl.dot(q, kt, out_dtype=tl.float16)  # [MQ, MQ]
-                qk = qk * SCALE
-                qk = qk + mask_desc.load([0, 0])
-                # Row-wise softmax, one reduce per axis.
-                mx = tl.max(qk, 1)  # [MQ]
-                sh = qk - mx[:, None]
-                e = tl.exp(sh.to(tl.float32)).to(tl.float16)
-                su = tl.sum(e, 1)  # [MQ]
-                v = vd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
-                o = tl.dot(e, v, out_dtype=tl.float16)  # [MQ, HD]
-                o = o / su[:, None]
-                o_wide.store([0, h * HD], o)
+        o_wide = tl.make_tensor_descriptor(desc_o, shape=[MQ, q_width],
+                                           strides=[q_width, 1],
+                                           block_shape=[MQ, HD])
+        q_wide = tl.make_tensor_descriptor(desc_q, shape=[MQ, q_width],
+                                           strides=[q_width, 1],
+                                           block_shape=[MQ, HD])
+        for h in tl.static_range(0, NQH, 1):
+            kvh = h // GQA
+            q = q_wide.load([0, h * HD])  # [MQ, HD]
+            k = kd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
+            kt = k.T  # [HD, MQ]
+            qk = tl.dot(q, kt, out_dtype=tl.float16)  # [MQ, MQ]
+            qk = qk * SCALE
+            qk = qk + mask_desc.load([0, 0])
+            # Row-wise softmax, one reduce per axis.
+            mx = tl.max(qk, 1)  # [MQ]
+            sh = qk - mx[:, None]
+            e = tl.exp(sh.to(tl.float32)).to(tl.float16)
+            su = tl.sum(e, 1)  # [MQ]
+            v = vd_desc.load([KD_ROW, KD_COL + kvh * HD])  # [MQ, HD]
+            o = tl.dot(e, v, out_dtype=tl.float16)  # [MQ, HD]
+            o = o / su[:, None]
+            o_wide.store([0, h * HD], o)
     elif MQ == 1:
         for h in tl.static_range(0, NQH, 1):
             kvh = h // GQA
@@ -224,14 +208,12 @@ def attn_fwd(desc_q, desc_o,  #
         # causal extent exactly as the builder does (`slen = qi + 1`), never a
         # whole-row max.
         #
-        # ⛔ THE PREFIX SEGMENT IS CONDITIONAL — the SAME `if SWEPT > 0` guard the
-        # decode arm carries, and for the same reason: the one-pass arm only takes
-        # `MQ >= 8` (the descriptor law above), so a SMALL-MQ first chunk (the
-        # ladder's own bottom rung is 7) reaches THIS arm with no resident prefix —
-        # `SWEPT == 0`, the swept descriptors guarded away, and the row's loop over
-        # one segment is the causal extent in full. The builder's row loop is the
-        # same shape: its `live` segment list skips the dead prefix, and causality
-        # comes from `qi + 1` either way.
+        # ⛔ THE PREFIX SEGMENT IS CONDITIONAL — the `if SWEPT > 0` guards exist for
+        # the `SWEPT == 0` shape (a first chunk baked `ActiveCap::NONE`): the swept
+        # descriptors stay addressed-nowhere and the row's loop over the one new
+        # segment is the causal extent in full. The builder's row loop is the same
+        # shape: its `live` segment list skips the dead prefix, and causality comes
+        # from `qi + 1` either way.
         for qi in tl.static_range(0, MQ, 1):
             # The row's causal extent of the new segment: a second descriptor pair
             # over the same pointers, block width the row's own `qi + 1` (rope.py's

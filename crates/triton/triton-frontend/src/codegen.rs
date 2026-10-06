@@ -2721,19 +2721,18 @@ impl<'a> CodeGen<'a> {
                 ));
             }
         };
-        let elem_size = (elem_bits / 8).max(1) as i64;
-        let contig = *block_shape.last().unwrap();
-        if contig * elem_size < 16 {
-            return Err(Error::new(
-                format!(
-                    "Descriptor block shape must have at least 16 bytes in the last \
-                     dimension, but got {contig} * {elem_size} = {} bytes",
-                    contig * elem_size
-                ),
-                pos.line,
-                pos.col,
-            ));
-        }
+        let _ = elem_bits;
+        // ⛔ NO 16-BYTE FLOOR — upstream Triton's check here (`semantic.py:1863`) is
+        // NVIDIA TMA's own law: a TMA descriptor's innermost box must be ≥16 bytes on
+        // that hardware. This front end lowers to KTIR for Spyre, whose descriptor
+        // path (the door's direct-access tiles) has no such floor — the builder that
+        // preceded the splice emitted the `[7, 7]` f16 causal-triangle tile (the
+        // prefill ladder's bottom rung) and the card ran it. Applying the GPU
+        // validation here changed which device program runs (the small chunk fell to
+        // a per-row arm) to satisfy a constraint the target does not have — the
+        // review's finding. The block shape still must be compile-time constants
+        // (checked above) and the last stride 1 (checked above); those are the
+        // KTIR-side facts.
 
         let mut shape_ids = Vec::with_capacity(ndim);
         for s in &shape {

@@ -1859,21 +1859,22 @@ fn spliced_attn_lowers_through_the_door() {
             );
 
             // ⛔ THE ARM THE SHAPE TOOK, PINNED BY THE MASK SLOT — at `rung == NONE`
-            // (a first-chunk prefill, no runtime length mask) the one observable
-            // difference between the one-pass and the per-row arm: the one-pass binds
-            // the `[mq, mq]` causal triangle (a mask parameter), the per-row arm
-            // states causality by slice and binds none. MQ=7 must take the per-row
-            // arm (the descriptor law: a 7-wide f16 mask block is 14 bytes, under
-            // Triton's 16-byte floor); MQ=8 is the law's own boundary and must STAY
-            // one-pass. Decode and continuation shapes bind the runtime length mask
-            // instead, so they are outside this pin.
+            // (a first-chunk prefill, no runtime length mask) every `MQ > 1` shape
+            // takes the causal one-pass arm and binds the `[mq, mq]` triangle (a
+            // mask parameter); the per-row continuation arm states causality by
+            // slice and binds none. The mq=7 row pins the FRONT END'S OWN LAW: the
+            // TMA 16-byte floor was a GPU validation removed from this target, so
+            // the ladder's bottom rung takes the one-pass arm exactly as the
+            // builder's did — a re-introduced floor would flip this row. Decode and
+            // continuation shapes bind the runtime length mask instead, so they are
+            // outside this pin.
             if s.rung == u32::MAX {
                 let ktir = spliced
                     .ktir
                     .as_ref()
                     .expect("spliced op carries its program");
                 let one_pass_mask = ktir.mask.is_some();
-                let want_one_pass = s.mq >= 8;
+                let want_one_pass = s.mq > 1;
                 assert_eq!(
                     one_pass_mask, want_one_pass,
                     "the arm the causal one-pass condition picked (geom={:?} mq={}): \

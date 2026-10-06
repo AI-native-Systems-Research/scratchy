@@ -806,15 +806,11 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
     // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
     // block spanning the whole chunk (`seq_len == mq`) — the additive `[mq, mq]` causal
-    // triangle can then replace the per-row slice.
-    // ⛔ PLUS THE DESCRIPTOR LAW'S OWN FLOOR, `mq >= 8`: the causal triangle enters the
-    // scores by ADDING a `[mq, mq]` tile, and the only way the front end states one is a
-    // descriptor whose block IS `[mq, mq]` — which Triton's 16-byte last-dim law makes
-    // impossible for an f16 mask below 8 rows. A smaller chunk (the ladder's own bottom
-    // rung is 7) takes the per-row continuation arm instead, which states causality by
-    // SLICE (`slen = qi + 1`) and needs NO mask — the builder's own row loop, the path
-    // every shape it did not special-case takes.
-    let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1 && mq >= 8;
+    // triangle can then replace the per-row slice. (A temporary `mq >= 8` floor sat
+    // here to satisfy the front end's since-removed TMA 16-byte check — a GPU law the
+    // Spyre target does not have; with the check gone the builder's own condition
+    // stands again, and the ladder's bottom rung takes the one-pass arm like main.)
+    let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1;
     // THE MASK IS BOUND WHEN A SEGMENT CONSUMES IT — the runtime length mask (decode,
     // `[1, prefix_len]`) or the causal triangle (the one-pass, `[mq, mq]`). The builder
     // mints the mask tile in exactly these two arms and no other.
@@ -883,9 +879,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// be a binding slot nothing addresses (the ladder DCEs the unconsumed descriptor and the
 /// handoff refuses "addressed NOWHERE"). `HAS_MASK` is the builder's own `mask_prefix`,
 /// and `ONE_PASS` the builder's own one-pass arm condition (`live.len() == 1 && mq > 1 &&
-/// !mask_prefix && seq_len == mq`) plus the descriptor law's own floor `mq >= 8` — the
-/// causal triangle is a `[mq, mq]` ADD, whose only descriptor encoding needs a 16-byte
-/// last block dim, so a smaller chunk states causality by per-row slice instead.
+/// !mask_prefix && seq_len == mq`).
 ///
 /// The facts arrive as ONE struct — the group is the shape's own frame (geometry, widths,
 /// segment extents, arm selectors), minted by `lower_attn` beside the laws that derive
