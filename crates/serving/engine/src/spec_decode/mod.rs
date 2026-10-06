@@ -25,7 +25,7 @@ pub mod verify;
 pub use backend::{
     BackendError, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle, SpecDecodeBackend,
 };
-pub use mtp::{MtpProposer, MtpProposerConfig};
+pub use mtp::{MtpDrafter, MtpProposer, MtpProposerConfig};
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};
 pub use verify::{RejectionResult, greedy_rejection_sample};

@@ -182,9 +182,22 @@ pub struct SchedulerOutput {
 
     /// Request IDs preempted in this step (used by v2 model runner).
     pub preempted_req_ids: Option<HashSet<String>>,
+
+    /// The requests a worker-side draft head runs for once this step's target forward has: their
+    /// rows pass through it, and each that produces a token drafts the next step's. Planned by the
+    /// engine's proposer after scheduling, not by the scheduler.
+    #[serde(default)]
+    pub draft_req_ids: HashSet<String>,
 }
 
 impl SchedulerOutput {
+    /// Whether the step after this one needs this one's outcome to be scheduled: the drafts it
+    /// makes (`draft_req_ids`), or how many of the drafts it verifies it keeps. A loop that
+    /// schedules ahead queues nothing behind it.
+    pub fn is_speculative(&self) -> bool {
+        !self.draft_req_ids.is_empty() || !self.scheduled_spec_decode_tokens.is_empty()
+    }
+
     /// Create an empty `SchedulerOutput` with no scheduled work.
     pub fn make_empty() -> Self {
         Self {
@@ -198,6 +211,7 @@ impl SchedulerOutput {
             finished_req_ids: HashSet::new(),
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
+            draft_req_ids: HashSet::new(),
         }
     }
 }
@@ -289,6 +303,7 @@ mod tests {
             finished_req_ids: HashSet::new(),
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: None,
+            draft_req_ids: HashSet::new(),
         };
         assert_eq!(so.total_num_scheduled_tokens, 150);
         assert_eq!(so.scheduled_new_reqs.len(), 1);

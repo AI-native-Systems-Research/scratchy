@@ -21,11 +21,17 @@
 //! sequence that produced a token this step drafts; an intermediate prefill chunk still runs its
 //! rows through pass 1, priming the head's KV for the prompt.
 //!
-//! A step of more than the head's `max_seqs` sequences (its compiled `spec_max_seqs`) runs no head
-//! forward, so it costs what its target alone does. Its sequences' head KV then misses the step's
-//! rows, so they draft no more (`stale`) until a recompute runs them from their first position.
+//! The worker that ran the step runs the passes ([`MtpDrafter`]) for the requests the engine
+//! planned when it scheduled the step ([`MtpProposer`]'s `plan`), and returns their drafts with
+//! the step's output — so the engine schedules asynchronously, waiting only on a step that drafts
+//! or verifies. A step of more than the head's `max_seqs` sequences (its compiled
+//! `spec_max_seqs`) plans none: it costs what its target alone does. Its sequences' head KV then
+//! misses the step's rows, so they draft no more (`stale`) until a recompute runs them from their
+//! first position.
 
 use std::collections::{HashMap, HashSet};
+
+use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
 
 use super::backend::{
     BackendError, ForwardArgmaxRequest, KvPoolHandle, ModelHandle, SpecDecodeBackend,
@@ -68,16 +74,47 @@ impl MtpProposer {
     pub fn config(&self) -> &MtpProposerConfig {
         &self.config
     }
+}
 
-    fn propose(
+/// The head's passes over one step (module docs), run by the worker that ran it.
+#[derive(Clone, Copy, Debug)]
+pub struct MtpDrafter {
+    /// Drafts per step (`k`, the head's compiled `spec_drafts`).
+    pub drafts: usize,
+    /// Maximum model context length: no draft lands past it.
+    pub max_model_len: usize,
+}
+
+impl MtpDrafter {
+    /// The drafts of the step `seed` describes for the requests in `plan`, which produced
+    /// `produced` (per request, in `seed` order) and whose token histories `history` reads.
+    pub fn draft(
         &self,
         seed: &DraftSeedInputs,
         produced: &[Vec<u32>],
         history: &dyn Fn(&str) -> Option<Vec<u32>>,
         backend: &mut dyn SpecDecodeBackend,
+        plan: &HashSet<String>,
     ) -> Result<HashMap<String, Vec<u32>>, BackendError> {
         let num_reqs = seed.req_ids.len();
         let row_bytes = seed.target_hidden.len() / seed.num_tokens.max(1);
+        let included: Vec<usize> = (0..num_reqs)
+            .filter(|&i| plan.contains(&seed.req_ids[i]))
+            .collect();
+        if included.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Rows `is` of the step's block table.
+        let stride = seed.block_table_stride;
+        let block_rows = |is: &[usize]| -> Vec<u32> {
+            is.iter()
+                .flat_map(|&i| {
+                    seed.block_table[i * stride..(i + 1) * stride]
+                        .iter()
+                        .copied()
+                })
+                .collect()
+        };
 
         // Pass 1: each sequence's rows through its newest, each row with its successor, and the
         // position of each drafting sequence's newest row.
@@ -87,7 +124,8 @@ impl MtpProposer {
         let mut target_hidden = Vec::with_capacity(seed.target_hidden.len());
         let (mut cu_seqlens_q, mut seqused_k) = (vec![0u32], Vec::with_capacity(num_reqs));
         let mut newest: Vec<Option<usize>> = vec![None; num_reqs];
-        for (i, req_id) in seed.req_ids.iter().enumerate() {
+        for &i in &included {
+            let req_id = &seed.req_ids[i];
             let tokens = history(req_id).unwrap_or_default();
             let rows = seed.cu_seqlens_q[i] as usize..seed.cu_seqlens_q[i + 1] as usize;
             // The newest token sits at `tokens.len() - 1`, produced by the row at the position
@@ -112,16 +150,25 @@ impl MtpProposer {
             cu_seqlens_q.push(input_ids.len() as u32);
             seqused_k.push(seed.seqused_k[i] - (rows.end - end) as u32);
         }
+        // Each included sequence's last row, in `included` order.
         let lm_rows: Vec<u32> = cu_seqlens_q[1..].iter().map(|&end| end - 1).collect();
-        let drafting: Vec<usize> = (0..num_reqs).filter(|&i| newest[i].is_some()).collect();
-        let hidden_rows: Vec<u32> = drafting.iter().map(|&i| lm_rows[i]).collect();
+        let drafting: Vec<usize> = included
+            .iter()
+            .copied()
+            .filter(|&i| newest[i].is_some())
+            .collect();
+        let hidden_rows: Vec<u32> = (included.iter().zip(&lm_rows))
+            .filter(|&(&i, _)| newest[i].is_some())
+            .map(|(_, &r)| r)
+            .collect();
+        let pass1_blocks = block_rows(&included);
         let pass1 = ForwardArgmaxRequest {
             input_ids: &input_ids,
             positions: &positions,
             slot_mapping: &slot_mapping,
             cu_seqlens_q: &cu_seqlens_q,
             seqused_k: &seqused_k,
-            block_table: &seed.block_table,
+            block_table: &pass1_blocks,
             span_ids: None,
             sliding_slot_mappings: &[],
             sliding_block_tables: &[],
@@ -145,29 +192,17 @@ impl MtpProposer {
             .collect();
 
         // Passes 2..=k: one row per drafting sequence, at the position after the last.
-        let stride = seed.block_table_stride;
         let n = drafting.len();
         let rows: Vec<u32> = (0..n as u32).collect();
         let cu_seqlens: Vec<u32> = (0..=n as u32).collect();
-        let block_table: Vec<u32> = drafting
-            .iter()
-            .flat_map(|&i| {
-                seed.block_table[i * stride..(i + 1) * stride]
-                    .iter()
-                    .copied()
-            })
-            .collect();
-        for depth in 1..self.config.num_speculative_tokens {
+        let block_table = block_rows(&drafting);
+        for depth in 1..self.drafts {
             let positions: Vec<usize> = drafting
                 .iter()
                 .map(|&i| newest[i].expect("drafting sequences have a newest row") + depth)
                 .collect();
             // The draft this pass makes lands at `position + 2`.
-            if n == 0
-                || positions
-                    .iter()
-                    .any(|&p| p + 2 >= self.config.max_model_len)
-            {
+            if n == 0 || positions.iter().any(|&p| p + 2 >= self.max_model_len) {
                 break;
             }
             let slot_mapping: Vec<u32> = drafting
@@ -225,38 +260,43 @@ impl MtpProposer {
 }
 
 impl Proposer for MtpProposer {
-    fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>> {
-        let (Some(seed), Some(produced)) = (ctx.draft_seed, ctx.sampled_token_ids) else {
-            return HashMap::new();
-        };
-        let Some(backend) = ctx.backend.as_deref_mut() else {
-            return HashMap::new();
-        };
+    fn plan(
+        &mut self,
+        sched: &SchedulerOutput,
+        takes_drafts: &dyn Fn(&str) -> bool,
+    ) -> HashSet<String> {
         // A request gone drafts no more; one run from its first position has its head KV whole.
-        self.stale.retain(|r| (ctx.takes_drafts)(r));
-        for (i, r) in seed.req_ids.iter().enumerate() {
-            if seed.positions.get(seed.cu_seqlens_q[i] as usize) == Some(&0) {
-                self.stale.remove(r);
-            }
+        self.stale.retain(|r| takes_drafts(r));
+        let cached = &sched.scheduled_cached_reqs;
+        let from_start = (sched.scheduled_new_reqs.iter())
+            .filter(|r| r.num_computed_tokens == 0)
+            .map(|r| &r.req_id)
+            .chain(
+                (cached.req_ids.iter().zip(&cached.num_computed_tokens))
+                    .filter(|&(_, &n)| n == 0)
+                    .map(|(r, _)| r),
+            );
+        for r in from_start {
+            self.stale.remove(r);
         }
+        let scheduled = sched
+            .num_scheduled_tokens
+            .keys()
+            .filter(|r| takes_drafts(r));
         // A step of more sequences than the head drafts for runs as the target alone.
-        if seed.req_ids.len() > self.config.max_seqs {
-            self.stale.extend(seed.req_ids.iter().cloned());
-            return HashMap::new();
+        if sched.num_scheduled_tokens.len() > self.config.max_seqs {
+            self.stale.extend(scheduled.cloned());
+            return HashSet::new();
         }
-        // No head forward for a step none of whose requests drafts.
-        let drafts = |r: &String| (ctx.takes_drafts)(r) && !self.stale.contains(r);
-        if self.config.num_speculative_tokens == 0 || !seed.req_ids.iter().any(drafts) {
-            return HashMap::new();
-        }
-        let mut proposed = self
-            .propose(seed, produced, ctx.get_all_tokens, backend)
-            .unwrap_or_else(|e| {
-                tracing::warn!("MTP proposer: no drafts this step: {e:?}");
-                HashMap::new()
-            });
-        proposed.retain(|r, _| !self.stale.contains(r));
-        proposed
+        scheduled
+            .filter(|r| !self.stale.contains(*r))
+            .cloned()
+            .collect()
+    }
+
+    fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>> {
+        // The worker drafted for the requests this step planned.
+        ctx.worker_drafts.cloned().unwrap_or_default()
     }
 }
 
@@ -387,26 +427,23 @@ mod tests {
         })
     }
 
-    /// [`two_sequence_step`]: pass 1 runs `a` through its newest row and all of `b`; `a` alone
-    /// drafts, chaining at 12 and 13.
-    #[test]
-    fn pass_one_runs_each_sequence_through_its_newest_row() {
-        let (seed, produced, history_a, history_b) = two_sequence_step();
-        let history = |id: &str| match id {
-            "a" => Some(history_a.clone()),
-            "b" => Some(history_b.clone()),
-            _ => None,
-        };
-        let proposer = proposer(4);
-        let mut backend = Recorder::default();
-        let drafts = proposer
-            .propose(&seed, &produced, &history, &mut backend)
-            .expect("drafts");
+    const DRAFTER: MtpDrafter = MtpDrafter {
+        drafts: 3,
+        max_model_len: 4096,
+    };
 
-        let hidden_of = |rows: &[u8]| rows.iter().flat_map(|&r| [r; ROW_BYTES]).collect();
-        // Chained forward `c`: the draft before it at `p`, block 3, the hidden rows forward `c - 1`
-        // returned.
-        let chain = |c: u8, input: u32, p: u32| Forward {
+    fn ids(of: &[&str]) -> HashSet<String> {
+        of.iter().map(|&id| id.to_string()).collect()
+    }
+
+    fn hidden_of(rows: &[u8]) -> Vec<u8> {
+        rows.iter().flat_map(|&r| [r; ROW_BYTES]).collect()
+    }
+
+    /// Chained forward `c` of `a`: the draft before it at `p`, block 3, the hidden rows forward
+    /// `c - 1` returned.
+    fn chain(c: u8, input: u32, p: u32) -> Forward {
+        Forward {
             input_ids: vec![input],
             positions: vec![p],
             slot_mapping: vec![3 * 16 + p],
@@ -416,7 +453,23 @@ mod tests {
             last_token_indices: vec![0],
             target_hidden: vec![c - 1 + 100; ROW_BYTES],
             hidden_rows: vec![0],
+        }
+    }
+
+    /// [`two_sequence_step`], both planned: pass 1 runs `a` through its newest row and all of `b`;
+    /// `a` alone drafts, chaining at 12 and 13.
+    #[test]
+    fn pass_one_runs_each_sequence_through_its_newest_row() {
+        let (seed, produced, history_a, history_b) = two_sequence_step();
+        let history = |id: &str| match id {
+            "a" => Some(history_a.clone()),
+            "b" => Some(history_b.clone()),
+            _ => None,
         };
+        let mut backend = Recorder::default();
+        let drafts = DRAFTER
+            .draft(&seed, &produced, &history, &mut backend, &ids(&["a", "b"]))
+            .expect("drafts");
         let want = [
             Forward {
                 input_ids: vec![history_a[11], history_a[12], 701, 702, 703],
@@ -437,54 +490,101 @@ mod tests {
         assert_eq!(drafts, want_drafts);
     }
 
-    /// A step of more sequences than the head drafts for runs no head forward, and its sequences
-    /// draft no more — their head KV missed its rows — until a recompute runs one from its first
-    /// position.
+    /// The head runs for the planned requests alone: `a` without `b` drafts as before from rows
+    /// of its own; `b` alone only primes its prompt; nothing planned, nothing runs.
     #[test]
-    fn a_step_past_the_head_s_sequences_skips_it_and_stales_them() {
+    fn pass_one_runs_only_the_planned_requests() {
         let (seed, produced, history_a, history_b) = two_sequence_step();
         let history = |id: &str| match id {
             "a" => Some(history_a.clone()),
             "b" => Some(history_b.clone()),
             _ => None,
         };
-        let takes = |_: &str| true;
-        let step = |proposer: &mut MtpProposer, backend: &mut Recorder, seed: &DraftSeedInputs| {
-            let mut ctx = ProposerStepCtx {
-                scheduled_req_ids: &[],
-                get_all_tokens: &history,
-                worker_drafts: None,
-                backend: Some(backend),
-                draft_seed: Some(seed),
-                sampled_token_ids: Some(&produced),
-                takes_drafts: &takes,
-            };
-            proposer.propose_for_step(&mut ctx)
+        let run = |plan: &[&str]| {
+            let mut backend = Recorder::default();
+            let drafts = DRAFTER
+                .draft(&seed, &produced, &history, &mut backend, &ids(plan))
+                .expect("drafts");
+            (backend.forwards, drafts)
         };
 
-        // Two sequences, a head that drafts for one: no head forward.
+        let (forwards, drafts) = run(&["a"]);
+        let pass1 = Forward {
+            input_ids: vec![history_a[11], history_a[12]],
+            positions: vec![10, 11],
+            slot_mapping: vec![58, 59],
+            cu_seqlens_q: vec![0, 2],
+            seqused_k: vec![12],
+            block_table: vec![3, 0],
+            last_token_indices: vec![1],
+            target_hidden: hidden_of(&[0, 1]),
+            hidden_rows: vec![1],
+        };
+        assert_eq!(forwards, [pass1, chain(1, 1001, 12), chain(2, 2000, 13)]);
+        assert_eq!(
+            drafts,
+            HashMap::from([("a".to_string(), vec![1001, 2000, 3000])])
+        );
+
+        let (forwards, drafts) = run(&["b"]);
+        assert_eq!(forwards.len(), 1, "pass 1 primes b's prompt");
+        assert_eq!(forwards[0].positions, [0, 1, 2]);
+        assert!(drafts.is_empty());
+
+        let (forwards, drafts) = run(&[]);
+        assert!(forwards.is_empty() && drafts.is_empty());
+    }
+
+    /// A scheduled step of `(request, num_computed_tokens)`: one at 0 runs from its first position.
+    fn scheduled(reqs: &[(&str, u32)]) -> SchedulerOutput {
+        let mut s = SchedulerOutput::make_empty();
+        for &(id, computed) in reqs {
+            s.num_scheduled_tokens.insert(id.into(), 1);
+            s.scheduled_cached_reqs.req_ids.push(id.into());
+            s.scheduled_cached_reqs.num_computed_tokens.push(computed);
+        }
+        s
+    }
+
+    /// A step of more sequences than the head drafts for plans none and stales them — their head
+    /// KV misses its rows — until a recompute runs one from its first position. A request whose
+    /// sampling reads its history takes no drafts. The proposer hands back the worker's drafts.
+    #[test]
+    fn a_step_past_the_head_s_sequences_plans_none_and_stales_them() {
+        let takes = |_: &str| true;
         let mut proposer = proposer(1);
-        let mut backend = Recorder::default();
-        assert!(step(&mut proposer, &mut backend, &seed).is_empty());
-        assert!(backend.forwards.is_empty(), "no head forward");
+        assert!(
+            proposer
+                .plan(&scheduled(&[("a", 10), ("b", 20)]), &takes)
+                .is_empty()
+        );
 
-        // Within its sequences again: `a` is stale, so it takes no drafts.
+        // Within its sequences again: both stale.
         proposer.config.max_seqs = 2;
-        let mut backend = Recorder::default();
-        assert!(step(&mut proposer, &mut backend, &seed).is_empty());
+        assert!(
+            proposer
+                .plan(&scheduled(&[("a", 11), ("b", 21)]), &takes)
+                .is_empty()
+        );
 
-        // `a` recomputed from its first position — its whole history in one chunk, positions
-        // 0..=11, then `b`'s 0..=2: whole again, it drafts.
-        let (mut recomputed, ..) = two_sequence_step();
-        recomputed.positions = (0..12).chain(0..3).collect();
-        recomputed.slot_mapping = (48..60).chain(80..83).collect();
-        recomputed.cu_seqlens_q = vec![0, 12, 15];
-        recomputed.seqused_k = vec![12, 3];
-        recomputed.num_tokens = 15;
-        recomputed.q_lens = vec![12, 3];
-        recomputed.target_hidden = (0..15u8).flat_map(|r| [r; ROW_BYTES]).collect();
-        let mut backend = Recorder::default();
-        let drafts = step(&mut proposer, &mut backend, &recomputed);
-        assert!(drafts.contains_key("a"), "{drafts:?}");
+        // `a` recomputed from its first position: whole again.
+        let plan = proposer.plan(&scheduled(&[("a", 0), ("b", 22)]), &takes);
+        assert_eq!(plan, ids(&["a"]));
+        let not_b = |id: &str| id != "b";
+        let plan = proposer.plan(&scheduled(&[("a", 1), ("b", 0)]), &not_b);
+        assert_eq!(plan, ids(&["a"]));
+
+        let drafts = HashMap::from([("a".to_string(), vec![7, 8])]);
+        let none = |_: &str| None;
+        let mut ctx = ProposerStepCtx {
+            scheduled_req_ids: &[],
+            get_all_tokens: &none,
+            worker_drafts: Some(&drafts),
+            backend: None,
+            draft_seed: None,
+            sampled_token_ids: None,
+            takes_drafts: &takes,
+        };
+        assert_eq!(proposer.propose_for_step(&mut ctx), drafts);
     }
 }

@@ -149,6 +149,17 @@ pub struct ProposerStepCtx<'a> {
 /// Takes `&mut` because draft-model proposers issue GPU work via
 /// `ctx.backend`; ngram impls treat it as `&self` effectively.
 pub trait Proposer {
+    /// The requests a worker-side draft head runs for in the step `sched` scheduled
+    /// (`SchedulerOutput::draft_req_ids`), of those `takes_drafts` admits. A proposer that drafts
+    /// on the host plans none.
+    fn plan(
+        &mut self,
+        _sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        _takes_drafts: &dyn Fn(&str) -> bool,
+    ) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>>;
 }
 

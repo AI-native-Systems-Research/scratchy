@@ -2583,6 +2583,7 @@ impl SchedulerInterface for Scheduler {
             } else {
                 Some(preempted_req_ids)
             },
+            draft_req_ids: HashSet::new(),
         };
 
         // Post-schedule updates.
