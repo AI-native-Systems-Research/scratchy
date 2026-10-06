@@ -1605,7 +1605,109 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 
 /// THE FULL LADDER for one kernel: parse → TTIR → `make_ttir` → `from_ttir` → `make_ktir`
 /// → `to_ktir` — the exact sequence `bake_py.rs` drives, stated once.
+///
+/// ⭐⭐⭐ MEMOIZED BY SPEC — THE EXPANSION-COST LAW. A bake asks for the SAME (kernel,
+/// spec, grid) many times over: the prefill ladder's 21 rungs × 40 layers state one
+/// program per (kind, shape) cell, and the shape repeats across every layer of a rung —
+/// MEASURED before this cache, the 2b card bake spent ~100 minutes in the models build
+/// script, ~17 s per attention program alone (~26 programs in the golden's 442 s run),
+/// where main's direct-emission builder paid none of it. The compile is a pure function
+/// of (source, spec, grid) — the ladder is deterministic — so the second and later
+/// callers get a CLONE of the first result. Every consumer mutates only its own copy
+/// (`mint`/`mint_attn` re-state names and bindings; `inject_dead_cache_views` and
+/// `truncate_unused_mask_param` edit their own copy), so a cached pristine `Module` is
+/// safe to hand out again.
 fn compile_kernel(
+    src: &str,
+    spec: &KernelSpec,
+    grid: &[i64],
+) -> Result<triton_ktir::ir::Module, String> {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    thread_local! {
+        /// The memo. The key is the canonical `String` spelled below, so it needs no
+        /// `Hash`/`Ord` on `ArgSpec`/`Val` and is deterministic in construction.
+        static CACHE: RefCell<BTreeMap<String, triton_ktir::ir::Module>> =
+            const { RefCell::new(BTreeMap::new()) };
+    }
+    // ⛔ THE SOURCE TEXT IS PART OF THE KEY, not the file path: `read_kernel` re-reads
+    // the `.py` from disk on every call and the bake runs inside ONE build-script
+    // process, so a same-named file edited between two `lower` calls in one expansion
+    // (a test that rewrites a fixture) must not be served the first text's module.
+    let mut key = String::with_capacity(src.len() + 256);
+    key.push_str(spec.file.as_str());
+    key.push('\0');
+    key.push_str(spec.kernel.as_str());
+    key.push('\0');
+    let mut params: BTreeMap<&str, String> = BTreeMap::new();
+    for (name, arg) in &spec.signature {
+        params.insert(
+            name.as_str(),
+            match arg {
+                ArgSpec::Constexpr => "constexpr".to_string(),
+                // ⛔ THE FULL TYPE, NOT JUST THE DISCRIMINANT: a `*fp16` and a `*fp8`
+                // parameter of one kernel name are different programs, and keying on
+                // "ptr" alone would serve one for the other. The debug spelling is
+                // injective for `Type` (a plain enum of plain payloads).
+                ArgSpec::Ptr(t) => format!("ptr:{t:?}"),
+                ArgSpec::Scalar(t) => format!("scalar:{t:?}"),
+            },
+        );
+    }
+    for (name, kind) in &params {
+        key.push_str(name);
+        key.push('\u{1}');
+        key.push_str(kind);
+        key.push('\u{1}');
+    }
+    key.push('\0');
+    // ⛔ EVERY CONSTEXPR VALUE, CANONICALLY ORDERED — a HashMap iteration order must
+    // never leak into the key, or two identical specs could miss. `Val::Float` is keyed
+    // by its BITS: -0.0 and 0.0 compile identically but `f64::to_bits` distinguishes
+    // them, and distinguishing is the safe direction for a cache key.
+    let mut cvals: BTreeMap<&str, String> = BTreeMap::new();
+    for (name, v) in &spec.constexprs {
+        let s = match v {
+            Val::Int(i) => format!("i{i}"),
+            Val::Float(f) => format!("f{}", f.to_bits()),
+            Val::Bool(b) => format!("b{b}"),
+            Val::Str(s) => format!("s{s}"),
+            Val::None => "none".to_string(),
+            // A dtype or a sequence cannot be a top-level constexpr binding in any
+            // kernel this splice states (the rows bind ints, floats and bools only);
+            // spelling the discriminant keeps the key total rather than panicking on
+            // a future row.
+            Val::Dtype(_) => "dtype".to_string(),
+            Val::Seq(_) => "seq".to_string(),
+            Val::Ir(_) => "ir".to_string(),
+            Val::Desc { .. } => "desc".to_string(),
+            Val::Slice => "slice".to_string(),
+        };
+        cvals.insert(name.as_str(), s);
+    }
+    for (name, v) in &cvals {
+        key.push_str(name);
+        key.push('\u{1}');
+        key.push_str(v);
+        key.push('\u{1}');
+    }
+    key.push('\0');
+    for g in grid {
+        key.push_str(&format!("g{g}\u{1}"));
+    }
+    key.push('\0');
+    key.push_str(src);
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let module = compile_kernel_uncached(src, spec, grid)?;
+    CACHE.with(|c| c.borrow_mut().insert(key, module.clone()));
+    Ok(module)
+}
+
+/// The compile itself, unstated above so the memo's key construction cannot interleave
+/// with the ladder's phases.
+fn compile_kernel_uncached(
     src: &str,
     spec: &KernelSpec,
     grid: &[i64],
