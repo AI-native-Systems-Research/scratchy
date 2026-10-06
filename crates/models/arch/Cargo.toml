@@ -147,6 +147,7 @@ all-arches = [
 # gemma4 (2 configs)
 "gemma-4-12b-it" = ["arch-gemma4"]
 "gemma-4-12b-it-parity-tiny" = ["arch-gemma4"]
+"gemma-4-12b-it-parity-tiny-allglobal" = ["arch-gemma4"]
 "gemma-4-31b-it" = ["arch-gemma4"]
 
 # gemma4-moe (1 configs)
@@ -332,11 +333,13 @@ all-arches = [
 "gemma4" = [
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
+    "gemma-4-12b-it-parity-tiny-allglobal",
     "gemma-4-31b-it",
 ]
 "gemma4-moe" = [
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",
+    "gemma-4-12b-it-parity-tiny-allglobal",
 ]
 "granite" = [
     "granite-3.0-2b-base",
@@ -503,6 +506,7 @@ all = [
     "gemma-3-4b-it-parity-tiny",
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
+    "gemma-4-12b-it-parity-tiny-allglobal",
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
     "gemma-4-26b-a4b-it-parity-tiny",

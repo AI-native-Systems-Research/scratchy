@@ -296,8 +296,104 @@ impl TidRegion {
 /// and declares its own region, which the compile-time disjointness proof then covers.
 pub const KV_BLOCK_INDEX_TID: u32 = u32::MAX - 120;
 
+/// ⭐⭐⭐⭐⭐ THE ROPE-P **CLASS** REGION — one P placement per DISTINCT rope head dim.
+///
+/// A hybrid-attention model (gemma-4) carries TWO rope classes in one tape — sliding `hd` and a wider
+/// global `hd` — and a composite single P is IMPOSSIBLE, not merely awkward: the big class's
+/// `[hd,hd]` contraction sweeps every input lane, so it would read the small class's nonzero block as
+/// spurious ±1 terms. Each class needs its OWN `[hd_c, hd_c]` table and its OWN seg0 placement.
+///
+/// ## Class ordering, and why class 0 keeps the old sentinel
+/// Classes are the tape's DISTINCT rope head dims sorted DESCENDING, so class 0 is the widest. Class 0
+/// answers [`ROPE_P_TID`] itself: a UNIFORM model (every rope node one head dim) has exactly one class,
+/// so its ops still name `ROPE_P_TID` and its bundle is byte-identical to the pre-class layout. Classes
+/// `1..N-1` take this region's slots. The alternative — renumbering every class — would change the tid a
+/// uniform model's ops name, for no benefit and one silent-repoint risk more.
+///
+/// [`rope_p_class_hds`]: crate::reserved_tids::rope_p_class_hds
+pub const ROPE_P_CLASS_BASE: u32 = u32::MAX - 121;
+
+/// Reserved tid for the rope-P table of rope class `idx` (distinct rope head dims, sorted descending;
+/// class 0 = the widest = [`ROPE_P_TID`] itself, so a uniform model's bundle is unchanged).
+pub fn rope_p_class_tid(idx: usize) -> u32 {
+    if idx == 0 {
+        // ⭐ DOCUMENTED WHY: class 0 IS the old single-class tid. Keeping it there is what makes a
+        // uniform model's ops name `ROPE_P_TID` exactly as before — byte-identical bundles — instead
+        // of renumbering every class and silently repointing ids already baked into artifacts.
+        return ROPE_P_TID;
+    }
+    // Class 1 takes the region's BASE slot (class 0 lives on the sentinel, so no slot is wasted).
+    reserved_region("rope_p_class").at(idx as u32 - 1)
+}
+
+/// ⭐⭐⭐⭐⭐ THE IDENTITY **CLASS** REGION — one `[hd,hd]` identity per DISTINCT attention head dim.
+///
+/// Same defect, same fix, one axis over: `IDENTITY_TID`'s placement was sized at the WIDEST
+/// `AttnDecode` head dim while the bound value was staged at the BASE head dim, so on a hybrid
+/// (gemma-4 tiny-allglobal: classes 128 and 64) the wide class's GQA krep/vrep matmuls read slab 1 of
+/// a `[128,128]` placement holding only a `[64,64]` table — lanes 64..127 all zero (dump-proven,
+/// `op11_prog0_seg0_tt108_newkrep.bin`). Attention classes are the tape's DISTINCT `AttnDecode` head
+/// dims sorted DESCENDING; class 0 = the widest = [`IDENTITY_TID`] itself, for the same
+/// byte-identity reason as rope class 0.
+pub const IDENTITY_CLASS_BASE: u32 = u32::MAX - 129;
+
+/// Reserved tid for the identity table of attention class `idx` (distinct AttnDecode head dims,
+/// sorted descending; class 0 = the widest = [`IDENTITY_TID`] itself).
+pub fn identity_class_tid(idx: usize) -> u32 {
+    if idx == 0 {
+        // ⭐ Same law as `rope_p_class_tid(0)`: the widest class keeps the old single-class tid so a
+        // uniform model's bundle is byte-identical.
+        return IDENTITY_TID;
+    }
+    // Class 1 takes the region's BASE slot (class 0 lives on the sentinel, so no slot is wasted).
+    reserved_region("identity_class").at(idx as u32 - 1)
+}
+
+/// Does `tid` name a KERNEL-TABLE class table of family `what` (`"rope-P"` or `"identity"`)?
+///
+/// The load-time placement cross-check walks every PLACED tid and asks this, because the reverse
+/// direction of the check ("every placed class tid is in the wiring's set") cannot enumerate the
+/// class ids from a placement — it can only test a tid it finds. Class 0 is the family's sentinel;
+/// classes 1.. live in the family's region.
+pub fn is_kernel_table_class_tid(tid: u32, what: &str) -> bool {
+    match what {
+        "rope-P" => {
+            tid == ROPE_P_TID || {
+                let r = reserved_region("rope_p_class");
+                (r.floor()..=r.base).contains(&tid)
+            }
+        }
+        "identity" => {
+            tid == IDENTITY_TID || {
+                let r = reserved_region("identity_class");
+                (r.floor()..=r.base).contains(&tid)
+            }
+        }
+        _ => false,
+    }
+}
+
+/// ⭐ THE ONE SOURCE OF TRUTH FOR A CLASS SET, IN THE ORDER THE TIDS ARE ASSIGNED.
+///
+/// Both consumers of the class list — the PLACEMENT site (`compute_bundle_layout`, which sizes each
+/// class's seg0 placement) and the macro's `gk` (which bakes the list into the wiring the worker's
+/// load-time bind reads) — must produce the SAME set in the SAME order or a class tid names a
+/// placement sized for a different class. This is the shared helper both call: distinct values,
+/// sorted DESCENDING so class 0 is the widest (and a uniform model's single class is class 0, which
+/// [`rope_p_class_tid`] answers with the pre-class sentinel).
+///
+/// ⛔ TAKES THE HEAD DIMS AS PLAIN DATA, not a `SubtileIR`: this crate cannot depend on
+/// `scratchy-subtile` (the dependency runs the other way), so the callers iterate their own rope/attn
+/// nodes and hand the dims over. The ORDERING LAW lives here, once, where both callers meet it.
+pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
+    let mut out: Vec<u32> = hds.collect();
+    out.sort_unstable_by(|a, b| b.cmp(a));
+    out.dedup();
+    out
+}
+
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 4] = [
+pub const RESERVED_REGIONS: [TidRegion; 6] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -317,7 +413,23 @@ pub const RESERVED_REGIONS: [TidRegion; 4] = [
         base: KV_BLOCK_INDEX_TID,
         slots: 1,
     },
-    // ⛔ THE GAP FROM MAX-121 TO MAX-1_000_170 IS DELIBERATELY LEFT EMPTY. It held the K-split
+    // ⭐ THE ROPE-P CLASS REGION — one slot per rope head-dim class past the first (class 0 keeps
+    // `ROPE_P_TID`; see [`rope_p_class_tid`] for why). 8 slots: two classes is the gemma-4 shape, and
+    // a model with more DISTINCT rope head dims than that is a config error the region's own overflow
+    // assert turns into a bake refusal.
+    TidRegion {
+        name: "rope_p_class",
+        base: ROPE_P_CLASS_BASE,
+        slots: 8,
+    },
+    // ⭐ THE IDENTITY CLASS REGION — the same law one rung down, for the attention classes (see
+    // [`identity_class_tid`]).
+    TidRegion {
+        name: "identity_class",
+        base: IDENTITY_CLASS_BASE,
+        slots: 8,
+    },
+    // ⛔ THE GAP FROM MAX-137 TO MAX-1_000_170 IS DELIBERATELY LEFT EMPTY. It held the K-split
     // block/zero/down_proj regions, which are gone with the K-split itself. `kct_resident` keeps
     // its ABSOLUTE base rather than sliding up into the hole: every reserved id is a number that
     // has been baked into artifacts, and moving one to tidy the map would silently repoint it.
@@ -388,6 +500,8 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("sentinels").base == u32::MAX - 1);
     assert!(reserved_region("scalarmul_scale").slots > 0);
     assert!(reserved_region("kv_block_index").base == KV_BLOCK_INDEX_TID);
+    assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
+    assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
 };
 
@@ -498,4 +612,60 @@ fn a_named_region_survives_an_insertion_above_it() {
         KV_BLOCK_INDEX_TID,
         "the kv_block_index region's only slot is not KV_BLOCK_INDEX_TID"
     );
+}
+
+/// ⭐ THE CLASS LAWS, PINNED — a class tid answers the right table, and a uniform model sees none of it.
+///
+/// Class 0 of both class families KEEPS the pre-class sentinel, which is what makes a uniform model's
+/// bundle byte-identical (its ops name `ROPE_P_TID`/`IDENTITY_TID` exactly as before). Classes 1.. live
+/// in their own named regions, disjoint from every neighbour — including each other, which is the
+/// pairing this file exists to make un-silentable: a rope class tid and an identity class tid are both
+/// "MAX-minus-small" numbers a hand-assigned space would happily have collide.
+#[test]
+fn class_tids_keep_class_zero_on_the_sentinel_and_descend_their_own_regions() {
+    // Class 0 IS the old single-class tid, for both families.
+    assert_eq!(rope_p_class_tid(0), ROPE_P_TID);
+    assert_eq!(identity_class_tid(0), IDENTITY_TID);
+    // Class 1 descends into its own region, one rung below the kv_block_index region.
+    assert_eq!(rope_p_class_tid(1), ROPE_P_CLASS_BASE);
+    assert_eq!(identity_class_tid(1), IDENTITY_CLASS_BASE);
+    // The two class families never share a tid.
+    for i in 0..8u32 {
+        for j in 0..8u32 {
+            assert_ne!(
+                reserved_region("rope_p_class").at(i),
+                reserved_region("identity_class").at(j),
+                "rope class {i} and identity class {j} are one tid — two kernel tables share one \
+                 placement"
+            );
+        }
+    }
+    // A class tid never leaves its region (the floor check `at` already refuses the overflow, but the
+    // law is worth stating where the class scheme is defined). With 8 slots and class 0 on the
+    // sentinel, classes 1..8 are the addressable ones.
+    assert!(
+        rope_p_class_tid(8) >= reserved_region("rope_p_class").floor(),
+        "rope class 8 walked below the rope_p_class region"
+    );
+}
+
+/// ⛔ THE OVERFLOW IS A REFUSAL, NOT A WRAP — a 9th rope class must not alias the identity classes.
+/// `#[should_panic]` is the honest shape here: `TidRegion::at` is a `const fn` assert the bake hits.
+#[test]
+#[should_panic(expected = "reserved tid region overflow")]
+fn a_ninth_rope_class_is_a_refusal_not_an_alias() {
+    let _ = rope_p_class_tid(9);
+}
+
+/// The class set is DISTINCT and DESCENDING — the order the tids are assigned in, so class 0 is the
+/// widest head dim and a uniform model's single class is class 0.
+#[test]
+fn the_class_set_is_distinct_and_descending() {
+    assert_eq!(
+        rope_p_class_hds([128u32, 64, 128, 256, 64].into_iter()),
+        vec![256, 128, 64]
+    );
+    assert_eq!(rope_p_class_hds([64u32].into_iter()), vec![64]);
+    let empty: std::iter::Empty<u32> = std::iter::empty();
+    assert_eq!(rope_p_class_hds(empty), Vec::<u32>::new());
 }

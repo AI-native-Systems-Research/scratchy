@@ -420,6 +420,22 @@ fn rope(
     if hd == 0 {
         return err(format!("{name}: the `x` view states a zero head dim"));
     }
+    // ⭐ THE ROPE-P CLASS TID — which `[hd,hd]` P table this rope's `matmul(x, P)` names. The class
+    // set is the bake's OWN registry (`BundleLayout::rope_class_hds`, the same registry mechanism
+    // `scalarmul_scales` established), so the emitter, the placement pass and the worker's load-time
+    // bind all resolve class↔tid through ONE list. A rope arriving with no registry, or a head dim
+    // the registry does not hold, is a desync — refuse it rather than guessing class 0.
+    let p_tid = layout
+        .and_then(|l| l.rope_class_hds.iter().position(|&h| h == hd))
+        .map(ktir_superdsc::reserved_tids::rope_p_class_tid)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{name}: rope head_dim {hd} absent from BundleLayout.rope_class_hds {:?} (registry \
+                 desync — the placement pass and this lowering disagree about the tape's rope \
+                 classes, so which P table this rope reads is not a fact either of them states)",
+                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
+            ),
+        })?;
     scratchy_subtile::model_geometry::with_config_head_dim(
         scratchy_subtile::model_geometry::HeadDim::new(hd),
         RopeAt(lk::RopeAt {
@@ -431,6 +447,7 @@ fn rope(
             t: out.tid,
             mq,
             total,
+            p_tid,
             sym_id_base,
             layout,
             rows_are_requests,

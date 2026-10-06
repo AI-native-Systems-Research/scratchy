@@ -182,8 +182,8 @@ pub use ktir_superdsc::reserved_tids::{
     NEW_V_PROBE_TID, ONES_REDUCE_TID, RESERVED_REGIONS, RESERVED_REGIONS_ARE_DISJOINT,
     RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID, RMS_SEED_TID, RMS_VAR_PROBE_TID,
     ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID, SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID,
-    SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, kct_resident_tid, reserved_region,
-    scalarmul_scale_tid,
+    SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion, identity_class_tid, is_kernel_table_class_tid,
+    kct_resident_tid, reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
@@ -634,36 +634,46 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // any RopeRotate/RopeAppend, `lower_rope_node` emits `rot = matmul(x, P)` (the
     // rotate-half as a 64-stick-aligned matmul, avoiding the 32-half sub-stick). P is
     // a FIXED permutation-sign matrix the worker synthesizes + binds (it is NOT a
-    // model/safetensors weight, so it gets the reserved id ROPE_P_TID). Place it in
+    // model/safetensors weight, so it gets a reserved id). Place it in
     // seg0 (ACTIVATION, re-bound per step like RMS_SEED/ATTN_SCALE) — NOT seg1 (WEIGHT):
     // a seg1 weight is only H2D'd at PrepareModel, where the worker binds ONLY the
     // manifest's model weights, so a synthetic seg1 P stays ZERO ⇒ rot=matmul(x,0)=0 ⇒
     // RoPE collapses to `x·cos` (rotate-half/sin term DROPPED) ⇒ wrong positional
-    // encoding ⇒ wrong content. Same P for every head/position/layer.
-    // ⭐ THE MAX, NOT THE FIRST — a hybrid model (gemma-4) carries TWO rope classes
-    // (sliding hd=256, global hd=512) and every class's `matmul(x, P)` reads THIS
-    // one placement. Sized at the first rope node's hd, a global layer's P addressed
-    // 4× past its own footprint (`rope_rot ... access offset 180224B + 8192B exceeds
-    // its placement footprint 131072B`) — the same first-vs-max fix the IDENTITY_TID
-    // placement already makes for a hybrid's attention classes.
-    let hd = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
+    // encoding ⇒ wrong content. Same P for every head/position/layer of one CLASS.
+    //
+    // ⭐⭐ ONE P PER DISTINCT ROPE HEAD DIM, NOT ONE AT THE MAX. The max-fold this replaced was
+    // itself a half-fix: it stopped a global layer's P from addressing past its footprint, but the
+    // VALUE the macro emitted was still staged at the BASE head dim — so on gemma-4
+    // tiny-allglobal a `[64,64]` table sat in a `[128,128]` placement and the global class's rope
+    // rotated pairs ±32 (half=32 for a 128-wide head) with lanes 64..127 left at cos-only
+    // (dump-proven: first divergence `t107` at op2, the roped K). A composite single P is
+    // IMPOSSIBLE — the big class's `[hd,hd]` contraction sweeps every input lane, so it would read
+    // the small class's nonzero block as spurious ±1 terms — so each class gets its OWN table,
+    // OWN placement, OWN tid (`rope_p_class_tid`). Class 0 (the widest, set sorted descending)
+    // keeps `ROPE_P_TID`, so a UNIFORM model's ops name the same tid and its bundle is
+    // byte-identical.
+    //
+    // ⛔ THE CLASS SET IS THE SHARED REGISTRY, NOT A LOCAL DERIVATION. The door resolves a rope
+    // program's class off `BundleLayout::rope_class_hds` and the worker's load-time bind builds
+    // each class's table from the same list the macro bakes into the wiring — so THIS loop's set
+    // (via the shared `rope_p_class_hds` helper) is the one source of truth for all three.
+    let rope_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
+        ir.nodes.iter().filter_map(|n| match &n.op {
             SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
-                Some(head_dim.get() as u64)
+                Some(head_dim.get())
             }
             _ => None,
-        })
-        .max();
-    if let Some(hd) = hd {
+        }),
+    );
+    for (class, &hd) in rope_class_hds.iter().enumerate() {
+        let tid = ktir_superdsc::reserved_tids::rope_p_class_tid(class);
         let seg = SegRole::Activation.segment();
         let off = seg_bytes[seg];
-        let sz = hd * hd * 2; // [hd,hd] fp16
+        let sz = hd as u64 * hd as u64 * 2; // [hd,hd] fp16
         placements.insert(
-            ROPE_P_TID,
+            tid,
             TensorPlacement {
-                tid: ROPE_P_TID,
+                tid,
                 bank: 0,
                 role: SegRole::Activation,
                 segment: seg,
@@ -714,21 +724,45 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // bundle_layout.json genuinely never had IDENTITY_TID, exactly as this predicts. Moved OUTSIDE that
     // mq>1 guard so it runs for ANY AttnDecode node regardless of mq, matching the consumer's real,
     // unconditional need (assemble_attn_head references `ident` at every mq, decode included).
-    // ⭐⭐ THE WIDEST CLASS, NOT THE FIRST. A hybrid model (gemma-4) carries TWO attention classes in
-    // one tape — sliding (hd=256) and global (hd=512) — and both reserved tids below are sized by a
-    // head dim. Taking the first node's sized them for the sliding class, and the global class's
-    // zero-copy then read 63·512·2 = 64512 B out of a 64·256·2 = 32768 B placement — the footprint
-    // check caught it, but the same understatement would have aliased seg3 on the card. The max is
-    // over every AttnDecode's own declared geometry, so each class's consumer fits.
-    if let Some(hd) = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::AttnDecode { geom, .. } => Some(geom.hd().get() as u64),
+    // ⭐⭐ ONE IDENTITY PER DISTINCT ATTENTION HEAD DIM, NOT ONE AT THE MAX. The max-fold this
+    // replaced sized the placement at the widest `AttnDecode` head dim while the VALUE was staged at
+    // the base head dim — so on gemma-4 tiny-allglobal a `[64,64]` identity sat in a `[128,128]`
+    // placement and the global class's GQA krep/vrep matmuls read slab 1 as ALL ZERO (dump-proven:
+    // `newkrep` lanes 64..127 zero, lanes 0..63 exactly the roped K). Each class gets its OWN
+    // `[hd,hd]` table, OWN placement, OWN tid (`identity_class_tid`); class 0 (the widest, set
+    // sorted descending) keeps `IDENTITY_TID`, so a uniform model's bundle is byte-identical.
+    // `attn_class_hds` is the SHARED registry the door resolves a program's class through and the
+    // worker's load-time bind builds each class's table from.
+    let attn_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds(
+        ir.nodes.iter().filter_map(|n| match &n.op {
+            SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
             _ => None,
-        })
-        .max()
-    {
+        }),
+    );
+    if let Some((&hd_max, _)) = attn_class_hds.split_first() {
+        for (class, &hd) in attn_class_hds.iter().enumerate() {
+            let tid = ktir_superdsc::reserved_tids::identity_class_tid(class);
+            let seg = SegRole::Activation.segment();
+            let off = seg_bytes[seg];
+            let sz = hd as u64 * hd as u64 * 2; // [hd,hd] fp16 identity
+            placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    bank: 0,
+                    role: SegRole::Activation,
+                    segment: seg,
+                    offset: off,
+                    size: sz,
+                },
+            );
+            seg_bytes[seg] = align128(off + sz);
+        }
+        // `hd` below (ATTN_ZERO's per-row width) is the WIDEST class's, matching the max-fold this
+        // block's placement used to make: ATTN_ZERO is one zero buffer shared by every class's
+        // pad-row zero-copies, and `synthetic_constants` binds `mq_pad * head_dim` zeros at the
+        // base head dim the wiring carries — unchanged by the class split.
+        let hd = hd_max as u64;
         let seg = SegRole::Activation.segment();
         let off = seg_bytes[seg];
         let sz = hd * hd * 2; // [hd,hd] fp16 identity
@@ -1404,14 +1438,27 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // NOTE: ATTN_SCALE_TID is intentionally absent — the attention scale is no longer a reserved
         // per-step const; it flows through `scalarmul_scales` (config attention_multiplier) whose
         // placements are proven seg0 by the scale loop above.
-        for &rtid in &[
+        // The rope-P and identity CLASS tids ride the same check: every class table is worker-bound
+        // per step exactly like the class-0 sentinels, so a class tid in seg1 is the same silent-zero
+        // defect. (The class lists are the registries this same pass built, so the tids here are the
+        // ones the door and the load-time bind resolve.)
+        let mut checked: Vec<u32> = vec![
             ROPE_P_TID,
             ATTN_MASK_TID,
             ATTN_CAUSAL_TID,
             RMS_HALF_TID,
             RMS_INVCOLS_TID,
             ONES_REDUCE_TID,
-        ] {
+        ];
+        checked.extend(
+            (0..rope_class_hds.len())
+                .map(ktir_superdsc::reserved_tids::rope_p_class_tid),
+        );
+        checked.extend(
+            (0..attn_class_hds.len())
+                .map(ktir_superdsc::reserved_tids::identity_class_tid),
+        );
+        for &rtid in &checked {
             if let Some(pl) = placements.get(&rtid) {
                 assert!(
                     pl.segment == act_seg && matches!(pl.role, SegRole::Activation),
@@ -1532,6 +1579,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
         weight_bank_bytes,
         kernel_weights: std::collections::BTreeMap::new(),
         scalarmul_scales,
+        rope_class_hds,
+        attn_class_hds,
         synth,
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
@@ -3195,6 +3244,12 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // otherwise). Its verdict is that the bundle compiled; there is nothing for the runtime to do
         // with the table.
         arrangements: _,
+        // EMIT-ONLY TOO, and for the scalarmul_scales-shaped reason: the class SETS reach the runtime
+        // on the `Wiring` (the macro bakes `gk`'s lists), and the load-time cross-check reads the
+        // class PLACEMENTS off this layout's own `places` — tid → size hd²·2 is all it needs, so
+        // baking the lists here would be a second copy of what the wiring already carries.
+        rope_class_hds: _,
+        attn_class_hds: _,
         kv_request_stride_bytes,
     } = l;
 
@@ -4376,6 +4431,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ⭐⭐⭐ THE HYBRID ROPE-CLASS REGRESSION — one P placement per DISTINCT rope head dim.
+    ///
+    /// This is the gemma-4 defect pinned as a law: the placement used to size ONE `ROPE_P_TID` at the
+    /// MAX rope head dim while the macro emitted the VALUE at the BASE head dim, so a `[64,64]` table
+    /// sat in a `[128,128]` placement and the wide class's rope rotated pairs at half=32 with lanes
+    /// 64..127 left at cos-only (dump-proven: first divergence `t107`, the roped K, at op2 of
+    /// prefill). A composite single P is IMPOSSIBLE (the big class's contraction reads the small
+    /// class's nonzero block as spurious ±1 terms), so the fix is one table, one placement, one tid
+    /// per class. Class 0 = the WIDEST and keeps `ROPE_P_TID` — a uniform model's bundle stays
+    /// byte-identical.
+    #[test]
+    fn a_hybrid_rope_tape_places_one_p_per_class() {
+        use scratchy_subtile::subtile_ir::{
+            SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
+        };
+        use std::marker::PhantomData;
+
+        // Two rope classes in one tape: the gemma-4 tiny-allglobal shape (sliding 64, global 128).
+        // Shapes are irrelevant to the class machinery — only the `head_dim` payloads are read.
+        let tensors = vec![
+            TensorShape { rows: 4, cols: 128 }, // t0 x (class-0 rope)
+            TensorShape { rows: 4, cols: 64 },  // t1 x (class-1 rope)
+        ];
+        let rope = |tid: usize, hd: u32| SubtileNode {
+            id: SubtileId::from_index(tid),
+            op: SubOp::RopeRotate {
+                head_dim: ktir_superdsc::head_counts::HeadDim::new(hd),
+                _form: PhantomData,
+            },
+            inputs: vec![
+                TensorRegion {
+                    tensor: TensorId::from_index(tid),
+                    region: tensors[tid].whole(),
+                },
+                TensorRegion {
+                    tensor: TensorId::from_index(tid),
+                    region: tensors[tid].whole(),
+                },
+                TensorRegion {
+                    tensor: TensorId::from_index(tid),
+                    region: tensors[tid].whole(),
+                },
+            ],
+            output: TensorRegion {
+                tensor: TensorId::from_index(tid),
+                region: tensors[tid].whole(),
+            },
+        };
+        // BOTH orderings: class order is derived from the SET (descending), not the node order, so
+        // the layout must not depend on which class the tape mentions first.
+        for nodes in [
+            vec![rope(0, 128), rope(1, 64)],
+            vec![rope(0, 64), rope(1, 128)],
+        ] {
+            let ir: SubtileIR = SubtileIR {
+                tensors: tensors.clone(),
+                num_sources: 0,
+                nodes,
+                result: TensorId::from_index(0),
+                op_output: Vec::new(),
+            };
+            let weight_ids: std::collections::HashSet<u32> = Default::default();
+            let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+                .expect("a layout for a two-class rope bundle");
+
+            // THE CLASS SET: distinct, descending.
+            assert_eq!(
+                layout.rope_class_hds, vec![128, 64],
+                "the rope class set is the DISTINCT head dims, sorted descending"
+            );
+            // Class 0 keeps the sentinel; class 1 descends into its own region.
+            let (t0, t1) = (
+                rope_p_class_tid(0),
+                rope_p_class_tid(1),
+            );
+            assert_eq!(t0, ROPE_P_TID);
+            assert_ne!(t1, ROPE_P_TID);
+            // ONE placement PER CLASS, each sized at its OWN hd²·2 — the max-fold defect is that a
+            // class's placement was sized by a class it is not.
+            let p0 = &layout.placements[&t0];
+            let p1 = &layout.placements[&t1];
+            assert_eq!(p0.size, 128 * 128 * 2, "class 0's placement is hd=128's table");
+            assert_eq!(p1.size, 64 * 64 * 2, "class 1's placement is hd=64's table");
+            // Both are seg0 ACTIVATIONS (the per-step bind the seg0 guard demands).
+            for (name, p) in [("class 0", p0), ("class 1", p1)] {
+                assert_eq!(
+                    p.segment,
+                    SegRole::Activation.segment(),
+                    "{name}'s P placement is in the activation segment"
+                );
+            }
+            // And no two class placements overlap.
+            assert!(
+                p0.offset + p0.size <= p1.offset || p1.offset + p1.size <= p0.offset,
+                "the two class placements alias"
+            );
+        }
+    }
+
+    /// ⭐ THE UNIFORM CASE IS UNCHANGED: one rope class ⇒ one placement ⇒ `ROPE_P_TID`, at the SAME
+    /// offset the pre-class layout gave it (offset 0 of seg0 for a rope-only bundle). This is the
+    /// granite byte-identity pin — a uniform model's ops name the same tid and its bytes do not move.
+    #[test]
+    fn a_uniform_rope_tape_is_byte_identical_to_the_pre_class_layout() {
+        use scratchy_subtile::subtile_ir::{
+            SubtileId, SubtileNode, TensorId, TensorRegion, TensorShape,
+        };
+
+        let tensors = vec![TensorShape { rows: 4, cols: 128 }];
+        let node = SubtileNode {
+            id: SubtileId::from_index(0),
+            op: SubOp::RopeRotate {
+                head_dim: ktir_superdsc::head_counts::HeadDim::new(128),
+                _form: std::marker::PhantomData,
+            },
+            inputs: vec![
+                TensorRegion {
+                    tensor: TensorId::from_index(0),
+                    region: tensors[0].whole(),
+                };
+                3
+            ],
+            output: TensorRegion {
+                tensor: TensorId::from_index(0),
+                region: tensors[0].whole(),
+            },
+        };
+        let ir: SubtileIR = SubtileIR {
+            tensors,
+            num_sources: 0,
+            nodes: vec![node],
+            result: TensorId::from_index(0),
+            op_output: Vec::new(),
+        };
+        let weight_ids: std::collections::HashSet<u32> = Default::default();
+        let layout = compute_bundle_layout(&ir, &weight_ids, false, &[])
+            .expect("a layout for a uniform rope bundle");
+        // ONE class, and it IS the sentinel — no class-1 tid is placed at all.
+        assert_eq!(layout.rope_class_hds, vec![128]);
+        assert_eq!(rope_p_class_tid(0), ROPE_P_TID);
+        assert_eq!(layout.placements[&ROPE_P_TID].size, 128 * 128 * 2);
+        assert!(layout
+            .placements
+            .values()
+            .filter(|p| p.role == SegRole::Activation)
+            .count()
+            >= 1);
+        // No class-1 tid exists in the placements.
+        assert!(!layout.placements.contains_key(&rope_p_class_tid(1)));
     }
 
     #[test]

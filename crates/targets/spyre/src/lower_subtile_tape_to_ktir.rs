@@ -2396,6 +2396,16 @@ pub struct BundleWiring {
     /// must fill them, the card path through `wiring::constant_steps` and the emulator through its
     /// own source binding. This is the one list they read, so they cannot disagree about it.
     pub scalarmul_scales: Vec<f32>,
+    /// ⭐ THE ROPE-P CLASS SET — this tape's DISTINCT rope head dims, sorted descending; index `i`
+    /// ↔ `rope_p_class_tid(i)`. The macro bakes this into the `Wiring` so the worker's load-time
+    /// bind builds one `[hd,hd]` P table PER CLASS (a hybrid model's single composite P is
+    /// impossible). Computed by the shared `rope_p_class_hds` helper off the same `ir` the
+    /// placement pass reads, so the two lists are one list.
+    pub rope_class_hds: Vec<u32>,
+    /// ⭐ THE IDENTITY CLASS SET — this tape's DISTINCT `AttnDecode` head dims, sorted descending;
+    /// index `i` ↔ `identity_class_tid(i)`. Same law as [`Self::rope_class_hds`], for the GQA
+    /// krep/vrep and cachewr matmul-by-identity tables.
+    pub attn_class_hds: Vec<u32>,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -2424,6 +2434,23 @@ pub fn graph_wiring<F: RopeForm>(
     let _ = weight_ids;
     let layout = BundleLayout {
         scalarmul_scales: scalar_registry(ir),
+        // ⭐ THE CLASS REGISTRIES, here too — the door resolves a rope/attn program's P/identity
+        // class through these, and this pass lowers through the door. Same shared helper, same
+        // tape, so the wiring's answer and the placement pass's cannot disagree.
+        rope_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
+            ir.nodes.iter().filter_map(|n| match &n.op {
+                SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
+                    Some(head_dim.get())
+                }
+                _ => None,
+            }),
+        ),
+        attn_class_hds: ktir_superdsc::reserved_tids::rope_p_class_hds(
+            ir.nodes.iter().filter_map(|n| match &n.op {
+                SubOp::AttnDecode { geom, .. } => Some(geom.hd().get()),
+                _ => None,
+            }),
+        ),
         ..Default::default()
     };
     let mut sym_id_base: i64 = 0;
@@ -2506,6 +2533,8 @@ pub fn graph_wiring<F: RopeForm>(
         tensor_shapes,
         attn_mask,
         scalarmul_scales: layout.scalarmul_scales.clone(),
+        rope_class_hds: layout.rope_class_hds.clone(),
+        attn_class_hds: layout.attn_class_hds.clone(),
     })
 }
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`

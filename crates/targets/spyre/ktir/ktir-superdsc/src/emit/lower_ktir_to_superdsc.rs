@@ -51,7 +51,7 @@ use crate::ktir_node::{Elementwise, KtirNode};
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{
-    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, IDENTITY_TID, LAST_HIDDEN_TID, ROPE_P_TID,
+    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, LAST_HIDDEN_TID,
     kct_resident_tid, scalarmul_scale_tid,
 };
 use crate::sdsc_abstract::{KernelTag, Stk};
@@ -2331,6 +2331,12 @@ pub struct RopeAt<'a> {
     pub t: u32,
     pub mq: u32,
     pub total: u32,
+    /// ⭐ THE ROPE-P CLASS TID this rope's `matmul(x, P)` names. One `[hd,hd]` P per DISTINCT rope
+    /// head dim in the tape (a hybrid model carries two, and a composite single P is impossible: the
+    /// big class's contraction reads the small class's nonzero block as spurious ±1 terms). The DOOR
+    /// resolves the class index off the shared `rope_class_hds` registry, so the emitter and the
+    /// placement pass cannot disagree about which table a class reads.
+    pub p_tid: u32,
     pub sym_id_base: &'a mut i64,
     pub layout: Option<&'a BundleLayout>,
     pub rows_are_requests: bool,
@@ -2365,6 +2371,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         t,
         mq,
         total,
+        p_tid,
         sym_id_base,
         layout,
         rows_are_requests,
@@ -2399,7 +2406,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             ns = hd / Fp16::ELEMS_PER_STICK,
         ));
     }
-    let p = crate::place::act_name(ROPE_P_TID);
+    // ⭐ THE CLASS TID, NOT THE BARE SENTINEL — the ONE P this rope's head dim class reads. A uniform
+    // model's door resolves class 0, which IS `ROPE_P_TID`, so its ops and bytes are unchanged.
+    let p = crate::place::act_name(p_tid);
     use SynthRole as R;
     let out_id = PlaceId::Act(t);
     let rot = syn(layout, out_id.synth(R::Rot)); // x · P  (rotate-half, synthetic seg3)
@@ -3226,7 +3235,26 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // [mq, nqh·hd] — the identity; every scratch name below is a rendering of it.
     let attn_id = PlaceId::Act(t);
     let n = |r: SynthRole| syn(layout, attn_id.synth(r));
-    let ident = crate::place::act_name(IDENTITY_TID);
+    // ⭐ THE IDENTITY CLASS TID — which `[hd,hd]` identity table this attention class's krep/vrep and
+    // cachewr matmuls name. One table per DISTINCT AttnDecode head dim (the bake's
+    // `attn_class_hds` registry), because a hybrid model's wide class reads slab 1 of a
+    // max-hd placement holding a base-hd table as ALL ZERO (dump-proven on gemma-4
+    // tiny-allglobal: `newkrep` lanes 64..127 zero while lanes 0..63 equal the roped K).
+    // A uniform model resolves class 0, which IS `IDENTITY_TID`, so its ops are unchanged.
+    let ident = crate::place::act_name({
+        let class = layout
+            .and_then(|l| l.attn_class_hds.iter().position(|&h| h == hd))
+            .ok_or_else(|| Error {
+                message: format!(
+                    "AttnDecode t{t}: head_dim {hd} absent from BundleLayout.attn_class_hds {:?} \
+                     (registry desync — the placement pass and this lowering disagree about the \
+                     tape's attention classes, so which identity table this node reads is not a \
+                     fact either of them states)",
+                    layout.map(|l| l.attn_class_hds.clone()).unwrap_or_default(),
+                ),
+            })?;
+        crate::reserved_tids::identity_class_tid(class)
+    });
 
     let mut ops: Vec<EmittedOp> = Vec::new();
 

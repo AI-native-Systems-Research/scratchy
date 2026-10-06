@@ -1444,10 +1444,10 @@ impl CoreRunner {
                 // loops). m>1 only: at m==1 the offload may fall through to the
                 // interpreter's `scf.for`, whose body DOES read the seed (the matmul's
                 // `outs`) — and an m==1 charge is `n` elements, never the problem.
-                if info.m > 1 {
-                    if let Some(&seed) = op.operands.get(3) {
-                        self.ctx.forget(seed);
-                    }
+                if info.m > 1
+                    && let Some(&seed) = op.operands.get(3)
+                {
+                    self.ctx.forget(seed);
                 }
                 match crate::metal::run_matmul_loop_gpu(info, &mut self.ctx) {
                     Ok(()) => {

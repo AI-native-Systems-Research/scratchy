@@ -171,10 +171,10 @@ pub(crate) struct Parsed {
 pub(crate) fn wiring_to_parsed(
     w: &'static scratchy_target_spyre::wiring::Wiring,
 ) -> ExecutorResult<Parsed> {
-    // The emitted identity / rope-P kernels against a fresh `stage_2d` — once per program, not
-    // per token. See `Wiring::verify_kernel_tables` for why "the emitter used the same helper"
-    // is not on its own sufficient.
-    w.verify_kernel_tables().map_err(werr)?;
+    // (The kernel-table check moved to where the LAYOUT is in hand: `BakeFacts::of` is followed by
+    // `Wiring::verify_class_placements(&code.layout)` once per baked bundle, which cross-checks the
+    // class sets against the placements — the fact that actually failed on gemma-4, where a fresh
+    // re-staging at the same base head dim agreed with a wrong table.)
     let capacity = w
         .capacity()
         .ok_or_else(|| werr("wiring has no attn_mask (re-bake with the length mask)"))?;
@@ -1169,6 +1169,17 @@ impl SpyreWorker {
                 // What the DECODE bake placed — one call, and its own refusal.
                 let df = scratchy_target_spyre::wiring::BakeFacts::of(&code.layout);
                 df.require_identity(&code.fp).map_err(werr)?;
+                // ⭐ THE CLASS SETS vs THE PLACEMENTS — the load-time cross-check that closes the
+                // "emu green, card garbage" gap for the kernel-table class: the emulator executes
+                // the KTIR dialect ops and never reads these tids, so nothing on its path can see
+                // a wiring/layout desync. Here, every rope-P and identity class tid must be placed
+                // at exactly its `hd²·2` footprint, and every placed class tid must be in the
+                // wiring's set — the gemma-4 defect (a base-hd table in a max-hd placement) is
+                // unrepresentable once this runs.
+                wirings
+                    .decode
+                    .verify_class_placements(&code.layout)
+                    .map_err(werr)?;
                 // ⭐ AND THE TAPE IS CHECKED AGAINST THE ARTIFACT, ONCE, HERE. Every tensor the
                 // forward would bind must be one this bundle placed. They come from the same bake
                 // and so agree "by construction" — which is exactly what was also true of the
@@ -1270,6 +1281,14 @@ impl SpyreWorker {
                         // `SCRATCHY_RMS_MATMUL_REDUCE`, so a bundle-vs-env mismatch cannot leave a
                         // matmul reading an unbound (zero) seg0.
                         prefill_facts = Some(scratchy_target_spyre::wiring::BakeFacts::of(pl));
+                        // The prefill bake's class sets against ITS placements — the same
+                        // cross-check the decode bake just passed, for the same reason.
+                        wirings
+                            .prefill
+                            .as_ref()
+                            .unwrap_or(&wirings.decode)
+                            .verify_class_placements(pl)
+                            .map_err(werr)?;
                         // OWNS ITS WEIGHTS ON PURPOSE — do NOT switch this to `new_borrowing`.
                         // This session is allocated BEFORE the decode session, so its 2.6 GB seg1
                         // reservation is what places decode's own weight region. Making it borrow (a

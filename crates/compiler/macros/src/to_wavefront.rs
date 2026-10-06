@@ -1077,7 +1077,7 @@ pub fn lower_decode_to_wavefront(
                             .bounds
                             .get("sliding_window")
                             .copied()
-                            .ok_or_else(|| BridgeError::MalformedOp {
+                            .ok_or(BridgeError::MalformedOp {
                                 tile,
                                 op: OpKind::SlidingAttention,
                                 detail: "sliding_attention tile, but the model config carries no \

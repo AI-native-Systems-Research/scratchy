@@ -8322,34 +8322,30 @@ fn emit_superdsc_wiring(
         None => quote! { ::core::option::Option::None },
     };
 
-    // ⭐ THE TWO KERNEL TABLES, EVALUATED HERE. `identity` and `rope_p` are pure functions of
-    // `head_dim`, and the worker rebuilt both on EVERY forward via `stage_2d` — 2·hd² f32 per
-    // token to produce the same bytes each time. Computed by the SAME shared helpers the runtime
-    // called (`StickLayout::kernel` + `rope_p_entry`, the latter Kani-proven), so the emitted
-    // table and the proof cannot drift.
+    // ⭐ THE KERNEL-TABLE CLASS SETS, FROM THE BAKE — NOT THE TABLES THEMSELVES. The tables are
+    // pure functions of each class's head dim, but baking them as literals was the gemma-4 defect
+    // in two ways at once: the literals were staged at the BASE `head_dim` while the placement
+    // pass sized the tids at the MAX over the tape's classes (a `[64,64]` table in a `[128,128]`
+    // placement — the wide class's rope rotated pairs at half=32 and its GQA krep read slab 1 as
+    // zeros, dump-proven), and a hybrid's widest class is `hd = 512`, whose 512² table is 262,144
+    // f32 literals for one field — the expansion-cost rule broken at its most expensive.
     //
-    // ⛔ STAGED THROUGH THE KERNEL LAYOUT, NOT ROW-MAJOR. A reserved seg0 tid has no
-    // RetileDescriptor, so the host fill IS the device layout. The two coincide only at hd == 64;
-    // at hd == 128 16,256 of 16,384 identity entries would come from the wrong byte.
-    let (identity_lits, rope_p_lits) = {
-        use scratchy_subtile::sdsc_abstract::{rope_p_entry, stage_kernel_table};
-        let hdu = hd as usize;
-        let ident = stage_kernel_table(hdu, |i, j| {
-            if i == j { 1.0 } else { 0.0 }
-        });
-        // `hd >= 2` is the runtime's own guard on emitting a rope-P at all.
-        let ropep: Vec<f32> = if hdu >= 2 {
-            stage_kernel_table(hdu, |inn, o| rope_p_entry(hdu, inn, o) as f32)
-        } else {
-            Vec::new()
-        };
-        let f = |v: Vec<f32>| -> Vec<proc_macro2::Literal> {
-            v.into_iter()
-                .map(proc_macro2::Literal::f32_suffixed)
-                .collect()
-        };
-        (f(ident), f(ropep))
-    };
+    // So the bake carries the class HEAD DIMS (the same lists `gk` derived from the same `ir` the
+    // placement pass read — one source of truth), and the worker's `synthetic_constants` builds
+    // each class's table at load through the SAME shared helpers the emission used
+    // (`stage_kernel_table` + `rope_p_entry`), with `Wiring::verify_class_placements`
+    // cross-checking the sets against the baked placements. Class 0 of each set is the widest and
+    // keeps the pre-class sentinel tid, so a uniform model's binds are byte-identical.
+    let rope_class_hds: Vec<proc_macro2::Literal> = gk
+        .rope_class_hds
+        .iter()
+        .map(|v| proc_macro2::Literal::u32_unsuffixed(*v))
+        .collect();
+    let attn_class_hds: Vec<proc_macro2::Literal> = gk
+        .attn_class_hds
+        .iter()
+        .map(|v| proc_macro2::Literal::u32_unsuffixed(*v))
+        .collect();
     // `1/hidden` over one stick — the mq>1 sum-based amax pre-scale.
     let rms_invcols_lits: Vec<proc_macro2::Literal> = {
         let inv = 1.0f32 / (b("hidden_size").max(1) as f32);
@@ -8388,8 +8384,8 @@ fn emit_superdsc_wiring(
                 head_dim: #head_dim,
                 rope_theta_bits: #theta_bits,
             },
-            identity: &[#(#identity_lits),*],
-            rope_p: &[#(#rope_p_lits),*],
+            rope_class_hds: &[#(#rope_class_hds),*],
+            attn_class_hds: &[#(#attn_class_hds),*],
             rms_invcols: &[#(#rms_invcols_lits),*],
             scalarmul_scales: &[#(#scalarmul_scale_lits),*],
         }
