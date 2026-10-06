@@ -1532,6 +1532,16 @@ pub struct CudaWorker {
     draft_kv_cache: Option<KvCachePool>,
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
+    /// ⭐⭐⭐ THE RESOLVED `max_num_seqs` — the width every worker-side
+    /// consumer actually builds at (GDN state pool slots, the captured-graph
+    /// ladder). Set at the END of `load_model` by
+    /// [`CudaWorker::resolve_max_num_seqs`]: the caller's explicit ask, or
+    /// (unset) the device tier clamped to what this device's memory affords
+    /// where the model carries per-sequence GDN state. Reported to the
+    /// engine via [`Worker::max_num_seqs_override`] so the scheduler admits
+    /// exactly this many — one process, one number. `None` until
+    /// `load_model` resolves it.
+    resolved_max_num_seqs: Option<usize>,
     is_shutdown: bool,
     /// Per-request `prompt ++ generated` as ONE buffer, for the logits processors, which take the
     /// history in that shape. A second copy of `InputBatch`'s history, appended at the same commits.
@@ -1747,6 +1757,7 @@ impl CudaWorker {
             draft_kv_cache: None,
             model_dtype: GpuDType::BF16,
             resolved_architecture: None,
+            resolved_max_num_seqs: None,
             is_shutdown: false,
             graph_runner: None,
             #[cfg(feature = "nccl")]
@@ -1818,6 +1829,93 @@ impl CudaWorker {
     /// Update max_num_batched_tokens (used for GPU-aware auto-detection).
     pub fn set_max_num_batched_tokens(&mut self, value: usize) {
         self.config.max_num_batched_tokens = value;
+    }
+
+    /// ⭐⭐⭐ THE UNSET `--max-num-seqs` ANSWER — called at the END of `load_model`,
+    /// BEFORE every consumer of the width (GDN pool in `initialize_cache`, capture
+    /// ladder in `compile_or_warm_up_model`). Semantics are the trait's
+    /// ([`Worker::max_num_seqs_override`] / [`Worker::align_max_num_seqs`]) and the
+    /// resolver's (`gpu_budget::resolve_default_max_num_seqs` — see the metal
+    /// worker's doc for the full contract): explicit ask verbatim; unset → the
+    /// device-tier answer (cuda reports facts: 1024 on a ≥70 GiB non-A100, else
+    /// 256) clamped to what this device's budget affords.
+    fn resolve_max_num_seqs(&mut self) {
+        use scratchy_serving_engine::gpu_budget::{MaxNumSeqsFacts, resolve_default_max_num_seqs};
+        if self.resolved_max_num_seqs.is_some() {
+            return;
+        }
+        let resolved = match self.config.max_num_seqs {
+            Some(asked) => asked,
+            None => {
+                let (total_bytes, name) = crate::current_device_total_bytes_and_name()
+                    .map_or((None, None), |(t, n)| (Some(t), Some(n)));
+                let gdn_per_slot = self
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.gdn_runtime_config())
+                    .map(|cfg| {
+                        GdnStatePool::<crate::PoolMem>::reserve_bytes(
+                            cfg.num_linear_layers(),
+                            1,
+                            cfg.conv_dim as usize,
+                            cfg.conv_kernel as usize,
+                            cfg.num_v_heads as usize,
+                            cfg.head_v_dim as usize,
+                            cfg.head_k_dim as usize,
+                        )
+                    });
+                let (budget, allocated) = match total_bytes {
+                    Some(total) => {
+                        let budget = (total as f64 * self.config.gpu_memory_utilization) as usize;
+                        // Weights are resident and synchronized by this point,
+                        // so (total − free) is what this process already holds.
+                        let allocated = unsafe { driver::mem_get_info() }
+                            .map(|(free, t)| t.saturating_sub(free))
+                            .unwrap_or(0);
+                        (Some(budget), allocated)
+                    }
+                    // No device query = no budget to clamp against: the tier
+                    // answer survives as-is (the OOM guard still refuses an
+                    // unaffordable pool).
+                    None => (None, 0),
+                };
+                // Cuda's runtime activation peak is only measurable by the
+                // profile run in `determine_available_memory`, which runs
+                // AFTER this resolves. Budget the static allowance instead:
+                // a decode/prefill profile peak on this class of hardware
+                // sits well under 2 GiB, and the resolver's KV floor + the
+                // OOM guard absorb the residue. An allowance, not a measured
+                // figure — flagged so nobody mistakes it for one.
+                const PEAK_ACTIVATION_ALLOWANCE: usize = 2 * 1024 * 1024 * 1024;
+                let facts = MaxNumSeqsFacts {
+                    device_total_bytes: total_bytes,
+                    device_name: name,
+                    device_budget_bytes: budget,
+                    allocated_bytes: allocated,
+                    peak_activation_bytes: PEAK_ACTIVATION_ALLOWANCE,
+                    gdn_per_slot_bytes: gdn_per_slot,
+                    sampler_bytes_per_row: 0,
+                };
+                resolve_default_max_num_seqs(&facts, false)
+            }
+        };
+        info!(
+            "ScratchyWorker(cuda): max_num_seqs = {resolved} ({}; pass \
+             --max-num-seqs to override)",
+            if self.config.max_num_seqs.is_some() {
+                "requested"
+            } else {
+                "default"
+            }
+        );
+        self.resolved_max_num_seqs = Some(resolved);
+    }
+
+    /// The resolved width, floored at 1. Every consumer of the width calls
+    /// this — never `self.config.max_num_seqs`, which keeps the REQUEST so
+    /// error messages can speak about what the caller asked.
+    fn max_num_seqs_resolved(&self) -> usize {
+        self.resolved_max_num_seqs.unwrap_or(1).max(1)
     }
 
     /// Expose the HF config after load_model.
@@ -3314,6 +3412,35 @@ impl Worker for CudaWorker {
         !self.kv_cache_is_fp8
     }
 
+    fn max_num_seqs_override(&self) -> Option<usize> {
+        // The width this worker resolved (caller's ask, or the memory-
+        // affordable default) and derived its capture ladder + GDN pool
+        // from. Reported so the scheduler admits exactly this many — one
+        // process, one number — including when the flag was UNSET and the
+        // worker answered it itself. `None` before `load_model`.
+        self.resolved_max_num_seqs
+    }
+
+    fn align_max_num_seqs(&mut self, width: usize) {
+        // DOWNWARD only, and only when the flag was unset: ranks each clamp
+        // on their own `mem_get_info` (which also counts other processes),
+        // so the engine hands back the narrowest width and every rank
+        // builds its `auto_capture_sizes` ladder at it — otherwise a batch
+        // between two ranks' ladder rungs replays a graph on one rank and
+        // runs eager on the other, and the all-reduce shapes disagree. An
+        // explicit ask is identical on every rank and never re-clamped.
+        if self.config.max_num_seqs.is_none()
+            && let Some(r) = self.resolved_max_num_seqs.as_mut()
+            && *r > width
+        {
+            info!(
+                "ScratchyWorker(cuda): aligning max_num_seqs {} → {width} (narrowest rank)",
+                *r
+            );
+            *r = width;
+        }
+    }
+
     fn init_device(&mut self) -> ExecutorResult<()> {
         let device = GpuDevice::new(self.config.device_id)
             .map_err(|e| ExecutorError::WorkerInit(format!("GpuDevice init failed: {e}")))?;
@@ -3672,6 +3799,12 @@ impl Worker for CudaWorker {
         self.model_dir = Some(model_dir.clone());
         self.hf_config = Some(hf_config);
 
+        // Resolve `max_num_seqs` NOW — after the model's GDN config is
+        // answerable and weights are GPU-resident, before every consumer of
+        // the width (GDN state pool in `initialize_cache`, the capture
+        // ladder in `compile_or_warm_up_model`).
+        self.resolve_max_num_seqs();
+
         // Resolve pooling strategy.
         self.pooling_strategy = scratchy_core_model::embedding::resolve_pooling_strategy(
             &self.config.pooling_strategy,
@@ -3889,7 +4022,7 @@ impl Worker for CudaWorker {
         // (`max_num_seqs`), matching the scheduler's `max_num_running_reqs`
         // so the slot allocator never exhausts. Mirrors the metal arm.
         if let Some(gdn_cfg) = model.gdn_runtime_config() {
-            let num_slots = self.config.max_num_seqs.max(1);
+            let num_slots = self.max_num_seqs_resolved();
             let num_layers = model.num_layers();
             let t_gdn = std::time::Instant::now();
             let gdn_pool = unsafe {
@@ -3976,7 +4109,7 @@ impl Worker for CudaWorker {
                 .map(|cfg| {
                     crate::gdn_state::GdnStatePool::<crate::PoolMem>::reserve_bytes(
                         cfg.num_linear_layers(),
-                        self.config.max_num_seqs.max(1),
+                        self.max_num_seqs_resolved(),
                         cfg.conv_dim as usize,
                         cfg.conv_kernel as usize,
                         cfg.num_v_heads as usize,
@@ -4279,6 +4412,9 @@ impl Worker for CudaWorker {
         }
 
         let max_blocks_per_seq = self.max_blocks_per_seq();
+        // Read before the `&mut self.device` borrow below — the width was
+        // resolved at load_model, so it is a plain copy here.
+        let max_num_seqs = self.max_num_seqs_resolved();
 
         let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
             (Some(m), Some(kv), Some(d)) => (m, kv, d),
@@ -4320,9 +4456,7 @@ impl Worker for CudaWorker {
             // run — batch sizes above `max_num_seqs` are never replayed
             // (`nearest_graph_size` caps the runtime batch at it), so
             // capturing them is dead work.
-            scratchy_core_config::CudaGraphConfig::auto_capture_sizes(
-                self.config.max_num_seqs.max(1),
-            )
+            scratchy_core_config::CudaGraphConfig::auto_capture_sizes(max_num_seqs)
         } else {
             self.config.cuda_graph_sizes.clone()
         };

@@ -119,13 +119,20 @@ impl SpyreWorker {
     /// fell back to a constant, and a constant depth is what made the pool's size unanswerable against
     /// what the caller asked for. Two setters would let a future caller set one and leave the other at a
     /// default, silently restoring exactly that.
+    ///
+    /// `max_num_seqs` is the REQUEST (`Option`): `None` (unset `--max-num-seqs`) leaves `admitted` unset,
+    /// which sizes the pool at the WIDEST rung the bake can express — the same width
+    /// `Worker::max_num_seqs_override` then reports to the scheduler, so a bare `scr serve` runs at the
+    /// widest batched decode this bake can do. `Some(n)` declares `n` and the pool is cut for it (the
+    /// budget still refuses a declaration it cannot hold).
     pub fn declare_workload(
         &mut self,
-        max_num_seqs: usize,
+        max_num_seqs: Option<usize>,
         max_model_len: Option<usize>,
         gpu_memory_utilization: f64,
     ) {
-        self.admitted = scratchy_subtile::sdsc_abstract::AdmittedRequests::new(max_num_seqs);
+        self.admitted =
+            max_num_seqs.and_then(scratchy_subtile::sdsc_abstract::AdmittedRequests::new);
         self.declared_context = max_model_len;
         self.gpu_memory_utilization = gpu_memory_utilization;
     }

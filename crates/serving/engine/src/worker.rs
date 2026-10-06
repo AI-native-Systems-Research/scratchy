@@ -149,15 +149,38 @@ pub trait Worker: Send {
     /// invariant from the other end: it reports the widest width it can batch and the scheduler admits no
     /// more than that.
     ///
+    /// It also ANSWERS an unset `--max-num-seqs`, which is why cuda and metal report here too: when the
+    /// caller named nothing, a worker that resolved a memory-affordable default (the GDN slot count, the
+    /// device tier) hands the scheduler the value it actually built its pools at, so
+    /// `WorkerCreateConfig::max_num_seqs = None` never resolves to two different numbers in one process.
+    ///
     /// ⭐ CAPPING, NOT REFUSING — cuda refuses no `max_num_seqs` and neither should anyone else. Exceeding
     /// the ladder is a THROUGHPUT cliff, not a correctness bound: spyre's own fallback is one launch per
     /// request (~93 µs each) and stays correct. The cap keeps a run on the batched path instead of
     /// silently dropping it onto the slow one; it is not protecting against corruption.
     ///
-    /// `None` = no cap (cuda/metal, whose ladders already track `max_num_seqs`). Valid after `load_model`.
+    /// `None` = no cap and no worker-decided default (use the caller's value). Valid after `load_model`.
     fn max_num_seqs_override(&self) -> Option<usize> {
         None
     }
+
+    /// Align this worker's resolved width with the NARROWEST rank in the
+    /// process (or, multi-node, the all-reduced narrowest width) — called
+    /// BEFORE `initialize_cache` / `compile_or_warm_up_model`, so every
+    /// rank's pools, sampler arenas, and capture ladders build at ONE width.
+    ///
+    /// Each TP rank resolves an unset `--max-num-seqs` against its own
+    /// `mem_get_info`, so two ranks can land on 205 and 210 — and then build
+    /// `auto_capture_sizes` ladders that top out differently (batch 203 runs
+    /// eager on one rank, padded to 208 on the other → mismatched all-reduce
+    /// shapes). The engine collects the MIN and hands it back through here.
+    ///
+    /// ⛔ DOWNWARD ONLY, and only for an UNSET flag: `min(resolved, width)`.
+    /// An explicit ask is identical on every rank by construction and is
+    /// never re-clamped here — capping-is-not-validating applies across
+    /// ranks too. The default no-op serves backends whose width is fixed at
+    /// BAKE time (spyre: `BATCH_RUNGS` ignores it entirely).
+    fn align_max_num_seqs(&mut self, _width: usize) {}
 
     /// ⭐⭐⭐ HOW THIS WORKER ADDRESSES ITS KV — a CAPABILITY, declared before it runs a step.
     ///
@@ -255,6 +278,29 @@ pub trait Worker: Send {
 
     /// Whether this is the driver worker.
     fn is_driver_worker(&self) -> bool;
+}
+
+/// The narrowest width the given workers report, as ONE collection — TP
+/// paths each clamp an unset `--max-num-seqs` on their own memory query,
+/// so the scheduler must admit no more than the narrowest rank's pools
+/// hold. A rank reporting nothing leaves the answer unchanged (not
+/// `usize::MAX` — that would hand the scheduler an unbounded width).
+pub fn min_max_num_seqs(workers: &[Box<dyn Worker>]) -> Option<usize> {
+    workers.iter().flat_map(|w| w.max_num_seqs_override()).min()
+}
+
+/// Align every worker in the collection to the narrowest reported width
+/// (`min_max_num_seqs`), BEFORE `initialize_cache` /
+/// `compile_or_warm_up_model` — pools, sampler arenas, and capture
+/// ladders then all build at ONE width, so no batch can replay a graph
+/// on one rank and run eager on another (mismatched all-reduce shapes).
+/// No-op when no worker reported a width.
+pub fn align_all_max_num_seqs(workers: &mut [Box<dyn Worker>]) {
+    if let Some(w) = min_max_num_seqs(workers) {
+        for worker in workers.iter_mut() {
+            worker.align_max_num_seqs(w);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +415,92 @@ impl Worker for NoopWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker that answers an unset `--max-num-seqs` with a fixed width
+    /// and tracks what `align_max_num_seqs` told it — the shape metal/cuda
+    /// present after `load_model` resolves the flag.
+    struct WidthWorker {
+        width: Option<usize>,
+        aligned_to: Vec<usize>,
+    }
+
+    impl Worker for WidthWorker {
+        fn init_device(&mut self) -> ExecutorResult<()> {
+            Ok(())
+        }
+        fn load_model(&mut self) -> ExecutorResult<()> {
+            Ok(())
+        }
+        fn initialize_cache(&mut self, _gpu: usize, _cpu: usize) -> ExecutorResult<()> {
+            Ok(())
+        }
+        fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
+            Ok(0)
+        }
+        fn execute_model(
+            &mut self,
+            _scheduler_output: &SchedulerOutput,
+        ) -> ExecutorResult<ModelRunnerOutput> {
+            Ok(ModelRunnerOutput::from_token_map(HashMap::new()))
+        }
+        fn shutdown(&mut self) {}
+        fn rank(&self) -> usize {
+            0
+        }
+        fn local_rank(&self) -> usize {
+            0
+        }
+        fn is_driver_worker(&self) -> bool {
+            true
+        }
+        fn max_num_seqs_override(&self) -> Option<usize> {
+            self.width
+        }
+        fn align_max_num_seqs(&mut self, width: usize) {
+            // Mirror the real impls: a rank that never reported a width
+            // (nothing was sized by the flag) stays silent under align.
+            if self.width.is_some() {
+                self.aligned_to.push(width);
+                self.width = Some(self.width.unwrap_or(width).min(width));
+            }
+        }
+    }
+
+    /// THE ONE-NUMBER-PER-PROCESS INVARIANT, wired: the MIN of the ranks'
+    /// reported widths is what every rank ends up at after alignment, and a
+    /// rank that reports nothing neither caps nor aligns anyone. Runs the
+    /// REAL collection/alignment the init paths use — not a re-implementation
+    /// of it.
+    #[test]
+    fn ranks_align_to_the_narrowest_reported_width() {
+        let mut ranks: Vec<Box<dyn Worker>> = vec![
+            Box::new(WidthWorker {
+                width: Some(210),
+                aligned_to: vec![],
+            }),
+            Box::new(WidthWorker {
+                width: Some(205),
+                aligned_to: vec![],
+            }),
+            Box::new(WidthWorker {
+                width: None,
+                aligned_to: vec![],
+            }),
+        ];
+        assert_eq!(
+            min_max_num_seqs(&ranks),
+            Some(205),
+            "the narrowest reporting rank wins"
+        );
+        align_all_max_num_seqs(&mut ranks);
+        let widths: Vec<_> = ranks
+            .iter()
+            .map(|w: &Box<dyn Worker>| w.max_num_seqs_override())
+            .collect();
+        // Both reporting ranks now sit at ONE width; the silent rank stays
+        // silent (its pools were never sized by the flag's default).
+        assert_eq!(widths, vec![Some(205), Some(205), None]);
+    }
 
     #[test]
     fn test_worker_config() {
