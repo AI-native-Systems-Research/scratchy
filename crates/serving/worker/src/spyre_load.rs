@@ -1180,6 +1180,19 @@ impl SpyreWorker {
                     .decode
                     .verify_class_placements(&code.layout)
                     .map_err(werr)?;
+                // ⭐ THE CAUSAL MASK'S ROW EXTENT vs ITS PLACEMENT — the load-time cross-check for
+                // the `nqh` bake. The host stages `causal_tiled(cmask, mq, mq_pad, nqh)` rows into
+                // `ATTN_CAUSAL_TID`'s `nqh·mq·mq_pad`-element placement, and the head count those
+                // two halves share is `Geometry::nqh`. The host used to derive it as
+                // `hidden / head_dim` — right only for a square Q projection, wrong on gemma-4,
+                // and the shortfall was SILENT (the bind guard refuses over-binds only) while the
+                // unstaged tail of the additive mask read as "no mask". This makes any head count
+                // other than the bake's a load-time refusal. At the decode row count `mq = 1`,
+                // where the pad law gives every baked rung the one-stick score width 64.
+                wirings
+                    .decode
+                    .verify_causal_placement(&code.layout, 1, 64)
+                    .map_err(werr)?;
                 // ⭐ AND THE TAPE IS CHECKED AGAINST THE ARTIFACT, ONCE, HERE. Every tensor the
                 // forward would bind must be one this bundle placed. They come from the same bake
                 // and so agree "by construction" — which is exactly what was also true of the
@@ -1271,12 +1284,60 @@ impl SpyreWorker {
                     .or(top_prefill);
                 let (mut prefill_ss, prefill_m) = match prefill_code {
                     Some(pcode) => {
-                        // The baked prefill m (query rows) = the embed activation's placement rows:
-                        // size / (hidden·2). run_step MUST use exactly this m.
+                        // The baked prefill m (query rows). run_step MUST use exactly this m.
+                        //
+                        // ⭐⭐⭐⭐⭐ FROM THE MANIFEST'S OWN RUNG ENTRY, NOT from the embed
+                        // activation's placement bytes. The old derivation was
+                        // `place_of_tid(embed).size / (hidden·2)`, and BOTH of its halves were
+                        // wrong on their own:
+                        //
+                        // 1. THE TID. It read `dparsed.embed_src` — the DECODE program's embed
+                        //    tid — against the PREFILL bundle's layout, but tensor ids are PER
+                        //    PROGRAM (codegen: "the prefill graph numbers its own"), so on
+                        //    gemma-4's allglobal tiny fixture it named the attention Q activation
+                        //    `[mq, nqh·hd]` and the division answered `mq·nqh·hd/hidden` = 4× the
+                        //    real width (7 read as 28).
+                        // 2. THE DIVISOR. Even at the right tid, an activation's placement
+                        //    reserves the DEVICE width, `bump_sticks_to_splittable(hidden)` —
+                        //    the ≥8-core occupancy pad (`lower_subtile_tape_to_superdsc.rs`'s
+                        //    `nbytes`) — so `size / (hidden·2)` is right only while hidden's own
+                        //    stick count is already core-splittable. granite's 2048 (32 sticks)
+                        //    is; gemma-4's 3840 (60 sticks → padded to 4096) is NOT, and the
+                        //    tiny fixture's 128 (2 sticks → padded to 512) is not — the quotient
+                        //    overstates the row count by `bump/hidden` (16/15 at production
+                        //    scale, 4× on the fixture).
+                        //
+                        // The mismeasured width went straight into the prefill LADDER as the
+                        // anchor rung's label: on the tiny fixture the 7-row bundle registered as
+                        // "28", sorted above the 11/15/… rungs, and an 8-token prompt — the
+                        // fixture's own request — selected it by `prefill_rung_for`'s
+                        // smallest-m≥real rule, then ran its attention ops past placements sized
+                        // for 7 rows. The manifest's `prefill_rungs` rows already state each
+                        // bundle's width at the bake (the same list this anchor was selected
+                        // FROM), so the label is read back off the entry the anchor came from —
+                        // no second derivation to disagree with the first.
                         let pl = &pcode.layout;
-                        let prefill_m = pl
-                            .place_of_tid(dparsed.embed_src as u32)
-                            .map_or(0, |p| (p.size as usize) / (dparsed.hidden * 2));
+                        // The anchor is `top_prefill`-gated: either the manifest's NARROWEST rung
+                        // (the normal path — its width is that entry's own `rm`, the same value
+                        // the selection just keyed on) or the top prefill bundle itself (no
+                        // ladder — its width is the prefill wiring's own `m_cap`, the shape the
+                        // embed activation was staged at, from the wiring and not from the
+                        // placement bytes).
+                        let prefill_m = g0
+                            .prefill_rungs
+                            .iter()
+                            .filter(|(rm, _)| *rm > 1)
+                            .min_by_key(|(rm, _)| *rm)
+                            .map_or_else(
+                                || {
+                                    wirings
+                                        .prefill
+                                        .as_ref()
+                                        .map_or(0, |p| p.tensor_shapes[p.embed_src as usize].0
+                                            as usize)
+                                },
+                                |(rm, _)| *rm as usize,
+                            );
                         // What the PREFILL bake placed. From the bundle, never from
                         // `SCRATCHY_RMS_MATMUL_REDUCE`, so a bundle-vs-env mismatch cannot leave a
                         // matmul reading an unbound (zero) seg0.
@@ -1288,6 +1349,22 @@ impl SpyreWorker {
                             .as_ref()
                             .unwrap_or(&wirings.decode)
                             .verify_class_placements(pl)
+                            .map_err(werr)?;
+                        // ⭐ AND THE CAUSAL MASK against the PREFILL bake, at its own row count:
+                        // the placement reserves `nqh·prefill_m·pad` elements and the host stages
+                        // that many, so a head count other than the bake's (`Geometry::nqh`) is a
+                        // refusal here. The pad is the same `div_ceil(64)·64` law the emitter and
+                        // `run_prefill_batch` both apply — `PaddedMq::of_bundle` at a prompt
+                        // chunk's width.
+                        wirings
+                            .prefill
+                            .as_ref()
+                            .unwrap_or(&wirings.decode)
+                            .verify_causal_placement(
+                                pl,
+                                prefill_m as u32,
+                                (prefill_m as u32).div_ceil(64) * 64,
+                            )
                             .map_err(werr)?;
                         // OWNS ITS WEIGHTS ON PURPOSE — do NOT switch this to `new_borrowing`.
                         // This session is allocated BEFORE the decode session, so its 2.6 GB seg1
@@ -1769,15 +1846,15 @@ impl SpyreWorker {
                     if let Some(pmask) = rcode.layout.place_of_tid(
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
                     ) {
-                        // ⭐ QUERY HEADS FROM THE BAKED GEOMETRY. The head count
-                        // IS a model fact — which is precisely why it must come
-                        // from the artifact the tape was lowered at rather than
-                        // from `config.json`, whose `unwrap_or(1)` could hand
-                        // back a plausible wrong answer the bundle disagrees
-                        // with. `hidden / head_dim` is the same derivation the
-                        // emitter uses (`nqh = hidden_size / head_dim`).
+                        // ⭐ QUERY HEADS FROM THE BAKED GEOMETRY — THE COUNT ITSELF, NOT THE OLD
+                        // `hidden / head_dim` QUOTIENT. The quotient is the head count only for a
+                        // SQUARE Q projection; gemma-4's is not (hidden 3840 against nqh·hd
+                        // 4096/8192), and a mask-capacity derived from the quotient overstates how
+                        // many blocks a rung's placement holds — the tail blocks read unstaged
+                        // zeros, which in an ADDITIVE mask means VALID. `Geometry::nqh` is baked
+                        // from `num_attention_heads` at the same bounds the tape was lowered at.
                         let g = &wirings.decode.geometry;
-                        let nqh = (g.hidden as u64 / (g.head_dim as u64).max(1)).max(1);
+                        let nqh = g.nqh.max(1) as u64;
                         let bytes = pmask.size;
                         let per = nqh * rn as u64 * 2;
                         let cap = if per > 0 { bytes / per } else { 0 };

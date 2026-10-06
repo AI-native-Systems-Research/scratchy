@@ -112,7 +112,11 @@ pub(crate) fn run_prefill_batch(
     want_logits: LogitsWanted<'_>,
 ) -> ExecutorResult<Option<Vec<f32>>> {
     use scratchy_subtile::sdsc_abstract::{ChunkRows, decode_prefix_col_valid};
-    let (h, hd, vocab) = (sh.hidden, sh.head_dim, sh.vocab);
+    // ⭐ NO `hd` HERE ANY MORE. The one head-count question this function asked (`h / hd`) is now
+    // the bake's own `Geometry::nqh` — the quotient was the head count only for a square Q
+    // projection, and a hybrid-attention arch (gemma-4) has none. `Shared::head_dim` stays for
+    // the sendnn pool sizing, which is a KV-width question, not a head-count one.
+    let (h, vocab) = (sh.hidden, sh.vocab);
     // The bundle is baked for EXACTLY m=prefill_m query rows, so run at prefill_m: the `real`
     // prompt tokens fill rows [0..real), rows [real..prefill_m) are PAD. A PROMPT CHUNK's pad row
     // replicates the LAST real token — its id (`tok_at`), its rotary position, and its causal extent
@@ -184,7 +188,15 @@ pub(crate) fn run_prefill_batch(
         None if i < real => toks[i],
         None => toks[real - 1],
     };
-    let nqh = h / hd;
+    // ⭐⭐⭐⭐⭐ THE HEAD COUNT FROM THE BAKE, NOT `h / hd`. The quotient is the head count only for a
+    // SQUARE Q projection; gemma-4's is not (hidden 3840 against nqh·hd 4096/8192 — and the
+    // tiny-allglobal fixture's hidden 128 against 4·64). Deriving it here staged a causal mask
+    // covering only `h/hd` of the baked `nqh` head rows: the bind guard refuses OVER-binds only, so
+    // the shortfall was silent, and the ops read the unstaged tail of the ADDITIVE mask as ZERO —
+    // i.e. those heads ran with NO causal mask. MEASURED on the tiny fixture: heads 2-3 unmasked,
+    // every layer, prefill; heads 0-1 exact. `b.wiring` is the bake the tape was lowered at, so its
+    // `Geometry::nqh` is the count the placements were sized by and cannot disagree with them.
+    let nqh = b.wiring.geometry.nqh as usize;
     // stick-padded query count (mqp) — MUST match the emitter's `mq.div_ceil(64)*64`. The old hardcoded
     // 64 was a LIVE bug for mq>64 (e.g. prefill_m=128): the causal mask / ATTN_ZERO were bound 64-wide
     // while the emitter reads them mqp-wide, so rows≥64 read past the bound data (non-causal leakage).
@@ -762,7 +774,10 @@ pub(crate) fn superdsc_forward_chunk(
     if n == 0 {
         return Err(werr("superdsc_forward_chunk: n=0".to_string()));
     }
-    let (h, hd, vocab) = (sh.hidden, sh.head_dim, sh.vocab);
+    // ⭐ NO `hd` HERE EITHER — the solo-decode causal tile's head count is the bake's
+    // `Geometry::nqh` (see the `num_q_heads` site below), and nothing else in this
+    // function asks a head-dim question.
+    let (h, vocab) = (sh.hidden, sh.vocab);
     // MASK EXTENT: one validity row PER PAGE, laid end to end. The fold is re-launched per page and
     // walks along this buffer, so page `i`'s row sits `i * page_slots` in.
     // ⛔⛔⛔ SIZED BY THE PAGES THE LAUNCH **WALKS**, NOT BY THE HOST'S BLOCK COUNT.
@@ -1281,7 +1296,12 @@ pub(crate) fn superdsc_forward_chunk(
         }
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
             hidden: h,
-            num_q_heads: h / hd,
+            // ⭐⭐⭐⭐⭐ THE BAKED HEAD COUNT — the causal tile is `nqh` rows at mq==1, and
+            // `h / hd` is that count only for a square Q projection. Same defect class the
+            // prefill path recorded: a short tile leaves the upper head rows of the ADDITIVE
+            // mask unstaged, which reads as ZERO — no mask. `b` is the decode meta this step
+            // launches, so its wiring's geometry is the count the placement was sized by.
+            num_q_heads: b.wiring.geometry.nqh as usize,
             mq_pad: 64,
             embed_tokens: sh.embed_tokens,
             tokens: &[tok],

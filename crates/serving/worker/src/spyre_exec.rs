@@ -793,7 +793,21 @@ impl Worker for SpyreWorker {
                 // block. Declared here because this is where the row count and the head count are
                 // both known; idempotent, so restating it each step costs nothing and cannot drift
                 // from the rung actually running.
-                let nqh = sh.hidden / sh.head_dim.max(1);
+                // ⭐⭐⭐⭐⭐ THE BAKED HEAD COUNT, NOT `sh.hidden / sh.head_dim`. The quotient is the
+                // head count only for a SQUARE Q projection; gemma-4's is not (hidden 3840 against
+                // nqh·hd 4096/8192), and a mask shape built on the quotient stages and strides only
+                // that many of the baked `nqh·mq` rows — the shortfall reads as ZERO in an additive
+                // mask, i.e. as no mask, exactly the causal-mask defect the prefill path recorded.
+                // The decode meta's wiring is the bake the rungs were lowered at; geometry is
+                // identical across cap buckets, so the bucket chosen here cannot disagree with the
+                // rung actually running.
+                let nqh = model
+                    .decode
+                    .last()
+                    .expect("at least one decode bucket")
+                    .wiring
+                    .geometry
+                    .nqh as usize;
                 // ROW-BATCHED FOLD (emitter: `per_request` at mq>1 with rows_are_requests). A pass is
                 // baked for ONE request's `nqh` rows, so a mask BLOCK is `nqh` rows deep, not
                 // `nqh*seqs`, and each pass must additionally be rebased onto its own request's row

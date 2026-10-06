@@ -7908,6 +7908,15 @@ fn emit_superdsc_wiring(
         v => v,
     };
     let head_dim = u32l(hd as u32);
+    // ⭐⭐⭐⭐⭐ THE HEAD COUNT ITSELF, NOT THE `hidden/hd` QUOTIENT. Baking `heads`
+    // here is what retires the host-side `hidden / head_dim` derivation everywhere:
+    // that quotient is the head count only for a SQUARE Q projection, and gemma-4's
+    // is not (hidden 3840 against nqh·hd 4096/8192). A worker staging the causal or
+    // prefix mask with the quotient head count binds only that many of the baked
+    // `nqh·mq` rows — the shortfall is silent (the bind guard refuses over-binds
+    // only) and the unstaged tail of an ADDITIVE mask reads as ZERO, i.e. as no
+    // mask. MEASURED on gemma-4 tiny-allglobal: heads 2-3 ran unmasked, every layer.
+    let nqh = u32l(heads as u32);
     let kv_dim = u32l((b("num_key_value_heads").max(1) * hd) as u32);
     // ⛔ SCALARS FIRST, AND NO DEFAULT. `rope_theta` is a FLOAT, so it lives in
     // `model.scalars`; `bounds` is integer-valued and a bounds-only lookup
@@ -8382,6 +8391,7 @@ fn emit_superdsc_wiring(
                 vocab: #vocab,
                 layers: #n_layers,
                 head_dim: #head_dim,
+                nqh: #nqh,
                 rope_theta_bits: #theta_bits,
             },
             rope_class_hds: &[#(#rope_class_hds),*],

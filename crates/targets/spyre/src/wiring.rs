@@ -324,6 +324,58 @@ impl Wiring {
         Ok(())
     }
 
+    /// ⭐⭐⭐⭐⭐ THE CAUSAL MASK'S ROW EXTENT vs ITS PLACEMENT — ONCE, AT LOAD.
+    ///
+    /// The placement reserves `nqh · mq · mq_pad` fp16 elements for `ATTN_CAUSAL_TID`
+    /// (`lower_subtile_tape_to_superdsc.rs`, the `cmbytes` law), and the host stages exactly
+    /// `causal_tiled(cmask, mq, mq_pad, nqh)` into it. The row count both halves share is the
+    /// head count — which every host staging site used to DERIVE as `hidden / head_dim`. That
+    /// quotient is the head count only for a SQUARE Q projection (`hidden == nqh·hd`): true of
+    /// granite/llama, false of gemma-4 (production hidden 3840 against nqh·hd 4096/8192; the
+    /// tiny-allglobal fixture's hidden 128 against 4·64). A host staging at the quotient binds
+    /// only that many of the baked `nqh·mq` rows, and `refill_activations`' bind guard refuses
+    /// OVER-binds only — the shortfall is silent, and the ops read the unstaged tail of the
+    /// ADDITIVE mask as ZERO, i.e. as "no mask". MEASURED on the tiny fixture: heads 2-3 of
+    /// every layer ran with no causal mask, heads 0-1 exact.
+    ///
+    /// The fix bakes the count ([`Geometry::nqh`], from the same bounds the tape was lowered
+    /// at). This check is its guard: the placement's byte size must be exactly
+    /// `nqh · mq · score_width · 2`, so a staging shape built on any other head count — the
+    /// quotient, a stale wiring, a different model's geometry — is a load-time refusal instead
+    /// of a silent partial mask. Same shape of check as [`Self::verify_class_placements`], for
+    /// the same reason: the emulator executes the KTIR dialect ops and never reads this tid, so
+    /// nothing on its path can see the disagreement.
+    pub fn verify_causal_placement(
+        &self,
+        layout: &bundle::BundleLayout<'_>,
+        mq: u32,
+        score_width: u32,
+    ) -> Result<(), String> {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        let nqh = self.geometry.nqh as u64;
+        let want = nqh * mq as u64 * score_width as u64 * 2;
+        match layout.place_of_tid(sd::ATTN_CAUSAL_TID) {
+            Some(p) if p.size == want => Ok(()),
+            Some(p) => Err(format!(
+                "the causal mask (t{}) is placed at {} B, but this wiring's geometry bakes \
+                 {nqh} query head(s) × {mq} row(s) × {score_width} score width = {want} B. The \
+                 host stages `nqh·mq` mask rows; a placement that does not match is a \
+                 wiring/layout desync — and a STAGING at any other head count (the old \
+                 `hidden / head_dim` derivation, right only for a square Q projection) binds \
+                 only part of the placement, which the bind guard cannot see because it \
+                 refuses over-binds only. The unstaged tail of an ADDITIVE mask reads as ZERO, \
+                 i.e. as no mask.",
+                sd::ATTN_CAUSAL_TID,
+                p.size,
+            )),
+            None => Err(format!(
+                "the causal mask (t{}) is nowhere in this layout, but every attention bundle \
+                 places it — the wiring and the layout come from different bakes",
+                sd::ATTN_CAUSAL_TID,
+            )),
+        }
+    }
+
     /// The query-row CAPACITY this bundle was baked at — the embedding activation's placement rows.
     ///
     /// ⛔⛔⛔ THIS IS A CAPACITY, NOT THE ROW COUNT OF A LAUNCH, AND IT IS NOT WHAT THE TAPE
@@ -600,6 +652,23 @@ pub struct Geometry {
     pub vocab: u32,
     pub layers: u32,
     pub head_dim: u32,
+    /// ⭐⭐⭐⭐⭐ THE QUERY-HEAD COUNT, baked — `num_attention_heads` from the same
+    /// bounds the tape was lowered at.
+    ///
+    /// ⛔⛔⛔ NOT `hidden / head_dim`, WHICH IS WHAT EVERY HOST STAGING SITE USED TO
+    /// DERIVE. That quotient is the head count only when the Q projection is SQUARE
+    /// (`hidden == nqh·hd`) — true of granite/llama and false of gemma-4, whose
+    /// `hidden` (3840) is not a multiple of any class's `nqh·hd` (16·256 = 4096,
+    /// 16·512 = 8192). A host that stages the causal mask or the prefix mask tiled
+    /// to `hidden/head_dim` head rows binds only that many of the baked `nqh·mq`
+    /// rows — the bind guard refuses OVER-binds only, so the shortfall is silent,
+    /// and the ops read the unstaged tail of an ADDITIVE mask as ZERO, i.e. as
+    /// "no mask". MEASURED, gemma-4 tiny-allglobal (hidden 128, nqh 4, hd 64):
+    /// the causal mask covered heads 0-1 and heads 2-3 ran with NO causal mask,
+    /// every layer, prefill — card dump `sc` rows 22..43 unmasked, heads 0-1 exact.
+    /// The fix is the count itself, baked here from the bounds, so the staged row
+    /// count and the baked placement cannot disagree.
+    pub nqh: u32,
     /// Rotary base, as bits — `f32` is not structurally-eq, so a `const`-able
     /// struct cannot hold one and still derive `Eq`. Read via [`Self::rope_theta`].
     pub rope_theta_bits: u32,
@@ -1415,6 +1484,94 @@ mod constant_tape_tests {
             .expect("a uniform model's single-class pair passes");
     }
 
+    /// ⭐⭐⭐⭐⭐ THE CAUSAL-MASK HEAD-COUNT DEFECT, PINNED — gemma-4 tiny-allglobal's exact
+    /// geometry (hidden 128, nqh 4, head_dim 64), where `hidden / head_dim` = 2 ≠ 4.
+    ///
+    /// The host used to stage `causal_tiled(cmask, mq, mq_pad, hidden / head_dim)` rows into a
+    /// placement sized `nqh · mq · mq_pad`. The quotient is the head count only for a SQUARE Q
+    /// projection (`hidden == nqh·hd`) — true of granite/llama, false of gemma-4 at production
+    /// scale too (hidden 3840 against nqh·hd 4096/8192). The shortfall was silent: the bind
+    /// guard refuses OVER-binds only, and the unstaged tail of the ADDITIVE mask reads as ZERO,
+    /// i.e. as "no mask". MEASURED on the tiny fixture: heads 2-3 of every layer ran unmasked.
+    ///
+    /// This test pins both halves of the fix: the BAKED count stages the full placement (the
+    /// cross-check passes at `Geometry::nqh`), and the QUOTIENT's staging does not cover the
+    /// placement — which the load-time cross-check refuses, because its `want` is computed from
+    /// the bake's own `nqh` and not from any host arithmetic.
+    #[test]
+    fn the_causal_mask_head_count_is_the_bake_not_the_hidden_quotient() {
+        use crate::lower_subtile_tape_to_superdsc as sd;
+        // The gemma-4 tiny-allglobal geometry: hidden 128, FOUR query heads, head_dim 64.
+        // `hidden / head_dim` = 2 — the wrong count every host staging site used to derive.
+        let wiring = Wiring {
+            geometry: Geometry {
+                hidden: 128,
+                head_dim: 64,
+                nqh: 4,
+                ..uniform_wiring().geometry
+            },
+            ..uniform_wiring()
+        };
+        // The tiny fixture's prefill: mq = 11, mq_pad = 64. The placement law:
+        // `nqh · mq · score_width · 2` bytes.
+        let (mq, width) = (11u32, 64u32);
+        let placed_bytes = 4u64 * mq as u64 * width as u64 * 2;
+        let mut lay = class_layout(&[]);
+        lay.places.to_mut().push(bundle::Placement {
+            id: bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID),
+            segment: 0,
+            bank: 0,
+            offset: 0,
+            size: placed_bytes,
+            is_logits: false,
+        });
+        // The BAKED count's staging covers the placement — the pair agrees.
+        wiring
+            .verify_causal_placement(&lay, mq, width)
+            .expect("the bake's own nqh stages exactly its placement");
+        // THE DEFECT'S SHAPE: a staging at the QUOTIENT covers only `2·mq` of the `4·mq` rows.
+        // The quotient staging itself is silent at bind time (under-binding is allowed), so the
+        // CHECK is what must fire — its `want` comes from the bake's `nqh`, never from host
+        // arithmetic, and the two counts disagree on exactly this geometry.
+        let quotient = wiring.geometry.hidden / wiring.geometry.head_dim;
+        assert_ne!(
+            quotient, wiring.geometry.nqh,
+            "the fixture must be one where the quotient is NOT the head count, or this test \
+             pins nothing"
+        );
+        let quotient_bytes = quotient as u64 * mq as u64 * width as u64 * 2;
+        assert!(
+            quotient_bytes < placed_bytes,
+            "the quotient's staging is a PARTIAL bind, which is the silent direction of the \
+             bind guard"
+        );
+        // And the cross-check fires when the placement does not match the bake's head count —
+        // here simulated from the layout side (a placement sized at the quotient), which is the
+        // same disagreement seen from the other half.
+        let mut lay_quotient = class_layout(&[]);
+        lay_quotient.places.to_mut().push(bundle::Placement {
+            id: bundle::PlaceId::Act(sd::ATTN_CAUSAL_TID),
+            segment: 0,
+            bank: 0,
+            offset: 0,
+            size: quotient_bytes,
+            is_logits: false,
+        });
+        let why = wiring
+            .verify_causal_placement(&lay_quotient, mq, width)
+            .expect_err("a placement sized at the hidden/head_dim quotient must refuse");
+        assert!(
+            why.contains("4 query head"),
+            "the refusal names the bake's head count, got {why:?}"
+        );
+        // And a layout with no causal placement at all refuses — the stale-bake direction.
+        let lay_missing = class_layout(&[]);
+        assert!(
+            wiring.verify_causal_placement(&lay_missing, mq, width).is_err(),
+            "a wiring whose layout never placed the causal mask must refuse"
+        );
+    }
+
     /// A minimal `Wiring` for the cross-check tests — only the class fields are load-bearing.
     fn uniform_wiring() -> Wiring {
         Wiring {
@@ -1433,6 +1590,7 @@ mod constant_tape_tests {
                 vocab: 512,
                 layers: 1,
                 head_dim: 64,
+                nqh: 2,
                 rope_theta_bits: 0,
             },
             rope_class_hds: &[],
