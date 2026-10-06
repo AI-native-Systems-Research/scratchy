@@ -23,7 +23,7 @@ use scratchy_subtile::wave_schedule::wave_order;
 use scratchy_target_metal::from_tape::{TapeItem, roll_at};
 use scratchy_target_metal::op_abi::{
     METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS, METAL_WAVE_ORDER_ROWS,
-    metal_colour_rule,
+    metal_colour_rule, metal_guard_gates,
 };
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::model_consts::MetalModelConsts;
@@ -175,6 +175,8 @@ pub struct MetalStepFacts<'a> {
 pub struct CanonicalAt<'a> {
     pub stem: &'a str,
     pub m: u64,
+    /// The buckets it stands for, `m` among them: each runs its tape, codec guards realized at `m`.
+    pub buckets: &'a [u64],
 }
 
 /// Where the backbone's layer loop was cut.
@@ -210,6 +212,10 @@ pub enum CanonicalRefusal {
     Fold(FoldError),
     Colour(ColourError),
     Steps(StepRefusal),
+    /// A bucket the canonical stands for realizes its codec guards unlike the canonical's rows.
+    Guards {
+        bucket: u64,
+    },
 }
 
 impl std::fmt::Display for CanonicalRefusal {
@@ -220,6 +226,11 @@ impl std::fmt::Display for CanonicalRefusal {
             Self::Fold(e) => write!(f, "the shared fold pass refused: {e}"),
             Self::Colour(e) => write!(f, "tape colorer refused a DECLARED pilot: {e}"),
             Self::Steps(e) => write!(f, "the step records refused a DECLARED pilot: {e}"),
+            Self::Guards { bucket } => write!(
+                f,
+                "bucket {bucket} realizes its codec guards unlike this canonical's rows, which \
+                 would realize them for it: the bucket folding must key on them"
+            ),
         }
     }
 }
@@ -252,7 +263,11 @@ pub fn lower_canonical(
     sources: &mut SourceManifest,
 ) -> Result<MetalCanonical, CanonicalRefusal> {
     use CanonicalRefusal::Steps;
-    let CanonicalAt { stem, m } = at;
+    let CanonicalAt { stem, m, buckets } = at;
+    let guards = |m: u64| metal_guard_gates(m as u32);
+    if let Some(&bucket) = buckets.iter().find(|&&b| guards(b) != guards(m)) {
+        return Err(CanonicalRefusal::Guards { bucket });
+    }
     // Metal's TurboQuant: the codec steps its declared facts insert.
     // Only on a model built with it (`MetalModelConsts::kv_codec`): a dense model runs none.
     let coded;

@@ -11222,7 +11222,12 @@ pub fn emit_model(
             ) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
-                    l.input
+                    // A canonical realizes its codec guards at its own rows
+                    // (`metal_guard_gates`), for every bucket it stands for: buckets whose
+                    // realizations differ cannot share one (`lower_canonical` refuses it).
+                    let guards = scratchy_target_metal::op_abi::metal_guard_gates(m);
+                    let ops = l
+                        .input
                         .ops
                         .iter()
                         .map(|od| {
@@ -11240,7 +11245,8 @@ pub fn emit_model(
                             };
                             format!("{:?}#{mm}#{:?};", od.op, od.inputs)
                         })
-                        .collect::<String>()
+                        .collect::<String>();
+                    format!("{guards:?}{ops}")
                 }
                 Err(e) => format!("REFUSED:{e:?}"),
             };
@@ -11807,7 +11813,15 @@ pub fn emit_model(
                 .map(|_| &widths as &dyn Fn(st::LayerId) -> [Option<st::AffineBits>; 3]),
         };
         let mc = resolved_metal_consts.as_ref().expect("metal consts filled");
-        let at = mc3::CanonicalAt { stem, m };
+        let buckets: Vec<u64> = (bucket_points.iter().zip(&bucket_canonical))
+            .filter(|&(_, c)| c == canonical)
+            .map(|(wp, _)| wp.num_tokens)
+            .collect();
+        let at = mc3::CanonicalAt {
+            stem,
+            m,
+            buckets: &buckets,
+        };
         let lowered = mc3::lower_canonical(&l, &facts, mc, at, &mut metal_sources)
             .unwrap_or_else(|e| panic!("[m2-flip] {stem} m={m}: {e}"));
         *ns_field = lowered.colours.get();
