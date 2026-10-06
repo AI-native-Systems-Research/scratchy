@@ -272,8 +272,9 @@ pub fn lower_canonical(
         row_programs: m == 1,
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.
-    // A fused command reads what its fold absorbed, so the folds the tape order makes keep every
-    // absorbed step ahead of the step it folds into.
+    // A fused command reads what its fold absorbed and writes its epilogues, so the folds the tape
+    // order makes keep every absorbed step ahead of the step it folds into, and every epilogue
+    // with it: they fold the same again.
     let waved;
     let l = if m <= METAL_WAVE_ORDER_ROWS {
         let tp = crate::tape_program::tape_program(l, stem, m);
@@ -291,7 +292,8 @@ pub fn lower_canonical(
                     < scratchy_target_metal::op_abi::METAL_SORTED_PAIRS;
             }
         }
-        waved = wave_order(l, metal_colour_rule, folds.absorbed_ops(), &free);
+        let (absorbed, epilogues) = (folds.absorbed_ops(), folds.epilogue_ops());
+        waved = wave_order(l, metal_colour_rule, absorbed, epilogues, &free);
         &waved
     } else {
         l

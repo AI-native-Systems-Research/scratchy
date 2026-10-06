@@ -402,6 +402,8 @@ pub struct TapeFolds<K> {
     fusions: BTreeMap<SlotId, Vec<Fusion<K>>>,
     /// `absorbed`, by source op.
     absorbed_ops: Vec<(usize, usize)>,
+    /// The epilogues [`TapeFolds::role`] lowers as epilogues, by source op.
+    epilogue_ops: Vec<(usize, usize)>,
 }
 
 impl<K> TapeFolds<K> {
@@ -435,6 +437,12 @@ impl<K> TapeFolds<K> {
     /// computes it.
     pub fn absorbed_ops(&self) -> &[(usize, usize)] {
         &self.absorbed_ops
+    }
+
+    /// Every step a fold's command writes as its epilogue, by source op, with the source op of the
+    /// step driving that command.
+    pub fn epilogue_ops(&self) -> &[(usize, usize)] {
+        &self.epilogue_ops
     }
 
     /// Every fold, with the step driving it: by driver, then in the order they were applied.
@@ -1573,6 +1581,12 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
         TapeFolds {
             absorbed_ops: (self.absorbed.iter().enumerate())
                 .filter_map(|(j, w)| w.map(|w| (j, w)))
+                .collect(),
+            epilogue_ops: (self.epilogue.iter().enumerate())
+                .filter_map(|(j, of)| {
+                    of.filter(|of| self.absorbed[*of].is_none())
+                        .map(|of| (j, of))
+                })
                 .collect(),
             absorbed: by_slot(&self.absorbed),
             epilogue: by_slot(&self.epilogue),

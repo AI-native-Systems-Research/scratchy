@@ -46,6 +46,25 @@ pub fn wave_levels(input: &LoweringInput) -> Vec<usize> {
     levels
 }
 
+/// Per op of `n`, the op its `(op, next)` links chain to: itself when it has none.
+fn chain_ends(n: usize, links: &[(usize, usize)]) -> Vec<usize> {
+    let mut next: Vec<usize> = (0..n).collect();
+    for &(op, to) in links {
+        next[op] = to;
+    }
+    (0..n)
+        .map(|mut i| {
+            for _ in 0..n {
+                if next[i] == i {
+                    return i;
+                }
+                i = next[i];
+            }
+            panic!("a fold's links chain into a cycle at op {i}")
+        })
+        .collect()
+}
+
 /// `l` with its ops in WAVE ORDER: by level, ties in tape order — each op as early as what it
 /// reads allows, so independent branches interleave instead of running one after the other.
 ///
@@ -54,15 +73,21 @@ pub fn wave_levels(input: &LoweringInput) -> Vec<usize> {
 /// writes over that step's delta) after the steps still reading that buffer's earlier value. So
 /// such a step's level is also past every earlier reader of any value living in a buffer it may
 /// write. A read no operand names ([`LoweredDecode::unnamed_reads`]) is an edge like any other.
+///
 /// Nor do data edges order a fold's driver after the steps it absorbed, whose operands its command
-/// reads: each `(ahead, op)` pair — `ahead` before `op` in tape order — keeps `ahead` ahead. An
-/// op the target dispatches nothing for (`free`: a step a fold computes inside another, a view)
-/// takes no level of its own: its readers may run at its level. The result is a permutation of the
-/// ops: the same steps compute the same values.
+/// reads: each `(step, driver)` of `absorbed` — `step` before `driver` in tape order — keeps the
+/// step ahead, and what the step reads, the driver's command reads. And a fold's epilogue is its
+/// driver's command's own write: each `(epilogue, driver)` of `epilogues` runs at its driver's
+/// level, the two kept together in tape order, and a step reading either runs past them — so the
+/// folds the tape order made fold again in wave order, never split into a command each. An op the
+/// target dispatches nothing for (`free`: a step a fold computes inside another, a view) takes no
+/// level of its own: its readers may run at its level. The result is a permutation of the ops: the
+/// same steps compute the same values.
 pub fn wave_order(
     l: &LoweredDecode,
     rule: fn(&ArchOp) -> ColourRule,
-    ahead: &[(usize, usize)],
+    absorbed: &[(usize, usize)],
+    epilogues: &[(usize, usize)],
     free: &[bool],
 ) -> LoweredDecode {
     let ops = &l.input.ops;
@@ -94,23 +119,28 @@ pub fn wave_order(
             }
         }
     }
-    // `wave_levels`, plus the edges data does not carry: in tape order, every level an op waits
-    // on is final when it is reached.
-    let mut kept_ahead: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for &(a, op) in ahead.iter().chain(&l.unnamed_reads) {
-        kept_ahead[op].push(a);
+    // The command each op runs in: the driver its epilogues chain up to.
+    let command = chain_ends(n, epilogues);
+    // Each command's first op in tape order: where its members sit among their level's.
+    let mut first: Vec<usize> = (0..n).collect();
+    for i in (0..n).rev() {
+        first[command[i]] = first[command[i]].min(i);
     }
-    let mut level = vec![0usize; n];
-    // The first level an op's readers may take: past its own, or at it when it dispatches nothing.
-    let mut ready = vec![0usize; n];
+    let dispatches = |c: usize| usize::from(!free.get(c).copied().unwrap_or(false));
+    // Every op's constraints from outside its command: the commands it reads (data, a read no
+    // operand names, the steps its fold absorbed), and the readers of what it writes over in place.
+    let mut kept_ahead: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(w, r) in absorbed.iter().chain(&l.unnamed_reads) {
+        kept_ahead[r].push(w);
+    }
+    // The op whose command makes each op's reads: an absorbed step reads in its driver's.
+    let reads_in = chain_ends(n, absorbed);
+    let mut after: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for i in 0..n {
-        for &a in &kept_ahead[i] {
-            level[i] = level[i].max(ready[a]);
-        }
         let mut over: Vec<usize> = Vec::new();
         for input in &ops[i].inputs {
             if let InputRef::Op(j) = input {
-                level[i] = level[i].max(ready[*j]);
+                after[i].push((command[*j], dispatches(command[*j])));
                 if writes_over(i) {
                     over.push(owner[*j]);
                     // A norm folding the step it reads writes over that step's delta.
@@ -123,15 +153,43 @@ pub fn wave_order(
                 }
             }
         }
+        for &w in &kept_ahead[i] {
+            after[i].push((command[w], dispatches(command[w])));
+        }
         for b in over {
             for &r in readers[b].iter().take_while(|r| **r < i) {
-                level[i] = level[i].max(level[r] + 1);
+                let x = reads_in[r];
+                if x < i {
+                    after[i].push((command[x], 1));
+                }
             }
         }
-        ready[i] = level[i] + usize::from(!free.get(i).copied().unwrap_or(false));
+        after[i].retain(|&(c, _)| c != command[i]);
     }
+    // `wave_levels` over commands: a command waits on every command any member waits on. A
+    // command's members can follow an op reading another member in tape order, so the levels are
+    // raised until none moves.
+    let mut level = vec![0usize; n];
+    let settled = (0..=n).any(|_| {
+        let mut moved = false;
+        for i in 0..n {
+            let at = (after[i].iter())
+                .map(|&(c, past)| level[c] + past)
+                .max()
+                .unwrap_or(0);
+            if at > level[command[i]] {
+                level[command[i]] = at;
+                moved = true;
+            }
+        }
+        !moved
+    });
+    assert!(
+        settled,
+        "a fold's command waits on its own epilogue's reader"
+    );
     let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&i| (level[i], i));
+    order.sort_by_key(|&i| (level[command[i]], first[command[i]], i));
     let mut at = vec![0usize; n];
     for (new, &old) in order.iter().enumerate() {
         at[old] = new;
@@ -262,14 +320,41 @@ mod tests {
             mul(vec![Op(3)]),
             mul(vec![Op(2), Op(4)]),
         ]);
-        let w = wave_order(&l, in_place_add, &[], &[]);
+        let w = wave_order(&l, in_place_add, &[], &[], &[]);
         assert_eq!(tiles(&w), [0, 3, 1, 4, 2, 5]);
         // An op kept ahead of another holds it back: 3 stays after 2.
-        let kept = wave_order(&l, in_place_add, &[(2, 3)], &[]);
+        let kept = wave_order(&l, in_place_add, &[(2, 3)], &[], &[]);
         assert_eq!(tiles(&kept), [0, 1, 2, 3, 4, 5]);
         // The join reads the two ops it read, wherever they went; it is still the result.
         assert_eq!(w.input.ops[5].inputs, [Op(4), Op(3)]);
         assert_eq!(w.input.result, 5);
+    }
+
+    #[test]
+    fn an_epilogue_runs_with_its_driver_and_its_readers_run_past_them() {
+        use InputRef::{Ext, Op};
+        // Gemma 4's MoE entry: one command (driver 5) computes the norm 1 (absorbed), the add 2
+        // others read (its epilogue) and the norm 5; the router 3 and the dense gate/up 4 read the
+        // add, the experts 6 read the norm 5 and the router, the down 7 the gate/up; 8 joins.
+        let l = decode(vec![
+            mul(vec![Ext(0)]),
+            mul(vec![Op(0)]),
+            mul(vec![Op(1), Ext(0)]),
+            mul(vec![Op(2)]),
+            mul(vec![Op(2)]),
+            mul(vec![Op(2)]),
+            mul(vec![Op(5), Op(3)]),
+            mul(vec![Op(4)]),
+            mul(vec![Op(6), Op(7)]),
+        ]);
+        // The absorbed norm alone kept ahead, the norm 5 lands among the add's readers, away from
+        // the add: a fold of the reordered tape can no longer take it.
+        let absorbed = [false, true, false, false, false, false, false, false, false];
+        let apart = wave_order(&l, |_| ColourRule::FRESH, &[(1, 5)], &[], &absorbed);
+        assert_eq!(tiles(&apart), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        // As one command, the three run together and every reader of the add follows them.
+        let whole = wave_order(&l, |_| ColourRule::FRESH, &[(1, 5)], &[(2, 5)], &absorbed);
+        assert_eq!(tiles(&whole), [0, 1, 2, 5, 3, 4, 6, 7, 8]);
     }
 
     #[test]
@@ -285,11 +370,11 @@ mod tests {
             op(vec![Ext(0), Op(0)]),
             mul(vec![Op(3), Op(4)]),
         ]);
-        let w = wave_order(&l, in_place_add, &[], &[]);
+        let w = wave_order(&l, in_place_add, &[], &[], &[]);
         let at = |tile: u32| tiles(&w).iter().position(|t| *t == tile).unwrap();
         assert!(at(3) < at(4), "{:?}", tiles(&w));
         // A fresh-buffer op with the same operands moves up to its data level.
-        let fresh = wave_order(&l, |_| ColourRule::FRESH, &[], &[]);
+        let fresh = wave_order(&l, |_| ColourRule::FRESH, &[], &[], &[]);
         assert_eq!(tiles(&fresh), [0, 1, 2, 4, 3, 5]);
     }
 
@@ -304,11 +389,11 @@ mod tests {
             mul(vec![Op(1), Op(2)]),
         ]);
         assert_eq!(
-            tiles(&wave_order(&l, |_| ColourRule::FRESH, &[], &[])),
+            tiles(&wave_order(&l, |_| ColourRule::FRESH, &[], &[], &[])),
             [0, 2, 1, 3]
         );
         l.unnamed_reads = vec![(1, 2)];
-        let w = wave_order(&l, |_| ColourRule::FRESH, &[], &[]);
+        let w = wave_order(&l, |_| ColourRule::FRESH, &[], &[], &[]);
         assert_eq!(tiles(&w), [0, 1, 2, 3]);
         // The pair follows its ops.
         assert_eq!(w.unnamed_reads, [(1, 2)]);
